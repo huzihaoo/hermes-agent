@@ -313,6 +313,91 @@ class TestSkillView:
         assert "not found" in result["error"].lower()
         assert "available_skills" in result
 
+    def test_view_skill_by_frontmatter_name(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = tmp_path / "gstack-review"
+            skill_dir.mkdir(parents=True, exist_ok=True)
+            (skill_dir / "SKILL.md").write_text(
+                """\
+---
+name: review
+description: Review diffs.
+---
+
+# Review
+
+Use this skill to review changes.
+"""
+            )
+            raw = skill_view("review")
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["name"] == "review"
+        assert "Review" in result["content"]
+
+    def test_view_skill_in_trusted_symlinked_dir_does_not_warn(self, tmp_path, caplog):
+        real_skills_dir = tmp_path / "skills-real"
+        real_skills_dir.mkdir(parents=True, exist_ok=True)
+        skill_dir = real_skills_dir / "gstack-review"
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(
+            """\
+---
+name: review
+description: Review diffs.
+---
+
+# Review
+"""
+        )
+        linked_skills_dir = tmp_path / "skills-link"
+        linked_skills_dir.symlink_to(real_skills_dir, target_is_directory=True)
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", linked_skills_dir),
+            caplog.at_level("WARNING", logger="tools.skills_tool"),
+        ):
+            raw = skill_view("review")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert not any(
+            "outside the trusted skills directory" in record.message
+            for record in caplog.records
+        )
+
+    def test_view_skill_via_trusted_symlinked_file_does_not_warn(self, tmp_path, caplog):
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir(parents=True, exist_ok=True)
+        source_dir = tmp_path / "generated" / "gstack-review"
+        source_dir.mkdir(parents=True, exist_ok=True)
+        (source_dir / "SKILL.md").write_text(
+            """\
+---
+name: review
+description: Review diffs.
+---
+
+# Review
+"""
+        )
+        trusted_skill_dir = skills_dir / "gstack-review"
+        trusted_skill_dir.mkdir(parents=True, exist_ok=True)
+        (trusted_skill_dir / "SKILL.md").symlink_to(source_dir / "SKILL.md")
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", skills_dir),
+            caplog.at_level("WARNING", logger="tools.skills_tool"),
+        ):
+            raw = skill_view("review")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert not any(
+            "outside the trusted skills directory" in record.message
+            for record in caplog.records
+        )
+
     def test_view_reference_file(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             skill_dir = _make_skill(tmp_path, "my-skill")

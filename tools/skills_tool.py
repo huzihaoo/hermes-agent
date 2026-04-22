@@ -891,6 +891,7 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
 
         skill_dir = None
         skill_md = None
+        content = None
 
         # Search all dirs: local first, then external (first match wins)
         for search_dir in all_dirs:
@@ -911,6 +912,27 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
                     if found_skill_md.parent.name == name:
                         skill_dir = found_skill_md.parent
                         skill_md = found_skill_md
+                        break
+                if skill_md:
+                    break
+
+        # Search by frontmatter name across all dirs
+        if not skill_md:
+            for search_dir in all_dirs:
+                for found_skill_md in search_dir.rglob("SKILL.md"):
+                    try:
+                        found_content = found_skill_md.read_text(encoding="utf-8")
+                        found_frontmatter, _ = _parse_frontmatter(found_content)
+                    except Exception:
+                        found_frontmatter = {}
+                        found_content = None
+                    found_name = str(
+                        found_frontmatter.get("name", found_skill_md.parent.name)
+                    )
+                    if found_name == name:
+                        skill_dir = found_skill_md.parent
+                        skill_md = found_skill_md
+                        content = found_content
                         break
                 if skill_md:
                     break
@@ -938,32 +960,46 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
             )
 
         # Read the file once — reused for platform check and main content below
-        try:
-            content = skill_md.read_text(encoding="utf-8")
-        except Exception as e:
-            return json.dumps(
-                {
-                    "success": False,
-                    "error": f"Failed to read skill '{name}': {e}",
-                },
-                ensure_ascii=False,
-            )
+        if content is None:
+            try:
+                content = skill_md.read_text(encoding="utf-8")
+            except Exception as e:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": f"Failed to read skill '{name}': {e}",
+                    },
+                    ensure_ascii=False,
+                )
 
         # Security: warn if skill is loaded from outside trusted directories
         # (local skills dir + configured external_dirs are all trusted)
         _outside_skills_dir = True
-        _trusted_dirs = [SKILLS_DIR.resolve()]
-        try:
-            _trusted_dirs.extend(d.resolve() for d in all_dirs[1:])
-        except Exception:
-            pass
-        for _td in _trusted_dirs:
+        _trusted_dirs = []
+        for _candidate in [SKILLS_DIR, *all_dirs[1:]]:
+            for _dir_variant in (_candidate.absolute(), _candidate.resolve()):
+                try:
+                    if _dir_variant not in _trusted_dirs:
+                        _trusted_dirs.append(_dir_variant)
+                except Exception:
+                    continue
+        _candidate_paths = []
+        for _candidate_path in (skill_md.absolute(), skill_md.resolve()):
             try:
-                skill_md.resolve().relative_to(_td)
-                _outside_skills_dir = False
-                break
-            except ValueError:
+                if _candidate_path not in _candidate_paths:
+                    _candidate_paths.append(_candidate_path)
+            except Exception:
                 continue
+        for _td in _trusted_dirs:
+            for _candidate_path in _candidate_paths:
+                try:
+                    _candidate_path.relative_to(_td)
+                    _outside_skills_dir = False
+                    break
+                except ValueError:
+                    continue
+            if not _outside_skills_dir:
+                break
 
         # Security: detect common prompt injection patterns
         # (pattern list at module level as _INJECTION_PATTERNS)
