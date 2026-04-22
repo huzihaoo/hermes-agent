@@ -513,6 +513,8 @@ class APIServerAdapter(BasePlatformAdapter):
         self,
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
+        requested_provider: Optional[str] = None,
+        requested_model: Optional[str] = None,
         stream_delta_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
@@ -528,12 +530,42 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         from run_agent import AIAgent
         from gateway.run import _resolve_runtime_agent_kwargs, _resolve_gateway_model, _load_gateway_config
+        from hermes_cli.runtime_provider import resolve_runtime_provider, format_runtime_provider_error
         from hermes_cli.tools_config import _get_platform_tools
-
-        runtime_kwargs = _resolve_runtime_agent_kwargs()
-        model = _resolve_gateway_model()
+        from hermes_cli.models import get_default_model_for_provider
 
         user_config = _load_gateway_config()
+        requested_provider = str(requested_provider or "").strip()
+        requested_model = str(requested_model or "").strip()
+
+        if requested_provider:
+            try:
+                runtime = resolve_runtime_provider(requested=requested_provider)
+            except Exception as exc:
+                raise RuntimeError(format_runtime_provider_error(exc)) from exc
+            runtime_kwargs = {
+                "api_key": runtime.get("api_key"),
+                "base_url": runtime.get("base_url"),
+                "provider": runtime.get("provider"),
+                "api_mode": runtime.get("api_mode"),
+                "command": runtime.get("command"),
+                "args": list(runtime.get("args") or []),
+                "credential_pool": runtime.get("credential_pool"),
+            }
+            model = requested_model or str(runtime.get("model") or "").strip()
+        else:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            model = requested_model
+
+        model = model or _resolve_gateway_model(user_config)
+        if not model and (runtime_kwargs.get("provider") or requested_provider):
+            try:
+                model = get_default_model_for_provider(
+                    str(runtime_kwargs.get("provider") or requested_provider)
+                )
+            except Exception:
+                model = ""
+
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
 
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
@@ -632,6 +664,8 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         stream = body.get("stream", False)
+        requested_provider = str(body.get("provider") or "").strip() or None
+        requested_model = str(body.get("model") or "").strip() or None
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
@@ -769,6 +803,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
+                requested_provider=requested_provider,
+                requested_model=requested_model,
                 stream_delta_callback=_on_delta,
                 tool_progress_callback=_on_tool_progress,
                 agent_ref=agent_ref,
@@ -786,6 +822,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
+                requested_provider=requested_provider,
+                requested_model=requested_model,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -1413,6 +1451,8 @@ class APIServerAdapter(BasePlatformAdapter):
         previous_response_id = body.get("previous_response_id")
         conversation = body.get("conversation")
         store = body.get("store", True)
+        requested_provider = str(body.get("provider") or "").strip() or None
+        requested_model = str(body.get("model") or "").strip() or None
 
         # conversation and previous_response_id are mutually exclusive
         if conversation and previous_response_id:
@@ -1535,6 +1575,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=conversation_history,
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
+                requested_provider=requested_provider,
+                requested_model=requested_model,
                 stream_delta_callback=_on_delta,
                 tool_progress_callback=_on_tool_progress,
                 tool_start_callback=_on_tool_start,
@@ -1568,6 +1610,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=conversation_history,
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
+                requested_provider=requested_provider,
+                requested_model=requested_model,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -1987,6 +2031,8 @@ class APIServerAdapter(BasePlatformAdapter):
         conversation_history: List[Dict[str, str]],
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
+        requested_provider: Optional[str] = None,
+        requested_model: Optional[str] = None,
         stream_delta_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
@@ -2010,6 +2056,8 @@ class APIServerAdapter(BasePlatformAdapter):
             agent = self._create_agent(
                 ephemeral_system_prompt=ephemeral_system_prompt,
                 session_id=session_id,
+                requested_provider=requested_provider,
+                requested_model=requested_model,
                 stream_delta_callback=stream_delta_callback,
                 tool_progress_callback=tool_progress_callback,
                 tool_start_callback=tool_start_callback,
@@ -2129,6 +2177,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
+        requested_provider = str(body.get("provider") or "").strip() or None
+        requested_model = str(body.get("model") or "").strip() or None
 
         # Accept explicit conversation_history from the request body.
         # Precedence: explicit conversation_history > previous_response_id.
@@ -2182,6 +2232,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent = self._create_agent(
                     ephemeral_system_prompt=ephemeral_system_prompt,
                     session_id=session_id,
+                    requested_provider=requested_provider,
+                    requested_model=requested_model,
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
                 )

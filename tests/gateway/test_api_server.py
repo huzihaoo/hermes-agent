@@ -753,6 +753,113 @@ class TestChatCompletionsEndpoint:
             assert call_kwargs["conversation_history"][1] == {"role": "assistant", "content": "2"}
 
     @pytest.mark.asyncio
+    async def test_chat_completions_uses_request_provider_and_model(self, adapter):
+        app = _create_app(adapter)
+        fake_agent = MagicMock()
+        fake_agent.run_conversation.return_value = {
+            "final_response": "ok",
+            "messages": [],
+            "api_calls": 1,
+        }
+        fake_agent.session_prompt_tokens = 0
+        fake_agent.session_completion_tokens = 0
+        fake_agent.session_total_tokens = 0
+
+        with (
+            patch.object(adapter, "_ensure_session_db", return_value=None),
+            patch("gateway.run._load_gateway_config", return_value={}),
+            patch("gateway.run._resolve_runtime_agent_kwargs", side_effect=AssertionError("default runtime should not be used")),
+            patch("gateway.run._resolve_gateway_model", return_value="gateway-default"),
+            patch("gateway.run.GatewayRunner._load_fallback_model", return_value="fallback-model"),
+            patch("hermes_cli.tools_config._get_platform_tools", return_value=[]),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value={
+                    "api_key": "req-key",
+                    "base_url": "https://api.example.com",
+                    "provider": "openrouter",
+                    "api_mode": "responses",
+                    "command": None,
+                    "args": [],
+                    "credential_pool": None,
+                    "model": "ignored-default",
+                },
+            ) as mock_runtime,
+            patch("hermes_cli.models.get_default_model_for_provider") as mock_default_model,
+            patch("run_agent.AIAgent", return_value=fake_agent) as mock_agent_cls,
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "provider": "openrouter",
+                        "model": "openrouter/gpt-5.4",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                )
+
+        assert resp.status == 200
+        mock_runtime.assert_called_once_with(requested="openrouter")
+        mock_default_model.assert_not_called()
+        assert mock_agent_cls.call_args.kwargs["provider"] == "openrouter"
+        assert mock_agent_cls.call_args.kwargs["model"] == "openrouter/gpt-5.4"
+        assert mock_agent_cls.call_args.kwargs["api_key"] == "req-key"
+
+    @pytest.mark.asyncio
+    async def test_chat_completions_uses_provider_default_model_when_model_missing(self, adapter):
+        app = _create_app(adapter)
+        fake_agent = MagicMock()
+        fake_agent.run_conversation.return_value = {
+            "final_response": "ok",
+            "messages": [],
+            "api_calls": 1,
+        }
+        fake_agent.session_prompt_tokens = 0
+        fake_agent.session_completion_tokens = 0
+        fake_agent.session_total_tokens = 0
+
+        with (
+            patch.object(adapter, "_ensure_session_db", return_value=None),
+            patch("gateway.run._load_gateway_config", return_value={}),
+            patch("gateway.run._resolve_runtime_agent_kwargs", side_effect=AssertionError("default runtime should not be used")),
+            patch("gateway.run._resolve_gateway_model", return_value=""),
+            patch("gateway.run.GatewayRunner._load_fallback_model", return_value=None),
+            patch("hermes_cli.tools_config._get_platform_tools", return_value=[]),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value={
+                    "api_key": "req-key",
+                    "base_url": "https://api.example.com",
+                    "provider": "openrouter",
+                    "api_mode": "responses",
+                    "command": None,
+                    "args": [],
+                    "credential_pool": None,
+                    "model": "",
+                },
+            ) as mock_runtime,
+            patch(
+                "hermes_cli.models.get_default_model_for_provider",
+                return_value="openrouter/default-model",
+            ) as mock_default_model,
+            patch("run_agent.AIAgent", return_value=fake_agent) as mock_agent_cls,
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "provider": "openrouter",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                )
+
+        assert resp.status == 200
+        mock_runtime.assert_called_once_with(requested="openrouter")
+        mock_default_model.assert_called_once_with("openrouter")
+        assert mock_agent_cls.call_args.kwargs["provider"] == "openrouter"
+        assert mock_agent_cls.call_args.kwargs["model"] == "openrouter/default-model"
+
+    @pytest.mark.asyncio
     async def test_agent_error_returns_500(self, adapter):
         """Agent exception returns 500."""
         app = _create_app(adapter)
@@ -968,6 +1075,113 @@ class TestResponsesEndpoint:
             assert resp.status == 200
             call_kwargs = mock_run.call_args.kwargs
             assert call_kwargs["ephemeral_system_prompt"] == "Talk like a pirate."
+
+    @pytest.mark.asyncio
+    async def test_responses_uses_request_provider_and_model(self, adapter):
+        app = _create_app(adapter)
+        fake_agent = MagicMock()
+        fake_agent.run_conversation.return_value = {
+            "final_response": "ok",
+            "messages": [],
+            "api_calls": 1,
+        }
+        fake_agent.session_prompt_tokens = 0
+        fake_agent.session_completion_tokens = 0
+        fake_agent.session_total_tokens = 0
+
+        with (
+            patch.object(adapter, "_ensure_session_db", return_value=None),
+            patch("gateway.run._load_gateway_config", return_value={}),
+            patch("gateway.run._resolve_runtime_agent_kwargs", side_effect=AssertionError("default runtime should not be used")),
+            patch("gateway.run._resolve_gateway_model", return_value="gateway-default"),
+            patch("gateway.run.GatewayRunner._load_fallback_model", return_value="fallback-model"),
+            patch("hermes_cli.tools_config._get_platform_tools", return_value=[]),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value={
+                    "api_key": "req-key",
+                    "base_url": "https://api.example.com",
+                    "provider": "openrouter",
+                    "api_mode": "responses",
+                    "command": None,
+                    "args": [],
+                    "credential_pool": None,
+                    "model": "ignored-default",
+                },
+            ) as mock_runtime,
+            patch("hermes_cli.models.get_default_model_for_provider") as mock_default_model,
+            patch("run_agent.AIAgent", return_value=fake_agent) as mock_agent_cls,
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "provider": "openrouter",
+                        "model": "openrouter/gpt-5.4",
+                        "input": "hi",
+                    },
+                )
+
+        assert resp.status == 200
+        mock_runtime.assert_called_once_with(requested="openrouter")
+        mock_default_model.assert_not_called()
+        assert mock_agent_cls.call_args.kwargs["provider"] == "openrouter"
+        assert mock_agent_cls.call_args.kwargs["model"] == "openrouter/gpt-5.4"
+        assert mock_agent_cls.call_args.kwargs["api_key"] == "req-key"
+
+    @pytest.mark.asyncio
+    async def test_responses_uses_provider_default_model_when_model_missing(self, adapter):
+        app = _create_app(adapter)
+        fake_agent = MagicMock()
+        fake_agent.run_conversation.return_value = {
+            "final_response": "ok",
+            "messages": [],
+            "api_calls": 1,
+        }
+        fake_agent.session_prompt_tokens = 0
+        fake_agent.session_completion_tokens = 0
+        fake_agent.session_total_tokens = 0
+
+        with (
+            patch.object(adapter, "_ensure_session_db", return_value=None),
+            patch("gateway.run._load_gateway_config", return_value={}),
+            patch("gateway.run._resolve_runtime_agent_kwargs", side_effect=AssertionError("default runtime should not be used")),
+            patch("gateway.run._resolve_gateway_model", return_value=""),
+            patch("gateway.run.GatewayRunner._load_fallback_model", return_value=None),
+            patch("hermes_cli.tools_config._get_platform_tools", return_value=[]),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value={
+                    "api_key": "req-key",
+                    "base_url": "https://api.example.com",
+                    "provider": "openrouter",
+                    "api_mode": "responses",
+                    "command": None,
+                    "args": [],
+                    "credential_pool": None,
+                    "model": "",
+                },
+            ) as mock_runtime,
+            patch(
+                "hermes_cli.models.get_default_model_for_provider",
+                return_value="openrouter/default-model",
+            ) as mock_default_model,
+            patch("run_agent.AIAgent", return_value=fake_agent) as mock_agent_cls,
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "provider": "openrouter",
+                        "input": "hi",
+                    },
+                )
+
+        assert resp.status == 200
+        mock_runtime.assert_called_once_with(requested="openrouter")
+        mock_default_model.assert_called_once_with("openrouter")
+        assert mock_agent_cls.call_args.kwargs["provider"] == "openrouter"
+        assert mock_agent_cls.call_args.kwargs["model"] == "openrouter/default-model"
 
     @pytest.mark.asyncio
     async def test_previous_response_id_chaining(self, adapter):
