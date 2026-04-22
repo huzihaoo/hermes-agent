@@ -6441,7 +6441,10 @@ class AIAgent:
     def _build_api_kwargs(self, api_messages: list) -> dict:
         """Build the keyword arguments dict for the active API mode."""
         if self.api_mode == "anthropic_messages":
-            from agent.anthropic_adapter import build_anthropic_kwargs
+            from agent.anthropic_adapter import (
+                _is_third_party_anthropic_endpoint,
+                build_anthropic_kwargs,
+            )
             anthropic_messages = self._prepare_anthropic_messages_for_api(api_messages)
             # Pass context_length (total input+output window) so the adapter can
             # clamp max_tokens (output cap) when the user configured a smaller
@@ -6454,7 +6457,8 @@ class AIAgent:
             ephemeral_out = getattr(self, "_ephemeral_max_output_tokens", None)
             if ephemeral_out is not None:
                 self._ephemeral_max_output_tokens = None  # consume immediately
-            return build_anthropic_kwargs(
+            anthropic_base_url = getattr(self, "_anthropic_base_url", None)
+            kwargs = build_anthropic_kwargs(
                 model=self.model,
                 messages=anthropic_messages,
                 tools=self.tools,
@@ -6463,9 +6467,16 @@ class AIAgent:
                 is_oauth=self._is_anthropic_oauth,
                 preserve_dots=self._anthropic_preserve_dots(),
                 context_length=ctx_len,
-                base_url=getattr(self, "_anthropic_base_url", None),
+                base_url=anthropic_base_url,
                 fast_mode=(self.request_overrides or {}).get("speed") == "fast",
             )
+            if self.session_id and _is_third_party_anthropic_endpoint(anthropic_base_url):
+                metadata = kwargs.get("metadata")
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                metadata.setdefault("session_id", self.session_id)
+                kwargs["metadata"] = metadata
+            return kwargs
 
         # AWS Bedrock native Converse API — bypasses the OpenAI client entirely.
         # The adapter handles message/tool conversion and boto3 calls directly.

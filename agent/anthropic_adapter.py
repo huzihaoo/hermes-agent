@@ -240,6 +240,15 @@ def _common_betas_for_base_url(base_url: str | None) -> list[str]:
     return _COMMON_BETAS
 
 
+def _requires_claude_cli_identity(base_url: str | None) -> bool:
+    """Return True for proxies that only accept Claude Code-style identity headers."""
+    normalized = _normalize_base_url_text(base_url)
+    if not normalized:
+        return False
+    normalized = normalized.rstrip("/").lower()
+    return any(host in normalized for host in ("moacode.org", "duckcoding.ai"))
+
+
 def build_anthropic_client(api_key: str, base_url: str = None):
     """Create an Anthropic client, auto-detecting setup-tokens vs API keys.
 
@@ -276,8 +285,14 @@ def build_anthropic_client(api_key: str, base_url: str = None):
         # don't follow Anthropic's sk-ant-* prefix convention and would be
         # misclassified as OAuth tokens.
         kwargs["api_key"] = api_key
+        third_party_headers = {}
         if common_betas:
-            kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
+            third_party_headers["anthropic-beta"] = ",".join(common_betas)
+        if _requires_claude_cli_identity(normalized_base_url):
+            third_party_headers["user-agent"] = f"claude-cli/{_get_claude_code_version()} (external, cli)"
+            third_party_headers["x-app"] = "cli"
+        if third_party_headers:
+            kwargs["default_headers"] = third_party_headers
     elif _is_oauth_token(api_key):
         # OAuth access token / setup-token → Bearer auth + Claude Code identity.
         # Anthropic routes OAuth requests based on user-agent and headers;
