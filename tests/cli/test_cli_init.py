@@ -160,6 +160,31 @@ class TestSingleQueryState:
         assert hasattr(cli, "_pending_input")
 
 
+class TestInterruptCleanup:
+    def test_stuck_interrupt_thread_resets_agent_and_clients(self):
+        cli = _make_cli()
+        cli.agent = MagicMock()
+
+        with patch("agent.auxiliary_client.shutdown_cached_clients") as mock_shutdown:
+            cli._handle_stuck_interrupt_agent_thread()
+
+        mock_shutdown.assert_called_once()
+        assert cli.agent is None
+
+    def test_stuck_interrupt_thread_replaces_primary_client_before_dropping_agent(self):
+        cli = _make_cli()
+        agent = MagicMock()
+        cli.agent = agent
+
+        with patch("agent.auxiliary_client.shutdown_cached_clients"):
+            cli._handle_stuck_interrupt_agent_thread()
+
+        agent._replace_primary_openai_client.assert_called_once_with(
+            reason="cli_interrupt_timeout_reset"
+        )
+        assert cli.agent is None
+
+
 class TestHistoryDisplay:
     def test_history_numbers_only_visible_messages_and_summarizes_tools(self, capsys):
         cli = _make_cli()

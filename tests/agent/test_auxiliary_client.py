@@ -1242,6 +1242,49 @@ class TestCallLlmPaymentFallback:
                 )
 
 
+class TestCallLlmInterruptCheck:
+    def test_interrupt_before_request_skips_client_call(self):
+        client = MagicMock()
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                    return_value=(client, "test-model")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                    return_value=("auto", "test-model", None, None, None)):
+            with pytest.raises(InterruptedError, match="Auxiliary compression interrupted"):
+                call_llm(
+                    task="compression",
+                    messages=[{"role": "user", "content": "hello"}],
+                    interrupt_check=lambda: True,
+                )
+
+        client.chat.completions.create.assert_not_called()
+
+    def test_interrupt_before_fallback_skips_fallback_request(self):
+        primary_client = MagicMock()
+        primary_err = Exception("Payment Required: insufficient credits")
+        primary_err.status_code = 402
+        primary_client.chat.completions.create.side_effect = primary_err
+
+        fallback_client = MagicMock()
+        checks = iter([False, False, True])
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                    return_value=(primary_client, "test-model")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                    return_value=("auto", "test-model", None, None, None)), \
+             patch("agent.auxiliary_client._try_payment_fallback",
+                    return_value=(fallback_client, "fb-model", "openai-codex")):
+            with pytest.raises(InterruptedError, match="Auxiliary compression interrupted"):
+                call_llm(
+                    task="compression",
+                    messages=[{"role": "user", "content": "hello"}],
+                    interrupt_check=lambda: next(checks),
+                )
+
+        primary_client.chat.completions.create.assert_called_once()
+        fallback_client.chat.completions.create.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Gate: _resolve_api_key_provider must skip anthropic when not configured
 # ---------------------------------------------------------------------------

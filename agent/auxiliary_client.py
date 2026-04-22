@@ -41,7 +41,7 @@ import threading
 import time
 from pathlib import Path  # noqa: F401 — used by test mocks
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from openai import OpenAI
 
@@ -2361,6 +2361,7 @@ def call_llm(
     tools: list = None,
     timeout: float = None,
     extra_body: dict = None,
+    interrupt_check: Optional[Callable[[], bool]] = None,
 ) -> Any:
     """Centralized synchronous LLM call.
 
@@ -2379,6 +2380,8 @@ def call_llm(
         tools: Tool definitions (for function calling).
         timeout: Request timeout in seconds (None = read from auxiliary.{task}.timeout config).
         extra_body: Additional request body fields.
+        interrupt_check: Optional callable that returns True when the
+            caller has been interrupted and the request should be skipped.
 
     Returns:
         Response object with .choices[0].message.content
@@ -2386,6 +2389,14 @@ def call_llm(
     Raises:
         RuntimeError: If no provider is configured.
     """
+    def _raise_if_interrupted() -> None:
+        if callable(interrupt_check) and interrupt_check():
+            raise InterruptedError(
+                f"Auxiliary {task or 'call'} interrupted before LLM request"
+            )
+
+    _raise_if_interrupted()
+
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
 
@@ -2469,17 +2480,23 @@ def call_llm(
 
     # Handle max_tokens vs max_completion_tokens retry, then payment fallback.
     try:
+        _raise_if_interrupted()
         return _validate_llm_response(
             client.chat.completions.create(**kwargs), task)
     except Exception as first_err:
+        if isinstance(first_err, InterruptedError):
+            raise
         err_str = str(first_err)
         if "max_tokens" in err_str or "unsupported_parameter" in err_str:
             kwargs.pop("max_tokens", None)
             kwargs["max_completion_tokens"] = max_tokens
             try:
+                _raise_if_interrupted()
                 return _validate_llm_response(
                     client.chat.completions.create(**kwargs), task)
             except Exception as retry_err:
+                if isinstance(retry_err, InterruptedError):
+                    raise
                 # If the max_tokens retry also hits a payment or connection
                 # error, fall through to the fallback chain below.
                 if not (_is_payment_error(retry_err) or _is_connection_error(retry_err)):
@@ -2515,6 +2532,7 @@ def call_llm(
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, timeout=effective_timeout,
                     extra_body=extra_body)
+                _raise_if_interrupted()
                 return _validate_llm_response(
                     fb_client.chat.completions.create(**fb_kwargs), task)
         raise

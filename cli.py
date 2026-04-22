@@ -2074,6 +2074,27 @@ class HermesCLI:
         except Exception:
             return f"⚕ {self.model if getattr(self, 'model', None) else 'Hermes'}"
 
+    def _handle_stuck_interrupt_agent_thread(self) -> None:
+        """Clean up client state after an interrupted agent thread outlives its grace period."""
+        try:
+            from agent.auxiliary_client import shutdown_cached_clients
+
+            shutdown_cached_clients()
+        except Exception:
+            pass
+        try:
+            if self.agent is not None:
+                self.agent._replace_primary_openai_client(  # type: ignore[attr-defined]
+                    reason="cli_interrupt_timeout_reset"
+                )
+        except Exception:
+            pass
+        # Do not reuse the agent instance after a timed-out interrupt. The
+        # stale daemon thread may still hold the old agent object briefly
+        # while it unwinds, and reusing it can retain large turn state or
+        # race with follow-up turns. Force a clean re-init on the next turn.
+        self.agent = None
+
     def _get_status_bar_fragments(self):
         if not self._status_bar_visible or getattr(self, '_model_picker_state', None):
             return []
@@ -7783,6 +7804,7 @@ class HermesCLI:
                         "on exit.",
                         agent_thread.ident,
                     )
+                    self._handle_stuck_interrupt_agent_thread()
             else:
                 # Normal completion: agent thread should be done already,
                 # but guard against edge cases.

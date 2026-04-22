@@ -118,6 +118,8 @@ class TestFlushMemoriesRespectsConfigTimeout:
             "flush_memories should not pass explicit timeout to _call_llm; "
             "let _get_task_timeout('flush_memories') resolve from config"
         )
+        assert callable(call_kwargs.kwargs["interrupt_check"])
+        assert call_kwargs.kwargs["interrupt_check"]() is False
 
     def test_fallback_path_uses_config_timeout(self, monkeypatch):
         """When auxiliary client is unavailable and we fall back to direct
@@ -227,6 +229,24 @@ class TestFlushMemoriesUsesAuxiliaryClient:
         # No flush sentinel should remain
         for msg in messages:
             assert "_flush_sentinel" not in msg
+
+    def test_flush_skipped_when_interrupt_requested(self, monkeypatch):
+        """If the agent is already interrupted, flush_memories should bail out immediately."""
+        agent = _make_agent(monkeypatch, api_mode="chat_completions", provider="openrouter")
+        agent._interrupt_requested = True
+
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi"},
+            {"role": "user", "content": "Remember X"},
+        ]
+
+        with patch("agent.auxiliary_client.call_llm") as mock_call, \
+             patch("tools.memory_tool.memory_tool") as mock_memory:
+            agent.flush_memories(messages)
+
+        mock_call.assert_not_called()
+        mock_memory.assert_not_called()
 
 
 class TestFlushMemoriesCodexFallback:

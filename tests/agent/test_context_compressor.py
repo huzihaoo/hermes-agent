@@ -92,6 +92,17 @@ class TestCompress:
         # original content is present in either case.
         assert msgs[-2]["content"] in result[-2]["content"]
 
+    def test_interrupt_skips_compression(self, compressor):
+        msgs = self._make_messages(10)
+        compressor._interrupt_check = lambda: True
+
+        with patch.object(compressor, "_generate_summary") as mock_summary:
+            result = compressor.compress(msgs)
+
+        assert result == msgs
+        assert compressor.compression_count == 0
+        mock_summary.assert_not_called()
+
 
 class TestGenerateSummaryNoneContent:
     """Regression: content=None (from tool-call-only assistant messages) must not crash."""
@@ -221,6 +232,39 @@ class TestNonStringContent:
             "api_key": "codex-token",
             "api_mode": "codex_responses",
         }
+        assert callable(mock_call.call_args.kwargs["interrupt_check"])
+        assert mock_call.call_args.kwargs["interrupt_check"]() is False
+
+    def test_interrupt_skips_summary_call(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        c._interrupt_check = lambda: True
+        messages = [
+            {"role": "user", "content": "do something"},
+            {"role": "assistant", "content": "ok"},
+        ]
+
+        with patch("agent.context_compressor.call_llm") as mock_call:
+            summary = c._generate_summary(messages)
+
+        assert summary is None
+        mock_call.assert_not_called()
+
+    def test_interrupt_error_from_call_is_treated_as_skip(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        messages = [
+            {"role": "user", "content": "do something"},
+            {"role": "assistant", "content": "ok"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", side_effect=InterruptedError):
+            summary = c._generate_summary(messages)
+
+        assert summary is None
+        assert c._summary_failure_cooldown_until == 0.0
 
 
 class TestSummaryFailureCooldown:

@@ -1503,6 +1503,14 @@ class AIAgent:
                 provider=self.provider,
                 api_mode=self.api_mode,
             )
+        try:
+            setattr(
+                self.context_compressor,
+                "_interrupt_check",
+                lambda: bool(getattr(self, "_interrupt_requested", False)),
+            )
+        except Exception:
+            pass
         self.compression_enabled = compression_enabled
 
         # Reject models whose context window is below the minimum required
@@ -6987,6 +6995,13 @@ class AIAgent:
                        None = use config value (flush_min_turns).
                        0 = always flush (used for compression).
         """
+        if self._interrupt_requested:
+            logger.info(
+                "Skipping memory flush because an interrupt was requested "
+                "(session=%s)",
+                self.session_id or "none",
+            )
+            return
         if self._memory_flush_min_turns == 0 and min_turns is None:
             return
         if "memory" not in self.valid_tool_names or not self._memory_store:
@@ -7052,6 +7067,7 @@ class AIAgent:
                     tools=[memory_tool_def],
                     temperature=0.3,
                     max_tokens=5120,
+                    interrupt_check=lambda: bool(self._interrupt_requested),
                     # timeout resolved from auxiliary.flush_memories.timeout config
                 )
             except RuntimeError:

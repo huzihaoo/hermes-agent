@@ -557,6 +557,13 @@ class ContextCompressor(ContextEngine):
         the middle turns without a summary rather than inject a useless
         placeholder.
         """
+        interrupt_check = getattr(self, "_interrupt_check", None)
+        if not callable(interrupt_check):
+            interrupt_check = lambda: False
+        if interrupt_check():
+            logger.info("Skipping context summary generation because interrupt was requested")
+            return None
+
         now = time.monotonic()
         if now < self._summary_failure_cooldown_until:
             logger.debug(
@@ -669,6 +676,9 @@ FOCUS TOPIC: "{focus_topic}"
 The user has requested that this compaction PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget."""
 
         try:
+            if interrupt_check():
+                logger.info("Aborting context summary call because interrupt was requested")
+                return None
             call_kwargs = {
                 "task": "compression",
                 "main_runtime": {
@@ -680,6 +690,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 },
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": int(summary_budget * 1.3),
+                "interrupt_check": interrupt_check,
                 # timeout resolved from auxiliary.compression.timeout config by call_llm
             }
             if self.summary_model:
@@ -695,6 +706,9 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             self._summary_failure_cooldown_until = 0.0
             self._summary_model_fallen_back = False
             return self._with_summary_prefix(summary)
+        except InterruptedError:
+            logger.info("Context summary generation interrupted before auxiliary request completed")
+            return None
         except RuntimeError:
             # No provider configured — long cooldown, unlikely to self-resolve
             self._summary_failure_cooldown_until = time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SECONDS
@@ -943,6 +957,11 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 related to this topic and be more aggressive about compressing
                 everything else.  Inspired by Claude Code's ``/compact``.
         """
+        interrupt_check = getattr(self, "_interrupt_check", None)
+        if callable(interrupt_check) and interrupt_check():
+            logger.info("Skipping context compression because interrupt was requested")
+            return messages
+
         n_messages = len(messages)
         # Only need head + 3 tail messages minimum (token budget decides the real tail size)
         _min_for_compress = self.protect_first_n + 3 + 1
