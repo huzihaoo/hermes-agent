@@ -224,6 +224,38 @@ async def test_thread_id_passed_to_send(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_feishu_topic_marker_passed_to_send(monkeypatch, tmp_path):
+    """Feishu watcher notifications keep topic:<root_message_id> metadata intact."""
+    import tools.process_registry as pr_module
+
+    sessions = [SimpleNamespace(output_buffer="done\n", exited=True, exit_code=0)]
+    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry(sessions))
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    feishu_adapter = SimpleNamespace(send=AsyncMock(), handle_message=AsyncMock())
+    runner.adapters[Platform.FEISHU] = feishu_adapter
+
+    watcher = {
+        "session_id": "proc_feishu_topic",
+        "check_interval": 0,
+        "platform": "feishu",
+        "chat_id": "oc_chat",
+        "thread_id": "topic:om_root",
+    }
+
+    await runner._run_process_watcher(watcher)
+
+    assert feishu_adapter.send.await_count == 1
+    _, kwargs = feishu_adapter.send.call_args
+    assert kwargs["metadata"] == {"thread_id": "topic:om_root"}
+    assert runner.adapters[Platform.TELEGRAM].send.await_count == 0
+
+
+@pytest.mark.asyncio
 async def test_no_thread_id_sends_no_metadata(monkeypatch, tmp_path):
     """When thread_id is empty, metadata should be None (general topic)."""
     import tools.process_registry as pr_module
@@ -302,6 +334,25 @@ def test_build_process_event_source_falls_back_to_session_key_chat_type(monkeypa
     assert source.thread_id == "42"
     assert source.user_id == "123"
     assert source.user_name == "Emiliyan"
+
+
+def test_build_process_event_source_uses_topic_marker_from_session_key(monkeypatch, tmp_path):
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+
+    evt = {
+        "session_id": "proc_watch",
+        "session_key": "agent:main:feishu:group:oc_chat:topic:om_root",
+        "platform": "feishu",
+        "chat_id": "oc_chat",
+    }
+
+    source = runner._build_process_event_source(evt)
+
+    assert source is not None
+    assert source.platform == Platform.FEISHU
+    assert source.chat_id == "oc_chat"
+    assert source.chat_type == "group"
+    assert source.thread_id == "topic:om_root"
 
 
 @pytest.mark.asyncio
@@ -392,6 +443,16 @@ def test_parse_session_key_with_user_id_part():
     """Group keys with per-user isolation have user_id as 6th part — don't return as thread_id."""
     result = _parse_session_key("agent:main:telegram:group:chat1:user99")
     assert result == {"platform": "telegram", "chat_type": "group", "chat_id": "chat1"}
+
+
+def test_parse_session_key_with_group_topic_marker():
+    result = _parse_session_key("agent:main:feishu:group:oc_chat:topic:om_root")
+    assert result == {
+        "platform": "feishu",
+        "chat_type": "group",
+        "chat_id": "oc_chat",
+        "thread_id": "topic:om_root",
+    }
 
 
 def test_parse_session_key_dm_with_thread():

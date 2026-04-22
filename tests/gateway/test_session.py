@@ -760,6 +760,16 @@ class TestWhatsAppDMSessionKeyConsistency:
         key = build_session_key(source)
         assert key == "agent:main:telegram:group:-1002285219667:17585"
 
+    def test_group_topic_marker_is_preserved_in_session_key(self):
+        source = SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="oc_chat",
+            chat_type="group",
+            thread_id="topic:om_root",
+        )
+        key = build_session_key(source)
+        assert key == "agent:main:feishu:group:oc_chat:topic:om_root"
+
     def test_group_thread_sessions_are_shared_by_default(self):
         """Threads default to shared sessions — user_id is NOT appended."""
         alice = SessionSource(

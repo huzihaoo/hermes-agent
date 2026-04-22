@@ -122,6 +122,7 @@ _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _MENTION_RE = re.compile(r"@_user_\d+")
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
 _POST_CONTENT_INVALID_RE = re.compile(r"content format of the post type is incorrect", re.IGNORECASE)
+_FEISHU_TOPIC_THREAD_PREFIX = "topic:"
 # ---------------------------------------------------------------------------
 # Media type sets and upload constants
 # ---------------------------------------------------------------------------
@@ -2188,13 +2189,18 @@ class FeishuAdapter(BasePlatformAdapter):
         chat_id = getattr(message, "chat_id", "") or ""
         chat_info = await self.get_chat_info(chat_id)
         sender_profile = await self._resolve_sender_profile(sender_id)
+        source_chat_type = self._resolve_source_chat_type(chat_info=chat_info, event_chat_type=chat_type)
         source = self.build_source(
             chat_id=chat_id,
             chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
-            chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type=chat_type),
+            chat_type=source_chat_type,
             user_id=sender_profile["user_id"],
             user_name=sender_profile["user_name"],
-            thread_id=getattr(message, "thread_id", None) or None,
+            thread_id=self._resolve_source_thread_id(
+                message=message,
+                message_id=message_id,
+                source_chat_type=source_chat_type,
+            ),
             user_id_alt=sender_profile["user_id_alt"],
         )
         normalized = MessageEvent(
@@ -2910,6 +2916,52 @@ class FeishuAdapter(BasePlatformAdapter):
             return "dm"
         return "group"
 
+    @staticmethod
+    def _build_topic_thread_id(anchor: Optional[str]) -> Optional[str]:
+        normalized = str(anchor or "").strip()
+        if not normalized:
+            return None
+        return f"{_FEISHU_TOPIC_THREAD_PREFIX}{normalized}"
+
+    @staticmethod
+    def _topic_anchor_from_thread_id(thread_id: Optional[str]) -> Optional[str]:
+        normalized = str(thread_id or "").strip()
+        if not normalized.startswith(_FEISHU_TOPIC_THREAD_PREFIX):
+            return None
+        anchor = normalized[len(_FEISHU_TOPIC_THREAD_PREFIX):].strip()
+        return anchor or None
+
+    def _resolve_source_thread_id(
+        self,
+        *,
+        message: Any,
+        message_id: str,
+        source_chat_type: str,
+    ) -> Optional[str]:
+        if source_chat_type == "dm":
+            return getattr(message, "thread_id", None) or None
+        anchor = (
+            getattr(message, "root_id", None)
+            or getattr(message, "upper_message_id", None)
+            or getattr(message, "parent_id", None)
+            or getattr(message, "message_id", None)
+            or message_id
+            or None
+        )
+        return self._build_topic_thread_id(anchor)
+
+    def _resolve_reply_target(
+        self,
+        *,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> tuple[Optional[str], bool]:
+        thread_id = str((metadata or {}).get("thread_id") or "").strip() or None
+        topic_anchor = self._topic_anchor_from_thread_id(thread_id)
+        effective_reply_to = reply_to or topic_anchor
+        reply_in_thread = bool(thread_id)
+        return effective_reply_to, reply_in_thread
+
     async def _resolve_sender_profile(self, sender_id: Any) -> Dict[str, Optional[str]]:
         open_id = getattr(sender_id, "open_id", None) or None
         user_id = getattr(sender_id, "user_id", None) or None
@@ -3272,15 +3324,18 @@ class FeishuAdapter(BasePlatformAdapter):
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
-        reply_in_thread = bool((metadata or {}).get("thread_id"))
-        if reply_to:
+        effective_reply_to, reply_in_thread = self._resolve_reply_target(
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+        if effective_reply_to:
             body = self._build_reply_message_body(
                 content=payload,
                 msg_type=msg_type,
                 reply_in_thread=reply_in_thread,
                 uuid_value=str(uuid.uuid4()),
             )
-            request = self._build_reply_message_request(reply_to, body)
+            request = self._build_reply_message_request(effective_reply_to, body)
             return await asyncio.to_thread(self._client.im.v1.message.reply, request)
 
         body = self._build_create_message_body(

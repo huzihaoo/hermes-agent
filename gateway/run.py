@@ -492,9 +492,9 @@ def _parse_session_key(session_key: str) -> "dict | None":
     optionally ``thread_id`` keys, or None if the key doesn't match.
 
     The 6th element is only returned as ``thread_id`` for chat types where
-    it is unambiguous (``dm`` and ``thread``).  For group/channel sessions
-    the suffix may be a user_id (per-user isolation) rather than a
-    thread_id, so we leave ``thread_id`` out to avoid mis-routing.
+    it is unambiguous (``dm`` and ``thread``).  Group/channel/forum sessions
+    only expose ``thread_id`` when they use the explicit ``:topic:{anchor}``
+    marker, so per-user group keys remain unambiguous.
     """
     parts = session_key.split(":")
     if len(parts) >= 5 and parts[0] == "agent" and parts[1] == "main":
@@ -505,6 +505,8 @@ def _parse_session_key(session_key: str) -> "dict | None":
         }
         if len(parts) > 5 and parts[3] in ("dm", "thread"):
             result["thread_id"] = parts[5]
+        elif len(parts) > 6 and parts[3] in ("group", "channel", "forum") and parts[5] == "topic":
+            result["thread_id"] = f"{parts[5]}:{parts[6]}"
         return result
     return None
 
@@ -7522,6 +7524,7 @@ class GatewayRunner:
         derived_platform = ""
         derived_chat_type = ""
         derived_chat_id = ""
+        derived_thread_id = ""
 
         if session_key:
             try:
@@ -7541,6 +7544,7 @@ class GatewayRunner:
                 derived_platform = _parsed["platform"]
                 derived_chat_type = _parsed["chat_type"]
                 derived_chat_id = _parsed["chat_id"]
+                derived_thread_id = str(_parsed.get("thread_id") or "").strip()
 
         platform_name = str(evt.get("platform") or derived_platform or "").strip().lower()
         chat_type = str(evt.get("chat_type") or derived_chat_type or "").strip().lower()
@@ -7561,7 +7565,7 @@ class GatewayRunner:
             platform=platform,
             chat_id=chat_id,
             chat_type=chat_type,
-            thread_id=str(evt.get("thread_id") or "").strip() or None,
+            thread_id=str(evt.get("thread_id") or derived_thread_id or "").strip() or None,
             user_id=str(evt.get("user_id") or "").strip() or None,
             user_name=str(evt.get("user_name") or "").strip() or None,
         )
