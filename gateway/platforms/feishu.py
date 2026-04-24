@@ -1091,6 +1091,19 @@ class FeishuAdapter(BasePlatformAdapter):
         self._approval_state: Dict[int, Dict[str, str]] = {}
         self._approval_counter = itertools.count(1)
         self._load_seen_message_ids()
+        
+        # Admission control (optional, enabled via config)
+        self._admission_enabled = config.extra.get("admission_control_enabled", False)
+        self._admission_controller: Optional[Any] = None
+        self._queue_worker: Optional[Any] = None
+        if self._admission_enabled:
+            from gateway.admission import AdmissionController
+            from gateway.admission.worker import QueueWorker
+            self._admission_controller = AdmissionController()
+            self._queue_worker = QueueWorker(
+                self._admission_controller,
+                self._process_queue_item
+            )
 
     @staticmethod
     def _load_settings(extra: Dict[str, Any]) -> FeishuAdapterSettings:
@@ -1259,6 +1272,12 @@ class FeishuAdapter(BasePlatformAdapter):
             self._loop = asyncio.get_running_loop()
             await self._connect_with_retry()
             self._mark_connected()
+            
+            # Start admission queue worker if enabled
+            if self._admission_enabled and self._queue_worker:
+                await self._queue_worker.start()
+                logger.info("[admission] Queue worker started")
+            
             logger.info("[Feishu] Connected in %s mode (%s)", self._connection_mode, self._domain_name)
             return True
         except Exception as exc:
@@ -1271,6 +1290,12 @@ class FeishuAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Disconnect from Feishu/Lark."""
         self._running = False
+        
+        # Stop admission queue worker if enabled
+        if self._admission_enabled and self._queue_worker:
+            await self._queue_worker.stop()
+            logger.info("[admission] Queue worker stopped")
+        
         await self._cancel_pending_tasks(self._pending_text_batch_tasks)
         await self._cancel_pending_tasks(self._pending_media_batch_tasks)
         self._reset_batch_buffers()
@@ -2217,8 +2242,68 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         await self._dispatch_inbound_event(normalized)
 
+    # =========================================================================
+    # Admission queue processing
+    # =========================================================================
+
+    async def _process_queue_item(self, item) -> dict:
+        """Process a queue item by reconstructing the event and dispatching it.
+        
+        Called by QueueWorker when an item is dequeued.
+        """
+        try:
+            from gateway.types import MessageEvent, MessageSource, MessageType
+            # Reconstruct event from queue item
+            source = MessageSource(
+                platform=self.platform,
+                user_id=item.user_id,
+                chat_id=item.chat_id or "",
+                thread_id=item.thread_id or "",
+            )
+            event = MessageEvent(
+                source=source,
+                text=item.message,
+                message_type=MessageType.TEXT,
+                message_id=item.id,
+            )
+            await self._handle_message_with_guards(event)
+            return {"status": "completed"}
+        except Exception as exc:
+            logger.error("[admission] Failed to process queue item %s: %s", item.id, exc, exc_info=True)
+            return {"status": "failed", "error": str(exc)}
+
+    # =========================================================================
+    # Message dispatch
+    # =========================================================================
+
     async def _dispatch_inbound_event(self, event: MessageEvent) -> None:
         """Apply Feishu-specific burst protection before entering the base adapter."""
+        # --- Admission gate (optional) ---
+        if self._admission_enabled and self._admission_controller:
+            user_id = event.source.user_id or ""
+            message_text = event.text or ""
+            chat_id = event.source.chat_id or ""
+            thread_id = event.source.thread_id or ""
+            try:
+                admitted, feedback, queue_item = await self._admission_controller.admit(
+                    user_id=user_id,
+                    message=message_text,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    platform="feishu",
+                )
+                if not admitted:
+                    logger.info("[admission] Rejected user=%s: %s", user_id, feedback)
+                    return
+                logger.debug(
+                    "[admission] Admitted user=%s lane=%s pos=%s",
+                    user_id,
+                    queue_item.lane if queue_item else "?",
+                    queue_item.id if queue_item else "?",
+                )
+            except Exception:
+                logger.warning("[admission] Gate error, falling through", exc_info=True)
+
         if event.message_type == MessageType.TEXT and not event.is_command():
             await self._enqueue_text_event(event)
             return

@@ -2708,8 +2708,25 @@ class GatewayRunner:
             return None
         elif not self._is_user_authorized(source):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
-            # In DMs: offer pairing code. In groups: silently ignore.
-            if source.chat_type == "dm" and self._get_unauthorized_dm_behavior(source.platform) == "pair":
+            # In DMs: offer pairing code. In groups: reply with a short rejection.
+            if source.chat_type != "dm":
+                # Group chat: send a brief unauthorized notice (rate-limited per user)
+                _unauth_rl_key = f"unauth_group:{source.platform.value}:{source.user_id}"
+                _now = __import__("time").time()
+                _last = getattr(self, "_unauth_group_ts", {}).get(_unauth_rl_key, 0)
+                if _now - _last > 60:  # at most once per 60s per user
+                    if not hasattr(self, "_unauth_group_ts"):
+                        self._unauth_group_ts = {}
+                    self._unauth_group_ts[_unauth_rl_key] = _now
+                    adapter = self.adapters.get(source.platform)
+                    if adapter:
+                        await adapter.send(
+                            source.chat_id,
+                            "抱歉，你还没有使用权限，请联系管理员开通。",
+                            thread_id=getattr(source, "thread_id", None),
+                        )
+                return None
+            if self._get_unauthorized_dm_behavior(source.platform) == "pair":
                 platform_name = source.platform.value if source.platform else "unknown"
                 # Rate-limit ALL pairing responses (code or rejection) to
                 # prevent spamming the user with repeated messages when

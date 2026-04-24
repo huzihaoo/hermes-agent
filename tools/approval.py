@@ -610,6 +610,31 @@ def check_dangerous_command(command: str, env_type: str,
     if not is_dangerous:
         return {"approved": True, "message": None}
 
+    # Permission policy: check user role before approval
+    try:
+        from tools.permission_policy import get_decision_by_id
+        from gateway.session_context import get_session_env
+        
+        user_id = get_session_env("HERMES_USER_ID")
+        if user_id:
+            decision = get_decision_by_id(user_id, command)
+            if decision == "ALLOW":
+                logger.debug("Permission policy: ALLOW for user %s, command %s", user_id, command[:60])
+                return {"approved": True, "message": None}
+            elif decision == "DENY":
+                logger.warning("Permission policy: DENY for user %s, command %s", user_id, command[:60])
+                return {
+                    "approved": False,
+                    "message": "❌ 权限不足，无法执行此操作。",
+                    "pattern_key": pattern_key,
+                    "description": description,
+                }
+            # decision == "APPROVE" or "CONFIRM" -> continue to approval flow
+            logger.debug("Permission policy: %s for user %s, command %s", decision, user_id, command[:60])
+    except Exception as e:
+        logger.debug("Permission policy check failed (non-fatal): %s", e)
+        # Fall through to original approval flow on error
+
     session_key = get_current_session_key()
     if is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
