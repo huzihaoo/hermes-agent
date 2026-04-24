@@ -68,9 +68,15 @@ class AdmissionController:
     ):
         self._db_path = db_path or (Path.home() / ".hermes" / "admission" / "queue.db")
         self._audit_dir = audit_dir or (Path.home() / ".hermes" / "audit")
+        
+        # Ensure directories exist
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._audit_dir.mkdir(parents=True, exist_ok=True)
+        
         self.queue = AdmissionQueue(db_path=self._db_path)
         try:
             self.queue.load()
+            logger.info("[admission] Loaded queue from %s", self._db_path)
         except Exception as exc:
             logger.warning("[admission] Failed to load persisted queue: %s", exc)
         
@@ -81,6 +87,9 @@ class AdmissionController:
             "total_completed": 0,
             "total_failed": 0,
         }
+        
+        logger.info("[admission] Controller initialized (db=%s, audit=%s)", 
+                   self._db_path, self._audit_dir)
 
     # ------------------------------------------------------------------
     # Public API

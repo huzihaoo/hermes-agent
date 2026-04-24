@@ -76,17 +76,21 @@ class QueueWorker:
                 if item:
                     logger.info(f"[worker] Processing {item.id} from {lane} lane (user={item.user_id})")
                     
+                    start_time = asyncio.get_event_loop().time()
                     try:
                         # Process the item
                         result = await self._process_fn(item)
                         
                         # Mark as completed
+                        elapsed = asyncio.get_event_loop().time() - start_time
+                        result["processing_time_seconds"] = round(elapsed, 2)
                         self._admission.complete(item.id, result)
-                        logger.info(f"[worker] Completed {item.id}")
+                        logger.info(f"[worker] Completed {item.id} in {elapsed:.2f}s")
                         
                     except Exception as e:
                         # Mark as failed
-                        logger.error(f"[worker] Failed to process {item.id}: {e}", exc_info=True)
+                        elapsed = asyncio.get_event_loop().time() - start_time
+                        logger.error(f"[worker] Failed to process {item.id} after {elapsed:.2f}s: {e}", exc_info=True)
                         self._admission.fail(item.id, str(e))
                 else:
                     # No items in queue, wait before checking again

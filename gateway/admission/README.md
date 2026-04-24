@@ -4,6 +4,51 @@
 
 多用户/多群组并发消息的准入控制与排队系统。消息按类型分入不同车道（lane），车道间并发处理，车道内 FIFO 串行。
 
+## 快速开始
+
+### 1. 启用准入控制
+
+编辑 `~/.hermes/config.yaml`：
+
+```yaml
+platforms:
+  feishu:
+    extra:
+      admission_control_enabled: true
+```
+
+### 2. 启动 Gateway
+
+```bash
+cd ~/.hermes/hermes-agent
+python -m gateway.run
+```
+
+启动日志会显示：
+```
+[admission] Controller initialized (db=..., audit=...)
+[admission] Queue worker started
+```
+
+### 3. 查看队列状态
+
+```bash
+# 人类可读格式
+python -m gateway.admission.cli status
+
+# JSON 格式
+python -m gateway.admission.cli status --json
+```
+
+### 4. 测试
+
+发送 Feishu 消息，观察日志：
+```
+[admission] Admitted user=xxx lane=standard pos=1
+[worker] Processing xxx from standard lane
+[worker] Completed xxx in 2.34s
+```
+
 ## 架构
 
 ```
@@ -106,3 +151,48 @@ pytest tests/gateway/test_admission*.py tests/gateway/test_queue*.py tests/gatew
 3. **错误降级**：准入检查失败时 fall-through 到原始处理流程，不阻塞消息。
 
 4. **SQLite 而非 Redis**：单机部署场景，SQLite 足够且零依赖。分布式场景可替换为 Redis。
+
+## 故障排查
+
+### 队列卡住不处理
+
+```bash
+# 检查队列状态
+python -m gateway.admission.cli status
+
+# 检查 worker 是否启动
+grep "Queue worker started" ~/.hermes/logs/gateway.log
+
+# 清空队列（测试用）
+python -m gateway.admission.cli clear
+```
+
+### 消息被拒绝
+
+检查审计日志：
+```bash
+tail -f ~/.hermes/audit/$(date +%Y-%m-%d).jsonl | jq .
+```
+
+查找 `"result": "denied"` 的记录。
+
+### 性能问题
+
+查看处理时间：
+```bash
+grep "Completed.*in" ~/.hermes/logs/gateway.log | tail -20
+```
+
+如果某个车道处理时间过长，考虑：
+- 调整车道分类逻辑（`controller.py` 中的 `_classify_lane`）
+- 增加该车道的 worker 数量（需修改 `worker.py`）
+
+## CLI 工具
+
+```bash
+# 查看状态
+python -m gateway.admission.cli status [--json]
+
+# 清空队列（仅测试用）
+python -m gateway.admission.cli clear [fast|standard|heavy]
+```
