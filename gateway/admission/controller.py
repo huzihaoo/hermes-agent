@@ -73,6 +73,14 @@ class AdmissionController:
             self.queue.load()
         except Exception as exc:
             logger.warning("[admission] Failed to load persisted queue: %s", exc)
+        
+        # Metrics
+        self._metrics = {
+            "total_admitted": 0,
+            "total_rejected": 0,
+            "total_completed": 0,
+            "total_failed": 0,
+        }
 
     # ------------------------------------------------------------------
     # Public API
@@ -108,6 +116,7 @@ class AdmissionController:
 
         self.queue.enqueue(item)
         self._save_quiet()
+        self._metrics["total_admitted"] += 1
 
         pos = self.queue.get_position(item.id)
         pos_text = f"，排队 {pos[1]} 位" if pos and pos[1] > 1 else ""
@@ -135,11 +144,48 @@ class AdmissionController:
         self.queue.mark_completed(item_id, result)
         self._audit("complete", item_id, "completed", result)
         self._save_quiet()
+        self._metrics["total_completed"] += 1
 
     def fail(self, item_id: str, error: str | None = None) -> None:
         self.queue.mark_failed(item_id, error)
         self._audit("fail", item_id, "failed", {"error": error})
         self._save_quiet()
+        self._metrics["total_failed"] += 1
+
+    # ------------------------------------------------------------------
+    # Queue visibility
+    # ------------------------------------------------------------------
+
+    def get_status(self) -> dict:
+        """Get current queue status for all lanes.
+        
+        Returns:
+            {
+                "fast": {"pending": N, "items": [...]},
+                "standard": {"pending": N, "items": [...]},
+                "heavy": {"pending": N, "items": [...]},
+                "metrics": {"total_admitted": N, ...}
+            }
+        """
+        status = {}
+        for lane in ["fast", "standard", "heavy"]:
+            items = self.queue.list_pending(lane)
+            status[lane] = {
+                "pending": len(items),
+                "items": [
+                    {
+                        "id": item.id,
+                        "user_id": item.user_id,
+                        "user_role": item.user_role,
+                        "priority": item.priority,
+                        "message_preview": item.message[:50] + "..." if len(item.message) > 50 else item.message,
+                        "created_at": item.created_at.isoformat(),
+                    }
+                    for item in items[:5]  # Only show first 5 per lane
+                ]
+            }
+        status["metrics"] = self._metrics.copy()
+        return status
 
     # ------------------------------------------------------------------
     # Internals
