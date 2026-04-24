@@ -88,6 +88,10 @@ class AdmissionController:
             "total_failed": 0,
         }
         
+        # Queue depth thresholds for warnings
+        self._depth_warning_threshold = 10
+        self._depth_critical_threshold = 50
+        
         logger.info("[admission] Controller initialized (db=%s, audit=%s)", 
                    self._db_path, self._audit_dir)
 
@@ -129,6 +133,9 @@ class AdmissionController:
 
         pos = self.queue.get_position(item.id)
         pos_text = f"，排队 {pos[1]} 位" if pos and pos[1] > 1 else ""
+        
+        # Check queue depth and log warnings
+        self._check_queue_depth(lane)
 
         self._audit("enqueue", item.id, "queued", {
             "role": role,
@@ -199,6 +206,21 @@ class AdmissionController:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    def _check_queue_depth(self, lane: Lane) -> None:
+        """Check queue depth and log warnings if thresholds exceeded."""
+        depth = self.queue.pending_count(lane)
+        
+        if depth >= self._depth_critical_threshold:
+            logger.error(
+                "[admission] CRITICAL: %s lane depth=%d (threshold=%d)",
+                lane, depth, self._depth_critical_threshold
+            )
+        elif depth >= self._depth_warning_threshold:
+            logger.warning(
+                "[admission] WARNING: %s lane depth=%d (threshold=%d)",
+                lane, depth, self._depth_warning_threshold
+            )
 
     def _audit(self, action: str, resource: str, result: str, metadata: dict | None = None) -> None:
         try:

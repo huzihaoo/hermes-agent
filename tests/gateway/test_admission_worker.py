@@ -36,7 +36,7 @@ async def test_worker_start_stop():
         worker = QueueWorker(ctrl, noop)
         await worker.start()
         assert worker._running is True
-        assert len(worker._tasks) == 3  # one per lane
+        assert len(worker._tasks) == 4  # 3 lanes + 1 cleanup
 
         await worker.stop()
         assert worker._running is False
@@ -55,7 +55,7 @@ async def test_worker_double_start_is_noop():
         worker = QueueWorker(ctrl, noop)
         await worker.start()
         await worker.start()  # should warn and return
-        assert len(worker._tasks) == 3
+        assert len(worker._tasks) == 4  # 3 lanes + 1 cleanup
         await worker.stop()
 
 

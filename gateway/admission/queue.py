@@ -105,6 +105,29 @@ class AdmissionQueue:
             for lane_items in self._lanes.values():
                 result.extend(lane_items)
             return result
+    
+    def cleanup_old_items(self, max_age_hours: int = 24) -> int:
+        """Remove completed/failed items older than max_age_hours.
+        
+        Returns number of items removed.
+        """
+        from datetime import datetime, timedelta
+        
+        cutoff = datetime.now() - timedelta(hours=max_age_hours)
+        removed = 0
+        
+        with self._lock:
+            to_remove = []
+            for item_id, item in self._items_by_id.items():
+                if item.status in ("completed", "failed", "cancelled"):
+                    if item.completed_at and item.completed_at < cutoff:
+                        to_remove.append(item_id)
+            
+            for item_id in to_remove:
+                del self._items_by_id[item_id]
+                removed += 1
+        
+        return removed
 
     # ------------------------------------------------------------------
     # Persistence (optional — wired in Task 2)

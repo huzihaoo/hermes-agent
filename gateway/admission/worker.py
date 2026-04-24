@@ -30,6 +30,7 @@ class QueueWorker:
         self._process_fn = process_fn
         self._running = False
         self._tasks: list[asyncio.Task] = []
+        self._cleanup_interval_hours = 6  # Cleanup every 6 hours
 
     async def start(self) -> None:
         """Start worker loops for all lanes."""
@@ -45,6 +46,7 @@ class QueueWorker:
             asyncio.create_task(self._worker_loop("fast")),
             asyncio.create_task(self._worker_loop("standard")),
             asyncio.create_task(self._worker_loop("heavy")),
+            asyncio.create_task(self._cleanup_loop()),
         ]
 
     async def stop(self) -> None:
@@ -104,3 +106,30 @@ class QueueWorker:
                 await asyncio.sleep(5)  # Back off on errors
 
         logger.info(f"[worker] Stopped {lane} lane worker")
+    
+    async def _cleanup_loop(self) -> None:
+        """Periodic cleanup of old completed items."""
+        logger.info("[worker] Started cleanup loop")
+        
+        while self._running:
+            try:
+                # Wait for cleanup interval
+                await asyncio.sleep(self._cleanup_interval_hours * 3600)
+                
+                if not self._running:
+                    break
+                
+                # Cleanup items older than 24 hours
+                removed = self._admission.queue.cleanup_old_items(max_age_hours=24)
+                if removed > 0:
+                    logger.info(f"[worker] Cleaned up {removed} old items")
+                    self._admission.queue.save()
+                    
+            except asyncio.CancelledError:
+                logger.info("[worker] Cleanup loop cancelled")
+                break
+            except Exception as e:
+                logger.error(f"[worker] Cleanup error: {e}", exc_info=True)
+                await asyncio.sleep(3600)  # Retry in 1 hour on error
+        
+        logger.info("[worker] Stopped cleanup loop")

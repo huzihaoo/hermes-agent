@@ -99,6 +99,30 @@ Feishu Message
 | admin | 50 | 管理员 |
 | member | 10 | 普通成员（默认） |
 
+角色通过 `tools/permission_policy.py` 解析，配置文件：`~/.hermes/config/user-roles.json`
+
+### 配置用户角色
+
+编辑 `~/.hermes/config/user-roles.json`：
+
+```json
+{
+  "users": {
+    "default": "member",
+    "张三": "owner",
+    "李四": "admin"
+  },
+  "user_id_mapping": {
+    "ou_abc123": "张三",
+    "ou_def456": "李四"
+  }
+}
+```
+
+- `users`：display_name → role 映射
+- `user_id_mapping`：user_id (如 Feishu open_id) → display_name 映射
+- `default`：未配置用户的默认角色
+
 ## 启用方式
 
 在 `config.yaml` 中：
