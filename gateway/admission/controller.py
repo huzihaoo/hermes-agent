@@ -94,6 +94,46 @@ class AdmissionController:
         
         logger.info("[admission] Controller initialized (db=%s, audit=%s)", 
                    self._db_path, self._audit_dir)
+    
+    def validate_config(self) -> tuple[bool, list[str]]:
+        """Validate admission control configuration.
+        
+        Returns:
+            (is_valid, error_messages)
+        """
+        errors = []
+        
+        # Check database path is writable
+        try:
+            self._db_path.parent.mkdir(parents=True, exist_ok=True)
+            test_file = self._db_path.parent / ".write_test"
+            test_file.touch()
+            test_file.unlink()
+        except Exception as e:
+            errors.append(f"Database path not writable: {e}")
+        
+        # Check audit directory is writable
+        try:
+            self._audit_dir.mkdir(parents=True, exist_ok=True)
+            test_file = self._audit_dir / ".write_test"
+            test_file.touch()
+            test_file.unlink()
+        except Exception as e:
+            errors.append(f"Audit directory not writable: {e}")
+        
+        # Check permission policy is loadable
+        try:
+            from tools.permission_policy import get_user_role_by_id
+            # Try to get default role
+            role = get_user_role_by_id("test_user")
+            if role not in ("owner", "admin", "senior", "member"):
+                errors.append(f"Invalid default role: {role}")
+        except FileNotFoundError:
+            errors.append("Permission policy config not found: ~/.hermes/config/user-roles.json")
+        except Exception as e:
+            errors.append(f"Permission policy error: {e}")
+        
+        return (len(errors) == 0, errors)
 
     # ------------------------------------------------------------------
     # Public API
@@ -202,6 +242,32 @@ class AdmissionController:
             }
         status["metrics"] = self._metrics.copy()
         return status
+    
+    def format_status_text(self) -> str:
+        """Format queue status as human-readable text for chat display."""
+        status = self.get_status()
+        
+        lines = ["📊 队列状态", ""]
+        
+        # Lane status
+        for lane in ["fast", "standard", "heavy"]:
+            lane_data = status[lane]
+            emoji = {"fast": "⚡", "standard": "📝", "heavy": "🔨"}[lane]
+            lines.append(f"{emoji} {lane.upper()}: {lane_data['pending']} 排队")
+            
+            if lane_data["items"]:
+                for item in lane_data["items"][:3]:  # Show top 3
+                    lines.append(f"  • {item['user_id']} (优先级 {item['priority']})")
+        
+        # Metrics
+        lines.append("")
+        lines.append("📈 统计")
+        m = status["metrics"]
+        lines.append(f"  已处理: {m['total_completed']}")
+        lines.append(f"  失败: {m['total_failed']}")
+        lines.append(f"  总准入: {m['total_admitted']}")
+        
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Internals

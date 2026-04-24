@@ -70,6 +70,38 @@ def cmd_clear(args):
         print(f"Cleared {total} items from all lanes")
 
 
+def cmd_stats(args):
+    """Show metrics and statistics."""
+    ctrl = AdmissionController()
+    status = ctrl.get_status()
+    
+    print("=== Admission Control Statistics ===\n")
+    
+    metrics = status["metrics"]
+    total = metrics["total_admitted"]
+    completed = metrics["total_completed"]
+    failed = metrics["total_failed"]
+    
+    print(f"Total admitted:  {total}")
+    print(f"Total completed: {completed}")
+    print(f"Total failed:    {failed}")
+    
+    if total > 0:
+        success_rate = (completed / total) * 100
+        failure_rate = (failed / total) * 100
+        print(f"\nSuccess rate: {success_rate:.1f}%")
+        print(f"Failure rate: {failure_rate:.1f}%")
+    
+    # Current queue depth
+    print("\n=== Current Queue Depth ===")
+    for lane in ["fast", "standard", "heavy"]:
+        depth = status[lane]["pending"]
+        print(f"{lane.capitalize()}: {depth}")
+    
+    total_pending = sum(status[lane]["pending"] for lane in ["fast", "standard", "heavy"])
+    print(f"Total pending: {total_pending}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Admission queue CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -84,6 +116,10 @@ def main():
     clear_parser.add_argument("lane", nargs="?", choices=["fast", "standard", "heavy"],
                              help="Lane to clear (omit to clear all)")
     clear_parser.set_defaults(func=cmd_clear)
+    
+    # stats command
+    stats_parser = subparsers.add_parser("stats", help="Show metrics and statistics")
+    stats_parser.set_defaults(func=cmd_stats)
     
     args = parser.parse_args()
     

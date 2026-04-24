@@ -1100,10 +1100,22 @@ class FeishuAdapter(BasePlatformAdapter):
             from gateway.admission import AdmissionController
             from gateway.admission.worker import QueueWorker
             self._admission_controller = AdmissionController()
-            self._queue_worker = QueueWorker(
-                self._admission_controller,
-                self._process_queue_item
-            )
+            
+            # Validate configuration
+            is_valid, errors = self._admission_controller.validate_config()
+            if not is_valid:
+                logger.error("[admission] Configuration validation failed:")
+                for error in errors:
+                    logger.error("[admission]   - %s", error)
+                logger.warning("[admission] Continuing with admission control disabled")
+                self._admission_enabled = False
+                self._admission_controller = None
+            else:
+                self._queue_worker = QueueWorker(
+                    self._admission_controller,
+                    self._process_queue_item
+                )
+                logger.info("[admission] Configuration validated successfully")
 
     @staticmethod
     def _load_settings(extra: Dict[str, Any]) -> FeishuAdapterSettings:
