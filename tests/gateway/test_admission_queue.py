@@ -1,16 +1,16 @@
-"""Tests for the admission queue."""
+"""Tests for the admission queue with domain isolation."""
 
 import sys
 from pathlib import Path
 
-# Ensure repo root is importable
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from gateway.admission.queue import AdmissionQueue
 from gateway.admission.types import QueueItem
 
 
-def _make_item(id: str, role: str = "member", lane: str = "standard", priority: int = 10, **kw):
+def _make_item(id: str, role: str = "member", lane: str = "standard",
+               priority: int = 10, domain: str = "user", domain_id: str = "", **kw):
     return QueueItem(
         id=id,
         user_id=f"u-{id}",
@@ -18,6 +18,8 @@ def _make_item(id: str, role: str = "member", lane: str = "standard", priority: 
         message=f"msg-{id}",
         lane=lane,
         priority=priority,
+        domain=domain,
+        domain_id=domain_id or f"u-{id}",
         **kw,
     )
 
@@ -78,15 +80,81 @@ def test_lanes_are_isolated():
 
 
 # ------------------------------------------------------------------
+# Domain isolation
+# ------------------------------------------------------------------
+
+def test_domains_are_isolated():
+    """Items in different domains don't interfere."""
+    q = AdmissionQueue()
+    q.enqueue(_make_item("u1", domain="user", domain_id="user-1"))
+    q.enqueue(_make_item("g1", domain="group", domain_id="group-1"))
+    q.enqueue(_make_item("v1", domain="vm", domain_id="vm-1"))
+
+    # Dequeue from user domain only
+    out = q.dequeue("standard", domain="user")
+    assert out is not None
+    assert out.id == "u1"
+
+    # Group and VM still have their items
+    assert q.pending_count(domain="group") == 1
+    assert q.pending_count(domain="vm") == 1
+
+    # Dequeue from group
+    out_g = q.dequeue("standard", domain="group")
+    assert out_g.id == "g1"
+
+    # Dequeue from vm
+    out_v = q.dequeue("standard", domain="vm")
+    assert out_v.id == "v1"
+
+
+def test_cross_domain_dequeue_picks_highest_priority():
+    """Without domain filter, dequeue picks highest priority across domains."""
+    q = AdmissionQueue()
+    q.enqueue(_make_item("low", domain="user", priority=10))
+    q.enqueue(_make_item("high", domain="group", priority=100))
+
+    out = q.dequeue("standard")  # no domain filter
+    assert out.id == "high"
+
+
+def test_pending_count_by_domain():
+    q = AdmissionQueue()
+    q.enqueue(_make_item("a", domain="user", lane="fast"))
+    q.enqueue(_make_item("b", domain="user", lane="standard"))
+    q.enqueue(_make_item("c", domain="group", lane="standard"))
+
+    assert q.pending_count() == 3
+    assert q.pending_count(domain="user") == 2
+    assert q.pending_count(domain="group") == 1
+    assert q.pending_count(domain="vm") == 0
+    assert q.pending_count(lane="standard") == 2
+    assert q.pending_count(lane="standard", domain="user") == 1
+
+
+def test_list_pending_by_domain():
+    q = AdmissionQueue()
+    q.enqueue(_make_item("a", domain="user"))
+    q.enqueue(_make_item("b", domain="group"))
+
+    user_items = q.list_pending(domain="user")
+    assert len(user_items) == 1
+    assert user_items[0].id == "a"
+
+    all_items = q.list_pending()
+    assert len(all_items) == 2
+
+
+# ------------------------------------------------------------------
 # Position tracking
 # ------------------------------------------------------------------
 
 def test_get_position():
     q = AdmissionQueue()
-    q.enqueue(_make_item("a", priority=10))
-    q.enqueue(_make_item("b", priority=100))
+    # Same domain_id so they share a sub-queue
+    q.enqueue(_make_item("a", priority=10, domain_id="shared"))
+    q.enqueue(_make_item("b", priority=100, domain_id="shared"))
 
-    # b has higher priority → position 1
     pos_b = q.get_position("b")
     assert pos_b == ("standard", 1)
 
@@ -94,12 +162,20 @@ def test_get_position():
     assert pos_a == ("standard", 2)
 
 
+def test_get_position_different_domain_ids():
+    """Items with different domain_ids each get position 1."""
+    q = AdmissionQueue()
+    q.enqueue(_make_item("a", priority=10, domain_id="did-a"))
+    q.enqueue(_make_item("b", priority=100, domain_id="did-b"))
+
+    assert q.get_position("a") == ("standard", 1)
+    assert q.get_position("b") == ("standard", 1)
+
+
 def test_get_position_after_dequeue():
     q = AdmissionQueue()
     q.enqueue(_make_item("a", priority=10))
     q.dequeue("standard")
-
-    # No longer queued
     assert q.get_position("a") is None
 
 

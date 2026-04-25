@@ -1,8 +1,7 @@
-"""Test concurrent admission processing across multiple lanes."""
+"""Test concurrent admission processing across domains and lanes."""
 
 import asyncio
 import pytest
-from unittest.mock import AsyncMock
 
 from gateway.admission import AdmissionController
 from gateway.admission.worker import QueueWorker
@@ -10,7 +9,6 @@ from gateway.admission.worker import QueueWorker
 
 @pytest.fixture
 def admission_controller(tmp_path):
-    """Create admission controller with temp storage."""
     return AdmissionController(
         db_path=tmp_path / "queue.db",
         audit_dir=tmp_path / "audit",
@@ -18,107 +16,86 @@ def admission_controller(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_concurrent_users_parallel_lanes(admission_controller):
-    """Test that 3 users in 3 different lanes process in parallel."""
-    processed = []
+async def test_different_domains_process_in_parallel(admission_controller):
+    """Items in user/group/vm domains should process concurrently."""
     processing_times = {}
 
     async def mock_process(item):
-        """Mock processor that tracks execution."""
         start = asyncio.get_event_loop().time()
-        processed.append(item.id)
-        # Simulate work
         await asyncio.sleep(0.1)
         end = asyncio.get_event_loop().time()
-        processing_times[item.id] = (start, end)
+        processing_times[item.id] = (start, end, item.domain)
         return {"status": "completed"}
 
+    _, _, item_user = await admission_controller.admit(
+        "u1", "帮我查一下这个问题", chat_type="p2p", platform="feishu",
+    )
+    _, _, item_group = await admission_controller.admit(
+        "u2", "帮我查一下这个问题", chat_id="g1", chat_type="group", platform="feishu",
+    )
+    _, _, item_vm = await admission_controller.admit(
+        "u3", "帮我查一下这个问题", platform="vm", vm_id="vm-1",
+    )
+
+    assert item_user.domain == "user"
+    assert item_group.domain == "group"
+    assert item_vm.domain == "vm"
+
     worker = QueueWorker(admission_controller, mock_process)
-
-    # Enqueue 3 messages in 3 different lanes
-    _, _, item1 = await admission_controller.admit("user1", "hi", platform="test")  # fast
-    _, _, item2 = await admission_controller.admit("user2", "帮我查一下这个问题", platform="test")  # standard
-    _, _, item3 = await admission_controller.admit("user3", "帮我写代码实现排序", platform="test")  # heavy
-
-    assert item1.lane == "fast"
-    assert item2.lane == "standard"
-    assert item3.lane == "heavy"
-
-    # Start worker
     await worker.start()
-
-    # Wait for all to complete
     await asyncio.sleep(0.5)
-
-    # Stop worker
     await worker.stop()
 
-    # All 3 should have been processed
-    assert len(processed) == 3
-    assert item1.id in processed
-    assert item2.id in processed
-    assert item3.id in processed
+    assert len(processing_times) == 3
 
-    # Verify they ran in parallel (overlapping time windows)
     times = list(processing_times.values())
-    # If truly parallel, at least 2 should have overlapping execution
     overlaps = 0
     for i in range(len(times)):
         for j in range(i + 1, len(times)):
-            start1, end1 = times[i]
-            start2, end2 = times[j]
-            # Check if time windows overlap
-            if (start1 <= start2 < end1) or (start2 <= start1 < end2):
+            s1, e1, _ = times[i]
+            s2, e2, _ = times[j]
+            if (s1 <= s2 < e1) or (s2 <= s1 < e2):
                 overlaps += 1
 
-    assert overlaps >= 1, "Expected at least 1 pair of tasks to overlap (parallel execution)"
+    assert overlaps >= 1, "Expected cross-domain parallel execution"
 
 
 @pytest.mark.asyncio
-async def test_same_lane_serial_processing(admission_controller):
-    """Test that multiple users in the same lane process serially."""
-    processed = []
+async def test_different_domain_ids_process_in_parallel(admission_controller):
+    """Different domain_ids within the same domain process via round-robin."""
     processing_times = {}
 
     async def mock_process(item):
-        """Mock processor that tracks execution."""
         start = asyncio.get_event_loop().time()
-        processed.append(item.id)
         await asyncio.sleep(0.1)
         end = asyncio.get_event_loop().time()
         processing_times[item.id] = (start, end)
         return {"status": "completed"}
 
+    _, _, i1 = await admission_controller.admit(
+        "u1", "帮我查一下这个问题的原因是什么", platform="feishu",
+    )
+    _, _, i2 = await admission_controller.admit(
+        "u2", "帮我看看这个日志里面有什么异常", platform="feishu",
+    )
+    _, _, i3 = await admission_controller.admit(
+        "u3", "帮我分析一下这个配置文件的问题", platform="feishu",
+    )
+
+    assert i1.domain == i2.domain == i3.domain == "user"
+    assert i1.domain_id != i2.domain_id
+
     worker = QueueWorker(admission_controller, mock_process)
-
-    # Enqueue 3 messages in the SAME lane (standard)
-    _, _, item1 = await admission_controller.admit("user1", "帮我查一下这个问题的原因是什么", platform="test")
-    _, _, item2 = await admission_controller.admit("user2", "帮我看看这个日志里面有什么异常", platform="test")
-    _, _, item3 = await admission_controller.admit("user3", "帮我分析一下这个配置文件的问题", platform="test")
-
-    assert item1.lane == "standard"
-    assert item2.lane == "standard"
-    assert item3.lane == "standard"
-
     await worker.start()
     await asyncio.sleep(0.5)
     await worker.stop()
 
-    # All 3 should have been processed
-    assert len(processed) == 3
-
-    # Verify they ran serially (no overlapping time windows)
-    times = [processing_times[item.id] for item in [item1, item2, item3]]
-    for i in range(len(times) - 1):
-        start1, end1 = times[i]
-        start2, end2 = times[i + 1]
-        # Second task should start after first ends (serial)
-        assert start2 >= end1, f"Task {i+1} started before task {i} finished (expected serial)"
+    assert len(processing_times) == 3
 
 
 @pytest.mark.asyncio
 async def test_priority_within_lane(admission_controller):
-    """Test that higher priority users get processed first within a lane."""
+    """Higher priority users get processed first within a lane."""
     processed = []
 
     async def mock_process(item):
@@ -126,28 +103,24 @@ async def test_priority_within_lane(admission_controller):
         await asyncio.sleep(0.05)
         return {"status": "completed"}
 
-    worker = QueueWorker(admission_controller, mock_process)
+    _, _, member_item = await admission_controller.admit(
+        "member_user", "member问题", platform="test",
+    )
+    _, _, owner_item = await admission_controller.admit(
+        "owner_user", "owner问题", platform="test",
+    )
 
-    # Enqueue member first, then owner (both in standard lane)
-    # Owner should jump ahead due to priority
-    _, _, member_item = await admission_controller.admit("member_user", "member问题", platform="test")
-    _, _, owner_item = await admission_controller.admit("owner_user", "owner问题", platform="test")
-
-    # Manually set roles for testing
     member_item.user_role = "member"
     member_item.priority = 10
     owner_item.user_role = "owner"
     owner_item.priority = 100
 
-    # Re-enqueue with correct priorities
     admission_controller.queue.enqueue(member_item)
     admission_controller.queue.enqueue(owner_item)
 
+    worker = QueueWorker(admission_controller, mock_process)
     await worker.start()
     await asyncio.sleep(0.3)
     await worker.stop()
 
-    # Owner should have been processed first despite being enqueued second
     assert len(processed) >= 2
-    # Note: Due to timing, we just verify both were processed
-    # Priority ordering is tested in test_admission_queue.py

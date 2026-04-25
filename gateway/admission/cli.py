@@ -3,42 +3,59 @@
 
 Usage:
     python -m gateway.admission.cli status
+    python -m gateway.admission.cli status --domain user
+    python -m gateway.admission.cli status --domain-id alice
     python -m gateway.admission.cli clear [lane]
 """
 
 import argparse
 import json
 import sys
-from pathlib import Path
 
 from gateway.admission import AdmissionController
+from gateway.admission.types import ALL_DOMAINS, ALL_LANES
 
 
 def cmd_status(args):
     """Show current queue status."""
     ctrl = AdmissionController()
-    status = ctrl.get_status()
-    
+    domain = args.domain if hasattr(args, "domain") else None
+    domain_id = args.domain_id if hasattr(args, "domain_id") else None
+    status = ctrl.get_status(domain=domain, domain_id=domain_id)
+
     if args.json:
         print(json.dumps(status, indent=2, ensure_ascii=False))
         return
-    
-    # Human-readable output
+
     print("=== Admission Queue Status ===\n")
-    
-    for lane in ["fast", "standard", "heavy"]:
-        lane_data = status[lane]
-        print(f"[{lane.upper()}] {lane_data['pending']} pending")
-        
-        if lane_data["items"]:
-            for item in lane_data["items"]:
-                print(f"  - {item['user_id']} ({item['user_role']}, pri={item['priority']})")
-                print(f"    {item['message_preview']}")
-                print(f"    created: {item['created_at']}")
-        else:
-            print("  (empty)")
+
+    domain_emoji = {"user": "👤", "group": "👥", "vm": "🖥️"}
+    lane_emoji = {"fast": "⚡", "standard": "📝", "heavy": "🔨"}
+
+    for d in ALL_DOMAINS:
+        if d not in status:
+            continue
+        d_data = status[d]
+        d_total = sum(
+            lane_info["pending"]
+            for did_data in d_data.values()
+            for lane_info in did_data.values()
+        )
+        print(f"{domain_emoji[d]} {d.upper()} ({d_total} pending)")
+
+        for did, did_data in sorted(d_data.items()):
+            did_total = sum(v["pending"] for v in did_data.values())
+            print(f"  📌 {did} ({did_total})")
+            for lane in ALL_LANES:
+                if lane not in did_data:
+                    continue
+                l_data = did_data[lane]
+                print(f"    {lane_emoji[lane]} {lane}: {l_data['pending']}")
+                for item in l_data["items"]:
+                    print(f"      - {item['user_id']} ({item['user_role']}, pri={item['priority']})")
+                    print(f"        {item['message_preview']}")
         print()
-    
+
     metrics = status["metrics"]
     print("=== Metrics ===")
     print(f"Total admitted:  {metrics['total_admitted']}")
@@ -50,79 +67,35 @@ def cmd_status(args):
 def cmd_clear(args):
     """Clear queue (for testing/debugging)."""
     ctrl = AdmissionController()
-    
-    if args.lane:
-        # Clear specific lane
-        items = ctrl.queue.list_pending(args.lane)
-        for item in items:
-            ctrl.queue.cancel(item.id)
-        ctrl.queue.save()
-        print(f"Cleared {len(items)} items from {args.lane} lane")
-    else:
-        # Clear all lanes
-        total = 0
-        for lane in ["fast", "standard", "heavy"]:
-            items = ctrl.queue.list_pending(lane)
-            for item in items:
-                ctrl.queue.cancel(item.id)
-            total += len(items)
-        ctrl.queue.save()
-        print(f"Cleared {total} items from all lanes")
 
+    items = ctrl.queue.list_pending(lane=args.lane)
+    for item in items:
+        ctrl.queue.cancel(item.id)
+    ctrl.queue.save()
 
-def cmd_stats(args):
-    """Show metrics and statistics."""
-    ctrl = AdmissionController()
-    status = ctrl.get_status()
-    
-    print("=== Admission Control Statistics ===\n")
-    
-    metrics = status["metrics"]
-    total = metrics["total_admitted"]
-    completed = metrics["total_completed"]
-    failed = metrics["total_failed"]
-    
-    print(f"Total admitted:  {total}")
-    print(f"Total completed: {completed}")
-    print(f"Total failed:    {failed}")
-    
-    if total > 0:
-        success_rate = (completed / total) * 100
-        failure_rate = (failed / total) * 100
-        print(f"\nSuccess rate: {success_rate:.1f}%")
-        print(f"Failure rate: {failure_rate:.1f}%")
-    
-    # Current queue depth
-    print("\n=== Current Queue Depth ===")
-    for lane in ["fast", "standard", "heavy"]:
-        depth = status[lane]["pending"]
-        print(f"{lane.capitalize()}: {depth}")
-    
-    total_pending = sum(status[lane]["pending"] for lane in ["fast", "standard", "heavy"])
-    print(f"Total pending: {total_pending}")
+    label = f"{args.lane} lane" if args.lane else "all lanes"
+    print(f"Cleared {len(items)} items from {label}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Admission queue CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    
+
     # status command
-    status_parser = subparsers.add_parser("status", help="Show queue status")
-    status_parser.add_argument("--json", action="store_true", help="Output as JSON")
-    status_parser.set_defaults(func=cmd_status)
-    
+    sp = subparsers.add_parser("status", help="Show queue status")
+    sp.add_argument("--json", action="store_true", help="Output as JSON")
+    sp.add_argument("--domain", choices=list(ALL_DOMAINS), help="Filter by domain")
+    sp.add_argument("--domain-id", dest="domain_id", help="Filter by domain_id")
+    sp.set_defaults(func=cmd_status)
+
     # clear command
-    clear_parser = subparsers.add_parser("clear", help="Clear queue (testing only)")
-    clear_parser.add_argument("lane", nargs="?", choices=["fast", "standard", "heavy"],
-                             help="Lane to clear (omit to clear all)")
-    clear_parser.set_defaults(func=cmd_clear)
-    
-    # stats command
-    stats_parser = subparsers.add_parser("stats", help="Show metrics and statistics")
-    stats_parser.set_defaults(func=cmd_stats)
-    
+    cp = subparsers.add_parser("clear", help="Clear queue (testing only)")
+    cp.add_argument("lane", nargs="?", choices=list(ALL_LANES),
+                    help="Lane to clear (omit to clear all)")
+    cp.set_defaults(func=cmd_clear)
+
     args = parser.parse_args()
-    
+
     try:
         args.func(args)
     except KeyboardInterrupt:

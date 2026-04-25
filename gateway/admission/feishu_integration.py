@@ -49,6 +49,7 @@ class FeishuAdmissionBridge:
             # Extract message metadata
             message_id = event.get("message_id", "")
             chat_id = event.get("chat_id", "")
+            chat_type = event.get("chat_type", "")  # "p2p" or "group"
             user_id = event.get("sender", {}).get("sender_id", {}).get("open_id", "")
             message_text = event.get("message", {}).get("content", "")
 
@@ -57,6 +58,7 @@ class FeishuAdmissionBridge:
                 user_id=user_id,
                 message=message_text,
                 chat_id=chat_id,
+                chat_type=chat_type,
                 platform="feishu",
             )
 
@@ -67,9 +69,6 @@ class FeishuAdmissionBridge:
                 )
             else:
                 logger.warning(f"Message rejected: {feedback}")
-
-            # TODO: Trigger async worker to process queue_item
-            # For now, just log it
             
         except Exception as e:
             logger.error(f"Failed to intercept message: {e}", exc_info=True)

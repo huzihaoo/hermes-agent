@@ -1,4 +1,4 @@
-"""SQLite persistence for admission queue items."""
+"""SQLite persistence for admission queue items with domain support."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from .types import QueueItem
 def init_db(db_path: Path) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS queue_items (
@@ -30,27 +31,65 @@ def init_db(db_path: Path) -> None:
             result TEXT,
             chat_id TEXT,
             thread_id TEXT,
-            platform TEXT
+            platform TEXT,
+            domain TEXT NOT NULL DEFAULT 'user',
+            domain_id TEXT NOT NULL DEFAULT '',
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            max_retries INTEGER NOT NULL DEFAULT 3,
+            last_error TEXT,
+            next_retry_at TEXT
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS metrics (
+            key TEXT PRIMARY KEY,
+            value INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    # Migrate old tables that lack domain columns
+    _migrate_add_column(conn, "domain", "TEXT NOT NULL DEFAULT 'user'")
+    _migrate_add_column(conn, "domain_id", "TEXT NOT NULL DEFAULT ''")
+    # Migrate retry fields
+    _migrate_add_column(conn, "retry_count", "INTEGER NOT NULL DEFAULT 0")
+    _migrate_add_column(conn, "max_retries", "INTEGER NOT NULL DEFAULT 3")
+    _migrate_add_column(conn, "last_error", "TEXT")
+    _migrate_add_column(conn, "next_retry_at", "TEXT")
     conn.commit()
     conn.close()
 
 
+def _migrate_add_column(conn: sqlite3.Connection, col_name: str, col_def: str) -> None:
+    """Add a column if it doesn't exist yet (idempotent migration)."""
+    cursor = conn.execute("PRAGMA table_info(queue_items)")
+    existing = {row[1] for row in cursor.fetchall()}
+    if col_name not in existing:
+        conn.execute(f"ALTER TABLE queue_items ADD COLUMN {col_name} {col_def}")
+
+
 def save_items(db_path: Path, items: List[QueueItem]) -> None:
+    """Save queue items to SQLite using upsert (no DELETE, safe for concurrent writes)."""
     init_db(db_path)
     conn = sqlite3.connect(db_path)
-    conn.execute("DELETE FROM queue_items WHERE status = 'queued'")
-
+    conn.execute("PRAGMA journal_mode=WAL")
+    
+    # Get all current item IDs in DB
+    cursor = conn.execute("SELECT id FROM queue_items")
+    existing_ids = {row[0] for row in cursor.fetchall()}
+    
+    # Upsert all items
     for item in items:
         conn.execute(
             """
             INSERT OR REPLACE INTO queue_items (
                 id, user_id, user_role, message, lane, priority, status,
                 created_at, started_at, completed_at, result,
-                chat_id, thread_id, platform
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                chat_id, thread_id, platform,
+                domain, domain_id,
+                retry_count, max_retries, last_error, next_retry_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 item.id,
@@ -67,8 +106,20 @@ def save_items(db_path: Path, items: List[QueueItem]) -> None:
                 item.chat_id,
                 item.thread_id,
                 item.platform,
+                item.domain,
+                item.domain_id,
+                item.retry_count,
+                item.max_retries,
+                item.last_error,
+                item.next_retry_at.isoformat() if item.next_retry_at else None,
             ),
         )
+    
+    # Delete items that are no longer in memory
+    current_ids = {item.id for item in items}
+    to_delete = existing_ids - current_ids
+    for item_id in to_delete:
+        conn.execute("DELETE FROM queue_items WHERE id = ?", (item_id,))
 
     conn.commit()
     conn.close()
@@ -81,11 +132,18 @@ def load_items(db_path: Path) -> List[QueueItem]:
     init_db(db_path)
     conn = sqlite3.connect(db_path)
     cursor = conn.execute(
-        "SELECT id, user_id, user_role, message, lane, priority, status, created_at, started_at, completed_at, result, chat_id, thread_id, platform FROM queue_items WHERE status = 'queued'"
+        """SELECT id, user_id, user_role, message, lane, priority, status,
+                  created_at, started_at, completed_at, result,
+                  chat_id, thread_id, platform,
+                  domain, domain_id,
+                  retry_count, max_retries, last_error, next_retry_at
+           FROM queue_items"""
     )
 
     items: list[QueueItem] = []
     for row in cursor.fetchall():
+        domain = row[14] if row[14] else "user"
+        domain_id = row[15] if row[15] else row[1]  # fallback to user_id
         items.append(
             QueueItem(
                 id=row[0],
@@ -102,8 +160,44 @@ def load_items(db_path: Path) -> List[QueueItem]:
                 chat_id=row[11],
                 thread_id=row[12],
                 platform=row[13],
+                domain=domain,
+                domain_id=domain_id,
+                retry_count=row[16] if row[16] is not None else 0,
+                max_retries=row[17] if row[17] is not None else 3,
+                last_error=row[18],
+                next_retry_at=datetime.fromisoformat(row[19]) if row[19] else None,
             )
         )
 
     conn.close()
     return items
+
+
+def save_metrics(db_path: Path, metrics: dict[str, int]) -> None:
+    """Save metrics to SQLite."""
+    init_db(db_path)
+    conn = sqlite3.connect(db_path)
+    
+    for key, value in metrics.items():
+        conn.execute(
+            "INSERT OR REPLACE INTO metrics (key, value) VALUES (?, ?)",
+            (key, value)
+        )
+    
+    conn.commit()
+    conn.close()
+
+
+def load_metrics(db_path: Path) -> dict[str, int]:
+    """Load metrics from SQLite."""
+    if not db_path.exists():
+        return {}
+    
+    init_db(db_path)
+    conn = sqlite3.connect(db_path)
+    cursor = conn.execute("SELECT key, value FROM metrics")
+    
+    metrics = {row[0]: row[1] for row in cursor.fetchall()}
+    
+    conn.close()
+    return metrics

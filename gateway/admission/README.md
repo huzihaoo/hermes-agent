@@ -1,5 +1,7 @@
 # Admission Control — 多车道准入队列
 
+> **当前版本: v1.0.1** | [CHANGELOG](CHANGELOG.md) | [版本管理](VERSION_MANAGEMENT.md)
+
 ## 概述
 
 多用户/多群组并发消息的准入控制与排队系统。消息按类型分入不同车道（lane），车道间并发处理，车道内 FIFO 串行。
