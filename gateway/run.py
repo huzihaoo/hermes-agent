@@ -4808,19 +4808,82 @@ class GatewayRunner:
         if receipt.status == TaskStatus.FAILED:
             lines.append(f"\\n**错误类型:** {receipt.error_class or '未知'}")
             lines.append(f"**错误信息:** {receipt.error_message or '无'}".replace("\\n", " ")[:200])
+            
+            diagnosis = self._diagnose_task_failure(receipt)
+            if diagnosis:
+                lines.append(f"**诊断:** {diagnosis}")
         
         return "\\n".join(lines)
 
-    async def _handle_templates_command(self, event: MessageEvent) -> str:
-        """Handle /templates - list recent templates."""
-        from gateway.tasks.template import TemplateStore
-        store = TemplateStore(db_path=_hermes_home / "analytics" / "templates.db")
-        templates = store.list_recent(limit=20)
-        if not templates:
-            return "📦 **模板列表**\n\n暂无模板。"
+    def _diagnose_task_failure(self, receipt) -> str:
+        """Generate a brief human-readable diagnosis for failed tasks."""
+        error_class = (receipt.error_class or "").lower()
+        error_message = (receipt.error_message or "").lower()
+        tool_names = [t.get("tool_name", "") for t in (receipt.tool_call_details or [])]
+        
+        if error_class in {"api_error", "provider_error", "model_error"}:
+            return "上游模型/API 返回错误。优先检查 provider 状态、模型可用性和短时重试。"
+        
+        if error_class in {"context_overflow", "context_length", "token_limit"} or "context length" in error_message:
+            return "上下文过长，超过模型窗口。需要压缩输入、拆分任务，或减少附带上下文。"
+        
+        if error_class in {"tool_error", "tool_failed", "function_error"}:
+            if tool_names:
+                return f"工具调用失败，最后相关工具包含 {', '.join(f'`{name}`' for name in tool_names[:3] if name)}。优先检查输入参数和资源是否存在。"
+            return "工具调用失败。优先检查工具参数、权限和外部依赖状态。"
+        
+        if error_class in {"timeout", "request_timeout", "inactivity_timeout"} or "timeout" in error_message:
+            return "任务执行超时。通常是外部调用慢、工具阻塞，或任务拆分粒度过大。"
+        
+        if "not found" in error_message or "no such file" in error_message:
+            return "任务依赖的文件或资源不存在。优先检查路径、文件名和运行目录。"
+        
+        return "暂未命中特定故障模式。建议结合错误信息、最后一次工具调用和事件日志继续排查。"
 
-        lines = ["📦 **模板列表**\n"]
-        for tpl in templates:
+    async def _handle_templates_command(self, event: MessageEvent) -> str:
+        """Handle /templates [query] [--type <type>] - list and filter templates."""
+        from gateway.tasks.template import TemplateStore
+        
+        args = event.get_command_args().strip()
+        
+        # Parse filter arguments
+        query = None
+        type_filter = None
+        
+        if args:
+            parts = args.split()
+            # Check for --type flag
+            if "--type" in parts:
+                type_idx = parts.index("--type")
+                if type_idx + 1 < len(parts):
+                    type_filter = parts[type_idx + 1]
+                    # Remove --type and its value from parts
+                    parts = parts[:type_idx] + parts[type_idx + 2:]
+            
+            # Remaining parts are query
+            if parts:
+                query = " ".join(parts)
+        
+        store = TemplateStore(db_path=_hermes_home / "analytics" / "templates.db")
+        templates = store.list_recent(limit=100)
+        
+        # Apply filters
+        if query:
+            templates = [t for t in templates if query.lower() in t["name"].lower()]
+        if type_filter:
+            templates = [t for t in templates if t["task_type"] == type_filter]
+        
+        if not templates:
+            filter_desc = []
+            if query:
+                filter_desc.append(f"名称包含 '{query}'")
+            if type_filter:
+                filter_desc.append(f"类型为 '{type_filter}'")
+            filter_str = "、".join(filter_desc) if filter_desc else ""
+            return f"📦 **模板列表**\\n\\n暂无{filter_str}的模板。"
+
+        lines = ["📦 **模板列表**\\n"]
+        for tpl in templates[:20]:  # Limit display to 20
             icon = {
                 "coding": "💻",
                 "docs": "📝",
@@ -4828,13 +4891,28 @@ class GatewayRunner:
                 "chat": "💬",
                 "cron": "⏰",
             }.get(tpl["task_type"], "❓")
-            lines.append(f"{icon} `{tpl['template_id'][:8]}` — {tpl['name']} (from task `{tpl['source_task_id']}`)")
+            
+            # Show template ID, name, and params if any
+            template_line = f"{icon} `{tpl['template_id'][:8]}` — {tpl['name']}"
+            params = tpl.get("params", {})
+            if params:
+                param_names = ", ".join(f"`{{{{{k}}}}}`" for k in params.keys())
+                template_line += f" (参数: {param_names})"
+            
+            # Show usage stats if available
+            usage_count = tpl.get("usage_count", 0)
+            if usage_count > 0:
+                template_line += f" — 使用 {usage_count} 次"
+            
+            lines.append(template_line)
 
-        lines.append("\n💡 使用 `/template create <task_id> <name>` 从成功任务创建模板")
-        return "\n".join(lines)
+        lines.append("\\n💡 使用 `/template create <task_id> <name>` 从成功任务创建模板")
+        lines.append("💡 使用 `hermes cron create <schedule> --template <id> --param key=value` 创建定时任务")
+        lines.append("💡 使用 `/templates <关键词>` 或 `/templates --type <类型>` 过滤模板")
+        return "\\n".join(lines)
 
     async def _handle_template_command(self, event: MessageEvent) -> str:
-        """Handle /template create <task_id> <name> - create template from successful task."""
+        """Handle /template subcommands: create, show, render."""
         from gateway.tasks.template import TemplateStore
         from hermes_cli.task_trace import generate_receipt
         from gateway.tasks.types import TaskStatus
@@ -4842,14 +4920,245 @@ class GatewayRunner:
 
         args = event.get_command_args().strip()
         if not args:
-            return "用法: `/template create <task_id> <name>`"
-
-        parts = args.split(maxsplit=2)
-        if len(parts) < 2 or parts[0] != "create":
+            return (
+                "用法:\\n"
+                "- `/template create <task_id> <name>` 从成功任务创建模板\\n"
+                "- `/template show <template_id>` 查看模板详情\\n"
+                "- `/template edit <template_id> --name <新名称> --content <新内容>` 编辑模板\\n"
+                "- `/template render <template_id> key=value ...` 预览渲染结果\\n"
+                "- `/template export <template_id>` 导出模板为 JSON\\n"
+                "- `/template import <json>` 从 JSON 导入模板\\n"
+                "- `/template delete <template_id>` 删除模板\\n"
+                "- `/templates [query] [--type <type>]` 列出模板"
+            )
+        parts = args.split()
+        action = parts[0]
+        
+        store = TemplateStore(db_path=_hermes_home / "analytics" / "templates.db")
+        
+        # Helper: resolve template ID (exact or prefix match)
+        def resolve_template_id(template_id_input: str):
+            template = store.get(template_id_input)
+            if not template:
+                all_templates = store.list_recent(limit=100)
+                matches = [t for t in all_templates if t["template_id"].startswith(template_id_input)]
+                if len(matches) == 1:
+                    return matches[0], None
+                elif len(matches) > 1:
+                    return None, f"模板 ID `{template_id_input}` 匹配到多个模板，请使用更长的 ID。"
+            return template, None
+        
+        # Handle /template render <id> key=value ...
+        if action == "render":
+            if len(parts) < 2:
+                return "用法: `/template render <template_id> key=value ...`"
+            
+            template_id_input = parts[1]
+            template, error = resolve_template_id(template_id_input)
+            if error:
+                return error
+            if not template:
+                return f"模板 `{template_id_input}` 未找到。"
+            
+            # Parse key=value params
+            param_values = {}
+            for param_str in parts[2:]:
+                if "=" not in param_str:
+                    return f"参数格式错误: `{param_str}`。请使用 `key=value` 格式。"
+                key, value = param_str.split("=", 1)
+                param_values[key.strip()] = value.strip()
+            
+            # Render template
+            try:
+                rendered = store.render(template["template_id"], param_values)
+            except ValueError as e:
+                return f"❌ 渲染失败: {e}"
+            
+            return (
+                f"✅ **模板渲染预览**\\n\\n"
+                f"**模板:** {template['name']} (`{template['template_id'][:8]}`)\\n\\n"
+                f"**渲染结果:**\\n```\\n{rendered}\\n```"
+            )
+        
+        # Handle /template delete <id>
+        if action == "delete":
+            if len(parts) < 2:
+                return "用法: `/template delete <template_id>`"
+            
+            template_id_input = parts[1]
+            template, error = resolve_template_id(template_id_input)
+            if error:
+                return error
+            if not template:
+                return f"模板 `{template_id_input}` 未找到。"
+            
+            # Delete the template
+            template_id = template["template_id"]
+            template_name = template["name"]
+            if store.delete(template_id):
+                return f"✅ 模板 `{template_name}` (`{template_id[:8]}`) 已删除。"
+            else:
+                return f"❌ 删除模板失败。"
+        
+        # Handle /template edit <id> --name <name> --content <content>
+        if action == "edit":
+            if len(parts) < 2:
+                return "用法: `/template edit <template_id> --name <新名称> --content <新内容>`"
+            
+            template_id_input = parts[1]
+            template, error = resolve_template_id(template_id_input)
+            if error:
+                return error
+            if not template:
+                return f"模板 `{template_id_input}` 未找到。"
+            
+            # Parse --name and --content flags
+            new_name = None
+            new_content = None
+            
+            i = 2
+            while i < len(parts):
+                if parts[i] == "--name" and i + 1 < len(parts):
+                    new_name = parts[i + 1]
+                    i += 2
+                elif parts[i] == "--content" and i + 1 < len(parts):
+                    # Collect remaining parts as content
+                    new_content = " ".join(parts[i + 1:])
+                    break
+                else:
+                    i += 1
+            
+            if new_name is None and new_content is None:
+                return "请至少提供 `--name` 或 `--content` 参数。"
+            
+            # Update the template
+            template_id = template["template_id"]
+            if store.update(template_id, name=new_name, request_summary=new_content):
+                lines = [f"✅ 模板 `{template['name']}` 已更新。\\n"]
+                if new_name:
+                    lines.append(f"- 新名称: {new_name}")
+                if new_content:
+                    lines.append(f"- 新内容: {new_content}")
+                    # Show extracted params
+                    updated = store.get(template_id)
+                    params = updated.get("params", {})
+                    if params:
+                        lines.append(f"- 提取的参数: {', '.join(f'`{{{{{k}}}}}`' for k in params.keys())}")
+                return "\\n".join(lines)
+            else:
+                return f"❌ 更新模板失败。"
+        
+        # Handle /template export <id>
+        if action == "export":
+            if len(parts) < 2:
+                return "用法: `/template export <template_id>`"
+            
+            template_id_input = parts[1]
+            template, error = resolve_template_id(template_id_input)
+            if error:
+                return error
+            if not template:
+                return f"模板 `{template_id_input}` 未找到。"
+            
+            # Export template
+            template_id = template["template_id"]
+            exported = store.export_template(template_id)
+            if exported:
+                return json.dumps(exported, ensure_ascii=False, indent=2)
+            else:
+                return f"❌ 导出模板失败。"
+        
+        # Handle /template import <json>
+        if action == "import":
+            if len(parts) < 2:
+                return "用法: `/template import <json>`"
+            
+            # Collect all parts after "import" as JSON
+            json_str = " ".join(parts[1:])
+            
+            try:
+                data = json.loads(json_str)
+            except json.JSONDecodeError as e:
+                return f"❌ 无效的 JSON 格式: {e}"
+            
+            try:
+                template_id = store.import_template(data)
+                template = store.get(template_id)
+                return f"✅ 模板 `{template['name']}` 已导入。\\n\\n模板 ID: `{template_id[:8]}`"
+            except ValueError as e:
+                return f"❌ 导入失败: {e}"
+        
+        # Handle /template show <id>
+        if action == "show":
+            if len(parts) < 2:
+                return "用法: `/template show <template_id>`"
+            
+            template_id_input = parts[1]
+            template, error = resolve_template_id(template_id_input)
+            if error:
+                return error
+            if not template:
+                return f"模板 `{template_id_input}` 未找到。"
+            
+            # Format template details
+            icon = {
+                "coding": "💻",
+                "docs": "📝",
+                "research": "🔍",
+                "chat": "💬",
+                "cron": "⏰",
+            }.get(template["task_type"], "❓")
+            
+            lines = [
+                f"{icon} **模板详情**\\n",
+                f"**ID:** `{template['template_id']}`",
+                f"**名称:** {template['name']}",
+                f"**类型:** {template['task_type']}",
+                f"**来源任务:** `{template['source_task_id']}`",
+            ]
+            
+            params = template.get("params", {})
+            if params:
+                lines.append(f"\\n**参数:**")
+                for param_name, param_def in params.items():
+                    required = "必填" if param_def.get("required", True) else "可选"
+                    default = param_def.get("default")
+                    if default is not None:
+                        lines.append(f"  - `{{{{{param_name}}}}}` ({required}, 默认值: `{default}`)")
+                    else:
+                        lines.append(f"  - `{{{{{param_name}}}}}` ({required})")
+            
+            lines.append(f"\\n**模板内容:**")
+            lines.append(f"```\\n{template.get('request_summary', '')}\\n```")
+            
+            if params:
+                lines.append(f"\\n**使用示例:**")
+                example_params = " ".join(f"--param {k}=<value>" for k in params.keys())
+                lines.append(f"`hermes cron create 'every 1d' --template {template['template_id'][:8]} {example_params}`")
+            
+            return "\\n".join(lines)
+        
+        # Handle /template create <task_id> <name>
+        if action != "create":
+            return (
+                "用法:\\n"
+                "- `/template create <task_id> <name>` 从成功任务创建模板\\n"
+                "- `/template show <template_id>` 查看模板详情\\n"
+                "- `/template edit <template_id> --name <新名称> --content <新内容>` 编辑模板\\n"
+                "- `/template render <template_id> key=value ...` 预览渲染结果\\n"
+                "- `/template export <template_id>` 导出模板为 JSON\\n"
+                "- `/template import <json>` 从 JSON 导入模板\\n"
+                "- `/template delete <template_id>` 删除模板\\n"
+                "- `/templates [query] [--type <type>]` 列出模板"
+            )
+        
+        if len(parts) < 2:
             return "用法: `/template create <task_id> <name>`"
 
         task_id = parts[1]
-        name = parts[2] if len(parts) > 2 else f"template-from-{task_id}"
+        # Preserve spaces in name by slicing original args
+        name_start = args.find(task_id) + len(task_id)
+        name = args[name_start:].strip() or f"template-from-{task_id}"
 
         trace_file = _hermes_home / "analytics" / "events.jsonl"
         receipt = generate_receipt(trace_file=trace_file, task_id=task_id)
@@ -4866,14 +5175,26 @@ class GatewayRunner:
             request_summary=receipt.request_summary,
             created_at=time.time(),
         )
-
-        return (
-            f"✅ **模板已创建**\n"
-            f"模板 ID: `{template_id}`\n"
-            f"名称: {name}\n"
-            f"来源任务: `{task_id}`\n"
-            f"类型: `{receipt.task_type.value}`"
-        )
+        
+        # Get the created template to show params
+        template = store.get(template_id)
+        params = template.get("params", {})
+        
+        result_lines = [
+            f"✅ **模板已创建**",
+            f"模板 ID: `{template_id}`",
+            f"名称: {name}",
+            f"来源任务: `{task_id}`",
+            f"类型: `{receipt.task_type.value}`",
+        ]
+        
+        if params:
+            param_list = ", ".join(f"`{{{{{k}}}}}`" for k in params.keys())
+            result_lines.append(f"参数: {param_list}")
+            result_lines.append(f"\\n💡 使用示例:")
+            result_lines.append(f"`hermes cron create 'every 1d' --template {template_id[:8]} --param key=value`")
+        
+        return "\\n".join(result_lines)
     
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model for this session.

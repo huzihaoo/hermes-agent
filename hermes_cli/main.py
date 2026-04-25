@@ -3070,6 +3070,40 @@ def cmd_cron(args):
     cron_command(args)
 
 
+def cmd_template(args):
+    """Template management."""
+    from hermes_cli.template import (
+        template_list, template_show, template_delete, template_create, 
+        template_render, template_edit, template_export, template_import
+    )
+    
+    subcmd = getattr(args, "template_command", None)
+    if subcmd is None or subcmd == "list":
+        template_list(query=getattr(args, "query", None), type_filter=getattr(args, "type", None))
+    elif subcmd == "show":
+        template_show(args.template_id)
+    elif subcmd == "delete":
+        template_delete(args.template_id)
+    elif subcmd == "create":
+        template_create(args.task_id, args.name)
+    elif subcmd == "render":
+        # Parse --param key=value arguments
+        param_values = {}
+        for param_str in getattr(args, "param", []):
+            if "=" in param_str:
+                key, value = param_str.split("=", 1)
+                param_values[key] = value
+        template_render(args.template_id, param_values)
+    elif subcmd == "edit":
+        template_edit(args.template_id, name=getattr(args, "name", None), content=getattr(args, "content", None))
+    elif subcmd == "export":
+        template_export(args.template_id)
+    elif subcmd == "import":
+        template_import(args.json_str)
+    else:
+        print(f"Unknown template command: {subcmd}")
+
+
 def cmd_webhook(args):
     """Webhook subscription management."""
     from hermes_cli.webhook import webhook_command
@@ -5237,6 +5271,8 @@ For more help on a command:
     cron_create.add_argument("--repeat", type=int, help="Optional repeat count")
     cron_create.add_argument("--skill", dest="skills", action="append", help="Attach a skill. Repeat to add multiple skills.")
     cron_create.add_argument("--script", help="Path to a Python script whose stdout is injected into the prompt each run")
+    cron_create.add_argument("--template", help="Template ID to use (overrides prompt)")
+    cron_create.add_argument("--param", dest="template_params", action="append", help="Template parameter in key=value format. Repeat for multiple params.")
 
     # cron edit
     cron_edit = cron_subparsers.add_parser("edit", help="Edit an existing scheduled job")
@@ -5272,6 +5308,55 @@ For more help on a command:
     cron_subparsers.add_parser("tick", help="Run due jobs once and exit")
 
     cron_parser.set_defaults(func=cmd_cron)
+
+    # =========================================================================
+    # template command
+    # =========================================================================
+    template_parser = subparsers.add_parser(
+        "template",
+        help="Manage task templates",
+        description="List, show, and delete task templates"
+    )
+    template_subparsers = template_parser.add_subparsers(dest="template_command")
+    
+    # template list
+    template_list_cmd = template_subparsers.add_parser("list", help="List templates")
+    template_list_cmd.add_argument("query", nargs="?", help="Optional name filter")
+    template_list_cmd.add_argument("--type", help="Filter by task type (docs, coding, research, chat, cron)")
+    
+    # template show
+    template_show_cmd = template_subparsers.add_parser("show", help="Show template details")
+    template_show_cmd.add_argument("template_id", help="Template ID (full or short)")
+    
+    # template create
+    template_create_cmd = template_subparsers.add_parser("create", help="Create template from a successful task")
+    template_create_cmd.add_argument("task_id", help="Task ID to create template from")
+    template_create_cmd.add_argument("name", help="Template name")
+    
+    # template render
+    template_render_cmd = template_subparsers.add_parser("render", help="Preview template rendering")
+    template_render_cmd.add_argument("template_id", help="Template ID (full or short)")
+    template_render_cmd.add_argument("--param", action="append", default=[], help="Parameter in key=value format. Repeatable.")
+    
+    # template edit
+    template_edit_cmd = template_subparsers.add_parser("edit", help="Edit template name or content")
+    template_edit_cmd.add_argument("template_id", help="Template ID (full or short)")
+    template_edit_cmd.add_argument("--name", help="New template name")
+    template_edit_cmd.add_argument("--content", help="New template content")
+    
+    # template export
+    template_export_cmd = template_subparsers.add_parser("export", help="Export template as JSON")
+    template_export_cmd.add_argument("template_id", help="Template ID (full or short)")
+    
+    # template import
+    template_import_cmd = template_subparsers.add_parser("import", help="Import template from JSON")
+    template_import_cmd.add_argument("json_str", help="JSON string or file path")
+    
+    # template delete
+    template_delete_cmd = template_subparsers.add_parser("delete", aliases=["rm", "remove"], help="Delete a template")
+    template_delete_cmd.add_argument("template_id", help="Template ID (full or short)")
+    
+    template_parser.set_defaults(func=cmd_template)
 
     # =========================================================================
     # webhook command
@@ -6010,9 +6095,19 @@ Examples:
     )
     insights_parser.add_argument("--days", type=int, default=30, help="Number of days to analyze (default: 30)")
     insights_parser.add_argument("--source", help="Filter by platform (cli, telegram, discord, etc.)")
+    insights_parser.add_argument("--event-log", help="Read insights from structured events JSONL instead of the session DB")
+    insights_parser.add_argument("--user", help="Filter event-log insights by user_id")
+    insights_parser.add_argument("--admin", action="store_true", help="Show admin event-log insights across all users")
 
     def cmd_insights(args):
         try:
+            if getattr(args, "event_log", None):
+                from agent.event_insights import EventInsightsEngine
+                engine = EventInsightsEngine(Path(args.event_log))
+                report = engine.generate(days=args.days, user_id=getattr(args, "user", None), admin=bool(getattr(args, "admin", False)))
+                print(engine.format_terminal(report))
+                return
+
             from hermes_state import SessionDB
             from agent.insights import InsightsEngine
 
@@ -6025,6 +6120,24 @@ Examples:
             print(f"Error generating insights: {e}")
 
     insights_parser.set_defaults(func=cmd_insights)
+
+    # =========================================================================
+    # task-trace command
+    # =========================================================================
+    task_trace_parser = subparsers.add_parser(
+        "task-trace",
+        help="Show structured task execution events",
+        description="Display task start/complete, API calls, and tool calls from the analytics log"
+    )
+    task_trace_parser.add_argument("--task-id", help="Filter by task ID")
+    task_trace_parser.add_argument("--event", help="Filter by event type (task:start, api:call, tool:call, task:complete)")
+    task_trace_parser.add_argument("--tail", type=int, help="Show only the last N events")
+
+    def cmd_task_trace_wrapper(args):
+        from hermes_cli.task_trace import cmd_task_trace
+        cmd_task_trace(args)
+
+    task_trace_parser.set_defaults(func=cmd_task_trace_wrapper)
 
     # =========================================================================
     # claw command (OpenClaw migration)

@@ -17,7 +17,7 @@ async def test_templates_command_empty(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
     result = await gateway_run.GatewayRunner._handle_templates_command(runner, event)
-    assert "暂无模板" in result
+    assert "暂无" in result and "模板" in result
 
 
 @pytest.mark.asyncio
