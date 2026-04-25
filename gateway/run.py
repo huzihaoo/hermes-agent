@@ -3143,6 +3143,12 @@ class GatewayRunner:
         if canonical == "task":
             return await self._handle_task_command(event)
 
+        if canonical == "templates":
+            return await self._handle_templates_command(event)
+
+        if canonical == "template":
+            return await self._handle_template_command(event)
+
         if canonical == "reload-mcp":
             return await self._handle_reload_mcp_command(event)
 
@@ -4804,6 +4810,70 @@ class GatewayRunner:
             lines.append(f"**错误信息:** {receipt.error_message or '无'}".replace("\\n", " ")[:200])
         
         return "\\n".join(lines)
+
+    async def _handle_templates_command(self, event: MessageEvent) -> str:
+        """Handle /templates - list recent templates."""
+        from gateway.tasks.template import TemplateStore
+        store = TemplateStore(db_path=_hermes_home / "analytics" / "templates.db")
+        templates = store.list_recent(limit=20)
+        if not templates:
+            return "📦 **模板列表**\n\n暂无模板。"
+
+        lines = ["📦 **模板列表**\n"]
+        for tpl in templates:
+            icon = {
+                "coding": "💻",
+                "docs": "📝",
+                "research": "🔍",
+                "chat": "💬",
+                "cron": "⏰",
+            }.get(tpl["task_type"], "❓")
+            lines.append(f"{icon} `{tpl['template_id'][:8]}` — {tpl['name']} (from task `{tpl['source_task_id']}`)")
+
+        lines.append("\n💡 使用 `/template create <task_id> <name>` 从成功任务创建模板")
+        return "\n".join(lines)
+
+    async def _handle_template_command(self, event: MessageEvent) -> str:
+        """Handle /template create <task_id> <name> - create template from successful task."""
+        from gateway.tasks.template import TemplateStore
+        from hermes_cli.task_trace import generate_receipt
+        from gateway.tasks.types import TaskStatus
+        import time
+
+        args = event.get_command_args().strip()
+        if not args:
+            return "用法: `/template create <task_id> <name>`"
+
+        parts = args.split(maxsplit=2)
+        if len(parts) < 2 or parts[0] != "create":
+            return "用法: `/template create <task_id> <name>`"
+
+        task_id = parts[1]
+        name = parts[2] if len(parts) > 2 else f"template-from-{task_id}"
+
+        trace_file = _hermes_home / "analytics" / "events.jsonl"
+        receipt = generate_receipt(trace_file=trace_file, task_id=task_id)
+        if receipt.started_at == 0:
+            return f"任务 `{task_id}` 未找到。"
+        if receipt.status != TaskStatus.COMPLETED:
+            return f"只能从成功任务创建模板。任务 `{task_id}` 当前状态是 `{receipt.status.value}`。"
+
+        store = TemplateStore(db_path=_hermes_home / "analytics" / "templates.db")
+        template_id = store.create_from_task(
+            source_task_id=task_id,
+            name=name,
+            task_type=receipt.task_type.value,
+            request_summary=receipt.request_summary,
+            created_at=time.time(),
+        )
+
+        return (
+            f"✅ **模板已创建**\n"
+            f"模板 ID: `{template_id}`\n"
+            f"名称: {name}\n"
+            f"来源任务: `{task_id}`\n"
+            f"类型: `{receipt.task_type.value}`"
+        )
     
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model for this session.
