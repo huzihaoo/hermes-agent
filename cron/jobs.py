@@ -378,6 +378,7 @@ def create_job(
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
     script: Optional[str] = None,
+    template_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -397,10 +398,24 @@ def create_job(
         script: Optional path to a Python script whose stdout is injected into the
                 prompt each run.  The script runs before the agent turn, and its output
                 is prepended as context.  Useful for data collection / change detection.
+        template_id: Optional template ID to load prompt from. If provided, overrides prompt parameter.
 
     Returns:
         The created job dict
     """
+    # Load prompt from template if template_id is provided
+    if template_id:
+        try:
+            from gateway.tasks.template import TemplateStore
+            from hermes_constants import get_hermes_home
+            store = TemplateStore(db_path=get_hermes_home() / "analytics" / "templates.db")
+            template = store.get(template_id)
+            if not template:
+                raise ValueError(f"Template {template_id} not found")
+            prompt = template["request_summary"] or ""
+        except Exception as e:
+            raise ValueError(f"Failed to load template {template_id}: {e}")
+
     parsed_schedule = parse_schedule(schedule)
 
     # Normalize repeat: treat 0 or negative values as None (infinite)
@@ -458,6 +473,7 @@ def create_job(
         # Delivery configuration
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery
+        "template_id": template_id,  # Optional template reference
     }
 
     jobs = load_jobs()
