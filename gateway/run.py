@@ -727,6 +727,26 @@ class GatewayRunner:
 
     # -----------------------------------------------------------------
 
+    def _emit_request_start_event(self, event, source, session_entry) -> None:
+        """Emit a structured request:start event for task tracing."""
+        try:
+            from hermes_events import EventEmitter
+            trace_file = _hermes_home / "analytics" / "events.jsonl"
+            emitter = EventEmitter(trace_file=trace_file)
+            text = getattr(event, "text", "") or ""
+            summary = text[:80]
+            emitter.emit("request:start", {
+                "task_id": getattr(session_entry, "session_id", ""),
+                "platform": source.platform.value if getattr(source, "platform", None) else "",
+                "user_id": getattr(source, "user_id", None),
+                "user_name": getattr(source, "user_name", None),
+                "chat_id": getattr(source, "chat_id", None),
+                "message_id": getattr(event, "message_id", None),
+                "request_summary": summary,
+            })
+        except Exception:
+            logger.debug("request:start emission failed", exc_info=True)
+
     def _flush_memories_for_session(
         self,
         old_session_id: str,
@@ -1820,6 +1840,13 @@ class GatewayRunner:
                     logger.info("Suspended %d in-flight session(s) from previous run", suspended)
             except Exception as e:
                 logger.warning("Session suspension on startup failed: %s", e)
+
+        # Phase 1 task trace hygiene: convert stale pending markers into timeout events.
+        try:
+            from hermes_events import cleanup_stale_pending
+            cleanup_stale_pending(trace_file=_hermes_home / "analytics" / "events.jsonl", timeout_minutes=30)
+        except Exception as e:
+            logger.debug("Task trace stale-pending cleanup failed: %s", e)
 
         # Stuck-loop detection (#7536): if a session has been active across
         # 3+ consecutive restarts, it's probably stuck in a loop (the same
@@ -3104,6 +3131,12 @@ class GatewayRunner:
         if canonical == "insights":
             return await self._handle_insights_command(event)
 
+        if canonical == "tasks":
+            return await self._handle_tasks_command(event)
+
+        if canonical == "task":
+            return await self._handle_task_command(event)
+
         if canonical == "reload-mcp":
             return await self._handle_reload_mcp_command(event)
 
@@ -3462,6 +3495,7 @@ class GatewayRunner:
         # Get or create session
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
+        self._emit_request_start_event(event, source, session_entry)
         
         # Emit session:start for new or auto-reset sessions
         _is_new_session = (
@@ -4639,6 +4673,131 @@ class GatewayRunner:
         if page != requested_page:
             lines.append(f"_(Requested page {requested_page} was out of range, showing page {page}.)_")
         return "\n".join(lines)
+
+    async def _handle_tasks_command(self, event: MessageEvent) -> str:
+        """Handle /tasks - list recent tasks (product-level)."""
+        from hermes_cli.task_trace import list_tasks
+        from gateway.tasks.types import TaskStatus
+        try:
+            from gateway.admission.audit import AuditEvent, log_audit
+            log_audit(AuditEvent(
+                user_id=event.source.user_id or "unknown",
+                action="list_tasks",
+                resource="task_list",
+                result="allowed",
+                metadata={"platform": event.source.platform.value if event.source.platform else ""},
+            ))
+        except Exception:
+            pass
+        trace_file = _hermes_home / "analytics" / "events.jsonl"
+        user_id = event.source.user_id
+        tasks = list_tasks(trace_file=trace_file, limit=10, user_id=user_id)
+        if not tasks:
+            return "📋 **最近任务**\\n\\n暂无任务记录。"
+        
+        lines = ["📋 **最近任务**\\n"]
+        for t in tasks:
+            # 状态图标
+            if t.status == TaskStatus.COMPLETED:
+                icon = "✅"
+            elif t.status == TaskStatus.FAILED:
+                icon = "❌"
+            elif t.status == TaskStatus.RUNNING:
+                icon = "⏳"
+            else:
+                icon = "⏸️"
+            
+            # 任务类型标签
+            type_label = {
+                "coding": "💻",
+                "docs": "📝",
+                "research": "🔍",
+                "chat": "💬",
+                "cron": "⏰",
+                "unknown": "❓",
+            }.get(t.task_type.value, "❓")
+            
+            summary = t.request_summary or "无摘要"
+            lines.append(f"{icon} {type_label} `{t.task_id}` — {summary[:50]}")
+        
+        lines.append("\\n💡 使用 `/task <id>` 查看详情")
+        return "\\n".join(lines)
+
+    async def _handle_task_command(self, event: MessageEvent) -> str:
+        """Handle /task <id> - show task details (product-level)."""
+        from hermes_cli.task_trace import generate_receipt
+        from gateway.tasks.types import TaskStatus
+        task_id = event.get_command_args().strip()
+        if not task_id:
+            return "用法: `/task <task_id>`"
+        try:
+            from gateway.admission.audit import AuditEvent, log_audit
+            log_audit(AuditEvent(
+                user_id=event.source.user_id or "unknown",
+                action="get_task",
+                resource=task_id,
+                result="allowed",
+                metadata={"platform": event.source.platform.value if event.source.platform else ""},
+            ))
+        except Exception:
+            pass
+        trace_file = _hermes_home / "analytics" / "events.jsonl"
+        receipt = generate_receipt(trace_file=trace_file, task_id=task_id)
+        
+        if receipt.status == TaskStatus.PENDING and receipt.started_at == 0:
+            return f"任务 `{task_id}` 未找到。"
+        
+        # 状态图标
+        if receipt.status == TaskStatus.COMPLETED:
+            icon = "✅"
+        elif receipt.status == TaskStatus.FAILED:
+            icon = "❌"
+        elif receipt.status == TaskStatus.RUNNING:
+            icon = "⏳"
+        else:
+            icon = "⏸️"
+        
+        # 任务类型标签
+        type_label = {
+            "coding": "💻 编码",
+            "docs": "📝 文档",
+            "research": "🔍 研究",
+            "chat": "💬 对话",
+            "cron": "⏰ 定时",
+            "unknown": "❓ 未知",
+        }.get(receipt.task_type.value, "❓ 未知")
+        
+        lines = [
+            f"{icon} **任务详情** `{task_id}`",
+            f"**类型:** {type_label}",
+            f"**状态:** {receipt.status.value}",
+            f"**用户:** {receipt.user_id or '未知'}",
+            f"**平台:** {receipt.platform or '未知'}",
+            f"**摘要:** {receipt.request_summary or '无'}",
+            f"**开始时间:** {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(receipt.started_at))}",
+        ]
+        
+        if receipt.completed_at:
+            lines.append(f"**完成时间:** {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(receipt.completed_at))}")
+            duration = receipt.completed_at - receipt.started_at
+            lines.append(f"**耗时:** {duration:.1f}s")
+        
+        lines.append(f"**Token 消耗:** {receipt.total_tokens}")
+        lines.append(f"**工具调用:** {receipt.tool_calls} 次")
+        
+        if receipt.tool_call_details:
+            lines.append("\\n**工具调用详情:**")
+            for i, tool in enumerate(receipt.tool_call_details[:5], 1):
+                tool_name = tool.get("tool_name", "unknown")
+                lines.append(f"  {i}. `{tool_name}`")
+            if len(receipt.tool_call_details) > 5:
+                lines.append(f"  ... 还有 {len(receipt.tool_call_details) - 5} 个")
+        
+        if receipt.status == TaskStatus.FAILED:
+            lines.append(f"\\n**错误类型:** {receipt.error_class or '未知'}")
+            lines.append(f"**错误信息:** {receipt.error_message or '无'}".replace("\\n", " ")[:200])
+        
+        return "\\n".join(lines)
     
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model for this session.
@@ -6640,12 +6799,12 @@ class GatewayRunner:
 
         # Normalize Unicode dashes (Telegram/iOS auto-converts -- to em/en dash)
         import re as _re
-        args = _re.sub(r'[\u2012\u2013\u2014\u2015](days|source)', r'--\1', args)
+        args = _re.sub(r'[\u2012\u2013\u2014\u2015](days|source|admin)', r'--\1', args)
 
         days = 30
-        source = None
+        admin = False
 
-        # Parse simple args: /insights 7  or  /insights --days 7
+        # Parse simple args: /insights 7  or  /insights --days 7 --admin
         if args:
             parts = args.split()
             i = 0
@@ -6656,9 +6815,9 @@ class GatewayRunner:
                     except ValueError:
                         return f"Invalid --days value: {parts[i + 1]}"
                     i += 2
-                elif parts[i] == "--source" and i + 1 < len(parts):
-                    source = parts[i + 1]
-                    i += 2
+                elif parts[i] == "--admin":
+                    admin = True
+                    i += 1
                 elif parts[i].isdigit():
                     days = int(parts[i])
                     i += 1
@@ -6666,18 +6825,16 @@ class GatewayRunner:
                     i += 1
 
         try:
-            from hermes_state import SessionDB
-            from agent.insights import InsightsEngine
+            from agent.event_insights import EventInsightsEngine
 
             loop = _asyncio.get_running_loop()
 
             def _run_insights():
-                db = SessionDB()
-                engine = InsightsEngine(db)
-                report = engine.generate(days=days, source=source)
-                result = engine.format_gateway(report)
-                db.close()
-                return result
+                trace_file = _hermes_home / "analytics" / "events.jsonl"
+                engine = EventInsightsEngine(trace_file=trace_file)
+                user_id = None if admin else getattr(event.source, "user_id", None)
+                report = engine.generate(days=days, user_id=user_id, admin=admin)
+                return engine.format_gateway(report)
 
             return await loop.run_in_executor(None, _run_insights)
         except Exception as e:
@@ -8790,6 +8947,7 @@ class GatewayRunner:
             # to the user immediately.
             from tools.approval import (
                 register_gateway_notify,
+                register_gateway_timeout_callback,
                 reset_current_session_key,
                 set_current_session_key,
                 unregister_gateway_notify,
@@ -8832,9 +8990,17 @@ class GatewayRunner:
                         ).result(timeout=15)
                         return
                     except Exception as _e:
-                        logger.warning(
-                            "Button-based approval failed, falling back to text: %s", _e
-                        )
+                        # Enhanced degradation warning for Feishu interactive approval failures
+                        adapter_type = type(_status_adapter).__name__
+                        if adapter_type == "FeishuAdapter":
+                            logger.warning(
+                                "[Feishu] Interactive approval card failed (API error or missing permissions). "
+                                "Falling back to text-based approval. Error: %s", _e
+                            )
+                        else:
+                            logger.warning(
+                                "Button-based approval failed, falling back to text: %s", _e
+                            )
 
                 # Fallback: plain text approval prompt
                 cmd_preview = cmd[:200] + "..." if len(cmd) > 200 else cmd
@@ -8856,6 +9022,17 @@ class GatewayRunner:
                     ).result(timeout=15)
                 except Exception as _e:
                     logger.error("Failed to send approval request: %s", _e)
+
+            def _approval_timeout_sync(choice: str) -> None:
+                """Handle approval timeout by updating the Feishu card to expired state.
+                
+                Called from the agent thread when an approval times out.
+                Bridges sync→async to update the card on the event loop.
+                """
+                # Only Feishu supports timeout card updates currently
+                if getattr(type(_status_adapter), "register_approval_timeout_callback", None) is not None:
+                    # The Feishu adapter will handle the card update via its own callback
+                    pass
 
             # Prepend pending model switch note so the model knows about the switch
             _pending_notes = getattr(self, '_pending_model_notes', {})
@@ -8881,6 +9058,12 @@ class GatewayRunner:
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
+            register_gateway_timeout_callback(_approval_session_key, _approval_timeout_sync)
+            
+            # Register Feishu-specific timeout callback for card updates
+            if getattr(type(_status_adapter), "register_approval_timeout_callback", None) is not None:
+                _status_adapter.register_approval_timeout_callback(_approval_session_key, _approval_timeout_sync)
+            
             try:
                 result = agent.run_conversation(message, conversation_history=agent_history, task_id=session_id)
             finally:
