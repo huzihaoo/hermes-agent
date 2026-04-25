@@ -5489,6 +5489,27 @@ class HermesCLI:
             self._handle_debug_command()
         elif canonical == "paste":
             self._handle_paste_command()
+        elif canonical == "trace":
+            from hermes_cli.trace import trace_list, trace_show
+            args = cmd_original.split(maxsplit=2)
+            if len(args) < 2 or args[1] == "list":
+                trace_list()
+            elif args[1] == "show" and len(args) > 2:
+                trace_show(args[2])
+            else:
+                trace_list()
+        elif canonical == "cost":
+            from hermes_cli.trace import cost_summary
+            args = cmd_original.split()
+            days = 30
+            group_by = None
+            for i, a in enumerate(args):
+                if a == "--days" and i + 1 < len(args):
+                    try: days = int(args[i + 1])
+                    except ValueError: pass
+                if a == "--group-by" and i + 1 < len(args):
+                    group_by = args[i + 1]
+            cost_summary(days=days, group_by=group_by)
         elif canonical == "image":
             self._handle_image_command(cmd_original)
         elif canonical == "reload":

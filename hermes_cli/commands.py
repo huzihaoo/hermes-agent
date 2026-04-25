@@ -156,6 +156,12 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True, aliases=("gateway",)),
     CommandDef("paste", "Check clipboard for an image and attach it", "Info",
                cli_only=True),
+    
+    # Observability
+    CommandDef("trace", "Manage traces: /trace list|show <id>", "Observability",
+               args_hint="[list|show] [id]", subcommands=("list", "show")),
+    CommandDef("cost", "Show cost summary", "Observability",
+               args_hint="[--days N] [--user <id>] [--group-by user]"),
     CommandDef("image", "Attach a local image file for your next prompt", "Info",
                cli_only=True, args_hint="<path>"),
     CommandDef("update", "Update Hermes Agent to the latest version", "Info",
