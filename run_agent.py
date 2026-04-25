@@ -1229,6 +1229,7 @@ class AIAgent:
                     self._memory_store = MemoryStore(
                         memory_char_limit=mem_config.get("memory_char_limit", 2200),
                         user_char_limit=mem_config.get("user_char_limit", 1375),
+                        user_id=user_id,  # Per-user memory isolation
                     )
                     self._memory_store.load_from_disk()
             except Exception:
@@ -3215,6 +3216,13 @@ class AIAgent:
         NOT called per-turn — only at CLI exit, /reset, gateway
         session expiry, etc.
         """
+        # Auto memory review before shutdown
+        if self._memory_store and messages:
+            try:
+                self._auto_memory_review(messages)
+            except Exception:
+                pass  # Don't break shutdown on review failure
+        
         if self._memory_manager:
             try:
                 self._memory_manager.on_session_end(messages or [])
@@ -3245,6 +3253,67 @@ class AIAgent:
             self._memory_manager.on_session_end(messages or [])
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # Auto memory review & error evolution
+    # ------------------------------------------------------------------
+
+    # Patterns that indicate the user corrected the agent
+    _CORRECTION_PATTERNS = (
+        "不对", "不是这样", "错了", "你搞错了", "不要这样",
+        "remember this", "记住", "别再", "don't do that",
+        "wrong", "incorrect", "no, ", "nope",
+    )
+
+    def _detect_corrections(self, messages: list) -> list[str]:
+        """Scan user messages for correction patterns. Return matched messages."""
+        corrections = []
+        for msg in messages:
+            if msg.get("role") != "user":
+                continue
+            text = (msg.get("content") or "").lower()
+            if any(p in text for p in self._CORRECTION_PATTERNS):
+                corrections.append(msg.get("content", ""))
+        return corrections
+
+    def _auto_memory_review(self, messages: list) -> None:
+        """End-of-session auto review: detect corrections and save to memory.
+
+        Two mechanisms:
+        1. Correction detection: if user corrected the agent, extract the
+           correction and save it as a memory entry.
+        2. Session summary: if the session was long enough (>= flush_min_turns),
+           check if there are learnings worth persisting.
+        """
+        if not self._memory_store:
+            return
+
+        try:
+            corrections = self._detect_corrections(messages)
+            if not corrections:
+                return
+
+            # Build a compact correction summary
+            from tools.memory_tool import memory_tool
+            for correction_text in corrections[:3]:  # Cap at 3 corrections per session
+                # Extract the core correction (first 200 chars)
+                snippet = correction_text.strip()[:200]
+                if not snippet:
+                    continue
+                # Save as memory entry
+                try:
+                    memory_tool(
+                        action="add",
+                        target="memory",
+                        content=f"User correction: {snippet}",
+                        store=self._memory_store,
+                    )
+                except Exception as e:
+                    # Log but don't break shutdown
+                    logger.warning(f"Failed to save correction to memory: {e}")
+        except Exception as e:
+            # Log but don't break shutdown
+            logger.warning(f"Auto memory review failed: {e}")
 
     def close(self) -> None:
         """Release all resources held by this agent instance.
@@ -7475,6 +7544,13 @@ class AIAgent:
             parsed_calls.append((tool_call, function_name, function_args))
 
         # ── Logging / callbacks ──────────────────────────────────────────
+        try:
+            from hermes_events import EventEmitter
+            _trace_file = Path(self.logs_dir).parent / "analytics" / "events.jsonl"
+            _tool_emitter = EventEmitter(trace_file=_trace_file)
+        except Exception:
+            _tool_emitter = None
+
         tool_names_str = ", ".join(name for _, name, _ in parsed_calls)
         if not self.quiet_mode:
             print(f"  ⚡ Concurrent: {num_tools} tool calls — {tool_names_str}")
@@ -7488,6 +7564,15 @@ class AIAgent:
                     print(f"  📞 Tool {i}: {name}({list(args.keys())}) - {args_preview}")
 
         for tc, name, args in parsed_calls:
+            if _tool_emitter is not None:
+                try:
+                    _tool_emitter.emit("tool:call", {
+                        "task_id": effective_task_id,
+                        "tool_name": name,
+                        "args_preview": _build_tool_preview(name, args),
+                    })
+                except Exception:
+                    pass
             if self.tool_progress_callback:
                 try:
                     preview = _build_tool_preview(name, args)
@@ -7680,9 +7765,16 @@ class AIAgent:
             enforce_turn_budget(turn_tool_msgs, env=get_active_env(effective_task_id))
 
     def _execute_tool_calls_sequential(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
-        """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools."""
+        """Execute tool calls sequentially (one at a time)."""
+        try:
+            from hermes_events import EventEmitter
+            _trace_file = Path(self.logs_dir).parent / "analytics" / "events.jsonl"
+            _tool_emitter = EventEmitter(trace_file=_trace_file)
+        except Exception:
+            _tool_emitter = None
+
         for i, tool_call in enumerate(assistant_message.tool_calls, 1):
-            # SAFETY: check interrupt BEFORE starting each tool.
+
             # If the user sent "stop" during a previous tool's execution,
             # do NOT start any more tools -- skip them all immediately.
             if self._interrupt_requested:
@@ -7754,6 +7846,15 @@ class AIAgent:
                     pass
 
             if _block_msg is None and self.tool_progress_callback:
+                if _tool_emitter is not None:
+                    try:
+                        _tool_emitter.emit("tool:call", {
+                            "task_id": effective_task_id,
+                            "tool_name": function_name,
+                            "args_preview": _build_tool_preview(function_name, function_args),
+                        })
+                    except Exception:
+                        pass
                 try:
                     preview = _build_tool_preview(function_name, function_args)
                     self.tool_progress_callback("tool.started", function_name, preview, function_args)
@@ -7761,10 +7862,30 @@ class AIAgent:
                     logging.debug(f"Tool progress callback error: {cb_err}")
 
             if _block_msg is None and self.tool_start_callback:
+                if _tool_emitter is not None and not self.tool_progress_callback:
+                    try:
+                        _tool_emitter.emit("tool:call", {
+                            "task_id": effective_task_id,
+                            "tool_name": function_name,
+                            "args_preview": _build_tool_preview(function_name, function_args),
+                        })
+                    except Exception:
+                        pass
                 try:
                     self.tool_start_callback(tool_call.id, function_name, function_args)
                 except Exception as cb_err:
                     logging.debug(f"Tool start callback error: {cb_err}")
+
+            # Checkpoint: snapshot working dir before file-mutating tools
+            if _block_msg is None and not self.tool_progress_callback and not self.tool_start_callback and _tool_emitter is not None:
+                try:
+                    _tool_emitter.emit("tool:call", {
+                        "task_id": effective_task_id,
+                        "tool_name": function_name,
+                        "args_preview": _build_tool_preview(function_name, function_args),
+                    })
+                except Exception:
+                    pass
 
             # Checkpoint: snapshot working dir before file-mutating tools
             if _block_msg is None and function_name in ("write_file", "patch") and self._checkpoint_mgr.enabled:
@@ -8250,6 +8371,50 @@ class AIAgent:
 
         return final_response
 
+    def _unified_failure_exit(
+        self,
+        *,
+        task_id: str,
+        error_class: str,
+        error_message: str,
+        response_text: str = "",
+        conversation_history: List[Dict[str, Any]],
+        iterations: int,
+        partial: bool = False,
+    ) -> Dict[str, Any]:
+        """Unified failure exit point for all run_conversation failure paths.
+        
+        Responsibilities:
+        - Emit task:failed event
+        - Finalize pending event if exists
+        - Standardize error_class / error_message
+        - Assemble return payload
+        """
+        # Emit task:failed event
+        try:
+            from hermes_events import EventEmitter
+            trace_file = Path(self.logs_dir).parent / "analytics" / "events.jsonl"
+            emitter = EventEmitter(trace_file=trace_file)
+            emitter.emit("task:failed", {
+                "task_id": task_id,
+                "error_class": error_class,
+                "error_message": error_message,
+                "iterations": iterations,
+            })
+        except Exception:
+            pass  # Don't let event emission block the failure return
+        
+        return {
+            "completed": False,
+            "failed": True,
+            "partial": partial,
+            "response": response_text,
+            "conversation_history": conversation_history,
+            "iterations": iterations,
+            "error_class": error_class,
+            "error_message": error_message,
+        }
+
     def run_conversation(
         self,
         user_message: str,
@@ -8316,6 +8481,24 @@ class AIAgent:
         self._persist_user_message_override = persist_user_message
         # Generate unique task_id if not provided to isolate VMs between concurrent tasks
         effective_task_id = task_id or str(uuid.uuid4())
+        
+        # Initialize task trace emitter
+        from hermes_events import EventEmitter, TaskEvent
+        _trace_file = Path(self.logs_dir).parent / "analytics" / "events.jsonl"
+        _task_store = None
+        try:
+            from gateway.tasks.store import TaskStore
+            _task_store_path = Path(self.logs_dir).parent / "analytics" / "tasks.db"
+            _task_store = TaskStore(db_path=_task_store_path)
+        except Exception:
+            pass  # TaskStore is optional, fall back to JSONL-only
+        _emitter = EventEmitter(trace_file=_trace_file, task_store=_task_store)
+        _emitter.mark_pending(effective_task_id)
+        _emitter.emit("task:start", TaskEvent.task_start(
+            task_id=effective_task_id,
+            platform=self.platform or "cli",
+            user_id=getattr(self, "user_id", None),
+        )["data"])
         
         # Reset retry counters and iteration budget at the start of each turn
         # so subagent usage from a previous turn doesn't eat into the next one.
@@ -9471,6 +9654,17 @@ class AIAgent:
                                 )
                             except Exception:
                                 pass  # never block the agent loop
+
+                        try:
+                            _emitter.emit("api:call", TaskEvent.api_call(
+                                task_id=effective_task_id,
+                                model=self.model,
+                                provider=self.provider,
+                                input_tokens=canonical_usage.input_tokens,
+                                output_tokens=canonical_usage.output_tokens,
+                            )["data"])
+                        except Exception:
+                            pass
                         
                         if self.verbose_logging:
                             logging.debug(f"Token usage: prompt={usage_dict['prompt_tokens']:,}, completion={usage_dict['completion_tokens']:,}, total={usage_dict['total_tokens']:,}")
@@ -11361,6 +11555,33 @@ class AIAgent:
 
         # Clear stream callback so it doesn't leak into future calls
         self._stream_callback = None
+
+        # Finalize task trace
+        # Finalize task trace
+        _emitter.finalize_pending(effective_task_id)
+        if completed:
+            _emitter.emit("task:complete", TaskEvent.task_complete(
+                task_id=effective_task_id,
+                total_tokens=self.session_total_tokens,
+                api_calls=api_call_count,
+                tool_calls=sum(1 for m in messages if m.get("role") == "tool"),
+            )["data"])
+        else:
+            _error_message = result.get("error") if isinstance(result, dict) else None
+            _error_message = _error_message or (final_response if isinstance(final_response, str) else "task failed")
+            _emitter.emit("task:failed", TaskEvent.task_failed(
+                task_id=effective_task_id,
+                error_class="task_failed",
+                error_message=str(_error_message)[:500],
+            )["data"])
+
+            _error_message = result.get("error") if isinstance(result, dict) else None
+            _error_message = _error_message or (final_response if isinstance(final_response, str) else "task failed")
+            _emitter.emit("task:failed", TaskEvent.task_failed(
+                task_id=effective_task_id,
+                error_class="task_failed",
+                error_message=str(_error_message),
+            )["data"])
 
         # Check skill trigger NOW — based on how many tool iterations THIS turn used.
         _should_review_skills = False

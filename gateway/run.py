@@ -732,7 +732,13 @@ class GatewayRunner:
         try:
             from hermes_events import EventEmitter
             trace_file = _hermes_home / "analytics" / "events.jsonl"
-            emitter = EventEmitter(trace_file=trace_file)
+            _task_store = None
+            try:
+                from gateway.tasks.store import TaskStore
+                _task_store = TaskStore(db_path=_hermes_home / "analytics" / "tasks.db")
+            except Exception:
+                pass
+            emitter = EventEmitter(trace_file=trace_file, task_store=_task_store)
             text = getattr(event, "text", "") or ""
             summary = text[:80]
             emitter.emit("request:start", {
