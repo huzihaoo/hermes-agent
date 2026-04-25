@@ -1884,6 +1884,38 @@ async def delete_cron_job(job_id: str):
 
 
 # ---------------------------------------------------------------------------
+# Observability endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/traces")
+async def list_traces(limit: int = 20, user_id: Optional[str] = None, status: Optional[str] = None):
+    from gateway.observability.api import api_list_traces
+    return api_list_traces(limit=limit, user_id=user_id, status=status)
+
+
+@app.get("/api/traces/{trace_id}")
+async def get_trace(trace_id: str):
+    from gateway.observability.api import api_get_trace
+    result = api_get_trace(trace_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Trace not found")
+    return result
+
+
+@app.get("/api/stats/daily")
+async def stats_daily(days: int = 7):
+    from gateway.observability.api import api_stats_daily
+    return api_stats_daily(days=days)
+
+
+@app.get("/api/stats/cost")
+async def stats_cost(days: int = 30, group_by: Optional[str] = None):
+    from gateway.observability.api import api_stats_cost
+    return api_stats_cost(days=days, group_by=group_by)
+
+
+# ---------------------------------------------------------------------------
 # Skills & Tools endpoints
 # ---------------------------------------------------------------------------
 

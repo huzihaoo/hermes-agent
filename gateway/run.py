@@ -3151,6 +3151,12 @@ class GatewayRunner:
 
         if canonical == "reload-mcp":
             return await self._handle_reload_mcp_command(event)
+        
+        if canonical == "trace":
+            return await self._handle_trace_command(event)
+        
+        if canonical == "cost":
+            return await self._handle_cost_command(event)
 
         if canonical == "approve":
             return await self._handle_approve_command(event)
@@ -7237,6 +7243,102 @@ class GatewayRunner:
         except Exception as e:
             logger.error("Insights command error: %s", e, exc_info=True)
             return f"Error generating insights: {e}"
+
+    async def _handle_trace_command(self, event: MessageEvent) -> str:
+        """Handle /trace [trace_id] - list traces or show trace details."""
+        import time
+        from gateway.observability.store import TraceStore
+        
+        store = TraceStore(db_path=_hermes_home / "analytics" / "traces.db")
+        args = event.get_command_args().strip()
+        
+        if not args:
+            # List recent traces
+            traces = store.list_recent(limit=15)
+            if not traces:
+                return "📊 暂无 Trace 记录。"
+            
+            lines = ["📊 **最近 Trace**\\n"]
+            for t in traces:
+                icon = {"completed": "✅", "failed": "❌", "running": "⏳"}.get(t["status"], "❓")
+                dur = ""
+                if t.get("end_time") and t.get("start_time"):
+                    dur = f"{t['end_time'] - t['start_time']:.1f}s"
+                cost = f"${t.get('total_cost_usd', 0):.4f}"
+                tokens = f"{t.get('total_tokens', 0):,}"
+                summary = (t.get("request_summary") or "")[:40]
+                lines.append(f"{icon} `{t['trace_id'][:10]}` {dur:>6} {tokens:>8}tok {cost:>8} {summary}")
+            
+            lines.append("\\n💡 `/trace <id>` 查看详情")
+            return "\\n".join(lines)
+        
+        # Show specific trace
+        trace_id = args.split()[0]
+        trace = store.get(trace_id)
+        
+        # Prefix match
+        if not trace:
+            all_traces = store.list_recent(limit=100)
+            matches = [t for t in all_traces if t["trace_id"].startswith(trace_id)]
+            if len(matches) == 1:
+                trace = matches[0]
+        
+        if not trace:
+            return f"❌ Trace `{trace_id}` 未找到。"
+        
+        icon = {"completed": "✅", "failed": "❌", "running": "⏳"}.get(trace["status"], "❓")
+        lines = [
+            f"{icon} **Trace 详情**\\n",
+            f"**ID:** `{trace['trace_id']}`",
+            f"**用户:** {trace.get('user_id') or '未知'}",
+            f"**状态:** {trace['status']}",
+            f"**Token:** {trace.get('total_tokens', 0):,}",
+            f"**成本:** ${trace.get('total_cost_usd', 0):.4f}",
+        ]
+        
+        if trace.get("end_time") and trace.get("start_time"):
+            lines.append(f"**耗时:** {trace['end_time'] - trace['start_time']:.1f}s")
+        
+        # Spans
+        spans = store.get_spans(trace["trace_id"])
+        if spans:
+            lines.append("\\n**步骤:**")
+            for i, s in enumerate(spans, 1):
+                kind_icon = {"llm": "🤖", "tool": "🔧"}.get(s["kind"], "⚙️")
+                dur = f"{s.get('duration_ms', 0):.0f}ms"
+                cost = f"${s.get('cost_usd', 0):.4f}" if s.get("cost_usd") else ""
+                lines.append(f"  {i}. {kind_icon} {s['name']} {dur} {cost}")
+        
+        return "\\n".join(lines)
+
+    async def _handle_cost_command(self, event: MessageEvent) -> str:
+        """Handle /cost [days] - show cost summary."""
+        from gateway.observability.store import TraceStore
+        
+        store = TraceStore(db_path=_hermes_home / "analytics" / "traces.db")
+        args = event.get_command_args().strip()
+        
+        days = 30
+        if args:
+            try:
+                days = int(args.split()[0])
+            except ValueError:
+                pass
+        
+        stats = store.stats_daily(days=days)
+        by_user = store.stats_by_user(days=days)
+        
+        lines = [f"💰 **成本统计** (最近 {days} 天)\\n"]
+        lines.append(f"**任务数:** {stats['total_traces']}")
+        lines.append(f"**Token:** {stats['total_tokens']:,}")
+        lines.append(f"**总成本:** ${stats['total_cost_usd']:.4f}")
+        
+        if by_user:
+            lines.append("\\n**按用户:**")
+            for u in by_user[:10]:
+                lines.append(f"  {u['user_id']}: {u['trace_count']}次 {u.get('total_tokens', 0):,}tok ${u.get('total_cost_usd', 0):.4f}")
+        
+        return "\\n".join(lines)
 
     async def _handle_reload_mcp_command(self, event: MessageEvent) -> str:
         """Handle /reload-mcp command -- disconnect and reconnect all MCP servers."""
