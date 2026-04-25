@@ -15,7 +15,7 @@ import re
 import sys
 import threading
 import unicodedata
-from typing import Optional
+from typing import Any, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -29,12 +29,12 @@ _approval_session_key: contextvars.ContextVar[str] = contextvars.ContextVar(
 )
 
 
-def set_current_session_key(session_key: str) -> contextvars.Token[str]:
+def set_current_session_key(session_key: str) -> Any:
     """Bind the active approval session key to the current context."""
     return _approval_session_key.set(session_key or "")
 
 
-def reset_current_session_key(token: contextvars.Token[str]) -> None:
+def reset_current_session_key(token: Any) -> None:
     """Restore the prior approval session key context."""
     _approval_session_key.reset(token)
 
@@ -143,7 +143,7 @@ def _legacy_pattern_key(pattern: str) -> str:
     return pattern.split(r'\b')[1] if r'\b' in pattern else pattern[:20]
 
 
-_PATTERN_KEY_ALIASES: dict[str, set[str]] = {}
+_PATTERN_KEY_ALIASES: Dict[str, Set[str]] = {}
 for _pattern, _description in DANGEROUS_PATTERNS:
     _legacy_key = _legacy_pattern_key(_pattern)
     _canonical_key = _description
@@ -151,7 +151,7 @@ for _pattern, _description in DANGEROUS_PATTERNS:
     _PATTERN_KEY_ALIASES.setdefault(_legacy_key, set()).update({_legacy_key, _canonical_key})
 
 
-def _approval_key_aliases(pattern_key: str) -> set[str]:
+def _approval_key_aliases(pattern_key: str) -> Set[str]:
     """Return all approval keys that should match this pattern.
 
     New approvals use the human-readable description string, but older
@@ -202,9 +202,9 @@ def detect_dangerous_command(command: str) -> tuple:
 # =========================================================================
 
 _lock = threading.Lock()
-_pending: dict[str, dict] = {}
-_session_approved: dict[str, set] = {}
-_session_yolo: set[str] = set()
+_pending: Dict[str, dict] = {}
+_session_approved: Dict[str, set] = {}
+_session_yolo: Set[str] = set()
 _permanent_approved: set = set()
 
 # =========================================================================
@@ -226,8 +226,9 @@ class _ApprovalEntry:
         self.result: Optional[str] = None  # "once"|"session"|"always"|"deny"
 
 
-_gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
-_gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+_gateway_queues: Dict[str, List] = {}        # session_key → [_ApprovalEntry, …]
+_gateway_notify_cbs: Dict[str, object] = {}  # session_key → callable(approval_data)
+_gateway_timeout_cbs: Dict[str, object] = {} # session_key → callable(approval_data)
 
 
 def register_gateway_notify(session_key: str, cb) -> None:
@@ -240,6 +241,17 @@ def register_gateway_notify(session_key: str, cb) -> None:
     """
     with _lock:
         _gateway_notify_cbs[session_key] = cb
+
+
+def register_gateway_timeout_callback(session_key: str, cb) -> None:
+    """Register a per-session callback invoked when an approval times out.
+
+    The callback signature is ``cb(approval_data: dict) -> None`` where
+    *approval_data* is the same dict passed to the notify callback.
+    This allows platforms to update the approval card to show "expired".
+    """
+    with _lock:
+        _gateway_timeout_cbs[session_key] = cb
 
 
 def unregister_gateway_notify(session_key: str) -> None:
@@ -407,7 +419,7 @@ def save_permanent_allowlist(patterns: set):
 # =========================================================================
 
 def prompt_dangerous_approval(command: str, description: str,
-                              timeout_seconds: int | None = None,
+                              timeout_seconds: Optional[int] = None,
                               allow_permanent: bool = True,
                               approval_callback=None) -> str:
     """Prompt the user to approve a dangerous command (CLI only).
@@ -878,6 +890,18 @@ def check_all_command_guards(command: str, env_type: str,
             choice = entry.result
             if not resolved or choice is None or choice == "deny":
                 reason = "timed out" if not resolved else "denied by user"
+                
+                # Invoke timeout callback if this was a timeout (not a user denial)
+                if not resolved:
+                    timeout_cb = None
+                    with _lock:
+                        timeout_cb = _gateway_timeout_cbs.get(session_key)
+                    if timeout_cb is not None:
+                        try:
+                            timeout_cb(approval_data)
+                        except Exception as exc:
+                            logger.warning("Gateway timeout callback failed: %s", exc)
+                
                 return {
                     "approved": False,
                     "message": f"BLOCKED: Command {reason}. Do NOT retry this command.",

@@ -174,6 +174,7 @@ _FEISHU_WEBHOOK_BODY_TIMEOUT_SECONDS = 30          # max seconds to read request
 _FEISHU_WEBHOOK_ANOMALY_THRESHOLD = 25             # consecutive error responses before WARNING log
 _FEISHU_WEBHOOK_ANOMALY_TTL_SECONDS = 6 * 60 * 60  # anomaly tracker TTL (6 hours) — matches openclaw
 _FEISHU_CARD_ACTION_DEDUP_TTL_SECONDS = 15 * 60    # card action token dedup window (15 min)
+_FEISHU_APPROVAL_STATE_TTL_SECONDS = 10 * 60        # stale approval button state retention window
 
 _APPROVAL_CHOICE_MAP: Dict[str, str] = {
     "approve_once": "once",
@@ -1090,6 +1091,8 @@ class FeishuAdapter(BasePlatformAdapter):
         # Exec approval button state (approval_id → {session_key, message_id, chat_id})
         self._approval_state: Dict[int, Dict[str, str]] = {}
         self._approval_counter = itertools.count(1)
+        # Approval timeout callbacks (session_key → callback)
+        self._approval_callbacks: Dict[str, Any] = {}
         self._load_seen_message_ids()
         
         # Admission control (optional, enabled via config)
@@ -1490,6 +1493,7 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
+            self._gc_stale_approval_state()
             approval_id = next(self._approval_counter)
             cmd_preview = command[:3000] + "..." if len(command) > 3000 else command
 
@@ -1539,11 +1543,19 @@ class FeishuAdapter(BasePlatformAdapter):
                     "session_key": session_key,
                     "message_id": result.message_id or "",
                     "chat_id": chat_id,
+                    "created_at": time.monotonic(),
                 }
             return result
         except Exception as exc:
             logger.warning("[Feishu] send_exec_approval failed: %s", exc)
             return SendResult(success=False, error=str(exc))
+
+    def register_approval_timeout_callback(self, session_key: str, callback: Any) -> None:
+        """Register a callback to be invoked when an approval request times out.
+        
+        The callback will be called with a single argument: the choice string "timeout".
+        """
+        self._approval_callbacks[session_key] = callback
 
     @staticmethod
     def _build_resolved_approval_card(*, choice: str, user_name: str) -> Dict[str, Any]:
@@ -1563,6 +1575,94 @@ class FeishuAdapter(BasePlatformAdapter):
                 },
             ],
         }
+
+    @staticmethod
+    def _build_permission_denied_approval_card(*, user_name: str) -> Dict[str, Any]:
+        """Build raw card JSON for a rejected approval click without sufficient privileges."""
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"content": "⛔ Approval Not Allowed", "tag": "plain_text"},
+                "template": "red",
+            },
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": (
+                        f"⛔ **{user_name}** does not have permission to approve this command. "
+                        "Ask the requester, an admin, or the owner to approve it."
+                    ),
+                },
+            ],
+        }
+
+    @staticmethod
+    def _build_expired_approval_card() -> Dict[str, Any]:
+        """Build raw card JSON for an expired approval request."""
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"content": "⏱️ Approval Expired", "tag": "plain_text"},
+                "template": "grey",
+            },
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": "⏱️ This approval request has expired and is no longer valid.",
+                },
+            ],
+        }
+
+    def _gc_stale_approval_state(self, max_age_seconds: float = _FEISHU_APPROVAL_STATE_TTL_SECONDS) -> None:
+        """Drop stale approval button state entries that are unlikely to be resolved."""
+        now = time.monotonic()
+        stale_ids = [
+            approval_id
+            for approval_id, state in self._approval_state.items()
+            if now - float(state.get("created_at", 0) or 0) > max_age_seconds
+        ]
+        for approval_id in stale_ids:
+            state = self._approval_state.pop(approval_id, None)
+            if state:
+                # Fire timeout callback if registered
+                session_key = state.get("session_key", "")
+                if session_key and session_key in self._approval_callbacks:
+                    callback = self._approval_callbacks.pop(session_key, None)
+                    if callback:
+                        try:
+                            callback("timeout")
+                        except Exception as exc:
+                            logger.warning("[Feishu] approval timeout callback failed: %s", exc)
+                
+                # Update Feishu card to expired state
+                message_id = state.get("message_id", "")
+                chat_id = state.get("chat_id", "")
+                if message_id and chat_id and self._loop and not self._loop.is_closed():
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            self._update_approval_card_to_expired(message_id, chat_id),
+                            self._loop
+                        )
+                    except Exception as exc:
+                        logger.warning("[Feishu] failed to schedule expired card update: %s", exc)
+
+    async def _update_approval_card_to_expired(self, message_id: str, chat_id: str) -> None:
+        """Update a Feishu approval card to show expired state via message PATCH API."""
+        if not self._client:
+            return
+        try:
+            card = self._build_expired_approval_card()
+            payload = json.dumps(card, ensure_ascii=False)
+            body = self._build_update_message_body(msg_type="interactive", content=payload)
+            request = self._build_update_message_request(message_id=message_id, request_body=body)
+            response = await asyncio.to_thread(self._client.im.v1.message.update, request)
+            result = self._finalize_send_result(response, "expired card update failed")
+            if result.success:
+                logger.info("[Feishu] Updated approval card %s to expired state", message_id)
+            else:
+                logger.warning("[Feishu] Failed to update approval card %s to expired: %s", message_id, result.error)
+        except Exception as exc:
+            logger.warning("[Feishu] Exception updating approval card to expired: %s", exc)
 
     async def send_voice(
         self,
@@ -1939,6 +2039,30 @@ class FeishuAdapter(BasePlatformAdapter):
         open_id = str(getattr(operator, "open_id", "") or "")
         user_name = self._get_cached_sender_name(open_id) or open_id
 
+        try:
+            from tools.permission_policy import get_user_role_by_id
+
+            role = get_user_role_by_id(open_id) if open_id else "member"
+        except Exception:
+            logger.debug("[Feishu] Failed to resolve approval-click user role", exc_info=True)
+            role = "member"
+
+        if choice != "deny" and role == "member":
+            logger.warning(
+                "[Feishu] Blocking approval click from unauthorized member %s for approval %s",
+                open_id,
+                approval_id,
+            )
+            if P2CardActionTriggerResponse is None:
+                return None
+            response = P2CardActionTriggerResponse()
+            if CallBackCard is not None:
+                card = CallBackCard()
+                card.type = "raw"
+                card.data = self._build_permission_denied_approval_card(user_name=user_name)
+                response.card = card
+            return response
+
         self._submit_on_loop(loop, self._resolve_approval(approval_id, choice, user_name))
 
         if P2CardActionTriggerResponse is None:
@@ -1957,6 +2081,12 @@ class FeishuAdapter(BasePlatformAdapter):
         if not state:
             logger.debug("[Feishu] Approval %s already resolved or unknown", approval_id)
             return
+        
+        # Clean up timeout callback since approval was resolved normally
+        session_key = state.get("session_key", "")
+        if session_key:
+            self._approval_callbacks.pop(session_key, None)
+        
         try:
             from tools.approval import resolve_gateway_approval
             count = resolve_gateway_approval(state["session_key"], choice)
@@ -2296,11 +2426,15 @@ class FeishuAdapter(BasePlatformAdapter):
             message_text = event.text or ""
             chat_id = event.source.chat_id or ""
             thread_id = event.source.thread_id or ""
+            chat_type = getattr(event.source, "chat_type", "dm") or "dm"
+            # Map SessionSource chat_type ("dm"/"group") to admission chat_type
+            admission_chat_type = "group" if chat_type == "group" else None
             try:
                 admitted, feedback, queue_item = await self._admission_controller.admit(
                     user_id=user_id,
                     message=message_text,
                     chat_id=chat_id,
+                    chat_type=admission_chat_type,
                     thread_id=thread_id,
                     platform="feishu",
                 )
@@ -2308,11 +2442,12 @@ class FeishuAdapter(BasePlatformAdapter):
                     logger.info("[admission] Rejected user=%s: %s", user_id, feedback)
                     return
                 logger.debug(
-                    "[admission] Admitted user=%s lane=%s pos=%s",
+                    "[admission] Queued user=%s lane=%s id=%s",
                     user_id,
                     queue_item.lane if queue_item else "?",
                     queue_item.id if queue_item else "?",
                 )
+                return  # Worker will process via _process_queue_item
             except Exception:
                 logger.warning("[admission] Gate error, falling through", exc_info=True)
 

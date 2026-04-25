@@ -359,7 +359,10 @@ class TestCardActionCallbackResponse:
         )
         adapter._sender_name_cache["ou_bob"] = ("Bob", 9999999999)
 
-        with patch("asyncio.run_coroutine_threadsafe", side_effect=_close_submitted_coro):
+        with (
+            patch("asyncio.run_coroutine_threadsafe", side_effect=_close_submitted_coro),
+            patch("tools.permission_policy.get_user_role_by_id", return_value="admin"),
+        ):
             response = adapter._on_card_action_trigger(data)
 
         assert response is not None

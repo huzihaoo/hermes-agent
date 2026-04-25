@@ -133,4 +133,4 @@ testpaths = ["tests"]
 markers = [
     "integration: marks tests requiring external services (API keys, Modal, etc.)",
 ]
-addopts = "-m 'not integration' -n auto"
+addopts = "-m 'not integration'"

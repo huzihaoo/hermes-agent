@@ -93,6 +93,9 @@ def cron_list(show_all: bool = False):
         script = job.get("script")
         if script:
             print(f"    Script:    {script}")
+        template_id = job.get("template_id")
+        if template_id:
+            print(f"    Template:  {template_id[:8]}")
 
         # Execution history
         last_status = job.get("last_status")
@@ -158,16 +161,50 @@ def cron_status():
 
 
 def cron_create(args):
+    from gateway.tasks.template import TemplateStore
+    from hermes_constants import get_hermes_home
+    
+    # Handle template-based creation
+    template_id = getattr(args, "template", None)
+    prompt = args.prompt or ""
+    
+    if template_id:
+        # Load template and render with params
+        store = TemplateStore(db_path=get_hermes_home() / "analytics" / "templates.db")
+        template = store.get(template_id)
+        
+        if not template:
+            print(color(f"Template {template_id} not found.", Colors.RED))
+            return 1
+        
+        # Parse template_params from ["key=value", ...] to {"key": "value"}
+        param_values = {}
+        if getattr(args, "template_params", None):
+            for param_str in args.template_params:
+                if "=" not in param_str:
+                    print(color(f"Invalid parameter format: {param_str}. Use key=value.", Colors.RED))
+                    return 1
+                key, value = param_str.split("=", 1)
+                param_values[key.strip()] = value.strip()
+        
+        # Render template
+        try:
+            prompt = store.render(template_id, param_values)
+        except ValueError as e:
+            print(color(f"Template rendering failed: {e}", Colors.RED))
+            return 1
+    
     result = _cron_api(
         action="create",
         schedule=args.schedule,
-        prompt=args.prompt,
+        prompt=prompt,
         name=getattr(args, "name", None),
         deliver=getattr(args, "deliver", None),
         repeat=getattr(args, "repeat", None),
         skill=getattr(args, "skill", None),
         skills=_normalize_skills(getattr(args, "skill", None), getattr(args, "skills", None)),
         script=getattr(args, "script", None),
+        template_id=template_id,
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))

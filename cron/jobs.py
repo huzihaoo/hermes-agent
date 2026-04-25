@@ -403,8 +403,9 @@ def create_job(
     Returns:
         The created job dict
     """
-    # Load prompt from template if template_id is provided
-    if template_id:
+    # Load prompt from template if template_id is provided and caller did not
+    # already supply a rendered prompt.
+    if template_id and not prompt:
         try:
             from gateway.tasks.template import TemplateStore
             from hermes_constants import get_hermes_home
@@ -413,6 +414,11 @@ def create_job(
             if not template:
                 raise ValueError(f"Template {template_id} not found")
             prompt = template["request_summary"] or ""
+            # Auto-load template skills if not explicitly provided
+            if not skill and not skills:
+                template_skills = template.get("skills", [])
+                if template_skills:
+                    skills = template_skills
         except Exception as e:
             raise ValueError(f"Failed to load template {template_id}: {e}")
 

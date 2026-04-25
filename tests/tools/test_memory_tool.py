@@ -198,11 +198,17 @@ class TestMemoryStorePersistence:
         assert "Alice, developer" in store2.user_entries
 
     def test_deduplication_on_load(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        # Directly patch HERMES_HOME environment variable (more reliable)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        
+        # get_memory_dir() returns HERMES_HOME/memories
+        mem_dir = tmp_path / "memories"
+        mem_dir.mkdir(parents=True, exist_ok=True)
+        
         # Write file with duplicates
-        mem_file = tmp_path / "MEMORY.md"
+        mem_file = mem_dir / "MEMORY.md"
         mem_file.write_text("duplicate entry\n§\nduplicate entry\n§\nunique entry")
-
+    
         store = MemoryStore()
         store.load_from_disk()
         assert len(store.memory_entries) == 2

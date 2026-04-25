@@ -49,6 +49,9 @@ class TemplateStore:
                 # Migration: add last_used_at column if missing
                 if "last_used_at" not in columns:
                     conn.execute("ALTER TABLE templates ADD COLUMN last_used_at REAL")
+                # Migration: add skills column if missing
+                if "skills" not in columns:
+                    conn.execute("ALTER TABLE templates ADD COLUMN skills TEXT")
                 conn.commit()
             
             conn.execute("""
@@ -61,7 +64,8 @@ class TemplateStore:
                     params TEXT,
                     created_at REAL NOT NULL,
                     usage_count INTEGER DEFAULT 0,
-                    last_used_at REAL
+                    last_used_at REAL,
+                    skills TEXT
                 )
             """)
             conn.execute("""
@@ -89,7 +93,8 @@ class TemplateStore:
     def create_from_task(
         self, *, source_task_id: str, name: str, task_type: str,
         request_summary: Optional[str], created_at: float,
-        params: Optional[Dict[str, dict]] = None
+        params: Optional[Dict[str, dict]] = None,
+        skills: Optional[List[str]] = None
     ) -> str:
         """Create template from task, auto-extracting params if not provided."""
         template_id = str(uuid.uuid4())
@@ -99,17 +104,18 @@ class TemplateStore:
             params = self._extract_params(request_summary)
         
         params_json = json.dumps(params or {})
+        skills_json = json.dumps(skills or [])
         
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
                 """
                 INSERT INTO templates (
                     template_id, source_task_id, name, task_type,
-                    request_summary, params, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    request_summary, params, created_at, skills
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (template_id, source_task_id, name, task_type, 
-                 request_summary, params_json, created_at),
+                 request_summary, params_json, created_at, skills_json),
             )
             conn.commit()
         return template_id
@@ -131,6 +137,14 @@ class TemplateStore:
                     result["params"] = {}
             else:
                 result["params"] = {}
+            # Parse skills JSON
+            if result.get("skills"):
+                try:
+                    result["skills"] = json.loads(result["skills"])
+                except json.JSONDecodeError:
+                    result["skills"] = []
+            else:
+                result["skills"] = []
             return result
 
     def list_recent(self, *, limit: int = 20, sort_by: str = "created") -> List[dict]:
@@ -158,6 +172,14 @@ class TemplateStore:
                         result["params"] = {}
                 else:
                     result["params"] = {}
+                # Parse skills JSON
+                if result.get("skills"):
+                    try:
+                        result["skills"] = json.loads(result["skills"])
+                    except json.JSONDecodeError:
+                        result["skills"] = []
+                else:
+                    result["skills"] = []
                 results.append(result)
             return results
 
@@ -212,8 +234,8 @@ class TemplateStore:
             conn.commit()
             return cursor.rowcount > 0
 
-    def update(self, template_id: str, name: str = None, request_summary: str = None) -> bool:
-        """Update template name and/or content. Returns True if updated, False if not found.
+    def update(self, template_id: str, name: str = None, request_summary: str = None, skills: Optional[List[str]] = None) -> bool:
+        """Update template name, content, and/or skills. Returns True if updated, False if not found.
         
         If request_summary is provided, params are re-extracted from it.
         """
@@ -237,6 +259,10 @@ class TemplateStore:
             params = self._extract_params(request_summary)
             updates.append("params = ?")
             values.append(json.dumps(params) if params else None)
+        
+        if skills is not None:
+            updates.append("skills = ?")
+            values.append(json.dumps(skills))
         
         if not updates:
             return True  # Nothing to update
@@ -262,6 +288,7 @@ class TemplateStore:
             "task_type": template["task_type"],
             "request_summary": template["request_summary"],
             "params": template.get("params", {}),
+            "skills": template.get("skills", []),
         }
 
     def import_template(self, data: dict) -> str:
@@ -277,13 +304,14 @@ class TemplateStore:
         # Create template
         template_id = str(uuid.uuid4())
         params = data.get("params", {})
+        skills = data.get("skills", [])
         
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
-                INSERT INTO templates (template_id, source_task_id, name, task_type, request_summary, params, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO templates (template_id, source_task_id, name, task_type, request_summary, params, created_at, skills)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     template_id,
@@ -291,8 +319,9 @@ class TemplateStore:
                     data["name"],
                     data["task_type"],
                     data["request_summary"],
-                    json.dumps(params) if params else None,
+                    json.dumps(params),
                     time.time(),
+                    json.dumps(skills),
                 ),
             )
             conn.commit()

@@ -113,17 +113,36 @@ class MemoryStore:
         Tool responses always reflect this live state.
     """
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
+    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375, user_id: str | None = None):
+        # Validate user_id to prevent path traversal attacks
+        if user_id is not None:
+            if not user_id or not isinstance(user_id, str):
+                raise ValueError("user_id must be a non-empty string")
+            # Prevent path traversal
+            if ".." in user_id or "/" in user_id or "\\" in user_id:
+                raise ValueError("user_id cannot contain path separators or '..'")
+            # Limit length to prevent filesystem issues
+            if len(user_id) > 255:
+                raise ValueError("user_id too long (max 255 chars)")
+        
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
+        self.user_id = user_id  # Per-user memory isolation
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
 
+    def _mem_dir(self) -> Path:
+        """Return the memory directory, scoped to user_id when set."""
+        base = get_memory_dir()
+        if self.user_id:
+            return base / "users" / self.user_id
+        return base
+
     def load_from_disk(self):
         """Load entries from MEMORY.md and USER.md, capture system prompt snapshot."""
-        mem_dir = get_memory_dir()
+        mem_dir = self._mem_dir()
         mem_dir.mkdir(parents=True, exist_ok=True)
 
         self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
@@ -176,9 +195,8 @@ class MemoryStore:
                     pass
             fd.close()
 
-    @staticmethod
-    def _path_for(target: str) -> Path:
-        mem_dir = get_memory_dir()
+    def _path_for(self, target: str) -> Path:
+        mem_dir = self._mem_dir()
         if target == "user":
             return mem_dir / "USER.md"
         return mem_dir / "MEMORY.md"
@@ -194,7 +212,7 @@ class MemoryStore:
 
     def save_to_disk(self, target: str):
         """Persist entries to the appropriate file. Called after every mutation."""
-        get_memory_dir().mkdir(parents=True, exist_ok=True)
+        self._mem_dir().mkdir(parents=True, exist_ok=True)
         self._write_file(self._path_for(target), self._entries_for(target))
 
     def _entries_for(self, target: str) -> List[str]:
@@ -466,6 +484,8 @@ def memory_tool(
     content: str = None,
     old_text: str = None,
     store: Optional[MemoryStore] = None,
+    user_id: str | None = None,
+    memory_dir: str | None = None,
 ) -> str:
     """
     Single entry point for the memory tool. Dispatches to MemoryStore methods.
@@ -473,7 +493,19 @@ def memory_tool(
     Returns JSON string with results.
     """
     if store is None:
-        return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
+        # Test/utility mode: allow constructing a temporary scoped store explicitly.
+        if memory_dir is not None or user_id is not None:
+            try:
+                store = MemoryStore(user_id=user_id)
+                if memory_dir is not None:
+                    # Override memory directory for testing
+                    store.memory_dir = Path(memory_dir)
+                    store.memory_dir.mkdir(parents=True, exist_ok=True)
+                store.load_from_disk()
+            except Exception as e:
+                return tool_error(f"Memory initialization failed: {e}", success=False)
+        else:
+            return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
 
     if target not in ("memory", "user"):
         return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)

@@ -3041,3 +3041,72 @@ class TestSenderNameResolution(unittest.TestCase):
             result = asyncio.run(adapter._resolve_sender_name_from_api("ou_broken"))
 
         self.assertIsNone(result)
+
+
+class TestFeishuApprovalCards(unittest.TestCase):
+    @patch.dict(os.environ, {}, clear=True)
+    def test_member_cannot_resolve_approval_card(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._get_cached_sender_name = Mock(return_value="普通成员")
+        adapter._submit_on_loop = Mock()
+
+        event = SimpleNamespace(operator=SimpleNamespace(open_id="ou_member"))
+        action_value = {
+            "approval_id": 7,
+            "hermes_action": "approve_once",
+        }
+
+        class _Response:
+            def __init__(self):
+                self.card = None
+
+        class _Card:
+            def __init__(self):
+                self.type = None
+                self.data = None
+
+        with (
+            patch("gateway.platforms.feishu.P2CardActionTriggerResponse", _Response),
+            patch("gateway.platforms.feishu.CallBackCard", _Card),
+            patch("tools.permission_policy.get_user_role_by_id", return_value="member"),
+        ):
+            response = adapter._handle_approval_card_action(
+                event=event,
+                action_value=action_value,
+                loop=object(),
+            )
+
+        adapter._submit_on_loop.assert_not_called()
+        self.assertIsInstance(response, _Response)
+        self.assertIsInstance(response.card, _Card)
+        self.assertEqual(response.card.type, "raw")
+        self.assertIn("Approval Not Allowed", json.dumps(response.card.data, ensure_ascii=False))
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_gc_stale_approval_state_drops_expired_entries(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._approval_state = {
+            1: {
+                "session_key": "agent:main:feishu:group:oc_chat:ou_old",
+                "message_id": "om_old",
+                "chat_id": "oc_chat",
+                "created_at": time.monotonic() - 999,
+            },
+            2: {
+                "session_key": "agent:main:feishu:group:oc_chat:ou_new",
+                "message_id": "om_new",
+                "chat_id": "oc_chat",
+                "created_at": time.monotonic(),
+            },
+        }
+
+        adapter._gc_stale_approval_state(max_age_seconds=60)
+
+        self.assertNotIn(1, adapter._approval_state)
+        self.assertIn(2, adapter._approval_state)
