@@ -8498,6 +8498,7 @@ class AIAgent:
             task_id=effective_task_id,
             platform=self.platform or "cli",
             user_id=getattr(self, "user_id", None),
+            task_type="chat",  # explicit task_type for Phase 1.5-B
         )["data"])
         
         # Reset retry counters and iteration budget at the start of each turn

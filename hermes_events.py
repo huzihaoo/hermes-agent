@@ -49,10 +49,12 @@ class EventEmitter:
                 return
             
             if event in {"task:start", "request:start"}:
+                explicit_task_type = data.get("task_type")
+                task_type = TaskType(explicit_task_type) if explicit_task_type else _infer_task_type(data.get("request_summary"))
                 task = Task(
                     task_id=task_id,
                     status=TaskStatus.RUNNING,
-                    task_type=_infer_task_type(data.get("request_summary")),
+                    task_type=task_type,
                     user_id=data.get("user_id"),
                     platform=data.get("platform"),
                     request_summary=data.get("request_summary"),
@@ -99,13 +101,14 @@ class TaskEvent:
     """Factories for standardized task-trace events."""
 
     @staticmethod
-    def task_start(*, task_id: str, platform: str, user_id: Optional[str] = None) -> Dict[str, Any]:
+    def task_start(*, task_id: str, platform: str, user_id: Optional[str] = None, task_type: Optional[str] = None) -> Dict[str, Any]:
         return {
             "event": "task:start",
             "data": {
                 "task_id": task_id,
                 "platform": platform,
                 "user_id": user_id,
+                **({"task_type": task_type} if task_type is not None else {}),
             },
         }
 
