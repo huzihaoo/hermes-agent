@@ -90,5 +90,5 @@ gateway/observability/
 - [ ] Prometheus metrics exporter
 - [ ] Span 采样率控制
 - [ ] 历史数据自动清理（retention policy）
-- [ ] Dashboard 前端 UI
+- [x] Dashboard 前端 UI (v1.1.0)
 - [ ] 告警规则（cost threshold / error rate）

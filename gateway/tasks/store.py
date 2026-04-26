@@ -186,3 +186,22 @@ class TaskStore:
             query = f"SELECT COUNT(*) FROM tasks {where_sql}"
             result = conn.execute(query, params).fetchone()
             return result[0] if result else 0
+
+    def cleanup_old_tasks(self, retention_days: int = 90) -> int:
+        """Delete tasks older than retention_days.
+        
+        Args:
+            retention_days: Keep tasks for this many days (default: 90)
+        
+        Returns:
+            Number of deleted tasks
+        """
+        import time
+        with sqlite3.connect(self.db_path) as conn:
+            cutoff = time.time() - (retention_days * 86400)
+            deleted = conn.execute(
+                "DELETE FROM tasks WHERE started_at < ?",
+                (cutoff,)
+            ).rowcount
+            conn.commit()
+            return deleted

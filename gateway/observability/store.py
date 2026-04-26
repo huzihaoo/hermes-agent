@@ -175,5 +175,49 @@ class TraceStore:
         conn.close()
         return [dict(row) for row in rows]
 
+    def cleanup_old_data(self, retention_days: int = 90) -> Dict[str, int]:
+        """Delete traces and spans older than retention_days.
+        
+        Args:
+            retention_days: Keep data for this many days (default: 90)
+        
+        Returns:
+            Dict with deleted_traces and deleted_spans counts
+        """
+        conn = sqlite3.connect(self.db_path)
+        cutoff = time.time() - (retention_days * 86400)
+        
+        # Get trace IDs to delete
+        trace_ids = conn.execute(
+            "SELECT trace_id FROM traces WHERE start_time < ?",
+            (cutoff,)
+        ).fetchall()
+        trace_ids = [row[0] for row in trace_ids]
+        
+        if not trace_ids:
+            conn.close()
+            return {"deleted_traces": 0, "deleted_spans": 0}
+        
+        # Delete spans first (foreign key constraint)
+        placeholders = ",".join("?" * len(trace_ids))
+        spans_deleted = conn.execute(
+            f"DELETE FROM spans WHERE trace_id IN ({placeholders})",
+            trace_ids
+        ).rowcount
+        
+        # Delete traces
+        traces_deleted = conn.execute(
+            f"DELETE FROM traces WHERE trace_id IN ({placeholders})",
+            trace_ids
+        ).rowcount
+        
+        conn.commit()
+        conn.close()
+        
+        return {
+            "deleted_traces": traces_deleted,
+            "deleted_spans": spans_deleted,
+        }
+
 
 import time  # for stats_daily cutoff
