@@ -365,11 +365,46 @@ class WebhookAdapter(BasePlatformAdapter):
             prompt_template, payload, event_type, route_name
         )
 
+        # ── Template integration ──────────────────────────────────
+        # If route has template_id, load template and merge settings.
+        # Template prompt is used as fallback if route has no explicit prompt.
+        # Template skills are used as fallback if route has no explicit skills.
+        template_id = route_config.get("template_id")
+        template_skills: List[str] = []
+        if template_id:
+            try:
+                from gateway.tasks.template import TemplateStore
+                from hermes_constants import get_hermes_home
+
+                tpl_store = TemplateStore(
+                    db_path=get_hermes_home() / "analytics" / "templates.db"
+                )
+                tpl = tpl_store.get(template_id)
+                if tpl:
+                    # Use template prompt if route didn't define one
+                    if not prompt_template and tpl.get("request_summary"):
+                        prompt = self._render_prompt(
+                            tpl["request_summary"],
+                            payload,
+                            event_type,
+                            route_name,
+                        )
+                    # Collect template skills as fallback
+                    template_skills = tpl.get("skills", []) or []
+                    # Record template usage
+                    tpl_store.record_usage(template_id)
+                else:
+                    logger.warning(
+                        "[webhook] Template %s not found", template_id
+                    )
+            except Exception as e:
+                logger.warning(
+                    "[webhook] Template loading failed: %s", e
+                )
+
         # Inject skill content if configured.
-        # We call build_skill_invocation_message() directly rather than
-        # using /skill-name slash commands — the gateway's command parser
-        # would intercept those and break the flow.
-        skills = route_config.get("skills", [])
+        # Route-level skills take precedence; fall back to template skills.
+        skills = route_config.get("skills", []) or template_skills
         if skills:
             try:
                 from agent.skill_commands import (

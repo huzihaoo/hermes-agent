@@ -57,6 +57,7 @@ DEFAULT_EXCLUDES = [
     ".venv/",
     "venv/",
     ".git/",
+    "qipc_sharedmemory_*",
 ]
 
 # Git subprocess timeout (seconds).

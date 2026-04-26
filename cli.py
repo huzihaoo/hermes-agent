@@ -3749,6 +3749,40 @@ class HermesCLI:
         ])
         self.console.print("\n".join(lines), highlight=False, markup=False)
     
+    def _show_session_health(self):
+        """Show session health metrics for memory protection monitoring."""
+        agent = getattr(self, "agent", None)
+        if not agent or not hasattr(agent, "_health_monitor"):
+            self.console.print("  Session health monitor not available.")
+            return
+        
+        monitor = agent._health_monitor
+        messages = getattr(agent, "_session_messages", []) or self.conversation_history or []
+        health = monitor.check(messages)
+        
+        runtime_h = health.runtime_seconds / 3600
+        runtime_pct = min(100, (health.runtime_seconds / monitor.RT_BLOCK) * 100)
+        msg_pct = min(100, (health.message_count / monitor.MSG_BLOCK) * 100)
+        
+        lines = [
+            f"{health.status_emoji} Session Health: {health.level.value.upper()}",
+            "",
+            f"  Messages:     {health.message_count:>4} / {monitor.MSG_BLOCK}  ({msg_pct:.0f}%)",
+            f"  Runtime:      {runtime_h:>4.1f}h / {monitor.RT_BLOCK / 3600:.0f}h    ({runtime_pct:.0f}%)",
+            f"  Large returns: {health.large_return_count:>3} / {monitor.LARGE_RETURN_MAX}",
+        ]
+        
+        if health.warnings:
+            lines.append("")
+            lines.append("  Warnings:")
+            for w in health.warnings:
+                lines.append(f"    ⚠️  {w}")
+        
+        lines.append("")
+        lines.append("  Thresholds: 400→warn  450→critical  500→blocked")
+        
+        self.console.print("\n".join(lines), highlight=False, markup=False)
+    
     def _fast_command_available(self) -> bool:
         try:
             from hermes_cli.models import model_supports_fast_mode
@@ -5467,6 +5501,8 @@ class HermesCLI:
             self._show_gateway_status()
         elif canonical == "status":
             self._show_session_status()
+        elif canonical == "health":
+            self._show_session_health()
         elif canonical == "statusbar":
             self._status_bar_visible = not self._status_bar_visible
             state = "visible" if self._status_bar_visible else "hidden"

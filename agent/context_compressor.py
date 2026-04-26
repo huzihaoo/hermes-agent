@@ -710,13 +710,12 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             logger.info("Context summary generation interrupted before auxiliary request completed")
             return None
         except RuntimeError:
-            # No provider configured — long cooldown, unlikely to self-resolve
-            self._summary_failure_cooldown_until = time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SECONDS
-            logging.warning("Context compression: no provider available for "
-                            "summary. Middle turns will be dropped without summary "
-                            "for %d seconds.",
-                            _SUMMARY_FAILURE_COOLDOWN_SECONDS)
-            return None
+            # No provider configured — use heuristic fallback instead of cooldown
+            logger.warning(
+                "Context compression: no auxiliary provider available. "
+                "Using heuristic fallback (keep head + tail, drop middle)."
+            )
+            return self._heuristic_compression_fallback(turns_to_summarize)
         except Exception as e:
             # If the summary model is different from the main model and the
             # error looks permanent (model not found, 503, 404), fall back to
@@ -756,6 +755,72 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 _transient_cooldown,
             )
             return None
+
+    def _heuristic_compression_fallback(self, messages: List[Dict[str, Any]]) -> str:
+        """Simple heuristic compression when no auxiliary model is available.
+        
+        Extracts key facts from the middle turns without LLM summarization:
+        - Count of user/assistant exchanges
+        - Tool calls made (names only)
+        - Files mentioned
+        - Errors detected
+        
+        Returns a minimal handoff summary that preserves basic context.
+        """
+        user_msgs = sum(1 for m in messages if m.get("role") == "user")
+        assistant_msgs = sum(1 for m in messages if m.get("role") == "assistant")
+        tool_calls = []
+        files_mentioned = set()
+        errors_found = []
+        
+        for msg in messages:
+            # Extract tool calls
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                for tc in msg["tool_calls"]:
+                    if hasattr(tc, "function"):
+                        tool_calls.append(tc.function.name)
+                    elif isinstance(tc, dict) and "function" in tc:
+                        tool_calls.append(tc["function"].get("name", "?"))
+            
+            # Extract file paths from tool results
+            if msg.get("role") == "tool":
+                content = msg.get("content", "")
+                paths = re.findall(r'["\']([^"\']+\.(py|js|ts|json|md|txt|yaml|yml|sh|go|rs))["\']', content)
+                files_mentioned.update(p[0] for p in paths[:5])  # limit to 5 per message
+            
+            # Detect errors
+            if msg.get("role") in ("tool", "assistant"):
+                content = str(msg.get("content", "")).lower()
+                if any(err in content for err in ("error:", "failed:", "exception:", "traceback")):
+                    snippet = str(msg.get("content", ""))[:200]
+                    errors_found.append(snippet)
+        
+        # Build minimal summary
+        summary_parts = [
+            f"## Compacted Context (Heuristic Fallback)",
+            f"",
+            f"**Exchanges:** {user_msgs} user messages, {assistant_msgs} assistant responses",
+        ]
+        
+        if tool_calls:
+            tool_counts = {}
+            for t in tool_calls:
+                tool_counts[t] = tool_counts.get(t, 0) + 1
+            top_tools = sorted(tool_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+            summary_parts.append(f"**Tools used:** {', '.join(f'{t}({n})' for t, n in top_tools)}")
+        
+        if files_mentioned:
+            summary_parts.append(f"**Files:** {', '.join(sorted(files_mentioned)[:10])}")
+        
+        if errors_found:
+            summary_parts.append(f"**Errors detected:** {len(errors_found)} error(s) in middle turns")
+            summary_parts.append(f"  First error: {errors_found[0][:150]}...")
+        
+        summary_parts.append("")
+        summary_parts.append("*Note: This is a heuristic summary (no LLM available). "
+                           "Detailed context was lost. Consider using a full auxiliary model for better compression.*")
+        
+        return self._with_summary_prefix("\n".join(summary_parts))
 
     @staticmethod
     def _with_summary_prefix(summary: str) -> str:

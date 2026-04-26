@@ -1169,6 +1169,10 @@ class AIAgent:
             max_snapshots=checkpoint_max_snapshots,
         )
         
+        # Session health monitor (memory protection)
+        from agent.session_health import SessionHealthMonitor
+        self._health_monitor = SessionHealthMonitor(session_id=self.session_id)
+        
         # SQLite session store (optional -- provided by CLI or gateway)
         self._session_db = session_db
         self._parent_session_id = parent_session_id
@@ -7757,6 +7761,11 @@ class AIAgent:
                 "tool_call_id": tc.id,
             }
             messages.append(tool_msg)
+            
+            # Track tool return size for session health
+            size_warning = self._health_monitor.track_tool_return(function_result)
+            if size_warning and not self.quiet_mode:
+                self._safe_print(f"\n{size_warning}")
 
         # ── Per-turn aggregate budget enforcement ─────────────────────────
         num_tools = len(parsed_calls)
@@ -8149,6 +8158,11 @@ class AIAgent:
                 "tool_call_id": tool_call.id
             }
             messages.append(tool_msg)
+            
+            # Track tool return size for session health
+            size_warning = self._health_monitor.track_tool_return(function_result)
+            if size_warning and not self.quiet_mode:
+                self._safe_print(f"\n{size_warning}")
 
             if not self.quiet_mode:
                 if self.verbose_logging:
@@ -8811,6 +8825,19 @@ class AIAgent:
             api_call_count += 1
             self._api_call_count = api_call_count
             self._touch_activity(f"starting API call #{api_call_count}")
+            
+            # Session health check (memory protection)
+            health = self._health_monitor.check(messages)
+            if health.should_block:
+                _turn_exit_reason = "session_health_limit"
+                if not self.quiet_mode:
+                    self._safe_print(f"\n{health.format_warning()}")
+                logger.error("Session health limit reached: %s", health.warnings)
+                break
+            elif health.should_warn and self._health_monitor.should_emit_warning(health):
+                if not self.quiet_mode:
+                    self._safe_print(f"\n{health.format_warning()}")
+                logger.warning("Session health warning: %s", health.warnings)
 
             # Grace call: the budget is exhausted but we gave the model one
             # more chance.  Consume the grace flag so the loop exits after

@@ -3070,6 +3070,9 @@ class GatewayRunner:
         if canonical == "status":
             return await self._handle_status_command(event)
 
+        if canonical == "health":
+            return await self._handle_health_command(event)
+
         if canonical == "restart":
             return await self._handle_restart_command(event)
         
