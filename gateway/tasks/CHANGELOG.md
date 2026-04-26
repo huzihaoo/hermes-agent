@@ -13,6 +13,19 @@ MAJOR.MINOR.PATCH
 
 ---
 
+## [1.3.0] — 2026-04-26 — Task Cancel + Retry
+
+### Added
+- **TaskStore.cancel_task**：支持取消 `pending` / `running` 状态任务
+- **TaskStore.retry_task**：支持将 `failed` / `cancelled` 状态任务重置为 `pending`
+- **Gateway 子命令**：`/task cancel <id>`、`/task retry <id>`
+- **归属校验**：仅任务所属用户可执行取消/重试
+
+### Verified
+- 20/20 cancel+retry tests passing
+
+---
+
 ## [1.2.0] — 2026-04-26 — Pagination + Status Filter
 
 ### Added
@@ -91,7 +104,7 @@ gateway/tasks/
 ## 待办（下一版本候选）
 
 - [x] 任务列表分页 (v1.2.0)
-- [ ] 任务取消功能
-- [ ] 任务重试功能
+- [x] 任务取消功能 (v1.3.0)
+- [x] 任务重试功能 (v1.3.0)
 - [ ] 模板市场 / 模板分享
 - [ ] Dashboard UI 集成

@@ -13,6 +13,17 @@ MAJOR.MINOR.PATCH
 
 ---
 
+## [1.1.1] — 2026-04-26 — Retention Policy
+
+### Added
+- **TraceStore.cleanup_old_data**：按保留天数清理 traces / spans
+- **TaskStore.cleanup_old_tasks**：按保留天数清理历史任务
+
+### Verified
+- 6/6 retention policy tests passing
+
+---
+
 ## [1.1.0] — 2026-04-26 — Dashboard UI MVP
 
 ### Added
@@ -89,6 +100,6 @@ gateway/observability/
 
 - [ ] Prometheus metrics exporter
 - [ ] Span 采样率控制
-- [ ] 历史数据自动清理（retention policy）
+- [x] 历史数据自动清理（retention policy）(v1.1.1)
 - [x] Dashboard 前端 UI (v1.1.0)
 - [ ] 告警规则（cost threshold / error rate）
