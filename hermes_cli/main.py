@@ -3158,6 +3158,13 @@ def cmd_version(args):
     # Show Python version
     print(f"Python: {sys.version.split()[0]}")
     
+    # Show admission module version
+    try:
+        from gateway.admission import __version__ as admission_version
+        print(f"Admission: v{admission_version}")
+    except ImportError:
+        pass
+    
     # Check for key dependencies
     try:
         import openai
