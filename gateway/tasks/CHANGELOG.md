@@ -13,6 +13,20 @@ MAJOR.MINOR.PATCH
 
 ---
 
+## [1.2.0] — 2026-04-26 — Pagination + Status Filter
+
+### Added
+- **TaskStore.list_recent 分页**：新增 offset 和 status 参数
+- **TaskStore.count_tasks**：按 user_id / status 统计任务总数
+- **/tasks [page]**：飞书群内分页浏览任务列表（10条/页）
+- **分页导航**：footer 显示上一页/下一页提示
+
+### Verified
+- 9/9 pagination tests passing
+- 98/98 total core tests passing
+
+---
+
 ## [1.1.0] — 2026-04-26 — Webhook Template Integration
 
 ### Added

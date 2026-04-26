@@ -1,6 +1,11 @@
 """Observability module for Hermes Agent.
 
 Version History:
+  v1.1.0 (2026-04-26) — Dashboard UI MVP
+    - Standalone FastAPI dashboard server (port 8765)
+    - Dark-themed UI: Overview / Traces / Cost tabs
+    - Real-time stats with auto-refresh
+
   v1.0.0 (2026-04-24) — Initial release (Observability MVP)
     - Trace/Span model with hierarchical structure
     - TraceStore with SQLite persistence
@@ -12,7 +17,7 @@ Version History:
     - Phase A-E complete, 100% test coverage
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 from .trace import Trace, Span
 from .store import TraceStore

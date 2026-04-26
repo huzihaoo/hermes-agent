@@ -13,6 +13,24 @@ MAJOR.MINOR.PATCH
 
 ---
 
+## [1.1.0] — 2026-04-26 — Dashboard UI MVP
+
+### Added
+- **Dashboard Server**：独立 FastAPI 服务 (port 8765)
+- **Dashboard UI**：暗色主题，3 个 tab (Overview / Traces / Cost)
+- **实时统计**：total traces, cost, avg duration, success rate
+- **自动刷新**：每 30 秒刷新数据
+
+### Files
+```
+gateway/observability/
+├── dashboard_server.py  # FastAPI standalone server
+└── static/
+    └── index.html       # Dashboard UI
+```
+
+---
+
 ## [1.0.0] — 2026-04-24 — Observability MVP
 
 ### Phase A — Trace/Span Model + Pricing + CLI
