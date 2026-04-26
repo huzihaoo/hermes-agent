@@ -1099,6 +1099,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._admission_enabled = config.extra.get("admission_control_enabled", False)
         self._admission_controller: Optional[Any] = None
         self._queue_worker: Optional[Any] = None
+        self._metrics_server: Optional[Any] = None
+        self._metrics_exporter: Optional[Any] = None
         if self._admission_enabled:
             from gateway.admission import AdmissionController
             from gateway.admission.worker import QueueWorker
@@ -1119,6 +1121,33 @@ class FeishuAdapter(BasePlatformAdapter):
                     self._process_queue_item
                 )
                 logger.info("[admission] Configuration validated successfully")
+                
+                # Auto-load policy template if specified
+                template_name = config.extra.get("admission_template")
+                if template_name:
+                    try:
+                        from gateway.admission.templates import TemplateStore
+                        store = TemplateStore()
+                        tpl = store.get(template_name)
+                        if tpl:
+                            self._admission_controller.apply_template(tpl)
+                            logger.info("[admission] Applied template: %s", template_name)
+                        else:
+                            logger.warning("[admission] Template not found: %s", template_name)
+                    except Exception as e:
+                        logger.warning("[admission] Failed to load template %s: %s", template_name, e)
+                
+                # Auto-start metrics server if port specified
+                metrics_port = config.extra.get("admission_metrics_port")
+                if metrics_port:
+                    try:
+                        from gateway.admission.metrics_export import MetricsExporter
+                        from gateway.admission.metrics_server import MetricsServer
+                        self._metrics_exporter = MetricsExporter(self._admission_controller)
+                        self._metrics_server = MetricsServer(self._metrics_exporter, port=int(metrics_port))
+                        logger.info("[admission] Metrics server configured on port %s", metrics_port)
+                    except Exception as e:
+                        logger.warning("[admission] Failed to configure metrics server: %s", e)
 
     @staticmethod
     def _load_settings(extra: Dict[str, Any]) -> FeishuAdapterSettings:
@@ -1293,6 +1322,11 @@ class FeishuAdapter(BasePlatformAdapter):
                 await self._queue_worker.start()
                 logger.info("[admission] Queue worker started")
             
+            # Start metrics server if configured
+            if self._metrics_server:
+                await self._metrics_server.start()
+                logger.info("[admission] Metrics server started on port %s", self._metrics_server.port)
+            
             logger.info("[Feishu] Connected in %s mode (%s)", self._connection_mode, self._domain_name)
             return True
         except Exception as exc:
@@ -1305,6 +1339,11 @@ class FeishuAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Disconnect from Feishu/Lark."""
         self._running = False
+        
+        # Stop metrics server if running
+        if self._metrics_server:
+            await self._metrics_server.stop()
+            logger.info("[admission] Metrics server stopped")
         
         # Stop admission queue worker if enabled
         if self._admission_enabled and self._queue_worker:
