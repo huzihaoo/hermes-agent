@@ -453,3 +453,89 @@ def get_running_pid() -> Optional[int]:
 def is_gateway_running() -> bool:
     """Check if the gateway daemon is currently running."""
     return get_running_pid() is not None
+
+
+def _is_process_alive(pid: int) -> bool:
+    """Check if a process is still alive."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+def get_all_gateway_processes() -> list[tuple[int, Optional[str]]]:
+    """Scan all gateway processes, return list of (PID, HERMES_HOME).
+    
+    Returns:
+        List of (pid, hermes_home) tuples. hermes_home may be None if not detectable.
+        Excludes the current process.
+    
+    Changed in: v1.7.0 — startup guard to prevent process pileup
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    current_pid = os.getpid()
+    processes = []
+    
+    try:
+        # Try ps auxe first (shows environment variables)
+        result = subprocess.run(
+            ["ps", "auxe"] if not _IS_WINDOWS else ["tasklist", "/V"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        
+        if result.returncode != 0:
+            # Fall back to ps aux (no environment)
+            result = subprocess.run(
+                ["ps", "aux"] if not _IS_WINDOWS else ["tasklist"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        
+        for line in result.stdout.splitlines():
+            # Look for gateway processes — match various invocation patterns:
+            # - hermes gateway run
+            # - hermes_cli.main gateway run
+            # - hermes_cli/main.py gateway run
+            # - gateway/run.py
+            _lower = line.lower()
+            is_gateway = (
+                ("hermes gateway run" in _lower)
+                or ("hermes_cli.main gateway" in _lower)
+                or ("hermes_cli/main.py gateway" in _lower)
+                or ("gateway/run.py" in _lower)
+            )
+            if not is_gateway:
+                continue
+            
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            
+            try:
+                pid = int(parts[1])
+            except ValueError:
+                continue
+            
+            # Skip self
+            if pid == current_pid:
+                continue
+            
+            # Extract HERMES_HOME from environment if available
+            hermes_home = None
+            for part in parts:
+                if "HERMES_HOME=" in part:
+                    hermes_home = part.split("=", 1)[1]
+                    break
+            
+            processes.append((pid, hermes_home))
+    
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        logger.warning("Failed to scan gateway processes: %s", e)
+    
+    return processes

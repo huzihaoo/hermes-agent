@@ -3161,6 +3161,9 @@ class GatewayRunner:
         if canonical == "cost":
             return await self._handle_cost_command(event)
 
+        if canonical == "alerts":
+            return await self._handle_alerts_command(event)
+
         if canonical == "approve":
             return await self._handle_approve_command(event)
 
@@ -7471,6 +7474,38 @@ class GatewayRunner:
         
         return "\\n".join(lines)
 
+    async def _handle_alerts_command(self, event: MessageEvent) -> str:
+        """Handle /alerts - show current alert status."""
+        from gateway.observability.store import TraceStore
+        from gateway.observability.alerts import AlertChecker, AlertSeverity
+
+        store = TraceStore(db_path=_hermes_home / "analytics" / "traces.db")
+        checker = AlertChecker(store)
+        results = checker.check_all()
+
+        triggered = [r for r in results if r.triggered]
+        if not triggered:
+            lines = ["✅ **告警状态** — 一切正常\n"]
+            for r in results:
+                icon = "🟢"
+                if r.rule.metric.value == "cost":
+                    lines.append(f"{icon} {r.rule.name}: ${r.current_value:.4f} / ${r.rule.threshold:.2f}")
+                else:
+                    lines.append(f"{icon} {r.rule.name}: {r.current_value:.1%} / {r.rule.threshold:.0%}")
+            return "\n".join(lines)
+
+        lines = [f"🚨 **告警状态** — {len(triggered)} 条告警触发\n"]
+        for r in results:
+            if r.triggered:
+                icon = "🔴" if r.rule.severity == AlertSeverity.CRITICAL else "🟡"
+            else:
+                icon = "🟢"
+            if r.rule.metric.value == "cost":
+                lines.append(f"{icon} {r.rule.name}: ${r.current_value:.4f} / ${r.rule.threshold:.2f}")
+            else:
+                lines.append(f"{icon} {r.rule.name}: {r.current_value:.1%} / {r.rule.threshold:.0%}")
+        return "\n".join(lines)
+
     async def _handle_reload_mcp_command(self, event: MessageEvent) -> str:
         """Handle /reload-mcp command -- disconnect and reconnect all MCP servers."""
         loop = asyncio.get_running_loop()
@@ -10436,13 +10471,97 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     """
     # ── Duplicate-instance guard ──────────────────────────────────────
     # Prevent two gateways from running under the same HERMES_HOME.
-    # The PID file is scoped to HERMES_HOME, so future multi-profile
-    # setups (each profile using a distinct HERMES_HOME) will naturally
-    # allow concurrent instances without tripping this guard.
+    # Changed in v1.7.0: scan ALL gateway processes, not just PID file.
+    # This prevents process pileup from manual starts, LaunchAgent races, etc.
     import time as _time
-    from gateway.status import get_running_pid, remove_pid_file, terminate_pid
-    existing_pid = get_running_pid()
-    if existing_pid is not None and existing_pid != os.getpid():
+    from gateway.status import (
+        get_running_pid,
+        get_all_gateway_processes,
+        remove_pid_file,
+        terminate_pid,
+        release_all_scoped_locks,
+        _is_process_alive,
+    )
+    
+    current_home = str(get_hermes_home())
+    
+    # Step 1: Scan all gateway processes
+    all_processes = get_all_gateway_processes()
+    
+    # Step 2: Filter to same HERMES_HOME (or unknown HOME)
+    # If HERMES_HOME is not detectable, assume same (conservative)
+    same_home_pids = [
+        pid for pid, home in all_processes
+        if home is None or home == current_home
+    ]
+    
+    # Step 3: Handle multiple processes
+    if len(same_home_pids) > 1:
+        if replace:
+            logger.warning(
+                "Detected %d gateway processes under HERMES_HOME=%s. "
+                "Cleaning up all before starting new instance.",
+                len(same_home_pids), current_home
+            )
+            print(f"\n⚠️  Found {len(same_home_pids)} gateway processes, cleaning up...\n")
+            
+            # Kill all processes
+            for pid in same_home_pids:
+                try:
+                    logger.info("Terminating gateway process PID %d", pid)
+                    terminate_pid(pid, force=False)
+                except (ProcessLookupError, PermissionError, OSError) as e:
+                    logger.debug("Failed to terminate PID %d: %s", pid, e)
+            
+            # Wait up to 10 seconds for all to exit
+            for _ in range(20):
+                remaining = [p for p in same_home_pids if _is_process_alive(p)]
+                if not remaining:
+                    break
+                _time.sleep(0.5)
+            else:
+                # Force kill remaining processes
+                remaining = [p for p in same_home_pids if _is_process_alive(p)]
+                if remaining:
+                    logger.warning(
+                        "Gateway processes %s did not exit after SIGTERM, sending SIGKILL.",
+                        remaining
+                    )
+                    for pid in remaining:
+                        try:
+                            terminate_pid(pid, force=True)
+                        except (ProcessLookupError, PermissionError, OSError):
+                            pass
+                    _time.sleep(0.5)
+            
+            # Clean up PID file and locks
+            remove_pid_file()
+            try:
+                _released = release_all_scoped_locks()
+                if _released:
+                    logger.info("Released %d stale scoped lock(s) from old gateway.", _released)
+            except Exception:
+                pass
+            
+            print("✓ Cleanup complete, starting new gateway...\n")
+        else:
+            # Refuse to start
+            logger.error(
+                "Multiple gateway processes detected under HERMES_HOME=%s (PIDs: %s). "
+                "This indicates a process pileup. Run 'hermes gateway stop' first.",
+                current_home, same_home_pids
+            )
+            print(f"\n❌ Multiple gateway processes detected:\n")
+            for pid in same_home_pids:
+                print(f"   PID {pid}")
+            print(f"\nThis indicates a process pileup.")
+            print(f"Run 'hermes gateway stop' to clean up, then restart.\n")
+            print(f"Or use 'hermes gateway run --replace' to auto-cleanup.\n")
+            return False
+    
+    elif len(same_home_pids) == 1:
+        # Single process, use existing logic
+        existing_pid = same_home_pids[0]
         if replace:
             logger.info(
                 "Replacing existing gateway instance (PID %d) with --replace.",
@@ -10458,13 +10577,12 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                     existing_pid,
                 )
                 return False
+            
             # Wait up to 10 seconds for the old process to exit
             for _ in range(20):
-                try:
-                    os.kill(existing_pid, 0)
-                    _time.sleep(0.5)
-                except (ProcessLookupError, PermissionError):
-                    break  # Process is gone
+                if not _is_process_alive(existing_pid):
+                    break
+                _time.sleep(0.5)
             else:
                 # Still alive after 10s — force kill
                 logger.warning(
@@ -10476,23 +10594,19 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                     _time.sleep(0.5)
                 except (ProcessLookupError, PermissionError, OSError):
                     pass
+            
             remove_pid_file()
-            # Also release all scoped locks left by the old process.
-            # Stopped (Ctrl+Z) processes don't release locks on exit,
-            # leaving stale lock files that block the new gateway from starting.
             try:
-                from gateway.status import release_all_scoped_locks
                 _released = release_all_scoped_locks()
                 if _released:
                     logger.info("Released %d stale scoped lock(s) from old gateway.", _released)
             except Exception:
                 pass
         else:
-            hermes_home = str(get_hermes_home())
             logger.error(
                 "Another gateway instance is already running (PID %d, HERMES_HOME=%s). "
                 "Use 'hermes gateway restart' to replace it, or 'hermes gateway stop' first.",
-                existing_pid, hermes_home,
+                existing_pid, current_home,
             )
             print(
                 f"\n❌ Gateway already running (PID {existing_pid}).\n"
@@ -10501,6 +10615,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 f"   Or use 'hermes gateway run --replace' to auto-replace.\n"
             )
             return False
+    
+    # else: len(same_home_pids) == 0, no existing processes, proceed normally
 
     # Sync bundled skills on gateway start (fast -- skips unchanged)
     try:

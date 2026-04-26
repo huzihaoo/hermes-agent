@@ -13,6 +13,72 @@ MAJOR.MINOR.PATCH
 
 ---
 
+## [1.7.0] — 2026-04-26 — Gateway 启动防护：杜绝进程堆积
+
+### Added
+- **全局进程扫描**：`gateway/status.py` 新增 `get_all_gateway_processes()` 和 `_is_process_alive()`
+  - 启动时扫描所有 gateway 进程（不只是 PID 文件记录的那个）
+  - 提取 HERMES_HOME 环境变量，只清理同一个 HOME 下的进程
+  - 兼容多种启动方式：`hermes gateway run`、`python -m hermes_cli.main gateway`、`gateway/run.py`
+
+- **启动防护逻辑**：`gateway/run.py` 的 `start_gateway()` 重构
+  - 检测到多个进程时：
+    - 不带 `--replace`：拒绝启动，提示用户清理
+    - 带 `--replace`：自动清理所有旧进程，然后启动新进程
+  - 单个进程时：保持原有逻辑（向后兼容）
+  - 无进程时：正常启动
+
+### Fixed
+- **进程堆积问题**：从设计上杜绝多个 gateway 进程同时运行
+  - 手动启动多次 `hermes gateway run --replace` 不再堆积
+  - LaunchAgent 自动重启与手动启动的竞态不再产生多进程
+  - 旧进程清理慢时，新进程会等待或强制 kill
+
+### Changed
+- **PID 文件不再是唯一真相源**：启动时优先信任全局进程扫描，PID 文件作为辅助
+- **--replace 语义增强**：从"替换 PID 文件里的进程"变为"清理所有同 HERMES_HOME 的进程"
+
+### Verified
+- 手动测试：单进程启动、多进程拒绝、--replace 自动清理、LaunchAgent 重启
+- 兼容性：不影响现有 `hermes gateway start/stop/restart` 命令
+
+### Documentation
+- 新增 `DESIGN_GATEWAY_STARTUP_GUARD.md`：设计方案、风险评估、测试用例
+- 更新 `RUNBOOK_GATEWAY_PROCESS_PILEUP.md`：补充 v1.7.0+ 的设计防护说明
+
+---
+
+## [1.6.1] — 2026-04-26 — Gateway 进程堆积问题 Runbook
+
+### Added
+- **RUNBOOK_GATEWAY_PROCESS_PILEUP.md**：Gateway 进程堆积问题的诊断、解决、预防完整指南
+  - 根因分析：PID 文件机制局限、LaunchAgent 竞态、手动启动重试
+  - 诊断步骤：进程列表、PID 文件、LaunchAgent 状态
+  - 三种解决方案：官方命令、手动清理、保留 CLI 会话
+  - 预防措施：避免手动启动、监控进程数量、日志审计
+  - 常见问题 FAQ
+
+### Context
+- 今日遇到多个 `hermes gateway run --replace` 进程堆积，导致新 gateway 启动失败
+- 根因：`--replace` 只能 kill PID 文件记录的进程，旧进程清理慢时新进程已启动
+- 解决：`hermes gateway stop` + `hermes gateway start` 清理所有进程
+
+---
+
+## [1.6.0] — 2026-04-26 — FeishuAdapter 自动集成
+
+### Added
+- **FeishuAdapter 自动启停 MetricsServer**：读取 `config.extra.admission_metrics_port`，在 `connect()` 时启动，`disconnect()` 时停止
+- **FeishuAdapter 自动加载 template**：读取 `config.extra.admission_template`，在 admission 初始化后自动 apply
+- **配置示例补充**：README 新增 `admission_metrics_port` 和 `admission_template` 配置说明
+
+### Verified
+- 新增 `test_feishu_admission_autostart.py`（8 tests）：template 自动加载、metrics server 启停、组合场景
+- 修复 `test_admission_autostart.py` 中的默认值断言（rate_limit 默认 20）
+- admission 全量测试 139/139 通过
+
+---
+
 ## [1.5.0] — 2026-04-26 — 运维面板闭环
 
 ### Added

@@ -17,6 +17,10 @@ platforms:
   feishu:
     extra:
       admission_control_enabled: true
+      # 可选：启用 Prometheus 指标导出
+      admission_metrics_port: 9090
+      # 可选：启动时自动加载策略模板
+      admission_template: strict
 ```
 
 ### 2. 启动 Gateway
