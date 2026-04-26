@@ -1149,6 +1149,28 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
         # Reuse the parse from the platform check above
         frontmatter = parsed_frontmatter
 
+        # Return body-only content for the main SKILL.md to avoid duplicating
+        # frontmatter data that is already surfaced as structured JSON fields.
+        try:
+            _, display_content = _parse_frontmatter(content)
+        except Exception:
+            display_content = content
+
+        truncated = False
+        truncation_note = None
+        if len(display_content) > SKILL_VIEW_MAX_CONTENT_CHARS:
+            truncated = True
+            omitted = len(display_content) - SKILL_VIEW_MAX_CONTENT_CHARS
+            truncation_note = (
+                f"Skill content truncated: showing first {SKILL_VIEW_MAX_CONTENT_CHARS:,} chars "
+                f"of {len(display_content):,}; omitted {omitted:,} chars. "
+                f"Use file_path or read the skill on disk for the full text."
+            )
+            display_content = (
+                display_content[:SKILL_VIEW_MAX_CONTENT_CHARS].rstrip()
+                + "\n\n[... truncated ...]"
+            )
+
         # Get reference, template, asset, and script files if this is a directory-based skill
         reference_files = []
         template_files = []
@@ -1297,7 +1319,8 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
             "description": frontmatter.get("description", ""),
             "tags": tags,
             "related_skills": related_skills,
-            "content": content,
+            "content": display_content,
+            "truncated": truncated,
             "path": rel_path,
             "skill_dir": str(skill_dir) if skill_dir else None,
             "linked_files": linked_files if linked_files else None,
@@ -1315,6 +1338,9 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
             if setup_needed
             else SkillReadinessStatus.AVAILABLE.value,
         }
+
+        if truncation_note:
+            result["truncation_note"] = truncation_note
 
         setup_help = next((e["help"] for e in required_env_vars if e.get("help")), None)
         if setup_help:
@@ -1414,6 +1440,10 @@ SKILLS_LIST_SCHEMA = {
         "required": [],
     },
 }
+
+# Maximum content chars returned by skill_view() for the main SKILL.md.
+# Larger skills are truncated with a note.  file_path access is not truncated.
+SKILL_VIEW_MAX_CONTENT_CHARS = 30_000
 
 SKILL_VIEW_SCHEMA = {
     "name": "skill_view",

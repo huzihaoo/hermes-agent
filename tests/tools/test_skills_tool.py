@@ -567,7 +567,7 @@ class TestSkillViewSecureSetupOnLoad:
         result = json.loads(raw)
         assert result["success"] is True
         assert result["setup_skipped"] is True
-        assert result["content"].startswith("---")
+        assert result["content"].startswith("#")
 
     def test_gateway_load_returns_guidance_without_secret_capture(
         self,
@@ -612,7 +612,7 @@ class TestSkillViewSecureSetupOnLoad:
         assert result["success"] is True
         assert called["value"] is False
         assert "local cli" in result["gateway_setup_hint"].lower()
-        assert result["content"].startswith("---")
+        assert result["content"].startswith("#")
 
 
 # ---------------------------------------------------------------------------
