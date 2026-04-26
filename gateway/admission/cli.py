@@ -13,6 +13,7 @@ import json
 import sys
 
 from gateway.admission import AdmissionController
+from gateway.admission.templates import PolicyTemplate, TemplateStore
 from gateway.admission.types import ALL_DOMAINS, ALL_LANES
 
 
@@ -77,6 +78,76 @@ def cmd_clear(args):
     print(f"Cleared {len(items)} items from {label}")
 
 
+def cmd_template(args):
+    """Manage policy templates."""
+    from pathlib import Path as P
+
+    store = TemplateStore(store_dir=P(args.store_dir) if args.store_dir else None)
+
+    if args.action == "list":
+        names = store.list_names()
+        if not names:
+            print("No templates found. Run 'template seed' to create built-ins.")
+            return
+        for n in names:
+            t = store.get(n)
+            desc = t.description if t else ""
+            print(f"  {n:20s}  {desc}")
+        return
+
+    if args.action == "seed":
+        store.seed_builtins()
+        print(f"Seeded {len(store.list_names())} built-in templates.")
+        return
+
+    if args.action == "export":
+        if not args.name or not args.path:
+            print("Usage: template export --name NAME --path FILE", file=sys.stderr)
+            sys.exit(1)
+        store.export_template(args.name, P(args.path))
+        print(f"Exported '{args.name}' → {args.path}")
+        return
+
+    if args.action == "import":
+        if not args.path:
+            print("Usage: template import --path FILE", file=sys.stderr)
+            sys.exit(1)
+        t = store.import_template(P(args.path))
+        print(f"Imported '{t.name}' from {args.path}")
+        return
+
+    print(f"Unknown template action: {args.action}", file=sys.stderr)
+    sys.exit(1)
+
+
+def cmd_alerts(args, controller=None):
+    """Show alert history."""
+    ctrl = controller or AdmissionController()
+    limit = getattr(args, "limit", 50)
+    history = ctrl.get_alert_history(limit=limit)
+    if not history:
+        print("No alerts fired.")
+        return
+    for rec in history:
+        import time as _t
+        ts = _t.strftime("%Y-%m-%d %H:%M:%S", _t.localtime(rec.timestamp))
+        print(f"  [{rec.level.value.upper()}] {ts}  {rec.message}")
+
+
+def cmd_apply(args, controller=None):
+    """Apply a policy template to the controller."""
+    from pathlib import Path as P
+    store = TemplateStore(store_dir=P(args.store_dir) if getattr(args, "store_dir", None) else None)
+    tpl = store.get(args.name)
+    if tpl is None:
+        print(f"Template '{args.name}' not found. Run 'template list' to see available.")
+        return
+    ctrl = controller or AdmissionController()
+    ctrl.apply_template(tpl)
+    print(f"Applied template '{tpl.name}' — rate_limit={tpl.rate_limit_per_user}, "
+          f"depth_warning={tpl.depth_warning}, depth_critical={tpl.depth_critical}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Admission queue CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -93,6 +164,26 @@ def main():
     cp.add_argument("lane", nargs="?", choices=list(ALL_LANES),
                     help="Lane to clear (omit to clear all)")
     cp.set_defaults(func=cmd_clear)
+
+    # template command
+    tp = subparsers.add_parser("template", help="Manage policy templates")
+    tp.add_argument("action", choices=["list", "seed", "export", "import"],
+                    help="Template action")
+    tp.add_argument("--name", help="Template name (for export)")
+    tp.add_argument("--path", help="File path (for export/import)")
+    tp.add_argument("--store-dir", dest="store_dir", help="Custom template store directory")
+    tp.set_defaults(func=cmd_template)
+
+    # alerts command
+    ap = subparsers.add_parser("alerts", help="Show alert history")
+    ap.add_argument("--limit", type=int, default=50, help="Max alert records to show")
+    ap.set_defaults(func=cmd_alerts)
+
+    # apply command
+    pp = subparsers.add_parser("apply", help="Apply a policy template")
+    pp.add_argument("name", help="Template name")
+    pp.add_argument("--store-dir", dest="store_dir", help="Custom template store directory")
+    pp.set_defaults(func=cmd_apply)
 
     args = parser.parse_args()
 

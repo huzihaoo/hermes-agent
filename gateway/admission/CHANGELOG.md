@@ -13,6 +13,79 @@ MAJOR.MINOR.PATCH
 
 ---
 
+## [1.5.0] — 2026-04-26 — 运维面板闭环
+
+### Added
+- **README 全面更新**：版本号 → v1.5.0，文件结构、告警/模板/Prometheus/CLI 全部补齐
+- **CLI `alerts` 子命令**：查看告警历史 (`python -m gateway.admission.cli alerts`)
+- **CLI `apply` 子命令**：从 store 加载模板并应用 (`python -m gateway.admission.cli apply strict`)
+- **MetricsServer**：独立 HTTP server 暴露 `/metrics` 端点（stdlib http.server，零侵入 gateway）
+
+### Verified
+- 新增 `test_admission_cli_ext.py`（4 tests）+ `test_admission_metrics_server.py`（3 tests）
+- admission 全量测试 135/135 通过
+
+---
+
+## [1.4.0] — 2026-04-26 — Prometheus metrics exporter
+
+### Added
+- **MetricsExporter**：新增 `metrics_export.py`，纯字符串生成 Prometheus exposition format，无外部依赖
+- 导出 counter：admitted / rejected / completed / failed / retried / dead
+- 导出 gauge：`admission_queue_depth{domain,lane}` 每个 domain×lane 组合
+- 导出 counter：`admission_alerts_fired_total`
+
+### Verified
+- 新增 `test_admission_metrics_export.py`（5 tests）
+- admission 全量测试 128/128 通过
+
+---
+
+## [1.3.0] — 2026-04-26 — 边界测试 + Shutdown 压力 + Connection Pool
+
+### Added
+- **边界测试**：空队列全 lane/domain dequeue、100 domain_id 极端数量、1000 item 单 lane 满载、backoff 全阻塞、cleanup 边界
+- **Graceful shutdown 压力测试**：drain 内完成、超时取消、空队列快速停止、double stop、10 并发 in-flight drain
+- **ConnectionPool**：`persistence.py` 新增 `ConnectionPool` 类，模块级 pool 缓存，所有 save/load 复用同一连接，不再每次 open/close
+
+### Verified
+- 新增 `test_admission_boundary.py`（18 tests）+ `test_admission_shutdown.py`（5 tests）+ `test_admission_connpool.py`（5 tests）
+- admission 全量测试 123/123 通过
+
+---
+
+## [1.2.0] — 2026-04-26 — 策略模板
+
+### Added
+- **PolicyTemplate**：可复用的准入策略配置数据类（rate limit / depth threshold / error rate）
+- **TemplateStore**：JSON 文件持久化，支持 CRUD / import / export / seed
+- **Built-in templates**：`strict`（严格）/ `relaxed`（宽松）/ `vip-priority`（VIP 优先）
+- **AdmissionController.apply_template()**：运行时热切换策略模板
+- **CLI `template` 子命令**：`list` / `seed` / `export` / `import`
+
+### Verified
+- 新增 `tests/gateway/test_admission_templates.py` + `tests/gateway/test_admission_cli.py`
+- admission 全量测试 95/95 通过
+
+---
+
+## [1.1.0] — 2026-04-26 — 告警规则
+
+### Added
+- **Alert framework**：新增 `alerts.py`，包含 `AlertManager`、`AlertRecord`、`AlertLevel`
+- **Queue depth alert**：支持 warning / critical 双阈值告警
+- **Error rate alert**：基于 `total_completed + total_failed + total_dead` 计算错误率并告警
+- **Cooldown suppression**：同一规则支持冷却期，避免重复刷屏
+- **Alert callbacks + history**：支持回调投递与历史查询
+- **Controller integration**：`AdmissionController` 内置告警管理，队列深度检查改走统一 alert pipeline
+
+### Verified
+- 新增 `tests/gateway/test_admission_alerts.py`
+- 17/17 告警测试通过
+- admission 全量测试 79/79 通过
+
+---
+
 ## [1.0.1] — 2026-04-25 — 并发硬化
 
 ### Fixed
@@ -75,7 +148,7 @@ gateway/admission/
 
 ## 待办（下一版本候选）
 
-- [ ] 边界测试：空队列 dequeue、极端 domain_id 数量、单 lane 满载
-- [ ] Worker graceful shutdown 压力测试
-- [ ] 持久化 connection pool（当前每次 save/load 都 open/close）
-- [ ] Prometheus metrics exporter
+- [x] 边界测试：空队列 dequeue、极端 domain_id 数量、单 lane 满载 *(v1.3.0)*
+- [x] Worker graceful shutdown 压力测试 *(v1.3.0)*
+- [x] 持久化 connection pool（当前每次 save/load 都 open/close）*(v1.3.0)*
+- [x] Prometheus metrics exporter *(v1.4.0)*

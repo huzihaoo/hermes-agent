@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import List
@@ -11,9 +12,51 @@ from typing import List
 from .types import QueueItem
 
 
+class ConnectionPool:
+    """Thread-safe single-connection pool for SQLite.
+
+    Reuses one connection per db_path, protected by a lock.
+    """
+
+    def __init__(self, db_path: Path):
+        self._db_path = db_path
+        self._lock = threading.Lock()
+        self._conn: sqlite3.Connection | None = None
+
+    def get(self) -> sqlite3.Connection:
+        with self._lock:
+            if self._conn is None:
+                self._db_path.parent.mkdir(parents=True, exist_ok=True)
+                self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
+                self._conn.execute("PRAGMA journal_mode=WAL")
+            return self._conn
+
+    def close(self) -> None:
+        with self._lock:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
+
+
+# Module-level pool cache: db_path -> ConnectionPool
+_pools: dict[str, ConnectionPool] = {}
+_pools_lock = threading.Lock()
+
+
+def _get_pool(db_path: Path) -> ConnectionPool:
+    key = str(db_path)
+    with _pools_lock:
+        if key not in _pools:
+            _pools[key] = ConnectionPool(db_path)
+        return _pools[key]
+
+
 def init_db(db_path: Path) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
+    conn = _get_pool(db_path).get()
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(
         """
@@ -58,7 +101,6 @@ def init_db(db_path: Path) -> None:
     _migrate_add_column(conn, "last_error", "TEXT")
     _migrate_add_column(conn, "next_retry_at", "TEXT")
     conn.commit()
-    conn.close()
 
 
 def _migrate_add_column(conn: sqlite3.Connection, col_name: str, col_def: str) -> None:
@@ -72,8 +114,7 @@ def _migrate_add_column(conn: sqlite3.Connection, col_name: str, col_def: str) -
 def save_items(db_path: Path, items: List[QueueItem]) -> None:
     """Save queue items to SQLite using upsert (no DELETE, safe for concurrent writes)."""
     init_db(db_path)
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL")
+    conn = _get_pool(db_path).get()
     
     # Get all current item IDs in DB
     cursor = conn.execute("SELECT id FROM queue_items")
@@ -122,7 +163,6 @@ def save_items(db_path: Path, items: List[QueueItem]) -> None:
         conn.execute("DELETE FROM queue_items WHERE id = ?", (item_id,))
 
     conn.commit()
-    conn.close()
 
 
 def load_items(db_path: Path) -> List[QueueItem]:
@@ -130,7 +170,7 @@ def load_items(db_path: Path) -> List[QueueItem]:
         return []
 
     init_db(db_path)
-    conn = sqlite3.connect(db_path)
+    conn = _get_pool(db_path).get()
     cursor = conn.execute(
         """SELECT id, user_id, user_role, message, lane, priority, status,
                   created_at, started_at, completed_at, result,
@@ -169,14 +209,13 @@ def load_items(db_path: Path) -> List[QueueItem]:
             )
         )
 
-    conn.close()
     return items
 
 
 def save_metrics(db_path: Path, metrics: dict[str, int]) -> None:
     """Save metrics to SQLite."""
     init_db(db_path)
-    conn = sqlite3.connect(db_path)
+    conn = _get_pool(db_path).get()
     
     for key, value in metrics.items():
         conn.execute(
@@ -185,7 +224,6 @@ def save_metrics(db_path: Path, metrics: dict[str, int]) -> None:
         )
     
     conn.commit()
-    conn.close()
 
 
 def load_metrics(db_path: Path) -> dict[str, int]:
@@ -194,10 +232,9 @@ def load_metrics(db_path: Path) -> dict[str, int]:
         return {}
     
     init_db(db_path)
-    conn = sqlite3.connect(db_path)
+    conn = _get_pool(db_path).get()
     cursor = conn.execute("SELECT key, value FROM metrics")
     
     metrics = {row[0]: row[1] for row in cursor.fetchall()}
     
-    conn.close()
     return metrics

@@ -195,3 +195,32 @@ def test_get_status_shows_queue_state_by_domain():
         assert "metrics" in status
         assert status["metrics"]["total_admitted"] == 3
         assert status["metrics"]["total_completed"] == 0
+
+
+def test_apply_template_updates_controller_thresholds():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ctrl = AdmissionController(
+            db_path=Path(tmpdir) / "q.db",
+            audit_dir=Path(tmpdir) / "audit",
+        )
+
+        from gateway.admission.templates import PolicyTemplate
+
+        tpl = PolicyTemplate(
+            name="strict",
+            description="strict mode",
+            rate_limit_per_user=7,
+            rate_limit_window_seconds=45,
+            depth_warning=4,
+            depth_critical=9,
+            error_rate_threshold=0.11,
+            error_rate_critical=0.22,
+            alert_cooldown_seconds=33,
+        )
+
+        ctrl.apply_template(tpl)
+
+        assert ctrl._rate_limit == 7
+        assert ctrl._rate_window == 45
+        assert ctrl._depth_warning_threshold == 4
+        assert ctrl._depth_critical_threshold == 9

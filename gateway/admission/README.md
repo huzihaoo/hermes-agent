@@ -1,10 +1,10 @@
 # Admission Control — 多车道准入队列
 
-> **当前版本: v1.0.1** | [CHANGELOG](CHANGELOG.md) | [版本管理](VERSION_MANAGEMENT.md)
+> **当前版本: v1.5.0** | [CHANGELOG](CHANGELOG.md) | [版本管理](VERSION_MANAGEMENT.md)
 
 ## 概述
 
-多用户/多群组并发消息的准入控制与排队系统。消息按类型分入不同车道（lane），车道间并发处理，车道内 FIFO 串行。
+多用户/多群组并发消息的准入控制与排队系统。消息按类型分入不同车道（lane），车道间并发处理，车道内 FIFO 串行。支持告警规则、策略模板、Prometheus 指标导出。
 
 ## 快速开始
 
@@ -26,30 +26,30 @@ cd ~/.hermes/hermes-agent
 python -m gateway.run
 ```
 
-启动日志会显示：
-```
-[admission] Controller initialized (db=..., audit=...)
-[admission] Queue worker started
-```
-
 ### 3. 查看队列状态
 
 ```bash
-# 人类可读格式
-python -m gateway.admission.cli status
-
-# JSON 格式
-python -m gateway.admission.cli status --json
+python -m gateway.admission.cli status          # 人类可读
+python -m gateway.admission.cli status --json    # JSON
+python -m gateway.admission.cli status --domain user  # 按域过滤
 ```
 
-### 4. 测试
+### 4. 管理策略模板
 
-发送 Feishu 消息，观察日志：
+```bash
+python -m gateway.admission.cli template seed           # 初始化内置模板
+python -m gateway.admission.cli template list            # 列出所有模板
+python -m gateway.admission.cli template export --name strict --path strict.json
+python -m gateway.admission.cli template import --path strict.json
 ```
-[admission] Admitted user=xxx lane=standard pos=1
-[worker] Processing xxx from standard lane
-[worker] Completed xxx in 2.34s
+
+### 5. 测试
+
+```bash
+pytest tests/gateway/test_admission_*.py -q
 ```
+
+当前 128/128 通过。
 
 ## 架构
 
@@ -57,26 +57,28 @@ python -m gateway.admission.cli status --json
 Feishu Message
     │
     ▼
-┌─────────────────────┐
-│  AdmissionController │  ← 准入决策 + 分类
-│  (controller.py)     │
-└────────┬────────────┘
+┌──────────────────────┐
+│  AdmissionController  │  ← 准入决策 + 分类 + 告警
+│  (controller.py)      │
+│  ├─ AlertManager      │  ← 队列深度 / 错误率告警
+│  └─ apply_template()  │  ← 运行时热切换策略
+└────────┬─────────────┘
          │ enqueue
          ▼
-┌─────────────────────┐
-│   PriorityQueue      │  ← SQLite 持久化
-│   (queue.py)         │
-│                      │
+┌──────────────────────┐
+│   AdmissionQueue      │  ← SQLite 持久化 (ConnectionPool)
+│   (queue.py)          │
+│                       │
 │  ┌──────┐ ┌────────┐ ┌───────┐
-│  │ fast │ │standard│ │ heavy │  ← 3 车道
+│  │ fast │ │standard│ │ heavy │  ← 3 车道 × 3 域
 │  └──┬───┘ └───┬────┘ └──┬────┘
 └─────┼─────────┼─────────┼────┘
       │         │         │
       ▼         ▼         ▼
-┌─────────────────────────────┐
-│       QueueWorker            │  ← 3 并发 worker
-│       (worker.py)            │
-└──────────────────────────────┘
+┌────────────────────────────────┐
+│       QueueWorker               │  ← per-domain dispatcher
+│       (worker.py)               │     + semaphore 并发控制
+└────────────────────────────────┘
          │
          ▼
     FeishuAdapter._handle_message_with_guards()
@@ -90,58 +92,78 @@ Feishu Message
 | heavy | 包含"代码/写代码/实现/开发"等关键词 | 编码任务、长程生成 |
 | standard | 其他 | 普通问答、查询 |
 
-车道间并发：3 个 worker 同时从 3 个车道取任务。
-车道内串行：同一车道内按优先级 FIFO 处理。
+## 域隔离
+
+| 域 | 路由条件 | domain_id |
+|----|----------|-----------|
+| user | 默认 / 私聊 | user_id |
+| group | chat_type == "group" | chat_id |
+| vm | platform == "vm" 或 vm_id 存在 | vm_id |
+
+域内 domain_id 间 round-robin 公平调度。
 
 ## 优先级
 
 | 角色 | 优先级 | 说明 |
 |------|--------|------|
-| owner | 100 | 管理员，最高优先 |
+| owner | 100 | 最高优先 |
 | admin | 50 | 管理员 |
+| senior | 30 | 高级成员 |
 | member | 10 | 普通成员（默认） |
 
-角色通过 `tools/permission_policy.py` 解析，配置文件：`~/.hermes/config/user-roles.json`
+## 告警规则 (v1.1.0+)
 
-### 配置用户角色
+内置两种告警规则：
 
-编辑 `~/.hermes/config/user-roles.json`：
+- **QueueDepthAlert**: 队列深度超过 warning (10) / critical (50) 阈值时触发
+- **ErrorRateAlert**: 错误率 (failed + dead) / total 超过 20% (warning) / 50% (critical) 时触发
 
-```json
-{
-  "users": {
-    "default": "member",
-    "张三": "owner",
-    "李四": "admin"
-  },
-  "user_id_mapping": {
-    "ou_abc123": "张三",
-    "ou_def456": "李四"
-  }
-}
+告警支持冷却期（默认 300s）、回调投递、历史查询。
+
+```python
+from gateway.admission import AdmissionController
+ctrl = AdmissionController()
+history = ctrl.get_alert_history(limit=50)
 ```
 
-- `users`：display_name → role 映射
-- `user_id_mapping`：user_id (如 Feishu open_id) → display_name 映射
-- `default`：未配置用户的默认角色
+## 策略模板 (v1.2.0+)
 
-## 启用方式
+预定义的准入策略配置，可保存、分享、导入导出。
 
-在 `config.yaml` 中：
+内置模板：
+- `strict` — 严格模式（低限流、紧阈值）
+- `relaxed` — 宽松模式（高限流、宽阈值）
+- `vip-priority` — VIP 优先（中等限流、快速告警）
 
-```yaml
-platforms:
-  feishu:
-    extra:
-      admission_control_enabled: true
+```python
+from gateway.admission import AdmissionController
+from gateway.admission.templates import TemplateStore
+
+ctrl = AdmissionController()
+store = TemplateStore()
+store.seed_builtins()
+tpl = store.get("strict")
+ctrl.apply_template(tpl)
 ```
 
-默认关闭。开启后所有 Feishu 入站消息经过准入检查。
+## Prometheus 指标 (v1.4.0+)
+
+```python
+from gateway.admission.metrics_export import MetricsExporter
+exporter = MetricsExporter(ctrl)
+print(exporter.export())
+```
+
+导出指标：
+- `admission_total_admitted` / `rejected` / `completed` / `failed` / `retried` / `dead` (counter)
+- `admission_queue_depth{domain,lane}` (gauge)
+- `admission_alerts_fired_total` (counter)
 
 ## 持久化
 
-- 队列状态：SQLite (`~/.hermes/admission_queue.db`)
-- 审计日志：JSONL (`~/.hermes/admission_audit/`)
+- 队列状态：SQLite + WAL + ConnectionPool (`~/.hermes/admission/queue.db`)
+- 审计日志：JSONL (`~/.hermes/audit/`)
+- 策略模板：JSON (`~/.hermes/admission/templates/`)
 
 重启后队列中未处理的消息会恢复。
 
@@ -149,76 +171,67 @@ platforms:
 
 ```
 gateway/admission/
-├── __init__.py          # 公开 API
-├── types.py             # QueueItem, Lane 类型定义
-├── queue.py             # SQLite 优先级队列
-├── controller.py        # 准入决策 + 分类逻辑
-├── worker.py            # 异步多车道 worker
-├── persistence.py       # 持久化层
-├── audit.py             # JSONL 审计日志
+├── __init__.py           # 公开 API + 版本号
+├── types.py              # QueueItem, Lane, Domain 类型定义
+├── queue.py              # 内存队列 + 线程安全 + round-robin
+├── controller.py         # 准入控制器（权限、限流、重试、审计、告警、模板）
+├── persistence.py        # SQLite 持久化 + ConnectionPool
+├── worker.py             # 异步 Worker（per-domain dispatcher）
+├── audit.py              # JSONL 审计日志
+├── alerts.py             # 告警规则（QueueDepthAlert / ErrorRateAlert / AlertManager）
+├── templates.py          # 策略模板（PolicyTemplate / TemplateStore）
+├── metrics_export.py     # Prometheus 指标导出
 ├── feishu_integration.py # FeishuAdapter 桥接
-└── README.md            # 本文件
+├── cli.py                # CLI 命令（status / clear / template）
+├── README.md             # 本文件
+├── CHANGELOG.md          # 变更日志
+├── VERSION_MANAGEMENT.md # 版本管理规范
+├── ROLLBACK.md           # 回滚 SOP
+└── version_check.py      # 版本检查脚本
 ```
 
-## 测试
+## CLI 工具
 
 ```bash
-pytest tests/gateway/test_admission*.py tests/gateway/test_queue*.py tests/gateway/test_audit.py tests/gateway/test_feishu_integration.py -v
+# 队列状态
+python -m gateway.admission.cli status [--json] [--domain user|group|vm] [--domain-id ID]
+
+# 清空队列（仅测试用）
+python -m gateway.admission.cli clear [fast|standard|heavy]
+
+# 策略模板管理
+python -m gateway.admission.cli template list
+python -m gateway.admission.cli template seed
+python -m gateway.admission.cli template export --name NAME --path FILE
+python -m gateway.admission.cli template import --path FILE
 ```
-
-当前 41/41 通过。
-
-## 设计决策
-
-1. **车道 vs 用户隔离**：当前按消息类型分车道，不按用户/群组隔离。原因：用户数不确定，动态创建 worker 复杂度高。如需用户级隔离，可在 standard 车道内加 per-user sub-queue。
-
-2. **默认关闭**：通过 config flag 控制，避免影响现有单用户部署。
-
-3. **错误降级**：准入检查失败时 fall-through 到原始处理流程，不阻塞消息。
-
-4. **SQLite 而非 Redis**：单机部署场景，SQLite 足够且零依赖。分布式场景可替换为 Redis。
 
 ## 故障排查
 
 ### 队列卡住不处理
 
 ```bash
-# 检查队列状态
 python -m gateway.admission.cli status
-
-# 检查 worker 是否启动
 grep "Queue worker started" ~/.hermes/logs/gateway.log
-
-# 清空队列（测试用）
-python -m gateway.admission.cli clear
+python -m gateway.admission.cli clear  # 测试用
 ```
 
 ### 消息被拒绝
 
-检查审计日志：
 ```bash
 tail -f ~/.hermes/audit/$(date +%Y-%m-%d).jsonl | jq .
 ```
 
-查找 `"result": "denied"` 的记录。
-
 ### 性能问题
 
-查看处理时间：
 ```bash
 grep "Completed.*in" ~/.hermes/logs/gateway.log | tail -20
 ```
 
-如果某个车道处理时间过长，考虑：
-- 调整车道分类逻辑（`controller.py` 中的 `_classify_lane`）
-- 增加该车道的 worker 数量（需修改 `worker.py`）
+## 设计决策
 
-## CLI 工具
-
-```bash
-# 查看状态
-python -m gateway.admission.cli status [--json]
-
-# 清空队列（仅测试用）
-python -m gateway.admission.cli clear [fast|standard|heavy]
-```
+1. **三层隔离 (domain → domain_id → lane)**: 域间完全隔离，域内 domain_id 间 round-robin 公平调度
+2. **默认关闭**: 通过 config flag 控制，不影响现有单用户部署
+3. **错误降级**: 准入检查失败时 fall-through 到原始处理流程
+4. **SQLite + ConnectionPool**: 单机部署零依赖，连接复用减少 I/O 开销
+5. **0 侵入源码**: 作为独立 sidecar 部署，不修改 hermes gateway 源码

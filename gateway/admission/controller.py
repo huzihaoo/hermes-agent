@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Tuple
 
+from .alerts import AlertManager, ErrorRateAlert, QueueDepthAlert
 from .audit import AuditEvent, log_audit
 from .queue import AdmissionQueue
 from .types import (
@@ -141,6 +142,16 @@ class AdmissionController:
 
         self._depth_warning_threshold = 10
         self._depth_critical_threshold = 50
+
+        # Alert system
+        self._alert_manager = AlertManager(cooldown_seconds=300)
+        self._alert_manager.register(QueueDepthAlert(
+            warning=self._depth_warning_threshold,
+            critical=self._depth_critical_threshold,
+        ))
+        self._alert_manager.register(ErrorRateAlert(
+            threshold=0.2, critical_threshold=0.5, window_seconds=300,
+        ))
 
         # Rate limiting: sliding window per user_id
         self._rate_limit = rate_limit_per_user
@@ -440,16 +451,39 @@ class AdmissionController:
         depth = self.queue.pending_count(lane=lane, domain=domain)
         label = f"{domain}:{lane}" if domain else lane
 
-        if depth >= self._depth_critical_threshold:
-            logger.error(
-                "[admission] CRITICAL: %s depth=%d (threshold=%d)",
-                label, depth, self._depth_critical_threshold,
-            )
-        elif depth >= self._depth_warning_threshold:
-            logger.warning(
-                "[admission] WARNING: %s depth=%d (threshold=%d)",
-                label, depth, self._depth_warning_threshold,
-            )
+        alerts = self._alert_manager.check_all({
+            "pending_count": depth,
+            **self._metrics,
+        })
+        for alert in alerts:
+            if alert.rule_name.startswith("queue_depth"):
+                if alert.level.value == "critical":
+                    logger.error("[admission] %s", alert.message)
+                else:
+                    logger.warning("[admission] %s", alert.message)
+
+    def get_alert_history(self, limit: int = 100) -> list:
+        return self._alert_manager.get_history(limit=limit)
+
+    def apply_template(self, template) -> None:
+        """Apply a PolicyTemplate to reconfigure this controller."""
+        self._rate_limit = template.rate_limit_per_user
+        self._rate_window = template.rate_limit_window_seconds
+        self._depth_warning_threshold = template.depth_warning
+        self._depth_critical_threshold = template.depth_critical
+
+        # Rebuild alert manager with new thresholds
+        self._alert_manager = AlertManager(cooldown_seconds=template.alert_cooldown_seconds)
+        self._alert_manager.register(QueueDepthAlert(
+            warning=template.depth_warning,
+            critical=template.depth_critical,
+        ))
+        self._alert_manager.register(ErrorRateAlert(
+            threshold=template.error_rate_threshold,
+            critical_threshold=template.error_rate_critical,
+            window_seconds=300,
+        ))
+        logger.info("[admission] Applied template '%s'", template.name)
 
     def _audit(self, action: str, resource: str, result: str, metadata: dict | None = None) -> None:
         try:

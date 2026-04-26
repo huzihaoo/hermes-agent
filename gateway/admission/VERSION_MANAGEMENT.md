@@ -4,7 +4,7 @@
 
 ```python
 from gateway.admission import __version__
-print(__version__)  # "1.0.1"
+print(__version__)  # "1.5.0"
 ```
 
 ## 查看版本历史
@@ -123,7 +123,12 @@ pytest tests/gateway/test_admission_*.py -q
 
 | admission 版本 | hermes-agent 版本 | Python | SQLite | 备注 |
 |---------------|------------------|--------|--------|------|
-| 1.0.0 - 1.0.1 | 0.9.0+ | 3.11+ | 3.35+ | 需要 WAL 模式 |
+| 1.0.0 - 1.0.1 | 0.9.0+ | 3.11+ | 3.35+ | 基础队列 + 域隔离 |
+| 1.1.0 | 0.9.0+ | 3.11+ | 3.35+ | 告警规则 |
+| 1.2.0 | 0.9.0+ | 3.11+ | 3.35+ | 策略模板 |
+| 1.3.0 | 0.9.0+ | 3.11+ | 3.35+ | 边界测试 + ConnectionPool |
+| 1.4.0 | 0.9.0+ | 3.11+ | 3.35+ | Prometheus exporter |
+| 1.5.0 | 0.9.0+ | 3.11+ | 3.35+ | MetricsServer + CLI alerts/apply |
 
 ## 下一版本规划
 
