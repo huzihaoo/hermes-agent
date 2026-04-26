@@ -4696,8 +4696,7 @@ class GatewayRunner:
         return "\n".join(lines)
 
     async def _handle_tasks_command(self, event: MessageEvent) -> str:
-        """Handle /tasks - list recent tasks (product-level)."""
-        from hermes_cli.task_trace import list_tasks
+        """Handle /tasks [page] - list recent tasks with pagination."""
         from gateway.tasks.types import TaskStatus
         try:
             from gateway.admission.audit import AuditEvent, log_audit
@@ -4710,13 +4709,42 @@ class GatewayRunner:
             ))
         except Exception:
             pass
-        trace_file = _hermes_home / "analytics" / "events.jsonl"
-        user_id = event.source.user_id
-        tasks = list_tasks(trace_file=trace_file, limit=10, user_id=user_id)
-        if not tasks:
-            return "📋 **最近任务**\\n\\n暂无任务记录。"
         
-        lines = ["📋 **最近任务**\\n"]
+        # Parse page number from args
+        args = event.get_command_args().strip()
+        page = 1
+        if args:
+            try:
+                page = max(1, int(args))
+            except ValueError:
+                pass
+        
+        page_size = 10
+        offset = (page - 1) * page_size
+        
+        # Try SQLite store first, fall back to JSONL
+        tasks = []
+        total = 0
+        user_id = event.source.user_id
+        try:
+            from gateway.tasks.store import TaskStore
+            store = TaskStore(db_path=_hermes_home / "analytics" / "tasks.db")
+            tasks = store.list_recent(limit=page_size, offset=offset, user_id=user_id)
+            total = store.count_tasks(user_id=user_id)
+        except Exception:
+            from hermes_cli.task_trace import list_tasks
+            trace_file = _hermes_home / "analytics" / "events.jsonl"
+            all_tasks = list_tasks(trace_file=trace_file, limit=100, user_id=user_id)
+            total = len(all_tasks)
+            tasks = all_tasks[offset:offset + page_size]
+        
+        if not tasks:
+            if page > 1:
+                return f"📋 **最近任务** — 第 {page} 页\n\n没有更多任务了。"
+            return "📋 **最近任务**\n\n暂无任务记录。"
+        
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        lines = [f"📋 **最近任务** — 第 {page}/{total_pages} 页 (共 {total} 条)\n"]
         for t in tasks:
             # 状态图标
             if t.status == TaskStatus.COMPLETED:
@@ -4741,8 +4769,14 @@ class GatewayRunner:
             summary = t.request_summary or "无摘要"
             lines.append(f"{icon} {type_label} `{t.task_id}` — {summary[:50]}")
         
-        lines.append("\\n💡 使用 `/task <id>` 查看详情")
-        return "\\n".join(lines)
+        footer = []
+        if page < total_pages:
+            footer.append(f"`/tasks {page + 1}` 下一页")
+        if page > 1:
+            footer.append(f"`/tasks {page - 1}` 上一页")
+        footer.append("`/task <id>` 查看详情")
+        lines.append("\n💡 " + " | ".join(footer))
+        return "\n".join(lines)
 
     async def _handle_task_command(self, event: MessageEvent) -> str:
         """Handle /task <id> - show task details (product-level)."""

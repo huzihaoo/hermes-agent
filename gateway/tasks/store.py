@@ -106,30 +106,47 @@ class TaskStore:
             )
 
     def list_recent(
-        self, *, limit: int = 10, user_id: Optional[str] = None
+        self,
+        *,
+        limit: int = 10,
+        offset: int = 0,
+        user_id: Optional[str] = None,
+        status: Optional[TaskStatus] = None,
     ) -> List[Task]:
-        """List recent tasks, optionally filtered by user_id."""
+        """List recent tasks with pagination and filters.
+        
+        Args:
+            limit: Max tasks to return (default: 10)
+            offset: Skip first N tasks (default: 0)
+            user_id: Filter by user_id
+            status: Filter by status
+        """
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
+            
+            # Build query
+            where_clauses = []
+            params = []
+            
             if user_id:
-                rows = conn.execute(
-                    """
-                    SELECT * FROM tasks
-                    WHERE user_id = ?
-                    ORDER BY started_at DESC
-                    LIMIT ?
-                    """,
-                    (user_id, limit),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    """
-                    SELECT * FROM tasks
-                    ORDER BY started_at DESC
-                    LIMIT ?
-                    """,
-                    (limit,),
-                ).fetchall()
+                where_clauses.append("user_id = ?")
+                params.append(user_id)
+            
+            if status:
+                where_clauses.append("status = ?")
+                params.append(status.value)
+            
+            where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+            
+            query = f"""
+                SELECT * FROM tasks
+                {where_sql}
+                ORDER BY started_at DESC
+                LIMIT ? OFFSET ?
+            """
+            params.extend([limit, offset])
+            
+            rows = conn.execute(query, params).fetchall()
             return [
                 Task(
                     task_id=row["task_id"],
@@ -144,3 +161,28 @@ class TaskStore:
                 )
                 for row in rows
             ]
+
+    def count_tasks(
+        self,
+        *,
+        user_id: Optional[str] = None,
+        status: Optional[TaskStatus] = None,
+    ) -> int:
+        """Count total tasks matching filters."""
+        with sqlite3.connect(self.db_path) as conn:
+            where_clauses = []
+            params = []
+            
+            if user_id:
+                where_clauses.append("user_id = ?")
+                params.append(user_id)
+            
+            if status:
+                where_clauses.append("status = ?")
+                params.append(status.value)
+            
+            where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+            
+            query = f"SELECT COUNT(*) FROM tasks {where_sql}"
+            result = conn.execute(query, params).fetchone()
+            return result[0] if result else 0

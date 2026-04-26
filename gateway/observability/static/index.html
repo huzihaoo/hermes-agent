@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hermes Observability Dashboard</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #0a0a0a;
+            color: #e0e0e0;
+            line-height: 1.6;
+        }
+        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+        header {
+            background: #1a1a1a;
+            padding: 20px;
+            border-bottom: 2px solid #2a2a2a;
+            margin-bottom: 30px;
+        }
+        h1 { color: #00d4aa; font-size: 28px; font-weight: 600; }
+        .subtitle { color: #888; font-size: 14px; margin-top: 5px; }
+        
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 30px;
+            border-bottom: 1px solid #2a2a2a;
+        }
+        .tab {
+            padding: 12px 24px;
+            background: none;
+            border: none;
+            color: #888;
+            cursor: pointer;
+            font-size: 15px;
+            border-bottom: 2px solid transparent;
+            transition: all 0.2s;
+        }
+        .tab:hover { color: #e0e0e0; }
+        .tab.active {
+            color: #00d4aa;
+            border-bottom-color: #00d4aa;
+        }
+        
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        .stat-card {
+            background: #1a1a1a;
+            padding: 20px;
+            border-radius: 8px;
+            border: 1px solid #2a2a2a;
+        }
+        .stat-label {
+            color: #888;
+            font-size: 13px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 8px;
+        }
+        .stat-value {
+            font-size: 32px;
+            font-weight: 600;
+            color: #00d4aa;
+        }
+        .stat-unit { font-size: 16px; color: #888; margin-left: 4px; }
+        
+        .trace-list {
+            background: #1a1a1a;
+            border-radius: 8px;
+            border: 1px solid #2a2a2a;
+            overflow: hidden;
+        }
+        .trace-item {
+            padding: 16px 20px;
+            border-bottom: 1px solid #2a2a2a;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .trace-item:hover { background: #222; }
+        .trace-item:last-child { border-bottom: none; }
+        
+        .trace-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        .trace-id {
+            font-family: 'Monaco', 'Courier New', monospace;
+            font-size: 13px;
+            color: #00d4aa;
+        }
+        .trace-status {
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+        .status-completed { background: #1a4d2e; color: #4ade80; }
+        .status-running { background: #3d3d1a; color: #fbbf24; }
+        .status-failed { background: #4d1a1a; color: #f87171; }
+        
+        .trace-summary { color: #ccc; font-size: 14px; margin-bottom: 8px; }
+        .trace-meta {
+            display: flex;
+            gap: 20px;
+            font-size: 13px;
+            color: #888;
+        }
+        .trace-meta span { display: flex; align-items: center; gap: 6px; }
+        
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #888;
+        }
+        .error {
+            background: #4d1a1a;
+            color: #f87171;
+            padding: 16px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1>⚕ Hermes Observability</h1>
+            <div class="subtitle">Real-time monitoring & analytics</div>
+        </div>
+    </header>
+    
+    <div class="container">
+        <div class="tabs">
+            <button class="tab active" onclick="switchTab('overview')">Overview</button>
+            <button class="tab" onclick="switchTab('traces')">Traces</button>
+            <button class="tab" onclick="switchTab('cost')">Cost</button>
+        </div>
+        
+        <div id="overview" class="tab-content active">
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-label">Total Traces</div>
+                    <div class="stat-value" id="stat-total">-</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Total Cost</div>
+                    <div class="stat-value">
+                        $<span id="stat-cost">-</span>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Avg Duration</div>
+                    <div class="stat-value">
+                        <span id="stat-duration">-</span>
+                        <span class="stat-unit">ms</span>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Success Rate</div>
+                    <div class="stat-value">
+                        <span id="stat-success">-</span>
+                        <span class="stat-unit">%</span>
+                    </div>
+                </div>
+            </div>
+            
+            <h2 style="margin-bottom: 20px; color: #e0e0e0;">Recent Traces</h2>
+            <div id="overview-traces" class="trace-list">
+                <div class="loading">Loading...</div>
+            </div>
+        </div>
+        
+        <div id="traces" class="tab-content">
+            <h2 style="margin-bottom: 20px; color: #e0e0e0;">All Traces</h2>
+            <div id="all-traces" class="trace-list">
+                <div class="loading">Loading...</div>
+            </div>
+        </div>
+        
+        <div id="cost" class="tab-content">
+            <h2 style="margin-bottom: 20px; color: #e0e0e0;">Cost Analysis</h2>
+            <div id="cost-content">
+                <div class="loading">Loading...</div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        const API_BASE = '/api';
+        
+        function switchTab(tabName) {
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            event.target.classList.add('active');
+            document.getElementById(tabName).classList.add('active');
+            
+            if (tabName === 'traces') loadAllTraces();
+            if (tabName === 'cost') loadCostAnalysis();
+        }
+        
+        async function loadOverview() {
+            try {
+                const res = await fetch(`${API_BASE}/traces?limit=10`);
+                const data = await res.json();
+                
+                const traces = data.traces || [];
+                document.getElementById('stat-total').textContent = traces.length;
+                
+                const totalCost = traces.reduce((sum, t) => sum + (t.total_cost_usd || 0), 0);
+                document.getElementById('stat-cost').textContent = totalCost.toFixed(4);
+                
+                const completed = traces.filter(t => t.end_time);
+                const avgDuration = completed.length > 0
+                    ? completed.reduce((sum, t) => sum + ((t.end_time - t.start_time) * 1000), 0) / completed.length
+                    : 0;
+                document.getElementById('stat-duration').textContent = Math.round(avgDuration);
+                
+                const success = traces.filter(t => t.status === 'completed').length;
+                const successRate = traces.length > 0 ? (success / traces.length * 100) : 0;
+                document.getElementById('stat-success').textContent = successRate.toFixed(1);
+                
+                renderTraces(traces, 'overview-traces');
+            } catch (err) {
+                console.error('Failed to load overview:', err);
+                document.getElementById('overview-traces').innerHTML = 
+                    '<div class="error">Failed to load data</div>';
+            }
+        }
+        
+        async function loadAllTraces() {
+            try {
+                const res = await fetch(`${API_BASE}/traces?limit=50`);
+                const data = await res.json();
+                renderTraces(data.traces || [], 'all-traces');
+            } catch (err) {
+                console.error('Failed to load traces:', err);
+                document.getElementById('all-traces').innerHTML = 
+                    '<div class="error">Failed to load traces</div>';
+            }
+        }
+        
+        async function loadCostAnalysis() {
+            try {
+                const res = await fetch(`${API_BASE}/cost?days=30&group_by=user`);
+                const data = await res.json();
+                
+                let html = '<div class="stats-grid">';
+                html += `<div class="stat-card">
+                    <div class="stat-label">Total (30 days)</div>
+                    <div class="stat-value">$${(data.total_cost_usd || 0).toFixed(4)}</div>
+                </div>`;
+                html += '</div>';
+                
+                if (data.by_user && data.by_user.length > 0) {
+                    html += '<h3 style="margin: 30px 0 20px; color: #e0e0e0;">By User</h3>';
+                    html += '<div class="trace-list">';
+                    data.by_user.forEach(u => {
+                        html += `<div class="trace-item">
+                            <div class="trace-header">
+                                <span style="color: #ccc;">${u.user_id || 'Unknown'}</span>
+                                <span style="color: #00d4aa; font-weight: 600;">$${(u.total_cost_usd || 0).toFixed(4)}</span>
+                            </div>
+                            <div class="trace-meta">
+                                <span>${u.trace_count || 0} traces</span>
+                                <span>${u.total_tokens || 0} tokens</span>
+                            </div>
+                        </div>`;
+                    });
+                    html += '</div>';
+                }
+                
+                document.getElementById('cost-content').innerHTML = html;
+            } catch (err) {
+                console.error('Failed to load cost:', err);
+                document.getElementById('cost-content').innerHTML = 
+                    '<div class="error">Failed to load cost data</div>';
+            }
+        }
+        
+        function renderTraces(traces, containerId) {
+            const container = document.getElementById(containerId);
+            if (traces.length === 0) {
+                container.innerHTML = '<div class="loading">No traces found</div>';
+                return;
+            }
+            
+            let html = '';
+            traces.forEach(trace => {
+                const statusClass = `status-${trace.status || 'running'}`;
+                const duration = trace.end_time 
+                    ? Math.round((trace.end_time - trace.start_time) * 1000)
+                    : '-';
+                const time = new Date(trace.start_time * 1000).toLocaleString('zh-CN');
+                
+                html += `<div class="trace-item">
+                    <div class="trace-header">
+                        <span class="trace-id">${trace.trace_id.substring(0, 16)}...</span>
+                        <span class="trace-status ${statusClass}">${trace.status || 'running'}</span>
+                    </div>
+                    <div class="trace-summary">${trace.request_summary || 'No summary'}</div>
+                    <div class="trace-meta">
+                        <span>⏱ ${duration}ms</span>
+                        <span>💰 $${(trace.total_cost_usd || 0).toFixed(4)}</span>
+                        <span>🔢 ${trace.total_tokens || 0} tokens</span>
+                        <span>📅 ${time}</span>
+                    </div>
+                </div>`;
+            });
+            
+            container.innerHTML = html;
+        }
+        
+        // Load overview on page load
+        loadOverview();
+        
+        // Auto-refresh every 30s
+        setInterval(loadOverview, 30000);
+    </script>
+</body>
+</html>
