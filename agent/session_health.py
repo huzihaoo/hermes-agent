@@ -9,8 +9,20 @@ Based on incident: Session 20260425_124550_f9ed45
 - 2.3MB session file
 - Context compression failure
 
-Ref: knowledge/wiki/systems/session-memory-protection.md
+Version History:
+  v1.0.0 (2026-04-26) — Initial release
+    - SessionHealthMonitor with 400/450/500 message thresholds
+    - Runtime tracking (6h limit)
+    - Large return tracking (50KB/100KB thresholds)
+    - Health levels: green/yellow/red/blocked
+    - CLI /health command integration
+    - 18/18 tests passing
 """
+
+__version__ = "1.0.0"
+
+# Ref: knowledge/wiki/systems/session-memory-protection.md
+
 import time
 import logging
 from dataclasses import dataclass, field
