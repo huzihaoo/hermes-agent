@@ -4779,12 +4779,34 @@ class GatewayRunner:
         return "\n".join(lines)
 
     async def _handle_task_command(self, event: MessageEvent) -> str:
-        """Handle /task <id> - show task details (product-level)."""
+        """Handle /task <id> | /task cancel <id> | /task retry <id>."""
         from hermes_cli.task_trace import generate_receipt
         from gateway.tasks.types import TaskStatus
-        task_id = event.get_command_args().strip()
-        if not task_id:
-            return "用法: `/task <task_id>`"
+        raw_args = event.get_command_args().strip()
+        if not raw_args:
+            return "用法: `/task <task_id>` | `/task cancel <id>` | `/task retry <id>`"
+
+        parts = raw_args.split(None, 1)
+        subcommand = parts[0].lower()
+
+        # Sub-commands: cancel / retry
+        if subcommand == "cancel" and len(parts) == 2:
+            from types import SimpleNamespace as _NS
+            sub_event = _NS(
+                source=event.source,
+                get_command_args=lambda _tid=parts[1].strip(): _tid,
+            )
+            return await self._handle_task_cancel_command(sub_event)
+        if subcommand == "retry" and len(parts) == 2:
+            from types import SimpleNamespace as _NS
+            sub_event = _NS(
+                source=event.source,
+                get_command_args=lambda _tid=parts[1].strip(): _tid,
+            )
+            return await self._handle_task_retry_command(sub_event)
+
+        # Default: show task detail
+        task_id = raw_args
         try:
             from gateway.admission.audit import AuditEvent, log_audit
             log_audit(AuditEvent(
@@ -4857,6 +4879,78 @@ class GatewayRunner:
                 lines.append(f"**诊断:** {diagnosis}")
         
         return "\\n".join(lines)
+
+    async def _handle_task_cancel_command(self, event: MessageEvent) -> str:
+        """Handle /cancel <id> - cancel a pending/running task."""
+        from gateway.tasks.types import TaskStatus
+        task_id = event.get_command_args().strip()
+        if not task_id:
+            return "用法: `/cancel <task_id>`"
+
+        try:
+            from gateway.admission.audit import AuditEvent, log_audit
+            log_audit(AuditEvent(
+                user_id=event.source.user_id or "unknown",
+                action="cancel_task",
+                resource=task_id,
+                result="attempt",
+                metadata={"platform": event.source.platform.value if event.source.platform else ""},
+            ))
+        except Exception:
+            pass
+
+        from gateway.tasks.store import TaskStore
+        store = TaskStore(db_path=_hermes_home / "analytics" / "tasks.db")
+        task = store.get(task_id)
+        if not task:
+            return f"任务 `{task_id}` 未找到。"
+
+        if task.user_id and event.source.user_id and task.user_id != event.source.user_id:
+            return f"任务 `{task_id}` 不属于当前用户，不能取消。"
+
+        if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+            return f"任务 `{task_id}` 当前状态为 `{task.status.value}`，不能取消。"
+
+        ok = store.cancel_task(task_id)
+        if not ok:
+            return f"任务 `{task_id}` 取消失败，请稍后重试。"
+        return f"🛑 任务 `{task_id}` 已取消。"
+
+    async def _handle_task_retry_command(self, event: MessageEvent) -> str:
+        """Handle /task retry <id> - retry a failed/cancelled task."""
+        from gateway.tasks.types import TaskStatus
+        task_id = event.get_command_args().strip()
+        if not task_id:
+            return "用法: `/retry <task_id>`"
+
+        try:
+            from gateway.admission.audit import AuditEvent, log_audit
+            log_audit(AuditEvent(
+                user_id=event.source.user_id or "unknown",
+                action="retry_task",
+                resource=task_id,
+                result="attempt",
+                metadata={"platform": event.source.platform.value if event.source.platform else ""},
+            ))
+        except Exception:
+            pass
+
+        from gateway.tasks.store import TaskStore
+        store = TaskStore(db_path=_hermes_home / "analytics" / "tasks.db")
+        task = store.get(task_id)
+        if not task:
+            return f"任务 `{task_id}` 未找到。"
+
+        if task.user_id and event.source.user_id and task.user_id != event.source.user_id:
+            return f"任务 `{task_id}` 不属于当前用户，不能重试。"
+
+        if task.status not in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+            return f"任务 `{task_id}` 当前状态为 `{task.status.value}`，只有失败或已取消的任务可以重试。"
+
+        updated = store.retry_task(task_id)
+        if not updated:
+            return f"任务 `{task_id}` 重试失败，请稍后重试。"
+        return f"🔄 任务 `{task_id}` 已重置为 `pending`，可重新执行。"
 
     def _diagnose_task_failure(self, receipt) -> str:
         """Generate a brief human-readable diagnosis for failed tasks."""

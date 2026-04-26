@@ -187,6 +187,50 @@ class TaskStore:
             result = conn.execute(query, params).fetchone()
             return result[0] if result else 0
 
+    def cancel_task(self, task_id: str) -> bool:
+        """Cancel a running or pending task.
+
+        Returns True if the task was cancelled, False if not found or
+        already in a terminal state (completed/failed/cancelled).
+        """
+        import time as _time
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                """UPDATE tasks SET status = ?, completed_at = ?
+                   WHERE task_id = ? AND status IN (?, ?)""",
+                (
+                    TaskStatus.CANCELLED.value,
+                    _time.time(),
+                    task_id,
+                    TaskStatus.PENDING.value,
+                    TaskStatus.RUNNING.value,
+                ),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+    def retry_task(self, task_id: str) -> Optional[Task]:
+        """Reset a failed or cancelled task back to pending.
+
+        Returns the updated Task if successful, None if not found or
+        the task is not in a retryable state.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                """UPDATE tasks SET status = ?, completed_at = NULL
+                   WHERE task_id = ? AND status IN (?, ?)""",
+                (
+                    TaskStatus.PENDING.value,
+                    task_id,
+                    TaskStatus.FAILED.value,
+                    TaskStatus.CANCELLED.value,
+                ),
+            )
+            conn.commit()
+            if cur.rowcount == 0:
+                return None
+            return self.get(task_id)
+
     def cleanup_old_tasks(self, retention_days: int = 90) -> int:
         """Delete tasks older than retention_days.
         
