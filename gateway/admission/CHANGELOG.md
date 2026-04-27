@@ -13,6 +13,54 @@ MAJOR.MINOR.PATCH
 
 ---
 
+## [1.8.0] — 2026-04-27 — VM 仓库多用户并发隔离
+
+### Added
+- **worktree_audit.py**：worktree 操作审计模块
+  - `log_worktree_event(user, repo, action, ...)` — 记录 user → worktree → branch → git 操作
+  - `query_user_activity(user, days, repo)` — 查询用户近 N 天的 worktree 操作记录
+  - 审计日志写入 `~/.hermes/audit/worktree/YYYY-MM-DD.jsonl`
+  - 覆盖主仓库和嵌套仓库（msg/data_proto, tools/*）的 git 操作
+
+- **worktree_manager.py**：worktree 生命周期管理 CLI
+  - `ensure <user> <repo> [--branch]` — 自动创建 worktree（不存在时）
+  - `list [--user]` — 列出所有 worktree 及分支状态
+  - `gc [--older-than N]` — 列出 N 天未访问的 stale worktree
+  - `status <user> <repo>` — 查询 worktree 状态（分支、dirty、未提交文件数）
+  - 读取 `user-roles.json` 的 `repo_config` 段获取仓库配置
+
+- **VM 侧运维脚本**（部署到 `/home/mini/worktrees/`）
+  - `audit-logger.sh` — 轻量审计日志记录（shell 层）
+  - `safe-push.sh` — 并发 push 安全包装器（文件锁 + fetch + rebase）
+  - `gc-worktrees.sh` — worktree GC（30 天未访问自动清理）
+  - `check-disk-quota.sh` — 磁盘配额检查（10GB/用户/仓库）
+  - `rotate-audit-log.sh` — 审计日志轮转（10MB 轮转，保留 90 天）
+
+### Changed
+- **user-roles.json**：新增 `repo_config` 段（仓库源路径、默认分支、worktree_base）
+- **user-roles.json**：补全王中坤角色映射
+- **config.yaml system_prompt**：注入完整的 worktree 路由、审计、合并、push 安全、嵌套仓库规则
+- **AGENTS.md**：同步 VM 仓库访问规则和合并流程
+
+### VM 侧部署
+- 4 仓库 × 4 用户 = 16 个 worktree 已创建
+- 5 个嵌套仓库通过 symlink 链接到所有 worktree
+  - `msg/data_proto`、`tools/mcap_data_translate`、`tools/data_preprocess`
+  - `tools/quality-gate-keeper`、`tools/simulator_with_dnp`
+
+### Verified
+- VM 端到端测试 10/10 通过
+- 真实场景验证 4/4 通过（新用户 worktree 自动创建、嵌套仓库审计、配额检查、GC dry-run）
+- gstack Boil the Lake + QCon Beijing 2026-04 交叉审视完成
+- 生产就绪度：8.5/10
+
+### Documentation
+- 设计文档：`knowledge/wiki/designs/vm-repo-isolation.md`（v1.0.0 最终版）
+- gstack 审视报告：`knowledge/wiki/reviews/vm-repo-isolation-gstack-review.md`
+- 快速参考卡片：`knowledge/wiki/quick-refs/vm-repo-access.md`
+
+---
+
 ## [1.7.0] — 2026-04-26 — Gateway 启动防护：杜绝进程堆积
 
 ### Added

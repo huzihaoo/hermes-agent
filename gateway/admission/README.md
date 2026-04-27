@@ -1,6 +1,6 @@
 # Admission Control — 多车道准入队列
 
-> **当前版本: v1.5.0** | [CHANGELOG](CHANGELOG.md) | [版本管理](VERSION_MANAGEMENT.md)
+> **当前版本: v1.8.0** | [CHANGELOG](CHANGELOG.md) | [版本管理](VERSION_MANAGEMENT.md)
 
 ## 概述
 
