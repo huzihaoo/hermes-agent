@@ -2397,8 +2397,9 @@ class FeishuAdapter(BasePlatformAdapter):
         if session_key:
             self._approval_callbacks.pop(session_key, None)
 
+        approval_kind = str(state.get("approval_kind") or "exec").strip().lower()
         if choice == "deny":
-            if str(state.get("approval_kind") or "").strip().lower() == "permission_grant":
+            if approval_kind == "permission_grant":
                 applicant_notify_success = await self._notify_permission_request_result(state, approved=False)
                 group_broadcast_success = await self._broadcast_permission_request_result(state, approved=False)
                 self._emit_permission_audit_event(
@@ -2410,9 +2411,18 @@ class FeishuAdapter(BasePlatformAdapter):
                     reuse_hit=bool(state.get("reuse_hit")),
                     dedup_hit=bool(state.get("dedup_hit")),
                 )
+                return
+            try:
+                from tools.approval import resolve_gateway_approval
+                count = resolve_gateway_approval(state["session_key"], choice)
+                logger.info(
+                    "Feishu button denied %d approval(s) for session %s (user=%s)",
+                    count, state["session_key"], user_name,
+                )
+            except Exception as exc:
+                logger.error("Failed to deny gateway approval from Feishu button: %s", exc)
             return
 
-        approval_kind = str(state.get("approval_kind") or "exec").strip().lower()
         if choice in {"grant_senior", "grant_permission"} and approval_kind == "permission_grant":
             try:
                 from gateway.pairing import PairingStore

@@ -12,13 +12,28 @@ Designed to be called via ssh-mini-agent from the gateway host.
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 CONFIG_PATH = Path.home() / ".hermes" / "config" / "user-roles.json"
+AUDIT_LOG_PATH = Path("/home/mini/worktrees/.audit.log")
+
+
+def log_audit(user: str, repo: str, action: str) -> None:
+    """Log worktree operation to audit log."""
+    try:
+        AUDIT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as f:
+            timestamp = datetime.datetime.now().isoformat()
+            f.write(f"{timestamp}|{user}|{repo}|{action}\n")
+    except Exception as e:
+        # Don't fail the operation if audit logging fails
+        print(f"Warning: audit log failed: {e}", file=sys.stderr)
 
 
 def load_config() -> dict:
@@ -37,13 +52,34 @@ def get_user_role(config: dict, user_name: str) -> str:
     return config.get("users", {}).get(user_name, config.get("users", {}).get("default", "member"))
 
 
+def _safe_component(value: str, label: str) -> str:
+    value = str(value or "").strip()
+    if not value:
+        raise ValueError(f"{label} is required")
+    if "/" in value or "\\" in value or value in {".", ".."} or "\x00" in value:
+        raise ValueError(f"invalid {label}: {value!r}")
+    return value
+
+
+def _safe_branch(value: str) -> str:
+    value = str(value or "").strip()
+    if not value:
+        raise ValueError("branch is required")
+    if value.startswith("-") or "\x00" in value or re.search(r"[\s~^:?*\[\\]", value) or ".." in value or "@{" in value:
+        raise ValueError(f"invalid branch: {value!r}")
+    return value
+
+
 def worktree_path(rc: dict, repo: str, user: str) -> str:
-    base = rc.get("worktree_base", "/home/mini/worktrees")
-    return f"{base}/{repo}/{user}"
+    base = Path(rc.get("worktree_base", "/home/mini/worktrees"))
+    return str(base / _safe_component(repo, "repo") / _safe_component(user, "user"))
 
 
 def ensure_worktree(user: str, repo: str, branch: str | None = None) -> dict:
     """Ensure a worktree exists for user+repo. Create if missing.
+    
+    Owner users get the source repo directly.
+    Non-owner users get isolated worktrees.
     
     Returns: {"path": str, "branch": str, "created": bool}
     """
@@ -51,13 +87,30 @@ def ensure_worktree(user: str, repo: str, branch: str | None = None) -> dict:
     rc = get_repo_config(config)
     repos = rc.get("repos", {})
 
+    try:
+        repo = _safe_component(repo, "repo")
+        user = _safe_component(user, "user")
+    except ValueError as exc:
+        return {"error": str(exc)}
+
     if repo not in repos:
         return {"error": f"Unknown repo: {repo}. Known: {list(repos.keys())}"}
 
     repo_info = repos[repo]
     source = repo_info["source"]
     default_branch = repo_info.get("default_branch", "main")
-    target_branch = branch or default_branch
+    try:
+        target_branch = _safe_branch(branch or default_branch)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    
+    # Check if user is owner
+    user_role = get_user_role(config, user)
+    if user_role == "owner":
+        # Owner uses source repo directly
+        return {"path": source, "branch": _get_current_branch(source), "created": False}
+    
+    # Non-owner: use worktree
     wt_path = worktree_path(rc, repo, user)
 
     # Check if worktree already exists
@@ -88,6 +141,10 @@ def ensure_worktree(user: str, repo: str, branch: str | None = None) -> dict:
         )
 
     actual_branch = _get_current_branch(wt_path)
+    
+    # Log audit
+    log_audit(user, repo, f"auto-create worktree: {wt_path} @ {actual_branch}")
+    
     return {"path": wt_path, "branch": actual_branch, "created": True}
 
 

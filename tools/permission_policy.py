@@ -9,7 +9,7 @@ from typing import Literal, Optional
 
 Decision = Literal["ALLOW", "CONFIRM", "APPROVE", "DENY"]
 Role = Literal["owner", "admin", "senior", "member"]
-OpType = Literal["read", "write", "delete_small", "dangerous"]
+OpType = Literal["read", "write", "delete_small", "dangerous", "vm_direct_exec"]
 
 _CONFIG_PATH = Path.home() / ".hermes" / "config" / "user-roles.json"
 _config: dict | None = None
@@ -90,6 +90,16 @@ def classify_command(command: str) -> OpType:
     cfg = _load_config()
     cmd = command.strip()
 
+    # VM direct execution: this is distinct from ordinary writes.  In shared
+    # Feishu usage it bypasses the shared-state v2 -> VM worker execution plane,
+    # so non-owner users should not be able to normalize it as a routine write.
+    if re.search(r"\bssh-mini-agent\s+(run_bash_json|run_py_json|edit_file)\b", cmd):
+        return "vm_direct_exec"
+    if re.search(r"\bssh-mini-run\b", cmd):
+        return "vm_direct_exec"
+    if re.search(r"\bssh\b[^\n;]*\bmini@", cmd):
+        return "vm_direct_exec"
+
     # Check critical paths first — always dangerous
     for pattern in cfg.get("critical_paths", []):
         expanded = str(Path(pattern.replace("~", str(Path.home()))).parent)
@@ -97,7 +107,7 @@ def classify_command(command: str) -> OpType:
             return "dangerous"
 
     # Match against pattern lists
-    for op_type in ("dangerous", "delete_small", "write", "read"):
+    for op_type in ("dangerous", "vm_direct_exec", "delete_small", "write", "read"):
         for pattern in cfg["command_patterns"].get(op_type, []):
             if pattern in cmd:
                 return op_type  # type: ignore[return-value]
@@ -111,11 +121,29 @@ def classify_command(command: str) -> OpType:
     return "write"  # default unknown to write (safer than read)
 
 
+def _decision_for(role: str, op_type: str, cfg: dict) -> Decision:
+    role_matrix = cfg.get("permission_matrix", {}).get(role) or cfg.get("permission_matrix", {}).get("member", {})
+    decision = role_matrix.get(op_type)
+    if decision:
+        return decision  # type: ignore[return-value]
+    if op_type == "vm_direct_exec":
+        # Backward-compatible fail-closed default for older configs that lack
+        # the new op_type. Owner/admin can proceed, senior requires approval,
+        # members are denied.
+        return {
+            "owner": "ALLOW",
+            "admin": "CONFIRM",
+            "senior": "APPROVE",
+            "member": "DENY",
+        }.get(role, "DENY")  # type: ignore[return-value]
+    return "DENY"
+
+
 def get_decision(display_name: str, command: str) -> Decision:
     role = get_user_role(display_name)
     op_type = classify_command(command)
     cfg = _load_config()
-    return cfg["permission_matrix"][role][op_type]  # type: ignore[return-value]
+    return _decision_for(role, op_type, cfg)
 
 
 def get_decision_by_id(user_id: str, command: str) -> Decision:
@@ -123,9 +151,9 @@ def get_decision_by_id(user_id: str, command: str) -> Decision:
     role = get_user_role_by_id(user_id)
     op_type = classify_command(command)
     cfg = _load_config()
-    decision = cfg["permission_matrix"][role][op_type]
+    decision = _decision_for(role, op_type, cfg)
     _log_decision(user_id, role, command, op_type, decision)
-    return decision  # type: ignore[return-value]
+    return decision
 
 
 def _log_decision(user_id: str, role: str, command: str, op_type: str, decision: str) -> None:

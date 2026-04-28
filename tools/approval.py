@@ -124,6 +124,14 @@ DANGEROUS_PATTERNS = [
     # Script execution via heredoc — bypasses the -e/-c flag patterns above.
     # `python3 << 'EOF'` feeds arbitrary code via stdin without -c/-e flags.
     (r'\b(python[23]?|perl|ruby|node)\s+<<', "script execution via heredoc"),
+    # VM shared-agent guardrail: write/exec style ssh-mini access should not
+    # silently become the default Feishu execution plane.  Read-only
+    # ssh-mini-agent helpers remain allowed; mutating or raw remote shell
+    # commands must go through approval / explicit immediate-tool semantics,
+    # while long-running business tasks should use shared-state v2 -> VM worker.
+    (r'\bssh-mini-agent\s+(run_bash_json|run_py_json|edit_file)\b', "VM direct execution via ssh-mini-agent write helper (prefer shared-state v2 -> VM worker for long-running business tasks)"),
+    (r'\bssh-mini-run\b', "VM direct execution via ssh-mini-run (prefer shared-state v2 -> VM worker for long-running business tasks)"),
+    (r'\bssh\b[^\n;]*\bmini@', "VM direct execution via raw ssh to mini (prefer shared-state v2 -> VM worker for long-running business tasks)"),
     # Git destructive operations that can lose uncommitted work or rewrite
     # shared history. Not captured by rm/chmod/etc patterns.
     (r'\bgit\s+reset\s+--hard\b', "git reset --hard (destroys uncommitted changes)"),
@@ -768,6 +776,40 @@ def check_all_command_guards(command: str, env_type: str,
 
     # Dangerous command check (detection only, no approval)
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
+
+    # Permission policy: check user role before approval.  This must happen
+    # after findings are gathered but before generic approval handling so
+    # non-owner Feishu users cannot self-normalize direct VM execution.
+    try:
+        from tools.permission_policy import get_decision_by_id
+        from gateway.session_context import get_session_env
+
+        user_id = get_session_env("HERMES_SESSION_USER_ID")
+        if user_id and is_dangerous:
+            decision = get_decision_by_id(user_id, command)
+            if decision == "ALLOW":
+                logger.debug("Permission policy: ALLOW for user %s, command %s", user_id, command[:60])
+                if not tirith_result["action"] in ("block", "warn"):
+                    return {"approved": True, "message": None}
+            elif decision == "DENY":
+                logger.warning("Permission policy: DENY for user %s, command %s", user_id, command[:60])
+                return {
+                    "approved": False,
+                    "message": "❌ 权限不足，无法执行此操作。",
+                    "pattern_key": pattern_key,
+                    "description": description,
+                }
+            else:
+                logger.debug("Permission policy: %s for user %s, command %s", decision, user_id, command[:60])
+    except Exception as e:
+        logger.warning("Permission policy check failed for dangerous command; denying by default: %s", e)
+        if is_gateway and is_dangerous:
+            return {
+                "approved": False,
+                "message": "❌ 权限策略不可用，已拒绝执行高风险命令。",
+                "pattern_key": pattern_key,
+                "description": description,
+            }
 
     # --- Phase 2: Decide ---
 

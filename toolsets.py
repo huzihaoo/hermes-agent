@@ -60,6 +60,10 @@ _HERMES_CORE_TOOLS = [
     "send_message",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+    # PNC/MCU domain agents on the mini VM
+    "generate_dbc", "parse_bus_data",
+    # Shared-state v2 VM worker submission
+    "vm_task_submit",
 ]
 
 
@@ -94,6 +98,12 @@ TOOLSETS = {
     "terminal": {
         "description": "Terminal/command execution and process management tools",
         "tools": ["terminal", "process"],
+        "includes": []
+    },
+    
+    "vm_tasks": {
+        "description": "Submit long-running VM/business tasks to shared-state v2 for VM worker execution",
+        "tools": ["vm_task_submit"],
         "includes": []
     },
     
@@ -201,6 +211,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "pnc_agents": {
+        "description": "PNC/MCU domain agents on the mini VM: generate DBC outputs and parse bus data",
+        "tools": ["generate_dbc", "parse_bus_data"],
+        "includes": []
+    },
+
 
     # Scenario-specific toolsets
     
@@ -270,6 +286,8 @@ TOOLSETS = {
             "cronjob",
             # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
             "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+            # PNC/MCU domain agents on the mini VM
+            "generate_dbc", "parse_bus_data",
 
         ],
         "includes": []

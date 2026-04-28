@@ -75,6 +75,28 @@ class TestHandleFunctionCall:
         ]
 
 
+    def test_user_id_is_forwarded_to_registry_dispatch(self, monkeypatch):
+        captured = {}
+
+        def fake_dispatch(name, args, **kwargs):
+            captured.update(name=name, args=args, kwargs=kwargs)
+            return json.dumps({"ok": True})
+
+        monkeypatch.setattr("model_tools.registry.dispatch", fake_dispatch)
+
+        result = json.loads(
+            handle_function_call(
+                "web_search",
+                {"q": "test"},
+                task_id="task-1",
+                user_id="ou_guo",
+            )
+        )
+
+        assert result == {"ok": True}
+        assert captured["kwargs"]["user_id"] == "ou_guo"
+
+
 # =========================================================================
 # Agent loop tools
 # =========================================================================
