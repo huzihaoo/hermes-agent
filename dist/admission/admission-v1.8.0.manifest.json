@@ -1,0 +1,32 @@
+{
+  "name": "gateway-admission",
+  "version": "1.8.0",
+  "artifact": "/Users/songying/.hermes/hermes-agent/dist/admission/admission-v1.8.0.tar.gz",
+  "sha256": "adec0bcf43137f58404cfbf39c5a180e60e654ad22fc3fdba4c1770302da6727",
+  "files": [
+    "gateway/admission/__init__.py",
+    "gateway/admission/alerts.py",
+    "gateway/admission/audit.py",
+    "gateway/admission/cli.py",
+    "gateway/admission/controller.py",
+    "gateway/admission/feishu_integration.py",
+    "gateway/admission/metrics_export.py",
+    "gateway/admission/metrics_server.py",
+    "gateway/admission/persistence.py",
+    "gateway/admission/queue.py",
+    "gateway/admission/templates.py",
+    "gateway/admission/types.py",
+    "gateway/admission/version_check.py",
+    "gateway/admission/worker.py",
+    "gateway/admission/worktree_audit.py",
+    "gateway/admission/worktree_manager.py",
+    "gateway/admission/VERSION",
+    "gateway/admission/CHANGELOG.md",
+    "gateway/admission/README.md",
+    "gateway/admission/VERSION_MANAGEMENT.md",
+    "gateway/admission/IMPLEMENTATION_SUMMARY_v1.8.0.md",
+    "gateway/admission/ROLLBACK.md",
+    "gateway/admission/RUNBOOK_GATEWAY_PROCESS_PILEUP.md",
+    "gateway/admission/DESIGN_GATEWAY_STARTUP_GUARD.md"
+  ]
+}

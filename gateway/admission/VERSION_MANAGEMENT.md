@@ -4,7 +4,7 @@
 
 ```python
 from gateway.admission import __version__
-print(__version__)  # "1.5.0"
+print(__version__)  # "1.8.0"
 ```
 
 ## 查看版本历史
@@ -46,8 +46,8 @@ Changed in: v1.0.1 — _gc_empty_domain_id race fix
 cd /Users/songying/.hermes/hermes-agent
 source venv/bin/activate
 
-# 跑完整测试套件
-pytest tests/gateway/test_admission_*.py -q
+# 跑完整 admission 测试套件
+python -m pytest tests/gateway/test_admission*.py tests/gateway/test_feishu_admission_autostart.py -q -o 'addopts='
 
 # 确认通过
 # Expected: XX passed, 0 failed
@@ -103,7 +103,7 @@ python3 -c "from gateway.admission import __version__; print(__version__)"
 git log --oneline -5 -- gateway/admission/
 
 # 测试覆盖率
-pytest tests/gateway/test_admission_*.py --cov=gateway.admission --cov-report=term-missing
+python -m pytest tests/gateway/test_admission*.py tests/gateway/test_feishu_admission_autostart.py --cov=gateway.admission --cov-report=term-missing -o 'addopts='
 ```
 
 ## 回滚到旧版本
@@ -116,7 +116,7 @@ git log --oneline -- gateway/admission/__init__.py
 git checkout <commit-hash> -- gateway/admission/
 
 # 验证
-pytest tests/gateway/test_admission_*.py -q
+python -m pytest tests/gateway/test_admission*.py tests/gateway/test_feishu_admission_autostart.py -q -o 'addopts='
 ```
 
 ## 版本兼容性矩阵
@@ -129,6 +129,9 @@ pytest tests/gateway/test_admission_*.py -q
 | 1.3.0 | 0.9.0+ | 3.11+ | 3.35+ | 边界测试 + ConnectionPool |
 | 1.4.0 | 0.9.0+ | 3.11+ | 3.35+ | Prometheus exporter |
 | 1.5.0 | 0.9.0+ | 3.11+ | 3.35+ | MetricsServer + CLI alerts/apply |
+| 1.6.0 | 0.9.0+ | 3.11+ | 3.35+ | FeishuAdapter 自动集成 MetricsServer/template |
+| 1.7.0 | 0.9.0+ | 3.11+ | 3.35+ | Gateway 启动防护，杜绝进程堆积 |
+| 1.8.0 | 0.10.0+ | 3.11+ | 3.35+ | VM 仓库多用户 worktree 隔离 + 审计 |
 
 ## 下一版本规划
 
