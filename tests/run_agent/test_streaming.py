@@ -12,6 +12,12 @@ from unittest.mock import MagicMock, patch, PropertyMock
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _streaming_tests_have_provider(monkeypatch):
+    """Keep streaming unit tests independent of the developer's real config."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────
 
 
@@ -95,6 +101,44 @@ class TestStreamingAccumulator:
         assert response.choices[0].finish_reason == "stop"
         assert response.usage is not None
         assert response.usage.completion_tokens == 3
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_large_context_default_read_timeout_scales_above_stale_timeout(
+        self, mock_close, mock_create, monkeypatch
+    ):
+        """Default stream read timeout should not preempt stale-stream recovery."""
+        from run_agent import AIAgent
+        import httpx
+
+        monkeypatch.delenv("HERMES_STREAM_READ_TIMEOUT", raising=False)
+        monkeypatch.delenv("HERMES_STREAM_STALE_TIMEOUT", raising=False)
+
+        chunks = [_make_stream_chunk(content="ok", finish_reason="stop")]
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = iter(chunks)
+        mock_create.return_value = mock_client
+
+        agent = AIAgent(
+            model="test/model",
+            api_key="sk-test",
+            base_url="https://sub2api.minieye.tech/v1",
+            provider="custom",
+            api_mode="chat_completions",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent._interrupt_requested = False
+
+        large_message = {"role": "user", "content": "x" * 240_004}
+        response = agent._interruptible_streaming_api_call({"messages": [large_message]})
+
+        assert response.choices[0].message.content == "ok"
+        timeout = mock_client.chat.completions.create.call_args.kwargs["timeout"]
+        assert isinstance(timeout, httpx.Timeout)
+        # ~60k tokens => stale timeout scales to 240s, read timeout to 270s.
+        assert timeout.read == 270.0
 
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")

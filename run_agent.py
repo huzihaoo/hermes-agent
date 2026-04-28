@@ -39,7 +39,6 @@ from types import SimpleNamespace
 import uuid
 from typing import List, Dict, Any, Optional
 from openai import OpenAI
-import fire
 from datetime import datetime
 from pathlib import Path
 
@@ -2628,10 +2627,14 @@ class AIAgent:
                      contextlib.redirect_stderr(_devnull):
                     review_agent = AIAgent(
                         model=self.model,
+                        api_key=self.api_key,
+                        base_url=self.base_url,
+                        provider=self.provider,
+                        api_mode=self.api_mode,
+                        credential_pool=getattr(self, "_credential_pool", None),
                         max_iterations=8,
                         quiet_mode=True,
                         platform=self.platform,
-                        provider=self.provider,
                     )
                     review_agent._memory_store = self._memory_store
                     review_agent._memory_enabled = self._memory_enabled
@@ -3886,6 +3889,27 @@ class AIAgent:
                 "Pre-call sanitizer: added %d stub tool result(s)",
                 len(missing_results),
             )
+
+        # 3. Some OpenAI-compatible gateways reject historical messages whose
+        # ``content`` is the empty string, even though OpenAI accepts common
+        # cases such as tool-call-only assistant turns.  Keep this API-copy-only
+        # so persisted session history stays faithful, but make the outbound
+        # payload portable for strict fallback providers (notably vtok.ai
+        # returning "消息内容不能为空").
+        for msg in messages:
+            content = msg.get("content")
+            if not isinstance(content, str) or content.strip():
+                continue
+            role = msg.get("role")
+            if role == "assistant" and msg.get("tool_calls"):
+                msg["content"] = "[tool call]"
+            elif role == "assistant":
+                msg["content"] = "[empty assistant message]"
+            elif role == "tool":
+                msg["content"] = "[empty tool result]"
+            else:
+                msg["content"] = "[empty message]"
+
         return messages
 
     @staticmethod
@@ -5653,6 +5677,22 @@ class AIAgent:
         # SSE keep-alive pings but no actual data.
         last_chunk_time = {"t": time.time()}
 
+        def _estimated_request_tokens() -> int:
+            return sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
+
+        def _scaled_remote_stream_stale_timeout(base_timeout: float) -> float:
+            # Slow remote reasoning/tool-call models can legitimately spend
+            # minutes before the first SSE data chunk when context is large.
+            # Keep read-timeout and stale-timeout scaling in one place so the
+            # lower-level httpx ReadTimeout does not fire before our richer
+            # stale-stream detector/status path.
+            _est_tokens = _estimated_request_tokens()
+            if _est_tokens > 100_000:
+                return max(base_timeout, 300.0)
+            if _est_tokens > 50_000:
+                return max(base_timeout, 240.0)
+            return base_timeout
+
         def _fire_first_delta():
             if not first_delta_fired["done"] and on_first_delta:
                 first_delta_fired["done"] = True
@@ -5665,16 +5705,22 @@ class AIAgent:
             """Stream a chat completions response."""
             import httpx as _httpx
             _base_timeout = float(os.getenv("HERMES_API_TIMEOUT", 1800.0))
-            _stream_read_timeout = float(os.getenv("HERMES_STREAM_READ_TIMEOUT", 120.0))
+            _stream_read_timeout_raw = os.getenv("HERMES_STREAM_READ_TIMEOUT")
+            _stream_read_timeout = float(_stream_read_timeout_raw or 120.0)
             # Local providers (Ollama, llama.cpp, vLLM) can take minutes for
             # prefill on large contexts before producing the first token.
             # Auto-increase the httpx read timeout unless the user explicitly
             # overrode HERMES_STREAM_READ_TIMEOUT.
-            if _stream_read_timeout == 120.0 and self.base_url and is_local_endpoint(self.base_url):
+            if _stream_read_timeout_raw is None and self.base_url and is_local_endpoint(self.base_url):
                 _stream_read_timeout = _base_timeout
                 logger.debug(
                     "Local provider detected (%s) — stream read timeout raised to %.0fs",
                     self.base_url, _stream_read_timeout,
+                )
+            elif _stream_read_timeout_raw is None:
+                _stream_read_timeout = max(
+                    _stream_read_timeout,
+                    _scaled_remote_stream_stale_timeout(180.0) + 30.0,
                 )
             stream_kwargs = {
                 **api_kwargs,
@@ -6069,11 +6115,12 @@ class AIAgent:
                 if request_client is not None:
                     self._close_request_openai_client(request_client, reason="stream_request_complete")
 
-        _stream_stale_timeout_base = float(os.getenv("HERMES_STREAM_STALE_TIMEOUT", 180.0))
+        _stream_stale_timeout_raw = os.getenv("HERMES_STREAM_STALE_TIMEOUT")
+        _stream_stale_timeout_base = float(_stream_stale_timeout_raw or 180.0)
         # Local providers (Ollama, oMLX, llama-cpp) can take 300+ seconds
         # for prefill on large contexts.  Disable the stale detector unless
         # the user explicitly set HERMES_STREAM_STALE_TIMEOUT.
-        if _stream_stale_timeout_base == 180.0 and self.base_url and is_local_endpoint(self.base_url):
+        if _stream_stale_timeout_raw is None and self.base_url and is_local_endpoint(self.base_url):
             _stream_stale_timeout = float("inf")
             logger.debug("Local provider detected (%s) — stale stream timeout disabled", self.base_url)
         else:
@@ -6082,13 +6129,7 @@ class AIAgent:
             # when the context is large.  Without this, the stale detector kills
             # healthy connections during the model's thinking phase, producing
             # spurious RemoteProtocolError ("peer closed connection").
-            _est_tokens = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
-            if _est_tokens > 100_000:
-                _stream_stale_timeout = max(_stream_stale_timeout_base, 300.0)
-            elif _est_tokens > 50_000:
-                _stream_stale_timeout = max(_stream_stale_timeout_base, 240.0)
-            else:
-                _stream_stale_timeout = _stream_stale_timeout_base
+            _stream_stale_timeout = _scaled_remote_stream_stale_timeout(_stream_stale_timeout_base)
 
         t = threading.Thread(target=_call, daemon=True)
         t.start()
@@ -12277,4 +12318,6 @@ def main(
 
 
 if __name__ == "__main__":
+    import fire
+
     fire.Fire(main)

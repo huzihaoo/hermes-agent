@@ -73,7 +73,9 @@ def init_db(db_path: Path) -> None:
             completed_at TEXT,
             result TEXT,
             chat_id TEXT,
+            chat_type TEXT,
             thread_id TEXT,
+            request_message_id TEXT,
             platform TEXT,
             domain TEXT NOT NULL DEFAULT 'user',
             domain_id TEXT NOT NULL DEFAULT '',
@@ -95,6 +97,8 @@ def init_db(db_path: Path) -> None:
     # Migrate old tables that lack domain columns
     _migrate_add_column(conn, "domain", "TEXT NOT NULL DEFAULT 'user'")
     _migrate_add_column(conn, "domain_id", "TEXT NOT NULL DEFAULT ''")
+    _migrate_add_column(conn, "chat_type", "TEXT")
+    _migrate_add_column(conn, "request_message_id", "TEXT")
     # Migrate retry fields
     _migrate_add_column(conn, "retry_count", "INTEGER NOT NULL DEFAULT 0")
     _migrate_add_column(conn, "max_retries", "INTEGER NOT NULL DEFAULT 3")
@@ -127,10 +131,10 @@ def save_items(db_path: Path, items: List[QueueItem]) -> None:
             INSERT OR REPLACE INTO queue_items (
                 id, user_id, user_role, message, lane, priority, status,
                 created_at, started_at, completed_at, result,
-                chat_id, thread_id, platform,
+                chat_id, chat_type, thread_id, request_message_id, platform,
                 domain, domain_id,
                 retry_count, max_retries, last_error, next_retry_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 item.id,
@@ -145,7 +149,9 @@ def save_items(db_path: Path, items: List[QueueItem]) -> None:
                 item.completed_at.isoformat() if item.completed_at else None,
                 json.dumps(item.result) if item.result else None,
                 item.chat_id,
+                item.chat_type,
                 item.thread_id,
+                item.request_message_id,
                 item.platform,
                 item.domain,
                 item.domain_id,
@@ -174,7 +180,7 @@ def load_items(db_path: Path) -> List[QueueItem]:
     cursor = conn.execute(
         """SELECT id, user_id, user_role, message, lane, priority, status,
                   created_at, started_at, completed_at, result,
-                  chat_id, thread_id, platform,
+                  chat_id, chat_type, thread_id, request_message_id, platform,
                   domain, domain_id,
                   retry_count, max_retries, last_error, next_retry_at
            FROM queue_items"""
@@ -182,8 +188,8 @@ def load_items(db_path: Path) -> List[QueueItem]:
 
     items: list[QueueItem] = []
     for row in cursor.fetchall():
-        domain = row[14] if row[14] else "user"
-        domain_id = row[15] if row[15] else row[1]  # fallback to user_id
+        domain = row[16] if row[16] else "user"
+        domain_id = row[17] if row[17] else row[1]  # fallback to user_id
         items.append(
             QueueItem(
                 id=row[0],
@@ -198,14 +204,16 @@ def load_items(db_path: Path) -> List[QueueItem]:
                 completed_at=datetime.fromisoformat(row[9]) if row[9] else None,
                 result=json.loads(row[10]) if row[10] else None,
                 chat_id=row[11],
-                thread_id=row[12],
-                platform=row[13],
+                chat_type=row[12],
+                thread_id=row[13],
+                request_message_id=row[14],
+                platform=row[15],
                 domain=domain,
                 domain_id=domain_id,
-                retry_count=row[16] if row[16] is not None else 0,
-                max_retries=row[17] if row[17] is not None else 3,
-                last_error=row[18],
-                next_retry_at=datetime.fromisoformat(row[19]) if row[19] else None,
+                retry_count=row[18] if row[18] is not None else 0,
+                max_retries=row[19] if row[19] is not None else 3,
+                last_error=row[20],
+                next_retry_at=datetime.fromisoformat(row[21]) if row[21] else None,
             )
         )
 

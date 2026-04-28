@@ -47,6 +47,19 @@ class TestResolveToolset:
         assert "web_search" in tools
         assert "web_extract" in tools
 
+    def test_vm_tasks_exposes_submit_and_status(self):
+        tools = resolve_toolset("vm_tasks")
+        assert "vm_task_submit" in tools
+        assert "vm_task_status" in tools
+
+    def test_feishu_toolset_exposes_pnc_and_vm_status_tools(self):
+        tools = resolve_toolset("hermes-feishu")
+        assert "pnc_agents_smoke" in tools
+        assert "generate_dbc" in tools
+        assert "parse_bus_data" in tools
+        assert "vm_task_submit" in tools
+        assert "vm_task_status" in tools
+
     def test_cycle_detection(self):
         # Create a cycle: A includes B, B includes A
         TOOLSETS["_cycle_a"] = {"description": "test", "tools": ["t1"], "includes": ["_cycle_b"]}

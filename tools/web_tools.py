@@ -47,7 +47,10 @@ import re
 import asyncio
 from typing import List, Dict, Any, Optional
 import httpx
-from firecrawl import Firecrawl
+try:
+    from firecrawl import Firecrawl
+except ModuleNotFoundError:  # optional dependency; registry must still expose web tools
+    Firecrawl = None
 from agent.auxiliary_client import (
     async_call_llm,
     extract_content_or_reasoning,
@@ -235,6 +238,8 @@ def _get_firecrawl_client():
     if _firecrawl_client is not None and _firecrawl_client_config == client_config:
         return _firecrawl_client
 
+    if Firecrawl is None:
+        raise ImportError("firecrawl package is not installed")
     _firecrawl_client = Firecrawl(**kwargs)
     _firecrawl_client_config = client_config
     return _firecrawl_client

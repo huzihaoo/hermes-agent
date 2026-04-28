@@ -14,6 +14,7 @@ import subprocess
 from pathlib import PurePosixPath
 from typing import Any
 
+from tools import vm_task_tool
 from tools.registry import registry, tool_error, tool_result
 
 
@@ -34,6 +35,9 @@ USER_ROLES_CONFIG = os.getenv(
     "~/.hermes/config/user-roles.json",
 )
 DEFAULT_REPO = "pnc_specs"
+DEFAULT_PNC_PROJECT = "D2L3"
+DEFAULT_PNC_PLATFORM = "mcu"
+DEFAULT_PNC_PROFILE = "default"
 LOCAL_WRAPPER = os.getenv("SSH_MINI_AGENT_BIN", "ssh-mini-agent")
 DEFAULT_TIMEOUT_SECONDS = 300
 MAX_TIMEOUT_SECONDS = 1800
@@ -296,6 +300,134 @@ def _run_remote_agent(agent_name: str, args: dict[str, Any], user_id: str = "") 
     return tool_result({"ok": True, "agent": agent_name, **payload})
 
 
+def _pnc_command_args(agent_name: str, args: dict[str, Any]) -> list[str]:
+    effective_args = dict(args)
+    if agent_name == "generate-dbc":
+        # The VM-side generate-dbc CLI requires these even for smoke/failure-path
+        # validation. Keep caller-provided values authoritative, but default to
+        # the currently locked PNC skeleton values so generated VM goals are
+        # executable instead of failing before input validation.
+        effective_args.setdefault("project", DEFAULT_PNC_PROJECT)
+        effective_args.setdefault("platform", DEFAULT_PNC_PLATFORM)
+        effective_args.setdefault("profile", DEFAULT_PNC_PROFILE)
+    cmd: list[str] = []
+    for key in ("project", "platform", "profile", "input", "output", "regression"):
+        value = effective_args.get(key)
+        if value:
+            cmd.extend([f"--{key}", str(value)])
+    return cmd
+
+
+def _build_pnc_task_goal(agent_name: str, args: dict[str, Any], user: str, user_id: str = "") -> str:
+    repo = DEFAULT_REPO
+    branch = ""
+    if _allow_debug_user_override():
+        repo = str(args.get("repo") or DEFAULT_REPO).strip() or DEFAULT_REPO
+        branch = str(args.get("branch") or "").strip()
+
+    title_slug = agent_name.replace("_", "-")
+    work_tmp_dir = f"/home/mini/nas/miniPan/tmp/pnc-{title_slug}"
+    cli_args = " ".join([shlex.quote(f"./{agent_name}")] + [shlex.quote(part) for part in _pnc_command_args(agent_name, args)])
+    branch_suffix = f" --branch {shlex.quote(branch)}" if branch else ""
+
+    return "\n".join(
+        [
+            f"# PNC VM task: {agent_name}",
+            "",
+            "Execution contract:",
+            "- Host/main is control plane only; VM worker owns execution truth.",
+            "- executor: fixed-cli under VM worker",
+            "- Do not report completion until canonical result/log/proof is written and imported.",
+            "",
+            "Requester:",
+            f"- requester_user: {user}",
+            f"- requester_user_id: {user_id or '(unknown)'}",
+            "",
+            "Repository/worktree:",
+            f"- repo: {repo}",
+            f"- ensure_command: python3 {REMOTE_WORKTREE_MANAGER} ensure {shlex.quote(user)} {repo}{branch_suffix}",
+            f"- agent_subdir: {REMOTE_AGENT_SUBDIR}",
+            "",
+            "VM data landing rules:",
+            "- download_dir=/home/mini/nas/miniPan/tmp/pdcl_downloads",
+            f"- work_tmp_dir={work_tmp_dir}",
+            "- Use the NAS tmp task directory for intermediates/cache/extracted files.",
+            "- Do not default new task data to ~/Downloads, /tmp, repo source dirs, or ~/.cache.",
+            "",
+            "Command to run after resolving WORKTREE_PATH from ensure_command:",
+            f"- cd \"$WORKTREE_PATH/{REMOTE_AGENT_SUBDIR}\"",
+            f"- {cli_args}",
+            "",
+            "Safety constraints:",
+            "- Validate input/output/regression paths before use.",
+            "- Keep user worktree isolation; do not operate in another user's worktree.",
+            "- Before any git operation, call /home/mini/worktrees/audit-logger.sh with user, repo, and command summary.",
+            "- Never use git push --force unless owner explicitly requested it.",
+            "",
+            "Required result:",
+            "- Write a concise result summary with exit code, stdout/stderr summary, artifacts, verification evidence, and remaining risk.",
+            "- Include final artifact paths and any failure diagnostics.",
+        ]
+    )
+
+
+def _submit_pnc_task(agent_name: str, args: dict[str, Any], user_id: str = "") -> str:
+    for path_key in ("input", "output", "regression"):
+        value = args.get(path_key)
+        if value and not _is_absolute_posix_path(str(value)):
+            return tool_error(
+                f"{path_key} must be an absolute VM path, got: {value}",
+                agent=agent_name,
+            )
+
+    effective_user_id = str(user_id or _current_session_user_id()).strip()
+    user = _resolve_execution_user(args, user_id=effective_user_id)
+    if not user:
+        return tool_error(
+            "Unable to resolve Feishu user for PNC VM worktree; refusing to use a shared fallback",
+            agent=agent_name,
+        )
+    permission_error = _check_pnc_permission(agent_name, user, user_id=effective_user_id)
+    if permission_error:
+        return tool_error(permission_error, agent=agent_name)
+
+    goal = _build_pnc_task_goal(agent_name, args, user=user, user_id=effective_user_id)
+    title = f"PNC {agent_name} task for {user}"
+    raw = vm_task_tool.vm_task_submit_json(title=title, goal=goal, owner=user, user_id=effective_user_id)
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return tool_error("vm_task_submit returned non-JSON output", agent=agent_name, stdout=_tail(raw))
+    if not payload.get("success"):
+        return tool_error(
+            payload.get("error") or "vm_task_submit failed",
+            agent=agent_name,
+            vm_task=payload,
+        )
+    task_payload = payload.get("task") if isinstance(payload.get("task"), dict) else {}
+    task_id = task_payload.get("task_id")
+    routing = payload.get("routing", {})
+    return tool_result(
+        {
+            "ok": True,
+            "mode": "submitted",
+            "agent": agent_name,
+            "task_id": task_id,
+            "task": task_payload,
+            "routing": routing,
+            "user_message": (
+                f"已提交 {agent_name} VM 任务，task_id={task_id or '(unknown)'}。"
+                "这只是提交成功，不是完成；请用 vm_task_status 查询 picked-up/terminal result。"
+            ),
+            "next_action": {
+                "tool": "vm_task_status",
+                "task_id": task_id,
+                "reason": "确认 VM canonical queue / worker pickup / terminal result before reporting completion",
+            },
+        }
+    )
+
+
 def _build_smoke_script(user: str, repo: str, branch: str = "") -> str:
     manager_q = shlex.quote(REMOTE_WORKTREE_MANAGER)
     user_q = shlex.quote(user)
@@ -395,13 +527,13 @@ def pnc_agents_smoke_tool(args: dict[str, Any], user_id: str = "", **_: Any) -> 
 
 
 def generate_dbc_tool(args: dict[str, Any], user_id: str = "", **_: Any) -> str:
-    """Run the generate-dbc CLI agent on the mini VM."""
-    return _run_remote_agent("generate-dbc", args or {}, user_id=user_id)
+    """Submit the generate-dbc CLI agent task for VM worker execution."""
+    return _submit_pnc_task("generate-dbc", args or {}, user_id=user_id)
 
 
 def parse_bus_data_tool(args: dict[str, Any], user_id: str = "", **_: Any) -> str:
-    """Run the parse-bus-data CLI agent on the mini VM."""
-    return _run_remote_agent("parse-bus-data", args or {}, user_id=user_id)
+    """Submit the parse-bus-data CLI agent task for VM worker execution."""
+    return _submit_pnc_task("parse-bus-data", args or {}, user_id=user_id)
 
 
 def check_requirements() -> bool:

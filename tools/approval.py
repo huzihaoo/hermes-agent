@@ -748,15 +748,36 @@ def check_all_command_guards(command: str, env_type: str,
     if env_type in ("docker", "singularity", "modal", "daytona"):
         return {"approved": True, "message": None}
 
-    # --yolo or approvals.mode=off: bypass all approval prompts.
-    # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
-    approval_mode = _get_approval_mode()
-    if os.getenv("HERMES_YOLO_MODE") or is_current_session_yolo_enabled() or approval_mode == "off":
-        return {"approved": True, "message": None}
-
     is_cli = os.getenv("HERMES_INTERACTIVE")
     is_gateway = os.getenv("HERMES_GATEWAY_SESSION")
     is_ask = os.getenv("HERMES_EXEC_ASK")
+
+    # VM direct execution is not a normal approval prompt. In gateway/shared
+    # contexts it must not be bypassed by yolo or approvals.mode=off; only an
+    # explicit emergency marker allows owner/admin direct maintenance.
+    is_dangerous, pattern_key, description = detect_dangerous_command(command)
+    try:
+        from tools.permission_policy import classify_command
+        op_type_for_bypass = classify_command(command) if is_dangerous else ""
+    except Exception:
+        op_type_for_bypass = ""
+    if is_gateway and op_type_for_bypass == "vm_direct_exec" and not os.getenv("HERMES_VM_DIRECT_EXEC_EMERGENCY"):
+        return {
+            "approved": False,
+            "message": "❌ VM 业务执行请走 vm_task_submit / shared-state v2 / VM worker；直连执行需要显式 emergency override。",
+            "pattern_key": pattern_key,
+            "description": description,
+        }
+
+    # --yolo or approvals.mode=off: bypass normal approval prompts. VM direct
+    # execution in gateway sessions is deliberately excluded from this fast
+    # path. Emergency only skips the shared-state routing block below; identity
+    # policy still has to run so members cannot ride an owner maintenance flag.
+    # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
+    approval_mode = _get_approval_mode()
+    if not (is_gateway and op_type_for_bypass == "vm_direct_exec"):
+        if os.getenv("HERMES_YOLO_MODE") or is_current_session_yolo_enabled() or approval_mode == "off":
+            return {"approved": True, "message": None}
 
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
     # flows, we do not block on approvals and we skip external guard work.
@@ -775,18 +796,36 @@ def check_all_command_guards(command: str, env_type: str,
         pass  # tirith module not installed — allow
 
     # Dangerous command check (detection only, no approval)
-    is_dangerous, pattern_key, description = detect_dangerous_command(command)
+    # is_dangerous/pattern_key/description were computed before the yolo bypass
+    # so vm_direct_exec can remain emergency-gated even in yolo/off modes.
 
     # Permission policy: check user role before approval.  This must happen
     # after findings are gathered but before generic approval handling so
     # non-owner Feishu users cannot self-normalize direct VM execution.
     try:
-        from tools.permission_policy import get_decision_by_id
+        from tools.permission_policy import classify_command, get_decision_by_id
         from gateway.session_context import get_session_env
 
         user_id = get_session_env("HERMES_SESSION_USER_ID")
         if user_id and is_dangerous:
+            op_type = classify_command(command)
             decision = get_decision_by_id(user_id, command)
+            if op_type == "vm_direct_exec" and not os.getenv("HERMES_VM_DIRECT_EXEC_EMERGENCY"):
+                if decision == "DENY":
+                    logger.warning("Permission policy: DENY for user %s, command %s", user_id, command[:60])
+                    return {
+                        "approved": False,
+                        "message": "❌ 权限不足，无法执行此操作。",
+                        "pattern_key": pattern_key,
+                        "description": description,
+                    }
+                logger.warning("VM direct execution denied without emergency override for user %s", user_id)
+                return {
+                    "approved": False,
+                    "message": "❌ VM 业务执行请走 vm_task_submit / shared-state v2 / VM worker；直连执行需要显式 emergency override。",
+                    "pattern_key": pattern_key,
+                    "description": description,
+                }
             if decision == "ALLOW":
                 logger.debug("Permission policy: ALLOW for user %s, command %s", user_id, command[:60])
                 if not tirith_result["action"] in ("block", "warn"):

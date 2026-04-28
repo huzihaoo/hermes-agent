@@ -38,7 +38,9 @@ class QueueItem:
     result: dict | None = None
     # Optional context for reconstructing the event after dequeue
     chat_id: str | None = None
+    chat_type: str | None = None
     thread_id: str | None = None
+    request_message_id: str | None = None
     platform: str | None = None
     # Retry tracking
     retry_count: int = 0

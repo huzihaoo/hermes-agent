@@ -50,6 +50,7 @@ class FeishuAdmissionBridge:
             message_id = event.get("message_id", "")
             chat_id = event.get("chat_id", "")
             chat_type = event.get("chat_type", "")  # "p2p" or "group"
+            thread_id = event.get("thread_id", "")
             user_id = event.get("sender", {}).get("sender_id", {}).get("open_id", "")
             message_text = event.get("message", {}).get("content", "")
 
@@ -59,6 +60,8 @@ class FeishuAdmissionBridge:
                 message=message_text,
                 chat_id=chat_id,
                 chat_type=chat_type,
+                thread_id=thread_id,
+                request_message_id=message_id,
                 platform="feishu",
             )
 

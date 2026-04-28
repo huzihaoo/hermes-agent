@@ -2786,19 +2786,21 @@ class FeishuAdapter(BasePlatformAdapter):
         Called by QueueWorker when an item is dequeued.
         """
         try:
-            from gateway.types import MessageEvent, MessageSource, MessageType
+            from gateway.platforms.base import MessageEvent, MessageType
+            from gateway.session import SessionSource
             # Reconstruct event from queue item
-            source = MessageSource(
+            source = SessionSource(
                 platform=self.platform,
                 user_id=item.user_id,
                 chat_id=item.chat_id or "",
+                chat_type=item.chat_type or "dm",
                 thread_id=item.thread_id or "",
             )
             event = MessageEvent(
                 source=source,
                 text=item.message,
                 message_type=MessageType.TEXT,
-                message_id=item.id,
+                message_id=item.request_message_id or item.id,
             )
             await self._handle_message_with_guards(event)
             return {"status": "completed"}
@@ -2828,6 +2830,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     chat_id=chat_id,
                     chat_type=admission_chat_type,
                     thread_id=thread_id,
+                    request_message_id=event.message_id,
                     platform="feishu",
                 )
                 if not admitted:

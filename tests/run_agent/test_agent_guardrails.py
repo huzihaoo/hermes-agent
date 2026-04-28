@@ -71,6 +71,22 @@ class TestSanitizeApiMessages:
         out = AIAgent._sanitize_api_messages(msgs)
         assert out == msgs
 
+    def test_empty_tool_call_assistant_content_gets_placeholder(self):
+        msgs = [
+            {"role": "assistant", "content": "", "tool_calls": [assistant_dict_call("c_empty")]},
+            tool_result("c_empty"),
+        ]
+        out = AIAgent._sanitize_api_messages(msgs)
+        assert out[0]["content"] == "[tool call]"
+
+    def test_empty_assistant_content_gets_placeholder(self):
+        msgs = [
+            {"role": "assistant", "content": ""},
+            {"role": "user", "content": "continue"},
+        ]
+        out = AIAgent._sanitize_api_messages(msgs)
+        assert out[0]["content"] == "[empty assistant message]"
+
     def test_mixed_orphaned_result_and_orphaned_call(self):
         msgs = [
             {"role": "assistant", "tool_calls": [
@@ -263,3 +279,63 @@ class TestGetToolCallIdStatic:
     def test_object_without_id_attr(self):
         tc = types.SimpleNamespace()
         assert AIAgent._get_tool_call_id_static(tc) == ""
+
+
+def test_background_review_inherits_runtime(monkeypatch):
+    import run_agent as run_agent_mod
+
+    original_cls = AIAgent
+    parent = original_cls.__new__(original_cls)
+    parent.model = "gpt-5.5"
+    parent.api_key = "sk-parent"
+    parent.base_url = "https://sub2api.minieye.tech/v1"
+    parent.provider = "custom"
+    parent.api_mode = "chat_completions"
+    parent.platform = "cli"
+    parent._credential_pool = object()
+    parent._memory_store = object()
+    parent._memory_enabled = True
+    parent._user_profile_enabled = True
+    parent._safe_print = lambda *a, **k: None
+    parent.background_review_callback = None
+
+    captured = {}
+
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self._session_messages = []
+
+        def run_conversation(self, **kwargs):
+            captured["run_conversation"] = kwargs
+
+        def close(self):
+            captured["closed"] = True
+
+    class ImmediateThread:
+        def __init__(self, target, daemon=None, name=None):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(run_agent_mod, "AIAgent", FakeReviewAgent)
+    monkeypatch.setattr(run_agent_mod.threading, "Thread", ImmediateThread)
+
+    original_cls._spawn_background_review(
+        parent,
+        messages_snapshot=[{"role": "user", "content": "hello"}],
+        review_memory=True,
+        review_skills=True,
+    )
+
+    assert captured["model"] == "gpt-5.5"
+    assert captured["api_key"] == "sk-parent"
+    assert captured["base_url"] == "https://sub2api.minieye.tech/v1"
+    assert captured["provider"] == "custom"
+    assert captured["api_mode"] == "chat_completions"
+    assert captured["credential_pool"] is parent._credential_pool
+    assert captured["run_conversation"]["conversation_history"] == [
+        {"role": "user", "content": "hello"}
+    ]
+    assert captured["closed"] is True

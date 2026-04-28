@@ -220,6 +220,7 @@ class AdmissionController:
         chat_id: str | None = None,
         chat_type: str | None = None,
         thread_id: str | None = None,
+        request_message_id: str | None = None,
         platform: str | None = None,
         vm_id: str | None = None,
     ) -> Tuple[bool, str, QueueItem | None]:
@@ -256,7 +257,9 @@ class AdmissionController:
             domain=domain,
             domain_id=domain_id,
             chat_id=chat_id,
+            chat_type=chat_type,
             thread_id=thread_id,
+            request_message_id=request_message_id,
             platform=platform,
         )
 

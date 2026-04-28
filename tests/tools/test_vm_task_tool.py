@@ -24,6 +24,59 @@ def test_vm_task_submit_schema_is_raw_function_schema():
     assert "function" not in definition["function"]
 
 
+def test_vm_task_status_schema_is_raw_function_schema():
+    schema = registry.get_schema("vm_task_status")
+
+    assert schema["name"] == "vm_task_status"
+    assert schema["parameters"]["required"] == ["task_id"]
+
+    definition = registry.get_definitions({"vm_task_status"})[0]
+    assert definition["type"] == "function"
+    assert definition["function"]["name"] == "vm_task_status"
+
+
+def test_vm_task_status_reads_task_status_and_result(monkeypatch, tmp_path):
+    root = tmp_path / "shared-state"
+    task_id = "task-123"
+    task_dir = root / "tasks" / task_id
+    task_dir.mkdir(parents=True)
+    (task_dir / "status.md").write_text("# Status\nstate: failed\n", encoding="utf-8")
+    (task_dir / "result.md").write_text("# Result\nexit_code: 1\n", encoding="utf-8")
+    failed = root / "dispatch" / "failed"
+    failed.mkdir(parents=True)
+    (failed / f"{task_id}.json").write_text(
+        json.dumps({"task_id": task_id, "state": "failed", "summary": "boom"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(vm_task_tool, "_DEFAULT_VM_CANONICAL_ROOT", root)
+
+    result = vm_task_tool.vm_task_status(task_id)
+
+    assert result["success"] is True
+    assert result["task_id"] == task_id
+    assert result["state"] == "failed"
+    assert result["dispatch_queue"] == "failed"
+    assert result["status_md"].startswith("# Status")
+    assert result["result_md"].startswith("# Result")
+    assert result["paths"]["task_dir"] == str(task_dir)
+
+
+def test_vm_task_status_rejects_invalid_task_id():
+    result = vm_task_tool.vm_task_status("../bad")
+
+    assert result["success"] is False
+    assert "invalid task_id" in result["error"]
+
+
+def test_vm_task_status_reports_missing_task(monkeypatch, tmp_path):
+    monkeypatch.setattr(vm_task_tool, "_DEFAULT_VM_CANONICAL_ROOT", tmp_path / "shared-state")
+
+    result = vm_task_tool.vm_task_status("missing-task")
+
+    assert result["success"] is False
+    assert result["state"] == "missing"
+
+
 def test_vm_task_submit_returns_structured_timeout(monkeypatch, tmp_path):
     _disable_trusted_session(monkeypatch)
     script = tmp_path / "create_task_v2.py"

@@ -102,8 +102,8 @@ TOOLSETS = {
     },
     
     "vm_tasks": {
-        "description": "Submit long-running VM/business tasks to shared-state v2 for VM worker execution",
-        "tools": ["vm_task_submit"],
+        "description": "Submit long-running VM/business tasks to shared-state v2 for VM worker execution and read canonical task status/results",
+        "tools": ["vm_task_submit", "vm_task_status"],
         "includes": []
     },
     
@@ -366,7 +366,7 @@ TOOLSETS = {
 
     "hermes-feishu": {
         "description": "Feishu/Lark bot toolset - enterprise messaging via Feishu/Lark (full access)",
-        "tools": _HERMES_CORE_TOOLS + ["pnc_agents_smoke", "generate_dbc", "parse_bus_data", "vm_task_submit"],
+        "tools": _HERMES_CORE_TOOLS + ["pnc_agents_smoke", "generate_dbc", "parse_bus_data", "vm_task_submit", "vm_task_status"],
         "includes": []
     },
 

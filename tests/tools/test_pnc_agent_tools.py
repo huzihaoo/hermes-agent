@@ -6,30 +6,28 @@ import subprocess
 from tools import pnc_agent_tools
 
 
-def test_generate_dbc_invokes_remote_agent_with_expected_args(monkeypatch):
+def test_generate_dbc_submits_vm_task_instead_of_direct_ssh(monkeypatch):
     captured = {}
     monkeypatch.setattr(pnc_agent_tools, "_check_pnc_permission", lambda *a, **kw: None)
     monkeypatch.setattr(pnc_agent_tools, "_current_session_user_name", lambda: "郭艳彬")
     monkeypatch.setattr(pnc_agent_tools, "_current_session_user_id", lambda: "")
 
-    def fake_run(cmd, input, text, capture_output, timeout, check):
-        captured.update(
-            cmd=cmd,
-            input=input,
-            text=text,
-            capture_output=capture_output,
-            timeout=timeout,
-            check=check,
-        )
-        monkeypatch.setattr(pnc_agent_tools, "_check_pnc_permission", lambda *a, **kw: None)
-        return subprocess.CompletedProcess(
-            cmd,
-            0,
-            stdout=json.dumps({"ok": True, "exit_code": 0, "stdout": "done", "stderr": ""}),
-            stderr="",
+    def fake_submit(title, goal, owner="", user_id=""):
+        captured.update(title=title, goal=goal, owner=owner, user_id=user_id)
+        return json.dumps(
+            {
+                "success": True,
+                "task": {"task_id": "task-generate-dbc"},
+                "routing": {
+                    "host_state": "host-created",
+                    "delivery_attempted": True,
+                    "next_truth_checks": ["confirm task appears in VM canonical queue before saying delivered-to-VM"],
+                },
+            },
+            ensure_ascii=False,
         )
 
-    monkeypatch.setattr(pnc_agent_tools.subprocess, "run", fake_run)
+    monkeypatch.setattr(pnc_agent_tools.vm_task_tool, "vm_task_submit_json", fake_submit)
 
     result = json.loads(
         pnc_agent_tools.generate_dbc_tool(
@@ -37,108 +35,174 @@ def test_generate_dbc_invokes_remote_agent_with_expected_args(monkeypatch):
                 "project": "p1",
                 "platform": "j5",
                 "profile": "dev",
-                "input": "/tmp/in.dbc",
-                "output": "/tmp/out",
-                "regression": "/tmp/reg",
+                "input": "/home/mini/worktrees/pnc_specs/郭艳彬/in.dbc",
+                "output": "/home/mini/worktrees/pnc_specs/郭艳彬/out",
+                "regression": "/home/mini/worktrees/pnc_specs/郭艳彬/reg",
                 "timeout": 123,
-            }
+            },
+            user_id="ou_guo",
         )
     )
 
     assert result["ok"] is True
+    assert result["mode"] == "submitted"
     assert result["agent"] == "generate-dbc"
-    assert captured["cmd"] == ["ssh-mini-agent", "run_bash_json"]
-    assert captured["timeout"] == 128
-    assert "generate-dbc" in captured["input"]
-    assert "--input" in captured["input"]
-    assert "/tmp/in.dbc" in captured["input"]
-    assert "--output" in captured["input"]
-    assert "/tmp/out" in captured["input"]
+    assert result["task_id"] == "task-generate-dbc"
+    assert result["routing"]["host_state"] == "host-created"
+    assert result["routing"]["delivery_attempted"] is True
+    assert "canonical queue" in result["routing"]["next_truth_checks"][0]
+    assert result["user_message"].startswith("已提交")
+    assert "不是完成" in result["user_message"]
+    assert result["next_action"]["tool"] == "vm_task_status"
+    assert result["next_action"]["task_id"] == "task-generate-dbc"
+    assert captured["owner"] == "郭艳彬"
+    assert captured["user_id"] == "ou_guo"
+    assert "generate-dbc" in captured["title"]
+    assert "./generate-dbc" in captured["goal"]
+    assert "worktree_manager.py ensure" in captured["goal"]
+    assert "/home/mini/nas/miniPan/tmp/pdcl_downloads" in captured["goal"]
+    assert "/home/mini/nas/miniPan/tmp/" in captured["goal"]
+    assert "ssh-mini-agent run_bash_json" not in captured["goal"]
 
 
-def test_generate_dbc_ensures_user_worktree_before_running(monkeypatch):
+def test_parse_bus_data_submits_vm_task(monkeypatch):
     captured = {}
-    monkeypatch.setattr(pnc_agent_tools, "_allow_debug_user_override", lambda: True)
     monkeypatch.setattr(pnc_agent_tools, "_check_pnc_permission", lambda *a, **kw: None)
     monkeypatch.setattr(pnc_agent_tools, "_current_session_user_name", lambda: "郭艳彬")
     monkeypatch.setattr(pnc_agent_tools, "_current_session_user_id", lambda: "")
 
-    def fake_run(cmd, input, text, capture_output, timeout, check):
-        captured.update(cmd=cmd, input=input, timeout=timeout)
-        return subprocess.CompletedProcess(
-            cmd,
-            0,
-            stdout=json.dumps({"ok": True, "exit_code": 0, "stdout": "done", "stderr": ""}),
-            stderr="",
+    def fake_submit(title, goal, owner="", user_id=""):
+        captured.update(title=title, goal=goal, owner=owner, user_id=user_id)
+        return json.dumps(
+            {
+                "success": True,
+                "task": {"task_id": "task-parse-bus-data"},
+                "routing": {
+                    "host_state": "host-created",
+                    "delivery_attempted": True,
+                    "next_truth_checks": ["confirm task appears in VM canonical queue before saying delivered-to-VM"],
+                },
+            },
+            ensure_ascii=False,
         )
 
-    monkeypatch.setattr(pnc_agent_tools.subprocess, "run", fake_run)
+    monkeypatch.setattr(pnc_agent_tools.vm_task_tool, "vm_task_submit_json", fake_submit)
 
     result = json.loads(
-        pnc_agent_tools.generate_dbc_tool(
+        pnc_agent_tools.parse_bus_data_tool(
             {
-                "user": "郭艳彬",
-                "repo": "pnc_specs",
-                "input": "/tmp/in.dbc",
-            }
+                "input": "/home/mini/worktrees/pnc_specs/郭艳彬/data",
+                "output": "/home/mini/worktrees/pnc_specs/郭艳彬/out",
+            },
+            user_id="ou_guo",
         )
     )
 
     assert result["ok"] is True
-    assert "worktree_manager.py ensure" in captured["input"]
-    assert "郭艳彬" in captured["input"]
-    assert "ignored-public-user" not in captured["input"]
-    assert "pnc_specs" in captured["input"]
-    assert "WORKTREE_PATH=$(" in captured["input"]
-    assert "cd \"$AGENT_ROOT\"" in captured["input"]
+    assert result["mode"] == "submitted"
+    assert result["agent"] == "parse-bus-data"
+    assert result["task_id"] == "task-parse-bus-data"
+    assert result["routing"]["host_state"] == "host-created"
+    assert result["routing"]["delivery_attempted"] is True
+    assert "canonical queue" in result["routing"]["next_truth_checks"][0]
+    assert "不是完成" in result["user_message"]
+    assert result["next_action"]["tool"] == "vm_task_status"
+    assert result["next_action"]["task_id"] == "task-parse-bus-data"
+    assert "./parse-bus-data" in captured["goal"]
 
 
-def test_generate_dbc_uses_gateway_sender_when_user_omitted(monkeypatch):
-    captured = {}
+
+def test_generate_dbc_task_goal_uses_gateway_sender_when_user_omitted(monkeypatch):
     monkeypatch.setattr(pnc_agent_tools, "_check_pnc_permission", lambda *a, **kw: None)
-
-    def fake_run(cmd, input, text, capture_output, timeout, check):
-        captured.update(cmd=cmd, input=input, timeout=timeout)
-        monkeypatch.setattr(pnc_agent_tools, "_check_pnc_permission", lambda *a, **kw: None)
-        return subprocess.CompletedProcess(
-            cmd,
-            0,
-            stdout=json.dumps({"ok": True, "exit_code": 0, "stdout": "done", "stderr": ""}),
-            stderr="",
-        )
-
-    monkeypatch.setattr(pnc_agent_tools.subprocess, "run", fake_run)
     monkeypatch.setattr(pnc_agent_tools, "_current_session_user_name", lambda: "宋伟军")
     monkeypatch.setattr(pnc_agent_tools, "_current_session_user_id", lambda: "")
+    captured = {}
+
+    def fake_submit(title, goal, owner="", user_id=""):
+        captured.update(title=title, goal=goal, owner=owner, user_id=user_id)
+        return json.dumps({"success": True, "task": {"task_id": "task-user"}, "routing": {}}, ensure_ascii=False)
+
+    monkeypatch.setattr(pnc_agent_tools.vm_task_tool, "vm_task_submit_json", fake_submit)
 
     result = json.loads(pnc_agent_tools.generate_dbc_tool({"input": "/tmp/in.dbc"}))
 
     assert result["ok"] is True
-    assert "worktree_manager.py ensure" in captured["input"]
-    assert "宋伟军" in captured["input"]
-    assert "/home/mini/worktrees/pnc_specs/宋伟军" not in captured["input"]
+    assert captured["owner"] == "宋伟军"
+    assert "worktree_manager.py ensure" in captured["goal"]
+    assert "宋伟军" in captured["goal"]
+    assert "/home/mini/worktrees/pnc_specs/宋伟军" not in captured["goal"]
+    assert "--project D2L3 --platform mcu --profile default" in captured["goal"]
 
 
-def test_generate_dbc_maps_gateway_sender_id_when_name_missing(monkeypatch, tmp_path):
+def test_generate_dbc_task_goal_defaults_required_cli_context(monkeypatch):
+    monkeypatch.setattr(pnc_agent_tools, "_check_pnc_permission", lambda *a, **kw: None)
+    monkeypatch.setattr(pnc_agent_tools, "_current_session_user_name", lambda: "郭艳彬")
+    monkeypatch.setattr(pnc_agent_tools, "_current_session_user_id", lambda: "")
     captured = {}
+
+    def fake_submit(title, goal, owner="", user_id=""):
+        captured.update(title=title, goal=goal, owner=owner, user_id=user_id)
+        return json.dumps({"success": True, "task": {"task_id": "task-defaults"}, "routing": {}}, ensure_ascii=False)
+
+    monkeypatch.setattr(pnc_agent_tools.vm_task_tool, "vm_task_submit_json", fake_submit)
+
+    result = json.loads(
+        pnc_agent_tools.generate_dbc_tool(
+            {
+                "input": "/home/mini/worktrees/pnc_specs/郭艳彬/in.dbc",
+                "output": "/home/mini/nas/miniPan/tmp/pnc-generate-dbc-smoke-output",
+            },
+            user_id="ou_guo",
+        )
+    )
+
+    assert result["ok"] is True
+    assert "./generate-dbc --project D2L3 --platform mcu --profile default" in captured["goal"]
+
+
+def test_generate_dbc_task_goal_preserves_explicit_cli_context(monkeypatch):
+    monkeypatch.setattr(pnc_agent_tools, "_check_pnc_permission", lambda *a, **kw: None)
+    monkeypatch.setattr(pnc_agent_tools, "_current_session_user_name", lambda: "郭艳彬")
+    monkeypatch.setattr(pnc_agent_tools, "_current_session_user_id", lambda: "")
+    captured = {}
+
+    def fake_submit(title, goal, owner="", user_id=""):
+        captured.update(title=title, goal=goal, owner=owner, user_id=user_id)
+        return json.dumps({"success": True, "task": {"task_id": "task-explicit"}, "routing": {}}, ensure_ascii=False)
+
+    monkeypatch.setattr(pnc_agent_tools.vm_task_tool, "vm_task_submit_json", fake_submit)
+
+    result = json.loads(
+        pnc_agent_tools.generate_dbc_tool(
+            {
+                "project": "custom-project",
+                "platform": "custom-platform",
+                "profile": "custom-profile",
+                "input": "/home/mini/worktrees/pnc_specs/郭艳彬/in.dbc",
+                "output": "/home/mini/nas/miniPan/tmp/pnc-generate-dbc-smoke-output",
+            },
+            user_id="ou_guo",
+        )
+    )
+
+    assert result["ok"] is True
+    assert "--project custom-project --platform custom-platform --profile custom-profile" in captured["goal"]
+
+
+def test_generate_dbc_task_goal_maps_gateway_sender_id_when_name_missing(monkeypatch, tmp_path):
     monkeypatch.setattr(pnc_agent_tools, "_check_pnc_permission", lambda *a, **kw: None)
     roles = tmp_path / "user-roles.json"
     roles.write_text(
         json.dumps({"user_id_mapping": {"ou_test": "郭艳彬"}}, ensure_ascii=False),
         encoding="utf-8",
     )
+    captured = {}
 
-    def fake_run(cmd, input, text, capture_output, timeout, check):
-        captured.update(cmd=cmd, input=input, timeout=timeout)
-        monkeypatch.setattr(pnc_agent_tools, "_check_pnc_permission", lambda *a, **kw: None)
-        return subprocess.CompletedProcess(
-            cmd,
-            0,
-            stdout=json.dumps({"ok": True, "exit_code": 0, "stdout": "done", "stderr": ""}),
-            stderr="",
-        )
+    def fake_submit(title, goal, owner="", user_id=""):
+        captured.update(title=title, goal=goal, owner=owner, user_id=user_id)
+        return json.dumps({"success": True, "task": {"task_id": "task-map"}, "routing": {}}, ensure_ascii=False)
 
-    monkeypatch.setattr(pnc_agent_tools.subprocess, "run", fake_run)
+    monkeypatch.setattr(pnc_agent_tools.vm_task_tool, "vm_task_submit_json", fake_submit)
     monkeypatch.setattr(pnc_agent_tools, "USER_ROLES_CONFIG", str(roles))
     monkeypatch.setattr(pnc_agent_tools, "_current_session_user_name", lambda: "")
     monkeypatch.setattr(pnc_agent_tools, "_current_session_user_id", lambda: "ou_test")
@@ -146,30 +210,27 @@ def test_generate_dbc_maps_gateway_sender_id_when_name_missing(monkeypatch, tmp_
     result = json.loads(pnc_agent_tools.generate_dbc_tool({"input": "/tmp/in.dbc"}))
 
     assert result["ok"] is True
-    assert "郭艳彬" in captured["input"]
-    assert "worktree_manager.py ensure" in captured["input"]
+    assert captured["owner"] == "郭艳彬"
+    assert captured["user_id"] == "ou_test"
+    assert "requester_user_id: ou_test" in captured["goal"]
+    assert "郭艳彬" in captured["goal"]
+    assert "worktree_manager.py ensure" in captured["goal"]
 
 
-def test_generate_dbc_resolves_user_from_explicit_user_id(monkeypatch):
+def test_generate_dbc_task_goal_resolves_user_from_explicit_user_id(monkeypatch):
     captured = {}
     monkeypatch.setattr(pnc_agent_tools, "_check_pnc_permission", lambda *a, **kw: None)
-
-    def fake_run(cmd, input, text, capture_output, timeout, check):
-        captured.update(cmd=cmd, input=input, timeout=timeout)
-        monkeypatch.setattr(pnc_agent_tools, "_check_pnc_permission", lambda *a, **kw: None)
-        return subprocess.CompletedProcess(
-            cmd,
-            0,
-            stdout=json.dumps({"ok": True, "exit_code": 0, "stdout": "done", "stderr": ""}),
-            stderr="",
-        )
-
-    monkeypatch.setattr(pnc_agent_tools.subprocess, "run", fake_run)
     monkeypatch.setattr(
         pnc_agent_tools,
         "_resolve_user_name_from_id",
         lambda uid: "郭艳彬" if uid == "ou_guo" else "",
     )
+
+    def fake_submit(title, goal, owner="", user_id=""):
+        captured.update(title=title, goal=goal, owner=owner, user_id=user_id)
+        return json.dumps({"success": True, "task": {"task_id": "task-explicit"}, "routing": {}}, ensure_ascii=False)
+
+    monkeypatch.setattr(pnc_agent_tools.vm_task_tool, "vm_task_submit_json", fake_submit)
 
     result = json.loads(
         pnc_agent_tools.generate_dbc_tool(
@@ -179,26 +240,22 @@ def test_generate_dbc_resolves_user_from_explicit_user_id(monkeypatch):
     )
 
     assert result["ok"] is True
-    assert "worktree_manager.py ensure" in captured["input"]
-    assert "郭艳彬" in captured["input"]
-    assert "pnc_specs" in captured["input"]
+    assert captured["owner"] == "郭艳彬"
+    assert captured["user_id"] == "ou_guo"
+    assert "郭艳彬" in captured["goal"]
+    assert "pnc_specs" in captured["goal"]
 
 
-def test_generate_dbc_ignores_public_user_argument_by_default(monkeypatch):
+def test_generate_dbc_task_goal_ignores_public_user_argument_by_default(monkeypatch):
     captured = {}
     monkeypatch.setattr(pnc_agent_tools, "_check_pnc_permission", lambda *a, **kw: None)
-
-    def fake_run(cmd, input, text, capture_output, timeout, check):
-        captured.update(input=input)
-        return subprocess.CompletedProcess(
-            cmd,
-            0,
-            stdout=json.dumps({"ok": True, "exit_code": 0, "stdout": "done", "stderr": ""}),
-            stderr="",
-        )
-
-    monkeypatch.setattr(pnc_agent_tools.subprocess, "run", fake_run)
     monkeypatch.setattr(pnc_agent_tools, "_resolve_user_name_from_id", lambda user_id: "会话用户")
+
+    def fake_submit(title, goal, owner="", user_id=""):
+        captured.update(title=title, goal=goal, owner=owner, user_id=user_id)
+        return json.dumps({"success": True, "task": {"task_id": "task-ignore"}, "routing": {}}, ensure_ascii=False)
+
+    monkeypatch.setattr(pnc_agent_tools.vm_task_tool, "vm_task_submit_json", fake_submit)
 
     result = json.loads(
         pnc_agent_tools.generate_dbc_tool(
@@ -208,61 +265,48 @@ def test_generate_dbc_ignores_public_user_argument_by_default(monkeypatch):
     )
 
     assert result["ok"] is True
-    assert "会话用户" in captured["input"]
-    assert "攻击者指定用户" not in captured["input"]
+    assert captured["owner"] == "会话用户"
+    assert "会话用户" in captured["goal"]
+    assert "攻击者指定用户" not in captured["goal"]
 
 
-def test_generate_dbc_prefers_user_id_mapping_over_spoofable_display_name(monkeypatch):
+def test_generate_dbc_task_goal_prefers_user_id_mapping_over_spoofable_display_name(monkeypatch):
     captured = {}
     monkeypatch.setattr(pnc_agent_tools, "_check_pnc_permission", lambda *a, **kw: None)
     monkeypatch.setattr(pnc_agent_tools, "_current_session_user_name", lambda: "宋伟军")
     monkeypatch.setattr(pnc_agent_tools, "_current_session_user_id", lambda: "ou_guo")
     monkeypatch.setattr(pnc_agent_tools, "_resolve_user_name_from_id", lambda uid: "郭艳彬" if uid == "ou_guo" else "")
 
-    def fake_run(cmd, input, text, capture_output, timeout, check):
-        captured.update(input=input)
-        return subprocess.CompletedProcess(
-            cmd,
-            0,
-            stdout=json.dumps({"ok": True, "exit_code": 0, "stdout": "done", "stderr": ""}),
-            stderr="",
-        )
+    def fake_submit(title, goal, owner="", user_id=""):
+        captured.update(title=title, goal=goal, owner=owner, user_id=user_id)
+        return json.dumps({"success": True, "task": {"task_id": "task-prefer"}, "routing": {}}, ensure_ascii=False)
 
-    monkeypatch.setattr(pnc_agent_tools.subprocess, "run", fake_run)
+    monkeypatch.setattr(pnc_agent_tools.vm_task_tool, "vm_task_submit_json", fake_submit)
 
     result = json.loads(pnc_agent_tools.generate_dbc_tool({"input": "/tmp/in.dbc"}, user_id="ou_guo"))
 
     assert result["ok"] is True
-    assert "郭艳彬" in captured["input"]
-    assert "宋伟军" not in captured["input"]
+    assert captured["owner"] == "郭艳彬"
+    assert "郭艳彬" in captured["goal"]
+    assert "宋伟军" not in captured["goal"]
 
 
-def test_generate_dbc_accepts_ssh_warning_before_json_payload(monkeypatch):
+def test_parse_bus_data_reports_vm_task_submit_failure(monkeypatch):
     monkeypatch.setattr(pnc_agent_tools, "_check_pnc_permission", lambda *a, **kw: None)
     monkeypatch.setattr(pnc_agent_tools, "_current_session_user_name", lambda: "郭艳彬")
     monkeypatch.setattr(pnc_agent_tools, "_current_session_user_id", lambda: "")
 
-    def fake_run(cmd, input, text, capture_output, timeout, check):
-        return subprocess.CompletedProcess(
-            cmd,
-            0,
-            stdout=(
-                "** WARNING: connection is not using a post-quantum key exchange algorithm.\n"
-                "** This session may be vulnerable to store now, decrypt later attacks.\n"
-                + json.dumps({"ok": True, "exit_code": 0, "stdout": "done", "stderr": ""})
-                + "\n"
-            ),
-            stderr="",
-        )
+    def fake_submit(title, goal, owner="", user_id=""):
+        return json.dumps({"success": False, "error": "bridge delivery failed", "returncode": 2}, ensure_ascii=False)
 
-    monkeypatch.setattr(pnc_agent_tools.subprocess, "run", fake_run)
+    monkeypatch.setattr(pnc_agent_tools.vm_task_tool, "vm_task_submit_json", fake_submit)
 
-    result = json.loads(pnc_agent_tools.generate_dbc_tool({"input": "/tmp/in.dbc"}))
+    result = json.loads(pnc_agent_tools.parse_bus_data_tool({"input": "/tmp/data", "output": "/tmp/out"}))
 
-    assert result["ok"] is True
-    assert result["agent"] == "generate-dbc"
-    assert result["stdout"] == "done"
-
+    assert "error" in result
+    assert result["agent"] == "parse-bus-data"
+    assert "bridge delivery failed" in result["error"]
+    assert result["vm_task"]["returncode"] == 2
 
 def test_pnc_agents_smoke_resolves_user_and_checks_agent_root(monkeypatch):
     captured = {}
@@ -322,24 +366,6 @@ def test_generate_dbc_remote_script_rejects_paths_outside_resolved_worktree(monk
     assert "path outside resolved worktree for output" in script
     assert "/home/mini/worktrees/pnc_specs/*" in script
     assert "/home/mini/pnc_specs)" not in script
-
-
-def test_parse_bus_data_reports_local_wrapper_failure(monkeypatch):
-    monkeypatch.setattr(pnc_agent_tools, "_check_pnc_permission", lambda *a, **kw: None)
-    monkeypatch.setattr(pnc_agent_tools, "_current_session_user_name", lambda: "郭艳彬")
-    monkeypatch.setattr(pnc_agent_tools, "_current_session_user_id", lambda: "")
-
-    def fake_run(*args, **kwargs):
-        return subprocess.CompletedProcess(args[0], 127, stdout="", stderr="ssh-mini-agent: not found")
-
-    monkeypatch.setattr(pnc_agent_tools.subprocess, "run", fake_run)
-
-    result = json.loads(pnc_agent_tools.parse_bus_data_tool({"input": "/tmp/data", "output": "/tmp/out"}))
-
-    assert "error" in result
-    assert result["agent"] == "parse-bus-data"
-    assert result["exit_code"] == 127
-    assert "ssh-mini-agent" in result["stderr"]
 
 
 def test_rejects_non_absolute_file_paths():

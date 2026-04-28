@@ -103,6 +103,7 @@ def test_admit_group_message_sets_group_domain():
         assert admitted is True
         assert item.domain == "group"
         assert item.domain_id == "group-chat-1"
+        assert item.chat_type == "group"
         assert "群聊/standard" in feedback
 
 

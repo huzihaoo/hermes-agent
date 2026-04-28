@@ -87,18 +87,21 @@ def get_user_role_by_id(user_id: str) -> Role:
 
 
 def classify_command(command: str) -> OpType:
-    cfg = _load_config()
     cmd = command.strip()
 
     # VM direct execution: this is distinct from ordinary writes.  In shared
     # Feishu usage it bypasses the shared-state v2 -> VM worker execution plane,
     # so non-owner users should not be able to normalize it as a routine write.
+    # Keep this config-independent so gateway approval/yolo bypass checks cannot
+    # fail open if ~/.hermes/config/user-roles.json is missing or malformed.
     if re.search(r"\bssh-mini-agent\s+(run_bash_json|run_py_json|edit_file)\b", cmd):
         return "vm_direct_exec"
     if re.search(r"\bssh-mini-run\b", cmd):
         return "vm_direct_exec"
     if re.search(r"\bssh\b[^\n;]*\bmini@", cmd):
         return "vm_direct_exec"
+
+    cfg = _load_config()
 
     # Check critical paths first — always dangerous
     for pattern in cfg.get("critical_paths", []):
@@ -127,15 +130,10 @@ def _decision_for(role: str, op_type: str, cfg: dict) -> Decision:
     if decision:
         return decision  # type: ignore[return-value]
     if op_type == "vm_direct_exec":
-        # Backward-compatible fail-closed default for older configs that lack
-        # the new op_type. Owner/admin can proceed, senior requires approval,
-        # members are denied.
-        return {
-            "owner": "ALLOW",
-            "admin": "CONFIRM",
-            "senior": "APPROVE",
-            "member": "DENY",
-        }.get(role, "DENY")  # type: ignore[return-value]
+        # Direct VM execution bypasses shared-state v2 -> VM worker.  Fail
+        # closed by default for Feishu/shared usage; owner can only bypass with
+        # an explicit emergency marker handled in the approval layer.
+        return "DENY"
     return "DENY"
 
 
