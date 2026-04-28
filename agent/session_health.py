@@ -77,8 +77,16 @@ class SessionHealthMonitor:
     
     Thresholds:
       Messages:  400 → yellow, 450 → red, 500 → blocked
-      Runtime:   4h → yellow, 5h → red, 6h → blocked
+      Runtime:   8h → yellow, 10h → red, 12h → blocked
+        (runtime alone caps at YELLOW unless messages also elevated)
       Tool returns > 40KB: 5 cumulative → yellow checkpoint hint
+    
+    Design note: Pure runtime is a weak signal — a 10h session with 50
+    messages is perfectly healthy.  The original 4h/5h/6h limits were
+    set after an 11h/872-message incident but penalized low-traffic
+    overnight tasks.  Runtime now uses relaxed thresholds and is capped
+    at YELLOW when message count is low (< MSG_WARN), so it never
+    single-handedly triggers handoff or hard-block.
     """
     
     # Message limits
@@ -86,10 +94,10 @@ class SessionHealthMonitor:
     MSG_CRITICAL = 450
     MSG_BLOCK = 500
     
-    # Runtime limits (seconds)
-    RT_WARN = 4 * 3600
-    RT_CRITICAL = 5 * 3600
-    RT_BLOCK = 6 * 3600
+    # Runtime limits (seconds) — relaxed for overnight / long-running tasks
+    RT_WARN = 8 * 3600
+    RT_CRITICAL = 10 * 3600
+    RT_BLOCK = 12 * 3600
     
     # Tool return size
     TOOL_WARN_BYTES = 50 * 1024
@@ -132,25 +140,51 @@ class SessionHealthMonitor:
             )
         
         # --- Runtime ---
+        # Runtime alone is a weak signal.  When message count is below
+        # MSG_WARN the session is low-traffic (e.g. overnight build task)
+        # and runtime should cap at YELLOW regardless of hours elapsed.
         hours = runtime / 3600
+        _rt_cap = None  # None = no cap; set to a level to limit runtime escalation
+        if msg_count < self.MSG_WARN:
+            _rt_cap = HealthLevel.YELLOW
+        
         if runtime >= self.RT_BLOCK:
-            level = HealthLevel.BLOCKED
-            warnings.append(
-                f"Runtime: {hours:.1f}h ≥ 6h (LIMIT). "
+            _rt_level = HealthLevel.BLOCKED
+            _rt_msg = (
+                f"Runtime: {hours:.1f}h ≥ {self.RT_BLOCK // 3600}h (LIMIT). "
                 f"Start a new session."
             )
         elif runtime >= self.RT_CRITICAL:
-            level = max(level, HealthLevel.RED, key=lambda l: list(HealthLevel).index(l))
-            warnings.append(
-                f"Runtime: {hours:.1f}h ≥ 5h. "
+            _rt_level = HealthLevel.RED
+            _rt_msg = (
+                f"Runtime: {hours:.1f}h ≥ {self.RT_CRITICAL // 3600}h. "
                 f"Checkpoint now and consider a new session."
             )
         elif runtime >= self.RT_WARN:
-            level = max(level, HealthLevel.YELLOW, key=lambda l: list(HealthLevel).index(l))
-            warnings.append(
-                f"Runtime: {hours:.1f}h ≥ 4h. "
+            _rt_level = HealthLevel.YELLOW
+            _rt_msg = (
+                f"Runtime: {hours:.1f}h ≥ {self.RT_WARN // 3600}h. "
                 f"Consider checkpointing soon."
             )
+        else:
+            _rt_level = None
+            _rt_msg = None
+        
+        if _rt_level is not None:
+            # Apply cap: low-traffic sessions don't escalate past YELLOW on time alone
+            if _rt_cap is not None:
+                effective = min(
+                    _rt_level, _rt_cap,
+                    key=lambda l: list(HealthLevel).index(l),
+                )
+                if effective != _rt_level:
+                    _rt_msg += (
+                        f" (capped at {effective.value} — "
+                        f"message count {msg_count} is below {self.MSG_WARN})"
+                    )
+                _rt_level = effective
+            level = max(level, _rt_level, key=lambda l: list(HealthLevel).index(l))
+            warnings.append(_rt_msg)
         
         # --- Large tool returns ---
         if self.large_return_count >= self.LARGE_RETURN_MAX:

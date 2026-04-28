@@ -99,33 +99,63 @@ class TestSessionHealthMonitor:
     def test_runtime_thresholds(self):
         m = SessionHealthMonitor("test")
         
-        # Simulate 3h runtime (green)
-        m.start_time = time.time() - (3 * 3600)
+        # Simulate 5h runtime (green — below new 8h threshold)
+        m.start_time = time.time() - (5 * 3600)
         h = m.check([{}] * 10)
         assert h.level == HealthLevel.GREEN
         
-        # Simulate 4.5h runtime (yellow)
-        m.start_time = time.time() - (4.5 * 3600)
+        # Simulate 9h runtime with low messages → capped at YELLOW
+        m.start_time = time.time() - (9 * 3600)
         h = m.check([{}] * 10)
         assert h.level == HealthLevel.YELLOW
-        assert any("4h" in w for w in h.warnings)
+        assert any("8h" in w for w in h.warnings)
         
-        # Simulate 5.5h runtime (red)
-        m.start_time = time.time() - (5.5 * 3600)
+        # Simulate 11h runtime with low messages → still capped at YELLOW
+        m.start_time = time.time() - (11 * 3600)
         h = m.check([{}] * 10)
+        assert h.level == HealthLevel.YELLOW
+        assert any("capped" in w for w in h.warnings)
+        
+        # Simulate 13h runtime with low messages → still capped at YELLOW
+        m.start_time = time.time() - (13 * 3600)
+        h = m.check([{}] * 10)
+        assert h.level == HealthLevel.YELLOW
+        assert any("capped" in w for w in h.warnings)
+    
+    def test_runtime_uncapped_with_high_messages(self):
+        """When message count is >= MSG_WARN, runtime escalates normally."""
+        m = SessionHealthMonitor("test")
+        high_msgs = [{}] * 410  # above MSG_WARN (400)
+        
+        # 9h + high messages → YELLOW (from both runtime and messages)
+        m.start_time = time.time() - (9 * 3600)
+        h = m.check(high_msgs)
+        assert h.level == HealthLevel.YELLOW
+        
+        # 11h + high messages → RED (runtime uncapped)
+        m.start_time = time.time() - (11 * 3600)
+        h = m.check(high_msgs)
         assert h.level == HealthLevel.RED
-        assert any("5h" in w for w in h.warnings)
+        assert any("10h" in w for w in h.warnings)
+        assert not any("capped" in w for w in h.warnings)
         
-        # Simulate 6.5h runtime (blocked)
-        m.start_time = time.time() - (6.5 * 3600)
-        h = m.check([{}] * 10)
+        # 13h + high messages → BLOCKED (runtime uncapped)
+        m.start_time = time.time() - (13 * 3600)
+        h = m.check(high_msgs)
         assert h.level == HealthLevel.BLOCKED
-        assert any("6h" in w for w in h.warnings)
+    
+    def test_overnight_low_traffic_stays_green(self):
+        """A 7h session with 50 messages should be perfectly GREEN."""
+        m = SessionHealthMonitor("test")
+        m.start_time = time.time() - (7 * 3600)
+        h = m.check([{}] * 50)
+        assert h.level == HealthLevel.GREEN
+        assert len(h.warnings) == 0
     
     def test_combined_thresholds_max_level_wins(self):
         """When multiple thresholds trigger, highest level wins."""
         m = SessionHealthMonitor("test")
-        m.start_time = time.time() - (4.5 * 3600)  # yellow runtime
+        m.start_time = time.time() - (9 * 3600)  # yellow runtime
         h = m.check([{}] * 451)  # red message count
         assert h.level == HealthLevel.RED
         assert len(h.warnings) == 2  # both warnings present

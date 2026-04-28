@@ -13,6 +13,7 @@ VERSIONED_MODULES = [
     ("gateway/tasks", "Task Product Layer"),
     ("gateway/observability", "Observability"),
     ("agent/session_health.py", "Session Health"),
+    ("agent/session_handoff.py", "Session Handoff"),
 ]
 
 
