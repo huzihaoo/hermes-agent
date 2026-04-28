@@ -1581,13 +1581,11 @@ class FeishuAdapter(BasePlatformAdapter):
                 title = "🛂 Permission Grant Approval Required"
                 header_template = "orange"
                 role_value = requested_role if requested_role in _PERMISSION_GRANT_ALLOWED_ROLES else "member"
-                role_options = [
-                    {
-                        "text": {"tag": "plain_text", "content": label},
-                        "value": role,
-                    }
-                    for role, label in _PERMISSION_GRANT_ROLE_OPTIONS
-                ]
+                primary_label = (
+                    f"✅ Approve {role_value.title()}"
+                    if role_value != "member"
+                    else "✅ Approve"
+                )
                 body = (
                     f"**Applicant:** {target_user_name or '(unknown)'}\n"
                     f"**User ID:** `{target_user_id or '(missing)'}`\n"
@@ -1599,20 +1597,25 @@ class FeishuAdapter(BasePlatformAdapter):
                 )
                 actions = [
                     {
-                        "tag": "select_static",
-                        "placeholder": {"tag": "plain_text", "content": "Select role"},
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": primary_label},
+                        "type": "primary",
                         "value": {
-                            "hermes_action": "select_requested_role",
+                            "hermes_action": "grant_permission",
                             "approval_id": approval_id,
                             "requested_role": role_value,
                         },
-                        "options": role_options,
-                        "initial_option": next(
-                            (option for option in role_options if option["value"] == role_value),
-                            role_options[-1],
-                        ),
                     },
-                    _btn("✅ Approve", "grant_permission", "primary"),
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "✅ Approve Member"},
+                        "type": "default",
+                        "value": {
+                            "hermes_action": "grant_permission",
+                            "approval_id": approval_id,
+                            "requested_role": "member",
+                        },
+                    },
                     _btn("❌ Deny", "deny", "danger"),
                 ]
             else:
@@ -2206,6 +2209,7 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.debug("[Feishu] Card action missing approval_id, ignoring")
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
         choice = _APPROVAL_CHOICE_MAP.get(action_value.get("hermes_action"), "deny")
+        requested_role_override = str(action_value.get("requested_role") or "").strip().lower()
 
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
@@ -2237,7 +2241,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
         if choice == "select_requested_role":
             state = self._approval_state.get(approval_id)
-            requested_role = str(action_value.get("requested_role") or "").strip().lower()
+            requested_role = requested_role_override
             if state and requested_role in _PERMISSION_GRANT_ALLOWED_ROLES:
                 state["requested_role"] = requested_role
             if P2CardActionTriggerResponse is None:
@@ -2253,6 +2257,9 @@ class FeishuAdapter(BasePlatformAdapter):
                 response.card = card
             return response
 
+        state = self._approval_state.get(approval_id)
+        if choice == "grant_permission" and requested_role_override in _PERMISSION_GRANT_ALLOWED_ROLES and state:
+            state["requested_role"] = requested_role_override
         self._submit_on_loop(loop, self._resolve_approval(approval_id, choice, user_name))
 
         if P2CardActionTriggerResponse is None:
@@ -2261,7 +2268,7 @@ class FeishuAdapter(BasePlatformAdapter):
         if CallBackCard is not None:
             card = CallBackCard()
             card.type = "raw"
-            state = self._approval_state.get(approval_id, {})
+            state = state or {}
             card.data = self._build_resolved_approval_card(
                 choice=choice,
                 user_name=user_name,

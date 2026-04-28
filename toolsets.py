@@ -60,10 +60,10 @@ _HERMES_CORE_TOOLS = [
     "send_message",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
-    # PNC/MCU domain agents on the mini VM
-    "generate_dbc", "parse_bus_data",
-    # Shared-state v2 VM worker submission
-    "vm_task_submit",
+    # PNC/MCU domain agents are intentionally not in the global platform core.
+    # They are exposed only through explicit PNC/Feishu toolsets so unsupported
+    # platforms do not get a VM execution surface by accident.
+    # Shared-state v2 VM worker submission is likewise scoped to Feishu/VM task toolsets.
 ]
 
 
@@ -212,8 +212,8 @@ TOOLSETS = {
     },
 
     "pnc_agents": {
-        "description": "PNC/MCU domain agents on the mini VM: generate DBC outputs and parse bus data",
-        "tools": ["generate_dbc", "parse_bus_data"],
+        "description": "PNC/MCU domain agents on the mini VM: smoke-check user/worktree mapping, generate DBC outputs, and parse bus data",
+        "tools": ["pnc_agents_smoke", "generate_dbc", "parse_bus_data"],
         "includes": []
     },
 
@@ -286,8 +286,7 @@ TOOLSETS = {
             "cronjob",
             # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
             "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
-            # PNC/MCU domain agents on the mini VM
-            "generate_dbc", "parse_bus_data",
+            # PNC/MCU domain agents are scoped to Feishu and explicit pnc_agents toolsets.
 
         ],
         "includes": []
@@ -367,7 +366,7 @@ TOOLSETS = {
 
     "hermes-feishu": {
         "description": "Feishu/Lark bot toolset - enterprise messaging via Feishu/Lark (full access)",
-        "tools": _HERMES_CORE_TOOLS,
+        "tools": _HERMES_CORE_TOOLS + ["pnc_agents_smoke", "generate_dbc", "parse_bus_data", "vm_task_submit"],
         "includes": []
     },
 

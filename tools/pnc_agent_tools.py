@@ -90,13 +90,13 @@ def _resolve_user_name_from_id(user_id: str | None) -> str:
 
 
 def _resolve_user_from_session(user_id_override: str = "") -> str:
-    """Resolve the Feishu sender to the canonical VM user name when possible."""
-    user_name = _current_session_user_name()
-    if user_name:
-        return user_name
-
+    """Resolve the sender to a canonical VM user name, preferring stable user_id."""
     user_id = str(user_id_override or _current_session_user_id()).strip()
-    return _resolve_user_name_from_id(user_id)
+    mapped_user = _resolve_user_name_from_id(user_id)
+    if mapped_user:
+        return mapped_user
+
+    return _current_session_user_name()
 
 
 def _allow_debug_user_override() -> bool:
@@ -127,6 +127,27 @@ def _check_pnc_permission(agent_name: str, user: str, user_id: str = "") -> str 
     if role not in {"owner", "admin", "senior"}:
         return f"permission denied for {agent_name}: role {role!r} is not allowed to run PNC VM tools"
     return None
+
+
+def _build_remote_path_checks(args: dict[str, Any]) -> list[str]:
+    lines = [
+        "WORKTREE_REAL=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' \"$WORKTREE_PATH\")",
+        "case \"$WORKTREE_REAL\" in /home/mini/worktrees/pnc_specs/*) ;; *) echo \"unsafe worktree path for PNC tools: $WORKTREE_REAL\" >&2; exit 3 ;; esac",
+    ]
+    for key in ("input", "output", "regression"):
+        value = args.get(key)
+        if not value:
+            continue
+        value_q = shlex.quote(str(value))
+        key_q = shlex.quote(key)
+        lines.extend(
+            [
+                f"RAW_PATH={value_q}",
+                "REAL_PATH=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' \"$RAW_PATH\")",
+                "case \"$REAL_PATH\" in \"$WORKTREE_REAL\"|\"$WORKTREE_REAL\"/*) ;; *) echo \"path outside resolved worktree for " + key_q + ": $RAW_PATH -> $REAL_PATH\" >&2; exit 3 ;; esac",
+            ]
+        )
+    return lines
 
 
 def _build_remote_script(agent_name: str, args: dict[str, Any], user_id: str = "") -> str:
@@ -166,6 +187,7 @@ def _build_remote_script(agent_name: str, args: dict[str, Any], user_id: str = "
                 f"AGENT_ROOT=\"$WORKTREE_PATH/{REMOTE_AGENT_SUBDIR}\"",
             ]
         )
+        lines.extend(_build_remote_path_checks(args))
 
     lines.extend(
         [
@@ -178,6 +200,31 @@ def _build_remote_script(agent_name: str, args: dict[str, Any], user_id: str = "
         ]
     )
     return "\n".join(lines)
+
+
+def _parse_json_payload(text: str) -> dict[str, Any]:
+    """Parse ssh-mini-agent JSON output, tolerating transport warnings before it."""
+    raw = (text or "").strip()
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        payload = None
+        for line in raw.splitlines():
+            candidate = line.strip()
+            if not candidate.startswith(("{", "[")):
+                continue
+            try:
+                payload = json.loads(candidate)
+                break
+            except json.JSONDecodeError:
+                continue
+        if payload is None:
+            raise
+    if not isinstance(payload, dict):
+        return {"result": payload}
+    return payload
 
 
 def _run_remote_agent(agent_name: str, args: dict[str, Any], user_id: str = "") -> str:
@@ -237,7 +284,7 @@ def _run_remote_agent(agent_name: str, args: dict[str, Any], user_id: str = "") 
         )
 
     try:
-        payload = json.loads(completed.stdout.strip() or "{}")
+        payload = _parse_json_payload(completed.stdout)
     except json.JSONDecodeError:
         return tool_error(
             "ssh-mini-agent returned non-JSON output",
@@ -246,10 +293,105 @@ def _run_remote_agent(agent_name: str, args: dict[str, Any], user_id: str = "") 
             stderr=_tail(completed.stderr),
         )
 
-    if not isinstance(payload, dict):
-        payload = {"result": payload}
-
     return tool_result({"ok": True, "agent": agent_name, **payload})
+
+
+def _build_smoke_script(user: str, repo: str, branch: str = "") -> str:
+    manager_q = shlex.quote(REMOTE_WORKTREE_MANAGER)
+    user_q = shlex.quote(user)
+    repo_q = shlex.quote(repo)
+    ensure_cmd = f"python3 {manager_q} ensure {user_q} {repo_q}"
+    if branch:
+        ensure_cmd += f" --branch {shlex.quote(branch)}"
+    return "\n".join(
+        [
+            "set -euo pipefail",
+            f"ENSURE_JSON=$({ensure_cmd})",
+            "WORKTREE_PATH=$(python3 -c 'import json,sys; data=json.loads(sys.argv[1]); print(data.get(\"path\", \"\"))' \"$ENSURE_JSON\")",
+            "if [[ -z \"$WORKTREE_PATH\" ]]; then",
+            "  echo \"failed to resolve worktree: $ENSURE_JSON\" >&2",
+            "  exit 2",
+            "fi",
+            f"AGENT_ROOT=\"$WORKTREE_PATH/{REMOTE_AGENT_SUBDIR}\"",
+            "AGENT_ROOT_EXISTS=false",
+            "GENERATE_DBC_EXECUTABLE=false",
+            "PARSE_BUS_DATA_EXECUTABLE=false",
+            "[[ -d \"$AGENT_ROOT\" ]] && AGENT_ROOT_EXISTS=true",
+            "[[ -x \"$AGENT_ROOT/generate-dbc\" ]] && GENERATE_DBC_EXECUTABLE=true",
+            "[[ -x \"$AGENT_ROOT/parse-bus-data\" ]] && PARSE_BUS_DATA_EXECUTABLE=true",
+            "python3 - <<'PY' \"$ENSURE_JSON\" \"$WORKTREE_PATH\" \"$AGENT_ROOT\" \"$AGENT_ROOT_EXISTS\" \"$GENERATE_DBC_EXECUTABLE\" \"$PARSE_BUS_DATA_EXECUTABLE\"",
+            "import json, sys",
+            "ensure_json = json.loads(sys.argv[1])",
+            "payload = {",
+            "    'ok': True,",
+            "    'ensure_json': ensure_json,",
+            "    'worktree_path': sys.argv[2],",
+            "    'agent_root': sys.argv[3],",
+            "    'agent_root_exists': sys.argv[4] == 'true',",
+            "    'generate_dbc_executable': sys.argv[5] == 'true',",
+            "    'parse_bus_data_executable': sys.argv[6] == 'true',",
+            "}",
+            "print(json.dumps(payload, ensure_ascii=False))",
+            "PY",
+        ]
+    )
+
+
+def pnc_agents_smoke_tool(args: dict[str, Any], user_id: str = "", **_: Any) -> str:
+    """Safely verify PNC user resolution and VM worktree/tool-root availability."""
+    args = args or {}
+    timeout = _coerce_timeout(args.get("timeout") or 60)
+    user = _resolve_execution_user(args, user_id=user_id)
+    if not user:
+        return tool_error(
+            "Unable to resolve Feishu user for PNC VM worktree; refusing to use a shared fallback",
+            agent="pnc_agents_smoke",
+        )
+    permission_error = _check_pnc_permission("pnc_agents_smoke", user, user_id=user_id)
+    if permission_error:
+        return tool_error(permission_error, agent="pnc_agents_smoke")
+    repo = DEFAULT_REPO
+    branch = ""
+    if _allow_debug_user_override():
+        repo = str(args.get("repo") or DEFAULT_REPO).strip() or DEFAULT_REPO
+        branch = str(args.get("branch") or "").strip()
+    script = _build_smoke_script(user, repo, branch=branch)
+    try:
+        completed = subprocess.run(
+            [LOCAL_WRAPPER, "run_bash_json"],
+            input=script,
+            text=True,
+            capture_output=True,
+            timeout=timeout + 5,
+            check=False,
+        )
+    except FileNotFoundError:
+        return tool_error(f"local wrapper not found: {LOCAL_WRAPPER}", agent="pnc_agents_smoke")
+    except subprocess.TimeoutExpired as exc:
+        return tool_error(
+            f"pnc_agents_smoke timed out after {timeout} seconds",
+            agent="pnc_agents_smoke",
+            stdout=_tail(exc.stdout or ""),
+            stderr=_tail(exc.stderr or ""),
+        )
+    if completed.returncode != 0:
+        return tool_error(
+            "pnc_agents_smoke invocation failed",
+            agent="pnc_agents_smoke",
+            exit_code=completed.returncode,
+            stdout=_tail(completed.stdout),
+            stderr=_tail(completed.stderr),
+        )
+    try:
+        payload = _parse_json_payload(completed.stdout)
+    except json.JSONDecodeError:
+        return tool_error(
+            "ssh-mini-agent returned non-JSON output",
+            agent="pnc_agents_smoke",
+            stdout=_tail(completed.stdout),
+            stderr=_tail(completed.stderr),
+        )
+    return tool_result({"ok": True, "agent": "pnc_agents_smoke", "user": user, "repo": repo, **payload})
 
 
 def generate_dbc_tool(args: dict[str, Any], user_id: str = "", **_: Any) -> str:
@@ -283,6 +425,31 @@ _COMMON_PROPERTIES = {
     "regression": {"type": "string", "description": "Absolute path on the mini VM to the regression directory."},
     "timeout": {"type": "integer", "description": "Maximum runtime in seconds, default 300, capped at 1800."},
 }
+
+registry.register(
+    name="pnc_agents_smoke",
+    toolset="pnc_agents",
+    schema={
+        "name": "pnc_agents_smoke",
+        "description": (
+            "Safely verify PNC VM tool routing without running domain agents: "
+            "map the gateway sender to the user's pnc_specs worktree, run ensure, "
+            "and check the tool root/executables."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "timeout": {"type": "integer", "description": "Maximum runtime in seconds, default 60, capped at 1800."},
+            },
+        },
+    },
+    handler=pnc_agents_smoke_tool,
+    check_fn=check_requirements,
+    description="Smoke-check PNC VM user/worktree/tool-root routing without running domain agents",
+    emoji="🧪",
+    max_result_size_chars=20000,
+)
+
 
 registry.register(
     name="generate_dbc",

@@ -3115,11 +3115,12 @@ class TestFeishuApprovalCards(unittest.TestCase):
 
         payload = json.loads(adapter._feishu_send_with_retry.await_args.kwargs["payload"])
         actions = payload["elements"][1]["actions"]
-        self.assertEqual(actions[0]["tag"], "select_static")
-        option_texts = [item["text"]["content"] for item in actions[0]["options"]]
-        self.assertEqual(option_texts, ["Owner", "Admin", "Senior", "Member"])
+        self.assertEqual([action["tag"] for action in actions], ["button", "button", "button"])
+        action_names = [action["value"]["hermes_action"] for action in actions]
+        self.assertEqual(action_names, ["grant_permission", "grant_permission", "deny"])
         self.assertEqual(actions[0]["value"]["requested_role"], "senior")
-        self.assertEqual(actions[1]["value"]["hermes_action"], "grant_permission")
+        self.assertEqual(actions[1]["value"]["requested_role"], "member")
+        self.assertEqual(actions[2]["value"]["hermes_action"], "deny")
         body = payload["elements"][0]["content"]
         self.assertIn("Applicant", body)
         self.assertIn("Source chat", body)
@@ -3207,6 +3208,7 @@ class TestFeishuApprovalCards(unittest.TestCase):
         action_value = {
             "approval_id": 12,
             "hermes_action": "grant_permission",
+            "requested_role": "member",
         }
 
         class _Response:
@@ -3236,7 +3238,8 @@ class TestFeishuApprovalCards(unittest.TestCase):
         self.assertIn("Granted permission", card_json)
         self.assertIn("胡子豪", card_json)
         self.assertIn("张三", card_json)
-        self.assertIn("senior", card_json.lower())
+        self.assertIn("member", card_json.lower())
+        self.assertEqual(adapter._approval_state[12]["requested_role"], "member")
 
     @patch.dict(os.environ, {}, clear=True)
     def test_group_permission_request_sends_ack_and_approval_card(self):

@@ -12,6 +12,43 @@ from typing import Any, Dict
 from hermes_constants import get_hermes_home
 from tools.registry import registry
 
+
+def _session_value(name: str) -> str:
+    try:
+        from gateway.session_context import get_session_env
+
+        return (get_session_env(name, "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _resolve_submitter(user_id: str = "") -> tuple[str, str]:
+    resolved_user_id = str(user_id or _session_value("HERMES_SESSION_USER_ID")).strip()
+    user_name = _session_value("HERMES_SESSION_USER_NAME")
+    if resolved_user_id:
+        try:
+            from tools.permission_policy import _load_config
+
+            mapped = _load_config().get("user_id_mapping", {}).get(resolved_user_id)
+            if mapped:
+                user_name = str(mapped).strip()
+        except Exception:
+            pass
+    return user_name, resolved_user_id
+
+
+def _check_vm_task_permission(user_name: str, user_id: str = "") -> str | None:
+    try:
+        from tools.permission_policy import get_user_role, get_user_role_by_id
+
+        role = get_user_role_by_id(user_id) if user_id else get_user_role(user_name)
+    except Exception as exc:
+        return f"permission policy unavailable for vm_task_submit; refusing VM task submission: {exc}"
+    if role not in {"owner", "admin", "senior"}:
+        return f"permission denied for vm_task_submit: role {role!r} is not allowed to submit VM worker tasks"
+    return None
+
+
 _DEFAULT_BRIDGE_ROOT = Path.home() / "Mounts" / "mini_root" / "tmp" / "openclaw-shared-state"
 
 VM_TASK_SUBMIT_SCHEMA = {
@@ -33,7 +70,7 @@ VM_TASK_SUBMIT_SCHEMA = {
             },
             "owner": {
                 "type": "string",
-                "description": "Optional owner/requester label.",
+                "description": "Optional requester label. Ignored in gateway sessions; trusted session identity is used instead.",
             },
         },
         "required": ["title", "goal"],
@@ -49,11 +86,18 @@ def _python_executable() -> str:
     return shutil.which("python3.11") or shutil.which("python3") or "python3"
 
 
-def vm_task_submit(title: str, goal: str, owner: str = "") -> Dict[str, Any]:
+def vm_task_submit(title: str, goal: str, owner: str = "", user_id: str = "") -> Dict[str, Any]:
     """Create and bridge-deliver a shared-state v2 task for VM worker pickup."""
     title = str(title or "").strip()
     goal = str(goal or "").strip()
-    owner = str(owner or "").strip()
+    trusted_user_name, trusted_user_id = _resolve_submitter(user_id)
+    if trusted_user_name or trusted_user_id:
+        permission_error = _check_vm_task_permission(trusted_user_name, trusted_user_id)
+        if permission_error:
+            return {"success": False, "error": permission_error, "returncode": None}
+        owner = trusted_user_name or trusted_user_id
+    else:
+        owner = str(owner or "").strip()
     if not title:
         return {"success": False, "error": "title is required"}
     if not goal:
@@ -126,8 +170,8 @@ def vm_task_submit(title: str, goal: str, owner: str = "") -> Dict[str, Any]:
     }
 
 
-def vm_task_submit_json(title: str, goal: str, owner: str = "") -> str:
-    return json.dumps(vm_task_submit(title=title, goal=goal, owner=owner), ensure_ascii=False)
+def vm_task_submit_json(title: str, goal: str, owner: str = "", user_id: str = "") -> str:
+    return json.dumps(vm_task_submit(title=title, goal=goal, owner=owner, user_id=user_id), ensure_ascii=False)
 
 
 registry.register(
@@ -138,6 +182,7 @@ registry.register(
         title=args.get("title", ""),
         goal=args.get("goal", ""),
         owner=args.get("owner", ""),
+        user_id=kw.get("user_id", ""),
     ),
     emoji="🛰️",
 )

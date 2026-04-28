@@ -96,6 +96,29 @@ class TestHandleFunctionCall:
         assert result == {"ok": True}
         assert captured["kwargs"]["user_id"] == "ou_guo"
 
+    def test_pnc_agents_smoke_receives_user_id_from_handle_function_call(self, monkeypatch):
+        captured = {}
+
+        def fake_dispatch(name, args, **kwargs):
+            captured.update(name=name, args=args, kwargs=kwargs)
+            return json.dumps({"ok": True, "agent": name, "user": "郭艳彬"})
+
+        monkeypatch.setattr("model_tools.registry.dispatch", fake_dispatch)
+
+        result = json.loads(
+            handle_function_call(
+                "pnc_agents_smoke",
+                {"timeout": 30},
+                task_id="task-1",
+                user_id="ou_be96d63ed3b673924ab9ee0724b4b549",
+            )
+        )
+
+        assert result["ok"] is True
+        assert captured["name"] == "pnc_agents_smoke"
+        assert captured["args"] == {"timeout": 30}
+        assert captured["kwargs"]["user_id"] == "ou_be96d63ed3b673924ab9ee0724b4b549"
+
 
 # =========================================================================
 # Agent loop tools

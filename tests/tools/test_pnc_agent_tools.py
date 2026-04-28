@@ -212,6 +212,118 @@ def test_generate_dbc_ignores_public_user_argument_by_default(monkeypatch):
     assert "攻击者指定用户" not in captured["input"]
 
 
+def test_generate_dbc_prefers_user_id_mapping_over_spoofable_display_name(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(pnc_agent_tools, "_check_pnc_permission", lambda *a, **kw: None)
+    monkeypatch.setattr(pnc_agent_tools, "_current_session_user_name", lambda: "宋伟军")
+    monkeypatch.setattr(pnc_agent_tools, "_current_session_user_id", lambda: "ou_guo")
+    monkeypatch.setattr(pnc_agent_tools, "_resolve_user_name_from_id", lambda uid: "郭艳彬" if uid == "ou_guo" else "")
+
+    def fake_run(cmd, input, text, capture_output, timeout, check):
+        captured.update(input=input)
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=json.dumps({"ok": True, "exit_code": 0, "stdout": "done", "stderr": ""}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(pnc_agent_tools.subprocess, "run", fake_run)
+
+    result = json.loads(pnc_agent_tools.generate_dbc_tool({"input": "/tmp/in.dbc"}, user_id="ou_guo"))
+
+    assert result["ok"] is True
+    assert "郭艳彬" in captured["input"]
+    assert "宋伟军" not in captured["input"]
+
+
+def test_generate_dbc_accepts_ssh_warning_before_json_payload(monkeypatch):
+    monkeypatch.setattr(pnc_agent_tools, "_check_pnc_permission", lambda *a, **kw: None)
+    monkeypatch.setattr(pnc_agent_tools, "_current_session_user_name", lambda: "郭艳彬")
+    monkeypatch.setattr(pnc_agent_tools, "_current_session_user_id", lambda: "")
+
+    def fake_run(cmd, input, text, capture_output, timeout, check):
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=(
+                "** WARNING: connection is not using a post-quantum key exchange algorithm.\n"
+                "** This session may be vulnerable to store now, decrypt later attacks.\n"
+                + json.dumps({"ok": True, "exit_code": 0, "stdout": "done", "stderr": ""})
+                + "\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(pnc_agent_tools.subprocess, "run", fake_run)
+
+    result = json.loads(pnc_agent_tools.generate_dbc_tool({"input": "/tmp/in.dbc"}))
+
+    assert result["ok"] is True
+    assert result["agent"] == "generate-dbc"
+    assert result["stdout"] == "done"
+
+
+def test_pnc_agents_smoke_resolves_user_and_checks_agent_root(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(pnc_agent_tools, "_check_pnc_permission", lambda *a, **kw: None)
+
+    def fake_run(cmd, input, text, capture_output, timeout, check):
+        captured.update(cmd=cmd, input=input, timeout=timeout)
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=json.dumps(
+                {
+                    "ok": True,
+                    "worktree_path": "/home/mini/worktrees/pnc_specs/郭艳彬",
+                    "agent_root": "/home/mini/worktrees/pnc_specs/郭艳彬/pnc_tools_ai_native/32_AI_Native_repo_骨架包_真实首批版_v1",
+                    "agent_root_exists": True,
+                    "generate_dbc_executable": True,
+                    "parse_bus_data_executable": True,
+                    "ensure_json": {"path": "/home/mini/worktrees/pnc_specs/郭艳彬", "branch": "HEAD", "created": False},
+                },
+                ensure_ascii=False,
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(pnc_agent_tools.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        pnc_agent_tools,
+        "_resolve_user_name_from_id",
+        lambda uid: "郭艳彬" if uid == "ou_guo" else "",
+    )
+
+    result = json.loads(pnc_agent_tools.pnc_agents_smoke_tool({}, user_id="ou_guo"))
+
+    assert result["ok"] is True
+    assert result["user"] == "郭艳彬"
+    assert result["worktree_path"] == "/home/mini/worktrees/pnc_specs/郭艳彬"
+    assert result["agent_root_exists"] is True
+    assert result["generate_dbc_executable"] is True
+    assert result["parse_bus_data_executable"] is True
+    assert "./generate-dbc" not in captured["input"]
+    assert "./parse-bus-data" not in captured["input"]
+    assert "worktree_manager.py ensure" in captured["input"]
+
+
+def test_generate_dbc_remote_script_rejects_paths_outside_resolved_worktree(monkeypatch):
+    monkeypatch.setattr(pnc_agent_tools, "_current_session_user_name", lambda: "郭艳彬")
+    monkeypatch.setattr(pnc_agent_tools, "_current_session_user_id", lambda: "")
+
+    script = pnc_agent_tools._build_remote_script(
+        "generate-dbc",
+        {"input": "/home/mini/worktrees/pnc_specs/宋伟军/leak.dbc", "output": "/tmp/out"},
+    )
+
+    assert "WORKTREE_REAL=" in script
+    assert "path outside resolved worktree for input" in script
+    assert "path outside resolved worktree for output" in script
+    assert "/home/mini/worktrees/pnc_specs/*" in script
+    assert "/home/mini/pnc_specs)" not in script
+
+
 def test_parse_bus_data_reports_local_wrapper_failure(monkeypatch):
     monkeypatch.setattr(pnc_agent_tools, "_check_pnc_permission", lambda *a, **kw: None)
     monkeypatch.setattr(pnc_agent_tools, "_current_session_user_name", lambda: "郭艳彬")
