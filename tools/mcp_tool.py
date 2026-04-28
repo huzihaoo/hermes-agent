@@ -71,6 +71,7 @@ Thread safety:
 
 import asyncio
 import concurrent.futures
+import contextlib
 import inspect
 import json
 import logging
@@ -83,6 +84,39 @@ import time
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def _stdio_errlog_for_server(server_name: str, config: dict):
+    """Return an errlog sink for MCP stdio subprocess stderr.
+
+    The MCP SDK defaults child stderr to the parent terminal.  That is useful
+    when debugging a single server, but in Hermes' TUI it corrupts the terminal
+    with JSON logs from noisy servers (notably @hibson/mcp-feishu-doc).  Default
+    to a per-server log file while leaving an opt-in escape hatch:
+
+        mcp_servers.<name>.stderr: inherit | file | null
+        mcp_servers.<name>.stderr_log_path: /custom/path.log
+    """
+    mode = str(config.get("stderr", config.get("errlog", "file")) or "file").strip().lower()
+    if mode in {"inherit", "terminal", "tty"}:
+        yield None
+        return
+
+    if mode in {"null", "none", "discard", "devnull"}:
+        with open(os.devnull, "w", encoding="utf-8") as fh:
+            yield fh
+        return
+
+    hermes_home = os.path.expanduser(os.environ.get("HERMES_HOME", "~/.hermes"))
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(server_name)).strip("._") or "server"
+    log_path = os.path.expanduser(
+        str(config.get("stderr_log_path") or os.path.join(hermes_home, "logs", "mcp", f"{safe_name}.stderr.log"))
+    )
+    log_dir = os.path.dirname(log_path) or "."
+    os.makedirs(log_dir, exist_ok=True)
+    with open(log_path, "a", buffering=1, encoding="utf-8", errors="replace") as fh:
+        yield fh
 
 # ---------------------------------------------------------------------------
 # Graceful import -- MCP SDK is an optional dependency
@@ -921,18 +955,24 @@ class MCPServerTask:
 
         # Snapshot child PIDs before spawning so we can track the new one.
         pids_before = _snapshot_child_pids()
-        async with stdio_client(server_params) as (read_stream, write_stream):
-            # Capture the newly spawned subprocess PID for force-kill cleanup.
-            new_pids = _snapshot_child_pids() - pids_before
-            if new_pids:
-                with _lock:
-                    _stdio_pids.update(new_pids)
-            async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
-                await session.initialize()
-                self.session = session
-                await self._discover_tools()
-                self._ready.set()
-                await self._shutdown_event.wait()
+        with _stdio_errlog_for_server(self.name, config) as errlog:
+            client_cm = (
+                stdio_client(server_params)
+                if errlog is None
+                else stdio_client(server_params, errlog=errlog)
+            )
+            async with client_cm as (read_stream, write_stream):
+                # Capture the newly spawned subprocess PID for force-kill cleanup.
+                new_pids = _snapshot_child_pids() - pids_before
+                if new_pids:
+                    with _lock:
+                        _stdio_pids.update(new_pids)
+                async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
+                    await session.initialize()
+                    self.session = session
+                    await self._discover_tools()
+                    self._ready.set()
+                    await self._shutdown_event.wait()
         # Context exited cleanly — subprocess was terminated by the SDK.
         if new_pids:
             with _lock:

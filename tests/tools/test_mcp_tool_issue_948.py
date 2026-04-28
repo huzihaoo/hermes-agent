@@ -95,3 +95,141 @@ def test_run_stdio_uses_resolved_command_and_prepended_path(tmp_path):
             await server.shutdown()
 
     asyncio.run(_test())
+
+
+def test_run_stdio_redirects_child_stderr_to_configured_file(tmp_path):
+    log_path = tmp_path / "mcp" / "srv.stderr.log"
+
+    mock_session = MagicMock()
+    mock_session.initialize = AsyncMock()
+    mock_session.list_tools = AsyncMock(return_value=SimpleNamespace(tools=[]))
+
+    mock_stdio_cm = MagicMock()
+    mock_stdio_cm.__aenter__ = AsyncMock(return_value=(object(), object()))
+    mock_stdio_cm.__aexit__ = AsyncMock(return_value=False)
+
+    mock_session_cm = MagicMock()
+    mock_session_cm.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session_cm.__aexit__ = AsyncMock(return_value=False)
+
+    async def _test():
+        with patch("tools.osv_check.check_package_for_malware", return_value=None), \
+             patch("tools.mcp_tool._resolve_stdio_command", return_value=("/bin/echo", {"PATH": "/usr/bin"})), \
+             patch("tools.mcp_tool.stdio_client", return_value=mock_stdio_cm) as mock_stdio, \
+             patch("tools.mcp_tool.ClientSession", return_value=mock_session_cm):
+            server = MCPServerTask("srv")
+            await server.start({
+                "command": "echo",
+                "args": [],
+                "env": {"PATH": "/usr/bin"},
+                "stderr_log_path": str(log_path),
+            })
+
+            _, call_kwargs = mock_stdio.call_args
+            assert "errlog" in call_kwargs
+            assert call_kwargs["errlog"].name == str(log_path)
+            assert log_path.parent.exists()
+
+            await server.shutdown()
+
+    asyncio.run(_test())
+
+
+def test_run_stdio_can_opt_in_to_inherited_stderr(tmp_path):
+    mock_session = MagicMock()
+    mock_session.initialize = AsyncMock()
+    mock_session.list_tools = AsyncMock(return_value=SimpleNamespace(tools=[]))
+
+    mock_stdio_cm = MagicMock()
+    mock_stdio_cm.__aenter__ = AsyncMock(return_value=(object(), object()))
+    mock_stdio_cm.__aexit__ = AsyncMock(return_value=False)
+
+    mock_session_cm = MagicMock()
+    mock_session_cm.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session_cm.__aexit__ = AsyncMock(return_value=False)
+
+    async def _test():
+        with patch("tools.osv_check.check_package_for_malware", return_value=None), \
+             patch("tools.mcp_tool._resolve_stdio_command", return_value=("/bin/echo", {"PATH": "/usr/bin"})), \
+             patch("tools.mcp_tool.stdio_client", return_value=mock_stdio_cm) as mock_stdio, \
+             patch("tools.mcp_tool.ClientSession", return_value=mock_session_cm):
+            server = MCPServerTask("srv")
+            await server.start({
+                "command": "echo",
+                "args": [],
+                "env": {"PATH": "/usr/bin"},
+                "stderr": "inherit",
+            })
+
+            _, call_kwargs = mock_stdio.call_args
+            assert "errlog" not in call_kwargs
+
+            await server.shutdown()
+
+    asyncio.run(_test())
+
+
+def test_run_stdio_uses_default_stderr_log_path_under_hermes_home(tmp_path):
+    mock_session = MagicMock()
+    mock_session.initialize = AsyncMock()
+    mock_session.list_tools = AsyncMock(return_value=SimpleNamespace(tools=[]))
+
+    mock_stdio_cm = MagicMock()
+    mock_stdio_cm.__aenter__ = AsyncMock(return_value=(object(), object()))
+    mock_stdio_cm.__aexit__ = AsyncMock(return_value=False)
+
+    mock_session_cm = MagicMock()
+    mock_session_cm.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session_cm.__aexit__ = AsyncMock(return_value=False)
+
+    async def _test():
+        with patch.dict("os.environ", {"HERMES_HOME": str(tmp_path)}, clear=False), \
+             patch("tools.osv_check.check_package_for_malware", return_value=None), \
+             patch("tools.mcp_tool._resolve_stdio_command", return_value=("/bin/echo", {"PATH": "/usr/bin"})), \
+             patch("tools.mcp_tool.stdio_client", return_value=mock_stdio_cm) as mock_stdio, \
+             patch("tools.mcp_tool.ClientSession", return_value=mock_session_cm):
+            server = MCPServerTask("srv/name")
+            await server.start({"command": "echo", "args": [], "env": {"PATH": "/usr/bin"}})
+
+            _, call_kwargs = mock_stdio.call_args
+            expected = tmp_path / "logs" / "mcp" / "srv_name.stderr.log"
+            assert call_kwargs["errlog"].name == str(expected)
+            assert expected.parent.exists()
+
+            await server.shutdown()
+
+    asyncio.run(_test())
+
+
+def test_run_stdio_can_discard_child_stderr_with_devnull(tmp_path):
+    mock_session = MagicMock()
+    mock_session.initialize = AsyncMock()
+    mock_session.list_tools = AsyncMock(return_value=SimpleNamespace(tools=[]))
+
+    mock_stdio_cm = MagicMock()
+    mock_stdio_cm.__aenter__ = AsyncMock(return_value=(object(), object()))
+    mock_stdio_cm.__aexit__ = AsyncMock(return_value=False)
+
+    mock_session_cm = MagicMock()
+    mock_session_cm.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session_cm.__aexit__ = AsyncMock(return_value=False)
+
+    async def _test():
+        with patch("tools.osv_check.check_package_for_malware", return_value=None), \
+             patch("tools.mcp_tool._resolve_stdio_command", return_value=("/bin/echo", {"PATH": "/usr/bin"})), \
+             patch("tools.mcp_tool.stdio_client", return_value=mock_stdio_cm) as mock_stdio, \
+             patch("tools.mcp_tool.ClientSession", return_value=mock_session_cm):
+            server = MCPServerTask("srv")
+            await server.start({
+                "command": "echo",
+                "args": [],
+                "env": {"PATH": "/usr/bin"},
+                "stderr": "null",
+            })
+
+            _, call_kwargs = mock_stdio.call_args
+            assert call_kwargs["errlog"].name == os.devnull
+
+            await server.shutdown()
+
+    asyncio.run(_test())
