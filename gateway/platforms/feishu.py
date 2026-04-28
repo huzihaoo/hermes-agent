@@ -181,14 +181,39 @@ _APPROVAL_CHOICE_MAP: Dict[str, str] = {
     "approve_session": "session",
     "approve_always": "always",
     "deny": "deny",
+    "grant_senior": "grant_senior",
+    "grant_permission": "grant_permission",
+    "select_requested_role": "select_requested_role",
 }
 _APPROVAL_LABEL_MAP: Dict[str, str] = {
     "once": "Approved once",
     "session": "Approved for session",
-    "always": "Approved permanently",
+    "always": "Approved always",
     "deny": "Denied",
+    "grant_senior": "Granted senior access",
+    "grant_permission": "Granted permission",
+    "select_requested_role": "Requested role updated",
 }
-_FEISHU_BOT_MSG_TRACK_SIZE = 512                   # LRU size for tracking sent message IDs
+_PERMISSION_GRANT_ROLE_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("owner", "Owner"),
+    ("admin", "Admin"),
+    ("senior", "Senior"),
+    ("member", "Member"),
+)
+_PERMISSION_GRANT_ALLOWED_ROLES = {role for role, _label in _PERMISSION_GRANT_ROLE_OPTIONS}
+_PERMISSION_REQUEST_TEXT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?:开通|申请|给我|帮我).{0,8}(?:权限|访问|角色)", re.IGNORECASE),
+    re.compile(r"(?:我是|我叫|叫我).{1,20}(?:开通|申请).{0,8}(?:权限|访问|角色)", re.IGNORECASE),
+    re.compile(r"permission\s*(?:grant|access|role)", re.IGNORECASE),
+)
+_PERMISSION_REQUEST_ROLE_HINTS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"(?:高级用户|高级权限|高级角色|senior|高级)", re.IGNORECASE), "senior"),
+    (re.compile(r"(?:管理员|管理权限|admin)", re.IGNORECASE), "admin"),
+    (re.compile(r"(?:普通用户|普通权限|member)", re.IGNORECASE), "member"),
+)
+_FEISHU_PERMISSION_REQUEST_DEDUP_TTL_SECONDS = 5 * 60
+_PERMISSION_REQUEST_ACK_TEXT = "已收到你的权限申请，正在等待管理员审批。审批通过后我会继续为你开通。"
+
 _FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003})  # reply target withdrawn/missing → create fallback
 _FEISHU_ACK_EMOJI = "OK"
 
@@ -1091,6 +1116,7 @@ class FeishuAdapter(BasePlatformAdapter):
         # Exec approval button state (approval_id → {session_key, message_id, chat_id})
         self._approval_state: Dict[int, Dict[str, str]] = {}
         self._approval_counter = itertools.count(1)
+        self._permission_request_seen: Dict[str, float] = {}
         # Approval timeout callbacks (session_key → callback)
         self._approval_callbacks: Dict[str, Any] = {}
         self._load_seen_message_ids()
@@ -1535,6 +1561,13 @@ class FeishuAdapter(BasePlatformAdapter):
             self._gc_stale_approval_state()
             approval_id = next(self._approval_counter)
             cmd_preview = command[:3000] + "..." if len(command) > 3000 else command
+            approval_kind = str((metadata or {}).get("approval_kind") or "exec").strip().lower()
+            requested_role = str((metadata or {}).get("requested_role") or "").strip().lower()
+            target_user_id = str((metadata or {}).get("target_user_id") or "").strip()
+            target_user_name = str((metadata or {}).get("target_user_name") or "").strip()
+            request_chat_name = str((metadata or {}).get("request_chat_name") or "").strip()
+            request_message_id = str((metadata or {}).get("request_message_id") or "").strip()
+            request_text = str((metadata or {}).get("request_text") or "").strip()
 
             def _btn(label: str, action_name: str, btn_type: str = "default") -> dict:
                 return {
@@ -1544,25 +1577,69 @@ class FeishuAdapter(BasePlatformAdapter):
                     "value": {"hermes_action": action_name, "approval_id": approval_id},
                 }
 
+            if approval_kind == "permission_grant":
+                title = "🛂 Permission Grant Approval Required"
+                header_template = "orange"
+                role_value = requested_role if requested_role in _PERMISSION_GRANT_ALLOWED_ROLES else "member"
+                role_options = [
+                    {
+                        "text": {"tag": "plain_text", "content": label},
+                        "value": role,
+                    }
+                    for role, label in _PERMISSION_GRANT_ROLE_OPTIONS
+                ]
+                body = (
+                    f"**Applicant:** {target_user_name or '(unknown)'}\n"
+                    f"**User ID:** `{target_user_id or '(missing)'}`\n"
+                    f"**Requested role:** `{role_value}`\n"
+                    f"**Source chat:** {request_chat_name or '(unknown)'}\n"
+                    f"**Request message ID:** `{request_message_id or '(missing)'}`\n"
+                    f"**Requested action:** {description}\n"
+                    f"**Original request:** {request_text or description}"
+                )
+                actions = [
+                    {
+                        "tag": "select_static",
+                        "placeholder": {"tag": "plain_text", "content": "Select role"},
+                        "value": {
+                            "hermes_action": "select_requested_role",
+                            "approval_id": approval_id,
+                            "requested_role": role_value,
+                        },
+                        "options": role_options,
+                        "initial_option": next(
+                            (option for option in role_options if option["value"] == role_value),
+                            role_options[-1],
+                        ),
+                    },
+                    _btn("✅ Approve", "grant_permission", "primary"),
+                    _btn("❌ Deny", "deny", "danger"),
+                ]
+            else:
+                title = "⚠️ Command Approval Required"
+                header_template = "orange"
+                body = f"```\n{cmd_preview}\n```\n**Reason:** {description}"
+                actions = [
+                    _btn("✅ Allow Once", "approve_once", "primary"),
+                    _btn("✅ Session", "approve_session"),
+                    _btn("✅ Always", "approve_always"),
+                    _btn("❌ Deny", "deny", "danger"),
+                ]
+
             card = {
                 "config": {"wide_screen_mode": True},
                 "header": {
-                    "title": {"content": "⚠️ Command Approval Required", "tag": "plain_text"},
-                    "template": "orange",
+                    "title": {"content": title, "tag": "plain_text"},
+                    "template": header_template,
                 },
                 "elements": [
                     {
                         "tag": "markdown",
-                        "content": f"```\n{cmd_preview}\n```\n**Reason:** {description}",
+                        "content": body,
                     },
                     {
                         "tag": "action",
-                        "actions": [
-                            _btn("✅ Allow Once", "approve_once", "primary"),
-                            _btn("✅ Session", "approve_session"),
-                            _btn("✅ Always", "approve_always"),
-                            _btn("❌ Deny", "deny", "danger"),
-                        ],
+                        "actions": actions,
                     },
                 ],
             }
@@ -1583,6 +1660,14 @@ class FeishuAdapter(BasePlatformAdapter):
                     "message_id": result.message_id or "",
                     "chat_id": chat_id,
                     "created_at": time.monotonic(),
+                    "approval_kind": approval_kind,
+                    "target_user_id": target_user_id,
+                    "target_user_name": target_user_name,
+                    "requested_role": requested_role,
+                    "description": description,
+                    "request_chat_name": request_chat_name,
+                    "request_message_id": request_message_id,
+                    "request_text": request_text,
                 }
             return result
         except Exception as exc:
@@ -1597,10 +1682,39 @@ class FeishuAdapter(BasePlatformAdapter):
         self._approval_callbacks[session_key] = callback
 
     @staticmethod
-    def _build_resolved_approval_card(*, choice: str, user_name: str) -> Dict[str, Any]:
+    def _build_resolved_approval_card(
+        *,
+        choice: str,
+        user_name: str,
+        approval_kind: str = "exec",
+        target_user_name: str = "",
+        requested_role: str = "",
+    ) -> Dict[str, Any]:
         """Build raw card JSON for a resolved approval action."""
         icon = "❌" if choice == "deny" else "✅"
         label = _APPROVAL_LABEL_MAP.get(choice, "Resolved")
+        if approval_kind == "permission_grant":
+            resolved_role = requested_role or "member"
+            outcome_line = (
+                f"{icon} **{target_user_name or '该用户'}** 权限申请已通过\n"
+                f"**角色：** `{resolved_role}`\n"
+                f"**审批人：** {user_name}"
+                if choice != "deny"
+                else f"{icon} **{target_user_name or '该用户'}** 权限申请未通过\n**审批人：** {user_name}"
+            )
+            return {
+                "config": {"wide_screen_mode": True},
+                "header": {
+                    "title": {"content": f"{icon} {label}", "tag": "plain_text"},
+                    "template": "red" if choice == "deny" else "green",
+                },
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": outcome_line,
+                    },
+                ],
+            }
         return {
             "config": {"wide_screen_mode": True},
             "header": {
@@ -1611,6 +1725,25 @@ class FeishuAdapter(BasePlatformAdapter):
                 {
                     "tag": "markdown",
                     "content": f"{icon} **{label}** by {user_name}",
+                },
+            ],
+        }
+
+    @staticmethod
+    def _build_permission_role_updated_card(*, user_name: str, requested_role: str) -> Dict[str, Any]:
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"content": "📝 Requested role updated", "tag": "plain_text"},
+                "template": "blue",
+            },
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": (
+                        f"📝 **Requested role:** `{requested_role}`\n"
+                        f"Updated by {user_name}."
+                    ),
                 },
             ],
         }
@@ -2087,7 +2220,7 @@ class FeishuAdapter(BasePlatformAdapter):
             role = "member"
 
         if choice != "deny" and role == "member":
-            logger.warning(
+            logger.info(
                 "[Feishu] Blocking approval click from unauthorized member %s for approval %s",
                 open_id,
                 approval_id,
@@ -2102,6 +2235,24 @@ class FeishuAdapter(BasePlatformAdapter):
                 response.card = card
             return response
 
+        if choice == "select_requested_role":
+            state = self._approval_state.get(approval_id)
+            requested_role = str(action_value.get("requested_role") or "").strip().lower()
+            if state and requested_role in _PERMISSION_GRANT_ALLOWED_ROLES:
+                state["requested_role"] = requested_role
+            if P2CardActionTriggerResponse is None:
+                return None
+            response = P2CardActionTriggerResponse()
+            if CallBackCard is not None:
+                card = CallBackCard()
+                card.type = "raw"
+                card.data = self._build_permission_role_updated_card(
+                    user_name=user_name,
+                    requested_role=state.get("requested_role", requested_role) if state else requested_role,
+                )
+                response.card = card
+            return response
+
         self._submit_on_loop(loop, self._resolve_approval(approval_id, choice, user_name))
 
         if P2CardActionTriggerResponse is None:
@@ -2110,9 +2261,129 @@ class FeishuAdapter(BasePlatformAdapter):
         if CallBackCard is not None:
             card = CallBackCard()
             card.type = "raw"
-            card.data = self._build_resolved_approval_card(choice=choice, user_name=user_name)
+            state = self._approval_state.get(approval_id, {})
+            card.data = self._build_resolved_approval_card(
+                choice=choice,
+                user_name=user_name,
+                approval_kind=str(state.get("approval_kind") or "exec"),
+                target_user_name=str(state.get("target_user_name") or ""),
+                requested_role=str(state.get("requested_role") or ""),
+            )
             response.card = card
         return response
+
+    def _emit_permission_audit_event(
+        self,
+        *,
+        outcome: str,
+        state: Dict[str, Any],
+        approver_name: str,
+        applicant_notify_success: Optional[bool] = None,
+        group_broadcast_success: Optional[bool] = None,
+        reuse_hit: Optional[bool] = None,
+        dedup_hit: Optional[bool] = None,
+    ) -> None:
+        try:
+            from hermes_cli.config import get_hermes_home
+            from hermes_events import EventEmitter
+
+            trace_file = get_hermes_home() / "analytics" / "permission_approvals.jsonl"
+            EventEmitter(trace_file=trace_file).emit(
+                "permission_grant:resolved",
+                {
+                    "outcome": outcome,
+                    "approval_kind": str(state.get("approval_kind") or "permission_grant"),
+                    "target_user_id": str(state.get("target_user_id") or ""),
+                    "target_user_name": str(state.get("target_user_name") or ""),
+                    "requested_role": str(state.get("requested_role") or ""),
+                    "request_chat_id": str(state.get("request_chat_id") or ""),
+                    "request_chat_name": str(state.get("request_chat_name") or ""),
+                    "request_message_id": str(state.get("request_message_id") or ""),
+                    "request_text": str(state.get("request_text") or ""),
+                    "reused_approval_id": state.get("reused_approval_id"),
+                    "reused_approval_message_id": str(state.get("reused_approval_message_id") or ""),
+                    "approver_name": approver_name,
+                    "applicant_notify_success": applicant_notify_success,
+                    "group_broadcast_success": group_broadcast_success,
+                    "reuse_hit": reuse_hit,
+                    "dedup_hit": dedup_hit,
+                },
+            )
+        except Exception:
+            logger.debug("[Feishu] Failed to emit permission approval audit event", exc_info=True)
+
+    async def _broadcast_permission_request_result(self, state: Dict[str, Any], *, approved: bool) -> bool:
+        if self.config.extra.get("permission_result_broadcast_enabled") is False:
+            return False
+        request_chat_id = str(state.get("request_chat_id") or "").strip()
+        request_chat_name = str(state.get("request_chat_name") or "").strip()
+        if not request_chat_id:
+            return False
+        target_user_name = str(state.get("target_user_name") or "该用户").strip() or "该用户"
+        requested_role = str(state.get("requested_role") or "member").strip().lower() or "member"
+        text = (
+            f"{request_chat_name or '当前群组'}：{target_user_name} 的权限申请已通过，角色：{requested_role}。"
+            if approved
+            else f"{request_chat_name or '当前群组'}：{target_user_name} 的权限申请未通过。"
+        )
+        try:
+            result = await self.send(
+                chat_id=request_chat_id,
+                content=text,
+                reply_to=None,
+                metadata=None,
+            )
+            if not getattr(result, "success", False):
+                logger.warning(
+                    "[Feishu] Failed to broadcast permission request result for %s: %s",
+                    target_user_name,
+                    getattr(result, "error", None),
+                )
+                return False
+            return True
+        except Exception as exc:
+            logger.warning(
+                "[Feishu] Exception while broadcasting permission request result for %s: %s",
+                target_user_name,
+                exc,
+            )
+            return False
+
+    async def _notify_permission_request_result(self, state: Dict[str, Any], *, approved: bool) -> bool:
+        request_chat_id = str(state.get("request_chat_id") or "").strip()
+        if not request_chat_id:
+            return False
+        request_message_id = str(state.get("request_message_id") or "").strip() or None
+        request_thread_id = str(state.get("request_thread_id") or "").strip() or None
+        target_user_name = str(state.get("target_user_name") or "该用户").strip() or "该用户"
+        requested_role = str(state.get("requested_role") or "member").strip().lower() or "member"
+        text = (
+            f"你的权限申请已通过，已开通为 {requested_role}。"
+            if approved
+            else f"你的权限申请未通过，请联系管理员了解详情。"
+        )
+        try:
+            result = await self.send(
+                chat_id=request_chat_id,
+                content=text,
+                reply_to=request_message_id,
+                metadata={"thread_id": request_thread_id} if request_thread_id else None,
+            )
+            if not getattr(result, "success", False):
+                logger.warning(
+                    "[Feishu] Failed to notify permission request result for %s: %s",
+                    target_user_name,
+                    getattr(result, "error", None),
+                )
+                return False
+            return True
+        except Exception as exc:
+            logger.warning(
+                "[Feishu] Exception while notifying permission request result for %s: %s",
+                target_user_name,
+                exc,
+            )
+            return False
 
     async def _resolve_approval(self, approval_id: Any, choice: str, user_name: str) -> None:
         """Pop approval state and unblock the waiting agent thread."""
@@ -2125,6 +2396,60 @@ class FeishuAdapter(BasePlatformAdapter):
         session_key = state.get("session_key", "")
         if session_key:
             self._approval_callbacks.pop(session_key, None)
+
+        if choice == "deny":
+            if str(state.get("approval_kind") or "").strip().lower() == "permission_grant":
+                applicant_notify_success = await self._notify_permission_request_result(state, approved=False)
+                group_broadcast_success = await self._broadcast_permission_request_result(state, approved=False)
+                self._emit_permission_audit_event(
+                    outcome="denied",
+                    state=state,
+                    approver_name=user_name,
+                    applicant_notify_success=applicant_notify_success,
+                    group_broadcast_success=group_broadcast_success,
+                    reuse_hit=bool(state.get("reuse_hit")),
+                    dedup_hit=bool(state.get("dedup_hit")),
+                )
+            return
+
+        approval_kind = str(state.get("approval_kind") or "exec").strip().lower()
+        if choice in {"grant_senior", "grant_permission"} and approval_kind == "permission_grant":
+            try:
+                from gateway.pairing import PairingStore
+                from tools.permission_policy import map_user_id, set_user_role
+
+                target_user_id = str(state.get("target_user_id") or "").strip()
+                target_user_name = str(state.get("target_user_name") or "").strip()
+                requested_role = str(state.get("requested_role") or "member").strip().lower() or "member"
+
+                if not target_user_id or not target_user_name:
+                    raise ValueError("missing target user identity for permission grant")
+
+                role_value = requested_role if requested_role in _PERMISSION_GRANT_ALLOWED_ROLES else "member"
+                set_user_role(target_user_name, role_value)
+                map_user_id(target_user_name, target_user_id)
+                PairingStore().approve_user("feishu", target_user_id, target_user_name)
+                logger.info(
+                    "[Feishu] Granted %s role to %s (%s) via approval card by %s",
+                    role_value,
+                    target_user_name,
+                    target_user_id,
+                    user_name,
+                )
+                applicant_notify_success = await self._notify_permission_request_result(state, approved=True)
+                group_broadcast_success = await self._broadcast_permission_request_result(state, approved=True)
+                self._emit_permission_audit_event(
+                    outcome="approved",
+                    state=state,
+                    approver_name=user_name,
+                    applicant_notify_success=applicant_notify_success,
+                    group_broadcast_success=group_broadcast_success,
+                    reuse_hit=bool(state.get("reuse_hit")),
+                    dedup_hit=bool(state.get("dedup_hit")),
+                )
+            except Exception as exc:
+                logger.error("[Feishu] Failed to apply permission grant approval: %s", exc, exc_info=True)
+            return
         
         try:
             from tools.approval import resolve_gateway_approval
@@ -2421,6 +2746,17 @@ class FeishuAdapter(BasePlatformAdapter):
             reply_to_text=reply_to_text,
             timestamp=datetime.now(),
         )
+
+        if chat_type != "p2p":
+            maybe_role = await self._maybe_handle_permission_request(
+                event=normalized,
+                chat_id=chat_id,
+                user_id=sender_profile["user_id"],
+                user_name=sender_profile["user_name"],
+            )
+            if maybe_role is not None:
+                return
+
         await self._dispatch_inbound_event(normalized)
 
     # =========================================================================
@@ -2497,6 +2833,183 @@ class FeishuAdapter(BasePlatformAdapter):
             await self._enqueue_media_event(event)
             return
         await self._handle_message_with_guards(event)
+
+    def _is_permission_request_message(self, text: str) -> bool:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return False
+        return any(pattern.search(normalized) for pattern in _PERMISSION_REQUEST_TEXT_PATTERNS)
+
+    def _infer_permission_requested_role(self, text: str, *, default: str = "member") -> str:
+        normalized = str(text or "")
+        for pattern, role in _PERMISSION_REQUEST_ROLE_HINTS:
+            if pattern.search(normalized):
+                return role
+        return default if default in _PERMISSION_GRANT_ALLOWED_ROLES else "member"
+
+    def _select_permission_admin_chat_id(self, event: MessageEvent) -> Optional[str]:
+        explicit_chat_id = str(self.config.extra.get("permission_approval_chat_id") or "").strip()
+        if explicit_chat_id:
+            return explicit_chat_id
+        source = getattr(event, "source", None)
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        if chat_id and chat_id in self._admins:
+            return chat_id
+        home_channel = getattr(self.config, "home_channel", None)
+        home_chat_id = str(getattr(home_channel, "chat_id", "") or "")
+        if home_chat_id:
+            return home_chat_id
+        admins = sorted(str(item).strip() for item in self._admins if str(item).strip())
+        return admins[0] if admins else None
+
+    def _prune_permission_request_dedup(self) -> None:
+        now = time.monotonic()
+        ttl_seconds = int(self.config.extra.get("permission_request_dedup_ttl_seconds", _FEISHU_PERMISSION_REQUEST_DEDUP_TTL_SECONDS) or _FEISHU_PERMISSION_REQUEST_DEDUP_TTL_SECONDS)
+        stale_keys = [
+            key for key, seen_at in self._permission_request_seen.items()
+            if now - seen_at > ttl_seconds
+        ]
+        for key in stale_keys:
+            self._permission_request_seen.pop(key, None)
+
+    def _find_pending_permission_approval(self, *, user_id: str, chat_id: str) -> Optional[Dict[str, Any]]:
+        self._gc_stale_approval_state()
+        for state in self._approval_state.values():
+            if (
+                str(state.get("approval_kind") or "").strip().lower() == "permission_grant"
+                and str(state.get("target_user_id") or "").strip() == user_id
+                and str(state.get("request_chat_id") or "").strip() == chat_id
+            ):
+                return state
+        return None
+
+    def _mark_permission_request_seen(self, *, user_id: str, chat_id: str) -> bool:
+        self._prune_permission_request_dedup()
+        dedup_key = f"{chat_id}:{user_id}"
+        if dedup_key in self._permission_request_seen:
+            return True
+        self._permission_request_seen[dedup_key] = time.monotonic()
+        return False
+
+    async def _maybe_handle_permission_request(
+        self,
+        *,
+        event: MessageEvent,
+        chat_id: str,
+        user_id: str,
+        user_name: str,
+    ) -> Optional[str]:
+        text = str(getattr(event, "text", "") or "").strip()
+        if not self._is_permission_request_message(text):
+            return None
+
+        try:
+            from tools.permission_policy import get_user_role_by_id
+
+            current_role = get_user_role_by_id(user_id) if user_id else "member"
+        except Exception:
+            logger.debug("[Feishu] Failed to resolve current role for permission request", exc_info=True)
+            current_role = "member"
+
+        if current_role != "member":
+            return None
+
+        pending_state = self._find_pending_permission_approval(user_id=user_id, chat_id=chat_id)
+        if pending_state is not None:
+            logger.info("[Feishu] Reusing pending permission approval for %s in %s", user_id, chat_id)
+            pending_state["reuse_hit"] = True
+            pending_state["reused_approval_id"] = pending_state.get("approval_id")
+            pending_state["reused_approval_message_id"] = pending_state.get("message_id")
+            self._emit_permission_audit_event(
+                outcome="reused_pending",
+                state=pending_state,
+                approver_name="system",
+                reuse_hit=True,
+                dedup_hit=False,
+            )
+            await self.send(
+                chat_id=chat_id,
+                content="你的权限申请正在处理，请等待管理员审批结果。",
+                reply_to=event.message_id,
+                metadata={"thread_id": getattr(event.source, "thread_id", None)} if getattr(event.source, "thread_id", None) else None,
+            )
+            return "pending_permission_request"
+
+        if self._mark_permission_request_seen(user_id=user_id, chat_id=chat_id):
+            logger.info("[Feishu] Deduplicated repeated permission request from %s in %s", user_id, chat_id)
+            self._emit_permission_audit_event(
+                outcome="deduplicated",
+                state={
+                    "approval_kind": "permission_grant",
+                    "target_user_id": user_id,
+                    "target_user_name": user_name,
+                    "request_chat_id": chat_id,
+                    "request_chat_name": str(getattr(event.source, "chat_name", "") or "").strip(),
+                    "request_message_id": event.message_id,
+                    "request_text": text,
+                },
+                approver_name="system",
+                reuse_hit=False,
+                dedup_hit=True,
+            )
+            return "duplicate_permission_request"
+
+        admin_chat_id = self._select_permission_admin_chat_id(event)
+        if not admin_chat_id:
+            logger.warning("[Feishu] No admin chat available for permission request from %s", user_id)
+            fallback_result = await self.send(
+                chat_id=chat_id,
+                content="已收到你的申请，但管理员审批通道未配置，请联系管理员处理。",
+                reply_to=event.message_id,
+                metadata={"thread_id": getattr(event.source, "thread_id", None)} if getattr(event.source, "thread_id", None) else None,
+            )
+            if not getattr(fallback_result, "success", False):
+                logger.warning(
+                    "[Feishu] Failed to send missing-approval-channel notice to %s: %s",
+                    chat_id,
+                    getattr(fallback_result, "error", None),
+                )
+            return "missing_approval_channel"
+
+        ack_result = await self.send(
+            chat_id=chat_id,
+            content=_PERMISSION_REQUEST_ACK_TEXT,
+            reply_to=event.message_id,
+            metadata={"thread_id": getattr(event.source, "thread_id", None)} if getattr(event.source, "thread_id", None) else None,
+        )
+        if not getattr(ack_result, "success", False):
+            logger.warning("[Feishu] Failed to send permission request ack to %s: %s", chat_id, getattr(ack_result, "error", None))
+
+        requested_role = self._infer_permission_requested_role(text, default="member")
+        session_key = f"permission_grant:{user_id}:{event.message_id or uuid.uuid4()}"
+        approval_metadata = {
+            "approval_kind": "permission_grant",
+            "target_user_id": user_id,
+            "target_user_name": user_name,
+            "requested_role": requested_role,
+            "request_chat_id": chat_id,
+            "request_chat_name": str(getattr(event.source, "chat_name", "") or "").strip(),
+            "request_message_id": event.message_id,
+                "request_text": text,
+                "reuse_hit": False,
+                "dedup_hit": False,
+            }
+        description = text[:500]
+        result = await self.send_exec_approval(
+            chat_id=admin_chat_id,
+            command=text,
+            session_key=session_key,
+            description=description,
+            metadata=approval_metadata,
+        )
+        if not getattr(result, "success", False):
+            logger.warning(
+                "[Feishu] Failed to send permission approval card for %s (%s): %s",
+                user_name,
+                user_id,
+                getattr(result, "error", None),
+            )
+        return requested_role
 
     # =========================================================================
     # Media batching

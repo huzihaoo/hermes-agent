@@ -145,6 +145,49 @@ class PairingStore:
                 return True
         return False
 
+    def approve_user(
+        self,
+        platform: str,
+        user_id: str,
+        user_name: str = "",
+        *,
+        clear_pending_for_user: bool = True,
+    ) -> dict:
+        """Approve a user directly without requiring a pairing code.
+
+        Useful for admin workflows where the operator already knows the user's
+        identity from a group conversation. Optionally clears any pending
+        pairing requests for the same user so the next DM is recognized
+        immediately.
+        """
+        normalized_platform = platform.lower().strip()
+        normalized_user_id = str(user_id or "").strip()
+        normalized_user_name = str(user_name or "").strip()
+        if not normalized_platform:
+            raise ValueError("platform is required")
+        if not normalized_user_id:
+            raise ValueError("user_id is required")
+
+        with self._lock:
+            if clear_pending_for_user:
+                pending = self._load_json(self._pending_path(normalized_platform))
+                stale_codes = [
+                    code for code, info in pending.items()
+                    if str(info.get("user_id", "")).strip() == normalized_user_id
+                ]
+                if stale_codes:
+                    for code in stale_codes:
+                        pending.pop(code, None)
+                    self._save_json(self._pending_path(normalized_platform), pending)
+
+            self._approve_user(normalized_platform, normalized_user_id, normalized_user_name)
+
+        return {
+            "user_id": normalized_user_id,
+            "user_name": normalized_user_name,
+            "platform": normalized_platform,
+        }
+
     # ----- Pending codes -----
 
     def generate_code(

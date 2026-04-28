@@ -57,6 +57,44 @@ class TestConfigEnvOverrides(unittest.TestCase):
     @patch.dict(os.environ, {
         "FEISHU_APP_ID": "cli_xxx",
         "FEISHU_APP_SECRET": "secret_xxx",
+        "FEISHU_PERMISSION_APPROVAL_CHAT_ID": "oc_perm",
+        "FEISHU_PERMISSION_RESULT_BROADCAST_ENABLED": "false",
+        "FEISHU_PERMISSION_REQUEST_DEDUP_TTL_SECONDS": "42",
+    }, clear=False)
+    def test_feishu_permission_result_broadcast_flag_loaded(self):
+        from gateway.config import GatewayConfig, Platform, _apply_env_overrides
+
+        config = GatewayConfig()
+        _apply_env_overrides(config)
+
+        self.assertEqual(
+            config.platforms[Platform.FEISHU].extra["permission_result_broadcast_enabled"],
+            False,
+        )
+        self.assertEqual(
+            config.platforms[Platform.FEISHU].extra["permission_request_dedup_ttl_seconds"],
+            42,
+        )
+
+    @patch.dict(os.environ, {
+        "FEISHU_APP_ID": "cli_xxx",
+        "FEISHU_APP_SECRET": "secret_xxx",
+        "FEISHU_PERMISSION_APPROVAL_CHAT_ID": "oc_perm",
+    }, clear=False)
+    def test_feishu_permission_approval_chat_loaded(self):
+        from gateway.config import GatewayConfig, Platform, _apply_env_overrides
+
+        config = GatewayConfig()
+        _apply_env_overrides(config)
+
+        self.assertEqual(
+            config.platforms[Platform.FEISHU].extra["permission_approval_chat_id"],
+            "oc_perm",
+        )
+
+    @patch.dict(os.environ, {
+        "FEISHU_APP_ID": "cli_xxx",
+        "FEISHU_APP_SECRET": "secret_xxx",
         "FEISHU_HOME_CHANNEL": "oc_xxx",
     }, clear=False)
     def test_feishu_home_channel_loaded(self):
@@ -3045,6 +3083,432 @@ class TestSenderNameResolution(unittest.TestCase):
 
 class TestFeishuApprovalCards(unittest.TestCase):
     @patch.dict(os.environ, {}, clear=True)
+    def test_permission_grant_card_renders_role_options(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = object()
+        adapter._approval_counter = iter([42])
+        adapter._feishu_send_with_retry = AsyncMock(return_value=SimpleNamespace(success=lambda: True, data=None))
+        adapter._finalize_send_result = Mock(return_value=SimpleNamespace(success=True, message_id="om_card_42", error=None))
+
+        metadata = {
+            "approval_kind": "permission_grant",
+            "requested_role": "senior",
+            "target_user_id": "ou_target",
+            "target_user_name": "张三",
+            "request_chat_name": "研发群",
+            "request_message_id": "om_request_42",
+            "request_text": "你好，我是张三，帮我开通代码审查权限",
+        }
+
+        asyncio.run(
+            adapter.send_exec_approval(
+                chat_id="oc_admin",
+                command="permission request",
+                session_key="perm:grant:42",
+                description="申请开通代码审查权限",
+                metadata=metadata,
+            )
+        )
+
+        payload = json.loads(adapter._feishu_send_with_retry.await_args.kwargs["payload"])
+        actions = payload["elements"][1]["actions"]
+        self.assertEqual(actions[0]["tag"], "select_static")
+        option_texts = [item["text"]["content"] for item in actions[0]["options"]]
+        self.assertEqual(option_texts, ["Owner", "Admin", "Senior", "Member"])
+        self.assertEqual(actions[0]["value"]["requested_role"], "senior")
+        self.assertEqual(actions[1]["value"]["hermes_action"], "grant_permission")
+        body = payload["elements"][0]["content"]
+        self.assertIn("Applicant", body)
+        self.assertIn("Source chat", body)
+        self.assertIn("研发群", body)
+        self.assertIn("Request message ID", body)
+        self.assertIn("om_request_42", body)
+        self.assertIn("Original request", body)
+        self.assertIn("帮我开通代码审查权限", body)
+        self.assertIn(42, adapter._approval_state)
+        self.assertEqual(adapter._approval_state[42]["requested_role"], "senior")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_permission_grant_card_action_updates_requested_role_before_approval(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._approval_state = {
+            11: {
+                "session_key": "perm:grant:11",
+                "approval_kind": "permission_grant",
+                "target_user_id": "ou_target",
+                "target_user_name": "张三",
+                "requested_role": "member",
+            }
+        }
+        adapter._get_cached_sender_name = Mock(return_value="胡子豪")
+        captured = []
+        adapter._submit_on_loop = lambda _loop, coro: (captured.append(coro), None)
+
+        event = SimpleNamespace(operator=SimpleNamespace(open_id="ou_admin"))
+        action_value = {
+            "approval_id": 11,
+            "hermes_action": "select_requested_role",
+            "requested_role": "admin",
+        }
+
+        class _Response:
+            def __init__(self):
+                self.card = None
+
+        class _Card:
+            def __init__(self):
+                self.type = None
+                self.data = None
+
+        with (
+            patch("gateway.platforms.feishu.P2CardActionTriggerResponse", _Response),
+            patch("gateway.platforms.feishu.CallBackCard", _Card),
+            patch("tools.permission_policy.get_user_role_by_id", return_value="owner"),
+        ):
+            response = adapter._handle_approval_card_action(
+                event=event,
+                action_value=action_value,
+                loop=object(),
+            )
+
+        self.assertEqual(adapter._approval_state[11]["requested_role"], "admin")
+        self.assertEqual(captured, [])
+        self.assertIsInstance(response, _Response)
+        self.assertIsInstance(response.card, _Card)
+        self.assertIn("Requested role", json.dumps(response.card.data, ensure_ascii=False))
+        self.assertIn("admin", json.dumps(response.card.data, ensure_ascii=False).lower())
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_permission_grant_resolved_card_includes_approver_and_role(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._approval_state = {
+            12: {
+                "session_key": "perm:grant:12",
+                "approval_kind": "permission_grant",
+                "target_user_id": "ou_target",
+                "target_user_name": "张三",
+                "requested_role": "senior",
+            }
+        }
+        adapter._get_cached_sender_name = Mock(return_value="胡子豪")
+        captured = []
+        adapter._submit_on_loop = lambda _loop, coro: (captured.append(coro), None)
+
+        event = SimpleNamespace(operator=SimpleNamespace(open_id="ou_admin"))
+        action_value = {
+            "approval_id": 12,
+            "hermes_action": "grant_permission",
+        }
+
+        class _Response:
+            def __init__(self):
+                self.card = None
+
+        class _Card:
+            def __init__(self):
+                self.type = None
+                self.data = None
+
+        with (
+            patch("gateway.platforms.feishu.P2CardActionTriggerResponse", _Response),
+            patch("gateway.platforms.feishu.CallBackCard", _Card),
+            patch("tools.permission_policy.get_user_role_by_id", return_value="owner"),
+        ):
+            response = adapter._handle_approval_card_action(
+                event=event,
+                action_value=action_value,
+                loop=object(),
+            )
+
+        card_json = json.dumps(response.card.data, ensure_ascii=False)
+        self.assertEqual(len(captured), 1)
+        for coro in captured:
+            coro.close()
+        self.assertIn("Granted permission", card_json)
+        self.assertIn("胡子豪", card_json)
+        self.assertIn("张三", card_json)
+        self.assertIn("senior", card_json.lower())
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_group_permission_request_sends_ack_and_approval_card(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        request_text = "你好，我是张三，帮我开通高级用户权限"
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_group", "name": "研发群", "type": "group"}
+        )
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "ou_applicant", "user_name": "张三", "user_id_alt": None}
+        )
+        adapter._extract_message_content = AsyncMock(
+            return_value=(request_text, Mock(value="text"), [], [])
+        )
+        adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="om_ack"))
+        adapter.send_exec_approval = AsyncMock(return_value=SimpleNamespace(success=True, message_id="om_card"))
+        adapter._select_permission_admin_chat_id = Mock(return_value="oc_admin")
+        adapter._permission_request_seen = {}
+
+        message = SimpleNamespace(
+            chat_id="oc_group",
+            thread_id=None,
+            parent_id=None,
+            upper_message_id=None,
+            message_type="text",
+            content=json.dumps({"text": request_text}, ensure_ascii=False),
+            message_id="om_req",
+        )
+
+        with patch("tools.permission_policy.get_user_role_by_id", return_value="member"):
+            asyncio.run(
+                adapter._process_inbound_message(
+                    data=SimpleNamespace(event=SimpleNamespace(message=message)),
+                    message=message,
+                    sender_id=SimpleNamespace(open_id="ou_applicant", user_id=None, union_id=None),
+                    chat_type="group",
+                    message_id="om_req",
+                )
+            )
+
+        adapter.send.assert_awaited_once()
+        self.assertIn("等待管理员审批", adapter.send.await_args.kwargs["content"])
+        adapter.send_exec_approval.assert_awaited_once()
+        approval_kwargs = adapter.send_exec_approval.await_args.kwargs
+        self.assertEqual(approval_kwargs["chat_id"], "oc_admin")
+        self.assertEqual(approval_kwargs["metadata"]["approval_kind"], "permission_grant")
+        self.assertEqual(approval_kwargs["metadata"]["target_user_id"], "ou_applicant")
+        self.assertEqual(approval_kwargs["metadata"]["target_user_name"], "张三")
+        self.assertEqual(approval_kwargs["metadata"]["requested_role"], "senior")
+        self.assertEqual(approval_kwargs["metadata"]["request_chat_id"], "oc_group")
+        self.assertEqual(approval_kwargs["metadata"]["request_chat_name"], "研发群")
+        self.assertEqual(approval_kwargs["metadata"]["request_message_id"], "om_req")
+        self.assertIn("高级用户权限", approval_kwargs["metadata"]["request_text"])
+        adapter._dispatch_inbound_event.assert_not_awaited()
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_duplicate_permission_request_is_deduplicated(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"permission_request_dedup_ttl_seconds": 1}))
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_group", "name": "研发群", "type": "group"}
+        )
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "ou_applicant", "user_name": "张三", "user_id_alt": None}
+        )
+        adapter._extract_message_content = AsyncMock(
+            return_value=("你好，我是张三，帮我开通权限", Mock(value="text"), [], [])
+        )
+        adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="om_ack"))
+        adapter.send_exec_approval = AsyncMock(return_value=SimpleNamespace(success=True, message_id="om_card"))
+        adapter._is_permission_request_message = Mock(return_value=True)
+        adapter._select_permission_admin_chat_id = Mock(return_value="oc_admin")
+        adapter._permission_request_seen = {}
+        adapter._find_pending_permission_approval = Mock(return_value={
+            "approval_id": 77,
+            "approval_kind": "permission_grant",
+            "target_user_id": "ou_applicant",
+            "request_chat_id": "oc_group",
+            "message_id": "om_existing_card",
+            "request_chat_name": "研发群",
+        })
+        adapter._emit_permission_audit_event = Mock()
+
+        message = SimpleNamespace(
+            chat_id="oc_group",
+            thread_id=None,
+            parent_id=None,
+            upper_message_id=None,
+            message_type="text",
+            content='{"text":"你好，我是张三，帮我开通权限"}',
+            message_id="om_req_dup",
+        )
+
+        with patch("tools.permission_policy.get_user_role_by_id", return_value="member"):
+            asyncio.run(
+                adapter._process_inbound_message(
+                    data=SimpleNamespace(event=SimpleNamespace(message=message)),
+                    message=message,
+                    sender_id=SimpleNamespace(open_id="ou_applicant", user_id=None, union_id=None),
+                    chat_type="group",
+                    message_id="om_req_dup",
+                )
+            )
+            asyncio.run(
+                adapter._process_inbound_message(
+                    data=SimpleNamespace(event=SimpleNamespace(message=message)),
+                    message=message,
+                    sender_id=SimpleNamespace(open_id="ou_applicant", user_id=None, union_id=None),
+                    chat_type="group",
+                    message_id="om_req_dup_2",
+                )
+            )
+
+        self.assertEqual(adapter.send_exec_approval.await_count, 0)
+        self.assertEqual(adapter.send.await_count, 2)
+        self.assertIn("正在处理", adapter.send.await_args_list[0].kwargs["content"])
+        self.assertIn("正在处理", adapter.send.await_args_list[1].kwargs["content"])
+        self.assertEqual(adapter._find_pending_permission_approval.return_value["approval_id"], 77)
+        self.assertEqual(adapter._find_pending_permission_approval.return_value["message_id"], "om_existing_card")
+        self.assertEqual(adapter._emit_permission_audit_event.call_count, 2)
+        audit_kwargs = adapter._emit_permission_audit_event.call_args.kwargs
+        self.assertEqual(audit_kwargs["outcome"], "reused_pending")
+        self.assertEqual(audit_kwargs["state"]["reused_approval_id"], 77)
+        self.assertEqual(audit_kwargs["state"]["reused_approval_message_id"], "om_existing_card")
+        adapter._dispatch_inbound_event.assert_not_awaited()
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_permission_request_dedup_ttl_is_configurable(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"permission_request_dedup_ttl_seconds": 1}))
+        adapter._permission_request_seen = {"oc_group:ou_applicant": time.monotonic() - 2}
+
+        self.assertFalse(adapter._mark_permission_request_seen(user_id="ou_applicant", chat_id="oc_group"))
+        self.assertGreater(adapter._permission_request_seen["oc_group:ou_applicant"], time.monotonic() - 1)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_duplicate_permission_request_emits_dedup_audit(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_group", "name": "研发群", "type": "group"}
+        )
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "ou_applicant", "user_name": "张三", "user_id_alt": None}
+        )
+        adapter._extract_message_content = AsyncMock(
+            return_value=("你好，我是张三，帮我开通权限", Mock(value="text"), [], [])
+        )
+        adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="om_ack"))
+        adapter.send_exec_approval = AsyncMock(return_value=SimpleNamespace(success=True, message_id="om_card"))
+        adapter._is_permission_request_message = Mock(return_value=True)
+        adapter._select_permission_admin_chat_id = Mock(return_value="oc_admin")
+        adapter._permission_request_seen = {"oc_group:ou_applicant": time.monotonic()}
+        adapter._find_pending_permission_approval = Mock(return_value=None)
+        adapter._emit_permission_audit_event = Mock()
+
+        message = SimpleNamespace(
+            chat_id="oc_group",
+            thread_id=None,
+            parent_id=None,
+            upper_message_id=None,
+            message_type="text",
+            content='{"text":"你好，我是张三，帮我开通权限"}',
+            message_id="om_req_dedup",
+        )
+
+        with patch("tools.permission_policy.get_user_role_by_id", return_value="member"):
+            asyncio.run(
+                adapter._process_inbound_message(
+                    data=SimpleNamespace(event=SimpleNamespace(message=message)),
+                    message=message,
+                    sender_id=SimpleNamespace(open_id="ou_applicant", user_id=None, union_id=None),
+                    chat_type="group",
+                    message_id="om_req_dedup",
+                )
+            )
+
+        adapter.send_exec_approval.assert_not_awaited()
+        adapter.send.assert_not_awaited()
+        adapter._emit_permission_audit_event.assert_called_once()
+        audit_kwargs = adapter._emit_permission_audit_event.call_args.kwargs
+        self.assertEqual(audit_kwargs["outcome"], "deduplicated")
+        self.assertEqual(audit_kwargs["state"]["target_user_id"], "ou_applicant")
+        self.assertTrue(audit_kwargs["dedup_hit"])
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_select_permission_admin_chat_prefers_explicit_config(self):
+        from gateway.config import HomeChannel, Platform, PlatformConfig
+        from gateway.platforms.base import MessageEvent, MessageType
+        from gateway.platforms.feishu import FeishuAdapter
+        from gateway.session import SessionSource
+
+        config = PlatformConfig(
+            extra={"permission_approval_chat_id": "oc_perm", "admins": ["oc_admin_fallback"]},
+            home_channel=HomeChannel(platform=Platform.FEISHU, chat_id="oc_home", name="Home"),
+        )
+        adapter = FeishuAdapter(config)
+        event = MessageEvent(
+            text="帮我开通权限",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=adapter.platform,
+                chat_id="oc_group",
+                chat_name="研发群",
+                chat_type="group",
+                user_id="ou_applicant",
+                user_name="张三",
+            ),
+        )
+
+        self.assertEqual(adapter._select_permission_admin_chat_id(event), "oc_perm")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_group_permission_request_without_approval_channel_warns_applicant(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_group", "name": "研发群", "type": "group"}
+        )
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "ou_applicant", "user_name": "张三", "user_id_alt": None}
+        )
+        adapter._extract_message_content = AsyncMock(
+            return_value=("你好，我是张三，帮我开通权限", Mock(value="text"), [], [])
+        )
+        adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="om_ack"))
+        adapter.send_exec_approval = AsyncMock(return_value=SimpleNamespace(success=True, message_id="om_card"))
+        adapter._is_permission_request_message = Mock(return_value=True)
+        adapter._select_permission_admin_chat_id = Mock(return_value=None)
+
+        message = SimpleNamespace(
+            chat_id="oc_group",
+            thread_id=None,
+            parent_id=None,
+            upper_message_id=None,
+            message_type="text",
+            content='{"text":"你好，我是张三，帮我开通权限"}',
+            message_id="om_req2",
+        )
+
+        with patch("tools.permission_policy.get_user_role_by_id", return_value="member"):
+            asyncio.run(
+                adapter._process_inbound_message(
+                    data=SimpleNamespace(event=SimpleNamespace(message=message)),
+                    message=message,
+                    sender_id=SimpleNamespace(open_id="ou_applicant", user_id=None, union_id=None),
+                    chat_type="group",
+                    message_id="om_req2",
+                )
+            )
+
+        adapter.send.assert_awaited_once()
+        self.assertIn("管理员审批通道未配置", adapter.send.await_args.kwargs["content"])
+        adapter.send_exec_approval.assert_not_awaited()
+        adapter._dispatch_inbound_event.assert_not_awaited()
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_member_cannot_resolve_approval_card(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
@@ -3085,6 +3549,140 @@ class TestFeishuApprovalCards(unittest.TestCase):
         self.assertEqual(response.card.type, "raw")
         self.assertIn("Approval Not Allowed", json.dumps(response.card.data, ensure_ascii=False))
 
+    @patch.dict(os.environ, {}, clear=True)
+    def test_permission_grant_approval_applies_role_mapping(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"permission_result_broadcast_enabled": False}))
+        adapter.send = AsyncMock(side_effect=[
+            SimpleNamespace(success=True, message_id="om_applicant_notify"),
+            SimpleNamespace(success=True, message_id="om_group_notify"),
+        ])
+        adapter._approval_state = {
+            9: {
+                "session_key": "perm:grant:9",
+                "approval_kind": "permission_grant",
+                "target_user_id": "ou_target",
+                "target_user_name": "宋伟军",
+                "requested_role": "senior",
+                "request_chat_id": "oc_group",
+                "request_chat_name": "研发群",
+                "request_message_id": "om_req9",
+            }
+        }
+        adapter._approval_callbacks = {"perm:grant:9": Mock()}
+        adapter._emit_permission_audit_event = Mock()
+
+        with (
+            patch("gateway.pairing.PairingStore.approve_user") as mock_approve_user,
+            patch("tools.permission_policy.set_user_role") as mock_set_role,
+            patch("tools.permission_policy.map_user_id") as mock_map_user_id,
+        ):
+            asyncio.run(adapter._resolve_approval(9, "grant_senior", "胡子豪"))
+
+        mock_set_role.assert_called_once_with("宋伟军", "senior")
+        mock_map_user_id.assert_called_once_with("宋伟军", "ou_target")
+        mock_approve_user.assert_called_once_with("feishu", "ou_target", "宋伟军")
+        self.assertEqual(adapter.send.await_count, 1)
+        self.assertIn("已通过", adapter.send.await_args_list[0].kwargs["content"])
+        self.assertIn("senior", adapter.send.await_args_list[0].kwargs["content"].lower())
+        adapter._emit_permission_audit_event.assert_called_once()
+        audit_kwargs = adapter._emit_permission_audit_event.call_args.kwargs
+        self.assertEqual(audit_kwargs["outcome"], "approved")
+        self.assertEqual(audit_kwargs["approver_name"], "胡子豪")
+        self.assertEqual(audit_kwargs["state"]["target_user_id"], "ou_target")
+        self.assertEqual(audit_kwargs["state"]["request_chat_name"], "研发群")
+        self.assertNotIn(9, adapter._approval_state)
+        self.assertNotIn("perm:grant:9", adapter._approval_callbacks)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_permission_grant_deny_does_not_apply_role_mapping(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"permission_result_broadcast_enabled": False}))
+        adapter.send = AsyncMock(side_effect=[
+            SimpleNamespace(success=True, message_id="om_applicant_notify"),
+            SimpleNamespace(success=True, message_id="om_group_notify"),
+        ])
+        adapter._approval_state = {
+            10: {
+                "session_key": "perm:grant:10",
+                "approval_kind": "permission_grant",
+                "target_user_id": "ou_target",
+                "target_user_name": "宋伟军",
+                "requested_role": "senior",
+                "request_chat_id": "oc_group",
+                "request_chat_name": "研发群",
+                "request_message_id": "om_req10",
+            }
+        }
+        adapter._approval_callbacks = {"perm:grant:10": Mock()}
+        adapter._emit_permission_audit_event = Mock()
+
+        with (
+            patch("gateway.pairing.PairingStore.approve_user") as mock_approve_user,
+            patch("tools.permission_policy.set_user_role") as mock_set_role,
+            patch("tools.permission_policy.map_user_id") as mock_map_user_id,
+        ):
+            asyncio.run(adapter._resolve_approval(10, "deny", "胡子豪"))
+
+        mock_set_role.assert_not_called()
+        mock_map_user_id.assert_not_called()
+        mock_approve_user.assert_not_called()
+        self.assertEqual(adapter.send.await_count, 1)
+        self.assertIn("未通过", adapter.send.await_args_list[0].kwargs["content"])
+        adapter._emit_permission_audit_event.assert_called_once()
+        audit_kwargs = adapter._emit_permission_audit_event.call_args.kwargs
+        self.assertEqual(audit_kwargs["outcome"], "denied")
+        self.assertEqual(audit_kwargs["approver_name"], "胡子豪")
+        self.assertEqual(audit_kwargs["state"]["target_user_id"], "ou_target")
+        self.assertEqual(audit_kwargs["state"]["request_chat_name"], "研发群")
+        self.assertNotIn(10, adapter._approval_state)
+        self.assertNotIn("perm:grant:10", adapter._approval_callbacks)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_permission_grant_approval_broadcasts_when_enabled(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"permission_result_broadcast_enabled": True}))
+        adapter.send = AsyncMock(side_effect=[
+            SimpleNamespace(success=True, message_id="om_applicant_notify"),
+            SimpleNamespace(success=True, message_id="om_group_notify"),
+        ])
+        adapter._approval_state = {
+            90: {
+                "session_key": "perm:grant:90",
+                "approval_kind": "permission_grant",
+                "target_user_id": "ou_target",
+                "target_user_name": "宋伟军",
+                "requested_role": "senior",
+                "request_chat_id": "oc_group",
+                "request_chat_name": "研发群",
+                "request_message_id": "om_req90",
+            }
+        }
+        adapter._approval_callbacks = {"perm:grant:90": Mock()}
+        adapter._emit_permission_audit_event = Mock()
+
+        with (
+            patch("gateway.pairing.PairingStore.approve_user"),
+            patch("tools.permission_policy.set_user_role"),
+            patch("tools.permission_policy.map_user_id"),
+        ):
+            asyncio.run(adapter._resolve_approval(90, "grant_senior", "胡子豪"))
+
+        self.assertEqual(adapter.send.await_count, 2)
+        self.assertIn("已通过", adapter.send.await_args_list[1].kwargs["content"])
+        self.assertIn("研发群", adapter.send.await_args_list[1].kwargs["content"])
+        adapter._emit_permission_audit_event.assert_called_once()
+        audit_kwargs = adapter._emit_permission_audit_event.call_args.kwargs
+        self.assertEqual(audit_kwargs["outcome"], "approved")
+        self.assertEqual(audit_kwargs["approver_name"], "胡子豪")
+        self.assertEqual(audit_kwargs["state"]["target_user_id"], "ou_target")
+        self.assertEqual(audit_kwargs["state"]["request_chat_name"], "研发群")
     @patch.dict(os.environ, {}, clear=True)
     def test_gc_stale_approval_state_drops_expired_entries(self):
         from gateway.config import PlatformConfig

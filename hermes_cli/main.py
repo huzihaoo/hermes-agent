@@ -5570,6 +5570,20 @@ Examples:
     pairing_approve_parser.add_argument("platform", help="Platform name (telegram, discord, slack, whatsapp)")
     pairing_approve_parser.add_argument("code", help="Pairing code to approve")
 
+    pairing_approve_user_parser = pairing_sub.add_parser("approve-user", help="Directly approve a known user")
+    pairing_approve_user_parser.add_argument("platform", help="Platform name")
+    pairing_approve_user_parser.add_argument("user_id", help="User ID to approve")
+    pairing_approve_user_parser.add_argument("user_name", nargs="?", default="", help="Optional display name")
+
+    pairing_grant_senior_parser = pairing_sub.add_parser("grant-senior", help="Set senior role and approve a known user")
+    pairing_grant_senior_parser.add_argument("platform", help="Platform name")
+    pairing_grant_senior_parser.add_argument("user_id", help="User ID to approve")
+    pairing_grant_senior_parser.add_argument("user_name", help="Display name to assign senior role")
+
+    pairing_grant_senior_by_name_parser = pairing_sub.add_parser("grant-senior-by-name", help="Use a stored mapping to grant senior again")
+    pairing_grant_senior_by_name_parser.add_argument("platform", help="Platform name")
+    pairing_grant_senior_by_name_parser.add_argument("user_name", help="Display name with a stored user_id mapping")
+
     pairing_revoke_parser = pairing_sub.add_parser("revoke", help="Revoke user access")
     pairing_revoke_parser.add_argument("platform", help="Platform name")
     pairing_revoke_parser.add_argument("user_id", help="User ID to revoke")

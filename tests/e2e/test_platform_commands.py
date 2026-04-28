@@ -11,12 +11,14 @@ Tests are parametrized over platforms via the ``platform`` fixture in conftest.
 """
 
 import asyncio
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from gateway.platforms.base import SendResult
-from tests.e2e.conftest import make_event, send_and_capture
+from gateway.config import Platform
+from gateway.session import SessionSource
+from tests.e2e.conftest import make_event, make_runner, send_and_capture
 
 
 class TestSlashCommands:
@@ -171,6 +173,67 @@ class TestAuthorization:
         if adapter.send.called:
             response_text = adapter.send.call_args[0][1] if len(adapter.send.call_args[0]) > 1 else ""
             assert "/new" not in response_text
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_feishu_group_permission_request_bypasses_rejection(self):
+        """Unauthorized Feishu group permission requests should create approval flow, not generic rejection."""
+        runner = make_runner(Platform.FEISHU)
+        runner._is_user_authorized = lambda _source: False
+        adapter = Mock()
+        adapter._maybe_handle_permission_request = AsyncMock(return_value="senior")
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="unauth-reject"))
+        runner.adapters[Platform.FEISHU] = adapter
+        event = make_event(
+            Platform.FEISHU,
+            "你好，我是杨昌荣，帮忙开通一下高级用户权限",
+            chat_id="oc_group",
+            user_id="ou_yang",
+        )
+        event.source = SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="oc_group",
+            chat_name="研发群",
+            chat_type="group",
+            user_id="ou_yang",
+            user_name="杨昌荣",
+            thread_id="omt_topic",
+        )
+
+        await runner._handle_message(event)
+
+        adapter._maybe_handle_permission_request.assert_awaited_once()
+        approval_kwargs = adapter._maybe_handle_permission_request.await_args.kwargs
+        assert approval_kwargs["chat_id"] == "oc_group"
+        assert approval_kwargs["user_id"] == "ou_yang"
+        assert approval_kwargs["user_name"] == "杨昌荣"
+        adapter.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_feishu_group_non_permission_request_gets_rejection(self):
+        """Unauthorized non-permission Feishu group messages still get the normal rejection."""
+        runner = make_runner(Platform.FEISHU)
+        runner._is_user_authorized = lambda _source: False
+        adapter = Mock()
+        adapter._maybe_handle_permission_request = AsyncMock(return_value=None)
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="unauth-reject"))
+        runner.adapters[Platform.FEISHU] = adapter
+        event = make_event(Platform.FEISHU, "你好", chat_id="oc_group", user_id="ou_yang")
+        event.source = SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="oc_group",
+            chat_name="研发群",
+            chat_type="group",
+            user_id="ou_yang",
+            user_name="杨昌荣",
+            thread_id="omt_topic",
+        )
+
+        await runner._handle_message(event)
+
+        adapter._maybe_handle_permission_request.assert_awaited_once()
+        adapter.send.assert_awaited_once()
+        response_text = adapter.send.await_args.args[1]
+        assert "没有使用权限" in response_text
 
 
 class TestSendFailureResilience:

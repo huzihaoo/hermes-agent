@@ -2740,9 +2740,35 @@ class GatewayRunner:
             logger.debug("Ignoring message with no user_id from %s", source.platform.value)
             return None
         elif not self._is_user_authorized(source):
-            logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
+            logger.info("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
             # In DMs: offer pairing code. In groups: reply with a short rejection.
             if source.chat_type != "dm":
+                adapter = self.adapters.get(source.platform)
+                if (
+                    source.platform == Platform.FEISHU
+                    and adapter is not None
+                    and hasattr(adapter, "_maybe_handle_permission_request")
+                ):
+                    try:
+                        permission_result = await adapter._maybe_handle_permission_request(
+                            event=event,
+                            chat_id=source.chat_id,
+                            user_id=source.user_id or "",
+                            user_name=source.user_name or "",
+                        )
+                        if permission_result is not None:
+                            logger.info(
+                                "Handled unauthorized Feishu permission request from %s with result=%s",
+                                source.user_id,
+                                permission_result,
+                            )
+                            return None
+                    except Exception:
+                        logger.warning(
+                            "Failed to handle unauthorized Feishu permission request from %s",
+                            source.user_id,
+                            exc_info=True,
+                        )
                 # Group chat: send a brief unauthorized notice (rate-limited per user)
                 _unauth_rl_key = f"unauth_group:{source.platform.value}:{source.user_id}"
                 _now = __import__("time").time()
@@ -2751,12 +2777,13 @@ class GatewayRunner:
                     if not hasattr(self, "_unauth_group_ts"):
                         self._unauth_group_ts = {}
                     self._unauth_group_ts[_unauth_rl_key] = _now
-                    adapter = self.adapters.get(source.platform)
                     if adapter:
+                        _unauth_thread = getattr(source, "thread_id", None)
+                        _unauth_meta = {"thread_id": _unauth_thread} if _unauth_thread else None
                         await adapter.send(
                             source.chat_id,
                             "抱歉，你还没有使用权限，请联系管理员开通。",
-                            thread_id=getattr(source, "thread_id", None),
+                            metadata=_unauth_meta,
                         )
                 return None
             if self._get_unauthorized_dm_behavior(source.platform) == "pair":

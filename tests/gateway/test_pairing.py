@@ -165,6 +165,107 @@ class TestApprovalFlow:
         assert result["user_id"] == "user1"
         assert result["user_name"] == "Alice"
 
+    def test_direct_approve_known_user(self, tmp_path):
+        with patch("gateway.pairing.PAIRING_DIR", tmp_path):
+            store = PairingStore()
+            result = store.approve_user("feishu", "ou_test_user", "宋伟军")
+
+        assert result == {
+            "platform": "feishu",
+            "user_id": "ou_test_user",
+            "user_name": "宋伟军",
+        }
+        with patch("gateway.pairing.PAIRING_DIR", tmp_path):
+            assert store.is_approved("feishu", "ou_test_user") is True
+
+    def test_direct_approve_clears_pending_requests_for_same_user(self, tmp_path):
+        with patch("gateway.pairing.PAIRING_DIR", tmp_path):
+            store = PairingStore()
+            code = store.generate_code("feishu", "ou_test_user", "宋伟军")
+            pending_before = store.list_pending("feishu")
+            result = store.approve_user("feishu", "ou_test_user", "宋伟军")
+            pending_after = store.list_pending("feishu")
+
+        assert code is not None
+        assert len(pending_before) == 1
+        assert result["user_id"] == "ou_test_user"
+        assert pending_after == []
+        with patch("gateway.pairing.PAIRING_DIR", tmp_path):
+            assert store.is_approved("feishu", "ou_test_user") is True
+
+    def test_set_user_role_persists(self, tmp_path):
+        config_path = tmp_path / "user-roles.json"
+        config = {
+            "version": "1.0",
+            "user_id_mapping": {},
+            "users": {"default": "member"},
+            "permission_matrix": {
+                "owner": {},
+                "admin": {},
+                "senior": {},
+                "member": {},
+            },
+            "command_patterns": {},
+            "critical_paths": [],
+        }
+        config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+        with patch("tools.permission_policy._CONFIG_PATH", config_path), patch("tools.permission_policy._config", None):
+            from tools.permission_policy import set_user_role, get_user_role
+
+            set_user_role("宋伟军", "senior")
+            assert get_user_role("宋伟军") == "senior"
+            saved = json.loads(config_path.read_text(encoding="utf-8"))
+            assert saved["users"]["宋伟军"] == "senior"
+
+    def test_map_user_id_persists(self, tmp_path):
+        config_path = tmp_path / "user-roles.json"
+        config = {
+            "version": "1.0",
+            "user_id_mapping": {},
+            "users": {"default": "member", "宋伟军": "senior"},
+            "permission_matrix": {
+                "owner": {},
+                "admin": {},
+                "senior": {},
+                "member": {},
+            },
+            "command_patterns": {},
+            "critical_paths": [],
+        }
+        config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+        with patch("tools.permission_policy._CONFIG_PATH", config_path), patch("tools.permission_policy._config", None):
+            from tools.permission_policy import map_user_id, get_user_role_by_id
+
+            map_user_id("宋伟军", "ou_test_user")
+            assert get_user_role_by_id("ou_test_user") == "senior"
+            saved = json.loads(config_path.read_text(encoding="utf-8"))
+            assert saved["user_id_mapping"]["ou_test_user"] == "宋伟军"
+
+    def test_find_user_id_by_name_returns_stored_mapping(self, tmp_path):
+        config_path = tmp_path / "user-roles.json"
+        config = {
+            "version": "1.0",
+            "user_id_mapping": {"ou_test_user": "宋伟军"},
+            "users": {"default": "member", "宋伟军": "senior"},
+            "permission_matrix": {
+                "owner": {},
+                "admin": {},
+                "senior": {},
+                "member": {},
+            },
+            "command_patterns": {},
+            "critical_paths": [],
+        }
+        config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+        with patch("tools.permission_policy._CONFIG_PATH", config_path), patch("tools.permission_policy._config", None):
+            from tools.permission_policy import find_user_id_by_name
+
+            assert find_user_id_by_name("宋伟军") == "ou_test_user"
+            assert find_user_id_by_name(" 不存在 ") is None
+
     def test_approved_user_is_approved(self, tmp_path):
         with patch("gateway.pairing.PAIRING_DIR", tmp_path):
             store = PairingStore()

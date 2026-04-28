@@ -1032,6 +1032,22 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 chat_id=feishu_home,
                 name=os.getenv("FEISHU_HOME_CHANNEL_NAME", "Home"),
             )
+        feishu_permission_approval_chat_id = os.getenv("FEISHU_PERMISSION_APPROVAL_CHAT_ID", "").strip()
+        if feishu_permission_approval_chat_id:
+            config.platforms[Platform.FEISHU].extra["permission_approval_chat_id"] = feishu_permission_approval_chat_id
+        feishu_permission_result_broadcast_enabled = os.getenv("FEISHU_PERMISSION_RESULT_BROADCAST_ENABLED", "").strip()
+        if feishu_permission_result_broadcast_enabled:
+            config.platforms[Platform.FEISHU].extra["permission_result_broadcast_enabled"] = (
+                feishu_permission_result_broadcast_enabled.lower() in {"true", "1", "yes", "on"}
+            )
+        feishu_permission_request_dedup_ttl_seconds = os.getenv("FEISHU_PERMISSION_REQUEST_DEDUP_TTL_SECONDS", "").strip()
+        if feishu_permission_request_dedup_ttl_seconds:
+            try:
+                config.platforms[Platform.FEISHU].extra["permission_request_dedup_ttl_seconds"] = int(
+                    feishu_permission_request_dedup_ttl_seconds
+                )
+            except ValueError:
+                pass
 
     # WeCom (Enterprise WeChat)
     wecom_bot_id = os.getenv("WECOM_BOT_ID")

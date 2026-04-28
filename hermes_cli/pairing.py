@@ -2,10 +2,16 @@
 CLI commands for the DM pairing system.
 
 Usage:
-    hermes pairing list              # Show all pending + approved users
-    hermes pairing approve <platform> <code>  # Approve a pairing code
-    hermes pairing revoke <platform> <user_id> # Revoke user access
-    hermes pairing clear-pending     # Clear all expired/pending codes
+    hermes pairing list                             # Show all pending + approved users
+    hermes pairing approve <platform> <code>       # Approve a pairing code
+    hermes pairing approve-user <platform> <user_id> [user_name]
+                                                   # Directly approve a known user
+    hermes pairing grant-senior <platform> <user_id> <user_name>
+                                                   # Set senior role + map ID + approve user
+    hermes pairing grant-senior-by-name <platform> <user_name>
+                                                   # Reuse stored mapping to grant senior again
+    hermes pairing revoke <platform> <user_id>     # Revoke user access
+    hermes pairing clear-pending                    # Clear all expired/pending codes
 """
 
 def pairing_command(args):
@@ -19,12 +25,18 @@ def pairing_command(args):
         _cmd_list(store)
     elif action == "approve":
         _cmd_approve(store, args.platform, args.code)
+    elif action == "approve-user":
+        _cmd_approve_user(store, args.platform, args.user_id, getattr(args, "user_name", ""))
+    elif action == "grant-senior":
+        _cmd_grant_senior(store, args.platform, args.user_id, args.user_name)
+    elif action == "grant-senior-by-name":
+        _cmd_grant_senior_by_name(store, args.platform, args.user_name)
     elif action == "revoke":
         _cmd_revoke(store, args.platform, args.user_id)
     elif action == "clear-pending":
         _cmd_clear_pending(store)
     else:
-        print("Usage: hermes pairing {list|approve|revoke|clear-pending}")
+        print("Usage: hermes pairing {list|approve|approve-user|grant-senior|grant-senior-by-name|revoke|clear-pending}")
         print("Run 'hermes pairing --help' for details.")
 
 
@@ -76,6 +88,61 @@ def _cmd_approve(store, platform: str, code: str):
     else:
         print(f"\n  Code '{code}' not found or expired for platform '{platform}'.")
         print("  Run 'hermes pairing list' to see pending codes.\n")
+
+
+def _cmd_approve_user(store, platform: str, user_id: str, user_name: str = ""):
+    """Directly approve a known user without waiting for a pairing code."""
+    platform = platform.lower().strip()
+    user_id = str(user_id or "").strip()
+    user_name = str(user_name or "").strip()
+
+    if not platform or not user_id:
+        print("\n  Usage: hermes pairing approve-user <platform> <user_id> [user_name]\n")
+        return
+
+    result = store.approve_user(platform, user_id, user_name)
+    display = f"{result['user_name']} ({result['user_id']})" if result.get("user_name") else result["user_id"]
+    print(f"\n  Approved! User {display} on {platform} can now use the bot~")
+    print("  Any stale pending pairing request for this user was cleared.\n")
+
+
+def _cmd_grant_senior(store, platform: str, user_id: str, user_name: str):
+    """Set senior role, map the user ID, and approve the user in one shot."""
+    from tools.permission_policy import map_user_id, set_user_role
+
+    platform = platform.lower().strip()
+    user_id = str(user_id or "").strip()
+    user_name = str(user_name or "").strip()
+
+    if not platform or not user_id or not user_name:
+        print("\n  Usage: hermes pairing grant-senior <platform> <user_id> <user_name>\n")
+        return
+
+    set_user_role(user_name, "senior")
+    map_user_id(user_name, user_id)
+    result = store.approve_user(platform, user_id, user_name)
+    display = f"{result['user_name']} ({result['user_id']})"
+    print(f"\n  Granted senior role and approved {display} on {platform}.\n")
+
+
+def _cmd_grant_senior_by_name(store, platform: str, user_name: str):
+    """Grant senior using an already-known name->user_id mapping."""
+    from tools.permission_policy import find_user_id_by_name
+
+    platform = platform.lower().strip()
+    user_name = str(user_name or "").strip()
+
+    if not platform or not user_name:
+        print("\n  Usage: hermes pairing grant-senior-by-name <platform> <user_name>\n")
+        return
+
+    user_id = find_user_id_by_name(user_name)
+    if not user_id:
+        print(f"\n  No stored user_id mapping found for {user_name}.\n")
+        print("  Use 'hermes pairing grant-senior <platform> <user_id> <user_name>' first.\n")
+        return
+
+    _cmd_grant_senior(store, platform, user_id, user_name)
 
 
 def _cmd_revoke(store, platform: str, user_id: str):
