@@ -4,7 +4,7 @@
 
 ```python
 from gateway.admission import __version__
-print(__version__)  # "1.8.0"
+print(__version__)  # "1.9.0"
 ```
 
 ## 查看版本历史
@@ -132,6 +132,7 @@ python -m pytest tests/gateway/test_admission*.py tests/gateway/test_feishu_admi
 | 1.6.0 | 0.9.0+ | 3.11+ | 3.35+ | FeishuAdapter 自动集成 MetricsServer/template |
 | 1.7.0 | 0.9.0+ | 3.11+ | 3.35+ | Gateway 启动防护，杜绝进程堆积 |
 | 1.8.0 | 0.10.0+ | 3.11+ | 3.35+ | VM 仓库多用户 worktree 隔离 + 审计 |
+| 1.9.0 | 0.10.0+ | 3.11+ | 3.35+ | Feishu 任务话题反馈路由闭环 + request_message_id 持久化 |
 
 ## 下一版本规划
 

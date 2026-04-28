@@ -13,6 +13,28 @@ MAJOR.MINOR.PATCH
 
 ---
 
+## [1.9.0] — 2026-04-28 — Feishu 任务话题反馈路由闭环
+
+### Added
+- Admission queue now persists the original Feishu `request_message_id` alongside chat/thread routing metadata.
+- New regression coverage for queued Feishu events preserving `thread_id` and original request message IDs.
+
+### Changed
+- Feishu queue reconstruction now uses the original request message ID when replaying admitted messages, keeping topic/thread replies anchored to the source task message.
+- `AdmissionController.admit()` accepts `request_message_id` for platform adapters and legacy Feishu bridge callers.
+- Queue persistence schema migrates existing SQLite DBs with `request_message_id TEXT`.
+
+### Fixed
+- VM/shared-state feedback chain can now preserve original Feishu topic routing via task metadata and host relay restoration.
+- Feishu-origin VM notifications fail closed when required per-task routing fields are incomplete instead of falling back to ambient main-chat environment.
+
+### Verified
+- `tests/gateway/test_admission_connpool.py tests/gateway/test_queue_persistence.py tests/gateway/test_admission_controller.py tests/gateway/test_feishu_admission_routing.py tests/gateway/test_feishu_admission_autostart.py tests/gateway/test_run_progress_topics.py` — 52 passed
+- `tests/tools/test_vm_task_tool_session_routing.py tests/tools/test_vm_task_tool.py tests/gateway/test_feishu_admission_routing.py` — 14 passed
+- `workspace-work/tests/test_shared_state_v2_host.py` — 59 passed, 5 subtests passed
+
+---
+
 ## [1.8.0] — 2026-04-27 — VM 仓库多用户并发隔离
 
 ### Added
