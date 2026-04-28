@@ -156,6 +156,17 @@ class TaskEvent:
         }
 
     @staticmethod
+    def task_failed(*, task_id: str, error_class: str, error_message: str) -> Dict[str, Any]:
+        return {
+            "event": "task:failed",
+            "data": {
+                "task_id": task_id,
+                "error_class": error_class,
+                "error_message": error_message,
+            },
+        }
+
+    @staticmethod
     def task_timeout(*, task_id: str, reason: str) -> Dict[str, Any]:
         return {
             "event": "task:timeout",

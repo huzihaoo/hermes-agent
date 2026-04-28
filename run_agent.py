@@ -211,6 +211,71 @@ class IterationBudget:
             return max(0, self.max_total - self._used)
 
 
+class _ProviderLaneState:
+    """Shared per-provider execution lane with concurrency and breaker state."""
+
+    def __init__(self, max_concurrency: int):
+        self.max_concurrency = max(1, int(max_concurrency))
+        self.in_flight = 0
+        self.open_until = 0.0
+        self.consecutive_failures = 0
+        self.last_reason = ""
+        self.last_error = ""
+        self._cond = threading.Condition()
+
+    def acquire(self, *, interrupt_check=None, poll_interval: float = 0.2) -> float:
+        waited = 0.0
+        with self._cond:
+            while True:
+                if interrupt_check and interrupt_check():
+                    raise InterruptedError("Interrupted while waiting for provider lane")
+                now = time.time()
+                if self.open_until > now:
+                    timeout = min(max(self.open_until - now, 0.0), poll_interval)
+                    self._cond.wait(timeout=timeout)
+                    waited += timeout
+                    continue
+                if self.in_flight < self.max_concurrency:
+                    self.in_flight += 1
+                    return waited
+                self._cond.wait(timeout=poll_interval)
+                waited += poll_interval
+
+    def release(self) -> None:
+        with self._cond:
+            if self.in_flight > 0:
+                self.in_flight -= 1
+            self._cond.notify_all()
+
+    def mark_success(self) -> None:
+        with self._cond:
+            self.consecutive_failures = 0
+            self.last_reason = ""
+            self.last_error = ""
+            self.open_until = 0.0
+            self._cond.notify_all()
+
+    def mark_failure(self, *, cooldown_seconds: float, reason: str, error_summary: str) -> None:
+        with self._cond:
+            self.consecutive_failures += 1
+            self.last_reason = reason
+            self.last_error = error_summary
+            if cooldown_seconds > 0:
+                self.open_until = max(self.open_until, time.time() + cooldown_seconds)
+            self._cond.notify_all()
+
+    def snapshot(self) -> dict:
+        with self._cond:
+            return {
+                "max_concurrency": self.max_concurrency,
+                "in_flight": self.in_flight,
+                "open_until": self.open_until,
+                "consecutive_failures": self.consecutive_failures,
+                "last_reason": self.last_reason,
+                "last_error": self.last_error,
+            }
+
+
 # Tools that must never run concurrently (interactive / user-facing).
 # When any of these appear in a batch, we fall back to sequential execution.
 _NEVER_PARALLEL_TOOLS = frozenset({"clarify"})
@@ -546,6 +611,8 @@ class AIAgent:
     # to suppress duplicate warnings within a cooldown window.
     _context_pressure_last_warned: dict = {}
     _CONTEXT_PRESSURE_COOLDOWN = 300  # seconds between re-warning same session
+    _provider_lane_registry: dict = {}
+    _provider_lane_registry_lock = threading.Lock()
 
     @property
     def base_url(self) -> str:
@@ -555,6 +622,152 @@ class AIAgent:
     def base_url(self, value: str) -> None:
         self._base_url = value
         self._base_url_lower = value.lower() if value else ""
+
+    def _provider_lane_key(self) -> str:
+        key_material = "|".join([
+            str(getattr(self, "provider", "") or ""),
+            str(getattr(self, "base_url", "") or ""),
+            str(getattr(self, "model", "") or ""),
+            str(getattr(self, "api_mode", "") or ""),
+            str(getattr(self, "api_key", "") or ""),
+        ])
+        return hashlib.sha256(key_material.encode("utf-8", errors="ignore")).hexdigest()
+
+    def _provider_lane_label(self) -> str:
+        provider = getattr(self, "provider", "unknown") or "unknown"
+        model = getattr(self, "model", "unknown") or "unknown"
+        return f"{provider}:{model}"
+
+    @staticmethod
+    def _env_int(name: str, default: int, *, minimum: Optional[int] = None, maximum: Optional[int] = None) -> int:
+        raw = os.getenv(name)
+        try:
+            value = int(raw) if raw is not None else int(default)
+        except (TypeError, ValueError):
+            value = int(default)
+        if minimum is not None:
+            value = max(minimum, value)
+        if maximum is not None:
+            value = min(maximum, value)
+        return value
+
+    @staticmethod
+    def _env_float(name: str, default: float, *, minimum: Optional[float] = None, maximum: Optional[float] = None) -> float:
+        raw = os.getenv(name)
+        try:
+            value = float(raw) if raw is not None else float(default)
+        except (TypeError, ValueError):
+            value = float(default)
+        if minimum is not None:
+            value = max(minimum, value)
+        if maximum is not None:
+            value = min(maximum, value)
+        return value
+
+    def _provider_lane_max_concurrency(self) -> int:
+        return self._env_int("HERMES_PROVIDER_LANE_CONCURRENCY", 1, minimum=1, maximum=32)
+
+    def _provider_lane_retry_after_cap(self) -> int:
+        return self._env_int("HERMES_PROVIDER_LANE_RETRY_AFTER_MAX", 300, minimum=1, maximum=3600)
+
+    def _provider_lane_wait_log_threshold(self) -> float:
+        return self._env_float("HERMES_PROVIDER_LANE_WAIT_LOG_THRESHOLD", 1.0, minimum=0.0, maximum=60.0)
+
+    def _api_max_retries(self) -> int:
+        return self._env_int("HERMES_API_MAX_RETRIES", 3, minimum=1, maximum=10)
+
+    def _api_retry_base_delay(self) -> float:
+        return self._env_float("HERMES_API_RETRY_BASE_DELAY", 2.0, minimum=0.1, maximum=300.0)
+
+    def _api_retry_max_delay(self) -> float:
+        base = self._api_retry_base_delay()
+        return self._env_float("HERMES_API_RETRY_MAX_DELAY", 60.0, minimum=base, maximum=3600.0)
+
+    def _compression_retry_pause(self) -> float:
+        return self._env_float("HERMES_CONTEXT_RETRY_PAUSE", 2.0, minimum=0.0, maximum=30.0)
+
+    def _get_provider_lane_state(self) -> _ProviderLaneState:
+        lane_key = self._provider_lane_key()
+        max_concurrency = self._provider_lane_max_concurrency()
+        with self._provider_lane_registry_lock:
+            state = self._provider_lane_registry.get(lane_key)
+            if state is None:
+                state = _ProviderLaneState(max_concurrency=max_concurrency)
+                self._provider_lane_registry[lane_key] = state
+            elif state.max_concurrency != max_concurrency:
+                state.max_concurrency = max(1, int(max_concurrency))
+            return state
+
+    @staticmethod
+    def _provider_lane_snapshot_summary(snapshot: dict) -> str:
+        remaining = 0
+        open_until = snapshot.get("open_until") or 0.0
+        if open_until:
+            remaining = max(0, int(open_until - time.time()))
+        return (
+            f"in_flight={snapshot.get('in_flight', 0)}/{snapshot.get('max_concurrency', '?')} "
+            f"open_for={remaining}s failures={snapshot.get('consecutive_failures', 0)} "
+            f"last_reason={snapshot.get('last_reason') or '-'}"
+        )
+
+    def _provider_lane_cooldown_for_reason(self, reason: FailoverReason, *, retry_after: Optional[int] = None) -> float:
+        if retry_after:
+            return float(min(max(int(retry_after), 1), self._provider_lane_retry_after_cap()))
+        if reason in (FailoverReason.rate_limit, FailoverReason.billing):
+            return float(self._env_float("HERMES_PROVIDER_LANE_RATE_LIMIT_COOLDOWN", 60.0, minimum=1.0, maximum=3600.0))
+        if reason in (FailoverReason.auth, FailoverReason.auth_permanent):
+            return float(self._env_float("HERMES_PROVIDER_LANE_AUTH_COOLDOWN", 300.0, minimum=1.0, maximum=3600.0))
+        if reason in (FailoverReason.overloaded, FailoverReason.timeout, FailoverReason.server_error):
+            return float(self._env_float("HERMES_PROVIDER_LANE_TRANSIENT_COOLDOWN", 20.0, minimum=1.0, maximum=600.0))
+        return 0.0
+
+    def _provider_lane_precheck(self) -> tuple[_ProviderLaneState, dict, Optional[int]]:
+        lane_state = self._get_provider_lane_state()
+        snapshot = lane_state.snapshot()
+        now = time.time()
+        remaining = None
+        if snapshot["open_until"] > now:
+            remaining = max(1, int(snapshot["open_until"] - now))
+        return lane_state, snapshot, remaining
+
+    def _record_provider_lane_success(self, lane_state: Optional[_ProviderLaneState]) -> None:
+        if lane_state is None:
+            return
+        snapshot_before = lane_state.snapshot()
+        lane_state.mark_success()
+        if snapshot_before.get("consecutive_failures") or snapshot_before.get("open_until", 0.0) > time.time():
+            logger.info(
+                "Provider lane recovered %s %s",
+                self._provider_lane_label(),
+                self._provider_lane_snapshot_summary(snapshot_before),
+            )
+
+    def _record_provider_lane_failure(
+        self,
+        lane_state: Optional[_ProviderLaneState],
+        *,
+        classified,
+        api_error: Exception,
+        retry_after: Optional[int] = None,
+    ) -> None:
+        if lane_state is None:
+            return
+        reason = getattr(classified, "reason", FailoverReason.unknown)
+        cooldown = self._provider_lane_cooldown_for_reason(reason, retry_after=retry_after)
+        summary = self._summarize_api_error(api_error)
+        lane_state.mark_failure(
+            cooldown_seconds=cooldown,
+            reason=reason.value if hasattr(reason, "value") else str(reason),
+            error_summary=summary,
+        )
+        snapshot_after = lane_state.snapshot()
+        logger.warning(
+            "Provider lane opened %s cooldown=%.1fs %s error=%s",
+            self._provider_lane_label(),
+            cooldown,
+            self._provider_lane_snapshot_summary(snapshot_after),
+            summary,
+        )
 
     def __init__(
         self,
@@ -770,6 +983,7 @@ class AIAgent:
         self.interim_assistant_callback = interim_assistant_callback
         self.status_callback = status_callback
         self.tool_gen_callback = tool_gen_callback
+        self.handoff_callback = None  # Phase 2: set by gateway/CLI for session rotation
 
         
         # Tool execution state — allows _vprint during tool execution
@@ -1172,6 +1386,7 @@ class AIAgent:
         # Session health monitor (memory protection)
         from agent.session_health import SessionHealthMonitor
         self._health_monitor = SessionHealthMonitor(session_id=self.session_id)
+        self._handoff_triggered = False  # Phase 2: auto-continuation guard
         
         # SQLite session store (optional -- provided by CLI or gateway)
         self._session_db = session_db
@@ -8834,7 +9049,48 @@ class AIAgent:
                     self._safe_print(f"\n{health.format_warning()}")
                 logger.error("Session health limit reached: %s", health.warnings)
                 break
-            elif health.should_warn and self._health_monitor.should_emit_warning(health):
+            elif health.level.value == "red" and not self._handoff_triggered:
+                # Phase 2: auto-continuation — rotate session at RED level
+                self._handoff_triggered = True
+                try:
+                    from agent.session_handoff import SessionHandoff
+                    _handoff = SessionHandoff()
+                    _handoff_result = _handoff.execute_handoff(
+                        old_session_id=self.session_id,
+                        messages=messages,
+                    )
+                    # Replace messages with the new session's message list
+                    _sys_prompt = ""
+                    for _m in messages:
+                        if _m.get("role") == "system":
+                            _sys_prompt = _m.get("content", "")
+                            break
+                    messages = _handoff_result.new_messages(_sys_prompt)
+                    # Reset health monitor for the new (shorter) message list
+                    self._health_monitor = SessionHealthMonitor(
+                        session_id=_handoff_result.new_session_id,
+                    )
+                    if not self.quiet_mode:
+                        self._safe_print(f"\n{_handoff_result.user_notice}")
+                    logger.info(
+                        "Session handoff: %s → %s (%d tail msgs, fallback=%s)",
+                        _handoff_result.old_session_id,
+                        _handoff_result.new_session_id,
+                        len(_handoff_result.tail_messages),
+                        _handoff_result.fallback_mode,
+                    )
+                    # Fire handoff callback for gateway/CLI integration
+                    if hasattr(self, "handoff_callback") and self.handoff_callback:
+                        try:
+                            self.handoff_callback(_handoff_result)
+                        except Exception as _hcb_err:
+                            logger.debug("handoff_callback error: %s", _hcb_err)
+                    # Continue the loop with the fresh message list
+                    continue
+                except Exception as _handoff_err:
+                    logger.error("Session handoff failed, falling back to warning: %s", _handoff_err)
+                    # Fall through to normal warning behavior
+            if health.should_warn and self._health_monitor.should_emit_warning(health):
                 if not self.quiet_mode:
                     self._safe_print(f"\n{health.format_warning()}")
                 logger.warning("Session health warning: %s", health.warnings)
@@ -9041,7 +9297,10 @@ class AIAgent:
             
             api_start_time = time.time()
             retry_count = 0
-            max_retries = 3
+            max_retries = self._api_max_retries()
+            retry_base_delay = self._api_retry_base_delay()
+            retry_max_delay = self._api_retry_max_delay()
+            compression_retry_pause = self._compression_retry_pause()
             primary_recovery_attempted = False
             max_compression_attempts = 3
             codex_auth_retry_attempted=False
@@ -9057,6 +9316,9 @@ class AIAgent:
             api_kwargs = None  # Guard against UnboundLocalError in except handler
 
             while retry_count < max_retries:
+                lane_state = None
+                lane_waited = 0.0
+                lane_acquired = False
                 # ── Nous Portal rate limit guard ──────────────────────
                 # If another session already recorded that Nous is rate-
                 # limited, skip the API call entirely.  Each attempt
@@ -9104,7 +9366,46 @@ class AIAgent:
                     except Exception:
                         pass  # Never let rate guard break the agent loop
 
+                lane_state, _lane_snapshot, lane_open_remaining = self._provider_lane_precheck()
+                if lane_open_remaining and self._fallback_index < len(self._fallback_chain):
+                    self._emit_status(
+                        f"⛔ Provider lane open for {lane_open_remaining}s "
+                        f"({self._provider_lane_label()}) — trying fallback..."
+                    )
+                    logger.info(
+                        "Provider lane precheck triggered fallback %s %s",
+                        self._provider_lane_label(),
+                        self._provider_lane_snapshot_summary(_lane_snapshot),
+                    )
+                    if self._try_activate_fallback():
+                        retry_count = 0
+                        compression_attempts = 0
+                        primary_recovery_attempted = False
+                        continue
+                    lane_state, _lane_snapshot, lane_open_remaining = self._provider_lane_precheck()
+                if lane_open_remaining:
+                    self._emit_status(
+                        f"⏳ Provider lane cooling down for {lane_open_remaining}s "
+                        f"({self._provider_lane_label()})"
+                    )
+                elif _lane_snapshot.get("in_flight", 0) >= _lane_snapshot.get("max_concurrency", 1):
+                    logger.info(
+                        "Provider lane queued %s %s",
+                        self._provider_lane_label(),
+                        self._provider_lane_snapshot_summary(_lane_snapshot),
+                    )
+
                 try:
+                    lane_waited = lane_state.acquire(
+                        interrupt_check=lambda: self._interrupt_requested
+                    )
+                    lane_acquired = True
+                    if lane_waited >= self._provider_lane_wait_log_threshold():
+                        self._vprint(
+                            f"{self.log_prefix}⏳ Waited {lane_waited:.1f}s for provider lane "
+                            f"({self._provider_lane_label()})",
+                            force=True,
+                        )
                     self._reset_stream_delivery_tracking()
                     api_kwargs = self._build_api_kwargs(api_messages)
                     if self._force_ascii_payload:
@@ -9260,11 +9561,52 @@ class AIAgent:
                             thinking_spinner = None
                         if self.thinking_callback:
                             self.thinking_callback("")
-                        
+
+                        _last_msg_role = messages[-1].get("role") if messages else None
+                        _last_tool_name = None
+                        _last_tool_preview = None
+                        if _last_msg_role == "tool":
+                            _tool_content = messages[-1].get("content")
+                            if isinstance(_tool_content, str):
+                                _last_tool_preview = _tool_content[:240]
+                            for _m in reversed(messages):
+                                if _m.get("role") == "assistant" and _m.get("tool_calls"):
+                                    _tcs = _m["tool_calls"]
+                                    if _tcs and isinstance(_tcs[0], dict):
+                                        _last_tool_name = _tcs[-1].get("function", {}).get("name")
+                                    break
+
+                        _response_type = type(response).__name__ if response is not None else "NoneType"
+                        _choices_len = None
+                        if response is not None and hasattr(response, "choices"):
+                            try:
+                                _choices = response.choices
+                                _choices_len = len(_choices) if _choices is not None else None
+                            except Exception:
+                                _choices_len = "unavailable"
+                        _response_model = getattr(response, "model", None) if response is not None else None
+                        _response_error = getattr(response, "error", None) if response is not None else None
+                        _response_message = getattr(response, "message", None) if response is not None else None
+                        logger.warning(
+                            "Malformed upstream response: details=%s provider=%s model=%s api_mode=%s response_type=%s choices_len=%s last_msg_role=%s last_tool=%s last_tool_preview=%r response_model=%s response_error=%r response_message=%r",
+                            "; ".join(error_details) or "unknown",
+                            self.provider,
+                            self.model,
+                            self.api_mode,
+                            _response_type,
+                            _choices_len,
+                            _last_msg_role,
+                            _last_tool_name,
+                            _last_tool_preview,
+                            _response_model,
+                            _response_error,
+                            _response_message,
+                        )
+
                         # Invalid response — could be rate limiting, provider timeout,
                         # upstream server error, or malformed response.
                         retry_count += 1
-                        
+
                         # Eager fallback: empty/malformed responses are a common
                         # rate-limit symptom.  Switch to fallback immediately
                         # rather than retrying with extended backoff.
@@ -9713,6 +10055,7 @@ class AIAgent:
                             if not self.quiet_mode:
                                 self._vprint(f"{self.log_prefix}   💾 Cache: {cached:,}/{prompt:,} tokens ({hit_pct:.0f}% hit, {written:,} written)")
                     
+                    self._record_provider_lane_success(lane_state)
                     has_retried_429 = False  # Reset on success
                     # Clear Nous rate limit state on successful request —
                     # proves the limit has reset and other sessions can
@@ -9976,6 +10319,22 @@ class AIAgent:
                         )
                         continue
 
+                    _retry_after = None
+                    _resp_headers = getattr(getattr(api_error, "response", None), "headers", None)
+                    if _resp_headers and hasattr(_resp_headers, "get"):
+                        _ra_raw = _resp_headers.get("retry-after") or _resp_headers.get("Retry-After")
+                        if _ra_raw:
+                            try:
+                                _retry_after = min(int(_ra_raw), self._provider_lane_retry_after_cap())
+                            except (TypeError, ValueError):
+                                _retry_after = None
+                    self._record_provider_lane_failure(
+                        lane_state,
+                        classified=classified,
+                        api_error=api_error,
+                        retry_after=_retry_after,
+                    )
+
                     retry_count += 1
                     elapsed_time = time.time() - api_start_time
                     self._touch_activity(
@@ -10105,7 +10464,7 @@ class AIAgent:
                                     f"🗜️ Context reduced to {_reduced_ctx:,} tokens "
                                     f"(was {old_ctx:,}), retrying..."
                                 )
-                                time.sleep(2)
+                                time.sleep(compression_retry_pause)
                                 restart_with_compressed_messages = True
                                 break
                         # Fall through to normal error handling if compression
@@ -10200,7 +10559,7 @@ class AIAgent:
 
                         if len(messages) < original_len:
                             self._emit_status(f"🗜️ Compressed {original_len} → {len(messages)} messages, retrying...")
-                            time.sleep(2)  # Brief pause between compression retries
+                            time.sleep(compression_retry_pause)  # Brief pause between compression retries
                             restart_with_compressed_messages = True
                             break
                         else:
@@ -10337,7 +10696,7 @@ class AIAgent:
                         if len(messages) < original_len or new_ctx and new_ctx < old_ctx:
                             if len(messages) < original_len:
                                 self._emit_status(f"🗜️ Compressed {original_len} → {len(messages)} messages, retrying...")
-                            time.sleep(2)  # Brief pause between compression retries
+                            time.sleep(compression_retry_pause)  # Brief pause between compression retries
                             restart_with_compressed_messages = True
                             break
                         else:
@@ -10530,10 +10889,14 @@ class AIAgent:
                             _ra_raw = _resp_headers.get("retry-after") or _resp_headers.get("Retry-After")
                             if _ra_raw:
                                 try:
-                                    _retry_after = min(int(_ra_raw), 120)  # Cap at 2 minutes
+                                    _retry_after = min(int(_ra_raw), self._provider_lane_retry_after_cap())  # Cap retry-after wait
                                 except (TypeError, ValueError):
                                     pass
-                    wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+                    wait_time = _retry_after if _retry_after else jittered_backoff(
+                        retry_count,
+                        base_delay=retry_base_delay,
+                        max_delay=retry_max_delay,
+                    )
                     if is_rate_limited:
                         self._emit_status(f"⏱️ Rate limit reached. Waiting {wait_time}s before retry (attempt {retry_count + 1}/{max_retries})...")
                     else:
@@ -10571,6 +10934,9 @@ class AIAgent:
                                 f"error retry backoff ({retry_count}/{max_retries}), "
                                 f"{int(sleep_end - time.time())}s remaining"
                             )
+                finally:
+                    if lane_state is not None and lane_acquired:
+                        lane_state.release()
             
             # If the API call was interrupted, skip response processing
             if interrupted:
@@ -11176,6 +11542,13 @@ class AIAgent:
                             _prior_was_tool
                             and not getattr(self, "_post_tool_empty_retried", False)
                         ):
+                            _last_tool_name = None
+                            for _m in reversed(messages):
+                                if _m.get("role") == "assistant" and _m.get("tool_calls"):
+                                    _tcs = _m["tool_calls"]
+                                    if _tcs and isinstance(_tcs[0], dict):
+                                        _last_tool_name = _tcs[-1].get("function", {}).get("name")
+                                    break
                             self._post_tool_empty_retried = True
                             # Clear stale narration so it doesn't resurface
                             # on a later empty response after the nudge.
@@ -11183,7 +11556,11 @@ class AIAgent:
                             self._last_content_tools_all_housekeeping = False
                             logger.info(
                                 "Empty response after tool calls — nudging model "
-                                "to continue processing"
+                                "to continue (provider=%s model=%s finish_reason=%s last_tool=%s)",
+                                self.provider,
+                                self.model,
+                                finish_reason,
+                                _last_tool_name,
                             )
                             self._emit_status(
                                 "⚠️ Model returned empty after tool calls — "
@@ -11194,6 +11571,7 @@ class AIAgent:
                             #   tool(result) → assistant("(empty)") → user(nudge)
                             # Without this, we'd have tool → user which most
                             # APIs reject as an invalid sequence.
+                            assistant_msg = self._build_assistant_message(assistant_message, finish_reason)
                             assistant_msg["content"] = "(empty)"
                             messages.append(assistant_msg)
                             messages.append({

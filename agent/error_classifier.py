@@ -115,6 +115,8 @@ _RATE_LIMIT_PATTERNS = [
     # AWS Bedrock throttling
     "throttlingexception",
     "too many concurrent requests",
+    "concurrency limit exceeded",
+    "concurrency limit exceeded for account",
     "servicequotaexceededexception",
 ]
 
