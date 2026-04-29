@@ -4479,6 +4479,24 @@ class FeishuAdapter(BasePlatformAdapter):
             .build()
         )
 
+    @staticmethod
+    def _reply_fallback_metadata(metadata: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not metadata:
+            return None
+        cleaned = dict(metadata)
+        cleaned.pop("thread_id", None)
+        return cleaned or None
+
+    @staticmethod
+    def _should_fallback_reply_response(response: Any) -> bool:
+        code = getattr(response, "code", None)
+        if code in {230011, 231003}:
+            return True
+        if code == 2200:
+            msg = str(getattr(response, "msg", "") or "").lower()
+            return "internal error" in msg
+        return False
+
     async def _feishu_send_with_retry(
         self,
         *,
@@ -4503,9 +4521,9 @@ class FeishuAdapter(BasePlatformAdapter):
                 # fall back to posting a new message directly to the chat.
                 if active_reply_to and not self._response_succeeded(response):
                     code = getattr(response, "code", None)
-                    if code in _FEISHU_REPLY_FALLBACK_CODES:
+                    if self._should_fallback_reply_response(response):
                         logger.warning(
-                            "[Feishu] Reply to %s failed (code %s — message withdrawn/missing); "
+                            "[Feishu] Reply to %s failed (code %s — reply target/thread rejected); "
                             "falling back to new message in chat %s",
                             active_reply_to,
                             code,
@@ -4517,7 +4535,7 @@ class FeishuAdapter(BasePlatformAdapter):
                             msg_type=msg_type,
                             payload=payload,
                             reply_to=None,
-                            metadata=None,
+                            metadata=self._reply_fallback_metadata(metadata),
                         )
                 return response
             except Exception as exc:

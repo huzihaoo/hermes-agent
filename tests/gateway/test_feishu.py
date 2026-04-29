@@ -2429,6 +2429,53 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(captured["create_request"].request_body.receive_id, "oc_chat")
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_send_does_not_fallback_for_non_internal_2200_reply_error(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {"reply_calls": 0, "create_calls": 0}
+
+        class _MessageAPI:
+            def reply(self, request):
+                captured["reply_calls"] += 1
+                return SimpleNamespace(
+                    success=lambda: False,
+                    code=2200,
+                    msg="invalid receive_id",
+                )
+
+            def create(self, request):
+                captured["create_calls"] += 1
+                return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="unexpected"))
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content="progress update",
+                    reply_to="om_child",
+                    metadata={"thread_id": "topic:om_root"},
+                )
+            )
+
+        self.assertFalse(result.success)
+        self.assertIn("invalid receive_id", result.error)
+        self.assertEqual(captured["reply_calls"], 1)
+        self.assertEqual(captured["create_calls"], 0)
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_send_retries_transient_failure(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
