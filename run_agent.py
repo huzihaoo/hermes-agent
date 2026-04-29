@@ -2298,6 +2298,65 @@ class AIAgent:
             return {"max_completion_tokens": value}
         return {"max_tokens": value}
 
+    def _configured_default_max_tokens(self) -> Optional[int]:
+        raw = os.getenv("HERMES_DEFAULT_MAX_OUTPUT_TOKENS", "").strip()
+        if not raw:
+            return None
+        try:
+            value = int(raw)
+        except ValueError:
+            logger.warning("Ignoring invalid HERMES_DEFAULT_MAX_OUTPUT_TOKENS=%r", raw)
+            return None
+        return max(1, min(value, 131072))
+
+    def _default_max_tokens_for_current_model(self) -> Optional[int]:
+        """Return a safe output cap when config did not set max_tokens.
+
+        Some OpenAI-compatible gateways default to a small output budget. That
+        can truncate large tool-call arguments, producing invalid/incomplete JSON
+        even when input context is still fine. Use a larger default for the
+        sub2api GPT-5 family while keeping gpt-5.4-mini below its observed 128K
+        fallback context window.
+        """
+        configured = self._configured_default_max_tokens()
+        if configured is not None:
+            return configured
+        model = (self.model or "").lower().rsplit("/", 1)[-1]
+        base_url = (self.base_url or "").lower()
+        provider = (self.provider or "").lower()
+        is_sub2api = "sub2api.minieye.tech" in base_url or provider in {"custom:sub2api", "sub2api"}
+        if not is_sub2api or not model.startswith("gpt-5"):
+            return None
+        if "mini" in model:
+            return 32768
+        return 65536
+
+    def _consume_ephemeral_or_default_max_tokens(self) -> Optional[int]:
+        """Return one-call output cap override, otherwise the configured/default cap."""
+        ephemeral_out = getattr(self, "_ephemeral_max_output_tokens", None)
+        if ephemeral_out is not None:
+            self._ephemeral_max_output_tokens = None
+            try:
+                return max(1, int(ephemeral_out))
+            except (TypeError, ValueError):
+                return None
+        return self.max_tokens if self.max_tokens is not None else self._default_max_tokens_for_current_model()
+
+    def _next_truncated_tool_call_max_tokens(self, current: Optional[int]) -> int:
+        """Raise output cap after a truncated tool call, bounded by model/context."""
+        try:
+            base = int(current) if current is not None else int(self._default_max_tokens_for_current_model() or 65536)
+        except (TypeError, ValueError):
+            base = 65536
+        target = max(base * 2, 131072)
+        ctx_len = getattr(getattr(self, "context_compressor", None), "context_length", None)
+        if isinstance(ctx_len, int) and ctx_len > 0:
+            # Keep room for prompt tokens; if this is still too high for the
+            # current prompt, the existing provider error recovery will clamp it
+            # to available_tokens on the next response.
+            target = min(target, max(1, ctx_len - 1024))
+        return max(1, min(target, 131072))
+
     def _has_content_after_think_block(self, content: str) -> bool:
         """
         Check if content has actual text after any reasoning/thinking blocks.
@@ -6399,6 +6458,14 @@ class AIAgent:
                     provider=self.provider,
                 )
 
+            # The next retry still has the already-built api_messages from the
+            # primary attempt.  If the fallback has a smaller context window,
+            # force the caller to run a preflight compression pass before it
+            # sends that oversized prompt to the fallback provider.  This avoids
+            # noisy failover loops like 400K primary → 128K mini fallback →
+            # immediate context-window error.
+            self._fallback_just_activated = True
+
             self._emit_status(
                 f"🔄 Primary model failed — switching to fallback: "
                 f"{fb_model} via {fb_provider}"
@@ -6911,8 +6978,9 @@ class AIAgent:
             if self.request_overrides:
                 kwargs.update(self.request_overrides)
 
-            if self.max_tokens is not None and not is_codex_backend:
-                kwargs["max_output_tokens"] = self.max_tokens
+            effective_max_tokens = self._consume_ephemeral_or_default_max_tokens()
+            if effective_max_tokens is not None and not is_codex_backend:
+                kwargs["max_output_tokens"] = effective_max_tokens
 
             if is_xai_responses and getattr(self, "session_id", None):
                 kwargs["extra_headers"] = {"x-grok-conv-id": self.session_id}
@@ -7006,8 +7074,9 @@ class AIAgent:
         if self.tools:
             api_kwargs["tools"] = self.tools
 
-        if self.max_tokens is not None:
-            api_kwargs.update(self._max_tokens_param(self.max_tokens))
+        effective_max_tokens = self._consume_ephemeral_or_default_max_tokens()
+        if effective_max_tokens is not None:
+            api_kwargs.update(self._max_tokens_param(effective_max_tokens))
         elif self._is_qwen_portal():
             # Qwen Portal defaults to a very low max_tokens when omitted.
             # Reasoning models (qwen3-coder-plus) exhaust that budget on
@@ -9377,6 +9446,26 @@ class AIAgent:
             api_kwargs = None  # Guard against UnboundLocalError in except handler
 
             while retry_count < max_retries:
+                if getattr(self, "_fallback_just_activated", False):
+                    self._fallback_just_activated = False
+                    _fallback_compressor = getattr(self, "context_compressor", None)
+                    if (
+                        self.compression_enabled
+                        and _fallback_compressor is not None
+                        and _fallback_compressor.should_compress(approx_tokens)
+                    ):
+                        self._emit_status(
+                            f"🗜️ Fallback context requires compaction (~{approx_tokens:,} tokens; "
+                            f"limit={_fallback_compressor.context_length:,})..."
+                        )
+                        messages, active_system_prompt = self._compress_context(
+                            messages, system_message, approx_tokens=approx_tokens,
+                            task_id=effective_task_id,
+                        )
+                        conversation_history = None
+                        restart_with_compressed_messages = True
+                        break
+
                 lane_state = None
                 lane_waited = 0.0
                 lane_acquired = False
@@ -9942,15 +10031,20 @@ class AIAgent:
                         if self.api_mode in ("chat_completions", "bedrock_converse"):
                             assistant_message = response.choices[0].message
                             if assistant_message.tool_calls:
-                                if truncated_tool_call_retries < 1:
+                                if truncated_tool_call_retries < 2:
                                     truncated_tool_call_retries += 1
+                                    current_cap = None
+                                    if isinstance(api_kwargs, dict):
+                                        current_cap = api_kwargs.get("max_tokens") or api_kwargs.get("max_completion_tokens") or api_kwargs.get("max_output_tokens")
+                                    next_cap = self._next_truncated_tool_call_max_tokens(current_cap)
+                                    self._ephemeral_max_output_tokens = next_cap
                                     self._vprint(
-                                        f"{self.log_prefix}⚠️  Truncated tool call detected — retrying API call...",
+                                        f"{self.log_prefix}⚠️  Truncated tool call detected — retrying API call with max_tokens={next_cap:,}...",
                                         force=True,
                                     )
                                     # Don't append the broken response to messages;
                                     # just re-run the same API call from the current
-                                    # message state, giving the model another chance.
+                                    # message state with a larger one-call output cap.
                                     continue
                                 self._vprint(
                                     f"{self.log_prefix}⚠️  Truncated tool call response detected again — refusing to execute incomplete tool arguments.",

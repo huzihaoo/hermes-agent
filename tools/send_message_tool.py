@@ -251,6 +251,14 @@ def _handle_send(args):
                 media_files=media_files,
             )
         )
+        if isinstance(result, dict) and result.get("success"):
+            result.setdefault("chat_id", chat_id)
+            if thread_id:
+                result["thread_id"] = thread_id
+                result["delivery_target"] = f"{platform_name}:{chat_id}:{thread_id}"
+            else:
+                result.setdefault("delivery_target", f"{platform_name}:{chat_id}")
+
         if used_home_channel and isinstance(result, dict) and result.get("success"):
             result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
 
@@ -1223,6 +1231,7 @@ async def _send_feishu(pconfig, chat_id, message, media_files=None, thread_id=No
             "success": True,
             "platform": "feishu",
             "chat_id": chat_id,
+            "thread_id": normalized_thread_id or None,
             "message_id": last_result.message_id,
         }
     except Exception as e:

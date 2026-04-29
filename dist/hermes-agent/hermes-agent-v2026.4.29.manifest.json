@@ -1,0 +1,18 @@
+{
+  "version": "0.10.1",
+  "tag": "v2026.4.29",
+  "artifact": "/Users/songying/.hermes/hermes-agent/dist/hermes-agent/hermes-agent-v2026.4.29.tar.gz",
+  "sha256": "9737eeddc1eb86947dc75a4a101d4963e3d8f7380f0d08833a2ae9fa191743a4",
+  "built": "2026-04-29T20:13:55.073732",
+  "files": [
+    "gateway/platforms/feishu.py",
+    "gateway/platforms/FEISHU_CHANGELOG.md",
+    "run_agent.py",
+    "tools/send_message_tool.py",
+    "tests/gateway/test_feishu.py",
+    "tests/tools/test_send_message_tool.py",
+    "tests/test_sub2api_output_cap_static.py",
+    "hermes_cli/__init__.py",
+    "pyproject.toml"
+  ]
+}

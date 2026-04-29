@@ -4367,7 +4367,12 @@ class FeishuAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _response_succeeded(response: Any) -> bool:
-        return bool(response and getattr(response, "success", lambda: False)())
+        success = getattr(response, "success", None)
+        if callable(success):
+            return bool(response and success())
+        if isinstance(success, bool):
+            return bool(response and success)
+        return False
 
     @staticmethod
     def _extract_response_field(response: Any, field_name: str) -> Any:
@@ -4390,6 +4395,8 @@ class FeishuAdapter(BasePlatformAdapter):
         return SendResult(success=False, error=f"[{code}] {msg}", raw_response=response)
 
     def _finalize_send_result(self, response: Any, default_message: str) -> SendResult:
+        if isinstance(response, SendResult):
+            return response
         if not self._response_succeeded(response):
             return self._response_error_result(response, default_message=default_message)
         return SendResult(
@@ -4488,6 +4495,20 @@ class FeishuAdapter(BasePlatformAdapter):
         return cleaned or None
 
     @staticmethod
+    def _metadata_has_topic_thread(metadata: Optional[Dict[str, Any]]) -> bool:
+        thread_id = str((metadata or {}).get("thread_id") or "").strip()
+        return thread_id.startswith(_FEISHU_TOPIC_THREAD_PREFIX)
+
+    def _topic_reply_rejected_result(self, response: Any) -> SendResult:
+        code = getattr(response, "code", "unknown")
+        msg = getattr(response, "msg", "reply failed")
+        return SendResult(
+            success=False,
+            error=f"[{code}] reply target/thread rejected; refusing chat fallback for Feishu topic route: {msg}",
+            raw_response=response,
+        )
+
+    @staticmethod
     def _should_fallback_reply_response(response: Any) -> bool:
         code = getattr(response, "code", None)
         if code in {230011, 231003}:
@@ -4507,7 +4528,8 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
         last_error: Optional[Exception] = None
-        active_reply_to = reply_to
+        metadata_thread_id = str((metadata or {}).get("thread_id") or "").strip()
+        active_reply_to = reply_to or self._topic_anchor_from_thread_id(metadata_thread_id)
         for attempt in range(_FEISHU_SEND_ATTEMPTS):
             try:
                 response = await self._send_raw_message(
@@ -4518,10 +4540,22 @@ class FeishuAdapter(BasePlatformAdapter):
                     metadata=metadata,
                 )
                 # If replying to a message failed because it was withdrawn or not found,
-                # fall back to posting a new message directly to the chat.
+                # fall back to posting a new message directly to the chat only for plain
+                # direct replies. A topic route must fail closed; otherwise Feishu can
+                # return API success for a message that lands in the group instead of the
+                # task topic.
                 if active_reply_to and not self._response_succeeded(response):
                     code = getattr(response, "code", None)
                     if self._should_fallback_reply_response(response):
+                        if self._metadata_has_topic_thread(metadata):
+                            logger.warning(
+                                "[Feishu] Reply to topic %s failed (code %s — reply target/thread rejected); "
+                                "refusing chat fallback for topic route in chat %s",
+                                active_reply_to,
+                                code,
+                                chat_id,
+                            )
+                            return self._topic_reply_rejected_result(response)
                         logger.warning(
                             "[Feishu] Reply to %s failed (code %s — reply target/thread rejected); "
                             "falling back to new message in chat %s",

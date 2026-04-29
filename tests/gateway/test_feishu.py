@@ -2376,7 +2376,59 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertTrue(captured["reply_request"].request_body.reply_in_thread)
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_send_falls_back_to_chat_create_when_thread_reply_returns_internal_error(self):
+    def test_topic_reply_internal_error_fails_closed_instead_of_creating_chat_message(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {"reply_calls": 0, "create_calls": 0}
+
+        class _MessageAPI:
+            def reply(self, request):
+                captured["reply_calls"] += 1
+                captured["reply_request"] = request
+                return SimpleNamespace(
+                    success=lambda: False,
+                    code=2200,
+                    msg="internal error",
+                )
+
+            def create(self, request):
+                captured["create_calls"] += 1
+                captured["create_request"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_created_wrong_surface"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content="progress update",
+                    metadata={"thread_id": "topic:om_root"},
+                )
+            )
+
+        self.assertFalse(result.success)
+        self.assertIn("reply target/thread rejected", result.error)
+        self.assertEqual(captured["reply_calls"], 1)
+        self.assertEqual(captured["create_calls"], 0)
+        self.assertTrue(captured["reply_request"].request_body.reply_in_thread)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_falls_back_to_chat_create_for_non_topic_direct_reply_internal_error(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
@@ -2418,7 +2470,6 @@ class TestAdapterBehavior(unittest.TestCase):
                     chat_id="oc_chat",
                     content="progress update",
                     reply_to="om_child",
-                    metadata={"thread_id": "topic:om_root"},
                 )
             )
 

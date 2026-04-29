@@ -13,6 +13,24 @@ MAJOR.MINOR.PATCH
 
 ---
 
+## [1.3.0] — 2026-04-29 — 话题回复 fail-closed 与输出预算保护
+
+### Added
+- Topic 路由回复失败时新增 fail-closed 保护：当 Feishu topic metadata 明确存在时，reply API 返回 2200/230020 等可疑失败不再降级成群聊新消息，避免反馈落到错误 surface。
+- `send_message` 目标解析加强：支持通过 `platform:chat_id:thread_id` 精确保留飞书话题路由。
+- sub2api GPT-5 系列默认输出预算：primary 默认 65536 tokens，mini fallback 默认 32768 tokens；可用 `HERMES_DEFAULT_MAX_OUTPUT_TOKENS` 覆盖。
+- fallback 切换到更小上下文窗口时先触发压缩，再重试，避免 400K prompt 直接打到 128K fallback 造成循环失败。
+
+### Fixed
+- `_response_succeeded` 兼容 SDK response 的 `success` bool 属性和 callable 两种形态。
+- `_finalize_send_result` 可直接透传已有 `SendResult`，避免二次解析导致错误状态丢失。
+
+### Verified
+- `python -m py_compile run_agent.py gateway/platforms/feishu.py tools/send_message_tool.py` — 通过。
+- 新增/更新 Feishu topic fallback、send_message thread target、sub2api output cap 静态回归测试。
+
+---
+
 ## [1.2.0] — 2026-04-29 — 话题数据文件入口与用户可见降级
 
 ### Added
