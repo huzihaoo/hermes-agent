@@ -992,8 +992,10 @@ def _configured_feishu_max_file_bytes() -> int:
     except ValueError:
         logger.warning("[Feishu] Ignoring invalid HERMES_FEISHU_MAX_FILE_BYTES=%r", raw_value)
         return _DEFAULT_FEISHU_MAX_FILE_BYTES
-    if parsed <= 0:
-        logger.warning("[Feishu] Ignoring non-positive HERMES_FEISHU_MAX_FILE_BYTES=%r", raw_value)
+    if parsed == 0:
+        return 0
+    if parsed < 0:
+        logger.warning("[Feishu] Ignoring negative HERMES_FEISHU_MAX_FILE_BYTES=%r", raw_value)
         return _DEFAULT_FEISHU_MAX_FILE_BYTES
     return parsed
 
@@ -3739,17 +3741,18 @@ class FeishuAdapter(BasePlatformAdapter):
                 filename = response_filename or fallback_filename or f"{request_type}_{file_key}"
                 max_file_bytes = _configured_feishu_max_file_bytes()
                 raw_bytes, oversized = self._read_binary_response(response, max_bytes=max_file_bytes)
-                if not raw_bytes:
-                    continue
                 if oversized:
+                    limit_text = f"{max_file_bytes} bytes" if max_file_bytes is not None else "当前网关配置"
                     warning = (
                         f"{_normalize_feishu_text(filename)}: 文件超过当前网关下载上限 "
-                        f"{max_file_bytes} bytes；请提供 VM/NAS 路径，或拆分/压缩为较小文件。"
+                        f"{limit_text}；请提供 VM/NAS 路径，或拆分/压缩为较小文件。"
                         "中大文件请放到 /mnt/tmp/<task_id>/，对外路径为 "
                         "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/<task_id>/。"
                     )
                     logger.warning("[Feishu] Refusing oversized message resource %s/%s: %s", message_id, file_key, warning)
                     return FeishuResourceDownloadResult(warning=warning)
+                if not raw_bytes:
+                    continue
                 media_type = self._normalize_media_type(
                     content_type,
                     default=self._guess_media_type_from_filename(filename),
@@ -3788,69 +3791,77 @@ class FeishuAdapter(BasePlatformAdapter):
                 )
         return FeishuResourceDownloadResult(warning=first_warning)
 
-    # =========================================================================
-    # Static helpers — extension / media-type guessing
-    # =========================================================================
-
     @staticmethod
     def _read_binary_response(response: Any, *, max_bytes: Optional[int] = None) -> tuple[bytes, bool]:
         file_obj = getattr(response, "file", None)
         if file_obj is None:
             return b"", False
-        limit = max_bytes if max_bytes and max_bytes > 0 else None
+
+        # max_bytes=None means no host-side size gate. max_bytes=0 is an
+        # operator kill-switch: deny without touching the response stream.
+        if max_bytes is not None and max_bytes <= 0:
+            return b"", True
+
+        limit = max_bytes
+
+        # Prefer bounded chunked read() whenever available, even if getvalue()
+        # exists. BytesIO.getvalue() materializes the whole payload, which is
+        # exactly what the host-side gate must avoid for large Feishu files.
+        if hasattr(file_obj, "read"):
+            chunks: List[bytes] = []
+            total = 0
+            stream_position = None
+            try:
+                if hasattr(file_obj, "tell"):
+                    stream_position = file_obj.tell()
+                if hasattr(file_obj, "seek"):
+                    file_obj.seek(0)
+                while True:
+                    read_size = _FEISHU_RESOURCE_READ_CHUNK_BYTES
+                    if limit is not None:
+                        read_size = max(1, min(read_size, limit + 1 - total))
+                    try:
+                        chunk = file_obj.read(read_size)
+                    except TypeError:
+                        if limit is not None:
+                            # A stream that cannot honor bounded reads cannot
+                            # be safely size-gated without an unbounded read.
+                            return b"\0", True
+                        chunk = file_obj.read()
+                    if not chunk:
+                        break
+                    chunk_bytes = bytes(chunk)
+                    chunks.append(chunk_bytes)
+                    total += len(chunk_bytes)
+                    if limit is not None and total > limit:
+                        return b"".join(chunks)[: limit + 1], True
+            finally:
+                if stream_position is not None and hasattr(file_obj, "seek"):
+                    try:
+                        file_obj.seek(stream_position)
+                    except Exception:
+                        pass
+            return b"".join(chunks), False
+
+        # Fallback: getvalue() only when no read() exists. This is uncommon for
+        # SDK responses; if it exceeds the limit, report oversized.
         if hasattr(file_obj, "getvalue"):
-            if limit is not None:
-                stream_position = None
-                try:
-                    if hasattr(file_obj, "tell"):
-                        stream_position = file_obj.tell()
-                    if hasattr(file_obj, "seek"):
-                        file_obj.seek(0)
-                    data = file_obj.read(limit + 1)
-                except TypeError:
-                    return b"\0", True
-                finally:
-                    if stream_position is not None and hasattr(file_obj, "seek"):
-                        try:
-                            file_obj.seek(stream_position)
-                        except Exception:
-                            pass
-                data = bytes(data or b"")
-                if len(data) > limit:
-                    return data[: limit + 1], True
-                return data, False
             data = bytes(file_obj.getvalue())
+            if limit is not None and len(data) > limit:
+                return data[: limit + 1], True
             return data, False
 
-        chunks: List[bytes] = []
-        total = 0
-        collected = 0
-        while True:
-            try:
-                chunk = file_obj.read(_FEISHU_RESOURCE_READ_CHUNK_BYTES)
-            except TypeError:
-                if limit is None:
-                    chunk = file_obj.read()
-                else:
-                    return b"\0", True
-            if not chunk:
-                break
-            chunk = bytes(chunk)
-            total += len(chunk)
-            if limit is not None and total > limit:
-                remaining = max(0, limit + 1 - collected)
-                if remaining:
-                    chunks.append(chunk[:remaining])
-                return b"".join(chunks), True
-            chunks.append(chunk)
-            collected += len(chunk)
-        return b"".join(chunks), False
+        return b"", False
 
     @staticmethod
     def _get_response_header(response: Any, name: str) -> str:
-        raw = getattr(response, "raw", None)
-        headers = getattr(raw, "headers", {}) or {}
-        return str(headers.get(name, headers.get(name.lower(), "")) or "").split(";", 1)[0].strip().lower()
+        headers = getattr(getattr(response, "raw", None), "headers", None)
+        if not headers:
+            return ""
+        try:
+            return str(headers.get(name) or headers.get(name.lower()) or "")
+        except Exception:
+            return ""
 
     @staticmethod
     def _guess_extension(filename: str, content_type: str, default: str, *, allowed: set[str]) -> str:

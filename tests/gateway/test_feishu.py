@@ -1540,6 +1540,32 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(file_obj.read_sizes, [6])
         self.assertFalse(file_obj.getvalue_called)
 
+    @patch.dict(os.environ, {"HERMES_FEISHU_MAX_FILE_BYTES": "0"}, clear=True)
+    def test_configured_feishu_max_file_bytes_zero_means_deny_downloads(self):
+        from gateway.platforms.feishu import _configured_feishu_max_file_bytes
+
+        result = _configured_feishu_max_file_bytes()
+
+        self.assertEqual(result, 0)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_read_binary_response_max_bytes_zero_denies_any_read(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        class SmallFile:
+            def read(self, size=-1):
+                return b"x"
+
+        file_obj = SmallFile()
+        response = SimpleNamespace(file=file_obj)
+        adapter = FeishuAdapter(PlatformConfig())
+
+        raw_bytes, oversized = adapter._read_binary_response(response, max_bytes=0)
+
+        self.assertTrue(oversized)
+        self.assertEqual(raw_bytes, b"")
+
     @patch.dict(os.environ, {}, clear=True)
     def test_download_message_resource_oversized_feishu_error_reports_vm_tmp_handoff(self):
         from gateway.config import PlatformConfig
