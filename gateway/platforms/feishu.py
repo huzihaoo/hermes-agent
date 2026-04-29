@@ -149,6 +149,14 @@ _FEISHU_DOC_UPLOAD_TYPES = {
 # ---------------------------------------------------------------------------
 
 _MAX_TEXT_INJECT_BYTES = 100 * 1024
+_FEISHU_RESOURCE_READ_CHUNK_BYTES = 1024 * 1024
+_DEFAULT_FEISHU_MAX_FILE_BYTES = 32 * 1024 * 1024
+_FEISHU_KNOWN_RESOURCE_WARNINGS = {
+    234037: "文件超过飞书机器人消息下载限制，请提供 VM/NAS 路径，或拆分/压缩为较小文件。VM 临时目录建议使用 /mnt/tmp/<task_id>/，对外路径为 //hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/<task_id>/。",
+    234001: "飞书文件夹不能通过消息附件接口直接下载；请发 zip 或提供 VM/NAS 路径。若要支持文件夹读取，需要开通 Drive scopes 并走 Drive API。",
+    234003: "飞书文件夹不能通过消息附件接口直接下载；请发 zip 或提供 VM/NAS 路径。若要支持文件夹读取，需要开通 Drive scopes 并走 Drive API。",
+    99991672: "当前飞书应用缺少 Drive 读取权限，无法读取文件夹；请发 zip 或提供 VM/NAS 路径。",
+}
 _FEISHU_CONNECT_ATTEMPTS = 3
 _FEISHU_SEND_ATTEMPTS = 3
 _FEISHU_APP_LOCK_SCOPE = "feishu-app-id"
@@ -307,6 +315,13 @@ class FeishuNormalizedMessage:
     mentioned_ids: List[str] = field(default_factory=list)
     relation_kind: str = "plain"
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class FeishuResourceDownloadResult:
+    path: str = ""
+    media_type: str = ""
+    warning: str = ""
 
 
 @dataclass(frozen=True)
@@ -705,6 +720,26 @@ def normalize_feishu_message(*, message_type: str, raw_content: str) -> FeishuNo
             relation_kind=normalized_type,
             metadata={"placeholder_text": placeholder},
         )
+    if normalized_type == "folder":
+        folder_name = _first_non_empty_text(
+            payload.get("file_name"),
+            payload.get("folder_name"),
+            payload.get("title"),
+            payload.get("text"),
+        )
+        warning = _feishu_folder_unsupported_warning(folder_name)
+        return FeishuNormalizedMessage(
+            raw_type=normalized_type,
+            text_content=warning,
+            preferred_message_type="text",
+            relation_kind="folder",
+            metadata={
+                "file_key": str(payload.get("file_key", "") or "").strip(),
+                "file_name": folder_name,
+                "warning": warning,
+                "unsupported_feishu_folder": True,
+            },
+        )
     if normalized_type == "merge_forward":
         return _normalize_merge_forward_message(payload)
     if normalized_type == "share_chat":
@@ -923,6 +958,44 @@ def _build_media_ref_from_payload(payload: Dict[str, Any], *, resource_type: str
 def _attachment_placeholder(file_name: str) -> str:
     normalized_name = _normalize_feishu_text(file_name)
     return f"[Attachment: {normalized_name}]" if normalized_name else FALLBACK_ATTACHMENT_TEXT
+
+
+def _feishu_folder_unsupported_warning(folder_name: str = "") -> str:
+    normalized_name = _normalize_feishu_text(folder_name)
+    prefix = f"[Folder: {normalized_name}]\n" if normalized_name else "[Folder]\n"
+    return (
+        prefix
+        + "飞书文件夹不能通过消息附件接口直接下载；请发 zip 或提供 VM/NAS 路径。"
+        + "中大文件请放到 /mnt/tmp/<task_id>/，对外路径为 //hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/<task_id>/。"
+        + "若要支持文件夹读取，需要开通 Drive scopes 并走 Drive API。"
+    )
+
+
+def _feishu_resource_warning(code: Any, file_name: str = "") -> str:
+    try:
+        numeric_code = int(code)
+    except (TypeError, ValueError):
+        return ""
+    warning = _FEISHU_KNOWN_RESOURCE_WARNINGS.get(numeric_code, "")
+    if not warning:
+        return ""
+    normalized_name = _normalize_feishu_text(file_name)
+    return f"{normalized_name}: {warning}" if normalized_name else warning
+
+
+def _configured_feishu_max_file_bytes() -> int:
+    raw_value = os.environ.get("HERMES_FEISHU_MAX_FILE_BYTES", "")
+    if not raw_value:
+        return _DEFAULT_FEISHU_MAX_FILE_BYTES
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        logger.warning("[Feishu] Ignoring invalid HERMES_FEISHU_MAX_FILE_BYTES=%r", raw_value)
+        return _DEFAULT_FEISHU_MAX_FILE_BYTES
+    if parsed <= 0:
+        logger.warning("[Feishu] Ignoring non-positive HERMES_FEISHU_MAX_FILE_BYTES=%r", raw_value)
+        return _DEFAULT_FEISHU_MAX_FILE_BYTES
+    return parsed
 
 
 def _find_header_title(payload: Any) -> str:
@@ -2182,6 +2255,12 @@ class FeishuAdapter(BasePlatformAdapter):
         event = getattr(data, "event", None)
         action = getattr(event, "action", None)
         action_value = getattr(action, "value", {}) or {}
+        if isinstance(action_value, str):
+            try:
+                action_value = json.loads(action_value)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                logger.debug("[Feishu] Card action value is not valid JSON: %s", action_value)
+                action_value = {}
         hermes_action = action_value.get("hermes_action") if isinstance(action_value, dict) else None
 
         if hermes_action:
@@ -3441,12 +3520,20 @@ class FeishuAdapter(BasePlatformAdapter):
         logger.info("[Feishu] Received raw message type=%s message_id=%s", raw_type, message_id)
 
         normalized = normalize_feishu_message(message_type=raw_type, raw_content=raw_content)
-        media_urls, media_types = await self._download_feishu_message_resources(
+        media_urls, media_types, download_warnings = await self._download_feishu_message_resources_with_warnings(
             message_id=message_id,
             normalized=normalized,
         )
         inbound_type = self._resolve_normalized_message_type(normalized, media_types)
         text = normalized.text_content
+        warning_parts = [warning for warning in download_warnings if warning]
+        metadata_warning = str(normalized.metadata.get("warning", "") or "")
+        if metadata_warning and metadata_warning not in warning_parts and metadata_warning not in text:
+            warning_parts.insert(0, metadata_warning)
+        if warning_parts:
+            text = "\n".join(part for part in [text, *warning_parts] if part).strip()
+            if not media_urls:
+                inbound_type = MessageType.TEXT
 
         if (
             inbound_type in {MessageType.DOCUMENT, MessageType.AUDIO, MessageType.VIDEO, MessageType.PHOTO}
@@ -3465,8 +3552,21 @@ class FeishuAdapter(BasePlatformAdapter):
         message_id: str,
         normalized: FeishuNormalizedMessage,
     ) -> tuple[List[str], List[str]]:
+        media_urls, media_types, _warnings = await self._download_feishu_message_resources_with_warnings(
+            message_id=message_id,
+            normalized=normalized,
+        )
+        return media_urls, media_types
+
+    async def _download_feishu_message_resources_with_warnings(
+        self,
+        *,
+        message_id: str,
+        normalized: FeishuNormalizedMessage,
+    ) -> tuple[List[str], List[str], List[str]]:
         media_urls: List[str] = []
         media_types: List[str] = []
+        warnings: List[str] = []
 
         for image_key in normalized.image_keys:
             cached_path, media_type = await self._download_feishu_image(
@@ -3478,17 +3578,33 @@ class FeishuAdapter(BasePlatformAdapter):
                 media_types.append(media_type)
 
         for media_ref in normalized.media_refs:
-            cached_path, media_type = await self._download_feishu_message_resource(
-                message_id=message_id,
-                file_key=media_ref.file_key,
-                resource_type=media_ref.resource_type,
-                fallback_filename=media_ref.file_name,
-            )
-            if cached_path:
-                media_urls.append(cached_path)
-                media_types.append(media_type)
+            legacy_downloader = self.__dict__.get("_download_feishu_message_resource")
+            if legacy_downloader is None:
+                class_downloader = getattr(type(self), "_download_feishu_message_resource", None)
+                if class_downloader is not FeishuAdapter._download_feishu_message_resource:
+                    legacy_downloader = self._download_feishu_message_resource
+            if legacy_downloader is not None:
+                cached_path, media_type = await legacy_downloader(
+                    message_id=message_id,
+                    file_key=media_ref.file_key,
+                    resource_type=media_ref.resource_type,
+                    fallback_filename=media_ref.file_name,
+                )
+                result = FeishuResourceDownloadResult(cached_path, media_type)
+            else:
+                result = await self._download_feishu_message_resource_result(
+                    message_id=message_id,
+                    file_key=media_ref.file_key,
+                    resource_type=media_ref.resource_type,
+                    fallback_filename=media_ref.file_name,
+                )
+            if result.path:
+                media_urls.append(result.path)
+                media_types.append(result.media_type)
+            if result.warning:
+                warnings.append(result.warning)
 
-        return media_urls, media_types
+        return media_urls, media_types, warnings
 
     @staticmethod
     def _resolve_media_message_type(media_type: str, *, default: MessageType) -> MessageType:
@@ -3549,7 +3665,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     getattr(response, "msg", "request failed"),
                 )
                 return "", ""
-            raw_bytes = self._read_binary_response(response)
+            raw_bytes, _oversized = self._read_binary_response(response)
             if not raw_bytes:
                 return "", ""
             content_type = self._get_response_header(response, "Content-Type")
@@ -3570,13 +3686,30 @@ class FeishuAdapter(BasePlatformAdapter):
         resource_type: str,
         fallback_filename: str,
     ) -> tuple[str, str]:
+        result = await self._download_feishu_message_resource_result(
+            message_id=message_id,
+            file_key=file_key,
+            resource_type=resource_type,
+            fallback_filename=fallback_filename,
+        )
+        return result.path, result.media_type
+
+    async def _download_feishu_message_resource_result(
+        self,
+        *,
+        message_id: str,
+        file_key: str,
+        resource_type: str,
+        fallback_filename: str,
+    ) -> FeishuResourceDownloadResult:
         if not self._client or not message_id:
-            return "", ""
+            return FeishuResourceDownloadResult()
 
         request_types = [resource_type]
         if resource_type in {"audio", "media"}:
             request_types.append("file")
 
+        first_warning = ""
         for request_type in request_types:
             try:
                 request = self._build_message_resource_request(
@@ -3586,22 +3719,37 @@ class FeishuAdapter(BasePlatformAdapter):
                 )
                 response = await asyncio.to_thread(self._client.im.v1.message_resource.get, request)
                 if not response or not response.success():
+                    code = getattr(response, "code", "unknown")
+                    msg = getattr(response, "msg", "request failed")
                     logger.debug(
                         "[Feishu] Resource download failed for %s/%s via type=%s: %s %s",
                         message_id,
                         file_key,
                         request_type,
-                        getattr(response, "code", "unknown"),
-                        getattr(response, "msg", "request failed"),
+                        code,
+                        msg,
                     )
+                    warning = _feishu_resource_warning(code, fallback_filename)
+                    if warning and not first_warning:
+                        first_warning = warning
                     continue
 
-                raw_bytes = self._read_binary_response(response)
-                if not raw_bytes:
-                    continue
                 content_type = self._get_response_header(response, "Content-Type")
                 response_filename = getattr(response, "file_name", None) or ""
                 filename = response_filename or fallback_filename or f"{request_type}_{file_key}"
+                max_file_bytes = _configured_feishu_max_file_bytes()
+                raw_bytes, oversized = self._read_binary_response(response, max_bytes=max_file_bytes)
+                if not raw_bytes:
+                    continue
+                if oversized:
+                    warning = (
+                        f"{_normalize_feishu_text(filename)}: 文件超过当前网关下载上限 "
+                        f"{max_file_bytes} bytes；请提供 VM/NAS 路径，或拆分/压缩为较小文件。"
+                        "中大文件请放到 /mnt/tmp/<task_id>/，对外路径为 "
+                        "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/<task_id>/。"
+                    )
+                    logger.warning("[Feishu] Refusing oversized message resource %s/%s: %s", message_id, file_key, warning)
+                    return FeishuResourceDownloadResult(warning=warning)
                 media_type = self._normalize_media_type(
                     content_type,
                     default=self._guess_media_type_from_filename(filename),
@@ -3611,26 +3759,26 @@ class FeishuAdapter(BasePlatformAdapter):
                     ext = self._guess_extension(filename, content_type, ".jpg", allowed=_IMAGE_EXTENSIONS)
                     cached_path = cache_image_from_bytes(raw_bytes, ext=ext)
                     logger.info("[Feishu] Cached message image resource at %s", cached_path)
-                    return cached_path, media_type or self._default_image_media_type(ext)
+                    return FeishuResourceDownloadResult(cached_path, media_type or self._default_image_media_type(ext))
 
                 if request_type == "audio" or media_type.startswith("audio/"):
                     ext = self._guess_extension(filename, content_type, ".ogg", allowed=_AUDIO_EXTENSIONS)
                     cached_path = cache_audio_from_bytes(raw_bytes, ext=ext)
                     logger.info("[Feishu] Cached message audio resource at %s", cached_path)
-                    return cached_path, (media_type or f"audio/{ext.lstrip('.') or 'ogg'}")
+                    return FeishuResourceDownloadResult(cached_path, media_type or f"audio/{ext.lstrip('.') or 'ogg'}")
 
                 if media_type.startswith("video/"):
                     if not Path(filename).suffix:
                         filename = f"{filename}.mp4"
                     cached_path = cache_document_from_bytes(raw_bytes, filename)
                     logger.info("[Feishu] Cached message video resource at %s", cached_path)
-                    return cached_path, media_type
+                    return FeishuResourceDownloadResult(cached_path, media_type)
 
                 if not Path(filename).suffix and media_type in _DOCUMENT_MIME_TO_EXT:
                     filename = f"{filename}{_DOCUMENT_MIME_TO_EXT[media_type]}"
                 cached_path = cache_document_from_bytes(raw_bytes, filename)
                 logger.info("[Feishu] Cached message document resource at %s", cached_path)
-                return cached_path, (media_type or self._guess_document_media_type(filename))
+                return FeishuResourceDownloadResult(cached_path, media_type or self._guess_document_media_type(filename))
             except Exception:
                 logger.warning(
                     "[Feishu] Failed to cache message resource %s/%s",
@@ -3638,20 +3786,65 @@ class FeishuAdapter(BasePlatformAdapter):
                     file_key,
                     exc_info=True,
                 )
-        return "", ""
+        return FeishuResourceDownloadResult(warning=first_warning)
 
     # =========================================================================
     # Static helpers — extension / media-type guessing
     # =========================================================================
 
     @staticmethod
-    def _read_binary_response(response: Any) -> bytes:
+    def _read_binary_response(response: Any, *, max_bytes: Optional[int] = None) -> tuple[bytes, bool]:
         file_obj = getattr(response, "file", None)
         if file_obj is None:
-            return b""
+            return b"", False
+        limit = max_bytes if max_bytes and max_bytes > 0 else None
         if hasattr(file_obj, "getvalue"):
-            return bytes(file_obj.getvalue())
-        return bytes(file_obj.read())
+            if limit is not None:
+                stream_position = None
+                try:
+                    if hasattr(file_obj, "tell"):
+                        stream_position = file_obj.tell()
+                    if hasattr(file_obj, "seek"):
+                        file_obj.seek(0)
+                    data = file_obj.read(limit + 1)
+                except TypeError:
+                    return b"\0", True
+                finally:
+                    if stream_position is not None and hasattr(file_obj, "seek"):
+                        try:
+                            file_obj.seek(stream_position)
+                        except Exception:
+                            pass
+                data = bytes(data or b"")
+                if len(data) > limit:
+                    return data[: limit + 1], True
+                return data, False
+            data = bytes(file_obj.getvalue())
+            return data, False
+
+        chunks: List[bytes] = []
+        total = 0
+        collected = 0
+        while True:
+            try:
+                chunk = file_obj.read(_FEISHU_RESOURCE_READ_CHUNK_BYTES)
+            except TypeError:
+                if limit is None:
+                    chunk = file_obj.read()
+                else:
+                    return b"\0", True
+            if not chunk:
+                break
+            chunk = bytes(chunk)
+            total += len(chunk)
+            if limit is not None and total > limit:
+                remaining = max(0, limit + 1 - collected)
+                if remaining:
+                    chunks.append(chunk[:remaining])
+                return b"".join(chunks), True
+            chunks.append(chunk)
+            collected += len(chunk)
+        return b"".join(chunks), False
 
     @staticmethod
     def _get_response_header(response: Any, name: str) -> str:

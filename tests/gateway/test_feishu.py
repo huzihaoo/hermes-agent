@@ -1,6 +1,7 @@
 """Tests for the Feishu gateway integration."""
 
 import asyncio
+import io
 import json
 import os
 import tempfile
@@ -217,6 +218,21 @@ class TestFeishuMessageNormalization(unittest.TestCase):
             normalized.text_content,
             "Build Failed\nService: payments-api\nBranch: main\nView Logs\nRetry\nActions: View Logs, Retry",
         )
+
+    def test_normalize_folder_message_reports_unsupported(self):
+        from gateway.platforms.feishu import normalize_feishu_message
+
+        normalized = normalize_feishu_message(
+            message_type="folder",
+            raw_content=json.dumps({"file_key": "fld_1", "file_name": "bus-data"}),
+        )
+
+        self.assertEqual(normalized.relation_kind, "folder")
+        self.assertEqual(normalized.preferred_message_type, "text")
+        self.assertEqual(normalized.media_refs, [])
+        self.assertTrue(normalized.metadata["unsupported_feishu_folder"])
+        self.assertIn("[Folder: bus-data]", normalized.text_content)
+        self.assertIn("飞书文件夹不能通过消息附件接口直接下载", normalized.text_content)
 
 
 class TestFeishuAdapterMessaging(unittest.TestCase):
@@ -1207,6 +1223,35 @@ class TestAdapterBehavior(unittest.TestCase):
         )
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_extract_post_message_honors_subclass_legacy_resource_downloader(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        class LegacyOverrideAdapter(FeishuAdapter):
+            async def _download_feishu_message_resource(self, **kwargs):
+                return "/tmp/subclass-spec.pdf", "application/pdf"
+
+        adapter = LegacyOverrideAdapter(PlatformConfig())
+        adapter._download_feishu_image = AsyncMock(return_value=("/tmp/feishu-image.png", "image/png"))
+        message = SimpleNamespace(
+            message_type="post",
+            content=(
+                '{"en_us":{"title":"Rich message","content":['
+                '[{"tag":"img","image_key":"img_123","alt":"diagram"}],'
+                '[{"tag":"media","file_key":"file_123","file_name":"spec.pdf"}]'
+                ']}}'
+            ),
+            message_id="om_post_media_subclass",
+        )
+
+        text, msg_type, media_urls, media_types = asyncio.run(adapter._extract_message_content(message))
+
+        self.assertEqual(text, "Rich message\n[Image: diagram]\n[Attachment: spec.pdf]")
+        self.assertEqual(msg_type.value, "text")
+        self.assertEqual(media_urls, ["/tmp/feishu-image.png", "/tmp/subclass-spec.pdf"])
+        self.assertEqual(media_types, ["image/png", "application/pdf"])
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_extract_merge_forward_message_as_text_summary(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
@@ -1356,6 +1401,212 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(msg_type.value, "document")
         self.assertEqual(media_urls, ["/tmp/doc_123_report.pdf"])
         self.assertEqual(media_types, ["application/pdf"])
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_extract_folder_message_reports_unsupported_without_download(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._download_feishu_message_resource = AsyncMock(
+            return_value=("/tmp/should-not-exist", "application/octet-stream")
+        )
+        message = SimpleNamespace(
+            message_type="folder",
+            content='{"file_key":"folder_key","file_name":"raw_data"}',
+            message_id="om_folder",
+        )
+
+        text, msg_type, media_urls, media_types = asyncio.run(adapter._extract_message_content(message))
+
+        self.assertIn("raw_data", text)
+        self.assertIn("文件夹", text)
+        self.assertIn("zip", text.lower())
+        self.assertIn("/mnt/tmp/<task_id>/", text)
+        self.assertEqual(msg_type.value, "text")
+        self.assertEqual(media_urls, [])
+        self.assertEqual(media_types, [])
+        adapter._download_feishu_message_resource.assert_not_awaited()
+
+    @patch.dict(os.environ, {"HERMES_FEISHU_MAX_FILE_BYTES": "4"}, clear=True)
+    def test_extract_file_message_over_size_reports_vm_tmp_handoff(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        class SizedReadFile:
+            def __init__(self):
+                self._data = b"12345"
+
+            def read(self, size=-1):
+                if size == -1:
+                    return self._data
+                return self._data[:size]
+
+        class FakeResponse:
+            code = 0
+            msg = "ok"
+            file_name = "large.mcap"
+            file = SizedReadFile()
+            raw = SimpleNamespace(headers={"Content-Type": "application/octet-stream"})
+
+            def success(self):
+                return True
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(message_resource=SimpleNamespace(get=lambda request: FakeResponse()))
+            )
+        )
+        message = SimpleNamespace(
+            message_type="file",
+            content='{"file_key":"file_large","file_name":"large.mcap"}',
+            message_id="om_large",
+        )
+
+        text, msg_type, media_urls, media_types = asyncio.run(adapter._extract_message_content(message))
+
+        self.assertEqual(msg_type.value, "text")
+        self.assertEqual(media_urls, [])
+        self.assertEqual(media_types, [])
+        self.assertIn("large.mcap", text)
+        self.assertIn("超过", text)
+        self.assertIn("/mnt/tmp/<task_id>/", text)
+        self.assertIn("//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/<task_id>/", text)
+
+    @patch.dict(os.environ, {"HERMES_FEISHU_MAX_FILE_BYTES": "5"}, clear=True)
+    def test_read_binary_response_detects_oversize_without_reading_full_stream(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        class ChunkedFile:
+            def __init__(self):
+                self.calls = 0
+
+            def read(self, size=-1):
+                self.calls += 1
+                return b"1234" if self.calls == 1 else b"56"
+
+        file_obj = ChunkedFile()
+        response = SimpleNamespace(file=file_obj)
+        adapter = FeishuAdapter(PlatformConfig())
+
+        raw_bytes, oversized = adapter._read_binary_response(response, max_bytes=5)
+
+        self.assertTrue(oversized)
+        self.assertEqual(raw_bytes, b"123456")
+        self.assertEqual(file_obj.calls, 2)
+
+    @patch.dict(os.environ, {"HERMES_FEISHU_MAX_FILE_BYTES": "5"}, clear=True)
+    def test_read_binary_response_detects_oversize_without_getvalue_materialization(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        class BytesIOStyleFile:
+            def __init__(self):
+                self.read_sizes = []
+                self.getvalue_called = False
+                self.position = 0
+                self.data = b"123456789"
+
+            def tell(self):
+                return self.position
+
+            def seek(self, position):
+                self.position = position
+
+            def read(self, size=-1):
+                self.read_sizes.append(size)
+                if size == -1:
+                    chunk = self.data[self.position:]
+                    self.position = len(self.data)
+                    return chunk
+                chunk = self.data[self.position:self.position + size]
+                self.position += len(chunk)
+                return chunk
+
+            def getvalue(self):
+                self.getvalue_called = True
+                return self.data
+
+        file_obj = BytesIOStyleFile()
+        response = SimpleNamespace(file=file_obj)
+        adapter = FeishuAdapter(PlatformConfig())
+
+        raw_bytes, oversized = adapter._read_binary_response(response, max_bytes=5)
+
+        self.assertTrue(oversized)
+        self.assertEqual(raw_bytes, b"123456")
+        self.assertEqual(file_obj.read_sizes, [6])
+        self.assertFalse(file_obj.getvalue_called)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_download_message_resource_oversized_feishu_error_reports_vm_tmp_handoff(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        class FakeResponse:
+            code = 234037
+            msg = "Downloaded file size exceeds limit"
+
+            def success(self):
+                return False
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(message_resource=SimpleNamespace(get=lambda request: FakeResponse()))
+            )
+        )
+        message = SimpleNamespace(
+            message_type="file",
+            content='{"file_key":"file_zip","file_name":"huge.zip"}',
+            message_id="om_huge_zip",
+        )
+
+        text, msg_type, media_urls, media_types = asyncio.run(adapter._extract_message_content(message))
+
+        self.assertEqual(msg_type.value, "text")
+        self.assertEqual(media_urls, [])
+        self.assertEqual(media_types, [])
+        self.assertIn("huge.zip", text)
+        self.assertIn("飞书", text)
+        self.assertIn("/mnt/tmp/<task_id>/", text)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_prepare_inbound_document_message_includes_cached_path_and_filename(self):
+        from gateway.config import GatewayConfig, Platform
+        from gateway.platforms.base import MessageEvent, MessageType
+        from gateway.run import GatewayRunner
+        from gateway.session import SessionSource
+
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig()
+        runner.adapters = {}
+        runner._model = "test-model"
+        runner._base_url = ""
+        source = SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="oc_chat",
+            chat_type="group",
+            thread_id="om_topic",
+            user_name="张三",
+        )
+        event = MessageEvent(
+            text="请解析这个数据文件",
+            message_type=MessageType.DOCUMENT,
+            source=source,
+            media_urls=["/Users/songying/.hermes/cache/documents/doc_abc123_raw_data.dbc"],
+            media_types=["application/octet-stream"],
+        )
+
+        message_text = asyncio.run(
+            runner._prepare_inbound_message_text(event=event, source=source, history=[])
+        )
+
+        self.assertIn("raw_data.dbc", message_text)
+        self.assertIn("/Users/songying/.hermes/cache/documents/doc_abc123_raw_data.dbc", message_text)
+        self.assertIn("请解析这个数据文件", message_text)
 
     @patch.dict(os.environ, {}, clear=True)
     def test_extract_media_message_with_image_mime_becomes_photo(self):
