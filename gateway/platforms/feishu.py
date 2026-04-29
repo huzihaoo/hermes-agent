@@ -3707,6 +3707,17 @@ class FeishuAdapter(BasePlatformAdapter):
         if not self._client or not message_id:
             return FeishuResourceDownloadResult()
 
+        max_file_bytes = _configured_feishu_max_file_bytes()
+        if max_file_bytes == 0:
+            warning = (
+                f"{_normalize_feishu_text(fallback_filename or file_key)}: "
+                "当前网关已通过 HERMES_FEISHU_MAX_FILE_BYTES=0（0 bytes）禁用飞书附件下载；"
+                "请提供 VM/NAS 路径，或将中大文件放到 /mnt/tmp/<task_id>/，对外路径为 "
+                "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/<task_id>/。"
+            )
+            logger.warning("[Feishu] Message resource download disabled for %s/%s: %s", message_id, file_key, warning)
+            return FeishuResourceDownloadResult(warning=warning)
+
         request_types = [resource_type]
         if resource_type in {"audio", "media"}:
             request_types.append("file")
@@ -3739,7 +3750,6 @@ class FeishuAdapter(BasePlatformAdapter):
                 content_type = self._get_response_header(response, "Content-Type")
                 response_filename = getattr(response, "file_name", None) or ""
                 filename = response_filename or fallback_filename or f"{request_type}_{file_key}"
-                max_file_bytes = _configured_feishu_max_file_bytes()
                 raw_bytes, oversized = self._read_binary_response(response, max_bytes=max_file_bytes)
                 if oversized:
                     limit_text = f"{max_file_bytes} bytes" if max_file_bytes is not None else "当前网关配置"

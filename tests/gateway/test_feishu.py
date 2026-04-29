@@ -1548,6 +1548,34 @@ class TestAdapterBehavior(unittest.TestCase):
 
         self.assertEqual(result, 0)
 
+    @patch.dict(os.environ, {"HERMES_FEISHU_MAX_FILE_BYTES": "0"}, clear=True)
+    def test_message_resource_zero_max_skips_sdk_resource_get(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        resource_get = Mock(side_effect=AssertionError("message_resource.get must not be called"))
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(message_resource=SimpleNamespace(get=resource_get))
+            )
+        )
+        message = SimpleNamespace(
+            message_type="file",
+            content='{"file_key":"file_deny","file_name":"deny.mcap"}',
+            message_id="om_deny",
+        )
+
+        text, msg_type, media_urls, media_types = asyncio.run(adapter._extract_message_content(message))
+
+        self.assertEqual(msg_type.value, "text")
+        self.assertEqual(media_urls, [])
+        self.assertEqual(media_types, [])
+        self.assertIn("HERMES_FEISHU_MAX_FILE_BYTES=0", text)
+        self.assertIn("deny.mcap", text)
+        self.assertIn("/mnt/tmp/<task_id>/", text)
+        resource_get.assert_not_called()
+
     @patch.dict(os.environ, {}, clear=True)
     def test_read_binary_response_max_bytes_zero_denies_any_read(self):
         from gateway.config import PlatformConfig
@@ -1565,6 +1593,54 @@ class TestAdapterBehavior(unittest.TestCase):
 
         self.assertTrue(oversized)
         self.assertEqual(raw_bytes, b"")
+
+    @patch.dict(os.environ, {"HERMES_FEISHU_MAX_FILE_BYTES": "0"}, clear=True)
+    def test_extract_file_message_zero_max_file_bytes_denies_without_read_and_reports_handoff(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        class DeniedFile:
+            def __init__(self):
+                self.read_called = False
+
+            def read(self, size=-1):
+                self.read_called = True
+                return b"x"
+
+        file_obj = DeniedFile()
+
+        class FakeResponse:
+            code = 0
+            msg = "ok"
+            file_name = "blocked.mcap"
+            file = file_obj
+            raw = SimpleNamespace(headers={"Content-Type": "application/octet-stream"})
+
+            def success(self):
+                return True
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(message_resource=SimpleNamespace(get=lambda request: FakeResponse()))
+            )
+        )
+        message = SimpleNamespace(
+            message_type="file",
+            content='{"file_key":"file_blocked","file_name":"blocked.mcap"}',
+            message_id="om_blocked",
+        )
+
+        text, msg_type, media_urls, media_types = asyncio.run(adapter._extract_message_content(message))
+
+        self.assertFalse(file_obj.read_called)
+        self.assertEqual(msg_type.value, "text")
+        self.assertEqual(media_urls, [])
+        self.assertEqual(media_types, [])
+        self.assertIn("blocked.mcap", text)
+        self.assertIn("HERMES_FEISHU_MAX_FILE_BYTES=0", text)
+        self.assertIn("/mnt/tmp/<task_id>/", text)
+        self.assertIn("//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/<task_id>/", text)
 
     @patch.dict(os.environ, {}, clear=True)
     def test_download_message_resource_oversized_feishu_error_reports_vm_tmp_handoff(self):
