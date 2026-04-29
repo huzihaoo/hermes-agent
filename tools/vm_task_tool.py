@@ -53,12 +53,33 @@ def _check_vm_task_permission(user_name: str, user_id: str = "") -> str | None:
 _DEFAULT_BRIDGE_ROOT = Path.home() / "Mounts" / "mini_root" / "tmp" / "openclaw-shared-state"
 _DEFAULT_VM_CANONICAL_ROOT = Path.home() / "Mounts" / "mini_root" / ".hermes" / "shared-state"
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_VM_PATH_CONTRACT = """
+
+---
+VM path contract:
+- Code/repos live under `/home/mini/<repo>` for owner/admin main repositories, or `/home/mini/worktrees/<repo>/<user>` for member/senior isolated worktrees.
+- Shared-state execution truth lives under `/home/mini/.hermes/shared-state`; legacy/OpenClaw bridge state may appear under `/home/mini/tmp/openclaw-shared-state`.
+- Task data, downloads, conversion intermediates, caches, raw packages, and generated artifacts must default to `/mnt/tmp/<task_id>/` and `/mnt/tmp/<task_id>/downloads`.
+- User-visible CIFS path for `/mnt/tmp/<task_id>/` is `//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/<task_id>/`.
+- Mounted data/tool roots include `/mnt/evaluation_data` and `/mnt/pnc_tools`.
+- Do not default task artifacts to `~/Downloads`, `/tmp`, repo source dirs, `~/.cache`, or old `/home/mini/nas/miniPan/tmp/...` unless explicitly requested.
+- If the user asks where a download/output/path is, or says a path cannot be found, answer with both the VM-internal path and the user-visible CIFS path. If only one side is known, translate `/mnt/tmp/...` <-> `//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/...`.
+""".strip()
+
+
+def _goal_with_vm_path_contract(goal: str) -> str:
+    if "VM path contract:" in goal:
+        return goal
+    return f"{goal.rstrip()}\n\n{_VM_PATH_CONTRACT}\n"
 
 VM_TASK_SUBMIT_SCHEMA = {
     "name": "vm_task_submit",
     "description": (
         "Submit a long-running VM/business task to shared-state v2 so the VM worker executes it. "
-        "Use this instead of direct ssh-mini-run / ssh-mini-agent write execution for Feishu VM tasks."
+        "Use this instead of direct ssh-mini-run / ssh-mini-agent write execution for Feishu VM tasks. "
+        "The submitted goal is automatically appended with the VM path contract: code under /home/mini, "
+        "artifacts under /mnt/tmp/<task_id>/, and user-visible CIFS paths under "
+        "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/<task_id>/."
     ),
     "parameters": {
         "type": "object",
@@ -69,7 +90,11 @@ VM_TASK_SUBMIT_SCHEMA = {
             },
             "goal": {
                 "type": "string",
-                "description": "Full self-contained VM-visible task brief. Include repo, branch, user/worktree, paths, expected verification, and output requirements.",
+                "description": (
+                    "Full self-contained VM-visible task brief. Include repo, branch, user/worktree, "
+                    "expected verification, output requirements, and any known user-facing artifact/download path. "
+                    "The tool appends the canonical VM path contract automatically."
+                ),
             },
             "owner": {
                 "type": "string",
@@ -127,6 +152,7 @@ def vm_task_submit(title: str, goal: str, owner: str = "", user_id: str = "") ->
         return {"success": False, "error": "title is required"}
     if not goal:
         return {"success": False, "error": "goal is required"}
+    goal = _goal_with_vm_path_contract(goal)
 
     create_task = _create_task_script()
     if not create_task.exists():

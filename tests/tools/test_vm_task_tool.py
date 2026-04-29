@@ -149,6 +149,32 @@ def test_vm_task_submit_uses_trusted_session_owner_and_ignores_arg(monkeypatch, 
     assert "spoofed" not in captured["cmd"]
 
 
+def test_vm_task_submit_adds_vm_path_contract_to_goal(monkeypatch, tmp_path):
+    _disable_trusted_session(monkeypatch)
+    script = tmp_path / "create_task_v2.py"
+    script.write_text("print('unused')", encoding="utf-8")
+    monkeypatch.setattr(vm_task_tool, "_create_task_script", lambda: script)
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        goal_file = cmd[cmd.index("--goal-file") + 1]
+        captured["goal"] = open(goal_file, encoding="utf-8").read()
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"task_id": "t1"}), stderr="")
+
+    monkeypatch.setattr(vm_task_tool.subprocess, "run", fake_run)
+
+    result = vm_task_tool.vm_task_submit("title", "do work")
+
+    assert result["success"] is True
+    assert "do work" in captured["goal"]
+    assert "VM path contract" in captured["goal"]
+    assert "/mnt/tmp/<task_id>/" in captured["goal"]
+    assert "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/<task_id>/" in captured["goal"]
+    assert "/home/mini/<repo>" in captured["goal"]
+    assert "/home/mini/worktrees/<repo>/<user>" in captured["goal"]
+    assert "If the user asks where a download/output/path is" in captured["goal"]
+
+
 def test_vm_task_submit_denies_member_before_creating_task(monkeypatch, tmp_path):
     script = tmp_path / "create_task_v2.py"
     script.write_text("print('unused')", encoding="utf-8")

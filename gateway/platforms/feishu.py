@@ -222,7 +222,7 @@ _PERMISSION_REQUEST_ROLE_HINTS: tuple[tuple[re.Pattern[str], str], ...] = (
 _FEISHU_PERMISSION_REQUEST_DEDUP_TTL_SECONDS = 5 * 60
 _PERMISSION_REQUEST_ACK_TEXT = "已收到你的权限申请，正在等待管理员审批。审批通过后我会继续为你开通。"
 
-_FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003})  # reply target withdrawn/missing → create fallback
+_FEISHU_REPLY_FALLBACK_CODES = frozenset({2200, 230011, 231003})  # reply target/thread rejected → create fallback
 _FEISHU_ACK_EMOJI = "OK"
 
 # QR onboarding constants
@@ -4517,7 +4517,7 @@ class FeishuAdapter(BasePlatformAdapter):
                             msg_type=msg_type,
                             payload=payload,
                             reply_to=None,
-                            metadata=metadata,
+                            metadata=None,
                         )
                 return response
             except Exception as exc:
