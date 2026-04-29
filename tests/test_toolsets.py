@@ -57,6 +57,7 @@ class TestResolveToolset:
         assert "pnc_agents_smoke" in tools
         assert "generate_dbc" in tools
         assert "parse_bus_data" in tools
+        assert "validate_data_validity" in tools
         assert "vm_task_submit" in tools
         assert "vm_task_status" in tools
 

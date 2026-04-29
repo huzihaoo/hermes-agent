@@ -3,13 +3,24 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import shlex
 from pathlib import Path
 from typing import Literal, Optional
 
 Decision = Literal["ALLOW", "CONFIRM", "APPROVE", "DENY"]
 Role = Literal["owner", "admin", "senior", "member"]
-OpType = Literal["read", "write", "delete_small", "dangerous", "vm_direct_exec"]
+OpType = Literal[
+    "read",
+    "write",
+    "delete_small",
+    "dangerous",
+    "vm_direct_exec",
+    "vm_git_routine",
+    "vm_git_push",
+    "vm_git_dangerous",
+]
 
 _CONFIG_PATH = Path.home() / ".hermes" / "config" / "user-roles.json"
 _config: dict | None = None
@@ -86,8 +97,210 @@ def get_user_role_by_id(user_id: str) -> Role:
     return cfg["users"].get("default", "member")
 
 
+_ROUTINE_GIT_OPS = (
+    "fetch",
+    "pull",
+    "checkout",
+    "switch",
+    "status",
+    "diff",
+    "log",
+    "branch",
+    "commit",
+    "add",
+    "restore",
+    "merge",
+    "rebase",
+    "submodule",
+)
+
+
+def _extract_ssh_mini_run_remote(cmd: str) -> str | None:
+    if re.search(r"[\r\n]", cmd):
+        return None
+    try:
+        argv = shlex.split(cmd)
+    except ValueError:
+        return None
+    if len(argv) != 2:
+        return None
+    if argv[0] not in {"ssh-mini-run", "~/.local/bin/ssh-mini-run", "/Users/songying/.local/bin/ssh-mini-run"}:
+        return None
+    return argv[1].strip()
+
+
+def _has_shell_control_chars(segment: str) -> bool:
+    # Keep the routine-git bypass narrow: no command chaining beyond explicit
+    # && segments, no pipes, redirects, command substitution, backgrounding, or
+    # slash is only allowed for the exact audit-logger path validated below.
+    return bool(re.search(r"[;|`$<>\r\n#'\"\\(){}*?\[\]]|(?<!&)&(?!&)", segment))
+
+
+def _expected_session_user_name() -> str:
+    return (os.getenv("HERMES_SESSION_USER_NAME") or os.getenv("HERMES_USER_NAME") or "").strip()
+
+
+def _worktree_user_from_cd(segment: str) -> str | None:
+    match = re.match(r"^cd\s+/home/mini/worktrees/([A-Za-z0-9._-]+)/([A-Za-z0-9._\-\u4e00-\u9fff]+)/?$", segment.strip())
+    if not match:
+        return None
+    repo, user = match.groups()
+    if repo in (".", "..") or user in (".", ".."):
+        return None
+    return user
+
+
+def _is_cd_to_user_worktree(segment: str) -> bool:
+    return _worktree_user_from_cd(segment) is not None
+
+
+def _is_audit_logger(segment: str) -> bool:
+    return bool(re.match(r"^/home/mini/worktrees/audit-logger\.sh\s+[A-Za-z0-9._\-\u4e00-\u9fff]+\s+[A-Za-z0-9._-]+\s+[A-Za-z0-9._-]+$", segment.strip()))
+
+
+def _git_op(segment: str) -> str | None:
+    match = re.fullmatch(r"git\s+([a-zA-Z0-9_-]+)(?:\s+[^\r\n;|`$<>]*)?", segment.strip())
+    return match.group(1) if match else None
+
+
+def _is_git_force_push(segment: str) -> bool:
+    stripped = segment.strip()
+    return bool(
+        re.match(r"^git\s+push\b", stripped)
+        and (
+            re.search(r"\s(--force(?:-with-lease)?\b|-f\b)", stripped)
+            or re.search(r"\s\+[^\s]+", stripped)
+        )
+    )
+
+
+def _is_git_clean(segment: str) -> bool:
+    return bool(re.match(r"^git\s+clean\b", segment.strip()))
+
+
+def _is_git_dangerous(segment: str) -> bool:
+    stripped = segment.strip()
+    if re.match(r"^git\s+reset\b", stripped) and re.search(r"\s--hard\b", stripped):
+        return True
+    if _is_git_clean(stripped):
+        return True
+    if _is_git_force_push(stripped):
+        return True
+    if re.match(r"^git\s+branch\b", stripped):
+        tokens = stripped.split()[2:]
+        short_flags = "".join(token[1:] for token in tokens if token.startswith("-") and not token.startswith("--"))
+        long_flags = {token for token in tokens if token.startswith("--")}
+        has_delete = "D" in short_flags or "d" in short_flags or "--delete" in long_flags
+        has_force = "D" in short_flags or "f" in short_flags or "--force" in long_flags
+        if has_delete and has_force:
+            return True
+    return False
+
+
+def _dangerous_git_branch_pattern() -> str:
+    return r"\bgit\s+branch\b[^\r\n;|`$<>]*(\s-D\S*|\s-[A-Za-z]*D[A-Za-z]*\b|(?=[^\r\n;|`$<>]*\s-[A-Za-z]*d[A-Za-z]*\b)(?=[^\r\n;|`$<>]*\s-[A-Za-z]*f[A-Za-z]*\b)|(?=[^\r\n;|`$<>]*\s--delete\b)(?=[^\r\n;|`$<>]*\s--force\b))"
+
+
+def _contains_dangerous_git_text(cmd: str) -> bool:
+    """Detect destructive git forms anywhere in a shell-ish command string."""
+    normalized_cmd = re.sub(r"[\\'\"]", "", cmd)
+    checks = (
+        r"\bgit\s+reset\b[^\r\n;|`$<>]*\s--hard\b",
+        r"\bgit\s+clean\b",
+        r"\bgit\s+push\b[^\r\n;|`$<>]*(\s--force(?:-with-lease)?\b|\s-[A-Za-z]*f[A-Za-z]*\b|\s\+[^\s]+)",
+        _dangerous_git_branch_pattern(),
+    )
+    return any(re.search(pattern, normalized_cmd) for pattern in checks)
+
+
+def _git_segment_has_unsafe_path_args(segment: str) -> bool:
+    if re.search(r"\s--no-index\b", segment):
+        return True
+    for token in segment.split()[2:]:
+        if token.startswith(("/", "~")) or "../" in token or token == "..":
+            return True
+    return False
+
+
+def _classify_safe_git_sequence(cmd: str) -> OpType | None:
+    """Classify a narrowly-validated git-only command sequence.
+
+    This intentionally does not allow arbitrary ssh-mini-run payloads that merely
+    contain `git status` somewhere.  The whole command must be a simple direct
+    git command or a quoted ssh-mini-run payload made only of `cd <user
+    worktree>`, optional audit logger calls, and git operations joined by &&.
+    """
+    remote = _extract_ssh_mini_run_remote(cmd)
+    if remote is None:
+        return None
+    candidate = remote
+    segments = [part.strip() for part in candidate.split("&&")]
+    if not segments or any(not part for part in segments):
+        return None
+
+    expected_user = _expected_session_user_name()
+    if not expected_user:
+        return None
+    saw_git = False
+    saw_push = False
+    saw_worktree_cd = False
+    cd_user: str | None = None
+    for segment in segments:
+        if _is_audit_logger(segment):
+            continue
+        segment_cd_user = _worktree_user_from_cd(segment)
+        if segment_cd_user is not None:
+            if saw_git:
+                return None
+            if cd_user is not None and segment_cd_user != cd_user:
+                return None
+            if expected_user and segment_cd_user != expected_user:
+                return None
+            cd_user = segment_cd_user
+            saw_worktree_cd = True
+            continue
+        if _has_shell_control_chars(segment):
+            return None
+        op = _git_op(segment)
+        if not op:
+            return None
+        if _git_segment_has_unsafe_path_args(segment):
+            return None
+        if remote is not None and not saw_worktree_cd:
+            return None
+        saw_git = True
+        if _is_git_dangerous(segment):
+            return "vm_git_dangerous"
+        if op == "push":
+            saw_push = True
+            continue
+        if op == "submodule" and re.search(r"\sforeach\b", segment):
+            return None
+        if op == "rebase" and re.search(r"\s(--exec|-x\S*)\b", segment):
+            return None
+        if op not in _ROUTINE_GIT_OPS:
+            return None
+
+    if not saw_git or not saw_worktree_cd:
+        return None
+    return "vm_git_push" if saw_push else "vm_git_routine"
+
+
 def classify_command(command: str) -> OpType:
+    if _contains_dangerous_git_text(command):
+        return "vm_git_dangerous"
+    if re.search(r"[\r\n]", command):
+        return "vm_direct_exec" if "ssh-mini-run" in command else "write"
     cmd = command.strip()
+
+    # Git operations inside a user's VM worktree are normal collaboration, not
+    # generic VM direct execution.  Keep this bypass deliberately narrow: the
+    # whole command must validate as a git-only sequence, otherwise ssh-mini-run
+    # remains vm_direct_exec and member users cannot smuggle arbitrary commands
+    # next to a harmless `git status`.
+    git_classification = _classify_safe_git_sequence(cmd)
+    if git_classification:
+        return git_classification
 
     # VM direct execution: this is distinct from ordinary writes.  In shared
     # Feishu usage it bypasses the shared-state v2 -> VM worker execution plane,
@@ -125,6 +338,10 @@ def classify_command(command: str) -> OpType:
 
 
 def _decision_for(role: str, op_type: str, cfg: dict) -> Decision:
+    if op_type == "vm_git_dangerous":
+        return "DENY"
+    if op_type == "vm_git_push":
+        return "APPROVE"
     role_matrix = cfg.get("permission_matrix", {}).get(role) or cfg.get("permission_matrix", {}).get("member", {})
     decision = role_matrix.get(op_type)
     if decision:
@@ -134,6 +351,8 @@ def _decision_for(role: str, op_type: str, cfg: dict) -> Decision:
         # closed by default for Feishu/shared usage; owner can only bypass with
         # an explicit emergency marker handled in the approval layer.
         return "DENY"
+    if op_type == "vm_git_routine":
+        return "ALLOW"
     return "DENY"
 
 

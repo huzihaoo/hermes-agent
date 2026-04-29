@@ -13,6 +13,30 @@ MAJOR.MINOR.PATCH
 
 ---
 
+## [1.10.0] — 2026-04-29 — VM Git 协作放行与 PNC 数据校验代理
+
+### Added
+- `validate_data_validity` PNC agent tool is exposed in the Feishu toolset and submits work through the shared-state/VM worker path.
+- VM task briefs now use `/mnt/tmp/<task_id>/` working directories and include the user-visible CIFS artifact path.
+- Permission-policy regressions cover narrowly-scoped VM worktree git operations, member push approval, and destructive git denial.
+
+### Changed
+- Member/senior VM worktree git collaboration is classified separately from generic VM direct execution when the whole `ssh-mini-run` payload is a validated git-only sequence in the caller's own worktree.
+- PNC agent smoke checks now include the `validate-data-validity` Python CLI skeleton.
+- Feishu send-message topic targets normalize raw `om_...` anchors to topic metadata before sending.
+- Fallback context-length selection now honors configured custom provider limits during model fallback compression.
+
+### Fixed
+- VM git collaboration no longer gets over-blocked as arbitrary direct VM execution while force push, `git clean`, `git reset --hard`, unsafe branch deletion, path traversal, and command-smuggling remain fail-closed.
+- Feishu approval-card callbacks accept both SDK-native dict values and stringified JSON action values.
+
+### Verified
+- `tests/tools/test_permission_policy.py tests/tools/test_pnc_agent_tools.py tests/test_toolsets.py tests/tools/test_send_message_tool.py tests/gateway/test_feishu_approval_buttons.py` — 153 passed
+- `tests/gateway/test_admission*.py tests/gateway/test_feishu_admission_autostart.py` — 147 passed
+- `tests/gateway/test_feishu.py tests/gateway/test_pairing.py tests/e2e/test_platform_commands.py` — 222 passed
+- `python check_versions.py` — Admission Control v1.10.0, all modules version-managed
+- `py_compile` — release-touched runtime/test modules compiled
+
 ## [1.9.0] — 2026-04-28 — Feishu 任务话题反馈路由闭环
 
 ### Added

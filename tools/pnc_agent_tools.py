@@ -310,12 +310,25 @@ def _pnc_command_args(agent_name: str, args: dict[str, Any]) -> list[str]:
         effective_args.setdefault("project", DEFAULT_PNC_PROJECT)
         effective_args.setdefault("platform", DEFAULT_PNC_PLATFORM)
         effective_args.setdefault("profile", DEFAULT_PNC_PROFILE)
+    elif agent_name == "validate-data-validity":
+        # Current validate-data-validity implementation exposes the SOC-simple
+        # profile in its manifest. Accept caller overrides for future MCU packs,
+        # but default to the validated profile so Feishu data checks run today.
+        effective_args.setdefault("project", "d4q")
+        effective_args.setdefault("platform", "soc")
+        effective_args.setdefault("profile", "soc-simple")
     cmd: list[str] = []
     for key in ("project", "platform", "profile", "input", "output", "regression"):
         value = effective_args.get(key)
         if value:
             cmd.extend([f"--{key}", str(value)])
     return cmd
+
+
+def _pnc_invocation(agent_name: str, args: dict[str, Any]) -> list[str]:
+    if agent_name == "validate-data-validity":
+        return ["python3", "src/tools/validate-data-validity/cli.py", *_pnc_command_args(agent_name, args)]
+    return [f"./{agent_name}", *_pnc_command_args(agent_name, args)]
 
 
 def _build_pnc_task_goal(agent_name: str, args: dict[str, Any], user: str, user_id: str = "") -> str:
@@ -326,8 +339,13 @@ def _build_pnc_task_goal(agent_name: str, args: dict[str, Any], user: str, user_
         branch = str(args.get("branch") or "").strip()
 
     title_slug = agent_name.replace("_", "-")
-    work_tmp_dir = f"/home/mini/nas/miniPan/tmp/pnc-{title_slug}"
-    cli_args = " ".join([shlex.quote(f"./{agent_name}")] + [shlex.quote(part) for part in _pnc_command_args(agent_name, args)])
+    work_tmp_dir = f"/mnt/tmp/pnc-{title_slug}"
+    download_dir = f"{work_tmp_dir}/downloads"
+    user_visible_path = (
+        "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving"
+        f"/tmp/pnc-{title_slug}/"
+    )
+    cli_args = " ".join(shlex.quote(part) for part in _pnc_invocation(agent_name, args))
     branch_suffix = f" --branch {shlex.quote(branch)}" if branch else ""
 
     return "\n".join(
@@ -349,10 +367,12 @@ def _build_pnc_task_goal(agent_name: str, args: dict[str, Any], user: str, user_
             f"- agent_subdir: {REMOTE_AGENT_SUBDIR}",
             "",
             "VM data landing rules:",
-            "- download_dir=/home/mini/nas/miniPan/tmp/pdcl_downloads",
+            f"- download_dir={download_dir}",
             f"- work_tmp_dir={work_tmp_dir}",
-            "- Use the NAS tmp task directory for intermediates/cache/extracted files.",
-            "- Do not default new task data to ~/Downloads, /tmp, repo source dirs, or ~/.cache.",
+            f"- user_visible_path={user_visible_path}",
+            "- Use /mnt/tmp task directories for intermediates/cache/extracted files.",
+            "- When reporting artifacts to users, include the CIFS source path from user_visible_path; do not return only /mnt/tmp/... paths.",
+            "- Do not default new task data to ~/Downloads, /tmp, repo source dirs, ~/.cache, or /home/mini/nas/miniPan/tmp/... unless explicitly requested.",
             "",
             "Command to run after resolving WORKTREE_PATH from ensure_command:",
             f"- cd \"$WORKTREE_PATH/{REMOTE_AGENT_SUBDIR}\"",
@@ -448,10 +468,12 @@ def _build_smoke_script(user: str, repo: str, branch: str = "") -> str:
             "AGENT_ROOT_EXISTS=false",
             "GENERATE_DBC_EXECUTABLE=false",
             "PARSE_BUS_DATA_EXECUTABLE=false",
+            "VALIDATE_DATA_VALIDITY_CLI=false",
             "[[ -d \"$AGENT_ROOT\" ]] && AGENT_ROOT_EXISTS=true",
             "[[ -x \"$AGENT_ROOT/generate-dbc\" ]] && GENERATE_DBC_EXECUTABLE=true",
             "[[ -x \"$AGENT_ROOT/parse-bus-data\" ]] && PARSE_BUS_DATA_EXECUTABLE=true",
-            "python3 - <<'PY' \"$ENSURE_JSON\" \"$WORKTREE_PATH\" \"$AGENT_ROOT\" \"$AGENT_ROOT_EXISTS\" \"$GENERATE_DBC_EXECUTABLE\" \"$PARSE_BUS_DATA_EXECUTABLE\"",
+            "[[ -f \"$AGENT_ROOT/src/tools/validate-data-validity/cli.py\" ]] && VALIDATE_DATA_VALIDITY_CLI=true",
+            "python3 - <<'PY' \"$ENSURE_JSON\" \"$WORKTREE_PATH\" \"$AGENT_ROOT\" \"$AGENT_ROOT_EXISTS\" \"$GENERATE_DBC_EXECUTABLE\" \"$PARSE_BUS_DATA_EXECUTABLE\" \"$VALIDATE_DATA_VALIDITY_CLI\"",
             "import json, sys",
             "ensure_json = json.loads(sys.argv[1])",
             "payload = {",
@@ -462,6 +484,7 @@ def _build_smoke_script(user: str, repo: str, branch: str = "") -> str:
             "    'agent_root_exists': sys.argv[4] == 'true',",
             "    'generate_dbc_executable': sys.argv[5] == 'true',",
             "    'parse_bus_data_executable': sys.argv[6] == 'true',",
+            "    'validate_data_validity_cli': sys.argv[7] == 'true',",
             "}",
             "print(json.dumps(payload, ensure_ascii=False))",
             "PY",
@@ -536,6 +559,11 @@ def parse_bus_data_tool(args: dict[str, Any], user_id: str = "", **_: Any) -> st
     return _submit_pnc_task("parse-bus-data", args or {}, user_id=user_id)
 
 
+def validate_data_validity_tool(args: dict[str, Any], user_id: str = "", **_: Any) -> str:
+    """Submit the validate-data-validity CLI agent task for VM worker execution."""
+    return _submit_pnc_task("validate-data-validity", args or {}, user_id=user_id)
+
+
 def check_requirements() -> bool:
     return bool(shutil_which(LOCAL_WRAPPER))
 
@@ -557,6 +585,7 @@ _COMMON_PROPERTIES = {
     "regression": {"type": "string", "description": "Absolute path on the mini VM to the regression directory."},
     "timeout": {"type": "integer", "description": "Maximum runtime in seconds, default 300, capped at 1800."},
 }
+
 
 registry.register(
     name="pnc_agents_smoke",
@@ -638,5 +667,41 @@ registry.register(
     check_fn=check_requirements,
     description="Run the parse-bus-data MCU/PNC CLI agent on the mini VM",
     emoji="🚌",
+    max_result_size_chars=20000,
+)
+
+registry.register(
+    name="validate_data_validity",
+    toolset="pnc_agents",
+    schema={
+        "name": "validate_data_validity",
+        "description": (
+            "Run the validate-data-validity MCU/PNC agent on the mini VM. "
+            "Use it when a Feishu user provides MCU data or a dataset path and asks whether "
+            "the data is valid. Paths must be absolute paths on the VM. Defaults currently "
+            "match the validated manifest: project=d4q, platform=soc, profile=soc-simple; "
+            "callers may override these when MCU-specific packs are available. The gateway "
+            "sender is automatically mapped to that user's pnc_specs worktree."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                **_COMMON_PROPERTIES,
+                "input": {
+                    "type": "string",
+                    "description": "Absolute path on the mini VM to the data file or dataset directory to validate.",
+                },
+                "output": {
+                    "type": "string",
+                    "description": "Absolute path on the mini VM to write validation_report.json and summaries.",
+                },
+            },
+            "required": ["input", "output"],
+        },
+    },
+    handler=validate_data_validity_tool,
+    check_fn=check_requirements,
+    description="Run the validate-data-validity MCU/PNC CLI agent on the mini VM",
+    emoji="✅",
     max_result_size_chars=20000,
 )

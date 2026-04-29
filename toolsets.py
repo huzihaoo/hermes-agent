@@ -366,7 +366,14 @@ TOOLSETS = {
 
     "hermes-feishu": {
         "description": "Feishu/Lark bot toolset - enterprise messaging via Feishu/Lark (full access)",
-        "tools": _HERMES_CORE_TOOLS + ["pnc_agents_smoke", "generate_dbc", "parse_bus_data", "vm_task_submit", "vm_task_status"],
+        "tools": _HERMES_CORE_TOOLS + [
+            "pnc_agents_smoke",
+            "generate_dbc",
+            "parse_bus_data",
+            "validate_data_validity",
+            "vm_task_submit",
+            "vm_task_status",
+        ],
         "includes": []
     },
 

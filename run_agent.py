@@ -6370,9 +6370,26 @@ class AIAgent:
             # causing oversized sessions to overflow the fallback.
             if hasattr(self, 'context_compressor') and self.context_compressor:
                 from agent.model_metadata import get_model_context_length
+                fb_config_context_length = None
+                try:
+                    if isinstance(fb, dict) and fb.get("context_length") is not None:
+                        fb_config_context_length = int(fb.get("context_length"))
+                except (TypeError, ValueError):
+                    fb_config_context_length = None
+                if fb_config_context_length is None:
+                    try:
+                        provider_name = str(fb_provider or "")
+                        custom_name = provider_name.split(":", 1)[1] if provider_name.startswith("custom:") else ""
+                        for _cp in (self._config.get("custom_providers") or []):
+                            if isinstance(_cp, dict) and _cp.get("name") == custom_name and _cp.get("context_length") is not None:
+                                fb_config_context_length = int(_cp.get("context_length"))
+                                break
+                    except Exception:
+                        fb_config_context_length = None
                 fb_context_length = get_model_context_length(
                     self.model, base_url=self.base_url,
                     api_key=self.api_key, provider=self.provider,
+                    config_context_length=fb_config_context_length,
                 )
                 self.context_compressor.update_model(
                     model=self.model,

@@ -12,6 +12,7 @@ from gateway.config import Platform
 from tools.send_message_tool import (
     _parse_target_ref,
     _send_discord,
+    _send_feishu,
     _send_matrix_via_adapter,
     _send_telegram,
     _send_to_platform,
@@ -64,6 +65,59 @@ def _ensure_slack_mock(monkeypatch):
 
 
 class TestSendMessageTool:
+    def test_send_feishu_normalizes_topic_anchor_thread_id(self):
+        captured = {}
+
+        class FakeFeishuAdapter:
+            MAX_MESSAGE_LENGTH = 10000
+
+            def __init__(self, pconfig):
+                self._domain_name = 'feishu'
+                self._client = None
+
+            def _build_lark_client(self, domain):
+                return object()
+
+            async def send(self, chat_id, message, metadata=None):
+                captured['chat_id'] = chat_id
+                captured['message'] = message
+                captured['metadata'] = metadata
+                return SimpleNamespace(success=True, message_id='mid-1')
+
+        pconfig = SimpleNamespace(enabled=True, token='unused', extra={})
+        with patch('gateway.platforms.feishu.FEISHU_AVAILABLE', True), \
+             patch('gateway.platforms.feishu.FeishuAdapter', FakeFeishuAdapter):
+            result = asyncio.run(_send_feishu(pconfig, 'oc_chat', 'hello', thread_id='om_topic_anchor'))
+
+        assert result['success'] is True
+        assert captured['chat_id'] == 'oc_chat'
+        assert captured['metadata'] == {'thread_id': 'topic:om_topic_anchor'}
+
+    def test_send_feishu_preserves_canonical_topic_thread_id(self):
+        captured = {}
+
+        class FakeFeishuAdapter:
+            MAX_MESSAGE_LENGTH = 10000
+
+            def __init__(self, pconfig):
+                self._domain_name = 'feishu'
+                self._client = None
+
+            def _build_lark_client(self, domain):
+                return object()
+
+            async def send(self, chat_id, message, metadata=None):
+                captured['metadata'] = metadata
+                return SimpleNamespace(success=True, message_id='mid-1')
+
+        pconfig = SimpleNamespace(enabled=True, token='unused', extra={})
+        with patch('gateway.platforms.feishu.FEISHU_AVAILABLE', True), \
+             patch('gateway.platforms.feishu.FeishuAdapter', FakeFeishuAdapter):
+            result = asyncio.run(_send_feishu(pconfig, 'oc_chat', 'hello', thread_id='topic:om_topic_anchor'))
+
+        assert result['success'] is True
+        assert captured['metadata'] == {'thread_id': 'topic:om_topic_anchor'}
+
     def test_cron_duplicate_target_is_skipped_and_explained(self):
         home = SimpleNamespace(chat_id="-1001")
         config, _telegram_cfg = _make_config()

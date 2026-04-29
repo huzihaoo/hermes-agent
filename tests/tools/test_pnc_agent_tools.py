@@ -60,8 +60,10 @@ def test_generate_dbc_submits_vm_task_instead_of_direct_ssh(monkeypatch):
     assert "generate-dbc" in captured["title"]
     assert "./generate-dbc" in captured["goal"]
     assert "worktree_manager.py ensure" in captured["goal"]
-    assert "/home/mini/nas/miniPan/tmp/pdcl_downloads" in captured["goal"]
-    assert "/home/mini/nas/miniPan/tmp/" in captured["goal"]
+    assert "/mnt/tmp/pnc-generate-dbc/downloads" in captured["goal"]
+    assert "work_tmp_dir=/mnt/tmp/pnc-generate-dbc" in captured["goal"]
+    assert "user_visible_path=//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/pnc-generate-dbc/" in captured["goal"]
+    assert "/home/mini/nas/miniPan/tmp/pdcl_downloads" not in captured["goal"]
     assert "ssh-mini-agent run_bash_json" not in captured["goal"]
 
 
@@ -111,6 +113,100 @@ def test_parse_bus_data_submits_vm_task(monkeypatch):
     assert "./parse-bus-data" in captured["goal"]
 
 
+def test_validate_data_validity_submits_vm_task_with_python_cli(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(pnc_agent_tools, "_check_pnc_permission", lambda *a, **kw: None)
+    monkeypatch.setattr(pnc_agent_tools, "_current_session_user_name", lambda: "宋伟军")
+    monkeypatch.setattr(pnc_agent_tools, "_current_session_user_id", lambda: "")
+
+    def fake_submit(title, goal, owner="", user_id=""):
+        captured.update(title=title, goal=goal, owner=owner, user_id=user_id)
+        return json.dumps(
+            {
+                "success": True,
+                "task": {"task_id": "task-validate-data-validity"},
+                "routing": {"host_state": "host-created", "delivery_attempted": True},
+            },
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setattr(pnc_agent_tools.vm_task_tool, "vm_task_submit_json", fake_submit)
+
+    result = json.loads(
+        pnc_agent_tools.validate_data_validity_tool(
+            {
+                "input": "/mnt/tmp/mcu-validity/input",
+                "output": "/mnt/tmp/mcu-validity/output",
+            },
+            user_id="ou_song",
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["mode"] == "submitted"
+    assert result["agent"] == "validate-data-validity"
+    assert result["task_id"] == "task-validate-data-validity"
+    assert captured["owner"] == "宋伟军"
+    assert captured["user_id"] == "ou_song"
+    assert "validate-data-validity" in captured["title"]
+    assert "python3 src/tools/validate-data-validity/cli.py" in captured["goal"]
+    assert "--project d4q --platform soc --profile soc-simple" in captured["goal"]
+    assert "work_tmp_dir=/mnt/tmp/pnc-validate-data-validity" in captured["goal"]
+    assert "user_visible_path=//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/pnc-validate-data-validity/" in captured["goal"]
+
+
+def test_validate_data_validity_preserves_explicit_cli_context(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(pnc_agent_tools, "_check_pnc_permission", lambda *a, **kw: None)
+    monkeypatch.setattr(pnc_agent_tools, "_current_session_user_name", lambda: "宋伟军")
+    monkeypatch.setattr(pnc_agent_tools, "_current_session_user_id", lambda: "")
+
+    def fake_submit(title, goal, owner="", user_id=""):
+        captured.update(title=title, goal=goal, owner=owner, user_id=user_id)
+        return json.dumps({"success": True, "task": {"task_id": "task-explicit-validity"}, "routing": {}}, ensure_ascii=False)
+
+    monkeypatch.setattr(pnc_agent_tools.vm_task_tool, "vm_task_submit_json", fake_submit)
+
+    result = json.loads(
+        pnc_agent_tools.validate_data_validity_tool(
+            {
+                "project": "custom-project",
+                "platform": "mcu",
+                "profile": "mcu-default",
+                "input": "/mnt/tmp/mcu-validity/input",
+                "output": "/mnt/tmp/mcu-validity/output",
+            },
+            user_id="ou_song",
+        )
+    )
+
+    assert result["ok"] is True
+    assert "--project custom-project --platform mcu --profile mcu-default" in captured["goal"]
+
+
+def test_validate_data_validity_rejects_relative_input_output(monkeypatch):
+    monkeypatch.setattr(pnc_agent_tools, "_check_pnc_permission", lambda *a, **kw: None)
+    monkeypatch.setattr(pnc_agent_tools, "_current_session_user_name", lambda: "宋伟军")
+    monkeypatch.setattr(pnc_agent_tools, "_current_session_user_id", lambda: "")
+
+    result = json.loads(
+        pnc_agent_tools.validate_data_validity_tool(
+            {"input": "relative/input", "output": "/mnt/tmp/validity-output"},
+            user_id="ou_song",
+        )
+    )
+
+    assert result["agent"] == "validate-data-validity"
+    assert "input must be an absolute VM path" in result["error"]
+
+
+def test_validate_data_validity_is_exposed_in_feishu_toolset():
+    from toolsets import resolve_toolset
+
+    tools = resolve_toolset("hermes-feishu")
+    assert "validate_data_validity" in tools
+
+
 
 def test_generate_dbc_task_goal_uses_gateway_sender_when_user_omitted(monkeypatch):
     monkeypatch.setattr(pnc_agent_tools, "_check_pnc_permission", lambda *a, **kw: None)
@@ -150,7 +246,7 @@ def test_generate_dbc_task_goal_defaults_required_cli_context(monkeypatch):
         pnc_agent_tools.generate_dbc_tool(
             {
                 "input": "/home/mini/worktrees/pnc_specs/郭艳彬/in.dbc",
-                "output": "/home/mini/nas/miniPan/tmp/pnc-generate-dbc-smoke-output",
+                "output": "/mnt/tmp/pnc-generate-dbc-smoke-output",
             },
             user_id="ou_guo",
         )
@@ -179,7 +275,7 @@ def test_generate_dbc_task_goal_preserves_explicit_cli_context(monkeypatch):
                 "platform": "custom-platform",
                 "profile": "custom-profile",
                 "input": "/home/mini/worktrees/pnc_specs/郭艳彬/in.dbc",
-                "output": "/home/mini/nas/miniPan/tmp/pnc-generate-dbc-smoke-output",
+                "output": "/mnt/tmp/pnc-generate-dbc-smoke-output",
             },
             user_id="ou_guo",
         )

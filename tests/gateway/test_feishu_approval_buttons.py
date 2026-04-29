@@ -207,6 +207,44 @@ class TestFeishuExecApproval:
         ids = list(adapter._approval_state.keys())
         assert ids[0] != ids[1]
 
+    @pytest.mark.asyncio
+    async def test_permission_grant_card_button_values_remain_dict_for_sdk_callback(self):
+        adapter = _make_adapter()
+
+        mock_response = SimpleNamespace(
+            success=lambda: True,
+            data=SimpleNamespace(message_id="msg_permission"),
+        )
+        with patch.object(
+            adapter, "_feishu_send_with_retry", new_callable=AsyncMock,
+            return_value=mock_response,
+        ) as mock_send:
+            await adapter.send_exec_approval(
+                chat_id="oc_admin",
+                command="你好，我是陈德荣，帮忙开通一下高级用户权限",
+                session_key="permission_grant:ou_user:om_msg",
+                description="你好，我是陈德荣，帮忙开通一下高级用户权限",
+                metadata={
+                    "approval_kind": "permission_grant",
+                    "target_user_id": "ou_user",
+                    "target_user_name": "陈德荣",
+                    "requested_role": "senior",
+                    "request_chat_id": "oc_group",
+                    "request_chat_name": "测试群",
+                    "request_message_id": "om_msg",
+                    "request_text": "你好，我是陈德荣，帮忙开通一下高级用户权限",
+                },
+            )
+
+        card = json.loads(mock_send.call_args[1]["payload"])
+        actions = card["elements"][1]["actions"]
+        assert len(actions) == 3
+        for action in actions:
+            assert isinstance(action["value"], dict)
+            assert action["value"]["hermes_action"] in {"grant_permission", "deny"}
+            assert isinstance(action["value"]["approval_id"], int)
+
+
 
 # ===========================================================================
 # _resolve_approval — approval state pop + gateway resolution
@@ -372,6 +410,28 @@ class TestCardActionCallbackResponse:
         assert card["header"]["template"] == "green"
         assert "Approved once" in card["header"]["title"]["content"]
         assert "Bob" in card["elements"][0]["content"]
+
+
+    def test_accepts_stringified_json_action_value(self, _patch_callback_card_types):
+        adapter = _make_adapter()
+        adapter._loop = MagicMock()
+        adapter._loop.is_closed = MagicMock(return_value=False)
+        data = _make_card_action_data(
+            json.dumps({"hermes_action": "approve_once", "approval_id": 5}),
+            open_id="ou_bob",
+        )
+        adapter._sender_name_cache["ou_bob"] = ("Bob", 9999999999)
+
+        with (
+            patch("asyncio.run_coroutine_threadsafe", side_effect=_close_submitted_coro),
+            patch("tools.permission_policy.get_user_role_by_id", return_value="admin"),
+        ):
+            response = adapter._on_card_action_trigger(data)
+
+        assert response is not None
+        assert response.card is not None
+        assert response.card.type == "raw"
+        assert "Approved once" in response.card.data["header"]["title"]["content"]
 
     def test_returns_card_for_deny_action(self, _patch_callback_card_types):
         adapter = _make_adapter()
