@@ -171,6 +171,13 @@ def _validate_repo_name(repo: str) -> str:
     return normalized_repo
 
 
+def _validate_repo_lookup_name(repo: str) -> str:
+    normalized_repo = _validate_repo_name(repo)
+    if "*" in normalized_repo:
+        raise ValueError(f"invalid repo name: {repo}")
+    return normalized_repo
+
+
 def grant_repo_acl(display_name: str, repo: str, grant: str) -> str:
     cfg = _load_config()
     normalized_name = _normalize_user_name(display_name)
@@ -227,7 +234,7 @@ def _lookup_repo_grant(grants: dict, repo: str) -> object:
         if not isinstance(scope, str) or not scope.endswith("/*"):
             continue
         prefix = scope[:-2]
-        if repo == prefix or repo.startswith(prefix + "/"):
+        if repo.startswith(prefix + "/"):
             if len(prefix) > best_prefix_len:
                 best_prefix_len = len(prefix)
                 best_grant = scoped_grant
@@ -241,10 +248,12 @@ def repo_acl_allows(user_name: str, repo: str, action: RepoAction) -> bool:
     role = get_user_role(user_name)
     if role in {"owner", "admin"}:
         return True
-    if not repo:
+    try:
+        normalized_repo = _validate_repo_lookup_name(repo)
+    except ValueError:
         return False
     grants = _repo_acl_for_user(cfg, user_name)
-    grant = _lookup_repo_grant(grants, str(repo).strip().strip("/"))
+    grant = _lookup_repo_grant(grants, normalized_repo)
     return _repo_grant_allows(grant, action)
 
 
@@ -308,13 +317,65 @@ def _expected_session_user_name() -> str:
     return (os.getenv("HERMES_SESSION_USER_NAME") or os.getenv("HERMES_USER_NAME") or "").strip()
 
 
+def _known_repo_keys() -> list[str]:
+    cfg = _load_config()
+    candidates: set[str] = set()
+    repos = ((cfg.get("repo_config") or {}).get("repos") or {})
+    if isinstance(repos, dict):
+        candidates.update(str(repo).strip().strip("/") for repo in repos)
+    repo_acl = cfg.get("repo_acl", {}) or {}
+    if isinstance(repo_acl, dict):
+        for grants in repo_acl.values():
+            if not isinstance(grants, dict):
+                continue
+            for scope in grants:
+                scope = str(scope or "").strip().strip("/")
+                if scope and "*" not in scope:
+                    candidates.add(scope)
+    valid = []
+    for repo in candidates:
+        try:
+            valid.append(_validate_repo_name(repo))
+        except ValueError:
+            continue
+    return sorted(set(valid), key=lambda repo: len(repo.split("/")), reverse=True)
+
+
+def _vm_path_has_dot_segments(path: str) -> bool:
+    return any(part in {".", ".."} for part in str(path or "").split("/"))
+
+
+def _parse_worktree_repo_user(rest: str) -> tuple[str, str] | None:
+    parts = rest.strip("/").split("/") if rest.strip("/") else []
+    if len(parts) < 2 or any(part in {"", ".", ".."} for part in parts):
+        return None
+    if any(part in {".", ".."} for part in rest.split("/")):
+        return None
+    for repo in _known_repo_keys():
+        repo_parts = repo.split("/")
+        if parts[:len(repo_parts)] != repo_parts or len(parts) <= len(repo_parts):
+            continue
+        user = parts[len(repo_parts)]
+        if re.fullmatch(r"[A-Za-z0-9._\-\u4e00-\u9fff]+", user or ""):
+            return repo, user
+    repo, user = parts[0], parts[1]
+    try:
+        _validate_repo_name(repo)
+    except ValueError:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9._\-\u4e00-\u9fff]+", user or ""):
+        return None
+    return repo, user
+
+
 def _repo_name_from_vm_path(path: str) -> tuple[str, str | None, bool] | None:
     """Return (repo, worktree_user, is_main_repo_path) for known VM repo paths."""
-    worktree = re.match(r"^/home/mini/worktrees/([A-Za-z0-9._-]+)/([A-Za-z0-9._\-\u4e00-\u9fff]+)(?:/.*)?$", path)
-    if worktree:
-        repo, user = worktree.groups()
-        if repo in (".", "..") or user in (".", ".."):
+    worktree_prefix = "/home/mini/worktrees/"
+    if path == "/home/mini/worktrees" or path.startswith(worktree_prefix):
+        parsed = _parse_worktree_repo_user(path[len(worktree_prefix):])
+        if not parsed:
             return None
+        repo, user = parsed
         return repo, user, False
     main = re.match(r"^/home/mini/([A-Za-z0-9._-]+)(?:/.*)?$", path)
     if main:
@@ -342,6 +403,8 @@ def _classify_ssh_mini_agent_repo_read(cmd: str) -> OpType | None:
         return None
     expected_user = _expected_session_user_name()
     for path in vm_paths:
+        if _vm_path_has_dot_segments(path):
+            return "vm_repo_unauthorized"
         parsed = _repo_name_from_vm_path(path)
         if not parsed:
             continue
@@ -360,13 +423,10 @@ def _classify_ssh_mini_agent_repo_read(cmd: str) -> OpType | None:
 
 
 def _worktree_repo_user_from_cd(segment: str) -> tuple[str, str] | None:
-    match = re.match(r"^cd\s+/home/mini/worktrees/([A-Za-z0-9._-]+)/([A-Za-z0-9._\-\u4e00-\u9fff]+)/?$", segment.strip())
+    match = re.match(r"^cd\s+/home/mini/worktrees/([^\r\n;|`$<>]+)/?$", segment.strip())
     if not match:
         return None
-    repo, user = match.groups()
-    if repo in (".", "..") or user in (".", ".."):
-        return None
-    return repo, user
+    return _parse_worktree_repo_user(match.group(1))
 
 
 def _worktree_user_from_cd(segment: str) -> str | None:
@@ -554,6 +614,8 @@ def _classify_ssh_mini_run_source_scope(cmd: str) -> OpType | None:
     cd_path = _remote_cd_path_from_ssh_mini_run(cmd)
     if not cd_path:
         return None
+    if _vm_path_has_dot_segments(cd_path):
+        return "vm_repo_unauthorized"
     parsed = _repo_name_from_vm_path(cd_path)
     if not parsed:
         return None

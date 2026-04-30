@@ -38,20 +38,27 @@ def mock_config(tmp_path):
                     "source": str(tmp_path / "pnc_specs"),
                     "default_branch": "main",
                 },
+                "planning_algo/nop/planning": {
+                    "source": str(tmp_path / "planning_algo_nop_planning"),
+                    "default_branch": "main",
+                },
             },
         },
     }
     config_path = tmp_path / "user-roles.json"
     config_path.write_text(json.dumps(config, ensure_ascii=False))
 
-    source = tmp_path / "pnc_specs"
-    source.mkdir()
-    subprocess.run(["git", "init", "-b", "main"], cwd=source, check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.name", "Test"], cwd=source, check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.email", "test@test"], cwd=source, check=True, capture_output=True)
-    (source / "README.md").write_text("# pnc_specs")
-    subprocess.run(["git", "add", "."], cwd=source, check=True, capture_output=True)
-    subprocess.run(["git", "commit", "-m", "init"], cwd=source, check=True, capture_output=True)
+    for repo_dir, title in [
+        (tmp_path / "pnc_specs", "pnc_specs"),
+        (tmp_path / "planning_algo_nop_planning", "planning_algo/nop/planning"),
+    ]:
+        repo_dir.mkdir()
+        subprocess.run(["git", "init", "-b", "main"], cwd=repo_dir, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo_dir, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test"], cwd=repo_dir, check=True, capture_output=True)
+        (repo_dir / "README.md").write_text(f"# {title}")
+        subprocess.run(["git", "add", "."], cwd=repo_dir, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=repo_dir, check=True, capture_output=True)
 
     return config_path
 
@@ -101,6 +108,84 @@ def test_senior_without_repo_acl_cannot_get_worktree(mock_config):
 
     assert "error" in result
     assert "missing read ACL" in result["error"]
+
+
+def test_group_wildcard_repo_acl_allows_worktree(mock_config, tmp_path):
+    config = json.loads(mock_config.read_text(encoding="utf-8"))
+    config["users"]["刘旭"] = "senior"
+    config["repo_acl"]["刘旭"] = {"planning_algo/*": "read"}
+    mock_config.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+
+    with patch.object(worktree_manager, "CONFIG_PATH", mock_config):
+        result = worktree_manager.ensure_worktree("刘旭", "planning_algo/nop/planning")
+
+    assert "error" not in result
+    assert result["path"] == str(tmp_path / "worktrees" / "planning_algo/nop/planning" / "刘旭")
+    assert result["created"] is True
+
+
+def test_more_specific_repo_acl_wins_over_group_wildcard(mock_config):
+    config = json.loads(mock_config.read_text(encoding="utf-8"))
+    config["users"]["刘旭"] = "senior"
+    config["repo_acl"]["刘旭"] = {
+        "planning_algo/*": "read",
+        "planning_algo/nop/planning": "write",
+    }
+
+    assert worktree_manager.repo_acl_allows(config, "刘旭", "planning_algo/nop/planning", "write") is True
+    assert worktree_manager.repo_acl_allows(config, "刘旭", "planning_algo/nop/other", "write") is False
+    assert worktree_manager.repo_acl_allows(config, "刘旭", "planning_algo", "read") is False
+
+
+def test_repo_acl_rejects_unsafe_repo_key(mock_config):
+    config = json.loads(mock_config.read_text(encoding="utf-8"))
+    config["users"]["刘旭"] = "senior"
+    config["repo_acl"]["刘旭"] = {"*": "read"}
+
+    assert worktree_manager.repo_acl_allows(config, "刘旭", "../pnc_specs", "read") is False
+    assert worktree_manager.repo_acl_allows(config, "刘旭", "planning_algo/*", "read") is False
+
+
+def test_list_worktrees_handles_slash_repo_keys(mock_config, tmp_path):
+    config = json.loads(mock_config.read_text(encoding="utf-8"))
+    config["users"]["刘旭"] = "senior"
+    config["repo_acl"]["刘旭"] = {"planning_algo/*": "read"}
+    mock_config.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+
+    with patch.object(worktree_manager, "CONFIG_PATH", mock_config):
+        worktree_manager.ensure_worktree("刘旭", "planning_algo/nop/planning")
+        result = worktree_manager.list_worktrees("刘旭")
+
+    assert result == [
+        {
+            "repo": "planning_algo/nop/planning",
+            "user": "刘旭",
+            "path": str(tmp_path / "worktrees" / "planning_algo/nop/planning" / "刘旭"),
+            "branch": "HEAD",
+        }
+    ]
+
+
+def test_gc_worktrees_handles_slash_repo_keys(mock_config, tmp_path):
+    import os
+    import time
+
+    config = json.loads(mock_config.read_text(encoding="utf-8"))
+    config["users"]["刘旭"] = "senior"
+    config["repo_acl"]["刘旭"] = {"planning_algo/*": "read"}
+    mock_config.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+
+    with patch.object(worktree_manager, "CONFIG_PATH", mock_config):
+        worktree_manager.ensure_worktree("刘旭", "planning_algo/nop/planning")
+        git_file = tmp_path / "worktrees" / "planning_algo/nop/planning" / "刘旭" / ".git"
+        old_time = time.time() - 3 * 86400
+        os.utime(git_file, (old_time, old_time))
+        result = worktree_manager.gc_worktrees(older_than_days=1)
+
+    assert len(result) == 1
+    assert result[0]["repo"] == "planning_algo/nop/planning"
+    assert result[0]["user"] == "刘旭"
+    assert result[0]["path"] == str(tmp_path / "worktrees" / "planning_algo/nop/planning" / "刘旭")
 
 
 def test_worktree_creation_logs_audit(mock_config, tmp_path, monkeypatch):

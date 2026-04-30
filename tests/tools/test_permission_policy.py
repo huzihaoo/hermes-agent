@@ -24,6 +24,12 @@ def _write_policy_config(path: Path) -> None:
             },
             "default": {},
         },
+        "repo_config": {
+            "repos": {
+                "minieye_dnp_nop": {"source": "/home/mini/minieye_dnp_nop", "default_branch": "main"},
+                "pnc_specs": {"source": "/home/mini/pnc_specs", "default_branch": "main"},
+            }
+        },
         "user_id_mapping": {
             "ou_owner": "胡子豪",
             "ou_member": "王平",
@@ -77,6 +83,7 @@ def test_repo_acl_supports_gitlab_project_exact_and_group_wildcard(monkeypatch, 
     monkeypatch.setattr(permission_policy, "_config", None)
 
     assert permission_policy.repo_acl_allows("刘旭", "planning_algo/nop/planning", "read") is True
+    assert permission_policy.repo_acl_allows("刘旭", "planning_algo", "read") is False
     assert permission_policy.repo_acl_allows("刘旭", "planning_algo/nop/planning", "write") is False
     assert permission_policy.repo_acl_allows("刘旭", "vehicle_dev/object_perception", "write") is True
     assert permission_policy.repo_acl_allows("刘旭", "vehicle_dev/other", "read") is False
@@ -97,6 +104,79 @@ def test_grant_repo_acl_accepts_gitlab_project_paths_and_group_wildcards(monkeyp
     assert saved["repo_acl"]["陈玉"]["planning_algo/nop/planning"] == "read"
     assert saved["repo_acl"]["陈玉"]["planning_algo/*"] == "write"
     assert permission_policy.repo_acl_allows("陈玉", "planning_algo/nop/other", "write") is True
+    assert permission_policy.repo_acl_allows("陈玉", "planning_algo", "write") is False
+    assert permission_policy.repo_acl_allows("陈玉", "planning_algo/*", "read") is False
+
+
+def test_slash_repo_worktree_paths_use_configured_repo_boundary(monkeypatch, tmp_path):
+    import tools.permission_policy as permission_policy
+
+    config_path = tmp_path / "user-roles.json"
+    _write_policy_config(config_path)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["users"]["刘旭"] = "senior"
+    config["repo_acl"]["刘旭"] = {"planning_algo/*": "write"}
+    config["repo_config"]["repos"]["planning_algo"] = {
+        "source": "/home/mini/planning_algo",
+        "default_branch": "main",
+    }
+    config["repo_config"]["repos"]["planning_algo/nop/planning"] = {
+        "source": "/home/mini/planning_algo_nop_planning",
+        "default_branch": "main",
+    }
+    config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_SESSION_USER_NAME", "刘旭")
+    monkeypatch.setattr(permission_policy, "_CONFIG_PATH", config_path)
+    monkeypatch.setattr(permission_policy, "_config", None)
+
+    read_cmd = "ssh-mini-agent read_file /home/mini/worktrees/planning_algo/nop/planning/刘旭/README.md --start 1 --lines 5"
+    git_cmd = "ssh-mini-run 'cd /home/mini/worktrees/planning_algo/nop/planning/刘旭 && git status'"
+
+    assert permission_policy.classify_command(read_cmd) == "read"
+    assert permission_policy.classify_command(git_cmd) == "vm_git_routine"
+    assert permission_policy.get_decision("刘旭", git_cmd) == "ALLOW"
+
+
+def test_slash_repo_worktree_wrong_user_is_denied(monkeypatch, tmp_path):
+    import tools.permission_policy as permission_policy
+
+    config_path = tmp_path / "user-roles.json"
+    _write_policy_config(config_path)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["users"]["刘旭"] = "senior"
+    config["repo_acl"]["刘旭"] = {"planning_algo/*": "read"}
+    config["repo_config"]["repos"]["planning_algo/nop/planning"] = {
+        "source": "/home/mini/planning_algo_nop_planning",
+        "default_branch": "main",
+    }
+    config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_SESSION_USER_NAME", "刘旭")
+    monkeypatch.setattr(permission_policy, "_CONFIG_PATH", config_path)
+    monkeypatch.setattr(permission_policy, "_config", None)
+
+    cmd = "ssh-mini-agent read_file /home/mini/worktrees/planning_algo/nop/planning/王平/README.md --start 1 --lines 5"
+
+    assert permission_policy.classify_command(cmd) == "vm_repo_unauthorized"
+    assert permission_policy.get_decision("刘旭", cmd) == "DENY"
+
+
+def test_ssh_mini_agent_worktree_dotdot_path_is_denied(monkeypatch, tmp_path):
+    import tools.permission_policy as permission_policy
+
+    config_path = tmp_path / "user-roles.json"
+    _write_policy_config(config_path)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["users"]["刘旭"] = "senior"
+    config["repo_acl"]["刘旭"] = {"minieye_dnp_nop": "read"}
+    config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_SESSION_USER_NAME", "刘旭")
+    monkeypatch.setattr(permission_policy, "_CONFIG_PATH", config_path)
+    monkeypatch.setattr(permission_policy, "_config", None)
+
+    cmd = "ssh-mini-agent read_file /home/mini/worktrees/minieye_dnp_nop/刘旭/../王平/README.md --start 1 --lines 5"
+
+    assert permission_policy.classify_command(cmd) == "vm_repo_unauthorized"
+    assert permission_policy.get_decision("刘旭", cmd) == "DENY"
 
 
 def test_check_dangerous_command_does_not_turn_generic_denies_into_repo_acl_request(monkeypatch, tmp_path):
@@ -657,7 +737,7 @@ def test_worktree_repo_dotdot_is_not_routine(monkeypatch, tmp_path):
 
     command = "ssh-mini-run 'cd /home/mini/worktrees/../王平 && git status'"
 
-    assert permission_policy.classify_command(command) == "vm_direct_exec"
+    assert permission_policy.classify_command(command) == "vm_repo_unauthorized"
     assert permission_policy.get_decision("王平", command) == "DENY"
 
 

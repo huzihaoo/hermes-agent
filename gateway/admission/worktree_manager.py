@@ -61,6 +61,20 @@ def _safe_component(value: str, label: str) -> str:
     return value
 
 
+def _safe_repo_key(value: str) -> str:
+    value = str(value or "").strip().strip("/")
+    if not value:
+        raise ValueError("repo is required")
+    if "\\" in value or "\x00" in value or "*" in value:
+        raise ValueError(f"invalid repo: {value!r}")
+    parts = value.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ValueError(f"invalid repo: {value!r}")
+    if not all(re.fullmatch(r"[A-Za-z0-9._-]+", part) for part in parts):
+        raise ValueError(f"invalid repo: {value!r}")
+    return value
+
+
 def _safe_branch(value: str) -> str:
     value = str(value or "").strip()
     if not value:
@@ -96,25 +110,74 @@ def _repo_grant_allows(grant: object, action: str) -> bool:
     return False
 
 
+def _lookup_repo_grant(grants: dict, repo: str) -> object:
+    grant = grants.get(repo)
+    if grant is not None:
+        return grant
+    best_prefix_len = -1
+    best_grant = None
+    for scope, scoped_grant in grants.items():
+        if not isinstance(scope, str) or not scope.endswith("/*"):
+            continue
+        prefix = scope[:-2]
+        if repo.startswith(prefix + "/"):
+            if len(prefix) > best_prefix_len:
+                best_prefix_len = len(prefix)
+                best_grant = scoped_grant
+    if best_grant is not None:
+        return best_grant
+    return grants.get("*")
+
+
 def repo_acl_allows(config: dict, user_name: str, repo: str, action: str) -> bool:
     role = get_user_role(config, user_name)
     if role in {"owner", "admin"}:
         return True
+    try:
+        repo = _safe_repo_key(repo)
+    except ValueError:
+        return False
     acl = config.get("repo_acl", {}) or {}
     grants = acl.get(user_name)
     if grants is None:
         grants = acl.get("default", {})
     if not isinstance(grants, dict):
         return False
-    grant = grants.get(repo)
-    if grant is None:
-        grant = grants.get("*")
+    grant = _lookup_repo_grant(grants, repo)
     return _repo_grant_allows(grant, action)
 
 
 def worktree_path(rc: dict, repo: str, user: str) -> str:
     base = Path(rc.get("worktree_base", "/home/mini/worktrees"))
-    return str(base / _safe_component(repo, "repo") / _safe_component(user, "user"))
+    return str(base / _safe_repo_key(repo) / _safe_component(user, "user"))
+
+
+def _repo_user_worktree_entries(rc: dict) -> list[tuple[str, str, Path]]:
+    """Return configured repo/user worktree leaf directories.
+
+    Repo keys may contain '/' (for example planning_algo/nop/planning), so
+    scanning worktree_base as <repo>/<user> is ambiguous. Iterate configured
+    repo keys instead and treat only direct children of each repo path as users.
+    """
+    base = Path(rc.get("worktree_base", "/home/mini/worktrees"))
+    repos = rc.get("repos", {}) or {}
+    entries: list[tuple[str, str, Path]] = []
+    for repo in sorted(repos):
+        try:
+            repo_path = base / _safe_repo_key(repo)
+        except ValueError:
+            continue
+        if not repo_path.exists():
+            continue
+        for user_dir in sorted(repo_path.iterdir()):
+            if not user_dir.is_dir():
+                continue
+            try:
+                user_name = _safe_component(user_dir.name, "user")
+            except ValueError:
+                continue
+            entries.append((repo, user_name, user_dir))
+    return entries
 
 
 def ensure_worktree(user: str, repo: str, branch: str | None = None) -> dict:
@@ -130,7 +193,7 @@ def ensure_worktree(user: str, repo: str, branch: str | None = None) -> dict:
     repos = rc.get("repos", {})
 
     try:
-        repo = _safe_component(repo, "repo")
+        repo = _safe_repo_key(repo)
         user = _safe_component(user, "user")
     except ValueError as exc:
         return {"error": str(exc)}
@@ -204,21 +267,16 @@ def list_worktrees(user: str | None = None) -> list[dict]:
     if not base.exists():
         return results
 
-    for repo_dir in sorted(base.iterdir()):
-        if not repo_dir.is_dir():
+    for repo_name, user_name, user_dir in _repo_user_worktree_entries(rc):
+        if user and user_name != user:
             continue
-        for user_dir in sorted(repo_dir.iterdir()):
-            if not user_dir.is_dir():
-                continue
-            if user and user_dir.name != user:
-                continue
-            branch = _get_current_branch(str(user_dir))
-            results.append({
-                "repo": repo_dir.name,
-                "user": user_dir.name,
-                "path": str(user_dir),
-                "branch": branch,
-            })
+        branch = _get_current_branch(str(user_dir))
+        results.append({
+            "repo": repo_name,
+            "user": user_name,
+            "path": str(user_dir),
+            "branch": branch,
+        })
     return results
 
 
@@ -261,23 +319,18 @@ def gc_worktrees(older_than_days: int = 30) -> list[dict]:
     if not base.exists():
         return stale
 
-    for repo_dir in base.iterdir():
-        if not repo_dir.is_dir():
-            continue
-        for user_dir in repo_dir.iterdir():
-            if not user_dir.is_dir():
-                continue
-            # Use mtime of .git file as proxy for last access
-            git_file = user_dir / ".git"
-            if git_file.exists():
-                mtime = git_file.stat().st_mtime
-                if mtime < cutoff:
-                    stale.append({
-                        "repo": repo_dir.name,
-                        "user": user_dir.name,
-                        "path": str(user_dir),
-                        "last_access": time.strftime("%Y-%m-%d", time.localtime(mtime)),
-                    })
+    for repo_name, user_name, user_dir in _repo_user_worktree_entries(rc):
+        # Use mtime of .git file as proxy for last access
+        git_file = user_dir / ".git"
+        if git_file.exists():
+            mtime = git_file.stat().st_mtime
+            if mtime < cutoff:
+                stale.append({
+                    "repo": repo_name,
+                    "user": user_name,
+                    "path": str(user_dir),
+                    "last_access": time.strftime("%Y-%m-%d", time.localtime(mtime)),
+                })
     return stale
 
 
