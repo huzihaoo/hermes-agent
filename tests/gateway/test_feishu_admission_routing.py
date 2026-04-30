@@ -17,20 +17,21 @@ from gateway.session import SessionSource
 
 
 class _CaptureAdmission:
-    def __init__(self):
+    def __init__(self, lane: str = "heavy"):
         self.calls = []
+        self.lane = lane
 
     async def admit(self, **kwargs):
         self.calls.append(kwargs)
-        return True, "queued", SimpleNamespace(id="queue-1", lane="heavy")
+        return True, "queued", SimpleNamespace(id="queue-1", lane=self.lane)
 
 
-def _adapter_without_init() -> FeishuAdapter:
+def _adapter_without_init(*, lane: str = "heavy") -> FeishuAdapter:
     adapter = object.__new__(FeishuAdapter)
     adapter.platform = "feishu"
     adapter.config = PlatformConfig(enabled=True)
     adapter._admission_enabled = True
-    adapter._admission_controller = _CaptureAdmission()
+    adapter._admission_controller = _CaptureAdmission(lane=lane)
     adapter.sent = []
 
     async def fake_send(chat_id, content, metadata=None, **kwargs):
@@ -73,6 +74,29 @@ async def test_feishu_admission_dispatch_preserves_topic_routing_fields():
     assert adapter.sent[0]["metadata"] == {"thread_id": "topic:om_topic"}
     assert "heavy" in adapter.sent[0]["content"]
     assert "VM" in adapter.sent[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_feishu_admission_does_not_send_public_feedback_for_fast_or_standard_queue_admission():
+    for lane in ("fast", "standard"):
+        adapter = _adapter_without_init(lane=lane)
+        event = MessageEvent(
+            source=SessionSource(
+                platform="feishu",
+                user_id="ou_user",
+                chat_id="oc_group",
+                chat_type="group",
+                thread_id="topic:om_topic",
+            ),
+            text="你好",
+            message_type=MessageType.TEXT,
+            message_id="om_request",
+        )
+
+        await adapter._dispatch_inbound_event(event)
+
+        assert len(adapter._admission_controller.calls) == 1
+        assert adapter.sent == []
 
 
 @pytest.mark.asyncio

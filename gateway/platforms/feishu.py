@@ -2923,12 +2923,11 @@ class FeishuAdapter(BasePlatformAdapter):
                     queue_item.lane if queue_item else "?",
                     queue_item.id if queue_item else "?",
                 )
-                if feedback:
-                    lane = queue_item.lane if queue_item else "standard"
-                    if lane == "heavy":
-                        feedback_text = f"{feedback}。这是 heavy/VM 类任务，可能需要几分钟；我会尽量保持在这个话题回传。"
-                    else:
-                        feedback_text = feedback
+                # Public queue acknowledgements are noisy for fast/standard chat turns:
+                # the worker will answer in the same topic shortly, so only surface an
+                # explicit queue notice for heavy/VM work where users need latency context.
+                if feedback and queue_item and queue_item.lane == "heavy":
+                    feedback_text = f"{feedback}。这是 heavy/VM 类任务，可能需要几分钟；我会尽量保持在这个话题回传。"
                     try:
                         await self.send(
                             chat_id,
