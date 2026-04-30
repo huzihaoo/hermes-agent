@@ -2923,6 +2923,20 @@ class FeishuAdapter(BasePlatformAdapter):
                     queue_item.lane if queue_item else "?",
                     queue_item.id if queue_item else "?",
                 )
+                if feedback:
+                    lane = queue_item.lane if queue_item else "standard"
+                    if lane == "heavy":
+                        feedback_text = f"{feedback}。这是 heavy/VM 类任务，可能需要几分钟；我会尽量保持在这个话题回传。"
+                    else:
+                        feedback_text = feedback
+                    try:
+                        await self.send(
+                            chat_id,
+                            feedback_text,
+                            metadata={"thread_id": thread_id} if thread_id else None,
+                        )
+                    except Exception:
+                        logger.warning("[admission] Failed to send queue feedback", exc_info=True)
                 return  # Worker will process via _process_queue_item
             except Exception:
                 logger.warning("[admission] Gate error, falling through", exc_info=True)
