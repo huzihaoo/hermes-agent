@@ -8,7 +8,7 @@ from tools.registry import registry
 
 
 def _disable_trusted_session(monkeypatch):
-    monkeypatch.setattr(vm_task_tool, "_resolve_submitter", lambda user_id="": ("", ""))
+    monkeypatch.setattr(vm_task_tool, "_resolve_submitter", lambda user_id="", owner="": ("", ""))
 
 
 def test_vm_task_submit_schema_is_raw_function_schema():
@@ -134,7 +134,7 @@ def test_vm_task_submit_uses_trusted_session_owner_and_ignores_arg(monkeypatch, 
     script = tmp_path / "create_task_v2.py"
     script.write_text("print('unused')", encoding="utf-8")
     monkeypatch.setattr(vm_task_tool, "_create_task_script", lambda: script)
-    monkeypatch.setattr(vm_task_tool, "_resolve_submitter", lambda user_id="": ("郭艳彬", "ou_guo"))
+    monkeypatch.setattr(vm_task_tool, "_resolve_submitter", lambda user_id="", owner="": ("郭艳彬", "ou_guo"))
     monkeypatch.setattr(vm_task_tool, "_check_vm_task_permission", lambda *a, **kw: None)
     captured = {}
 
@@ -183,7 +183,7 @@ def test_vm_task_submit_denies_member_before_creating_task(monkeypatch, tmp_path
     script = tmp_path / "create_task_v2.py"
     script.write_text("print('unused')", encoding="utf-8")
     monkeypatch.setattr(vm_task_tool, "_create_task_script", lambda: script)
-    monkeypatch.setattr(vm_task_tool, "_resolve_submitter", lambda user_id="": ("王平", "ou_wang"))
+    monkeypatch.setattr(vm_task_tool, "_resolve_submitter", lambda user_id="", owner="": ("王平", "ou_wang"))
     monkeypatch.setattr(vm_task_tool, "_check_vm_task_permission", lambda *a, **kw: "permission denied for vm_task_submit: role 'member' is not allowed")
     called = False
 

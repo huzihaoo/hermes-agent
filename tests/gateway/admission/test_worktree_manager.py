@@ -60,6 +60,12 @@ def mock_config(tmp_path):
         subprocess.run(["git", "add", "."], cwd=repo_dir, check=True, capture_output=True)
         subprocess.run(["git", "commit", "-m", "init"], cwd=repo_dir, check=True, capture_output=True)
 
+    for branch in ["main", "dev-nop", "dev-nop-wp"]:
+        if branch == "main":
+            continue
+        subprocess.run(["git", "checkout", "-b", branch], cwd=tmp_path / "pnc_specs", check=True, capture_output=True)
+    subprocess.run(["git", "checkout", "main"], cwd=tmp_path / "pnc_specs", check=True, capture_output=True)
+
     return config_path
 
 
@@ -187,6 +193,110 @@ def test_gc_worktrees_handles_slash_repo_keys(mock_config, tmp_path):
     assert result[0]["user"] == "刘旭"
     assert result[0]["path"] == str(tmp_path / "worktrees" / "planning_algo/nop/planning" / "刘旭")
 
+
+def test_user_override_default_branch_is_user_specific(mock_config, tmp_path):
+    overrides_dir = tmp_path / "user_overrides"
+    overrides_dir.mkdir()
+    (overrides_dir / "陈玉.yaml").write_text(
+        "default_branches:\n  pnc_specs: dev-nop-wp\n",
+        encoding="utf-8",
+    )
+    (overrides_dir / "刘旭.yaml").write_text(
+        "default_branches:\n  pnc_specs: dev-nop\n",
+        encoding="utf-8",
+    )
+    config = json.loads(mock_config.read_text(encoding="utf-8"))
+    config["users"]["陈玉"] = "senior"
+    config["users"]["刘旭"] = "senior"
+    config["repo_acl"]["陈玉"] = {"pnc_specs": "read"}
+    config["repo_acl"]["刘旭"] = {"pnc_specs": "read"}
+    mock_config.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+
+    with patch.object(worktree_manager, "CONFIG_PATH", mock_config), patch.object(worktree_manager, "USER_OVERRIDES_DIR", overrides_dir):
+        cy = worktree_manager.ensure_worktree("陈玉", "pnc_specs")
+        lx = worktree_manager.ensure_worktree("刘旭", "pnc_specs")
+
+    assert cy["branch"] == "dev-nop-wp"
+    assert lx["branch"] == "dev-nop"
+
+
+def test_missing_user_override_falls_back_to_repo_default_branch(mock_config, tmp_path):
+    overrides_dir = tmp_path / "user_overrides"
+    overrides_dir.mkdir()
+    config = json.loads(mock_config.read_text(encoding="utf-8"))
+    config["users"]["刘旭"] = "senior"
+    config["repo_acl"]["刘旭"] = {"pnc_specs": "read"}
+    mock_config.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+
+    with patch.object(worktree_manager, "CONFIG_PATH", mock_config), patch.object(worktree_manager, "USER_OVERRIDES_DIR", overrides_dir):
+        result = worktree_manager.ensure_worktree("刘旭", "pnc_specs")
+
+    assert "error" not in result
+    head = subprocess.run(
+        ["git", "-C", result["path"], "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    source_head = subprocess.run(
+        ["git", "-C", str(tmp_path / "pnc_specs"), "rev-parse", "main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert head == source_head
+
+
+def test_malformed_user_override_warns_and_falls_back_to_repo_default_branch(mock_config, tmp_path, capsys):
+    overrides_dir = tmp_path / "user_overrides"
+    overrides_dir.mkdir()
+    (overrides_dir / "刘旭.yaml").write_text(
+        "  default_branches:\n    pnc_specs: dev-nop-wp\n",
+        encoding="utf-8",
+    )
+    config = json.loads(mock_config.read_text(encoding="utf-8"))
+    config["users"]["刘旭"] = "senior"
+    config["repo_acl"]["刘旭"] = {"pnc_specs": "read"}
+    mock_config.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+
+    with patch.object(worktree_manager, "CONFIG_PATH", mock_config), patch.object(worktree_manager, "USER_OVERRIDES_DIR", overrides_dir):
+        result = worktree_manager.ensure_worktree("刘旭", "pnc_specs")
+
+    captured = capsys.readouterr()
+    assert "Warning: user override ignored" in captured.err
+    assert "error" not in result
+    head = subprocess.run(
+        ["git", "-C", result["path"], "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    source_head = subprocess.run(
+        ["git", "-C", str(tmp_path / "pnc_specs"), "rev-parse", "main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert head == source_head
+
+
+def test_user_override_invalid_branch_is_rejected(mock_config, tmp_path):
+    overrides_dir = tmp_path / "user_overrides"
+    overrides_dir.mkdir()
+    (overrides_dir / "刘旭.yaml").write_text(
+        "default_branches:\n  pnc_specs: ../../main\n",
+        encoding="utf-8",
+    )
+    config = json.loads(mock_config.read_text(encoding="utf-8"))
+    config["users"]["刘旭"] = "senior"
+    config["repo_acl"]["刘旭"] = {"pnc_specs": "read"}
+    mock_config.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+
+    with patch.object(worktree_manager, "CONFIG_PATH", mock_config), patch.object(worktree_manager, "USER_OVERRIDES_DIR", overrides_dir):
+        result = worktree_manager.ensure_worktree("刘旭", "pnc_specs")
+
+    assert "error" in result
+    assert "invalid branch" in result["error"]
 
 def test_worktree_creation_logs_audit(mock_config, tmp_path, monkeypatch):
     """Creating a worktree should log to audit."""

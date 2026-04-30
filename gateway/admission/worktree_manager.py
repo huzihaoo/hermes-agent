@@ -21,6 +21,7 @@ import sys
 from pathlib import Path
 
 CONFIG_PATH = Path.home() / ".hermes" / "config" / "user-roles.json"
+USER_OVERRIDES_DIR = Path.home() / ".hermes" / "config" / "user_overrides"
 AUDIT_LOG_PATH = Path("/home/mini/worktrees/.audit.log")
 
 
@@ -50,6 +51,78 @@ def get_user_name(config: dict, user_id: str) -> str | None:
 
 def get_user_role(config: dict, user_name: str) -> str:
     return config.get("users", {}).get(user_name, config.get("users", {}).get("default", "member"))
+
+
+def _parse_minimal_yaml_mapping(text: str) -> dict:
+    """Parse the tiny YAML subset used by user_overrides without PyYAML.
+
+    Supported subset:
+    - indentation-based mappings only
+    - scalar string values, optionally single/double quoted
+    - blank lines and whole-line/trailing comments
+
+    Unsupported YAML forms are treated as plain scalar text where possible; malformed
+    files fall back to repo defaults via load_user_override().
+    """
+    result: dict = {}
+    stack: list[tuple[int, dict]] = [(-1, result)]
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].rstrip()
+        if not line.strip() or ":" not in line:
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if len(stack) == 1 and indent != 0:
+            raise ValueError("top-level keys in user override must not be indented")
+        key, value = line.strip().split(":", 1)
+        key = key.strip()
+        value = value.strip()
+        while stack and indent <= stack[-1][0]:
+            stack.pop()
+        if not stack:
+            raise ValueError("invalid indentation in user override")
+        parent = stack[-1][1]
+        if not value:
+            child: dict = {}
+            parent[key] = child
+            stack.append((indent, child))
+        else:
+            if value == "{}":
+                parent[key] = {}
+                continue
+            if (value.startswith('\"') and value.endswith('\"')) or (value.startswith("'") and value.endswith("'")):
+                value = value[1:-1]
+            parent[key] = value
+    return result
+
+
+def _warn_user_override(message: str) -> None:
+    print(f"Warning: user override ignored: {message}", file=sys.stderr)
+
+
+def load_user_override(user: str) -> dict:
+    try:
+        safe_user = _safe_component(user, "user")
+    except ValueError as exc:
+        _warn_user_override(str(exc))
+        return {}
+    path = USER_OVERRIDES_DIR / f"{safe_user}.yaml"
+    if not path.is_file():
+        return {}
+    try:
+        return _parse_minimal_yaml_mapping(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        _warn_user_override(f"{path}: {exc}")
+        return {}
+
+
+def get_user_default_branch(config: dict, user: str, repo: str, fallback: str) -> str:
+    override = load_user_override(user)
+    branches = override.get("default_branches", {}) if isinstance(override, dict) else {}
+    if isinstance(branches, dict):
+        value = branches.get(repo)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return fallback
 
 
 def _safe_component(value: str, label: str) -> str:
@@ -203,7 +276,7 @@ def ensure_worktree(user: str, repo: str, branch: str | None = None) -> dict:
 
     repo_info = repos[repo]
     source = repo_info["source"]
-    default_branch = repo_info.get("default_branch", "main")
+    default_branch = get_user_default_branch(config, user, repo, repo_info.get("default_branch", "main"))
     try:
         target_branch = _safe_branch(branch or default_branch)
     except ValueError as exc:
