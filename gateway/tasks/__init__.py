@@ -1,6 +1,12 @@
 """Task product layer.
 
 Version History:
+  v1.4.0 (2026-04-30) — Routing metadata and delivery diagnostics
+    - Task records persist chat/thread/message routing metadata
+    - Task errors retain error class/message and receipt/delivery verification hints
+    - SQLite schema migrates older tasks.db files additively
+    - 277 focused release tests passing
+
   v1.3.0 (2026-04-26) — Task cancel + retry
     - TaskStore.cancel_task(): cancel pending/running tasks
     - TaskStore.retry_task(): reset failed/cancelled tasks to pending
@@ -30,7 +36,7 @@ Version History:
     - 36/36 tests passing
 """
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 from gateway.tasks.types import Task, TaskReceipt, TaskStatus, TaskType, _infer_task_type
 

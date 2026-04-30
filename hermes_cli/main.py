@@ -5584,6 +5584,18 @@ Examples:
     pairing_grant_senior_by_name_parser.add_argument("platform", help="Platform name")
     pairing_grant_senior_by_name_parser.add_argument("user_name", help="Display name with a stored user_id mapping")
 
+    pairing_grant_repo_parser = pairing_sub.add_parser("grant-repo", help="Grant repo ACL to a display name")
+    pairing_grant_repo_parser.add_argument("user_name", help="Display name")
+    pairing_grant_repo_parser.add_argument("repo", help="Repository name, or * for wildcard")
+    pairing_grant_repo_parser.add_argument("grant", choices=["read", "write", "push", "admin"], help="Repo grant scope")
+
+    pairing_revoke_repo_parser = pairing_sub.add_parser("revoke-repo", help="Revoke repo ACL from a display name")
+    pairing_revoke_repo_parser.add_argument("user_name", help="Display name")
+    pairing_revoke_repo_parser.add_argument("repo", help="Repository name, or * for wildcard")
+
+    pairing_list_repo_acl_parser = pairing_sub.add_parser("list-repo-acl", help="List configured repo ACL grants")
+    pairing_list_repo_acl_parser.add_argument("user_name", nargs="?", default=None, help="Optional display name")
+
     pairing_revoke_parser = pairing_sub.add_parser("revoke", help="Revoke user access")
     pairing_revoke_parser.add_argument("platform", help="Platform name")
     pairing_revoke_parser.add_argument("user_id", help="User ID to revoke")

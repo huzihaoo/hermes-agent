@@ -7,16 +7,20 @@ Per-tool resolution: pinned > config overrides > registry > default.
 from dataclasses import dataclass, field
 from typing import Dict
 
-# Tools whose thresholds must never be overridden.
-# read_file=inf prevents infinite persist->read->persist loops.
+# Tools whose thresholds must be bounded for stable long-running sessions.
+# read_file used to be pinned to infinity to avoid persist->read->persist loops,
+# but that allowed a single large read to bloat the conversation and force
+# fallback-time compaction.  Keep it high enough for useful file inspection,
+# but below the fallback compaction trigger (~96K tokens in the stable config).
 PINNED_THRESHOLDS: Dict[str, float] = {
-    "read_file": float("inf"),
+    "read_file": 80_000,
 }
 
-# Defaults matching the current hardcoded values in tool_result_storage.py.
-# Kept here as the single source of truth; tool_result_storage.py imports these.
-DEFAULT_RESULT_SIZE_CHARS: int = 100_000
-DEFAULT_TURN_BUDGET_CHARS: int = 200_000
+# Stable-write defaults.  These intentionally keep tool output written into the
+# conversation below the 128K fallback context's compaction trigger.  Full raw
+# outputs are persisted to temp files with a preview/path pointer instead.
+DEFAULT_RESULT_SIZE_CHARS: int = 80_000
+DEFAULT_TURN_BUDGET_CHARS: int = 80_000
 DEFAULT_PREVIEW_SIZE_CHARS: int = 1_500
 
 

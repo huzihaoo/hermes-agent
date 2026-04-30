@@ -7,7 +7,7 @@ from tools import vm_task_tool
 
 
 def _disable_trusted_session(monkeypatch):
-    monkeypatch.setattr(vm_task_tool, "_resolve_submitter", lambda user_id="": ("", ""))
+    monkeypatch.setattr(vm_task_tool, "_resolve_submitter", lambda user_id="", owner="": ("", ""))
 
 
 def test_vm_task_submit_captures_session_routing_context_into_meta_json(monkeypatch, tmp_path):
@@ -102,3 +102,30 @@ def test_vm_task_submit_preserves_routing_meta_when_scheduler_metadata_present(m
     assert meta_json["repo_scope"] == "pnc_specs"
     assert meta_json["workspace_scope"] == "owner_main_repo"
     assert meta_json["risk_class"] == "normal"
+
+
+def test_vm_task_submit_uses_explicit_owner_when_user_id_matches_owner_mapping(monkeypatch, tmp_path):
+    """Local owner fallback may pass display name as user_id; it should resolve as owner, not member."""
+    script = tmp_path / "create_task_v2.py"
+    script.write_text("print('unused')", encoding="utf-8")
+    monkeypatch.setattr(vm_task_tool, "_create_task_script", lambda: script)
+    monkeypatch.setattr(vm_task_tool, "_session_value", lambda name: "")
+    monkeypatch.setattr(
+        "tools.permission_policy._load_config",
+        lambda: {"user_id_mapping": {"ou_owner": "胡子豪"}},
+    )
+    monkeypatch.setattr("tools.permission_policy.get_user_role_by_id", lambda user_id: "member")
+    monkeypatch.setattr("tools.permission_policy.get_user_role", lambda user_name: "owner" if user_name == "胡子豪" else "member")
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"task_id": "t1"}), stderr="")
+
+    monkeypatch.setattr(vm_task_tool.subprocess, "run", fake_run)
+
+    result = vm_task_tool.vm_task_submit("title", "goal", owner="胡子豪", user_id="胡子豪")
+
+    assert result["success"] is True
+    assert "--owner" in captured["cmd"]
+    assert captured["cmd"][captured["cmd"].index("--owner") + 1] == "胡子豪"

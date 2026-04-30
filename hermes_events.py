@@ -59,6 +59,12 @@ class EventEmitter:
                     platform=data.get("platform"),
                     request_summary=data.get("request_summary"),
                     started_at=timestamp,
+                    chat_id=data.get("chat_id"),
+                    chat_type=data.get("chat_type"),
+                    thread_id=data.get("thread_id"),
+                    message_id=data.get("message_id"),
+                    receipt_path=data.get("receipt_path"),
+                    delivery_verified=data.get("delivery_verified"),
                 )
                 self.task_store.upsert(task)
             elif event == "task:complete":
@@ -66,12 +72,22 @@ class EventEmitter:
                 if existing:
                     existing.status = TaskStatus.COMPLETED
                     existing.completed_at = timestamp
+                    if "receipt_path" in data:
+                        existing.receipt_path = data.get("receipt_path")
+                    if "delivery_verified" in data:
+                        existing.delivery_verified = data.get("delivery_verified")
                     self.task_store.upsert(existing)
             elif event == "task:failed":
                 existing = self.task_store.get(task_id)
                 if existing:
                     existing.status = TaskStatus.FAILED
                     existing.completed_at = timestamp
+                    existing.error_class = data.get("error_class")
+                    existing.error_message = data.get("error_message")
+                    if "receipt_path" in data:
+                        existing.receipt_path = data.get("receipt_path")
+                    if "delivery_verified" in data:
+                        existing.delivery_verified = data.get("delivery_verified")
                     self.task_store.upsert(existing)
         except Exception:
             # Never break event emission due to store sync failure

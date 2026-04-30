@@ -16,6 +16,8 @@ from tools.tool_result_storage import (
     STORAGE_DIR,
     _build_persisted_message,
     _heredoc_marker,
+    build_preview_with_key_lines,
+    extract_key_tool_result_lines,
     _resolve_storage_dir,
     _write_to_sandbox,
     enforce_turn_budget,
@@ -52,6 +54,48 @@ class TestGeneratePreview:
         preview, has_more = generate_preview(text, max_chars=2000)
         assert len(preview) == 2000
         assert has_more is True
+
+
+    def test_extracts_key_artifact_and_error_lines_from_late_output(self):
+        content = (
+            "noise\n" * 2000
+            + "ERROR failed to generate report\n"
+            + "output_file=/mnt/tmp/task_123/final/result.json\n"
+            + "user_visible_path=//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/task_123/\n"
+            + "pytest: 12 passed in 0.42s\n"
+        )
+        lines = extract_key_tool_result_lines(content)
+        joined = "\n".join(lines)
+        assert "ERROR failed" in joined
+        assert "/mnt/tmp/task_123/final/result.json" in joined
+        assert "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/task_123/" in joined
+        assert "12 passed" in joined
+
+
+    def test_prioritizes_delivery_paths_over_noisy_warnings(self):
+        content = (
+            "\n".join(f"WARNING noisy warning {i}" for i in range(30))
+            + "\nartifact: /mnt/tmp/prio/out/result.mcap\n"
+            + "user_visible_path=//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/prio/\n"
+        )
+        lines = extract_key_tool_result_lines(content, max_lines=2)
+        joined = "\n".join(lines)
+        assert lines[0].startswith("user_visible_path=//hfs1.minieye.tech/")
+        assert "/mnt/tmp/prio/out/result.mcap" in joined
+        assert "WARNING noisy warning 0" not in joined
+
+    def test_preview_retains_key_lines_beyond_first_window(self):
+        content = (
+            "boring line\n" * 500
+            + "artifact: /mnt/tmp/long_task/out/final.mcap\n"
+            + "user_visible_path=//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/long_task/\n"
+        )
+        preview, has_more, key_lines = build_preview_with_key_lines(content, max_chars=200)
+        assert has_more is True
+        assert key_lines
+        assert "Key lines retained from full output" in preview
+        assert "/mnt/tmp/long_task/out/final.mcap" in preview
+        assert "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/long_task/" in preview
 
     def test_empty_content(self):
         preview, has_more = generate_preview("")
@@ -291,8 +335,8 @@ class TestMaybePersistToolResult:
         )
         assert "Truncated" in result
 
-    def test_read_file_never_persisted(self):
-        """read_file has threshold=inf, should never be persisted."""
+    def test_explicit_infinite_threshold_still_disables_persistence(self):
+        """Explicit threshold=inf remains an escape hatch for focused unit coverage."""
         env = MagicMock()
         content = "x" * 200_000
         result = maybe_persist_tool_result(
@@ -387,6 +431,27 @@ class TestMaybePersistToolResult:
             threshold=30_000,
         )
         assert "DISTINCTIVE_START_MARKER" in result
+
+
+    def test_persisted_message_retains_late_artifact_paths(self):
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        content = (
+            "x" * 50_000
+            + "\noutput_file=/mnt/tmp/task_456/report.json\n"
+            + "user_visible_path=//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/task_456/\n"
+        )
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="terminal",
+            tool_use_id="tc_paths",
+            env=env,
+            threshold=30_000,
+        )
+        assert PERSISTED_OUTPUT_TAG in result
+        assert "Key lines retained from full output" in result
+        assert "/mnt/tmp/task_456/report.json" in result
+        assert "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/task_456/" in result
 
     def test_env_temp_dir_changes_persisted_path(self):
         env = MagicMock()
@@ -506,30 +571,32 @@ class TestPerToolThresholds:
         val = registry.get_max_result_size("nonexistent_tool_xyz")
         assert val == DEFAULT_RESULT_SIZE_CHARS
 
-    def test_terminal_threshold(self):
+    def test_terminal_threshold_is_stability_capped(self):
         from tools.registry import registry
         # Trigger import of terminal_tool to register the tool
         try:
             import tools.terminal_tool  # noqa: F401
             val = registry.get_max_result_size("terminal")
-            assert val == 100_000
+            assert val == 80_000
         except ImportError:
             pytest.skip("terminal_tool not importable in test env")
 
-    def test_read_file_never_persisted(self):
+    def test_read_file_registry_value_remains_unbounded_but_budget_caps_it(self):
         from tools.registry import registry
         try:
             import tools.file_tools  # noqa: F401
             val = registry.get_max_result_size("read_file")
             assert val == float("inf")
+            from tools.budget_config import BudgetConfig
+            assert BudgetConfig().resolve_threshold("read_file") == 80_000
         except ImportError:
             pytest.skip("file_tools not importable in test env")
 
-    def test_search_files_threshold(self):
+    def test_search_files_threshold_is_stability_capped(self):
         from tools.registry import registry
         try:
             import tools.file_tools  # noqa: F401
             val = registry.get_max_result_size("search_files")
-            assert val == 100_000
+            assert val == 80_000
         except ImportError:
             pytest.skip("file_tools not importable in test env")

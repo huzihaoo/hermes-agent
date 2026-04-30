@@ -23,9 +23,10 @@ def _session_value(name: str) -> str:
         return ""
 
 
-def _resolve_submitter(user_id: str = "") -> tuple[str, str]:
+def _resolve_submitter(user_id: str = "", owner: str = "") -> tuple[str, str]:
     resolved_user_id = str(user_id or _session_value("HERMES_SESSION_USER_ID")).strip()
-    user_name = _session_value("HERMES_SESSION_USER_NAME")
+    explicit_owner = str(owner or "").strip()
+    user_name = _session_value("HERMES_SESSION_USER_NAME") or explicit_owner
     if resolved_user_id:
         try:
             from tools.permission_policy import _load_config
@@ -33,8 +34,17 @@ def _resolve_submitter(user_id: str = "") -> tuple[str, str]:
             mapped = _load_config().get("user_id_mapping", {}).get(resolved_user_id)
             if mapped:
                 user_name = str(mapped).strip()
+            elif explicit_owner and resolved_user_id == explicit_owner:
+                # Local tool fallbacks sometimes pass a display name through the
+                # user_id parameter because no platform open_id is available.
+                # Treat an exact owner/display-name match as a name, not as an
+                # unknown platform id that would fail closed to member.
+                resolved_user_id = ""
+                user_name = explicit_owner
         except Exception:
-            pass
+            if explicit_owner and resolved_user_id == explicit_owner:
+                resolved_user_id = ""
+                user_name = explicit_owner
     return user_name, resolved_user_id
 
 
@@ -256,7 +266,7 @@ def vm_task_submit(
     """Create and bridge-deliver a shared-state v2 task for VM worker pickup."""
     title = str(title or "").strip()
     goal = str(goal or "").strip()
-    trusted_user_name, trusted_user_id = _resolve_submitter(user_id)
+    trusted_user_name, trusted_user_id = _resolve_submitter(user_id, owner)
     if trusted_user_name or trusted_user_id:
         permission_error = _check_vm_task_permission(trusted_user_name, trusted_user_id)
         if permission_error:

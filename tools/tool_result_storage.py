@@ -17,13 +17,15 @@ Defense against context-window overflow operates at three levels:
 
 3. **Per-turn aggregate budget** (enforce_turn_budget): After all tool
    results in a single assistant turn are collected, if the total exceeds
-   MAX_TURN_BUDGET_CHARS (200K), the largest non-persisted results are
-   spilled to disk until the aggregate is under budget. This catches cases
-   where many medium-sized results combine to overflow context.
+   DEFAULT_TURN_BUDGET_CHARS (currently 80K for stable fallback behavior),
+   the largest non-persisted results are spilled to disk until the aggregate
+   is under budget. This catches cases where many medium-sized results combine
+   to overflow context.
 """
 
 import logging
 import os
+import re
 import shlex
 import uuid
 
@@ -66,6 +68,93 @@ def generate_preview(content: str, max_chars: int = DEFAULT_PREVIEW_SIZE_CHARS) 
     if last_nl > max_chars // 2:
         truncated = truncated[:last_nl + 1]
     return truncated, True
+
+
+_PATH_RE = re.compile(
+    r"(?:(?:/mnt/tmp|/tmp|/var/folders|/Users|/home|/workspace|/data)/[^\s'\"<>]+"
+    r"|//hfs1\.minieye\.tech/[^\s'\"<>]+)",
+    re.IGNORECASE,
+)
+_ARTIFACT_EXT_RE = re.compile(
+    r"\.(?:mcap|json|jsonl|csv|parquet|txt|log|zip|tar|gz|tgz|pdf|png|jpg|jpeg|html|md|yaml|yml)(?:$|[?#])",
+    re.IGNORECASE,
+)
+_SIGNAL_LINE_RE = re.compile(
+    r"\b(?:error|failed|failure|traceback|exception|warning|warn|output|artifact|saved to|written to|full output saved|user_visible_path|cifs|pytest|passed|failed|collected)\b",
+    re.IGNORECASE,
+)
+
+
+def extract_key_tool_result_lines(content: str, *, max_lines: int = 12, max_chars: int = 1400) -> list[str]:
+    """Extract path/artifact/error/test summary lines from large tool output.
+
+    The full output is persisted, but long tasks still need critical delivery
+    details inline.  Rank delivery paths first so noisy warnings cannot push
+    `/mnt/tmp/...` or `//hfs1.minieye.tech/...` artifact paths out of the
+    retained preview.
+    """
+    if not content or max_lines <= 0 or max_chars <= 0:
+        return []
+
+    buckets: list[list[str]] = [[] for _ in range(6)]
+
+    def compact_line(line: str) -> str:
+        compact = " ".join((line or "").strip().split())
+        if len(compact) > 260:
+            compact = compact[:257].rstrip() + "..."
+        return compact
+
+    for raw in content.splitlines():
+        line = compact_line(raw)
+        if not line:
+            continue
+        low = line.lower()
+        if "//hfs1.minieye.tech/" in low:
+            buckets[0].append(line)
+        elif "/mnt/tmp/" in low:
+            buckets[1].append(line)
+        elif re.search(r"\b(?:output_file|user_visible_path|saved to|written to|artifact|full output saved)\b", line, re.IGNORECASE):
+            buckets[2].append(line)
+        elif _ARTIFACT_EXT_RE.search(line) or _PATH_RE.search(line):
+            buckets[3].append(line)
+        elif re.search(r"\b(?:pytest|passed|failed|collected)\b", line, re.IGNORECASE):
+            buckets[4].append(line)
+        elif _SIGNAL_LINE_RE.search(line):
+            buckets[5].append(line)
+
+    selected: list[str] = []
+    seen: set[str] = set()
+
+    for bucket in buckets:
+        for line in bucket:
+            if len(selected) >= max_lines:
+                return selected
+            key = line.lower()
+            if key in seen:
+                continue
+            if sum(len(x) + 1 for x in selected) + len(line) > max_chars:
+                continue
+            seen.add(key)
+            selected.append(line)
+
+    return selected
+
+
+def build_preview_with_key_lines(content: str, max_chars: int = DEFAULT_PREVIEW_SIZE_CHARS) -> tuple[str, bool, list[str]]:
+    """Generate a preview plus key lines that might otherwise be truncated away."""
+    preview, has_more = generate_preview(content, max_chars=max_chars)
+    key_lines = [line for line in extract_key_tool_result_lines(content) if line not in preview]
+    if not key_lines:
+        return preview, has_more, []
+
+    budget = max(max_chars, DEFAULT_PREVIEW_SIZE_CHARS) + 1800
+    key_block = "\n\nKey lines retained from full output:\n" + "\n".join(f"- {line}" for line in key_lines)
+    combined = preview + key_block
+    if len(combined) > budget:
+        allowed = max(0, budget - len(key_block))
+        preview = preview[:allowed].rstrip()
+        combined = preview + key_block
+    return combined, has_more, key_lines
 
 
 def _heredoc_marker(content: str) -> str:
@@ -148,7 +237,7 @@ def maybe_persist_tool_result(
 
     storage_dir = _resolve_storage_dir(env)
     remote_path = f"{storage_dir}/{tool_use_id}.txt"
-    preview, has_more = generate_preview(content, max_chars=config.preview_size)
+    preview, has_more, _key_lines = build_preview_with_key_lines(content, max_chars=config.preview_size)
 
     if env is not None:
         try:

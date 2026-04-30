@@ -24,7 +24,12 @@ def mock_config(tmp_path):
         "users": {
             "胡子豪": "owner",
             "郭艳彬": "senior",
+            "王平": "member",
             "default": "member",
+        },
+        "repo_acl": {
+            "郭艳彬": {"pnc_specs": "write"},
+            "default": {},
         },
         "repo_config": {
             "worktree_base": str(tmp_path / "worktrees"),
@@ -76,6 +81,26 @@ def test_non_owner_gets_worktree(mock_config, tmp_path):
     worktree_path = Path(expected_path)
     assert worktree_path.exists()
     assert (worktree_path / ".git").exists()
+
+
+def test_member_without_repo_read_acl_cannot_get_worktree(mock_config):
+    with patch.object(worktree_manager, "CONFIG_PATH", mock_config):
+        result = worktree_manager.ensure_worktree("王平", "pnc_specs")
+
+    assert "error" in result
+    assert "no VM repo read permission" in result["error"]
+
+
+def test_senior_without_repo_acl_cannot_get_worktree(mock_config):
+    config = json.loads(mock_config.read_text(encoding="utf-8"))
+    config["users"]["刘旭"] = "senior"
+    mock_config.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+
+    with patch.object(worktree_manager, "CONFIG_PATH", mock_config):
+        result = worktree_manager.ensure_worktree("刘旭", "pnc_specs")
+
+    assert "error" in result
+    assert "missing read ACL" in result["error"]
 
 
 def test_worktree_creation_logs_audit(mock_config, tmp_path, monkeypatch):

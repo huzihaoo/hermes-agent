@@ -10,6 +10,10 @@ Usage:
                                                    # Set senior role + map ID + approve user
     hermes pairing grant-senior-by-name <platform> <user_name>
                                                    # Reuse stored mapping to grant senior again
+    hermes pairing grant-repo <user_name> <repo> <grant>
+                                                   # Grant repo ACL: read/write/push/admin
+    hermes pairing revoke-repo <user_name> <repo>  # Revoke repo ACL
+    hermes pairing list-repo-acl [user_name]       # List repo ACL grants
     hermes pairing revoke <platform> <user_id>     # Revoke user access
     hermes pairing clear-pending                    # Clear all expired/pending codes
 """
@@ -31,12 +35,18 @@ def pairing_command(args):
         _cmd_grant_senior(store, args.platform, args.user_id, args.user_name)
     elif action == "grant-senior-by-name":
         _cmd_grant_senior_by_name(store, args.platform, args.user_name)
+    elif action == "grant-repo":
+        _cmd_grant_repo(args.user_name, args.repo, args.grant)
+    elif action == "revoke-repo":
+        _cmd_revoke_repo(args.user_name, args.repo)
+    elif action == "list-repo-acl":
+        _cmd_list_repo_acl(getattr(args, "user_name", None))
     elif action == "revoke":
         _cmd_revoke(store, args.platform, args.user_id)
     elif action == "clear-pending":
         _cmd_clear_pending(store)
     else:
-        print("Usage: hermes pairing {list|approve|approve-user|grant-senior|grant-senior-by-name|revoke|clear-pending}")
+        print("Usage: hermes pairing {list|approve|approve-user|grant-senior|grant-senior-by-name|grant-repo|revoke-repo|list-repo-acl|revoke|clear-pending}")
         print("Run 'hermes pairing --help' for details.")
 
 
@@ -143,6 +153,46 @@ def _cmd_grant_senior_by_name(store, platform: str, user_name: str):
         return
 
     _cmd_grant_senior(store, platform, user_id, user_name)
+
+
+def _cmd_grant_repo(user_name: str, repo: str, grant: str):
+    """Grant repo ACL to a display name."""
+    from tools.permission_policy import grant_repo_acl
+
+    try:
+        saved_grant = grant_repo_acl(user_name, repo, grant)
+    except ValueError as exc:
+        print(f"\n  Could not grant repo ACL: {exc}\n")
+        return
+    print(f"\n  Granted repo ACL: {user_name} -> {repo} = {saved_grant}.\n")
+
+
+def _cmd_revoke_repo(user_name: str, repo: str):
+    """Revoke repo ACL from a display name."""
+    from tools.permission_policy import revoke_repo_acl
+
+    try:
+        removed = revoke_repo_acl(user_name, repo)
+    except ValueError as exc:
+        print(f"\n  Could not revoke repo ACL: {exc}\n")
+        return
+    if removed:
+        print(f"\n  Revoked repo ACL: {user_name} -> {repo}.\n")
+    else:
+        print(f"\n  No repo ACL found for {user_name} -> {repo}.\n")
+
+
+def _cmd_list_repo_acl(user_name: str | None = None):
+    """List repo ACL grants."""
+    import json
+    from tools.permission_policy import list_repo_acl
+
+    try:
+        grants = list_repo_acl(user_name)
+    except ValueError as exc:
+        print(f"\n  Could not list repo ACL: {exc}\n")
+        return
+    print(json.dumps(grants, ensure_ascii=False, indent=2))
 
 
 def _cmd_revoke(store, platform: str, user_id: str):

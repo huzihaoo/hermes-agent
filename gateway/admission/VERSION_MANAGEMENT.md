@@ -139,3 +139,8 @@ python -m pytest tests/gateway/test_admission*.py tests/gateway/test_feishu_admi
 ## 下一版本规划
 
 查看 `CHANGELOG.md` 底部的 "待办（下一版本候选）" 章节。
+
+## v1.11.0 — 2026-04-30
+
+- Repo ACL and VM direct-exec release gate hardening.
+- Verified by 277 focused regression tests, check_versions, and py_compile.

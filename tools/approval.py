@@ -44,14 +44,18 @@ def get_current_session_key(default: str = "default") -> str:
 
     Resolution order:
     1. approval-specific contextvars (set by gateway before agent.run)
-    2. session_context contextvars (set by _set_session_env)
-    3. os.environ fallback (CLI, cron, tests)
+    2. HERMES_SESSION_KEY env fallback for CLI/tests
+    3. session_context contextvars (set by _set_session_env)
     """
     session_key = _approval_session_key.get()
     if session_key:
         return session_key
+    env_session_key = os.getenv("HERMES_SESSION_KEY")
+    if env_session_key:
+        return env_session_key
     from gateway.session_context import get_session_env
-    return get_session_env("HERMES_SESSION_KEY", default)
+    session_env_key = get_session_env("HERMES_SESSION_KEY", default)
+    return session_env_key or default
 
 # Sensitive write targets that should trigger approval even when referenced
 # via shell expansions like $HOME or $HERMES_HOME.
@@ -621,7 +625,40 @@ def check_dangerous_command(command: str, env_type: str,
     if env_type in ("docker", "singularity", "modal", "daytona"):
         return {"approved": True, "message": None}
 
-    # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
+    # VM source access must never bypass repo_acl, including yolo/off modes.
+    # `check_all_command_guards` already enforces this for the normal terminal
+    # path, but some callers/tests still use the legacy single-check helper.
+    # Keep the source ACL guard before yolo so HERMES_YOLO_MODE cannot turn a
+    # source-bearing repo denial into an allow.
+    repo_acl_precheck = None
+    try:
+        from tools.permission_policy import classify_command, get_decision_by_id
+        from gateway.session_context import get_session_env
+
+        op_type = classify_command(command)
+        user_id = get_session_env("HERMES_USER_ID") or get_session_env("HERMES_SESSION_USER_ID")
+        if op_type == "vm_repo_unauthorized":
+            if user_id:
+                decision = get_decision_by_id(user_id, command)
+                if decision == "DENY":
+                    return _repo_acl_denial_result(
+                        command,
+                        pattern_key=op_type,
+                        description="VM repository access denied by repo ACL policy",
+                    )
+            repo_acl_precheck = {
+                "approved": False,
+                "message": "❌ 权限不足，无法执行此操作。",
+                "pattern_key": op_type,
+                "description": "VM repository access denied by repo ACL policy",
+            }
+    except Exception as e:
+        logger.debug("Repo ACL precheck failed before yolo (non-fatal): %s", e)
+
+    if repo_acl_precheck:
+        return repo_acl_precheck
+
+    # --yolo: bypass normal approval prompts. Gateway /yolo is session-scoped;
     # CLI --yolo remains process-scoped via the env var for local use.
     if os.getenv("HERMES_YOLO_MODE") or is_current_session_yolo_enabled():
         return {"approved": True, "message": None}
@@ -632,10 +669,10 @@ def check_dangerous_command(command: str, env_type: str,
 
     # Permission policy: check user role before approval
     try:
-        from tools.permission_policy import get_decision_by_id
+        from tools.permission_policy import get_decision_by_id, classify_command
         from gateway.session_context import get_session_env
         
-        user_id = get_session_env("HERMES_USER_ID")
+        user_id = get_session_env("HERMES_USER_ID") or get_session_env("HERMES_SESSION_USER_ID")
         if user_id:
             decision = get_decision_by_id(user_id, command)
             if decision == "ALLOW":
@@ -643,6 +680,19 @@ def check_dangerous_command(command: str, env_type: str,
                 return {"approved": True, "message": None}
             elif decision == "DENY":
                 logger.warning("Permission policy: DENY for user %s, command %s", user_id, command[:60])
+                op_type = ""
+                try:
+                    from tools.permission_policy import classify_command
+
+                    op_type = classify_command(command)
+                except Exception:
+                    op_type = ""
+                if op_type == "vm_repo_unauthorized":
+                    return _repo_acl_denial_result(
+                        command,
+                        pattern_key=pattern_key,
+                        description=description,
+                    )
                 return {
                     "approved": False,
                     "message": "❌ 权限不足，无法执行此操作。",
@@ -704,6 +754,45 @@ def check_dangerous_command(command: str, env_type: str,
     return {"approved": True, "message": None}
 
 
+def _repo_acl_denial_result(command: str, *, pattern_key: str, description: str) -> dict:
+    result = {
+        "approved": False,
+        "message": "❌ 权限不足，无法执行此操作。",
+        "pattern_key": pattern_key,
+        "description": description,
+    }
+    try:
+        from gateway.session_context import get_session_env
+        from tools.repo_acl_approval import (
+            build_repo_acl_approval_card,
+            create_repo_acl_request_from_command,
+            reserve_repo_acl_approval_outbox,
+        )
+
+        requester_display_name = get_session_env("HERMES_SESSION_USER_NAME")
+        requester_user_id = get_session_env("HERMES_SESSION_USER_ID")
+        if not requester_display_name or not requester_user_id:
+            return result
+        request = create_repo_acl_request_from_command(
+            command,
+            requester_display_name=requester_display_name,
+            requester_user_id=requester_user_id,
+            chat_id=get_session_env("HERMES_SESSION_CHAT_ID"),
+            thread_id=get_session_env("HERMES_SESSION_THREAD_ID"),
+        )
+        if request:
+            card = build_repo_acl_approval_card(request)
+            result.update({
+                "status": "repo_acl_approval_pending",
+                "repo_acl_request": request,
+                "repo_acl_approval_card": card,
+                "repo_acl_approval_outbox": reserve_repo_acl_approval_outbox(request, card),
+            })
+    except Exception as exc:
+        logger.warning("Failed to create repo ACL approval reservation: %s", exc)
+    return result
+
+
 # =========================================================================
 # Combined pre-exec guard (tirith + dangerous command detection)
 # =========================================================================
@@ -735,6 +824,23 @@ def _format_tirith_description(tirith_result: dict) -> str:
     return "Security scan — " + "; ".join(parts)
 
 
+def _is_owner_vm_task_submit_fallback(command: str) -> bool:
+    """Return True for the narrow local owner fallback that submits VM tasks.
+
+    This intentionally only recognizes a Python heredoc that imports and calls
+    the built-in vm_task_submit helper.  It is not a general heredoc bypass;
+    callers with other dangerous content still go through normal approval.
+    """
+    normalized = command.replace("\r\n", "\n")
+    if not re.search(r"\bpython(?:3(?:\.\d+)?)?\s+(?:-\s+)?<<", normalized):
+        return False
+    if "from tools.vm_task_tool import vm_task_submit" not in normalized:
+        return False
+    if "vm_task_submit(" not in normalized:
+        return False
+    return True
+
+
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None) -> dict:
     """Run all pre-exec security checks and return a single approval decision.
@@ -752,32 +858,103 @@ def check_all_command_guards(command: str, env_type: str,
     is_gateway = os.getenv("HERMES_GATEWAY_SESSION")
     is_ask = os.getenv("HERMES_EXEC_ASK")
 
-    # VM direct execution is not a normal approval prompt. In gateway/shared
-    # contexts it must not be bypassed by yolo or approvals.mode=off; only an
-    # explicit emergency marker allows owner/admin direct maintenance.
+    # VM source access must never bypass repo_acl, including yolo/off modes.
+    # Non-source VM execution is handled by normal dangerous-command approval.
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
+    # Local owner VM task submission fallback: the native vm_task_submit tool is
+    # not always exposed to local sessions, so owners may need a Python heredoc
+    # wrapper.  Allow only that narrow helper shape, and only when no other
+    # dangerous pattern is present inside the command body.
+    owner_vm_task_submit_fallback = False
+    if is_cli and not is_gateway and is_dangerous and description == "script execution via heredoc" and _is_owner_vm_task_submit_fallback(command):
+        try:
+            from tools.permission_policy import get_user_role
+            from gateway.session_context import get_session_env
+
+            local_user_name = get_session_env("HERMES_SESSION_USER_NAME") or os.getenv("HERMES_USER_NAME") or os.getenv("USER") or ""
+            local_role = get_user_role(local_user_name) if local_user_name else ""
+            other_dangerous = []
+            for pattern, other_description in DANGEROUS_PATTERNS:
+                if other_description == "script execution via heredoc":
+                    continue
+                if re.search(pattern, command, re.IGNORECASE | re.DOTALL):
+                    other_dangerous.append(other_description)
+            if local_role in {"owner", "admin"} and not other_dangerous:
+                is_dangerous = False
+                pattern_key = None
+                description = None
+                owner_vm_task_submit_fallback = True
+        except Exception as exc:
+            logger.debug("Owner/admin vm_task_submit fallback check failed: %s", exc)
+
+    try:
+        from tools.permission_policy import classify_command as _classify_for_repo_guard, get_decision_by_id as _decision_for_repo_guard
+        from gateway.session_context import get_session_env as _get_session_env_for_repo_guard
+
+        repo_guard_op = _classify_for_repo_guard(command)
+        repo_guard_user_id = _get_session_env_for_repo_guard("HERMES_SESSION_USER_ID")
+        if repo_guard_user_id:
+            repo_guard_decision = _decision_for_repo_guard(repo_guard_user_id, command)
+            if repo_guard_op == "vm_repo_unauthorized":
+                return _repo_acl_denial_result(
+                    command,
+                    pattern_key=repo_guard_op,
+                    description="VM repository access denied by repo ACL policy",
+                )
+            if repo_guard_decision == "DENY":
+                return {
+                    "approved": False,
+                    "message": "❌ 权限不足，无法执行此操作。",
+                    "pattern_key": repo_guard_op,
+                    "description": "Permission policy denied this command",
+                }
+            if (
+                repo_guard_op == "vm_direct_exec"
+                or (
+                    is_dangerous
+                    and "VM direct execution" in str(description or "")
+                    and (os.getenv("HERMES_YOLO_MODE") or is_current_session_yolo_enabled() or _get_approval_mode() == "off")
+                )
+            ) and not os.getenv("HERMES_VM_DIRECT_EXEC_EMERGENCY"):
+                return {
+                    "approved": False,
+                    "message": "❌ VM 业务执行请走 vm_task_submit / shared-state v2 / VM worker；直连执行需要显式 emergency override。",
+                    "pattern_key": repo_guard_op,
+                    "description": "VM direct execution requires emergency override",
+                }
+    except Exception as exc:
+        logger.warning("Repo permission policy check failed; denying gateway VM repo access by default: %s", exc)
+        if os.getenv("HERMES_GATEWAY_SESSION") or os.getenv("HERMES_EXEC_ASK"):
+            if is_dangerous:
+                return {
+                    "approved": False,
+                    "message": "❌ VM 业务执行请走 vm_task_submit / shared-state v2 / VM worker；直连执行需要显式 emergency override。",
+                    "pattern_key": pattern_key,
+                    "description": description,
+                }
+            return {
+                "approved": False,
+                "message": "❌ 权限策略不可用，已拒绝访问 VM 仓库。",
+                "pattern_key": "vm_repo_policy_unavailable",
+                "description": "VM repository permission policy unavailable",
+            }
     try:
         from tools.permission_policy import classify_command
         op_type_for_bypass = classify_command(command) if is_dangerous else ""
     except Exception:
         op_type_for_bypass = ""
-    if is_gateway and op_type_for_bypass == "vm_direct_exec" and not os.getenv("HERMES_VM_DIRECT_EXEC_EMERGENCY"):
-        return {
-            "approved": False,
-            "message": "❌ VM 业务执行请走 vm_task_submit / shared-state v2 / VM worker；直连执行需要显式 emergency override。",
-            "pattern_key": pattern_key,
-            "description": description,
-        }
+    if is_gateway and op_type_for_bypass == "vm_repo_unauthorized":
+        return _repo_acl_denial_result(
+            command,
+            pattern_key=op_type_for_bypass,
+            description="VM repository access denied by repo ACL policy",
+        )
 
-    # --yolo or approvals.mode=off: bypass normal approval prompts. VM direct
-    # execution in gateway sessions is deliberately excluded from this fast
-    # path. Emergency only skips the shared-state routing block below; identity
-    # policy still has to run so members cannot ride an owner maintenance flag.
-    # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
+    # --yolo or approvals.mode=off: bypass normal approval prompts. Source
+    # access remains protected by the repo ACL check above.
     approval_mode = _get_approval_mode()
-    if not (is_gateway and op_type_for_bypass == "vm_direct_exec"):
-        if os.getenv("HERMES_YOLO_MODE") or is_current_session_yolo_enabled() or approval_mode == "off":
-            return {"approved": True, "message": None}
+    if os.getenv("HERMES_YOLO_MODE") or is_current_session_yolo_enabled() or approval_mode == "off":
+        return {"approved": True, "message": None}
 
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
     # flows, we do not block on approvals and we skip external guard work.
@@ -810,27 +987,14 @@ def check_all_command_guards(command: str, env_type: str,
         if user_id and is_dangerous:
             op_type = classify_command(command)
             decision = get_decision_by_id(user_id, command)
-            if op_type == "vm_direct_exec" and not os.getenv("HERMES_VM_DIRECT_EXEC_EMERGENCY"):
-                if decision == "DENY":
-                    logger.warning("Permission policy: DENY for user %s, command %s", user_id, command[:60])
-                    return {
-                        "approved": False,
-                        "message": "❌ 权限不足，无法执行此操作。",
-                        "pattern_key": pattern_key,
-                        "description": description,
-                    }
-                logger.warning("VM direct execution denied without emergency override for user %s", user_id)
-                return {
-                    "approved": False,
-                    "message": "❌ VM 业务执行请走 vm_task_submit / shared-state v2 / VM worker；直连执行需要显式 emergency override。",
-                    "pattern_key": pattern_key,
-                    "description": description,
-                }
-            if decision == "ALLOW":
-                logger.debug("Permission policy: ALLOW for user %s, command %s", user_id, command[:60])
-                if not tirith_result["action"] in ("block", "warn"):
-                    return {"approved": True, "message": None}
-            elif decision == "DENY":
+            if op_type == "vm_repo_unauthorized":
+                logger.warning("Permission policy: repo ACL DENY for user %s, command %s", user_id, command[:60])
+                return _repo_acl_denial_result(
+                    command,
+                    pattern_key=pattern_key,
+                    description=description,
+                )
+            if decision == "DENY":
                 logger.warning("Permission policy: DENY for user %s, command %s", user_id, command[:60])
                 return {
                     "approved": False,
@@ -838,6 +1002,12 @@ def check_all_command_guards(command: str, env_type: str,
                     "pattern_key": pattern_key,
                     "description": description,
                 }
+            if op_type == "vm_direct_exec" and not os.getenv("HERMES_VM_DIRECT_EXEC_EMERGENCY"):
+                logger.debug("Permission policy: %s for non-source VM direct command by user %s", decision, user_id)
+            if decision == "ALLOW":
+                logger.debug("Permission policy: ALLOW for user %s, command %s", user_id, command[:60])
+                if not tirith_result["action"] in ("block", "warn"):
+                    return {"approved": True, "message": None}
             else:
                 logger.debug("Permission policy: %s for user %s, command %s", decision, user_id, command[:60])
     except Exception as e:
@@ -857,6 +1027,30 @@ def check_all_command_guards(command: str, env_type: str,
 
     session_key = get_current_session_key()
 
+    # Local CLI owner/admin policy: an authenticated local operator should not
+    # be stopped by Tirith-only content warnings (for example Chinese text in a
+    # VM task brief being flagged as confusable Unicode).  This does *not*
+    # bypass dangerous command patterns; rm/git reset/VM direct exec/etc. still
+    # flow through the normal approval/guard path below.
+    if is_cli and not is_gateway and not is_dangerous and tirith_result["action"] in ("block", "warn"):
+        try:
+            from tools.permission_policy import get_user_role
+            from gateway.session_context import get_session_env
+
+            local_user_name = get_session_env("HERMES_SESSION_USER_NAME") or os.getenv("HERMES_USER_NAME") or os.getenv("USER") or ""
+            local_role = get_user_role(local_user_name) if local_user_name else ""
+            if local_role in {"owner", "admin"} and any(
+                os.getenv(name) for name in ("HERMES_SESSION_USER_NAME", "HERMES_USER_NAME")
+            ):
+                return {
+                    "approved": True,
+                    "message": None,
+                    "owner_cli_approved": True,
+                    "description": _format_tirith_description(tirith_result),
+                }
+        except Exception as exc:
+            logger.debug("Owner/admin CLI Tirith bypass check failed: %s", exc)
+
     # Tirith block/warn → approvable warning with rich findings.
     # Previously, tirith "block" was a hard block with no approval prompt.
     # Now both block and warn go through the approval flow so users can
@@ -875,7 +1069,10 @@ def check_all_command_guards(command: str, env_type: str,
 
     # Nothing to warn about
     if not warnings:
-        return {"approved": True, "message": None}
+        result = {"approved": True, "message": None}
+        if owner_vm_task_submit_fallback:
+            result["owner_vm_task_submit_fallback_approved"] = True
+        return result
 
     # --- Phase 2.5: Smart approval (auxiliary LLM risk assessment) ---
     # When approvals.mode=smart, ask the aux LLM before prompting the user.

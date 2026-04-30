@@ -4,6 +4,7 @@ import json
 import os
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from gateway.pairing import (
@@ -242,6 +243,138 @@ class TestApprovalFlow:
             assert get_user_role_by_id("ou_test_user") == "senior"
             saved = json.loads(config_path.read_text(encoding="utf-8"))
             assert saved["user_id_mapping"]["ou_test_user"] == "宋伟军"
+
+    def test_repo_acl_grant_and_revoke_persist(self, tmp_path):
+        config_path = tmp_path / "user-roles.json"
+        config = {
+            "version": "1.0",
+            "user_id_mapping": {},
+            "users": {"default": "member", "郭艳彬": "senior"},
+            "repo_acl": {},
+            "permission_matrix": {
+                "owner": {},
+                "admin": {},
+                "senior": {},
+                "member": {},
+            },
+            "command_patterns": {},
+            "critical_paths": [],
+        }
+        config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+        with patch("tools.permission_policy._CONFIG_PATH", config_path), patch("tools.permission_policy._config", None):
+            from tools.permission_policy import grant_repo_acl, revoke_repo_acl, repo_acl_allows
+
+            grant_repo_acl("郭艳彬", "pnc_specs", "read")
+            grant_repo_acl("郭艳彬", "planning_algo/nop/planning", "write")
+            grant_repo_acl("郭艳彬", "planning_algo/*", "read")
+            assert repo_acl_allows("郭艳彬", "pnc_specs", "read") is True
+            assert repo_acl_allows("郭艳彬", "pnc_specs", "write") is False
+            assert repo_acl_allows("郭艳彬", "planning_algo/nop/planning", "write") is True
+            assert repo_acl_allows("郭艳彬", "planning_algo/nop/sibling", "read") is True
+            assert repo_acl_allows("郭艳彬", "vehicle_dev/object_perception", "read") is False
+            saved = json.loads(config_path.read_text(encoding="utf-8"))
+            assert saved["repo_acl"]["郭艳彬"]["pnc_specs"] == "read"
+            assert saved["repo_acl"]["郭艳彬"]["planning_algo/nop/planning"] == "write"
+            assert saved["repo_acl"]["郭艳彬"]["planning_algo/*"] == "read"
+
+            revoke_repo_acl("郭艳彬", "pnc_specs")
+            assert repo_acl_allows("郭艳彬", "pnc_specs", "read") is False
+            saved = json.loads(config_path.read_text(encoding="utf-8"))
+            assert "pnc_specs" not in saved["repo_acl"].get("郭艳彬", {})
+
+    def test_repo_acl_rejects_invalid_scope(self, tmp_path):
+        config_path = tmp_path / "user-roles.json"
+        config = {
+            "version": "1.0",
+            "user_id_mapping": {},
+            "users": {"default": "member", "郭艳彬": "senior"},
+            "repo_acl": {},
+            "permission_matrix": {
+                "owner": {},
+                "admin": {},
+                "senior": {},
+                "member": {},
+            },
+            "command_patterns": {},
+            "critical_paths": [],
+        }
+        config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+        with patch("tools.permission_policy._CONFIG_PATH", config_path), patch("tools.permission_policy._config", None):
+            from tools.permission_policy import grant_repo_acl
+
+            try:
+                grant_repo_acl("郭艳彬", "pnc_specs", "all")
+            except ValueError as exc:
+                assert "invalid repo ACL grant" in str(exc)
+            else:
+                raise AssertionError("grant_repo_acl should reject invalid grants")
+
+            for invalid_repo in ("../pnc_specs", "planning_algo/**", "planning_algo/../secret"):
+                try:
+                    grant_repo_acl("郭艳彬", invalid_repo, "read")
+                except ValueError as exc:
+                    assert "invalid repo" in str(exc)
+                else:
+                    raise AssertionError(f"grant_repo_acl should reject invalid repo scope: {invalid_repo}")
+    def test_pairing_repo_acl_command_grants_scope(self, tmp_path, capsys):
+        config_path = tmp_path / "user-roles.json"
+        config = {
+            "version": "1.0",
+            "user_id_mapping": {},
+            "users": {"default": "member", "郭艳彬": "senior"},
+            "repo_acl": {},
+            "permission_matrix": {
+                "owner": {},
+                "admin": {},
+                "senior": {},
+                "member": {},
+            },
+            "command_patterns": {},
+            "critical_paths": [],
+        }
+        config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+        with patch("tools.permission_policy._CONFIG_PATH", config_path), patch("tools.permission_policy._config", None):
+            from hermes_cli.pairing import pairing_command
+
+            pairing_command(SimpleNamespace(pairing_action="grant-repo", user_name="郭艳彬", repo="pnc_specs", grant="write"))
+            saved = json.loads(config_path.read_text(encoding="utf-8"))
+            assert saved["repo_acl"]["郭艳彬"]["pnc_specs"] == "write"
+
+        out = capsys.readouterr().out
+        assert "Granted repo ACL" in out
+        assert "郭艳彬" in out
+        assert "pnc_specs" in out
+
+    def test_pairing_repo_acl_command_revokes_scope(self, tmp_path, capsys):
+        config_path = tmp_path / "user-roles.json"
+        config = {
+            "version": "1.0",
+            "user_id_mapping": {},
+            "users": {"default": "member", "郭艳彬": "senior"},
+            "repo_acl": {"郭艳彬": {"pnc_specs": "write"}},
+            "permission_matrix": {
+                "owner": {},
+                "admin": {},
+                "senior": {},
+                "member": {},
+            },
+            "command_patterns": {},
+            "critical_paths": [],
+        }
+        config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+        with patch("tools.permission_policy._CONFIG_PATH", config_path), patch("tools.permission_policy._config", None):
+            from hermes_cli.pairing import pairing_command
+
+            pairing_command(SimpleNamespace(pairing_action="revoke-repo", user_name="郭艳彬", repo="pnc_specs"))
+            saved = json.loads(config_path.read_text(encoding="utf-8"))
+            assert "郭艳彬" not in saved.get("repo_acl", {})
+
+        out = capsys.readouterr().out
+        assert "Revoked repo ACL" in out
 
     def test_find_user_id_by_name_returns_stored_mapping(self, tmp_path):
         config_path = tmp_path / "user-roles.json"

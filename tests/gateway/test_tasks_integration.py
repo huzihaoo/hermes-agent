@@ -27,6 +27,50 @@ def test_emitter_syncs_task_start_to_store(tmp_path):
     assert task.task_type.value == "coding"  # inferred from "写代码"
 
 
+def test_emitter_syncs_request_routing_fields_to_store(tmp_path):
+    trace_file = tmp_path / "events.jsonl"
+    store = TaskStore(db_path=tmp_path / "tasks.db")
+    emitter = EventEmitter(trace_file=trace_file, task_store=store)
+
+    emitter.emit("request:start", {
+        "task_id": "feishu-topic-task",
+        "platform": "feishu",
+        "user_id": "ou_user",
+        "chat_id": "oc_chat",
+        "chat_type": "group",
+        "thread_id": "topic:om_anchor",
+        "message_id": "om_request",
+        "request_summary": "持续推进",
+    })
+
+    task = store.get("feishu-topic-task")
+    assert task is not None
+    assert task.user_id == "ou_user"
+    assert task.chat_id == "oc_chat"
+    assert task.chat_type == "group"
+    assert task.thread_id == "topic:om_anchor"
+    assert task.message_id == "om_request"
+
+
+def test_emitter_syncs_failure_error_fields_to_store(tmp_path):
+    trace_file = tmp_path / "events.jsonl"
+    store = TaskStore(db_path=tmp_path / "tasks.db")
+    emitter = EventEmitter(trace_file=trace_file, task_store=store)
+
+    emitter.emit("task:start", {"task_id": "t-error", "platform": "feishu", "user_id": "ou_user"})
+    emitter.emit("task:failed", {
+        "task_id": "t-error",
+        "error_class": "FeishuTopicDeliveryError",
+        "error_message": "topic reply rejected",
+    })
+
+    task = store.get("t-error")
+    assert task is not None
+    assert task.status == TaskStatus.FAILED
+    assert task.error_class == "FeishuTopicDeliveryError"
+    assert task.error_message == "topic reply rejected"
+
+
 def test_emitter_syncs_task_complete_to_store(tmp_path):
     trace_file = tmp_path / "events.jsonl"
     store = TaskStore(db_path=tmp_path / "tasks.db")

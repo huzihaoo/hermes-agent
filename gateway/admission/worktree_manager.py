@@ -70,6 +70,48 @@ def _safe_branch(value: str) -> str:
     return value
 
 
+def _repo_grant_allows(grant: object, action: str) -> bool:
+    if grant == "admin":
+        return True
+    if isinstance(grant, str):
+        if grant == "read":
+            return action == "read"
+        if grant == "write":
+            return action in {"read", "write"}
+        if grant == "push":
+            return action in {"read", "write", "push"}
+        return False
+    if isinstance(grant, dict):
+        if grant.get("admin") is True:
+            return True
+        actions = grant.get("actions", [])
+        if isinstance(actions, str):
+            actions = [actions]
+        if action in actions:
+            return True
+        if action == "read" and any(a in actions for a in ("write", "push")):
+            return True
+        if action == "write" and "push" in actions:
+            return True
+    return False
+
+
+def repo_acl_allows(config: dict, user_name: str, repo: str, action: str) -> bool:
+    role = get_user_role(config, user_name)
+    if role in {"owner", "admin"}:
+        return True
+    acl = config.get("repo_acl", {}) or {}
+    grants = acl.get(user_name)
+    if grants is None:
+        grants = acl.get("default", {})
+    if not isinstance(grants, dict):
+        return False
+    grant = grants.get(repo)
+    if grant is None:
+        grant = grants.get("*")
+    return _repo_grant_allows(grant, action)
+
+
 def worktree_path(rc: dict, repo: str, user: str) -> str:
     base = Path(rc.get("worktree_base", "/home/mini/worktrees"))
     return str(base / _safe_component(repo, "repo") / _safe_component(user, "user"))
@@ -109,6 +151,10 @@ def ensure_worktree(user: str, repo: str, branch: str | None = None) -> dict:
     if user_role == "owner":
         # Owner uses source repo directly
         return {"path": source, "branch": _get_current_branch(source), "created": False}
+    if user_role not in {"admin", "senior"}:
+        return {"error": f"repo access denied for {user}: role {user_role!r} has no VM repo read permission"}
+    if not repo_acl_allows(config, user, repo, "read"):
+        return {"error": f"repo access denied for {user}: missing read ACL for {repo}"}
     
     # Non-owner: use worktree
     wt_path = worktree_path(rc, repo, user)

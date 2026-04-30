@@ -741,12 +741,15 @@ class GatewayRunner:
             emitter = EventEmitter(trace_file=trace_file, task_store=_task_store)
             text = getattr(event, "text", "") or ""
             summary = text[:80]
+            user_id = getattr(source, "user_id", None) or getattr(source, "user_id_alt", None)
             emitter.emit("request:start", {
                 "task_id": getattr(session_entry, "session_id", ""),
                 "platform": source.platform.value if getattr(source, "platform", None) else "",
-                "user_id": getattr(source, "user_id", None),
+                "user_id": user_id,
                 "user_name": getattr(source, "user_name", None),
                 "chat_id": getattr(source, "chat_id", None),
+                "chat_type": getattr(source, "chat_type", None),
+                "thread_id": getattr(source, "thread_id", None),
                 "message_id": getattr(event, "message_id", None),
                 "request_summary": summary,
             })

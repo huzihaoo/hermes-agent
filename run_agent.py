@@ -3386,6 +3386,169 @@ class AIAgent:
             if self.verbose_logging:
                 logging.warning(f"Failed to save session log: {e}")
     
+
+    def _long_task_state_path(self, task_id: str | None = None) -> Path:
+        """Path for a compact structured sidecar used to recover long tasks."""
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", task_id or self.session_id or "default")[:120]
+        return Path(self.logs_dir).parent / "task-state" / f"{safe}.json"
+
+    @staticmethod
+    def _long_task_key_lines_from_text(text: str, *, limit: int = 20) -> list[str]:
+        """Extract compact state-worthy lines without importing tool modules."""
+        if not text:
+            return []
+        patterns = (
+            r"//hfs1\.minieye\.tech/[^\s'\"<>]+",
+            r"/mnt/tmp/[^\s'\"<>]+",
+            r"(?:output_file|user_visible_path|artifact|saved to|written to|full output saved)\s*[:=]\s*[^\n]+",
+            r"[^\n]+\.(?:mcap|json|jsonl|csv|parquet|txt|log|zip|pdf|png|html|md|yaml|yml)\b[^\n]*",
+            r"[^\n]*(?:pytest|passed|failed|traceback|exception|error|warning)[^\n]*",
+        )
+        found: list[str] = []
+        seen: set[str] = set()
+        for pat in patterns:
+            for m in re.finditer(pat, text, flags=re.IGNORECASE):
+                line = " ".join(m.group(0).strip().split())
+                if not line:
+                    continue
+                if len(line) > 260:
+                    line = line[:257].rstrip() + "..."
+                key = line.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                found.append(line)
+                if len(found) >= limit:
+                    return found
+        return found
+
+    def _update_long_task_state_sidecar(
+        self,
+        task_id: str,
+        *,
+        tool_name: str | None = None,
+        tool_args: dict | None = None,
+        tool_result: str | None = None,
+        status: str = "tool.completed",
+    ) -> None:
+        """Persist a tiny structured state sidecar after substantive tool turns.
+
+        This is deliberately local and best-effort.  It is not part of model
+        context, but it gives long-running sessions a stable recovery index when
+        compression/fallback/empty recovery causes natural-language history to
+        drift.
+        """
+        try:
+            path = self._long_task_state_path(task_id)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            state = {}
+            if path.exists():
+                try:
+                    state = json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    state = {}
+
+            events = state.get("recent_events") if isinstance(state.get("recent_events"), list) else []
+            artifacts = state.get("artifacts") if isinstance(state.get("artifacts"), list) else []
+            verification = state.get("verification") if isinstance(state.get("verification"), list) else []
+            blockers = state.get("blockers") if isinstance(state.get("blockers"), list) else []
+
+            key_lines = self._long_task_key_lines_from_text(tool_result or "")
+            for line in key_lines:
+                low = line.lower()
+                if ("//hfs1.minieye.tech/" in low or "/mnt/tmp/" in low or "artifact" in low or "output_file" in low or "user_visible_path" in low) and line not in artifacts:
+                    artifacts.append(line)
+                elif ("pytest" in low or " passed" in low or " failed" in low or "collected" in low) and line not in verification:
+                    verification.append(line)
+                elif ("error" in low or "exception" in low or "traceback" in low or "warning" in low) and line not in blockers:
+                    blockers.append(line)
+
+            event = {
+                "time": datetime.now().isoformat(),
+                "status": status,
+                "tool": tool_name or "",
+                "args_keys": sorted((tool_args or {}).keys())[:20] if isinstance(tool_args, dict) else [],
+                "result_chars": len(tool_result or ""),
+                "key_lines": key_lines[:8],
+            }
+            events.append(event)
+
+            state.update({
+                "schema_version": 1,
+                "task_id": task_id,
+                "session_id": self.session_id,
+                "platform": self.platform,
+                "model": self.model,
+                "provider": self.provider,
+                "updated_at": datetime.now().isoformat(),
+                "current_phase": status,
+                "recent_events": events[-25:],
+                "artifacts": artifacts[-30:],
+                "verification": verification[-20:],
+                "blockers": blockers[-20:],
+                "next": "Use recent_events/artifacts/verification/blockers as recovery hints after compression or fallback.",
+            })
+            atomic_json_write(path, state, indent=2, default=str)
+        except Exception as exc:
+            logger.debug("Failed to update long-task state sidecar: %s", exc)
+
+
+    def _load_long_task_state_summary(self, task_id: str | None = None, *, max_chars: int = 1800) -> str:
+        """Load a bounded sidecar summary for compression/fallback recovery."""
+        try:
+            path = self._long_task_state_path(task_id)
+            if not path.exists():
+                return ""
+            state = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(state, dict):
+                return ""
+            lines = [
+                "[System: Long-task structured recovery state. Preserve these facts during compression/fallback.]",
+                f"task_id: {state.get('task_id', task_id or '')}",
+                f"current_phase: {state.get('current_phase', '')}",
+            ]
+            sections = (
+                ("artifacts", state.get("artifacts")),
+                ("verification", state.get("verification")),
+                ("blockers", state.get("blockers")),
+            )
+            for title, values in sections:
+                if isinstance(values, list) and values:
+                    lines.append(f"{title}:")
+                    for item in values[-8:]:
+                        lines.append(f"- {item}")
+            events = state.get("recent_events")
+            if isinstance(events, list) and events:
+                lines.append("recent_events:")
+                for event in events[-5:]:
+                    if isinstance(event, dict):
+                        tool = event.get("tool", "")
+                        status = event.get("status", "")
+                        chars = event.get("result_chars", "")
+                        lines.append(f"- {status} {tool} result_chars={chars}")
+            if state.get("next"):
+                lines.append(f"next: {state.get('next')}")
+            summary = "\n".join(str(x) for x in lines if x is not None)
+            if len(summary) > max_chars:
+                summary = summary[:max_chars].rstrip() + "\n...[sidecar summary truncated]"
+            return summary
+        except Exception as exc:
+            logger.debug("Failed to load long-task sidecar summary: %s", exc)
+            return ""
+
+    def _inject_long_task_state_for_compression(self, messages: list, task_id: str | None = None) -> bool:
+        """Append a temporary bounded sidecar summary before compression."""
+        summary = self._load_long_task_state_summary(task_id)
+        if not summary:
+            return False
+        if any(isinstance(m, dict) and m.get("_long_task_state_sidecar") for m in messages[-3:]):
+            return False
+        messages.append({
+            "role": "user",
+            "content": summary,
+            "_long_task_state_sidecar": True,
+        })
+        return True
     def interrupt(self, message: str = None) -> None:
         """
         Request the agent to interrupt its current tool-calling loop.
@@ -7366,6 +7529,94 @@ class AIAgent:
 
         return msg
 
+
+    @staticmethod
+    def _last_assistant_tool_call_names(messages: list, max_scan: int = 8) -> list[str]:
+        """Return tool names from the latest assistant tool-call message.
+
+        Empty-response recovery needs to know whether the preceding tool
+        round was substantive or just housekeeping.  Keep this helper pure so
+        tests can exercise the policy without running the full agent loop.
+        """
+        if not messages:
+            return []
+        for msg in reversed(messages[-max_scan:]):
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") != "assistant":
+                continue
+            tool_calls = msg.get("tool_calls") or []
+            names: list[str] = []
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") or {}
+                if isinstance(fn, dict):
+                    name = fn.get("name")
+                    if isinstance(name, str) and name:
+                        names.append(name)
+            if names:
+                return names
+        return []
+
+    @staticmethod
+    def _is_tool_output_followed_by_empty_recovery(messages: list, max_scan: int = 6) -> bool:
+        """True when a prior post-tool empty-recovery marker is already pending.
+
+        The old logic used a single boolean.  That created either over-nudging
+        (repeated system prompts after every empty) or under-recovery (one nudge
+        consumed for the whole turn).  Detecting the actual pending marker keeps
+        the policy tied to message history: do not add another nudge until the
+        model has made a new tool-call round.
+        """
+        if not messages:
+            return False
+        recent = messages[-max_scan:]
+        for idx, msg in enumerate(recent):
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            if (msg.get("content") or "").strip() != "(empty)":
+                continue
+            for follow in recent[idx + 1:]:
+                if not isinstance(follow, dict):
+                    continue
+                if follow.get("role") == "assistant" and follow.get("tool_calls"):
+                    return False
+                if follow.get("role") == "user" and "process the tool results" in (follow.get("content") or ""):
+                    return True
+        return False
+
+    @classmethod
+    def _should_nudge_after_empty_tool_response(cls, messages: list, retried_flag: bool) -> bool:
+        """Policy for recovering from an empty model response after tool calls."""
+        prior_was_tool = any(
+            isinstance(m, dict) and m.get("role") == "tool"
+            for m in (messages or [])[-5:]
+        )
+        if not prior_was_tool:
+            return False
+        if cls._is_tool_output_followed_by_empty_recovery(messages):
+            return False
+        # Backward compatibility: if callers still pass the legacy flag, honor it
+        # only when there is no new assistant tool-call round after the marker.
+        if retried_flag and not cls._last_assistant_tool_call_names(messages):
+            return False
+        return True
+
+    @staticmethod
+    def _build_post_tool_empty_recovery_message(tool_names: list[str]) -> str:
+        """Concise, action-oriented recovery prompt after tool results."""
+        suffix = ""
+        if tool_names:
+            shown = ", ".join(tool_names[-4:])
+            suffix = f" Last tool round: {shown}."
+        return (
+            "[System: The previous assistant response was empty after tool calls."
+            f"{suffix} Read the tool results immediately above, give a concise "
+            "progress update/final answer, and continue only if another tool call "
+            "is required. Do not return an empty message.]"
+        )
+
     @staticmethod
     def _sanitize_tool_calls_for_strict_api(api_msg: dict) -> dict:
         """Strip Codex Responses API fields from tool_calls for strict providers.
@@ -7597,6 +7848,11 @@ class AIAgent:
         # Pre-compression memory flush: let the model save memories before they're lost
         self.flush_memories(messages, min_turns=0)
 
+        # Inject a compact structured long-task state summary so compression
+        # preserves artifacts/verification/blockers even when natural-language
+        # history is noisy or tool outputs were persisted.
+        _sidecar_injected = self._inject_long_task_state_for_compression(messages, task_id)
+
         # Notify external memory provider before compression discards context
         if self._memory_manager:
             try:
@@ -7605,6 +7861,12 @@ class AIAgent:
                 pass
 
         compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic)
+
+        if _sidecar_injected:
+            compressed = [
+                m for m in compressed
+                if not (isinstance(m, dict) and m.get("_long_task_state_sidecar"))
+            ]
 
         todo_snapshot = self._todo_store.format_for_injection()
         if todo_snapshot:
@@ -8062,6 +8324,13 @@ class AIAgent:
                     except Exception as cb_err:
                         logging.debug(f"Tool progress callback error: {cb_err}")
 
+                function_result = maybe_persist_tool_result(
+                    content=function_result,
+                    tool_name=name,
+                    tool_use_id=tc.id,
+                    env=get_active_env(effective_task_id),
+                )
+
                 if self.verbose_logging:
                     logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
                     logging.debug(f"Tool result ({len(function_result)} chars): {function_result}")
@@ -8087,13 +8356,6 @@ class AIAgent:
                 except Exception as cb_err:
                     logging.debug(f"Tool complete callback error: {cb_err}")
 
-            function_result = maybe_persist_tool_result(
-                content=function_result,
-                tool_name=name,
-                tool_use_id=tc.id,
-                env=get_active_env(effective_task_id),
-            )
-
             subdir_hints = self._subdirectory_hints.check_tool_call(name, args)
             if subdir_hints:
                 function_result += subdir_hints
@@ -8115,6 +8377,13 @@ class AIAgent:
         if num_tools > 0:
             turn_tool_msgs = messages[-num_tools:]
             enforce_turn_budget(turn_tool_msgs, env=get_active_env(effective_task_id))
+            for (tc, name, args), msg in zip(parsed_calls, turn_tool_msgs):
+                self._update_long_task_state_sidecar(
+                    effective_task_id,
+                    tool_name=name,
+                    tool_args=args,
+                    tool_result=msg.get("content", ""),
+                )
 
     def _execute_tool_calls_sequential(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute tool calls sequentially (one at a time)."""
@@ -8472,6 +8741,13 @@ class AIAgent:
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
 
+            function_result = maybe_persist_tool_result(
+                content=function_result,
+                tool_name=function_name,
+                tool_use_id=tool_call.id,
+                env=get_active_env(effective_task_id),
+            )
+
             self._current_tool = None
             self._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s)")
 
@@ -8484,13 +8760,6 @@ class AIAgent:
                     self.tool_complete_callback(tool_call.id, function_name, function_args, function_result)
                 except Exception as cb_err:
                     logging.debug(f"Tool complete callback error: {cb_err}")
-
-            function_result = maybe_persist_tool_result(
-                content=function_result,
-                tool_name=function_name,
-                tool_use_id=tool_call.id,
-                env=get_active_env(effective_task_id),
-            )
 
             # Discover subdirectory context files from tool arguments
             subdir_hints = self._subdirectory_hints.check_tool_call(function_name, function_args)
@@ -8536,7 +8805,22 @@ class AIAgent:
         # ── Per-turn aggregate budget enforcement ─────────────────────────
         num_tools_seq = len(assistant_message.tool_calls)
         if num_tools_seq > 0:
-            enforce_turn_budget(messages[-num_tools_seq:], env=get_active_env(effective_task_id))
+            turn_tool_msgs = messages[-num_tools_seq:]
+            enforce_turn_budget(turn_tool_msgs, env=get_active_env(effective_task_id))
+            for tc, msg in zip(assistant_message.tool_calls[-len(turn_tool_msgs):], turn_tool_msgs):
+                tool_args = {}
+                try:
+                    parsed = json.loads(tc.function.arguments or "{}")
+                    if isinstance(parsed, dict):
+                        tool_args = parsed
+                except Exception:
+                    tool_args = {}
+                self._update_long_task_state_sidecar(
+                    effective_task_id,
+                    tool_name=tc.function.name,
+                    tool_args=tool_args,
+                    tool_result=msg.get("content", ""),
+                )
 
 
 
@@ -9021,18 +9305,37 @@ class AIAgent:
                 tools=self.tools or None,
             )
 
-            if _preflight_tokens >= self.context_compressor.threshold_tokens:
+            _preflight_threshold_tokens = self.context_compressor.threshold_tokens
+            _preflight_threshold_reason = "primary"
+            # Stable-first: if a fallback model has a smaller configured context,
+            # pre-compress before the primary call once the request would exceed
+            # the fallback's compaction trigger.  This avoids the pattern
+            # primary transient failure → fallback activation → immediate large
+            # compaction/error on a 128K fallback.
+            for _fb in getattr(self, "_fallback_chain", []) or []:
+                try:
+                    _fb_ctx = int(_fb.get("context_length")) if isinstance(_fb, dict) and _fb.get("context_length") is not None else None
+                except (TypeError, ValueError):
+                    _fb_ctx = None
+                if _fb_ctx and _fb_ctx > 0:
+                    _fb_threshold = int(_fb_ctx * getattr(self.context_compressor, "threshold_percent", 0.75))
+                    if _fb_threshold < _preflight_threshold_tokens:
+                        _preflight_threshold_tokens = _fb_threshold
+                        _preflight_threshold_reason = "fallback"
+
+            if _preflight_tokens >= _preflight_threshold_tokens:
                 logger.info(
-                    "Preflight compression: ~%s tokens >= %s threshold (model %s, ctx %s)",
+                    "Preflight compression: ~%s tokens >= %s %s threshold (model %s, ctx %s)",
                     f"{_preflight_tokens:,}",
-                    f"{self.context_compressor.threshold_tokens:,}",
+                    f"{_preflight_threshold_tokens:,}",
+                    _preflight_threshold_reason,
                     self.model,
                     f"{self.context_compressor.context_length:,}",
                 )
                 if not self.quiet_mode:
                     self._safe_print(
                         f"📦 Preflight compression: ~{_preflight_tokens:,} tokens "
-                        f">= {self.context_compressor.threshold_tokens:,} threshold"
+                        f">= {_preflight_threshold_tokens:,} {_preflight_threshold_reason} threshold"
                     )
                 # May need multiple passes for very large sessions with small
                 # context windows (each pass summarises the middle N turns).
@@ -9066,7 +9369,7 @@ class AIAgent:
                         system_prompt=active_system_prompt or "",
                         tools=self.tools or None,
                     )
-                    if _preflight_tokens < self.context_compressor.threshold_tokens:
+                    if _preflight_tokens < _preflight_threshold_tokens:
                         break  # Under threshold
 
         # Plugin hook: pre_llm_call
@@ -9910,7 +10213,7 @@ class AIAgent:
                             finish_reason = "length"
 
                     if finish_reason == "length":
-                        self._vprint(f"{self.log_prefix}⚠️  Response truncated (finish_reason='length') - model hit max output tokens", force=True)
+                        self._vprint(f"{self.log_prefix}↻ Provider stopped at output limit; Hermes is auto-recovering", force=True)
 
                         # ── Detect thinking-budget exhaustion ──────────────
                         # When the model spends ALL output tokens on reasoning
@@ -9998,17 +10301,32 @@ class AIAgent:
                                     truncated_response_prefix += assistant_message.content
 
                                 if length_continue_retries < 3:
+                                    current_cap = None
+                                    if isinstance(api_kwargs, dict):
+                                        current_cap = api_kwargs.get("max_tokens") or api_kwargs.get("max_completion_tokens") or api_kwargs.get("max_output_tokens")
+                                    next_cap = self._next_truncated_tool_call_max_tokens(current_cap)
+                                    self._ephemeral_max_output_tokens = next_cap
                                     self._vprint(
                                         f"{self.log_prefix}↻ Requesting continuation "
-                                        f"({length_continue_retries}/3)..."
+                                        f"({length_continue_retries}/3) with max_tokens={next_cap:,}..."
                                     )
-                                    continue_msg = {
-                                        "role": "user",
-                                        "content": (
+                                    if length_continue_retries >= 2:
+                                        continuation_instruction = (
+                                            "[System: Your previous response was still truncated. Stop expanding. "
+                                            "Do not continue verbatim. Instead, finish with a concise final summary "
+                                            "in <=1200 words, include only actionable conclusions, key paths/IDs, "
+                                            "verification status, and next steps. Do not include raw logs, full metadata "
+                                            "schemas, or long copied content.]"
+                                        )
+                                    else:
+                                        continuation_instruction = (
                                             "[System: Your previous response was truncated by the output "
                                             "length limit. Continue exactly where you left off. Do not "
                                             "restart or repeat prior text. Finish the answer directly.]"
-                                        ),
+                                        )
+                                    continue_msg = {
+                                        "role": "user",
+                                        "content": continuation_instruction,
                                     }
                                     messages.append(continue_msg)
                                     self._session_messages = messages
@@ -10017,15 +10335,33 @@ class AIAgent:
                                     break
 
                                 partial_response = self._strip_think_blocks(truncated_response_prefix).strip()
+                                if partial_response:
+                                    if len(partial_response) > 12000:
+                                        partial_response = (
+                                            partial_response[:6000]
+                                            + "\n\n...[middle omitted after repeated output-length truncation]...\n\n"
+                                            + partial_response[-6000:]
+                                        )
+                                    final_partial_response = (
+                                        partial_response
+                                        + "\n\n⚠️ Output was still longer than the provider limit after 3 continuation attempts; "
+                                        "showing a bounded partial answer instead of failing the turn."
+                                    )
+                                else:
+                                    final_partial_response = (
+                                        "⚠️ The model kept hitting the provider output limit after 3 continuation attempts. "
+                                        "I stopped the turn instead of retrying indefinitely. Please ask for a narrower summary "
+                                        "or split the output into sections."
+                                    )
                                 self._cleanup_task_resources(effective_task_id)
                                 self._persist_session(messages, conversation_history)
                                 return {
-                                    "final_response": partial_response or None,
+                                    "final_response": final_partial_response,
                                     "messages": messages,
                                     "api_calls": api_call_count,
-                                    "completed": False,
+                                    "completed": True,
                                     "partial": True,
-                                    "error": "Response remained truncated after 3 continuation attempts",
+                                    "warning": "Response remained truncated after 3 continuation attempts",
                                 }
 
                         if self.api_mode in ("chat_completions", "bedrock_converse"):
@@ -10039,7 +10375,7 @@ class AIAgent:
                                     next_cap = self._next_truncated_tool_call_max_tokens(current_cap)
                                     self._ephemeral_max_output_tokens = next_cap
                                     self._vprint(
-                                        f"{self.log_prefix}⚠️  Truncated tool call detected — retrying API call with max_tokens={next_cap:,}...",
+                                        f"{self.log_prefix}↻ Tool call hit output limit — retrying with larger max_tokens={next_cap:,}...",
                                         force=True,
                                     )
                                     # Don't append the broken response to messages;
@@ -10047,7 +10383,7 @@ class AIAgent:
                                     # message state with a larger one-call output cap.
                                     continue
                                 self._vprint(
-                                    f"{self.log_prefix}⚠️  Truncated tool call response detected again — refusing to execute incomplete tool arguments.",
+                                    f"{self.log_prefix}⚠️  Tool call still truncated after recovery attempts — refusing to execute incomplete tool arguments.",
                                     force=True,
                                 )
                                 self._cleanup_task_resources(effective_task_id)
@@ -10078,16 +10414,48 @@ class AIAgent:
                                 "error": "Response truncated due to output length limit"
                             }
                         else:
-                            # First message was truncated - mark as failed
-                            self._vprint(f"{self.log_prefix}❌ First response truncated - cannot recover", force=True)
+                            # First message was truncated.  Do not hard-fail; ask
+                            # for a short summary on the same clean context.
+                            length_continue_retries += 1
+                            if length_continue_retries < 3:
+                                current_cap = None
+                                if isinstance(api_kwargs, dict):
+                                    current_cap = (
+                                        api_kwargs.get("max_tokens")
+                                        or api_kwargs.get("max_completion_tokens")
+                                        or api_kwargs.get("max_output_tokens")
+                                    )
+                                next_cap = self._next_truncated_tool_call_max_tokens(current_cap)
+                                self._ephemeral_max_output_tokens = next_cap
+                                self._vprint(
+                                    f"{self.log_prefix}↻ First response hit output limit — "
+                                    f"retrying with concise summary max_tokens={next_cap:,}...",
+                                    force=True,
+                                )
+                                messages.append({
+                                    "role": "user",
+                                    "content": (
+                                        "[System: Your first response was truncated by the provider output limit. "
+                                        "Do not continue verbatim. Reply with a concise final summary in <=1200 words: "
+                                        "actionable conclusions, key paths/IDs, verification status, and next steps only.]"
+                                    ),
+                                })
+                                self._session_messages = messages
+                                self._save_session_log(messages)
+                                restart_with_length_continuation = True
+                                break
+
                             self._persist_session(messages, conversation_history)
                             return {
-                                "final_response": None,
+                                "final_response": (
+                                    "⚠️ The first response repeatedly hit the provider output limit. "
+                                    "I stopped instead of retrying indefinitely. Please ask for a narrower summary."
+                                ),
                                 "messages": messages,
                                 "api_calls": api_call_count,
-                                "completed": False,
-                                "failed": True,
-                                "error": "First response truncated due to output length limit"
+                                "completed": True,
+                                "partial": True,
+                                "warning": "First response remained truncated after recovery attempts"
                             }
                     
                     # Track actual token usage from response for context management
@@ -11380,21 +11748,50 @@ class AIAgent:
                             if tc.function.name in {n for n, _ in invalid_json_args}
                         )
                         if _truncated:
+                            if truncated_tool_call_retries < 2:
+                                truncated_tool_call_retries += 1
+                                current_cap = None
+                                if isinstance(api_kwargs, dict):
+                                    current_cap = (
+                                        api_kwargs.get("max_tokens")
+                                        or api_kwargs.get("max_completion_tokens")
+                                        or api_kwargs.get("max_output_tokens")
+                                    )
+                                next_cap = self._next_truncated_tool_call_max_tokens(current_cap)
+                                self._ephemeral_max_output_tokens = next_cap
+                                self._vprint(
+                                    f"{self.log_prefix}↻ Tool call arguments were truncated "
+                                    f"(finish_reason={finish_reason!r}) — retrying with larger "
+                                    f"max_tokens={next_cap:,}...",
+                                    force=True,
+                                )
+                                # Routers can hide output truncation behind
+                                # finish_reason='tool_calls'. Treat malformed, cut-off JSON
+                                # exactly like explicit finish_reason='length': do not append
+                                # the broken assistant/tool-call message; retry the same state
+                                # once with a larger one-call output cap.
+                                continue
+
                             self._vprint(
-                                f"{self.log_prefix}⚠️  Truncated tool call arguments detected "
-                                f"(finish_reason={finish_reason!r}) — refusing to execute.",
+                                f"{self.log_prefix}⚠️  Tool call arguments still truncated after "
+                                "recovery attempts — returning a bounded partial instead of "
+                                "executing incomplete arguments.",
                                 force=True,
                             )
                             self._invalid_json_retries = 0
                             self._cleanup_task_resources(effective_task_id)
                             self._persist_session(messages, conversation_history)
                             return {
-                                "final_response": None,
+                                "final_response": (
+                                    "⚠️ Tool call arguments were truncated by the provider after "
+                                    "recovery attempts. I did not execute incomplete tool calls. "
+                                    "Please retry with a narrower request or split the operation."
+                                ),
                                 "messages": messages,
                                 "api_calls": api_call_count,
-                                "completed": False,
+                                "completed": True,
                                 "partial": True,
-                                "error": "Response truncated due to output length limit",
+                                "warning": "Tool call arguments remained truncated after recovery attempts",
                             }
 
                         # Track retries for invalid JSON arguments
@@ -11689,21 +12086,12 @@ class AIAgent:
                         # return empty after tool results instead of continuing
                         # to the next step.  One retry with a nudge usually
                         # fixes it.
-                        _prior_was_tool = any(
-                            m.get("role") == "tool"
-                            for m in messages[-5:]  # check recent messages
-                        )
-                        if (
-                            _prior_was_tool
-                            and not getattr(self, "_post_tool_empty_retried", False)
+                        _last_tool_names = self._last_assistant_tool_call_names(messages)
+                        _last_tool_name = _last_tool_names[-1] if _last_tool_names else None
+                        if self._should_nudge_after_empty_tool_response(
+                            messages,
+                            getattr(self, "_post_tool_empty_retried", False),
                         ):
-                            _last_tool_name = None
-                            for _m in reversed(messages):
-                                if _m.get("role") == "assistant" and _m.get("tool_calls"):
-                                    _tcs = _m["tool_calls"]
-                                    if _tcs and isinstance(_tcs[0], dict):
-                                        _last_tool_name = _tcs[-1].get("function", {}).get("name")
-                                    break
                             self._post_tool_empty_retried = True
                             # Clear stale narration so it doesn't resurface
                             # on a later empty response after the nudge.
@@ -11718,8 +12106,8 @@ class AIAgent:
                                 _last_tool_name,
                             )
                             self._emit_status(
-                                "⚠️ Model returned empty after tool calls — "
-                                "nudging to continue"
+                                "↻ Provider returned an empty post-tool message — "
+                                "recovering with a compact continuation prompt"
                             )
                             # Append the empty assistant message first so the
                             # message sequence stays valid:
@@ -11731,11 +12119,7 @@ class AIAgent:
                             messages.append(assistant_msg)
                             messages.append({
                                 "role": "user",
-                                "content": (
-                                    "You just executed tool calls but returned an "
-                                    "empty response. Please process the tool "
-                                    "results above and continue with the task."
-                                ),
+                                "content": self._build_post_tool_empty_recovery_message(_last_tool_names),
                             })
                             continue
 

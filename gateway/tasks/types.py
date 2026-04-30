@@ -87,6 +87,14 @@ class Task:
     started_at: float
     completed_at: Optional[float] = None
     agent_route: Optional[str] = None
+    chat_id: Optional[str] = None
+    chat_type: Optional[str] = None
+    thread_id: Optional[str] = None
+    message_id: Optional[str] = None
+    error_class: Optional[str] = None
+    error_message: Optional[str] = None
+    receipt_path: Optional[str] = None
+    delivery_verified: Optional[bool] = None
     
     def to_receipt(self, *, total_tokens: int = 0, tool_calls: int = 0, 
                     tool_call_details: Optional[List[Dict[str, Any]]] = None,
@@ -104,7 +112,7 @@ class Task:
             total_tokens=total_tokens,
             tool_calls=tool_calls,
             tool_call_details=tool_call_details or [],
-            error_class=error_class,
-            error_message=error_message,
+            error_class=error_class if error_class is not None else self.error_class,
+            error_message=error_message if error_message is not None else self.error_message,
             agent_route=self.agent_route,
         )

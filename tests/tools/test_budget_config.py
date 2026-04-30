@@ -2,7 +2,7 @@
 
 Covers default values, resolve_threshold() priority chain
 (pinned > tool_overrides > registry > default), immutability,
-and the PINNED_THRESHOLDS escape-hatch for read_file.
+and the PINNED_THRESHOLDS stable cap for read_file.
 """
 
 import dataclasses
@@ -30,21 +30,21 @@ class TestModuleConstants:
     """Verify documented default values haven't drifted."""
 
     def test_default_result_size(self):
-        assert DEFAULT_RESULT_SIZE_CHARS == 100_000
+        assert DEFAULT_RESULT_SIZE_CHARS == 80_000
 
     def test_default_turn_budget(self):
-        assert DEFAULT_TURN_BUDGET_CHARS == 200_000
+        assert DEFAULT_TURN_BUDGET_CHARS == 80_000
 
     def test_default_preview_size(self):
         assert DEFAULT_PREVIEW_SIZE_CHARS == 1_500
 
 
 class TestPinnedThresholds:
-    """PINNED_THRESHOLDS – tools whose values must never be overridden."""
+    """PINNED_THRESHOLDS – stable caps for tools that can otherwise bloat context."""
 
-    def test_read_file_is_inf(self):
-        assert PINNED_THRESHOLDS["read_file"] == float("inf")
-        assert math.isinf(PINNED_THRESHOLDS["read_file"])
+    def test_read_file_is_stability_capped(self):
+        assert PINNED_THRESHOLDS["read_file"] == 80_000
+        assert not math.isinf(PINNED_THRESHOLDS["read_file"])
 
     def test_pinned_is_not_empty(self):
         assert len(PINNED_THRESHOLDS) >= 1
@@ -138,10 +138,10 @@ class TestResolveThreshold:
     """Priority: pinned > tool_overrides > registry > default."""
 
     def test_pinned_wins_over_override(self):
-        """Even if tool_overrides contains read_file, pinned value wins."""
+        """Even if tool_overrides contains read_file, stable pinned value wins."""
         cfg = BudgetConfig(tool_overrides={"read_file": 1})
         result = cfg.resolve_threshold("read_file")
-        assert result == float("inf")
+        assert result == 80_000
 
     def test_tool_override_wins_over_default(self):
         """tool_overrides should be returned before falling back to registry."""
@@ -170,7 +170,27 @@ class TestResolveThreshold:
             "unknown_tool", default=50_000
         )
 
-    def test_pinned_read_file_returns_inf(self):
-        """Canonical case: read_file must always return inf."""
+    def test_pinned_read_file_returns_stability_cap(self):
+        """Canonical case: read_file is capped at the stable write-side threshold."""
         cfg = BudgetConfig()
-        assert cfg.resolve_threshold("read_file") == float("inf")
+        assert cfg.resolve_threshold("read_file") == 80_000
+
+    def test_builtin_registry_caps_do_not_exceed_stable_default(self):
+        """High-volume built-in tools should not bypass the 80K write-side cap."""
+        from tools import code_execution_tool, file_tools, terminal_tool, web_tools  # noqa: F401
+        from tools.registry import registry
+
+        for name in (
+            "terminal",
+            "execute_code",
+            "web_search",
+            "web_extract",
+            "write_file",
+            "patch",
+            "search_files",
+        ):
+            assert registry.get_max_result_size(name) == 80_000
+
+        # read_file's raw registry escape hatch remains, but BudgetConfig pins it.
+        assert math.isinf(registry.get_max_result_size("read_file"))
+        assert BudgetConfig().resolve_threshold("read_file") == 80_000

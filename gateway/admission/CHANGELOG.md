@@ -13,6 +13,26 @@ MAJOR.MINOR.PATCH
 
 ---
 
+## [1.11.0] — 2026-04-30 — Repo ACL and VM direct-exec release gate hardening
+
+### Added
+- Repo ACL checks now gate non-owner VM worktree creation and source reads before worktree paths are exposed.
+- Pairing CLI now supports explicit repo ACL grant, revoke, and list operations.
+- GitLab repo member snapshots and repo ACL approval reservations provide reviewable, fail-closed source-access onboarding.
+
+### Changed
+- VM direct execution remains emergency-gated even when process YOLO, session YOLO, or approvals.mode=off is active.
+- Repo ACL checks distinguish source access from non-source VM task execution so unrelated `/mnt/tmp` execution does not create repo ACL requests.
+
+### Fixed
+- Session-scoped approval lookup falls back safely for CLI/test sessions after gateway context is explicitly cleared.
+- Worktree access now denies missing role/ACL instead of relying on path existence.
+
+### Verified
+- `tests/gateway/admission/test_worktree_manager.py tests/gateway/test_feishu_vm_direct_execution_guard.py tests/gateway/test_pairing.py tests/gateway/test_task_trace_gateway.py tests/gateway/test_tasks_integration.py tests/gateway/test_tasks_store.py tests/test_sub2api_output_cap_static.py tests/tools/test_budget_config.py tests/tools/test_command_guards.py tests/tools/test_permission_policy.py tests/tools/test_pnc_agent_tools.py tests/tools/test_tool_result_storage.py tests/tools/test_vm_task_tool_session_routing.py tests/tools/test_gitlab_repo_acl_sync.py tests/tools/test_repo_acl_approval.py` — 277 passed
+- `python check_versions.py` — all modules version-managed
+- `py_compile` — release-touched runtime/test modules compiled
+
 ## [1.10.1] — 2026-04-30 — Explicit worker slot accounting
 
 ### Fixed

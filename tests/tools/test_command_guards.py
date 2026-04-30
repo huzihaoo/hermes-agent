@@ -328,3 +328,78 @@ class TestProgrammingErrorsPropagateFromWrapper:
         os.environ["HERMES_INTERACTIVE"] = "1"
         with pytest.raises(AttributeError, match="bug in wrapper"):
             check_all_command_guards("echo hello", "local")
+
+
+class TestOwnerCliBypassesTirithApproval:
+    @patch(_TIRITH_PATCH, return_value=_tirith_result(
+        "warn",
+        [{"rule_id": "homoglyph", "severity": "HIGH", "title": "Confusable Unicode", "description": "lookalike chars"}],
+        "confusable unicode",
+    ))
+    @patch("tools.permission_policy.get_user_role", return_value="owner")
+    def test_owner_cli_allows_tirith_warning_without_prompt(self, mock_role, mock_tirith):
+        os.environ["HERMES_INTERACTIVE"] = "1"
+        os.environ["HERMES_SESSION_USER_NAME"] = "胡子豪"
+        cb = MagicMock(return_value="deny")
+
+        result = check_all_command_guards("python3.11 - <<'PY'\nprint('中文')\nPY", "local", approval_callback=cb)
+
+        assert result["approved"] is True
+        assert result.get("owner_cli_approved") is True
+        cb.assert_not_called()
+
+    @patch(_TIRITH_PATCH, return_value=_tirith_result(
+        "block",
+        [{"rule_id": "homoglyph", "severity": "HIGH", "title": "Confusable Unicode", "description": "lookalike chars"}],
+        "confusable unicode",
+    ))
+    @patch("tools.permission_policy.get_user_role", return_value="owner")
+    def test_owner_cli_does_not_bypass_dangerous_patterns(self, mock_role, mock_tirith):
+        os.environ["HERMES_INTERACTIVE"] = "1"
+        os.environ["HERMES_SESSION_USER_NAME"] = "胡子豪"
+        cb = MagicMock(return_value="deny")
+
+        result = check_all_command_guards("rm -rf /tmp/test", "local", approval_callback=cb)
+
+        assert result["approved"] is False
+        cb.assert_called_once()
+
+
+class TestOwnerCliVmTaskSubmitFallback:
+    @patch(_TIRITH_PATCH, return_value=_tirith_result("allow"))
+    @patch("tools.permission_policy.get_user_role", return_value="owner")
+    def test_owner_cli_allows_vm_task_submit_heredoc_without_prompt(self, mock_role, mock_tirith):
+        os.environ["HERMES_INTERACTIVE"] = "1"
+        os.environ["HERMES_SESSION_USER_NAME"] = "胡子豪"
+        cb = MagicMock(return_value="deny")
+        command = """cd /Users/songying/.hermes/hermes-agent && python3 <<'PY'
+import json, sys
+sys.path.insert(0, '/Users/songying/.hermes/hermes-agent')
+from tools.vm_task_tool import vm_task_submit
+res = vm_task_submit(title='safe', goal='status only', owner='胡子豪', lane='fast', resource_class='io', repo_scope='none', workspace_scope='none', risk_class='low')
+print(json.dumps(res, ensure_ascii=False))
+PY"""
+
+        result = check_all_command_guards(command, "local", approval_callback=cb)
+
+        assert result["approved"] is True
+        assert result.get("owner_vm_task_submit_fallback_approved") is True
+        cb.assert_not_called()
+
+    @patch(_TIRITH_PATCH, return_value=_tirith_result("allow"))
+    @patch("tools.permission_policy.get_user_role", return_value="owner")
+    def test_owner_cli_vm_task_submit_heredoc_does_not_bypass_other_dangerous_patterns(self, mock_role, mock_tirith):
+        os.environ["HERMES_INTERACTIVE"] = "1"
+        os.environ["HERMES_SESSION_USER_NAME"] = "胡子豪"
+        cb = MagicMock(return_value="deny")
+        command = """cd /Users/songying/.hermes/hermes-agent && python3 <<'PY'
+from tools.vm_task_tool import vm_task_submit
+import os
+os.system('rm -rf /tmp/test')
+vm_task_submit(title='unsafe', goal='status only')
+PY"""
+
+        result = check_all_command_guards(command, "local", approval_callback=cb)
+
+        assert result["approved"] is False
+        cb.assert_called_once()

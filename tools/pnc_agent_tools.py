@@ -38,6 +38,11 @@ DEFAULT_REPO = "pnc_specs"
 DEFAULT_PNC_PROJECT = "D2L3"
 DEFAULT_PNC_PLATFORM = "mcu"
 DEFAULT_PNC_PROFILE = "default"
+D1Q9_CONTROL_UDP_PARSE_DEFAULTS = {
+    "project": "D1Q9",
+    "platform": "mcu",
+    "profile": "control-udp-bin-to-asc",
+}
 LOCAL_WRAPPER = os.getenv("SSH_MINI_AGENT_BIN", "ssh-mini-agent")
 DEFAULT_TIMEOUT_SECONDS = 300
 MAX_TIMEOUT_SECONDS = 1800
@@ -116,20 +121,23 @@ def _resolve_execution_user(args: dict[str, Any], user_id: str = "") -> str:
     return _resolve_user_from_session(user_id)
 
 
-def _check_pnc_permission(agent_name: str, user: str, user_id: str = "") -> str | None:
+def _check_pnc_permission(agent_name: str, user: str, user_id: str = "", repo: str = DEFAULT_REPO) -> str | None:
     """Fail closed for shared Feishu users that are not allowed to run PNC VM tools."""
     # These tools run a fixed, domain-specific VM CLI through ssh-mini-agent.
     # They are safer than arbitrary ssh-mini-agent run_bash_json, but still need
-    # identity-based isolation and role gating before the subprocess path.
+    # identity-based isolation and role + repo ACL gating before subprocess or
+    # VM task submission.
     try:
-        from tools.permission_policy import get_user_role, get_user_role_by_id
+        from tools.permission_policy import get_user_role, get_user_role_by_id, repo_acl_allows
 
         role = get_user_role_by_id(user_id) if user_id else get_user_role(user)
+        if role not in {"owner", "admin", "senior"}:
+            return f"permission denied for {agent_name}: role {role!r} is not allowed to run PNC VM tools"
+        if role not in {"owner", "admin"} and not repo_acl_allows(user, repo, "read"):
+            return f"permission denied for {agent_name}: missing repo ACL read grant for {repo}"
     except Exception as exc:
         return f"permission policy unavailable for {agent_name}; refusing VM execution: {exc}"
 
-    if role not in {"owner", "admin", "senior"}:
-        return f"permission denied for {agent_name}: role {role!r} is not allowed to run PNC VM tools"
     return None
 
 
@@ -300,7 +308,12 @@ def _run_remote_agent(agent_name: str, args: dict[str, Any], user_id: str = "") 
     return tool_result({"ok": True, "agent": agent_name, **payload})
 
 
-def _pnc_command_args(agent_name: str, args: dict[str, Any]) -> list[str]:
+def _looks_like_d1q9_control_udp_input(value: Any) -> bool:
+    text = str(value or "").lower()
+    return "d1q9" in text and ("control_udp" in text or "control-udp" in text or "control udp" in text or "control" in text)
+
+
+def _effective_pnc_args(agent_name: str, args: dict[str, Any]) -> dict[str, Any]:
     effective_args = dict(args)
     if agent_name == "generate-dbc":
         # The VM-side generate-dbc CLI requires these even for smoke/failure-path
@@ -310,6 +323,12 @@ def _pnc_command_args(agent_name: str, args: dict[str, Any]) -> list[str]:
         effective_args.setdefault("project", DEFAULT_PNC_PROJECT)
         effective_args.setdefault("platform", DEFAULT_PNC_PLATFORM)
         effective_args.setdefault("profile", DEFAULT_PNC_PROFILE)
+    elif agent_name == "parse-bus-data" and _looks_like_d1q9_control_udp_input(effective_args.get("input")):
+        # D1Q9 Control UDP ASC conversion is a standard 宋伟军-maintained profile.
+        # Pin the CLI context before task submission so Feishu requests do not fall
+        # back to a generic VM worker or an arbitrary manifest default.
+        for key, value in D1Q9_CONTROL_UDP_PARSE_DEFAULTS.items():
+            effective_args.setdefault(key, value)
     elif agent_name == "validate-data-validity":
         # Current validate-data-validity implementation exposes the SOC-simple
         # profile in its manifest. Accept caller overrides for future MCU packs,
@@ -317,6 +336,11 @@ def _pnc_command_args(agent_name: str, args: dict[str, Any]) -> list[str]:
         effective_args.setdefault("project", "d4q")
         effective_args.setdefault("platform", "soc")
         effective_args.setdefault("profile", "soc-simple")
+    return effective_args
+
+
+def _pnc_command_args(agent_name: str, args: dict[str, Any]) -> list[str]:
+    effective_args = _effective_pnc_args(agent_name, args)
     cmd: list[str] = []
     for key in ("project", "platform", "profile", "input", "output", "regression"):
         value = effective_args.get(key)
@@ -346,6 +370,7 @@ def _build_pnc_task_goal(agent_name: str, args: dict[str, Any], user: str, user_
         f"/tmp/pnc-{title_slug}/"
     )
     cli_args = " ".join(shlex.quote(part) for part in _pnc_invocation(agent_name, args))
+    manifest_relpath = f"src/tools/{agent_name}/manifest.yaml"
     branch_suffix = f" --branch {shlex.quote(branch)}" if branch else ""
 
     return "\n".join(
@@ -364,7 +389,15 @@ def _build_pnc_task_goal(agent_name: str, args: dict[str, Any], user: str, user_
             "Repository/worktree:",
             f"- repo: {repo}",
             f"- ensure_command: python3 {REMOTE_WORKTREE_MANAGER} ensure {shlex.quote(user)} {repo}{branch_suffix}",
+            "- runtime_worktree: clean-latest",
             f"- agent_subdir: {REMOTE_AGENT_SUBDIR}",
+            "",
+            "Repository freshness preflight:",
+            "- Before running the domain CLI, execute `git fetch origin --prune` in WORKTREE_PATH.",
+            "- Refuse execution unless a resolved_snapshot is captured with: repo, worktree_path, branch, commit, upstream_ref, upstream_commit, dirty=false, behind=false, manifest_path, manifest_sha256.",
+            "- Refuse execution if the worktree is detached, dirty, behind upstream, missing the manifest, or missing the requested project/platform/profile in the manifest.",
+            "- Write the resolved_snapshot into the canonical result/log so status answers can prove the exact pnc_specs representative used.",
+            f"- manifest_relpath: {manifest_relpath}",
             "",
             "VM data landing rules:",
             f"- download_dir={download_dir}",
@@ -380,6 +413,7 @@ def _build_pnc_task_goal(agent_name: str, args: dict[str, Any], user: str, user_
             "",
             "Safety constraints:",
             "- Validate input/output/regression paths before use.",
+            "- For generate-dbc, parse-bus-data, and validate-data-validity tasks, call the pnc_specs standard CLI and generate fresh outputs; do not satisfy the task by copying/reusing existing artifacts from the input directory unless the requester explicitly asks for reuse.",
             "- Keep user worktree isolation; do not operate in another user's worktree.",
             "- Before any git operation, call /home/mini/worktrees/audit-logger.sh with user, repo, and command summary.",
             "- Never use git push --force unless owner explicitly requested it.",

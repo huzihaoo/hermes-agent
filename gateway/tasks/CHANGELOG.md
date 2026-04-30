@@ -13,6 +13,20 @@ MAJOR.MINOR.PATCH
 
 ---
 
+## [1.4.0] — 2026-04-30 — Routing Metadata + Delivery Diagnostics
+
+### Added
+- Task records now persist `chat_id`, `chat_type`, `thread_id`, `message_id`, `error_class`, `error_message`, `receipt_path`, and `delivery_verified`.
+- Older `tasks.db` files migrate additively with allowlisted SQLite columns.
+
+### Changed
+- Task receipts now reuse stored error class/message when explicit error values are not supplied.
+
+### Verified
+- `tests/gateway/test_tasks_store.py tests/gateway/test_tasks_integration.py tests/gateway/test_task_trace_gateway.py` included in the 277-test release slice.
+
+---
+
 ## [1.3.0] — 2026-04-26 — Task Cancel + Retry
 
 ### Added

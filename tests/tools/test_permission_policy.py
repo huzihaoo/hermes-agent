@@ -13,8 +13,16 @@ def _write_policy_config(path: Path) -> None:
     config = {
         "users": {
             "胡子豪": "owner",
+            "陈玉": "senior",
             "王平": "member",
             "default": "member",
+        },
+        "repo_acl": {
+            "陈玉": {
+                "minieye_dnp_nop": "push",
+                "pnc_specs": "read",
+            },
+            "default": {},
         },
         "user_id_mapping": {
             "ou_owner": "胡子豪",
@@ -52,7 +60,166 @@ def _write_policy_config(path: Path) -> None:
     path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def test_member_can_run_routine_vm_git_commands(monkeypatch, tmp_path):
+
+def test_repo_acl_supports_gitlab_project_exact_and_group_wildcard(monkeypatch, tmp_path):
+    import tools.permission_policy as permission_policy
+
+    config_path = tmp_path / "user-roles.json"
+    _write_policy_config(config_path)
+    cfg = json.loads(config_path.read_text(encoding="utf-8"))
+    cfg["users"]["刘旭"] = "senior"
+    cfg["repo_acl"]["刘旭"] = {
+        "planning_algo/*": "read",
+        "vehicle_dev/object_perception": "write",
+    }
+    config_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    monkeypatch.setattr(permission_policy, "_CONFIG_PATH", config_path)
+    monkeypatch.setattr(permission_policy, "_config", None)
+
+    assert permission_policy.repo_acl_allows("刘旭", "planning_algo/nop/planning", "read") is True
+    assert permission_policy.repo_acl_allows("刘旭", "planning_algo/nop/planning", "write") is False
+    assert permission_policy.repo_acl_allows("刘旭", "vehicle_dev/object_perception", "write") is True
+    assert permission_policy.repo_acl_allows("刘旭", "vehicle_dev/other", "read") is False
+
+
+def test_grant_repo_acl_accepts_gitlab_project_paths_and_group_wildcards(monkeypatch, tmp_path):
+    import tools.permission_policy as permission_policy
+
+    config_path = tmp_path / "user-roles.json"
+    _write_policy_config(config_path)
+    monkeypatch.setattr(permission_policy, "_CONFIG_PATH", config_path)
+    monkeypatch.setattr(permission_policy, "_config", None)
+
+    permission_policy.grant_repo_acl("陈玉", "planning_algo/nop/planning", "read")
+    permission_policy.grant_repo_acl("陈玉", "planning_algo/*", "write")
+
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["repo_acl"]["陈玉"]["planning_algo/nop/planning"] == "read"
+    assert saved["repo_acl"]["陈玉"]["planning_algo/*"] == "write"
+    assert permission_policy.repo_acl_allows("陈玉", "planning_algo/nop/other", "write") is True
+
+
+def test_check_dangerous_command_does_not_turn_generic_denies_into_repo_acl_request(monkeypatch, tmp_path):
+    import tools.approval as approval
+    import tools.permission_policy as permission_policy
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    config_path = tmp_path / "user-roles.json"
+    _write_policy_config(config_path)
+    monkeypatch.setattr(permission_policy, "_CONFIG_PATH", config_path)
+    monkeypatch.setattr(permission_policy, "_config", None)
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+    monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.setenv("HERMES_REPO_ACL_APPROVAL_DIR", str(tmp_path / "repo-acl"))
+    tokens = set_session_vars(
+        platform="feishu",
+        chat_id="oc_test",
+        user_id="ou_member",
+        user_name="王平",
+        session_key="agent:main:feishu:group:generic-danger-deny",
+    )
+    try:
+        with approval._lock:
+            approval._gateway_notify_cbs.clear()
+            approval._gateway_timeout_cbs.clear()
+            approval._gateway_queues.clear()
+        approval.clear_session("agent:main:feishu:group:generic-danger-deny")
+        result = approval.check_dangerous_command("git push --force origin main", "local")
+    finally:
+        clear_session_vars(tokens)
+        with approval._lock:
+            approval._gateway_notify_cbs.clear()
+            approval._gateway_timeout_cbs.clear()
+            approval._gateway_queues.clear()
+        approval.clear_session("agent:main:feishu:group:generic-danger-deny")
+
+    assert result["approved"] is False
+    assert result.get("description") != "VM repository access denied by repo ACL policy"
+    assert "repo_acl_request" not in result
+    assert "repo_acl_approval_card" not in result
+    assert result.get("status") != "repo_acl_approval_pending"
+
+
+def test_check_dangerous_command_yolo_does_not_bypass_repo_acl_source_denial(monkeypatch, tmp_path):
+    import tools.approval as approval
+    import tools.permission_policy as permission_policy
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    config_path = tmp_path / "user-roles.json"
+    _write_policy_config(config_path)
+    monkeypatch.setattr(permission_policy, "_CONFIG_PATH", config_path)
+    monkeypatch.setattr(permission_policy, "_config", None)
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+    monkeypatch.setenv("HERMES_YOLO_MODE", "1")
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.setenv("HERMES_REPO_ACL_APPROVAL_DIR", str(tmp_path / "repo-acl"))
+    tokens = set_session_vars(
+        platform="feishu",
+        chat_id="oc_test",
+        user_id="ou_member",
+        user_name="王平",
+        session_key="agent:main:feishu:group:yolo-source-deny",
+    )
+    try:
+        result = approval.check_dangerous_command(
+            "ssh-mini-run 'cd /home/mini/worktrees/minieye_dnp_nop/王平 && python3 run_eval.py'",
+            "local",
+        )
+    finally:
+        clear_session_vars(tokens)
+        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+
+    assert result["approved"] is False
+    assert result.get("description") == "VM repository access denied by repo ACL policy"
+    assert result.get("status") in {None, "repo_acl_approval_pending"}
+
+
+def test_authorized_senior_raw_repo_command_gets_direct_exec_denial_not_repo_acl_request(monkeypatch, tmp_path):
+    import tools.approval as approval
+    import tools.permission_policy as permission_policy
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    config_path = tmp_path / "user-roles.json"
+    _write_policy_config(config_path)
+    monkeypatch.setattr(permission_policy, "_CONFIG_PATH", config_path)
+    monkeypatch.setattr(permission_policy, "_config", None)
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+    monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.setenv("HERMES_REPO_ACL_APPROVAL_DIR", str(tmp_path / "repo-acl"))
+    tokens = set_session_vars(
+        platform="feishu",
+        chat_id="oc_test",
+        user_id="ou_chenyu",
+        user_name="陈玉",
+        session_key="agent:main:feishu:group:authorized-raw-repo-deny",
+    )
+    command = "ssh-mini-run 'cd /home/mini/worktrees/minieye_dnp_nop/陈玉 && python3 run_eval.py'"
+    try:
+        with approval._lock:
+            approval._gateway_notify_cbs.clear()
+            approval._gateway_timeout_cbs.clear()
+            approval._gateway_queues.clear()
+        approval.clear_session("agent:main:feishu:group:authorized-raw-repo-deny")
+
+        assert permission_policy.classify_command(command) == "vm_direct_exec"
+        result = approval.check_all_command_guards(command, "local")
+    finally:
+        clear_session_vars(tokens)
+        with approval._lock:
+            approval._gateway_notify_cbs.clear()
+            approval._gateway_timeout_cbs.clear()
+            approval._gateway_queues.clear()
+        approval.clear_session("agent:main:feishu:group:authorized-raw-repo-deny")
+
+    assert result["approved"] is False
+    assert result.get("description") == "Permission policy denied this command"
+    assert "repo_acl_request" not in result
+    assert "repo_acl_approval_card" not in result
+    assert result.get("status") != "repo_acl_approval_pending"
+
+def test_member_cannot_run_routine_vm_git_commands(monkeypatch, tmp_path):
     import tools.permission_policy as permission_policy
 
     config_path = tmp_path / "user-roles.json"
@@ -64,15 +231,78 @@ def test_member_can_run_routine_vm_git_commands(monkeypatch, tmp_path):
     commands = [
         "ssh-mini-run 'cd /home/mini/worktrees/minieye_dnp_nop/王平 && git fetch origin'",
         "ssh-mini-run 'cd /home/mini/worktrees/minieye_dnp_nop/王平 && git pull --ff-only origin dev-nop'",
-        "ssh-mini-run 'cd /home/mini/worktrees/minieye_dnp_nop/王平 && git checkout dev-nop-wp'",
     ]
 
     for command in commands:
-        assert permission_policy.classify_command(command) == "vm_git_routine"
-        assert permission_policy.get_decision("王平", command) == "ALLOW"
+        assert permission_policy.classify_command(command) == "vm_repo_unauthorized"
+        assert permission_policy.get_decision("王平", command) == "DENY"
+def test_member_read_vm_repo_denied(monkeypatch, tmp_path):
+    import tools.permission_policy as permission_policy
+
+    config_path = tmp_path / "user-roles.json"
+    _write_policy_config(config_path)
+    monkeypatch.setenv("HERMES_SESSION_USER_NAME", "王平")
+    monkeypatch.setattr(permission_policy, "_CONFIG_PATH", config_path)
+    monkeypatch.setattr(permission_policy, "_config", None)
+
+    command = "ssh-mini-agent read_file /home/mini/worktrees/minieye_dnp_nop/王平/src/main.py --start 1 --lines 20"
+
+    assert permission_policy.classify_command(command) == "vm_repo_unauthorized"
+    assert permission_policy.get_decision("王平", command) == "DENY"
 
 
-def test_member_direct_vm_git_push_requires_approval(monkeypatch, tmp_path):
+def test_senior_read_vm_repo_requires_repo_acl(monkeypatch, tmp_path):
+    import tools.permission_policy as permission_policy
+
+    config_path = tmp_path / "user-roles.json"
+    _write_policy_config(config_path)
+    monkeypatch.setenv("HERMES_SESSION_USER_NAME", "陈玉")
+    monkeypatch.setattr(permission_policy, "_CONFIG_PATH", config_path)
+    monkeypatch.setattr(permission_policy, "_config", None)
+
+    allowed = "ssh-mini-agent read_file /home/mini/worktrees/pnc_specs/陈玉/README.md --start 1 --lines 20"
+    denied = "ssh-mini-agent read_file /home/mini/worktrees/dnp_develop_enviroment/陈玉/README.md --start 1 --lines 20"
+
+    assert permission_policy.classify_command(allowed) == "read"
+    assert permission_policy.get_decision("陈玉", allowed) == "ALLOW"
+    assert permission_policy.classify_command(denied) == "vm_repo_unauthorized"
+    assert permission_policy.get_decision("陈玉", denied) == "DENY"
+
+
+def test_senior_cannot_read_main_repo_even_with_repo_acl(monkeypatch, tmp_path):
+    import tools.permission_policy as permission_policy
+
+    config_path = tmp_path / "user-roles.json"
+    _write_policy_config(config_path)
+    monkeypatch.setenv("HERMES_SESSION_USER_NAME", "陈玉")
+    monkeypatch.setattr(permission_policy, "_CONFIG_PATH", config_path)
+    monkeypatch.setattr(permission_policy, "_config", None)
+
+    command = "ssh-mini-agent read_file /home/mini/minieye_dnp_nop/README.md --start 1 --lines 20"
+
+    assert permission_policy.classify_command(command) == "vm_repo_unauthorized"
+    assert permission_policy.get_decision("陈玉", command) == "DENY"
+
+
+def test_member_cannot_write_vm_git_even_with_repo_acl(monkeypatch, tmp_path):
+    import tools.permission_policy as permission_policy
+
+    config_path = tmp_path / "user-roles.json"
+    _write_policy_config(config_path)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["repo_acl"]["王平"] = {"minieye_dnp_nop": "write"}
+    config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_SESSION_USER_NAME", "王平")
+    monkeypatch.setattr(permission_policy, "_CONFIG_PATH", config_path)
+    monkeypatch.setattr(permission_policy, "_config", None)
+
+    command = "ssh-mini-run 'cd /home/mini/worktrees/minieye_dnp_nop/王平 && git checkout dev-nop-wp'"
+
+    assert permission_policy.classify_command(command) == "vm_git_routine"
+    assert permission_policy.get_decision("王平", command) == "DENY"
+
+
+def test_member_direct_vm_git_push_is_denied(monkeypatch, tmp_path):
     import tools.permission_policy as permission_policy
 
     config_path = tmp_path / "user-roles.json"
@@ -83,8 +313,74 @@ def test_member_direct_vm_git_push_requires_approval(monkeypatch, tmp_path):
 
     command = "ssh-mini-run 'cd /home/mini/worktrees/minieye_dnp_nop/王平 && git push origin wp/fix'"
 
+    assert permission_policy.classify_command(command) == "vm_repo_unauthorized"
+    assert permission_policy.get_decision("王平", command) == "DENY"
+
+def test_senior_with_repo_acl_can_run_routine_vm_git_commands(monkeypatch, tmp_path):
+    import tools.permission_policy as permission_policy
+
+    config_path = tmp_path / "user-roles.json"
+    _write_policy_config(config_path)
+    monkeypatch.setenv("HERMES_SESSION_USER_NAME", "陈玉")
+    monkeypatch.setattr(permission_policy, "_CONFIG_PATH", config_path)
+    monkeypatch.setattr(permission_policy, "_config", None)
+
+    commands = [
+        "ssh-mini-run 'cd /home/mini/worktrees/minieye_dnp_nop/陈玉 && git fetch origin'",
+        "ssh-mini-run 'cd /home/mini/worktrees/minieye_dnp_nop/陈玉 && git pull --ff-only origin dev-nop'",
+    ]
+
+    for command in commands:
+        assert permission_policy.classify_command(command) == "vm_git_routine"
+        assert permission_policy.get_decision("陈玉", command) == "ALLOW"
+
+
+def test_senior_without_repo_acl_cannot_run_vm_git(monkeypatch, tmp_path):
+    import tools.permission_policy as permission_policy
+
+    config_path = tmp_path / "user-roles.json"
+    _write_policy_config(config_path)
+    monkeypatch.setenv("HERMES_SESSION_USER_NAME", "陈玉")
+    monkeypatch.setattr(permission_policy, "_CONFIG_PATH", config_path)
+    monkeypatch.setattr(permission_policy, "_config", None)
+
+    command = "ssh-mini-run 'cd /home/mini/worktrees/dnp_develop_enviroment/陈玉 && git status'"
+
+    assert permission_policy.classify_command(command) == "vm_repo_unauthorized"
+    assert permission_policy.get_decision("陈玉", command) == "DENY"
+
+
+def test_senior_read_only_repo_acl_cannot_write_git(monkeypatch, tmp_path):
+    import tools.permission_policy as permission_policy
+
+    config_path = tmp_path / "user-roles.json"
+    _write_policy_config(config_path)
+    monkeypatch.setenv("HERMES_SESSION_USER_NAME", "陈玉")
+    monkeypatch.setattr(permission_policy, "_CONFIG_PATH", config_path)
+    monkeypatch.setattr(permission_policy, "_config", None)
+
+    status = "ssh-mini-run 'cd /home/mini/worktrees/pnc_specs/陈玉 && git status'"
+    checkout = "ssh-mini-run 'cd /home/mini/worktrees/pnc_specs/陈玉 && git checkout main'"
+
+    assert permission_policy.classify_command(status) == "vm_git_routine"
+    assert permission_policy.get_decision("陈玉", status) == "ALLOW"
+    assert permission_policy.classify_command(checkout) == "vm_repo_unauthorized"
+    assert permission_policy.get_decision("陈玉", checkout) == "DENY"
+
+
+def test_senior_repo_acl_push_still_requires_approval(monkeypatch, tmp_path):
+    import tools.permission_policy as permission_policy
+
+    config_path = tmp_path / "user-roles.json"
+    _write_policy_config(config_path)
+    monkeypatch.setenv("HERMES_SESSION_USER_NAME", "陈玉")
+    monkeypatch.setattr(permission_policy, "_CONFIG_PATH", config_path)
+    monkeypatch.setattr(permission_policy, "_config", None)
+
+    command = "ssh-mini-run 'cd /home/mini/worktrees/minieye_dnp_nop/陈玉 && git push origin cy/fix'"
+
     assert permission_policy.classify_command(command) == "vm_git_push"
-    assert permission_policy.get_decision("王平", command) == "APPROVE"
+    assert permission_policy.get_decision("陈玉", command) == "APPROVE"
 
 
 def test_member_force_push_remains_denied(monkeypatch, tmp_path):
@@ -102,7 +398,7 @@ def test_member_force_push_remains_denied(monkeypatch, tmp_path):
     assert permission_policy.get_decision("王平", command) == "DENY"
 
 
-def test_non_git_ssh_mini_run_stays_direct_exec(monkeypatch, tmp_path):
+def test_non_git_ssh_mini_run_outside_repo_does_not_require_repo_acl(monkeypatch, tmp_path):
     import tools.permission_policy as permission_policy
 
     config_path = tmp_path / "user-roles.json"
@@ -111,9 +407,24 @@ def test_non_git_ssh_mini_run_stays_direct_exec(monkeypatch, tmp_path):
     monkeypatch.setattr(permission_policy, "_CONFIG_PATH", config_path)
     monkeypatch.setattr(permission_policy, "_config", None)
 
-    command = "ssh-mini-run 'cd /home/mini/minieye_dnp_nop && python3 run_eval.py'"
+    command = "ssh-mini-run 'cd /mnt/tmp/eval_job && python3 run_eval.py --input data.json'"
 
-    assert permission_policy.classify_command(command) == "vm_direct_exec"
+    assert permission_policy.classify_command(command) == "write"
+    assert permission_policy.get_decision("王平", command) == "APPROVE"
+
+
+def test_non_git_ssh_mini_run_inside_unauthorized_repo_is_source_guarded(monkeypatch, tmp_path):
+    import tools.permission_policy as permission_policy
+
+    config_path = tmp_path / "user-roles.json"
+    _write_policy_config(config_path)
+    monkeypatch.setenv("HERMES_SESSION_USER_NAME", "王平")
+    monkeypatch.setattr(permission_policy, "_CONFIG_PATH", config_path)
+    monkeypatch.setattr(permission_policy, "_config", None)
+
+    command = "ssh-mini-run 'cd /home/mini/worktrees/minieye_dnp_nop/王平 && python3 run_eval.py'"
+
+    assert permission_policy.classify_command(command) == "vm_repo_unauthorized"
     assert permission_policy.get_decision("王平", command) == "DENY"
 
 
@@ -128,7 +439,7 @@ def test_mixed_arbitrary_vm_command_with_git_status_stays_direct_exec(monkeypatc
 
     command = "ssh-mini-run 'cd /home/mini/worktrees/minieye_dnp_nop/王平 && python3 run_eval.py && git status'"
 
-    assert permission_policy.classify_command(command) == "vm_direct_exec"
+    assert permission_policy.classify_command(command) == "vm_repo_unauthorized"
     assert permission_policy.get_decision("王平", command) == "DENY"
 
 
@@ -143,11 +454,11 @@ def test_routine_git_requires_user_worktree_scope(monkeypatch, tmp_path):
 
     command = "ssh-mini-run 'cd /home/mini/minieye_dnp_nop && git status'"
 
-    assert permission_policy.classify_command(command) == "vm_direct_exec"
+    assert permission_policy.classify_command(command) == "vm_repo_unauthorized"
     assert permission_policy.get_decision("王平", command) == "DENY"
 
 
-def test_routine_git_allows_audit_logger_then_git(monkeypatch, tmp_path):
+def test_member_audit_logger_then_git_stays_direct_exec(monkeypatch, tmp_path):
     import tools.permission_policy as permission_policy
 
     config_path = tmp_path / "user-roles.json"
@@ -162,8 +473,8 @@ def test_routine_git_allows_audit_logger_then_git(monkeypatch, tmp_path):
         "git fetch origin'"
     )
 
-    assert permission_policy.classify_command(command) == "vm_git_routine"
-    assert permission_policy.get_decision("王平", command) == "ALLOW"
+    assert permission_policy.classify_command(command) == "vm_repo_unauthorized"
+    assert permission_policy.get_decision("王平", command) == "DENY"
 
 
 def test_newline_smuggling_stays_direct_exec(monkeypatch, tmp_path):
@@ -207,7 +518,7 @@ def test_member_cannot_target_another_users_worktree(monkeypatch, tmp_path):
 
     command = "ssh-mini-run 'cd /home/mini/worktrees/minieye_dnp_nop/陈玉 && git status'"
 
-    assert permission_policy.classify_command(command) == "vm_direct_exec"
+    assert permission_policy.classify_command(command) == "vm_repo_unauthorized"
     assert permission_policy.get_decision("王平", command) == "DENY"
 
 
@@ -301,7 +612,7 @@ def test_git_submodule_foreach_is_not_routine(monkeypatch, tmp_path):
 
     command = "ssh-mini-run 'cd /home/mini/worktrees/minieye_dnp_nop/王平 && git submodule foreach python3 run_eval.py'"
 
-    assert permission_policy.classify_command(command) == "vm_direct_exec"
+    assert permission_policy.classify_command(command) == "vm_repo_unauthorized"
     assert permission_policy.get_decision("王平", command) == "DENY"
 
 
@@ -316,7 +627,7 @@ def test_git_rebase_exec_is_not_routine(monkeypatch, tmp_path):
 
     command = "ssh-mini-run 'cd /home/mini/worktrees/minieye_dnp_nop/王平 && git rebase --exec python3 origin/main'"
 
-    assert permission_policy.classify_command(command) == "vm_direct_exec"
+    assert permission_policy.classify_command(command) == "vm_repo_unauthorized"
     assert permission_policy.get_decision("王平", command) == "DENY"
 
 
@@ -331,7 +642,7 @@ def test_worktree_path_traversal_is_not_routine(monkeypatch, tmp_path):
 
     command = "ssh-mini-run 'cd /home/mini/worktrees/minieye_dnp_nop/王平/../../陈玉 && git status'"
 
-    assert permission_policy.classify_command(command) == "vm_direct_exec"
+    assert permission_policy.classify_command(command) == "vm_repo_unauthorized"
     assert permission_policy.get_decision("王平", command) == "DENY"
 
 
@@ -391,7 +702,7 @@ def test_git_glob_metacharacters_are_not_routine(monkeypatch, tmp_path):
 
     command = "ssh-mini-run 'cd /home/mini/worktrees/minieye_dnp_nop/王平 && git add *'"
 
-    assert permission_policy.classify_command(command) == "vm_direct_exec"
+    assert permission_policy.classify_command(command) == "vm_repo_unauthorized"
     assert permission_policy.get_decision("王平", command) == "DENY"
 
 
@@ -406,7 +717,7 @@ def test_git_rebase_attached_exec_is_not_routine(monkeypatch, tmp_path):
 
     command = "ssh-mini-run 'cd /home/mini/worktrees/minieye_dnp_nop/王平 && git rebase -xpython3 origin/main'"
 
-    assert permission_policy.classify_command(command) == "vm_direct_exec"
+    assert permission_policy.classify_command(command) == "vm_repo_unauthorized"
     assert permission_policy.get_decision("王平", command) == "DENY"
 
 
@@ -451,13 +762,14 @@ def test_vm_git_dangerous_denies_even_if_matrix_allows(monkeypatch, tmp_path):
     assert permission_policy.get_decision("王平", command) == "DENY"
 
 
-def test_vm_git_push_approval_even_if_matrix_allows(monkeypatch, tmp_path):
+def test_vm_git_push_denied_for_member_even_if_matrix_allows(monkeypatch, tmp_path):
     import tools.permission_policy as permission_policy
 
     config_path = tmp_path / "user-roles.json"
     _write_policy_config(config_path)
     config = json.loads(config_path.read_text(encoding="utf-8"))
     config["permission_matrix"]["member"]["vm_git_push"] = "ALLOW"
+    config["repo_acl"]["王平"] = {"minieye_dnp_nop": "push"}
     config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_SESSION_USER_NAME", "王平")
     monkeypatch.setattr(permission_policy, "_CONFIG_PATH", config_path)
@@ -466,7 +778,7 @@ def test_vm_git_push_approval_even_if_matrix_allows(monkeypatch, tmp_path):
     command = "ssh-mini-run 'cd /home/mini/worktrees/minieye_dnp_nop/王平 && git push origin wp/fix'"
 
     assert permission_policy.classify_command(command) == "vm_git_push"
-    assert permission_policy.get_decision("王平", command) == "APPROVE"
+    assert permission_policy.get_decision("王平", command) == "DENY"
 
 
 def test_reset_hard_with_leading_options_remains_denied(monkeypatch, tmp_path):
@@ -558,5 +870,5 @@ def test_routine_git_rejects_absolute_or_tilde_paths(monkeypatch, tmp_path):
     ]
 
     for command in commands:
-        assert permission_policy.classify_command(command) == "vm_direct_exec"
+        assert permission_policy.classify_command(command) == "vm_repo_unauthorized"
         assert permission_policy.get_decision("王平", command) == "DENY"

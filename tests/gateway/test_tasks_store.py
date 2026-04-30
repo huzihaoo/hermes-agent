@@ -19,6 +19,12 @@ def test_upsert_and_get(store):
         platform="feishu",
         request_summary="写一个函数",
         started_at=1000.0,
+        chat_id="oc_chat",
+        chat_type="group",
+        thread_id="topic:om_anchor",
+        message_id="om_request",
+        error_class="",
+        error_message="",
     )
     store.upsert(task)
     loaded = store.get("t1")
@@ -27,6 +33,54 @@ def test_upsert_and_get(store):
     assert loaded.status == TaskStatus.RUNNING
     assert loaded.task_type == TaskType.CODING
     assert loaded.user_id == "alice"
+    assert loaded.chat_id == "oc_chat"
+    assert loaded.chat_type == "group"
+    assert loaded.thread_id == "topic:om_anchor"
+    assert loaded.message_id == "om_request"
+
+
+def test_existing_task_schema_migrates_new_columns(tmp_path):
+    import sqlite3
+
+    db_path = tmp_path / "legacy_tasks.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("""
+            CREATE TABLE tasks (
+                task_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                task_type TEXT NOT NULL,
+                user_id TEXT,
+                platform TEXT,
+                request_summary TEXT,
+                started_at REAL NOT NULL,
+                completed_at REAL,
+                agent_route TEXT
+            )
+        """)
+        conn.execute("""
+            INSERT INTO tasks (
+                task_id, status, task_type, user_id, platform,
+                request_summary, started_at, completed_at, agent_route
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, ("legacy", "running", "chat", "u", "feishu", "old", 1.0, None, None))
+
+    migrated = TaskStore(db_path=db_path)
+    loaded = migrated.get("legacy")
+    assert loaded is not None
+    assert loaded.chat_id is None
+    assert loaded.thread_id is None
+
+    loaded.chat_id = "oc_chat"
+    loaded.chat_type = "group"
+    loaded.thread_id = "topic:om_anchor"
+    loaded.message_id = "om_request"
+    migrated.upsert(loaded)
+
+    reloaded = migrated.get("legacy")
+    assert reloaded.chat_id == "oc_chat"
+    assert reloaded.chat_type == "group"
+    assert reloaded.thread_id == "topic:om_anchor"
+    assert reloaded.message_id == "om_request"
 
 
 def test_upsert_updates_status(store):

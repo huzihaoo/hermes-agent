@@ -10,7 +10,15 @@ Schema:
     request_summary TEXT,
     started_at REAL,
     completed_at REAL,
-    agent_route TEXT
+    agent_route TEXT,
+    chat_id TEXT,
+    chat_type TEXT,
+    thread_id TEXT,
+    message_id TEXT,
+    error_class TEXT,
+    error_message TEXT,
+    receipt_path TEXT,
+    delivery_verified INTEGER
   )
 
 This replaces JSONL full-scan for task listing and detail queries.
@@ -31,6 +39,51 @@ class TaskStore:
         self.db_path = db_path
         self._init_schema()
 
+    @staticmethod
+    def _ensure_columns(conn: sqlite3.Connection, columns: dict[str, str]) -> None:
+        """Add missing columns for older tasks.db files."""
+        allowed_types = {"TEXT", "INTEGER", "REAL"}
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        for name, column_type in columns.items():
+            if not name.isidentifier() or column_type not in allowed_types:
+                raise ValueError(f"invalid migration column: {name} {column_type}")
+            if name not in existing:
+                conn.execute(f"ALTER TABLE tasks ADD COLUMN {name} {column_type}")
+
+    @staticmethod
+    def _bool_to_db(value: Optional[bool]) -> Optional[int]:
+        if value is None:
+            return None
+        return 1 if value else 0
+
+    @staticmethod
+    def _bool_from_db(value) -> Optional[bool]:
+        if value is None:
+            return None
+        return bool(value)
+
+    @staticmethod
+    def _task_from_row(row: sqlite3.Row) -> Task:
+        return Task(
+            task_id=row["task_id"],
+            status=TaskStatus(row["status"]),
+            task_type=TaskType(row["task_type"]),
+            user_id=row["user_id"],
+            platform=row["platform"],
+            request_summary=row["request_summary"],
+            started_at=row["started_at"],
+            completed_at=row["completed_at"],
+            agent_route=row["agent_route"],
+            chat_id=row["chat_id"],
+            chat_type=row["chat_type"],
+            thread_id=row["thread_id"],
+            message_id=row["message_id"],
+            error_class=row["error_class"],
+            error_message=row["error_message"],
+            receipt_path=row["receipt_path"],
+            delivery_verified=TaskStore._bool_from_db(row["delivery_verified"]),
+        )
+
     def _init_schema(self) -> None:
         """Create tasks table if not exists."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -45,9 +98,27 @@ class TaskStore:
                     request_summary TEXT,
                     started_at REAL NOT NULL,
                     completed_at REAL,
-                    agent_route TEXT
+                    agent_route TEXT,
+                    chat_id TEXT,
+                    chat_type TEXT,
+                    thread_id TEXT,
+                    message_id TEXT,
+                    error_class TEXT,
+                    error_message TEXT,
+                    receipt_path TEXT,
+                    delivery_verified INTEGER
                 )
             """)
+            self._ensure_columns(conn, {
+                "chat_id": "TEXT",
+                "chat_type": "TEXT",
+                "thread_id": "TEXT",
+                "message_id": "TEXT",
+                "error_class": "TEXT",
+                "error_message": "TEXT",
+                "receipt_path": "TEXT",
+                "delivery_verified": "INTEGER",
+            })
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_tasks_user_started
                 ON tasks(user_id, started_at DESC)
@@ -64,13 +135,23 @@ class TaskStore:
             conn.execute("""
                 INSERT INTO tasks (
                     task_id, status, task_type, user_id, platform,
-                    request_summary, started_at, completed_at, agent_route
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    request_summary, started_at, completed_at, agent_route,
+                    chat_id, chat_type, thread_id, message_id,
+                    error_class, error_message, receipt_path, delivery_verified
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(task_id) DO UPDATE SET
                     status = excluded.status,
                     task_type = excluded.task_type,
                     completed_at = excluded.completed_at,
-                    agent_route = excluded.agent_route
+                    agent_route = excluded.agent_route,
+                    chat_id = COALESCE(excluded.chat_id, tasks.chat_id),
+                    chat_type = COALESCE(excluded.chat_type, tasks.chat_type),
+                    thread_id = COALESCE(excluded.thread_id, tasks.thread_id),
+                    message_id = COALESCE(excluded.message_id, tasks.message_id),
+                    error_class = COALESCE(excluded.error_class, tasks.error_class),
+                    error_message = COALESCE(excluded.error_message, tasks.error_message),
+                    receipt_path = COALESCE(excluded.receipt_path, tasks.receipt_path),
+                    delivery_verified = COALESCE(excluded.delivery_verified, tasks.delivery_verified)
             """, (
                 task.task_id,
                 task.status.value,
@@ -81,6 +162,14 @@ class TaskStore:
                 task.started_at,
                 task.completed_at,
                 task.agent_route,
+                task.chat_id,
+                task.chat_type,
+                task.thread_id,
+                task.message_id,
+                task.error_class,
+                task.error_message,
+                task.receipt_path,
+                self._bool_to_db(task.delivery_verified),
             ))
             conn.commit()
 
@@ -93,17 +182,7 @@ class TaskStore:
             ).fetchone()
             if not row:
                 return None
-            return Task(
-                task_id=row["task_id"],
-                status=TaskStatus(row["status"]),
-                task_type=TaskType(row["task_type"]),
-                user_id=row["user_id"],
-                platform=row["platform"],
-                request_summary=row["request_summary"],
-                started_at=row["started_at"],
-                completed_at=row["completed_at"],
-                agent_route=row["agent_route"],
-            )
+            return self._task_from_row(row)
 
     def list_recent(
         self,
@@ -147,20 +226,7 @@ class TaskStore:
             params.extend([limit, offset])
             
             rows = conn.execute(query, params).fetchall()
-            return [
-                Task(
-                    task_id=row["task_id"],
-                    status=TaskStatus(row["status"]),
-                    task_type=TaskType(row["task_type"]),
-                    user_id=row["user_id"],
-                    platform=row["platform"],
-                    request_summary=row["request_summary"],
-                    started_at=row["started_at"],
-                    completed_at=row["completed_at"],
-                    agent_route=row["agent_route"],
-                )
-                for row in rows
-            ]
+            return [self._task_from_row(row) for row in rows]
 
     def count_tasks(
         self,

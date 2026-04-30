@@ -53,8 +53,9 @@ def test_emit_request_start_event(tmp_path, monkeypatch):
     emitted = []
 
     class _FakeEmitter:
-        def __init__(self, trace_file=None):
+        def __init__(self, trace_file=None, task_store=None):
             self.trace_file = trace_file
+            self.task_store = task_store
         def emit(self, event, data):
             emitted.append((event, data))
 
@@ -91,3 +92,47 @@ def test_emit_request_start_event(tmp_path, monkeypatch):
     assert data["chat_id"] == "chat-1"
     assert data["message_id"] == "msg-1"
     assert data["request_summary"] == "hello world"
+
+
+def test_emit_request_start_event_falls_back_to_alt_user_id(tmp_path, monkeypatch):
+    runner = object.__new__(gateway_run.GatewayRunner)
+    emitted = []
+
+    class _FakeEmitter:
+        def __init__(self, trace_file=None, task_store=None):
+            self.trace_file = trace_file
+            self.task_store = task_store
+        def emit(self, event, data):
+            emitted.append((event, data))
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    import hermes_events
+    monkeypatch.setattr(hermes_events, "EventEmitter", _FakeEmitter)
+
+    source = SimpleNamespace(
+        platform=SimpleNamespace(value="feishu"),
+        user_id=None,
+        user_id_alt="ou_fallback",
+        user_name="Fallback User",
+        chat_id="chat-1",
+        thread_id="topic:om_1",
+        chat_type="group",
+    )
+    event = SimpleNamespace(
+        text="hello from topic",
+        message_id="msg-1",
+        source=source,
+        metadata={},
+        auto_skill=None,
+    )
+    session_entry = SimpleNamespace(session_id="sess-1")
+
+    gateway_run.GatewayRunner._emit_request_start_event(runner, event, source, session_entry)
+
+    request_events = [x for x in emitted if x[0] == "request:start"]
+    assert request_events, "expected request:start event"
+    data = request_events[0][1]
+    assert data["user_id"] == "ou_fallback"
+    assert data["thread_id"] == "topic:om_1"
+    assert data["chat_type"] == "group"

@@ -1377,5 +1377,5 @@ registry.register(
         enabled_tools=kw.get("enabled_tools")),
     check_fn=check_sandbox_requirements,
     emoji="🐍",
-    max_result_size_chars=100_000,
+    max_result_size_chars=80_000,
 )
