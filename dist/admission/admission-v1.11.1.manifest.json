@@ -1,0 +1,7 @@
+{
+  "module": "admission",
+  "version": "1.11.1",
+  "artifact": "dist/admission/admission-v1.11.1.tar.gz",
+  "sha256": "e1147ec373bbd56680773826879d57f3f7070b34c4cf43df75a7274e904dee9e",
+  "built": "2026-04-30T17:26:46.754685"
+}

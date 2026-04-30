@@ -13,6 +13,19 @@ MAJOR.MINOR.PATCH
 
 ---
 
+## [1.11.1] — 2026-04-30 — Slash repo worktree ACL patch
+
+### Fixed
+- Slash-containing GitLab repo keys such as `planning_algo/nop/planning` are parsed by configured repo keys instead of naive path segments.
+- Group wildcard repo ACL scopes are descendants-only, so `planning_algo/*` no longer grants the parent repo `planning_algo`.
+- Repo ACL lookups reject wildcard lookup names and unsafe repo/path segments fail closed.
+- VM worktree paths and `ssh-mini-run cd` paths containing `.` or `..` classify as `vm_repo_unauthorized`.
+
+### Verified
+- `tests/gateway/admission/test_worktree_manager.py tests/tools/test_permission_policy.py tests/gateway/test_feishu_vm_direct_execution_guard.py tests/tools/test_repo_acl_approval.py` — 86 passed
+- `python check_versions.py` — all modules version-managed
+- `py_compile` — patched runtime/test modules compiled
+
 ## [1.11.0] — 2026-04-30 — Repo ACL and VM direct-exec release gate hardening
 
 ### Added

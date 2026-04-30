@@ -1,0 +1,11 @@
+{
+  "module": "hermes-agent",
+  "version": "0.10.3",
+  "artifact": "dist/hermes-agent/hermes-agent-v0.10.3.tar.gz",
+  "sha256": "a0a7b089d5c4dad17da940654dae37fa6bc16cb9e6c960feec1229f7edeea3c0",
+  "built": "2026-04-30T17:27:22.774314",
+  "components": {
+    "admission": "1.11.1",
+    "tasks": "1.4.0"
+  }
+}
