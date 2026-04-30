@@ -31,6 +31,12 @@ class QueueWorker:
     ):
         self._admission = admission_controller
         self._process_fn = process_fn
+        if (
+            not isinstance(max_concurrent_per_domain, int)
+            or isinstance(max_concurrent_per_domain, bool)
+            or max_concurrent_per_domain < 1
+        ):
+            raise ValueError("max_concurrent_per_domain must be a positive integer")
         self._running = False
         self._tasks: list[asyncio.Task] = []
         self._cleanup_interval_hours = 6
@@ -39,8 +45,8 @@ class QueueWorker:
         self._active_domain_ids: Dict[Domain, Set[str]] = {
             d: set() for d in ALL_DOMAINS
         }
-        # Semaphore per domain to enforce concurrency limit
-        self._domain_sema: Dict[Domain, asyncio.Semaphore] = {}
+        # Track available slots per domain without relying on private asyncio.Semaphore internals.
+        self._available_domain_slots: Dict[Domain, int] = {d: 0 for d in ALL_DOMAINS}
         # In-flight tasks for graceful shutdown
         self._inflight: Set[asyncio.Task] = set()
 
@@ -51,9 +57,7 @@ class QueueWorker:
             return
 
         self._running = True
-        self._domain_sema = {
-            d: asyncio.Semaphore(self._max_concurrent) for d in ALL_DOMAINS
-        }
+        self._available_domain_slots = {d: self._max_concurrent for d in ALL_DOMAINS}
         logger.info(
             "[worker] Starting domain dispatchers (max_concurrent=%d)",
             self._max_concurrent,
@@ -98,8 +102,6 @@ class QueueWorker:
     async def _domain_dispatcher(self, domain: Domain) -> None:
         """Dispatcher for a domain. Scans for work and spawns per-domain_id tasks."""
         logger.info("[worker] Started %s dispatcher", domain)
-        sema = self._domain_sema[domain]
-
         while self._running:
             try:
                 spawned = False
@@ -109,7 +111,7 @@ class QueueWorker:
                     if did not in active
                 ]
                 for domain_id in ready_domain_ids:
-                    if getattr(sema, "_value", 0) <= 0:
+                    if self._available_domain_slots[domain] <= 0:
                         break
                     for lane in ALL_LANES:
                         item = self._admission.dequeue_next(lane, domain=domain, domain_id=domain_id)
@@ -118,9 +120,9 @@ class QueueWorker:
 
                         spawned = True
                         active.add(item.domain_id)
-                        await sema.acquire()
+                        self._available_domain_slots[domain] -= 1
                         task = asyncio.create_task(
-                            self._process_item_with_acquired_slot(item, sema)
+                            self._process_item_with_reserved_slot(item)
                         )
                         self._inflight.add(task)
                         task.add_done_callback(self._inflight.discard)
@@ -142,20 +144,12 @@ class QueueWorker:
 
         logger.info("[worker] Stopped %s dispatcher", domain)
 
-    async def _process_item_with_acquired_slot(self, item: QueueItem, sema: asyncio.Semaphore) -> None:
-        """Process an item after the dispatcher has already acquired a domain slot."""
+    async def _process_item_with_reserved_slot(self, item: QueueItem) -> None:
+        """Process an item after the dispatcher has reserved a public domain slot."""
         try:
             await self._process_item(item)
         finally:
-            sema.release()
-
-    async def _gated_process(self, item: QueueItem, sema: asyncio.Semaphore) -> None:
-        """Acquire semaphore, process item, release."""
-        await sema.acquire()
-        try:
-            await self._process_item(item)
-        finally:
-            sema.release()
+            self._available_domain_slots[item.domain] += 1
 
     async def _process_item(self, item: QueueItem) -> None:
         """Process a single queue item."""

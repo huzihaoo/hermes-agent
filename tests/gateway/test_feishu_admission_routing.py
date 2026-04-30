@@ -258,3 +258,51 @@ async def test_queue_worker_does_not_dequeue_more_domain_ids_than_available_doma
 
     assert sorted(statuses.values()) == ["processing", "queued"]
     assert second.status == "queued"
+
+
+@pytest.mark.asyncio
+async def test_queue_worker_uses_public_slot_accounting_without_private_semaphore_value(tmp_path, monkeypatch):
+    class PublicSemaphore:
+        def __init__(self, value):
+            self._available = value
+
+        async def acquire(self):
+            while self._available <= 0:
+                await asyncio.sleep(0.01)
+            self._available -= 1
+
+        def release(self):
+            self._available += 1
+
+    monkeypatch.setattr("gateway.admission.worker.asyncio.Semaphore", PublicSemaphore)
+    ctrl = AdmissionController(db_path=tmp_path / "queue.db", audit_dir=tmp_path / "audit")
+    _, _, item = await ctrl.admit("u1", "standard public semaphore task", chat_id="group-a", chat_type="group", platform="feishu")
+    processed = []
+
+    async def handler(queue_item):
+        processed.append(queue_item.id)
+        return {"status": "completed"}
+
+    worker = QueueWorker(ctrl, handler, max_concurrent_per_domain=1)
+    await worker.start()
+    await asyncio.sleep(0.2)
+    await worker.stop()
+
+    assert processed == [item.id]
+    assert item.status == "completed"
+
+
+def test_queue_worker_rejects_non_positive_domain_concurrency(tmp_path):
+    ctrl = AdmissionController(db_path=tmp_path / "queue.db", audit_dir=tmp_path / "audit")
+
+    async def handler(queue_item):
+        return {"status": "completed"}
+
+    with pytest.raises(ValueError, match="max_concurrent_per_domain"):
+        QueueWorker(ctrl, handler, max_concurrent_per_domain=0)
+    with pytest.raises(ValueError, match="max_concurrent_per_domain"):
+        QueueWorker(ctrl, handler, max_concurrent_per_domain=-1)
+    with pytest.raises(ValueError, match="max_concurrent_per_domain"):
+        QueueWorker(ctrl, handler, max_concurrent_per_domain=1.5)
+    with pytest.raises(ValueError, match="max_concurrent_per_domain"):
+        QueueWorker(ctrl, handler, max_concurrent_per_domain=True)
