@@ -13,6 +13,20 @@ MAJOR.MINOR.PATCH
 
 ---
 
+## [1.10.1] — 2026-04-30 — Explicit worker slot accounting
+
+### Fixed
+- QueueWorker now uses explicit public slot accounting instead of relying on private semaphore internals, so same-domain serial and different-domain parallel dispatch stay correct under load.
+- Invalid `max_concurrent_per_domain` values now fail closed for non-positive integers, floats, and booleans before worker startup.
+- Registry-handler execution now forwards scheduler metadata consistently, matching the direct Python tool path.
+
+### Verified
+- `tests/gateway/test_feishu_admission_routing.py tests/gateway/test_admission_templates.py tests/tools/test_vm_task_tool_session_routing.py tests/tools/test_vm_task_tool.py tests/gateway/test_admission_worker.py tests/gateway/test_admission_concurrent.py tests/gateway/test_feishu.py tests/tools/test_send_message_tool.py` — 242 passed, 3 warnings
+- `tests/gateway/test_feishu_admission_autostart.py tests/gateway/test_admission_templates.py` — 21 passed
+- `tests/gateway/test_feishu_admission_routing.py tests/gateway/test_admission_templates.py tests/tools/test_vm_task_tool_session_routing.py tests/tools/test_vm_task_tool.py tests/gateway/test_admission_worker.py tests/gateway/test_admission_concurrent.py tests/gateway/test_feishu.py tests/tools/test_send_message_tool.py` — 237 passed, 16 skipped
+- `python check_versions.py` — Admission Control v1.10.1, all modules version-managed
+- `py_compile` — release-touched runtime/test modules compiled
+
 ## [1.10.0] — 2026-04-29 — VM Git 协作放行与 PNC 数据校验代理
 
 ### Added

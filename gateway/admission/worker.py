@@ -110,6 +110,15 @@ class QueueWorker:
                     did for did in self._admission.queue.active_domain_ids(domain)
                     if did not in active
                 ]
+                ready_domain_ids.sort(
+                    key=lambda did: (
+                        -max(
+                            (item.priority for item in self._admission.queue.list_pending(domain=domain, domain_id=did)),
+                            default=-1,
+                        ),
+                        did,
+                    )
+                )
                 for domain_id in ready_domain_ids:
                     if self._available_domain_slots[domain] <= 0:
                         break
