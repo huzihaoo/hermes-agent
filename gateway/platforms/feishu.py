@@ -1425,7 +1425,7 @@ class FeishuAdapter(BasePlatformAdapter):
             
             # Start metrics server if configured
             if self._metrics_server:
-                await self._metrics_server.start()
+                self._metrics_server.start()
                 logger.info("[admission] Metrics server started on port %s", self._metrics_server.port)
             
             logger.info("[Feishu] Connected in %s mode (%s)", self._connection_mode, self._domain_name)
@@ -1443,7 +1443,7 @@ class FeishuAdapter(BasePlatformAdapter):
         
         # Stop metrics server if running
         if self._metrics_server:
-            await self._metrics_server.stop()
+            self._metrics_server.stop()
             logger.info("[admission] Metrics server stopped")
         
         # Stop admission queue worker if enabled

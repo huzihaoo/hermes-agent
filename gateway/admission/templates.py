@@ -132,4 +132,15 @@ def builtin_templates() -> list[PolicyTemplate]:
             error_rate_critical=0.4,
             alert_cooldown_seconds=180,
         ),
+        PolicyTemplate(
+            name="pnc-shared-vm",
+            description="PNC shared Feishu -> Hermes -> VM shared-state control-plane policy",
+            rate_limit_per_user=12,
+            rate_limit_window_seconds=60,
+            depth_warning=6,
+            depth_critical=20,
+            error_rate_threshold=0.15,
+            error_rate_critical=0.35,
+            alert_cooldown_seconds=180,
+        ),
     ]

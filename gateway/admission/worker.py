@@ -103,19 +103,30 @@ class QueueWorker:
         while self._running:
             try:
                 spawned = False
-                for lane in ALL_LANES:
-                    item = self._admission.dequeue_next(lane, domain=domain)
-                    if item is None:
+                active = self._active_domain_ids[domain]
+                ready_domain_ids = [
+                    did for did in self._admission.queue.active_domain_ids(domain)
+                    if did not in active
+                ]
+                for domain_id in ready_domain_ids:
+                    if getattr(sema, "_value", 0) <= 0:
+                        break
+                    for lane in ALL_LANES:
+                        item = self._admission.dequeue_next(lane, domain=domain, domain_id=domain_id)
+                        if item is None:
+                            continue
+
+                        spawned = True
+                        active.add(item.domain_id)
+                        await sema.acquire()
+                        task = asyncio.create_task(
+                            self._process_item_with_acquired_slot(item, sema)
+                        )
+                        self._inflight.add(task)
+                        task.add_done_callback(self._inflight.discard)
+                        break
+                    else:
                         continue
-
-                    spawned = True
-                    # Fire-and-forget task with semaphore gating
-                    task = asyncio.create_task(
-                        self._gated_process(item, sema)
-                    )
-                    self._inflight.add(task)
-                    task.add_done_callback(self._inflight.discard)
-
                 if not spawned:
                     await asyncio.sleep(0.5)
 
@@ -131,10 +142,20 @@ class QueueWorker:
 
         logger.info("[worker] Stopped %s dispatcher", domain)
 
+    async def _process_item_with_acquired_slot(self, item: QueueItem, sema: asyncio.Semaphore) -> None:
+        """Process an item after the dispatcher has already acquired a domain slot."""
+        try:
+            await self._process_item(item)
+        finally:
+            sema.release()
+
     async def _gated_process(self, item: QueueItem, sema: asyncio.Semaphore) -> None:
         """Acquire semaphore, process item, release."""
-        async with sema:
+        await sema.acquire()
+        try:
             await self._process_item(item)
+        finally:
+            sema.release()
 
     async def _process_item(self, item: QueueItem) -> None:
         """Process a single queue item."""
@@ -157,6 +178,8 @@ class QueueWorker:
                 item.id, elapsed, e, exc_info=True,
             )
             self._admission.fail(item.id, str(e))
+        finally:
+            self._active_domain_ids[item.domain].discard(item.domain_id)
 
     async def _cleanup_loop(self) -> None:
         """Periodic cleanup of old completed items."""

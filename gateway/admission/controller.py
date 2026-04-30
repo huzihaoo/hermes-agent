@@ -285,8 +285,13 @@ class AdmissionController:
         domain_label = {"user": "私聊", "group": "群聊", "vm": "VM"}[domain]
         return (True, f"已加入 {domain_label}/{lane} 队列{pos_text}", item)
 
-    def dequeue_next(self, lane: Lane, domain: Domain | None = None) -> QueueItem | None:
-        item = self.queue.dequeue(lane, domain=domain)
+    def dequeue_next(
+        self,
+        lane: Lane,
+        domain: Domain | None = None,
+        domain_id: str | None = None,
+    ) -> QueueItem | None:
+        item = self.queue.dequeue(lane, domain=domain, domain_id=domain_id)
         if item:
             self._audit("dequeue", item.id, "allowed", {
                 "lane": lane,

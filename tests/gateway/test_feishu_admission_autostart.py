@@ -36,8 +36,8 @@ def mock_admission_modules():
         
         mock_server = MagicMock()
         mock_server.port = 9090
-        mock_server.start = AsyncMock()
-        mock_server.stop = AsyncMock()
+        mock_server.start = MagicMock()
+        mock_server.stop = MagicMock()
         mock_server_cls.return_value = mock_server
         
         yield {
@@ -182,7 +182,7 @@ class TestMetricsServerAutoStart:
             await adapter.connect()
         
         # Metrics server should be started
-        mock_admission_modules["server"].start.assert_awaited_once()
+        mock_admission_modules["server"].start.assert_called_once()
     
     @pytest.mark.asyncio
     async def test_metrics_server_stopped_on_disconnect(self, mock_admission_modules):
@@ -210,7 +210,7 @@ class TestMetricsServerAutoStart:
             await adapter.disconnect()
         
         # Metrics server should be stopped
-        mock_admission_modules["server"].stop.assert_awaited_once()
+        mock_admission_modules["server"].stop.assert_called_once()
 
 
 class TestCombinedAutoStart:

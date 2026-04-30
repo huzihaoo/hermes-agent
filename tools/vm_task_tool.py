@@ -53,6 +53,14 @@ def _check_vm_task_permission(user_name: str, user_id: str = "") -> str | None:
 _DEFAULT_BRIDGE_ROOT = Path.home() / "Mounts" / "mini_root" / "tmp" / "openclaw-shared-state"
 _DEFAULT_VM_CANONICAL_ROOT = Path.home() / "Mounts" / "mini_root" / ".hermes" / "shared-state"
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_ALLOWED_LANES = {"fast", "standard", "heavy"}
+_ALLOWED_RESOURCE_CLASSES = {"cpu", "io", "repo", "pnc_data", "network", "mixed"}
+_ALLOWED_WORKSPACE_SCOPES = {"owner_main_repo", "user_worktree", "shared_nested_repo", "none", "unknown"}
+_ALLOWED_RISK_CLASSES = {"low", "normal", "high"}
+_SAFE_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_REPO_SCOPE_RE = _SAFE_PATH_SEGMENT_RE
+_VM_ARTIFACT_PREFIX = "/mnt/tmp/"
+_CIFS_ARTIFACT_PREFIX = "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/"
 _VM_PATH_CONTRACT = """
 
 ---
@@ -100,6 +108,38 @@ VM_TASK_SUBMIT_SCHEMA = {
                 "type": "string",
                 "description": "Optional requester label. Ignored in gateway sessions; trusted session identity is used instead.",
             },
+            "lane": {
+                "type": "string",
+                "enum": ["fast", "standard", "heavy"],
+                "description": "Optional VM scheduler lane metadata. Use heavy for PNC data/conversion/evaluation and long-running VM tasks.",
+            },
+            "resource_class": {
+                "type": "string",
+                "enum": ["cpu", "io", "repo", "pnc_data", "network", "mixed"],
+                "description": "Optional VM scheduler resource-class metadata for slot/resource isolation.",
+            },
+            "repo_scope": {
+                "type": "string",
+                "description": "Optional VM scheduler repository scope, e.g. pnc_specs, minieye_dnp_nop, none, or unknown.",
+            },
+            "workspace_scope": {
+                "type": "string",
+                "enum": ["owner_main_repo", "user_worktree", "shared_nested_repo", "none", "unknown"],
+                "description": "Optional VM scheduler workspace isolation metadata.",
+            },
+            "risk_class": {
+                "type": "string",
+                "enum": ["low", "normal", "high"],
+                "description": "Optional VM scheduler risk metadata.",
+            },
+            "artifact_root": {
+                "type": "string",
+                "description": "Optional expected VM artifact root, preferably /mnt/tmp/<task_id>/.",
+            },
+            "artifact_cifs_root": {
+                "type": "string",
+                "description": "Optional user-visible CIFS artifact root corresponding to artifact_root.",
+            },
         },
         "required": ["title", "goal"],
     },
@@ -136,7 +176,83 @@ def _python_executable() -> str:
     return shutil.which("python3.11") or shutil.which("python3") or "python3"
 
 
-def vm_task_submit(title: str, goal: str, owner: str = "", user_id: str = "") -> Dict[str, Any]:
+def _validate_optional_enum(name: str, value: str, allowed: set[str]) -> str | None:
+    if not value:
+        return None
+    if value not in allowed:
+        return f"invalid {name}: {value!r}; expected one of {sorted(allowed)}"
+    return None
+
+
+def _validate_artifact_root(name: str, value: str, prefix: str) -> str | None:
+    if not value:
+        return None
+    if not value.startswith(prefix):
+        return f"invalid {name}: must be under {prefix}<task_id>/"
+    relative = value[len(prefix):]
+    if not relative:
+        return f"invalid {name}: must include task id under {prefix}"
+    parts = [part for part in relative.split("/") if part]
+    if not parts:
+        return f"invalid {name}: must include task id under {prefix}"
+    if any(part in {".", ".."} or not _SAFE_PATH_SEGMENT_RE.match(part) for part in parts):
+        return f"invalid {name}: path segments must be safe labels without traversal"
+    return None
+
+
+def _build_scheduler_meta(
+    *,
+    lane: str = "",
+    resource_class: str = "",
+    repo_scope: str = "",
+    workspace_scope: str = "",
+    risk_class: str = "",
+    artifact_root: str = "",
+    artifact_cifs_root: str = "",
+) -> tuple[dict[str, str], str | None]:
+    values = {
+        "lane": str(lane or "").strip(),
+        "resource_class": str(resource_class or "").strip(),
+        "repo_scope": str(repo_scope or "").strip(),
+        "workspace_scope": str(workspace_scope or "").strip(),
+        "risk_class": str(risk_class or "").strip(),
+        "artifact_root": str(artifact_root or "").strip(),
+        "artifact_cifs_root": str(artifact_cifs_root or "").strip(),
+    }
+    checks = (
+        ("lane", values["lane"], _ALLOWED_LANES),
+        ("resource_class", values["resource_class"], _ALLOWED_RESOURCE_CLASSES),
+        ("workspace_scope", values["workspace_scope"], _ALLOWED_WORKSPACE_SCOPES),
+        ("risk_class", values["risk_class"], _ALLOWED_RISK_CLASSES),
+    )
+    for name, value, allowed in checks:
+        error = _validate_optional_enum(name, value, allowed)
+        if error:
+            return {}, error
+    if values["repo_scope"] and not _REPO_SCOPE_RE.match(values["repo_scope"]):
+        return {}, "invalid repo_scope: must be a safe repository label, not a filesystem path"
+    artifact_root_error = _validate_artifact_root("artifact_root", values["artifact_root"], _VM_ARTIFACT_PREFIX)
+    if artifact_root_error:
+        return {}, artifact_root_error
+    cifs_root_error = _validate_artifact_root("artifact_cifs_root", values["artifact_cifs_root"], _CIFS_ARTIFACT_PREFIX)
+    if cifs_root_error:
+        return {}, cifs_root_error
+    return {k: v for k, v in values.items() if v}, None
+
+
+def vm_task_submit(
+    title: str,
+    goal: str,
+    owner: str = "",
+    user_id: str = "",
+    lane: str = "",
+    resource_class: str = "",
+    repo_scope: str = "",
+    workspace_scope: str = "",
+    risk_class: str = "",
+    artifact_root: str = "",
+    artifact_cifs_root: str = "",
+) -> Dict[str, Any]:
     """Create and bridge-deliver a shared-state v2 task for VM worker pickup."""
     title = str(title or "").strip()
     goal = str(goal or "").strip()
@@ -152,6 +268,17 @@ def vm_task_submit(title: str, goal: str, owner: str = "", user_id: str = "") ->
         return {"success": False, "error": "title is required"}
     if not goal:
         return {"success": False, "error": "goal is required"}
+    scheduler_meta, scheduler_meta_error = _build_scheduler_meta(
+        lane=lane,
+        resource_class=resource_class,
+        repo_scope=repo_scope,
+        workspace_scope=workspace_scope,
+        risk_class=risk_class,
+        artifact_root=artifact_root,
+        artifact_cifs_root=artifact_cifs_root,
+    )
+    if scheduler_meta_error:
+        return {"success": False, "error": scheduler_meta_error}
     goal = _goal_with_vm_path_contract(goal)
 
     create_task = _create_task_script()
@@ -177,6 +304,7 @@ def vm_task_submit(title: str, goal: str, owner: str = "", user_id: str = "") ->
         value = _session_value(env_key)
         if value:
             routing_meta[meta_key] = value
+    routing_meta.update(scheduler_meta)
 
     cmd = [
         _python_executable(),
@@ -239,8 +367,35 @@ def vm_task_submit(title: str, goal: str, owner: str = "", user_id: str = "") ->
     }
 
 
-def vm_task_submit_json(title: str, goal: str, owner: str = "", user_id: str = "") -> str:
-    return json.dumps(vm_task_submit(title=title, goal=goal, owner=owner, user_id=user_id), ensure_ascii=False)
+def vm_task_submit_json(
+    title: str,
+    goal: str,
+    owner: str = "",
+    user_id: str = "",
+    lane: str = "",
+    resource_class: str = "",
+    repo_scope: str = "",
+    workspace_scope: str = "",
+    risk_class: str = "",
+    artifact_root: str = "",
+    artifact_cifs_root: str = "",
+) -> str:
+    return json.dumps(
+        vm_task_submit(
+            title=title,
+            goal=goal,
+            owner=owner,
+            user_id=user_id,
+            lane=lane,
+            resource_class=resource_class,
+            repo_scope=repo_scope,
+            workspace_scope=workspace_scope,
+            risk_class=risk_class,
+            artifact_root=artifact_root,
+            artifact_cifs_root=artifact_cifs_root,
+        ),
+        ensure_ascii=False,
+    )
 
 
 def _read_text_if_present(path: Path, *, limit_chars: int = 12000) -> str:
@@ -328,6 +483,13 @@ registry.register(
         goal=args.get("goal", ""),
         owner=args.get("owner", ""),
         user_id=kw.get("user_id", ""),
+        lane=args.get("lane", ""),
+        resource_class=args.get("resource_class", ""),
+        repo_scope=args.get("repo_scope", ""),
+        workspace_scope=args.get("workspace_scope", ""),
+        risk_class=args.get("risk_class", ""),
+        artifact_root=args.get("artifact_root", ""),
+        artifact_cifs_root=args.get("artifact_cifs_root", ""),
     ),
     emoji="🛰️",
 )

@@ -135,6 +135,12 @@ class TestTemplateStore:
             assert "strict" in names
             assert "relaxed" in names
             assert "vip-priority" in names
+            assert "pnc-shared-vm" in names
+            pnc = store.get("pnc-shared-vm")
+            assert pnc is not None
+            assert pnc.rate_limit_per_user == 12
+            assert pnc.depth_warning == 6
+            assert pnc.depth_critical == 20
 
 
 # ── Built-in templates ───────────────────────────────────────────
@@ -146,6 +152,19 @@ class TestBuiltinTemplates:
         assert "strict" in names
         assert "relaxed" in names
         assert "vip-priority" in names
+        assert "pnc-shared-vm" in names
+
+    def test_pnc_shared_vm_builtin_values(self):
+        templates = {t.name: t for t in builtin_templates()}
+        pnc = templates["pnc-shared-vm"]
+        assert pnc.description == "PNC shared Feishu -> Hermes -> VM shared-state control-plane policy"
+        assert pnc.rate_limit_per_user == 12
+        assert pnc.rate_limit_window_seconds == 60
+        assert pnc.depth_warning == 6
+        assert pnc.depth_critical == 20
+        assert pnc.error_rate_threshold == 0.15
+        assert pnc.error_rate_critical == 0.35
+        assert pnc.alert_cooldown_seconds == 180
 
     def test_builtins_are_valid(self):
         for t in builtin_templates():

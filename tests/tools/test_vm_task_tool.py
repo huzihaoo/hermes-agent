@@ -17,6 +17,10 @@ def test_vm_task_submit_schema_is_raw_function_schema():
     assert schema["name"] == "vm_task_submit"
     assert schema["parameters"]["type"] == "object"
     assert "function" not in schema
+    properties = schema["parameters"]["properties"]
+    assert properties["lane"]["enum"] == ["fast", "standard", "heavy"]
+    assert properties["resource_class"]["enum"] == ["cpu", "io", "repo", "pnc_data", "network", "mixed"]
+    assert "VM scheduler" in properties["lane"]["description"]
 
     definition = registry.get_definitions({"vm_task_submit"})[0]
     assert definition["type"] == "function"
@@ -195,3 +199,109 @@ def test_vm_task_submit_denies_member_before_creating_task(monkeypatch, tmp_path
     assert result["success"] is False
     assert "permission denied" in result["error"]
     assert called is False
+
+
+def test_vm_task_submit_includes_scheduler_metadata_in_meta(monkeypatch, tmp_path):
+    _disable_trusted_session(monkeypatch)
+    script = tmp_path / "create_task_v2.py"
+    script.write_text("print('unused')", encoding="utf-8")
+    monkeypatch.setattr(vm_task_tool, "_create_task_script", lambda: script)
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"task_id": "t1"}), stderr="")
+
+    monkeypatch.setattr(vm_task_tool.subprocess, "run", fake_run)
+
+    result = vm_task_tool.vm_task_submit(
+        "title",
+        "goal",
+        lane="heavy",
+        resource_class="pnc_data",
+        repo_scope="pnc_specs",
+        workspace_scope="owner_main_repo",
+        risk_class="normal",
+        artifact_root="/mnt/tmp/task-1/",
+        artifact_cifs_root="//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/task-1/",
+    )
+
+    assert result["success"] is True
+    meta = json.loads(captured["cmd"][captured["cmd"].index("--meta") + 1])
+    assert meta["lane"] == "heavy"
+    assert meta["resource_class"] == "pnc_data"
+    assert meta["repo_scope"] == "pnc_specs"
+    assert meta["workspace_scope"] == "owner_main_repo"
+    assert meta["risk_class"] == "normal"
+    assert meta["artifact_root"] == "/mnt/tmp/task-1/"
+    assert meta["artifact_cifs_root"] == "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/task-1/"
+
+
+def test_vm_task_submit_rejects_invalid_scheduler_metadata_before_subprocess(monkeypatch, tmp_path):
+    _disable_trusted_session(monkeypatch)
+    script = tmp_path / "create_task_v2.py"
+    script.write_text("print('unused')", encoding="utf-8")
+    monkeypatch.setattr(vm_task_tool, "_create_task_script", lambda: script)
+    called = False
+
+    def fake_run(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("subprocess should not run for invalid scheduler metadata")
+
+    monkeypatch.setattr(vm_task_tool.subprocess, "run", fake_run)
+
+    invalid_cases = [
+        ({"lane": "urgent"}, "invalid lane"),
+        ({"repo_scope": "../pnc_specs"}, "invalid repo_scope"),
+        ({"repo_scope": "pnc_specs/nested"}, "invalid repo_scope"),
+        ({"artifact_root": "/home/mini/.cache/task-1/"}, "invalid artifact_root"),
+        ({"artifact_root": "/mnt/tmp/../escape/"}, "invalid artifact_root"),
+        ({"artifact_root": "/mnt/tmp/task-1/../escape/"}, "invalid artifact_root"),
+        ({"artifact_root": "/mnt/tmp/task-1/./escape/"}, "invalid artifact_root"),
+        ({"artifact_cifs_root": "//hfs.minieye.tech/department-pnc_team-planning_algo-driving/tmp/task-1/"}, "invalid artifact_cifs_root"),
+        ({"artifact_cifs_root": "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/task-1/../escape/"}, "invalid artifact_cifs_root"),
+    ]
+    for kwargs, error_text in invalid_cases:
+        result = vm_task_tool.vm_task_submit("title", "goal", **kwargs)
+        assert result["success"] is False
+        assert error_text in result["error"]
+    assert called is False
+
+
+def test_vm_task_submit_registry_handler_forwards_scheduler_metadata(monkeypatch, tmp_path):
+    _disable_trusted_session(monkeypatch)
+    script = tmp_path / "create_task_v2.py"
+    script.write_text("print('unused')", encoding="utf-8")
+    monkeypatch.setattr(vm_task_tool, "_create_task_script", lambda: script)
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"task_id": "t1"}), stderr="")
+
+    monkeypatch.setattr(vm_task_tool.subprocess, "run", fake_run)
+
+    entry = registry.get_entry("vm_task_submit")
+    assert entry is not None
+    payload = json.loads(entry.handler({
+        "title": "title",
+        "goal": "goal",
+        "lane": "heavy",
+        "resource_class": "pnc_data",
+        "repo_scope": "pnc_specs",
+        "workspace_scope": "owner_main_repo",
+        "risk_class": "normal",
+        "artifact_root": "/mnt/tmp/task-1/",
+        "artifact_cifs_root": "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/task-1/",
+    }))
+
+    assert payload["success"] is True
+    meta = json.loads(captured["cmd"][captured["cmd"].index("--meta") + 1])
+    assert meta["lane"] == "heavy"
+    assert meta["resource_class"] == "pnc_data"
+    assert meta["repo_scope"] == "pnc_specs"
+    assert meta["workspace_scope"] == "owner_main_repo"
+    assert meta["risk_class"] == "normal"
+    assert meta["artifact_root"] == "/mnt/tmp/task-1/"
+    assert meta["artifact_cifs_root"] == "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/task-1/"
