@@ -294,7 +294,7 @@ async def test_run_agent_progress_preserves_feishu_group_topic_marker(monkeypatc
     assert adapter.sent == [
         {
             "chat_id": "oc_chat",
-            "content": '💻 terminal: "pwd"',
+            "content": '⚙️ 正在处理请求...',
             "reply_to": None,
             "metadata": {"thread_id": "topic:om_root"},
         }

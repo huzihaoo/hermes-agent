@@ -310,6 +310,61 @@ def _expand_whatsapp_auth_aliases(identifier: str) -> set:
 
 logger = logging.getLogger(__name__)
 
+
+def format_tool_progress_message(
+    platform: Platform | None,
+    progress_mode: str,
+    tool_name: str | None = None,
+    preview: str | None = None,
+    args: dict | None = None,
+) -> str | None:
+    """Return the user-facing progress line for a tool call.
+
+    Feishu groups are frequently workspace/customer-facing.  In the default
+    ``human`` mode, keep internal orchestration tools private and show a coarse
+    natural-language status instead of leaking names such as ``skill_view`` or
+    ``mcp_feishu_project_*`` into the chat.
+    """
+    tool_name = tool_name or "tool"
+    args = args or {}
+
+    if platform == Platform.FEISHU and progress_mode == "human":
+        if tool_name in {"skill_view", "skills_list", "skill_manage"}:
+            return None
+        if tool_name.startswith("mcp_feishu_project_"):
+            return "🔎 正在查询飞书项目数据..."
+        if tool_name.startswith("mcp_feishu_doc_"):
+            return "📄 正在处理飞书文档..."
+        return "⚙️ 正在处理请求..."
+
+    from agent.display import get_tool_emoji
+
+    emoji = get_tool_emoji(tool_name, default="⚙️")
+    if progress_mode == "verbose":
+        if args:
+            from agent.display import get_tool_preview_max_len
+
+            _pl = get_tool_preview_max_len()
+            import json as _json
+
+            args_str = _json.dumps(args, ensure_ascii=False, default=str)
+            if _pl > 0 and len(args_str) > _pl:
+                args_str = args_str[:_pl - 3] + "..."
+            return f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
+        if preview:
+            return f"{emoji} {tool_name}: \"{preview}\""
+        return f"{emoji} {tool_name}..."
+
+    if preview:
+        from agent.display import get_tool_preview_max_len
+
+        _pl = get_tool_preview_max_len()
+        _cap = _pl if _pl > 0 else 40
+        if len(preview) > _cap:
+            preview = preview[:_cap - 3] + "..."
+        return f"{emoji} {tool_name}: \"{preview}\""
+    return f"{emoji} {tool_name}..."
+
 # Sentinel placed into _running_agents immediately when a session starts
 # processing, *before* any await.  Prevents a second message for the same
 # session from bypassing the "already running" guard during the async gap
@@ -631,8 +686,6 @@ class GatewayRunner:
         # Persistent Honcho managers keyed by gateway session key.
         # This preserves write_frequency="session" semantics across short-lived
         # per-message AIAgent instances.
-
-
 
         # Ensure tirith security scanner is available (downloads if needed)
         try:
@@ -9083,42 +9136,9 @@ class GatewayRunner:
             if not _is_current_run_generation():
                 return
             
-            # Build progress message with primary argument preview
-            from agent.display import get_tool_emoji
-            emoji = get_tool_emoji(tool_name, default="⚙️")
-            
-            # Verbose mode: show detailed arguments, respects tool_preview_length
-            if progress_mode == "verbose":
-                if args:
-                    from agent.display import get_tool_preview_max_len
-                    _pl = get_tool_preview_max_len()
-                    import json as _json
-                    args_str = _json.dumps(args, ensure_ascii=False, default=str)
-                    # When tool_preview_length is 0 (default), don't truncate
-                    # in verbose mode — the user explicitly asked for full
-                    # detail.  Platform message-length limits handle the rest.
-                    if _pl > 0 and len(args_str) > _pl:
-                        args_str = args_str[:_pl - 3] + "..."
-                    msg = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
-                elif preview:
-                    msg = f"{emoji} {tool_name}: \"{preview}\""
-                else:
-                    msg = f"{emoji} {tool_name}..."
-                progress_queue.put(msg)
+            msg = format_tool_progress_message(source.platform, progress_mode, tool_name, preview, args)
+            if msg is None:
                 return
-            
-            # "all" / "new" modes: short preview, respects tool_preview_length
-            # config (defaults to 40 chars when unset to keep gateway messages
-            # compact — unlike CLI spinners, these persist as permanent messages).
-            if preview:
-                from agent.display import get_tool_preview_max_len
-                _pl = get_tool_preview_max_len()
-                _cap = _pl if _pl > 0 else 40
-                if len(preview) > _cap:
-                    preview = preview[:_cap - 3] + "..."
-                msg = f"{emoji} {tool_name}: \"{preview}\""
-            else:
-                msg = f"{emoji} {tool_name}..."
             
             # Dedup: collapse consecutive identical progress messages.
             # Common with execute_code where models iterate with the same

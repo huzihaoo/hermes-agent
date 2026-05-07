@@ -292,6 +292,9 @@ async def test_none_user_id_skips_pairing(monkeypatch, tmp_path):
     (tmp_path / "config.yaml").write_text("", encoding="utf-8")
 
     runner = GatewayRunner(GatewayConfig())
+    runner.pairing_store._is_rate_limited = lambda _platform, _user_id: False
+    runner.pairing_store._is_locked_out = lambda _platform: False
+    runner.pairing_store._load_json = lambda _path: {}
     adapter = SimpleNamespace(send=AsyncMock())
     runner.adapters[Platform.TELEGRAM] = adapter
 
@@ -323,6 +326,9 @@ async def test_none_user_id_does_not_generate_pairing_code(monkeypatch, tmp_path
     (tmp_path / "config.yaml").write_text("", encoding="utf-8")
 
     runner = GatewayRunner(GatewayConfig())
+    runner.pairing_store._is_rate_limited = lambda _platform, _user_id: False
+    runner.pairing_store._is_locked_out = lambda _platform: False
+    runner.pairing_store._load_json = lambda _path: {}
     adapter = SimpleNamespace(send=AsyncMock())
     runner.adapters[Platform.DISCORD] = adapter
 
@@ -376,6 +382,9 @@ async def test_non_internal_event_without_user_triggers_pairing(monkeypatch, tmp
     monkeypatch.delenv("GATEWAY_ALLOWED_USERS", raising=False)
 
     runner = GatewayRunner(GatewayConfig())
+    runner.pairing_store._is_rate_limited = lambda _platform, _user_id: False
+    runner.pairing_store._is_locked_out = lambda _platform: False
+    runner.pairing_store._load_json = lambda _path: {}
     adapter = SimpleNamespace(send=AsyncMock())
     runner.adapters[Platform.DISCORD] = adapter
 

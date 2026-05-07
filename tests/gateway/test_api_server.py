@@ -22,6 +22,18 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import AioHTTPTestCase, TestClient, TestServer
 
+
+@pytest.fixture(autouse=True)
+def _isolate_api_server_env(monkeypatch):
+    """Keep live gateway config/env from changing API server unit-test defaults."""
+    for key in (
+        "API_SERVER_HOST",
+        "API_SERVER_PORT",
+        "API_SERVER_KEY",
+        "API_SERVER_CORS_ORIGINS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,

@@ -174,17 +174,20 @@ class TestTelegramSendImageFile:
 
 
 def _ensure_discord_mock():
-    """Install mock discord module so DiscordAdapter can be imported."""
-    if "discord" in sys.modules and hasattr(sys.modules["discord"], "__file__"):
-        return
+    """Install or repair mock discord module so DiscordAdapter can be imported."""
+    discord_mod = sys.modules.get("discord")
+    if discord_mod is not None and getattr(discord_mod, "File", None) is not None:
+        return discord_mod
 
     discord_mod = MagicMock()
     discord_mod.Intents.default.return_value = MagicMock()
     discord_mod.Client = MagicMock
     discord_mod.File = MagicMock
 
-    for name in ("discord", "discord.ext", "discord.ext.commands"):
-        sys.modules.setdefault(name, discord_mod)
+    sys.modules["discord"] = discord_mod
+    sys.modules["discord.ext"] = discord_mod
+    sys.modules["discord.ext.commands"] = discord_mod
+    return discord_mod
 
 
 _ensure_discord_mock()
@@ -196,8 +199,12 @@ from gateway.platforms.discord import DiscordAdapter  # noqa: E402
 class TestDiscordSendImageFile:
     @pytest.fixture
     def adapter(self):
+        import gateway.platforms.discord as discord_platform
+
+        _ensure_discord_mock()
+        discord_platform.discord = discord_mod_ref
         config = PlatformConfig(enabled=True, token="fake-token")
-        a = DiscordAdapter(config)
+        a = discord_platform.DiscordAdapter(config)
         a._client = MagicMock()
         return a
 

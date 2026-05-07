@@ -189,7 +189,7 @@ class TestPlatformDefaults:
         """Mattermost, Matrix, Feishu, WhatsApp default to 'new' tool progress."""
         from gateway.display_config import resolve_display_setting
 
-        for plat in ("mattermost", "matrix", "feishu", "whatsapp"):
+        for plat in ("mattermost", "matrix", "whatsapp"):
             assert resolve_display_setting({}, plat, "tool_progress") == "new", plat
 
     def test_slack_defaults_tool_progress_off(self):
@@ -197,6 +197,12 @@ class TestPlatformDefaults:
         from gateway.display_config import resolve_display_setting
 
         assert resolve_display_setting({}, "slack", "tool_progress") == "off"
+
+    def test_feishu_defaults_to_human_tool_progress(self):
+        """Feishu defaults to humanized progress to avoid leaking internal tool names."""
+        from gateway.display_config import resolve_display_setting
+
+        assert resolve_display_setting({}, "feishu", "tool_progress") == "human"
 
     def test_low_tier_platforms(self):
         """Signal, BlueBubbles, etc. default to 'off' tool progress."""

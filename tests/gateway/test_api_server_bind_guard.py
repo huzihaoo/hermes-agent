@@ -14,6 +14,30 @@ from gateway.platforms.api_server import APIServerAdapter
 from gateway.platforms.base import is_network_accessible
 
 
+@pytest.fixture(autouse=True)
+def _isolate_api_server_env(monkeypatch):
+    """Keep live gateway config/env from changing API server bind-guard defaults.
+
+    gateway.run can be imported by earlier tests and bridge the live
+    ~/.hermes config into os.environ. Tests in this module construct
+    APIServerAdapter directly and expect explicit PlatformConfig values to be
+    the only configuration source, so clear API server env both before and
+    after each test. The post-yield cleanup prevents tests that set these
+    variables internally from leaking into following tests in a full suite run.
+    """
+    keys = (
+        "API_SERVER_HOST",
+        "API_SERVER_PORT",
+        "API_SERVER_KEY",
+        "API_SERVER_CORS_ORIGINS",
+    )
+    for key in keys:
+        monkeypatch.delenv(key, raising=False)
+    yield
+    for key in keys:
+        monkeypatch.delenv(key, raising=False)
+
+
 # ---------------------------------------------------------------------------
 # Unit tests: is_network_accessible()
 # ---------------------------------------------------------------------------

@@ -32,6 +32,8 @@ async def test_gateway_tasks_command_uses_event_log(tmp_path, monkeypatch):
         )]
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr("gateway.tasks.store.TaskStore.list_recent", lambda self, *, limit, offset=0, user_id=None: _fake_list_tasks(trace_file=tmp_path / "analytics" / "events.jsonl", limit=limit, user_id=user_id)[offset:offset + limit])
+    monkeypatch.setattr("gateway.tasks.store.TaskStore.count_tasks", lambda self, user_id=None: len(_fake_list_tasks(trace_file=tmp_path / "analytics" / "events.jsonl", limit=100, user_id=user_id)))
     monkeypatch.setattr("hermes_cli.task_trace.list_tasks", _fake_list_tasks)
 
     result = await gateway_run.GatewayRunner._handle_tasks_command(runner, event)

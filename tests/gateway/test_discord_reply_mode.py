@@ -327,10 +327,29 @@ def _make_message(*, content: str = "hi", reference=None):
 @pytest.fixture
 def reply_text_adapter(monkeypatch):
     """DiscordAdapter wired for _handle_message → handle_message capture."""
+    import gateway.platforms.discord as discord_platform
+
+    if discord_platform.discord is None:
+        _ensure_discord_mock()
+        discord_platform.discord = sys.modules["discord"]
+    # Keep the module global used by DiscordAdapter._handle_message stable for
+    # the duration of these tests. Other gateway tests install lightweight
+    # discord mocks with different DMChannel classes; if we only mutate the
+    # current object, a later module-level mock swap can make this fixture's
+    # FakeDMChannel look like a normal guild channel and _handle_message will
+    # return before dispatching.
+    discord_mock = SimpleNamespace(
+        DMChannel=FakeDMChannel,
+        Thread=getattr(discord_platform.discord, "Thread", None) if isinstance(getattr(discord_platform.discord, "Thread", None), type) else type("Thread", (), {}),
+    )
+    monkeypatch.setattr(discord_platform, "discord", discord_mock)
+
+
     config = PlatformConfig(enabled=True, token="fake-token")
-    adapter = DiscordAdapter(config)
+    adapter = discord_platform.DiscordAdapter(config)
     adapter._client = SimpleNamespace(user=SimpleNamespace(id=999))
-    adapter._text_batch_delay_seconds = 0
+    adapter._text_batch_delay_seconds = 0.0
+    adapter._text_batch_split_delay_seconds = 0.0
     adapter.handle_message = AsyncMock()
     return adapter
 

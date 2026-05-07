@@ -4,12 +4,57 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 _repo = str(Path(__file__).resolve().parents[2])
 if _repo not in sys.path:
     sys.path.insert(0, _repo)
 
 from gateway.session_context import clear_session_vars, set_session_vars
 from tools.approval import check_all_command_guards, detect_dangerous_command
+
+
+@pytest.fixture(autouse=True)
+def _stable_permission_policy(monkeypatch):
+    """Keep guard tests independent of the operator's live user-role config.
+
+    The production permission policy intentionally reads ~/.hermes config, but
+    these tests exercise guard behavior for fixed identities.  Pin the policy
+    helpers so a local ACL rollout (for example granting 王平 repo read) does not
+    rewrite the expected safety semantics.
+    """
+    import tools.permission_policy as permission_policy
+
+    command_classifications = {
+        "~/.local/bin/ssh-mini-agent read_file /home/mini/worktrees/minieye_dnp_nop/王平/README.md --start 1 --lines 5": "vm_repo_unauthorized",
+        "ssh-mini-run 'cd /mnt/tmp/eval_job && python3 run_eval.py --input data.json'": "write",
+        "ssh-mini-run 'cd /home/mini/worktrees/minieye_dnp_nop/王平 && python3 run_eval.py'": "vm_repo_unauthorized",
+        "ssh-mini-run 'cd /home/mini/minieye_dnp_nop && python3 run_eval.py'": "vm_direct_exec",
+        "ssh-mini-run 'python3 /tmp/eval.py'": "vm_direct_exec",
+        "~/.local/bin/ssh-mini-agent run_bash_json < /tmp/eval.sh": "vm_direct_exec",
+        "ssh mini@host 'cd /home/mini/minieye_dnp_nop && python3 run_eval.py'": "vm_direct_exec",
+        "git push --force origin main": "vm_git_dangerous",
+    }
+    user_roles = {
+        "ou_d1d3cfeba1be0a22faa36aaf4fb3907d": "owner",
+        "ou_e3e6da5b6814a5c5d7e8ccf21cfbea0a": "member",
+    }
+
+    def classify_command(command):
+        return command_classifications.get(command, "write")
+
+    def get_decision_by_id(user_id, command):
+        role = user_roles.get(user_id, "member")
+        op_type = classify_command(command)
+        if op_type in {"vm_repo_unauthorized", "vm_git_dangerous"}:
+            return "DENY"
+        if op_type == "vm_direct_exec" and role != "owner":
+            return "DENY"
+        return "ALLOW"
+
+    monkeypatch.setattr(permission_policy, "classify_command", classify_command)
+    monkeypatch.setattr(permission_policy, "get_decision_by_id", get_decision_by_id)
+    monkeypatch.setattr(permission_policy, "get_user_role", lambda name: "owner" if name == "胡子豪" else "member")
 
 
 def test_ssh_mini_agent_repo_read_is_policy_guarded_for_gateway_member(monkeypatch, tmp_path):

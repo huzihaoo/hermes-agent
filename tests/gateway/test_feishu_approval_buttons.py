@@ -474,7 +474,7 @@ class TestCardActionCallbackResponse:
         assert response is not None
         assert response.card is None
 
-    def test_falls_back_to_open_id_when_name_not_cached(self, _patch_callback_card_types):
+    def test_uses_generic_approver_label_when_name_not_cached(self, _patch_callback_card_types):
         adapter = _make_adapter()
         adapter._loop = MagicMock()
         adapter._loop.is_closed = MagicMock(return_value=False)
@@ -487,7 +487,9 @@ class TestCardActionCallbackResponse:
             response = adapter._on_card_action_trigger(data)
 
         card = response.card.data
-        assert "ou_unknown" in card["elements"][0]["content"]
+        content = card["elements"][0]["content"]
+        assert "审批人" in content
+        assert "ou_unknown" not in content
 
     def test_ignores_expired_cached_name(self, _patch_callback_card_types):
         adapter = _make_adapter()
@@ -503,5 +505,7 @@ class TestCardActionCallbackResponse:
             response = adapter._on_card_action_trigger(data)
 
         card = response.card.data
-        assert "Old Name" not in card["elements"][0]["content"]
-        assert "ou_expired" in card["elements"][0]["content"]
+        content = card["elements"][0]["content"]
+        assert "Old Name" not in content
+        assert "审批人" in content
+        assert "ou_expired" not in content

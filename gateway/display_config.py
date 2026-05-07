@@ -59,6 +59,13 @@ _TIER_MEDIUM = {
     "streaming": None,
 }
 
+_TIER_HUMAN = {
+    "tool_progress": "human",
+    "show_reasoning": False,
+    "tool_preview_length": 40,
+    "streaming": None,
+}
+
 _TIER_LOW = {
     "tool_progress": "off",
     "show_reasoning": False,
@@ -84,7 +91,7 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     "slack":           {**_TIER_MEDIUM, "tool_progress": "off"},
     "mattermost":      _TIER_MEDIUM,
     "matrix":          _TIER_MEDIUM,
-    "feishu":          _TIER_MEDIUM,
+    "feishu":          _TIER_HUMAN,
 
     # Tier 3 — no edit support, progress messages are permanent
     "signal":          _TIER_LOW,
@@ -155,7 +162,15 @@ def resolve_display_setting(
     if setting != "streaming":
         val = display_cfg.get(setting)
         if val is not None:
-            return _normalise(setting, val)
+            normalised = _normalise(setting, val)
+            # Feishu is commonly used in shared workspaces; avoid letting a
+            # broad CLI/global progress preference ("all"/"new") re-enable raw
+            # tool traces there.  Explicit per-platform or legacy overrides
+            # above still win, and global off remains a true kill switch.
+            if setting == "tool_progress" and platform_key == "feishu" and normalised != "off":
+                plat_defaults = _PLATFORM_DEFAULTS.get(platform_key) or {}
+                return plat_defaults.get(setting, normalised)
+            return normalised
 
     # 3. Built-in platform default
     plat_defaults = _PLATFORM_DEFAULTS.get(platform_key)
