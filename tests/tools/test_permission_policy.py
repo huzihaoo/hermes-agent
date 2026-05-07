@@ -448,7 +448,7 @@ def test_senior_read_only_repo_acl_cannot_write_git(monkeypatch, tmp_path):
     assert permission_policy.get_decision("陈玉", checkout) == "DENY"
 
 
-def test_senior_repo_acl_push_still_requires_approval(monkeypatch, tmp_path):
+def test_senior_repo_acl_push_is_allowed_without_approval(monkeypatch, tmp_path):
     import tools.permission_policy as permission_policy
 
     config_path = tmp_path / "user-roles.json"
@@ -460,7 +460,30 @@ def test_senior_repo_acl_push_still_requires_approval(monkeypatch, tmp_path):
     command = "ssh-mini-run 'cd /home/mini/worktrees/minieye_dnp_nop/陈玉 && git push origin cy/fix'"
 
     assert permission_policy.classify_command(command) == "vm_git_push"
-    assert permission_policy.get_decision("陈玉", command) == "APPROVE"
+    assert permission_policy.get_decision("陈玉", command) == "ALLOW"
+
+
+def test_senior_routine_master_sync_push_is_allowed_without_approval(monkeypatch, tmp_path):
+    import tools.permission_policy as permission_policy
+
+    config_path = tmp_path / "user-roles.json"
+    _write_policy_config(config_path)
+    cfg = json.loads(config_path.read_text(encoding="utf-8"))
+    cfg["users"]["刘旭"] = "senior"
+    cfg["repo_acl"]["刘旭"] = {"minieye_ci_eval": "push"}
+    cfg["repo_config"]["repos"]["minieye_ci_eval"] = {
+        "source": "/home/mini/minieye_ci_eval",
+        "default_branch": "master",
+    }
+    config_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_SESSION_USER_NAME", "刘旭")
+    monkeypatch.setattr(permission_policy, "_CONFIG_PATH", config_path)
+    monkeypatch.setattr(permission_policy, "_config", None)
+
+    command = "ssh-mini-run 'cd /home/mini/worktrees/minieye_ci_eval/刘旭 && git fetch origin && git merge origin/dev-nop && git push origin master'"
+
+    assert permission_policy.classify_command(command) == "vm_git_push"
+    assert permission_policy.get_decision("刘旭", command) == "ALLOW"
 
 
 def test_member_force_push_remains_denied(monkeypatch, tmp_path):

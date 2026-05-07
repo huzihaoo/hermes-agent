@@ -1029,6 +1029,13 @@ class AIAgent:
         return self._env_float("HERMES_PROVIDER_LANE_WAIT_LOG_THRESHOLD", 1.0, minimum=0.0, maximum=60.0)
 
     def _api_max_retries(self) -> int:
+        configured = getattr(self, "_api_max_retries_config", None)
+        if configured is not None:
+            try:
+                value = int(configured)
+            except (TypeError, ValueError):
+                value = 3
+            return min(10, max(1, value))
         return self._env_int("HERMES_API_MAX_RETRIES", 3, minimum=1, maximum=10)
 
     def _api_retry_base_delay(self) -> float:
@@ -2089,7 +2096,7 @@ class AIAgent:
                 _api_retries = 1  # 1 = no retry (single attempt)
         except (TypeError, ValueError):
             _api_retries = 3
-        self._api_max_retries = _api_retries
+        self._api_max_retries_config = _api_retries
 
         # Initialize context compressor for automatic context management
         # Compresses conversation when approaching model's context limit

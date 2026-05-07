@@ -705,7 +705,11 @@ def _decision_for(role: str, op_type: str, cfg: dict) -> Decision:
     if op_type == "vm_repo_unauthorized":
         return "DENY"
     if op_type == "vm_git_push":
-        return "DENY" if role == "member" else "APPROVE"
+        # Senior/admin/owner users with explicit repo push ACL should not be
+        # blocked by an extra approval round for normal collaborative pushes.
+        # Destructive git operations (force-push/reset/clean/etc.) are already
+        # classified as vm_git_dangerous above and remain denied.
+        return "DENY" if role == "member" else "ALLOW"
     if op_type == "vm_direct_exec" and role not in {"owner", "admin"}:
         return "DENY"
     if role == "member" and op_type in {"read", "vm_git_routine"}:

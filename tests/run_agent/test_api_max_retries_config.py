@@ -31,16 +31,16 @@ def _make_agent(api_max_retries=None):
 def test_default_api_max_retries_is_three():
     """No config override → legacy default of 3 retries preserved."""
     agent = _make_agent()
-    assert agent._api_max_retries == 3
+    assert agent._api_max_retries() == 3
 
 
 def test_api_max_retries_honors_config_override():
     """Setting agent.api_max_retries in config propagates to the agent."""
     agent = _make_agent(api_max_retries=1)
-    assert agent._api_max_retries == 1
+    assert agent._api_max_retries() == 1
 
     agent2 = _make_agent(api_max_retries=5)
-    assert agent2._api_max_retries == 5
+    assert agent2._api_max_retries() == 5
 
 
 def test_api_max_retries_clamps_below_one_to_one():
@@ -48,18 +48,32 @@ def test_api_max_retries_clamps_below_one_to_one():
     (the ``while retry_count < max_retries`` guard would never execute),
     so clamp to 1 = single attempt, no retry."""
     agent = _make_agent(api_max_retries=0)
-    assert agent._api_max_retries == 1
+    assert agent._api_max_retries() == 1
 
     agent2 = _make_agent(api_max_retries=-3)
-    assert agent2._api_max_retries == 1
+    assert agent2._api_max_retries() == 1
 
 
 def test_api_max_retries_falls_back_on_invalid_value():
     """Garbage values in config don't crash agent init — fall back to 3."""
     agent = _make_agent(api_max_retries="not-a-number")
-    assert agent._api_max_retries == 3
+    assert agent._api_max_retries() == 3
 
     agent2 = _make_agent(api_max_retries=None)
     # None with dict.get default fires → default(3), then int(None) raises
     # TypeError → except branch sets to 3.
-    assert agent2._api_max_retries == 3
+    assert agent2._api_max_retries() == 3
+
+def test_api_retry_helpers_remain_callable_after_config_override():
+    """Config-backed retry setting must not shadow runtime helper methods.
+
+    The gateway calls these helpers inside run_conversation on every turn; if
+    agent initialization stores the config value on the same method name, live
+    Feishu/API requests fail before the first model call.
+    """
+    agent = _make_agent(api_max_retries=2)
+
+    assert agent._api_max_retries() == 2
+    assert agent._api_retry_base_delay() >= 0.1
+    assert agent._api_retry_max_delay() >= agent._api_retry_base_delay()
+    assert agent._compression_retry_pause() >= 0.0

@@ -22,6 +22,21 @@ class TestFeishuToolProgressFormatting:
 
         assert resolve_display_setting(config, "feishu", "tool_progress") == "human"
 
+    def test_feishu_explicit_platform_override_can_request_raw_progress(self):
+        config = {"display": {"tool_progress": "new", "platforms": {"feishu": {"tool_progress": "all"}}}}
+
+        assert resolve_display_setting(config, "feishu", "tool_progress") == "all"
+
+    def test_feishu_legacy_platform_override_can_request_raw_progress(self):
+        config = {"display": {"tool_progress": "new", "tool_progress_overrides": {"feishu": "all"}}}
+
+        assert resolve_display_setting(config, "feishu", "tool_progress") == "all"
+
+    def test_feishu_global_off_remains_kill_switch(self):
+        config = {"display": {"tool_progress": "off", "platforms": {}}}
+
+        assert resolve_display_setting(config, "feishu", "tool_progress") == "off"
+
     def test_feishu_human_progress_hides_internal_tool_names(self):
         msg = _format_tool_progress_message(
             Platform.FEISHU,
