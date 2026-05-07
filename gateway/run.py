@@ -998,15 +998,27 @@ class GatewayRunner:
 
         service_tier = getattr(self, "_service_tier", None)
         if not service_tier:
-            route["request_overrides"] = None
+            route["request_overrides"] = {}
             return route
 
         try:
             overrides = resolve_fast_mode_overrides(route.get("model"))
         except Exception:
             overrides = None
-        route["request_overrides"] = overrides
+        route["request_overrides"] = overrides or {}
         return route
+
+    def _invalidate_session_run_generation(self, session_key: Optional[str], reason: str = "") -> int:
+        """Bump the per-session run generation to suppress stale callbacks."""
+        if not session_key:
+            return 0
+        generations = getattr(self, "_session_run_generation", None)
+        if generations is None:
+            generations = {}
+            self._session_run_generation = generations
+        generations[session_key] = int(generations.get(session_key, 0) or 0) + 1
+        logger.debug("Invalidated run generation for %s (%s)", session_key[:40], reason)
+        return generations[session_key]
 
     async def _handle_adapter_fatal_error(self, adapter: BasePlatformAdapter) -> None:
         """React to an adapter failure after startup.
@@ -8975,6 +8987,7 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        run_generation: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -9067,6 +9080,8 @@ class GatewayRunner:
             if progress_mode == "new" and tool_name == last_tool[0]:
                 return
             last_tool[0] = tool_name
+            if not _is_current_run_generation():
+                return
             
             # Build progress message with primary argument preview
             from agent.display import get_tool_emoji
@@ -9110,6 +9125,8 @@ class GatewayRunner:
             # code (same boilerplate imports → identical previews).
             if msg == last_progress_msg[0]:
                 repeat_count[0] += 1
+                if not _is_current_run_generation():
+                    return
                 # Update the last line in progress_lines with a counter
                 # via a special "dedup" queue message.
                 progress_queue.put(("__dedup__", msg, repeat_count[0]))
@@ -9132,6 +9149,19 @@ class GatewayRunner:
         else:
             _progress_thread_id = source.thread_id
         _progress_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
+        _progress_reply_to = (
+            event_message_id
+            if source.platform == Platform.FEISHU
+            and bool(_progress_thread_id)
+            and not str(_progress_thread_id).startswith("topic:")
+            else None
+        )
+
+        def _is_current_run_generation() -> bool:
+            if run_generation is None or not session_key:
+                return True
+            current = getattr(self, "_session_run_generation", {}).get(session_key)
+            return current == run_generation
 
         async def send_progress_messages():
             if not progress_queue:
@@ -9164,6 +9194,8 @@ class GatewayRunner:
                     raw = progress_queue.get_nowait()
 
                     # Handle dedup messages: update last line with repeat counter
+                    if not _is_current_run_generation():
+                        continue
                     if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                         _, base_msg, count = raw
                         if progress_lines:
@@ -9205,15 +9237,15 @@ class GatewayRunner:
                                     adapter.name,
                                 )
                             can_edit = False
-                            await adapter.send(chat_id=source.chat_id, content=msg, metadata=_progress_metadata)
+                            await adapter.send(chat_id=source.chat_id, content=msg, reply_to=_progress_reply_to, metadata=_progress_metadata)
                     else:
                         if can_edit:
                             # First tool: send all accumulated text as new message
                             full_text = "\n".join(progress_lines)
-                            result = await adapter.send(chat_id=source.chat_id, content=full_text, metadata=_progress_metadata)
+                            result = await adapter.send(chat_id=source.chat_id, content=full_text, reply_to=_progress_reply_to, metadata=_progress_metadata)
                         else:
                             # Editing unsupported: send just this line
-                            result = await adapter.send(chat_id=source.chat_id, content=msg, metadata=_progress_metadata)
+                            result = await adapter.send(chat_id=source.chat_id, content=msg, reply_to=_progress_reply_to, metadata=_progress_metadata)
                         if result.success and result.message_id:
                             progress_msg_id = result.message_id
 
@@ -9432,10 +9464,12 @@ class GatewayRunner:
                 if _stream_consumer is not None:
                     if already_streamed:
                         _stream_consumer.on_segment_break()
-                    else:
+                    elif _is_current_run_generation():
                         _stream_consumer.on_commentary(text)
                     return
                 if already_streamed or not _status_adapter or not str(text or "").strip():
+                    return
+                if not _is_current_run_generation():
                     return
                 try:
                     asyncio.run_coroutine_threadsafe(

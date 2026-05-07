@@ -311,10 +311,11 @@ else:
 
 
 class _IdempotencyCache:
-    """In-memory idempotency cache with TTL and basic LRU semantics."""
+    """In-memory idempotency cache with TTL/LRU and in-flight deduplication."""
     def __init__(self, max_items: int = 1000, ttl_seconds: int = 300):
         from collections import OrderedDict
         self._store = OrderedDict()
+        self._inflight: Dict[str, Dict[str, Any]] = {}
         self._ttl = ttl_seconds
         self._max = max_items
 
@@ -332,9 +333,23 @@ class _IdempotencyCache:
         item = self._store.get(key)
         if item and item["fp"] == fingerprint:
             return item["resp"]
-        resp = await compute_coro()
+        inflight = self._inflight.get(key)
+        if inflight and inflight.get("fp") == fingerprint:
+            return await asyncio.shield(inflight["task"])
+        task = asyncio.create_task(compute_coro())
+        self._inflight[key] = {"fp": fingerprint, "task": task}
+        try:
+            resp = await asyncio.shield(task)
+        except Exception:
+            current = self._inflight.get(key)
+            if current and current.get("task") is task:
+                self._inflight.pop(key, None)
+            raise
         import time as _t
         self._store[key] = {"resp": resp, "fp": fingerprint, "ts": _t.time()}
+        current = self._inflight.get(key)
+        if current and current.get("task") is task:
+            self._inflight.pop(key, None)
         self._purge()
         return resp
 
@@ -378,7 +393,11 @@ class APIServerAdapter(BasePlatformAdapter):
         super().__init__(config, Platform.API_SERVER)
         extra = config.extra or {}
         self._host: str = extra.get("host", os.getenv("API_SERVER_HOST", DEFAULT_HOST))
-        self._port: int = int(extra.get("port", os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))))
+        port_value = extra.get("port", os.getenv("API_SERVER_PORT", str(DEFAULT_PORT)))
+        try:
+            self._port = int(port_value)
+        except (TypeError, ValueError):
+            self._port = DEFAULT_PORT
         self._api_key: str = extra.get("key", os.getenv("API_SERVER_KEY", ""))
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
@@ -519,6 +538,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        gateway_session_key: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -557,7 +577,13 @@ class APIServerAdapter(BasePlatformAdapter):
             runtime_kwargs = _resolve_runtime_agent_kwargs()
             model = requested_model
 
-        model = model or _resolve_gateway_model(user_config)
+        if not model:
+            try:
+                model = _resolve_gateway_model(user_config)
+            except TypeError:
+                # Backward-compatible with tests/older monkeypatches that
+                # exposed _resolve_gateway_model as a no-arg helper.
+                model = _resolve_gateway_model()
         if not model and (runtime_kwargs.get("provider") or requested_provider):
             try:
                 model = get_default_model_for_provider(
@@ -575,6 +601,7 @@ class APIServerAdapter(BasePlatformAdapter):
         from gateway.run import GatewayRunner
         fallback_model = GatewayRunner._load_fallback_model()
 
+        reasoning_config = GatewayRunner._load_reasoning_config()
         agent = AIAgent(
             model=model,
             **runtime_kwargs,
@@ -589,6 +616,8 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
+            reasoning_config=reasoning_config,
+            gateway_session_key=gateway_session_key,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
         )
@@ -623,6 +652,27 @@ class APIServerAdapter(BasePlatformAdapter):
             "pid": os.getpid(),
         })
 
+    def _parse_session_key_header(self, request: "web.Request") -> tuple[Optional[str], Optional["web.Response"]]:
+        session_key = request.headers.get("X-Hermes-Session-Key", "")
+        if not session_key:
+            return None, None
+        if not self._api_key:
+            return None, web.json_response(
+                _openai_error("Session key requires API key authentication."),
+                status=403,
+            )
+        if re.search(r'[\r\n\x00]', session_key):
+            return None, web.json_response(
+                {"error": {"message": "Invalid session key", "type": "invalid_request_error"}},
+                status=400,
+            )
+        if len(session_key) > 512:
+            return None, web.json_response(
+                {"error": {"message": "Session key too long", "type": "invalid_request_error"}},
+                status=400,
+            )
+        return session_key, None
+
     async def _handle_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models — return hermes-agent as an available model."""
         auth_err = self._check_auth(request)
@@ -642,6 +692,32 @@ class APIServerAdapter(BasePlatformAdapter):
                     "parent": None,
                 }
             ],
+        })
+
+    async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
+        """GET /v1/capabilities — advertise API-server integration contract."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        return web.json_response({
+            "object": "hermes.api_server.capabilities",
+            "platform": "hermes-agent",
+            "model": self._model_name,
+            "auth": {"type": "bearer", "required": bool(self._api_key)},
+            "features": {
+                "chat_completions": True,
+                "responses": True,
+                "run_status": True,
+                "run_events_sse": True,
+                "session_continuity_header": "X-Hermes-Session-Id",
+                "session_key_header": "X-Hermes-Session-Key",
+            },
+            "endpoints": {
+                "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
+                "responses": {"method": "POST", "path": "/v1/responses"},
+                "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
+                "run_events_sse": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
+            },
         })
 
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
@@ -695,6 +771,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 {"error": {"message": "No user message found in messages", "type": "invalid_request_error"}},
                 status=400,
             )
+
+        gateway_session_key, session_key_err = self._parse_session_key_header(request)
+        if session_key_err:
+            return session_key_err
 
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
         # When provided, history is loaded from state.db instead of from the request body.
@@ -764,36 +844,39 @@ class APIServerAdapter(BasePlatformAdapter):
                 if delta is not None:
                     _stream_q.put(delta)
 
-            def _on_tool_progress(event_type, name, preview, args, **kwargs):
-                """Send tool progress as a separate SSE event.
+            _active_tool_calls = set()
 
-                Previously, progress markers like ``⏰ list`` were injected
-                directly into ``delta.content``.  OpenAI-compatible frontends
-                (Open WebUI, LobeChat, …) store ``delta.content`` verbatim as
-                the assistant message and send it back on subsequent requests.
-                After enough turns the model learns to *emit* the markers as
-                plain text instead of issuing real tool calls — silently
-                hallucinating tool results.  See #6972.
-
-                The fix: push a tagged tuple ``("__tool_progress__", payload)``
-                onto the stream queue.  The SSE writer emits it as a custom
-                ``event: hermes.tool.progress`` line that compliant frontends
-                can render for UX but will *not* persist into conversation
-                history.  Clients that don't understand the custom event type
-                silently ignore it per the SSE specification.
-                """
-                if event_type != "tool.started":
+            def _on_tool_lifecycle(call_id, name, args=None, result=None, *, status="running"):
+                if not name or str(name).startswith("_"):
                     return
-                if name.startswith("_"):
+                if status == "completed" and call_id not in _active_tool_calls:
                     return
                 from agent.display import get_tool_emoji
+                try:
+                    from tools.registry import build_tool_preview
+                    label = build_tool_preview(name, args or {}) if args else name
+                except Exception:
+                    label = str(args or name)
                 emoji = get_tool_emoji(name)
-                label = preview or name
-                _stream_q.put(("__tool_progress__", {
+                if status == "running":
+                    _active_tool_calls.add(call_id)
+                payload = {
                     "tool": name,
                     "emoji": emoji,
                     "label": label,
-                }))
+                    "status": status,
+                    "toolCallId": call_id,
+                }
+                if status == "completed":
+                    _active_tool_calls.discard(call_id)
+                _stream_q.put(("__tool_progress__", payload))
+
+            def _on_tool_progress(event_type, name, preview, args, **kwargs):
+                """Send legacy tool progress as a separate SSE event."""
+                if event_type != "tool.started":
+                    return
+                call_id = kwargs.get("tool_call_id") or f"legacy_{uuid.uuid4().hex[:12]}"
+                _on_tool_lifecycle(call_id, name, args or {}, status="running")
 
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
@@ -803,16 +886,20 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
+                gateway_session_key=gateway_session_key,
                 requested_provider=requested_provider,
                 requested_model=requested_model,
                 stream_delta_callback=_on_delta,
                 tool_progress_callback=_on_tool_progress,
+                tool_start_callback=lambda call_id, name, args=None: _on_tool_lifecycle(call_id, name, args or {}, status="running"),
+                tool_complete_callback=lambda call_id, name, args=None, result=None: _on_tool_lifecycle(call_id, name, args or {}, result, status="completed"),
                 agent_ref=agent_ref,
             ))
 
             return await self._write_sse_chat_completion(
                 request, completion_id, model_name, created, _stream_q,
                 agent_task, agent_ref, session_id=session_id,
+                gateway_session_key=gateway_session_key,
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
@@ -822,6 +909,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
+                gateway_session_key=gateway_session_key,
                 requested_provider=requested_provider,
                 requested_model=requested_model,
             )
@@ -873,11 +961,15 @@ class APIServerAdapter(BasePlatformAdapter):
             },
         }
 
-        return web.json_response(response_data, headers={"X-Hermes-Session-Id": session_id})
+        return web.json_response(response_data, headers={k: v for k, v in {
+            "X-Hermes-Session-Id": session_id,
+            "X-Hermes-Session-Key": gateway_session_key,
+        }.items() if v})
 
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
         created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
+        gateway_session_key: str = None,
     ) -> "web.StreamResponse":
         """Write real streaming SSE from agent's stream_delta_callback queue.
 
@@ -900,6 +992,8 @@ class APIServerAdapter(BasePlatformAdapter):
             sse_headers.update(cors)
         if session_id:
             sse_headers["X-Hermes-Session-Id"] = session_id
+        if gateway_session_key:
+            sse_headers["X-Hermes-Session-Key"] = gateway_session_key
         response = web.StreamResponse(status=200, headers=sse_headers)
         await response.prepare(request)
 
@@ -1109,6 +1203,36 @@ class APIServerAdapter(BasePlatformAdapter):
         final_response_text = ""
         agent_error: Optional[str] = None
         usage: Dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+        def _persist_snapshot(status: str, output_items: List[Dict[str, Any]], error_message: Optional[str] = None) -> None:
+            """Persist the latest Responses snapshot for retrieval/chaining.
+
+            Streaming can terminate through normal completion, server-side
+            cancellation, or client disconnect. Keep this in one helper so all
+            terminal paths preserve ResponseStore state consistently.
+            """
+            if not store:
+                return
+            env = _envelope(status)
+            env["output"] = output_items
+            env["usage"] = {
+                "input_tokens": usage.get("input_tokens", 0),
+                "output_tokens": usage.get("output_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0),
+            }
+            if error_message:
+                env["error"] = {"message": error_message, "type": "server_error"}
+            full_history = list(conversation_history)
+            full_history.append({"role": "user", "content": user_message})
+            full_history.append({"role": "assistant", "content": final_response_text or error_message or ""})
+            self._response_store.put(response_id, {
+                "response": env,
+                "conversation_history": full_history,
+                "instructions": instructions,
+                "session_id": session_id,
+            })
+            if conversation:
+                self._response_store.set_conversation(conversation, response_id)
 
         try:
             # response.created — initial envelope, status=in_progress
@@ -1409,6 +1533,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     if conversation:
                         self._response_store.set_conversation(conversation, response_id)
 
+        except asyncio.CancelledError:
+            final_response_text = "".join(final_text_parts) or final_response_text
+            incomplete_items: List[Dict[str, Any]] = list(emitted_items)
+            incomplete_items.append({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": final_response_text}],
+            })
+            _persist_snapshot("incomplete", incomplete_items, "stream cancelled")
+            raise
+
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             # Client disconnected — interrupt the agent so it stops
             # making upstream LLM calls, then cancel the task.
@@ -1425,6 +1560,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 except (asyncio.CancelledError, Exception):
                     pass
             logger.info("SSE client disconnected; interrupted agent task %s", response_id)
+            final_response_text = "".join(final_text_parts) or final_response_text
+            incomplete_items: List[Dict[str, Any]] = list(emitted_items)
+            incomplete_items.append({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": final_response_text}],
+            })
+            _persist_snapshot("incomplete", incomplete_items, "client disconnected")
 
         return response
 
@@ -1521,6 +1664,10 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
         # Truncation support
+        gateway_session_key, session_key_err = self._parse_session_key_header(request)
+        if session_key_err:
+            return session_key_err
+
         if body.get("truncation") == "auto" and len(conversation_history) > 100:
             conversation_history = conversation_history[-100:]
 
@@ -1575,6 +1722,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=conversation_history,
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
+                gateway_session_key=gateway_session_key,
                 requested_provider=requested_provider,
                 requested_model=requested_model,
                 stream_delta_callback=_on_delta,
@@ -1610,6 +1758,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=conversation_history,
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
+                gateway_session_key=gateway_session_key,
                 requested_provider=requested_provider,
                 requested_model=requested_model,
             )
@@ -1686,7 +1835,9 @@ class APIServerAdapter(BasePlatformAdapter):
             if conversation:
                 self._response_store.set_conversation(conversation, response_id)
 
-        return web.json_response(response_data)
+        return web.json_response(response_data, headers={k: v for k, v in {
+            "X-Hermes-Session-Key": gateway_session_key,
+        }.items() if v})
 
     # ------------------------------------------------------------------
     # GET / DELETE response endpoints
@@ -2038,6 +2189,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
+        gateway_session_key: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -2056,6 +2208,7 @@ class APIServerAdapter(BasePlatformAdapter):
             agent = self._create_agent(
                 ephemeral_system_prompt=ephemeral_system_prompt,
                 session_id=session_id,
+                gateway_session_key=gateway_session_key,
                 requested_provider=requested_provider,
                 requested_model=requested_model,
                 stream_delta_callback=stream_delta_callback,
@@ -2068,7 +2221,7 @@ class APIServerAdapter(BasePlatformAdapter):
             result = agent.run_conversation(
                 user_message=user_message,
                 conversation_history=conversation_history,
-                task_id="default",
+                task_id=session_id or "default",
             )
             usage = {
                 "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,

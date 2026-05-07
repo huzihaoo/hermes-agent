@@ -107,6 +107,30 @@ def choose_cheap_model_route(user_message: str, routing_config: Optional[Dict[st
     return route
 
 
+def _primary_route(primary: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "model": primary.get("model"),
+        "runtime": {
+            "api_key": primary.get("api_key"),
+            "base_url": primary.get("base_url"),
+            "provider": primary.get("provider"),
+            "api_mode": primary.get("api_mode"),
+            "command": primary.get("command"),
+            "args": list(primary.get("args") or []),
+            "credential_pool": primary.get("credential_pool"),
+        },
+        "label": None,
+        "signature": (
+            primary.get("model"),
+            primary.get("provider"),
+            primary.get("base_url"),
+            primary.get("api_mode"),
+            primary.get("command"),
+            tuple(primary.get("args") or ()),
+        ),
+    }
+
+
 def resolve_turn_route(user_message: str, routing_config: Optional[Dict[str, Any]], primary: Dict[str, Any]) -> Dict[str, Any]:
     """Resolve the effective model/runtime for one turn.
 
@@ -114,27 +138,7 @@ def resolve_turn_route(user_message: str, routing_config: Optional[Dict[str, Any
     """
     route = choose_cheap_model_route(user_message, routing_config)
     if not route:
-        return {
-            "model": primary.get("model"),
-            "runtime": {
-                "api_key": primary.get("api_key"),
-                "base_url": primary.get("base_url"),
-                "provider": primary.get("provider"),
-                "api_mode": primary.get("api_mode"),
-                "command": primary.get("command"),
-                "args": list(primary.get("args") or []),
-                "credential_pool": primary.get("credential_pool"),
-            },
-            "label": None,
-            "signature": (
-                primary.get("model"),
-                primary.get("provider"),
-                primary.get("base_url"),
-                primary.get("api_mode"),
-                primary.get("command"),
-                tuple(primary.get("args") or ()),
-            ),
-        }
+        return _primary_route(primary)
 
     from hermes_cli.runtime_provider import resolve_runtime_provider
 
@@ -150,27 +154,7 @@ def resolve_turn_route(user_message: str, routing_config: Optional[Dict[str, Any
             explicit_base_url=route.get("base_url"),
         )
     except Exception:
-        return {
-            "model": primary.get("model"),
-            "runtime": {
-                "api_key": primary.get("api_key"),
-                "base_url": primary.get("base_url"),
-                "provider": primary.get("provider"),
-                "api_mode": primary.get("api_mode"),
-                "command": primary.get("command"),
-                "args": list(primary.get("args") or []),
-                "credential_pool": primary.get("credential_pool"),
-            },
-            "label": None,
-            "signature": (
-                primary.get("model"),
-                primary.get("provider"),
-                primary.get("base_url"),
-                primary.get("api_mode"),
-                primary.get("command"),
-                tuple(primary.get("args") or ()),
-            ),
-        }
+        return _primary_route(primary)
 
     return {
         "model": route.get("model"),

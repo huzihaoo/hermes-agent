@@ -92,6 +92,9 @@ def make_approval_callback(
             # Return "deny" for now (TODO: return "pending" when gateway supports it)
             return "deny"
 
+        if response is None:
+            return "deny"
+
         outcome = response.outcome
         if isinstance(outcome, AllowedOutcome):
             option_id = outcome.option_id
