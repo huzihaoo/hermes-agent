@@ -58,6 +58,111 @@ CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 
+_TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
+_IMAGE_PART_TYPES = frozenset({"image_url", "input_image"})
+_FILE_PART_TYPES = frozenset({"file", "input_file"})
+
+
+def _normalize_multimodal_content(content: Any) -> Any:
+    """Validate and normalize multimodal content for OpenAI-compatible APIs."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content[:MAX_NORMALIZED_TEXT_LENGTH] if len(content) > MAX_NORMALIZED_TEXT_LENGTH else content
+    if not isinstance(content, list):
+        return _normalize_chat_content(content)
+
+    items = content[:MAX_CONTENT_LIST_SIZE] if len(content) > MAX_CONTENT_LIST_SIZE else content
+    normalized_parts: List[Dict[str, Any]] = []
+
+    for part in items:
+        if isinstance(part, str):
+            if not part.strip():
+                raise ValueError("invalid_content_part:Text content parts must be non-empty.")
+            normalized_parts.append({"type": "text", "text": part[:MAX_NORMALIZED_TEXT_LENGTH]})
+            continue
+        if not isinstance(part, dict):
+            raise ValueError("invalid_content_part:Content parts must be objects or non-empty strings.")
+
+        raw_type = part.get("type")
+        part_type = str(raw_type or "").strip().lower()
+        if part_type in _TEXT_PART_TYPES:
+            text = part.get("text")
+            if text is None:
+                raise ValueError("invalid_content_part:Text content parts must include a text field.")
+            if not isinstance(text, str):
+                text = str(text)
+            if not text.strip():
+                raise ValueError("invalid_content_part:Text content parts must be non-empty.")
+            normalized_parts.append({"type": "text", "text": text[:MAX_NORMALIZED_TEXT_LENGTH]})
+            continue
+        if part_type in _IMAGE_PART_TYPES:
+            detail = part.get("detail")
+            image_ref = part.get("image_url")
+            if isinstance(image_ref, dict):
+                url_value = image_ref.get("url")
+                detail = image_ref.get("detail", detail)
+            else:
+                url_value = image_ref
+            if not isinstance(url_value, str) or not url_value.strip():
+                raise ValueError("invalid_image_url:Image parts must include a non-empty image URL.")
+            url_value = url_value.strip()
+            lowered = url_value.lower()
+            if lowered.startswith("data:"):
+                if not lowered.startswith("data:image/") or "," not in url_value:
+                    raise ValueError(
+                        "unsupported_content_type:Only image data URLs are supported. Non-image data payloads are not supported."
+                    )
+            elif not (lowered.startswith("http://") or lowered.startswith("https://")):
+                raise ValueError("invalid_image_url:Image inputs must use http(s) URLs or data:image/... URLs.")
+            image_part: Dict[str, Any] = {"type": "image_url", "image_url": {"url": url_value}}
+            if detail is not None:
+                if not isinstance(detail, str) or not detail.strip():
+                    raise ValueError("invalid_content_part:Image detail must be a non-empty string when provided.")
+                image_part["image_url"]["detail"] = detail.strip()
+            normalized_parts.append(image_part)
+            continue
+        if part_type in _FILE_PART_TYPES:
+            raise ValueError(
+                "unsupported_content_type:Inline image inputs are supported, but uploaded files and document inputs are not supported on this endpoint."
+            )
+        raise ValueError(
+            f"unsupported_content_type:Unsupported content part type {raw_type!r}. Only text and image_url/input_image parts are supported."
+        )
+
+    if not normalized_parts:
+        raise ValueError("invalid_content_part:Content arrays must include at least one text or image part.")
+    if all(p.get("type") == "text" for p in normalized_parts):
+        return "\n".join(p["text"] for p in normalized_parts if p.get("text"))
+    return normalized_parts
+
+
+def _content_has_visible_payload(content: Any) -> bool:
+    """True when content has any text or image attachment."""
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict):
+                ptype = str(part.get("type") or "").strip().lower()
+                if ptype in _TEXT_PART_TYPES and str(part.get("text") or "").strip():
+                    return True
+                if ptype in _IMAGE_PART_TYPES:
+                    return True
+    return False
+
+
+def _multimodal_validation_error(exc: ValueError, *, param: str) -> "web.Response":
+    """Translate multimodal validation errors into OpenAI-style 400 responses."""
+    raw = str(exc)
+    code, _, message = raw.partition(":")
+    if not message:
+        code, message = "invalid_content_part", raw
+    return web.json_response(
+        _openai_error(message, code=code, param=param),
+        status=400,
+    )
+
 
 def _normalize_chat_content(
     content: Any, *, _max_depth: int = 10, _depth: int = 0,
@@ -747,16 +852,21 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = None
         conversation_messages: List[Dict[str, str]] = []
 
-        for msg in messages:
+        for message_index, msg in enumerate(messages):
             role = msg.get("role", "")
-            content = _normalize_chat_content(msg.get("content", ""))
+            raw_content = msg.get("content", "")
             if role == "system":
+                content = _normalize_chat_content(raw_content)
                 # Accumulate system messages
                 if system_prompt is None:
                     system_prompt = content
                 else:
                     system_prompt = system_prompt + "\n" + content
             elif role in ("user", "assistant"):
+                try:
+                    content = _normalize_multimodal_content(raw_content)
+                except ValueError as exc:
+                    return _multimodal_validation_error(exc, param=f"messages[{message_index}].content")
                 conversation_messages.append({"role": role, "content": content})
 
         # Extract the last user message as the primary input
@@ -766,7 +876,7 @@ class APIServerAdapter(BasePlatformAdapter):
             user_message = conversation_messages[-1].get("content", "")
             history = conversation_messages[:-1]
 
-        if not user_message:
+        if not _content_has_visible_payload(user_message):
             return web.json_response(
                 {"error": {"message": "No user message found in messages", "type": "invalid_request_error"}},
                 status=400,
@@ -1616,7 +1726,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     input_messages.append({"role": "user", "content": item})
                 elif isinstance(item, dict):
                     role = item.get("role", "user")
-                    content = _normalize_chat_content(item.get("content", ""))
+                    try:
+                        content = _normalize_multimodal_content(item.get("content", ""))
+                    except ValueError as exc:
+                        return _multimodal_validation_error(exc, param=f"input[{len(input_messages)}].content")
                     input_messages.append({"role": role, "content": content})
         else:
             return web.json_response(_openai_error("'input' must be a string or array"), status=400)
@@ -1660,7 +1773,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Last input message is the user_message
         user_message = input_messages[-1].get("content", "") if input_messages else ""
-        if not user_message:
+        if not _content_has_visible_payload(user_message):
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
         # Truncation support

@@ -77,8 +77,113 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
 from hermes_constants import get_hermes_home
-from utils import atomic_yaml_write, is_truthy_value
+from utils import atomic_json_write, atomic_yaml_write, is_truthy_value
 _hermes_home = get_hermes_home()
+_AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT = 60 * 60
+_INTERRUPT_REASON_STOP = "Stop requested"
+_INTERRUPT_REASON_RESET = "Session reset requested"
+_INTERRUPT_REASON_TIMEOUT = "Timeout reached"
+_INTERRUPT_REASON_SSE_DISCONNECT = "SSE client disconnected"
+_INTERRUPT_REASON_GATEWAY_SHUTDOWN = "Gateway shutting down"
+_INTERRUPT_REASON_GATEWAY_RESTART = "Gateway restarting"
+_CONTROL_INTERRUPT_MESSAGES = frozenset(
+    {
+        _INTERRUPT_REASON_STOP.lower(),
+        _INTERRUPT_REASON_RESET.lower(),
+        _INTERRUPT_REASON_TIMEOUT.lower(),
+        _INTERRUPT_REASON_SSE_DISCONNECT.lower(),
+        _INTERRUPT_REASON_GATEWAY_SHUTDOWN.lower(),
+        _INTERRUPT_REASON_GATEWAY_RESTART.lower(),
+    }
+)
+
+
+def _coerce_gateway_timestamp(value: Any) -> Optional[float]:
+    """Best-effort conversion of stored gateway timestamps to epoch seconds."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.timestamp()
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) / 1000.0 if float(value) > 10_000_000_000 else float(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            numeric = float(text)
+            return numeric / 1000.0 if numeric > 10_000_000_000 else numeric
+        except ValueError:
+            pass
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+def _auto_continue_freshness_window() -> float:
+    raw = os.environ.get("HERMES_AUTO_CONTINUE_FRESHNESS")
+    if raw is None or raw == "":
+        return float(_AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return float(_AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT)
+
+
+def _is_fresh_gateway_interruption(
+    value: Any,
+    *,
+    now: Optional[float] = None,
+    window_secs: Optional[float] = None,
+) -> bool:
+    window = float(window_secs) if window_secs is not None else float(_AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT)
+    if window <= 0:
+        return True
+    timestamp = _coerce_gateway_timestamp(value)
+    if timestamp is None:
+        return True
+    current = time.time() if now is None else now
+    return current - timestamp <= window
+
+
+def _last_transcript_timestamp(history: Optional[List[Dict[str, Any]]]) -> Any:
+    if not history:
+        return None
+    for msg in reversed(history):
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if not role or role in ("session_meta", "system"):
+            continue
+        ts = msg.get("timestamp")
+        if ts is not None:
+            return ts
+        return None
+    return None
+
+
+def _is_control_interrupt_message(message: Optional[str]) -> bool:
+    if not message:
+        return False
+    normalized = " ".join(str(message).strip().split()).lower()
+    return normalized in _CONTROL_INTERRUPT_MESSAGES
+
+
+def _home_target_env_var(platform_name: str) -> str:
+    from cron.scheduler import _HOME_TARGET_ENV_VARS
+
+    return _HOME_TARGET_ENV_VARS.get(
+        platform_name.lower(),
+        f"{platform_name.upper()}_HOME_CHANNEL",
+    )
+
+
+def _home_thread_env_var(platform_name: str) -> str:
+    return f"{_home_target_env_var(platform_name)}_THREAD_ID"
 
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
@@ -1597,20 +1702,76 @@ class GatewayRunner:
         logged and swallowed so they never block the shutdown sequence.
         """
         active = self._snapshot_running_agents()
-        if not active:
-            return
 
         action = "restarting" if self._restart_requested else "shutting down"
         hint = (
             "Your current task will be interrupted. "
-            "Send any message after restart to resume where it left off."
+            "Send any message after restart and I'll try to resume where you left off."
             if self._restart_requested
             else "Your current task will be interrupted."
         )
         msg = f"⚠️ Gateway {action} — {hint}"
 
-        notified: set = set()
+        home_targets: set[tuple[str, str, Optional[str]]] = set()
+        active_targets: set[tuple[str, str, Optional[str]]] = set()
         for session_key in active:
+            parsed = _parse_session_key(session_key)
+            if not parsed:
+                continue
+            thread_id = parsed.get("thread_id")
+            try:
+                entry = getattr(getattr(self, "session_store", None), "_entries", {}).get(session_key)
+                origin = getattr(entry, "origin", None)
+                if origin is None and hasattr(entry, "get"):
+                    origin = entry.get("origin")
+                origin_thread_id = getattr(origin, "thread_id", None)
+                if origin_thread_id:
+                    thread_id = origin_thread_id
+            except Exception:
+                pass
+            active_targets.add((parsed["platform"], parsed["chat_id"], thread_id))
+        notified: set[tuple[str, str, Optional[str]]] = set()
+        for platform, adapter in self.adapters.items():
+            home = self.config.get_home_channel(platform)
+            if not home or not home.chat_id:
+                continue
+            platform_cfg = self.config.platforms.get(platform)
+            if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
+                continue
+            target = (platform.value, str(home.chat_id), str(home.thread_id) if home.thread_id else None)
+            home_targets.add(target)
+            if target in notified:
+                continue
+            if target[2] is None and any(active_target[0] == target[0] and active_target[1] == target[1] and active_target[2] is not None for active_target in active_targets):
+                continue
+            try:
+                metadata = {"thread_id": home.thread_id} if home.thread_id else None
+                result = await adapter.send(str(home.chat_id), msg, metadata=metadata)
+                if result is not None and getattr(result, "success", True) is False:
+                    continue
+                notified.add(target)
+            except Exception as e:
+                logger.debug(
+                    "Failed to send shutdown notification to home %s:%s: %s",
+                    platform.value, home.chat_id, e,
+                )
+
+        def _session_notification_sort_key(session_key: str) -> tuple[int, str]:
+            try:
+                entry = getattr(getattr(self, "session_store", None), "_entries", {}).get(session_key)
+                origin = getattr(entry, "origin", None)
+                if origin is None and hasattr(entry, "get"):
+                    origin = entry.get("origin")
+                if getattr(origin, "thread_id", None):
+                    return (0, session_key)
+            except Exception:
+                pass
+            parsed = _parse_session_key(session_key)
+            if parsed and parsed.get("thread_id"):
+                return (0, session_key)
+            return (1, session_key)
+
+        for session_key in sorted(active, key=_session_notification_sort_key):
             # Parse platform + chat_id from the session key.
             _parsed = _parse_session_key(session_key)
             if not _parsed:
@@ -1618,24 +1779,48 @@ class GatewayRunner:
             platform_str = _parsed["platform"]
             chat_id = _parsed["chat_id"]
 
-            # Deduplicate: one notification per chat, even if multiple
-            # sessions (different users/threads) share the same chat.
-            dedup_key = (platform_str, chat_id)
+            # Deduplicate: one notification per platform/chat/thread tuple.
+            thread_id = _parsed.get("thread_id")
+            try:
+                entry = getattr(getattr(self, "session_store", None), "_entries", {}).get(session_key)
+                origin = getattr(entry, "origin", None)
+                if origin is None and hasattr(entry, "get"):
+                    origin = entry.get("origin")
+                origin_thread_id = getattr(origin, "thread_id", None)
+                if origin_thread_id:
+                    thread_id = origin_thread_id
+            except Exception:
+                pass
+            dedup_key = (platform_str, chat_id, thread_id)
             if dedup_key in notified:
                 continue
+            if (platform_str, chat_id, None) in home_targets and dedup_key[2] is None:
+                continue
+            if (platform_str, chat_id, None) in home_targets and dedup_key[2] is not None:
+                notified.add((platform_str, chat_id, None))
 
             try:
                 platform = Platform(platform_str)
+                platform_cfg = self.config.platforms.get(platform)
+                if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
+                    continue
                 adapter = self.adapters.get(platform)
                 if not adapter:
                     continue
 
                 # Include thread_id if present so the message lands in the
                 # correct forum topic / thread.
-                thread_id = _parsed.get("thread_id")
                 metadata = {"thread_id": thread_id} if thread_id else None
 
-                await adapter.send(chat_id, msg, metadata=metadata)
+                result = await adapter.send(chat_id, msg, metadata=metadata)
+                if result is not None and getattr(result, "success", True) is False:
+                    logger.debug(
+                        "Shutdown notification send returned success=False for %s:%s: %s",
+                        platform_str,
+                        chat_id,
+                        getattr(result, "error", "send returned success=False"),
+                    )
+                    continue
                 notified.add(dedup_key)
                 logger.info(
                     "Sent shutdown notification to %s:%s",
@@ -1646,6 +1831,25 @@ class GatewayRunner:
                     "Failed to send shutdown notification to %s:%s: %s",
                     platform_str, chat_id, e,
                 )
+
+        if len(active_targets) == 1:
+            active_target = next(iter(active_targets))
+            if active_target[2] is not None:
+                for platform, adapter in self.adapters.items():
+                    home = self.config.get_home_channel(platform)
+                    if not home or not home.chat_id:
+                        continue
+                    platform_cfg = self.config.platforms.get(platform)
+                    if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
+                        continue
+                    if (platform.value, str(home.chat_id), None) == (active_target[0], active_target[1], None):
+                        try:
+                            result = await adapter.send(str(home.chat_id), msg)
+                            if result is not None and getattr(result, "success", True) is False:
+                                continue
+                            notified.add((platform.value, str(home.chat_id), None))
+                        except Exception:
+                            pass
 
     def _finalize_shutdown_agents(self, active_agents: Dict[str, Any]) -> None:
         for agent in active_agents.values():
@@ -1698,7 +1902,7 @@ class GatewayRunner:
         # (they might become active again next restart)
 
         try:
-            path.write_text(json.dumps(new_counts))
+            atomic_json_write(path, new_counts, indent=None)
         except Exception:
             pass
 
@@ -1766,7 +1970,7 @@ class GatewayRunner:
             if session_key in counts:
                 del counts[session_key]
                 if counts:
-                    path.write_text(json.dumps(counts))
+                    atomic_json_write(path, counts, indent=None)
                 else:
                     path.unlink(missing_ok=True)
         except Exception:
@@ -2095,6 +2299,7 @@ class GatewayRunner:
 
         # Notify the chat that initiated /restart that the gateway is back.
         await self._send_restart_notification()
+        await self._send_home_channel_startup_notifications()
 
         # Drain any recovered process watchers (from crash recovery checkpoint)
         try:
@@ -2404,6 +2609,14 @@ class GatewayRunner:
                     timeout,
                     self._running_agent_count(),
                 )
+                try:
+                    reason = "restart_timeout" if self._restart_requested else "shutdown_timeout"
+                    for session_key, agent in self._running_agents.items():
+                        if agent is _AGENT_PENDING_SENTINEL:
+                            continue
+                        self.session_store.mark_resume_pending(session_key, reason)
+                except Exception as e:
+                    logger.debug("Failed to mark resume-pending sessions during shutdown: %s", e)
                 self._interrupt_running_agents(
                     "Gateway restarting" if self._restart_requested else "Gateway shutting down"
                 )
@@ -8218,6 +8431,50 @@ class GatewayRunner:
 
         return True
 
+    async def _send_home_channel_startup_notifications(
+        self,
+        *,
+        skip_targets: Optional[set[tuple[str, str, Optional[str]]]] = None,
+    ) -> set[tuple[str, str, Optional[str]]]:
+        """Notify configured home channels that the gateway is back online."""
+        delivered: set[tuple[str, str, Optional[str]]] = set()
+        skipped = skip_targets or set()
+        message = "♻️ Gateway online — Hermes is back and ready."
+
+        for platform, adapter in self.adapters.items():
+            home = self.config.get_home_channel(platform)
+            if not home or not home.chat_id:
+                continue
+            platform_cfg = self.config.platforms.get(platform)
+            if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
+                logger.info(
+                    "Home-channel startup notification suppressed: %s has gateway_restart_notification=false",
+                    platform.value,
+                )
+                continue
+            target = (platform.value, str(home.chat_id), str(home.thread_id) if home.thread_id else None)
+            if target in skipped or target in delivered:
+                continue
+            try:
+                metadata = {"thread_id": home.thread_id} if home.thread_id else None
+                if metadata:
+                    result = await adapter.send(str(home.chat_id), message, metadata=metadata)
+                else:
+                    result = await adapter.send(str(home.chat_id), message)
+                if result is not None and getattr(result, "success", True) is False:
+                    logger.warning(
+                        "Home-channel startup notification failed for %s:%s: %s",
+                        platform.value,
+                        home.chat_id,
+                        getattr(result, "error", "send returned success=False"),
+                    )
+                    continue
+                delivered.add(target)
+                logger.info("Sent home-channel startup notification to %s:%s", platform.value, home.chat_id)
+            except Exception as exc:
+                logger.warning("Home-channel startup notification failed for %s:%s: %s", platform.value, home.chat_id, exc)
+        return delivered
+
     async def _send_restart_notification(self) -> None:
         """Notify the chat that initiated /restart that the gateway is back."""
         import json as _json
@@ -9790,11 +10047,46 @@ class GatewayRunner:
                 message = _msn + "\n\n" + message
 
             # Auto-continue: if the loaded history ends with a tool result,
-            # the previous agent turn was interrupted mid-work (gateway
-            # restart, crash, SIGTERM).  Prepend a system note so the model
+            # If the previous run was interrupted after a tool result (gateway
+            # restart, crash, SIGTERM), prepend a system note so the model
             # finishes processing the pending tool results before addressing
-            # the user's new message.  (#4493)
-            if agent_history and agent_history[-1].get("role") == "tool":
+            # the user's new message.  Restart-time resume markers use the
+            # same note even when the last transcript row is not a tool.
+            freshness_window = _auto_continue_freshness_window()
+            resume_marker_is_fresh = _is_fresh_gateway_interruption(
+                getattr(session_entry, "last_resume_marked_at", None) if session_entry is not None else None,
+                window_secs=freshness_window,
+            )
+            transcript_tail_is_fresh = _is_fresh_gateway_interruption(
+                _last_transcript_timestamp(history),
+                window_secs=freshness_window,
+            )
+            is_resume_pending = bool(
+                session_entry is not None
+                and getattr(session_entry, "resume_pending", False)
+                and resume_marker_is_fresh
+            )
+            has_fresh_tool_tail = bool(
+                agent_history
+                and agent_history[-1].get("role") == "tool"
+                and transcript_tail_is_fresh
+            )
+            if is_resume_pending:
+                reason = getattr(session_entry, "resume_reason", None) or "restart_timeout"
+                reason_phrase = (
+                    "a gateway restart"
+                    if reason == "restart_timeout"
+                    else "a gateway shutdown"
+                    if reason == "shutdown_timeout"
+                    else "a gateway interruption"
+                )
+                message = (
+                    f"[System note: Your previous turn in this session was interrupted by {reason_phrase}. "
+                    "The conversation history below is intact. If it contains unfinished tool result(s), "
+                    "process them first and summarize what was accomplished, then address the user's new message below.]\n\n"
+                    + message
+                )
+            elif has_fresh_tool_tail:
                 message = (
                     "[System note: Your previous turn was interrupted before you could "
                     "process the last tool result(s). The conversation history contains "

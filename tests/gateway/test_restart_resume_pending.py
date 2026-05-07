@@ -108,7 +108,11 @@ def _simulate_note_injection(
         if window_secs is not None
         else _auto_continue_freshness_window()
     )
-    interruption_is_fresh = _is_fresh_gateway_interruption(
+    resume_marker_is_fresh = _is_fresh_gateway_interruption(
+        getattr(resume_entry, "last_resume_marked_at", None) if resume_entry is not None else None,
+        window_secs=window,
+    )
+    transcript_tail_is_fresh = _is_fresh_gateway_interruption(
         _last_transcript_timestamp(history),
         window_secs=window,
     )
@@ -117,12 +121,12 @@ def _simulate_note_injection(
     is_resume_pending = bool(
         resume_entry is not None
         and getattr(resume_entry, "resume_pending", False)
-        and interruption_is_fresh
+        and resume_marker_is_fresh
     )
     has_fresh_tool_tail = bool(
         agent_history
         and agent_history[-1].get("role") == "tool"
-        and interruption_is_fresh
+        and transcript_tail_is_fresh
     )
 
     if is_resume_pending:
@@ -1142,3 +1146,89 @@ class TestStuckLoopEscalation:
                 {"indent": None},
             )
         ]
+
+
+@pytest.mark.asyncio
+async def test_home_channel_startup_notification_sent_and_suppressed():
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-42",
+        name="Ops Home",
+    )
+
+    delivered = await runner._send_home_channel_startup_notifications()
+
+    assert delivered == {(Platform.TELEGRAM.value, "home-42", None)}
+    assert adapter.sent == ["♻️ Gateway online — Hermes is back and ready."]
+
+    adapter.sent.clear()
+    runner.config.platforms[Platform.TELEGRAM].gateway_restart_notification = False
+    delivered = await runner._send_home_channel_startup_notifications()
+
+    assert delivered == set()
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_shutdown_fallback_respects_gateway_restart_notification_false():
+    runner, adapter = make_restart_runner()
+    runner._restart_requested = True
+    session_key = "agent:main:telegram:group:999"
+    runner.session_store._entries[session_key] = MagicMock(
+        origin=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="999",
+            chat_type="group",
+            user_id="u1",
+            thread_id="topic-7",
+        )
+    )
+    runner._running_agents[session_key] = MagicMock()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="999",
+        name="Ops Home",
+    )
+    runner.config.platforms[Platform.TELEGRAM].gateway_restart_notification = False
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert adapter.sent == []
+
+
+def test_resume_pending_freshness_uses_marker_timestamp_not_old_transcript():
+    now = datetime.now()
+    entry = SessionEntry(
+        session_key="agent:main:telegram:dm:1",
+        session_id="sid",
+        created_at=now,
+        updated_at=now,
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=now,
+    )
+    old_timestamp = (now.timestamp() - 7200)
+    history = [{"role": "assistant", "content": "old", "timestamp": old_timestamp}]
+
+    message = _simulate_note_injection(history, "continue", entry, window_secs=60)
+
+    assert message.startswith("[System note: Your previous turn in this session was interrupted")
+
+
+def test_stale_resume_marker_does_not_inject_resume_note():
+    now = datetime.now()
+    entry = SessionEntry(
+        session_key="agent:main:telegram:dm:1",
+        session_id="sid",
+        created_at=now,
+        updated_at=now,
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=datetime.fromtimestamp(now.timestamp() - 7200),
+    )
+    history = [{"role": "assistant", "content": "recent", "timestamp": now.timestamp()}]
+
+    message = _simulate_note_injection(history, "hello", entry, window_secs=60)
+
+    assert message == "hello"

@@ -102,6 +102,21 @@ class TestNormalizeMultimodalContent:
             _normalize_multimodal_content([{"type": "audio", "audio": {}}])
         assert str(exc.value).startswith("unsupported_content_type:")
 
+    @pytest.mark.parametrize(
+        "content",
+        [
+            [123],
+            [None],
+            [{"type": "text"}],
+            [{"type": "text", "text": ""}],
+            [{"type": "text", "text": "   "}],
+        ],
+    )
+    def test_malformed_parts_fail_closed(self, content):
+        with pytest.raises(ValueError) as exc:
+            _normalize_multimodal_content(content)
+        assert str(exc.value).startswith("invalid_content_part:")
+
 
 class TestContentHasVisiblePayload:
     def test_non_empty_string(self):
@@ -245,6 +260,25 @@ class TestChatCompletionsMultimodalHTTP:
             assert resp.status == 400
             body = await resp.json()
         assert body["error"]["code"] == "unsupported_content_type"
+
+    @pytest.mark.asyncio
+    async def test_malformed_content_part_returns_400_with_original_index(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "hermes-agent",
+                    "messages": [
+                        {"role": "system", "content": "You are concise."},
+                        {"role": "user", "content": [{"type": "text"}]},
+                    ],
+                },
+            )
+            assert resp.status == 400
+            body = await resp.json()
+        assert body["error"]["code"] == "invalid_content_part"
+        assert body["error"]["param"] == "messages[1].content"
 
 
 class TestResponsesMultimodalHTTP:
