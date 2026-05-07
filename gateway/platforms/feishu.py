@@ -2283,6 +2283,24 @@ class FeishuAdapter(BasePlatformAdapter):
         future = asyncio.run_coroutine_threadsafe(coro, loop)
         future.add_done_callback(self._log_background_failure)
 
+    def _resolve_approval_operator_display_name(self, operator: Any) -> str:
+        """Return a user-visible approver name without exposing Feishu IDs."""
+        candidates = [
+            getattr(operator, "name", None),
+            getattr(operator, "user_name", None),
+            getattr(operator, "display_name", None),
+            getattr(operator, "nickname", None),
+            getattr(operator, "en_name", None),
+        ]
+        open_id = str(getattr(operator, "open_id", "") or "").strip()
+        if open_id:
+            candidates.append(self._get_cached_sender_name(open_id))
+        for candidate in candidates:
+            name = str(candidate or "").strip()
+            if name and not name.startswith(("ou_", "on_", "ou-", "on-")):
+                return name
+        return "审批人"
+
     def _handle_approval_card_action(self, *, event: Any, action_value: Dict[str, Any], loop: Any) -> Any:
         """Schedule approval resolution and build the synchronous callback response."""
         approval_id = action_value.get("approval_id")
@@ -2294,7 +2312,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
-        user_name = self._get_cached_sender_name(open_id) or open_id
+        user_name = self._resolve_approval_operator_display_name(operator)
 
         try:
             from tools.permission_policy import get_user_role_by_id

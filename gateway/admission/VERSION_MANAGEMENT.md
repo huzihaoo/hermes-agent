@@ -4,7 +4,7 @@
 
 ```python
 from gateway.admission import __version__
-print(__version__)  # "1.11.1"
+print(__version__)  # "1.11.2"
 ```
 
 ## 查看版本历史
@@ -132,6 +132,7 @@ python -m pytest tests/gateway/test_admission*.py tests/gateway/test_feishu_admi
 | 1.6.0 | 0.9.0+ | 3.11+ | 3.35+ | FeishuAdapter 自动集成 MetricsServer/template |
 | 1.7.0 | 0.9.0+ | 3.11+ | 3.35+ | Gateway 启动防护，杜绝进程堆积 |
 | 1.8.0 | 0.10.0+ | 3.11+ | 3.35+ | VM 仓库多用户 worktree 隔离 + 审计 |
+| 1.11.2 | 0.10.4+ | 3.11+ | 3.35+ | Approval display privacy + repo ACL runtime canary |
 | 1.11.1 | 0.10.3+ | 3.11+ | 3.35+ | Slash repo worktree ACL patch + wildcard/path traversal hardening |
 | 1.10.1 | 0.10.0+ | 3.11+ | 3.35+ | Explicit worker slot accounting + registry metadata forwarding |
 | 1.10.0 | 0.10.0+ | 3.11+ | 3.35+ | VM worktree git collaboration + PNC validate-data-validity agent + /mnt/tmp artifact contract |
@@ -140,6 +141,13 @@ python -m pytest tests/gateway/test_admission*.py tests/gateway/test_feishu_admi
 ## 下一版本规划
 
 查看 `CHANGELOG.md` 底部的 "待办（下一版本候选）" 章节。
+
+## v1.11.2 — 2026-05-07
+
+- Feishu approval cards suppress raw `ou_` / `on_` ids from user-visible approver text.
+- Repo ACL approval cards support reviewed approver display names and reject id-like display values.
+- Added side-effect-light VM repo ACL runtime canary script.
+- Verification: focused Feishu approval, repo ACL approval, and canary-script regressions.
 
 ## v1.11.0 — 2026-04-30
 

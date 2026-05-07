@@ -3746,6 +3746,53 @@ class TestFeishuApprovalCards(unittest.TestCase):
         self.assertEqual(adapter._approval_state[12]["requested_role"], "member")
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_exec_approval_resolved_card_never_uses_open_id_as_approver_name(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._approval_state = {
+            13: {
+                "session_key": "agent:main:feishu:group:oc_test:session",
+                "approval_kind": "exec",
+            }
+        }
+        adapter._get_cached_sender_name = Mock(return_value=None)
+        captured = []
+        adapter._submit_on_loop = lambda _loop, coro: (captured.append(coro), None)
+
+        event = SimpleNamespace(operator=SimpleNamespace(open_id="ou_d1d3cfeba1be0a22faa36aaf4fb3907d"))
+        action_value = {"approval_id": 13, "hermes_action": "approve_session"}
+
+        class _Response:
+            def __init__(self):
+                self.card = None
+
+        class _Card:
+            def __init__(self):
+                self.type = None
+                self.data = None
+
+        with (
+            patch("gateway.platforms.feishu.P2CardActionTriggerResponse", _Response),
+            patch("gateway.platforms.feishu.CallBackCard", _Card),
+            patch("tools.permission_policy.get_user_role_by_id", return_value="owner"),
+        ):
+            response = adapter._handle_approval_card_action(
+                event=event,
+                action_value=action_value,
+                loop=object(),
+            )
+
+        card_json = json.dumps(response.card.data, ensure_ascii=False)
+        for coro in captured:
+            coro.close()
+        self.assertIn("Approved for session", card_json)
+        self.assertNotIn("ou_d1d3cfeba1be0a22faa36aaf4fb3907d", card_json)
+        self.assertNotIn("by ou_", card_json)
+
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_group_permission_request_sends_ack_and_approval_card(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter

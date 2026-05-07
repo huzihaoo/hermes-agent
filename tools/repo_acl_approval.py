@@ -67,6 +67,18 @@ def _new_request_id() -> str:
     return f"repoacl_{int(time.time())}_{secrets.token_hex(4)}"
 
 
+def _looks_like_feishu_user_id(value: str) -> bool:
+    normalized = str(value or "").strip()
+    return normalized.startswith(("ou_", "on_", "ou-", "on-"))
+
+
+def _safe_optional_display_name(value: str) -> str:
+    normalized = str(value or "").strip()
+    if not normalized or _looks_like_feishu_user_id(normalized):
+        return ""
+    return normalized
+
+
 class RepoAclApprovalStore:
     """Small JSON-backed store for pending repo ACL approval requests."""
 
@@ -125,6 +137,8 @@ class RepoAclApprovalStore:
         chat_id: str = "",
         thread_id: str = "",
         request_context: dict[str, Any] | None = None,
+        approver_display_name: str = "",
+        approver_user_id: str = "",
         dedupe: bool = True,
     ) -> dict[str, Any]:
         display_name = _normalize_nonempty(requester_display_name, "requester_display_name")
@@ -133,6 +147,10 @@ class RepoAclApprovalStore:
         grant = _validate_requested_grant(requested_grant)
         action = _normalize_nonempty(requested_action, "requested_action")
         normalized_reason = _normalize_nonempty(reason, "reason")
+        approver_name = _safe_optional_display_name(approver_display_name)
+        approver_id = str(approver_user_id or "").strip()
+        if approver_id and not approver_name:
+            raise ValueError("approver_display_name must be a display name when approver_user_id is provided")
         delivery = {
             "platform": "feishu",
             "chat_id": str(chat_id or "").strip(),
@@ -157,6 +175,8 @@ class RepoAclApprovalStore:
                 if existing.get("delivery") != delivery:
                     continue
                 if existing.get("request_context") != normalized_context:
+                    continue
+                if existing.get("approver", {}) != ({"display_name": approver_name, "feishu_user_id": approver_id} if approver_name else {}):
                     continue
                 reused = dict(existing)
                 reused["deduped"] = True
@@ -196,6 +216,11 @@ class RepoAclApprovalStore:
             ],
             "request_context": normalized_context,
         }
+        if approver_name:
+            request["approver"] = {
+                "display_name": approver_name,
+                "feishu_user_id": approver_id,
+            }
         requests[request_id] = request
         self._save_requests(requests)
         return request
@@ -357,12 +382,14 @@ def _text_block(content: str) -> dict[str, Any]:
 def build_repo_acl_approval_card(request: dict[str, Any]) -> dict[str, Any]:
     """Build a Feishu interactive-card-shaped payload for human approval."""
     requester = request.get("requester", {})
+    approver = request.get("approver", {}) or {}
     evidence = request.get("gitlab_evidence", {}) or {}
     request_id = request.get("request_id", "")
     repo = request.get("repo", "")
     grant = request.get("requested_grant", "")
     action = request.get("requested_action", "")
     display_name = requester.get("display_name", "")
+    approver_name = _safe_optional_display_name(approver.get("display_name", ""))
     evidence_lines = "无 GitLab snapshot 证据"
     if evidence:
         evidence_lines = "\n".join(f"- {key}: {value}" for key, value in evidence.items())
@@ -374,6 +401,7 @@ def build_repo_acl_approval_card(request: dict[str, Any]) -> dict[str, Any]:
         },
         "elements": [
             _text_block(f"**请求 ID**: `{request_id}`"),
+            *([_text_block(f"**审批人**: {approver_name}")] if approver_name else []),
             _text_block(f"**请求人**: {display_name} (`{requester.get('feishu_user_id', '')}`)"),
             _text_block(f"**仓库**: `{repo}`\n**请求权限**: `{grant}`\n**触发动作**: `{action}`"),
             _text_block(f"**原因**: {request.get('reason', '')}"),

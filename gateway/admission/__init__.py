@@ -21,7 +21,7 @@ Version History:
     - All 3 concurrency stress tests passing (500 items, 10 threads)
 """
 
-__version__ = "1.11.1"
+__version__ = "1.11.2"
 
 from .alerts import AlertLevel, AlertManager, AlertRecord, ErrorRateAlert, QueueDepthAlert
 from .audit import AuditEvent, log_audit

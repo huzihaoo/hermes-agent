@@ -103,6 +103,71 @@ def test_repo_acl_request_rejects_ambiguous_path_scopes(tmp_path):
         else:
             raise AssertionError(f"ambiguous repo scope should be rejected: {repo}")
 
+def test_build_repo_acl_approval_card_displays_approver_as_name_not_user_id(tmp_path):
+    store = RepoAclApprovalStore(tmp_path)
+    request = store.create_request(
+        requester_display_name="陈玉",
+        requester_user_id="ou_chenyu",
+        repo="planning_algo/nop/planning",
+        requested_grant="read",
+        requested_action="read_file",
+        reason="查看模块接口",
+        gitlab_evidence={"snapshot_grant": "Reporter/read"},
+        approver_display_name="胡子豪",
+        approver_user_id="ou_d1d3cfeba1be0a22faa36aaf4fb3907d",
+    )
+
+    card = build_repo_acl_approval_card(request)
+    body = json.dumps(card, ensure_ascii=False)
+
+    assert "审批人" in body
+    assert "审批人**: 胡子豪" in body
+    assert "审批人**: ou_" not in body
+    assert "ou_d1d3cfeba1be0a22faa36aaf4fb3907d" not in body
+
+
+def test_repo_acl_approval_rejects_id_like_approver_display_name(tmp_path):
+    store = RepoAclApprovalStore(tmp_path)
+
+    try:
+        store.create_request(
+            requester_display_name="陈玉",
+            requester_user_id="ou_chenyu",
+            repo="planning_algo/nop/planning",
+            requested_grant="read",
+            requested_action="read_file",
+            reason="查看模块接口",
+            approver_display_name="ou_d1d3cfeba1be0a22faa36aaf4fb3907d",
+            approver_user_id="ou_d1d3cfeba1be0a22faa36aaf4fb3907d",
+        )
+    except ValueError as exc:
+        assert "display name" in str(exc)
+    else:
+        raise AssertionError("id-like approver display name should be rejected")
+
+
+def test_build_repo_acl_approval_card_suppresses_id_like_stored_approver_name(tmp_path):
+    store = RepoAclApprovalStore(tmp_path)
+    request = store.create_request(
+        requester_display_name="陈玉",
+        requester_user_id="ou_chenyu",
+        repo="planning_algo/nop/planning",
+        requested_grant="read",
+        requested_action="read_file",
+        reason="查看模块接口",
+        gitlab_evidence={"snapshot_grant": "Reporter/read"},
+        approver_display_name="胡子豪",
+        approver_user_id="ou_d1d3cfeba1be0a22faa36aaf4fb3907d",
+    )
+    request["approver"]["display_name"] = "ou_d1d3cfeba1be0a22faa36aaf4fb3907d"
+
+    card = build_repo_acl_approval_card(request)
+    body = json.dumps(card, ensure_ascii=False)
+
+    assert "审批人**: ou_" not in body
+    assert "ou_d1d3cfeba1be0a22faa36aaf4fb3907d" not in body
+
+
 def test_build_repo_acl_approval_card_is_human_reviewable_and_non_applying(tmp_path):
     store = RepoAclApprovalStore(tmp_path)
     request = store.create_request(

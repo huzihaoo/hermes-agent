@@ -13,6 +13,20 @@ MAJOR.MINOR.PATCH
 
 ---
 
+## [1.11.2] — 2026-05-07 — Approval display privacy and repo ACL canary
+
+### Fixed
+- Feishu approval resolved cards now prefer human-readable approver names and suppress raw `ou_` / `on_` identifiers from user-visible card text.
+- Repo ACL approval cards can carry a reviewed approver display name while rejecting id-like approver names when a Feishu user id is also stored.
+
+### Added
+- Runtime repo ACL canary script verifies VM-side user-role config hash, worktree manager hash, configured repo count, senior grants, denied missing grants, and path traversal rejection before/after runtime rollout.
+
+### Verified
+- `tests/gateway/test_feishu.py::TestFeishuApprovalCards::test_exec_approval_resolved_card_never_uses_open_id_as_approver_name`
+- `tests/tools/test_repo_acl_approval.py` approver display-name regressions
+- `tests/test_repo_acl_runtime_canary_script.py`
+
 ## [1.11.1] — 2026-04-30 — Slash repo worktree ACL patch
 
 ### Fixed
