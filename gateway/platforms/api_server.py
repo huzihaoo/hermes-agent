@@ -2522,6 +2522,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/health/detailed", self._handle_health_detailed)
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
+            self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
