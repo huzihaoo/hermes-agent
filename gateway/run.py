@@ -5347,6 +5347,7 @@ class GatewayRunner:
                 session_key=session_key,
                 event_message_id=event.message_id,
                 channel_prompt=event.channel_prompt,
+                session_entry=session_entry,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -10795,6 +10796,7 @@ class GatewayRunner:
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
         run_generation: Optional[int] = None,
+        session_entry: Any = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -10822,11 +10824,11 @@ class GatewayRunner:
 
         if not session_key:
             session_key = build_session_key(source)
-        session_entry = None
-        try:
-            session_entry = self.session_store.get_or_create_session(source)
-        except Exception:
-            session_entry = None
+        if session_entry is None:
+            try:
+                session_entry = self.session_store.get_or_create_session(source)
+            except Exception:
+                session_entry = None
 
         from run_agent import AIAgent
         import queue
