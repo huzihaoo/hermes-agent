@@ -10904,9 +10904,24 @@ class GatewayRunner:
         long_tool_hint_fired = [False]
         _LONG_TOOL_THRESHOLD_S = 30.0
 
+        def _agent_interrupted() -> bool:
+            try:
+                agent = agent_holder[0]
+            except Exception:
+                return False
+            if agent is None:
+                return False
+            try:
+                return bool(getattr(agent, "is_interrupted", False))
+            except Exception:
+                return False
+
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
             if not progress_queue:
+                return
+
+            if _agent_interrupted():
                 return
 
             # Only act on tool.started events (ignore tool.completed, reasoning.available, etc.)
@@ -10998,7 +11013,7 @@ class GatewayRunner:
                     raw = progress_queue.get_nowait()
 
                     # Handle dedup messages: update last line with repeat counter
-                    if not _is_current_run_generation():
+                    if not _is_current_run_generation() or _agent_interrupted():
                         continue
                     if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                         _, base_msg, count = raw
@@ -11079,6 +11094,8 @@ class GatewayRunner:
                     while not progress_queue.empty():
                         try:
                             raw = progress_queue.get_nowait()
+                            if _agent_interrupted():
+                                continue
                             if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                                 _, base_msg, count = raw
                                 if progress_lines:
