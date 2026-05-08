@@ -32,6 +32,7 @@ import difflib
 import re
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Any
+PatchResult = Any
 from enum import Enum
 
 

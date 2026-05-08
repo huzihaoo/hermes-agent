@@ -19,6 +19,7 @@ Gateway-specific env vars:
 """
 
 import asyncio
+import aiohttp
 import base64
 import hashlib
 import hmac

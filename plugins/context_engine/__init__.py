@@ -23,9 +23,12 @@ import importlib.util
 import logging
 import sys
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from .base import ContextEngine
 
 _CONTEXT_ENGINE_PLUGINS_DIR = Path(__file__).parent
 

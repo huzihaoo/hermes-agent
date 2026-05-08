@@ -5,11 +5,14 @@ Jaccard similarity reranking and trust-weighted scoring.
 """
 
 from __future__ import annotations
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import numpy as np
+
 
 import math
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
-
 if TYPE_CHECKING:
     from .store import MemoryStore
 

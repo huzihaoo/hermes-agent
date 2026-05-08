@@ -17,6 +17,7 @@ import os
 import struct
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import threading
 import time
 from collections import defaultdict
@@ -3183,7 +3184,6 @@ class DiscordAdapter(BasePlatformAdapter):
         invocation, which catches stale clients, role grants made by
         mistake, and direct API calls bypassing Discord's UI hide.
         """
-        from types import SimpleNamespace
         try:
             no_perms = discord.Permissions(0)
             if getattr(no_perms, "value", None) != 0:

@@ -26,10 +26,13 @@ import importlib.util
 import logging
 import sys
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 from hermes_cli.config import cfg_get
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from .base import MemoryProvider
 
 _MEMORY_PLUGINS_DIR = Path(__file__).parent
 
