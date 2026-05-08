@@ -5373,19 +5373,10 @@ def cmd_import(args):
 
 def cmd_version(args):
     """Show version."""
-    print(f"Hermes Agent v{__version__} ({__release_date__})")
-    print(f"Project: {PROJECT_ROOT}")
+    from hermes_cli.version import format_version_report
 
-    # Show Python version
-    print(f"Python: {sys.version.split()[0]}")
-    
-    # Show admission module version
-    try:
-        from gateway.admission import __version__ as admission_version
-        print(f"Admission: v{admission_version}")
-    except ImportError:
-        pass
-    
+    print(format_version_report())
+
     # Check for key dependencies
     try:
         import openai

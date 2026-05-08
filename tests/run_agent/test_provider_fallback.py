@@ -220,3 +220,26 @@ class TestPoolRotationRoom:
 
     def test_many_credentials_available_returns_true(self):
         assert _pool_may_recover_from_rate_limit(_pool(10)) is True
+
+
+# ── Provider lane health ────────────────────────────────────────────────
+
+
+def test_local_programming_errors_do_not_open_provider_lane():
+    """A local NameError should not mark the upstream provider unhealthy."""
+    agent = _make_agent()
+    lane_state, snapshot, remaining = agent._provider_lane_precheck()
+    assert remaining is None
+
+    class Classified:
+        reason = __import__("agent.error_classifier", fromlist=["FailoverReason"]).FailoverReason.unknown
+
+    agent._record_provider_lane_failure(
+        lane_state,
+        classified=Classified(),
+        api_error=NameError("name 'DEVELOPER_ROLE_MODELS' is not defined"),
+    )
+
+    snapshot = lane_state.snapshot()
+    assert snapshot["consecutive_failures"] == 0
+    assert snapshot["open_until"] == 0.0

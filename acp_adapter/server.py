@@ -78,8 +78,12 @@ logger = logging.getLogger(__name__)
 
 try:
     from hermes_cli import __version__ as HERMES_VERSION
+    from hermes_cli.version import format_version_report
 except Exception:
     HERMES_VERSION = "0.0.0"
+
+    def format_version_report(*, include_python: bool = True) -> str:
+        return f"Hermes Agent v{HERMES_VERSION}"
 
 # Thread pool for running AIAgent (synchronous) in parallel.
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="acp-agent")
@@ -1644,7 +1648,7 @@ class HermesACPAgent(acp.Agent):
         return f"Queued for the next turn. ({depth} queued)"
 
     def _cmd_version(self, args: str, state: SessionState) -> str:
-        return f"Hermes Agent v{HERMES_VERSION}"
+        return format_version_report(include_python=False)
 
     # ---- Model switching (ACP protocol method) -------------------------------
 

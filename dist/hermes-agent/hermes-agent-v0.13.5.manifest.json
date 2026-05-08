@@ -1,0 +1,23 @@
+{
+  "name": "pnc-agent-hermes-agent-overlay",
+  "version": "0.13.5",
+  "tag": "pnc-agent-v0.13.5-overlay.20260508",
+  "commit": "fc2be0cf07df2067fd74bf790d41914d1c228d44",
+  "branch": "sync/upstream-v0.13-overlay-20260508",
+  "built_at": "2026-05-08T17:29:44.452126+08:00",
+  "artifact": "dist/hermes-agent/hermes-agent-v0.13.5.tar.gz",
+  "sha256": "28eeaf210d10fdbaa9b7ae47f7b90280bd6b47bd1dd2363e8359151f0a86d28d",
+  "included_paths": [
+    "acp_adapter/server.py",
+    "hermes_cli/main.py",
+    "hermes_cli/__init__.py",
+    "hermes_cli/version.py",
+    "run_agent.py",
+    "pyproject.toml",
+    "tests/acp/test_server.py",
+    "tests/hermes_cli/test_version_command.py",
+    "tests/run_agent/test_provider_fallback.py",
+    "tests/run_agent/test_provider_parity.py"
+  ],
+  "artifact_policy": "source-delta tarball for verified overlay patch release; full live worktree remains LaunchAgent runtime source"
+}

@@ -19,6 +19,7 @@ sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
 sys.modules.setdefault("fal_client", types.SimpleNamespace())
 
 from run_agent import AIAgent
+import run_agent
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -250,6 +251,20 @@ class TestDeveloperRoleSwap:
         agent._build_api_kwargs(messages)
         # Original messages must be untouched (internal representation stays "system")
         assert messages[0]["role"] == "system"
+
+
+    def test_developer_role_swap_has_import_fallback(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openrouter")
+        agent.model = "openai/gpt-5.5"
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "hi"},
+        ]
+        monkeypatch.delattr(run_agent, "DEVELOPER_ROLE_MODELS", raising=False)
+
+        kwargs = agent._build_api_kwargs(messages)
+
+        assert kwargs["messages"][0]["role"] == "developer"
 
     def test_developer_role_via_nous_portal(self, monkeypatch):
         agent = _make_agent(monkeypatch, "nous", base_url="https://inference-api.nousresearch.com/v1")

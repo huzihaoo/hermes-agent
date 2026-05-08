@@ -892,6 +892,9 @@ class TestSlashCommands:
         state = self._make_state(mock_manager)
         result = agent._handle_slash_command("/version", state)
         assert HERMES_VERSION in result
+        assert "Project:" not in result
+        assert "Modules:" in result
+        assert "Admission Control: v" in result
 
     def test_compact_compresses_context(self, agent, mock_manager):
         state = self._make_state(mock_manager)

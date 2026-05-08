@@ -1119,6 +1119,19 @@ class AIAgent:
         if lane_state is None:
             return
         reason = getattr(classified, "reason", FailoverReason.unknown)
+        if reason == FailoverReason.unknown and isinstance(
+            api_error, (NameError, TypeError, AttributeError, UnboundLocalError)
+        ):
+            # Local programming/configuration bugs are not provider health
+            # signals.  Keeping the lane open after these failures makes later
+            # Feishu turns skip the primary model even after the bug is fixed.
+            logger.info(
+                "Provider lane unchanged for local %s on %s: %s",
+                type(api_error).__name__,
+                self._provider_lane_label(),
+                self._summarize_api_error(api_error),
+            )
+            return
         cooldown = self._provider_lane_cooldown_for_reason(reason, retry_after=retry_after)
         summary = self._summarize_api_error(api_error)
         lane_state.mark_failure(
@@ -9408,10 +9421,15 @@ class AIAgent:
         # for instruction-following.  Swap the role at the API boundary so
         # internal message representation stays uniform ("system").
         _model_lower = (self.model or "").lower()
+        developer_role_models = globals().get(
+            "DEVELOPER_ROLE_MODELS",
+            ("gpt-5", "codex"),
+        )
         if (
             sanitized_messages
+            and isinstance(sanitized_messages[0], dict)
             and sanitized_messages[0].get("role") == "system"
-            and any(p in _model_lower for p in DEVELOPER_ROLE_MODELS)
+            and any(p in _model_lower for p in developer_role_models)
         ):
             # Shallow-copy the list + first message only — rest stays shared.
             sanitized_messages = list(sanitized_messages)
@@ -15569,7 +15587,7 @@ class AIAgent:
                 except (OSError, ValueError):
                     logger.error(error_msg)
                 
-                logger.debug("Outer loop error in API call #%d", api_call_count, exc_info=True)
+                logger.error("Outer loop error in API call #%d", api_call_count, exc_info=True)
                 
                 # If an assistant message with tool_calls was already appended,
                 # the API expects a role="tool" result for every tool_call_id.
