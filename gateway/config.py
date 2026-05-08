@@ -1370,7 +1370,9 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     api_server_cors_origins = os.getenv("API_SERVER_CORS_ORIGINS", "")
     api_server_port = os.getenv("API_SERVER_PORT")
     api_server_host = os.getenv("API_SERVER_HOST")
-    if api_server_enabled or api_server_key:
+    api_server_cfg = config.platforms.get(Platform.API_SERVER)
+    api_server_explicitly_disabled = api_server_cfg is not None and api_server_cfg.enabled is False
+    if (api_server_enabled or api_server_key) and not api_server_explicitly_disabled:
         if Platform.API_SERVER not in config.platforms:
             config.platforms[Platform.API_SERVER] = PlatformConfig()
         config.platforms[Platform.API_SERVER].enabled = True

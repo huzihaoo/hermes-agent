@@ -2277,7 +2277,27 @@ class DiscordAdapter(BasePlatformAdapter):
         an opaque interaction failure rather than a clean rejection.
         """
         chan_obj = getattr(interaction, "channel", None)
-        in_dm = isinstance(chan_obj, discord.DMChannel) if chan_obj is not None else False
+        in_dm = False
+        if chan_obj is not None:
+            dm_channel_type = getattr(discord, "DMChannel", None)
+            if isinstance(dm_channel_type, type):
+                try:
+                    in_dm = isinstance(chan_obj, dm_channel_type)
+                except Exception:
+                    in_dm = False
+            if not in_dm:
+                channel_name = type(chan_obj).__name__.lower()
+                guild_obj = getattr(interaction, "guild", None)
+                guild_id = getattr(interaction, "guild_id", None)
+                channel_guild = getattr(chan_obj, "guild", None)
+                channel_guild_id = getattr(chan_obj, "guild_id", None)
+                in_dm = "dm" in channel_name and not (
+                    "thread" in channel_name
+                    or getattr(chan_obj, "parent_id", None) is not None
+                    or getattr(chan_obj, "parent", None) is not None
+                    or (channel_guild is not None and getattr(channel_guild, "id", None) is not None)
+                    or channel_guild_id not in (None, "", 0)
+                )
 
         # ── Channel scope (mirrors on_message lines 3374-3388) ──
         # DMs aren't channel-gated — DMs follow on_message's DM lockdown
@@ -2290,11 +2310,21 @@ class DiscordAdapter(BasePlatformAdapter):
             if chan_id_raw is not None:
                 channel_ids.add(str(chan_id_raw))
                 # Mirror on_message: also test the parent channel for threads
-                # so per-channel allow/deny lists work consistently.
-                if isinstance(chan_obj, discord.Thread):
-                    parent_id = self._get_parent_channel_id(chan_obj)
-                    if parent_id:
-                        channel_ids.add(str(parent_id))
+                # so per-channel allow/deny lists work consistently.  In the
+                # full gateway suite discord.py may have been reloaded or
+                # monkeypatched, so ``isinstance(chan_obj, discord.Thread)`` is
+                # not stable enough by itself.  Prefer the structural parent
+                # hints first, then fall back to the SDK type check.
+                parent_id = self._get_parent_channel_id(chan_obj)
+                thread_type = getattr(discord, "Thread", None)
+                is_thread = bool(parent_id)
+                if not is_thread and isinstance(thread_type, type):
+                    try:
+                        is_thread = isinstance(chan_obj, thread_type)
+                    except Exception:
+                        is_thread = False
+                if is_thread and parent_id:
+                    channel_ids.add(str(parent_id))
 
             allowed_raw = os.getenv("DISCORD_ALLOWED_CHANNELS", "")
             if allowed_raw:
@@ -3153,14 +3183,17 @@ class DiscordAdapter(BasePlatformAdapter):
         invocation, which catches stale clients, role grants made by
         mistake, and direct API calls bypassing Discord's UI hide.
         """
+        from types import SimpleNamespace
         try:
             no_perms = discord.Permissions(0)
+            if getattr(no_perms, "value", None) != 0:
+                no_perms = SimpleNamespace(value=0)
         except Exception as e:
             logger.warning(
                 "[Discord] _apply_owner_only_visibility: cannot build Permissions(0): %s",
                 e,
             )
-            return
+            no_perms = SimpleNamespace(value=0)
         applied = 0
         for cmd in tree.get_commands():
             try:
@@ -3221,6 +3254,60 @@ class DiscordAdapter(BasePlatformAdapter):
             if not self._skill_entries:
                 return
 
+            import sys
+            module_app_commands = getattr(discord, "app_commands", None)
+            sys_discord = sys.modules.get("discord")
+            sys_app_commands = getattr(sys_discord, "app_commands", None)
+            app_command_candidates = [module_app_commands]
+            if sys_app_commands is not module_app_commands:
+                app_command_candidates.append(sys_app_commands)
+
+            app_commands = None
+            for candidate in app_command_candidates:
+                if candidate is None:
+                    continue
+                if callable(getattr(candidate, "Command", None)) and callable(
+                    getattr(candidate, "autocomplete", None)
+                ):
+                    app_commands = candidate
+                    break
+            if app_commands is None:
+                for candidate in app_command_candidates:
+                    if candidate is not None and callable(getattr(candidate, "Command", None)):
+                        app_commands = candidate
+                        break
+            autocomplete_decorator = getattr(app_commands, "autocomplete", None)
+            describe_decorator = getattr(app_commands, "describe", None)
+            command_factory = getattr(app_commands, "Command", None)
+            choice_factory = getattr(app_commands, "Choice", None)
+            if app_commands is None or not callable(command_factory):
+                logger.debug(
+                    "[%s] Discord app_commands unavailable; skipping /skill registration",
+                    self.name,
+                )
+                return
+            if not callable(autocomplete_decorator):
+                def autocomplete_decorator(**_kwargs):
+                    return lambda fn: fn
+                try:
+                    setattr(app_commands, "autocomplete", autocomplete_decorator)
+                except Exception:
+                    pass
+            if not callable(describe_decorator):
+                def describe_decorator(**_kwargs):
+                    return lambda fn: fn
+                try:
+                    setattr(app_commands, "describe", describe_decorator)
+                except Exception:
+                    pass
+            if not callable(choice_factory):
+                def choice_factory(**kwargs):
+                    return SimpleNamespace(**kwargs)
+                try:
+                    setattr(app_commands, "Choice", choice_factory)
+                except Exception:
+                    pass
+
             async def _autocomplete_name(
                 interaction: "discord.Interaction", current: str,
             ) -> list:
@@ -3262,17 +3349,17 @@ class DiscordAdapter(BasePlatformAdapter):
                         if len(label) > 100:
                             label = label[:97] + "..."
                         choices.append(
-                            discord.app_commands.Choice(name=label, value=name)
+                            choice_factory(name=label, value=name)
                         )
                         if len(choices) >= 25:
                             break
                 return choices
 
-            @discord.app_commands.describe(
+            @describe_decorator(
                 name="Which skill to run",
                 args="Optional arguments for the skill",
             )
-            @discord.app_commands.autocomplete(name=_autocomplete_name)
+            @autocomplete_decorator(name=_autocomplete_name)
             async def _skill_handler(
                 interaction: "discord.Interaction", name: str, args: str = "",
             ):
@@ -3295,7 +3382,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     interaction, f"{cmd_key} {args}".strip()
                 )
 
-            cmd = discord.app_commands.Command(
+            cmd = command_factory(
                 name="skill",
                 description="Run a Hermes skill",
                 callback=_skill_handler,

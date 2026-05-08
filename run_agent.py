@@ -1960,6 +1960,7 @@ class AIAgent:
         # needed later by the startup feasibility check.  Avoid exposing a
         # broad pseudo-public config object on the agent instance.
         self._aux_compression_context_length_config = None
+        self.skip_memory = skip_memory
 
         # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
         self._memory_store = None
@@ -2922,6 +2923,11 @@ class AIAgent:
         ``run_conversation()`` call.
         """
         if not self.compression_enabled:
+            return
+        if getattr(self, "skip_memory", False):
+            # Ephemeral skip-memory agents (gateway cache stress tests,
+            # batch/cron-style runs) should not pay the eager auxiliary
+            # provider discovery/warning cost at construction time.
             return
         try:
             from agent.auxiliary_client import (

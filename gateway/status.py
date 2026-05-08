@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Any, Optional
+from utils import atomic_json_write
 
 _GATEWAY_KIND = "hermes-gateway"
 _RUNTIME_STATUS_FILE = "gateway_state.json"
@@ -35,9 +36,187 @@ def _get_pid_path() -> Path:
     return home / "gateway.pid"
 
 
+def _unlink_pid_file() -> None:
+    """Best-effort unconditional PID-file unlink for known-stale records."""
+    try:
+        _get_pid_path().unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def _get_runtime_status_path() -> Path:
     """Return the persisted runtime health/status file path."""
     return _get_pid_path().with_name(_RUNTIME_STATUS_FILE)
+
+
+def _get_takeover_marker_path() -> Path:
+    """Return the marker written before planned gateway replacement."""
+    return _get_pid_path().with_name(".gateway-takeover.json")
+
+
+def _get_planned_stop_marker_path() -> Path:
+    """Return the marker written before planned/manual gateway stop."""
+    return _get_pid_path().with_name(".gateway-planned-stop.json")
+
+
+_WINDOWS_LOCK_OFFSET = 0x7FFF0000
+
+
+def _try_acquire_file_lock(handle) -> bool:
+    """Best-effort non-blocking file lock used by platform-specific tests."""
+    if _IS_WINDOWS:
+        mod = globals().get("msvcrt")
+        if mod is None:
+            import msvcrt as mod  # type: ignore
+        handle.seek(_WINDOWS_LOCK_OFFSET)
+        handle.write("\n")
+        handle.flush()
+        handle.seek(_WINDOWS_LOCK_OFFSET)
+        mod.locking(handle.fileno(), mod.LK_NBLCK, 1)
+        return True
+    try:
+        import fcntl
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+
+
+def _release_file_lock(handle) -> None:
+    if _IS_WINDOWS:
+        mod = globals().get("msvcrt")
+        if mod is None:
+            import msvcrt as mod  # type: ignore
+        handle.seek(_WINDOWS_LOCK_OFFSET)
+        mod.locking(handle.fileno(), mod.LK_UNLCK, 1)
+        return
+    import fcntl
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _write_json_file(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+    tmp.replace(path)
+
+
+def write_takeover_marker(target_pid: int) -> bool:
+    """Record that an existing gateway is being replaced intentionally."""
+    try:
+        _write_json_file(_get_takeover_marker_path(), {
+            "target_pid": int(target_pid),
+            "target_start_time": _get_process_start_time(int(target_pid)),
+            "replacer_pid": os.getpid(),
+            "written_at": _utc_now_iso(),
+        })
+        return True
+    except Exception:
+        return False
+
+
+def clear_takeover_marker() -> None:
+    """Best-effort removal of the one-shot takeover marker."""
+    try:
+        _get_takeover_marker_path().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def consume_takeover_marker_for_self() -> bool:
+    """Consume a planned-replacement marker if it names this process.
+
+    The marker is one-shot: remove it after inspection even when stale,
+    malformed, or meant for a different process so stale records cannot grief
+    later shutdowns.
+    """
+    marker_path = _get_takeover_marker_path()
+    payload = _read_json_file(marker_path)
+    try:
+        marker_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    if not payload:
+        return False
+
+    try:
+        written_at = payload.get("written_at")
+        if written_at:
+            written_dt = datetime.fromisoformat(str(written_at))
+            if written_dt.tzinfo is None:
+                written_dt = written_dt.replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc) - written_dt).total_seconds() > 60:
+                return False
+    except Exception:
+        return False
+
+    try:
+        target_pid = int(payload.get("target_pid"))
+    except (TypeError, ValueError):
+        return False
+    if target_pid != os.getpid():
+        return False
+
+    target_start = payload.get("target_start_time")
+    current_start = _get_process_start_time(os.getpid())
+    if target_start is not None and current_start is not None and target_start != current_start:
+        return False
+    return True
+
+
+def write_planned_stop_marker(target_pid: int) -> bool:
+    """Record that an existing gateway is being stopped intentionally."""
+    try:
+        _write_json_file(_get_planned_stop_marker_path(), {
+            "target_pid": int(target_pid),
+            "target_start_time": _get_process_start_time(int(target_pid)),
+            "stopper_pid": os.getpid(),
+            "written_at": _utc_now_iso(),
+        })
+        return True
+    except Exception:
+        return False
+
+
+def clear_planned_stop_marker() -> None:
+    """Best-effort removal of the one-shot planned-stop marker."""
+    try:
+        _get_planned_stop_marker_path().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def consume_planned_stop_marker_for_self() -> bool:
+    """Consume a planned-stop marker if it names this process."""
+    marker_path = _get_planned_stop_marker_path()
+    payload = _read_json_file(marker_path)
+    try:
+        marker_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    if not payload:
+        return False
+    try:
+        written_at = payload.get("written_at")
+        if written_at:
+            written_dt = datetime.fromisoformat(str(written_at))
+            if written_dt.tzinfo is None:
+                written_dt = written_dt.replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc) - written_dt).total_seconds() > 60:
+                return False
+    except Exception:
+        return False
+    try:
+        target_pid = int(payload.get("target_pid"))
+    except (TypeError, ValueError):
+        return False
+    if target_pid != os.getpid():
+        return False
+    target_start = payload.get("target_start_time")
+    current_start = _get_process_start_time(os.getpid())
+    if target_start is not None and current_start is not None and target_start != current_start:
+        return False
+    return True
 
 
 def _get_lock_dir() -> Path:
@@ -183,9 +362,21 @@ def _read_json_file(path: Path) -> Optional[dict[str, Any]]:
     return payload if isinstance(payload, dict) else None
 
 
-def _write_json_file(path: Path, payload: dict[str, Any]) -> None:
+def _write_json_file(path: Path, payload: dict[str, Any], *, exclusive: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload))
+    if exclusive:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+        except Exception:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        return
+    atomic_json_write(path, payload, indent=None, separators=(",", ":"))
 
 
 def _read_pid_record() -> Optional[dict]:
@@ -214,7 +405,91 @@ def _read_pid_record() -> Optional[dict]:
 
 def write_pid_file() -> None:
     """Write the current process PID and metadata to the gateway PID file."""
-    _write_json_file(_get_pid_path(), _build_pid_record())
+    _write_json_file(_get_pid_path(), _build_pid_record(), exclusive=True)
+
+
+def _get_runtime_lock_path() -> Path:
+    return _get_pid_path().with_name("gateway.lock")
+
+
+def acquire_gateway_runtime_lock(lock_path: Optional[Path] = None) -> bool:
+    """Claim the current HERMES_HOME gateway runtime lock for this process."""
+    path = Path(lock_path) if lock_path is not None else _get_runtime_lock_path()
+    record = _build_pid_record()
+    existing = _read_json_file(path)
+    if existing:
+        try:
+            existing_pid = int(existing.get("pid"))
+        except (TypeError, ValueError):
+            existing_pid = None
+        if existing_pid == os.getpid() and existing.get("start_time") == record.get("start_time"):
+            _write_json_file(path, record)
+            return True
+        stale = existing_pid is None
+        if not stale:
+            try:
+                os.kill(existing_pid, 0)
+            except (ProcessLookupError, PermissionError):
+                stale = True
+            else:
+                current_start = _get_process_start_time(existing_pid)
+                if existing.get("start_time") is not None and current_start is not None and current_start != existing.get("start_time"):
+                    stale = True
+        if not stale:
+            return False
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    try:
+        _write_json_file(path, record, exclusive=True)
+        return True
+    except FileExistsError:
+        return False
+
+
+def is_gateway_runtime_lock_active(lock_path: Optional[Path] = None) -> bool:
+    """Return whether a live process owns the gateway runtime lock."""
+    path = Path(lock_path) if lock_path is not None else _get_runtime_lock_path()
+    record = _read_json_file(path)
+    if not record:
+        return False
+    try:
+        pid = int(record.get("pid"))
+    except (TypeError, ValueError):
+        return False
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+    current_start = _get_process_start_time(pid)
+    if record.get("start_time") is not None and current_start is not None and current_start != record.get("start_time"):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def release_gateway_runtime_lock(lock_path: Optional[Path] = None) -> None:
+    """Release this process's gateway runtime lock."""
+    path = Path(lock_path) if lock_path is not None else _get_runtime_lock_path()
+    record = _read_json_file(path)
+    if not record:
+        return
+    if record.get("pid") != os.getpid():
+        return
+    if record.get("start_time") != _get_process_start_time(os.getpid()):
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def write_runtime_status(
@@ -394,11 +669,17 @@ def release_scoped_lock(scope: str, identity: str) -> None:
         pass
 
 
-def release_all_scoped_locks() -> int:
+def release_all_scoped_locks(
+    *,
+    owner_pid: Optional[int] = None,
+    owner_start_time: Optional[Any] = None,
+) -> int:
     """Remove all scoped lock files in the lock directory.
 
     Called during --replace to clean up stale locks left by stopped/killed
-    gateway processes that did not release their locks gracefully.
+    gateway processes that did not release their locks gracefully.  When
+    ``owner_pid`` and/or ``owner_start_time`` are provided, only locks owned by
+    that process identity are removed.
     Returns the number of lock files removed.
     """
     lock_dir = _get_lock_dir()
@@ -406,6 +687,14 @@ def release_all_scoped_locks() -> int:
     if lock_dir.exists():
         for lock_file in lock_dir.glob("*.lock"):
             try:
+                if owner_pid is not None or owner_start_time is not None:
+                    existing = _read_json_file(lock_file)
+                    if not existing:
+                        continue
+                    if owner_pid is not None and existing.get("pid") != owner_pid:
+                        continue
+                    if owner_start_time is not None and existing.get("start_time") != owner_start_time:
+                        continue
                 lock_file.unlink(missing_ok=True)
                 removed += 1
             except OSError:
@@ -413,38 +702,82 @@ def release_all_scoped_locks() -> int:
     return removed
 
 
-def get_running_pid() -> Optional[int]:
+def get_running_pid(pid_path: Optional[Path] = None, *, cleanup_stale: bool = True) -> Optional[int]:
     """Return the PID of a running gateway instance, or ``None``.
 
     Checks the PID file and verifies the process is actually alive.
-    Cleans up stale PID files automatically.
+    Cleans up stale PID files automatically unless cleanup_stale=False.
     """
-    record = _read_pid_record()
+    original_get_pid_path = None
+    if pid_path is not None:
+        path = Path(pid_path)
+        record = _read_json_file(path)
+        if record is None and path.exists():
+            try:
+                record = {"pid": int(path.read_text().strip())}
+            except Exception:
+                record = None
+    else:
+        path = _get_pid_path()
+        record = _read_pid_record()
+
+    def _cleanup() -> None:
+        if not cleanup_stale:
+            return
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            path.with_name("gateway.lock").unlink(missing_ok=True)
+        except OSError:
+            pass
+
     if not record:
-        remove_pid_file()
+        _cleanup()
         return None
 
     try:
         pid = int(record["pid"])
     except (KeyError, TypeError, ValueError):
-        remove_pid_file()
+        _cleanup()
         return None
 
     try:
         os.kill(pid, 0)  # signal 0 = existence check, no actual signal sent
     except (ProcessLookupError, PermissionError):
-        remove_pid_file()
+        if path.with_name("gateway.lock").exists():
+            lock_record = _read_json_file(path.with_name("gateway.lock"))
+            try:
+                lock_pid = int(lock_record.get("pid")) if lock_record else None
+            except (TypeError, ValueError):
+                lock_pid = None
+            if lock_pid == os.getpid() and lock_record and lock_record.get("start_time") == record.get("start_time"):
+                return os.getpid()
+        _cleanup()
         return None
 
     recorded_start = record.get("start_time")
     current_start = _get_process_start_time(pid)
     if recorded_start is not None and current_start is not None and current_start != recorded_start:
-        remove_pid_file()
+        _cleanup()
         return None
 
     if not _looks_like_gateway_process(pid):
-        if not _record_looks_like_gateway(record):
-            remove_pid_file()
+        lock_active = is_gateway_runtime_lock_active(path.with_name("gateway.lock"))
+        if not lock_active:
+            lock_record = _read_json_file(path.with_name("gateway.lock"))
+            try:
+                lock_pid = int(lock_record.get("pid")) if lock_record else None
+            except (TypeError, ValueError):
+                lock_pid = None
+            lock_active = (
+                lock_pid == pid
+                and lock_record is not None
+                and lock_record.get("start_time") == record.get("start_time")
+            )
+        if not _record_looks_like_gateway(record) or not lock_active:
+            _cleanup()
             return None
 
     return pid
