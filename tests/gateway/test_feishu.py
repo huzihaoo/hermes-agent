@@ -3602,6 +3602,8 @@ class TestFeishuApprovalCards(unittest.TestCase):
             "requested_role": "senior",
             "target_user_id": "ou_target",
             "target_user_name": "张三",
+            "request_chat_id": "oc_source",
+            "request_thread_id": "omt_source",
             "request_chat_name": "研发群",
             "request_message_id": "om_request_42",
             "request_text": "你好，我是张三，帮我开通代码审查权限",
@@ -3635,6 +3637,8 @@ class TestFeishuApprovalCards(unittest.TestCase):
         self.assertIn("帮我开通代码审查权限", body)
         self.assertIn(42, adapter._approval_state)
         self.assertEqual(adapter._approval_state[42]["requested_role"], "senior")
+        self.assertEqual(adapter._approval_state[42]["request_chat_id"], "oc_source")
+        self.assertEqual(adapter._approval_state[42]["request_thread_id"], "omt_source")
 
     @patch.dict(os.environ, {}, clear=True)
     def test_permission_grant_card_action_updates_requested_role_before_approval(self):
@@ -3744,6 +3748,61 @@ class TestFeishuApprovalCards(unittest.TestCase):
         self.assertIn("张三", card_json)
         self.assertIn("member", card_json.lower())
         self.assertEqual(adapter._approval_state[12]["requested_role"], "member")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_permission_grant_card_action_resolves_approver_name_and_role_from_user_id(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._approval_state = {
+            14: {
+                "session_key": "perm:grant:14",
+                "approval_kind": "permission_grant",
+                "target_user_id": "ou_target",
+                "target_user_name": "张三",
+                "requested_role": "admin",
+            }
+        }
+        adapter._sender_name_cache = {"on_admin": ("胡子豪", time.time() + 60)}
+        captured = []
+        adapter._submit_on_loop = lambda _loop, coro: (captured.append(coro), None)
+
+        event = SimpleNamespace(operator=SimpleNamespace(user_id="on_admin"))
+        action_value = {"approval_id": 14, "hermes_action": "grant_permission"}
+
+        class _Response:
+            def __init__(self):
+                self.card = None
+
+        class _Card:
+            def __init__(self):
+                self.type = None
+                self.data = None
+
+        def _role_by_id(user_id):
+            return "owner" if user_id == "on_admin" else "member"
+
+        with (
+            patch("gateway.platforms.feishu.P2CardActionTriggerResponse", _Response),
+            patch("gateway.platforms.feishu.CallBackCard", _Card),
+            patch("tools.permission_policy.get_user_role_by_id", side_effect=_role_by_id),
+        ):
+            response = adapter._handle_approval_card_action(
+                event=event,
+                action_value=action_value,
+                loop=object(),
+            )
+
+        self.assertEqual(len(captured), 1)
+        for coro in captured:
+            coro.close()
+        card_json = json.dumps(response.card.data, ensure_ascii=False)
+        self.assertIn("张三", card_json)
+        self.assertIn("admin", card_json.lower())
+        self.assertIn("胡子豪", card_json)
+        self.assertNotIn("该用户", card_json)
+        self.assertNotIn("审批人：** 审批人", card_json)
 
     @patch.dict(os.environ, {}, clear=True)
     def test_exec_approval_resolved_card_never_uses_open_id_as_approver_name(self):

@@ -2005,6 +2005,8 @@ class FeishuAdapter(BasePlatformAdapter):
             requested_role = str((metadata or {}).get("requested_role") or "").strip().lower()
             target_user_id = str((metadata or {}).get("target_user_id") or "").strip()
             target_user_name = str((metadata or {}).get("target_user_name") or "").strip()
+            request_chat_id = str((metadata or {}).get("request_chat_id") or "").strip()
+            request_thread_id = str((metadata or {}).get("request_thread_id") or "").strip()
             request_chat_name = str((metadata or {}).get("request_chat_name") or "").strip()
             request_message_id = str((metadata or {}).get("request_message_id") or "").strip()
             request_text = str((metadata or {}).get("request_text") or "").strip()
@@ -2108,6 +2110,8 @@ class FeishuAdapter(BasePlatformAdapter):
                     "target_user_name": target_user_name,
                     "requested_role": requested_role,
                     "description": description,
+                    "request_chat_id": request_chat_id,
+                    "request_thread_id": request_thread_id,
                     "request_chat_name": request_chat_name,
                     "request_message_id": request_message_id,
                     "request_text": request_text,
@@ -2812,9 +2816,18 @@ class FeishuAdapter(BasePlatformAdapter):
             getattr(operator, "nickname", None),
             getattr(operator, "en_name", None),
         ]
-        open_id = str(getattr(operator, "open_id", "") or "").strip()
-        if open_id:
-            candidates.append(self._get_cached_sender_name(open_id))
+        ids_to_check = []
+        for attr in ("open_id", "user_id", "union_id"):
+            value = str(getattr(operator, attr, "") or "").strip()
+            if value and value not in ids_to_check:
+                ids_to_check.append(value)
+        user_id_obj = getattr(operator, "user_id", None)
+        for attr in ("open_id", "user_id", "union_id"):
+            value = str(getattr(user_id_obj, attr, "") or "").strip()
+            if value and value not in ids_to_check:
+                ids_to_check.append(value)
+        for sender_id in ids_to_check:
+            candidates.append(self._get_cached_sender_name(sender_id))
         for candidate in candidates:
             name = str(candidate or "").strip()
             if name and not name.startswith(("ou_", "on_", "ou-", "on-")):
@@ -2831,13 +2844,19 @@ class FeishuAdapter(BasePlatformAdapter):
         requested_role_override = str(action_value.get("requested_role") or "").strip().lower()
 
         operator = getattr(event, "operator", None)
-        open_id = str(getattr(operator, "open_id", "") or "")
+        open_id = str(getattr(operator, "open_id", "") or "").strip()
+        operator_user_id = str(getattr(operator, "user_id", "") or "").strip()
+        approver_lookup_ids = [value for value in (open_id, operator_user_id) if value]
         user_name = self._resolve_approval_operator_display_name(operator)
 
         try:
             from tools.permission_policy import get_user_role_by_id
 
-            role = get_user_role_by_id(open_id) if open_id else "member"
+            role = "member"
+            for lookup_id in approver_lookup_ids:
+                role = get_user_role_by_id(lookup_id)
+                if role != "member":
+                    break
         except Exception:
             logger.debug("[Feishu] Failed to resolve approval-click user role", exc_info=True)
             role = "member"
@@ -4688,9 +4707,11 @@ class FeishuAdapter(BasePlatformAdapter):
         open_id = getattr(sender_id, "open_id", None) or None
         user_id = getattr(sender_id, "user_id", None) or None
         union_id = getattr(sender_id, "union_id", None) or None
-        # Preserve the local invariant: the app-scoped open_id is the primary
-        # Hermes identity for Feishu events; union_id remains the stable alt key.
-        primary_id = open_id or user_id
+        # For normal inbound events, preserve the local invariant: the
+        # app-scoped open_id is the primary Hermes identity.  For bot profile
+        # resolution, keep tenant user_id primary when Feishu provides it while
+        # still using open_id for the bot-name API below.
+        primary_id = (user_id or open_id) if is_bot else (open_id or user_id)
         # bot/v3/bots/basic_batch only accepts open_id.
         name_lookup_id = open_id if is_bot else (primary_id or union_id)
         display_name = await self._resolve_sender_name_from_api(
