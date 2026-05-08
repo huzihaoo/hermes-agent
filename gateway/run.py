@@ -30,6 +30,7 @@ from collections import OrderedDict
 from contextvars import copy_context
 from difflib import SequenceMatcher
 from pathlib import Path
+from urllib.parse import quote as _quote
 from datetime import datetime
 from typing import Dict, Optional, Any, List
 
@@ -83,6 +84,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write, atomic_yaml_write, is_truthy_value
 from agent.memory_manager import sanitize_context
+from agent.i18n import t
 try:
     from agent.account_usage import fetch_account_usage, render_account_usage_lines
 except Exception:  # pragma: no cover - optional diagnostics should not break gateway import

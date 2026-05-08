@@ -96,6 +96,7 @@ from hermes_cli.timeouts import (
     get_provider_request_timeout,
     get_provider_stale_timeout,
 )
+from agent.prompt_builder import DEVELOPER_ROLE_MODELS
 
 _hermes_home = get_hermes_home()
 _project_env = Path(__file__).parent / '.env'
@@ -149,6 +150,9 @@ from agent.model_metadata import (
 from agent.context_compressor import ContextCompressor
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
+from agent.anthropic_adapter import _is_third_party_anthropic_endpoint
+from agent.rate_limit_tracker import RateLimitState
+from agent.session_health import SessionHealthMonitor
 from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.codex_responses_adapter import (
@@ -3193,6 +3197,34 @@ class AIAgent:
         if est_tokens > 50_000:
             return max(stale_base, 450.0)
         return stale_base
+
+    def _is_remote_longrun_endpoint(self) -> bool:
+        """Return True for remote OpenAI-wire endpoints that need longer stream read timeouts.
+
+        Local endpoints are handled separately by ``is_local_endpoint``.  This
+        helper covers remote aggregators/custom gateways where large-context
+        reasoning models can legitimately wait several minutes before the first
+        SSE chunk.
+        """
+        base_url = getattr(self, "_base_url_lower", "") or str(self.base_url or "").lower()
+        if not base_url or is_local_endpoint(base_url):
+            return False
+
+        provider = (self.provider or "").strip().lower()
+        if provider.startswith("custom"):
+            return True
+
+        return (
+            base_url_host_matches(base_url, "openrouter.ai")
+            or base_url_host_matches(base_url, "api.githubcopilot.com")
+            or base_url_host_matches(base_url, "models.github.ai")
+            or base_url_host_matches(base_url, "api.kimi.com")
+            or base_url_host_matches(base_url, "moonshot.ai")
+            or base_url_host_matches(base_url, "moonshot.cn")
+            or base_url_host_matches(base_url, "nousresearch.com")
+            or base_url_host_matches(base_url, "inference-api.nousresearch.com")
+            or base_url_host_matches(base_url, "sub2api.minieye.tech")
+        )
 
     def _is_openrouter_url(self) -> bool:
         """Return True when the base URL targets OpenRouter."""
@@ -9229,7 +9261,7 @@ class AIAgent:
             if ephemeral_out is not None:
                 self._ephemeral_max_output_tokens = None  # consume immediately
             anthropic_base_url = getattr(self, "_anthropic_base_url", None)
-            return _transport.build_kwargs(
+            kwargs = _transport.build_kwargs(
                 model=self.model,
                 messages=anthropic_messages,
                 tools=self.tools,
@@ -15329,6 +15361,14 @@ class AIAgent:
                         # Inspired by clawdbot's "incomplete-text" recovery.
                         # Also covers Qwen3/Ollama in-content <think> blocks
                         # (detected above as _has_inline_thinking).
+                        _has_inline_thinking = bool(
+                            isinstance(final_response, str)
+                            and re.search(
+                                r"<(?:think|thinking|reasoning)>",
+                                final_response,
+                                flags=re.IGNORECASE,
+                            )
+                        )
                         _has_structured = bool(
                             getattr(assistant_message, "reasoning", None)
                             or getattr(assistant_message, "reasoning_content", None)
