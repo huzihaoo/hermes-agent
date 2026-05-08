@@ -15,12 +15,14 @@ import uuid
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+from typing import TYPE_CHECKING
 
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, SendResult
 from gateway.session import SessionEntry, SessionSource, build_session_key
+from gateway.run import GatewayRunner
 
 E2E_MESSAGE_SETTLE_DELAY = 0.3
 

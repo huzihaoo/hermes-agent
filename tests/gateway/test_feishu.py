@@ -9,7 +9,9 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, Mock, patch
+from gateway.platforms.feishu import FeishuAdapter
 
 try:
     import lark_oapi
