@@ -8904,8 +8904,8 @@ class GatewayRunner:
                 aux_error = getattr(compressor, "_last_aux_model_failure_error", None)
                 if aux_model:
                     lines.append(
-                        f"ℹ️ Configured compression model '{aux_model}' failed "
-                        f"({aux_error or 'unknown error'}). Recovered using main model."
+                        f"ℹ️ auxiliary.compression.model '{aux_model}' failed "
+                        f"({aux_error or 'unknown error'}). Recovered using main model; context is intact."
                     )
             return "\n".join(lines)
         except Exception as e:
