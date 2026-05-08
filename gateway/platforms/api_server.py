@@ -516,6 +516,9 @@ class APIServerAdapter(BasePlatformAdapter):
         self._response_store = ResponseStore()
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
+        self._run_statuses: Dict[str, Dict[str, Any]] = {}
+        self._active_run_agents: Dict[str, Any] = {}
+        self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
         # Creation timestamps for orphaned-run TTL sweep
         self._run_streams_created: Dict[str, float] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
@@ -2489,25 +2492,6 @@ class APIServerAdapter(BasePlatformAdapter):
 
         run_id = f"run_{uuid.uuid4().hex}"
         loop = asyncio.get_running_loop()
-        q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
-        self._run_streams[run_id] = q
-        self._run_streams_created[run_id] = time.time()
-
-        event_cb = self._make_run_event_callback(run_id, loop)
-
-        # Also wire stream_delta_callback so message.delta events flow through
-        def _text_cb(delta: Optional[str]) -> None:
-            if delta is None:
-                return
-            try:
-                loop.call_soon_threadsafe(q.put_nowait, {
-                    "event": "message.delta",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "delta": delta,
-                })
-            except Exception:
-                pass
 
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
@@ -2558,8 +2542,35 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
+        q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
+        self._run_streams[run_id] = q
+        self._run_streams_created[run_id] = time.time()
+        event_cb = self._make_run_event_callback(run_id, loop)
+
+        # Also wire stream_delta_callback so message.delta events flow through
+        def _text_cb(delta: Optional[str]) -> None:
+            if delta is None:
+                return
+            try:
+                loop.call_soon_threadsafe(q.put_nowait, {
+                    "event": "message.delta",
+                    "run_id": run_id,
+                    "timestamp": time.time(),
+                    "delta": delta,
+                })
+            except Exception:
+                pass
+
         session_id = body.get("session_id") or stored_session_id or run_id
         ephemeral_system_prompt = instructions
+        self._run_statuses[run_id] = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "queued",
+            "session_id": session_id,
+            "created_at": self._run_streams_created[run_id],
+            "last_event": "run.created",
+        }
 
         async def _run_and_close():
             try:
@@ -2571,11 +2582,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
                 )
+                self._active_run_agents[run_id] = agent
+                self._run_statuses[run_id].update({"status": "running", "last_event": "run.running"})
                 def _run_sync():
                     r = agent.run_conversation(
                         user_message=user_message,
                         conversation_history=conversation_history,
-                        task_id="default",
+                        task_id=session_id,
                     )
                     u = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
@@ -2586,6 +2599,13 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+                self._run_statuses[run_id].update({
+                    "status": "cancelled" if self._run_statuses.get(run_id, {}).get("status") == "stopping" else "completed",
+                    "last_event": "run.completed",
+                    "output": final_response,
+                    "usage": usage,
+                    "session_id": session_id,
+                })
                 q.put_nowait({
                     "event": "run.completed",
                     "run_id": run_id,
@@ -2595,6 +2615,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
             except Exception as exc:
                 logger.exception("[api_server] run %s failed", run_id)
+                self._run_statuses[run_id].update({
+                    "status": "failed",
+                    "last_event": "run.failed",
+                    "error": str(exc),
+                    "session_id": session_id,
+                })
                 try:
                     q.put_nowait({
                         "event": "run.failed",
@@ -2605,6 +2631,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
             finally:
+                self._active_run_agents.pop(run_id, None)
+                self._active_run_tasks.pop(run_id, None)
                 # Sentinel: signal SSE stream to close
                 try:
                     q.put_nowait(None)
@@ -2612,6 +2640,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     pass
 
         task = asyncio.create_task(_run_and_close())
+        self._active_run_tasks[run_id] = task
         try:
             self._background_tasks.add(task)
         except TypeError:
@@ -2620,6 +2649,49 @@ class APIServerAdapter(BasePlatformAdapter):
             task.add_done_callback(self._background_tasks.discard)
 
         return web.json_response({"run_id": run_id, "status": "started"}, status=202)
+
+    async def _handle_get_run(self, request: "web.Request") -> "web.Response":
+        """GET /v1/runs/{run_id} — return current structured run status."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        run_id = request.match_info["run_id"]
+        status = self._run_statuses.get(run_id)
+        if status is None:
+            return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
+        return web.json_response(dict(status))
+
+    async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
+        """POST /v1/runs/{run_id}/stop — request interruption of an active run."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        run_id = request.match_info["run_id"]
+        agent = self._active_run_agents.get(run_id)
+        if agent is None:
+            return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
+        try:
+            if hasattr(agent, "interrupt"):
+                agent.interrupt("Stop requested via API")
+        except Exception:
+            logger.debug("[api_server] run %s interrupt failed", run_id, exc_info=True)
+        self._run_statuses.setdefault(run_id, {"object": "hermes.run", "run_id": run_id}).update({
+            "status": "stopping",
+            "last_event": "run.stopping",
+        })
+        q = self._run_streams.get(run_id)
+        if q is not None:
+            try:
+                q.put_nowait({
+                    "event": "run.failed",
+                    "run_id": run_id,
+                    "timestamp": time.time(),
+                    "error": "Run stopped by API",
+                })
+                q.put_nowait(None)
+            except Exception:
+                pass
+        return web.json_response({"run_id": run_id, "status": "stopping"})
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
         """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events."""
@@ -2719,7 +2791,9 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
+            self._app.router.add_get("/v1/runs/{run_id}", self._handle_get_run)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
+            self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:

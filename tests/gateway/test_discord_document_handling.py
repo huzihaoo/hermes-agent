@@ -7,6 +7,7 @@ to download, cache, and optionally inject text from non-image/audio files.
 
 import os
 import sys
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Optional
@@ -150,7 +151,17 @@ def _mock_aiohttp_download(raw_bytes: bytes):
     session.__aenter__ = AsyncMock(return_value=session)
     session.__aexit__ = AsyncMock(return_value=False)
 
-    return patch("aiohttp.ClientSession", return_value=session)
+    class _CombinedPatch:
+        def __enter__(self):
+            self._stack = ExitStack()
+            self._stack.enter_context(patch("gateway.platforms.discord.is_safe_url", return_value=True))
+            self._stack.enter_context(patch("aiohttp.ClientSession", return_value=session))
+            return session
+
+        def __exit__(self, exc_type, exc, tb):
+            return self._stack.__exit__(exc_type, exc, tb)
+
+    return _CombinedPatch()
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +361,7 @@ class TestIncomingDocumentHandling:
 
             return FakeSession()
 
-        with patch("aiohttp.ClientSession", return_value=make_session([content1, content2])):
+        with patch("gateway.platforms.discord.is_safe_url", return_value=True), patch("aiohttp.ClientSession", return_value=make_session([content1, content2])):
             msg = make_message(
                 attachments=[
                     make_attachment(filename="file1.txt", content_type="text/plain"),
