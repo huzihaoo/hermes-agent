@@ -109,3 +109,72 @@ def test_smoke_assertions_fail_when_fast_feedback_is_public():
     errors = smoke._assert_smoke(result)
 
     assert any("exactly one heavy public feedback" in error for error in errors)
+
+release_script_path = repo_root / "scripts" / "hermes_release_smoke.py"
+release_spec = importlib.util.spec_from_file_location("hermes_release_smoke", str(release_script_path))
+release_smoke = importlib.util.module_from_spec(release_spec)
+assert release_spec.loader is not None
+release_spec.loader.exec_module(release_smoke)
+
+
+def test_release_smoke_assertions_accept_healthy_host_result():
+    result = {
+        "config": {"agent_max_turns": 3000, "terminal_cwd": "/work"},
+        "env": {"deprecated_keys_present": []},
+        "health": {
+            "status": "ok",
+            "gateway_state": "running",
+            "platforms": {
+                "feishu": {"state": "connected"},
+                "api_server": {"state": "connected"},
+            },
+        },
+        "cli": {"ok": True},
+        "launchd": {
+            "exists": True,
+            "program_arguments": ["python", "-m", "hermes_cli.main", "gateway", "run"],
+            "working_directory": "/repo",
+            "virtual_env": "/repo/.venv",
+        },
+        "logs": {"high_signal_tail": []},
+        "sync_script": {"writes_deprecated_messaging_cwd": False},
+        "vm": {"skipped": True},
+        "thresholds": {"recommended_turn_budget": 2500},
+    }
+
+    assert release_smoke.assert_smoke(result, require_runtime=True, require_vm=False) == []
+
+
+def test_release_smoke_assertions_fail_on_rebase_regression_signals():
+    result = {
+        "config": {"agent_max_turns": 900, "terminal_cwd": ""},
+        "env": {"deprecated_keys_present": ["MESSAGING_CWD"]},
+        "health": {
+            "status": "ok",
+            "gateway_state": "running",
+            "platforms": {
+                "feishu": {"state": "disconnected"},
+                "api_server": {"state": "connected"},
+            },
+        },
+        "cli": {"ok": False},
+        "launchd": {
+            "exists": True,
+            "program_arguments": ["python", "old.py"],
+            "working_directory": "/repo",
+            "virtual_env": "/other/.venv",
+        },
+        "logs": {"high_signal_tail": ["NameError: name 'DEVELOPER_ROLE_MODELS' is not defined"]},
+        "sync_script": {"writes_deprecated_messaging_cwd": True},
+        "vm": {"ok": False},
+        "thresholds": {"recommended_turn_budget": 2500},
+    }
+
+    errors = release_smoke.assert_smoke(result, require_runtime=True, require_vm=True)
+
+    assert any("max_turns below" in error for error in errors)
+    assert any("deprecated env keys" in error for error in errors)
+    assert any("sync script still writes" in error for error in errors)
+    assert any("feishu not connected" in error for error in errors)
+    assert any("gateway.error.log contains high-signal" in error for error in errors)
+    assert any("ssh-mini-agent doctor failed" in error for error in errors)
