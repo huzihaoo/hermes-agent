@@ -3361,6 +3361,12 @@ class AIAgent:
         # completions endpoint; its /v1/responses endpoint returns 404.
         if normalized_provider == "nous":
             return False
+        # Named custom OpenAI-wire gateways declare their supported transport
+        # in config.yaml.  Do not infer Responses API solely from a GPT-5.x
+        # model name; gateways such as sub2api serve GPT-5.x through
+        # /chat/completions and return upstream 5xx on /responses.
+        if normalized_provider.startswith("custom"):
+            return False
         if normalized_provider == "copilot":
             try:
                 from hermes_cli.models import _should_use_copilot_responses_api
@@ -8525,8 +8531,8 @@ class AIAgent:
                 provider=fb_provider,
             ):
                 # GPT-5.x models usually need Responses API, but keep
-                # provider-specific exceptions like Copilot gpt-5-mini on
-                # chat completions.
+                # provider-specific exceptions like Copilot gpt-5-mini and
+                # named custom OpenAI-wire gateways on chat completions.
                 fb_api_mode = "codex_responses"
             elif fb_provider == "bedrock" or (
                 base_url_hostname(fb_base_url).startswith("bedrock-runtime.")
@@ -10993,6 +10999,7 @@ class AIAgent:
                 if block_result is None
             ]
             futures = []
+            future_to_parsed_index = {}
             if runnable_calls:
                 max_workers = min(len(runnable_calls), _MAX_TOOL_WORKERS)
                 with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -11001,6 +11008,7 @@ class AIAgent:
                         ctx = contextvars.copy_context()
                         f = executor.submit(ctx.run, _run_tool, i, tc, name, args)
                         futures.append(f)
+                        future_to_parsed_index[f] = i
 
                     # Wait for all to complete with periodic heartbeats so the
                     # gateway's inactivity monitor doesn't kill us during long
@@ -11040,9 +11048,9 @@ class AIAgent:
                         # Heartbeat every ~30s (6 × 5s poll intervals)
                         if _conc_elapsed > 0 and _conc_elapsed % 30 < 6:
                             _still_running = [
-                                parsed_calls[futures.index(f)][1]
+                                parsed_calls[future_to_parsed_index[f]][1]
                                 for f in not_done
-                                if f in futures
+                                if f in future_to_parsed_index
                             ]
                             self._touch_activity(
                                 f"concurrent tools running ({_conc_elapsed}s, "
@@ -11149,7 +11157,7 @@ class AIAgent:
         if num_tools > 0:
             turn_tool_msgs = messages[-num_tools:]
             enforce_turn_budget(turn_tool_msgs, env=get_active_env(effective_task_id))
-            for (tc, name, args), msg in zip(parsed_calls, turn_tool_msgs):
+            for (tc, name, args, _block_result, _blocked_by_guardrail), msg in zip(parsed_calls, turn_tool_msgs):
                 self._update_long_task_state_sidecar(
                     effective_task_id,
                     tool_name=name,

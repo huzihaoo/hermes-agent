@@ -20,6 +20,7 @@ from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
+from gateway.feishu_reply import sanitize_feishu_internal_error
 
 logger = logging.getLogger(__name__)
 
@@ -3109,12 +3110,25 @@ class BasePlatformAdapter(ABC):
                 error_type = type(e).__name__
                 error_detail = str(e)[:300] if str(e) else "no details available"
                 _thread_metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+                progress_mode = "human"
+                try:
+                    from gateway.display_config import resolve_display_setting
+                    from gateway.run import _load_gateway_config, _platform_config_key
+                    progress_mode = resolve_display_setting(
+                        _load_gateway_config(),
+                        _platform_config_key(event.source.platform),
+                        "tool_progress",
+                        "human",
+                    )
+                except Exception:
+                    pass
                 await self.send(
                     chat_id=event.source.chat_id,
-                    content=(
-                        f"Sorry, I encountered an error ({error_type}).\n"
-                        f"{error_detail}\n"
-                        "Try again or use /reset to start a fresh session."
+                    content=sanitize_feishu_internal_error(
+                        event.source.platform,
+                        progress_mode,
+                        error_type,
+                        error_detail,
                     ),
                     metadata=_thread_metadata,
                 )

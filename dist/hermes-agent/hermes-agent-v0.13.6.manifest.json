@@ -1,0 +1,28 @@
+{
+  "name": "pnc-agent-hermes-agent-overlay",
+  "version": "0.13.6",
+  "tag": "pnc-agent-v0.13.6-overlay.20260509",
+  "base_commit_before_release": "a699c0d062ec111670f706268a86868169cb45c1",
+  "branch": "sync/upstream-v0.13-overlay-20260508",
+  "built_at": "2026-05-09T09:57:26.718181+08:00",
+  "artifact": "dist/hermes-agent/hermes-agent-v0.13.6.tar.gz",
+  "sha256": "f0beda4730fcfcd4ec8bbeca2c91d484c7c9ccdd992b751812ed27827dbfa670",
+  "included_paths": [
+    "gateway/feishu_reply.py",
+    "gateway/platforms/base.py",
+    "gateway/platforms/feishu.py",
+    "gateway/run.py",
+    "gateway/stream_consumer.py",
+    "hermes_cli/__init__.py",
+    "hermes_cli/runtime_provider.py",
+    "pyproject.toml",
+    "run_agent.py",
+    "scripts/hermes_release_smoke.py",
+    "tests/gateway/test_feishu.py",
+    "tests/gateway/test_stream_consumer_fresh_final.py",
+    "tests/gateway/test_tool_progress_humanization.py",
+    "tests/test_feishu_admission_smoke_script.py"
+  ],
+  "artifact_policy": "source-delta tarball for Feishu reply sanitization, provider fallback, release smoke, and version bump patch release; live worktree remains LaunchAgent runtime source",
+  "admission_version": "1.11.2"
+}

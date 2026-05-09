@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+from gateway.feishu_reply import _FEISHU_MODEL_FAILURE_TEXT
 
 
 def _make_adapter(*, supports_delete: bool = True) -> MagicMock:
@@ -171,6 +172,83 @@ class TestFreshFinalForLongLivedPreviews:
         assert consumer._message_created_ts is None
         # Even with finalize=True, no fresh send — the sentinel gates it.
         assert consumer._should_send_fresh_final() is False
+
+
+class TestFeishuVisibleTextSanitizerBoundary:
+    def _consumer(self, adapter: MagicMock | None = None) -> GatewayStreamConsumer:
+        return GatewayStreamConsumer(
+            adapter=adapter or _make_adapter(),
+            chat_id="chat",
+            config=StreamConsumerConfig(
+                visible_text_sanitizer=lambda text: (
+                    _FEISHU_MODEL_FAILURE_TEXT
+                    if (
+                        "provider overloaded" in text
+                        or "Proxy error" in text
+                        or "HTTP 502" in text
+                    )
+                    else text
+                ),
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_first_stream_chunk_is_sanitized_before_send(self):
+        adapter = _make_adapter()
+        consumer = self._consumer(adapter)
+        await consumer._send_or_edit(
+            'assistant to=functions.browser_snapshot {"full": true}\nHTTP 502: provider overloaded'
+        )
+        adapter.send.assert_awaited_once()
+        assert adapter.send.await_args.kwargs["content"] == _FEISHU_MODEL_FAILURE_TEXT
+
+    @pytest.mark.asyncio
+    async def test_overflow_new_chunk_is_sanitized_before_send(self):
+        adapter = _make_adapter()
+        consumer = self._consumer(adapter)
+        await consumer._send_new_chunk("⚠️ Proxy error (502): provider overloaded", None)
+        adapter.send.assert_awaited_once()
+        assert adapter.send.await_args.kwargs["content"] == _FEISHU_MODEL_FAILURE_TEXT
+
+    @pytest.mark.asyncio
+    async def test_fallback_final_chunk_is_sanitized_before_send(self):
+        adapter = _make_adapter()
+        consumer = self._consumer(adapter)
+        consumer._message_id = "msg_1"
+        consumer._last_sent_text = "partial"
+        consumer._fallback_prefix = "partial"
+        await consumer._send_fallback_final(
+            "partial\nassistant to=functions.terminal {}\nHTTP 502: provider overloaded"
+        )
+        adapter.send.assert_awaited_once()
+        assert adapter.send.await_args.kwargs["content"] == _FEISHU_MODEL_FAILURE_TEXT
+
+    @pytest.mark.asyncio
+    async def test_segment_tail_flush_is_sanitized_before_send(self):
+        adapter = _make_adapter()
+        consumer = self._consumer(adapter)
+        consumer._message_id = "msg_1"
+        consumer._accumulated = "assistant to=functions.browser_click {}\nHTTP 502: provider overloaded"
+        await consumer._flush_segment_tail_on_edit_failure()
+        adapter.send.assert_awaited_once()
+        assert adapter.send.await_args.kwargs["content"] == _FEISHU_MODEL_FAILURE_TEXT
+
+    @pytest.mark.asyncio
+    async def test_commentary_boundary_is_sanitized_before_send(self):
+        adapter = _make_adapter()
+        consumer = self._consumer(adapter)
+        await consumer._send_commentary("tool_call: {}\nHTTP 502: provider overloaded")
+        adapter.send.assert_awaited_once()
+        assert adapter.send.await_args.kwargs["content"] == _FEISHU_MODEL_FAILURE_TEXT
+
+    @pytest.mark.asyncio
+    async def test_normal_streaming_prose_is_preserved(self):
+        adapter = _make_adapter()
+        consumer = self._consumer(adapter)
+        prose = "这次不是工具没跑，我会把 tool call 的展示压成人能看懂的状态。"
+        await consumer._send_or_edit(prose)
+        adapter.send.assert_awaited_once()
+        assert adapter.send.await_args.kwargs["content"] == prose
 
 
 class TestStreamConsumerConfigFreshFinalField:

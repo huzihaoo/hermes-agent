@@ -3807,6 +3807,39 @@ class TestFeishuApprovalCards(unittest.TestCase):
         self.assertNotIn("审批人：** 审批人", card_json)
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_permission_grant_resolution_recovers_legacy_state_identity(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._approval_state = {
+            15: {
+                "session_key": "permission_grant:ou_legacy:om_request",
+                "approval_kind": "permission_grant",
+                "requested_role": "admin",
+                "description": "我是陈德荣，帮忙开通一下管理员权限",
+            }
+        }
+        adapter._notify_permission_request_result = AsyncMock(return_value=False)
+        adapter._broadcast_permission_request_result = AsyncMock(return_value=False)
+        adapter._emit_permission_audit_event = Mock()
+
+        with (
+            patch("gateway.pairing.PairingStore.approve_user") as approve_user,
+            patch("tools.permission_policy.set_user_role") as set_user_role,
+            patch("tools.permission_policy.map_user_id") as map_user_id,
+        ):
+            asyncio.run(adapter._resolve_approval(15, "grant_permission", "胡子豪"))
+
+        set_user_role.assert_called_once_with("陈德荣", "admin")
+        map_user_id.assert_called_once_with("陈德荣", "ou_legacy")
+        approve_user.assert_called_once_with("feishu", "ou_legacy", "陈德荣")
+        emitted_state = adapter._emit_permission_audit_event.call_args.kwargs["state"]
+        self.assertEqual(emitted_state["target_user_id"], "ou_legacy")
+        self.assertEqual(emitted_state["target_user_name"], "陈德荣")
+
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_exec_approval_resolved_card_never_uses_open_id_as_approver_name(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter

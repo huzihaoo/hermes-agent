@@ -21,7 +21,7 @@ import queue
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger("gateway.stream_consumer")
 
@@ -52,6 +52,10 @@ class StreamConsumerConfig:
     # openclaw/openclaw#72038.  Default 0 = always edit in place (legacy
     # behavior).  The gateway enables this selectively per-platform.
     fresh_final_after_seconds: float = 0.0
+    # Optional final user-visible sanitizer.  Gateway passes this for Feishu
+    # human-mode delivery so streaming edits, overflow chunks, segment-tail
+    # flushes, and fresh/fallback finals all share the same reply boundary.
+    visible_text_sanitizer: Optional[Callable[[str], str]] = None
 
 
 class GatewayStreamConsumer:
@@ -174,6 +178,25 @@ class GatewayStreamConsumer:
         self._last_sent_text = ""
         self._fallback_final_send = False
         self._fallback_prefix = ""
+
+    def _sanitize_visible_text(self, text: str) -> str:
+        sanitizer = getattr(self.cfg, "visible_text_sanitizer", None)
+        if sanitizer is None:
+            return text
+        try:
+            return str(sanitizer(text) or "")
+        except Exception:
+            logger.debug("visible text sanitizer error", exc_info=True)
+            return text
+
+    def _sanitize_preserving_cursor(self, text: str) -> str:
+        cursor = self.cfg.cursor or ""
+        has_cursor = bool(cursor and text.endswith(cursor))
+        body = text[:-len(cursor)] if has_cursor else text
+        sanitized = self._sanitize_visible_text(body)
+        if has_cursor and sanitized.strip():
+            return sanitized + cursor
+        return sanitized
 
     def on_delta(self, text: str) -> None:
         """Thread-safe callback — called from the agent's worker thread.
@@ -533,7 +556,7 @@ class GatewayStreamConsumer:
 
         Returns the message_id so callers can thread subsequent chunks.
         """
-        text = self._clean_for_display(text)
+        text = self._sanitize_visible_text(self._clean_for_display(text))
         if not text.strip():
             return reply_to_id
         try:
@@ -595,8 +618,8 @@ class GatewayStreamConsumer:
 
         Retries each chunk once on flood-control failures with a short delay.
         """
-        final_text = self._clean_for_display(text)
-        continuation = self._continuation_text(final_text)
+        final_text = self._sanitize_visible_text(self._clean_for_display(text))
+        continuation = self._sanitize_visible_text(self._continuation_text(final_text))
         self._fallback_final_send = False
         if not continuation.strip():
             # Nothing new to send — the visible partial already matches final text.
@@ -644,6 +667,9 @@ class GatewayStreamConsumer:
         last_successful_chunk = ""
         sent_any_chunk = False
         for chunk in chunks:
+            chunk = self._sanitize_visible_text(chunk)
+            if not chunk.strip():
+                continue
             # Try sending with one retry on flood-control errors.
             result = None
             for attempt in range(2):
@@ -718,7 +744,7 @@ class GatewayStreamConsumer:
         tail = self._accumulated
         if visible and tail.startswith(visible):
             tail = tail[len(visible):].lstrip()
-        tail = self._clean_for_display(tail)
+        tail = self._sanitize_visible_text(self._clean_for_display(tail))
         if not tail.strip():
             return
         try:
@@ -755,7 +781,7 @@ class GatewayStreamConsumer:
 
     async def _send_commentary(self, text: str) -> bool:
         """Send a completed interim assistant commentary message."""
-        text = self._clean_for_display(text)
+        text = self._sanitize_visible_text(self._clean_for_display(text))
         if not text.strip():
             return False
         try:
@@ -809,6 +835,9 @@ class GatewayStreamConsumer:
 
         Ported from openclaw/openclaw#72038.
         """
+        text = self._sanitize_visible_text(self._clean_for_display(text))
+        if not text.strip():
+            return False
         old_message_id = self._message_id
         try:
             result = await self.adapter.send(
@@ -867,7 +896,7 @@ class GatewayStreamConsumer:
         # Strip MEDIA: directives so they don't appear as visible text.
         # Media files are delivered as native attachments after the stream
         # finishes (via _deliver_media_from_response in gateway/run.py).
-        text = self._clean_for_display(text)
+        text = self._sanitize_preserving_cursor(self._clean_for_display(text))
         # A bare streaming cursor is not meaningful user-visible content and
         # can render as a stray tofu/white-box message on some clients.
         visible_without_cursor = text

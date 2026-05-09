@@ -3077,6 +3077,20 @@ class FeishuAdapter(BasePlatformAdapter):
                 target_user_name = str(state.get("target_user_name") or "").strip()
                 requested_role = str(state.get("requested_role") or "member").strip().lower() or "member"
 
+                if not target_user_id:
+                    session_key_parts = str(state.get("session_key") or "").split(":")
+                    if len(session_key_parts) >= 3 and session_key_parts[0] == "permission_grant":
+                        target_user_id = session_key_parts[1].strip()
+                        if target_user_id:
+                            state["target_user_id"] = target_user_id
+                if not target_user_name:
+                    request_hint = str(state.get("request_text") or state.get("description") or "")
+                    name_match = re.search(r"(?:我是|我叫|叫我)\s*([^，,。\s]{1,20})", request_hint)
+                    if name_match:
+                        target_user_name = name_match.group(1).strip()
+                        if target_user_name:
+                            state["target_user_name"] = target_user_name
+
                 if not target_user_id or not target_user_name:
                     raise ValueError("missing target user identity for permission grant")
 

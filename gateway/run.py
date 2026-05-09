@@ -485,6 +485,13 @@ def _expand_whatsapp_auth_aliases(identifier: str) -> set:
 
 logger = logging.getLogger(__name__)
 
+from gateway.feishu_reply import (
+    format_feishu_lifecycle_status,
+    sanitize_feishu_final_response,
+    sanitize_feishu_internal_error,
+    sanitize_feishu_visible_text,
+)
+
 
 def format_tool_progress_message(
     platform: Platform | None,
@@ -6873,11 +6880,12 @@ class GatewayRunner:
                     )
                 elif status_code == 400:
                     status_hint = " The request was rejected by the API."
-            return (
-                f"Sorry, I encountered an error ({error_type}).\n"
-                f"{error_detail}\n"
-                f"{status_hint}"
-                "Try again or use /reset to start a fresh session."
+            return sanitize_feishu_internal_error(
+                source.platform,
+                progress_mode,
+                error_type,
+                error_detail,
+                status_hint=status_hint,
             )
         finally:
             # Restore session context variables to their pre-handler state
@@ -12323,6 +12331,13 @@ class GatewayRunner:
                         edit_interval=_scfg.edit_interval,
                         buffer_threshold=_scfg.buffer_threshold,
                         cursor=_effective_cursor,
+                        visible_text_sanitizer=lambda text: sanitize_feishu_visible_text(
+                            source.platform,
+                            resolve_display_setting(user_config, platform_key, "tool_progress")
+                            or os.getenv("HERMES_TOOL_PROGRESS_MODE")
+                            or "all",
+                            text,
+                        ),
                     )
                     _stream_consumer = GatewayStreamConsumer(
                         adapter=_adapter,
@@ -12364,8 +12379,16 @@ class GatewayRunner:
                             "Proxy error (%d) from %s: %s",
                             resp.status, proxy_url, error_text[:500],
                         )
+                        raw_proxy_error = f"⚠️ Proxy error ({resp.status}): {error_text[:300]}"
                         return {
-                            "final_response": f"⚠️ Proxy error ({resp.status}): {error_text[:300]}",
+                            "final_response": sanitize_feishu_visible_text(
+                                source.platform,
+                                resolve_display_setting(user_config, platform_key, "tool_progress")
+                                or os.getenv("HERMES_TOOL_PROGRESS_MODE")
+                                or "all",
+                                raw_proxy_error,
+                                failed=True,
+                            ),
                             "messages": [],
                             "api_calls": 0,
                             "tools": [],
@@ -12829,10 +12852,18 @@ class GatewayRunner:
             if not _status_adapter:
                 return
             try:
+                visible_message = format_feishu_lifecycle_status(
+                    source.platform,
+                    progress_mode,
+                    event_type,
+                    message,
+                )
+                if visible_message is None:
+                    return
                 _fut = asyncio.run_coroutine_threadsafe(
                     _status_adapter.send(
                         _status_chat_id,
-                        message,
+                        visible_message,
                         metadata=_status_thread_metadata,
                     ),
                     _loop_for_step,
@@ -12917,6 +12948,14 @@ class GatewayRunner:
                 from gateway.config import StreamingConfig
                 _scfg = StreamingConfig()
 
+            def _sanitize_visible_text_for_feishu(text: str, *, failed: bool = False) -> str:
+                return sanitize_feishu_visible_text(
+                    source.platform,
+                    progress_mode,
+                    text,
+                    failed=failed,
+                )
+
             # Per-platform streaming gate: display.platforms.<plat>.streaming
             # can disable streaming for specific platforms even when the global
             # streaming config is enabled.
@@ -12955,6 +12994,7 @@ class GatewayRunner:
                             edit_interval=_scfg.edit_interval,
                             buffer_threshold=_scfg.buffer_threshold,
                             cursor=_effective_cursor,
+                            visible_text_sanitizer=lambda text: _sanitize_visible_text_for_feishu(text),
                         )
                         _stream_consumer = GatewayStreamConsumer(
                             adapter=_adapter,
@@ -12969,13 +13009,14 @@ class GatewayRunner:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
 
             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
+                visible_text = _sanitize_visible_text_for_feishu(str(text or ""))
                 if _stream_consumer is not None:
                     if already_streamed:
                         _stream_consumer.on_segment_break()
-                    elif _is_current_run_generation():
-                        _stream_consumer.on_commentary(text)
+                    elif _is_current_run_generation() and visible_text.strip():
+                        _stream_consumer.on_commentary(visible_text)
                     return
-                if already_streamed or not _status_adapter or not str(text or "").strip():
+                if already_streamed or not _status_adapter or not visible_text.strip():
                     return
                 if not _is_current_run_generation():
                     return
@@ -12983,7 +13024,7 @@ class GatewayRunner:
                     asyncio.run_coroutine_threadsafe(
                         _status_adapter.send(
                             _status_chat_id,
-                            text,
+                            visible_text,
                             metadata=_status_thread_metadata,
                         ),
                         _loop_for_step,
@@ -13356,6 +13397,12 @@ class GatewayRunner:
             
             # Return final response, or a message if something went wrong
             final_response = result.get("final_response")
+            final_response = sanitize_feishu_final_response(
+                source.platform,
+                progress_mode,
+                final_response,
+                failed=bool(result.get("failed")),
+            )
 
             # Extract actual token counts from the agent instance used for this run
             _last_prompt_toks = 0
@@ -13370,6 +13417,12 @@ class GatewayRunner:
 
             if not final_response:
                 error_msg = f"⚠️ {result['error']}" if result.get("error") else "(No response generated)"
+                error_msg = sanitize_feishu_final_response(
+                    source.platform,
+                    progress_mode,
+                    error_msg,
+                    failed=bool(result.get("failed")),
+                )
                 return {
                     "final_response": error_msg,
                     "messages": result.get("messages", []),
