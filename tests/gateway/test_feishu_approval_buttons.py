@@ -350,6 +350,50 @@ class TestNonApprovalCardAction:
         assert "/card button" in event.text
 
 
+from tools.repo_acl_approval import RepoAclApprovalStore
+
+
+class TestRepoAclCardActionCallbackResponse:
+    def test_repo_acl_action_returns_non_applying_callback_card(self, _patch_callback_card_types, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_REPO_ACL_APPROVAL_DIR", str(tmp_path))
+        store = RepoAclApprovalStore(tmp_path)
+        request = store.create_request(
+            requester_display_name="陈玉",
+            requester_user_id="ou_chenyu",
+            repo="planning_algo/nop/planning",
+            requested_grant="read",
+            requested_action="read_file",
+            reason="查看模块接口",
+        )
+        adapter = _make_adapter()
+        adapter._loop = MagicMock()
+        adapter._loop.is_closed = MagicMock(return_value=False)
+        data = _make_card_action_data(
+            {
+                "hermes_action": "repo_acl_approve_read_30d",
+                "action": "approve_read_30d",
+                "request_id": request["request_id"],
+            },
+            open_id="ou_owner",
+        )
+        adapter._sender_name_cache["ou_owner"] = ("胡子豪", 9999999999)
+
+        with patch("asyncio.run_coroutine_threadsafe") as mock_submit:
+            response = adapter._on_card_action_trigger(data)
+
+        assert response is not None
+        assert response.card is not None
+        assert response.card.type == "raw"
+        body = json.dumps(response.card.data, ensure_ascii=False)
+        assert "Repo ACL 审批已记录" in body
+        assert "不会自动写入 live repo_acl" in body
+        assert request["request_id"] in body
+        mock_submit.assert_not_called()
+        saved = json.loads((tmp_path / "repo-acl-requests.json").read_text(encoding="utf-8"))
+        assert saved[request["request_id"]]["status"] == "approved_pending_apply"
+        assert saved[request["request_id"]]["resolution"]["auto_apply"] is False
+
+
 # ===========================================================================
 # _on_card_action_trigger — inline card response for approval actions
 # ===========================================================================

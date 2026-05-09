@@ -2789,6 +2789,9 @@ class FeishuAdapter(BasePlatformAdapter):
                 action_value = {}
         hermes_action = action_value.get("hermes_action") if isinstance(action_value, dict) else None
 
+        if hermes_action and str(hermes_action).startswith("repo_acl_"):
+            return self._handle_repo_acl_card_action(event=event, action_value=action_value)
+
         if hermes_action:
             return self._handle_approval_card_action(event=event, action_value=action_value, loop=loop)
 
@@ -2833,6 +2836,45 @@ class FeishuAdapter(BasePlatformAdapter):
             if name and not name.startswith(("ou_", "on_", "ou-", "on-")):
                 return name
         return "审批人"
+
+    def _handle_repo_acl_card_action(self, *, event: Any, action_value: Dict[str, Any]) -> Any:
+        """Record repo ACL approval-card clicks without granting repo access."""
+        request_id = str(action_value.get("request_id") or "").strip()
+        action = str(action_value.get("action") or "").strip()
+        if not request_id or not action:
+            logger.debug("[Feishu] Repo ACL card action missing request_id/action, ignoring")
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+        operator = getattr(event, "operator", None)
+        user_name = self._resolve_approval_operator_display_name(operator)
+        try:
+            from tools.repo_acl_approval import build_repo_acl_resolved_card, resolve_repo_acl_card_action
+
+            request = resolve_repo_acl_card_action(request_id, action, user_name)
+            response_card = build_repo_acl_resolved_card(request)
+        except Exception as exc:
+            logger.warning("[Feishu] Failed to resolve repo ACL card action %s/%s: %s", request_id, action, exc)
+            response_card = {
+                "config": {"wide_screen_mode": True},
+                "header": {
+                    "template": "red",
+                    "title": {"tag": "plain_text", "content": "Repo ACL 审批处理失败"},
+                },
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": "审批点击未能记录，请联系管理员检查本地 outbox / request store。",
+                    }
+                ],
+            }
+        if P2CardActionTriggerResponse is None:
+            return None
+        response = P2CardActionTriggerResponse()
+        if CallBackCard is not None:
+            card = CallBackCard()
+            card.type = "raw"
+            card.data = response_card
+            response.card = card
+        return response
 
     def _handle_approval_card_action(self, *, event: Any, action_value: Dict[str, Any], loop: Any) -> Any:
         """Schedule approval resolution and build the synchronous callback response."""
