@@ -1,0 +1,14 @@
+{
+  "name": "pnc-agent-hermes-agent-overlay",
+  "version": "0.13.7",
+  "tag": "pnc-agent-v0.13.7-overlay.20260510",
+  "branch": "sync/upstream-v0.13-overlay-20260508",
+  "base_commit_before_release": "8eef969ee7d9f89d019856c0ab7ee098feaaeb4b",
+  "built_at": "2026-05-10T14:21:45.451444+08:00",
+  "artifact": "dist/hermes-agent/hermes-agent-v0.13.7.tar.gz",
+  "sha256": "5018aecd479a31062b93845fa69c52c7c99c46ad46241e87608f4b0c305c0641",
+  "tracked_file_count": 3350,
+  "included_paths_policy": "git ls-files snapshot excluding dist artifacts and local venv/cache",
+  "release_scope": "repo ACL approval card dry-run closure plus local/Feishu/VM cutover proof for local-vm-dual-runtime-harness release",
+  "admission_version": "1.11.2"
+}
