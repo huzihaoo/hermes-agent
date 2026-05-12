@@ -223,8 +223,8 @@ TOOLSETS = {
         "includes": []
     },
     "pnc_agents": {
-        "description": "PNC/MCU domain agents on the mini VM: smoke-check user/worktree mapping, generate DBC outputs, and parse bus data",
-        "tools": ["pnc_agents_smoke", "generate_dbc", "parse_bus_data"],
+        "description": "PNC/MCU domain agents on the mini VM: smoke-check user/worktree mapping, generate DBC outputs, parse bus data, validate data validity, and convert MCAP for Foxglove",
+        "tools": ["pnc_agents_smoke", "generate_dbc", "parse_bus_data", "validate_data_validity", "open_foxglove"],
         "includes": []
     },
 
@@ -462,6 +462,7 @@ TOOLSETS = {
             "generate_dbc",
             "parse_bus_data",
             "validate_data_validity",
+            "open_foxglove",
             "vm_task_submit",
             "vm_task_status",
             "feishu_doc_read",

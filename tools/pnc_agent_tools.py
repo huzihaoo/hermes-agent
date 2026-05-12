@@ -43,6 +43,15 @@ D1Q9_CONTROL_UDP_PARSE_DEFAULTS = {
     "platform": "mcu",
     "profile": "control-udp-bin-to-asc",
 }
+OPEN_FOXGLOVE_DEFAULTS = {
+    "platform": "soc",
+    "profile": "one-click-convert",
+}
+OPEN_FOXGLOVE_PROJECT_ALIASES = {
+    "d4q": "d4q",
+    "d2l3": "d2l3",
+    "g1q3": "g1q3",
+}
 LOCAL_WRAPPER = os.getenv("SSH_MINI_AGENT_BIN", "ssh-mini-agent")
 DEFAULT_TIMEOUT_SECONDS = 300
 MAX_TIMEOUT_SECONDS = 1800
@@ -313,6 +322,11 @@ def _looks_like_d1q9_control_udp_input(value: Any) -> bool:
     return "d1q9" in text and ("control_udp" in text or "control-udp" in text or "control udp" in text or "control" in text)
 
 
+def _normalise_open_foxglove_project(value: Any) -> str:
+    project = str(value or "").strip().lower()
+    return OPEN_FOXGLOVE_PROJECT_ALIASES.get(project, project)
+
+
 def _effective_pnc_args(agent_name: str, args: dict[str, Any]) -> dict[str, Any]:
     effective_args = dict(args)
     if agent_name == "generate-dbc":
@@ -336,6 +350,15 @@ def _effective_pnc_args(agent_name: str, args: dict[str, Any]) -> dict[str, Any]
         effective_args.setdefault("project", "d4q")
         effective_args.setdefault("platform", "soc")
         effective_args.setdefault("profile", "soc-simple")
+    elif agent_name == "open-foxglove":
+        # open-foxglove is the pnc_specs Foxglove MCAP conversion entrypoint.
+        # It accepts D4Q/D2L3/G1Q3 project packs and always uses AI Native
+        # platform=soc with the one-click-convert profile unless explicitly
+        # overridden by the caller.
+        if effective_args.get("project"):
+            effective_args["project"] = _normalise_open_foxglove_project(effective_args.get("project"))
+        effective_args.setdefault("platform", OPEN_FOXGLOVE_DEFAULTS["platform"])
+        effective_args.setdefault("profile", OPEN_FOXGLOVE_DEFAULTS["profile"])
     return effective_args
 
 
@@ -352,6 +375,8 @@ def _pnc_command_args(agent_name: str, args: dict[str, Any]) -> list[str]:
 def _pnc_invocation(agent_name: str, args: dict[str, Any]) -> list[str]:
     if agent_name == "validate-data-validity":
         return ["python3", "src/tools/validate-data-validity/cli.py", *_pnc_command_args(agent_name, args)]
+    if agent_name == "open-foxglove":
+        return ["./open-foxglove", *_pnc_command_args(agent_name, args)]
     return [f"./{agent_name}", *_pnc_command_args(agent_name, args)]
 
 
@@ -370,7 +395,12 @@ def _build_pnc_task_goal(agent_name: str, args: dict[str, Any], user: str, user_
         f"/tmp/pnc-{title_slug}/"
     )
     cli_args = " ".join(shlex.quote(part) for part in _pnc_invocation(agent_name, args))
-    manifest_relpath = f"src/tools/{agent_name}/manifest.yaml"
+    if agent_name == "validate-data-validity":
+        manifest_relpath = "src/tools/validate-data-validity/manifest.yaml"
+    elif agent_name == "open-foxglove":
+        manifest_relpath = "src/tools/open-foxglove/manifest.yaml"
+    else:
+        manifest_relpath = f"src/tools/{agent_name}/manifest.yaml"
     branch_suffix = f" --branch {shlex.quote(branch)}" if branch else ""
 
     return "\n".join(
@@ -413,7 +443,7 @@ def _build_pnc_task_goal(agent_name: str, args: dict[str, Any], user: str, user_
             "",
             "Safety constraints:",
             "- Validate input/output/regression paths before use.",
-            "- For generate-dbc, parse-bus-data, and validate-data-validity tasks, call the pnc_specs standard CLI and generate fresh outputs; do not satisfy the task by copying/reusing existing artifacts from the input directory unless the requester explicitly asks for reuse.",
+            "- For generate-dbc, parse-bus-data, validate-data-validity, and open-foxglove tasks, call the pnc_specs standard CLI and generate fresh outputs; do not satisfy the task by copying/reusing existing artifacts from the input directory unless the requester explicitly asks for reuse.",
             "- Keep user worktree isolation; do not operate in another user's worktree.",
             "- Before any git operation, call /home/mini/worktrees/audit-logger.sh with user, repo, and command summary.",
             "- Never use git push --force unless owner explicitly requested it.",
@@ -507,7 +537,9 @@ def _build_smoke_script(user: str, repo: str, branch: str = "") -> str:
             "[[ -x \"$AGENT_ROOT/generate-dbc\" ]] && GENERATE_DBC_EXECUTABLE=true",
             "[[ -x \"$AGENT_ROOT/parse-bus-data\" ]] && PARSE_BUS_DATA_EXECUTABLE=true",
             "[[ -f \"$AGENT_ROOT/src/tools/validate-data-validity/cli.py\" ]] && VALIDATE_DATA_VALIDITY_CLI=true",
-            "python3 - <<'PY' \"$ENSURE_JSON\" \"$WORKTREE_PATH\" \"$AGENT_ROOT\" \"$AGENT_ROOT_EXISTS\" \"$GENERATE_DBC_EXECUTABLE\" \"$PARSE_BUS_DATA_EXECUTABLE\" \"$VALIDATE_DATA_VALIDITY_CLI\"",
+            "OPEN_FOXGLOVE_EXECUTABLE=false",
+            "[[ -x \"$AGENT_ROOT/open-foxglove\" ]] && OPEN_FOXGLOVE_EXECUTABLE=true",
+            "python3 - <<'PY' \"$ENSURE_JSON\" \"$WORKTREE_PATH\" \"$AGENT_ROOT\" \"$AGENT_ROOT_EXISTS\" \"$GENERATE_DBC_EXECUTABLE\" \"$PARSE_BUS_DATA_EXECUTABLE\" \"$VALIDATE_DATA_VALIDITY_CLI\" \"$OPEN_FOXGLOVE_EXECUTABLE\"",
             "import json, sys",
             "ensure_json = json.loads(sys.argv[1])",
             "payload = {",
@@ -519,6 +551,7 @@ def _build_smoke_script(user: str, repo: str, branch: str = "") -> str:
             "    'generate_dbc_executable': sys.argv[5] == 'true',",
             "    'parse_bus_data_executable': sys.argv[6] == 'true',",
             "    'validate_data_validity_cli': sys.argv[7] == 'true',",
+            "    'open_foxglove_executable': sys.argv[8] == 'true',",
             "}",
             "print(json.dumps(payload, ensure_ascii=False))",
             "PY",
@@ -596,6 +629,11 @@ def parse_bus_data_tool(args: dict[str, Any], user_id: str = "", **_: Any) -> st
 def validate_data_validity_tool(args: dict[str, Any], user_id: str = "", **_: Any) -> str:
     """Submit the validate-data-validity CLI agent task for VM worker execution."""
     return _submit_pnc_task("validate-data-validity", args or {}, user_id=user_id)
+
+
+def open_foxglove_tool(args: dict[str, Any], user_id: str = "", **_: Any) -> str:
+    """Submit the open-foxglove MCAP conversion task for VM worker execution."""
+    return _submit_pnc_task("open-foxglove", args or {}, user_id=user_id)
 
 
 def check_requirements() -> bool:
@@ -737,5 +775,44 @@ registry.register(
     check_fn=check_requirements,
     description="Run the validate-data-validity MCU/PNC CLI agent on the mini VM",
     emoji="✅",
+    max_result_size_chars=20000,
+)
+
+registry.register(
+    name="open_foxglove",
+    toolset="pnc_agents",
+    schema={
+        "name": "open_foxglove",
+        "description": (
+            "Run the open-foxglove PNC agent on the mini VM. Use it when a Feishu user "
+            "provides a raw MCAP and asks to convert it into a Foxglove-loadable MCAP. "
+            "Supports project=d4q/d2l3/g1q3, defaults to platform=soc and "
+            "profile=one-click-convert. Paths must be absolute VM paths. The gateway "
+            "sender is automatically mapped to that user's pnc_specs worktree."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                **_COMMON_PROPERTIES,
+                "project": {
+                    "type": "string",
+                    "description": "Project pack ID: d4q, d2l3, or g1q3. Case-insensitive.",
+                },
+                "input": {
+                    "type": "string",
+                    "description": "Absolute path on the mini VM to the raw MCAP input file.",
+                },
+                "output": {
+                    "type": "string",
+                    "description": "Absolute path on the mini VM to the output directory for <stem>.converted.mcap, summary.json, artifacts.json, and foxglove_open_plan.json.",
+                },
+            },
+            "required": ["project", "input", "output"],
+        },
+    },
+    handler=open_foxglove_tool,
+    check_fn=check_requirements,
+    description="Convert raw MCAP to Foxglove-loadable MCAP via pnc_specs open-foxglove on the mini VM",
+    emoji="🦊",
     max_result_size_chars=20000,
 )

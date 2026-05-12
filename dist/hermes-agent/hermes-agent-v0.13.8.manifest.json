@@ -1,0 +1,14 @@
+{
+  "name": "pnc-agent-hermes-agent-overlay",
+  "version": "0.13.8",
+  "tag": "pnc-agent-v0.13.8-overlay.20260512",
+  "branch": "sync/upstream-v0.13-overlay-20260508",
+  "base_commit_before_release": "78438a4c249169e8831abefe2d5893ca85e5f3d6",
+  "built_at": "2026-05-12T14:20:55.752612+08:00",
+  "artifact": "dist/hermes-agent/hermes-agent-v0.13.8.tar.gz",
+  "sha256": "0f4d0f59e99956e25e4a84966752c26aa637a42d361717da16db2b8950293095",
+  "tracked_file_count": 3347,
+  "included_paths_policy": "git ls-files snapshot excluding dist artifacts and local venv/cache",
+  "release_scope": "Expose pnc_specs open-foxglove VM tool through Hermes/Feishu pnc_agents and restart host/VM/CLI entrypoints",
+  "admission_version": "1.11.2"
+}

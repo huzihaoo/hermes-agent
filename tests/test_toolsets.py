@@ -73,6 +73,7 @@ class TestResolveToolset:
         assert "generate_dbc" in tools
         assert "parse_bus_data" in tools
         assert "validate_data_validity" in tools
+        assert "open_foxglove" in tools
         assert "vm_task_submit" in tools
         assert "vm_task_status" in tools
 

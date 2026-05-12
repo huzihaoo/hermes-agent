@@ -600,3 +600,64 @@ def test_rejects_member_role_before_remote_execution(monkeypatch):
     assert "error" in result
     assert "permission denied" in result["error"]
     assert called is False
+
+
+
+def test_open_foxglove_submits_vm_task_with_standard_defaults(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(pnc_agent_tools, "_check_pnc_permission", lambda *a, **kw: None)
+    monkeypatch.setattr(pnc_agent_tools, "_current_session_user_name", lambda: "宋伟军")
+    monkeypatch.setattr(pnc_agent_tools, "_current_session_user_id", lambda: "")
+
+    def fake_submit(title, goal, owner="", user_id=""):
+        captured.update(title=title, goal=goal, owner=owner, user_id=user_id)
+        return json.dumps({"success": True, "task": {"task_id": "task-open-foxglove"}, "routing": {}}, ensure_ascii=False)
+
+    monkeypatch.setattr(pnc_agent_tools.vm_task_tool, "vm_task_submit_json", fake_submit)
+
+    result = json.loads(
+        pnc_agent_tools.open_foxglove_tool(
+            {
+                "project": "D2L3",
+                "input": "/mnt/pnc_tools/case_data/open-foxglove/input.mcap",
+                "output": "/mnt/tmp/pnc-open-foxglove-output",
+            },
+            user_id="ou_song",
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["mode"] == "submitted"
+    assert result["agent"] == "open-foxglove"
+    assert result["task_id"] == "task-open-foxglove"
+    assert captured["owner"] == "宋伟军"
+    assert captured["user_id"] == "ou_song"
+    assert "open-foxglove" in captured["title"]
+    assert "./open-foxglove --project d2l3 --platform soc --profile one-click-convert" in captured["goal"]
+    assert "manifest_relpath: src/tools/open-foxglove/manifest.yaml" in captured["goal"]
+    assert "work_tmp_dir=/mnt/tmp/pnc-open-foxglove" in captured["goal"]
+    assert "user_visible_path=//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/pnc-open-foxglove/" in captured["goal"]
+    assert "generate fresh outputs" in captured["goal"]
+
+
+def test_open_foxglove_requires_absolute_input_output(monkeypatch):
+    monkeypatch.setattr(pnc_agent_tools, "_check_pnc_permission", lambda *a, **kw: None)
+    monkeypatch.setattr(pnc_agent_tools, "_current_session_user_name", lambda: "宋伟军")
+    monkeypatch.setattr(pnc_agent_tools, "_current_session_user_id", lambda: "")
+
+    result = json.loads(
+        pnc_agent_tools.open_foxglove_tool(
+            {"project": "d2l3", "input": "relative.mcap", "output": "/mnt/tmp/out"},
+            user_id="ou_song",
+        )
+    )
+
+    assert result["agent"] == "open-foxglove"
+    assert "input must be an absolute VM path" in result["error"]
+
+
+def test_open_foxglove_is_exposed_in_feishu_toolset():
+    from toolsets import resolve_toolset
+
+    tools = resolve_toolset("hermes-feishu")
+    assert "open_foxglove" in tools
