@@ -133,3 +133,9 @@ Current operator guard:
 Convergence rule:
 - Gateway/Feishu entry is judged by LaunchAgent PID + active runtime root + health endpoint + marker checks.
 - Interactive CLI tabs are judged independently; restart old tabs after runtime hotfixes before treating their preflight output as a fresh regression.
+
+## Follow-up communication closure (2026-05-13)
+
+- Feishu group follow-up sent: `message_id=om_x100b6f091d0f7914b2e8209658b4267`.
+- Feishu release document `YQ10dU1N3o3GB0xfAHlcRL9Jnqb` appended with stale interactive CLI session guidance.
+- Durable overlay commit: `b5ca5513b hotfix: gate fallback preflight compression in overlay`.
