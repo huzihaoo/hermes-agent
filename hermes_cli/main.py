@@ -9080,6 +9080,9 @@ def main():
     status_parser.add_argument(
         "--deep", action="store_true", help="Run deep checks (may take longer)"
     )
+    status_parser.add_argument(
+        "--fallback", action="store_true", help="Show recent fallback/failover diagnostics"
+    )
     status_parser.set_defaults(func=cmd_status)
 
     # =========================================================================

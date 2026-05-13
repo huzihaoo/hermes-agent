@@ -6,6 +6,8 @@ Shows the status of all Hermes Agent components.
 
 import os
 import sys
+import json
+from collections import Counter, deque
 import subprocess  # noqa: F401 — re-exported for tests that monkeypatch status.subprocess to guard against regressions
 import importlib.util
 from pathlib import Path
@@ -84,6 +86,105 @@ def _effective_provider_label() -> str:
     return provider_label(effective)
 
 
+
+def _fallback_events_path() -> Path:
+    return get_hermes_home() / "analytics" / "events.jsonl"
+
+
+def _load_recent_fallback_events(path: Path | None = None, *, max_lines: int = 5000) -> list[dict]:
+    """Load recent fallback:* task-trace events from analytics/events.jsonl."""
+    trace_path = Path(path) if path is not None else _fallback_events_path()
+    if not trace_path.exists():
+        return []
+    events: list[dict] = []
+    try:
+        with trace_path.open("r", encoding="utf-8") as fh:
+            for line in deque(fh, maxlen=max_lines):
+                line = line.strip()
+                if not line or "fallback:" not in line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except Exception:
+                    continue
+                event_name = payload.get("event") or ""
+                if not isinstance(event_name, str) or not event_name.startswith("fallback:"):
+                    continue
+                data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+                item = dict(data)
+                item["event"] = event_name.split(":", 1)[1]
+                item["timestamp"] = payload.get("timestamp") or data.get("timestamp")
+                events.append(item)
+    except Exception:
+        return []
+    return events
+
+
+def summarize_fallback_events(events: list[dict]) -> dict:
+    by_event = Counter(e.get("event") or "unknown" for e in events)
+    by_reason = Counter((e.get("reason") or "unknown") for e in events)
+    provider_counter = Counter()
+    cooling: list[dict] = []
+    last_event = events[-1] if events else None
+    for e in events:
+        provider = e.get("to_provider") or e.get("provider") or e.get("from_provider") or "unknown"
+        model = e.get("to_model") or e.get("model") or e.get("from_model") or "unknown"
+        provider_counter[f"{provider}:{model}"] += 1
+        if e.get("event") == "skipped_cooling":
+            try:
+                remaining_int = int(e.get("remaining_seconds") or 0)
+            except Exception:
+                remaining_int = 0
+            if remaining_int > 0:
+                cooling.append({
+                    "provider": provider,
+                    "model": model,
+                    "remaining_seconds": remaining_int,
+                    "reason": e.get("reason") or "unknown",
+                    "task_id": e.get("task_id"),
+                })
+    return {
+        "total": len(events),
+        "by_event": dict(by_event),
+        "by_reason": dict(by_reason),
+        "by_provider": dict(provider_counter),
+        "cooling": cooling[-10:],
+        "last_event": last_event,
+    }
+
+
+def _print_fallback_status(*, max_lines: int = 5000) -> None:
+    print()
+    print(color("◆ Fallback Diagnostics", Colors.CYAN, Colors.BOLD))
+    path = _fallback_events_path()
+    events = _load_recent_fallback_events(path, max_lines=max_lines)
+    summary = summarize_fallback_events(events)
+    print(f"  Trace:        {path}")
+    if not events:
+        print("  Recent:       no fallback events found")
+        return
+    print(f"  Recent:       {summary['total']} fallback event(s) in last {max_lines} trace line(s)")
+    if summary["by_event"]:
+        print("  Events:       " + ", ".join(f"{k}={v}" for k, v in sorted(summary["by_event"].items())))
+    if summary["by_reason"]:
+        print("  Reasons:      " + ", ".join(f"{k}={v}" for k, v in sorted(summary["by_reason"].items())))
+    top = sorted(summary["by_provider"].items(), key=lambda kv: kv[1], reverse=True)[:5]
+    if top:
+        print("  Providers:    " + ", ".join(f"{name}={count}" for name, count in top))
+    if summary["cooling"]:
+        print("  Cooling:")
+        for item in summary["cooling"]:
+            print(
+                f"    - {item['provider']}:{item['model']} "
+                f"~{item['remaining_seconds']}s reason={item['reason']} task={item.get('task_id') or '-'}"
+            )
+    last = summary.get("last_event") or {}
+    if last:
+        provider = last.get("to_provider") or last.get("provider") or last.get("from_provider") or "unknown"
+        model = last.get("to_model") or last.get("model") or last.get("from_model") or "unknown"
+        reason = last.get("reason") or "unknown"
+        print(f"  Last:         {last.get('event')} {provider}:{model} reason={reason} task={last.get('task_id') or '-'}")
+
 from hermes_constants import is_termux as _is_termux
 
 
@@ -91,6 +192,7 @@ def show_status(args):
     """Show status of all Hermes Agent components."""
     show_all = getattr(args, 'all', False)
     deep = getattr(args, 'deep', False)
+    show_fallback = getattr(args, 'fallback', False)
 
     print()
     print(color("┌─────────────────────────────────────────────────────────┐", Colors.CYAN))
@@ -543,6 +645,9 @@ def show_status(args):
             print(f"  Port 18789:   {'in use' if port_in_use else 'available'}")
         except OSError:
             pass
+
+    if show_fallback or show_all or deep:
+        _print_fallback_status()
 
     print()
     print(color("─" * 60, Colors.DIM))

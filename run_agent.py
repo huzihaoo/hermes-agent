@@ -1846,6 +1846,7 @@ class AIAgent:
             self._fallback_chain = []
         self._fallback_index = 0
         self._fallback_activated = getattr(self, "_fallback_activated", False)
+        self._fallback_just_activated = False
         # Legacy attribute kept for backward compat (tests, external callers)
         self._fallback_model = self._fallback_chain[0] if self._fallback_chain else None
         if self._fallback_chain and not self.quiet_mode:
@@ -2502,6 +2503,7 @@ class AIAgent:
             "compressor_base_url": getattr(_cc, "base_url", self.base_url),
             "compressor_api_key": getattr(_cc, "api_key", ""),
             "compressor_provider": getattr(_cc, "provider", self.provider),
+            "compressor_api_mode": getattr(_cc, "api_mode", self.api_mode),
             "compressor_context_length": _cc.context_length,
             "compressor_threshold_tokens": _cc.threshold_tokens,
         }
@@ -2752,6 +2754,7 @@ class AIAgent:
             "compressor_base_url": getattr(_cc, "base_url", self.base_url) if _cc else self.base_url,
             "compressor_api_key": getattr(_cc, "api_key", "") if _cc else "",
             "compressor_provider": getattr(_cc, "provider", self.provider) if _cc else self.provider,
+            "compressor_api_mode": getattr(_cc, "api_mode", self.api_mode) if _cc else self.api_mode,
             "compressor_context_length": _cc.context_length if _cc else 0,
             "compressor_threshold_tokens": _cc.threshold_tokens if _cc else 0,
         }
@@ -8730,10 +8733,12 @@ class AIAgent:
                 base_url=rt["compressor_base_url"],
                 api_key=rt["compressor_api_key"],
                 provider=rt["compressor_provider"],
+                api_mode=rt.get("compressor_api_mode", self.api_mode),
             )
 
             # ── Reset fallback chain for the new turn ──
             self._fallback_activated = False
+            self._fallback_just_activated = False
             self._fallback_index = 0
 
             logging.info(
@@ -12154,21 +12159,25 @@ class AIAgent:
 
             _preflight_threshold_tokens = self.context_compressor.threshold_tokens
             _preflight_threshold_reason = "primary"
-            # Stable-first: if a fallback model has a smaller configured context,
-            # pre-compress before the primary call once the request would exceed
-            # the fallback's compaction trigger.  This avoids the pattern
-            # primary transient failure → fallback activation → immediate large
-            # compaction/error on a 128K fallback.
-            for _fb in getattr(self, "_fallback_chain", []) or []:
-                try:
-                    _fb_ctx = int(_fb.get("context_length")) if isinstance(_fb, dict) and _fb.get("context_length") is not None else None
-                except (TypeError, ValueError):
-                    _fb_ctx = None
-                if _fb_ctx and _fb_ctx > 0:
-                    _fb_threshold = int(_fb_ctx * getattr(self.context_compressor, "threshold_percent", 0.75))
-                    if _fb_threshold < _preflight_threshold_tokens:
-                        _preflight_threshold_tokens = _fb_threshold
-                        _preflight_threshold_reason = "fallback"
+            # Stable-first only after failover: do not pre-compress healthy
+            # primary turns to the smallest fallback window. That made large
+            # primary-model sessions (e.g. 400K ctx) compress at the 128K
+            # fallback threshold every turn, adding an expensive summarization
+            # call even when the primary lane was available. Once a fallback is
+            # actually activated, _try_activate_fallback() updates the context
+            # compressor to the fallback model and sets _fallback_just_activated,
+            # so the next pass naturally uses the smaller fallback threshold.
+            if getattr(self, "_fallback_just_activated", False):
+                for _fb in getattr(self, "_fallback_chain", []) or []:
+                    try:
+                        _fb_ctx = int(_fb.get("context_length")) if isinstance(_fb, dict) and _fb.get("context_length") is not None else None
+                    except (TypeError, ValueError):
+                        _fb_ctx = None
+                    if _fb_ctx and _fb_ctx > 0:
+                        _fb_threshold = int(_fb_ctx * getattr(self.context_compressor, "threshold_percent", 0.75))
+                        if _fb_threshold < _preflight_threshold_tokens:
+                            _preflight_threshold_tokens = _fb_threshold
+                            _preflight_threshold_reason = "fallback"
 
             if _preflight_tokens >= _preflight_threshold_tokens:
                 logger.info(
