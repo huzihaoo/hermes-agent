@@ -41,6 +41,47 @@ from hermes_time import now as _hermes_now
 logger = logging.getLogger(__name__)
 
 
+def _make_task_store():
+    try:
+        return TaskStore()  # type: ignore[name-defined]
+    except NameError:
+        from gateway.tasks.store import TaskStore as _TaskStore
+        return _TaskStore(db_path=get_hermes_home() / "analytics" / "tasks.db")
+
+
+def _record_delivery_verification(
+    *,
+    job: dict,
+    platform_name: str,
+    chat_id: str,
+    thread_id: Optional[str],
+    message_id: Optional[str],
+    delivery_verified: bool,
+    failure_reason: Optional[str],
+) -> None:
+    """Best-effort TaskStore update for outbound cron delivery evidence."""
+    task_id = job.get("task_id") or job.get("origin_task_id") or job.get("id")
+    if not task_id:
+        return
+    try:
+        store = _make_task_store()
+        task = store.get(str(task_id))
+        if task is None:
+            return
+        task.platform = task.platform or platform_name
+        task.chat_id = chat_id
+        if thread_id is not None:
+            task.thread_id = thread_id
+        if message_id is not None:
+            task.message_id = message_id
+        task.delivery_verified = bool(delivery_verified)
+        if failure_reason:
+            task.error_message = failure_reason
+        store.upsert(task)
+    except Exception as exc:
+        logger.debug("Job '%s': failed to record delivery verification: %s", job.get("id"), exc)
+
+
 class CronPromptInjectionBlocked(Exception):
     """Raised by _build_job_prompt when the fully-assembled prompt trips the
     injection scanner. Caught in run_job so the operator sees a clean
@@ -573,6 +614,16 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     )
 
                 if adapter_ok:
+                    message_id = getattr(send_result, "message_id", None) if text_to_send else None
+                    _record_delivery_verification(
+                        job=job,
+                        platform_name=platform_name,
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        message_id=message_id,
+                        delivery_verified=bool(message_id) or not text_to_send,
+                        failure_reason=None,
+                    )
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
                     delivered = True
             except Exception as e:
@@ -604,9 +655,28 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             if result and result.get("error"):
                 msg = f"delivery error: {result['error']}"
                 logger.error("Job '%s': %s", job["id"], msg)
+                _record_delivery_verification(
+                    job=job,
+                    platform_name=platform_name,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    message_id=None,
+                    delivery_verified=False,
+                    failure_reason=msg,
+                )
                 delivery_errors.append(msg)
                 continue
 
+            message_id = result.get("message_id") if isinstance(result, dict) else None
+            _record_delivery_verification(
+                job=job,
+                platform_name=platform_name,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                message_id=message_id,
+                delivery_verified=bool(message_id) or not cleaned_delivery_content.strip(),
+                failure_reason=None,
+            )
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
 
     if delivery_errors:

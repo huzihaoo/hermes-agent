@@ -48,15 +48,40 @@ def _resolve_submitter(user_id: str = "", owner: str = "") -> tuple[str, str]:
     return user_name, resolved_user_id
 
 
-def _check_vm_task_permission(user_name: str, user_id: str = "") -> str | None:
+def _vm_task_permission_denied_payload(user_name: str = "", role: str = "") -> dict[str, Any]:
+    requester = str(user_name or "当前账号").strip() or "当前账号"
+    return {
+        "success": False,
+        "error_code": "vm_task_permission_denied",
+        "error": (
+            f"{requester}当前账号没有 VM 编译/执行任务权限，本次未执行。"
+            "请管理员授权 VM worker task 权限，或由 owner/有权限的人在同一线程重新发起。"
+            "授权后会按审计规则在对应 worktree 执行，并回传 commit SHA、CI 链接和产物路径或失败摘要。"
+        ),
+        "retryable": False,
+        "returncode": None,
+    }
+
+
+def _vm_task_permission_policy_unavailable_payload() -> dict[str, Any]:
+    return {
+        "success": False,
+        "error_code": "vm_task_permission_policy_unavailable",
+        "error": "暂时无法确认 VM 编译/执行任务权限，本次未执行。请稍后重试，或让管理员在同一线程重新发起。",
+        "retryable": True,
+        "returncode": None,
+    }
+
+
+def _check_vm_task_permission(user_name: str, user_id: str = "") -> dict[str, Any] | None:
     try:
         from tools.permission_policy import get_user_role, get_user_role_by_id
 
         role = get_user_role_by_id(user_id) if user_id else get_user_role(user_name)
-    except Exception as exc:
-        return f"permission policy unavailable for vm_task_submit; refusing VM task submission: {exc}"
+    except Exception:
+        return _vm_task_permission_policy_unavailable_payload()
     if role not in {"owner", "admin", "senior"}:
-        return f"permission denied for vm_task_submit: role {role!r} is not allowed to submit VM worker tasks"
+        return _vm_task_permission_denied_payload(user_name, role)
     return None
 
 
@@ -270,7 +295,7 @@ def vm_task_submit(
     if trusted_user_name or trusted_user_id:
         permission_error = _check_vm_task_permission(trusted_user_name, trusted_user_id)
         if permission_error:
-            return {"success": False, "error": permission_error, "returncode": None}
+            return permission_error
         owner = trusted_user_name or trusted_user_id
     else:
         owner = str(owner or "").strip()

@@ -156,6 +156,38 @@ class TestFallbackChainAdvancement:
             assert agent._try_activate_fallback() is True
             assert agent.model == "gpt-4o"
 
+
+
+    def test_fallback_entry_context_length_overrides_custom_provider_context(self):
+        fbs = [
+            {
+                "provider": "custom:sub2api",
+                "model": "gpt-5.4",
+                "context_length": 1000000,
+            }
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        agent._config = {
+            "custom_providers": [
+                {
+                    "name": "sub2api",
+                    "context_length": 400000,
+                }
+            ]
+        }
+        agent.context_compressor = MagicMock()
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(base_url="https://sub2api.minieye.tech/v1"), "gpt-5.4"),
+            ),
+            patch("agent.model_metadata.get_model_context_length", return_value=1000000) as mock_ctx,
+        ):
+            assert agent._try_activate_fallback() is True
+            assert mock_ctx.call_args.kwargs["config_context_length"] == 1000000
+            assert agent.context_compressor.update_model.call_args.kwargs["context_length"] == 1000000
+
     def test_resolves_key_env_for_fallback_provider(self):
         fbs = [
             {

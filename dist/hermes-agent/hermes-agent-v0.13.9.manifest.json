@@ -1,0 +1,22 @@
+{
+  "name": "pnc-agent-overlay",
+  "version": "0.13.9",
+  "tag": "pnc-agent-v0.13.9-overlay.20260514",
+  "base_commit": "75044449fcf0a6651d8f2f39f4d930ac72b650eb",
+  "artifact": "dist/hermes-agent/hermes-agent-v0.13.9.tar.gz",
+  "sha256": "99cfd6480ae930645805bad37f36326db37163c4d6d3052672d205b9ccf624d2",
+  "tracked_file_count": 3348,
+  "built_at": "2026-05-14T14:50:15.597303+00:00",
+  "scope": [
+    "cron delivery verification",
+    "task event delivery metadata",
+    "vm task permission UX",
+    "fallback context-length regression",
+    "version bump"
+  ],
+  "excluded": [
+    "dist directory from tar source",
+    "unrelated workspace-work dirty docs/knowledge",
+    "old overlay/stable dirty checkout"
+  ]
+}

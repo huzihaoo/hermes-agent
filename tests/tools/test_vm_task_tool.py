@@ -184,7 +184,11 @@ def test_vm_task_submit_denies_member_before_creating_task(monkeypatch, tmp_path
     script.write_text("print('unused')", encoding="utf-8")
     monkeypatch.setattr(vm_task_tool, "_create_task_script", lambda: script)
     monkeypatch.setattr(vm_task_tool, "_resolve_submitter", lambda user_id="", owner="": ("王平", "ou_wang"))
-    monkeypatch.setattr(vm_task_tool, "_check_vm_task_permission", lambda *a, **kw: "permission denied for vm_task_submit: role 'member' is not allowed")
+    monkeypatch.setattr(
+        vm_task_tool,
+        "_check_vm_task_permission",
+        lambda *a, **kw: vm_task_tool._vm_task_permission_denied_payload("王平", "member"),
+    )
     called = False
 
     def fake_run(*args, **kwargs):
@@ -197,8 +201,17 @@ def test_vm_task_submit_denies_member_before_creating_task(monkeypatch, tmp_path
     result = vm_task_tool.vm_task_submit("title", "goal", owner="spoofed", user_id="ou_wang")
 
     assert result["success"] is False
-    assert "permission denied" in result["error"]
+    assert result["error_code"] == "vm_task_permission_denied"
+    assert "当前账号没有 VM 编译/执行任务权限" in result["error"]
+    assert "管理员" in result["error"]
+    assert "owner" in result["error"]
+    assert result["retryable"] is False
     assert called is False
+    leaked = json.dumps(result, ensure_ascii=False)
+    assert "vm_task_submit" not in leaked
+    assert "ssh-mini" not in leaked
+    assert "role 'member'" not in leaked
+    assert "member" not in result["error"]
 
 
 def test_vm_task_submit_includes_scheduler_metadata_in_meta(monkeypatch, tmp_path):

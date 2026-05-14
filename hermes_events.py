@@ -72,10 +72,16 @@ class EventEmitter:
                 if existing:
                     existing.status = TaskStatus.COMPLETED
                     existing.completed_at = timestamp
+                    if "message_id" in data:
+                        existing.message_id = data.get("message_id")
+                    if "thread_id" in data:
+                        existing.thread_id = data.get("thread_id")
                     if "receipt_path" in data:
                         existing.receipt_path = data.get("receipt_path")
                     if "delivery_verified" in data:
                         existing.delivery_verified = data.get("delivery_verified")
+                    elif existing.platform == "feishu" and existing.message_id:
+                        existing.delivery_verified = True
                     self.task_store.upsert(existing)
             elif event == "task:failed":
                 existing = self.task_store.get(task_id)
@@ -160,15 +166,31 @@ class TaskEvent:
         }
 
     @staticmethod
-    def task_complete(*, task_id: str, total_tokens: int, api_calls: int, tool_calls: int) -> Dict[str, Any]:
+    def task_complete(
+        *,
+        task_id: str,
+        total_tokens: int,
+        api_calls: int,
+        tool_calls: int,
+        message_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        delivery_verified: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        data: Dict[str, Any] = {
+            "task_id": task_id,
+            "total_tokens": total_tokens,
+            "api_calls": api_calls,
+            "tool_calls": tool_calls,
+        }
+        if message_id is not None:
+            data["message_id"] = message_id
+        if thread_id is not None:
+            data["thread_id"] = thread_id
+        if delivery_verified is not None:
+            data["delivery_verified"] = delivery_verified
         return {
             "event": "task:complete",
-            "data": {
-                "task_id": task_id,
-                "total_tokens": total_tokens,
-                "api_calls": api_calls,
-                "tool_calls": tool_calls,
-            },
+            "data": data,
         }
 
     @staticmethod

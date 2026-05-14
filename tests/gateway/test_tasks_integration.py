@@ -85,6 +85,32 @@ def test_emitter_syncs_task_complete_to_store(tmp_path):
     assert task.completed_at is not None
 
 
+def test_emitter_marks_completion_delivery_verified_for_feishu_topic_with_message(tmp_path):
+    trace_file = tmp_path / "events.jsonl"
+    store = TaskStore(db_path=tmp_path / "tasks.db")
+    emitter = EventEmitter(trace_file=trace_file, task_store=store)
+
+    emitter.emit("request:start", {
+        "task_id": "feishu-topic-task",
+        "platform": "feishu",
+        "user_id": "ou_user",
+        "chat_id": "oc_chat",
+        "chat_type": "group",
+        "thread_id": "topic:om_anchor",
+        "message_id": "om_request",
+    })
+    emitter.emit("task:complete", {
+        "task_id": "feishu-topic-task",
+        "message_id": "om_reply",
+    })
+
+    task = store.get("feishu-topic-task")
+    assert task is not None
+    assert task.status == TaskStatus.COMPLETED
+    assert task.message_id == "om_reply"
+    assert task.delivery_verified is True
+
+
 def test_emitter_syncs_task_failed_to_store(tmp_path):
     trace_file = tmp_path / "events.jsonl"
     store = TaskStore(db_path=tmp_path / "tasks.db")
