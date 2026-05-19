@@ -51,6 +51,8 @@ OPEN_FOXGLOVE_PROJECT_ALIASES = {
     "d4q": "d4q",
     "d2l3": "d2l3",
     "g1q3": "g1q3",
+    "d2j": "d2j",
+    "g3y": "g3y",
 }
 LOCAL_WRAPPER = os.getenv("SSH_MINI_AGENT_BIN", "ssh-mini-agent")
 DEFAULT_TIMEOUT_SECONDS = 300
@@ -352,7 +354,7 @@ def _effective_pnc_args(agent_name: str, args: dict[str, Any]) -> dict[str, Any]
         effective_args.setdefault("profile", "soc-simple")
     elif agent_name == "open-foxglove":
         # open-foxglove is the pnc_specs Foxglove MCAP conversion entrypoint.
-        # It accepts D4Q/D2L3/G1Q3 project packs and always uses AI Native
+        # It accepts D4Q/D2L3/G1Q3/D2J/G3Y project packs and always uses AI Native
         # platform=soc with the one-click-convert profile unless explicitly
         # overridden by the caller.
         if effective_args.get("project"):
@@ -786,7 +788,7 @@ registry.register(
         "description": (
             "Run the open-foxglove PNC agent on the mini VM. Use it when a Feishu user "
             "provides a raw MCAP and asks to convert it into a Foxglove-loadable MCAP. "
-            "Supports project=d4q/d2l3/g1q3, defaults to platform=soc and "
+            "Supports project=d4q/d2l3/g1q3/d2j/g3y, defaults to platform=soc and "
             "profile=one-click-convert. Paths must be absolute VM paths. The gateway "
             "sender is automatically mapped to that user's pnc_specs worktree."
         ),
@@ -796,7 +798,7 @@ registry.register(
                 **_COMMON_PROPERTIES,
                 "project": {
                     "type": "string",
-                    "description": "Project pack ID: d4q, d2l3, or g1q3. Case-insensitive.",
+                    "description": "Project pack ID: d4q, d2l3, g1q3, d2j, or g3y. Case-insensitive.",
                 },
                 "input": {
                     "type": "string",

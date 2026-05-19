@@ -640,6 +640,47 @@ def test_open_foxglove_submits_vm_task_with_standard_defaults(monkeypatch):
     assert "generate fresh outputs" in captured["goal"]
 
 
+def test_open_foxglove_accepts_d2j_and_g3y_project_packs(monkeypatch):
+    captured_goals = []
+    monkeypatch.setattr(pnc_agent_tools, "_check_pnc_permission", lambda *a, **kw: None)
+    monkeypatch.setattr(pnc_agent_tools, "_current_session_user_name", lambda: "宋伟军")
+    monkeypatch.setattr(pnc_agent_tools, "_current_session_user_id", lambda: "")
+
+    def fake_submit(title, goal, owner="", user_id=""):
+        captured_goals.append(goal)
+        return json.dumps({"success": True, "task": {"task_id": f"task-{len(captured_goals)}"}, "routing": {}}, ensure_ascii=False)
+
+    monkeypatch.setattr(pnc_agent_tools.vm_task_tool, "vm_task_submit_json", fake_submit)
+
+    for project in ("D2J", "g3y"):
+        result = json.loads(
+            pnc_agent_tools.open_foxglove_tool(
+                {
+                    "project": project,
+                    "input": f"/mnt/pnc_tools/case_data/open-foxglove/{project.lower()}.mcap",
+                    "output": f"/mnt/tmp/pnc-open-foxglove-{project.lower()}",
+                },
+                user_id="ou_song",
+            )
+        )
+        assert result["ok"] is True
+
+    assert "./open-foxglove --project d2j --platform soc --profile one-click-convert" in captured_goals[0]
+    assert "./open-foxglove --project g3y --platform soc --profile one-click-convert" in captured_goals[1]
+
+
+def test_open_foxglove_schema_documents_all_supported_projects():
+    entry = pnc_agent_tools.registry.get_entry("open_foxglove")
+    assert entry is not None
+    schema = entry.schema
+    description = schema["description"]
+    project_description = schema["parameters"]["properties"]["project"]["description"]
+
+    for project in ("d4q", "d2l3", "g1q3", "d2j", "g3y"):
+        assert project in description.lower()
+        assert project in project_description.lower()
+
+
 def test_open_foxglove_requires_absolute_input_output(monkeypatch):
     monkeypatch.setattr(pnc_agent_tools, "_check_pnc_permission", lambda *a, **kw: None)
     monkeypatch.setattr(pnc_agent_tools, "_current_session_user_name", lambda: "宋伟军")
