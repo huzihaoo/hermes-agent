@@ -2120,13 +2120,19 @@ def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
     if node_bin.is_dir():
         candidates.append(str(node_bin))
 
+    def _optional_dir(path: Path) -> str | None:
+        try:
+            return str(path) if path.is_dir() else None
+        except OSError:
+            return None
+
     hermes_home = get_hermes_home()
-    hermes_node = hermes_home / "node" / "bin"
-    if hermes_node.is_dir():
-        candidates.append(str(hermes_node))
-    hermes_nm = hermes_home / "node_modules" / ".bin"
-    if hermes_nm.is_dir():
-        candidates.append(str(hermes_nm))
+    hermes_node = _optional_dir(hermes_home / "node" / "bin")
+    if hermes_node:
+        candidates.append(hermes_node)
+    hermes_nm = _optional_dir(hermes_home / "node_modules" / ".bin")
+    if hermes_nm:
+        candidates.append(hermes_nm)
 
     return candidates
 
