@@ -399,6 +399,38 @@ def _extract_agent_final_text_from_runner_log(runner_log: Path) -> str:
     return text[-20000:]
 
 
+def _persist_agent_final_text_artifact(
+    task: dict[str, Any],
+    local_task: local_state.WorkerTask,
+    runner_log: Path,
+) -> Path | None:
+    """Persist the agent's final assistant text as a first-class artifact.
+
+    Codex normally writes --output-last-message itself, but timeout/retry and
+    embedded-runner paths can still leave only runner.log with
+    finalAssistantVisibleText/finalAssistantRawText. Downstream reconcilers and
+    windowed smoke tests should not need to parse runner.log to prove the final
+    marker, so promote that text to codex-last-message.txt when possible.
+    """
+    output_path = str(task.get("codex_output_last_message") or "").strip()
+    if output_path:
+        path = Path(output_path)
+    else:
+        path = local_task.artifacts_dir / "codex-last-message.txt"
+    existing = ""
+    if path.is_file():
+        with contextlib.suppress(Exception):
+            existing = path.read_text(encoding="utf-8", errors="replace")
+    if existing.strip():
+        return path
+    text = _extract_agent_final_text_from_runner_log(runner_log).strip()
+    if not text:
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text + "\n", encoding="utf-8")
+    return path
+
+
 def _extract_result_status_from_text(text: str) -> str | None:
     in_result = False
     for raw_line in text.splitlines():
@@ -1189,6 +1221,7 @@ def execute_claim(task: dict[str, Any], args: argparse.Namespace) -> dict[str, A
                     break
             exit_code = int(process.wait())
         local_task.sync_log_tail(reason="process_exit")
+        _persist_agent_final_text_artifact(task, local_task, runner_log)
         final_result = _terminal_local_result(local_task)
         if final_result is None:
             external_terminal = _terminal_external_result(task, local_task)
