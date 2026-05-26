@@ -1,0 +1,28 @@
+{
+  "pack": "vm_codex_window_runner_patch_20260526",
+  "created_at": "2026-05-26",
+  "files": [
+    {
+      "name": "vm_codex_window_runner.before_accept_payload.py",
+      "size": 11486,
+      "sha256": "3785c68905a11de71bc2eb620c08cebeedc6968d02c87d92dd09b5b46f1cbe56"
+    },
+    {
+      "name": "vm_codex_window_runner.py",
+      "size": 11756,
+      "sha256": "2c8cc7c80eeb2026130b59adb1a04038057e791e7a54950c41d5585427995360"
+    },
+    {
+      "name": "vm_coding_worker_v2.before_prompt_override.py",
+      "size": 58762,
+      "sha256": "d5828deba0d86b290c50c6fee2be0fe286a45bf72688d91889fb91a76dc935cc"
+    },
+    {
+      "name": "vm_coding_worker_v2.py",
+      "size": 58894,
+      "sha256": "735ed2016c44b6a0d12190c8491768bcf21e2e2457dc6b61db317af4679a3278"
+    }
+  ],
+  "vm_path": "/mnt/tmp/vm_codex_window_runner_patch_20260526",
+  "cifs": "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/vm_codex_window_runner_patch_20260526/"
+}
