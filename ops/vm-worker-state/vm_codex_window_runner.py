@@ -165,6 +165,94 @@ def apply_concurrency_policy(args: argparse.Namespace, root: Path, ids: list[str
 def write_policy_receipt(out: Path, receipt: dict) -> None:
     (out / 'policy.json').write_text(json.dumps(receipt, ensure_ascii=False, indent=2), encoding='utf-8')
 
+
+
+def _truthy(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+def pending_dispatch_task_ids(root: Path, *, prefix: str | None = None, limit: int = 50) -> list[str]:
+    pending_dir = root / 'dispatch' / 'pending'
+    ids: list[str] = []
+    if not pending_dir.is_dir():
+        return ids
+    for path in sorted(pending_dir.glob('*.json')):
+        tid = path.stem
+        if prefix and not tid.startswith(prefix):
+            continue
+        ids.append(tid)
+        if len(ids) >= limit:
+            break
+    return ids
+
+
+def codex_metadata_status(root: Path, tid: str) -> dict:
+    meta = task_meta(root, tid)
+    dispatch = read_json(root / 'dispatch' / 'pending' / f'{tid}.json')
+    merged = dict(dispatch)
+    merged.update(meta)
+    executor = str(merged.get('executor_type') or '').strip().lower()
+    backend = str(merged.get('agent_backend') or merged.get('coding_agent_backend') or '').strip().lower().replace('_', '-')
+    codex_enabled_present = 'codex_backend_enabled' in merged
+    codex_enabled = _truthy(merged.get('codex_backend_enabled'))
+    intended = executor == 'coding_agent' or backend in {'codex', 'codex-cli', 'openai-codex'} or codex_enabled_present
+    valid = executor == 'coding_agent' and backend == 'codex' and codex_enabled
+    reasons: list[str] = []
+    if not intended:
+        reasons.append('not an intended Codex/coding-agent task')
+    else:
+        if executor != 'coding_agent':
+            reasons.append('executor_type must be coding_agent')
+        if backend != 'codex':
+            reasons.append('agent_backend must be codex')
+        if not codex_enabled:
+            reasons.append('codex_backend_enabled must be true')
+    workload = infer_workload_class(root, [tid], 'auto')
+    return {
+        'task_id': tid,
+        'intended_codex': intended,
+        'valid_codex_metadata': valid,
+        'executor_type': executor,
+        'agent_backend': backend,
+        'codex_backend_enabled': codex_enabled,
+        'workload_class': workload,
+        'resource_class': str(merged.get('resource_class') or ''),
+        'reasons': reasons,
+    }
+
+
+def build_dry_run_selection(root: Path, *, prefix: str | None, limit: int) -> dict:
+    task_ids = pending_dispatch_task_ids(root, prefix=prefix, limit=limit)
+    eligible: list[dict] = []
+    rejected: list[dict] = []
+    skipped: list[dict] = []
+    for tid in task_ids:
+        status = codex_metadata_status(root, tid)
+        if status['valid_codex_metadata']:
+            eligible.append(status)
+        elif status['intended_codex']:
+            rejected.append(status)
+        else:
+            skipped.append(status)
+    return {
+        'selector_version': 1,
+        'root': str(root),
+        'prefix': prefix,
+        'limit': limit,
+        'scanned_count': len(task_ids),
+        'eligible_count': len(eligible),
+        'rejected_count': len(rejected),
+        'skipped_count': len(skipped),
+        'eligible': eligible,
+        'rejected': rejected,
+        'skipped': skipped,
+        'side_effects': 'none; dry-run selector does not claim or move dispatch files',
+    }
+
 def build_performance_summary(
     *,
     args: argparse.Namespace,
@@ -358,8 +446,8 @@ def launch(root: Path, worker: Path, tid: str, out: Path) -> subprocess.Popen | 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument('--base', required=True)
-    ap.add_argument('--count', type=int, required=True)
+    ap.add_argument('--base', default=None)
+    ap.add_argument('--count', type=int, default=None)
     ap.add_argument('--window', type=int, default=24)
     ap.add_argument('--retry-window', type=int, default=4)
     ap.add_argument('--max-retries', type=int, default=1)
@@ -370,8 +458,20 @@ def main() -> int:
     ap.add_argument('--telemetry-only', action='store_true', help='Only write summary/performance for existing task state; do not launch workers.')
     ap.add_argument('--started-at', default=None, help='Optional ISO timestamp for telemetry-only wall time.')
     ap.add_argument('--finished-at', default=None, help='Optional ISO timestamp for telemetry-only wall time.')
+    ap.add_argument('--dry-run-selector', action='store_true', help='List pending Codex-eligible tasks without claiming or executing them.')
+    ap.add_argument('--selector-prefix', default=None, help='Optional pending task_id prefix for dry-run selector.')
+    ap.add_argument('--selector-limit', type=int, default=50)
     args = ap.parse_args()
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
+    if args.dry_run_selector:
+        selection = build_dry_run_selection(ROOT, prefix=args.selector_prefix, limit=args.selector_limit)
+        (out / 'selector.json').write_text(json.dumps(selection, ensure_ascii=False, indent=2), encoding='utf-8')
+        summary = {'dry_run_selector': True, 'eligible_count': selection['eligible_count'], 'rejected_count': selection['rejected_count'], 'skipped_count': selection['skipped_count'], 'scanned_count': selection['scanned_count'], 'side_effects': selection['side_effects']}
+        (out / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+        print(json.dumps(summary, ensure_ascii=False))
+        return 0
+    if not args.base or args.count is None:
+        raise SystemExit('--base and --count are required unless --dry-run-selector is used')
     ids = [f'{args.base}-{i}' for i in range(1, args.count + 1)]
     effective_window, policy_receipt = apply_concurrency_policy(args, ROOT, ids)
     args.window = effective_window

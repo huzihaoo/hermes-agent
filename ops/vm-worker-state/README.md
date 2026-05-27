@@ -74,11 +74,40 @@ Runtime validation performed on VM:
 - Phase 1: `performance.json` telemetry generation plus `--telemetry-only` post-processing.
 - Phase 2: adaptive concurrency policy receipts and fail-closed VM-heavy blocking.
 
+
+## Scheduler / daemon discovery
+
+Live VM discovery found these current candidates:
+
+- active user service: `hermes-vm-coding-worker-daemon.service`
+- active watchdog: `hermes-vm-scheduler-operator-summary-watchdog.service`
+- scheduler source: `/home/mini/.hermes/worker-state/vm_coding_worker_scheduler.py`
+- daemon wrapper source: `/home/mini/.hermes/worker-state/vm_coding_worker_daemon.py`
+- service example: `/home/mini/.hermes/worker-state/hermes-vm-coding-worker-scheduler.service.example`
+
+The service example is explicitly dry-run/shadow by default. Do not enable execute mode without an approved isolated/cutover drill.
+
+## Dry-run selector
+
+`vm_codex_window_runner.py` now supports:
+
+```bash
+python3 vm_codex_window_runner.py   --out /mnt/tmp/<selector_out>   --dry-run-selector   --selector-prefix <optional-prefix>   --selector-limit 50
+```
+
+It writes `selector.json` and `summary.json`, classifying pending tasks as:
+
+- `eligible`: valid `executor_type=coding_agent`, `agent_backend=codex`, `codex_backend_enabled=true`
+- `rejected`: intended Codex tasks with incomplete/wrong metadata
+- `skipped`: non-Codex tasks
+
+It has no dispatch side effects: it does not claim, move, or execute tasks.
+
 ## Next planned phase
 
 Follow `codex-concurrency-development-plan-20260526.md`:
 
-1. Locate and integrate the live scheduler/daemon source path with dry-run selector first.
+1. Wire this dry-run selector into the discovered scheduler path without execute mode.
 2. Run daemon-driven read-only N=12 with policy receipts and performance telemetry.
 3. Run isolated scratch patch/test N=6 before any real repo mutation smoke.
 4. Add Dashboard/operator visibility for policy, final marker, verification, and artifacts.

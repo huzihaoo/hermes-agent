@@ -2,7 +2,7 @@
   "generated_at": "2026-05-26T17:55:00+08:00",
   "scope": "VM Codex coding-agent concurrency evidence snapshot",
   "branch": "vm-codex-window-runner-20260526",
-  "latest_local_commit_observed": "a0284e457 feat(ops): emit Codex window telemetry",
+  "latest_local_commit_observed": "8569e69ce feat(ops): gate Codex runner concurrency policy",
   "vm_health_latest_observed": {
     "ssh_ok": true,
     "ssh_extra": "0/4",
@@ -50,7 +50,7 @@
     "recheck_done": 12,
     "rca": "runner.log contained finalAssistantVisibleText/finalAssistantRawText, but codex-last-message.txt was not persisted in some retry/embedded paths; fixed by promoting final text artifact."
   },
-  "next_phase": "Phase 3: scheduler / daemon integration dry-run selector",
+  "next_phase": "Phase 3b: wire dry-run selector into scheduler path without execute mode",
   "phase1_telemetry": {
     "implemented": true,
     "runner_generates": [
@@ -123,5 +123,25 @@
       "live_n24_repo_read_non_regression": "/mnt/tmp/codex_readonly_real24_phase2_telemetry_20260527/summary.json"
     },
     "blocked_semantics": "blocked summaries report ok_count=0/done=0 and keep rows only for diagnostics, so old terminal state cannot be misread as a successful blocked run."
+  },
+  "phase3_dry_run_selector": {
+    "implemented": true,
+    "live_daemon_discovery": {
+      "active_service": "hermes-vm-coding-worker-daemon.service",
+      "active_watchdog": "hermes-vm-scheduler-operator-summary-watchdog.service",
+      "scheduler_source": "/home/mini/.hermes/worker-state/vm_coding_worker_scheduler.py",
+      "daemon_wrapper_source": "/home/mini/.hermes/worker-state/vm_coding_worker_daemon.py",
+      "service_example": "/home/mini/.hermes/worker-state/hermes-vm-coding-worker-scheduler.service.example"
+    },
+    "selector_evidence": {
+      "selector_path": "/mnt/tmp/codex_dryrun_selector_phase3_20260527/selector.json",
+      "summary_path": "/mnt/tmp/codex_dryrun_selector_phase3_20260527/summary.json",
+      "eligible_count": 1,
+      "rejected_count": 1,
+      "skipped_count": 1,
+      "dispatch_unchanged": true,
+      "fixture_prefix": "codex-dryrun-selector-phase3-20260527"
+    },
+    "side_effects": "none; dry-run selector does not claim or move dispatch files"
   }
 }

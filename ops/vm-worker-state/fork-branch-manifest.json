@@ -2,17 +2,17 @@
   "branch": "vm-codex-window-runner-20260526",
   "publish_remote": "fork",
   "do_not_push": "origin",
-  "latest_commit_before_this_manifest_refresh": "a0284e457",
+  "latest_commit_before_this_manifest_refresh": "8569e69ce",
   "files": [
     {
       "path": "ops/vm-worker-state/README.md",
-      "size": 4460,
-      "sha256": "93f84ec3ecb2cea3a50197d9a4a550be4cc3ba7521ad26205f36867d9440bb8e"
+      "size": 5663,
+      "sha256": "32f2535a75d8afc36e8a7012920a4e91bcf41d6c418024de0bf17c5ca3d14ef9"
     },
     {
       "path": "ops/vm-worker-state/vm_codex_window_runner.py",
-      "size": 21215,
-      "sha256": "3859710589df753af8260b996b33216f06bab34a22c44109acfeb290b421e881"
+      "size": 25607,
+      "sha256": "bcdbe4e309cc590e3fd0afc7f9e45241ba72ecc64366afe3d32d965d0c7c509f"
     },
     {
       "path": "ops/vm-worker-state/vm_coding_worker_v2.py",
@@ -26,13 +26,13 @@
     },
     {
       "path": "ops/vm-worker-state/evidence/20260526-codex-concurrency-evidence.json",
-      "size": 4893,
-      "sha256": "9bfaefb616f1998a6e59a268a703978fd5fb2433c640720b4d53a3370e406b0a"
+      "size": 5925,
+      "sha256": "30274e3d8aaa3d54cd8eb7f54cbb9f17467d064c56a45c4c7ba6097c92280cdd"
     },
     {
       "path": "ops/vm-worker-state/manifest.json",
-      "size": 1837,
-      "sha256": "e3f75921915666eefc6b193bb06bae9fb7c1e1bc95bbff91dba81950e598d9a2"
+      "size": 1725,
+      "sha256": "eabb2e053a0579af10ed5bdff1d4c9863c6083307cd7404d49ce17c795bee150"
     }
   ],
   "self_hash_note": "fork-branch-manifest.json does not include its own sha256 to avoid self-referential drift."

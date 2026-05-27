@@ -1,17 +1,17 @@
 {
   "pack": "vm_codex_window_runner_patch_20260526",
   "updated_at": "2026-05-27",
-  "latest_commit_before_this_manifest_refresh": "a0284e457",
+  "latest_commit_before_this_manifest_refresh": "8569e69ce",
   "files": [
     {
       "path": "ops/vm-worker-state/README.md",
-      "size": 4460,
-      "sha256": "93f84ec3ecb2cea3a50197d9a4a550be4cc3ba7521ad26205f36867d9440bb8e"
+      "size": 5663,
+      "sha256": "32f2535a75d8afc36e8a7012920a4e91bcf41d6c418024de0bf17c5ca3d14ef9"
     },
     {
       "path": "ops/vm-worker-state/vm_codex_window_runner.py",
-      "size": 21215,
-      "sha256": "3859710589df753af8260b996b33216f06bab34a22c44109acfeb290b421e881"
+      "size": 25607,
+      "sha256": "bcdbe4e309cc590e3fd0afc7f9e45241ba72ecc64366afe3d32d965d0c7c509f"
     },
     {
       "path": "ops/vm-worker-state/vm_coding_worker_v2.py",
@@ -25,17 +25,16 @@
     },
     {
       "path": "ops/vm-worker-state/evidence/20260526-codex-concurrency-evidence.json",
-      "size": 4893,
-      "sha256": "9bfaefb616f1998a6e59a268a703978fd5fb2433c640720b4d53a3370e406b0a"
+      "size": 5925,
+      "sha256": "30274e3d8aaa3d54cd8eb7f54cbb9f17467d064c56a45c4c7ba6097c92280cdd"
     }
   ],
   "manifest_note": "This manifest intentionally excludes manifest files from file hashes to avoid self-referential drift.",
   "vm_path": "/mnt/tmp/vm_codex_window_runner_patch_20260526",
   "cifs": "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/vm_codex_window_runner_patch_20260526/",
   "live_evidence": {
+    "phase3_dry_run_selector": "/mnt/tmp/codex_dryrun_selector_phase3_20260527/selector.json",
     "phase2_vm_heavy_blocked": "/mnt/tmp/codex_readonly_real12_phase2_policy_block_20260527b/summary.json",
-    "phase2_repo_read_clamp": "/mnt/tmp/codex_readonly_real12_phase2_policy_clamp_20260527/policy.json",
-    "phase2_n24_non_regression": "/mnt/tmp/codex_readonly_real24_phase2_telemetry_20260527/summary.json",
-    "phase1_n12_performance": "/mnt/tmp/codex_readonly_real12_phase1_20260527_0855/performance.json"
+    "phase2_n24_non_regression": "/mnt/tmp/codex_readonly_real24_phase2_telemetry_20260527/summary.json"
   }
 }
