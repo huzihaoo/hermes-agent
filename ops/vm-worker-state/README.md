@@ -148,3 +148,23 @@ The only Codex-like pending task was the intentional metadata-rejected fixture (
 - but there is currently no honest live eligible pending Codex sample to claim as proof.
 
 Do not fabricate a live eligible selector result from this cycle.
+
+
+
+### Phase 3d live eligible dry-run observation
+
+A safe live-root eligible Codex fixture was created briefly, observed by scheduler dry-run, and then removed.
+
+Evidence:
+
+```text
+/mnt/tmp/codex_scheduler_phase3d_live_eligible_20260527/plan.json
+```
+
+Observed:
+- `eligible_count=1`
+- fixture task was seen under `codex_dry_run_selector.eligible`
+- dispatch path stayed in `pending` before and after dry-run
+- fixture was cleaned up immediately after observation
+
+This is the first honest live-root proof that the scheduler dry-run selector can see a pending eligible Codex task without claim/execute side effects.

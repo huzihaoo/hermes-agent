@@ -1,12 +1,12 @@
 {
   "pack": "vm_codex_window_runner_patch_20260526",
   "updated_at": "2026-05-27",
-  "latest_commit_before_this_manifest_refresh": "23131fc9b",
+  "latest_commit_before_this_manifest_refresh": "83ff542ff",
   "files": [
     {
       "path": "ops/vm-worker-state/README.md",
-      "size": 7112,
-      "sha256": "eda13979e41800078efdeb202932ef028f87483129dff766a10bfde903e0f2be"
+      "size": 7727,
+      "sha256": "0be2755158fd5a43b85408ef49569fbcb4394ce5a3b0aba170ac947fc732f2f1"
     },
     {
       "path": "ops/vm-worker-state/vm_codex_window_runner.py",
@@ -30,16 +30,16 @@
     },
     {
       "path": "ops/vm-worker-state/evidence/20260526-codex-concurrency-evidence.json",
-      "size": 7877,
-      "sha256": "d37ffc8bdcad99a6972d86d34fed170c88cadf398d0d042386a4c01e3595aa03"
+      "size": 8260,
+      "sha256": "043dd382697c93d79173cc42ee07d908c25f1698e0ca6d5b9a0ef95dba144d52"
     }
   ],
   "manifest_note": "This manifest intentionally excludes manifest files from file hashes to avoid self-referential drift.",
   "vm_path": "/mnt/tmp/vm_codex_window_runner_patch_20260526",
   "cifs": "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/vm_codex_window_runner_patch_20260526/",
   "live_evidence": {
+    "phase3d_live_eligible_plan": "/mnt/tmp/codex_scheduler_phase3d_live_eligible_20260527/plan.json",
     "phase3c_live_scheduler_plan": "/mnt/tmp/codex_scheduler_phase3c_live_observe_20260527/plan.json",
-    "phase3b_scheduler_isolated_selector": "/mnt/tmp/codex_scheduler_dryrun_phase3b_isolated_20260527/out/plan.json",
-    "phase3_runner_selector": "/mnt/tmp/codex_dryrun_selector_phase3_20260527/selector.json"
+    "phase3b_scheduler_isolated_selector": "/mnt/tmp/codex_scheduler_dryrun_phase3b_isolated_20260527/out/plan.json"
   }
 }

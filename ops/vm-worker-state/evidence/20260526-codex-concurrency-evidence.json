@@ -2,7 +2,7 @@
   "generated_at": "2026-05-26T17:55:00+08:00",
   "scope": "VM Codex coding-agent concurrency evidence snapshot",
   "branch": "vm-codex-window-runner-20260526",
-  "latest_local_commit_observed": "23131fc9b feat(ops): surface Codex selector in scheduler dry-run",
+  "latest_local_commit_observed": "83ff542ff docs(ops): record live Codex dry-run boundary",
   "vm_health_latest_observed": {
     "ssh_ok": true,
     "ssh_extra": "0/4",
@@ -50,7 +50,7 @@
     "recheck_done": 12,
     "rca": "runner.log contained finalAssistantVisibleText/finalAssistantRawText, but codex-last-message.txt was not persisted in some retry/embedded paths; fixed by promoting final text artifact."
   },
-  "next_phase": "Phase 3d: wait for or stage a real pending eligible Codex task in a safe boundary, or move to daemon-driven read-only N=12 only after explicit cutover approval",
+  "next_phase": "Phase 4: isolated patch/test coding smoke or daemon-driven read-only N=12 after explicit cutover choice",
   "phase1_telemetry": {
     "implemented": true,
     "runner_generates": [
@@ -183,5 +183,15 @@
       }
     ],
     "boundary": "At observation time there were no live pending eligible Codex tasks; do not fabricate a live eligible dry-run result. The scheduler dry-run path itself works, but current live evidence only shows metadata-rejected/skipped pending tasks."
+  },
+  "phase3d_live_eligible_dry_run": {
+    "plan": "/mnt/tmp/codex_scheduler_phase3d_live_eligible_20260527/plan.json",
+    "fixture_task_id": "codex-live-eligible-phase3d-20260527-eligible",
+    "eligible_count": 1,
+    "fixture_seen_as_eligible": true,
+    "dispatch_before": "pending",
+    "dispatch_after": "pending",
+    "side_effects": "none during observation; fixture cleaned immediately after observation",
+    "cleanup_verified": true
   }
 }

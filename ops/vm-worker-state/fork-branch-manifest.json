@@ -2,12 +2,12 @@
   "branch": "vm-codex-window-runner-20260526",
   "publish_remote": "fork",
   "do_not_push": "origin",
-  "latest_commit_before_this_manifest_refresh": "23131fc9b",
+  "latest_commit_before_this_manifest_refresh": "83ff542ff",
   "files": [
     {
       "path": "ops/vm-worker-state/README.md",
-      "size": 7112,
-      "sha256": "eda13979e41800078efdeb202932ef028f87483129dff766a10bfde903e0f2be"
+      "size": 7727,
+      "sha256": "0be2755158fd5a43b85408ef49569fbcb4394ce5a3b0aba170ac947fc732f2f1"
     },
     {
       "path": "ops/vm-worker-state/vm_codex_window_runner.py",
@@ -31,13 +31,13 @@
     },
     {
       "path": "ops/vm-worker-state/evidence/20260526-codex-concurrency-evidence.json",
-      "size": 7877,
-      "sha256": "d37ffc8bdcad99a6972d86d34fed170c88cadf398d0d042386a4c01e3595aa03"
+      "size": 8260,
+      "sha256": "043dd382697c93d79173cc42ee07d908c25f1698e0ca6d5b9a0ef95dba144d52"
     },
     {
       "path": "ops/vm-worker-state/manifest.json",
-      "size": 1915,
-      "sha256": "34ce18ad3a0fd8f03119d45fc5e680bf3750c45e238019114ef6b82de0dab73d"
+      "size": 1924,
+      "sha256": "e92a3f74bf2ba5571603cef0fc814c12f1ea751ecd63861d16412d8ba5ad4fb7"
     }
   ],
   "self_hash_note": "fork-branch-manifest.json does not include its own sha256 to avoid self-referential drift."
