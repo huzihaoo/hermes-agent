@@ -92,6 +92,79 @@ def collect_rows(root: Path, worker: Path, ids: list[str], expected_prefix: str 
     return rows
 
 
+
+
+
+def task_meta(root: Path, tid: str) -> dict:
+    return read_json(root / 'tasks' / tid / 'meta.json')
+
+
+def infer_workload_class(root: Path, ids: list[str], requested: str | None = None) -> str:
+    if requested and requested != 'auto':
+        return requested
+    texts: list[str] = []
+    for tid in ids:
+        meta = task_meta(root, tid)
+        for key in ('resource_class', 'smoke', 'lane', 'repo_scope', 'target_file'):
+            value = meta.get(key)
+            if value is not None:
+                texts.append(str(value).lower())
+    joined = ' '.join(texts)
+    if any(token in joined for token in ('mcap', 'vm_heavy', 'dnp_heavy', 'open-foxglove', 'mcap_data_translate')):
+        return 'vm_heavy'
+    if 'patch' in joined or 'test' in joined and 'repo_read' not in joined:
+        return 'patch_test'
+    if 'canary' in joined or 'synthetic' in joined:
+        return 'canary'
+    if 'repo_read' in joined or 'readonly' in joined or 'read-only' in joined:
+        return 'repo_read'
+    return 'repo_read'
+
+
+POLICY_LIMITS = {
+    'canary': {'default_window': 24, 'max_window': 32, 'blocked': False},
+    'repo_read': {'default_window': 6, 'max_window': 8, 'blocked': False},
+    'patch_test': {'default_window': 2, 'max_window': 4, 'blocked': False},
+    'vm_heavy': {'default_window': 0, 'max_window': 0, 'blocked': True},
+}
+
+
+def apply_concurrency_policy(args: argparse.Namespace, root: Path, ids: list[str]) -> tuple[int, dict]:
+    workload = infer_workload_class(root, ids, getattr(args, 'workload_class', 'auto'))
+    policy = POLICY_LIMITS.get(workload, POLICY_LIMITS['repo_read'])
+    requested_window = int(args.window)
+    effective_window = requested_window
+    decision = 'allow'
+    reasons: list[str] = []
+    if policy['blocked']:
+        decision = 'block'
+        effective_window = 0
+        reasons.append(f'workload_class {workload} must use governed VM tooling, not Codex window runner')
+    elif requested_window > policy['max_window'] and not getattr(args, 'allow_window_override', False):
+        decision = 'clamp'
+        effective_window = int(policy['max_window'])
+        reasons.append(f'requested window {requested_window} exceeds {workload} max {policy["max_window"]}')
+    elif requested_window <= 0:
+        decision = 'default'
+        effective_window = int(policy['default_window'])
+        reasons.append(f'non-positive window requested; using {workload} default {effective_window}')
+    receipt = {
+        'policy_version': 1,
+        'workload_class': workload,
+        'decision': decision,
+        'requested_window': requested_window,
+        'effective_window': effective_window,
+        'default_window': policy['default_window'],
+        'max_window': policy['max_window'],
+        'allow_window_override': bool(getattr(args, 'allow_window_override', False)),
+        'reasons': reasons,
+    }
+    return effective_window, receipt
+
+
+def write_policy_receipt(out: Path, receipt: dict) -> None:
+    (out / 'policy.json').write_text(json.dumps(receipt, ensure_ascii=False, indent=2), encoding='utf-8')
+
 def build_performance_summary(
     *,
     args: argparse.Namespace,
@@ -126,6 +199,7 @@ def build_performance_summary(
         'configured_window': args.window,
         'retry_window': args.retry_window,
         'max_retries': args.max_retries,
+        'policy': read_json(out / 'policy.json'),
         'ok_count': ok_count,
         'done': sum(r.get('state') == 'done' for r in rows),
         'failed': sum(r.get('state') == 'failed' for r in rows),
@@ -291,12 +365,25 @@ def main() -> int:
     ap.add_argument('--max-retries', type=int, default=1)
     ap.add_argument('--out', required=True)
     ap.add_argument('--expected-prefix', default=None)
+    ap.add_argument('--workload-class', default='auto', choices=['auto', 'canary', 'repo_read', 'patch_test', 'vm_heavy'])
+    ap.add_argument('--allow-window-override', action='store_true', help='Allow window above policy max for explicit experiments.')
     ap.add_argument('--telemetry-only', action='store_true', help='Only write summary/performance for existing task state; do not launch workers.')
     ap.add_argument('--started-at', default=None, help='Optional ISO timestamp for telemetry-only wall time.')
     ap.add_argument('--finished-at', default=None, help='Optional ISO timestamp for telemetry-only wall time.')
     args = ap.parse_args()
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
     ids = [f'{args.base}-{i}' for i in range(1, args.count + 1)]
+    effective_window, policy_receipt = apply_concurrency_policy(args, ROOT, ids)
+    args.window = effective_window
+    write_policy_receipt(out, policy_receipt)
+    if policy_receipt.get('decision') == 'block':
+        rows = collect_rows(ROOT, WORKER, ids, args.expected_prefix)
+        summary = {'base': args.base, 'count': args.count, 'window': args.window, 'retry_window': args.retry_window, 'max_retries': args.max_retries, 'ok_count': 0, 'done': 0, 'failed': 0, 'claimed': 0, 'pending': len(rows), 'failures': rows, 'blocked': True, 'block_reason': '; '.join(policy_receipt.get('reasons') or []), 'rows': rows}
+        (out / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+        performance = build_performance_summary(args=args, out=out, rows=rows, started_at=now(), finished_at=now(), retries={})
+        (out / 'performance.json').write_text(json.dumps(performance, ensure_ascii=False, indent=2), encoding='utf-8')
+        print(json.dumps(summary, ensure_ascii=False))
+        return 2
     retries = {tid: 0 for tid in ids}
     running: dict[str, subprocess.Popen] = {}
     started = time.time()

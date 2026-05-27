@@ -2,7 +2,7 @@
   "generated_at": "2026-05-26T17:55:00+08:00",
   "scope": "VM Codex coding-agent concurrency evidence snapshot",
   "branch": "vm-codex-window-runner-20260526",
-  "latest_local_commit_observed": "d097b2110 docs(ops): plan VM Codex concurrency rollout",
+  "latest_local_commit_observed": "a0284e457 feat(ops): emit Codex window telemetry",
   "vm_health_latest_observed": {
     "ssh_ok": true,
     "ssh_extra": "0/4",
@@ -50,7 +50,7 @@
     "recheck_done": 12,
     "rca": "runner.log contained finalAssistantVisibleText/finalAssistantRawText, but codex-last-message.txt was not persisted in some retry/embedded paths; fixed by promoting final text artifact."
   },
-  "next_phase": "Phase 2: adaptive concurrency policy",
+  "next_phase": "Phase 3: scheduler / daemon integration dry-run selector",
   "phase1_telemetry": {
     "implemented": true,
     "runner_generates": [
@@ -87,5 +87,41 @@
       "duplicate_start_task_ids": [],
       "retry_count_total": 0
     }
+  },
+  "phase2_policy": {
+    "implemented": true,
+    "policy_limits": {
+      "canary": {
+        "default_window": 24,
+        "max_window": 32,
+        "blocked": false
+      },
+      "repo_read": {
+        "default_window": 6,
+        "max_window": 8,
+        "blocked": false
+      },
+      "patch_test": {
+        "default_window": 2,
+        "max_window": 4,
+        "blocked": false
+      },
+      "vm_heavy": {
+        "default_window": 0,
+        "max_window": 0,
+        "blocked": true
+      }
+    },
+    "verified_cases": {
+      "fixture_repo_read_window24_clamped_to_8": true,
+      "fixture_canary_window24_allowed": true,
+      "fixture_patch_test_window8_clamped_to_4": true,
+      "fixture_repo_read_override_allows_window24": true,
+      "fixture_repo_read_window0_defaults_to_6": true,
+      "live_vm_heavy_blocked": "/mnt/tmp/codex_readonly_real12_phase2_policy_block_20260527b/summary.json",
+      "live_repo_read_window24_clamped": "/mnt/tmp/codex_readonly_real12_phase2_policy_clamp_20260527/policy.json",
+      "live_n24_repo_read_non_regression": "/mnt/tmp/codex_readonly_real24_phase2_telemetry_20260527/summary.json"
+    },
+    "blocked_semantics": "blocked summaries report ok_count=0/done=0 and keep rows only for diagnostics, so old terminal state cannot be misread as a successful blocked run."
   }
 }

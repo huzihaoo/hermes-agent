@@ -68,14 +68,17 @@ Runtime validation performed on VM:
 - Strongest real smoke is read-only repo inspection. Isolated patch/test coding smoke is still pending.
 - Dashboard/operator observability for this Codex lane still needs API/list/detail proof.
 
+## Completed rollout phases in this pack
+
+- Phase 0: evidence and manifest reconciliation.
+- Phase 1: `performance.json` telemetry generation plus `--telemetry-only` post-processing.
+- Phase 2: adaptive concurrency policy receipts and fail-closed VM-heavy blocking.
+
 ## Next planned phase
 
 Follow `codex-concurrency-development-plan-20260526.md`:
 
-1. Add performance telemetry and post-process existing N=24 evidence.
-2. Encode adaptive concurrency policy:
-   - repo_read default window=6
-   - repo_read max window=8 until N=48 proves stable
-   - block VM-heavy/MCAP/DNP-heavy work from this Codex lane
-3. Locate and integrate the live scheduler/daemon source path with dry-run selector first.
-4. Run isolated scratch patch/test N=6 before any real repo mutation smoke.
+1. Locate and integrate the live scheduler/daemon source path with dry-run selector first.
+2. Run daemon-driven read-only N=12 with policy receipts and performance telemetry.
+3. Run isolated scratch patch/test N=6 before any real repo mutation smoke.
+4. Add Dashboard/operator visibility for policy, final marker, verification, and artifacts.
