@@ -2,7 +2,7 @@
   "generated_at": "2026-05-26T17:55:00+08:00",
   "scope": "VM Codex coding-agent concurrency evidence snapshot",
   "branch": "vm-codex-window-runner-20260526",
-  "latest_local_commit_observed": "8569e69ce feat(ops): gate Codex runner concurrency policy",
+  "latest_local_commit_observed": "5817a87f7 feat(ops): add Codex dry-run selector",
   "vm_health_latest_observed": {
     "ssh_ok": true,
     "ssh_extra": "0/4",
@@ -50,7 +50,7 @@
     "recheck_done": 12,
     "rca": "runner.log contained finalAssistantVisibleText/finalAssistantRawText, but codex-last-message.txt was not persisted in some retry/embedded paths; fixed by promoting final text artifact."
   },
-  "next_phase": "Phase 3b: wire dry-run selector into scheduler path without execute mode",
+  "next_phase": "Phase 3c: scheduler dry-run lane selector on real pending Codex tasks without execute, then daemon-driven N=12 only after explicit cutover boundary",
   "phase1_telemetry": {
     "implemented": true,
     "runner_generates": [
@@ -143,5 +143,24 @@
       "fixture_prefix": "codex-dryrun-selector-phase3-20260527"
     },
     "side_effects": "none; dry-run selector does not claim or move dispatch files"
+  },
+  "phase3b_scheduler_dry_run_selector": {
+    "implemented": true,
+    "packaged_scheduler": "ops/vm-worker-state/vm_coding_worker_scheduler.py",
+    "live_scheduler": "/home/mini/.hermes/worker-state/vm_coding_worker_scheduler.py",
+    "isolated_plan": "/mnt/tmp/codex_scheduler_dryrun_phase3b_isolated_20260527/out/plan.json",
+    "isolated_shared_state": "/mnt/tmp/codex_scheduler_dryrun_phase3b_isolated_20260527/shared-state",
+    "isolated_result": {
+      "eligible_count": 1,
+      "rejected_count": 1,
+      "skipped_count": 1,
+      "dispatch_unchanged": true
+    },
+    "live_root_risk": "active hermes-vm-coding-worker-daemon.service may claim eligible pending tasks before shadow dry-run observes them; use isolated roots for selector fixtures and do not infer selector failure from live pending churn.",
+    "live_root_observation": {
+      "fixture_eligible_moved_to": "claimed",
+      "fixture_rejected": "pending",
+      "fixture_skipped": "pending"
+    }
   }
 }

@@ -1,12 +1,12 @@
 {
   "pack": "vm_codex_window_runner_patch_20260526",
   "updated_at": "2026-05-27",
-  "latest_commit_before_this_manifest_refresh": "8569e69ce",
+  "latest_commit_before_this_manifest_refresh": "5817a87f7",
   "files": [
     {
       "path": "ops/vm-worker-state/README.md",
-      "size": 5663,
-      "sha256": "32f2535a75d8afc36e8a7012920a4e91bcf41d6c418024de0bf17c5ca3d14ef9"
+      "size": 6350,
+      "sha256": "85ebf856581ed7e21eeebfab532252ae522344ceb950b708d649541c7b066409"
     },
     {
       "path": "ops/vm-worker-state/vm_codex_window_runner.py",
@@ -19,22 +19,27 @@
       "sha256": "8d1b73ce9df9a70f09186589d41cea40321a9c43053099bf3b7648d67d222193"
     },
     {
+      "path": "ops/vm-worker-state/vm_coding_worker_scheduler.py",
+      "size": 56465,
+      "sha256": "277f0dc9a09177038feefb0802ececb0909bbf947a2fbed591d41034c06ea610"
+    },
+    {
       "path": "ops/vm-worker-state/codex-concurrency-development-plan-20260526.md",
       "size": 16738,
       "sha256": "adabbb0dfd410c7726edd34e7f8c8afafd8b107895ce3378f18a0c4dc3e58ffe"
     },
     {
       "path": "ops/vm-worker-state/evidence/20260526-codex-concurrency-evidence.json",
-      "size": 5925,
-      "sha256": "30274e3d8aaa3d54cd8eb7f54cbb9f17467d064c56a45c4c7ba6097c92280cdd"
+      "size": 6968,
+      "sha256": "002213f1be8d68912deb595e1baa36780e874608f3459e1d31e848a9b141d35d"
     }
   ],
   "manifest_note": "This manifest intentionally excludes manifest files from file hashes to avoid self-referential drift.",
   "vm_path": "/mnt/tmp/vm_codex_window_runner_patch_20260526",
   "cifs": "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/vm_codex_window_runner_patch_20260526/",
   "live_evidence": {
-    "phase3_dry_run_selector": "/mnt/tmp/codex_dryrun_selector_phase3_20260527/selector.json",
-    "phase2_vm_heavy_blocked": "/mnt/tmp/codex_readonly_real12_phase2_policy_block_20260527b/summary.json",
-    "phase2_n24_non_regression": "/mnt/tmp/codex_readonly_real24_phase2_telemetry_20260527/summary.json"
+    "phase3b_scheduler_isolated_selector": "/mnt/tmp/codex_scheduler_dryrun_phase3b_isolated_20260527/out/plan.json",
+    "phase3_runner_selector": "/mnt/tmp/codex_dryrun_selector_phase3_20260527/selector.json",
+    "phase2_vm_heavy_blocked": "/mnt/tmp/codex_readonly_real12_phase2_policy_block_20260527b/summary.json"
   }
 }

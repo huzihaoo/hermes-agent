@@ -103,6 +103,19 @@ It writes `selector.json` and `summary.json`, classifying pending tasks as:
 
 It has no dispatch side effects: it does not claim, move, or execute tasks.
 
+
+### Phase 3b scheduler dry-run selector evidence
+
+`vm_coding_worker_scheduler.py` now exposes `codex_dry_run_selector` in its dry-run plan output. It classifies pending tasks into `eligible`, `rejected`, and `skipped` using the same Codex metadata gate.
+
+Validation used an isolated shared-state root at:
+
+```text
+/mnt/tmp/codex_scheduler_dryrun_phase3b_isolated_20260527/shared-state
+```
+
+The isolated dry-run result was 1 eligible / 1 rejected / 1 skipped and dispatch files were unchanged. A live-root attempt showed why isolated validation matters: the already-active `hermes-vm-coding-worker-daemon.service` can claim eligible pending tasks before a shadow dry-run observes them.
+
 ## Next planned phase
 
 Follow `codex-concurrency-development-plan-20260526.md`:
