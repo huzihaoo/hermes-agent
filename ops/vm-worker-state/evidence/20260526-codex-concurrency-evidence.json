@@ -1,0 +1,54 @@
+{
+  "generated_at": "2026-05-26T17:55:00+08:00",
+  "scope": "VM Codex coding-agent concurrency evidence snapshot",
+  "branch": "vm-codex-window-runner-20260526",
+  "latest_local_commit_observed": "8c77dd2c4 fix(ops): persist Codex final marker artifact",
+  "vm_health_latest_observed": {
+    "ssh_ok": true,
+    "ssh_extra": "0/4",
+    "mux": "ok",
+    "resource_ok_for_submit": true,
+    "cpu": 128,
+    "mem_available_gib_approx": 113.9,
+    "swap_free_gib_approx": 31.26,
+    "background_loadavg_approx": "16.89 7.63 4.18",
+    "dnp_real": "6/32",
+    "dnp_like": "10/136",
+    "mcap_rss_gib_approx": 4.6
+  },
+  "strongest_real_readonly_smoke": {
+    "task_base": "codex-readonly-real24-20260526-1709",
+    "run_task_id": "codex-readonly-real24-run-20260526-1709",
+    "summary_path": "/mnt/tmp/codex_readonly_real24_20260526_1709/summary.json",
+    "run_status_path": "/mnt/tmp/codex-readonly-real24-run-20260526-1709/status.json",
+    "waves_path": "/mnt/tmp/codex_readonly_real24_20260526_1709/waves.log",
+    "user_visible_cifs": "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/codex_readonly_real24_20260526_1709/",
+    "count": 24,
+    "configured_window": 6,
+    "max_retries": 1,
+    "ok_count": 24,
+    "done": 24,
+    "failed": 0,
+    "claimed": 0,
+    "pending": 0,
+    "started_at": "2026-05-26T17:29:55+0800",
+    "finished_at": "2026-05-26T17:40:12+0800",
+    "wall_seconds": 617,
+    "tasks_per_minute": 2.33,
+    "avg_wall_seconds_per_task": 25.7
+  },
+  "historical_false_negative_rca": {
+    "initial_summary_path": "/mnt/tmp/codex_readonly_real12_20260526_1635/summary.json",
+    "initial_ok_count": 10,
+    "initial_done": 12,
+    "false_negative_task_ids": [
+      "codex-readonly-real12-20260526-1635-8",
+      "codex-readonly-real12-20260526-1635-12"
+    ],
+    "recheck_summary_path": "/mnt/tmp/codex_readonly_real12_20260526_1635_recheck/summary.json",
+    "recheck_ok_count": 12,
+    "recheck_done": 12,
+    "rca": "runner.log contained finalAssistantVisibleText/finalAssistantRawText, but codex-last-message.txt was not persisted in some retry/embedded paths; fixed by promoting final text artifact."
+  },
+  "next_phase": "Phase 0: evidence and manifest reconciliation"
+}

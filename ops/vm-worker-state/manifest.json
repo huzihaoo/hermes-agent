@@ -1,28 +1,40 @@
 {
   "pack": "vm_codex_window_runner_patch_20260526",
-  "created_at": "2026-05-26",
+  "updated_at": "2026-05-26",
+  "latest_commit_before_this_manifest_refresh": "8c77dd2c4",
   "files": [
     {
-      "name": "vm_codex_window_runner.before_accept_payload.py",
-      "size": 11486,
-      "sha256": "3785c68905a11de71bc2eb620c08cebeedc6968d02c87d92dd09b5b46f1cbe56"
+      "path": "ops/vm-worker-state/README.md",
+      "size": 4272,
+      "sha256": "df1b28d4809a807b293f668950cb9271a8199dfd247930774c5c7280ffc3c8b7"
     },
     {
-      "name": "vm_codex_window_runner.py",
+      "path": "ops/vm-worker-state/vm_codex_window_runner.py",
       "size": 11756,
       "sha256": "2c8cc7c80eeb2026130b59adb1a04038057e791e7a54950c41d5585427995360"
     },
     {
-      "name": "vm_coding_worker_v2.before_prompt_override.py",
-      "size": 58762,
-      "sha256": "d5828deba0d86b290c50c6fee2be0fe286a45bf72688d91889fb91a76dc935cc"
+      "path": "ops/vm-worker-state/vm_coding_worker_v2.py",
+      "size": 61722,
+      "sha256": "8d1b73ce9df9a70f09186589d41cea40321a9c43053099bf3b7648d67d222193"
     },
     {
-      "name": "vm_coding_worker_v2.py",
-      "size": 58894,
-      "sha256": "735ed2016c44b6a0d12190c8491768bcf21e2e2457dc6b61db317af4679a3278"
+      "path": "ops/vm-worker-state/codex-concurrency-development-plan-20260526.md",
+      "size": 16738,
+      "sha256": "adabbb0dfd410c7726edd34e7f8c8afafd8b107895ce3378f18a0c4dc3e58ffe"
+    },
+    {
+      "path": "ops/vm-worker-state/evidence/20260526-codex-concurrency-evidence.json",
+      "size": 2220,
+      "sha256": "60e740722bbc61537aff58d0383945289384543c83b511a059ef6c6b4569faa7"
     }
   ],
+  "manifest_note": "This manifest intentionally excludes manifest files from file hashes to avoid self-referential drift.",
   "vm_path": "/mnt/tmp/vm_codex_window_runner_patch_20260526",
-  "cifs": "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/vm_codex_window_runner_patch_20260526/"
+  "cifs": "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/vm_codex_window_runner_patch_20260526/",
+  "live_evidence": {
+    "real_readonly_n24_summary": "/mnt/tmp/codex_readonly_real24_20260526_1709/summary.json",
+    "real_readonly_n24_status": "/mnt/tmp/codex-readonly-real24-run-20260526-1709/status.json",
+    "real_readonly_n12_recheck": "/mnt/tmp/codex_readonly_real12_20260526_1635_recheck/summary.json"
+  }
 }
