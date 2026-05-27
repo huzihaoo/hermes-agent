@@ -124,3 +124,27 @@ Follow `codex-concurrency-development-plan-20260526.md`:
 2. Run daemon-driven read-only N=12 with policy receipts and performance telemetry.
 3. Run isolated scratch patch/test N=6 before any real repo mutation smoke.
 4. Add Dashboard/operator visibility for policy, final marker, verification, and artifacts.
+
+
+
+### Phase 3c live dry-run observation boundary
+
+A live scheduler dry-run observation was executed at:
+
+```text
+/mnt/tmp/codex_scheduler_phase3c_live_observe_20260527/plan.json
+```
+
+At observation time there were no live pending eligible Codex tasks. The live dry-run result was:
+
+- `eligible_count=0`
+- `rejected_count=1`
+- `skipped_count=1`
+- `pending_count=2`
+
+The only Codex-like pending task was the intentional metadata-rejected fixture (`agent_backend=openclaw` with `codex_backend_enabled=true`). Therefore the correct conclusion is:
+
+- scheduler dry-run path works on live root without execute,
+- but there is currently no honest live eligible pending Codex sample to claim as proof.
+
+Do not fabricate a live eligible selector result from this cycle.

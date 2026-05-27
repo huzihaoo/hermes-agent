@@ -2,7 +2,7 @@
   "generated_at": "2026-05-26T17:55:00+08:00",
   "scope": "VM Codex coding-agent concurrency evidence snapshot",
   "branch": "vm-codex-window-runner-20260526",
-  "latest_local_commit_observed": "5817a87f7 feat(ops): add Codex dry-run selector",
+  "latest_local_commit_observed": "23131fc9b feat(ops): surface Codex selector in scheduler dry-run",
   "vm_health_latest_observed": {
     "ssh_ok": true,
     "ssh_extra": "0/4",
@@ -50,7 +50,7 @@
     "recheck_done": 12,
     "rca": "runner.log contained finalAssistantVisibleText/finalAssistantRawText, but codex-last-message.txt was not persisted in some retry/embedded paths; fixed by promoting final text artifact."
   },
-  "next_phase": "Phase 3c: scheduler dry-run lane selector on real pending Codex tasks without execute, then daemon-driven N=12 only after explicit cutover boundary",
+  "next_phase": "Phase 3d: wait for or stage a real pending eligible Codex task in a safe boundary, or move to daemon-driven read-only N=12 only after explicit cutover approval",
   "phase1_telemetry": {
     "implemented": true,
     "runner_generates": [
@@ -162,5 +162,26 @@
       "fixture_rejected": "pending",
       "fixture_skipped": "pending"
     }
+  },
+  "phase3c_live_scheduler_observation": {
+    "live_plan": "/mnt/tmp/codex_scheduler_phase3c_live_observe_20260527/plan.json",
+    "observed_state": "dry_run",
+    "live_pending_count": 2,
+    "live_codex_selector": {
+      "eligible_count": 0,
+      "rejected_count": 1,
+      "skipped_count": 1
+    },
+    "pending_codex_like_count": 1,
+    "pending_codex_like_tasks": [
+      {
+        "task_id": "codex-dryrun-selector-phase3-20260527-rejected",
+        "executor_type": "coding_agent",
+        "agent_backend": "openclaw",
+        "codex_backend_enabled": true,
+        "resource_class": "repo_read"
+      }
+    ],
+    "boundary": "At observation time there were no live pending eligible Codex tasks; do not fabricate a live eligible dry-run result. The scheduler dry-run path itself works, but current live evidence only shows metadata-rejected/skipped pending tasks."
   }
 }
