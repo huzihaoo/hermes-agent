@@ -28,6 +28,14 @@ def now() -> str:
     return datetime.now().isoformat(timespec='seconds')
 
 
+
+def parse_ts(value: str) -> float | None:
+    try:
+        return datetime.fromisoformat(value.strip()).timestamp()
+    except Exception:
+        return None
+
+
 def qstate(root: Path, tid: str) -> str | None:
     for q in ['done', 'failed', 'claimed', 'pending']:
         if (root / 'dispatch' / q / f'{tid}.json').exists():
@@ -48,6 +56,90 @@ def read_text(path: Path) -> str:
         return path.read_text(errors='replace')
     except Exception:
         return ''
+
+
+
+def parse_waves(path: Path) -> list[dict]:
+    waves: list[dict] = []
+    for raw in read_text(path).splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        ts_text, _, rest = line.partition(' start count=')
+        if not rest:
+            waves.append({'raw': line, 'parse_error': 'missing_start_marker'})
+            continue
+        count_text, _, ids_text = rest.partition(' ids=')
+        try:
+            count = int(count_text)
+        except ValueError:
+            count = None
+        ids: list[str] = []
+        if ids_text.startswith('[') and ids_text.endswith(']'):
+            for item in ids_text.strip('[]').split(','):
+                item = item.strip().strip("'").strip('"')
+                if item:
+                    ids.append(item)
+        waves.append({'timestamp': ts_text, 'count': count, 'ids': ids, 'raw': line})
+    return waves
+
+
+def collect_rows(root: Path, worker: Path, ids: list[str], expected_prefix: str | None) -> list[dict]:
+    rows = []
+    for idx, tid in enumerate(ids, 1):
+        msg = expected_message(root, tid, expected_prefix)
+        rows.append({'i': idx, 'task_id': tid, 'state': qstate(root, tid), 'ok': terminal_ok(root, worker, tid, msg)})
+    return rows
+
+
+def build_performance_summary(
+    *,
+    args: argparse.Namespace,
+    out: Path,
+    rows: list[dict],
+    started_at: str | None,
+    finished_at: str | None,
+    retries: dict[str, int] | None = None,
+) -> dict:
+    waves = parse_waves(out / 'waves.log')
+    start_epoch = parse_ts(started_at or '')
+    finish_epoch = parse_ts(finished_at or '')
+    wall_seconds = round(finish_epoch - start_epoch, 3) if start_epoch is not None and finish_epoch is not None else None
+    counts_by_task: dict[str, int] = {}
+    effective_max_wave_count = 0
+    for wave in waves:
+        count = wave.get('count')
+        if isinstance(count, int):
+            effective_max_wave_count = max(effective_max_wave_count, count)
+        for tid in wave.get('ids') or []:
+            counts_by_task[tid] = counts_by_task.get(tid, 0) + 1
+    duplicate_starts = sorted(tid for tid, count in counts_by_task.items() if count > 1)
+    retry_total = sum((retries or {}).values())
+    ok_count = sum(1 for r in rows if r.get('ok'))
+    return {
+        'base': args.base,
+        'count': args.count,
+        'started_at': started_at,
+        'finished_at': finished_at,
+        'wall_seconds': wall_seconds,
+        'tasks_per_minute': round(ok_count / (wall_seconds / 60), 3) if wall_seconds and wall_seconds > 0 else None,
+        'configured_window': args.window,
+        'retry_window': args.retry_window,
+        'max_retries': args.max_retries,
+        'ok_count': ok_count,
+        'done': sum(r.get('state') == 'done' for r in rows),
+        'failed': sum(r.get('state') == 'failed' for r in rows),
+        'claimed': sum(r.get('state') == 'claimed' for r in rows),
+        'pending': sum(r.get('state') == 'pending' for r in rows),
+        'waves_count': len(waves),
+        'effective_max_wave_count': effective_max_wave_count,
+        'started_task_count': len(counts_by_task),
+        'duplicate_start_task_ids': duplicate_starts,
+        'retry_count_total': retry_total,
+        'retry_counts': retries or {},
+        'rows': rows,
+        'telemetry_version': 1,
+    }
 
 
 def pid_alive(pid: object) -> bool:
@@ -199,12 +291,25 @@ def main() -> int:
     ap.add_argument('--max-retries', type=int, default=1)
     ap.add_argument('--out', required=True)
     ap.add_argument('--expected-prefix', default=None)
+    ap.add_argument('--telemetry-only', action='store_true', help='Only write summary/performance for existing task state; do not launch workers.')
+    ap.add_argument('--started-at', default=None, help='Optional ISO timestamp for telemetry-only wall time.')
+    ap.add_argument('--finished-at', default=None, help='Optional ISO timestamp for telemetry-only wall time.')
     args = ap.parse_args()
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
     ids = [f'{args.base}-{i}' for i in range(1, args.count + 1)]
     retries = {tid: 0 for tid in ids}
     running: dict[str, subprocess.Popen] = {}
     started = time.time()
+    started_at = args.started_at or now()
+    if args.telemetry_only:
+        rows = collect_rows(ROOT, WORKER, ids, args.expected_prefix)
+        finished_at = args.finished_at or now()
+        summary = {'base': args.base, 'count': args.count, 'window': args.window, 'retry_window': args.retry_window, 'max_retries': args.max_retries, 'ok_count': sum(r['ok'] for r in rows), 'done': sum(r['state'] == 'done' for r in rows), 'failed': sum(r['state'] == 'failed' for r in rows), 'claimed': sum(r['state'] == 'claimed' for r in rows), 'pending': sum(r['state'] == 'pending' for r in rows), 'failures': [r for r in rows if not r['ok']]}
+        (out / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+        performance = build_performance_summary(args=args, out=out, rows=rows, started_at=started_at, finished_at=finished_at, retries=retries)
+        (out / 'performance.json').write_text(json.dumps(performance, ensure_ascii=False, indent=2), encoding='utf-8')
+        print(json.dumps(summary, ensure_ascii=False))
+        return 0
     while True:
         # Reconcile artifact successes first.
         for tid in ids:
@@ -245,12 +350,12 @@ def main() -> int:
         if time.time() - started > 3600:
             break
         time.sleep(5)
-    rows = []
-    for idx, tid in enumerate(ids, 1):
-        msg = expected_message(ROOT, tid, args.expected_prefix)
-        rows.append({'i': idx, 'task_id': tid, 'state': qstate(ROOT, tid), 'ok': terminal_ok(ROOT, WORKER, tid, msg)})
+    rows = collect_rows(ROOT, WORKER, ids, args.expected_prefix)
+    finished_at = now()
     summary = {'base': args.base, 'count': args.count, 'window': args.window, 'retry_window': args.retry_window, 'max_retries': args.max_retries, 'ok_count': sum(r['ok'] for r in rows), 'done': sum(r['state'] == 'done' for r in rows), 'failed': sum(r['state'] == 'failed' for r in rows), 'claimed': sum(r['state'] == 'claimed' for r in rows), 'pending': sum(r['state'] == 'pending' for r in rows), 'failures': [r for r in rows if not r['ok']]}
     (out / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+    performance = build_performance_summary(args=args, out=out, rows=rows, started_at=started_at, finished_at=finished_at, retries=retries)
+    (out / 'performance.json').write_text(json.dumps(performance, ensure_ascii=False, indent=2), encoding='utf-8')
     shared_state_v2.rebuild_index(ROOT)
     print(json.dumps(summary, ensure_ascii=False))
     return 0

@@ -1,7 +1,7 @@
 {
   "pack": "vm_codex_window_runner_patch_20260526",
-  "updated_at": "2026-05-26",
-  "latest_commit_before_this_manifest_refresh": "8c77dd2c4",
+  "updated_at": "2026-05-27",
+  "latest_commit_before_this_manifest_refresh": "d097b2110",
   "files": [
     {
       "path": "ops/vm-worker-state/README.md",
@@ -10,8 +10,8 @@
     },
     {
       "path": "ops/vm-worker-state/vm_codex_window_runner.py",
-      "size": 11756,
-      "sha256": "2c8cc7c80eeb2026130b59adb1a04038057e791e7a54950c41d5585427995360"
+      "size": 16791,
+      "sha256": "884aaca266706c2ef2da60de55f10cbe9c95fe32ed0adab1ef31454f5bbb0206"
     },
     {
       "path": "ops/vm-worker-state/vm_coding_worker_v2.py",
@@ -25,8 +25,8 @@
     },
     {
       "path": "ops/vm-worker-state/evidence/20260526-codex-concurrency-evidence.json",
-      "size": 2220,
-      "sha256": "60e740722bbc61537aff58d0383945289384543c83b511a059ef6c6b4569faa7"
+      "size": 3550,
+      "sha256": "3ac67aec01a9925cb07b5322d534ba4b5349e402ce849c019da09fb57edffbd7"
     }
   ],
   "manifest_note": "This manifest intentionally excludes manifest files from file hashes to avoid self-referential drift.",
@@ -34,7 +34,8 @@
   "cifs": "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/vm_codex_window_runner_patch_20260526/",
   "live_evidence": {
     "real_readonly_n24_summary": "/mnt/tmp/codex_readonly_real24_20260526_1709/summary.json",
-    "real_readonly_n24_status": "/mnt/tmp/codex-readonly-real24-run-20260526-1709/status.json",
-    "real_readonly_n12_recheck": "/mnt/tmp/codex_readonly_real12_20260526_1635_recheck/summary.json"
+    "real_readonly_n24_performance": "/mnt/tmp/codex_readonly_real24_20260526_1709/performance.json",
+    "phase1_n12_summary": "/mnt/tmp/codex_readonly_real12_phase1_20260527_0855/summary.json",
+    "phase1_n12_performance": "/mnt/tmp/codex_readonly_real12_phase1_20260527_0855/performance.json"
   }
 }

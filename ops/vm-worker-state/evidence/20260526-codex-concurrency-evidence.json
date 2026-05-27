@@ -2,7 +2,7 @@
   "generated_at": "2026-05-26T17:55:00+08:00",
   "scope": "VM Codex coding-agent concurrency evidence snapshot",
   "branch": "vm-codex-window-runner-20260526",
-  "latest_local_commit_observed": "8c77dd2c4 fix(ops): persist Codex final marker artifact",
+  "latest_local_commit_observed": "d097b2110 docs(ops): plan VM Codex concurrency rollout",
   "vm_health_latest_observed": {
     "ssh_ok": true,
     "ssh_extra": "0/4",
@@ -50,5 +50,42 @@
     "recheck_done": 12,
     "rca": "runner.log contained finalAssistantVisibleText/finalAssistantRawText, but codex-last-message.txt was not persisted in some retry/embedded paths; fixed by promoting final text artifact."
   },
-  "next_phase": "Phase 0: evidence and manifest reconciliation"
+  "next_phase": "Phase 2: adaptive concurrency policy",
+  "phase1_telemetry": {
+    "implemented": true,
+    "runner_generates": [
+      "summary.json",
+      "performance.json"
+    ],
+    "existing_n24_performance_path": "/mnt/tmp/codex_readonly_real24_20260526_1709/performance.json",
+    "existing_n24_performance": {
+      "wall_seconds": 617.0,
+      "tasks_per_minute": 2.334,
+      "waves_count": 11,
+      "effective_max_wave_count": 5,
+      "duplicate_start_task_ids": [
+        "codex-readonly-real24-20260526-1709-19",
+        "codex-readonly-real24-20260526-1709-4"
+      ]
+    },
+    "fresh_n12": {
+      "task_base": "codex-readonly-real12-phase1-20260527-0855",
+      "run_task_id": "codex-readonly-real12-phase1-run-20260527-0855",
+      "summary_path": "/mnt/tmp/codex_readonly_real12_phase1_20260527_0855/summary.json",
+      "performance_path": "/mnt/tmp/codex_readonly_real12_phase1_20260527_0855/performance.json",
+      "user_visible_cifs": "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/codex_readonly_real12_phase1_20260527_0855/",
+      "count": 12,
+      "ok_count": 12,
+      "done": 12,
+      "failed": 0,
+      "claimed": 0,
+      "pending": 0,
+      "wall_seconds": 41.0,
+      "tasks_per_minute": 17.561,
+      "waves_count": 4,
+      "effective_max_wave_count": 5,
+      "duplicate_start_task_ids": [],
+      "retry_count_total": 0
+    }
+  }
 }
