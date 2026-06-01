@@ -87,6 +87,45 @@ def _effective_provider_label() -> str:
 from hermes_constants import is_termux as _is_termux
 
 
+def _memory_status_summary(config: dict) -> list[tuple[str, str]]:
+    memory_section = config.get("memory")
+    memory_cfg = memory_section if isinstance(memory_section, dict) else {}
+    provider = (memory_cfg.get("provider") or "").strip()
+    active_provider = provider or "built-in"
+    rows: list[tuple[str, str]] = []
+    rows.append(("Memory:", f"{active_provider} (configured)" if provider else "built-in (default)"))
+
+    if provider != "local_mem0_sidecar":
+        return rows
+
+    rows.append(("Memory Policy:", "search-only, candidate-gated, reviewed-auto-recall"))
+
+    try:
+        from plugins.memory.local_mem0_sidecar import _SidecarClient, _load_config
+
+        sidecar_cfg = _load_config()
+        base_url = (sidecar_cfg.get("base_url") or "").strip()
+        if base_url:
+            rows.append(("Memory URL:", base_url))
+            try:
+                client = _SidecarClient(
+                    base_url,
+                    api_key=sidecar_cfg.get("api_key", ""),
+                    timeout=sidecar_cfg.get("timeout", 5.0),
+                )
+                health = client.health()
+                ok = bool(health.get("ok", True)) if isinstance(health, dict) else True
+                rows.append(("Memory Health:", "ok" if ok else "degraded"))
+            except Exception as exc:
+                rows.append(("Memory Health:", f"error: {exc}"))
+        else:
+            rows.append(("Memory URL:", "(not set)"))
+    except Exception as exc:
+        rows.append(("Memory Health:", f"unavailable: {exc}"))
+
+    return rows
+
+
 def show_status(args):
     """Show status of all Hermes Agent components."""
     show_all = getattr(args, 'all', False)
@@ -115,6 +154,8 @@ def show_status(args):
 
     print(f"  Model:        {_configured_model_label(config)}")
     print(f"  Provider:     {_effective_provider_label()}")
+    for label, value in _memory_status_summary(config):
+        print(f"  {label:<12} {value}")
 
     # =========================================================================
     # API Keys

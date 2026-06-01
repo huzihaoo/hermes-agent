@@ -1,0 +1,3 @@
+name: local_mem0_sidecar
+version: 0.1.0
+description: "Local Mem0 sidecar memory provider over the user's local mem0-gateway HTTP API."

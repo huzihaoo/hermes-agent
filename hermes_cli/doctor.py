@@ -1768,6 +1768,47 @@ def run_doctor(args):
             issues.append("Mem0 is set as memory provider but mem0ai is not installed")
         except Exception as _e:
             check_warn("Mem0 check failed", str(_e))
+    elif _active_memory_provider == "local_mem0_sidecar":
+        try:
+            from plugins.memory.local_mem0_sidecar import _load_config as _load_local_mem0_config, _SidecarClient as _LocalMem0SidecarClient
+
+            local_cfg = _load_local_mem0_config(str(HERMES_HOME))
+            base_url = str(local_cfg.get("base_url", "") or "").strip()
+            api_key = str(local_cfg.get("api_key", "") or "")
+            if base_url:
+                check_ok("Local Mem0 sidecar configured")
+                check_info(f"base_url={base_url}")
+                check_info(f"user_id={local_cfg.get('user_id', '?')}  agent_id={local_cfg.get('agent_id', '?')}")
+                if base_url.startswith("http://0.0.0.0"):
+                    check_warn("Local Mem0 sidecar binds to 0.0.0.0", "prefer loopback-only bind (127.0.0.1) unless remote access is intentional")
+                try:
+                    sidecar_health = _LocalMem0SidecarClient(
+                        base_url=base_url,
+                        api_key=api_key,
+                        timeout=float(local_cfg.get("timeout_seconds", 5.0) or 5.0),
+                    ).health()
+                    if sidecar_health.get("ok"):
+                        check_ok("Local Mem0 sidecar health check passed")
+                    else:
+                        check_warn("Local Mem0 sidecar health check failed", str(sidecar_health.get("error", "unknown error")))
+                except Exception as _health_e:
+                    check_warn("Local Mem0 sidecar health check failed", str(_health_e))
+            else:
+                _fail_and_issue(
+                    "Local Mem0 sidecar base URL not set",
+                    "(set LOCAL_MEM0_SIDECAR_BASE_URL or run hermes memory setup)",
+                    "local_mem0_sidecar is set as memory provider but base_url is missing",
+                    issues,
+                )
+        except ImportError:
+            _fail_and_issue(
+                "local_mem0_sidecar plugin not loadable",
+                "verify plugins/memory/local_mem0_sidecar/ is present",
+                "local_mem0_sidecar is set as memory provider but the plugin could not be imported",
+                issues,
+            )
+        except Exception as _e:
+            check_warn("local_mem0_sidecar check failed", str(_e))
     else:
         # Generic check for other memory providers (openviking, hindsight, etc.)
         try:
