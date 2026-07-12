@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -20,6 +22,7 @@ from typing import Any
 from hermes_cli.config import get_hermes_home
 
 _MAX_EVENTS = 50
+_L4_EVENT_EPOCH_MAX = 4_102_444_800.0  # 2100-01-01T00:00:00Z
 
 
 def safe_task_id(task_id: str) -> str:
@@ -51,7 +54,27 @@ def _append_unique(items: list[Any], value: Any | None) -> list[Any]:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.fromtimestamp(_now_epoch(), timezone.utc).isoformat()
+
+
+def _now_epoch() -> float:
+    """Return the sealed L4 event clock, otherwise the live UTC epoch."""
+
+    if (
+        os.getenv("HERMES_OUTBOUND_MODE", "").strip().lower() == "record-only"
+        and os.getenv("HERMES_L4_SANDBOX_ACTIVE", "").strip() == "1"
+    ):
+        raw = os.getenv("HERMES_L4_EVENT_EPOCH", "").strip()
+        if not raw:
+            raise RuntimeError("record-only L4 sandbox requires HERMES_L4_EVENT_EPOCH")
+        try:
+            value = float(raw)
+        except ValueError as exc:
+            raise RuntimeError("HERMES_L4_EVENT_EPOCH must be a finite UTC epoch") from exc
+        if not math.isfinite(value) or not 0.0 <= value <= _L4_EVENT_EPOCH_MAX:
+            raise RuntimeError("HERMES_L4_EVENT_EPOCH is outside the accepted UTC epoch range")
+        return value
+    return time.time()
 
 
 def _atomic_write_json(path: Path, body: dict[str, Any]) -> None:
@@ -91,12 +114,34 @@ def write_task_state(
 
     updated_at = _now_iso()
     body["updated_at"] = updated_at
+    previous_phase = body.get("current_phase")
     if phase:
         body["current_phase"] = phase
 
     events = _list(body.get("recent_events"))
     if event:
-        events.append({"ts": updated_at, "time": updated_at, "phase": phase or body.get("current_phase"), "summary": event})
+        event_phase = phase or body.get("current_phase")
+        same_state_event_exists = any(
+            isinstance(item, dict)
+            and str(item.get("phase") or "") == str(event_phase or "")
+            and str(item.get("summary") or "") == str(event)
+            for item in events
+        )
+        # Pipeline-progress rows may be interleaved with the collected state.
+        # Suppress a poll repeat whenever the business phase itself did not
+        # transition; the same event may recur after a real phase transition.
+        if not (
+            str(previous_phase or "") == str(event_phase or "")
+            and same_state_event_exists
+        ):
+            events.append(
+                {
+                    "ts": updated_at,
+                    "time": updated_at,
+                    "phase": event_phase,
+                    "summary": event,
+                }
+            )
     body["recent_events"] = events[-_MAX_EVENTS:]
 
     body["artifacts"] = _append_unique(_list(body.get("artifacts")), artifact)

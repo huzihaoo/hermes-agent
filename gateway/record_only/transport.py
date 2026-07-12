@@ -15,10 +15,10 @@ import stat
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, Callable, Iterator, Mapping
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, quote, unquote, urlsplit
 
 from gateway.record_only.census_binding import AUTHORITATIVE_CENSUS_BINDING
 
@@ -85,6 +85,10 @@ OPERATIONS = {
     "startup_notice",
     "shutdown_notice",
     "error_notice",
+    "project_comment_list",
+    "project_comment_add",
+    "auth_status_check",
+    "auth_device_init",
 }
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
@@ -421,6 +425,60 @@ def _validate_json_shape(value: Any, *, field: str) -> None:
             _validate_json_shape(item, field=field)
 
 
+FOXGLOVE_MCAP_PREFIX = "/mnt/minieye/pdcl/department/perception_test_team/"
+FOXGLOVE_PATH_SAFE = "/._-()[]中文abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+
+def _validate_foxglove_query(link: str) -> None:
+    parsed = urlsplit(link)
+    if parsed.fragment:
+        raise RecordOnlyError("HTTP link fragments are not recordable")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise RecordOnlyError("invalid HTTP link port") from exc
+    if not parsed.hostname or port is not None and not 1 <= port <= 65535:
+        raise RecordOnlyError("invalid HTTP link host")
+    if parsed.path not in {"", "/"}:
+        raise RecordOnlyError("Foxglove link path must be root")
+    prefix = "ds=foxglove-http&ds.mcapPath="
+    if not parsed.query.startswith(prefix) or parsed.query.count("&") != 1:
+        raise RecordOnlyError("unsupported HTTP query contract")
+    try:
+        pairs = parse_qsl(
+            parsed.query,
+            keep_blank_values=True,
+            strict_parsing=True,
+            max_num_fields=2,
+        )
+    except (ValueError, UnicodeError) as exc:
+        raise RecordOnlyError("invalid Foxglove query encoding") from exc
+    if len(pairs) != 2 or pairs[0] != ("ds", "foxglove-http") or pairs[1][0] != "ds.mcapPath":
+        raise RecordOnlyError("unsupported HTTP query contract")
+    raw_path = parsed.query[len(prefix) :]
+    try:
+        mcap_path = unquote(raw_path, encoding="utf-8", errors="strict")
+    except (UnicodeDecodeError, UnicodeError) as exc:
+        raise RecordOnlyError("invalid Foxglove path encoding") from exc
+    if (
+        not mcap_path
+        or "\x00" in mcap_path
+        or "%" in mcap_path
+        or quote(mcap_path, safe=FOXGLOVE_PATH_SAFE) != raw_path
+        or pairs[1][1] != mcap_path
+    ):
+        raise RecordOnlyError("Foxglove path must use canonical single encoding")
+    path = PurePosixPath(mcap_path)
+    if (
+        not mcap_path.startswith(FOXGLOVE_MCAP_PREFIX)
+        or not path.is_absolute()
+        or any(part in {"", ".", ".."} for part in path.parts[1:])
+        or not path.name.endswith(".viz.mcap")
+        or path.name != f"{path.parent.name}.viz.mcap"
+    ):
+        raise RecordOnlyError("Foxglove path is outside the approved MCAP contract")
+
+
 def _reject_credential_links(links: list[str]) -> None:
     sensitive_query_key = re.compile(
         r"(?i)(?:^|[?&])(?:token|key|sig|signature|credential|code|auth|password|secret)="
@@ -432,8 +490,10 @@ def _reject_credential_links(links: list[str]) -> None:
                 raise RecordOnlyError("credential-bearing HTTP link refused")
             if sensitive_query_key.search("?" + parsed.query):
                 raise RecordOnlyError("credential-like HTTP query refused")
-            if parsed.query or parsed.fragment:
-                raise RecordOnlyError("HTTP links with query or fragment are not recordable")
+            if parsed.query:
+                _validate_foxglove_query(link)
+            elif parsed.fragment:
+                raise RecordOnlyError("HTTP link fragments are not recordable")
 
 
 def _validate_routing_claims(
@@ -454,6 +514,12 @@ def _validate_routing_claims(
         raise RecordOnlyError("file operations require a supported media payload_type")
     if operation in {"reaction_add", "reaction_remove"} and payload_type != "reaction":
         raise RecordOnlyError("reaction operations require payload_type=reaction")
+    if operation in {"project_comment_list", "auth_status_check"} and payload_type != "query":
+        raise RecordOnlyError("outbound query operations require payload_type=query")
+    if operation == "project_comment_add" and payload_type != "text":
+        raise RecordOnlyError("project comment add requires payload_type=text")
+    if operation == "auth_device_init" and payload_type != "auth_request":
+        raise RecordOnlyError("auth device init requires payload_type=auth_request")
     if operation in {"text_send", "startup_notice", "shutdown_notice", "error_notice"}:
         if thread_id is not None or message_id is not None or reply_mode != "none" or update_mode != "none":
             raise RecordOnlyError("send/notice routing claims are contradictory")
@@ -486,6 +552,14 @@ def _validate_routing_claims(
     elif operation == "reaction_remove":
         if thread_id is not None or message_id is None or reply_mode != "none" or update_mode != "delete":
             raise RecordOnlyError("reaction remove routing claims are contradictory")
+    elif operation in {
+        "project_comment_list",
+        "project_comment_add",
+        "auth_status_check",
+        "auth_device_init",
+    }:
+        if thread_id is not None or message_id is not None or reply_mode != "none" or update_mode != "none":
+            raise RecordOnlyError("outbound intent routing claims are contradictory")
 
 
 def _default_forbidden_roots() -> tuple[Path, ...]:
@@ -1167,7 +1241,7 @@ class RecordOnlyOutboundTransport:
 
         explicit_ids = {
             value
-            for value in [destination_id, thread_id, message_id, *mentions]
+            for value in [destination_id, thread_id, message_id, task_id, *mentions]
             if isinstance(value, str) and value
         }
         raw_payload_hash = hmac.new(self._content_key, raw_payload, hashlib.sha256).hexdigest()
@@ -1398,7 +1472,14 @@ class RecordOnlyRelaySender:
         )
 
     def send_task_card(
-        self, target: str, card_payload: dict[str, Any], message_id: str | None = None
+        self,
+        target: str,
+        card_payload: dict[str, Any],
+        message_id: str | None = None,
+        *,
+        task_id: str | None = None,
+        terminal_state: str | None = None,
+        dedupe_key: str | None = None,
     ) -> dict[str, Any]:
         platform, destination_id, thread_id = _parse_target(target)
         result = self.transport.record(
@@ -1410,8 +1491,11 @@ class RecordOnlyRelaySender:
             message_id=message_id,
             payload_type="interactive_card",
             payload=card_payload,
+            task_id=task_id,
+            terminal_state=terminal_state,
             reply_mode="thread" if thread_id else "none",
             update_mode="patch" if message_id else "create",
+            caller_dedupe_key=dedupe_key,
         )
         return {
             "success": True,

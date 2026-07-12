@@ -1,8 +1,11 @@
 import json
+import os
+import shutil
 from pathlib import Path
 
 import pytest
 
+from gateway.record_only import runtime
 from gateway.tasks.store import TaskStore
 from gateway.tasks.types import Task, TaskStatus, TaskType
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
@@ -23,6 +26,44 @@ def _task(task_id="task-1", *, chat_id=pnc_vm_task_sync.G1Q3_RCA_CHAT_ID, status
         chat_type="group",
         vm_task_id=vm_task_id,
     )
+
+
+def _set_record_only_env(tmp_path: Path, monkeypatch):
+    records = tmp_path / "records"
+    try:
+        records.resolve(strict=False).relative_to(Path.home().resolve())
+    except ValueError:
+        pass
+    else:
+        records = tmp_path.parent / f"{tmp_path.name}-outbound-records"
+    records.mkdir(mode=0o700)
+    key_file = tmp_path / "record.key"
+    key_file.write_text("ab" * 32 + "\n", encoding="ascii")
+    key_file.chmod(0o600)
+    census_root = Path(
+        os.getenv("HERMES_OUTBOUND_CENSUS_ROOT")
+        or Path(__file__).resolve().parents[3] / "evidence" / "target-outbound-census"
+    )
+    monkeypatch.setenv("HERMES_OUTBOUND_MODE", "record-only")
+    monkeypatch.setenv("HERMES_OUTBOUND_RECORD_ROOT", str(records))
+    monkeypatch.setenv("HERMES_OUTBOUND_RECORD_KEY_FILE", str(key_file))
+    monkeypatch.setenv("HERMES_OUTBOUND_CENSUS_ROOT", str(census_root))
+    runtime._reset_for_tests()
+    return records
+
+
+def _make_fixture_root(tmp_path: Path, monkeypatch) -> Path:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv(pnc_vm_task_sync.FIXTURE_ISOLATION_ROOT_ENV, str(tmp_path.parent))
+    source_census = Path(__file__).resolve().parents[3] / "evidence" / "target-outbound-census"
+    census_root = tmp_path.parent / f"{tmp_path.name}-outbound-census"
+    census_root.mkdir(mode=0o700)
+    for name in ("INDEX.json", "census-v4.json"):
+        shutil.copy2(source_census / name, census_root / name)
+    monkeypatch.setenv("HERMES_OUTBOUND_CENSUS_ROOT", str(census_root))
+    fixture_root = tmp_path / pnc_vm_task_sync.FIXTURE_DIR_NAME / "case"
+    fixture_root.mkdir(parents=True, mode=0o700)
+    return fixture_root
 
 
 def test_iter_candidate_tasks_filters_to_pnc_feishu_vm_tasks(tmp_path):
@@ -51,6 +92,7 @@ def test_iter_candidate_tasks_filters_to_pnc_feishu_vm_tasks(tmp_path):
 
 
 def test_sync_pnc_vm_tasks_collects_and_writes_sidecar(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERMES_OUTBOUND_MODE", raising=False)
     token = set_hermes_home_override(tmp_path)
     try:
         store = TaskStore(tmp_path / "analytics" / "tasks.db")
@@ -241,6 +283,285 @@ def test_main_dry_run_outputs_json(tmp_path, capsys):
     assert out["rows"][0]["vm_task_id"] == "vm-1"
 
 
+def test_fixture_mode_executes_projection_notice_comment_and_sidecar_without_collector(tmp_path, monkeypatch):
+    token = set_hermes_home_override(tmp_path)
+    fixture_root = _make_fixture_root(tmp_path, monkeypatch)
+    _set_record_only_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_G1Q3_REPORT_COMMENT", "1")
+    task_id = "g1q3-rca-fixture-7017699515"
+    vm_task_id = "g1q3-rca-issue-intake-7017699515"
+    payload = {
+        "state": {
+            "value": "completed",
+            "summary": "中文 fixture 完成",
+            "terminal": True,
+            "updated_at": "2026-07-12T10:00:00+00:00",
+        },
+        "artifacts": [],
+        "errors": [],
+        "vm_bridge": {"state": "completed", "summary": "中文 fixture 完成"},
+        "delivery_contract": {
+            "schema_version": "g1q3_delivery_contract_v1",
+            "work_item_id": "7017699515",
+            "business_state": "report_completed",
+            "presentation_state": "report_ready_needs_review",
+            "report": {"status": "report_generated_need_review", "is_deliverable": True, "is_candidate": True},
+            "summary": {"l0": "报告已生成", "short_conclusion": "纵向控制请求波动"},
+            "evidence_boundary": [
+                "领取 //hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/l4-fixture/"
+            ],
+            "artifacts": {
+                "index_html_vm": "/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases/7017699515/index.html",
+                "case_dir_cifs": "//hfs.minieye.tech/department-perception_test_team/G1Q3_RCA/cases/7017699515/",
+            },
+        },
+    }
+    fixture_file = fixture_root / f"{vm_task_id}.json"
+    fixture_file.write_text(
+        json.dumps(
+            {
+                "schema_version": pnc_vm_task_sync.FIXTURE_SCHEMA_VERSION,
+                "vm_task_id": vm_task_id,
+                "scenario_id": "S4",
+                "payload": payload,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    fixture_file.chmod(0o600)
+
+    def bomb_collect(*_args, **_kwargs):
+        raise AssertionError("real VM/SSH collector was touched")
+
+    monkeypatch.setattr(pnc_vm_task_sync, "collect_vm_task_status", bomb_collect)
+    monkeypatch.setattr(
+        pnc_vm_task_sync,
+        "_read_vm_pipeline_state_json",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("fixture attempted a VM pipeline-state read")
+        ),
+    )
+    monkeypatch.setattr(
+        pnc_vm_task_sync,
+        "_read_vm_json_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("fixture attempted a VM JSON read")
+        ),
+    )
+    try:
+        store = TaskStore(tmp_path / "analytics" / "tasks.db")
+        store.upsert(_task(task_id, vm_task_id=vm_task_id))
+        result = pnc_vm_task_sync.sync_pnc_vm_tasks(
+            limit=10,
+            fixture_root=fixture_root,
+            required_fixture_scenarios=["S4"],
+        )
+        sidecar = json.loads((tmp_path / "task-state" / f"{task_id}.json").read_text(encoding="utf-8"))
+        transport = runtime.get_record_only_transport("gateway.pnc_report_comment")
+        assert transport is not None
+        rows = transport.read_all()
+    finally:
+        runtime._reset_for_tests()
+        reset_hermes_home_override(token)
+
+    assert result["ok"] is True
+    assert result["synced_count"] == 1
+    assert result["fixture_mode"] is True
+    assert result["pipeline_evidence_source"] == "fixture"
+    assert result["rows"][0]["pipeline_evidence_source"] == "fixture"
+    assert result["executed_fixture_scenarios"] == ["S4"]
+    assert result["missing_fixture_scenarios"] == []
+    assert sidecar["completion_notice"]["state"] == "completed"
+    assert sidecar["report_comment"]["action"] == "recorded_intents"
+    assert sidecar["report_comment"]["posted"] is False
+    assert sidecar["vm_delivery_proposal"]["delivery"]["report_status"] == "html_delivery_ready"
+    assert sidecar["vm_delivery_proposal"]["evidence_source"] == "fixture"
+    assert sidecar["vm_delivery_proposal"]["delivery_contract"]["schema_version"] == "g1q3_delivery_contract_v1"
+    assert [row["operation"] for row in rows] == ["project_comment_list", "project_comment_add"]
+    assert not (tmp_path / "pnc_agent" / "quota" / "g1q3_report_comments.json").exists()
+
+
+def test_fixture_mode_rejects_symlink_dry_run_and_real_ssh_fallback(tmp_path, monkeypatch):
+    token = set_hermes_home_override(tmp_path)
+    fixture_root = _make_fixture_root(tmp_path, monkeypatch)
+    symlink = fixture_root.parent / "linked"
+    symlink.symlink_to(fixture_root, target_is_directory=True)
+    try:
+        with pytest.raises(ValueError, match="symlinks|aliases"):
+            pnc_vm_task_sync._validate_fixture_root(symlink)
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            pnc_vm_task_sync.sync_pnc_vm_tasks(dry_run=True, fixture_root=fixture_root)
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            pnc_vm_task_sync.sync_pnc_vm_tasks(
+                fixture_root=fixture_root,
+                shared_state_root="/mnt/tmp/forbidden-real-root",
+                ssh_mini_agent="/candidate/ssh-mini-agent",
+            )
+        with pytest.raises(SystemExit):
+            pnc_vm_task_sync.main(
+                ["--fixture-root", str(fixture_root), "--no-lock", "--json"]
+            )
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_fixture_mode_rejects_canonical_home_before_reading_fixture(tmp_path, monkeypatch):
+    fixture_root = _make_fixture_root(tmp_path, monkeypatch)
+    canonical_home = pnc_vm_task_sync._canonical_hermes_roots()[0]
+    with pytest.raises(ValueError, match="canonical Hermes/OpenClaw home"):
+        pnc_vm_task_sync._validate_fixture_root(fixture_root, hermes_home=canonical_home)
+
+
+def test_fixture_mode_requires_valid_record_only_before_taskstore_or_collector(tmp_path, monkeypatch):
+    token = set_hermes_home_override(tmp_path)
+    fixture_root = _make_fixture_root(tmp_path, monkeypatch)
+    monkeypatch.delenv("HERMES_OUTBOUND_MODE", raising=False)
+    runtime._reset_for_tests()
+
+    def bomb_collect(*_args, **_kwargs):
+        raise AssertionError("real VM/SSH collector was touched")
+
+    monkeypatch.setattr(pnc_vm_task_sync, "collect_vm_task_status", bomb_collect)
+    try:
+        with pytest.raises(ValueError, match="requires HERMES_OUTBOUND_MODE=record-only"):
+            pnc_vm_task_sync.sync_pnc_vm_tasks(fixture_root=fixture_root)
+        assert not (tmp_path / "analytics").exists()
+        assert not (tmp_path / "task-state").exists()
+    finally:
+        runtime._reset_for_tests()
+        reset_hermes_home_override(token)
+
+
+def test_fixture_mode_rejects_duplicate_json_keys_and_unsafe_output_parent(tmp_path, monkeypatch):
+    token = set_hermes_home_override(tmp_path)
+    fixture_root = _make_fixture_root(tmp_path, monkeypatch)
+    _set_record_only_env(tmp_path, monkeypatch)
+    vm_task_id = "fixture-duplicate-json"
+    duplicate = fixture_root / f"{vm_task_id}.json"
+    duplicate.write_text(
+        '{"schema_version":"pnc_vm_task_sync_fixture_v1",'
+        '"vm_task_id":"fixture-duplicate-json","scenario_id":"S1",'
+        '"payload":{"state":{"value":"completed","value":"failed"}}}',
+        encoding="utf-8",
+    )
+    duplicate.chmod(0o600)
+    try:
+        store = TaskStore(tmp_path / "analytics" / "tasks.db")
+        store.upsert(_task("fixture-duplicate-task", vm_task_id=vm_task_id))
+        result = pnc_vm_task_sync.sync_pnc_vm_tasks(fixture_root=fixture_root)
+        assert result["ok"] is False
+        assert "duplicate JSON key" in result["errors"][0]
+
+        outside = tmp_path / "outside-task-state"
+        outside.mkdir(mode=0o700)
+        task_state = tmp_path / "task-state"
+        if task_state.exists():
+            task_state.rmdir()
+        task_state.symlink_to(outside, target_is_directory=True)
+        with pytest.raises((OSError, ValueError)):
+            pnc_vm_task_sync.sync_pnc_vm_tasks(fixture_root=fixture_root)
+    finally:
+        runtime._reset_for_tests()
+        reset_hermes_home_override(token)
+
+
+def test_fixture_output_swap_after_read_fails_before_any_outside_sidecar_write(tmp_path, monkeypatch):
+    token = set_hermes_home_override(tmp_path)
+    fixture_root = _make_fixture_root(tmp_path, monkeypatch)
+    _set_record_only_env(tmp_path, monkeypatch)
+    vm_task_id = "fixture-hostile-swap"
+    task_id = "fixture-hostile-swap-task"
+    fixture_file = fixture_root / f"{vm_task_id}.json"
+    fixture_file.write_text(
+        json.dumps(
+            {
+                "schema_version": pnc_vm_task_sync.FIXTURE_SCHEMA_VERSION,
+                "vm_task_id": vm_task_id,
+                "scenario_id": "S1",
+                "payload": {
+                    "state": {"value": "completed", "summary": "done", "terminal": True},
+                    "artifacts": [],
+                    "vm_bridge": {"state": "completed", "summary": "done"},
+                    "errors": [],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    fixture_file.chmod(0o600)
+    outside = tmp_path / "outside-sidecars"
+    outside.mkdir(mode=0o700)
+    original_load = pnc_vm_task_sync._load_fixture_status
+
+    def swap_after_read(root, current_vm_task_id):
+        loaded = original_load(root, current_vm_task_id)
+        task_state = tmp_path / "task-state"
+        task_state.rmdir()
+        task_state.symlink_to(outside, target_is_directory=True)
+        return loaded
+
+    monkeypatch.setattr(pnc_vm_task_sync, "_load_fixture_status", swap_after_read)
+    try:
+        store = TaskStore(tmp_path / "analytics" / "tasks.db")
+        store.upsert(_task(task_id, vm_task_id=vm_task_id))
+        result = pnc_vm_task_sync.sync_pnc_vm_tasks(fixture_root=fixture_root)
+    finally:
+        runtime._reset_for_tests()
+        reset_hermes_home_override(token)
+
+    assert result["ok"] is False
+    assert any("task-state" in error or "post-run verification" in error for error in result["errors"])
+    assert list(outside.iterdir()) == []
+
+
+def test_fixture_lock_parent_swap_is_rejected_without_outside_lock_write(tmp_path, monkeypatch):
+    token = set_hermes_home_override(tmp_path)
+    _make_fixture_root(tmp_path, monkeypatch)
+    try:
+        pnc_vm_task_sync._validate_isolated_hermes_home(tmp_path, prepare_outputs=True)
+        binding = pnc_vm_task_sync._capture_fixture_output_binding(tmp_path)
+        locks = tmp_path / "locks"
+        outside = tmp_path / "outside-locks"
+        outside.mkdir(mode=0o700)
+        locks.rmdir()
+        locks.symlink_to(outside, target_is_directory=True)
+
+        with pytest.raises((OSError, ValueError)):
+            with pnc_vm_task_sync.FixtureSingleRunLock(binding):
+                raise AssertionError("unsafe fixture lock was acquired")
+        assert list(outside.iterdir()) == []
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_fixture_record_paths_reject_protected_ancestor_key_and_census(tmp_path, monkeypatch):
+    token = set_hermes_home_override(tmp_path)
+    _make_fixture_root(tmp_path, monkeypatch)
+    records = tmp_path / "records"
+    records.mkdir(mode=0o700)
+    protected = tmp_path / "synthetic-account" / ".hermes"
+    protected.mkdir(parents=True, mode=0o700)
+    key = protected / "record.key"
+    key.write_text("ab" * 32 + "\n", encoding="ascii")
+    key.chmod(0o600)
+    monkeypatch.setenv("HERMES_OUTBOUND_RECORD_ROOT", str(records))
+    monkeypatch.setenv("HERMES_OUTBOUND_RECORD_KEY_FILE", str(key))
+    monkeypatch.setenv("HERMES_OUTBOUND_CENSUS_ROOT", str(protected / "outbound-census"))
+    try:
+        monkeypatch.setenv(
+            pnc_vm_task_sync.FIXTURE_ISOLATION_ROOT_ENV,
+            str(protected.parent),
+        )
+        with pytest.raises(ValueError, match="overlaps protected root"):
+            pnc_vm_task_sync._validate_fixture_record_paths(
+                tmp_path,
+                protected_roots=(protected,),
+            )
+    finally:
+        reset_hermes_home_override(token)
+
+
 def test_sync_pnc_vm_tasks_updates_taskstore_terminal_status(tmp_path, monkeypatch):
     token = set_hermes_home_override(tmp_path)
     try:
@@ -323,6 +644,53 @@ def test_sync_pnc_vm_tasks_writes_task_card_compatible_object(tmp_path, monkeypa
     assert relayed["task_card"]["delivery"]["artifact_path"].startswith("//hfs1.minieye.tech/")
     assert relayed["task_card"]["status_line"]
     assert "last_sent_hash" not in relayed["task_card"]
+
+
+def test_sync_pnc_vm_tasks_publishes_nonterminal_delivery_proposal(tmp_path, monkeypatch):
+    token = set_hermes_home_override(tmp_path)
+    try:
+        store = TaskStore(tmp_path / "analytics" / "tasks.db")
+        store.upsert(_task("task-running", vm_task_id="vm-running"))
+        monkeypatch.setattr(
+            pnc_vm_task_sync,
+            "collect_vm_task_status",
+            lambda task_id, **kwargs: {
+                "updated_at": "2026-07-12T10:00:00+00:00",
+                "state": {
+                    "value": "running",
+                    "summary": "downloading",
+                    "terminal": False,
+                },
+                "artifacts": [],
+                "vm_bridge": {"summary": "downloading", "state": "running"},
+                "delivery_contract": {
+                    "schema_version": "g1q3_delivery_contract_v1",
+                    "business_state": "awaiting_download",
+                    "report": {"status": "need_download", "is_deliverable": False},
+                    "user_action": {"requires_user_input": False},
+                },
+                "errors": [],
+            },
+        )
+        result = pnc_vm_task_sync.sync_pnc_vm_tasks(limit=10)
+        body = json.loads(
+            (tmp_path / "task-state" / "task-running.json").read_text(
+                encoding="utf-8"
+            )
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert result["ok"] is True
+    assert "completion_notice" not in body
+    proposal = body["vm_delivery_proposal"]
+    assert proposal["delivery"]["report_status"] == "need_download"
+    assert proposal["delivery_contract"]["business_state"] == "awaiting_download"
+    assert proposal["chat_id"] == pnc_vm_task_sync.G1Q3_RCA_CHAT_ID
+    assert proposal["thread_id"] is None
+    relayed = pnc_completion_notice_relay.reconcile_vm_delivery_proposal("task-running", body)
+    assert relayed["task_card"]["chat_id"] == pnc_vm_task_sync.G1Q3_RCA_CHAT_ID
+    assert pnc_completion_notice_relay._card_target(relayed["task_card"]) == f"feishu:{pnc_vm_task_sync.G1Q3_RCA_CHAT_ID}"
 
 
 
@@ -883,6 +1251,39 @@ def test_g1q3_task_card_stitches_latest_governance_report_contract(tmp_path, mon
         assert stale not in boundary_text
 
 
+def test_record_only_report_attachment_records_before_download_or_meegle_upload(tmp_path, monkeypatch):
+    token = set_hermes_home_override(tmp_path)
+    _set_record_only_env(tmp_path, monkeypatch)
+
+    def bomb(*_args, **_kwargs):
+        raise AssertionError("real attachment download/upload was touched")
+
+    monkeypatch.setattr(pnc_vm_task_sync.urllib.request, "urlopen", bomb)
+    monkeypatch.setattr("gateway.pnc_issue_context.default_meegle_runner", bomb)
+    try:
+        link = pnc_vm_task_sync._feishu_report_attachment_link(
+            work_item_id="7017699515",
+            vm_task_id="vm-attachment-7017699515",
+            index_html="/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases/7017699515/index.html",
+        )
+        transport = runtime.get_record_only_transport("scripts.pnc_vm_task_sync.report_attachment")
+        assert transport is not None
+        rows = transport.read_all()
+    finally:
+        runtime._reset_for_tests()
+        reset_hermes_home_override(token)
+
+    assert link == ""
+    assert len(rows) == 1
+    assert rows[0]["operation"] == "file_send"
+    assert rows[0]["platform"] == "feishu_project"
+    assert rows[0]["external_delivery_attempted"] is False
+    assert rows[0]["links"] == [
+        "http://192.168.26.174:18081/G1Q3_RCA/cases/7017699515/index.html"
+    ]
+    assert not (tmp_path / "pnc_agent" / "quota" / "g1q3_report_attachments.json").exists()
+
+
 def test_feishu_report_attachment_upload_adds_utf8_bom_charset_and_codec_version(tmp_path, monkeypatch):
     token = set_hermes_home_override(tmp_path)
     uploads = []
@@ -1082,3 +1483,12 @@ def test_genuine_download_in_progress_stays_optimistic():
     assert delivery["human_action_kind"] == "none"
     assert "数据下载执行中" in delivery["conclusion"]
     assert delivery["source"] == "delivery_contract_v1"
+
+
+def test_l4_vm_sync_uses_sealed_event_clock(monkeypatch):
+    monkeypatch.setenv("HERMES_OUTBOUND_MODE", "record-only")
+    monkeypatch.setenv("HERMES_L4_SANDBOX_ACTIVE", "1")
+    monkeypatch.setenv("HERMES_L4_EVENT_EPOCH", "1783850400")
+
+    assert pnc_vm_task_sync._now_epoch() == 1783850400.0
+    assert pnc_vm_task_sync._now_iso() == "2026-07-12T18:00:00+08:00"

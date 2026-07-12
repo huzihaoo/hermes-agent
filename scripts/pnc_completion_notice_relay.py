@@ -13,8 +13,10 @@ import fcntl
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
+import stat
 import subprocess
 import sys
 import threading
@@ -51,7 +53,39 @@ from scripts.pnc_g1q3_truth import (  # noqa: E402
 from scripts.pnc_status_projection import derive_presentation, sanitize_milestones  # noqa: E402
 from scripts import pnc_fault_taxonomy  # noqa: E402
 
-reload_env()
+
+def _reload_env_for_current_mode() -> None:
+    from gateway.record_only.runtime import record_only_enabled
+
+    if not record_only_enabled():
+        reload_env()
+
+
+_reload_env_for_current_mode()
+
+
+_L4_EVENT_EPOCH_MAX = 4_102_444_800.0  # 2100-01-01T00:00:00Z
+
+
+def _now_epoch() -> float:
+    """Return the sealed L4 event clock, otherwise the live UTC epoch."""
+
+    if (
+        os.getenv("HERMES_OUTBOUND_MODE", "").strip().lower() == "record-only"
+        and os.getenv("HERMES_L4_SANDBOX_ACTIVE", "").strip() == "1"
+    ):
+        raw = os.getenv("HERMES_L4_EVENT_EPOCH", "").strip()
+        if not raw:
+            raise RuntimeError("record-only L4 sandbox requires HERMES_L4_EVENT_EPOCH")
+        try:
+            value = float(raw)
+        except ValueError as exc:
+            raise RuntimeError("HERMES_L4_EVENT_EPOCH must be a finite UTC epoch") from exc
+        if not math.isfinite(value) or not 0.0 <= value <= _L4_EVENT_EPOCH_MAX:
+            raise RuntimeError("HERMES_L4_EVENT_EPOCH is outside the accepted UTC epoch range")
+        return value
+    return time.time()
+
 
 DEFAULT_MAX_ATTEMPTS = int(os.getenv("PNC_COMPLETION_NOTICE_MAX_ATTEMPTS", "3") or "3")
 FAILED_ALERT_PREFIX = "[PNC completion notice relay 告警]"
@@ -74,7 +108,7 @@ RELAY_SEND_CONCURRENCY = max(1, int(os.getenv("PNC_RELAY_SEND_CONCURRENCY", "5")
 # C8 safety gate: watcher/full-scan may only auto-deliver completion_delivery
 # notices generated after the current relay process starts. Historical
 # suppressed+contract notices require an explicit --task-id/manual call.
-RELAY_PROCESS_START_TS = time.time()
+RELAY_PROCESS_START_TS = _now_epoch()
 INTEGRATION_TOOLS_DEFAULT_INTAKE_STALE_SECONDS = int(os.getenv("PNC_INTEGRATION_TOOLS_INTAKE_STALE_SECONDS", "600") or "600")
 INTEGRATION_TOOLS_DEFAULT_NEED_INPUT_STALE_SECONDS = int(os.getenv("PNC_INTEGRATION_TOOLS_NEED_INPUT_STALE_SECONDS", "1800") or "1800")
 PNC_PROGRESS_HEARTBEAT_STALE_SECONDS = int(os.getenv("PNC_PROGRESS_HEARTBEAT_STALE_SECONDS", "600") or "600")
@@ -120,14 +154,25 @@ class FeishuHotSender:
         self._platform = None
         self._pconfig = None
         self._adapter = None
+        self._record_sender = None
         self._init_error: str | None = None
         # Serializes adapter (re)build under concurrent senders: the lark _client
         # itself is fine for concurrent requests, but rebuild-on-auth-error mutates
         # self._adapter/_client and must not race.
         self._adapter_lock = threading.Lock()
+        from gateway.record_only.runtime import get_record_only_transport
+
+        record_transport = get_record_only_transport("scripts.pnc_completion_notice_relay")
+        if record_transport is not None:
+            from gateway.record_only.transport import RecordOnlyRelaySender
+
+            self._record_sender = RecordOnlyRelaySender(record_transport)
+            return
         self._ensure_adapter()
 
     def _ensure_adapter(self, *, rebuild: bool = False):
+        if self._record_sender is not None:
+            raise RuntimeError("record-only FeishuHotSender has no live adapter")
         if self._adapter is not None and not rebuild:
             return self._adapter
         with self._adapter_lock:
@@ -235,6 +280,8 @@ class FeishuHotSender:
         }
 
     def send_task_card(self, target: str, card_payload: dict[str, Any], message_id: str | None = None) -> dict[str, Any]:
+        if self._record_sender is not None:
+            return self._record_sender.send_task_card(target, card_payload, message_id=message_id)
         try:
             result = asyncio.run(self._send_card_once(target, card_payload, message_id=message_id))
             if self._looks_auth_error(result):
@@ -245,6 +292,8 @@ class FeishuHotSender:
         return result
 
     def send(self, args: dict[str, Any]) -> str:
+        if self._record_sender is not None:
+            return self._record_sender.send(args)
         if args.get("action", "send") != "send":
             return send_message_tool(args)
         target = str(args.get("target") or "")
@@ -298,7 +347,7 @@ def _skipped_locked_result(*, send: bool) -> dict[str, Any]:
     }
 
 def _now_iso() -> str:
-    return datetime.now(PNC_FEISHU_BUSINESS_TZ).isoformat()
+    return datetime.fromtimestamp(_now_epoch(), PNC_FEISHU_BUSINESS_TZ).isoformat()
 
 
 def _parse_iso_ts(value: Any) -> float | None:
@@ -308,7 +357,13 @@ def _parse_iso_ts(value: Any) -> float | None:
         return None
     text = value.strip().replace("Z", "+00:00")
     try:
-        return datetime.fromisoformat(text).timestamp()
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            # Milestones are persisted as business-time display strings. Treating
+            # them as the process-local timezone adds another +08:00 on every
+            # replay when the isolated worker runs with TZ=UTC.
+            parsed = parsed.replace(tzinfo=PNC_FEISHU_BUSINESS_TZ)
+        return parsed.timestamp()
     except ValueError:
         return None
 
@@ -351,7 +406,7 @@ def _notice_is_relayable(
     last_attempt = _parse_iso_ts(notice.get("last_attempt_at")) or _parse_iso_ts(notice.get("sent_at"))
     if last_attempt is None:
         return True, "failed_without_last_attempt"
-    current = datetime.now(timezone.utc).timestamp() if now_ts is None else now_ts
+    current = _now_epoch() if now_ts is None else now_ts
     age = current - last_attempt
     if age >= retry_failed_after_seconds:
         return True, f"failed_retry_due:{int(age)}s"
@@ -383,7 +438,7 @@ def iter_pending_notices(*, task_ids: Iterable[str] | None = None, retry_failed_
     # task_filter (explicit request) always bypasses the window so direct lookups
     # still hit. The window must be >= retry_failed_after to never drop a file the
     # relay could still legitimately retry.
-    now_ts = time.time()
+    now_ts = _now_epoch()
     window_seconds = max(
         SCAN_ACT_WINDOW_SECONDS,
         int(retry_failed_after_seconds or 0) + SCAN_ACT_WINDOW_MARGIN_SECONDS,
@@ -409,9 +464,11 @@ def iter_pending_notices(*, task_ids: Iterable[str] | None = None, retry_failed_
         if task_filter and task_id not in task_filter:
             continue
         body = _load_json(path)
+        body = reconcile_vm_delivery_proposal(task_id, body)
+        # Reconciliation may create the card for a non-terminal task. Enrich
+        # afterwards so the first scan reaches the same fixed point as replays.
         body = enrich_task_card_vm_progress(task_id, body)
         body = enrich_task_card_delivery_contract(task_id, body)
-        body = reconcile_vm_delivery_proposal(task_id, body)
         _atomic_write_json(path, body)
         guard_action = None
         body, guard_action = apply_integration_tools_close_loop_guard(task_id, path, body)
@@ -433,6 +490,10 @@ def iter_pending_notices(*, task_ids: Iterable[str] | None = None, retry_failed_
             if _g1q3_guard_action is not None:
                 body["_close_loop_guard_action"] = _g1q3_guard_action
             task_card = body.get("task_card") if isinstance(body.get("task_card"), dict) else task_card
+            # Candidate admission and sending must observe the same enriched
+            # card. Otherwise the next scan sees a different render and emits
+            # a second PATCH for the same terminal transition.
+            _atomic_write_json(path, body)
         card_relayable = _task_card_needs_sync(task_card) if task_card else False
         notify_pending = (_originator_notify_pending(task_id, body) or _mechanical_download_notify_pending(task_id, body) or _g1q3_anomaly_notify_pending(task_id, body) or _infra_recovery_notify_pending(task_id, body)) if task_card else False
         if not notice:
@@ -496,7 +557,7 @@ def _task_state_from_meta_or_status(task_id: str, meta: dict[str, Any]) -> str:
 
 
 def _task_age_seconds(meta: dict[str, Any], body: dict[str, Any], task_card: dict[str, Any], *, now_ts: float | None = None) -> float | None:
-    current = datetime.now(timezone.utc).timestamp() if now_ts is None else now_ts
+    current = _now_epoch() if now_ts is None else now_ts
     # The SLA clock is the business/shared-state state timestamp.  Sidecar
     # collectors may refresh body.updated_at while only adding VM probes; that
     # must not reset the user-visible close-loop SLA.
@@ -628,9 +689,16 @@ def _load_g1q3_pipeline_result(artifact_root: str, contract: dict[str, Any] | No
     """Load authoritative pipeline_result.json for G1Q3 card/notify truth."""
     contract = contract if isinstance(contract, dict) else {}
     body = body if isinstance(body, dict) else {}
-    for candidate in (body.get("pipeline_result"), contract.get("pipeline_result")):
+    proposal = body.get("vm_delivery_proposal") if isinstance(body.get("vm_delivery_proposal"), dict) else {}
+    for candidate in (
+        body.get("pipeline_result"),
+        proposal.get("pipeline_result"),
+        contract.get("pipeline_result"),
+    ):
         if isinstance(candidate, dict) and candidate:
             return candidate
+    if proposal.get("evidence_source") == "fixture":
+        return {}
     local = _load_artifact_json(artifact_root, "pipeline_result.json") if artifact_root else {}
     if local:
         return local
@@ -795,6 +863,8 @@ def _load_g1q3_delivery_contract(task_id: str, body: dict[str, Any] | None = Non
     candidates: list[Any] = []
     if isinstance(body, dict):
         candidates.append(body.get("delivery_contract"))
+        proposal = body.get("vm_delivery_proposal") if isinstance(body.get("vm_delivery_proposal"), dict) else {}
+        candidates.append(proposal.get("delivery_contract"))
         task_card = body.get("task_card") if isinstance(body.get("task_card"), dict) else {}
         candidates.append(task_card.get("delivery_contract"))
         delivery = task_card.get("delivery") if isinstance(task_card.get("delivery"), dict) else {}
@@ -1265,6 +1335,7 @@ def _pipeline_blocker_for_task(task_id: str, task_card: dict[str, Any]) -> dict[
         candidates.insert(0, {"fault_class": biz_fc, "kind": str(business.get("blocker_kind") or "").strip()})
     candidates.append(_load_original_pipeline_blocker(task_id))
     diagnostics = task_card.get("diagnostics") if isinstance(task_card.get("diagnostics"), dict) else {}
+    candidates.append(diagnostics.get("pipeline_blocker"))
     candidates.append(diagnostics.get("blocker"))
     candidates.append(diagnostics.get("download_blocker"))
     for item in candidates:
@@ -1657,14 +1728,18 @@ def reconcile_vm_delivery_proposal(task_id: str, body: dict[str, Any]) -> dict[s
         task_card = {
             "schema_version": 1,
             "task_id": task_id,
-            "chat_id": notice.get("chat_id"),
-            "thread_id": notice.get("thread_id"),
-            "message_id": notice.get("message_id"),
+            "chat_id": notice.get("chat_id") or proposal.get("chat_id"),
+            "thread_id": notice.get("thread_id") or proposal.get("thread_id"),
+            "message_id": notice.get("message_id") or proposal.get("message_id"),
             "vm_task_id": notice.get("vm_task_id") or proposal.get("vm_task_id"),
             "created_at": body.get("created_at") or proposal.get("generated_at") or _now_iso(),
             "one_card_policy": True,
             "milestones": [],
         }
+    for field in ("chat_id", "thread_id", "message_id", "vm_task_id"):
+        proposal_value = proposal.get(field)
+        if proposal_value and not task_card.get(field):
+            task_card[field] = proposal_value
     proposed_delivery = proposal.get("delivery") if isinstance(proposal.get("delivery"), dict) else {}
     if proposed_delivery:
         existing_delivery = task_card.get("delivery") if isinstance(task_card.get("delivery"), dict) else {}
@@ -1715,7 +1790,7 @@ def enrich_task_card_vm_progress(task_id: str, body: dict[str, Any], *, now_ts: 
             _append_milestone(milestones, f"执行阶段：{label}", event.get("ts") or event.get("time"))
     state = str(vm_bridge.get("state") or task_card.get("user_state") or "").strip().lower()
     progress_ts = _parse_iso_ts(progress.get("ts") or progress.get("time"))
-    current_ts = datetime.now(timezone.utc).timestamp() if now_ts is None else now_ts
+    current_ts = _now_epoch() if now_ts is None else now_ts
     if state in {"running", "executing", "in_progress", "picked-up"} and progress_ts is not None:
         stale = max(0.0, current_ts - progress_ts)
         if stale >= max(1, PNC_PROGRESS_HEARTBEAT_STALE_SECONDS):
@@ -1786,6 +1861,7 @@ def enrich_g1q3_task_card_delivery(task_id: str, body: dict[str, Any]) -> dict[s
     latest_report_contract = _latest_governance_report_contract(task_id, body, meta)
     if _g1q3_contract_report_ready_truth(latest_report_contract):
         delivery_contract = latest_report_contract
+    pipeline_result_truth = _load_g1q3_pipeline_result(artifact_root, delivery_contract, body)
     contract_business_result = _g1q3_contract_missing_input_business_result(delivery_contract)
     if contract_business_result and not business_result:
         business_result = contract_business_result
@@ -2152,6 +2228,15 @@ def enrich_g1q3_task_card_delivery(task_id: str, body: dict[str, Any]) -> dict[s
         diagnostics["download_blocker"] = pipeline_blocker
         if pipeline_blocker.get("kind"):
             diagnostics["download_blocker_kind"] = str(pipeline_blocker.get("kind") or "")
+    authoritative_pipeline_blocker = (
+        pipeline_result_truth.get("blocker")
+        if isinstance(pipeline_result_truth.get("blocker"), dict)
+        else {}
+    )
+    if authoritative_pipeline_blocker:
+        diagnostics["pipeline_blocker"] = dict(authoritative_pipeline_blocker)
+        if authoritative_pipeline_blocker.get("kind"):
+            diagnostics["blocker_kind"] = str(authoritative_pipeline_blocker.get("kind") or "")
     if truth.get("anomaly"):
         diagnostics["anomaly"] = True
         diagnostics["anomaly_reasons"] = truth.get("anomaly_reasons") or []
@@ -2277,7 +2362,7 @@ def apply_integration_tools_close_loop_guard(
             try:
                 applied_ts = _parse_iso_ts(task_card.get("close_loop_guard_applied_at"))
                 if applied_ts is not None:
-                    current_ts = datetime.now(timezone.utc).timestamp() if now_ts is None else now_ts
+                    current_ts = _now_epoch() if now_ts is None else now_ts
                     applied_age = max(0.0, current_ts - applied_ts)
             except Exception:
                 applied_age = None
@@ -2383,8 +2468,8 @@ def apply_g1q3_close_loop_guard(
     # blocked intake is processed within seconds, so this never blocks real use.
     _created_ts = _parse_iso_ts(meta.get("created_at")) or _parse_iso_ts(meta.get("updated_at"))
     if _created_ts is not None:
-        _now_epoch = datetime.now(timezone.utc).timestamp() if now_ts is None else now_ts
-        if (_now_epoch - _created_ts) > G1Q3_CLOSE_LOOP_GUARD_MAX_AGE_SECONDS:
+        current_epoch = _now_epoch() if now_ts is None else now_ts
+        if (current_epoch - _created_ts) > G1Q3_CLOSE_LOOP_GUARD_MAX_AGE_SECONDS:
             return body, None
     now_iso = _now_iso()
     summary = "g1q3_rca close-loop guard: completed -> blocked (intake 需补充数据/证据)"
@@ -2535,7 +2620,10 @@ def _originator_notify_pending(task_id: str, body: dict[str, Any]) -> bool:
     diagnostics = task_card.get("diagnostics") if isinstance(task_card.get("diagnostics"), dict) else {}
     if diagnostics.get("anomaly"):
         return False
-    if str(delivery.get("report_status") or "").strip() in {"need_pipeline_fix", "need_download"} and _is_pipeline_fix_task(task_id, task_card):
+    report_status = str(delivery.get("report_status") or "").strip()
+    if report_status == "need_pipeline_fix":
+        return False
+    if report_status == "need_download" and _is_pipeline_fix_task(task_id, task_card):
         return False
     if str(delivery.get("report_status") or "").strip() == "need_download" and _mechanical_download_blocker_kind(task_id, task_card):
         return False
@@ -2687,7 +2775,10 @@ def maybe_notify_originator(
     diagnostics = task_card.get("diagnostics") if isinstance(task_card.get("diagnostics"), dict) else {}
     if diagnostics.get("anomaly"):
         return {"skipped": True, "reason": "anomaly_notify_handles", "kind": "g1q3_anomaly"}
-    if str(delivery.get("report_status") or "").strip() in {"need_pipeline_fix", "need_download"} and _is_pipeline_fix_task(task_id, task_card):
+    report_status = str(delivery.get("report_status") or "").strip()
+    if report_status == "need_pipeline_fix":
+        return {"skipped": True, "reason": "pipeline_fix_no_originator_ping", "kind": "need_input"}
+    if report_status == "need_download" and _is_pipeline_fix_task(task_id, task_card):
         return {"skipped": True, "reason": "pipeline_fix_no_originator_ping", "kind": "need_input"}
     if str(delivery.get("report_status") or "").strip() == "need_download" and _mechanical_download_blocker_kind(task_id, task_card):
         return {"skipped": True, "reason": "mechanical_download_notify_handles", "kind": "need_input"}
@@ -3092,7 +3183,144 @@ def _card_target(task_card: dict[str, Any], fallback_notice: dict[str, Any] | No
     return f"feishu:{chat_id}:{anchor}" if anchor else f"feishu:{chat_id}"
 
 
-def sync_task_card(
+_CARD_PERSISTENT_FIELDS = frozenset(
+    {
+        "card_message_id",
+        "last_sent_hash",
+        "last_render_hash",
+        "last_card_semantic_key",
+        "last_update_ts",
+        "last_update_observed_at",
+        "last_attempt_ts",
+        "last_error",
+        "card_message_expired_at",
+        "last_anomaly_notify_key",
+        "last_anomaly_notify_at",
+        "last_anomaly_notify_skipped_reason",
+        "last_anomaly_notify_error",
+        "last_download_notify_key",
+        "last_download_notify_at",
+        "last_download_notify_skipped_reason",
+        "last_download_notify_error",
+        "last_infra_notify_key",
+        "last_infra_notify_at",
+        "last_infra_notify_skipped_reason",
+        "last_infra_notify_error",
+        "last_notify_key",
+        "last_notify_at",
+        "last_notify_skipped_reason",
+        "last_notify_error",
+        "close_loop_guard_state",
+        "close_loop_guard_applied_at",
+        "close_loop_guard_reason",
+        "need_input_first_timeout_at",
+    }
+)
+_CARD_LOCK_TIMEOUT_SECONDS = 10.0
+_CARD_TERMINAL_STATES = frozenset(
+    {"completed", "done", "failed", "cancelled", "canceled", "abandoned", "blocked", "awaiting_user", "needs_fix"}
+)
+
+
+def _normalized_card_state(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+
+
+def _card_semantic_key(
+    *,
+    task_id: str,
+    target: str,
+    task_card: dict[str, Any],
+    notice: dict[str, Any],
+    render_hash: str,
+) -> str:
+    user_state = _normalized_card_state(task_card.get("user_state")) or "unknown"
+    notice_state = _normalized_card_state(notice.get("state"))
+    terminal_state = notice_state if notice_state in _CARD_TERMINAL_STATES else (
+        user_state if user_state in _CARD_TERMINAL_STATES else "nonterminal"
+    )
+    material = {
+        "schema_version": 1,
+        "task_id": str(task_id or "").strip(),
+        "target": str(target or "").strip(),
+        "user_state": user_state,
+        "terminal_state": terminal_state,
+        "render_hash": render_hash,
+    }
+    encoded = json.dumps(material, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "card-semantic:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_card_lock_binding(fd: int, path: Path, expected: tuple[int, int] | None = None) -> tuple[int, int]:
+    opened = os.fstat(fd)
+    visible = os.lstat(path)
+    if not stat.S_ISREG(opened.st_mode) or not stat.S_ISREG(visible.st_mode):
+        raise RuntimeError(f"task-card lock must be a regular file: {path}")
+    if opened.st_uid != os.getuid() or visible.st_uid != os.getuid():
+        raise RuntimeError(f"task-card lock owner mismatch: {path}")
+    if opened.st_nlink != 1 or visible.st_nlink != 1:
+        raise RuntimeError(f"task-card lock link count mismatch: {path}")
+    if stat.S_IMODE(opened.st_mode) != 0o600 or stat.S_IMODE(visible.st_mode) != 0o600:
+        raise RuntimeError(f"task-card lock mode must be 0600: {path}")
+    identity = (opened.st_dev, opened.st_ino)
+    if identity != (visible.st_dev, visible.st_ino):
+        raise RuntimeError(f"task-card lock path/descriptor identity mismatch: {path}")
+    if expected is not None and identity != expected:
+        raise RuntimeError(f"task-card lock binding changed while held: {path}")
+    return identity
+
+
+class _TaskCardSidecarLock:
+    def __init__(self, sidecar_path: Path, *, timeout_seconds: float = _CARD_LOCK_TIMEOUT_SECONDS):
+        self.path = sidecar_path.parent / f".{sidecar_path.name}.card.lock"
+        self.timeout_seconds = max(0.1, float(timeout_seconds))
+        self.fd = -1
+        self.identity: tuple[int, int] | None = None
+        self.acquired = False
+
+    def __enter__(self):
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        if nofollow is None:
+            raise RuntimeError("task-card lock requires O_NOFOLLOW")
+        flags = os.O_RDWR | os.O_CREAT | nofollow | getattr(os, "O_CLOEXEC", 0)
+        self.fd = os.open(self.path, flags, 0o600)
+        try:
+            os.set_inheritable(self.fd, False)
+            self.identity = _validate_card_lock_binding(self.fd, self.path)
+            deadline = time.monotonic() + self.timeout_seconds
+            while True:
+                try:
+                    fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self.acquired = True
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"timed out waiting for task-card lock: {self.path}")
+                    time.sleep(0.025)
+            _validate_card_lock_binding(self.fd, self.path, self.identity)
+            return self
+        except Exception:
+            if self.acquired:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            os.close(self.fd)
+            self.fd = -1
+            self.acquired = False
+            raise
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if self.fd >= 0 and self.identity is not None:
+                _validate_card_lock_binding(self.fd, self.path, self.identity)
+        finally:
+            if self.fd >= 0:
+                if self.acquired:
+                    fcntl.flock(self.fd, fcntl.LOCK_UN)
+                os.close(self.fd)
+                self.fd = -1
+                self.acquired = False
+
+
+def _sync_task_card_unlocked(
     *,
     task_id: str,
     path: Path,
@@ -3109,18 +3337,33 @@ def sync_task_card(
     render_hash = stable_render_hash(rendered)
     card_message_id = str(task_card.get("card_message_id") or "").strip() or None
     last_sent_hash = str(task_card.get("last_sent_hash") or "").strip()
+    last_semantic_key = str(task_card.get("last_card_semantic_key") or "").strip()
     last_update_ts = _parse_iso_ts(task_card.get("last_update_ts"))
-    now_ts = datetime.now(timezone.utc).timestamp()
+    now_ts = _now_epoch()
     target = _card_target(task_card, notice)
-    if card_message_id and last_sent_hash == render_hash:
-        return {"skipped": True, "reason": "hash_unchanged", "target": target, "message_id": card_message_id}
+    semantic_key = _card_semantic_key(
+        task_id=task_id,
+        target=target,
+        task_card=task_card,
+        notice=notice,
+        render_hash=render_hash,
+    )
+    if card_message_id and last_sent_hash == render_hash and (not last_semantic_key or last_semantic_key == semantic_key):
+        return {
+            "skipped": True,
+            "reason": "hash_unchanged",
+            "disposition": "duplicate_noop",
+            "semantic_key": semantic_key,
+            "target": target,
+            "message_id": card_message_id,
+        }
     if card_message_id and throttle_seconds > 0 and last_update_ts is not None and now_ts - last_update_ts < throttle_seconds:
         task_card.pop("last_error", None)
         body["task_card"] = task_card
         _atomic_write_json(path, body)
-        return {"skipped": True, "reason": "throttled", "target": target, "message_id": card_message_id}
+        return {"skipped": True, "reason": "throttled", "semantic_key": semantic_key, "target": target, "message_id": card_message_id}
     if not send:
-        return {"dry_run": True, "target": target, "message_id": card_message_id, "render_hash": render_hash, "will_update": bool(card_message_id)}
+        return {"dry_run": True, "target": target, "message_id": card_message_id, "render_hash": render_hash, "semantic_key": semantic_key, "will_update": bool(card_message_id)}
     if send_card_func is None:
         return {"skipped": True, "reason": "no_card_sender", "target": target}
     result = send_card_func(target, rendered, message_id=card_message_id)
@@ -3129,6 +3372,7 @@ def sync_task_card(
         task_card["card_message_id"] = result.get("message_id") or card_message_id
         task_card["last_sent_hash"] = render_hash
         task_card["last_render_hash"] = render_hash
+        task_card["last_card_semantic_key"] = semantic_key
         task_card["last_update_ts"] = sent_at
         task_card["last_update_observed_at"] = sent_at
         task_card.pop("last_error", None)
@@ -3136,6 +3380,8 @@ def sync_task_card(
         _atomic_write_json(path, body)
         result = dict(result)
         result["target"] = target
+        result["semantic_key"] = semantic_key
+        result["disposition"] = "recorded"
         return result
     error = str((result or {}).get("error") if isinstance(result, dict) else result)
     now_iso = _now_iso()
@@ -3149,17 +3395,59 @@ def sync_task_card(
         # card via explicit/manual recovery if needed.
         task_card["last_sent_hash"] = render_hash
         task_card["last_render_hash"] = render_hash
+        task_card["last_card_semantic_key"] = semantic_key
         task_card["last_update_observed_at"] = now_iso
         task_card["card_message_expired_at"] = task_card.get("card_message_expired_at") or now_iso
         body["task_card"] = task_card
         _atomic_write_json(path, body)
-        return {"skipped": True, "reason": "card_message_expired", "error": error, "target": target, "message_id": card_message_id}
+        return {"skipped": True, "reason": "card_message_expired", "disposition": "suppressed_terminal", "semantic_key": semantic_key, "error": error, "target": target, "message_id": card_message_id}
     body["task_card"] = task_card
     _atomic_write_json(path, body)
     fallback_text = str(notice.get("text") or "").strip()[:500]
     if not fallback_text:
         fallback_text = _build_task_card_fallback_text(task_id, task_card, notice, error)
     return {"success": False, "error": error, "target": target, "fallback_text": fallback_text}
+
+
+def sync_task_card(
+    *,
+    task_id: str,
+    path: Path,
+    body: dict[str, Any],
+    send: bool,
+    send_card_func: Callable[..., dict[str, Any]] | None = None,
+    throttle_seconds: float = DEFAULT_CARD_UPDATE_THROTTLE_SECONDS,
+) -> dict[str, Any] | None:
+    desired_card = body.get("task_card") if isinstance(body.get("task_card"), dict) else None
+    if not desired_card:
+        return None
+    with _TaskCardSidecarLock(path):
+        latest_body = _load_json(path)
+        if not latest_body:
+            raise RuntimeError(f"task-card sidecar is missing or invalid: {path}")
+        latest_card = latest_body.get("task_card") if isinstance(latest_body.get("task_card"), dict) else {}
+        merged_card = dict(desired_card)
+        # The sidecar under the lock is the CAS authority. A stale caller may
+        # contribute a newly-rendered business card, but it cannot overwrite or
+        # resurrect delivery markers from an earlier successful disposition.
+        for field in _CARD_PERSISTENT_FIELDS:
+            if field in latest_card:
+                merged_card[field] = latest_card[field]
+            else:
+                merged_card.pop(field, None)
+        working_body = dict(latest_body)
+        working_body["task_card"] = merged_card
+        result = _sync_task_card_unlocked(
+            task_id=task_id,
+            path=path,
+            body=working_body,
+            send=send,
+            send_card_func=send_card_func,
+            throttle_seconds=throttle_seconds,
+        )
+        body.clear()
+        body.update(working_body)
+        return result
 
 
 def _is_expired_card_update_error(error: str) -> bool:
@@ -3365,28 +3653,7 @@ def _merge_task_card_persistent_fields(current: dict[str, Any], previous: dict[s
     """
     if not isinstance(current, dict) or not isinstance(previous, dict):
         return current
-    for key in (
-        "last_anomaly_notify_key",
-        "last_anomaly_notify_at",
-        "last_anomaly_notify_skipped_reason",
-        "last_anomaly_notify_error",
-        "last_download_notify_key",
-        "last_download_notify_at",
-        "last_download_notify_skipped_reason",
-        "last_download_notify_error",
-        "last_infra_notify_key",
-        "last_infra_notify_at",
-        "last_infra_notify_skipped_reason",
-        "last_infra_notify_error",
-        "last_notify_key",
-        "last_notify_at",
-        "last_notify_skipped_reason",
-        "last_notify_error",
-        "close_loop_guard_state",
-        "close_loop_guard_applied_at",
-        "close_loop_guard_reason",
-        "need_input_first_timeout_at",
-    ):
+    for key in _CARD_PERSISTENT_FIELDS:
         if key in previous and key not in current:
             current[key] = previous[key]
     return current
@@ -3488,7 +3755,66 @@ def maybe_alert_failed_notice(path: Path, body: dict[str, Any], *, task_id: str,
     return result if isinstance(result, dict) else {"raw": raw}
 
 
-def relay_pending_notices(*, task_ids: Iterable[str] | None = None, send: bool = False, limit: int = 20, retry_failed_after_seconds: int = 0, max_attempts: int = 3, send_func: Callable[[dict[str, Any]], str] | None = None, send_card_func: Callable[..., dict[str, Any]] | None = None, since_ts: float | None = None, explicit_completion_delivery: bool | None = None, max_card_fallbacks_per_loop: int | None = None) -> dict[str, Any]:
+def _record_only_task_senders(
+    record_sender: Any,
+    *,
+    task_id: str,
+    body: dict[str, Any],
+    notice: dict[str, Any],
+) -> tuple[Callable[[dict[str, Any]], str], Callable[..., dict[str, Any]]]:
+    """Bind record-only sends to one task without changing live sender APIs."""
+    task_card = body.get("task_card") if isinstance(body.get("task_card"), dict) else {}
+    terminal_state = str(notice.get("state") or task_card.get("user_state") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", terminal_state):
+        terminal_state = ""
+
+    def _dedupe_key(kind: str, target: str, payload: Any, message_id: str | None = None) -> str:
+        material = json.dumps(
+            {
+                "kind": kind,
+                "message_id": message_id,
+                "payload": payload,
+                "target": target,
+                "task_id": task_id,
+                "terminal_state": terminal_state or None,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return f"relay:{kind}:{hashlib.sha256(material).hexdigest()}"
+
+    def _send_text(args: dict[str, Any]) -> str:
+        bound = dict(args)
+        target = str(bound.get("target") or "")
+        message = bound.get("message")
+        bound["task_id"] = task_id
+        if terminal_state:
+            bound["terminal_state"] = terminal_state
+        else:
+            bound.pop("terminal_state", None)
+        bound["dedupe_key"] = _dedupe_key("text", target, message)
+        return record_sender.send(bound)
+
+    def _send_card(
+        target: str,
+        card_payload: dict[str, Any],
+        message_id: str | None = None,
+    ) -> dict[str, Any]:
+        return record_sender.send_task_card(
+            target,
+            card_payload,
+            message_id=message_id,
+            task_id=task_id,
+            terminal_state=terminal_state or None,
+            dedupe_key=_dedupe_key("card", target, card_payload, message_id),
+        )
+
+    return _send_text, _send_card
+
+
+def relay_pending_notices(*, task_ids: Iterable[str] | None = None, send: bool = False, limit: int = 20, retry_failed_after_seconds: int = 0, max_attempts: int = 3, send_func: Callable[[dict[str, Any]], str] | None = None, send_card_func: Callable[..., dict[str, Any]] | None = None, since_ts: float | None = None, explicit_completion_delivery: bool | None = None, max_card_fallbacks_per_loop: int | None = None, crash_hook: Callable[[str, dict[str, Any]], None] | None = None) -> dict[str, Any]:
+    record_sender = None
     if send:
         try:
             from gateway.record_only.runtime import get_record_only_transport
@@ -3507,8 +3833,6 @@ def relay_pending_notices(*, task_ids: Iterable[str] | None = None, send: bool =
             from gateway.record_only.transport import RecordOnlyRelaySender
 
             record_sender = RecordOnlyRelaySender(record_transport)
-            send_func = record_sender.send
-            send_card_func = record_sender.send_task_card
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
     fallback_budget = DEFAULT_MAX_CARD_FALLBACKS_PER_LOOP if max_card_fallbacks_per_loop is None else max(0, int(max_card_fallbacks_per_loop))
@@ -3563,8 +3887,17 @@ def relay_pending_notices(*, task_ids: Iterable[str] | None = None, send: bool =
             if _g1q3_guard_action is not None:
                 guard_action = _g1q3_guard_action
         body = enrich_task_card_delivery_contract(task_id, body)
+        task_send_func = send_func
+        task_card_func = send_card_func
+        if record_sender is not None:
+            task_send_func, task_card_func = _record_only_task_senders(
+                record_sender,
+                task_id=task_id,
+                body=body,
+                notice=notice,
+            )
         try:
-            card_result = sync_task_card(task_id=task_id, path=path, body=body, send=send, send_card_func=send_card_func)
+            card_result = sync_task_card(task_id=task_id, path=path, body=body, send=send, send_card_func=task_card_func)
         except Exception as exc:
             # A single malformed card (e.g. a stale positive milestone that trips
             # the fail-closed render guard) must never crash the whole watch loop
@@ -3586,7 +3919,7 @@ def relay_pending_notices(*, task_ids: Iterable[str] | None = None, send: bool =
                 body=body,
                 meta=meta_for_notify,
                 send=send,
-                send_func=send_func,
+                send_func=task_send_func,
             )
         except Exception as exc:  # never let a notify failure break card/notice relay
             notify_result = {"error": f"{type(exc).__name__}: {exc}"}
@@ -3597,7 +3930,7 @@ def relay_pending_notices(*, task_ids: Iterable[str] | None = None, send: bool =
                 body=body,
                 meta=meta_for_notify,
                 send=send,
-                send_func=send_func,
+                send_func=task_send_func,
             )
         except Exception as exc:
             download_notify_result = {"error": f"{type(exc).__name__}: {exc}"}
@@ -3608,7 +3941,7 @@ def relay_pending_notices(*, task_ids: Iterable[str] | None = None, send: bool =
                 body=body,
                 meta=meta_for_notify,
                 send=send,
-                send_func=send_func,
+                send_func=task_send_func,
             )
         except Exception as exc:
             anomaly_notify_result = {"error": f"{type(exc).__name__}: {exc}"}
@@ -3620,7 +3953,7 @@ def relay_pending_notices(*, task_ids: Iterable[str] | None = None, send: bool =
                 body=body,
                 meta=meta_for_notify,
                 send=send,
-                send_func=send_func,
+                send_func=task_send_func,
             )
         except Exception as exc:
             infra_notify_result = {"error": f"{type(exc).__name__}: {exc}"}
@@ -3672,7 +4005,7 @@ def relay_pending_notices(*, task_ids: Iterable[str] | None = None, send: bool =
                     row["skipped_text"] = True
                     return row, errs
                 try:
-                    raw = (send_func or send_message_tool)({"action": "send", "target": target, "message": fallback_text})
+                    raw = (task_send_func or send_message_tool)({"action": "send", "target": target, "message": fallback_text})
                     try:
                         fallback_result = json.loads(raw)
                     except Exception:
@@ -3725,21 +4058,28 @@ def relay_pending_notices(*, task_ids: Iterable[str] | None = None, send: bool =
             })
             return row, errs
         try:
-            raw = (send_func or send_message_tool)({"action": "send", "target": target, "message": text})
+            if crash_hook is not None:
+                crash_hook("before_sender", {"task_id": task_id, "path": str(path)})
+            raw = (task_send_func or send_message_tool)({"action": "send", "target": target, "message": text})
             try:
                 result = json.loads(raw)
             except Exception:
                 result = {"raw": raw}
             if isinstance(result, dict) and result.get("success"):
+                if crash_hook is not None:
+                    crash_hook("after_record_before_mark", {"task_id": task_id, "path": str(path)})
+                    crash_hook("before_mark_persist", {"task_id": task_id, "path": str(path)})
                 if delivery_required:
                     _mark_delivery_sent(path, body, result=result)
                 else:
                     _mark(path, body, status="sent", result=result)
+                if crash_hook is not None:
+                    crash_hook("after_mark_before_ack", {"task_id": task_id, "path": str(path)})
                 row.update({"sent": True, "result": result, "delivery_sent": bool(delivery_required)})
             else:
                 error = str((result or {}).get("error") if isinstance(result, dict) else result)
                 updated_notice = _mark(path, body, status="failed", result=result if isinstance(result, dict) else {"raw": raw}, error=error)
-                alert = maybe_alert_failed_notice(path, body, task_id=task_id, notice=updated_notice, error=error, max_attempts=max_attempts, send_func=send_func)
+                alert = maybe_alert_failed_notice(path, body, task_id=task_id, notice=updated_notice, error=error, max_attempts=max_attempts, send_func=task_send_func)
                 row.update({"sent": False, "error": error, "result": result})
                 if alert is not None:
                     row["alert"] = alert
@@ -3747,7 +4087,7 @@ def relay_pending_notices(*, task_ids: Iterable[str] | None = None, send: bool =
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             updated_notice = _mark(path, body, status="failed", error=error)
-            alert = maybe_alert_failed_notice(path, body, task_id=task_id, notice=updated_notice, error=error, max_attempts=max_attempts, send_func=send_func)
+            alert = maybe_alert_failed_notice(path, body, task_id=task_id, notice=updated_notice, error=error, max_attempts=max_attempts, send_func=task_send_func)
             row.update({"sent": False, "error": error})
             if alert is not None:
                 row["alert"] = alert

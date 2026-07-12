@@ -3,6 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
+from gateway.record_only import runtime
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from scripts import pnc_meegle_auth_watchdog as wd
 
 
@@ -63,6 +67,21 @@ def auth(expires=100, authenticated=True, **kw):
     return data
 
 
+def record_only_env(tmp_path: Path, monkeypatch):
+    root = tmp_path / "records"
+    root.mkdir(mode=0o700)
+    key_file = tmp_path / "record.key"
+    key_file.write_text("ab" * 32 + "\n", encoding="ascii")
+    key_file.chmod(0o600)
+    census_root = Path(__file__).resolve().parents[3] / "evidence" / "target-outbound-census"
+    monkeypatch.setenv("HERMES_OUTBOUND_MODE", "record-only")
+    monkeypatch.setenv("HERMES_OUTBOUND_RECORD_ROOT", str(root))
+    monkeypatch.setenv("HERMES_OUTBOUND_RECORD_KEY_FILE", str(key_file))
+    monkeypatch.setenv("HERMES_OUTBOUND_CENSUS_ROOT", str(census_root))
+    runtime._reset_for_tests()
+    return root, set_hermes_home_override(tmp_path)
+
+
 def test_healthy_does_not_alert(tmp_path):
     d, sent = deps([auth(106)])
     result = wd.run_once(cfg(tmp_path), d)
@@ -71,6 +90,52 @@ def test_healthy_does_not_alert(tmp_path):
     assert result["consecutive_expired"] == 0
     assert result["consecutive_unknown"] == 0
     assert sent == []
+
+
+def test_live_mode_keeps_injected_status_runner_and_sender_semantics(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_OUTBOUND_MODE", "live")
+    sent = []
+    d = deps([auth(None, authenticated=False), auth(None, authenticated=False)], sent=sent)[0]
+    first = wd.run_once(cfg(tmp_path), d)
+    second = wd.run_once(cfg(tmp_path), d)
+
+    assert first["alert_sent"] is False
+    assert second["alert_sent"] is True
+    assert len(sent) == 1
+
+
+def test_record_only_mode_skips_reload_env_protected_root_read(monkeypatch):
+    monkeypatch.setenv("HERMES_OUTBOUND_MODE", "record-only")
+
+    def bomb_reload():
+        raise AssertionError("reload_env attempted a protected-root read")
+
+    monkeypatch.setattr(wd, "reload_env", bomb_reload)
+    wd._reload_env_for_current_mode()
+
+
+def test_partial_record_only_config_fails_before_original_watchdog_deps_or_state(tmp_path, monkeypatch):
+    home_token = set_hermes_home_override(tmp_path)
+    monkeypatch.setenv("HERMES_OUTBOUND_MODE", "record-only")
+    records = tmp_path / "records"
+    records.mkdir(mode=0o700)
+    monkeypatch.setenv("HERMES_OUTBOUND_RECORD_ROOT", str(records))
+    monkeypatch.delenv("HERMES_OUTBOUND_RECORD_KEY_FILE", raising=False)
+    runtime._reset_for_tests()
+
+    def bomb(*_args, **_kwargs):
+        raise AssertionError("real watchdog dependency was touched")
+
+    try:
+        with pytest.raises(runtime.RecordOnlyConfigurationError, match="KEY_FILE"):
+            wd.run_once(
+                cfg(tmp_path),
+                wd.WatchdogDeps(status_func=bomb, runner=bomb, send_func=bomb),
+            )
+        assert not (tmp_path / "state.json").exists()
+    finally:
+        runtime._reset_for_tests()
+        reset_hermes_home_override(home_token)
 
 
 def test_authenticated_expires_roll_119_to_0_to_119_never_alerts_or_assists(tmp_path):
@@ -332,6 +397,139 @@ def test_long_auto_roll_without_device_code_init_triggers_proactive_reinit(tmp_p
     assert saved["last_proactive_reinit_at"] == 1000.0 + 7200
     assert isinstance(float(saved["last_proactive_reinit_at"]), float)
     assert "last_device_code_init_at" not in saved
+
+
+def test_record_only_confirmed_expiry_records_status_device_and_alert_without_real_deps(tmp_path, monkeypatch):
+    _records, home_token = record_only_env(tmp_path, monkeypatch)
+    statuses = [auth(None, authenticated=False), auth(None, authenticated=False)]
+    status_index = {"value": 0}
+
+    def fixture_status():
+        index = min(status_index["value"], len(statuses) - 1)
+        status_index["value"] += 1
+        return dict(statuses[index])
+
+    def bomb(*_args, **_kwargs):
+        raise AssertionError("real watchdog dependency was touched")
+
+    deps_value = wd.WatchdogDeps(
+        status_func=bomb,
+        record_only_status_func=fixture_status,
+        runner=bomb,
+        send_func=bomb,
+        now_func=lambda: 1000.0,
+    )
+    try:
+        first = wd.run_once(cfg(tmp_path), deps_value)
+        second = wd.run_once(cfg(tmp_path), deps_value)
+        transport = runtime.get_record_only_transport("scripts.pnc_meegle_auth_watchdog")
+        assert transport is not None
+        rows = transport.read_all()
+    finally:
+        runtime._reset_for_tests()
+        reset_hermes_home_override(home_token)
+
+    assert first["confirmed_failure"] is False
+    assert first["alert_sent"] is False
+    assert second["confirmed_failure"] is True
+    assert second["alert_sent"] is True
+    assert [row["operation"] for row in rows] == [
+        "auth_status_check",
+        "auth_device_init",
+        "text_send",
+    ]
+    assert rows[0]["attempt_count"] == 2
+    assert rows[1]["external_delivery_attempted"] is False
+    assert rows[2]["external_delivery_attempted"] is False
+    assert second["alert_result"]["external_delivery_verified"] is False
+
+
+def test_record_only_quiet_hours_preserve_confirm_without_device_or_alert(tmp_path, monkeypatch):
+    _records, home_token = record_only_env(tmp_path, monkeypatch)
+
+    def bomb(*_args, **_kwargs):
+        raise AssertionError("real watchdog dependency was touched")
+
+    deps_value = wd.WatchdogDeps(
+        status_func=bomb,
+        record_only_status_func=lambda: auth(None, authenticated=False),
+        runner=bomb,
+        send_func=bomb,
+        now_func=lambda: 23 * 3600,
+    )
+    quiet_config = cfg(tmp_path, quiet_start="22:00", quiet_end="08:00")
+    try:
+        wd.run_once(quiet_config, deps_value)
+        result = wd.run_once(quiet_config, deps_value)
+        transport = runtime.get_record_only_transport("scripts.pnc_meegle_auth_watchdog")
+        assert transport is not None
+        rows = transport.read_all()
+    finally:
+        runtime._reset_for_tests()
+        reset_hermes_home_override(home_token)
+
+    assert result["confirmed_failure"] is True
+    assert result["quiet_hours_suppressed"] is True
+    assert result["alert_sent"] is False
+    assert [row["operation"] for row in rows] == ["auth_status_check"]
+    assert rows[0]["attempt_count"] == 2
+
+
+def test_record_only_preserves_rate_limit_and_recovery_with_original_deps_bombed(tmp_path, monkeypatch):
+    _records, home_token = record_only_env(tmp_path, monkeypatch)
+    statuses = [
+        auth(None, authenticated=False),
+        auth(None, authenticated=False),
+        auth(None, authenticated=False),
+        auth(88),
+    ]
+    times = [1000.0, 2000.0, 2500.0, 3000.0]
+    indexes = {"status": 0, "time": 0}
+
+    def fixture_status():
+        value = statuses[indexes["status"]]
+        indexes["status"] += 1
+        return dict(value)
+
+    def next_time():
+        value = times[indexes["time"]]
+        indexes["time"] += 1
+        return value
+
+    def bomb(*_args, **_kwargs):
+        raise AssertionError("real watchdog dependency was touched")
+
+    deps_value = wd.WatchdogDeps(
+        status_func=bomb,
+        record_only_status_func=fixture_status,
+        runner=bomb,
+        send_func=bomb,
+        now_func=next_time,
+    )
+    try:
+        first = wd.run_once(cfg(tmp_path), deps_value)
+        alerted = wd.run_once(cfg(tmp_path), deps_value)
+        rate_limited = wd.run_once(cfg(tmp_path), deps_value)
+        recovered = wd.run_once(cfg(tmp_path), deps_value)
+        transport = runtime.get_record_only_transport("scripts.pnc_meegle_auth_watchdog")
+        assert transport is not None
+        rows = transport.read_all()
+    finally:
+        runtime._reset_for_tests()
+        reset_hermes_home_override(home_token)
+
+    assert first["alert_sent"] is False
+    assert alerted["alert_sent"] is True
+    assert rate_limited["alert_sent"] is False
+    assert recovered["alert_sent"] is True
+    assert recovered["state"] == "healthy"
+    assert [row["operation"] for row in rows] == [
+        "auth_status_check",
+        "auth_device_init",
+        "text_send",
+        "text_send",
+    ]
+    assert rows[0]["attempt_count"] == 4
 
 
 def test_proactive_reinit_cooldown_survives_save_load_roundtrip(tmp_path):

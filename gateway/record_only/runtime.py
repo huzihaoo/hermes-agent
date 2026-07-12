@@ -49,34 +49,80 @@ def _required_absolute_path(name: str) -> Path:
 
 
 def _read_key_file(path: Path) -> bytes:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    fd = -1
     try:
-        info = path.lstat()
+        visible_before = os.stat(path, follow_symlinks=False)
+        fd = os.open(path, flags)
+        opened_before = os.fstat(fd)
+        visible_opened = os.stat(path, follow_symlinks=False)
     except OSError as exc:
+        if fd >= 0:
+            os.close(fd)
         raise RecordOnlyConfigurationError(f"record key file unavailable: {exc}") from exc
     if (
-        stat.S_ISLNK(info.st_mode)
-        or not stat.S_ISREG(info.st_mode)
-        or info.st_uid != os.getuid()
-        or info.st_nlink != 1
-        or info.st_mode & 0o077
-        or info.st_size < 32
-        or info.st_size > 4096
+        stat.S_ISLNK(visible_before.st_mode)
+        or not stat.S_ISREG(opened_before.st_mode)
+        or opened_before.st_uid != os.getuid()
+        or opened_before.st_nlink != 1
+        or opened_before.st_mode & 0o077
+        or opened_before.st_size < 32
+        or opened_before.st_size > 4096
+        or (visible_before.st_dev, visible_before.st_ino)
+        != (opened_before.st_dev, opened_before.st_ino)
+        or (visible_opened.st_dev, visible_opened.st_ino)
+        != (opened_before.st_dev, opened_before.st_ino)
     ):
+        os.close(fd)
         raise RecordOnlyConfigurationError(
             "record key file must be user-owned mode 0600, single-link, regular, and bounded"
         )
     try:
-        raw = path.read_bytes().strip()
+        chunks: list[bytes] = []
+        remaining = 4097
+        while remaining > 0:
+            chunk = os.read(fd, min(256, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw_bytes = b"".join(chunks)
+        opened_after = os.fstat(fd)
+        visible_after = os.stat(path, follow_symlinks=False)
     except OSError as exc:
         raise RecordOnlyConfigurationError(f"record key file cannot be read: {exc}") from exc
-    after = path.lstat()
-    if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != (
-        info.st_dev,
-        info.st_ino,
-        info.st_size,
-        info.st_mtime_ns,
+    finally:
+        if fd >= 0:
+            os.close(fd)
+            fd = -1
+    before_fingerprint = (
+        opened_before.st_dev,
+        opened_before.st_ino,
+        opened_before.st_size,
+        opened_before.st_mtime_ns,
+        opened_before.st_ctime_ns,
+    )
+    after_fingerprint = (
+        opened_after.st_dev,
+        opened_after.st_ino,
+        opened_after.st_size,
+        opened_after.st_mtime_ns,
+        opened_after.st_ctime_ns,
+    )
+    if (
+        len(raw_bytes) > 4096
+        or len(raw_bytes) != opened_before.st_size
+        or before_fingerprint != after_fingerprint
+        or (visible_after.st_dev, visible_after.st_ino)
+        != (opened_after.st_dev, opened_after.st_ino)
+        or stat.S_ISLNK(visible_after.st_mode)
     ):
         raise RecordOnlyConfigurationError("record key file changed while being read")
+    raw = raw_bytes.strip()
     if _HEX_KEY_RE.fullmatch(raw):
         raw = bytes.fromhex(raw.decode("ascii"))
     if len(raw) < 32:

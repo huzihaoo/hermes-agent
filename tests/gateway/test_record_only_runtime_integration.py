@@ -50,6 +50,75 @@ def test_record_only_mode_fails_closed_without_key(tmp_path: Path, monkeypatch: 
         runtime.get_record_only_transport("test.missing-key")
 
 
+def test_record_key_reader_rejects_symlink_and_hardlink(tmp_path: Path) -> None:
+    key = tmp_path / "record.key"
+    key.write_text("ab" * 32 + "\n", encoding="ascii")
+    key.chmod(0o600)
+    symlink = tmp_path / "record-link.key"
+    symlink.symlink_to(key)
+    with pytest.raises(runtime.RecordOnlyConfigurationError):
+        runtime._read_key_file(symlink)
+
+    hardlink = tmp_path / "record-hardlink.key"
+    hardlink.hardlink_to(key)
+    with pytest.raises(runtime.RecordOnlyConfigurationError, match="single-link"):
+        runtime._read_key_file(key)
+
+
+def test_record_key_reader_rejects_path_swap_at_open(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    key = tmp_path / "record.key"
+    replacement = tmp_path / "replacement.key"
+    key.write_text("ab" * 32 + "\n", encoding="ascii")
+    replacement.write_text("cd" * 32 + "\n", encoding="ascii")
+    key.chmod(0o600)
+    replacement.chmod(0o600)
+    real_open = runtime.os.open
+    swapped = False
+
+    def swap_then_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if not swapped and Path(path) == key:
+            swapped = True
+            key.rename(tmp_path / "original.key")
+            replacement.rename(key)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(runtime.os, "open", swap_then_open)
+    with pytest.raises(runtime.RecordOnlyConfigurationError):
+        runtime._read_key_file(key)
+
+
+def test_record_key_reader_rejects_in_read_mutation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    key = tmp_path / "record.key"
+    key.write_text("ab" * 128, encoding="ascii")
+    key.chmod(0o600)
+    real_read = runtime.os.read
+    mutated = False
+
+    def read_then_mutate(fd, size):
+        nonlocal mutated
+        chunk = real_read(fd, size)
+        if chunk and not mutated:
+            mutated = True
+            key.write_text("cd" * 128, encoding="ascii")
+            key.chmod(0o600)
+        return chunk
+
+    monkeypatch.setattr(runtime.os, "read", read_then_mutate)
+    with pytest.raises(runtime.RecordOnlyConfigurationError, match="changed while being read"):
+        runtime._read_key_file(key)
+
+
+def test_live_mode_never_reads_record_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HERMES_OUTBOUND_MODE", "live")
+
+    def bomb(_path):
+        raise AssertionError("live mode read the record-only key")
+
+    monkeypatch.setattr(runtime, "_read_key_file", bomb)
+    assert runtime.get_record_only_transport("test.live-key-lazy") is None
+
+
 def test_card_reply_is_recorded_with_no_delivery_authority(record_only_env: Path) -> None:
     transport = runtime.get_record_only_transport("test.card")
     assert transport is not None
@@ -172,6 +241,67 @@ async def test_feishu_reactions_record_before_client(record_only_env: Path) -> N
     serialized = json.dumps(rows, ensure_ascii=False)
     assert "om_fixture" not in serialized
     assert reaction_id not in json.dumps(rows[1]["payload"], ensure_ascii=False)
+
+
+@pytest.mark.asyncio
+async def test_feishu_plugin_all_ten_operation_classes_stop_before_real_io(record_only_env: Path) -> None:
+    from gateway.platforms.feishu import FeishuAdapter
+
+    class BombClient:
+        def __getattribute__(self, name: str):
+            raise AssertionError(f"real Feishu client was touched: {name}")
+
+    adapter = FeishuAdapter(PlatformConfig(enabled=True))
+    adapter._client = BombClient()
+
+    async def bomb_download(*_args, **_kwargs):
+        raise AssertionError("remote media download was attempted")
+
+    adapter._download_remote_image = bomb_download
+
+    assert (await adapter.send("oc_fixture", "plain send")).success is True
+    assert (await adapter.send("oc_fixture", "reply", reply_to="om_source")).success is True
+    assert (await adapter.edit_message("oc_fixture", "om_edit", "edited")).success is True
+    assert (await adapter.send_exec_approval("oc_fixture", "echo safe", "session-fixture")).success is True
+    card_reply = await adapter._send_raw_message(
+        chat_id="oc_fixture",
+        msg_type="interactive",
+        payload=json.dumps({"elements": [{"tag": "markdown", "content": "card reply"}]}),
+        reply_to="om_card_source",
+        metadata=None,
+    )
+    assert card_reply.success is True
+    await adapter._update_approval_card_to_expired("om_card_update", "oc_fixture")
+    assert (
+        await adapter.send_image("oc_fixture", "https://example.invalid/image.png")
+    ).success is True
+    assert (
+        await adapter.send_document(
+            "oc_fixture",
+            "/definitely/not/read/document.txt",
+            reply_to="om_file_source",
+        )
+    ).success is True
+    reaction_id = await adapter._add_reaction("om_reaction", "Typing")
+    assert reaction_id is not None
+    assert await adapter._remove_reaction("om_reaction", reaction_id) is True
+
+    transport = runtime.get_record_only_transport("gateway.feishu.adapter")
+    assert transport is not None
+    rows = transport.read_all()
+    assert [row["operation"] for row in rows] == [
+        "text_send",
+        "text_reply",
+        "text_update",
+        "card_send",
+        "card_reply",
+        "card_update",
+        "file_send",
+        "file_reply",
+        "reaction_add",
+        "reaction_remove",
+    ]
+    assert all(row["external_delivery_attempted"] is False for row in rows)
 
 
 @pytest.mark.asyncio

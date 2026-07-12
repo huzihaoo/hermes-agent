@@ -9,16 +9,22 @@ user-facing /tasks view does not depend on manual collection.
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import json
+import math
 import os
+import pwd
 import re
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone, timedelta
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -44,6 +50,23 @@ REPORT_ATTACHMENT_CODEC_VERSION = "bom-utf8-v1"
 UTF8_BOM = b"\xef\xbb\xbf"
 REPORT_INTERNAL_HTTP_BASE = "http://192.168.26.174:18081"
 PNC_FEISHU_BUSINESS_TZ = timezone(timedelta(hours=8))
+_L4_EVENT_EPOCH_MAX = 4_102_444_800.0  # 2100-01-01T00:00:00Z
+FIXTURE_SCHEMA_VERSION = "pnc_vm_task_sync_fixture_v1"
+FIXTURE_DIR_NAME = "l4-fixtures"
+FIXTURE_ISOLATION_ROOT_ENV = "HERMES_L4_ISOLATION_ROOT"
+FIXTURE_EVIDENCE_SOURCE_KEY = "_l4_fixture_evidence_source"
+FIXTURE_EVIDENCE_SOURCE = "fixture"
+FIXTURE_TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+MAX_FIXTURE_BYTES = 20 * 1024 * 1024
+L4_SCENARIO_IDS = frozenset(f"S{index}" for index in range(1, 11))
+FIXTURE_OUTPUT_DIRS = (
+    "analytics",
+    "task-state",
+    "pnc_agent",
+    "pnc_agent/quota",
+    "runtime",
+    "locks",
+)
 
 PERCEPTION_TEST_TEAM_VM_PREFIX = "/mnt/minieye/pdcl/department/perception_test_team/"
 PERCEPTION_TEST_TEAM_CIFS_PREFIX = "//hfs.minieye.tech/department-perception_test_team/"
@@ -355,6 +378,8 @@ def _pipeline_result_for_delivery_contract(contract: dict[str, Any], payload_or_
     for candidate in (payload.get("pipeline_result"), contract.get("pipeline_result")):
         if isinstance(candidate, dict) and candidate:
             return candidate
+    if payload.get(FIXTURE_EVIDENCE_SOURCE_KEY) == FIXTURE_EVIDENCE_SOURCE:
+        return {}
     artifacts = contract.get("artifacts") if isinstance(contract.get("artifacts"), dict) else {}
     task_root_vm = str(artifacts.get("task_root_vm") or "").strip().rstrip("/")
     return _read_vm_json_file(task_root_vm + "/pipeline_result.json") if task_root_vm else {}
@@ -472,6 +497,458 @@ def _task_store_path() -> Path:
     return get_hermes_home() / "analytics" / "tasks.db"
 
 
+def _canonical_hermes_roots() -> tuple[Path, ...]:
+    try:
+        homes = {Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()}
+    except (KeyError, OSError):
+        homes = {Path.home().resolve()}
+    return tuple(
+        root
+        for home in homes
+        for root in ((home / ".hermes").resolve(), (home / ".openclaw").resolve())
+    )
+
+
+def _protected_local_roots() -> tuple[Path, ...]:
+    try:
+        account_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+    except (KeyError, OSError):
+        account_home = Path.home().resolve()
+    return tuple(
+        (account_home / relative).resolve()
+        for relative in (
+            ".hermes",
+            ".openclaw",
+            ".codex",
+            ".claude",
+            ".ssh",
+            ".aws",
+            ".config/gcloud",
+            "Library/Keychains",
+        )
+    )
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    for candidate, ancestor in ((left, right), (right, left)):
+        try:
+            candidate.relative_to(ancestor)
+        except ValueError:
+            continue
+        return True
+    return False
+
+
+def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _open_verified_directory(path: Path) -> tuple[int, os.stat_result]:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+        fd_info = os.fstat(fd)
+        path_info = os.stat(path, follow_symlinks=False)
+    except OSError:
+        if "fd" in locals():
+            os.close(fd)
+        raise
+    if (
+        not stat.S_ISDIR(fd_info.st_mode)
+        or fd_info.st_uid != os.getuid()
+        or fd_info.st_mode & 0o022
+        or not _same_identity(fd_info, path_info)
+    ):
+        os.close(fd)
+        raise ValueError(f"unsafe directory identity/owner/mode: {path}")
+    return fd, fd_info
+
+
+def _open_private_child_directory(parent_fd: int, name: str) -> int:
+    try:
+        os.mkdir(name, 0o700, dir_fd=parent_fd)
+    except OSError as exc:
+        if exc.errno != errno.EEXIST:
+            raise
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(name, flags, dir_fd=parent_fd)
+    info = os.fstat(fd)
+    path_info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.getuid()
+        or info.st_mode & 0o022
+        or not _same_identity(info, path_info)
+    ):
+        os.close(fd)
+        raise ValueError(f"unsafe isolated output directory: {name}")
+    return fd
+
+
+def _reject_unsafe_directory_entries(directory_fd: int) -> None:
+    for name in os.listdir(directory_fd):
+        info = None
+        for attempt in range(4):
+            try:
+                candidate = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                break
+            # An atomic replace can leave the inode observed by stat with zero
+            # links for a few microseconds. Re-resolve the name; never retry or
+            # accept a multi-link, wrong-owner, writable, or non-file entry.
+            if stat.S_ISREG(candidate.st_mode) and candidate.st_nlink == 0:
+                if attempt < 3:
+                    time.sleep(0.002)
+                    continue
+                info = candidate
+                break
+            info = candidate
+            break
+        if info is None:
+            continue
+        if (
+            not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode))
+            or info.st_uid != os.getuid()
+            or info.st_mode & 0o022
+            or (stat.S_ISREG(info.st_mode) and info.st_nlink != 1)
+        ):
+            raise ValueError(
+                f"unsafe isolated output entry: {name} "
+                f"mode={stat.S_IMODE(info.st_mode):04o} nlink={info.st_nlink}"
+            )
+
+
+@dataclass(frozen=True)
+class FixtureOutputBinding:
+    os_home: Path
+    hermes_home: Path
+    identities: tuple[tuple[str, int, int], ...]
+
+
+def _capture_fixture_output_binding(home: Path) -> FixtureOutputBinding:
+    identities: list[tuple[str, int, int]] = []
+    for relative in ("", *FIXTURE_OUTPUT_DIRS):
+        path = home if not relative else home / relative
+        fd, info = _open_verified_directory(path)
+        try:
+            _reject_unsafe_directory_entries(fd)
+            identities.append((relative, info.st_dev, info.st_ino))
+        finally:
+            os.close(fd)
+    return FixtureOutputBinding(
+        os_home=Path.home().resolve(strict=True),
+        hermes_home=home,
+        identities=tuple(identities),
+    )
+
+
+def _verify_fixture_output_binding(binding: FixtureOutputBinding) -> None:
+    current_os_home = Path.home()
+    if current_os_home.absolute() != binding.os_home or current_os_home.resolve(strict=True) != binding.os_home:
+        raise ValueError("isolated OS HOME changed after fixture admission")
+    current_hermes_raw = Path(get_hermes_home()).expanduser()
+    if (
+        current_hermes_raw.absolute() != binding.hermes_home
+        or current_hermes_raw.resolve(strict=True) != binding.hermes_home
+    ):
+        raise ValueError("isolated HERMES_HOME changed after fixture admission")
+    for relative, expected_dev, expected_ino in binding.identities:
+        path = binding.hermes_home if not relative else binding.hermes_home / relative
+        fd, info = _open_verified_directory(path)
+        try:
+            if (info.st_dev, info.st_ino) != (expected_dev, expected_ino):
+                raise ValueError(f"fixture output directory identity changed: {relative or '.'}")
+            _reject_unsafe_directory_entries(fd)
+        finally:
+            os.close(fd)
+
+
+def _validate_isolated_hermes_home(
+    path: str | Path | None = None,
+    *,
+    prepare_outputs: bool = False,
+) -> Path:
+    raw = Path(path if path is not None else get_hermes_home()).expanduser()
+    if not raw.is_absolute():
+        raise ValueError("fixture mode requires an absolute HERMES_HOME")
+    try:
+        home = raw.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"isolated HERMES_HOME is unavailable: {exc}") from exc
+    if raw.absolute() != home:
+        raise ValueError("isolated HERMES_HOME must not contain symlinks or path aliases")
+    canonical_roots = _canonical_hermes_roots()
+    account_home = canonical_roots[0].parent if canonical_roots else None
+    os_home_raw = Path.home()
+    os_home = os_home_raw.resolve(strict=True)
+    if os_home_raw.absolute() != os_home:
+        raise ValueError("fixture mode requires an OS HOME without symlinks or path aliases")
+    if account_home is not None and os_home == account_home:
+        raise ValueError("fixture mode requires an isolated OS HOME")
+    for blocked in canonical_roots:
+        try:
+            home.relative_to(blocked)
+        except ValueError:
+            continue
+        raise ValueError("fixture mode refuses canonical Hermes/OpenClaw home")
+    try:
+        home.relative_to(os_home)
+    except ValueError as exc:
+        raise ValueError("isolated HERMES_HOME must stay within isolated OS HOME") from exc
+    try:
+        home_fd, home_info = _open_verified_directory(home)
+    except OSError as exc:
+        raise ValueError(f"isolated HERMES_HOME cannot be opened safely: {exc}") from exc
+    try:
+        if prepare_outputs:
+            opened: list[int] = []
+            try:
+                analytics_fd = _open_private_child_directory(home_fd, "analytics")
+                opened.append(analytics_fd)
+                task_state_fd = _open_private_child_directory(home_fd, "task-state")
+                opened.append(task_state_fd)
+                pnc_agent_fd = _open_private_child_directory(home_fd, "pnc_agent")
+                opened.append(pnc_agent_fd)
+                quota_fd = _open_private_child_directory(pnc_agent_fd, "quota")
+                opened.append(quota_fd)
+                runtime_fd = _open_private_child_directory(home_fd, "runtime")
+                opened.append(runtime_fd)
+                locks_fd = _open_private_child_directory(home_fd, "locks")
+                opened.append(locks_fd)
+                for directory_fd in (analytics_fd, task_state_fd, quota_fd, runtime_fd, locks_fd):
+                    _reject_unsafe_directory_entries(directory_fd)
+            finally:
+                for child_fd in reversed(opened):
+                    os.close(child_fd)
+        after = os.stat(home, follow_symlinks=False)
+        if not _same_identity(home_info, after):
+            raise ValueError("isolated HERMES_HOME identity changed during validation")
+    finally:
+        os.close(home_fd)
+    return home
+
+
+def _validate_fixture_root(path: str | Path, *, hermes_home: Path | None = None) -> Path:
+    raw = Path(path).expanduser()
+    if not raw.is_absolute():
+        raise ValueError("fixture root must be absolute")
+    home = _validate_isolated_hermes_home(hermes_home)
+    try:
+        resolved = raw.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"fixture root is unavailable: {exc}") from exc
+    if raw.absolute() != resolved:
+        raise ValueError("fixture root must not contain symlinks or path aliases")
+    allowed_root = (home / FIXTURE_DIR_NAME).resolve(strict=False)
+    try:
+        resolved.relative_to(allowed_root)
+    except ValueError as exc:
+        raise ValueError(f"fixture root must stay within {allowed_root}") from exc
+    info = resolved.stat()
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.getuid()
+        or info.st_mode & 0o022
+    ):
+        raise ValueError("fixture root must be a user-owned directory without group/other write")
+    return resolved
+
+
+def _validate_fixture_record_paths(
+    home: Path,
+    *,
+    protected_roots: Iterable[Path] | None = None,
+) -> Path:
+    isolation_raw = Path(os.getenv(FIXTURE_ISOLATION_ROOT_ENV, "")).expanduser()
+    if not isolation_raw.is_absolute():
+        raise ValueError(f"fixture mode requires absolute {FIXTURE_ISOLATION_ROOT_ENV}")
+    try:
+        isolation_root = isolation_raw.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"fixture isolation root is unavailable: {exc}") from exc
+    if isolation_raw.absolute() != isolation_root:
+        raise ValueError("fixture isolation root must not contain symlinks or aliases")
+    isolation_fd, _ = _open_verified_directory(isolation_root)
+    os.close(isolation_fd)
+    protected = tuple(Path(path).resolve() for path in (protected_roots or _protected_local_roots()))
+    for blocked in protected:
+        if _paths_overlap(isolation_root, blocked):
+            raise ValueError(f"fixture isolation root overlaps protected root: {blocked}")
+    for candidate, label in ((Path.home().resolve(strict=True), "OS HOME"), (home, "HERMES_HOME")):
+        try:
+            candidate.relative_to(isolation_root)
+        except ValueError as exc:
+            raise ValueError(f"fixture {label} must stay within the isolation root") from exc
+    record_root_raw = Path(os.getenv("HERMES_OUTBOUND_RECORD_ROOT", "")).expanduser()
+    key_file_raw = Path(os.getenv("HERMES_OUTBOUND_RECORD_KEY_FILE", "")).expanduser()
+    if not record_root_raw.is_absolute() or not key_file_raw.is_absolute():
+        raise ValueError("fixture record root and key file must be absolute")
+    try:
+        record_root = record_root_raw.resolve(strict=True)
+        key_file = key_file_raw.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"fixture record root/key is unavailable: {exc}") from exc
+    if record_root_raw.absolute() != record_root or key_file_raw.absolute() != key_file:
+        raise ValueError("fixture record root/key must not contain symlinks or aliases")
+    for candidate, label in ((record_root, "record root"), (key_file, "record key")):
+        try:
+            candidate.relative_to(isolation_root)
+        except ValueError as exc:
+            raise ValueError(f"fixture {label} must stay within the isolation root") from exc
+        for blocked in protected:
+            try:
+                candidate.relative_to(blocked)
+            except ValueError:
+                continue
+            raise ValueError(f"fixture {label} must not resolve under protected root: {blocked}")
+    record_fd, _ = _open_verified_directory(record_root)
+    os.close(record_fd)
+    key_info = key_file.lstat()
+    if (
+        stat.S_ISLNK(key_info.st_mode)
+        or not stat.S_ISREG(key_info.st_mode)
+        or key_info.st_uid != os.getuid()
+        or key_info.st_nlink != 1
+        or key_info.st_mode & 0o077
+    ):
+        raise ValueError("fixture record key must be user-owned mode 0600 single-link regular file")
+
+    census_raw = Path(os.getenv("HERMES_OUTBOUND_CENSUS_ROOT", "")).expanduser()
+    if not census_raw.is_absolute():
+        raise ValueError("fixture outbound census root must be absolute")
+    try:
+        census_root = census_raw.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"fixture outbound census root is unavailable: {exc}") from exc
+    if census_raw.absolute() != census_root:
+        raise ValueError("fixture outbound census root must not contain symlinks or aliases")
+    try:
+        census_root.relative_to(isolation_root)
+    except ValueError as exc:
+        raise ValueError("fixture outbound census root must stay within the isolation root") from exc
+    for blocked in protected:
+        try:
+            census_root.relative_to(blocked)
+        except ValueError:
+            continue
+        raise ValueError(f"fixture outbound census root must not resolve under protected root: {blocked}")
+    census_fd, _ = _open_verified_directory(census_root)
+    try:
+        names = set(os.listdir(census_fd))
+        required_names = {"INDEX.json", "census-v4.json"}
+        if names != required_names:
+            raise ValueError("fixture outbound census root must contain only frozen INDEX.json and census-v4.json")
+        for name, maximum in (("INDEX.json", 64 * 1024), ("census-v4.json", 16 * 1024 * 1024)):
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(name, flags, dir_fd=census_fd)
+            try:
+                info = os.fstat(fd)
+                path_info = os.stat(name, dir_fd=census_fd, follow_symlinks=False)
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.getuid()
+                    or info.st_nlink != 1
+                    or info.st_mode & 0o022
+                    or info.st_size > maximum
+                    or not _same_identity(info, path_info)
+                ):
+                    raise ValueError(f"unsafe fixture outbound census file: {name}")
+            finally:
+                os.close(fd)
+    finally:
+        os.close(census_fd)
+    return isolation_root
+
+
+def _load_fixture_status(fixture_root: Path, vm_task_id: str) -> tuple[dict[str, Any], str]:
+    if not FIXTURE_TASK_ID_RE.fullmatch(vm_task_id):
+        raise ValueError("fixture vm_task_id is not path-safe")
+    filename = f"{vm_task_id}.json"
+    root_fd = -1
+    file_fd = -1
+    try:
+        root_fd, root_info = _open_verified_directory(fixture_root)
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        file_fd = os.open(filename, flags, dir_fd=root_fd)
+        before = os.fstat(file_fd)
+        path_before = os.stat(filename, dir_fd=root_fd, follow_symlinks=False)
+    except OSError as exc:
+        if file_fd >= 0:
+            os.close(file_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
+        raise ValueError(f"fixture status unavailable for {vm_task_id}: {exc}") from exc
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_uid != os.getuid()
+        or before.st_mode & 0o022
+        or before.st_nlink != 1
+        or before.st_size > MAX_FIXTURE_BYTES
+    ):
+        os.close(file_fd)
+        os.close(root_fd)
+        raise ValueError("fixture status must be a bounded, user-owned, single-link regular file")
+    try:
+        chunks: list[bytes] = []
+        remaining = MAX_FIXTURE_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(file_fd, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        after = os.fstat(file_fd)
+        path_after = os.stat(filename, dir_fd=root_fd, follow_symlinks=False)
+        root_after = os.stat(fixture_root, follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError(f"fixture status cannot be read: {exc}") from exc
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+            file_fd = -1
+        if root_fd >= 0:
+            os.close(root_fd)
+            root_fd = -1
+    if len(raw) > MAX_FIXTURE_BYTES:
+        raise ValueError("fixture status exceeds maximum size")
+    if len(raw) != before.st_size:
+        raise ValueError("fixture status byte count changed while being read")
+    if (
+        (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    ):
+        raise ValueError("fixture status changed while being read")
+    if not _same_identity(before, path_before) or not _same_identity(after, path_after):
+        raise ValueError("fixture status path identity changed while being read")
+    if not _same_identity(root_info, root_after):
+        raise ValueError("fixture root identity changed while status was read")
+
+    def strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate JSON key: {key}")
+            value[key] = item
+        return value
+
+    try:
+        envelope = json.loads(raw.decode("utf-8"), object_pairs_hook=strict_object)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"fixture status is not valid UTF-8 JSON: {exc}") from exc
+    if not isinstance(envelope, dict) or envelope.get("schema_version") != FIXTURE_SCHEMA_VERSION:
+        raise ValueError(f"fixture status requires schema_version={FIXTURE_SCHEMA_VERSION}")
+    if envelope.get("vm_task_id") != vm_task_id:
+        raise ValueError("fixture status vm_task_id does not match filename/task")
+    scenario_id = str(envelope.get("scenario_id") or "").strip().upper()
+    if scenario_id not in L4_SCENARIO_IDS:
+        raise ValueError("fixture status scenario_id must be one of S1..S10")
+    payload = envelope.get("payload")
+    if not isinstance(payload, dict):
+        raise ValueError("fixture status payload must be an object")
+    return payload, scenario_id
+
+
 class SingleRunLock:
     def __init__(self, path: Path):
         self.path = path
@@ -494,6 +971,83 @@ class SingleRunLock:
             if self.acquired:
                 fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
             self.handle.close()
+
+
+class FixtureSingleRunLock:
+    """Pinned lock for the isolated L4 fixture entry point."""
+
+    def __init__(self, binding: FixtureOutputBinding):
+        self.binding = binding
+        self.directory_fd = -1
+        self.lock_fd = -1
+        self.acquired = False
+
+    def __enter__(self):
+        try:
+            _verify_fixture_output_binding(self.binding)
+            locks_path = self.binding.hermes_home / "locks"
+            self.directory_fd, directory_info = _open_verified_directory(locks_path)
+            expected = next(
+                ((device, inode) for relative, device, inode in self.binding.identities if relative == "locks"),
+                None,
+            )
+            if expected is None or (directory_info.st_dev, directory_info.st_ino) != expected:
+                raise ValueError("fixture lock directory identity does not match admission binding")
+            flags = (
+                os.O_RDWR
+                | os.O_CREAT
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            self.lock_fd = os.open(
+                "pnc-vm-task-sync.lock",
+                flags,
+                0o600,
+                dir_fd=self.directory_fd,
+            )
+            info = os.fstat(self.lock_fd)
+            path_info = os.stat(
+                "pnc-vm-task-sync.lock",
+                dir_fd=self.directory_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_nlink != 1
+                or info.st_mode & 0o077
+                or not _same_identity(info, path_info)
+            ):
+                raise ValueError("fixture lock must be user-owned mode 0600 single-link regular file")
+            try:
+                fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                self.acquired = False
+            else:
+                self.acquired = True
+            _verify_fixture_output_binding(self.binding)
+            return self
+        except Exception:
+            if self.lock_fd >= 0:
+                os.close(self.lock_fd)
+                self.lock_fd = -1
+            if self.directory_fd >= 0:
+                os.close(self.directory_fd)
+                self.directory_fd = -1
+            raise
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if self.lock_fd >= 0 and self.acquired:
+                fcntl.flock(self.lock_fd, fcntl.LOCK_UN)
+        finally:
+            if self.lock_fd >= 0:
+                os.close(self.lock_fd)
+                self.lock_fd = -1
+            if self.directory_fd >= 0:
+                os.close(self.directory_fd)
+                self.directory_fd = -1
+        _verify_fixture_output_binding(self.binding)
 
 
 def iter_candidate_tasks(
@@ -521,7 +1075,27 @@ def iter_candidate_tasks(
 
 
 def _now_iso() -> str:
-    return datetime.now(PNC_FEISHU_BUSINESS_TZ).isoformat()
+    return datetime.fromtimestamp(_now_epoch(), PNC_FEISHU_BUSINESS_TZ).isoformat()
+
+
+def _now_epoch() -> float:
+    """Return the sealed L4 event clock, otherwise the live UTC epoch."""
+
+    if (
+        os.getenv("HERMES_OUTBOUND_MODE", "").strip().lower() == "record-only"
+        and os.getenv("HERMES_L4_SANDBOX_ACTIVE", "").strip() == "1"
+    ):
+        raw = os.getenv("HERMES_L4_EVENT_EPOCH", "").strip()
+        if not raw:
+            raise RuntimeError("record-only L4 sandbox requires HERMES_L4_EVENT_EPOCH")
+        try:
+            value = float(raw)
+        except ValueError as exc:
+            raise RuntimeError("HERMES_L4_EVENT_EPOCH must be a finite UTC epoch") from exc
+        if not math.isfinite(value) or not 0.0 <= value <= _L4_EVENT_EPOCH_MAX:
+            raise RuntimeError("HERMES_L4_EVENT_EPOCH is outside the accepted UTC epoch range")
+        return value
+    return time.time()
 
 
 
@@ -560,7 +1134,7 @@ def _sync_taskstore_terminal_status(store: TaskStore, task: Task, payload: dict[
     if task.status in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}:
         return None
     task.status = new_status
-    task.completed_at = task.completed_at or _parse_payload_updated_at(payload) or datetime.now(timezone.utc).timestamp()
+    task.completed_at = task.completed_at or _parse_payload_updated_at(payload) or _now_epoch()
     state_obj = payload.get("state") if isinstance(payload.get("state"), dict) else {}
     if new_status == TaskStatus.FAILED and not task.error_message:
         task.error_message = str(state_obj.get("summary") or (payload.get("vm_bridge") or {}).get("summary") or "VM task reached failed terminal state")
@@ -618,6 +1192,25 @@ def _feishu_report_attachment_link(*, work_item_id: str, vm_task_id: str, index_
     work_item_id = str(work_item_id or "").strip()
     index_html = str(index_html or "").strip()
     if not work_item_id or not index_html:
+        return ""
+
+    from gateway.record_only.runtime import get_record_only_transport
+
+    recorder = get_record_only_transport("scripts.pnc_vm_task_sync.report_attachment")
+    if recorder is not None:
+        source_url = _report_internal_http_link(index_html)
+        if not source_url:
+            return ""
+        recorder.record(
+            operation="file_send",
+            platform="feishu_project",
+            destination_kind="work_item",
+            destination_id=work_item_id,
+            payload_type="file",
+            payload={"index_html": index_html, "source_url": source_url},
+            task_id=vm_task_id,
+            caller_dedupe_key=f"g1q3-report-attachment:{work_item_id}:{index_html}",
+        )
         return ""
 
     key = f"{work_item_id}|{index_html}"
@@ -1105,7 +1698,13 @@ def _task_card_for_task(task: Task, payload: dict[str, Any]) -> dict[str, Any]:
     artifacts = payload.get("artifacts") if isinstance(payload.get("artifacts"), list) else []
     artifact_path = str(artifacts[0]) if artifacts else str(bridge.get("user_visible_path") or "")
     delivery = _delivery_from_contract(task, payload)
-    if delivery and delivery.get("report_status") not in {"html_delivery_ready", "report_ready", "report_generated_need_review"}:
+    fixture_evidence = payload.get(FIXTURE_EVIDENCE_SOURCE_KEY) == FIXTURE_EVIDENCE_SOURCE
+    if (
+        not fixture_evidence
+        and delivery
+        and delivery.get("report_status")
+        not in {"html_delivery_ready", "report_ready", "report_generated_need_review"}
+    ):
         stitched_contract = _latest_governance_report_contract_for_task(task)
         if stitched_contract:
             stitched_delivery = _delivery_from_contract(task, stitched_contract)
@@ -1117,7 +1716,7 @@ def _task_card_for_task(task: Task, payload: dict[str, Any]) -> dict[str, Any]:
         user_state = "awaiting_user"
     elif delivery and delivery.get("report_status") in {"html_delivery_ready", "report_ready", "report_generated_need_review"}:
         user_state = "done"
-    if not delivery:
+    if not delivery and not fixture_evidence:
         delivery = _extract_g1q3_delivery_from_result(task, state)
     intake_needs_download = (
         not delivery
@@ -1330,19 +1929,18 @@ def _completion_notice_for_task(task: Task, payload: dict[str, Any]) -> dict[str
 
 def _write_completion_notice(task: Task, payload: dict[str, Any]) -> dict[str, Any] | None:
     notice = _completion_notice_for_task(task, payload)
-    if not notice:
-        return None
     path = sidecar_path(task.task_id)
     body = _load_existing(path)
-    existing = body.get("completion_notice") if isinstance(body.get("completion_notice"), dict) else {}
-    if existing.get("send_status") in {"sent", "acknowledged"}:
-        notice["send_status"] = existing.get("send_status")
-        if existing.get("sent_at"):
-            notice["sent_at"] = existing.get("sent_at")
-    existing_delivery_contract = existing.get("completion_delivery") if isinstance(existing.get("completion_delivery"), dict) else None
-    if existing_delivery_contract:
-        notice["completion_delivery"] = existing_delivery_contract
-    body["completion_notice"] = notice
+    if notice is not None:
+        existing = body.get("completion_notice") if isinstance(body.get("completion_notice"), dict) else {}
+        if existing.get("send_status") in {"sent", "acknowledged"}:
+            notice["send_status"] = existing.get("send_status")
+            if existing.get("sent_at"):
+                notice["sent_at"] = existing.get("sent_at")
+        existing_delivery_contract = existing.get("completion_delivery") if isinstance(existing.get("completion_delivery"), dict) else None
+        if existing_delivery_contract:
+            notice["completion_delivery"] = existing_delivery_contract
+        body["completion_notice"] = notice
     proposed_card = _task_card_for_task(task, payload)
     report_comment = _maybe_report_comment_for_task(task, proposed_card, payload)
     if report_comment is not None:
@@ -1356,6 +1954,11 @@ def _write_completion_notice(task: Task, payload: dict[str, Any]) -> dict[str, A
         "source": "pnc_vm_task_sync",
         "generated_at": _now_iso(),
         "vm_task_id": task.vm_task_id or task.task_id,
+        # Non-terminal tasks do not have a completion_notice yet. Preserve the
+        # TaskStore route so relay never degrades their card target to `feishu:`.
+        "chat_id": task.chat_id,
+        "thread_id": task.thread_id,
+        "message_id": task.message_id,
         "delivery": proposed_card.get("delivery") if isinstance(proposed_card.get("delivery"), dict) else {},
         "user_state": str(proposed_card.get("user_state") or "").strip(),
         "status_line": str(proposed_card.get("status_line") or "").strip(),
@@ -1365,6 +1968,19 @@ def _write_completion_notice(task: Task, payload: dict[str, Any]) -> dict[str, A
             or ((payload.get("state") or {}).get("updated_at") if isinstance(payload.get("state"), dict) else None)
         ),
         "artifacts_ref": payload.get("artifacts") if isinstance(payload.get("artifacts"), list) else [],
+        "delivery_contract": (
+            payload.get("delivery_contract")
+            if isinstance(payload.get("delivery_contract"), dict)
+            else None
+        ),
+        "pipeline_result": (
+            payload.get("pipeline_result")
+            if isinstance(payload.get("pipeline_result"), dict)
+            else None
+        ),
+        "evidence_source": (
+            payload.get(FIXTURE_EVIDENCE_SOURCE_KEY) or "live_vm_collection"
+        ),
     }
     _atomic_write_json(path, body)
     return notice
@@ -1379,11 +1995,45 @@ def sync_pnc_vm_tasks(
     no_artifacts: bool = False,
     shared_state_root: str | None = None,
     ssh_mini_agent: str | None = None,
+    fixture_root: str | Path | None = None,
+    required_fixture_scenarios: Iterable[str] | None = None,
 ) -> dict[str, Any]:
+    if fixture_root is not None and (dry_run or shared_state_root is not None or ssh_mini_agent is not None):
+        raise ValueError("fixture mode is mutually exclusive with dry-run and real VM/SSH collection")
+    fixture_home = _validate_isolated_hermes_home() if fixture_root is not None else None
+    resolved_fixture_root = (
+        _validate_fixture_root(fixture_root, hermes_home=fixture_home)
+        if fixture_root is not None
+        else None
+    )
+    required_scenarios = {
+        str(item).strip().upper() for item in (required_fixture_scenarios or []) if str(item).strip()
+    }
+    if required_scenarios and resolved_fixture_root is None:
+        raise ValueError("required fixture scenarios require fixture mode")
+    unknown_scenarios = required_scenarios - L4_SCENARIO_IDS
+    if unknown_scenarios:
+        raise ValueError(f"unknown L4 fixture scenarios: {sorted(unknown_scenarios)}")
+    output_binding: FixtureOutputBinding | None = None
+    if resolved_fixture_root is not None:
+        assert fixture_home is not None
+        from gateway.record_only.runtime import get_record_only_transport, record_only_enabled
+
+        if not record_only_enabled():
+            raise ValueError("fixture mode requires HERMES_OUTBOUND_MODE=record-only")
+        _validate_fixture_record_paths(fixture_home)
+        if get_record_only_transport("scripts.pnc_vm_task_sync.fixture_gate") is None:
+            raise ValueError("fixture mode requires HERMES_OUTBOUND_MODE=record-only")
+        _validate_isolated_hermes_home(fixture_home, prepare_outputs=True)
+        output_binding = _capture_fixture_output_binding(fixture_home)
+        _verify_fixture_output_binding(output_binding)
     store = TaskStore(_task_store_path())
+    if output_binding is not None:
+        _verify_fixture_output_binding(output_binding)
     tasks = iter_candidate_tasks(store=store, chat_ids=chat_ids, limit=limit, include_terminal=include_terminal)
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
+    executed_scenarios: set[str] = set()
     for task in tasks:
         vm_task_id = str(task.vm_task_id or task.task_id).strip()
         row: dict[str, Any] = {
@@ -1397,17 +2047,58 @@ def sync_pnc_vm_tasks(
             rows.append(row)
             continue
         try:
-            collect_kwargs: dict[str, Any] = {"include_artifacts": not no_artifacts}
-            if shared_state_root is not None:
-                collect_kwargs["shared_state_root"] = shared_state_root
-            if ssh_mini_agent is not None:
-                collect_kwargs["ssh_mini_agent"] = ssh_mini_agent
-            payload = collect_vm_task_status(vm_task_id, **collect_kwargs)
-            pipeline_progress = _apply_pipeline_progress_to_payload(payload)
+            if resolved_fixture_root is not None:
+                if not FIXTURE_TASK_ID_RE.fullmatch(str(task.task_id)):
+                    raise ValueError("fixture task_id is not path-safe")
+                payload, scenario_id = _load_fixture_status(resolved_fixture_root, vm_task_id)
+                payload = dict(payload)
+                payload[FIXTURE_EVIDENCE_SOURCE_KEY] = FIXTURE_EVIDENCE_SOURCE
+                executed_scenarios.add(scenario_id)
+                row["fixture_scenario_id"] = scenario_id
+            else:
+                collect_kwargs: dict[str, Any] = {"include_artifacts": not no_artifacts}
+                if shared_state_root is not None:
+                    collect_kwargs["shared_state_root"] = shared_state_root
+                if ssh_mini_agent is not None:
+                    collect_kwargs["ssh_mini_agent"] = ssh_mini_agent
+                payload = collect_vm_task_status(vm_task_id, **collect_kwargs)
+            if resolved_fixture_root is not None:
+                fixture_bridge = (
+                    payload.get("vm_bridge")
+                    if isinstance(payload.get("vm_bridge"), dict)
+                    else {}
+                )
+                fixture_progress = (
+                    fixture_bridge.get("progress")
+                    if isinstance(fixture_bridge.get("progress"), dict)
+                    else {}
+                )
+                pipeline_progress = dict(fixture_progress)
+                if pipeline_progress:
+                    pipeline_progress["source"] = FIXTURE_EVIDENCE_SOURCE
+                    fixture_bridge = dict(fixture_bridge)
+                    fixture_bridge["progress"] = pipeline_progress
+                    payload["vm_bridge"] = fixture_bridge
+                row["pipeline_evidence_source"] = FIXTURE_EVIDENCE_SOURCE
+            else:
+                pipeline_progress = _apply_pipeline_progress_to_payload(payload)
+                row["pipeline_evidence_source"] = (
+                    str(pipeline_progress.get("source") or "") or None
+                )
+            if output_binding is not None:
+                _verify_fixture_output_binding(output_binding)
             sidecar_path = write_collected_status_to_sidecar(task.task_id, payload)
+            if output_binding is not None:
+                _verify_fixture_output_binding(output_binding)
             _write_pipeline_progress_to_sidecar(task.task_id, pipeline_progress)
+            if output_binding is not None:
+                _verify_fixture_output_binding(output_binding)
             completion_notice = _write_completion_notice(task, payload)
+            if output_binding is not None:
+                _verify_fixture_output_binding(output_binding)
             taskstore_status = _sync_taskstore_terminal_status(store, task, payload)
+            if output_binding is not None:
+                _verify_fixture_output_binding(output_binding)
             row.update({
                 "synced": True,
                 "state": (payload.get("state") or {}).get("value"),
@@ -1424,11 +2115,25 @@ def sync_pnc_vm_tasks(
             errors.append(message)
             row.update({"synced": False, "error": message})
         rows.append(row)
+    if output_binding is not None:
+        try:
+            _verify_fixture_output_binding(output_binding)
+        except Exception as exc:
+            errors.append(f"fixture output post-run verification failed: {type(exc).__name__}: {exc}")
+    missing_scenarios = sorted(required_scenarios - executed_scenarios)
+    if missing_scenarios:
+        errors.append(f"required fixture scenarios not executed: {missing_scenarios}")
     return {
         "ok": not errors,
         "candidate_count": len(tasks),
         "synced_count": sum(1 for row in rows if row.get("synced")),
         "dry_run": dry_run,
+        "fixture_mode": resolved_fixture_root is not None,
+        "pipeline_evidence_source": (
+            FIXTURE_EVIDENCE_SOURCE if resolved_fixture_root is not None else "live_vm_probe"
+        ),
+        "executed_fixture_scenarios": sorted(executed_scenarios),
+        "missing_fixture_scenarios": missing_scenarios,
         "rows": rows,
         "errors": errors,
     }
@@ -1446,9 +2151,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lock-root")
     parser.add_argument("--shared-state-root")
     parser.add_argument("--ssh-mini-agent")
+    parser.add_argument(
+        "--fixture-root",
+        help=f"Read {FIXTURE_SCHEMA_VERSION} payloads from HERMES_HOME/{FIXTURE_DIR_NAME}; never use SSH",
+    )
+    parser.add_argument(
+        "--require-fixture-scenario",
+        action="append",
+        default=[],
+        help="Require an executed L4 scenario ID (S1..S10); repeat to form the harness gate",
+    )
     args = parser.parse_args(argv)
 
-    hermes_home = Path(get_hermes_home()).expanduser().resolve(strict=False)
+    if args.fixture_root:
+        try:
+            hermes_home = _validate_isolated_hermes_home()
+        except ValueError as exc:
+            parser.error(str(exc))
+    else:
+        hermes_home = Path(get_hermes_home()).expanduser().resolve(strict=False)
     if args.lock_root:
         lock_root = Path(args.lock_root).expanduser().resolve(strict=False)
         try:
@@ -1457,6 +2178,32 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--lock-root must stay within HERMES_HOME")
     else:
         lock_root = hermes_home / "locks"
+    if args.fixture_root and lock_root != hermes_home / "locks":
+        parser.error("fixture mode requires the default isolated HERMES_HOME/locks root")
+    fixture_root = None
+    fixture_lock_binding: FixtureOutputBinding | None = None
+    if args.fixture_root:
+        if args.dry_run or args.shared_state_root or args.ssh_mini_agent or args.no_lock:
+            parser.error("--fixture-root is mutually exclusive with --dry-run/--shared-state-root/--ssh-mini-agent/--no-lock")
+        try:
+            fixture_root = _validate_fixture_root(args.fixture_root, hermes_home=hermes_home)
+        except ValueError as exc:
+            parser.error(str(exc))
+        try:
+            from gateway.record_only.runtime import get_record_only_transport, record_only_enabled
+
+            if not record_only_enabled():
+                parser.error("fixture mode requires HERMES_OUTBOUND_MODE=record-only")
+            _validate_fixture_record_paths(hermes_home)
+            if get_record_only_transport("scripts.pnc_vm_task_sync.fixture_cli_gate") is None:
+                parser.error("fixture mode requires HERMES_OUTBOUND_MODE=record-only")
+            _validate_isolated_hermes_home(hermes_home, prepare_outputs=True)
+            fixture_lock_binding = _capture_fixture_output_binding(hermes_home)
+            _verify_fixture_output_binding(fixture_lock_binding)
+        except Exception as exc:
+            parser.error(f"fixture admission failed: {type(exc).__name__}: {exc}")
+    elif args.require_fixture_scenario:
+        parser.error("--require-fixture-scenario requires --fixture-root")
     lock_path = lock_root / "pnc-vm-task-sync.lock"
     sync_kwargs = {
         "limit": max(1, min(args.limit, 200)),
@@ -1467,10 +2214,18 @@ def main(argv: list[str] | None = None) -> int:
         "shared_state_root": args.shared_state_root,
         "ssh_mini_agent": args.ssh_mini_agent,
     }
+    if fixture_root is not None:
+        sync_kwargs["fixture_root"] = fixture_root
+        sync_kwargs["required_fixture_scenarios"] = args.require_fixture_scenario
     if args.no_lock:
         result = sync_pnc_vm_tasks(**sync_kwargs)
     else:
-        with SingleRunLock(lock_path) as lock:
+        lock_context = (
+            FixtureSingleRunLock(fixture_lock_binding)
+            if fixture_lock_binding is not None
+            else SingleRunLock(lock_path)
+        )
+        with lock_context as lock:
             if not lock.acquired:
                 result = {
                     "ok": True,

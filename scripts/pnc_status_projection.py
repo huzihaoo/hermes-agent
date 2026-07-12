@@ -228,6 +228,13 @@ def _humanize_reason(text: str, *, kind: str = "") -> str:
 
 def _blocker_dict(contract: dict[str, Any], report_truth: dict[str, Any]) -> dict[str, Any]:
     for data in (report_truth, contract):
+        pipeline = None
+        if isinstance(data, dict):
+            pipeline = data.get("pipeline_result") or data.get("pipeline")
+        if isinstance(pipeline, dict):
+            blocker = pipeline.get("blocker")
+            if isinstance(blocker, dict) and (blocker.get("kind") or blocker.get("fault_class") or blocker.get("message")):
+                return blocker
         for key in ("pipeline_blocker", "blocker", "download_blocker"):
             value = data.get(key) if isinstance(data, dict) else None
             if isinstance(value, dict) and (value.get("kind") or value.get("fault_class") or value.get("message")):

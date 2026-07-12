@@ -149,6 +149,56 @@ def _existing_comment_has_signature(*, project_key: str, work_item_id: str, sign
     return signature in (out or "")
 
 
+def _record_only_comment_intents(
+    *,
+    project_key: str,
+    work_item_id: str,
+    task_id: str,
+    plan: dict[str, str],
+) -> dict[str, Any] | None:
+    from gateway.record_only.runtime import get_record_only_transport
+
+    recorder = get_record_only_transport("gateway.pnc_report_comment")
+    if recorder is None:
+        return None
+    common = {
+        "platform": "feishu_project",
+        "destination_kind": "work_item",
+        "destination_id": str(work_item_id),
+        "task_id": str(task_id),
+        "reply_mode": "none",
+        "update_mode": "none",
+    }
+    list_intent = recorder.record(
+        operation="project_comment_list",
+        payload_type="query",
+        payload={"signature": plan["signature"]},
+        caller_dedupe_key=f"g1q3-report-comment:list:{project_key}:{work_item_id}:{task_id}",
+        metadata={"project_key": str(project_key), "intent": "dedupe_check"},
+        **common,
+    )
+    add_intent = recorder.record(
+        operation="project_comment_add",
+        payload_type="text",
+        payload=plan["content"],
+        caller_dedupe_key=f"g1q3-report-comment:add:{project_key}:{work_item_id}:{task_id}",
+        metadata={
+            "project_key": str(project_key),
+            "conditional_on": "comment_signature_absent",
+            "intent": "conditional_add",
+        },
+        **common,
+    )
+    return {
+        "action": "recorded_intents",
+        "posted": False,
+        "list_record_id": list_intent.record_id,
+        "add_record_id": add_intent.record_id,
+        "duplicate": list_intent.duplicate and add_intent.duplicate,
+        **recorder.safety_status(),
+    }
+
+
 def maybe_comment_report_ready(
     *,
     project_key: str,
@@ -177,6 +227,15 @@ def maybe_comment_report_ready(
         if not project_key or not work_item_id:
             result["action"] = "comment_failed"
             result["reason"] = "missing project_key or work_item_id"
+            return result
+        recorded = _record_only_comment_intents(
+            project_key=str(project_key),
+            work_item_id=str(work_item_id),
+            task_id=str(task_id),
+            plan=plan,
+        )
+        if recorded is not None:
+            result.update(recorded)
             return result
         if meegle_runner is None:
             from gateway.pnc_issue_context import default_meegle_runner

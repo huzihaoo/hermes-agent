@@ -163,3 +163,33 @@ def test_a11_sanitize_drops_stale_report_positive_milestone_when_no_report():
     with_report = {'lane': 'report_ready', 'has_deliverable_report': True}
     kept = sanitize_milestones(stale, with_report)
     assert any('报告已生成' in m['label'] for m in kept)
+
+
+def test_nested_pipeline_blocker_routes_infra_failure_to_pipeline_fix():
+    pipeline_result = {
+        "status": "blocked",
+        "stage": "s3b_translate",
+        "blocker": {
+            "kind": "translate_workdir_permission",
+            "fault_class": "infra_self_healable",
+            "retryable": True,
+            "message": "translate work directory is not writable",
+        },
+    }
+
+    projection = derive_presentation(
+        "blocked",
+        {
+            "business_state": "blocked_need_evidence",
+            "pipeline_result": pipeline_result,
+        },
+        {"pipeline_result": pipeline_result},
+        "",
+        {},
+    )
+
+    assert projection["lane"] == "pipeline_fix"
+    assert projection["report_status"] == "need_pipeline_fix"
+    assert projection["human_action_kind"] == "none"
+    assert projection["requires_user_input"] is False
+    assert projection["action_category"] == "none"

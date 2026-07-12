@@ -96,6 +96,34 @@ def test_write_sidecar_invalid_progress_json_and_dedupes_lists(tmp_path):
     assert body["blockers"] == ["blocker-a"]
 
 
+def test_write_sidecar_dedupes_only_consecutive_identical_business_events(tmp_path):
+    token = set_hermes_home_override(tmp_path)
+    try:
+        vm_task_state_bridge.write_task_state(
+            "task-events", phase="completed", event="done"
+        )
+        vm_task_state_bridge.write_task_state(
+            "task-events", phase="completed", event="done"
+        )
+        vm_task_state_bridge.write_task_state(
+            "task-events", phase="blocked", event="needs input"
+        )
+        path = vm_task_state_bridge.write_task_state(
+            "task-events", phase="completed", event="done"
+        )
+        body = json.loads(path.read_text(encoding="utf-8"))
+    finally:
+        reset_hermes_home_override(token)
+
+    assert [
+        (row["phase"], row["summary"]) for row in body["recent_events"]
+    ] == [
+        ("completed", "done"),
+        ("blocked", "needs input"),
+        ("completed", "done"),
+    ]
+
+
 def test_write_sidecar_replaces_corrupt_existing_file(tmp_path):
     token = set_hermes_home_override(tmp_path)
     try:
@@ -133,3 +161,12 @@ def test_main_emits_single_json_object_with_path(tmp_path, capsys):
     body = json.loads(path.read_text(encoding="utf-8"))
     assert body["current_phase"] == "vm_running"
     assert body["artifacts"] == ["artifact-a"]
+
+
+def test_l4_bridge_uses_sealed_event_clock(monkeypatch):
+    monkeypatch.setenv("HERMES_OUTBOUND_MODE", "record-only")
+    monkeypatch.setenv("HERMES_L4_SANDBOX_ACTIVE", "1")
+    monkeypatch.setenv("HERMES_L4_EVENT_EPOCH", "1783850400")
+
+    assert vm_task_state_bridge._now_epoch() == 1783850400.0
+    assert vm_task_state_bridge._now_iso() == "2026-07-12T10:00:00+00:00"

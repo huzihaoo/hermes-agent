@@ -16,10 +16,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pwd
 import re
+import stat
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -33,7 +35,15 @@ from gateway.pnc_issue_context import check_meegle_auth_status, default_meegle_r
 from scripts.vm_task_state_bridge import _atomic_write_json  # noqa: E402
 from tools.send_message_tool import send_message_tool  # noqa: E402
 
-reload_env()
+
+def _reload_env_for_current_mode() -> None:
+    from gateway.record_only.runtime import record_only_enabled
+
+    if not record_only_enabled():
+        reload_env()
+
+
+_reload_env_for_current_mode()
 
 DEFAULT_WARN_MIN = 45  # Deprecated/no-op: kept for env compatibility only.
 DEFAULT_CRIT_MIN = 20  # Deprecated/no-op: kept for env compatibility only.
@@ -55,6 +65,7 @@ URL_SECRET_RE = re.compile(r"([?&](?:access_token|refresh_token|token|secret|sig
 @dataclass
 class WatchdogDeps:
     status_func: Callable[[], dict[str, Any]] = check_meegle_auth_status
+    record_only_status_func: Callable[[], dict[str, Any]] | None = None
     runner: Callable[[list[str]], tuple[int, str, str]] = default_meegle_runner
     send_func: Callable[[dict[str, Any]], str] = send_message_tool
     now_func: Callable[[], float] = time.time
@@ -404,9 +415,122 @@ def _should_proactive_reinit(previous: dict[str, Any], now: float, *, auto_rolls
     return last_init <= 0 or now - last_init >= config.proactive_reinit_hours * 3600
 
 
+def _record_only_dependencies(config: WatchdogConfig, deps: WatchdogDeps) -> tuple[WatchdogDeps, bool]:
+    from gateway.record_only.runtime import get_record_only_transport
+
+    recorder = get_record_only_transport("scripts.pnc_meegle_auth_watchdog")
+    if recorder is None:
+        return deps, False
+
+    status_fixture = deps.record_only_status_func
+    host = str(config.host_default or "project.feishu.cn")
+
+    def record_status() -> dict[str, Any]:
+        recorder.record(
+            operation="auth_status_check",
+            platform="meegle",
+            destination_kind="auth_host",
+            destination_id=host,
+            payload_type="query",
+            payload={"command": "auth status", "fixture": status_fixture is not None},
+            caller_dedupe_key=f"meegle-auth-status:{host}",
+        )
+        if status_fixture is not None:
+            return status_fixture()
+        return {
+            "ok": False,
+            "authenticated": None,
+            "expires_in_minutes": None,
+            "host": host,
+            "error": "record-only: real Meegle auth status suppressed",
+        }
+
+    def record_device_init(args: list[str]) -> tuple[int, str, str]:
+        recorder.record(
+            operation="auth_device_init",
+            platform="meegle",
+            destination_kind="auth_host",
+            destination_id=host,
+            payload_type="auth_request",
+            payload={"command": list(args)},
+            caller_dedupe_key=f"meegle-auth-device-init:{host}",
+        )
+        return 1, "", "record-only: real Meegle device-code init suppressed"
+
+    from gateway.record_only.transport import RecordOnlyRelaySender
+
+    return (
+        replace(
+            deps,
+            status_func=record_status,
+            runner=record_device_init,
+            send_func=RecordOnlyRelaySender(recorder).send,
+        ),
+        True,
+    )
+
+
+def _validate_record_only_state_path(path: Path) -> tuple[Path, tuple[int, int]]:
+    home_raw = Path(get_hermes_home()).expanduser()
+    if not home_raw.is_absolute():
+        raise ValueError("record-only watchdog requires absolute HERMES_HOME")
+    home = home_raw.resolve(strict=True)
+    if home_raw.absolute() != home:
+        raise ValueError("record-only watchdog HERMES_HOME must not contain symlinks or aliases")
+    try:
+        account_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+    except (KeyError, OSError):
+        account_home = Path.home().resolve()
+    for blocked in ((account_home / ".hermes").resolve(), (account_home / ".openclaw").resolve()):
+        try:
+            home.relative_to(blocked)
+        except ValueError:
+            continue
+        raise ValueError("record-only watchdog refuses canonical Hermes/OpenClaw home")
+
+    raw = Path(path).expanduser()
+    if not raw.is_absolute():
+        raise ValueError("record-only watchdog state path must be absolute")
+    parent = raw.parent.resolve(strict=True)
+    if raw.parent.absolute() != parent:
+        raise ValueError("record-only watchdog state parent must not contain symlinks or aliases")
+    try:
+        parent.relative_to(home)
+    except ValueError as exc:
+        raise ValueError("record-only watchdog state path must stay within HERMES_HOME") from exc
+    parent_info = parent.stat()
+    if not stat.S_ISDIR(parent_info.st_mode) or parent_info.st_uid != os.getuid() or parent_info.st_mode & 0o022:
+        raise ValueError("record-only watchdog state parent has unsafe owner/mode")
+    try:
+        info = raw.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_mode & 0o022
+            or info.st_nlink != 1
+        ):
+            raise ValueError("record-only watchdog state file has unsafe type/owner/mode/link count")
+    return raw, (parent_info.st_dev, parent_info.st_ino)
+
+
+def _verify_record_only_state_path(path: Path, parent_identity: tuple[int, int]) -> None:
+    verified, current_parent_identity = _validate_record_only_state_path(path)
+    if verified != path:
+        raise ValueError("record-only watchdog state path changed")
+    if current_parent_identity != parent_identity:
+        raise ValueError("record-only watchdog state parent identity changed during run")
+
+
 def run_once(config: WatchdogConfig, deps: WatchdogDeps | None = None) -> dict[str, Any]:
-    deps = deps or WatchdogDeps()
+    deps, record_only = _record_only_dependencies(config, deps or WatchdogDeps())
     state_path = config.state_path or deps.state_path or _default_state_path()
+    state_identity = None
+    if record_only:
+        state_path, state_identity = _validate_record_only_state_path(Path(state_path))
     previous = load_state(state_path)
     now = deps.now_func()
     result: dict[str, Any] = {"ok": True, "state_file": str(state_path), "dry_run": config.dry_run}
@@ -488,6 +612,8 @@ def run_once(config: WatchdogConfig, deps: WatchdogDeps | None = None) -> dict[s
     if alert_result is not None:
         current["last_alert_result"] = redact(alert_result)
     save_state(state_path, current)
+    if record_only:
+        _verify_record_only_state_path(state_path, state_identity)
 
     result.update({
         "state": state,

@@ -11,8 +11,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.parse import quote
 
 from gateway.record_only.transport import (
+    FOXGLOVE_PATH_SAFE,
     GatewayRecordAdapter,
     RecordOnlyError,
     RecordOnlyOutboundTransport,
@@ -135,6 +137,66 @@ class RecordOnlyTests(unittest.TestCase):
                         destination_id="oc_a",
                         payload_type="text",
                         payload=payload,
+                    )
+        self.assertFalse(self.transport.ledger.exists())
+
+    def test_exact_foxglove_query_contract_is_recordable(self) -> None:
+        path = (
+            "/mnt/minieye/pdcl/department/perception_test_team/"
+            "G1Q3_RCA/cases/case-a/case-a.viz.mcap"
+        )
+        link = (
+            "https://192.168.21.217/?ds=foxglove-http&ds.mcapPath="
+            + quote(path, safe=FOXGLOVE_PATH_SAFE)
+        )
+        self.transport.record(
+            operation="card_send",
+            platform="feishu",
+            destination_kind="chat",
+            destination_id="oc_foxglove",
+            payload_type="interactive_card",
+            payload={"url": link},
+            update_mode="create",
+        )
+        self.assertEqual(self.transport.read_all()[0]["links"], [link])
+
+    def test_foxglove_query_rejects_noncanonical_or_escaped_paths(self) -> None:
+        prefix = "https://viewer.invalid/?ds=foxglove-http&ds.mcapPath="
+        good = (
+            "/mnt/minieye/pdcl/department/perception_test_team/"
+            "G1Q3_RCA/cases/case-a/case-a.viz.mcap"
+        )
+        bad_links = (
+            prefix + quote(good, safe=FOXGLOVE_PATH_SAFE) + "&extra=1",
+            "https://viewer.invalid/?ds=foxglove-http&ds=foxglove-http&ds.mcapPath="
+            + quote(good, safe=FOXGLOVE_PATH_SAFE),
+            "https://user@viewer.invalid/?ds=foxglove-http&ds.mcapPath="
+            + quote(good, safe=FOXGLOVE_PATH_SAFE),
+            prefix + quote(good, safe=FOXGLOVE_PATH_SAFE) + "#fragment",
+            prefix + quote(good + "\x00", safe=FOXGLOVE_PATH_SAFE),
+            prefix
+            + quote(
+                "/mnt/minieye/pdcl/department/perception_test_team/../secret/secret.viz.mcap",
+                safe=FOXGLOVE_PATH_SAFE,
+            ),
+            prefix
+            + quote(
+                "/mnt/minieye/pdcl/department/perception_test_team_evil/case/case.viz.mcap",
+                safe=FOXGLOVE_PATH_SAFE,
+            ),
+            prefix + quote(quote(good, safe=""), safe=""),
+        )
+        for index, link in enumerate(bad_links):
+            with self.subTest(index=index, link=link):
+                with self.assertRaises(RecordOnlyError):
+                    self.transport.record(
+                        operation="card_send",
+                        platform="feishu",
+                        destination_kind="chat",
+                        destination_id=f"oc_foxglove_bad_{index}",
+                        payload_type="interactive_card",
+                        payload={"url": link},
+                        update_mode="create",
                     )
         self.assertFalse(self.transport.ledger.exists())
 

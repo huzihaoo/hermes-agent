@@ -1,9 +1,11 @@
 import json
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
+from gateway.record_only import runtime
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from scripts import pnc_completion_notice_relay
 
@@ -24,6 +26,21 @@ def _write_sidecar(tmp_path, task_id="task-1", *, send_status="pending"):
     return sidecar
 
 
+def _set_record_only_env(tmp_path: Path, monkeypatch):
+    records = tmp_path / "records"
+    records.mkdir(mode=0o700)
+    key_file = tmp_path / "record.key"
+    key_file.write_text("ab" * 32 + "\n", encoding="ascii")
+    key_file.chmod(0o600)
+    census_root = Path(__file__).resolve().parents[3] / "evidence" / "target-outbound-census"
+    monkeypatch.setenv("HERMES_OUTBOUND_MODE", "record-only")
+    monkeypatch.setenv("HERMES_OUTBOUND_RECORD_ROOT", str(records))
+    monkeypatch.setenv("HERMES_OUTBOUND_RECORD_KEY_FILE", str(key_file))
+    monkeypatch.setenv("HERMES_OUTBOUND_CENSUS_ROOT", str(census_root))
+    runtime._reset_for_tests()
+    return records
+
+
 def test_relay_dry_run_builds_feishu_topic_target(tmp_path):
     token = set_hermes_home_override(tmp_path)
     try:
@@ -36,6 +53,48 @@ def test_relay_dry_run_builds_feishu_topic_target(tmp_path):
     assert result["candidate_count"] == 1
     assert result["rows"][0]["target"] == f"feishu:{pnc_completion_notice_relay.DEFAULT_CHAT_IDS[1]}:om_1"
     assert result["rows"][0]["preview"] == "完成通知"
+
+
+def test_record_only_mode_skips_relay_reload_env_protected_root_read(monkeypatch):
+    monkeypatch.setenv("HERMES_OUTBOUND_MODE", "record-only")
+
+    def bomb_reload():
+        raise AssertionError("relay reload_env attempted a protected-root read")
+
+    monkeypatch.setattr(pnc_completion_notice_relay, "reload_env", bomb_reload)
+    pnc_completion_notice_relay._reload_env_for_current_mode()
+
+
+def test_live_mode_keeps_relay_reload_env_behavior(monkeypatch):
+    monkeypatch.setenv("HERMES_OUTBOUND_MODE", "live")
+    calls = []
+    monkeypatch.setattr(pnc_completion_notice_relay, "reload_env", lambda: calls.append(True))
+
+    pnc_completion_notice_relay._reload_env_for_current_mode()
+
+    assert calls == [True]
+
+
+def test_l4_sealed_clock_and_business_timestamp_format_are_idempotent(monkeypatch):
+    monkeypatch.setenv("HERMES_OUTBOUND_MODE", "record-only")
+    monkeypatch.setenv("HERMES_L4_SANDBOX_ACTIVE", "1")
+    monkeypatch.setenv("HERMES_L4_EVENT_EPOCH", "1783850400")
+
+    assert pnc_completion_notice_relay._now_epoch() == 1783850400.0
+    assert pnc_completion_notice_relay._now_iso() == "2026-07-12T18:00:00+08:00"
+    assert pnc_completion_notice_relay._format_business_ts("2026-07-12 19:57:39") == "2026-07-12 19:57:39"
+    assert pnc_completion_notice_relay._format_business_ts(
+        pnc_completion_notice_relay._format_business_ts("2026-07-12 19:57:39")
+    ) == "2026-07-12 19:57:39"
+
+
+def test_l4_sealed_clock_fails_closed_when_epoch_is_missing(monkeypatch):
+    monkeypatch.setenv("HERMES_OUTBOUND_MODE", "record-only")
+    monkeypatch.setenv("HERMES_L4_SANDBOX_ACTIVE", "1")
+    monkeypatch.delenv("HERMES_L4_EVENT_EPOCH", raising=False)
+
+    with pytest.raises(RuntimeError, match="requires HERMES_L4_EVENT_EPOCH"):
+        pnc_completion_notice_relay._now_epoch()
 
 
 def test_relay_send_marks_notice_sent(tmp_path, monkeypatch):
@@ -375,6 +434,97 @@ def test_watch_mode_uses_hot_sender_and_relay_loop_once(tmp_path, monkeypatch):
     assert sleeps == [0.1]
 
 
+def test_hot_sender_constructor_is_record_only_complete_and_never_builds_adapter(tmp_path, monkeypatch):
+    _set_record_only_env(tmp_path, monkeypatch)
+
+    def bomb_adapter(*_args, **_kwargs):
+        raise AssertionError("live Feishu adapter was built")
+
+    monkeypatch.setattr(pnc_completion_notice_relay.FeishuHotSender, "_ensure_adapter", bomb_adapter)
+    try:
+        sender = pnc_completion_notice_relay.FeishuHotSender()
+        text = json.loads(sender.send({
+            "action": "send",
+            "target": "feishu:oc_fixture:om_topic",
+            "message": "中文完成",
+            "task_id": "task-hot-record-only",
+        }))
+        card = sender.send_task_card(
+            "feishu:oc_fixture:om_topic",
+            {"elements": [{"tag": "markdown", "content": "终态卡片"}]},
+            message_id="om_card",
+        )
+        transport = runtime.get_record_only_transport("scripts.pnc_completion_notice_relay")
+        assert transport is not None
+        rows = transport.read_all()
+    finally:
+        runtime._reset_for_tests()
+
+    assert text["success"] is True
+    assert text["external_delivery_attempted"] is False
+    assert card["success"] is True
+    assert card["simulated_update_recorded"] is True
+    assert [row["operation"] for row in rows] == ["text_reply", "card_update"]
+
+
+def test_hot_sender_live_mode_still_builds_the_real_adapter_path(monkeypatch):
+    monkeypatch.setenv("HERMES_OUTBOUND_MODE", "live")
+    calls = []
+
+    def fake_ensure(self, *, rebuild=False):
+        calls.append(rebuild)
+        self._adapter = object()
+        return self._adapter
+
+    monkeypatch.setattr(pnc_completion_notice_relay.FeishuHotSender, "_ensure_adapter", fake_ensure)
+    sender = pnc_completion_notice_relay.FeishuHotSender()
+
+    assert sender._record_sender is None
+    assert calls == [False]
+
+
+def test_record_only_task_senders_bind_context_dedupe_and_redact_tracking_id(tmp_path, monkeypatch):
+    _set_record_only_env(tmp_path, monkeypatch)
+    raw_task_id = "g1q3-rca-issue-intake-7017699515"
+    try:
+        from gateway.record_only.transport import RecordOnlyRelaySender
+
+        transport = runtime.get_record_only_transport("scripts.pnc_completion_notice_relay")
+        assert transport is not None
+        sender = RecordOnlyRelaySender(transport)
+        send_text, send_card = pnc_completion_notice_relay._record_only_task_senders(
+            sender,
+            task_id=raw_task_id,
+            body={"task_card": {"user_state": "done"}},
+            notice={"state": "completed"},
+        )
+        text_args = {
+            "action": "send",
+            "target": "feishu:oc_fixture:om_topic",
+            "message": f"中文完成，追踪号 {raw_task_id}",
+        }
+        card_payload = {
+            "elements": [
+                {"tag": "markdown", "content": f"终态卡片，追踪号 {raw_task_id}"}
+            ]
+        }
+        assert json.loads(send_text(text_args))["success"] is True
+        assert json.loads(send_text(text_args))["duplicate"] is True
+        assert send_card("feishu:oc_fixture:om_topic", card_payload, message_id="om_card")["success"] is True
+        assert send_card("feishu:oc_fixture:om_topic", card_payload, message_id="om_card")["duplicate"] is True
+        rows = transport.read_all()
+    finally:
+        runtime._reset_for_tests()
+
+    assert [row["operation"] for row in rows] == ["text_reply", "card_update"]
+    assert [row["attempt_count"] for row in rows] == [2, 2]
+    assert all(row["task_id_hash"] for row in rows)
+    assert all(row["caller_dedupe_key_hash"] for row in rows)
+    assert all(row["terminal_state"] == "completed" for row in rows)
+    assert all(row["external_delivery_attempted"] is False for row in rows)
+    assert raw_task_id not in json.dumps(rows, ensure_ascii=False)
+
+
 def test_relay_sends_task_card_once_and_marks_sent_hash(tmp_path, monkeypatch):
     token = set_hermes_home_override(tmp_path)
     try:
@@ -446,6 +596,83 @@ def test_relay_updates_existing_task_card_when_hash_changes(tmp_path):
     assert calls == [(f"feishu:{pnc_completion_notice_relay.DEFAULT_CHAT_IDS[1]}:om_1", "om_card")]
     assert updated["last_sent_hash"] != "old"
     assert updated["card_message_id"] == "om_card"
+
+
+def test_task_card_sidecar_cas_suppresses_stale_repeat_disposition(tmp_path):
+    sidecar = _write_sidecar(tmp_path, task_id="card-cas", send_status="sent")
+    base = json.loads(sidecar.read_text(encoding="utf-8"))
+    base["task_card"] = {
+        "schema_version": 1,
+        "task_id": "card-cas",
+        "chat_id": pnc_completion_notice_relay.DEFAULT_CHAT_IDS[1],
+        "thread_id": "topic:om_card_cas",
+        "user_state": "done",
+        "milestones": [],
+        "pending_confirms": [],
+        "delivery": {"conclusion": "done"},
+    }
+    sidecar.write_text(json.dumps(base), encoding="utf-8")
+    first_body = json.loads(sidecar.read_text(encoding="utf-8"))
+    stale_body = json.loads(sidecar.read_text(encoding="utf-8"))
+    calls = []
+
+    def sender(target, rendered, message_id=None):
+        calls.append((target, message_id))
+        return {"success": True, "message_id": "om_card_cas"}
+
+    first = pnc_completion_notice_relay.sync_task_card(
+        task_id="card-cas",
+        path=sidecar,
+        body=first_body,
+        send=True,
+        send_card_func=sender,
+        throttle_seconds=0,
+    )
+    repeat = pnc_completion_notice_relay.sync_task_card(
+        task_id="card-cas",
+        path=sidecar,
+        body=stale_body,
+        send=True,
+        send_card_func=sender,
+        throttle_seconds=0,
+    )
+    durable = json.loads(sidecar.read_text(encoding="utf-8"))["task_card"]
+
+    assert first["disposition"] == "recorded"
+    assert repeat["disposition"] == "duplicate_noop"
+    assert repeat["reason"] == "hash_unchanged"
+    assert len(calls) == 1
+    assert durable["last_card_semantic_key"] == first["semantic_key"] == repeat["semantic_key"]
+
+
+def test_task_card_sidecar_lock_rejects_hardlink(tmp_path):
+    sidecar = _write_sidecar(tmp_path, task_id="card-hardlink", send_status="sent")
+    body = json.loads(sidecar.read_text(encoding="utf-8"))
+    body["task_card"] = {
+        "task_id": "card-hardlink",
+        "chat_id": pnc_completion_notice_relay.DEFAULT_CHAT_IDS[1],
+        "user_state": "running",
+        "milestones": [],
+        "delivery": {},
+    }
+    sidecar.write_text(json.dumps(body), encoding="utf-8")
+    source = tmp_path / "lock-source"
+    source.write_text("", encoding="utf-8")
+    source.chmod(0o600)
+    os.link(source, sidecar.parent / f".{sidecar.name}.card.lock")
+    calls = []
+
+    with pytest.raises(RuntimeError, match="link count mismatch"):
+        pnc_completion_notice_relay.sync_task_card(
+            task_id="card-hardlink",
+            path=sidecar,
+            body=body,
+            send=True,
+            send_card_func=lambda *args, **kwargs: calls.append(True) or {"success": True},
+            throttle_seconds=0,
+        )
+
+    assert calls == []
 
 
 def test_relay_calls_hot_sender_with_message_id_keyword(tmp_path):
@@ -1826,6 +2053,78 @@ def test_infra_self_healable_task_does_not_ping_originator(tmp_path):
         reset_hermes_home_override(token)
     assert pending is False
     assert decision == {"skipped": True, "reason": "pipeline_fix_no_originator_ping", "kind": "need_input"}
+
+
+def test_nested_fixture_pipeline_blocker_persists_and_routes_to_ops(tmp_path, monkeypatch):
+    token = set_hermes_home_override(tmp_path)
+    task_id = "l4-infra-route-g1q3-rca"
+    blocker = {
+        "kind": "translate_workdir_permission",
+        "fault_class": "infra_self_healable",
+        "retryable": True,
+        "message": "PermissionError in isolated fixture",
+    }
+    try:
+        monkeypatch.setenv("HERMES_PNC_INFRA_ALERT", "1")
+        shared = tmp_path / "runtime" / "shared-state" / "tasks" / task_id
+        shared.mkdir(parents=True)
+        meta = {
+            "state": "blocked",
+            "business_line": "g1q3_rca",
+            "requester": "ou_l4_originator",
+            "latest_summary": "infra self heal",
+        }
+        (shared / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        body = {
+            "vm_delivery_proposal": {
+                "schema_version": 1,
+                "source": "pnc_vm_task_sync",
+                "evidence_source": "fixture",
+                "chat_id": pnc_completion_notice_relay.DEFAULT_CHAT_IDS[1],
+                "thread_id": "topic:om_l4_infra",
+                "message_id": "om_l4_infra",
+                "vm_task_id": "vm-l4-infra",
+                "user_state": "in_progress",
+                "delivery": {"report_status": "need_download"},
+                "delivery_contract": {
+                    "schema_version": "g1q3_delivery_contract_v1",
+                    "business_state": "blocked_need_evidence",
+                    "report": {"status": "need_download", "is_deliverable": False},
+                    "pipeline_result": {
+                        "status": "blocked",
+                        "stage": "s3b_translate",
+                        "blocker": blocker,
+                    },
+                },
+            }
+        }
+        body = pnc_completion_notice_relay.reconcile_vm_delivery_proposal(task_id, body)
+        body = pnc_completion_notice_relay.enrich_g1q3_task_card_delivery(task_id, body)
+        card = body["task_card"]
+        pending = pnc_completion_notice_relay._originator_notify_pending(task_id, body)
+        originator = pnc_completion_notice_relay.maybe_notify_originator(
+            task_id=task_id,
+            path=tmp_path / "task-state" / f"{task_id}.json",
+            body=body,
+            meta=meta,
+            send=False,
+        )
+        infra = pnc_completion_notice_relay.maybe_notify_infra_recovery(
+            task_id=task_id,
+            path=tmp_path / "task-state" / f"{task_id}.json",
+            body=body,
+            meta=meta,
+            send=False,
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert card["delivery"]["report_status"] == "need_pipeline_fix"
+    assert card["diagnostics"]["pipeline_blocker"] == blocker
+    assert pending is False
+    assert originator["reason"] == "pipeline_fix_no_originator_ping"
+    assert infra["dry_run"] is True
+    assert infra["kind"] == "infra_recovery"
 
 
 def test_close_loop_guard_card_render_stable_no_fault_class(tmp_path, monkeypatch):
