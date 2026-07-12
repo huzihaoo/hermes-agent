@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from collections import OrderedDict
@@ -3376,6 +3377,307 @@ class TestWebhookSecurity(unittest.TestCase):
         response = asyncio.run(adapter._handle_webhook_request(request))
         self.assertEqual(response.status, 200)
         self.assertIn(b"test_challenge_token", response.body)
+
+
+class TestFeishuApiPollStartupLookback(unittest.TestCase):
+    @staticmethod
+    def _item(message_id: str, create_time: int) -> dict:
+        return {
+            "message_id": message_id,
+            "create_time": str(create_time),
+            "msg_type": "text",
+            "chat_id": "oc_test",
+            "body": {"content": json.dumps({"text": "test"})},
+            "sender": {"id": "ou_test", "id_type": "open_id", "sender_type": "user"},
+        }
+
+    @staticmethod
+    def _make_adapter(extra=None):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        with patch.object(FeishuAdapter, "_load_seen_message_ids"):
+            return FeishuAdapter(PlatformConfig(extra=extra or {"api_poll_chat_ids": ["oc_test"]}))
+
+    @staticmethod
+    def _api_response(*, items, has_more=False, page_token=""):
+        response = Mock()
+        response.read.return_value = json.dumps(
+            {
+                "code": 0,
+                "data": {
+                    "items": items,
+                    "has_more": has_more,
+                    "page_token": page_token,
+                },
+            }
+        ).encode("utf-8")
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        return response
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("plugins.platforms.feishu.adapter.time.time", return_value=1_000)
+    def test_default_does_not_replay_messages_from_before_adapter_start(self, _mock_time):
+        adapter = self._make_adapter()
+        adapter._fetch_recent_chat_messages_via_api = Mock(return_value=[self._item("om_old", 999)])
+        adapter._handle_message_event_data = AsyncMock()
+
+        asyncio.run(adapter._poll_api_chat_once("oc_test"))
+
+        adapter._handle_message_event_data.assert_not_awaited()
+        self.assertEqual(adapter._api_poll_startup_lookback_seconds, 0)
+
+    @patch.dict(
+        os.environ,
+        {"HERMES_FEISHU_API_POLL_STARTUP_LOOKBACK_SECONDS": "120"},
+        clear=True,
+    )
+    @patch("plugins.platforms.feishu.adapter.time.time", return_value=1_000)
+    def test_env_lookback_replays_unseen_message_within_window(self, _mock_time):
+        adapter = self._make_adapter()
+        adapter._fetch_recent_chat_messages_via_api = Mock(return_value=[self._item("om_gap", 950)])
+        adapter._handle_message_event_data = AsyncMock()
+
+        asyncio.run(adapter._poll_api_chat_once("oc_test"))
+
+        adapter._handle_message_event_data.assert_awaited_once()
+        self.assertEqual(adapter._api_poll_start_cursor_ms, 880_000)
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("plugins.platforms.feishu.adapter.time.time", return_value=1_000)
+    def test_config_lookback_replays_unseen_message_within_window(self, _mock_time):
+        adapter = self._make_adapter(
+            {
+                "api_poll_chat_ids": ["oc_test"],
+                "api_poll_startup_lookback_seconds": 30,
+            }
+        )
+        adapter._fetch_recent_chat_messages_via_api = Mock(return_value=[self._item("om_gap", 980)])
+        adapter._handle_message_event_data = AsyncMock()
+
+        asyncio.run(adapter._poll_api_chat_once("oc_test"))
+
+        adapter._handle_message_event_data.assert_awaited_once()
+        self.assertEqual(adapter._api_poll_start_cursor_ms, 970_000)
+
+    @patch.dict(
+        os.environ,
+        {"HERMES_FEISHU_API_POLL_STARTUP_LOOKBACK_SECONDS": "120"},
+        clear=True,
+    )
+    @patch("plugins.platforms.feishu.adapter.time.time", return_value=1_000)
+    def test_message_outside_lookback_is_not_replayed(self, _mock_time):
+        adapter = self._make_adapter()
+        adapter._fetch_recent_chat_messages_via_api = Mock(return_value=[self._item("om_too_old", 879)])
+        adapter._handle_message_event_data = AsyncMock()
+
+        asyncio.run(adapter._poll_api_chat_once("oc_test"))
+
+        adapter._handle_message_event_data.assert_not_awaited()
+
+    @patch.dict(
+        os.environ,
+        {"HERMES_FEISHU_API_POLL_STARTUP_LOOKBACK_SECONDS": "120"},
+        clear=True,
+    )
+    @patch("plugins.platforms.feishu.adapter.time.time", return_value=1_000)
+    def test_persisted_duplicate_inside_lookback_is_not_processed(self, _mock_time):
+        adapter = self._make_adapter()
+        adapter._seen_message_ids = {"om_seen": 1_000.0}
+        adapter._seen_message_order = ["om_seen"]
+        adapter._fetch_recent_chat_messages_via_api = Mock(return_value=[self._item("om_seen", 950)])
+        adapter._process_inbound_message = AsyncMock()
+
+        asyncio.run(adapter._poll_api_chat_once("oc_test"))
+
+        adapter._process_inbound_message.assert_not_awaited()
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_startup_lookback_paginates_until_cursor_is_crossed(self):
+        adapter = self._make_adapter()
+        adapter._fetch_tenant_access_token_via_api = Mock(return_value="token")
+        first_page = [self._item(f"om_recent_{index}", 999) for index in range(50)]
+        second_page = [self._item("om_boundary", 879)]
+        responses = [
+            self._api_response(items=first_page, has_more=True, page_token="page-2"),
+            self._api_response(items=second_page, has_more=True, page_token="page-3"),
+        ]
+
+        with patch("plugins.platforms.feishu.adapter.urlopen", side_effect=responses) as mock_urlopen:
+            items = adapter._fetch_recent_chat_messages_via_api(
+                "oc_test",
+                startup_cursor_ms=880_000,
+            )
+
+        self.assertEqual(len(items), 51)
+        self.assertEqual(mock_urlopen.call_count, 2)
+        first_url = mock_urlopen.call_args_list[0].args[0].full_url
+        second_url = mock_urlopen.call_args_list[1].args[0].full_url
+        self.assertIn("page_size=50", first_url)
+        self.assertNotIn("page_token=", first_url)
+        self.assertIn("page_token=page-2", second_url)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_default_fetch_remains_single_page(self):
+        adapter = self._make_adapter()
+        adapter._fetch_tenant_access_token_via_api = Mock(return_value="token")
+        response = self._api_response(
+            items=[self._item("om_recent", 999)],
+            has_more=True,
+            page_token="page-2",
+        )
+
+        with patch("plugins.platforms.feishu.adapter.urlopen", return_value=response) as mock_urlopen:
+            items = adapter._fetch_recent_chat_messages_via_api("oc_test")
+
+        self.assertEqual([item["message_id"] for item in items], ["om_recent"])
+        mock_urlopen.assert_called_once()
+        self.assertIn("page_size=10", mock_urlopen.call_args.args[0].full_url)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_startup_lookback_fails_closed_at_page_limit(self):
+        from plugins.platforms.feishu.adapter import _MAX_API_POLL_STARTUP_PAGES
+
+        adapter = self._make_adapter()
+        adapter._fetch_tenant_access_token_via_api = Mock(return_value="token")
+        responses = [
+            self._api_response(
+                items=[self._item(f"om_recent_{index}", 999)],
+                has_more=True,
+                page_token=f"page-{index + 2}",
+            )
+            for index in range(_MAX_API_POLL_STARTUP_PAGES)
+        ]
+
+        with patch("plugins.platforms.feishu.adapter.urlopen", side_effect=responses) as mock_urlopen:
+            with self.assertRaisesRegex(RuntimeError, "exceeded 20 pages"):
+                adapter._fetch_recent_chat_messages_via_api(
+                    "oc_test",
+                    startup_cursor_ms=880_000,
+                )
+
+        self.assertEqual(mock_urlopen.call_count, _MAX_API_POLL_STARTUP_PAGES)
+
+    @patch.dict(
+        os.environ,
+        {"HERMES_FEISHU_API_POLL_STARTUP_LOOKBACK_SECONDS": "120"},
+        clear=True,
+    )
+    @patch("plugins.platforms.feishu.adapter.time.time", return_value=1_000)
+    def test_cancelled_replay_retries_before_persisting_dedup_or_baseline(self, _mock_time):
+        adapter = self._make_adapter()
+        adapter._persist_seen_message_ids = Mock()
+        adapter._fetch_recent_chat_messages_via_api = Mock(return_value=[self._item("om_gap", 950)])
+        adapter._admit = Mock(return_value=None)
+        adapter._process_inbound_message = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(adapter._poll_api_chat_once("oc_test"))
+
+        self.assertNotIn("oc_test", adapter._api_poll_baselined_chat_ids)
+        self.assertNotIn("om_gap", adapter._api_poll_seen_message_ids)
+        self.assertNotIn("om_gap", adapter._seen_message_ids)
+        self.assertNotIn("om_gap", adapter._pending_dedup_message_ids)
+
+        adapter._process_inbound_message = AsyncMock()
+        asyncio.run(adapter._poll_api_chat_once("oc_test"))
+
+        adapter._process_inbound_message.assert_awaited_once()
+        self.assertIn("oc_test", adapter._api_poll_baselined_chat_ids)
+        self.assertIn("om_gap", adapter._api_poll_seen_message_ids)
+        self.assertIn("om_gap", adapter._seen_message_ids)
+        adapter._persist_seen_message_ids.assert_called_once()
+
+    @patch.dict(
+        os.environ,
+        {"HERMES_FEISHU_API_POLL_STARTUP_LOOKBACK_SECONDS": "120"},
+        clear=True,
+    )
+    def test_startup_gate_requires_every_configured_chat_baseline(self):
+        adapter = self._make_adapter(
+            {
+                "api_poll_chat_ids": ["oc_one", "oc_two"],
+                "api_poll_startup_lookback_seconds": 120,
+            }
+        )
+
+        async def _baseline(chat_id):
+            adapter._api_poll_baselined_chat_ids.add(chat_id)
+
+        adapter._poll_api_chat_once = AsyncMock(side_effect=_baseline)
+
+        asyncio.run(adapter._establish_api_poll_startup_baselines())
+
+        self.assertEqual(
+            adapter._api_poll_baselined_chat_ids,
+            {"oc_one", "oc_two"},
+        )
+        self.assertEqual(adapter._poll_api_chat_once.await_count, 2)
+
+    @patch.dict(
+        os.environ,
+        {"HERMES_FEISHU_API_POLL_STARTUP_LOOKBACK_SECONDS": "120"},
+        clear=True,
+    )
+    def test_cancelled_startup_fetch_does_not_request_another_page(self):
+        adapter = self._make_adapter()
+        adapter._fetch_tenant_access_token_via_api = Mock(return_value="token")
+        read_started = threading.Event()
+        release_read = threading.Event()
+        response = self._api_response(
+            items=[self._item("om_recent", 999)],
+            has_more=True,
+            page_token="page-2",
+        )
+        payload = response.read.return_value
+
+        def _blocking_read():
+            read_started.set()
+            release_read.wait(timeout=2)
+            return payload
+
+        response.read.side_effect = _blocking_read
+
+        async def _run():
+            with patch("plugins.platforms.feishu.adapter.urlopen", return_value=response) as mock_urlopen:
+                task = asyncio.create_task(adapter._poll_api_chat_once("oc_test"))
+                started = await asyncio.to_thread(read_started.wait, 1)
+                self.assertTrue(started)
+                task.cancel()
+                release_read.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                self.assertEqual(mock_urlopen.call_count, 1)
+
+        asyncio.run(_run())
+        self.assertNotIn("oc_test", adapter._api_poll_baselined_chat_ids)
+
+    @patch("plugins.platforms.feishu.adapter.time.time", return_value=1_000)
+    def test_page_size_and_lookback_environment_bounds_fail_closed(self, _mock_time):
+        with patch.dict(
+            os.environ,
+            {
+                "HERMES_FEISHU_API_POLL_PAGE_SIZE": "50",
+                "HERMES_FEISHU_API_POLL_STARTUP_LOOKBACK_SECONDS": "600",
+            },
+            clear=True,
+        ):
+            adapter = self._make_adapter()
+            self.assertEqual(adapter._api_poll_page_size, 50)
+            self.assertEqual(adapter._api_poll_startup_lookback_seconds, 600)
+
+        with patch.dict(
+            os.environ,
+            {
+                "HERMES_FEISHU_API_POLL_PAGE_SIZE": "51",
+                "HERMES_FEISHU_API_POLL_STARTUP_LOOKBACK_SECONDS": "invalid",
+            },
+            clear=True,
+        ):
+            adapter = self._make_adapter()
+            self.assertEqual(adapter._api_poll_page_size, 10)
+            self.assertEqual(adapter._api_poll_startup_lookback_seconds, 0)
 
 
 class TestDedupTTL(unittest.TestCase):

@@ -277,6 +277,13 @@ _DEFAULT_TEXT_BATCH_MAX_MESSAGES = 8
 _DEFAULT_TEXT_BATCH_MAX_CHARS = 4000
 _DEFAULT_MEDIA_BATCH_DELAY_SECONDS = 0.8
 _DEFAULT_DEDUP_CACHE_SIZE = 2048
+_DEFAULT_API_POLL_PAGE_SIZE = 10
+_MAX_API_POLL_PAGE_SIZE = 50
+_DEFAULT_API_POLL_STARTUP_LOOKBACK_SECONDS = 0
+_MAX_API_POLL_STARTUP_LOOKBACK_SECONDS = 10 * 60
+_MAX_API_POLL_STARTUP_PAGES = 20
+_API_POLL_REQUEST_TIMEOUT_SECONDS = 20
+_API_POLL_CANCEL_WAIT_SECONDS = _API_POLL_REQUEST_TIMEOUT_SECONDS + 5
 _DEFAULT_WEBHOOK_HOST = "127.0.0.1"
 _DEFAULT_WEBHOOK_PORT = 8765
 _DEFAULT_WEBHOOK_PATH = "/feishu/webhook"
@@ -1315,6 +1322,34 @@ def _configured_feishu_max_file_bytes() -> int:
     return parsed
 
 
+def _bounded_int_setting(
+    config_value: Any,
+    *,
+    env_name: str,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    raw_value = os.environ.get(env_name, config_value)
+    if raw_value in (None, ""):
+        return default
+    try:
+        parsed = int(raw_value)
+    except (TypeError, ValueError):
+        logger.warning("[Feishu] Ignoring invalid %s=%r", env_name, raw_value)
+        return default
+    if parsed < minimum or parsed > maximum:
+        logger.warning(
+            "[Feishu] Ignoring out-of-range %s=%r (expected %d..%d)",
+            env_name,
+            raw_value,
+            minimum,
+            maximum,
+        )
+        return default
+    return parsed
+
+
 def _find_header_title(payload: Any) -> str:
     if not isinstance(payload, dict):
         return ""
@@ -1679,6 +1714,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._event_handler: Optional[Any] = None
         self._seen_message_ids: Dict[str, float] = {}  # message_id → seen_at (time.time())
         self._seen_message_order: List[str] = []
+        self._pending_dedup_message_ids: set[str] = set()
         self._dedup_state_path = get_hermes_home() / "feishu_seen_message_ids.json"
         self._dedup_lock = threading.Lock()
         self._sender_name_cache: Dict[str, tuple[str, float]] = {}  # sender_id → (name, expire_at)
@@ -1700,12 +1736,28 @@ class FeishuAdapter(BasePlatformAdapter):
         self._app_lock_identity: Optional[str] = None
         self._api_poll_chat_ids = self._parse_api_poll_chat_ids(config.extra.get("api_poll_chat_ids"))
         self._api_poll_interval_seconds = max(3.0, float(config.extra.get("api_poll_interval_seconds", 10.0) or 10.0))
-        self._api_poll_page_size = max(1, min(50, int(config.extra.get("api_poll_page_size", 10) or 10)))
+        self._api_poll_page_size = _bounded_int_setting(
+            config.extra.get("api_poll_page_size"),
+            env_name="HERMES_FEISHU_API_POLL_PAGE_SIZE",
+            default=_DEFAULT_API_POLL_PAGE_SIZE,
+            minimum=1,
+            maximum=_MAX_API_POLL_PAGE_SIZE,
+        )
+        self._api_poll_startup_lookback_seconds = _bounded_int_setting(
+            config.extra.get("api_poll_startup_lookback_seconds"),
+            env_name="HERMES_FEISHU_API_POLL_STARTUP_LOOKBACK_SECONDS",
+            default=_DEFAULT_API_POLL_STARTUP_LOOKBACK_SECONDS,
+            minimum=0,
+            maximum=_MAX_API_POLL_STARTUP_LOOKBACK_SECONDS,
+        )
         self._api_poll_task: Optional[asyncio.Task] = None
         self._api_poll_seen_message_ids: set[str] = set()
         self._api_poll_baselined_chat_ids: set[str] = set()
         self._api_poll_last_seen_create_time_ms: Dict[str, int] = {}
         self._api_poll_started_at_ms = int(time.time() * 1000)
+        self._api_poll_start_cursor_ms = (
+            self._api_poll_started_at_ms - (self._api_poll_startup_lookback_seconds * 1000)
+        )
         self._text_batch_state = FeishuBatchState()
         self._pending_text_batches = self._text_batch_state.events
         self._pending_text_batch_tasks = self._text_batch_state.tasks
@@ -2058,6 +2110,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
             self._loop = asyncio.get_running_loop()
             await self._connect_with_retry()
+            await self._establish_api_poll_startup_baselines()
             self._mark_connected()
 
             # Start admission queue worker if enabled
@@ -2209,9 +2262,26 @@ class FeishuAdapter(BasePlatformAdapter):
             return
         self._api_poll_task = loop.create_task(self._poll_api_chats_loop())
         logger.info(
-            "[Feishu] API polling fallback enabled for %d chat(s), interval=%.1fs",
+            "[Feishu] API polling fallback enabled for %d chat(s), interval=%.1fs, page_size=%d, startup_lookback=%ds",
             len(self._api_poll_chat_ids),
             self._api_poll_interval_seconds,
+            self._api_poll_page_size,
+            self._api_poll_startup_lookback_seconds,
+        )
+
+    async def _establish_api_poll_startup_baselines(self) -> None:
+        if not self._api_poll_chat_ids or self._api_poll_startup_lookback_seconds <= 0:
+            return
+        for chat_id in self._api_poll_chat_ids:
+            await self._poll_api_chat_once(chat_id)
+        missing = set(self._api_poll_chat_ids) - self._api_poll_baselined_chat_ids
+        if missing:
+            raise RuntimeError(
+                "API polling startup lookback did not establish every configured chat baseline"
+            )
+        logger.info(
+            "[Feishu] API polling startup lookback complete for %d chat(s)",
+            len(self._api_poll_chat_ids),
         )
 
     async def _stop_api_polling(self) -> None:
@@ -2246,7 +2316,16 @@ class FeishuAdapter(BasePlatformAdapter):
         return value
 
     async def _poll_api_chat_once(self, chat_id: str) -> None:
-        items = await asyncio.to_thread(self._fetch_recent_chat_messages_via_api, chat_id)
+        is_startup_baseline = chat_id not in self._api_poll_baselined_chat_ids
+        startup_cursor_ms = (
+            self._api_poll_start_cursor_ms
+            if is_startup_baseline and self._api_poll_startup_lookback_seconds > 0
+            else None
+        )
+        items = await self._fetch_api_poll_messages(
+            chat_id,
+            startup_cursor_ms=startup_cursor_ms,
+        )
         cursor_ms = self._api_poll_last_seen_create_time_ms.get(chat_id)
         if chat_id not in self._api_poll_baselined_chat_ids:
             new_items = []
@@ -2255,15 +2334,14 @@ class FeishuAdapter(BasePlatformAdapter):
                 if not message_id:
                     continue
                 create_time = self._api_poll_item_create_time_ms(item)
-                if create_time is not None and create_time >= self._api_poll_started_at_ms:
+                if create_time is not None and create_time >= self._api_poll_start_cursor_ms:
                     new_items.append(item)
                 else:
                     self._api_poll_seen_message_ids.add(message_id)
                     if create_time is not None:
                         cursor_ms = max(cursor_ms or create_time, create_time)
-            self._api_poll_baselined_chat_ids.add(chat_id)
             logger.info(
-                "[Feishu] API polling baseline established for chat %s with %d recent message(s), replaying %d since adapter start",
+                "[Feishu] API polling baseline prepared for chat %s with %d recent message(s), replaying %d since startup cursor",
                 chat_id,
                 len(items),
                 len(new_items),
@@ -2284,17 +2362,24 @@ class FeishuAdapter(BasePlatformAdapter):
         processed_create_times: List[int] = []
         for item in new_items:
             message_id = str(item.get("message_id") or "").strip()
-            self._api_poll_seen_message_ids.add(message_id)
             create_time = self._api_poll_item_create_time_ms(item)
-            if create_time is not None:
-                processed_create_times.append(create_time)
             logger.info(
                 "[Feishu] API polling replaying message_id=%s chat_id=%s msg_type=%s",
                 message_id,
                 chat_id,
                 item.get("msg_type"),
             )
-            await self._handle_message_event_data(self._api_message_item_to_event_data(item))
+            event_data = self._api_message_item_to_event_data(item)
+            if is_startup_baseline and self._api_poll_startup_lookback_seconds > 0:
+                setattr(event_data, "_hermes_deferred_dedup_commit", True)
+            await self._handle_message_event_data(event_data)
+            self._api_poll_seen_message_ids.add(message_id)
+            if create_time is not None:
+                processed_create_times.append(create_time)
+
+        if is_startup_baseline:
+            self._api_poll_baselined_chat_ids.add(chat_id)
+            logger.info("[Feishu] API polling baseline established for chat %s", chat_id)
 
         if processed_create_times:
             self._api_poll_last_seen_create_time_ms[chat_id] = max(
@@ -2304,26 +2389,108 @@ class FeishuAdapter(BasePlatformAdapter):
         elif cursor_ms is not None:
             self._api_poll_last_seen_create_time_ms[chat_id] = cursor_ms
 
-    def _fetch_recent_chat_messages_via_api(self, chat_id: str) -> List[Dict[str, Any]]:
+    async def _fetch_api_poll_messages(
+        self,
+        chat_id: str,
+        *,
+        startup_cursor_ms: Optional[int],
+    ) -> List[Dict[str, Any]]:
+        cancel_event = threading.Event()
+        fetch_task = asyncio.create_task(
+            asyncio.to_thread(
+                self._fetch_recent_chat_messages_via_api,
+                chat_id,
+                startup_cursor_ms=startup_cursor_ms,
+                cancel_event=cancel_event,
+            )
+        )
+        try:
+            return await asyncio.shield(fetch_task)
+        except asyncio.CancelledError:
+            cancel_event.set()
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(fetch_task),
+                    timeout=_API_POLL_CANCEL_WAIT_SECONDS,
+                )
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                # Preserve the caller's cancellation. The cooperative event
+                # prevents another page request after the current bounded
+                # urlopen returns.
+                pass
+            raise
+
+    def _fetch_recent_chat_messages_via_api(
+        self,
+        chat_id: str,
+        *,
+        startup_cursor_ms: Optional[int] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> List[Dict[str, Any]]:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("message list fetch cancelled")
         token = self._fetch_tenant_access_token_via_api()
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("message list fetch cancelled")
         base_url = "https://open.larksuite.com" if self._domain_name == "lark" else "https://open.feishu.cn"
-        query = urlencode(
-            {
+        page_size = _MAX_API_POLL_PAGE_SIZE if startup_cursor_ms is not None else self._api_poll_page_size
+        max_pages = _MAX_API_POLL_STARTUP_PAGES if startup_cursor_ms is not None else 1
+        page_token = ""
+        seen_page_tokens: set[str] = set()
+        items: List[Dict[str, Any]] = []
+
+        for page_number in range(1, max_pages + 1):
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("message list fetch cancelled")
+            query_params = {
                 "container_id_type": "chat",
                 "container_id": chat_id,
                 "sort_type": "ByCreateTimeDesc",
-                "page_size": str(self._api_poll_page_size),
+                "page_size": str(page_size),
             }
+            if page_token:
+                query_params["page_token"] = page_token
+            request = Request(
+                f"{base_url}/open-apis/im/v1/messages?{urlencode(query_params)}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            with urlopen(request, timeout=_API_POLL_REQUEST_TIMEOUT_SECONDS) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("message list fetch cancelled")
+            if payload.get("code") != 0:
+                raise RuntimeError(f"message list failed: {payload.get('code')} {payload.get('msg')}")
+
+            data = payload.get("data") or {}
+            page_items = list(data.get("items") or [])
+            items.extend(page_items)
+            has_more = bool(data.get("has_more"))
+            if startup_cursor_ms is None or not has_more:
+                return items
+
+            reached_startup_cursor = any(
+                create_time is not None and create_time < startup_cursor_ms
+                for create_time in (self._api_poll_item_create_time_ms(item) for item in page_items)
+            )
+            if reached_startup_cursor:
+                logger.info(
+                    "[Feishu] API polling startup lookback fetched %d message(s) across %d page(s) for chat %s",
+                    len(items),
+                    page_number,
+                    chat_id,
+                )
+                return items
+
+            next_page_token = str(data.get("page_token") or "").strip()
+            if not next_page_token or next_page_token in seen_page_tokens:
+                raise RuntimeError("message list pagination returned a missing or repeated page_token")
+            seen_page_tokens.add(next_page_token)
+            page_token = next_page_token
+
+        raise RuntimeError(
+            "message list startup lookback exceeded "
+            f"{_MAX_API_POLL_STARTUP_PAGES} pages before reaching the startup cursor"
         )
-        request = Request(
-            f"{base_url}/open-apis/im/v1/messages?{query}",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        with urlopen(request, timeout=20) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-        if payload.get("code") != 0:
-            raise RuntimeError(f"message list failed: {payload.get('code')} {payload.get('msg')}")
-        return list((payload.get("data") or {}).get("items") or [])
 
     def _fetch_tenant_access_token_via_api(self) -> str:
         base_url = "https://open.larksuite.com" if self._domain_name == "lark" else "https://open.feishu.cn"
@@ -3429,9 +3596,34 @@ class FeishuAdapter(BasePlatformAdapter):
             return
 
         message_id = getattr(message, "message_id", None)
-        if not message_id or self._is_duplicate(message_id):
+        deferred_dedup_commit = bool(getattr(data, "_hermes_deferred_dedup_commit", False))
+        if not message_id or self._claim_message_id(message_id, durable=not deferred_dedup_commit):
             logger.debug("[Feishu] Dropping duplicate/missing message_id: %s", message_id)
             return
+
+        try:
+            await self._handle_claimed_message_event_data(
+                data=data,
+                message=message,
+                sender=sender,
+                message_id=message_id,
+            )
+        except BaseException:
+            if deferred_dedup_commit:
+                self._release_pending_message_id(message_id)
+            raise
+        if deferred_dedup_commit:
+            self._commit_pending_message_id(message_id)
+
+    async def _handle_claimed_message_event_data(
+        self,
+        *,
+        data: Any,
+        message: Any,
+        sender: Any,
+        message_id: str,
+    ) -> None:
+        """Process one inbound event after its message ID has been claimed."""
 
         reason = self._admit(sender, message)
         if reason is not None:
@@ -6913,20 +7105,60 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.warning("[Feishu] Failed to persist dedup state to %s", self._dedup_state_path, exc_info=True)
 
     def _is_duplicate(self, message_id: str) -> bool:
+        return self._claim_message_id(message_id, durable=True)
+
+    def _claim_message_id(self, message_id: str, *, durable: bool) -> bool:
         now = time.time()
         ttl = _FEISHU_DEDUP_TTL_SECONDS
         with self._dedup_lock:
+            pending_ids = getattr(self, "_pending_dedup_message_ids", None)
+            if pending_ids is None:
+                pending_ids = set()
+                self._pending_dedup_message_ids = pending_ids
             seen_at = self._seen_message_ids.get(message_id)
             if seen_at is not None and (ttl <= 0 or now - seen_at < ttl):
                 return True
-            # Record with current wall-clock timestamp so TTL works across restarts.
-            self._seen_message_ids[message_id] = now
-            self._seen_message_order.append(message_id)
-            while len(self._seen_message_order) > self._dedup_cache_size:
-                stale = self._seen_message_order.pop(0)
-                self._seen_message_ids.pop(stale, None)
-            self._persist_seen_message_ids()
+            if message_id in pending_ids:
+                return True
+            if seen_at is not None:
+                self._seen_message_ids.pop(message_id, None)
+                self._seen_message_order = [item for item in self._seen_message_order if item != message_id]
+            if not durable:
+                pending_ids.add(message_id)
+                return False
+            self._record_seen_message_id_locked(message_id, now)
             return False
+
+    def _record_seen_message_id_locked(self, message_id: str, seen_at: float) -> None:
+        # Caller holds _dedup_lock.
+        self._seen_message_ids[message_id] = seen_at
+        self._seen_message_order.append(message_id)
+        while len(self._seen_message_order) > self._dedup_cache_size:
+            stale = self._seen_message_order.pop(0)
+            self._seen_message_ids.pop(stale, None)
+        self._persist_seen_message_ids()
+
+    def _commit_pending_message_id(self, message_id: str) -> None:
+        now = time.time()
+        ttl = _FEISHU_DEDUP_TTL_SECONDS
+        with self._dedup_lock:
+            pending_ids = getattr(self, "_pending_dedup_message_ids", None)
+            if pending_ids is not None:
+                pending_ids.discard(message_id)
+            seen_at = self._seen_message_ids.get(message_id)
+            if seen_at is not None and (ttl <= 0 or now - seen_at < ttl):
+                return
+            if seen_at is not None:
+                self._seen_message_ids.pop(message_id, None)
+                self._seen_message_order = [item for item in self._seen_message_order if item != message_id]
+            # Record with current wall-clock timestamp so TTL works across restarts.
+            self._record_seen_message_id_locked(message_id, now)
+
+    def _release_pending_message_id(self, message_id: str) -> None:
+        with self._dedup_lock:
+            pending_ids = getattr(self, "_pending_dedup_message_ids", None)
+            if pending_ids is not None:
+                pending_ids.discard(message_id)
 
     # =========================================================================
     # Outbound payload construction and send pipeline
