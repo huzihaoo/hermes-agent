@@ -1,711 +1,199 @@
 #!/usr/bin/env python3
-"""G1Q3-RCA end-to-end delivery smoke gate.
+"""Offline G1Q3-RCA release-gate smoke checks.
 
-Fixed release-gate for the G1Q3-RCA intake -> pipeline -> report chain.  This is
-the executable form of runbook PNC_BUSINESS_OVERLAY_RELEASE_RUNBOOK.md §S5.5
-"headless back-half smoke": it triggers the REAL datapipe coordinator (not a
-mock), watches the real VM pipeline to completion, then verifies the §S5.5 five
-green-check fields against the real case_dir.
+``--fixture-mode`` verifies a frozen, digest-bound local evidence bundle and
+``--no-dispatch`` inspects routing source structure without executing candidate
+code, VM access, or writes. These offline checks remain non-authorizing and
+return No-Go until an external release authority binds the fixture to a frozen
+release. Real execution is deliberately unavailable: ``--execute`` always emits
+a machine-readable blocker until all governed controls exist.
 
-The existing no-flag/full behavior still dispatches the detached coordinator,
-downloads (~7.5G), runs s1->s6, and verifies.  Candidate pre-cutover checks use
-the separate ``--no-dispatch`` record-only path with six explicit isolated
-roots; that path never enters preflight, dotenv, gateway, VM, or Feishu code.
-
-Coverage boundary (honest, printed): this headless path drives the execution
-chain (s1_gate..s6_report + green checks) but does NOT exercise the long-lived
-gateway websocket ingress nor the card-delivery/relay path — those require a
-real human @-mention (A3), a physical constraint (the gateway drops bot-sent
-messages via self_echo/bots_disabled by design).  See §S5.5.
-
-Exit codes: 0 = real/dry-run PASS; 2 = smoke FAIL/timeout or a valid candidate
-no-dispatch observation that remains No-Go; 3 = preflight/isolation/invocation
-gate failed — smoke not attempted.
+Exit codes: 2 = a valid offline observation completed but release remains No-Go;
+3 = an invalid invocation/evidence observation or the real-execution blocker.
+Machine readers distinguish invalid offline input via ``error.code`` and the
+disabled execute surface via ``blocker.code``. No mode performs VM or
+production I/O.
 """
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import os
 import re
 import stat
-import subprocess
 import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
 REPO = Path(__file__).resolve().parent.parent
-SSH_MINI_AGENT = str(Path.home() / ".local" / "bin" / "ssh-mini-agent")
-
-# Fixed smoke case (owner-designated, 2026-07-10): ACC follow-stop, PDCL event.
-DEFAULT_ISSUE_URL = "https://project.feishu.cn/t03o4q/issue/detail/7041712812"
-DEFAULT_WORK_ITEM = "7041712812"
-DEFAULT_REQUESTER = "ou_d1d3cfeba1be0a22faa36aaf4fb3907d"  # owner (胡子豪)
 G1Q3_RCA_GROUP_ID = "oc_6cfc782212009ff4cd815349909dd423"
-CASE_ROOT = "/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases"
-
-# Candidate-only record path.  The local candidate sandbox and the governed VM
-# smoke landing are the only namespaces accepted by --no-dispatch.
-NO_DISPATCH_ALLOWED_BASES = (
-    Path.home() / "hermes-candidate-sandboxes",
-    Path("/mnt/tmp/hermes-v0182-smoke-20260710"),
+FIXTURE_SCHEMA = "g1q3-smoke-fixture/v2"
+FIXTURE_EVIDENCE = {
+    "case/gate_result.json": ("case", "gate_result.json"),
+    "case/report_data.json": ("case", "report_data.json"),
+    "case/index.html": ("case", "index.html"),
+    "artifact/exit.code": ("artifact", "exit.code"),
+    "shared-state/task_card.json": ("shared_state", "task_card.json"),
+}
+REQUIRED_GATES = {f"G{i}" for i in range(7)}
+RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{5,63}$")
+RELEASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{5,127}$")
+TASK_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{5,127}$")
+WORK_ITEM_RE = re.compile(r"^[0-9]{1,32}$")
+EVIDENCE_IDENTITY_FIELDS = (
+    "run_id",
+    "task_slug",
+    "work_item_id",
+    "issue_url",
+    "group_id",
 )
-NO_DISPATCH_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{5,63}$")
-NO_DISPATCH_ROOT_FIELDS = (
-    "case_root",
-    "artifact_root",
-    "shared_state_root",
-    "output_root",
-    "work_root",
-    "download_root",
-)
-
-STAGE_ORDER = [
-    "s1_gate", "s2_download", "s3a_materialize", "s3b_translate",
-    "s5_alignment", "s6_report",
-]
+NON_AUTHORIZING_RESULT = {
+    "ok": False,
+    "production_ready": False,
+    "cutover_go": False,
+    "l6_gate_passed": False,
+    "execution_authorized": False,
+    "dispatch_attempted": False,
+    "external_release_binding_verified": False,
+}
 
 
-# --------------------------------------------------------------------------
-# small helpers
-# --------------------------------------------------------------------------
-def _log(msg: str) -> None:
-    print(msg, flush=True)
+class InvalidInvocation(ValueError):
+    pass
 
 
-def _run_vm_py(script: str, timeout: float = 45.0) -> tuple[int, str, str]:
-    """Run a python snippet on the VM via ssh-mini-agent run_py_json."""
-    proc = subprocess.run(
-        [SSH_MINI_AGENT, "run_py_json"],
-        input=script, text=True, capture_output=True, timeout=timeout,
-    )
-    return proc.returncode, proc.stdout, proc.stderr
+class SmokeArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise InvalidInvocation(message)
 
 
-def _vm_read_json(path: str, lines: int = 800, timeout: float = 45.0) -> dict | None:
-    """Read a JSON file off the VM; return parsed dict or None."""
-    proc = subprocess.run(
-        [SSH_MINI_AGENT, "read_file", path, "--start", "1", "--lines", str(lines)],
-        text=True, capture_output=True, timeout=timeout,
-    )
-    if proc.returncode != 0:
-        return None
-    try:
-        return json.loads(proc.stdout)
-    except Exception:
-        return None
-
-
-# --------------------------------------------------------------------------
-# candidate --no-dispatch record-only path (local filesystem only)
-# --------------------------------------------------------------------------
-class NoDispatchIsolationError(ValueError):
-    """Raised before any candidate record is written when isolation is unsafe."""
-
-
-def _canonical_existing_directory(path: Path, *, label: str) -> Path:
-    if not path.is_absolute() or Path(os.path.normpath(str(path))) != path:
-        raise NoDispatchIsolationError(f"{label} must be an absolute canonical path")
-    try:
-        resolved = path.resolve(strict=True)
-        info = path.lstat()
-    except OSError as exc:
-        raise NoDispatchIsolationError(f"{label} is unavailable: {exc}") from exc
-    if resolved != path or stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-        raise NoDispatchIsolationError(f"{label} must be a real directory without symlinks")
-    if info.st_uid != os.getuid():
-        raise NoDispatchIsolationError(f"{label} must be owned by the current user")
-    if info.st_mode & 0o022:
-        raise NoDispatchIsolationError(f"{label} must not be group/world writable")
-    return path
-
-
-def _path_is_within(path: Path, base: Path) -> bool:
-    try:
-        path.relative_to(base)
-    except ValueError:
-        return False
-    return True
-
-
-def validate_no_dispatch_roots(
-    *,
-    run_id: str,
-    case_root: Path,
-    artifact_root: Path,
-    shared_state_root: Path,
-    output_root: Path,
-    work_root: Path,
-    download_root: Path,
-) -> dict[str, Path]:
-    """Bind all candidate paths to one isolated run namespace.
-
-    All six roots must already exist as distinct direct children of a directory
-    named after ``run_id``.  That run directory must be below the candidate
-    sandbox base or the fixed governed VM smoke landing.  This makes an
-    accidental live ``~/.hermes``/production shared-state path fail closed.
-    """
-    if not NO_DISPATCH_RUN_ID_RE.fullmatch(str(run_id or "")):
-        raise NoDispatchIsolationError(
-            "run-id must be 6-64 characters using only letters, digits, '_' or '-'"
-        )
-    raw = {
-        "case_root": case_root,
-        "artifact_root": artifact_root,
-        "shared_state_root": shared_state_root,
-        "output_root": output_root,
-        "work_root": work_root,
-        "download_root": download_root,
+def execute_blocker() -> dict:
+    """Return the stable blocker contract for intentionally disabled execution."""
+    return {
+        "code": "G1Q3_REAL_EXECUTION_NOT_IMPLEMENTED",
+        "reason": "real dispatch is disabled in this offline smoke gate",
+        "missing_controls": [
+            "trusted_signed_owner_approval",
+            "release_run_nonce_durable_single_use",
+            "frozen_repo_head_tree_policy_binding",
+            "issue_handoff_requester_group_identity_envelope",
+            "atomic_quota_reservation",
+            "governed_ssh_mini_mcap_run_dispatch",
+            "bounded_resource_timeout_and_task_owned_cleanup",
+        ],
+        "dispatch_attempted": False,
+        "execution_authorized": False,
     }
-    roots = {
-        name: _canonical_existing_directory(Path(value), label=name.replace("_", "-"))
-        for name, value in raw.items()
-    }
-    if len(set(roots.values())) != len(roots):
-        raise NoDispatchIsolationError("candidate roots must be distinct")
-
-    parents = {path.parent for path in roots.values()}
-    if len(parents) != 1:
-        raise NoDispatchIsolationError("candidate roots must share one direct run parent")
-    run_root = _canonical_existing_directory(parents.pop(), label="run-root")
-    if run_root.name != run_id:
-        raise NoDispatchIsolationError("run-root basename must exactly match --run-id")
-    if any(path.parent != run_root for path in roots.values()):
-        raise NoDispatchIsolationError("candidate roots must be direct children of run-root")
-
-    allowed = False
-    for candidate in NO_DISPATCH_ALLOWED_BASES:
-        try:
-            base = _canonical_existing_directory(candidate, label="allowed candidate base")
-        except NoDispatchIsolationError:
-            continue
-        if run_root != base and _path_is_within(run_root, base):
-            allowed = True
-            break
-    if not allowed:
-        raise NoDispatchIsolationError(
-            "run-root must be below ~/hermes-candidate-sandboxes or "
-            "/mnt/tmp/hermes-v0182-smoke-20260710"
-        )
-    return {"run_root": run_root, **roots}
 
 
-def _open_isolated_directory(
-    path: Path | str, *, label: str, dir_fd: int | None = None
-) -> int:
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_DIRECTORY", 0)
-    )
+def _decode_json_object(raw: bytes, *, label: str) -> dict:
+    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+        result: dict = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"{label} contains duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
     try:
-        if dir_fd is not None:
-            name = str(path)
-            if not name or Path(name).name != name:
-                raise NoDispatchIsolationError(f"{label} child name is not canonical")
-            fd = os.open(name, flags, dir_fd=dir_fd)
-        else:
-            absolute = Path(path)
-            if not absolute.is_absolute() or Path(os.path.normpath(str(absolute))) != absolute:
-                raise NoDispatchIsolationError(f"{label} must be an absolute canonical path")
-            fd = os.open(absolute.anchor, flags)
-            try:
-                for part in absolute.parts[1:]:
-                    next_fd = os.open(part, flags, dir_fd=fd)
-                    os.close(fd)
-                    fd = next_fd
-            except Exception:
-                os.close(fd)
-                raise
-    except OSError as exc:
-        raise NoDispatchIsolationError(f"cannot safely open {label}: {exc}") from exc
-    info = os.fstat(fd)
-    if (
-        not stat.S_ISDIR(info.st_mode)
-        or info.st_uid != os.getuid()
-        or info.st_mode & 0o022
-    ):
-        os.close(fd)
-        raise NoDispatchIsolationError(f"{label} changed or became unsafe")
-    return fd
-
-
-def _directory_identity(fd: int) -> tuple[int, int, int, int, int]:
-    info = os.fstat(fd)
-    return (info.st_dev, info.st_ino, info.st_mode, info.st_mtime_ns, info.st_ctime_ns)
-
-
-def _assert_path_matches_fd(path: Path, fd: int, *, label: str) -> None:
-    try:
-        path_info = path.lstat()
-    except OSError as exc:
-        raise NoDispatchIsolationError(f"{label} disappeared during recording") from exc
-    fd_info = os.fstat(fd)
-    if stat.S_ISLNK(path_info.st_mode) or (
-        path_info.st_dev,
-        path_info.st_ino,
-    ) != (fd_info.st_dev, fd_info.st_ino):
-        raise NoDispatchIsolationError(f"{label} was replaced during recording")
-
-
-def _write_exclusive_json(dir_fd: int, name: str, body: dict) -> tuple[bytes, str]:
-    if not name or Path(name).name != name:
-        raise NoDispatchIsolationError("record filename is not canonical")
-    data = (json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode(
-        "utf-8"
-    )
-    flags = (
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    try:
-        fd = os.open(name, flags, 0o600, dir_fd=dir_fd)
-    except OSError as exc:
-        raise NoDispatchIsolationError(f"cannot create isolated record {name}: {exc}") from exc
-    try:
-        offset = 0
-        while offset < len(data):
-            offset += os.write(fd, data[offset:])
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    os.fsync(dir_fd)
-    return data, hashlib.sha256(data).hexdigest()
-
-
-def _validate_no_dispatch_identity(issue_url: str, work_item: str) -> str:
-    parsed = urlsplit(str(issue_url or ""))
-    parts = parsed.path.split("/")
-    if (
-        parsed.scheme != "https"
-        or parsed.netloc != "project.feishu.cn"
-        or parsed.query
-        or parsed.fragment
-        or "%" in parsed.path
-        or len(parts) != 5
-        or parts[0]
-        or parts[2:4] != ["issue", "detail"]
-        or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", parts[1])
-        or not re.fullmatch(r"[0-9]{1,32}", parts[4])
-        or parts[4] != str(work_item or "")
-    ):
-        raise NoDispatchIsolationError("issue-url and work-item identity are invalid or mismatched")
-    canonical = f"https://project.feishu.cn/{parts[1]}/issue/detail/{parts[4]}"
-    if canonical != issue_url:
-        raise NoDispatchIsolationError("issue-url must use canonical project.feishu.cn spelling")
-    return parts[1]
-
-
-def record_no_dispatch(
-    *,
-    issue_url: str,
-    work_item: str,
-    requester: str,
-    run_id: str,
-    case_root: Path,
-    artifact_root: Path,
-    shared_state_root: Path,
-    output_root: Path,
-    work_root: Path,
-    download_root: Path,
-) -> dict:
-    """Record a candidate-only execution intent without importing dispatch code."""
-    project_key = _validate_no_dispatch_identity(issue_url, work_item)
-    roots = validate_no_dispatch_roots(
-        run_id=run_id,
-        case_root=case_root,
-        artifact_root=artifact_root,
-        shared_state_root=shared_state_root,
-        output_root=output_root,
-        work_root=work_root,
-        download_root=download_root,
-    )
-    run_fd = _open_isolated_directory(roots["run_root"], label="run_root")
-    fds = {"run_root": run_fd}
-    try:
-        for name, path in roots.items():
-            if name != "run_root":
-                fds[name] = _open_isolated_directory(
-                    path.name, label=name, dir_fd=run_fd
-                )
-    except Exception:
-        for fd in fds.values():
-            os.close(fd)
-        raise
-    readonly_before = {
-        name: _directory_identity(fds[name])
-        for name in ("case_root", "work_root", "download_root")
-    }
-    task_slug = f"g1q3_rca_issue_intake_{work_item}_{run_id}"
-    observed_at = datetime.now(timezone.utc).isoformat()
-    root_strings = {name: str(path) for name, path in roots.items()}
-    requester_hash = hashlib.sha256(str(requester or "").encode("utf-8")).hexdigest()
-    policy = {
-        "dispatch_allowed": False,
-        "download_allowed": False,
-        "feishu_read_allowed": False,
-        "feishu_write_allowed": False,
-        "network_allowed": False,
-        "vm_access_allowed": False,
-        "production_shared_state_write_allowed": False,
-    }
-    request = {
-        "schema_version": "g1q3_rca_no_dispatch_request_v1",
-        "mode": "candidate_no_dispatch",
-        "observed_at": observed_at,
-        "identity": {
-            "run_id": run_id,
-            "task_slug": task_slug,
-            "project_key": project_key,
-            "work_item_id": work_item,
-            "issue_url": issue_url,
-            "source_group_id": G1Q3_RCA_GROUP_ID,
-            "requester_sha256": requester_hash,
-        },
-        "roots": root_strings,
-        "execution_policy": policy,
-        "decision": {
-            "route_evaluation_performed": False,
-            "dispatch_attempted": False,
-            "download_attempted": False,
-            "external_delivery_attempted": False,
-        },
-    }
-    state = {
-        "schema_version": "g1q3_rca_no_dispatch_state_v1",
-        "task_id": task_slug,
-        "run_id": run_id,
-        "state": "recorded_not_dispatched",
-        "candidate_only": True,
-        "production_state": False,
-        "terminal": True,
-        "observed_at": observed_at,
-        "execution_policy": policy,
-    }
-    request_name = f"rca_execution_request.{run_id}.json"
-    state_name = f"no_dispatch_state.{run_id}.json"
-    audit_name = f"no_dispatch_audit.{run_id}.json"
-    written: dict[str, dict[str, str]] = {}
-    try:
-        request_bytes, request_sha = _write_exclusive_json(
-            fds["artifact_root"], request_name, request
-        )
-        written["execution_request"] = {
-            "path": str(roots["artifact_root"] / request_name),
-            "sha256": request_sha,
-        }
-        state_bytes, state_sha = _write_exclusive_json(
-            fds["shared_state_root"], state_name, state
-        )
-        written["isolated_shared_state"] = {
-            "path": str(roots["shared_state_root"] / state_name),
-            "sha256": state_sha,
-        }
-        readonly_after = {
-            name: _directory_identity(fds[name])
-            for name in ("case_root", "work_root", "download_root")
-        }
-        untouched = {
-            name: readonly_before[name] == readonly_after[name]
-            for name in readonly_before
-        }
-        if not all(untouched.values()):
-            raise NoDispatchIsolationError("read-only candidate roots changed during recording")
-        audit = {
-            "schema_version": "g1q3_rca_no_dispatch_audit_v1",
-            "mode": "candidate_no_dispatch",
-            "observed_at": observed_at,
-            "identity": request["identity"],
-            "roots": root_strings,
-            "execution_policy": policy,
-            "enforcement": {
-                "scope": "g1q3_rca_e2e_smoke script control flow",
-                "preflight_called": False,
-                "dotenv_loaded": False,
-                "gateway_run_imported": False,
-                "dispatch_attempted": False,
-                "download_attempted": False,
-                "feishu_contact_attempted": False,
-                "vm_or_ssh_attempted": False,
-                "network_attempted": False,
-                "production_shared_state_write_attempted": False,
-                "read_only_roots_unchanged": untouched,
-            },
-            "records": written,
-            "authorization": {
-                "candidate_execution_authorized": False,
-                "production_write_authorized": False,
-                "dispatch_authorized": False,
-                "download_authorized": False,
-                "external_delivery_authorized": False,
-                "cutover_authorized": False,
-                "gate_decision": "NO_GO",
-            },
-        }
-        audit_bytes, audit_sha = _write_exclusive_json(
-            fds["output_root"], audit_name, audit
-        )
-        written["audit"] = {
-            "path": str(roots["output_root"] / audit_name),
-            "sha256": audit_sha,
-        }
-        for name, fd in fds.items():
-            _assert_path_matches_fd(roots[name], fd, label=name)
-        return {
-            "mode": "no-dispatch",
-            "ok": False,
-            "record_only_completed": True,
-            "offline_check_passed": True,
-            "gate_decision": "NO_GO",
-            "task_slug": task_slug,
-            "roots": root_strings,
-            "records": written,
-            "dispatch_attempted": False,
-            "download_attempted": False,
-            "feishu_contact_attempted": False,
-            "vm_or_ssh_attempted": False,
-            "network_attempted": False,
-            "production_shared_state_write_attempted": False,
-            "execution_authorized": False,
-            "cutover_authorized": False,
-            "audit_payload_bytes": len(audit_bytes),
-            "request_payload_bytes": len(request_bytes),
-            "state_payload_bytes": len(state_bytes),
-        }
-    finally:
-        for fd in fds.values():
-            os.close(fd)
-
-
-# --------------------------------------------------------------------------
-# preflight gate (exit 3 on failure — smoke not attempted)
-# --------------------------------------------------------------------------
-def preflight(hermes_home: Path) -> tuple[bool, list[str]]:
-    findings: list[str] = []
-    ok = True
-
-    # 1) governance download flag (set in-process to match gateway plist).
-    os.environ["G1Q3_GOVERNANCE_DOWNLOAD_ENABLED"] = "1"
-    try:
-        sys.path.insert(0, str(REPO)); sys.path.insert(0, str(REPO / "scripts"))
-        from pnc_g1q3_governance_rca import governance_download_enabled
-        if governance_download_enabled():
-            findings.append("flag: G1Q3_GOVERNANCE_DOWNLOAD_ENABLED=1 OK")
-        else:
-            ok = False; findings.append("flag: governance_download_enabled False -> BLOCK")
-    except Exception as exc:
-        ok = False; findings.append(f"flag: import failed: {type(exc).__name__}: {exc}")
-
-    # 2) relay not crash-looping (poison-card fail-closed loop kills card sync).
-    relay_ok, relay_note = _relay_not_crashlooping()
-    findings.append(f"relay: {relay_note}")
-    ok = ok and relay_ok
-
-    # 3) VM reachable.
-    try:
-        proc = subprocess.run([SSH_MINI_AGENT, "doctor", "--json"],
-                              text=True, capture_output=True, timeout=30)
-        doc = json.loads(proc.stdout) if proc.stdout.strip() else {}
-        if doc.get("ok") and doc.get("remote_rc") == 0:
-            findings.append("vm: ssh-mini doctor ok")
-        else:
-            ok = False; findings.append(f"vm: doctor not ok: {str(doc)[:120]}")
-    except Exception as exc:
-        ok = False; findings.append(f"vm: doctor failed: {type(exc).__name__}: {exc}")
-
-    # 4) daily download quota has headroom.
-    q_ok, q_note = _quota_has_headroom(hermes_home)
-    findings.append(f"quota: {q_note}")
-    ok = ok and q_ok
-
-    return ok, findings
-
-
-def _relay_not_crashlooping() -> tuple[bool, str]:
-    label = "local.pnc.completion-notice-relay"
-    def _query() -> tuple[str, str]:
-        proc = subprocess.run(["launchctl", "list"], text=True, capture_output=True, timeout=15)
-        for line in proc.stdout.splitlines():
-            if label in line:
-                parts = line.split()
-                return parts[0], parts[1]  # pid, status
-        return "", ""
-    pid1, status1 = _query()
-    if not pid1:
-        return True, f"{label} not loaded (skip — no relay to crash)"
-    # A crash-loop shows status=1 AND a churning pid across a short window.
-    time.sleep(3)
-    pid2, status2 = _query()
-    if status1 == "1" and pid1 != pid2:
-        return False, f"CRASH-LOOP: status=1 pid churned {pid1}->{pid2} -> BLOCK (see §S5.5 poison-card)"
-    return True, f"stable pid={pid2} status={status2}"
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=reject_duplicate_keys)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} is not valid UTF-8 JSON") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} JSON root must be an object")
+    return value
 
 
 def _quota_has_headroom(hermes_home: Path) -> tuple[bool, str]:
+    """Safely observe quota, but never treat an observation as a reservation."""
     day = datetime.now(timezone.utc).date().isoformat()
     ledger = hermes_home / "pnc_agent" / "quota" / f"g1q3_auto_download-{day}.json"
     quota_env = os.environ.get("HERMES_G1Q3_AUTO_DOWNLOAD_DAILY_QUOTA", "").strip()
     try:
-        quota = int(quota_env) if quota_env else 0
+        quota = int(quota_env)
     except ValueError:
-        quota = 0
+        return False, "quota configuration is malformed -> BLOCK"
     if quota <= 0:
         return False, "HERMES_G1Q3_AUTO_DOWNLOAD_DAILY_QUOTA<=0 -> auto_download_disabled -> BLOCK"
-    used = 0
-    if ledger.exists():
-        try:
-            used = int(json.loads(ledger.read_text()).get("used") or 0)
-        except Exception:
-            used = 0
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(ledger, flags)
+    except OSError as exc:
+        return False, f"quota ledger unavailable or unsafe ({type(exc).__name__}) -> BLOCK"
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            return False, "quota ledger is not a regular file -> BLOCK"
+        if before.st_uid != os.getuid() or before.st_nlink != 1 or before.st_mode & 0o022:
+            return False, "quota ledger ownership/link/mode is unsafe -> BLOCK"
+        if before.st_size > 64 * 1024:
+            return False, "quota ledger exceeds size limit -> BLOCK"
+        raw = bytearray()
+        while True:
+            block = os.read(fd, 8192)
+            if not block:
+                break
+            raw.extend(block)
+            if len(raw) > 64 * 1024:
+                return False, "quota ledger exceeds size limit -> BLOCK"
+        after = os.fstat(fd)
+        before_id = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        after_id = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        if before_id != after_id or len(raw) != before.st_size:
+            return False, "quota ledger changed while observed -> BLOCK"
+    finally:
+        os.close(fd)
+    try:
+        body = _decode_json_object(bytes(raw), label="quota ledger")
+        used = body["used"]
+        if isinstance(used, bool) or not isinstance(used, int) or used < 0:
+            raise ValueError("used must be a non-negative integer")
+    except (KeyError, TypeError, ValueError):
+        return False, "quota ledger is malformed -> BLOCK"
     if used >= quota:
         return False, f"exhausted used={used}/{quota} -> BLOCK"
-    return True, f"headroom used={used}/{quota}"
-
-
-# --------------------------------------------------------------------------
-# trigger the REAL detached datapipe coordinator
-# --------------------------------------------------------------------------
-def trigger(issue_url: str, work_item: str, requester: str) -> tuple[str, str, dict]:
-    """Returns (task_slug, artifact_root, dispatch_result)."""
-    sys.path.insert(0, str(REPO)); sys.path.insert(0, str(REPO / "scripts"))
-    from gateway.config import Platform
-    from gateway.pnc_group_binding import evaluate_pnc_group_request
-    import gateway.run as gr
-    from gateway.pnc_rca_artifacts import write_vm_tmp_text
-
-    text = f"分析这个问题 {issue_url}"
-    dec = evaluate_pnc_group_request(platform=Platform.FEISHU, chat_id=G1Q3_RCA_GROUP_ID, text=text)
-    if dec.decision != "accepted":
-        raise RuntimeError(f"decision != accepted: {dec.decision}")
-    handoff = dec.handoff_contract or {}
-    work_item_id = str(handoff.get("work_item_id") or work_item)
-
-    # Fresh message_id -> fresh /mnt/tmp/..._<hash>/ namespace (real download, no reuse).
-    uniq = hashlib.sha1(os.urandom(16)).hexdigest()[:10]
-    message_id = f"om_smoke_{uniq}"
-    trig = hashlib.sha1(message_id.encode()).hexdigest()[:6]
-    safe_case = re.sub(r"[^A-Za-z0-9_-]+", "_", handoff.get("case_id") or work_item_id).strip("_") or "unknown"
-    task_slug = f"g1q3_rca_issue_intake_{safe_case}_{trig}"
-    artifact_root = f"/mnt/tmp/{task_slug}/"
-    artifact_cifs = ("//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/"
-                     f"{task_slug}/")
-    full_case_id = f"G1Q3-{handoff.get('case_id')}" if handoff.get("case_id") else "待从飞书问题字段解析"
-    translate_config = gr._g1q3_translate_baseline_config()
-
-    from gateway.pnc_rca_schema import build_execution_request, to_json as rca_to_json
-    from gateway.pnc_issue_context import issue_context_from_compact_text
-    issue_ctx = issue_context_from_compact_text(
-        project_key="t03o4q", work_item_id=work_item_id, compact_text="", issue_url=issue_url,
+    return False, (
+        f"observed headroom used={used}/{quota}, but no atomic reservation was made -> BLOCK"
     )
-    exec_req = build_execution_request(
-        request_kind="issue_intake", task_id=task_slug, issue_context=issue_ctx,
-        request_text_excerpt=text[:1200], source_group_id=G1Q3_RCA_GROUP_ID,
-        source_message_id=message_id, artifact_root=artifact_root,
-        artifact_cifs_root=artifact_cifs, allow_download=True,
-        translate_baseline=translate_config.get("translate_baseline", "production"),
-        translate_contract_path=translate_config.get("translate_contract_path", ""),
-    )
-    request_json = rca_to_json(exec_req)
-    execution_request_path = f"{artifact_root}rca_execution_request.json"
-    write_vm_tmp_text(execution_request_path, request_json + "\n")
-
-    # CRITICAL: dispatch the REAL pipeline entrypoint (start_new_session detached).
-    # _submit_g1q3_rca_status_handoff is a card/status handoff that does NOT start
-    # the datapipe — calling it strands the run at s1_gate (2026-07-10 lesson).
-    result = gr._dispatch_governance_datapipe_coordinator(
-        task_slug=task_slug, artifact_root=artifact_root, artifact_cifs_root=artifact_cifs,
-        execution_request_path=execution_request_path, request_json=request_json,
-        template_id="rca_issue_intake", full_case_id=full_case_id, work_item_id=work_item_id,
-        source_group_id=G1Q3_RCA_GROUP_ID, message_id=message_id, requester=requester,
-        translate_config=translate_config,
-    )
-    return task_slug, artifact_root, result
 
 
-# --------------------------------------------------------------------------
-# watch the pipeline to completion
-# --------------------------------------------------------------------------
-def watch(artifact_root: str, timeout: float, poll: float = 20.0) -> tuple[bool, dict]:
-    root = artifact_root.rstrip("/")
-    deadline = time.monotonic() + timeout
-    last_stages: dict = {}
-    while time.monotonic() < deadline:
-        ps = _vm_read_json(f"{root}/pipeline_state.json")
-        if ps:
-            stages = ps.get("stages")
-            norm = ({k: (v.get("status") if isinstance(v, dict) else v) for k, v in stages.items()}
-                    if isinstance(stages, dict) else {})
-            if norm != last_stages:
-                _log(f"  stages: {json.dumps(norm, ensure_ascii=False)}")
-                last_stages = norm
-            s6 = (stages or {}).get("s6_report") if isinstance(stages, dict) else None
-            s6_status = s6.get("status") if isinstance(s6, dict) else s6
-            # completion: exit.code file == 0 AND s6 completed
-            rc, out, _ = _run_vm_py(
-                f"import os,json;p={json.dumps(root)}+'/exit.code';"
-                f"print(json.dumps({{'exit':open(p).read().strip() if os.path.exists(p) else None}}))")
-            exit_code = None
-            try:
-                exit_code = json.loads(out).get("exit")
-            except Exception:
-                pass
-            if s6_status == "completed" and exit_code == "0":
-                return True, {"stages": last_stages, "exit_code": exit_code}
-            if exit_code not in (None, "0"):
-                return False, {"stages": last_stages, "exit_code": exit_code, "reason": "nonzero_exit"}
-        time.sleep(poll)
-    return False, {"stages": last_stages, "reason": "timeout"}
+def trigger(
+    issue_url: str, work_item: str, requester: str, run_id: str, group_id: str
+) -> tuple[str, str, dict]:
+    """Compatibility symbol that can no longer reach a dispatcher."""
+    del issue_url, work_item, requester, run_id, group_id
+    raise RuntimeError(json.dumps(execute_blocker(), sort_keys=True))
 
 
-# --------------------------------------------------------------------------
-# §S5.5 five green checks against the real case_dir
-# --------------------------------------------------------------------------
-def find_case_dir(work_item: str) -> str | None:
-    rc, out, _ = _run_vm_py(
-        "import os,json,glob;"
-        f"c=sorted(glob.glob({json.dumps(CASE_ROOT + '/' + work_item + '*')}));"
-        "print(json.dumps({'dirs':c}))")
-    try:
-        dirs = json.loads(out).get("dirs") or []
-    except Exception:
-        dirs = []
-    # prefer the most specific (e.g. <id>_acc) with a report_data.json
-    for d in sorted(dirs, key=len, reverse=True):
-        rd = _vm_read_json(f"{d}/report_data.json", lines=1)
-        if rd is not None or _vm_file_exists(f"{d}/report_data.json"):
-            return d
-    return dirs[-1] if dirs else None
-
-
-def _vm_file_exists(path: str) -> bool:
-    rc, out, _ = _run_vm_py(f"import os,json;print(json.dumps({{'e':os.path.exists({json.dumps(path)})}}))")
-    try:
-        return bool(json.loads(out).get("e"))
-    except Exception:
-        return False
-
-
-def green_checks(case_dir: str, artifact_root: str) -> dict:
+def judge_green_checks(
+    *,
+    gate: dict | None,
+    report: dict | None,
+    index_html_bytes: int | None,
+    report_data_bytes: int | None,
+    exit_code: str | None,
+    card_delivery: dict | None = None,
+) -> dict:
+    """Judge frozen evidence without performing I/O."""
     checks: dict = {}
-    gate = _vm_read_json(f"{case_dir}/gate_result.json")
-    report = _vm_read_json(f"{case_dir}/report_data.json", lines=4000)
-
     # 1) G0-G6 all pass
     gates = (gate or {}).get("gates", gate)
     if isinstance(gates, list):
-        statuses = {g.get("gate"): g.get("status") for g in gates if isinstance(g, dict)}
+        entries = [g for g in gates if isinstance(g, dict)]
+        statuses = {g.get("gate"): g.get("status") for g in entries}
+        gates_unique = len(entries) == len(gates) == len(statuses)
     elif isinstance(gates, dict):
         statuses = {k: (v.get("status") if isinstance(v, dict) else v) for k, v in gates.items()}
+        gates_unique = True
     else:
         statuses = {}
-    g_pass = bool(statuses) and all(str(v).lower() == "pass" for v in statuses.values())
+        gates_unique = False
+    g_pass = gates_unique and set(statuses) == REQUIRED_GATES and all(
+        str(statuses[name]).lower() == "pass" for name in REQUIRED_GATES
+    )
     checks["1_gates_all_pass"] = {"ok": g_pass, "detail": statuses}
 
     summary = (report or {}).get("summary") or {}
@@ -715,7 +203,7 @@ def green_checks(case_dir: str, artifact_root: str) -> dict:
     banner = str(summary.get("ui_banner_title") or "") + str(summary.get("high_confidence_boundary") or "")
     # honesty: hypothesis_ready must NOT be washed to a completed/定责 banner
     honest = True
-    if status == "hypothesis_ready" and re.search(r"已完成|completed|已定责", banner):
+    if status == "hypothesis_ready" and re.search(r"已完成|completed|已定责", banner, re.IGNORECASE):
         honest = False
     checks["2_status_honest"] = {"ok": bool(status_ok and honest), "status": status,
                                  "boundary": summary.get("high_confidence_boundary")}
@@ -723,254 +211,860 @@ def green_checks(case_dir: str, artifact_root: str) -> dict:
     # 3) field lineage: no dropped decoded fields
     fl = (report or {}).get("field_lineage") or {}
     dropped = fl.get("manifest_decoded_dropped")
-    checks["3_manifest_decoded_dropped_empty"] = {"ok": dropped == [], "dropped": dropped,
-                                                  "fidelity_ok": fl.get("fidelity_ok")}
+    checks["3_manifest_decoded_dropped_empty"] = {
+        "ok": dropped == [] and fl.get("fidelity_ok") is True,
+        "dropped": dropped,
+        "fidelity_ok": fl.get("fidelity_ok"),
+    }
 
     # 4) artifacts non-empty + exit0
-    idx = _vm_stat_size(f"{case_dir}/index.html")
-    rd = _vm_stat_size(f"{case_dir}/report_data.json")
-    exit_code = _vm_read_text(f"{artifact_root.rstrip('/')}/exit.code")
-    checks["4_artifacts_exit0"] = {"ok": bool(idx and idx > 0 and rd and rd > 0 and exit_code == "0"),
-                                   "index_html_bytes": idx, "report_data_bytes": rd, "exit_code": exit_code}
+    checks["4_artifacts_exit0"] = {
+        "ok": bool(
+            index_html_bytes
+            and index_html_bytes > 0
+            and report_data_bytes
+            and report_data_bytes > 0
+            and exit_code == "0"
+        ),
+        "index_html_bytes": index_html_bytes,
+        "report_data_bytes": report_data_bytes,
+        "exit_code": exit_code,
+    }
 
-    # 5) card delivery — headless boundary, NOT covered (not pass/fail)
-    checks["5_card_delivery"] = {"ok": None, "note":
-        "NOT-COVERED (headless boundary): direct coordinator dispatch skips gateway "
-        "early-card/relay delivery. Requires A3 real @-mention to verify card terminal."}
+    # 5) Card delivery is only scored when an isolated shared-state fixture is
+    # supplied. Real headless execution keeps the boundary explicit.
+    if card_delivery is None:
+        checks["5_card_delivery"] = {
+            "ok": None,
+            "note": "NOT-COVERED (headless boundary): requires isolated shared-state replay or owner-gated A3 canary.",
+        }
+    else:
+        report_status = str(card_delivery.get("report_status") or "")
+        has_report = card_delivery.get("has_deliverable_report") is True
+        user_state = str(card_delivery.get("user_state") or "")
+        card_ok = (
+            report_status in {"report_ready", "html_delivery_ready", "hypothesis_ready"}
+            and has_report
+            and user_state in {"done", "completed", "review"}
+        )
+        checks["5_card_delivery"] = {
+            "ok": card_ok,
+            "report_status": report_status,
+            "has_deliverable_report": has_report,
+            "user_state": user_state,
+        }
     return checks
 
 
-def _vm_stat_size(path: str) -> int | None:
-    rc, out, _ = _run_vm_py(
-        f"import os,json;p={json.dumps(path)};"
-        "print(json.dumps({'s':os.path.getsize(p) if os.path.exists(p) else None}))")
+def _canonical_isolated_dir(path: Path, isolation_root: Path, *, label: str) -> Path:
+    if not path.is_absolute():
+        raise ValueError(f"{label} must be absolute")
+    resolved = Path(os.path.normpath(str(path)))
+    if resolved != path:
+        raise ValueError(f"{label} must be a canonical real directory")
     try:
-        return json.loads(out).get("s")
-    except Exception:
-        return None
+        relative = resolved.relative_to(isolation_root)
+    except ValueError as exc:
+        raise ValueError(f"{label} escapes isolation root") from exc
+    if relative.parent != Path("."):
+        raise ValueError(f"{label} must be a direct child of isolation root")
+    try:
+        info = resolved.lstat()
+    except OSError as exc:
+        raise ValueError(f"{label} is unavailable") from exc
+    if not stat.S_ISDIR(info.st_mode):
+        raise ValueError(f"{label} must be a canonical real directory")
+    if info.st_uid != os.getuid() or info.st_mode & 0o222:
+        raise ValueError(f"{label} must be user-owned and frozen read-only")
+    return resolved
 
 
-def _vm_read_text(path: str) -> str | None:
-    rc, out, _ = _run_vm_py(
-        f"import os,json;p={json.dumps(path)};"
-        "print(json.dumps({'t':open(p).read().strip() if os.path.exists(p) else None}))")
+def _reject_symlink_components(path: Path, *, label: str) -> None:
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            raise ValueError(f"{label} path component is unavailable: {current}") from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise ValueError(f"{label} cannot contain symlink components: {current}")
+
+
+def validate_fixture_roots(
+    *, isolation_root: Path, case_root: Path, artifact_root: Path, shared_state_root: Path
+) -> tuple[Path, Path, Path, Path]:
+    if not isolation_root.is_absolute():
+        raise ValueError("isolation root must be absolute")
+    lexical = Path(os.path.normpath(str(isolation_root)))
+    if lexical != isolation_root:
+        raise ValueError("isolation root must be lexically canonical")
+    forbidden = (
+        Path.home() / ".hermes",
+        Path.home() / "Mounts",
+        Path("/mnt"),
+        Path("/Volumes"),
+    )
+    for blocked in forbidden:
+        try:
+            lexical.relative_to(blocked)
+        except ValueError:
+            continue
+        raise ValueError(f"isolation root is under forbidden production root: {blocked}")
+    _reject_symlink_components(lexical, label="isolation root")
+    isolation = lexical
     try:
-        return json.loads(out).get("t")
+        isolation_info = isolation.lstat()
+    except OSError as exc:
+        raise ValueError("isolation root is unavailable") from exc
+    if not stat.S_ISDIR(isolation_info.st_mode):
+        raise ValueError("isolation root must be a canonical real directory")
+    if isolation_info.st_uid != os.getuid() or isolation_info.st_mode & 0o222:
+        raise ValueError("isolation root must be user-owned and frozen read-only")
+    for blocked in forbidden:
+        try:
+            isolation.relative_to(blocked)
+        except ValueError:
+            continue
+        raise ValueError(f"isolation root is under forbidden production root: {blocked}")
+    roots = (
+        _canonical_isolated_dir(case_root, isolation, label="case root"),
+        _canonical_isolated_dir(artifact_root, isolation, label="artifact root"),
+        _canonical_isolated_dir(shared_state_root, isolation, label="shared-state root"),
+    )
+    if len(set(roots)) != len(roots):
+        raise ValueError("case/artifact/shared-state roots must be distinct")
+    return isolation, roots[0], roots[1], roots[2]
+
+
+def _open_frozen_directory(
+    path: str | Path, *, label: str, dir_fd: int | None = None
+) -> int:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+    )
+    try:
+        fd = os.open(path, flags, dir_fd=dir_fd)
+    except OSError as exc:
+        raise ValueError(f"{label} cannot be safely opened: {exc}") from exc
+    info = os.fstat(fd)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o222:
+        os.close(fd)
+        raise ValueError(f"{label} must be a user-owned frozen directory")
+    return fd
+
+
+def _open_absolute_directory(
+    path: Path, *, label: str, require_frozen: bool = True
+) -> int:
+    """Open every absolute path component without following symlinks."""
+    if not path.is_absolute() or Path(os.path.normpath(str(path))) != path:
+        raise ValueError(f"{label} must be an absolute canonical path")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+    )
+    fd = os.open(path.anchor, flags)
+    try:
+        for part in path.parts[1:]:
+            next_fd = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode):
+            raise ValueError(f"{label} must be a directory")
+        if require_frozen and (info.st_uid != os.getuid() or info.st_mode & 0o222):
+            raise ValueError(f"{label} must be a user-owned frozen directory")
+        return fd
     except Exception:
-        return None
+        os.close(fd)
+        raise
+
+
+def _directory_identity(fd: int) -> tuple[int, ...]:
+    info = os.fstat(fd)
+    if info.st_mode & 0o222:
+        raise ValueError("fixture directory became writable during verification")
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _assert_path_still_matches_fd(path: Path, fd: int, *, label: str) -> None:
+    try:
+        path_info = path.lstat()
+    except OSError as exc:
+        raise ValueError(f"{label} path was replaced during verification") from exc
+    fd_info = os.fstat(fd)
+    if stat.S_ISLNK(path_info.st_mode) or (
+        path_info.st_dev,
+        path_info.st_ino,
+    ) != (fd_info.st_dev, fd_info.st_ino):
+        raise ValueError(f"{label} path was replaced during verification")
+
+
+def _stat_identity(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_uid,
+        info.st_gid,
+        info.st_nlink,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _read_fixture_entry(
+    dir_fd: int, name: str, *, label: str, max_bytes: int = 16 * 1024 * 1024
+) -> tuple[bytes, tuple[int, ...]]:
+    if not name or Path(name).name != name:
+        raise ValueError(f"fixture entry name is not canonical: {label}")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(name, flags, dir_fd=dir_fd)
+    except OSError as exc:
+        raise ValueError(f"fixture file cannot be safely opened: {label}: {exc}") from exc
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(f"fixture is not a regular file: {label}")
+        if before.st_uid != os.getuid() or before.st_nlink != 1:
+            raise ValueError(f"fixture ownership/hardlink check failed: {label}")
+        if before.st_mode & 0o222:
+            raise ValueError(f"fixture file must be frozen read-only: {label}")
+        if before.st_size > max_bytes:
+            raise ValueError(f"fixture file too large: {label}")
+        data = bytearray()
+        while True:
+            block = os.read(fd, 65536)
+            if not block:
+                break
+            data.extend(block)
+            if len(data) > max_bytes:
+                raise ValueError(f"fixture file too large: {label}")
+        after = os.fstat(fd)
+        identity_before = (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        identity_after = (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if identity_before != identity_after or len(data) != before.st_size:
+            raise ValueError(f"fixture changed while being read: {label}")
+        return bytes(data), identity_after
+    finally:
+        os.close(fd)
+
+
+def _parse_issue_url(issue_url: str) -> tuple[str, str]:
+    parsed = urlsplit(issue_url)
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != "project.feishu.cn"
+        or parsed.query
+        or parsed.fragment
+        or "%" in parsed.path
+    ):
+        raise ValueError("issue URL must be canonical project.feishu.cn HTTPS without query/fragment")
+    parts = parsed.path.split("/")
+    if len(parts) != 5 or parts[0] or parts[2:4] != ["issue", "detail"]:
+        raise ValueError("issue URL path must be /<project>/issue/detail/<work-item>")
+    project_key, work_item = parts[1], parts[4]
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", project_key) or not WORK_ITEM_RE.fullmatch(work_item):
+        raise ValueError("issue URL project/work-item identity is invalid")
+    canonical = f"https://project.feishu.cn/{project_key}/issue/detail/{work_item}"
+    if issue_url != canonical:
+        raise ValueError("issue URL is not canonical")
+    return project_key, work_item
+
+
+def _validate_identity(*, issue_url: str, work_item: str, group_id: str) -> dict:
+    project_key, url_work_item = _parse_issue_url(issue_url)
+    if not WORK_ITEM_RE.fullmatch(work_item) or work_item != url_work_item:
+        raise ValueError("explicit work-item does not match issue URL")
+    if group_id != G1Q3_RCA_GROUP_ID:
+        raise ValueError("group-id does not match the fixed G1Q3-RCA release gate")
+    return {
+        "project_key": project_key,
+        "work_item_id": work_item,
+        "issue_url": issue_url,
+        "group_id": group_id,
+    }
+
+
+def _read_local_routing_policy() -> tuple[bytes, str, bool]:
+    """Read policy bytes stably without importing or executing them."""
+    policy_path = REPO / "gateway" / "pnc_group_binding.py"
+    parent_fd = _open_absolute_directory(
+        policy_path.parent, label="routing policy parent", require_frozen=False
+    )
+    try:
+        parent_identity = _stat_identity(os.fstat(parent_fd))
+        snapshots = []
+        for _pass in range(2):
+            flags = (
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            try:
+                fd = os.open(policy_path.name, flags, dir_fd=parent_fd)
+            except OSError as exc:
+                raise ValueError(f"routing policy cannot be safely opened: {exc}") from exc
+            try:
+                before = os.fstat(fd)
+                if (
+                    not stat.S_ISREG(before.st_mode)
+                    or before.st_uid != os.getuid()
+                    or before.st_nlink != 1
+                    or before.st_size > 1024 * 1024
+                ):
+                    raise ValueError("routing policy ownership/type/link/size is unsafe")
+                source = bytearray()
+                while True:
+                    block = os.read(fd, 65536)
+                    if not block:
+                        break
+                    source.extend(block)
+                    if len(source) > 1024 * 1024:
+                        raise ValueError("routing policy exceeds size limit")
+                after = os.fstat(fd)
+                identity = _stat_identity(after)
+                if identity != _stat_identity(before) or len(source) != before.st_size:
+                    raise ValueError("routing policy changed while being read")
+                snapshots.append((bytes(source), identity))
+            finally:
+                os.close(fd)
+        _assert_path_still_matches_fd(
+            policy_path.parent, parent_fd, label="routing policy parent"
+        )
+        if _stat_identity(os.fstat(parent_fd)) != parent_identity:
+            raise ValueError("routing policy parent changed during verification")
+    finally:
+        os.close(parent_fd)
+    if snapshots[0] != snapshots[1]:
+        raise ValueError("routing policy changed between verification passes")
+    try:
+        final_info = policy_path.lstat()
+    except OSError as exc:
+        raise ValueError("routing policy path was replaced during verification") from exc
+    final_identity = snapshots[1][1]
+    if stat.S_ISLNK(final_info.st_mode) or _stat_identity(final_info) != final_identity:
+        raise ValueError("routing policy path changed or was replaced during verification")
+    source = snapshots[1][0]
+    digest = hashlib.sha256(source).hexdigest()
+    try:
+        parent_info = policy_path.parent.lstat()
+    except OSError as exc:
+        raise ValueError("routing policy parent was replaced during verification") from exc
+    if stat.S_ISLNK(parent_info.st_mode) or _stat_identity(parent_info) != parent_identity:
+        raise ValueError("routing policy parent changed or was replaced during verification")
+    frozen = bool(
+        final_info.st_uid == os.getuid()
+        and final_info.st_nlink == 1
+        and not final_info.st_mode & 0o222
+        and stat.S_ISDIR(parent_info.st_mode)
+        and parent_info.st_uid == os.getuid()
+        and not parent_info.st_mode & 0o222
+    )
+    return source, digest, frozen
+
+
+def _inspect_local_routing_policy() -> dict:
+    """Inspect the policy contract with AST only; never execute candidate code."""
+    source, digest, frozen = _read_local_routing_policy()
+    try:
+        text = source.decode("utf-8")
+        tree = ast.parse(text, filename=str(REPO / "gateway" / "pnc_group_binding.py"))
+    except (UnicodeError, SyntaxError) as exc:
+        raise ValueError("routing policy is not valid UTF-8 Python") from exc
+
+    group_constant = None
+    entrypoint_args: list[str] | None = None
+    unsafe_top_level_expression_lines = [
+        node.lineno
+        for node in tree.body
+        if isinstance(node, ast.Expr)
+        and not isinstance(node.value, ast.Constant)
+    ]
+    for node in tree.body:
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(isinstance(target, ast.Name) and target.id == "G1Q3_RCA_GROUP_ID" for target in targets):
+                try:
+                    group_constant = ast.literal_eval(node.value)
+                except (ValueError, TypeError):
+                    group_constant = None
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "evaluate_pnc_group_request":
+            entrypoint_args = [arg.arg for arg in (*node.args.args, *node.args.kwonlyargs)]
+
+    required_args = {"platform", "chat_id", "text"}
+    return {
+        "routing_policy_sha256": digest,
+        "policy_source_frozen": frozen,
+        "policy_execution_performed": False,
+        "ast_parse_ok": True,
+        "group_constant_matches": group_constant == G1Q3_RCA_GROUP_ID,
+        "entrypoint_signature_matches": (
+            entrypoint_args is not None and required_args.issubset(entrypoint_args)
+        ),
+        "top_level_expression_safe": not unsafe_top_level_expression_lines,
+        "unsafe_top_level_expression_lines": unsafe_top_level_expression_lines,
+        "semantic_route_evaluation_performed": False,
+    }
+
+
+def _validate_fixture_manifest(
+    manifest: dict,
+    *,
+    roots: dict[str, str],
+    evidence: dict[str, bytes],
+) -> dict:
+    required_top = {"schema_version", "identity", "roots", "authorization", "evidence"}
+    if set(manifest) != required_top or manifest.get("schema_version") != FIXTURE_SCHEMA:
+        raise ValueError("fixture manifest schema/top-level fields are invalid")
+    if manifest.get("roots") != roots:
+        raise ValueError("fixture manifest roots do not match opened roots")
+    authorization = manifest.get("authorization")
+    if authorization != {
+        "execution_authorized": False,
+        "dispatch_attempted": False,
+        "approval_receipt_id": None,
+    }:
+        raise ValueError("fixture manifest must explicitly be non-authorizing and non-dispatching")
+    identity = manifest.get("identity")
+    identity_fields = {
+        "release_id",
+        "run_id",
+        "task_slug",
+        "work_item_id",
+        "issue_url",
+        "group_id",
+        "source_commit",
+        "source_tree",
+        "policy_sha256",
+    }
+    if not isinstance(identity, dict) or set(identity) != identity_fields:
+        raise ValueError("fixture identity envelope is incomplete")
+    release_id = identity.get("release_id")
+    run_id = identity.get("run_id")
+    task_slug = identity.get("task_slug")
+    work_item = identity.get("work_item_id")
+    if not isinstance(release_id, str) or not RELEASE_ID_RE.fullmatch(release_id):
+        raise ValueError("fixture release_id is invalid")
+    if not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id):
+        raise ValueError("fixture run_id is invalid")
+    if not isinstance(task_slug, str) or not TASK_SLUG_RE.fullmatch(task_slug):
+        raise ValueError("fixture task_slug is invalid")
+    for field, length in (("source_commit", 40), ("source_tree", 40), ("policy_sha256", 64)):
+        value = identity.get(field)
+        if not isinstance(value, str) or not re.fullmatch(rf"[0-9a-f]{{{length}}}", value):
+            raise ValueError(f"fixture {field} is invalid")
+    bound = _validate_identity(
+        issue_url=str(identity.get("issue_url") or ""),
+        work_item=str(work_item or ""),
+        group_id=str(identity.get("group_id") or ""),
+    )
+    expected_slug = f"g1q3_rca_issue_intake_{work_item}_{run_id}"
+    if task_slug != expected_slug:
+        raise ValueError("fixture task_slug is not bound to work-item and run_id")
+    digests = manifest.get("evidence")
+    if not isinstance(digests, dict) or set(digests) != set(FIXTURE_EVIDENCE):
+        raise ValueError("fixture evidence digest set is incomplete")
+    for logical_path, data in evidence.items():
+        expected = digests.get(logical_path)
+        actual = hashlib.sha256(data).hexdigest()
+        if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+            raise ValueError(f"fixture digest is invalid: {logical_path}")
+        if expected != actual:
+            raise ValueError(f"fixture digest mismatch: {logical_path}")
+    return {
+        "release_id": release_id,
+        "run_id": run_id,
+        "task_slug": task_slug,
+        "source_commit": identity["source_commit"],
+        "source_tree": identity["source_tree"],
+        "policy_sha256": identity["policy_sha256"],
+        **bound,
+    }
+
+
+def _validate_evidence_identity(*, body: dict, identity: dict, label: str) -> None:
+    expected = {field: identity[field] for field in EVIDENCE_IDENTITY_FIELDS}
+    if body.get("fixture_identity") != expected:
+        raise ValueError(f"{label} fixture identity does not match manifest")
+
+
+def _validate_task_card_handoff(*, body: dict, identity: dict) -> None:
+    expected = {
+        "contract_version": "g1q3_rca_group_handoff_v2",
+        "run_id": identity["run_id"],
+        "task_slug": identity["task_slug"],
+        "work_item_id": identity["work_item_id"],
+        "issue_url": identity["issue_url"],
+        "source_group_id": identity["group_id"],
+    }
+    if body.get("fixture_handoff_contract") != expected:
+        raise ValueError("task card handoff identity does not match manifest")
+    task_card = body.get("task_card")
+    expected_card_identity = {
+        "task_id": identity["task_slug"],
+        "run_id": identity["run_id"],
+        "work_item_id": identity["work_item_id"],
+        "issue_url": identity["issue_url"],
+        "chat_id": identity["group_id"],
+    }
+    if not isinstance(task_card, dict) or any(
+        task_card.get(field) != value
+        for field, value in expected_card_identity.items()
+    ):
+        raise ValueError("task card native identity does not match manifest")
+
+
+def fixture_checks(
+    *, isolation_root: Path, case_root: Path, artifact_root: Path, shared_state_root: Path
+) -> dict:
+    isolation_fd = _open_absolute_directory(isolation_root, label="isolation root")
+    fds: dict[str, int] = {"isolation": isolation_fd}
+    paths = {
+        "isolation": isolation_root,
+        "case": case_root,
+        "artifact": artifact_root,
+        "shared_state": shared_state_root,
+    }
+    try:
+        for key, root in (
+            ("case", case_root),
+            ("artifact", artifact_root),
+            ("shared_state", shared_state_root),
+        ):
+            fds[key] = _open_frozen_directory(
+                root.name, label=f"{key} root", dir_fd=isolation_fd
+            )
+        directories_before = {key: _directory_identity(fd) for key, fd in fds.items()}
+        snapshots: list[dict[str, tuple[bytes, tuple[int, ...]]]] = []
+        locations = {
+            "fixture_manifest.json": ("isolation", "fixture_manifest.json"),
+            **FIXTURE_EVIDENCE,
+        }
+        for _pass in range(2):
+            snapshots.append({
+                logical_path: _read_fixture_entry(
+                    fds[root_key], name, label=logical_path
+                )
+                for logical_path, (root_key, name) in locations.items()
+            })
+        directories_after = {key: _directory_identity(fd) for key, fd in fds.items()}
+        if directories_before != directories_after or snapshots[0] != snapshots[1]:
+            raise ValueError("fixture set changed between frozen verification passes")
+        entry_inodes = {
+            (identity[0], identity[1])
+            for _data, identity in snapshots[1].values()
+        }
+        if len(entry_inodes) != len(snapshots[1]):
+            raise ValueError("fixture entries must have distinct file identities")
+        for key, fd in fds.items():
+            _assert_path_still_matches_fd(paths[key], fd, label=f"{key} root")
+        frozen = {key: value[0] for key, value in snapshots[1].items()}
+    finally:
+        for fd in reversed(list(fds.values())):
+            os.close(fd)
+
+    manifest = _decode_json_object(
+        frozen.pop("fixture_manifest.json"), label="fixture manifest"
+    )
+    roots = {
+        "case": case_root.name,
+        "artifact": artifact_root.name,
+        "shared_state": shared_state_root.name,
+    }
+    identity = _validate_fixture_manifest(manifest, roots=roots, evidence=frozen)
+    gate = _decode_json_object(frozen["case/gate_result.json"], label="gate result")
+    report_bytes = frozen["case/report_data.json"]
+    report = _decode_json_object(report_bytes, label="report data")
+    card_body = _decode_json_object(
+        frozen["shared-state/task_card.json"], label="task card"
+    )
+    _validate_evidence_identity(body=gate, identity=identity, label="gate result")
+    _validate_evidence_identity(body=report, identity=identity, label="report data")
+    _validate_evidence_identity(body=card_body, identity=identity, label="task card")
+    _validate_task_card_handoff(body=card_body, identity=identity)
+    task_card = card_body.get("task_card") if isinstance(card_body.get("task_card"), dict) else {}
+    card_delivery = task_card.get("delivery") if isinstance(task_card.get("delivery"), dict) else None
+    if card_delivery is None:
+        card_delivery = (
+            card_body.get("delivery") if isinstance(card_body.get("delivery"), dict) else card_body
+        )
+    checks = judge_green_checks(
+        gate=gate,
+        report=report,
+        index_html_bytes=len(frozen["case/index.html"]),
+        report_data_bytes=len(report_bytes),
+        exit_code=frozen["artifact/exit.code"].decode("utf-8").strip(),
+        card_delivery=card_delivery,
+    )
+    return {
+        "0_fixture_manifest_self_consistent": {
+            "ok": True,
+            **identity,
+            "execution_authorized": False,
+            "dispatch_attempted": False,
+        },
+        "0_external_release_binding": {
+            "ok": False,
+            "external_release_binding_verified": False,
+            "production_ready": False,
+            "l6_gate_passed": False,
+            "cutover_go": False,
+            "reason": "fixture manifest is self-declared; no external release authority was supplied",
+        },
+        **checks,
+    }
+
+
+def no_dispatch_decision(*, issue_url: str, work_item: str, group_id: str) -> dict:
+    identity = _validate_identity(
+        issue_url=issue_url, work_item=work_item, group_id=group_id
+    )
+    policy = _inspect_local_routing_policy()
+    structure_observed = bool(
+        policy["ast_parse_ok"]
+        and policy["group_constant_matches"]
+        and policy["entrypoint_signature_matches"]
+        and policy["top_level_expression_safe"]
+    )
+    frozen_contract_observed = bool(
+        structure_observed and policy["policy_source_frozen"]
+    )
+    return {
+        "ok": False,
+        "offline_check_passed": frozen_contract_observed,
+        "offline_policy_contract_observed": frozen_contract_observed,
+        "policy_structure_observed": structure_observed,
+        "decision": "not_executed",
+        "identity": identity,
+        "handoff_work_item_id": None,
+        "handoff_identity_verified": False,
+        **policy,
+        "execution_authorized": False,
+        "dispatch_attempted": False,
+        "external_release_binding_verified": False,
+        "production_ready": False,
+        "cutover_go": False,
+        "l6_gate_passed": False,
+        "authorization_note": (
+            "Only a frozen AST contract can pass this offline observation; it is not semantic "
+            "routing, handoff, release, or execution authorization"
+        ),
+    }
 
 
 # --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    p = SmokeArgumentParser(
         prog="g1q3_rca_e2e_smoke",
-        description="G1Q3-RCA end-to-end delivery smoke gate (runbook §S5.5 headless back-half).",
+        description="Offline G1Q3-RCA frozen-fixture and no-dispatch release gate.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--hermes-home", default=os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
-    p.add_argument("--issue-url", default=DEFAULT_ISSUE_URL)
-    p.add_argument("--work-item", default=DEFAULT_WORK_ITEM)
-    p.add_argument("--requester", default=DEFAULT_REQUESTER)
-    p.add_argument("--timeout", type=float, default=1200.0, help="max seconds to watch the pipeline")
-    p.add_argument("--json", action="store_true")
-    modes = p.add_mutually_exclusive_group()
-    modes.add_argument("--dry-run", action="store_true",
-                       help="legacy preflight + decision build; queries VM but does not dispatch")
-    modes.add_argument(
-        "--no-dispatch",
-        action="store_true",
-        help="candidate-only local record; no preflight, VM, network, download, Feishu, or dispatch",
-    )
-    p.add_argument("--run-id", help="required candidate isolation namespace for --no-dispatch")
+    modes = p.add_mutually_exclusive_group(required=True)
+    modes.add_argument("--fixture-mode", action="store_true",
+                       help="read only explicitly isolated local fixture roots")
+    modes.add_argument("--no-dispatch", "--dry-run", dest="no_dispatch", action="store_true",
+                       help="routing AST contract only; no code execution, VM access, write, or dispatch")
+    modes.add_argument("--execute", action="store_true",
+                       help="disabled; always returns a machine-readable release blocker")
+    p.add_argument("--hermes-home")
+    p.add_argument("--issue-url")
+    p.add_argument("--work-item")
+    p.add_argument("--requester")
+    p.add_argument("--group-id")
+    p.add_argument("--run-id")
+    p.add_argument("--confirm-execute", help="legacy argument; ignored because execution is disabled")
+    p.add_argument("--isolation-root", type=Path)
     p.add_argument("--case-root", type=Path)
     p.add_argument("--artifact-root", type=Path)
     p.add_argument("--shared-state-root", type=Path)
-    p.add_argument("--output-root", type=Path)
-    p.add_argument("--work-root", type=Path)
-    p.add_argument("--download-root", type=Path)
+    p.add_argument("--timeout", type=float, default=1200.0, help="legacy execute argument; ignored")
+    p.add_argument("--json", action="store_true")
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
-
-    isolation_values = {name: getattr(args, name) for name in NO_DISPATCH_ROOT_FIELDS}
-    if args.no_dispatch:
-        missing = [name for name, value in isolation_values.items() if value is None]
-        if not args.run_id:
-            missing.append("run_id")
-        if missing:
-            result = {
-                "mode": "no-dispatch",
-                "ok": False,
-                "record_only_completed": False,
-                "dispatch_attempted": False,
-                "download_attempted": False,
-                "feishu_contact_attempted": False,
-                "vm_or_ssh_attempted": False,
-                "network_attempted": False,
-                "production_shared_state_write_attempted": False,
-                "gate_decision": "NO_GO",
-                "error": {
-                    "code": "G1Q3_NO_DISPATCH_ROOTS_REQUIRED",
-                    "missing": sorted(missing),
-                },
-            }
-            if args.json:
-                print(json.dumps(result, ensure_ascii=False, indent=2))
-            else:
-                _log(f"NO-DISPATCH BLOCKED: missing {', '.join(sorted(missing))}")
-            return 3
-        try:
-            result = record_no_dispatch(
-                issue_url=args.issue_url,
-                work_item=args.work_item,
-                requester=args.requester,
-                run_id=args.run_id,
-                **isolation_values,
-            )
-        except Exception as exc:
-            result = {
-                "mode": "no-dispatch",
-                "ok": False,
-                "record_only_completed": False,
-                "dispatch_attempted": False,
-                "download_attempted": False,
-                "feishu_contact_attempted": False,
-                "vm_or_ssh_attempted": False,
-                "network_attempted": False,
-                "production_shared_state_write_attempted": False,
-                "gate_decision": "NO_GO",
-                "error": {
-                    "code": "G1Q3_NO_DISPATCH_ISOLATION_FAILED",
-                    "reason": str(exc),
-                    "exception_type": type(exc).__name__,
-                },
-            }
-            if args.json:
-                print(json.dumps(result, ensure_ascii=False, indent=2))
-            else:
-                _log(f"NO-DISPATCH BLOCKED: {type(exc).__name__}: {exc}")
-            return 3
-        if args.json:
-            print(json.dumps(result, ensure_ascii=False, indent=2))
-        else:
-            _log(f"NO-DISPATCH RECORDED: {result['records']['audit']['path']}")
-            _log("NO-GO: dispatch/download/Feishu/VM/production shared-state were not attempted")
-        return 2
-
-    unexpected_isolation = [name for name, value in isolation_values.items() if value is not None]
-    if args.run_id is not None:
-        unexpected_isolation.append("run_id")
-    if unexpected_isolation:
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    try:
+        args = _build_parser().parse_args(raw_argv)
+    except InvalidInvocation as exc:
         result = {
             "mode": "invalid",
-            "ok": False,
-            "gate_decision": "NO_GO",
-            "dispatch_attempted": False,
+            **NON_AUTHORIZING_RESULT,
+            "offline_check_passed": False,
+            "gate_scope": "offline_non_authorizing_only",
             "error": {
-                "code": "G1Q3_ISOLATION_REQUIRES_NO_DISPATCH",
-                "arguments": sorted(unexpected_isolation),
+                "code": "G1Q3_INVALID_INVOCATION",
+                "reason": str(exc),
             },
         }
-        if args.json:
+        if "--json" in raw_argv:
             print(json.dumps(result, ensure_ascii=False, indent=2))
         else:
-            _log("ISOLATION ARGUMENTS REQUIRE --no-dispatch")
+            print(f"g1q3_rca_e2e_smoke: error: {exc}", file=sys.stderr)
         return 3
+    mode = "fixture" if args.fixture_mode else ("no-dispatch" if args.no_dispatch else "execute")
+    result: dict = {
+        "mode": mode,
+        **NON_AUTHORIZING_RESULT,
+        "offline_check_passed": False,
+        "gate_scope": "offline_non_authorizing_only",
+    }
 
-    hermes_home = Path(args.hermes_home)
-    os.environ.setdefault("HERMES_HOME", str(hermes_home))
-    # Load .env so Feishu/quota config matches the live gateway.
-    try:
-        sys.path.insert(0, str(REPO))
-        from hermes_cli.env_loader import load_hermes_dotenv
-        load_hermes_dotenv(project_env=REPO / ".env")
-    except Exception:
-        pass
-
-    result: dict = {"mode": "dry-run" if args.dry_run else "full", "ok": False}
-
-    _log("== preflight ==")
-    pf_ok, pf = preflight(hermes_home)
-    for f in pf:
-        _log(f"  {f}")
-    result["preflight"] = {"ok": pf_ok, "findings": pf}
-    if not pf_ok:
-        _log("PREFLIGHT FAILED -> exit 3 (smoke not attempted)")
-        if args.json:
-            print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 3
-
-    if args.dry_run:
-        # Validate decision + execution_request build without dispatching.
+    if args.fixture_mode:
+        incompatible = sorted(
+            name
+            for name in ("hermes_home", "issue_url", "work_item", "requester", "group_id", "run_id", "confirm_execute")
+            if getattr(args, name) is not None
+        )
+        if incompatible:
+            result["error"] = {
+                "code": "G1Q3_INVALID_INVOCATION",
+                "reason": "fixture mode received incompatible arguments",
+                "arguments": incompatible,
+            }
+            if args.json:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 3
+        roots = (args.isolation_root, args.case_root, args.artifact_root, args.shared_state_root)
+        if any(path is None for path in roots):
+            result["error"] = {
+                "code": "G1Q3_INVALID_INVOCATION",
+                "reason": "fixture mode requires isolation/case/artifact/shared-state roots",
+            }
+            if args.json:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 3
         try:
-            sys.path.insert(0, str(REPO)); sys.path.insert(0, str(REPO / "scripts"))
-            from gateway.config import Platform
-            from gateway.pnc_group_binding import evaluate_pnc_group_request
-            dec = evaluate_pnc_group_request(platform=Platform.FEISHU, chat_id=G1Q3_RCA_GROUP_ID,
-                                             text=f"分析这个问题 {args.issue_url}")
-            ok = dec.decision == "accepted"
-            result["decision"] = {"ok": ok, "decision": dec.decision,
-                                  "work_item": (dec.handoff_contract or {}).get("work_item_id")}
-            result["ok"] = ok
-            _log(f"== dry-run decision: {dec.decision} ==")
+            isolation, case_root, artifact_root, shared_state_root = validate_fixture_roots(
+                isolation_root=args.isolation_root,
+                case_root=args.case_root,
+                artifact_root=args.artifact_root,
+                shared_state_root=args.shared_state_root,
+            )
+            checks = fixture_checks(
+                isolation_root=isolation,
+                case_root=case_root,
+                artifact_root=artifact_root,
+                shared_state_root=shared_state_root,
+            )
+            result["roots"] = {
+                "isolation": str(isolation),
+                "case": str(case_root),
+                "artifact": str(artifact_root),
+                "shared_state": str(shared_state_root),
+            }
+            result["green_checks"] = checks
+            scored = [
+                item.get("ok")
+                for name, item in checks.items()
+                if name != "0_external_release_binding" and item.get("ok") is not None
+            ]
+            result["offline_check_passed"] = bool(scored) and all(scored)
         except Exception as exc:
-            result["decision"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-        if args.json:
-            print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 0 if result["ok"] else 2
-
-    _log("== trigger detached datapipe coordinator ==")
-    try:
-        task_slug, artifact_root, dispatch = trigger(args.issue_url, args.work_item, args.requester)
-    except Exception as exc:
-        _log(f"TRIGGER FAILED: {type(exc).__name__}: {exc}")
-        result["trigger"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-        if args.json:
-            print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 2
-    result["trigger"] = {"ok": bool(dispatch.get("dispatched")), "task_slug": task_slug,
-                         "artifact_root": artifact_root, "followup_task_id": dispatch.get("followup_task_id")}
-    _log(f"  dispatched={dispatch.get('dispatched')} slug={task_slug}")
-    if not dispatch.get("dispatched"):
+            result["error"] = {
+                "code": "G1Q3_INVALID_FIXTURE_EVIDENCE",
+                "reason": str(exc),
+                "exception_type": type(exc).__name__,
+            }
+            if args.json:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 3
         if args.json:
             print(json.dumps(result, ensure_ascii=False, indent=2))
         return 2
 
-    _log(f"== watch pipeline (timeout={args.timeout:.0f}s) ==")
-    done, watch_info = watch(artifact_root, args.timeout)
-    result["watch"] = watch_info
-    if not done:
-        _log(f"PIPELINE DID NOT COMPLETE: {watch_info.get('reason')}")
+    if args.no_dispatch:
+        incompatible = sorted(
+            name
+            for name in ("hermes_home", "requester", "run_id", "confirm_execute")
+            if getattr(args, name) is not None
+        )
+        if any(
+            value is not None
+            for value in (
+                args.isolation_root,
+                args.case_root,
+                args.artifact_root,
+                args.shared_state_root,
+            )
+        ):
+            incompatible.append("fixture_roots")
+        if incompatible:
+            result["error"] = {
+                "code": "G1Q3_INVALID_INVOCATION",
+                "reason": "no-dispatch mode received incompatible arguments",
+                "arguments": sorted(incompatible),
+            }
+            if args.json:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 3
+        if not args.issue_url or not args.work_item or not args.group_id:
+            result["error"] = {
+                "code": "G1Q3_INVALID_INVOCATION",
+                "reason": (
+                    "no-dispatch mode requires explicit --issue-url, --work-item, and --group-id"
+                ),
+            }
+            if args.json:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 3
+        try:
+            result["decision"] = no_dispatch_decision(
+                issue_url=args.issue_url,
+                work_item=args.work_item,
+                group_id=args.group_id,
+            )
+            result["offline_check_passed"] = bool(
+                result["decision"].get("offline_check_passed")
+            )
+        except Exception as exc:
+            result["error"] = {
+                "code": "G1Q3_INVALID_OFFLINE_EVIDENCE",
+                "reason": str(exc),
+                "exception_type": type(exc).__name__,
+            }
+            result["decision"] = {
+                "ok": False,
+                "offline_check_passed": False,
+                "error": result["error"],
+            }
+            if args.json:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 3
         if args.json:
             print(json.dumps(result, ensure_ascii=False, indent=2))
         return 2
 
-    _log("== §S5.5 green checks ==")
-    case_dir = find_case_dir(args.work_item)
-    result["case_dir"] = case_dir
-    if not case_dir:
-        _log("NO CASE_DIR FOUND -> FAIL")
-        if args.json:
-            print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 2
-    checks = green_checks(case_dir, artifact_root)
-    result["green_checks"] = checks
-    for k, v in checks.items():
-        mark = "SKIP" if v.get("ok") is None else ("PASS" if v.get("ok") else "FAIL")
-        _log(f"  [{mark}] {k}: {json.dumps({kk: vv for kk, vv in v.items() if kk != 'ok'}, ensure_ascii=False)[:160]}")
-
-    # PASS = all pass/fail checks (1-4) pass; check 5 is an honest NOT-COVERED note.
-    scored = [v.get("ok") for v in checks.values() if v.get("ok") is not None]
-    ok = bool(scored) and all(scored)
-    result["ok"] = ok
-    _log(f"\n== {'PASS' if ok else 'FAIL'} == (card-delivery NOT covered: headless boundary, needs A3)")
-    if args.json:
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-    return 0 if ok else 2
+    # --execute is a compatibility surface only. It deliberately does not
+    # inspect its arguments, environment, filesystem, VM, or production state.
+    result["blocker"] = execute_blocker()
+    print(json.dumps(result, ensure_ascii=False, indent=2 if args.json else None))
+    return 3
 
 
 if __name__ == "__main__":
