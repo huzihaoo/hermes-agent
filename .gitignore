@@ -42,6 +42,8 @@ run_datagen_sonnet.sh
 source-data/*
 run_datagen_megascience_glm4-6.sh
 data/*
+!tests/gateway/data/
+!tests/gateway/data/pdcl_command_vectors.json
 node_modules/
 browser-use/
 agent-browser/

