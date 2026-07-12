@@ -1649,12 +1649,11 @@ class AutoSetHomeMiddleware(InboundMiddleware):
                 adapter._auto_sethome_done = True  # DM seen — no further upgrades needed
             if _should_set:
                 try:
-                    from hermes_constants import get_hermes_home
+                    from hermes_constants import get_config_path
                     from hermes_cli.config import atomic_config_write
                     import yaml
 
-                    _home = get_hermes_home()
-                    config_path = _home / "config.yaml"
+                    config_path = get_config_path()
                     user_config: dict = {}
                     if config_path.exists():
                         with open(config_path, encoding="utf-8") as f:

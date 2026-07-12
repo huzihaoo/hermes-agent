@@ -196,6 +196,7 @@ _ENV_VAR_NAME_DENYLIST: frozenset[str] = frozenset({
     # NOT a HERMES_* blanket: integration credentials (HERMES_GEMINI_*,
     # HERMES_LANGFUSE_*, HERMES_SPOTIFY_*, ...) ARE allowed.
     "HERMES_HOME", "HERMES_PROFILE", "HERMES_CONFIG", "HERMES_ENV",
+    "HERMES_CONFIG_PATH", "HERMES_ENV_PATH",
 })
 
 
@@ -670,17 +671,13 @@ def get_container_exec_info() -> Optional[dict]:
 # Config paths
 # =============================================================================
 
-# Re-export from hermes_constants — canonical definition lives there.
-from hermes_constants import get_hermes_home  # noqa: F811,E402
+# Re-export from hermes_constants — canonical definitions live there.
+from hermes_constants import (  # noqa: F811,E402
+    get_config_path,
+    get_env_path,
+    get_hermes_home,
+)
 from utils import atomic_replace, fast_safe_load
-
-def get_config_path() -> Path:
-    """Get the main config file path."""
-    return get_hermes_home() / "config.yaml"
-
-def get_env_path() -> Path:
-    """Get the .env file path (for API keys)."""
-    return get_hermes_home() / ".env"
 
 def get_project_root() -> Path:
     """Get the project installation directory."""

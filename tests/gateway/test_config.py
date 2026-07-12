@@ -844,6 +844,28 @@ class TestLoadGatewayConfig:
 
         assert config.default_reset_policy.notify is False
 
+    def test_explicit_config_path_isolated_from_canonical_config(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        candidate_root = tmp_path / "candidate-config"
+        hermes_home.mkdir()
+        candidate_root.mkdir()
+        canonical = hermes_home / "config.yaml"
+        candidate = candidate_root / "config.yaml"
+        canonical.write_text(
+            "session_reset:\n  notify: true\n", encoding="utf-8"
+        )
+        candidate.write_text(
+            "session_reset:\n  notify: false\n", encoding="utf-8"
+        )
+        canonical_before = canonical.read_bytes()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_CONFIG_PATH", str(candidate))
+
+        config = load_gateway_config()
+
+        assert config.default_reset_policy.notify is False
+        assert canonical.read_bytes() == canonical_before
+
     def test_bridges_quoted_false_always_log_local_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()

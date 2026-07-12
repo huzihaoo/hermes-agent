@@ -14,6 +14,8 @@ from hermes_constants import (
     find_node_executable,
     find_node_executable_on_path,
     get_default_hermes_root,
+    get_config_path,
+    get_env_path,
     get_hermes_dir,
     get_hermes_home,
     heal_hermes_managed_node,
@@ -114,6 +116,49 @@ class TestGetHermesHome:
         monkeypatch.setattr(hermes_constants, "_profile_fallback_warned", False)
 
         assert get_hermes_home() == local_appdata / "hermes"
+
+
+class TestVersionedConfigPaths:
+    def test_defaults_remain_under_hermes_home(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "state"))
+        monkeypatch.delenv("HERMES_CONFIG_PATH", raising=False)
+        monkeypatch.delenv("HERMES_ENV_PATH", raising=False)
+
+        assert get_config_path() == tmp_path / "state" / "config.yaml"
+        assert get_env_path() == tmp_path / "state" / ".env"
+
+    def test_overrides_do_not_relocate_durable_state(self, tmp_path, monkeypatch):
+        state_home = tmp_path / "state"
+        config_path = tmp_path / "candidate" / "config.yaml"
+        env_path = tmp_path / "candidate" / ".env"
+        monkeypatch.setenv("HERMES_HOME", str(state_home))
+        monkeypatch.setenv("HERMES_CONFIG_PATH", str(config_path))
+        monkeypatch.setenv("HERMES_ENV_PATH", str(env_path))
+
+        assert get_hermes_home() == state_home
+        assert get_config_path() == config_path
+        assert get_env_path() == env_path
+
+    def test_context_local_profile_wins_over_process_file_bindings(self, tmp_path, monkeypatch):
+        profile = tmp_path / "profiles" / "worker"
+        monkeypatch.setenv("HERMES_CONFIG_PATH", str(tmp_path / "candidate" / "config.yaml"))
+        monkeypatch.setenv("HERMES_ENV_PATH", str(tmp_path / "candidate" / ".env"))
+        token = hermes_constants.set_hermes_home_override(profile)
+        try:
+            assert get_config_path() == profile / "config.yaml"
+            assert get_env_path() == profile / ".env"
+        finally:
+            hermes_constants.reset_hermes_home_override(token)
+
+    @pytest.mark.parametrize(
+        ("name", "getter"),
+        (("HERMES_CONFIG_PATH", get_config_path), ("HERMES_ENV_PATH", get_env_path)),
+    )
+    def test_relative_override_fails_closed(self, monkeypatch, name, getter):
+        monkeypatch.setenv(name, "relative/path")
+
+        with pytest.raises(ValueError, match="must be an absolute path"):
+            getter()
 
 
 class TestHermesManagedNode:

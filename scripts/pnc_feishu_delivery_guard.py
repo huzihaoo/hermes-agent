@@ -23,8 +23,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from gateway.platforms.feishu import FeishuAdapter  # noqa: E402
+from hermes_constants import get_config_path  # noqa: E402
 
-DEFAULT_CONFIG = Path.home() / ".hermes" / "config.yaml"
+DEFAULT_CONFIG = get_config_path()
 
 
 @dataclass(frozen=True)

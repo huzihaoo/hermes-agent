@@ -29,6 +29,11 @@ def build_write_denied_paths(home: str) -> set[str]:
     """Return exact sensitive paths that must never be written."""
     hermes_home = _hermes_home_path()
     hermes_root = _hermes_root_path()
+    try:
+        from hermes_constants import get_env_path
+        active_env = get_env_path()
+    except Exception:
+        active_env = hermes_home / ".env"
     return {
         os.path.realpath(p)
         for p in [
@@ -38,6 +43,8 @@ def build_write_denied_paths(home: str) -> set[str]:
             os.path.join(home, ".ssh", "config"),
             # Active profile .env (or top-level .env when not in profile mode).
             str(hermes_home / ".env"),
+            # A versioned runtime may bind secrets outside HERMES_HOME.
+            str(active_env),
             # Top-level .env, even when running under a profile — overwriting it
             # leaks credentials across every profile that inherits from root (#15981).
             str(hermes_root / ".env"),

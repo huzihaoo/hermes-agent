@@ -69,7 +69,7 @@ Usage:
 import json
 import logging
 
-from hermes_constants import get_hermes_home, display_hermes_home
+from hermes_constants import display_hermes_home, get_env_path, get_hermes_home
 import os
 import re
 from enum import Enum
@@ -156,7 +156,7 @@ def _skill_lookup_path_error(name: str) -> Optional[str]:
 
 def load_env() -> Dict[str, str]:
     """Load profile-scoped environment variables from HERMES_HOME/.env."""
-    env_path = get_hermes_home() / ".env"
+    env_path = get_env_path()
     env_vars: Dict[str, str] = {}
     if not env_path.exists():
         return env_vars

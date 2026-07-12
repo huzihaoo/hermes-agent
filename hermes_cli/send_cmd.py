@@ -234,12 +234,11 @@ def _load_hermes_env() -> None:
         load_dotenv = None  # type: ignore[assignment]
 
     try:
-        from hermes_cli.config import get_hermes_home
-        home = get_hermes_home()
+        from hermes_cli.config import get_config_path, get_env_path
     except Exception:
         return
 
-    env_path = home / ".env"
+    env_path = get_env_path()
     if load_dotenv and env_path.exists():
         try:
             load_dotenv(str(env_path), override=True, encoding="utf-8")
@@ -255,7 +254,7 @@ def _load_hermes_env() -> None:
     # gateway.config.load_gateway_config() sees them. Scalars only; don't
     # override values already in the env.
     import os
-    config_path = home / "config.yaml"
+    config_path = get_config_path()
     if not config_path.exists():
         return
 

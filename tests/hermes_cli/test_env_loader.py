@@ -19,6 +19,30 @@ def test_user_env_overrides_stale_shell_values(tmp_path, monkeypatch):
     assert os.getenv("OPENAI_BASE_URL") == "https://new.example/v1"
 
 
+def test_explicit_env_path_wins_when_caller_passes_hermes_home(tmp_path, monkeypatch):
+    state_home = tmp_path / "state"
+    state_home.mkdir()
+    (state_home / ".env").write_text(
+        "OPENAI_BASE_URL=https://canonical.example/v1\n", encoding="utf-8"
+    )
+    candidate_env = tmp_path / "candidate" / ".env"
+    candidate_env.parent.mkdir()
+    candidate_env.write_text(
+        "OPENAI_BASE_URL=https://candidate.example/v1\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(state_home))
+    monkeypatch.setenv("HERMES_ENV_PATH", str(candidate_env))
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://stale.example/v1")
+
+    loaded = load_hermes_dotenv(hermes_home=state_home)
+
+    assert loaded == [candidate_env]
+    assert os.getenv("OPENAI_BASE_URL") == "https://candidate.example/v1"
+    assert (state_home / ".env").read_text(encoding="utf-8") == (
+        "OPENAI_BASE_URL=https://canonical.example/v1\n"
+    )
+
+
 def test_project_env_overrides_stale_shell_values_when_user_env_missing(tmp_path, monkeypatch):
     home = tmp_path / "hermes"
     project_env = tmp_path / ".env"

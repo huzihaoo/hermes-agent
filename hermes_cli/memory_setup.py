@@ -12,7 +12,7 @@ import sys
 import shlex
 from pathlib import Path
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_env_path, get_hermes_home
 from hermes_cli.secret_prompt import masked_secret_prompt
 
 _CANCELLED = -1
@@ -289,7 +289,7 @@ def cmd_setup(args) -> None:
     if not isinstance(provider_config, dict):
         provider_config = {}
 
-    env_path = get_hermes_home() / ".env"
+    env_path = get_env_path()
     env_writes = {}
 
     if schema:

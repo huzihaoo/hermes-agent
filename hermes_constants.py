@@ -912,11 +912,30 @@ def is_container() -> bool:
 
 
 def get_config_path() -> Path:
-    """Return the path to ``config.yaml`` under HERMES_HOME.
+    """Return the active ``config.yaml`` path.
 
     Replaces the ``get_hermes_home() / "config.yaml"`` pattern repeated
     in 7+ files (skill_utils.py, hermes_logging.py, hermes_time.py, etc.).
+
+    ``HERMES_CONFIG_PATH`` deliberately changes only the configuration file;
+    durable state continues to use ``HERMES_HOME``.  This supports reversible
+    runtime upgrades where a newer binary needs its own config schema while
+    sharing the existing session/state store.  Relative overrides are rejected
+    so launchd and cron cannot resolve the file against different working
+    directories.
     """
+    # A multiplexed profile is a stronger, context-local boundary than a
+    # process-wide default-runtime binding. Never route one profile through
+    # another profile's sealed config file.
+    if get_hermes_home_override():
+        return get_hermes_home() / "config.yaml"
+
+    override = os.environ.get("HERMES_CONFIG_PATH", "").strip()
+    if override:
+        path = Path(override).expanduser()
+        if not path.is_absolute():
+            raise ValueError("HERMES_CONFIG_PATH must be an absolute path")
+        return path
     return get_hermes_home() / "config.yaml"
 
 
@@ -927,7 +946,22 @@ def get_skills_dir() -> Path:
 
 
 def get_env_path() -> Path:
-    """Return the path to the ``.env`` file under HERMES_HOME."""
+    """Return the active Hermes secrets file path.
+
+    ``HERMES_ENV_PATH`` is the secrets-file counterpart to
+    ``HERMES_CONFIG_PATH`` and likewise leaves durable state rooted at
+    ``HERMES_HOME``.  The override must be absolute for deterministic service
+    startup and fail-closed cutover validation.
+    """
+    if get_hermes_home_override():
+        return get_hermes_home() / ".env"
+
+    override = os.environ.get("HERMES_ENV_PATH", "").strip()
+    if override:
+        path = Path(override).expanduser()
+        if not path.is_absolute():
+            raise ValueError("HERMES_ENV_PATH must be an absolute path")
+        return path
     return get_hermes_home() / ".env"
 
 
