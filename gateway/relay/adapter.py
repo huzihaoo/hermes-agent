@@ -26,6 +26,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.relay.descriptor import CapabilityDescriptor
 from gateway.relay.transport import RelayTransport
+from gateway.record_only.runtime import get_record_only_transport
 from gateway.session import SessionSource
 
 logger = logging.getLogger(__name__)
@@ -478,6 +479,29 @@ class RelayAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
+        metadata_with_scope = self._with_scope(chat_id, metadata)
+        try:
+            recorder = get_record_only_transport("gateway.relay.adapter")
+        except Exception as exc:
+            return SendResult(success=False, error=f"record-only configuration refused outbound: {exc}")
+        if recorder is not None:
+            thread_id = metadata_with_scope.get("thread_id") or None
+            result = recorder.record(
+                operation="text_reply" if (reply_to or thread_id) else "text_send",
+                platform=self._platform_by_chat.get(str(chat_id)) or "relay",
+                destination_kind="thread" if thread_id else "chat",
+                destination_id=chat_id,
+                thread_id=thread_id,
+                message_id=reply_to,
+                payload_type="text",
+                payload=content,
+                task_id=metadata_with_scope.get("task_id"),
+                terminal_state=metadata_with_scope.get("terminal_state"),
+                reply_mode="message" if reply_to else ("thread" if thread_id else "none"),
+                caller_dedupe_key=metadata_with_scope.get("dedupe_key"),
+                metadata=metadata_with_scope,
+            )
+            return SendResult(success=True, message_id=result.message_id, raw_response=result)
         if self._transport is None:
             return SendResult(success=False, error="no transport")
         result = await self._transport.send_outbound(
@@ -486,7 +510,7 @@ class RelayAdapter(BasePlatformAdapter):
                 "chat_id": chat_id,
                 "content": content,
                 "reply_to": reply_to,
-                "metadata": self._with_scope(chat_id, metadata),
+                "metadata": metadata_with_scope,
             },
             platform=self._platform_by_chat.get(str(chat_id)),
         )
@@ -517,6 +541,27 @@ class RelayAdapter(BasePlatformAdapter):
         e.g. to post a Discord interaction follow-up as the shared bot without
         the token ever reaching the gateway. See RelayTransport.send_follow_up.
         """
+        follow_up_metadata = dict(metadata or {})
+        follow_up_metadata["capability_kind"] = kind
+        try:
+            recorder = get_record_only_transport("gateway.relay.adapter")
+        except Exception as exc:
+            return SendResult(success=False, error=f"record-only configuration refused outbound: {exc}")
+        if recorder is not None:
+            platform = kind.split(".", 1)[0] if kind and "." in kind else "relay"
+            result = recorder.record(
+                operation="text_send",
+                platform=platform,
+                destination_kind="session",
+                destination_id=session_key,
+                payload_type="text",
+                payload=content,
+                task_id=follow_up_metadata.get("task_id"),
+                terminal_state=follow_up_metadata.get("terminal_state"),
+                caller_dedupe_key=follow_up_metadata.get("dedupe_key"),
+                metadata=follow_up_metadata,
+            )
+            return SendResult(success=True, message_id=result.message_id, raw_response=result)
         if self._transport is None:
             return SendResult(success=False, error="no transport")
         # Phase 1.5: the capability `kind` is platform-prefixed (e.g.
@@ -535,7 +580,7 @@ class RelayAdapter(BasePlatformAdapter):
                 "session_key": session_key,
                 "kind": kind,
                 "content": content,
-                "metadata": metadata or {},
+                "metadata": follow_up_metadata,
             },
             platform=follow_up_platform,
         )

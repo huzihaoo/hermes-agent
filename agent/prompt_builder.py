@@ -1414,6 +1414,32 @@ def _skill_should_show(
     return True
 
 
+MINIMAL_SKILLS_SYSTEM_PROMPT = (
+    "## Skills\n"
+    "Use progressive disclosure for skills. Do not preload a full skill index. "
+    "When a task may need specialized workflow knowledge, call skills_list(category?) "
+    "to discover candidates, then skill_view(name) only for the selected directly "
+    "relevant skill. Avoid loading broad or merely tangential skills because skill "
+    "content consumes the shared context window. If the user asks to configure, set "
+    "up, install, enable, disable, modify, or troubleshoot Hermes Agent itself, load "
+    "the `hermes-agent` skill first with skill_view(name='hermes-agent')."
+)
+
+
+def get_skills_system_prompt_mode() -> str:
+    """Return the configured skill prompt mode without mutating config state."""
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+
+        config = load_config_readonly()
+        return str(
+            cfg_get(config, "skills", "system_prompt_mode", default="full")
+            or "full"
+        ).strip().lower()
+    except Exception:
+        return "full"
+
+
 def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
@@ -1444,6 +1470,11 @@ def build_skills_system_prompt(
 
     if not skills_dir.exists() and not external_dirs:
         return ""
+
+    # The live deployment explicitly opts into a lean prompt. Keep the full
+    # upstream skill index as the default for every other configuration.
+    if get_skills_system_prompt_mode() == "minimal":
+        return MINIMAL_SKILLS_SYSTEM_PROMPT
 
     # ── Layer 1: in-process LRU cache ─────────────────────────────────
     # Include the resolved platform so per-platform disabled-skill lists

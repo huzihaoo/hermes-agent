@@ -6,17 +6,22 @@ Per-tool resolution: pinned > config overrides > registry > default.
 from dataclasses import dataclass, field
 from typing import Dict
 
-# Tools whose thresholds must never be overridden.
-# read_file=inf prevents infinite persist->read->persist loops.
+# Tools whose thresholds are bounded for stable long-running sessions.
 PINNED_THRESHOLDS: Dict[str, float] = {
-    "read_file": float("inf"),
+    "read_file": 80_000,
+    "skill_view": 20_000,
+    "session_search": 20_000,
+    "search_files": 20_000,
+    "terminal": 40_000,
 }
 
 # Defaults matching the current hardcoded values in tool_result_storage.py.
 # Kept here as the single source of truth; tool_result_storage.py imports these.
-DEFAULT_RESULT_SIZE_CHARS: int = 100_000
-DEFAULT_TURN_BUDGET_CHARS: int = 200_000
+DEFAULT_RESULT_SIZE_CHARS: int = 80_000
+DEFAULT_TURN_BUDGET_CHARS: int = 80_000
 DEFAULT_PREVIEW_SIZE_CHARS: int = 1_500
+DEFAULT_HISTORICAL_TOOL_MESSAGE_MAX_CHARS: int = 20_000
+DEFAULT_HISTORICAL_TOOL_PREVIEW_SIZE_CHARS: int = DEFAULT_PREVIEW_SIZE_CHARS
 
 
 @dataclass(frozen=True)
@@ -32,6 +37,8 @@ class BudgetConfig:
     default_result_size: int = DEFAULT_RESULT_SIZE_CHARS
     turn_budget: int = DEFAULT_TURN_BUDGET_CHARS
     preview_size: int = DEFAULT_PREVIEW_SIZE_CHARS
+    historical_tool_message_max_chars: int = DEFAULT_HISTORICAL_TOOL_MESSAGE_MAX_CHARS
+    historical_tool_preview_size_chars: int = DEFAULT_HISTORICAL_TOOL_PREVIEW_SIZE_CHARS
     tool_overrides: Dict[str, int] = field(default_factory=dict)
 
     def resolve_threshold(self, tool_name: str) -> int | float:
@@ -42,9 +49,8 @@ class BudgetConfig:
         The registry per-tool value is capped at ``default_result_size`` so a
         context-scaled budget (small model) actually constrains tools that
         register a large fixed ``max_result_size_chars`` (web/terminal/x_search
-        all register 100K). For the default budget this is a no-op because both
-        equal 100K; for a scaled-down budget it prevents a per-tool registry
-        value from re-inflating the cap past the model's window (#23767).
+        all register 100K). The live default caps those values at 80K; a
+        scaled-down budget can reduce them further for a small model (#23767).
         """
         if tool_name in PINNED_THRESHOLDS:
             return PINNED_THRESHOLDS[tool_name]
@@ -84,9 +90,9 @@ _MIN_TURN_BUDGET_CHARS: int = 16_000
 def budget_for_context_window(context_length: int | None) -> BudgetConfig:
     """Return a BudgetConfig scaled to the active model's context window.
 
-    The fixed defaults (100K result / 200K turn chars) are correct for large
+    The fixed defaults (80K result / 80K turn chars) are correct for large
     (200K+ token) models but blind to small ones: on a 65K-token model a single
-    tool result persisted at the 100K-char threshold, or a 200K-char turn
+    tool result persisted at the fixed threshold, or a full-size turn
     budget (~50K tokens), can by itself approach or exceed the whole window and
     force an oversized request (#23767).
 

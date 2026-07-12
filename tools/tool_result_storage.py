@@ -17,7 +17,8 @@ Defense against context-window overflow operates at three levels:
 
 3. **Per-turn aggregate budget** (enforce_turn_budget): After all tool
    results in a single assistant turn are collected, if the total exceeds
-   MAX_TURN_BUDGET_CHARS (200K), the largest non-persisted results are
+   the configured turn budget (80K in the live overlay), the largest
+   non-persisted results are
    spilled to disk until the aggregate is under budget. This catches cases
    where many medium-sized results combine to overflow context.
 """
@@ -88,6 +89,26 @@ def generate_preview(content: str, max_chars: int = DEFAULT_PREVIEW_SIZE_CHARS) 
     if last_nl > max_chars // 2:
         truncated = truncated[:last_nl + 1]
     return truncated, True
+
+
+def build_historical_tool_compaction_message(
+    content: str,
+    *,
+    preview_chars: int,
+) -> str:
+    """Build a compact provider-bound copy of a historical tool result."""
+    text = str(content or "")
+    limit = max(0, int(preview_chars or 0))
+    if len(text) <= limit:
+        return text
+    omitted = len(text) - limit
+    preview = text[:limit].rstrip()
+    return (
+        preview
+        + "\n\n[Historical tool result compacted for API context: showing first "
+        + f"{limit:,} chars of {len(text):,}; omitted {omitted:,}. "
+        + "Stored transcript retains full content.]"
+    )
 
 
 def _heredoc_marker(content: str) -> str:

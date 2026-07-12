@@ -6,7 +6,6 @@ and the PINNED_THRESHOLDS escape-hatch for read_file.
 """
 
 import dataclasses
-import math
 from unittest.mock import patch
 
 import pytest
@@ -31,10 +30,10 @@ class TestModuleConstants:
     """Verify documented default values haven't drifted."""
 
     def test_default_result_size(self):
-        assert DEFAULT_RESULT_SIZE_CHARS == 100_000
+        assert DEFAULT_RESULT_SIZE_CHARS == 80_000
 
     def test_default_turn_budget(self):
-        assert DEFAULT_TURN_BUDGET_CHARS == 200_000
+        assert DEFAULT_TURN_BUDGET_CHARS == 80_000
 
     def test_default_preview_size(self):
         assert DEFAULT_PREVIEW_SIZE_CHARS == 1_500
@@ -43,9 +42,8 @@ class TestModuleConstants:
 class TestPinnedThresholds:
     """PINNED_THRESHOLDS – tools whose values must never be overridden."""
 
-    def test_read_file_is_inf(self):
-        assert PINNED_THRESHOLDS["read_file"] == float("inf")
-        assert math.isinf(PINNED_THRESHOLDS["read_file"])
+    def test_read_file_is_bounded(self):
+        assert PINNED_THRESHOLDS["read_file"] == 80_000
 
     def test_pinned_is_not_empty(self):
         assert len(PINNED_THRESHOLDS) >= 1
@@ -142,7 +140,7 @@ class TestResolveThreshold:
         """Even if tool_overrides contains read_file, pinned value wins."""
         cfg = BudgetConfig(tool_overrides={"read_file": 1})
         result = cfg.resolve_threshold("read_file")
-        assert result == float("inf")
+        assert result == 80_000
 
     def test_tool_override_wins_over_default(self):
         """tool_overrides should be returned before falling back to registry."""
@@ -171,10 +169,10 @@ class TestResolveThreshold:
             "unknown_tool", default=50_000
         )
 
-    def test_pinned_read_file_returns_inf(self):
-        """Canonical case: read_file must always return inf."""
+    def test_pinned_read_file_returns_live_cap(self):
+        """Large reads remain useful without bypassing context protection."""
         cfg = BudgetConfig()
-        assert cfg.resolve_threshold("read_file") == float("inf")
+        assert cfg.resolve_threshold("read_file") == 80_000
 
     @patch("tools.registry.registry")
     def test_registry_value_capped_at_default(self, mock_registry):
@@ -195,11 +193,11 @@ class TestResolveThreshold:
         assert cfg.resolve_threshold("some_tool") == float("inf")
 
     @patch("tools.registry.registry")
-    def test_default_budget_unchanged_for_100k_tool(self, mock_registry):
-        """Default budget keeps 100K registry tools at 100K (no behavior change)."""
+    def test_default_budget_caps_100k_tool_at_live_limit(self, mock_registry):
+        """The live overlay caps a 100K registry tool at 80K."""
         mock_registry.get_max_result_size.return_value = 100_000
-        cfg = BudgetConfig()  # default_result_size == 100_000
-        assert cfg.resolve_threshold("web_search") == 100_000
+        cfg = BudgetConfig()
+        assert cfg.resolve_threshold("web_search") == 80_000
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +216,7 @@ class TestBudgetForContextWindow:
         assert budget_for_context_window(-5) is DEFAULT_BUDGET
 
     def test_large_model_unchanged(self):
-        """A 200K-token model keeps the historical 100K/200K char defaults."""
+        """A 200K-token model keeps the live 80K/80K char defaults."""
         cfg = budget_for_context_window(200_000)
         assert cfg.default_result_size == DEFAULT_RESULT_SIZE_CHARS
         assert cfg.turn_budget == DEFAULT_TURN_BUDGET_CHARS

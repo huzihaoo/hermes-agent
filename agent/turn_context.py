@@ -38,6 +38,100 @@ from agent.model_metadata import (
 logger = logging.getLogger(__name__)
 
 
+def fallback_safe_preflight_threshold(agent: Any) -> tuple[int, str]:
+    """Return the smallest explicit primary/fallback compression threshold.
+
+    Only fallback entries with an explicit context length participate. This
+    avoids guessing model metadata while ensuring an in-flight request can fit
+    after failover to a smaller configured window.
+    """
+    compressor = agent.context_compressor
+    try:
+        primary_threshold = max(1, int(compressor.threshold_tokens))
+    except (TypeError, ValueError, AttributeError):
+        primary_threshold = 1
+
+    threshold = primary_threshold
+    reason = "primary"
+    try:
+        threshold_percent = float(
+            getattr(compressor, "threshold_percent", 0.75) or 0.75
+        )
+    except (TypeError, ValueError):
+        threshold_percent = 0.75
+
+    compute_threshold = getattr(compressor, "_compute_threshold_tokens", None)
+    for fallback in getattr(agent, "_fallback_chain", None) or []:
+        if not isinstance(fallback, dict):
+            continue
+        try:
+            context_length = int(fallback.get("context_length") or 0)
+        except (TypeError, ValueError):
+            continue
+        if context_length <= 0:
+            continue
+
+        try:
+            max_tokens = int(fallback.get("max_tokens") or 0) or None
+        except (TypeError, ValueError):
+            max_tokens = None
+        try:
+            if callable(compute_threshold):
+                candidate = int(
+                    compute_threshold(
+                        context_length,
+                        threshold_percent,
+                        max_tokens,
+                    )
+                )
+            else:
+                effective_window = max(1, context_length - (max_tokens or 0))
+                candidate = int(effective_window * threshold_percent)
+        except (TypeError, ValueError):
+            continue
+
+        candidate = max(1, candidate)
+        if candidate < threshold:
+            threshold = candidate
+            provider = str(fallback.get("provider") or "?")
+            model = str(fallback.get("model") or "?")
+            reason = f"fallback-safe:{provider}/{model}"
+
+    return threshold, reason
+
+
+def should_defer_preflight(
+    compressor: Any,
+    prompt_tokens: int,
+    threshold_tokens: int,
+) -> bool:
+    """Apply upstream estimate deferral without weakening fallback safety."""
+    primary_threshold = int(getattr(compressor, "threshold_tokens", 0) or 0)
+    if threshold_tokens < primary_threshold and prompt_tokens >= threshold_tokens:
+        return False
+    defer = getattr(
+        compressor,
+        "should_defer_preflight_to_real_usage",
+        lambda _tokens: False,
+    )
+    return bool(defer(prompt_tokens))
+
+
+def should_compress_for_preflight(
+    compressor: Any,
+    prompt_tokens: int,
+    threshold_tokens: int,
+) -> bool:
+    """Ask the upstream compressor at an alternate preflight threshold.
+
+    Shifting the decision token count preserves the compressor's cooldown and
+    anti-thrash policy without mutating its primary-model threshold.
+    """
+    primary_threshold = int(getattr(compressor, "threshold_tokens", 0) or 0)
+    decision_tokens = prompt_tokens + max(0, primary_threshold - threshold_tokens)
+    return bool(compressor.should_compress(decision_tokens))
+
+
 def _compression_made_progress(
     orig_len: int, new_len: int, orig_tokens: int, new_tokens: int
 ) -> bool:
@@ -351,11 +445,14 @@ def build_turn_context(
     # Gate the (expensive) full token estimate behind a cheap pre-check.
     # See ``_should_run_preflight_estimate`` for the OR semantics that fix
     # issue #27405 (a few very large messages slipping past the count gate).
+    _preflight_threshold, _preflight_threshold_reason = (
+        fallback_safe_preflight_threshold(agent)
+    )
     if agent.compression_enabled and _should_run_preflight_estimate(
         messages,
         agent.context_compressor.protect_first_n,
         agent.context_compressor.protect_last_n,
-        agent.context_compressor.threshold_tokens,
+        _preflight_threshold,
     ):
         _preflight_tokens = estimate_request_tokens_rough(
             messages,
@@ -363,12 +460,11 @@ def build_turn_context(
             tools=agent.tools or None,
         )
         _compressor = agent.context_compressor
-        _defer_preflight = getattr(
+        _preflight_deferred = should_defer_preflight(
             _compressor,
-            "should_defer_preflight_to_real_usage",
-            lambda _tokens: False,
+            _preflight_tokens,
+            _preflight_threshold,
         )
-        _preflight_deferred = _defer_preflight(_preflight_tokens)
         # Codex app-server threads are compacted by the codex agent itself;
         # Hermes only initiates compaction in "hermes" mode (#36801).
         _codex_native_auto = (
@@ -401,7 +497,7 @@ def build_turn_context(
                 "Skipping preflight compression: rough estimate ~%s >= %s, "
                 "but last real provider prompt was %s after compression",
                 f"{_preflight_tokens:,}",
-                f"{_compressor.threshold_tokens:,}",
+                f"{_preflight_threshold:,}",
                 f"{_compressor.last_real_prompt_tokens:,}",
             )
         elif _compression_cooldown:
@@ -417,17 +513,24 @@ def build_turn_context(
                 "(mode=%s); Hermes will not start thread compaction here.",
                 getattr(agent, "codex_app_server_auto_compaction", "native"),
             )
-        elif _compressor.should_compress(_preflight_tokens):
+        elif should_compress_for_preflight(
+            _compressor,
+            _preflight_tokens,
+            _preflight_threshold,
+        ):
             logger.info(
-                "Preflight compression: ~%s tokens >= %s threshold (model %s, ctx %s)",
+                "Preflight compression: ~%s tokens >= %s threshold "
+                "(%s; model %s, ctx %s)",
                 f"{_preflight_tokens:,}",
-                f"{_compressor.threshold_tokens:,}",
+                f"{_preflight_threshold:,}",
+                _preflight_threshold_reason,
                 agent.model,
                 f"{_compressor.context_length:,}",
             )
             agent._emit_status(
                 f"📦 Preflight compression: ~{_preflight_tokens:,} tokens "
-                f">= {_compressor.threshold_tokens:,} threshold. "
+                f">= {_preflight_threshold:,} threshold "
+                f"({_preflight_threshold_reason}). "
                 "This may take a moment."
             )
             for _pass in range(3):
@@ -458,7 +561,11 @@ def build_turn_context(
                 agent._last_content_with_tools = None
                 agent._last_content_tools_all_housekeeping = False
                 agent._mute_post_response = False
-                if not _compressor.should_compress(_preflight_tokens):
+                if not should_compress_for_preflight(
+                    _compressor,
+                    _preflight_tokens,
+                    _preflight_threshold,
+                ):
                     break
 
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).

@@ -257,6 +257,23 @@ TOOLSETS = {
         "includes": []
     },
 
+    "pnc_agents": {
+        "description": (
+            "PNC/MCU domain agents on the mini VM: smoke-check user/worktree mapping, "
+            "generate DBC outputs, parse bus data, validate data validity, inspect "
+            "mdrive4 MCAP, and convert MCAP for Foxglove"
+        ),
+        "tools": [
+            "pnc_agents_smoke",
+            "generate_dbc",
+            "parse_bus_data",
+            "validate_data_validity",
+            "open_foxglove",
+            "mdrive4_cli",
+        ],
+        "includes": [],
+    },
+
     "kanban": {
         "description": (
             "Kanban multi-agent coordination — only active when the agent "
@@ -516,6 +533,18 @@ TOOLSETS = {
     "hermes-feishu": {
         "description": "Feishu/Lark bot toolset - enterprise messaging via Feishu/Lark (full access)",
         "tools": _HERMES_CORE_TOOLS + [
+            "pnc_agents_smoke",
+            "generate_dbc",
+            "parse_bus_data",
+            "validate_data_validity",
+            "open_foxglove",
+            "mdrive4_cli",
+            "logsim_replay",
+            "mcap_clean",
+            "mcap_translate",
+            "build_repro",
+            "vm_task_submit",
+            "vm_task_status",
             "feishu_doc_read",
             "feishu_drive_list_comments",
             "feishu_drive_list_comment_replies",

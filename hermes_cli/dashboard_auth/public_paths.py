@@ -53,3 +53,12 @@ PUBLIC_API_PATHS: frozenset[str] = frozenset({
     # 401 no_cookie. The JWT — not this allowlist — is the security boundary.
     "/api/cron/fire",
 })
+
+
+def is_public_task_read(*, method: str, path: str, public: str | None) -> bool:
+    """Allow only explicitly group-scoped, read-only task delivery views."""
+    return (
+        method.upper() in {"GET", "HEAD"}
+        and (path == "/api/tasks" or path.startswith("/api/tasks/"))
+        and public == "1"
+    )

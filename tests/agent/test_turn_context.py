@@ -364,3 +364,34 @@ def test_expired_cooldown_allows_preflight(tmp_path):
     agent._emit_status.assert_called_once()
     agent._compress_context.assert_called()
 
+
+def test_preflight_uses_smaller_explicit_fallback_window(tmp_path):
+    agent = _make_agent_with_cooldown(tmp_path / "state.db", "sess-1")
+    agent._fallback_chain = [
+        {
+            "provider": "backup",
+            "model": "small-model",
+            "context_length": 65_000,
+        }
+    ]
+
+    with patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
+         patch("agent.turn_context.estimate_request_tokens_rough", return_value=70_000):
+        ctx = _build(agent)
+
+    assert isinstance(ctx, TurnContext)
+    assert agent.context_compressor.threshold_tokens == 85_000
+    agent._compress_context.assert_called_once()
+    assert agent._compress_context.call_args.kwargs["approx_tokens"] == 70_000
+
+
+def test_preflight_does_not_guess_missing_fallback_window(tmp_path):
+    agent = _make_agent_with_cooldown(tmp_path / "state.db", "sess-1")
+    agent._fallback_chain = [{"provider": "backup", "model": "unknown-size"}]
+
+    with patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
+         patch("agent.turn_context.estimate_request_tokens_rough", return_value=70_000):
+        ctx = _build(agent)
+
+    assert isinstance(ctx, TurnContext)
+    agent._compress_context.assert_not_called()

@@ -258,6 +258,31 @@ def clear_session(session_key: str) -> int:
     return cancelled
 
 
+def abort_all_pending() -> int:
+    """Resolve and drop EVERY pending clarify across all sessions.
+
+    Called early in gateway shutdown (design
+    gateway-clarify-concurrency-watchdog-fix-20260620, B1) so agent worker
+    threads blocked in ``wait_for_response`` wake within <=1s (the 1s poll
+    slice) and release — otherwise graceful shutdown stalls on them and
+    launchd escalates SIGTERM to SIGKILL, which then triggers a dirty
+    auto-resume/load feedback loop. Same empty-string sentinel as
+    ``clear_session``; idempotent.
+    """
+    with _lock:
+        entries = list(_entries.values())
+        _entries.clear()
+        _session_index.clear()
+    cancelled = 0
+    for entry in entries:
+        if entry is None:
+            continue
+        entry.response = ""
+        entry.event.set()
+        cancelled += 1
+    return cancelled
+
+
 # =========================================================================
 # Config
 # =========================================================================

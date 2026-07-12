@@ -1,0 +1,80 @@
+{
+  "blockers": [
+    "external_outbound_census_not_verified",
+    "unclassified_executable_modes_not_resolved",
+    "runtime_egress_trace_not_complete",
+    "dynamic_import_trace_not_complete",
+    "skill_trace_not_complete",
+    "subprocess_descendant_trace_not_complete",
+    "candidate_integration_not_verified",
+    "deny_network_containment_not_verified",
+    "credential_stripping_not_verified",
+    "trusted_record_key_provisioning_not_verified",
+    "durable_external_ledger_anchor_not_implemented",
+    "record_root_filesystem_semantics_not_attested",
+    "trusted_clock_not_integrated"
+  ],
+  "caller_claims_verified": false,
+  "candidate_execution_authorized": false,
+  "cutover_authorized": false,
+  "external_delivery_attempted": false,
+  "external_delivery_verified": false,
+  "external_outbound_census": {
+    "all_runtime_rows_classified": false,
+    "candidate_execution_authorized": false,
+    "canonical_artifact": {
+      "artifact": "census-v4.json",
+      "schema_version": "hermes_static_outbound_census_v1",
+      "sha256": "d2c17c7b03642074d301259437f17cc879e8adfbd91d07029c2dda775a563e63"
+    },
+    "cutover_authorized": false,
+    "dynamic_import_trace_complete": false,
+    "external_delivery_attempted": false,
+    "external_delivery_verified": false,
+    "gate_decision": "NO_GO",
+    "index": {
+      "artifact": "INDEX.json",
+      "schema_version": "hermes_target_only_evidence_index_v1",
+      "sha256": "b6bcfb3a597da616bec2acc8e57eea18695b0bb20e29446926cf2eb2e3f81914"
+    },
+    "manifest_files": 6171,
+    "pending_rows": 6338,
+    "production_ready": false,
+    "promotion_authorized": false,
+    "record_only_coverage_complete": false,
+    "runtime_egress_trace_complete": false,
+    "runtime_rows": 3612,
+    "scanned_files": 4279,
+    "skill_trace_complete": false,
+    "source_commit": "9de9c25f620ff7f1ce0fd5457d596052d5159596",
+    "source_sha256_manifest_sha256": "8df101b0f85845864b3956266b3c4a07412ad44b4cac05acea9d8a265a4c6dbe",
+    "source_tree": "1624297419fab639f57302244f6bb28b161bd014",
+    "source_tree_manifest_sha256": "320341a68141ee65be7e25463ef27370d83ba2a0f006fafe5c19239ef69c6c0f",
+    "status": "PROVISIONAL_STATIC_OUTBOUND_CENSUS_NO_GO",
+    "subprocess_descendant_trace_complete": false,
+    "superseded": [
+      "census-v1.json",
+      "census-v2.json",
+      "census-v3.json",
+      "census-v3.repro.json"
+    ],
+    "test_rows": 2726,
+    "total_rows": 6338,
+    "unclassified_executable_mode_count": 5,
+    "unclassified_executables": [
+      ".github/pr-screenshots/39327/providers-collapsed.png",
+      ".github/pr-screenshots/39327/providers-expanded.png",
+      ".github/pr-screenshots/39327/tools-collapsed.png",
+      ".github/pr-screenshots/39327/tools-expanded.png",
+      "optional-skills/devops/docker-management/SKILL.md"
+    ],
+    "unverified_rows": 6338
+  },
+  "production_ready": false,
+  "promotion_authorized": false,
+  "provisional_target_only": true,
+  "record_only": true,
+  "record_only_coverage_complete": false,
+  "simulated": true,
+  "success_scope": "record_persisted_not_delivered"
+}

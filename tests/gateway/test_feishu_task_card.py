@@ -1,0 +1,294 @@
+import pytest
+
+import json
+
+from gateway.feishu_task_card import assert_no_forbidden_fragments, render_task_card, render_status_line
+
+
+def _dump(card):
+    import json
+    return json.dumps(card, ensure_ascii=False)
+
+
+def test_render_three_user_states():
+    running = render_task_card({"user_state": "running"})
+    awaiting = render_task_card({"user_state": "awaiting_user", "pending_confirms": [{"id": "c1", "question": "是否继续？", "options": ["继续", "中止"], "resolved": None}]})
+    done = render_task_card({"user_state": "done", "delivery": {"conclusion": "已完成", "artifact_path": "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/t/"}})
+
+    assert "VM 已经接手开始跑了" in _dump(running)
+    assert "是否继续" in _dump(awaiting)
+    assert "继续" in _dump(awaiting)
+    assert "结论：已完成" in _dump(done)
+    assert "//hfs1.minieye.tech/" in _dump(done)
+
+
+def test_empty_delivery_section_is_omitted():
+    card = render_task_card({"user_state": "running", "delivery": {}})
+    assert "交付区" not in _dump(card)
+
+
+def test_forbidden_fragments_raise():
+    with pytest.raises(ValueError):
+        render_task_card({"status_line": "当前判定为 已完成"})
+    with pytest.raises(ValueError):
+        assert_no_forbidden_fragments({"x": "状态同步如下"})
+
+
+def test_template_fills_completed_without_status_override():
+    assert render_status_line({"user_state": "completed", "delivery": {"conclusion": "OK"}}) == "这边已经跑完了，结论给你收好了：OK"
+
+
+def test_all_confirm_option_presets_render_buttons():
+    from gateway.feishu_task_card import CONFIRM_OPTION_PRESETS
+
+    for preset, options in CONFIRM_OPTION_PRESETS.items():
+        card = render_task_card({
+            "task_id": f"task-{preset}",
+            "user_state": "awaiting_user",
+            "pending_confirms": [{"id": "c1", "question": "请选择", "preset": preset, "resolved": None}],
+        })
+        action_blocks = [el for el in card["elements"] if el.get("tag") == "action"]
+        labels = [action["text"]["content"] for action in action_blocks[0]["actions"]]
+        assert labels == options
+        assert all(action["value"]["task_id"] == f"task-{preset}" for action in action_blocks[0]["actions"])
+
+
+def test_g1q3_delivery_section_renders_business_fields():
+    card = render_task_card({
+        "user_state": "done",
+        "status_line": "RCA 报告已生成，候选归因待人工确认。",
+        "delivery": {
+            "conclusion": "RCA 报告已生成",
+            "attribution_status": "hypothesis_ready",
+            "report_status": "html_delivery_ready",
+            "candidate_cause": "触发请求出现但 TTC/gate 风险上下文不足",
+            "responsibility_candidate": "刘培瑞",
+            "artifact_label": "打开 HTML 报告",
+            "artifact_path": "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/t/index.html",
+            "artifact_root": "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/t/",
+            "boundaries": ["需要人工确认候选原因、责任域与证据边界"],
+        },
+        "diagnostics": {
+            "shared_state": "completed",
+            "attribution_status": "hypothesis_ready",
+            "report_status": "html_delivery_ready",
+            "key_decision": "reused_existing_report",
+            "blocker": "无",
+        },
+    })
+    text = _dump(card)
+    assert "归因状态：已有候选归因，待人工确认" in text
+    assert "报告状态：HTML 报告已生成" in text
+    assert "候选原因：触发请求出现但 TTC/gate 风险上下文不足" in text
+    assert "责任候选：刘培瑞" in text
+    assert "HTML 报告路径" in text
+    assert "打开 HTML 报告" not in text
+    assert "index.html" in text
+    assert "**诊断**" in text
+    assert "命中既有报告，已复用" in text
+
+
+def test_delivery_section_does_not_render_html_source():
+    card = render_task_card({
+        "user_state": "done",
+        "delivery": {
+            "conclusion": "<style>.header h1{font-size:15px}</style>",
+            "artifact_path": "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/t/index.html",
+        },
+    })
+    text = _dump(card)
+    assert ".header h1" not in text
+    assert "<style>" not in text
+    assert "已隐藏疑似 HTML/CSS 源码" in text
+
+
+def test_diagnostics_section_is_bottom_and_compact():
+    card = render_task_card({
+        "user_state": "done",
+        "delivery": {"conclusion": "RCA 报告已生成"},
+        "diagnostics": {
+            "shared_state": "completed",
+            "attribution_status": "hypothesis_ready",
+            "report_status": "html_delivery_ready",
+            "key_decision": "reused_existing_report",
+            "blocker": "无",
+            "ignored": "not-rendered",
+        },
+    })
+    diag = card["elements"][-1]["content"]
+    assert diag.startswith("**诊断**")
+    assert diag.count("\n- ") == 5
+    assert "ignored" not in diag
+
+
+def test_render_task_card_backfills_milestones_from_vm_bridge_progress():
+    rendered = render_task_card({
+        "task_id": "task-progress",
+        "user_state": "running",
+        "vm_bridge": {"progress": {"phase": "read_mcap", "message": "读取mcap", "ts": "2026-06-18T12:00:00+00:00"}},
+        "recent_events": [{"phase": "sync_repo", "summary": "同步仓库", "ts": "2026-06-18T11:59:00+00:00"}],
+    })
+    text = json.dumps(rendered, ensure_ascii=False)
+    assert "执行阶段：读取mcap" in text
+    assert "执行阶段：同步仓库" in text
+
+
+def test_milestone_timestamps_render_as_business_datetime_without_iso_offset():
+    rendered = render_task_card({
+        "task_id": "task-timefmt",
+        "user_state": "running",
+        "milestones": [
+            {"ts": "2026-06-23T10:39:42+08:00", "label": "已接单，开始读取飞书问题"},
+            {"ts": "2026-06-23T02:40:21.221264+00:00", "label": "任务状态更新：in_progress"},
+        ],
+    })
+    text = json.dumps(rendered, ensure_ascii=False)
+    assert "2026-06-23 10:39:42 · 已接单" in text
+    assert "2026-06-23 10:40:21 · 任务状态更新：in_progress" in text
+    assert "T10:39:42+08:00" not in text
+    assert ".221264" not in text
+
+
+def test_v10_delivery_three_part_and_cifs_success_rendered():
+    card = render_task_card({
+        "user_state": "done",
+        "delivery": {
+            "conclusion": "已完成",
+            "input_original": "/bad/original.mcap",
+            "input_resolved": "/mnt/minieye/mdrive4/case/original.mcap",
+            "artifact_vm": "/mnt/tmp/task-v10/output/",
+            "artifact_cifs": "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/task-v10/",
+            "cifs_status": "success",
+        },
+    })
+    text = _dump(card)
+    assert "📥 输入：/bad/original.mcap → 实际读取：/mnt/minieye/mdrive4/case/original.mcap" in text
+    assert "📤 产物(VM)：/mnt/tmp/task-v10/output/" in text
+    assert "📦 取件(CIFS)：//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/task-v10/" in text
+    assert "CIFS 状态：成功，可从取件路径获取" in text
+
+
+def test_v10_delivery_cifs_failure_has_remedy_and_missing_fields_explicit():
+    card = render_task_card({
+        "user_state": "done",
+        "delivery": {
+            "conclusion": "已完成",
+            "artifact_vm": "/mnt/tmp/task-v10-fail/",
+            "cifs_status": "failed",
+        },
+    })
+    text = _dump(card)
+    assert "📥 输入：未落地/不适用" not in text
+    assert "📤 产物(VM)：/mnt/tmp/task-v10-fail/" in text
+    assert "📦 取件(CIFS)：未落地/不适用" in text
+    assert "本次未落 CIFS" in text
+    assert "拉取到CIFS" in text
+
+
+def test_g1q3_delivery_section_uses_user_readable_status_and_clean_paths():
+    card = render_task_card({
+        "user_state": "done",
+        "delivery": {
+            "conclusion": "RCA 报告已生成",
+            "attribution_status": "hypothesis_ready",
+            "report_status": "html_delivery_ready",
+            "candidate_cause": "候选因果判断：实际减速度相对 OOI 加速度偏重，建议由 控制 继续核查。；",
+            "input_original": "飞书问题 7026726390 + mdi download event -u abc -s ./",
+            "input_resolved": "mdi download event -u abc -s ./",
+            "artifact_vm": "/mnt/tmp/g1q3/",
+            "artifact_cifs": "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/g1q3/",
+            "cifs_status": "success",
+        },
+        "diagnostics": {"shared_state": "blocked", "attribution_status": "hypothesis_ready", "report_status": "html_delivery_ready"},
+    })
+    text = _dump(card)
+    assert "归因状态：已有候选归因，待人工确认" in text
+    assert "报告状态：HTML 报告已生成" in text
+    assert "候选原因：实际减速度相对 OOI 加速度偏重，建议由控制继续核查" in text
+    assert "候选原因：候选因果判断" not in text
+    assert "。；" not in text
+    assert "📥 输入：飞书问题 7026726390 + mdi download event -u abc -s ./ → 实际读取：mdi download event -u abc -s ./" in text
+    assert "HTML 报告路径" not in text
+    assert "shared-state" not in text
+    assert "html_delivery_ready" not in text
+    assert "hypothesis_ready" not in text
+
+
+def test_http_artifact_keeps_open_html_report_label():
+    card = render_task_card({
+        "user_state": "done",
+        "delivery": {
+            "conclusion": "RCA 报告已生成",
+            "artifact_label": "打开 HTML 报告",
+            "artifact_path": "https://example.invalid/report/index.html",
+        },
+    })
+    text = _dump(card)
+    assert "[打开 HTML 报告](https://example.invalid/report/index.html)" in text
+    assert "HTML 报告路径" not in text
+
+
+def test_http_report_url_is_clickable_open_label_and_cifs_stays_pickup():
+    card = render_task_card({
+        "user_state": "done",
+        "delivery": {
+            "conclusion": "RCA 报告已生成",
+            "artifact_label": "打开 HTML 报告",
+            "artifact_path": "http://192.168.26.174:18081/G1Q3_RCA/cases/7026726390_acc/index.html",
+            "artifact_root": "http://192.168.26.174:18081/G1Q3_RCA/cases/7026726390_acc",
+            "artifact_cifs": "//hfs.minieye.tech/department-perception_test_team/G1Q3_RCA/cases/7026726390_acc",
+            "cifs_status": "success",
+        },
+    })
+    text = _dump(card)
+    assert "[打开 HTML 报告](http://192.168.26.174:18081/G1Q3_RCA/cases/7026726390_acc/index.html)" in text
+    assert "📦 取件(CIFS)：//hfs.minieye.tech/department-perception_test_team/G1Q3_RCA/cases/7026726390_acc" in text
+    assert "HTML 报告路径：http" not in text
+
+
+def test_g1q3_card_prefers_foxglove_and_hides_independent_html_link():
+    foxglove_url = (
+        "https://192.168.21.217/?ds=foxglove-http&ds.mcapPath="
+        "/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases/"
+        "6986500860_fcw_FCW-%E5%90%88%E8%82%A5-%E9%9B%A8%E5%A4%A9/"
+        "6986500860_fcw_FCW-%E5%90%88%E8%82%A5-%E9%9B%A8%E5%A4%A9.viz.mcap"
+    )
+    card = render_task_card({
+        "user_state": "done",
+        "delivery": {
+            "conclusion": "RCA 报告已生成",
+            "report_status": "html_delivery_ready",
+            "artifact_label": "打开 HTML 报告",
+            "artifact_path": "http://192.168.26.174:18081/G1Q3_RCA/cases/6986500860_fcw/index.html",
+            "foxglove_url": foxglove_url,
+            "attribution_causal_text": "目标测速异常 -> ACC 纵向请求波动 -> 减速过重",
+        },
+    })
+
+    text = _dump(card)
+    assert f"[打开 foxglove 可视化]({foxglove_url})" in text
+    assert "[打开 HTML 报告]" not in text
+    assert "http://192.168.26.174:18081/G1Q3_RCA/cases/6986500860_fcw/index.html" not in text
+    assert "归因因果：目标测速异常 -> ACC 纵向请求波动 -> 减速过重" in text
+    assert "@" not in text
+
+
+
+def test_render_task_card_declined_out_of_scope_delivery():
+    card = render_task_card({
+        "task_id": "g1q3-rca-out-of-scope",
+        "user_state": "done",
+        "status_line": "不予自动受理/转人工：问题所属项目未命中 G1Q3 受理范围",
+        "delivery": {
+            "conclusion": "不予自动受理/转人工：问题所属项目未命中 G1Q3 受理范围",
+            "report_status": "out_of_scope",
+            "attribution_status": "not_applicable",
+            "boundaries": ["实际项目=「某非G1项目」"],
+            "human_action_kind": "need_triage",
+        },
+    })
+
+    dumped = json.dumps(card, ensure_ascii=False)
+    assert "不予受理/转人工" in dumped
+    assert "实际项目=「某非G1项目」" in dumped
+    assert "待补齐数据" not in dumped

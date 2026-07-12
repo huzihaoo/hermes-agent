@@ -28,6 +28,52 @@ TOOL_PROGRESS_FLAG = "tool_progress_prompt"
 OPENCLAW_RESIDUE_FLAG = "openclaw_residue_cleanup"
 PROFILE_BUILD_FLAG = "profile_build_offered"
 
+# #20 onboarding: per-chat welcome (shown once per chat under onboarding.seen)
+def feishu_welcome_flag(chat_id: str) -> str:
+    """Per-chat welcome flag so each newly-authorized group is greeted once."""
+    return f"feishu_welcome:{chat_id}"
+
+
+# -------------------------------------------------------------------------
+# #20 onboarding / provisioning content (env-gated; off by default)
+# -------------------------------------------------------------------------
+
+def _flag_on(env_value: str) -> bool:
+    return str(env_value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def unauthorized_group_hint_enabled(env: Mapping[str, str]) -> bool:
+    """Gate for the unauthorized-group hint. Off by default → silent ignore."""
+    return _flag_on(env.get("FEISHU_UNAUTH_GROUP_HINT_ENABLED", ""))
+
+
+def feishu_welcome_enabled(env: Mapping[str, str]) -> bool:
+    """Gate for the new-group welcome. Off by default → no welcome."""
+    return _flag_on(env.get("FEISHU_WELCOME_ENABLED", ""))
+
+
+def unauthorized_group_hint(chat_id: str) -> str:
+    """One-time guidance for an unauthorized group: tells members who to ask and
+    surfaces the chat_id the owner needs to provision."""
+    cid = chat_id or "<unknown>"
+    return (
+        "本群还没有开通 PNC-Agent。\n"
+        f"请联系管理员开通(群 id: `{cid}`),开通后我就能在这里接 G1Q3 RCA 任务。"
+    )
+
+
+def feishu_welcome_card_body() -> str:
+    """Welcome body for a newly-authorized group (markdown). Reuses the #17
+    clarify guidance vocabulary so the entry experience is consistent."""
+    return (
+        "👋 我是 PNC-Agent,这个群已开通 G1Q3 RCA 任务支持。\n\n"
+        "你可以这样找我:\n"
+        "- **查 case 状态** — 发 G1Q3 case 编号(如 `G1Q3-1234`)\n"
+        "- **提交问题分析** — 转发飞书问题卡片 / 粘贴问题链接 / work_item_id\n"
+        "- **证据 / 缺项查询** — 发 case 编号 + 说明要看什么\n\n"
+        "不确定就直接说,我会问清楚再接手。"
+    )
+
 
 # -------------------------------------------------------------------------
 # Hint content
@@ -250,4 +296,9 @@ __all__ = [
     "profile_build_directive",
     "is_seen",
     "mark_seen",
+    "feishu_welcome_flag",
+    "unauthorized_group_hint_enabled",
+    "feishu_welcome_enabled",
+    "unauthorized_group_hint",
+    "feishu_welcome_card_body",
 ]

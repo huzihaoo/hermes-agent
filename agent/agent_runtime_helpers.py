@@ -37,6 +37,11 @@ from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_res
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import STATUS_EXHAUSTED
 from agent.error_classifier import FailoverReason
+from tools.budget_config import DEFAULT_BUDGET
+from tools.tool_result_storage import (
+    PERSISTED_OUTPUT_TAG,
+    build_historical_tool_compaction_message,
+)
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -2584,6 +2589,38 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             "Pre-call sanitizer: removed %d duplicate tool_call_id reference(s)",
             removed_dupes,
         )
+
+    # Bound historical oversized tool output on the provider-bound copy only.
+    # New outputs are already governed by the write-side budget, but sessions
+    # can contain older rows created before that policy existed.
+    compacted_messages: List[Dict[str, Any]] = []
+    max_chars = DEFAULT_BUDGET.historical_tool_message_max_chars
+    preview_chars = min(
+        DEFAULT_BUDGET.historical_tool_preview_size_chars,
+        max_chars,
+    )
+    for msg in messages:
+        content = msg.get("content")
+        if (
+            msg.get("role") == "tool"
+            and isinstance(content, str)
+            and len(content) > max_chars
+            and not content.lstrip().startswith(PERSISTED_OUTPUT_TAG)
+        ):
+            replacement = build_historical_tool_compaction_message(
+                content,
+                preview_chars=preview_chars,
+            )
+            compacted_messages.append({**msg, "content": replacement})
+            _ra().logger.debug(
+                "Pre-call sanitizer: compacted oversized historical tool "
+                "result (%d chars -> %d chars)",
+                len(content),
+                len(replacement),
+            )
+        else:
+            compacted_messages.append(msg)
+    messages = compacted_messages
     return messages
 
 

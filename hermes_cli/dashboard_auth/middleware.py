@@ -31,7 +31,7 @@ from hermes_cli.dashboard_auth.cookies import (
     read_sso_attempt_cookie,
     set_sso_attempt_cookie,
 )
-from hermes_cli.dashboard_auth.public_paths import PUBLIC_API_PATHS
+from hermes_cli.dashboard_auth.public_paths import PUBLIC_API_PATHS, is_public_task_read
 
 _log = logging.getLogger(__name__)
 
@@ -267,7 +267,11 @@ async def gated_auth_middleware(
         return await call_next(request)
 
     path = request.url.path
-    if _path_is_public(path):
+    if _path_is_public(path) or is_public_task_read(
+        method=request.method,
+        path=path,
+        public=request.query_params.get("public"),
+    ):
         return await call_next(request)
 
     at, _rt = read_session_cookies(request)
@@ -458,4 +462,3 @@ def _attempt_refresh(request: Request, *, refresh_token):
         if new_session is not None:
             return new_session, provider.name
     return None
-

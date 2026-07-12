@@ -32,7 +32,12 @@ from agent.conversation_compression import conversation_history_after_compressio
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
-from agent.turn_context import build_turn_context
+from agent.turn_context import (
+    build_turn_context,
+    fallback_safe_preflight_threshold,
+    should_compress_for_preflight,
+    should_defer_preflight,
+)
 from agent.turn_retry_state import TurnRetryState
 from agent.memory_manager import build_memory_context_block
 from agent.message_sanitization import (
@@ -306,6 +311,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     (which constructs a fresh ``AIAgent`` per turn and depends on this
     DB roundtrip).
     """
+    rebuilding_stored_prompt = False
     stored_prompt = None
     stored_state = "missing"
     if conversation_history and agent._session_db:
@@ -328,20 +334,44 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 agent.session_id, exc,
             )
 
-    if stored_prompt and _stored_prompt_matches_runtime(agent, stored_prompt):
+    legacy_full_skills_prompt = False
+    if stored_prompt:
+        try:
+            from agent.prompt_builder import get_skills_system_prompt_mode
+
+            legacy_full_skills_prompt = (
+                get_skills_system_prompt_mode() == "minimal"
+                and "## Skills (mandatory)" in stored_prompt
+                and "<available_skills>" in stored_prompt
+            )
+        except Exception:
+            legacy_full_skills_prompt = False
+
+    runtime_matches = bool(
+        stored_prompt and _stored_prompt_matches_runtime(agent, stored_prompt)
+    )
+    if stored_prompt and runtime_matches and not legacy_full_skills_prompt:
         # Continuing session — reuse the exact system prompt from the
         # previous turn so the Anthropic cache prefix matches.
         agent._cached_system_prompt = stored_prompt
         return
     if stored_prompt:
-        stored_state = "stale_runtime"
-        logger.info(
-            "Stored system prompt for session %s has stale runtime identity; "
-            "rebuilding for model=%s provider=%s.",
-            agent.session_id,
-            getattr(agent, "model", "") or "",
-            getattr(agent, "provider", "") or "",
-        )
+        rebuilding_stored_prompt = True
+        if not runtime_matches:
+            stored_state = "stale_runtime"
+            logger.info(
+                "Stored system prompt for session %s has stale runtime identity; "
+                "rebuilding for model=%s provider=%s.",
+                agent.session_id,
+                getattr(agent, "model", "") or "",
+                getattr(agent, "provider", "") or "",
+            )
+        if legacy_full_skills_prompt:
+            logger.info(
+                "Stored system prompt for session %s contains the legacy full "
+                "skills index; rebuilding for skills.system_prompt_mode=minimal.",
+                agent.session_id,
+            )
 
     if conversation_history and stored_state in ("null", "empty"):
         # Continuing session whose stored prompt is unusable.  The
@@ -360,19 +390,19 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # prompt) — build from scratch.
     agent._cached_system_prompt = agent._build_system_prompt(system_message)
 
-    # Plugin hook: on_session_start — fired once when a brand-new
-    # session is created (not on continuation).  Plugins can use this
-    # to initialise session-scoped state (e.g. warm a memory cache).
-    try:
-        from hermes_cli.plugins import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "on_session_start",
-            session_id=agent.session_id,
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-        )
-    except Exception as exc:
-        logger.warning("on_session_start hook failed: %s", exc)
+    # A continuing session may need a prompt migration, but that is not a new
+    # session and must not replay plugin start side effects.
+    if not rebuilding_stored_prompt:
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "on_session_start",
+                session_id=agent.session_id,
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+            )
+        except Exception as exc:
+            logger.warning("on_session_start hook failed: %s", exc)
 
     # Cold-start credits seed (L3) — fallback for the first-turn path. The TUI/
     # desktop build seeds at session OPEN (see seed_credits_at_session_start in
@@ -998,8 +1028,8 @@ def run_conversation(
         # LLM cooldown + anti-thrash guards (#11529). compression_attempts is a
         # hard per-turn backstop shared with the overflow error handlers.
         _compressor = agent.context_compressor
-        _defer_preflight = getattr(
-            _compressor, "should_defer_preflight_to_real_usage", lambda _t: False
+        _preflight_threshold, _preflight_threshold_reason = (
+            fallback_safe_preflight_threshold(agent)
         )
         _compression_cooldown = getattr(
             _compressor, "get_active_compression_failure_cooldown", lambda: None
@@ -1008,16 +1038,25 @@ def run_conversation(
             agent.compression_enabled
             and len(messages) > 1
             and compression_attempts < 3
-            and not _defer_preflight(request_pressure_tokens)
+            and not should_defer_preflight(
+                _compressor,
+                request_pressure_tokens,
+                _preflight_threshold,
+            )
             and not _compression_cooldown
-            and _compressor.should_compress(request_pressure_tokens)
+            and should_compress_for_preflight(
+                _compressor,
+                request_pressure_tokens,
+                _preflight_threshold,
+            )
         ):
             compression_attempts += 1
             logger.info(
                 "Pre-API compression: ~%s request tokens >= %s threshold "
-                "(context=%s, attempt=%s/3)",
+                "(%s; context=%s, attempt=%s/3)",
                 f"{request_pressure_tokens:,}",
-                f"{int(getattr(_compressor, 'threshold_tokens', 0) or 0):,}",
+                f"{_preflight_threshold:,}",
+                _preflight_threshold_reason,
                 f"{int(getattr(_compressor, 'context_length', 0) or 0):,}"
                 if getattr(_compressor, "context_length", 0) else "unknown",
                 compression_attempts,

@@ -636,6 +636,18 @@ DANGEROUS_PATTERNS = [
     # Gateway protection: never start gateway outside systemd management
     (r'gateway\s+run\b.*(&\s*$|&\s*;|\bdisown\b|\bsetsid\b)', "start gateway outside systemd (use 'systemctl --user restart hermes-gateway')"),
     (r'\bnohup\b.*gateway\s+run\b', "start gateway outside systemd (use 'systemctl --user restart hermes-gateway')"),
+    (
+        r'(?:^|[/\s])ssh-mini-agent\s+(run_bash_json|run_py_json|edit_file)\b',
+        "VM direct execution via ssh-mini-agent write helper",
+    ),
+    (
+        r'(?:^|[/\s])ssh-mini-run\b',
+        "VM direct execution via ssh-mini-run",
+    ),
+    (
+        r'\bssh\b[^\n;]*\bmini@',
+        "VM direct execution via raw SSH",
+    ),
     # Self-termination protection: prevent agent from killing its own process
     (r'\b(pkill|killall)\b.*\b(hermes|gateway|cli\.py)\b', "kill hermes/gateway process (self-termination)"),
     # Self-termination via kill + command substitution (pgrep/pidof).
@@ -1407,6 +1419,9 @@ _pending: dict[str, dict] = {}
 _session_approved: dict[str, set] = {}
 _session_yolo: set[str] = set()
 _permanent_approved: set = set()
+# Retained for the local Feishu timeout-card compatibility surface. Official
+# v0.18.2 resolves waits internally; the Feishu adapter owns card expiry.
+_gateway_timeout_cbs: dict[str, object] = {}
 
 # =========================================================================
 # Blocking gateway approval (mirrors CLI's synchronous input() flow)
@@ -2268,12 +2283,28 @@ def check_dangerous_command(command: str, env_type: str,
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
 
+    approval_mode = _get_approval_mode()
+    pnc_guard, pnc_policy_allowed = _pnc_gateway_permission_guard(
+        command,
+        enabled=(
+            _is_gateway_approval_context()
+            or env_var_enabled("HERMES_EXEC_ASK")
+            or env_var_enabled("HERMES_GATEWAY_SESSION")
+        ),
+        approval_mode=approval_mode,
+    )
+    if pnc_guard is not None:
+        return pnc_guard
+
     # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
     # CLI --yolo remains process-scoped via the env var for local use.
     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
         return {"approved": True, "message": None}
 
     if _command_matches_permanent_allowlist(command):
+        return {"approved": True, "message": None}
+
+    if pnc_policy_allowed:
         return {"approved": True, "message": None}
 
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
@@ -2534,6 +2565,150 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     return {"resolved": resolved, "choice": choice, "reason": entry.reason}
 
 
+def _repo_acl_denial_result(command: str, *, pattern_key: str, description: str) -> dict:
+    result = {
+        "approved": False,
+        "message": "❌ 权限不足，无法执行此操作。",
+        "pattern_key": pattern_key,
+        "description": description,
+    }
+    try:
+        from gateway.session_context import get_session_env
+        from tools.repo_acl_approval import (
+            build_repo_acl_approval_card,
+            create_repo_acl_request_from_command,
+            reserve_repo_acl_approval_outbox,
+        )
+
+        requester_display_name = get_session_env("HERMES_SESSION_USER_NAME")
+        requester_user_id = get_session_env("HERMES_SESSION_USER_ID")
+        if not requester_display_name or not requester_user_id:
+            return result
+        request = create_repo_acl_request_from_command(
+            command,
+            requester_display_name=requester_display_name,
+            requester_user_id=requester_user_id,
+            chat_id=get_session_env("HERMES_SESSION_CHAT_ID"),
+            thread_id=get_session_env("HERMES_SESSION_THREAD_ID"),
+        )
+        if request:
+            card = build_repo_acl_approval_card(request)
+            result.update(
+                {
+                    "status": "repo_acl_approval_pending",
+                    "repo_acl_request": request,
+                    "repo_acl_approval_card": card,
+                    "repo_acl_approval_outbox": reserve_repo_acl_approval_outbox(
+                        request, card
+                    ),
+                }
+            )
+    except Exception as exc:
+        logger.warning("Failed to create repo ACL approval reservation: %s", exc)
+    return result
+
+
+def _pnc_gateway_permission_guard(
+    command: str,
+    *,
+    enabled: bool,
+    approval_mode: str,
+) -> tuple[dict | None, bool]:
+    """Apply the local VM/repository policy before any approval bypass.
+
+    Returns a blocking result plus whether a narrowly classified VM command
+    has already been authorized by the PNC policy. Official hardline, user
+    deny, and Tirith checks remain authoritative.
+    """
+    if not enabled:
+        return None, False
+    policy_surface = bool(
+        re.search(
+            r"(?:ssh-mini(?:-agent|-run)|\bssh\b[^\n;]*\bmini@|"
+            r"\bgit\s+(?:push|reset|clean|branch)\b)",
+            command,
+        )
+    )
+    if not policy_surface:
+        return None, False
+    try:
+        from gateway.session_context import get_session_env
+        from tools.permission_policy import classify_command, get_decision_by_id
+
+        operation = classify_command(command)
+        vm_related = operation.startswith("vm_") or bool(
+            re.search(r"(?:ssh-mini(?:-agent|-run)|\bssh\b[^\n;]*\bmini@)", command)
+        )
+        if not vm_related:
+            return None, False
+
+        user_id = get_session_env("HERMES_SESSION_USER_ID")
+        if not user_id:
+            raise RuntimeError("gateway VM command has no bound user identity")
+        decision = get_decision_by_id(user_id, command)
+        if operation == "vm_repo_unauthorized":
+            return (
+                _repo_acl_denial_result(
+                    command,
+                    pattern_key=operation,
+                    description="VM repository access denied by repo ACL policy",
+                ),
+                False,
+            )
+        if decision == "DENY":
+            return (
+                {
+                    "approved": False,
+                    "message": "❌ 权限不足，无法执行此操作。",
+                    "pattern_key": operation,
+                    "description": "Permission policy denied this command",
+                },
+                False,
+            )
+
+        is_dangerous, _pattern_key, description = detect_dangerous_command(command)
+        yolo_requested = (
+            _YOLO_MODE_FROZEN
+            or is_truthy_value(os.getenv("HERMES_YOLO_MODE", ""))
+            or is_current_session_yolo_enabled()
+            or approval_mode == "off"
+        )
+        direct_surface = operation == "vm_direct_exec" or (
+            is_dangerous
+            and "VM direct execution" in str(description or "")
+            and yolo_requested
+        )
+        if direct_surface and not is_truthy_value(
+            os.getenv("HERMES_VM_DIRECT_EXEC_EMERGENCY", "")
+        ):
+            return (
+                {
+                    "approved": False,
+                    "message": (
+                        "❌ VM 业务执行请走 vm_task_submit / shared-state v2 / VM worker；"
+                        "直连执行需要显式 emergency override。"
+                    ),
+                    "pattern_key": operation,
+                    "description": "VM direct execution requires emergency override",
+                },
+                False,
+            )
+        return None, decision == "ALLOW"
+    except Exception as exc:
+        logger.warning(
+            "PNC permission policy unavailable; denying gateway VM command: %s", exc
+        )
+        return (
+            {
+                "approved": False,
+                "message": "❌ 权限策略不可用，已拒绝访问 VM 仓库。",
+                "pattern_key": "vm_repo_policy_unavailable",
+                "description": "VM repository permission policy unavailable",
+            },
+            False,
+        )
+
+
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
                              has_host_access: bool = False) -> dict:
@@ -2582,9 +2757,19 @@ def check_all_command_guards(command: str, env_type: str,
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
 
+    is_gateway = _is_gateway_approval_context()
+    is_ask = env_var_enabled("HERMES_EXEC_ASK")
+    approval_mode = _get_approval_mode()
+    pnc_guard, pnc_policy_allowed = _pnc_gateway_permission_guard(
+        command,
+        enabled=is_gateway or is_ask or env_var_enabled("HERMES_GATEWAY_SESSION"),
+        approval_mode=approval_mode,
+    )
+    if pnc_guard is not None:
+        return pnc_guard
+
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
-    approval_mode = _get_approval_mode()
     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
         return {"approved": True, "message": None}
 
@@ -2592,8 +2777,6 @@ def check_all_command_guards(command: str, env_type: str,
         return {"approved": True, "message": None}
 
     is_cli = _is_interactive_cli()
-    is_gateway = _is_gateway_approval_context()
-    is_ask = env_var_enabled("HERMES_EXEC_ASK")
 
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
     # flows, we do not block on approvals and we skip external guard work.
@@ -2709,6 +2892,8 @@ def check_all_command_guards(command: str, env_type: str,
 
     # Dangerous command check (detection only, no approval)
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
+    if pnc_policy_allowed:
+        is_dangerous, pattern_key, description = False, None, None
 
     # --- Phase 2: Decide ---
 

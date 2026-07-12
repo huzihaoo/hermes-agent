@@ -931,6 +931,29 @@ def get_env_path() -> Path:
     return get_hermes_home() / ".env"
 
 
+def get_runtime_dir() -> Path:
+    """Return the runtime metadata directory under HERMES_HOME."""
+    return get_hermes_home() / "runtime"
+
+
+def get_live_manifest_path() -> Path:
+    """Return the machine-readable live runtime manifest path."""
+    return get_runtime_dir() / "LIVE_MANIFEST.json"
+
+
+def load_live_manifest() -> dict:
+    """Load the live runtime manifest, returning an empty dict on failure."""
+    manifest_path = get_live_manifest_path()
+    if not manifest_path.exists():
+        return {}
+    try:
+        import json
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 # ─── Network Preferences ─────────────────────────────────────────────────────
 
 

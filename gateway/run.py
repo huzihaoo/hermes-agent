@@ -40,10 +40,11 @@ import tempfile
 import threading
 import time
 import sqlite3
+import subprocess
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Callable, Dict, Optional, Any, List, Union
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
@@ -56,7 +57,7 @@ from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.async_utils import safe_schedule_threadsafe
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
-from hermes_cli.config import cfg_get
+from hermes_cli.config import cfg_get, load_config
 from hermes_cli.fallback_config import get_fallback_chain
 
 # --- Agent cache tuning ---------------------------------------------------
@@ -70,6 +71,15 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
+PNC_FEISHU_BUSINESS_TZ = timezone(timedelta(hours=8))
+
+
+def _pnc_feishu_business_now() -> datetime:
+    return datetime.now(PNC_FEISHU_BUSINESS_TZ)
+
+
+def _pnc_feishu_business_now_iso() -> str:
+    return _pnc_feishu_business_now().isoformat()
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
@@ -1766,6 +1776,19 @@ from gateway.platforms.base import (
     merge_pending_message_event,
     utf16_len,
 )
+from gateway.pnc_issue_context import (
+    fetch_g1q3_issue_context_result as _fetch_g1q3_issue_context_result,
+    resolve_feishu_issue_project_key,
+)
+from gateway.pnc_rca_artifacts import write_vm_tmp_text
+from gateway.pnc_rca_schema import (
+    build_execution_request,
+    issue_context_from_compact_text,
+    validate_issue_context_fields,
+    to_json as rca_schema_to_json,
+)
+from gateway.pnc_rca_state_machine import new_intake_state, transition, write_rca_intake_state
+from gateway.feishu_reply import sanitize_feishu_inbound_text
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     GATEWAY_FATAL_CONFIG_EXIT_CODE,
@@ -1782,6 +1805,1358 @@ from gateway.whatsapp_identity import (
 
 
 logger = logging.getLogger(__name__)
+
+
+
+def _integration_tools_config() -> dict:
+    """Return integration-tools business-line config from runtime/private config."""
+    try:
+        cfg = load_config() or {}
+    except Exception as exc:
+        logger.warning("Integration-tools config load failed: %s", exc)
+        return {}
+    block = cfg_get(cfg, "business_lines", "integration_tools", default={}) or {}
+    return block if isinstance(block, dict) else {}
+
+
+def _integration_tools_intake_chat_ids(config: dict | None = None) -> set[str]:
+    block = config if isinstance(config, dict) else _integration_tools_config()
+    raw_ids: list[Any] = []
+    for key in ("intake_chat_ids", "intake_chat_id", "intake_group_ids", "intake_group_id"):
+        value = block.get(key)
+        if isinstance(value, (list, tuple, set)):
+            raw_ids.extend(value)
+        elif value:
+            raw_ids.append(value)
+    return {str(v).strip() for v in raw_ids if str(v or "").strip()}
+
+
+PNC_ALL_BUSINESS_TEST_GROUP_ID = "oc_16614f4ba25b8c88b69c0b8e9ebc2fb5"
+
+
+def _looks_like_g1q3_rca_request_for_business_routing(text: str) -> bool:
+    body = str(text or "")
+    lower = body.lower()
+    if "g1q3" in lower or "rca" in lower:
+        return True
+    if re.search(r"(?:飞书问题|问题|issue|work[_ -]?item)\s*[:：#]?\s*\d{6,}", body, re.IGNORECASE):
+        return True
+    if re.search(r"\bcase\s+g1q3[-_ ]?\d+", lower):
+        return True
+    return False
+
+
+def _looks_like_integration_tools_request(text: str) -> bool:
+    body = str(text or "").lower()
+    terms = (
+        "logsim", "mcap", "foxglove", "build-repro", "mcap-clean", "mcap-translate",
+        "编译", "回放", "回灌", "清洗", "转换", "ci", "pipeline", "fixed-cli",
+        "mdrive4", "pc_init", "cmake", "dmk",
+    )
+    return any(term in body for term in terms)
+
+
+def _is_integration_tools_intake_source(source: Any) -> bool:
+    return _is_integration_tools_intake_event(source, "")
+
+
+def _is_integration_tools_intake_event(source: Any, text: str) -> bool:
+    if getattr(source, "platform", None) != Platform.FEISHU:
+        return False
+    block = _integration_tools_config()
+    if not bool(block.get("enabled", False)):
+        return False
+    chat_id = str(getattr(source, "chat_id", "") or "").strip()
+    if chat_id not in _integration_tools_intake_chat_ids(block):
+        return False
+    if chat_id == PNC_ALL_BUSINESS_TEST_GROUP_ID:
+        if _looks_like_g1q3_rca_request_for_business_routing(text):
+            return False
+        return _looks_like_integration_tools_request(text)
+    return True
+
+
+def _find_existing_integration_tools_task(source_platform: str, message_id: str) -> dict | None:
+    """Find an existing integration-tools intake task for source_message_id."""
+    msg = str(message_id or "").strip()
+    if not msg:
+        return None
+    state_root = _hermes_home / "runtime" / "shared-state"
+    index_path = state_root / "state" / "index.json"
+    candidates: list[dict] = []
+    try:
+        data = json.loads(index_path.read_text(encoding="utf-8"))
+        tasks = data.get("tasks") if isinstance(data, dict) else []
+        if isinstance(tasks, list):
+            candidates.extend([t for t in tasks if isinstance(t, dict)])
+    except Exception as exc:
+        logger.debug("Integration-tools dedupe index read skipped: %s", exc)
+    if not candidates:
+        tasks_dir = state_root / "tasks"
+        try:
+            for meta_path in tasks_dir.glob("*/meta.json"):
+                try:
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                candidates.append({"task_id": meta.get("task_id") or meta_path.parent.name, "meta": meta})
+        except Exception as exc:
+            logger.debug("Integration-tools dedupe task scan skipped: %s", exc)
+    for task in candidates:
+        meta = task.get("meta") if isinstance(task.get("meta"), dict) else task
+        if not isinstance(meta, dict):
+            continue
+        if str(meta.get("business_line") or "") != "integration_tools":
+            continue
+        if str(meta.get("source_platform") or source_platform or "") != str(source_platform or ""):
+            continue
+        if str(meta.get("source_message_id") or "") != msg:
+            continue
+        task_id = str(task.get("task_id") or meta.get("task_id") or "")
+        if task_id:
+            return {"task_id": task_id, "id": task_id, "meta": meta}
+    return None
+
+
+def _find_integration_tools_task_by_thread(source_platform: str, thread_id: str) -> dict | None:
+    """Find an existing integration-tools task for a Feishu topic/thread anchor."""
+    thread = str(thread_id or "").strip()
+    if not thread:
+        return None
+    state_root = _hermes_home / "runtime" / "shared-state"
+    candidates: list[dict] = []
+    # Prefer direct filesystem scan so newly-created tasks are visible before
+    # snapshot/index refresh. Keep it bounded to integration_tools meta files.
+    try:
+        for meta_path in (state_root / "tasks").glob("*/meta.json"):
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            candidates.append({"task_id": meta.get("task_id") or meta_path.parent.name, "meta": meta})
+    except Exception as exc:
+        logger.debug("Integration-tools thread lookup scan skipped: %s", exc)
+    matches: list[tuple[int, str, str, dict]] = []
+    root_message_id = thread.split("topic:", 1)[1] if thread.startswith("topic:") else thread
+    for task in candidates:
+        meta = task.get("meta") if isinstance(task.get("meta"), dict) else task
+        if not isinstance(meta, dict):
+            continue
+        if str(meta.get("business_line") or "") != "integration_tools":
+            continue
+        if str(meta.get("source_platform") or source_platform or "") != str(source_platform or ""):
+            continue
+        anchors = {
+            str(meta.get("source_thread_id") or ""),
+            str(meta.get("reply_anchor_message_id") or ""),
+            str(meta.get("source_message_id") or ""),
+        }
+        source_message = str(meta.get("source_message_id") or "")
+        if source_message:
+            anchors.add(f"topic:{source_message}")
+        if thread not in anchors:
+            continue
+        task_id = str(task.get("task_id") or meta.get("task_id") or "")
+        if not task_id:
+            continue
+        # Prefer the topic root task over later follow-up tasks, then earliest created_at.
+        priority = 0 if source_message == root_message_id else 1
+        created_at = str(meta.get("created_at") or "")
+        matches.append((priority, created_at, task_id, meta))
+    if not matches:
+        return None
+    _priority, _created_at, task_id, meta = sorted(matches, key=lambda item: (item[0], item[1], item[2]))[0]
+    return {"task_id": task_id, "id": task_id, "meta": meta}
+
+
+def _find_g1q3_rca_task_by_thread(source_platform: str, thread_id: str) -> dict | None:
+    """Find an existing G1Q3-RCA task for a Feishu topic/thread anchor."""
+    thread = str(thread_id or "").strip()
+    if not thread:
+        return None
+    state_root = _hermes_home / "runtime" / "shared-state"
+    candidates: list[dict] = []
+    for root in (_hermes_home / "task-state", state_root / "tasks"):
+        try:
+            if root.name == "tasks":
+                paths = root.glob("*/meta.json")
+            else:
+                paths = root.glob("*.json")
+            for meta_path in paths:
+                try:
+                    body = json.loads(meta_path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                task_id = meta_path.parent.name if meta_path.name == "meta.json" else meta_path.stem
+                candidates.append({"task_id": body.get("task_id") or task_id, "meta": body})
+        except Exception as exc:
+            logger.debug("G1Q3-RCA thread lookup scan skipped for %s: %s", root, exc)
+    root_message_id = thread.split("topic:", 1)[1] if thread.startswith("topic:") else thread
+    matches: list[tuple[str, str, dict]] = []
+    for task in candidates:
+        meta = task.get("meta") if isinstance(task.get("meta"), dict) else task
+        if not isinstance(meta, dict):
+            continue
+        task_id = str(task.get("task_id") or meta.get("task_id") or meta.get("vm_task_id") or "")
+        if "g1q3-rca" not in task_id and "g1q3_rca" not in json.dumps(meta, ensure_ascii=False).lower():
+            continue
+        task_card = meta.get("task_card") if isinstance(meta.get("task_card"), dict) else {}
+        completion_notice = meta.get("completion_notice") if isinstance(meta.get("completion_notice"), dict) else {}
+        source_platform_value = str(
+            meta.get("source_platform")
+            or task_card.get("source_platform")
+            or completion_notice.get("source_platform")
+            or source_platform
+            or ""
+        )
+        if source_platform_value and source_platform and source_platform_value != str(source_platform or ""):
+            continue
+        anchors = {
+            str(meta.get("source_thread_id") or ""),
+            str(meta.get("reply_anchor_message_id") or ""),
+            str(meta.get("source_message_id") or ""),
+            str(task_card.get("thread_id") or ""),
+            str(task_card.get("source_thread_id") or ""),
+            str(task_card.get("message_id") or ""),
+            str(completion_notice.get("thread_id") or ""),
+            str(completion_notice.get("message_id") or ""),
+        }
+        for anchor in list(anchors):
+            if anchor:
+                anchors.add(f"topic:{anchor}")
+                if anchor.startswith("topic:"):
+                    anchors.add(anchor.split("topic:", 1)[1])
+        if thread not in anchors and root_message_id not in anchors:
+            continue
+        work_item_id = ""
+        match = re.search(r"g1q3[-_]rca[-_]issue[-_]intake[-_](\d+)", task_id, re.IGNORECASE)
+        if match:
+            work_item_id = match.group(1)
+        for source in (meta, task_card, completion_notice):
+            if not isinstance(source, dict):
+                continue
+            work_item_id = work_item_id or str(source.get("work_item_id") or source.get("issue_id") or "").strip()
+        case_id = str(meta.get("case_id") or task_card.get("case_id") or completion_notice.get("case_id") or "").strip()
+        state = str(meta.get("current_phase") or completion_notice.get("state") or task_card.get("user_state") or "").strip()
+        updated = str(meta.get("updated_at") or completion_notice.get("generated_at") or task_card.get("last_update_ts") or "")
+        matches.append((updated, task_id, {"task_id": task_id, "id": task_id, "work_item_id": work_item_id, "case_id": case_id, "state": state}))
+    if not matches:
+        return None
+    _updated, _task_id, result = sorted(matches, key=lambda item: (item[0], item[1]), reverse=True)[0]
+    # Authoritative state from the shared-state dispatch meta: the card's
+    # user_state can lag/flap (relay re-asserts it each pass), but the dispatch
+    # `state` is the close-loop truth used by the @originator ping and resume.
+    try:
+        _auth_meta_path = state_root / "tasks" / str(result.get("task_id") or _task_id) / "meta.json"
+        if _auth_meta_path.exists():
+            _auth_state = str(json.loads(_auth_meta_path.read_text(encoding="utf-8")).get("state") or "").strip()
+            if _auth_state:
+                result["state"] = _auth_state
+    except Exception:
+        pass
+    return result
+
+
+_G1Q3_RESUME_STATES = {"blocked", "need_input", "awaiting_user"}
+
+
+def _g1q3_resume_bypasses_dedup(active_thread_case: dict | None) -> bool:
+    """True when an existing g1q3 thread task is waiting on the human.
+
+    A re-trigger in that topic is the originator returning with the data
+    (PDCL field filled), so it must re-run toward closure instead of being
+    rejected by the intake dedup guard.
+    """
+    if not isinstance(active_thread_case, dict):
+        return False
+    return str(active_thread_case.get("state") or "").strip().lower() in _G1Q3_RESUME_STATES
+
+
+def _supersede_g1q3_task(task_id: str, *, reason: str = "superseded_by_resume") -> None:
+    """Best-effort: close out an old blocked g1q3 task when its resume re-runs.
+
+    Keeps the topic from accumulating a stale blocked card alongside the fresh
+    run.  Never raises into the inbound hot path.
+    """
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        return
+    try:
+        state_root = _hermes_home / "runtime" / "shared-state"
+        update_script = state_root / "bin" / "update_task_state.py"
+        if not update_script.exists():
+            return
+        subprocess.run(
+            [
+                sys.executable, str(update_script),
+                "--root", str(state_root),
+                "--task-id", task_id,
+                "--state", "superseded",
+                "--summary", f"g1q3 resume: {reason}",
+                "--status-text", "原阻塞任务已被发起人补数据后的重跑取代。",
+                "--json",
+            ],
+            text=True, capture_output=True, timeout=60,
+        )
+    except Exception as exc:
+        logger.debug("G1Q3 supersede-on-resume failed for %s: %s", task_id, exc)
+
+
+def _latest_long_task_milestone(task_id: str, task_dir: Path) -> str:
+    candidates: list[dict[str, Any]] = []
+    paths = [
+        task_dir / "task_card.json",
+        task_dir / "task-card.json",
+        task_dir / "completion_notice.json",
+        _hermes_home / "runtime" / "task-state" / f"{task_id}.json",
+        _hermes_home / "task-state" / f"{task_id}.json",
+    ]
+    for path in paths:
+        try:
+            if not path.exists():
+                continue
+            loaded = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            continue
+        for source in (loaded, loaded.get("task_card") if isinstance(loaded, dict) else None):
+            if not isinstance(source, dict):
+                continue
+            milestones = source.get("milestones") if isinstance(source.get("milestones"), list) else []
+            for item in milestones:
+                if isinstance(item, dict):
+                    candidates.append(item)
+            vm_bridge = source.get("vm_bridge") if isinstance(source.get("vm_bridge"), dict) else {}
+            progress = vm_bridge.get("progress") if isinstance(vm_bridge.get("progress"), dict) else source.get("progress")
+            if isinstance(progress, dict):
+                msg = str(progress.get("message") or progress.get("summary") or progress.get("phase") or "").strip()
+                if msg:
+                    phase = str(progress.get("phase") or "").strip()
+                    label = f"执行阶段：{phase} — {msg}" if phase and phase not in msg else f"执行阶段：{msg}"
+                    candidates.append({"label": label, "ts": progress.get("ts") or progress.get("updated_at") or ""})
+            events = source.get("recent_events") if isinstance(source.get("recent_events"), list) else []
+            for event in events:
+                if isinstance(event, dict):
+                    msg = str(event.get("summary") or event.get("message") or event.get("event") or "").strip()
+                    if msg:
+                        phase = str(event.get("phase") or "").strip()
+                        label = f"执行阶段：{phase} — {msg}" if phase and phase not in msg else f"执行阶段：{msg}"
+                        candidates.append({"label": label, "ts": event.get("ts") or event.get("created_at") or ""})
+    if not candidates:
+        return ""
+    def rank(item: dict[str, Any]) -> tuple[int, str]:
+        label = str(item.get("label") or "")
+        execution_priority = 1 if any(token in label for token in ("同步", "读取", "运行", "作图", "落地", "完成", "执行阶段")) else 0
+        return (execution_priority, str(item.get("ts") or ""))
+    latest = sorted(candidates, key=rank)[-1]
+    return str(latest.get("label") or "").strip()[:220]
+
+
+def _long_task_status_snapshot(task_id: str) -> dict:
+    """Return a small safe status snapshot for thread-only long-running task replies."""
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        return {}
+    task_dir = _hermes_home / "runtime" / "shared-state" / "tasks" / task_id
+    meta: dict[str, Any] = {}
+    status_text = ""
+    try:
+        meta_path = task_dir / "meta.json"
+        if meta_path.exists():
+            loaded = json.loads(meta_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                meta = loaded
+    except Exception:
+        meta = {}
+    try:
+        status_path = task_dir / "status.md"
+        if status_path.exists():
+            lines = status_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            body = []
+            in_frontmatter = False
+            seen_frontmatter = False
+            for line in lines:
+                if line.strip() == "---" and not seen_frontmatter:
+                    in_frontmatter = True
+                    seen_frontmatter = True
+                    continue
+                if line.strip() == "---" and in_frontmatter:
+                    in_frontmatter = False
+                    continue
+                if not in_frontmatter:
+                    body.append(line)
+            status_text = "\n".join(x for x in body if x.strip()).strip()[:500]
+    except Exception:
+        status_text = ""
+    state = str(meta.get("state") or "").strip()
+    if not state:
+        try:
+            status_path = task_dir / "status.md"
+            for line in status_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                if line.lower().startswith("state:"):
+                    state = line.split(":", 1)[1].strip()
+                    break
+        except Exception:
+            pass
+    try:
+        goal_text = ""
+        goal_path = task_dir / "goal.md"
+        if goal_path.exists():
+            goal_text = goal_path.read_text(encoding="utf-8", errors="replace")[:3000]
+        if (not status_text or "followup_received" in status_text) and goal_text:
+            triage = _classify_mdrive4_intake_request(goal_text, originator=str(meta.get("requester") or meta.get("user_id") or ""))
+            hint = str(triage.get("reply_hint") or "").strip()
+            if hint:
+                status_text = (status_text + " " if status_text else "") + hint
+    except Exception:
+        pass
+    return {
+        "task_id": task_id,
+        "state": state,
+        "status_text": status_text,
+        "latest_milestone": _latest_long_task_milestone(task_id, task_dir),
+        "reply_policy": meta.get("reply_policy"),
+        "broadcast_allowed": meta.get("broadcast_allowed"),
+        "artifact_root_policy": meta.get("artifact_root_policy"),
+    }
+
+
+def _integration_tools_task_status_snapshot(task_id: str) -> dict:
+    """Backward-compatible wrapper for older integration_tools callers/tests."""
+    return _long_task_status_snapshot(task_id)
+
+
+def _format_long_task_status_hint(snapshot: dict) -> str:
+    state = str((snapshot or {}).get("state") or "未知").strip() or "未知"
+    status_text = str((snapshot or {}).get("status_text") or "").strip()
+    milestone = str((snapshot or {}).get("latest_milestone") or "").strip()
+    if len(status_text) > 220:
+        status_text = status_text[:220].rstrip() + "..."
+    bits = [f"当前状态：{state}"]
+    if milestone:
+        bits.append(f"最新进展：{milestone}")
+    if status_text:
+        bits.append(status_text)
+    if len(bits) > 1:
+        return "。".join(bits) + "。"
+    return f"当前状态：{state}。已记录补充，等待继续处理。"
+
+
+def _format_integration_tools_status_hint(snapshot: dict) -> str:
+    """Backward-compatible wrapper for older integration_tools callers/tests."""
+    return _format_long_task_status_hint(snapshot)
+
+
+def _is_long_task_status_nudge(text: str) -> bool:
+    compact = str(text or "").strip().lower().replace(" ", "")
+    if not compact:
+        return False
+    return any(token in compact for token in [
+        "咋不说话", "怎么不说话", "为啥不说话", "没回复", "没有回复", "一直没有回复",
+        "进展", "什么进度", "到哪了", "还没好吗", "ping", "催一下", "催进度",
+    ])
+
+
+def _is_integration_tools_status_nudge(text: str) -> bool:
+    """Backward-compatible wrapper for older integration_tools callers/tests."""
+    return _is_long_task_status_nudge(text)
+
+
+def _load_integration_tools_task_text(task_id: str, filename: str) -> str:
+    try:
+        path = _hermes_home / "runtime" / "shared-state" / "tasks" / str(task_id or "") / filename
+        if path.exists():
+            return path.read_text(encoding="utf-8", errors="replace")[:6000]
+    except Exception:
+        pass
+    return ""
+
+def _extract_original_request_from_goal(goal_text: str) -> str:
+    text = str(goal_text or "")
+    marker = "## 原始请求摘录"
+    if marker in text:
+        return text.split(marker, 1)[1].strip()
+    return text.strip()
+
+def _retriage_integration_tools_followup(task_id: str, followup_text: str, requester: str) -> dict:
+    goal_text = _load_integration_tools_task_text(task_id, "goal.md")
+    original = _extract_original_request_from_goal(goal_text)
+    combined = (original + "\n" + str(followup_text or "")).strip() if original else str(followup_text or "").strip()
+    return _classify_mdrive4_intake_request(combined, originator=requester)
+
+def _append_integration_tools_thread_followup(
+    *,
+    task_id: str,
+    requester: str,
+    source_group_id: str,
+    message_id: str,
+    source_thread_id: str,
+    request_text: str,
+    receipt_dir: str | Path | None = None,
+) -> dict:
+    """Record a thread follow-up against an existing intake task without creating a new task."""
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        return {"success": False, "error": "missing_task_id"}
+    state_root = _hermes_home / "runtime" / "shared-state"
+    append_log = state_root / "bin" / "append_task_log.py"
+    text = (request_text or "").strip().replace("\r\n", "\n")[:4000]
+    if append_log.exists():
+        cmd = [
+            sys.executable, str(append_log),
+            "--root", str(state_root),
+            "--task-id", task_id,
+            "--text", (
+                "integration_tools thread follow-up recorded\n"
+                f"source_message_id: {message_id}\n"
+                f"source_thread_id: {source_thread_id}\n"
+                f"requester: {requester}\n\n"
+                f"{text}"
+            ),
+            "--summary", "Thread follow-up recorded; re-check missing fields on original integration_tools task",
+            "--json",
+        ]
+        try:
+            proc = subprocess.run(cmd, text=True, capture_output=True, timeout=60)
+            if proc.returncode != 0:
+                logger.warning("Integration-tools follow-up append failed: %s", (proc.stderr or proc.stdout or '').strip())
+        except Exception as exc:
+            logger.warning("Integration-tools follow-up append failed: %s", exc)
+    # Close-loop guard: distinguish a status nudge ("why no reply") from real
+    # missing-field/user-data follow-up.  A status nudge must not demote the
+    # original task to need_input; it should only return a status hint.
+    is_status_nudge = _is_long_task_status_nudge(text)
+    followup_triage = None
+    update_script = state_root / "bin" / "update_task_state.py"
+    if update_script.exists() and not is_status_nudge:
+        followup_triage = _retriage_integration_tools_followup(task_id, text, requester)
+        next_state = str((followup_triage or {}).get("status") or "need_input").strip()
+        if next_state not in {"need_input", "intake_checked", "ready_for_eval", "manual_review", "closed", "dispatched"}:
+            next_state = "need_input"
+        missing = ", ".join(str(x) for x in ((followup_triage or {}).get("missing_fields") or []))
+        summary = f"Integration-tools follow-up re-triage: {((followup_triage or {}).get('kind') or 'general')} -> {next_state}"
+        status_text = summary + (f"; missing: {missing}" if missing else "")
+        update_cmd = [
+            sys.executable, str(update_script),
+            "--root", str(state_root),
+            "--task-id", task_id,
+            "--state", next_state,
+            "--summary", summary,
+            "--status-text", status_text,
+            "--json",
+        ]
+        try:
+            proc = subprocess.run(update_cmd, text=True, capture_output=True, timeout=60)
+            if proc.returncode != 0:
+                logger.warning("Integration-tools follow-up state update failed: %s", (proc.stderr or proc.stdout or '').strip())
+        except Exception as exc:
+            logger.warning("Integration-tools follow-up state update failed: %s", exc)
+    try:
+        _append_integration_tools_receipt({
+            "event_type": "integration_tools_thread_followup",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "platform": "feishu",
+            "business_line_ref": "integration_tools",
+            "group_id": str(source_group_id or ""),
+            "requester": str(requester or ""),
+            "message_id": str(message_id or ""),
+            "source_thread_id": str(source_thread_id or ""),
+            "reply_policy": "thread_only",
+            "handoff_success": True,
+            "task_id": task_id,
+            "created_new_task": False,
+            "status_nudge": is_status_nudge,
+            "triage_kind": (followup_triage or {}).get("kind") if isinstance(followup_triage, dict) else None,
+            "triage_status": (followup_triage or {}).get("status") if isinstance(followup_triage, dict) else None,
+        }, receipt_dir)
+    except Exception as receipt_exc:
+        logger.warning("Integration-tools follow-up receipt write failed: %s", receipt_exc)
+    snapshot = _long_task_status_snapshot(task_id)
+    return {
+        "success": True,
+        "task": {"task_id": task_id, "id": task_id},
+        "thread_followup": True,
+        "status_nudge": is_status_nudge,
+        "triage": followup_triage,
+        "status_snapshot": snapshot,
+        "status_hint": _format_long_task_status_hint(snapshot),
+    }
+
+
+def _write_integration_tools_dead_letter(
+    *,
+    receipt_dir: str | Path | None,
+    requester: str,
+    source_group_id: str,
+    message_id: str,
+    source_thread_id: str = "",
+    request_text: str = "",
+    error: str = "",
+) -> str:
+    base = Path(receipt_dir) if receipt_dir is not None else (_hermes_home / "pnc_agent" / "receipts" / "integration_tools")
+    dead_dir = base / "dead-letter"
+    dead_dir.mkdir(parents=True, exist_ok=True)
+    suffix = re.sub(r"[^A-Za-z0-9_-]+", "_", (message_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")))[-48:]
+    path = dead_dir / f"{suffix}.json"
+    record = {
+        "event_type": "integration_tools_intake_dead_letter",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "platform": "feishu",
+        "business_line_ref": "integration_tools",
+        "group_id": str(source_group_id or ""),
+        "requester": str(requester or ""),
+        "message_id": str(message_id or ""),
+        "source_thread_id": str(source_thread_id or ""),
+        "reply_policy": "thread_only",
+        "request_excerpt": (request_text or "").strip().replace("\r\n", "\n")[:2000],
+        "error": str(error or ""),
+        "retry_count": 0,
+    }
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(path)
+    return str(path)
+
+
+def _append_integration_tools_receipt(record: dict, receipt_dir: str | Path | None = None) -> None:
+    if receipt_dir is None:
+        return
+    out_dir = Path(receipt_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"{datetime.now(timezone.utc).date().isoformat()}.jsonl"
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+INTEGRATION_TOOLS_CLOSE_LOOP_POLICY = {
+    "intake_checked_stale_minutes": 10,
+    "intake_checked_escalate_minutes": 120,
+    "need_input_stale_minutes": 30,
+    "allowed_next_states_from_intake_checked": [
+        "need_input",
+        "accepted",
+        "dispatched",
+        "executing",
+        "delivery_receipt_draft_ready",
+        "closed",
+    ],
+    "required_next_action": "dispatch | direct_answer | need_input(thread_only) | close",
+}
+
+
+def _integration_tools_close_loop_reply_line() -> str:
+    return "闭环要求：若信息完整，会在 10 分钟内推进到执行/直接结论；若缺信息，会在原话题补充 need_input。"
+
+
+def _looks_like_mdrive4_clarification_question(raw: str, compact: str) -> bool:
+    """Return True for pure mdrive4/tool clarification questions that should not create intake tasks."""
+    text = str(raw or "").strip()
+    if not text:
+        return False
+    has_question_shape = (
+        text.endswith(("?", "？"))
+        or re.search(r"能.+吗", text) is not None
+        or any(k in compact for k in ["是不是", "有没有", "是什么", "看得到吗"])
+        or "嘛" in text
+    )
+    if not has_question_shape:
+        return False
+    execution_terms = [
+        "清洗", "转换", "转成", "排查", "诊断", "检查", "作图", "画图", "返回", "跑一下", "执行", "处理",
+        "mcap-clean", "mcapclean", "mcap-translate", "mcaptranslate", "/mnt/", ".mcap",
+    ]
+    if any(k in compact for k in execution_terms):
+        return False
+    domain_terms = ["mdrive4", "mdrive4-cli", "mdrive4cli", "mcap", "foxglove", "pnc_specs", "工具", "仓库"]
+    return any(k in compact for k in domain_terms)
+
+
+def _classify_mdrive4_intake_request(text: str, originator: str | None = None) -> dict:
+    """Lightweight deterministic triage for common mdrive4 integration_tools asks.
+
+    When INTEGRATION_TOOLS_TRIAGE_V2_ENABLED is truthy, delegate to the field-first
+    v2 classifier (gateway.integration_tools_intake) which (a) no longer
+    short-circuits to ``general`` just because the literal token ``mdrive4`` is
+    absent, and (b) returns ``extracted_fields`` so downstream clarification does
+    not re-ask. Default OFF -> behaviour is byte-for-byte the legacy v1 below.
+    """
+    if os.environ.get("INTEGRATION_TOOLS_TRIAGE_V2_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}:
+        try:
+            from gateway.integration_tools_intake import classify_integration_tools_intake_v2
+            return classify_integration_tools_intake_v2(
+                text,
+                originator=originator,
+                close_loop_policy=INTEGRATION_TOOLS_CLOSE_LOOP_POLICY,
+            )
+        except Exception:
+            logger.warning("integration_tools triage v2 failed, falling back to v1", exc_info=True)
+    raw = str(text or "")
+    compact = raw.lower().replace(" ", "")
+    originator = str(originator or "").strip()
+    result = {
+        "kind": "general",
+        "status": "intake_checked",
+        "missing_fields": [],
+        "reply_hint": "",
+        "auto_dispatch": None,
+        "close_loop_policy": INTEGRATION_TOOLS_CLOSE_LOOP_POLICY,
+    }
+    if any(k in compact for k in ["参考这个文档", "上手的时候可以参考", "from_copylink规控同学", "文档哈"]):
+        return {
+            "kind": "announcement_reference",
+            "status": "closed",
+            "missing_fields": [],
+            "reply_hint": "识别为群内文档/公告分享，不创建执行任务。",
+            "close_loop_policy": INTEGRATION_TOOLS_CLOSE_LOOP_POLICY,
+        }
+    if _looks_like_mdrive4_clarification_question(raw, compact):
+        return {
+            "kind": "question",
+            "status": "closed",
+            "missing_fields": [],
+            "reply_hint": "这是澄清问句：我会按群内答疑直接回答，不创建执行任务、不进入 intake/超时闭环。",
+            "auto_dispatch": None,
+            "direct_reply": "是，mdrive4 相关问题我会按仓库里的 mdrive4-cli / 受治理工具口径答疑；这条是澄清问句，不创建执行任务、不进入 intake/超时闭环。",
+            "close_loop_policy": INTEGRATION_TOOLS_CLOSE_LOOP_POLICY,
+        }
+    if any(k in compact for k in ["待小助手可以用的时候验证", "待小助手", "验证下"]) and any(k in compact for k in ["mcap", "pnc_specs", "解析"]):
+        missing = ["是否现在执行验证", "输入路径是否可读", "期望验证命令/输出"]
+        return {
+            "kind": "parser_verification_pending",
+            "status": "need_input",
+            "close_loop_policy": INTEGRATION_TOOLS_CLOSE_LOOP_POLICY,
+            "missing_fields": missing,
+            "reply_hint": "需要确认是否现在执行验证、输入路径是否可读、期望验证命令/输出。",
+        }
+    if "mdrive4" not in compact:
+        return result
+    mcap_match = re.search(r"(/mnt/[^\s，。；;]+\.mcap)", raw)
+    has_explicit_owner = bool(re.search(r"owner\s*[:：]\s*\S+", raw, re.IGNORECASE)) or "owner" in compact or "胡子豪" in raw
+    has_owner = has_explicit_owner or bool(originator)
+    has_project = "project" in compact or "项目" in compact or "mdrive4" in compact
+    wants_clean = any(k in compact for k in ["清洗", "mcap-clean", "mcapclean", "clean后", "clean路径"])
+    wants_translate = any(k in compact for k in ["转成foxglove", "foxglove可用", "mcap-translate", "mcaptranslate", "转换foxglove", "可用格式"])
+    wants_diagnostic = any(k in compact for k in ["topic缺失", "缺失topic", "planningtopic", "topicmissing", "utc_tick", "utctick", "dnptick", "dnp tick", "tick流转", "tick", "诊断", "排查", "检查", "解析检查"]) and any(k in compact for k in ["mcap", "topic", "tick", "dnp"])
+    if wants_diagnostic and not (wants_clean or wants_translate):
+        missing = []
+        if not mcap_match:
+            missing.append("mcap/转换产物绝对路径")
+        if not any(k in compact for k in ["topic", "tick", "utc_tick", "utctick", "dnp"]):
+            missing.append("期望检查的 topic 名或 tick 现象")
+        # 发起人即默认验收人；不再因缺显式 owner 阻塞 mcap 诊断请求。
+        return {
+            "kind": "mcap_diagnostic_request",
+            "status": "need_input" if missing else "intake_checked",
+            "missing_fields": missing,
+            "reply_hint": (
+                "识别为 mcap/topic/tick 诊断类请求；已保留原始路径/动作，将按具体 topic/tick 现象继续收口。"
+                if not missing
+                else "识别为 mcap/topic/tick 诊断类请求；请只补齐缺失的路径、topic/tick 现象或验收人，不需要重复已提供的路径和动作。"
+            ),
+            "auto_dispatch": None,
+            "close_loop_policy": INTEGRATION_TOOLS_CLOSE_LOOP_POLICY,
+        }
+    if mcap_match and has_owner and has_project and (wants_clean or wants_translate):
+        cli = "mcap-translate" if wants_translate else "mcap-clean"
+        return {
+            "kind": f"{cli}_execution",
+            "status": "intake_checked",
+            "missing_fields": [],
+            "reply_hint": f"识别为 {cli} 执行请求，输入/owner/project 已具备；将自动派发受治理 fixed-CLI。",
+            "auto_dispatch": {
+                "cli": cli,
+                "input": mcap_match.group(1).rstrip("。；;，,"),
+                "project": "mdrive4",
+            },
+            "close_loop_policy": INTEGRATION_TOOLS_CLOSE_LOOP_POLICY,
+        }
+    if any(k in compact for k in ["产物", "drs", "artifact", "拉取"]):
+        missing = ["issue_ref/DRS ticket/clip ref", "software_version/build", "产物类型", "用途", "是否已有 PDCL/DRS/MDI 授权"]
+        return {
+            "kind": "mdrive4_artifact_pull",
+            "status": "need_input",
+            "close_loop_policy": INTEGRATION_TOOLS_CLOSE_LOOP_POLICY,
+            "missing_fields": missing,
+            "reply_hint": "需要补充 issue_ref/DRS ticket、版本、产物类型、用途和授权情况；未授权时只能先做离线 plan。",
+        }
+    if any(k in compact for k in ["飞书问题", "问题清单", "问题整理", "项目规划组"]):
+        missing = ["飞书项目/问题清单链接或项目 key", "筛选范围", "期望输出字段", "排序方式"]
+        return {
+            "kind": "mdrive4_feishu_issue_list",
+            "status": "need_input",
+            "close_loop_policy": INTEGRATION_TOOLS_CLOSE_LOOP_POLICY,
+            "missing_fields": missing,
+            "reply_hint": "需要先补充飞书项目/问题清单链接、筛选范围、输出字段和排序方式。",
+        }
+    if any(k in compact for k in ["decision_and_planning", "decisionandplanning", "编译", "build", "快速上手", "开发"]):
+        missing = ["目标分支/commit", "编译目标范围", "运行环境", "期望输出", "是否允许 VM 实际编译"]
+        return {
+            "kind": "mdrive4_decision_and_planning_build",
+            "status": "need_input",
+            "close_loop_policy": INTEGRATION_TOOLS_CLOSE_LOOP_POLICY,
+            "missing_fields": missing,
+            "reply_hint": "这是代码/模块类任务，需要补充分支、编译目标、环境、输出形式和是否允许 VM 编译；命令必须先按 VM 事实源核对。",
+        }
+    return result
+
+
+def _mark_integration_tools_triage(
+    *,
+    task_id: str,
+    triage: dict,
+    receipt_dir: str | Path | None = None,
+) -> None:
+    task_id = str(task_id or "").strip()
+    status = str((triage or {}).get("status") or "").strip()
+    if not task_id or status not in {"need_input", "intake_checked", "ready_for_eval", "manual_review", "closed", "dispatched"}:
+        return
+    state_root = _hermes_home / "runtime" / "shared-state"
+    update_script = state_root / "bin" / "update_task_state.py"
+    if not update_script.exists():
+        return
+    kind = str((triage or {}).get("kind") or "general")
+    missing = ", ".join(str(x) for x in ((triage or {}).get("missing_fields") or []))
+    summary = f"integration_tools auto triage: {kind} -> {status}"
+    status_text = summary + (f"; missing: {missing}" if missing else "")
+    cmd = [
+        sys.executable, str(update_script),
+        "--root", str(state_root),
+        "--task-id", task_id,
+        "--state", status,
+        "--summary", summary,
+        "--status-text", status_text,
+        "--json",
+    ]
+    try:
+        proc = subprocess.run(cmd, text=True, capture_output=True, timeout=60)
+        if proc.returncode != 0:
+            logger.warning("Integration-tools triage state update failed: %s", (proc.stderr or proc.stdout or '').strip())
+    except Exception as exc:
+        logger.warning("Integration-tools triage state update failed: %s", exc)
+    try:
+        _append_integration_tools_receipt({
+            "event_type": "integration_tools_auto_triage",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "task_id": task_id,
+            "kind": kind,
+            "status": status,
+            "missing_fields": (triage or {}).get("missing_fields") or [],
+            "reply_hint": (triage or {}).get("reply_hint") or "",
+        }, receipt_dir)
+    except Exception:
+        pass
+
+
+
+def _integration_tools_child_task_slug(parent_task_id: str, cli_name: str) -> str:
+    safe_parent = re.sub(r"[^A-Za-z0-9_.:-]+", "-", str(parent_task_id or "integration-tools")).strip("-._")
+    safe_cli = re.sub(r"[^A-Za-z0-9_.:-]+", "-", str(cli_name or "fixed-cli")).strip("-._")
+    return f"{safe_parent}-{safe_cli}"[:80]
+
+
+def _update_integration_tools_parent_after_dispatch(
+    *,
+    parent_task_id: str,
+    child_task_id: str,
+    cli_name: str,
+    output_slug: str,
+    receipt_dir: str | Path | None = None,
+) -> None:
+    parent_task_id = str(parent_task_id or "").strip()
+    child_task_id = str(child_task_id or "").strip()
+    if not parent_task_id or not child_task_id:
+        return
+    state_root = _hermes_home / "runtime" / "shared-state"
+    update_script = state_root / "bin" / "update_task_state.py"
+    summary = f"integration_tools auto-dispatched {cli_name} fixed-CLI task {child_task_id}"
+    status_text = (
+        f"{summary}\n\n"
+        f"已自动派发到受治理 {cli_name} fixed-CLI；等待 VM worker terminal receipt。\n"
+        f"输出策略：/mnt/tmp/{output_slug}/output/\n"
+        f"用户可见路径：//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/{output_slug}/\n"
+    )
+    if update_script.exists():
+        cmd = [
+            sys.executable, str(update_script), "--root", str(state_root),
+            "--task-id", parent_task_id, "--state", "dispatched",
+            "--summary", summary, "--status-text", status_text, "--json",
+        ]
+        try:
+            proc = subprocess.run(cmd, text=True, capture_output=True, timeout=60)
+            if proc.returncode != 0:
+                logger.warning("Integration-tools parent dispatch state update failed: %s", (proc.stderr or proc.stdout or '').strip())
+        except Exception as exc:
+            logger.warning("Integration-tools parent dispatch state update failed: %s", exc)
+    try:
+        meta_path = state_root / "tasks" / parent_task_id / "meta.json"
+        if meta_path.exists():
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta["run_id"] = child_task_id
+            meta["coding_session_key"] = f"vm_task:{child_task_id}"
+            meta["status"] = "dispatched"
+            meta["latest_summary"] = summary
+            meta["updated_at"] = _pnc_feishu_business_now_iso()
+            meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except Exception:
+        logger.debug("Integration-tools parent meta dispatch patch failed", exc_info=True)
+    try:
+        _append_integration_tools_receipt({
+            "event_type": "integration_tools_auto_dispatch",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "parent_task_id": parent_task_id,
+            "child_task_id": child_task_id,
+            "cli": cli_name,
+            "output_slug": output_slug,
+            "status": "dispatched",
+        }, receipt_dir)
+    except Exception:
+        pass
+
+
+def _maybe_auto_dispatch_integration_tools_fixed_cli(
+    *,
+    parent_task_id: str,
+    triage: dict,
+    requester: str,
+    requester_user_id: str,
+    receipt_dir: str | Path | None = None,
+) -> dict | None:
+    dispatch = (triage or {}).get("auto_dispatch") if isinstance(triage, dict) else None
+    if not isinstance(dispatch, dict):
+        return None
+    cli_name = str(dispatch.get("cli") or "").strip()
+    input_path = str(dispatch.get("input") or "").strip()
+    if cli_name not in {"mcap-clean", "mcap-translate", "logsim-replay"} or not input_path.startswith("/mnt/"):
+        return {"ok": False, "error": "invalid_auto_dispatch", "cli": cli_name, "input": input_path}
+    try:
+        from tools import pnc_agent_tools as _pnc_tools
+        output_slug = _integration_tools_child_task_slug(parent_task_id, cli_name)
+        args = {"input": input_path, "task_id": output_slug, "timeout": 1800, "memory_mb": 8192}
+        if cli_name == "mcap-translate":
+            raw = _pnc_tools.mcap_translate_tool(args, user_id=requester_user_id)
+        elif cli_name == "mcap-clean":
+            raw = _pnc_tools.mcap_clean_tool(args, user_id=requester_user_id)
+        else:
+            raw = _pnc_tools.logsim_replay_tool(args, user_id=requester_user_id)
+        payload = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        if not payload.get("ok"):
+            return {"ok": False, "error": payload.get("error") or "fixed_cli_submit_failed", "raw": payload}
+        task = payload.get("task") if isinstance(payload.get("task"), dict) else {}
+        child_task_id = str(task.get("task_id") or payload.get("task_id") or "").strip()
+        if child_task_id:
+            _update_integration_tools_parent_after_dispatch(
+                parent_task_id=parent_task_id,
+                child_task_id=child_task_id,
+                cli_name=cli_name,
+                output_slug=output_slug,
+                receipt_dir=receipt_dir,
+            )
+        return {"ok": True, "cli": cli_name, "child_task_id": child_task_id, "output_slug": output_slug, "raw": payload}
+    except Exception as exc:
+        logger.warning("Integration-tools auto-dispatch failed: %s", exc, exc_info=True)
+        return {"ok": False, "error": str(exc)[:500], "cli": cli_name, "input": input_path}
+
+
+def _submit_integration_tools_intake_handoff(
+    *,
+    requester: str,
+    source_group_id: str,
+    message_id: str,
+    source_thread_id: str = "",
+    request_text: str = "",
+    receipt_dir: str | Path | None = None,
+) -> dict:
+    """Create or reuse a shared-state v2 integration-tools intake task.
+
+    This is V4 ingress only: create a control-plane intake task. It deliberately
+    does not submit VM execution, because group business permission is not the
+    same as VM execution permission. The handoff is idempotent by Feishu
+    source_message_id and stores thread-only reply anchors as first-class meta.
+    """
+    existing = _find_existing_integration_tools_task("feishu", message_id)
+    if existing is not None:
+        task_id = str(existing.get("task_id") or existing.get("id") or "")
+        try:
+            _append_integration_tools_receipt({
+                "event_type": "integration_tools_intake_handoff",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "platform": "feishu",
+                "business_line_ref": "integration_tools",
+                "group_id": str(source_group_id or ""),
+                "requester": str(requester or ""),
+                "message_id": str(message_id or ""),
+                "source_thread_id": str(source_thread_id or ""),
+                "reply_policy": "thread_only",
+                "dedupe_hit": True,
+                "handoff_success": True,
+                "task_id": task_id,
+                "handoff_error": "",
+            }, receipt_dir)
+        except Exception as receipt_exc:
+            logger.warning("Integration-tools dedupe receipt write failed: %s", receipt_exc)
+        return {"success": True, "task": existing, "dedupe_hit": True}
+
+    request_excerpt = (request_text or "").strip().replace("\r\n", "\n")[:2000]
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    suffix = re.sub(r"[^A-Za-z0-9_-]+", "_", (message_id or timestamp))[-24:] or timestamp
+    task_slug = f"integration_tools_intake_{suffix}"
+    # Owner decision 2026-06-12: integration_tools generated artifacts land in
+    # the generic /mnt/tmp/<task_id>/ namespace (CIFS pickup via hfs1);
+    # /mnt/minieye/mdrive4 remains a read-only data source.
+    artifact_root = f"/mnt/tmp/{task_slug}/"
+    artifact_cifs_root = (
+        "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/"
+        f"tmp/{task_slug}/"
+    )
+    reply_anchor = source_thread_id or message_id
+    goal = (
+        "执行 pnc-agent 集成与工具业务线 intake。\n"
+        "- business_line: integration_tools\n"
+        "- primary_domain: mdrive4\n"
+        f"- source_group_id: {source_group_id}\n"
+        f"- request_message_id: {message_id}\n"
+        f"- source_thread_id: {source_thread_id}\n"
+        f"- reply_anchor_message_id: {reply_anchor}\n"
+        "- reply_policy: thread_only\n"
+        "- broadcast_allowed: false\n"
+        f"- requester: {requester}\n"
+        "- group_default_business_permission: true\n"
+        "- required_state: intake_checked or need_input; intake_checked is not terminal\n"
+        "- close_loop_sla: intake_checked must advance within 10 minutes to need_input / accepted / dispatched / executing / delivery_receipt_draft_ready / closed.\n"
+        "- close_loop_escalation: intake_checked >=120 minutes requires operator follow-up.\n"
+        "- 必须先做信息完整性检查、风险判断、owner/验收人检查。\n"
+        "- 如果涉及代码/模块事实，必须以 VM /home/mini/pnc_specs 和 /home/mini/minieye_dnp_nop 为事实源。\n"
+        "- 不得执行生产变更、权限审批、数据删除/覆盖、裸 MCAP/replay/docker、repo mutation。\n"
+        "- 后续 need_input/status/delivery 回复必须回原消息话题/thread，不得刷主群。\n"
+        "- 输出：只返回 L0/L1 简要接单/缺项/风险结论，详细证据写 receipt。\n"
+        f"- VM work_tmp_dir_policy: {artifact_root}\n"
+        f"- user_visible_cifs_policy: {artifact_cifs_root}\n"
+        "\n## 原始请求摘录\n"
+        f"{request_excerpt}\n"
+    )
+    create_task = _hermes_home / "runtime" / "shared-state" / "bin" / "create_task_v2.py"
+    if not create_task.exists():
+        error = f"create_task_v2.py not found: {create_task}"
+        dead_letter = _write_integration_tools_dead_letter(
+            receipt_dir=receipt_dir, requester=requester, source_group_id=source_group_id,
+            message_id=message_id, source_thread_id=source_thread_id, request_text=request_text, error=error,
+        )
+        return {"success": False, "error": error, "dead_letter": dead_letter}
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".md", delete=False) as f:
+        f.write(goal)
+        goal_file = f.name
+    meta = {
+        "business_line": "integration_tools",
+        "primary_domain": "mdrive4",
+        "mdrive4_data_root": "/mnt/minieye/mdrive4",
+        "task_type": "intake",
+        "source_platform": "feishu",
+        "source_group_id": source_group_id,
+        "source_message_id": message_id,
+        "source_thread_id": source_thread_id,
+        "reply_anchor_message_id": reply_anchor,
+        "reply_policy": "thread_only",
+        "broadcast_allowed": False,
+        "requester": requester,
+        "group_default_business_permission": True,
+        "requires_owner": True,
+        "requires_acceptance_responsible": True,
+        "owner_gate_required_before": ["accepted", "dispatched", "executing"],
+        "acceptance_gate_required_before": ["verification", "delivery_receipt", "closed"],
+        "status": "new",
+        "risk_policy": "manual_review_for_high_risk",
+        "close_loop_policy": INTEGRATION_TOOLS_CLOSE_LOOP_POLICY,
+        "close_loop_required_next_action": INTEGRATION_TOOLS_CLOSE_LOOP_POLICY["required_next_action"],
+        "artifact_root_policy": artifact_root,
+        "artifact_cifs_root_policy": artifact_cifs_root,
+    }
+    cmd = [
+        sys.executable,
+        str(create_task),
+        "--title",
+        "pnc-agent 集成与工具业务 intake",
+        "--goal-file",
+        goal_file,
+        "--owner",
+        "integration-tools-owner",
+        "--meta",
+        json.dumps(meta, ensure_ascii=False),
+        "--json",
+    ]
+    try:
+        proc = subprocess.run(cmd, text=True, capture_output=True, timeout=120)
+    except Exception as exc:
+        error = f"task creation failed: {exc}"
+        dead_letter = _write_integration_tools_dead_letter(
+            receipt_dir=receipt_dir, requester=requester, source_group_id=source_group_id,
+            message_id=message_id, source_thread_id=source_thread_id, request_text=request_text, error=error,
+        )
+        return {"success": False, "error": error, "dead_letter": dead_letter}
+    if proc.returncode != 0:
+        error = (proc.stderr or proc.stdout or "task creation failed").strip()
+        dead_letter = _write_integration_tools_dead_letter(
+            receipt_dir=receipt_dir, requester=requester, source_group_id=source_group_id,
+            message_id=message_id, source_thread_id=source_thread_id, request_text=request_text, error=error,
+        )
+        return {"success": False, "error": error, "returncode": proc.returncode, "dead_letter": dead_letter}
+    try:
+        payload = json.loads(proc.stdout or "{}")
+    except Exception as exc:
+        error = f"invalid task creator json: {exc}"
+        dead_letter = _write_integration_tools_dead_letter(
+            receipt_dir=receipt_dir, requester=requester, source_group_id=source_group_id,
+            message_id=message_id, source_thread_id=source_thread_id, request_text=request_text, error=error,
+        )
+        return {"success": False, "error": error, "stdout": proc.stdout, "stderr": proc.stderr, "dead_letter": dead_letter}
+    triage = _classify_mdrive4_intake_request(request_text, originator=requester)
+    submit_result = {
+        "success": True,
+        "task": payload,
+        "dedupe_hit": False,
+        "reply_policy": "thread_only",
+        "reply_anchor_message_id": reply_anchor,
+        "artifact_root_policy": artifact_root,
+        "artifact_cifs_root_policy": artifact_cifs_root,
+        "triage": triage,
+        "close_loop_policy": INTEGRATION_TOOLS_CLOSE_LOOP_POLICY,
+    }
+    parent_task_id = str(payload.get("task_id") or payload.get("id") or "")
+    auto_dispatch_result = None
+    if parent_task_id and isinstance(triage.get("auto_dispatch"), dict):
+        auto_dispatch_result = _maybe_auto_dispatch_integration_tools_fixed_cli(
+            parent_task_id=parent_task_id,
+            triage=triage,
+            requester=requester,
+            requester_user_id=requester,
+            receipt_dir=receipt_dir,
+        )
+        submit_result["auto_dispatch"] = auto_dispatch_result
+        if isinstance(auto_dispatch_result, dict) and auto_dispatch_result.get("ok"):
+            triage = {**triage, "status": "dispatched"}
+            submit_result["triage"] = triage
+    _mark_integration_tools_triage(
+        task_id=parent_task_id,
+        triage=triage,
+        receipt_dir=receipt_dir,
+    )
+    try:
+        _append_integration_tools_receipt({
+            "event_type": "integration_tools_intake_handoff",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "platform": "feishu",
+            "business_line_ref": "integration_tools",
+            "group_id": str(source_group_id or ""),
+            "requester": str(requester or ""),
+            "message_id": str(message_id or ""),
+            "source_thread_id": str(source_thread_id or ""),
+            "reply_anchor_message_id": str(reply_anchor or ""),
+            "reply_policy": "thread_only",
+            "broadcast_allowed": False,
+            "dedupe_hit": False,
+            "triage_kind": triage.get("kind"),
+            "triage_status": triage.get("status"),
+            "auto_dispatch": auto_dispatch_result,
+            "close_loop_policy": INTEGRATION_TOOLS_CLOSE_LOOP_POLICY,
+            "handoff_success": True,
+            "task_id": str(payload.get("task_id") or payload.get("id") or ""),
+            "handoff_error": "",
+            "artifact_root_policy": artifact_root,
+            "artifact_cifs_root_policy": artifact_cifs_root,
+        }, receipt_dir)
+    except Exception as receipt_exc:
+        logger.warning("Integration-tools intake receipt write failed: %s", receipt_exc)
+    return submit_result
+
+
+
+def _is_synthetic_g1q3_quota_trigger(*, message_id: str = "", requester: str = "") -> bool:
+    """Return True for local/test submissions that must not spend production quota."""
+    msg = str(message_id or "").strip()
+    user = str(requester or "").strip()
+    return msg.startswith("om_test") or user in {"ou_test_user", "test_user", "pytest"}
+
+
+def _g1q3_request_text_with_metadata(event: Any) -> str:
+    """Return text plus non-secret Feishu rich-link URLs for G1Q3 routing.
+
+    Feishu Project cards can be clickable in the client while their normalized
+    plaintext contains only the title/field labels.  The Feishu adapter stores
+    extracted link URLs in event.metadata.feishu.link_urls; appending only those
+    URLs lets the existing issue-id parser work without persisting raw payloads.
+    """
+    text = str(getattr(event, "text", "") or "")
+    metadata = getattr(event, "metadata", None)
+    feishu_meta = metadata.get("feishu") if isinstance(metadata, dict) else {}
+    urls = feishu_meta.get("link_urls") if isinstance(feishu_meta, dict) else []
+    if not isinstance(urls, list):
+        urls = []
+    safe_urls: list[str] = []
+    for url in urls:
+        item = str(url or "").strip()
+        if not item.startswith(("http://", "https://")):
+            continue
+        if "project.feishu.cn/" not in item or "/issue/detail/" not in item:
+            continue
+        if item not in safe_urls:
+            safe_urls.append(item)
+    if not safe_urls:
+        return text
+    existing = text
+    extra = "\n".join(url for url in safe_urls if url not in existing)
+    return f"{text}\n{extra}".strip() if extra else text
+
+def _dispatch_governance_datapipe_coordinator(
+    *,
+    task_slug: str,
+    artifact_root: str,
+    artifact_cifs_root: str,
+    execution_request_path: str,
+    request_json: str,
+    template_id: str,
+    full_case_id: str,
+    work_item_id: str,
+    source_group_id: str,
+    message_id: str,
+    requester: str,
+    translate_config: dict[str, str] | None = None,
+) -> dict:
+    """Spawn the detached host coordinator for governance-path RCA data pipeline.
+
+    Flag-gated by G1Q3_GOVERNANCE_DOWNLOAD_ENABLED (checked by the caller). The
+    coordinator runs the data pipeline via the network-capable plain-shell
+    governance path (ssh-mini-submit), then creates the standard read-only codex
+    task. Returns a dict with ``dispatched`` on success; on any failure returns
+    ``{"dispatched": False}`` so the caller can fall back to the normal inline
+    path (fail-safe). Detached: survives gateway restarts, never blocks the loop.
+    """
+    try:
+        coordinator = Path(__file__).resolve().parent.parent / "scripts" / "pnc_g1q3_governance_rca.py"
+        if not coordinator.is_file():
+            return {"dispatched": False, "error": "coordinator script missing"}
+        followup_slug = work_item_id or _gov_slug(full_case_id) or _gov_slug(task_slug)
+        # Include a short request slug suffix so repeated taps on the same issue in
+        # the same second do not collide while preserving the human-readable issue id.
+        followup_suffix = _gov_slug(task_slug)[-12:]
+        followup_task_id = (
+            f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-"
+            f"g1q3-rca-issue-intake-{followup_slug}-{followup_suffix}"
+        )[:127].rstrip("-")
+        params = {
+            "task_slug": task_slug,
+            "followup_task_id": followup_task_id,
+            "artifact_root": artifact_root,
+            "artifact_cifs_root": artifact_cifs_root,
+            "execution_request_path": execution_request_path,
+            "request_json": request_json,
+            "template_id": template_id,
+            "full_case_id": full_case_id,
+            "work_item_id": work_item_id,
+            **(translate_config or {"translate_baseline": "production", "translate_contract_path": ""}),
+            "source_group_id": source_group_id,
+            "message_id": message_id,
+            "user_id": requester,
+            "title": f"G1Q3 RCA issue intake: {work_item_id or full_case_id}",
+        }
+        params_dir = _hermes_home / "pnc_agent" / "governance_rca"
+        params_dir.mkdir(parents=True, exist_ok=True)
+        params_file = params_dir / f"{_gov_slug(task_slug)}.json"
+        params_file.write_text(json.dumps(params, ensure_ascii=False), encoding="utf-8")
+        log_file = params_dir / f"{_gov_slug(task_slug)}.log"
+        with open(log_file, "ab") as logf:
+            subprocess.Popen(
+                [sys.executable, str(coordinator), "--params-file", str(params_file)],
+                stdout=logf, stderr=logf, start_new_session=True,
+            )
+        return {
+            "dispatched": True,
+            "params_file": str(params_file),
+            "log_file": str(log_file),
+            "followup_task_id": followup_task_id,
+        }
+    except Exception as exc:  # fail-safe: caller falls back to inline path
+        logger.warning("governance datapipe coordinator dispatch failed: %s", exc)
+        return {"dispatched": False, "error": str(exc)[:200]}
+
+
+def _create_governance_early_acceptance_card(
+    *,
+    vm_task_submit_func,
+    task_id: str,
+    task_title: str,
+    goal: str,
+    requester: str,
+    chat_id: str,
+    message_id: str,
+    artifact_root: str,
+    artifact_cifs_root: str,
+    logger_obj=None,
+    seed_func=None,
+) -> dict[str, Any]:
+    """Best-effort early one-card acceptance seed for governance intakes.
+
+    Must never raise: governance dispatch is fail-safe, and the detached
+    coordinator can fall back to the final submit path if this seed fails.
+    """
+    out: dict[str, Any] = {"notify_process": {}, "early_submit": {}, "early_card": {}}
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        return out
+    try:
+        submit_result = vm_task_submit_func(
+            title=task_title,
+            goal=goal,
+            task_id=task_id,
+            user_id=requester,
+            lane="standard",
+            resource_class="pnc_data",
+            repo_scope="unknown",
+            workspace_scope="none",
+            risk_class="normal",
+            artifact_root=artifact_root,
+            artifact_cifs_root=artifact_cifs_root,
+            executor_type="governed_tool",
+            agent_backend="codex",
+            codex_backend_enabled=True,
+        )
+        out["early_submit"] = submit_result if isinstance(submit_result, dict) else {"raw": submit_result}
+        if isinstance(submit_result, dict) and isinstance(submit_result.get("notify_process"), dict):
+            out["notify_process"] = submit_result["notify_process"]
+        if not (isinstance(submit_result, dict) and submit_result.get("success")):
+            out["early_card"] = {"ok": False, "reason": "early_submit_failed"}
+            return out
+        if seed_func is None:
+            from scripts.pnc_g1q3_governance_rca import seed_governance_early_card
+            seed_func = seed_governance_early_card
+        out["early_card"] = seed_func(
+            task_id=task_id,
+            chat_id=chat_id,
+            thread_id=f"topic:{message_id}" if message_id else "",
+            message_id=message_id,
+            artifact_root=artifact_root,
+            artifact_cifs_root=artifact_cifs_root,
+            submit_result=out["early_submit"],
+        )
+    except Exception as exc:
+        if logger_obj is not None:
+            logger_obj.warning("governance early acceptance card failed: %s", exc)
+        out["notify_process"] = {"started": False, "reason": f"early_card_failed: {type(exc).__name__}: {exc}"}
+        out["early_error"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
+def _gov_slug(task_slug: str) -> str:
+    return "".join(c for c in str(task_slug or "") if c.isalnum() or c in "-_") or "unknown"
+
+
+def _g1q3_translate_baseline_config() -> dict[str, str]:
+    baseline = os.getenv("HERMES_G1Q3_TRANSLATE_BASELINE", "production").strip() or "production"
+    contract_path = os.getenv("HERMES_G1Q3_TRANSLATE_CONTRACT_PATH", "").strip()
+    if baseline == "candidate" and not contract_path:
+        contract_path = "api/g1q3_rca/translate_contract.candidate.json"
+    # Fail-safe: only production/candidate are first-class.  Custom paths must
+    # be explicitly labelled as custom so cards don't imply production.
+    if baseline not in {"production", "candidate"}:
+        baseline = "custom" if contract_path else "production"
+    return {"translate_baseline": baseline, "translate_contract_path": contract_path}
 
 
 _OWN_POLICY_OPEN_ENV = {
@@ -1824,6 +3199,341 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
             continue
         return f"{platform.value}: open policy without allow-all opt-in"
     return None
+
+
+def _submit_g1q3_rca_status_handoff(
+    *,
+    template_id: str,
+    case_id: str,
+    requester: str,
+    source_group_id: str,
+    message_id: str,
+    work_item_id: str = "",
+    request_text: str = "",
+    receipt_dir: str | Path | None = None,
+) -> dict:
+    """Submit the first governed G1Q3 RCA status handoff to shared-state v2."""
+    from gateway.pnc_delivery_policy import G1Q3RcaTaskIntent, validate_g1q3_rca_task_intent
+    from tools.vm_task_tool import vm_task_submit
+
+    intent = G1Q3RcaTaskIntent(
+        template_id=template_id,
+        case_id=case_id,
+        requester=requester,
+        source_group_id=source_group_id,
+        work_item_id=work_item_id,
+    )
+    validation = validate_g1q3_rca_task_intent(intent)
+    if validation.decision != "valid":
+        return {"success": False, "error": validation.reason or "invalid_handoff_intent"}
+
+    safe_case = re.sub(r"[^A-Za-z0-9_-]+", "_", case_id or work_item_id).strip("_") or "unknown"
+    task_kind = "issue_intake" if template_id == "rca_issue_intake" else "status"
+    request_kind = "issue_intake" if template_id == "rca_issue_intake" else "status_check"
+    # Suffix the artifact namespace with a trigger-derived hash so repeated
+    # or concurrent submissions for the same issue never share /mnt/tmp
+    # directories (duplicate runs used to overwrite each other's
+    # rca_execution_request.json and collide on output dirs).
+    import hashlib as _hashlib
+    _trigger_suffix = _hashlib.sha1(str(message_id or "").encode("utf-8")).hexdigest()[:6] if str(message_id or "").strip() else ""
+    task_slug = f"g1q3_rca_{task_kind}_{safe_case}" + (f"_{_trigger_suffix}" if _trigger_suffix else "")
+    artifact_root = f"/mnt/tmp/{task_slug}/"
+    artifact_cifs_root = (
+        "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/"
+        f"tmp/{task_slug}/"
+    )
+    full_case_id = case_id if str(case_id).upper().startswith("G1Q3") else (f"G1Q3-{case_id}" if case_id else "待从飞书问题字段解析")
+    issue_line = f"- work_item_id: {work_item_id}\n" if work_item_id else ""
+    request_excerpt = (request_text or "").strip().replace("\r\n", "\n")[:1200]
+    source = {
+        "platform": "feishu",
+        "chat_id": source_group_id,
+        "message_id": message_id,
+        "user_id": requester,
+    }
+    intake_state = new_intake_state(
+        task_id=task_slug,
+        group_binding_id="gb_g1q3_rca_feishu_group",
+        source=source,
+        request_text_excerpt=request_excerpt,
+    )
+    if receipt_dir is not None:
+        try:
+            write_rca_intake_state(receipt_dir, intake_state)
+        except Exception as receipt_exc:
+            logger.warning("RCA intake state receipt write failed: %s", receipt_exc)
+    issue_project_key = ""
+    issue_context_text = ""
+    issue_read_status = "not_requested"
+    issue_read_source = ""
+    issue_source_quality = "unavailable"
+    issue_blockers: list[dict[str, Any]] = []
+    if template_id == "rca_issue_intake" and work_item_id:
+        if receipt_dir is not None:
+            try:
+                write_rca_intake_state(receipt_dir, transition(intake_state, "issue_enrichment_started"))
+            except Exception as receipt_exc:
+                logger.warning("RCA intake enrichment-start receipt write failed: %s", receipt_exc)
+        issue_project_key = resolve_feishu_issue_project_key(
+            request_text or "",
+            work_item_id=work_item_id,
+            source_group_id=source_group_id,
+        )
+        issue_read_result = _fetch_g1q3_issue_context_result(project_key=issue_project_key, work_item_id=work_item_id)
+        issue_context_text = issue_read_result.context_text
+        issue_read_status = issue_read_result.status
+        issue_read_source = getattr(issue_read_result, "source", "") or ""
+        issue_source_quality = issue_read_result.source_quality
+        if issue_context_text:
+            next_stage = "issue_fields_extracted"
+        else:
+            issue_blockers.append(issue_read_result.blocker or {
+                "kind": "host_issue_preread_unavailable",
+                "message": "主控侧未成功读取飞书 issue 字段/评论，不能据此判定字段缺失",
+                "retryable": True,
+            })
+            next_stage = "issue_preread_blocked"
+    issue_url = f"https://project.feishu.cn/{issue_project_key}/issue/detail/{work_item_id}" if issue_project_key and work_item_id else ""
+    issue_context = issue_context_from_compact_text(
+        project_key=issue_project_key,
+        work_item_id=work_item_id,
+        url=issue_url,
+        compact_text=issue_context_text,
+        source_quality=issue_source_quality,
+        blockers=issue_blockers,
+    )
+    if case_id:
+        issue_context = dataclasses.replace(issue_context, case_id=full_case_id)
+    if issue_read_status and template_id == "rca_issue_intake" and work_item_id:
+        read_status_ref: dict[str, Any] = {"type": "host_issue_read_status", "status": issue_read_status}
+        if issue_read_source:
+            read_status_ref["source"] = issue_read_source
+        issue_context = dataclasses.replace(
+            issue_context,
+            media_refs=[*issue_context.media_refs, read_status_ref],
+        )
+    if template_id == "rca_issue_intake" and work_item_id and issue_context.source_quality != "unavailable":
+        issue_context, field_blocker = validate_issue_context_fields(issue_context)
+        if field_blocker:
+            issue_blockers.append(field_blocker)
+            issue_context = dataclasses.replace(issue_context, blockers=[*issue_context.blockers, field_blocker])
+            next_stage = "issue_field_validation_blocked"
+    # S8 field-quality loop: when the card was read but a required field is
+    # missing/invalid, plan (and post, if enabled) an owner-facing comment on
+    # the issue. Plan-only by default; the only write is meegle comment add.
+    field_gap_comment: dict[str, Any] | None = None
+    if template_id == "rca_issue_intake" and work_item_id and issue_blockers:
+        _gap_kind = str(issue_blockers[0].get("kind") or "")
+        if _gap_kind.startswith("issue_field_"):
+            try:
+                from gateway.pnc_field_gap_comment import maybe_comment_field_gap
+                _owner_open_ids = [requester] if str(requester or "").startswith("ou_") else []
+                field_gap_comment = maybe_comment_field_gap(
+                    project_key=issue_project_key,
+                    work_item_id=work_item_id,
+                    blocker_kind=_gap_kind,
+                    sub_kind=str(issue_blockers[0].get("sub_kind") or ""),
+                    owners=list(issue_context.owners or []),
+                    owner_open_ids=_owner_open_ids,
+                    ledger_dir=_hermes_home / "pnc_agent" / "quota",
+                )
+            except Exception as gap_exc:
+                logger.warning("G1Q3 field-gap comment step failed: %s", gap_exc)
+                field_gap_comment = {"action": "comment_failed", "reason": str(gap_exc)[:200]}
+    # Auto-download grant: only spend daily quota on clean intakes (fields
+    # extracted and PDCL valid); a blocked intake cannot download anyway.
+    download_grant: dict[str, Any] = {"granted": False, "reason": "not_eligible"}
+    if template_id == "rca_issue_intake" and work_item_id and not issue_blockers:
+        if _is_synthetic_g1q3_quota_trigger(message_id=message_id, requester=requester):
+            download_grant = {"granted": False, "reason": "synthetic_trigger_no_quota_spend"}
+        else:
+            try:
+                from gateway.pnc_download_quota import consume_g1q3_download_grant
+                download_grant = consume_g1q3_download_grant(
+                    quota_dir=_hermes_home / "pnc_agent" / "quota",
+                    task_id=task_slug,
+                )
+            except Exception as quota_exc:
+                logger.warning("G1Q3 download quota check failed (fail closed): %s", quota_exc)
+                download_grant = {"granted": False, "reason": f"quota_check_failed: {quota_exc}"[:200]}
+    allow_download = bool(download_grant.get("granted"))
+    translate_config = _g1q3_translate_baseline_config()
+    execution_request = build_execution_request(
+        request_kind=request_kind,
+        task_id=task_slug,
+        issue_context=issue_context,
+        request_text_excerpt=request_excerpt,
+        source_group_id=source_group_id,
+        source_message_id=message_id,
+        artifact_root=artifact_root,
+        artifact_cifs_root=artifact_cifs_root,
+        allow_download=allow_download,
+        translate_baseline=translate_config.get("translate_baseline", "production"),
+        translate_contract_path=translate_config.get("translate_contract_path", ""),
+    )
+    request_json = rca_schema_to_json(execution_request)
+    execution_request_path = f"{artifact_root}rca_execution_request.json"
+    execution_request_local_path = write_vm_tmp_text(execution_request_path, request_json + "\n")
+    if receipt_dir is not None:
+        try:
+            enriched_state = transition(
+                intake_state,
+                next_stage if template_id == "rca_issue_intake" and work_item_id else "case_resolved",
+                issue_context=issue_context,
+                execution_request_path=execution_request_path,
+                blocker=issue_blockers[0] if issue_blockers else None,
+                retryable=bool(issue_blockers),
+            )
+            write_rca_intake_state(receipt_dir, enriched_state)
+        except Exception as receipt_exc:
+            logger.warning("RCA intake enriched/blocker receipt write failed: %s", receipt_exc)
+    request_text_block = f"\n## 原始请求摘录（供 VM 无飞书权限时弱解析）\n{request_excerpt}\n" if request_excerpt else ""
+    issue_context_block = ""
+    if template_id == "rca_issue_intake" and work_item_id:
+        if issue_context_text:
+            issue_context_block = f"\n## Feishu issue context（主控侧预读取）\n{issue_context_text}\n"
+        else:
+            issue_context_block = (
+                "\n## Feishu issue context（主控侧预读取）\n"
+                "主控侧未成功读取飞书 issue 字段/评论；这是状态机的 issue_preread_blocked，"
+                "不能据此判定 问题数据地址_PDCL 缺失或格式不合法。"
+                "请优先检查主控飞书项目读取权限/MCP 调用链路；VM 只消费主控固化后的结构化字段。\n"
+            )
+    goal = (
+        "执行 G1Q3 RCA 问题 intake / 只读状态查询 handoff。\n"
+        f"- template_id: {template_id}\n"
+        f"- case_id: {full_case_id}\n"
+        f"{issue_line}"
+        f"- source_group_id: {source_group_id}\n"
+        f"- request_message_id: {message_id}\n"
+        "- schema_version: g1q3_rca_execution_request_v1\n"
+        f"- execution_request_path: {execution_request_path}\n"
+        f"- translate_baseline: {translate_config.get('translate_baseline') or 'production'}\n"
+        + (f"- translate_contract_path: {translate_config.get('translate_contract_path')}\n" if translate_config.get('translate_contract_path') else "")
+        + (f"- host_request_prewrite: {execution_request_local_path}\n" if execution_request_local_path else "- host_request_prewrite: unavailable; embedded JSON fallback below\n")
+        + (
+            "- VM command suggestion: python3 /home/mini/data3/yj-evaluation-server/api/g1q3_rca/scripts/run_rca_auto_pipeline.py --request "
+            f"{execution_request_path} --output-dir {artifact_root}\n"
+            f"- auto_download: granted (今日额度 {download_grant.get('used')}/{download_grant.get('quota')})；S2 下载与受控管线由编排器按预算执行。\n"
+            if allow_download
+            else "- VM command suggestion: python3 /home/mini/data3/yj-evaluation-server/api/g1q3_rca/scripts/run_rca_execution_request.py --request "
+            f"{execution_request_path} --output-dir {artifact_root}\n"
+            + (f"- auto_download: not granted（{download_grant.get('reason') or 'disabled'}）；已受理但自动下载未授予，待 owner 触发下载或次日额度，无需发起人补数据；本次仅做只读状态/门禁检查。\n" if template_id == "rca_issue_intake" and work_item_id else "")
+        )
+        + "- 范围：先读取/归一化飞书问题字段；如可定位 G1Q3 case，则只读检查该 case 当前 RCA 产物状态、gate_result/report_data/global index 可见性。\n"
+        "- 若 VM worker 无法读取飞书 issue 字段，则先使用下方结构化 request 和原始请求摘录做弱解析，并明确标注低置信边界。\n"
+        "- 输出：仅返回 L0/L1 摘要，不返回原始日志、源码 diff、内部路径细节或命令流水。\n"
+        f"- VM work_tmp_dir: {artifact_root}\n"
+        f"- user_visible_cifs: {artifact_cifs_root}\n"
+        "\n## RcaExecutionRequest JSON\n"
+        f"```json\n{request_json}\n```\n"
+        f"{issue_context_block}"
+        f"{request_text_block}"
+    )
+    # Governance-path codification (flag-gated by G1Q3_GOVERNANCE_DOWNLOAD_ENABLED;
+    # INERT until that flag is set AND the gateway is restarted). For download-bearing
+    # RCA intakes, run the data pipeline via the network-capable plain-shell governance
+    # path, then a standard read-only codex task renders the result. codex sandbox stays
+    # network-off. Any dispatch failure falls back to the normal inline path (fail-safe).
+    # See knowledge/outputs/g1q3-rca-governance-download-orchestration-design-20260622.md
+    if allow_download and template_id == "rca_issue_intake" and work_item_id and not issue_blockers:
+        try:
+            from scripts.pnc_g1q3_governance_rca import governance_download_enabled
+            _gov_on = governance_download_enabled()
+        except Exception:
+            _gov_on = False
+        if _gov_on:
+            _gov = _dispatch_governance_datapipe_coordinator(
+                task_slug=task_slug, artifact_root=artifact_root,
+                artifact_cifs_root=artifact_cifs_root,
+                execution_request_path=execution_request_path, request_json=request_json,
+                template_id=template_id, full_case_id=full_case_id, work_item_id=work_item_id,
+                source_group_id=source_group_id, message_id=message_id, requester=requester,
+                translate_config=translate_config,
+            )
+            if isinstance(_gov, dict) and _gov.get("dispatched"):
+                _gov_task_id = str(_gov.get("followup_task_id") or "").strip()
+                _notify_process: dict[str, Any] = {}
+                _early_submit_result: dict[str, Any] = {}
+                _early_card_result: dict[str, Any] = {}
+                if _gov_task_id:
+                    _early = _create_governance_early_acceptance_card(
+                        vm_task_submit_func=vm_task_submit,
+                        task_id=_gov_task_id,
+                        task_title=f"G1Q3 RCA issue intake: {work_item_id or full_case_id}",
+                        goal=goal,
+                        requester=requester,
+                        chat_id=source_group_id,
+                        message_id=message_id,
+                        artifact_root=artifact_root,
+                        artifact_cifs_root=artifact_cifs_root,
+                        logger_obj=logger,
+                    )
+                    _notify_process = _early.get("notify_process") if isinstance(_early.get("notify_process"), dict) else {}
+                    _early_submit_result = _early.get("early_submit") if isinstance(_early.get("early_submit"), dict) else {}
+                    _early_card_result = _early.get("early_card") if isinstance(_early.get("early_card"), dict) else {}
+                if receipt_dir is not None:
+                    try:
+                        write_rca_intake_state(receipt_dir, transition(
+                            intake_state, "vm_submitted", issue_context=issue_context,
+                            vm_task_id=_gov_task_id, blocker=None, retryable=False,
+                        ))
+                    except Exception as receipt_exc:
+                        logger.warning("governance datapipe receipt write failed: %s", receipt_exc)
+                return {"success": True, "dispatched": "governance_datapipe",
+                        "governance": _gov, "task": {"task_id": _gov_task_id} if _gov_task_id else {},
+                        "notify_process": _notify_process,
+                        "early_submit": _early_submit_result,
+                        "early_card": _early_card_result,
+                        "execution_request": json.loads(request_json),
+                        "download_grant": download_grant}
+            # dispatch failed -> fall through to normal inline path (fail-safe)
+    task_title = f"G1Q3 RCA issue intake: {work_item_id or full_case_id}" if template_id == "rca_issue_intake" else f"G1Q3 RCA status check: {full_case_id}"
+    submit_result = vm_task_submit(
+        title=task_title,
+        goal=goal,
+        user_id=requester,
+        lane="standard",
+        resource_class="pnc_data",
+        repo_scope="unknown",
+        workspace_scope="none",
+        risk_class="normal",
+        artifact_root=artifact_root,
+        artifact_cifs_root=artifact_cifs_root,
+        executor_type="governed_tool",
+        agent_backend="codex",
+        codex_backend_enabled=True,
+    )
+    if isinstance(submit_result, dict):
+        submit_result.setdefault("execution_request", json.loads(request_json))
+        if template_id == "rca_issue_intake" and work_item_id:
+            submit_result.setdefault("download_grant", download_grant)
+            if field_gap_comment is not None:
+                submit_result.setdefault("field_gap_comment", field_gap_comment)
+            submit_result.setdefault("issue_preread", {
+                "status": issue_read_status,
+                "source": issue_read_source,
+                "source_quality": issue_source_quality,
+                "blocker": issue_blockers[0] if issue_blockers else None,
+            })
+    if receipt_dir is not None:
+        try:
+            task = submit_result.get("task") if isinstance(submit_result, dict) else {}
+            vm_task_id = str((task or {}).get("task_id") or (task or {}).get("id") or "") if isinstance(task, dict) else ""
+            write_rca_intake_state(
+                receipt_dir,
+                transition(
+                    intake_state,
+                    "vm_submitted" if submit_result.get("success") else "vm_failed",
+                    issue_context=issue_context,
+                    vm_task_id=vm_task_id,
+                    blocker=None if submit_result.get("success") else {"kind": "vm_submit_failed", "message": str(submit_result.get("error") or "")},
+                    retryable=not bool(submit_result.get("success")),
+                ),
+            )
+        except Exception as receipt_exc:
+            logger.warning("RCA intake VM submission receipt write failed: %s", receipt_exc)
+    return submit_result
 
 
 # Sentinel placed into _running_agents immediately when a session starts
@@ -2781,6 +4491,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     # Class-level defaults so partial construction in tests doesn't
     # blow up on attribute access.
+    _running_agents: Dict[str, Any] = {}
     _running_agents_ts: Dict[str, float] = {}
     _busy_input_mode: str = "interrupt"
     _busy_text_mode: str = "interrupt"
@@ -2799,6 +4510,72 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
     _startup_restore_in_progress: bool = False
+
+    def _configured_feishu_group_allowed_chats(self) -> set[str]:
+        """Return the local Feishu business-group allowlist."""
+        raw_values: list[Any] = [os.getenv("FEISHU_GROUP_ALLOWED_CHATS", "")]
+        try:
+            platform_cfg = getattr(self, "config", None).platforms.get(Platform.FEISHU)
+            extra = getattr(platform_cfg, "extra", {}) if platform_cfg else {}
+            configured = extra.get("group_allowed_chats") if isinstance(extra, dict) else None
+            if isinstance(configured, list):
+                raw_values.extend(configured)
+            elif configured is not None:
+                raw_values.append(configured)
+        except Exception:
+            pass
+
+        allowed: set[str] = set()
+        for value in raw_values:
+            allowed.update(
+                item.strip()
+                for item in str(value or "").split(",")
+                if item.strip()
+            )
+        return allowed
+
+    def _is_user_authorized(self, source: SessionSource) -> bool:
+        """Preserve Feishu chat-scoped admission, then use upstream authz."""
+        if (
+            source.platform == Platform.FEISHU
+            and source.chat_type in {"group", "forum", "channel"}
+            and source.chat_id
+        ):
+            allowed_chats = self._configured_feishu_group_allowed_chats()
+            if "*" in allowed_chats or source.chat_id in allowed_chats:
+                return True
+        return super()._is_user_authorized(source)
+
+    def _get_unauthorized_dm_behavior(
+        self,
+        platform: Optional[Platform],
+        *,
+        profile: Optional[str] = None,
+    ) -> str:
+        """Treat the legacy Feishu group allowlist as a restricted gateway."""
+        behavior = super()._get_unauthorized_dm_behavior(platform, profile=profile)
+        if (
+            platform != Platform.FEISHU
+            or behavior != "pair"
+            or not os.getenv("FEISHU_GROUP_ALLOWED_CHATS", "").strip()
+        ):
+            return behavior
+
+        # Explicit per-platform pairing and adapter pairing policy still win,
+        # matching the newer upstream resolver's precedence.
+        try:
+            platform_cfg = getattr(self, "config", None).platforms.get(platform)
+            extra = getattr(platform_cfg, "extra", {}) if platform_cfg else {}
+            if isinstance(extra, dict) and "unauthorized_dm_behavior" in extra:
+                return behavior
+        except Exception:
+            pass
+        try:
+            if self._adapter_dm_policy(platform, profile=profile) == "pairing":
+                return behavior
+        except Exception:
+            pass
+        return "ignore"
 
     def __init__(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref
@@ -4330,6 +6107,176 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _status_action_gerund(self) -> str:
         return "restarting" if self._restart_requested else "shutting down"
+
+    async def _send_feishu_interactive_card(
+        self,
+        adapter: Any,
+        chat_id: str,
+        card: Dict[str, Any],
+        *,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Send a full interactive card (with action/button elements).
+
+        Sibling of _send_feishu_status_card, which only supports a single markdown
+        body. Used by the intake clarification flow which needs button rows.
+        """
+        if getattr(adapter, "platform", None) != Platform.FEISHU or not hasattr(adapter, "_feishu_send_with_retry"):
+            return False
+        try:
+            payload = json.dumps(card, ensure_ascii=False)
+            response = await adapter._feishu_send_with_retry(
+                chat_id=chat_id, msg_type="interactive", payload=payload, reply_to=reply_to, metadata=metadata
+            )
+            result = adapter._finalize_send_result(response, "clarification card send failed")
+            return bool(result.success)
+        except Exception:
+            logger.warning("[intake-clarify] interactive card send failed", exc_info=True)
+            return False
+
+    async def _send_pnc_clarify_card(self, source: Any, event: Any, decision: Any) -> bool:
+        """#17: render a button-clarify card for a pnc_group_binding clarify decision.
+
+        Returns True when the interactive card was sent (caller then suppresses the
+        text fallback and returns None to _handle_message). Feishu-only; any other
+        platform falls back to the decision's text message.
+        """
+        adapter = self.adapters.get(source.platform)
+        if adapter is None or getattr(adapter, "platform", None) != Platform.FEISHU:
+            return False
+        options = getattr(decision, "clarify_options", None) or ()
+        if not options:
+            return False
+        buttons = [
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": label},
+                "type": "primary",
+                "value": {"hermes_action": "rca_clarify", "choice": choice_id},
+            }
+            for choice_id, label in options
+        ]
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {"title": {"content": "G1Q3 RCA · 请选择", "tag": "plain_text"}, "template": "blue"},
+            "elements": [
+                {"tag": "markdown", "content": decision.user_message or "你想做哪一类？"},
+                {"tag": "action", "actions": buttons},
+            ],
+        }
+        return await self._send_feishu_interactive_card(
+            adapter, str(source.chat_id or ""), card,
+            reply_to=str(event.message_id or "") or None,
+            metadata={"pnc_rca_clarify": True},
+        )
+
+    async def _maybe_send_unauthorized_group_hint(self, source: Any) -> None:
+        """#20 F2: one-time hint for an UNAUTHORIZED group (flag-gated, off by default).
+
+        Off → silent ignore (unchanged). On → send once per chat a rate-limited
+        hint surfacing the chat_id the owner must provision. Never raises.
+        """
+        try:
+            from agent.onboarding import (
+                unauthorized_group_hint, unauthorized_group_hint_enabled, is_seen, mark_seen,
+            )
+            if not unauthorized_group_hint_enabled(os.environ):
+                return
+            if getattr(source, "chat_type", None) == "dm":
+                return
+            chat_id = str(getattr(source, "chat_id", "") or "")
+            if not chat_id:
+                return
+            flag = f"unauth_group_hint:{chat_id}"
+            if is_seen(_load_gateway_config(), flag):
+                return
+            adapter = self.adapters.get(source.platform)
+            if adapter is not None:
+                await adapter.send(chat_id, unauthorized_group_hint(chat_id))
+                mark_seen(get_hermes_home() / "config.yaml", flag)
+        except Exception:
+            logger.debug("unauthorized group hint failed", exc_info=True)
+
+    async def _maybe_send_feishu_welcome(self, source: Any) -> None:
+        """#20 F3: one-time welcome for a newly-authorized group (flag off by default).
+
+        Off → no welcome (unchanged). On → send a capability intro once per chat.
+        Never raises.
+        """
+        try:
+            from agent.onboarding import (
+                feishu_welcome_card_body, feishu_welcome_enabled, feishu_welcome_flag,
+                is_seen, mark_seen,
+            )
+            if not feishu_welcome_enabled(os.environ):
+                return
+            if getattr(source, "chat_type", None) == "dm":
+                return
+            if getattr(source.platform, "value", None) != "feishu" and source.platform != Platform.FEISHU:
+                return
+            chat_id = str(getattr(source, "chat_id", "") or "")
+            if not chat_id:
+                return
+            flag = feishu_welcome_flag(chat_id)
+            if is_seen(_load_gateway_config(), flag):
+                return
+            adapter = self.adapters.get(source.platform)
+            if adapter is not None:
+                await self._send_feishu_status_card(
+                    adapter, chat_id, title="PNC-Agent", body=feishu_welcome_card_body(),
+                )
+                mark_seen(get_hermes_home() / "config.yaml", flag)
+        except Exception:
+            logger.debug("feishu welcome failed", exc_info=True)
+
+    async def _maybe_send_intake_clarification(self, event: Any, source: Any, triage: Dict[str, Any]) -> Optional[str]:
+        """If the request is ambiguous, send a structured clarification card and
+        return a short ack (so the caller defers task creation until answered).
+
+        Returns None to proceed on the normal path. Gated by INTAKE_CLARIFY_ENABLED;
+        when off this is a no-op and the existing flow is byte-for-byte unchanged.
+        """
+        if os.environ.get("INTAKE_CLARIFY_ENABLED", "").strip().lower() not in {"1", "true", "yes", "on"}:
+            return None
+        try:
+            from gateway.intake_clarification import needs_clarification, save_spec, render_clarification_card
+            from gateway.feishu_mention import resolve_display_name
+
+            request_id = str(event.message_id or "").strip()
+            if not request_id:
+                return None
+            originator = str(source.user_id or "").strip()
+            spec = needs_clarification(
+                request_id=request_id,
+                raw_text=str(event.text or ""),
+                extracted_fields=(triage or {}).get("extracted_fields") or {},
+                triage_kind=str((triage or {}).get("kind") or ""),
+                originator_open_id=originator,
+                chat_id=str(source.chat_id or ""),
+                thread_id=str(source.thread_id or ""),
+                triage_status=str((triage or {}).get("status") or ""),
+                triage_has_auto_dispatch=bool((triage or {}).get("auto_dispatch")),
+                triage_missing=list((triage or {}).get("missing_fields") or []),
+            )
+            if spec is None:
+                return None
+            save_spec(spec)
+            adapter = self.adapters.get(source.platform)
+            if adapter is None:
+                return None
+            name = resolve_display_name(originator) if originator else ""
+            card = render_clarification_card(spec, originator_name=name)
+            await self._send_feishu_interactive_card(
+                adapter, str(source.chat_id or ""), card,
+                reply_to=str(event.message_id or "") or None,
+                metadata={"intake_clarify_request_id": request_id},
+            )
+            return "我先确认几个点，麻烦点一下卡片上的选项（也可以直接打字回复），选完我就按你的选择接手。"
+        except Exception:
+            logger.warning("[intake-clarify] send clarification failed; proceeding on normal path", exc_info=True)
+            return None
+
 
     def _queue_during_drain_enabled(self) -> bool:
         # Both "queue" and "steer" modes imply the user doesn't want messages
@@ -6663,6 +8610,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.info("Active profile: %s", _profile)
         except Exception:
             pass
+        # G1Q3 issue preread preflight: Meegle CLI is the primary Feishu
+        # Project read source.  An expired/missing Meegle login must surface
+        # to operators as "Meegle 未登录/请授权" — never leak downstream as a
+        # PDCL-missing misreport.  Best-effort; never blocks startup.
+        try:
+            from gateway.pnc_issue_context import check_meegle_auth_status
+            _meegle_auth = check_meegle_auth_status()
+            if _meegle_auth.get("authenticated"):
+                _expires = _meegle_auth.get("expires_in_minutes")
+                if isinstance(_expires, int) and _expires <= 30:
+                    logger.warning(
+                        "Meegle auth preflight: token expires in %d min "
+                        "(host=%s). G1Q3 issue preread will degrade to "
+                        "issue_preread_blocked after expiry; run "
+                        "`meegle auth login --device-code` to refresh.",
+                        _expires, _meegle_auth.get("host") or "unknown",
+                    )
+                else:
+                    logger.info(
+                        "Meegle auth preflight: authenticated (host=%s, "
+                        "expires_in_minutes=%s)",
+                        _meegle_auth.get("host") or "unknown", _expires,
+                    )
+            elif _meegle_auth.get("authenticated") is False:
+                logger.warning(
+                    "Meegle auth preflight: NOT authenticated (%s). G1Q3 "
+                    "issue preread will report issue_preread_blocked "
+                    "(Meegle 未登录/请授权), not PDCL missing. Run "
+                    "`meegle auth login --device-code --host project.feishu.cn`.",
+                    _meegle_auth.get("error") or "unauthenticated",
+                )
+            else:
+                logger.warning(
+                    "Meegle auth preflight inconclusive: %s. G1Q3 issue "
+                    "preread may be degraded.",
+                    _meegle_auth.get("error") or "unknown error",
+                )
+        except Exception:
+            logger.debug("Meegle auth preflight failed at gateway startup", exc_info=True)
         try:
             from gateway.status import write_runtime_status
             write_runtime_status(gateway_state="starting", exit_reason=None)
@@ -6703,6 +8689,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "SIGNAL_ALLOWED_USERS", "SIGNAL_GROUP_ALLOWED_USERS",
             "TELEGRAM_GROUP_ALLOWED_USERS",
             "TELEGRAM_GROUP_ALLOWED_CHATS",
+            "FEISHU_GROUP_ALLOWED_CHATS",
             "EMAIL_ALLOWED_USERS",
             "SMS_ALLOWED_USERS", "MATTERMOST_ALLOWED_USERS",
             "MATRIX_ALLOWED_USERS", "DINGTALK_ALLOWED_USERS",
@@ -7977,6 +9964,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._running = False
             self._draining = True
 
+            # Wake any agent worker threads blocked on a clarify prompt so they
+            # release and graceful shutdown can complete within the SIGTERM grace
+            # window (else launchd escalates to SIGKILL -> dirty auto-resume loop).
+            # See design gateway-clarify-concurrency-watchdog-fix-20260620 (B2).
+            try:
+                from tools.clarify_gateway import abort_all_pending
+                _woke = abort_all_pending()
+                if _woke:
+                    logger.info("Shutdown: aborted %d pending clarify wait(s) to unblock worker threads", _woke)
+            except Exception:
+                logger.debug("clarify abort_all_pending during shutdown failed", exc_info=True)
+
             # Notify all chats with active agents BEFORE draining.
             # Adapters are still connected here, so messages can be sent.
             await self._notify_active_sessions_of_shutdown()
@@ -8844,8 +10843,438 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
+            else:
+                # #20 F2: unauthorized GROUP message. Default behavior is silent
+                # ignore; when FEISHU_UNAUTH_GROUP_HINT_ENABLED is on, send a
+                # one-time, rate-limited hint that surfaces the chat_id the owner
+                # must provision. Off by default → byte-for-byte unchanged.
+                await self._maybe_send_unauthorized_group_hint(source)
             return None
-        
+
+        # #20 F3: one-time welcome for a newly-authorized feishu group (flag off
+        # by default; no-op + zero cost when off).
+        if not is_internal:
+            await self._maybe_send_feishu_welcome(source)
+
+        # PNC-Agent G1Q3 RCA owner-review commands.
+        # Explicit "rca ..." lines are an owner/reviewer control plane, not a
+        # normal intake request.  Consume disabled/malformed/unauthorized
+        # review commands here so they do not fall through into the G1Q3
+        # handoff/intake path below.
+        if not is_internal and not event.is_command():
+            try:
+                from gateway.pnc_rca_owner_review import handle_owner_review_message
+
+                _review_result = handle_owner_review_message(event, hermes_home=_hermes_home)
+            except Exception as _review_exc:
+                logger.warning("PNC RCA owner review handling failed: %s", _review_exc)
+                _review_result = None
+            if _review_result is not None and getattr(_review_result, "handled", False):
+                return getattr(_review_result, "response", None)
+
+        # PNC-Agent fixed Feishu group binding dry-run gate.
+        # This is deliberately early and side-effect-light: reject/dry-run decisions
+        # return before session/agent execution, while unrelated chats continue on
+        # the normal Gateway path.  The business policy itself lives outside the
+        # Feishu adapter so platform transport stays generic.
+        if not is_internal and not event.is_command():
+            try:
+                from gateway.pnc_group_binding import (
+                    PNC_ALL_BUSINESS_TEST_GROUP_ID,
+                    evaluate_pnc_group_request,
+                    write_pnc_group_binding_receipt,
+                    write_pnc_group_handoff_receipt,
+                )
+                _active_thread_case = _find_g1q3_rca_task_by_thread(
+                    "feishu",
+                    getattr(source, "thread_id", None),
+                )
+                _pnc_decision = evaluate_pnc_group_request(
+                    platform=source.platform,
+                    chat_id=source.chat_id,
+                    text=_g1q3_request_text_with_metadata(event),
+                    active_thread_case=_active_thread_case,
+                )
+            except Exception as _pnc_exc:
+                logger.warning("PNC group binding policy failed open: %s", _pnc_exc)
+                _pnc_decision = None
+                _active_thread_case = None
+            if _pnc_decision is not None and _pnc_decision.group_binding_id:
+                event.metadata["pnc_group_binding"] = dataclasses.asdict(_pnc_decision)
+                try:
+                    _receipt_dir = getattr(self, "_pnc_group_binding_receipt_dir", None) or (_hermes_home / "pnc_agent" / "receipts" / "g1q3_rca")
+                    write_pnc_group_binding_receipt(
+                        receipt_dir=_receipt_dir,
+                        decision=_pnc_decision,
+                        platform=source.platform,
+                        chat_id=source.chat_id,
+                        user_id=source.user_id,
+                        message_id=event.message_id,
+                    )
+                except Exception as _receipt_exc:
+                    logger.warning("PNC group binding receipt write failed: %s", _receipt_exc)
+                if _pnc_decision.decision == "clarify":
+                    if await self._send_pnc_clarify_card(source, event, _pnc_decision):
+                        return None  # button card sent; its body carries the guidance
+                    return _pnc_decision.user_message or "请补充 G1Q3 case 后再发一次。"
+                if _pnc_decision.decision == "reject":
+                    return _pnc_decision.user_message or "这个群里的 PNC-Agent 只处理 G1Q3 RCA 标准任务。"
+                if _pnc_decision.decision == "dry_run":
+                    return (
+                        "G1Q3 RCA dry-run\n"
+                        f"binding: {_pnc_decision.group_binding_id}\n"
+                        f"business_line: {_pnc_decision.business_line_ref}\n"
+                        f"project_space: {_pnc_decision.project_space_ref}\n"
+                        f"template: {_pnc_decision.template_id}\n"
+                        f"output_cap: {_pnc_decision.output_cap}\n"
+                        "status: route decision only; no agent/worker execution started"
+                    )
+                if _pnc_decision.decision == "accepted":
+                    _handoff = _pnc_decision.handoff_contract or {}
+                    # Idempotency guard: the same issue/case re-triggered while a
+                    # prior handoff is still in its active window must not spawn
+                    # a duplicate VM task.  The key is reserved before the async
+                    # submit so two concurrent messages cannot both pass the
+                    # check (the reservation happens without an await in
+                    # between).  Entries expire by TTL; submit failure releases
+                    # the reservation immediately.
+                    _dedup_identifier = str(_handoff.get("work_item_id") or "").strip() or str(_handoff.get("case_id") or "").strip()
+                    _surface = "test" if str(source.chat_id or "").strip() == PNC_ALL_BUSINESS_TEST_GROUP_ID else "dedicated"
+                    _dedup_key = f"{_surface}:{_pnc_decision.template_id}:{_dedup_identifier}"
+                    _dedup_window = 1800.0 if _pnc_decision.template_id == "rca_issue_intake" else 600.0
+                    _recent = getattr(self, "_g1q3_recent_handoffs", None)
+                    if _recent is None:
+                        _recent = {}
+                        self._g1q3_recent_handoffs = _recent
+                    _now_mono = time.monotonic()
+                    for _stale_key in [k for k, v in _recent.items() if _now_mono - v[1] > v[2]]:
+                        _recent.pop(_stale_key, None)
+                    # Resume exemption: if the existing thread task is waiting on
+                    # the human (blocked/need_input), this re-trigger is the
+                    # originator returning with the data — re-run toward closure
+                    # instead of dedup-blocking, and supersede the stale blocked
+                    # task so the topic does not keep two cards.
+                    _is_g1q3_resume = _g1q3_resume_bypasses_dedup(_active_thread_case)
+                    if _is_g1q3_resume:
+                        _recent.pop(_dedup_key, None)
+                        _resume_prior_task_id = str((_active_thread_case or {}).get("task_id") or "").strip()
+                        if _resume_prior_task_id:
+                            _supersede_g1q3_task(_resume_prior_task_id, reason="re-run after originator supplied data")
+                        logger.info(
+                            "G1Q3 resume: thread task %s in %s; dedup bypass, re-running intake for %s",
+                            _resume_prior_task_id,
+                            str((_active_thread_case or {}).get("state") or ""),
+                            _dedup_identifier,
+                        )
+                    if _dedup_identifier and not _is_g1q3_resume and _dedup_key in _recent:
+                        _prior_task_id, _prior_ts, _prior_window = _recent[_dedup_key]
+                        _age_min = int((_now_mono - _prior_ts) // 60)
+                        if _prior_task_id:
+                            try:
+                                _sidecar_path = _hermes_home / "task-state" / f"{_prior_task_id}.json"
+                                _sidecar_body = json.loads(_sidecar_path.read_text(encoding="utf-8")) if _sidecar_path.exists() else {}
+                                _task_card = _sidecar_body.get("task_card") if isinstance(_sidecar_body.get("task_card"), dict) else {}
+                                if not _task_card:
+                                    _task_card = {
+                                        "schema_version": 1,
+                                        "task_id": str(_prior_task_id),
+                                        "vm_task_id": str(_prior_task_id),
+                                        "chat_id": getattr(source, "chat_id", None),
+                                        "thread_id": getattr(source, "thread_id", None),
+                                        "user_state": "host-created",
+                                        "delivery": {"conclusion": None, "artifact_path": None, "boundaries": [], "next_options": []},
+                                    }
+                                _task_card["status_line"] = (
+                                    f"重复请求已收到：这个问题 {_age_min} 分钟前已接单，仍在处理窗口内；"
+                                    "本次不再重复建任务。"
+                                )
+                                _task_card["one_card_policy"] = True
+                                _milestones = _task_card.get("milestones") if isinstance(_task_card.get("milestones"), list) else []
+                                if not _milestones:
+                                    _milestones.append({"ts": _pnc_feishu_business_now_iso(), "label": "任务建好"})
+                                _milestone_label = "收到重复请求，沿用当前任务"
+                                if not any(isinstance(_m, dict) and _m.get("label") == _milestone_label for _m in _milestones):
+                                    _milestones.append({"ts": _pnc_feishu_business_now_iso(), "label": _milestone_label})
+                                _task_card["milestones"] = _milestones
+                                _sidecar_body["task_card"] = _task_card
+                                _sidecar_body["updated_at"] = _pnc_feishu_business_now_iso()
+                                _tmp_path = _sidecar_path.with_suffix(_sidecar_path.suffix + ".tmp")
+                                _tmp_path.write_text(json.dumps(_sidecar_body, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+                                _tmp_path.replace(_sidecar_path)
+                                return ""
+                            except Exception:
+                                logger.debug("G1Q3 duplicate one-card update failed", exc_info=True)
+                        return (
+                            f"这个问题 {_age_min} 分钟前已接单，仍在处理窗口内，本次不再重复建任务。\n"
+                            f"追踪号：{_prior_task_id or '生成中（上一次请求仍在提交）'}\n"
+                            f"如需强制重新处理，请等当前任务完成或联系运维。"
+                        )
+                    if _dedup_identifier:
+                        _recent[_dedup_key] = ("", _now_mono, _dedup_window)
+                    _session_env_tokens = None
+                    _clear_session_vars = None
+                    try:
+                        from gateway.session_context import set_session_vars, clear_session_vars as _clear_session_vars
+                        _session_env_tokens = set_session_vars(
+                            platform=source.platform.value if hasattr(source.platform, "value") else str(source.platform),
+                            chat_id=str(source.chat_id or ""),
+                            chat_name=str(source.chat_name or ""),
+                            thread_id=str(source.thread_id or ""),
+                            user_id=str(source.user_id or ""),
+                            user_name=str(source.user_name or ""),
+                            session_key=self._session_key_for_source(source),
+                            message_id=str(event.message_id or ""),
+                        )
+                    except Exception as _session_ctx_exc:
+                        logger.warning("PNC group handoff session context setup failed: %s", _session_ctx_exc)
+                    try:
+                        # Run the full handoff (Meegle subprocesses, CIFS
+                        # artifact write, create_task subprocess) off the
+                        # event loop: a single intake can take minutes at
+                        # worst and must not freeze gateway-wide message
+                        # handling.  contextvars (session routing) propagate
+                        # into the worker thread automatically.
+                        _submit_result = await asyncio.to_thread(
+                            _submit_g1q3_rca_status_handoff,
+                            template_id=_pnc_decision.template_id or "",
+                            case_id=str(_handoff.get("case_id") or ""),
+                            requester=str(source.user_id or ""),
+                            source_group_id=str(source.chat_id or ""),
+                            message_id=str(event.message_id or ""),
+                            work_item_id=str(_handoff.get("work_item_id") or ""),
+                            request_text=_g1q3_request_text_with_metadata(event),
+                            receipt_dir=_receipt_dir,
+                        )
+                    finally:
+                        if _session_env_tokens is not None and _clear_session_vars is not None:
+                            try:
+                                _clear_session_vars(_session_env_tokens)
+                            except Exception:
+                                pass
+                    event.metadata["pnc_group_handoff"] = _submit_result
+                    try:
+                        write_pnc_group_handoff_receipt(
+                            receipt_dir=_receipt_dir,
+                            decision=_pnc_decision,
+                            submit_result=_submit_result,
+                            platform=source.platform,
+                            chat_id=source.chat_id,
+                            user_id=source.user_id,
+                            message_id=event.message_id,
+                        )
+                    except Exception as _handoff_receipt_exc:
+                        logger.warning("PNC group handoff receipt write failed: %s", _handoff_receipt_exc)
+                    if not _submit_result.get("success"):
+                        if _dedup_identifier:
+                            _recent.pop(_dedup_key, None)
+                        return (
+                            "G1Q3 RCA 状态查询暂时没有接单成功。\n"
+                            f"原因：{_submit_result.get('error') or '任务提交失败'}\n"
+                            "我已保留这次请求记录，稍后可以按同一问题重试。"
+                        )
+                    _task = _submit_result.get("task") or {}
+                    _task_id = _task.get("task_id") or _task.get("id") or "unknown"
+                    if _dedup_identifier:
+                        _recent[_dedup_key] = (str(_task_id), _now_mono, _dedup_window)
+                    self._record_pnc_handoff_task(
+                        event=event,
+                        source=source,
+                        submit_result=_submit_result,
+                        request_summary=str(event.text or ""),
+                    )
+                    _case_label = str(_handoff.get("case_id") or "").strip()
+                    _issue_label = str(_handoff.get("work_item_id") or "").strip()
+                    if _case_label and not _case_label.upper().startswith("G1Q3"):
+                        _case_label = f"G1Q3-{_case_label}"
+                    _target_label = _case_label or (f"飞书问题 {_issue_label}" if _issue_label else "这个 G1Q3 问题")
+                    if _pnc_decision.template_id == "rca_case_evidence_summary":
+                        _action_line = f"已接单：正在检查 {_target_label} 还缺少哪些 RCA 输入/证据。"
+                        _scope_line = "我会先查已有 intake/产物状态，并把缺项翻译成可补充字段；群里只返回 L0/L1 简要结论。"
+                    elif _pnc_decision.template_id == "rca_case_status_check":
+                        _action_line = f"已接单：正在查询 {_target_label} 的 RCA 进展/结论/报告位置。"
+                        _scope_line = "我会优先读取已有任务和报告产物；群里只返回简要结论，详细证据不直接刷屏。"
+                    else:
+                        _action_line = f"已接单：正在读取并分析 {_target_label}。"
+                        _scope_line = "我会先做问题字段 intake 和现有 RCA 状态检查；群里只返回简要结论，详细证据不直接刷屏。"
+                    # Surface host-side issue preread blockers in the group
+                    # ack so an expired Meegle login reads as "请重新授权",
+                    # never as a PDCL-missing misreport.
+                    _preread_info = _submit_result.get("issue_preread") or {}
+                    _preread_blocker = _preread_info.get("blocker") or {}
+                    _blocker_kind = str(_preread_blocker.get("kind") or "")
+                    if "unauthenticated" in _blocker_kind or str(_preread_info.get("source") or "") == "mcp_auto_degraded":
+                        try:
+                            await self._notify_g1q3_meegle_auth_alert(_preread_info)
+                        except Exception:
+                            logger.warning("Meegle auth alert dispatch failed", exc_info=True)
+                    if "unauthenticated" in _blocker_kind:
+                        _notice_line = (
+                            "\n注意：主控 Meegle 登录已过期/未授权，本次暂未读取到飞书 issue 字段"
+                            "（这不代表 问题数据地址_PDCL 缺失）。请联系运维重新授权 Meegle 后再让我重试。"
+                        )
+                    elif _blocker_kind.startswith("issue_field_"):
+                        _gap_action = str((_submit_result.get("field_gap_comment") or {}).get("action") or "")
+                        _gap_suffix = (
+                            "我已在 issue 卡片留言提醒补充。" if _gap_action == "posted"
+                            else "（此前已留言提醒过）" if _gap_action in {"skipped_recent", "skipped_existing"}
+                            else ""
+                        )
+                        _notice_line = (
+                            "\n注意：飞书 issue 字段已读取，但 问题数据地址_PDCL 缺失或格式不合法；"
+                            f"请在飞书卡片补充 mdi download 命令后再让我重试。{_gap_suffix}"
+                        )
+                    elif _blocker_kind:
+                        _notice_line = (
+                            "\n注意：主控侧本次未成功读取飞书 issue 字段/评论（issue_preread_blocked），"
+                            "这不代表 问题数据地址_PDCL 缺失；稍后可让我重试。"
+                        )
+                    else:
+                        _notice_line = ""
+                    try:
+                        _sidecar_path = _hermes_home / "task-state" / f"{_task_id}.json"
+                        _sidecar_body = json.loads(_sidecar_path.read_text(encoding="utf-8")) if _sidecar_path.exists() else {}
+                        _task_card = _sidecar_body.get("task_card") if isinstance(_sidecar_body.get("task_card"), dict) else {}
+                        if _task_card:
+                            _task_card["status_line"] = _action_line
+                            _task_card["scope_line"] = _scope_line
+                            _task_card["one_card_policy"] = True
+                            if _notice_line:
+                                _delivery = _task_card.get("delivery") if isinstance(_task_card.get("delivery"), dict) else {}
+                                _boundaries = _delivery.get("boundaries") if isinstance(_delivery.get("boundaries"), list) else []
+                                _clean_notice = _notice_line.strip()
+                                if _clean_notice and _clean_notice not in _boundaries:
+                                    _boundaries.append(_clean_notice)
+                                _delivery["boundaries"] = _boundaries
+                                _task_card["delivery"] = _delivery
+                            _sidecar_body["task_card"] = _task_card
+                            _sidecar_body["updated_at"] = _pnc_feishu_business_now_iso()
+                            _tmp_path = _sidecar_path.with_suffix(_sidecar_path.suffix + ".tmp")
+                            _tmp_path.write_text(json.dumps(_sidecar_body, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+                            _tmp_path.replace(_sidecar_path)
+                    except Exception:
+                        logger.debug("G1Q3 handoff one-card ack sidecar update failed", exc_info=True)
+                    return ""
+
+        # PNC-Agent integration-tools Feishu group intake binding.
+        # This group is a business intake surface: group members have default
+        # business permission, but every task still needs owner/acceptance
+        # responsibility and high-risk actions stay manual_review/escalate.
+        if (
+            not is_internal
+            and not event.is_command()
+            and _is_integration_tools_intake_event(source, event.text or "")
+        ):
+            _receipt_dir = _hermes_home / "pnc_agent" / "receipts" / "integration_tools"
+            _session_env_tokens = None
+            _clear_session_vars = None
+            try:
+                from gateway.session_context import set_session_vars, clear_session_vars as _clear_session_vars
+                _session_env_tokens = set_session_vars(
+                    platform=source.platform.value if hasattr(source.platform, "value") else str(source.platform),
+                    chat_id=str(source.chat_id or ""),
+                    chat_name=str(source.chat_name or ""),
+                    thread_id=str(source.thread_id or ""),
+                    user_id=str(source.user_id or ""),
+                    user_name=str(source.user_name or ""),
+                    session_key=self._session_key_for_source(source),
+                    message_id=str(event.message_id or ""),
+                )
+            except Exception as _session_ctx_exc:
+                logger.warning("Integration-tools session context setup failed: %s", _session_ctx_exc)
+            try:
+                _thread_id = str(source.thread_id or "")
+                _message_id = str(event.message_id or "")
+                _existing_thread_task = None
+                if _thread_id and _thread_id not in {"", _message_id, f"topic:{_message_id}"}:
+                    _existing_thread_task = _find_integration_tools_task_by_thread("feishu", _thread_id)
+                if _existing_thread_task is not None:
+                    _submit_result = _append_integration_tools_thread_followup(
+                        task_id=str(_existing_thread_task.get("task_id") or _existing_thread_task.get("id") or ""),
+                        requester=str(source.user_id or ""),
+                        source_group_id=str(source.chat_id or ""),
+                        message_id=_message_id,
+                        source_thread_id=_thread_id,
+                        request_text=str(event.text or ""),
+                        receipt_dir=_receipt_dir,
+                    )
+                else:
+                    _pre_triage = _classify_mdrive4_intake_request(str(event.text or ""), originator=str(source.user_id or ""))
+                    _clarify_ack = await self._maybe_send_intake_clarification(event, source, _pre_triage)
+                    if _clarify_ack is not None:
+                        # Ambiguous: a clarification card was sent. Defer task creation
+                        # until the user answers; return the ack now.
+                        event.metadata["integration_tools_handoff"] = {
+                            "success": True,
+                            "task": {"task_id": "intake-clarify-pending"},
+                            "dedupe_hit": False,
+                            "clarification_pending": True,
+                        }
+                        return _clarify_ack
+                    if _pre_triage.get("kind") == "question" and _pre_triage.get("status") == "closed":
+                        _submit_result = {
+                            "success": True,
+                            "task": {"task_id": "question-no-task"},
+                            "dedupe_hit": False,
+                            "triage": _pre_triage,
+                            "direct_answer": True,
+                            "close_loop_policy": INTEGRATION_TOOLS_CLOSE_LOOP_POLICY,
+                        }
+                    else:
+                        _submit_result = _submit_integration_tools_intake_handoff(
+                            requester=str(source.user_id or ""),
+                            source_group_id=str(source.chat_id or ""),
+                            message_id=_message_id,
+                            source_thread_id=_thread_id,
+                            request_text=str(event.text or ""),
+                            receipt_dir=_receipt_dir,
+                        )
+            finally:
+                if _session_env_tokens is not None and _clear_session_vars is not None:
+                    try:
+                        _clear_session_vars(_session_env_tokens)
+                    except Exception:
+                        pass
+            event.metadata["integration_tools_handoff"] = _submit_result
+            if not isinstance(_submit_result, dict) or not _submit_result.get("success"):
+                return (
+                    "集成与工具需求暂时没有接单成功。\n"
+                    f"原因：{(_submit_result or {}).get('error') if isinstance(_submit_result, dict) else '任务提交失败'}\n"
+                    "我已保留这次请求记录，稍后可以按同一需求重试。"
+                )
+            _task = _submit_result.get("task") or {}
+            _task_id = _task.get("task_id") or _task.get("id") or "unknown"
+            _triage = _submit_result.get("triage") or {}
+            if _submit_result.get("direct_answer") and _triage.get("kind") == "question":
+                return str(_triage.get("direct_reply") or _triage.get("reply_hint") or "这是澄清问句，我直接在群内回答，不创建执行任务。").strip()
+            if _submit_result.get("thread_followup"):
+                _status_hint = str(_submit_result.get("status_hint") or "").strip()
+                _status_line = "已记录到原需求，不新建单。"
+                _boundary_lines = [_status_hint] if _status_hint else []
+            elif _submit_result.get("dedupe_hit"):
+                _status_line = "已接过单，沿用原任务。"
+                _boundary_lines = []
+            elif _triage.get("status") == "closed" and _triage.get("reply_hint"):
+                _status_line = f"已记录：{_triage.get('reply_hint')}"
+                _boundary_lines = []
+            elif _submit_result.get("auto_dispatch") and isinstance(_submit_result.get("auto_dispatch"), dict) and _submit_result["auto_dispatch"].get("ok"):
+                _status_line = f"已派发：{_submit_result['auto_dispatch'].get('cli') or 'fixed-CLI'} 已进入受治理 VM fixed-CLI 队列，等待执行回执。"
+                _boundary_lines = [_integration_tools_close_loop_reply_line(), "真实执行只走受治理 fixed-CLI；不裸跑 docker/mcap_service/业务脚本。"]
+            elif _triage.get("status") == "need_input" and _triage.get("reply_hint"):
+                _status_line = f"已接单。需要补充：{_triage.get('reply_hint')}"
+                _boundary_lines = [_integration_tools_close_loop_reply_line()]
+            else:
+                _status_line = "已接单。会先做完整性和风险检查；代码/模块以 VM fact source 为准。"
+                _boundary_lines = [_integration_tools_close_loop_reply_line()]
+            self._record_integration_tools_handoff_task(
+                event=event,
+                source=source,
+                submit_result=_submit_result,
+                request_summary=str(event.text or ""),
+                status_line=_status_line,
+                boundaries=_boundary_lines,
+            )
+            return ""
+
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
         # forwarded it to the user; now the user's reply goes back via
@@ -10219,6 +12648,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         history = history or []
         message_text = event.text or ""
+        try:
+            platforms = getattr(self.config, "platforms", {}) or {}
+            feishu_config = platforms.get(Platform.FEISHU) or platforms.get("feishu")
+            feishu_extra = getattr(feishu_config, "extra", None) or {}
+            raw_bot_names = (
+                feishu_extra.get("bot_display_names")
+                or feishu_extra.get("bot_display_name")
+                or feishu_extra.get("bot_name")
+            )
+            bot_display_names = (
+                raw_bot_names
+                if isinstance(raw_bot_names, (list, tuple, set))
+                else ([raw_bot_names] if raw_bot_names else None)
+            )
+        except Exception:
+            bot_display_names = None
+        message_text = sanitize_feishu_inbound_text(
+            source.platform,
+            message_text,
+            bot_display_names=bot_display_names,
+            metadata=getattr(event, "metadata", None),
+            record_metrics=True,
+            registry_scope={"chat_id": source.chat_id, "thread_id": source.thread_id},
+        )
+        task_context = self._build_inbound_task_context(event=event, source=source)
         _group_sessions_per_user = getattr(self.config, "group_sessions_per_user", True)
         _thread_sessions_per_user = getattr(self.config, "thread_sessions_per_user", False)
         # Prefer the already resolved session key from the caller so this write
@@ -10496,7 +12950,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as exc:
                 logger.debug("@ context reference expansion failed: %s", exc)
 
+        if task_context:
+            message_text = f"{message_text}\n\n[Task context]\n{task_context}"
+
         return message_text
+
+    def _build_inbound_task_context(self, *, event: MessageEvent, source: SessionSource) -> str:
+        """Build a compact current-topic task summary for short follow-ups."""
+        try:
+            if getattr(source, "platform", None) != Platform.FEISHU:
+                return ""
+            if not getattr(source, "thread_id", None):
+                return ""
+
+            from gateway.tasks.store import TaskStore
+
+            store = TaskStore(db_path=_hermes_home / "analytics" / "tasks.db")
+            feishu_meta = {}
+            if isinstance(getattr(event, "metadata", None), dict):
+                feishu_meta = event.metadata.get("feishu") or {}
+
+            tasks = store.find_recent_for_topic(
+                chat_id=str(getattr(source, "chat_id", "") or ""),
+                thread_id=str(getattr(source, "thread_id", "") or "") or None,
+                message_id=str(
+                    feishu_meta.get("root_id")
+                    or feishu_meta.get("message_id")
+                    or getattr(event, "message_id", "")
+                    or ""
+                )
+                or None,
+                limit=3,
+            )
+            if not tasks:
+                return ""
+
+            task = tasks[0]
+            lines = [
+                "Use this current topic task context first. For short ambiguous follow-ups "
+                "in this Feishu topic, do not rely on cross-session search unless the user "
+                "explicitly asks for history or prior local work.",
+                f"Current topic task_id: {task.task_id}",
+                f"status: {task.status.value}",
+            ]
+            if task.request_summary:
+                lines.append(f"request: {task.request_summary[:240]}")
+            if task.delivery_verified is not None:
+                lines.append(f"delivery_verified: {'yes' if task.delivery_verified else 'no'}")
+            if task.receipt_path:
+                lines.append(f"receipt_path: {task.receipt_path}")
+            if task.error_class or task.error_message:
+                error = f"{task.error_class or 'error'}"
+                if task.error_message:
+                    error += f": {str(task.error_message)[:200]}"
+                lines.append(error)
+            return "\n".join(lines)
+        except Exception:
+            logger.debug("Failed to build inbound task context", exc_info=True)
+            return ""
 
     def _consume_pending_native_image_paths(self, session_key: str) -> List[str]:
         pending_native = getattr(self, "_pending_native_image_paths_by_session", None)
@@ -10538,6 +13049,313 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
         return source
+
+    def _emit_request_start_event(self, event, source, session_entry) -> None:
+        """Emit a structured request:start event for task tracing."""
+        try:
+            from hermes_events import EventEmitter
+            trace_file = _hermes_home / "analytics" / "events.jsonl"
+            _task_store = None
+            try:
+                from gateway.tasks.store import TaskStore
+                _task_store = TaskStore(db_path=_hermes_home / "analytics" / "tasks.db")
+            except Exception:
+                pass
+            emitter = EventEmitter(trace_file=trace_file, task_store=_task_store)
+            text = getattr(event, "text", "") or ""
+            summary = text[:80]
+            user_id = getattr(source, "user_id", None) or getattr(source, "user_id_alt", None)
+            emitter.emit("request:start", {
+                "task_id": getattr(session_entry, "session_id", ""),
+                "platform": source.platform.value if getattr(source, "platform", None) else "",
+                "user_id": user_id,
+                "user_name": getattr(source, "user_name", None),
+                "chat_id": getattr(source, "chat_id", None),
+                "chat_type": getattr(source, "chat_type", None),
+                "thread_id": getattr(source, "thread_id", None),
+                "message_id": getattr(event, "message_id", None),
+                "request_summary": summary,
+            })
+        except Exception:
+            logger.debug("request:start emission failed", exc_info=True)
+
+    _MEEGLE_AUTH_ALERT_INTERVAL_SECONDS = 3600.0
+
+    async def _notify_g1q3_meegle_auth_alert(self, preread: dict) -> None:
+        """Alert operators (home channel) that the Meegle login is expired.
+
+        Rate-limited to once per hour per gateway process.  Best-effort: any
+        failure here must never affect the intake reply path.
+        """
+        try:
+            now = time.monotonic()
+            last = getattr(self, "_last_meegle_auth_alert_monotonic", 0.0)
+            if now - last < self._MEEGLE_AUTH_ALERT_INTERVAL_SECONDS:
+                return
+            self._last_meegle_auth_alert_monotonic = now
+            degraded = str(preread.get("source") or "") == "mcp_auto_degraded"
+            blocker = preread.get("blocker") or {}
+            status_line = (
+                "G1Q3 issue 预读取已自动降级到 MCP 兜底（本次仍读取成功）。"
+                if degraded
+                else f"G1Q3 issue 预读取被阻塞：{str(blocker.get('kind') or 'host_meegle_preread_unauthenticated')}"
+            )
+            msg = (
+                "[G1Q3-RCA 运维告警] Meegle 登录已过期/未授权。\n"
+                f"{status_line}\n"
+                "请在主控机执行：meegle auth login --device-code --host project.feishu.cn\n"
+                "（本提醒每小时最多一次）"
+            )
+            for platform, adapter in list(self.adapters.items()):
+                home = self.config.get_home_channel(platform)
+                if not home or not home.chat_id:
+                    continue
+                try:
+                    metadata = {"thread_id": home.thread_id} if home.thread_id else None
+                    if metadata:
+                        await adapter.send(str(home.chat_id), msg, metadata=metadata)
+                    else:
+                        await adapter.send(str(home.chat_id), msg)
+                    logger.warning("Meegle auth alert sent to home channel %s:%s", platform.value, home.chat_id)
+                    return
+                except Exception as send_exc:
+                    logger.warning("Meegle auth alert send failed for %s: %s", platform.value, send_exc)
+            logger.warning("Meegle auth alert: no home channel available; logged only")
+        except Exception:
+            logger.warning("Meegle auth alert failed", exc_info=True)
+
+    def _record_integration_tools_handoff_task(self, *, event, source, submit_result: dict, request_summary: str, status_line: str, boundaries: list[str] | None = None) -> None:
+        """Persist integration-tools intake/follow-up as a one-task-one-card sidecar."""
+        try:
+            if not isinstance(submit_result, dict) or not submit_result.get("success"):
+                return
+            task_payload = submit_result.get("task") or {}
+            if not isinstance(task_payload, dict):
+                return
+            task_id = str(task_payload.get("task_id") or task_payload.get("id") or "").strip()
+            if not task_id:
+                return
+            from gateway.tasks.store import TaskStore
+            from gateway.tasks.types import Task, TaskStatus, _infer_task_type
+            store = TaskStore(db_path=_hermes_home / "analytics" / "tasks.db")
+            existing = store.get(task_id)
+            started_at = getattr(existing, "started_at", None) or time.time()
+            user_id = getattr(source, "user_id", None) or getattr(source, "user_id_alt", None)
+            auto_dispatch = submit_result.get("auto_dispatch") if isinstance(submit_result.get("auto_dispatch"), dict) else {}
+            child_vm_task_id = str(auto_dispatch.get("child_task_id") or "").strip() or task_id
+            task = Task(
+                task_id=task_id,
+                status=TaskStatus.RUNNING,
+                task_type=_infer_task_type(request_summary),
+                user_id=user_id,
+                platform=source.platform.value if getattr(source, "platform", None) else "",
+                request_summary=(request_summary or "")[:1000],
+                started_at=started_at,
+                completed_at=getattr(existing, "completed_at", None),
+                agent_route="integration-tools",
+                chat_id=getattr(source, "chat_id", None),
+                chat_type=getattr(source, "chat_type", None),
+                thread_id=getattr(source, "thread_id", None),
+                message_id=getattr(event, "message_id", None),
+                receipt_path=getattr(existing, "receipt_path", None),
+                delivery_verified=getattr(existing, "delivery_verified", None),
+                vm_task_id=child_vm_task_id,
+            )
+            store.upsert(task)
+            try:
+                from scripts.vm_task_state_bridge import _atomic_write_json, _load_existing, sidecar_path
+                sidecar = sidecar_path(task_id)
+                body = _load_existing(sidecar)
+                existing_card = body.get("task_card") if isinstance(body.get("task_card"), dict) else {}
+                now_iso = _pnc_feishu_business_now_iso()
+                existing_delivery = existing_card.get("delivery") if isinstance(existing_card.get("delivery"), dict) else {}
+                existing_boundaries = existing_delivery.get("boundaries") if isinstance(existing_delivery.get("boundaries"), list) else []
+                merged_boundaries = []
+                for item in [*existing_boundaries, *(boundaries or [])]:
+                    text = str(item or "").strip()
+                    if text and text not in merged_boundaries:
+                        merged_boundaries.append(text)
+                milestones = existing_card.get("milestones") if isinstance(existing_card.get("milestones"), list) else []
+                if not milestones:
+                    milestones = [{"ts": now_iso, "label": "任务建好"}]
+                if child_vm_task_id != task_id:
+                    label = f"已自动派发 VM fixed-CLI：{child_vm_task_id}"
+                    if not any(isinstance(item, dict) and item.get("label") == label for item in milestones):
+                        milestones.append({"ts": now_iso, "label": label})
+                user_state = "running" if child_vm_task_id != task_id else "host-created"
+                if child_vm_task_id != task_id and (not status_line or "已派发" not in str(status_line)):
+                    status_line = f"已派发：{auto_dispatch.get('cli') or 'fixed-CLI'} 已进入受治理 VM fixed-CLI 队列，等待执行回执。"
+                task_card = {
+                    "schema_version": 1,
+                    "task_id": task.task_id,
+                    "vm_task_id": task.vm_task_id,
+                    "run_id": child_vm_task_id if child_vm_task_id != task_id else existing_card.get("run_id"),
+                    "card_message_id": existing_card.get("card_message_id"),
+                    "last_sent_hash": existing_card.get("last_sent_hash"),
+                    "last_render_hash": existing_card.get("last_render_hash"),
+                    "last_update_ts": existing_card.get("last_update_ts"),
+                    "chat_id": task.chat_id,
+                    "thread_id": task.thread_id,
+                    "user_state": user_state,
+                    "status_line": str(status_line or "已接单。会先做完整性和风险检查。"),
+                    "scope_line": "集成与工具需求：详细证据写 receipt，话题里只保留任务卡片。",
+                    "one_card_policy": True,
+                    "completion_delivery": {"required": True, "mode": "thread_reply", "must_carry": ["conclusion", "cause", "fixed_state", "html_url", "verification"], "at_originator": True, "max_attempts": 3},
+                    "milestones": milestones,
+                    "pending_confirms": existing_card.get("pending_confirms") if isinstance(existing_card.get("pending_confirms"), list) else [],
+                    "delivery": {
+                        "conclusion": existing_delivery.get("conclusion"),
+                        "artifact_path": existing_delivery.get("artifact_path"),
+                        "boundaries": merged_boundaries,
+                        "next_options": existing_delivery.get("next_options") if isinstance(existing_delivery.get("next_options"), list) else [],
+                    },
+                }
+                body["task_card"] = {k: v for k, v in task_card.items() if v is not None}
+                body["completion_delivery"] = {"required": True, "mode": "thread_reply", "must_carry": ["conclusion", "cause", "fixed_state", "html_url", "verification"], "at_originator": True, "max_attempts": 3}
+                _external_delivery = body.get("external_delivery") if isinstance(body.get("external_delivery"), dict) else {}
+                if _external_delivery.get("target") is None and _external_delivery.get("status") == "skipped":
+                    body.pop("external_delivery", None)
+                body["updated_at"] = now_iso
+                _atomic_write_json(sidecar, body)
+            except Exception:
+                logger.debug("Integration-tools one-card sidecar write failed", exc_info=True)
+        except Exception:
+            logger.debug("Integration-tools TaskStore persistence failed", exc_info=True)
+
+    def _record_pnc_handoff_task(self, *, event, source, submit_result: dict, request_summary: str) -> None:
+        """Persist a Feishu PNC VM handoff into the user-facing TaskStore.
+
+        The fixed PNC group-binding path returns before the normal agent session
+        is created, so it must write the task observability row itself.  Without
+        this, users can receive a Feishu "已接单" reply while /tasks has no
+        corresponding row until a manual backfill happens.
+        """
+        try:
+            if not isinstance(submit_result, dict) or not submit_result.get("success"):
+                return
+            task_payload = submit_result.get("task") or {}
+            if not isinstance(task_payload, dict):
+                return
+            task_id = str(task_payload.get("task_id") or task_payload.get("id") or "").strip()
+            if not task_id:
+                return
+
+            from gateway.tasks.store import TaskStore
+            from gateway.tasks.types import Task, TaskStatus, _infer_task_type
+
+            store = TaskStore(db_path=_hermes_home / "analytics" / "tasks.db")
+            existing = store.get(task_id)
+            started_at = getattr(existing, "started_at", None) or time.time()
+            user_id = getattr(source, "user_id", None) or getattr(source, "user_id_alt", None)
+            vm_task_id = str(task_payload.get("vm_task_id") or task_id)
+            task = Task(
+                task_id=task_id,
+                status=TaskStatus.RUNNING,
+                task_type=_infer_task_type(request_summary),
+                user_id=user_id,
+                platform=source.platform.value if getattr(source, "platform", None) else "",
+                request_summary=(request_summary or "")[:1000],
+                started_at=started_at,
+                completed_at=getattr(existing, "completed_at", None),
+                agent_route="g1q3-rca",
+                chat_id=getattr(source, "chat_id", None),
+                chat_type=getattr(source, "chat_type", None),
+                thread_id=getattr(source, "thread_id", None),
+                message_id=getattr(event, "message_id", None),
+                receipt_path=getattr(existing, "receipt_path", None),
+                delivery_verified=getattr(existing, "delivery_verified", None),
+                vm_task_id=vm_task_id,
+            )
+            store.upsert(task)
+            try:
+                from gateway.feishu_task_card import render_status_line
+                from scripts.vm_task_state_bridge import _atomic_write_json, _load_existing, sidecar_path
+
+                sidecar = sidecar_path(task_id)
+                body = _load_existing(sidecar)
+                existing_card = body.get("task_card") if isinstance(body.get("task_card"), dict) else {}
+                now_iso = _pnc_feishu_business_now_iso()
+                existing_delivery = existing_card.get("delivery") if isinstance(existing_card.get("delivery"), dict) else {}
+                task_card = {
+                    "schema_version": 1,
+                    "task_id": task.task_id,
+                    "vm_task_id": task.vm_task_id,
+                    "card_message_id": existing_card.get("card_message_id"),
+                    "last_sent_hash": existing_card.get("last_sent_hash"),
+                    "last_render_hash": existing_card.get("last_render_hash"),
+                    "last_update_ts": existing_card.get("last_update_ts"),
+                    "chat_id": task.chat_id,
+                    "thread_id": task.thread_id,
+                    "user_state": "host-created",
+                    "completion_delivery": {"required": True, "mode": "thread_reply", "must_carry": ["conclusion", "cause", "fixed_state", "html_url", "verification"], "at_originator": True, "max_attempts": 3},
+                    "one_card_policy": existing_card.get("one_card_policy"),
+                    "scope_line": existing_card.get("scope_line"),
+                    "milestones": existing_card.get("milestones") if isinstance(existing_card.get("milestones"), list) and existing_card.get("milestones") else [{"ts": now_iso, "label": "任务建好"}],
+                    "pending_confirms": existing_card.get("pending_confirms") if isinstance(existing_card.get("pending_confirms"), list) else [],
+                    "delivery": {
+                        "conclusion": existing_delivery.get("conclusion"),
+                        "artifact_path": existing_delivery.get("artifact_path"),
+                        "boundaries": existing_delivery.get("boundaries") if isinstance(existing_delivery.get("boundaries"), list) else [],
+                        "next_options": existing_delivery.get("next_options") if isinstance(existing_delivery.get("next_options"), list) else [],
+                    },
+                }
+                task_card["status_line"] = render_status_line(task_card)
+                body["task_card"] = {k: v for k, v in task_card.items() if v is not None}
+                body["completion_delivery"] = {"required": True, "mode": "thread_reply", "must_carry": ["conclusion", "cause", "fixed_state", "html_url", "verification"], "at_originator": True, "max_attempts": 3}
+                _external_delivery = body.get("external_delivery") if isinstance(body.get("external_delivery"), dict) else {}
+                if _external_delivery.get("target") is None and _external_delivery.get("status") == "skipped":
+                    body.pop("external_delivery", None)
+                body["updated_at"] = now_iso
+                _atomic_write_json(sidecar, body)
+            except Exception:
+                logger.debug("PNC handoff task_card sidecar write failed", exc_info=True)
+        except Exception:
+            logger.debug("PNC handoff TaskStore persistence failed", exc_info=True)
+
+    def _emit_task_terminal_event(
+        self,
+        *,
+        task_id: str,
+        status: str,
+        total_tokens: int = 0,
+        api_calls: int = 0,
+        tool_calls: int = 0,
+        message_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        error_class: Optional[str] = None,
+        error_message: Optional[str] = None,
+    ) -> None:
+        """Emit a terminal task event for normal gateway agent turns."""
+        try:
+            from hermes_events import EventEmitter
+
+            trace_file = _hermes_home / "analytics" / "events.jsonl"
+            _task_store = None
+            try:
+                from gateway.tasks.store import TaskStore
+                _task_store = TaskStore(db_path=_hermes_home / "analytics" / "tasks.db")
+            except Exception:
+                pass
+            emitter = EventEmitter(trace_file=trace_file, task_store=_task_store)
+            if status == "completed":
+                emitter.emit("task:complete", {
+                    "task_id": task_id,
+                    "total_tokens": int(total_tokens or 0),
+                    "api_calls": int(api_calls or 0),
+                    "tool_calls": int(tool_calls or 0),
+                    "message_id": message_id,
+                    "thread_id": thread_id,
+                    "delivery_verified": True if message_id else None,
+                })
+            elif status == "failed":
+                emitter.emit("task:failed", {
+                    "task_id": task_id,
+                    "error_class": error_class or "AgentError",
+                    "error_message": (error_message or "")[:1000],
+                })
+        except Exception:
+            logger.debug("task terminal event emission failed", exc_info=True)
+
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
@@ -11298,6 +14116,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message_text = _clean_message_text
         except Exception as _ts_err:
             logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
+        self._emit_request_start_event(event, source, session_entry)
 
         # Bind this gateway run generation to the adapter's active-session
         # event so deferred post-delivery callbacks can be released by the
@@ -11846,6 +14665,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_entry.session_id,
                 )
                 response = ""
+            if agent_failed_early or is_context_overflow_failure:
+                self._emit_task_terminal_event(
+                    task_id=session_entry.session_id,
+                    status="failed",
+                    error_class="ContextOverflow" if is_context_overflow_failure else "AgentError",
+                    error_message=str(agent_result.get("error") or response or ""),
+                )
+            else:
+                self._emit_task_terminal_event(
+                    task_id=session_entry.session_id,
+                    status="completed",
+                    total_tokens=int(agent_result.get("input_tokens", 0) or 0)
+                    + int(agent_result.get("output_tokens", 0) or 0),
+                    api_calls=int(agent_result.get("api_calls", 0) or 0),
+                    tool_calls=len(agent_result.get("tools", []) or []),
+                    message_id=str(event.message_id) if event.message_id else None,
+                    thread_id=str(getattr(source, "thread_id", "") or "") or None,
+                )
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
@@ -11898,6 +14735,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
             logger.exception("Agent error in session %s", session_key)
+            self._emit_task_terminal_event(
+                task_id=session_entry.session_id,
+                status="failed",
+                error_class=type(e).__name__,
+                error_message=str(e),
+            )
             # Crash-resilience for failures that happen before AIAgent enters
             # run_conversation() (for example: provider/httpx client init
             # failures). In that path the agent cannot persist the current
@@ -14089,6 +16932,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 metadata["direct_messages_topic_id"] = tid
             if reply_to_message_id is not None:
                 metadata["telegram_reply_to_message_id"] = str(reply_to_message_id)
+        elif platform == Platform.FEISHU and reply_to_message_id is not None:
+            # Preserve the triggering message so delayed/progress sends stay
+            # in the original Feishu topic through the reply API.
+            metadata["reply_to_message_id"] = str(reply_to_message_id)
         return metadata
 
     @staticmethod

@@ -309,6 +309,7 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 from hermes_cli.dashboard_auth.public_paths import (
     PUBLIC_API_PATHS as _PUBLIC_API_PATHS,
+    is_public_task_read as _is_public_task_read,
 )
 
 
@@ -578,7 +579,12 @@ async def auth_middleware(request: Request, call_next):
     if getattr(request.app.state, "auth_required", False):
         return await call_next(request)
     path = request.url.path
-    if path.startswith("/api/") and path not in _PUBLIC_API_PATHS:
+    public_task_read = _is_public_task_read(
+        method=request.method,
+        path=path,
+        public=request.query_params.get("public"),
+    )
+    if path.startswith("/api/") and path not in _PUBLIC_API_PATHS and not public_task_read:
         if not _has_valid_session_token(request) and not _has_valid_query_token(request, path):
             return JSONResponse(
                 status_code=401,
@@ -16539,6 +16545,69 @@ def _mount_plugin_api_routes():
             _log.info("Mounted plugin API routes: /api/plugins/%s/", plugin["name"])
         except Exception as exc:
             _log.warning("Failed to load plugin %s API routes: %s", plugin["name"], exc)
+
+
+@app.get("/api/tasks")
+async def list_tasks_api(
+    status: Optional[str] = None,
+    platform: Optional[str] = None,
+    chat_id: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+    public: Optional[int] = None,
+):
+    from gateway.tasks.types import TaskStatus
+    from hermes_cli.task_views import list_task_views
+
+    parsed_status = None
+    if status:
+        try:
+            parsed_status = TaskStatus(status)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"Unknown task status: {status}") from exc
+    clamped_limit = max(1, min(int(limit), 100))
+    safe_offset = max(0, int(offset))
+    if public == 1 and not chat_id:
+        return {
+            "tasks": [],
+            "total": 0,
+            "status_counts": {task_status.value: 0 for task_status in TaskStatus},
+            "limit": clamped_limit,
+            "offset": safe_offset,
+        }
+    return list_task_views(
+        status=parsed_status,
+        platform="feishu",
+        chat_id=chat_id,
+        limit=clamped_limit,
+        offset=safe_offset,
+    )
+
+
+@app.get("/api/tasks/{task_id:path}")
+async def get_task_api(
+    task_id: str,
+    public: Optional[int] = None,
+    chat_id: Optional[str] = None,
+):
+    from hermes_cli.task_views import get_task_view
+
+    if public == 1 and not chat_id:
+        raise HTTPException(status_code=404, detail="Task not found")
+    result = get_task_view(task_id)
+    if result is None or result.get("platform") != "feishu":
+        raise HTTPException(status_code=404, detail="Task not found")
+    if chat_id and result.get("chat_id") != chat_id:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return result
+
+
+@app.post("/api/tasks")
+async def create_task_intake_api() -> None:
+    raise HTTPException(
+        status_code=403,
+        detail="Task creation from this delivery dashboard is disabled; use Feishu intake",
+    )
 
 
 # Mount plugin API routes before the SPA catch-all.
