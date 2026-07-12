@@ -37,12 +37,17 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Mapping
 from xml.sax.saxutils import escape
 
 from hermes_cli._subprocess_compat import (
     windows_detach_flags,
     windows_detach_flags_without_breakaway,
     windows_hide_flags,
+)
+from hermes_cli.service_runtime_bindings import (
+    SERVICE_BINDING_ENV_KEYS,
+    resolve_service_runtime_bindings,
 )
 
 # Short timeouts: schtasks occasionally wedges and we don't want to hang forever.
@@ -383,6 +388,7 @@ def _build_gateway_cmd_script(
     working_dir: str,
     hermes_home: str,
     profile_arg: str,
+    runtime_bindings: Mapping[str, str] | None = None,
 ) -> str:
     """Build the ``gateway.cmd`` wrapper content (CRLF-terminated).
 
@@ -399,6 +405,18 @@ def _build_gateway_cmd_script(
     lines = ["@echo off", f"rem {_TASK_DESCRIPTION}"]
     lines.append(f"cd /d {_quote_cmd_script_arg(working_dir)}")
     lines.append(f'set "HERMES_HOME={hermes_home}"')
+    # A Scheduled Task must not inherit a versioned pair from the shell or
+    # task-manager environment. Clear first, then add only manifest authority.
+    for key in SERVICE_BINDING_ENV_KEYS:
+        lines.append(f'set "{key}="')
+    for key in SERVICE_BINDING_ENV_KEYS:
+        if runtime_bindings and key in runtime_bindings:
+            value = runtime_bindings[key]
+            if any(char in value for char in ('"', "\x00", "\r", "\n")):
+                raise ValueError(f"invalid character in Windows environment value: {key}")
+            # Percent expansion happens even inside set's quoted form.
+            value = value.replace("%", "%%")
+            lines.append(f'set "{key}={value}"')
     lines.append('set "PYTHONIOENCODING=utf-8"')
     lines.append('set "HERMES_GATEWAY_DETACHED=1"')
     pythonw_path, venv_dir, extra_pythonpath = _resolve_detached_python(python_path)
@@ -442,6 +460,7 @@ def _build_gateway_vbs_script(
     working_dir: str,
     hermes_home: str,
     profile_arg: str,
+    runtime_bindings: Mapping[str, str] | None = None,
 ) -> str:
     """Build a console-less ``gateway.vbs`` launcher (CRLF-terminated).
 
@@ -481,6 +500,15 @@ def _build_gateway_vbs_script(
         'Set sh = CreateObject("WScript.Shell")',
         'Set env = sh.Environment("PROCESS")',
         f"env.Item({_quote_vbs_string('HERMES_HOME')}) = {_quote_vbs_string(hermes_home)}",
+        *[
+            f"env.Item({_quote_vbs_string(key)}) = {_quote_vbs_string('')}"
+            for key in SERVICE_BINDING_ENV_KEYS
+        ],
+        *[
+            f"env.Item({_quote_vbs_string(key)}) = {_quote_vbs_string(runtime_bindings[key])}"
+            for key in SERVICE_BINDING_ENV_KEYS
+            if runtime_bindings and key in runtime_bindings
+        ],
         f"env.Item({_quote_vbs_string('PYTHONIOENCODING')}) = {_quote_vbs_string('utf-8')}",
         f"env.Item({_quote_vbs_string('HERMES_GATEWAY_DETACHED')}) = {_quote_vbs_string('1')}",
         f"env.Item({_quote_vbs_string('VIRTUAL_ENV')}) = {_quote_vbs_string(_preserve_hermes_home_path(venv_dir))}",
@@ -539,8 +567,15 @@ def _write_task_script() -> Path:
     working_dir = _stable_gateway_working_dir(PROJECT_ROOT)
     hermes_home = str(Path(get_hermes_home()))
     profile_arg = _profile_arg(hermes_home)
+    runtime_bindings = resolve_service_runtime_bindings(hermes_home)
 
-    content = _build_gateway_cmd_script(python_path, working_dir, hermes_home, profile_arg)
+    content = _build_gateway_cmd_script(
+        python_path,
+        working_dir,
+        hermes_home,
+        profile_arg,
+        runtime_bindings,
+    )
     script_path = get_task_script_path()
     tmp = script_path.with_suffix(".tmp")
     tmp.write_text(content, encoding="utf-8", newline="")
@@ -549,7 +584,13 @@ def _write_task_script() -> Path:
     # Also render the console-less .vbs launcher used by Scheduled Task and the
     # Startup-folder fallback via wscript.exe (issue #45599 fix A). The .cmd
     # wrapper stays as a generated helper/compatibility artifact.
-    vbs_content = _build_gateway_vbs_script(python_path, working_dir, hermes_home, profile_arg)
+    vbs_content = _build_gateway_vbs_script(
+        python_path,
+        working_dir,
+        hermes_home,
+        profile_arg,
+        runtime_bindings,
+    )
     vbs_path = script_path.with_suffix(".vbs")
     vbs_tmp = vbs_path.with_name(vbs_path.name + ".tmp")
     vbs_tmp.write_text(vbs_content, encoding="utf-8", newline="")
@@ -800,6 +841,7 @@ def _build_gateway_argv() -> tuple[list[str], str, dict[str, str]]:
         "HERMES_GATEWAY_DETACHED": "1",
         "VIRTUAL_ENV": _preserve_hermes_home_path(venv_dir),
     }
+    env_overlay.update(resolve_service_runtime_bindings(hermes_home))
     _prepend_pythonpath(
         env_overlay,
         [project_root, *[_preserve_hermes_home_path(entry) for entry in extra_pythonpath]]
@@ -873,6 +915,7 @@ def windowless_gateway_restart_spec(
     }
     if hermes_home:
         env_overlay["HERMES_HOME"] = hermes_home
+        env_overlay.update(resolve_service_runtime_bindings(hermes_home))
     _prepend_pythonpath(
         env_overlay,
         [project_root, *extra_pythonpath] if extra_pythonpath else [project_root],
@@ -900,8 +943,12 @@ def _spawn_detached(script_path: Path | None = None) -> int:
     _assert_windows()
     argv, working_dir, env_overlay = _build_gateway_argv()
 
-    # Inherit PATH etc. from the current env, overlay our required vars.
-    env = {**os.environ, **env_overlay}
+    # Inherit ordinary process settings, but never inherit config/env binding
+    # authority from the management shell.
+    env = dict(os.environ)
+    for key in SERVICE_BINDING_ENV_KEYS:
+        env.pop(key, None)
+    env.update(env_overlay)
 
     # DETACHED_PROCESS        0x00000008  — no console attached to child
     # CREATE_NEW_PROCESS_GROUP 0x00000200 — child gets its own group, won't
@@ -1483,6 +1530,10 @@ def start() -> None:
             print("  If a UAC prompt opened, approve it, then run: hermes gateway start")
             return
 
+    # Reconcile persistent launchers before the direct start.  This makes a
+    # clean management shell and the next login agree on the exact pair.
+    _write_task_script()
+
     # Manual starts use the same console-less direct spawn path as restart()
     # and install --start-now. Scheduled Task / Startup entries are only login
     # persistence mechanisms.
@@ -1659,6 +1710,12 @@ def restart() -> None:
     doesn't produce a running gateway.
     """
     _assert_windows()
+
+    from hermes_cli.config import get_hermes_home
+
+    # Validate before stopping so an invalid external manifest cannot turn a
+    # healthy gateway into an avoidable outage.
+    resolve_service_runtime_bindings(get_hermes_home())
 
     stop()
 

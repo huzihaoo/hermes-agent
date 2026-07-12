@@ -12034,13 +12034,14 @@ def cmd_dashboard(args):
         # returns the root for both layouts: ~/.hermes for a standard install
         # and /opt/data for Docker (it strips a trailing profiles/<name>).
         # See the support report for the double-mount workaround this avoids.
-        try:
-            from hermes_constants import get_default_hermes_root
-            env["HERMES_HOME"] = str(get_default_hermes_root())
-        except Exception:
-            # Best-effort: if root resolution fails, fall back to the prior
-            # behaviour (drop HERMES_HOME) rather than block the reroute.
-            env.pop("HERMES_HOME", None)
+        from hermes_constants import get_default_hermes_root
+        from hermes_cli.service_runtime_bindings import apply_service_runtime_bindings
+
+        # The child changes profile authority from a named home to the default
+        # root. Re-resolve the root's sealed pair instead of merely deleting the
+        # named-profile environment. Invalid external metadata is fatal before
+        # exec; legacy roots get no pair.
+        apply_service_runtime_bindings(env, get_default_hermes_root())
         # On Windows, os.execvpe() does not truly replace the process — it
         # spawns via CreateProcess then the parent exits.  Under Python 3.14+
         # this can crash with STATUS_ACCESS_VIOLATION (0xC0000005) when
