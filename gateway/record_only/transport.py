@@ -33,43 +33,7 @@ TARGET_OUTBOUND_CENSUS_ARTIFACT = AUTHORITATIVE_CENSUS_BINDING.artifact_name
 TARGET_OUTBOUND_CENSUS_SHA256 = AUTHORITATIVE_CENSUS_BINDING.artifact_sha256
 TARGET_OUTBOUND_CENSUS_STATUS = AUTHORITATIVE_CENSUS_BINDING.status
 TARGET_OUTBOUND_CENSUS_BINDING = MappingProxyType(
-    {
-        "index_sha256": AUTHORITATIVE_CENSUS_BINDING.index_sha256,
-        "canonical_artifact": AUTHORITATIVE_CENSUS_BINDING.artifact_name,
-        "canonical_artifact_sha256": AUTHORITATIVE_CENSUS_BINDING.artifact_sha256,
-        "status": AUTHORITATIVE_CENSUS_BINDING.status,
-        "gate_decision": AUTHORITATIVE_CENSUS_BINDING.gate_decision,
-        "source_commit": AUTHORITATIVE_CENSUS_BINDING.source_commit,
-        "source_tree": AUTHORITATIVE_CENSUS_BINDING.source_tree,
-        "source_sha256_manifest_sha256": (
-            AUTHORITATIVE_CENSUS_BINDING.source_sha256_manifest_sha256
-        ),
-        "source_tree_manifest_sha256": (
-            AUTHORITATIVE_CENSUS_BINDING.source_tree_manifest_sha256
-        ),
-        "manifest_files": AUTHORITATIVE_CENSUS_BINDING.manifest_files,
-        "scanned_files": AUTHORITATIVE_CENSUS_BINDING.scanned_files,
-        "total_rows": AUTHORITATIVE_CENSUS_BINDING.total_rows,
-        "runtime_rows": AUTHORITATIVE_CENSUS_BINDING.runtime_rows,
-        "test_rows": AUTHORITATIVE_CENSUS_BINDING.test_rows,
-        "pending_rows": AUTHORITATIVE_CENSUS_BINDING.pending_rows,
-        "unverified_rows": AUTHORITATIVE_CENSUS_BINDING.unverified_rows,
-        "unclassified_executable_mode_count": len(
-            AUTHORITATIVE_CENSUS_BINDING.unclassified_executable_modes
-        ),
-        "all_runtime_rows_classified": False,
-        "runtime_egress_trace_complete": False,
-        "dynamic_import_trace_complete": False,
-        "skill_trace_complete": False,
-        "subprocess_descendant_trace_complete": False,
-        "record_only_coverage_complete": False,
-        "production_ready": False,
-        "promotion_authorized": False,
-        "candidate_execution_authorized": False,
-        "cutover_authorized": False,
-        "external_delivery_attempted": False,
-        "external_delivery_verified": False,
-    }
+    AUTHORITATIVE_CENSUS_BINDING.as_ledger_binding()
 )
 OPERATIONS = {
     "text_send",

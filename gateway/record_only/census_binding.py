@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -190,6 +191,41 @@ class VerifiedCensusBinding:
     unverified_rows: int
     unclassified_executable_modes: tuple[str, ...]
     superseded: tuple[str, ...]
+
+    def as_ledger_binding(self) -> dict[str, Any]:
+        return {
+            "index_sha256": self.index_sha256,
+            "canonical_artifact": self.artifact_name,
+            "canonical_artifact_sha256": self.artifact_sha256,
+            "status": self.status,
+            "gate_decision": self.gate_decision,
+            "source_commit": self.source_commit,
+            "source_tree": self.source_tree,
+            "source_sha256_manifest_sha256": self.source_sha256_manifest_sha256,
+            "source_tree_manifest_sha256": self.source_tree_manifest_sha256,
+            "manifest_files": self.manifest_files,
+            "scanned_files": self.scanned_files,
+            "total_rows": self.total_rows,
+            "runtime_rows": self.runtime_rows,
+            "test_rows": self.test_rows,
+            "pending_rows": self.pending_rows,
+            "unverified_rows": self.unverified_rows,
+            "unclassified_executable_mode_count": len(
+                self.unclassified_executable_modes
+            ),
+            "all_runtime_rows_classified": False,
+            "runtime_egress_trace_complete": False,
+            "dynamic_import_trace_complete": False,
+            "skill_trace_complete": False,
+            "subprocess_descendant_trace_complete": False,
+            "record_only_coverage_complete": False,
+            "production_ready": False,
+            "promotion_authorized": False,
+            "candidate_execution_authorized": False,
+            "cutover_authorized": False,
+            "external_delivery_attempted": False,
+            "external_delivery_verified": False,
+        }
 
     def as_status(self) -> dict[str, Any]:
         return {
@@ -675,4 +711,23 @@ DEFAULT_EVIDENCE_ROOT = Path(
         str(Path(__file__).resolve().parents[3] / "evidence" / "target-outbound-census"),
     )
 )
-AUTHORITATIVE_CENSUS_BINDING = verify_target_outbound_census(DEFAULT_EVIDENCE_ROOT)
+
+
+def _load_authoritative_census_binding():
+    from gateway.record_only.external_census_binding import (
+        EXTERNAL_CENSUS_BINDING_FD,
+        consume_external_census_binding,
+    )
+
+    try:
+        os.fstat(EXTERNAL_CENSUS_BINDING_FD)
+    except OSError as exc:
+        if exc.errno != errno.EBADF:
+            raise CensusBindingError(
+                f"cannot inspect inherited external binding FD: {exc}"
+            ) from exc
+        return verify_target_outbound_census(DEFAULT_EVIDENCE_ROOT)
+    return consume_external_census_binding()
+
+
+AUTHORITATIVE_CENSUS_BINDING = _load_authoritative_census_binding()
