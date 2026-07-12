@@ -38,6 +38,25 @@ class TestProfilePlatformPorts:
         runtime = {"platforms": {"webhook": {"state": "connected"}}}
         assert _profile_platform_ports(tmp_path, runtime) == {"webhook": 9001}
 
+    def test_default_profile_port_honors_versioned_config_binding(
+        self, tmp_path, monkeypatch
+    ):
+        state_home = tmp_path / "state"
+        candidate_config = tmp_path / "candidate" / "config.yaml"
+        state_home.mkdir()
+        candidate_config.parent.mkdir()
+        (state_home / "config.yaml").write_text(
+            "platforms:\n  webhook:\n    port: 9001\n", encoding="utf-8"
+        )
+        candidate_config.write_text(
+            "platforms:\n  webhook:\n    port: 9555\n", encoding="utf-8"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(state_home))
+        monkeypatch.setenv("HERMES_CONFIG_PATH", str(candidate_config))
+        runtime = {"platforms": {"webhook": {"state": "connected"}}}
+
+        assert _profile_platform_ports(state_home, runtime) == {"webhook": 9555}
+
     def test_port_from_gateway_platforms_block(self, tmp_path):
         (tmp_path / "config.yaml").write_text(
             "gateway:\n  platforms:\n    api_server:\n      port: 9500\n",

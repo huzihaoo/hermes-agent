@@ -13,7 +13,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_env_path_for_home, get_hermes_home
 
 from ._oss_providers import (
     LLM_PROVIDERS,
@@ -323,7 +323,7 @@ def _setup_platform(hermes_home: str, config: dict, flags: dict[str, str]) -> No
     provider.save_config(provider_config, hermes_home)
 
     if env_writes:
-        _write_env(Path(hermes_home) / ".env", env_writes)
+        _write_env(get_env_path_for_home(hermes_home), env_writes)
 
     print("\n  Memory provider: mem0")
     print("  Activation saved to config.yaml")
@@ -417,7 +417,7 @@ def _setup_selfhosted(hermes_home: str, config: dict, flags: dict[str, str]) -> 
     provider.save_config(provider_config, hermes_home)
 
     if env_writes:
-        _write_env(Path(hermes_home) / ".env", env_writes)
+        _write_env(get_env_path_for_home(hermes_home), env_writes)
 
     _check_selfhosted_server(host)
     print("\n  Memory provider: mem0 (self-hosted)")
@@ -464,7 +464,7 @@ def _setup_oss(hermes_home: str, config: dict, flags: dict[str, str]) -> None:
         return
 
     if env_writes:
-        _write_env(Path(hermes_home) / ".env", env_writes)
+        _write_env(get_env_path_for_home(hermes_home), env_writes)
     _save_mem0_json(hermes_home, {"mode": "oss", "user_id": user_id, "agent_id": "hermes", "oss": oss_config})
 
     _install_provider_deps(llm_id, embedder_id, vector_id)
@@ -489,7 +489,7 @@ def _prompt_api_key(label: str, env_var: str, hermes_home: str) -> str:
     """Prompt for API key, showing masked existing value if found."""
     existing = os.environ.get(env_var, "")
     if not existing:
-        env_path = Path(hermes_home) / ".env"
+        env_path = get_env_path_for_home(hermes_home)
         if env_path.exists():
             for line in env_path.read_text().splitlines():
                 if line.startswith(f"{env_var}="):
@@ -814,7 +814,7 @@ def _setup_oss_interactive(hermes_home: str, config: dict) -> None:
     oss_config, _ = build_oss_config(flags)
 
     if env_writes:
-        _write_env(Path(hermes_home) / ".env", env_writes)
+        _write_env(get_env_path_for_home(hermes_home), env_writes)
     _save_mem0_json(hermes_home, {"mode": "oss", "user_id": user_id, "agent_id": agent_id, "oss": oss_config})
 
     _install_provider_deps(llm_id, embedder_id, vector_id)

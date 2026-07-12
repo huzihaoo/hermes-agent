@@ -12,7 +12,11 @@ from pathlib import Path
 
 from hermes_cli.config import get_project_root, get_hermes_home, get_env_path
 from hermes_cli.env_loader import load_hermes_dotenv
-from hermes_constants import display_hermes_home
+from hermes_constants import (
+    display_hermes_home,
+    get_config_path_for_home,
+    get_env_path_for_home,
+)
 from hermes_constants import agent_browser_runnable
 
 PROJECT_ROOT = get_project_root()
@@ -21,7 +25,7 @@ _DHH = display_hermes_home()  # user-facing display path (e.g. ~/.hermes or ~/.h
 
 # Load environment variables from ~/.hermes/.env so API key checks work
 _env_path = get_env_path()
-load_hermes_dotenv(hermes_home=_env_path.parent, project_env=PROJECT_ROOT / ".env")
+load_hermes_dotenv(hermes_home=HERMES_HOME, project_env=PROJECT_ROOT / ".env")
 
 from hermes_cli.colors import Colors, color
 from hermes_cli.models import _HERMES_USER_AGENT
@@ -691,7 +695,7 @@ def run_doctor(args):
     # Managed scope (administrator-pinned config/env), when present.
     managed_scope_check()
     # Check ~/.hermes/.env (primary location for user config)
-    env_path = HERMES_HOME / '.env'
+    env_path = get_env_path_for_home(HERMES_HOME)
     if env_path.exists():
         check_ok(f"{_DHH}/.env file exists")
         
@@ -730,7 +734,7 @@ def run_doctor(args):
                 issues.append("Run 'hermes setup' to create .env")
     
     # Check ~/.hermes/config.yaml (primary) or project cli-config.yaml (fallback)
-    config_path = HERMES_HOME / 'config.yaml'
+    config_path = get_config_path_for_home(HERMES_HOME)
     if config_path.exists():
         check_ok(f"{_DHH}/config.yaml exists")
 
@@ -929,7 +933,7 @@ def run_doctor(args):
                 check_warn("config.yaml not found", "(using defaults)")
 
     # Check config version and stale keys
-    config_path = HERMES_HOME / 'config.yaml'
+    config_path = get_config_path_for_home(HERMES_HOME)
     if config_path.exists():
         try:
             from hermes_cli.config import check_config_version, migrate_config
@@ -2241,7 +2245,7 @@ def run_doctor(args):
     _active_memory_provider = ""
     try:
         import yaml as _yaml
-        _mem_cfg_path = HERMES_HOME / "config.yaml"
+        _mem_cfg_path = get_config_path_for_home(HERMES_HOME)
         if _mem_cfg_path.exists():
             with open(_mem_cfg_path, encoding="utf-8") as _f:
                 _raw_cfg = _yaml.safe_load(_f) or {}

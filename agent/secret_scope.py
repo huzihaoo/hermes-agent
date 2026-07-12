@@ -201,5 +201,6 @@ def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
     global vars are intentionally NOT copied in — ``get_secret`` reads those
     from ``os.environ`` directly, so the scope holds only profile secrets.
     """
-    return load_env_file(Path(hermes_home) / ".env")
+    from hermes_constants import get_env_path_for_home
 
+    return load_env_file(get_env_path_for_home(hermes_home))

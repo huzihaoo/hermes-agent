@@ -128,3 +128,17 @@ class TestEnvFileParsing:
         assert ss.build_profile_secret_scope(tmp_path) == {
             "ANTHROPIC_API_KEY": "sk-profile"
         }
+
+    def test_active_default_scope_honors_env_binding(self, tmp_path, monkeypatch):
+        state_home = tmp_path / "state"
+        candidate_env = tmp_path / "candidate" / ".env"
+        state_home.mkdir()
+        candidate_env.parent.mkdir()
+        (state_home / ".env").write_text("ANTHROPIC_API_KEY=canonical\n")
+        candidate_env.write_text("ANTHROPIC_API_KEY=candidate\n")
+        monkeypatch.setenv("HERMES_HOME", str(state_home))
+        monkeypatch.setenv("HERMES_ENV_PATH", str(candidate_env))
+
+        assert ss.build_profile_secret_scope(state_home) == {
+            "ANTHROPIC_API_KEY": "candidate"
+        }

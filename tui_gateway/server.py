@@ -19,6 +19,7 @@ from typing import Any, Optional
 
 from hermes_constants import (
     get_config_path,
+    get_config_path_for_home,
     get_hermes_home,
     get_hermes_home_override,
     reset_hermes_home_override,
@@ -995,7 +996,7 @@ def _profile_configured_cwd(profile_home: Path | None) -> str | None:
     try:
         import yaml
 
-        p = Path(profile_home) / "config.yaml"
+        p = get_config_path_for_home(profile_home)
         if not p.exists():
             return None
         with open(p, encoding="utf-8") as f:
@@ -1821,7 +1822,7 @@ def _load_cfg() -> dict:
         # profiles don't clobber each other.
         override = get_hermes_home_override()
         home = override if isinstance(override, str) and override else _hermes_home
-        p = Path(home) / "config.yaml"
+        p = get_config_path_for_home(home)
         mtime = p.stat().st_mtime if p.exists() else None
         with _cfg_lock:
             if _cfg_cache is not None and _cfg_mtime == mtime and _cfg_path == p:

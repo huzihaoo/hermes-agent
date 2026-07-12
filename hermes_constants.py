@@ -939,6 +939,22 @@ def get_config_path() -> Path:
     return get_hermes_home() / "config.yaml"
 
 
+def get_config_path_for_home(hermes_home: str | Path) -> Path:
+    """Resolve ``config.yaml`` for an API that receives an explicit home.
+
+    Older call sites pass ``HERMES_HOME`` explicitly because provider/profile
+    state belongs beneath that directory.  For the active home, however, a
+    versioned runtime's ``HERMES_CONFIG_PATH`` must still win.  A genuinely
+    different home remains explicitly scoped and keeps its own config file.
+    """
+    home = Path(hermes_home).expanduser()
+    try:
+        is_active_home = home.resolve() == get_hermes_home().resolve()
+    except OSError:
+        is_active_home = os.path.abspath(home) == os.path.abspath(get_hermes_home())
+    return get_config_path() if is_active_home else home / "config.yaml"
+
+
 def get_skills_dir() -> Path:
     """Return the path to the skills directory under HERMES_HOME."""
     return get_hermes_home() / "skills"
@@ -963,6 +979,16 @@ def get_env_path() -> Path:
             raise ValueError("HERMES_ENV_PATH must be an absolute path")
         return path
     return get_hermes_home() / ".env"
+
+
+def get_env_path_for_home(hermes_home: str | Path) -> Path:
+    """Resolve ``.env`` while preserving explicit profile-home semantics."""
+    home = Path(hermes_home).expanduser()
+    try:
+        is_active_home = home.resolve() == get_hermes_home().resolve()
+    except OSError:
+        is_active_home = os.path.abspath(home) == os.path.abspath(get_hermes_home())
+    return get_env_path() if is_active_home else home / ".env"
 
 
 def get_runtime_dir() -> Path:

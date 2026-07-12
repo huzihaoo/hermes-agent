@@ -15,7 +15,9 @@ from hermes_constants import (
     find_node_executable_on_path,
     get_default_hermes_root,
     get_config_path,
+    get_config_path_for_home,
     get_env_path,
+    get_env_path_for_home,
     get_hermes_dir,
     get_hermes_home,
     heal_hermes_managed_node,
@@ -138,6 +140,27 @@ class TestVersionedConfigPaths:
         assert get_hermes_home() == state_home
         assert get_config_path() == config_path
         assert get_env_path() == env_path
+
+    def test_explicit_active_home_honors_file_bindings(self, tmp_path, monkeypatch):
+        state_home = tmp_path / "state"
+        candidate = tmp_path / "candidate"
+        monkeypatch.setenv("HERMES_HOME", str(state_home))
+        monkeypatch.setenv("HERMES_CONFIG_PATH", str(candidate / "config.yaml"))
+        monkeypatch.setenv("HERMES_ENV_PATH", str(candidate / ".env"))
+
+        assert get_config_path_for_home(state_home) == candidate / "config.yaml"
+        assert get_env_path_for_home(state_home) == candidate / ".env"
+
+    def test_explicit_other_home_remains_profile_scoped(self, tmp_path, monkeypatch):
+        state_home = tmp_path / "state"
+        profile_home = tmp_path / "profiles" / "worker"
+        candidate = tmp_path / "candidate"
+        monkeypatch.setenv("HERMES_HOME", str(state_home))
+        monkeypatch.setenv("HERMES_CONFIG_PATH", str(candidate / "config.yaml"))
+        monkeypatch.setenv("HERMES_ENV_PATH", str(candidate / ".env"))
+
+        assert get_config_path_for_home(profile_home) == profile_home / "config.yaml"
+        assert get_env_path_for_home(profile_home) == profile_home / ".env"
 
     def test_context_local_profile_wins_over_process_file_bindings(self, tmp_path, monkeypatch):
         profile = tmp_path / "profiles" / "worker"

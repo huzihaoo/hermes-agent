@@ -4467,7 +4467,7 @@ def _guard_named_profile_under_multiplexer(force: bool = False) -> None:
         return  # default profile (or unrecognized) — this guard doesn't apply
 
     try:
-        from hermes_constants import get_default_hermes_root
+        from hermes_constants import get_config_path_for_home, get_default_hermes_root
         default_root = get_default_hermes_root()
         # (b) Is the default-profile gateway running?
         from gateway.status import get_running_pid as _default_running_pid  # noqa
@@ -4502,7 +4502,7 @@ def _guard_named_profile_under_multiplexer(force: bool = False) -> None:
         if env_multiplex is True:
             multiplex = True
         else:
-            cfg_path = default_root / "config.yaml"
+            cfg_path = get_config_path_for_home(default_root)
             if not cfg_path.exists():
                 return
             with open(cfg_path, encoding="utf-8") as f:

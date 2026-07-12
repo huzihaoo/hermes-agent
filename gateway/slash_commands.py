@@ -2062,7 +2062,7 @@ class GatewaySlashCommandsMixin:
         from hermes_constants import display_hermes_home
 
         args = event.get_command_args().strip().lower()
-        config_path = _hermes_home / 'config.yaml'
+        config_path = get_config_path()
 
         try:
             config = _load_gateway_config()

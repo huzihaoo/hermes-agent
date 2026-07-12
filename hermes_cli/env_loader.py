@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
-from hermes_constants import get_env_path
+from hermes_constants import get_config_path_for_home, get_env_path_for_home
 from utils import atomic_replace, fast_safe_load
 
 
@@ -234,12 +234,10 @@ def load_hermes_dotenv(
     loaded: list[Path] = []
 
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
-    # An explicit default-runtime secrets binding must also win for callers
-    # (notably cron) that pass ``hermes_home`` directly. ``get_env_path`` still
-    # gives a context-local multiplexed profile its own .env. Without this
-    # branch default-runtime reloads would silently fall back to the canonical
-    # .env and defeat a versioned runtime's sealed configuration boundary.
-    user_env = get_env_path() if os.environ.get("HERMES_ENV_PATH", "").strip() else home_path / ".env"
+    # Explicit-home APIs still honor the active runtime binding when the home
+    # is the current one, while genuinely separate profiles retain their own
+    # .env files.
+    user_env = get_env_path_for_home(home_path)
     project_env_path = Path(project_env) if project_env else None
 
     # Fix corrupted .env files before python-dotenv parses them (#8908).
@@ -387,7 +385,7 @@ def _load_secrets_config(home_path: Path) -> dict:
     Imported lazily and isolated from the main config loader so a
     malformed config can't take down dotenv loading entirely.
     """
-    config_path = home_path / "config.yaml"
+    config_path = get_config_path_for_home(home_path)
     if not config_path.exists():
         return {}
     try:

@@ -1311,6 +1311,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # Resolve Hermes home directory (respects HERMES_HOME override)
 from hermes_constants import (
     get_config_path,
+    get_config_path_for_home,
     get_env_path,
     get_hermes_home,
     get_hermes_home_override,
@@ -1345,19 +1346,19 @@ def _reload_runtime_env_preserving_config_authority() -> None:
         # Credentials are resolved from the active profile's secret scope, not
         # os.environ. Still honor config.yaml's agent.max_turns bridge below
         # using the scoped home, but never reload .env into global env.
-        _bridge_max_turns_from_config(_hermes_home)
+        _bridge_max_turns_from_config(get_hermes_home())
         return
 
     load_hermes_dotenv(
         hermes_home=_hermes_home,
         project_env=Path(__file__).resolve().parents[1] / '.env',
     )
-    _bridge_max_turns_from_config(_hermes_home)
+    _bridge_max_turns_from_config(get_hermes_home())
 
 
 def _bridge_max_turns_from_config(home: "Path") -> None:
     """Bridge config.yaml agent.max_turns into HERMES_MAX_ITERATIONS (a global)."""
-    config_path = home / 'config.yaml'
+    config_path = get_config_path_for_home(home)
     if not config_path.exists():
         return
     try:
@@ -1464,7 +1465,7 @@ _DOCKER_MEDIA_OUTPUT_CONTAINER_PATHS = {"/output", "/outputs"}
 
 # Bridge config.yaml values into the environment so os.getenv() picks them up.
 # config.yaml is authoritative for terminal settings — overrides .env.
-_config_path = _hermes_home / 'config.yaml'
+_config_path = get_config_path()
 if _config_path.exists():
     try:
         import yaml as _yaml
@@ -4051,7 +4052,7 @@ def _load_gateway_config() -> dict:
     direct yaml.safe_load carries the managed merge on its own. Fail-open.
     """
     config_home = _gateway_config_home()
-    config_path = config_home / 'config.yaml'
+    config_path = get_config_path_for_home(config_home)
     raw: dict = {}
     used_canonical = False
     try:

@@ -583,6 +583,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
     def post_setup(self, hermes_home: str, config: dict) -> None:
         from pathlib import Path
 
+        from hermes_constants import get_env_path_for_home
         from hermes_cli.config import save_config
         from hermes_cli.memory_setup import _prompt, _write_env_vars
 
@@ -605,7 +606,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
         save_config(config)
 
         if env_writes:
-            _write_env_vars(Path(hermes_home) / ".env", env_writes)
+            _write_env_vars(get_env_path_for_home(hermes_home), env_writes)
 
         api_key = env_writes.get("SUPERMEMORY_API_KEY") or existing
         # Make the freshly-entered key visible to the connection probe below.

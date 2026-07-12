@@ -128,6 +128,22 @@ def test_apply_external_secret_sources_noop_when_disabled(tmp_path, monkeypatch)
     assert env_loader.get_secret_source("ANTHROPIC_API_KEY") is None
 
 
+def test_secret_source_config_honors_active_config_binding(tmp_path, monkeypatch):
+    state_home = tmp_path / "state"
+    candidate_config = tmp_path / "candidate" / "config.yaml"
+    state_home.mkdir()
+    candidate_config.parent.mkdir()
+    canonical = state_home / "config.yaml"
+    canonical.write_text("secrets:\n  source: canonical\n", encoding="utf-8")
+    candidate_config.write_text("secrets:\n  source: candidate\n", encoding="utf-8")
+    canonical_before = canonical.read_bytes()
+    monkeypatch.setenv("HERMES_HOME", str(state_home))
+    monkeypatch.setenv("HERMES_CONFIG_PATH", str(candidate_config))
+
+    assert env_loader._load_secrets_config(state_home) == {"source": "candidate"}
+    assert canonical.read_bytes() == canonical_before
+
+
 def test_apply_external_secret_sources_dedupes_within_process(tmp_path, monkeypatch):
     """``load_hermes_dotenv()`` is called at module-import time from several
     hot modules (cli.py, hermes_cli/main.py, run_agent.py, ...).  The

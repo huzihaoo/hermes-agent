@@ -44,7 +44,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from agent.memory_provider import MemoryProvider
-from hermes_constants import get_hermes_home
+from hermes_constants import get_env_path_for_home, get_hermes_home
 from tools.registry import tool_error
 from hermes_cli.config import cfg_get
 
@@ -892,7 +892,7 @@ class HindsightMemoryProvider(MemoryProvider):
             if llm_key:
                 env_writes["HINDSIGHT_LLM_API_KEY"] = llm_key
             else:
-                env_path = Path(hermes_home) / ".env"
+                env_path = get_env_path_for_home(hermes_home)
                 existing_llm_key = ""
                 if env_path.exists():
                     for line in env_path.read_text().splitlines():
@@ -921,7 +921,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self.save_config(provider_config, hermes_home)
 
         if env_writes:
-            env_path = Path(hermes_home) / ".env"
+            env_path = get_env_path_for_home(hermes_home)
             env_path.parent.mkdir(parents=True, exist_ok=True)
             existing_lines = []
             if env_path.exists():
@@ -950,7 +950,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
             llm_api_key = env_writes.get("HINDSIGHT_LLM_API_KEY", "")
             if not llm_api_key:
-                llm_api_key = _load_simple_env(Path(hermes_home) / ".env").get("HINDSIGHT_LLM_API_KEY", "")
+                llm_api_key = _load_simple_env(get_env_path_for_home(hermes_home)).get("HINDSIGHT_LLM_API_KEY", "")
             if not llm_api_key:
                 llm_api_key = _load_simple_env(_embedded_profile_env_path(materialized_config)).get(
                     "HINDSIGHT_API_LLM_API_KEY",
