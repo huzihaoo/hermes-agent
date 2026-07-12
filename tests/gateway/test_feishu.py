@@ -759,22 +759,41 @@ class TestAdapterBehavior(unittest.TestCase):
             run_threadsafe.assert_not_called()
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_user_reaction_with_managed_emoji_is_still_routed(self):
-        # Operator-origin filter is enough to prevent feedback loops; we must
-        # not additionally swallow user-origin reactions just because their
-        # emoji happens to collide with a lifecycle emoji.
+    def test_user_reaction_with_managed_emoji_is_ignored(self):
+        """Lifecycle reactions never create an extra agent turn."""
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
         adapter._loop = SimpleNamespace(is_closed=lambda: False)
 
-        event = SimpleNamespace(
-            message_id="om_msg",
-            operator_type="user",
-            reaction_type=SimpleNamespace(emoji_type="Typing"),
+        for emoji in ("OK", "Typing", "CrossMark"):
+            event = SimpleNamespace(
+                message_id="om_msg",
+                operator_type="user",
+                reaction_type=SimpleNamespace(emoji_type=emoji),
+            )
+            data = SimpleNamespace(event=event)
+            with patch(
+                "plugins.platforms.feishu.adapter.asyncio.run_coroutine_threadsafe"
+            ) as run_threadsafe:
+                adapter._on_reaction_event("im.message.reaction.created_v1", data)
+            run_threadsafe.assert_not_called()
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_user_reaction_with_nonmanaged_emoji_is_routed(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._loop = SimpleNamespace(is_closed=lambda: False)
+        data = SimpleNamespace(
+            event=SimpleNamespace(
+                message_id="om_msg",
+                operator_type="user",
+                reaction_type=SimpleNamespace(emoji_type="THUMBSUP"),
+            )
         )
-        data = SimpleNamespace(event=event)
 
         def _close_coro_and_return_future(coro, _loop):
             coro.close()
@@ -1208,7 +1227,7 @@ class TestAdapterBehavior(unittest.TestCase):
             message_id="om_post",
         )
 
-        text, msg_type, media_urls, media_types, _mentions = asyncio.run(adapter._extract_message_content(message))
+        text, msg_type, media_urls, media_types = asyncio.run(adapter._extract_message_content(message))
 
         self.assertEqual(text, "Title\nhello\n[doc](https://example.com)")
         self.assertEqual(msg_type.value, "text")
@@ -1227,7 +1246,7 @@ class TestAdapterBehavior(unittest.TestCase):
             message_id="om_post_fr",
         )
 
-        text, msg_type, media_urls, media_types, _mentions = asyncio.run(adapter._extract_message_content(message))
+        text, msg_type, media_urls, media_types = asyncio.run(adapter._extract_message_content(message))
 
         self.assertEqual(text, "Subject\nbonjour")
         self.assertEqual(msg_type.value, "text")
@@ -1253,7 +1272,7 @@ class TestAdapterBehavior(unittest.TestCase):
             message_id="om_post_rich",
         )
 
-        text, msg_type, media_urls, media_types, _mentions = asyncio.run(adapter._extract_message_content(message))
+        text, msg_type, media_urls, media_types = asyncio.run(adapter._extract_message_content(message))
 
         self.assertEqual(text, "Rich message\n[Image: diagram]\n@Alice please check the attachment\n[Attachment: spec.pdf]\n:smile:")
         self.assertEqual(msg_type.value, "text")
@@ -1279,7 +1298,7 @@ class TestAdapterBehavior(unittest.TestCase):
             message_id="om_post_media",
         )
 
-        text, msg_type, media_urls, media_types, _mentions = asyncio.run(adapter._extract_message_content(message))
+        text, msg_type, media_urls, media_types = asyncio.run(adapter._extract_message_content(message))
 
         self.assertEqual(text, "Rich message\n[Image: diagram]\n[Attachment: spec.pdf]")
         self.assertEqual(msg_type.value, "text")
@@ -1316,7 +1335,7 @@ class TestAdapterBehavior(unittest.TestCase):
             message_id="om_merge_forward",
         )
 
-        text, msg_type, media_urls, media_types, _mentions = asyncio.run(adapter._extract_message_content(message))
+        text, msg_type, media_urls, media_types = asyncio.run(adapter._extract_message_content(message))
 
         self.assertEqual(
             text,
@@ -1338,7 +1357,7 @@ class TestAdapterBehavior(unittest.TestCase):
             message_id="om_share_chat",
         )
 
-        text, msg_type, media_urls, media_types, _mentions = asyncio.run(adapter._extract_message_content(message))
+        text, msg_type, media_urls, media_types = asyncio.run(adapter._extract_message_content(message))
 
         self.assertEqual(text, "Shared chat: Platform Ops\nChat ID: oc_shared")
         self.assertEqual(msg_type.value, "text")
@@ -1372,7 +1391,7 @@ class TestAdapterBehavior(unittest.TestCase):
             message_id="om_interactive",
         )
 
-        text, msg_type, media_urls, media_types, _mentions = asyncio.run(adapter._extract_message_content(message))
+        text, msg_type, media_urls, media_types = asyncio.run(adapter._extract_message_content(message))
 
         self.assertEqual(text, "Approval Request\nRequester: Alice\nApprove\nActions: Approve")
         self.assertEqual(msg_type.value, "text")
@@ -1392,7 +1411,7 @@ class TestAdapterBehavior(unittest.TestCase):
             message_id="om_image",
         )
 
-        text, msg_type, media_urls, media_types, _mentions = asyncio.run(adapter._extract_message_content(message))
+        text, msg_type, media_urls, media_types = asyncio.run(adapter._extract_message_content(message))
 
         self.assertEqual(text, "")
         self.assertEqual(msg_type.value, "photo")
@@ -1418,7 +1437,7 @@ class TestAdapterBehavior(unittest.TestCase):
             message_id="om_audio",
         )
 
-        text, msg_type, media_urls, media_types, _mentions = asyncio.run(adapter._extract_message_content(message))
+        text, msg_type, media_urls, media_types = asyncio.run(adapter._extract_message_content(message))
 
         self.assertEqual(text, "")
         self.assertEqual(msg_type.value, "audio")
@@ -1440,7 +1459,7 @@ class TestAdapterBehavior(unittest.TestCase):
             message_id="om_file",
         )
 
-        text, msg_type, media_urls, media_types, _mentions = asyncio.run(adapter._extract_message_content(message))
+        text, msg_type, media_urls, media_types = asyncio.run(adapter._extract_message_content(message))
 
         self.assertEqual(text, "")
         self.assertEqual(msg_type.value, "document")
@@ -1462,7 +1481,7 @@ class TestAdapterBehavior(unittest.TestCase):
             message_id="om_media",
         )
 
-        text, msg_type, media_urls, media_types, _mentions = asyncio.run(adapter._extract_message_content(message))
+        text, msg_type, media_urls, media_types = asyncio.run(adapter._extract_message_content(message))
 
         self.assertEqual(text, "")
         self.assertEqual(msg_type.value, "photo")
@@ -1484,7 +1503,7 @@ class TestAdapterBehavior(unittest.TestCase):
             message_id="om_video",
         )
 
-        text, msg_type, media_urls, media_types, _mentions = asyncio.run(adapter._extract_message_content(message))
+        text, msg_type, media_urls, media_types = asyncio.run(adapter._extract_message_content(message))
 
         self.assertEqual(text, "")
         self.assertEqual(msg_type.value, "video")
@@ -1694,10 +1713,24 @@ class TestAdapterBehavior(unittest.TestCase):
         adapter._dispatch_inbound_event.assert_awaited_once()
         event = adapter._dispatch_inbound_event.await_args.args[0]
         self.assertEqual(event.message_type, MessageType.TEXT)
-        self.assertEqual(event.source.user_id, "u_user")  # tenant-scoped user_id preferred over app-scoped open_id
+        self.assertEqual(event.source.user_id, "ou_user")
         self.assertEqual(event.source.user_name, "张三")
         self.assertEqual(event.source.user_id_alt, "on_union")
         self.assertEqual(event.source.chat_name, "Feishu DM")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_sender_profile_falls_back_to_tenant_user_id_without_open_id(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        profile = asyncio.run(
+            adapter._resolve_sender_profile(
+                SimpleNamespace(open_id=None, user_id="u_only", union_id=None)
+            )
+        )
+
+        self.assertEqual(profile["user_id"], "u_only")
 
     @patch.dict(os.environ, {}, clear=True)
     def test_text_batch_merges_rapid_messages_into_single_event(self):
@@ -3536,6 +3569,27 @@ class TestFeishuApiPollStartupLookback(unittest.TestCase):
         self.assertIn("page_size=10", mock_urlopen.call_args.args[0].full_url)
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_startup_lookback_rejects_missing_has_more(self):
+        adapter = self._make_adapter()
+        adapter._fetch_tenant_access_token_via_api = Mock(return_value="token")
+        response = Mock()
+        response.read.return_value = json.dumps(
+            {
+                "code": 0,
+                "data": {"items": [self._item("om_recent", 999)]},
+            }
+        ).encode("utf-8")
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+
+        with patch("plugins.platforms.feishu.adapter.urlopen", return_value=response):
+            with self.assertRaisesRegex(RuntimeError, "missing boolean has_more"):
+                adapter._fetch_recent_chat_messages_via_api(
+                    "oc_test",
+                    startup_cursor_ms=880_000,
+                )
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_startup_lookback_fails_closed_at_page_limit(self):
         from plugins.platforms.feishu.adapter import _MAX_API_POLL_STARTUP_PAGES
 
@@ -3773,7 +3827,7 @@ class TestGroupMentionAtAll(unittest.TestCase):
     """Tests for @_all (Feishu @everyone) group mention routing."""
 
     @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
-    def test_at_all_in_content_accepts_without_explicit_bot_mention(self):
+    def test_at_all_in_content_does_not_accept_without_explicit_bot_mention(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
@@ -3783,11 +3837,10 @@ class TestGroupMentionAtAll(unittest.TestCase):
             mentions=[],
         )
         sender_id = SimpleNamespace(open_id="ou_any", user_id=None)
-        self.assertTrue(_admits_group(adapter, message, sender_id, ""))
+        self.assertFalse(_admits_group(adapter, message, sender_id, ""))
 
     @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "allowlist", "FEISHU_ALLOWED_USERS": "ou_allowed"}, clear=True)
-    def test_at_all_still_requires_policy_gate(self):
-        """@_all bypasses mention gating but NOT the allowlist policy."""
+    def test_at_all_does_not_bypass_mention_or_policy_gate(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
@@ -3796,9 +3849,28 @@ class TestGroupMentionAtAll(unittest.TestCase):
         # Non-allowlisted user — should be blocked even with @_all.
         blocked_sender = SimpleNamespace(open_id="ou_blocked", user_id=None)
         self.assertFalse(_admits_group(adapter, message, blocked_sender, ""))
-        # Allowlisted user — should pass.
+        # An allowlisted user still needs an explicit bot mention.
         allowed_sender = SimpleNamespace(open_id="ou_allowed", user_id=None)
-        self.assertTrue(_admits_group(adapter, message, allowed_sender, ""))
+        self.assertFalse(_admits_group(adapter, message, allowed_sender, ""))
+
+    @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
+    def test_at_all_with_explicit_bot_mention_is_accepted(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._bot_open_id = "ou_bot"
+        message = SimpleNamespace(
+            content='{"text":"@_all @_user_1 attention"}',
+            mentions=[
+                SimpleNamespace(
+                    id=SimpleNamespace(open_id="ou_bot", user_id=None),
+                    name="Hermes",
+                )
+            ],
+        )
+        sender_id = SimpleNamespace(open_id="ou_any", user_id=None)
+        self.assertTrue(_admits_group(adapter, message, sender_id, ""))
 
 
 @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
@@ -4802,7 +4874,7 @@ class TestFeishuExtractMessageContent(unittest.TestCase):
         )
 
         text, inbound_type, media_urls, media_types, mentions = asyncio.run(
-            adapter._extract_message_content(message)
+            adapter._extract_message_content(message, include_mentions=True)
         )
         self.assertEqual(text, "@Alice hello")
         self.assertEqual(len(mentions), 1)
@@ -4817,7 +4889,9 @@ class TestFeishuExtractMessageContent(unittest.TestCase):
             mentions=None,
         )
 
-        text, _, _, _, mentions = asyncio.run(adapter._extract_message_content(message))
+        text, _, _, _, mentions = asyncio.run(
+            adapter._extract_message_content(message, include_mentions=True)
+        )
         self.assertEqual(text, "plain hello")
         self.assertEqual(mentions, [])
 

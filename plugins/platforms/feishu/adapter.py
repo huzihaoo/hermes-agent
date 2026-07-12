@@ -2464,6 +2464,8 @@ class FeishuAdapter(BasePlatformAdapter):
             data = payload.get("data") or {}
             page_items = list(data.get("items") or [])
             items.extend(page_items)
+            if startup_cursor_ms is not None and not isinstance(data.get("has_more"), bool):
+                raise RuntimeError("message list startup response missing boolean has_more")
             has_more = bool(data.get("has_more"))
             if startup_cursor_ms is None or not has_more:
                 return items
@@ -3718,9 +3720,8 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         if emoji_type in {_FEISHU_ACK_EMOJI, _FEISHU_REACTION_IN_PROGRESS, _FEISHU_REACTION_FAILURE}:
             return
-        # Drop bot/app-origin reactions to break the feedback loop from our
-        # own lifecycle reactions. A human reacting with the same emoji (e.g.
-        # clicking Typing on a bot message) is still routed through.
+        # Drop bot/app-origin reactions to break feedback loops. Managed
+        # lifecycle emojis are suppressed above for every operator.
         loop = self._loop
         if (
             operator_type in {"bot", "app"}
@@ -6615,9 +6616,9 @@ class FeishuAdapter(BasePlatformAdapter):
     ) -> Dict[str, Optional[str]]:
         """Map Feishu's three-tier user IDs onto Hermes' SessionSource fields.
 
-        Preference order for the primary ``user_id`` field:
-          1. user_id  (tenant-scoped, most stable — requires permission scope)
-          2. open_id  (app-scoped, always available — different per bot app)
+        For normal users, ``open_id`` remains primary to preserve the local
+        session/authz contract; ``user_id`` is the fallback. Bot profiles use
+        tenant-scoped ``user_id`` first when Feishu provides it.
 
         ``user_id_alt`` carries the union_id (developer-scoped, stable across
         all apps by the same developer).  Session-key generation prefers

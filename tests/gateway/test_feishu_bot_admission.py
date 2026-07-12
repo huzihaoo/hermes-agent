@@ -475,7 +475,7 @@ def test_admit_per_group_require_mention_overrides_global():
     assert adapter._admit(sender, make_message(chat_id="oc_free", chat_type="group")) is None
     assert (
         adapter._admit(sender, make_message(chat_id="oc_other", chat_type="group"))
-        == "group_policy_rejected"
+        == "bot_not_mentioned"
     )
 
 
