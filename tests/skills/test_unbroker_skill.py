@@ -1388,6 +1388,33 @@ def test_dotenv_env_fills_missing_creds_and_shell_wins():
                     os.environ[k] = v
 
 
+def test_dotenv_env_honors_versioned_env_binding():
+    saved = {
+        key: os.environ.get(key)
+        for key in ("HERMES_HOME", "HERMES_ENV_PATH", "BROWSERBASE_API_KEY")
+    }
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        state = root / "state"
+        candidate = root / "candidate"
+        state.mkdir()
+        candidate.mkdir()
+        (state / ".env").write_text("BROWSERBASE_API_KEY=canonical\n", encoding="utf-8")
+        (candidate / ".env").write_text("BROWSERBASE_API_KEY=candidate\n", encoding="utf-8")
+        try:
+            os.environ["HERMES_HOME"] = str(state)
+            os.environ["HERMES_ENV_PATH"] = str(candidate / ".env")
+            os.environ.pop("BROWSERBASE_API_KEY", None)
+
+            assert config.dotenv_env()["BROWSERBASE_API_KEY"] == "candidate"
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+
 def test_cdp_cli_check_reports_not_running():
     orig = cdp.endpoint_status
     cdp.endpoint_status = lambda *a, **k: None

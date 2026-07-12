@@ -49,13 +49,21 @@ def _hermes_home() -> Path:
     return Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
 
 
+def _bound_env_path() -> Path:
+    env_binding = os.environ.get("HERMES_ENV_PATH", "").strip()
+    path = Path(env_binding).expanduser() if env_binding else _hermes_home() / ".env"
+    if env_binding and not path.is_absolute():
+        raise ValueError("HERMES_ENV_PATH must be an absolute path")
+    return path
+
+
 def _dotenv_paths() -> List[Path]:
     paths: List[Path] = []
     project_env = Path.cwd() / ".env"
     if project_env.exists():
         paths.append(project_env)
 
-    user_env = _hermes_home() / ".env"
+    user_env = _bound_env_path()
     if user_env.exists():
         paths.append(user_env)
 
@@ -115,7 +123,7 @@ def _resolve_user(user: Optional[str]) -> str:
 
     sys.exit(
         "Missing Hyperliquid address. Pass <address> explicitly or set "
-        f"{DEFAULT_USER_ENV} in your environment or {_hermes_home() / '.env'}."
+        f"{DEFAULT_USER_ENV} in your environment or {_bound_env_path()}."
     )
 
 

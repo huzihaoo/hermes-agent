@@ -67,7 +67,10 @@ def dotenv_env() -> dict:
     loads for its own tools (BROWSERBASE_API_KEY, EMAIL_*, AGENTMAIL_API_KEY, ...) even though the
     terminal-tool shell doesn't export them. Shell env wins; the .env only fills gaps."""
     merged: dict = {}
-    p = paths.hermes_home() / ".env"
+    raw_env_path = os.environ.get("HERMES_ENV_PATH", "").strip()
+    p = Path(raw_env_path).expanduser() if raw_env_path else paths.hermes_home() / ".env"
+    if raw_env_path and not p.is_absolute():
+        raise ValueError("HERMES_ENV_PATH must be an absolute path")
     if p.exists():
         try:
             for line in p.read_text(encoding="utf-8", errors="replace").splitlines():

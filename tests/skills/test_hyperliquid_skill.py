@@ -274,6 +274,41 @@ def test_user_dotenv_overrides_project_dotenv(tmp_path, monkeypatch):
     assert mod._env_lookup("HYPERLIQUID_USER_ADDRESS") == "0xuserhome"
 
 
+def test_versioned_env_binding_overrides_state_home_dotenv(tmp_path, monkeypatch):
+    mod = load_module()
+    project_dir = tmp_path / "project"
+    state_home = tmp_path / "state"
+    candidate = tmp_path / "candidate"
+    project_dir.mkdir()
+    state_home.mkdir()
+    candidate.mkdir()
+    (state_home / ".env").write_text(
+        "HYPERLIQUID_USER_ADDRESS=0xcanonical\n", encoding="utf-8"
+    )
+    (candidate / ".env").write_text(
+        "HYPERLIQUID_USER_ADDRESS=0xcandidate\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(project_dir)
+    monkeypatch.setenv("HERMES_HOME", str(state_home))
+    monkeypatch.setenv("HERMES_ENV_PATH", str(candidate / ".env"))
+    monkeypatch.delenv("HYPERLIQUID_USER_ADDRESS", raising=False)
+
+    assert mod._env_lookup("HYPERLIQUID_USER_ADDRESS") == "0xcandidate"
+
+
+def test_relative_versioned_env_binding_fails_closed(tmp_path, monkeypatch):
+    mod = load_module()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("HERMES_ENV_PATH", "relative/.env")
+
+    try:
+        mod._dotenv_paths()
+    except ValueError as exc:
+        assert "must be an absolute path" in str(exc)
+    else:
+        raise AssertionError("relative HERMES_ENV_PATH must fail closed")
+
+
 def test_main_export_json_writes_expected_contract(tmp_path, capsys):
     mod = load_module()
     output_path = tmp_path / "exports" / "btc-1h.json"

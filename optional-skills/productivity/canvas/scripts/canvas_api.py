@@ -28,9 +28,16 @@ def _check_config():
     if not CANVAS_BASE_URL:
         missing.append("CANVAS_BASE_URL")
     if missing:
-        hermes_env = os.path.join(
-            os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")), ".env"
-        )
+        hermes_env = os.environ.get("HERMES_ENV_PATH", "").strip()
+        if hermes_env:
+            if not os.path.isabs(os.path.expanduser(hermes_env)):
+                print("HERMES_ENV_PATH must be an absolute path", file=sys.stderr)
+                sys.exit(2)
+            hermes_env = os.path.expanduser(hermes_env)
+        else:
+            hermes_env = os.path.join(
+                os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")), ".env"
+            )
         print(
             f"Missing required environment variables: {', '.join(missing)}\n"
             f"Set them in {hermes_env} or export them in your shell.\n"
