@@ -2,6 +2,13 @@
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
+## Governed Knowledge Entry
+
+- For production work, recover current task state from the explicit handoff or shared-state first, then run `context-governance retrieve '<task or topic>' --max-nodes 8 --max-chars 6000` before broad searches.
+- Read only the returned sources and verify every current/blocker/owner/delivery claim against live workspace/runtime evidence. Knowledge, summaries, and memory are reference layers, not execution truth.
+- VM-bound shared-state tasks carry `attachments/governed-knowledge-context.md`. Treat it as a bounded reference capsule; missing or degraded retrieval must be recorded and must not trigger a bulk historical scan.
+- **Production closeout**: update the existing canonical knowledge page or skill with reusable decisions, procedures, tests, and failure lessons; record the final artifact manifest/receipt; classify bulky raw inputs as hot execution, one unique cold copy, or a Trash-review candidate. This is classification only: a partial/missing capsule forces raw hold, and no Trash/delete is allowed without a separate governed review.
+
 **Never give up on the right solution.**
 
 ## What Hermes Is
