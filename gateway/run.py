@@ -3201,6 +3201,19 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
     return None
 
 
+def _cleanup_stale_pending_task_traces() -> None:
+    """Finalize stale task markers before new gateway work can be accepted."""
+    try:
+        from hermes_events import cleanup_stale_pending
+
+        cleanup_stale_pending(
+            trace_file=_hermes_home / "analytics" / "events.jsonl",
+            timeout_minutes=30,
+        )
+    except Exception:
+        logger.debug("Stale pending task-trace cleanup failed", exc_info=True)
+
+
 def _submit_g1q3_rca_status_handoff(
     *,
     template_id: str,
@@ -8770,6 +8783,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
             self._request_clean_exit(reason)
+            return True
+
+        # Reconcile markers left by a previous process only after startup has
+        # passed its shutdown and access-policy gates, but before plugins,
+        # relays, or platform adapters can accept new work.
+        _cleanup_stale_pending_task_traces()
+        if await self._abort_startup_if_shutdown_requested():
             return True
         
         # Discover Python plugins before shell hooks so plugin block

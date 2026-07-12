@@ -5,9 +5,18 @@ tested on the REAL functions (no control-flow stubbing). Only the ssh-mini /
 vm_task_submit IO boundaries are substituted in the end-to-end wiring test.
 """
 import json
+import subprocess
 
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from scripts import pnc_g1q3_governance_rca as gov
+
+
+def _record_only_remote_read_runner(calls):
+    def run(cmd, *, timeout):
+        calls.append({"cmd": cmd, "timeout": timeout})
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    return run
 
 
 def test_flag_default_off_and_truthy_variants():
@@ -91,12 +100,54 @@ def test_followup_goal_is_readonly_and_forbids_sandbox_download():
     assert "need_download" in goal  # honest failure surfaced in the goal
 
 
+def test_remote_read_helpers_use_injected_ssh_wrapper():
+    calls = []
+
+    def runner(cmd, *, timeout):
+        calls.append({"cmd": cmd, "timeout": timeout})
+        command = cmd[1]
+        if command.endswith("/exit.code 2>/dev/null || echo __none__"):
+            stdout = "0\n"
+        elif command.endswith("/pipeline_state.json 2>/dev/null || true"):
+            stdout = '{"status":"completed"}\n'
+        else:
+            stdout = "/mnt/tmp/case_x/index.html\n__present__\n"
+        return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+    wrapper = "/record-only/ssh-mini-run"
+    poll = gov.poll_datapipe_exit(
+        task_slug="case_x",
+        artifact_root="/mnt/tmp/case_x/",
+        timeout_seconds=0,
+        ssh_mini_run=wrapper,
+        runner=runner,
+    )
+    state = gov.pipeline_state_verdict(
+        artifact_root="/mnt/tmp/case_x/",
+        ssh_mini_run=wrapper,
+        runner=runner,
+    )
+    present = gov.products_present(
+        artifact_root="/mnt/tmp/case_x/",
+        ssh_mini_run=wrapper,
+        runner=runner,
+    )
+
+    assert poll == {"done": True, "exit": 0}
+    assert state == {"status": "completed", "blocker": None}
+    assert present is True
+    assert len(calls) == 3
+    assert all(call["cmd"][0] == wrapper for call in calls)
+    assert all(call["timeout"] == 40 for call in calls)
+
+
 def test_coordinate_failure_path_creates_honest_readonly_task(monkeypatch):
     # Substitute only the IO boundaries; the decision/wiring runs for real.
     monkeypatch.setattr(gov, "dispatch_datapipe", lambda **k: {"ok": True, "task_id": "t"})
     monkeypatch.setattr(gov, "poll_datapipe_exit", lambda **k: {"done": True, "exit": 1})
     monkeypatch.setattr(gov, "products_present", lambda **k: False)
     captured = {}
+    remote_calls = []
 
     def fake_submit(**kwargs):
         captured.update(kwargs)
@@ -110,7 +161,8 @@ def test_coordinate_failure_path_creates_honest_readonly_task(monkeypatch):
         "execution_request_path": "/mnt/tmp/case_x/req.json",
         "work_item_id": "7023754183", "request_json": "{}",
         "artifact_cifs_root": "//hfs1/x/",
-    }, sleep=lambda s: None)
+    }, sleep=lambda s: None, ssh_mini_run="/record-only/ssh-mini-run",
+        remote_read_runner=_record_only_remote_read_runner(remote_calls))
 
     assert result["ok"] is True
     assert result["followup"]["datapipe"] == "failed"
@@ -119,6 +171,10 @@ def test_coordinate_failure_path_creates_honest_readonly_task(monkeypatch):
     assert captured["agent_backend"] == "codex"
     assert "need_download" in captured["goal"]
     assert "run_rca_execution_request.py" in captured["goal"]
+    assert remote_calls == [{
+        "cmd": ["/record-only/ssh-mini-run", "cat /mnt/tmp/case_x/pipeline_state.json 2>/dev/null || true"],
+        "timeout": 40,
+    }]
 
 
 def test_coordinate_success_path_creates_readonly_task_pointing_at_materialized(monkeypatch):
@@ -229,6 +285,7 @@ def test_coordinate_missing_early_card_falls_back_to_original_submit(monkeypatch
     monkeypatch.setattr(gov, "poll_datapipe_exit", lambda **k: {"done": True, "exit": 1})
     monkeypatch.setattr(gov, "products_present", lambda **k: False)
     captured = {}
+    remote_calls = []
     import tools.vm_task_tool as vtt
     monkeypatch.setattr(vtt, "vm_task_submit", lambda **kw: captured.update(kw) or {"success": True, "notify_process": {"started": True}})
 
@@ -239,10 +296,15 @@ def test_coordinate_missing_early_card_falls_back_to_original_submit(monkeypatch
         "execution_request_path": "/mnt/tmp/case_missing/req.json",
         "work_item_id": "7041712812",
         "request_json": "{}",
-    }, sleep=lambda s: None)
+    }, sleep=lambda s: None, ssh_mini_run="/record-only/ssh-mini-run",
+        remote_read_runner=_record_only_remote_read_runner(remote_calls))
 
     assert result["ok"] is True
     assert captured["task_id"] == "20260709-170000-g1q3-rca-issue-intake-missing"
+    assert remote_calls == [{
+        "cmd": ["/record-only/ssh-mini-run", "cat /mnt/tmp/case_missing/pipeline_state.json 2>/dev/null || true"],
+        "timeout": 40,
+    }]
 
 
 def test_gateway_early_acceptance_helper_fail_safe_on_seed_error():

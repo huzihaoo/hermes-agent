@@ -3,14 +3,14 @@ from pathlib import Path
 
 from scripts.pnc_status_projection import derive_presentation, no_deliverable_forbidden_hits, sanitize_milestones
 
-ROOT = Path('/Users/songying/.hermes/runtime/shared-state/tasks')
+FIXTURE_PATH = Path(__file__).with_name("fixtures") / "pnc_status_projection_cases.json"
+FIXTURES = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))["cases"]
 
 
 def _fixture(task_id: str):
-    task_dir = ROOT / task_id
-    meta = json.loads((task_dir / 'meta.json').read_text(encoding='utf-8'))
-    text = '\n'.join((task_dir / name).read_text(encoding='utf-8', errors='ignore') if (task_dir / name).exists() else '' for name in ('result.md','log.md','status.md'))
-    return meta, text
+    fixture = FIXTURES[task_id]
+    assert fixture["source_case_id"] == task_id
+    return fixture["meta"], fixture["evidence_text"]
 
 
 def _project(task_id: str, truth=None, contract=None):
@@ -62,6 +62,26 @@ def test_report_ready_prefers_foxglove_when_both_surfaces_exist():
     assert p['lane'] == 'report_ready'
     assert p['report_status'] == 'report_ready'
     assert p['artifact_label'] == '打开 foxglove 可视化'
+
+
+def test_report_ready_accepts_html_url_fragment_surface():
+    p = derive_presentation(
+        "completed",
+        contract={"artifact_path": "https://reports.example/case/index.html#evidence"},
+        report_truth={"real_report": True},
+    )
+    assert p["has_deliverable_report"] is True
+    assert p["report_status"] == "html_delivery_ready"
+
+
+def test_malformed_html_url_surface_fails_closed():
+    p = derive_presentation(
+        "completed",
+        contract={"artifact_path": "http://[broken"},
+        report_truth={"real_report": True},
+    )
+    assert p["has_deliverable_report"] is False
+    assert p["user_state"] != "done"
 
 
 def test_report_ready_fails_closed_when_both_surfaces_are_missing():

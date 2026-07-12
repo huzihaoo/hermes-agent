@@ -34,7 +34,7 @@ import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict
+from typing import Any, Callable, Dict
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -178,8 +178,22 @@ def build_followup_goal(*, template_id: str, full_case_id: str, work_item_id: st
 # IO: dispatch + poll (side-effectful; thin)
 # --------------------------------------------------------------------------
 
+RemoteRunner = Callable[..., subprocess.CompletedProcess]
+
+
 def _run(cmd: list[str], timeout: int = 60) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def _run_ssh_mini(
+    command: str,
+    *,
+    timeout: int,
+    ssh_mini_run: str | Path | None = None,
+    runner: RemoteRunner = _run,
+) -> subprocess.CompletedProcess:
+    wrapper = str(ssh_mini_run or SSH_MINI_RUN)
+    return runner([wrapper, command], timeout=timeout)
 
 
 def dispatch_datapipe(*, task_slug: str, artifact_root: str, execution_request_path: str,
@@ -211,12 +225,19 @@ def dispatch_datapipe(*, task_slug: str, artifact_root: str, execution_request_p
 def poll_datapipe_exit(*, task_slug: str, artifact_root: str,
                        timeout_seconds: int = DEFAULT_POLL_TIMEOUT_SECONDS,
                        interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS,
-                       sleep=time.sleep) -> Dict[str, Any]:
+                       sleep=time.sleep,
+                       ssh_mini_run: str | Path | None = None,
+                       runner: RemoteRunner = _run) -> Dict[str, Any]:
     """Poll the ssh-mini-submit job's exit.code under its work-dir."""
     exit_path = f"{artifact_root.rstrip('/')}/exit.code"
     waited = 0
     while waited <= timeout_seconds:
-        proc = _run([SSH_MINI_RUN, f"cat {exit_path} 2>/dev/null || echo __none__"], timeout=40)
+        proc = _run_ssh_mini(
+            f"cat {exit_path} 2>/dev/null || echo __none__",
+            timeout=40,
+            ssh_mini_run=ssh_mini_run,
+            runner=runner,
+        )
         out = (proc.stdout or "").strip().splitlines()
         val = out[-1].strip() if out else "__none__"
         if val.isdigit() or (val.startswith("-") and val[1:].isdigit()):
@@ -226,10 +247,20 @@ def poll_datapipe_exit(*, task_slug: str, artifact_root: str,
     return {"done": False, "exit": None, "timed_out": True}
 
 
-def pipeline_state_verdict(*, artifact_root: str) -> Dict[str, Any]:
+def pipeline_state_verdict(
+    *,
+    artifact_root: str,
+    ssh_mini_run: str | Path | None = None,
+    runner: RemoteRunner = _run,
+) -> Dict[str, Any]:
     """Read pipeline_state.json and return terminal status/blocker when present."""
     state_path = f"{artifact_root.rstrip('/')}/pipeline_state.json"
-    proc = _run([SSH_MINI_RUN, f"cat {state_path} 2>/dev/null || true"], timeout=40)
+    proc = _run_ssh_mini(
+        f"cat {state_path} 2>/dev/null || true",
+        timeout=40,
+        ssh_mini_run=ssh_mini_run,
+        runner=runner,
+    )
     text = (proc.stdout or "").strip()
     if not text:
         return {}
@@ -255,12 +286,21 @@ def pipeline_state_verdict(*, artifact_root: str) -> Dict[str, Any]:
     return {"status": status, "blocker": blocker} if status or blocker else {}
 
 
-def products_present(*, artifact_root: str) -> bool:
+def products_present(
+    *,
+    artifact_root: str,
+    ssh_mini_run: str | Path | None = None,
+    runner: RemoteRunner = _run,
+) -> bool:
     """Best-effort: does the materialized case carry a report under artifact_root?"""
     out = artifact_root.rstrip("/")
-    proc = _run([SSH_MINI_RUN,
-                 f"(ls {out}/**/index.html {out}/index.html {out}/*/report_data.json 2>/dev/null | head -1) "
-                 "&& echo __present__ || echo __absent__"], timeout=40)
+    proc = _run_ssh_mini(
+        f"(ls {out}/**/index.html {out}/index.html {out}/*/report_data.json 2>/dev/null | head -1) "
+        "&& echo __present__ || echo __absent__",
+        timeout=40,
+        ssh_mini_run=ssh_mini_run,
+        runner=runner,
+    )
     return "__present__" in (proc.stdout or "")
 
 
@@ -503,7 +543,13 @@ def update_existing_governance_card(
     }
 
 
-def coordinate(params: Dict[str, Any], *, sleep=time.sleep) -> Dict[str, Any]:
+def coordinate(
+    params: Dict[str, Any],
+    *,
+    sleep=time.sleep,
+    ssh_mini_run: str | Path | None = None,
+    remote_read_runner: RemoteRunner = _run,
+) -> Dict[str, Any]:
     """End-to-end: dispatch datapipe -> poll -> create standard read-only codex task."""
     from tools.vm_task_tool import vm_task_submit  # local import; heavy deps
 
@@ -523,9 +569,17 @@ def coordinate(params: Dict[str, Any], *, sleep=time.sleep) -> Dict[str, Any]:
     else:
         poll = poll_datapipe_exit(task_slug=task_slug, artifact_root=artifact_root,
                                   timeout_seconds=params.get("poll_timeout", DEFAULT_POLL_TIMEOUT_SECONDS),
-                                  sleep=sleep)
-        present = products_present(artifact_root=artifact_root) if poll.get("done") else False
-        state = pipeline_state_verdict(artifact_root=artifact_root) if poll.get("done") else {}
+                                  sleep=sleep, ssh_mini_run=ssh_mini_run, runner=remote_read_runner)
+        present = products_present(
+            artifact_root=artifact_root,
+            ssh_mini_run=ssh_mini_run,
+            runner=remote_read_runner,
+        ) if poll.get("done") else False
+        state = pipeline_state_verdict(
+            artifact_root=artifact_root,
+            ssh_mini_run=ssh_mini_run,
+            runner=remote_read_runner,
+        ) if poll.get("done") else {}
         followup = decide_followup(datapipe_exit=poll.get("exit"), products_present=present,
                                    pipeline_status=str(state.get("status") or ""),
                                    blocker=state.get("blocker") if isinstance(state.get("blocker"), dict) else None)

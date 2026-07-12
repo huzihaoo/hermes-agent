@@ -1,0 +1,82 @@
+{
+  "schema_version": "pnc_status_projection_regression_cases_v1",
+  "provenance": {
+    "kind": "sanitized_minimal_regression_vectors",
+    "source": "historical case identifiers and original regression assertions",
+    "contains_live_payload": false
+  },
+  "cases": {
+    "20260629-190539-g1q3-rca-issue-intake-6954459231": {
+      "source_case_id": "20260629-190539-g1q3-rca-issue-intake-6954459231",
+      "meta": {
+        "state": "blocked",
+        "created_at": "2026-06-29T19:05:39+08:00",
+        "updated_at": "2026-06-29T19:19:00+08:00"
+      },
+      "evidence_text": "terminal_state: blocked_need_evidence\nblocker.kind: missing_or_invalid_pdcl\n"
+    },
+    "20260629-192549-g1q3-rca-issue-intake-7031356230-56230_047667": {
+      "source_case_id": "20260629-192549-g1q3-rca-issue-intake-7031356230-56230_047667",
+      "meta": {
+        "state": "running",
+        "created_at": "2026-06-29T19:25:49+08:00",
+        "updated_at": "2026-06-29T19:37:00+08:00"
+      },
+      "evidence_text": "execution_state: running\nreport_review: need_review\n"
+    },
+    "20260611-144408-g1q3-rca-issue-intake-7015689036": {
+      "source_case_id": "20260611-144408-g1q3-rca-issue-intake-7015689036",
+      "meta": {
+        "state": "completed",
+        "created_at": "2026-06-11T14:44:08+08:00",
+        "updated_at": "2026-06-11T15:00:00+08:00"
+      },
+      "evidence_text": "terminal_state: need_evidence\nreport_status: need_user_data\n"
+    },
+    "20260627-142804-g1q3-rca-issue-intake-7029768863-68863_4a42ba": {
+      "source_case_id": "20260627-142804-g1q3-rca-issue-intake-7029768863-68863_4a42ba",
+      "meta": {
+        "state": "completed",
+        "created_at": "2026-06-27T14:28:04+08:00",
+        "updated_at": "2026-06-27T14:31:00+08:00"
+      },
+      "evidence_text": "business_state: not_admissible\nterminal_state: out_of_scope\n"
+    },
+    "20260615-191917-g1q3-rca-7017699515-fresh-rerun-v2-without-prior": {
+      "source_case_id": "20260615-191917-g1q3-rca-7017699515-fresh-rerun-v2-without-prior",
+      "meta": {
+        "state": "timeout",
+        "created_at": "2026-06-15T19:19:17+08:00",
+        "updated_at": "2026-06-15T20:19:17+08:00"
+      },
+      "evidence_text": "terminal_state: task_timeout\n"
+    },
+    "20260615-113107-g1q3-rca-issue-intake-6966935625": {
+      "source_case_id": "20260615-113107-g1q3-rca-issue-intake-6966935625",
+      "meta": {
+        "state": "pending",
+        "created_at": "2026-06-15T11:31:07+08:00",
+        "updated_at": "2026-06-15T11:31:07+08:00"
+      },
+      "evidence_text": "queue_state: pending\n"
+    },
+    "20260603-105813-g1q3-rca-status-check-g1q3-042": {
+      "source_case_id": "20260603-105813-g1q3-rca-status-check-g1q3-042",
+      "meta": {
+        "state": "completed",
+        "created_at": "2026-06-03T10:58:13+08:00",
+        "updated_at": "2026-06-03T11:01:00+08:00"
+      },
+      "evidence_text": "mode: readonly_status_check\nresult: no_new_report\n"
+    },
+    "20260615-193823-g1q3-rca-issue-intake-7000062233": {
+      "source_case_id": "20260615-193823-g1q3-rca-issue-intake-7000062233",
+      "meta": {
+        "state": "blocked",
+        "created_at": "2026-06-15T19:38:23+08:00",
+        "updated_at": "2026-06-15T19:43:00+08:00"
+      },
+      "evidence_text": "terminal_state: invalid_frame_id\nframe_id: 0\n"
+    }
+  }
+}

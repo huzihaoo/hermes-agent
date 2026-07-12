@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from scripts.pnc_rca_contract_drift_guard import check_contract_drift
+from scripts.pnc_rca_contract_drift_guard import check_contract_drift, default_host_path
 
 BEGIN = "# === RCA_REQUEST_CONTRACT:BEGIN (do not edit between markers without updating host copy) ==="
 END = "# === RCA_REQUEST_CONTRACT:END ==="
@@ -48,10 +48,14 @@ def test_contract_drift_guard_warn_skips_when_counterpart_missing(tmp_path):
     assert result["warning"] == "counterpart_missing"
 
 
-def test_contract_drift_guard_real_host_copy_degrades_when_vm_mount_missing():
-    host = Path("/Users/songying/.hermes/runtime/hermes-live/gateway/pnc_rca_schema.py")
-    vm = Path("/path/that/does/not/exist/rca_request_contract.py")
+def test_contract_drift_guard_tracked_host_copy_degrades_when_vm_mount_missing(tmp_path):
+    host = default_host_path()
+    vm = tmp_path / "missing" / "rca_request_contract.py"
+
+    assert host.is_file()
     result = check_contract_drift(host, vm)
+
     assert result["ok"] is True
     assert result["status"] == "skip"
     assert result["warning"] == "counterpart_missing"
+    assert result["missing"] == [str(vm)]

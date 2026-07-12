@@ -2,6 +2,8 @@ import json
 import os
 from datetime import datetime, timezone
 
+import pytest
+
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from scripts import pnc_completion_notice_relay
 
@@ -259,12 +261,16 @@ def test_completion_notice_relay_launchd_guard_requires_keepalive_watch(monkeypa
     assert any("KeepAlive=true" in error for error in result["errors"])
 
 
-def test_completion_notice_relay_launchd_guard_accepts_keepalive_watch(monkeypatch):
+def test_completion_notice_relay_launchd_guard_accepts_keepalive_watch(tmp_path, monkeypatch):
     from scripts import hermes_live_drift_guard
 
-    raw_with_watch = """
-    program = /Users/songying/.hermes/runtime/venvs/hermes-live-v0.14.6/bin/python
-    /Users/songying/.hermes/runtime/hermes-live/scripts/pnc_completion_notice_relay.py
+    plist = tmp_path / "Library" / "LaunchAgents" / "local.pnc.completion-notice-relay.plist"
+    plist.parent.mkdir(parents=True)
+    plist.write_text("<plist/>", encoding="utf-8")
+    monkeypatch.setattr(hermes_live_drift_guard.Path, "home", staticmethod(lambda: tmp_path))
+    raw_with_watch = f"""
+    program = {tmp_path}/.hermes/runtime/venvs/hermes-live-v0.14.6/bin/python
+    {tmp_path}/.hermes/runtime/hermes-live/scripts/pnc_completion_notice_relay.py
     --send --watch --retry-failed-after 600 --max-attempts 3
     KeepAlive => true
     """
@@ -277,6 +283,7 @@ def test_completion_notice_relay_launchd_guard_accepts_keepalive_watch(monkeypat
     result = hermes_live_drift_guard.validate_pnc_completion_notice_relay_launchd()
 
     assert result["ok"] is True
+    assert result["errors"] == []
 
 
 def test_failed_notice_alerts_home_channel_once_at_max_attempts(tmp_path, monkeypatch):
@@ -2288,6 +2295,34 @@ def test_normalize_html_artifact_path_keeps_real_http_report_clickable():
     assert pointer == "https://reports.example.com/g1q3/index.html"
 
 
+def test_normalize_html_artifact_path_preserves_url_query_and_fragment():
+    exact = "https://reports.example.com/g1q3/index.html?token=abc#section"
+    pointer, root = pnc_completion_notice_relay._normalize_html_artifact_path(exact)
+    assert pointer == exact
+    assert root == "https://reports.example.com/g1q3/"
+
+
+def test_normalize_html_artifact_path_rejects_malformed_urls():
+    for malformed in ("http://[broken", "file://[broken"):
+        assert pnc_completion_notice_relay._normalize_html_artifact_path(
+            malformed,
+            report_status="html_delivery_ready",
+        ) == ("", "")
+
+    pointer, root = pnc_completion_notice_relay._normalize_html_artifact_path(
+        "https://reports.example.com/g1q3?token=abc#section",
+        report_status="html_delivery_ready",
+    )
+    assert pointer == "https://reports.example.com/g1q3/index.html?token=abc#section"
+    assert root == "https://reports.example.com/g1q3/"
+
+
+def test_canonical_report_index_rejects_ambiguous_empty_path_segments():
+    assert pnc_completion_notice_relay._canonical_user_visible_report_index(
+        "/mnt/tmp/case-a//nested/",
+    ) == ""
+
+
 def test_is_cifs_unc_detects_shares_but_not_web_urls():
     assert pnc_completion_notice_relay._is_cifs_unc("//hfs1.minieye.tech/share/x")
     assert pnc_completion_notice_relay._is_cifs_unc("\\\\hfs1\\share")
@@ -2495,7 +2530,7 @@ G5_time_alignment requires_download
     assert "需人工确认" in text_calls[0]["message"]
 
 
-def test_g1q3_green_gate_with_parsed_l2_can_be_delivery_ready(tmp_path):
+def test_g1q3_green_gate_with_parsed_l2_can_be_delivery_ready(tmp_path, monkeypatch):
     task_id = "20260622-210000-g1q3-rca-issue-intake-green"
     token = set_hermes_home_override(tmp_path)
     try:
@@ -2506,14 +2541,85 @@ def test_g1q3_green_gate_with_parsed_l2_can_be_delivery_ready(tmp_path):
         (artifact_root / "index.html").write_text("<html>ok</html>", encoding="utf-8")
         (artifact_root / "gate_result.json").write_text(json.dumps({"decision": "green", "parsed_l2_assets_present": True}), encoding="utf-8")
         (artifact_root / "report_data.json").write_text(json.dumps({"html_validation_state": "html_delivery_ready", "parsed_l2_assets_present": True}), encoding="utf-8")
-        (shared / "meta.json").write_text(json.dumps({"state": "completed", "business_line": "g1q3_rca", "artifact_root": str(artifact_root), "updated_at": "2026-06-22T21:00:00+08:00"}), encoding="utf-8")
+        artifact_vm_root = f"/mnt/tmp/{task_id}/"
+        artifact_cifs_root = f"//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/{task_id}/"
+        monkeypatch.setattr(
+            pnc_completion_notice_relay,
+            "local_candidates_for_vm_path",
+            lambda path: [artifact_root] if str(path).rstrip("/") == artifact_vm_root.rstrip("/") else [],
+        )
+        (shared / "meta.json").write_text(json.dumps({
+            "state": "completed",
+            "business_line": "g1q3_rca",
+            "artifact_root": artifact_vm_root,
+            "artifact_cifs_root": artifact_cifs_root,
+            "updated_at": "2026-06-22T21:00:00+08:00",
+        }), encoding="utf-8")
         body = {"task_card": {"task_id": task_id, "delivery": {}, "milestones": []}, "completion_notice": {"state": "completed"}}
         out = pnc_completion_notice_relay.enrich_g1q3_task_card_delivery(task_id, body)
     finally:
         reset_hermes_home_override(token)
-    assert out["task_card"]["delivery"]["report_status"] == "html_delivery_ready"
-    assert out["task_card"]["delivery"]["conclusion"] == "RCA 报告已生成"
+    delivery = out["task_card"]["delivery"]
+    assert delivery["report_status"] == "html_delivery_ready"
+    assert delivery["artifact_root"] == artifact_cifs_root
+    assert delivery["artifact_cifs"] == artifact_cifs_root
+    assert delivery["artifact_path"] == artifact_cifs_root + "index.html"
+    assert delivery["cifs_status"] == "success"
+    assert delivery["conclusion"] == "RCA 报告已生成"
     assert out["task_card"]["user_state"] == "done"
+
+
+@pytest.mark.parametrize(
+    "artifact_cifs_root",
+    ["", "//nonexistent.invalid/share/review/", "http://[broken"],
+)
+def test_g1q3_host_local_report_without_bound_pickup_surface_fails_closed(
+    tmp_path,
+    artifact_cifs_root,
+):
+    task_id = "20260622-210001-g1q3-rca-issue-intake-host-only"
+    token = set_hermes_home_override(tmp_path)
+    try:
+        shared = tmp_path / "runtime" / "shared-state" / "tasks" / task_id
+        shared.mkdir(parents=True, exist_ok=True)
+        artifact_root = tmp_path / "artifacts" / task_id
+        artifact_root.mkdir(parents=True, exist_ok=True)
+        (artifact_root / "index.html").write_text("<html>ok</html>", encoding="utf-8")
+        (artifact_root / "gate_result.json").write_text(json.dumps({
+            "decision": "green",
+            "parsed_l2_assets_present": True,
+        }), encoding="utf-8")
+        (artifact_root / "report_data.json").write_text(json.dumps({
+            "html_validation_state": "html_delivery_ready",
+            "parsed_l2_assets_present": True,
+        }), encoding="utf-8")
+        meta = {
+            "state": "completed",
+            "business_line": "g1q3_rca",
+            "artifact_root": str(artifact_root),
+        }
+        if artifact_cifs_root:
+            meta["artifact_cifs_root"] = artifact_cifs_root
+        (shared / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        body = {
+            "task_card": {"task_id": task_id, "delivery": {}, "milestones": []},
+            "completion_notice": {"state": "completed"},
+        }
+
+        out = pnc_completion_notice_relay.enrich_g1q3_task_card_delivery(task_id, body)
+    finally:
+        reset_hermes_home_override(token)
+
+    delivery = out["task_card"]["delivery"]
+    rendered = json.dumps(
+        pnc_completion_notice_relay.render_task_card(out["task_card"]),
+        ensure_ascii=False,
+    )
+    assert out["task_card"]["user_state"] != "done"
+    assert out["task_card"]["presentation"]["has_deliverable_report"] is False
+    assert delivery["cifs_status"] != "success"
+    assert delivery["artifact_label"] != "打开 HTML 报告"
+    assert "成功，可从取件路径获取" not in rendered
 
 
 def test_milestones_are_business_tz_sorted_and_semantic_deduped():

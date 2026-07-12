@@ -69,7 +69,7 @@ def test_concurrent_mixed_fault_routing_is_stable_and_deterministic(tmp_path):
             # infra
             tid, body = _make_task(tmp_path, i, kind="translate_workdir_permission",
                                     fault_class="infra_self_healable", state="blocked", with_governance=False)
-            tasks.append((tid, body)); expected[tid] = ("skipped", "infra_self_healable_no_originator_ping")
+            tasks.append((tid, body)); expected[tid] = ("skipped", "pipeline_fix_no_originator_ping")
             # human, resolvable originator
             tid, body = _make_task(tmp_path, 100 + i, kind="need_source_or_evidence",
                                    fault_class="needs_human_input", state="need_input", with_governance=True)
@@ -108,7 +108,7 @@ def test_concurrent_mixed_fault_routing_is_stable_and_deterministic(tmp_path):
                 assert res.get("has_mention") is True, (tid, res)
         # no infra task ever produced a mention / orphan card
         for tid, (lane, _r) in expected.items():
-            if expected[tid][1] == "infra_self_healable_no_originator_ping":
+            if expected[tid][1] == "pipeline_fix_no_originator_ping":
                 assert "has_mention" not in concurrent[tid] or concurrent[tid].get("has_mention") is not True
     finally:
         reset_hermes_home_override(token)

@@ -8,9 +8,62 @@ must never break the agent or gateway flow.
 from __future__ import annotations
 
 import json
+import os
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
+
+_IS_WINDOWS = sys.platform == "win32"
+_WINDOWS_LOCK_OFFSET = 1024 * 1024
+
+
+def _try_acquire_cleanup_lock(handle) -> bool:
+    try:
+        if _IS_WINDOWS:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write("\n")
+                handle.flush()
+            handle.seek(_WINDOWS_LOCK_OFFSET)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except (BlockingIOError, OSError):
+        return False
+
+
+def _release_cleanup_lock(handle) -> None:
+    try:
+        if _IS_WINDOWS:
+            handle.seek(_WINDOWS_LOCK_OFFSET)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+def _trace_contains_timeout_event(trace_path: Path, event_id: str) -> bool:
+    try:
+        with trace_path.open("r", encoding="utf-8") as trace_file:
+            for line in trace_file:
+                try:
+                    payload = json.loads(line)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                data = payload.get("data") if isinstance(payload, dict) else None
+                if isinstance(data, dict) and data.get("timeout_event_id") == event_id:
+                    return True
+    except (OSError, UnicodeError):
+        return False
+    return False
 
 
 class EventEmitter:
@@ -20,9 +73,14 @@ class EventEmitter:
         self.trace_file = Path(trace_file) if trace_file else None
         self.task_store = task_store  # Optional TaskStore for SQLite persistence
 
-    def emit(self, event: str, data: Dict[str, Any]) -> None:
+    def emit(self, event: str, data: Dict[str, Any]) -> bool:
+        """Return whether the append-only JSONL write succeeded.
+
+        TaskStore synchronization remains best-effort and is deliberately not
+        part of this return value.
+        """
         if self.trace_file is None:
-            return
+            return False
         try:
             self.trace_file.parent.mkdir(parents=True, exist_ok=True)
             payload = {
@@ -37,7 +95,8 @@ class EventEmitter:
             if self.task_store:
                 self._sync_to_store(event, data, payload["timestamp"])
         except Exception:
-            return
+            return False
+        return True
 
     def _sync_to_store(self, event: str, data: Dict[str, Any], timestamp: float) -> None:
         """Sync task lifecycle events to SQLite store."""
@@ -219,21 +278,46 @@ def cleanup_stale_pending(*, trace_file: Path, timeout_minutes: int = 30) -> Non
     trace_path = Path(trace_file)
     emitter = EventEmitter(trace_path)
     try:
-        for pending_file in trace_path.parent.glob(".pending-*"):
-            age_s = time.time() - pending_file.stat().st_mtime
-            if age_s <= timeout_minutes * 60:
-                continue
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = trace_path.parent / ".task-trace-cleanup.lock"
+        with lock_path.open("a+", encoding="utf-8") as lock_file:
+            if not _try_acquire_cleanup_lock(lock_file):
+                return
             try:
-                data = json.loads(pending_file.read_text(encoding="utf-8"))
-                task_id = data.get("task_id") or pending_file.name.replace(".pending-", "", 1)
-            except Exception:
-                task_id = pending_file.name.replace(".pending-", "", 1)
-            timeout_event = TaskEvent.task_timeout(
-                task_id=task_id,
-                reason=f"stale pending > {timeout_minutes} minutes",
-            )
-            emitter.emit(timeout_event["event"], timeout_event["data"])
-            pending_file.unlink(missing_ok=True)
+                for pending_file in trace_path.parent.glob(".pending-*"):
+                    try:
+                        if not pending_file.is_file():
+                            continue
+                        age_s = time.time() - pending_file.stat().st_mtime
+                        if age_s <= timeout_minutes * 60:
+                            continue
+                        try:
+                            data = json.loads(pending_file.read_text(encoding="utf-8"))
+                            task_id = data.get("task_id") or pending_file.name.replace(".pending-", "", 1)
+                            try:
+                                marker_timestamp = float(data.get("timestamp"))
+                            except (TypeError, ValueError):
+                                marker_timestamp = pending_file.stat().st_mtime
+                        except Exception:
+                            task_id = pending_file.name.replace(".pending-", "", 1)
+                            marker_timestamp = pending_file.stat().st_mtime
+                        timeout_event_id = (
+                            f"stale-timeout:{pending_file.name}:{task_id}:{marker_timestamp:.6f}"
+                        )
+                        if _trace_contains_timeout_event(trace_path, timeout_event_id):
+                            pending_file.unlink(missing_ok=True)
+                            continue
+                        timeout_event = TaskEvent.task_timeout(
+                            task_id=task_id,
+                            reason=f"stale pending > {timeout_minutes} minutes",
+                        )
+                        timeout_event["data"]["timeout_event_id"] = timeout_event_id
+                        if emitter.emit(timeout_event["event"], timeout_event["data"]):
+                            pending_file.unlink(missing_ok=True)
+                    except Exception:
+                        continue
+            finally:
+                _release_cleanup_lock(lock_file)
     except Exception:
         return
 

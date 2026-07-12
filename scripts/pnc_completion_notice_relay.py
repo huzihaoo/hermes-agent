@@ -23,6 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable
+from urllib.parse import urlsplit, urlunsplit
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -1102,6 +1103,71 @@ def _cifs_for_vm_path(vm_path: str, fallback_root_cifs: str = "") -> str:
         return str(fallback_root_cifs).rstrip("/") + "/"
     return ""
 
+
+def _canonical_user_visible_report_index(path: str) -> str:
+    """Map a governed VM/host/CIFS artifact path to its canonical CIFS index."""
+    text = str(path or "").strip()
+    if not text:
+        return ""
+
+    for prefix in ("/mnt/tmp/", PERCEPTION_TEST_TEAM_VM_PREFIX):
+        if text.startswith(prefix):
+            rel = text[len(prefix):].rstrip("/")
+            rel_parts = rel.split("/")
+            if not rel or any(part in {"", ".", ".."} for part in rel_parts):
+                return ""
+
+    mapped = _cifs_for_vm_path(text)
+    if not mapped:
+        home = str(Path.home()).rstrip("/")
+        host_mappings = (
+            (
+                home + "/Mounts/mini_root/mnt/tmp/",
+                "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/",
+            ),
+            (
+                home + "/Mounts/department-pnc_team-planning_algo-driving/tmp/",
+                "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/",
+            ),
+            (
+                home + "/Mounts/mini_root/mnt/minieye/pdcl/department/perception_test_team/",
+                PERCEPTION_TEST_TEAM_CIFS_PREFIX,
+            ),
+        )
+        for host_prefix, cifs_prefix in host_mappings:
+            if text.startswith(host_prefix):
+                rel = text[len(host_prefix):].lstrip("/").rstrip("/")
+                if rel and not any(part in {"", ".", ".."} for part in rel.split("/")):
+                    mapped = cifs_prefix + rel
+                break
+
+    if not mapped:
+        governed_cifs_prefixes = (
+            "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/",
+            PERCEPTION_TEST_TEAM_CIFS_PREFIX,
+        )
+        if text.startswith(governed_cifs_prefixes):
+            rel = text.split("/", 4)[-1].rstrip("/")
+            if rel and not any(part in {"", ".", ".."} for part in rel.split("/")):
+                mapped = text.rstrip("/")
+
+    if not mapped:
+        return ""
+    return mapped if mapped.lower().endswith(".html") else mapped.rstrip("/") + "/index.html"
+
+
+def _user_visible_report_index(artifact_root: str, artifact_cifs_root: str) -> str:
+    """Return a recipient surface bound to the materialized artifact root."""
+    derived = _canonical_user_visible_report_index(artifact_root)
+    if not derived:
+        return ""
+    declared_raw = str(artifact_cifs_root or "").strip()
+    if declared_raw:
+        declared = _canonical_user_visible_report_index(declared_raw)
+        if not declared or declared != derived:
+            return ""
+    return derived
+
 def _load_shared_result_payload(task_id: str) -> dict[str, Any]:
     """Read shared-state result.md as JSON/dict when possible."""
     path = _shared_state_task_dir(task_id) / "result.md"
@@ -1482,14 +1548,36 @@ def _normalize_html_artifact_path(path: str, *, report_status: str = "") -> tupl
         return "", "html_source_suppressed"
     clean = text.rstrip()
     is_web = clean.startswith(("http://", "https://", "file://"))
-    if clean.lower().endswith(".html"):
+    try:
+        parsed = urlsplit(clean) if is_web else None
+    except ValueError:
+        return "", ""
+    path_part = parsed.path if parsed is not None else clean
+    if path_part.lower().endswith(".html"):
         pointer = clean
-        root = clean.rsplit("/", 1)[0] + "/" if "/" in clean else ""
+        root_path = path_part.rsplit("/", 1)[0] + "/" if "/" in path_part else ""
+        root = (
+            urlunsplit((parsed.scheme, parsed.netloc, root_path, "", ""))
+            if parsed is not None
+            else root_path
+        )
     elif report_status == "html_delivery_ready":
         # F1 only sets html_delivery_ready when a real index.html exists on the
         # host, so synthesizing the index.html pointer here is now safe.
-        pointer = clean.rstrip("/") + "/index.html"
-        root = clean.rstrip("/") + "/"
+        report_path = path_part.rstrip("/") + "/index.html"
+        root_path = path_part.rstrip("/") + "/"
+        if parsed is not None:
+            pointer = urlunsplit((
+                parsed.scheme,
+                parsed.netloc,
+                report_path,
+                parsed.query,
+                parsed.fragment,
+            ))
+            root = urlunsplit((parsed.scheme, parsed.netloc, root_path, "", ""))
+        else:
+            pointer = report_path
+            root = root_path
     else:
         # No confirmed report: keep the directory for display, fabricate no
         # clickable pointer (avoids a button into an empty directory).
@@ -1735,6 +1823,11 @@ def enrich_g1q3_task_card_delivery(task_id: str, body: dict[str, Any]) -> dict[s
     # worker result.md/pipeline_result report_ready is an authoritative later
     # stage than stale S1 ready_to_download log text.
     host_report_exists = _host_report_exists(artifact_root, artifact_cifs_root) if (artifact_cifs_root or artifact_root) else False
+    verified_report_index = (
+        _user_visible_report_index(artifact_root, artifact_cifs_root)
+        if host_report_exists
+        else ""
+    )
     if report_ready_truth:
         report_status = "report_ready" if str(report_ready_truth.get("foxglove_url") or "").strip() else "html_delivery_ready"
         # Worker report_ready already verified non-empty index.html/report_data.
@@ -1834,6 +1927,9 @@ def enrich_g1q3_task_card_delivery(task_id: str, body: dict[str, Any]) -> dict[s
     report_case_dir_cifs = _perception_test_team_cifs(report_case_dir_vm)
     report_index_html_cifs = _perception_test_team_cifs(report_index_html_vm)
     report_data_cifs = _perception_test_team_cifs(report_data_vm)
+    if verified_report_index and not report_ready_truth:
+        report_index_html_cifs = verified_report_index
+        report_case_dir_cifs = verified_report_index.rsplit("/", 1)[0] + "/"
     report_case_dir_http = _perception_test_team_http(report_case_dir_vm)
     report_index_html_http = _perception_test_team_http(report_index_html_vm)
     agent_artifact_root_vm = str(report_ready_truth.get("artifact_root_vm") or artifact_root or "").strip()
@@ -1997,6 +2093,8 @@ def enrich_g1q3_task_card_delivery(task_id: str, body: dict[str, Any]) -> dict[s
     })
     if report_ready_truth:
         projection_report_truth.update(report_ready_truth)
+    elif verified_report_index and real_report:
+        projection_report_truth["index_html_vm"] = verified_report_index
     if blocked_keyframe_pipeline:
         projection_report_truth["report_status"] = "need_keyframe"
         projection_report_truth["honest_report_status"] = "need_keyframe"

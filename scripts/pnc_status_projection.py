@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass, field
 import json
 import re
 from typing import Any, Iterable
+from urllib.parse import urlsplit
 
 REPORT_READY_STATUSES = {"html_delivery_ready", "report_ready", "report_generated_need_review"}
 FAILED_STATES = {"failed", "timeout", "cancelled", "canceled", "abandoned", "error"}
@@ -121,6 +122,15 @@ def _action_category(kind: str) -> str:
     return "none"
 
 
+def _surface_path(value: str) -> str:
+    if value.startswith(("http://", "https://", "file://")):
+        try:
+            return urlsplit(value).path
+        except ValueError:
+            return ""
+    return value.split("?", 1)[0].split("#", 1)[0]
+
+
 def _delivery_surface_flags(report_truth: dict[str, Any], contract: dict[str, Any]) -> tuple[bool, bool]:
     ready = report_truth.get("report_ready_truth") if isinstance(report_truth.get("report_ready_truth"), dict) else {}
     html_candidates = (
@@ -134,7 +144,11 @@ def _delivery_surface_flags(report_truth: dict[str, Any], contract: dict[str, An
         _nested(ready, "foxglove_url", "viz_mcap_vm"),
         _nested(contract, "foxglove_url", "viz_mcap_vm", "rca_status.foxglove_url", "artifacts.viz_mcap_vm"),
     )
-    has_html = any(value.lower().split("?", 1)[0].endswith(".html") for value in html_candidates if value)
+    has_html = any(
+        _surface_path(value).lower().endswith(".html")
+        for value in html_candidates
+        if value
+    )
     has_foxglove = any(
         value.startswith(("http://", "https://")) or value.endswith(".viz.mcap")
         for value in foxglove_candidates

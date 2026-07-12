@@ -553,10 +553,12 @@ def test_g1q3_completed_intake_with_real_report_still_renders_done(tmp_path, mon
             "work_item_id": "7017699515",
             "readback": {"text": ""},
             "status_summary": {"attribution_status": "hypothesis_ready", "report_status": "html_delivery_ready"},
-            "artifacts": {"best": {"index_html": "/mnt/minieye/.../index.html", "review_payload": {}}},
+            "artifacts": {"best": {
+                "index_html": "/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases/7017699515/index.html",
+                "review_payload": {},
+            }},
         }
         monkeypatch.setattr(pnc_vm_task_sync.vm_task_completion_probe, "_read_rca_execution_result", lambda vm_task_id, task_dir: structured)
-        monkeypatch.setattr(pnc_vm_task_sync, "_feishu_report_attachment_link", lambda **kwargs: "https://project.feishu.cn/token")
         card = pnc_vm_task_sync._task_card_for_task(task, {
             "state": {"value": "completed", "summary": "completed", "terminal": True},
             "artifacts": [],
@@ -565,6 +567,8 @@ def test_g1q3_completed_intake_with_real_report_still_renders_done(tmp_path, mon
     finally:
         reset_hermes_home_override(token)
     assert card["user_state"] == "done"
+    assert card["delivery"]["report_status"] == "html_delivery_ready"
+    assert card["delivery"]["artifact_path"].endswith("/G1Q3_RCA/cases/7017699515/index.html")
     assert "RCA 报告已生成" in card["delivery"]["conclusion"]
 
 
@@ -622,18 +626,18 @@ def test_g1q3_sync_report_ready_result_wins_over_stale_ready_to_download_log_and
     assert result["ok"] is True
     assert "task_card" not in body
     delivery = body["vm_delivery_proposal"]["delivery"]
-    assert delivery["report_status"] == "html_delivery_ready"
+    assert delivery["report_status"] == "report_ready"
     assert delivery["agent_artifact_root_vm"].startswith("/mnt/tmp/")
     assert delivery["business_case_dir_vm"].startswith("/mnt/minieye/pdcl/department/perception_test_team/")
     assert delivery["business_case_dir_cifs"].startswith("//hfs.minieye.tech/department-perception_test_team/")
     assert delivery["foxglove_url"].endswith("/7026726390_acc/7026726390_acc.viz.mcap")
     assert delivery["artifact_path"] == delivery["foxglove_url"]
-    assert delivery["report_status"] == "report_ready"
+    assert delivery["artifact_label"] == "打开 foxglove 可视化"
     assert delivery["attribution_causal_text"] == "实际减速度偏重 -> 纵向控制请求波动"
     assert body["vm_delivery_proposal"]["user_state"] == "done"
 
     relayed = pnc_completion_notice_relay.reconcile_vm_delivery_proposal(task_id, body)
-    assert relayed["task_card"]["delivery"]["report_status"] == "html_delivery_ready"
+    assert relayed["task_card"]["delivery"]["report_status"] == "report_ready"
     assert relayed["task_card"]["delivery"]["business_case_dir_cifs"].startswith("//hfs.minieye.tech/department-perception_test_team/")
     assert relayed["task_card"]["user_state"] == "done"
 

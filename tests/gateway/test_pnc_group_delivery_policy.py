@@ -88,7 +88,9 @@ def test_missing_case_rejected_before_handoff():
     )
 
     assert decision.decision == "reject"
-    assert decision.reason == "missing_case_id"
+    # Both case_id and work_item_id are valid issue identifiers.  Keep the
+    # rejection reason aligned with that expanded handoff contract.
+    assert decision.reason == "missing_issue_identifier"
 
 
 def test_cross_line_intent_rejected():
