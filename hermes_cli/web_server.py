@@ -14293,6 +14293,9 @@ def _resolve_chat_argv(
 
     if profile_dir is not None:
         env["HERMES_HOME"] = str(profile_dir)
+        from hermes_constants import apply_subprocess_home_env
+
+        apply_subprocess_home_env(env)
 
     if resume:
         _resume_db = _open_session_db_for_profile(

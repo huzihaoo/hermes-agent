@@ -844,6 +844,7 @@ def _normalize_command_for_detection(command: str) -> str:
     # Fold the (more specific) Hermes home first: on Windows it nests under the
     # user home (C:\Users\alice\AppData\...\hermes), so folding the user home
     # first would eat the prefix the Hermes-home fold needs.
+    command = _rewrite_resolved_hermes_files(command)
     command = _rewrite_resolved_hermes_home(command)
     command = _rewrite_resolved_user_home(command)
     # Strip shell backslash-escapes: r\m → rm. Prevents \-injection bypass.
@@ -924,6 +925,67 @@ def _fold_home_prefixes(command: str, paths, replacement: str) -> str:
                 command,
             )
     return command
+
+
+@functools.lru_cache(maxsize=128)
+def _exact_path_fold_regex(path: str):
+    """Compile a boundary-safe regex for one absolute filesystem path."""
+    if not path:
+        return None
+    components = [c for c in re.split(r"[/\\]+", path) if c]
+    if len(components) < 2:
+        return None
+    body = r"[/\\]+".join(re.escape(c) for c in components)
+    # Do not start in the middle of a longer path, and do not treat
+    # config.yaml.bak as the protected config.yaml token.
+    return re.compile(
+        r"(?<![A-Za-z0-9_./\\-])[/\\]*"
+        + body
+        + r"(?=$|["
+        + _PATH_TOKEN_STOP
+        + r"])",
+    )
+
+
+def _fold_exact_paths(command: str, paths, replacement: str) -> str:
+    """Fold exact absolute paths without matching siblings or backup suffixes."""
+    seen: set[str] = set()
+    for path in sorted((str(p) for p in paths if p), key=len, reverse=True):
+        if path in seen:
+            continue
+        seen.add(path)
+        pattern = _exact_path_fold_regex(path)
+        if pattern is not None:
+            command = pattern.sub(replacement, command)
+    return command
+
+
+def _rewrite_resolved_hermes_files(command: str) -> str:
+    """Fold active versioned config/env files into static protected sentinels."""
+    try:
+        from hermes_constants import get_config_path, get_env_path
+
+        config = get_config_path().expanduser()
+        env_file = get_env_path().expanduser()
+        config_paths = [str(config), str(config.resolve(strict=False))]
+        env_paths = [str(env_file), str(env_file.resolve(strict=False))]
+    except Exception:
+        config_paths = []
+        env_paths = []
+
+    # Retain defense in depth for an absolute process binding even when a
+    # named profile correctly ignores it as its active file.
+    for name, target in (
+        ("HERMES_CONFIG_PATH", config_paths),
+        ("HERMES_ENV_PATH", env_paths),
+    ):
+        raw = os.environ.get(name, "").strip()
+        if raw and os.path.isabs(os.path.expanduser(raw)):
+            expanded = os.path.expanduser(raw)
+            target.extend([expanded, os.path.realpath(expanded)])
+
+    command = _fold_exact_paths(command, config_paths, "~/.hermes/config.yaml")
+    return _fold_exact_paths(command, env_paths, "~/.hermes/.env")
 
 
 def _rewrite_resolved_user_home(command: str) -> str:

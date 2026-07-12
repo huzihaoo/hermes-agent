@@ -147,6 +147,45 @@ class TestWantsTuiEarly:
         monkeypatch.setattr(m, "_EARLY_INTERFACE_CACHE", None)
         assert m._wants_tui_early([]) is False
 
+    def test_absolute_versioned_binding_wins_before_config_import(self, tmp_path, monkeypatch):
+        state = tmp_path / "state"
+        candidate = tmp_path / "candidate"
+        state.mkdir()
+        candidate.mkdir()
+        (state / "config.yaml").write_text("display:\n  interface: cli\n")
+        (candidate / "config.yaml").write_text("display:\n  interface: tui\n")
+        monkeypatch.setenv("HERMES_HOME", str(state))
+        monkeypatch.setenv("HERMES_CONFIG_PATH", str(candidate / "config.yaml"))
+
+        assert m._wants_tui_early([]) is True
+
+    def test_named_profile_ignores_default_versioned_binding(self, tmp_path, monkeypatch):
+        profile = tmp_path / "state" / "profiles" / "worker"
+        candidate = tmp_path / "candidate"
+        profile.mkdir(parents=True)
+        candidate.mkdir()
+        (profile / "config.yaml").write_text("display:\n  interface: cli\n")
+        (candidate / "config.yaml").write_text("display:\n  interface: tui\n")
+        monkeypatch.setenv("HERMES_HOME", str(profile))
+        monkeypatch.setenv("HERMES_CONFIG_PATH", str(candidate / "config.yaml"))
+
+        assert m._wants_tui_early([]) is False
+
+    def test_unresolved_profile_flag_does_not_read_default_binding(self, tmp_path, monkeypatch):
+        candidate = tmp_path / "candidate.yaml"
+        candidate.write_text("display:\n  interface: tui\n")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "state"))
+        monkeypatch.setenv("HERMES_CONFIG_PATH", str(candidate))
+
+        assert m._wants_tui_early(["--profile", "worker"]) is False
+
+    def test_relative_versioned_binding_fails_closed(self, tmp_path, monkeypatch):
+        (tmp_path / "config.yaml").write_text("display:\n  interface: tui\n")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_CONFIG_PATH", "relative/config.yaml")
+
+        assert m._wants_tui_early([]) is False
+
 
 # ---------------------------------------------------------------------------
 # argument parser — flags exist at both levels and are relaunch-inherited

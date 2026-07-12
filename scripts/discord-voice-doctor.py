@@ -181,7 +181,7 @@ def check_env_vars():
         from hermes_cli.env_loader import load_hermes_dotenv
 
         load_hermes_dotenv(
-            hermes_home=ENV_FILE.parent,
+            hermes_home=HERMES_HOME,
             project_env=PROJECT_ROOT / ".env",
         )
     except ImportError:

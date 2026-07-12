@@ -9,7 +9,11 @@ OK="${GREEN}✔${NC}"; FAIL="${RED}✘${NC}"; WARN="${YELLOW}⚠${NC}"
 TWOZERO_URL="https://www.404zero.com/pisang/twozero.tox"
 TOX_PATH="$HOME/Downloads/twozero.tox"
 HERMES_HOME_DIR="${HERMES_HOME:-$HOME/.hermes}"
-HERMES_CFG="${HERMES_HOME_DIR}/config.yaml"
+HERMES_CFG="${HERMES_CONFIG_PATH:-${HERMES_HOME_DIR}/config.yaml}"
+case "$HERMES_CFG" in
+    /*|[A-Za-z]:[\\/]*) ;;
+    *) echo "Refusing relative Hermes config path: $HERMES_CFG" >&2; exit 2 ;;
+esac
 MCP_PORT=40404
 MCP_ENDPOINT="http://localhost:${MCP_PORT}/mcp"
 

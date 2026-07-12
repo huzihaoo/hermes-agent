@@ -18,12 +18,18 @@ GH_AUTH_METHOD="none"
 GITHUB_TOKEN="${GITHUB_TOKEN:-}"
 GH_USER=""
 
+_hermes_env="${HERMES_ENV_PATH:-${HERMES_HOME:-$HOME/.hermes}/.env}"
+case "$_hermes_env" in
+    /*|[A-Za-z]:[\\/]*) ;;
+    *) _hermes_env="" ;;
+esac
+
 if command -v gh &>/dev/null && gh auth status &>/dev/null 2>&1; then
     GH_AUTH_METHOD="gh"
     GH_USER=$(gh api user --jq '.login' 2>/dev/null)
 elif [ -n "$GITHUB_TOKEN" ]; then
     GH_AUTH_METHOD="curl"
-elif _hermes_env="${HERMES_HOME:-$HOME/.hermes}/.env"; [ -f "$_hermes_env" ] && grep -q "^GITHUB_TOKEN=" "$_hermes_env" 2>/dev/null; then
+elif [ -n "$_hermes_env" ] && [ -f "$_hermes_env" ] && grep -q "^GITHUB_TOKEN=" "$_hermes_env" 2>/dev/null; then
     GITHUB_TOKEN=$(grep "^GITHUB_TOKEN=" "$_hermes_env" | head -1 | cut -d= -f2 | tr -d '\n\r')
     if [ -n "$GITHUB_TOKEN" ]; then
         GH_AUTH_METHOD="curl"
@@ -55,6 +61,7 @@ if [ -n "$_remote_url" ] && echo "$_remote_url" | grep -q "github.com"; then
     GH_REPO=$(echo "$GH_OWNER_REPO" | cut -d/ -f2)
 fi
 unset _remote_url
+unset _hermes_env
 
 # --- Summary ---
 

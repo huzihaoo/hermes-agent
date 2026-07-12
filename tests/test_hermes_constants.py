@@ -173,6 +173,43 @@ class TestVersionedConfigPaths:
         finally:
             hermes_constants.reset_hermes_home_override(token)
 
+    def test_process_named_profile_wins_over_default_file_bindings(self, tmp_path, monkeypatch):
+        profile = tmp_path / "root" / "profiles" / "worker"
+        candidate = tmp_path / "candidate"
+        monkeypatch.setenv("HERMES_HOME", str(profile))
+        monkeypatch.setenv("HERMES_CONFIG_PATH", str(candidate / "config.yaml"))
+        monkeypatch.setenv("HERMES_ENV_PATH", str(candidate / ".env"))
+
+        assert get_config_path() == profile / "config.yaml"
+        assert get_env_path() == profile / ".env"
+        assert get_config_path_for_home(profile) == profile / "config.yaml"
+        assert get_env_path_for_home(profile) == profile / ".env"
+
+    def test_subprocess_named_profile_drops_default_file_bindings(self, tmp_path):
+        profile = tmp_path / "root" / "profiles" / "worker"
+        env = {
+            "HERMES_HOME": str(profile),
+            "HERMES_CONFIG_PATH": str(tmp_path / "candidate" / "config.yaml"),
+            "HERMES_ENV_PATH": str(tmp_path / "candidate" / ".env"),
+        }
+
+        hermes_constants.apply_subprocess_home_env(env)
+
+        assert "HERMES_CONFIG_PATH" not in env
+        assert "HERMES_ENV_PATH" not in env
+
+    def test_subprocess_default_home_preserves_file_bindings(self, tmp_path):
+        env = {
+            "HERMES_HOME": str(tmp_path / "state"),
+            "HERMES_CONFIG_PATH": str(tmp_path / "candidate" / "config.yaml"),
+            "HERMES_ENV_PATH": str(tmp_path / "candidate" / ".env"),
+        }
+
+        hermes_constants.apply_subprocess_home_env(env)
+
+        assert env["HERMES_CONFIG_PATH"] == str(tmp_path / "candidate" / "config.yaml")
+        assert env["HERMES_ENV_PATH"] == str(tmp_path / "candidate" / ".env")
+
     @pytest.mark.parametrize(
         ("name", "getter"),
         (("HERMES_CONFIG_PATH", get_config_path), ("HERMES_ENV_PATH", get_env_path)),

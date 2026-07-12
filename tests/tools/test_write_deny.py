@@ -39,6 +39,14 @@ class TestWriteDenyExactPaths:
         path = str(get_hermes_home() / ".env")
         assert _is_write_denied(path) is True
 
+    def test_active_versioned_config_and_env_are_denied(self, tmp_path, monkeypatch):
+        candidate = tmp_path / "candidate"
+        monkeypatch.setenv("HERMES_CONFIG_PATH", str(candidate / "config.yaml"))
+        monkeypatch.setenv("HERMES_ENV_PATH", str(candidate / ".env"))
+
+        assert _is_write_denied(str(candidate / "config.yaml")) is True
+        assert _is_write_denied(str(candidate / ".env")) is True
+
     def test_hermes_root_env_when_running_under_profile(self, tmp_path, monkeypatch):
         """Top-level ``<root>/.env`` stays write-denied even when running under
         a profile (#15981).
@@ -124,5 +132,5 @@ class TestWriteAllowed:
         from hermes_constants import get_hermes_home
 
         home = get_hermes_home()
-        for name in ["auth.json", "config.yaml", "webhook_subscriptions.json"]:
+        for name in ["auth.json", "webhook_subscriptions.json"]:
             assert _is_write_denied(str(home / name)) is False, f"{name} should be writable"

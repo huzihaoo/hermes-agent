@@ -595,6 +595,37 @@ class TestHermesConfigWriteProtection:
         )
         assert dangerous is False
 
+    def test_external_versioned_config_in_place_requires_approval(self, tmp_path, monkeypatch):
+        config_path = tmp_path / "candidate" / "config.yaml"
+        monkeypatch.setenv("HERMES_CONFIG_PATH", str(config_path))
+
+        dangerous, key, desc = detect_dangerous_command(
+            f"sed -i 's/manual/off/' '{config_path}'"
+        )
+
+        assert dangerous is True
+        assert "hermes config" in desc.lower() or "in-place" in desc.lower()
+
+    def test_external_versioned_env_in_place_requires_approval(self, tmp_path, monkeypatch):
+        env_path = tmp_path / "candidate" / ".env"
+        monkeypatch.setenv("HERMES_ENV_PATH", str(env_path))
+
+        dangerous, key, desc = detect_dangerous_command(
+            f"perl -i -pe 's/SECRET=old/SECRET=new/' '{env_path}'"
+        )
+
+        assert dangerous is True
+
+    def test_external_config_backup_suffix_is_not_folded(self, tmp_path, monkeypatch):
+        config_path = tmp_path / "candidate" / "config.yaml"
+        monkeypatch.setenv("HERMES_CONFIG_PATH", str(config_path))
+
+        dangerous, key, desc = detect_dangerous_command(
+            f"sed -i 's/a/b/' '{config_path}.bak'"
+        )
+
+        assert dangerous is False
+
     def test_perl_in_place_env(self):
         dangerous, key, desc = detect_dangerous_command(
             "perl -i -pe 's/SECRET=old/SECRET=new/' ~/.hermes/.env"
