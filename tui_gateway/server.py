@@ -304,6 +304,9 @@ class _SlashWorker:
             # config/skills/state against the session's profile home, not the
             # gateway's launch HERMES_HOME (#40677).
             env["HERMES_HOME"] = str(profile_home)
+            from hermes_constants import apply_subprocess_home_env
+
+            apply_subprocess_home_env(env)
 
         # start_new_session=True detaches the slash worker into its own
         # process group / session. Without this, the worker inherits the
