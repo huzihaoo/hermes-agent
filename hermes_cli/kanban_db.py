@@ -7767,6 +7767,9 @@ def _default_spawn(
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
+    from hermes_constants import apply_subprocess_home_env
+
+    apply_subprocess_home_env(env)
 
     cmd = [
         *_resolve_hermes_argv(),

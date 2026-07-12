@@ -167,6 +167,27 @@ def test_profile_configured_cwd_reads_target_profile(tmp_path):
     assert server._profile_configured_cwd(home) == str(project)
 
 
+def test_profile_configured_cwd_honors_active_versioned_binding(
+    tmp_path, monkeypatch
+):
+    state_home = tmp_path / "state"
+    canonical_project = tmp_path / "canonical-project"
+    candidate_project = tmp_path / "candidate-project"
+    candidate_config = tmp_path / "candidate" / "config.yaml"
+    state_home.mkdir()
+    canonical_project.mkdir()
+    candidate_project.mkdir()
+    candidate_config.parent.mkdir()
+    _write_profile_cfg(state_home, str(canonical_project))
+    candidate_config.write_text(
+        f"terminal:\n  cwd: {candidate_project}\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(state_home))
+    monkeypatch.setenv("HERMES_CONFIG_PATH", str(candidate_config))
+
+    assert server._profile_configured_cwd(state_home) == str(candidate_project)
+
+
 def test_profile_configured_cwd_skips_placeholders_and_missing(tmp_path):
     """Placeholder values, missing config, and bad paths fall through to None."""
     assert server._profile_configured_cwd(None) is None

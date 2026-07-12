@@ -72,12 +72,22 @@ def _hermes_home() -> Path:
     return Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
 
 
+def _bound_file(name: str, fallback: Path) -> Path:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return fallback
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise TelephonyError(f"{name} must be an absolute path")
+    return path
+
+
 def _env_path() -> Path:
-    return _hermes_home() / ".env"
+    return _bound_file("HERMES_ENV_PATH", _hermes_home() / ".env")
 
 
 def _config_path() -> Path:
-    return _hermes_home() / "config.yaml"
+    return _bound_file("HERMES_CONFIG_PATH", _hermes_home() / "config.yaml")
 
 
 def _state_path() -> Path:

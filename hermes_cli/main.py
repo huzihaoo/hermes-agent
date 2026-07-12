@@ -113,7 +113,31 @@ def _set_process_title() -> None:
 _EARLY_INTERFACE_CACHE: "list | None" = None
 
 
-def _config_default_interface_early() -> str:
+def _named_profile_requested_early(argv: "list[str] | None" = None) -> bool:
+    """Dependency-free check for a named profile before normal CLI imports."""
+    if argv is None:
+        argv = sys.argv[1:]
+    profile = os.environ.get("HERMES_PROFILE", "").strip().lower()
+    if profile and profile != "default":
+        return True
+    home = os.environ.get("HERMES_HOME", "").strip()
+    if home and os.path.basename(os.path.dirname(os.path.normpath(home))) == "profiles":
+        return True
+    for index, arg in enumerate(argv):
+        value = None
+        if arg in {"-p", "--profile"} and index + 1 < len(argv):
+            value = argv[index + 1]
+        elif arg.startswith("--profile="):
+            value = arg.split("=", 1)[1]
+        if value and value.strip().lower() != "default":
+            import re as _re_iface
+
+            if _re_iface.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", value.strip()):
+                return True
+    return False
+
+
+def _config_default_interface_early(argv: "list[str] | None" = None) -> str:
     """Return the configured default interface ("cli"/"tui") via a minimal
     YAML read. Best-effort: any error falls back to "cli" (legacy behavior)."""
     global _EARLY_INTERFACE_CACHE
@@ -122,11 +146,22 @@ def _config_default_interface_early() -> str:
     value = "cli"
     try:
         home = os.environ.get("HERMES_HOME")
-        if home:
+        binding = os.environ.get("HERMES_CONFIG_PATH", "").strip()
+        # A profile flag has not been resolved yet. Fail closed to the classic
+        # CLI instead of consulting the default runtime's candidate config.
+        if _named_profile_requested_early(argv) and not (
+            home
+            and os.path.basename(os.path.dirname(os.path.normpath(home))) == "profiles"
+        ):
+            cfg_path = None
+        elif binding and not _named_profile_requested_early(argv):
+            # Relative bindings are intentionally not resolved against cwd.
+            cfg_path = binding if os.path.isabs(binding) else None
+        elif home:
             cfg_path = os.path.join(home, "config.yaml")
         else:
             cfg_path = os.path.join(os.path.expanduser("~"), ".hermes", "config.yaml")
-        if os.path.exists(cfg_path):
+        if cfg_path and os.path.exists(cfg_path):
             import yaml as _yaml_iface
 
             with open(cfg_path, encoding="utf-8") as _f:
@@ -156,7 +191,7 @@ def _wants_tui_early(argv: "list[str] | None" = None) -> bool:
         return False
     if os.environ.get("HERMES_TUI") == "1" or "--tui" in argv:
         return True
-    return _config_default_interface_early() == "tui"
+    return _config_default_interface_early(argv) == "tui"
 
 
 # Mouse-tracking residue suppression — runs BEFORE every other import on the
@@ -455,6 +490,8 @@ def _apply_profile_override() -> None:
     hermes_home_env = os.environ.get("HERMES_HOME", "")
     if profile_name is None and hermes_home_env:
         if Path(hermes_home_env).parent.name == "profiles":
+            os.environ.pop("HERMES_CONFIG_PATH", None)
+            os.environ.pop("HERMES_ENV_PATH", None)
             return
 
     # 2. If no flag, check active_profile in the hermes root.
@@ -504,6 +541,10 @@ def _apply_profile_override() -> None:
             )
             return
         os.environ["HERMES_HOME"] = hermes_home
+        # A named profile owns its own config and env. Never retain a
+        # default-runtime candidate binding inherited from the parent process.
+        os.environ.pop("HERMES_CONFIG_PATH", None)
+        os.environ.pop("HERMES_ENV_PATH", None)
         # Strip the flag from argv so argparse doesn't choke
         if consume > 0 and profile_index is not None:
             start = profile_index + 1  # +1 because argv is sys.argv[1:]
@@ -514,7 +555,7 @@ _apply_profile_override()
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
-from hermes_cli.config import get_hermes_home
+from hermes_cli.config import get_config_path, get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
 
 load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
@@ -532,7 +573,7 @@ _FORCE_IPV4_EARLY = False
 try:
     import yaml as _yaml_early
 
-    _cfg_path = get_hermes_home() / "config.yaml"
+    _cfg_path = get_config_path()
     if _cfg_path.exists():
         with open(_cfg_path, encoding="utf-8") as _f:
             _early_cfg_raw = _yaml_early.load(
@@ -11993,13 +12034,14 @@ def cmd_dashboard(args):
         # returns the root for both layouts: ~/.hermes for a standard install
         # and /opt/data for Docker (it strips a trailing profiles/<name>).
         # See the support report for the double-mount workaround this avoids.
-        try:
-            from hermes_constants import get_default_hermes_root
-            env["HERMES_HOME"] = str(get_default_hermes_root())
-        except Exception:
-            # Best-effort: if root resolution fails, fall back to the prior
-            # behaviour (drop HERMES_HOME) rather than block the reroute.
-            env.pop("HERMES_HOME", None)
+        from hermes_constants import get_default_hermes_root
+        from hermes_cli.service_runtime_bindings import apply_service_runtime_bindings
+
+        # The child changes profile authority from a named home to the default
+        # root. Re-resolve the root's sealed pair instead of merely deleting the
+        # named-profile environment. Invalid external metadata is fatal before
+        # exec; legacy roots get no pair.
+        apply_service_runtime_bindings(env, get_default_hermes_root())
         # On Windows, os.execvpe() does not truly replace the process — it
         # spawns via CreateProcess then the parent exits.  Under Python 3.14+
         # this can crash with STATUS_ACCESS_VIOLATION (0xC0000005) when

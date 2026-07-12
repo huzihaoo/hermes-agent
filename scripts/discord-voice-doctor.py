@@ -20,7 +20,9 @@ PROJECT_ROOT = SCRIPT_DIR.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 HERMES_HOME = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
-ENV_FILE = HERMES_HOME / ".env"
+from hermes_constants import get_config_path_for_home, get_env_path_for_home
+
+ENV_FILE = get_env_path_for_home(HERMES_HOME)
 
 OK = "\033[92m\u2713\033[0m"
 FAIL = "\033[91m\u2717\033[0m"
@@ -179,7 +181,7 @@ def check_env_vars():
         from hermes_cli.env_loader import load_hermes_dotenv
 
         load_hermes_dotenv(
-            hermes_home=ENV_FILE.parent,
+            hermes_home=HERMES_HOME,
             project_env=PROJECT_ROOT / ".env",
         )
     except ImportError:
@@ -238,7 +240,7 @@ def check_config(groq_key, eleven_key):
     """Check hermes config.yaml."""
     section("Configuration")
 
-    config_path = HERMES_HOME / "config.yaml"
+    config_path = get_config_path_for_home(HERMES_HOME)
     if config_path.exists():
         try:
             import yaml

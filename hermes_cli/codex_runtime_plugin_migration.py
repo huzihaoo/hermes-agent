@@ -584,6 +584,14 @@ def _build_hermes_tools_mcp_entry() -> dict:
         hermes_home = ""
     if hermes_home:
         env["HERMES_HOME"] = hermes_home
+    # A default candidate runtime may keep config and secrets outside its
+    # durable HERMES_HOME. Persist only explicit absolute bindings; named
+    # profile startup removes inherited default bindings before this runs.
+    if hermes_home and Path(hermes_home).expanduser().parent.name != "profiles":
+        for name in ("HERMES_CONFIG_PATH", "HERMES_ENV_PATH"):
+            binding = os.environ.get(name, "").strip()
+            if binding and os.path.isabs(os.path.expanduser(binding)):
+                env[name] = binding
     # PYTHONPATH passes through so a worktree-launched hermes finds the
     # branch's modules instead of the installed package.
     pythonpath = os.environ.get("PYTHONPATH")

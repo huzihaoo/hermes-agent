@@ -474,6 +474,28 @@ class TestNoSkillsOptOut:
         assert len(calls) == 1
         assert result == {"copied": ["x"]}
 
+    def test_seed_profile_skills_drops_default_runtime_bindings(
+        self, profile_env, monkeypatch
+    ):
+        import subprocess as _sp
+
+        profile_dir = create_profile("coder", no_alias=True)
+        monkeypatch.setenv("HERMES_CONFIG_PATH", str(profile_env / "candidate" / "config.yaml"))
+        monkeypatch.setenv("HERMES_ENV_PATH", str(profile_env / "candidate" / ".env"))
+        captured = {}
+
+        def fake_run(*args, **kwargs):
+            captured.update(kwargs)
+            return _sp.CompletedProcess(
+                args=args, returncode=0, stdout='{"copied": []}', stderr=""
+            )
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+
+        assert seed_profile_skills(profile_dir, quiet=True) == {"copied": []}
+        assert "HERMES_CONFIG_PATH" not in captured["env"]
+        assert "HERMES_ENV_PATH" not in captured["env"]
+
     def test_delete_marker_re_enables_seeding(self, profile_env, monkeypatch):
         """Deleting .no-bundled-skills opts the profile back in."""
         import subprocess as _sp

@@ -58,7 +58,13 @@ if _race_path.exists():
 # ═══════════════════════════════════════════════════════════════════
 
 HERMES_HOME = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
-CONFIG_PATH = HERMES_HOME / "config.yaml"
+_CONFIG_BINDING = os.getenv("HERMES_CONFIG_PATH", "").strip()
+if _CONFIG_BINDING:
+    CONFIG_PATH = Path(_CONFIG_BINDING).expanduser()
+    if not CONFIG_PATH.is_absolute():
+        raise RuntimeError("HERMES_CONFIG_PATH must be absolute")
+else:
+    CONFIG_PATH = HERMES_HOME / "config.yaml"
 PREFILL_PATH = HERMES_HOME / "prefill.json"
 
 # ═══════════════════════════════════════════════════════════════════

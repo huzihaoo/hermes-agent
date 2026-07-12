@@ -48,6 +48,30 @@ def test_save_twilio_writes_env_and_state(tmp_path: Path, monkeypatch):
     assert state["twilio"]["default_phone_sid"] == "PN123"
 
 
+def test_versioned_config_and_env_paths_override_state_home(tmp_path: Path, monkeypatch):
+    mod = load_module()
+    candidate = tmp_path / "candidate"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("HERMES_CONFIG_PATH", str(candidate / "config.yaml"))
+    monkeypatch.setenv("HERMES_ENV_PATH", str(candidate / ".env"))
+
+    assert mod._config_path() == candidate / "config.yaml"
+    assert mod._env_path() == candidate / ".env"
+
+
+def test_relative_versioned_path_fails_closed(tmp_path: Path, monkeypatch):
+    mod = load_module()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("HERMES_ENV_PATH", "relative/.env")
+
+    try:
+        mod._env_path()
+    except mod.TelephonyError as exc:
+        assert "must be an absolute path" in str(exc)
+    else:
+        raise AssertionError("relative HERMES_ENV_PATH must fail closed")
+
+
 def test_upsert_env_updates_existing_values(tmp_path: Path):
     mod = load_module()
     env_path = tmp_path / ".env"

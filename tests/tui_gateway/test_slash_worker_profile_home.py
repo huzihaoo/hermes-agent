@@ -35,6 +35,36 @@ def test_slash_worker_accepts_profile_home():
             assert call_kwargs["env"]["HERMES_HOME"] == "/home/luke/.hermes/profiles/work"
 
 
+def test_slash_worker_profile_drops_default_runtime_file_bindings(monkeypatch):
+    from tui_gateway import server
+
+    inherited = {
+        "PATH": os.environ.get("PATH", ""),
+        "HERMES_HOME": "/home/luke/.hermes",
+        "HERMES_CONFIG_PATH": "/opt/hermes-candidate/config.yaml",
+        "HERMES_ENV_PATH": "/opt/hermes-candidate/.env",
+    }
+    monkeypatch.setattr(
+        server,
+        "hermes_subprocess_env",
+        lambda **_kwargs: dict(inherited),
+    )
+    with patch("subprocess.Popen") as mock_popen:
+        mock_popen.return_value.stdout = MagicMock()
+        mock_popen.return_value.stderr = MagicMock()
+
+        server._SlashWorker(
+            session_key="test_key",
+            model="test-model",
+            profile_home="/home/luke/.hermes/profiles/work",
+        )
+
+    child_env = mock_popen.call_args.kwargs["env"]
+    assert child_env["HERMES_HOME"] == "/home/luke/.hermes/profiles/work"
+    assert "HERMES_CONFIG_PATH" not in child_env
+    assert "HERMES_ENV_PATH" not in child_env
+
+
 def test_slash_worker_without_profile_home():
     """_SlashWorker works without profile_home parameter (backward compatible)."""
     with patch.dict("sys.modules", {

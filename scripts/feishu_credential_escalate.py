@@ -77,7 +77,8 @@ import { StdioClientTransport } from '/Users/songying/.hermes/local-mcp/feishu-d
 import fs from 'fs';
 import yaml from '/Users/songying/.hermes/local-mcp/feishu-doc/node_modules/js-yaml/dist/js-yaml.mjs';
 const req = __PAYLOAD__;
-const config = yaml.load(fs.readFileSync('/Users/songying/.hermes/config.yaml','utf8'));
+const configPath = process.env.HERMES_CONFIG_PATH || '/Users/songying/.hermes/config.yaml';
+const config = yaml.load(fs.readFileSync(configPath,'utf8'));
 const s = config.mcp_servers['feishu-doc'];
 const transport = new StdioClientTransport({command:s.command,args:s.args,env:{...process.env,...s.env}});
 const client = new Client({name:'hermes-feishu-credential-reauth',version:'0.1.0'});

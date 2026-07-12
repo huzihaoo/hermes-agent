@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 from hermes_constants import (
+    get_config_path,
+    get_config_path_for_home,
     get_hermes_home,
     get_hermes_home_override,
     reset_hermes_home_override,
@@ -302,6 +304,9 @@ class _SlashWorker:
             # config/skills/state against the session's profile home, not the
             # gateway's launch HERMES_HOME (#40677).
             env["HERMES_HOME"] = str(profile_home)
+            from hermes_constants import apply_subprocess_home_env
+
+            apply_subprocess_home_env(env)
 
         # start_new_session=True detaches the slash worker into its own
         # process group / session. Without this, the worker inherits the
@@ -994,7 +999,7 @@ def _profile_configured_cwd(profile_home: Path | None) -> str | None:
     try:
         import yaml
 
-        p = Path(profile_home) / "config.yaml"
+        p = get_config_path_for_home(profile_home)
         if not p.exists():
             return None
         with open(p, encoding="utf-8") as f:
@@ -1820,7 +1825,7 @@ def _load_cfg() -> dict:
         # profiles don't clobber each other.
         override = get_hermes_home_override()
         home = override if isinstance(override, str) and override else _hermes_home
-        p = Path(home) / "config.yaml"
+        p = get_config_path_for_home(home)
         mtime = p.stat().st_mtime if p.exists() else None
         with _cfg_lock:
             if _cfg_cache is not None and _cfg_mtime == mtime and _cfg_path == p:
@@ -1865,7 +1870,7 @@ def _save_cfg(cfg: dict):
 
     from hermes_cli.config import atomic_config_write
 
-    path = _hermes_home / "config.yaml"
+    path = get_config_path()
     atomic_config_write(path, cfg)
     with _cfg_lock:
         _cfg_cache = copy.deepcopy(cfg)
@@ -10979,7 +10984,7 @@ def _(rid, params: dict) -> dict:
         display = _load_cfg().get("display")
         return _ok(rid, {"value": _display_mouse_tracking(display)})
     if key == "mtime":
-        cfg_path = _hermes_home / "config.yaml"
+        cfg_path = get_config_path()
         try:
             return _ok(
                 rid, {"mtime": cfg_path.stat().st_mtime if cfg_path.exists() else 0}
@@ -13427,7 +13432,7 @@ def _(rid, params: dict) -> dict:
                 "title": "Environment",
                 "rows": [
                     ["Working Dir", os.getcwd()],
-                    ["Config File", str(_hermes_home / "config.yaml")],
+                    ["Config File", str(get_config_path())],
                 ],
             },
         ]

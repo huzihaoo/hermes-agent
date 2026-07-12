@@ -150,6 +150,42 @@ def get_default_hermes_root() -> Path:
     return env_path
 
 
+def _path_is_named_profile_home(path: str | Path) -> bool:
+    """Return whether *path* has the canonical ``<root>/profiles/<name>`` shape."""
+    try:
+        return Path(path).expanduser().parent.name == "profiles"
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _active_home_is_named_profile() -> bool:
+    """Return whether the current process/context targets a named profile.
+
+    A named profile is a stronger isolation boundary than process-wide
+    ``HERMES_CONFIG_PATH`` / ``HERMES_ENV_PATH`` bindings used by a default
+    runtime. Context-local overrides are profile-scoped by contract; process
+    launches are recognized by either ``HERMES_PROFILE`` or the canonical
+    profile-directory shape.
+    """
+    if get_hermes_home_override():
+        return True
+    profile = os.environ.get("HERMES_PROFILE", "").strip().lower()
+    if profile and profile != "default":
+        return True
+    return _path_is_named_profile_home(get_hermes_home())
+
+
+def _subprocess_targets_named_profile(env: dict[str, str]) -> bool:
+    """Return whether a child environment targets a named profile."""
+    if get_hermes_home_override():
+        return True
+    profile = str(env.get("HERMES_PROFILE") or "").strip().lower()
+    if profile and profile != "default":
+        return True
+    home = str(env.get("HERMES_HOME") or "").strip()
+    return bool(home and _path_is_named_profile_home(home))
+
+
 def _get_packaged_data_dir(name: str) -> Path | None:
     """Return an installed data-files directory if one exists.
 
@@ -782,7 +818,13 @@ def get_subprocess_home(env: dict[str, str] | None = None) -> str | None:
 
 
 def apply_subprocess_home_env(env: dict[str, str]) -> None:
-    """Apply Hermes' subprocess HOME contract to *env* in-place."""
+    """Apply Hermes' subprocess HOME and config-isolation contract in-place."""
+    # Default-runtime file bindings must never cross into a named profile.
+    # Child processes do not inherit ContextVars, so every subprocess bridge
+    # converges here after it injects its target HERMES_HOME/HERMES_PROFILE.
+    if _subprocess_targets_named_profile(env):
+        env.pop("HERMES_CONFIG_PATH", None)
+        env.pop("HERMES_ENV_PATH", None)
     real_home = get_real_home(env)
     if real_home:
         env["HERMES_REAL_HOME"] = real_home
@@ -912,12 +954,49 @@ def is_container() -> bool:
 
 
 def get_config_path() -> Path:
-    """Return the path to ``config.yaml`` under HERMES_HOME.
+    """Return the active ``config.yaml`` path.
 
     Replaces the ``get_hermes_home() / "config.yaml"`` pattern repeated
     in 7+ files (skill_utils.py, hermes_logging.py, hermes_time.py, etc.).
+
+    ``HERMES_CONFIG_PATH`` deliberately changes only the configuration file;
+    durable state continues to use ``HERMES_HOME``.  This supports reversible
+    runtime upgrades where a newer binary needs its own config schema while
+    sharing the existing session/state store.  Relative overrides are rejected
+    so launchd and cron cannot resolve the file against different working
+    directories.
     """
+    # A multiplexed profile is a stronger, context-local boundary than a
+    # process-wide default-runtime binding. Never route one profile through
+    # another profile's sealed config file.
+    if _active_home_is_named_profile():
+        return get_hermes_home() / "config.yaml"
+
+    override = os.environ.get("HERMES_CONFIG_PATH", "").strip()
+    if override:
+        path = Path(override).expanduser()
+        if not path.is_absolute():
+            raise ValueError("HERMES_CONFIG_PATH must be an absolute path")
+        return path
     return get_hermes_home() / "config.yaml"
+
+
+def get_config_path_for_home(hermes_home: str | Path) -> Path:
+    """Resolve ``config.yaml`` for an API that receives an explicit home.
+
+    Older call sites pass ``HERMES_HOME`` explicitly because provider/profile
+    state belongs beneath that directory.  For the active home, however, a
+    versioned runtime's ``HERMES_CONFIG_PATH`` must still win.  A genuinely
+    different home remains explicitly scoped and keeps its own config file.
+    """
+    home = Path(hermes_home).expanduser()
+    if _path_is_named_profile_home(home):
+        return home / "config.yaml"
+    try:
+        is_active_home = home.resolve() == get_hermes_home().resolve()
+    except OSError:
+        is_active_home = os.path.abspath(home) == os.path.abspath(get_hermes_home())
+    return get_config_path() if is_active_home else home / "config.yaml"
 
 
 def get_skills_dir() -> Path:
@@ -927,8 +1006,35 @@ def get_skills_dir() -> Path:
 
 
 def get_env_path() -> Path:
-    """Return the path to the ``.env`` file under HERMES_HOME."""
+    """Return the active Hermes secrets file path.
+
+    ``HERMES_ENV_PATH`` is the secrets-file counterpart to
+    ``HERMES_CONFIG_PATH`` and likewise leaves durable state rooted at
+    ``HERMES_HOME``.  The override must be absolute for deterministic service
+    startup and fail-closed cutover validation.
+    """
+    if _active_home_is_named_profile():
+        return get_hermes_home() / ".env"
+
+    override = os.environ.get("HERMES_ENV_PATH", "").strip()
+    if override:
+        path = Path(override).expanduser()
+        if not path.is_absolute():
+            raise ValueError("HERMES_ENV_PATH must be an absolute path")
+        return path
     return get_hermes_home() / ".env"
+
+
+def get_env_path_for_home(hermes_home: str | Path) -> Path:
+    """Resolve ``.env`` while preserving explicit profile-home semantics."""
+    home = Path(hermes_home).expanduser()
+    if _path_is_named_profile_home(home):
+        return home / ".env"
+    try:
+        is_active_home = home.resolve() == get_hermes_home().resolve()
+    except OSError:
+        is_active_home = os.path.abspath(home) == os.path.abspath(get_hermes_home())
+    return get_env_path() if is_active_home else home / ".env"
 
 
 def get_runtime_dir() -> Path:

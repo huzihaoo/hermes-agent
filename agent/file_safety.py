@@ -29,6 +29,19 @@ def build_write_denied_paths(home: str) -> set[str]:
     """Return exact sensitive paths that must never be written."""
     hermes_home = _hermes_home_path()
     hermes_root = _hermes_root_path()
+    try:
+        from hermes_constants import get_config_path, get_env_path
+
+        active_config = get_config_path()
+        active_env = get_env_path()
+    except Exception:
+        active_config = hermes_home / "config.yaml"
+        active_env = hermes_home / ".env"
+    explicit_bindings: list[str] = []
+    for name in ("HERMES_CONFIG_PATH", "HERMES_ENV_PATH"):
+        value = os.environ.get(name, "").strip()
+        if value and os.path.isabs(os.path.expanduser(value)):
+            explicit_bindings.append(value)
     return {
         os.path.realpath(p)
         for p in [
@@ -38,9 +51,17 @@ def build_write_denied_paths(home: str) -> set[str]:
             os.path.join(home, ".ssh", "config"),
             # Active profile .env (or top-level .env when not in profile mode).
             str(hermes_home / ".env"),
+            # Config is executable security policy (approval/yolo settings).
+            str(hermes_home / "config.yaml"),
+            # A versioned runtime may bind config outside HERMES_HOME.
+            str(active_config),
+            # A versioned runtime may bind secrets outside HERMES_HOME.
+            str(active_env),
             # Top-level .env, even when running under a profile — overwriting it
             # leaks credentials across every profile that inherits from root (#15981).
             str(hermes_root / ".env"),
+            # Protect the default/root security policy while a profile is active.
+            str(hermes_root / "config.yaml"),
             # Active profile Anthropic PKCE credential store.
             str(hermes_home / ".anthropic_oauth.json"),
             # Top-level Anthropic PKCE credential store remains sensitive even
@@ -54,6 +75,7 @@ def build_write_denied_paths(home: str) -> set[str]:
             "/etc/sudoers",
             "/etc/passwd",
             "/etc/shadow",
+            *explicit_bindings,
         ]
     }
 

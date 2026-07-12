@@ -566,6 +566,28 @@ class TestSensitivePathCheck:
         assert "error" in result
         assert "Hermes config" in result["error"]
 
+    def test_canonical_config_stays_blocked_with_versioned_binding(
+        self, tmp_path, monkeypatch
+    ):
+        state_home = tmp_path / "state"
+        candidate_config = tmp_path / "candidate" / "config.yaml"
+        state_home.mkdir()
+        candidate_config.parent.mkdir()
+        canonical = state_home / "config.yaml"
+        canonical.write_text("approvals:\n  mode: manual\n")
+        candidate_config.write_text("approvals:\n  mode: manual\n")
+        monkeypatch.setenv("HERMES_HOME", str(state_home))
+        monkeypatch.setenv("HERMES_CONFIG_PATH", str(candidate_config))
+        monkeypatch.setattr("tools.file_tools._hermes_config_resolved", None)
+        monkeypatch.setattr("tools.file_tools._hermes_config_resolved_loaded", False)
+
+        from tools.file_tools import write_file_tool
+
+        canonical_result = json.loads(write_file_tool(str(canonical), "bad"))
+        candidate_result = json.loads(write_file_tool(str(candidate_config), "bad"))
+        assert "Hermes config" in canonical_result["error"]
+        assert "Hermes config" in candidate_result["error"]
+
     def test_system_path_still_blocked(self, monkeypatch):
         monkeypatch.setattr("tools.file_tools._hermes_config_resolved", "/some/other/path")
         monkeypatch.setattr("tools.file_tools._hermes_config_resolved_loaded", True)

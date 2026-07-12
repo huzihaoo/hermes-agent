@@ -108,8 +108,9 @@ def _load_env() -> None:
         for env_file in loaded:
             logging.getLogger(__name__).info("Loaded env from %s", env_file)
     else:
+        from hermes_constants import get_env_path
         logging.getLogger(__name__).info(
-            "No .env found at %s, using system env", hermes_home / ".env"
+            "No .env found at %s, using system env", get_env_path()
         )
 
 

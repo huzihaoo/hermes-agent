@@ -848,6 +848,40 @@ class TestHermesHomeLeakGuard:
         env = entry.get("env", {})
         assert env.get("HERMES_HOME") == real_path
 
+    def test_default_runtime_absolute_file_bindings_propagate(self, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", "/Users/alice/.hermes")
+        monkeypatch.setenv(
+            "HERMES_CONFIG_PATH", "/Users/alice/hermes-v0182/config.yaml"
+        )
+        monkeypatch.setenv("HERMES_ENV_PATH", "/Users/alice/hermes-v0182/.env")
+
+        env = _build_hermes_tools_mcp_entry()["env"]
+
+        assert env["HERMES_CONFIG_PATH"] == "/Users/alice/hermes-v0182/config.yaml"
+        assert env["HERMES_ENV_PATH"] == "/Users/alice/hermes-v0182/.env"
+
+    def test_named_profile_does_not_persist_default_file_bindings(self, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", "/Users/alice/.hermes/profiles/worker")
+        monkeypatch.setenv(
+            "HERMES_CONFIG_PATH", "/Users/alice/hermes-v0182/config.yaml"
+        )
+        monkeypatch.setenv("HERMES_ENV_PATH", "/Users/alice/hermes-v0182/.env")
+
+        env = _build_hermes_tools_mcp_entry()["env"]
+
+        assert "HERMES_CONFIG_PATH" not in env
+        assert "HERMES_ENV_PATH" not in env
+
+    def test_relative_file_bindings_are_not_persisted(self, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", "/Users/alice/.hermes")
+        monkeypatch.setenv("HERMES_CONFIG_PATH", "relative/config.yaml")
+        monkeypatch.setenv("HERMES_ENV_PATH", "relative/.env")
+
+        env = _build_hermes_tools_mcp_entry()["env"]
+
+        assert "HERMES_CONFIG_PATH" not in env
+        assert "HERMES_ENV_PATH" not in env
+
     def test_unset_hermes_home_omits_env_key(self, monkeypatch):
         """When HERMES_HOME is unset in the environment, the MCP entry MUST
         NOT bake in a resolved-default path. The codex subprocess should

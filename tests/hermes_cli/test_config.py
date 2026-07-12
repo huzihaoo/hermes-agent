@@ -1325,6 +1325,8 @@ class TestEnvWriteDenylist:
             "HERMES_PROFILE",
             "HERMES_CONFIG",
             "HERMES_ENV",
+            "HERMES_CONFIG_PATH",
+            "HERMES_ENV_PATH",
         ],
     )
     def test_denylisted_keys_rejected(self, denied_key):
@@ -1805,5 +1807,4 @@ class TestCodexAppServerAutoConfig:
 
             raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
             assert raw["compression"]["codex_app_server_auto"] == "hermes"
-
 

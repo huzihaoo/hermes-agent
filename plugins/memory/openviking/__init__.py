@@ -48,6 +48,7 @@ from urllib.request import url2pathname
 from agent.message_content import flatten_message_text
 from agent.memory_provider import MemoryProvider
 from agent.skill_commands import extract_user_instruction_from_skill_message
+from hermes_constants import get_env_path_for_home
 from tools.registry import tool_error
 from utils import atomic_json_write, env_var_enabled
 
@@ -1966,7 +1967,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         from hermes_cli.memory_setup import _CANCELLED, _curses_select, _print_cancelled_setup, _prompt
 
         hermes_home_path = Path(hermes_home)
-        env_path = hermes_home_path / ".env"
+        env_path = get_env_path_for_home(hermes_home_path)
         if not isinstance(config.get("memory"), dict):
             config["memory"] = {}
         provider_config = config["memory"].get("openviking", {})

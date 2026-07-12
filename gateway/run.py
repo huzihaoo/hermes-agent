@@ -1309,7 +1309,13 @@ _ensure_ssl_certs()
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
-from hermes_constants import get_hermes_home, get_hermes_home_override
+from hermes_constants import (
+    get_config_path,
+    get_config_path_for_home,
+    get_env_path,
+    get_hermes_home,
+    get_hermes_home_override,
+)
 from utils import atomic_json_write, atomic_yaml_write, base_url_host_matches, is_truthy_value
 _hermes_home = get_hermes_home()
 
@@ -1317,7 +1323,7 @@ _hermes_home = get_hermes_home()
 # User-managed env files should override stale shell exports on restart.
 from dotenv import load_dotenv  # noqa: F401  # backward-compat for tests that monkeypatch this symbol
 from hermes_cli.env_loader import load_hermes_dotenv
-_env_path = _hermes_home / '.env'
+_env_path = get_env_path()
 load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).resolve().parents[1] / '.env')
 
 
@@ -1340,19 +1346,19 @@ def _reload_runtime_env_preserving_config_authority() -> None:
         # Credentials are resolved from the active profile's secret scope, not
         # os.environ. Still honor config.yaml's agent.max_turns bridge below
         # using the scoped home, but never reload .env into global env.
-        _bridge_max_turns_from_config(_hermes_home)
+        _bridge_max_turns_from_config(get_hermes_home())
         return
 
     load_hermes_dotenv(
         hermes_home=_hermes_home,
         project_env=Path(__file__).resolve().parents[1] / '.env',
     )
-    _bridge_max_turns_from_config(_hermes_home)
+    _bridge_max_turns_from_config(get_hermes_home())
 
 
 def _bridge_max_turns_from_config(home: "Path") -> None:
     """Bridge config.yaml agent.max_turns into HERMES_MAX_ITERATIONS (a global)."""
-    config_path = home / 'config.yaml'
+    config_path = get_config_path_for_home(home)
     if not config_path.exists():
         return
     try:
@@ -1459,7 +1465,7 @@ _DOCKER_MEDIA_OUTPUT_CONTAINER_PATHS = {"/output", "/outputs"}
 
 # Bridge config.yaml values into the environment so os.getenv() picks them up.
 # config.yaml is authoritative for terminal settings — overrides .env.
-_config_path = _hermes_home / 'config.yaml'
+_config_path = get_config_path()
 if _config_path.exists():
     try:
         import yaml as _yaml
@@ -3669,7 +3675,7 @@ def _try_resolve_fallback_provider() -> dict | None:
     from hermes_cli.runtime_provider import resolve_runtime_provider
     try:
         import yaml as _y
-        cfg_path = _hermes_home / "config.yaml"
+        cfg_path = get_config_path()
         if not cfg_path.exists():
             return None
         with open(cfg_path, encoding="utf-8") as _f:
@@ -4046,7 +4052,7 @@ def _load_gateway_config() -> dict:
     direct yaml.safe_load carries the managed merge on its own. Fail-open.
     """
     config_home = _gateway_config_home()
-    config_path = config_home / 'config.yaml'
+    config_path = get_config_path_for_home(config_home)
     raw: dict = {}
     used_canonical = False
     try:
@@ -6207,7 +6213,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter = self.adapters.get(source.platform)
             if adapter is not None:
                 await adapter.send(chat_id, unauthorized_group_hint(chat_id))
-                mark_seen(get_hermes_home() / "config.yaml", flag)
+                mark_seen(get_config_path(), flag)
         except Exception:
             logger.debug("unauthorized group hint failed", exc_info=True)
 
@@ -6239,7 +6245,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await self._send_feishu_status_card(
                     adapter, chat_id, title="PNC-Agent", body=feishu_welcome_card_body(),
                 )
-                mark_seen(get_hermes_home() / "config.yaml", flag)
+                mark_seen(get_config_path(), flag)
         except Exception:
             logger.debug("feishu welcome failed", exc_info=True)
 
@@ -6918,7 +6924,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Load OpenRouter provider routing preferences from config.yaml."""
         try:
             import yaml as _y
-            cfg_path = _hermes_home / "config.yaml"
+            cfg_path = get_config_path()
             if cfg_path.exists():
                 with open(cfg_path, encoding="utf-8") as _f:
                     cfg = _y.safe_load(_f) or {}
@@ -6937,7 +6943,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         try:
             import yaml as _y
-            cfg_path = _hermes_home / "config.yaml"
+            cfg_path = get_config_path()
             if cfg_path.exists():
                 with open(cfg_path, encoding="utf-8") as _f:
                     cfg = _y.safe_load(_f) or {}
@@ -7483,7 +7489,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"{message}\n\n"
                     f"{busy_input_hint_gateway(_hint_mode)}"
                 )
-                mark_seen(_hermes_home / "config.yaml", BUSY_INPUT_FLAG)
+                mark_seen(get_config_path(), BUSY_INPUT_FLAG)
         except Exception as _onb_err:
             logger.debug("Failed to apply busy-input onboarding hint: %s", _onb_err)
 
@@ -14034,7 +14040,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     and not is_seen(_onb_cfg, PROFILE_BUILD_FLAG)
                 ):
                     context_prompt += profile_build_directive()
-                    mark_seen(_hermes_home / "config.yaml", PROFILE_BUILD_FLAG)
+                    mark_seen(get_config_path(), PROFILE_BUILD_FLAG)
                 else:
                     context_prompt += _intro_note
             except Exception as _pb_err:
@@ -19827,7 +19833,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if gate_on and not is_seen(_cfg, TOOL_PROGRESS_FLAG):
                             long_tool_hint_fired[0] = True
                             progress_queue.put(tool_progress_hint_gateway())
-                            mark_seen(_hermes_home / "config.yaml", TOOL_PROGRESS_FLAG)
+                            mark_seen(get_config_path(), TOOL_PROGRESS_FLAG)
                 except Exception as _hint_err:
                     logger.debug("tool-progress onboarding hint failed: %s", _hint_err)
                 return

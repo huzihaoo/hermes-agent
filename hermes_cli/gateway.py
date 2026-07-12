@@ -58,6 +58,14 @@ from hermes_cli.setup import (
     prompt_yes_no,
 )
 from hermes_cli.colors import Colors, color
+from hermes_cli.service_runtime_bindings import (
+    SERVICE_BINDING_ENV_KEYS,
+    ServiceRuntimeBindingError,
+    apply_service_runtime_bindings,
+    is_named_profile_home,
+    resolve_service_runtime_bindings,
+    service_runtime_environment,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -708,17 +716,58 @@ def launch_detached_gateway_restart_by_cmdline(
     """
     if old_pid <= 0 or not run_argv:
         return False
-    return _spawn_gateway_restart_watcher(old_pid, list(run_argv))
+    return _spawn_gateway_restart_watcher(
+        old_pid,
+        list(run_argv),
+        target_home=_target_home_for_gateway_argv(run_argv),
+    )
 
 
 def launch_detached_profile_gateway_restart(profile: str, old_pid: int) -> bool:
     """Relaunch a manually-run profile gateway after its current PID exits."""
     if old_pid <= 0:
         return False
-    return _spawn_gateway_restart_watcher(old_pid, _gateway_run_args_for_profile(profile))
+    return _spawn_gateway_restart_watcher(
+        old_pid,
+        _gateway_run_args_for_profile(profile),
+        target_home=_target_home_for_profile(profile),
+    )
 
 
-def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
+def _target_home_for_profile(profile: str) -> Path:
+    if profile == "default":
+        from hermes_constants import get_default_hermes_root
+
+        return get_default_hermes_root()
+    from hermes_cli.profiles import get_profile_dir
+
+    return get_profile_dir(profile)
+
+
+def _target_home_for_gateway_argv(run_argv: list[str]) -> Path:
+    """Resolve argv profile semantics without inheriting the updater's home.
+
+    A captured argv with no profile flag is the default-profile CLI form, even
+    when a named-profile process initiated the update.  Using the management
+    process's current HERMES_HOME here would bind that default gateway to the
+    named updater by accident.
+    """
+    for index, token in enumerate(run_argv):
+        if token in {"-p", "--profile"} and index + 1 < len(run_argv):
+            return _target_home_for_profile(str(run_argv[index + 1]))
+        if token.startswith("--profile="):
+            return _target_home_for_profile(token.split("=", 1)[1])
+    from hermes_constants import get_default_hermes_root
+
+    return get_default_hermes_root()
+
+
+def _spawn_gateway_restart_watcher(
+    old_pid: int,
+    run_argv: list[str],
+    *,
+    target_home: str | Path | None = None,
+) -> bool:
     """Spawn the detached watcher that respawns ``run_argv`` once ``old_pid`` exits."""
     if old_pid <= 0 or not run_argv:
         return False
@@ -754,6 +803,7 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
     # ``_spawn_detached`` path) and capture the cwd + env overlay the base
     # interpreter needs to resolve imports without the venv launcher.
     # No-op on POSIX.  See gateway_windows.windowless_gateway_restart_spec.
+    target_home = Path(target_home or get_hermes_home())
     respawn_cwd = ""
     respawn_env_overlay: dict[str, str] = {}
     if sys.platform == "win32":
@@ -765,12 +815,19 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
             run_argv, respawn_cwd, respawn_env_overlay = (
                 windowless_gateway_restart_spec(list(run_argv))
             )
+        except ServiceRuntimeBindingError:
+            raise
         except Exception:
             # Best-effort: if the rewrite fails for any reason, fall back to
             # the original argv.  A visible window is worse than nothing, but
             # a failed respawn is worse still — keep the gateway coming back.
             respawn_cwd = ""
             respawn_env_overlay = {}
+
+    # Never let the watcher process's ambient config/env pair become restart
+    # authority.  Resolve the target manifest now, before the old gateway is
+    # touched, and carry only that validated pair into the eventual respawn.
+    apply_service_runtime_bindings(respawn_env_overlay, target_home)
 
     # Serialized as JSON literals embedded in the watcher source so the
     # inner respawn can apply cwd= / env= without extra argv plumbing.
@@ -819,7 +876,11 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
         if _respawn_cwd:
             _popen_kwargs["cwd"] = _respawn_cwd
         if _respawn_env_overlay:
-            _popen_kwargs["env"] = {{**os.environ, **_respawn_env_overlay}}
+            _respawn_env = os.environ.copy()
+            _respawn_env.pop("HERMES_CONFIG_PATH", None)
+            _respawn_env.pop("HERMES_ENV_PATH", None)
+            _respawn_env.update(_respawn_env_overlay)
+            _popen_kwargs["env"] = _respawn_env
         if sys.platform == "win32":
             try:
                 _popen_kwargs["creationflags"] = windows_detach_flags()
@@ -848,12 +909,14 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
         str(old_pid),
         *run_argv,
     ]
+    watcher_env = service_runtime_environment(target_home)
 
     # Same platform-aware detach for the watcher process itself — so
     # closing the user's terminal doesn't kill the watcher.
     try:
         subprocess.Popen(
             watcher_argv,
+            env=watcher_env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             **windows_detach_popen_kwargs(),
@@ -872,6 +935,7 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
             )
             subprocess.Popen(
                 watcher_argv,
+                env=watcher_env,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 **fallback_kwargs,
@@ -930,7 +994,36 @@ def _read_systemd_unit_environment(system: bool = False) -> dict[str, str]:
         if not line.startswith("Environment="):
             continue
         body = line[len("Environment=") :].strip()
-        for token in body.split():
+        try:
+            tokens = shlex.split(body, posix=True)
+        except ValueError:
+            return {}
+        for token in tokens:
+            if "=" not in token:
+                continue
+            key, value = token.split("=", 1)
+            parsed[key] = value
+    return parsed
+
+
+def _read_systemd_unit_file_environment(system: bool = False) -> dict[str, str]:
+    """Read Environment= directives from the installed unit on disk."""
+    unit_path = get_systemd_unit_path(system=system)
+    try:
+        lines = unit_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+    parsed: dict[str, str] = {}
+    for line in lines:
+        stripped = line.strip()
+        if not stripped.startswith("Environment="):
+            continue
+        body = stripped[len("Environment=") :].strip()
+        try:
+            tokens = shlex.split(body, posix=True)
+        except ValueError:
+            return {}
+        for token in tokens:
             if "=" not in token:
                 continue
             key, value = token.split("=", 1)
@@ -939,7 +1032,7 @@ def _read_systemd_unit_environment(system: bool = False) -> dict[str, str]:
 
 
 def _sync_hermes_home_from_systemd_unit(system: bool) -> None:
-    """When acting on a system-scope unit, adopt its ``HERMES_HOME``.
+    """Adopt the system unit's complete Hermes runtime binding triple.
 
     Under ``sudo``, ``HERMES_HOME`` is stripped and ``HOME=/root``, so
     :func:`get_hermes_home` falls back to ``/root/.hermes`` — the wrong
@@ -953,10 +1046,14 @@ def _sync_hermes_home_from_systemd_unit(system: bool) -> None:
     unit_home = env.get("HERMES_HOME", "").strip()
     if not unit_home:
         return
-    current = os.environ.get("HERMES_HOME", "").strip()
-    if current == unit_home:
-        return
     os.environ["HERMES_HOME"] = unit_home
+    for key in SERVICE_BINDING_ENV_KEYS:
+        os.environ.pop(key, None)
+    if not is_named_profile_home(unit_home):
+        for key in SERVICE_BINDING_ENV_KEYS:
+            value = env.get(key, "").strip()
+            if value:
+                os.environ[key] = value
 
 
 def _read_systemd_unit_properties(
@@ -2655,7 +2752,28 @@ def _stable_service_working_dir() -> str:
     return str(PROJECT_ROOT)
 
 
-def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) -> str:
+def _systemd_environment_line(name: str, value: str) -> str:
+    """Render one Environment= directive using systemd string escaping."""
+    if any(char in value for char in ("\x00", "\r", "\n")):
+        raise ValueError(f"invalid control character in systemd environment value: {name}")
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'Environment="{name}={escaped}"'
+
+
+def _systemd_binding_lines(target_home: str | Path) -> str:
+    bindings = resolve_service_runtime_bindings(target_home)
+    return "\n".join(
+        _systemd_environment_line(key, bindings[key])
+        for key in SERVICE_BINDING_ENV_KEYS
+        if key in bindings
+    )
+
+
+def generate_systemd_unit(
+    system: bool = False,
+    run_as_user: str | None = None,
+    target_hermes_home: str | None = None,
+) -> str:
     python_path = get_python_path()
     working_dir = _stable_service_working_dir()
     detected_venv = _detect_venv_dir()
@@ -2695,7 +2813,7 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
 
     if system:
         username, group_name, home_dir = _system_service_identity(run_as_user)
-        hermes_home = _hermes_home_for_target_user(home_dir)
+        hermes_home = target_hermes_home or _hermes_home_for_target_user(home_dir)
         profile_arg = _profile_arg_for_target_user(hermes_home, home_dir)
         # Remap all paths that may resolve under the calling user's home
         # (e.g. /root/) to the target user's home so the service can
@@ -2711,6 +2829,8 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
         path_entries.extend(_build_wsl_interop_paths(path_entries))
         path_entries.extend(common_bin_paths)
         sane_path = ":".join(path_entries)
+        binding_lines = _systemd_binding_lines(hermes_home)
+        binding_block = f"\n{binding_lines}" if binding_lines else ""
         return f"""[Unit]
 Description={SERVICE_DESCRIPTION}
 After=network-online.target
@@ -2723,12 +2843,12 @@ User={username}
 Group={group_name}
 ExecStart={python_path} -m hermes_cli.main{f" {profile_arg}" if profile_arg else ""} gateway run
 WorkingDirectory={working_dir}
-Environment="HOME={home_dir}"
-Environment="USER={username}"
-Environment="LOGNAME={username}"
-Environment="PATH={sane_path}"
-Environment="VIRTUAL_ENV={venv_dir}"
-Environment="HERMES_HOME={hermes_home}"
+{_systemd_environment_line("HOME", home_dir)}
+{_systemd_environment_line("USER", username)}
+{_systemd_environment_line("LOGNAME", username)}
+{_systemd_environment_line("PATH", sane_path)}
+{_systemd_environment_line("VIRTUAL_ENV", venv_dir)}
+{_systemd_environment_line("HERMES_HOME", hermes_home)}{binding_block}
 Restart=always
 RestartSec=5
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
@@ -2750,6 +2870,8 @@ WantedBy=multi-user.target
     path_entries.extend(_build_wsl_interop_paths(path_entries))
     path_entries.extend(common_bin_paths)
     sane_path = ":".join(path_entries)
+    binding_lines = _systemd_binding_lines(hermes_home)
+    binding_block = f"\n{binding_lines}" if binding_lines else ""
     return f"""[Unit]
 Description={SERVICE_DESCRIPTION}
 After=network-online.target
@@ -2760,9 +2882,9 @@ StartLimitIntervalSec=0
 Type=simple
 ExecStart={python_path} -m hermes_cli.main{f" {profile_arg}" if profile_arg else ""} gateway run
 WorkingDirectory={working_dir}
-Environment="PATH={sane_path}"
-Environment="VIRTUAL_ENV={venv_dir}"
-Environment="HERMES_HOME={hermes_home}"
+{_systemd_environment_line("PATH", sane_path)}
+{_systemd_environment_line("VIRTUAL_ENV", venv_dir)}
+{_systemd_environment_line("HERMES_HOME", hermes_home)}{binding_block}
 Restart=always
 RestartSec=5
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
@@ -2832,7 +2954,19 @@ def systemd_unit_is_current(system: bool = False) -> bool:
 
     installed = unit_path.read_text(encoding="utf-8")
     expected_user = _read_systemd_user_from_unit(unit_path) if system else None
-    expected = generate_systemd_unit(system=system, run_as_user=expected_user)
+    installed_home = (
+        _read_systemd_unit_file_environment(system=True).get("HERMES_HOME")
+        if system
+        else None
+    )
+    if installed_home:
+        expected = generate_systemd_unit(
+            system=system,
+            run_as_user=expected_user,
+            target_hermes_home=installed_home,
+        )
+    else:
+        expected = generate_systemd_unit(system=system, run_as_user=expected_user)
     # Normalize out directives that older systemd versions silently drop
     # (RestartMaxDelaySec, RestartSteps) so a unit that differs only by
     # those directives is not perpetually flagged as outdated.
@@ -2904,14 +3038,80 @@ def _refuse_temp_home_service_write(definition: str, kind: str) -> bool:
     return True
 
 
+def _systemd_target_home(
+    system: bool, run_as_user: str | None = None
+) -> tuple[str, str | None]:
+    if not system:
+        return str(get_hermes_home().resolve()), None
+    username, _group_name, home_dir = _system_service_identity(run_as_user)
+    return _hermes_home_for_target_user(home_dir), username
+
+
+def _systemd_target_home_for_operation(system: bool) -> tuple[str, str | None]:
+    """Use an installed system unit's pinned home before deriving a default."""
+    if not system:
+        return _systemd_target_home(False)
+    unit_path = get_systemd_unit_path(system=True)
+    if unit_path.exists():
+        unit_env = _read_systemd_unit_file_environment(system=True)
+        unit_home = unit_env.get("HERMES_HOME", "").strip()
+        if not unit_home:
+            raise ServiceRuntimeBindingError(
+                f"installed systemd unit omits HERMES_HOME: {unit_path}"
+            )
+        return unit_home, _read_systemd_user_from_unit(unit_path)
+    return _systemd_target_home(True)
+
+
+def _rebuild_missing_systemd_unit_from_external_manifest(
+    system: bool, run_as_user: str | None = None
+) -> bool:
+    """Recreate a missing unit only when a validated external manifest exists."""
+    unit_path = get_systemd_unit_path(system=system)
+    if unit_path.exists():
+        return False
+    target_home, resolved_user = _systemd_target_home(system, run_as_user)
+    if not resolve_service_runtime_bindings(target_home):
+        return False
+    new_unit = generate_systemd_unit(
+        system=system,
+        run_as_user=resolved_user if system else None,
+        target_hermes_home=target_home if system else None,
+    )
+    if _refuse_temp_home_service_write(new_unit, "systemd unit"):
+        return False
+    unit_path.parent.mkdir(parents=True, exist_ok=True)
+    unit_path.write_text(new_unit, encoding="utf-8")
+    _run_systemctl(["daemon-reload"], system=system, check=True, timeout=30)
+    print(
+        f"↻ Rebuilt missing gateway {_service_scope_label(system)} service definition "
+        "from the validated live manifest"
+    )
+    return True
+
+
 def refresh_systemd_unit_if_needed(system: bool = False) -> bool:
     """Rewrite the installed systemd unit when the generated definition has changed."""
     unit_path = get_systemd_unit_path(system=system)
-    if not unit_path.exists() or systemd_unit_is_current(system=system):
+    if not unit_path.exists():
+        return _rebuild_missing_systemd_unit_from_external_manifest(system)
+    if systemd_unit_is_current(system=system):
         return False
 
     expected_user = _read_systemd_user_from_unit(unit_path) if system else None
-    new_unit = generate_systemd_unit(system=system, run_as_user=expected_user)
+    installed_home = (
+        _read_systemd_unit_file_environment(system=True).get("HERMES_HOME")
+        if system
+        else None
+    )
+    if installed_home:
+        new_unit = generate_systemd_unit(
+            system=system,
+            run_as_user=expected_user,
+            target_hermes_home=installed_home,
+        )
+    else:
+        new_unit = generate_systemd_unit(system=system, run_as_user=expected_user)
 
     # ── Test-environment safety belt ─────────────────────────────────────
     # The user-scope unit path resolves under ``Path.home()``, which is NOT
@@ -3078,6 +3278,9 @@ def systemd_install(
     if system:
         _require_root_for_system_service("install")
 
+    target_home, _resolved_user = _systemd_target_home(system, run_as_user)
+    resolve_service_runtime_bindings(target_home)
+
     # Offer to remove legacy units (hermes.service from pre-rename installs)
     # before installing the new hermes-gateway.service. If both remain, they
     # flap-fight for the Telegram bot token on every gateway startup.
@@ -3108,10 +3311,10 @@ def systemd_install(
         print("Use --force to reinstall")
         return
 
-    unit_path.parent.mkdir(parents=True, exist_ok=True)
     new_unit = generate_systemd_unit(system=system, run_as_user=run_as_user)
     if _refuse_temp_home_service_write(new_unit, "systemd unit"):
         return
+    unit_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"Installing {_service_scope_label(system)} systemd service to: {unit_path}")
     unit_path.write_text(new_unit, encoding="utf-8")
 
@@ -3178,11 +3381,17 @@ def systemd_start(system: bool = False):
     system = _select_systemd_scope(system)
     if system:
         _require_root_for_system_service("start")
+        target_home, _resolved_user = _systemd_target_home_for_operation(True)
     else:
+        target_home, _resolved_user = _systemd_target_home(False)
+    resolve_service_runtime_bindings(target_home)
+    if not system:
         # Fail fast with actionable guidance if the user D-Bus session is not
         # reachable (common on fresh RHEL/Debian SSH sessions without linger).
         # Raises UserSystemdUnavailableError with a remediation message.
         _preflight_user_systemd()
+    if not get_systemd_unit_path(system=system).exists():
+        _rebuild_missing_systemd_unit_from_external_manifest(system)
     _require_service_installed("start", system=system)
     refresh_systemd_unit_if_needed(system=system)
     _run_systemctl(["start", get_service_name()], system=system, check=True, timeout=30)
@@ -3221,8 +3430,14 @@ def systemd_restart(system: bool = False):
     system = _select_systemd_scope(system)
     if system:
         _require_root_for_system_service("restart")
+        target_home, _resolved_user = _systemd_target_home_for_operation(True)
     else:
+        target_home, _resolved_user = _systemd_target_home(False)
+    resolve_service_runtime_bindings(target_home)
+    if not system:
         _preflight_user_systemd()
+    if not get_systemd_unit_path(system=system).exists():
+        _rebuild_missing_systemd_unit_from_external_manifest(system)
     _require_service_installed("restart", system=system)
     refresh_systemd_unit_if_needed(system=system)
     _sync_hermes_home_from_systemd_unit(system=system)
@@ -3740,6 +3955,12 @@ def _gateway_run_command() -> list[str]:
     return cmd
 
 
+def _xml_text(value: str | Path) -> str:
+    from xml.sax.saxutils import escape
+
+    return escape(str(value), {'"': "&quot;", "'": "&apos;"})
+
+
 def _spawn_detached_gateway() -> bool:
     """Launch the gateway as a detached background process (launchd fallback).
 
@@ -3762,8 +3983,10 @@ def _spawn_detached_gateway() -> bool:
         return False
     try:
         with out, err:
+            child_env = service_runtime_environment(get_hermes_home())
             subprocess.Popen(
                 _gateway_run_command(),
+                env=child_env,
                 stdin=subprocess.DEVNULL,
                 stdout=out,
                 stderr=err,
@@ -3808,6 +4031,7 @@ def generate_launchd_plist() -> str:
     # to launchd's WorkingDirectory as to systemd's).
     working_dir = _stable_service_working_dir()
     hermes_home = str(get_hermes_home().resolve())
+    runtime_bindings = resolve_service_runtime_bindings(hermes_home)
     log_dir = get_hermes_home() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     label = get_launchd_label()
@@ -3841,13 +4065,13 @@ def generate_launchd_plist() -> str:
 
     # Build ProgramArguments array, including --profile when using a named profile
     prog_args = [
-        f"<string>{python_path}</string>",
+        f"<string>{_xml_text(python_path)}</string>",
         "<string>-m</string>",
         "<string>hermes_cli.main</string>",
     ]
     if profile_arg:
         for part in profile_arg.split():
-            prog_args.append(f"<string>{part}</string>")
+            prog_args.append(f"<string>{_xml_text(part)}</string>")
     prog_args.extend(
         [
             "<string>gateway</string>",
@@ -3856,13 +4080,18 @@ def generate_launchd_plist() -> str:
         ]
     )
     prog_args_xml = "\n        ".join(prog_args)
+    binding_xml = "".join(
+        f"\n        <key>{key}</key>\n        <string>{_xml_text(runtime_bindings[key])}</string>"
+        for key in SERVICE_BINDING_ENV_KEYS
+        if key in runtime_bindings
+    )
 
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>{label}</string>
+    <string>{_xml_text(label)}</string>
 
     <key>ProgramArguments</key>
     <array>
@@ -3870,16 +4099,16 @@ def generate_launchd_plist() -> str:
     </array>
     
     <key>WorkingDirectory</key>
-    <string>{working_dir}</string>
+    <string>{_xml_text(working_dir)}</string>
     
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>{sane_path}</string>
+        <string>{_xml_text(sane_path)}</string>
         <key>VIRTUAL_ENV</key>
-        <string>{venv_dir}</string>
+        <string>{_xml_text(venv_dir)}</string>
         <key>HERMES_HOME</key>
-        <string>{hermes_home}</string>
+        <string>{_xml_text(hermes_home)}</string>{binding_xml}
     </dict>
 
     <key>LimitLoadToSessionType</key>
@@ -3895,10 +4124,10 @@ def generate_launchd_plist() -> str:
     <true/>
     
     <key>StandardOutPath</key>
-    <string>{log_dir}/gateway.log</string>
+    <string>{_xml_text(log_dir / "gateway.log")}</string>
     
     <key>StandardErrorPath</key>
-    <string>{log_dir}/gateway.error.log</string>
+    <string>{_xml_text(log_dir / "gateway.error.log")}</string>
 </dict>
 </plist>
 """
@@ -4063,10 +4292,10 @@ def launchd_install(force: bool = False):
         print("Use --force to reinstall")
         return
 
-    plist_path.parent.mkdir(parents=True, exist_ok=True)
     new_plist = generate_launchd_plist()
     if _refuse_temp_home_service_write(new_plist, "launchd plist"):
         return
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"Installing launchd service to: {plist_path}")
     plist_path.write_text(new_plist)
 
@@ -4107,18 +4336,30 @@ def launchd_uninstall():
     print("✓ Service uninstalled")
 
 
+def _ensure_launchd_plist_present(*, allow_legacy: bool = False) -> bool:
+    """Rebuild a missing plist after validating any external live binding."""
+    plist_path = get_launchd_plist_path()
+    if plist_path.exists():
+        return False
+    runtime_bindings = resolve_service_runtime_bindings(get_hermes_home())
+    if not runtime_bindings and not allow_legacy:
+        return False
+    new_plist = generate_launchd_plist()
+    if _refuse_temp_home_service_write(new_plist, "launchd plist"):
+        raise RuntimeError("refusing to write a temporary-home launchd plist")
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    plist_path.write_text(new_plist, encoding="utf-8")
+    return True
+
+
 def launchd_start():
     plist_path = get_launchd_plist_path()
     label = get_launchd_label()
 
     # Self-heal if the plist is missing entirely (e.g., manual cleanup, failed upgrade)
     if not plist_path.exists():
-        new_plist = generate_launchd_plist()
-        if _refuse_temp_home_service_write(new_plist, "launchd plist"):
-            sys.exit(1)
         print("↻ launchd plist missing; regenerating service definition")
-        plist_path.parent.mkdir(parents=True, exist_ok=True)
-        plist_path.write_text(new_plist, encoding="utf-8")
+        _ensure_launchd_plist_present(allow_legacy=True)
         try:
             _launchctl_bootstrap(_launchd_domain(), plist_path, label, timeout=30)
             subprocess.run(
@@ -4249,6 +4490,10 @@ def _wait_for_gateway_exit(
 
 
 def launchd_restart():
+    runtime_bindings = resolve_service_runtime_bindings(get_hermes_home())
+    if runtime_bindings:
+        _ensure_launchd_plist_present()
+        refresh_launchd_plist_if_needed()
     label = get_launchd_label()
     target = f"{_launchd_domain()}/{label}"
     drain_timeout = _get_restart_drain_timeout()
@@ -4467,7 +4712,7 @@ def _guard_named_profile_under_multiplexer(force: bool = False) -> None:
         return  # default profile (or unrecognized) — this guard doesn't apply
 
     try:
-        from hermes_constants import get_default_hermes_root
+        from hermes_constants import get_config_path_for_home, get_default_hermes_root
         default_root = get_default_hermes_root()
         # (b) Is the default-profile gateway running?
         from gateway.status import get_running_pid as _default_running_pid  # noqa
@@ -4502,7 +4747,7 @@ def _guard_named_profile_under_multiplexer(force: bool = False) -> None:
         if env_multiplex is True:
             multiplex = True
         else:
-            cfg_path = default_root / "config.yaml"
+            cfg_path = get_config_path_for_home(default_root)
             if not cfg_path.exists():
                 return
             with open(cfg_path, encoding="utf-8") as f:
@@ -4647,6 +4892,9 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
         force: Skip the supervised-gateway conflict guard and start even when a
                systemd/launchd service is already supervising this profile.
     """
+    # Persistent and direct gateway starts converge on manifest authority at
+    # the last in-process boundary before gateway configuration is consumed.
+    apply_service_runtime_bindings(os.environ, get_hermes_home())
     _guard_official_docker_root_gateway()
     _guard_named_profile_under_multiplexer(force=force)
     _guard_supervised_gateway_conflict(force=force)
@@ -4704,6 +4952,8 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
     if supports_systemd_services():
         try:
             refresh_systemd_unit_if_needed(system=False)
+        except ServiceRuntimeBindingError:
+            raise
         except Exception:
             pass  # best-effort; don't block gateway startup
 

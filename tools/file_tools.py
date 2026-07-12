@@ -630,6 +630,30 @@ def _get_hermes_config_resolved() -> str | None:
     return _hermes_config_resolved
 
 
+def _get_hermes_config_resolved_paths() -> set[str]:
+    """Return active, profile-home, and canonical-root config paths."""
+    paths: set[str] = set()
+    cached = _get_hermes_config_resolved()
+    if cached:
+        paths.add(cached)
+    try:
+        from hermes_constants import (
+            get_config_path,
+            get_default_hermes_root,
+            get_hermes_home,
+        )
+
+        for path in (
+            get_config_path(),
+            get_hermes_home() / "config.yaml",
+            get_default_hermes_root() / "config.yaml",
+        ):
+            paths.add(str(path.resolve()))
+    except Exception:
+        pass
+    return paths
+
+
 def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
     """Return an error message if the path targets a sensitive system location."""
     try:
@@ -650,8 +674,8 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     # approvals.mode and other security settings live here; a malicious or
     # prompt-injected agent could silently disable exec approval by writing to
     # this file.
-    hermes_config = _get_hermes_config_resolved()
-    if hermes_config and (resolved == hermes_config or normalized == hermes_config):
+    hermes_configs = _get_hermes_config_resolved_paths()
+    if resolved in hermes_configs or normalized in hermes_configs:
         return (
             f"Refusing to write to Hermes config file: {filepath}\n"
             "Agent cannot modify security-sensitive configuration. "

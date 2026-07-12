@@ -23,6 +23,7 @@ import re
 from typing import Any, Dict, List
 
 from agent.memory_provider import MemoryProvider
+from hermes_constants import get_config_path_for_home
 from tools.registry import tool_error
 from .store import MemoryStore
 from .retrieval import FactRetriever
@@ -95,8 +96,8 @@ FACT_FEEDBACK_SCHEMA = {
 # ---------------------------------------------------------------------------
 
 def _load_plugin_config() -> dict:
-    from hermes_constants import get_hermes_home
-    config_path = get_hermes_home() / "config.yaml"
+    from hermes_constants import get_config_path
+    config_path = get_config_path()
     if not config_path.exists():
         return {}
     try:
@@ -130,8 +131,7 @@ class HolographicMemoryProvider(MemoryProvider):
 
     def save_config(self, values, hermes_home):
         """Write config to config.yaml under plugins.hermes-memory-store."""
-        from pathlib import Path
-        config_path = Path(hermes_home) / "config.yaml"
+        config_path = get_config_path_for_home(hermes_home)
         try:
             import yaml
             existing = {}

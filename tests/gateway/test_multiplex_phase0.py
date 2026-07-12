@@ -167,6 +167,27 @@ class TestMultiplexConfigFlag:
         assert scoped_config["display"]["tool_progress"] is False
         assert scoped_config["display"]["interim_assistant_messages"] is False
 
+    def test_gateway_runtime_loader_honors_versioned_config_binding(
+        self, tmp_path, monkeypatch
+    ):
+        import gateway.run as gateway_run
+
+        state_home = tmp_path / "state"
+        candidate_config = tmp_path / "candidate" / "config.yaml"
+        state_home.mkdir()
+        candidate_config.parent.mkdir()
+        (state_home / "config.yaml").write_text(
+            "display:\n  tool_progress: canonical\n", encoding="utf-8"
+        )
+        candidate_config.write_text(
+            "display:\n  tool_progress: candidate\n", encoding="utf-8"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(state_home))
+        monkeypatch.setenv("HERMES_CONFIG_PATH", str(candidate_config))
+        monkeypatch.setattr(gateway_run, "_hermes_home", state_home)
+
+        assert gateway_run._load_gateway_config()["display"]["tool_progress"] == "candidate"
+
 
 class TestSessionStoreProfileResolution:
     """SessionStore._generate_session_key honors the flag: legacy namespace

@@ -132,3 +132,22 @@ class TestSaveConfigValueAtomic:
 
         assert result is False
         assert config_env.read_text() == original_content
+
+    def test_versioned_binding_never_writes_canonical_config(self, tmp_path, monkeypatch):
+        state_home = tmp_path / "state"
+        candidate_config = tmp_path / "candidate" / "config.yaml"
+        state_home.mkdir()
+        candidate_config.parent.mkdir()
+        canonical = state_home / "config.yaml"
+        canonical.write_text("display:\n  skin: canonical\n", encoding="utf-8")
+        candidate_config.write_text("display:\n  skin: candidate\n", encoding="utf-8")
+        canonical_before = canonical.read_bytes()
+        monkeypatch.setenv("HERMES_HOME", str(state_home))
+        monkeypatch.setenv("HERMES_CONFIG_PATH", str(candidate_config))
+        monkeypatch.setattr("cli._hermes_home", state_home)
+
+        from cli import save_config_value
+
+        assert save_config_value("display.skin", "updated") is True
+        assert yaml.safe_load(candidate_config.read_text())["display"]["skin"] == "updated"
+        assert canonical.read_bytes() == canonical_before

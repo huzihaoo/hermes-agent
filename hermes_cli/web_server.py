@@ -51,6 +51,7 @@ PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from hermes_constants import get_config_path_for_home
 from hermes_cli import __version__, __release_date__
 from hermes_cli.config import (
     cfg_get,
@@ -2308,7 +2309,7 @@ def _profile_platform_ports(profile_home: Path, runtime: Optional[dict]) -> Dict
 
     blocks: Dict[str, dict] = {}
     try:
-        with open(profile_home / "config.yaml", encoding="utf-8") as f:
+        with open(get_config_path_for_home(profile_home), encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
         gateway_cfg = cfg.get("gateway") if isinstance(cfg.get("gateway"), dict) else {}
         # gateway.platforms first, top-level platforms second — later wins,
@@ -14292,6 +14293,9 @@ def _resolve_chat_argv(
 
     if profile_dir is not None:
         env["HERMES_HOME"] = str(profile_dir)
+        from hermes_constants import apply_subprocess_home_env
+
+        apply_subprocess_home_env(env)
 
     if resume:
         _resume_db = _open_session_db_for_profile(
