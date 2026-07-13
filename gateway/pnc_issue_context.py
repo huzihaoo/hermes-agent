@@ -9,6 +9,7 @@ context block rather than pretending business evidence is missing.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -49,12 +50,95 @@ _FEISHU_ISSUE_PROJECT_RE = re.compile(
     r"project\.feishu\.cn/([^/\s)]+)/issue/detail/(\d+)",
     re.IGNORECASE,
 )
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^\r\n)]*\)", re.IGNORECASE)
+_HTML_IMAGE_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
+_FEISHU_FILE_URL_RE = re.compile(
+    r"https?://(?:[a-z0-9-]+\.)*(?:feishu\.cn|larksuite\.com)"
+    r"/[^\s<>\"'\])]*?(?:/file/(?:stream/)?(?:download|preview)|"
+    r"/attachment/(?:stream/)?(?:download|preview))"
+    r"[^\s<>\"'\])]*",
+    re.IGNORECASE,
+)
 
 
 G1Q3_RCA_FEISHU_PROJECT_KEY = "t03o4q"
 G1Q3_RCA_GROUP_ID = "oc_6cfc782212009ff4cd815349909dd423"
 PNC_ALL_BUSINESS_TEST_GROUP_ID = "oc_16614f4ba25b8c88b69c0b8e9ebc2fb5"
 MEEGLE_CLI_TIMEOUT_SECONDS = 12
+G1Q3_ISSUE_ENRICHMENT_TIMEOUT_SECONDS = 75
+G1Q3_ISSUE_MCP_CALL_TIMEOUT_SECONDS = 15
+
+
+class IssueEnrichmentDeadlineExceeded(TimeoutError):
+    """The bounded host issue preread exhausted its total business budget."""
+
+
+def _positive_timeout_seconds(value: Any, *, name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a positive finite number")
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a positive finite number") from exc
+    if not math.isfinite(normalized) or normalized <= 0:
+        raise ValueError(f"{name} must be a positive finite number")
+    return normalized
+
+
+def _deadline_timeout_seconds(
+    deadline_monotonic: float,
+    *,
+    phase_limit_seconds: float,
+) -> float:
+    remaining = float(deadline_monotonic) - time.monotonic()
+    if remaining <= 0:
+        raise IssueEnrichmentDeadlineExceeded("host issue preread deadline exceeded")
+    return min(
+        _positive_timeout_seconds(
+            phase_limit_seconds,
+            name="phase_limit_seconds",
+        ),
+        remaining,
+    )
+
+
+def _deadline_expired(deadline_monotonic: float | None) -> bool:
+    return (
+        deadline_monotonic is not None
+        and time.monotonic() >= float(deadline_monotonic)
+    )
+
+
+def _timeout_error(tool: str) -> dict[str, str]:
+    return {"tool": tool, "error_class": "TimeoutError"}
+
+
+def _error_is_timeout(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    return "timeout" in text or "timed out" in text
+
+
+def sanitize_issue_evidence_text(value: Any) -> str:
+    """Remove transient Feishu file capabilities from VM-bound issue text.
+
+    Feishu descriptions and comments can embed short-lived signed file URLs.
+    They are presentation references, not RCA input data, and must not cross
+    the host/VM boundary.  Normal issue URLs remain intact.
+    """
+    text = compact_value(value).replace("\r\n", "\n")
+    if not text:
+        return ""
+    text = _HTML_COMMENT_RE.sub("", text)
+    text = _MARKDOWN_IMAGE_RE.sub("[image]", text)
+    text = _HTML_IMAGE_RE.sub("[image]", text)
+    text = _FEISHU_FILE_URL_RE.sub("[attachment]", text)
+    text = re.sub(
+        r"\[([^\]]*)\]\(\[attachment\]\)",
+        lambda match: f"{match.group(1).strip()} [attachment]".strip(),
+        text,
+    )
+    return text.strip()
 
 
 def extract_feishu_issue_project_key(text: str, *, work_item_id: str = "") -> str:
@@ -88,7 +172,12 @@ def resolve_feishu_issue_project_key(
     return ""
 
 
-def call_gateway_tool(function_name: str, args: dict[str, Any]) -> dict[str, Any]:
+def call_gateway_tool(
+    function_name: str,
+    args: dict[str, Any],
+    *,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
     """Call an already-registered Hermes tool from gateway-side policy code.
 
     MCP discovery can fail transiently during gateway startup.  For G1Q3 host
@@ -98,7 +187,11 @@ def call_gateway_tool(function_name: str, args: dict[str, Any]) -> dict[str, Any
     from model_tools import handle_function_call
 
     def _call_once() -> dict[str, Any]:
-        raw = handle_function_call(function_name, args)
+        raw = handle_function_call(
+            function_name,
+            args,
+            execution_timeout_seconds=timeout_seconds,
+        )
         if isinstance(raw, str):
             try:
                 parsed = json.loads(raw)
@@ -108,7 +201,16 @@ def call_gateway_tool(function_name: str, args: dict[str, Any]) -> dict[str, Any
         return raw if isinstance(raw, dict) else {"result": raw}
 
     parsed = _call_once()
-    if function_name.startswith("mcp_feishu_project_") and _is_unknown_tool_payload(parsed, function_name):
+    if (
+        function_name.startswith("mcp_feishu_project_")
+        and _is_unknown_tool_payload(parsed, function_name)
+    ):
+        if timeout_seconds is not None:
+            # MCP discovery owns a separate startup lifecycle and may wait for
+            # slow servers for up to two minutes. A claimed RCA outbox row must
+            # not inherit that unbounded work; fail fast and let the durable
+            # retry observe the next startup/discovery result.
+            return parsed
         _discover_mcp_tools_once()
         parsed = _call_once()
     return parsed
@@ -198,7 +300,11 @@ def check_meegle_auth_status(runner: MeegleRunner | None = None) -> dict[str, An
     }
 
 
-def default_meegle_runner(args: list[str]) -> tuple[int, str, str]:
+def default_meegle_runner(
+    args: list[str],
+    *,
+    timeout_seconds: float = MEEGLE_CLI_TIMEOUT_SECONDS,
+) -> tuple[int, str, str]:
     """Run the official Meegle CLI with bounded timeout and JSON-friendly env.
 
     This is a diagnostic/fallback source for Feishu Project reads.  Secrets are
@@ -210,11 +316,15 @@ def default_meegle_runner(args: list[str]) -> tuple[int, str, str]:
         return 127, "", "meegle CLI not found"
     env = os.environ.copy()
     env.setdefault("MEEGLE_HOST", "project.feishu.cn")
+    timeout_seconds = _positive_timeout_seconds(
+        timeout_seconds,
+        name="Meegle timeout",
+    )
     completed = subprocess.run(
         [exe, *args],
         text=True,
         capture_output=True,
-        timeout=MEEGLE_CLI_TIMEOUT_SECONDS,
+        timeout=min(timeout_seconds, float(MEEGLE_CLI_TIMEOUT_SECONDS)),
         env=env,
         check=False,
     )
@@ -339,11 +449,35 @@ def _normalize_meegle_comments_payload(payload: Any) -> list[dict[str, Any]]:
     return normalized
 
 
+def _call_meegle_with_deadline(
+    runner: MeegleRunner,
+    args: list[str],
+    *,
+    deadline_monotonic: float | None,
+) -> tuple[int, str, str]:
+    if deadline_monotonic is None:
+        return runner(args)
+    timeout_seconds = _deadline_timeout_seconds(
+        deadline_monotonic,
+        phase_limit_seconds=MEEGLE_CLI_TIMEOUT_SECONDS,
+    )
+    if runner is default_meegle_runner:
+        result = default_meegle_runner(args, timeout_seconds=timeout_seconds)
+    else:
+        result = runner(args)
+    if _deadline_expired(deadline_monotonic):
+        raise IssueEnrichmentDeadlineExceeded(
+            "host issue preread deadline exceeded after Meegle call"
+        )
+    return result
+
+
 def fetch_g1q3_issue_context_result_via_meegle(
     *,
     project_key: str,
     work_item_id: str,
     runner: MeegleRunner = default_meegle_runner,
+    deadline_monotonic: float | None = None,
 ) -> G1Q3IssueReadResult:
     """Best-effort read through the official @lark-project/meegle CLI."""
     issue_id = str(work_item_id or "").strip()
@@ -359,7 +493,11 @@ def fetch_g1q3_issue_context_result_via_meegle(
 
     errors: list[dict[str, str]] = []
     try:
-        rc, out, err = runner(["auth", "status", "--format", "json"])
+        rc, out, err = _call_meegle_with_deadline(
+            runner,
+            ["auth", "status", "--format", "json"],
+            deadline_monotonic=deadline_monotonic,
+        )
         auth_payload = _json_from_cli_stdout(out)
         if rc != 0 or (isinstance(auth_payload, dict) and auth_payload.get("authenticated") is False):
             reason = auth_payload.get("reason") if isinstance(auth_payload, dict) else (err or out)
@@ -372,11 +510,11 @@ def fetch_g1q3_issue_context_result_via_meegle(
                 },
                 errors=[{"tool": "meegle auth status", "error_class": "Unauthenticated", "message": str(reason or "")[:200]}],
             )
-    except subprocess.TimeoutExpired:
+    except (subprocess.TimeoutExpired, TimeoutError):
         return G1Q3IssueReadResult(
             status="read_failed",
             blocker={"kind": "host_meegle_preread_timeout", "message": "Meegle CLI auth status 超时", "retryable": True},
-            errors=[{"tool": "meegle auth status", "error_class": "TimeoutExpired"}],
+            errors=[_timeout_error("meegle auth status")],
         )
     except Exception as exc:
         return G1Q3IssueReadResult(
@@ -388,24 +526,39 @@ def fetch_g1q3_issue_context_result_via_meegle(
     workitem_payload: Any = {}
     comments_payload: Any = {}
     try:
-        rc, out, err = runner(["workitem", "get", "--project-key", project, "--work-item-id", issue_id, "--fields", "_all", "--format", "json"])
+        rc, out, err = _call_meegle_with_deadline(
+            runner,
+            [
+                "workitem", "get", "--project-key", project,
+                "--work-item-id", issue_id, "--fields", "_all",
+                "--format", "json",
+            ],
+            deadline_monotonic=deadline_monotonic,
+        )
         if rc != 0:
             errors.append({"tool": "meegle workitem get", "error_class": "CLIError", "message": (err or out)[:200]})
         else:
             workitem_payload = _json_from_cli_stdout(out)
-    except subprocess.TimeoutExpired:
-        errors.append({"tool": "meegle workitem get", "error_class": "TimeoutExpired"})
+    except (subprocess.TimeoutExpired, TimeoutError):
+        errors.append(_timeout_error("meegle workitem get"))
     except Exception as exc:
         errors.append({"tool": "meegle workitem get", "error_class": type(exc).__name__, "message": str(exc)[:200]})
 
     try:
-        rc, out, err = runner(["comment", "list", "--project-key", project, "--work-item-id", issue_id, "--format", "json"])
+        rc, out, err = _call_meegle_with_deadline(
+            runner,
+            [
+                "comment", "list", "--project-key", project,
+                "--work-item-id", issue_id, "--format", "json",
+            ],
+            deadline_monotonic=deadline_monotonic,
+        )
         if rc != 0:
             errors.append({"tool": "meegle comment list", "error_class": "CLIError", "message": (err or out)[:200]})
         else:
             comments_payload = _json_from_cli_stdout(out)
-    except subprocess.TimeoutExpired:
-        errors.append({"tool": "meegle comment list", "error_class": "TimeoutExpired"})
+    except (subprocess.TimeoutExpired, TimeoutError):
+        errors.append(_timeout_error("meegle comment list"))
     except Exception as exc:
         errors.append({"tool": "meegle comment list", "error_class": type(exc).__name__, "message": str(exc)[:200]})
 
@@ -481,16 +634,16 @@ def compact_g1q3_issue_context(*, work_item_brief: dict[str, Any], comments: lis
     """Build a compact, recipient-safe issue context block for VM intake."""
     attrs, by_key, by_name = _field_maps(work_item_brief)
 
-    title = str(attrs.get("work_item_name") or "").strip()
-    project_name = compact_value(by_key.get("field_052f23") or by_name.get("所属项目"))
-    frame_id = compact_value(by_key.get("field_1fda45") or by_name.get("问题发生frameid"))
-    happened_at = compact_value(by_name.get("发生时间"))
+    title = sanitize_issue_evidence_text(attrs.get("work_item_name") or "")
+    project_name = sanitize_issue_evidence_text(by_key.get("field_052f23") or by_name.get("所属项目"))
+    frame_id = sanitize_issue_evidence_text(by_key.get("field_1fda45") or by_name.get("问题发生frameid"))
+    happened_at = sanitize_issue_evidence_text(by_name.get("发生时间"))
     data_addr = compact_value(by_key.get("field_93aa63") or by_name.get("问题数据地址_PDCL"))
-    root_cause = compact_value(by_key.get("field_842fc8") or by_name.get("问题根本原因分析"))
-    owner = compact_value(by_name.get("当前负责人") or by_name.get("责任人"))
-    vehicle = compact_value(by_key.get("field_9e1bd0") or by_name.get("车辆编号/台架编号"))
-    status_name = compact_value((attrs.get("work_item_status") or {}).get("name"))
-    description = compact_value(by_name.get("描述"))[:1200]
+    root_cause = sanitize_issue_evidence_text(by_key.get("field_842fc8") or by_name.get("问题根本原因分析"))
+    owner = sanitize_issue_evidence_text(by_name.get("当前负责人") or by_name.get("责任人"))
+    vehicle = sanitize_issue_evidence_text(by_key.get("field_9e1bd0") or by_name.get("车辆编号/台架编号"))
+    status_name = sanitize_issue_evidence_text((attrs.get("work_item_status") or {}).get("name"))
+    description = sanitize_issue_evidence_text(by_name.get("描述"))[:1200]
 
     lines = ["## Feishu issue 已解析字段（主控侧读取）"]
     if title:
@@ -523,10 +676,9 @@ def compact_g1q3_issue_context(*, work_item_brief: dict[str, Any], comments: lis
         if not isinstance(raw, dict):
             continue
         created = str(raw.get("created_at") or "").strip()
-        content = str(raw.get("content") or "").strip().replace("\r\n", "\n")
+        content = sanitize_issue_evidence_text(raw.get("content") or "")
         if not content:
             continue
-        content = re.sub(r"!\[[^\]]*\]\([^\)]*\)(?:<!--.*?-->)?", "[image]", content)
         content = re.sub(r"\n{3,}", "\n\n", content).strip()
         if len(content) > 500:
             content = content[:500].rstrip() + "..."
@@ -567,6 +719,8 @@ def fetch_g1q3_issue_context_result_via_mcp(
     work_item_id: str,
     tool_caller: GatewayToolCaller = call_gateway_tool,
     now_ms: int | None = None,
+    deadline_monotonic: float | None = None,
+    tool_timeout_seconds: float = G1Q3_ISSUE_MCP_CALL_TIMEOUT_SECONDS,
 ) -> G1Q3IssueReadResult:
     """Best-effort read through Hermes MCP Feishu Project tools.
 
@@ -577,12 +731,38 @@ def fetch_g1q3_issue_context_result_via_mcp(
     issue_id = str(work_item_id or "").strip()
     if not issue_id:
         return G1Q3IssueReadResult(status="not_requested")
+    tool_timeout_seconds = _positive_timeout_seconds(
+        tool_timeout_seconds,
+        name="tool_timeout_seconds",
+    )
 
     errors: list[dict[str, str]] = []
     brief_payload: Any = {}
     comments_payload: Any = {}
+
+    def call_tool(name: str, args: dict[str, Any]) -> Any:
+        timeout_seconds = tool_timeout_seconds
+        if deadline_monotonic is not None:
+            timeout_seconds = _deadline_timeout_seconds(
+                deadline_monotonic,
+                phase_limit_seconds=tool_timeout_seconds,
+            )
+        if tool_caller is call_gateway_tool:
+            value = call_gateway_tool(
+                name,
+                args,
+                timeout_seconds=timeout_seconds,
+            )
+        else:
+            value = tool_caller(name, args)
+        if _deadline_expired(deadline_monotonic):
+            raise IssueEnrichmentDeadlineExceeded(
+                f"host issue preread deadline exceeded after {name}"
+            )
+        return value
+
     try:
-        raw_brief = tool_caller(
+        raw_brief = call_tool(
             "mcp_feishu_project_get_workitem_brief",
             {
                 "fields": ["_all"],
@@ -596,13 +776,25 @@ def fetch_g1q3_issue_context_result_via_mcp(
         )
         brief_payload = mcp_result_payload(raw_brief)
         if _payload_error(brief_payload):
-            errors.append({"tool": "mcp_feishu_project_get_workitem_brief", "error_class": "ToolError", "message": _payload_error(brief_payload)[:200]})
+            error = _payload_error(brief_payload)
+            errors.append({
+                "tool": "mcp_feishu_project_get_workitem_brief",
+                "error_class": "TimeoutError" if _error_is_timeout(error) else "ToolError",
+                "message": error[:200],
+            })
             brief_payload = {}
+    except IssueEnrichmentDeadlineExceeded:
+        errors.append(_timeout_error("mcp_feishu_project_get_workitem_brief"))
     except Exception as exc:
         logger.warning("G1Q3 issue preread MCP failed at workitem brief: %s", exc)
-        errors.append({"tool": "mcp_feishu_project_get_workitem_brief", "error_class": type(exc).__name__})
+        errors.append({
+            "tool": "mcp_feishu_project_get_workitem_brief",
+            "error_class": (
+                "TimeoutError" if isinstance(exc, TimeoutError) else type(exc).__name__
+            ),
+        })
     try:
-        raw_comments = tool_caller(
+        raw_comments = call_tool(
             "mcp_feishu_project_list_workitem_comments",
             {
                 "end_time": now_ms if now_ms is not None else int(time.time() * 1000),
@@ -614,11 +806,23 @@ def fetch_g1q3_issue_context_result_via_mcp(
         )
         comments_payload = mcp_result_payload(raw_comments)
         if _payload_error(comments_payload):
-            errors.append({"tool": "mcp_feishu_project_list_workitem_comments", "error_class": "ToolError", "message": _payload_error(comments_payload)[:200]})
+            error = _payload_error(comments_payload)
+            errors.append({
+                "tool": "mcp_feishu_project_list_workitem_comments",
+                "error_class": "TimeoutError" if _error_is_timeout(error) else "ToolError",
+                "message": error[:200],
+            })
             comments_payload = {}
+    except IssueEnrichmentDeadlineExceeded:
+        errors.append(_timeout_error("mcp_feishu_project_list_workitem_comments"))
     except Exception as exc:
         logger.warning("G1Q3 issue preread MCP failed at comments: %s", exc)
-        errors.append({"tool": "mcp_feishu_project_list_workitem_comments", "error_class": type(exc).__name__})
+        errors.append({
+            "tool": "mcp_feishu_project_list_workitem_comments",
+            "error_class": (
+                "TimeoutError" if isinstance(exc, TimeoutError) else type(exc).__name__
+            ),
+        })
 
     comments = comments_payload.get("comments") if isinstance(comments_payload, dict) else comments_payload
     context_text = compact_g1q3_issue_context(
@@ -629,11 +833,23 @@ def fetch_g1q3_issue_context_result_via_mcp(
         _capture_g1q3_issue_context(project_key=project_key, work_item_id=issue_id, read_source="mcp", context_text=context_text, read_status="fields_extracted", errors=errors or None)
         return G1Q3IssueReadResult(context_text=context_text, status="fields_extracted", errors=errors or None, source="mcp")
     if errors:
+        timed_out = any(
+            item.get("error_class") in {"TimeoutError", "TimeoutExpired"}
+            for item in errors
+        )
         return G1Q3IssueReadResult(
             status="read_failed",
             blocker={
-                "kind": "host_mcp_preread_failed",
-                "message": "MCP 飞书 Project issue 字段/评论读取失败，不能据此判定字段缺失",
+                "kind": (
+                    "host_mcp_preread_timeout"
+                    if timed_out
+                    else "host_mcp_preread_failed"
+                ),
+                "message": (
+                    "MCP 飞书 Project issue 读取超出生产时间预算，不能据此判定字段缺失"
+                    if timed_out
+                    else "MCP 飞书 Project issue 字段/评论读取失败，不能据此判定字段缺失"
+                ),
                 "retryable": True,
                 "failed_tools": [item["tool"] for item in errors],
             },
@@ -658,6 +874,8 @@ def fetch_g1q3_issue_context_result(
     use_meegle_fallback: bool | None = None,
     use_mcp_fallback: bool | None = None,
     meegle_runner: MeegleRunner = default_meegle_runner,
+    total_timeout_seconds: float = G1Q3_ISSUE_ENRICHMENT_TIMEOUT_SECONDS,
+    mcp_call_timeout_seconds: float = G1Q3_ISSUE_MCP_CALL_TIMEOUT_SECONDS,
 ) -> G1Q3IssueReadResult:
     """Read Feishu Project issue fields/comments with Meegle as primary.
 
@@ -673,6 +891,17 @@ def fetch_g1q3_issue_context_result(
     issue_id = str(work_item_id or "").strip()
     if not issue_id:
         return G1Q3IssueReadResult(status="not_requested")
+    total_timeout_seconds = _positive_timeout_seconds(
+        total_timeout_seconds,
+        name="total_timeout_seconds",
+    )
+    mcp_call_timeout_seconds = _positive_timeout_seconds(
+        mcp_call_timeout_seconds,
+        name="mcp_call_timeout_seconds",
+    )
+    if mcp_call_timeout_seconds > total_timeout_seconds:
+        raise ValueError("issue preread timeout budgets are invalid")
+    deadline_monotonic = time.monotonic() + total_timeout_seconds
     if use_mcp_fallback is None:
         use_mcp_fallback = os.getenv("HERMES_G1Q3_MCP_FALLBACK", "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -680,6 +909,7 @@ def fetch_g1q3_issue_context_result(
         project_key=project_key,
         work_item_id=issue_id,
         runner=meegle_runner,
+        deadline_monotonic=deadline_monotonic,
     )
     if meegle_result.context_text:
         return meegle_result
@@ -700,6 +930,8 @@ def fetch_g1q3_issue_context_result(
             work_item_id=issue_id,
             tool_caller=tool_caller,
             now_ms=now_ms,
+            deadline_monotonic=deadline_monotonic,
+            tool_timeout_seconds=mcp_call_timeout_seconds,
         )
         if mcp_result.context_text:
             combined_errors = [*(meegle_result.errors or []), *(mcp_result.errors or [])] or None
@@ -719,16 +951,32 @@ def fetch_g1q3_issue_context_result(
                 source="mcp_auto_degraded" if auto_degrade else "mcp",
             )
         errors = [*(meegle_result.errors or []), *(mcp_result.errors or [])]
-        blocker = {
-            "kind": "host_issue_preread_failed",
-            "message": "Meegle 主链路和 MCP 兜底均未成功读取飞书 issue 字段/评论，不能据此判定字段缺失",
-            "retryable": True,
-            "failed_tools": [item.get("tool", "unknown") for item in errors],
-        } if errors else {
-            "kind": "host_issue_preread_empty",
-            "message": "Meegle 主链路和 MCP 兜底均返回空结果，不能据此判定字段缺失",
-            "retryable": True,
-        }
+        timed_out = _deadline_expired(deadline_monotonic) or any(
+            item.get("error_class") in {"TimeoutError", "TimeoutExpired"}
+            for item in errors
+        )
+        blocker = (
+            {
+                "kind": (
+                    "host_issue_preread_timeout"
+                    if timed_out
+                    else "host_issue_preread_failed"
+                ),
+                "message": (
+                    "Meegle 主链路和 MCP 兜底均未在生产时间预算内完成，不能据此判定字段缺失"
+                    if timed_out
+                    else "Meegle 主链路和 MCP 兜底均未成功读取飞书 issue 字段/评论，不能据此判定字段缺失"
+                ),
+                "retryable": True,
+                "failed_tools": [item.get("tool", "unknown") for item in errors],
+            }
+            if errors
+            else {
+                "kind": "host_issue_preread_empty",
+                "message": "Meegle 主链路和 MCP 兜底均返回空结果，不能据此判定字段缺失",
+                "retryable": True,
+            }
+        )
         meegle_kind = str((meegle_result.blocker or {}).get("kind") or "")
         if errors and "unauthenticated" in meegle_kind:
             # Keep the unauthenticated signal: it drives the group-side

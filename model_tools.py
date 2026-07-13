@@ -22,12 +22,14 @@ Public API (signatures preserved from the original 2,400-line version):
 
 import os
 import json
+import math
 import re
 import asyncio
+from contextvars import ContextVar, copy_context
 import logging
 import threading
 import time
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from tools.registry import discover_builtin_tools, registry
 from toolsets import resolve_toolset, validate_toolset
@@ -46,6 +48,10 @@ _WARNED_DISABLED_BUNDLES: set = set()
 _tool_loop = None          # persistent loop for the main (CLI) thread
 _tool_loop_lock = threading.Lock()
 _worker_thread_local = threading.local()  # per-worker-thread persistent loops
+_async_bridge_timeout_seconds: ContextVar[float | None] = ContextVar(
+    "async_bridge_timeout_seconds",
+    default=None,
+)
 
 
 def _get_tool_loop():
@@ -85,7 +91,7 @@ def _get_worker_loop():
     return loop
 
 
-def _run_async(coro):
+def _run_async(coro, *, timeout_seconds: float | None = None):
     """Run an async coroutine from a sync context.
 
     If the current thread already has a running event loop (e.g., inside
@@ -105,6 +111,18 @@ def _run_async(coro):
     This is the single source of truth for sync->async bridging in tool
     handlers. Each handler is self-protecting via this function.
     """
+    requested_timeout = (
+        _async_bridge_timeout_seconds.get()
+        if timeout_seconds is None
+        else timeout_seconds
+    )
+    if requested_timeout is not None:
+        if isinstance(requested_timeout, bool):
+            raise ValueError("timeout_seconds must be a positive finite number")
+        requested_timeout = float(requested_timeout)
+        if not math.isfinite(requested_timeout) or requested_timeout <= 0:
+            raise ValueError("timeout_seconds must be a positive finite number")
+
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -150,7 +168,9 @@ def _run_async(coro):
 
         future = pool.submit(propagate_context_to_thread(_run_in_worker))
         try:
-            return future.result(timeout=300)
+            return future.result(
+                timeout=(300 if requested_timeout is None else requested_timeout)
+            )
         except concurrent.futures.TimeoutError:
             # Cancel the coroutine inside its own loop so the worker thread
             # can wind down instead of running forever.
@@ -175,10 +195,63 @@ def _run_async(coro):
     # lifetime — preventing "Event loop is closed" on GC cleanup.
     if threading.current_thread() is not threading.main_thread():
         worker_loop = _get_worker_loop()
-        return worker_loop.run_until_complete(coro)
+        if requested_timeout is None:
+            return worker_loop.run_until_complete(coro)
+        return worker_loop.run_until_complete(
+            asyncio.wait_for(coro, timeout=requested_timeout)
+        )
 
     tool_loop = _get_tool_loop()
-    return tool_loop.run_until_complete(coro)
+    if requested_timeout is None:
+        return tool_loop.run_until_complete(coro)
+    return tool_loop.run_until_complete(
+        asyncio.wait_for(coro, timeout=requested_timeout)
+    )
+
+
+def _run_interruptible_sync(
+    call: Callable[[], str],
+    *,
+    timeout_seconds: float,
+) -> str:
+    """Bound a sync MCP proxy and cooperatively cancel its background RPC."""
+    import concurrent.futures
+
+    from tools.interrupt import set_interrupt
+
+    result_future: concurrent.futures.Future[str] = concurrent.futures.Future()
+    worker_ready = threading.Event()
+    worker_thread_id: list[int | None] = [None]
+    call_context = copy_context()
+
+    def run() -> None:
+        worker_thread_id[0] = threading.current_thread().ident
+        worker_ready.set()
+        try:
+            result_future.set_result(call_context.run(call))
+        except BaseException as exc:
+            result_future.set_exception(exc)
+        finally:
+            set_interrupt(False)
+
+    worker = threading.Thread(
+        target=run,
+        name="bounded-mcp-tool-call",
+        daemon=True,
+    )
+    worker.start()
+    try:
+        return result_future.result(timeout=timeout_seconds)
+    except concurrent.futures.TimeoutError as exc:
+        if worker_ready.wait(timeout=1.0) and worker_thread_id[0] is not None:
+            set_interrupt(True, thread_id=worker_thread_id[0])
+            try:
+                result_future.result(timeout=1.0)
+            except Exception:
+                pass
+        raise TimeoutError(
+            f"MCP tool execution timed out after {timeout_seconds:.3f}s"
+        ) from exc
 
 
 # =============================================================================
@@ -1031,6 +1104,7 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    execution_timeout_seconds: Optional[float] = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1135,6 +1209,7 @@ def handle_function_call(
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                execution_timeout_seconds=execution_timeout_seconds,
             )
 
     _tool_original_args = dict(function_args)
@@ -1238,6 +1313,19 @@ def handle_function_call(
         # to wrap every tool manually.  We use monotonic() so the value is
         # unaffected by wall-clock adjustments during the call.
         _dispatch_start = time.monotonic()
+        timeout_token = None
+        normalized_timeout = None
+        if execution_timeout_seconds is not None:
+            if isinstance(execution_timeout_seconds, bool):
+                raise ValueError(
+                    "execution_timeout_seconds must be a positive finite number"
+                )
+            normalized_timeout = float(execution_timeout_seconds)
+            if not math.isfinite(normalized_timeout) or normalized_timeout <= 0:
+                raise ValueError(
+                    "execution_timeout_seconds must be a positive finite number"
+                )
+            timeout_token = _async_bridge_timeout_seconds.set(normalized_timeout)
         _approval_tokens = None
         try:
             from tools.approval import (
@@ -1255,7 +1343,7 @@ def handle_function_call(
                 # Prefer the caller-provided list so subagents can't overwrite
                 # the parent's tool set via the process-global.
                 sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
-                def _dispatch(next_args: Dict[str, Any]) -> Any:
+                def _registry_dispatch(next_args: Dict[str, Any]) -> Any:
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
@@ -1263,13 +1351,22 @@ def handle_function_call(
                         enabled_tools=sandbox_enabled,
                     )
             else:
-                def _dispatch(next_args: Dict[str, Any]) -> Any:
+                def _registry_dispatch(next_args: Dict[str, Any]) -> Any:
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
                         user_task=user_task,
                     )
+
+            def _dispatch(next_args: Dict[str, Any]) -> Any:
+                if normalized_timeout is not None and function_name.startswith("mcp_"):
+                    return _run_interruptible_sync(
+                        lambda: _registry_dispatch(next_args),
+                        timeout_seconds=normalized_timeout,
+                    )
+                return _registry_dispatch(next_args)
+
             from hermes_cli.middleware import run_tool_execution_middleware
 
             result = run_tool_execution_middleware(
@@ -1289,6 +1386,8 @@ def handle_function_call(
                     reset_current_observability_context(_approval_tokens)
                 except Exception:
                     pass
+            if timeout_token is not None:
+                _async_bridge_timeout_seconds.reset(timeout_token)
         duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
 
         _emit_post_tool_call_hook(

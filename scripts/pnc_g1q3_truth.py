@@ -3,7 +3,8 @@
 User-facing G1Q3 status surfaces must not infer deliverability from VM terminal
 state or the existence of an HTML file alone.  The gate result is authoritative:
 non-green gates can only be reported as intake/admission complete and waiting for
-source download/parsed evidence.
+remote-read processing or additional evidence.  Historical download-shaped
+states remain readable, but this module never emits a download instruction.
 """
 from __future__ import annotations
 
@@ -71,7 +72,7 @@ def gate_is_green(gate_result: Any = None, log_text: str = "") -> bool:
 def parsed_l2_assets_present(gate_result: Any = None, report_data: Any = None, log_text: str = "") -> bool:
     """Best-effort parsed/L2 asset predicate for deliverability.
 
-    Absence is fail-closed.  Explicit requires_download/missing parsed signals
+    Absence is fail-closed.  Historical requires_download/missing parsed signals
     always veto.  Tests and future producers may provide parsed_l2_assets_present.
     """
     for data in (gate_result, report_data):
@@ -111,7 +112,7 @@ def parsed_l2_assets_present(gate_result: Any = None, report_data: Any = None, l
         return True
     # If the gate itself is still non-green, absence of an explicit parsed/L2
     # signal should be reported as gate truth, not promoted to a generic
-    # requires_download surrogate.
+    # historical requires_download surrogate.
     if _gate_decision(gate_result, "") in NON_GREEN_GATE_DECISIONS:
         return True
     return False
@@ -157,9 +158,9 @@ def _reconcile_from_business_result(
     """
     gate_decision = biz["gate_decision"] or "skipped"
     return {
-        "honest_report_status": "need_download",
+        "honest_report_status": "need_evidence",
         "honest_attribution_status": "",
-        "honest_conclusion": f"intake 与准入校验完成；待下载/解析数据后再出 RCA 结论（gate={gate_decision}）",
+        "honest_conclusion": f"intake 与准入校验完成；待远程读取/解析或补充证据后再出 RCA 结论（gate={gate_decision}；不执行 MDI 下载）",
         "gate_decision": gate_decision,
         "gate_skip_reason": biz.get("gate_skip_reason") or "",
         "gate_green": False,
@@ -205,9 +206,9 @@ def reconcile_report_truth(
     if gate_decision and not gate_green:
         decision_label = gate_decision or "non_green"
         return {
-            "honest_report_status": "need_download",
+            "honest_report_status": "need_evidence",
             "honest_attribution_status": "hypothesis_ready" if raw_attr else "",
-            "honest_conclusion": f"intake 与准入校验完成；待下载/解析数据后再出 RCA 结论（gate={decision_label}）",
+            "honest_conclusion": f"intake 与准入校验完成；待远程读取/解析或补充证据后再出 RCA 结论（gate={decision_label}；不执行 MDI 下载）",
             "gate_decision": decision_label,
             "gate_green": False,
             "parsed_l2_assets_present": assets_present,
@@ -219,9 +220,9 @@ def reconcile_report_truth(
     if raw_report_status == "html_delivery_ready" and not (gate_green and assets_present):
         anomaly_reasons.append("html_ready_without_gate_or_assets")
         return {
-            "honest_report_status": "need_download",
+            "honest_report_status": "need_evidence",
             "honest_attribution_status": "hypothesis_ready" if raw_attr else "",
-            "honest_conclusion": f"命中既有报告草稿，但证据未齐（gate={gate_decision or 'unknown'}），不作为可交付；待下载/解析后再出 RCA 结论。",
+            "honest_conclusion": f"命中既有报告草稿，但证据未齐（gate={gate_decision or 'unknown'}），不作为可交付；待远程读取/解析或补充证据后再出 RCA 结论（不执行 MDI 下载）。",
             "gate_decision": gate_decision,
             "gate_green": gate_green,
             "parsed_l2_assets_present": assets_present,
@@ -253,12 +254,15 @@ def downgrade_g1q3_notice_text(text: str, verdict: dict[str, Any]) -> str:
     if not isinstance(verdict, dict) or verdict.get("gate_green") is True:
         return text
     decision = str(verdict.get("gate_decision") or "non_green")
-    honest = str(verdict.get("honest_conclusion") or f"intake 与准入校验完成；待下载/解析数据后再出 RCA 结论（gate={decision}）")
+    honest = str(
+        verdict.get("honest_conclusion")
+        or f"intake 与准入校验完成；待远程读取/解析或补充证据后再出 RCA 结论（gate={decision}；不执行 MDI 下载）"
+    )
     original = str(text or "").strip()
     if not original:
         return honest
     # Keep a short evidence/hypothesis tail without deliverable wording.
-    cleaned = FALSE_GREEN_RE.sub("待下载解析", original)
+    cleaned = FALSE_GREEN_RE.sub("待远程读取解析", original)
     cleaned = re.sub(r"(?im)^.*(?:报告链接|report link|html link|html_url|artifact_path|artifact link).*$", "", cleaned)
     # Under a non-green gate there is no deliverable report, so any bare CIFS/UNC
     # (//hfs...) or VM (/mnt/tmp/...) file-share link is a dead/unverified pointer

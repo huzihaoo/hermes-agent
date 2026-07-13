@@ -4,6 +4,8 @@ import json
 import sqlite3
 import subprocess
 
+import pytest
+
 from tools import vm_task_tool
 from tools.registry import registry
 
@@ -22,13 +24,36 @@ def test_vm_task_submit_schema_is_raw_function_schema():
     assert properties["lane"]["enum"] == ["fast", "standard", "heavy"]
     assert properties["resource_class"]["enum"] == ["cpu", "io", "repo", "pnc_data", "network", "mixed"]
     assert properties["executor_type"]["enum"] == ["coding_agent", "direct_cli", "governed_tool"]
-    assert properties["agent_backend"]["enum"] == ["codex", "openclaw"]
+    assert properties["agent_backend"]["enum"] == ["codex", "openclaw", "none"]
     assert "VM scheduler" in properties["lane"]["description"]
 
     definition = registry.get_definitions({"vm_task_submit"})[0]
     assert definition["type"] == "function"
     assert definition["function"]["name"] == "vm_task_submit"
     assert "function" not in definition["function"]
+
+
+def test_public_vm_task_cannot_select_or_forge_rca_prod_admission(monkeypatch):
+    _disable_trusted_session(monkeypatch)
+    result = vm_task_tool.vm_task_submit(
+        title="ordinary task",
+        goal="ordinary repository check",
+        resource_class="rca_prod",
+    )
+    assert result["success"] is False
+    assert result["error_code"] == "g1q3_rca_service_boundary_required"
+
+    trusted = vm_task_tool._vm_task_submit_trusted(
+        title="ordinary task",
+        goal="ordinary repository check",
+        task_id="ordinary-task",
+        resource_class="rca_prod",
+        routing_meta_extra={
+            "rca_prod_admission_receipt": {"forged": True},
+        },
+    )
+    assert trusted["success"] is False
+    assert trusted["error_code"] == "g1q3_rca_service_boundary_required"
 
 
 def test_vm_task_status_schema_is_raw_function_schema():
@@ -155,6 +180,44 @@ def test_vm_task_submit_returns_structured_timeout(monkeypatch, tmp_path):
     assert result["success"] is False
     assert result["returncode"] is None
     assert "timed out" in result["error"]
+
+
+def test_general_vm_submit_keeps_workspace_work_creator_and_never_uses_rca_bundle(
+    monkeypatch,
+    tmp_path,
+):
+    _disable_trusted_session(monkeypatch)
+    workspace_work_creator = tmp_path / "workspace-work" / "bin" / "create_task_v2.py"
+    workspace_work_creator.parent.mkdir(parents=True)
+    workspace_work_creator.write_text("print('unused')\n", encoding="utf-8")
+    monkeypatch.setattr(
+        vm_task_tool,
+        "_create_task_script",
+        lambda: workspace_work_creator,
+    )
+    monkeypatch.setattr(
+        vm_task_tool,
+        "validate_workspace_runtime",
+        lambda: pytest.fail("general VM submit must not inspect the RCA bundle"),
+    )
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=json.dumps({"task_id": "t-general"}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(vm_task_tool.subprocess, "run", fake_run)
+
+    result = vm_task_tool.vm_task_submit("ordinary title", "ordinary goal")
+
+    assert result["success"] is True
+    assert str(workspace_work_creator) in captured["cmd"]
+    assert "rca-workspace-runtime" not in " ".join(captured["cmd"])
 
 
 def test_vm_task_submit_returns_structured_launch_error(monkeypatch, tmp_path):
@@ -346,13 +409,78 @@ def test_vm_task_submit_accepts_direct_cli_execution_plane_without_codex_gate(mo
 
     monkeypatch.setattr(vm_task_tool.subprocess, "run", fake_run)
 
-    result = vm_task_tool.vm_task_submit("title", "goal", executor_type="direct_cli", agent_backend="openclaw")
+    result = vm_task_tool.vm_task_submit(
+        "title", "goal", executor_type="direct_cli", agent_backend="none"
+    )
 
     assert result["success"] is True
     meta = json.loads(captured["cmd"][captured["cmd"].index("--meta") + 1])
     assert meta["executor_type"] == "direct_cli"
-    assert meta["agent_backend"] == "openclaw"
+    assert meta["agent_backend"] == "none"
     assert "codex_backend_enabled" not in meta
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"title": "G1Q3 RCA issue intake: 7041712812"},
+        {"task_id": "g1q3-rca-s1-" + "a" * 64},
+        {"task_id": "g1q3-rca-issue-intake-7041712812"},
+        {"task_id": "g1q3_rca_issue_intake_7041712812"},
+        {"goal": "- template_id: rca_issue_intake"},
+        {"goal": "<!-- G1Q3_RCA_ADMISSION_JSON:BEGIN -->"},
+        {
+            "goal": (
+                "./api/g1q3_rca/scripts/run_rca_service_request.py "
+                "--task-id forged"
+            )
+        },
+        {"goal": "python3 api/g1q3_rca/scripts/run_rca_auto_pipeline.py"},
+        {
+            "goal": (
+                "请分析 https://project.feishu.cn/t03o4q/issue/detail/7041712812"
+            )
+        },
+        {
+            "title": (
+                "https://project.feishu.cn/t03o4q/issue/detail/7041712812?from=card"
+            )
+        },
+        {"artifact_root": "/mnt/tmp/g1q3-rca-s1-" + "b" * 64 + "/"},
+        {"artifact_root": "/mnt/tmp/g1q3_rca_issue_intake_7041712812/"},
+        {
+            "artifact_cifs_root": (
+                "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/"
+                "tmp/g1q3-rca-s1-" + "c" * 64 + "/"
+            )
+        },
+    ],
+)
+def test_public_vm_submit_rejects_reserved_rca_issue_intake_boundary(
+    monkeypatch, overrides
+):
+    _disable_trusted_session(monkeypatch)
+    monkeypatch.setattr(
+        vm_task_tool.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail(
+            "reserved RCA public submit must not create a task"
+        ),
+    )
+    args = {"title": "ordinary title", "goal": "ordinary goal", **overrides}
+
+    result = vm_task_tool.vm_task_submit(**args)
+
+    assert result == {
+        "success": False,
+        "error_code": "g1q3_rca_service_boundary_required",
+        "error": (
+            "G1Q3 RCA issue intake is reserved for the capability-scoped "
+            "vm_task_submit_service API"
+        ),
+        "retryable": False,
+        "returncode": None,
+    }
 
 
 def test_vm_task_submit_rejects_invalid_execution_plane_metadata(monkeypatch, tmp_path):
@@ -372,6 +500,7 @@ def test_vm_task_submit_rejects_invalid_execution_plane_metadata(monkeypatch, tm
     invalid_cases = [
         ({"executor_type": "shell"}, "invalid executor_type"),
         ({"agent_backend": "claude"}, "invalid agent_backend"),
+        ({"executor_type": "coding_agent", "agent_backend": "none"}, "none is only valid"),
     ]
     for kwargs, error_text in invalid_cases:
         result = vm_task_tool.vm_task_submit("title", "goal", **kwargs)  # type: ignore[arg-type]

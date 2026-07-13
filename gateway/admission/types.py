@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 Lane = Literal["fast", "standard", "heavy"]
 Domain = Literal["user", "group", "vm"]
@@ -42,6 +42,9 @@ class QueueItem:
     thread_id: str | None = None
     request_message_id: str | None = None
     platform: str | None = None
+    # Allowlisted, adapter-built context needed to reconstruct trusted events.
+    # User message text must never be interpreted as this structure.
+    event_context: dict[str, Any] | None = None
     # Retry tracking
     retry_count: int = 0
     max_retries: int = DEFAULT_MAX_RETRIES

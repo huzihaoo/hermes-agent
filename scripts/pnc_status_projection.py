@@ -24,16 +24,32 @@ TIMEOUT_RE = re.compile(r"task_timeout|timeout|timed out|超时", re.I)
 IN_FLIGHT_RE = re.compile(r"download(?:ing)?|解析|running|executing|progress|heartbeat|已派发|下载中|执行中", re.I)
 PIPELINE_FIX_KINDS = {"reader_topic_mismatch", "alignment_failed", "schema_mismatch", "request_contract_drift", "translate_tool_missing"}
 PIPELINE_FIX_CLASSES = {"hard_defect", "infra_self_healable"}
+REMOTE_REFERENCE_GUIDANCE = (
+    "需在飞书问题单的 问题数据地址_PDCL 字段补充可解析的 event/clip 引用，"
+    "地址中必须包含明确的 event UUID 或 clip UUID；"
+    "系统只提取引用并远程读取，不执行 MDI 下载。"
+)
+REMOTE_EVIDENCE_GUIDANCE = (
+    "需补充问题数据/证据；涉及问题数据时只接受可解析的 event/clip 引用并远程读取，"
+    "不执行 MDI 下载。"
+)
+LEGACY_DATA_ACCESS_RE = re.compile(
+    r"mdi\s+(?:download|refresh2?|clip|event)|pdcl|ready_to_download|need_download|requires_download|"
+    r"download(?:ing)?|下载",
+    re.I,
+)
 PIPELINE_STAGE_DEFINITIONS = {
     "s1_gate": {"stage": "gate", "label": "受理门禁核验中"},
     "gate": {"stage": "gate", "label": "受理门禁核验中"},
-    "download": {"stage": "s2_download", "label": "数据下载执行中"},
-    "downloading": {"stage": "s2_download", "label": "数据下载执行中"},
-    "s2_download": {"stage": "s2_download", "label": "数据下载执行中"},
-    "parse": {"stage": "s3_parse", "label": "数据落地中"},
-    "parsing": {"stage": "s3_parse", "label": "数据落地中"},
-    "s3_parse": {"stage": "s3_parse", "label": "数据落地中"},
-    "s3a_materialize": {"stage": "s3_parse", "label": "数据落地中"},
+    # Historical stage identifiers remain input-compatible; labels reflect the
+    # production remote-read contract and never promise MDI materialization.
+    "download": {"stage": "s2_download", "label": "远程读取问题数据中（历史阶段兼容）"},
+    "downloading": {"stage": "s2_download", "label": "远程读取问题数据中（历史阶段兼容）"},
+    "s2_download": {"stage": "s2_download", "label": "远程读取问题数据中（历史阶段兼容）"},
+    "parse": {"stage": "s3_parse", "label": "远程数据解析中"},
+    "parsing": {"stage": "s3_parse", "label": "远程数据解析中"},
+    "s3_parse": {"stage": "s3_parse", "label": "远程数据解析中"},
+    "s3a_materialize": {"stage": "s3_parse", "label": "远程数据解析中"},
     "s3b_translate": {"stage": "s3b_translate", "label": "MCAP 解析/translate 中"},
     "s5_alignment": {"stage": "s5_alignment", "label": "帧对齐中"},
     "s6_report": {"stage": "s6_report", "label": "RCA 报告生成中"},
@@ -206,21 +222,25 @@ def _missing_reason(contract: dict[str, Any], report_truth: dict[str, Any], log_
         return "需补正向触发帧 frame_id（必须大于 0）或人工指定关键帧后继续 RCA。"
     if kind == "keyframe":
         return "自动找帧无候选；需人工指定关键帧或确认采集信号后继续 RCA。"
-    if "pdcl" in log_text.lower() or "ready_to_download" in log_text.lower() or "need_evidence" in log_text.lower():
-        return "需补充有效的问题数据地址/PDCL 下载命令或等价证据，补齐后再继续 RCA。"
-    return "需补充问题数据/证据后继续 RCA。"
+    if LEGACY_DATA_ACCESS_RE.search(log_text):
+        return REMOTE_REFERENCE_GUIDANCE
+    return REMOTE_EVIDENCE_GUIDANCE
 
 
 def _humanize_reason(text: str, *, kind: str = "") -> str:
     low = text.lower()
     if kind == "frame" or "invalid_frame_id" in low or "frame_id" in low:
         return "需补正向触发帧 frame_id（必须大于 0）或人工指定关键帧后继续 RCA。"
-    if "missing_or_invalid_pdcl" in low or "invalid pdcl" in low or "pdcl" in low:
-        return "需补充有效的问题数据地址/PDCL 下载命令或等价证据，补齐后再继续 RCA。"
-    if "need_evidence" in low or "need_source_or_evidence" in low:
-        return "需补充问题数据/证据后继续 RCA。"
     if "task_timeout" in low or "timeout" in low:
         return "执行超时，需工程侧检查后重试或转人工处理。"
+    if (
+        "missing_remote_data_reference" in low
+        or "invalid_remote_data_reference" in low
+        or LEGACY_DATA_ACCESS_RE.search(text)
+    ):
+        return REMOTE_REFERENCE_GUIDANCE
+    if "need_evidence" in low or "need_source_or_evidence" in low:
+        return REMOTE_EVIDENCE_GUIDANCE
     return text[:300]
 
 
@@ -249,10 +269,14 @@ def _pipeline_fix_reason(contract: dict[str, Any], report_truth: dict[str, Any],
     retryable = _lower(blocker.get("retryable"))
     if fault_class in PIPELINE_FIX_CLASSES or kind in PIPELINE_FIX_KINDS:
         msg = _first(blocker.get("message"), report_truth.get("blocker_message"), report_truth.get("failure_reason"), contract.get("failure_reason"), limit=220)
+        if LEGACY_DATA_ACCESS_RE.search(msg):
+            msg = "历史数据访问状态已映射为远程读取；系统不执行 MDI 下载"
         label = kind or fault_class or "pipeline_fix"
         return f"工程侧解析/对齐链路异常（{label}）" + (f"：{msg}" if msg else "；数据已就位，无需发起人补数据。")
     if kind and retryable == "true" and not NEED_EVIDENCE_RE.search(kind):
         msg = _first(blocker.get("message"), limit=220)
+        if LEGACY_DATA_ACCESS_RE.search(msg):
+            msg = "历史数据访问状态已映射为远程读取；系统不执行 MDI 下载"
         return f"工程侧可重试链路异常（{kind}）" + (f"：{msg}" if msg else "；数据已就位，无需发起人补数据。")
     if "reader_topic_mismatch" in log_all or "alignment_failed" in log_all:
         return "工程侧解析/对齐链路异常；数据已就位，无需发起人补数据。"
@@ -293,6 +317,8 @@ def _pipeline_stage_label(contract: dict[str, Any], report_truth: dict[str, Any]
                 ])
         explicit = _first(*explicit_candidates, limit=80)
         if explicit:
+            if LEGACY_DATA_ACCESS_RE.search(explicit):
+                return "远程读取问题数据中（历史阶段兼容）"
             return explicit
         if stage in PIPELINE_STAGE_LABELS:
             return PIPELINE_STAGE_LABELS[stage]
@@ -335,7 +361,12 @@ def _semantic_milestones(lane: str, *, created_at: str = "", updated_at: str = "
     elif lane == "pipeline_fix":
         labels.append((updated_at, "工程侧解析/对齐链路修复中，数据无需补传"))
     elif report_status:
-        safe_status = "工程侧待修复" if report_status == "need_pipeline_fix" else report_status
+        safe_status = {
+            "need_pipeline_fix": "工程侧待修复",
+            "need_download": "待补充远程引用/证据",
+            "need_user_data": "待补充远程引用/证据",
+            "need_evidence": "待补充远程引用/证据",
+        }.get(report_status, report_status)
         labels.append((updated_at, f"报告状态确认：{safe_status}"))
     seen: set[str] = set()
     out: list[dict[str, str]] = []
@@ -409,7 +440,7 @@ def derive_presentation(
             lane="pipeline_fix", user_state="in_progress", status_line=pipeline_fix_reason,
             conclusion=pipeline_fix_reason, diagnostic_state="工程侧修复中", human_action_kind="none", action_category="none",
             requires_user_input=False, missing_reason="", report_status="need_pipeline_fix",
-            cifs_status="暂无报告；数据已下载，工程侧修复解析/对齐链路后继续 RCA", artifact_label="产物目录(暂无报告)",
+            cifs_status="暂无报告；工程侧修复远程读取/解析链路后继续 RCA（不执行 MDI 下载）", artifact_label="产物目录(暂无报告)",
             blocker=pipeline_fix_reason,
             milestones=_semantic_milestones("pipeline_fix", created_at=created_at, updated_at=updated_at, report_status="need_pipeline_fix"),
         )
@@ -440,13 +471,13 @@ def derive_presentation(
     )
     if awaiting_automatic_download or _is_pipeline_running(contract, report_truth, vm_progress, log_all):
         stage_label = _pipeline_stage_label(contract, report_truth, vm_progress)
-        status_line = "数据下载执行中（pipeline running）；等待解析完成后更新 RCA 状态。"
+        status_line = "正在远程读取/处理问题数据；当前尚无可交付 RCA 报告（不执行 MDI 下载）。"
         if stage_label:
-            status_line = f"{stage_label}（pipeline running）；当前尚无可交付 RCA 报告。"
+            status_line = f"{stage_label}（执行中）；当前尚无可交付 RCA 报告。"
         p = Presentation(
             lane="in_progress", user_state="in_progress", status_line=status_line,
             conclusion=status_line, diagnostic_state="执行中",
-            human_action_kind="none", action_category="none", requires_user_input=False, report_status="need_download",
+            human_action_kind="none", action_category="none", requires_user_input=False, report_status="in_progress",
             cifs_status="未落地/不适用", artifact_label="产物目录(暂无报告)", blocker="无",
             milestones=_semantic_milestones("in_progress", created_at=created_at, updated_at=updated_at),
         )
@@ -462,8 +493,8 @@ def derive_presentation(
     if need_evidence:
         reason = _missing_reason(contract, report_truth, log_all)
         p = Presentation(
-            lane="need_evidence", user_state="in_progress", status_line=f"已阻塞，需补齐数据/证据：{reason}",
-            conclusion=f"未生成 RCA 报告；{reason}待补齐后继续下载/解析与 RCA。", diagnostic_state="已阻塞，需补充/确认后继续",
+            lane="need_evidence", user_state="in_progress", status_line=f"已阻塞：{reason}",
+            conclusion=f"未生成 RCA 报告；{reason}", diagnostic_state="已阻塞，需补充/确认后继续",
             human_action_kind="need_data", action_category="hard", requires_user_input=True, missing_reason=reason,
             report_status="need_user_data", cifs_status="暂无报告；需补充数据/证据后生成 RCA 报告", artifact_label="产物目录(暂无报告)", blocker=reason,
             milestones=_semantic_milestones("need_evidence", created_at=created_at, updated_at=updated_at),
@@ -524,9 +555,18 @@ def derive_presentation(
 
 
 def no_deliverable_forbidden_hits(rendered: Any, *, has_deliverable_report: bool = False) -> list[str]:
-    """Forbidden fragments.  The old optimistic download phrase is banned in every lane."""
+    """Return stale/optimistic phrases that violate the remote-read contract."""
     text = json.dumps(rendered, ensure_ascii=False, sort_keys=True) if not isinstance(rendered, str) else rendered
-    hits = ["正在自动下载/解析"] if "正在自动下载/解析" in text else []
+    always_forbidden = (
+        "正在自动下载/解析",
+        "数据下载执行中",
+        "继续下载/解析",
+        "数据已下载",
+        "自动下载/数据管线",
+        "待下载/解析",
+        "重发问题链接，我会自动重跑",
+    )
+    hits = [fragment for fragment in always_forbidden if fragment in text]
     if has_deliverable_report:
         return hits
     forbidden = ("完成后出 RCA 结论", "成功，可从取件路径获取", "RCA 报告已生成")

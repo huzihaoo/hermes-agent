@@ -56,7 +56,10 @@ def _set_record_only_env(tmp_path: Path, monkeypatch):
 def _make_fixture_root(tmp_path: Path, monkeypatch) -> Path:
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv(pnc_vm_task_sync.FIXTURE_ISOLATION_ROOT_ENV, str(tmp_path.parent))
-    source_census = Path(__file__).resolve().parents[3] / "evidence" / "target-outbound-census"
+    source_census = Path(
+        os.getenv("HERMES_OUTBOUND_CENSUS_ROOT")
+        or Path(__file__).resolve().parents[3] / "evidence" / "target-outbound-census"
+    )
     census_root = tmp_path.parent / f"{tmp_path.name}-outbound-census"
     census_root.mkdir(mode=0o700)
     for name in ("INDEX.json", "census-v4.json"):
@@ -268,13 +271,36 @@ def test_completion_notice_uses_g1q3_l1_notice(tmp_path, monkeypatch):
     assert notice["message_id"] == "om_1"
 
 
-def test_main_dry_run_outputs_json(tmp_path, capsys):
+def test_main_dry_run_outputs_json(tmp_path, capsys, monkeypatch):
     token = set_hermes_home_override(tmp_path)
     try:
         store = TaskStore(tmp_path / "analytics" / "tasks.db")
         store.upsert(_task("task-1", vm_task_id="vm-1"))
+        receipt_path = tmp_path / "runtime" / "sync-receipt.json"
+        monkeypatch.setenv("PNC_VM_TASK_SYNC_RECEIPT_PATH", str(receipt_path))
+        monkeypatch.setattr(
+            pnc_vm_task_sync,
+            "build_process_runtime_evidence",
+            lambda **_kwargs: {
+                "pid": 321,
+                "process_create_time": 1783890000.0,
+                "started_at": "2026-07-13T00:00:00+00:00",
+                "runtime_identity": {
+                    "executable": "/runtime/.venv/bin/python",
+                    "script": "/runtime/scripts/pnc_vm_task_sync.py",
+                    "cwd": "/runtime",
+                    "script_sha256": "1" * 64,
+                    "interpreter_sha256": "2" * 64,
+                    "plist_path": "/Users/test/Library/LaunchAgents/sync.plist",
+                    "plist_sha256": "3" * 64,
+                    "program_arguments_sha256": "4" * 64,
+                    "environment_sha256": "5" * 64,
+                },
+            },
+        )
         rc = pnc_vm_task_sync.main(["--dry-run", "--json"])
         out = json.loads(capsys.readouterr().out)
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     finally:
         reset_hermes_home_override(token)
 
@@ -282,6 +308,15 @@ def test_main_dry_run_outputs_json(tmp_path, capsys):
     assert out["dry_run"] is True
     assert out["candidate_count"] == 1
     assert out["rows"][0]["vm_task_id"] == "vm-1"
+    assert receipt_path.stat().st_mode & 0o777 == 0o600
+    assert receipt["schema_version"] == "pnc_vm_task_sync_completion_v1"
+    assert receipt["service_label"] == "local.pnc.vm-task-sync"
+    assert receipt["exit_code"] == 0
+    assert receipt["ok"] is True
+    assert receipt["skipped"] is False
+    assert receipt["candidate_count"] == 1
+    assert receipt["error_count"] == 0
+    assert receipt["errors"] == []
 
 
 def test_fixture_mode_executes_projection_notice_comment_and_sidecar_without_collector(tmp_path, monkeypatch):
@@ -685,7 +720,7 @@ def test_sync_pnc_vm_tasks_publishes_nonterminal_delivery_proposal(tmp_path, mon
     assert result["ok"] is True
     assert "completion_notice" not in body
     proposal = body["vm_delivery_proposal"]
-    assert proposal["delivery"]["report_status"] == "need_download"
+    assert proposal["delivery"]["report_status"] == "in_progress"
     assert proposal["delivery_contract"]["business_state"] == "awaiting_download"
     assert proposal["chat_id"] == pnc_vm_task_sync.G1Q3_RCA_CHAT_ID
     assert proposal["thread_id"] is None
@@ -871,11 +906,10 @@ def test_g1q3_completed_task_card_prefers_rca_readback_html_and_attribution(monk
     assert "需要人工确认候选原因" in delivery["boundaries"][0]
 
 
-def test_g1q3_completed_intake_without_report_renders_need_download_not_done(tmp_path, monkeypatch):
+def test_g1q3_completed_legacy_intake_without_report_projects_remote_read_not_done(tmp_path, monkeypatch):
     # Regression (issue 7023754183): a completed G1Q3-RCA task that only passed
-    # the read-only gate (ready_to_download) has no report; this writer must
-    # render an honest need-download state so it agrees with the relay instead
-    # of re-asserting done every 120s.
+    # the historical read-only gate has no report. Its old status markers must
+    # project onto the current remote-read path instead of being shown as done.
     token = set_hermes_home_override(tmp_path)
     try:
         vm_task_id = "20260622-110137-g1q3-rca-issue-intake-7023754183"
@@ -904,14 +938,15 @@ def test_g1q3_completed_intake_without_report_renders_need_download_not_done(tmp
 
     assert card["user_state"] != "done"
     assert card["user_state"] == "in_progress"
-    assert card["delivery"]["report_status"] == "need_user_data"
+    assert card["delivery"]["report_status"] == "in_progress"
     assert "ready_to_download" in card["delivery"]["conclusion"] or "未生成 RCA 报告" in card["delivery"]["conclusion"]
+    assert "下载" not in card["delivery"]["conclusion"]
     # No fabricated clickable report link.
     assert not card["delivery"].get("artifact_path")
 
 
 def test_g1q3_completed_intake_with_real_report_still_renders_done(tmp_path, monkeypatch):
-    # Guard: the need-download path must NOT swallow genuine completed reports.
+    # Guard: the legacy projection must not swallow genuine completed reports.
     token = set_hermes_home_override(tmp_path)
     try:
         vm_task_id = "vm-real-report"
@@ -1468,7 +1503,7 @@ def test_honest_blocked_keyframe_contract_does_not_override():
     assert delivery["report_status"] == "need_keyframe"
 
 
-def test_genuine_download_in_progress_stays_optimistic():
+def test_historical_download_stage_projects_remote_read_in_progress():
     task = _task(
         "20260627-120000-g1q3-rca-issue-intake-7029488224-download",
         vm_task_id="20260627-120000-g1q3-rca-issue-intake-7029488224-download",
@@ -1484,9 +1519,11 @@ def test_genuine_download_in_progress_stays_optimistic():
 
     delivery = card["delivery"]
     assert card["user_state"] == "in_progress"
-    assert delivery["report_status"] == "need_download"
+    assert delivery["report_status"] == "in_progress"
     assert delivery["human_action_kind"] == "none"
-    assert "数据下载执行中" in delivery["conclusion"]
+    assert "远程读取问题数据中" in delivery["conclusion"]
+    assert "数据下载执行中" not in delivery["conclusion"]
+    assert "pipeline running" not in delivery["conclusion"]
     assert delivery["source"] == "delivery_contract_v1"
 
 

@@ -7,16 +7,22 @@ slice: no live Feishu calls, no worker execution, no outbound delivery.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+import hashlib
 import json
+import os
 from pathlib import Path
 import re
-from typing import Literal
+import stat
+from typing import Literal, Sequence
 
 
 G1Q3_RCA_GROUP_ID = "oc_6cfc782212009ff4cd815349909dd423"
 PNC_ALL_BUSINESS_TEST_GROUP_ID = "oc_16614f4ba25b8c88b69c0b8e9ebc2fb5"
 G1Q3_RCA_GROUP_BINDING_ID = "gb_g1q3_rca_feishu_group"
+GROUP_BINDING_RECEIPT_FILENAME_RE = re.compile(
+    r"\A\d{4}-\d{2}-\d{2}-[0-9a-f]{64}\.jsonl\Z"
+)
 
 _GIT_INTENT = re.compile(
     r"(git\s+(clone|pull|push|fetch|checkout|commit|merge|rebase|reset|branch|stash)|"
@@ -33,6 +39,66 @@ _SHELL_INTENT = re.compile(
 )
 _SELF_REF_FOLLOWUP = re.compile(
     r"(结论|报告|进展|状态|做到哪|哪一步|卡在|卡哪|为什么|为啥|跑完|跑过|怎么样了|同步|这个不就是|哪里不满足|失败)",
+    re.IGNORECASE,
+)
+_FEISHU_ISSUE_URL = re.compile(
+    r"https?://project\.feishu\.cn/[^\s/?#)]+/issue/detail/(\d+)",
+    re.IGNORECASE,
+)
+_MANUAL_NEGATED_INTENT = re.compile(
+    r"^(?:(?:请|麻烦|帮我|帮忙)\s*)?"
+    r"(?:不要|先别|无需|不用|别|暂不|暂时不要|不需要)\s*"
+    r"(?:帮我|帮忙|再)?\s*(?:分析|重跑|重新分析|再跑|debug|调试|做\s*(?:g1q3\s*)?rca)",
+    re.IGNORECASE,
+)
+_MANUAL_READ_ONLY_INTENT = re.compile(
+    r"(?:不要|请勿|无需|不用|别|不)\s*(?:执行|运行|触发|创建|建单|重跑|重新分析|分析|debug|调试)"
+    r"|(?:只|仅)\s*(?:查|查询|看)\s*(?:一下)?\s*(?:状态|进展|结果|报告)",
+    re.IGNORECASE,
+)
+_MANUAL_QUERY_INTENT = re.compile(
+    r"(?:报告|结果|结论)(?:链接)?\s*(?:在)?(?:哪|哪里|是什么)"
+    r"|(?:分析)?任务.{0,8}(?:状态|进展).{0,8}(?:如何|怎样|怎么样|到哪|是什么|呢)"
+    r"|(?:谁|由谁|是谁).{0,8}触发"
+    r"|触发.{0,8}(?:谁|何人|人员)"
+    r"|(?:状态|进展).{0,8}(?:如何|怎样|怎么样|到哪|呢)",
+    re.IGNORECASE,
+)
+_MANUAL_CONDITIONAL_INTENT = re.compile(
+    r"(?:能否|是否|可否|可不可以|要不要|需不需要)"
+    r"|(?:可以|能|需要).{0,12}(?:吗|么|？|\?)",
+    re.IGNORECASE,
+)
+_MANUAL_RERUN_INTENT = re.compile(
+    r"(?:(?:请|麻烦|帮我|帮忙|立即|尽快|赶紧)\s*)*"
+    r"(?:重跑|重新分析|再跑(?:一遍|一次)?|rerun)"
+    r"(?:\s*(?:一下)?\s*(?:(?:这个|该)\s*)?(?:问题|(?:g1q3\s*)?rca))?"
+    r"(?:\s*[，,:：;；。.!！]?\s*(?:辛苦(?:了|一下)?|谢谢(?:你)?|感谢))?",
+    re.IGNORECASE,
+)
+_MANUAL_DEBUG_INTENT = re.compile(
+    r"(?:(?:请|麻烦|帮我|帮忙|立即|尽快|赶紧)\s*)*(?:debug|调试)"
+    r"(?:\s*(?:一下)?\s*(?:(?:这个|该)\s*)?(?:问题|(?:g1q3\s*)?rca))?"
+    r"(?:\s*[，,:：;；。.!！]?\s*(?:辛苦(?:了|一下)?|谢谢(?:你)?|感谢))?",
+    re.IGNORECASE,
+)
+_MANUAL_ANALYZE_INTENT = re.compile(
+    r"(?:"
+    r"(?:(?:请|麻烦|帮我|帮忙|立即|尽快|赶紧|紧急)\s*)*"
+    r"分析(?:一下|下)?\s*(?:(?:这个|该)\s*)?问题"
+    r"|(?:(?:请|麻烦|帮我|帮忙|立即|尽快|赶紧|紧急)\s*)*分析(?:一下|下)?"
+    r"|(?:有个|有一个)?\s*紧急问题[，,:：\s]+"
+    r"(?:(?:请|麻烦|帮我|帮忙|立即|尽快|赶紧)\s*)*分析(?:一下|下)?"
+    r"|(?:这个|该)\s*问题(?:很|比较|非常)?\s*紧急[，,:：\s]+"
+    r"(?:(?:请|麻烦|帮我|帮忙|立即|尽快|赶紧)\s*)*"
+    r"分析(?:一下|下)?"
+    r"|给\s*(?:(?:这个|该)\s*)?问题\s*(?:做|跑|执行)(?:一下)?\s*(?:g1q3\s*)?rca"
+    r"|开始(?:做|跑)\s*(?:g1q3\s*)?rca"
+    r"|开始分析(?:一下|下)?(?:\s*(?:(?:这个|该)\s*)?问题)?"
+    r"|(?:做|跑|执行)(?:一下)?\s*(?:g1q3\s*)?rca"
+    r"|紧急处理\s*(?:(?:这个|该)\s*)?问题"
+    r")"
+    r"(?:\s*[，,:：;；。.!！]?\s*(?:辛苦(?:了|一下)?|谢谢(?:你)?|感谢))?",
     re.IGNORECASE,
 )
 
@@ -157,7 +223,7 @@ def _reject(reason: str, message: str) -> PncGroupBindingDecision:
 # never reaches here (already allow'd upstream in the all-business test group).
 _RCA_CLARIFY_OPTIONS: tuple[tuple[str, str], ...] = (
     ("rca_case_status_check", "查 case 状态"),
-    ("rca_issue_intake", "提交问题分析"),
+    ("rca_issue_intake", "查飞书问题状态（Kafka 自动创建）"),
     ("rca_case_evidence_summary", "证据 / 缺项查询"),
 )
 
@@ -175,7 +241,7 @@ def _mentions_g1q3_case(text: str) -> bool:
 
 def _extract_issue_work_item_id(text: str) -> str:
     body = text or ""
-    match = re.search(r"project\.feishu\.cn/[^\s)]+/issue/detail/(\d+)", body, re.IGNORECASE)
+    match = _FEISHU_ISSUE_URL.search(body)
     if match:
         return match.group(1)
     # Follow-up messages in the bound Feishu group often say only
@@ -190,6 +256,150 @@ def _extract_issue_work_item_id(text: str) -> str:
         if match:
             return match.group(1)
     return ""
+
+
+@dataclass(frozen=True)
+class _FeishuIssueIdentity:
+    project_simple_name: str
+    work_item_id: str
+    canonical_url: str
+
+
+def _extract_feishu_issue_identities(
+    text: str,
+    supplemental_urls: Sequence[str] | None = None,
+) -> tuple[_FeishuIssueIdentity, ...]:
+    """Return distinct canonical issue identities in encounter order."""
+    values = [str(text or "")]
+    if supplemental_urls is not None and not isinstance(supplemental_urls, (str, bytes)):
+        values.extend(str(value or "") for value in supplemental_urls)
+
+    identities: list[_FeishuIssueIdentity] = []
+    seen: set[tuple[str, str]] = set()
+    for value in values:
+        for match in _FEISHU_ISSUE_URL.finditer(value):
+            matched_url = match.group(0).rstrip("/")
+            path = re.sub(
+                r"^https?://project\.feishu\.cn/",
+                "",
+                matched_url,
+                flags=re.IGNORECASE,
+            )
+            project_simple_name = path.split("/", 1)[0].strip().lower()
+            work_item_id = match.group(1)
+            identity_key = (project_simple_name, work_item_id)
+            if not project_simple_name or identity_key in seen:
+                continue
+            seen.add(identity_key)
+            identities.append(
+                _FeishuIssueIdentity(
+                    project_simple_name=project_simple_name,
+                    work_item_id=work_item_id,
+                    canonical_url=(
+                        "https://project.feishu.cn/"
+                        f"{project_simple_name}/issue/detail/{work_item_id}"
+                    ),
+                )
+            )
+    return tuple(identities)
+
+
+def _extract_feishu_issue_url_work_item_id(text: str) -> str:
+    """Extract only an explicit Feishu Project issue URL identity.
+
+    This intentionally excludes bare issue numbers. Explicit links are routed
+    into RCA policy on any Feishu surface; only a command-prefix request in a
+    fixed group may later enter manual admission. Legacy number-only handling
+    remains scoped to the two existing G1Q3 chats.
+    """
+    identities = _extract_feishu_issue_identities(text or "")
+    return identities[0].work_item_id if len(identities) == 1 else ""
+
+
+def _extract_feishu_issue_url(text: str) -> str:
+    identities = _extract_feishu_issue_identities(text or "")
+    return identities[0].canonical_url if len(identities) == 1 else ""
+
+
+def _manual_command_scope(
+    text: str,
+    *,
+    external_identity: bool = False,
+    strip_directed_mention: bool = False,
+) -> tuple[str, ...]:
+    body = text or ""
+    issue_match = _FEISHU_ISSUE_URL.search(body)
+    if issue_match is None and not external_identity:
+        return ()
+    # The whole current-message text is authored command scope. Rich-card and
+    # reply identities arrive separately through supplemental metadata; only
+    # their identity is consumed, never their body or action words.
+    scope = re.sub(
+        r"https?://project\.feishu\.cn/[^\s/?#)]+/issue/detail/\d+(?:[?#][^\s]*)?",
+        "",
+        body,
+        flags=re.IGNORECASE,
+    )
+    scope = re.sub(
+        r"\[Mentioned:[^\]]*\]",
+        "",
+        scope,
+        flags=re.IGNORECASE,
+    )
+    command_lines: list[str] = []
+    directed_mention_consumed = False
+    for line in scope.splitlines() or (scope,):
+        command_text = line.strip()
+        if strip_directed_mention and not directed_mention_consumed and command_text:
+            if command_text.startswith("@"):
+                command_text = re.sub(
+                    r"^\s*@[^\s，,:：]+[\s，,:：]*",
+                    "",
+                    command_text,
+                    count=1,
+                ).strip()
+                directed_mention_consumed = True
+        command_text = command_text.strip("，,:：;；。.!！?？ ")
+        if command_text:
+            command_lines.append(command_text)
+    return tuple(command_lines)
+
+
+def _manual_command_clause(text: str) -> str:
+    """Backward-compatible flattened view used by older policy callers."""
+    return "，".join(_manual_command_scope(text))
+
+
+def _manual_trigger_mode(
+    text: str,
+    *,
+    external_identity: bool = False,
+    strip_directed_mention: bool = False,
+) -> str:
+    command_lines = _manual_command_scope(
+        text,
+        external_identity=external_identity,
+        strip_directed_mention=strip_directed_mention,
+    )
+    if not command_lines:
+        return ""
+    command_text = "，".join(command_lines)
+    if (
+        _MANUAL_NEGATED_INTENT.match(command_text)
+        or _MANUAL_READ_ONLY_INTENT.search(command_text)
+        or _MANUAL_QUERY_INTENT.search(command_text)
+        or _MANUAL_CONDITIONAL_INTENT.search(command_text)
+    ):
+        return ""
+    modes: set[str] = set()
+    for candidate in (command_text, *command_lines):
+        if _MANUAL_DEBUG_INTENT.fullmatch(candidate):
+            modes.add("debug")
+        if _MANUAL_RERUN_INTENT.fullmatch(candidate):
+            modes.add("rerun")
+        if _MANUAL_ANALYZE_INTENT.fullmatch(candidate):
+            modes.add("run_or_join")
+    return next(iter(modes)) if len(modes) == 1 else ""
 
 
 def _looks_like_feishu_issue_card(text: str) -> bool:
@@ -248,6 +458,54 @@ def _specific_rejection_reason(text: str) -> tuple[str, str] | None:
     return None
 
 
+def pnc_group_binding_receipt_filename(
+    *,
+    receipt_date: date,
+    platform: object,
+    chat_id: object,
+    user_id: object,
+    message_id: object,
+) -> str:
+    """Return the canonical immutable receipt filename for one source event."""
+    if isinstance(receipt_date, datetime) or not isinstance(receipt_date, date):
+        raise ValueError("receipt_date must be a date")
+    identity = {
+        "chat_id": _normalize(chat_id),
+        "message_id": _normalize(message_id),
+        "platform": str(getattr(platform, "value", platform) or ""),
+        "requester_id": _normalize(user_id),
+        "schema_version": "pnc_group_binding_receipt_identity_v1",
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            identity,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return f"{receipt_date.isoformat()}-{digest}.jsonl"
+
+
+def pnc_group_binding_receipt_path(
+    *,
+    receipt_dir: str | Path,
+    receipt_date: date,
+    platform: object,
+    chat_id: object,
+    user_id: object,
+    message_id: object,
+) -> Path:
+    """Return the canonical per-event path without touching the filesystem."""
+    return Path(receipt_dir).expanduser() / pnc_group_binding_receipt_filename(
+        receipt_date=receipt_date,
+        platform=platform,
+        chat_id=chat_id,
+        user_id=user_id,
+        message_id=message_id,
+    )
+
+
 def write_pnc_group_binding_receipt(
     *,
     receipt_dir: str | Path,
@@ -256,12 +514,30 @@ def write_pnc_group_binding_receipt(
     chat_id: object,
     user_id: object,
     message_id: object,
+    manual_authorization: dict | None = None,
+    gateway_runtime_identity: dict | None = None,
 ) -> Path:
-    """Append a privacy-light JSONL receipt for a PNC group-binding decision."""
-    out_dir = Path(receipt_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    """Create one immutable privacy-light JSONL receipt for a source event."""
+    out_dir = Path(receipt_dir).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    resolved_dir = out_dir.resolve(strict=True)
+    if resolved_dir != Path(os.path.abspath(out_dir)):
+        raise OSError("group binding receipt directory must not traverse symlinks")
+    directory_info = os.lstat(resolved_dir)
+    if (
+        not stat.S_ISDIR(directory_info.st_mode)
+        or directory_info.st_uid != os.getuid()
+    ):
+        raise OSError("group binding receipt directory is not owner-controlled")
     now = datetime.now(timezone.utc)
-    path = out_dir / f"{now.date().isoformat()}.jsonl"
+    filename = pnc_group_binding_receipt_filename(
+        receipt_date=now.date(),
+        platform=platform,
+        chat_id=chat_id,
+        user_id=user_id,
+        message_id=message_id,
+    )
+    path = resolved_dir / filename
     record = {
         "event_type": "group_binding_decision",
         "timestamp": now.isoformat(),
@@ -280,9 +556,89 @@ def write_pnc_group_binding_receipt(
         "requester": _normalize(user_id),
         "message_id": _normalize(message_id),
         "decision_snapshot": asdict(decision),
+        "manual_authorization": (
+            dict(manual_authorization)
+            if isinstance(manual_authorization, dict)
+            else None
+        ),
+        "gateway_runtime_identity": (
+            dict(gateway_runtime_identity)
+            if isinstance(gateway_runtime_identity, dict)
+            else None
+        ),
     }
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    payload = (
+        json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    directory_descriptor = os.open(
+        resolved_dir,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    descriptor = -1
+    try:
+        opened_directory = os.fstat(directory_descriptor)
+        if (
+            not stat.S_ISDIR(opened_directory.st_mode)
+            or opened_directory.st_dev != directory_info.st_dev
+            or opened_directory.st_ino != directory_info.st_ino
+            or opened_directory.st_uid != os.getuid()
+        ):
+            raise OSError("group binding receipt directory changed during open")
+        os.fchmod(directory_descriptor, 0o700)
+        opened_directory = os.fstat(directory_descriptor)
+        if stat.S_IMODE(opened_directory.st_mode) != 0o700:
+            raise OSError("group binding receipt directory is not private")
+        descriptor = os.open(
+            filename,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory_descriptor,
+        )
+        file_info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(file_info.st_mode)
+            or file_info.st_uid != os.getuid()
+            or file_info.st_nlink != 1
+        ):
+            raise OSError("group binding receipt file is not owner-controlled")
+        os.fchmod(descriptor, 0o600)
+        written = 0
+        while written < len(payload):
+            count = os.write(descriptor, payload[written:])
+            if count <= 0:
+                raise OSError("group binding receipt write was incomplete")
+            written += count
+        final_file_info = os.fstat(descriptor)
+        if (
+            final_file_info.st_dev != file_info.st_dev
+            or final_file_info.st_ino != file_info.st_ino
+            or final_file_info.st_uid != os.getuid()
+            or final_file_info.st_nlink != 1
+            or final_file_info.st_size != len(payload)
+            or stat.S_IMODE(final_file_info.st_mode) != 0o600
+        ):
+            raise OSError("group binding receipt file changed during write")
+        os.fsync(descriptor)
+        os.fsync(directory_descriptor)
+        final_directory = os.lstat(resolved_dir)
+        if (
+            final_directory.st_dev != opened_directory.st_dev
+            or final_directory.st_ino != opened_directory.st_ino
+            or final_directory.st_uid != os.getuid()
+            or stat.S_IMODE(final_directory.st_mode) != 0o700
+        ):
+            raise OSError("group binding receipt directory changed during write")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(directory_descriptor)
     return path
 
 
@@ -342,17 +698,114 @@ def evaluate_pnc_group_request(
     chat_id: object,
     text: str,
     active_thread_case: dict | None = None,
+    issue_link_urls: Sequence[str] | None = None,
+    reply_to_text: str | None = None,
+    manual_mention_directed: bool | None = None,
 ) -> PncGroupBindingDecision:
     """Evaluate a request against G1Q3 RCA Feishu business surfaces.
 
-    The dedicated G1Q3-RCA group remains strictly bound to this business.  The
-    shared PNC test group can exercise all business lines, so it enters the
-    G1Q3 policy only when the message carries a clear G1Q3/RCA/issue signal;
-    unrelated business prompts are allowed to continue to their own adapters.
+    An explicit Feishu Project issue URL is read-only by default. In the two
+    fixed RCA groups only, a command-prefix action can enter the durable manual
+    control plane; authorization and real-mention checks happen at the gateway
+    boundary. Number-only and case-only handling remains scoped below.
     """
     if not _is_feishu(platform):
         return PncGroupBindingDecision(decision="allow")
     normalized_chat_id = _normalize(chat_id)
+    bound_chat = normalized_chat_id in {
+        G1Q3_RCA_GROUP_ID,
+        PNC_ALL_BUSINESS_TEST_GROUP_ID,
+    }
+    current_identities = _extract_feishu_issue_identities(
+        text or "",
+        supplemental_urls=issue_link_urls,
+    )
+    reply_identities = (
+        _extract_feishu_issue_identities(reply_to_text)
+        if reply_to_text
+        else ()
+    )
+    identities_by_key: dict[tuple[str, str], _FeishuIssueIdentity] = {}
+    for identity in (*current_identities, *reply_identities):
+        identities_by_key.setdefault(
+            (identity.project_simple_name, identity.work_item_id), identity
+        )
+    identities = tuple(identities_by_key.values())
+    identity_source = "message" if current_identities else "reply"
+    if len(identities) > 1:
+        return _bound_decision(
+            decision="clarify",
+            template_id="rca_issue_intake",
+            reason="ambiguous_issue_identity",
+            user_message=(
+                "检测到多个不同的飞书问题单，本次不会创建、重跑或查询任务。"
+                "请仅保留一个完整问题链接后重新 @ 小助手。"
+            ),
+            route_surface="rca_issue_identity_clarify",
+            risk_gate="exactly_one_issue_identity",
+        )
+    issue_identity = identities[0] if identities else None
+    issue_url = issue_identity.canonical_url if issue_identity else ""
+    issue_url_work_item_id = issue_identity.work_item_id if issue_identity else ""
+    manual_mode = (
+        _manual_trigger_mode(
+            text or "",
+            external_identity=bool(issue_identity and not _FEISHU_ISSUE_URL.search(text or "")),
+            strip_directed_mention=manual_mention_directed is True,
+        )
+        if bound_chat and issue_url
+        else ""
+    )
+    if manual_mode and manual_mention_directed is not True:
+        manual_mode = ""
+    if manual_mode:
+        specific_rejection = _specific_rejection_reason(text or "")
+        if specific_rejection is not None:
+            reason, message = specific_rejection
+            return _reject(reason, message)
+        return _bound_decision(
+            decision="accepted",
+            template_id="rca_issue_intake",
+            reason="manual_explicit_issue_action",
+            user_message="G1Q3 RCA manual request accepted for durable admission.",
+            route_surface="rca_manual_intake",
+            risk_gate="manual_intake_control_store",
+            handoff_contract={
+                "contract_version": "g1q3_rca_manual_trigger_v1",
+                "case_id": "",
+                "work_item_id": issue_url_work_item_id,
+                "issue_url": issue_url,
+                "project_simple_name": issue_identity.project_simple_name,
+                "issue_identity_source": identity_source,
+                "mode": manual_mode,
+                "source_kind": "feishu_group_manual",
+                "group_response_cap": "L1",
+            },
+        )
+    if issue_url_work_item_id:
+        return _bound_decision(
+            decision="accepted",
+            template_id="rca_case_status_check",
+            reason="kafka_only_issue_lookup",
+            user_message=(
+                "当前消息仅查询已有 RCA 任务状态，不会创建或重跑。"
+                "手工运行只接受固定 RCA 群内真实 @ 机器人、明确动作和完整问题链接。"
+            ),
+            route_surface="rca_kafka_issue_status",
+            risk_gate="kafka_only_read_only",
+            handoff_contract={
+                "contract_version": "g1q3_rca_kafka_issue_status_v1",
+                "case_id": "",
+                "work_item_id": issue_url_work_item_id,
+                "issue_url": issue_url,
+                "project_simple_name": issue_identity.project_simple_name,
+                "issue_identity_source": identity_source,
+                "source_kind": "feishu_issue_url",
+                "intake": "kafka_workflow_event",
+                "read_only": True,
+                "group_response_cap": "L1",
+            },
+        )
     if normalized_chat_id == G1Q3_RCA_GROUP_ID:
         pass
     elif _is_all_business_test_group(normalized_chat_id):
@@ -381,18 +834,17 @@ def evaluate_pnc_group_request(
         return _bound_decision(
             decision="accepted",
             template_id="rca_case_status_check",
-            reason=None,
-            user_message="G1Q3 RCA thread follow-up accepted for governed shared-state status handoff.",
-            route_surface="rca_case_status_check",
-            risk_gate="execution_layer",
+            reason="kafka_only_read_only_status",
+            user_message="G1Q3 RCA thread follow-up accepted for read-only status lookup.",
+            route_surface="rca_kafka_read_only_status",
+            risk_gate="kafka_only_read_only",
             handoff_contract={
-                "contract_version": "g1q3_rca_group_handoff_v2",
+                "contract_version": "g1q3_rca_kafka_status_v1",
                 "case_id": case_id,
                 "work_item_id": work_item_id,
                 "source_task_id": task_id,
-                "resource_class": "pnc_data",
-                "lane": "standard",
-                "artifact_root_policy": "/mnt/tmp/<task_id>/",
+                "read_only": True,
+                "intake": "kafka_workflow_event",
                 "group_response_cap": "L1",
             },
         )
@@ -415,20 +867,41 @@ def evaluate_pnc_group_request(
                 route_surface="report_generation_deferred",
                 risk_gate="template_not_enabled_for_real_handoff",
             )
+        read_only_status = template_id in {
+            "rca_case_status_check",
+            "rca_case_evidence_summary",
+        }
         return _bound_decision(
             decision="accepted",
             template_id=template_id,
-            reason=None,
-            user_message="G1Q3 RCA intake request accepted for governed shared-state handoff.",
-            route_surface=template_id,
-            risk_gate="execution_layer",
+            reason=("kafka_only_read_only_status" if read_only_status else None),
+            user_message=(
+                "G1Q3 RCA request accepted for read-only Kafka status lookup."
+                if read_only_status
+                else (
+                    "Legacy chat intake will not create a task; use Kafka automatic "
+                    "intake or the authorized fixed-group manual control plane."
+                )
+            ),
+            route_surface=("rca_kafka_read_only_status" if read_only_status else template_id),
+            risk_gate=("kafka_only_read_only" if read_only_status else "execution_layer"),
             handoff_contract={
-                "contract_version": "g1q3_rca_group_handoff_v2",
+                "contract_version": (
+                    "g1q3_rca_kafka_status_v1"
+                    if read_only_status
+                    else "g1q3_rca_group_handoff_v2"
+                ),
                 "case_id": case_id,
                 "work_item_id": work_item_id,
-                "resource_class": "pnc_data",
-                "lane": "standard",
-                "artifact_root_policy": "/mnt/tmp/<task_id>/",
+                **(
+                    {"read_only": True, "intake": "kafka_workflow_event"}
+                    if read_only_status
+                    else {
+                        "resource_class": "pnc_data",
+                        "lane": "standard",
+                        "artifact_root_policy": "/mnt/tmp/<task_id>/",
+                    }
+                ),
                 "group_response_cap": "L1",
             },
         )

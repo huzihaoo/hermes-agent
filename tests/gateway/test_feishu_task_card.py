@@ -193,8 +193,8 @@ def test_g1q3_delivery_section_uses_user_readable_status_and_clean_paths():
             "attribution_status": "hypothesis_ready",
             "report_status": "html_delivery_ready",
             "candidate_cause": "候选因果判断：实际减速度相对 OOI 加速度偏重，建议由 控制 继续核查。；",
-            "input_original": "飞书问题 7026726390 + mdi download event -u abc -s ./",
-            "input_resolved": "mdi download event -u abc -s ./",
+            "input_original": "飞书问题 7026726390 + mdi clip -u abc -s ./",
+            "input_resolved": "mdi refresh2 -u abc -s ./",
             "artifact_vm": "/mnt/tmp/g1q3/",
             "artifact_cifs": "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/g1q3/",
             "cifs_status": "success",
@@ -207,11 +207,44 @@ def test_g1q3_delivery_section_uses_user_readable_status_and_clean_paths():
     assert "候选原因：实际减速度相对 OOI 加速度偏重，建议由控制继续核查" in text
     assert "候选原因：候选因果判断" not in text
     assert "。；" not in text
-    assert "📥 输入：飞书问题 7026726390 + mdi download event -u abc -s ./ → 实际读取：mdi download event -u abc -s ./" in text
+    assert "📥 输入：远程读取引用（不执行 MDI 下载）" in text
+    assert "mdi clip" not in text
+    assert "mdi refresh2" not in text
     assert "HTML 报告路径" not in text
     assert "shared-state" not in text
     assert "html_delivery_ready" not in text
     assert "hypothesis_ready" not in text
+
+
+def test_legacy_download_statuses_never_promise_automatic_download():
+    card = render_task_card({
+        "user_state": "running",
+        "milestones": [{"ts": "", "label": "gate=ready_to_download"}],
+        "delivery": {
+            "conclusion": "等待旧状态迁移",
+            "report_status": "need_download",
+        },
+    })
+    text = _dump(card)
+    assert "报告状态：待补充数据/证据" in text
+    assert "ready_to_download" not in text
+    assert "自动下载" not in text
+    assert "等待下载" not in text
+
+
+def test_legacy_mdi_command_is_neutralized_in_non_input_card_fields():
+    card = render_task_card({
+        "user_state": "awaiting_user",
+        "delivery": {
+            "conclusion": "请运行 mdi event -u opaque -s ./ 后继续",
+            "report_status": "need_user_data",
+        },
+    })
+
+    text = _dump(card)
+    assert "历史数据地址已转换为远程读取引用" in text
+    assert "mdi event" not in text.lower()
+    assert "opaque" not in text
 
 
 def test_http_artifact_keeps_open_html_report_label():

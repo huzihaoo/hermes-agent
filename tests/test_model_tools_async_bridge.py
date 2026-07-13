@@ -13,6 +13,7 @@ The fix replaces asyncio.run() with a persistent event loop in _run_async().
 import asyncio
 import json
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -82,6 +83,23 @@ class TestRunAsyncLoopLifecycle:
         loop2 = _run_async(_get_current_loop())
         assert loop2 is loop, "Loop changed between calls"
         assert not loop.is_closed(), "Loop closed before second call"
+
+    def test_explicit_timeout_cancels_main_thread_coroutine(self):
+        from model_tools import _run_async
+
+        cancelled = threading.Event()
+
+        async def _slow():
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        with pytest.raises(TimeoutError):
+            _run_async(_slow(), timeout_seconds=0.01)
+
+        assert cancelled.is_set()
 
 
 class TestRunAsyncWorkerThread:
@@ -178,6 +196,92 @@ class TestRunAsyncWorkerThread:
             "cross-thread contention on the event loop"
         )
 
+    def test_explicit_timeout_cancels_worker_thread_coroutine(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from model_tools import _run_async
+
+        cancelled = threading.Event()
+
+        async def _slow():
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        def _run():
+            with pytest.raises(TimeoutError):
+                _run_async(_slow(), timeout_seconds=0.01)
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(_run).result(timeout=2)
+
+        assert cancelled.is_set()
+
+
+def test_handle_function_call_scopes_explicit_async_timeout(monkeypatch):
+    import model_tools
+
+    cancelled = threading.Event()
+
+    async def _slow():
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    def dispatch(*_args, **_kwargs):
+        try:
+            return model_tools._run_async(_slow())
+        except Exception as exc:
+            return json.dumps({"error": type(exc).__name__})
+
+    monkeypatch.setattr(model_tools.registry, "dispatch", dispatch)
+
+    result = json.loads(
+        model_tools.handle_function_call(
+            "bounded_test_tool",
+            {},
+            skip_pre_tool_call_hook=True,
+            execution_timeout_seconds=0.01,
+        )
+    )
+
+    assert "TimeoutError" in result["error"]
+    assert cancelled.is_set()
+    assert model_tools._async_bridge_timeout_seconds.get() is None
+
+
+def test_handle_function_call_interrupts_sync_mcp_proxy_on_timeout(monkeypatch):
+    import model_tools
+    from tools.interrupt import is_interrupted
+
+    cancelled = threading.Event()
+
+    def dispatch(*_args, **_kwargs):
+        while not is_interrupted():
+            time.sleep(0.001)
+        cancelled.set()
+        return json.dumps({"error": "interrupted"})
+
+    monkeypatch.setattr(model_tools.registry, "dispatch", dispatch)
+
+    started_at = time.monotonic()
+    result = json.loads(
+        model_tools.handle_function_call(
+            "mcp_bounded_test_tool",
+            {},
+            skip_pre_tool_call_hook=True,
+            execution_timeout_seconds=0.01,
+        )
+    )
+
+    assert time.monotonic() - started_at < 0.5
+    assert "timed out" in result["error"]
+    assert cancelled.wait(timeout=0.5)
+    assert model_tools._async_bridge_timeout_seconds.get() is None
+
 
 class TestRunAsyncWithRunningLoop:
     """When a loop is already running, _run_async falls back to a thread."""
@@ -254,8 +358,12 @@ class TestRunAsyncWithRunningLoop:
             FakeExecutor,
         )
 
-        with pytest.raises(concurrent.futures.TimeoutError):
-            _run_async(_never_finishes())
+        coroutine = _never_finishes()
+        try:
+            with pytest.raises(concurrent.futures.TimeoutError):
+                _run_async(coroutine)
+        finally:
+            coroutine.close()
 
         assert events["result_timeout"] == 300
         # The worker wrapper creates its own event loop so _run_async can

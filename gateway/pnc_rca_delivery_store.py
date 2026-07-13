@@ -1,0 +1,4707 @@
+"""Durable execution watches and delivery records for Kafka-triggered RCA."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+import hashlib
+import json
+from pathlib import Path
+import sqlite3
+import stat
+from typing import Any, Mapping
+import uuid
+
+from gateway.pnc_rca_delivery_contract import (
+    DELIVERY_EFFECT_KIND,
+    DELIVERY_THREAD_EFFECT_KIND,
+    DeliveryContractError,
+    VerifiedDelivery,
+    VerifiedTerminalDelivery,
+    build_terminal_delivery,
+    build_terminal_thread_reply_effect,
+    build_thread_reply_effect,
+    validate_delivery_subscription_target,
+)
+from gateway.pnc_rca_runtime_transition import (
+    ensure_host_runtime_transition_schema,
+    insert_host_runtime_transition,
+    validate_host_runtime_transition_schema,
+)
+
+
+DELIVERY_STORE_SCHEMA_VERSION = "pnc_rca_delivery_store_v6"
+DELIVERY_BACKPRESSURE_SNAPSHOT_SCHEMA_VERSION = (
+    "pnc_rca_delivery_backpressure_snapshot_v2"
+)
+DELIVERY_CAPACITY_SNAPSHOT_SCHEMA_VERSION = (
+    "pnc_rca_delivery_capacity_snapshot_v1"
+)
+MAX_DELIVERY_CAPACITY_CANDIDATES = 100
+MAX_DELIVERY_CAPACITY_EVIDENCE_ROWS = 33
+MAX_DELIVERY_CAPACITY_SNAPSHOT_BYTES = 2 * 1024 * 1024
+DELIVERY_OUTCOME_SLO_SCHEMA_VERSION = "pnc_rca_delivery_outcome_slo_v2"
+DELIVERY_OUTCOME_SLO_SUCCESS_STATUSES = ("delivered", "partial")
+DELIVERY_OUTCOME_SLO_FAILURE_STATUSES = ("quarantined",)
+DELIVERY_OUTCOME_SLO_WINDOWS = (
+    ("5m", 300, 3, 0.5),
+    ("15m", 900, 5, 0.4),
+    ("60m", 3600, 8, 0.3),
+)
+DELIVERY_OUTCOME_CONSECUTIVE_WINDOW_SECONDS = 3600
+DELIVERY_OUTCOME_CONSECUTIVE_FAILURE_THRESHOLD = 3
+OUTBOX_QUARANTINED_TERMINAL_STATE = "submission_quarantined"
+OUTBOX_QUARANTINED_PUBLIC_ERROR_CODE = "outbox_submission_quarantined"
+DELIVERY_WATCH_SLA_SECONDS = 86_400
+PERMANENT_FAILURE_CIRCUIT_THRESHOLD = 2
+_PERMANENT_FAILURE_STREAK_META_KEY = "permanent_failure_streak"
+_PERMANENT_FAILURE_LAST_META_KEY = "permanent_failure_last"
+SUPPORTED_DELIVERY_STORE_SCHEMA_VERSIONS = frozenset(
+    {
+        "pnc_rca_delivery_store_v1",
+        "pnc_rca_delivery_store_v2",
+        "pnc_rca_delivery_store_v3",
+        "pnc_rca_delivery_store_v4",
+        "pnc_rca_delivery_store_v5",
+        DELIVERY_STORE_SCHEMA_VERSION,
+    }
+)
+WATCH_ACTIVE_STATES = frozenset({"pending", "running"})
+WATCH_TERMINAL_STATES = frozenset(
+    {"terminal_failed", "quarantined", "delivery_created"}
+)
+DELIVERY_EFFECT_STATES = frozenset(
+    {
+        "pending",
+        "claimed",
+        "retry_wait",
+        "uncertain",
+        "succeeded",
+        "quarantined",
+        "suppressed",
+    }
+)
+DELIVERY_EFFECT_UNRESOLVED_STATES = (
+    "pending",
+    "claimed",
+    "retry_wait",
+    "uncertain",
+)
+DELIVERY_WATCH_STATES = WATCH_ACTIVE_STATES | WATCH_TERMINAL_STATES
+REQUIRED_DELIVERY_EFFECT_KINDS = (DELIVERY_EFFECT_KIND, DELIVERY_THREAD_EFFECT_KIND)
+ACTIVATION_DELIVERY_STATES = frozenset({"bounded_active", "steady_active"})
+_ACTIVATION_REQUIRED_TABLES = frozenset(
+    {
+        "rca_activation_epochs",
+        "rca_activation_budget_slots",
+        "rca_activation_admission_ledger",
+        "business_triggers",
+        "rca_outbox",
+    }
+)
+_ACTIVATION_EXECUTION_ELIGIBLE_SQL = """
+EXISTS (
+    SELECT 1
+      FROM rca_activation_epochs AS activation_epoch
+      JOIN rca_activation_admission_ledger AS activation_ledger
+        ON activation_ledger.epoch_id = activation_epoch.epoch_id
+       AND activation_ledger.ledger_id = o.activation_ledger_id
+ LEFT JOIN rca_activation_budget_slots AS activation_slot
+        ON activation_slot.epoch_id = activation_epoch.epoch_id
+       AND activation_slot.slot_kind = activation_ledger.slot_kind
+     WHERE activation_epoch.is_current = 1
+       AND activation_epoch.state IN ('bounded_active', 'steady_active')
+       AND o.activation_epoch_id = activation_epoch.epoch_id
+       AND t.activation_epoch_id = activation_epoch.epoch_id
+       AND t.activation_ledger_id = o.activation_ledger_id
+       AND activation_ledger.decision = 'admit'
+       AND activation_ledger.bound_at IS NOT NULL
+       AND activation_ledger.business_key = o.business_key
+       AND activation_ledger.submission_key = o.submission_key
+       AND activation_ledger.generation = o.generation
+       AND (
+            activation_epoch.state = 'steady_active'
+            OR (
+                activation_epoch.state = 'bounded_active'
+                AND activation_slot.consumed_ledger_id = activation_ledger.ledger_id
+            )
+       )
+)
+"""
+_ACTIVATION_CURRENT_BINDING_SQL = """
+EXISTS (
+    SELECT 1
+      FROM rca_activation_epochs AS activation_epoch
+     WHERE activation_epoch.is_current = 1
+       AND o.activation_epoch_id = activation_epoch.epoch_id
+       AND t.activation_epoch_id = activation_epoch.epoch_id
+       AND o.activation_ledger_id IS NOT NULL
+       AND t.activation_ledger_id = o.activation_ledger_id
+)
+"""
+
+
+class StaleDeliveryWatchLeaseError(RuntimeError):
+    """A watch mutation used an expired or superseded fencing token."""
+
+
+class DeliveryRecordConflictError(RuntimeError):
+    """A submission was already bound to different immutable delivery bytes."""
+
+
+class StaleDeliveryEffectLeaseError(RuntimeError):
+    """An effect mutation used an expired or superseded fencing token."""
+
+
+@dataclass(frozen=True)
+class ExecutionWatchClaim:
+    submission_key: str
+    submission_outbox_id: int
+    business_key: str
+    generation: int
+    project_key: str
+    work_item_type_key: str
+    work_item_id: str
+    task_id: str
+    state: str
+    poll_attempt: int
+    fence: int
+    lease_token: str
+    lease_owner: str
+    lease_expires_at: str
+    terminal_first_seen_at: str | None
+    submission_payload: dict[str, Any]
+    submission_result: dict[str, Any]
+    origin_source_id: str = ""
+    trigger_origin_source_id: str = ""
+
+
+@dataclass(frozen=True)
+class DeliveryCreateResult:
+    delivery_id: str
+    effect_key: str
+    created: bool
+
+
+@dataclass(frozen=True)
+class SubscriptionMaterializationResult:
+    materialized: int = 0
+    quarantined: int = 0
+
+
+@dataclass(frozen=True)
+class DeliveryEffectClaim:
+    effect_key: str
+    delivery_id: str
+    effect_kind: str
+    required: bool
+    target_key: str
+    payload: dict[str, Any]
+    payload_sha256: str
+    previous_status: str
+    attempt: int
+    fence: int
+    request_id: str
+    lease_token: str
+    lease_owner: str
+    lease_expires_at: str
+    effect_created_at: str
+    artifact_set_id: str
+    project_key: str
+    work_item_type_key: str
+    work_item_id: str
+    issue_url: str
+    report_url: str
+    manifest: dict[str, Any]
+    artifacts: list[dict[str, Any]]
+    write_phase: str = "prewrite"
+    write_started_at: str | None = None
+    reconciliation_miss_count: int = 0
+    recovery_write_count: int = 0
+    last_recovery_write_at: str | None = None
+    outcome: str = "success"
+    terminal_state: str = ""
+    terminal_error_code: str = ""
+    outcome_key: str = ""
+    business_key: str = ""
+    submission_key: str = ""
+    generation: int = 0
+
+
+@dataclass(frozen=True)
+class DeliveryEffectMutation:
+    effect_key: str
+    delivery_id: str
+    effect_status: str
+    job_status: str
+    next_attempt_at: str | None = None
+
+
+@dataclass(frozen=True)
+class DeliveryReconciliationState:
+    missing_read_count: int
+    recovery_write_count: int
+    visibility_grace_elapsed: bool
+    recovery_interval_elapsed: bool
+    recovery_eligible: bool
+    recovery_limit_exceeded: bool
+
+
+@dataclass(frozen=True)
+class DeliveryDispatcherCircuit:
+    state: str
+    reason_code: str = ""
+    reason_detail: str = ""
+    opened_at: str | None = None
+    updated_at: str = ""
+
+    @property
+    def is_open(self) -> bool:
+        return self.state == "open"
+
+
+@dataclass(frozen=True)
+class DeliveryBackpressureSnapshot:
+    schema_version: str
+    observed_at: str
+    db_path: str
+    pending: int
+    claimed: int
+    retry_wait: int
+    uncertain: int
+    unresolved_effects: int
+    untracked_completed_submissions: int
+    pending_watches: int
+    running_watches: int
+    unresolved_work: int
+    outcome_slo: dict[str, Any]
+    circuit: DeliveryDispatcherCircuit
+    circuits: dict[str, DeliveryDispatcherCircuit]
+
+    def public_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "observed_at": self.observed_at,
+            "db_path": self.db_path,
+            "effect_counts": {
+                "pending": self.pending,
+                "claimed": self.claimed,
+                "retry_wait": self.retry_wait,
+                "uncertain": self.uncertain,
+            },
+            "unresolved_effects": self.unresolved_effects,
+            "pipeline_counts": {
+                "untracked_completed_submissions": (
+                    self.untracked_completed_submissions
+                ),
+                "pending_watches": self.pending_watches,
+                "running_watches": self.running_watches,
+            },
+            "unresolved_work": self.unresolved_work,
+            "delivery_outcome_slo": self.outcome_slo,
+            "delivery_dispatcher_circuit": {
+                "state": self.circuit.state,
+                "reason_code": self.circuit.reason_code,
+                "reason_detail": self.circuit.reason_detail,
+                "opened_at": self.circuit.opened_at,
+                "updated_at": self.circuit.updated_at,
+            },
+            "delivery_dispatcher_circuits": {
+                name: {
+                    "state": item.state,
+                    "reason_code": item.reason_code,
+                    "reason_detail": item.reason_detail,
+                    "opened_at": item.opened_at,
+                    "updated_at": item.updated_at,
+                }
+                for name, item in sorted(self.circuits.items())
+            },
+        }
+
+
+@dataclass(frozen=True)
+class DeliveryCapacitySnapshot:
+    payload: dict[str, Any]
+    snapshot_sha256: str
+
+
+def _utc_datetime(value: datetime | None = None) -> datetime:
+    current = value or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        raise ValueError("datetime values must be timezone-aware")
+    return current.astimezone(timezone.utc)
+
+
+def _iso(value: datetime | None = None) -> str:
+    return _utc_datetime(value).isoformat()
+
+
+def _parse_iso(value: str) -> datetime:
+    parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("stored datetime must be timezone-aware")
+    return parsed.astimezone(timezone.utc)
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _json_object(value: Any) -> dict[str, Any]:
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def validate_delivery_outcome_slo(
+    value: Mapping[str, Any], *, expected_observed_at: str | None = None
+) -> bool:
+    """Validate the fixed outcome-SLO policy and all derived counters."""
+    expected_keys = {
+        "schema_version",
+        "observed_at",
+        "success_delivery_statuses",
+        "failure_delivery_statuses",
+        "windows",
+        "consecutive_failure_window_seconds",
+        "consecutive_failure_threshold",
+        "consecutive_failure_count",
+        "consecutive_failure_breached",
+        "contract_valid",
+        "healthy",
+    }
+    if set(value) != expected_keys:
+        raise ValueError("delivery outcome SLO fields are invalid")
+    if value.get("schema_version") != DELIVERY_OUTCOME_SLO_SCHEMA_VERSION:
+        raise ValueError("delivery outcome SLO schema is invalid")
+    observed_at = str(value.get("observed_at") or "")
+    _parse_iso(observed_at)
+    if expected_observed_at is not None and observed_at != expected_observed_at:
+        raise ValueError("delivery outcome SLO observation is inconsistent")
+    if value.get("success_delivery_statuses") != sorted(
+        DELIVERY_OUTCOME_SLO_SUCCESS_STATUSES
+    ):
+        raise ValueError("delivery outcome SLO success statuses are invalid")
+    if value.get("failure_delivery_statuses") != sorted(
+        DELIVERY_OUTCOME_SLO_FAILURE_STATUSES
+    ):
+        raise ValueError("delivery outcome SLO failure statuses are invalid")
+    windows = value.get("windows")
+    if not isinstance(windows, Mapping) or set(windows) != {
+        name for name, *_policy in DELIVERY_OUTCOME_SLO_WINDOWS
+    }:
+        raise ValueError("delivery outcome SLO windows are invalid")
+    any_window_breached = False
+    window_keys = {
+        "window_seconds",
+        "min_samples",
+        "max_failure_rate",
+        "sample_count",
+        "failure_count",
+        "failure_rate",
+        "breached",
+    }
+    for name, window_seconds, min_samples, max_failure_rate in (
+        DELIVERY_OUTCOME_SLO_WINDOWS
+    ):
+        window = windows.get(name)
+        if not isinstance(window, Mapping) or set(window) != window_keys:
+            raise ValueError("delivery outcome SLO window contract is invalid")
+        integer_values = (
+            window.get("window_seconds"),
+            window.get("min_samples"),
+            window.get("sample_count"),
+            window.get("failure_count"),
+        )
+        if any(type(item) is not int or item < 0 for item in integer_values):
+            raise ValueError("delivery outcome SLO counters are invalid")
+        if (
+            window["window_seconds"] != window_seconds
+            or window["min_samples"] != min_samples
+            or isinstance(window.get("max_failure_rate"), bool)
+            or float(window.get("max_failure_rate", -1)) != max_failure_rate
+            or window["failure_count"] > window["sample_count"]
+        ):
+            raise ValueError("delivery outcome SLO policy is invalid")
+        expected_rate = (
+            window["failure_count"] / window["sample_count"]
+            if window["sample_count"]
+            else 0.0
+        )
+        if isinstance(window.get("failure_rate"), bool) or abs(
+            float(window.get("failure_rate", -1)) - expected_rate
+        ) > 1e-12:
+            raise ValueError("delivery outcome SLO failure rate is invalid")
+        expected_breached = (
+            window["sample_count"] >= min_samples
+            and expected_rate > max_failure_rate
+        )
+        if type(window.get("breached")) is not bool or (
+            window["breached"] is not expected_breached
+        ):
+            raise ValueError("delivery outcome SLO breach state is invalid")
+        any_window_breached = any_window_breached or expected_breached
+    count = value.get("consecutive_failure_count")
+    if type(count) is not int or count < 0:
+        raise ValueError("delivery outcome consecutive failure count is invalid")
+    if (
+        value.get("consecutive_failure_window_seconds")
+        != DELIVERY_OUTCOME_CONSECUTIVE_WINDOW_SECONDS
+        or value.get("consecutive_failure_threshold")
+        != DELIVERY_OUTCOME_CONSECUTIVE_FAILURE_THRESHOLD
+    ):
+        raise ValueError("delivery outcome consecutive failure policy is invalid")
+    consecutive_breached = count >= DELIVERY_OUTCOME_CONSECUTIVE_FAILURE_THRESHOLD
+    if type(value.get("consecutive_failure_breached")) is not bool or (
+        value["consecutive_failure_breached"] is not consecutive_breached
+    ):
+        raise ValueError("delivery outcome consecutive breach state is invalid")
+    if type(value.get("contract_valid")) is not bool:
+        raise ValueError("delivery outcome contract validity is invalid")
+    expected_healthy = (
+        value["contract_valid"]
+        and not any_window_breached
+        and not consecutive_breached
+    )
+    if type(value.get("healthy")) is not bool or value["healthy"] is not expected_healthy:
+        raise ValueError("delivery outcome SLO health is invalid")
+    return expected_healthy
+
+
+class RcaDeliveryStore:
+    """Own delivery-only tables in the existing RCA control SQLite database."""
+
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        busy_timeout_ms: int = 5000,
+        require_current: bool = False,
+    ):
+        self.db_path = Path(db_path).expanduser()
+        if not isinstance(require_current, bool):
+            raise TypeError("require_current must be true or false")
+        self.require_current = require_current
+        if require_current:
+            self._validate_runtime_fences()
+            self._validate_existing_path()
+        else:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.busy_timeout_ms = max(1, int(busy_timeout_ms))
+        self._initialize()
+        if require_current:
+            self._validate_runtime_fences()
+
+    def _validate_runtime_fences(self) -> None:
+        for suffix in (".pnc-rca-maintenance", ".pnc-rca-tombstone"):
+            marker = Path(f"{self.db_path}{suffix}")
+            try:
+                observed = marker.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise RuntimeError("rca_delivery_store_runtime_fence_invalid") from exc
+            if stat.S_ISLNK(observed.st_mode) or not stat.S_ISREG(observed.st_mode):
+                raise RuntimeError("rca_delivery_store_runtime_fence_invalid")
+            raise RuntimeError("rca_delivery_store_runtime_fenced")
+
+    def _validate_existing_path(self) -> None:
+        if not self.db_path.is_absolute():
+            raise RuntimeError("rca_delivery_store_existing_path_not_absolute")
+        try:
+            observed = self.db_path.lstat()
+        except OSError as exc:
+            raise RuntimeError("rca_delivery_store_existing_path_missing") from exc
+        if (
+            stat.S_ISLNK(observed.st_mode)
+            or not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+            or observed.st_size <= 0
+        ):
+            raise RuntimeError("rca_delivery_store_existing_path_invalid")
+
+    def _connect(self) -> sqlite3.Connection:
+        if self.require_current:
+            self._validate_runtime_fences()
+        conn = sqlite3.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            isolation_level=None,
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=FULL")
+        if self.require_current:
+            try:
+                self._validate_runtime_fences()
+            except RuntimeError:
+                conn.close()
+                raise
+        return conn
+
+    @staticmethod
+    def _validate_activation_required(activation_required: bool) -> None:
+        if not isinstance(activation_required, bool):
+            raise ValueError("activation_required must be true or false")
+
+    @classmethod
+    def _activation_enforced_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        activation_required: bool,
+    ) -> bool:
+        """Fail closed once a current activation epoch exists.
+
+        ``activation_required=False`` is retained only for legacy databases that
+        have no current epoch. The decision must be made inside the caller's
+        transaction so epoch creation and delivery work have a clear order.
+        """
+        cls._validate_activation_required(activation_required)
+        if activation_required:
+            return True
+        epoch_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'rca_activation_epochs'"
+        ).fetchone()
+        if epoch_table is None:
+            return False
+        epoch_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(rca_activation_epochs)")
+        }
+        if not {"epoch_id", "state", "is_current"}.issubset(epoch_columns):
+            return True
+        return (
+            conn.execute(
+                "SELECT 1 FROM rca_activation_epochs WHERE is_current = 1 LIMIT 1"
+            ).fetchone()
+            is not None
+        )
+
+    @classmethod
+    def _activation_schema_ready(cls, conn: sqlite3.Connection) -> bool:
+        present = {
+            str(row["name"])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        if not _ACTIVATION_REQUIRED_TABLES.issubset(present):
+            return False
+        required_columns = {
+            "rca_activation_epochs": {"epoch_id", "state", "is_current"},
+            "rca_activation_budget_slots": {
+                "epoch_id",
+                "slot_kind",
+                "consumed_ledger_id",
+            },
+            "rca_activation_admission_ledger": {
+                "ledger_id",
+                "epoch_id",
+                "slot_kind",
+                "decision",
+                "bound_at",
+                "business_key",
+                "submission_key",
+                "generation",
+            },
+            "business_triggers": {"activation_epoch_id", "activation_ledger_id"},
+            "rca_outbox": {"activation_epoch_id", "activation_ledger_id"},
+        }
+        return all(
+            columns.issubset(
+                {
+                    str(row["name"])
+                    for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+            )
+            for table, columns in required_columns.items()
+        )
+
+    @classmethod
+    def _require_activation_schema(cls, conn: sqlite3.Connection) -> None:
+        if not cls._activation_schema_ready(conn):
+            raise RuntimeError("delivery_activation_schema_unavailable")
+
+    @classmethod
+    def _execution_activation_eligible_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        submission_key: str,
+    ) -> bool:
+        cls._require_activation_schema(conn)
+        return (
+            conn.execute(
+                f"""
+                SELECT 1
+                  FROM rca_execution_watch AS w
+                  JOIN rca_outbox AS o ON o.outbox_id = w.submission_outbox_id
+                  JOIN business_triggers AS t
+                    ON t.business_key = o.business_key
+                   AND t.generation = o.generation
+                 WHERE w.submission_key = ?
+                   AND {_ACTIVATION_EXECUTION_ELIGIBLE_SQL}
+                 LIMIT 1
+                """,
+                (submission_key,),
+            ).fetchone()
+            is not None
+        )
+
+    def _initialize(self) -> None:
+        marker_value = self._preflight_schema_version()
+        if self.require_current:
+            if marker_value != DELIVERY_STORE_SCHEMA_VERSION:
+                raise RuntimeError("rca_delivery_store_schema_not_current")
+            return
+        conn = self._connect()
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS rca_delivery_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS rca_execution_watch (
+                    submission_key TEXT PRIMARY KEY,
+                    submission_outbox_id INTEGER NOT NULL UNIQUE,
+                    business_key TEXT NOT NULL,
+                    generation INTEGER NOT NULL CHECK (generation >= 1),
+                    project_key TEXT NOT NULL,
+                    work_item_type_key TEXT NOT NULL,
+                    work_item_id TEXT NOT NULL,
+                    task_id TEXT UNIQUE,
+                    state TEXT NOT NULL CHECK (
+                        state IN (
+                            'pending', 'running', 'terminal_failed',
+                            'quarantined', 'delivery_created'
+                        )
+                    ),
+                    poll_attempt INTEGER NOT NULL DEFAULT 0 CHECK (poll_attempt >= 0),
+                    next_poll_at TEXT NOT NULL,
+                    last_observed_at TEXT,
+                    terminal_at TEXT,
+                    terminal_first_seen_at TEXT,
+                    fence INTEGER NOT NULL DEFAULT 0 CHECK (fence >= 0),
+                    lease_token TEXT,
+                    lease_owner TEXT,
+                    lease_expires_at TEXT,
+                    last_status_json TEXT,
+                    last_error_code TEXT NOT NULL DEFAULT '',
+                    last_error_detail TEXT NOT NULL DEFAULT '',
+                    delivery_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(business_key, generation),
+                    FOREIGN KEY(submission_outbox_id) REFERENCES rca_outbox(outbox_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS rca_delivery_jobs (
+                    delivery_id TEXT PRIMARY KEY,
+                    submission_key TEXT NOT NULL UNIQUE,
+                    business_key TEXT NOT NULL,
+                    generation INTEGER NOT NULL CHECK (generation >= 1),
+                    artifact_set_id TEXT NOT NULL UNIQUE,
+                    project_key TEXT NOT NULL,
+                    work_item_type_key TEXT NOT NULL,
+                    work_item_id TEXT NOT NULL,
+                    target_key TEXT NOT NULL,
+                    issue_url TEXT NOT NULL,
+                    report_url TEXT NOT NULL,
+                    outcome TEXT NOT NULL DEFAULT 'success',
+                    outcome_key TEXT NOT NULL DEFAULT '',
+                    terminal_state TEXT NOT NULL DEFAULT '',
+                    terminal_error_code TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL CHECK (
+                        status IN ('ready', 'partial', 'delivered', 'quarantined')
+                    ),
+                    manifest_json TEXT NOT NULL,
+                    contract_json TEXT NOT NULL,
+                    artifacts_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(submission_key)
+                        REFERENCES rca_execution_watch(submission_key)
+                );
+
+                CREATE TABLE IF NOT EXISTS rca_delivery_effects (
+                    effect_key TEXT PRIMARY KEY,
+                    delivery_id TEXT NOT NULL,
+                    effect_kind TEXT NOT NULL CHECK (
+                        effect_kind IN (
+                            'feishu_issue_comment', 'feishu_card_patch',
+                            'feishu_thread_reply', 'feishu_attachment_upload',
+                            'feishu_field_update'
+                        )
+                    ),
+                    required INTEGER NOT NULL CHECK (required IN (0, 1)),
+                    target_key TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    payload_sha256 TEXT NOT NULL,
+                    outcome TEXT NOT NULL DEFAULT 'success',
+                    write_phase TEXT NOT NULL DEFAULT 'prewrite' CHECK (
+                        write_phase IN ('prewrite', 'write_started', 'settled')
+                    ),
+                    write_started_at TEXT,
+                    reconciliation_miss_count INTEGER NOT NULL DEFAULT 0 CHECK (
+                        reconciliation_miss_count >= 0
+                    ),
+                    recovery_write_count INTEGER NOT NULL DEFAULT 0 CHECK (
+                        recovery_write_count >= 0
+                    ),
+                    last_recovery_write_at TEXT,
+                    status TEXT NOT NULL CHECK (
+                        status IN (
+                            'pending', 'claimed', 'retry_wait', 'uncertain',
+                            'succeeded', 'quarantined', 'suppressed'
+                        )
+                    ),
+                    attempt INTEGER NOT NULL DEFAULT 0 CHECK (attempt >= 0),
+                    next_attempt_at TEXT,
+                    fence INTEGER NOT NULL DEFAULT 0 CHECK (fence >= 0),
+                    lease_token TEXT,
+                    lease_owner TEXT,
+                    lease_expires_at TEXT,
+                    remote_receipt_json TEXT,
+                    last_error_code TEXT NOT NULL DEFAULT '',
+                    last_error_detail TEXT NOT NULL DEFAULT '',
+                    completed_at TEXT,
+                    quarantined_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(delivery_id, effect_kind, target_key),
+                    FOREIGN KEY(delivery_id) REFERENCES rca_delivery_jobs(delivery_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS rca_delivery_attempts (
+                    attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    effect_key TEXT NOT NULL,
+                    attempt_no INTEGER NOT NULL CHECK (attempt_no >= 1),
+                    event_seq INTEGER NOT NULL CHECK (event_seq >= 1),
+                    fence INTEGER NOT NULL CHECK (fence >= 0),
+                    request_id TEXT NOT NULL,
+                    outcome TEXT NOT NULL CHECK (
+                        outcome IN (
+                            'started', 'ack', 'nack', 'unknown',
+                            'reconciled', 'quarantined'
+                        )
+                    ),
+                    remote_id TEXT NOT NULL DEFAULT '',
+                    error_code TEXT NOT NULL DEFAULT '',
+                    detail TEXT NOT NULL DEFAULT '',
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    UNIQUE(effect_key, attempt_no, event_seq),
+                    FOREIGN KEY(effect_key) REFERENCES rca_delivery_effects(effect_key)
+                );
+
+                CREATE TABLE IF NOT EXISTS rca_delivery_dispatcher_circuit (
+                    circuit_name TEXT PRIMARY KEY,
+                    state TEXT NOT NULL CHECK (state IN ('closed', 'open')),
+                    reason_code TEXT NOT NULL DEFAULT '',
+                    reason_detail TEXT NOT NULL DEFAULT '',
+                    opened_at TEXT,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_execution_watch_due
+                    ON rca_execution_watch(state, next_poll_at, lease_expires_at);
+                CREATE INDEX IF NOT EXISTS idx_delivery_jobs_status
+                    ON rca_delivery_jobs(status, created_at);
+                CREATE INDEX IF NOT EXISTS idx_delivery_jobs_updated_at
+                    ON rca_delivery_jobs(updated_at DESC, status);
+                CREATE INDEX IF NOT EXISTS idx_delivery_effects_due
+                    ON rca_delivery_effects(status, next_attempt_at, lease_expires_at);
+                """
+            )
+            ensure_host_runtime_transition_schema(conn)
+            self._migrate_schema(conn)
+            validate_host_runtime_transition_schema(
+                conn,
+                error_prefix="incompatible_delivery_store_schema",
+            )
+            marker = conn.execute(
+                "SELECT value FROM rca_delivery_meta WHERE key = 'schema_version'"
+            ).fetchone()
+            if (
+                marker is not None
+                and str(marker["value"])
+                not in SUPPORTED_DELIVERY_STORE_SCHEMA_VERSIONS
+            ):
+                raise RuntimeError("incompatible_delivery_store_schema:version")
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_delivery_attempts_effect
+                    ON rca_delivery_attempts(effect_key, attempt_no, event_seq)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_delivery_attempts_request
+                    ON rca_delivery_attempts(request_id)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_delivery_jobs_updated_at
+                    ON rca_delivery_jobs(updated_at DESC, status)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_delivery_attempts_outcome_started
+                    ON rca_delivery_attempts(outcome, started_at)
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO rca_delivery_meta(key, value)
+                VALUES('schema_version', ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """,
+                (DELIVERY_STORE_SCHEMA_VERSION,),
+            )
+            conn.execute(
+                """
+                INSERT INTO rca_delivery_dispatcher_circuit(
+                    circuit_name, state, updated_at
+                ) VALUES('feishu_issue_comment', 'closed', ?)
+                ON CONFLICT(circuit_name) DO NOTHING
+                """,
+                (_iso(),),
+            )
+            conn.execute(
+                """
+                INSERT INTO rca_delivery_dispatcher_circuit(
+                    circuit_name, state, updated_at
+                ) VALUES('feishu_thread_reply', 'closed', ?)
+                ON CONFLICT(circuit_name) DO NOTHING
+                """,
+                (_iso(),),
+            )
+        finally:
+            conn.close()
+
+    def _preflight_schema_version(self) -> str | None:
+        if not self.db_path.is_file() or self.db_path.stat().st_size == 0:
+            return None
+        uri = f"{self.db_path.resolve().as_uri()}?mode=ro"
+        try:
+            conn = sqlite3.connect(uri, uri=True)
+            conn.row_factory = sqlite3.Row
+            table = conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'rca_delivery_meta'"
+            ).fetchone()
+            if table is None:
+                return None
+            marker = conn.execute(
+                "SELECT value FROM rca_delivery_meta WHERE key = 'schema_version'"
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise RuntimeError("incompatible_delivery_store_schema:preflight") from exc
+        finally:
+            if "conn" in locals():
+                conn.close()
+        if (
+            marker is not None
+            and str(marker["value"])
+            not in SUPPORTED_DELIVERY_STORE_SCHEMA_VERSIONS
+        ):
+            raise RuntimeError("incompatible_delivery_store_schema:version")
+        return str(marker["value"]) if marker is not None else None
+
+    @staticmethod
+    def _migrate_schema(conn: sqlite3.Connection) -> None:
+        # Serialize schema inspection and migration across resident processes.
+        initial_watch_info = list(conn.execute("PRAGMA table_info(rca_execution_watch)"))
+        relax_task_id = any(
+            str(row["name"]) == "task_id" and int(row["notnull"]) == 1
+            for row in initial_watch_info
+        )
+        if relax_task_id:
+            conn.execute("PRAGMA foreign_keys=OFF")
+            conn.execute("PRAGMA legacy_alter_table=ON")
+        conn.execute("BEGIN IMMEDIATE")
+        watch_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(rca_execution_watch)")
+        }
+        if "terminal_first_seen_at" not in watch_columns:
+            conn.execute(
+                "ALTER TABLE rca_execution_watch ADD COLUMN terminal_first_seen_at TEXT"
+            )
+        current_watch_info = list(
+            conn.execute("PRAGMA table_info(rca_execution_watch)")
+        )
+        if any(
+            str(row["name"]) == "task_id" and int(row["notnull"]) == 1
+            for row in current_watch_info
+        ):
+            conn.execute(
+                "ALTER TABLE rca_execution_watch RENAME TO rca_execution_watch_v4"
+            )
+            conn.execute(
+                """
+                CREATE TABLE rca_execution_watch (
+                    submission_key TEXT PRIMARY KEY,
+                    submission_outbox_id INTEGER NOT NULL UNIQUE,
+                    business_key TEXT NOT NULL,
+                    generation INTEGER NOT NULL CHECK (generation >= 1),
+                    project_key TEXT NOT NULL,
+                    work_item_type_key TEXT NOT NULL,
+                    work_item_id TEXT NOT NULL,
+                    task_id TEXT UNIQUE,
+                    state TEXT NOT NULL CHECK (
+                        state IN (
+                            'pending', 'running', 'terminal_failed',
+                            'quarantined', 'delivery_created'
+                        )
+                    ),
+                    poll_attempt INTEGER NOT NULL DEFAULT 0 CHECK (poll_attempt >= 0),
+                    next_poll_at TEXT NOT NULL,
+                    last_observed_at TEXT,
+                    terminal_at TEXT,
+                    terminal_first_seen_at TEXT,
+                    fence INTEGER NOT NULL DEFAULT 0 CHECK (fence >= 0),
+                    lease_token TEXT,
+                    lease_owner TEXT,
+                    lease_expires_at TEXT,
+                    last_status_json TEXT,
+                    last_error_code TEXT NOT NULL DEFAULT '',
+                    last_error_detail TEXT NOT NULL DEFAULT '',
+                    delivery_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(business_key, generation),
+                    FOREIGN KEY(submission_outbox_id) REFERENCES rca_outbox(outbox_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO rca_execution_watch(
+                    submission_key, submission_outbox_id, business_key, generation,
+                    project_key, work_item_type_key, work_item_id, task_id, state,
+                    poll_attempt, next_poll_at, last_observed_at, terminal_at,
+                    terminal_first_seen_at, fence, lease_token, lease_owner,
+                    lease_expires_at, last_status_json, last_error_code,
+                    last_error_detail, delivery_id, created_at, updated_at
+                )
+                SELECT submission_key, submission_outbox_id, business_key, generation,
+                       project_key, work_item_type_key, work_item_id, task_id, state,
+                       poll_attempt, next_poll_at, last_observed_at, terminal_at,
+                       terminal_first_seen_at, fence, lease_token, lease_owner,
+                       lease_expires_at, last_status_json, last_error_code,
+                       last_error_detail, delivery_id, created_at, updated_at
+                  FROM rca_execution_watch_v4
+                """
+            )
+            conn.execute("DROP TABLE rca_execution_watch_v4")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_execution_watch_due "
+                "ON rca_execution_watch(state, next_poll_at, lease_expires_at)"
+            )
+
+        job_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(rca_delivery_jobs)")
+        }
+        for name, definition in {
+            "outcome": "TEXT NOT NULL DEFAULT 'success'",
+            "outcome_key": "TEXT NOT NULL DEFAULT ''",
+            "terminal_state": "TEXT NOT NULL DEFAULT ''",
+            "terminal_error_code": "TEXT NOT NULL DEFAULT ''",
+        }.items():
+            if name not in job_columns:
+                conn.execute(
+                    f"ALTER TABLE rca_delivery_jobs ADD COLUMN {name} {definition}"
+                )
+
+        effect_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(rca_delivery_effects)")
+        }
+        if "outcome" not in effect_columns:
+            conn.execute(
+                "ALTER TABLE rca_delivery_effects "
+                "ADD COLUMN outcome TEXT NOT NULL DEFAULT 'success'"
+            )
+        if "write_phase" not in effect_columns:
+            conn.execute(
+                "ALTER TABLE rca_delivery_effects ADD COLUMN write_phase TEXT "
+                "NOT NULL DEFAULT 'prewrite' CHECK (write_phase IN "
+                "('prewrite', 'write_started', 'settled'))"
+            )
+            conn.execute(
+                "UPDATE rca_delivery_effects SET write_phase = 'write_started' "
+                "WHERE status IN ('claimed', 'uncertain')"
+            )
+            conn.execute(
+                "UPDATE rca_delivery_effects SET write_phase = 'settled' "
+                "WHERE status IN ('succeeded', 'quarantined', 'suppressed')"
+            )
+        for name, definition in {
+            "write_started_at": "TEXT",
+            "reconciliation_miss_count": (
+                "INTEGER NOT NULL DEFAULT 0 CHECK (reconciliation_miss_count >= 0)"
+            ),
+            "recovery_write_count": (
+                "INTEGER NOT NULL DEFAULT 0 CHECK (recovery_write_count >= 0)"
+            ),
+            "last_recovery_write_at": "TEXT",
+        }.items():
+            if name not in effect_columns:
+                conn.execute(
+                    f"ALTER TABLE rca_delivery_effects ADD COLUMN {name} {definition}"
+                )
+        conn.execute(
+            "UPDATE rca_delivery_effects "
+            "SET write_started_at = COALESCE(write_started_at, updated_at, created_at) "
+            "WHERE write_phase = 'write_started' AND write_started_at IS NULL"
+        )
+
+        attempt_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(rca_delivery_attempts)")
+        }
+        if attempt_columns and "event_seq" not in attempt_columns:
+            conn.execute("ALTER TABLE rca_delivery_attempts RENAME TO rca_delivery_attempts_v1")
+            conn.execute(
+                """
+                CREATE TABLE rca_delivery_attempts (
+                    attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    effect_key TEXT NOT NULL,
+                    attempt_no INTEGER NOT NULL CHECK (attempt_no >= 1),
+                    event_seq INTEGER NOT NULL CHECK (event_seq >= 1),
+                    fence INTEGER NOT NULL CHECK (fence >= 0),
+                    request_id TEXT NOT NULL,
+                    outcome TEXT NOT NULL CHECK (
+                        outcome IN (
+                            'started', 'ack', 'nack', 'unknown',
+                            'reconciled', 'quarantined'
+                        )
+                    ),
+                    remote_id TEXT NOT NULL DEFAULT '',
+                    error_code TEXT NOT NULL DEFAULT '',
+                    detail TEXT NOT NULL DEFAULT '',
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    UNIQUE(effect_key, attempt_no, event_seq),
+                    FOREIGN KEY(effect_key) REFERENCES rca_delivery_effects(effect_key)
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO rca_delivery_attempts(
+                    attempt_id, effect_key, attempt_no, event_seq, fence,
+                    request_id, outcome, remote_id, error_code, detail,
+                    started_at, finished_at
+                )
+                SELECT attempt_id, effect_key, attempt_no, 1, fence,
+                       request_id, outcome, remote_id, error_code, detail,
+                       started_at, finished_at
+                  FROM rca_delivery_attempts_v1
+                """
+            )
+            conn.execute("DROP TABLE rca_delivery_attempts_v1")
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_delivery_attempts_effect
+                    ON rca_delivery_attempts(effect_key, attempt_no, event_seq)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_delivery_attempts_request
+                    ON rca_delivery_attempts(request_id)
+                """
+            )
+        conn.commit()
+        if relax_task_id:
+            conn.execute("PRAGMA legacy_alter_table=OFF")
+            conn.execute("PRAGMA foreign_keys=ON")
+            if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise RuntimeError("incompatible_delivery_store_schema:foreign_keys")
+
+    def journal_settings(self) -> dict[str, Any]:
+        conn = self._connect()
+        try:
+            return {
+                "journal_mode": str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower(),
+                "synchronous": int(conn.execute("PRAGMA synchronous").fetchone()[0]),
+                "foreign_keys": int(conn.execute("PRAGMA foreign_keys").fetchone()[0]),
+            }
+        finally:
+            conn.close()
+
+    def _materialize_quarantined_outbox_in_transaction(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        row: sqlite3.Row,
+        current: str,
+    ) -> None:
+        delivery = build_terminal_delivery(
+            business_key=str(row["business_key"]),
+            submission_key=str(row["submission_key"]),
+            generation=int(row["generation"]),
+            project_key=str(row["project_key"]),
+            work_item_type_key=str(row["work_item_type_key"]),
+            work_item_id=str(row["work_item_id"]),
+            outcome="quarantined",
+            terminal_state=OUTBOX_QUARANTINED_TERMINAL_STATE,
+            error_code=OUTBOX_QUARANTINED_PUBLIC_ERROR_CODE,
+        )
+        terminal_at = str(row["quarantined_at"] or current)
+        status = {
+            "success": False,
+            "state": OUTBOX_QUARANTINED_TERMINAL_STATE,
+            "error_code": OUTBOX_QUARANTINED_PUBLIC_ERROR_CODE,
+        }
+        inserted = conn.execute(
+            """
+            INSERT INTO rca_execution_watch(
+                submission_key, submission_outbox_id, business_key,
+                generation, project_key, work_item_type_key, work_item_id,
+                task_id, state, next_poll_at, last_observed_at, terminal_at,
+                last_status_json, last_error_code, last_error_detail,
+                delivery_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'delivery_created', ?, ?, ?,
+                      ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row["submission_key"],
+                row["outbox_id"],
+                row["business_key"],
+                row["generation"],
+                row["project_key"],
+                row["work_item_type_key"],
+                row["work_item_id"],
+                current,
+                current,
+                terminal_at,
+                _canonical_json(status),
+                str(row["last_error_code"] or "dispatch_quarantined")[:120],
+                str(row["last_error_detail"] or "")[:1000],
+                delivery.delivery_id,
+                str(row["outbox_created_at"] or current),
+                current,
+            ),
+        )
+        if inserted.rowcount != 1:
+            raise DeliveryRecordConflictError(
+                "quarantined outbox watch was not created exactly once"
+            )
+        self._ensure_terminal_delivery_in_transaction(
+            conn,
+            delivery=delivery,
+            current=current,
+            materialize_subscriptions=(
+                self._materialize_delivery_subscriptions_in_transaction
+            ),
+        )
+
+    def backfill_completed_submissions(
+        self,
+        *,
+        limit: int = 1000,
+        now: datetime | None = None,
+        activation_required: bool = False,
+    ) -> int:
+        """Create watches and public terminal deliveries for durable outbox rows."""
+        self._validate_activation_required(activation_required)
+        if limit < 1:
+            return 0
+        current = _iso(now)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            activation_enforced = self._activation_enforced_tx(
+                conn,
+                activation_required=activation_required,
+            )
+            if activation_enforced:
+                self._require_activation_schema(conn)
+            activation_filter = (
+                f"AND {_ACTIVATION_EXECUTION_ELIGIBLE_SQL}"
+                if activation_enforced
+                else ""
+            )
+            rows = conn.execute(
+                f"""
+                SELECT o.outbox_id, o.submission_key, o.business_key, o.generation,
+                       o.status AS outbox_status, o.created_at AS outbox_created_at,
+                       o.quarantined_at, o.last_error_code, o.last_error_detail,
+                       t.project_key, t.work_item_type_key, t.work_item_id
+                  FROM rca_outbox AS o
+                  JOIN business_triggers AS t
+                    ON t.business_key = o.business_key
+                   AND t.generation = o.generation
+             LEFT JOIN rca_execution_watch AS w
+                    ON w.submission_key = o.submission_key
+                 WHERE (
+                        (o.status = 'completed' AND o.result_json IS NOT NULL)
+                        OR o.status = 'quarantined'
+                   )
+                   AND w.submission_key IS NULL
+                   {activation_filter}
+                 ORDER BY COALESCE(o.completed_at, o.quarantined_at, o.updated_at),
+                          o.outbox_id
+                 LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            inserted = 0
+            for row in rows:
+                if str(row["outbox_status"]) == "quarantined":
+                    self._materialize_quarantined_outbox_in_transaction(
+                        conn,
+                        row=row,
+                        current=current,
+                    )
+                    inserted += 1
+                else:
+                    result = conn.execute(
+                        """
+                        INSERT OR IGNORE INTO rca_execution_watch(
+                            submission_key, submission_outbox_id, business_key,
+                            generation, project_key, work_item_type_key, work_item_id,
+                            task_id, state, next_poll_at, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                        """,
+                        (
+                            row["submission_key"],
+                            row["outbox_id"],
+                            row["business_key"],
+                            row["generation"],
+                            row["project_key"],
+                            row["work_item_type_key"],
+                            row["work_item_id"],
+                            row["submission_key"],
+                            current,
+                            current,
+                            current,
+                        ),
+                    )
+                    inserted += result.rowcount
+            conn.commit()
+            return inserted
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def preview_unwatched_completed(
+        self,
+        *,
+        limit: int = 1000,
+        activation_required: bool = False,
+    ) -> list[dict[str, Any]]:
+        self._validate_activation_required(activation_required)
+        if limit < 1:
+            return []
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            activation_enforced = self._activation_enforced_tx(
+                conn,
+                activation_required=activation_required,
+            )
+            if activation_enforced:
+                self._require_activation_schema(conn)
+            activation_filter = (
+                f"AND {_ACTIVATION_EXECUTION_ELIGIBLE_SQL}"
+                if activation_enforced
+                else ""
+            )
+            rows = conn.execute(
+                f"""
+                SELECT o.outbox_id AS submission_outbox_id, o.submission_key,
+                       o.business_key, o.generation, t.project_key,
+                       t.work_item_type_key, t.work_item_id, o.payload_json,
+                       o.result_json
+                  FROM rca_outbox AS o
+                  JOIN business_triggers AS t
+                    ON t.business_key = o.business_key
+                   AND t.generation = o.generation
+             LEFT JOIN rca_execution_watch AS w
+                    ON w.submission_key = o.submission_key
+                 WHERE o.status = 'completed'
+                   AND o.result_json IS NOT NULL
+                   AND w.submission_key IS NULL
+                   {activation_filter}
+                 ORDER BY o.completed_at, o.outbox_id
+                 LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
+
+    def claim_due_watch(
+        self,
+        *,
+        lease_owner: str,
+        lease_seconds: int = 120,
+        now: datetime | None = None,
+        activation_required: bool = False,
+    ) -> ExecutionWatchClaim | None:
+        self._validate_activation_required(activation_required)
+        owner = str(lease_owner or "").strip()
+        if not owner:
+            raise ValueError("lease_owner is required")
+        if lease_seconds < 1:
+            raise ValueError("lease_seconds must be positive")
+        current_dt = _utc_datetime(now)
+        current = _iso(current_dt)
+        expires = _iso(current_dt + timedelta(seconds=lease_seconds))
+        token = uuid.uuid4().hex
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            activation_enforced = self._activation_enforced_tx(
+                conn,
+                activation_required=activation_required,
+            )
+            if activation_enforced:
+                self._require_activation_schema(conn)
+            activation_filter = (
+                f"AND {_ACTIVATION_EXECUTION_ELIGIBLE_SQL}"
+                if activation_enforced
+                else ""
+            )
+            activation_update_filter = (
+                f"""
+                AND EXISTS (
+                    SELECT 1
+                      FROM rca_outbox AS o
+                      JOIN business_triggers AS t
+                        ON t.business_key = o.business_key
+                       AND t.generation = o.generation
+                     WHERE o.outbox_id = rca_execution_watch.submission_outbox_id
+                       AND {_ACTIVATION_EXECUTION_ELIGIBLE_SQL}
+                )
+                """
+                if activation_enforced
+                else ""
+            )
+            row = conn.execute(
+                f"""
+                SELECT w.*, o.payload_json AS submission_payload_json,
+                       o.result_json AS submission_result_json,
+                       o.origin_source_id AS origin_source_id,
+                       t.origin_source_id AS trigger_origin_source_id
+                  FROM rca_execution_watch AS w
+                  JOIN rca_outbox AS o ON o.outbox_id = w.submission_outbox_id
+                  JOIN business_triggers AS t
+                    ON t.business_key = o.business_key
+                   AND t.generation = o.generation
+                 WHERE w.state IN ('pending', 'running')
+                   AND w.next_poll_at <= ?
+                   AND (
+                        w.lease_token IS NULL
+                        OR w.lease_expires_at IS NULL
+                        OR w.lease_expires_at <= ?
+                   )
+                   {activation_filter}
+                 ORDER BY w.next_poll_at, w.created_at, w.submission_key
+                 LIMIT 1
+                """,
+                (current, current),
+            ).fetchone()
+            if row is None:
+                conn.commit()
+                return None
+            updated = conn.execute(
+                f"""
+                UPDATE rca_execution_watch
+                   SET poll_attempt = poll_attempt + 1, fence = fence + 1,
+                       lease_token = ?, lease_owner = ?, lease_expires_at = ?,
+                       updated_at = ?
+                 WHERE submission_key = ?
+                   AND state IN ('pending', 'running')
+                   AND next_poll_at <= ?
+                   AND (
+                        lease_token IS NULL OR lease_expires_at IS NULL
+                        OR lease_expires_at <= ?
+                   )
+                   {activation_update_filter}
+                """,
+                (token, owner, expires, current, row["submission_key"], current, current),
+            )
+            if updated.rowcount != 1:
+                conn.rollback()
+                return None
+            claimed = conn.execute(
+                """
+                SELECT w.*, o.payload_json AS submission_payload_json,
+                       o.result_json AS submission_result_json,
+                       o.origin_source_id AS origin_source_id,
+                       t.origin_source_id AS trigger_origin_source_id
+                  FROM rca_execution_watch AS w
+                  JOIN rca_outbox AS o ON o.outbox_id = w.submission_outbox_id
+                  JOIN business_triggers AS t
+                    ON t.business_key = o.business_key
+                   AND t.generation = o.generation
+                 WHERE w.submission_key = ?
+                """,
+                (row["submission_key"],),
+            ).fetchone()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return ExecutionWatchClaim(
+            submission_key=str(claimed["submission_key"]),
+            submission_outbox_id=int(claimed["submission_outbox_id"]),
+            business_key=str(claimed["business_key"]),
+            generation=int(claimed["generation"]),
+            project_key=str(claimed["project_key"]),
+            work_item_type_key=str(claimed["work_item_type_key"]),
+            work_item_id=str(claimed["work_item_id"]),
+            task_id=str(claimed["task_id"]),
+            state=str(claimed["state"]),
+            poll_attempt=int(claimed["poll_attempt"]),
+            fence=int(claimed["fence"]),
+            lease_token=str(claimed["lease_token"]),
+            lease_owner=str(claimed["lease_owner"]),
+            lease_expires_at=str(claimed["lease_expires_at"]),
+            terminal_first_seen_at=(
+                str(claimed["terminal_first_seen_at"])
+                if claimed["terminal_first_seen_at"]
+                else None
+            ),
+            submission_payload=_json_object(claimed["submission_payload_json"]),
+            submission_result=_json_object(claimed["submission_result_json"]),
+            origin_source_id=str(claimed["origin_source_id"] or ""),
+            trigger_origin_source_id=str(claimed["trigger_origin_source_id"] or ""),
+        )
+
+    @staticmethod
+    def _current_claim(
+        conn: sqlite3.Connection,
+        submission_key: str,
+        lease_token: str,
+        current: str,
+    ) -> sqlite3.Row:
+        row = conn.execute(
+            """
+            SELECT * FROM rca_execution_watch
+             WHERE submission_key = ? AND lease_token = ?
+               AND state IN ('pending', 'running')
+               AND lease_expires_at IS NOT NULL AND lease_expires_at > ?
+            """,
+            (submission_key, lease_token, current),
+        ).fetchone()
+        if row is None:
+            raise StaleDeliveryWatchLeaseError(
+                f"stale execution-watch lease for {submission_key}"
+            )
+        return row
+
+    def reschedule_watch(
+        self,
+        *,
+        submission_key: str,
+        lease_token: str,
+        observed_state: str,
+        status: dict[str, Any],
+        next_poll_at: datetime,
+        error_code: str = "",
+        error_detail: str = "",
+        now: datetime | None = None,
+    ) -> None:
+        state = "running" if observed_state not in {"", "pending"} else "pending"
+        current = _iso(now)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._current_claim(conn, submission_key, lease_token, current)
+            updated = conn.execute(
+                """
+                UPDATE rca_execution_watch
+                   SET state = ?, next_poll_at = ?, last_observed_at = ?,
+                       last_status_json = ?, last_error_code = ?,
+                       last_error_detail = ?, lease_token = NULL,
+                       lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+                 WHERE submission_key = ? AND lease_token = ?
+                """,
+                (
+                    state,
+                    _iso(next_poll_at),
+                    current,
+                    _canonical_json(status),
+                    str(error_code or "")[:120],
+                    str(error_detail or "")[:1000],
+                    current,
+                    submission_key,
+                    lease_token,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise StaleDeliveryWatchLeaseError(submission_key)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def note_terminal_completion(
+        self,
+        *,
+        submission_key: str,
+        lease_token: str,
+        status: dict[str, Any],
+        now: datetime | None = None,
+    ) -> str:
+        """Persist the first completed observation while retaining the claim."""
+        current = _iso(now)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._current_claim(conn, submission_key, lease_token, current)
+            updated = conn.execute(
+                """
+                UPDATE rca_execution_watch
+                   SET terminal_first_seen_at = COALESCE(terminal_first_seen_at, ?),
+                       last_observed_at = ?, last_status_json = ?, updated_at = ?
+                 WHERE submission_key = ? AND lease_token = ?
+                """,
+                (
+                    current,
+                    current,
+                    _canonical_json(status),
+                    current,
+                    submission_key,
+                    lease_token,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise StaleDeliveryWatchLeaseError(submission_key)
+            first_seen = conn.execute(
+                """
+                SELECT terminal_first_seen_at FROM rca_execution_watch
+                 WHERE submission_key = ?
+                """,
+                (submission_key,),
+            ).fetchone()[0]
+            conn.commit()
+            return str(first_seen)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def terminal_failure(
+        self,
+        *,
+        submission_key: str,
+        lease_token: str,
+        status: dict[str, Any],
+        error_code: str,
+        error_detail: str,
+        now: datetime | None = None,
+    ) -> None:
+        self._finish_watch(
+            submission_key=submission_key,
+            lease_token=lease_token,
+            state="terminal_failed",
+            status=status,
+            error_code=error_code,
+            error_detail=error_detail,
+            now=now,
+        )
+
+    def quarantine_watch(
+        self,
+        *,
+        submission_key: str,
+        lease_token: str,
+        status: dict[str, Any],
+        error_code: str,
+        error_detail: str,
+        now: datetime | None = None,
+    ) -> None:
+        self._finish_watch(
+            submission_key=submission_key,
+            lease_token=lease_token,
+            state="quarantined",
+            status=status,
+            error_code=error_code,
+            error_detail=error_detail,
+            now=now,
+        )
+
+    def _finish_watch(
+        self,
+        *,
+        submission_key: str,
+        lease_token: str,
+        state: str,
+        status: dict[str, Any],
+        error_code: str,
+        error_detail: str,
+        now: datetime | None,
+    ) -> None:
+        if state not in {"terminal_failed", "quarantined"}:
+            raise ValueError(f"unsupported terminal watch state: {state}")
+        current = _iso(now)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._current_claim(conn, submission_key, lease_token, current)
+            updated = conn.execute(
+                """
+                UPDATE rca_execution_watch
+                   SET state = ?, terminal_at = ?, last_observed_at = ?,
+                       last_status_json = ?, last_error_code = ?,
+                       last_error_detail = ?, lease_token = NULL,
+                       lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+                 WHERE submission_key = ? AND lease_token = ?
+                """,
+                (
+                    state,
+                    current,
+                    current,
+                    _canonical_json(status),
+                    str(error_code or "")[:120],
+                    str(error_detail or "")[:1000],
+                    current,
+                    submission_key,
+                    lease_token,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise StaleDeliveryWatchLeaseError(submission_key)
+            self._record_permanent_failure_in_transaction(
+                conn,
+                subject_key=submission_key,
+                failure_state=state,
+                error_code=error_code,
+                error_detail=error_detail,
+                current=current,
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ).fetchone()
+        return row is not None
+
+    @classmethod
+    def _quarantine_subscription_in_transaction(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        subscription_key: str,
+        delivery_id: str,
+        current: str,
+    ) -> None:
+        conn.execute(
+            """
+            UPDATE rca_delivery_subscriptions
+               SET status = 'quarantined', delivery_id = ?, updated_at = ?
+             WHERE subscription_key = ? AND status = 'pending'
+            """,
+            (delivery_id, current, subscription_key),
+        )
+        conn.execute(
+            "UPDATE rca_delivery_jobs SET status = 'quarantined', updated_at = ? "
+            "WHERE delivery_id = ?",
+            (current, delivery_id),
+        )
+
+    @classmethod
+    def _materialize_subscription_in_transaction(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        subscription: sqlite3.Row,
+        job: sqlite3.Row,
+        current: str,
+    ) -> None:
+        subscription_key = str(subscription["subscription_key"])
+        effect_kind = str(subscription["effect_kind"])
+        target_key = str(subscription["target_key"])
+        delivery_id = str(job["delivery_id"])
+        if int(subscription["required"]) != 1:
+            raise DeliveryContractError("delivery_subscription_required_invalid")
+        try:
+            target = json.loads(str(subscription["target_json"] or ""))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise DeliveryContractError(
+                "delivery_subscription_target_invalid"
+            ) from exc
+        if not isinstance(target, dict):
+            raise DeliveryContractError("delivery_subscription_target_invalid")
+        validate_delivery_subscription_target(
+            effect_kind=effect_kind,
+            target_key=target_key,
+            target=target,
+            project_key=str(job["project_key"]),
+            work_item_type_key=str(job["work_item_type_key"]),
+            work_item_id=str(job["work_item_id"]),
+        )
+        issue_effect = conn.execute(
+            """
+            SELECT effect_key, target_key, payload_json, payload_sha256, required
+              FROM rca_delivery_effects
+             WHERE delivery_id = ? AND effect_kind = 'feishu_issue_comment'
+            """,
+            (delivery_id,),
+        ).fetchone()
+        if issue_effect is None or int(issue_effect["required"]) != 1:
+            raise DeliveryContractError("delivery_primary_effect_missing")
+
+        if effect_kind == DELIVERY_EFFECT_KIND:
+            if (
+                target_key != str(issue_effect["target_key"])
+                or target_key != str(job["target_key"])
+            ):
+                raise DeliveryContractError("delivery_primary_effect_invalid")
+            effect_key = str(issue_effect["effect_key"])
+        elif effect_kind == DELIVERY_THREAD_EFFECT_KIND:
+            try:
+                issue_payload = json.loads(str(issue_effect["payload_json"] or ""))
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise DeliveryContractError("delivery_primary_effect_invalid") from exc
+            if not isinstance(issue_payload, dict):
+                raise DeliveryContractError("delivery_primary_effect_invalid")
+            outcome = str(job["outcome"] or "success")
+            if outcome == "success":
+                effect_key, payload_sha256, payload = build_thread_reply_effect(
+                    issue_effect_payload=issue_payload,
+                    target_key=target_key,
+                    target=target,
+                )
+            else:
+                effect_key, payload_sha256, payload = (
+                    build_terminal_thread_reply_effect(
+                        issue_effect_payload=issue_payload,
+                        target_key=target_key,
+                        target=target,
+                    )
+                )
+            conn.execute(
+                """
+                INSERT INTO rca_delivery_effects(
+                    effect_key, delivery_id, effect_kind, required,
+                    target_key, payload_json, payload_sha256, outcome, status,
+                    created_at, updated_at
+                ) VALUES (?, ?, 'feishu_thread_reply', 1, ?, ?, ?, ?, 'pending', ?, ?)
+                ON CONFLICT(delivery_id, effect_kind, target_key) DO NOTHING
+                """,
+                (
+                    effect_key,
+                    delivery_id,
+                    target_key,
+                    _canonical_json(payload),
+                    payload_sha256,
+                    outcome,
+                    current,
+                    current,
+                ),
+            )
+            existing = conn.execute(
+                """
+                SELECT effect_key, payload_sha256, required
+                  FROM rca_delivery_effects
+                 WHERE delivery_id = ? AND effect_kind = 'feishu_thread_reply'
+                   AND target_key = ?
+                """,
+                (delivery_id, target_key),
+            ).fetchone()
+            if (
+                existing is None
+                or str(existing["effect_key"]) != effect_key
+                or str(existing["payload_sha256"]) != payload_sha256
+                or int(existing["required"]) != 1
+            ):
+                raise DeliveryRecordConflictError(
+                    "delivery subscription is bound to a different thread effect"
+                )
+        else:
+            raise DeliveryContractError("delivery_effect_kind_unsupported")
+
+        updated = conn.execute(
+            """
+            UPDATE rca_delivery_subscriptions
+               SET status = 'materialized', delivery_id = ?, effect_key = ?,
+                   materialized_at = ?, updated_at = ?
+             WHERE subscription_key = ? AND status = 'pending'
+            """,
+            (delivery_id, effect_key, current, current, subscription_key),
+        )
+        if updated.rowcount != 1:
+            raise DeliveryRecordConflictError(
+                "delivery subscription changed during materialization"
+            )
+        cls._aggregate_job_status(conn, delivery_id, current)
+
+    @classmethod
+    def _materialize_delivery_subscriptions_in_transaction(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        delivery_id: str,
+        current: str,
+        limit: int | None = None,
+        activation_required: bool = False,
+    ) -> SubscriptionMaterializationResult:
+        cls._validate_activation_required(activation_required)
+        activation_enforced = cls._activation_enforced_tx(
+            conn,
+            activation_required=activation_required,
+        )
+        if activation_enforced:
+            cls._require_activation_schema(conn)
+        if not cls._table_exists(conn, "rca_delivery_subscriptions"):
+            return SubscriptionMaterializationResult()
+        job = conn.execute(
+            "SELECT * FROM rca_delivery_jobs WHERE delivery_id = ?",
+            (delivery_id,),
+        ).fetchone()
+        if job is None:
+            raise DeliveryRecordConflictError("delivery job disappeared")
+        if activation_enforced and not cls._execution_activation_eligible_tx(
+            conn,
+            submission_key=str(job["submission_key"]),
+        ):
+            raise StaleDeliveryWatchLeaseError(
+                f"delivery activation changed for {job['submission_key']}"
+            )
+        sql = (
+            "SELECT * FROM rca_delivery_subscriptions "
+            "WHERE business_key = ? AND generation = ? AND status = 'pending' "
+            "ORDER BY created_at, subscription_key"
+        )
+        params: list[Any] = [job["business_key"], job["generation"]]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(max(1, int(limit)))
+        materialized = 0
+        quarantined = 0
+        for subscription in conn.execute(sql, tuple(params)).fetchall():
+            try:
+                cls._materialize_subscription_in_transaction(
+                    conn,
+                    subscription=subscription,
+                    job=job,
+                    current=current,
+                )
+                materialized += 1
+            except (DeliveryContractError, DeliveryRecordConflictError):
+                cls._quarantine_subscription_in_transaction(
+                    conn,
+                    subscription_key=str(subscription["subscription_key"]),
+                    delivery_id=delivery_id,
+                    current=current,
+                )
+                quarantined += 1
+        return SubscriptionMaterializationResult(materialized, quarantined)
+
+    def materialize_pending_subscriptions(
+        self,
+        *,
+        limit: int = 100,
+        now: datetime | None = None,
+        activation_required: bool = False,
+    ) -> SubscriptionMaterializationResult:
+        self._validate_activation_required(activation_required)
+        if limit < 1:
+            return SubscriptionMaterializationResult()
+        current = _iso(now)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            activation_enforced = self._activation_enforced_tx(
+                conn,
+                activation_required=activation_required,
+            )
+            if activation_enforced:
+                self._require_activation_schema(conn)
+            if not self._table_exists(conn, "rca_delivery_subscriptions"):
+                conn.commit()
+                return SubscriptionMaterializationResult()
+            activation_joins = (
+                """
+                  JOIN rca_execution_watch AS w
+                    ON w.submission_key = j.submission_key
+                  JOIN rca_outbox AS o
+                    ON o.outbox_id = w.submission_outbox_id
+                  JOIN business_triggers AS t
+                    ON t.business_key = o.business_key
+                   AND t.generation = o.generation
+                """
+                if activation_enforced
+                else ""
+            )
+            activation_filter = (
+                f"AND {_ACTIVATION_EXECUTION_ELIGIBLE_SQL}"
+                if activation_enforced
+                else ""
+            )
+            rows = conn.execute(
+                f"""
+                SELECT DISTINCT j.delivery_id
+                  FROM rca_delivery_subscriptions AS s
+                  JOIN rca_delivery_jobs AS j
+                    ON j.business_key = s.business_key
+                   AND j.generation = s.generation
+                  {activation_joins}
+                 WHERE s.status = 'pending'
+                   {activation_filter}
+                 ORDER BY s.catchup_requested_at IS NULL,
+                          s.catchup_requested_at, s.created_at
+                 LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            materialized = 0
+            quarantined = 0
+            remaining = limit
+            for row in rows:
+                result = self._materialize_delivery_subscriptions_in_transaction(
+                    conn,
+                    delivery_id=str(row["delivery_id"]),
+                    current=current,
+                    limit=remaining,
+                    activation_required=activation_enforced,
+                )
+                materialized += result.materialized
+                quarantined += result.quarantined
+                remaining -= result.materialized + result.quarantined
+                if remaining <= 0:
+                    break
+            conn.commit()
+            return SubscriptionMaterializationResult(materialized, quarantined)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def create_delivery(
+        self,
+        *,
+        claim: ExecutionWatchClaim,
+        delivery: VerifiedDelivery,
+        status: dict[str, Any],
+        runtime_identity: Mapping[str, Any] | None = None,
+        now: datetime | None = None,
+        activation_required: bool = False,
+    ) -> DeliveryCreateResult:
+        self._validate_activation_required(activation_required)
+        if (
+            delivery.submission_key != claim.submission_key
+            or delivery.business_key != claim.business_key
+            or delivery.generation != claim.generation
+            or delivery.project_key != claim.project_key
+            or delivery.work_item_type_key != claim.work_item_type_key
+            or delivery.work_item_id != claim.work_item_id
+        ):
+            raise DeliveryRecordConflictError(
+                "verified delivery identity does not match claimed execution watch"
+            )
+        current = _iso(now)
+        job = delivery.job_payload()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._current_claim(
+                conn, claim.submission_key, claim.lease_token, current
+            )
+            activation_enforced = self._activation_enforced_tx(
+                conn,
+                activation_required=activation_required,
+            )
+            if activation_enforced:
+                self._require_activation_schema(conn)
+            if activation_enforced and not self._execution_activation_eligible_tx(
+                conn,
+                submission_key=claim.submission_key,
+            ):
+                raise StaleDeliveryWatchLeaseError(
+                    f"delivery activation changed for {claim.submission_key}"
+                )
+            existing = conn.execute(
+                "SELECT delivery_id, artifact_set_id FROM rca_delivery_jobs WHERE submission_key = ?",
+                (claim.submission_key,),
+            ).fetchone()
+            if existing:
+                if (
+                    existing["delivery_id"] != delivery.delivery_id
+                    or existing["artifact_set_id"] != delivery.artifact_set_id
+                ):
+                    raise DeliveryRecordConflictError(
+                        "submission is already bound to a different artifact set"
+                    )
+                effect = conn.execute(
+                    "SELECT effect_key FROM rca_delivery_effects "
+                    "WHERE delivery_id = ? AND effect_kind = 'feishu_issue_comment'",
+                    (delivery.delivery_id,),
+                ).fetchone()
+                if effect is None or effect["effect_key"] != delivery.effect_key:
+                    raise DeliveryRecordConflictError(
+                        "delivery is already bound to a different effect"
+                    )
+                created = False
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO rca_delivery_jobs(
+                        delivery_id, submission_key, business_key, generation,
+                        artifact_set_id, project_key, work_item_type_key,
+                        work_item_id, target_key, issue_url, report_url, status,
+                        manifest_json, contract_json, artifacts_json,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        delivery.delivery_id,
+                        delivery.submission_key,
+                        delivery.business_key,
+                        delivery.generation,
+                        delivery.artifact_set_id,
+                        delivery.project_key,
+                        delivery.work_item_type_key,
+                        delivery.work_item_id,
+                        delivery.target_key,
+                        delivery.issue_url,
+                        delivery.report_url,
+                        _canonical_json(delivery.manifest),
+                        _canonical_json(delivery.contract),
+                        _canonical_json(job["artifacts"]),
+                        current,
+                        current,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO rca_delivery_effects(
+                        effect_key, delivery_id, effect_kind, required,
+                        target_key, payload_json, payload_sha256, status,
+                        created_at, updated_at
+                    ) VALUES (?, ?, 'feishu_issue_comment', 1, ?, ?, ?, 'pending', ?, ?)
+                    """,
+                    (
+                        delivery.effect_key,
+                        delivery.delivery_id,
+                        delivery.target_key,
+                        _canonical_json(delivery.effect_payload),
+                        delivery.semantic_payload_sha256,
+                        current,
+                        current,
+                    ),
+                )
+                created = True
+            self._materialize_delivery_subscriptions_in_transaction(
+                conn,
+                delivery_id=delivery.delivery_id,
+                current=current,
+                activation_required=activation_enforced,
+            )
+            updated = conn.execute(
+                """
+                UPDATE rca_execution_watch
+                   SET state = 'delivery_created', delivery_id = ?, terminal_at = ?,
+                       last_observed_at = ?, last_status_json = ?,
+                       last_error_code = '', last_error_detail = '',
+                       lease_token = NULL, lease_owner = NULL,
+                       lease_expires_at = NULL, updated_at = ?
+                 WHERE submission_key = ? AND lease_token = ?
+                """,
+                (
+                    delivery.delivery_id,
+                    current,
+                    current,
+                    _canonical_json(status),
+                    current,
+                    claim.submission_key,
+                    claim.lease_token,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise StaleDeliveryWatchLeaseError(claim.submission_key)
+            if runtime_identity is not None:
+                insert_host_runtime_transition(
+                    conn,
+                    submission_key=claim.submission_key,
+                    business_key=claim.business_key,
+                    generation=claim.generation,
+                    service_label="local.pnc.rca-delivery-collector",
+                    transition_kind="delivery_created",
+                    entity_key=delivery.delivery_id,
+                    runtime_identity=runtime_identity,
+                    transitioned_at=current,
+                )
+            conn.commit()
+            return DeliveryCreateResult(
+                delivery.delivery_id, delivery.effect_key, created
+            )
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    @classmethod
+    def _ensure_terminal_delivery_in_transaction(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        delivery: VerifiedTerminalDelivery,
+        current: str,
+        materialize_subscriptions: Any = None,
+        activation_required: bool = False,
+    ) -> bool:
+        existing = conn.execute(
+            """
+            SELECT delivery_id, outcome_key, outcome, terminal_state,
+                   terminal_error_code
+              FROM rca_delivery_jobs WHERE submission_key = ?
+            """,
+            (delivery.submission_key,),
+        ).fetchone()
+        if existing is not None:
+            expected = (
+                delivery.delivery_id,
+                delivery.outcome_key,
+                delivery.outcome,
+                delivery.terminal_state,
+                delivery.error_code,
+            )
+            observed = tuple(
+                existing[key]
+                for key in (
+                    "delivery_id",
+                    "outcome_key",
+                    "outcome",
+                    "terminal_state",
+                    "terminal_error_code",
+                )
+            )
+            if observed != expected:
+                raise DeliveryRecordConflictError(
+                    "submission is already bound to a different terminal outcome"
+                )
+            effect = conn.execute(
+                """
+                SELECT effect_key FROM rca_delivery_effects
+                 WHERE delivery_id = ? AND effect_kind = 'feishu_issue_comment'
+                """,
+                (delivery.delivery_id,),
+            ).fetchone()
+            if effect is None or effect["effect_key"] != delivery.effect_key:
+                raise DeliveryRecordConflictError(
+                    "terminal delivery is bound to a different issue effect"
+                )
+            created = False
+        else:
+            conn.execute(
+                """
+                INSERT INTO rca_delivery_jobs(
+                    delivery_id, submission_key, business_key, generation,
+                    artifact_set_id, project_key, work_item_type_key,
+                    work_item_id, target_key, issue_url, report_url,
+                    outcome, outcome_key, terminal_state,
+                    terminal_error_code, status, manifest_json,
+                    contract_json, artifacts_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, ?,
+                          'ready', '{}', '{}', '[]', ?, ?)
+                """,
+                (
+                    delivery.delivery_id,
+                    delivery.submission_key,
+                    delivery.business_key,
+                    delivery.generation,
+                    delivery.outcome_key,
+                    delivery.project_key,
+                    delivery.work_item_type_key,
+                    delivery.work_item_id,
+                    delivery.target_key,
+                    delivery.outcome,
+                    delivery.outcome_key,
+                    delivery.terminal_state,
+                    delivery.error_code,
+                    current,
+                    current,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO rca_delivery_effects(
+                    effect_key, delivery_id, effect_kind, required,
+                    target_key, payload_json, payload_sha256, outcome,
+                    status, created_at, updated_at
+                ) VALUES (?, ?, 'feishu_issue_comment', 1, ?, ?, ?, ?,
+                          'pending', ?, ?)
+                """,
+                (
+                    delivery.effect_key,
+                    delivery.delivery_id,
+                    delivery.target_key,
+                    _canonical_json(delivery.effect_payload),
+                    delivery.semantic_payload_sha256,
+                    delivery.outcome,
+                    current,
+                    current,
+                ),
+            )
+            created = True
+        materializer = (
+            materialize_subscriptions
+            or cls._materialize_delivery_subscriptions_in_transaction
+        )
+        materializer(
+            conn,
+            delivery_id=delivery.delivery_id,
+            current=current,
+            activation_required=activation_required,
+        )
+        return created
+
+    def create_terminal_delivery(
+        self,
+        *,
+        claim: ExecutionWatchClaim,
+        status: dict[str, Any],
+        outcome: str,
+        terminal_state: str,
+        error_code: str,
+        error_detail: str,
+        runtime_identity: Mapping[str, Any] | None = None,
+        now: datetime | None = None,
+        activation_required: bool = False,
+    ) -> DeliveryCreateResult:
+        """Atomically turn a failed execution into durable required effects."""
+        self._validate_activation_required(activation_required)
+        delivery: VerifiedTerminalDelivery = build_terminal_delivery(
+            business_key=claim.business_key,
+            submission_key=claim.submission_key,
+            generation=claim.generation,
+            project_key=claim.project_key,
+            work_item_type_key=claim.work_item_type_key,
+            work_item_id=claim.work_item_id,
+            outcome=outcome,
+            terminal_state=terminal_state,
+            error_code=error_code,
+        )
+        current = _iso(now)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._current_claim(
+                conn, claim.submission_key, claim.lease_token, current
+            )
+            activation_enforced = self._activation_enforced_tx(
+                conn,
+                activation_required=activation_required,
+            )
+            if activation_enforced:
+                self._require_activation_schema(conn)
+            if activation_enforced and not self._execution_activation_eligible_tx(
+                conn,
+                submission_key=claim.submission_key,
+            ):
+                raise StaleDeliveryWatchLeaseError(
+                    f"delivery activation changed for {claim.submission_key}"
+                )
+            created = self._ensure_terminal_delivery_in_transaction(
+                conn,
+                delivery=delivery,
+                current=current,
+                materialize_subscriptions=(
+                    self._materialize_delivery_subscriptions_in_transaction
+                ),
+                activation_required=activation_enforced,
+            )
+            updated = conn.execute(
+                """
+                UPDATE rca_execution_watch
+                   SET state = 'delivery_created', delivery_id = ?, terminal_at = ?,
+                       last_observed_at = ?, last_status_json = ?,
+                       last_error_code = ?, last_error_detail = ?,
+                       lease_token = NULL, lease_owner = NULL,
+                       lease_expires_at = NULL, updated_at = ?
+                 WHERE submission_key = ? AND lease_token = ?
+                """,
+                (
+                    delivery.delivery_id,
+                    current,
+                    current,
+                    _canonical_json(status),
+                    delivery.error_code,
+                    str(error_detail or "")[:1000],
+                    current,
+                    claim.submission_key,
+                    claim.lease_token,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise StaleDeliveryWatchLeaseError(claim.submission_key)
+            if runtime_identity is not None:
+                insert_host_runtime_transition(
+                    conn,
+                    submission_key=claim.submission_key,
+                    business_key=claim.business_key,
+                    generation=claim.generation,
+                    service_label="local.pnc.rca-delivery-collector",
+                    transition_kind="delivery_created",
+                    entity_key=delivery.delivery_id,
+                    runtime_identity=runtime_identity,
+                    transitioned_at=current,
+                )
+            conn.commit()
+            return DeliveryCreateResult(
+                delivery.delivery_id, delivery.effect_key, created
+            )
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _effect_request_id(effect_key: str, fence: int) -> str:
+        return f"{effect_key}:fence:{fence}"
+
+    @staticmethod
+    def _append_attempt_event(
+        conn: sqlite3.Connection,
+        *,
+        effect_key: str,
+        attempt_no: int,
+        fence: int,
+        request_id: str,
+        outcome: str,
+        current: str,
+        remote_id: str = "",
+        error_code: str = "",
+        detail: str = "",
+    ) -> None:
+        event_seq = int(
+            conn.execute(
+                """
+                SELECT COALESCE(MAX(event_seq), 0) + 1
+                  FROM rca_delivery_attempts
+                 WHERE effect_key = ? AND attempt_no = ?
+                """,
+                (effect_key, attempt_no),
+            ).fetchone()[0]
+        )
+        conn.execute(
+            """
+            INSERT INTO rca_delivery_attempts(
+                effect_key, attempt_no, event_seq, fence, request_id,
+                outcome, remote_id, error_code, detail, started_at, finished_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                effect_key,
+                max(1, int(attempt_no)),
+                event_seq,
+                max(0, int(fence)),
+                str(request_id or "system"),
+                outcome,
+                str(remote_id or "")[:256],
+                str(error_code or "")[:120],
+                str(detail or "")[:1000],
+                current,
+                None if outcome == "started" else current,
+            ),
+        )
+
+    @staticmethod
+    def _aggregate_job_status(conn: sqlite3.Connection, delivery_id: str, current: str) -> str:
+        rows = conn.execute(
+            """
+            SELECT required, status FROM rca_delivery_effects
+             WHERE delivery_id = ?
+            """,
+            (delivery_id,),
+        ).fetchall()
+        subscription_states: list[str] = []
+        if RcaDeliveryStore._table_exists(conn, "rca_delivery_subscriptions"):
+            job_identity = conn.execute(
+                "SELECT business_key, generation FROM rca_delivery_jobs "
+                "WHERE delivery_id = ?",
+                (delivery_id,),
+            ).fetchone()
+            if job_identity is not None:
+                subscription_states = [
+                    str(row["status"])
+                    for row in conn.execute(
+                        """
+                        SELECT status FROM rca_delivery_subscriptions
+                         WHERE business_key = ? AND generation = ? AND required = 1
+                        """,
+                        (job_identity["business_key"], job_identity["generation"]),
+                    ).fetchall()
+                ]
+        required = [row for row in rows if int(row["required"]) == 1]
+        optional = [row for row in rows if int(row["required"]) == 0]
+        if (
+            any(row["status"] == "quarantined" for row in required)
+            or "quarantined" in subscription_states
+        ):
+            status = "quarantined"
+        elif (
+            required
+            and all(row["status"] == "succeeded" for row in required)
+            and all(state == "materialized" for state in subscription_states)
+        ):
+            status = (
+                "partial"
+                if optional and any(row["status"] != "succeeded" for row in optional)
+                else "delivered"
+            )
+        else:
+            status = "ready"
+        conn.execute(
+            "UPDATE rca_delivery_jobs SET status = ?, updated_at = ? WHERE delivery_id = ?",
+            (status, current, delivery_id),
+        )
+        return status
+
+    @staticmethod
+    def _current_effect_claim(
+        conn: sqlite3.Connection,
+        *,
+        effect_key: str,
+        lease_token: str,
+        fence: int,
+        current: str,
+    ) -> sqlite3.Row:
+        row = conn.execute(
+            """
+            SELECT e.*, j.created_at AS job_created_at,
+                   j.submission_key AS job_submission_key
+              FROM rca_delivery_effects AS e
+              JOIN rca_delivery_jobs AS j ON j.delivery_id = e.delivery_id
+             WHERE e.effect_key = ? AND e.lease_token = ? AND e.fence = ?
+               AND e.status = 'claimed'
+               AND e.lease_expires_at IS NOT NULL AND e.lease_expires_at > ?
+            """,
+            (effect_key, lease_token, fence, current),
+        ).fetchone()
+        if row is None:
+            raise StaleDeliveryEffectLeaseError(
+                f"stale delivery-effect lease for {effect_key} fence {fence}"
+            )
+        return row
+
+    def extend_effect_lease(
+        self,
+        *,
+        claim: DeliveryEffectClaim,
+        lease_seconds: int,
+        now: datetime | None = None,
+    ) -> str:
+        """Extend only the live fenced lease owned by this exact worker claim."""
+        if lease_seconds < 1:
+            raise ValueError("lease_seconds must be positive")
+        owner = str(claim.lease_owner or "").strip()
+        if not owner:
+            raise ValueError("claim lease_owner is required")
+        current_dt = _utc_datetime(now)
+        current = _iso(current_dt)
+        expires = _iso(current_dt + timedelta(seconds=lease_seconds))
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            updated = conn.execute(
+                """
+                UPDATE rca_delivery_effects
+                   SET lease_expires_at = ?, updated_at = ?
+                 WHERE effect_key = ? AND status = 'claimed'
+                   AND lease_token = ? AND fence = ? AND lease_owner = ?
+                   AND lease_expires_at IS NOT NULL
+                   AND lease_expires_at > ?
+                """,
+                (
+                    expires,
+                    current,
+                    claim.effect_key,
+                    claim.lease_token,
+                    claim.fence,
+                    owner,
+                    current,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise StaleDeliveryEffectLeaseError(
+                    f"stale delivery-effect lease for {claim.effect_key} "
+                    f"fence {claim.fence}"
+                )
+            conn.commit()
+            return expires
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def mark_effect_write_started(
+        self,
+        *,
+        claim: DeliveryEffectClaim,
+        now: datetime | None = None,
+        activation_required: bool = False,
+    ) -> None:
+        """Persist the remote-write ambiguity boundary before invoking it."""
+        self._validate_activation_required(activation_required)
+        current = _iso(now)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = self._current_effect_claim(
+                conn,
+                effect_key=claim.effect_key,
+                lease_token=claim.lease_token,
+                fence=claim.fence,
+                current=current,
+            )
+            activation_enforced = self._activation_enforced_tx(
+                conn,
+                activation_required=activation_required,
+            )
+            if activation_enforced:
+                self._require_activation_schema(conn)
+            if activation_enforced and not self._execution_activation_eligible_tx(
+                conn,
+                submission_key=str(row["job_submission_key"]),
+            ):
+                raise StaleDeliveryEffectLeaseError(
+                    f"delivery activation changed for {claim.effect_key}"
+                )
+            if str(row["write_phase"] or "") != "prewrite":
+                raise DeliveryRecordConflictError(
+                    "delivery effect crossed its write boundary more than once"
+                )
+            updated = conn.execute(
+                """
+                UPDATE rca_delivery_effects
+                   SET write_phase = 'write_started', write_started_at = ?,
+                       reconciliation_miss_count = 0, updated_at = ?
+                 WHERE effect_key = ? AND lease_token = ? AND fence = ?
+                   AND status = 'claimed' AND write_phase = 'prewrite'
+                """,
+                (
+                    current,
+                    current,
+                    claim.effect_key,
+                    claim.lease_token,
+                    claim.fence,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise StaleDeliveryEffectLeaseError(
+                    f"stale delivery-effect write boundary for {claim.effect_key}"
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def record_effect_reconciliation_miss(
+        self,
+        *,
+        claim: DeliveryEffectClaim,
+        visibility_grace_seconds: int,
+        minimum_missing_reads: int,
+        recovery_interval_seconds: int,
+        max_recovery_writes: int,
+        now: datetime | None = None,
+    ) -> DeliveryReconciliationState:
+        """Record a strict marker miss and evaluate bounded recovery eligibility."""
+        if (
+            visibility_grace_seconds < 1
+            or minimum_missing_reads < 2
+            or recovery_interval_seconds < 1
+            or max_recovery_writes < 1
+        ):
+            raise ValueError("delivery reconciliation policy is invalid")
+        current_dt = _utc_datetime(now)
+        current = _iso(current_dt)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = self._current_effect_claim(
+                conn,
+                effect_key=claim.effect_key,
+                lease_token=claim.lease_token,
+                fence=claim.fence,
+                current=current,
+            )
+            if str(row["write_phase"] or "") != "write_started":
+                raise DeliveryRecordConflictError(
+                    "delivery reconciliation requires an entered write boundary"
+                )
+            try:
+                write_started_at = _parse_iso(str(row["write_started_at"] or ""))
+                last_recovery_at = (
+                    _parse_iso(str(row["last_recovery_write_at"]))
+                    if row["last_recovery_write_at"]
+                    else None
+                )
+            except ValueError as exc:
+                raise DeliveryRecordConflictError(
+                    "delivery reconciliation timestamps are invalid"
+                ) from exc
+            missing_reads = int(row["reconciliation_miss_count"]) + 1
+            visibility_anchor = last_recovery_at or write_started_at
+            grace_elapsed = (
+                current_dt - visibility_anchor
+            ).total_seconds() >= visibility_grace_seconds
+            interval_elapsed = (
+                last_recovery_at is None
+                or (current_dt - last_recovery_at).total_seconds()
+                >= recovery_interval_seconds
+            )
+            updated = conn.execute(
+                """
+                UPDATE rca_delivery_effects
+                   SET reconciliation_miss_count = ?, updated_at = ?
+                 WHERE effect_key = ? AND lease_token = ? AND fence = ?
+                   AND status = 'claimed' AND write_phase = 'write_started'
+                """,
+                (
+                    missing_reads,
+                    current,
+                    claim.effect_key,
+                    claim.lease_token,
+                    claim.fence,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise StaleDeliveryEffectLeaseError(
+                    f"stale delivery-effect reconciliation for {claim.effect_key}"
+                )
+            conn.commit()
+            recovery_write_count = int(row["recovery_write_count"])
+            recovery_limit_reached = recovery_write_count >= max_recovery_writes
+            return DeliveryReconciliationState(
+                missing_read_count=missing_reads,
+                recovery_write_count=recovery_write_count,
+                visibility_grace_elapsed=grace_elapsed,
+                recovery_interval_elapsed=interval_elapsed,
+                recovery_eligible=(
+                    grace_elapsed
+                    and interval_elapsed
+                    and missing_reads >= minimum_missing_reads
+                    and not recovery_limit_reached
+                ),
+                recovery_limit_exceeded=(
+                    grace_elapsed
+                    and missing_reads >= minimum_missing_reads
+                    and recovery_limit_reached
+                ),
+            )
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def authorize_effect_recovery_write(
+        self,
+        *,
+        claim: DeliveryEffectClaim,
+        visibility_grace_seconds: int,
+        minimum_missing_reads: int,
+        recovery_interval_seconds: int,
+        max_recovery_writes: int,
+        now: datetime | None = None,
+        activation_required: bool = False,
+    ) -> int | None:
+        """Atomically consume one rate-limited recovery-write authorization."""
+        self._validate_activation_required(activation_required)
+        if (
+            visibility_grace_seconds < 1
+            or minimum_missing_reads < 2
+            or recovery_interval_seconds < 1
+            or max_recovery_writes < 1
+        ):
+            raise ValueError("delivery reconciliation policy is invalid")
+        current_dt = _utc_datetime(now)
+        current = _iso(current_dt)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = self._current_effect_claim(
+                conn,
+                effect_key=claim.effect_key,
+                lease_token=claim.lease_token,
+                fence=claim.fence,
+                current=current,
+            )
+            activation_enforced = self._activation_enforced_tx(
+                conn,
+                activation_required=activation_required,
+            )
+            if activation_enforced:
+                self._require_activation_schema(conn)
+            if activation_enforced and not self._execution_activation_eligible_tx(
+                conn,
+                submission_key=str(row["job_submission_key"]),
+            ):
+                raise StaleDeliveryEffectLeaseError(
+                    f"delivery activation changed for {claim.effect_key}"
+                )
+            if str(row["write_phase"] or "") != "write_started":
+                raise DeliveryRecordConflictError(
+                    "delivery recovery requires an entered write boundary"
+                )
+            try:
+                write_started_at = _parse_iso(str(row["write_started_at"] or ""))
+                last_recovery_at = (
+                    _parse_iso(str(row["last_recovery_write_at"]))
+                    if row["last_recovery_write_at"]
+                    else None
+                )
+            except ValueError as exc:
+                raise DeliveryRecordConflictError(
+                    "delivery recovery timestamps are invalid"
+                ) from exc
+            missing_reads = int(row["reconciliation_miss_count"])
+            recovery_write_count = int(row["recovery_write_count"])
+            grace_elapsed = (
+                current_dt - (last_recovery_at or write_started_at)
+            ).total_seconds() >= visibility_grace_seconds
+            interval_elapsed = (
+                last_recovery_at is None
+                or (current_dt - last_recovery_at).total_seconds()
+                >= recovery_interval_seconds
+            )
+            if (
+                missing_reads < minimum_missing_reads
+                or not grace_elapsed
+                or not interval_elapsed
+                or recovery_write_count >= max_recovery_writes
+            ):
+                conn.commit()
+                return None
+            recovery_write_count += 1
+            updated = conn.execute(
+                """
+                UPDATE rca_delivery_effects
+                   SET recovery_write_count = ?, last_recovery_write_at = ?,
+                       reconciliation_miss_count = 0,
+                       last_error_code = 'delivery_effect_recovery_write_authorized',
+                       last_error_detail = ?, updated_at = ?
+                 WHERE effect_key = ? AND lease_token = ? AND fence = ?
+                   AND status = 'claimed' AND write_phase = 'write_started'
+                """,
+                (
+                    recovery_write_count,
+                    current,
+                    (
+                        "controlled recovery write authorized after "
+                        f"{missing_reads} strict marker misses"
+                    ),
+                    current,
+                    claim.effect_key,
+                    claim.lease_token,
+                    claim.fence,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise StaleDeliveryEffectLeaseError(
+                    f"stale delivery-effect recovery write for {claim.effect_key}"
+                )
+            conn.commit()
+            return recovery_write_count
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def claim_due_effect(
+        self,
+        *,
+        lease_owner: str,
+        lease_seconds: int = 60,
+        max_age_seconds: int = 86_400,
+        now: datetime | None = None,
+        activation_required: bool = False,
+    ) -> DeliveryEffectClaim | None:
+        self._validate_activation_required(activation_required)
+        self.materialize_pending_subscriptions(
+            limit=100,
+            now=now,
+            activation_required=activation_required,
+        )
+        owner = str(lease_owner or "").strip()
+        if not owner:
+            raise ValueError("lease_owner is required")
+        if lease_seconds < 1 or max_age_seconds < 1:
+            raise ValueError("lease and max age must be positive")
+        current_dt = _utc_datetime(now)
+        current = _iso(current_dt)
+        expires = _iso(current_dt + timedelta(seconds=lease_seconds))
+        cutoff = _iso(current_dt - timedelta(seconds=max_age_seconds))
+        token = uuid.uuid4().hex
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            activation_enforced = self._activation_enforced_tx(
+                conn,
+                activation_required=activation_required,
+            )
+            if activation_enforced:
+                self._require_activation_schema(conn)
+            activation_joins = (
+                """
+                  JOIN rca_execution_watch AS w
+                    ON w.submission_key = j.submission_key
+                  JOIN rca_outbox AS o
+                    ON o.outbox_id = w.submission_outbox_id
+                  JOIN business_triggers AS t
+                    ON t.business_key = o.business_key
+                   AND t.generation = o.generation
+                """
+                if activation_enforced
+                else ""
+            )
+            activation_filter = (
+                f"AND {_ACTIVATION_EXECUTION_ELIGIBLE_SQL}"
+                if activation_enforced
+                else ""
+            )
+            expired = conn.execute(
+                f"""
+                SELECT e.effect_key, e.delivery_id, e.effect_kind,
+                       e.attempt, e.fence
+                  FROM rca_delivery_effects AS e
+                  JOIN rca_delivery_jobs AS j ON j.delivery_id = e.delivery_id
+                  {activation_joins}
+                 WHERE e.created_at <= ?
+                   AND (
+                        e.status IN ('pending', 'retry_wait', 'uncertain')
+                        OR (
+                            e.status = 'claimed' AND e.lease_expires_at IS NOT NULL
+                            AND e.lease_expires_at <= ?
+                        )
+                   )
+                   {activation_filter}
+                """,
+                (cutoff, current),
+            ).fetchall()
+            for row in expired:
+                attempt_no = max(1, int(row["attempt"]))
+                fence = int(row["fence"])
+                self._append_attempt_event(
+                    conn,
+                    effect_key=str(row["effect_key"]),
+                    attempt_no=attempt_no,
+                    fence=fence,
+                    request_id=self._effect_request_id(str(row["effect_key"]), fence),
+                    outcome="quarantined",
+                    current=current,
+                    error_code="delivery_effect_age_exceeded",
+                    detail="delivery effect exceeded the 24 hour retry horizon",
+                )
+                conn.execute(
+                    """
+                    UPDATE rca_delivery_effects
+                       SET status = 'quarantined', quarantined_at = ?,
+                           write_phase = 'settled',
+                           next_attempt_at = NULL, lease_token = NULL,
+                           lease_owner = NULL, lease_expires_at = NULL,
+                           last_error_code = 'delivery_effect_age_exceeded',
+                           last_error_detail = 'delivery effect exceeded the retry horizon',
+                           updated_at = ?
+                     WHERE effect_key = ?
+                    """,
+                    (current, current, row["effect_key"]),
+                )
+                self._aggregate_job_status(conn, str(row["delivery_id"]), current)
+                self._record_permanent_failure_in_transaction(
+                    conn,
+                    circuit_name=str(row["effect_kind"]),
+                    subject_key=str(row["effect_key"]),
+                    failure_state="quarantined",
+                    error_code="delivery_effect_age_exceeded",
+                    error_detail="delivery effect exceeded the retry horizon",
+                    current=current,
+                )
+
+            row = conn.execute(
+                f"""
+                SELECT e.*, j.artifact_set_id, j.project_key,
+                       j.work_item_type_key, j.work_item_id, j.issue_url,
+                       j.report_url, j.outcome AS job_outcome,
+                       j.outcome_key AS job_outcome_key,
+                       j.business_key AS job_business_key,
+                       j.submission_key AS job_submission_key,
+                       j.generation AS job_generation,
+                       j.terminal_state AS job_terminal_state,
+                       j.terminal_error_code AS job_terminal_error_code,
+                       j.manifest_json, j.artifacts_json
+                  FROM rca_delivery_effects AS e
+                  JOIN rca_delivery_jobs AS j ON j.delivery_id = e.delivery_id
+                  JOIN rca_delivery_dispatcher_circuit AS circuit
+                    ON circuit.circuit_name = e.effect_kind
+                   AND circuit.state = 'closed'
+                  {activation_joins}
+                 WHERE (
+                        (
+                            e.status IN ('pending', 'retry_wait', 'uncertain')
+                            AND (e.next_attempt_at IS NULL OR e.next_attempt_at <= ?)
+                        )
+                        OR (
+                            e.status = 'claimed' AND e.lease_expires_at IS NOT NULL
+                            AND e.lease_expires_at <= ?
+                        )
+                 )
+                   {activation_filter}
+                 ORDER BY COALESCE(e.next_attempt_at, e.created_at), e.created_at,
+                          e.effect_key
+                 LIMIT 1
+                """,
+                (current, current),
+            ).fetchone()
+            if row is None:
+                conn.commit()
+                return None
+            previous_status = str(row["status"])
+            previous_write_phase = str(row["write_phase"] or "")
+            if previous_write_phase not in {"prewrite", "write_started"}:
+                raise DeliveryRecordConflictError(
+                    "dispatchable delivery effect has an invalid write phase"
+                )
+            if previous_status == "claimed":
+                old_fence = int(row["fence"])
+                write_was_started = previous_write_phase == "write_started"
+                self._append_attempt_event(
+                    conn,
+                    effect_key=str(row["effect_key"]),
+                    attempt_no=int(row["attempt"]),
+                    fence=old_fence,
+                    request_id=self._effect_request_id(str(row["effect_key"]), old_fence),
+                    outcome="unknown" if write_was_started else "nack",
+                    current=current,
+                    error_code=(
+                        "delivery_effect_write_outcome_unknown"
+                        if write_was_started
+                        else "delivery_effect_prewrite_lease_expired"
+                    ),
+                    detail=(
+                        "worker lease expired after entering the remote write boundary"
+                        if write_was_started
+                        else "worker lease expired before entering the remote write boundary"
+                    ),
+                )
+                previous_status = "uncertain" if write_was_started else "retry_wait"
+            elif previous_status == "uncertain" and previous_write_phase != "write_started":
+                raise DeliveryRecordConflictError(
+                    "uncertain delivery effect is missing its write boundary"
+                )
+            next_write_phase = (
+                "write_started" if previous_status == "uncertain" else "prewrite"
+            )
+            next_write_started_at = (
+                str(row["write_started_at"])
+                if next_write_phase == "write_started" and row["write_started_at"]
+                else None
+            )
+            next_reconciliation_miss_count = (
+                int(row["reconciliation_miss_count"])
+                if next_write_phase == "write_started"
+                else 0
+            )
+            next_attempt = int(row["attempt"]) + 1
+            next_fence = int(row["fence"]) + 1
+            request_id = self._effect_request_id(str(row["effect_key"]), next_fence)
+            updated = conn.execute(
+                """
+                UPDATE rca_delivery_effects
+                   SET status = 'claimed', attempt = ?, fence = ?,
+                       lease_token = ?, lease_owner = ?, lease_expires_at = ?,
+                       write_phase = ?, write_started_at = ?,
+                       reconciliation_miss_count = ?,
+                       next_attempt_at = NULL, updated_at = ?
+                 WHERE effect_key = ?
+                   AND (
+                        status IN ('pending', 'retry_wait', 'uncertain')
+                        OR (
+                            status = 'claimed' AND lease_expires_at IS NOT NULL
+                            AND lease_expires_at <= ?
+                        )
+                   )
+                """,
+                (
+                    next_attempt,
+                    next_fence,
+                    token,
+                    owner,
+                    expires,
+                    next_write_phase,
+                    next_write_started_at,
+                    next_reconciliation_miss_count,
+                    current,
+                    row["effect_key"],
+                    current,
+                ),
+            )
+            if updated.rowcount != 1:
+                conn.rollback()
+                return None
+            self._append_attempt_event(
+                conn,
+                effect_key=str(row["effect_key"]),
+                attempt_no=next_attempt,
+                fence=next_fence,
+                request_id=request_id,
+                outcome="started",
+                current=current,
+            )
+            conn.commit()
+            artifacts = json.loads(str(row["artifacts_json"] or "[]"))
+            if not isinstance(artifacts, list):
+                artifacts = []
+            if str(row["outcome"] or "success") != str(
+                row["job_outcome"] or "success"
+            ):
+                raise DeliveryRecordConflictError(
+                    "delivery effect outcome does not match its job"
+                )
+            return DeliveryEffectClaim(
+                effect_key=str(row["effect_key"]),
+                delivery_id=str(row["delivery_id"]),
+                effect_kind=str(row["effect_kind"]),
+                required=bool(row["required"]),
+                target_key=str(row["target_key"]),
+                payload=_json_object(row["payload_json"]),
+                payload_sha256=str(row["payload_sha256"]),
+                previous_status=previous_status,
+                attempt=next_attempt,
+                fence=next_fence,
+                request_id=request_id,
+                lease_token=token,
+                lease_owner=owner,
+                lease_expires_at=expires,
+                effect_created_at=str(row["created_at"]),
+                artifact_set_id=str(row["artifact_set_id"]),
+                project_key=str(row["project_key"]),
+                work_item_type_key=str(row["work_item_type_key"]),
+                work_item_id=str(row["work_item_id"]),
+                issue_url=str(row["issue_url"]),
+                report_url=str(row["report_url"]),
+                manifest=_json_object(row["manifest_json"]),
+                artifacts=artifacts,
+                write_phase=next_write_phase,
+                write_started_at=next_write_started_at,
+                reconciliation_miss_count=next_reconciliation_miss_count,
+                recovery_write_count=int(row["recovery_write_count"]),
+                last_recovery_write_at=(
+                    str(row["last_recovery_write_at"])
+                    if row["last_recovery_write_at"]
+                    else None
+                ),
+                outcome=str(row["job_outcome"] or "success"),
+                terminal_state=str(row["job_terminal_state"] or ""),
+                terminal_error_code=str(row["job_terminal_error_code"] or ""),
+                outcome_key=str(row["job_outcome_key"] or ""),
+                business_key=str(row["job_business_key"] or ""),
+                submission_key=str(row["job_submission_key"] or ""),
+                generation=int(row["job_generation"]),
+            )
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def complete_effect(
+        self,
+        *,
+        claim: DeliveryEffectClaim,
+        outcome: str,
+        remote_id: str,
+        receipt: dict[str, Any],
+        runtime_identity: Mapping[str, Any] | None = None,
+        now: datetime | None = None,
+    ) -> DeliveryEffectMutation:
+        if outcome not in {"ack", "reconciled"}:
+            raise ValueError("successful effect outcome must be ack or reconciled")
+        if not str(remote_id or "").strip():
+            raise ValueError("remote_id is required for a successful effect")
+        current = _iso(now)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = self._current_effect_claim(
+                conn,
+                effect_key=claim.effect_key,
+                lease_token=claim.lease_token,
+                fence=claim.fence,
+                current=current,
+            )
+            self._append_attempt_event(
+                conn,
+                effect_key=claim.effect_key,
+                attempt_no=claim.attempt,
+                fence=claim.fence,
+                request_id=claim.request_id,
+                outcome=outcome,
+                current=current,
+                remote_id=remote_id,
+            )
+            conn.execute(
+                """
+                UPDATE rca_delivery_effects
+                   SET status = 'succeeded', next_attempt_at = NULL,
+                       write_phase = 'settled',
+                       remote_receipt_json = ?, completed_at = ?,
+                       last_error_code = '', last_error_detail = '',
+                       lease_token = NULL, lease_owner = NULL,
+                       lease_expires_at = NULL, updated_at = ?
+                 WHERE effect_key = ? AND lease_token = ? AND fence = ?
+                """,
+                (
+                    _canonical_json(receipt),
+                    current,
+                    current,
+                    claim.effect_key,
+                    claim.lease_token,
+                    claim.fence,
+                ),
+            )
+            job_status = self._aggregate_job_status(
+                conn, str(row["delivery_id"]), current
+            )
+            if job_status in {"delivered", "partial"}:
+                self._reset_permanent_failure_streak_in_transaction(
+                    conn,
+                    circuit_name=claim.effect_kind,
+                    require_closed_circuit=True,
+                )
+            if runtime_identity is not None:
+                job_identity = conn.execute(
+                    """
+                    SELECT submission_key, business_key, generation
+                      FROM rca_delivery_jobs WHERE delivery_id = ?
+                    """,
+                    (claim.delivery_id,),
+                ).fetchone()
+                if job_identity is None:
+                    raise RuntimeError("delivery runtime transition job is missing")
+                insert_host_runtime_transition(
+                    conn,
+                    submission_key=str(job_identity["submission_key"]),
+                    business_key=str(job_identity["business_key"]),
+                    generation=int(job_identity["generation"]),
+                    service_label="local.pnc.rca-delivery-dispatcher",
+                    transition_kind="effect_succeeded",
+                    entity_key=claim.effect_key,
+                    runtime_identity=runtime_identity,
+                    transitioned_at=current,
+                )
+            conn.commit()
+            return DeliveryEffectMutation(
+                claim.effect_key, claim.delivery_id, "succeeded", job_status
+            )
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def reschedule_effect(
+        self,
+        *,
+        claim: DeliveryEffectClaim,
+        error_code: str,
+        error_detail: str,
+        delay_seconds: int,
+        uncertain: bool,
+        max_age_seconds: int = 86_400,
+        now: datetime | None = None,
+    ) -> DeliveryEffectMutation:
+        if delay_seconds < 0 or max_age_seconds < 1:
+            raise ValueError("retry delay and max age are invalid")
+        current_dt = _utc_datetime(now)
+        current = _iso(current_dt)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            mutation = self._reschedule_effect_in_transaction(
+                conn,
+                claim=claim,
+                error_code=error_code,
+                error_detail=error_detail,
+                delay_seconds=delay_seconds,
+                uncertain=uncertain,
+                max_age_seconds=max_age_seconds,
+                current_dt=current_dt,
+                current=current,
+            )
+            conn.commit()
+            return mutation
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def reschedule_effect_and_open_circuit(
+        self,
+        *,
+        claim: DeliveryEffectClaim,
+        error_code: str,
+        error_detail: str,
+        delay_seconds: int,
+        uncertain: bool,
+        max_age_seconds: int = 86_400,
+        now: datetime | None = None,
+    ) -> DeliveryEffectMutation:
+        """Reschedule a fenced effect and open its dispatcher circuit atomically."""
+        if delay_seconds < 0 or max_age_seconds < 1:
+            raise ValueError("retry delay and max age are invalid")
+        current_dt = _utc_datetime(now)
+        current = _iso(current_dt)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            mutation = self._reschedule_effect_in_transaction(
+                conn,
+                claim=claim,
+                error_code=error_code,
+                error_detail=error_detail,
+                delay_seconds=delay_seconds,
+                uncertain=uncertain,
+                max_age_seconds=max_age_seconds,
+                current_dt=current_dt,
+                current=current,
+            )
+            self._open_delivery_dispatcher_circuit_in_transaction(
+                conn,
+                circuit_name=claim.effect_kind,
+                reason_code=error_code,
+                reason_detail=error_detail,
+                current=current,
+            )
+            conn.commit()
+            return mutation
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _reschedule_effect_in_transaction(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        claim: DeliveryEffectClaim,
+        error_code: str,
+        error_detail: str,
+        delay_seconds: int,
+        uncertain: bool,
+        max_age_seconds: int,
+        current_dt: datetime,
+        current: str,
+    ) -> DeliveryEffectMutation:
+        row = self._current_effect_claim(
+            conn,
+            effect_key=claim.effect_key,
+            lease_token=claim.lease_token,
+            fence=claim.fence,
+            current=current,
+        )
+        age = (current_dt - _parse_iso(str(row["created_at"]))).total_seconds()
+        if age >= max_age_seconds:
+            effect_status = "quarantined"
+            event_outcome = "quarantined"
+            next_attempt_at = None
+            write_phase = "settled"
+            final_code = "delivery_effect_age_exceeded"
+            final_detail = "delivery effect exceeded the 24 hour retry horizon"
+        else:
+            effect_status = "uncertain" if uncertain else "retry_wait"
+            event_outcome = "unknown" if uncertain else "nack"
+            next_attempt_at = _iso(current_dt + timedelta(seconds=delay_seconds))
+            write_phase = "write_started" if uncertain else "prewrite"
+            final_code = error_code
+            final_detail = error_detail
+        self._append_attempt_event(
+            conn,
+            effect_key=claim.effect_key,
+            attempt_no=claim.attempt,
+            fence=claim.fence,
+            request_id=claim.request_id,
+            outcome=event_outcome,
+            current=current,
+            error_code=final_code,
+            detail=final_detail,
+        )
+        conn.execute(
+            """
+            UPDATE rca_delivery_effects
+               SET status = ?, next_attempt_at = ?,
+                   write_phase = ?,
+                   write_started_at = CASE WHEN ? = 'prewrite' THEN NULL
+                                           ELSE write_started_at END,
+                   reconciliation_miss_count = CASE WHEN ? = 'prewrite' THEN 0
+                                                    ELSE reconciliation_miss_count END,
+                   quarantined_at = CASE WHEN ? = 'quarantined' THEN ? ELSE NULL END,
+                   last_error_code = ?, last_error_detail = ?,
+                   lease_token = NULL, lease_owner = NULL,
+                   lease_expires_at = NULL, updated_at = ?
+             WHERE effect_key = ? AND lease_token = ? AND fence = ?
+            """,
+            (
+                effect_status,
+                next_attempt_at,
+                write_phase,
+                write_phase,
+                write_phase,
+                effect_status,
+                current,
+                str(final_code or "")[:120],
+                str(final_detail or "")[:1000],
+                current,
+                claim.effect_key,
+                claim.lease_token,
+                claim.fence,
+            ),
+        )
+        job_status = self._aggregate_job_status(
+            conn, str(row["delivery_id"]), current
+        )
+        if effect_status == "quarantined":
+            self._record_permanent_failure_in_transaction(
+                conn,
+                circuit_name=claim.effect_kind,
+                subject_key=claim.effect_key,
+                failure_state="quarantined",
+                error_code=final_code,
+                error_detail=final_detail,
+                current=current,
+            )
+        return DeliveryEffectMutation(
+            claim.effect_key,
+            claim.delivery_id,
+            effect_status,
+            job_status,
+            next_attempt_at,
+        )
+
+    def quarantine_effect(
+        self,
+        *,
+        claim: DeliveryEffectClaim,
+        error_code: str,
+        error_detail: str,
+        now: datetime | None = None,
+    ) -> DeliveryEffectMutation:
+        current = _iso(now)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            mutation = self._quarantine_effect_in_transaction(
+                conn,
+                claim=claim,
+                error_code=error_code,
+                error_detail=error_detail,
+                current=current,
+            )
+            conn.commit()
+            return mutation
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def quarantine_effect_and_open_circuit(
+        self,
+        *,
+        claim: DeliveryEffectClaim,
+        error_code: str,
+        error_detail: str,
+        now: datetime | None = None,
+    ) -> DeliveryEffectMutation:
+        """Atomically quarantine an effect and stop writes to its boundary."""
+        current = _iso(now)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            mutation = self._quarantine_effect_in_transaction(
+                conn,
+                claim=claim,
+                error_code=error_code,
+                error_detail=error_detail,
+                current=current,
+            )
+            self._open_delivery_dispatcher_circuit_in_transaction(
+                conn,
+                circuit_name=claim.effect_kind,
+                reason_code=error_code,
+                reason_detail=error_detail,
+                current=current,
+            )
+            conn.commit()
+            return mutation
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _quarantine_effect_in_transaction(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        claim: DeliveryEffectClaim,
+        error_code: str,
+        error_detail: str,
+        current: str,
+    ) -> DeliveryEffectMutation:
+        row = self._current_effect_claim(
+            conn,
+            effect_key=claim.effect_key,
+            lease_token=claim.lease_token,
+            fence=claim.fence,
+            current=current,
+        )
+        self._append_attempt_event(
+            conn,
+            effect_key=claim.effect_key,
+            attempt_no=claim.attempt,
+            fence=claim.fence,
+            request_id=claim.request_id,
+            outcome="quarantined",
+            current=current,
+            error_code=error_code,
+            detail=error_detail,
+        )
+        conn.execute(
+            """
+            UPDATE rca_delivery_effects
+               SET status = 'quarantined', quarantined_at = ?,
+                   write_phase = 'settled',
+                   next_attempt_at = NULL, last_error_code = ?,
+                   last_error_detail = ?, lease_token = NULL,
+                   lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+             WHERE effect_key = ? AND lease_token = ? AND fence = ?
+            """,
+            (
+                current,
+                str(error_code or "")[:120],
+                str(error_detail or "")[:1000],
+                current,
+                claim.effect_key,
+                claim.lease_token,
+                claim.fence,
+            ),
+        )
+        job_status = self._aggregate_job_status(
+            conn, str(row["delivery_id"]), current
+        )
+        self._record_permanent_failure_in_transaction(
+            conn,
+            circuit_name=claim.effect_kind,
+            subject_key=claim.effect_key,
+            failure_state="quarantined",
+            error_code=error_code,
+            error_detail=error_detail,
+            current=current,
+        )
+        return DeliveryEffectMutation(
+            claim.effect_key, claim.delivery_id, "quarantined", job_status
+        )
+
+    def delivery_dispatcher_circuit(
+        self, effect_kind: str = DELIVERY_EFFECT_KIND
+    ) -> DeliveryDispatcherCircuit:
+        if effect_kind not in {DELIVERY_EFFECT_KIND, DELIVERY_THREAD_EFFECT_KIND}:
+            raise ValueError("unsupported delivery circuit")
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT state, reason_code, reason_detail, opened_at, updated_at
+                  FROM rca_delivery_dispatcher_circuit
+                 WHERE circuit_name = ?
+                """
+                , (effect_kind,)
+            ).fetchone()
+            if row is None:
+                return DeliveryDispatcherCircuit(
+                    state="open", reason_code="delivery_circuit_state_missing"
+                )
+            return DeliveryDispatcherCircuit(**dict(row))
+        finally:
+            conn.close()
+
+    def delivery_dispatcher_circuits(self) -> dict[str, DeliveryDispatcherCircuit]:
+        return {
+            effect_kind: self.delivery_dispatcher_circuit(effect_kind)
+            for effect_kind in (DELIVERY_EFFECT_KIND, DELIVERY_THREAD_EFFECT_KIND)
+        }
+
+    def open_delivery_dispatcher_circuit(
+        self,
+        *,
+        effect_kind: str = DELIVERY_EFFECT_KIND,
+        reason_code: str,
+        reason_detail: str = "",
+        now: datetime | None = None,
+    ) -> DeliveryDispatcherCircuit:
+        if effect_kind not in {DELIVERY_EFFECT_KIND, DELIVERY_THREAD_EFFECT_KIND}:
+            raise ValueError("unsupported delivery circuit")
+        current = _iso(now)
+        conn = self._connect()
+        try:
+            self._open_delivery_dispatcher_circuit_in_transaction(
+                conn,
+                circuit_name=effect_kind,
+                reason_code=reason_code,
+                reason_detail=reason_detail,
+                current=current,
+            )
+        finally:
+            conn.close()
+        return self.delivery_dispatcher_circuit(effect_kind)
+
+    @staticmethod
+    def _permanent_failure_streak_in_transaction(
+        conn: sqlite3.Connection,
+        circuit_name: str = DELIVERY_EFFECT_KIND,
+    ) -> int:
+        streak_key = (
+            _PERMANENT_FAILURE_STREAK_META_KEY
+            if circuit_name == DELIVERY_EFFECT_KIND
+            else f"{_PERMANENT_FAILURE_STREAK_META_KEY}:{circuit_name}"
+        )
+        row = conn.execute(
+            "SELECT value FROM rca_delivery_meta WHERE key = ?",
+            (streak_key,),
+        ).fetchone()
+        if row is None:
+            return 0
+        try:
+            streak = int(str(row["value"]))
+        except (TypeError, ValueError):
+            return PERMANENT_FAILURE_CIRCUIT_THRESHOLD
+        if streak < 0:
+            return PERMANENT_FAILURE_CIRCUIT_THRESHOLD
+        return streak
+
+    def _record_permanent_failure_in_transaction(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        circuit_name: str = DELIVERY_EFFECT_KIND,
+        subject_key: str,
+        failure_state: str,
+        error_code: str,
+        error_detail: str,
+        current: str,
+    ) -> int:
+        streak_key = (
+            _PERMANENT_FAILURE_STREAK_META_KEY
+            if circuit_name == DELIVERY_EFFECT_KIND
+            else f"{_PERMANENT_FAILURE_STREAK_META_KEY}:{circuit_name}"
+        )
+        last_key = (
+            _PERMANENT_FAILURE_LAST_META_KEY
+            if circuit_name == DELIVERY_EFFECT_KIND
+            else f"{_PERMANENT_FAILURE_LAST_META_KEY}:{circuit_name}"
+        )
+        streak = self._permanent_failure_streak_in_transaction(
+            conn, circuit_name
+        ) + 1
+        last_failure = {
+            "subject_key": str(subject_key or "")[:256],
+            "state": str(failure_state or "")[:120],
+            "error_code": str(error_code or "")[:120],
+            "error_detail": str(error_detail or "")[:1000],
+            "observed_at": current,
+        }
+        conn.execute(
+            """
+            INSERT INTO rca_delivery_meta(key, value) VALUES(?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (streak_key, str(streak)),
+        )
+        conn.execute(
+            """
+            INSERT INTO rca_delivery_meta(key, value) VALUES(?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (last_key, _canonical_json(last_failure)),
+        )
+        if streak >= PERMANENT_FAILURE_CIRCUIT_THRESHOLD:
+            self._open_delivery_dispatcher_circuit_in_transaction(
+                conn,
+                circuit_name=circuit_name,
+                reason_code="delivery_permanent_failure_streak_exceeded",
+                reason_detail=(
+                    f"{streak} consecutive permanent RCA pipeline failures; "
+                    f"last={last_failure['state']}:{last_failure['error_code']}; "
+                    f"subject={last_failure['subject_key']}"
+                ),
+                current=current,
+            )
+        return streak
+
+    @staticmethod
+    def _reset_permanent_failure_streak_in_transaction(
+        conn: sqlite3.Connection,
+        *,
+        circuit_name: str = DELIVERY_EFFECT_KIND,
+        require_closed_circuit: bool,
+    ) -> bool:
+        streak_key = (
+            _PERMANENT_FAILURE_STREAK_META_KEY
+            if circuit_name == DELIVERY_EFFECT_KIND
+            else f"{_PERMANENT_FAILURE_STREAK_META_KEY}:{circuit_name}"
+        )
+        last_key = (
+            _PERMANENT_FAILURE_LAST_META_KEY
+            if circuit_name == DELIVERY_EFFECT_KIND
+            else f"{_PERMANENT_FAILURE_LAST_META_KEY}:{circuit_name}"
+        )
+        if require_closed_circuit:
+            circuit = conn.execute(
+                "SELECT state FROM rca_delivery_dispatcher_circuit "
+                "WHERE circuit_name = ?",
+                (circuit_name,),
+            ).fetchone()
+            if circuit is None or str(circuit["state"]) != "closed":
+                return False
+        conn.execute(
+            """
+            INSERT INTO rca_delivery_meta(key, value) VALUES(?, '0')
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (streak_key,),
+        )
+        conn.execute(
+            "DELETE FROM rca_delivery_meta WHERE key = ?",
+            (last_key,),
+        )
+        return True
+
+    def permanent_failure_circuit_state(
+        self, effect_kind: str = DELIVERY_EFFECT_KIND
+    ) -> dict[str, Any]:
+        if effect_kind not in {DELIVERY_EFFECT_KIND, DELIVERY_THREAD_EFFECT_KIND}:
+            raise ValueError("unsupported delivery circuit")
+        last_key = (
+            _PERMANENT_FAILURE_LAST_META_KEY
+            if effect_kind == DELIVERY_EFFECT_KIND
+            else f"{_PERMANENT_FAILURE_LAST_META_KEY}:{effect_kind}"
+        )
+        conn = self._connect()
+        try:
+            streak = self._permanent_failure_streak_in_transaction(
+                conn, effect_kind
+            )
+            row = conn.execute(
+                "SELECT value FROM rca_delivery_meta WHERE key = ?",
+                (last_key,),
+            ).fetchone()
+            last_failure = _json_object(row["value"]) if row is not None else {}
+            return {
+                "threshold": PERMANENT_FAILURE_CIRCUIT_THRESHOLD,
+                "consecutive_failures": streak,
+                "last_failure": last_failure,
+            }
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _open_delivery_dispatcher_circuit_in_transaction(
+        conn: sqlite3.Connection,
+        *,
+        circuit_name: str = DELIVERY_EFFECT_KIND,
+        reason_code: str,
+        reason_detail: str,
+        current: str,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO rca_delivery_dispatcher_circuit(
+                circuit_name, state, reason_code, reason_detail,
+                opened_at, updated_at
+            ) VALUES(?, 'open', ?, ?, ?, ?)
+            ON CONFLICT(circuit_name) DO UPDATE SET
+                state = 'open', reason_code = excluded.reason_code,
+                reason_detail = excluded.reason_detail,
+                opened_at = COALESCE(
+                    rca_delivery_dispatcher_circuit.opened_at,
+                    excluded.opened_at
+                ),
+                updated_at = excluded.updated_at
+            """,
+            (
+                circuit_name,
+                str(reason_code or "delivery_dispatcher_system_error")[:120],
+                str(reason_detail or "")[:1000],
+                current,
+                current,
+            ),
+        )
+
+    def close_delivery_dispatcher_circuit(
+        self,
+        *,
+        effect_kind: str = DELIVERY_EFFECT_KIND,
+        now: datetime | None = None,
+    ) -> DeliveryDispatcherCircuit:
+        if effect_kind not in {DELIVERY_EFFECT_KIND, DELIVERY_THREAD_EFFECT_KIND}:
+            raise ValueError("unsupported delivery circuit")
+        current = _iso(now)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                INSERT INTO rca_delivery_dispatcher_circuit(
+                    circuit_name, state, updated_at
+                ) VALUES(?, 'closed', ?)
+                ON CONFLICT(circuit_name) DO UPDATE SET
+                    state = 'closed', reason_code = '', reason_detail = '',
+                    opened_at = NULL, updated_at = excluded.updated_at
+                """,
+                (effect_kind, current),
+            )
+            self._reset_permanent_failure_streak_in_transaction(
+                conn,
+                circuit_name=effect_kind,
+                require_closed_circuit=False,
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return self.delivery_dispatcher_circuit(effect_kind)
+
+    @staticmethod
+    def _delivery_outcome_slo_in_transaction(
+        conn: sqlite3.Connection, *, current_dt: datetime
+    ) -> dict[str, Any]:
+        observed_at = _iso(current_dt)
+        cutoff = _iso(
+            current_dt
+            - timedelta(seconds=DELIVERY_OUTCOME_CONSECUTIVE_WINDOW_SECONDS)
+        )
+        rows = conn.execute(
+            """
+            SELECT status, updated_at
+              FROM rca_delivery_jobs
+             WHERE updated_at >= ?
+             ORDER BY updated_at DESC, rowid DESC
+            """,
+            (cutoff,),
+        ).fetchall()
+        recent: list[tuple[bool, datetime]] = []
+        contract_valid = True
+        success_statuses = set(DELIVERY_OUTCOME_SLO_SUCCESS_STATUSES)
+        failure_statuses = set(DELIVERY_OUTCOME_SLO_FAILURE_STATUSES)
+        allowed_statuses = {"ready", *success_statuses, *failure_statuses}
+        for row in rows:
+            status = str(row["status"] or "")
+            try:
+                updated_at = _parse_iso(str(row["updated_at"] or ""))
+            except ValueError:
+                contract_valid = False
+                continue
+            if status not in allowed_statuses:
+                contract_valid = False
+                continue
+            if status == "ready":
+                continue
+            recent.append((status in failure_statuses, updated_at))
+
+        windows: dict[str, dict[str, Any]] = {}
+        for name, window_seconds, min_samples, max_failure_rate in (
+            DELIVERY_OUTCOME_SLO_WINDOWS
+        ):
+            window_cutoff = current_dt - timedelta(seconds=window_seconds)
+            delivery_failures = [
+                failed for failed, updated_at in recent if updated_at >= window_cutoff
+            ]
+            failures = sum(delivery_failures)
+            failure_rate = (
+                failures / len(delivery_failures) if delivery_failures else 0.0
+            )
+            windows[name] = {
+                "window_seconds": window_seconds,
+                "min_samples": min_samples,
+                "max_failure_rate": max_failure_rate,
+                "sample_count": len(delivery_failures),
+                "failure_count": failures,
+                "failure_rate": failure_rate,
+                "breached": (
+                    len(delivery_failures) >= min_samples
+                    and failure_rate > max_failure_rate
+                ),
+            }
+
+        consecutive_failures = 0
+        for failed, _updated_at in recent:
+            if not failed:
+                break
+            consecutive_failures += 1
+        consecutive_breached = (
+            consecutive_failures >= DELIVERY_OUTCOME_CONSECUTIVE_FAILURE_THRESHOLD
+        )
+        outcome_slo = {
+            "schema_version": DELIVERY_OUTCOME_SLO_SCHEMA_VERSION,
+            "observed_at": observed_at,
+            "success_delivery_statuses": sorted(
+                DELIVERY_OUTCOME_SLO_SUCCESS_STATUSES
+            ),
+            "failure_delivery_statuses": sorted(
+                DELIVERY_OUTCOME_SLO_FAILURE_STATUSES
+            ),
+            "windows": windows,
+            "consecutive_failure_window_seconds": (
+                DELIVERY_OUTCOME_CONSECUTIVE_WINDOW_SECONDS
+            ),
+            "consecutive_failure_threshold": (
+                DELIVERY_OUTCOME_CONSECUTIVE_FAILURE_THRESHOLD
+            ),
+            "consecutive_failure_count": consecutive_failures,
+            "consecutive_failure_breached": consecutive_breached,
+            "contract_valid": contract_valid,
+            "healthy": (
+                contract_valid
+                and not consecutive_breached
+                and not any(window["breached"] for window in windows.values())
+            ),
+        }
+        validate_delivery_outcome_slo(
+            outcome_slo, expected_observed_at=observed_at
+        )
+        return outcome_slo
+
+    @classmethod
+    def read_existing_backpressure_snapshot(
+        cls,
+        db_path: str | Path,
+        *,
+        now: datetime | None = None,
+        busy_timeout_ms: int = 5000,
+    ) -> DeliveryBackpressureSnapshot:
+        """Read the delivery backlog and circuit from one immutable DB snapshot."""
+        path = Path(db_path).expanduser()
+        if not path.is_file():
+            raise RuntimeError("delivery_backpressure_store_unavailable:file_missing")
+        current_dt = _utc_datetime(now)
+        current = _iso(current_dt)
+        uri = f"{path.resolve().as_uri()}?mode=ro"
+        try:
+            conn = sqlite3.connect(
+                uri,
+                uri=True,
+                timeout=busy_timeout_ms / 1000,
+                isolation_level=None,
+            )
+            conn.row_factory = sqlite3.Row
+            conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+            conn.execute("PRAGMA query_only=ON")
+            conn.execute("BEGIN")
+            marker = conn.execute(
+                "SELECT value FROM rca_delivery_meta WHERE key = 'schema_version'"
+            ).fetchone()
+            if (
+                marker is None
+                or str(marker["value"])
+                not in SUPPORTED_DELIVERY_STORE_SCHEMA_VERSIONS
+            ):
+                raise RuntimeError(
+                    "delivery_backpressure_contract_invalid:schema_version"
+                )
+            rows = conn.execute(
+                "SELECT status, COUNT(*) AS count "
+                "FROM rca_delivery_effects GROUP BY status"
+            ).fetchall()
+            counts = {str(row["status"]): int(row["count"]) for row in rows}
+            unknown_states = set(counts) - DELIVERY_EFFECT_STATES
+            if unknown_states or any(value < 0 for value in counts.values()):
+                raise RuntimeError(
+                    "delivery_backpressure_contract_invalid:effect_status"
+                )
+            watch_rows = conn.execute(
+                "SELECT state, COUNT(*) AS count "
+                "FROM rca_execution_watch GROUP BY state"
+            ).fetchall()
+            watch_counts = {
+                str(row["state"]): int(row["count"]) for row in watch_rows
+            }
+            if set(watch_counts) - DELIVERY_WATCH_STATES or any(
+                value < 0 for value in watch_counts.values()
+            ):
+                raise RuntimeError(
+                    "delivery_backpressure_contract_invalid:watch_state"
+                )
+            untracked_completed = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*)
+                      FROM rca_outbox AS outbox
+                      LEFT JOIN rca_execution_watch AS watch
+                        ON watch.submission_outbox_id = outbox.outbox_id
+                     WHERE outbox.status IN ('completed', 'quarantined')
+                       AND watch.submission_outbox_id IS NULL
+                    """
+                ).fetchone()[0]
+            )
+            if untracked_completed < 0:
+                raise RuntimeError(
+                    "delivery_backpressure_contract_invalid:untracked_completed"
+                )
+            circuit_rows = conn.execute(
+                """
+                SELECT circuit_name, state, reason_code, reason_detail,
+                       opened_at, updated_at
+                  FROM rca_delivery_dispatcher_circuit
+                 WHERE circuit_name IN ('feishu_issue_comment', 'feishu_thread_reply')
+                """
+            ).fetchall()
+            rows_by_name = {str(item["circuit_name"]): item for item in circuit_rows}
+            circuits: dict[str, DeliveryDispatcherCircuit] = {}
+            for circuit_name in REQUIRED_DELIVERY_EFFECT_KINDS:
+                circuit_row = rows_by_name.get(circuit_name)
+                if circuit_row is None:
+                    circuits[circuit_name] = DeliveryDispatcherCircuit(
+                        state="open",
+                        reason_code="delivery_circuit_state_missing",
+                        reason_detail=circuit_name,
+                        updated_at=current,
+                    )
+                    continue
+                circuit_body = dict(circuit_row)
+                circuit_body.pop("circuit_name", None)
+                item = DeliveryDispatcherCircuit(**circuit_body)
+                if item.state not in {"closed", "open"}:
+                    raise RuntimeError(
+                        "delivery_backpressure_contract_invalid:circuit_state"
+                    )
+                circuits[circuit_name] = item
+            open_names = sorted(
+                name for name, item in circuits.items() if item.is_open
+            )
+            circuit = (
+                circuits[open_names[0]]
+                if open_names
+                else circuits[DELIVERY_EFFECT_KIND]
+            )
+            outcome_slo = cls._delivery_outcome_slo_in_transaction(
+                conn, current_dt=current_dt
+            )
+            conn.commit()
+        except sqlite3.Error as exc:
+            if "conn" in locals():
+                conn.rollback()
+            raise RuntimeError("delivery_backpressure_store_unavailable:sqlite") from exc
+        except Exception:
+            if "conn" in locals():
+                conn.rollback()
+            raise
+        finally:
+            if "conn" in locals():
+                conn.close()
+
+        unresolved = {
+            state: counts.get(state, 0)
+            for state in DELIVERY_EFFECT_UNRESOLVED_STATES
+        }
+        unresolved_effects = sum(unresolved.values())
+        pending_watches = watch_counts.get("pending", 0)
+        running_watches = watch_counts.get("running", 0)
+        return DeliveryBackpressureSnapshot(
+            schema_version=DELIVERY_BACKPRESSURE_SNAPSHOT_SCHEMA_VERSION,
+            observed_at=current,
+            db_path=str(path),
+            pending=unresolved["pending"],
+            claimed=unresolved["claimed"],
+            retry_wait=unresolved["retry_wait"],
+            uncertain=unresolved["uncertain"],
+            unresolved_effects=unresolved_effects,
+            untracked_completed_submissions=untracked_completed,
+            pending_watches=pending_watches,
+            running_watches=running_watches,
+            unresolved_work=(
+                unresolved_effects
+                + untracked_completed
+                + pending_watches
+                + running_watches
+            ),
+            outcome_slo=outcome_slo,
+            circuit=circuit,
+            circuits=circuits,
+        )
+
+    def backpressure_snapshot(
+        self, *, now: datetime | None = None
+    ) -> DeliveryBackpressureSnapshot:
+        return self.read_existing_backpressure_snapshot(
+            self.db_path,
+            now=now,
+            busy_timeout_ms=self.busy_timeout_ms,
+        )
+
+    def preview_dispatchable_effects(
+        self,
+        *,
+        limit: int = 100,
+        activation_required: bool = False,
+    ) -> list[dict[str, Any]]:
+        self._validate_activation_required(activation_required)
+        if limit < 1:
+            return []
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            activation_enforced = self._activation_enforced_tx(
+                conn,
+                activation_required=activation_required,
+            )
+            if activation_enforced:
+                self._require_activation_schema(conn)
+            activation_joins = (
+                """
+                  JOIN rca_execution_watch AS w
+                    ON w.submission_key = j.submission_key
+                  JOIN rca_outbox AS o
+                    ON o.outbox_id = w.submission_outbox_id
+                  JOIN business_triggers AS t
+                    ON t.business_key = o.business_key
+                   AND t.generation = o.generation
+                """
+                if activation_enforced
+                else ""
+            )
+            activation_filter = (
+                f"AND {_ACTIVATION_EXECUTION_ELIGIBLE_SQL}"
+                if activation_enforced
+                else ""
+            )
+            rows = conn.execute(
+                f"""
+                SELECT e.effect_key, e.delivery_id, e.effect_kind, e.required,
+                       e.status, e.attempt, e.next_attempt_at, e.created_at,
+                       j.project_key, j.work_item_id, j.report_url, j.outcome
+                  FROM rca_delivery_effects AS e
+                  JOIN rca_delivery_jobs AS j ON j.delivery_id = e.delivery_id
+                  {activation_joins}
+                 WHERE e.status IN ('pending', 'retry_wait', 'uncertain', 'claimed')
+                   {activation_filter}
+                 ORDER BY COALESCE(e.next_attempt_at, e.created_at), e.effect_key
+                 LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
+
+    def list_rows(self, table: str) -> list[dict[str, Any]]:
+        allowed = {
+            "rca_execution_watch",
+            "rca_delivery_jobs",
+            "rca_delivery_effects",
+            "rca_delivery_attempts",
+            "rca_delivery_dispatcher_circuit",
+            "rca_delivery_subscriptions",
+        }
+        if table not in allowed:
+            raise ValueError(f"unsupported delivery table: {table}")
+        conn = self._connect()
+        try:
+            rows = conn.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _activation_pipeline_count_tx(
+        conn: sqlite3.Connection,
+        *,
+        from_sql: str,
+        where_sql: str,
+    ) -> dict[str, int]:
+        row = conn.execute(
+            f"""
+            SELECT COUNT(*) AS total,
+                   COALESCE(SUM(CASE
+                       WHEN {_ACTIVATION_CURRENT_BINDING_SQL} THEN 1 ELSE 0
+                   END), 0) AS current_bound,
+                   COALESCE(SUM(CASE
+                       WHEN {_ACTIVATION_EXECUTION_ELIGIBLE_SQL} THEN 1 ELSE 0
+                   END), 0) AS eligible
+              {from_sql}
+             WHERE {where_sql}
+            """
+        ).fetchone()
+        total = int(row["total"])
+        current_bound = int(row["current_bound"])
+        eligible = int(row["eligible"])
+        return {
+            "eligible": eligible,
+            "held_current": max(0, current_bound - eligible),
+            "blocked_historical": max(0, total - current_bound),
+        }
+
+    @classmethod
+    def _activation_health_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        activation_required: bool,
+    ) -> dict[str, Any]:
+        activation_enforced = cls._activation_enforced_tx(
+            conn,
+            activation_required=activation_required,
+        )
+        schema_ready = cls._activation_schema_ready(conn)
+        empty = {
+            "completed_submissions": 0,
+            "active_watches": 0,
+            "pending_subscriptions": 0,
+            "dispatchable_effects": 0,
+        }
+        if not schema_ready:
+            return {
+                "required": activation_enforced,
+                "schema_ready": False,
+                "current_epoch_id": "",
+                "current_epoch_state": "unconfigured",
+                "processing_enabled": not activation_enforced,
+                "eligible_counts": dict(empty),
+                "held_current_counts": dict(empty),
+                "blocked_historical_counts": dict(empty),
+            }
+        epoch = conn.execute(
+            "SELECT epoch_id, state FROM rca_activation_epochs WHERE is_current = 1"
+        ).fetchone()
+        state = str(epoch["state"]) if epoch is not None else "unconfigured"
+        if not activation_enforced:
+            return {
+                "required": False,
+                "schema_ready": True,
+                "current_epoch_id": "",
+                "current_epoch_state": state,
+                "processing_enabled": True,
+                "eligible_counts": dict(empty),
+                "held_current_counts": dict(empty),
+                "blocked_historical_counts": dict(empty),
+            }
+        rows: dict[str, dict[str, int]] = {
+            "completed_submissions": cls._activation_pipeline_count_tx(
+                conn,
+                from_sql="""
+                  FROM rca_outbox AS o
+                  JOIN business_triggers AS t
+                    ON t.business_key = o.business_key
+                   AND t.generation = o.generation
+             LEFT JOIN rca_execution_watch AS w
+                    ON w.submission_key = o.submission_key
+                """,
+                where_sql="""
+                ((o.status = 'completed' AND o.result_json IS NOT NULL)
+                 OR o.status = 'quarantined')
+                AND w.submission_key IS NULL
+                """,
+            ),
+            "active_watches": cls._activation_pipeline_count_tx(
+                conn,
+                from_sql="""
+                  FROM rca_execution_watch AS w
+                  JOIN rca_outbox AS o ON o.outbox_id = w.submission_outbox_id
+                  JOIN business_triggers AS t
+                    ON t.business_key = o.business_key
+                   AND t.generation = o.generation
+                """,
+                where_sql="w.state IN ('pending', 'running')",
+            ),
+            "dispatchable_effects": cls._activation_pipeline_count_tx(
+                conn,
+                from_sql="""
+                  FROM rca_delivery_effects AS e
+                  JOIN rca_delivery_jobs AS j ON j.delivery_id = e.delivery_id
+                  JOIN rca_execution_watch AS w
+                    ON w.submission_key = j.submission_key
+                  JOIN rca_outbox AS o
+                    ON o.outbox_id = w.submission_outbox_id
+                  JOIN business_triggers AS t
+                    ON t.business_key = o.business_key
+                   AND t.generation = o.generation
+                """,
+                where_sql="""
+                e.status IN ('pending', 'claimed', 'retry_wait', 'uncertain')
+                """,
+            ),
+        }
+        if cls._table_exists(conn, "rca_delivery_subscriptions"):
+            rows["pending_subscriptions"] = cls._activation_pipeline_count_tx(
+                conn,
+                from_sql="""
+                  FROM rca_delivery_subscriptions AS s
+                  JOIN rca_delivery_jobs AS j
+                    ON j.business_key = s.business_key
+                   AND j.generation = s.generation
+                  JOIN rca_execution_watch AS w
+                    ON w.submission_key = j.submission_key
+                  JOIN rca_outbox AS o
+                    ON o.outbox_id = w.submission_outbox_id
+                  JOIN business_triggers AS t
+                    ON t.business_key = o.business_key
+                   AND t.generation = o.generation
+                """,
+                where_sql="s.status = 'pending'",
+            )
+        else:
+            rows["pending_subscriptions"] = {
+                "eligible": 0,
+                "held_current": 0,
+                "blocked_historical": 0,
+            }
+        return {
+            "required": activation_enforced,
+            "schema_ready": True,
+            "current_epoch_id": str(epoch["epoch_id"]) if epoch is not None else "",
+            "current_epoch_state": state,
+            "processing_enabled": state in ACTIVATION_DELIVERY_STATES,
+            "eligible_counts": {
+                name: values["eligible"] for name, values in sorted(rows.items())
+            },
+            "held_current_counts": {
+                name: values["held_current"]
+                for name, values in sorted(rows.items())
+            },
+            "blocked_historical_counts": {
+                name: values["blocked_historical"]
+                for name, values in sorted(rows.items())
+            },
+        }
+
+    def capacity_sample_candidates(
+        self,
+        *,
+        activated_at: datetime,
+        limit: int = 20,
+        excluded_task_attempts: set[tuple[str, str]] | None = None,
+    ) -> list[DeliveryCapacitySnapshot]:
+        """Return immutable delivered candidates from one read transaction.
+
+        This is deliberately a read-only projection over the existing delivery
+        tables. It neither marks rows nor creates a capacity-specific DB schema;
+        create-once evidence files and the signed ledger own deduplication.
+        """
+        activation = _utc_datetime(activated_at)
+        if isinstance(limit, bool) or not isinstance(limit, int) or not (
+            1 <= limit <= MAX_DELIVERY_CAPACITY_CANDIDATES
+        ):
+            raise ValueError("capacity candidate limit is invalid")
+        excluded = set(excluded_task_attempts or set())
+        if any(
+            not isinstance(item, tuple)
+            or len(item) != 2
+            or not all(isinstance(value, str) and value for value in item)
+            for item in excluded
+        ):
+            raise ValueError("excluded task attempts are invalid")
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            rows = conn.execute(
+                """
+                SELECT j.*, w.task_id, w.last_status_json,
+                       o.completed_at AS submission_completed_at,
+                       o.payload_json AS submission_payload_json,
+                       o.result_json AS submission_result_json
+                  FROM rca_delivery_jobs AS j
+                  JOIN rca_execution_watch AS w
+                    ON w.submission_key = j.submission_key
+                  JOIN rca_outbox AS o
+                    ON o.outbox_id = w.submission_outbox_id
+                 WHERE j.status = 'delivered'
+                   AND j.outcome = 'success'
+                   AND w.state = 'delivery_created'
+                   AND w.task_id IS NOT NULL
+                   AND w.last_status_json IS NOT NULL
+                   AND o.status = 'completed'
+                   AND o.result_json IS NOT NULL
+                   AND j.updated_at >= ?
+                 ORDER BY j.updated_at, j.delivery_id
+                 LIMIT ?
+                """,
+                (
+                    _iso(activation),
+                    min(
+                        MAX_DELIVERY_CAPACITY_CANDIDATES * 4,
+                        limit + len(excluded),
+                    ),
+                ),
+            ).fetchall()
+            snapshots: list[DeliveryCapacitySnapshot] = []
+            subscriptions_ready = self._table_exists(
+                conn, "rca_delivery_subscriptions"
+            )
+            for row in rows:
+                status = _json_object(row["last_status_json"])
+                task_meta = status.get("meta")
+                task_meta = dict(task_meta) if isinstance(task_meta, Mapping) else {}
+                task_id = str(row["task_id"] or "")
+                attempt_id = str(task_meta.get("rca_prod_attempt_id") or "")
+                if (task_id, attempt_id) in excluded:
+                    continue
+                effect_rows = conn.execute(
+                    """
+                    SELECT e.effect_key, e.effect_kind, e.required, e.target_key,
+                           e.status, e.remote_receipt_json, e.completed_at,
+                           e.updated_at,
+                           (
+                               SELECT a.remote_id
+                                 FROM rca_delivery_attempts AS a
+                                WHERE a.effect_key = e.effect_key
+                                  AND a.outcome IN ('ack', 'reconciled')
+                                  AND a.finished_at IS NOT NULL
+                                ORDER BY a.event_seq DESC, a.attempt_id DESC
+                                LIMIT 1
+                           ) AS remote_id
+                      FROM rca_delivery_effects AS e
+                     WHERE e.delivery_id = ? AND e.required = 1
+                     ORDER BY e.effect_kind, e.effect_key
+                     LIMIT ?
+                    """,
+                    (row["delivery_id"], MAX_DELIVERY_CAPACITY_EVIDENCE_ROWS),
+                ).fetchall()
+                effects = [
+                    {
+                        "effect_key": str(effect["effect_key"]),
+                        "effect_kind": str(effect["effect_kind"]),
+                        "required": int(effect["required"]) == 1,
+                        "target_key": str(effect["target_key"]),
+                        "status": str(effect["status"]),
+                        "remote_receipt": _json_object(
+                            effect["remote_receipt_json"]
+                        ),
+                        "remote_id": str(effect["remote_id"] or ""),
+                        "completed_at": (
+                            str(effect["completed_at"])
+                            if effect["completed_at"]
+                            else None
+                        ),
+                        "updated_at": str(effect["updated_at"]),
+                    }
+                    for effect in effect_rows
+                ]
+                subscriptions: list[dict[str, Any]] = []
+                if subscriptions_ready:
+                    subscription_rows = conn.execute(
+                        """
+                        SELECT subscription_key, effect_kind, target_key,
+                               required, status, delivery_id, effect_key,
+                               materialized_at, updated_at
+                          FROM rca_delivery_subscriptions
+                         WHERE business_key = ? AND generation = ?
+                           AND required = 1
+                         ORDER BY effect_kind, subscription_key
+                         LIMIT ?
+                        """,
+                        (
+                            row["business_key"],
+                            row["generation"],
+                            MAX_DELIVERY_CAPACITY_EVIDENCE_ROWS,
+                        ),
+                    ).fetchall()
+                    subscriptions = [
+                        {
+                            "subscription_key": str(item["subscription_key"]),
+                            "effect_kind": str(item["effect_kind"]),
+                            "target_key": str(item["target_key"]),
+                            "required": int(item["required"]) == 1,
+                            "status": str(item["status"]),
+                            "delivery_id": str(item["delivery_id"] or ""),
+                            "effect_key": str(item["effect_key"] or ""),
+                            "materialized_at": (
+                                str(item["materialized_at"])
+                                if item["materialized_at"]
+                                else None
+                            ),
+                            "updated_at": str(item["updated_at"]),
+                        }
+                        for item in subscription_rows
+                    ]
+                submission_payload = _json_object(row["submission_payload_json"])
+                trigger_context = submission_payload.get("trigger_context")
+                source_kind = (
+                    str(trigger_context.get("source_kind") or "")
+                    if isinstance(trigger_context, Mapping)
+                    else ""
+                )
+                updated_values = [
+                    str(row["updated_at"]),
+                    *(item["updated_at"] for item in effects),
+                    *(item["updated_at"] for item in subscriptions),
+                ]
+                payload = {
+                    "schema_version": DELIVERY_CAPACITY_SNAPSHOT_SCHEMA_VERSION,
+                    "snapshot_at": max(updated_values),
+                    "task_id": task_id,
+                    "attempt_id": attempt_id,
+                    "source_kind": source_kind,
+                    "submission_completed_at": str(
+                        row["submission_completed_at"] or ""
+                    ),
+                    "task_meta": task_meta,
+                    "job": {
+                        "delivery_id": str(row["delivery_id"]),
+                        "submission_key": str(row["submission_key"]),
+                        "business_key": str(row["business_key"]),
+                        "generation": int(row["generation"]),
+                        "outcome": str(row["outcome"]),
+                        "status": str(row["status"]),
+                        "created_at": str(row["created_at"]),
+                        "updated_at": str(row["updated_at"]),
+                    },
+                    "effects": effects,
+                    "required_subscriptions": subscriptions,
+                }
+                raw = _canonical_json(payload).encode("utf-8")
+                if len(raw) > MAX_DELIVERY_CAPACITY_SNAPSHOT_BYTES:
+                    raise RuntimeError("rca_delivery_capacity_snapshot_too_large")
+                snapshots.append(
+                    DeliveryCapacitySnapshot(
+                        payload=payload,
+                        snapshot_sha256=hashlib.sha256(raw).hexdigest(),
+                    )
+                )
+                if len(snapshots) >= limit:
+                    break
+            conn.commit()
+            return snapshots
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def health(
+        self,
+        *,
+        now: datetime | None = None,
+        activation_required: bool = False,
+    ) -> dict[str, Any]:
+        self._validate_activation_required(activation_required)
+        current_dt = _utc_datetime(now)
+        current = _iso(current_dt)
+        stalled_cutoff = _iso(
+            current_dt - timedelta(seconds=DELIVERY_WATCH_SLA_SECONDS)
+        )
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            activation = self._activation_health_tx(
+                conn,
+                activation_required=activation_required,
+            )
+            watch = {
+                row["state"]: int(row["count"])
+                for row in conn.execute(
+                    "SELECT state, COUNT(*) AS count FROM rca_execution_watch GROUP BY state"
+                ).fetchall()
+            }
+            jobs = {
+                row["status"]: int(row["count"])
+                for row in conn.execute(
+                    "SELECT status, COUNT(*) AS count FROM rca_delivery_jobs GROUP BY status"
+                ).fetchall()
+            }
+            job_outcomes = {
+                row["outcome"]: int(row["count"])
+                for row in conn.execute(
+                    "SELECT outcome, COUNT(*) AS count "
+                    "FROM rca_delivery_jobs GROUP BY outcome"
+                ).fetchall()
+            }
+            outcome_slo = self._delivery_outcome_slo_in_transaction(
+                conn, current_dt=current_dt
+            )
+            effects = {
+                row["status"]: int(row["count"])
+                for row in conn.execute(
+                    "SELECT status, COUNT(*) AS count FROM rca_delivery_effects GROUP BY status"
+                ).fetchall()
+            }
+            attempts = {
+                row["outcome"]: int(row["count"])
+                for row in conn.execute(
+                    "SELECT outcome, COUNT(*) AS count FROM rca_delivery_attempts GROUP BY outcome"
+                ).fetchall()
+            }
+            circuit_rows = conn.execute(
+                """
+                SELECT circuit_name, state, reason_code, reason_detail,
+                       opened_at, updated_at
+                  FROM rca_delivery_dispatcher_circuit
+                """
+            ).fetchall()
+            circuits = {
+                str(row["circuit_name"]): {
+                    key: row[key]
+                    for key in (
+                        "state", "reason_code", "reason_detail",
+                        "opened_at", "updated_at",
+                    )
+                }
+                for row in circuit_rows
+            }
+            subscriptions: dict[str, int] = {}
+            pending_required_subscriptions = 0
+            if self._table_exists(conn, "rca_delivery_subscriptions"):
+                subscriptions = {
+                    str(row["status"]): int(row["count"])
+                    for row in conn.execute(
+                        "SELECT status, COUNT(*) AS count "
+                        "FROM rca_delivery_subscriptions GROUP BY status"
+                    ).fetchall()
+                }
+                pending_required_subscriptions = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM rca_delivery_subscriptions "
+                        "WHERE required = 1 AND status = 'pending'"
+                    ).fetchone()[0]
+                )
+            unresolved_required_effects = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM rca_delivery_effects "
+                    "WHERE required = 1 AND status IN "
+                    "('pending', 'claimed', 'retry_wait', 'uncertain')"
+                ).fetchone()[0]
+            )
+            oldest_due = conn.execute(
+                """
+                SELECT MIN(next_poll_at) FROM rca_execution_watch
+                 WHERE state IN ('pending', 'running')
+                """
+            ).fetchone()[0]
+            expired = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) FROM rca_execution_watch
+                     WHERE state IN ('pending', 'running')
+                       AND lease_token IS NOT NULL AND lease_expires_at <= ?
+                    """,
+                    (current,),
+                ).fetchone()[0]
+            )
+            oldest_active_created_at = conn.execute(
+                """
+                SELECT MIN(created_at) FROM rca_execution_watch
+                 WHERE state IN ('pending', 'running')
+                """
+            ).fetchone()[0]
+            stalled_watch_count = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) FROM rca_execution_watch
+                     WHERE state IN ('pending', 'running') AND created_at <= ?
+                    """,
+                    (stalled_cutoff,),
+                ).fetchone()[0]
+            )
+            business_blockers = {
+                "activation_schema_unavailable": int(
+                    activation["required"] and not activation["schema_ready"]
+                ),
+                "stalled_watches": stalled_watch_count,
+                "terminal_failed_watches": int(watch.get("terminal_failed", 0)),
+                "quarantined_watches": int(watch.get("quarantined", 0)),
+                "quarantined_jobs": int(jobs.get("quarantined", 0)),
+                "uncertain_effects": int(effects.get("uncertain", 0)),
+                "quarantined_effects": int(effects.get("quarantined", 0)),
+                "quarantined_subscriptions": int(
+                    subscriptions.get("quarantined", 0)
+                ),
+                "pending_required_subscriptions": pending_required_subscriptions,
+                "unresolved_required_effects": unresolved_required_effects,
+                "outcome_slo_breached": int(not outcome_slo["healthy"]),
+            }
+            required_circuits = {
+                DELIVERY_EFFECT_KIND,
+                DELIVERY_THREAD_EFFECT_KIND,
+            }
+            circuits_ready = all(
+                circuits.get(name, {}).get("state") == "closed"
+                for name in required_circuits
+            )
+            circuit = circuits.get(DELIVERY_EFFECT_KIND, {"state": "missing"})
+            ready = not any(business_blockers.values()) and circuits_ready
+            permanent_failure_circuit = {
+                "threshold": PERMANENT_FAILURE_CIRCUIT_THRESHOLD,
+                "consecutive_failures": (
+                    self._permanent_failure_streak_in_transaction(conn)
+                ),
+            }
+            return {
+                "ok": ready,
+                "process_healthy": True,
+                "business_ready": ready,
+                "schema_version": DELIVERY_STORE_SCHEMA_VERSION,
+                "db_path": str(self.db_path),
+                "execution_watch": watch,
+                "delivery_jobs": jobs,
+                "delivery_job_outcomes": job_outcomes,
+                "delivery_outcome_slo": outcome_slo,
+                "delivery_effects": effects,
+                "delivery_attempts": attempts,
+                "delivery_subscriptions": subscriptions,
+                "delivery_dispatcher_circuit": circuit,
+                "delivery_dispatcher_circuits": circuits,
+                "activation": activation,
+                "permanent_failure_circuit": permanent_failure_circuit,
+                "oldest_watch_next_poll_at": oldest_due,
+                "oldest_active_watch_created_at": oldest_active_created_at,
+                "watch_sla_seconds": DELIVERY_WATCH_SLA_SECONDS,
+                "business_blockers": business_blockers,
+                "expired_watch_leases": expired,
+            }
+        finally:
+            conn.close()

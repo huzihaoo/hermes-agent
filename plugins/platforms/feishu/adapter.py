@@ -140,6 +140,8 @@ from gateway.platforms.base import (
     cache_image_from_url,
     cache_audio_from_bytes,
     cache_image_from_bytes,
+    _reply_anchor_for_event,
+    _thread_metadata_for_source,
 )
 from gateway.feishu_reply import FeishuBotMessageRegistry, record_feishu_bot_message_fingerprint
 from gateway.feishu_interaction_policy import (
@@ -159,6 +161,41 @@ logger = logging.getLogger(__name__)
 
 PNC_ALL_BUSINESS_TEST_GROUP_ID = "oc_16614f4ba25b8c88b69c0b8e9ebc2fb5"
 G1Q3_RCA_GROUP_ID = "oc_6cfc782212009ff4cd815349909dd423"
+_FEISHU_QUEUE_EVENT_CONTEXT_SCHEMA = "feishu_queue_message_event_v1"
+_G1Q3_RCA_MANUAL_QUEUE_ROUTE = "g1q3_rca_manual_v1"
+_MAX_FEISHU_QUEUE_REPLY_TEXT_CHARS = 32 * 1024
+_MAX_FEISHU_QUEUE_LINK_COUNT = 32
+_MAX_FEISHU_QUEUE_LINK_CHARS = 4096
+_MAX_API_POLL_PENDING_PER_CHAT = 1000
+_MAX_API_POLL_ITEM_BYTES = 128 * 1024
+_MAX_API_POLL_TOTAL_BYTES = 16 * 1024 * 1024
+_MAX_API_POLL_PER_CHAT_BYTES = 4 * 1024 * 1024
+_MAX_API_POLL_SCAN_ITEMS = 10_000
+_MAX_API_POLL_TERMINAL_HOLES = 1000
+_MAX_FEISHU_INBOX_STATE_BYTES = 16 * 1024 * 1024
+_API_POLL_CAPACITY_RESERVE_BYTES = 16 * 1024
+_API_POLL_SIDECAR_SCHEMA = "feishu_api_poll_state_v1"
+_API_POLL_INVALID_TOKEN_RE = re.compile(
+    r"(?is)(?:page[_\s-]*token.{0,80}(?:invalid|expired|illegal|not\s+valid))"
+    r"|(?:(?:invalid|expired|illegal|not\s+valid).{0,80}page[_\s-]*token)"
+)
+
+
+class _FeishuReplyContextUnavailable(RuntimeError):
+    """A referenced parent message could not be read reliably."""
+
+
+class _FeishuApiPollInvalidContinuation(RuntimeError):
+    """A persisted API page token is explicitly invalid and may be reset."""
+
+    def __init__(self, message: str, page_token: str):
+        super().__init__(message)
+        self.page_token = page_token
+
+
+@dataclass(frozen=True)
+class _FeishuApiPollScanContinuation:
+    state: Dict[str, Any]
 
 
 def _integration_tools_intake_chat_ids() -> set[str]:
@@ -187,9 +224,243 @@ def _looks_like_g1q3_rca_request_for_admission(text: str) -> bool:
         return True
     if re.search(r"(?:飞书问题|问题|issue|work[_ -]?item)\s*[:：#]?\s*\d{6,}", body, re.IGNORECASE):
         return True
+    if re.search(
+        r"project\.feishu\.cn/[^\s)]+/issue/detail/\d+",
+        body,
+        re.IGNORECASE,
+    ):
+        return True
     if re.search(r"\bcase\s+g1q3[-_ ]?\d+", lower):
         return True
     return False
+
+
+def _admission_text_with_issue_links(event: MessageEvent) -> str:
+    """Persist only allowlisted Feishu issue links needed after queue dequeue."""
+    text = str(getattr(event, "text", "") or "")
+    metadata = getattr(event, "metadata", None)
+    feishu = metadata.get("feishu") if isinstance(metadata, dict) else {}
+    raw_urls = feishu.get("link_urls") if isinstance(feishu, dict) else []
+    if not isinstance(raw_urls, list):
+        raw_urls = []
+    issue_urls: list[str] = []
+    for raw_url in raw_urls:
+        url = str(raw_url or "").strip()
+        if not url.startswith(("http://", "https://")):
+            continue
+        if not re.search(
+            r"^https?://project\.feishu\.cn/[^\s/?#]+/issue/detail/\d+",
+            url,
+            re.IGNORECASE,
+        ):
+            continue
+        if url not in issue_urls and url not in text:
+            issue_urls.append(url)
+    if not issue_urls:
+        return text
+    return "\n".join([text, *issue_urls]).strip()
+
+
+def _requires_durable_g1q3_gateway_decision(event: MessageEvent) -> bool:
+    """Route trusted fixed-group mentions through Gateway before inbox ACK."""
+    source = getattr(event, "source", None)
+    if source is None:
+        return False
+    chat_id = str(getattr(source, "chat_id", "") or "").strip()
+    if (
+        chat_id not in {G1Q3_RCA_GROUP_ID, PNC_ALL_BUSINESS_TEST_GROUP_ID}
+        or str(getattr(source, "chat_type", "") or "").strip().lower() != "group"
+        or bool(getattr(source, "is_bot", False))
+    ):
+        return False
+    metadata = getattr(event, "metadata", None)
+    feishu = metadata.get("feishu") if isinstance(metadata, dict) else None
+    if not isinstance(feishu, dict):
+        return False
+    if (
+        feishu.get("self_mentioned") is not True
+        or feishu.get("self_mention_command_directed") is not True
+        or feishu.get("is_bot_sender") is True
+        or feishu.get("sender_type") not in {None, "user"}
+    ):
+        return False
+    return True
+
+
+def _build_feishu_queue_event_context(
+    event: MessageEvent,
+    *,
+    durable_rca_manual: bool,
+) -> Dict[str, Any]:
+    """Serialize only the transport fields the queue worker may trust."""
+    source = event.source
+    metadata = event.metadata if isinstance(event.metadata, dict) else {}
+    raw_feishu = metadata.get("feishu")
+    raw_feishu = raw_feishu if isinstance(raw_feishu, dict) else {}
+    raw_links = raw_feishu.get("link_urls")
+    raw_link_urls = (
+        [str(url).strip() for url in raw_links if str(url or "").strip()]
+        if isinstance(raw_links, list)
+        else []
+    )
+    reply_to_text = str(event.reply_to_text or "")
+    if durable_rca_manual:
+        if len(reply_to_text) > _MAX_FEISHU_QUEUE_REPLY_TEXT_CHARS:
+            raise ValueError("durable Feishu reply context is too large")
+        if len(raw_link_urls) > _MAX_FEISHU_QUEUE_LINK_COUNT:
+            raise ValueError("durable Feishu link context has too many URLs")
+        if any(len(url) > _MAX_FEISHU_QUEUE_LINK_CHARS for url in raw_link_urls):
+            raise ValueError("durable Feishu link URL is too large")
+    else:
+        reply_to_text = reply_to_text[:_MAX_FEISHU_QUEUE_REPLY_TEXT_CHARS]
+        raw_link_urls = raw_link_urls[:_MAX_FEISHU_QUEUE_LINK_COUNT]
+    link_urls: list[str] = []
+    for url in raw_link_urls:
+        bounded_url = url[:_MAX_FEISHU_QUEUE_LINK_CHARS]
+        if bounded_url not in link_urls:
+            link_urls.append(bounded_url)
+    platform = getattr(source.platform, "value", source.platform)
+    receive_time_ms = raw_feishu.get("receive_time_ms")
+    if isinstance(receive_time_ms, bool) or not isinstance(
+        receive_time_ms, (str, int, float, type(None))
+    ):
+        receive_time_ms = None
+    return {
+        "schema_version": _FEISHU_QUEUE_EVENT_CONTEXT_SCHEMA,
+        "route_contract": (
+            _G1Q3_RCA_MANUAL_QUEUE_ROUTE if durable_rca_manual else None
+        ),
+        "source": {
+            "platform": str(platform or "feishu"),
+            "user_id": str(source.user_id or ""),
+            "user_id_alt": str(source.user_id_alt or "") or None,
+            "user_name": str(source.user_name or "") or None,
+            "chat_id": str(source.chat_id or ""),
+            "chat_name": str(source.chat_name or "") or None,
+            "chat_type": str(source.chat_type or "dm"),
+            "thread_id": str(source.thread_id or "") or None,
+            "is_bot": source.is_bot is True,
+        },
+        "event": {
+            "message_id": str(event.message_id or ""),
+            "reply_to_message_id": str(event.reply_to_message_id or "") or None,
+            "reply_to_text": reply_to_text or None,
+        },
+        "feishu": {
+            "message_id": str(event.message_id or ""),
+            "root_id": str(raw_feishu.get("root_id") or "") or None,
+            "parent_id": str(raw_feishu.get("parent_id") or "") or None,
+            "thread_id": str(source.thread_id or "") or None,
+            "sender_id": str(source.user_id or ""),
+            "sender_type": "bot" if source.is_bot else "user",
+            "is_bot_sender": source.is_bot is True,
+            "is_topic": bool(source.thread_id),
+            "raw_container_id": str(source.chat_id or ""),
+            "receive_time_ms": receive_time_ms,
+            "ingress_source": str(raw_feishu.get("ingress_source") or "") or None,
+            "link_urls": link_urls or None,
+            "self_mentioned": raw_feishu.get("self_mentioned") is True,
+            "self_mention_command_directed": (
+                raw_feishu.get("self_mention_command_directed") is True
+            ),
+            "mention_required": raw_feishu.get("mention_required") is True,
+        },
+    }
+
+
+def _validated_feishu_queue_event_context(item: Any) -> Optional[Dict[str, Any]]:
+    """Return a normalized context only when all transport identity mirrors agree."""
+    context = getattr(item, "event_context", None)
+    if not isinstance(context, dict) or context.get("schema_version") != _FEISHU_QUEUE_EVENT_CONTEXT_SCHEMA:
+        return None
+    source = context.get("source")
+    event = context.get("event")
+    feishu = context.get("feishu")
+    if not all(isinstance(value, dict) for value in (source, event, feishu)):
+        return None
+
+    def _norm(value: Any) -> str:
+        return str(value or "").strip()
+
+    expected_user_id = _norm(getattr(item, "user_id", ""))
+    expected_chat_id = _norm(getattr(item, "chat_id", ""))
+    expected_chat_type = _norm(getattr(item, "chat_type", "")) or "dm"
+    expected_thread_id = _norm(getattr(item, "thread_id", ""))
+    expected_message_id = _norm(getattr(item, "request_message_id", ""))
+    source_is_bot = source.get("is_bot") is True
+    if (
+        _norm(getattr(item, "platform", "")) != "feishu"
+        or _norm(source.get("platform")) != "feishu"
+        or _norm(source.get("user_id")) != expected_user_id
+        or _norm(source.get("chat_id")) != expected_chat_id
+        or _norm(source.get("chat_type")) != expected_chat_type
+        or _norm(source.get("thread_id")) != expected_thread_id
+        or _norm(event.get("message_id")) != expected_message_id
+        or _norm(feishu.get("message_id")) != expected_message_id
+        or _norm(feishu.get("sender_id")) != expected_user_id
+        or _norm(feishu.get("raw_container_id")) != expected_chat_id
+        or _norm(feishu.get("thread_id")) != expected_thread_id
+        or (feishu.get("is_bot_sender") is True) != source_is_bot
+        or _norm(feishu.get("sender_type")) != ("bot" if source_is_bot else "user")
+    ):
+        return None
+
+    raw_links = feishu.get("link_urls")
+    link_urls = []
+    if isinstance(raw_links, list):
+        if len(raw_links) > _MAX_FEISHU_QUEUE_LINK_COUNT:
+            return None
+        for raw_url in raw_links:
+            url = _norm(raw_url)
+            if len(url) > _MAX_FEISHU_QUEUE_LINK_CHARS:
+                return None
+            if url.startswith(("http://", "https://")) and url not in link_urls:
+                link_urls.append(url)
+    receive_time_ms = feishu.get("receive_time_ms")
+    if isinstance(receive_time_ms, bool) or not isinstance(
+        receive_time_ms, (str, int, float, type(None))
+    ):
+        receive_time_ms = None
+    ingress_source = _norm(feishu.get("ingress_source"))
+    if ingress_source not in {"event_callback", "api_poll"}:
+        ingress_source = "event_callback"
+
+    reply_to_text = str(event.get("reply_to_text") or "")
+    if len(reply_to_text) > _MAX_FEISHU_QUEUE_REPLY_TEXT_CHARS:
+        return None
+
+    return {
+        "route_contract": context.get("route_contract"),
+        "source": {
+            "user_id_alt": _norm(source.get("user_id_alt")) or None,
+            "user_name": _norm(source.get("user_name")) or None,
+            "chat_name": _norm(source.get("chat_name")) or None,
+            "is_bot": source_is_bot,
+        },
+        "event": {
+            "reply_to_message_id": _norm(event.get("reply_to_message_id")) or None,
+            "reply_to_text": reply_to_text or None,
+        },
+        "feishu": {
+            "message_id": expected_message_id,
+            "root_id": _norm(feishu.get("root_id")) or None,
+            "parent_id": _norm(feishu.get("parent_id")) or None,
+            "thread_id": expected_thread_id or None,
+            "sender_id": expected_user_id,
+            "sender_type": "bot" if source_is_bot else "user",
+            "is_bot_sender": source_is_bot,
+            "is_topic": feishu.get("is_topic") is True,
+            "raw_container_id": expected_chat_id,
+            "receive_time_ms": receive_time_ms,
+            "ingress_source": ingress_source,
+            "link_urls": link_urls or None,
+            "self_mentioned": feishu.get("self_mentioned") is True,
+            "self_mention_command_directed": (
+                feishu.get("self_mention_command_directed") is True
+            ),
+            "mention_required": feishu.get("mention_required") is True,
+        },
+    }
 
 
 def _is_integration_tools_intake_chat(chat_id: str) -> bool:
@@ -209,6 +480,15 @@ def _is_integration_tools_message_context(chat_id: str, text: str) -> bool:
         return False
     ids = _integration_tools_intake_chat_ids()
     if cid not in ids:
+        return False
+    # Feishu issue URLs belong to the G1Q3 RCA policy boundary, including its
+    # fixed-group manual control plane. Integration-tools must never claim
+    # them; metadata-only card URLs were appended above before this check.
+    if re.search(
+        r"https?://project\.feishu\.cn/[^\s/?#)]+/issue/detail/\d+",
+        str(text or ""),
+        re.IGNORECASE,
+    ):
         return False
     if cid == PNC_ALL_BUSINESS_TEST_GROUP_ID:
         if _looks_like_g1q3_rca_request_for_admission(text):
@@ -298,6 +578,7 @@ _FEISHU_WEBHOOK_RATE_WINDOW_SECONDS = 60            # sliding window for rate li
 _FEISHU_WEBHOOK_RATE_LIMIT_MAX = 120               # max requests per window per IP — matches openclaw
 _FEISHU_WEBHOOK_RATE_MAX_KEYS = 4096               # max tracked keys (prevents unbounded growth)
 _FEISHU_WEBHOOK_BODY_TIMEOUT_SECONDS = 30          # max seconds to read request body
+_FEISHU_API_TIMEOUT_SECONDS = 12.0
 _FEISHU_WEBHOOK_ANOMALY_THRESHOLD = 25             # consecutive error responses before WARNING log
 _FEISHU_WEBHOOK_ANOMALY_TTL_SECONDS = 6 * 60 * 60  # anomaly tracker TTL (6 hours) — matches openclaw
 _FEISHU_CARD_ACTION_DEDUP_TTL_SECONDS = 15 * 60    # card action token dedup window (15 min)
@@ -461,14 +742,23 @@ class _FeishuBotIdentity:
     name: str = ""
 
     def matches(self, *, open_id: str, user_id: str, name: str) -> bool:
-        # Precedence: open_id > user_id > name. IDs are authoritative when both
-        # sides have them; the next tier is only considered when either side
-        # lacks the current one.
-        if open_id and self.open_id:
-            return open_id == self.open_id
-        if user_id and self.user_id:
-            return user_id == self.user_id
-        return bool(self.name) and name == self.name
+        mention_open_id = str(open_id or "").strip()
+        mention_user_id = str(user_id or "").strip()
+        mention_name = str(name or "").strip()
+        bot_open_id = str(self.open_id or "").strip()
+        bot_user_id = str(self.user_id or "").strip()
+        bot_name = str(self.name or "").strip()
+
+        # IDs are authoritative. An open_id comparison is decisive when both
+        # sides provide one; otherwise a comparable user_id is decisive. Name
+        # fallback is safe only when neither side has any usable ID.
+        if mention_open_id and bot_open_id:
+            return mention_open_id == bot_open_id
+        if mention_user_id and bot_user_id:
+            return mention_user_id == bot_user_id
+        if mention_open_id or mention_user_id or bot_open_id or bot_user_id:
+            return False
+        return bool(bot_name) and mention_name == bot_name
 
 
 @dataclass(frozen=True)
@@ -1546,6 +1836,28 @@ def _strip_edge_self_mentions(
             return remaining
 
 
+def _self_mention_is_command_directed(
+    text: str,
+    mentions: Sequence[FeishuMentionRef],
+) -> bool:
+    """Return whether this bot is the first addressee in the message."""
+    remaining = str(text or "").lstrip()
+    if not remaining:
+        return False
+    for ref in mentions:
+        if not getattr(ref, "is_self", False):
+            continue
+        mention_text = (
+            f"@{getattr(ref, 'name', '') or getattr(ref, 'open_id', '') or 'user'}"
+        )
+        if not remaining.startswith(mention_text):
+            continue
+        after = remaining[len(mention_text) :]
+        if not after or after[0] in _MENTION_BOUNDARY_CHARS:
+            return True
+    return False
+
+
 def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
     """Run the official Lark WS client in its own thread-local event loop."""
     import lark_oapi.ws.client as ws_client_module
@@ -1712,10 +2024,14 @@ class FeishuAdapter(BasePlatformAdapter):
         self._webhook_runner: Optional[Any] = None
         self._webhook_site: Optional[Any] = None
         self._event_handler: Optional[Any] = None
-        self._seen_message_ids: Dict[str, float] = {}  # message_id → seen_at (time.time())
+        # Completed IDs are durable for the dedup TTL. Processing IDs are
+        # persisted separately, but intentionally become retryable on restart.
+        self._seen_message_ids: Dict[str, float] = {}
         self._seen_message_order: List[str] = []
         self._pending_dedup_message_ids: set[str] = set()
+        self._processing_message_ids: Dict[str, float] = {}
         self._dedup_state_path = get_hermes_home() / "feishu_seen_message_ids.json"
+        self._api_poll_state_path = get_hermes_home() / "feishu_api_poll_state_v1.json"
         self._dedup_lock = threading.Lock()
         self._sender_name_cache: Dict[str, tuple[str, float]] = {}  # sender_id → (name, expire_at)
         self._webhook_rate_counts: Dict[str, tuple[int, float]] = {}  # rate_key → (count, window_start)
@@ -1752,8 +2068,22 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         self._api_poll_task: Optional[asyncio.Task] = None
         self._api_poll_seen_message_ids: set[str] = set()
+        self._api_poll_seen_message_order: List[str] = []
         self._api_poll_baselined_chat_ids: set[str] = set()
         self._api_poll_last_seen_create_time_ms: Dict[str, int] = {}
+        self._api_poll_cursor_message_ids: Dict[str, set[str]] = {}
+        self._api_poll_discovery_floor_ms: Dict[str, int] = {}
+        self._api_poll_pending_items: Dict[str, List[Dict[str, Any]]] = {}
+        self._api_poll_scan_state: Dict[str, Dict[str, Any]] = {}
+        self._api_poll_terminal_holes: List[Dict[str, Any]] = []
+        self._api_poll_state_error: Optional[str] = None
+        self._api_poll_raw_state: Any = None
+        self._api_poll_block_persistence = False
+        self._api_poll_revision = 0
+        self._api_poll_sidecar_initialized = False
+        self._api_poll_app_scope = hashlib.sha256(
+            f"{self._domain_name}\0{self._app_id}".encode("utf-8")
+        ).hexdigest()[:32]
         self._api_poll_started_at_ms = int(time.time() * 1000)
         self._api_poll_start_cursor_ms = (
             self._api_poll_started_at_ms - (self._api_poll_startup_lookback_seconds * 1000)
@@ -2291,6 +2621,28 @@ class FeishuAdapter(BasePlatformAdapter):
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
+    def api_poll_persistence_status(self) -> Dict[str, Any]:
+        """Return bounded operational state without exposing message payloads."""
+        with self._dedup_lock:
+            pending_count = sum(
+                len(items) for items in self._api_poll_pending_items.values()
+            )
+            continuation_count = len(self._api_poll_scan_state)
+            return {
+                "healthy": self._api_poll_state_error is None,
+                "error": self._api_poll_state_error,
+                "pending_count": pending_count,
+                "pending_by_chat": {
+                    chat_id: len(items)
+                    for chat_id, items in self._api_poll_pending_items.items()
+                },
+                "scan_continuation_count": continuation_count,
+                "terminal_hole_count": len(self._api_poll_terminal_holes),
+                "rollback_ready": pending_count == 0 and continuation_count == 0,
+                "rollback_blocking_pending_count": pending_count,
+                "rollback_blocking_scan_continuation_count": continuation_count,
+            }
+
     async def _poll_api_chats_loop(self) -> None:
         while True:
             for chat_id in list(self._api_poll_chat_ids):
@@ -2315,18 +2667,848 @@ class FeishuAdapter(BasePlatformAdapter):
             return value * 1000
         return value
 
+    @staticmethod
+    def _bounded_api_poll_field(value: Any, max_chars: int) -> str:
+        text = str(value or "")
+        if len(text) <= max_chars:
+            return text
+        digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+        suffix = f"#sha256:{digest}"
+        return f"{text[:max(0, max_chars - len(suffix))]}{suffix}"
+
+    @staticmethod
+    def _api_poll_poison_stub(
+        item: Any,
+        *,
+        expected_chat_id: Optional[str],
+        code: str,
+    ) -> Dict[str, Any]:
+        try:
+            raw_payload = json.dumps(
+                item,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        except Exception:
+            raw_payload = repr(item).encode("utf-8", errors="replace")
+        raw_item = item if isinstance(item, dict) else {}
+        existing_poison = raw_item.get("_hermes_api_poll_poison")
+        existing_poison = existing_poison if isinstance(existing_poison, dict) else {}
+        payload_sha256 = str(existing_poison.get("payload_sha256") or "").strip()
+        if len(payload_sha256) != 64:
+            payload_sha256 = hashlib.sha256(raw_payload).hexdigest()
+        raw_message_id = str(raw_item.get("message_id") or "").strip()
+        existing_original_id = str(
+            existing_poison.get("original_message_id") or ""
+        ).strip()
+        original_message_id = existing_original_id or raw_message_id
+        raw_chat_id = expected_chat_id or str(raw_item.get("chat_id") or "").strip()
+        poison_identity = hashlib.sha256(
+            f"{raw_chat_id}\0{payload_sha256}".encode("utf-8", errors="replace")
+        ).hexdigest()
+        message_id = f"poison-{poison_identity}"
+        chat_id = FeishuAdapter._bounded_api_poll_field(raw_chat_id, 512)
+        sender = raw_item.get("sender")
+        sender = sender if isinstance(sender, dict) else {}
+        raw_payload_bytes = existing_poison.get("payload_bytes")
+        try:
+            payload_bytes = int(raw_payload_bytes or len(raw_payload))
+        except (TypeError, ValueError):
+            payload_bytes = len(raw_payload)
+        payload_bytes = max(0, min(payload_bytes, 2**63 - 1))
+        stub = {
+            "message_id": message_id,
+            "msg_type": FeishuAdapter._bounded_api_poll_field(
+                raw_item.get("msg_type") or "unknown", 64
+            ),
+            "chat_id": chat_id,
+            "create_time": FeishuAdapter._bounded_api_poll_field(
+                raw_item.get("create_time"), 64
+            ),
+            "update_time": FeishuAdapter._bounded_api_poll_field(
+                raw_item.get("update_time"), 64
+            ),
+            "root_id": FeishuAdapter._bounded_api_poll_field(
+                raw_item.get("root_id"), 512
+            ),
+            "parent_id": FeishuAdapter._bounded_api_poll_field(
+                raw_item.get("parent_id"), 512
+            ),
+            "body": {"content": ""},
+            "sender": {
+                "id": FeishuAdapter._bounded_api_poll_field(sender.get("id"), 512),
+                "id_type": FeishuAdapter._bounded_api_poll_field(
+                    sender.get("id_type"), 64
+                ),
+                "sender_type": FeishuAdapter._bounded_api_poll_field(
+                    sender.get("sender_type") or "user", 64
+                ),
+            },
+            "mentions": [],
+            "_hermes_api_poll_poison": {
+                "code": FeishuAdapter._bounded_api_poll_field(
+                    existing_poison.get("code") or code, 64
+                ),
+                "payload_sha256": payload_sha256,
+                "payload_bytes": payload_bytes,
+                "original_message_id": FeishuAdapter._bounded_api_poll_field(
+                    original_message_id, 512
+                ),
+            },
+        }
+        encoded_stub = json.dumps(
+            stub,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded_stub) > _MAX_API_POLL_ITEM_BYTES:
+            raise ValueError("bounded API poll poison stub exceeds 128 KiB")
+        return stub
+
+    @staticmethod
+    def _validated_api_poll_pending_item(
+        item: Any,
+        *,
+        expected_chat_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if not isinstance(item, dict):
+            return FeishuAdapter._api_poll_poison_stub(
+                item,
+                expected_chat_id=expected_chat_id,
+                code="item_not_object",
+            )
+        existing_poison = item.get("_hermes_api_poll_poison")
+        if isinstance(existing_poison, dict):
+            return FeishuAdapter._api_poll_poison_stub(
+                item,
+                expected_chat_id=expected_chat_id,
+                code=str(existing_poison.get("code") or "poison"),
+            )
+        body = item.get("body")
+        body = body if isinstance(body, dict) else {}
+        sender = item.get("sender")
+        sender = sender if isinstance(sender, dict) else {}
+        raw_mentions = item.get("mentions") or []
+        if not isinstance(raw_mentions, list) or len(raw_mentions) > 64:
+            return FeishuAdapter._api_poll_poison_stub(
+                item,
+                expected_chat_id=expected_chat_id,
+                code="invalid_mentions",
+            )
+        mentions = []
+        for raw_mention in raw_mentions:
+            if not isinstance(raw_mention, dict):
+                return FeishuAdapter._api_poll_poison_stub(
+                    item,
+                    expected_chat_id=expected_chat_id,
+                    code="invalid_mention",
+                )
+            mentions.append(
+                {
+                    "id": str(raw_mention.get("id") or ""),
+                    "id_type": str(raw_mention.get("id_type") or ""),
+                    "key": str(raw_mention.get("key") or ""),
+                    "name": str(raw_mention.get("name") or ""),
+                }
+            )
+        # Persist the smallest allowlisted envelope needed to reconstruct the
+        # callback. Unknown API response fields cannot inflate durable state.
+        envelope = {
+            "message_id": str(item.get("message_id") or ""),
+            "msg_type": str(item.get("msg_type") or ""),
+            "chat_id": str(item.get("chat_id") or ""),
+            "create_time": str(item.get("create_time") or ""),
+            "update_time": str(item.get("update_time") or ""),
+            "root_id": str(item.get("root_id") or ""),
+            "parent_id": str(item.get("parent_id") or ""),
+            "body": {"content": str(body.get("content") or "")},
+            "sender": {
+                "id": str(sender.get("id") or ""),
+                "id_type": str(sender.get("id_type") or ""),
+                "sender_type": str(sender.get("sender_type") or "user"),
+            },
+            "mentions": mentions,
+        }
+        try:
+            encoded = json.dumps(
+                envelope,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("API poll pending item must be JSON serializable") from exc
+        if len(encoded) > _MAX_API_POLL_ITEM_BYTES:
+            return FeishuAdapter._api_poll_poison_stub(
+                item,
+                expected_chat_id=expected_chat_id,
+                code="item_exceeds_128_kib",
+            )
+        normalized = json.loads(encoded.decode("utf-8"))
+        message_id = str(normalized.get("message_id") or "").strip()
+        chat_id = str(normalized.get("chat_id") or "").strip()
+        if not message_id or not chat_id:
+            return FeishuAdapter._api_poll_poison_stub(
+                item,
+                expected_chat_id=expected_chat_id,
+                code="missing_transport_identity",
+            )
+        if expected_chat_id and chat_id != expected_chat_id:
+            return FeishuAdapter._api_poll_poison_stub(
+                item,
+                expected_chat_id=expected_chat_id,
+                code="chat_identity_mismatch",
+            )
+        return normalized
+
+    def _remember_api_poll_seen_locked(self, message_ids: Sequence[str]) -> None:
+        order = self._api_poll_seen_message_order
+        seen = self._api_poll_seen_message_ids
+        for raw_message_id in message_ids:
+            message_id = str(raw_message_id or "").strip()
+            if not message_id:
+                continue
+            if message_id in seen:
+                try:
+                    order.remove(message_id)
+                except ValueError:
+                    pass
+            seen.add(message_id)
+            order.append(message_id)
+        limit = max(1, int(getattr(self, "_dedup_cache_size", 1000) or 1000))
+        while len(order) > limit:
+            stale = order.pop(0)
+            seen.discard(stale)
+
+    def _api_poll_state_snapshot(self) -> Dict[str, Any]:
+        return {
+            "pending": self._api_poll_pending_items,
+            "baselined_chat_ids": sorted(self._api_poll_baselined_chat_ids),
+            "last_seen_create_time_ms": self._api_poll_last_seen_create_time_ms,
+            "cursor_message_ids": {
+                chat_id: sorted(message_ids)
+                for chat_id, message_ids in self._api_poll_cursor_message_ids.items()
+            },
+            "discovery_floor_ms": self._api_poll_discovery_floor_ms,
+            "scan_state": self._api_poll_scan_state,
+            "terminal_holes": self._api_poll_terminal_holes,
+            "seen_message_ids": list(self._api_poll_seen_message_order),
+        }
+
+    def _api_poll_sidecar_payload(
+        self,
+        state: Dict[str, Any],
+        *,
+        revision: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        pending = state.get("pending", {})
+        scan_state = state.get("scan_state", {})
+        pending_count = sum(
+            len(items) for items in pending.values() if isinstance(items, list)
+        )
+        continuation_count = len(scan_state) if isinstance(scan_state, dict) else 0
+        return {
+            "schema_version": _API_POLL_SIDECAR_SCHEMA,
+            "app_scope": self._api_poll_app_scope,
+            "revision": self._api_poll_revision + 1 if revision is None else revision,
+            "updated_at": time.time(),
+            "rollback_readiness": {
+                "ready": pending_count == 0 and continuation_count == 0,
+                "pending_count": pending_count,
+                "scan_continuation_count": continuation_count,
+            },
+            "state": state,
+        }
+
+    @staticmethod
+    def _api_poll_encoded_size(value: Any) -> int:
+        return len(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+
+    @staticmethod
+    def _api_poll_chat_state_view(
+        state: Dict[str, Any],
+        chat_id: str,
+    ) -> Dict[str, Any]:
+        pending = state.get("pending", {})
+        scan_state = state.get("scan_state", {})
+        cursor_ids = state.get("cursor_message_ids", {})
+        cursors = state.get("last_seen_create_time_ms", {})
+        floors = state.get("discovery_floor_ms", {})
+        holes = state.get("terminal_holes", [])
+        return {
+            "pending": pending.get(chat_id, []) if isinstance(pending, dict) else [],
+            "scan_state": (
+                scan_state.get(chat_id) if isinstance(scan_state, dict) else None
+            ),
+            "terminal_holes": [
+                hole
+                for hole in holes
+                if isinstance(hole, dict) and hole.get("chat_id") == chat_id
+            ]
+            if isinstance(holes, list)
+            else [],
+            "last_seen_create_time_ms": (
+                cursors.get(chat_id) if isinstance(cursors, dict) else None
+            ),
+            "cursor_message_ids": (
+                cursor_ids.get(chat_id, []) if isinstance(cursor_ids, dict) else []
+            ),
+            "discovery_floor_ms": (
+                floors.get(chat_id) if isinstance(floors, dict) else None
+            ),
+        }
+
+    def _validate_api_poll_capacity(
+        self,
+        state: Dict[str, Any],
+        payload: Dict[str, Any],
+    ) -> None:
+        pending = state.get("pending", {})
+        scan_state = state.get("scan_state", {})
+        holes = state.get("terminal_holes", [])
+        chat_ids = set(pending) | set(scan_state)
+        chat_ids.update(
+            str(hole.get("chat_id") or "")
+            for hole in holes
+            if isinstance(hole, dict) and hole.get("chat_id")
+        )
+        for chat_id in chat_ids:
+            pending_items = pending.get(chat_id, [])
+            scan = scan_state.get(chat_id)
+            scan_candidates = scan.get("candidates", []) if isinstance(scan, dict) else []
+            ownership_count = len(pending_items) + len(scan_candidates)
+            if ownership_count > _MAX_API_POLL_PENDING_PER_CHAT:
+                raise ValueError(
+                    f"API poll ownership count exceeds per-chat capacity for {chat_id}"
+                )
+            chat_bytes = self._api_poll_encoded_size(
+                self._api_poll_chat_state_view(state, chat_id)
+            )
+            if chat_bytes > _MAX_API_POLL_PER_CHAT_BYTES:
+                raise ValueError(
+                    f"API poll ownership bytes exceed per-chat capacity for {chat_id}"
+                )
+        payload_bytes = self._api_poll_encoded_size(payload)
+        if payload_bytes > _MAX_API_POLL_TOTAL_BYTES:
+            raise ValueError("API poll sidecar exceeds 16 MiB byte capacity")
+
+    def _persist_api_poll_state(self, *, require_success: bool = False) -> bool:
+        if self._api_poll_block_persistence:
+            logger.error("[Feishu] API poll sidecar writes are blocked after an unsafe load")
+            if require_success:
+                raise RuntimeError("Feishu API poll sidecar is unhealthy")
+            return False
+        try:
+            state = self._api_poll_state_snapshot()
+            next_revision = self._api_poll_revision + 1
+            payload = self._api_poll_sidecar_payload(state, revision=next_revision)
+            self._validate_api_poll_capacity(state, payload)
+            self._api_poll_state_path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_json_write(self._api_poll_state_path, payload, indent=None)
+            self._api_poll_revision = next_revision
+            self._api_poll_sidecar_initialized = True
+            return True
+        except (OSError, TypeError, ValueError) as exc:
+            logger.warning(
+                "[Feishu] Failed to persist API poll sidecar to %s",
+                self._api_poll_state_path,
+                exc_info=True,
+            )
+            if require_success:
+                raise RuntimeError("Feishu API poll sidecar write failed") from exc
+            return False
+
+    def _api_poll_candidate_capacity(self, chat_id: str) -> tuple[int, int]:
+        """Return conservative (count, bytes) available to this chat's next chunk."""
+        with self._dedup_lock:
+            state = dict(self._api_poll_state_snapshot())
+            state["scan_state"] = dict(state["scan_state"])
+            state["scan_state"].pop(chat_id, None)
+            pending = state.get("pending", {}).get(chat_id, [])
+            count_budget = max(
+                0,
+                _MAX_API_POLL_PENDING_PER_CHAT - len(pending),
+            )
+            payload = self._api_poll_sidecar_payload(state)
+            total_budget = max(
+                0,
+                _MAX_API_POLL_TOTAL_BYTES
+                - self._api_poll_encoded_size(payload)
+                - _API_POLL_CAPACITY_RESERVE_BYTES,
+            )
+            chat_budget = max(
+                0,
+                _MAX_API_POLL_PER_CHAT_BYTES
+                - self._api_poll_encoded_size(
+                    self._api_poll_chat_state_view(state, chat_id)
+                )
+                - _API_POLL_CAPACITY_RESERVE_BYTES,
+            )
+            return count_budget, min(total_budget, chat_budget)
+
+    def _validated_api_poll_scan_state(
+        self,
+        chat_id: str,
+        state: Any,
+    ) -> Dict[str, Any]:
+        if not isinstance(state, dict):
+            raise ValueError("API poll scan state must be an object")
+        page_token = str(state.get("page_token") or "").strip()
+        watermark_ms = state.get("watermark_ms")
+        raw_cursor_ids = state.get("cursor_message_ids", [])
+        raw_candidates = state.get("candidates", [])
+        if not page_token or len(page_token) > 2048:
+            raise ValueError("API poll scan page token is invalid")
+        if (
+            isinstance(watermark_ms, bool)
+            or not isinstance(watermark_ms, int)
+            or watermark_ms < 0
+        ):
+            raise ValueError("API poll scan watermark is invalid")
+        if not isinstance(raw_cursor_ids, list) or not isinstance(raw_candidates, list):
+            raise ValueError("API poll scan collection state is invalid")
+        if len(raw_candidates) > _MAX_API_POLL_PENDING_PER_CHAT:
+            raise ValueError("API poll scan candidates exceed capacity")
+        candidates = [
+            self._validated_api_poll_pending_item(
+                item,
+                expected_chat_id=chat_id,
+            )
+            for item in raw_candidates
+        ]
+        return {
+            "page_token": page_token,
+            "watermark_ms": watermark_ms,
+            "cursor_message_ids": sorted(
+                {
+                    str(value).strip()
+                    for value in raw_cursor_ids
+                    if str(value or "").strip()
+                }
+            ),
+            "candidates": candidates,
+            "baselined": state.get("baselined") is True,
+        }
+
+    def _commit_api_poll_scan_state(
+        self,
+        chat_id: str,
+        state: Dict[str, Any],
+    ) -> None:
+        normalized = self._validated_api_poll_scan_state(chat_id, state)
+        with self._dedup_lock:
+            previous_state = self._api_poll_scan_state.get(chat_id)
+            previous_baselined = chat_id in self._api_poll_baselined_chat_ids
+            previous_floor = self._api_poll_discovery_floor_ms.get(chat_id)
+            self._api_poll_scan_state[chat_id] = normalized
+            self._api_poll_baselined_chat_ids.add(chat_id)
+            self._api_poll_discovery_floor_ms.setdefault(
+                chat_id,
+                self._api_poll_start_cursor_ms,
+            )
+            try:
+                self._persist_api_poll_state(require_success=True)
+            except BaseException:
+                if previous_state is None:
+                    self._api_poll_scan_state.pop(chat_id, None)
+                else:
+                    self._api_poll_scan_state[chat_id] = previous_state
+                if previous_baselined:
+                    self._api_poll_baselined_chat_ids.add(chat_id)
+                else:
+                    self._api_poll_baselined_chat_ids.discard(chat_id)
+                if previous_floor is None:
+                    self._api_poll_discovery_floor_ms.pop(chat_id, None)
+                else:
+                    self._api_poll_discovery_floor_ms[chat_id] = previous_floor
+                raise
+
+    def _reset_api_poll_scan_state(
+        self,
+        chat_id: str,
+        *,
+        expected_page_token: str,
+    ) -> bool:
+        """CAS-clear only an invalid continuation, preserving its watermark."""
+        with self._dedup_lock:
+            current = self._api_poll_scan_state.get(chat_id)
+            if not isinstance(current, dict):
+                return False
+            current_token = str(current.get("page_token") or "").strip()
+            if not current_token or current_token != expected_page_token:
+                return False
+            previous = current
+            self._api_poll_scan_state.pop(chat_id, None)
+            try:
+                self._persist_api_poll_state(require_success=True)
+            except BaseException:
+                self._api_poll_scan_state[chat_id] = previous
+                raise
+            return True
+
+    def _commit_api_poll_discovery(
+        self,
+        chat_id: str,
+        *,
+        pending_items: Sequence[Dict[str, Any]],
+        seen_message_ids: Sequence[str] = (),
+        cursor_ms: Optional[int] = None,
+        cursor_message_ids: Sequence[str] = (),
+        mark_baselined: bool = False,
+        clear_scan_state: bool = False,
+    ) -> None:
+        """Persist a fetched page before any callback can own its messages."""
+        normalized_items = [
+            self._validated_api_poll_pending_item(
+                item,
+                expected_chat_id=chat_id,
+            )
+            for item in pending_items
+        ]
+        normalized_seen = {
+            str(message_id).strip()
+            for message_id in seen_message_ids
+            if str(message_id or "").strip()
+        }
+        with self._dedup_lock:
+            if self._api_poll_state_error:
+                raise RuntimeError(
+                    f"API poll persistent state is unhealthy: {self._api_poll_state_error}"
+                )
+            previous_pending = list(self._api_poll_pending_items.get(chat_id, []))
+            previous_seen = set(self._api_poll_seen_message_ids)
+            previous_seen_order = list(self._api_poll_seen_message_order)
+            previous_baselined = chat_id in self._api_poll_baselined_chat_ids
+            previous_cursor = self._api_poll_last_seen_create_time_ms.get(chat_id)
+            previous_cursor_ids = set(
+                self._api_poll_cursor_message_ids.get(chat_id, set())
+            )
+            previous_floor = self._api_poll_discovery_floor_ms.get(chat_id)
+            previous_scan_state = self._api_poll_scan_state.get(chat_id)
+
+            pending = list(previous_pending)
+            known_ids = {
+                str(item.get("message_id") or "").strip()
+                for item in pending
+            }
+            for item in normalized_items:
+                message_id = str(item.get("message_id") or "").strip()
+                if message_id in known_ids or message_id in self._api_poll_seen_message_ids:
+                    continue
+                pending.append(item)
+                known_ids.add(message_id)
+            if len(pending) > _MAX_API_POLL_PENDING_PER_CHAT:
+                logger.error(
+                    "[Feishu] API poll pending count capacity exceeded for chat %s",
+                    chat_id,
+                )
+                raise RuntimeError(
+                    f"API poll pending capacity exceeded for chat {chat_id}"
+                )
+            pending.sort(
+                key=lambda value: (
+                    self._api_poll_item_create_time_ms(value) or 0,
+                    str(value.get("message_id") or ""),
+                )
+            )
+            if pending:
+                self._api_poll_pending_items[chat_id] = pending
+            else:
+                self._api_poll_pending_items.pop(chat_id, None)
+            self._remember_api_poll_seen_locked(sorted(normalized_seen))
+            if mark_baselined:
+                self._api_poll_baselined_chat_ids.add(chat_id)
+                self._api_poll_discovery_floor_ms.setdefault(
+                    chat_id,
+                    self._api_poll_start_cursor_ms,
+                )
+            if clear_scan_state:
+                self._api_poll_scan_state.pop(chat_id, None)
+            if cursor_ms is not None:
+                normalized_cursor_ids = {
+                    str(message_id).strip()
+                    for message_id in cursor_message_ids
+                    if str(message_id or "").strip()
+                }
+                if previous_cursor is None or cursor_ms > previous_cursor:
+                    self._api_poll_last_seen_create_time_ms[chat_id] = cursor_ms
+                    self._api_poll_cursor_message_ids[chat_id] = normalized_cursor_ids
+                elif cursor_ms == previous_cursor:
+                    self._api_poll_cursor_message_ids[chat_id] = (
+                        previous_cursor_ids | normalized_cursor_ids
+                    )
+            try:
+                self._persist_api_poll_state(require_success=True)
+            except BaseException:
+                if previous_pending:
+                    self._api_poll_pending_items[chat_id] = previous_pending
+                else:
+                    self._api_poll_pending_items.pop(chat_id, None)
+                self._api_poll_seen_message_ids = previous_seen
+                self._api_poll_seen_message_order = previous_seen_order
+                if previous_baselined:
+                    self._api_poll_baselined_chat_ids.add(chat_id)
+                else:
+                    self._api_poll_baselined_chat_ids.discard(chat_id)
+                if previous_cursor is None:
+                    self._api_poll_last_seen_create_time_ms.pop(chat_id, None)
+                else:
+                    self._api_poll_last_seen_create_time_ms[chat_id] = previous_cursor
+                if previous_cursor_ids:
+                    self._api_poll_cursor_message_ids[chat_id] = previous_cursor_ids
+                else:
+                    self._api_poll_cursor_message_ids.pop(chat_id, None)
+                if previous_floor is None:
+                    self._api_poll_discovery_floor_ms.pop(chat_id, None)
+                else:
+                    self._api_poll_discovery_floor_ms[chat_id] = previous_floor
+                if previous_scan_state is None:
+                    self._api_poll_scan_state.pop(chat_id, None)
+                else:
+                    self._api_poll_scan_state[chat_id] = previous_scan_state
+                raise
+
+    def _finalize_api_poll_pending_item(
+        self,
+        chat_id: str,
+        item: Dict[str, Any],
+        *,
+        terminal_hole: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Atomically retire pending ownership and advance its durable cursor."""
+        message_id = str(item.get("message_id") or "").strip()
+        create_time = self._api_poll_item_create_time_ms(item)
+        with self._dedup_lock:
+            previous_pending = list(self._api_poll_pending_items.get(chat_id, []))
+            previous_seen = set(self._api_poll_seen_message_ids)
+            previous_seen_order = list(self._api_poll_seen_message_order)
+            previous_cursor = self._api_poll_last_seen_create_time_ms.get(chat_id)
+            previous_cursor_ids = set(
+                self._api_poll_cursor_message_ids.get(chat_id, set())
+            )
+            previous_holes = list(self._api_poll_terminal_holes)
+            remaining = [
+                pending
+                for pending in previous_pending
+                if str(pending.get("message_id") or "").strip() != message_id
+            ]
+            if remaining:
+                self._api_poll_pending_items[chat_id] = remaining
+            else:
+                self._api_poll_pending_items.pop(chat_id, None)
+            self._remember_api_poll_seen_locked([message_id])
+            if terminal_hole is not None:
+                hole = {
+                    "schema_version": "feishu_api_poll_terminal_hole_v1",
+                    "kind": str(terminal_hole.get("kind") or "unknown")[:64],
+                    "status": str(terminal_hole.get("status") or "terminal")[:64],
+                    "message_id": message_id,
+                    "chat_id": self._bounded_api_poll_field(chat_id, 512),
+                    "create_time": str(item.get("create_time") or "")[:64],
+                    "sender_id": str(
+                        (item.get("sender") or {}).get("id")
+                        if isinstance(item.get("sender"), dict)
+                        else ""
+                    )[:512],
+                    "payload_sha256": str(
+                        terminal_hole.get("payload_sha256") or ""
+                    )[:64],
+                    "original_message_id": self._bounded_api_poll_field(
+                        terminal_hole.get("original_message_id"), 512
+                    ),
+                    "error": str(terminal_hole.get("error") or "")[:512],
+                    "admission_item_id": str(
+                        terminal_hole.get("admission_item_id") or ""
+                    )[:128],
+                    "recorded_at": time.time(),
+                }
+                self._api_poll_terminal_holes.append(hole)
+                self._api_poll_terminal_holes = self._api_poll_terminal_holes[
+                    -_MAX_API_POLL_TERMINAL_HOLES:
+                ]
+            if create_time is not None:
+                if previous_cursor is None or create_time > previous_cursor:
+                    self._api_poll_last_seen_create_time_ms[chat_id] = create_time
+                    self._api_poll_cursor_message_ids[chat_id] = {message_id}
+                elif create_time == previous_cursor:
+                    self._api_poll_cursor_message_ids[chat_id] = (
+                        previous_cursor_ids | {message_id}
+                    )
+            try:
+                self._persist_api_poll_state(require_success=True)
+            except BaseException:
+                if previous_pending:
+                    self._api_poll_pending_items[chat_id] = previous_pending
+                else:
+                    self._api_poll_pending_items.pop(chat_id, None)
+                self._api_poll_seen_message_ids = previous_seen
+                self._api_poll_seen_message_order = previous_seen_order
+                if previous_cursor is None:
+                    self._api_poll_last_seen_create_time_ms.pop(chat_id, None)
+                else:
+                    self._api_poll_last_seen_create_time_ms[chat_id] = previous_cursor
+                if previous_cursor_ids:
+                    self._api_poll_cursor_message_ids[chat_id] = previous_cursor_ids
+                else:
+                    self._api_poll_cursor_message_ids.pop(chat_id, None)
+                self._api_poll_terminal_holes = previous_holes
+                raise
+
+    def _api_poll_admission_owner(self, message_id: str) -> Any:
+        controller = getattr(self, "_admission_controller", None)
+        getter = getattr(controller, "get_transport_item", None)
+        if not callable(getter):
+            return None
+        return getter("feishu", message_id)
+
+    async def _drain_api_poll_pending(self, chat_id: str) -> bool:
+        """Process staged events in order; return False while durable work owns one."""
+        while True:
+            with self._dedup_lock:
+                pending = self._api_poll_pending_items.get(chat_id, [])
+                item = pending[0] if pending else None
+            if item is None:
+                return True
+
+            message_id = str(item.get("message_id") or "").strip()
+            poison = item.get("_hermes_api_poll_poison")
+            if isinstance(poison, dict):
+                code = str(poison.get("code") or "poison")
+                logger.error(
+                    "[Feishu] API poll retiring poison message %s: %s",
+                    message_id,
+                    code,
+                )
+                self._finalize_api_poll_pending_item(
+                    chat_id,
+                    item,
+                    terminal_hole={
+                        "kind": "poison",
+                        "status": "dead",
+                        "payload_sha256": poison.get("payload_sha256"),
+                        "original_message_id": poison.get("original_message_id"),
+                        "error": code,
+                    },
+                )
+                continue
+
+            owner = self._api_poll_admission_owner(message_id)
+            owner_status = str(getattr(owner, "status", "") or "")
+            if owner_status == "completed":
+                result = getattr(owner, "result", None)
+                if (
+                    isinstance(result, dict)
+                    and result.get("durable_feishu_completion") is True
+                ):
+                    self._complete_message_processing(message_id)
+                    self._finalize_api_poll_pending_item(chat_id, item)
+                    continue
+            if owner_status in {"queued", "processing"}:
+                return False
+            if owner_status in {"dead", "cancelled"}:
+                logger.error(
+                    "[Feishu] API poll pending message %s reached terminal admission status=%s",
+                    message_id,
+                    owner_status,
+                )
+                self._finalize_api_poll_pending_item(
+                    chat_id,
+                    item,
+                    terminal_hole={
+                        "kind": "admission_terminal",
+                        "status": owner_status,
+                        "error": f"admission_{owner_status}",
+                        "admission_item_id": getattr(owner, "id", ""),
+                    },
+                )
+                continue
+            if owner is not None:
+                logger.error(
+                    "[Feishu] API poll pending message %s is held by non-durable admission status=%s",
+                    message_id,
+                    owner_status or "<empty>",
+                )
+                return False
+
+            # Admission ownership is authoritative. Only consult the transport
+            # inbox after an owner is terminal or absent; the durable worker can
+            # complete the inbox just before QueueWorker commits queue completion.
+            if self._message_processing_completed(message_id):
+                self._finalize_api_poll_pending_item(chat_id, item)
+                continue
+
+            with self._dedup_lock:
+                if message_id in self._processing_message_ids:
+                    return False
+
+            logger.info(
+                "[Feishu] API polling replaying staged message_id=%s chat_id=%s msg_type=%s",
+                message_id,
+                chat_id,
+                item.get("msg_type"),
+            )
+            completed = await self._handle_message_event_data(
+                self._api_message_item_to_event_data(item)
+            )
+            if not completed:
+                return False
+            self._finalize_api_poll_pending_item(chat_id, item)
+
     async def _poll_api_chat_once(self, chat_id: str) -> None:
-        is_startup_baseline = chat_id not in self._api_poll_baselined_chat_ids
-        startup_cursor_ms = (
-            self._api_poll_start_cursor_ms
-            if is_startup_baseline and self._api_poll_startup_lookback_seconds > 0
-            else None
+        # Keep the derived cursor coherent for tests and callers that replace
+        # the start clock before the first poll. Persisted per-chat floors still
+        # remain authoritative after a baseline has been committed.
+        self._api_poll_start_cursor_ms = self._api_poll_started_at_ms - (
+            self._api_poll_startup_lookback_seconds * 1000
         )
-        items = await self._fetch_api_poll_messages(
-            chat_id,
-            startup_cursor_ms=startup_cursor_ms,
-        )
+        if self._api_poll_state_error:
+            raise RuntimeError(
+                f"API poll persistent state is unhealthy: {self._api_poll_state_error}"
+            )
+
+        pending_error: Optional[Exception] = None
+        pending_drained = True
+        try:
+            pending_drained = await self._drain_api_poll_pending(chat_id)
+        except Exception as exc:
+            pending_error = exc
+
+        try:
+            fetch_result = await self._fetch_api_poll_messages(chat_id)
+        except _FeishuApiPollInvalidContinuation as exc:
+            reset = self._reset_api_poll_scan_state(
+                chat_id,
+                expected_page_token=exc.page_token,
+            )
+            if not reset:
+                raise
+            logger.warning(
+                "[Feishu] API poll continuation reset for chat %s after explicit token rejection",
+                chat_id,
+            )
+            fetch_result = await self._fetch_api_poll_messages(chat_id)
+        if isinstance(fetch_result, _FeishuApiPollScanContinuation):
+            self._commit_api_poll_scan_state(chat_id, fetch_result.state)
+            if pending_error is not None:
+                raise pending_error
+            return
+        items = fetch_result
+        items = [
+            self._validated_api_poll_pending_item(
+                item,
+                expected_chat_id=chat_id,
+            )
+            for item in items
+        ]
         cursor_ms = self._api_poll_last_seen_create_time_ms.get(chat_id)
+        discovered_seen_ids: List[str] = []
+        discovered_seen_times: List[tuple[str, int]] = []
         if chat_id not in self._api_poll_baselined_chat_ids:
             new_items = []
             for item in items:
@@ -2337,8 +3519,9 @@ class FeishuAdapter(BasePlatformAdapter):
                 if create_time is not None and create_time >= self._api_poll_start_cursor_ms:
                     new_items.append(item)
                 else:
-                    self._api_poll_seen_message_ids.add(message_id)
+                    discovered_seen_ids.append(message_id)
                     if create_time is not None:
+                        discovered_seen_times.append((message_id, create_time))
                         cursor_ms = max(cursor_ms or create_time, create_time)
             logger.info(
                 "[Feishu] API polling baseline prepared for chat %s with %d recent message(s), replaying %d since startup cursor",
@@ -2353,55 +3536,50 @@ class FeishuAdapter(BasePlatformAdapter):
                 if not message_id or message_id in self._api_poll_seen_message_ids:
                     continue
                 create_time = self._api_poll_item_create_time_ms(item)
-                if cursor_ms is not None and create_time is not None and create_time <= cursor_ms:
-                    self._api_poll_seen_message_ids.add(message_id)
+                cursor_ids = self._api_poll_cursor_message_ids.get(chat_id, set())
+                if (
+                    cursor_ms is not None
+                    and create_time is not None
+                    and (
+                        create_time < cursor_ms
+                        or (create_time == cursor_ms and message_id in cursor_ids)
+                    )
+                ):
+                    discovered_seen_ids.append(message_id)
                     continue
                 new_items.append(item)
 
         new_items.sort(key=lambda item: self._api_poll_item_create_time_ms(item) or 0)
-        processed_create_times: List[int] = []
-        for item in new_items:
-            message_id = str(item.get("message_id") or "").strip()
-            create_time = self._api_poll_item_create_time_ms(item)
-            logger.info(
-                "[Feishu] API polling replaying message_id=%s chat_id=%s msg_type=%s",
-                message_id,
-                chat_id,
-                item.get("msg_type"),
-            )
-            event_data = self._api_message_item_to_event_data(item)
-            if is_startup_baseline and self._api_poll_startup_lookback_seconds > 0:
-                setattr(event_data, "_hermes_deferred_dedup_commit", True)
-            await self._handle_message_event_data(event_data)
-            self._api_poll_seen_message_ids.add(message_id)
-            if create_time is not None:
-                processed_create_times.append(create_time)
-
-        if is_startup_baseline:
-            self._api_poll_baselined_chat_ids.add(chat_id)
-            logger.info("[Feishu] API polling baseline established for chat %s", chat_id)
-
-        if processed_create_times:
-            self._api_poll_last_seen_create_time_ms[chat_id] = max(
-                self._api_poll_last_seen_create_time_ms.get(chat_id, processed_create_times[0]),
-                max(processed_create_times),
-            )
-        elif cursor_ms is not None:
-            self._api_poll_last_seen_create_time_ms[chat_id] = cursor_ms
+        discovered_cursor_ids = [
+            message_id
+            for message_id, create_time in discovered_seen_times
+            if cursor_ms is not None and create_time == cursor_ms
+        ]
+        self._commit_api_poll_discovery(
+            chat_id,
+            pending_items=new_items,
+            seen_message_ids=discovered_seen_ids,
+            cursor_ms=cursor_ms,
+            cursor_message_ids=discovered_cursor_ids,
+            mark_baselined=True,
+            clear_scan_state=True,
+        )
+        if pending_error is not None:
+            raise pending_error
+        if pending_drained:
+            await self._drain_api_poll_pending(chat_id)
 
     async def _fetch_api_poll_messages(
         self,
         chat_id: str,
-        *,
-        startup_cursor_ms: Optional[int],
-    ) -> List[Dict[str, Any]]:
+    ) -> List[Dict[str, Any]] | _FeishuApiPollScanContinuation:
         cancel_event = threading.Event()
         fetch_task = asyncio.create_task(
             asyncio.to_thread(
                 self._fetch_recent_chat_messages_via_api,
                 chat_id,
-                startup_cursor_ms=startup_cursor_ms,
                 cancel_event=cancel_event,
+                durable_scan=True,
             )
         )
         try:
@@ -2414,27 +3592,31 @@ class FeishuAdapter(BasePlatformAdapter):
                     timeout=_API_POLL_CANCEL_WAIT_SECONDS,
                 )
             except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-                # Preserve the caller's cancellation. The cooperative event
-                # prevents another page request after the current bounded
-                # urlopen returns.
                 pass
             raise
 
-    def _fetch_recent_chat_messages_via_api(
+    def _fetch_recent_chat_messages_legacy(
         self,
         chat_id: str,
         *,
-        startup_cursor_ms: Optional[int] = None,
-        cancel_event: Optional[threading.Event] = None,
+        startup_cursor_ms: Optional[int],
+        cancel_event: Optional[threading.Event],
     ) -> List[Dict[str, Any]]:
-        if cancel_event is not None and cancel_event.is_set():
-            raise RuntimeError("message list fetch cancelled")
+        """Preserve the v0.18.2 direct-fetch contract outside durable polling."""
         token = self._fetch_tenant_access_token_via_api()
-        if cancel_event is not None and cancel_event.is_set():
-            raise RuntimeError("message list fetch cancelled")
-        base_url = "https://open.larksuite.com" if self._domain_name == "lark" else "https://open.feishu.cn"
-        page_size = _MAX_API_POLL_PAGE_SIZE if startup_cursor_ms is not None else self._api_poll_page_size
-        max_pages = _MAX_API_POLL_STARTUP_PAGES if startup_cursor_ms is not None else 1
+        base_url = (
+            "https://open.larksuite.com"
+            if self._domain_name == "lark"
+            else "https://open.feishu.cn"
+        )
+        page_size = (
+            _MAX_API_POLL_PAGE_SIZE
+            if startup_cursor_ms is not None
+            else self._api_poll_page_size
+        )
+        max_pages = (
+            _MAX_API_POLL_STARTUP_PAGES if startup_cursor_ms is not None else 1
+        )
         page_token = ""
         seen_page_tokens: set[str] = set()
         items: List[Dict[str, Any]] = []
@@ -2454,27 +3636,36 @@ class FeishuAdapter(BasePlatformAdapter):
                 f"{base_url}/open-apis/im/v1/messages?{urlencode(query_params)}",
                 headers={"Authorization": f"Bearer {token}"},
             )
-            with urlopen(request, timeout=_API_POLL_REQUEST_TIMEOUT_SECONDS) as response:
+            with urlopen(
+                request,
+                timeout=_API_POLL_REQUEST_TIMEOUT_SECONDS,
+            ) as response:
                 payload = json.loads(response.read().decode("utf-8"))
             if cancel_event is not None and cancel_event.is_set():
                 raise RuntimeError("message list fetch cancelled")
             if payload.get("code") != 0:
-                raise RuntimeError(f"message list failed: {payload.get('code')} {payload.get('msg')}")
+                raise RuntimeError(
+                    f"message list failed: {payload.get('code')} {payload.get('msg')}"
+                )
 
             data = payload.get("data") or {}
             page_items = list(data.get("items") or [])
             items.extend(page_items)
-            if startup_cursor_ms is not None and not isinstance(data.get("has_more"), bool):
-                raise RuntimeError("message list startup response missing boolean has_more")
+            if startup_cursor_ms is not None and not isinstance(
+                data.get("has_more"), bool
+            ):
+                raise RuntimeError(
+                    "message list startup response missing boolean has_more"
+                )
             has_more = bool(data.get("has_more"))
             if startup_cursor_ms is None or not has_more:
                 return items
-
-            reached_startup_cursor = any(
+            if any(
                 create_time is not None and create_time < startup_cursor_ms
-                for create_time in (self._api_poll_item_create_time_ms(item) for item in page_items)
-            )
-            if reached_startup_cursor:
+                for create_time in (
+                    self._api_poll_item_create_time_ms(item) for item in page_items
+                )
+            ):
                 logger.info(
                     "[Feishu] API polling startup lookback fetched %d message(s) across %d page(s) for chat %s",
                     len(items),
@@ -2485,7 +3676,9 @@ class FeishuAdapter(BasePlatformAdapter):
 
             next_page_token = str(data.get("page_token") or "").strip()
             if not next_page_token or next_page_token in seen_page_tokens:
-                raise RuntimeError("message list pagination returned a missing or repeated page_token")
+                raise RuntimeError(
+                    "message list pagination returned a missing or repeated page_token"
+                )
             seen_page_tokens.add(next_page_token)
             page_token = next_page_token
 
@@ -2493,6 +3686,219 @@ class FeishuAdapter(BasePlatformAdapter):
             "message list startup lookback exceeded "
             f"{_MAX_API_POLL_STARTUP_PAGES} pages before reaching the startup cursor"
         )
+
+    def _fetch_recent_chat_messages_via_api(
+        self,
+        chat_id: str,
+        *,
+        startup_cursor_ms: Optional[int] = None,
+        cancel_event: Optional[threading.Event] = None,
+        durable_scan: bool = True,
+    ) -> List[Dict[str, Any]] | _FeishuApiPollScanContinuation:
+        if not durable_scan or startup_cursor_ms is not None:
+            return self._fetch_recent_chat_messages_legacy(
+                chat_id,
+                startup_cursor_ms=startup_cursor_ms,
+                cancel_event=cancel_event,
+            )
+        token = self._fetch_tenant_access_token_via_api()
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("message list fetch cancelled")
+        base_url = "https://open.larksuite.com" if self._domain_name == "lark" else "https://open.feishu.cn"
+        watermark_ms = self._api_poll_last_seen_create_time_ms.get(
+            chat_id,
+            self._api_poll_discovery_floor_ms.get(
+                chat_id,
+                self._api_poll_start_cursor_ms,
+            ),
+        )
+        scan_state = self._api_poll_scan_state.get(chat_id)
+        scan_baselined = chat_id in self._api_poll_baselined_chat_ids
+        scan_cursor_ids = set(self._api_poll_cursor_message_ids.get(chat_id, set()))
+        page_token = ""
+        persisted_page_token = ""
+        # The API sorts newest-first. Retain the oldest bounded chunk above the
+        # watermark; once that chunk completes, the cursor advances and the next
+        # poll retrieves the next chunk. This handles gaps larger than the
+        # persistent pending capacity without skipping older work.
+        candidates: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        candidate_sizes: Dict[str, int] = {}
+        candidate_bytes = 0
+        scanned_candidates = 0
+        if isinstance(scan_state, dict):
+            normalized_scan = self._validated_api_poll_scan_state(chat_id, scan_state)
+            if normalized_scan["watermark_ms"] == watermark_ms:
+                page_token = normalized_scan["page_token"]
+                persisted_page_token = page_token
+                scan_baselined = normalized_scan["baselined"]
+                scan_cursor_ids = set(normalized_scan["cursor_message_ids"])
+                for candidate in normalized_scan["candidates"]:
+                    message_id = str(candidate.get("message_id") or "").strip()
+                    encoded_size = len(
+                        json.dumps(
+                            candidate,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    )
+                    candidates[message_id] = candidate
+                    candidate_sizes[message_id] = encoded_size
+                    candidate_bytes += encoded_size
+        candidate_count_budget, candidate_byte_budget = (
+            self._api_poll_candidate_capacity(chat_id)
+        )
+        if len(candidates) > candidate_count_budget or candidate_bytes > candidate_byte_budget:
+            while candidates and (
+                len(candidates) > candidate_count_budget
+                or candidate_bytes > candidate_byte_budget
+            ):
+                stale_message_id, _stale_item = candidates.popitem(last=False)
+                candidate_bytes -= candidate_sizes.pop(stale_message_id, 0)
+        max_pages = max(
+            1,
+            (_MAX_API_POLL_SCAN_ITEMS + self._api_poll_page_size - 1)
+            // self._api_poll_page_size,
+        ) + 1
+
+        for page_index in range(max_pages):
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("message list fetch cancelled")
+            query_params = {
+                "container_id_type": "chat",
+                "container_id": chat_id,
+                "sort_type": "ByCreateTimeDesc",
+                "page_size": str(self._api_poll_page_size),
+            }
+            if page_token:
+                query_params["page_token"] = page_token
+            query = urlencode(query_params)
+            request = Request(
+                f"{base_url}/open-apis/im/v1/messages?{query}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            try:
+                with urlopen(
+                    request,
+                    timeout=_API_POLL_REQUEST_TIMEOUT_SECONDS,
+                ) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RuntimeError("message list fetch cancelled")
+            except HTTPError as exc:
+                if page_token:
+                    try:
+                        error_payload = json.loads(exc.read().decode("utf-8"))
+                    except Exception:
+                        error_payload = {}
+                    detail = f"{error_payload.get('code')} {error_payload.get('msg')}"
+                    if _API_POLL_INVALID_TOKEN_RE.search(detail):
+                        raise _FeishuApiPollInvalidContinuation(
+                            "message list rejected persisted page token",
+                            persisted_page_token or page_token,
+                        ) from exc
+                raise
+            if payload.get("code") != 0:
+                detail = f"{payload.get('code')} {payload.get('msg')}"
+                if page_token and _API_POLL_INVALID_TOKEN_RE.search(detail):
+                    raise _FeishuApiPollInvalidContinuation(
+                        "message list rejected persisted page token",
+                        persisted_page_token or page_token,
+                    )
+                raise RuntimeError(
+                    f"message list failed: {payload.get('code')} {payload.get('msg')}"
+                )
+            data = payload.get("data") or {}
+            page_items = list(data.get("items") or [])
+            for item in page_items:
+                persisted_candidate = self._validated_api_poll_pending_item(
+                    item,
+                    expected_chat_id=chat_id,
+                )
+                message_id = str(
+                    persisted_candidate.get("message_id") or ""
+                ).strip()
+                create_time = self._api_poll_item_create_time_ms(
+                    persisted_candidate
+                )
+                if scan_baselined:
+                    is_candidate = bool(
+                        create_time is None
+                        or create_time > watermark_ms
+                        or (
+                            create_time == watermark_ms
+                            and message_id not in scan_cursor_ids
+                        )
+                    )
+                else:
+                    is_candidate = bool(
+                        create_time is None or create_time >= watermark_ms
+                    )
+                if not is_candidate:
+                    continue
+                scanned_candidates += 1
+                encoded_size = len(
+                    json.dumps(
+                        persisted_candidate,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                )
+                if encoded_size > candidate_byte_budget:
+                    raise RuntimeError(
+                        f"API poll item cannot fit persistent budget for chat {chat_id}"
+                    )
+                candidates.pop(message_id, None)
+                candidate_bytes -= candidate_sizes.pop(message_id, 0)
+                candidates[message_id] = persisted_candidate
+                candidate_sizes[message_id] = encoded_size
+                candidate_bytes += encoded_size
+                while (
+                    len(candidates) > candidate_count_budget
+                    or candidate_bytes > candidate_byte_budget
+                ):
+                    stale_message_id, _stale_item = candidates.popitem(last=False)
+                    candidate_bytes -= candidate_sizes.pop(stale_message_id, 0)
+
+            if watermark_ms is not None and any(
+                create_time is not None and create_time < watermark_ms
+                for create_time in (
+                    self._api_poll_item_create_time_ms(item)
+                    for item in page_items
+                )
+            ):
+                return list(candidates.values())
+            if data.get("has_more") is not True:
+                return list(candidates.values())
+            next_page_token = str(data.get("page_token") or "").strip()
+            if not next_page_token or next_page_token == page_token:
+                if page_token:
+                    raise _FeishuApiPollInvalidContinuation(
+                        "message list pagination returned a repeated page token",
+                        persisted_page_token or page_token,
+                    )
+                raise RuntimeError("message list pagination returned an invalid page token")
+            page_token = next_page_token
+
+            if (
+                scanned_candidates >= _MAX_API_POLL_SCAN_ITEMS
+                or page_index + 1 >= max_pages
+            ):
+                logger.warning(
+                    "[Feishu] API polling scan checkpointed for chat %s before watermark=%s",
+                    chat_id,
+                    watermark_ms,
+                )
+                return _FeishuApiPollScanContinuation(
+                    state={
+                        "page_token": page_token,
+                        "watermark_ms": watermark_ms,
+                        "cursor_message_ids": sorted(scan_cursor_ids),
+                        "candidates": list(candidates.values()),
+                        "baselined": scan_baselined,
+                    }
+                )
+
+        raise RuntimeError(f"API polling pagination did not terminate for chat {chat_id}")
 
     def _fetch_tenant_access_token_via_api(self) -> str:
         base_url = "https://open.larksuite.com" if self._domain_name == "lark" else "https://open.feishu.cn"
@@ -3586,7 +4992,7 @@ class FeishuAdapter(BasePlatformAdapter):
             with self._pending_inbound_lock:
                 self._pending_drain_scheduled = False
 
-    async def _handle_message_event_data(self, data: Any) -> None:
+    async def _handle_message_event_data(self, data: Any) -> bool:
         """Shared inbound message handling for websocket and webhook transports."""
         event = getattr(data, "event", None)
         message = getattr(event, "message", None)
@@ -3595,58 +5001,45 @@ class FeishuAdapter(BasePlatformAdapter):
             setattr(data, "_hermes_ingress_source", "event_callback")
         if not message or not sender or not getattr(sender, "sender_id", None):
             logger.debug("[Feishu] Dropping malformed inbound event: missing message/sender")
-            return
+            return True
 
         message_id = getattr(message, "message_id", None)
-        deferred_dedup_commit = bool(getattr(data, "_hermes_deferred_dedup_commit", False))
-        if not message_id or self._claim_message_id(message_id, durable=not deferred_dedup_commit):
+        if not message_id or not self._begin_message_processing(message_id):
             logger.debug("[Feishu] Dropping duplicate/missing message_id: %s", message_id)
-            return
+            return bool(message_id and self._message_processing_completed(message_id))
 
         try:
-            await self._handle_claimed_message_event_data(
+            reason = self._admit(sender, message)
+            if reason is not None:
+                logger.info(
+                    "[Feishu] Dropping inbound event before processing: reason=%s message_id=%s chat_id=%s chat_type=%s",
+                    reason,
+                    message_id,
+                    getattr(message, "chat_id", "") or "",
+                    getattr(message, "chat_type", "") or "",
+                )
+                self._complete_message_processing(message_id)
+                return True
+
+            chat_type = getattr(message, "chat_type", "p2p")
+            durable_completion = await self._process_inbound_message(
                 data=data,
                 message=message,
-                sender=sender,
+                sender_id=getattr(sender, "sender_id", None),
+                chat_type=chat_type,
                 message_id=message_id,
+                is_bot=_is_bot_sender(sender),
             )
+            if durable_completion is False:
+                # The RCA queue worker owns this inbox entry until Gateway has
+                # committed the source-neutral control-store admission.
+                return self._message_processing_completed(message_id)
         except BaseException:
-            if deferred_dedup_commit:
-                self._release_pending_message_id(message_id)
+            self._abandon_message_processing(message_id)
             raise
-        if deferred_dedup_commit:
-            self._commit_pending_message_id(message_id)
-
-    async def _handle_claimed_message_event_data(
-        self,
-        *,
-        data: Any,
-        message: Any,
-        sender: Any,
-        message_id: str,
-    ) -> None:
-        """Process one inbound event after its message ID has been claimed."""
-
-        reason = self._admit(sender, message)
-        if reason is not None:
-            logger.info(
-                "[Feishu] Dropping inbound event before processing: reason=%s message_id=%s chat_id=%s chat_type=%s",
-                reason,
-                message_id,
-                getattr(message, "chat_id", "") or "",
-                getattr(message, "chat_type", "") or "",
-            )
-            return
-
-        chat_type = getattr(message, "chat_type", "p2p")
-        await self._process_inbound_message(
-            data=data,
-            message=message,
-            sender_id=getattr(sender, "sender_id", None),
-            chat_type=chat_type,
-            message_id=message_id,
-            is_bot=_is_bot_sender(sender),
-        )
+        else:
+            self._complete_message_processing(message_id)
+            return True
 
     def _on_message_read_event(self, data: P2ImMessageMessageReadV1) -> None:
         """Ignore read-receipt events that Hermes does not act on."""
@@ -3987,7 +5380,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
     _RCA_CLARIFY_GUIDANCE = {
         "rca_case_status_check": "**查 case 状态** — 发 G1Q3 case 编号（如 `G1Q3-1234`），或直接问「这个 case 跑到哪一步了」。",
-        "rca_issue_intake": "**提交问题分析** — 转发完整的飞书问题卡片，或粘贴问题链接 / work_item_id / G1Q3 case 编号。",
+        "rca_issue_intake": "**飞书问题** — 普通问题卡或链接只查状态；手工运行仅在固定 RCA 群内真实 @ 机器人，并发送明确动作和完整问题链接。",
         "rca_case_evidence_summary": "**证据 / 缺项查询** — 发 G1Q3 case 编号，并说明要看的证据或缺什么（如「G1Q3-1234 缺什么」）。",
     }
 
@@ -5094,7 +6487,7 @@ class FeishuAdapter(BasePlatformAdapter):
         chat_type: str,
         message_id: str,
         is_bot: bool = False,
-    ) -> None:
+    ) -> Optional[bool]:
         try:
             extracted = await self._extract_message_content(message, include_mentions=True)
         except TypeError as exc:
@@ -5107,6 +6500,10 @@ class FeishuAdapter(BasePlatformAdapter):
         else:
             text, inbound_type, media_urls, media_types, mentions = extracted
 
+        self_mention_command_directed = bool(
+            inbound_type == MessageType.TEXT
+            and _self_mention_is_command_directed(text, mentions)
+        )
         if inbound_type == MessageType.TEXT:
             text = _strip_edge_self_mentions(text, mentions)
             if text.startswith("/"):
@@ -5129,7 +6526,30 @@ class FeishuAdapter(BasePlatformAdapter):
             or getattr(message, "root_id", None)
             or None
         )
-        reply_to_text = await self._fetch_message_text(reply_to_message_id) if reply_to_message_id else None
+        raw_chat_id = str(getattr(message, "chat_id", "") or "").strip()
+        requires_complete_reply_context = bool(
+            reply_to_message_id
+            and raw_chat_id in {G1Q3_RCA_GROUP_ID, PNC_ALL_BUSINESS_TEST_GROUP_ID}
+            and str(chat_type or "").strip().lower() not in {"p2p", "dm"}
+            and not is_bot
+            and self_mention_command_directed
+            and self._mentions_self(message)
+        )
+        try:
+            reply_to_text = (
+                await self._fetch_message_text(reply_to_message_id)
+                if reply_to_message_id
+                else None
+            )
+        except Exception:
+            if requires_complete_reply_context:
+                raise
+            logger.warning(
+                "[Feishu] Continuing ordinary message without parent context: %s",
+                reply_to_message_id,
+                exc_info=True,
+            )
+            reply_to_text = None
 
         sender_primary = (
             getattr(sender_id, "open_id", None)
@@ -5151,7 +6571,7 @@ class FeishuAdapter(BasePlatformAdapter):
             len(media_urls),
         )
 
-        chat_id = getattr(message, "chat_id", "") or ""
+        chat_id = raw_chat_id
         chat_info = await self.get_chat_info(chat_id)
         try:
             sender_profile = await self._resolve_sender_profile(sender_id, is_bot=is_bot)
@@ -5173,6 +6593,11 @@ class FeishuAdapter(BasePlatformAdapter):
             ),
             user_id_alt=sender_profile["user_id_alt"],
             is_bot=is_bot,
+        )
+        is_group_message = source_chat_type != "dm"
+        self_mentioned = bool(self._mentions_self(message))
+        mention_required = bool(
+            is_group_message and self._require_mention_for(chat_id)
         )
         link_urls: List[str] = []
         try:
@@ -5216,6 +6641,9 @@ class FeishuAdapter(BasePlatformAdapter):
                     "receive_time_ms": getattr(message, "create_time", None),
                     "ingress_source": ingress_source,
                     "link_urls": link_urls or None,
+                    "self_mentioned": self_mentioned,
+                    "self_mention_command_directed": self_mention_command_directed,
+                    "mention_required": mention_required,
                 }
             },
             timestamp=datetime.now(),
@@ -5240,55 +6668,166 @@ class FeishuAdapter(BasePlatformAdapter):
             if maybe_role is not None:
                 return
 
-        await self._dispatch_inbound_event(normalized)
+        return await self._dispatch_inbound_event(normalized)
 
     # =========================================================================
     # Admission queue processing
     # =========================================================================
+
+    async def _process_durable_g1q3_queue_event(self, event: MessageEvent) -> Dict[str, Any]:
+        """Run a fixed-group directed mention inline until Gateway decides it."""
+        if not self._message_handler:
+            raise RuntimeError("gateway message handler is unavailable")
+
+        chat_id = str(event.source.chat_id or "")
+        chat_lock = self._get_chat_lock(chat_id)
+        async with chat_lock:
+            if event.message_id and self._reactions_enabled():
+                await self._add_ack_reaction(event.message_id)
+            await self._run_processing_hook("on_processing_start", event)
+            try:
+                response = await self._message_handler(event)
+                metadata = event.metadata if isinstance(event.metadata, dict) else {}
+                policy_error = metadata.get("pnc_group_binding_error")
+                if (
+                    isinstance(policy_error, dict)
+                    and policy_error.get("schema_version")
+                    == "pnc_group_binding_error_v1"
+                    and policy_error.get("retryable") is True
+                ):
+                    code = str(policy_error.get("code") or "unknown")
+                    raise RuntimeError(f"retryable PNC group binding error: {code}")
+                manual_admission = metadata.get("pnc_manual_rca_admission")
+                binding = metadata.get("pnc_group_binding")
+                authorization = metadata.get("pnc_manual_authorization")
+                binding = binding if isinstance(binding, dict) else {}
+                authorization = authorization if isinstance(authorization, dict) else {}
+                manual_route = (
+                    binding.get("decision") == "accepted"
+                    and binding.get("route_surface") == "rca_manual_intake"
+                )
+                terminal_rejection = bool(
+                    manual_route and authorization.get("authorized") is False
+                )
+                if manual_route and not isinstance(manual_admission, dict) and not terminal_rejection:
+                    raise RuntimeError("RCA manual admission did not reach a durable decision")
+
+                response_text, ephemeral_ttl = self._unwrap_ephemeral(response)
+                if response_text:
+                    try:
+                        send_result = await self._send_with_retry(
+                            chat_id=chat_id,
+                            content=str(response_text),
+                            reply_to=_reply_anchor_for_event(event),
+                            metadata=_thread_metadata_for_source(
+                                event.source,
+                                _reply_anchor_for_event(event),
+                            ),
+                        )
+                        if (
+                            ephemeral_ttl > 0
+                            and send_result.success
+                            and send_result.message_id
+                        ):
+                            self._schedule_ephemeral_delete(
+                                chat_id=chat_id,
+                                message_id=send_result.message_id,
+                                ttl_seconds=ephemeral_ttl,
+                            )
+                    except Exception:
+                        # The control-store decision is already durable. Response
+                        # delivery failure must not create another RCA generation.
+                        logger.warning(
+                            "[admission] Failed to send durable RCA decision response",
+                            exc_info=True,
+                        )
+            except BaseException:
+                await self._run_processing_hook(
+                    "on_processing_complete", event, ProcessingOutcome.FAILURE
+                )
+                raise
+            await self._run_processing_hook(
+                "on_processing_complete", event, ProcessingOutcome.SUCCESS
+            )
+            return {
+                "durable_admission": isinstance(manual_admission, dict),
+                "terminal_rejection": terminal_rejection,
+            }
 
     async def _process_queue_item(self, item) -> dict:
         """Process a queue item by reconstructing the event and dispatching it.
 
         Called by QueueWorker when an item is dequeued.
         """
+        raw_context = getattr(item, "event_context", None)
+        requires_durable_decision = bool(
+            isinstance(raw_context, dict)
+            and raw_context.get("route_contract") == _G1Q3_RCA_MANUAL_QUEUE_ROUTE
+        )
         try:
-            from gateway.platforms.base import MessageEvent, MessageType
             from gateway.session import SessionSource
-            # Reconstruct event from queue item
+
+            context = _validated_feishu_queue_event_context(item)
+            if requires_durable_decision and context is None:
+                raise RuntimeError("trusted Feishu queue context is missing or invalid")
+            source_context = context.get("source", {}) if context else {}
+            event_context = context.get("event", {}) if context else {}
             source = SessionSource(
-                platform=self.platform,
+                platform=Platform.FEISHU,
                 user_id=item.user_id,
+                user_id_alt=source_context.get("user_id_alt"),
+                user_name=source_context.get("user_name"),
                 chat_id=item.chat_id or "",
+                chat_name=source_context.get("chat_name"),
                 chat_type=item.chat_type or "dm",
-                thread_id=item.thread_id or "",
+                thread_id=item.thread_id or None,
+                is_bot=source_context.get("is_bot") is True,
+                message_id=item.request_message_id or item.id,
             )
             event = MessageEvent(
                 source=source,
                 text=item.message,
                 message_type=MessageType.TEXT,
                 message_id=item.request_message_id or item.id,
+                reply_to_message_id=event_context.get("reply_to_message_id"),
+                reply_to_text=event_context.get("reply_to_text"),
+                metadata={"feishu": context["feishu"]} if context else {},
             )
+            durable_decision = _requires_durable_g1q3_gateway_decision(event)
+            if requires_durable_decision and not durable_decision:
+                raise RuntimeError("trusted Feishu RCA route contract did not validate")
+            if durable_decision:
+                result = await self._process_durable_g1q3_queue_event(event)
+                self._complete_message_processing(event.message_id)
+                return {
+                    "status": "completed",
+                    "durable_feishu_completion": True,
+                    **result,
+                }
             await self._handle_message_with_guards(event)
             return {"status": "completed"}
-        except Exception as exc:
+        except BaseException as exc:
+            if requires_durable_decision and item.request_message_id:
+                self._abandon_message_processing(item.request_message_id)
             logger.error("[admission] Failed to process queue item %s: %s", item.id, exc, exc_info=True)
-            return {"status": "failed", "error": str(exc)}
+            raise
 
     # =========================================================================
     # Message dispatch
     # =========================================================================
 
-    async def _dispatch_inbound_event(self, event: MessageEvent) -> None:
+    async def _dispatch_inbound_event(self, event: MessageEvent) -> bool:
         """Apply Feishu-specific burst protection before entering the base adapter."""
         # --- Admission gate (optional) ---
         if self._admission_enabled and self._admission_controller:
             user_id = event.source.user_id or ""
-            message_text = event.text or ""
+            message_text = _admission_text_with_issue_links(event)
             chat_id = event.source.chat_id or ""
             thread_id = event.source.thread_id or ""
             chat_type = getattr(event.source, "chat_type", "dm") or "dm"
             # Map SessionSource chat_type ("dm"/"group") to admission chat_type
             admission_chat_type = "group" if chat_type == "group" else None
+            requires_durable_decision = _requires_durable_g1q3_gateway_decision(event)
             try:
                 business_line = "integration_tools" if _is_integration_tools_message_context(chat_id, message_text) else "generic"
                 intent = (
@@ -5330,7 +6869,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         )
                     except Exception:
                         logger.warning("[admission] Failed to send pre-admission integration-tools fast reply", exc_info=True)
-                    return
+                    return True
 
                 admitted, feedback, queue_item = await self._admission_controller.admit(
                     user_id=user_id,
@@ -5340,10 +6879,17 @@ class FeishuAdapter(BasePlatformAdapter):
                     thread_id=thread_id,
                     request_message_id=event.message_id,
                     platform="feishu",
+                    event_context=_build_feishu_queue_event_context(
+                        event,
+                        durable_rca_manual=requires_durable_decision,
+                    ),
+                    require_durable_persistence=requires_durable_decision,
                 )
                 if not admitted:
                     logger.info("[admission] Rejected user=%s: %s", user_id, feedback)
-                    return
+                    return True
+                if requires_durable_decision and queue_item is None:
+                    raise RuntimeError("durable RCA admission returned no queue item")
                 logger.debug(
                     "[admission] Queued user=%s lane=%s id=%s",
                     user_id,
@@ -5386,17 +6932,27 @@ class FeishuAdapter(BasePlatformAdapter):
                         )
                     except Exception:
                         logger.warning("[admission] Failed to send queue feedback", exc_info=True)
-                return  # Worker will process via _process_queue_item
+                if requires_durable_decision:
+                    result = getattr(queue_item, "result", None)
+                    return bool(
+                        getattr(queue_item, "status", None) == "completed"
+                        and isinstance(result, dict)
+                        and result.get("durable_feishu_completion") is True
+                    )
+                return True  # Worker will process via _process_queue_item
             except Exception:
                 logger.warning("[admission] Gate error, falling through", exc_info=True)
+                if requires_durable_decision:
+                    raise
 
         if event.message_type == MessageType.TEXT and not event.is_command():
             await self._enqueue_text_event(event)
-            return
+            return True
         if self._should_batch_media_event(event):
             await self._enqueue_media_event(event)
-            return
+            return True
         await self._handle_message_with_guards(event)
+        return True
 
     def _is_permission_request_message(self, text: str) -> bool:
         normalized = str(text or "").strip()
@@ -6608,6 +8164,15 @@ class FeishuAdapter(BasePlatformAdapter):
         reply_in_thread = bool(thread_id)
         return effective_reply_to, reply_in_thread
 
+    @staticmethod
+    def _message_idempotency_uuid(metadata: Optional[Dict[str, Any]]) -> str:
+        value = str((metadata or {}).get("idempotency_uuid") or "").strip()
+        if not value:
+            return str(uuid.uuid4())
+        if len(value) > 50 or not re.fullmatch(r"[A-Za-z0-9._:-]+", value):
+            raise ValueError("Feishu idempotency_uuid must be 1-50 safe ASCII characters")
+        return value
+
     async def _resolve_sender_profile(
         self,
         sender_id: Any,
@@ -6742,8 +8307,12 @@ class FeishuAdapter(BasePlatformAdapter):
             return None
 
     async def _fetch_message_text(self, message_id: str) -> Optional[str]:
-        if not self._client or not message_id:
+        if not message_id:
             return None
+        if not getattr(self, "_client", None):
+            raise _FeishuReplyContextUnavailable(
+                f"Feishu client unavailable for parent message {message_id}"
+            )
         if message_id in self._message_text_cache:
             self._message_text_cache.move_to_end(message_id)
             return self._message_text_cache[message_id]
@@ -6754,25 +8323,54 @@ class FeishuAdapter(BasePlatformAdapter):
                 code = getattr(response, "code", "unknown")
                 msg = getattr(response, "msg", "message lookup failed")
                 logger.warning("[Feishu] Failed to fetch parent message %s: [%s] %s", message_id, code, msg)
-                return None
+                raise _FeishuReplyContextUnavailable(
+                    f"Feishu parent lookup failed for {message_id}: {code}"
+                )
             items = getattr(getattr(response, "data", None), "items", None) or []
             parent = items[0] if items else None
+            if parent is None:
+                raise _FeishuReplyContextUnavailable(
+                    f"Feishu parent lookup returned no item for {message_id}"
+                )
             body = getattr(parent, "body", None)
             msg_type = getattr(parent, "msg_type", "") or ""
             raw_content = getattr(body, "content", "") or ""
             parent_mentions = getattr(parent, "mentions", None) if parent else None
-            text = self._extract_text_from_raw_content(
-                msg_type=msg_type,
+            normalized = normalize_feishu_message(
+                message_type=msg_type,
                 raw_content=raw_content,
                 mentions=parent_mentions,
+                bot=self._bot_identity(),
             )
+            text = normalized.text_content
+            if not text:
+                text = str(normalized.metadata.get("placeholder_text") or "").strip() or None
+            issue_links: list[str] = []
+            raw_links = normalized.metadata.get("link_urls")
+            if isinstance(raw_links, list):
+                for raw_link in raw_links:
+                    match = re.match(
+                        r"^https?://project\.feishu\.cn/[^\s/?#)]+/issue/detail/\d+",
+                        str(raw_link or "").strip(),
+                        re.IGNORECASE,
+                    )
+                    if match:
+                        canonical_link = match.group(0).rstrip("/")
+                        if canonical_link not in issue_links:
+                            issue_links.append(canonical_link)
+            if issue_links:
+                text = "\n".join([str(text or "").strip(), *issue_links]).strip()
             self._message_text_cache[message_id] = text
             while len(self._message_text_cache) > _FEISHU_MESSAGE_TEXT_CACHE_SIZE:
                 self._message_text_cache.popitem(last=False)
             return text
-        except Exception:
+        except _FeishuReplyContextUnavailable:
+            raise
+        except Exception as exc:
             logger.warning("[Feishu] Failed to fetch parent message %s", message_id, exc_info=True)
-            return None
+            raise _FeishuReplyContextUnavailable(
+                f"Feishu parent lookup raised for {message_id}"
+            ) from exc
 
     def _extract_text_from_raw_content(
         self,
@@ -6865,10 +8463,11 @@ class FeishuAdapter(BasePlatformAdapter):
         return None
 
     def _require_mention_for(self, chat_id: str) -> bool:
-        rule = self._group_rules.get(chat_id) if chat_id else None
+        group_rules = getattr(self, "_group_rules", {})
+        rule = group_rules.get(chat_id) if chat_id else None
         if rule and rule.require_mention is not None:
             return rule.require_mention
-        return self._require_mention
+        return bool(getattr(self, "_require_mention", False))
 
     # --- Group policy ---------------------------------------------------------
 
@@ -6937,40 +8536,39 @@ class FeishuAdapter(BasePlatformAdapter):
         return self._post_mentions_bot(normalized.mentions)
 
     def _message_mentions_bot(self, mentions: List[Any]) -> bool:
-        # IDs trump names: when both sides have open_id (or both user_id),
-        # match requires equal IDs. Name fallback only when either side
-        # lacks an ID.
+        identity = self._bot_identity()
         for mention in mentions:
-            mention_id = getattr(mention, "id", None)
-            mention_open_id = (getattr(mention_id, "open_id", None) or "").strip()
-            mention_user_id = (getattr(mention_id, "user_id", None) or "").strip()
+            mention_open_id, mention_user_id = _extract_mention_ids(mention)
             mention_name = (getattr(mention, "name", None) or "").strip()
-
-            if mention_open_id and self._bot_open_id:
-                if mention_open_id == self._bot_open_id:
-                    return True
-                continue  # IDs differ — not the bot; skip name fallback.
-            if mention_user_id and self._bot_user_id:
-                if mention_user_id == self._bot_user_id:
-                    return True
-                continue
-            if self._bot_name and mention_name == self._bot_name:
+            if identity.matches(
+                open_id=mention_open_id,
+                user_id=mention_user_id,
+                name=mention_name,
+            ):
                 return True
 
         return False
 
     def _post_mentions_bot(self, mentions: Sequence[Any]) -> bool:
+        identity = self._bot_identity()
         for mention in mentions:
             if isinstance(mention, FeishuMentionRef):
                 if mention.is_self:
                     return True
-                if self._bot_open_id and mention.open_id == self._bot_open_id:
-                    return True
-                if self._bot_name and mention.name == self._bot_name:
+                if identity.matches(
+                    open_id=mention.open_id,
+                    user_id="",
+                    name=mention.name,
+                ):
                     return True
                 continue
             if isinstance(mention, str):
-                if mention in {self._bot_open_id, self._bot_user_id}:
+                mention_id = mention.strip()
+                if mention_id and mention_id in {
+                    value
+                    for value in (self._bot_open_id, self._bot_user_id)
+                    if value
+                }:
                     return True
         return False
 
@@ -7059,15 +8657,302 @@ class FeishuAdapter(BasePlatformAdapter):
     # Deduplication — seen message ID cache (persistent)
     # =========================================================================
 
-    def _load_seen_message_ids(self) -> None:
+    def _load_api_poll_state(self, raw_state: Any) -> bool:
+        if not isinstance(raw_state, dict):
+            self._api_poll_state_error = "api_poll state must be an object"
+            self._api_poll_raw_state = raw_state
+            logger.error("[Feishu] Persisted API poll state is invalid")
+            return False
         try:
-            payload = json.loads(self._dedup_state_path.read_text(encoding="utf-8"))
+            raw_pending = raw_state.get("pending", {})
+            if not isinstance(raw_pending, dict):
+                raise ValueError("api_poll.pending must be an object")
+            pending: Dict[str, List[Dict[str, Any]]] = {}
+            for raw_chat_id, raw_items in raw_pending.items():
+                chat_id = str(raw_chat_id or "").strip()
+                if not chat_id or not isinstance(raw_items, list):
+                    raise ValueError("api_poll pending chat entry is invalid")
+                if len(raw_items) > _MAX_API_POLL_PENDING_PER_CHAT:
+                    raise ValueError("api_poll pending chat exceeds capacity")
+                normalized = [
+                    self._validated_api_poll_pending_item(
+                        item,
+                        expected_chat_id=chat_id,
+                    )
+                    for item in raw_items
+                ]
+                message_ids = [
+                    str(item.get("message_id") or "").strip()
+                    for item in normalized
+                ]
+                if len(message_ids) != len(set(message_ids)):
+                    raise ValueError("api_poll pending message IDs are duplicated")
+                normalized.sort(
+                    key=lambda value: (
+                        self._api_poll_item_create_time_ms(value) or 0,
+                        str(value.get("message_id") or ""),
+                    )
+                )
+                if normalized:
+                    pending[chat_id] = normalized
+
+            pending_bytes = len(
+                json.dumps(
+                    pending,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+            if pending_bytes > _MAX_API_POLL_TOTAL_BYTES:
+                raise ValueError("api_poll pending state exceeds byte capacity")
+
+            raw_baselined = raw_state.get("baselined_chat_ids", [])
+            raw_seen = raw_state.get("seen_message_ids", [])
+            raw_cursors = raw_state.get("last_seen_create_time_ms", {})
+            raw_cursor_ids = raw_state.get("cursor_message_ids", {})
+            raw_floors = raw_state.get("discovery_floor_ms", {})
+            raw_scan_state = raw_state.get("scan_state", {})
+            raw_holes = raw_state.get("terminal_holes", [])
+            if not isinstance(raw_baselined, list) or not isinstance(raw_seen, list):
+                raise ValueError("api_poll list state is invalid")
+            if (
+                not isinstance(raw_cursors, dict)
+                or not isinstance(raw_cursor_ids, dict)
+                or not isinstance(raw_floors, dict)
+                or not isinstance(raw_scan_state, dict)
+                or not isinstance(raw_holes, list)
+            ):
+                raise ValueError("api_poll cursor state is invalid")
+            baselined = {
+                str(value).strip()
+                for value in raw_baselined
+                if str(value or "").strip()
+            }
+            seen_order = [
+                str(value).strip()
+                for value in raw_seen
+                if str(value or "").strip()
+            ]
+            seen_order = list(dict.fromkeys(seen_order))[
+                -max(1, int(getattr(self, "_dedup_cache_size", 1000) or 1000)):
+            ]
+            seen = set(seen_order)
+            cursors: Dict[str, int] = {}
+            for raw_chat_id, raw_cursor in raw_cursors.items():
+                chat_id = str(raw_chat_id or "").strip()
+                if (
+                    not chat_id
+                    or isinstance(raw_cursor, bool)
+                    or not isinstance(raw_cursor, int)
+                    or raw_cursor < 0
+                ):
+                    raise ValueError("api_poll cursor entry is invalid")
+                cursors[chat_id] = raw_cursor
+            cursor_ids: Dict[str, set[str]] = {}
+            for raw_chat_id, raw_ids in raw_cursor_ids.items():
+                chat_id = str(raw_chat_id or "").strip()
+                if not chat_id or not isinstance(raw_ids, list):
+                    raise ValueError("api_poll cursor message IDs are invalid")
+                ids = {
+                    str(value).strip()
+                    for value in raw_ids
+                    if str(value or "").strip()
+                }
+                if ids:
+                    cursor_ids[chat_id] = ids
+            floors: Dict[str, int] = {}
+            for raw_chat_id, raw_floor in raw_floors.items():
+                chat_id = str(raw_chat_id or "").strip()
+                if (
+                    not chat_id
+                    or isinstance(raw_floor, bool)
+                    or not isinstance(raw_floor, int)
+                    or raw_floor < 0
+                ):
+                    raise ValueError("api_poll discovery floor entry is invalid")
+                floors[chat_id] = raw_floor
+            scan_state: Dict[str, Dict[str, Any]] = {}
+            for raw_chat_id, raw_scan in raw_scan_state.items():
+                chat_id = str(raw_chat_id or "").strip()
+                if not chat_id:
+                    raise ValueError("api_poll scan chat identity is invalid")
+                scan_state[chat_id] = self._validated_api_poll_scan_state(
+                    chat_id,
+                    raw_scan,
+                )
+            holes: List[Dict[str, Any]] = []
+            for raw_hole in raw_holes[-_MAX_API_POLL_TERMINAL_HOLES:]:
+                if not isinstance(raw_hole, dict):
+                    raise ValueError("api_poll terminal hole is invalid")
+                holes.append(
+                    {
+                        "schema_version": "feishu_api_poll_terminal_hole_v1",
+                        "kind": str(raw_hole.get("kind") or "unknown")[:64],
+                        "status": str(raw_hole.get("status") or "terminal")[:64],
+                        "message_id": str(raw_hole.get("message_id") or "")[:512],
+                        "chat_id": str(raw_hole.get("chat_id") or "")[:512],
+                        "create_time": str(raw_hole.get("create_time") or "")[:64],
+                        "sender_id": str(raw_hole.get("sender_id") or "")[:512],
+                        "payload_sha256": str(
+                            raw_hole.get("payload_sha256") or ""
+                        )[:64],
+                        "original_message_id": self._bounded_api_poll_field(
+                            raw_hole.get("original_message_id"), 512
+                        ),
+                        "error": str(raw_hole.get("error") or "")[:512],
+                        "admission_item_id": str(
+                            raw_hole.get("admission_item_id") or ""
+                        )[:128],
+                        "recorded_at": float(raw_hole.get("recorded_at") or 0.0),
+                    }
+                )
+            baselined.update(pending)
+            baselined.update(scan_state)
+        except (TypeError, ValueError) as exc:
+            self._api_poll_state_error = f"{type(exc).__name__}: {exc}"
+            self._api_poll_raw_state = raw_state
+            logger.error(
+                "[Feishu] Persisted API poll state is invalid: %s",
+                exc,
+            )
+            return False
+
+        self._api_poll_pending_items = pending
+        self._api_poll_baselined_chat_ids = baselined
+        self._api_poll_seen_message_ids = seen
+        self._api_poll_seen_message_order = seen_order
+        self._api_poll_last_seen_create_time_ms = cursors
+        self._api_poll_cursor_message_ids = cursor_ids
+        self._api_poll_discovery_floor_ms = floors
+        self._api_poll_scan_state = scan_state
+        self._api_poll_terminal_holes = holes
+        normalized_state = self._api_poll_state_snapshot()
+        normalized_payload = self._api_poll_sidecar_payload(
+            normalized_state,
+            revision=max(0, self._api_poll_revision),
+        )
+        try:
+            self._validate_api_poll_capacity(normalized_state, normalized_payload)
+        except ValueError as exc:
+            self._api_poll_state_error = f"ValueError: {exc}"
+            self._api_poll_raw_state = raw_state
+            logger.error("[Feishu] Persisted API poll state exceeds capacity: %s", exc)
+            return False
+        return True
+
+    def _load_api_poll_sidecar(self) -> bool:
+        """Load the independent ownership sidecar; return whether it existed."""
+        try:
+            if self._api_poll_state_path.stat().st_size > _MAX_API_POLL_TOTAL_BYTES:
+                raise ValueError("API poll sidecar exceeds 16 MiB")
+            payload = json.loads(self._api_poll_state_path.read_text(encoding="utf-8"))
         except FileNotFoundError:
-            return
-        except (OSError, json.JSONDecodeError):
+            return False
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            self._api_poll_state_error = (
+                f"API poll sidecar unreadable: {type(exc).__name__}"
+            )
+            self._api_poll_block_persistence = True
+            logger.error(
+                "[Feishu] Failed to load API poll sidecar from %s",
+                self._api_poll_state_path,
+                exc_info=True,
+            )
+            return True
+        try:
+            if not isinstance(payload, dict):
+                raise ValueError("API poll sidecar top level must be an object")
+            if payload.get("schema_version") != _API_POLL_SIDECAR_SCHEMA:
+                raise ValueError("API poll sidecar schema is unsupported")
+            if payload.get("app_scope") != self._api_poll_app_scope:
+                raise ValueError("API poll sidecar app scope does not match")
+            revision = payload.get("revision")
+            if (
+                isinstance(revision, bool)
+                or not isinstance(revision, int)
+                or revision < 0
+            ):
+                raise ValueError("API poll sidecar revision is invalid")
+            self._api_poll_revision = revision
+            if not self._load_api_poll_state(payload.get("state")):
+                raise ValueError(self._api_poll_state_error or "API poll state is invalid")
+        except (TypeError, ValueError) as exc:
+            self._api_poll_state_error = f"{type(exc).__name__}: {exc}"
+            self._api_poll_raw_state = payload
+            self._api_poll_block_persistence = True
+            logger.error("[Feishu] Persisted API poll sidecar is invalid: %s", exc)
+            return True
+        self._api_poll_sidecar_initialized = True
+        return True
+
+    def _load_seen_message_ids(self) -> None:
+        payload: Any = None
+        try:
+            if self._dedup_state_path.stat().st_size > _MAX_FEISHU_INBOX_STATE_BYTES:
+                self._api_poll_state_error = "persistent inbox exceeds 16 MiB"
+                self._api_poll_block_persistence = True
+                logger.error(
+                    "[Feishu] Refusing oversized persisted inbox at %s",
+                    self._dedup_state_path,
+                )
+            else:
+                payload = json.loads(
+                    self._dedup_state_path.read_text(encoding="utf-8")
+                )
+        except FileNotFoundError:
+            payload = None
+        except (OSError, json.JSONDecodeError) as exc:
+            self._api_poll_state_error = f"persistent inbox unreadable: {type(exc).__name__}"
+            self._api_poll_block_persistence = True
             logger.warning("[Feishu] Failed to load persisted dedup state from %s", self._dedup_state_path, exc_info=True)
+            payload = None
+        if payload is not None and not isinstance(payload, dict):
+            self._api_poll_state_error = "persistent inbox top level must be an object"
+            self._api_poll_block_persistence = True
+            logger.error(
+                "[Feishu] Persisted inbox top level is invalid at %s",
+                self._dedup_state_path,
+            )
+            payload = None
+
+        sidecar_exists = self._load_api_poll_sidecar()
+        if (
+            not sidecar_exists
+            and isinstance(payload, dict)
+            and "api_poll" in payload
+            and self._api_poll_state_error is None
+        ):
+            if self._load_api_poll_state(payload.get("api_poll")):
+                try:
+                    self._persist_api_poll_state(require_success=True)
+                    logger.info(
+                        "[Feishu] Migrated embedded API poll ownership to %s",
+                        self._api_poll_state_path,
+                    )
+                except RuntimeError as exc:
+                    self._api_poll_state_error = (
+                        f"API poll sidecar migration failed: {type(exc).__name__}"
+                    )
+                    self._api_poll_block_persistence = True
+                    logger.error(
+                        "[Feishu] Failed to migrate embedded API poll ownership",
+                        exc_info=True,
+                    )
+
+        if not isinstance(payload, dict):
             return
-        seen_data = payload.get("message_ids", {}) if isinstance(payload, dict) else {}
+        seen_data: Any = {}
+        if isinstance(payload.get("messages"), dict):
+            # v2 is a minimal persistent inbox. Only completed entries are
+            # deduplicated after restart; processing entries represent a crash
+            # window and are deliberately recoverable by redelivery.
+            seen_data = {
+                key: value.get("updated_at")
+                for key, value in payload["messages"].items()
+                if isinstance(value, dict) and value.get("status") == "completed"
+            }
+        else:
+            seen_data = payload.get("message_ids", {})
         now = time.time()
         ttl = _FEISHU_DEDUP_TTL_SECONDS
         # Backward-compat: old format stored a plain list of IDs (no timestamps).
@@ -7095,37 +8980,121 @@ class FeishuAdapter(BasePlatformAdapter):
         self._seen_message_order = list(reversed(sorted_ids))
         self._seen_message_ids = {k: valid[k] for k in sorted_ids}
 
-    def _persist_seen_message_ids(self) -> None:
+    def _persist_seen_message_ids(self, *, require_success: bool = False) -> bool:
+        if getattr(self, "_api_poll_block_persistence", False):
+            logger.error(
+                "[Feishu] Persistent inbox writes are blocked after an unsafe load"
+            )
+            if require_success:
+                raise RuntimeError("Feishu persistent inbox is unhealthy")
+            return False
         try:
             self._dedup_state_path.parent.mkdir(parents=True, exist_ok=True)
             recent = self._seen_message_order[-self._dedup_cache_size:]
-            # Save as {msg_id: timestamp} so TTL filtering works across restarts.
-            payload = {"message_ids": {k: self._seen_message_ids[k] for k in recent if k in self._seen_message_ids}}
+            completed = {
+                key: self._seen_message_ids[key]
+                for key in recent
+                if key in self._seen_message_ids
+            }
+            messages = {
+                key: {"status": "completed", "updated_at": timestamp}
+                for key, timestamp in completed.items()
+            }
+            messages.update(
+                {
+                    key: {"status": "processing", "updated_at": timestamp}
+                    for key, timestamp in self._processing_message_ids.items()
+                }
+            )
+            payload = {
+                "schema_version": "feishu_message_inbox_v2",
+                "messages": messages,
+                # Rollback compatibility for older binaries.
+                "message_ids": completed,
+            }
+            encoded_payload = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            if len(encoded_payload) > _MAX_FEISHU_INBOX_STATE_BYTES:
+                raise ValueError(
+                    "Feishu persistent inbox exceeds 16 MiB byte capacity"
+                )
             atomic_json_write(self._dedup_state_path, payload, indent=None)
-        except OSError:
+            return True
+        except (OSError, TypeError, ValueError) as exc:
             logger.warning("[Feishu] Failed to persist dedup state to %s", self._dedup_state_path, exc_info=True)
+            if require_success:
+                raise RuntimeError("Feishu persistent inbox write failed") from exc
+            return False
 
-    def _is_duplicate(self, message_id: str) -> bool:
-        return self._claim_message_id(message_id, durable=True)
-
-    def _claim_message_id(self, message_id: str, *, durable: bool) -> bool:
+    def _begin_message_processing(self, message_id: str) -> bool:
+        """Persist processing before callback work without marking completion."""
         now = time.time()
         ttl = _FEISHU_DEDUP_TTL_SECONDS
         with self._dedup_lock:
-            pending_ids = getattr(self, "_pending_dedup_message_ids", None)
-            if pending_ids is None:
-                pending_ids = set()
-                self._pending_dedup_message_ids = pending_ids
+            seen_at = self._seen_message_ids.get(message_id)
+            if seen_at is not None and (ttl <= 0 or now - seen_at < ttl):
+                return False
+            if seen_at is not None:
+                self._seen_message_ids.pop(message_id, None)
+                self._seen_message_order = [
+                    item for item in self._seen_message_order if item != message_id
+                ]
+            if message_id in self._processing_message_ids:
+                return False
+            self._processing_message_ids[message_id] = now
+            self._persist_seen_message_ids()
+            return True
+
+    def _complete_message_processing(self, message_id: str) -> None:
+        now = time.time()
+        with self._dedup_lock:
+            self._processing_message_ids.pop(message_id, None)
+            self._seen_message_ids[message_id] = now
+            if message_id in self._seen_message_order:
+                self._seen_message_order.remove(message_id)
+            self._seen_message_order.append(message_id)
+            while len(self._seen_message_order) > self._dedup_cache_size:
+                stale = self._seen_message_order.pop(0)
+                self._seen_message_ids.pop(stale, None)
+            self._persist_seen_message_ids()
+
+    def _message_processing_completed(self, message_id: str) -> bool:
+        now = time.time()
+        ttl = _FEISHU_DEDUP_TTL_SECONDS
+        with self._dedup_lock:
+            seen_at = self._seen_message_ids.get(message_id)
+            return bool(
+                seen_at is not None and (ttl <= 0 or now - seen_at < ttl)
+            )
+
+    def _abandon_message_processing(self, message_id: str) -> None:
+        with self._dedup_lock:
+            if self._processing_message_ids.pop(message_id, None) is not None:
+                self._persist_seen_message_ids()
+
+    def _is_duplicate(self, message_id: str) -> bool:
+        """Legacy atomic check-and-complete helper for older call sites/tests."""
+        if not self._begin_message_processing(message_id):
+            return True
+        self._complete_message_processing(message_id)
+        return False
+
+    def _claim_message_id(self, message_id: str, *, durable: bool) -> bool:
+        """Compatibility helper for pre-v0.18.2 callers and focused tests."""
+        now = time.time()
+        ttl = _FEISHU_DEDUP_TTL_SECONDS
+        with self._dedup_lock:
             seen_at = self._seen_message_ids.get(message_id)
             if seen_at is not None and (ttl <= 0 or now - seen_at < ttl):
                 return True
-            if message_id in pending_ids:
+            if message_id in self._pending_dedup_message_ids:
                 return True
             if seen_at is not None:
                 self._seen_message_ids.pop(message_id, None)
-                self._seen_message_order = [item for item in self._seen_message_order if item != message_id]
+                self._seen_message_order = [
+                    item for item in self._seen_message_order if item != message_id
+                ]
             if not durable:
-                pending_ids.add(message_id)
+                self._pending_dedup_message_ids.add(message_id)
                 return False
             self._record_seen_message_id_locked(message_id, now)
             return False
@@ -7272,6 +9241,7 @@ class FeishuAdapter(BasePlatformAdapter):
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
+        idempotency_uuid = self._message_idempotency_uuid(metadata)
         effective_reply_to, reply_in_thread = self._resolve_reply_target(
             reply_to=reply_to,
             metadata=metadata,
@@ -7301,7 +9271,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 content=payload,
                 msg_type=msg_type,
                 reply_in_thread=reply_in_thread,
-                uuid_value=str(uuid.uuid4()),
+                uuid_value=idempotency_uuid,
             )
             request = self._build_reply_message_request(effective_reply_to, body)
             return await self._run_blocking(self._client.im.v1.message.reply, request)
@@ -7315,7 +9285,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 receive_id=_thread_id,
                 msg_type=msg_type,
                 content=payload,
-                uuid_value=str(uuid.uuid4()),
+                uuid_value=idempotency_uuid,
             )
             request = self._build_create_message_request("thread_id", body)
         else:
@@ -7331,7 +9301,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 receive_id=receive_id,
                 msg_type=msg_type,
                 content=payload,
-                uuid_value=str(uuid.uuid4()),
+                uuid_value=idempotency_uuid,
             )
             request = self._build_create_message_request(receive_id_type, body)
         return await self._run_blocking(self._client.im.v1.message.create, request)
@@ -7457,6 +9427,7 @@ class FeishuAdapter(BasePlatformAdapter):
             .app_secret(self._app_secret)
             .domain(domain)
             .log_level(lark.LogLevel.WARNING)
+            .timeout(_FEISHU_API_TIMEOUT_SECONDS)
             .build()
         )
 
@@ -7502,8 +9473,10 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
         last_error: Optional[Exception] = None
-        metadata_thread_id = str((metadata or {}).get("thread_id") or "").strip()
-        metadata_reply_to = str((metadata or {}).get("reply_to_message_id") or "").strip() or None
+        send_metadata = dict(metadata or {})
+        send_metadata.setdefault("idempotency_uuid", str(uuid.uuid4()))
+        metadata_thread_id = str(send_metadata.get("thread_id") or "").strip()
+        metadata_reply_to = str(send_metadata.get("reply_to_message_id") or "").strip() or None
         active_reply_to = reply_to or metadata_reply_to or self._topic_anchor_from_thread_id(metadata_thread_id)
         for attempt in range(_FEISHU_SEND_ATTEMPTS):
             try:
@@ -7512,7 +9485,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     msg_type=msg_type,
                     payload=payload,
                     reply_to=active_reply_to,
-                    metadata=metadata,
+                    metadata=send_metadata,
                 )
                 # If replying to a message failed because it was withdrawn or not found,
                 # fall back to posting a new message directly to the chat only for plain
@@ -7522,7 +9495,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 if active_reply_to and not self._response_succeeded(response):
                     code = getattr(response, "code", None)
                     if self._should_fallback_reply_response(response):
-                        if self._metadata_has_topic_thread(metadata):
+                        if self._metadata_has_topic_thread(send_metadata):
                             logger.warning(
                                 "[Feishu] Reply to topic %s failed (code %s — reply target/thread rejected); "
                                 "refusing chat fallback for topic route in chat %s",
@@ -7544,7 +9517,7 @@ class FeishuAdapter(BasePlatformAdapter):
                             msg_type=msg_type,
                             payload=payload,
                             reply_to=None,
-                            metadata=self._reply_fallback_metadata(metadata),
+                            metadata=self._reply_fallback_metadata(send_metadata),
                         )
                 return response
             except Exception as exc:

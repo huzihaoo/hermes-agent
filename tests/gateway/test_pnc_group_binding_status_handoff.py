@@ -44,141 +44,164 @@ def make_feishu_event(text: str, *, chat_id: str = G1Q3_GROUP_ID) -> MessageEven
     )
 
 
+@pytest.mark.parametrize(
+    "flag",
+    [None, "true", "1", "invalid", "false", "0", "no", "off"],
+)
+def test_issue_intake_legacy_entry_fails_closed_before_side_effects(
+    monkeypatch, flag
+):
+    if flag is None:
+        monkeypatch.delenv("HERMES_RCA_LEGACY_AUTO_EXECUTION_DISABLED", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_RCA_LEGACY_AUTO_EXECUTION_DISABLED", flag)
+    monkeypatch.setattr(
+        pnc_issue_context,
+        "fetch_g1q3_issue_context_result",
+        lambda **kwargs: pytest.fail("disabled legacy intake must not preread the issue"),
+    )
+    monkeypatch.setattr(
+        "tools.vm_task_tool.vm_task_submit",
+        lambda **kwargs: pytest.fail("disabled legacy intake must not create a VM task"),
+    )
+
+    result = gateway_run._submit_g1q3_rca_status_handoff(
+        template_id="rca_issue_intake",
+        case_id="",
+        work_item_id="7008267126",
+        requester="ou_test_user",
+        source_group_id=G1Q3_GROUP_ID,
+        message_id="om_test_message",
+        request_text="分析这个问题",
+    )
+
+    assert result == {
+        "success": False,
+        "error_code": "g1q3_rca_legacy_chat_handoff_retired",
+        "error": (
+            "旧群聊旁路已退役，不会创建任务。生产入口仅包括 Kafka 自动受理，"
+            "以及固定 RCA 群内真实 @、明确动作和完整问题链接的手工控制面。"
+        ),
+        "retryable": False,
+        "intake": "durable_rca_control_plane",
+    }
+
+
 @pytest.mark.asyncio
-async def test_g1q3_status_accepted_submits_shared_state_handoff(monkeypatch, tmp_path):
-    runner = make_runner(receipt_dir=tmp_path)
-    event = make_feishu_event("帮我看一下 case G1Q3-042 现在归因做到哪一步了")
-    calls = []
+@pytest.mark.parametrize(
+    ("chat_id", "text"),
+    [
+        (G1Q3_GROUP_ID, "普通消息也不能在专用 RCA 群绕过策略"),
+        (
+            gateway_run.PNC_ALL_BUSINESS_TEST_GROUP_ID,
+            "分析 G1Q3 RCA 飞书问题 7008267126",
+        ),
+    ],
+)
+async def test_g1q3_policy_failure_never_falls_through_to_generic_agent(
+    monkeypatch, chat_id, text
+):
+    from gateway import pnc_group_binding
 
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run.GatewayRunner, "_is_user_authorized", lambda self, source: True)
-
-    def fake_submit(**kwargs):
-        from gateway.session_context import get_session_env
-        assert get_session_env("HERMES_SESSION_PLATFORM") == "feishu"
-        assert get_session_env("HERMES_SESSION_CHAT_ID") == G1Q3_GROUP_ID
-        assert get_session_env("HERMES_SESSION_THREAD_ID") == "topic:om_request_topic"
-        assert get_session_env("HERMES_SESSION_MESSAGE_ID") == "om_test_message"
-        calls.append(kwargs)
-        return {
-            "success": True,
-            "task": {"task_id": "pnc_status_001"},
-            "routing": {"host_state": "host-created"},
-            "notify_process": {"started": True, "session_id": "proc_001"},
-        }
-
-    monkeypatch.setattr(gateway_run, "_submit_g1q3_rca_status_handoff", fake_submit)
+    runner = make_runner()
+    event = make_feishu_event(text, chat_id=chat_id)
+    monkeypatch.setattr(
+        gateway_run.GatewayRunner,
+        "_is_user_authorized",
+        lambda self, source: True,
+    )
+    monkeypatch.setattr(
+        pnc_group_binding,
+        "evaluate_pnc_group_request",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("policy unavailable")),
+    )
 
     response = await gateway_run.GatewayRunner._handle_message(runner, event)
 
-    assert response == ""
-    assert len(calls) == 1
-    call = calls[0]
-    assert call["template_id"] == "rca_case_status_check"
-    assert call["case_id"] == "042"
-    assert call["requester"] == "ou_test_user"
-    assert call["source_group_id"] == G1Q3_GROUP_ID
-    assert call["message_id"] == "om_test_message"
-    assert call["work_item_id"] == ""
-    from gateway.session_context import get_session_env
-    assert get_session_env("HERMES_SESSION_PLATFORM") == ""
-    assert get_session_env("HERMES_SESSION_CHAT_ID") == ""
-    assert get_session_env("HERMES_SESSION_THREAD_ID") == ""
-    assert get_session_env("HERMES_SESSION_MESSAGE_ID") == ""
-
-    records = [json.loads(line) for path in tmp_path.glob("*.jsonl") for line in path.read_text().splitlines()]
-    assert records[-2]["decision"] == "accepted"
-    assert records[-2]["decision_snapshot"]["handoff_contract"]["case_id"] == "042"
-    assert records[-1]["event_type"] == "handoff_submission"
-    assert records[-1]["handoff_success"] is True
-    assert records[-1]["task_id"] == "pnc_status_001"
+    assert "路由策略暂时不可用" in response
+    assert "不会进入通用 Agent 或创建 VM 任务" in response
 
 
 @pytest.mark.asyncio
-async def test_g1q3_issue_card_uses_metadata_link_for_handoff(monkeypatch, tmp_path):
-    runner = make_runner(receipt_dir=tmp_path)
+async def test_metadata_only_issue_card_policy_failure_is_fail_closed(
+    monkeypatch,
+):
+    from gateway import pnc_group_binding
+
+    runner = make_runner()
     event = make_feishu_event(
-        "@胡子豪的小助手 分析这个问题 [【08】问题管理] LCC-临停区方向盘调节明显",
-        chat_id="oc_16614f4ba25b8c88b69c0b8e9ebc2fb5",
+        "@胡子豪的小助手 分析这个问题 [【08】问题管理] ACC case",
+        chat_id=gateway_run.PNC_ALL_BUSINESS_TEST_GROUP_ID,
     )
     event.metadata["feishu"] = {
-        "link_urls": ["https://project.feishu.cn/t03o4q/issue/detail/7003183096?openScene=4"],
+        "link_urls": [
+            "https://project.feishu.cn/t03o4q/issue/detail/7003183096?openScene=4"
+        ]
     }
-    calls = []
-
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run.GatewayRunner, "_is_user_authorized", lambda self, source: True)
     monkeypatch.setattr(
-        gateway_run,
-        "_submit_g1q3_rca_status_handoff",
-        lambda **kwargs: calls.append(kwargs) or {
-            "success": True,
-            "task": {"task_id": "20260623-112927-g1q3-rca-issue-intake-7003183096"},
-            "notify_process": {"started": True},
-        },
+        gateway_run.GatewayRunner,
+        "_is_user_authorized",
+        lambda self, source: True,
+    )
+    monkeypatch.setattr(
+        pnc_group_binding,
+        "evaluate_pnc_group_request",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("policy unavailable")),
     )
 
     response = await gateway_run.GatewayRunner._handle_message(runner, event)
 
-    assert response == ""
-    assert calls[0]["template_id"] == "rca_issue_intake"
-    assert calls[0]["work_item_id"] == "7003183096"
-    assert "issue/detail/7003183096" in calls[0]["request_text"]
+    assert "路由策略暂时不可用" in response
+    assert "不会进入通用 Agent 或创建 VM 任务" in response
+
+
+def test_shared_group_policy_failure_guard_does_not_claim_unrelated_business():
+    assert gateway_run._looks_like_g1q3_rca_request_for_business_routing(
+        "https://project.feishu.cn/t03o4q/issue/detail/7003183096"
+    ) is True
+    assert gateway_run._looks_like_g1q3_rca_request_for_business_routing(
+        "请跑一下 mcap 转换并给我结果"
+    ) is False
 
 
 @pytest.mark.asyncio
-async def test_g1q3_governance_dispatch_receipt_has_task_id_and_probe(monkeypatch, tmp_path):
+async def test_g1q3_case_status_is_read_only_and_never_submits(monkeypatch, tmp_path):
     runner = make_runner(receipt_dir=tmp_path)
-    event = make_feishu_event("分析这个问题 https://project.feishu.cn/t03o4q/issue/detail/7003183096")
-
+    event = make_feishu_event("帮我看一下 case G1Q3-042 现在归因做到哪一步了")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run.GatewayRunner, "_is_user_authorized", lambda self, source: True)
     monkeypatch.setattr(
         gateway_run,
         "_submit_g1q3_rca_status_handoff",
-        lambda **kwargs: {
-            "success": True,
-            "dispatched": "governance_datapipe",
-            "task": {"task_id": "20260623-112927-g1q3-rca-issue-intake-7003183096"},
-            "notify_process": {"started": True, "session_id": "proc_probe"},
-        },
+        lambda **_kwargs: pytest.fail("status lookup must never submit"),
     )
 
     response = await gateway_run.GatewayRunner._handle_message(runner, event)
 
-    assert response == ""
+    assert "不能安全映射到唯一 Kafka 问题单" in response
+    assert "不会为状态查询新建任务" in response
+
     records = [json.loads(line) for path in tmp_path.glob("*.jsonl") for line in path.read_text().splitlines()]
-    assert records[-1]["event_type"] == "handoff_submission"
-    assert records[-1]["task_id"] == "20260623-112927-g1q3-rca-issue-intake-7003183096"
-    assert records[-1]["completion_probe_started"] is True
+    assert records[-1]["decision"] == "accepted"
+    assert records[-1]["decision_snapshot"]["handoff_contract"]["case_id"] == "042"
+    assert records[-1]["decision_snapshot"]["handoff_contract"]["read_only"] is True
+    assert all(record.get("event_type") != "handoff_submission" for record in records)
 
 
 @pytest.mark.asyncio
-async def test_g1q3_status_handoff_persists_task_observability(monkeypatch, tmp_path):
+async def test_g1q3_status_lookup_does_not_create_task_observability(monkeypatch, tmp_path):
     runner = make_runner(receipt_dir=tmp_path)
     event = make_feishu_event("帮我看一下 case G1Q3-042 现在归因做到哪一步了")
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run.GatewayRunner, "_is_user_authorized", lambda self, source: True)
-    monkeypatch.setattr(
-        gateway_run,
-        "_submit_g1q3_rca_status_handoff",
-        lambda **kwargs: {"success": True, "task": {"task_id": "pnc_status_001"}},
-    )
+    monkeypatch.setattr(gateway_run, "_submit_g1q3_rca_status_handoff", lambda **_kwargs: pytest.fail("must not submit"))
 
     response = await gateway_run.GatewayRunner._handle_message(runner, event)
 
-    assert response == ""
+    assert "不会为状态查询新建任务" in response
     task = TaskStore(tmp_path / "analytics" / "tasks.db").get("pnc_status_001")
-    assert task is not None
-    assert task.platform == "feishu"
-    assert task.chat_id == G1Q3_GROUP_ID
-    assert task.chat_type == "group"
-    assert task.thread_id == "topic:om_request_topic"
-    assert task.message_id == "om_test_message"
-    assert task.agent_route == "g1q3-rca"
-    assert task.vm_task_id == "pnc_status_001"
-    assert "G1Q3-042" in (task.request_summary or "")
+    assert task is None
 
 
 def test_gateway_thread_metadata_for_feishu_carries_reply_anchor():
@@ -194,52 +217,7 @@ def test_gateway_thread_metadata_for_feishu_carries_reply_anchor():
 
 
 @pytest.mark.asyncio
-async def test_g1q3_issue_url_intake_submits_work_item_handoff(monkeypatch, tmp_path):
-    runner = make_runner(receipt_dir=tmp_path)
-    event = make_feishu_event("@胡子豪的小助手 分析这个问题 https://project.feishu.cn/t03o4q/issue/detail/7008267126")
-    calls = []
-
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run.GatewayRunner, "_is_user_authorized", lambda self, source: True)
-
-    def fake_submit(**kwargs):
-        from gateway.session_context import get_session_env
-        assert get_session_env("HERMES_SESSION_PLATFORM") == "feishu"
-        assert get_session_env("HERMES_SESSION_CHAT_ID") == G1Q3_GROUP_ID
-        assert get_session_env("HERMES_SESSION_THREAD_ID") == "topic:om_request_topic"
-        assert get_session_env("HERMES_SESSION_MESSAGE_ID") == "om_test_message"
-        calls.append(kwargs)
-        return {"success": True, "task": {"task_id": "pnc_intake_001"}}
-
-    monkeypatch.setattr(gateway_run, "_submit_g1q3_rca_status_handoff", fake_submit)
-
-    response = await gateway_run.GatewayRunner._handle_message(runner, event)
-
-    assert response == ""
-    assert len(calls) == 1
-    call = calls[0]
-    assert call["template_id"] == "rca_issue_intake"
-    assert call["case_id"] == ""
-    assert call["work_item_id"] == "7008267126"
-    assert call["message_id"] == "om_test_message"
-    assert "7008267126" in call["request_text"]
-    from gateway.session_context import get_session_env
-    assert get_session_env("HERMES_SESSION_PLATFORM") == ""
-    assert get_session_env("HERMES_SESSION_CHAT_ID") == ""
-    assert get_session_env("HERMES_SESSION_THREAD_ID") == ""
-    assert get_session_env("HERMES_SESSION_MESSAGE_ID") == ""
-    records = [json.loads(line) for path in tmp_path.glob("*.jsonl") for line in path.read_text().splitlines()]
-    assert records[-1]["event_type"] == "handoff_submission"
-    assert records[-1]["handoff_success"] is True
-    assert records[-1]["task_id"] == "pnc_intake_001"
-    assert records[-1]["template_id"] == "rca_issue_intake"
-    assert records[-1]["contract_version"] == "g1q3_rca_group_handoff_v2"
-    assert records[-1]["case_id"] == ""
-    assert records[-1]["work_item_id"] == "7008267126"
-
-
-@pytest.mark.asyncio
-async def test_status_handoff_submit_uses_scheduler_safe_metadata(monkeypatch):
+async def test_status_handoff_submit_boundary_suppresses_all_side_effects(monkeypatch):
     calls = []
 
     def fake_vm_task_submit(**kwargs):
@@ -256,31 +234,21 @@ async def test_status_handoff_submit_uses_scheduler_safe_metadata(monkeypatch):
         message_id="om_test_message",
     )
 
-    assert result["success"] is True
-    assert len(calls) == 1
-    call = calls[0]
-    assert call["repo_scope"] == "unknown"
-    assert call["workspace_scope"] == "none"
-    assert call["risk_class"] == "normal"
-    assert call["executor_type"] == "governed_tool"
+    assert result["success"] is False
+    assert result["error_code"] == "g1q3_rca_status_query_read_only"
+    assert result["read_only"] is True
+    assert result["side_effects_suppressed"] is True
+    assert calls == []
 
 
-def test_vm_task_submit_carries_feishu_topic_reply_route(monkeypatch):
-    calls = []
-
-    class Proc:
-        returncode = 0
-        stdout = '{"task_id":"g1q3_rca_issue_intake_7008267126"}'
-        stderr = ""
-
-    def fake_run(cmd, text, capture_output, timeout):
-        calls.append(cmd)
-        return Proc()
-
-    monkeypatch.setattr("tools.vm_task_tool.subprocess.run", fake_run)
-    monkeypatch.setattr("tools.vm_task_tool._spawn_completion_probe_background", lambda task_id: {"started": True})
+def test_feishu_topic_context_cannot_bypass_rca_service_boundary(monkeypatch):
+    monkeypatch.setattr(
+        "tools.vm_task_tool.subprocess.run",
+        lambda *_args, **_kwargs: pytest.fail(
+            "reserved RCA public submit must not create a task"
+        ),
+    )
     monkeypatch.setattr("tools.vm_task_tool._check_vm_task_permission", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr("tools.vm_task_tool._create_task_script", lambda: SimpleNamespace(exists=lambda: True, __str__=lambda self: "/tmp/create_task_v2.py"))
 
     from gateway.session_context import clear_session_vars, set_session_vars
     from tools.vm_task_tool import vm_task_submit
@@ -313,95 +281,8 @@ def test_vm_task_submit_carries_feishu_topic_reply_route(monkeypatch):
     finally:
         clear_session_vars(tokens)
 
-    assert result["success"] is True
-    meta = json.loads(calls[0][calls[0].index("--meta") + 1])
-    assert meta["platform"] == "feishu"
-    assert meta["chat_id"] == G1Q3_GROUP_ID
-    assert meta["chat_name"] == "G1Q3-RCA业务群"
-    assert meta["thread_id"] == "topic:om_request_topic"
-    assert meta["message_id"] == "om_test_message"
-    assert meta["session_key"] == "feishu:test"
-
-
-def test_issue_intake_handoff_goal_includes_work_item_id(monkeypatch):
-    calls = []
-
-    def fake_vm_task_submit(**kwargs):
-        calls.append(kwargs)
-        return {"success": True, "task": {"task_id": "pnc_intake_001"}}
-
-    monkeypatch.setattr("tools.vm_task_tool.vm_task_submit", fake_vm_task_submit)
-    monkeypatch.setattr(gateway_run, "_fetch_g1q3_issue_context_result", lambda **kwargs: pnc_issue_context.G1Q3IssueReadResult(status="read_empty", blocker={"kind": "host_issue_preread_empty", "message": "主控侧飞书 issue 读取返回空结果，不能据此判定字段缺失", "retryable": True}))
-
-    result = gateway_run._submit_g1q3_rca_status_handoff(
-        template_id="rca_issue_intake",
-        case_id="",
-        work_item_id="7008267126",
-        requester="ou_test_user",
-        source_group_id=G1Q3_GROUP_ID,
-        message_id="om_test_message",
-        request_text="@胡子豪的小助手 分析这个问题 https://project.feishu.cn/t03o4q/issue/detail/7008267126",
-    )
-
-    assert result["success"] is True
-    assert len(calls) == 1
-    call = calls[0]
-    assert "work_item_id: 7008267126" in call["goal"]
-    assert "待从飞书问题字段解析" in call["goal"]
-    assert "issue_preread_blocked" in call["goal"]
-    assert "schema_version: g1q3_rca_execution_request_v1" in call["goal"]
-    assert "execution_request_path: /mnt/tmp/g1q3_rca_issue_intake_7008267126_8be9b8/rca_execution_request.json" in call["goal"]
-    assert "VM command suggestion: python3 /home/mini/data3/yj-evaluation-server/api/g1q3_rca/scripts/run_rca_execution_request.py" in call["goal"]
-    assert "RcaExecutionRequest JSON" in call["goal"]
-    assert result["execution_request"]["schema_version"] == "g1q3_rca_execution_request_v1"
-    assert result["execution_request"]["work_item"]["work_item_id"] == "7008267126"
-    assert result["execution_request"]["work_item"]["project_key"] == "t03o4q"
-    assert result["execution_request"]["evidence"]["source_quality"] == "unavailable"
-    assert result["execution_request"]["evidence"]["blockers"][0]["kind"] == "host_issue_preread_empty"
-    assert "原始请求摘录" in call["goal"]
-    assert "issue/detail/7008267126" in call["goal"]
-    assert call["artifact_root"] == "/mnt/tmp/g1q3_rca_issue_intake_7008267126_8be9b8/"
-    assert call["title"] == "G1Q3 RCA issue intake: 7008267126"
-
-
-def test_issue_intake_handoff_goal_injects_gateway_issue_context(monkeypatch):
-    calls = []
-    fetch_calls = []
-
-    def fake_vm_task_submit(**kwargs):
-        calls.append(kwargs)
-        return {"success": True, "task": {"task_id": "pnc_intake_001"}}
-
-    def fake_fetch(**kwargs):
-        fetch_calls.append(kwargs)
-        return "- title: G1Q3_6351 ACC 旁车道其他车辆连续切入自车道ACC制动感强\n- frame_id: 318153\n- 根因分析字段: 目标误识别为CBLA法规目标"
-
-    monkeypatch.setattr("tools.vm_task_tool.vm_task_submit", fake_vm_task_submit)
-    monkeypatch.setattr(gateway_run, "_fetch_g1q3_issue_context_result", lambda **kwargs: pnc_issue_context.G1Q3IssueReadResult(context_text=fake_fetch(**kwargs), status="fields_extracted"))
-
-    result = gateway_run._submit_g1q3_rca_status_handoff(
-        template_id="rca_issue_intake",
-        case_id="",
-        work_item_id="7008267126",
-        requester="ou_test_user",
-        source_group_id=G1Q3_GROUP_ID,
-        message_id="om_test_message",
-        request_text="@胡子豪的小助手 分析这个问题 https://project.feishu.cn/t03o4q/issue/detail/7008267126",
-    )
-
-    assert result["success"] is True
-    assert fetch_calls == [{"project_key": "t03o4q", "work_item_id": "7008267126"}]
-    goal = calls[0]["goal"]
-    assert "Feishu issue context（主控侧预读取）" in goal
-    assert "title: G1Q3_6351 ACC" in goal
-    assert "frame_id: 318153" in goal
-    assert "根因分析字段: 目标误识别为CBLA法规目标" in goal
-    assert result["execution_request"]["work_item"]["project_key"] == "t03o4q"
-    assert result["execution_request"]["work_item"]["title"].startswith("G1Q3_6351 ACC")
-    assert result["execution_request"]["case"]["frame_id"] == "318153"
-    assert result["execution_request"]["evidence"]["root_cause_text"] == "目标误识别为CBLA法规目标"
-    assert result["execution_request"]["evidence"]["source_quality"] == "partial"
-    assert "execution_request_path: /mnt/tmp/g1q3_rca_issue_intake_7008267126_8be9b8/rca_execution_request.json" in goal
+    assert result["success"] is False
+    assert result["error_code"] == "g1q3_rca_service_boundary_required"
 
 
 def test_fetch_issue_context_calls_registered_mcp_tools(monkeypatch):
@@ -445,46 +326,8 @@ def test_fetch_issue_context_calls_registered_mcp_tools(monkeypatch):
     assert "已回放，优化后通过" in context
 
 
-def test_issue_intake_handoff_writes_rca_state_receipts(monkeypatch, tmp_path):
-    calls = []
-
-    def fake_vm_task_submit(**kwargs):
-        calls.append(kwargs)
-        return {"success": True, "task": {"task_id": "pnc_intake_001"}}
-
-    monkeypatch.setattr("tools.vm_task_tool.vm_task_submit", fake_vm_task_submit)
-    monkeypatch.setattr(gateway_run, "_fetch_g1q3_issue_context_result", lambda **kwargs: pnc_issue_context.G1Q3IssueReadResult(context_text="- title: G1Q3_6351 ACC\n- frame_id: 318153\n- 数据地址: mdi download event -u demo -s ./", status="fields_extracted"))
-
-    result = gateway_run._submit_g1q3_rca_status_handoff(
-        template_id="rca_issue_intake",
-        case_id="",
-        work_item_id="7008267126",
-        requester="ou_test_user",
-        source_group_id=G1Q3_GROUP_ID,
-        message_id="om_test_message",
-        request_text="@胡子豪的小助手 分析这个问题",
-        receipt_dir=tmp_path,
-    )
-
-    assert result["success"] is True
-    records = [
-        json.loads(line)
-        for path in tmp_path.glob("*rca-intake.jsonl")
-        for line in path.read_text(encoding="utf-8").splitlines()
-    ]
-    assert [record["stage"] for record in records] == [
-        "admitted",
-        "issue_enrichment_started",
-        "issue_fields_extracted",
-        "vm_submitted",
-    ]
-    assert records[-1]["vm_task_id"] == "pnc_intake_001"
-    assert records[-1]["issue_context"]["work_item_id"] == "7008267126"
-    assert records[2]["execution_request_path"] == "/mnt/tmp/g1q3_rca_issue_intake_7008267126_8be9b8/rca_execution_request.json"
-
-
 @pytest.mark.asyncio
-async def test_g1q3_evidence_followup_submits_handoff_but_report_remains_dry_run(monkeypatch):
+async def test_g1q3_evidence_followup_is_read_only_and_report_remains_dry_run(monkeypatch):
     runner = make_runner()
     submitted = []
 
@@ -505,12 +348,11 @@ async def test_g1q3_evidence_followup_submits_handoff_but_report_remains_dry_run
         make_feishu_event("给 G1Q3-088 生成一版 RCA 摘要报告"),
     )
 
-    assert evidence_response == ""
-    assert submitted[0]["template_id"] == "rca_case_evidence_summary"
-    assert submitted[0]["case_id"] == "105"
+    assert "不能安全映射到唯一 Kafka 问题单" in evidence_response
+    assert "不会为状态查询新建任务" in evidence_response
     assert "G1Q3 RCA dry-run" in report_response
     assert "template: rca_report_generate" in report_response
-    assert len(submitted) == 1
+    assert submitted == []
 
 
 @pytest.mark.asyncio
@@ -527,11 +369,12 @@ async def test_g1q3_evidence_followup_ack_uses_missing_evidence_copy(monkeypatch
 
     response = await gateway_run.GatewayRunner._handle_message(runner, event)
 
-    assert response == ""
+    assert "尚未查询到对应 RCA 任务" in response
+    assert "不会手工创建、重跑任务或进入通用 Agent" in response
 
 
 @pytest.mark.asyncio
-async def test_g1q3_status_handoff_submission_failure_is_reported(monkeypatch):
+async def test_g1q3_status_lookup_never_reaches_submission_failure_path(monkeypatch):
     runner = make_runner()
     event = make_feishu_event("帮我看一下 case G1Q3-042 现在归因做到哪一步了")
 
@@ -539,184 +382,39 @@ async def test_g1q3_status_handoff_submission_failure_is_reported(monkeypatch):
     monkeypatch.setattr(
         gateway_run,
         "_submit_g1q3_rca_status_handoff",
-        lambda **kwargs: {"success": False, "error": "permission denied"},
+        lambda **_kwargs: pytest.fail("read-only lookup must not submit"),
     )
 
     response = await gateway_run.GatewayRunner._handle_message(runner, event)
 
-    assert response is not None
-    assert "G1Q3 RCA 状态查询暂时没有接单成功" in response
-    assert "permission denied" in response
-
-
-def test_issue_intake_handoff_blocks_field_validation_after_successful_preread(monkeypatch):
-    calls = []
-
-    def fake_vm_task_submit(**kwargs):
-        calls.append(kwargs)
-        return {"success": True, "task": {"task_id": "pnc_intake_001"}}
-
-    monkeypatch.setattr("tools.vm_task_tool.vm_task_submit", fake_vm_task_submit)
-    monkeypatch.setattr(
-        gateway_run,
-        "_fetch_g1q3_issue_context_result",
-        lambda **kwargs: pnc_issue_context.G1Q3IssueReadResult(
-            context_text="- title: G1Q3_0938 AWB\n- frame_id: 938",
-            status="fields_extracted",
-        ),
-    )
-
-    result = gateway_run._submit_g1q3_rca_status_handoff(
-        template_id="rca_issue_intake",
-        case_id="",
-        work_item_id="7015689036",
-        requester="ou_test_user",
-        source_group_id=G1Q3_GROUP_ID,
-        message_id="om_test_message",
-        request_text="@胡子豪的小助手 分析这个问题 https://project.feishu.cn/t03o4q/issue/detail/7015689036",
-    )
-
-    assert result["success"] is True
-    payload = result["execution_request"]
-    assert payload["evidence"]["source_quality"] == "partial"
-    assert payload["data"]["pdcl_download_cmd"] == ""
-    assert payload["data"]["is_pdcl_format"] is False
-    assert payload["evidence"]["blockers"][0]["kind"] == "issue_field_missing_pdcl_download_cmd"
+    assert "不能安全映射到唯一 Kafka 问题单" in response
+    assert "不会为状态查询新建任务" in response
 
 
 @pytest.mark.asyncio
-async def test_g1q3_intake_ack_surfaces_meegle_unauthenticated_notice(monkeypatch, tmp_path):
-    runner = make_runner(receipt_dir=tmp_path)
-    event = make_feishu_event("@胡子豪的小助手 分析这个问题 https://project.feishu.cn/t03o4q/issue/detail/7008267126")
-
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run.GatewayRunner, "_is_user_authorized", lambda self, source: True)
-    monkeypatch.setattr(
-        gateway_run,
-        "_submit_g1q3_rca_status_handoff",
-        lambda **kwargs: {
-            "success": True,
-            "task": {"task_id": "pnc_intake_002"},
-            "issue_preread": {
-                "status": "read_failed",
-                "source_quality": "unavailable",
-                "blocker": {
-                    "kind": "host_meegle_preread_unauthenticated",
-                    "message": "Meegle 未登录或授权已过期",
-                    "retryable": True,
-                },
-            },
-        },
-    )
-
-    response = await gateway_run.GatewayRunner._handle_message(runner, event)
-
-    assert response == ""
-
-
-@pytest.mark.asyncio
-async def test_g1q3_intake_ack_surfaces_field_missing_pdcl_notice(monkeypatch, tmp_path):
-    runner = make_runner(receipt_dir=tmp_path)
-    event = make_feishu_event("@胡子豪的小助手 分析这个问题 https://project.feishu.cn/t03o4q/issue/detail/7008267126")
-
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run.GatewayRunner, "_is_user_authorized", lambda self, source: True)
-    monkeypatch.setattr(
-        gateway_run,
-        "_submit_g1q3_rca_status_handoff",
-        lambda **kwargs: {
-            "success": True,
-            "task": {"task_id": "pnc_intake_003"},
-            "issue_preread": {
-                "status": "fields_extracted",
-                "source_quality": "partial",
-                "blocker": {
-                    "kind": "issue_field_missing_pdcl_download_cmd",
-                    "message": "问题数据地址_PDCL 缺失",
-                    "retryable": True,
-                },
-            },
-        },
-    )
-
-    response = await gateway_run.GatewayRunner._handle_message(runner, event)
-
-    assert response == ""
-
-
-@pytest.mark.asyncio
-async def test_g1q3_intake_ack_has_no_notice_when_preread_clean(monkeypatch, tmp_path):
-    runner = make_runner(receipt_dir=tmp_path)
-    event = make_feishu_event("@胡子豪的小助手 分析这个问题 https://project.feishu.cn/t03o4q/issue/detail/7008267126")
-
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run.GatewayRunner, "_is_user_authorized", lambda self, source: True)
-    monkeypatch.setattr(
-        gateway_run,
-        "_submit_g1q3_rca_status_handoff",
-        lambda **kwargs: {
-            "success": True,
-            "task": {"task_id": "pnc_intake_004"},
-            "issue_preread": {"status": "fields_extracted", "source_quality": "partial", "blocker": None},
-        },
-    )
-
-    response = await gateway_run.GatewayRunner._handle_message(runner, event)
-
-    assert response == ""
-
-
-def test_issue_intake_submit_result_carries_issue_preread_blocker(monkeypatch):
-    monkeypatch.setattr(
-        "tools.vm_task_tool.vm_task_submit",
-        lambda **kwargs: {"success": True, "task": {"task_id": "pnc_intake_005"}},
-    )
-    monkeypatch.setattr(
-        gateway_run,
-        "_fetch_g1q3_issue_context_result",
-        lambda **kwargs: pnc_issue_context.G1Q3IssueReadResult(
-            status="read_failed",
-            blocker={
-                "kind": "host_meegle_preread_unauthenticated",
-                "message": "Meegle 未登录或授权已过期",
-                "retryable": True,
-            },
-        ),
-    )
-
-    result = gateway_run._submit_g1q3_rca_status_handoff(
-        template_id="rca_issue_intake",
-        case_id="",
-        work_item_id="7008267126",
-        requester="ou_test_user",
-        source_group_id=G1Q3_GROUP_ID,
-        message_id="om_test_message",
-        request_text="@胡子豪的小助手 分析这个问题 https://project.feishu.cn/t03o4q/issue/detail/7008267126",
-    )
-
-    assert result["success"] is True
-    preread = result["issue_preread"]
-    assert preread["status"] == "read_failed"
-    assert preread["source_quality"] == "unavailable"
-    assert preread["blocker"]["kind"] == "host_meegle_preread_unauthenticated"
-
-
-@pytest.mark.asyncio
-async def test_g1q3_slow_handoff_does_not_block_event_loop(monkeypatch, tmp_path):
+async def test_g1q3_slow_control_store_lookup_does_not_block_event_loop(monkeypatch, tmp_path):
     import asyncio
     import time
 
     runner = make_runner(receipt_dir=tmp_path)
-    event = make_feishu_event("帮我看一下 case G1Q3-042 现在归因做到哪一步了")
+    event = make_feishu_event("飞书问题 7013527412 状态怎么样")
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run.GatewayRunner, "_is_user_authorized", lambda self, source: True)
 
-    def slow_submit(**kwargs):
+    def slow_lookup(_project_key, _work_item_type_key, _work_item_id):
         time.sleep(0.4)
-        return {"success": True, "task": {"task_id": "pnc_slow_001"}}
+        return None
 
-    monkeypatch.setattr(gateway_run, "_submit_g1q3_rca_status_handoff", slow_submit)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_g1q3_issue_identity",
+        lambda _handoff: ("project-key", "problem-type", "7013527412"),
+    )
+    monkeypatch.setattr(
+        gateway_run, "_find_g1q3_rca_task_by_issue_identity", slow_lookup
+    )
+    monkeypatch.setattr(gateway_run, "_submit_g1q3_rca_status_handoff", lambda **_kwargs: pytest.fail("must not submit"))
 
     handle_task = asyncio.ensure_future(gateway_run.GatewayRunner._handle_message(runner, event))
     await asyncio.sleep(0)
@@ -726,7 +424,7 @@ async def test_g1q3_slow_handoff_does_not_block_event_loop(monkeypatch, tmp_path
 
     response = await handle_task
 
-    assert response == ""
+    assert "尚未查询到对应 RCA 任务" in response
     # If the submit ran synchronously on the loop, this sleep could not
     # resume until the 0.4s handoff finished.
     assert loop_latency < 0.3, f"event loop blocked for {loop_latency:.2f}s during handoff"
@@ -785,245 +483,7 @@ async def test_meegle_auth_alert_mentions_auto_degrade_success():
 
 
 @pytest.mark.asyncio
-async def test_g1q3_duplicate_issue_trigger_within_window_is_deduped(monkeypatch, tmp_path):
-    runner = make_runner(receipt_dir=tmp_path)
-    submit_calls = []
-
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run.GatewayRunner, "_is_user_authorized", lambda self, source: True)
-
-    def fake_submit(**kwargs):
-        submit_calls.append(kwargs)
-        return {"success": True, "task": {"task_id": "pnc_dedup_001"}}
-
-    monkeypatch.setattr(gateway_run, "_submit_g1q3_rca_status_handoff", fake_submit)
-
-    text = "@胡子豪的小助手 分析这个问题 https://project.feishu.cn/t03o4q/issue/detail/7008267126"
-    first = await gateway_run.GatewayRunner._handle_message(runner, make_feishu_event(text))
-    second = await gateway_run.GatewayRunner._handle_message(runner, make_feishu_event(text))
-
-    assert first == ""
-    assert len(submit_calls) == 1
-    assert not second.startswith("已接单")
-    assert "不再重复建任务" in second
-    assert "pnc_dedup_001" in second
-
-
-@pytest.mark.asyncio
-async def test_g1q3_dedup_releases_reservation_on_submit_failure(monkeypatch, tmp_path):
-    runner = make_runner(receipt_dir=tmp_path)
-    submit_calls = []
-
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run.GatewayRunner, "_is_user_authorized", lambda self, source: True)
-
-    def flaky_submit(**kwargs):
-        submit_calls.append(kwargs)
-        if len(submit_calls) == 1:
-            return {"success": False, "error": "vm bridge down"}
-        return {"success": True, "task": {"task_id": "pnc_retry_002"}}
-
-    monkeypatch.setattr(gateway_run, "_submit_g1q3_rca_status_handoff", flaky_submit)
-
-    text = "@胡子豪的小助手 分析这个问题 https://project.feishu.cn/t03o4q/issue/detail/7008267126"
-    first = await gateway_run.GatewayRunner._handle_message(runner, make_feishu_event(text))
-    second = await gateway_run.GatewayRunner._handle_message(runner, make_feishu_event(text))
-
-    assert "没有接单成功" in first
-    assert second == ""
-    assert len(submit_calls) == 2
-
-
-@pytest.mark.asyncio
-async def test_g1q3_different_issues_are_not_deduped(monkeypatch, tmp_path):
-    runner = make_runner(receipt_dir=tmp_path)
-    submit_calls = []
-
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(gateway_run.GatewayRunner, "_is_user_authorized", lambda self, source: True)
-
-    def fake_submit(**kwargs):
-        submit_calls.append(kwargs)
-        return {"success": True, "task": {"task_id": f"pnc_multi_{len(submit_calls):03d}"}}
-
-    monkeypatch.setattr(gateway_run, "_submit_g1q3_rca_status_handoff", fake_submit)
-
-    first = await gateway_run.GatewayRunner._handle_message(
-        runner, make_feishu_event("@胡子豪的小助手 分析这个问题 https://project.feishu.cn/t03o4q/issue/detail/7008267126"))
-    second = await gateway_run.GatewayRunner._handle_message(
-        runner, make_feishu_event("@胡子豪的小助手 分析这个问题 https://project.feishu.cn/t03o4q/issue/detail/7015689036"))
-
-    assert first == ""
-    assert second == ""
-    assert len(submit_calls) == 2
-
-
-def test_issue_intake_grants_download_within_quota(monkeypatch, tmp_path):
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setenv("HERMES_G1Q3_AUTO_DOWNLOAD_DAILY_QUOTA", "1")
-    submitted_goals = []
-
-    def fake_vm_task_submit(**kwargs):
-        submitted_goals.append(kwargs["goal"])
-        return {"success": True, "task": {"task_id": f"pnc_quota_{len(submitted_goals):03d}"}}
-
-    monkeypatch.setattr("tools.vm_task_tool.vm_task_submit", fake_vm_task_submit)
-    monkeypatch.setattr(
-        gateway_run,
-        "_fetch_g1q3_issue_context_result",
-        lambda **kwargs: pnc_issue_context.G1Q3IssueReadResult(
-            context_text=(
-                "## Feishu issue 已解析字段（主控侧读取）\n"
-                "- title: G1Q3_6351 ACC case\n"
-                "- work_item_id: 7008267126\n"
-                "- frame_id: 318153\n"
-                "- 数据地址: mdi download event -u demo -s ./\n"
-            ),
-            status="fields_extracted",
-            source="meegle",
-        ),
-    )
-
-    def submit(message_id):
-        return gateway_run._submit_g1q3_rca_status_handoff(
-            template_id="rca_issue_intake",
-            case_id="",
-            work_item_id="7008267126",
-            requester="ou_real_owner",
-            source_group_id=G1Q3_GROUP_ID,
-            message_id=message_id,
-            request_text="分析这个问题 https://project.feishu.cn/t03o4q/issue/detail/7008267126",
-        )
-
-    first = submit("om_msg_1")
-    second = submit("om_msg_2")
-
-    assert first["download_grant"]["granted"] is True
-    assert first["execution_request"]["execution_policy"]["allow_download"] is True
-    assert first["execution_request"]["execution_policy"]["mode"] == "materialize_when_allowed"
-    assert "run_rca_auto_pipeline.py" in submitted_goals[0]
-    assert "auto_download: granted" in submitted_goals[0]
-
-    assert second["download_grant"]["granted"] is False
-    assert second["download_grant"]["reason"] == "daily_quota_exhausted"
-    assert second["execution_request"]["execution_policy"]["allow_download"] is False
-    assert second["execution_request"]["execution_policy"]["mode"] == "readonly_status_first"
-    assert "run_rca_execution_request.py" in submitted_goals[1]
-    assert "auto_download: not granted" in submitted_goals[1]
-
-
-
-def test_issue_intake_synthetic_trigger_does_not_spend_download_quota(monkeypatch, tmp_path):
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setenv("HERMES_G1Q3_AUTO_DOWNLOAD_DAILY_QUOTA", "1")
-    monkeypatch.setattr(
-        "tools.vm_task_tool.vm_task_submit",
-        lambda **kwargs: {"success": True, "task": {"task_id": "pnc_synthetic_quota"}},
-    )
-    monkeypatch.setattr(
-        gateway_run,
-        "_fetch_g1q3_issue_context_result",
-        lambda **kwargs: pnc_issue_context.G1Q3IssueReadResult(
-            context_text=(
-                "## Feishu issue 已解析字段（主控侧读取）\n"
-                "- title: G1Q3 synthetic quota guard\n"
-                "- work_item_id: 7008267126\n"
-                "- frame_id: 318153\n"
-                "- 数据地址: mdi download event -u demo -s ./\n"
-            ),
-            status="fields_extracted",
-            source="meegle",
-        ),
-    )
-
-    result = gateway_run._submit_g1q3_rca_status_handoff(
-        template_id="rca_issue_intake",
-        case_id="",
-        work_item_id="7008267126",
-        requester="ou_test_user",
-        source_group_id=G1Q3_GROUP_ID,
-        message_id="om_test_message",
-        request_text="分析这个问题 https://project.feishu.cn/t03o4q/issue/detail/7008267126",
-    )
-
-    assert result["download_grant"]["granted"] is False
-    assert result["download_grant"]["reason"] == "synthetic_trigger_no_quota_spend"
-    assert result["execution_request"]["execution_policy"]["allow_download"] is False
-    assert list((tmp_path / "pnc_agent" / "quota").glob("*.json")) == []
-
-def test_issue_intake_does_not_spend_quota_on_blocked_intake(monkeypatch, tmp_path):
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setenv("HERMES_G1Q3_AUTO_DOWNLOAD_DAILY_QUOTA", "5")
-
-    monkeypatch.setattr(
-        "tools.vm_task_tool.vm_task_submit",
-        lambda **kwargs: {"success": True, "task": {"task_id": "pnc_quota_blocked"}},
-    )
-    monkeypatch.setattr(
-        gateway_run,
-        "_fetch_g1q3_issue_context_result",
-        lambda **kwargs: pnc_issue_context.G1Q3IssueReadResult(
-            status="read_failed",
-            blocker={"kind": "host_meegle_preread_unauthenticated", "message": "expired", "retryable": True},
-        ),
-    )
-
-    result = gateway_run._submit_g1q3_rca_status_handoff(
-        template_id="rca_issue_intake",
-        case_id="",
-        work_item_id="7008267126",
-        requester="ou_test_user",
-        source_group_id=G1Q3_GROUP_ID,
-        message_id="om_msg_blocked",
-        request_text="分析这个问题 https://project.feishu.cn/t03o4q/issue/detail/7008267126",
-    )
-
-    assert result["download_grant"]["granted"] is False
-    assert result["download_grant"]["reason"] == "not_eligible"
-    assert result["execution_request"]["execution_policy"]["allow_download"] is False
-    assert list((tmp_path / "pnc_agent" / "quota").glob("*.json")) == []
-
-
-def test_issue_intake_field_blocker_triggers_field_gap_plan(monkeypatch, tmp_path):
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.delenv("HERMES_G1Q3_FIELD_GAP_COMMENT", raising=False)
-    monkeypatch.setattr(
-        "tools.vm_task_tool.vm_task_submit",
-        lambda **kwargs: {"success": True, "task": {"task_id": "pnc_gap_001"}},
-    )
-    monkeypatch.setattr(
-        gateway_run,
-        "_fetch_g1q3_issue_context_result",
-        lambda **kwargs: pnc_issue_context.G1Q3IssueReadResult(
-            context_text=(
-                "## Feishu issue 已解析字段（主控侧读取）\n"
-                "- title: ACC-旁车道切入自车道，ACC未减速\n"
-                "- work_item_id: 7015828844\n"
-                "- 当前负责人: 邵祖钦\n"
-            ),
-            status="fields_extracted",
-            source="meegle",
-        ),
-    )
-
-    result = gateway_run._submit_g1q3_rca_status_handoff(
-        template_id="rca_issue_intake",
-        case_id="",
-        work_item_id="7015828844",
-        requester="ou_test_user",
-        source_group_id=G1Q3_GROUP_ID,
-        message_id="om_gap_msg",
-        request_text="分析这个问题 https://project.feishu.cn/t03o4q/issue/detail/7015828844",
-    )
-
-    gap = result["field_gap_comment"]
-    assert gap["action"] == "planned"
-    assert gap["blocker_kind"] == "issue_field_missing_pdcl_download_cmd"
-    assert "问题数据地址_PDCL" in gap["comment_content"]
-
-
-@pytest.mark.asyncio
-async def test_g1q3_status_handoff_writes_initial_task_card_sidecar(monkeypatch, tmp_path):
+async def test_g1q3_status_lookup_does_not_write_task_card_sidecar(monkeypatch, tmp_path):
     token = set_hermes_home_override(tmp_path)
     try:
         runner = make_runner(receipt_dir=tmp_path)
@@ -1034,52 +494,12 @@ async def test_g1q3_status_handoff_writes_initial_task_card_sidecar(monkeypatch,
         monkeypatch.setattr(
             gateway_run,
             "_submit_g1q3_rca_status_handoff",
-            lambda **kwargs: {"success": True, "task": {"task_id": "pnc_status_card_001"}},
+            lambda **_kwargs: pytest.fail("must not submit"),
         )
 
         response = await gateway_run.GatewayRunner._handle_message(runner, event)
-        body = json.loads((tmp_path / "task-state" / "pnc_status_card_001.json").read_text(encoding="utf-8"))
     finally:
         reset_hermes_home_override(token)
 
-    assert response == ""
-    assert body["task_card"]["user_state"] == "host-created"
-    assert body["task_card"]["task_id"] == "pnc_status_card_001"
-    assert body["task_card"].get("one_card_policy") is True
-    assert body["task_card"]["chat_id"] == G1Q3_GROUP_ID
-    assert body["task_card"]["thread_id"] == "topic:om_request_topic"
-    assert body["task_card"]["status_line"]
-    assert "last_sent_hash" not in body["task_card"]
-
-
-def test_issue_intake_auth_blocker_notice_is_not_pdcl_gap_copy(monkeypatch, tmp_path):
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(
-        "tools.vm_task_tool.vm_task_submit",
-        lambda **kwargs: {"success": True, "task": {"task_id": "pnc_auth_blocked"}},
-    )
-    monkeypatch.setattr(
-        gateway_run,
-        "_fetch_g1q3_issue_context_result",
-        lambda **kwargs: pnc_issue_context.G1Q3IssueReadResult(
-            status="read_failed",
-            blocker={"kind": "host_meegle_preread_unauthenticated", "message": "Meegle 授权过期", "retryable": True},
-        ),
-    )
-
-    result = gateway_run._submit_g1q3_rca_status_handoff(
-        template_id="rca_issue_intake",
-        case_id="",
-        work_item_id="7008267126",
-        requester="ou_test_user",
-        source_group_id=G1Q3_GROUP_ID,
-        message_id="om_auth_blocked",
-        request_text="分析这个问题 https://project.feishu.cn/t03o4q/issue/detail/7008267126",
-    )
-
-    blocker = result["issue_preread"]["blocker"]
-    assert "授权过期" in blocker["message"]
-    rendered = "Meegle 授权过期，主控暂时读不到飞书 issue 字段，正在续期/已通知管理员；请稍候再让我重试。本提示不要求你补数据地址。"
-    assert "授权过期" in rendered
-    assert "补 问题数据地址_PDCL" not in rendered
-    assert result["field_gap_comment"] if "field_gap_comment" in result else True
+    assert "不会为状态查询新建任务" in response
+    assert not (tmp_path / "task-state" / "pnc_status_card_001.json").exists()

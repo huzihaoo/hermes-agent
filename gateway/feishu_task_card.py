@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -71,7 +72,7 @@ STATUS_DISPLAY = {
     "need_review": "待人工复核",
     "html_delivery_ready": "HTML 报告已生成",
     "report_ready": "报告已生成",
-    "need_download": "待自动下载/解析",
+    "need_download": "待补充数据/证据",
     "out_of_scope": "不予受理/转人工",
     "not_admissible": "不予受理/转人工",
     "not_applicable": "不适用",
@@ -117,7 +118,7 @@ def _display_label(value: Any) -> str:
         "report_ready": "报告已生成",
         "html_delivery_ready": "HTML 报告已生成",
         "hypothesis_ready": "已有候选归因，待人工确认",
-        "ready_to_download": "数据准入通过，等待下载/解析",
+        "ready_to_download": "数据准入通过，等待处理",
         "out_of_scope": "不予受理/转人工",
         "not_admissible": "不予受理/转人工",
     }
@@ -152,6 +153,16 @@ def _safe_card_text(value: Any, default: str = "") -> str:
     lowered = text.lower()
     if any(fragment in lowered for fragment in HTML_SOURCE_FRAGMENTS):
         return "[已隐藏疑似 HTML/CSS 源码；请通过报告链接打开]"
+    if re.search(r"\bmdi\s+(?:download|refresh2?|clip|event)\b", text, re.I):
+        return "历史数据地址已转换为远程读取引用（不执行 MDI 下载）"
+    return text
+
+
+def _safe_input_text(value: Any) -> str:
+    """Never render a historical MDI command as an executable instruction."""
+    text = _safe_card_text(value)
+    if text == "历史数据地址已转换为远程读取引用（不执行 MDI 下载）":
+        return "远程读取引用（不执行 MDI 下载）"
     return text
 
 
@@ -333,8 +344,8 @@ def render_task_card(task_card: dict[str, Any]) -> dict[str, Any]:
     )
     artifact_label = "打开 foxglove 可视化" if artifact_path == foxglove_url and foxglove_url else _display_artifact_label(delivery.get("artifact_label"), artifact_path)
     artifact_root = _safe_card_text(delivery.get("artifact_root"))
-    input_original = _safe_card_text(delivery.get("input_original") or delivery.get("input"))
-    input_resolved = _safe_card_text(delivery.get("input_resolved"))
+    input_original = _safe_input_text(delivery.get("input_original") or delivery.get("input"))
+    input_resolved = _safe_input_text(delivery.get("input_resolved"))
     artifact_vm = _safe_card_text(delivery.get("artifact_vm"))
     artifact_cifs = _safe_card_text(delivery.get("artifact_cifs"))
     cifs_status = _safe_card_text(delivery.get("cifs_status"))

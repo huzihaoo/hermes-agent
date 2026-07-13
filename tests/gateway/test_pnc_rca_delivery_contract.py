@@ -1,0 +1,661 @@
+from __future__ import annotations
+
+import hashlib
+
+import pytest
+
+from gateway.pnc_rca_admission import build_rca_admission
+from gateway.pnc_rca_delivery_contract import (
+    DELIVERY_THREAD_EFFECT_KIND,
+    DeliveryContractError,
+    MAX_DELIVERY_ARTIFACT_BYTES,
+    MAX_DELIVERY_ARTIFACTS,
+    build_report_artifact_url,
+    build_report_url,
+    build_thread_reply_effect,
+    compute_artifact_set_id,
+    MAX_FEISHU_COMMENT_BYTES,
+    verify_delivery_bundle,
+)
+
+
+FORMAL_SUBMISSION_KEY = "g1q3-rca-s1-" + "a" * 64
+FORMAL_ARTIFACT_SET_ID = "g1q3-rca-artifact-v1-" + "b" * 64
+FORMAL_REPORT_PATH = (
+    f"/G1Q3_RCA/cases/{FORMAL_SUBMISSION_KEY}/"
+    f"{FORMAL_ARTIFACT_SET_ID}/index.html"
+)
+
+
+def _admission(*, offset: int = 10):
+    return build_rca_admission(
+        project_key="t03o4q",
+        project_simple_name="g1q3",
+        work_item_type_key="issue",
+        work_item_id="7041712812",
+        rule_version="issue-created-v1",
+        topic="feishu-project-workflow-event",
+        partition=2,
+        offset=offset,
+    )
+
+
+def _sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _bundle(
+    *,
+    admission=None,
+    explicit_kind: str | None = "html",
+    include_web_assets: bool = False,
+):
+    admission = admission or _admission()
+    root = f"/mnt/tmp/{admission.submission_key}/"
+    index_html = (
+        b'<!doctype html><title>RCA</title>'
+        b'<video src="assets/media/video.mp4"></video>'
+    )
+    if include_web_assets:
+        index_html = (
+            b'<!doctype html><title>RCA</title>'
+            b'<link rel="stylesheet" href="assets/app.css">'
+            b'<script src="assets/app.js"></script>'
+            b'<video src="assets/media/video.mp4"></video>'
+        )
+    contents = {
+        "index.html": index_html,
+        "report_data.json": b'{"schema_version":"g1q3_rca_report_v2"}',
+        "assets/media/video.mp4": b"fake-video-bytes",
+    }
+    if include_web_assets:
+        contents.update(
+            {
+                "assets/app.css": b"body{color:#111}",
+                "assets/app.js": b"globalThis.RCA_READY=true;",
+            }
+        )
+    manifest = {
+        "schema_version": "delivery_manifest_v1",
+        "sealed": True,
+        "submission_key": admission.submission_key,
+        "business_key": admission.business_key,
+        "generation": admission.generation,
+        "project_key": admission.source_refs.project_key,
+        "work_item_type_key": admission.source_refs.work_item_type_key,
+        "work_item_id": admission.source_refs.work_item_id,
+        "artifact_revision": 1,
+        "sealed_at": "2026-07-10T08:00:00+00:00",
+        "deliverable_kind": "html",
+        "dependencies_complete": True,
+        "artifact_root": root,
+        "html_validation": {
+            "state": "html_delivery_ready",
+            "report_data_sha256": _sha(contents["report_data.json"]),
+            "blockers": [],
+            "fidelity_ok": True,
+        },
+        "artifacts": [
+            {
+                "role": "index_html",
+                "path": "index.html",
+                "size": len(contents["index.html"]),
+                "sha256": _sha(contents["index.html"]),
+                "media_type": "text/html; charset=utf-8",
+                "required": True,
+            },
+            {
+                "role": "report_data",
+                "path": "report_data.json",
+                "size": len(contents["report_data.json"]),
+                "sha256": _sha(contents["report_data.json"]),
+                "media_type": "application/json",
+                "required": True,
+            },
+            {
+                "role": "video",
+                "path": "assets/media/video.mp4",
+                "size": len(contents["assets/media/video.mp4"]),
+                "sha256": _sha(contents["assets/media/video.mp4"]),
+                "media_type": "video/mp4",
+                "required": False,
+            },
+        ],
+    }
+    if include_web_assets:
+        manifest["artifacts"].extend(
+            [
+                {
+                    "role": "stylesheet",
+                    "path": "assets/app.css",
+                    "size": len(contents["assets/app.css"]),
+                    "sha256": _sha(contents["assets/app.css"]),
+                    "media_type": "text/css; charset=utf-8",
+                    "required": True,
+                },
+                {
+                    "role": "javascript",
+                    "path": "assets/app.js",
+                    "size": len(contents["assets/app.js"]),
+                    "sha256": _sha(contents["assets/app.js"]),
+                    "media_type": "text/javascript; charset=utf-8",
+                    "required": True,
+                },
+            ]
+        )
+    manifest["artifact_set_id"] = compute_artifact_set_id(manifest)
+    manifest["report_url"] = build_report_url(
+        admission.submission_key, manifest["artifact_set_id"]
+    )
+    report = {
+        "status": "html_delivery_ready",
+        "is_deliverable": True,
+        "requires_human_review": True,
+    }
+    if explicit_kind is not None:
+        report["deliverable_kind"] = explicit_kind
+    contract = {
+        "schema_version": "g1q3_delivery_contract_v1",
+        "task_id": admission.submission_key,
+        "run_id": admission.submission_key,
+        "work_item_id": admission.source_refs.work_item_id,
+        "business_state": "report_completed",
+        "report": report,
+        "summary": {"short_conclusion": "候选因果判断：减速度请求偏重。"},
+        "artifacts": {
+            "delivery_manifest_vm": root + "delivery_manifest.json",
+            "artifact_set_id": manifest["artifact_set_id"],
+            "index_html_vm": root + "index.html",
+            "report_data_vm": root + "report_data.json",
+        },
+    }
+    observed = [
+        {
+            "path": root + path,
+            "size": len(data),
+            "sha256": _sha(data),
+            "is_file": True,
+            "is_symlink": False,
+            "parents_symlink_free": True,
+        }
+        for path, data in contents.items()
+    ]
+    dependencies = [root + "assets/media/video.mp4"]
+    if include_web_assets:
+        dependencies.extend([root + "assets/app.css", root + "assets/app.js"])
+    return admission, contract, manifest, observed, dependencies
+
+
+def _reseal(contract, manifest):
+    manifest["artifact_set_id"] = compute_artifact_set_id(manifest)
+    manifest["report_url"] = build_report_url(
+        manifest["submission_key"], manifest["artifact_set_id"]
+    )
+    contract["artifacts"]["artifact_set_id"] = manifest["artifact_set_id"]
+
+
+def _verify(bundle):
+    admission, contract, manifest, observed, dependencies = bundle
+    return verify_delivery_bundle(
+        admission=admission,
+        delivery_contract=contract,
+        delivery_manifest=manifest,
+        observed_files=observed,
+        html_dependencies=dependencies,
+    )
+
+
+def test_valid_sealed_html_bundle_builds_one_issue_comment_effect():
+    delivery = _verify(_bundle())
+
+    assert delivery.submission_key == _admission().submission_key
+    assert delivery.effect_payload["effect_kind"] == "feishu_issue_comment"
+    assert delivery.effect_payload["work_item_id"] == "7041712812"
+    assert delivery.effect_payload["marker"] == delivery.marker
+    assert delivery.marker in delivery.effect_payload["comment_content"]
+    assert delivery.effect_key in delivery.marker
+    assert delivery.target_key == "feishu_project:t03o4q:issue:7041712812"
+    assert delivery.report_url == build_report_url(
+        delivery.submission_key, delivery.artifact_set_id
+    )
+    assert delivery.issue_url == (
+        "https://project.feishu.cn/g1q3/issue/detail/7041712812"
+    )
+    assert "/t03o4q/issue/detail/" not in delivery.issue_url
+
+
+def test_thread_reply_effect_is_bound_to_exact_topic_and_is_deterministic():
+    delivery = _verify(_bundle())
+    target = {
+        "schema_version": "pnc_rca_delivery_target_v1",
+        "platform": "feishu",
+        "chat_id": "oc_123456",
+        "thread_id": "topic:om_root123",
+        "reply_anchor_message_id": "om_root123",
+        "source_message_id": "om_trigger456",
+        "requester_id": "ou_requester789",
+        "reply_in_thread": True,
+        "output_cap": "L1",
+    }
+    built = build_thread_reply_effect(
+        issue_effect_payload=delivery.effect_payload,
+        target_key="feishu_thread:oc_123456:om_root123",
+        target=target,
+    )
+    repeated = build_thread_reply_effect(
+        issue_effect_payload=delivery.effect_payload,
+        target_key="feishu_thread:oc_123456:om_root123",
+        target=target,
+    )
+
+    assert built == repeated
+    effect_key, semantic_sha, payload = built
+    assert payload["effect_kind"] == DELIVERY_THREAD_EFFECT_KIND
+    assert payload["semantic_payload_sha256"] == semantic_sha
+    assert payload["effect_key"] == effect_key
+    assert payload["thread_id"] == "topic:om_root123"
+    assert payload["idempotency_uuid"]
+    assert payload["marker"] in payload["message_content"]
+    assert delivery.report_url in payload["message_content"]
+    assert delivery.issue_url in payload["message_content"]
+
+
+def test_thread_reply_effect_refuses_target_or_topic_fallback_drift():
+    delivery = _verify(_bundle())
+    target = {
+        "schema_version": "pnc_rca_delivery_target_v1",
+        "platform": "feishu",
+        "chat_id": "oc_123456",
+        "thread_id": "topic:om_root123",
+        "reply_anchor_message_id": "om_root123",
+        "source_message_id": "om_trigger456",
+        "requester_id": "ou_requester789",
+        "reply_in_thread": True,
+        "output_cap": "L1",
+    }
+
+    with pytest.raises(DeliveryContractError) as exc:
+        build_thread_reply_effect(
+            issue_effect_payload=delivery.effect_payload,
+            target_key="feishu_thread:oc_other:om_root123",
+            target=target,
+        )
+    assert exc.value.code == "delivery_subscription_target_invalid"
+
+    with pytest.raises(DeliveryContractError) as exc:
+        build_thread_reply_effect(
+            issue_effect_payload=delivery.effect_payload,
+            target_key="feishu_thread:oc_123456:om_root123",
+            target={**target, "thread_id": ""},
+        )
+    assert exc.value.code == "delivery_subscription_target_invalid"
+
+
+def test_artifact_identity_is_independent_of_publication_location():
+    _admission_value, _contract, manifest, _observed, _dependencies = _bundle()
+    baseline = compute_artifact_set_id(manifest)
+    relocated = dict(manifest)
+    relocated["report_url"] = "http://invalid.example/another/location"
+
+    assert compute_artifact_set_id(relocated) == baseline
+
+
+def test_report_url_uses_live_canonical_http_root_and_content_address():
+    assert build_report_url(FORMAL_SUBMISSION_KEY, FORMAL_ARTIFACT_SET_ID) == (
+        "http://192.168.26.174:18081/G1Q3_RCA/cases/"
+        f"{FORMAL_SUBMISSION_KEY}/{FORMAL_ARTIFACT_SET_ID}/index.html"
+    )
+
+
+def test_changed_artifact_content_gets_a_different_publication_url():
+    admission, _contract, manifest, _observed, _dependencies = _bundle()
+    changed = {
+        **manifest,
+        "artifacts": [dict(item) for item in manifest["artifacts"]],
+    }
+    changed["artifacts"][-1]["sha256"] = "f" * 64
+    changed_id = compute_artifact_set_id(changed)
+
+    assert changed_id != manifest["artifact_set_id"]
+    assert build_report_url(admission.submission_key, changed_id) != (
+        manifest["report_url"]
+    )
+
+
+@pytest.mark.parametrize("identity_kind", ["submission", "artifact_set"])
+def test_report_url_identity_must_match_submission_and_artifact_set(identity_kind):
+    admission, contract, manifest, observed, dependencies = _bundle()
+    if identity_kind == "artifact_set":
+        report_url = build_report_url(
+            admission.submission_key, "g1q3-rca-artifact-v1-" + "f" * 64
+        )
+    else:
+        report_url = build_report_url(
+            "g1q3-rca-s1-" + "f" * 64, manifest["artifact_set_id"]
+        )
+    manifest["report_url"] = report_url
+
+    with pytest.raises(DeliveryContractError) as exc:
+        _verify((admission, contract, manifest, observed, dependencies))
+
+    assert exc.value.code == "report_url_identity_mismatch"
+
+
+def test_report_asset_url_is_confined_to_the_content_addressed_directory():
+    admission, _contract, manifest, _observed, _dependencies = _bundle()
+    report_url = build_report_url(
+        admission.submission_key, manifest["artifact_set_id"]
+    )
+
+    assert build_report_artifact_url(report_url, "assets/app.css") == (
+        report_url.rsplit("/", 1)[0] + "/assets/app.css"
+    )
+    with pytest.raises(DeliveryContractError) as exc:
+        build_report_artifact_url(report_url, "../other/index.html")
+    assert exc.value.code == "artifact_path_invalid"
+
+
+def test_manifest_enforces_artifact_count_file_and_bundle_limits():
+    _admission_value, _contract, manifest, _observed, _dependencies = _bundle()
+    manifest["artifacts"][0]["size"] = MAX_DELIVERY_ARTIFACT_BYTES + 1
+    with pytest.raises(DeliveryContractError) as exc:
+        compute_artifact_set_id(manifest)
+    assert exc.value.code == "delivery_artifact_file_too_large"
+
+    _admission_value, _contract, manifest, _observed, _dependencies = _bundle()
+    for item in manifest["artifacts"]:
+        item["size"] = MAX_DELIVERY_ARTIFACT_BYTES
+    with pytest.raises(DeliveryContractError) as exc:
+        compute_artifact_set_id(manifest)
+    assert exc.value.code == "delivery_artifact_bundle_too_large"
+
+    _admission_value, _contract, manifest, _observed, _dependencies = _bundle()
+    manifest["artifacts"].extend(
+        dict(manifest["artifacts"][-1])
+        for _index in range(MAX_DELIVERY_ARTIFACTS - len(manifest["artifacts"]) + 1)
+    )
+    with pytest.raises(DeliveryContractError) as exc:
+        compute_artifact_set_id(manifest)
+    assert exc.value.code == "delivery_manifest_artifacts_invalid"
+
+
+def test_large_conclusion_is_utf8_bounded_while_report_link_is_preserved():
+    admission, contract, manifest, observed, dependencies = _bundle()
+    contract["summary"]["short_conclusion"] = "候选结论" * 10_000
+
+    delivery = _verify((admission, contract, manifest, observed, dependencies))
+
+    content = delivery.effect_payload["comment_content"]
+    assert len(content.encode("utf-8")) <= MAX_FEISHU_COMMENT_BYTES
+    assert manifest["report_url"] in content
+    assert delivery.conclusion.endswith("...")
+    assert {item.role for item in delivery.artifacts} == {
+        "index_html",
+        "report_data",
+        "video",
+    }
+
+
+def test_frozen_v1_without_explicit_kind_accepts_only_manifest_proven_html():
+    delivery = _verify(_bundle(explicit_kind=None))
+    assert delivery.effect_payload["report_status"] == "html_delivery_ready"
+
+
+def test_viz_only_or_non_html_explicit_kind_is_rejected():
+    bundle = list(_bundle(explicit_kind="viz"))
+    with pytest.raises(DeliveryContractError) as exc:
+        _verify(tuple(bundle))
+    assert exc.value.code == "delivery_kind_unsupported"
+
+
+def test_missing_manifest_fails_closed():
+    admission, contract, _manifest, observed, dependencies = _bundle()
+    with pytest.raises(DeliveryContractError) as exc:
+        verify_delivery_bundle(
+            admission=admission,
+            delivery_contract=contract,
+            delivery_manifest={},
+            observed_files=observed,
+            html_dependencies=dependencies,
+        )
+    assert exc.value.code == "delivery_manifest_missing"
+
+
+def test_html_and_json_are_both_required_even_when_contract_says_deliverable():
+    admission, contract, manifest, observed, dependencies = _bundle()
+    manifest["artifacts"] = [
+        item for item in manifest["artifacts"] if item["role"] != "report_data"
+    ]
+    _reseal(contract, manifest)
+    with pytest.raises(DeliveryContractError) as exc:
+        _verify((admission, contract, manifest, observed, dependencies))
+    assert exc.value.code == "required_html_artifact_missing"
+
+
+def test_dependency_hash_mismatch_is_permanent_contract_error():
+    admission, contract, manifest, observed, dependencies = _bundle()
+    observed[-1]["sha256"] = "0" * 64
+    with pytest.raises(DeliveryContractError) as exc:
+        _verify((admission, contract, manifest, observed, dependencies))
+    assert exc.value.code == "artifact_hash_mismatch"
+
+
+def test_symlink_observation_is_rejected_even_with_matching_hash():
+    admission, contract, manifest, observed, dependencies = _bundle()
+    observed[0]["is_file"] = False
+    observed[0]["is_symlink"] = True
+    with pytest.raises(DeliveryContractError) as exc:
+        _verify((admission, contract, manifest, observed, dependencies))
+    assert exc.value.code == "artifact_not_regular_file"
+
+
+def test_symlinked_parent_directory_is_rejected():
+    admission, contract, manifest, observed, dependencies = _bundle()
+    observed[-1]["parents_symlink_free"] = False
+    with pytest.raises(DeliveryContractError) as exc:
+        _verify((admission, contract, manifest, observed, dependencies))
+    assert exc.value.code == "artifact_not_regular_file"
+
+
+def test_path_traversal_is_rejected_before_observation_lookup():
+    admission, contract, manifest, observed, dependencies = _bundle()
+    manifest["artifacts"][0]["path"] = "../index.html"
+    _reseal(contract, manifest)
+    with pytest.raises(DeliveryContractError) as exc:
+        _verify((admission, contract, manifest, observed, dependencies))
+    assert exc.value.code == "artifact_path_invalid"
+
+
+def test_manifest_identity_must_match_admission():
+    admission, contract, manifest, observed, dependencies = _bundle()
+    manifest["work_item_id"] = "7041712813"
+    _reseal(contract, manifest)
+    with pytest.raises(DeliveryContractError) as exc:
+        _verify((admission, contract, manifest, observed, dependencies))
+    assert exc.value.code == "delivery_identity_mismatch"
+
+
+def test_kafka_offset_is_audit_only_for_delivery_and_effect_keys():
+    first = _verify(_bundle(admission=_admission(offset=10)))
+    replay = _verify(_bundle(admission=_admission(offset=999)))
+
+    assert first.submission_key == replay.submission_key
+    assert first.artifact_set_id == replay.artifact_set_id
+    assert first.delivery_id == replay.delivery_id
+    assert first.effect_key == replay.effect_key
+
+
+def test_generation_two_has_an_independent_delivery_and_effect_key():
+    first = _verify(_bundle())
+    second_admission = build_rca_admission(
+        project_key="t03o4q",
+        project_simple_name="g1q3",
+        work_item_type_key="issue",
+        work_item_id="7041712812",
+        rule_version="issue-created-v1",
+        trigger_kind="manual_retrigger",
+        generation=2,
+    )
+    second = _verify(_bundle(admission=second_admission))
+
+    assert first.business_key == second.business_key
+    assert first.submission_key != second.submission_key
+    assert first.artifact_set_id != second.artifact_set_id
+    assert first.delivery_id != second.delivery_id
+    assert first.effect_key != second.effect_key
+
+
+def test_every_html_dependency_must_be_manifested_and_hash_verified():
+    admission, contract, manifest, observed, dependencies = _bundle()
+    manifest["artifacts"] = [
+        item for item in manifest["artifacts"] if item["role"] != "video"
+    ]
+    _reseal(contract, manifest)
+
+    with pytest.raises(DeliveryContractError) as exc:
+        _verify((admission, contract, manifest, observed, dependencies))
+    assert exc.value.code == "html_dependency_not_manifested"
+
+
+@pytest.mark.parametrize(
+    ("mutator", "code"),
+    [
+        (lambda c, m: c.update(business_state="final_closed"), "delivery_business_state_not_ready"),
+        (lambda c, m: c["report"].update(is_deliverable=False), "delivery_report_not_deliverable"),
+        (lambda c, m: c["report"].update(requires_human_review=False), "delivery_review_boundary_missing"),
+        (lambda c, m: m.update(sealed=False), "delivery_manifest_not_sealed"),
+        (lambda c, m: m.update(artifact_set_id="0" * 64), "artifact_set_id_mismatch"),
+    ],
+)
+def test_report_truth_and_seal_fail_closed(mutator, code):
+    admission, contract, manifest, observed, dependencies = _bundle()
+    mutator(contract, manifest)
+    with pytest.raises(DeliveryContractError) as exc:
+        _verify((admission, contract, manifest, observed, dependencies))
+    assert exc.value.code == code
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        f"https://192.168.26.174:18081{FORMAL_REPORT_PATH}",
+        f"http://192.168.26.175:18081{FORMAL_REPORT_PATH}",
+        f"http://192.168.26.174:18082{FORMAL_REPORT_PATH}",
+        f"http://user@192.168.26.174:18081{FORMAL_REPORT_PATH}",
+        f"http://192.168.26.174:18081{FORMAL_REPORT_PATH}?q=1",
+        f"http://192.168.26.174:18081{FORMAL_REPORT_PATH}#x",
+        (
+            "http://192.168.26.174:18081/G1Q3_RCA/cases/%2e%2e/"
+            f"{FORMAL_ARTIFACT_SET_ID}/index.html"
+        ),
+        (
+            f"http://192.168.26.174:18081/G1Q3_RCA/cases/{FORMAL_SUBMISSION_KEY}/"
+            "%252e%252e/index.html"
+        ),
+        (
+            f"http://192.168.26.174:18081/G1Q3_RCA/cases/{FORMAL_SUBMISSION_KEY}/"
+            f"{FORMAL_ARTIFACT_SET_ID}/nested/index.html"
+        ),
+    ],
+)
+def test_report_url_is_exactly_the_formal_internal_html_route(url):
+    admission, contract, manifest, observed, dependencies = _bundle()
+    manifest["report_url"] = url
+
+    with pytest.raises(DeliveryContractError) as exc:
+        _verify((admission, contract, manifest, observed, dependencies))
+    assert exc.value.code == "report_url_invalid"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "code"),
+    [
+        ("artifact_revision", None, "delivery_field_invalid"),
+        ("artifact_revision", "1", "delivery_field_invalid"),
+        ("sealed_at", "2026-07-10T08:00:00", "delivery_manifest_sealed_at_invalid"),
+    ],
+)
+def test_manifest_revision_and_timezone_aware_seal_are_mandatory(field, value, code):
+    admission, contract, manifest, observed, dependencies = _bundle()
+    manifest[field] = value
+    with pytest.raises(DeliveryContractError) as exc:
+        _verify((admission, contract, manifest, observed, dependencies))
+    assert exc.value.code == code
+
+
+def test_html_validation_object_is_mandatory():
+    admission, contract, manifest, observed, dependencies = _bundle()
+    manifest.pop("html_validation")
+    with pytest.raises(DeliveryContractError) as exc:
+        _verify((admission, contract, manifest, observed, dependencies))
+    assert exc.value.code == "html_validation_missing"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "code"),
+    [
+        ("state", "html_review_ready", "html_validation_state_invalid"),
+        ("blockers", ["video_unaligned"], "html_validation_blocked"),
+        ("fidelity_ok", False, "html_validation_fidelity_failed"),
+    ],
+)
+def test_html_validation_must_be_delivery_ready_unblocked_and_faithful(
+    field, value, code
+):
+    admission, contract, manifest, observed, dependencies = _bundle()
+    manifest["html_validation"][field] = value
+    with pytest.raises(DeliveryContractError) as exc:
+        _verify((admission, contract, manifest, observed, dependencies))
+    assert exc.value.code == code
+
+
+def test_html_validation_is_bound_to_sealed_report_data_hash():
+    admission, contract, manifest, observed, dependencies = _bundle()
+    manifest["html_validation"]["report_data_sha256"] = "f" * 64
+    _reseal(contract, manifest)
+    with pytest.raises(DeliveryContractError) as exc:
+        _verify((admission, contract, manifest, observed, dependencies))
+    assert exc.value.code == "html_validation_report_data_hash_mismatch"
+
+
+def test_revision_seal_and_html_validation_are_part_of_artifact_identity():
+    _admission, _contract, manifest, _observed, _dependencies = _bundle()
+    baseline = compute_artifact_set_id(manifest)
+    for field, value in (
+        ("artifact_revision", 2),
+        ("sealed_at", "2026-07-10T08:00:01+00:00"),
+    ):
+        changed = dict(manifest)
+        changed[field] = value
+        assert compute_artifact_set_id(changed) != baseline
+
+
+def test_formal_cases_artifact_cannot_replace_task_root_sealed_bundle():
+    admission, contract, manifest, observed, dependencies = _bundle()
+    formal = (
+        "/mnt/minieye/pdcl/department/perception_test_team/"
+        "G1Q3_RCA/cases/7041712812_acc/index.html"
+    )
+    manifest["artifacts"][0]["path"] = formal
+    _reseal(contract, manifest)
+    contract["artifacts"]["index_html_vm"] = formal
+    with pytest.raises(DeliveryContractError) as exc:
+        _verify((admission, contract, manifest, observed, dependencies))
+    assert exc.value.code == "artifact_path_outside_root"
+
+
+def test_mcap_is_never_an_html_delivery_dependency():
+    _admission, _contract, manifest, _observed, _dependencies = _bundle()
+    manifest["artifacts"].append(
+        {
+            "role": "viz_mcap",
+            "path": "viz.mcap",
+            "size": 100,
+            "sha256": "a" * 64,
+            "media_type": "application/octet-stream",
+            "required": False,
+        }
+    )
+    with pytest.raises(DeliveryContractError) as exc:
+        compute_artifact_set_id(manifest)
+    assert exc.value.code == "html_delivery_mcap_forbidden"

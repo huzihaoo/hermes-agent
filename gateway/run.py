@@ -27,6 +27,7 @@ except ModuleNotFoundError:
 import asyncio
 import concurrent.futures
 import dataclasses
+import hashlib
 import inspect
 import json
 import logging
@@ -45,7 +46,7 @@ from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from typing import Callable, Dict, Optional, Any, List, Union
+from typing import Callable, Dict, Optional, Any, List, Mapping, Union
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
 # /usage; we still import it at module top in the gateway because test
@@ -1782,18 +1783,6 @@ from gateway.platforms.base import (
     merge_pending_message_event,
     utf16_len,
 )
-from gateway.pnc_issue_context import (
-    fetch_g1q3_issue_context_result as _fetch_g1q3_issue_context_result,
-    resolve_feishu_issue_project_key,
-)
-from gateway.pnc_rca_artifacts import write_vm_tmp_text
-from gateway.pnc_rca_schema import (
-    build_execution_request,
-    issue_context_from_compact_text,
-    validate_issue_context_fields,
-    to_json as rca_schema_to_json,
-)
-from gateway.pnc_rca_state_machine import new_intake_state, transition, write_rca_intake_state
 from gateway.feishu_reply import sanitize_feishu_inbound_text
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
@@ -1837,6 +1826,7 @@ def _integration_tools_intake_chat_ids(config: dict | None = None) -> set[str]:
     return {str(v).strip() for v in raw_ids if str(v or "").strip()}
 
 
+G1Q3_RCA_GROUP_ID = "oc_6cfc782212009ff4cd815349909dd423"
 PNC_ALL_BUSINESS_TEST_GROUP_ID = "oc_16614f4ba25b8c88b69c0b8e9ebc2fb5"
 
 
@@ -1847,9 +1837,25 @@ def _looks_like_g1q3_rca_request_for_business_routing(text: str) -> bool:
         return True
     if re.search(r"(?:飞书问题|问题|issue|work[_ -]?item)\s*[:：#]?\s*\d{6,}", body, re.IGNORECASE):
         return True
+    if re.search(
+        r"project\.feishu\.cn/[^\s)]+/issue/detail/\d+",
+        body,
+        re.IGNORECASE,
+    ):
+        return True
     if re.search(r"\bcase\s+g1q3[-_ ]?\d+", lower):
         return True
     return False
+
+
+def _has_feishu_project_issue_url(text: str) -> bool:
+    return bool(
+        re.search(
+            r"https?://project\.feishu\.cn/[^\s/?#)]+/issue/detail/\d+",
+            str(text or ""),
+            re.IGNORECASE,
+        )
+    )
 
 
 def _looks_like_integration_tools_request(text: str) -> bool:
@@ -1874,6 +1880,8 @@ def _is_integration_tools_intake_event(source: Any, text: str) -> bool:
         return False
     chat_id = str(getattr(source, "chat_id", "") or "").strip()
     if chat_id not in _integration_tools_intake_chat_ids(block):
+        return False
+    if _has_feishu_project_issue_url(text):
         return False
     if chat_id == PNC_ALL_BUSINESS_TEST_GROUP_ID:
         if _looks_like_g1q3_rca_request_for_business_routing(text):
@@ -2061,6 +2069,557 @@ def _find_g1q3_rca_task_by_thread(source_platform: str, thread_id: str) -> dict 
     except Exception:
         pass
     return result
+
+
+def _g1q3_rca_control_db_path() -> Path:
+    """Return the canonical Kafka RCA control database without creating it."""
+    configured = str(
+        os.getenv("HERMES_RCA_KAFKA_CONTROL_DB_PATH")
+        or os.getenv("HERMES_RCA_OUTBOX_CONTROL_DB_PATH")
+        or ""
+    ).strip()
+    if configured:
+        return Path(configured).expanduser()
+    return (
+        _hermes_home
+        / "runtime"
+        / "pnc_agent"
+        / "feishu_issue_kafka_rca"
+        / "control.sqlite3"
+    )
+
+
+def _env_enabled(name: str) -> bool:
+    return str(os.getenv(name, "") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _g1q3_rca_activation_required() -> bool:
+    """Load the fail-closed manual activation switch bound into runtime identity."""
+    name = "HERMES_RCA_ACTIVATION_REQUIRED"
+    value = str(os.getenv(name, "false") or "").strip().lower()
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    raise ValueError(f"{name} must be exactly true or false")
+
+
+def _g1q3_manual_intake_enabled() -> bool:
+    env_value = os.getenv("HERMES_RCA_MANUAL_INTAKE_ENABLED")
+    if env_value is not None and str(env_value).strip():
+        return _env_enabled("HERMES_RCA_MANUAL_INTAKE_ENABLED")
+    try:
+        cfg = load_config() or {}
+        configured = cfg_get(
+            cfg,
+            "business_lines",
+            "rca",
+            "manual_intake_enabled",
+            default=False,
+        )
+        if isinstance(configured, bool):
+            return configured
+        return str(configured or "").strip().lower() in {"1", "true", "yes", "on"}
+    except Exception:
+        return False
+
+
+def _g1q3_manual_chat_allowlist() -> tuple[frozenset[str], bool, str]:
+    maximum = frozenset({G1Q3_RCA_GROUP_ID, PNC_ALL_BUSINESS_TEST_GROUP_ID})
+    requested = frozenset(
+        item.strip()
+        for item in str(os.getenv("HERMES_RCA_MANUAL_CHAT_IDS", "") or "").split(",")
+        if item.strip()
+    )
+    digest = hashlib.sha256(
+        json.dumps(
+            sorted(requested), ensure_ascii=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    valid = bool(requested) and requested.issubset(maximum)
+    return (requested if valid else frozenset(), valid, digest)
+
+
+def _g1q3_manual_operator_rate_config() -> tuple[int, int]:
+    try:
+        rate_limit = int(
+            str(os.getenv("HERMES_RCA_MANUAL_OPERATOR_RATE_LIMIT", "3") or "3").strip()
+        )
+        rate_window_seconds = int(
+            str(
+                os.getenv(
+                    "HERMES_RCA_MANUAL_OPERATOR_RATE_WINDOW_SECONDS",
+                    "600",
+                )
+                or "600"
+            ).strip()
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("manual_operator_rate_config_invalid") from exc
+    if rate_limit < 1 or rate_window_seconds < 1:
+        raise ValueError("manual_operator_rate_config_invalid")
+    return rate_limit, rate_window_seconds
+
+
+def _g1q3_manual_runtime_public_config(
+    admission_runtime_config: Any | None = None,
+) -> dict[str, Any]:
+    from gateway.pnc_rca_policy_config import (
+        ManualRcaAdmissionRuntimeConfig,
+        manual_rca_admission_runtime_config_from_env,
+    )
+
+    resolved_admission_config = (
+        manual_rca_admission_runtime_config_from_env()
+        if admission_runtime_config is None
+        else admission_runtime_config
+    )
+    if not isinstance(resolved_admission_config, ManualRcaAdmissionRuntimeConfig):
+        raise TypeError(
+            "admission_runtime_config must be ManualRcaAdmissionRuntimeConfig"
+        )
+    allowed_chats, chat_allowlist_valid, chat_allowlist_sha256 = (
+        _g1q3_manual_chat_allowlist()
+    )
+    operator_user_env = str(
+        os.getenv("HERMES_RCA_MANUAL_OPERATOR_USER_IDS", "") or ""
+    ).strip()
+    if not operator_user_env:
+        operator_user_env = str(
+            os.getenv("HERMES_RCA_MANUAL_DEBUG_USER_IDS", "") or ""
+        ).strip()
+    operator_users = sorted(
+        {item.strip() for item in operator_user_env.split(",") if item.strip()}
+    )
+    operator_enabled_env = os.getenv("HERMES_RCA_MANUAL_OPERATOR_ENABLED")
+    operator_enabled = (
+        _env_enabled("HERMES_RCA_MANUAL_OPERATOR_ENABLED")
+        if operator_enabled_env is not None and str(operator_enabled_env).strip()
+        else _env_enabled("HERMES_RCA_MANUAL_DEBUG_ENABLED")
+    )
+    rate_limit, rate_window_seconds = _g1q3_manual_operator_rate_config()
+    return {
+        "schema_version": "pnc_rca_gateway_manual_runtime_config_v3",
+        "activation_required": _g1q3_rca_activation_required(),
+        "manual_intake_enabled": _g1q3_manual_intake_enabled(),
+        "manual_chat_ids": sorted(allowed_chats),
+        "manual_chat_allowlist_valid": chat_allowlist_valid,
+        "manual_chat_allowlist_sha256": chat_allowlist_sha256,
+        "manual_operator_enabled": operator_enabled,
+        "manual_operator_user_count": len(operator_users),
+        "manual_operator_user_ids_sha256": hashlib.sha256(
+            json.dumps(
+                operator_users, ensure_ascii=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest(),
+        "manual_operator_rate_limit": rate_limit,
+        "manual_operator_rate_window_seconds": rate_window_seconds,
+        **resolved_admission_config.to_public_dict(),
+    }
+
+
+def _g1q3_manual_authorization_snapshot(
+    *,
+    mode: str,
+    chat_id: str,
+    requester_id: str,
+    mention_verified: bool,
+    chat_allowlist: tuple[frozenset[str], bool, str] | None = None,
+) -> dict[str, Any]:
+    allowed_chats, chat_allowlist_valid, chat_allowlist_sha256 = (
+        chat_allowlist or _g1q3_manual_chat_allowlist()
+    )
+    operator_user_env = str(
+        os.getenv("HERMES_RCA_MANUAL_OPERATOR_USER_IDS", "") or ""
+    ).strip()
+    if not operator_user_env:
+        operator_user_env = str(
+            os.getenv("HERMES_RCA_MANUAL_DEBUG_USER_IDS", "") or ""
+        ).strip()
+    operator_users = sorted(
+        {
+            item.strip()
+            for item in operator_user_env.split(",")
+            if item.strip()
+        }
+    )
+    debug_requested = str(mode or "").strip() == "debug"
+    operator_requested = str(mode or "").strip() in {"rerun", "debug"}
+    operator_enabled_env = os.getenv("HERMES_RCA_MANUAL_OPERATOR_ENABLED")
+    operator_enabled = (
+        _env_enabled("HERMES_RCA_MANUAL_OPERATOR_ENABLED")
+        if operator_enabled_env is not None and str(operator_enabled_env).strip()
+        else _env_enabled("HERMES_RCA_MANUAL_DEBUG_ENABLED")
+    )
+    requester_allowed = (
+        str(requester_id or "").strip() in set(operator_users)
+        if operator_requested
+        else True
+    )
+    manual_enabled = _g1q3_manual_intake_enabled()
+    chat_allowed = str(chat_id or "").strip() in allowed_chats
+    operator_rate_limit, operator_rate_window_seconds = (
+        _g1q3_manual_operator_rate_config()
+    )
+    return {
+        "schema_version": "pnc_rca_manual_authorization_v2",
+        "manual_intake_enabled": manual_enabled,
+        "manual_chat_allowlist_valid": chat_allowlist_valid,
+        "manual_chat_allowlist_sha256": chat_allowlist_sha256,
+        "chat_allowed": chat_allowed,
+        "mention_verified": bool(mention_verified),
+        "debug_requested": debug_requested,
+        # Legacy debug field names cover the shared rerun/debug operator gate.
+        "debug_enabled": operator_enabled,
+        "requester_allowed": requester_allowed,
+        "debug_user_allowlist_sha256": hashlib.sha256(
+            json.dumps(
+                operator_users, ensure_ascii=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest(),
+        "manual_operator_rate_limit": operator_rate_limit,
+        "manual_operator_rate_window_seconds": operator_rate_window_seconds,
+        "authorized": (
+            manual_enabled
+            and chat_allowlist_valid
+            and chat_allowed
+            and bool(mention_verified)
+            and (
+                not operator_requested
+                or (operator_enabled and requester_allowed)
+            )
+        ),
+    }
+
+
+def _admit_g1q3_manual_trigger(
+    *,
+    issue_url: str,
+    mode: str,
+    chat_id: str,
+    thread_id: str,
+    message_id: str,
+    requester_id: str,
+    submit_enabled: bool,
+    operator_authorized: bool,
+    operator_rate_limit: int,
+    operator_rate_window_seconds: int,
+    allowed_chat_ids: tuple[str, ...],
+    admission_runtime_config: Any | None = None,
+) -> dict[str, Any]:
+    from gateway.pnc_rca_control_store import (
+        MANUAL_TRIGGER_SCHEMA_VERSION,
+        ManualRcaAdmissionError,
+        ManualRcaTriggerRequest,
+        RcaControlStore,
+    )
+    from gateway.pnc_rca_policy_config import (
+        ManualRcaAdmissionRuntimeConfig,
+        manual_rca_admission_runtime_config_from_env,
+    )
+
+    allowed_chats = frozenset(
+        str(item or "").strip() for item in allowed_chat_ids if str(item or "").strip()
+    )
+    maximum = frozenset({G1Q3_RCA_GROUP_ID, PNC_ALL_BUSINESS_TEST_GROUP_ID})
+    if not allowed_chats or not allowed_chats.issubset(maximum):
+        raise ManualRcaAdmissionError("manual_chat_allowlist_invalid")
+    try:
+        resolved_admission_config = (
+            manual_rca_admission_runtime_config_from_env()
+            if admission_runtime_config is None
+            else admission_runtime_config
+        )
+    except (TypeError, ValueError, KeyError) as exc:
+        error_code = (
+            "manual_outbox_high_watermark_invalid"
+            if "OUTBOX_HIGH_WATERMARK" in str(exc)
+            else "manual_active_policy_invalid"
+        )
+        raise ManualRcaAdmissionError(error_code) from exc
+    if not isinstance(resolved_admission_config, ManualRcaAdmissionRuntimeConfig):
+        raise ManualRcaAdmissionError("manual_admission_runtime_config_invalid")
+    if (
+        isinstance(operator_rate_limit, bool)
+        or isinstance(operator_rate_window_seconds, bool)
+        or not isinstance(operator_rate_limit, int)
+        or not isinstance(operator_rate_window_seconds, int)
+        or operator_rate_limit < 1
+        or operator_rate_window_seconds < 1
+    ):
+        raise ManualRcaAdmissionError("manual_operator_rate_config_invalid")
+
+    request = ManualRcaTriggerRequest(
+        schema_version=MANUAL_TRIGGER_SCHEMA_VERSION,
+        issue_url=issue_url,
+        mode=mode,  # type: ignore[arg-type]
+        reason="manual_explicit_issue_action",
+        platform="feishu",
+        chat_id=chat_id,
+        thread_id=thread_id,
+        message_id=message_id,
+        requester_id=requester_id,
+    )
+    try:
+        store = RcaControlStore(
+            _g1q3_rca_control_db_path(),
+            require_current=True,
+        )
+    except (OSError, RuntimeError, sqlite3.Error) as exc:
+        raise ManualRcaAdmissionError("manual_control_store_unavailable") from exc
+    result = store.admit_manual_trigger(
+        request,
+        allowed_chat_ids=allowed_chats,
+        submit_enabled=submit_enabled,
+        operator_authorized=operator_authorized,
+        operator_rate_limit=operator_rate_limit,
+        operator_rate_window_seconds=operator_rate_window_seconds,
+        active_policy=resolved_admission_config.active_policy,
+        outbox_high_watermark=resolved_admission_config.outbox_high_watermark,
+        activation_required=_g1q3_rca_activation_required(),
+        # Bounded activation resolves one exact preauthorized manual slot from
+        # the immutable message identity, so success/failure canaries do not
+        # require a Gateway restart or a mutable per-request mode switch.
+        activation_slot_kind="",
+    )
+    return result.to_dict()
+
+
+def _format_g1q3_manual_admission(result: Mapping[str, Any]) -> str:
+    outcome = str(result.get("outcome") or "")
+    labels = {
+        "created": "已创建",
+        "joined": "已绑定到既有任务",
+        "rearmed": "已恢复等待输入的既有任务",
+        "catchup_attached": "已绑定既有结果并安排回帖",
+    }
+    return "\n".join(
+        (
+            f"G1Q3 RCA {labels.get(outcome, '已受理')}。",
+            f"追踪号：{str(result.get('submission_key') or '')}",
+            f"执行代次：{int(result.get('generation') or 0)}",
+            "最终结果会回到当前话题（成功时为 HTML 报告，失败时为终态说明）；"
+            "本入口复用固定生产链路。",
+        )
+    )
+
+
+def _resolve_g1q3_issue_identity(
+    handoff: Mapping[str, Any],
+) -> tuple[str, str, str] | None:
+    """Resolve one URL/bare-ID handoff against the exact active policy."""
+    issue_id = str(handoff.get("work_item_id") or "").strip()
+    if not issue_id.isdigit():
+        return None
+    try:
+        from gateway.pnc_rca_policy_config import workflow_policy_from_env
+
+        policy = workflow_policy_from_env()
+    except (TypeError, ValueError, KeyError):
+        return None
+    if (
+        len(policy.project_keys) != 1
+        or len(policy.work_item_type_keys) != 1
+        or len(policy.project_simple_names) != 1
+    ):
+        return None
+    project_simple_name = str(
+        handoff.get("project_simple_name") or next(iter(policy.project_simple_names))
+    ).strip()
+    if project_simple_name not in policy.project_simple_names:
+        return None
+    return (
+        next(iter(policy.project_keys)),
+        next(iter(policy.work_item_type_keys)),
+        issue_id,
+    )
+
+
+def _find_g1q3_rca_task_by_issue_identity(
+    project_key: str,
+    work_item_type_key: str,
+    work_item_id: str,
+) -> dict | None:
+    """Read one source-neutral RCA task status from the durable control store.
+
+    The connection uses SQLite ``mode=ro`` and this helper never initializes or
+    mutates the database.  A missing/unreadable store is indistinguishable from
+    "not observed yet" at the chat boundary and therefore remains fail-closed.
+    """
+    exact_project_key = str(project_key or "").strip()
+    exact_type_key = str(work_item_type_key or "").strip()
+    issue_id = str(work_item_id or "").strip()
+    if not exact_project_key or not exact_type_key or not issue_id.isdigit():
+        return None
+    db_path = _g1q3_rca_control_db_path()
+    if not db_path.is_file():
+        return None
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        rows = conn.execute(
+            """
+            SELECT t.submission_key AS task_id,
+                   t.business_key AS business_key,
+                   t.project_key AS project_key,
+                   t.work_item_type_key AS work_item_type_key,
+                   t.work_item_id AS work_item_id,
+                   t.state AS trigger_state,
+                   t.generation AS generation,
+                   t.source_event_id AS source_event_id,
+                   t.created_at AS trigger_created_at,
+                   o.status AS outbox_status,
+                   o.result_json AS result_json,
+                   o.last_error_code AS last_error_code,
+                   o.updated_at AS updated_at
+              FROM business_triggers AS t
+              LEFT JOIN rca_outbox AS o
+                ON o.business_key = t.business_key
+               AND o.generation = t.generation
+             WHERE t.project_key = ? AND t.work_item_type_key = ?
+               AND t.work_item_id = ?
+             ORDER BY t.generation DESC, t.created_at DESC
+            """,
+            (exact_project_key, exact_type_key, issue_id),
+        ).fetchall()
+        if not rows:
+            return None
+        if len({str(item["business_key"] or "") for item in rows}) != 1:
+            logger.warning(
+                "RCA status identity maps to multiple chains: %s/%s/%s",
+                exact_project_key,
+                exact_type_key,
+                issue_id,
+            )
+            return None
+        row = rows[0]
+        result: dict[str, Any] = {}
+        try:
+            loaded = json.loads(str(row["result_json"] or "{}"))
+            if isinstance(loaded, dict):
+                result = loaded
+        except (TypeError, ValueError, json.JSONDecodeError):
+            result = {}
+        canonical_task_id = str(row["task_id"] or "").strip()
+        receipt_task_id = str(result.get("task_id") or "").strip()
+        if receipt_task_id and receipt_task_id != canonical_task_id:
+            logger.warning(
+                "RCA status receipt identity mismatch for issue %s",
+                issue_id,
+            )
+            receipt_task_id = ""
+        source_event_id = str(row["source_event_id"] or "").strip()
+        source_kind = "kafka_workflow_event" if source_event_id else ""
+        trigger_columns = {
+            str(column["name"])
+            for column in conn.execute("PRAGMA table_info(business_triggers)")
+        }
+        source_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'rca_trigger_sources'"
+        ).fetchone()
+        if "origin_source_id" in trigger_columns and source_table is not None:
+            source = conn.execute(
+                """
+                SELECT s.source_kind
+                  FROM business_triggers AS t
+                  LEFT JOIN rca_trigger_sources AS s
+                    ON s.source_id = t.origin_source_id
+                 WHERE t.business_key = ? AND t.generation = ?
+                 LIMIT 1
+                """,
+                (row["business_key"], row["generation"]),
+            ).fetchone()
+            if source is not None and str(source["source_kind"] or "").strip():
+                source_kind = str(source["source_kind"]).strip()
+        return {
+            "project_key": exact_project_key,
+            "work_item_type_key": exact_type_key,
+            "work_item_id": issue_id,
+            "task_id": receipt_task_id or canonical_task_id,
+            "task_state": str(result.get("task_state") or "").strip(),
+            "trigger_state": str(row["trigger_state"] or "").strip(),
+            "outbox_status": str(row["outbox_status"] or "").strip(),
+            "generation": int(row["generation"]),
+            "source_event_id": source_event_id,
+            "last_error_code": str(row["last_error_code"] or "").strip(),
+            "updated_at": str(row["updated_at"] or row["trigger_created_at"] or "").strip(),
+            "source_kind": source_kind or "unknown",
+        }
+    except (OSError, sqlite3.Error) as exc:
+        logger.debug("Kafka RCA read-only status lookup unavailable: %s", exc)
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _format_g1q3_kafka_issue_status(work_item_id: str, task: dict | None) -> str:
+    """Render an L1-only durable RCA status response for a Feishu issue URL."""
+    issue_id = str(work_item_id or "").strip()
+    boundary = "本次仅做只读状态查询，不会手工创建、重跑任务或进入通用 Agent。"
+    if not isinstance(task, dict) or not str(task.get("task_id") or "").strip():
+        return (
+            f"飞书问题 {issue_id} 当前尚未查询到对应 RCA 任务。\n"
+            "Kafka 自动入口请等待 creation event 被消费；固定群手工入口需真实 @、"
+            "明确动作和完整问题链接。\n"
+            f"{boundary}"
+        )
+    task_id = str(task.get("task_id") or "").strip()
+    snapshot = _long_task_status_snapshot(task_id)
+    state = str(snapshot.get("state") or task.get("task_state") or task.get("trigger_state") or task.get("outbox_status") or "已记录").strip()
+    milestone = str(snapshot.get("latest_milestone") or "").strip()
+    source_kind = str(task.get("source_kind") or "").strip()
+    source_label = (
+        "固定群手工 RCA"
+        if source_kind == "feishu_group_manual"
+        else "Kafka RCA" if source_kind == "kafka_workflow_event" else "RCA"
+    )
+    lines = [
+        f"飞书问题 {issue_id} 的 {source_label} 任务已查询到。",
+        f"追踪号：{task_id}",
+        f"当前状态：{state}",
+    ]
+    if milestone:
+        lines.append(f"最新进展：{milestone[:220]}")
+    lines.append(boundary)
+    return "\n".join(lines)
+
+
+def _format_g1q3_kafka_case_status(
+    case_id: str,
+    *,
+    source_task_id: str = "",
+) -> str:
+    """Render a case-only status query without creating an execution task."""
+    normalized_case = str(case_id or "").strip()
+    task_id = str(source_task_id or "").strip()
+    boundary = "本次仅做只读状态查询，不会手工创建、重跑任务或进入通用 Agent。"
+    if task_id:
+        snapshot = _long_task_status_snapshot(task_id)
+        state = str(snapshot.get("state") or "已记录").strip()
+        milestone = str(snapshot.get("latest_milestone") or "").strip()
+        lines = [
+            f"G1Q3 case {normalized_case or '（当前话题）'} 的既有任务已查询到。",
+            f"追踪号：{task_id}",
+            f"当前状态：{state}",
+        ]
+        if milestone:
+            lines.append(f"最新进展：{milestone[:220]}")
+        lines.append(boundary)
+        return "\n".join(lines)
+    return (
+        f"G1Q3 case {normalized_case or '（未提供）'} 不能安全映射到唯一 Kafka 问题单。\n"
+        "请提供完整飞书问题链接或 work_item_id 后查询；系统不会为状态查询新建任务。\n"
+        f"{boundary}"
+    )
 
 
 _G1Q3_RESUME_STATES = {"blocked", "need_input", "awaiting_user"}
@@ -2972,13 +3531,23 @@ def _submit_integration_tools_intake_handoff(
         logger.warning("Integration-tools intake receipt write failed: %s", receipt_exc)
     return submit_result
 
-
-
-def _is_synthetic_g1q3_quota_trigger(*, message_id: str = "", requester: str = "") -> bool:
-    """Return True for local/test submissions that must not spend production quota."""
-    msg = str(message_id or "").strip()
-    user = str(requester or "").strip()
-    return msg.startswith("om_test") or user in {"ou_test_user", "test_user", "pytest"}
+def _g1q3_issue_link_urls_from_metadata(event: Any) -> tuple[str, ...]:
+    """Return allowlisted issue links from the current Feishu message only."""
+    metadata = getattr(event, "metadata", None)
+    feishu_meta = metadata.get("feishu") if isinstance(metadata, dict) else {}
+    urls = feishu_meta.get("link_urls") if isinstance(feishu_meta, dict) else []
+    if not isinstance(urls, list):
+        return ()
+    safe_urls: list[str] = []
+    for url in urls:
+        item = str(url or "").strip()
+        if not item.startswith(("http://", "https://")):
+            continue
+        if "project.feishu.cn/" not in item or "/issue/detail/" not in item:
+            continue
+        if item not in safe_urls:
+            safe_urls.append(item)
+    return tuple(safe_urls)
 
 
 def _g1q3_request_text_with_metadata(event: Any) -> str:
@@ -2990,20 +3559,21 @@ def _g1q3_request_text_with_metadata(event: Any) -> str:
     URLs lets the existing issue-id parser work without persisting raw payloads.
     """
     text = str(getattr(event, "text", "") or "")
-    metadata = getattr(event, "metadata", None)
-    feishu_meta = metadata.get("feishu") if isinstance(metadata, dict) else {}
-    urls = feishu_meta.get("link_urls") if isinstance(feishu_meta, dict) else []
-    if not isinstance(urls, list):
-        urls = []
-    safe_urls: list[str] = []
-    for url in urls:
-        item = str(url or "").strip()
-        if not item.startswith(("http://", "https://")):
-            continue
-        if "project.feishu.cn/" not in item or "/issue/detail/" not in item:
-            continue
-        if item not in safe_urls:
-            safe_urls.append(item)
+    safe_urls = list(_g1q3_issue_link_urls_from_metadata(event))
+    if not safe_urls and not _has_feishu_project_issue_url(text):
+        reply_text = str(getattr(event, "reply_to_text", "") or "")
+        reply_urls = list(
+            dict.fromkeys(
+                match.group(0).rstrip("/")
+                for match in re.finditer(
+                    r"https?://project\.feishu\.cn/[^\s/?#)]+/issue/detail/\d+",
+                    reply_text,
+                    re.IGNORECASE,
+                )
+            )
+        )
+        if len(reply_urls) == 1:
+            safe_urls = reply_urls
     if not safe_urls:
         return text
     existing = text
@@ -3025,62 +3595,30 @@ def _dispatch_governance_datapipe_coordinator(
     requester: str,
     translate_config: dict[str, str] | None = None,
 ) -> dict:
-    """Spawn the detached host coordinator for governance-path RCA data pipeline.
-
-    Flag-gated by G1Q3_GOVERNANCE_DOWNLOAD_ENABLED (checked by the caller). The
-    coordinator runs the data pipeline via the network-capable plain-shell
-    governance path (ssh-mini-submit), then creates the standard read-only codex
-    task. Returns a dict with ``dispatched`` on success; on any failure returns
-    ``{"dispatched": False}`` so the caller can fall back to the normal inline
-    path (fail-safe). Detached: survives gateway restarts, never blocks the loop.
-    """
-    try:
-        coordinator = Path(__file__).resolve().parent.parent / "scripts" / "pnc_g1q3_governance_rca.py"
-        if not coordinator.is_file():
-            return {"dispatched": False, "error": "coordinator script missing"}
-        followup_slug = work_item_id or _gov_slug(full_case_id) or _gov_slug(task_slug)
-        # Include a short request slug suffix so repeated taps on the same issue in
-        # the same second do not collide while preserving the human-readable issue id.
-        followup_suffix = _gov_slug(task_slug)[-12:]
-        followup_task_id = (
-            f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-"
-            f"g1q3-rca-issue-intake-{followup_slug}-{followup_suffix}"
-        )[:127].rstrip("-")
-        params = {
-            "task_slug": task_slug,
-            "followup_task_id": followup_task_id,
-            "artifact_root": artifact_root,
-            "artifact_cifs_root": artifact_cifs_root,
-            "execution_request_path": execution_request_path,
-            "request_json": request_json,
-            "template_id": template_id,
-            "full_case_id": full_case_id,
-            "work_item_id": work_item_id,
-            **(translate_config or {"translate_baseline": "production", "translate_contract_path": ""}),
-            "source_group_id": source_group_id,
-            "message_id": message_id,
-            "user_id": requester,
-            "title": f"G1Q3 RCA issue intake: {work_item_id or full_case_id}",
-        }
-        params_dir = _hermes_home / "pnc_agent" / "governance_rca"
-        params_dir.mkdir(parents=True, exist_ok=True)
-        params_file = params_dir / f"{_gov_slug(task_slug)}.json"
-        params_file.write_text(json.dumps(params, ensure_ascii=False), encoding="utf-8")
-        log_file = params_dir / f"{_gov_slug(task_slug)}.log"
-        with open(log_file, "ab") as logf:
-            subprocess.Popen(
-                [sys.executable, str(coordinator), "--params-file", str(params_file)],
-                stdout=logf, stderr=logf, start_new_session=True,
-            )
-        return {
-            "dispatched": True,
-            "params_file": str(params_file),
-            "log_file": str(log_file),
-            "followup_task_id": followup_task_id,
-        }
-    except Exception as exc:  # fail-safe: caller falls back to inline path
-        logger.warning("governance datapipe coordinator dispatch failed: %s", exc)
-        return {"dispatched": False, "error": str(exc)[:200]}
+    """Compatibility boundary for the removed download-era coordinator."""
+    del (
+        task_slug,
+        artifact_root,
+        artifact_cifs_root,
+        execution_request_path,
+        request_json,
+        template_id,
+        full_case_id,
+        work_item_id,
+        source_group_id,
+        message_id,
+        requester,
+        translate_config,
+    )
+    return {
+        "dispatched": False,
+        "error_code": "g1q3_rca_legacy_download_coordinator_retired",
+        "error": (
+            "The download-era governance coordinator is retired. RCA execution "
+            "uses remote reads after Kafka or authorized manual control-plane admission."
+        ),
+        "side_effects_suppressed": True,
+    }
 
 
 def _create_governance_early_acceptance_card(
@@ -3097,72 +3635,32 @@ def _create_governance_early_acceptance_card(
     logger_obj=None,
     seed_func=None,
 ) -> dict[str, Any]:
-    """Best-effort early one-card acceptance seed for governance intakes.
-
-    Must never raise: governance dispatch is fail-safe, and the detached
-    coordinator can fall back to the final submit path if this seed fails.
-    """
-    out: dict[str, Any] = {"notify_process": {}, "early_submit": {}, "early_card": {}}
-    task_id = str(task_id or "").strip()
-    if not task_id:
-        return out
-    try:
-        submit_result = vm_task_submit_func(
-            title=task_title,
-            goal=goal,
-            task_id=task_id,
-            user_id=requester,
-            lane="standard",
-            resource_class="pnc_data",
-            repo_scope="unknown",
-            workspace_scope="none",
-            risk_class="normal",
-            artifact_root=artifact_root,
-            artifact_cifs_root=artifact_cifs_root,
-            executor_type="governed_tool",
-            agent_backend="codex",
-            codex_backend_enabled=True,
-        )
-        out["early_submit"] = submit_result if isinstance(submit_result, dict) else {"raw": submit_result}
-        if isinstance(submit_result, dict) and isinstance(submit_result.get("notify_process"), dict):
-            out["notify_process"] = submit_result["notify_process"]
-        if not (isinstance(submit_result, dict) and submit_result.get("success")):
-            out["early_card"] = {"ok": False, "reason": "early_submit_failed"}
-            return out
-        if seed_func is None:
-            from scripts.pnc_g1q3_governance_rca import seed_governance_early_card
-            seed_func = seed_governance_early_card
-        out["early_card"] = seed_func(
-            task_id=task_id,
-            chat_id=chat_id,
-            thread_id=f"topic:{message_id}" if message_id else "",
-            message_id=message_id,
-            artifact_root=artifact_root,
-            artifact_cifs_root=artifact_cifs_root,
-            submit_result=out["early_submit"],
-        )
-    except Exception as exc:
-        if logger_obj is not None:
-            logger_obj.warning("governance early acceptance card failed: %s", exc)
-        out["notify_process"] = {"started": False, "reason": f"early_card_failed: {type(exc).__name__}: {exc}"}
-        out["early_error"] = f"{type(exc).__name__}: {exc}"
-    return out
-
-
-def _gov_slug(task_slug: str) -> str:
-    return "".join(c for c in str(task_slug or "") if c.isalnum() or c in "-_") or "unknown"
-
-
-def _g1q3_translate_baseline_config() -> dict[str, str]:
-    baseline = os.getenv("HERMES_G1Q3_TRANSLATE_BASELINE", "production").strip() or "production"
-    contract_path = os.getenv("HERMES_G1Q3_TRANSLATE_CONTRACT_PATH", "").strip()
-    if baseline == "candidate" and not contract_path:
-        contract_path = "api/g1q3_rca/translate_contract.candidate.json"
-    # Fail-safe: only production/candidate are first-class.  Custom paths must
-    # be explicitly labelled as custom so cards don't imply production.
-    if baseline not in {"production", "candidate"}:
-        baseline = "custom" if contract_path else "production"
-    return {"translate_baseline": baseline, "translate_contract_path": contract_path}
+    """Permanently reject the retired chat/governance task creation path."""
+    del (
+        vm_task_submit_func,
+        task_id,
+        task_title,
+        goal,
+        requester,
+        chat_id,
+        message_id,
+        artifact_root,
+        artifact_cifs_root,
+        logger_obj,
+        seed_func,
+    )
+    return {
+        "notify_process": {"started": False, "reason": "legacy_rca_handoff_retired"},
+        "early_submit": {
+            "success": False,
+            "error_code": "g1q3_rca_chat_handoff_retired",
+            "side_effects_suppressed": True,
+        },
+        "early_card": {"ok": False, "reason": "legacy_rca_handoff_retired"},
+    }
+def _legacy_rca_issue_auto_execution_disabled() -> bool:
+    """The legacy generic-Agent/direct-VM chat bypass is permanently retired."""
+    return True
 
 
 _OWN_POLICY_OPEN_ENV = {
@@ -3233,7 +3731,6 @@ def _submit_g1q3_rca_status_handoff(
 ) -> dict:
     """Submit the first governed G1Q3 RCA status handoff to shared-state v2."""
     from gateway.pnc_delivery_policy import G1Q3RcaTaskIntent, validate_g1q3_rca_task_intent
-    from tools.vm_task_tool import vm_task_submit
 
     intent = G1Q3RcaTaskIntent(
         template_id=template_id,
@@ -3245,314 +3742,40 @@ def _submit_g1q3_rca_status_handoff(
     validation = validate_g1q3_rca_task_intent(intent)
     if validation.decision != "valid":
         return {"success": False, "error": validation.reason or "invalid_handoff_intent"}
-
-    safe_case = re.sub(r"[^A-Za-z0-9_-]+", "_", case_id or work_item_id).strip("_") or "unknown"
-    task_kind = "issue_intake" if template_id == "rca_issue_intake" else "status"
-    request_kind = "issue_intake" if template_id == "rca_issue_intake" else "status_check"
-    # Suffix the artifact namespace with a trigger-derived hash so repeated
-    # or concurrent submissions for the same issue never share /mnt/tmp
-    # directories (duplicate runs used to overwrite each other's
-    # rca_execution_request.json and collide on output dirs).
-    import hashlib as _hashlib
-    _trigger_suffix = _hashlib.sha1(str(message_id or "").encode("utf-8")).hexdigest()[:6] if str(message_id or "").strip() else ""
-    task_slug = f"g1q3_rca_{task_kind}_{safe_case}" + (f"_{_trigger_suffix}" if _trigger_suffix else "")
-    artifact_root = f"/mnt/tmp/{task_slug}/"
-    artifact_cifs_root = (
-        "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/"
-        f"tmp/{task_slug}/"
-    )
-    full_case_id = case_id if str(case_id).upper().startswith("G1Q3") else (f"G1Q3-{case_id}" if case_id else "待从飞书问题字段解析")
-    issue_line = f"- work_item_id: {work_item_id}\n" if work_item_id else ""
-    request_excerpt = (request_text or "").strip().replace("\r\n", "\n")[:1200]
-    source = {
-        "platform": "feishu",
-        "chat_id": source_group_id,
-        "message_id": message_id,
-        "user_id": requester,
+    if template_id == "rca_issue_intake" and _legacy_rca_issue_auto_execution_disabled():
+        return {
+            "success": False,
+            "error_code": "g1q3_rca_legacy_chat_handoff_retired",
+            "error": (
+                "旧群聊旁路已退役，不会创建任务。生产入口仅包括 Kafka 自动受理，"
+                "以及固定 RCA 群内真实 @、明确动作和完整问题链接的手工控制面。"
+            ),
+            "retryable": False,
+            "intake": "durable_rca_control_plane",
+        }
+    if template_id in {"rca_case_status_check", "rca_case_evidence_summary"}:
+        return {
+            "success": False,
+            "error_code": "g1q3_rca_status_query_read_only",
+            "error": (
+                "RCA 状态/证据查询只能读取 Kafka control store 或既有任务；"
+                "不会创建 VM/Codex 任务。"
+            ),
+            "retryable": False,
+            "read_only": True,
+            "side_effects_suppressed": True,
+        }
+    return {
+        "success": False,
+        "error_code": "g1q3_rca_chat_handoff_retired",
+        "error": (
+            "The legacy RCA chat handoff is retired. Use Kafka automatic intake or "
+            "the authorized fixed-group manual control plane; no direct VM/Codex "
+            "task was created."
+        ),
+        "retryable": False,
+        "side_effects_suppressed": True,
     }
-    intake_state = new_intake_state(
-        task_id=task_slug,
-        group_binding_id="gb_g1q3_rca_feishu_group",
-        source=source,
-        request_text_excerpt=request_excerpt,
-    )
-    if receipt_dir is not None:
-        try:
-            write_rca_intake_state(receipt_dir, intake_state)
-        except Exception as receipt_exc:
-            logger.warning("RCA intake state receipt write failed: %s", receipt_exc)
-    issue_project_key = ""
-    issue_context_text = ""
-    issue_read_status = "not_requested"
-    issue_read_source = ""
-    issue_source_quality = "unavailable"
-    issue_blockers: list[dict[str, Any]] = []
-    if template_id == "rca_issue_intake" and work_item_id:
-        if receipt_dir is not None:
-            try:
-                write_rca_intake_state(receipt_dir, transition(intake_state, "issue_enrichment_started"))
-            except Exception as receipt_exc:
-                logger.warning("RCA intake enrichment-start receipt write failed: %s", receipt_exc)
-        issue_project_key = resolve_feishu_issue_project_key(
-            request_text or "",
-            work_item_id=work_item_id,
-            source_group_id=source_group_id,
-        )
-        issue_read_result = _fetch_g1q3_issue_context_result(project_key=issue_project_key, work_item_id=work_item_id)
-        issue_context_text = issue_read_result.context_text
-        issue_read_status = issue_read_result.status
-        issue_read_source = getattr(issue_read_result, "source", "") or ""
-        issue_source_quality = issue_read_result.source_quality
-        if issue_context_text:
-            next_stage = "issue_fields_extracted"
-        else:
-            issue_blockers.append(issue_read_result.blocker or {
-                "kind": "host_issue_preread_unavailable",
-                "message": "主控侧未成功读取飞书 issue 字段/评论，不能据此判定字段缺失",
-                "retryable": True,
-            })
-            next_stage = "issue_preread_blocked"
-    issue_url = f"https://project.feishu.cn/{issue_project_key}/issue/detail/{work_item_id}" if issue_project_key and work_item_id else ""
-    issue_context = issue_context_from_compact_text(
-        project_key=issue_project_key,
-        work_item_id=work_item_id,
-        url=issue_url,
-        compact_text=issue_context_text,
-        source_quality=issue_source_quality,
-        blockers=issue_blockers,
-    )
-    if case_id:
-        issue_context = dataclasses.replace(issue_context, case_id=full_case_id)
-    if issue_read_status and template_id == "rca_issue_intake" and work_item_id:
-        read_status_ref: dict[str, Any] = {"type": "host_issue_read_status", "status": issue_read_status}
-        if issue_read_source:
-            read_status_ref["source"] = issue_read_source
-        issue_context = dataclasses.replace(
-            issue_context,
-            media_refs=[*issue_context.media_refs, read_status_ref],
-        )
-    if template_id == "rca_issue_intake" and work_item_id and issue_context.source_quality != "unavailable":
-        issue_context, field_blocker = validate_issue_context_fields(issue_context)
-        if field_blocker:
-            issue_blockers.append(field_blocker)
-            issue_context = dataclasses.replace(issue_context, blockers=[*issue_context.blockers, field_blocker])
-            next_stage = "issue_field_validation_blocked"
-    # S8 field-quality loop: when the card was read but a required field is
-    # missing/invalid, plan (and post, if enabled) an owner-facing comment on
-    # the issue. Plan-only by default; the only write is meegle comment add.
-    field_gap_comment: dict[str, Any] | None = None
-    if template_id == "rca_issue_intake" and work_item_id and issue_blockers:
-        _gap_kind = str(issue_blockers[0].get("kind") or "")
-        if _gap_kind.startswith("issue_field_"):
-            try:
-                from gateway.pnc_field_gap_comment import maybe_comment_field_gap
-                _owner_open_ids = [requester] if str(requester or "").startswith("ou_") else []
-                field_gap_comment = maybe_comment_field_gap(
-                    project_key=issue_project_key,
-                    work_item_id=work_item_id,
-                    blocker_kind=_gap_kind,
-                    sub_kind=str(issue_blockers[0].get("sub_kind") or ""),
-                    owners=list(issue_context.owners or []),
-                    owner_open_ids=_owner_open_ids,
-                    ledger_dir=_hermes_home / "pnc_agent" / "quota",
-                )
-            except Exception as gap_exc:
-                logger.warning("G1Q3 field-gap comment step failed: %s", gap_exc)
-                field_gap_comment = {"action": "comment_failed", "reason": str(gap_exc)[:200]}
-    # Auto-download grant: only spend daily quota on clean intakes (fields
-    # extracted and PDCL valid); a blocked intake cannot download anyway.
-    download_grant: dict[str, Any] = {"granted": False, "reason": "not_eligible"}
-    if template_id == "rca_issue_intake" and work_item_id and not issue_blockers:
-        if _is_synthetic_g1q3_quota_trigger(message_id=message_id, requester=requester):
-            download_grant = {"granted": False, "reason": "synthetic_trigger_no_quota_spend"}
-        else:
-            try:
-                from gateway.pnc_download_quota import consume_g1q3_download_grant
-                download_grant = consume_g1q3_download_grant(
-                    quota_dir=_hermes_home / "pnc_agent" / "quota",
-                    task_id=task_slug,
-                )
-            except Exception as quota_exc:
-                logger.warning("G1Q3 download quota check failed (fail closed): %s", quota_exc)
-                download_grant = {"granted": False, "reason": f"quota_check_failed: {quota_exc}"[:200]}
-    allow_download = bool(download_grant.get("granted"))
-    translate_config = _g1q3_translate_baseline_config()
-    execution_request = build_execution_request(
-        request_kind=request_kind,
-        task_id=task_slug,
-        issue_context=issue_context,
-        request_text_excerpt=request_excerpt,
-        source_group_id=source_group_id,
-        source_message_id=message_id,
-        artifact_root=artifact_root,
-        artifact_cifs_root=artifact_cifs_root,
-        allow_download=allow_download,
-        translate_baseline=translate_config.get("translate_baseline", "production"),
-        translate_contract_path=translate_config.get("translate_contract_path", ""),
-    )
-    request_json = rca_schema_to_json(execution_request)
-    execution_request_path = f"{artifact_root}rca_execution_request.json"
-    execution_request_local_path = write_vm_tmp_text(execution_request_path, request_json + "\n")
-    if receipt_dir is not None:
-        try:
-            enriched_state = transition(
-                intake_state,
-                next_stage if template_id == "rca_issue_intake" and work_item_id else "case_resolved",
-                issue_context=issue_context,
-                execution_request_path=execution_request_path,
-                blocker=issue_blockers[0] if issue_blockers else None,
-                retryable=bool(issue_blockers),
-            )
-            write_rca_intake_state(receipt_dir, enriched_state)
-        except Exception as receipt_exc:
-            logger.warning("RCA intake enriched/blocker receipt write failed: %s", receipt_exc)
-    request_text_block = f"\n## 原始请求摘录（供 VM 无飞书权限时弱解析）\n{request_excerpt}\n" if request_excerpt else ""
-    issue_context_block = ""
-    if template_id == "rca_issue_intake" and work_item_id:
-        if issue_context_text:
-            issue_context_block = f"\n## Feishu issue context（主控侧预读取）\n{issue_context_text}\n"
-        else:
-            issue_context_block = (
-                "\n## Feishu issue context（主控侧预读取）\n"
-                "主控侧未成功读取飞书 issue 字段/评论；这是状态机的 issue_preread_blocked，"
-                "不能据此判定 问题数据地址_PDCL 缺失或格式不合法。"
-                "请优先检查主控飞书项目读取权限/MCP 调用链路；VM 只消费主控固化后的结构化字段。\n"
-            )
-    goal = (
-        "执行 G1Q3 RCA 问题 intake / 只读状态查询 handoff。\n"
-        f"- template_id: {template_id}\n"
-        f"- case_id: {full_case_id}\n"
-        f"{issue_line}"
-        f"- source_group_id: {source_group_id}\n"
-        f"- request_message_id: {message_id}\n"
-        "- schema_version: g1q3_rca_execution_request_v1\n"
-        f"- execution_request_path: {execution_request_path}\n"
-        f"- translate_baseline: {translate_config.get('translate_baseline') or 'production'}\n"
-        + (f"- translate_contract_path: {translate_config.get('translate_contract_path')}\n" if translate_config.get('translate_contract_path') else "")
-        + (f"- host_request_prewrite: {execution_request_local_path}\n" if execution_request_local_path else "- host_request_prewrite: unavailable; embedded JSON fallback below\n")
-        + (
-            "- VM command suggestion: python3 /home/mini/data3/yj-evaluation-server/api/g1q3_rca/scripts/run_rca_auto_pipeline.py --request "
-            f"{execution_request_path} --output-dir {artifact_root}\n"
-            f"- auto_download: granted (今日额度 {download_grant.get('used')}/{download_grant.get('quota')})；S2 下载与受控管线由编排器按预算执行。\n"
-            if allow_download
-            else "- VM command suggestion: python3 /home/mini/data3/yj-evaluation-server/api/g1q3_rca/scripts/run_rca_execution_request.py --request "
-            f"{execution_request_path} --output-dir {artifact_root}\n"
-            + (f"- auto_download: not granted（{download_grant.get('reason') or 'disabled'}）；已受理但自动下载未授予，待 owner 触发下载或次日额度，无需发起人补数据；本次仅做只读状态/门禁检查。\n" if template_id == "rca_issue_intake" and work_item_id else "")
-        )
-        + "- 范围：先读取/归一化飞书问题字段；如可定位 G1Q3 case，则只读检查该 case 当前 RCA 产物状态、gate_result/report_data/global index 可见性。\n"
-        "- 若 VM worker 无法读取飞书 issue 字段，则先使用下方结构化 request 和原始请求摘录做弱解析，并明确标注低置信边界。\n"
-        "- 输出：仅返回 L0/L1 摘要，不返回原始日志、源码 diff、内部路径细节或命令流水。\n"
-        f"- VM work_tmp_dir: {artifact_root}\n"
-        f"- user_visible_cifs: {artifact_cifs_root}\n"
-        "\n## RcaExecutionRequest JSON\n"
-        f"```json\n{request_json}\n```\n"
-        f"{issue_context_block}"
-        f"{request_text_block}"
-    )
-    # Governance-path codification (flag-gated by G1Q3_GOVERNANCE_DOWNLOAD_ENABLED;
-    # INERT until that flag is set AND the gateway is restarted). For download-bearing
-    # RCA intakes, run the data pipeline via the network-capable plain-shell governance
-    # path, then a standard read-only codex task renders the result. codex sandbox stays
-    # network-off. Any dispatch failure falls back to the normal inline path (fail-safe).
-    # See knowledge/outputs/g1q3-rca-governance-download-orchestration-design-20260622.md
-    if allow_download and template_id == "rca_issue_intake" and work_item_id and not issue_blockers:
-        try:
-            from scripts.pnc_g1q3_governance_rca import governance_download_enabled
-            _gov_on = governance_download_enabled()
-        except Exception:
-            _gov_on = False
-        if _gov_on:
-            _gov = _dispatch_governance_datapipe_coordinator(
-                task_slug=task_slug, artifact_root=artifact_root,
-                artifact_cifs_root=artifact_cifs_root,
-                execution_request_path=execution_request_path, request_json=request_json,
-                template_id=template_id, full_case_id=full_case_id, work_item_id=work_item_id,
-                source_group_id=source_group_id, message_id=message_id, requester=requester,
-                translate_config=translate_config,
-            )
-            if isinstance(_gov, dict) and _gov.get("dispatched"):
-                _gov_task_id = str(_gov.get("followup_task_id") or "").strip()
-                _notify_process: dict[str, Any] = {}
-                _early_submit_result: dict[str, Any] = {}
-                _early_card_result: dict[str, Any] = {}
-                if _gov_task_id:
-                    _early = _create_governance_early_acceptance_card(
-                        vm_task_submit_func=vm_task_submit,
-                        task_id=_gov_task_id,
-                        task_title=f"G1Q3 RCA issue intake: {work_item_id or full_case_id}",
-                        goal=goal,
-                        requester=requester,
-                        chat_id=source_group_id,
-                        message_id=message_id,
-                        artifact_root=artifact_root,
-                        artifact_cifs_root=artifact_cifs_root,
-                        logger_obj=logger,
-                    )
-                    _notify_process = _early.get("notify_process") if isinstance(_early.get("notify_process"), dict) else {}
-                    _early_submit_result = _early.get("early_submit") if isinstance(_early.get("early_submit"), dict) else {}
-                    _early_card_result = _early.get("early_card") if isinstance(_early.get("early_card"), dict) else {}
-                if receipt_dir is not None:
-                    try:
-                        write_rca_intake_state(receipt_dir, transition(
-                            intake_state, "vm_submitted", issue_context=issue_context,
-                            vm_task_id=_gov_task_id, blocker=None, retryable=False,
-                        ))
-                    except Exception as receipt_exc:
-                        logger.warning("governance datapipe receipt write failed: %s", receipt_exc)
-                return {"success": True, "dispatched": "governance_datapipe",
-                        "governance": _gov, "task": {"task_id": _gov_task_id} if _gov_task_id else {},
-                        "notify_process": _notify_process,
-                        "early_submit": _early_submit_result,
-                        "early_card": _early_card_result,
-                        "execution_request": json.loads(request_json),
-                        "download_grant": download_grant}
-            # dispatch failed -> fall through to normal inline path (fail-safe)
-    task_title = f"G1Q3 RCA issue intake: {work_item_id or full_case_id}" if template_id == "rca_issue_intake" else f"G1Q3 RCA status check: {full_case_id}"
-    submit_result = vm_task_submit(
-        title=task_title,
-        goal=goal,
-        user_id=requester,
-        lane="standard",
-        resource_class="pnc_data",
-        repo_scope="unknown",
-        workspace_scope="none",
-        risk_class="normal",
-        artifact_root=artifact_root,
-        artifact_cifs_root=artifact_cifs_root,
-        executor_type="governed_tool",
-        agent_backend="codex",
-        codex_backend_enabled=True,
-    )
-    if isinstance(submit_result, dict):
-        submit_result.setdefault("execution_request", json.loads(request_json))
-        if template_id == "rca_issue_intake" and work_item_id:
-            submit_result.setdefault("download_grant", download_grant)
-            if field_gap_comment is not None:
-                submit_result.setdefault("field_gap_comment", field_gap_comment)
-            submit_result.setdefault("issue_preread", {
-                "status": issue_read_status,
-                "source": issue_read_source,
-                "source_quality": issue_source_quality,
-                "blocker": issue_blockers[0] if issue_blockers else None,
-            })
-    if receipt_dir is not None:
-        try:
-            task = submit_result.get("task") if isinstance(submit_result, dict) else {}
-            vm_task_id = str((task or {}).get("task_id") or (task or {}).get("id") or "") if isinstance(task, dict) else ""
-            write_rca_intake_state(
-                receipt_dir,
-                transition(
-                    intake_state,
-                    "vm_submitted" if submit_result.get("success") else "vm_failed",
-                    issue_context=issue_context,
-                    vm_task_id=vm_task_id,
-                    blocker=None if submit_result.get("success") else {"kind": "vm_submit_failed", "message": str(submit_result.get("error") or "")},
-                    retryable=not bool(submit_result.get("success")),
-                ),
-            )
-        except Exception as receipt_exc:
-            logger.warning("RCA intake VM submission receipt write failed: %s", receipt_exc)
-    return submit_result
 
 
 # Sentinel placed into _running_agents immediately when a session starts
@@ -4651,6 +4874,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         self.delivery_router = DeliveryRouter(self.config)
         self._running = False
+        self._rca_gateway_runtime_identity: dict[str, Any] | None = None
+        self._rca_manual_admission_runtime_config: Any | None = None
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
         self._shutdown_event = asyncio.Event()
         self._exit_cleanly = False
@@ -8561,6 +8786,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         logger.info("Starting Hermes Gateway...")
         try:
+            from gateway.pnc_rca_policy_config import (
+                manual_rca_admission_runtime_config_from_env,
+            )
+            from gateway.pnc_rca_runtime_identity import (
+                GATEWAY_LOADED_DEPENDENCIES,
+                GATEWAY_RCA_RUNTIME_RELATIVE_FILES,
+                build_runtime_identity,
+            )
+
+            admission_runtime_config = (
+                manual_rca_admission_runtime_config_from_env()
+            )
+            self._rca_gateway_runtime_identity = build_runtime_identity(
+                service_label="ai.hermes.gateway",
+                script_path=Path(__file__),
+                public_config=_g1q3_manual_runtime_public_config(
+                    admission_runtime_config
+                ),
+                runtime_relative_files=GATEWAY_RCA_RUNTIME_RELATIVE_FILES,
+                loaded_dependencies=GATEWAY_LOADED_DEPENDENCIES,
+            ).to_dict()
+            self._rca_manual_admission_runtime_config = admission_runtime_config
+        except Exception as exc:
+            self._rca_gateway_runtime_identity = None
+            self._rca_manual_admission_runtime_config = None
+            logger.error(
+                "RCA manual gateway runtime identity unavailable; manual intake "
+                "will fail closed: %s",
+                type(exc).__name__,
+            )
+        try:
             self._gateway_loop = asyncio.get_running_loop()
         except RuntimeError:
             self._gateway_loop = None
@@ -10906,27 +11162,138 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not is_internal and not event.is_command():
             try:
                 from gateway.pnc_group_binding import (
-                    PNC_ALL_BUSINESS_TEST_GROUP_ID,
                     evaluate_pnc_group_request,
                     write_pnc_group_binding_receipt,
-                    write_pnc_group_handoff_receipt,
                 )
-                _active_thread_case = _find_g1q3_rca_task_by_thread(
-                    "feishu",
-                    getattr(source, "thread_id", None),
+                _pnc_request_text = _g1q3_request_text_with_metadata(event)
+                _pnc_event_text = str(getattr(event, "text", "") or "")
+                _pnc_metadata = getattr(event, "metadata", None)
+                _pnc_feishu_metadata = (
+                    _pnc_metadata.get("feishu")
+                    if isinstance(_pnc_metadata, dict)
+                    else {}
+                )
+                _pnc_feishu_metadata = (
+                    _pnc_feishu_metadata
+                    if isinstance(_pnc_feishu_metadata, dict)
+                    else {}
+                )
+                _active_thread_case = (
+                    None
+                    if _has_feishu_project_issue_url(_pnc_request_text)
+                    else _find_g1q3_rca_task_by_thread(
+                        "feishu",
+                        getattr(source, "thread_id", None),
+                    )
                 )
                 _pnc_decision = evaluate_pnc_group_request(
                     platform=source.platform,
                     chat_id=source.chat_id,
-                    text=_g1q3_request_text_with_metadata(event),
+                    text=_pnc_event_text,
                     active_thread_case=_active_thread_case,
+                    issue_link_urls=_g1q3_issue_link_urls_from_metadata(event),
+                    reply_to_text=str(getattr(event, "reply_to_text", "") or ""),
+                    manual_mention_directed=(
+                        _pnc_feishu_metadata.get("self_mention_command_directed")
+                        is True
+                    ),
                 )
             except Exception as _pnc_exc:
-                logger.warning("PNC group binding policy failed open: %s", _pnc_exc)
+                logger.warning("PNC group binding policy failed: %s", _pnc_exc)
+                event.metadata["pnc_group_binding_error"] = {
+                    "schema_version": "pnc_group_binding_error_v1",
+                    "code": "policy_evaluation_failed",
+                    "retryable": True,
+                }
                 _pnc_decision = None
                 _active_thread_case = None
+                _failed_chat_id = str(getattr(source, "chat_id", "") or "").strip()
+                _failed_request_text = _g1q3_request_text_with_metadata(event)
+                if (
+                    _failed_chat_id == G1Q3_RCA_GROUP_ID
+                    or _has_feishu_project_issue_url(_failed_request_text)
+                    or (
+                        _failed_chat_id == PNC_ALL_BUSINESS_TEST_GROUP_ID
+                        and _looks_like_g1q3_rca_request_for_business_routing(
+                            _failed_request_text
+                        )
+                    )
+                ):
+                    return (
+                        "G1Q3 RCA 路由策略暂时不可用，本次请求已安全中止，"
+                        "不会进入通用 Agent 或创建 VM 任务；请稍后重试。"
+                    )
+            if (
+                _pnc_decision is not None
+                and _pnc_decision.route_surface == "rca_manual_intake"
+                and bool(getattr(source, "is_bot", False))
+            ):
+                _pnc_decision = dataclasses.replace(
+                    _pnc_decision,
+                    decision="reject",
+                    reason="manual_bot_sender_rejected",
+                    user_message=(
+                        "G1Q3 RCA 人工入口只接受真实用户 @ 触发，机器人消息不会创建任务。"
+                    ),
+                )
             if _pnc_decision is not None and _pnc_decision.group_binding_id:
                 event.metadata["pnc_group_binding"] = dataclasses.asdict(_pnc_decision)
+                _manual_authorization = None
+                _manual_gateway_runtime_identity = None
+                _manual_active_chat_ids: frozenset[str] = frozenset()
+                if (
+                    _pnc_decision.route_surface == "rca_manual_intake"
+                    and _pnc_decision.decision == "accepted"
+                ):
+                    _manual_handoff = _pnc_decision.handoff_contract or {}
+                    _feishu_metadata = event.metadata.get("feishu")
+                    _feishu_metadata = (
+                        _feishu_metadata
+                        if isinstance(_feishu_metadata, dict)
+                        else {}
+                    )
+                    _manual_mention_verified = bool(
+                        str(source.chat_type or "").strip().lower() == "group"
+                        and _feishu_metadata.get("self_mentioned") is True
+                        and _feishu_metadata.get("self_mention_command_directed")
+                        is True
+                    )
+                    _manual_chat_allowlist = _g1q3_manual_chat_allowlist()
+                    _manual_active_chat_ids = _manual_chat_allowlist[0]
+                    try:
+                        _manual_authorization = _g1q3_manual_authorization_snapshot(
+                            mode=str(_manual_handoff.get("mode") or ""),
+                            chat_id=str(source.chat_id or ""),
+                            requester_id=str(source.user_id or ""),
+                            mention_verified=_manual_mention_verified,
+                            chat_allowlist=_manual_chat_allowlist,
+                        )
+                    except ValueError:
+                        return (
+                            "G1Q3 RCA 人工操作限流配置无效，本次已安全中止，"
+                            "没有创建分析任务。"
+                        )
+                    _manual_gateway_runtime_identity = getattr(
+                        self, "_rca_gateway_runtime_identity", None
+                    )
+                    if not isinstance(_manual_gateway_runtime_identity, dict):
+                        return (
+                            "G1Q3 RCA 人工入口运行身份不可用，本次已安全中止，"
+                            "没有创建分析任务。"
+                        )
+                    _manual_admission_runtime_config = getattr(
+                        self,
+                        "_rca_manual_admission_runtime_config",
+                        None,
+                    )
+                    if _manual_admission_runtime_config is None:
+                        return (
+                            "G1Q3 RCA 人工入口策略快照不可用，本次已安全中止，"
+                            "没有创建分析任务。"
+                        )
+                    event.metadata["pnc_manual_authorization"] = dict(
+                        _manual_authorization
+                    )
                 try:
                     _receipt_dir = getattr(self, "_pnc_group_binding_receipt_dir", None) or (_hermes_home / "pnc_agent" / "receipts" / "g1q3_rca")
                     write_pnc_group_binding_receipt(
@@ -10936,9 +11303,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         chat_id=source.chat_id,
                         user_id=source.user_id,
                         message_id=event.message_id,
+                        manual_authorization=_manual_authorization,
+                        gateway_runtime_identity=_manual_gateway_runtime_identity,
                     )
                 except Exception as _receipt_exc:
                     logger.warning("PNC group binding receipt write failed: %s", _receipt_exc)
+                    if _pnc_decision.route_surface == "rca_manual_intake":
+                        return (
+                            "G1Q3 RCA 人工授权回执写入失败，本次已安全中止，"
+                            "没有创建分析任务。"
+                        )
                 if _pnc_decision.decision == "clarify":
                     if await self._send_pnc_clarify_card(source, event, _pnc_decision):
                         return None  # button card sent; its body carries the guidance
@@ -10957,229 +11331,191 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 if _pnc_decision.decision == "accepted":
                     _handoff = _pnc_decision.handoff_contract or {}
-                    # Idempotency guard: the same issue/case re-triggered while a
-                    # prior handoff is still in its active window must not spawn
-                    # a duplicate VM task.  The key is reserved before the async
-                    # submit so two concurrent messages cannot both pass the
-                    # check (the reservation happens without an await in
-                    # between).  Entries expire by TTL; submit failure releases
-                    # the reservation immediately.
-                    _dedup_identifier = str(_handoff.get("work_item_id") or "").strip() or str(_handoff.get("case_id") or "").strip()
-                    _surface = "test" if str(source.chat_id or "").strip() == PNC_ALL_BUSINESS_TEST_GROUP_ID else "dedicated"
-                    _dedup_key = f"{_surface}:{_pnc_decision.template_id}:{_dedup_identifier}"
-                    _dedup_window = 1800.0 if _pnc_decision.template_id == "rca_issue_intake" else 600.0
-                    _recent = getattr(self, "_g1q3_recent_handoffs", None)
-                    if _recent is None:
-                        _recent = {}
-                        self._g1q3_recent_handoffs = _recent
-                    _now_mono = time.monotonic()
-                    for _stale_key in [k for k, v in _recent.items() if _now_mono - v[1] > v[2]]:
-                        _recent.pop(_stale_key, None)
-                    # Resume exemption: if the existing thread task is waiting on
-                    # the human (blocked/need_input), this re-trigger is the
-                    # originator returning with the data — re-run toward closure
-                    # instead of dedup-blocking, and supersede the stale blocked
-                    # task so the topic does not keep two cards.
-                    _is_g1q3_resume = _g1q3_resume_bypasses_dedup(_active_thread_case)
-                    if _is_g1q3_resume:
-                        _recent.pop(_dedup_key, None)
-                        _resume_prior_task_id = str((_active_thread_case or {}).get("task_id") or "").strip()
-                        if _resume_prior_task_id:
-                            _supersede_g1q3_task(_resume_prior_task_id, reason="re-run after originator supplied data")
-                        logger.info(
-                            "G1Q3 resume: thread task %s in %s; dedup bypass, re-running intake for %s",
-                            _resume_prior_task_id,
-                            str((_active_thread_case or {}).get("state") or ""),
-                            _dedup_identifier,
+                    if _pnc_decision.route_surface == "rca_manual_intake":
+                        _manual_authorization = event.metadata.get(
+                            "pnc_manual_authorization"
                         )
-                    if _dedup_identifier and not _is_g1q3_resume and _dedup_key in _recent:
-                        _prior_task_id, _prior_ts, _prior_window = _recent[_dedup_key]
-                        _age_min = int((_now_mono - _prior_ts) // 60)
-                        if _prior_task_id:
-                            try:
-                                _sidecar_path = _hermes_home / "task-state" / f"{_prior_task_id}.json"
-                                _sidecar_body = json.loads(_sidecar_path.read_text(encoding="utf-8")) if _sidecar_path.exists() else {}
-                                _task_card = _sidecar_body.get("task_card") if isinstance(_sidecar_body.get("task_card"), dict) else {}
-                                if not _task_card:
-                                    _task_card = {
-                                        "schema_version": 1,
-                                        "task_id": str(_prior_task_id),
-                                        "vm_task_id": str(_prior_task_id),
-                                        "chat_id": getattr(source, "chat_id", None),
-                                        "thread_id": getattr(source, "thread_id", None),
-                                        "user_state": "host-created",
-                                        "delivery": {"conclusion": None, "artifact_path": None, "boundaries": [], "next_options": []},
-                                    }
-                                _task_card["status_line"] = (
-                                    f"重复请求已收到：这个问题 {_age_min} 分钟前已接单，仍在处理窗口内；"
-                                    "本次不再重复建任务。"
+                        if not isinstance(_manual_authorization, dict):
+                            return (
+                                "G1Q3 RCA 人工授权状态不可用，本次未创建任务。"
+                            )
+                        if not _manual_authorization.get("manual_intake_enabled"):
+                            return (
+                                "G1Q3 RCA 人工入口当前处于安全关闭状态，本次未创建任务。"
+                                "自动 Kafka 入口和只读状态查询不受影响。"
+                            )
+                        if not _manual_authorization.get("mention_verified"):
+                            _manual_issue_id = str(
+                                _handoff.get("work_item_id") or ""
+                            ).strip()
+                            _manual_issue_identity = _resolve_g1q3_issue_identity(
+                                _handoff
+                            )
+                            _manual_existing = (
+                                await asyncio.to_thread(
+                                    _find_g1q3_rca_task_by_issue_identity,
+                                    *_manual_issue_identity,
                                 )
-                                _task_card["one_card_policy"] = True
-                                _milestones = _task_card.get("milestones") if isinstance(_task_card.get("milestones"), list) else []
-                                if not _milestones:
-                                    _milestones.append({"ts": _pnc_feishu_business_now_iso(), "label": "任务建好"})
-                                _milestone_label = "收到重复请求，沿用当前任务"
-                                if not any(isinstance(_m, dict) and _m.get("label") == _milestone_label for _m in _milestones):
-                                    _milestones.append({"ts": _pnc_feishu_business_now_iso(), "label": _milestone_label})
-                                _task_card["milestones"] = _milestones
-                                _sidecar_body["task_card"] = _task_card
-                                _sidecar_body["updated_at"] = _pnc_feishu_business_now_iso()
-                                _tmp_path = _sidecar_path.with_suffix(_sidecar_path.suffix + ".tmp")
-                                _tmp_path.write_text(json.dumps(_sidecar_body, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
-                                _tmp_path.replace(_sidecar_path)
-                                return ""
-                            except Exception:
-                                logger.debug("G1Q3 duplicate one-card update failed", exc_info=True)
-                        return (
-                            f"这个问题 {_age_min} 分钟前已接单，仍在处理窗口内，本次不再重复建任务。\n"
-                            f"追踪号：{_prior_task_id or '生成中（上一次请求仍在提交）'}\n"
-                            f"如需强制重新处理，请等当前任务完成或联系运维。"
-                        )
-                    if _dedup_identifier:
-                        _recent[_dedup_key] = ("", _now_mono, _dedup_window)
-                    _session_env_tokens = None
-                    _clear_session_vars = None
-                    try:
-                        from gateway.session_context import set_session_vars, clear_session_vars as _clear_session_vars
-                        _session_env_tokens = set_session_vars(
-                            platform=source.platform.value if hasattr(source.platform, "value") else str(source.platform),
-                            chat_id=str(source.chat_id or ""),
-                            chat_name=str(source.chat_name or ""),
-                            thread_id=str(source.thread_id or ""),
-                            user_id=str(source.user_id or ""),
-                            user_name=str(source.user_name or ""),
-                            session_key=self._session_key_for_source(source),
-                            message_id=str(event.message_id or ""),
-                        )
-                    except Exception as _session_ctx_exc:
-                        logger.warning("PNC group handoff session context setup failed: %s", _session_ctx_exc)
-                    try:
-                        # Run the full handoff (Meegle subprocesses, CIFS
-                        # artifact write, create_task subprocess) off the
-                        # event loop: a single intake can take minutes at
-                        # worst and must not freeze gateway-wide message
-                        # handling.  contextvars (session routing) propagate
-                        # into the worker thread automatically.
-                        _submit_result = await asyncio.to_thread(
-                            _submit_g1q3_rca_status_handoff,
-                            template_id=_pnc_decision.template_id or "",
-                            case_id=str(_handoff.get("case_id") or ""),
-                            requester=str(source.user_id or ""),
-                            source_group_id=str(source.chat_id or ""),
-                            message_id=str(event.message_id or ""),
-                            work_item_id=str(_handoff.get("work_item_id") or ""),
-                            request_text=_g1q3_request_text_with_metadata(event),
-                            receipt_dir=_receipt_dir,
-                        )
-                    finally:
-                        if _session_env_tokens is not None and _clear_session_vars is not None:
-                            try:
-                                _clear_session_vars(_session_env_tokens)
-                            except Exception:
-                                pass
-                    event.metadata["pnc_group_handoff"] = _submit_result
-                    try:
-                        write_pnc_group_handoff_receipt(
-                            receipt_dir=_receipt_dir,
-                            decision=_pnc_decision,
-                            submit_result=_submit_result,
-                            platform=source.platform,
-                            chat_id=source.chat_id,
-                            user_id=source.user_id,
-                            message_id=event.message_id,
-                        )
-                    except Exception as _handoff_receipt_exc:
-                        logger.warning("PNC group handoff receipt write failed: %s", _handoff_receipt_exc)
-                    if not _submit_result.get("success"):
-                        if _dedup_identifier:
-                            _recent.pop(_dedup_key, None)
-                        return (
-                            "G1Q3 RCA 状态查询暂时没有接单成功。\n"
-                            f"原因：{_submit_result.get('error') or '任务提交失败'}\n"
-                            "我已保留这次请求记录，稍后可以按同一问题重试。"
-                        )
-                    _task = _submit_result.get("task") or {}
-                    _task_id = _task.get("task_id") or _task.get("id") or "unknown"
-                    if _dedup_identifier:
-                        _recent[_dedup_key] = (str(_task_id), _now_mono, _dedup_window)
-                    self._record_pnc_handoff_task(
-                        event=event,
-                        source=source,
-                        submit_result=_submit_result,
-                        request_summary=str(event.text or ""),
-                    )
-                    _case_label = str(_handoff.get("case_id") or "").strip()
-                    _issue_label = str(_handoff.get("work_item_id") or "").strip()
-                    if _case_label and not _case_label.upper().startswith("G1Q3"):
-                        _case_label = f"G1Q3-{_case_label}"
-                    _target_label = _case_label or (f"飞书问题 {_issue_label}" if _issue_label else "这个 G1Q3 问题")
-                    if _pnc_decision.template_id == "rca_case_evidence_summary":
-                        _action_line = f"已接单：正在检查 {_target_label} 还缺少哪些 RCA 输入/证据。"
-                        _scope_line = "我会先查已有 intake/产物状态，并把缺项翻译成可补充字段；群里只返回 L0/L1 简要结论。"
-                    elif _pnc_decision.template_id == "rca_case_status_check":
-                        _action_line = f"已接单：正在查询 {_target_label} 的 RCA 进展/结论/报告位置。"
-                        _scope_line = "我会优先读取已有任务和报告产物；群里只返回简要结论，详细证据不直接刷屏。"
-                    else:
-                        _action_line = f"已接单：正在读取并分析 {_target_label}。"
-                        _scope_line = "我会先做问题字段 intake 和现有 RCA 状态检查；群里只返回简要结论，详细证据不直接刷屏。"
-                    # Surface host-side issue preread blockers in the group
-                    # ack so an expired Meegle login reads as "请重新授权",
-                    # never as a PDCL-missing misreport.
-                    _preread_info = _submit_result.get("issue_preread") or {}
-                    _preread_blocker = _preread_info.get("blocker") or {}
-                    _blocker_kind = str(_preread_blocker.get("kind") or "")
-                    if "unauthenticated" in _blocker_kind or str(_preread_info.get("source") or "") == "mcp_auto_degraded":
+                                if _manual_issue_identity is not None
+                                else None
+                            )
+                            return _format_g1q3_kafka_issue_status(
+                                _manual_issue_id, _manual_existing
+                            )
+                        if (
+                            not _manual_authorization.get(
+                                "manual_chat_allowlist_valid"
+                            )
+                            or not _manual_authorization.get("chat_allowed")
+                        ):
+                            return (
+                                "当前群未进入 RCA 人工入口灰度，本次未创建任务。"
+                                "Kafka 自动入口和只读状态查询不受影响。"
+                            )
+                        if not _manual_authorization.get("authorized"):
+                            return "当前账号没有 RCA debug 重跑权限，本次未创建任务。"
+                        _manual_issue_url = str(_handoff.get("issue_url") or "").strip()
+                        _manual_mode = str(_handoff.get("mode") or "").strip()
+                        _manual_message_id = str(event.message_id or "").strip()
+                        _manual_thread_id = str(source.thread_id or "").strip()
+                        if not _manual_thread_id and _manual_message_id:
+                            _manual_thread_id = f"topic:{_manual_message_id}"
                         try:
-                            await self._notify_g1q3_meegle_auth_alert(_preread_info)
-                        except Exception:
-                            logger.warning("Meegle auth alert dispatch failed", exc_info=True)
-                    if "unauthenticated" in _blocker_kind:
-                        _notice_line = (
-                            "\n注意：主控 Meegle 登录已过期/未授权，本次暂未读取到飞书 issue 字段"
-                            "（这不代表 问题数据地址_PDCL 缺失）。请联系运维重新授权 Meegle 后再让我重试。"
+                            _manual_result = await asyncio.to_thread(
+                                _admit_g1q3_manual_trigger,
+                                issue_url=_manual_issue_url,
+                                mode=_manual_mode,
+                                chat_id=str(source.chat_id or ""),
+                                thread_id=_manual_thread_id,
+                                message_id=_manual_message_id,
+                                requester_id=str(source.user_id or ""),
+                                submit_enabled=bool(
+                                    _manual_authorization.get(
+                                        "manual_intake_enabled"
+                                    )
+                                ),
+                                operator_authorized=(
+                                    _manual_mode not in {"rerun", "debug"}
+                                    or bool(
+                                        _manual_authorization.get("debug_enabled")
+                                    )
+                                    and bool(
+                                        _manual_authorization.get("requester_allowed")
+                                    )
+                                ),
+                                operator_rate_limit=int(
+                                    _manual_authorization[
+                                        "manual_operator_rate_limit"
+                                    ]
+                                ),
+                                operator_rate_window_seconds=int(
+                                    _manual_authorization[
+                                        "manual_operator_rate_window_seconds"
+                                    ]
+                                ),
+                                allowed_chat_ids=tuple(
+                                    sorted(_manual_active_chat_ids)
+                                ),
+                                admission_runtime_config=(
+                                    _manual_admission_runtime_config
+                                ),
+                            )
+                        except Exception as _manual_exc:
+                            _manual_code = str(_manual_exc or "manual_intake_failed").strip()
+                            logger.warning(
+                                "PNC RCA manual admission failed closed: %s", _manual_code
+                            )
+                            if _manual_code == "manual_operator_not_authorized":
+                                return "当前账号没有 RCA debug 重跑权限，本次未创建任务。"
+                            if _manual_code == "manual_operator_rate_limited":
+                                return "RCA debug / 重跑操作过于频繁，本次未创建任务；请稍后重试。"
+                            if _manual_code == "manual_late_catchup_unavailable":
+                                return (
+                                    "既有 RCA 结果的当前话题投递状态异常，本次未承诺回帖、"
+                                    "未创建新一代任务；请联系值班人员处理投递隔离。"
+                                )
+                            if _manual_code in {
+                                "manual_active_policy_unavailable",
+                                "manual_active_policy_invalid",
+                            }:
+                                return "RCA 创建策略尚未就绪，本次未创建任务；请稍后重试。"
+                            if _manual_code == "manual_outbox_high_watermark_reached":
+                                return "RCA 当前排队任务已达上限，本次未创建任务；请稍后重试。"
+                            if _manual_code.startswith("manual_control_store_"):
+                                return "RCA 控制面存储容量不足，本次未创建任务；请联系值班人员。"
+                            if _manual_code == "manual_chat_allowlist_invalid":
+                                return "RCA 人工入口灰度配置无效，本次未创建任务。"
+                            if _manual_code.startswith("activation_epoch_rejected_"):
+                                return (
+                                    "RCA 当前处于生产激活保护阶段，本次人工请求未创建任务；"
+                                    "已预授权的发布 canary 或正式 steady 状态恢复后可受理。"
+                                )
+                            if _manual_code.startswith("activation_bounded_"):
+                                return (
+                                    "RCA 当前仅放行精确预授权的发布 canary，本次人工请求未创建任务。"
+                                )
+                            return (
+                                "G1Q3 RCA 人工受理失败并已安全中止，本次没有进入通用 Agent、"
+                                "没有创建 VM 任务。"
+                            )
+                        event.metadata["pnc_manual_rca_admission"] = dict(_manual_result)
+                        return _format_g1q3_manual_admission(_manual_result)
+                    if (
+                        _pnc_decision.route_surface
+                        in {"rca_kafka_issue_status", "rca_kafka_read_only_status"}
+                        or _pnc_decision.template_id
+                        in {"rca_case_status_check", "rca_case_evidence_summary"}
+                    ):
+                        _issue_id = str(_handoff.get("work_item_id") or "").strip()
+                        _case_id = str(_handoff.get("case_id") or "").strip()
+                        _source_task_id = str(_handoff.get("source_task_id") or "").strip()
+                        _issue_identity = _resolve_g1q3_issue_identity(_handoff)
+                        _kafka_task = (
+                            await asyncio.to_thread(
+                                _find_g1q3_rca_task_by_issue_identity,
+                                *_issue_identity,
+                            )
+                            if _issue_identity is not None
+                            else None
                         )
-                    elif _blocker_kind.startswith("issue_field_"):
-                        _gap_action = str((_submit_result.get("field_gap_comment") or {}).get("action") or "")
-                        _gap_suffix = (
-                            "我已在 issue 卡片留言提醒补充。" if _gap_action == "posted"
-                            else "（此前已留言提醒过）" if _gap_action in {"skipped_recent", "skipped_existing"}
-                            else ""
+                        event.metadata["pnc_kafka_rca_status"] = {
+                            "work_item_id": _issue_id,
+                            "case_id": _case_id,
+                            "read_only": True,
+                            "intake": "kafka_workflow_event",
+                            "identity_resolved": _issue_identity is not None,
+                            "found": isinstance(_kafka_task, dict),
+                            "task_id": (
+                                str((_kafka_task or {}).get("task_id") or "")
+                                if isinstance(_kafka_task, dict)
+                                else ""
+                            ),
+                        }
+                        if _issue_id:
+                            event.metadata["pnc_kafka_issue_status"] = {
+                                "work_item_id": _issue_id,
+                                "read_only": True,
+                                "intake": "kafka_workflow_event",
+                                "identity_resolved": _issue_identity is not None,
+                                "found": isinstance(_kafka_task, dict),
+                                "task_id": (
+                                    str((_kafka_task or {}).get("task_id") or "")
+                                    if isinstance(_kafka_task, dict)
+                                    else ""
+                                ),
+                            }
+                        return (
+                            _format_g1q3_kafka_issue_status(_issue_id, _kafka_task)
+                            if _issue_id
+                            else _format_g1q3_kafka_case_status(
+                                _case_id,
+                                source_task_id=_source_task_id,
+                            )
                         )
-                        _notice_line = (
-                            "\n注意：飞书 issue 字段已读取，但 问题数据地址_PDCL 缺失或格式不合法；"
-                            f"请在飞书卡片补充 mdi download 命令后再让我重试。{_gap_suffix}"
-                        )
-                    elif _blocker_kind:
-                        _notice_line = (
-                            "\n注意：主控侧本次未成功读取飞书 issue 字段/评论（issue_preread_blocked），"
-                            "这不代表 问题数据地址_PDCL 缺失；稍后可让我重试。"
-                        )
-                    else:
-                        _notice_line = ""
-                    try:
-                        _sidecar_path = _hermes_home / "task-state" / f"{_task_id}.json"
-                        _sidecar_body = json.loads(_sidecar_path.read_text(encoding="utf-8")) if _sidecar_path.exists() else {}
-                        _task_card = _sidecar_body.get("task_card") if isinstance(_sidecar_body.get("task_card"), dict) else {}
-                        if _task_card:
-                            _task_card["status_line"] = _action_line
-                            _task_card["scope_line"] = _scope_line
-                            _task_card["one_card_policy"] = True
-                            if _notice_line:
-                                _delivery = _task_card.get("delivery") if isinstance(_task_card.get("delivery"), dict) else {}
-                                _boundaries = _delivery.get("boundaries") if isinstance(_delivery.get("boundaries"), list) else []
-                                _clean_notice = _notice_line.strip()
-                                if _clean_notice and _clean_notice not in _boundaries:
-                                    _boundaries.append(_clean_notice)
-                                _delivery["boundaries"] = _boundaries
-                                _task_card["delivery"] = _delivery
-                            _sidecar_body["task_card"] = _task_card
-                            _sidecar_body["updated_at"] = _pnc_feishu_business_now_iso()
-                            _tmp_path = _sidecar_path.with_suffix(_sidecar_path.suffix + ".tmp")
-                            _tmp_path.write_text(json.dumps(_sidecar_body, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
-                            _tmp_path.replace(_sidecar_path)
-                    except Exception:
-                        logger.debug("G1Q3 handoff one-card ack sidecar update failed", exc_info=True)
-                    return ""
+                    return (
+                        "旧群聊旁路不会创建、重跑或直接提交 VM 任务。普通问题链接只查状态；"
+                        "手工运行仅接受固定 RCA 群内真实 @、明确动作和完整问题链接。"
+                    )
 
         # PNC-Agent integration-tools Feishu group intake binding.
         # This group is a business intake surface: group members have default

@@ -1,8 +1,29 @@
 import json
+from pathlib import Path
 
 import pytest
 
 from gateway import pnc_issue_context
+
+
+def test_sanitize_issue_evidence_text_removes_transient_feishu_file_urls_only():
+    issue_url = "https://project.feishu.cn/t03o4q/issue/detail/7008267126"
+    signed_url = (
+        "https://project.feishu.cn/goapi/v5/platform/file/stream/download/"
+        "temporary-token?signature=secret"
+    )
+    text = pnc_issue_context.sanitize_issue_evidence_text(
+        f"issue {issue_url}\n![preview]({signed_url})<!--private-token-->\n"
+        f"附件: [log]({signed_url})\nraw: {signed_url}"
+    )
+
+    assert issue_url in text
+    assert "[image]" in text
+    assert "log [attachment]" in text
+    assert "raw: [attachment]" in text
+    assert "temporary-token" not in text
+    assert "private-token" not in text
+    assert "signature=secret" not in text
 
 
 def test_compact_issue_context_handles_structured_result_and_comments():
@@ -32,6 +53,33 @@ def test_compact_issue_context_handles_structured_result_and_comments():
     assert "数据地址: mdi download event" in context
     assert "根因分析字段: 目标误识别为CBLA法规目标" in context
     assert "已回放\n\n优化后通过 [image]" in context
+
+
+def test_compact_issue_context_does_not_forward_signed_file_capabilities():
+    signed_url = (
+        "https://project.feishu.cn/goapi/v5/platform/file/stream/download/"
+        "temporary-token?signature=secret"
+    )
+    context = pnc_issue_context.compact_g1q3_issue_context(
+        work_item_brief={
+            "work_item_attribute": {
+                "work_item_id": "7008267126",
+                "work_item_name": "G1Q3 case",
+            },
+            "work_item_fields": [
+                {"name": "问题数据地址_PDCL", "value": "mdi event demo-event"},
+                {"name": "描述", "value": f"截图 ![preview]({signed_url})"},
+                {"name": "问题根本原因分析", "value": f"证据 {signed_url}"},
+            ],
+        },
+        comments=[{"content": f"附件 [log]({signed_url})<!--private-->"}],
+    )
+
+    assert context.count("[attachment]") == 2
+    assert "[image]" in context
+    assert "temporary-token" not in context
+    assert "signature=secret" not in context
+    assert "private" not in context
 
 
 def test_compact_issue_context_treats_work_item_id_only_payload_as_empty():
@@ -288,6 +336,76 @@ def test_meegle_unauthenticated_auto_degrades_to_mcp_and_succeeds(monkeypatch):
     assert "mcp_feishu_project_get_workitem_brief" in mcp_calls
 
 
+def test_gateway_tool_forwards_explicit_execution_timeout(monkeypatch):
+    import model_tools
+
+    captured = {}
+
+    def handle(function_name, args, **kwargs):
+        captured.update({
+            "function_name": function_name,
+            "args": args,
+            **kwargs,
+        })
+        return json.dumps({"result": {"ok": True}})
+
+    monkeypatch.setattr(model_tools, "handle_function_call", handle)
+
+    result = pnc_issue_context.call_gateway_tool(
+        "mcp_feishu_project_get_workitem_brief",
+        {"work_item_id": "7015689036"},
+        timeout_seconds=7.5,
+    )
+
+    assert result == {"result": {"ok": True}}
+    assert captured["execution_timeout_seconds"] == 7.5
+
+
+def test_preread_timeout_is_retryable_and_not_field_missing(monkeypatch):
+    monkeypatch.delenv("HERMES_G1Q3_MCP_FALLBACK", raising=False)
+    monkeypatch.delenv("HERMES_G1Q3_MCP_AUTODEGRADE", raising=False)
+
+    def timed_out_meegle(_args):
+        raise TimeoutError("meegle timed out")
+
+    def timed_out_mcp(_name, _args):
+        return {"error": "Tool execution failed: TimeoutError"}
+
+    result = pnc_issue_context.fetch_g1q3_issue_context_result(
+        project_key="t03o4q",
+        work_item_id="7015689036",
+        tool_caller=timed_out_mcp,
+        meegle_runner=timed_out_meegle,
+    )
+
+    assert result.status == "read_failed"
+    assert result.blocker["kind"] == "host_issue_preread_timeout"
+    assert result.blocker["retryable"] is True
+    assert "字段缺失" not in result.blocker["kind"]
+    assert {
+        item["error_class"] for item in result.errors or []
+    } == {"TimeoutError"}
+
+
+def test_expired_total_budget_skips_mcp_boundaries():
+    calls = []
+
+    result = pnc_issue_context.fetch_g1q3_issue_context_result_via_mcp(
+        project_key="t03o4q",
+        work_item_id="7015689036",
+        tool_caller=lambda name, _args: calls.append(name),
+        deadline_monotonic=pnc_issue_context.time.monotonic() - 1,
+    )
+
+    assert calls == []
+    assert result.status == "read_failed"
+    assert result.blocker["kind"] == "host_mcp_preread_timeout"
+    assert [item["tool"] for item in result.errors or []] == [
+        "mcp_feishu_project_get_workitem_brief",
+        "mcp_feishu_project_list_workitem_comments",
+    ]
+
+
 def test_meegle_unauthenticated_with_mcp_also_down_keeps_unauthenticated_blocker(monkeypatch):
     monkeypatch.delenv("HERMES_G1Q3_MCP_FALLBACK", raising=False)
     monkeypatch.delenv("HERMES_G1Q3_MCP_AUTODEGRADE", raising=False)
@@ -428,9 +546,19 @@ def test_meegle_unauthenticated_blocker_message_names_relogin_not_pdcl():
     assert "不代表 问题数据地址_PDCL 缺失" in result.blocker["message"]
 
 
-def test_meegle_success_writes_portable_capture_to_configured_root(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_G1Q3_ISSUE_CAPTURE_ROOT", str(tmp_path / "captures"))
+def test_meegle_success_writes_portable_capture_only_when_explicitly_enabled(monkeypatch):
+    from gateway import pnc_issue_capture
+
+    monkeypatch.setenv("HERMES_G1Q3_ISSUE_CAPTURE_ENABLED", "true")
+    monkeypatch.setenv("HERMES_G1Q3_ISSUE_CAPTURE_ROOT", "/mnt/tmp/rca-capture-test")
     monkeypatch.delenv("HERMES_G1Q3_DISABLE_ISSUE_CAPTURE", raising=False)
+    captured = {}
+
+    def fake_write(payload):
+        captured.update(payload)
+        return pnc_issue_capture.capture_path_for(payload)
+
+    monkeypatch.setattr(pnc_issue_capture, "write_issue_capture", fake_write)
 
     def fake_meegle(args):
         joined = " ".join(args)
@@ -458,8 +586,7 @@ def test_meegle_success_writes_portable_capture_to_configured_root(tmp_path, mon
         tool_caller=lambda *_: (_ for _ in ()).throw(AssertionError("no mcp")),
     )
 
-    capture_path = tmp_path / "captures" / "7015689036" / "issue_capture.json"
-    capture = json.loads(capture_path.read_text(encoding="utf-8"))
+    capture = captured
     assert result.status == "fields_extracted"
     assert capture["schema_version"] == "g1q3_rca_issue_capture_v1"
     assert capture["read_source"] == "meegle"
@@ -471,7 +598,106 @@ def test_meegle_success_writes_portable_capture_to_configured_root(tmp_path, mon
     assert "user_key" not in text
 
 
+def test_meegle_success_does_not_capture_by_default(monkeypatch):
+    from gateway import pnc_issue_capture
+
+    monkeypatch.delenv("HERMES_G1Q3_ISSUE_CAPTURE_ENABLED", raising=False)
+    monkeypatch.delenv("HERMES_G1Q3_ISSUE_CAPTURE_ROOT", raising=False)
+    monkeypatch.setattr(
+        pnc_issue_capture,
+        "write_issue_capture",
+        lambda *_args, **_kwargs: pytest.fail("normal preread must not write capture"),
+    )
+
+    def fake_meegle(args):
+        joined = " ".join(args)
+        if joined.startswith("auth status"):
+            return 0, json.dumps({"authenticated": True}), ""
+        if joined.startswith("workitem get"):
+            return 0, json.dumps({
+                "id": "7015689036",
+                "name": "G1Q3 no implicit capture",
+                "fields": {"问题数据地址_PDCL": "mdi download event -u demo -s ./"},
+            }, ensure_ascii=False), ""
+        if joined.startswith("comment list"):
+            return 0, json.dumps({"comments": []}), ""
+        return 1, "", "unexpected"
+
+    result = pnc_issue_context.fetch_g1q3_issue_context_result(
+        project_key="t03o4q",
+        work_item_id="7015689036",
+        meegle_runner=fake_meegle,
+    )
+
+    assert result.status == "fields_extracted"
+
+
+def test_capture_root_rejects_production_canonical_cases(monkeypatch):
+    from gateway import pnc_issue_capture
+
+    monkeypatch.setenv(
+        "HERMES_G1Q3_ISSUE_CAPTURE_ROOT",
+        "/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases",
+    )
+    with pytest.raises(ValueError, match="must be under /mnt/tmp"):
+        pnc_issue_capture.capture_root()
+
+
+@pytest.mark.parametrize(
+    "configured_root",
+    [
+        None,
+        "relative/task",
+        "/mnt/tmp",
+        "/mnt/tmp/task/../../etc",
+    ],
+)
+def test_capture_root_requires_explicit_task_scoped_mnt_tmp(
+    monkeypatch, configured_root
+):
+    from gateway import pnc_issue_capture
+
+    if configured_root is None:
+        monkeypatch.delenv("HERMES_G1Q3_ISSUE_CAPTURE_ROOT", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_G1Q3_ISSUE_CAPTURE_ROOT", configured_root)
+
+    with pytest.raises(ValueError):
+        pnc_issue_capture.capture_root()
+
+
+def test_capture_root_accepts_only_explicit_mnt_tmp_task_directory(monkeypatch):
+    from gateway import pnc_issue_capture
+
+    monkeypatch.setenv(
+        "HERMES_G1Q3_ISSUE_CAPTURE_ROOT", "/mnt/tmp/rca-diagnostic-task"
+    )
+
+    assert pnc_issue_capture.capture_root() == Path(
+        "/mnt/tmp/rca-diagnostic-task"
+    )
+
+
+def test_capture_disabled_short_circuits_before_payload_or_io(monkeypatch):
+    from gateway import pnc_issue_capture
+
+    monkeypatch.delenv("HERMES_G1Q3_ISSUE_CAPTURE_ENABLED", raising=False)
+    monkeypatch.setattr(
+        pnc_issue_capture,
+        "build_issue_capture",
+        lambda **_kwargs: pytest.fail("disabled capture must not build a payload"),
+    )
+    monkeypatch.setattr(
+        pnc_issue_capture,
+        "write_issue_capture",
+        lambda *_args, **_kwargs: pytest.fail("disabled capture must not write"),
+    )
+
+    assert pnc_issue_capture.maybe_capture_issue_context() == ""
+
+
 def test_capture_failure_never_breaks_issue_preread(monkeypatch):
+    monkeypatch.setenv("HERMES_G1Q3_ISSUE_CAPTURE_ENABLED", "true")
     monkeypatch.setenv("HERMES_G1Q3_ISSUE_CAPTURE_ROOT", "/dev/null/not-a-dir")
 
     def fake_meegle(args):

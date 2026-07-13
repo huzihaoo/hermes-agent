@@ -99,6 +99,34 @@ def get_user_role_by_id(user_id: str) -> Role:
     return cfg["users"].get("default", "member")
 
 
+def service_capability_allows(service_id: str, capability: str) -> bool:
+    """Return whether an explicitly declared service has one exact capability.
+
+    Service grants are separate from human roles and repository ACLs.  There is
+    intentionally no wildcard or role fallback: a missing/malformed entry fails
+    closed and cannot turn a service account into a general VM actor.
+    """
+
+    normalized_service = str(service_id or "").strip()
+    normalized_capability = str(capability or "").strip()
+    if not normalized_service or not normalized_capability:
+        return False
+    cfg = _load_config()
+    service_entries = cfg.get("service_capabilities", {})
+    if not isinstance(service_entries, dict):
+        return False
+    entry = service_entries.get(normalized_service)
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("actor_kind") != "service" or entry.get("enabled") is not True:
+        return False
+    capabilities = entry.get("capabilities", [])
+    if not isinstance(capabilities, (list, tuple, set)):
+        return False
+    exact_grants = {str(item).strip() for item in capabilities if str(item or "").strip()}
+    return normalized_capability in exact_grants
+
+
 def _repo_acl_for_user(cfg: dict, user_name: str) -> dict:
     """Return repo ACL grants for a display name.
 

@@ -31,10 +31,26 @@ def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def check_contract_drift(host_path: Path, vm_path: Path) -> dict[str, Any]:
+def check_contract_drift(
+    host_path: Path,
+    vm_path: Path,
+    *,
+    allow_missing: bool = False,
+) -> dict[str, Any]:
+    """Compare the marked request contract, failing closed by default.
+
+    A missing counterpart is not evidence of parity.  Development diagnostics
+    may opt into the historical skip behavior explicitly, but release gates
+    must use the default.
+    """
     missing = [str(path) for path in (host_path, vm_path) if not path.exists()]
     if missing:
-        return {"ok": True, "status": "skip", "warning": "counterpart_missing", "missing": missing}
+        return {
+            "ok": bool(allow_missing),
+            "status": "skip" if allow_missing else "contract_unverified",
+            "error": "counterpart_missing",
+            "missing": missing,
+        }
 
     try:
         host_text = extract_contract_text(host_path)
@@ -80,10 +96,19 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", type=Path, default=default_host_path())
     parser.add_argument("--vm", type=Path, default=default_vm_path())
+    parser.add_argument(
+        "--allow-missing",
+        action="store_true",
+        help="development-only: report a missing counterpart as a successful skip",
+    )
     parser.add_argument("--json", action="store_true", help="emit JSON result")
     args = parser.parse_args()
 
-    result = check_contract_drift(args.host, args.vm)
+    result = check_contract_drift(
+        args.host,
+        args.vm,
+        allow_missing=args.allow_missing,
+    )
     if args.json:
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     else:

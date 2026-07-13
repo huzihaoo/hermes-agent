@@ -2,7 +2,11 @@ import json
 
 from pathlib import Path
 
-from gateway.pnc_pdcl_contract import classify_invalid_pdcl, parse_pdcl_command
+from gateway.pnc_pdcl_contract import (
+    classify_invalid_pdcl,
+    is_valid_pdcl_download_cmd,
+    parse_pdcl_command,
+)
 from gateway.pnc_rca_schema import (
     RCA_EXECUTION_REQUEST_SCHEMA_VERSION,
     RCA_INTAKE_STATE_SCHEMA_VERSION,
@@ -10,7 +14,6 @@ from gateway.pnc_rca_schema import (
     RcaIssueContext,
     build_execution_request,
     issue_context_from_compact_text,
-    is_valid_pdcl_download_cmd,
     validate_issue_context_fields,
     to_dict,
     to_json,
@@ -101,6 +104,10 @@ def test_unavailable_issue_context_gets_structured_blocker():
 
 
 def test_build_execution_request_has_policy_defaults_and_survives_fields():
+    signed_url = (
+        "https://project.feishu.cn/goapi/v5/platform/file/stream/download/"
+        "temporary-token?signature=secret"
+    )
     ctx = RcaIssueContext(
         project_key="t03o4q",
         work_item_id="7008267126",
@@ -111,8 +118,20 @@ def test_build_execution_request_has_policy_defaults_and_survives_fields():
         project_label="G1Q3",
         frame_id="318153",
         pdcl_download_cmd="mdi download event -u demo -s ./",
-        root_cause_text="目标误识别",
-        description_markdown="compact issue context",
+        root_cause_text=f"目标误识别 {signed_url}",
+        description_markdown=(
+            "compact issue context\n"
+            "- 数据地址: mdi download event -u demo -s ./\n"
+            f"- 证据: {signed_url}<!--private-token-->"
+        ),
+        comments_timeline=[
+            {
+                "text": (
+                    "copied: mdi download event -u demo -s ./ "
+                    f"attachment={signed_url}"
+                )
+            }
+        ],
         source_quality="partial",
     )
 
@@ -131,14 +150,37 @@ def test_build_execution_request_has_policy_defaults_and_survives_fields():
     assert payload["schema_version"] == RCA_EXECUTION_REQUEST_SCHEMA_VERSION
     assert payload["work_item"]["work_item_id"] == "7008267126"
     assert payload["case"]["frame_id"] == "318153"
-    assert payload["data"]["pdcl_download_cmd"].startswith("mdi download")
+    assert "pdcl_download_cmd" not in payload["data"]
+    assert payload["data"]["data_access"]["references"] == [
+        {
+            "event_uuid": "demo",
+            "kind": "event",
+            "reader_class": "RemoteEventReader",
+        }
+    ]
+    assert payload["data"]["data_access"]["reader_contract"] == {
+        "completeness": "full_requested_scope",
+        "distribution": "pdcl_pyclip",
+        "fallback": "forbidden",
+        "mdi_download_allowed": False,
+        "required_version": "0.1.6+rca.2",
+    }
     assert payload["evidence"]["source_quality"] == "partial"
+    assert "mdi download" not in json.dumps(payload["evidence"], ensure_ascii=False)
+    assert "[remote data reference redacted]" in payload["evidence"]["description_markdown"]
+    assert "[attachment]" in json.dumps(payload["evidence"], ensure_ascii=False)
+    assert "temporary-token" not in json.dumps(payload, ensure_ascii=False)
+    assert "private-token" not in json.dumps(payload, ensure_ascii=False)
+    assert "signature=secret" not in json.dumps(payload, ensure_ascii=False)
     assert payload["execution_policy"] == {
         "allow_download": False,
         "allow_feishu_writeback": False,
         "artifact_root": "/mnt/tmp/g1q3_rca_issue_intake_7008267126/",
+        "data_access_mode": "remote_read",
+        "derived_artifacts_allowed": True,
         "group_response_cap": "L1",
-        "mode": "readonly_status_first",
+        "input_materialization": "forbidden",
+        "mode": "remote_read",
         "translate_baseline": "production",
         "translate_contract_path": "",
     }
@@ -147,7 +189,11 @@ def test_build_execution_request_has_policy_defaults_and_survives_fields():
 
 
 def test_build_execution_request_carries_translate_baseline_candidate():
-    ctx = RcaIssueContext(work_item_id="7026690721", source_quality="partial")
+    ctx = RcaIssueContext(
+        work_item_id="7026690721",
+        source_quality="partial",
+        pdcl_download_cmd="mdi download clip -u clip-7026690721 -s ./",
+    )
     request = build_execution_request(
         request_kind="issue_intake",
         task_id="g1q3_rca_issue_intake_7026690721",
@@ -173,11 +219,11 @@ def test_validate_issue_context_fields_distinguishes_missing_and_invalid_pdcl():
     )
 
     assert missing_ctx.is_pdcl_format is False
-    assert missing_blocker["kind"] == "issue_field_missing_pdcl_download_cmd"
+    assert missing_blocker["kind"] == "issue_field_missing_remote_data_reference"
     assert missing_blocker["sub_kind"] == "empty"
     assert invalid_ctx.is_pdcl_format is False
-    assert invalid_blocker["kind"] == "issue_field_invalid_pdcl_download_cmd"
-    assert invalid_blocker["sub_kind"] == "bad_mdi_form"
+    assert invalid_blocker["kind"] == "issue_field_invalid_remote_data_reference"
+    assert invalid_blocker["sub_kind"] == "remote_data_reference_invalid"
     assert valid_ctx.is_pdcl_format is True
     assert valid_blocker is None
     assert is_valid_pdcl_download_cmd("mdi download clip -u abc -s ./") is True

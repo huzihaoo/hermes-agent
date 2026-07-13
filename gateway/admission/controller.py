@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -9,7 +10,7 @@ import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Tuple
+from typing import Any, Tuple
 
 from .alerts import AlertManager, ErrorRateAlert, QueueDepthAlert
 from .audit import AuditEvent, log_audit
@@ -20,6 +21,8 @@ from .types import (
 )
 
 logger = logging.getLogger(__name__)
+
+_MAX_DURABLE_EVENT_CONTEXT_BYTES = 128 * 1024
 
 # Priority by role
 _ROLE_PRIORITY = {
@@ -97,6 +100,19 @@ def _resolve_domain_id(
     return user_id
 
 
+def deterministic_transport_item_id(
+    platform: str,
+    request_message_id: str,
+) -> str:
+    """Return the stable queue ID for a transport message."""
+    return str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"hermes-admission-v1:{platform}:{request_message_id}",
+        )
+    )
+
+
 class AdmissionController:
     """Coordinates permission checks, queue admission, audit, rate-limit, and retry."""
 
@@ -116,7 +132,13 @@ class AdmissionController:
         self.queue = AdmissionQueue(db_path=self._db_path)
         try:
             self.queue.load()
-            logger.info("[admission] Loaded queue from %s", self._db_path)
+            if self.queue.persistence_healthy:
+                logger.info("[admission] Loaded queue from %s", self._db_path)
+            else:
+                logger.error(
+                    "[admission] Queue persistence is unhealthy after load: %s",
+                    self.queue.persistence_errors,
+                )
         except Exception as exc:
             logger.warning("[admission] Failed to load persisted queue: %s", exc)
 
@@ -223,13 +245,49 @@ class AdmissionController:
         request_message_id: str | None = None,
         platform: str | None = None,
         vm_id: str | None = None,
+        event_context: dict[str, Any] | None = None,
+        require_durable_persistence: bool = False,
     ) -> Tuple[bool, str, QueueItem | None]:
         """Check permission, rate-limit, and enqueue.
 
         Returns (admitted, feedback_message, queue_item).
         """
-        # Rate limit check
-        if not self._check_rate_limit(user_id):
+        # A controller that observed unreadable persisted state must not admit or
+        # consume more work: a later snapshot save could otherwise delete rows
+        # that were intentionally skipped during recovery.
+        self.queue.require_persistence_healthy()
+
+        if require_durable_persistence and event_context is not None:
+            try:
+                encoded_context = json.dumps(
+                    event_context,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            except (TypeError, ValueError) as exc:
+                raise ValueError("durable event_context must be JSON serializable") from exc
+            if len(encoded_context) > _MAX_DURABLE_EVENT_CONTEXT_BYTES:
+                raise ValueError("durable event_context exceeds 128 KiB")
+
+        item_id = (
+            deterministic_transport_item_id(platform, request_message_id)
+            if platform and request_message_id
+            else str(uuid.uuid4())
+        )
+        existing = self.queue.get_item(item_id)
+        if existing and existing.status in {"queued", "processing", "completed"}:
+            if (
+                existing.user_id != user_id
+                or existing.chat_id != chat_id
+                or existing.platform != platform
+            ):
+                raise ValueError("admission request identity conflict")
+            return (True, "请求已在队列中", existing)
+
+        # A dead/failed deterministic item represents redelivery of the same
+        # transport event. Do not rate-limit recovery of work we already accepted.
+        is_redelivery = existing is not None
+        if not is_redelivery and not self._check_rate_limit(user_id):
             with self._metrics_lock:
                 self._metrics["total_rejected"] += 1
             self._audit("rate_limit", "", "denied", {
@@ -239,8 +297,6 @@ class AdmissionController:
             })
             return (False, f"请求过于频繁，请 {self._rate_window} 秒后再试", None)
 
-        self._record_request(user_id)
-
         role = _resolve_role(user_id)
         lane = _classify_lane(message)
         priority = _ROLE_PRIORITY.get(role, 10)
@@ -248,7 +304,7 @@ class AdmissionController:
         domain_id = _resolve_domain_id(domain, user_id, chat_id=chat_id, vm_id=vm_id)
 
         item = QueueItem(
-            id=str(uuid.uuid4()),
+            id=item_id,
             user_id=user_id,
             user_role=role,
             message=message,
@@ -261,12 +317,21 @@ class AdmissionController:
             thread_id=thread_id,
             request_message_id=request_message_id,
             platform=platform,
+            event_context=event_context,
         )
 
-        self.queue.enqueue(item)
+        if require_durable_persistence:
+            self.queue.enqueue_persisted(item)
+        else:
+            self.queue.enqueue(item)
         with self._metrics_lock:
             self._metrics["total_admitted"] += 1
-        self._save_quiet()
+        if not is_redelivery:
+            self._record_request(user_id)
+        if require_durable_persistence:
+            self._save_metrics_quiet()
+        else:
+            self._save_quiet()
 
         pos = self.queue.get_position(item.id)
         pos_text = f"，排队 {pos[1]} 位" if pos and pos[1] > 1 else ""
@@ -285,42 +350,74 @@ class AdmissionController:
         domain_label = {"user": "私聊", "group": "群聊", "vm": "VM"}[domain]
         return (True, f"已加入 {domain_label}/{lane} 队列{pos_text}", item)
 
+    def get_transport_item(
+        self,
+        platform: str,
+        request_message_id: str,
+    ) -> QueueItem | None:
+        """Return the queue record that owns a transport message, if any."""
+        if not platform or not request_message_id:
+            return None
+        self.queue.require_persistence_healthy()
+        return self.queue.get_item(
+            deterministic_transport_item_id(platform, request_message_id)
+        )
+
     def dequeue_next(
         self,
         lane: Lane,
         domain: Domain | None = None,
         domain_id: str | None = None,
     ) -> QueueItem | None:
-        item = self.queue.dequeue(lane, domain=domain, domain_id=domain_id)
+        item = self.queue.dequeue_persisted(
+            lane,
+            domain=domain,
+            domain_id=domain_id,
+        )
         if item:
             self._audit("dequeue", item.id, "allowed", {
                 "lane": lane,
                 "domain": item.domain,
                 "user_id": item.user_id,
             })
-            self._save_quiet()
         return item
 
     def complete(self, item_id: str, result: dict | None = None) -> None:
-        self.queue.mark_completed(item_id, result)
+        def mark_completed(item: QueueItem) -> None:
+            item.status = "completed"
+            item.result = result
+            item.completed_at = datetime.now()
+
+        self.queue.update_persisted(item_id, mark_completed)
         self._audit("complete", item_id, "completed", result)
-        self._save_quiet()
         with self._metrics_lock:
             self._metrics["total_completed"] += 1
+        self._save_metrics_quiet()
 
     def fail(self, item_id: str, error: str | None = None) -> None:
         """Mark item as failed. If retries remain, re-enqueue with backoff."""
-        item = self.queue.get_item(item_id)
-        if item and item.retry_count < item.max_retries:
-            # Re-enqueue with exponential backoff
-            item.retry_count += 1
+        transition: dict[str, Any] = {}
+
+        def mark_retry_or_dead(item: QueueItem) -> None:
+            if item.retry_count < item.max_retries:
+                item.retry_count += 1
+                item.last_error = error
+                delay = DEFAULT_RETRY_BASE_DELAY * (2 ** (item.retry_count - 1))
+                item.next_retry_at = datetime.now() + timedelta(seconds=delay)
+                item.status = "queued"
+                item.started_at = None
+                item.completed_at = None
+                transition.update(status="queued", delay=delay)
+                return
             item.last_error = error
-            delay = DEFAULT_RETRY_BASE_DELAY * (2 ** (item.retry_count - 1))
-            item.next_retry_at = datetime.now() + timedelta(seconds=delay)
-            item.status = "queued"
-            item.started_at = None
-            item.completed_at = None
-            self.queue.enqueue(item)
+            item.status = "dead"
+            item.result = {"error": error} if error else None
+            item.completed_at = datetime.now()
+            transition.update(status="dead")
+
+        item = self.queue.update_persisted(item_id, mark_retry_or_dead)
+        if item and transition.get("status") == "queued":
+            delay = float(transition["delay"])
             with self._metrics_lock:
                 self._metrics["total_retried"] += 1
             self._audit("retry", item_id, "queued", {
@@ -334,30 +431,24 @@ class AdmissionController:
                 "[admission] Retry %d/%d for %s (delay=%.1fs): %s",
                 item.retry_count, item.max_retries, item_id, delay, error,
             )
+        elif item and transition.get("status") == "dead":
+            with self._metrics_lock:
+                self._metrics["total_dead"] += 1
+            self._audit("dead_letter", item_id, "failed", {
+                "error": error,
+                "retry_count": item.retry_count,
+                "user_id": item.user_id,
+            })
+            logger.warning(
+                "[admission] Dead-lettered %s after %d retries: %s",
+                item_id, item.retry_count, error,
+            )
         else:
-            # Exhausted retries → dead letter
-            if item:
-                item.last_error = error
-            self.queue.mark_failed(item_id, error)
-            if item and item.retry_count >= item.max_retries:
-                item.status = "dead"
-                with self._metrics_lock:
-                    self._metrics["total_dead"] += 1
-                self._audit("dead_letter", item_id, "failed", {
-                    "error": error,
-                    "retry_count": item.retry_count if item else 0,
-                    "user_id": item.user_id if item else "",
-                })
-                logger.warning(
-                    "[admission] Dead-lettered %s after %d retries: %s",
-                    item_id, item.retry_count, error,
-                )
-            else:
-                with self._metrics_lock:
-                    self._metrics["total_failed"] += 1
-                self._audit("fail", item_id, "failed", {"error": error})
+            with self._metrics_lock:
+                self._metrics["total_failed"] += 1
+            self._audit("fail", item_id, "failed", {"error": error})
 
-        self._save_quiet()
+        self._save_metrics_quiet()
 
     # ------------------------------------------------------------------
     # Queue visibility
@@ -406,6 +497,7 @@ class AdmissionController:
                 status[d] = d_status
 
         status["metrics"] = self._metrics.copy()
+        status["persistence"] = self.queue.persistence_status()
         return status
 
     def format_status_text(self, domain: Domain | None = None,
@@ -511,7 +603,15 @@ class AdmissionController:
     def _save_quiet(self) -> None:
         try:
             self.queue.save()
+        except Exception as exc:
+            logger.error("[admission] Queue save failed: %s", exc)
+            return
+        self._save_metrics_quiet()
+
+    def _save_metrics_quiet(self) -> None:
+        try:
             from .persistence import save_metrics
+
             save_metrics(self._db_path, self._metrics)
         except Exception as exc:
-            logger.warning("[admission] Save failed: %s", exc)
+            logger.warning("[admission] Metrics save failed: %s", exc)

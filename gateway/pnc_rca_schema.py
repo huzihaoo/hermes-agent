@@ -5,15 +5,20 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field, is_dataclass, replace as dataclass_replace
 from datetime import datetime, timezone
 import json
+import re
 from typing import Any, Literal
 
-from gateway.pnc_pdcl_contract import classify_invalid_pdcl, is_valid_pdcl_download_cmd
+from gateway.pnc_rca_data_access import (
+    RemoteDataAccessError,
+    build_blocked_remote_data_access,
+    build_remote_data_access,
+)
 
 
 # === RCA_REQUEST_CONTRACT:BEGIN (do not edit between markers without updating host copy) ===
 RCA_ISSUE_CONTEXT_SCHEMA_VERSION = "pnc_rca_issue_context_v1"
 RCA_INTAKE_STATE_SCHEMA_VERSION = "pnc_rca_intake_state_v1"
-RCA_EXECUTION_REQUEST_SCHEMA_VERSION = "g1q3_rca_execution_request_v1"
+RCA_EXECUTION_REQUEST_SCHEMA_VERSION = "g1q3_rca_execution_request_v2"
 RCA_EXECUTION_RESULT_SCHEMA_VERSION = "g1q3_rca_execution_result_v1"
 RCA_TOOLCHAIN_FINGERPRINT_SCHEMA_VERSION = "g1q3_rca_toolchain_v1"
 
@@ -54,22 +59,23 @@ def validate_issue_context_fields(issue_context: RcaIssueContext) -> tuple[RcaIs
     """
     if issue_context.source_quality == "unavailable":
         return issue_context, None
-    pdcl_cmd = _sanitize_string(issue_context.pdcl_download_cmd)
-    if not pdcl_cmd:
+    source_value = _sanitize_string(issue_context.pdcl_download_cmd)
+    if not source_value:
         return dataclasses_replace(issue_context, is_pdcl_format=False), {
-            "kind": "issue_field_missing_pdcl_download_cmd",
+            "kind": "issue_field_missing_remote_data_reference",
             "sub_kind": "empty",
             "field": "问题数据地址_PDCL",
-            "message": "主控已读取问题卡片，但未提取到 问题数据地址_PDCL 下载命令",
+            "message": "主控已读取问题卡片，但未提取到可远程读取的 event/clip 数据引用",
             "retryable": True,
         }
-    if not is_valid_pdcl_download_cmd(pdcl_cmd):
-        sub_kind = classify_invalid_pdcl(pdcl_cmd)
+    try:
+        build_remote_data_access(source_value)
+    except RemoteDataAccessError as exc:
         return dataclasses_replace(issue_context, is_pdcl_format=False), {
-            "kind": "issue_field_invalid_pdcl_download_cmd",
-            "sub_kind": sub_kind,
+            "kind": "issue_field_invalid_remote_data_reference",
+            "sub_kind": exc.code,
             "field": "问题数据地址_PDCL",
-            "message": "主控已读取问题卡片，但 问题数据地址_PDCL 不是受支持的只读 MDI 下载命令（支持 mdi refresh -t/-e 与 mdi download <res> -u）",
+            "message": "主控已读取问题卡片，但 问题数据地址_PDCL 无法解析为 RemoteEventReader/RemoteClipReader 引用",
             "retryable": True,
         }
     return dataclasses_replace(issue_context, is_pdcl_format=True), None
@@ -124,6 +130,16 @@ class RcaExecutionResult:
 
 def _sanitize_string(value: str, *, limit: int | None = None) -> str:
     text = str(value or "").replace("\r\n", "\n").strip()
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+    text = re.sub(
+        r"https?://(?:[a-z0-9-]+\.)*(?:feishu\.cn|larksuite\.com)"
+        r"/[^\s<>\"'\])]*?(?:/file/(?:stream/)?(?:download|preview)|"
+        r"/attachment/(?:stream/)?(?:download|preview))"
+        r"[^\s<>\"'\])]*",
+        "[attachment]",
+        text,
+        flags=re.IGNORECASE,
+    )
     if limit is not None and len(text) > limit:
         return text[:limit].rstrip() + "..."
     return text
@@ -142,6 +158,25 @@ def _sanitize_mapping(value: Any) -> Any:
         return sanitized
     if isinstance(value, list):
         return [_sanitize_mapping(item) for item in value]
+    if isinstance(value, str):
+        return _sanitize_string(value)
+    return value
+
+
+def _redact_remote_source_value(value: Any, source_value: str) -> Any:
+    """Remove the legacy address envelope from every VM-bound evidence field."""
+    source = str(source_value or "").strip()
+    if not source:
+        return value
+    if isinstance(value, str):
+        return value.replace(source, "[remote data reference redacted]")
+    if isinstance(value, dict):
+        return {
+            str(key): _redact_remote_source_value(item, source)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_remote_source_value(item, source) for item in value]
     return value
 
 
@@ -218,6 +253,16 @@ def build_execution_request(
     toolchain: dict[str, Any] | None = None,
 ) -> RcaExecutionRequest:
     """Build the fixed VM execution request contract from host intake context."""
+    if allow_download:
+        raise ValueError("MDI download is forbidden by the RCA remote-read contract")
+    try:
+        data_access = build_remote_data_access(issue_context.pdcl_download_cmd)
+    except RemoteDataAccessError as exc:
+        if not issue_context.blockers:
+            raise
+        data_access = build_blocked_remote_data_access(
+            issue_context.pdcl_download_cmd, exc
+        )
     case_id = issue_context.case_id or ""
     return RcaExecutionRequest(
         request_kind=request_kind,
@@ -238,22 +283,28 @@ def build_execution_request(
             "project_label": issue_context.project_label,
         },
         data={
-            "pdcl_download_cmd": issue_context.pdcl_download_cmd,
-            "is_pdcl_format": issue_context.is_pdcl_format,
+            "data_access": data_access,
             "artifact_root": artifact_root,
             "artifact_cifs_root": artifact_cifs_root,
         },
-        evidence={
+        evidence=_redact_remote_source_value({
             "source_quality": issue_context.source_quality,
             "root_cause_text": issue_context.root_cause_text,
             "description_markdown": issue_context.description_markdown,
             "comments_timeline": issue_context.comments_timeline,
             "media_refs": issue_context.media_refs,
             "blockers": issue_context.blockers,
-        },
+        }, issue_context.pdcl_download_cmd),
         execution_policy={
-            "mode": "materialize_when_allowed" if allow_download else "readonly_status_first",
-            "allow_download": bool(allow_download),
+            "mode": (
+                "remote_read"
+                if data_access.get("status") != "blocked"
+                else "remote_read_blocked"
+            ),
+            "data_access_mode": "remote_read",
+            "allow_download": False,
+            "input_materialization": "forbidden",
+            "derived_artifacts_allowed": True,
             "allow_feishu_writeback": bool(allow_feishu_writeback),
             "group_response_cap": group_response_cap,
             "artifact_root": artifact_root,

@@ -36,26 +36,26 @@ def test_contract_drift_guard_reports_contract_drift(tmp_path):
     assert result["host_sha256"] != result["vm_sha256"]
 
 
-def test_contract_drift_guard_warn_skips_when_counterpart_missing(tmp_path):
+def test_contract_drift_guard_fails_closed_when_counterpart_missing(tmp_path):
     host = tmp_path / "host.py"
     vm = tmp_path / "missing.py"
     _write_contract(host, "VALUE = 1\n")
 
     result = check_contract_drift(host, vm)
 
-    assert result["ok"] is True
-    assert result["status"] == "skip"
-    assert result["warning"] == "counterpart_missing"
+    assert result["ok"] is False
+    assert result["status"] == "contract_unverified"
+    assert result["error"] == "counterpart_missing"
 
 
-def test_contract_drift_guard_tracked_host_copy_degrades_when_vm_mount_missing(tmp_path):
+def test_contract_drift_guard_can_explicitly_allow_missing_for_development(tmp_path):
     host = default_host_path()
     vm = tmp_path / "missing" / "rca_request_contract.py"
 
     assert host.is_file()
-    result = check_contract_drift(host, vm)
+    result = check_contract_drift(host, vm, allow_missing=True)
 
     assert result["ok"] is True
     assert result["status"] == "skip"
-    assert result["warning"] == "counterpart_missing"
+    assert result["error"] == "counterpart_missing"
     assert result["missing"] == [str(vm)]

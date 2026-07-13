@@ -6,6 +6,7 @@ the main group chat.
 
 Covers: #6969, #9916, #7355
 """
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 from types import SimpleNamespace
 
@@ -195,6 +196,10 @@ class TestFeishuFallbackThreadRouting:
 
         # Use the real implementation path
         adapter._client = mock_client
+        adapter._record_only_outbound_result = MagicMock(return_value=None)
+        adapter._message_idempotency_uuid = FeishuAdapter._message_idempotency_uuid
+        adapter._resolve_reply_target = FeishuAdapter._resolve_reply_target.__get__(adapter)
+        adapter._topic_anchor_from_thread_id = FeishuAdapter._topic_anchor_from_thread_id
         adapter._build_create_message_body = FeishuAdapter._build_create_message_body
         adapter._build_create_message_request = FeishuAdapter._build_create_message_request
         # _send_raw_message routes blocking SDK calls through _run_blocking
@@ -254,6 +259,10 @@ class TestFeishuFallbackThreadRouting:
 
         adapter = MagicMock(spec=FeishuAdapter)
         adapter._client = mock_client
+        adapter._record_only_outbound_result = MagicMock(return_value=None)
+        adapter._message_idempotency_uuid = FeishuAdapter._message_idempotency_uuid
+        adapter._resolve_reply_target = FeishuAdapter._resolve_reply_target.__get__(adapter)
+        adapter._topic_anchor_from_thread_id = FeishuAdapter._topic_anchor_from_thread_id
         adapter._build_create_message_body = FeishuAdapter._build_create_message_body
         adapter._build_create_message_request = FeishuAdapter._build_create_message_request
         async def _run_blocking_passthrough(func, *args):
@@ -271,3 +280,50 @@ class TestFeishuFallbackThreadRouting:
         )
 
         mock_client.im.v1.message.create.assert_called_once()
+
+    def test_idempotency_uuid_rejects_unsafe_or_oversized_values(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        assert FeishuAdapter._message_idempotency_uuid(
+            {"idempotency_uuid": "rca-effect:123"}
+        ) == "rca-effect:123"
+        with pytest.raises(ValueError, match="idempotency_uuid"):
+            FeishuAdapter._message_idempotency_uuid(
+                {"idempotency_uuid": "contains whitespace"}
+            )
+        with pytest.raises(ValueError, match="idempotency_uuid"):
+            FeishuAdapter._message_idempotency_uuid(
+                {"idempotency_uuid": "x" * 51}
+            )
+
+    @pytest.mark.asyncio
+    async def test_transport_retry_reuses_one_idempotency_uuid(self, monkeypatch):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = object.__new__(FeishuAdapter)
+        observed = []
+
+        async def fake_send_raw_message(**kwargs):
+            observed.append(kwargs["metadata"]["idempotency_uuid"])
+            if len(observed) == 1:
+                raise RuntimeError("temporary network failure")
+            return SimpleNamespace(success=lambda: True)
+
+        async def no_sleep(_seconds):
+            return None
+
+        adapter._send_raw_message = fake_send_raw_message
+        monkeypatch.setattr(asyncio, "sleep", no_sleep)
+
+        response = await FeishuAdapter._feishu_send_with_retry(
+            adapter,
+            chat_id="oc_main_chat",
+            msg_type="text",
+            payload='{"text":"hello"}',
+            reply_to=None,
+            metadata={"thread_id": "topic:om_root"},
+        )
+
+        assert response.success() is True
+        assert len(observed) == 2
+        assert observed[0] == observed[1]

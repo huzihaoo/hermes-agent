@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>local.pnc.completion-notice-relay</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/songying/.hermes/runtime/hermes-live/.venv/bin/python</string>
+    <string>/Users/songying/.hermes/runtime/hermes-live/scripts/pnc_completion_notice_relay.py</string>
+    <string>--send</string>
+    <string>--watch</string>
+    <string>--limit</string>
+    <string>50</string>
+    <string>--retry-failed-after</string>
+    <string>600</string>
+    <string>--max-attempts</string>
+    <string>3</string>
+    <string>--watch-canary-loops</string>
+    <string>3</string>
+    <string>--max-card-fallbacks-per-loop</string>
+    <string>0</string>
+    <string>--json</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/songying/.hermes/runtime/hermes-live</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HERMES_HOME</key>
+    <string>/Users/songying/.hermes</string>
+    <key>PATH</key>
+    <string>/Users/songying/.hermes/runtime/hermes-live/.venv/bin:/Users/songying/.local/bin:/Users/songying/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PNC_RELAY_WATCH_CANARY_LOOPS</key>
+    <string>3</string>
+    <key>PNC_COMPLETION_NOTICE_RELAY_HEALTH_PATH</key>
+    <string>/Users/songying/.hermes/runtime/pnc_agent/feishu_issue_kafka_rca/completion_notice_relay_health.json</string>
+    <key>PNC_TASK_CARD_MAX_FALLBACKS_PER_LOOP</key>
+    <string>0</string>
+    <key>PYTHONNOUSERSITE</key>
+    <string>1</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+    <key>VIRTUAL_ENV</key>
+    <string>/Users/songying/.hermes/runtime/hermes-live/.venv</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>ExitTimeOut</key>
+  <integer>30</integer>
+  <key>Umask</key>
+  <integer>63</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/songying/.hermes/logs/pnc-completion-notice-relay.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/songying/.hermes/logs/pnc-completion-notice-relay.error.log</string>
+</dict>
+</plist>

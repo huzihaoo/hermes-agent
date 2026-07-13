@@ -50,8 +50,16 @@ from scripts.pnc_g1q3_truth import (  # noqa: E402
     parsed_l2_assets_present,
     reconcile_report_truth,
 )
-from scripts.pnc_status_projection import derive_presentation, sanitize_milestones  # noqa: E402
+from scripts.pnc_status_projection import (  # noqa: E402
+    REMOTE_REFERENCE_GUIDANCE,
+    derive_presentation,
+    sanitize_milestones,
+)
 from scripts import pnc_fault_taxonomy  # noqa: E402
+from scripts.pnc_aux_runtime_health import (  # noqa: E402
+    build_process_runtime_evidence,
+    write_owner_health,
+)
 
 
 def _reload_env_for_current_mode() -> None:
@@ -87,6 +95,21 @@ def _now_epoch() -> float:
     return time.time()
 
 
+REMOTE_REFERENCE_COMPATIBILITY_NOTE = (
+    "问题数据地址中的历史 MDI 形状仅用于提取 event/clip 引用；"
+    "系统远程读取数据，不执行 MDI 下载。"
+)
+RCA_EXECUTION_REQUEST_JSON_BEGIN = (
+    "<!-- G1Q3_RCA_EXECUTION_REQUEST_JSON:BEGIN -->"
+)
+RCA_EXECUTION_REQUEST_JSON_END = "<!-- G1Q3_RCA_EXECUTION_REQUEST_JSON:END -->"
+RCA_LEGACY_EXECUTION_REQUEST_HEADING = "## RcaExecutionRequest JSON"
+RCA_GOAL_MAX_BYTES = 4 * 1024 * 1024
+RCA_EXECUTION_REQUEST_MAX_BYTES = 2 * 1024 * 1024
+LEGACY_MDI_COMMAND_RE = re.compile(
+    r"\bmdi\s+(?:download|refresh2?|clip|event)\b", re.I
+)
+
 DEFAULT_MAX_ATTEMPTS = int(os.getenv("PNC_COMPLETION_NOTICE_MAX_ATTEMPTS", "3") or "3")
 FAILED_ALERT_PREFIX = "[PNC completion notice relay 告警]"
 DEFAULT_WATCH_POLL_SECONDS = float(os.getenv("PNC_COMPLETION_NOTICE_WATCH_POLL_SECONDS", "1") or "1")
@@ -97,6 +120,8 @@ DEFAULT_CARD_UPDATE_THROTTLE_SECONDS = float(os.getenv("PNC_TASK_CARD_UPDATE_THR
 # recovery by setting PNC_TASK_CARD_MAX_FALLBACKS_PER_LOOP > 0.
 DEFAULT_MAX_CARD_FALLBACKS_PER_LOOP = max(0, int(os.getenv("PNC_TASK_CARD_MAX_FALLBACKS_PER_LOOP", "0") or "0"))
 DEFAULT_WATCH_CANARY_LOOPS = max(0, int(os.getenv("PNC_RELAY_WATCH_CANARY_LOOPS", "3") or "3"))
+COMPLETION_RELAY_HEALTH_SCHEMA_VERSION = "pnc_completion_notice_relay_health_v1"
+COMPLETION_RELAY_SERVICE_LABEL = "local.pnc.completion-notice-relay"
 # Full-scan pre-filter: skip _load_json on sidecars whose mtime is older than this
 # act-window (7d, aligned with the archive threshold). Never below retry window +
 # margin, so a file the relay could still retry is never dropped.
@@ -624,6 +649,40 @@ def _first_text(*values: Any, limit: int = 220) -> str:
     return ""
 
 
+def _remote_read_user_text(value: Any, *, limit: int = 300) -> str:
+    """Translate historical download-era wording at the user-facing boundary."""
+    raw = str(value or "")
+    text = _safe_delivery_text(value, limit=limit)
+    if not text:
+        return ""
+    if LEGACY_MDI_COMMAND_RE.search(raw) or (
+        "pdcl" in raw.lower()
+        and re.search(r"补充|缺失|无效|missing|invalid|(?:下载)?命令", raw, re.I)
+    ):
+        return REMOTE_REFERENCE_COMPATIBILITY_NOTE[:limit]
+    if "不执行 MDI 下载" in raw:
+        return _compact_text(raw, limit=limit)
+    replacements = (
+        ("正在自动下载/解析", "正在远程读取/解析"),
+        ("自动下载/数据管线", "远程读取/数据处理链路"),
+        ("数据下载执行中", "远程读取问题数据中"),
+        ("数据已下载", "问题数据已通过远程读取取得"),
+        ("继续下载/解析", "继续远程读取/解析"),
+        ("待下载/解析", "待远程读取/解析"),
+        ("等待自动下载", "等待远程读取"),
+    )
+    normalized = text
+    for old, new in replacements:
+        normalized = normalized.replace(old, new)
+    normalized = re.sub(r"\bready_to_download\b", "待远程读取", normalized, flags=re.I)
+    normalized = re.sub(r"\brequires_download\b", "需要远程读取", normalized, flags=re.I)
+    normalized = re.sub(r"\bneed_download\b", "待补充远程引用/证据", normalized, flags=re.I)
+    normalized = re.sub(r"\bdownloading\b|\bdownload\b", "远程读取", normalized, flags=re.I)
+    if normalized != text and "不执行 MDI 下载" not in normalized:
+        normalized = normalized.rstrip("。； ") + "（远程读取模式，不执行 MDI 下载）。"
+    return _compact_text(normalized, limit=limit)
+
+
 def _nested_get(data: Any, *paths: str) -> Any:
     for path in paths:
         current = data
@@ -837,6 +896,8 @@ def _shared_result_report_ready(task_id: str) -> dict[str, Any]:
     if not (html_verified or viz_verified):
         return {}
     execution_request = _load_execution_request_from_goal(task_id)
+    remote_input = _remote_input_summary(execution_request)
+    legacy_input = _legacy_remote_input_summary(execution_request)
     return {
         "terminal_state": terminal or "report_ready",
         "pipeline_status": pipeline_status,
@@ -847,7 +908,7 @@ def _shared_result_report_ready(task_id: str) -> dict[str, Any]:
         "high_confidence_boundary": str(observation.get("high_confidence_boundary") or "").strip(),
         "candidate_owner_domain": observation.get("candidate_owner_domain"),
         "input_display": _compact_input_label(execution_request),
-        "input_resolved": str(_nested_get(execution_request, "data.pdcl_download_cmd") or "").strip(),
+        "input_resolved": remote_input or legacy_input,
         "artifact_root_vm": str(artifacts.get("artifact_root_vm") or "").strip(),
         "artifact_root_cifs": str(artifacts.get("artifact_root_cifs") or "").strip(),
         "case_dir_vm": str(artifacts.get("case_dir_vm") or "").strip(),
@@ -1119,25 +1180,89 @@ def _read_shared_log_tail(task_id: str, *, max_chars: int = 220_000) -> str:
 
 
 
+def _bounded_json_object(
+    text: str,
+    *,
+    require_canonical: bool,
+) -> dict[str, Any] | None:
+    if not text or len(text.encode("utf-8")) > RCA_EXECUTION_REQUEST_MAX_BYTES:
+        return None
+
+    def object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"invalid JSON constant: {value}")
+
+    try:
+        value = json.loads(
+            text,
+            object_pairs_hook=object_pairs,
+            parse_constant=reject_constant,
+        )
+        if not isinstance(value, dict):
+            return None
+        if require_canonical:
+            canonical = json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            if text != canonical:
+                return None
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        return None
+    return value
+
+
 def _load_execution_request_from_goal(task_id: str) -> dict[str, Any]:
-    """Extract the embedded RcaExecutionRequest JSON from shared-state goal.md."""
+    """Extract one bounded execution request, preferring the fixed-CLI marker."""
     goal_path = _shared_state_task_dir(task_id) / "goal.md"
     try:
-        raw = goal_path.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
+        if goal_path.stat().st_size > RCA_GOAL_MAX_BYTES:
+            return {}
+        raw = goal_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
         return {}
-    marker = "## RcaExecutionRequest JSON"
-    idx = raw.find(marker)
-    if idx >= 0:
-        raw = raw[idx:]
-    match = re.search(r"```json\s*(\{.*?\})\s*```", raw, re.S)
+    if len(raw.encode("utf-8")) > RCA_GOAL_MAX_BYTES:
+        return {}
+
+    begin_count = raw.count(RCA_EXECUTION_REQUEST_JSON_BEGIN)
+    end_count = raw.count(RCA_EXECUTION_REQUEST_JSON_END)
+    if begin_count or end_count:
+        if begin_count != 1 or end_count != 1:
+            return {}
+        begin = raw.find(RCA_EXECUTION_REQUEST_JSON_BEGIN)
+        payload_start = begin + len(RCA_EXECUTION_REQUEST_JSON_BEGIN)
+        end = raw.find(RCA_EXECUTION_REQUEST_JSON_END)
+        if begin < 0 or end <= payload_start:
+            return {}
+        enclosed = raw[payload_start:end]
+        if not enclosed.startswith("\n") or not enclosed.endswith("\n"):
+            return {}
+        payload = enclosed[1:-1]
+        if "\n" in payload or "\r" in payload:
+            return {}
+        if "<!-- G1Q3_RCA_" in payload:
+            return {}
+        return _bounded_json_object(payload, require_canonical=True) or {}
+
+    if raw.count(RCA_LEGACY_EXECUTION_REQUEST_HEADING) != 1:
+        return {}
+    tail = raw.split(RCA_LEGACY_EXECUTION_REQUEST_HEADING, 1)[1]
+    if tail.count("```json") != 1 or tail.count("```") != 2:
+        return {}
+    match = re.match(r"\s*```json[ \t]*\r?\n(.*?)\r?\n```", tail, re.S)
     if not match:
         return {}
-    try:
-        data = json.loads(match.group(1))
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
+    return _bounded_json_object(match.group(1), require_canonical=False) or {}
 
 
 def _compact_input_label(execution_request: dict[str, Any]) -> str:
@@ -1145,15 +1270,47 @@ def _compact_input_label(execution_request: dict[str, Any]) -> str:
         return ""
     issue = _nested_get(execution_request, "work_item.work_item_id")
     url = _nested_get(execution_request, "work_item.url")
-    data_cmd = _nested_get(execution_request, "data.pdcl_download_cmd")
+    remote_input = _remote_input_summary(execution_request)
+    legacy_input = _legacy_remote_input_summary(execution_request)
     parts = []
     if issue:
         parts.append(f"飞书问题 {issue}")
     elif url:
         parts.append(str(url))
-    if data_cmd:
-        parts.append(str(data_cmd))
+    if remote_input:
+        parts.append(remote_input)
+    elif legacy_input:
+        parts.append(legacy_input)
     return " + ".join(parts)
+
+
+def _remote_input_summary(execution_request: dict[str, Any]) -> str:
+    """Return a user-safe v2 input label without exposing opaque identifiers."""
+    access = _nested_get(execution_request, "data.data_access")
+    if not isinstance(access, dict) or access.get("mode") != "remote_read":
+        return ""
+    references = access.get("references")
+    if not isinstance(references, list) or not references:
+        return ""
+    counts: dict[str, int] = {}
+    for reference in references:
+        if not isinstance(reference, dict):
+            continue
+        kind = str(reference.get("kind") or "").strip()
+        if kind in {"event", "clip"}:
+            counts[kind] = counts.get(kind, 0) + 1
+    if not counts:
+        return ""
+    detail = ", ".join(f"{kind} x{counts[kind]}" for kind in sorted(counts))
+    return f"远程直读 ({detail}；不执行 MDI 下载)"
+
+
+def _legacy_remote_input_summary(execution_request: dict[str, Any]) -> str:
+    """Map a v1 command-shaped address to the v2 display contract."""
+    legacy = str(_nested_get(execution_request, "data.pdcl_download_cmd") or "").strip()
+    if not legacy:
+        return ""
+    return "远程直读 (历史 v1 event/clip 引用；不执行 MDI 下载)"
 
 
 def _cifs_for_vm_path(vm_path: str, fallback_root_cifs: str = "") -> str:
@@ -1486,7 +1643,7 @@ def maybe_notify_mechanical_download_failure(
     send: bool,
     send_func: Callable[[dict[str, Any]], str] | None = None,
 ) -> dict[str, Any] | None:
-    """Ping originator once when an automatic download path fails mechanically."""
+    """Ping once for a historical need_download state caused by pipeline failure."""
     task_card = body.get("task_card") if isinstance(body.get("task_card"), dict) else None
     if not isinstance(task_card, dict):
         return None
@@ -1520,9 +1677,12 @@ def maybe_notify_mechanical_download_failure(
     owners = delivery.get("owners") or task_card.get("owners")
     if isinstance(owners, list) and owners:
         owner_text = " ".join(str(x) for x in owners[:2] if str(x).strip())
-    reason = _first_text(delivery.get("conclusion"), task_card.get("status_line"), meta.get("latest_summary"), limit=220)
+    reason = _remote_read_user_text(
+        _first_text(delivery.get("conclusion"), task_card.get("status_line"), meta.get("latest_summary"), limit=220),
+        limit=220,
+    )
     message = (
-        f"{originator} {owner_text} 自动下载/数据管线没有跑通，系统已定位为机械故障 {kind}，不是飞书项目字段缺失。".strip()
+        f"{originator} {owner_text} 远程读取/数据处理链路没有跑通，系统已定位为机械故障 {kind}，不是飞书项目字段缺失；系统不会回退到 MDI 下载。".strip()
         + (f" 当前状态：{reason}" if reason else "")
         + " 请保持本话题，修复后我会继续重跑闭环。"
         + (f" 追踪号 {task_id}" if task_id else "")
@@ -1855,18 +2015,26 @@ def enrich_g1q3_task_card_delivery(task_id: str, body: dict[str, Any]) -> dict[s
 
     artifact_root = _first_text(meta.get("artifact_root"), delivery.get("artifact_root"), body.get("artifact_root"), limit=500)
     artifact_cifs_root = _first_text(meta.get("artifact_cifs_root"), delivery.get("artifact_root"), delivery.get("artifact_path"), body.get("artifact_cifs_root"), limit=500)
-    report_data = _load_artifact_json(artifact_root, "report_data.json")
-    gate_result = _load_artifact_json(artifact_root, "gate_result.json")
-    delivery_contract = _load_g1q3_delivery_contract(task_id, body, artifact_root)
     latest_report_contract = _latest_governance_report_contract(task_id, body, meta)
-    if _g1q3_contract_report_ready_truth(latest_report_contract):
+    latest_report_truth = _g1q3_contract_report_ready_truth(latest_report_contract)
+    if latest_report_truth:
+        report_data: dict[str, Any] = {}
+        gate_result: dict[str, Any] = {}
         delivery_contract = latest_report_contract
+    else:
+        report_data = _load_artifact_json(artifact_root, "report_data.json")
+        gate_result = _load_artifact_json(artifact_root, "gate_result.json")
+        delivery_contract = _load_g1q3_delivery_contract(task_id, body, artifact_root)
     pipeline_result_truth = _load_g1q3_pipeline_result(artifact_root, delivery_contract, body)
     contract_business_result = _g1q3_contract_missing_input_business_result(delivery_contract)
     if contract_business_result and not business_result:
         business_result = contract_business_result
     report_ready_truth = _g1q3_report_ready_truth(task_id, artifact_root, report_data, gate_result, delivery_contract)
-    blocked_keyframe_pipeline = _blocked_keyframe_pipeline_result(artifact_root, delivery_contract, body)
+    blocked_keyframe_pipeline = (
+        {}
+        if latest_report_truth
+        else _blocked_keyframe_pipeline_result(artifact_root, delivery_contract, body)
+    )
 
     attribution_status = _first_text(
         report_ready_truth.get("attribution_status"),
@@ -1946,14 +2114,14 @@ def enrich_g1q3_task_card_delivery(task_id: str, body: dict[str, Any]) -> dict[s
         _extract_labeled_line(log_text, "责任候选"),
         limit=80,
     )
-    evidence_boundary = _first_text(
+    evidence_boundary = _remote_read_user_text(_first_text(
         report_ready_truth.get("high_confidence_boundary"),
         delivery.get("evidence_boundary"),
         _nested_get(report_data, "evidence_boundary", "boundary", "rca_receipt.review.boundary"),
         _nested_get(gate_result, "evidence_boundary"),
         _extract_log_field(log_text, "evidence_boundary"),
         limit=260,
-    )
+    ), limit=260)
 
     truth = reconcile_report_truth(
         gate_result,
@@ -1996,6 +2164,13 @@ def enrich_g1q3_task_card_delivery(task_id: str, body: dict[str, Any]) -> dict[s
     artifact_path, artifact_dir = _normalize_html_artifact_path(artifact_source, report_status=report_status if gate_green else "")
     report_case_dir_vm = str(report_ready_truth.get("case_dir_vm") or "").strip()
     report_index_html_vm = str(report_ready_truth.get("index_html_vm") or "").strip()
+    if (
+        not report_index_html_vm
+        and report_status == "html_delivery_ready"
+        and host_report_exists
+        and artifact_root
+    ):
+        report_index_html_vm = artifact_root.rstrip("/") + "/index.html"
     report_data_vm = str(report_ready_truth.get("report_data_vm") or "").strip()
     report_viz_mcap_vm = str(report_ready_truth.get("viz_mcap_vm") or "").strip()
     report_foxglove_url = str(report_ready_truth.get("foxglove_url") or "").strip()
@@ -2038,14 +2213,26 @@ def enrich_g1q3_task_card_delivery(task_id: str, body: dict[str, Any]) -> dict[s
         report_delivery_path = ""
         report_delivery_root = agent_artifact_root_cifs or agent_artifact_root_vm or artifact_dir
         artifact_path = ""
-    real_report = (not blocked_keyframe_pipeline) and (bool(report_ready_truth) or (bool(report_status) and report_status == "html_delivery_ready" and gate_green))
+    real_report = (not blocked_keyframe_pipeline) and (
+        bool(report_ready_truth)
+        or (
+            bool(verified_report_index)
+            and report_status == "html_delivery_ready"
+            and gate_green
+        )
+    )
     if real_report:
         # Report-ready cards must describe the report boundary only.  Do not
         # seed from stale intake/blocked card boundaries; those may contain
         # historical need_input/out_of_scope gate text that is no longer true.
         boundaries = []
     else:
-        boundaries = delivery.get("boundaries") if isinstance(delivery.get("boundaries"), list) else []
+        stored_boundaries = delivery.get("boundaries") if isinstance(delivery.get("boundaries"), list) else []
+        boundaries = [
+            normalized
+            for item in stored_boundaries
+            if (normalized := _remote_read_user_text(item, limit=300))
+        ]
     if host_report_exists and not gate_green and not blocked_keyframe_pipeline:
         boundaries = _append_unique(boundaries, f"命中既有报告草稿，但证据未齐（gate={truth.get('gate_decision') or 'unknown'}），不作为可交付。")
     if blocked_keyframe_pipeline:
@@ -2062,9 +2249,12 @@ def enrich_g1q3_task_card_delivery(task_id: str, body: dict[str, Any]) -> dict[s
             "当前证据尚不足以形成高置信自动归因；需要人工确认候选原因、责任域与证据边界。" if attribution_status in {"hypothesis_ready", "needs_review", "need_review"} or truth.get("anomaly") else "",
         )
 
-    honest_conclusion = _first_text(truth.get("honest_conclusion"), limit=180)
+    honest_conclusion = _remote_read_user_text(_first_text(truth.get("honest_conclusion"), limit=180), limit=180)
     if blocked_keyframe_pipeline:
-        honest_conclusion = f"数据已下载，自动找帧无候选（{blocked_keyframe_message}）→ 已停在 {blocked_keyframe_stage}，需人工指定关键帧或确认采集信号后继续 RCA"
+        honest_conclusion = (
+            f"问题数据已通过远程读取取得（不执行 MDI 下载）；自动找帧无候选（{blocked_keyframe_message}）"
+            f"→ 已停在 {blocked_keyframe_stage}，需人工指定关键帧或确认采集信号后继续 RCA"
+        )
     delivery.update({
         "conclusion": honest_conclusion if honest_conclusion else (_first_text(delivery.get("conclusion"), notice.get("text"), limit=120) if not report_status else ""),
         "artifact_label": "打开 foxglove 可视化" if (report_foxglove_url and real_report) else ("打开 HTML 报告" if (report_delivery_path.lower().endswith(".html") and real_report) else "报告目录"),
@@ -2198,7 +2388,7 @@ def enrich_g1q3_task_card_delivery(task_id: str, body: dict[str, Any]) -> dict[s
         # A CIFS directory can exist for raw/intermediate artifacts; it is not a
         # report-delivery success unless the projection has proven a real report.
         if str(delivery.get("cifs_status") or "").strip().lower() in {"success", "ok", "succeeded", "done", "ready"}:
-            delivery["cifs_status"] = "暂无报告；数据已下载，工程侧修复解析/对齐链路后继续 RCA" if str(delivery.get("report_status") or "") == "need_pipeline_fix" else "暂无报告；需补充数据/证据后生成 RCA 报告"
+            delivery["cifs_status"] = "暂无报告；工程侧修复远程读取/解析链路后继续 RCA（不执行 MDI 下载）" if str(delivery.get("report_status") or "") == "need_pipeline_fix" else "暂无报告；需补充数据/证据后生成 RCA 报告"
         if str(delivery.get("artifact_label") or "") == "报告目录":
             delivery["artifact_label"] = "产物目录(暂无报告)"
     task_card["delivery"] = delivery
@@ -2417,7 +2607,8 @@ def apply_g1q3_close_loop_guard(
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Park a blocked G1Q3 RCA intake in `blocked` so the originator is pinged.
 
-    A blocked intake (PDCL missing OR Feishu/Meegle read failed -> need_download)
+    A blocked intake (remote reference missing OR Feishu/Meegle read failed;
+    historical state name: need_download)
     is imported from the VM as state=completed, which both hides that it needs
     human input and drops it into dispatch/done.  This relay-side guard re-asserts
     state=blocked (an active human-action state) exactly once, so
@@ -2450,7 +2641,7 @@ def apply_g1q3_close_loop_guard(
             delivery["action_category"] = "none"
             delivery["requires_user_input"] = False
             delivery.pop("missing_reason", None)
-            delivery["cifs_status"] = "暂无报告；数据已下载，工程侧修复解析/对齐链路后继续 RCA"
+            delivery["cifs_status"] = "暂无报告；工程侧修复远程读取/解析链路后继续 RCA（不执行 MDI 下载）"
             delivery["conclusion"] = f"数据已就位，无需发起人补数据；工程侧解析/对齐链路待修（{kind or fault_class or 'pipeline_fix'}）。"
             task_card["delivery"] = delivery
             task_card["close_loop_guard_skipped_reason"] = "pipeline_fix_not_user_data"
@@ -2473,14 +2664,26 @@ def apply_g1q3_close_loop_guard(
             return body, None
     now_iso = _now_iso()
     summary = "g1q3_rca close-loop guard: completed -> blocked (intake 需补充数据/证据)"
-    status_line = str(task_card.get("status_line") or "需补充问题数据/证据后继续 RCA；已 @发起人介入。")
-    conclusion = str(delivery.get("conclusion") or "intake 与准入校验完成；待补充数据/证据后继续 RCA。")
+    status_line = _remote_read_user_text(
+        task_card.get("status_line") or "需补充问题数据/证据后继续 RCA；已 @发起人介入。"
+    )
+    conclusion = _remote_read_user_text(
+        delivery.get("conclusion") or "intake 与准入校验完成；待补充数据/证据后继续 RCA。"
+    )
     status_text = f"{summary}\n\n{status_line}\n{conclusion}\n"
     shared_state_result = _update_shared_state_for_close_loop(task_id, state="blocked", summary=summary, status_text=status_text)
-    boundaries = delivery.get("boundaries") if isinstance(delivery.get("boundaries"), list) else []
+    stored_boundaries = delivery.get("boundaries") if isinstance(delivery.get("boundaries"), list) else []
+    boundaries = [
+        normalized
+        for item in stored_boundaries
+        if (normalized := _remote_read_user_text(item, limit=300))
+    ]
     delivery["boundaries"] = _append_unique(
         boundaries,
-        "请在飞书问题卡片补充 问题数据地址_PDCL（mdi refresh -t/-e -s ./ 或 mdi download <res> -u <id> -s ./），再在本话题重发问题链接，我会自动重跑 RCA；未补充前不生成报告。",
+        REMOTE_REFERENCE_GUIDANCE
+        + " 新建问题单由 Kafka 创建事件自动受理；人工入口仅限固定群（HERMES_RCA_MANUAL_CHAT_IDS 当前启用子集），"
+        + "且必须真实 @小助手、明确发送“分析/重跑 + 完整问题单 URL”。普通 URL、未 @ 或私聊仍只读，不创建或重跑任务。"
+        + "两种入口共用统一受理、去重、代际控制和远程读取链路；人工触发结果回到原任务话题。未补充前不生成报告。",
     )[:5]
     task_card["delivery"] = delivery
     milestones = task_card.get("milestones") if isinstance(task_card.get("milestones"), list) else []
@@ -2591,7 +2794,13 @@ def _need_input_reason(task_card: dict[str, Any], meta: dict[str, Any]) -> str:
         delivery.get("conclusion"),
         meta.get("latest_summary"),
     ):
-        text = str(candidate or "").strip()
+        raw = str(candidate or "").strip()
+        if LEGACY_MDI_COMMAND_RE.search(raw) or (
+            "pdcl" in raw.lower()
+            and re.search(r"补充|缺失|无效|missing|invalid|(?:下载)?命令", raw, re.I)
+        ):
+            return REMOTE_REFERENCE_GUIDANCE[:300]
+        text = _remote_read_user_text(candidate)
         if text:
             return text[:300]
     return ""
@@ -3045,8 +3254,9 @@ def maybe_notify_infra_recovery(
 ) -> dict[str, Any] | None:
     """Ops-facing alert for an infra/self-healable fault (env-gated, once per
     transition). Routes to the ops owner — NEVER the issue originator — with the
-    blocker kind, remediation, and the resume command, so a fault that survived
-    in-process self-heal is loud to the right person instead of parked silently."""
+    blocker kind, remediation, and the controlled resume stage, so a fault that
+    survived in-process self-heal is loud to the right person without reviving
+    a direct legacy pipeline entry point."""
     task_card = body.get("task_card") if isinstance(body.get("task_card"), dict) else None
     if not isinstance(task_card, dict):
         return None
@@ -3078,7 +3288,8 @@ def maybe_notify_infra_recovery(
     ops = build_at_mention(_INFRA_ALERT_OPS_OPEN_ID, _INFRA_ALERT_OPS_NAME) if _INFRA_ALERT_OPS_OPEN_ID.startswith("ou_") else _INFRA_ALERT_OPS_NAME
     message = (
         f"{ops} 基础设施类阻塞（数据已就位，无需发起人补数据）：{kind}；{detail}；"
-        f"如自愈未恢复，可重跑 --from-stage {resume_stage}。\n追踪号 {task_id}"
+        f"建议恢复阶段：{resume_stage}。如自愈未恢复，必须按追踪号通过统一 RCA 控制面执行受控重试；"
+        f"禁止直接运行旧阶段脚本或下载路径。\n追踪号 {task_id}"
     )
     if not send:
         return {"dry_run": True, "kind": "infra_recovery", "target": target, "notify_key": notify_key, "preview": message[:300]}
@@ -4144,7 +4355,35 @@ def relay_pending_notices(*, task_ids: Iterable[str] | None = None, send: bool =
     }
 
 
-def watch_pending_notices(*, task_ids: Iterable[str] | None = None, send: bool = False, limit: int = 50, retry_failed_after_seconds: int = 0, max_attempts: int = DEFAULT_MAX_ATTEMPTS, poll_seconds: float = DEFAULT_WATCH_POLL_SECONDS, full_scan_seconds: int = DEFAULT_WATCH_FULL_SCAN_SECONDS, canary_loops: int = DEFAULT_WATCH_CANARY_LOOPS, max_card_fallbacks_per_loop: int | None = None) -> dict[str, Any]:
+def _completion_relay_health_path() -> Path:
+    configured = os.getenv("PNC_COMPLETION_NOTICE_RELAY_HEALTH_PATH", "").strip()
+    if configured:
+        expanded = Path(configured).expanduser()
+        if not expanded.is_absolute():
+            raise ValueError("PNC_COMPLETION_NOTICE_RELAY_HEALTH_PATH must be absolute")
+        return expanded.absolute()
+    return (
+        get_hermes_home()
+        / "runtime/pnc_agent/feishu_issue_kafka_rca/completion_notice_relay_health.json"
+    )
+
+
+def watch_pending_notices(
+    *,
+    task_ids: Iterable[str] | None = None,
+    send: bool = False,
+    limit: int = 50,
+    retry_failed_after_seconds: int = 0,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    poll_seconds: float = DEFAULT_WATCH_POLL_SECONDS,
+    full_scan_seconds: int = DEFAULT_WATCH_FULL_SCAN_SECONDS,
+    canary_loops: int = DEFAULT_WATCH_CANARY_LOOPS,
+    max_card_fallbacks_per_loop: int | None = None,
+    health_path: Path | None = None,
+    runtime_evidence_builder: Callable[..., dict[str, Any]] = (
+        build_process_runtime_evidence
+    ),
+) -> dict[str, Any]:
     hot_sender = None
     if send:
         from gateway.record_only.runtime import get_record_only_transport
@@ -4163,6 +4402,15 @@ def watch_pending_notices(*, task_ids: Iterable[str] | None = None, send: bool =
     total_sent = 0
     last_result: dict[str, Any] | None = None
     watched_mtimes: dict[str, int] = {}
+    runtime_evidence = (
+        runtime_evidence_builder(
+            service_label=COMPLETION_RELAY_SERVICE_LABEL,
+            script_path=Path(__file__),
+        )
+        if health_path is not None
+        else None
+    )
+    startup_canary_completed_at: str | None = None
     # Do not retroactively @-ping every historical anomaly on relay restart.
     backfill_g1q3_anomaly_notify_keys(task_ids=task_ids or None)
     while True:
@@ -4185,6 +4433,15 @@ def watch_pending_notices(*, task_ids: Iterable[str] | None = None, send: bool =
                     if old is None or old != mtime:
                         changed.append(key)
             selected_task_ids = changed
+        loop_result: dict[str, Any] = {
+            "ok": True,
+            "card_fallback_attempted_count": 0,
+            "card_fallback_sent_count": 0,
+            "errors": [],
+        }
+        effective_fallback_budget = (
+            0 if loop_count < canary_loops else max_card_fallbacks_per_loop
+        )
         if selected_task_ids is None or selected_task_ids:
             result = relay_pending_notices(
                 task_ids=selected_task_ids,
@@ -4196,13 +4453,51 @@ def watch_pending_notices(*, task_ids: Iterable[str] | None = None, send: bool =
                 send_card_func=(getattr(hot_sender, "send_task_card", None) if hot_sender is not None else None),
                 since_ts=RELAY_PROCESS_START_TS,
                 explicit_completion_delivery=False,
-                max_card_fallbacks_per_loop=0 if loop_count < canary_loops else max_card_fallbacks_per_loop,
+                max_card_fallbacks_per_loop=effective_fallback_budget,
             )
+            loop_result = result
             last_result = result
             total_sent += int(result.get("sent_count") or 0)
             if result.get("candidate_count") or result.get("errors"):
                 print(json.dumps({"watch": True, "loop": loop_count, **result}, ensure_ascii=False, sort_keys=True), flush=True)
         loop_count += 1
+        completed_loops = min(loop_count, canary_loops)
+        if canary_loops == 0 or completed_loops >= canary_loops:
+            startup_canary_completed_at = (
+                startup_canary_completed_at or datetime.now(timezone.utc).isoformat()
+            )
+        if health_path is not None and runtime_evidence is not None:
+            errors = [str(value) for value in loop_result.get("errors") or []]
+            write_owner_health(
+                health_path,
+                {
+                    "schema_version": COMPLETION_RELAY_HEALTH_SCHEMA_VERSION,
+                    "service_label": COMPLETION_RELAY_SERVICE_LABEL,
+                    "observed_at": datetime.now(timezone.utc).isoformat(),
+                    "started_at": runtime_evidence["started_at"],
+                    "pid": runtime_evidence["pid"],
+                    "process_create_time": runtime_evidence["process_create_time"],
+                    "loop_count": loop_count,
+                    "startup_canary_loops_required": canary_loops,
+                    "startup_canary_loops_completed": completed_loops,
+                    "startup_canary_completed_at": startup_canary_completed_at,
+                    "configured_max_card_fallbacks_per_loop": (
+                        max_card_fallbacks_per_loop
+                    ),
+                    "effective_max_card_fallbacks_per_loop": (
+                        effective_fallback_budget
+                    ),
+                    "card_fallback_attempted_count": int(
+                        loop_result.get("card_fallback_attempted_count") or 0
+                    ),
+                    "card_fallback_sent_count": int(
+                        loop_result.get("card_fallback_sent_count") or 0
+                    ),
+                    "healthy": loop_result.get("ok") is True and not errors,
+                    "errors": errors,
+                    "runtime_identity": runtime_evidence["runtime_identity"],
+                },
+            )
         time.sleep(max(0.1, poll_seconds))
 
 
@@ -4253,6 +4548,7 @@ def main(argv: list[str] | None = None) -> int:
                 full_scan_seconds=max(1, args.watch_full_scan_seconds),
                 canary_loops=max(0, args.watch_canary_loops),
                 max_card_fallbacks_per_loop=max(0, args.max_card_fallbacks_per_loop),
+                health_path=_completion_relay_health_path(),
             )
         return relay_pending_notices(task_ids=args.task_id, send=args.send, limit=args.limit, retry_failed_after_seconds=max(0, args.retry_failed_after), max_attempts=max(1, args.max_attempts), max_card_fallbacks_per_loop=max(0, args.max_card_fallbacks_per_loop))
 

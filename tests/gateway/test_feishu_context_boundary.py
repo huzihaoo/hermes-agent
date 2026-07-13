@@ -219,19 +219,26 @@ def test_feishu_inbound_short_user_followup_is_not_folded():
     assert cleaned == raw
 
 
-def test_g1q3_main_session_handoff_remains_dispatch_only():
+def test_g1q3_legacy_main_session_handoff_remains_retired():
     from pathlib import Path
 
     source = Path("gateway/run.py").read_text(encoding="utf-8")
     start = source.index("def _submit_g1q3_rca_status_handoff")
     end = source.index("def _resolve_runtime_agent_kwargs", start)
     handoff_source = source[start:end]
-    forbidden = ["report_builder", "decode_raw", "mcap_service", "mcap_data_translate"]
+    forbidden = [
+        "report_builder",
+        "decode_raw",
+        "mcap_service",
+        "mcap_data_translate",
+        "run_rca_auto_pipeline.py",
+    ]
 
     for token in forbidden:
         assert token not in handoff_source
-    assert "vm_task_submit" in handoff_source
-    assert "run_rca_auto_pipeline.py" in handoff_source  # VM command suggestion string is allowed.
+    assert "vm_task_submit" not in handoff_source
+    assert "g1q3_rca_legacy_chat_handoff_retired" in handoff_source
+    assert "g1q3_rca_chat_handoff_retired" in handoff_source
 
 
 def test_feishu_topic_history_sanitizer_still_omits_bot_self_history_after_issue_card_change():

@@ -3430,7 +3430,14 @@ class TestFeishuApiPollStartupLookback(unittest.TestCase):
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
         with patch.object(FeishuAdapter, "_load_seen_message_ids"):
-            return FeishuAdapter(PlatformConfig(extra=extra or {"api_poll_chat_ids": ["oc_test"]}))
+            adapter = FeishuAdapter(
+                PlatformConfig(extra=extra or {"api_poll_chat_ids": ["oc_test"]})
+            )
+        temp_dir = tempfile.TemporaryDirectory()
+        adapter._test_api_poll_temp_dir = temp_dir
+        adapter._dedup_state_path = Path(temp_dir.name) / "feishu_seen_message_ids.json"
+        adapter._api_poll_state_path = Path(temp_dir.name) / "feishu_api_poll_state_v1.json"
+        return adapter
 
     @staticmethod
     def _api_response(*, items, has_more=False, page_token=""):
@@ -3562,7 +3569,10 @@ class TestFeishuApiPollStartupLookback(unittest.TestCase):
         )
 
         with patch("plugins.platforms.feishu.adapter.urlopen", return_value=response) as mock_urlopen:
-            items = adapter._fetch_recent_chat_messages_via_api("oc_test")
+            items = adapter._fetch_recent_chat_messages_via_api(
+                "oc_test",
+                durable_scan=False,
+            )
 
         self.assertEqual([item["message_id"] for item in items], ["om_recent"])
         mock_urlopen.assert_called_once()
@@ -3619,7 +3629,7 @@ class TestFeishuApiPollStartupLookback(unittest.TestCase):
         clear=True,
     )
     @patch("plugins.platforms.feishu.adapter.time.time", return_value=1_000)
-    def test_cancelled_replay_retries_before_persisting_dedup_or_baseline(self, _mock_time):
+    def test_cancelled_replay_keeps_durable_pending_until_retry(self, _mock_time):
         adapter = self._make_adapter()
         adapter._persist_seen_message_ids = Mock()
         adapter._fetch_recent_chat_messages_via_api = Mock(return_value=[self._item("om_gap", 950)])
@@ -3629,19 +3639,26 @@ class TestFeishuApiPollStartupLookback(unittest.TestCase):
         with self.assertRaises(asyncio.CancelledError):
             asyncio.run(adapter._poll_api_chat_once("oc_test"))
 
-        self.assertNotIn("oc_test", adapter._api_poll_baselined_chat_ids)
+        self.assertIn("oc_test", adapter._api_poll_baselined_chat_ids)
+        self.assertEqual(
+            [item["message_id"] for item in adapter._api_poll_pending_items["oc_test"]],
+            ["om_gap"],
+        )
         self.assertNotIn("om_gap", adapter._api_poll_seen_message_ids)
         self.assertNotIn("om_gap", adapter._seen_message_ids)
-        self.assertNotIn("om_gap", adapter._pending_dedup_message_ids)
+        self.assertNotIn("om_gap", adapter._processing_message_ids)
+        self.assertNotIn("oc_test", adapter._api_poll_last_seen_create_time_ms)
 
+        adapter._persist_seen_message_ids.reset_mock()
         adapter._process_inbound_message = AsyncMock()
         asyncio.run(adapter._poll_api_chat_once("oc_test"))
 
         adapter._process_inbound_message.assert_awaited_once()
         self.assertIn("oc_test", adapter._api_poll_baselined_chat_ids)
+        self.assertNotIn("oc_test", adapter._api_poll_pending_items)
         self.assertIn("om_gap", adapter._api_poll_seen_message_ids)
         self.assertIn("om_gap", adapter._seen_message_ids)
-        adapter._persist_seen_message_ids.assert_called_once()
+        self.assertGreaterEqual(adapter._persist_seen_message_ids.call_count, 2)
 
     @patch.dict(
         os.environ,
@@ -4391,11 +4408,8 @@ class TestFeishuMentionMap(unittest.TestCase):
         )
         self.assertFalse(result["@_user_1"].is_self)
 
-    def test_build_mentions_map_falls_back_to_name_when_bot_open_id_not_hydrated(self):
-        """Regression: right after gateway startup, _hydrate_bot_identity may
-        not have populated _bot_open_id yet. During that window, a mention
-        carrying a real open_id should still match via name — otherwise
-        @bot messages silently fail admission."""
+    def test_build_mentions_map_rejects_name_fallback_when_mention_has_id(self):
+        """An identified mention cannot match an unhydrated bot by name alone."""
         from plugins.platforms.feishu.adapter import _build_mentions_map, _FeishuBotIdentity
 
         bot_mention = SimpleNamespace(
@@ -4403,12 +4417,11 @@ class TestFeishuMentionMap(unittest.TestCase):
             id=SimpleNamespace(open_id="ou_bot_actual", user_id=""),
             name="Hermes Bot",
         )
-        # Bot identity has name but no open_id yet (hydration pending).
         result = _build_mentions_map(
             [bot_mention],
             _FeishuBotIdentity(open_id="", name="Hermes Bot"),
         )
-        self.assertTrue(result["@_user_1"].is_self)
+        self.assertFalse(result["@_user_1"].is_self)
 
     def test_build_mentions_map_non_self_user(self):
         from plugins.platforms.feishu.adapter import _build_mentions_map, _FeishuBotIdentity

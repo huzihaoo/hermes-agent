@@ -27,11 +27,20 @@ NOW = datetime(2026, 6, 12, 12, 0, tzinfo=timezone.utc)
 
 def test_build_comment_covers_supported_kinds_and_names_owner():
     plan = build_field_gap_comment("issue_field_missing_pdcl_download_cmd", ["张三", "李四"])
-    assert "缺少 问题数据地址_PDCL" in plan["signature"]
+    assert plan["signature"] == "缺少可远程读取的数据引用"
     assert "张三、李四" in plan["content"]
-    assert "mdi download event -u" in plan["content"]
-    assert "mdi refresh -t" in plan["content"]
-    assert "pdcl_mdi_data_download_guide.md" in plan["content"]
+    assert "明确的 event UUID 或 clip UUID" in plan["content"]
+    assert "不会执行 MDI 下载" in plan["content"]
+    assert "Kafka 自动受理" in plan["content"]
+    assert "HERMES_RCA_MANUAL_CHAT_IDS 当前启用子集" in plan["content"]
+    assert "真实 @小助手" in plan["content"]
+    assert "分析/重跑 + 完整问题单 URL" in plan["content"]
+    assert "普通 URL、未 @ 或私聊仍只读" in plan["content"]
+    assert "人工触发结果回到原任务话题" in plan["content"]
+    assert "mdi download" not in plan["content"]
+
+    current = build_field_gap_comment("issue_field_missing_remote_data_reference")
+    assert current == build_field_gap_comment("issue_field_missing_pdcl_download_cmd")
 
     assert build_field_gap_comment("missing_frame_id")["signature"] == "缺少 问题发生frameid"
     assert build_field_gap_comment("host_meegle_preread_unauthenticated") is None
@@ -150,7 +159,7 @@ def test_post_failure_is_reported_not_raised(tmp_path, monkeypatch):
     assert "boom" in result["reason"]
 
 
-def test_invalid_pdcl_subkind_templates_are_specific_and_can_real_at():
+def test_legacy_invalid_pdcl_subkinds_project_remote_reference_copy_and_can_real_at():
     nas = build_field_gap_comment(
         "issue_field_invalid_pdcl_download_cmd",
         ["张三"],
@@ -164,16 +173,18 @@ def test_invalid_pdcl_subkind_templates_are_specific_and_can_real_at():
         owner_open_ids=["ou_owner"],
     )
 
-    assert nas["content"] != replay["content"]
-    assert "NAS" in nas["content"]
-    assert "NAS staging" in nas["content"]
-    assert "cyber_recorder" in replay["content"]
-    assert "不是数据下载命令" in replay["content"]
+    assert nas["content"] == replay["content"]
+    assert "RemoteEventReader/RemoteClipReader" in nas["content"]
+    assert "HERMES_RCA_MANUAL_CHAT_IDS 当前启用子集" in replay["content"]
+    assert "真实 @小助手" in replay["content"]
+    assert "普通 URL、未 @ 或私聊仍只读" in replay["content"]
+    assert "人工触发结果回到原任务话题" in replay["content"]
+    assert "mdi download" not in nas["content"].lower()
     assert '<at user_id="ou_owner">张三</at>' in nas["content"]
     assert '<at user_id="ou_owner">张三</at>' in replay["content"]
 
 
-def test_invalid_pdcl_empty_subkind_uses_missing_download_command_copy():
+def test_invalid_pdcl_empty_subkind_uses_missing_remote_reference_copy():
     plan = build_field_gap_comment(
         "issue_field_invalid_pdcl_download_cmd",
         ["张三"],
@@ -181,11 +192,11 @@ def test_invalid_pdcl_empty_subkind_uses_missing_download_command_copy():
         owner_open_ids=["ou_owner"],
     )
 
-    assert "缺少 问题数据地址_PDCL 下载命令" in plan["signature"]
-    assert "缺少 问题数据地址_PDCL 下载命令" in plan["content"]
+    assert plan["signature"] == "缺少可远程读取的数据引用"
+    assert "缺少可远程读取的 event/clip 数据引用" in plan["content"]
     assert "补充" in plan["content"]
-    assert "mdi download event -u" in plan["content"]
-    assert "mdi refresh -t" in plan["content"]
+    assert "不会执行 MDI 下载" in plan["content"]
+    assert "mdi download" not in plan["content"]
     assert '<at user_id="ou_owner">张三</at>' in plan["content"]
 
 

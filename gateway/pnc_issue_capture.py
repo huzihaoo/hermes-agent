@@ -1,8 +1,8 @@
 """Portable G1Q3 RCA issue preread captures.
 
-Capture is observational only: failures never affect host preread.  The JSON
-schema is pure data so VM-side yj tools can rebuild execution requests without
-importing gateway modules.
+Capture is an explicit diagnostic action only: normal issue preread is
+side-effect free.  When opted in, the JSON schema is pure data so VM-side yj
+tools can rebuild execution requests without importing gateway modules.
 """
 from __future__ import annotations
 
@@ -18,7 +18,9 @@ from typing import Any
 from gateway.pnc_rca_schema import issue_context_from_compact_text, to_dict
 
 CAPTURE_SCHEMA_VERSION = "g1q3_rca_issue_capture_v1"
-DEFAULT_CAPTURE_ROOT = Path("/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases")
+CAPTURE_ENABLED_ENV = "HERMES_G1Q3_ISSUE_CAPTURE_ENABLED"
+CAPTURE_ROOT_ENV = "HERMES_G1Q3_ISSUE_CAPTURE_ROOT"
+CAPTURE_ALLOWED_ROOT = Path("/mnt/tmp")
 
 _SENSITIVE_KEYS = {"raw", "raw_payload", "raw_feishu_payload", "full_payload", "secret", "token", "open_id", "user_key"}
 
@@ -52,8 +54,19 @@ def _case_dir_name(work_item_id: str, issue_context: dict[str, Any]) -> str:
 
 
 def capture_root() -> Path:
-    override = os.getenv("HERMES_G1Q3_ISSUE_CAPTURE_ROOT", "").strip()
-    return Path(override) if override else DEFAULT_CAPTURE_ROOT
+    raw = os.getenv(CAPTURE_ROOT_ENV, "").strip()
+    if not raw:
+        raise ValueError(f"{CAPTURE_ROOT_ENV} is required when capture is enabled")
+    root = Path(os.path.normpath(str(Path(raw).expanduser())))
+    if not root.is_absolute():
+        raise ValueError(f"{CAPTURE_ROOT_ENV} must be absolute")
+    try:
+        relative = root.relative_to(CAPTURE_ALLOWED_ROOT)
+    except ValueError as exc:
+        raise ValueError(f"{CAPTURE_ROOT_ENV} must be under /mnt/tmp/<task>") from exc
+    if not relative.parts:
+        raise ValueError(f"{CAPTURE_ROOT_ENV} must name a task directory")
+    return root
 
 
 def build_issue_capture(
@@ -115,7 +128,7 @@ def write_issue_capture(payload: dict[str, Any]) -> Path:
     data = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        # CIFS may reject overwrite; unlink then write is acceptable for observational capture.
+        # The explicit diagnostic target is replaceable by design.
         if path.exists():
             try:
                 path.unlink()
@@ -124,12 +137,20 @@ def write_issue_capture(payload: dict[str, Any]) -> Path:
         path.write_text(data, encoding="utf-8")
     except OSError:
         # Host macOS does not mount the VM /mnt path; write the same pure JSON to
-        # the perception_test_team share through the governed ssh-mini bridge.
+        # the explicit VM /mnt/tmp task directory through the governed bridge.
         _write_capture_via_ssh_mini(path, data)
     return path
 
 
 def maybe_capture_issue_context(**kwargs: Any) -> str:
+    enabled = os.getenv(CAPTURE_ENABLED_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if not enabled:
+        return ""
     if os.getenv("HERMES_G1Q3_DISABLE_ISSUE_CAPTURE", "").strip().lower() in {"1", "true", "yes", "on"}:
         return ""
     payload = build_issue_capture(**kwargs)

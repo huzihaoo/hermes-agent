@@ -7,7 +7,7 @@ text when the worker wrote an explicit verdict.
 from scripts import pnc_g1q3_truth
 
 
-def test_business_result_skipped_gate_drives_honest_need_download_verdict():
+def test_business_result_skipped_gate_maps_legacy_download_state_to_remote_read():
     verdict = pnc_g1q3_truth.reconcile_report_truth(
         gate_result={},
         report_status="",
@@ -23,11 +23,13 @@ def test_business_result_skipped_gate_drives_honest_need_download_verdict():
     assert verdict["truth_source"] == "business_result"
     assert verdict["gate_decision"] == "skipped"
     assert verdict["gate_green"] is False
-    assert verdict["honest_report_status"] == "need_download"
+    assert verdict["honest_report_status"] == "need_evidence"
     # Blocked intake read zero evidence -> NO attribution, never hypothesis_ready.
     assert verdict["honest_attribution_status"] == ""
     assert verdict["gate_skip_reason"] == "missing_or_invalid_pdcl_download_cmd"
     assert "gate=skipped" in verdict["honest_conclusion"]
+    assert "待远程读取/解析或补充证据" in verdict["honest_conclusion"]
+    assert "不执行 MDI 下载" in verdict["honest_conclusion"]
 
 
 def test_business_result_read_failure_terminal_is_non_deliverable():
@@ -42,7 +44,7 @@ def test_business_result_read_failure_terminal_is_non_deliverable():
         },
     )
     assert verdict["truth_source"] == "business_result"
-    assert verdict["honest_report_status"] == "need_download"
+    assert verdict["honest_report_status"] == "need_evidence"
     assert verdict["honest_attribution_status"] == ""
     assert verdict["gate_skip_reason"] == "feishu_issue_read_failed"
 
@@ -74,7 +76,7 @@ def test_no_business_result_keeps_inferred_behaviour():
     )
     assert verdict.get("truth_source") != "business_result"
     assert verdict["gate_decision"] == "ready_to_download"
-    assert verdict["honest_report_status"] == "need_download"
+    assert verdict["honest_report_status"] == "need_evidence"
 
 
 def test_skipped_is_recognised_as_non_green():
@@ -94,13 +96,14 @@ def test_downgrade_strips_dead_html_url_under_non_green_gate():
     verdict = {
         "gate_green": False,
         "gate_decision": "skipped",
-        "honest_conclusion": "intake 与准入校验完成；待下载/解析数据后再出 RCA 结论（gate=skipped）",
+        "honest_conclusion": "intake 与准入校验完成；待远程读取/解析或补充证据后再出 RCA 结论（gate=skipped；不执行 MDI 下载）",
     }
     out = pnc_g1q3_truth.downgrade_g1q3_notice_text(text, verdict)
     assert "html_url" not in out
     assert "//hfs1" not in out
     assert "L0_L1_issue_intake_summary.md" not in out
     assert "gate=skipped" in out
+    assert "不执行 MDI 下载" in out
 
 
 def test_downgrade_keeps_text_untouched_when_gate_green():

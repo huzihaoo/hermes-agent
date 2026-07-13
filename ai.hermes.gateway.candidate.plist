@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HERMES_HOME</key>
+        <string>/Users/songying/.hermes</string>
+        <key>PATH</key>
+        <string>/Users/songying/.hermes/runtime/hermes-live/.venv/bin:/Users/songying/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>PYTHONNOUSERSITE</key>
+        <string>1</string>
+        <key>VIRTUAL_ENV</key>
+        <string>/Users/songying/.hermes/runtime/hermes-live/.venv</string>
+    </dict>
+    <key>ExitTimeOut</key>
+    <integer>30</integer>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>Label</key>
+    <string>ai.hermes.gateway</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/songying/.hermes/runtime/hermes-live/.venv/bin/python</string>
+        <string>-m</string>
+        <string>hermes_cli.main</string>
+        <string>gateway</string>
+        <string>run</string>
+        <string>--replace</string>
+    </array>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardErrorPath</key>
+    <string>/Users/songying/.hermes/logs/gateway.error.log</string>
+    <key>StandardOutPath</key>
+    <string>/Users/songying/.hermes/logs/gateway.log</string>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>Umask</key>
+    <integer>63</integer>
+    <key>WorkingDirectory</key>
+    <string>/Users/songying/.hermes/runtime/hermes-live</string>
+</dict>
+</plist>

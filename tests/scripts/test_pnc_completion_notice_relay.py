@@ -32,7 +32,10 @@ def _set_record_only_env(tmp_path: Path, monkeypatch):
     key_file = tmp_path / "record.key"
     key_file.write_text("ab" * 32 + "\n", encoding="ascii")
     key_file.chmod(0o600)
-    census_root = Path(__file__).resolve().parents[3] / "evidence" / "target-outbound-census"
+    census_root = Path(
+        os.getenv("HERMES_OUTBOUND_CENSUS_ROOT")
+        or Path(__file__).resolve().parents[3] / "evidence" / "target-outbound-census"
+    )
     monkeypatch.setenv("HERMES_OUTBOUND_MODE", "record-only")
     monkeypatch.setenv("HERMES_OUTBOUND_RECORD_ROOT", str(records))
     monkeypatch.setenv("HERMES_OUTBOUND_RECORD_KEY_FILE", str(key_file))
@@ -523,6 +526,75 @@ def test_record_only_task_senders_bind_context_dedupe_and_redact_tracking_id(tmp
     assert all(row["terminal_state"] == "completed" for row in rows)
     assert all(row["external_delivery_attempted"] is False for row in rows)
     assert raw_task_id not in json.dumps(rows, ensure_ascii=False)
+
+
+def test_watch_health_proves_three_fused_startup_loops(tmp_path, monkeypatch):
+    token = set_hermes_home_override(tmp_path)
+    health_path = tmp_path / "health" / "relay.json"
+    (tmp_path / "health").mkdir(mode=0o700)
+    evidence = {
+        "pid": 123,
+        "process_create_time": 1783890000.0,
+        "started_at": "2026-07-13T00:00:00+00:00",
+        "runtime_identity": {
+            "executable": "/runtime/.venv/bin/python",
+            "script": "/runtime/scripts/pnc_completion_notice_relay.py",
+            "cwd": "/runtime",
+            "script_sha256": "1" * 64,
+            "interpreter_sha256": "2" * 64,
+            "plist_path": "/Users/test/Library/LaunchAgents/relay.plist",
+            "plist_sha256": "3" * 64,
+            "program_arguments_sha256": "4" * 64,
+            "environment_sha256": "5" * 64,
+        },
+    }
+    loops = []
+
+    def stop_after_three(seconds):
+        loops.append(seconds)
+        if len(loops) == 3:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        pnc_completion_notice_relay,
+        "relay_pending_notices",
+        lambda **_kwargs: {
+            "ok": True,
+            "candidate_count": 0,
+            "sent_count": 0,
+            "card_fallback_attempted_count": 0,
+            "card_fallback_sent_count": 0,
+            "errors": [],
+        },
+    )
+    monkeypatch.setattr(pnc_completion_notice_relay.time, "sleep", stop_after_three)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            pnc_completion_notice_relay.watch_pending_notices(
+                send=False,
+                poll_seconds=0.1,
+                full_scan_seconds=1,
+                canary_loops=3,
+                max_card_fallbacks_per_loop=0,
+                health_path=health_path,
+                runtime_evidence_builder=lambda **_kwargs: evidence,
+            )
+    finally:
+        reset_hermes_home_override(token)
+
+    body = json.loads(health_path.read_text(encoding="utf-8"))
+    assert health_path.stat().st_mode & 0o777 == 0o600
+    assert body["schema_version"] == "pnc_completion_notice_relay_health_v1"
+    assert body["loop_count"] == 3
+    assert body["startup_canary_loops_required"] == 3
+    assert body["startup_canary_loops_completed"] == 3
+    assert body["startup_canary_completed_at"]
+    assert body["configured_max_card_fallbacks_per_loop"] == 0
+    assert body["effective_max_card_fallbacks_per_loop"] == 0
+    assert body["card_fallback_attempted_count"] == 0
+    assert body["card_fallback_sent_count"] == 0
+    assert body["healthy"] is True
+    assert body["errors"] == []
 
 
 def test_relay_sends_task_card_once_and_marks_sent_hash(tmp_path, monkeypatch):
@@ -1852,8 +1924,11 @@ def test_enrich_g1q3_card_uses_authoritative_business_result_over_log(tmp_path):
     delivery = card["delivery"]
     diagnostics = card["diagnostics"]
     # Authoritative gate is "skipped", never the misleading ready_to_download.
-    assert "需补齐数据" in card["status_line"] or "需补充" in card["status_line"]
+    assert "event/clip 引用" in card["status_line"]
+    assert "远程读取" in card["status_line"]
+    assert "不执行 MDI 下载" in card["status_line"]
     assert "ready_to_download" not in card["status_line"]
+    assert "继续下载/解析" not in card["status_line"]
     assert delivery["report_status"] == "need_user_data"
     # Zero evidence read -> no attribution surfaced (no hypothesis_ready).
     assert delivery.get("attribution_status", "") == ""
@@ -2002,7 +2077,19 @@ def test_g1q3_close_loop_guard_flips_completed_need_download_to_blocked(tmp_path
     # The @originator ping is driven by the shared-state being a human-action state.
     assert pnc_completion_notice_relay._human_action_kind("blocked", str(card.get("user_state") or ""), []) == "need_input"
     # The boundary tells the originator how to resume.
-    assert any("问题数据地址_PDCL" in b for b in card["delivery"]["boundaries"])
+    boundary_text = "；".join(card["delivery"]["boundaries"])
+    assert "问题数据地址_PDCL" in boundary_text
+    assert "event/clip 引用" in boundary_text
+    assert "不执行 MDI 下载" in boundary_text
+    assert "Kafka 创建事件自动受理" in boundary_text
+    assert "HERMES_RCA_MANUAL_CHAT_IDS 当前启用子集" in boundary_text
+    assert "真实 @小助手" in boundary_text
+    assert "分析/重跑 + 完整问题单 URL" in boundary_text
+    assert "普通 URL、未 @ 或私聊仍只读" in boundary_text
+    assert "统一受理、去重、代际控制和远程读取链路" in boundary_text
+    assert "人工触发结果回到原任务话题" in boundary_text
+    assert "RCA 新任务仅由 Kafka" not in boundary_text
+    assert "重发问题链接，我会自动重跑" not in boundary_text
 
 
 def _write_g1q3_infra_blocked(tmp_path, task_id, *, blocker):
@@ -2212,7 +2299,10 @@ def test_infra_recovery_ops_alert_is_env_gated_and_targets_ops_not_originator(tm
         reset_hermes_home_override(token)
     assert off == {"skipped": True, "reason": "infra_alert_disabled", "kind": "infra_recovery"}
     assert on["dry_run"] is True and on["kind"] == "infra_recovery"
-    assert "--from-stage s3b_translate" in on["preview"]
+    assert "建议恢复阶段：s3b_translate" in on["preview"]
+    assert "统一 RCA 控制面执行受控重试" in on["preview"]
+    assert "禁止直接运行旧阶段脚本或下载路径" in on["preview"]
+    assert "--from-stage" not in on["preview"]
     assert "无需发起人补数据" in on["preview"]
 
 
@@ -3245,6 +3335,9 @@ def test_g1q3_mechanical_download_failure_ledger_claim_blocks_duplicate_attempt(
     assert first["sent"] is True
     assert second["reason"] == "already_notified_ledger"
     assert len(sends) == 1
+    assert "远程读取/数据处理链路" in sends[0]["message"]
+    assert "不会回退到 MDI 下载" in sends[0]["message"]
+    assert "自动下载/数据管线" not in sends[0]["message"]
 
 
 def test_g1q3_report_ready_result_wins_over_stale_ready_to_download_log_and_preserves_case_dir(tmp_path, monkeypatch):
@@ -3575,8 +3668,202 @@ def test_g1q3_delivery_contract_v1_missing_user_input_does_not_false_green(tmp_p
     assert delivery["report_status"] == "need_user_data"
     assert "未生成 RCA 报告" in delivery["conclusion"]
     assert out["task_card"]["user_state"] == "in_progress"
-    assert "需补齐数据" in out["task_card"]["status_line"]
+    assert "event/clip 引用" in out["task_card"]["status_line"]
+    assert "不执行 MDI 下载" in out["task_card"]["status_line"]
     assert "responsibility_candidate" not in delivery
+
+
+def _write_goal_for_request_parser(tmp_path, monkeypatch, content) -> None:
+    task_dir = tmp_path / "task"
+    task_dir.mkdir(parents=True, exist_ok=True)
+    goal_path = task_dir / "goal.md"
+    if isinstance(content, bytes):
+        goal_path.write_bytes(content)
+    else:
+        goal_path.write_text(content, encoding="utf-8")
+    monkeypatch.setattr(
+        pnc_completion_notice_relay,
+        "_shared_state_task_dir",
+        lambda _task_id: task_dir,
+    )
+
+
+def _fixed_request_goal(request: object) -> str:
+    canonical = json.dumps(
+        request,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return (
+        "<!-- G1Q3_RCA_EXECUTION_REQUEST_JSON:BEGIN -->\n"
+        f"{canonical}\n"
+        "<!-- G1Q3_RCA_EXECUTION_REQUEST_JSON:END -->"
+    )
+
+
+def _legacy_request_goal(request_json: str) -> str:
+    return (
+        "## RcaExecutionRequest JSON\n"
+        "```json\n"
+        f"{request_json}\n"
+        "```\n"
+    )
+
+
+def test_execution_request_goal_parser_prefers_unique_canonical_fixed_marker(
+    tmp_path, monkeypatch
+):
+    fixed = {
+        "schema_version": "g1q3_rca_execution_request_v2",
+        "work_item": {"work_item_id": "fixed"},
+    }
+    legacy = {"work_item": {"work_item_id": "legacy"}}
+    goal = (
+        _fixed_request_goal(fixed)
+        + "\n- cd /home/mini/data3/yj-evaluation-server\n"
+        + _legacy_request_goal(json.dumps(legacy))
+    )
+    _write_goal_for_request_parser(tmp_path, monkeypatch, goal)
+
+    assert pnc_completion_notice_relay._load_execution_request_from_goal("task") == (
+        fixed
+    )
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "duplicate_block",
+        "missing_end",
+        "end_before_begin",
+        "multiline",
+        "noncanonical",
+        "duplicate_key",
+        "non_object",
+        "marker_injection",
+        "deep_nesting",
+    ],
+)
+def test_execution_request_goal_parser_rejects_ambiguous_or_malicious_fixed_marker(
+    tmp_path, monkeypatch, corruption
+):
+    begin = "<!-- G1Q3_RCA_EXECUTION_REQUEST_JSON:BEGIN -->"
+    end = "<!-- G1Q3_RCA_EXECUTION_REQUEST_JSON:END -->"
+    canonical = '{"a":1,"b":2}'
+    if corruption == "duplicate_block":
+        fixed = f"{begin}\n{canonical}\n{end}\n{begin}\n{canonical}\n{end}"
+    elif corruption == "missing_end":
+        fixed = f"{begin}\n{canonical}\n"
+    elif corruption == "end_before_begin":
+        fixed = f"{end}\n{begin}\n{canonical}"
+    elif corruption == "multiline":
+        fixed = f'{begin}\n{{\n"a":1\n}}\n{end}'
+    elif corruption == "noncanonical":
+        fixed = f'{begin}\n{{"b":2, "a":1}}\n{end}'
+    elif corruption == "duplicate_key":
+        fixed = f'{begin}\n{{"a":1,"a":2}}\n{end}'
+    elif corruption == "non_object":
+        fixed = f"{begin}\n[1,2]\n{end}"
+    elif corruption == "deep_nesting":
+        payload = '{"nested":' + "[" * 1_500 + "0" + "]" * 1_500 + "}"
+        fixed = f"{begin}\n{payload}\n{end}"
+    else:
+        injected = json.dumps(
+            {"text": "<!-- G1Q3_RCA_ADMISSION_JSON:BEGIN -->"},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        fixed = f"{begin}\n{injected}\n{end}"
+    valid_legacy = _legacy_request_goal('{"legacy":true}')
+    _write_goal_for_request_parser(
+        tmp_path,
+        monkeypatch,
+        fixed + "\n" + valid_legacy,
+    )
+
+    assert pnc_completion_notice_relay._load_execution_request_from_goal("task") == {}
+
+
+def test_execution_request_goal_parser_keeps_bounded_legacy_object_compatibility(
+    tmp_path, monkeypatch
+):
+    legacy = {
+        "data": {"pdcl_download_cmd": "historical-shape"},
+        "work_item": {"work_item_id": "legacy"},
+    }
+    pretty = json.dumps(legacy, ensure_ascii=False, indent=2)
+    _write_goal_for_request_parser(
+        tmp_path,
+        monkeypatch,
+        _legacy_request_goal(pretty),
+    )
+
+    assert pnc_completion_notice_relay._load_execution_request_from_goal("task") == (
+        legacy
+    )
+
+
+@pytest.mark.parametrize(
+    "legacy_json",
+    [
+        "[]",
+        '{"a":1,"a":2}',
+        "NaN",
+    ],
+)
+def test_execution_request_goal_parser_rejects_invalid_legacy_shapes(
+    tmp_path, monkeypatch, legacy_json
+):
+    _write_goal_for_request_parser(
+        tmp_path,
+        monkeypatch,
+        _legacy_request_goal(legacy_json),
+    )
+
+    assert pnc_completion_notice_relay._load_execution_request_from_goal("task") == {}
+
+
+def test_execution_request_goal_parser_rejects_oversize_and_invalid_utf8(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        pnc_completion_notice_relay,
+        "RCA_EXECUTION_REQUEST_MAX_BYTES",
+        32,
+    )
+    _write_goal_for_request_parser(
+        tmp_path,
+        monkeypatch,
+        _legacy_request_goal(json.dumps({"value": "x" * 64})),
+    )
+    assert pnc_completion_notice_relay._load_execution_request_from_goal("task") == {}
+
+    _write_goal_for_request_parser(tmp_path, monkeypatch, b"\xff\xfe\xfd")
+    assert pnc_completion_notice_relay._load_execution_request_from_goal("task") == {}
+
+
+def test_execution_request_goal_parser_rejects_oversize_goal(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(pnc_completion_notice_relay, "RCA_GOAL_MAX_BYTES", 32)
+    _write_goal_for_request_parser(
+        tmp_path,
+        monkeypatch,
+        _fixed_request_goal({"value": "bounded-request"}),
+    )
+
+    assert pnc_completion_notice_relay._load_execution_request_from_goal("task") == {}
+
+
+def test_execution_request_goal_parser_rejects_duplicate_legacy_envelopes(
+    tmp_path, monkeypatch
+):
+    block = _legacy_request_goal('{"legacy":true}')
+    _write_goal_for_request_parser(tmp_path, monkeypatch, block + block)
+
+    assert pnc_completion_notice_relay._load_execution_request_from_goal("task") == {}
 
 
 def test_g1q3_report_ready_enrichment_uses_report_html_and_issue_input(tmp_path, monkeypatch):
@@ -3620,8 +3907,78 @@ def test_g1q3_report_ready_enrichment_uses_report_html_and_issue_input(tmp_path,
     assert delivery["business_case_dir_http"] == "http://192.168.26.174:18081/G1Q3_RCA/cases/7026726390_acc"
     assert delivery["artifact_vm"] == "/mnt/tmp/g1q3_rca_issue_intake_7026726390_bc7e1d/"
     assert delivery["artifact_cifs"] == "//hfs.minieye.tech/department-perception_test_team/G1Q3_RCA/cases/7026726390_acc"
-    assert delivery["input_original"] == "飞书问题 7026726390 + mdi download event -u 7445 -s ./"
-    assert delivery["input_resolved"] == "mdi download event -u 7445 -s ./"
+    assert delivery["input_original"] == "飞书问题 7026726390 + 远程直读 (历史 v1 event/clip 引用；不执行 MDI 下载)"
+    assert delivery["input_resolved"] == "远程直读 (历史 v1 event/clip 引用；不执行 MDI 下载)"
+    assert "7445" not in delivery["input_original"]
+    assert "7445" not in delivery["input_resolved"]
+
+
+def test_compact_input_label_uses_v2_remote_read_summary_without_identifiers():
+    request = {
+        "work_item": {"work_item_id": "7026726390"},
+        "data": {
+            "data_access": {
+                "mode": "remote_read",
+                "references": [
+                    {"kind": "event", "event_uuid": "sensitive-event"},
+                    {"kind": "clip", "clip_uuid": "sensitive-clip"},
+                ],
+            },
+        },
+    }
+
+    label = pnc_completion_notice_relay._compact_input_label(request)
+
+    assert label == "飞书问题 7026726390 + 远程直读 (clip x1, event x1；不执行 MDI 下载)"
+    assert "sensitive-event" not in label
+    assert "sensitive-clip" not in label
+
+
+def test_legacy_mdi_evidence_is_neutralized_without_false_need_input():
+    text = pnc_completion_notice_relay._remote_read_user_text(
+        "历史证据来源：mdi download event -u opaque -s ./"
+    )
+
+    assert text == pnc_completion_notice_relay.REMOTE_REFERENCE_COMPATIBILITY_NOTE
+    assert "event/clip 引用" in text
+    assert "不执行 MDI 下载" in text
+    assert "需在飞书问题单" not in text
+    assert "opaque" not in text
+
+
+@pytest.mark.parametrize(
+    "legacy_text",
+    [
+        "mdi clip -u opaque -s ./",
+        "mdi event -u opaque -s ./",
+        "mdi refresh2 -u opaque -s ./",
+        "mdi download event -u opaque -s ./；不执行 MDI 下载",
+    ],
+)
+def test_every_legacy_mdi_form_is_neutralized_before_user_render(legacy_text):
+    text = pnc_completion_notice_relay._remote_read_user_text(legacy_text)
+
+    assert text == pnc_completion_notice_relay.REMOTE_REFERENCE_COMPATIBILITY_NOTE
+    assert "opaque" not in text
+    assert legacy_text not in text
+
+
+def test_legacy_need_input_reason_requests_remote_reference_not_download():
+    reason = pnc_completion_notice_relay._need_input_reason(
+        {
+            "delivery": {
+                "missing_reason": "请补充问题数据地址_PDCL：mdi download event -u opaque -s ./",
+            },
+        },
+        {},
+    )
+
+    assert reason == pnc_completion_notice_relay.REMOTE_REFERENCE_GUIDANCE
+    assert "只提取引用并远程读取" in reason
+    assert "不执行 MDI 下载" in reason
+    assert "mdi refresh" not in reason.lower()
+    assert "mdi download" not in reason.lower()
+    assert "opaque" not in reason
 
 
 def test_perception_test_team_http_maps_vm_report_path():

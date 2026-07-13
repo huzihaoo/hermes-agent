@@ -195,7 +195,7 @@ def test_nested_pipeline_blocker_routes_infra_failure_to_pipeline_fix():
     assert projection["action_category"] == "none"
 
 
-def test_awaiting_automatic_download_stays_in_progress_without_stage_metadata():
+def test_awaiting_remote_read_stays_in_progress_without_stage_metadata():
     projection = derive_presentation(
         "running",
         {
@@ -209,5 +209,78 @@ def test_awaiting_automatic_download_stays_in_progress_without_stage_metadata():
     )
 
     assert projection["lane"] == "in_progress"
-    assert projection["report_status"] == "need_download"
+    assert projection["report_status"] == "in_progress"
     assert projection["requires_user_input"] is False
+
+
+def test_historical_need_download_input_projects_remote_reference_guidance():
+    projection = derive_presentation(
+        'completed',
+        {
+            'business_state': 'missing_user_input',
+            'user_action': {
+                'next_action_text': '请补充问题数据地址_PDCL 或有效 PDCL 下载命令',
+            },
+        },
+        {'report_status': 'need_download'},
+        'gate=ready_to_download',
+        {},
+    )
+
+    rendered = json.dumps(projection, ensure_ascii=False)
+    assert projection['lane'] == 'need_evidence'
+    assert 'event/clip 引用' in projection['missing_reason']
+    assert '远程读取' in projection['missing_reason']
+    assert '不执行 MDI 下载' in projection['missing_reason']
+    assert 'mdi refresh' not in rendered.lower()
+    assert 'mdi download' not in rendered.lower()
+    assert '继续下载/解析' not in rendered
+    assert '数据下载执行中' not in rendered
+
+
+def test_historical_s2_download_running_stage_is_displayed_as_remote_read():
+    projection = derive_presentation(
+        'running',
+        {
+            'pipeline_result': {
+                'status': 'running',
+                'stage': 's2_download',
+            },
+        },
+        {},
+        '',
+        {},
+    )
+
+    assert projection['lane'] == 'in_progress'
+    assert projection['report_status'] == 'in_progress'
+    assert '远程读取问题数据中' in projection['status_line']
+    assert '数据下载执行中' not in projection['status_line']
+    assert 'pipeline running' not in projection['status_line']
+
+
+def test_historical_download_stage_message_cannot_override_remote_read_label():
+    projection = derive_presentation(
+        'running',
+        {},
+        {},
+        '',
+        {
+            'pipeline_result': {
+                'status': 'running',
+                'stage': 's2_download',
+                'message': 'downloading source data',
+            },
+        },
+    )
+
+    assert '远程读取问题数据中' in projection['status_line']
+    assert 'downloading' not in projection['status_line']
+
+
+def test_forbidden_guard_catches_old_group_retrigger_and_download_claims():
+    rendered = '数据已下载；重发问题链接，我会自动重跑 RCA。'
+    hits = no_deliverable_forbidden_hits(rendered, has_deliverable_report=False)
+
+    assert '数据已下载' in hits
+    assert '重发问题链接，我会自动重跑' in hits

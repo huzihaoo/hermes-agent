@@ -35,77 +35,48 @@ DAILY_CAP_ENV = "HERMES_G1Q3_FIELD_GAP_COMMENT_DAILY_CAP"
 DEFAULT_DAILY_CAP = 10
 REPEAT_WINDOW_DAYS = 30
 
-# 2026-06-24 G1Q3-RCA backlog decision: among the live invalid PDCL samples,
-# the MDI family covers the vast majority and NAS paths are a small minority
-# (~6%).  We therefore keep the safe contract as "guide the issue owner to
-# provide a valid mdi download/refresh command" instead of adding a NAS staging
-# execution path here.
-#
 # Signature sentences double as content-based dedup keys: if any existing
 # comment contains the signature, we never post again.
 _TEMPLATES = {
-    "issue_field_missing_pdcl_download_cmd": {
-        "signature": "缺少 问题数据地址_PDCL 下载命令",
+    "issue_field_missing_remote_data_reference": {
+        "signature": "缺少可远程读取的数据引用",
         "body": (
-            "【G1Q3 RCA 机器人提醒】本问题卡片缺少 问题数据地址_PDCL 下载命令，自动根因分析无法启动。\n\n"
-            "请{owner}在「问题数据地址_PDCL」字段补充数据下载命令，格式示例：\n"
-            "`mdi download event -u <事件ID> -s ./`\n或 `mdi refresh -t <ticket> -e <event> -s ./`\n\n"
-            "参考 guide：`api/g1q3_rca/docs/pdcl_mdi_data_download_guide.md`。\n补充后在 RCA 群重新 @机器人 触发分析即可。"
+            "【G1Q3 RCA 机器人提醒】本问题卡片缺少可远程读取的 event/clip 数据引用，自动根因分析无法启动。\n\n"
+            "请{owner}在「问题数据地址_PDCL」字段补充可解析的 event/clip 地址，地址中必须包含明确的 event UUID 或 clip UUID。\n\n"
+            "该字段只用于提取远程读取引用，RCA 不会执行 MDI 下载。新建问题单由 Kafka 自动受理；"
+            "已建单补齐字段后，可在固定群（HERMES_RCA_MANUAL_CHAT_IDS 当前启用子集）真实 @小助手并发送“分析/重跑 + 完整问题单 URL”。"
+            "普通 URL、未 @ 或私聊仍只读；人工触发结果回到原任务话题。"
         ),
     },
-    "issue_field_invalid_pdcl_download_cmd": {
-        "signature": "问题数据地址_PDCL 格式不符合要求",
+    "issue_field_invalid_remote_data_reference": {
+        "signature": "问题数据地址_PDCL 无法解析为远程数据引用",
         "body": (
-            "【G1Q3 RCA 机器人提醒】本问题卡片的 问题数据地址_PDCL 格式不符合要求，自动根因分析无法启动。\n\n"
-            "请{owner}将「问题数据地址_PDCL」修改为标准下载命令，格式示例：\n"
-            "`mdi download event -u <事件ID> -s ./`\n或 `mdi refresh -t <ticket> -e <event> -s ./`\n\n"
-            "参考 guide：`api/g1q3_rca/docs/pdcl_mdi_data_download_guide.md`。\n修改后在 RCA 群重新 @机器人 触发分析即可。"
+            "【G1Q3 RCA 机器人提醒】本问题卡片的「问题数据地址_PDCL」无法解析为 RemoteEventReader/RemoteClipReader 引用。\n\n"
+            "请{owner}补充明确的 event UUID 或 clip UUID；仅 ticket、NAS 路径、回放命令和 raw/group/eventset 地址当前不能进入自动 RCA。\n\n"
+            "新建问题单由 Kafka 自动受理；已建单补齐字段后，可在固定群（HERMES_RCA_MANUAL_CHAT_IDS 当前启用子集）"
+            "真实 @小助手并发送“分析/重跑 + 完整问题单 URL”。普通 URL、未 @ 或私聊仍只读；人工触发结果回到原任务话题。"
         ),
-    },
-    "issue_field_invalid_pdcl_download_cmd:empty": {
-        "signature": "缺少 问题数据地址_PDCL 下载命令",
-        "body": (
-            "【G1Q3 RCA 机器人提醒】本问题卡片缺少 问题数据地址_PDCL 下载命令，自动根因分析无法启动。\n\n"
-            "请{owner}在「问题数据地址_PDCL」字段补充 `mdi download ...` 或 `mdi refresh ...` 下载命令，格式示例：\n"
-            "`mdi download event -u <事件ID> -s ./`\n或 `mdi refresh -t <ticket> -e <event> -s ./`\n\n"
-            "补充后在 RCA 群重新 @机器人 触发分析即可。"
-        ),
-    },
-    "issue_field_invalid_pdcl_download_cmd:nas_path": {
-        "signature": "问题数据地址_PDCL 填成了 NAS 路径",
-        "body": (
-            "【G1Q3 RCA 机器人提醒】本问题卡片的「问题数据地址_PDCL」填成了 NAS/本地文件路径，自动根因分析不能直接读取该路径。\n\n"
-            "请{owner}改为 `mdi download ...` 或 `mdi refresh ...` 下载命令；如果只有 NAS 数据，请先申请 NAS staging/转换为可下载的 MDI 数据地址。\n\n"
-            "正确示例：`mdi download event -u <事件ID> -s ./` 或 `mdi refresh -t <ticket> -e <event> -s ./`。\n补充后在 RCA 群重新 @机器人 触发分析即可。"
-        ),
-    },
-    "issue_field_invalid_pdcl_download_cmd:replay_cmd": {
-        "signature": "问题数据地址_PDCL 填成了回放命令",
-        "body": (
-            "【G1Q3 RCA 机器人提醒】本问题卡片的「问题数据地址_PDCL」看起来是 cyber_recorder 回放命令，它不是数据下载命令，自动根因分析无法据此拉取数据。\n\n"
-            "请{owner}把该字段改成 `mdi download ...` 或 `mdi refresh ...` 命令；回放命令如需保留，请放到描述/备注，不要放在下载地址字段。\n\n"
-            "正确示例：`mdi download event -u <事件ID> -s ./` 或 `mdi refresh -t <ticket> -e <event> -s ./`。\n补充后在 RCA 群重新 @机器人 触发分析即可。"
-        ),
-    },
-    "issue_field_invalid_pdcl_download_cmd:non_mdi": {
-        "signature": "问题数据地址_PDCL 不是 MDI 命令",
-        "body": "【G1Q3 RCA 机器人提醒】本问题卡片的「问题数据地址_PDCL」不是以 mdi 开头的下载/刷新命令。\n\n请{owner}改为 `mdi download ...` 或 `mdi refresh ...` 命令后再重试。",
-    },
-    "issue_field_invalid_pdcl_download_cmd:bad_mdi_form": {
-        "signature": "问题数据地址_PDCL 的 MDI 参数不符合要求",
-        "body": "【G1Q3 RCA 机器人提醒】本问题卡片的「问题数据地址_PDCL」虽然以 mdi 开头，但参数不符合只读下载白名单。\n\n请{owner}使用 `mdi download event -u <事件ID> -s ./` 或 `mdi refresh -t <ticket> -e <event> -s ./`，不要填写 `-f` 回放文件或非下载参数。",
     },
     "missing_frame_id": {
         "signature": "缺少 问题发生frameid",
         "body": (
             "【G1Q3 RCA 机器人提醒】本问题卡片缺少 问题发生frameid，数据已就绪但无法定位触发帧，自动根因分析停在对齐前。\n\n"
-            "请{owner}在「问题发生frameid」字段填写大于 0 的触发帧号。\n\n补充后在 RCA 群重新 @机器人 触发分析即可。"
+            "请{owner}在「问题发生frameid」字段填写大于 0 的触发帧号。\n\n新建问题单由 Kafka 自动受理；"
+            "已建单补齐字段后，可在固定群（HERMES_RCA_MANUAL_CHAT_IDS 当前启用子集）真实 @小助手并发送“分析/重跑 + 完整问题单 URL”。"
+            "普通 URL、未 @ 或私聊仍只读；人工触发结果回到原任务话题。"
         ),
     },
     "missing_frame_id:replay_cmd": {
         "signature": "问题发生frameid 填成了回放命令",
-        "body": "【G1Q3 RCA 机器人提醒】本问题卡片的「问题发生frameid」字段像是填入了 cyber_recorder/下载命令，该字段只能填写触发帧号。\n\n请{owner}把下载/回放相关内容移到「问题数据地址_PDCL」或描述字段，并在「问题发生frameid」填写大于 0 的数字帧号。",
+        "body": "【G1Q3 RCA 机器人提醒】本问题卡片的「问题发生frameid」字段像是填入了 cyber_recorder/数据命令，该字段只能填写触发帧号。\n\n请{owner}把数据/回放相关内容移到「问题数据地址_PDCL」或描述字段，并在「问题发生frameid」填写大于 0 的数字帧号。新建问题单由 Kafka 自动受理；已建单补齐字段后，可在固定群（HERMES_RCA_MANUAL_CHAT_IDS 当前启用子集）真实 @小助手并发送“分析/重跑 + 完整问题单 URL”。普通 URL、未 @ 或私聊仍只读；人工触发结果回到原任务话题。",
     },
+}
+
+# Keep historical blocker identifiers readable while projecting the current
+# remote-read-only contract. They are compatibility keys, not download paths.
+_LEGACY_TEMPLATE_ALIASES = {
+    "issue_field_missing_pdcl_download_cmd": "issue_field_missing_remote_data_reference",
+    "issue_field_invalid_pdcl_download_cmd": "issue_field_invalid_remote_data_reference",
 }
 
 
@@ -149,6 +120,10 @@ def build_field_gap_comment(
     """Render the comment plan for a supported field-gap blocker, else None."""
     kind = str(blocker_kind or "").strip()
     sub = str(sub_kind or "").strip()
+    if kind == "issue_field_invalid_pdcl_download_cmd" and sub == "empty":
+        kind = "issue_field_missing_remote_data_reference"
+    else:
+        kind = _LEGACY_TEMPLATE_ALIASES.get(kind, kind)
     template = _TEMPLATES.get(f"{kind}:{sub}") if sub else None
     if template is None:
         template = _TEMPLATES.get(kind)

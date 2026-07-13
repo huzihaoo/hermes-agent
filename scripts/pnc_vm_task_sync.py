@@ -17,6 +17,7 @@ import os
 import pwd
 import re
 import stat
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -41,6 +42,11 @@ from scripts.pnc_foxglove_delivery import foxglove_delivery_fields  # noqa: E402
 from scripts.pnc_status_projection import PIPELINE_RUNNING_STAGES, PIPELINE_STAGE_DEFINITIONS, PIPELINE_STAGE_LABELS, derive_presentation  # noqa: E402
 from scripts.vm_task_status_collect import collect_vm_task_status, write_collected_status_to_sidecar  # noqa: E402
 from tools import vm_task_completion_probe  # noqa: E402
+from scripts.pnc_aux_runtime_health import (  # noqa: E402
+    build_process_runtime_evidence,
+    canonical_json_sha256,
+    write_owner_health,
+)
 
 PNC_CHAT_ID = "oc_16614f4ba25b8c88b69c0b8e9ebc2fb5"
 G1Q3_RCA_CHAT_ID = "oc_6cfc782212009ff4cd815349909dd423"
@@ -72,6 +78,21 @@ PERCEPTION_TEST_TEAM_VM_PREFIX = "/mnt/minieye/pdcl/department/perception_test_t
 PERCEPTION_TEST_TEAM_CIFS_PREFIX = "//hfs.minieye.tech/department-perception_test_team/"
 PIPELINE_STATE_READ_LINES = 500
 PIPELINE_STATE_SOURCE = "vm_pipeline_state"
+VM_TASK_SYNC_COMPLETION_SCHEMA_VERSION = "pnc_vm_task_sync_completion_v1"
+VM_TASK_SYNC_SERVICE_LABEL = "local.pnc.vm-task-sync"
+
+
+def _vm_task_sync_receipt_path() -> Path:
+    configured = os.getenv("PNC_VM_TASK_SYNC_RECEIPT_PATH", "").strip()
+    if configured:
+        expanded = Path(configured).expanduser()
+        if not expanded.is_absolute():
+            raise ValueError("PNC_VM_TASK_SYNC_RECEIPT_PATH must be absolute")
+        return expanded.absolute()
+    return (
+        get_hermes_home()
+        / "runtime/pnc_agent/feishu_issue_kafka_rca/vm_task_sync_completion.json"
+    )
 
 
 def _perception_test_team_cifs(vm_path: str) -> str:
@@ -1397,7 +1418,7 @@ def _delivery_from_contract(task: Task, payload_or_contract: dict[str, Any]) -> 
             "数据已就位，无需重传；需人工指定关键帧或确认 discover_acc_speed_unstable 所需信号是否采集",
         ]
         return {
-            "conclusion": f"数据已下载，自动找帧无候选（{message}）→ 已停在 {stage}，需人工指定关键帧或确认采集信号后继续 RCA",
+            "conclusion": f"问题数据已远程读取，自动找帧无候选（{message}）→ 已停在 {stage}，需人工指定关键帧或确认采集信号后继续 RCA",
             "report_status": "need_keyframe",
             "attribution_status": "need_keyframe",
             "artifact_path": None,
@@ -1433,7 +1454,7 @@ def _delivery_from_contract(task: Task, payload_or_contract: dict[str, Any]) -> 
         if drift_reasons:
             blocked_boundaries.append("contract_drift_fields：" + ", ".join(drift_reasons[:6]))
         return {
-            "conclusion": f"数据已下载，自动找帧无候选（{message}）→ 已停在 {stage}，需人工指定关键帧或确认采集信号后继续 RCA",
+            "conclusion": f"问题数据已远程读取，自动找帧无候选（{message}）→ 已停在 {stage}，需人工指定关键帧或确认采集信号后继续 RCA",
             "report_status": "need_keyframe",
             "attribution_status": "need_keyframe",
             "artifact_path": None,
@@ -1455,10 +1476,10 @@ def _delivery_from_contract(task: Task, payload_or_contract: dict[str, Any]) -> 
         }
 
     if business_state == "awaiting_download" or (report.get("status") == "need_download" and user_action.get("requires_user_input") is False):
-        reason = str(user_action.get("next_action_text") or user_action.get("next_action") or summary.get("l0") or "已受理；数据待自动下载/解析，无需发起人补数据").strip()
+        reason = str(user_action.get("next_action_text") or user_action.get("next_action") or summary.get("l0") or "已受理；问题数据正在远程读取和解析，无需发起人补数据").strip()
         return {
-            "conclusion": "数据下载执行中（pipeline running）；等待解析完成后更新 RCA 状态",
-            "report_status": "need_download",
+            "conclusion": "远程读取问题数据中；等待解析完成后更新 RCA 状态",
+            "report_status": "in_progress",
             "attribution_status": "need_evidence",
             "artifact_path": None,
             "artifact_root": str(artifacts.get("task_root_cifs") or artifacts.get("task_root_vm") or "").strip() or None,
@@ -1468,7 +1489,7 @@ def _delivery_from_contract(task: Task, payload_or_contract: dict[str, Any]) -> 
             "next_options": [],
             "source": "delivery_contract_v1",
             "human_action_kind": "none",
-            "business_state": "awaiting_download",
+            "business_state": "remote_reading",
             "presentation_state": str(contract.get("presentation_state") or "processing").strip(),
             "translate_baseline": translate_baseline or None,
             "translate_contract_path": translate_contract_path or None,
@@ -1476,7 +1497,7 @@ def _delivery_from_contract(task: Task, payload_or_contract: dict[str, Any]) -> 
         }
 
     if business_state in {"missing_user_input", "data_required", "intake_validated"} or user_action.get("requires_user_input") is True:
-        reason = str(user_action.get("next_action_text") or user_action.get("next_action") or summary.get("l0") or "待下载/解析数据后再出 RCA 结论").strip()
+        reason = str(user_action.get("next_action_text") or user_action.get("next_action") or summary.get("l0") or "待远程读取/解析问题数据后再出 RCA 结论").strip()
         return {
             "conclusion": "intake 与准入校验完成；需要发起人补充缺失字段后再继续 RCA",
             "report_status": "need_user_data",
@@ -1710,7 +1731,7 @@ def _task_card_for_task(task: Task, payload: dict[str, Any]) -> dict[str, Any]:
             stitched_delivery = _delivery_from_contract(task, stitched_contract)
             if stitched_delivery:
                 delivery = stitched_delivery
-    if delivery and delivery.get("report_status") == "need_download":
+    if delivery and delivery.get("report_status") in {"need_download", "in_progress"}:
         user_state = "in_progress"
     elif delivery and delivery.get("report_status") == "need_keyframe":
         user_state = "awaiting_user"
@@ -1725,13 +1746,12 @@ def _task_card_for_task(task: Task, payload: dict[str, Any]) -> dict[str, Any]:
         and _g1q3_intake_needs_download(task)
     )
     if intake_needs_download:
-        # Gate-only intake (ready_to_download / need_evidence): no report, no
-        # attribution.  Render an honest need-download state so this writer
-        # agrees with the completion-notice relay instead of re-asserting done.
+        # Historical gate-only intake has no report or attribution. Project its
+        # legacy download state onto the current remote-read-only contract.
         user_state = "in_progress"
         delivery = {
-            "conclusion": "intake 与准入校验完成；尚未下载/解析数据，未生成 RCA 报告（gate=ready_to_download）",
-            "report_status": "need_download",
+            "conclusion": "intake 与准入校验完成；问题数据等待远程读取/解析，尚未生成 RCA 报告",
+            "report_status": "in_progress",
             "artifact_path": None,
             "boundaries": [],
             "next_options": [],
@@ -1758,7 +1778,16 @@ def _task_card_for_task(task: Task, payload: dict[str, Any]) -> dict[str, Any]:
     g1q3_evidence = (
         task.chat_id == G1Q3_RCA_CHAT_ID
         and (
-            delivery_report_status in {"html_delivery_ready", "report_ready", "report_generated_need_review", "need_download", "need_keyframe", "out_of_scope", "not_admissible"}
+            delivery_report_status in {
+                "html_delivery_ready",
+                "report_ready",
+                "report_generated_need_review",
+                "in_progress",
+                "need_download",
+                "need_keyframe",
+                "out_of_scope",
+                "not_admissible",
+            }
             or intake_needs_download
             or isinstance(payload.get("delivery_contract"), dict)
             or isinstance(payload.get("pipeline_result"), dict)
@@ -1787,11 +1816,23 @@ def _task_card_for_task(task: Task, payload: dict[str, Any]) -> dict[str, Any]:
         )
         card["presentation"] = projection
         card["user_state"] = str(projection.get("user_state") or card["user_state"])
+        if delivery_report_status == "in_progress":
+            card["user_state"] = "in_progress"
         if isinstance(card.get("delivery"), dict):
-            preserve_delivery_truth = card["delivery"].get("source") == "pipeline_result_truth_override" or delivery_report_status in {"need_keyframe", "html_delivery_ready", "report_ready", "report_generated_need_review"}
+            preserve_delivery_truth = (
+                card["delivery"].get("source") == "pipeline_result_truth_override"
+                or delivery_report_status
+                in {
+                    "in_progress",
+                    "need_keyframe",
+                    "html_delivery_ready",
+                    "report_ready",
+                    "report_generated_need_review",
+                }
+            )
             if not preserve_delivery_truth:
                 card["delivery"]["conclusion"] = str(projection.get("conclusion") or card["delivery"].get("conclusion") or "")
-            if not (preserve_delivery_truth and delivery_report_status == "report_ready"):
+            if not preserve_delivery_truth:
                 card["delivery"]["report_status"] = str(projection.get("report_status") or card["delivery"].get("report_status") or "")
             if projection.get("missing_reason"):
                 card["delivery"]["missing_reason"] = str(projection.get("missing_reason") or "")
@@ -2140,6 +2181,8 @@ def sync_pnc_vm_tasks(
 
 
 def main(argv: list[str] | None = None) -> int:
+    started_at = datetime.now(timezone.utc)
+    run_id = f"pnc-vm-task-sync-{os.getpid()}-{secrets.token_hex(8)}"
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--limit", type=int, default=50)
     parser.add_argument("--chat-id", action="append", default=[])
@@ -2239,6 +2282,37 @@ def main(argv: list[str] | None = None) -> int:
                 }
             else:
                 result = sync_pnc_vm_tasks(**sync_kwargs)
+    exit_code = 0 if result["ok"] else 2
+    if not result.get("skipped"):
+        completed_at = datetime.now(timezone.utc)
+        runtime_evidence = build_process_runtime_evidence(
+            service_label=VM_TASK_SYNC_SERVICE_LABEL,
+            script_path=Path(__file__),
+        )
+        errors = [str(value) for value in result.get("errors") or []]
+        result_summary = {
+            "candidate_count": int(result.get("candidate_count") or 0),
+            "synced_count": int(result.get("synced_count") or 0),
+            "error_count": len(errors),
+            "errors": errors,
+        }
+        write_owner_health(
+            _vm_task_sync_receipt_path(),
+            {
+                "schema_version": VM_TASK_SYNC_COMPLETION_SCHEMA_VERSION,
+                "service_label": VM_TASK_SYNC_SERVICE_LABEL,
+                "run_id": run_id,
+                "started_at": started_at.isoformat(),
+                "completed_at": completed_at.isoformat(),
+                "pid": runtime_evidence["pid"],
+                "exit_code": exit_code,
+                "ok": result.get("ok") is True,
+                "skipped": False,
+                **result_summary,
+                "result_sha256": canonical_json_sha256(result_summary),
+                "runtime_identity": runtime_evidence["runtime_identity"],
+            },
+        )
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     else:
@@ -2247,7 +2321,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"- {row['task_id']} -> {row['vm_task_id']}: {row.get('state') or row.get('status')}")
         for error in result["errors"]:
             print(f"error: {error}")
-    return 0 if result["ok"] else 2
+    return exit_code
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 from datetime import datetime
@@ -10,6 +11,8 @@ from pathlib import Path
 from typing import List
 
 from .types import QueueItem
+
+logger = logging.getLogger(__name__)
 
 
 class ConnectionPool:
@@ -82,7 +85,8 @@ def init_db(db_path: Path) -> None:
             retry_count INTEGER NOT NULL DEFAULT 0,
             max_retries INTEGER NOT NULL DEFAULT 3,
             last_error TEXT,
-            next_retry_at TEXT
+            next_retry_at TEXT,
+            event_context TEXT
         )
         """
     )
@@ -104,6 +108,7 @@ def init_db(db_path: Path) -> None:
     _migrate_add_column(conn, "max_retries", "INTEGER NOT NULL DEFAULT 3")
     _migrate_add_column(conn, "last_error", "TEXT")
     _migrate_add_column(conn, "next_retry_at", "TEXT")
+    _migrate_add_column(conn, "event_context", "TEXT")
     conn.commit()
 
 
@@ -116,62 +121,67 @@ def _migrate_add_column(conn: sqlite3.Connection, col_name: str, col_def: str) -
 
 
 def save_items(db_path: Path, items: List[QueueItem]) -> None:
-    """Save queue items to SQLite using upsert (no DELETE, safe for concurrent writes)."""
+    """Atomically synchronize the complete in-memory queue snapshot to SQLite."""
     init_db(db_path)
     conn = _get_pool(db_path).get()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        existing_ids = {
+            row[0] for row in conn.execute("SELECT id FROM queue_items").fetchall()
+        }
+        for item in items:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO queue_items (
+                    id, user_id, user_role, message, lane, priority, status,
+                    created_at, started_at, completed_at, result,
+                    chat_id, chat_type, thread_id, request_message_id, platform,
+                    domain, domain_id,
+                    retry_count, max_retries, last_error, next_retry_at,
+                    event_context
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    item.id,
+                    item.user_id,
+                    item.user_role,
+                    item.message,
+                    item.lane,
+                    item.priority,
+                    item.status,
+                    item.created_at.isoformat(),
+                    item.started_at.isoformat() if item.started_at else None,
+                    item.completed_at.isoformat() if item.completed_at else None,
+                    json.dumps(item.result) if item.result else None,
+                    item.chat_id,
+                    item.chat_type,
+                    item.thread_id,
+                    item.request_message_id,
+                    item.platform,
+                    item.domain,
+                    item.domain_id,
+                    item.retry_count,
+                    item.max_retries,
+                    item.last_error,
+                    item.next_retry_at.isoformat() if item.next_retry_at else None,
+                    json.dumps(item.event_context) if item.event_context is not None else None,
+                ),
+            )
 
-    # Get all current item IDs in DB
-    cursor = conn.execute("SELECT id FROM queue_items")
-    existing_ids = {row[0] for row in cursor.fetchall()}
-
-    # Upsert all items
-    for item in items:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO queue_items (
-                id, user_id, user_role, message, lane, priority, status,
-                created_at, started_at, completed_at, result,
-                chat_id, chat_type, thread_id, request_message_id, platform,
-                domain, domain_id,
-                retry_count, max_retries, last_error, next_retry_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                item.id,
-                item.user_id,
-                item.user_role,
-                item.message,
-                item.lane,
-                item.priority,
-                item.status,
-                item.created_at.isoformat(),
-                item.started_at.isoformat() if item.started_at else None,
-                item.completed_at.isoformat() if item.completed_at else None,
-                json.dumps(item.result) if item.result else None,
-                item.chat_id,
-                item.chat_type,
-                item.thread_id,
-                item.request_message_id,
-                item.platform,
-                item.domain,
-                item.domain_id,
-                item.retry_count,
-                item.max_retries,
-                item.last_error,
-                item.next_retry_at.isoformat() if item.next_retry_at else None,
-            ),
-        )
-
-    # Delete items that are no longer in memory
-    current_ids = {item.id for item in items}
-    to_delete = existing_ids - current_ids
-    for item_id in to_delete:
-        conn.execute("DELETE FROM queue_items WHERE id = ?", (item_id,))
-
-    conn.commit()
+        current_ids = {item.id for item in items}
+        for item_id in existing_ids - current_ids:
+            conn.execute("DELETE FROM queue_items WHERE id = ?", (item_id,))
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
 
 
-def load_items(db_path: Path) -> List[QueueItem]:
+def load_items(
+    db_path: Path,
+    *,
+    corruption_errors: list[str] | None = None,
+) -> List[QueueItem]:
     if not db_path.exists():
         return []
 
@@ -182,40 +192,57 @@ def load_items(db_path: Path) -> List[QueueItem]:
                   created_at, started_at, completed_at, result,
                   chat_id, chat_type, thread_id, request_message_id, platform,
                   domain, domain_id,
-                  retry_count, max_retries, last_error, next_retry_at
+                  retry_count, max_retries, last_error, next_retry_at,
+                  event_context
            FROM queue_items"""
     )
 
     items: list[QueueItem] = []
     for row in cursor.fetchall():
-        domain = row[16] if row[16] else "user"
-        domain_id = row[17] if row[17] else row[1]  # fallback to user_id
-        items.append(
-            QueueItem(
-                id=row[0],
-                user_id=row[1],
-                user_role=row[2],
-                message=row[3],
-                lane=row[4],
-                priority=row[5],
-                status=row[6],
-                created_at=datetime.fromisoformat(row[7]),
-                started_at=datetime.fromisoformat(row[8]) if row[8] else None,
-                completed_at=datetime.fromisoformat(row[9]) if row[9] else None,
-                result=json.loads(row[10]) if row[10] else None,
-                chat_id=row[11],
-                chat_type=row[12],
-                thread_id=row[13],
-                request_message_id=row[14],
-                platform=row[15],
-                domain=domain,
-                domain_id=domain_id,
-                retry_count=row[18] if row[18] is not None else 0,
-                max_retries=row[19] if row[19] is not None else 3,
-                last_error=row[20],
-                next_retry_at=datetime.fromisoformat(row[21]) if row[21] else None,
+        item_id = str(row[0] or "<missing-id>")
+        try:
+            result = json.loads(row[10]) if row[10] else None
+            event_context = json.loads(row[22]) if row[22] else None
+            if result is not None and not isinstance(result, dict):
+                raise ValueError("result must decode to an object")
+            if event_context is not None and not isinstance(event_context, dict):
+                raise ValueError("event_context must decode to an object")
+            domain = row[16] if row[16] else "user"
+            domain_id = row[17] if row[17] else row[1]  # fallback to user_id
+            items.append(
+                QueueItem(
+                    id=row[0],
+                    user_id=row[1],
+                    user_role=row[2],
+                    message=row[3],
+                    lane=row[4],
+                    priority=row[5],
+                    status=row[6],
+                    created_at=datetime.fromisoformat(row[7]),
+                    started_at=datetime.fromisoformat(row[8]) if row[8] else None,
+                    completed_at=datetime.fromisoformat(row[9]) if row[9] else None,
+                    result=result,
+                    chat_id=row[11],
+                    chat_type=row[12],
+                    thread_id=row[13],
+                    request_message_id=row[14],
+                    platform=row[15],
+                    domain=domain,
+                    domain_id=domain_id,
+                    retry_count=row[18] if row[18] is not None else 0,
+                    max_retries=row[19] if row[19] is not None else 3,
+                    last_error=row[20],
+                    next_retry_at=(
+                        datetime.fromisoformat(row[21]) if row[21] else None
+                    ),
+                    event_context=event_context,
+                )
             )
-        )
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            error = f"queue_item_corrupt:{item_id}:{type(exc).__name__}"
+            if corruption_errors is not None:
+                corruption_errors.append(error)
+            logger.error("[admission] Corrupt persisted queue item %s: %s", item_id, exc)
 
     return items
 
