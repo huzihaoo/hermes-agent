@@ -8146,6 +8146,39 @@ def test_future_runtime_projection_binds_complete_clean_git_tree(
     ).hexdigest()
 
 
+def test_future_runtime_projection_accepts_empty_tracked_marker_file(tmp_path):
+    fixture = _future_runtime_fixture(tmp_path)
+    relative = "docker/s6-rc.d/example/dependencies.d/base"
+    for root in (fixture.source, fixture.stage):
+        marker = root / relative
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_bytes(b"")
+    _git(fixture.source, "add", relative)
+    _git(
+        fixture.source,
+        "-c",
+        "user.name=RCA Future Runtime Test",
+        "-c",
+        "user.email=rca-future-runtime@example.invalid",
+        "commit",
+        "-q",
+        "-m",
+        "add empty runtime marker",
+    )
+
+    result = release_gate_module.project_future_candidate_runtime(
+        fixture.source,
+        fixture.stage,
+        candidate_plists=fixture.candidate_plists,
+        runner=fixture.runner,
+        runtime_verifier=fixture.runtime_verifier,
+    )
+
+    assert result["render_manifest"]["runtime_file_sha256"][relative] == hashlib.sha256(
+        b""
+    ).hexdigest()
+
+
 @pytest.mark.parametrize(
     "drift",
     [

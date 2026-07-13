@@ -9631,6 +9631,7 @@ def _stable_regular_file_observation(
     artifact: str,
     expected_mode: int | None = None,
     require_owner: bool = False,
+    allow_empty: bool = False,
     max_bytes: int = MAX_EVIDENCE_BYTES,
 ) -> tuple[bytes, os.stat_result]:
     absolute = path.expanduser().absolute()
@@ -9649,7 +9650,8 @@ def _stable_regular_file_observation(
                 expected_mode is not None
                 and stat.S_IMODE(initial.st_mode) != expected_mode
             )
-            or initial.st_size <= 0
+            or initial.st_size < 0
+            or (not allow_empty and initial.st_size == 0)
             or initial.st_size > max_bytes
             or absolute.resolve(strict=True) != absolute
         ):
@@ -13485,6 +13487,7 @@ def _future_runtime_file_observation(
         path,
         artifact=artifact,
         require_owner=require_owner,
+        allow_empty=True,
         max_bytes=runtime_stage.MAX_SOURCE_FILE_BYTES,
     )
     return {
@@ -13553,7 +13556,7 @@ def _future_runtime_source_snapshot(
             or expected_mode is None
             or len(oid) != expected_oid_length
             or any(character not in "0123456789abcdef" for character in oid)
-            or declared_size < 1
+            or declared_size < 0
             or declared_size > runtime_stage.MAX_SOURCE_FILE_BYTES
             or relative in result
         ):
