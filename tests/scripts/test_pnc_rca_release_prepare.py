@@ -1473,7 +1473,7 @@ def test_real_isolated_candidate_runtime_is_fail_closed_without_projection():
     assert error.value.code == "runtime_candidate_interpreter_mismatch"
 
 
-def test_real_request_fails_closed_while_host_candidate_is_dirty(
+def test_real_request_fails_closed_for_unsealed_actual_host_candidate(
     prepared_fixture,
 ):
     actual_root = release_gate.REPO_ROOT
@@ -1500,6 +1500,7 @@ def test_real_request_fails_closed_while_host_candidate_is_dirty(
         assert error.value.code in {
             "build_manifest_host_tree_dirty",
             "build_manifest_host_git_unavailable",
+            "future_runtime_stage_file_invalid",
         }
         assert not prepared_fixture.inputs.run_root.joinpath(
             prepare.APPROVAL_REQUEST_FILENAME
