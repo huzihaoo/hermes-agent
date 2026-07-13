@@ -21,6 +21,8 @@
     <string>1</string>
     <key>PYTHONNOUSERSITE</key>
     <string>1</string>
+    <key>PYTHONDONTWRITEBYTECODE</key>
+    <string>1</string>
     <key>VIRTUAL_ENV</key>
     <string>/Users/songying/.hermes/runtime/hermes-live/.venv</string>
   </dict>

@@ -813,6 +813,7 @@ def _validate_local_artifact_chain(
 def _plan_payload_bindings(bundle: ArtifactBundle) -> Mapping[str, Any]:
     env_stage = bundle.bodies["env_stage_receipt"]
     side_effect_contract = env_stage["side_effect_contract"]
+    runtime_manifest = bundle.bodies["runtime_stage_manifest"]
     return {
         "candidate_environment": {
             "source_path": env_stage["bindings"]["candidate_env"]["path"],
@@ -836,13 +837,16 @@ def _plan_payload_bindings(bundle: ArtifactBundle) -> Mapping[str, Any]:
             ],
         },
         "runtime": {
-            "staging_root": bundle.bodies["runtime_stage_manifest"].get("staging_root"),
-            "content_sha256": bundle.bodies["runtime_stage_manifest"].get(
-                "content_sha256"
+            "staging_root": runtime_manifest.get("staging_root"),
+            "candidate_plist_root": (
+                runtime_manifest.get("content", {})
+                .get("source", {})
+                .get("repo_root")
             ),
+            "content_sha256": runtime_manifest.get("content_sha256"),
             "canonical_path": str(CANONICAL_RUNTIME_ROOT),
             "candidate_plist_sha256": dict(
-                bundle.bodies["runtime_stage_manifest"]["future_canonical_projection"][
+                runtime_manifest["future_canonical_projection"][
                     "candidate_plist_sha256"
                 ]
             ),
@@ -1503,22 +1507,91 @@ def _runtime_payload_descriptor(
     source = content.get("source")
     plists = content.get("candidate_plists")
     venv = content.get("venv")
+    source_root_value = (
+        source.get("repo_root") if isinstance(source, Mapping) else None
+    )
     if (
         not isinstance(source, Mapping)
         or not isinstance(source.get("runtime_files"), Mapping)
+        or not isinstance(source_root_value, str)
+        or not source_root_value
+        or not Path(source_root_value).expanduser().is_absolute()
         or not isinstance(plists, Mapping)
         or set(plists) != set(CANDIDATE_PLISTS)
         or not isinstance(venv, Mapping)
         or not isinstance(venv.get("files"), Mapping)
     ):
         raise ProductionCutoverError("production_cutover_runtime_payload_invalid")
+    source_root = Path(source_root_value).expanduser().absolute()
+    try:
+        source_root_before = source_root.lstat()
+    except OSError as exc:
+        raise ProductionCutoverError(
+            "production_cutover_runtime_plist_source_unavailable"
+        ) from exc
+    if (
+        stat.S_ISLNK(source_root_before.st_mode)
+        or not stat.S_ISDIR(source_root_before.st_mode)
+        or source_root_before.st_uid != os.geteuid()
+        or stat.S_IMODE(source_root_before.st_mode) & 0o022
+    ):
+        raise ProductionCutoverError(
+            "production_cutover_runtime_plist_source_identity_invalid"
+        )
     expected: dict[str, Mapping[str, Any]] = {}
+    install_plists: dict[str, Mapping[str, Any]] = {}
+    projected_plist_sha256 = manifest.get("future_canonical_projection", {}).get(
+        "candidate_plist_sha256"
+    )
+    if not isinstance(projected_plist_sha256, Mapping):
+        raise ProductionCutoverError("production_cutover_runtime_payload_invalid")
     for relative, descriptor in source["runtime_files"].items():
         expected[_safe_runtime_relative(relative)] = descriptor
     for filename, pair in plists.items():
-        if not isinstance(pair, Mapping) or not isinstance(pair.get("staged"), Mapping):
+        if (
+            not isinstance(pair, Mapping)
+            or not isinstance(pair.get("source"), Mapping)
+            or not isinstance(pair.get("staged"), Mapping)
+        ):
             raise ProductionCutoverError("production_cutover_runtime_payload_invalid")
         expected[_safe_runtime_relative(filename)] = pair["staged"]
+        source_descriptor = pair["source"]
+        source_relative = _safe_runtime_relative(source_descriptor.get("path"))
+        source_sha256 = _require_sha256(
+            source_descriptor.get("sha256"),
+            code="production_cutover_runtime_payload_invalid",
+        )
+        source_mode = source_descriptor.get("mode")
+        source_size = source_descriptor.get("size_bytes")
+        if (
+            source_relative != filename
+            or source_descriptor.get("source_kind") != "regular"
+            or source_mode != "0644"
+            or isinstance(source_size, bool)
+            or not isinstance(source_size, int)
+            or source_size < 0
+            or projected_plist_sha256.get(filename) != source_sha256
+        ):
+            raise ProductionCutoverError("production_cutover_runtime_payload_invalid")
+        observed_source = _read_stable_payload_file(
+            source_root / source_relative,
+            artifact="production_cutover_runtime_plist_source",
+            expected_mode=int(source_mode, 8),
+            max_bytes=max(MAX_JSON_BYTES, source_size),
+        )
+        if (
+            observed_source.sha256 != source_sha256
+            or len(observed_source.raw) != source_size
+        ):
+            raise ProductionCutoverError(
+                "production_cutover_runtime_plist_source_mismatch"
+            )
+        install_plists[str(observed_source.path)] = {
+            "sha256": observed_source.sha256,
+            "size_bytes": len(observed_source.raw),
+            "mode": source_mode,
+            "identity": dict(observed_source.identity),
+        }
     for relative, descriptor in venv["files"].items():
         expected[f".venv/{_safe_runtime_relative(relative)}"] = descriptor
 
@@ -1582,11 +1655,15 @@ def _runtime_payload_descriptor(
                 "production_cutover_runtime_payload_layout_mismatch"
             )
         root_after = root.lstat()
+        source_root_after = source_root.lstat()
     except OSError as exc:
         raise ProductionCutoverError(
             "production_cutover_runtime_payload_unstable"
         ) from exc
-    if _stat_fields(root_before) != _stat_fields(root_after):
+    if (
+        _stat_fields(root_before) != _stat_fields(root_after)
+        or _stat_fields(source_root_before) != _stat_fields(source_root_after)
+    ):
         raise ProductionCutoverError("production_cutover_runtime_payload_unstable")
     binding = _require_sha256(
         manifest.get("content_sha256"),
@@ -1600,6 +1677,7 @@ def _runtime_payload_descriptor(
         "physical_sha256": _sha256_json(physical),
         "files": physical,
         "root_identity": _stat_fields(root_before),
+        "install_plists": install_plists,
     }
 
 
@@ -1730,7 +1808,7 @@ def _expected_commands_for_step(step: str, plan: Mapping[str, Any]) -> list[list
             ],
         ]
     if step == "install_plists":
-        runtime_root = payloads["runtime"]["staging_root"]
+        runtime_root = payloads["runtime"]["candidate_plist_root"]
         return [
             [
                 adapter,

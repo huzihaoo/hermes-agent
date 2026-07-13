@@ -240,6 +240,7 @@ def candidate(tmp_path: Path) -> SimpleNamespace:
         "source_binding": "/candidate/active-release-binding.json",
         "source_sidecar": "/candidate/feishu-sidecar.json",
         "runtime_stage": "/candidate/runtime-stage",
+        "plist_source_root": "/candidate/install-plists",
         "workspace_stage": "/candidate/workspace-stage",
         "active_binding": "/Users/songying/.hermes/runtime/pnc-rca/active-release-binding.json",
         "sidecar": "/Users/songying/.hermes/runtime/pnc-rca/feishu-sidecar.json",
@@ -261,6 +262,7 @@ def candidate(tmp_path: Path) -> SimpleNamespace:
     _write(physical(logical["source_binding"]), b'{"active":true}\n')
     _write(physical(logical["source_sidecar"]), b'{"hold":true}\n')
     physical(logical["runtime_stage"]).mkdir(parents=True, mode=0o700)
+    physical(logical["plist_source_root"]).mkdir(parents=True, mode=0o700)
     physical(logical["workspace_stage"]).mkdir(parents=True, mode=0o700)
     state = {
         "services_generation": 0,
@@ -277,6 +279,11 @@ def candidate(tmp_path: Path) -> SimpleNamespace:
     env_sha = _sha(physical(logical["source_env"]).read_bytes())
     binding_sha = _sha(physical(logical["source_binding"]).read_bytes())
     sidecar_sha = _sha(physical(logical["source_sidecar"]).read_bytes())
+    candidate_plist_sha256 = {}
+    for index, name in enumerate(cutover.CANDIDATE_PLISTS, 1):
+        source = physical(f"{logical['plist_source_root']}/{name}")
+        _write(source, f"canonical-plist-{index}\n".encode(), 0o644)
+        candidate_plist_sha256[name] = _sha(source.read_bytes())
     plan = {
         "schema_version": cutover.PLAN_SCHEMA_VERSION,
         "release_id": RELEASE_ID,
@@ -312,11 +319,10 @@ def candidate(tmp_path: Path) -> SimpleNamespace:
             },
             "runtime": {
                 "staging_root": logical["runtime_stage"],
+                "candidate_plist_root": logical["plist_source_root"],
                 "canonical_path": str(cutover.CANONICAL_RUNTIME_ROOT),
                 "content_sha256": "3" * 64,
-                "candidate_plist_sha256": {
-                    name: "7" * 64 for name in cutover.CANDIDATE_PLISTS
-                },
+                "candidate_plist_sha256": candidate_plist_sha256,
             },
             "workspace": {
                 "staging_root": logical["workspace_stage"],
@@ -432,6 +438,69 @@ def test_environment_pair_is_installed_atomically_and_matches_executor_contract(
         plan=candidate.plan,
         planned_commands=commands,
     )
+
+
+def test_install_plists_uses_canonical_sources_not_runtime_probe_projection(
+    candidate,
+):
+    runtime = candidate.physical(candidate.logical["runtime_stage"])
+    files = {}
+    for index, name in enumerate(cutover.CANDIDATE_PLISTS, 1):
+        staged = runtime / name
+        _write(staged, f"stage-projection-{index}\n".encode())
+        files[name] = {
+            "sha256": _sha(staged.read_bytes()),
+            "size_bytes": staged.stat().st_size,
+            "identity": _stat_fields(staged),
+        }
+    manifest = runtime / adapter.RUNTIME_STAGE_MANIFEST_NAME
+    _write(manifest, b"{}\n", 0o600)
+    install_plists = {}
+    for name in cutover.CANDIDATE_PLISTS:
+        logical = f"{candidate.logical['plist_source_root']}/{name}"
+        source = candidate.physical(logical)
+        install_plists[logical] = {
+            "sha256": _sha(source.read_bytes()),
+            "size_bytes": source.stat().st_size,
+            "mode": f"{stat.S_IMODE(source.stat().st_mode):04o}",
+            "identity": _stat_fields(source),
+        }
+    descriptor = {
+        "schema_version": cutover.PAYLOAD_DESCRIPTOR_SCHEMA_VERSION,
+        "kind": "runtime_tree",
+        "path": candidate.logical["runtime_stage"],
+        "binding_sha256": candidate.plan["bindings"]["runtime_content_sha256"],
+        "physical_sha256": adapter._sha256_json(files),
+        "files": files,
+        "root_identity": _stat_fields(runtime),
+        "install_plists": install_plists,
+    }
+    instance = candidate.build()
+    before = cutover._sha256_json(candidate.observer())
+    commands = cutover._expected_commands_for_step("install_plists", candidate.plan)
+    result = instance.execute_step(
+        "install_plists",
+        expected_identity_sha256=before,
+        plan=candidate.plan,
+        planned_commands=commands,
+        payload_descriptors={"runtime": descriptor},
+        lease_fingerprint=LEASE_FINGERPRINT,
+        lease_token=LEASE_TOKEN,
+    )
+
+    assert result["evidence"]["post_install_verified"] is True
+    for name in cutover.CANDIDATE_PLISTS:
+        installed = candidate.physical(
+            str(
+                cutover.CANONICAL_LAUNCH_AGENTS_ROOT
+                / name.replace(".candidate.plist", ".plist")
+            )
+        )
+        source = candidate.physical(
+            f"{candidate.logical['plist_source_root']}/{name}"
+        )
+        assert installed.read_bytes() == source.read_bytes()
+        assert installed.read_bytes() != (runtime / name).read_bytes()
 
 
 def test_second_file_commit_failure_restores_both_old_files(candidate):

@@ -197,14 +197,26 @@ def fixture(tmp_path: Path) -> SimpleNamespace:
     runtime_file = runtime_root / "gateway" / "candidate.py"
     runtime_descriptor = _write_payload(runtime_file, runtime_file_raw, mode=0o644)
     runtime_descriptor["path"] = "gateway/candidate.py"
+    runtime_source_root = root / "runtime-source"
+    runtime_source_root.mkdir(mode=0o700)
     plist_pairs = {}
     plist_hashes = {}
     for index, name in enumerate(cutover.CANDIDATE_PLISTS, 1):
-        raw = f"candidate-plist-{index}\n".encode()
-        staged = _write_payload(runtime_root / name, raw, mode=0o644)
+        source = _write_payload(
+            runtime_source_root / name,
+            f"canonical-candidate-plist-{index}\n".encode(),
+            mode=0o644,
+        )
+        source["path"] = name
+        source["source_kind"] = "regular"
+        staged = _write_payload(
+            runtime_root / name,
+            f"staged-probe-plist-{index}\n".encode(),
+            mode=0o644,
+        )
         staged["path"] = name
-        plist_pairs[name] = {"source": dict(staged), "staged": staged}
-        plist_hashes[name] = staged["sha256"]
+        plist_pairs[name] = {"source": source, "staged": staged}
+        plist_hashes[name] = source["sha256"]
     python_raw = b"#!/bin/sh\nexit 0\n"
     python_descriptor = _write_payload(
         runtime_root / ".venv" / "bin" / "python",
@@ -213,7 +225,10 @@ def fixture(tmp_path: Path) -> SimpleNamespace:
     )
     python_descriptor["path"] = "bin/python"
     runtime_content = {
-        "source": {"runtime_files": {"gateway/candidate.py": runtime_descriptor}},
+        "source": {
+            "repo_root": str(runtime_source_root),
+            "runtime_files": {"gateway/candidate.py": runtime_descriptor},
+        },
         "candidate_plists": plist_pairs,
         "venv": {"files": {"bin/python": python_descriptor}},
     }
@@ -306,6 +321,7 @@ def fixture(tmp_path: Path) -> SimpleNamespace:
         root=root,
         nonce_ledger=tmp_path / "nonce-ledger",
         runtime_root=runtime_root,
+        runtime_source_root=runtime_source_root,
         workspace_root=workspace_root,
         candidate_env=candidate_env,
         sidecar_path=sidecar_path,
@@ -1221,12 +1237,34 @@ def test_gateway_candidate_preserves_v0182_production_inheritance() -> None:
     assert environment["HERMES_LAZY_INSTALL_TARGET"] == (
         "/Users/songying/.hermes/runtime/lazy-packages/v0182-py311"
     )
+    assert environment["PYTHONDONTWRITEBYTECODE"] == "1"
     assert candidate["ProgramArguments"][0] == (
         "/Users/songying/.hermes/runtime/hermes-live/.venv/bin/python"
     )
     assert candidate["WorkingDirectory"] == (
         "/Users/songying/.hermes/runtime/hermes-live"
     )
+
+
+def test_install_plists_use_install_ready_source_root() -> None:
+    plan = {
+        "payload_bindings": {
+            "runtime": {
+                "staging_root": "/candidate/runtime-stage",
+                "candidate_plist_root": "/candidate/install-plists",
+                "candidate_plist_sha256": {
+                    name: format(index, "x") * 64
+                    for index, name in enumerate(cutover.CANDIDATE_PLISTS, 1)
+                },
+            }
+        }
+    }
+
+    commands = cutover._expected_commands_for_step("install_plists", plan)
+
+    assert [command[2] for command in commands] == [
+        f"/candidate/install-plists/{name}" for name in cutover.CANDIDATE_PLISTS
+    ]
 
 
 def test_wrong_start_command_order_fails_in_preflight(fixture) -> None:
@@ -1306,6 +1344,7 @@ def test_payload_hash_mismatch_fails_before_first_external_step(fixture) -> None
         "candidate_env",
         "sidecar_path",
         "runtime_root/gateway/candidate.py",
+        f"runtime_source_root/{cutover.CANDIDATE_PLISTS[0]}",
         "workspace_root/bin/create_task_v2.py",
     ],
 )

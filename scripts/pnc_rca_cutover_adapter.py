@@ -1125,11 +1125,48 @@ class ProductionCutoverAdapter:
                     )
             self._scan_tree(root, expected=expected_files, excluded=excluded)
             if step == "install_plists":
+                install_plists = descriptor.get("install_plists")
+                expected_sources = {command[2] for command in commands}
+                if (
+                    not isinstance(install_plists, Mapping)
+                    or set(install_plists) != expected_sources
+                ):
+                    raise CutoverAdapterError(
+                        "cutover_adapter_plist_payload_invalid"
+                    )
                 for command in commands:
-                    relative = Path(command[2]).relative_to(Path(descriptor["path"])).as_posix()
-                    entry = expected_files.get(relative)
-                    if entry is None or entry.get("sha256") != command[4]:
-                        raise CutoverAdapterError("cutover_adapter_plist_payload_invalid")
+                    entry = install_plists.get(command[2])
+                    if not isinstance(entry, Mapping):
+                        raise CutoverAdapterError(
+                            "cutover_adapter_plist_payload_invalid"
+                        )
+                    mode = entry.get("mode")
+                    size = entry.get("size_bytes")
+                    identity = entry.get("identity")
+                    if (
+                        entry.get("sha256") != command[4]
+                        or mode != "0644"
+                        or isinstance(size, bool)
+                        or not isinstance(size, int)
+                        or size < 0
+                        or not isinstance(identity, Mapping)
+                    ):
+                        raise CutoverAdapterError(
+                            "cutover_adapter_plist_payload_invalid"
+                        )
+                    observed = _read_stable_owner_file(
+                        self._projection.physical(command[2]),
+                        io_hook=self._io_hook,
+                    )
+                    if (
+                        observed.sha256 != command[4]
+                        or len(observed.raw) != size
+                        or observed.mode != int(mode, 8)
+                        or observed.identity != identity
+                    ):
+                        raise CutoverAdapterError(
+                            "cutover_adapter_plist_payload_drift"
+                        )
 
     def _stage_owner_file(
         self,
@@ -1416,6 +1453,15 @@ class ProductionCutoverAdapter:
             else:
                 for relative, entry in self._tree_expected_files(descriptor).items():
                     descriptor_by_path[str(Path(descriptor["path"]) / relative)] = entry
+                install_plists = descriptor.get("install_plists")
+                if isinstance(install_plists, Mapping):
+                    descriptor_by_path.update(
+                        {
+                            str(source): entry
+                            for source, entry in install_plists.items()
+                            if isinstance(entry, Mapping)
+                        }
+                    )
         staged: list[tuple[Path, Path]] = []
         try:
             for command in commands:

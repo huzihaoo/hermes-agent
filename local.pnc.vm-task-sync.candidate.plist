@@ -25,6 +25,8 @@
     <string>/Users/songying/.hermes/runtime/pnc_agent/feishu_issue_kafka_rca/vm_task_sync_completion.json</string>
     <key>PYTHONNOUSERSITE</key>
     <string>1</string>
+    <key>PYTHONDONTWRITEBYTECODE</key>
+    <string>1</string>
     <key>PYTHONUNBUFFERED</key>
     <string>1</string>
     <key>VIRTUAL_ENV</key>

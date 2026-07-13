@@ -233,6 +233,14 @@ def test_stage_is_complete_real_tree_and_projects_canonical_manifest(
     ).read_text(encoding="utf-8") == "VALUE = 'tracked-dynamic-import'\n"
 
 
+def test_repository_candidate_plists_disable_bytecode_writes() -> None:
+    root = Path(__file__).resolve().parents[2]
+
+    for filename in stage.CANDIDATE_PLISTS:
+        body = plistlib.loads((root / filename).read_bytes())
+        assert body["EnvironmentVariables"]["PYTHONDONTWRITEBYTECODE"] == "1"
+
+
 @pytest.mark.parametrize(
     ("filename", "mutate"),
     [
