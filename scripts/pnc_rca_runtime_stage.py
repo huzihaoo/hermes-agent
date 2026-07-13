@@ -603,6 +603,16 @@ def _render_plist(
     if not isinstance(arguments, list) or not arguments:
         raise RuntimeStageError("runtime_stage_plist_invalid", filename)
     projected = _project_plist_value(body, physical_root=staging_root)
+    environment = projected.get("EnvironmentVariables")
+    if not isinstance(environment, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in environment.items()
+    ):
+        raise RuntimeStageError("runtime_stage_plist_invalid", filename)
+    projected["EnvironmentVariables"] = {
+        **environment,
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
     projected_args = projected.get("ProgramArguments")
     if (
         not isinstance(projected_args, list)
@@ -736,12 +746,13 @@ print(json.dumps({
 """
     environment = {
         "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONNOUSERSITE": "1",
         "VIRTUAL_ENV": str(venv),
     }
     try:
         result = subprocess.run(
-            [str(interpreter), "-I", "-c", script],
+            [str(interpreter), "-I", "-B", "-c", script],
             check=False,
             capture_output=True,
             text=True,
@@ -1510,6 +1521,23 @@ def validate_staged_runtime(
         stage=stage,
         venv=venv,
     )
+    actual_dirs_after, actual_files_after = _enumerate_stage(stage)
+    if actual_dirs_after != set(expected_dirs) or actual_files_after != set(
+        expected_files
+    ):
+        raise RuntimeStageError("runtime_stage_changed_during_probe")
+    for relative, descriptor in expected_files.items():
+        observed = _read_stable_file(
+            stage / relative,
+            artifact="runtime_stage_staged_file",
+            max_bytes=max(MAX_VENV_FILE_BYTES, descriptor["size_bytes"]),
+            expected_mode=int(descriptor["mode"], 8),
+        )
+        if (
+            observed.sha256 != descriptor["sha256"]
+            or len(observed.raw) != descriptor["size_bytes"]
+        ):
+            raise RuntimeStageError("runtime_stage_changed_during_probe", relative)
     manifest_after = _read_stable_file(
         stage / MANIFEST_FILENAME,
         artifact="runtime_stage_manifest",

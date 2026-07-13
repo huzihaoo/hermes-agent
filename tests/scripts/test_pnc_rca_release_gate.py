@@ -7861,6 +7861,7 @@ def _write_candidate_plists(tmp_path, *, kafka_environment=None):
     default_environment = {
         "HERMES_HOME": str(tmp_path / ".hermes"),
         "PATH": "/usr/bin:/bin",
+        "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONNOUSERSITE": "1",
         "PYTHONUNBUFFERED": "1",
     }
@@ -7953,6 +7954,7 @@ def _future_runtime_plist_body(filename: str, root: Path) -> dict:
                 release_gate_module.CANONICAL_FUTURE_RUNTIME_ROOT.parent.parent
             ),
             "PATH": f"{root / '.venv' / 'bin'}:/usr/bin:/bin:/usr/sbin:/sbin",
+            "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONNOUSERSITE": "1",
             "PYTHONUNBUFFERED": "1",
             "VIRTUAL_ENV": str(root / ".venv"),
@@ -8005,7 +8007,7 @@ def _future_runtime_fixture(tmp_path: Path):
     )
 
     def runner(command, **_kwargs):
-        if command[1:3] == ["-I", "-c"]:
+        if command[1:4] == ["-I", "-B", "-c"]:
             payload = _candidate_runtime_probe_payload(interpreter)
         elif command[1:2] == ["-c"]:
             loaded = _candidate_runtime_probe_payload(interpreter)["loaded_runtime"]
@@ -8091,6 +8093,7 @@ def test_future_runtime_projection_binds_real_stage_to_canonical_root(tmp_path):
     for process in result["service_processes"].values():
         assert process["working_directory"] == str(canonical)
         assert process["environment"]["VIRTUAL_ENV"] == str(canonical / ".venv")
+        assert process["environment"]["PYTHONDONTWRITEBYTECODE"] == "1"
         assert process["environment"]["PYTHONNOUSERSITE"] == "1"
         assert str(fixture.stage) not in json.dumps(process)
 
@@ -8238,6 +8241,7 @@ def test_future_runtime_projection_rejects_source_and_stage_identity_drift(
         "source_worktree_root",
         "virtual_env",
         "python_no_user_site",
+        "bytecode_writes",
     ],
 )
 def test_future_runtime_projection_rejects_plist_projection_drift(
@@ -8260,6 +8264,8 @@ def test_future_runtime_projection_rejects_plist_projection_drift(
         body["EnvironmentVariables"]["VIRTUAL_ENV"] = "/tmp/other-venv"
     elif drift == "python_no_user_site":
         body["EnvironmentVariables"]["PYTHONNOUSERSITE"] = "0"
+    elif drift == "bytecode_writes":
+        body["EnvironmentVariables"].pop("PYTHONDONTWRITEBYTECODE")
     else:
         source = fixture.source / filename
         source_body = release_gate_module.plistlib.loads(source.read_bytes())
@@ -10172,7 +10178,7 @@ def test_candidate_runtime_probe_uses_plist_interpreter_and_clean_environment(
 
     def runner(command, **kwargs):
         captured.append((command, kwargs))
-        if command[1:3] == ["-I", "-c"]:
+        if command[1:4] == ["-I", "-B", "-c"]:
             payload = _candidate_runtime_probe_payload(interpreter)
         else:
             payload = {"ok": True, "config": {}}
@@ -10192,7 +10198,7 @@ def test_candidate_runtime_probe_uses_plist_interpreter_and_clean_environment(
     result = check_candidate_runtime_dependencies(tmp_path, runner=runner)
 
     dependency_command, dependency_kwargs = captured[0]
-    assert dependency_command[:3] == [str(interpreter), "-I", "-c"]
+    assert dependency_command[:4] == [str(interpreter), "-I", "-B", "-c"]
     assert dependency_kwargs["cwd"] == str(working)
     assert dependency_kwargs["env"] == expected_environment
     assert "PYTHONPATH" not in dependency_kwargs["env"]
@@ -10296,7 +10302,7 @@ def test_candidate_runtime_probe_rejects_feishu_outbound_drift(
     interpreter, _working, _environment = _write_candidate_plists(tmp_path)
 
     def runner(command, **_kwargs):
-        assert command[1:3] == ["-I", "-c"]
+        assert command[1:4] == ["-I", "-B", "-c"]
         payload = _candidate_runtime_probe_payload(interpreter)
         returncode = 0
         if drift == "missing_lark":
@@ -10356,6 +10362,26 @@ def test_candidate_runtime_requires_python_no_user_site(tmp_path, filename):
 
 
 @pytest.mark.parametrize(
+    "filename",
+    sorted(release_gate_module.CANDIDATE_SERVICES),
+)
+def test_candidate_runtime_requires_bytecode_disabled(tmp_path, filename):
+    _write_candidate_plists(tmp_path)
+    plist_path = tmp_path / filename
+    plist = release_gate_module.plistlib.loads(plist_path.read_bytes())
+    plist["EnvironmentVariables"].pop("PYTHONDONTWRITEBYTECODE")
+    plist_path.write_bytes(release_gate_module.plistlib.dumps(plist))
+
+    with pytest.raises(EvidenceError) as error:
+        check_candidate_runtime_dependencies(
+            tmp_path,
+            runner=lambda *args, **kwargs: pytest.fail("probe must not run"),
+        )
+
+    assert error.value.code == "runtime_candidate_bytecode_write_forbidden"
+
+
+@pytest.mark.parametrize(
     ("capture_environment", "blocker"),
     [
         (
@@ -10380,6 +10406,7 @@ def test_candidate_runtime_rejects_issue_capture_write_environment(
     environment = {
         "HERMES_HOME": str(tmp_path / ".hermes"),
         "PATH": "/usr/bin:/bin",
+        "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONNOUSERSITE": "1",
         "PYTHONUNBUFFERED": "1",
         **capture_environment,

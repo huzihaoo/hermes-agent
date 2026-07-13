@@ -10598,6 +10598,7 @@ def _auxiliary_runtime_expectations(
             "/Users/songying/.local/bin:/Users/songying/bin:"
             "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
         ),
+        "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONNOUSERSITE": "1",
         "PYTHONUNBUFFERED": "1",
         "VIRTUAL_ENV": str(CANONICAL_FUTURE_RUNTIME_ROOT / ".venv"),
@@ -13071,6 +13072,11 @@ def check_candidate_runtime_dependencies(
                 "runtime_candidate_python_no_user_site_required",
                 filename,
             )
+        if declared_env.get("PYTHONDONTWRITEBYTECODE") != "1":
+            raise EvidenceError(
+                "runtime_candidate_bytecode_write_forbidden",
+                filename,
+            )
         issue_capture_enabled = (
             str(declared_env.get("HERMES_G1Q3_ISSUE_CAPTURE_ENABLED", ""))
             .strip()
@@ -13238,7 +13244,7 @@ raise SystemExit(0 if payload["ok"] else 2)
 """
     try:
         completed = runner(
-            [str(interpreter), "-I", "-c", probe],
+            [str(interpreter), "-I", "-B", "-c", probe],
             cwd=str(working_directory),
             env=clean_env,
             text=True,
@@ -13655,6 +13661,7 @@ def _future_runtime_project_environment(
     if (
         environment.get("HERMES_HOME") != expected_hermes_home
         or environment.get("VIRTUAL_ENV") != str(physical_root / ".venv")
+        or environment.get("PYTHONDONTWRITEBYTECODE") != "1"
         or environment.get("PYTHONNOUSERSITE") != "1"
         or any(key.startswith(("DYLD_", "LD_")) for key in environment)
         or {"PYTHONPATH", "PYTHONHOME", "PYTHONUSERBASE"} & set(environment)
@@ -20056,7 +20063,7 @@ def _launchctl_process_evidence(
 
 
 def _unsafe_runtime_environment_keys(environment: Mapping[str, Any]) -> set[str]:
-    allowed_python = {"PYTHONNOUSERSITE"}
+    allowed_python = {"PYTHONDONTWRITEBYTECODE", "PYTHONNOUSERSITE"}
     return {
         str(key)
         for key in environment
@@ -20804,6 +20811,7 @@ print(json.dumps({
     environment = {
         "PATH": f"{virtual_env / 'bin'}:/usr/bin:/bin:/usr/sbin:/sbin",
         "VIRTUAL_ENV": str(virtual_env),
+        "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONNOUSERSITE": "1",
         "HOME": str(Path.home()),
     }

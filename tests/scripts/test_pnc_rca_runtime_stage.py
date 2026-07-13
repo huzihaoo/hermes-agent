@@ -219,6 +219,7 @@ def test_stage_is_complete_real_tree_and_projects_canonical_manifest(
         assert body["ProgramArguments"][0] == str(
             fixture.staging / ".venv" / "bin" / "python"
         )
+        assert body["EnvironmentVariables"]["PYTHONDONTWRITEBYTECODE"] == "1"
     for path in fixture.staging.rglob("*"):
         assert not path.is_symlink()
         if path.is_file():
@@ -462,6 +463,48 @@ def test_extra_file_invalidates_complete_or_partial_stage(fixture: SimpleNamespa
         stage.validate_staged_runtime(fixture.staging, venv_probe=_probe)
 
     assert error.value.code == "runtime_stage_extra_or_missing_entry"
+
+
+def test_default_venv_probe_disables_bytecode_writes(monkeypatch, tmp_path) -> None:
+    venv = tmp_path / "venv"
+    captured = {}
+
+    def run(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(_probe(venv)),
+            stderr="",
+        )
+
+    monkeypatch.setattr(stage.subprocess, "run", run)
+
+    assert stage._default_venv_probe(venv)["prefix"] == str(venv)
+    assert captured["command"][:4] == [
+        str(venv / "bin" / "python"),
+        "-I",
+        "-B",
+        "-c",
+    ]
+    assert captured["kwargs"]["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
+
+
+def test_validate_rechecks_layout_after_venv_probe(fixture: SimpleNamespace) -> None:
+    _run(fixture)
+
+    def mutating_probe(venv: Path) -> dict:
+        _write(
+            venv / "lib" / "site-packages" / "__pycache__" / "probe.pyc",
+            b"cache",
+        )
+        return _probe(venv)
+
+    with pytest.raises(stage.RuntimeStageError) as error:
+        stage.validate_staged_runtime(fixture.staging, venv_probe=mutating_probe)
+
+    assert error.value.code == "runtime_stage_changed_during_probe"
 
 
 def test_secret_is_rejected_and_cache_is_not_carried(fixture: SimpleNamespace) -> None:
