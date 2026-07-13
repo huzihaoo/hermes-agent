@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -1278,9 +1279,13 @@ def test_record_only_report_attachment_records_before_download_or_meegle_upload(
     assert rows[0]["operation"] == "file_send"
     assert rows[0]["platform"] == "feishu_project"
     assert rows[0]["external_delivery_attempted"] is False
-    assert rows[0]["links"] == [
-        "http://192.168.26.174:18081/G1Q3_RCA/cases/7017699515/index.html"
-    ]
+    assert len(rows[0]["links"]) == 1
+    assert re.fullmatch(
+        r"http://192\.168\.26\.174:18081/G1Q3_RCA/cases/"
+        r"hmac-sha256:[0-9a-f]{64}/index\.html",
+        rows[0]["links"][0],
+    )
+    assert "7017699515" not in rows[0]["links"][0]
     assert not (tmp_path / "pnc_agent" / "quota" / "g1q3_report_attachments.json").exists()
 
 

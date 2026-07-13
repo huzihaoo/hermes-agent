@@ -432,7 +432,13 @@ def derive_presentation(
 
     status_query = bool(STATUS_CHECK_RE.search(log_all)) or _lower(contract.get("mode")) in {"status_check", "execution_only_readonly_status_query"}
 
-    if _is_pipeline_running(contract, report_truth, vm_progress, log_all):
+    user_action = contract.get("user_action") if isinstance(contract.get("user_action"), dict) else {}
+    awaiting_automatic_download = (
+        state_l in RUNNING_STATES
+        and _lower(contract.get("business_state")) == "awaiting_download"
+        and user_action.get("requires_user_input") is False
+    )
+    if awaiting_automatic_download or _is_pipeline_running(contract, report_truth, vm_progress, log_all):
         stage_label = _pipeline_stage_label(contract, report_truth, vm_progress)
         status_line = "数据下载执行中（pipeline running）；等待解析完成后更新 RCA 状态。"
         if stage_label:

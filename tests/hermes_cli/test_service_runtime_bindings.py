@@ -602,7 +602,7 @@ def test_missing_systemd_definition_rebuilds_from_valid_external_manifest(
     monkeypatch.setattr(
         gateway,
         "generate_systemd_unit",
-        lambda system=False, run_as_user=None: "\n".join(
+        lambda system=False, run_as_user=None, **_kwargs: "\n".join(
             f"{key}={value}"
             for key, value in bindings.resolve_service_runtime_bindings(home).items()
         ),

@@ -193,3 +193,21 @@ def test_nested_pipeline_blocker_routes_infra_failure_to_pipeline_fix():
     assert projection["human_action_kind"] == "none"
     assert projection["requires_user_input"] is False
     assert projection["action_category"] == "none"
+
+
+def test_awaiting_automatic_download_stays_in_progress_without_stage_metadata():
+    projection = derive_presentation(
+        "running",
+        {
+            "business_state": "awaiting_download",
+            "report": {"status": "need_download", "is_deliverable": False},
+            "user_action": {"requires_user_input": False},
+        },
+        {"report_status": "need_download"},
+        "downloading",
+        {},
+    )
+
+    assert projection["lane"] == "in_progress"
+    assert projection["report_status"] == "need_download"
+    assert projection["requires_user_input"] is False

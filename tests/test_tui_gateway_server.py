@@ -2666,6 +2666,7 @@ def test_config_set_yolo_global_scope_writes_approvals_mode(tmp_path, monkeypatc
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text(yaml.safe_dump({"approvals": {"mode": "manual"}}))
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    monkeypatch.setenv("HERMES_CONFIG_PATH", str(cfg_path))
 
     resp_on = server.handle_request(
         {
@@ -2696,6 +2697,7 @@ def test_config_set_yolo_global_scope_honors_explicit_value(tmp_path, monkeypatc
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text(yaml.safe_dump({"approvals": {"mode": "manual"}}))
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    monkeypatch.setenv("HERMES_CONFIG_PATH", str(cfg_path))
 
     resp = server.handle_request(
         {
@@ -2930,6 +2932,7 @@ def test_config_set_statusbar_survives_non_dict_display(tmp_path, monkeypatch):
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text(yaml.safe_dump({"display": "broken"}))
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    monkeypatch.setenv("HERMES_CONFIG_PATH", str(cfg_path))
 
     resp = server.handle_request(
         {
@@ -2954,6 +2957,7 @@ def test_config_set_details_mode_pins_all_sections(tmp_path, monkeypatch):
         )
     )
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    monkeypatch.setenv("HERMES_CONFIG_PATH", str(cfg_path))
 
     resp = server.handle_request(
         {
@@ -2979,6 +2983,7 @@ def test_config_set_section_writes_per_section_override(tmp_path, monkeypatch):
 
     cfg_path = tmp_path / "config.yaml"
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    monkeypatch.setenv("HERMES_CONFIG_PATH", str(cfg_path))
 
     resp = server.handle_request(
         {
@@ -3003,6 +3008,7 @@ def test_config_set_section_clears_override_on_empty_value(tmp_path, monkeypatch
         )
     )
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    monkeypatch.setenv("HERMES_CONFIG_PATH", str(cfg_path))
 
     resp = server.handle_request(
         {
@@ -3298,6 +3304,7 @@ def test_complete_slash_details_args():
 
 def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    monkeypatch.setenv("HERMES_CONFIG_PATH", str(tmp_path / "config.yaml"))
     agent = types.SimpleNamespace(reasoning_config=None)
     server._sessions["sid"] = _session(agent=agent)
 
@@ -6812,12 +6819,14 @@ def test_browser_manage_connect_default_local_reports_launch_hint(monkeypatch):
         _stub_urlopen(monkeypatch, ok=False)
         with (
             patch(
-                "hermes_cli.browser_connect.try_launch_chrome_debug", return_value=False
+                "hermes_cli.browser_connect.launch_chrome_debug",
+                return_value=types.SimpleNamespace(launched=False, hint=None),
             ),
             patch(
                 "hermes_cli.browser_connect.get_chrome_debug_candidates",
                 return_value=[],
             ),
+            patch("platform.system", return_value="Linux"),
         ):
             resp = server.handle_request(
                 {
