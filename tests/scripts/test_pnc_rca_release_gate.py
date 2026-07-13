@@ -9488,6 +9488,7 @@ def _production_cutover_gate_fixture() -> tuple[dict, dict, dict]:
                         f"{label}.candidate.plist": "8" * 64
                         for label in release_gate_module.CUTOVER_RESIDENT_START_ORDER
                     },
+                    "ai.hermes.gateway.candidate.plist": "8" * 64,
                     "local.pnc.completion-notice-relay.candidate.plist": "8" * 64,
                     "local.pnc.vm-task-sync.candidate.plist": "8" * 64,
                 }

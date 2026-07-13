@@ -90,10 +90,11 @@ SERVICE_LABELS = (
     "local.pnc.rca-delivery-collector",
     "local.pnc.rca-delivery-dispatcher",
 )
-WRITER_LABELS = SERVICE_LABELS
 GATEWAY_AUX_LABELS = SERVICE_LABELS[:3]
 RESIDENT_LABELS = SERVICE_LABELS[3:]
+WRITER_LABELS = (SERVICE_LABELS[0], *RESIDENT_LABELS)
 CANDIDATE_PLISTS = (
+    "ai.hermes.gateway.candidate.plist",
     "local.pnc.completion-notice-relay.candidate.plist",
     "local.pnc.vm-task-sync.candidate.plist",
     "local.pnc.rca-kafka-consumer.candidate.plist",
@@ -1745,8 +1746,16 @@ def _expected_commands_for_step(step: str, plan: Mapping[str, Any]) -> list[list
         ]
     if step == "start_gateway_aux":
         return [
-            ["/bin/launchctl", "kickstart", "-k", f"{domain}/{label}"]
-            for label in plan["gateway_aux_start_order"]
+            [
+                "/bin/launchctl",
+                "bootstrap",
+                domain,
+                str(CANONICAL_LAUNCH_AGENTS_ROOT / "ai.hermes.gateway.plist"),
+            ],
+            *[
+                ["/bin/launchctl", "kickstart", "-k", f"{domain}/{label}"]
+                for label in plan["gateway_aux_start_order"][1:]
+            ],
         ]
     if step == "start_residents":
         return [

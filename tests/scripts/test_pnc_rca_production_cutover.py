@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import plistlib
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1179,9 +1180,22 @@ def test_preflight_binds_exact_start_commands_and_order(fixture) -> None:
         fixture.inputs, gate_validator=FakeGate(), now=NOW
     )
 
+    assert cutover.WRITER_LABELS == (
+        "ai.hermes.gateway",
+        *cutover.RESIDENT_LABELS,
+    )
+    assert "ai.hermes.gateway.candidate.plist" in cutover.CANDIDATE_PLISTS
     assert cutover._expected_start_commands("start_gateway_aux", plan) == [
-        ["/bin/launchctl", "kickstart", "-k", f"gui/{os.geteuid()}/{label}"]
-        for label in cutover.GATEWAY_AUX_LABELS
+        [
+            "/bin/launchctl",
+            "bootstrap",
+            f"gui/{os.geteuid()}",
+            str(cutover.CANONICAL_LAUNCH_AGENTS_ROOT / "ai.hermes.gateway.plist"),
+        ],
+        *[
+            ["/bin/launchctl", "kickstart", "-k", f"gui/{os.geteuid()}/{label}"]
+            for label in cutover.GATEWAY_AUX_LABELS[1:]
+        ],
     ]
     assert cutover._expected_start_commands("start_residents", plan) == [
         [
@@ -1192,6 +1206,27 @@ def test_preflight_binds_exact_start_commands_and_order(fixture) -> None:
         ]
         for label in reversed(cutover.RESIDENT_LABELS)
     ]
+
+
+def test_gateway_candidate_preserves_v0182_production_inheritance() -> None:
+    candidate_path = (
+        Path(__file__).resolve().parents[2] / "ai.hermes.gateway.candidate.plist"
+    )
+    candidate = plistlib.loads(candidate_path.read_bytes())
+    environment = candidate["EnvironmentVariables"]
+
+    assert environment["G1Q3_GOVERNANCE_DOWNLOAD_ENABLED"] == "1"
+    assert environment["HERMES_DISABLE_LAZY_INSTALLS"] == "1"
+    assert environment["HERMES_FEISHU_API_POLL_STARTUP_LOOKBACK_SECONDS"] == "120"
+    assert environment["HERMES_LAZY_INSTALL_TARGET"] == (
+        "/Users/songying/.hermes/runtime/lazy-packages/v0182-py311"
+    )
+    assert candidate["ProgramArguments"][0] == (
+        "/Users/songying/.hermes/runtime/hermes-live/.venv/bin/python"
+    )
+    assert candidate["WorkingDirectory"] == (
+        "/Users/songying/.hermes/runtime/hermes-live"
+    )
 
 
 def test_wrong_start_command_order_fails_in_preflight(fixture) -> None:

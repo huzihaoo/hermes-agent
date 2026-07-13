@@ -12052,6 +12052,7 @@ def validate_rca_cutover_execution_authorization(
     expected_plists = {
         f"{label}.candidate.plist" for label in CUTOVER_RESIDENT_START_ORDER
     } | {
+        "ai.hermes.gateway.candidate.plist",
         "local.pnc.completion-notice-relay.candidate.plist",
         "local.pnc.vm-task-sync.candidate.plist",
     }
