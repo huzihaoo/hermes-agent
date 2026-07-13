@@ -182,11 +182,12 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         "FEISHU_WEBHOOK_PORT": "9001",
         "FEISHU_WEBHOOK_PATH": "/hook",
         "FEISHU_VERIFICATION_TOKEN": "vtok",
-    }, clear=True)
+    }, clear=False)
     def test_connect_webhook_mode_starts_local_server(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
+        isolated_home = Path(os.environ["HERMES_HOME"])
         adapter = FeishuAdapter(PlatformConfig())
         runner = AsyncMock()
         site = AsyncMock()
@@ -212,11 +213,15 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         self.assertTrue(connected)
         runner.setup.assert_awaited_once()
         site.start.assert_awaited_once()
+        runtime_state = json.loads(
+            (isolated_home / "gateway_state.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(runtime_state["pid"], os.getpid())
 
     @patch.dict(os.environ, {
         "FEISHU_APP_ID": "cli_app",
         "FEISHU_APP_SECRET": "secret_app",
-    }, clear=True)
+    }, clear=False)
     def test_connect_acquires_scoped_lock_and_disconnect_releases_it(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
@@ -339,7 +344,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
     @patch.dict(os.environ, {
         "FEISHU_APP_ID": "cli_app",
         "FEISHU_APP_SECRET": "secret_app",
-    }, clear=True)
+    }, clear=False)
     def test_connect_rejects_existing_app_lock(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
@@ -364,7 +369,7 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
     @patch.dict(os.environ, {
         "FEISHU_APP_ID": "cli_app",
         "FEISHU_APP_SECRET": "secret_app",
-    }, clear=True)
+    }, clear=False)
     def test_connect_retries_transient_startup_failure(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
@@ -3361,7 +3366,7 @@ class TestWebhookSecurity(unittest.TestCase):
         response = asyncio.run(adapter._handle_webhook_request(request))
         self.assertEqual(response.status, 401)
 
-    @patch.dict(os.environ, {}, clear=True)
+    @patch.dict(os.environ, {}, clear=False)
     def test_webhook_connect_requires_inbound_auth_secret(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
