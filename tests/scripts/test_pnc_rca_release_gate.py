@@ -6768,12 +6768,12 @@ def test_no_clobber_rejects_ambiguous_interrupted_hardlink(tmp_path):
     ("mode", "expected_checks", "expected_ok", "expected_blockers"),
     [
         ("shadow", 9, True, []),
-        ("preauthorization", 20, True, []),
-        ("preproduction", 21, True, []),
-        ("canary", 21, True, []),
+        ("preauthorization", 21, True, []),
+        ("preproduction", 22, True, []),
+        ("canary", 22, True, []),
         (
             "production_bootstrap",
-            32,
+            33,
             False,
             [
                 "activation_current_epoch_missing",
@@ -6796,7 +6796,7 @@ def test_no_clobber_rejects_ambiguous_interrupted_hardlink(tmp_path):
         ),
         (
             "production",
-            31,
+            32,
             False,
             [
                 "activation_current_epoch_missing",
@@ -6911,7 +6911,7 @@ def test_canary_bootstrap_mode_fails_closed_without_live_authorization(tmp_path)
     by_name = {item["name"]: item for item in report["checks"]}
     assert report["mode"] == "canary_bootstrap"
     assert report["ok"] is False
-    assert len(report["checks"]) == 22
+    assert len(report["checks"]) == 23
     assert by_name["bootstrap_capacity_authorization"]["ok"] is False
     assert by_name["bootstrap_capacity_authorization"]["code"] in {
         "release_plan_invalid",
