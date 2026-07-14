@@ -235,7 +235,7 @@ test -x "$RCA_PYTHON"
 ## 7. 生产放量基线（2026-07-11 remote-read cutover）
 
 1. 首次上线保持 submit/dispatch safe-off；先完成 broker metadata/T0、最近 7 天真实 Kafka 消息的无 group/无 commit 影子回放、容量 horizon、clean BOM、受治理 canary。balanced 200-case provenance 与 24h/200-case remote-reader soak 在 `production_bootstrap` 及其前置阶段记录为上线后观察项，不作为首次上线硬阻塞；标准 steady-capacity 放大仍可重新要求。topic 必须由 broker metadata 确认精确大小写；当前 live `.env` 是 `feishu-project-workflow-event`，不得凭曾出现的 `feishu-project-workfLow-event` 交接字符串猜测。
-2. 最近 7 天回放只使用 `scripts/pnc_rca_kafka_recent_replay.py`：`group_id=None`、显式 `assign`、`offsets_for_times`、固定 end offset、`read_committed`、`enable_auto_commit=false`。真实 payload 只能进入自动销毁的临时 SQLite，必须走现有 workflow policy、control store、shadow trigger/outbox；`kafka_recent_replay.json` 只保留 offset、哈希和聚合计数。
+2. 最近 7 天回放只使用 `scripts/pnc_rca_kafka_recent_replay.py`：`group_id=None`、显式 `assign`、`offsets_for_times`、固定 end offset、`read_committed`、`enable_auto_commit=false`。真实 payload 只能进入自动销毁的临时 SQLite，必须走现有 workflow policy、control store、shadow trigger/outbox；`kafka_recent_replay.json` 只保留 offset、哈希和聚合计数。正式 receipt 还必须通过 `--e2e-canary-manifest` 绑定 owner 明确给出的真实问题单集合；release gate 会现场重读 `0600` manifest、重算 SHA/大小并要求所有 ID 在 7 天窗口内全部命中 accepted trigger/shadow outbox，少一条即 fail closed。
 3. DNP workload 分类读取飞书问题 `name`、`问题所属部门`、`问题所属部门_简洁` 三个字段，固定关键字为 `规划`、`SPP`、`OOI`；中文按 NFKC/casefold 后子串匹配，ASCII 按字母数字 token 边界匹配。原始标题和部门值不得进入 census、receipt 或 manifest；ACC/LCC/AEB/FCW 继续使用 owner-approved 精确功能分类叶子。
 4. 每单固定 `remote_read`、`allow_download=false`、`input_materialization=forbidden`；S2 只生成有 size/SHA/MCAP seal 的派生流。
 5. Worker 必须 `direct_cli + agent_backend=none`，并产出绑定 commit、入口 hash、run-id/PID/dispatch receipt 的 attestation；任何 Agent/fallback 计数非零即阻断。
@@ -353,6 +353,32 @@ EVIDENCE_DIR="$EVIDENCE_ROOT/$RUN_ID"
 ```
 
 `--env-file` 是权威输入，不允许 ambient `HERMES_RCA_KAFKA_*` 静默覆盖；文件必须是 owner-only 的非 symlink UTF-8 常规文件，采集器以同一个只读 fd 完成 identity 检查和有界读取。evidence 只记录文件 identity 与去除密码后的配置哈希，不记录密码或密码哈希。owner 必须显式设置 `HERMES_RCA_KAFKA_EXPECTED_CLUSTER_ID` 和 `HERMES_RCA_KAFKA_MIN_REPLICATION_FACTOR`，不得依赖 bootstrap 地址暗示 cluster identity，也不得依赖代码猜测副本 SLO。采集器使用 pinned `kafka-python==3.0.7` 的单次精确 topic Metadata v12 响应同时读取 cluster identity、topic topology 和 topic authorized operations，不额外要求 cluster ACL；该请求强制 `allow_auto_topic_creation=false`、`include_topic_authorized_operations=true`，且 broker 返回的 cluster id 必须与权威 env 完全相等。随后仅对固定 Group `root_cause_analysis_agent` 执行一次 `DescribeGroups(include_authorized_operations=true)` 权限读取；client 可以先用无副作用的 `FindCoordinator` 定位该 group，但不得调用 OffsetFetch。只有 broker 返回的 cluster identity、精确 topic、从 0 连续的 partition、有效 leader、ISR 与 replicas 完全相等、零 offline replica、副本数达到显式策略，且 topic 与 group 都明确具备 `READ` + `DESCRIBE`、同时不具备 `WRITE` / `CREATE` / `DELETE` / `ALTER` / `ALTER_CONFIGS` / `CLUSTER_ACTION` / `IDEMPOTENT_WRITE` 等 mutation 权限时，才分别写 `topic_healthy=true`、`topic_authorized=true` 与 `group_authorized=true`。`broker_metadata.json` 是这两个资源的同源、同连接证据，不再依赖未实现的独立 `broker_acl_snapshot.json`。采集器不创建 consumer、不加入 consumer group，也不调用 subscribe、assign、poll、commit、OffsetFetch 或 ListOffsets；`DescribeGroups` 是精确 topic Metadata 之外唯一的数据/权限读取。每分区 T0 必须另由 owner 根据上线语义审定，写入 `HERMES_RCA_KAFKA_START_OFFSETS_JSON` 并形成独立 `t0_offsets.json`；不得从任何 metadata 或 group 结果自动推导 T0。
+
+若 owner 尚不知道 cluster ID/RF，不得填写占位值。先在凭证轮换后运行不可放行的观测模式：
+
+```bash
+"$RCA_PYTHON" scripts/pnc_rca_kafka_preflight.py \
+  --env-file "$HOME/.hermes/.env" \
+  --observe-only \
+  --output "$EVIDENCE_DIR/broker_observation.json"
+```
+
+`broker_observation.json` 固定 `production_eligible=false`，只给出实测 cluster ID、replication factor、topology 和只读 ACL，owner 必须独立审批后把 cluster ID/RF 写入候选 env，再运行上面的严格 preflight；release gate 永不接受 observation schema 代替 `broker_metadata.json`。
+
+真实问题单 manifest 完成 Feishu 回读后，可在 workflow policy 尚未审批时先观察最近 7 天事件字段：
+
+```bash
+E2E_MANIFEST='<owner-only pnc_rca_kafka_e2e_canary_manifest_v1.json>'
+
+"$RCA_PYTHON" scripts/pnc_rca_kafka_recent_replay.py \
+  --env-file "$HOME/.hermes/.env" \
+  --e2e-canary-manifest "$E2E_MANIFEST" \
+  --observe-policy-only \
+  --window-days 7 \
+  --output "$EVIDENCE_DIR/kafka_policy_observation.json"
+```
+
+该模式用永不匹配真实事件的 synthetic transport policy，只输出 `project_key/project_simple_name/work_item_type_key/status_change_type/state transition` 有界计数及 manifest ID 命中情况，固定 `production_eligible=false`，不保留标题、PDCL 地址或 raw payload。manifest 必须绑定 0600 Feishu 官方回读 receipt 的绝对路径与 SHA；release gate 会重新读取该 receipt、逐项核对 work item ID/插件来源/PDCL 与功能字段覆盖，并重新哈希用户截图，任一源文件漂移都 fail closed。owner 审批这些真实观测值后再运行同参数但去掉 `--observe-policy-only` 的正式 shadow replay；只有 manifest 全量 accepted 且 trigger/outbox 闭环的 `kafka_recent_replay.json` 才可进入 release gate。
 
 ### 7.3 单事件 canary 证据采集
 

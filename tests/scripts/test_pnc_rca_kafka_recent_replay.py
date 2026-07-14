@@ -5,7 +5,11 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import signal
+import time
 from types import SimpleNamespace
+
+import pytest
 
 from scripts import pnc_rca_kafka_consumer
 from scripts import pnc_rca_kafka_recent_replay as replay
@@ -60,6 +64,36 @@ def _value(work_item_id: int) -> bytes:
         "updated_at": int(NOW.timestamp() * 1000),
         "work_item_type_key": "problem-type",
     }).encode()
+
+
+def _manifest(tmp_path: Path, work_item_ids: list[str]) -> Path:
+    path = tmp_path / "e2e-canary-manifest.json"
+    feishu_receipt = tmp_path / "feishu-receipt.json"
+    feishu_receipt.write_text("{}\n", encoding="utf-8")
+    feishu_receipt.chmod(0o600)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": replay.E2E_CANARY_MANIFEST_SCHEMA_VERSION,
+                "source": {
+                    "project_key": "project-key",
+                    "project_simple_name": "g1q3",
+                    "work_item_type_key": "problem-type",
+                    "feishu_plugin_source": "plugin-source",
+                    "feishu_receipt_path": str(feishu_receipt),
+                    "screenshot_sha256": "a" * 64,
+                    "feishu_receipt_sha256": "b" * 64,
+                },
+                "work_item_ids": work_item_ids,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+    return path
 
 
 @dataclass(frozen=True)
@@ -157,6 +191,8 @@ def test_recent_replay_uses_explicit_offsets_and_shadow_store(tmp_path: Path) ->
         "commit_performed": False,
         "allow_auto_create_topics": False,
         "isolation_level": "read_committed",
+        "request_timeout_ms": 5000,
+        "bootstrap_timeout_ms": 5000,
     }
     serialized = json.dumps(receipt, ensure_ascii=False)
     assert "private title" not in serialized
@@ -170,3 +206,110 @@ def test_recent_replay_output_is_canonical_owner_only(tmp_path: Path) -> None:
     assert path.read_bytes() == b'{"a":2,"z":1}\n'
     assert digest == replay._sha256(path.read_bytes())
     assert os.stat(path).st_mode & 0o777 == 0o600
+
+
+@pytest.mark.skipif(
+    not hasattr(signal, "SIGALRM") or not hasattr(signal, "setitimer"),
+    reason="POSIX interval timers are required",
+)
+def test_hard_deadline_interrupts_and_restores_signal_handler() -> None:
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    started = time.monotonic()
+
+    with pytest.raises(replay.ReplayError, match="kafka_recent_total_timeout"):
+        with replay._HardDeadline(1):
+            time.sleep(2)
+
+    assert time.monotonic() - started < 1.8
+    assert signal.getsignal(signal.SIGALRM) == previous_handler
+
+
+def test_recent_replay_binds_all_expected_real_work_items(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path, ["7000000000", "7000000001"])
+    expected, observation = replay.load_e2e_canary_manifest(manifest)
+
+    receipt = replay.collect_recent_replay(
+        _config(tmp_path),
+        consumer_factory=_FakeConsumer,
+        topic_partition_factory=_TopicPartition,
+        now=NOW,
+        max_messages=10,
+        max_bytes=1024 * 1024,
+        max_seconds=10,
+        expected_work_item_ids=expected,
+        e2e_manifest_observation=observation,
+    )
+
+    e2e = receipt["result"]["e2e_canary"]
+    assert e2e["required"] is True
+    assert e2e["complete"] is True
+    assert e2e["matched_work_item_ids"] == ["7000000000", "7000000001"]
+    assert e2e["missing_work_item_ids"] == []
+    assert e2e["manifest"]["sha256"] == replay._sha256(
+        manifest.read_bytes()
+    )
+    assert all(item["expected_e2e_work_item"] for item in receipt["result"]["records"])
+
+
+def test_policy_observation_discovers_real_values_without_approving_them(
+    tmp_path: Path,
+) -> None:
+    transport_env = {
+        "HERMES_RCA_KAFKA_BOOTSTRAP_SERVERS": "broker-1:9092",
+        "HERMES_RCA_KAFKA_TOPIC": TOPIC,
+        "HERMES_RCA_KAFKA_USER": "root_cause_analysis_agent",
+        "HERMES_RCA_KAFKA_PASSWORD": "test-secret",
+        "HERMES_RCA_KAFKA_GROUP": "root_cause_analysis_agent",
+        "HERMES_RCA_KAFKA_API_VERSION": "3.9.0",
+    }
+    config = replay._policy_observation_config(
+        transport_env,
+        hermes_home=tmp_path,
+    )
+    manifest = _manifest(tmp_path, ["7000000000", "7000000001"])
+    expected, observation = replay.load_e2e_canary_manifest(manifest)
+
+    receipt = replay.collect_recent_policy_observation(
+        config,
+        consumer_factory=_FakeConsumer,
+        topic_partition_factory=_TopicPartition,
+        now=NOW,
+        max_messages=10,
+        max_bytes=1024 * 1024,
+        max_seconds=10,
+        expected_work_item_ids=expected,
+        e2e_manifest_observation=observation,
+    )
+
+    assert receipt["schema_version"] == replay.POLICY_OBSERVATION_SCHEMA_VERSION
+    assert receipt["production_eligible"] is False
+    assert receipt["result"]["records_seen"] == 2
+    assert receipt["result"]["records_decoded"] == 2
+    assert receipt["result"]["fields"] == {
+        "project_key": [{"value": "project-key", "count": 2}],
+        "project_simple_name": [{"value": "g1q3", "count": 2}],
+        "work_item_type_key": [{"value": "problem-type", "count": 2}],
+        "status_change_type": [{"value": "Reached", "count": 2}],
+    }
+    assert receipt["result"]["transitions"] == [
+        {
+            "state_key": "new-problem-state",
+            "pre_status": "1",
+            "cur_status": "2",
+            "count": 2,
+        }
+    ]
+    assert receipt["result"]["e2e_canary"]["complete"] is True
+    serialized = json.dumps(receipt, ensure_ascii=False)
+    assert "private title" not in serialized
+    assert "test-secret" not in serialized
+
+
+def test_e2e_manifest_rejects_unsafe_or_duplicate_inputs(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path, ["7000000000", "7000000000"])
+    with pytest.raises(replay.ReplayError, match="work_item_duplicate"):
+        replay.load_e2e_canary_manifest(manifest)
+
+    manifest.chmod(0o640)
+    with pytest.raises(replay.ReplayError, match="file_unsafe"):
+        replay.load_e2e_canary_manifest(manifest)

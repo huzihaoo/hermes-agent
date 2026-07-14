@@ -171,10 +171,19 @@ T0_OFFSETS_SCHEMA_VERSION = "pnc_rca_t0_offsets_v1"
 WORKFLOW_FIXTURES_SCHEMA_VERSION = "pnc_rca_workflow_fixtures_v1"
 SHADOW_SOAK_SCHEMA_VERSION = "pnc_rca_shadow_soak_v1"
 KAFKA_RECENT_REPLAY_SCHEMA_VERSION = "pnc_rca_kafka_recent_replay_v1"
+KAFKA_E2E_CANARY_MANIFEST_SCHEMA_VERSION = (
+    "pnc_rca_kafka_e2e_canary_manifest_v1"
+)
+KAFKA_FEISHU_E2E_RECEIPT_SCHEMA_VERSION = (
+    "pnc_rca_feishu_kafka_e2e_receipt_v1"
+)
 KAFKA_RECENT_REPLAY_FILENAME = "kafka_recent_replay.json"
 KAFKA_RECENT_REPLAY_MODULE = "scripts/pnc_rca_kafka_recent_replay.py"
 KAFKA_RECENT_REPLAY_SCHEMA = (
     "docs/pnc/schemas/pnc_rca_kafka_recent_replay_v1.schema.json"
+)
+KAFKA_E2E_CANARY_MANIFEST_SCHEMA = (
+    "docs/pnc/schemas/pnc_rca_kafka_e2e_canary_manifest_v1.schema.json"
 )
 REMOTE_READER_HEALTH_SCHEMA_VERSION = "pnc_rca_remote_reader_health_v1"
 REMOTE_READER_SOAK_SCHEMA_VERSION = "pnc_rca_remote_reader_soak_v4"
@@ -758,6 +767,7 @@ MINIMUM_CRITICAL_FILES = frozenset({
     REMOTE_READER_DOMAIN_MAPPING_APPROVAL_SCHEMA,
     REMOTE_READER_WORKLOAD_EXPORT_RECEIPT_SCHEMA,
     KAFKA_RECENT_REPLAY_SCHEMA,
+    KAFKA_E2E_CANARY_MANIFEST_SCHEMA,
     "scripts/g1q3_rca_e2e_smoke.py",
     "scripts/pnc_g1q3_governance_rca.py",
     "scripts/pnc_g1q3_truth.py",
@@ -4091,6 +4101,217 @@ def _check_remote_reader_workload_provenance(
     }
 
 
+def _check_kafka_e2e_feishu_source(
+    *,
+    manifest_task_id: str,
+    source: Mapping[str, str],
+    expected_work_item_ids: Sequence[str],
+    window_started_at: datetime,
+    replay_observed_at: datetime,
+) -> dict[str, Any]:
+    blocker = "kafka_recent_replay_e2e_source_invalid"
+    receipt_path = Path(source["feishu_receipt_path"]).expanduser().absolute()
+    try:
+        raw_receipt, receipt = _load_owner_only_json(
+            receipt_path,
+            artifact="kafka_recent_replay_e2e_feishu_receipt",
+        )
+    except (EvidenceError, OSError, ValueError) as exc:
+        raise EvidenceError(blocker) from exc
+    if (
+        hashlib.sha256(raw_receipt).hexdigest()
+        != source["feishu_receipt_sha256"]
+        or set(receipt)
+        != {
+            "schema_version",
+            "observed_at",
+            "task_id",
+            "source_class",
+            "official_source",
+            "user_evidence",
+            "result",
+            "privacy",
+            "side_effects",
+        }
+        or receipt.get("schema_version")
+        != KAFKA_FEISHU_E2E_RECEIPT_SCHEMA_VERSION
+        or receipt.get("task_id") != manifest_task_id
+        or receipt.get("source_class") != "live_observation"
+    ):
+        raise EvidenceError(blocker)
+    receipt_observed_at = _timestamp(
+        receipt.get("observed_at"), f"{blocker}.observed_at"
+    )
+    if not window_started_at <= receipt_observed_at <= replay_observed_at:
+        raise EvidenceError(blocker)
+
+    official = _remote_soak_object(
+        receipt.get("official_source"),
+        field=f"{blocker}.official_source",
+        keys={
+            "client",
+            "project_key",
+            "project_simple_name",
+            "work_item_type_key",
+            "status_key",
+            "source_type",
+            "plugin_source",
+            "operation_type",
+            "op_record_module",
+        },
+        blocker=blocker,
+    )
+    if official != {
+        "client": "meegle",
+        "project_key": source["project_key"],
+        "project_simple_name": source["project_simple_name"],
+        "work_item_type_key": source["work_item_type_key"],
+        "status_key": "OPEN",
+        "source_type": "plugin",
+        "plugin_source": source["feishu_plugin_source"],
+        "operation_type": "create",
+        "op_record_module": "work_item_mod",
+    }:
+        raise EvidenceError(blocker)
+
+    privacy = _remote_soak_object(
+        receipt.get("privacy"),
+        field=f"{blocker}.privacy",
+        keys={
+            "credential_persisted",
+            "person_identity_persisted",
+            "raw_pdcl_reference_persisted",
+            "raw_title_persisted",
+        },
+        blocker=blocker,
+    )
+    side_effects = _remote_soak_object(
+        receipt.get("side_effects"),
+        field=f"{blocker}.side_effects",
+        keys={"feishu_write", "kafka_read", "production_mutation"},
+        blocker=blocker,
+    )
+    if privacy != {
+        "credential_persisted": False,
+        "person_identity_persisted": False,
+        "raw_pdcl_reference_persisted": False,
+        "raw_title_persisted": False,
+    } or side_effects != {
+        "feishu_write": False,
+        "kafka_read": False,
+        "production_mutation": False,
+    }:
+        raise EvidenceError(blocker)
+
+    user_evidence = _remote_soak_object(
+        receipt.get("user_evidence"),
+        field=f"{blocker}.user_evidence",
+        keys={"screenshot_path", "screenshot_sha256"},
+        blocker=blocker,
+    )
+    screenshot_sha256 = _sha256_digest(
+        user_evidence.get("screenshot_sha256"),
+        f"{blocker}.user_evidence.screenshot_sha256",
+    )
+    screenshot_path = Path(
+        _required_text(
+            user_evidence.get("screenshot_path"),
+            f"{blocker}.user_evidence.screenshot_path",
+        )
+    ).expanduser().absolute()
+    try:
+        raw_screenshot, screenshot_info = _stable_regular_file_observation(
+            screenshot_path,
+            artifact="kafka_recent_replay_e2e_screenshot",
+            require_owner=True,
+        )
+    except (EvidenceError, OSError, ValueError) as exc:
+        raise EvidenceError(blocker) from exc
+    if (
+        screenshot_sha256 != source["screenshot_sha256"]
+        or hashlib.sha256(raw_screenshot).hexdigest() != screenshot_sha256
+        or stat.S_IMODE(screenshot_info.st_mode) & 0o022
+    ):
+        raise EvidenceError(blocker)
+
+    result = _remote_soak_object(
+        receipt.get("result"),
+        field=f"{blocker}.result",
+        keys={
+            "expected",
+            "work_items_found",
+            "pdcl_field_present",
+            "function_field_present",
+            "creation_records_found",
+            "all_exactly_one_creation_record",
+            "all_identity_fields_match",
+            "items",
+        },
+        blocker=blocker,
+    )
+    expected_count = len(expected_work_item_ids)
+    if (
+        any(
+            _exact_int(result.get(name), f"{blocker}.result.{name}", minimum=1)
+            != expected_count
+            for name in (
+                "expected",
+                "work_items_found",
+                "pdcl_field_present",
+                "function_field_present",
+                "creation_records_found",
+            )
+        )
+        or result.get("all_exactly_one_creation_record") is not True
+        or result.get("all_identity_fields_match") is not True
+    ):
+        raise EvidenceError(blocker)
+    raw_items = result.get("items")
+    if not isinstance(raw_items, list) or len(raw_items) != expected_count:
+        raise EvidenceError(blocker)
+    observed_work_item_ids: list[str] = []
+    for index, raw_item in enumerate(raw_items):
+        item = _remote_soak_object(
+            raw_item,
+            field=f"{blocker}.result.items.{index}",
+            keys={"work_item_id", "create_time", "operation_time_ms"},
+            blocker=blocker,
+        )
+        work_item_id = _required_text(
+            item.get("work_item_id"),
+            f"{blocker}.result.items.{index}.work_item_id",
+        )
+        if not work_item_id.isdigit() or int(work_item_id) <= 0:
+            raise EvidenceError(blocker)
+        created_at = _timestamp(
+            item.get("create_time"),
+            f"{blocker}.result.items.{index}.create_time",
+        )
+        operation_time_ms = _exact_int(
+            item.get("operation_time_ms"),
+            f"{blocker}.result.items.{index}.operation_time_ms",
+            minimum=1,
+        )
+        operation_at = datetime.fromtimestamp(
+            operation_time_ms / 1000,
+            tz=timezone.utc,
+        )
+        if (
+            not window_started_at <= created_at <= replay_observed_at
+            or not window_started_at <= operation_at <= replay_observed_at
+            or abs((created_at - operation_at).total_seconds()) > 5
+        ):
+            raise EvidenceError(blocker)
+        observed_work_item_ids.append(work_item_id)
+    if sorted(observed_work_item_ids, key=int) != list(expected_work_item_ids):
+        raise EvidenceError(blocker)
+    return {
+        "feishu_receipt_sha256": source["feishu_receipt_sha256"],
+        "screenshot_sha256": screenshot_sha256,
+        "verified_work_item_count": expected_count,
+    }
+
+
 def _check_kafka_recent_replay(
     body: Mapping[str, Any],
     *,
@@ -4268,7 +4489,35 @@ def _check_kafka_recent_replay(
     )
     if max_messages > 10_000 or max_bytes > 128 * 1024 * 1024 or max_seconds > 300:
         raise EvidenceError("kafka_recent_replay_limits_invalid")
-    if body.get("transport") != {
+    transport = body.get("transport")
+    if not isinstance(transport, Mapping) or set(transport) != {
+        "assignment",
+        "group_id",
+        "subscribed",
+        "group_joined",
+        "enable_auto_commit",
+        "commit_performed",
+        "allow_auto_create_topics",
+        "isolation_level",
+        "request_timeout_ms",
+        "bootstrap_timeout_ms",
+    }:
+        raise EvidenceError("kafka_recent_replay_transport_invalid")
+    bounded_request_timeout = _exact_int(
+        transport.get("request_timeout_ms"),
+        f"{artifact}.transport.request_timeout_ms",
+        minimum=1,
+    )
+    bounded_bootstrap_timeout = _exact_int(
+        transport.get("bootstrap_timeout_ms"),
+        f"{artifact}.transport.bootstrap_timeout_ms",
+        minimum=1,
+    )
+    if {
+        key: value
+        for key, value in transport.items()
+        if key not in {"request_timeout_ms", "bootstrap_timeout_ms"}
+    } != {
         "assignment": "explicit",
         "group_id": None,
         "subscribed": False,
@@ -4277,7 +4526,10 @@ def _check_kafka_recent_replay(
         "commit_performed": False,
         "allow_auto_create_topics": False,
         "isolation_level": "read_committed",
-    }:
+    } or not (
+        bounded_request_timeout <= 5_000
+        and bounded_bootstrap_timeout == bounded_request_timeout
+    ):
         raise EvidenceError("kafka_recent_replay_transport_invalid")
 
     result = _remote_soak_object(
@@ -4294,6 +4546,7 @@ def _check_kafka_recent_replay(
             "production_mutation_performed",
             "raw_payload_persisted_to_output",
             "temporary_store_destroyed",
+            "e2e_canary",
         },
         blocker="kafka_recent_replay_result_invalid",
     )
@@ -4332,6 +4585,7 @@ def _check_kafka_recent_replay(
     observed_bytes = 0
     trigger_count = 0
     outbox_count = 0
+    expected_e2e_record_count = 0
     for index, raw_record in enumerate(raw_records):
         record = _remote_soak_object(
             raw_record,
@@ -4349,6 +4603,7 @@ def _check_kafka_recent_replay(
                 "submission_key_sha256",
                 "trigger_created",
                 "outbox_created",
+                "expected_e2e_work_item",
             },
             blocker="kafka_recent_replay_records_invalid",
         )
@@ -4387,6 +4642,7 @@ def _check_kafka_recent_replay(
             or decision not in {"accepted", "filtered", "invalid", "deduped"}
             or not isinstance(record.get("trigger_created"), bool)
             or not isinstance(record.get("outbox_created"), bool)
+            or not isinstance(record.get("expected_e2e_work_item"), bool)
         ):
             raise EvidenceError("kafka_recent_replay_records_invalid")
         _sha256_digest(
@@ -4412,6 +4668,183 @@ def _check_kafka_recent_replay(
         observed_bytes += value_bytes
         trigger_count += int(record["trigger_created"])
         outbox_count += int(record["outbox_created"])
+        expected_e2e_record_count += int(record["expected_e2e_work_item"])
+
+    e2e = _remote_soak_object(
+        result.get("e2e_canary"),
+        field=f"{artifact}.result.e2e_canary",
+        keys={
+            "required",
+            "manifest",
+            "expected_work_item_ids",
+            "matched_work_item_ids",
+            "missing_work_item_ids",
+            "unexpected_accepted_work_items",
+            "complete",
+        },
+        blocker="kafka_recent_replay_e2e_invalid",
+    )
+    manifest_observation = _remote_soak_object(
+        e2e.get("manifest"),
+        field=f"{artifact}.result.e2e_canary.manifest",
+        keys={"path", "sha256", "mode", "size", "work_item_count", "source"},
+        blocker="kafka_recent_replay_e2e_manifest_invalid",
+    )
+    manifest_path = Path(
+        _required_text(
+            manifest_observation.get("path"),
+            f"{artifact}.result.e2e_canary.manifest.path",
+        )
+    ).expanduser()
+    if (
+        not manifest_path.is_absolute()
+        or manifest_observation.get("mode") != "0600"
+    ):
+        raise EvidenceError("kafka_recent_replay_e2e_manifest_invalid")
+    expected_manifest_sha256 = _sha256_digest(
+        manifest_observation.get("sha256"),
+        f"{artifact}.result.e2e_canary.manifest.sha256",
+    )
+    raw_manifest, manifest_body = _load_owner_only_json(
+        manifest_path,
+        artifact="kafka_recent_replay_e2e_manifest",
+    )
+    if (
+        len(raw_manifest)
+        != _exact_int(
+            manifest_observation.get("size"),
+            f"{artifact}.result.e2e_canary.manifest.size",
+            minimum=1,
+        )
+        or hashlib.sha256(raw_manifest).hexdigest() != expected_manifest_sha256
+        or manifest_body.get("schema_version")
+        != KAFKA_E2E_CANARY_MANIFEST_SCHEMA_VERSION
+        or set(manifest_body)
+        != {
+            "schema_version",
+            "generated_at",
+            "task_id",
+            "source",
+            "work_item_ids",
+            "required_kafka_evidence",
+            "contains_raw_title",
+            "contains_raw_pdcl_reference",
+            "contains_credential",
+        }
+        or manifest_body.get("required_kafka_evidence")
+        != {
+            "window_days": 7,
+            "all_work_items_observed": True,
+            "all_work_items_accepted": True,
+            "all_triggers_created_or_deduplicated": True,
+            "shadow_outbox_only": True,
+            "commit_performed": False,
+        }
+        or manifest_body.get("contains_raw_title") is not False
+        or manifest_body.get("contains_raw_pdcl_reference") is not False
+        or manifest_body.get("contains_credential") is not False
+    ):
+        raise EvidenceError("kafka_recent_replay_e2e_manifest_invalid")
+    manifest_generated_at = _timestamp(
+        manifest_body.get("generated_at"),
+        f"{artifact}.result.e2e_canary.manifest.generated_at",
+    )
+    manifest_task_id = _required_text(
+        manifest_body.get("task_id"),
+        f"{artifact}.result.e2e_canary.manifest.task_id",
+    )
+    if manifest_generated_at > observed or len(manifest_task_id) > 128:
+        raise EvidenceError("kafka_recent_replay_e2e_manifest_invalid")
+    expected_ids = e2e.get("expected_work_item_ids")
+    matched_ids = e2e.get("matched_work_item_ids")
+    missing_ids = e2e.get("missing_work_item_ids")
+    manifest_ids = manifest_body.get("work_item_ids")
+    if not all(
+        isinstance(value, list)
+        for value in (expected_ids, matched_ids, missing_ids, manifest_ids)
+    ):
+        raise EvidenceError("kafka_recent_replay_e2e_invalid")
+
+    def valid_work_item_ids(values: Sequence[Any]) -> list[str]:
+        normalized = [str(value).strip() for value in values]
+        if (
+            not normalized
+            or any(
+                not value.isdigit() or int(value) <= 0 or len(value) > 32
+                for value in normalized
+            )
+            or len(normalized) != len(set(normalized))
+        ):
+            raise EvidenceError("kafka_recent_replay_e2e_invalid")
+        return sorted(normalized, key=int)
+
+    expected_id_list = valid_work_item_ids(expected_ids)
+    matched_id_list = valid_work_item_ids(matched_ids)
+    manifest_id_list = valid_work_item_ids(manifest_ids)
+    source_identity = _mapping(
+        manifest_body.get("source"),
+        f"{artifact}.result.e2e_canary.manifest.source",
+    )
+    observed_source_identity = _mapping(
+        manifest_observation.get("source"),
+        f"{artifact}.result.e2e_canary.manifest.observed_source",
+    )
+    source_fields = {
+        name: _required_text(
+            source_identity.get(name),
+            f"{artifact}.result.e2e_canary.manifest.source.{name}",
+        )
+        for name in (
+            "project_key",
+            "project_simple_name",
+            "work_item_type_key",
+            "feishu_plugin_source",
+            "feishu_receipt_path",
+            "screenshot_sha256",
+            "feishu_receipt_sha256",
+        )
+    }
+    if set(source_identity) != set(source_fields) or observed_source_identity != (
+        source_fields
+    ):
+        raise EvidenceError("kafka_recent_replay_e2e_manifest_invalid")
+    if not Path(source_fields["feishu_receipt_path"]).expanduser().is_absolute():
+        raise EvidenceError("kafka_recent_replay_e2e_manifest_invalid")
+    for name in ("screenshot_sha256", "feishu_receipt_sha256"):
+        _sha256_digest(
+            source_fields[name],
+            f"{artifact}.result.e2e_canary.manifest.source.{name}",
+        )
+    expected_count = _exact_int(
+        manifest_observation.get("work_item_count"),
+        f"{artifact}.result.e2e_canary.manifest.work_item_count",
+        minimum=1,
+    )
+    if (
+        e2e.get("required") is not True
+        or e2e.get("complete") is not True
+        or missing_ids != []
+        or expected_id_list != matched_id_list
+        or expected_id_list != manifest_id_list
+        or len(expected_id_list) != expected_count
+        or expected_e2e_record_count < expected_count
+        or source_fields["project_key"] not in consumer.policy.project_keys
+        or source_fields["project_simple_name"]
+        not in consumer.policy.project_simple_names
+        or source_fields["work_item_type_key"]
+        not in consumer.policy.work_item_type_keys
+        or isinstance(e2e.get("unexpected_accepted_work_items"), bool)
+        or not isinstance(e2e.get("unexpected_accepted_work_items"), int)
+        or e2e["unexpected_accepted_work_items"] < 0
+    ):
+        raise EvidenceError("kafka_recent_replay_e2e_incomplete")
+    feishu_source = _check_kafka_e2e_feishu_source(
+        manifest_task_id=manifest_task_id,
+        source=source_fields,
+        expected_work_item_ids=expected_id_list,
+        window_started_at=started_at,
+        replay_observed_at=observed,
+    )
     if (
         dict(sorted(decision_counts.items())) != result.get("decision_counts")
         or dict(sorted(reason_counts.items())) != result.get("reason_counts")
@@ -4464,6 +4897,10 @@ def _check_kafka_recent_replay(
         "accepted": decision_counts["accepted"],
         "triggers_created": trigger_count,
         "shadow_outbox_created": outbox_count,
+        "e2e_work_items_matched": expected_count,
+        "e2e_manifest_sha256": expected_manifest_sha256,
+        **feishu_source,
+        "feishu_plugin_source": source_fields["feishu_plugin_source"],
         "commit_performed": False,
         "production_mutation_performed": False,
     }

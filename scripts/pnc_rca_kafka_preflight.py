@@ -32,6 +32,7 @@ ENV_PREFIX = "HERMES_RCA_KAFKA_"
 FIXED_SERVICE_ID = "root_cause_analysis_agent"
 MAX_ENV_FILE_BYTES = 1024 * 1024
 BROKER_METADATA_SCHEMA_VERSION = "pnc_rca_broker_metadata_v3"
+BROKER_OBSERVATION_SCHEMA_VERSION = "pnc_rca_broker_observation_v1"
 COLLECTOR_SCHEMA_VERSION = "pnc_rca_kafka_preflight_v2"
 REQUIRED_AUTHORIZED_OPERATIONS = frozenset({"DESCRIBE", "READ"})
 KNOWN_AUTHORIZED_OPERATIONS = frozenset({
@@ -149,7 +150,7 @@ def _authorized_operations(
 class BrokerProbeConfig:
     bootstrap_servers: tuple[str, ...]
     topic: str
-    expected_cluster_id: str
+    expected_cluster_id: str | None
     username: str
     password: str = field(repr=False)
     configured_group_id: str = FIXED_SERVICE_ID
@@ -157,11 +158,16 @@ class BrokerProbeConfig:
     security_protocol: str = "SASL_PLAINTEXT"
     sasl_mechanism: str = "PLAIN"
     request_timeout_ms: int = 120_000
-    minimum_replication_factor: int = 1
+    minimum_replication_factor: int | None = None
     client_id: str = "root_cause_analysis_agent_metadata_preflight"
 
     @classmethod
-    def from_env(cls, env: Mapping[str, str] | None = None) -> "BrokerProbeConfig":
+    def from_env(
+        cls,
+        env: Mapping[str, str] | None = None,
+        *,
+        observe_only: bool = False,
+    ) -> "BrokerProbeConfig":
         source = os.environ if env is None else env
         bootstrap_servers = tuple(
             item.strip()
@@ -173,9 +179,11 @@ class BrokerProbeConfig:
         topic = _required(source, f"{ENV_PREFIX}TOPIC")
         if any(character in topic for character in ",\r\n"):
             raise ValueError(f"{ENV_PREFIX}TOPIC must name one exact topic")
-        expected_cluster_id = _required_single_line(
-            source, f"{ENV_PREFIX}EXPECTED_CLUSTER_ID"
-        )
+        expected_cluster_id = None
+        if not observe_only:
+            expected_cluster_id = _required_single_line(
+                source, f"{ENV_PREFIX}EXPECTED_CLUSTER_ID"
+            )
         username = _required(source, f"{ENV_PREFIX}USER")
         group_id = _required(source, f"{ENV_PREFIX}GROUP")
         if username != FIXED_SERVICE_ID:
@@ -205,8 +213,12 @@ class BrokerProbeConfig:
             request_timeout_ms=_positive_integer(
                 source, f"{ENV_PREFIX}REQUEST_TIMEOUT_MS", 120_000
             ),
-            minimum_replication_factor=_required_positive_integer(
-                source, f"{ENV_PREFIX}MIN_REPLICATION_FACTOR"
+            minimum_replication_factor=(
+                None
+                if observe_only
+                else _required_positive_integer(
+                    source, f"{ENV_PREFIX}MIN_REPLICATION_FACTOR"
+                )
             ),
         )
 
@@ -253,6 +265,7 @@ def collect_broker_metadata(
     admin_factory: Callable[..., Any] | None = None,
     now: datetime | None = None,
     env_file_observation: Mapping[str, Any] | None = None,
+    observe_only: bool = False,
 ) -> dict[str, Any]:
     """Query exact topic metadata/ACLs without joining a group or consuming."""
     kafka_version = metadata.version("kafka-python")
@@ -280,7 +293,7 @@ def collect_broker_metadata(
         cluster_id = cluster.get("cluster_id")
         if not isinstance(cluster_id, str) or not cluster_id:
             raise RuntimeError("broker_cluster_id_missing")
-        if cluster_id != config.expected_cluster_id:
+        if not observe_only and cluster_id != config.expected_cluster_id:
             raise RuntimeError("broker_cluster_id_mismatch")
         topics = cluster.get("topics")
         if not isinstance(topics, list) or len(topics) != 1:
@@ -367,7 +380,11 @@ def collect_broker_metadata(
         if len(replication_factors) != 1:
             raise RuntimeError("broker_replication_factor_inconsistent")
         replication_factor = replication_factors.pop()
-        if replication_factor < config.minimum_replication_factor:
+        if (
+            not observe_only
+            and config.minimum_replication_factor is not None
+            and replication_factor < config.minimum_replication_factor
+        ):
             raise RuntimeError("broker_replication_factor_below_policy")
 
         group_descriptions = admin.describe_groups(
@@ -406,8 +423,18 @@ def collect_broker_metadata(
     source_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     public_config = config.public_dict()
     return {
-        "schema_version": BROKER_METADATA_SCHEMA_VERSION,
+        "schema_version": (
+            BROKER_OBSERVATION_SCHEMA_VERSION
+            if observe_only
+            else BROKER_METADATA_SCHEMA_VERSION
+        ),
         "observed_at": observed_at.isoformat(),
+        "production_eligible": not observe_only,
+        "owner_approval_required": (
+            ["cluster_id", "minimum_replication_factor"]
+            if observe_only
+            else []
+        ),
         "topic_authorized": True,
         "topic_healthy": True,
         "group_authorized": True,
@@ -426,6 +453,7 @@ def collect_broker_metadata(
             "dependency_versions": {"kafka-python": kafka_version},
             "connection_config_sha256": _canonical_sha256(public_config),
             "config": public_config,
+            "mode": "observe_only" if observe_only else "release_gate",
             "env_file": dict(env_file_observation or {}),
             "side_effect_contract": {
                 "exact_topic_metadata": True,
@@ -580,6 +608,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--output",
         help="absolute broker_metadata.json path; stdout only when omitted",
     )
+    parser.add_argument(
+        "--observe-only",
+        action="store_true",
+        help=(
+            "observe cluster identity and replication without owner policy; "
+            "the receipt is never production-eligible"
+        ),
+    )
     return parser
 
 
@@ -594,15 +630,18 @@ def main(
     config: BrokerProbeConfig | None = None
     try:
         output_path = _output_path(args.output)
+        if args.observe_only and output_path is None:
+            raise ValueError("--observe-only requires --output")
         env_observation: Mapping[str, Any] | None = None
         if env is None:
             env, env_observation = load_environment(args.env_file)
-        config = BrokerProbeConfig.from_env(env)
+        config = BrokerProbeConfig.from_env(env, observe_only=args.observe_only)
         payload = collect_broker_metadata(
             config,
             admin_factory=admin_factory,
             now=now,
             env_file_observation=env_observation,
+            observe_only=args.observe_only,
         )
         if output_path is not None:
             _atomic_write_evidence(output_path, payload)

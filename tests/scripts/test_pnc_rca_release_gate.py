@@ -3464,6 +3464,103 @@ def _write_kafka_recent_replay_evidence(
     _env, env_observation = load_kafka_preflight_environment(kafka_env_file)
     observed = datetime.fromisoformat(OBSERVED_AT.replace("Z", "+00:00"))
     started = observed - timedelta(days=7)
+    e2e_work_item_ids = ["7000000000", "7000000001"]
+    e2e_task_id = "fixture-rca-production-readiness"
+    screenshot_path = evidence_dir / "kafka-e2e-user-screenshot.jpeg"
+    screenshot_path.write_bytes(b"fixture screenshot evidence")
+    screenshot_path.chmod(0o644)
+    screenshot_sha256 = hashlib.sha256(screenshot_path.read_bytes()).hexdigest()
+    feishu_receipt_path = evidence_dir / "kafka-e2e-feishu-receipt.json"
+    _write_remote_soak_manifest(
+        feishu_receipt_path,
+        {
+            "schema_version": (
+                release_gate_module.KAFKA_FEISHU_E2E_RECEIPT_SCHEMA_VERSION
+            ),
+            "observed_at": OBSERVED_AT,
+            "task_id": e2e_task_id,
+            "source_class": "live_observation",
+            "official_source": {
+                "client": "meegle",
+                "project_key": "t03o4q",
+                "project_simple_name": "g1q3",
+                "work_item_type_key": "issue",
+                "status_key": "OPEN",
+                "source_type": "plugin",
+                "plugin_source": "fixture-plugin-source",
+                "operation_type": "create",
+                "op_record_module": "work_item_mod",
+            },
+            "user_evidence": {
+                "screenshot_path": str(screenshot_path),
+                "screenshot_sha256": screenshot_sha256,
+            },
+            "result": {
+                "expected": len(e2e_work_item_ids),
+                "work_items_found": len(e2e_work_item_ids),
+                "pdcl_field_present": len(e2e_work_item_ids),
+                "function_field_present": len(e2e_work_item_ids),
+                "creation_records_found": len(e2e_work_item_ids),
+                "all_exactly_one_creation_record": True,
+                "all_identity_fields_match": True,
+                "items": [
+                    {
+                        "work_item_id": work_item_id,
+                        "create_time": OBSERVED_AT,
+                        "operation_time_ms": int(observed.timestamp() * 1000),
+                    }
+                    for work_item_id in e2e_work_item_ids
+                ],
+            },
+            "privacy": {
+                "credential_persisted": False,
+                "person_identity_persisted": False,
+                "raw_pdcl_reference_persisted": False,
+                "raw_title_persisted": False,
+            },
+            "side_effects": {
+                "feishu_write": False,
+                "kafka_read": False,
+                "production_mutation": False,
+            },
+        },
+    )
+    e2e_source = {
+        "project_key": "t03o4q",
+        "project_simple_name": "g1q3",
+        "work_item_type_key": "issue",
+        "feishu_plugin_source": "fixture-plugin-source",
+        "feishu_receipt_path": str(feishu_receipt_path),
+        "screenshot_sha256": screenshot_sha256,
+        "feishu_receipt_sha256": hashlib.sha256(
+            feishu_receipt_path.read_bytes()
+        ).hexdigest(),
+    }
+    e2e_manifest_path = evidence_dir / "kafka-e2e-canary-manifest.json"
+    _write_remote_soak_manifest(
+        e2e_manifest_path,
+        {
+            "schema_version": (
+                release_gate_module.KAFKA_E2E_CANARY_MANIFEST_SCHEMA_VERSION
+            ),
+            "generated_at": OBSERVED_AT,
+            "task_id": e2e_task_id,
+            "source": e2e_source,
+            "work_item_ids": e2e_work_item_ids,
+            "required_kafka_evidence": {
+                "window_days": 7,
+                "all_work_items_observed": True,
+                "all_work_items_accepted": True,
+                "all_triggers_created_or_deduplicated": True,
+                "shadow_outbox_only": True,
+                "commit_performed": False,
+            },
+            "contains_raw_title": False,
+            "contains_raw_pdcl_reference": False,
+            "contains_credential": False,
+        },
+    )
+    e2e_manifest_raw = e2e_manifest_path.read_bytes()
     raw_values = [b'{"fixture":"real-kafka-0"}', b'{"fixture":"real-kafka-1"}']
     records = [
         {
@@ -3485,6 +3582,7 @@ def _write_kafka_recent_replay_evidence(
             ).hexdigest(),
             "trigger_created": True,
             "outbox_created": True,
+            "expected_e2e_work_item": True,
         }
         for partition, offset, raw in ((0, 10, raw_values[0]), (1, 20, raw_values[1]))
     ]
@@ -3541,6 +3639,8 @@ def _write_kafka_recent_replay_evidence(
             "commit_performed": False,
             "allow_auto_create_topics": False,
             "isolation_level": "read_committed",
+            "request_timeout_ms": 5000,
+            "bootstrap_timeout_ms": 5000,
         },
         "result": {
             "stop_reason": "partition_end_offsets_reached",
@@ -3557,6 +3657,22 @@ def _write_kafka_recent_replay_evidence(
             "production_mutation_performed": False,
             "raw_payload_persisted_to_output": False,
             "temporary_store_destroyed": True,
+            "e2e_canary": {
+                "required": True,
+                "manifest": {
+                    "path": str(e2e_manifest_path),
+                    "sha256": hashlib.sha256(e2e_manifest_raw).hexdigest(),
+                    "mode": "0600",
+                    "size": len(e2e_manifest_raw),
+                    "work_item_count": len(e2e_work_item_ids),
+                    "source": e2e_source,
+                },
+                "expected_work_item_ids": e2e_work_item_ids,
+                "matched_work_item_ids": e2e_work_item_ids,
+                "missing_work_item_ids": [],
+                "unexpected_accepted_work_items": 0,
+                "complete": True,
+            },
         },
     }
     _write_remote_soak_manifest(
@@ -6762,6 +6878,91 @@ def test_no_clobber_rejects_ambiguous_interrupted_hardlink(tmp_path):
             report,
             conflict_code="test_release_conflict",
         )
+
+
+def test_release_gate_requires_all_real_kafka_e2e_work_items(tmp_path):
+    consumer, dispatcher, settings = _gate(tmp_path, "preauthorization")
+    replay_path = settings.evidence_dir / release_gate_module.KAFKA_RECENT_REPLAY_FILENAME
+    replay_receipt = json.loads(replay_path.read_text(encoding="utf-8"))
+    replay_receipt["result"]["e2e_canary"]["complete"] = False
+    replay_receipt["result"]["e2e_canary"]["missing_work_item_ids"] = [
+        replay_receipt["result"]["e2e_canary"]["expected_work_item_ids"][0]
+    ]
+    _write_remote_soak_manifest(replay_path, replay_receipt)
+
+    report = evaluate_release_gate(
+        consumer=consumer,
+        dispatcher=dispatcher,
+        settings=settings,
+        cutover=_cutover("preauthorization"),
+        now=NOW,
+    )
+
+    by_name = {item["name"]: item for item in report["checks"]}
+    assert report["ok"] is False
+    assert by_name["kafka_recent_replay"]["code"] == (
+        "kafka_recent_replay_e2e_incomplete"
+    )
+
+
+def test_release_gate_rehashes_real_kafka_e2e_manifest(tmp_path):
+    consumer, dispatcher, settings = _gate(tmp_path, "preauthorization")
+    replay_path = settings.evidence_dir / release_gate_module.KAFKA_RECENT_REPLAY_FILENAME
+    replay_receipt = json.loads(replay_path.read_text(encoding="utf-8"))
+    manifest_path = Path(
+        replay_receipt["result"]["e2e_canary"]["manifest"]["path"]
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["work_item_ids"].append("7000000002")
+    _write_remote_soak_manifest(manifest_path, manifest)
+
+    report = evaluate_release_gate(
+        consumer=consumer,
+        dispatcher=dispatcher,
+        settings=settings,
+        cutover=_cutover("preauthorization"),
+        now=NOW,
+    )
+
+    by_name = {item["name"]: item for item in report["checks"]}
+    assert report["ok"] is False
+    assert by_name["kafka_recent_replay"]["code"] == (
+        "kafka_recent_replay_e2e_manifest_invalid"
+    )
+
+
+@pytest.mark.parametrize("source_artifact", ["feishu_receipt", "screenshot"])
+def test_release_gate_rehashes_real_kafka_e2e_source_artifacts(
+    tmp_path, source_artifact
+):
+    consumer, dispatcher, settings = _gate(tmp_path, "preauthorization")
+    replay_path = settings.evidence_dir / release_gate_module.KAFKA_RECENT_REPLAY_FILENAME
+    replay_receipt = json.loads(replay_path.read_text(encoding="utf-8"))
+    manifest_path = Path(
+        replay_receipt["result"]["e2e_canary"]["manifest"]["path"]
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    feishu_receipt_path = Path(manifest["source"]["feishu_receipt_path"])
+    if source_artifact == "feishu_receipt":
+        target = feishu_receipt_path
+    else:
+        feishu_receipt = json.loads(feishu_receipt_path.read_text(encoding="utf-8"))
+        target = Path(feishu_receipt["user_evidence"]["screenshot_path"])
+    target.write_bytes(target.read_bytes() + b"tampered")
+
+    report = evaluate_release_gate(
+        consumer=consumer,
+        dispatcher=dispatcher,
+        settings=settings,
+        cutover=_cutover("preauthorization"),
+        now=NOW,
+    )
+
+    by_name = {item["name"]: item for item in report["checks"]}
+    assert report["ok"] is False
+    assert by_name["kafka_recent_replay"]["code"] == (
+        "kafka_recent_replay_e2e_source_invalid"
+    )
 
 
 @pytest.mark.parametrize(

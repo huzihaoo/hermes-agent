@@ -11,6 +11,7 @@ from kafka.protocol.admin import DescribeGroupsRequest
 from kafka.protocol.broker_version_data import BrokerVersionData
 
 from scripts.pnc_rca_kafka_preflight import (
+    BROKER_OBSERVATION_SCHEMA_VERSION,
     BROKER_METADATA_SCHEMA_VERSION,
     COLLECTOR_SCHEMA_VERSION,
     BrokerProbeConfig,
@@ -191,6 +192,19 @@ def test_config_requires_fixed_service_identity_and_safe_protocol():
         )
 
 
+def test_observe_only_config_does_not_require_owner_cluster_policy():
+    env = _env()
+    env.pop("HERMES_RCA_KAFKA_EXPECTED_CLUSTER_ID")
+    env.pop("HERMES_RCA_KAFKA_MIN_REPLICATION_FACTOR")
+
+    config = BrokerProbeConfig.from_env(env, observe_only=True)
+
+    assert config.expected_cluster_id is None
+    assert config.minimum_replication_factor is None
+    assert config.public_dict()["expected_cluster_id"] is None
+    assert config.public_dict()["minimum_replication_factor"] is None
+
+
 def test_collect_is_read_only_and_returns_release_gate_shape():
     admin = _Admin()
 
@@ -260,6 +274,36 @@ def test_collect_is_read_only_and_returns_release_gate_shape():
         "consumer_group_join": False,
         "topic_auto_create": False,
     }
+
+
+def test_observe_only_collects_owner_candidates_but_is_not_release_evidence():
+    env = _env()
+    env.pop("HERMES_RCA_KAFKA_EXPECTED_CLUSTER_ID")
+    env.pop("HERMES_RCA_KAFKA_MIN_REPLICATION_FACTOR")
+    admin = _Admin()
+
+    payload = collect_broker_metadata(
+        BrokerProbeConfig.from_env(env, observe_only=True),
+        admin_factory=lambda **_kwargs: admin,
+        now=datetime(2026, 7, 14, 9, 0, tzinfo=timezone.utc),
+        observe_only=True,
+    )
+
+    assert payload["schema_version"] == BROKER_OBSERVATION_SCHEMA_VERSION
+    assert payload["production_eligible"] is False
+    assert payload["owner_approval_required"] == [
+        "cluster_id",
+        "minimum_replication_factor",
+    ]
+    assert payload["cluster_id"] == "cluster-production-1"
+    assert payload["replication_factor"] == 2
+    assert payload["expected_cluster_id"] is None
+    assert payload["collector"]["mode"] == "observe_only"
+    assert admin.calls == [
+        f"metadata:{TOPIC}",
+        "describe_groups:root_cause_analysis_agent",
+        "close",
+    ]
 
 
 def test_collect_suppresses_kafka_admin_config_debug_log(caplog):
@@ -494,6 +538,30 @@ def test_main_writes_atomic_redacted_evidence(tmp_path, capsys):
     assert response["ok"] is True
     assert response["output"] == str(output)
     assert (output.stat().st_mode & 0o777) == 0o600
+
+
+def test_main_observe_only_requires_output_and_writes_noneligible_receipt(
+    tmp_path, capsys
+):
+    env = _env()
+    env.pop("HERMES_RCA_KAFKA_EXPECTED_CLUSTER_ID")
+    env.pop("HERMES_RCA_KAFKA_MIN_REPLICATION_FACTOR")
+    output = tmp_path / "broker-observation.json"
+
+    result = main(
+        ["--observe-only", "--output", str(output)],
+        admin_factory=lambda **_kwargs: _Admin(),
+        env=env,
+    )
+
+    assert result == 0
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == BROKER_OBSERVATION_SCHEMA_VERSION
+    assert payload["production_eligible"] is False
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+
+    assert main(["--observe-only"], env=env) == 2
+    assert json.loads(capsys.readouterr().err)["ok"] is False
 
 
 def test_main_redacts_password_from_failure_message(capsys):
