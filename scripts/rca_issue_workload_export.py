@@ -43,6 +43,13 @@ PROJECT_KEY = "t03o4q"
 WORK_ITEM_TYPE = "issue"
 WORK_ITEM_ID_FIELD = "work_item_id"
 WORK_ITEM_NAME_FIELD = "name"
+DNP_DEPARTMENT_FIELD = "field_c7f370"
+DNP_DEPARTMENT_SHORT_FIELD = "field_4bf24b"
+DNP_KEYWORD_FIELDS = (
+    WORK_ITEM_NAME_FIELD,
+    DNP_DEPARTMENT_FIELD,
+    DNP_DEPARTMENT_SHORT_FIELD,
+)
 FUNCTION_CATEGORY_FIELD = "field_e776bb"
 PDCL_DATA_FIELD = "field_93aa63"
 PDCL_DATA_FIELD_NAME = "问题数据地址_PDCL"
@@ -392,6 +399,7 @@ def _query_mql(
     _validate_source_identifiers(project_key, work_item_type)
     return (
         f"SELECT `{WORK_ITEM_ID_FIELD}`, `{WORK_ITEM_NAME_FIELD}`, "
+        f"`{DNP_DEPARTMENT_FIELD}`, `{DNP_DEPARTMENT_SHORT_FIELD}`, "
         f"`{FUNCTION_CATEGORY_FIELD}`, `{PDCL_DATA_FIELD}` "
         f"FROM `{project_key}`.`{work_item_type}` "
         f"WHERE `{PDCL_DATA_FIELD}` is not null "
@@ -401,23 +409,31 @@ def _query_mql(
 
 def _dnp_keyword_policy() -> dict[str, Any]:
     material = {
-        "field_key": WORK_ITEM_NAME_FIELD,
+        "field_keys": list(DNP_KEYWORD_FIELDS),
         "keywords": list(DNP_KEYWORDS),
         "match_mode": DNP_KEYWORD_MATCH_MODE,
     }
     return {**material, "sha256": _sha256_json(material)}
 
 
-def _matched_dnp_keywords(value: Any) -> tuple[str, ...]:
-    normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+def _matched_dnp_keywords(*values: Any) -> tuple[str, ...]:
+    normalized_values = tuple(
+        unicodedata.normalize("NFKC", str(value or "")).casefold()
+        for value in values
+    )
     matches: list[str] = []
     for keyword in DNP_KEYWORDS:
         normalized_keyword = unicodedata.normalize("NFKC", keyword).casefold()
         if normalized_keyword.isascii():
             pattern = rf"(?<![a-z0-9]){re.escape(normalized_keyword)}(?![a-z0-9])"
-            matched = re.search(pattern, normalized) is not None
+            matched = any(
+                re.search(pattern, normalized) is not None
+                for normalized in normalized_values
+            )
         else:
-            matched = normalized_keyword in normalized
+            matched = any(
+                normalized_keyword in normalized for normalized in normalized_values
+            )
         if matched:
             matches.append(keyword)
     return tuple(matches)
@@ -502,6 +518,7 @@ def scan_workloads(
     dnp_keyword_record_counts: Counter[str] = Counter()
     dnp_keyword_valid_work_item_counts: Counter[str] = Counter()
     dnp_keyword_reference_candidate_counts: Counter[str] = Counter()
+    dnp_keyword_rejections: Counter[str] = Counter()
     dnp_keyword_records = 0
     dnp_keyword_valid_work_items: set[str] = set()
     dnp_keyword_reference_candidates = 0
@@ -552,7 +569,7 @@ def scan_workloads(
             records_seen += 1
             work_item_id = str(row.get(WORK_ITEM_ID_FIELD) or "").strip()
             matched_dnp_keywords = _matched_dnp_keywords(
-                row.get(WORK_ITEM_NAME_FIELD)
+                *(row.get(field) for field in DNP_KEYWORD_FIELDS)
             )
             category = row.get(FUNCTION_CATEGORY_FIELD)
             source_value = str(row.get(PDCL_DATA_FIELD) or "").strip()
@@ -572,6 +589,10 @@ def scan_workloads(
                 or not all(isinstance(part, tuple) and part for part in category)
             ):
                 rejections["function_category_missing_or_invalid"] += 1
+                if matched_dnp_keywords:
+                    dnp_keyword_rejections[
+                        "function_category_missing_or_invalid"
+                    ] += 1
                 continue
             option_ids, option_path = category
             category_records[option_path] += 1
@@ -579,6 +600,8 @@ def scan_workloads(
                 access = build_remote_data_access(source_value)
             except RemoteDataAccessError as exc:
                 rejections[exc.code] += 1
+                if matched_dnp_keywords:
+                    dnp_keyword_rejections[exc.code] += 1
                 continue
             work_items_with_valid_reference.add(work_item_id)
             category_valid_work_items[option_path] += 1
@@ -661,6 +684,8 @@ def scan_workloads(
             "selected_fields": [
                 WORK_ITEM_ID_FIELD,
                 WORK_ITEM_NAME_FIELD,
+                DNP_DEPARTMENT_FIELD,
+                DNP_DEPARTMENT_SHORT_FIELD,
                 FUNCTION_CATEGORY_FIELD,
                 PDCL_DATA_FIELD,
             ],
@@ -709,13 +734,14 @@ def scan_workloads(
                     keyword: dnp_keyword_reference_candidate_counts[keyword]
                     for keyword in DNP_KEYWORDS
                 },
+                "rejection_reasons": dict(sorted(dnp_keyword_rejections.items())),
             },
             "rejection_reasons": dict(sorted(rejections.items())),
         },
         "security": {
             "raw_issue_payload_persisted": False,
             "raw_pdcl_field_persisted": False,
-            "raw_issue_name_persisted": False,
+            "raw_dnp_keyword_fields_persisted": False,
             "description_or_attachment_persisted": False,
             "credential_or_token_persisted": False,
             "input_materialized": False,
@@ -1230,7 +1256,7 @@ def build_mapping_request(
             "issue_identifiers_included": False,
             "remote_references_included": False,
             "raw_pdcl_fields_included": False,
-            "raw_issue_names_included": False,
+            "raw_dnp_keyword_fields_included": False,
             "credentials_or_tokens_included": False,
         },
     }

@@ -138,7 +138,7 @@ Host 在提交前递归检查 dataclass/dict/list 的原始和序列化请求，
 
 初始目标以 200 case/day 设计，但上线资格来自测量而非静态估算：
 
-- `production_bootstrap` 首次上线前以最近 7 天真实 Kafka 消息的 bounded replay 取代 24 小时 soak 硬门槛：显式时间戳 offset/fixed end offset、`group_id=None`、无 subscribe/join/commit，至少 1 条真实消息通过当前 policy 并创建 shadow trigger/outbox。24 小时、至少 200 个代表 case remote-reader soak 改为上线后观察项；正式证据格式仍固定为 `pnc_rca_remote_reader_soak_v4`，供后续具体问题分析或 steady-capacity 放大使用
+- `production_bootstrap` 首次上线前以最近 7 天真实 Kafka 消息的 bounded replay 取代 balanced 200-case provenance 与 24 小时 soak 硬门槛：显式时间戳 offset/fixed end offset、`group_id=None`、无 subscribe/join/commit，至少 1 条真实消息通过当前 policy 并创建 shadow trigger/outbox。balanced manifest 和 24 小时、至少 200 个代表 case remote-reader soak 改为上线后观察项；正式证据格式仍固定，供后续具体问题分析或 steady-capacity 放大使用
 - soak 不能以长时间 idle 冒充 24 小时运行。24 个一小时 bucket 每桶至少 4 单，首末 bucket 必须覆盖、相邻启动最大间隔 3630 秒；另需至少 900 秒处于并发 4、最长连续并发至少 300 秒。每 case 的 wall-clock 与 monotonic offset 交叉校验，120 秒边界不因调度误差放宽
 - soak 的临时 stream cache 只允许存在于 task-owned `/mnt/tmp/<task_id>/`，remote receipt/completeness/hash 验证后立即 unlink+fsync；正式 evidence 要求 `retained_stream_cache_bytes=0`。因此 750 MB 是单 case/并发峰值硬边界，不是允许累计保留 150 GB
 - success/error/timeout/limit 分类完整

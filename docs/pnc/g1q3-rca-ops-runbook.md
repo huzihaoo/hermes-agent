@@ -234,9 +234,9 @@ test -x "$RCA_PYTHON"
 
 ## 7. 生产放量基线（2026-07-11 remote-read cutover）
 
-1. 首次上线保持 submit/dispatch safe-off；先完成 broker metadata/T0、最近 7 天真实 Kafka 消息的无 group/无 commit 影子回放、容量 horizon、clean BOM、受治理 canary。24h/200-case remote-reader soak 在 `production_bootstrap` 及其前置阶段记录为上线后观察项，不作为首次上线硬阻塞；标准 steady-capacity 放大仍可重新要求。topic 必须由 broker metadata 确认精确大小写；当前 live `.env` 是 `feishu-project-workflow-event`，不得凭曾出现的 `feishu-project-workfLow-event` 交接字符串猜测。
+1. 首次上线保持 submit/dispatch safe-off；先完成 broker metadata/T0、最近 7 天真实 Kafka 消息的无 group/无 commit 影子回放、容量 horizon、clean BOM、受治理 canary。balanced 200-case provenance 与 24h/200-case remote-reader soak 在 `production_bootstrap` 及其前置阶段记录为上线后观察项，不作为首次上线硬阻塞；标准 steady-capacity 放大仍可重新要求。topic 必须由 broker metadata 确认精确大小写；当前 live `.env` 是 `feishu-project-workflow-event`，不得凭曾出现的 `feishu-project-workfLow-event` 交接字符串猜测。
 2. 最近 7 天回放只使用 `scripts/pnc_rca_kafka_recent_replay.py`：`group_id=None`、显式 `assign`、`offsets_for_times`、固定 end offset、`read_committed`、`enable_auto_commit=false`。真实 payload 只能进入自动销毁的临时 SQLite，必须走现有 workflow policy、control store、shadow trigger/outbox；`kafka_recent_replay.json` 只保留 offset、哈希和聚合计数。
-3. DNP workload 分类读取飞书问题标准 `name` 字段，固定关键字为 `规划`、`SPP`、`OOI`；中文按 NFKC/casefold 后子串匹配，ASCII 按字母数字 token 边界匹配。原始标题不得进入 census、receipt 或 manifest；ACC/LCC/AEB/FCW 继续使用 owner-approved 精确功能分类叶子。
+3. DNP workload 分类读取飞书问题 `name`、`问题所属部门`、`问题所属部门_简洁` 三个字段，固定关键字为 `规划`、`SPP`、`OOI`；中文按 NFKC/casefold 后子串匹配，ASCII 按字母数字 token 边界匹配。原始标题和部门值不得进入 census、receipt 或 manifest；ACC/LCC/AEB/FCW 继续使用 owner-approved 精确功能分类叶子。
 4. 每单固定 `remote_read`、`allow_download=false`、`input_materialization=forbidden`；S2 只生成有 size/SHA/MCAP seal 的派生流。
 5. Worker 必须 `direct_cli + agent_backend=none`，并产出绑定 commit、入口 hash、run-id/PID/dispatch receipt 的 attestation；任何 Agent/fallback 计数非零即阻断。
 6. MCAP 转换必须按任务独立容器、显式 memory/CPU/PID/timeout、ownership cleanup；镜像必须 pin digest 后才能生产 promotion。

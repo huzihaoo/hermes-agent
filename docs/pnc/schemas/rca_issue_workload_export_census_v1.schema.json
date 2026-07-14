@@ -54,7 +54,7 @@
         "authenticated": {"const": true},
         "project_key": {"const": "t03o4q"},
         "work_item_type": {"const": "issue"},
-        "selected_fields": {"const": ["work_item_id", "name", "field_e776bb", "field_93aa63"]},
+        "selected_fields": {"const": ["work_item_id", "name", "field_c7f370", "field_4bf24b", "field_e776bb", "field_93aa63"]},
         "mutation_performed": {"const": false},
         "attachment_read_performed": {"const": false},
         "page_size": {"type": "integer", "minimum": 1, "maximum": 50},
@@ -89,9 +89,9 @@
     "dnpKeywordPolicy": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["field_key", "keywords", "match_mode", "sha256"],
+      "required": ["field_keys", "keywords", "match_mode", "sha256"],
       "properties": {
-        "field_key": {"const": "name"},
+        "field_keys": {"const": ["name", "field_c7f370", "field_4bf24b"]},
         "keywords": {"const": ["规划", "SPP", "OOI"]},
         "match_mode": {"const": "nfkc_casefold_cjk_substring_ascii_token"},
         "sha256": {"$ref": "#/$defs/sha256"}
@@ -100,14 +100,15 @@
     "dnpKeywordMatches": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["record_count", "valid_work_item_count", "reference_candidate_count", "keyword_record_counts", "keyword_valid_work_item_counts", "keyword_reference_candidate_counts"],
+      "required": ["record_count", "valid_work_item_count", "reference_candidate_count", "keyword_record_counts", "keyword_valid_work_item_counts", "keyword_reference_candidate_counts", "rejection_reasons"],
       "properties": {
-        "record_count": {"type": "integer", "minimum": 50},
-        "valid_work_item_count": {"type": "integer", "minimum": 50},
-        "reference_candidate_count": {"type": "integer", "minimum": 50},
+        "record_count": {"type": "integer", "minimum": 0},
+        "valid_work_item_count": {"type": "integer", "minimum": 0},
+        "reference_candidate_count": {"type": "integer", "minimum": 0},
         "keyword_record_counts": {"$ref": "#/$defs/nonnegativeCountMap"},
         "keyword_valid_work_item_counts": {"$ref": "#/$defs/nonnegativeCountMap"},
-        "keyword_reference_candidate_counts": {"$ref": "#/$defs/nonnegativeCountMap"}
+        "keyword_reference_candidate_counts": {"$ref": "#/$defs/nonnegativeCountMap"},
+        "rejection_reasons": {"$ref": "#/$defs/countMap"}
       }
     },
     "category": {
@@ -152,11 +153,11 @@
     "security": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["raw_issue_payload_persisted", "raw_pdcl_field_persisted", "raw_issue_name_persisted", "description_or_attachment_persisted", "credential_or_token_persisted", "input_materialized", "input_materialized_bytes"],
+      "required": ["raw_issue_payload_persisted", "raw_pdcl_field_persisted", "raw_dnp_keyword_fields_persisted", "description_or_attachment_persisted", "credential_or_token_persisted", "input_materialized", "input_materialized_bytes"],
       "properties": {
         "raw_issue_payload_persisted": {"const": false},
         "raw_pdcl_field_persisted": {"const": false},
-        "raw_issue_name_persisted": {"const": false},
+        "raw_dnp_keyword_fields_persisted": {"const": false},
         "description_or_attachment_persisted": {"const": false},
         "credential_or_token_persisted": {"const": false},
         "input_materialized": {"const": false},

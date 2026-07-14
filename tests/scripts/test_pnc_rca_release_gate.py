@@ -3162,7 +3162,7 @@ def _remote_reader_workload_provenance(
     security = {
         "raw_issue_payload_persisted": False,
         "raw_pdcl_field_persisted": False,
-        "raw_issue_name_persisted": False,
+        "raw_dnp_keyword_fields_persisted": False,
         "description_or_attachment_persisted": False,
         "credential_or_token_persisted": False,
         "input_materialized": False,
@@ -3182,6 +3182,8 @@ def _remote_reader_workload_provenance(
             "selected_fields": [
                 "work_item_id",
                 "name",
+                "field_c7f370",
+                "field_4bf24b",
                 "field_e776bb",
                 "field_93aa63",
             ],
@@ -3197,12 +3199,12 @@ def _remote_reader_workload_provenance(
             "leaf_count": len(options),
         },
         "dnp_keyword_policy": {
-            "field_key": "name",
+            "field_keys": ["name", "field_c7f370", "field_4bf24b"],
             "keywords": ["规划", "SPP", "OOI"],
             "match_mode": "nfkc_casefold_cjk_substring_ascii_token",
             "sha256": _remote_soak_sha256(
                 {
-                    "field_key": "name",
+                    "field_keys": ["name", "field_c7f370", "field_4bf24b"],
                     "keywords": ["规划", "SPP", "OOI"],
                     "match_mode": "nfkc_casefold_cjk_substring_ascii_token",
                 }
@@ -3238,6 +3240,7 @@ def _remote_reader_workload_provenance(
                     "SPP": 0,
                     "OOI": 0,
                 },
+                "rejection_reasons": {},
             },
             "rejection_reasons": {},
         },
@@ -14075,8 +14078,16 @@ def test_production_missing_remote_reader_soak_is_a_hard_no_go(tmp_path):
 
 def test_production_bootstrap_defers_soaks_until_post_launch(tmp_path):
     consumer, dispatcher, settings = _gate(tmp_path, "production_bootstrap")
-    (settings.evidence_dir / "shadow_soak.json").unlink()
-    (settings.evidence_dir / "remote_reader_soak.json").unlink()
+    for filename in (
+        "shadow_soak.json",
+        "remote_reader_soak.json",
+        release_gate_module.REMOTE_READER_SOAK_MANIFEST_FILENAME,
+        release_gate_module.REMOTE_READER_WORKLOAD_CENSUS_FILENAME,
+        release_gate_module.REMOTE_READER_DOMAIN_MAPPING_FILENAME,
+        release_gate_module.REMOTE_READER_DOMAIN_MAPPING_APPROVAL_FILENAME,
+        release_gate_module.REMOTE_READER_WORKLOAD_EXPORT_RECEIPT_FILENAME,
+    ):
+        (settings.evidence_dir / filename).unlink()
 
     report = evaluate_release_gate(
         consumer=consumer,
@@ -14096,6 +14107,13 @@ def test_production_bootstrap_defers_soaks_until_post_launch(tmp_path):
         }
     assert "shadow_soak_missing" not in report["blockers"]
     assert "remote_reader_soak_missing" not in report["blockers"]
+    workload = checks["remote_reader_workload_provenance"]
+    assert workload["ok"] is True
+    assert workload["detail"] == {
+        "status": "deferred_to_post_launch",
+        "blocks_bootstrap_release": False,
+        "balanced_case_target": 200,
+    }
 
 
 @pytest.mark.parametrize(

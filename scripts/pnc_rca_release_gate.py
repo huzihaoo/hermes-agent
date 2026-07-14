@@ -3207,7 +3207,14 @@ def _check_remote_reader_workload_provenance(
         or feishu.get("project_key") != "t03o4q"
         or feishu.get("work_item_type") != "issue"
         or feishu.get("selected_fields")
-        != ["work_item_id", "name", "field_e776bb", "field_93aa63"]
+        != [
+            "work_item_id",
+            "name",
+            "field_c7f370",
+            "field_4bf24b",
+            "field_e776bb",
+            "field_93aa63",
+        ]
         or feishu.get("mutation_performed") is not False
         or feishu.get("attachment_read_performed") is not False
     ):
@@ -3358,11 +3365,11 @@ def _check_remote_reader_workload_provenance(
     dnp_keyword_policy = _remote_soak_object(
         census.get("dnp_keyword_policy"),
         field=f"{artifact}.census.dnp_keyword_policy",
-        keys={"field_key", "keywords", "match_mode", "sha256"},
+        keys={"field_keys", "keywords", "match_mode", "sha256"},
         blocker="remote_reader_workload_dnp_keyword_policy_invalid",
     )
     dnp_keyword_policy_material = {
-        "field_key": "name",
+        "field_keys": ["name", "field_c7f370", "field_4bf24b"],
         "keywords": ["规划", "SPP", "OOI"],
         "match_mode": "nfkc_casefold_cjk_substring_ascii_token",
     }
@@ -3601,6 +3608,7 @@ def _check_remote_reader_workload_provenance(
             "keyword_record_counts",
             "keyword_valid_work_item_counts",
             "keyword_reference_candidate_counts",
+            "rejection_reasons",
         },
         blocker="remote_reader_workload_dnp_keyword_counts_invalid",
     )
@@ -3644,6 +3652,10 @@ def _check_remote_reader_workload_provenance(
         f"{artifact}.census.statistics.dnp_keyword_matches.reference_candidate_count",
         minimum=50,
     )
+    _remote_soak_count_map(
+        dnp_keyword_matches.get("rejection_reasons"),
+        f"{artifact}.census.statistics.dnp_keyword_matches.rejection_reasons",
+    )
     if (
         dnp_valid_count > dnp_record_count
         or dnp_candidate_count > reference_candidates
@@ -3668,7 +3680,7 @@ def _check_remote_reader_workload_provenance(
         keys={
             "raw_issue_payload_persisted",
             "raw_pdcl_field_persisted",
-            "raw_issue_name_persisted",
+            "raw_dnp_keyword_fields_persisted",
             "description_or_attachment_persisted",
             "credential_or_token_persisted",
             "input_materialized",
@@ -3679,7 +3691,7 @@ def _check_remote_reader_workload_provenance(
     if security != {
         "raw_issue_payload_persisted": False,
         "raw_pdcl_field_persisted": False,
-        "raw_issue_name_persisted": False,
+        "raw_dnp_keyword_fields_persisted": False,
         "description_or_attachment_persisted": False,
         "credential_or_token_persisted": False,
         "input_materialized": False,
@@ -25173,33 +25185,44 @@ def evaluate_release_gate(
         except EvidenceError as exc:
             checks.fail("canary_plan", exc.code)
 
-        try:
-            workload_manifest = _load_remote_reader_soak_manifest(
-                settings.evidence_dir,
-                evidence_hashes,
-            )
-            workload_provenance = _load_remote_reader_workload_provenance(
-                settings.evidence_dir,
-                evidence_hashes,
-            )
-            critical_files = _mapping(
-                verified_build_detail.get("critical_file_sha256"),
-                "remote_reader_workload.build.critical_file_sha256",
-            )
-            detail = _check_remote_reader_workload_provenance(
-                workload_provenance,
-                workload_manifest=workload_manifest,
-                evidence_hashes=evidence_hashes,
-                expected_host_commit=verified_host_commit,
-                expected_exporter_sha256=_sha256_digest(
-                    critical_files.get(REMOTE_READER_WORKLOAD_EXPORT_MODULE),
-                    "remote_reader_workload.exporter_module_sha256",
-                ),
-            )
-            checks.pass_("remote_reader_workload_provenance", detail)
-        except EvidenceError as exc:
+        if settings.mode in POST_LAUNCH_OBSERVATION_MODES:
             workload_manifest = {}
-            checks.fail("remote_reader_workload_provenance", exc.code)
+            checks.pass_(
+                "remote_reader_workload_provenance",
+                {
+                    "status": "deferred_to_post_launch",
+                    "blocks_bootstrap_release": False,
+                    "balanced_case_target": 200,
+                },
+            )
+        else:
+            try:
+                workload_manifest = _load_remote_reader_soak_manifest(
+                    settings.evidence_dir,
+                    evidence_hashes,
+                )
+                workload_provenance = _load_remote_reader_workload_provenance(
+                    settings.evidence_dir,
+                    evidence_hashes,
+                )
+                critical_files = _mapping(
+                    verified_build_detail.get("critical_file_sha256"),
+                    "remote_reader_workload.build.critical_file_sha256",
+                )
+                detail = _check_remote_reader_workload_provenance(
+                    workload_provenance,
+                    workload_manifest=workload_manifest,
+                    evidence_hashes=evidence_hashes,
+                    expected_host_commit=verified_host_commit,
+                    expected_exporter_sha256=_sha256_digest(
+                        critical_files.get(REMOTE_READER_WORKLOAD_EXPORT_MODULE),
+                        "remote_reader_workload.exporter_module_sha256",
+                    ),
+                )
+                checks.pass_("remote_reader_workload_provenance", detail)
+            except EvidenceError as exc:
+                workload_manifest = {}
+                checks.fail("remote_reader_workload_provenance", exc.code)
 
         if settings.mode in POST_LAUNCH_OBSERVATION_MODES:
             checks.pass_(

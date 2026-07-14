@@ -65,9 +65,9 @@
     "dnpKeywordPolicy": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["field_key", "keywords", "match_mode", "sha256"],
+      "required": ["field_keys", "keywords", "match_mode", "sha256"],
       "properties": {
-        "field_key": {"const": "name"},
+        "field_keys": {"const": ["name", "field_c7f370", "field_4bf24b"]},
         "keywords": {"const": ["规划", "SPP", "OOI"]},
         "match_mode": {"const": "nfkc_casefold_cjk_substring_ascii_token"},
         "sha256": {"$ref": "#/$defs/sha256"}
@@ -112,11 +112,11 @@
     "security": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["raw_issue_payload_persisted", "raw_pdcl_field_persisted", "raw_issue_name_persisted", "description_or_attachment_persisted", "credential_or_token_persisted", "input_materialized", "input_materialized_bytes"],
+      "required": ["raw_issue_payload_persisted", "raw_pdcl_field_persisted", "raw_dnp_keyword_fields_persisted", "description_or_attachment_persisted", "credential_or_token_persisted", "input_materialized", "input_materialized_bytes"],
       "properties": {
         "raw_issue_payload_persisted": {"const": false},
         "raw_pdcl_field_persisted": {"const": false},
-        "raw_issue_name_persisted": {"const": false},
+        "raw_dnp_keyword_fields_persisted": {"const": false},
         "description_or_attachment_persisted": {"const": false},
         "credential_or_token_persisted": {"const": false},
         "input_materialized": {"const": false},

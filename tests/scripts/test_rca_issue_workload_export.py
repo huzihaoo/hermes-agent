@@ -69,6 +69,14 @@ def _query_body(rows: list[dict], *, count: int, session_id: str = "session-secr
                     "moql_field_list": [
                         _moql_field(exporter.WORK_ITEM_ID_FIELD, row["work_item_id"]),
                         _moql_field(exporter.WORK_ITEM_NAME_FIELD, row["name"]),
+                        _moql_field(
+                            exporter.DNP_DEPARTMENT_FIELD,
+                            row.get("department", ""),
+                        ),
+                        _moql_field(
+                            exporter.DNP_DEPARTMENT_SHORT_FIELD,
+                            row.get("department_short", ""),
+                        ),
                         _moql_field(exporter.FUNCTION_CATEGORY_FIELD, row["category"]),
                         _moql_field(exporter.PDCL_DATA_FIELD, row["pdcl"]),
                     ]
@@ -166,12 +174,14 @@ def _mapping_artifacts(taxonomy_sha256: str) -> tuple[dict, dict]:
 
 def test_scan_is_read_only_redacted_and_tracks_rejections(tmp_path: Path) -> None:
     secret_event = "event-secret-must-not-be-persisted"
-    secret_name = "规划 secret-title-must-not-be-persisted"
+    secret_name = "secret-title-must-not-be-persisted"
+    secret_department = "规划 secret-department-must-not-be-persisted"
     raw_command = f"mdi download event -u {secret_event} -s ./"
     rows = [
         {
             "work_item_id": "7000000001",
             "name": secret_name,
+            "department": secret_department,
             "category": (("driving", "行车辅助"), ("acc", "ACC")),
             "pdcl": raw_command,
         },
@@ -221,11 +231,12 @@ def test_scan_is_read_only_redacted_and_tracks_rejections(tmp_path: Path) -> Non
     assert secret_event not in serialized
     assert raw_command not in serialized
     assert secret_name not in serialized
+    assert secret_department not in serialized
     assert "session-0" not in serialized
     assert scan.census["security"] == {
         "raw_issue_payload_persisted": False,
         "raw_pdcl_field_persisted": False,
-        "raw_issue_name_persisted": False,
+        "raw_dnp_keyword_fields_persisted": False,
         "description_or_attachment_persisted": False,
         "credential_or_token_persisted": False,
         "input_materialized": False,
@@ -268,20 +279,21 @@ def test_meegle_failure_redacts_stderr() -> None:
 
 
 @pytest.mark.parametrize(
-    ("name", "expected"),
+    ("values", "expected"),
     [
-        ("规划问题", ("规划",)),
-        ("[spp] planning issue", ("SPP",)),
-        ("全角 ＯＯＩ 问题", ("OOI",)),
-        ("SPP2 is not the SPP token", ("SPP",)),
-        ("SPP2", ()),
-        ("NOSPPVALUE", ()),
+        (("规划问题", "", ""), ("规划",)),
+        (("[spp] planning issue", "", ""), ("SPP",)),
+        (("全角 ＯＯＩ 问题", "", ""), ("OOI",)),
+        (("SPP2 is not the SPP token", "", ""), ("SPP",)),
+        (("SPP2", "", ""), ()),
+        (("NOSPPVALUE", "", ""), ()),
+        (("ordinary title", "规划部", ""), ("规划",)),
     ],
 )
 def test_dnp_keyword_matching_is_normalized_and_ascii_token_bounded(
-    name: str, expected: tuple[str, ...]
+    values: tuple[str, str, str], expected: tuple[str, ...]
 ) -> None:
-    assert exporter._matched_dnp_keywords(name) == expected
+    assert exporter._matched_dnp_keywords(*values) == expected
 
 
 def test_domain_mapping_requires_owner_only_taxonomy_bound_receipt(
@@ -376,7 +388,7 @@ def _sealed_scan() -> tuple[exporter.ScanResult, exporter.DomainMapping]:
         "security": {
             "raw_issue_payload_persisted": False,
             "raw_pdcl_field_persisted": False,
-            "raw_issue_name_persisted": False,
+            "raw_dnp_keyword_fields_persisted": False,
             "description_or_attachment_persisted": False,
             "credential_or_token_persisted": False,
             "input_materialized": False,
