@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://minieye.internal/schemas/rca_issue_workload_export_census_v1.json",
+  "title": "G1Q3 RCA read-only Feishu workload census",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "observed_at", "source", "feishu", "taxonomy", "statistics", "security"],
+  "properties": {
+    "schema_version": {"const": "rca_issue_workload_export_census_v1"},
+    "observed_at": {"$ref": "#/$defs/timestamp"},
+    "source": {"$ref": "#/$defs/source"},
+    "feishu": {"$ref": "#/$defs/feishu"},
+    "taxonomy": {"$ref": "#/$defs/taxonomy"},
+    "statistics": {"$ref": "#/$defs/statistics"},
+    "security": {"$ref": "#/$defs/security"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "timestamp": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{6}Z$"},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["component", "component_commit", "module", "module_sha256", "committed_match", "module_clean"],
+      "properties": {
+        "component": {"const": "rca_issue_workload_export"},
+        "component_commit": {"$ref": "#/$defs/commit"},
+        "module": {"const": "scripts/rca_issue_workload_export.py"},
+        "module_sha256": {"$ref": "#/$defs/sha256"},
+        "committed_match": {"const": true},
+        "module_clean": {"const": true}
+      }
+    },
+    "session": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["offset", "requested", "returned", "observed_source_count", "query_sha256", "session_id_sha256"],
+      "properties": {
+        "offset": {"type": "integer", "minimum": 0},
+        "requested": {"type": "integer", "minimum": 1, "maximum": 50},
+        "returned": {"type": "integer", "minimum": 1, "maximum": 50},
+        "observed_source_count": {"type": "integer", "minimum": 200},
+        "query_sha256": {"$ref": "#/$defs/sha256"},
+        "session_id_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "feishu": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host", "authenticated", "project_key", "work_item_type", "selected_fields", "mutation_performed", "attachment_read_performed", "page_size", "page_count", "session_provenance"],
+      "properties": {
+        "host": {"const": "project.feishu.cn"},
+        "authenticated": {"const": true},
+        "project_key": {"const": "t03o4q"},
+        "work_item_type": {"const": "issue"},
+        "selected_fields": {"const": ["work_item_id", "field_e776bb", "field_93aa63"]},
+        "mutation_performed": {"const": false},
+        "attachment_read_performed": {"const": false},
+        "page_size": {"type": "integer", "minimum": 1, "maximum": 50},
+        "page_count": {"type": "integer", "minimum": 1},
+        "session_provenance": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/session"}}
+      }
+    },
+    "taxonomyOption": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["option_ids", "option_path"],
+      "properties": {
+        "option_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1, "maxLength": 128}},
+        "option_path": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1, "maxLength": 128}}
+      }
+    },
+    "taxonomy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field_key", "field_name", "field_type", "options", "sha256", "leaf_count"],
+      "properties": {
+        "field_key": {"const": "field_e776bb"},
+        "field_name": {"type": "string", "minLength": 1},
+        "field_type": {"const": "tree-select"},
+        "options": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/taxonomyOption"}},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "leaf_count": {"type": "integer", "minimum": 1}
+      }
+    },
+    "countMap": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 1}},
+    "category": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["option_path", "record_count", "valid_work_item_count", "valid_reference_candidate_count", "unique_reference_count", "duplicate_reference_candidate_count", "reader_class_counts"],
+      "properties": {
+        "option_path": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+        "record_count": {"type": "integer", "minimum": 1},
+        "valid_work_item_count": {"type": "integer", "minimum": 0},
+        "valid_reference_candidate_count": {"type": "integer", "minimum": 0},
+        "unique_reference_count": {"type": "integer", "minimum": 0},
+        "duplicate_reference_candidate_count": {"type": "integer", "minimum": 0},
+        "reader_class_counts": {"$ref": "#/$defs/countMap"}
+      }
+    },
+    "statistics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["initial_source_count", "minimum_observed_source_count", "maximum_observed_source_count", "target_records", "records_seen", "source_scan_complete", "unique_work_items_seen", "valid_work_item_count", "valid_reference_candidate_count", "unique_reference_count", "duplicate_reference_candidate_count", "snapshot_stable", "categories", "reader_class_counts", "reference_kind_counts", "rejection_reasons"],
+      "properties": {
+        "initial_source_count": {"type": "integer", "minimum": 200},
+        "minimum_observed_source_count": {"type": "integer", "minimum": 200},
+        "maximum_observed_source_count": {"type": "integer", "minimum": 200},
+        "target_records": {"type": "integer", "minimum": 200},
+        "records_seen": {"type": "integer", "minimum": 200},
+        "source_scan_complete": {"const": true},
+        "unique_work_items_seen": {"type": "integer", "minimum": 200},
+        "valid_work_item_count": {"type": "integer", "minimum": 200},
+        "valid_reference_candidate_count": {"type": "integer", "minimum": 200},
+        "unique_reference_count": {"type": "integer", "minimum": 200},
+        "duplicate_reference_candidate_count": {"type": "integer", "minimum": 0},
+        "snapshot_stable": {"const": true},
+        "categories": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/category"}},
+        "reader_class_counts": {"$ref": "#/$defs/countMap"},
+        "reference_kind_counts": {"$ref": "#/$defs/countMap"},
+        "rejection_reasons": {"$ref": "#/$defs/countMap"}
+      }
+    },
+    "security": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["raw_issue_payload_persisted", "raw_pdcl_field_persisted", "description_or_attachment_persisted", "credential_or_token_persisted", "input_materialized", "input_materialized_bytes"],
+      "properties": {
+        "raw_issue_payload_persisted": {"const": false},
+        "raw_pdcl_field_persisted": {"const": false},
+        "description_or_attachment_persisted": {"const": false},
+        "credential_or_token_persisted": {"const": false},
+        "input_materialized": {"const": false},
+        "input_materialized_bytes": {"const": 0}
+      }
+    }
+  }
+}

@@ -3093,6 +3093,221 @@ def _remote_reader_soak(
     return body, workload_manifest
 
 
+def _remote_reader_workload_provenance(
+    workload_manifest: dict,
+) -> dict[str, dict]:
+    manifest_at = datetime.strptime(
+        workload_manifest["generated_at"], "%Y-%m-%dT%H:%M:%S.%fZ"
+    ).replace(tzinfo=timezone.utc)
+    census_at = (manifest_at - timedelta(seconds=2)).strftime(
+        "%Y-%m-%dT%H:%M:%S.%fZ"
+    )
+    approved_at = (manifest_at - timedelta(seconds=1)).strftime(
+        "%Y-%m-%dT%H:%M:%S.%fZ"
+    )
+    options = [
+        {"option_ids": ["active", "aeb"], "option_path": ["active", "AEB"]},
+        {"option_ids": ["driving", "acc"], "option_path": ["driving", "ACC"]},
+        {"option_ids": ["driving", "dnp"], "option_path": ["driving", "DNP"]},
+        {"option_ids": ["driving", "lcc"], "option_path": ["driving", "LCC"]},
+    ]
+    taxonomy_material = {
+        "field_key": "field_e776bb",
+        "field_name": "function category",
+        "field_type": "tree-select",
+        "options": options,
+    }
+    taxonomy_sha256 = _remote_soak_sha256(taxonomy_material)
+    source = {
+        "component": "rca_issue_workload_export",
+        "component_commit": workload_manifest["source"]["component_commit"],
+        "module": release_gate_module.REMOTE_READER_WORKLOAD_EXPORT_MODULE,
+        "module_sha256": workload_manifest["source"]["artifact_sha256"],
+        "committed_match": True,
+        "module_clean": True,
+    }
+    sessions = [
+        {
+            "offset": offset,
+            "requested": 50,
+            "returned": 50,
+            "observed_source_count": 200,
+            "query_sha256": hashlib.sha256(f"query-{offset}".encode()).hexdigest(),
+            "session_id_sha256": hashlib.sha256(
+                f"session-{offset}".encode()
+            ).hexdigest(),
+        }
+        for offset in range(0, 200, 50)
+    ]
+    categories = [
+        {
+            "option_path": option_path,
+            "record_count": 50,
+            "valid_work_item_count": 50,
+            "valid_reference_candidate_count": 50,
+            "unique_reference_count": 50,
+            "duplicate_reference_candidate_count": 0,
+            "reader_class_counts": {reader_class: 50},
+        }
+        for option_path, reader_class in (
+            (["active", "AEB"], "RemoteEventReader"),
+            (["driving", "ACC"], "RemoteClipReader"),
+            (["driving", "DNP"], "RemoteEventReader"),
+            (["driving", "LCC"], "RemoteEventReader"),
+        )
+    ]
+    security = {
+        "raw_issue_payload_persisted": False,
+        "raw_pdcl_field_persisted": False,
+        "description_or_attachment_persisted": False,
+        "credential_or_token_persisted": False,
+        "input_materialized": False,
+        "input_materialized_bytes": 0,
+    }
+    census = {
+        "schema_version": (
+            release_gate_module.REMOTE_READER_WORKLOAD_CENSUS_SCHEMA_VERSION
+        ),
+        "observed_at": census_at,
+        "source": source,
+        "feishu": {
+            "host": "project.feishu.cn",
+            "authenticated": True,
+            "project_key": "t03o4q",
+            "work_item_type": "issue",
+            "selected_fields": [
+                "work_item_id",
+                "field_e776bb",
+                "field_93aa63",
+            ],
+            "mutation_performed": False,
+            "attachment_read_performed": False,
+            "page_size": 50,
+            "page_count": 4,
+            "session_provenance": sessions,
+        },
+        "taxonomy": {
+            **taxonomy_material,
+            "sha256": taxonomy_sha256,
+            "leaf_count": len(options),
+        },
+        "statistics": {
+            "initial_source_count": 200,
+            "minimum_observed_source_count": 200,
+            "maximum_observed_source_count": 200,
+            "target_records": 200,
+            "records_seen": 200,
+            "source_scan_complete": True,
+            "unique_work_items_seen": 200,
+            "valid_work_item_count": 200,
+            "valid_reference_candidate_count": 200,
+            "unique_reference_count": 200,
+            "duplicate_reference_candidate_count": 0,
+            "snapshot_stable": True,
+            "categories": categories,
+            "reader_class_counts": {
+                "RemoteClipReader": 50,
+                "RemoteEventReader": 150,
+            },
+            "reference_kind_counts": {"clip": 50, "event": 150},
+            "rejection_reasons": {},
+        },
+        "security": security,
+    }
+    rules = [
+        {
+            "function_domain": domain,
+            "option_ids": option_ids,
+            "option_path": option_path,
+        }
+        for domain, option_ids, option_path in (
+            ("AEB", ["active", "aeb"], ["active", "AEB"]),
+            ("ACC", ["driving", "acc"], ["driving", "ACC"]),
+            ("DNP", ["driving", "dnp"], ["driving", "DNP"]),
+            ("LCC", ["driving", "lcc"], ["driving", "LCC"]),
+        )
+    ]
+    rules_material = {
+        "schema_version": (
+            release_gate_module.REMOTE_READER_DOMAIN_MAPPING_SCHEMA_VERSION
+        ),
+        "project_key": "t03o4q",
+        "work_item_type": "issue",
+        "field_key": "field_e776bb",
+        "taxonomy_sha256": taxonomy_sha256,
+        "rules": rules,
+    }
+    approval = {
+        "schema_version": (
+            release_gate_module.REMOTE_READER_DOMAIN_MAPPING_APPROVAL_SCHEMA_VERSION
+        ),
+        "authority": "PDCL/data owner",
+        "approved_by": "data-owner-fixture",
+        "approved_at": approved_at,
+        "mapping_rules_sha256": _remote_soak_sha256(rules_material),
+    }
+    approval_file_sha256 = hashlib.sha256(
+        release_gate_module._remote_soak_canonical_json_bytes(approval) + b"\n"
+    ).hexdigest()
+    mapping_approval = {
+        "authority": "PDCL/data owner",
+        "approved_by": approval["approved_by"],
+        "approved_at": approved_at,
+        "receipt_sha256": approval_file_sha256,
+    }
+    mapping = {**rules_material, "approval": mapping_approval}
+
+    def file_sha256(body: dict) -> str:
+        return hashlib.sha256(
+            release_gate_module._remote_soak_canonical_json_bytes(body) + b"\n"
+        ).hexdigest()
+
+    receipt = {
+        "schema_version": (
+            release_gate_module.REMOTE_READER_WORKLOAD_EXPORT_RECEIPT_SCHEMA_VERSION
+        ),
+        "generated_at": workload_manifest["generated_at"],
+        "source": source,
+        "census": {
+            "body_sha256": _remote_soak_sha256(census),
+            "file_sha256": file_sha256(census),
+        },
+        "taxonomy_sha256": taxonomy_sha256,
+        "mapping": {
+            "artifact_sha256": file_sha256(mapping),
+            "rules_material_sha256": approval["mapping_rules_sha256"],
+            "approval": mapping_approval,
+        },
+        "selection": {
+            "eligible_reference_candidates": 200,
+            "unmapped_category_counts": [],
+            "case_count": 200,
+            "unique_work_items": 200,
+            "unique_references": 200,
+            "domain_counts": {"ACC": 50, "AEB_FCW": 50, "DNP": 50, "LCC": 50},
+            "reader_class_counts": {
+                "RemoteClipReader": 50,
+                "RemoteEventReader": 150,
+            },
+        },
+        "manifest": {
+            "schema_version": (
+                release_gate_module.REMOTE_READER_SOAK_MANIFEST_SCHEMA_VERSION
+            ),
+            "body_sha256": _remote_soak_sha256(workload_manifest),
+            "file_sha256": file_sha256(workload_manifest),
+            "case_count": 200,
+        },
+        "security": security,
+    }
+    return {
+        "census": census,
+        "mapping": mapping,
+        "approval": approval,
+        "receipt": receipt,
+    }
+
+
 def _write_common_evidence(evidence_dir: Path, kafka_env_file: Path) -> None:
     evidence_dir.mkdir()
     source, env_observation = load_kafka_preflight_environment(kafka_env_file)
@@ -3453,6 +3668,17 @@ def _write_canary_evidence(
             remote_health_path.read_bytes()
         ).hexdigest(),
     )
+    exporter_sha256 = hashlib.sha256(
+        (host_repo / release_gate_module.REMOTE_READER_WORKLOAD_EXPORT_MODULE).read_bytes()
+    ).hexdigest()
+    workload_manifest["source"] = {
+        "generation_mode": "machine_generated",
+        "component": "rca_issue_workload_export",
+        "component_commit": host_commit,
+        "artifact_sha256": exporter_sha256,
+    }
+    soak["workload_manifest"]["source"] = dict(workload_manifest["source"])
+    soak["workload_manifest"]["sha256"] = _remote_soak_sha256(workload_manifest)
     _write_json(
         evidence_dir / "remote_reader_soak.json",
         soak,
@@ -3461,6 +3687,23 @@ def _write_canary_evidence(
         evidence_dir / release_gate_module.REMOTE_READER_SOAK_MANIFEST_FILENAME,
         workload_manifest,
     )
+    workload_provenance = _remote_reader_workload_provenance(workload_manifest)
+    for name, filename in (
+        ("census", release_gate_module.REMOTE_READER_WORKLOAD_CENSUS_FILENAME),
+        ("mapping", release_gate_module.REMOTE_READER_DOMAIN_MAPPING_FILENAME),
+        (
+            "approval",
+            release_gate_module.REMOTE_READER_DOMAIN_MAPPING_APPROVAL_FILENAME,
+        ),
+        (
+            "receipt",
+            release_gate_module.REMOTE_READER_WORKLOAD_EXPORT_RECEIPT_FILENAME,
+        ),
+    ):
+        _write_remote_soak_manifest(
+            evidence_dir / filename,
+            workload_provenance[name],
+        )
 
 
 def _remote_read_canary_receipt(execution_request: dict) -> dict:
@@ -6372,12 +6615,12 @@ def test_no_clobber_rejects_ambiguous_interrupted_hardlink(tmp_path):
     ("mode", "expected_checks", "expected_ok", "expected_blockers"),
     [
         ("shadow", 9, True, []),
-        ("preauthorization", 19, True, []),
-        ("preproduction", 20, True, []),
-        ("canary", 20, True, []),
+        ("preauthorization", 20, True, []),
+        ("preproduction", 21, True, []),
+        ("canary", 21, True, []),
         (
             "production_bootstrap",
-            31,
+            32,
             False,
             [
                 "activation_current_epoch_missing",
@@ -6400,7 +6643,7 @@ def test_no_clobber_rejects_ambiguous_interrupted_hardlink(tmp_path):
         ),
         (
             "production",
-            30,
+            31,
             False,
             [
                 "activation_current_epoch_missing",
@@ -6515,7 +6758,7 @@ def test_canary_bootstrap_mode_fails_closed_without_live_authorization(tmp_path)
     by_name = {item["name"]: item for item in report["checks"]}
     assert report["mode"] == "canary_bootstrap"
     assert report["ok"] is False
-    assert len(report["checks"]) == 21
+    assert len(report["checks"]) == 22
     assert by_name["bootstrap_capacity_authorization"]["ok"] is False
     assert by_name["bootstrap_capacity_authorization"]["code"] in {
         "release_plan_invalid",
@@ -13722,6 +13965,157 @@ def test_production_requires_secure_canonical_remote_reader_soak_manifest(
 
     assert report["ok"] is False
     assert blocker in report["blockers"]
+
+
+@pytest.mark.parametrize(
+    ("filename", "artifact"),
+    [
+        (
+            release_gate_module.REMOTE_READER_WORKLOAD_CENSUS_FILENAME,
+            "remote_reader_workload_census",
+        ),
+        (
+            release_gate_module.REMOTE_READER_DOMAIN_MAPPING_FILENAME,
+            "remote_reader_domain_mapping",
+        ),
+        (
+            release_gate_module.REMOTE_READER_DOMAIN_MAPPING_APPROVAL_FILENAME,
+            "remote_reader_domain_mapping_approval",
+        ),
+        (
+            release_gate_module.REMOTE_READER_WORKLOAD_EXPORT_RECEIPT_FILENAME,
+            "remote_reader_workload_export_receipt",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("mutation", "blocker_suffix"),
+    [
+        (lambda path: path.unlink(), "missing"),
+        (
+            lambda path: _write_json(
+                path,
+                json.loads(path.read_text(encoding="utf-8")),
+            ),
+            "not_canonical",
+        ),
+        (lambda path: path.chmod(0o644), "unsafe_file"),
+    ],
+)
+def test_production_requires_secure_canonical_workload_provenance(
+    tmp_path,
+    filename,
+    artifact,
+    mutation,
+    blocker_suffix,
+):
+    consumer, dispatcher, settings = _gate(tmp_path, "production")
+    mutation(settings.evidence_dir / filename)
+
+    report = evaluate_release_gate(
+        consumer=consumer,
+        dispatcher=dispatcher,
+        settings=settings,
+        cutover=_cutover("production"),
+        now=NOW,
+    )
+
+    assert report["ok"] is False
+    assert f"{artifact}_{blocker_suffix}" in report["blockers"]
+
+
+@pytest.mark.parametrize(
+    ("filename", "mutation", "blocker"),
+    [
+        (
+            release_gate_module.REMOTE_READER_WORKLOAD_CENSUS_FILENAME,
+            lambda body: body["statistics"].update(snapshot_stable=False),
+            "remote_reader_workload_census_snapshot_invalid",
+        ),
+        (
+            release_gate_module.REMOTE_READER_WORKLOAD_CENSUS_FILENAME,
+            lambda body: body["source"].update(component_commit="f" * 40),
+            "remote_reader_workload_census_source_mismatch",
+        ),
+        (
+            release_gate_module.REMOTE_READER_DOMAIN_MAPPING_FILENAME,
+            lambda body: body["rules"][2].update(
+                option_ids=["driving", "unknown"],
+                option_path=["driving", "UNKNOWN"],
+            ),
+            "remote_reader_domain_mapping_rules_invalid",
+        ),
+        (
+            release_gate_module.REMOTE_READER_DOMAIN_MAPPING_APPROVAL_FILENAME,
+            lambda body: body.update(mapping_rules_sha256="f" * 64),
+            "remote_reader_domain_mapping_approval_mismatch",
+        ),
+        (
+            release_gate_module.REMOTE_READER_WORKLOAD_EXPORT_RECEIPT_FILENAME,
+            lambda body: body["manifest"].update(body_sha256="f" * 64),
+            "remote_reader_workload_export_receipt_manifest_mismatch",
+        ),
+        (
+            release_gate_module.REMOTE_READER_WORKLOAD_EXPORT_RECEIPT_FILENAME,
+            lambda body: body["selection"].update(
+                eligible_reference_candidates=201
+            ),
+            "remote_reader_workload_export_receipt_selection_invalid",
+        ),
+    ],
+)
+def test_production_rejects_tampered_workload_provenance(
+    tmp_path,
+    filename,
+    mutation,
+    blocker,
+):
+    consumer, dispatcher, settings = _gate(tmp_path, "production")
+    path = settings.evidence_dir / filename
+    body = json.loads(path.read_text(encoding="utf-8"))
+    mutation(body)
+    _write_remote_soak_manifest(path, body)
+
+    report = evaluate_release_gate(
+        consumer=consumer,
+        dispatcher=dispatcher,
+        settings=settings,
+        cutover=_cutover("production"),
+        now=NOW,
+    )
+
+    assert report["ok"] is False
+    assert blocker in report["blockers"]
+
+
+def test_workload_provenance_pass_detail_is_commit_and_owner_bound(tmp_path):
+    consumer, dispatcher, settings = _gate(tmp_path, "production")
+
+    report = evaluate_release_gate(
+        consumer=consumer,
+        dispatcher=dispatcher,
+        settings=settings,
+        cutover=_cutover("production"),
+        now=NOW,
+    )
+
+    check = next(
+        item
+        for item in report["checks"]
+        if item["name"] == "remote_reader_workload_provenance"
+    )
+    assert check["ok"] is True
+    assert check["detail"]["approved_by"] == "data-owner-fixture"
+    assert check["detail"]["case_count"] == 200
+    assert check["detail"]["exporter_commit"] == _git(
+        settings.host_repo_root, "rev-parse", "HEAD"
+    )
+    assert check["detail"]["exporter_module_sha256"] == hashlib.sha256(
+        (
+            settings.host_repo_root
+            / release_gate_module.REMOTE_READER_WORKLOAD_EXPORT_MODULE
+        ).read_bytes()
+    ).hexdigest()
 
 
 @pytest.mark.parametrize(

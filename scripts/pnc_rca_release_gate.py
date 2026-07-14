@@ -177,6 +177,37 @@ REMOTE_READER_SOAK_MANIFEST_SCHEMA_VERSION = (
     "pnc_rca_remote_reader_soak_manifest_v1"
 )
 REMOTE_READER_SOAK_MANIFEST_FILENAME = "remote_reader_soak_manifest.json"
+REMOTE_READER_WORKLOAD_CENSUS_SCHEMA_VERSION = (
+    "rca_issue_workload_export_census_v1"
+)
+REMOTE_READER_DOMAIN_MAPPING_SCHEMA_VERSION = "rca_issue_domain_mapping_v1"
+REMOTE_READER_DOMAIN_MAPPING_APPROVAL_SCHEMA_VERSION = (
+    "rca_issue_domain_mapping_approval_v1"
+)
+REMOTE_READER_WORKLOAD_EXPORT_RECEIPT_SCHEMA_VERSION = (
+    "rca_issue_workload_export_receipt_v1"
+)
+REMOTE_READER_WORKLOAD_CENSUS_FILENAME = "remote_reader_workload_census.json"
+REMOTE_READER_DOMAIN_MAPPING_FILENAME = "remote_reader_domain_mapping.json"
+REMOTE_READER_DOMAIN_MAPPING_APPROVAL_FILENAME = (
+    "remote_reader_domain_mapping_approval.json"
+)
+REMOTE_READER_WORKLOAD_EXPORT_RECEIPT_FILENAME = (
+    "remote_reader_workload_export_receipt.json"
+)
+REMOTE_READER_WORKLOAD_EXPORT_MODULE = "scripts/rca_issue_workload_export.py"
+REMOTE_READER_WORKLOAD_CENSUS_SCHEMA = (
+    "docs/pnc/schemas/rca_issue_workload_export_census_v1.schema.json"
+)
+REMOTE_READER_DOMAIN_MAPPING_SCHEMA = (
+    "docs/pnc/schemas/rca_issue_domain_mapping_v1.schema.json"
+)
+REMOTE_READER_DOMAIN_MAPPING_APPROVAL_SCHEMA = (
+    "docs/pnc/schemas/rca_issue_domain_mapping_approval_v1.schema.json"
+)
+REMOTE_READER_WORKLOAD_EXPORT_RECEIPT_SCHEMA = (
+    "docs/pnc/schemas/rca_issue_workload_export_receipt_v1.schema.json"
+)
 REMOTE_READER_SOAK_BASE_COMMIT = "17bceada4fb3591f9fd5b249ffb124749d7c7496"
 REMOTE_READER_SOAK_BASE_TREE = "49af84f253779c71828f72e2341a2bfcae9c0a96"
 REMOTE_READER_SOAK_MODULE = "api/g1q3_rca/remote_reader_soak.py"
@@ -264,6 +295,7 @@ PRODUCTION_RELEASE_CHECK_NAMES = frozenset({
     "cutover_plan",
     "shadow_soak",
     "canary_plan",
+    "remote_reader_workload_provenance",
     "remote_reader_soak",
     "canary_receipt",
     "canary_receipt_sources",
@@ -292,6 +324,7 @@ ACTIVATION_STAGE_RELEASE_CHECK_NAMES = frozenset({
     "cutover_plan",
     "shadow_soak",
     "canary_plan",
+    "remote_reader_workload_provenance",
     "remote_reader_soak",
     "activation_bootstrap_runtime",
 })
@@ -706,6 +739,10 @@ MINIMUM_CRITICAL_FILES = frozenset({
     "docs/pnc/g1q3-rca-auto-pipeline-design.md",
     "docs/pnc/g1q3-rca-intake-state-machine.md",
     REMOTE_READER_SOAK_HOST_SCHEMA,
+    REMOTE_READER_WORKLOAD_CENSUS_SCHEMA,
+    REMOTE_READER_DOMAIN_MAPPING_SCHEMA,
+    REMOTE_READER_DOMAIN_MAPPING_APPROVAL_SCHEMA,
+    REMOTE_READER_WORKLOAD_EXPORT_RECEIPT_SCHEMA,
     "scripts/g1q3_rca_e2e_smoke.py",
     "scripts/pnc_g1q3_governance_rca.py",
     "scripts/pnc_g1q3_truth.py",
@@ -717,6 +754,7 @@ MINIMUM_CRITICAL_FILES = frozenset({
     "scripts/pnc_rca_contract_drift_guard.py",
     "scripts/pnc_rca_canary_collector.py",
     "scripts/pnc_rca_release_gate.py",
+    REMOTE_READER_WORKLOAD_EXPORT_MODULE,
     "scripts/pnc_rca_store_migration_drill.py",
     "scripts/pnc_rca_writer_stop_evidence.py",
     "scripts/pnc_status_projection.py",
@@ -1719,16 +1757,18 @@ def _open_secure_evidence_directory(evidence_dir: Path, *, artifact: str) -> int
         raise EvidenceError(f"{artifact}_directory_invalid") from exc
 
 
-def _load_remote_reader_soak_manifest(
+def _load_canonical_owner_only_evidence(
     evidence_dir: Path,
+    filename: str,
+    *,
+    artifact: str,
     evidence_hashes: dict[str, str],
 ) -> dict[str, Any]:
-    artifact = "remote_reader_soak_manifest"
     directory_fd = _open_secure_evidence_directory(evidence_dir, artifact=artifact)
     try:
         observed = _secure_read_evidence_json_at(
             directory_fd,
-            REMOTE_READER_SOAK_MANIFEST_FILENAME,
+            filename,
             artifact=artifact,
             max_bytes=MAX_EVIDENCE_BYTES,
         )
@@ -1741,11 +1781,54 @@ def _load_remote_reader_soak_manifest(
         or observed.get("raw_sha256")
         != hashlib.sha256(canonical_file).hexdigest()
     ):
-        raise EvidenceError("remote_reader_soak_manifest_not_canonical")
-    evidence_hashes[REMOTE_READER_SOAK_MANIFEST_FILENAME] = str(
-        observed["raw_sha256"]
-    )
+        raise EvidenceError(f"{artifact}_not_canonical")
+    evidence_hashes[filename] = str(observed["raw_sha256"])
     return body
+
+
+def _load_remote_reader_soak_manifest(
+    evidence_dir: Path,
+    evidence_hashes: dict[str, str],
+) -> dict[str, Any]:
+    return _load_canonical_owner_only_evidence(
+        evidence_dir,
+        REMOTE_READER_SOAK_MANIFEST_FILENAME,
+        artifact="remote_reader_soak_manifest",
+        evidence_hashes=evidence_hashes,
+    )
+
+
+def _load_remote_reader_workload_provenance(
+    evidence_dir: Path,
+    evidence_hashes: dict[str, str],
+) -> dict[str, dict[str, Any]]:
+    artifacts = {
+        "census": (
+            REMOTE_READER_WORKLOAD_CENSUS_FILENAME,
+            "remote_reader_workload_census",
+        ),
+        "mapping": (
+            REMOTE_READER_DOMAIN_MAPPING_FILENAME,
+            "remote_reader_domain_mapping",
+        ),
+        "approval": (
+            REMOTE_READER_DOMAIN_MAPPING_APPROVAL_FILENAME,
+            "remote_reader_domain_mapping_approval",
+        ),
+        "receipt": (
+            REMOTE_READER_WORKLOAD_EXPORT_RECEIPT_FILENAME,
+            "remote_reader_workload_export_receipt",
+        ),
+    }
+    return {
+        name: _load_canonical_owner_only_evidence(
+            evidence_dir,
+            filename,
+            artifact=artifact,
+            evidence_hashes=evidence_hashes,
+        )
+        for name, (filename, artifact) in artifacts.items()
+    }
 
 
 def _committed_canary_material(
@@ -3016,6 +3099,840 @@ def _remote_soak_count_map(value: Any, field: str) -> dict[str, int]:
     return {
         str(key): _exact_int(item, f"{field}.{key}", minimum=1)
         for key, item in parsed.items()
+    }
+
+
+def _check_remote_reader_workload_provenance(
+    artifacts: Mapping[str, Mapping[str, Any]],
+    *,
+    workload_manifest: Mapping[str, Any],
+    evidence_hashes: Mapping[str, str],
+    expected_host_commit: str,
+    expected_exporter_sha256: str,
+) -> dict[str, Any]:
+    artifact = "remote_reader_workload_provenance"
+    if (
+        re.fullmatch(r"[0-9a-f]{40}", expected_host_commit or "") is None
+        or re.fullmatch(r"[0-9a-f]{64}", expected_exporter_sha256 or "") is None
+    ):
+        raise EvidenceError("remote_reader_workload_build_unverified")
+    if set(artifacts) != {"census", "mapping", "approval", "receipt"}:
+        raise EvidenceError("remote_reader_workload_provenance_shape_invalid")
+
+    census = _remote_soak_object(
+        artifacts.get("census"),
+        field=f"{artifact}.census",
+        keys={
+            "schema_version",
+            "observed_at",
+            "source",
+            "feishu",
+            "taxonomy",
+            "statistics",
+            "security",
+        },
+        blocker="remote_reader_workload_census_shape_invalid",
+    )
+    if census.get("schema_version") != REMOTE_READER_WORKLOAD_CENSUS_SCHEMA_VERSION:
+        raise EvidenceError("remote_reader_workload_census_schema_invalid")
+    census_at = _remote_soak_timestamp(
+        census.get("observed_at"), f"{artifact}.census.observed_at"
+    )
+    source = _remote_soak_object(
+        census.get("source"),
+        field=f"{artifact}.census.source",
+        keys={
+            "component",
+            "component_commit",
+            "module",
+            "module_sha256",
+            "committed_match",
+            "module_clean",
+        },
+        blocker="remote_reader_workload_census_source_invalid",
+    )
+    component_commit = _remote_soak_commit(
+        source.get("component_commit"), f"{artifact}.census.source.component_commit"
+    )
+    module_sha256 = _sha256_digest(
+        source.get("module_sha256"), f"{artifact}.census.source.module_sha256"
+    )
+    if (
+        source.get("component") != "rca_issue_workload_export"
+        or source.get("module") != REMOTE_READER_WORKLOAD_EXPORT_MODULE
+        or source.get("committed_match") is not True
+        or source.get("module_clean") is not True
+        or component_commit != expected_host_commit
+        or module_sha256 != expected_exporter_sha256
+    ):
+        raise EvidenceError("remote_reader_workload_census_source_mismatch")
+
+    feishu = _remote_soak_object(
+        census.get("feishu"),
+        field=f"{artifact}.census.feishu",
+        keys={
+            "host",
+            "authenticated",
+            "project_key",
+            "work_item_type",
+            "selected_fields",
+            "mutation_performed",
+            "attachment_read_performed",
+            "page_size",
+            "page_count",
+            "session_provenance",
+        },
+        blocker="remote_reader_workload_census_feishu_invalid",
+    )
+    if (
+        feishu.get("host") != "project.feishu.cn"
+        or feishu.get("authenticated") is not True
+        or feishu.get("project_key") != "t03o4q"
+        or feishu.get("work_item_type") != "issue"
+        or feishu.get("selected_fields")
+        != ["work_item_id", "field_e776bb", "field_93aa63"]
+        or feishu.get("mutation_performed") is not False
+        or feishu.get("attachment_read_performed") is not False
+    ):
+        raise EvidenceError("remote_reader_workload_census_feishu_mismatch")
+    page_size = _exact_int(
+        feishu.get("page_size"), f"{artifact}.census.feishu.page_size", minimum=1
+    )
+    page_count = _exact_int(
+        feishu.get("page_count"), f"{artifact}.census.feishu.page_count", minimum=1
+    )
+    if page_size > 50:
+        raise EvidenceError("remote_reader_workload_census_page_size_invalid")
+    sessions = feishu.get("session_provenance")
+    if not isinstance(sessions, list) or len(sessions) != page_count:
+        raise EvidenceError("remote_reader_workload_census_session_invalid")
+    returned_total = 0
+    expected_offset = 0
+    observed_source_counts: set[int] = set()
+    for index, raw_session in enumerate(sessions):
+        session = _remote_soak_object(
+            raw_session,
+            field=f"{artifact}.census.feishu.session_provenance.{index}",
+            keys={
+                "offset",
+                "requested",
+                "returned",
+                "observed_source_count",
+                "query_sha256",
+                "session_id_sha256",
+            },
+            blocker="remote_reader_workload_census_session_invalid",
+        )
+        offset = _exact_int(
+            session.get("offset"),
+            f"{artifact}.census.feishu.session_provenance.{index}.offset",
+            minimum=0,
+        )
+        requested = _exact_int(
+            session.get("requested"),
+            f"{artifact}.census.feishu.session_provenance.{index}.requested",
+            minimum=1,
+        )
+        returned = _exact_int(
+            session.get("returned"),
+            f"{artifact}.census.feishu.session_provenance.{index}.returned",
+            minimum=1,
+        )
+        observed_count = _exact_int(
+            session.get("observed_source_count"),
+            (
+                f"{artifact}.census.feishu.session_provenance.{index}."
+                "observed_source_count"
+            ),
+            minimum=1,
+        )
+        _sha256_digest(
+            session.get("query_sha256"),
+            f"{artifact}.census.feishu.session_provenance.{index}.query_sha256",
+        )
+        _sha256_digest(
+            session.get("session_id_sha256"),
+            f"{artifact}.census.feishu.session_provenance.{index}.session_id_sha256",
+        )
+        if (
+            offset != expected_offset
+            or requested > page_size
+            or returned > requested
+            or (index < page_count - 1 and returned != requested)
+        ):
+            raise EvidenceError("remote_reader_workload_census_session_invalid")
+        expected_offset += returned
+        returned_total += returned
+        observed_source_counts.add(observed_count)
+
+    taxonomy = _remote_soak_object(
+        census.get("taxonomy"),
+        field=f"{artifact}.census.taxonomy",
+        keys={
+            "field_key",
+            "field_name",
+            "field_type",
+            "options",
+            "sha256",
+            "leaf_count",
+        },
+        blocker="remote_reader_workload_taxonomy_invalid",
+    )
+    raw_options = taxonomy.get("options")
+    if not isinstance(raw_options, list) or not raw_options:
+        raise EvidenceError("remote_reader_workload_taxonomy_invalid")
+    normalized_options: list[dict[str, list[str]]] = []
+    option_identities: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
+    option_paths: set[tuple[str, ...]] = set()
+    for index, raw_option in enumerate(raw_options):
+        option = _remote_soak_object(
+            raw_option,
+            field=f"{artifact}.census.taxonomy.options.{index}",
+            keys={"option_ids", "option_path"},
+            blocker="remote_reader_workload_taxonomy_invalid",
+        )
+        option_ids = option.get("option_ids")
+        option_path = option.get("option_path")
+        if (
+            not isinstance(option_ids, list)
+            or not isinstance(option_path, list)
+            or not option_ids
+            or len(option_ids) != len(option_path)
+            or not all(isinstance(item, str) and item for item in option_ids)
+            or not all(isinstance(item, str) and item for item in option_path)
+        ):
+            raise EvidenceError("remote_reader_workload_taxonomy_invalid")
+        identity = (tuple(option_ids), tuple(option_path))
+        if identity in option_identities or tuple(option_path) in option_paths:
+            raise EvidenceError("remote_reader_workload_taxonomy_duplicate")
+        option_identities.add(identity)
+        option_paths.add(tuple(option_path))
+        normalized_options.append(
+            {"option_ids": list(option_ids), "option_path": list(option_path)}
+        )
+    if normalized_options != sorted(
+        normalized_options, key=lambda item: (item["option_path"], item["option_ids"])
+    ):
+        raise EvidenceError("remote_reader_workload_taxonomy_order_invalid")
+    taxonomy_material = {
+        "field_key": "field_e776bb",
+        "field_name": _required_text(
+            taxonomy.get("field_name"), f"{artifact}.census.taxonomy.field_name"
+        ),
+        "field_type": "tree-select",
+        "options": normalized_options,
+    }
+    taxonomy_sha256 = _sha256_digest(
+        taxonomy.get("sha256"), f"{artifact}.census.taxonomy.sha256"
+    )
+    if (
+        taxonomy.get("field_key") != "field_e776bb"
+        or taxonomy.get("field_type") != "tree-select"
+        or _exact_int(
+            taxonomy.get("leaf_count"),
+            f"{artifact}.census.taxonomy.leaf_count",
+            minimum=1,
+        )
+        != len(normalized_options)
+        or taxonomy_sha256 != _remote_soak_sha256(taxonomy_material)
+    ):
+        raise EvidenceError("remote_reader_workload_taxonomy_hash_mismatch")
+
+    statistics = _remote_soak_object(
+        census.get("statistics"),
+        field=f"{artifact}.census.statistics",
+        keys={
+            "initial_source_count",
+            "minimum_observed_source_count",
+            "maximum_observed_source_count",
+            "target_records",
+            "records_seen",
+            "source_scan_complete",
+            "unique_work_items_seen",
+            "valid_work_item_count",
+            "valid_reference_candidate_count",
+            "unique_reference_count",
+            "duplicate_reference_candidate_count",
+            "snapshot_stable",
+            "categories",
+            "reader_class_counts",
+            "reference_kind_counts",
+            "rejection_reasons",
+        },
+        blocker="remote_reader_workload_census_statistics_invalid",
+    )
+    source_count = _exact_int(
+        statistics.get("initial_source_count"),
+        f"{artifact}.census.statistics.initial_source_count",
+        minimum=200,
+    )
+    records_seen = _exact_int(
+        statistics.get("records_seen"),
+        f"{artifact}.census.statistics.records_seen",
+        minimum=200,
+    )
+    unique_seen = _exact_int(
+        statistics.get("unique_work_items_seen"),
+        f"{artifact}.census.statistics.unique_work_items_seen",
+        minimum=200,
+    )
+    valid_work_items = _exact_int(
+        statistics.get("valid_work_item_count"),
+        f"{artifact}.census.statistics.valid_work_item_count",
+        minimum=200,
+    )
+    reference_candidates = _exact_int(
+        statistics.get("valid_reference_candidate_count"),
+        f"{artifact}.census.statistics.valid_reference_candidate_count",
+        minimum=200,
+    )
+    unique_references = _exact_int(
+        statistics.get("unique_reference_count"),
+        f"{artifact}.census.statistics.unique_reference_count",
+        minimum=200,
+    )
+    duplicate_references = _exact_int(
+        statistics.get("duplicate_reference_candidate_count"),
+        f"{artifact}.census.statistics.duplicate_reference_candidate_count",
+        minimum=0,
+    )
+    if (
+        statistics.get("source_scan_complete") is not True
+        or statistics.get("snapshot_stable") is not True
+        or source_count != records_seen
+        or source_count != unique_seen
+        or source_count != returned_total
+        or observed_source_counts != {source_count}
+        or _exact_int(
+            statistics.get("minimum_observed_source_count"),
+            f"{artifact}.census.statistics.minimum_observed_source_count",
+            minimum=200,
+        )
+        != source_count
+        or _exact_int(
+            statistics.get("maximum_observed_source_count"),
+            f"{artifact}.census.statistics.maximum_observed_source_count",
+            minimum=200,
+        )
+        != source_count
+        or _exact_int(
+            statistics.get("target_records"),
+            f"{artifact}.census.statistics.target_records",
+            minimum=200,
+        )
+        != source_count
+        or valid_work_items > source_count
+        or unique_references > reference_candidates
+        or reference_candidates - unique_references != duplicate_references
+    ):
+        raise EvidenceError("remote_reader_workload_census_snapshot_invalid")
+    reader_counts = _remote_soak_count_map(
+        statistics.get("reader_class_counts"),
+        f"{artifact}.census.statistics.reader_class_counts",
+    )
+    reference_kind_counts = _remote_soak_count_map(
+        statistics.get("reference_kind_counts"),
+        f"{artifact}.census.statistics.reference_kind_counts",
+    )
+    if (
+        set(reader_counts) != {"RemoteClipReader", "RemoteEventReader"}
+        or set(reference_kind_counts) != {"clip", "event"}
+        or reader_counts["RemoteClipReader"] != reference_kind_counts["clip"]
+        or reader_counts["RemoteEventReader"] != reference_kind_counts["event"]
+        or sum(reader_counts.values()) != reference_candidates
+    ):
+        raise EvidenceError("remote_reader_workload_census_reader_counts_invalid")
+    raw_categories = statistics.get("categories")
+    if not isinstance(raw_categories, list) or not raw_categories:
+        raise EvidenceError("remote_reader_workload_census_categories_invalid")
+    normalized_category_paths: list[tuple[str, ...]] = []
+    category_work_items = 0
+    category_candidates = 0
+    category_reader_totals: Counter[str] = Counter()
+    category_candidate_counts: dict[tuple[str, ...], int] = {}
+    for index, raw_category in enumerate(raw_categories):
+        category = _remote_soak_object(
+            raw_category,
+            field=f"{artifact}.census.statistics.categories.{index}",
+            keys={
+                "option_path",
+                "record_count",
+                "valid_work_item_count",
+                "valid_reference_candidate_count",
+                "unique_reference_count",
+                "duplicate_reference_candidate_count",
+                "reader_class_counts",
+            },
+            blocker="remote_reader_workload_census_categories_invalid",
+        )
+        category_path = category.get("option_path")
+        if (
+            not isinstance(category_path, list)
+            or not category_path
+            or not all(isinstance(item, str) and item for item in category_path)
+            or tuple(category_path) not in option_paths
+            or tuple(category_path) in normalized_category_paths
+        ):
+            raise EvidenceError("remote_reader_workload_census_categories_invalid")
+        normalized_category_paths.append(tuple(category_path))
+        record_count = _exact_int(
+            category.get("record_count"),
+            f"{artifact}.census.statistics.categories.{index}.record_count",
+            minimum=1,
+        )
+        category_valid = _exact_int(
+            category.get("valid_work_item_count"),
+            f"{artifact}.census.statistics.categories.{index}.valid_work_item_count",
+            minimum=0,
+        )
+        category_candidate_count = _exact_int(
+            category.get("valid_reference_candidate_count"),
+            (
+                f"{artifact}.census.statistics.categories.{index}."
+                "valid_reference_candidate_count"
+            ),
+            minimum=0,
+        )
+        category_unique = _exact_int(
+            category.get("unique_reference_count"),
+            f"{artifact}.census.statistics.categories.{index}.unique_reference_count",
+            minimum=0,
+        )
+        category_duplicate = _exact_int(
+            category.get("duplicate_reference_candidate_count"),
+            (
+                f"{artifact}.census.statistics.categories.{index}."
+                "duplicate_reference_candidate_count"
+            ),
+            minimum=0,
+        )
+        category_readers = _mapping(
+            category.get("reader_class_counts"),
+            f"{artifact}.census.statistics.categories.{index}.reader_class_counts",
+        )
+        normalized_category_readers = {
+            str(name): _exact_int(
+                count,
+                (
+                    f"{artifact}.census.statistics.categories.{index}."
+                    f"reader_class_counts.{name}"
+                ),
+                minimum=1,
+            )
+            for name, count in category_readers.items()
+        }
+        if (
+            not set(normalized_category_readers).issubset(reader_counts)
+            or category_valid > record_count
+            or category_unique > category_candidate_count
+            or category_candidate_count - category_unique != category_duplicate
+            or sum(normalized_category_readers.values()) != category_candidate_count
+        ):
+            raise EvidenceError("remote_reader_workload_census_categories_invalid")
+        category_work_items += category_valid
+        category_candidates += category_candidate_count
+        category_reader_totals.update(normalized_category_readers)
+        category_candidate_counts[tuple(category_path)] = category_candidate_count
+    if (
+        normalized_category_paths != sorted(normalized_category_paths)
+        or category_work_items != valid_work_items
+        or category_candidates != reference_candidates
+        or dict(category_reader_totals) != reader_counts
+    ):
+        raise EvidenceError("remote_reader_workload_census_categories_invalid")
+    _remote_soak_count_map(
+        statistics.get("rejection_reasons"),
+        f"{artifact}.census.statistics.rejection_reasons",
+    )
+    security = _remote_soak_object(
+        census.get("security"),
+        field=f"{artifact}.census.security",
+        keys={
+            "raw_issue_payload_persisted",
+            "raw_pdcl_field_persisted",
+            "description_or_attachment_persisted",
+            "credential_or_token_persisted",
+            "input_materialized",
+            "input_materialized_bytes",
+        },
+        blocker="remote_reader_workload_census_security_invalid",
+    )
+    if security != {
+        "raw_issue_payload_persisted": False,
+        "raw_pdcl_field_persisted": False,
+        "description_or_attachment_persisted": False,
+        "credential_or_token_persisted": False,
+        "input_materialized": False,
+        "input_materialized_bytes": 0,
+    }:
+        raise EvidenceError("remote_reader_workload_census_security_invalid")
+
+    mapping = _remote_soak_object(
+        artifacts.get("mapping"),
+        field=f"{artifact}.mapping",
+        keys={
+            "schema_version",
+            "project_key",
+            "work_item_type",
+            "field_key",
+            "taxonomy_sha256",
+            "approval",
+            "rules",
+        },
+        blocker="remote_reader_domain_mapping_shape_invalid",
+    )
+    if (
+        mapping.get("schema_version") != REMOTE_READER_DOMAIN_MAPPING_SCHEMA_VERSION
+        or mapping.get("project_key") != "t03o4q"
+        or mapping.get("work_item_type") != "issue"
+        or mapping.get("field_key") != "field_e776bb"
+        or mapping.get("taxonomy_sha256") != taxonomy_sha256
+    ):
+        raise EvidenceError("remote_reader_domain_mapping_binding_mismatch")
+    mapping_approval = _remote_soak_object(
+        mapping.get("approval"),
+        field=f"{artifact}.mapping.approval",
+        keys={"authority", "approved_by", "approved_at", "receipt_sha256"},
+        blocker="remote_reader_domain_mapping_approval_invalid",
+    )
+    approved_by = _required_text(
+        mapping_approval.get("approved_by"), f"{artifact}.mapping.approval.approved_by"
+    )
+    if len(approved_by) > 128 or mapping_approval.get("authority") != "PDCL/data owner":
+        raise EvidenceError("remote_reader_domain_mapping_approval_invalid")
+    approved_at = _remote_soak_timestamp(
+        mapping_approval.get("approved_at"), f"{artifact}.mapping.approval.approved_at"
+    )
+    approval_sha256 = _sha256_digest(
+        mapping_approval.get("receipt_sha256"),
+        f"{artifact}.mapping.approval.receipt_sha256",
+    )
+    raw_rules = mapping.get("rules")
+    if not isinstance(raw_rules, list) or not raw_rules:
+        raise EvidenceError("remote_reader_domain_mapping_rules_invalid")
+    normalized_rules: list[dict[str, Any]] = []
+    mapped_identities: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
+    mapped_domains: set[str] = set()
+    for index, raw_rule in enumerate(raw_rules):
+        rule = _remote_soak_object(
+            raw_rule,
+            field=f"{artifact}.mapping.rules.{index}",
+            keys={"function_domain", "option_ids", "option_path"},
+            blocker="remote_reader_domain_mapping_rules_invalid",
+        )
+        domain = _required_text(
+            rule.get("function_domain"), f"{artifact}.mapping.rules.{index}.function_domain"
+        )
+        option_ids = rule.get("option_ids")
+        option_path = rule.get("option_path")
+        if (
+            domain not in {"ACC", "LCC", "AEB", "FCW", "DNP"}
+            or not isinstance(option_ids, list)
+            or not isinstance(option_path, list)
+            or not option_ids
+            or len(option_ids) != len(option_path)
+            or not all(isinstance(item, str) and item for item in option_ids)
+            or not all(isinstance(item, str) and item for item in option_path)
+        ):
+            raise EvidenceError("remote_reader_domain_mapping_rules_invalid")
+        identity = (tuple(option_ids), tuple(option_path))
+        if identity not in option_identities or identity in mapped_identities:
+            raise EvidenceError("remote_reader_domain_mapping_rules_invalid")
+        mapped_identities.add(identity)
+        mapped_domains.add(domain)
+        normalized_rules.append(
+            {
+                "function_domain": domain,
+                "option_ids": list(option_ids),
+                "option_path": list(option_path),
+            }
+        )
+    if (
+        not {"ACC", "LCC", "DNP"}.issubset(mapped_domains)
+        or not mapped_domains.intersection({"AEB", "FCW"})
+        or normalized_rules != raw_rules
+    ):
+        raise EvidenceError("remote_reader_domain_mapping_quota_coverage_missing")
+    mapping_rules_material = {
+        "schema_version": mapping["schema_version"],
+        "project_key": mapping["project_key"],
+        "work_item_type": mapping["work_item_type"],
+        "field_key": mapping["field_key"],
+        "taxonomy_sha256": mapping["taxonomy_sha256"],
+        "rules": normalized_rules,
+    }
+    mapping_rules_sha256 = _remote_soak_sha256(mapping_rules_material)
+    mapped_option_paths = {identity[1] for identity in mapped_identities}
+
+    approval = _remote_soak_object(
+        artifacts.get("approval"),
+        field=f"{artifact}.approval",
+        keys={
+            "schema_version",
+            "authority",
+            "approved_by",
+            "approved_at",
+            "mapping_rules_sha256",
+        },
+        blocker="remote_reader_domain_mapping_approval_shape_invalid",
+    )
+    if (
+        approval.get("schema_version")
+        != REMOTE_READER_DOMAIN_MAPPING_APPROVAL_SCHEMA_VERSION
+        or approval.get("authority") != mapping_approval.get("authority")
+        or approval.get("approved_by") != approved_by
+        or approval.get("approved_at") != mapping_approval.get("approved_at")
+        or approval.get("mapping_rules_sha256") != mapping_rules_sha256
+        or evidence_hashes.get(REMOTE_READER_DOMAIN_MAPPING_APPROVAL_FILENAME)
+        != approval_sha256
+        or census_at > approved_at
+    ):
+        raise EvidenceError("remote_reader_domain_mapping_approval_mismatch")
+
+    receipt = _remote_soak_object(
+        artifacts.get("receipt"),
+        field=f"{artifact}.receipt",
+        keys={
+            "schema_version",
+            "generated_at",
+            "source",
+            "census",
+            "taxonomy_sha256",
+            "mapping",
+            "selection",
+            "manifest",
+            "security",
+        },
+        blocker="remote_reader_workload_export_receipt_shape_invalid",
+    )
+    if (
+        receipt.get("schema_version")
+        != REMOTE_READER_WORKLOAD_EXPORT_RECEIPT_SCHEMA_VERSION
+        or receipt.get("source") != source
+        or receipt.get("taxonomy_sha256") != taxonomy_sha256
+        or receipt.get("security") != security
+    ):
+        raise EvidenceError("remote_reader_workload_export_receipt_mismatch")
+    receipt_at = _remote_soak_timestamp(
+        receipt.get("generated_at"), f"{artifact}.receipt.generated_at"
+    )
+    if approved_at > receipt_at:
+        raise EvidenceError("remote_reader_workload_export_receipt_timestamp_invalid")
+    receipt_census = _remote_soak_object(
+        receipt.get("census"),
+        field=f"{artifact}.receipt.census",
+        keys={"body_sha256", "file_sha256"},
+        blocker="remote_reader_workload_export_receipt_census_invalid",
+    )
+    if (
+        receipt_census.get("body_sha256") != _remote_soak_sha256(census)
+        or receipt_census.get("file_sha256")
+        != evidence_hashes.get(REMOTE_READER_WORKLOAD_CENSUS_FILENAME)
+    ):
+        raise EvidenceError("remote_reader_workload_export_receipt_census_mismatch")
+    receipt_mapping = _remote_soak_object(
+        receipt.get("mapping"),
+        field=f"{artifact}.receipt.mapping",
+        keys={"artifact_sha256", "rules_material_sha256", "approval"},
+        blocker="remote_reader_workload_export_receipt_mapping_invalid",
+    )
+    if (
+        receipt_mapping.get("artifact_sha256")
+        != evidence_hashes.get(REMOTE_READER_DOMAIN_MAPPING_FILENAME)
+        or receipt_mapping.get("rules_material_sha256") != mapping_rules_sha256
+        or receipt_mapping.get("approval") != mapping_approval
+    ):
+        raise EvidenceError("remote_reader_workload_export_receipt_mapping_mismatch")
+
+    manifest = _mapping(workload_manifest, f"{artifact}.manifest")
+    manifest_source = _mapping(manifest.get("source"), f"{artifact}.manifest.source")
+    manifest_at = _remote_soak_timestamp(
+        manifest.get("generated_at"), f"{artifact}.manifest.generated_at"
+    )
+    if (
+        manifest_at != receipt_at
+        or manifest_source.get("component_commit") != component_commit
+        or manifest_source.get("artifact_sha256") != module_sha256
+    ):
+        raise EvidenceError("remote_reader_workload_manifest_source_mismatch")
+    receipt_manifest = _remote_soak_object(
+        receipt.get("manifest"),
+        field=f"{artifact}.receipt.manifest",
+        keys={"schema_version", "body_sha256", "file_sha256", "case_count"},
+        blocker="remote_reader_workload_export_receipt_manifest_invalid",
+    )
+    manifest_cases = manifest.get("cases")
+    if not isinstance(manifest_cases, list):
+        raise EvidenceError("remote_reader_workload_export_receipt_manifest_invalid")
+    if (
+        receipt_manifest.get("schema_version") != REMOTE_READER_SOAK_MANIFEST_SCHEMA_VERSION
+        or receipt_manifest.get("body_sha256") != _remote_soak_sha256(manifest)
+        or receipt_manifest.get("file_sha256")
+        != evidence_hashes.get(REMOTE_READER_SOAK_MANIFEST_FILENAME)
+        or _exact_int(
+            receipt_manifest.get("case_count"),
+            f"{artifact}.receipt.manifest.case_count",
+            minimum=200,
+        )
+        != len(manifest_cases)
+    ):
+        raise EvidenceError("remote_reader_workload_export_receipt_manifest_mismatch")
+
+    selected_domain_counts: Counter[str] = Counter()
+    selected_reader_counts: Counter[str] = Counter()
+    selected_work_items: set[str] = set()
+    selected_references: set[tuple[str, str]] = set()
+    for index, raw_case in enumerate(manifest_cases):
+        case = _mapping(raw_case, f"{artifact}.manifest.cases.{index}")
+        work_item_id = _remote_soak_identifier(
+            case.get("work_item_id"), f"{artifact}.manifest.cases.{index}.work_item_id"
+        )
+        function_domain = _required_text(
+            case.get("function_domain"),
+            f"{artifact}.manifest.cases.{index}.function_domain",
+        )
+        quota_domain = "AEB_FCW" if function_domain in {"AEB", "FCW"} else function_domain
+        access = _mapping(
+            case.get("data_access"), f"{artifact}.manifest.cases.{index}.data_access"
+        )
+        references = access.get("references")
+        if not isinstance(references, list) or len(references) != 1:
+            raise EvidenceError("remote_reader_workload_export_receipt_selection_invalid")
+        reference = _mapping(
+            references[0], f"{artifact}.manifest.cases.{index}.reference"
+        )
+        kind = str(reference.get("kind") or "")
+        locator_field = "clip_uuid" if kind == "clip" else "event_uuid" if kind == "event" else ""
+        locator = str(reference.get(locator_field) or "") if locator_field else ""
+        reader_class = str(reference.get("reader_class") or "")
+        if (
+            quota_domain not in REMOTE_READER_SOAK_DOMAIN_QUOTAS
+            or function_domain not in mapped_domains
+            or reader_class not in REMOTE_READER_SOAK_READER_QUOTAS
+            or not locator
+            or reader_class
+            != (
+                "RemoteClipReader" if kind == "clip" else "RemoteEventReader"
+            )
+            or work_item_id in selected_work_items
+            or (kind, locator) in selected_references
+        ):
+            raise EvidenceError("remote_reader_workload_export_receipt_selection_invalid")
+        selected_work_items.add(work_item_id)
+        selected_references.add((kind, locator))
+        selected_domain_counts[quota_domain] += 1
+        selected_reader_counts[reader_class] += 1
+    selection = _remote_soak_object(
+        receipt.get("selection"),
+        field=f"{artifact}.receipt.selection",
+        keys={
+            "eligible_reference_candidates",
+            "unmapped_category_counts",
+            "case_count",
+            "unique_work_items",
+            "unique_references",
+            "domain_counts",
+            "reader_class_counts",
+        },
+        blocker="remote_reader_workload_export_receipt_selection_invalid",
+    )
+    eligible_candidates = _exact_int(
+        selection.get("eligible_reference_candidates"),
+        f"{artifact}.receipt.selection.eligible_reference_candidates",
+        minimum=200,
+    )
+    expected_eligible_candidates = sum(
+        count
+        for path, count in category_candidate_counts.items()
+        if path in mapped_option_paths
+    )
+    if eligible_candidates != expected_eligible_candidates:
+        raise EvidenceError("remote_reader_workload_export_receipt_selection_invalid")
+    unmapped = selection.get("unmapped_category_counts")
+    if not isinstance(unmapped, list):
+        raise EvidenceError("remote_reader_workload_export_receipt_selection_invalid")
+    normalized_unmapped: list[dict[str, Any]] = []
+    for index, raw_item in enumerate(unmapped):
+        item = _remote_soak_object(
+            raw_item,
+            field=f"{artifact}.receipt.selection.unmapped_category_counts.{index}",
+            keys={"option_path", "reference_count"},
+            blocker="remote_reader_workload_export_receipt_selection_invalid",
+        )
+        option_path = item.get("option_path")
+        if (
+            not isinstance(option_path, list)
+            or tuple(option_path) not in option_paths
+        ):
+            raise EvidenceError("remote_reader_workload_export_receipt_selection_invalid")
+        reference_count = _exact_int(
+            item.get("reference_count"),
+            f"{artifact}.receipt.selection.unmapped_category_counts.{index}.reference_count",
+            minimum=1,
+        )
+        normalized_unmapped.append(
+            {"option_path": list(option_path), "reference_count": reference_count}
+        )
+    expected_unmapped = [
+        {"option_path": list(path), "reference_count": count}
+        for path, count in sorted(category_candidate_counts.items())
+        if path not in mapped_option_paths and count > 0
+    ]
+    if normalized_unmapped != expected_unmapped:
+        raise EvidenceError("remote_reader_workload_export_receipt_selection_invalid")
+    if (
+        _exact_int(
+            selection.get("case_count"),
+            f"{artifact}.receipt.selection.case_count",
+            minimum=200,
+        )
+        != len(manifest_cases)
+        or _exact_int(
+            selection.get("unique_work_items"),
+            f"{artifact}.receipt.selection.unique_work_items",
+            minimum=200,
+        )
+        != len(selected_work_items)
+        or _exact_int(
+            selection.get("unique_references"),
+            f"{artifact}.receipt.selection.unique_references",
+            minimum=200,
+        )
+        != len(selected_references)
+        or _remote_soak_count_map(
+            selection.get("domain_counts"),
+            f"{artifact}.receipt.selection.domain_counts",
+        )
+        != dict(sorted(selected_domain_counts.items()))
+        or _remote_soak_count_map(
+            selection.get("reader_class_counts"),
+            f"{artifact}.receipt.selection.reader_class_counts",
+        )
+        != dict(sorted(selected_reader_counts.items()))
+        or dict(selected_domain_counts) != REMOTE_READER_SOAK_DOMAIN_QUOTAS
+        or any(
+            selected_reader_counts[name] < count
+            for name, count in REMOTE_READER_SOAK_READER_QUOTAS.items()
+        )
+    ):
+        raise EvidenceError("remote_reader_workload_export_receipt_selection_mismatch")
+    return {
+        "exporter_commit": component_commit,
+        "exporter_module_sha256": module_sha256,
+        "census_file_sha256": evidence_hashes[
+            REMOTE_READER_WORKLOAD_CENSUS_FILENAME
+        ],
+        "taxonomy_sha256": taxonomy_sha256,
+        "mapping_file_sha256": evidence_hashes[
+            REMOTE_READER_DOMAIN_MAPPING_FILENAME
+        ],
+        "mapping_rules_sha256": mapping_rules_sha256,
+        "approval_receipt_sha256": approval_sha256,
+        "approved_by": approved_by,
+        "manifest_sha256": _remote_soak_sha256(manifest),
+        "case_count": len(manifest_cases),
+        "source_record_count": source_count,
+        "unique_source_references": unique_references,
     }
 
 
@@ -23128,6 +24045,7 @@ def evaluate_release_gate(
     health_detail: dict[str, Any] = {}
     activation_detail: dict[str, Any] = {}
     migration_detail: dict[str, Any] = {}
+    workload_manifest: dict[str, Any] = {}
     bootstrap_runtime_detail: dict[str, Any] = {}
     activation_candidate_detail: dict[str, Any] = {}
     committed_canary_evidence: dict[str, dict[str, Any]] = {}
@@ -23687,6 +24605,34 @@ def evaluate_release_gate(
             checks.fail("canary_plan", exc.code)
 
         try:
+            workload_manifest = _load_remote_reader_soak_manifest(
+                settings.evidence_dir,
+                evidence_hashes,
+            )
+            workload_provenance = _load_remote_reader_workload_provenance(
+                settings.evidence_dir,
+                evidence_hashes,
+            )
+            critical_files = _mapping(
+                verified_build_detail.get("critical_file_sha256"),
+                "remote_reader_workload.build.critical_file_sha256",
+            )
+            detail = _check_remote_reader_workload_provenance(
+                workload_provenance,
+                workload_manifest=workload_manifest,
+                evidence_hashes=evidence_hashes,
+                expected_host_commit=verified_host_commit,
+                expected_exporter_sha256=_sha256_digest(
+                    critical_files.get(REMOTE_READER_WORKLOAD_EXPORT_MODULE),
+                    "remote_reader_workload.exporter_module_sha256",
+                ),
+            )
+            checks.pass_("remote_reader_workload_provenance", detail)
+        except EvidenceError as exc:
+            workload_manifest = {}
+            checks.fail("remote_reader_workload_provenance", exc.code)
+
+        try:
             if not remote_reader_fingerprint:
                 raise EvidenceError("remote_reader_soak_health_unverified")
             if not canary_requested_scope:
@@ -23695,10 +24641,8 @@ def evaluate_release_gate(
                 raise EvidenceError("remote_reader_soak_build_unverified")
             if not remote_reader_health_detail:
                 raise EvidenceError("remote_reader_soak_health_unverified")
-            workload_manifest = _load_remote_reader_soak_manifest(
-                settings.evidence_dir,
-                evidence_hashes,
-            )
+            if not workload_manifest:
+                raise EvidenceError("remote_reader_soak_manifest_provenance_unverified")
             soak = _load_evidence(
                 settings.evidence_dir, "remote_reader_soak.json", evidence_hashes
             )

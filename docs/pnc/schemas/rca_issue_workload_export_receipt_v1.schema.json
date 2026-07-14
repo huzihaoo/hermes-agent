@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://minieye.internal/schemas/rca_issue_workload_export_receipt_v1.json",
+  "title": "G1Q3 RCA workload export provenance receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "generated_at", "source", "census", "taxonomy_sha256", "mapping", "selection", "manifest", "security"],
+  "properties": {
+    "schema_version": {"const": "rca_issue_workload_export_receipt_v1"},
+    "generated_at": {"$ref": "#/$defs/timestamp"},
+    "source": {"$ref": "#/$defs/source"},
+    "census": {"$ref": "#/$defs/hashPair"},
+    "taxonomy_sha256": {"$ref": "#/$defs/sha256"},
+    "mapping": {"$ref": "#/$defs/mapping"},
+    "selection": {"$ref": "#/$defs/selection"},
+    "manifest": {"$ref": "#/$defs/manifest"},
+    "security": {"$ref": "#/$defs/security"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "timestamp": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{6}Z$"},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["component", "component_commit", "module", "module_sha256", "committed_match", "module_clean"],
+      "properties": {
+        "component": {"const": "rca_issue_workload_export"},
+        "component_commit": {"$ref": "#/$defs/commit"},
+        "module": {"const": "scripts/rca_issue_workload_export.py"},
+        "module_sha256": {"$ref": "#/$defs/sha256"},
+        "committed_match": {"const": true},
+        "module_clean": {"const": true}
+      }
+    },
+    "hashPair": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["body_sha256", "file_sha256"],
+      "properties": {"body_sha256": {"$ref": "#/$defs/sha256"}, "file_sha256": {"$ref": "#/$defs/sha256"}}
+    },
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["authority", "approved_by", "approved_at", "receipt_sha256"],
+      "properties": {
+        "authority": {"const": "PDCL/data owner"},
+        "approved_by": {"type": "string", "minLength": 1, "maxLength": 128},
+        "approved_at": {"$ref": "#/$defs/timestamp"},
+        "receipt_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "mapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_sha256", "rules_material_sha256", "approval"],
+      "properties": {
+        "artifact_sha256": {"$ref": "#/$defs/sha256"},
+        "rules_material_sha256": {"$ref": "#/$defs/sha256"},
+        "approval": {"$ref": "#/$defs/approval"}
+      }
+    },
+    "countMap": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 1}},
+    "unmapped": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["option_path", "reference_count"],
+      "properties": {
+        "option_path": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+        "reference_count": {"type": "integer", "minimum": 1}
+      }
+    },
+    "selection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["eligible_reference_candidates", "unmapped_category_counts", "case_count", "unique_work_items", "unique_references", "domain_counts", "reader_class_counts"],
+      "properties": {
+        "eligible_reference_candidates": {"type": "integer", "minimum": 200},
+        "unmapped_category_counts": {"type": "array", "items": {"$ref": "#/$defs/unmapped"}},
+        "case_count": {"const": 200},
+        "unique_work_items": {"const": 200},
+        "unique_references": {"const": 200},
+        "domain_counts": {"const": {"ACC": 50, "AEB_FCW": 50, "DNP": 50, "LCC": 50}},
+        "reader_class_counts": {"$ref": "#/$defs/countMap"}
+      }
+    },
+    "manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "body_sha256", "file_sha256", "case_count"],
+      "properties": {
+        "schema_version": {"const": "pnc_rca_remote_reader_soak_manifest_v1"},
+        "body_sha256": {"$ref": "#/$defs/sha256"},
+        "file_sha256": {"$ref": "#/$defs/sha256"},
+        "case_count": {"const": 200}
+      }
+    },
+    "security": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["raw_issue_payload_persisted", "raw_pdcl_field_persisted", "description_or_attachment_persisted", "credential_or_token_persisted", "input_materialized", "input_materialized_bytes"],
+      "properties": {
+        "raw_issue_payload_persisted": {"const": false},
+        "raw_pdcl_field_persisted": {"const": false},
+        "description_or_attachment_persisted": {"const": false},
+        "credential_or_token_persisted": {"const": false},
+        "input_materialized": {"const": false},
+        "input_materialized_bytes": {"const": 0}
+      }
+    }
+  }
+}

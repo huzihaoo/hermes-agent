@@ -232,6 +232,14 @@ def test_scan_is_read_only_redacted_and_tracks_rejections(tmp_path: Path) -> Non
     assert mapping_request["required_authority"] == "PDCL/data owner"
     assert mapping_request["feishu_binding"]["taxonomy_sha256"] == scan.taxonomy_sha256
     assert mapping_request["security"]["issue_identifiers_included"] is False
+    assert {
+        item["path"] for item in mapping_request["required_artifacts"]["schemas"]
+    } == {
+        "docs/pnc/schemas/rca_issue_workload_export_census_v1.schema.json",
+        "docs/pnc/schemas/rca_issue_domain_mapping_v1.schema.json",
+        "docs/pnc/schemas/rca_issue_domain_mapping_approval_v1.schema.json",
+        "docs/pnc/schemas/rca_issue_workload_export_receipt_v1.schema.json",
+    }
     request_text = json.dumps(mapping_request, ensure_ascii=False)
     assert secret_event not in request_text
     assert raw_command not in request_text
@@ -351,6 +359,7 @@ def _sealed_scan() -> tuple[exporter.ScanResult, exporter.DomainMapping]:
     mapping = exporter.DomainMapping(
         rules=rules,
         artifact_sha256="c" * 64,
+        rules_material_sha256="e" * 64,
         approval={
             "authority": "PDCL/data owner",
             "approved_by": "owner-key-1",
@@ -365,9 +374,11 @@ def test_manifest_is_deterministic_and_accepted_by_release_gate_consumer() -> No
     scan, mapping = _sealed_scan()
 
     manifest, receipt = exporter.build_manifest(
-        scan, mapping, generated_at=OBSERVED_AT
+        scan, mapping, generated_at=OBSERVED_AT, census_file_sha256="f" * 64
     )
-    repeated, _ = exporter.build_manifest(scan, mapping, generated_at=OBSERVED_AT)
+    repeated, _ = exporter.build_manifest(
+        scan, mapping, generated_at=OBSERVED_AT, census_file_sha256="f" * 64
+    )
 
     assert exporter._canonical_json_bytes(manifest) == exporter._canonical_json_bytes(
         repeated
@@ -379,6 +390,12 @@ def test_manifest_is_deterministic_and_accepted_by_release_gate_consumer() -> No
     assert receipt["selection"]["domain_counts"] == exporter.DOMAIN_QUOTAS
     assert receipt["selection"]["unique_work_items"] == 200
     assert receipt["selection"]["unique_references"] == 200
+    assert receipt["census"]["file_sha256"] == "f" * 64
+    assert receipt["mapping"]["rules_material_sha256"] == "e" * 64
+    assert receipt["manifest"]["body_sha256"] == exporter._sha256_json(manifest)
+    assert receipt["manifest"]["file_sha256"] == hashlib.sha256(
+        exporter._canonical_json_bytes(manifest) + b"\n"
+    ).hexdigest()
     serialized = exporter._canonical_json_bytes(manifest).decode()
     assert "mdi download" not in serialized
     assert "-s ./" not in serialized

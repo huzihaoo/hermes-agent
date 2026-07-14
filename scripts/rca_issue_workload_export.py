@@ -100,6 +100,7 @@ class WorkloadCandidate:
 class DomainMapping:
     rules: dict[tuple[tuple[str, ...], tuple[str, ...]], str]
     artifact_sha256: str
+    rules_material_sha256: str
     approval: dict[str, str]
 
 
@@ -833,6 +834,7 @@ def load_domain_mapping(
     return DomainMapping(
         rules=rules,
         artifact_sha256=_sha256_bytes(raw),
+        rules_material_sha256=_sha256_json(rules_material),
         approval=normalized_approval,
     )
 
@@ -920,8 +922,11 @@ def build_manifest(
     mapping: DomainMapping,
     *,
     generated_at: str,
+    census_file_sha256: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     generated_at = _parse_timestamp(generated_at, field="generated_at")
+    if not _HEX64_RE.fullmatch(census_file_sha256):
+        raise ExportError("census_hash_invalid", "census file hash is invalid")
     source = scan.census["source"]
     if (
         not source.get("committed_match")
@@ -1001,10 +1006,14 @@ def build_manifest(
         "schema_version": RECEIPT_SCHEMA_VERSION,
         "generated_at": generated_at,
         "source": dict(source),
-        "census_sha256": _sha256_json(scan.census),
+        "census": {
+            "body_sha256": _sha256_json(scan.census),
+            "file_sha256": census_file_sha256,
+        },
         "taxonomy_sha256": scan.taxonomy_sha256,
         "mapping": {
             "artifact_sha256": mapping.artifact_sha256,
+            "rules_material_sha256": mapping.rules_material_sha256,
             "approval": mapping.approval,
         },
         "selection": {
@@ -1028,7 +1037,8 @@ def build_manifest(
         },
         "manifest": {
             "schema_version": MANIFEST_SCHEMA_VERSION,
-            "sha256": _sha256_json(manifest),
+            "body_sha256": _sha256_json(manifest),
+            "file_sha256": _sha256_bytes(_canonical_json_bytes(manifest) + b"\n"),
             "case_count": len(cases),
         },
         "security": dict(scan.census["security"]),
@@ -1071,8 +1081,10 @@ def build_mapping_request(
         )
     schema_entries = []
     for schema_path in (
+        "docs/pnc/schemas/rca_issue_workload_export_census_v1.schema.json",
         "docs/pnc/schemas/rca_issue_domain_mapping_v1.schema.json",
         "docs/pnc/schemas/rca_issue_domain_mapping_approval_v1.schema.json",
+        "docs/pnc/schemas/rca_issue_workload_export_receipt_v1.schema.json",
     ):
         try:
             schema_bytes = (repo_root / schema_path).read_bytes()
@@ -1278,6 +1290,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             scan,
             mapping,
             generated_at=args.generated_at or _timestamp(),
+            census_file_sha256=census_sha256,
         )
         manifest_sha256 = _secure_atomic_write(
             _absolute_no_resolve(args.manifest_output), manifest
