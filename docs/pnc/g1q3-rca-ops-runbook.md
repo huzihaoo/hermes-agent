@@ -630,6 +630,10 @@ VM 统一凭据入口是 `/home/mini/.hermes/service.env`（owner `mini`、`0600
 
 正式 workload 必须由 PDCL/data owner 只读导出 `pnc_rca_remote_reader_soak_manifest_v1`：至少 200 个唯一 work item，ACC/LCC/AEB_FCW/DNP 各至少 50，clip/event 均存在且 `clip -> RemoteClipReader`、`event -> RemoteEventReader`。原字段只以 SHA-256 绑定；禁止把 MDI 命令、本地/NAS/MCAP path、下载 URL 或凭据写入 manifest。`source.artifact_sha256` 只是 producer locator，不是 manifest 自校验 hash；production 仍要求 data-owner provenance/receipt。当前历史快照不是合法输入：G1Q3 374 单仅 3 单可直接形成 event ref、另 1 单可严格拆出 clip ref，DNP 现有详情为 0 个可证明 remote ref；禁止用 raw/path 猜测或复用 archive-review candidate 凑数。
 
+正式 producer 是 `scripts/rca_issue_workload_export.py`。census 阶段只允许官方 `meegle` 读取 `work_item_id`、`field_e776bb`、`field_93aa63`，按稳定排序完整分页，并只持久化分类聚合、拒绝原因、查询/session 哈希和 remote-reference 计数；不得持久化原始 issue payload、PDCL 字段、description、attachment 或 session ID。manifest 阶段还必须满足：producer module 已提交且 clean、完整 source count 在所有页不漂移、domain mapping 与 live taxonomy SHA-256 完全一致、mapping 和独立 approval receipt 均为 canonical JSON/owner-only `0600`，且 approval receipt 逐字节 SHA 与 `mapping_rules_sha256` 双重绑定。合同分别见 `docs/pnc/schemas/rca_issue_domain_mapping_v1.schema.json` 和 `docs/pnc/schemas/rca_issue_domain_mapping_approval_v1.schema.json`。
+
+2026-07-14 12:38 +08:00 的 authenticated live census（G1Q3 `t03o4q` / `issue`）完整稳定读取 5,206/5,206 条非空 PDCL 记录，得到 1,239 个可解析 work item、1,141 个唯一 remote reference（81 clip、1,158 event candidates）；这已替代旧的“无可用 workload source”结论。它仍不是生产 manifest：live 64 个 `field_e776bb` leaf 中不存在名为 `DNP` 的 option，且 VM 当前只识别显式 `DNP`，所以任何 HNOA/TSI/TSR/HMI/TJA 等组合都必须由 PDCL/data owner 在 taxonomy-bound mapping receipt 中明确批准，不能按父类或样本数推断。
+
 真实任务必须通过 long-task wrapper，work/output 仍落 `/mnt/tmp/<task_id>/`。唯一例外是 exact Host `remote_reader_health.json`：`/mnt/tmp` 为 CIFS、mode 会被合成为 `0755`，无法满足 collector 的 owner-only 检查；它必须落 VM 本地 `0700` 私有目录并保持 regular、same-euid、`0600`、no symlink，再以绝对路径传入。collector 会以 `O_NOFOLLOW` 单次快照逐字节绑定它、dependency doctor、candidate commit/tree、vendored schema SHA `1979a850be44ca190f7d468b2d2e3f1cc939fe755eb770ab9679403701c415fa`，任一不一致在开始前 fail closed：
 
 ```bash
