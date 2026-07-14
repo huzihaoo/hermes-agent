@@ -4,13 +4,14 @@
   "title": "G1Q3 RCA read-only Feishu workload census",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "observed_at", "source", "feishu", "taxonomy", "statistics", "security"],
+  "required": ["schema_version", "observed_at", "source", "feishu", "taxonomy", "dnp_keyword_policy", "statistics", "security"],
   "properties": {
     "schema_version": {"const": "rca_issue_workload_export_census_v1"},
     "observed_at": {"$ref": "#/$defs/timestamp"},
     "source": {"$ref": "#/$defs/source"},
     "feishu": {"$ref": "#/$defs/feishu"},
     "taxonomy": {"$ref": "#/$defs/taxonomy"},
+    "dnp_keyword_policy": {"$ref": "#/$defs/dnpKeywordPolicy"},
     "statistics": {"$ref": "#/$defs/statistics"},
     "security": {"$ref": "#/$defs/security"}
   },
@@ -53,7 +54,7 @@
         "authenticated": {"const": true},
         "project_key": {"const": "t03o4q"},
         "work_item_type": {"const": "issue"},
-        "selected_fields": {"const": ["work_item_id", "field_e776bb", "field_93aa63"]},
+        "selected_fields": {"const": ["work_item_id", "name", "field_e776bb", "field_93aa63"]},
         "mutation_performed": {"const": false},
         "attachment_read_performed": {"const": false},
         "page_size": {"type": "integer", "minimum": 1, "maximum": 50},
@@ -84,10 +85,35 @@
       }
     },
     "countMap": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 1}},
+    "nonnegativeCountMap": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
+    "dnpKeywordPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field_key", "keywords", "match_mode", "sha256"],
+      "properties": {
+        "field_key": {"const": "name"},
+        "keywords": {"const": ["规划", "SPP", "OOI"]},
+        "match_mode": {"const": "nfkc_casefold_cjk_substring_ascii_token"},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "dnpKeywordMatches": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["record_count", "valid_work_item_count", "reference_candidate_count", "keyword_record_counts", "keyword_valid_work_item_counts", "keyword_reference_candidate_counts"],
+      "properties": {
+        "record_count": {"type": "integer", "minimum": 50},
+        "valid_work_item_count": {"type": "integer", "minimum": 50},
+        "reference_candidate_count": {"type": "integer", "minimum": 50},
+        "keyword_record_counts": {"$ref": "#/$defs/nonnegativeCountMap"},
+        "keyword_valid_work_item_counts": {"$ref": "#/$defs/nonnegativeCountMap"},
+        "keyword_reference_candidate_counts": {"$ref": "#/$defs/nonnegativeCountMap"}
+      }
+    },
     "category": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["option_path", "record_count", "valid_work_item_count", "valid_reference_candidate_count", "unique_reference_count", "duplicate_reference_candidate_count", "reader_class_counts"],
+      "required": ["option_path", "record_count", "valid_work_item_count", "valid_reference_candidate_count", "unique_reference_count", "duplicate_reference_candidate_count", "reader_class_counts", "dnp_keyword_reference_candidate_count"],
       "properties": {
         "option_path": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
         "record_count": {"type": "integer", "minimum": 1},
@@ -95,13 +121,14 @@
         "valid_reference_candidate_count": {"type": "integer", "minimum": 0},
         "unique_reference_count": {"type": "integer", "minimum": 0},
         "duplicate_reference_candidate_count": {"type": "integer", "minimum": 0},
-        "reader_class_counts": {"$ref": "#/$defs/countMap"}
+        "reader_class_counts": {"$ref": "#/$defs/countMap"},
+        "dnp_keyword_reference_candidate_count": {"type": "integer", "minimum": 0}
       }
     },
     "statistics": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["initial_source_count", "minimum_observed_source_count", "maximum_observed_source_count", "target_records", "records_seen", "source_scan_complete", "unique_work_items_seen", "valid_work_item_count", "valid_reference_candidate_count", "unique_reference_count", "duplicate_reference_candidate_count", "snapshot_stable", "categories", "reader_class_counts", "reference_kind_counts", "rejection_reasons"],
+      "required": ["initial_source_count", "minimum_observed_source_count", "maximum_observed_source_count", "target_records", "records_seen", "source_scan_complete", "unique_work_items_seen", "valid_work_item_count", "valid_reference_candidate_count", "unique_reference_count", "duplicate_reference_candidate_count", "snapshot_stable", "categories", "reader_class_counts", "reference_kind_counts", "dnp_keyword_matches", "rejection_reasons"],
       "properties": {
         "initial_source_count": {"type": "integer", "minimum": 200},
         "minimum_observed_source_count": {"type": "integer", "minimum": 200},
@@ -118,16 +145,18 @@
         "categories": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/category"}},
         "reader_class_counts": {"$ref": "#/$defs/countMap"},
         "reference_kind_counts": {"$ref": "#/$defs/countMap"},
+        "dnp_keyword_matches": {"$ref": "#/$defs/dnpKeywordMatches"},
         "rejection_reasons": {"$ref": "#/$defs/countMap"}
       }
     },
     "security": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["raw_issue_payload_persisted", "raw_pdcl_field_persisted", "description_or_attachment_persisted", "credential_or_token_persisted", "input_materialized", "input_materialized_bytes"],
+      "required": ["raw_issue_payload_persisted", "raw_pdcl_field_persisted", "raw_issue_name_persisted", "description_or_attachment_persisted", "credential_or_token_persisted", "input_materialized", "input_materialized_bytes"],
       "properties": {
         "raw_issue_payload_persisted": {"const": false},
         "raw_pdcl_field_persisted": {"const": false},
+        "raw_issue_name_persisted": {"const": false},
         "description_or_attachment_persisted": {"const": false},
         "credential_or_token_persisted": {"const": false},
         "input_materialized": {"const": false},

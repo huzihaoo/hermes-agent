@@ -57,7 +57,7 @@ Consumer 与 outbox dispatcher 分离：
 
 Activation epoch 固定为 `(无 epoch) -> safe_off -> preauthorized -> bounded_active -> confirmed -> steady_active`，任一步均可在排空 pending/claimed writer 后 `aborted`。preauthorization gate 的不可覆盖 capsule 是 `create` 的唯一输入，且 `create` 只能建立 `safe_off`；operator 不能自行填写 fingerprint、DB identity 或 start fence。preproduction gate 在仍停写的 `safe_off` 上重验 preauthorization、config、typed DB identity、T0/start fence、冻结 canary plan 和迁移/物化连续性，产生第二个不可覆盖 capsule；只有 `transition-preauthorized` 消费它后，才能逐条授权 exact slots 并转 `bounded_active`。preauthorization、preproduction 与 production 各自都采用 `receipt + sibling capsule + sibling commit marker` 的逻辑原子发布；marker 最后写入且精确绑定前两者，缺 marker 的 capsule 不可消费，崩溃重试只允许从原 receipt 字节恢复缺失成员。epoch 同时绑定 preauthorization 与 preproduction 两组 fingerprint/gate-receipt/capsule hash，以及 build/config、DB logical identity、Kafka start/end fence、production gate receipt 和三类 exact canary budget。
 
-业务 Activation 与容量 ratchet 是两个独立、单向的状态机。首次 release 的容量状态从 `BOOTSTRAP_PRODUCTION` generation 1 开始，即使业务已进入 `steady_active`，仍只允许并发 1、每日 5 次的 `rca_prod` 提交。进入 `bounded_active` 后、启动四个 resident 前，owner 必须执行 `prepare-bootstrap-production`：它消费同一 preproduction capsule，重验 exact slot authorization、active-release binding、live env、固定 bootstrap authority、owner 与 DB ratchet origin，在全局排他锁下 create-once 发布 `sample-producer-activation.json`。producer 的历史 `activated_at` 到 authorization deadline 必须至少剩余 7 天 6 小时（7 天合格样本窗 + 6 小时操作缓冲）；plan、锁内发布和 `production_bootstrap` gate 都独立重验。已有 receipt 的重试、production gate 和业务 steady apply 还要求当前时间到 deadline 至少剩余 7 天，确保不是“历史创建时够、真正开生产时已不可达”。没有该 receipt 或任一窗口不足时 runtime/release 均 fail closed；`transition-steady` 不得晚建或替换它。
+业务 Activation 与容量 ratchet 是两个独立、单向的状态机。首次 release 的容量状态从 `BOOTSTRAP_PRODUCTION` generation 1 开始，即使业务已进入 `steady_active`，仍只允许并发 1、每日 5 次的 `rca_prod` 提交。进入 `bounded_active` 后、启动四个 resident 前，owner 必须执行 `prepare-bootstrap-production`：它消费同一 preproduction capsule，重验 exact slot authorization、active-release binding、live env、固定 bootstrap authority、owner 与 DB ratchet origin，在全局排他锁下 create-once 发布 `sample-producer-activation.json`。这一步只建立上线后的样本生产能力；20 个/7 天样本本身不作为首次 `production_bootstrap` 的前置条件。没有 producer receipt 时 runtime/release 仍 fail closed；`transition-steady` 不得晚建或替换它。
 
 业务 `steady_active` 只表示 Kafka/群 @ 可以按 bootstrap 限额持续生产样本，不代表容量已放大。Host 必须积累至少 20 个、跨度至少 7 天、最大间隔/新鲜度合规且 `input_materialized_bytes=0` 的 v3 样本；容量 executor 随后以 create-once `steady-intent.json`、owner authorization、receipt、marker、evidence bundle 五件证据做 generation 1 -> 2 CAS。崩溃只允许 `recover --apply` 从已有 intent 中恢复，不读取 ambient operator/reason/authorization，也不自签 owner authority。容量 generation 2 成功只改变 admission capacity，不再次修改业务 Activation。
 
@@ -138,7 +138,7 @@ Host 在提交前递归检查 dataclass/dict/list 的原始和序列化请求，
 
 初始目标以 200 case/day 设计，但上线资格来自测量而非静态估算：
 
-- 24 小时、至少 200 个代表 case remote-reader soak。正式证据固定为 `pnc_rca_remote_reader_soak_v4`：四域各至少 50 单、两类 reader 各至少 25 单，200 个 case/work item/reference 全部唯一；每条记录绑定 requested scope、candidate commit/tree、dependency/reader fingerprint、remote receipt、零 MDI/下载/fallback/输入物化计数和 record SHA-256，再以 domain-separated Merkle root 收口
+- `production_bootstrap` 首次上线前以最近 7 天真实 Kafka 消息的 bounded replay 取代 24 小时 soak 硬门槛：显式时间戳 offset/fixed end offset、`group_id=None`、无 subscribe/join/commit，至少 1 条真实消息通过当前 policy 并创建 shadow trigger/outbox。24 小时、至少 200 个代表 case remote-reader soak 改为上线后观察项；正式证据格式仍固定为 `pnc_rca_remote_reader_soak_v4`，供后续具体问题分析或 steady-capacity 放大使用
 - soak 不能以长时间 idle 冒充 24 小时运行。24 个一小时 bucket 每桶至少 4 单，首末 bucket 必须覆盖、相邻启动最大间隔 3630 秒；另需至少 900 秒处于并发 4、最长连续并发至少 300 秒。每 case 的 wall-clock 与 monotonic offset 交叉校验，120 秒边界不因调度误差放宽
 - soak 的临时 stream cache 只允许存在于 task-owned `/mnt/tmp/<task_id>/`，remote receipt/completeness/hash 验证后立即 unlink+fsync；正式 evidence 要求 `retained_stream_cache_bytes=0`。因此 750 MB 是单 case/并发峰值硬边界，不是允许累计保留 150 GB
 - success/error/timeout/limit 分类完整
@@ -162,7 +162,7 @@ Host 在提交前递归检查 dataclass/dict/list 的原始和序列化请求，
 2. Host/worker/VM clean commit、critical BOM、resident runtime identity
 3. 固定 remote-reader overlay 和完整 dependency proof
 4. pinned MCAP digest 与 governed cleanup proof
-5. remote-reader soak、fresh capacity/retention horizon
+5. 最近 7 天真实 Kafka bounded replay、fresh capacity/retention horizon；remote-reader soak 作为上线后观察项
 6. `bounded_active` 下 exact `kafka_success` slot 直接 admission 的真实 governed canary；preauthorized shadow/promotion 不得替代
 7. collector 只读生成、由 `canary_receipt_commit.json` 原子指向的不可变 receipt + sources generation pair
 8. release gate、browser smoke、成功双交付 read-after-write，以及 terminal-failure 原话题 durable 回执 canary 全绿；终态 canary 必须绑定配置中的真实 control/delivery SQLite path + device/inode，并证明 source-created、terminal、materialized、completed、collected 时间线单调且整链新鲜

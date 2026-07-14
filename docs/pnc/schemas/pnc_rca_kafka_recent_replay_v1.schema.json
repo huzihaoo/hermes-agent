@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://minieye.internal/schemas/pnc_rca_kafka_recent_replay_v1.json",
+  "title": "PNC RCA bounded recent Kafka shadow replay receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "observed_at", "source", "config", "window", "limits", "transport", "result"],
+  "properties": {
+    "schema_version": {"const": "pnc_rca_kafka_recent_replay_v1"},
+    "observed_at": {"$ref": "#/$defs/timestamp"},
+    "source": {"type": "object"},
+    "config": {"type": "object"},
+    "window": {"type": "object"},
+    "limits": {"type": "object"},
+    "transport": {
+      "const": {
+        "assignment": "explicit",
+        "group_id": null,
+        "subscribed": false,
+        "group_joined": false,
+        "enable_auto_commit": false,
+        "commit_performed": false,
+        "allow_auto_create_topics": false,
+        "isolation_level": "read_committed"
+      }
+    },
+    "result": {"type": "object"}
+  },
+  "$defs": {
+    "timestamp": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{6}Z$"}
+  }
+}

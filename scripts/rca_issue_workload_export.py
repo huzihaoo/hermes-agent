@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -41,12 +42,15 @@ MANIFEST_SCHEMA_VERSION = "pnc_rca_remote_reader_soak_manifest_v1"
 PROJECT_KEY = "t03o4q"
 WORK_ITEM_TYPE = "issue"
 WORK_ITEM_ID_FIELD = "work_item_id"
+WORK_ITEM_NAME_FIELD = "name"
 FUNCTION_CATEGORY_FIELD = "field_e776bb"
 PDCL_DATA_FIELD = "field_93aa63"
 PDCL_DATA_FIELD_NAME = "问题数据地址_PDCL"
 DOMAIN_QUOTAS = {"ACC": 50, "AEB_FCW": 50, "DNP": 50, "LCC": 50}
 READER_CLASS_QUOTAS = {"RemoteClipReader": 25, "RemoteEventReader": 25}
-ALLOWED_FUNCTION_DOMAINS = {"ACC", "AEB", "DNP", "FCW", "LCC"}
+ALLOWED_FUNCTION_DOMAINS = {"ACC", "AEB", "FCW", "LCC"}
+DNP_KEYWORDS = ("规划", "SPP", "OOI")
+DNP_KEYWORD_MATCH_MODE = "nfkc_casefold_cjk_substring_ascii_token"
 MEEGLE_HOST = "project.feishu.cn"
 MAX_MEEGLE_RESPONSE_BYTES = 32 * 1024 * 1024
 MAX_MAPPING_BYTES = 256 * 1024
@@ -79,6 +83,7 @@ class WorkloadCandidate:
     option_ids: tuple[str, ...]
     option_path: tuple[str, ...]
     data_access: dict[str, Any]
+    matched_dnp_keywords: tuple[str, ...] = ()
 
     @property
     def reference(self) -> dict[str, str]:
@@ -386,11 +391,36 @@ def _query_mql(
 ) -> str:
     _validate_source_identifiers(project_key, work_item_type)
     return (
-        f"SELECT `{WORK_ITEM_ID_FIELD}`, `{FUNCTION_CATEGORY_FIELD}`, `{PDCL_DATA_FIELD}` "
+        f"SELECT `{WORK_ITEM_ID_FIELD}`, `{WORK_ITEM_NAME_FIELD}`, "
+        f"`{FUNCTION_CATEGORY_FIELD}`, `{PDCL_DATA_FIELD}` "
         f"FROM `{project_key}`.`{work_item_type}` "
         f"WHERE `{PDCL_DATA_FIELD}` is not null "
         f"ORDER BY `{WORK_ITEM_ID_FIELD}` ASC LIMIT {offset},{page_size}"
     )
+
+
+def _dnp_keyword_policy() -> dict[str, Any]:
+    material = {
+        "field_key": WORK_ITEM_NAME_FIELD,
+        "keywords": list(DNP_KEYWORDS),
+        "match_mode": DNP_KEYWORD_MATCH_MODE,
+    }
+    return {**material, "sha256": _sha256_json(material)}
+
+
+def _matched_dnp_keywords(value: Any) -> tuple[str, ...]:
+    normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    matches: list[str] = []
+    for keyword in DNP_KEYWORDS:
+        normalized_keyword = unicodedata.normalize("NFKC", keyword).casefold()
+        if normalized_keyword.isascii():
+            pattern = rf"(?<![a-z0-9]){re.escape(normalized_keyword)}(?![a-z0-9])"
+            matched = re.search(pattern, normalized) is not None
+        else:
+            matched = normalized_keyword in normalized
+        if matched:
+            matches.append(keyword)
+    return tuple(matches)
 
 
 def _single_reference_contract(
@@ -466,8 +496,15 @@ def scan_workloads(
         tuple[str, ...], set[tuple[str, str]]
     ] = defaultdict(set)
     category_reader_counts: dict[tuple[str, ...], Counter[str]] = defaultdict(Counter)
+    category_dnp_reference_candidates: Counter[tuple[str, ...]] = Counter()
     reader_counts: Counter[str] = Counter()
     reference_kind_counts: Counter[str] = Counter()
+    dnp_keyword_record_counts: Counter[str] = Counter()
+    dnp_keyword_valid_work_item_counts: Counter[str] = Counter()
+    dnp_keyword_reference_candidate_counts: Counter[str] = Counter()
+    dnp_keyword_records = 0
+    dnp_keyword_valid_work_items: set[str] = set()
+    dnp_keyword_reference_candidates = 0
     work_items_with_valid_reference: set[str] = set()
     seen_work_items: set[str] = set()
     session_provenance: list[dict[str, Any]] = []
@@ -514,6 +551,9 @@ def scan_workloads(
         for row in rows:
             records_seen += 1
             work_item_id = str(row.get(WORK_ITEM_ID_FIELD) or "").strip()
+            matched_dnp_keywords = _matched_dnp_keywords(
+                row.get(WORK_ITEM_NAME_FIELD)
+            )
             category = row.get(FUNCTION_CATEGORY_FIELD)
             source_value = str(row.get(PDCL_DATA_FIELD) or "").strip()
             if not _IDENTIFIER_RE.fullmatch(work_item_id):
@@ -523,6 +563,9 @@ def scan_workloads(
                 rejections["duplicate_work_item_page_drift"] += 1
                 continue
             seen_work_items.add(work_item_id)
+            if matched_dnp_keywords:
+                dnp_keyword_records += 1
+                dnp_keyword_record_counts.update(matched_dnp_keywords)
             if (
                 not isinstance(category, tuple)
                 or len(category) != 2
@@ -539,6 +582,9 @@ def scan_workloads(
                 continue
             work_items_with_valid_reference.add(work_item_id)
             category_valid_work_items[option_path] += 1
+            if matched_dnp_keywords:
+                dnp_keyword_valid_work_items.add(work_item_id)
+                dnp_keyword_valid_work_item_counts.update(matched_dnp_keywords)
             for reference in access["references"]:
                 detached = _single_reference_contract(access, reference)
                 candidate = WorkloadCandidate(
@@ -546,6 +592,7 @@ def scan_workloads(
                     option_ids=option_ids,
                     option_path=option_path,
                     data_access=detached,
+                    matched_dnp_keywords=matched_dnp_keywords,
                 )
                 candidates.append(candidate)
                 category_reference_candidates[option_path] += 1
@@ -553,6 +600,12 @@ def scan_workloads(
                     candidate.reference_identity
                 )
                 category_reader_counts[option_path][candidate.reader_class] += 1
+                if matched_dnp_keywords:
+                    dnp_keyword_reference_candidates += 1
+                    category_dnp_reference_candidates[option_path] += 1
+                    dnp_keyword_reference_candidate_counts.update(
+                        matched_dnp_keywords
+                    )
                 reader_counts[candidate.reader_class] += 1
                 reference_kind_counts[candidate.reference["kind"]] += 1
         offset += len(rows)
@@ -591,6 +644,9 @@ def scan_workloads(
                 "reader_class_counts": dict(
                     sorted(category_reader_counts[option_path].items())
                 ),
+                "dnp_keyword_reference_candidate_count": (
+                    category_dnp_reference_candidates[option_path]
+                ),
             }
         )
     census = {
@@ -604,6 +660,7 @@ def scan_workloads(
             "work_item_type": work_item_type,
             "selected_fields": [
                 WORK_ITEM_ID_FIELD,
+                WORK_ITEM_NAME_FIELD,
                 FUNCTION_CATEGORY_FIELD,
                 PDCL_DATA_FIELD,
             ],
@@ -618,6 +675,7 @@ def scan_workloads(
             "sha256": taxonomy_sha256,
             "leaf_count": len(taxonomy_options),
         },
+        "dnp_keyword_policy": _dnp_keyword_policy(),
         "statistics": {
             "initial_source_count": observed_counts[0] if observed_counts else 0,
             "minimum_observed_source_count": min(observed_counts) if observed_counts else 0,
@@ -635,11 +693,29 @@ def scan_workloads(
             "categories": categories,
             "reader_class_counts": dict(sorted(reader_counts.items())),
             "reference_kind_counts": dict(sorted(reference_kind_counts.items())),
+            "dnp_keyword_matches": {
+                "record_count": dnp_keyword_records,
+                "valid_work_item_count": len(dnp_keyword_valid_work_items),
+                "reference_candidate_count": dnp_keyword_reference_candidates,
+                "keyword_record_counts": {
+                    keyword: dnp_keyword_record_counts[keyword]
+                    for keyword in DNP_KEYWORDS
+                },
+                "keyword_valid_work_item_counts": {
+                    keyword: dnp_keyword_valid_work_item_counts[keyword]
+                    for keyword in DNP_KEYWORDS
+                },
+                "keyword_reference_candidate_counts": {
+                    keyword: dnp_keyword_reference_candidate_counts[keyword]
+                    for keyword in DNP_KEYWORDS
+                },
+            },
             "rejection_reasons": dict(sorted(rejections.items())),
         },
         "security": {
             "raw_issue_payload_persisted": False,
             "raw_pdcl_field_persisted": False,
+            "raw_issue_name_persisted": False,
             "description_or_attachment_persisted": False,
             "credential_or_token_persisted": False,
             "input_materialized": False,
@@ -781,7 +857,7 @@ def load_domain_mapping(
             raise ExportError("domain_mapping_rules_invalid", "domain mapping rule is invalid")
         rules[identity] = domain
         domains.add(domain)
-    if not {"ACC", "DNP", "LCC"}.issubset(domains) or not domains.intersection({"AEB", "FCW"}):
+    if not {"ACC", "LCC"}.issubset(domains) or not domains.intersection({"AEB", "FCW"}):
         raise ExportError("domain_mapping_quota_coverage_missing", "mapping does not cover all quotas")
     rules_material = {
         "schema_version": body["schema_version"],
@@ -941,7 +1017,11 @@ def build_manifest(
     eligible: list[tuple[WorkloadCandidate, str]] = []
     unmapped: Counter[tuple[str, ...]] = Counter()
     for candidate in scan.candidates:
-        domain = mapping.rules.get((candidate.option_ids, candidate.option_path))
+        domain = (
+            "DNP"
+            if candidate.matched_dnp_keywords
+            else mapping.rules.get((candidate.option_ids, candidate.option_path))
+        )
         if domain is None:
             unmapped[candidate.option_path] += 1
             continue
@@ -1011,6 +1091,7 @@ def build_manifest(
             "file_sha256": census_file_sha256,
         },
         "taxonomy_sha256": scan.taxonomy_sha256,
+        "dnp_keyword_policy": scan.census["dnp_keyword_policy"],
         "mapping": {
             "artifact_sha256": mapping.artifact_sha256,
             "rules_material_sha256": mapping.rules_material_sha256,
@@ -1018,6 +1099,12 @@ def build_manifest(
         },
         "selection": {
             "eligible_reference_candidates": len(eligible),
+            "dnp_keyword_reference_candidates": sum(
+                1 for candidate, domain in eligible if domain == "DNP"
+            ),
+            "dnp_keyword_selected_cases": sum(
+                1 for _candidate, domain in selected if domain == "DNP"
+            ),
             "unmapped_category_counts": [
                 {"option_path": list(path), "reference_count": count}
                 for path, count in sorted(unmapped.items())
@@ -1109,6 +1196,7 @@ def build_mapping_request(
             "work_item_type": scan.census["feishu"]["work_item_type"],
             "field_key": FUNCTION_CATEGORY_FIELD,
             "taxonomy_sha256": scan.taxonomy_sha256,
+            "dnp_keyword_policy": scan.census["dnp_keyword_policy"],
             "source_scan_complete": scan.census["statistics"][
                 "source_scan_complete"
             ],
@@ -1116,12 +1204,13 @@ def build_mapping_request(
         },
         "required_authority": "PDCL/data owner",
         "required_decision": {
-            "function_domains": ["ACC", "LCC", "AEB", "FCW", "DNP"],
+            "taxonomy_function_domains": ["ACC", "LCC", "AEB", "FCW"],
+            "keyword_function_domain": "DNP",
             "quota_domains": dict(sorted(DOMAIN_QUOTAS.items())),
             "rule_identity": ["option_ids", "option_path"],
             "instruction": (
-                "Approve exact live taxonomy leaves for every function domain; "
-                "DNP must not be inferred from parent labels or record volume."
+                "Approve exact live taxonomy leaves for ACC/LCC/AEB/FCW. "
+                "DNP is classified only by the component-bound name keyword policy."
             ),
         },
         "eligible_taxonomy_options": sorted(
@@ -1141,6 +1230,7 @@ def build_mapping_request(
             "issue_identifiers_included": False,
             "remote_references_included": False,
             "raw_pdcl_fields_included": False,
+            "raw_issue_names_included": False,
             "credentials_or_tokens_included": False,
         },
     }

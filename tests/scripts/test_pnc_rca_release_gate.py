@@ -3148,6 +3148,9 @@ def _remote_reader_workload_provenance(
             "unique_reference_count": 50,
             "duplicate_reference_candidate_count": 0,
             "reader_class_counts": {reader_class: 50},
+            "dnp_keyword_reference_candidate_count": (
+                50 if option_path == ["driving", "DNP"] else 0
+            ),
         }
         for option_path, reader_class in (
             (["active", "AEB"], "RemoteEventReader"),
@@ -3159,6 +3162,7 @@ def _remote_reader_workload_provenance(
     security = {
         "raw_issue_payload_persisted": False,
         "raw_pdcl_field_persisted": False,
+        "raw_issue_name_persisted": False,
         "description_or_attachment_persisted": False,
         "credential_or_token_persisted": False,
         "input_materialized": False,
@@ -3177,6 +3181,7 @@ def _remote_reader_workload_provenance(
             "work_item_type": "issue",
             "selected_fields": [
                 "work_item_id",
+                "name",
                 "field_e776bb",
                 "field_93aa63",
             ],
@@ -3190,6 +3195,18 @@ def _remote_reader_workload_provenance(
             **taxonomy_material,
             "sha256": taxonomy_sha256,
             "leaf_count": len(options),
+        },
+        "dnp_keyword_policy": {
+            "field_key": "name",
+            "keywords": ["规划", "SPP", "OOI"],
+            "match_mode": "nfkc_casefold_cjk_substring_ascii_token",
+            "sha256": _remote_soak_sha256(
+                {
+                    "field_key": "name",
+                    "keywords": ["规划", "SPP", "OOI"],
+                    "match_mode": "nfkc_casefold_cjk_substring_ascii_token",
+                }
+            ),
         },
         "statistics": {
             "initial_source_count": 200,
@@ -3210,6 +3227,18 @@ def _remote_reader_workload_provenance(
                 "RemoteEventReader": 150,
             },
             "reference_kind_counts": {"clip": 50, "event": 150},
+            "dnp_keyword_matches": {
+                "record_count": 50,
+                "valid_work_item_count": 50,
+                "reference_candidate_count": 50,
+                "keyword_record_counts": {"规划": 50, "SPP": 0, "OOI": 0},
+                "keyword_valid_work_item_counts": {"规划": 50, "SPP": 0, "OOI": 0},
+                "keyword_reference_candidate_counts": {
+                    "规划": 50,
+                    "SPP": 0,
+                    "OOI": 0,
+                },
+            },
             "rejection_reasons": {},
         },
         "security": security,
@@ -3223,7 +3252,6 @@ def _remote_reader_workload_provenance(
         for domain, option_ids, option_path in (
             ("AEB", ["active", "aeb"], ["active", "AEB"]),
             ("ACC", ["driving", "acc"], ["driving", "ACC"]),
-            ("DNP", ["driving", "dnp"], ["driving", "DNP"]),
             ("LCC", ["driving", "lcc"], ["driving", "LCC"]),
         )
     ]
@@ -3273,6 +3301,7 @@ def _remote_reader_workload_provenance(
             "file_sha256": file_sha256(census),
         },
         "taxonomy_sha256": taxonomy_sha256,
+        "dnp_keyword_policy": census["dnp_keyword_policy"],
         "mapping": {
             "artifact_sha256": file_sha256(mapping),
             "rules_material_sha256": approval["mapping_rules_sha256"],
@@ -3280,6 +3309,8 @@ def _remote_reader_workload_provenance(
         },
         "selection": {
             "eligible_reference_candidates": 200,
+            "dnp_keyword_reference_candidates": 50,
+            "dnp_keyword_selected_cases": 50,
             "unmapped_category_counts": [],
             "case_count": 200,
             "unique_work_items": 200,
@@ -3416,6 +3447,118 @@ def _write_common_evidence(evidence_dir: Path, kafka_env_file: Path) -> None:
                 },
             ],
         },
+    )
+
+
+def _write_kafka_recent_replay_evidence(
+    evidence_dir: Path,
+    *,
+    kafka_env_file: Path,
+    host_repo: Path,
+    host_commit: str,
+    consumer: ConsumerConfig,
+) -> None:
+    _env, env_observation = load_kafka_preflight_environment(kafka_env_file)
+    observed = datetime.fromisoformat(OBSERVED_AT.replace("Z", "+00:00"))
+    started = observed - timedelta(days=7)
+    raw_values = [b'{"fixture":"real-kafka-0"}', b'{"fixture":"real-kafka-1"}']
+    records = [
+        {
+            "partition": partition,
+            "offset": offset,
+            "timestamp_ms": int(observed.timestamp() * 1000),
+            "value_bytes": len(raw),
+            "value_sha256": hashlib.sha256(raw).hexdigest(),
+            "decision": "accepted",
+            "reason": "creation_policy_matched",
+            "event_uid_sha256": hashlib.sha256(
+                f"{TOPIC}:{partition}:{offset}".encode()
+            ).hexdigest(),
+            "business_key_sha256": hashlib.sha256(
+                f"business-{partition}".encode()
+            ).hexdigest(),
+            "submission_key_sha256": hashlib.sha256(
+                f"submission-{partition}".encode()
+            ).hexdigest(),
+            "trigger_created": True,
+            "outbox_created": True,
+        }
+        for partition, offset, raw in ((0, 10, raw_values[0]), (1, 20, raw_values[1]))
+    ]
+    module = host_repo / release_gate_module.KAFKA_RECENT_REPLAY_MODULE
+    receipt = {
+        "schema_version": release_gate_module.KAFKA_RECENT_REPLAY_SCHEMA_VERSION,
+        "observed_at": OBSERVED_AT,
+        "source": {
+            "component": "pnc_rca_kafka_recent_replay",
+            "component_commit": host_commit,
+            "module": release_gate_module.KAFKA_RECENT_REPLAY_MODULE,
+            "module_sha256": hashlib.sha256(module.read_bytes()).hexdigest(),
+            "committed_match": True,
+            "module_clean": True,
+        },
+        "config": {
+            "topic": TOPIC,
+            "cluster_binding": {
+                "bootstrap_servers_sha256": _sha256_json(
+                    list(consumer.bootstrap_servers)
+                ),
+                "principal_sha256": _sha256_json(consumer.username),
+                "env_file": env_observation,
+            },
+            "policy_sha256": _sha256_json(consumer.policy.to_dict()),
+        },
+        "window": {
+            "days": 7,
+            "started_at": started.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            "ended_at": OBSERVED_AT,
+            "start_timestamp_ms": int(started.timestamp() * 1000),
+            "partitions": [
+                {
+                    "partition": partition,
+                    "beginning_offset": 0,
+                    "window_start_offset": offset,
+                    "fixed_end_offset": offset + 1,
+                    "records_scanned": 1,
+                }
+                for partition, offset in ((0, 10), (1, 20))
+            ],
+        },
+        "limits": {
+            "max_messages": 5000,
+            "max_bytes": 64 * 1024 * 1024,
+            "max_seconds": 120,
+        },
+        "transport": {
+            "assignment": "explicit",
+            "group_id": None,
+            "subscribed": False,
+            "group_joined": False,
+            "enable_auto_commit": False,
+            "commit_performed": False,
+            "allow_auto_create_topics": False,
+            "isolation_level": "read_committed",
+        },
+        "result": {
+            "stop_reason": "partition_end_offsets_reached",
+            "records_scanned": 2,
+            "raw_bytes_scanned": sum(len(raw) for raw in raw_values),
+            "decision_counts": {"accepted": 2},
+            "reason_counts": {"creation_policy_matched": 2},
+            "records": records,
+            "shadow_store": {
+                "inbox": {"accepted": 2},
+                "outbox": {"shadow": 2},
+                "replay_raw_retained": {"count": 0, "bytes": 0},
+            },
+            "production_mutation_performed": False,
+            "raw_payload_persisted_to_output": False,
+            "temporary_store_destroyed": True,
+        },
+    }
+    _write_remote_soak_manifest(
+        evidence_dir / release_gate_module.KAFKA_RECENT_REPLAY_FILENAME,
+        receipt,
     )
 
 
@@ -4803,6 +4946,13 @@ def _gate(tmp_path: Path, mode: str):
             dispatcher.delivery_db_path,
             dispatcher.release_id,
             dispatcher.bootstrap_epoch_id,
+        )
+        _write_kafka_recent_replay_evidence(
+            evidence_dir,
+            kafka_env_file=kafka_env_file,
+            host_repo=host_repo,
+            host_commit=host_commit,
+            consumer=consumer,
         )
     if mode in release_gate_module.PRODUCTION_MODES:
         release_bom_sha256 = json.loads(
@@ -13921,6 +14071,31 @@ def test_production_missing_remote_reader_soak_is_a_hard_no_go(tmp_path):
 
     assert report["ok"] is False
     assert "remote_reader_soak_missing" in report["blockers"]
+
+
+def test_production_bootstrap_defers_soaks_until_post_launch(tmp_path):
+    consumer, dispatcher, settings = _gate(tmp_path, "production_bootstrap")
+    (settings.evidence_dir / "shadow_soak.json").unlink()
+    (settings.evidence_dir / "remote_reader_soak.json").unlink()
+
+    report = evaluate_release_gate(
+        consumer=consumer,
+        dispatcher=dispatcher,
+        settings=settings,
+        cutover=_cutover("production_bootstrap"),
+        now=NOW,
+    )
+
+    checks = {item["name"]: item for item in report["checks"]}
+    for name in ("shadow_soak", "remote_reader_soak"):
+        assert checks[name]["ok"] is True
+        assert checks[name]["detail"] == {
+            "status": "deferred_to_post_launch",
+            "blocks_bootstrap_release": False,
+            "required_for_steady_capacity": True,
+        }
+    assert "shadow_soak_missing" not in report["blockers"]
+    assert "remote_reader_soak_missing" not in report["blockers"]
 
 
 @pytest.mark.parametrize(

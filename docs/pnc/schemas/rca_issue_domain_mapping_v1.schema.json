@@ -32,14 +32,14 @@
     },
     "rules": {
       "type": "array",
-      "minItems": 4,
+      "minItems": 3,
       "uniqueItems": true,
       "items": {
         "type": "object",
         "additionalProperties": false,
         "required": ["function_domain", "option_ids", "option_path"],
         "properties": {
-          "function_domain": {"enum": ["ACC", "LCC", "AEB", "FCW", "DNP"]},
+          "function_domain": {"enum": ["ACC", "LCC", "AEB", "FCW"]},
           "option_ids": {
             "type": "array",
             "minItems": 1,

@@ -89,9 +89,9 @@ done
 
 首次放量的 bootstrap authority 只允许固定文件 `~/.ssh-mini/rca-bootstrap-capacity-authorization.json`：regular、owner-only `0600`、单链接、非 symlink，且每次 health、claim 和 submit 都重新读取。release prepare 先生成 BOM/主审批，随后才可签发该 authority。production env stage 的 receipt 是 post-BOM `active-release-binding`；cutover 必须把 candidate `.env` 与该 receipt 原子安装为 live `.env` 和 `<runtime_state_root>/active-release-binding.json`，并把两者纳入同一 snapshot/journal/rollback。常驻 dispatcher 会交叉校验 live env SHA、静态 release/epoch、BOM、主审批 raw SHA、authority raw SHA/fingerprint；仅替换 authority 或 binding 任一侧都会 fail closed。
 
-bootstrap 授权最长 8 天，只用于收集 steady capacity 所需的至少 20 个、跨度至少 7 天且 `input_materialized_bytes=0` 的真实成功样本。最终 bootstrap candidate 必须在 preauthorization 前冻结 `HERMES_RCA_DELIVERY_COLLECTOR_CAPACITY_SAMPLE_ENABLED=true`；进入 `bounded_active` 后、启动四 resident 前，由 owner 执行 `prepare-bootstrap-production` 发布 create-once producer receipt。receipt 的历史 `activated_at` 到授权 deadline 必须至少剩余 7 天 6 小时；少 1 微秒也拒绝，避免 generation 1 create-once latch 落入永远不能形成 7 天 ledger 的窗口。已有 receipt 重试、`production_bootstrap` gate 和业务 steady apply 时，当前时间到 deadline 仍必须至少剩余 7 天。collector 只消费该 receipt，绝不自行创建。禁止在授权到期前临时手改 env、重启绕过或延长同一 epoch。
+bootstrap 授权最长 8 天；20 个/7 天且 `input_materialized_bytes=0` 的真实成功样本属于上线后的 steady-capacity 观测与扩容条件，不是首次 `production_bootstrap` 的前置发布条件。最终 bootstrap candidate 仍须冻结 `HERMES_RCA_DELIVERY_COLLECTOR_CAPACITY_SAMPLE_ENABLED=true`，以便上线后自然收集样本；进入 `bounded_active` 后、启动四 resident 前，由 owner 执行 `prepare-bootstrap-production` 发布 create-once producer receipt。collector 只消费该 receipt，绝不自行创建。禁止在授权到期前临时手改 env、重启绕过或延长同一 epoch。
 
-业务 Activation `steady_active` 与容量 `STEADY_ACTIVE` generation 2 不同：前者开放 Kafka/群 @ 生产入口，但继续受 bootstrap 并发 1、每日 5 次限制；后者仅在 20 个/7 天样本和五件证据闭合后不可逆放大容量，不再次修改业务 Activation。容量 evidence root 固定为 control DB 同目录的 `rca-capacity-transition/`，必须同时保留 `steady-intent.json`、`steady-authorization.json`、`steady-receipt.json`、`steady-marker.json`、`evidence-bundle.json`；任何 prefix 缺失都保持 bootstrap 或 fail closed。
+业务 Activation `steady_active` 与容量 `STEADY_ACTIVE` generation 2 不同：前者开放 Kafka/群 @ 生产入口，但继续受 bootstrap 并发 1、每日 5 次限制；后者在上线后根据实际运行问题、20 个/7 天样本和五件证据闭合情况再决定是否不可逆放大容量，不再次修改业务 Activation。容量 evidence root 固定为 control DB 同目录的 `rca-capacity-transition/`，必须同时保留 `steady-intent.json`、`steady-authorization.json`、`steady-receipt.json`、`steady-marker.json`、`evidence-bundle.json`；任何 prefix 缺失都保持 bootstrap 或 fail closed。
 
 共享 outbox 对人工新执行采用 80% active 水位上限，为 Kafka 自动建单保留容量；同一问题的 `run_or_join` 仍可 join 已有 generation。claim 顺序是持久化的有界公平调度：最多连续 3 个 Kafka 后，若有人工任务等待则处理 1 个；不得改回纯 FIFO 或单一来源永久优先。Outbox 外部边界执行期间每 10 秒独立刷新 liveness；delivery effect keeper 每 10 秒续租、最大允许间隔 15 秒。服务 heartbeat 只证明进程存活，keeper 只证明 claim 仍受当前 fence 保护，两者都不能覆盖 error/circuit/readiness。发布 gate 仍要求 readiness observation 新鲜，长任务结束后必须完成一次完整 health refresh。
 
@@ -116,7 +116,7 @@ Activation 是唯一生产放量控制面，不允许把 legacy `submit=false` s
 7. producer receipt 就绪后一次性启动四个 RCA resident，不重启 Gateway；三个槽位各消费一次，execution 必须真实绑定 trigger/outbox/ledger 并形成完成证据。
 8. readiness 变为 ready 后 consumer 自动暂停全部 assignment。broker group offset 非负时必须等于 freeze position；missing/`-1` 只在 freeze position 等于 owner T0 时允许并回到 T0，绝不能伪造 commit。production gate 将每分区 `source/offset/broker_group_offset/freeze_position/start_offset`、三 canary、final writer barrier 和 release receipt 绑定进 production fingerprint。
 9. production gate 成功后原子发布 receipt、confirmation capsule、confirmation commit marker 三件套；只有 marker `publication_complete=true` 且精确绑定前两者才可 `confirm`。`confirm` 以 versioned exact-shape receipt 和当前 health 重算 release binding，并执行 runtime round 1 -> Kafka freeze/freshness 回读 -> runtime round 2。`confirmed` 继续冻结且关闭 claim，只允许逐事件 reconcile 当前 epoch `[start,end)` 内的 bound shadow；fence 外 offset 不落库、不提交，steady 后由同一 consumer 无重启重试。
-10. current/global shadow 清零后才转业务 `steady_active`。任何 pending inbox、claimed writer、未绑定 ledger、历史未处置 shadow、配置/PID 重启或 end-fence SHA 漂移都阻断状态转换。此时容量仍是 generation 1 bootstrap，直到 20 个/7 天样本和容量 executor 的 generation 2 CAS 独立完成。
+10. current/global shadow 清零后才转业务 `steady_active`。任何 pending inbox、claimed writer、未绑定 ledger、历史未处置 shadow、配置/PID 重启或 end-fence SHA 漂移都阻断状态转换。此时容量保持 generation 1 bootstrap；20 个/7 天样本和容量 executor 的 generation 2 CAS 均在上线后另行评估，不阻断首次业务上线。
 
 运维只使用 `scripts/pnc_rca_activation.py`。`status` 只读；所有 mutation 默认只输出脱敏 plan，必须显式 `--apply`、exact epoch/event、operator 和 reason。紧急 `abort` 先阻断新 claim；尚未执行的 current bound shadow/pending 必须逐事件执行 `defer-event`，形成 quarantined disposition 与不可变 audit。全局仍有 shadow 时 control store 拒绝创建替代 epoch；`deferred_quarantined` 必须进入人工重触发/backfill 清单，不能视为已完成分析。
 
@@ -234,13 +234,15 @@ test -x "$RCA_PYTHON"
 
 ## 7. 生产放量基线（2026-07-11 remote-read cutover）
 
-1. 首次上线保持 submit/dispatch safe-off；先完成 broker metadata/T0、24h/200-case remote-reader soak、容量 horizon、clean BOM、受治理 canary。topic 必须由 broker metadata 确认精确大小写；当前 live `.env` 是 `feishu-project-workflow-event`，不得凭曾出现的 `feishu-project-workfLow-event` 交接字符串猜测。
-2. 每单固定 `remote_read`、`allow_download=false`、`input_materialization=forbidden`；S2 只生成有 size/SHA/MCAP seal 的派生流。
-3. Worker 必须 `direct_cli + agent_backend=none`，并产出绑定 commit、入口 hash、run-id/PID/dispatch receipt 的 attestation；任何 Agent/fallback 计数非零即阻断。
-4. MCAP 转换必须按任务独立容器、显式 memory/CPU/PID/timeout、ownership cleanup；镜像必须 pin digest 后才能生产 promotion。
-5. 任务产物固定 `/mnt/tmp/<submission_key>/`，对外 CIFS `//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/<submission_key>/`；禁止写 production canonical cases root。
-6. 放量只按 `preauthorization -> safe_off -> preproduction -> preauthorized -> bounded -> production confirmation -> steady` 推进；正式人工 canary 只在 final chat subset、exact bounded slots 和同一 Gateway PID 上执行。回滚先关人工 intake 和 dispatch，再关 Kafka submit；不恢复绕过 durable outbox/control store 的旧群聊直提或 MDI 下载。
-7. SQLite 按 live 事实二选一：existing v8/v5 必须有 BOM-pinned predecessor validator 与真实恢复；greenfield 必须有 genesis/materialization journal/receipt 和受控 quarantine/tombstone 回滚。control-plane materialization 不是问题输入物化，后者始终 `forbidden`。
+1. 首次上线保持 submit/dispatch safe-off；先完成 broker metadata/T0、最近 7 天真实 Kafka 消息的无 group/无 commit 影子回放、容量 horizon、clean BOM、受治理 canary。24h/200-case remote-reader soak 在 `production_bootstrap` 及其前置阶段记录为上线后观察项，不作为首次上线硬阻塞；标准 steady-capacity 放大仍可重新要求。topic 必须由 broker metadata 确认精确大小写；当前 live `.env` 是 `feishu-project-workflow-event`，不得凭曾出现的 `feishu-project-workfLow-event` 交接字符串猜测。
+2. 最近 7 天回放只使用 `scripts/pnc_rca_kafka_recent_replay.py`：`group_id=None`、显式 `assign`、`offsets_for_times`、固定 end offset、`read_committed`、`enable_auto_commit=false`。真实 payload 只能进入自动销毁的临时 SQLite，必须走现有 workflow policy、control store、shadow trigger/outbox；`kafka_recent_replay.json` 只保留 offset、哈希和聚合计数。
+3. DNP workload 分类读取飞书问题标准 `name` 字段，固定关键字为 `规划`、`SPP`、`OOI`；中文按 NFKC/casefold 后子串匹配，ASCII 按字母数字 token 边界匹配。原始标题不得进入 census、receipt 或 manifest；ACC/LCC/AEB/FCW 继续使用 owner-approved 精确功能分类叶子。
+4. 每单固定 `remote_read`、`allow_download=false`、`input_materialization=forbidden`；S2 只生成有 size/SHA/MCAP seal 的派生流。
+5. Worker 必须 `direct_cli + agent_backend=none`，并产出绑定 commit、入口 hash、run-id/PID/dispatch receipt 的 attestation；任何 Agent/fallback 计数非零即阻断。
+6. MCAP 转换必须按任务独立容器、显式 memory/CPU/PID/timeout、ownership cleanup；镜像必须 pin digest 后才能生产 promotion。
+7. 任务产物固定 `/mnt/tmp/<submission_key>/`，对外 CIFS `//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/<submission_key>/`；禁止写 production canonical cases root。
+8. 放量只按 `preauthorization -> safe_off -> preproduction -> preauthorized -> bounded -> production confirmation -> steady` 推进；正式人工 canary 只在 final chat subset、exact bounded slots 和同一 Gateway PID 上执行。回滚先关人工 intake 和 dispatch，再关 Kafka submit；不恢复绕过 durable outbox/control store 的旧群聊直提或 MDI 下载。
+9. SQLite 按 live 事实二选一：existing v8/v5 必须有 BOM-pinned predecessor validator 与真实恢复；greenfield 必须有 genesis/materialization journal/receipt 和受控 quarantine/tombstone 回滚。control-plane materialization 不是问题输入物化，后者始终 `forbidden`。
 8. 对 delivery dispatcher candidate plist 与安装后 plist 的精确 `ProgramArguments[0]` 解释器执行 `lark-oapi==1.5.3` 话题回复 API 探针；receipt 必须绑定 plist SHA、解释器 realpath 与探针结果，不能用开发 shell、其他 venv 或 lockfile 代替。
 9. 若配置了 Feishu API poll，回滚窗口先冻结新的人工触发流量并保持 gateway 运行，等待 `~/.hermes/feishu_api_poll_state_v1.json` 中 `rollback_readiness.ready=true`、`rollback_readiness.pending_count=0`、`rollback_readiness.scan_continuation_count=0`，再关闭人工 intake 并停止 gateway；保存 sidecar 原件及 SHA-256 作为 evidence，旧 binary 可以忽略但不得删除。sidecar 缺失只有在配置和运行证据同时证明 API poll 从未启用时才允许。
 

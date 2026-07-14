@@ -170,6 +170,12 @@ RELEASE_GATE_SCHEMA_VERSION = "pnc_rca_release_gate_v1"
 T0_OFFSETS_SCHEMA_VERSION = "pnc_rca_t0_offsets_v1"
 WORKFLOW_FIXTURES_SCHEMA_VERSION = "pnc_rca_workflow_fixtures_v1"
 SHADOW_SOAK_SCHEMA_VERSION = "pnc_rca_shadow_soak_v1"
+KAFKA_RECENT_REPLAY_SCHEMA_VERSION = "pnc_rca_kafka_recent_replay_v1"
+KAFKA_RECENT_REPLAY_FILENAME = "kafka_recent_replay.json"
+KAFKA_RECENT_REPLAY_MODULE = "scripts/pnc_rca_kafka_recent_replay.py"
+KAFKA_RECENT_REPLAY_SCHEMA = (
+    "docs/pnc/schemas/pnc_rca_kafka_recent_replay_v1.schema.json"
+)
 REMOTE_READER_HEALTH_SCHEMA_VERSION = "pnc_rca_remote_reader_health_v1"
 REMOTE_READER_SOAK_SCHEMA_VERSION = "pnc_rca_remote_reader_soak_v4"
 REMOTE_READER_SOAK_CASE_SCHEMA_VERSION = "pnc_rca_remote_reader_soak_case_v1"
@@ -289,6 +295,7 @@ PRODUCTION_RELEASE_CHECK_NAMES = frozenset({
     "t0_offsets",
     "workflow_fixtures",
     "build_manifest",
+    "kafka_recent_replay",
     "store_migration",
     "remote_reader_health",
     "remote_reader_live_probe",
@@ -318,6 +325,7 @@ ACTIVATION_STAGE_RELEASE_CHECK_NAMES = frozenset({
     "t0_offsets",
     "workflow_fixtures",
     "build_manifest",
+    "kafka_recent_replay",
     "store_migration",
     "remote_reader_health",
     "remote_reader_live_probe",
@@ -684,6 +692,12 @@ BOOTSTRAP_CAPACITY_MODES = frozenset({
     "canary_bootstrap",
     "production_bootstrap",
 })
+POST_LAUNCH_OBSERVATION_MODES = frozenset({
+    "preauthorization",
+    "preproduction",
+    "canary_bootstrap",
+    "production_bootstrap",
+})
 EXPECTED_KAFKA_DEPENDENCY_VERSIONS = {
     "kafka-python": "3.0.7",
     "python-snappy": "0.7.3",
@@ -743,6 +757,7 @@ MINIMUM_CRITICAL_FILES = frozenset({
     REMOTE_READER_DOMAIN_MAPPING_SCHEMA,
     REMOTE_READER_DOMAIN_MAPPING_APPROVAL_SCHEMA,
     REMOTE_READER_WORKLOAD_EXPORT_RECEIPT_SCHEMA,
+    KAFKA_RECENT_REPLAY_SCHEMA,
     "scripts/g1q3_rca_e2e_smoke.py",
     "scripts/pnc_g1q3_governance_rca.py",
     "scripts/pnc_g1q3_truth.py",
@@ -750,6 +765,7 @@ MINIMUM_CRITICAL_FILES = frozenset({
     "scripts/pnc_completion_notice_relay.py",
     "scripts/pnc_rca_kafka_consumer.py",
     "scripts/pnc_rca_kafka_preflight.py",
+    KAFKA_RECENT_REPLAY_MODULE,
     "scripts/pnc_rca_outbox_dispatcher.py",
     "scripts/pnc_rca_contract_drift_guard.py",
     "scripts/pnc_rca_canary_collector.py",
@@ -3128,6 +3144,7 @@ def _check_remote_reader_workload_provenance(
             "source",
             "feishu",
             "taxonomy",
+            "dnp_keyword_policy",
             "statistics",
             "security",
         },
@@ -3190,7 +3207,7 @@ def _check_remote_reader_workload_provenance(
         or feishu.get("project_key") != "t03o4q"
         or feishu.get("work_item_type") != "issue"
         or feishu.get("selected_fields")
-        != ["work_item_id", "field_e776bb", "field_93aa63"]
+        != ["work_item_id", "name", "field_e776bb", "field_93aa63"]
         or feishu.get("mutation_performed") is not False
         or feishu.get("attachment_read_performed") is not False
     ):
@@ -3338,6 +3355,25 @@ def _check_remote_reader_workload_provenance(
     ):
         raise EvidenceError("remote_reader_workload_taxonomy_hash_mismatch")
 
+    dnp_keyword_policy = _remote_soak_object(
+        census.get("dnp_keyword_policy"),
+        field=f"{artifact}.census.dnp_keyword_policy",
+        keys={"field_key", "keywords", "match_mode", "sha256"},
+        blocker="remote_reader_workload_dnp_keyword_policy_invalid",
+    )
+    dnp_keyword_policy_material = {
+        "field_key": "name",
+        "keywords": ["规划", "SPP", "OOI"],
+        "match_mode": "nfkc_casefold_cjk_substring_ascii_token",
+    }
+    if (
+        {key: dnp_keyword_policy.get(key) for key in dnp_keyword_policy_material}
+        != dnp_keyword_policy_material
+        or dnp_keyword_policy.get("sha256")
+        != _remote_soak_sha256(dnp_keyword_policy_material)
+    ):
+        raise EvidenceError("remote_reader_workload_dnp_keyword_policy_invalid")
+
     statistics = _remote_soak_object(
         census.get("statistics"),
         field=f"{artifact}.census.statistics",
@@ -3357,6 +3393,7 @@ def _check_remote_reader_workload_provenance(
             "categories",
             "reader_class_counts",
             "reference_kind_counts",
+            "dnp_keyword_matches",
             "rejection_reasons",
         },
         blocker="remote_reader_workload_census_statistics_invalid",
@@ -3449,7 +3486,9 @@ def _check_remote_reader_workload_provenance(
     category_work_items = 0
     category_candidates = 0
     category_reader_totals: Counter[str] = Counter()
+    category_dnp_candidates = 0
     category_candidate_counts: dict[tuple[str, ...], int] = {}
+    category_dnp_candidate_counts: dict[tuple[str, ...], int] = {}
     for index, raw_category in enumerate(raw_categories):
         category = _remote_soak_object(
             raw_category,
@@ -3462,6 +3501,7 @@ def _check_remote_reader_workload_provenance(
                 "unique_reference_count",
                 "duplicate_reference_candidate_count",
                 "reader_class_counts",
+                "dnp_keyword_reference_candidate_count",
             },
             blocker="remote_reader_workload_census_categories_invalid",
         )
@@ -3521,18 +3561,29 @@ def _check_remote_reader_workload_provenance(
             )
             for name, count in category_readers.items()
         }
+        category_dnp_count = _exact_int(
+            category.get("dnp_keyword_reference_candidate_count"),
+            (
+                f"{artifact}.census.statistics.categories.{index}."
+                "dnp_keyword_reference_candidate_count"
+            ),
+            minimum=0,
+        )
         if (
             not set(normalized_category_readers).issubset(reader_counts)
             or category_valid > record_count
             or category_unique > category_candidate_count
             or category_candidate_count - category_unique != category_duplicate
             or sum(normalized_category_readers.values()) != category_candidate_count
+            or category_dnp_count > category_candidate_count
         ):
             raise EvidenceError("remote_reader_workload_census_categories_invalid")
         category_work_items += category_valid
         category_candidates += category_candidate_count
         category_reader_totals.update(normalized_category_readers)
+        category_dnp_candidates += category_dnp_count
         category_candidate_counts[tuple(category_path)] = category_candidate_count
+        category_dnp_candidate_counts[tuple(category_path)] = category_dnp_count
     if (
         normalized_category_paths != sorted(normalized_category_paths)
         or category_work_items != valid_work_items
@@ -3540,6 +3591,73 @@ def _check_remote_reader_workload_provenance(
         or dict(category_reader_totals) != reader_counts
     ):
         raise EvidenceError("remote_reader_workload_census_categories_invalid")
+    dnp_keyword_matches = _remote_soak_object(
+        statistics.get("dnp_keyword_matches"),
+        field=f"{artifact}.census.statistics.dnp_keyword_matches",
+        keys={
+            "record_count",
+            "valid_work_item_count",
+            "reference_candidate_count",
+            "keyword_record_counts",
+            "keyword_valid_work_item_counts",
+            "keyword_reference_candidate_counts",
+        },
+        blocker="remote_reader_workload_dnp_keyword_counts_invalid",
+    )
+    dnp_count_maps: list[dict[str, int]] = []
+    for name in (
+        "keyword_record_counts",
+        "keyword_valid_work_item_counts",
+        "keyword_reference_candidate_counts",
+    ):
+        raw_count_map = _mapping(
+            dnp_keyword_matches.get(name),
+            f"{artifact}.census.statistics.dnp_keyword_matches.{name}",
+        )
+        if set(raw_count_map) != {"规划", "SPP", "OOI"}:
+            raise EvidenceError("remote_reader_workload_dnp_keyword_counts_invalid")
+        dnp_count_maps.append(
+            {
+                keyword: _exact_int(
+                    raw_count_map.get(keyword),
+                    (
+                        f"{artifact}.census.statistics.dnp_keyword_matches."
+                        f"{name}.{keyword}"
+                    ),
+                    minimum=0,
+                )
+                for keyword in ("规划", "SPP", "OOI")
+            }
+        )
+    dnp_record_count = _exact_int(
+        dnp_keyword_matches.get("record_count"),
+        f"{artifact}.census.statistics.dnp_keyword_matches.record_count",
+        minimum=50,
+    )
+    dnp_valid_count = _exact_int(
+        dnp_keyword_matches.get("valid_work_item_count"),
+        f"{artifact}.census.statistics.dnp_keyword_matches.valid_work_item_count",
+        minimum=50,
+    )
+    dnp_candidate_count = _exact_int(
+        dnp_keyword_matches.get("reference_candidate_count"),
+        f"{artifact}.census.statistics.dnp_keyword_matches.reference_candidate_count",
+        minimum=50,
+    )
+    if (
+        dnp_valid_count > dnp_record_count
+        or dnp_candidate_count > reference_candidates
+        or category_dnp_candidates != dnp_candidate_count
+        or any(
+            any(value > union for value in count_map.values())
+            for count_map, union in zip(
+                dnp_count_maps,
+                (dnp_record_count, dnp_valid_count, dnp_candidate_count),
+                strict=True,
+            )
+        )
+    ):
+        raise EvidenceError("remote_reader_workload_dnp_keyword_counts_invalid")
     _remote_soak_count_map(
         statistics.get("rejection_reasons"),
         f"{artifact}.census.statistics.rejection_reasons",
@@ -3550,6 +3668,7 @@ def _check_remote_reader_workload_provenance(
         keys={
             "raw_issue_payload_persisted",
             "raw_pdcl_field_persisted",
+            "raw_issue_name_persisted",
             "description_or_attachment_persisted",
             "credential_or_token_persisted",
             "input_materialized",
@@ -3560,6 +3679,7 @@ def _check_remote_reader_workload_provenance(
     if security != {
         "raw_issue_payload_persisted": False,
         "raw_pdcl_field_persisted": False,
+        "raw_issue_name_persisted": False,
         "description_or_attachment_persisted": False,
         "credential_or_token_persisted": False,
         "input_materialized": False,
@@ -3626,7 +3746,7 @@ def _check_remote_reader_workload_provenance(
         option_ids = rule.get("option_ids")
         option_path = rule.get("option_path")
         if (
-            domain not in {"ACC", "LCC", "AEB", "FCW", "DNP"}
+            domain not in {"ACC", "LCC", "AEB", "FCW"}
             or not isinstance(option_ids, list)
             or not isinstance(option_path, list)
             or not option_ids
@@ -3648,7 +3768,7 @@ def _check_remote_reader_workload_provenance(
             }
         )
     if (
-        not {"ACC", "LCC", "DNP"}.issubset(mapped_domains)
+        not {"ACC", "LCC"}.issubset(mapped_domains)
         or not mapped_domains.intersection({"AEB", "FCW"})
         or normalized_rules != raw_rules
     ):
@@ -3698,6 +3818,7 @@ def _check_remote_reader_workload_provenance(
             "source",
             "census",
             "taxonomy_sha256",
+            "dnp_keyword_policy",
             "mapping",
             "selection",
             "manifest",
@@ -3710,6 +3831,7 @@ def _check_remote_reader_workload_provenance(
         != REMOTE_READER_WORKLOAD_EXPORT_RECEIPT_SCHEMA_VERSION
         or receipt.get("source") != source
         or receipt.get("taxonomy_sha256") != taxonomy_sha256
+        or receipt.get("dnp_keyword_policy") != dnp_keyword_policy
         or receipt.get("security") != security
     ):
         raise EvidenceError("remote_reader_workload_export_receipt_mismatch")
@@ -3807,7 +3929,7 @@ def _check_remote_reader_workload_provenance(
         reader_class = str(reference.get("reader_class") or "")
         if (
             quota_domain not in REMOTE_READER_SOAK_DOMAIN_QUOTAS
-            or function_domain not in mapped_domains
+            or function_domain not in mapped_domains | {"DNP"}
             or reader_class not in REMOTE_READER_SOAK_READER_QUOTAS
             or not locator
             or reader_class
@@ -3827,6 +3949,8 @@ def _check_remote_reader_workload_provenance(
         field=f"{artifact}.receipt.selection",
         keys={
             "eligible_reference_candidates",
+            "dnp_keyword_reference_candidates",
+            "dnp_keyword_selected_cases",
             "unmapped_category_counts",
             "case_count",
             "unique_work_items",
@@ -3842,9 +3966,12 @@ def _check_remote_reader_workload_provenance(
         minimum=200,
     )
     expected_eligible_candidates = sum(
-        count
+        (
+            count
+            if path in mapped_option_paths
+            else category_dnp_candidate_counts[path]
+        )
         for path, count in category_candidate_counts.items()
-        if path in mapped_option_paths
     )
     if eligible_candidates != expected_eligible_candidates:
         raise EvidenceError("remote_reader_workload_export_receipt_selection_invalid")
@@ -3874,14 +4001,30 @@ def _check_remote_reader_workload_provenance(
             {"option_path": list(option_path), "reference_count": reference_count}
         )
     expected_unmapped = [
-        {"option_path": list(path), "reference_count": count}
+        {
+            "option_path": list(path),
+            "reference_count": count - category_dnp_candidate_counts[path],
+        }
         for path, count in sorted(category_candidate_counts.items())
-        if path not in mapped_option_paths and count > 0
+        if path not in mapped_option_paths
+        and count - category_dnp_candidate_counts[path] > 0
     ]
     if normalized_unmapped != expected_unmapped:
         raise EvidenceError("remote_reader_workload_export_receipt_selection_invalid")
     if (
         _exact_int(
+            selection.get("dnp_keyword_reference_candidates"),
+            f"{artifact}.receipt.selection.dnp_keyword_reference_candidates",
+            minimum=50,
+        )
+        != dnp_candidate_count
+        or _exact_int(
+            selection.get("dnp_keyword_selected_cases"),
+            f"{artifact}.receipt.selection.dnp_keyword_selected_cases",
+            minimum=50,
+        )
+        != selected_domain_counts["DNP"]
+        or _exact_int(
             selection.get("case_count"),
             f"{artifact}.receipt.selection.case_count",
             minimum=200,
@@ -3933,6 +4076,384 @@ def _check_remote_reader_workload_provenance(
         "case_count": len(manifest_cases),
         "source_record_count": source_count,
         "unique_source_references": unique_references,
+    }
+
+
+def _check_kafka_recent_replay(
+    body: Mapping[str, Any],
+    *,
+    consumer: ConsumerConfig,
+    kafka_env_file: Path,
+    expected_partitions: Sequence[int],
+    expected_host_commit: str,
+    expected_module_sha256: str,
+    now: datetime,
+    max_age_seconds: int,
+) -> dict[str, Any]:
+    artifact = "kafka_recent_replay"
+    _require_schema(body, KAFKA_RECENT_REPLAY_SCHEMA_VERSION, artifact)
+    if set(body) != {
+        "schema_version",
+        "observed_at",
+        "source",
+        "config",
+        "window",
+        "limits",
+        "transport",
+        "result",
+    }:
+        raise EvidenceError("kafka_recent_replay_shape_invalid")
+    observed_at = _require_fresh(
+        body, now=now, max_age_seconds=max_age_seconds, artifact=artifact
+    )
+    source = _remote_soak_object(
+        body.get("source"),
+        field=f"{artifact}.source",
+        keys={
+            "component",
+            "component_commit",
+            "module",
+            "module_sha256",
+            "committed_match",
+            "module_clean",
+        },
+        blocker="kafka_recent_replay_source_invalid",
+    )
+    if (
+        source.get("component") != "pnc_rca_kafka_recent_replay"
+        or source.get("component_commit") != expected_host_commit
+        or source.get("module") != KAFKA_RECENT_REPLAY_MODULE
+        or source.get("module_sha256") != expected_module_sha256
+        or source.get("committed_match") is not True
+        or source.get("module_clean") is not True
+    ):
+        raise EvidenceError("kafka_recent_replay_source_mismatch")
+
+    config = _remote_soak_object(
+        body.get("config"),
+        field=f"{artifact}.config",
+        keys={"topic", "cluster_binding", "policy_sha256"},
+        blocker="kafka_recent_replay_config_invalid",
+    )
+    cluster_binding = _remote_soak_object(
+        config.get("cluster_binding"),
+        field=f"{artifact}.config.cluster_binding",
+        keys={
+            "bootstrap_servers_sha256",
+            "principal_sha256",
+            "env_file",
+        },
+        blocker="kafka_recent_replay_config_invalid",
+    )
+    try:
+        _env, expected_env_observation = load_kafka_preflight_environment(
+            kafka_env_file
+        )
+    except (OSError, ValueError) as exc:
+        raise EvidenceError("kafka_recent_replay_env_unavailable") from exc
+    if (
+        config.get("topic") != consumer.topic
+        or config.get("policy_sha256") != _sha256_json(consumer.policy.to_dict())
+        or cluster_binding.get("bootstrap_servers_sha256")
+        != _sha256_json(list(consumer.bootstrap_servers))
+        or cluster_binding.get("principal_sha256") != _sha256_json(consumer.username)
+        or cluster_binding.get("env_file") != expected_env_observation
+    ):
+        raise EvidenceError("kafka_recent_replay_config_mismatch")
+
+    window = _remote_soak_object(
+        body.get("window"),
+        field=f"{artifact}.window",
+        keys={
+            "days",
+            "started_at",
+            "ended_at",
+            "start_timestamp_ms",
+            "partitions",
+        },
+        blocker="kafka_recent_replay_window_invalid",
+    )
+    started_at = _timestamp(window.get("started_at"), f"{artifact}.window.started_at")
+    ended_at = _timestamp(window.get("ended_at"), f"{artifact}.window.ended_at")
+    observed = _timestamp(body.get("observed_at"), f"{artifact}.observed_at")
+    if (
+        _exact_int(window.get("days"), f"{artifact}.window.days", minimum=7) != 7
+        or ended_at != observed
+        or ended_at - started_at != timedelta(days=7)
+        or _exact_int(
+            window.get("start_timestamp_ms"),
+            f"{artifact}.window.start_timestamp_ms",
+            minimum=1,
+        )
+        != int(started_at.timestamp() * 1000)
+    ):
+        raise EvidenceError("kafka_recent_replay_window_invalid")
+    raw_partitions = window.get("partitions")
+    if not isinstance(raw_partitions, list):
+        raise EvidenceError("kafka_recent_replay_partitions_invalid")
+    expected_partition_list = sorted(int(value) for value in expected_partitions)
+    partition_records = 0
+    normalized_partitions: list[int] = []
+    for index, raw_partition in enumerate(raw_partitions):
+        partition = _remote_soak_object(
+            raw_partition,
+            field=f"{artifact}.window.partitions.{index}",
+            keys={
+                "partition",
+                "beginning_offset",
+                "window_start_offset",
+                "fixed_end_offset",
+                "records_scanned",
+            },
+            blocker="kafka_recent_replay_partitions_invalid",
+        )
+        partition_id = _exact_int(
+            partition.get("partition"),
+            f"{artifact}.window.partitions.{index}.partition",
+            minimum=0,
+        )
+        beginning = _exact_int(
+            partition.get("beginning_offset"),
+            f"{artifact}.window.partitions.{index}.beginning_offset",
+            minimum=0,
+        )
+        start = _exact_int(
+            partition.get("window_start_offset"),
+            f"{artifact}.window.partitions.{index}.window_start_offset",
+            minimum=0,
+        )
+        end = _exact_int(
+            partition.get("fixed_end_offset"),
+            f"{artifact}.window.partitions.{index}.fixed_end_offset",
+            minimum=0,
+        )
+        count = _exact_int(
+            partition.get("records_scanned"),
+            f"{artifact}.window.partitions.{index}.records_scanned",
+            minimum=0,
+        )
+        if beginning > start or start > end or count > end - start:
+            raise EvidenceError("kafka_recent_replay_partitions_invalid")
+        normalized_partitions.append(partition_id)
+        partition_records += count
+    if normalized_partitions != expected_partition_list:
+        raise EvidenceError("kafka_recent_replay_partition_coverage_mismatch")
+
+    limits = _remote_soak_object(
+        body.get("limits"),
+        field=f"{artifact}.limits",
+        keys={"max_messages", "max_bytes", "max_seconds"},
+        blocker="kafka_recent_replay_limits_invalid",
+    )
+    max_messages = _exact_int(
+        limits.get("max_messages"), f"{artifact}.limits.max_messages", minimum=1
+    )
+    max_bytes = _exact_int(
+        limits.get("max_bytes"), f"{artifact}.limits.max_bytes", minimum=1
+    )
+    max_seconds = _exact_int(
+        limits.get("max_seconds"), f"{artifact}.limits.max_seconds", minimum=1
+    )
+    if max_messages > 10_000 or max_bytes > 128 * 1024 * 1024 or max_seconds > 300:
+        raise EvidenceError("kafka_recent_replay_limits_invalid")
+    if body.get("transport") != {
+        "assignment": "explicit",
+        "group_id": None,
+        "subscribed": False,
+        "group_joined": False,
+        "enable_auto_commit": False,
+        "commit_performed": False,
+        "allow_auto_create_topics": False,
+        "isolation_level": "read_committed",
+    }:
+        raise EvidenceError("kafka_recent_replay_transport_invalid")
+
+    result = _remote_soak_object(
+        body.get("result"),
+        field=f"{artifact}.result",
+        keys={
+            "stop_reason",
+            "records_scanned",
+            "raw_bytes_scanned",
+            "decision_counts",
+            "reason_counts",
+            "records",
+            "shadow_store",
+            "production_mutation_performed",
+            "raw_payload_persisted_to_output",
+            "temporary_store_destroyed",
+        },
+        blocker="kafka_recent_replay_result_invalid",
+    )
+    records_scanned = _exact_int(
+        result.get("records_scanned"),
+        f"{artifact}.result.records_scanned",
+        minimum=1,
+    )
+    raw_bytes = _exact_int(
+        result.get("raw_bytes_scanned"),
+        f"{artifact}.result.raw_bytes_scanned",
+        minimum=1,
+    )
+    if (
+        records_scanned > max_messages
+        or raw_bytes > max_bytes
+        or records_scanned != partition_records
+        or result.get("stop_reason")
+        not in {
+            "partition_end_offsets_reached",
+            "message_limit_reached",
+            "byte_limit_reached",
+            "time_limit_reached",
+        }
+        or result.get("production_mutation_performed") is not False
+        or result.get("raw_payload_persisted_to_output") is not False
+        or result.get("temporary_store_destroyed") is not True
+    ):
+        raise EvidenceError("kafka_recent_replay_result_invalid")
+    raw_records = result.get("records")
+    if not isinstance(raw_records, list) or len(raw_records) != records_scanned:
+        raise EvidenceError("kafka_recent_replay_records_invalid")
+    decision_counts: Counter[str] = Counter()
+    reason_counts: Counter[str] = Counter()
+    coordinates: set[tuple[int, int]] = set()
+    observed_bytes = 0
+    trigger_count = 0
+    outbox_count = 0
+    for index, raw_record in enumerate(raw_records):
+        record = _remote_soak_object(
+            raw_record,
+            field=f"{artifact}.result.records.{index}",
+            keys={
+                "partition",
+                "offset",
+                "timestamp_ms",
+                "value_bytes",
+                "value_sha256",
+                "decision",
+                "reason",
+                "event_uid_sha256",
+                "business_key_sha256",
+                "submission_key_sha256",
+                "trigger_created",
+                "outbox_created",
+            },
+            blocker="kafka_recent_replay_records_invalid",
+        )
+        partition = _exact_int(
+            record.get("partition"),
+            f"{artifact}.result.records.{index}.partition",
+            minimum=0,
+        )
+        offset = _exact_int(
+            record.get("offset"),
+            f"{artifact}.result.records.{index}.offset",
+            minimum=0,
+        )
+        coordinate = (partition, offset)
+        decision = _required_text(
+            record.get("decision"), f"{artifact}.result.records.{index}.decision"
+        )
+        reason = _required_text(
+            record.get("reason"), f"{artifact}.result.records.{index}.reason"
+        )
+        value_bytes = _exact_int(
+            record.get("value_bytes"),
+            f"{artifact}.result.records.{index}.value_bytes",
+            minimum=1,
+        )
+        timestamp_ms = record.get("timestamp_ms")
+        if timestamp_ms is not None:
+            _exact_int(
+                timestamp_ms,
+                f"{artifact}.result.records.{index}.timestamp_ms",
+                minimum=0,
+            )
+        if (
+            partition not in expected_partition_list
+            or coordinate in coordinates
+            or decision not in {"accepted", "filtered", "invalid", "deduped"}
+            or not isinstance(record.get("trigger_created"), bool)
+            or not isinstance(record.get("outbox_created"), bool)
+        ):
+            raise EvidenceError("kafka_recent_replay_records_invalid")
+        _sha256_digest(
+            record.get("value_sha256"),
+            f"{artifact}.result.records.{index}.value_sha256",
+        )
+        _sha256_digest(
+            record.get("event_uid_sha256"),
+            f"{artifact}.result.records.{index}.event_uid_sha256",
+        )
+        for field in ("business_key_sha256", "submission_key_sha256"):
+            value = record.get(field)
+            if value is not None:
+                _sha256_digest(value, f"{artifact}.result.records.{index}.{field}")
+        if decision == "accepted" and (
+            record.get("business_key_sha256") is None
+            or record.get("submission_key_sha256") is None
+        ):
+            raise EvidenceError("kafka_recent_replay_records_invalid")
+        coordinates.add(coordinate)
+        decision_counts[decision] += 1
+        reason_counts[reason] += 1
+        observed_bytes += value_bytes
+        trigger_count += int(record["trigger_created"])
+        outbox_count += int(record["outbox_created"])
+    if (
+        dict(sorted(decision_counts.items())) != result.get("decision_counts")
+        or dict(sorted(reason_counts.items())) != result.get("reason_counts")
+        or observed_bytes != raw_bytes
+        or decision_counts["accepted"] < 1
+        or trigger_count < 1
+        or outbox_count < 1
+    ):
+        raise EvidenceError("kafka_recent_replay_chain_incomplete")
+    shadow_store = _remote_soak_object(
+        result.get("shadow_store"),
+        field=f"{artifact}.result.shadow_store",
+        keys={"inbox", "outbox", "replay_raw_retained"},
+        blocker="kafka_recent_replay_shadow_store_invalid",
+    )
+    raw_inbox = _mapping(
+        shadow_store.get("inbox"), f"{artifact}.result.shadow_store.inbox"
+    )
+    raw_outbox = _mapping(
+        shadow_store.get("outbox"), f"{artifact}.result.shadow_store.outbox"
+    )
+    inbox = {
+        str(name): _exact_int(
+            count,
+            f"{artifact}.result.shadow_store.inbox.{name}",
+            minimum=0,
+        )
+        for name, count in raw_inbox.items()
+    }
+    outbox = {
+        str(name): _exact_int(
+            count,
+            f"{artifact}.result.shadow_store.outbox.{name}",
+            minimum=0,
+        )
+        for name, count in raw_outbox.items()
+    }
+    if (
+        sum(inbox.values()) != records_scanned
+        or outbox.get("shadow", 0) < outbox_count
+    ):
+        raise EvidenceError("kafka_recent_replay_shadow_store_invalid")
+    return {
+        "observed_at": observed_at,
+        "window_days": 7,
+        "topic": consumer.topic,
+        "partitions": expected_partition_list,
+        "records_scanned": records_scanned,
+        "raw_bytes_scanned": raw_bytes,
+        "accepted": decision_counts["accepted"],
+        "triggers_created": trigger_count,
+        "shadow_outbox_created": outbox_count,
+        "commit_performed": False,
+        "production_mutation_performed": False,
     }
 
 
@@ -24388,6 +24909,44 @@ def evaluate_release_gate(
     else:
         warnings.append("build_manifest_missing")
 
+    if settings.mode in {
+        "preauthorization",
+        "preproduction",
+        *CANARY_MODES,
+        *PRODUCTION_MODES,
+    }:
+        try:
+            if not verified_build_detail:
+                raise EvidenceError("kafka_recent_replay_build_unverified")
+            if not broker_partitions:
+                raise EvidenceError("kafka_recent_replay_broker_unverified")
+            critical_files = _mapping(
+                verified_build_detail.get("critical_file_sha256"),
+                "kafka_recent_replay.build.critical_file_sha256",
+            )
+            recent_replay = _load_canonical_owner_only_evidence(
+                settings.evidence_dir,
+                KAFKA_RECENT_REPLAY_FILENAME,
+                artifact="kafka_recent_replay",
+                evidence_hashes=evidence_hashes,
+            )
+            detail = _check_kafka_recent_replay(
+                recent_replay,
+                consumer=consumer,
+                kafka_env_file=settings.kafka_env_file,
+                expected_partitions=broker_partitions,
+                expected_host_commit=verified_host_commit,
+                expected_module_sha256=_sha256_digest(
+                    critical_files.get(KAFKA_RECENT_REPLAY_MODULE),
+                    "kafka_recent_replay.module_sha256",
+                ),
+                now=current,
+                max_age_seconds=settings.evidence_max_age_seconds,
+            )
+            checks.pass_("kafka_recent_replay", detail)
+        except EvidenceError as exc:
+            checks.fail("kafka_recent_replay", exc.code)
+
     if settings.mode in BOOTSTRAP_CAPACITY_MODES:
         try:
             if not verified_build_detail:
@@ -24560,26 +25119,36 @@ def evaluate_release_gate(
         except EvidenceError as exc:
             checks.fail("cutover_plan", exc.code)
 
-        try:
-            soak = _load_evidence(
-                settings.evidence_dir, "shadow_soak.json", evidence_hashes
+        if settings.mode in POST_LAUNCH_OBSERVATION_MODES:
+            checks.pass_(
+                "shadow_soak",
+                {
+                    "status": "deferred_to_post_launch",
+                    "blocks_bootstrap_release": False,
+                    "required_for_steady_capacity": True,
+                },
             )
-            detail = _check_shadow_soak(
-                soak,
-                now=current,
-                max_age_seconds=settings.evidence_max_age_seconds,
-                minimum_duration_seconds=settings.shadow_soak_min_seconds,
-                minimum_storage_horizon_days=settings.min_storage_horizon_days,
-                expected_partitions=broker_partitions,
-                target_cases_per_day=settings.target_cases_per_day,
-                expected_build_manifest_sha256=evidence_hashes.get(
-                    "build_manifest.json", ""
-                ),
-                expected_config_sha256=config_sha256,
-            )
-            checks.pass_("shadow_soak", detail)
-        except EvidenceError as exc:
-            checks.fail("shadow_soak", exc.code)
+        else:
+            try:
+                soak = _load_evidence(
+                    settings.evidence_dir, "shadow_soak.json", evidence_hashes
+                )
+                detail = _check_shadow_soak(
+                    soak,
+                    now=current,
+                    max_age_seconds=settings.evidence_max_age_seconds,
+                    minimum_duration_seconds=settings.shadow_soak_min_seconds,
+                    minimum_storage_horizon_days=settings.min_storage_horizon_days,
+                    expected_partitions=broker_partitions,
+                    target_cases_per_day=settings.target_cases_per_day,
+                    expected_build_manifest_sha256=evidence_hashes.get(
+                        "build_manifest.json", ""
+                    ),
+                    expected_config_sha256=config_sha256,
+                )
+                checks.pass_("shadow_soak", detail)
+            except EvidenceError as exc:
+                checks.fail("shadow_soak", exc.code)
 
         try:
             plan = _load_evidence(
@@ -24632,39 +25201,51 @@ def evaluate_release_gate(
             workload_manifest = {}
             checks.fail("remote_reader_workload_provenance", exc.code)
 
-        try:
-            if not remote_reader_fingerprint:
-                raise EvidenceError("remote_reader_soak_health_unverified")
-            if not canary_requested_scope:
-                raise EvidenceError("remote_reader_soak_scope_unverified")
-            if not verified_vm_commit or not verified_vm_tree:
-                raise EvidenceError("remote_reader_soak_build_unverified")
-            if not remote_reader_health_detail:
-                raise EvidenceError("remote_reader_soak_health_unverified")
-            if not workload_manifest:
-                raise EvidenceError("remote_reader_soak_manifest_provenance_unverified")
-            soak = _load_evidence(
-                settings.evidence_dir, "remote_reader_soak.json", evidence_hashes
+        if settings.mode in POST_LAUNCH_OBSERVATION_MODES:
+            checks.pass_(
+                "remote_reader_soak",
+                {
+                    "status": "deferred_to_post_launch",
+                    "blocks_bootstrap_release": False,
+                    "required_for_steady_capacity": True,
+                },
             )
-            detail = _check_remote_reader_soak(
-                soak,
-                workload_manifest_body=workload_manifest,
-                expected_reader_fingerprint=remote_reader_fingerprint,
-                expected_vm_commit=verified_vm_commit,
-                expected_vm_tree=verified_vm_tree,
-                expected_remote_reader_health_sha256=_sha256_digest(
-                    evidence_hashes.get("remote_reader_health.json"),
-                    "remote_reader_soak.remote_reader_health_sha256",
-                ),
-                remote_reader_health_detail=remote_reader_health_detail,
-                dispatcher=dispatcher,
-                target_cases_per_day=settings.target_cases_per_day,
-                now=current,
-                max_age_seconds=settings.evidence_max_age_seconds,
-            )
-            checks.pass_("remote_reader_soak", detail)
-        except EvidenceError as exc:
-            checks.fail("remote_reader_soak", exc.code)
+        else:
+            try:
+                if not remote_reader_fingerprint:
+                    raise EvidenceError("remote_reader_soak_health_unverified")
+                if not canary_requested_scope:
+                    raise EvidenceError("remote_reader_soak_scope_unverified")
+                if not verified_vm_commit or not verified_vm_tree:
+                    raise EvidenceError("remote_reader_soak_build_unverified")
+                if not remote_reader_health_detail:
+                    raise EvidenceError("remote_reader_soak_health_unverified")
+                if not workload_manifest:
+                    raise EvidenceError(
+                        "remote_reader_soak_manifest_provenance_unverified"
+                    )
+                soak = _load_evidence(
+                    settings.evidence_dir, "remote_reader_soak.json", evidence_hashes
+                )
+                detail = _check_remote_reader_soak(
+                    soak,
+                    workload_manifest_body=workload_manifest,
+                    expected_reader_fingerprint=remote_reader_fingerprint,
+                    expected_vm_commit=verified_vm_commit,
+                    expected_vm_tree=verified_vm_tree,
+                    expected_remote_reader_health_sha256=_sha256_digest(
+                        evidence_hashes.get("remote_reader_health.json"),
+                        "remote_reader_soak.remote_reader_health_sha256",
+                    ),
+                    remote_reader_health_detail=remote_reader_health_detail,
+                    dispatcher=dispatcher,
+                    target_cases_per_day=settings.target_cases_per_day,
+                    now=current,
+                    max_age_seconds=settings.evidence_max_age_seconds,
+                )
+                checks.pass_("remote_reader_soak", detail)
+            except EvidenceError as exc:
+                checks.fail("remote_reader_soak", exc.code)
     elif (
         cutover_config.legacy_auto_execution_disabled is not True
         or cutover_config.legacy_daily_quota != 0

@@ -4,13 +4,14 @@
   "title": "G1Q3 RCA workload export provenance receipt",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "generated_at", "source", "census", "taxonomy_sha256", "mapping", "selection", "manifest", "security"],
+  "required": ["schema_version", "generated_at", "source", "census", "taxonomy_sha256", "dnp_keyword_policy", "mapping", "selection", "manifest", "security"],
   "properties": {
     "schema_version": {"const": "rca_issue_workload_export_receipt_v1"},
     "generated_at": {"$ref": "#/$defs/timestamp"},
     "source": {"$ref": "#/$defs/source"},
     "census": {"$ref": "#/$defs/hashPair"},
     "taxonomy_sha256": {"$ref": "#/$defs/sha256"},
+    "dnp_keyword_policy": {"$ref": "#/$defs/dnpKeywordPolicy"},
     "mapping": {"$ref": "#/$defs/mapping"},
     "selection": {"$ref": "#/$defs/selection"},
     "manifest": {"$ref": "#/$defs/manifest"},
@@ -61,6 +62,17 @@
       }
     },
     "countMap": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 1}},
+    "dnpKeywordPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field_key", "keywords", "match_mode", "sha256"],
+      "properties": {
+        "field_key": {"const": "name"},
+        "keywords": {"const": ["规划", "SPP", "OOI"]},
+        "match_mode": {"const": "nfkc_casefold_cjk_substring_ascii_token"},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
     "unmapped": {
       "type": "object",
       "additionalProperties": false,
@@ -73,9 +85,11 @@
     "selection": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["eligible_reference_candidates", "unmapped_category_counts", "case_count", "unique_work_items", "unique_references", "domain_counts", "reader_class_counts"],
+      "required": ["eligible_reference_candidates", "dnp_keyword_reference_candidates", "dnp_keyword_selected_cases", "unmapped_category_counts", "case_count", "unique_work_items", "unique_references", "domain_counts", "reader_class_counts"],
       "properties": {
         "eligible_reference_candidates": {"type": "integer", "minimum": 200},
+        "dnp_keyword_reference_candidates": {"type": "integer", "minimum": 50},
+        "dnp_keyword_selected_cases": {"const": 50},
         "unmapped_category_counts": {"type": "array", "items": {"$ref": "#/$defs/unmapped"}},
         "case_count": {"const": 200},
         "unique_work_items": {"const": 200},
@@ -98,10 +112,11 @@
     "security": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["raw_issue_payload_persisted", "raw_pdcl_field_persisted", "description_or_attachment_persisted", "credential_or_token_persisted", "input_materialized", "input_materialized_bytes"],
+      "required": ["raw_issue_payload_persisted", "raw_pdcl_field_persisted", "raw_issue_name_persisted", "description_or_attachment_persisted", "credential_or_token_persisted", "input_materialized", "input_materialized_bytes"],
       "properties": {
         "raw_issue_payload_persisted": {"const": false},
         "raw_pdcl_field_persisted": {"const": false},
+        "raw_issue_name_persisted": {"const": false},
         "description_or_attachment_persisted": {"const": false},
         "credential_or_token_persisted": {"const": false},
         "input_materialized": {"const": false},

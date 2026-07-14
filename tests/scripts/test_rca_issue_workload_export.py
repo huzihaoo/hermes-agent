@@ -68,6 +68,7 @@ def _query_body(rows: list[dict], *, count: int, session_id: str = "session-secr
                 {
                     "moql_field_list": [
                         _moql_field(exporter.WORK_ITEM_ID_FIELD, row["work_item_id"]),
+                        _moql_field(exporter.WORK_ITEM_NAME_FIELD, row["name"]),
                         _moql_field(exporter.FUNCTION_CATEGORY_FIELD, row["category"]),
                         _moql_field(exporter.PDCL_DATA_FIELD, row["pdcl"]),
                     ]
@@ -133,7 +134,6 @@ def _mapping_artifacts(taxonomy_sha256: str) -> tuple[dict, dict]:
             ("ACC", "acc", "ACC"),
             ("LCC", "lcc", "LCC"),
             ("FCW", "fcw", "FCW"),
-            ("DNP", "dnp", "DNP-owner-approved"),
         )
     ]
     rules_material = {
@@ -166,20 +166,24 @@ def _mapping_artifacts(taxonomy_sha256: str) -> tuple[dict, dict]:
 
 def test_scan_is_read_only_redacted_and_tracks_rejections(tmp_path: Path) -> None:
     secret_event = "event-secret-must-not-be-persisted"
+    secret_name = "规划 secret-title-must-not-be-persisted"
     raw_command = f"mdi download event -u {secret_event} -s ./"
     rows = [
         {
             "work_item_id": "7000000001",
+            "name": secret_name,
             "category": (("driving", "行车辅助"), ("acc", "ACC")),
             "pdcl": raw_command,
         },
         {
             "work_item_id": "7000000002",
+            "name": "ordinary issue",
             "category": (("driving", "行车辅助"), ("lcc", "LCC")),
             "pdcl": "not a supported address",
         },
         {
             "work_item_id": "7000000003",
+            "name": "OOI boundary issue",
             "category": (("driving", "行车辅助"), ("fcw", "FCW")),
             "pdcl": "mdi download clip -u clip-safe -s ./",
         },
@@ -195,6 +199,7 @@ def test_scan_is_read_only_redacted_and_tracks_rejections(tmp_path: Path) -> Non
 
     assert len(client.mql_calls) == 2
     assert all(call.startswith("SELECT ") for call in client.mql_calls)
+    assert all("`name`" in call for call in client.mql_calls)
     assert all("ORDER BY `work_item_id` ASC" in call for call in client.mql_calls)
     assert scan.census["feishu"]["mutation_performed"] is False
     assert scan.census["statistics"]["snapshot_stable"] is True
@@ -215,10 +220,12 @@ def test_scan_is_read_only_redacted_and_tracks_rejections(tmp_path: Path) -> Non
     serialized = json.dumps(scan.census, ensure_ascii=False)
     assert secret_event not in serialized
     assert raw_command not in serialized
+    assert secret_name not in serialized
     assert "session-0" not in serialized
     assert scan.census["security"] == {
         "raw_issue_payload_persisted": False,
         "raw_pdcl_field_persisted": False,
+        "raw_issue_name_persisted": False,
         "description_or_attachment_persisted": False,
         "credential_or_token_persisted": False,
         "input_materialized": False,
@@ -260,6 +267,23 @@ def test_meegle_failure_redacts_stderr() -> None:
     assert hashlib.sha256(secret.encode()).hexdigest() in exc_info.value.detail
 
 
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("规划问题", ("规划",)),
+        ("[spp] planning issue", ("SPP",)),
+        ("全角 ＯＯＩ 问题", ("OOI",)),
+        ("SPP2 is not the SPP token", ("SPP",)),
+        ("SPP2", ()),
+        ("NOSPPVALUE", ()),
+    ],
+)
+def test_dnp_keyword_matching_is_normalized_and_ascii_token_bounded(
+    name: str, expected: tuple[str, ...]
+) -> None:
+    assert exporter._matched_dnp_keywords(name) == expected
+
+
 def test_domain_mapping_requires_owner_only_taxonomy_bound_receipt(
     tmp_path: Path,
 ) -> None:
@@ -279,7 +303,7 @@ def test_domain_mapping_requires_owner_only_taxonomy_bound_receipt(
         taxonomy_sha256=taxonomy_sha256,
     )
 
-    assert mapping.rules[(('driving', 'dnp'), ('行车辅助', 'DNP-owner-approved'))] == "DNP"
+    assert set(mapping.rules.values()) == {"ACC", "LCC", "FCW"}
     assert mapping.approval["authority"] == "PDCL/data owner"
 
     mapping_path.chmod(0o644)
@@ -310,6 +334,7 @@ def _candidate(
         option_ids=("driving", option_id),
         option_path=("行车辅助", option_label),
         data_access=access,
+        matched_dnp_keywords=("规划",) if domain == "DNP" else (),
     )
 
 
@@ -324,7 +349,8 @@ def _sealed_scan() -> tuple[exporter.ScanResult, exporter.DomainMapping]:
     candidates = []
     rules = {}
     for domain_index, (domain, option_id, option_label) in enumerate(domain_specs):
-        rules[(("driving", option_id), ("行车辅助", option_label))] = domain
+        if domain != "DNP":
+            rules[(("driving", option_id), ("行车辅助", option_label))] = domain
         for within_domain in range(50):
             index = domain_index * 50 + within_domain
             candidates.append(
@@ -346,9 +372,11 @@ def _sealed_scan() -> tuple[exporter.ScanResult, exporter.DomainMapping]:
             "module_clean": True,
         },
         "statistics": {"snapshot_stable": True, "source_scan_complete": True},
+        "dnp_keyword_policy": exporter._dnp_keyword_policy(),
         "security": {
             "raw_issue_payload_persisted": False,
             "raw_pdcl_field_persisted": False,
+            "raw_issue_name_persisted": False,
             "description_or_attachment_persisted": False,
             "credential_or_token_persisted": False,
             "input_materialized": False,
@@ -390,6 +418,8 @@ def test_manifest_is_deterministic_and_accepted_by_release_gate_consumer() -> No
     assert receipt["selection"]["domain_counts"] == exporter.DOMAIN_QUOTAS
     assert receipt["selection"]["unique_work_items"] == 200
     assert receipt["selection"]["unique_references"] == 200
+    assert receipt["selection"]["dnp_keyword_reference_candidates"] == 50
+    assert receipt["selection"]["dnp_keyword_selected_cases"] == 50
     assert receipt["census"]["file_sha256"] == "f" * 64
     assert receipt["mapping"]["rules_material_sha256"] == "e" * 64
     assert receipt["manifest"]["body_sha256"] == exporter._sha256_json(manifest)
