@@ -828,6 +828,18 @@ def test_redaction_distinguishes_structural_file_names_from_secret_fields():
     assert error.value.code == "release_prepare_sensitive_key_present"
 
 
+def test_sensitive_env_values_exclude_numeric_output_token_budgets(tmp_path):
+    env_file = tmp_path / "candidate.env"
+    env_file.write_text(
+        "HERMES_DEFAULT_MAX_OUTPUT_TOKENS=16384\n"
+        "HERMES_MAX_OUTPUT_TOKENS_HARD_CAP=32768\n"
+        "HERMES_RCA_KAFKA_PASSWORD=fixture-secret\n",
+        encoding="utf-8",
+    )
+
+    assert prepare._sensitive_env_values(env_file) == ("fixture-secret",)
+
+
 def test_prepare_resume_is_byte_stable_and_no_clobber(prepared_fixture):
     first, _calls = _prepare(prepared_fixture)
     before = {

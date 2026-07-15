@@ -57,6 +57,10 @@ SENSITIVE_KEY_PATTERN = re.compile(
     r"(?:password|passwd|secret|token|credential|private[_-]?key|sasl[_-]?password)",
     re.IGNORECASE,
 )
+NON_SECRET_NUMERIC_TOKEN_ENV_KEYS = frozenset({
+    "HERMES_DEFAULT_MAX_OUTPUT_TOKENS",
+    "HERMES_MAX_OUTPUT_TOKENS_HARD_CAP",
+})
 
 PRODUCTION_ACTION_SET = (
     "promote_host_candidate",
@@ -1216,8 +1220,19 @@ def _sensitive_env_values(path: Path, *, raw: bytes | None = None) -> tuple[str,
         raise ReleasePrepareError("release_prepare_env_invalid") from exc
     result = []
     for key, value in values.items():
-        if value and len(value) >= 4 and SENSITIVE_KEY_PATTERN.search(str(key)):
-            result.append(str(value))
+        text_key = str(key)
+        text_value = str(value or "")
+        if (
+            text_key in NON_SECRET_NUMERIC_TOKEN_ENV_KEYS
+            and text_value.isdecimal()
+        ):
+            continue
+        if (
+            text_value
+            and len(text_value) >= 4
+            and SENSITIVE_KEY_PATTERN.search(text_key)
+        ):
+            result.append(text_value)
     return tuple(sorted(set(result), key=len, reverse=True))
 
 
