@@ -1640,6 +1640,7 @@ def prepare_release(
                 canonical_live_root=inputs.future_live_root,
                 runtime_verifier=runtime_verifier,
                 runtime_config_environment=runtime_config_environment,
+                vm_worker_candidate_root=inputs.vm_worker_candidate,
             ))
         except release_gate.EvidenceError as exc:
             raise ReleasePrepareError(exc.code, exc.detail) from exc
@@ -1723,6 +1724,7 @@ def prepare_release(
                 canonical_live_root=inputs.future_live_root,
                 runtime_verifier=runtime_verifier,
                 runtime_config_environment=runtime_config_environment,
+                vm_worker_candidate_root=inputs.vm_worker_candidate,
             ))
         except release_gate.EvidenceError as exc:
             raise ReleasePrepareError(exc.code, exc.detail) from exc

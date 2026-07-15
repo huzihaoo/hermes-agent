@@ -11001,11 +11001,26 @@ def test_candidate_runtime_config_override_is_check_only_and_redacted(tmp_path):
         tmp_path,
         runner=runner,
         config_environment=config_environment,
+        vm_worker_candidate_root="/mnt/tmp/release/worker-candidate",
     )
 
     assert captured[0][1]["env"] == expected_environment
     for _command, kwargs in captured[1:]:
         assert kwargs["env"] == {**expected_environment, **config_environment}
+    collector_command = next(
+        command
+        for command, _kwargs in captured[1:]
+        if Path(command[1]).name == "pnc_rca_delivery_collector.py"
+    )
+    assert collector_command[-2:] == [
+        "--check-config-worker-root",
+        "/mnt/tmp/release/worker-candidate",
+    ]
+    assert all(
+        "--check-config-worker-root" not in command
+        for command, _kwargs in captured[1:]
+        if Path(command[1]).name != "pnc_rca_delivery_collector.py"
+    )
     assert secret not in json.dumps(result)
     assert all(
         process["environment"] == expected_environment
@@ -11035,6 +11050,26 @@ def test_candidate_runtime_config_override_rejects_unsafe_keys_and_values(
         )
 
     assert error.value.code == "runtime_candidate_config_environment_invalid"
+
+
+@pytest.mark.parametrize(
+    "worker_root",
+    ["relative/worker", "/mnt/tmp/../worker", "/"],
+)
+def test_candidate_runtime_rejects_unsafe_worker_candidate_root(
+    tmp_path,
+    worker_root,
+):
+    _write_candidate_plists(tmp_path)
+
+    with pytest.raises(EvidenceError) as error:
+        check_candidate_runtime_dependencies(
+            tmp_path,
+            runner=lambda *args, **kwargs: pytest.fail("probe must not run"),
+            vm_worker_candidate_root=worker_root,
+        )
+
+    assert error.value.code == "runtime_candidate_vm_worker_root_invalid"
 
 
 def _resident_loaded_runtime_fixture(tmp_path: Path, service_label: str):

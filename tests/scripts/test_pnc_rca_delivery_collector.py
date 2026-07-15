@@ -290,6 +290,61 @@ def test_remote_parser_probe_runs_only_the_hash_pinned_canonical_checker(
     assert "run_py_json" not in captured["input"]
 
 
+def test_remote_parser_probe_can_verify_bound_worker_candidate(monkeypatch):
+    expected = collector_module.expected_remote_css_runtime_dependency()
+    worker_root = "/mnt/tmp/release/worker-candidate"
+    requirements_path = f"{worker_root}/requirements-rca-delivery.txt"
+    payload = {
+        "schema_version": expected["schema_version"],
+        "ok": True,
+        "mutates_state": False,
+        "python": {
+            "expected_executable": expected["python_executable"],
+            "actual_executable": expected["python_executable"],
+            "same_file": True,
+        },
+        "requirements": {
+            "path": requirements_path,
+            "sha256": expected["requirements_sha256"],
+            "pins": {
+                "tinycss2": expected["version"],
+                "webencodings": expected["webencodings_version"],
+            },
+        },
+        "runtime_versions": {
+            "tinycss2": expected["version"],
+            "webencodings": expected["webencodings_version"],
+        },
+        "semantic_checks": {
+            "escaped_url_tokenized": True,
+            "numeric_values_tokenized": True,
+            "webencodings_utf8_lookup": True,
+        },
+        "errors": [],
+    }
+    captured = {}
+
+    def run(command, **kwargs):
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(payload),
+            stderr="",
+        )
+
+    monkeypatch.setattr(collector_module.subprocess, "run", run)
+
+    assert collector_module.probe_remote_css_parser(
+        "/safe/ssh-mini-agent",
+        worker_root=worker_root,
+    ) == expected
+    assert f"{worker_root}/check_rca_delivery_runtime.py" in captured["input"]
+    assert requirements_path in captured["input"]
+    assert expected["checker_sha256"] in captured["input"]
+    assert expected["requirements_sha256"] in captured["input"]
+
+
 def test_completed_service_task_is_watched_by_stable_non_timestamp_id(tmp_path):
     _control(tmp_path)
     seen = []

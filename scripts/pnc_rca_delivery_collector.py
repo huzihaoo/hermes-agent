@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import signal
 import socket
 import sqlite3
@@ -481,13 +481,30 @@ def probe_remote_css_parser(
     ssh_mini_agent: str,
     *,
     timeout_seconds: int = 15,
+    worker_root: str | None = None,
 ) -> dict[str, str]:
     """Run the hash-pinned, read-only VM parser runtime checker."""
+    selected_root = PurePosixPath(
+        worker_root or str(PurePosixPath(REMOTE_CSS_RUNTIME_CHECKER_PATH).parent)
+    )
+    if (
+        not selected_root.is_absolute()
+        or ".." in selected_root.parts
+        or selected_root == PurePosixPath("/")
+    ):
+        raise ArtifactBundleReadError(
+            "html_css_parser_probe_root_invalid",
+            permanent=True,
+        )
+    checker_path = str(selected_root / PurePosixPath(REMOTE_CSS_RUNTIME_CHECKER_PATH).name)
+    requirements_path = str(
+        selected_root / PurePosixPath(REMOTE_CSS_RUNTIME_REQUIREMENTS_PATH).name
+    )
     probe = textwrap.dedent(
         f"""
         set -euo pipefail
-        checker={REMOTE_CSS_RUNTIME_CHECKER_PATH!r}
-        requirements={REMOTE_CSS_RUNTIME_REQUIREMENTS_PATH!r}
+        checker={checker_path!r}
+        requirements={requirements_path!r}
         test -f "$checker" && test ! -L "$checker"
         test -f "$requirements" && test ! -L "$requirements"
         test "$(/usr/bin/sha256sum "$checker" | /usr/bin/awk '{{print $1}}')" = {REMOTE_CSS_RUNTIME_CHECKER_SHA256!r}
@@ -549,7 +566,7 @@ def probe_remote_css_parser(
         }
         and requirements
         == {
-            "path": REMOTE_CSS_RUNTIME_REQUIREMENTS_PATH,
+            "path": requirements_path,
             "sha256": REMOTE_CSS_RUNTIME_REQUIREMENTS_SHA256,
             "pins": expected_versions,
         }
@@ -2236,6 +2253,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--health", action="store_true")
     parser.add_argument("--health-max-age-seconds", type=int)
+    parser.add_argument("--check-config-worker-root")
     return parser
 
 
@@ -2262,6 +2280,7 @@ def main(argv: list[str] | None = None) -> int:
             remote_css_parser = probe_remote_css_parser(
                 config.ssh_mini_agent,
                 timeout_seconds=min(config.artifact_read_timeout_seconds, 15),
+                worker_root=args.check_config_worker_root,
             )
         except ArtifactBundleReadError as exc:
             print(

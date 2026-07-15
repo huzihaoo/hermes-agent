@@ -1129,6 +1129,10 @@ def test_default_runtime_path_uses_future_projector_twice(
             "HERMES_RCA_KAFKA_PASSWORD": "super-secret-value",
             "HERMES_RCA_KAFKA_TOPIC": "feishu-project-workfLow-event",
         }
+        assert (
+            kwargs["vm_worker_candidate_root"]
+            == prepared_fixture.inputs.vm_worker_candidate
+        )
         return prepared_fixture.runtime
 
     monkeypatch.setattr(release_gate, "project_future_candidate_runtime", projector)

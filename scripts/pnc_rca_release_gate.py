@@ -15144,6 +15144,7 @@ def check_candidate_runtime_dependencies(
     runner: Any = subprocess.run,
     loaded_runtime_verifier: Any = _verify_resident_loaded_runtime_projection,
     config_environment: Mapping[str, str] | None = None,
+    vm_worker_candidate_root: str | None = None,
 ) -> dict[str, Any]:
     """Probe all interpreters, scripts, and clean launchd candidate environments."""
     root = repo_root.expanduser().resolve()
@@ -15170,6 +15171,16 @@ def check_candidate_runtime_dependencies(
         ):
             raise EvidenceError("runtime_candidate_config_environment_invalid")
         runtime_config_environment[key] = value
+    normalized_worker_root: str | None = None
+    if vm_worker_candidate_root is not None:
+        worker_root = PurePosixPath(str(vm_worker_candidate_root))
+        if (
+            not worker_root.is_absolute()
+            or ".." in worker_root.parts
+            or worker_root == PurePosixPath("/")
+        ):
+            raise EvidenceError("runtime_candidate_vm_worker_root_invalid")
+        normalized_worker_root = str(worker_root)
     for filename, (expected_label, expected_script_name) in CANDIDATE_SERVICES.items():
         plist_path = repo_root / filename
         try:
@@ -15477,8 +15488,16 @@ raise SystemExit(0 if payload["ok"] else 2)
     launchd_config: dict[str, Any] = {}
     for label, candidate in candidates.items():
         try:
+            check_arguments = [*candidate["arguments"], "--check-config"]
+            if (
+                label == "local.pnc.rca-delivery-collector"
+                and normalized_worker_root is not None
+            ):
+                check_arguments.extend(
+                    ["--check-config-worker-root", normalized_worker_root]
+                )
             checked = runner(
-                [*candidate["arguments"], "--check-config"],
+                check_arguments,
                 cwd=str(candidate["working_directory"]),
                 env={
                     **candidate["environment"],
@@ -16035,6 +16054,7 @@ def project_future_candidate_runtime(
     runtime_verifier: Callable[[Path], Mapping[str, Any]] | None = None,
     gateway_runtime_verifier: Callable[..., Mapping[str, Any]] | None = None,
     runtime_config_environment: Mapping[str, str] | None = None,
+    vm_worker_candidate_root: str | None = None,
 ) -> dict[str, Any]:
     """Verify a staged runtime and project only exact root-relative paths live."""
     source_root = host_candidate.expanduser().resolve()
@@ -16145,6 +16165,7 @@ def project_future_candidate_runtime(
             stage_root,
             runner=runner,
             config_environment=runtime_config_environment,
+            vm_worker_candidate_root=vm_worker_candidate_root,
         )
     else:
         runtime_detail = dict(runtime_verifier(stage_root))
