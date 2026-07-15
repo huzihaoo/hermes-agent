@@ -49,6 +49,8 @@ def _config(tmp_path: Path):
 
 def _value(work_item_id: int) -> bytes:
     return json.dumps({
+        "created_at": int(NOW.timestamp() * 1000),
+        "fields": [],
         "id": work_item_id,
         "name": f"private title {work_item_id}",
         "nodes": [
@@ -65,6 +67,7 @@ def _value(work_item_id: int) -> bytes:
         "status_change_type": "Reached",
         "template_type": "issue",
         "updated_at": int(NOW.timestamp() * 1000),
+        "work_item_status": {},
         "work_item_type_key": "problem-type",
     }).encode()
 
@@ -315,6 +318,11 @@ def test_policy_observation_discovers_real_values_without_approving_them(
         "project_simple_name": [{"value": "g1q3", "count": 1}],
         "work_item_type_key": [{"value": "problem-type", "count": 1}],
         "status_change_type": [{"value": "Reached", "count": 1}],
+    }
+    assert observed_policy["invariants"] == {
+        "created_at_equals_updated_at": 1,
+        "fields_array": 1,
+        "work_item_status_object": 1,
     }
     assert observed_policy["transitions"] == [
         {

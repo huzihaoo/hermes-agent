@@ -343,6 +343,7 @@ class _PolicyObservation:
         self.expected_control_fields: dict[str, Counter[str]] = {
             name: Counter() for name in EXPECTED_CONTROL_FIELDS
         }
+        self.expected_invariants: Counter[str] = Counter()
         self.expected_schema: dict[str, Counter[str]] = {}
         self.transitions: Counter[tuple[str, str, str]] = Counter()
         self.expected_transitions: Counter[tuple[str, str, str]] = Counter()
@@ -421,6 +422,30 @@ class _PolicyObservation:
                 self.expected_schema.setdefault(field, Counter())[
                     self._type_name(value)
                 ] += 1
+            created_at = payload.get("created_at")
+            updated_at = payload.get("updated_at")
+            if (
+                not isinstance(created_at, bool)
+                and isinstance(created_at, int)
+                and not isinstance(updated_at, bool)
+                and isinstance(updated_at, int)
+            ):
+                if created_at == updated_at:
+                    self.expected_invariants["created_at_equals_updated_at"] += 1
+                elif created_at < updated_at:
+                    self.expected_invariants["created_at_before_updated_at"] += 1
+                else:
+                    self.expected_invariants["created_at_after_updated_at"] += 1
+            else:
+                self.expected_invariants["created_or_updated_at_invalid"] += 1
+            if isinstance(payload.get("fields"), list):
+                self.expected_invariants["fields_array"] += 1
+            else:
+                self.expected_invariants["fields_not_array"] += 1
+            if isinstance(payload.get("work_item_status"), dict):
+                self.expected_invariants["work_item_status_object"] += 1
+            else:
+                self.expected_invariants["work_item_status_not_object"] += 1
 
         for name, counter in self.fields.items():
             value = self._identity(payload, name)
@@ -533,6 +558,7 @@ class _PolicyObservation:
                         self.expected_control_fields
                     ),
                     "fields": self._fields_receipt(self.expected_fields),
+                    "invariants": dict(sorted(self.expected_invariants.items())),
                     "schema": [
                         {
                             "field": field,
