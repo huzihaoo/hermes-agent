@@ -29,7 +29,7 @@ def _env(tmp_path):
     return {
         "HERMES_RCA_KAFKA_BOOTSTRAP_SERVERS": "broker-1:9092,broker-2:9092",
         "HERMES_RCA_KAFKA_TOPIC": TOPIC,
-        "HERMES_RCA_KAFKA_USER": "root_cause_analysis_agent",
+        "HERMES_RCA_KAFKA_USER": "rca_release_agent",
         "HERMES_RCA_KAFKA_PASSWORD": "top-secret-password",
         "HERMES_RCA_KAFKA_GROUP": "root_cause_analysis_agent",
         "HERMES_RCA_KAFKA_API_VERSION": "3.9.0",
@@ -499,7 +499,10 @@ def test_consumer_env_loader_preserves_literal_expansion_syntax(tmp_path, monkey
 @pytest.mark.parametrize(
     ("name", "value", "message"),
     [
-        ("HERMES_RCA_KAFKA_USER", "legacy", "must be exactly"),
+        ("HERMES_RCA_KAFKA_USER", "legacy", "must start with rca_"),
+        ("HERMES_RCA_KAFKA_USER", "rca_", "must start with rca_"),
+        ("HERMES_RCA_KAFKA_USER", "rca_invalid principal", "must start with rca_"),
+        ("HERMES_RCA_KAFKA_USER", "rca_" + "x" * 125, "must start with rca_"),
         ("HERMES_RCA_KAFKA_GROUP", "legacy", "must be exactly"),
         ("HERMES_RCA_KAFKA_CLIENT_ID", "legacy", "must be exactly"),
         ("HERMES_RCA_KAFKA_API_VERSION", "3.8.0", "must be exactly 3.9.0"),

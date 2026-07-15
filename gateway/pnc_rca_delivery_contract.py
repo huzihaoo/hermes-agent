@@ -45,6 +45,8 @@ MAX_DELIVERY_ARTIFACT_TOTAL_BYTES = 512 * 1024 * 1024
 MAX_DELIVERY_INDEX_HTML_BYTES = 32 * 1024 * 1024
 MAX_FEISHU_COMMENT_BYTES = 8 * 1024
 MAX_CONCLUSION_BYTES = 2 * 1024
+RCA_RESULT_FIELD_KEY = "field_9193cb"
+RCA_REPORT_FIELD_KEY = "field_8c912e"
 _HTML_REPORT_STATUSES = frozenset(
     {"html_delivery_ready", "report_generated_need_review", "report_ready"}
 )
@@ -179,6 +181,7 @@ _BASE_EFFECT_SEMANTIC_FIELDS = (
     "report_status",
     "requires_human_review",
     "conclusion",
+    "field_updates",
 )
 _THREAD_EFFECT_SEMANTIC_FIELDS = (
     "platform",
@@ -1386,6 +1389,11 @@ def verify_delivery_bundle(
         str(summary.get("short_conclusion") or summary.get("l0") or "").strip(),
         MAX_CONCLUSION_BYTES,
     )
+    if not conclusion:
+        raise DeliveryContractError(
+            "delivery_conclusion_missing",
+            "a non-empty RCA conclusion is required for the result field",
+        )
     semantic_payload = {
         "schema_version": DELIVERY_EFFECT_SCHEMA_VERSION,
         "delivery_id": delivery_id,
@@ -1400,6 +1408,16 @@ def verify_delivery_bundle(
         "report_status": report_status,
         "requires_human_review": True,
         "conclusion": conclusion,
+        "field_updates": [
+            {
+                "field_key": RCA_RESULT_FIELD_KEY,
+                "field_value": conclusion,
+            },
+            {
+                "field_key": RCA_REPORT_FIELD_KEY,
+                "field_value": report_url,
+            },
+        ],
     }
     semantic_payload_sha256 = compute_delivery_effect_payload_sha256(
         semantic_payload, DELIVERY_EFFECT_KIND

@@ -56,6 +56,7 @@ SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 NONCE_PATTERN = re.compile(r"[A-Za-z0-9_-]{16,128}\Z")
 CHAT_ID_PATTERN = re.compile(r"oc_[A-Za-z0-9_-]{1,255}\Z")
 USER_ID_PATTERN = re.compile(r"ou_[A-Za-z0-9_-]{1,255}\Z")
+KAFKA_PRINCIPAL_PATTERN = re.compile(r"rca_[A-Za-z0-9_.-]{1,124}\Z")
 SAFE_LITERAL_PATTERN = re.compile(r"[^\x00\r\n\t #]+\Z")
 
 CANONICAL_LIVE_ENV = Path.home() / ".hermes" / ".env"
@@ -86,6 +87,7 @@ ALLOWED_MANUAL_CHAT_IDS = frozenset(
 PASSTHROUGH_REQUIRED_KEYS = frozenset(
     {
         "HERMES_RCA_KAFKA_BOOTSTRAP_SERVERS",
+        "HERMES_RCA_KAFKA_USER",
         "HERMES_RCA_KAFKA_EXPECTED_CLUSTER_ID",
         "HERMES_RCA_KAFKA_PASSWORD",
         "HERMES_RCA_KAFKA_MIN_REPLICATION_FACTOR",
@@ -108,7 +110,6 @@ PASSTHROUGH_REQUIRED_KEYS = frozenset(
 )
 
 FIXED_PRODUCTION_VALUES = {
-    "HERMES_RCA_KAFKA_USER": FIXED_SERVICE_ID,
     "HERMES_RCA_KAFKA_GROUP": FIXED_SERVICE_ID,
     "HERMES_RCA_KAFKA_CLIENT_ID": FIXED_SERVICE_ID,
     "HERMES_RCA_KAFKA_API_VERSION": "3.9.0",
@@ -712,6 +713,9 @@ def _desired_values(
         raise ProductionEnvStageError("production_env_expected_topic_invalid")
     if _required_value(values, "HERMES_RCA_KAFKA_TOPIC") != expected_topic:
         raise ProductionEnvStageError("production_env_topic_mismatch")
+    kafka_principal = _required_value(values, "HERMES_RCA_KAFKA_USER")
+    if KAFKA_PRINCIPAL_PATTERN.fullmatch(kafka_principal) is None:
+        raise ProductionEnvStageError("production_env_kafka_principal_invalid")
 
     chat_ids = _normalized_csv(
         _required_value(values, "HERMES_RCA_MANUAL_CHAT_IDS"),
@@ -749,6 +753,7 @@ def _desired_values(
     desired["HERMES_RCA_PROD_RELEASE_ID"] = release_id
     desired["HERMES_RCA_PROD_BOOTSTRAP_EPOCH_ID"] = bootstrap_epoch_id
     desired["HERMES_RCA_KAFKA_TOPIC"] = expected_topic
+    desired["HERMES_RCA_KAFKA_USER"] = kafka_principal
     desired["HERMES_RCA_MANUAL_CHAT_IDS"] = ",".join(chat_ids)
     desired["HERMES_RCA_MANUAL_OPERATOR_ENABLED"] = (
         "true" if operator_enabled else "false"

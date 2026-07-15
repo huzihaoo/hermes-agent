@@ -1122,7 +1122,7 @@ def _consumer_env(tmp_path: Path, mode: str) -> dict[str, str]:
         "HERMES_RCA_KAFKA_BOOTSTRAP_SERVERS": "broker-1:9092,broker-2:9092",
         "HERMES_RCA_KAFKA_TOPIC": TOPIC,
         "HERMES_RCA_KAFKA_EXPECTED_CLUSTER_ID": "cluster-production-1",
-        "HERMES_RCA_KAFKA_USER": "root_cause_analysis_agent",
+        "HERMES_RCA_KAFKA_USER": "rca_release_agent",
         "HERMES_RCA_KAFKA_PASSWORD": SECRET,
         "HERMES_RCA_KAFKA_GROUP": "root_cause_analysis_agent",
         "HERMES_RCA_KAFKA_CLIENT_ID": "root_cause_analysis_agent",
@@ -3470,6 +3470,58 @@ def _write_kafka_recent_replay_evidence(
     screenshot_path.write_bytes(b"fixture screenshot evidence")
     screenshot_path.chmod(0o644)
     screenshot_sha256 = hashlib.sha256(screenshot_path.read_bytes()).hexdigest()
+    frame_census_path = evidence_dir / "kafka-e2e-frame-census.json"
+    _write_remote_soak_manifest(
+        frame_census_path,
+        {
+            "schema_version": (
+                release_gate_module.KAFKA_FEISHU_FRAME_CENSUS_SCHEMA_VERSION
+            ),
+            "generated_at": OBSERVED_AT,
+            "task_id": e2e_task_id,
+            "source": {
+                "kind": "official_meegle_read_only",
+                "project_key": "t03o4q",
+                "work_item_type_key": "issue",
+                "selected_field_keys": [
+                    "field_1fda45",
+                    "field_9193cb",
+                    "field_8c912e",
+                ],
+            },
+            "summary": {
+                "expected_work_items": len(e2e_work_item_ids),
+                "observed_work_items": len(e2e_work_item_ids),
+                "fetch_status_counts": {"ok": len(e2e_work_item_ids)},
+                "frame_reference_kind_counts": {
+                    "front_camera_timestamp": len(e2e_work_item_ids)
+                },
+                "result_field_nonempty_count": 0,
+                "report_field_nonempty_count": 0,
+            },
+            "records": [
+                {
+                    "work_item_id": work_item_id,
+                    "fetch_status": "ok",
+                    "frame_field_present": True,
+                    "result_field_present": False,
+                    "report_field_present": False,
+                    "frame_value_sha256": hashlib.sha256(
+                        f"frame:{work_item_id}".encode()
+                    ).hexdigest(),
+                    "frame_reference_kind": "front_camera_timestamp",
+                    "management_timestamp": 1_783_841_476_000_000,
+                    "management_timestamp_unit": "microseconds_since_unix_epoch",
+                    "timezone": "Asia/Shanghai",
+                    "max_delta_us": 100_000,
+                }
+                for work_item_id in e2e_work_item_ids
+            ],
+            "contains_raw_field_values": False,
+            "contains_credentials": False,
+            "mutation_performed": False,
+        },
+    )
     feishu_receipt_path = evidence_dir / "kafka-e2e-feishu-receipt.json"
     _write_remote_soak_manifest(
         feishu_receipt_path,
@@ -3500,6 +3552,12 @@ def _write_kafka_recent_replay_evidence(
                 "work_items_found": len(e2e_work_item_ids),
                 "pdcl_field_present": len(e2e_work_item_ids),
                 "function_field_present": len(e2e_work_item_ids),
+                "frame_field_present": len(e2e_work_item_ids),
+                "frame_reference_parseable": len(e2e_work_item_ids),
+                "frame_census_path": str(frame_census_path),
+                "frame_census_sha256": hashlib.sha256(
+                    frame_census_path.read_bytes()
+                ).hexdigest(),
                 "creation_records_found": len(e2e_work_item_ids),
                 "all_exactly_one_creation_record": True,
                 "all_identity_fields_match": True,
@@ -3515,6 +3573,7 @@ def _write_kafka_recent_replay_evidence(
             "privacy": {
                 "credential_persisted": False,
                 "person_identity_persisted": False,
+                "raw_frame_reference_persisted": False,
                 "raw_pdcl_reference_persisted": False,
                 "raw_title_persisted": False,
             },
@@ -4708,7 +4767,10 @@ def _write_production_evidence(
                 "effect_key": EFFECT_KEY,
                 "target_key": "feishu-issue-7041712812",
                 "marker": (f"[RCA_DELIVERY:{EFFECT_KEY}:{ARTIFACT_SET_ID[-12:]}]"),
-                "remote_receipt": {"remote_id": "feishu-comment-1"},
+                "remote_receipt": {
+                    "remote_id": "feishu-comment-1",
+                    "confirmed_field_keys": ["field_9193cb", "field_8c912e"],
+                },
             },
             "delivery_obligations": [
                 {
@@ -6962,6 +7024,34 @@ def test_release_gate_rehashes_real_kafka_e2e_source_artifacts(
     assert report["ok"] is False
     assert by_name["kafka_recent_replay"]["code"] == (
         "kafka_recent_replay_e2e_source_invalid"
+    )
+
+
+def test_release_gate_rehashes_real_feishu_frame_census(tmp_path):
+    consumer, dispatcher, settings = _gate(tmp_path, "preauthorization")
+    replay_path = settings.evidence_dir / release_gate_module.KAFKA_RECENT_REPLAY_FILENAME
+    replay_receipt = json.loads(replay_path.read_text(encoding="utf-8"))
+    manifest_path = Path(
+        replay_receipt["result"]["e2e_canary"]["manifest"]["path"]
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    feishu_receipt_path = Path(manifest["source"]["feishu_receipt_path"])
+    feishu_receipt = json.loads(feishu_receipt_path.read_text(encoding="utf-8"))
+    frame_census_path = Path(feishu_receipt["result"]["frame_census_path"])
+    frame_census_path.write_bytes(frame_census_path.read_bytes() + b"tampered")
+
+    report = evaluate_release_gate(
+        consumer=consumer,
+        dispatcher=dispatcher,
+        settings=settings,
+        cutover=_cutover("preauthorization"),
+        now=NOW,
+    )
+
+    by_name = {item["name"]: item for item in report["checks"]}
+    assert report["ok"] is False
+    assert by_name["kafka_recent_replay"]["code"] == (
+        "kafka_recent_replay_e2e_frame_census_invalid"
     )
 
 
@@ -11861,6 +11951,7 @@ def test_candidate_delivery_health_rejects_shared_runtime_module_hash_drift(
     "relative",
     [
         "gateway/pnc_issue_context.py",
+        "gateway/pnc_rca_frame_reference.py",
         "gateway/pnc_issue_capture.py",
         "gateway/feishu_task_card.py",
         "gateway/pnc_rca_stage_lineage.py",
@@ -11880,6 +11971,15 @@ def test_resident_runtime_identity_closes_over_live_business_dependencies(
     (tmp_path / relative).write_text("# drifted live dependency\n", encoding="utf-8")
 
     assert release_gate_module.rca_runtime_files_sha256(tmp_path) != baseline
+
+
+def test_frame_reference_is_closed_over_gateway_and_release_bom():
+    relative = "gateway/pnc_rca_frame_reference.py"
+
+    assert relative in release_gate_module.GATEWAY_RCA_RUNTIME_RELATIVE_FILES
+    assert relative in release_gate_module._required_critical_files(
+        release_gate_module.REPO_ROOT
+    )
 
 
 def test_runtime_snapshot_rejects_parent_directory_symlink(tmp_path):
@@ -13011,6 +13111,10 @@ def test_shadow_does_not_invoke_build_provenance_verifier(tmp_path):
     [
         (
             lambda config: replace(config, username="another-service"),
+            "consumer_identity_mismatch",
+        ),
+        (
+            lambda config: replace(config, username="rca_invalid principal"),
             "consumer_identity_mismatch",
         ),
         (
@@ -15592,6 +15696,12 @@ def test_production_queue_limits_require_scheduler_capacity_evidence(
         (
             lambda receipt: receipt["delivery"].update(remote_receipt={}),
             "canary_receipt_delivery_remote_receipt_shape_invalid",
+        ),
+        (
+            lambda receipt: receipt["delivery"]["remote_receipt"].update(
+                confirmed_field_keys=["field_9193cb"]
+            ),
+            "canary_receipt_delivery_result_fields_unconfirmed",
         ),
     ],
 )

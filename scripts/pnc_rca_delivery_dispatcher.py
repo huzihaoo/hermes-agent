@@ -37,6 +37,8 @@ from gateway.pnc_rca_delivery_contract import (
     DeliveryContractError,
     MAX_DELIVERY_ARTIFACT_BYTES,
     MAX_DELIVERY_INDEX_HTML_BYTES,
+    RCA_REPORT_FIELD_KEY,
+    RCA_RESULT_FIELD_KEY,
     build_report_artifact_url,
     build_terminal_delivery,
     build_terminal_thread_reply_effect,
@@ -104,6 +106,10 @@ _CIRCUIT_CODES = frozenset({
 
 ListComments = Callable[[str, str], Mapping[str, Any]]
 AddComment = Callable[[str, str, str], Mapping[str, Any]]
+GetFields = Callable[[str, str, tuple[str, ...]], Mapping[str, Any]]
+UpdateFields = Callable[
+    [str, str, tuple[tuple[str, str], ...]], Mapping[str, Any]
+]
 ListThreadReplies = Callable[[str, str], Mapping[str, Any]]
 AddThreadReply = Callable[[str, str, str, str], Mapping[str, Any]]
 ReportVerifier = Callable[[str, int, str], Mapping[str, Any]]
@@ -497,6 +503,7 @@ class ValidatedEffect:
     marker: str
     content: str
     artifacts: tuple[tuple[str, str, int, str], ...]
+    field_updates: tuple[tuple[str, str], ...] = ()
     chat_id: str = ""
     thread_id: str = ""
     idempotency_uuid: str = ""
@@ -744,6 +751,20 @@ def _json_stdout(value: str) -> Any:
         return {}
 
 
+def _field_value_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, Mapping):
+        for key in ("link", "url", "href", "text", "value"):
+            if key in value:
+                normalized = _field_value_text(value[key])
+                if normalized:
+                    return normalized
+    return ""
+
+
 def _unwrap_data(value: Any) -> Any:
     current = value
     for _ in range(4):
@@ -905,7 +926,7 @@ def _error_payload(rc: int, stdout: str, stderr: str) -> dict[str, Any]:
 
 
 class MeegleIssueCommentAdapter:
-    """Capability-minimal adapter: only comment list and comment add exist."""
+    """Bounded Meegle adapter for RCA fields and issue comments."""
 
     def __init__(
         self, runner: Callable[[list[str]], tuple[int, str, str]] | None = None
@@ -997,6 +1018,110 @@ class MeegleIssueCommentAdapter:
             "error_code": "meegle_comment_pagination_incomplete",
             "error": "comment history exceeds the bounded page reconciliation limit",
         }
+
+    def get_fields(
+        self,
+        project_key: str,
+        work_item_id: str,
+        field_keys: tuple[str, ...],
+    ) -> Mapping[str, Any]:
+        if set(field_keys) != {RCA_RESULT_FIELD_KEY, RCA_REPORT_FIELD_KEY}:
+            return {
+                "success": False,
+                "permanent": True,
+                "error_code": "feishu_field_allowlist_invalid",
+            }
+        args = [
+            "workitem",
+            "get",
+            "--project-key",
+            str(project_key),
+            "--work-item-id",
+            str(work_item_id),
+        ]
+        for field_key in field_keys:
+            args.extend(["--fields", field_key])
+        args.extend(["--format", "json"])
+        rc, out, err = self.runner(args)
+        if rc != 0:
+            return _error_payload(rc, out, err)
+        payload = _json_stdout(out)
+        if isinstance(payload, Mapping) and isinstance(payload.get("data"), Mapping):
+            payload = payload["data"]
+        if not isinstance(payload, Mapping):
+            return {
+                "success": False,
+                "error_code": "meegle_response_invalid",
+                "error": "work item field read must return an object",
+            }
+        rows = payload.get("work_item_fields")
+        if rows is None:
+            rows = payload.get("fields")
+        normalized: dict[str, str] = {}
+        if isinstance(rows, Mapping):
+            for key in field_keys:
+                if key in rows:
+                    normalized[key] = _field_value_text(rows[key])
+        elif isinstance(rows, list):
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    return {
+                        "success": False,
+                        "error_code": "meegle_response_invalid",
+                        "error": "work item fields must contain objects",
+                    }
+                key = str(row.get("key") or "").strip()
+                if key in field_keys:
+                    normalized[key] = _field_value_text(row.get("value"))
+        else:
+            return {
+                "success": False,
+                "error_code": "meegle_response_invalid",
+                "error": "work item field read is missing fields",
+            }
+        return {"success": True, "fields": normalized}
+
+    def update_fields(
+        self,
+        project_key: str,
+        work_item_id: str,
+        field_updates: tuple[tuple[str, str], ...],
+    ) -> Mapping[str, Any]:
+        if (
+            tuple(key for key, _value in field_updates)
+            != (RCA_RESULT_FIELD_KEY, RCA_REPORT_FIELD_KEY)
+        ):
+            return {
+                "success": False,
+                "permanent": True,
+                "error_code": "feishu_field_allowlist_invalid",
+            }
+        fields = [
+            {"field_key": key, "field_value": value}
+            for key, value in field_updates
+        ]
+        rc, out, err = self.runner([
+            "workitem",
+            "update",
+            "--project-key",
+            str(project_key),
+            "--work-item-id",
+            str(work_item_id),
+            "--params",
+            json.dumps({"fields": fields}, ensure_ascii=False, sort_keys=True),
+            "--format",
+            "json",
+        ])
+        if rc != 0:
+            return _error_payload(rc, out, err)
+        payload = _json_stdout(out)
+        if payload is None:
+            return {
+                "success": False,
+                "outcome_uncertain": True,
+                "error_code": "meegle_response_invalid",
+            }
+        return {"success": True}
 
     def add_comment(
         self, project_key: str, work_item_id: str, content: str
@@ -1363,6 +1488,7 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
             "artifact_set_id", "report_url", "report_status",
             "requires_human_review", "conclusion", "effect_key",
             "semantic_payload_sha256", "marker", "comment_content",
+            "field_updates",
         }
         content_field = "comment_content"
     else:
@@ -1385,7 +1511,7 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
             "thread_id", "reply_anchor_message_id", "source_message_id",
             "requester_id", "reply_in_thread", "output_cap", "effect_key",
             "semantic_payload_sha256", "marker", "idempotency_uuid",
-            "message_content",
+            "message_content", "field_updates",
         }
         content_field = "message_content"
     if set(payload) != exact_payload_keys:
@@ -1428,6 +1554,18 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         or payload.get("report_status") not in _HTML_REPORT_STATUSES
     ):
         raise DeliveryContractError("delivery_effect_review_boundary_invalid")
+    expected_field_updates = [
+        {
+            "field_key": RCA_RESULT_FIELD_KEY,
+            "field_value": payload.get("conclusion"),
+        },
+        {
+            "field_key": RCA_REPORT_FIELD_KEY,
+            "field_value": claim.report_url,
+        },
+    ]
+    if payload.get("field_updates") != expected_field_updates:
+        raise DeliveryContractError("delivery_effect_field_updates_invalid")
     if claim.manifest.get("report_url") != claim.report_url:
         raise DeliveryContractError("delivery_manifest_store_identity_mismatch")
     verified_artifacts = verify_persisted_artifact_inventory(
@@ -1499,6 +1637,13 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         marker=marker,
         content=content,
         artifacts=artifact_requests,
+        field_updates=(
+            (
+                RCA_RESULT_FIELD_KEY,
+                str(payload.get("conclusion") or ""),
+            ),
+            (RCA_REPORT_FIELD_KEY, claim.report_url),
+        ) if claim.effect_kind == DELIVERY_EFFECT_KIND else (),
         chat_id=str(payload.get("chat_id") or ""),
         thread_id=str(payload.get("thread_id") or ""),
         idempotency_uuid=str(payload.get("idempotency_uuid") or ""),
@@ -1639,6 +1784,51 @@ def _strict_comments(result: Any) -> tuple[list[dict[str, str]] | None, dict[str
     return normalized, payload
 
 
+def _strict_field_values(
+    result: Any,
+    expected_keys: tuple[str, ...],
+) -> tuple[dict[str, str] | None, dict[str, Any]]:
+    if not isinstance(result, Mapping):
+        return None, {
+            "success": False,
+            "error_code": "delivery_boundary_contract_invalid",
+            "error": "get_fields must return an object",
+        }
+    payload = dict(result)
+    if payload.get("success") is not True:
+        if payload.get("success") is not False:
+            payload = {
+                "success": False,
+                "error_code": "delivery_boundary_contract_invalid",
+                "error": "get_fields success must be boolean",
+            }
+        return None, payload
+    fields = payload.get("fields")
+    if not isinstance(fields, Mapping):
+        return None, {
+            "success": False,
+            "error_code": "delivery_boundary_contract_invalid",
+            "error": "get_fields response must contain a fields object",
+        }
+    normalized: dict[str, str] = {}
+    for key, value in fields.items():
+        key_text = str(key)
+        if key_text not in expected_keys or not isinstance(value, str):
+            return None, {
+                "success": False,
+                "error_code": "delivery_boundary_contract_invalid",
+                "error": "field read returned an unexpected key or value type",
+            }
+        normalized[key_text] = value.strip()
+    return normalized, payload
+
+
+def _field_updates_match(
+    fields: Mapping[str, str], updates: tuple[tuple[str, str], ...]
+) -> bool:
+    return all(fields.get(key) == value for key, value in updates)
+
+
 def _marker_matches(
     comments: list[dict[str, str]], marker: str
 ) -> list[dict[str, str]]:
@@ -1654,6 +1844,8 @@ class DeliveryDispatcher:
         list_comments: ListComments,
         add_comment: AddComment,
         report_verifier: ReportVerifier,
+        get_fields: GetFields | None = None,
+        update_fields: UpdateFields | None = None,
         list_thread_replies: ListThreadReplies | None = None,
         add_thread_reply: AddThreadReply | None = None,
         now: Callable[[], datetime] = _utc_now,
@@ -1664,6 +1856,8 @@ class DeliveryDispatcher:
         self.config = config
         self.list_comments = list_comments
         self.add_comment = add_comment
+        self.get_fields = get_fields
+        self.update_fields = update_fields
         self.list_thread_replies = list_thread_replies
         self.add_thread_reply = add_thread_reply
         self.report_verifier = report_verifier
@@ -1955,6 +2149,41 @@ class DeliveryDispatcher:
             }
         return self.list_thread_replies(validated.chat_id, validated.thread_id)
 
+    def _read_field_updates(
+        self, claim: DeliveryEffectClaim, validated: ValidatedEffect
+    ) -> Mapping[str, Any]:
+        if not validated.field_updates:
+            return {"success": True, "fields": {}}
+        if self.get_fields is None:
+            return {
+                "success": False,
+                "error_code": "meegle_dependency_unavailable",
+                "error": "work item field reader is not configured",
+            }
+        return self.get_fields(
+            claim.project_key,
+            claim.work_item_id,
+            tuple(key for key, _value in validated.field_updates),
+        )
+
+    def _write_field_updates(
+        self, claim: DeliveryEffectClaim, validated: ValidatedEffect
+    ) -> Mapping[str, Any]:
+        if not validated.field_updates:
+            return {"success": True}
+        if self.update_fields is None:
+            return {
+                "success": False,
+                "outcome_uncertain": False,
+                "error_code": "meegle_dependency_unavailable",
+                "error": "work item field writer is not configured",
+            }
+        return self.update_fields(
+            claim.project_key,
+            claim.work_item_id,
+            validated.field_updates,
+        )
+
     def _add_remote_effect(
         self, claim: DeliveryEffectClaim, validated: ValidatedEffect
     ) -> Mapping[str, Any]:
@@ -1995,6 +2224,9 @@ class DeliveryDispatcher:
                     "remote_id": remote_id,
                     "marker": validated.marker,
                     "source": source,
+                    "confirmed_field_keys": [
+                        key for key, _value in validated.field_updates
+                    ],
                 },
                 runtime_identity=self.runtime_identity,
                 now=self.now(),
@@ -2039,6 +2271,31 @@ class DeliveryDispatcher:
                 before = dict(before)
                 before["outcome_uncertain"] = True
             return self._boundary_failure(claim, before, uncertain_default=False)
+        expected_field_keys = tuple(key for key, _value in validated.field_updates)
+        try:
+            before_fields_raw = self._read_field_updates(claim, validated)
+        except Exception as exc:
+            self._heartbeat(claim)
+            return self._retry(
+                claim,
+                error_code="feishu_field_read_unavailable",
+                detail=type(exc).__name__,
+                uncertain=prior_write_uncertain,
+            )
+        self._heartbeat(claim)
+        before_fields, before_field_result = _strict_field_values(
+            before_fields_raw, expected_field_keys
+        )
+        if before_fields is None:
+            if prior_write_uncertain:
+                before_field_result = dict(before_field_result)
+                before_field_result["outcome_uncertain"] = True
+            return self._boundary_failure(
+                claim, before_field_result, uncertain_default=False
+            )
+        fields_match = _field_updates_match(
+            before_fields, validated.field_updates
+        )
         matches = _marker_matches(comments, validated.marker)
         if len(matches) > 1:
             return self._quarantine(
@@ -2046,16 +2303,17 @@ class DeliveryDispatcher:
                 error_code="delivery_remote_marker_duplicate",
                 detail="multiple comments contain the exact delivery marker",
             )
-        if matches:
+        existing_marker = matches[0] if matches else None
+        if existing_marker is not None and fields_match:
             return self._complete_from_marker(
                 claim,
                 validated,
-                matches[0],
+                existing_marker,
                 source="read_before_write",
             )
 
         recovery_write_count = 0
-        if prior_write_uncertain:
+        if prior_write_uncertain and existing_marker is None:
             reconciliation = self.store.record_effect_reconciliation_miss(
                 claim=claim,
                 visibility_grace_seconds=(
@@ -2135,34 +2393,37 @@ class DeliveryDispatcher:
                     error_code="delivery_remote_marker_duplicate",
                     detail="multiple comments contain the exact delivery marker",
                 )
-            if confirmation_matches:
+            if confirmation_matches and fields_match:
                 return self._complete_from_marker(
                     claim,
                     validated,
                     confirmation_matches[0],
                     source="recovery_read_before_write",
                 )
-            recovery_authorization = self.store.authorize_effect_recovery_write(
-                claim=claim,
-                visibility_grace_seconds=(
-                    self.config.reconciliation_visibility_grace_seconds
-                ),
-                minimum_missing_reads=self.config.reconciliation_min_missing_reads,
-                recovery_interval_seconds=self.config.recovery_write_interval_seconds,
-                max_recovery_writes=MAX_RECOVERY_WRITES,
-                now=self.now(),
-                activation_required=self.config.activation_required,
-            )
-            if recovery_authorization is None:
-                return self._retry(
-                    claim,
-                    error_code="delivery_recovery_write_rate_limited",
-                    detail="controlled recovery write authorization is not yet due",
-                    uncertain=True,
-                    exact_delay_seconds=UNCERTAIN_RECONCILIATION_POLL_SECONDS,
+            if confirmation_matches:
+                existing_marker = confirmation_matches[0]
+            else:
+                recovery_authorization = self.store.authorize_effect_recovery_write(
+                    claim=claim,
+                    visibility_grace_seconds=(
+                        self.config.reconciliation_visibility_grace_seconds
+                    ),
+                    minimum_missing_reads=self.config.reconciliation_min_missing_reads,
+                    recovery_interval_seconds=self.config.recovery_write_interval_seconds,
+                    max_recovery_writes=MAX_RECOVERY_WRITES,
+                    now=self.now(),
+                    activation_required=self.config.activation_required,
                 )
-            recovery_write_count = recovery_authorization
-        else:
+                if recovery_authorization is None:
+                    return self._retry(
+                        claim,
+                        error_code="delivery_recovery_write_rate_limited",
+                        detail="controlled recovery write authorization is not yet due",
+                        uncertain=True,
+                        exact_delay_seconds=UNCERTAIN_RECONCILIATION_POLL_SECONDS,
+                    )
+                recovery_write_count = recovery_authorization
+        if not prior_write_uncertain or existing_marker is not None:
             for role, artifact_url, expected_size, expected_sha256 in validated.artifacts:
                 self._heartbeat(claim)
                 try:
@@ -2210,11 +2471,77 @@ class DeliveryDispatcher:
                         ),
                     )
 
+            if not prior_write_uncertain:
+                self._heartbeat(claim)
+                self.store.mark_effect_write_started(
+                    claim=claim,
+                    now=self.now(),
+                    activation_required=self.config.activation_required,
+                )
+        if not fields_match:
+            try:
+                update_raw = self._write_field_updates(claim, validated)
+            except Exception as exc:
+                self._heartbeat(claim)
+                return self._retry(
+                    claim,
+                    error_code="feishu_field_update_outcome_unknown",
+                    detail=type(exc).__name__,
+                    uncertain=True,
+                )
             self._heartbeat(claim)
-            self.store.mark_effect_write_started(
-                claim=claim,
-                now=self.now(),
-                activation_required=self.config.activation_required,
+            if not isinstance(update_raw, Mapping):
+                return self._open_circuit(
+                    claim,
+                    error_code="delivery_boundary_contract_invalid",
+                    detail="update_fields must return an object",
+                    uncertain=True,
+                )
+            update_result = dict(update_raw)
+            if update_result.get("success") is not True:
+                if update_result.get("success") is not False:
+                    update_result = {
+                        "success": False,
+                        "outcome_uncertain": True,
+                        "error_code": "delivery_boundary_contract_invalid",
+                    }
+                return self._boundary_failure(
+                    claim, update_result, uncertain_default=True
+                )
+            try:
+                confirmed_fields_raw = self._read_field_updates(claim, validated)
+            except Exception as exc:
+                self._heartbeat(claim)
+                return self._retry(
+                    claim,
+                    error_code="feishu_field_postwrite_read_unavailable",
+                    detail=type(exc).__name__,
+                    uncertain=True,
+                )
+            self._heartbeat(claim)
+            confirmed_fields, confirmed_field_result = _strict_field_values(
+                confirmed_fields_raw, expected_field_keys
+            )
+            if confirmed_fields is None:
+                confirmed_field_result = dict(confirmed_field_result)
+                confirmed_field_result["outcome_uncertain"] = True
+                return self._boundary_failure(
+                    claim, confirmed_field_result, uncertain_default=True
+                )
+            if not _field_updates_match(confirmed_fields, validated.field_updates):
+                return self._retry(
+                    claim,
+                    error_code="feishu_field_postwrite_confirmation_mismatch",
+                    detail="attribution result/report fields did not match readback",
+                    uncertain=True,
+                )
+            fields_match = True
+        if existing_marker is not None:
+            return self._complete_from_marker(
+                claim,
+                validated,
+                existing_marker,
+                source="field_repair_after_marker",
             )
         try:
             add_raw = self._add_remote_effect(claim, validated)
@@ -2306,6 +2633,32 @@ class DeliveryDispatcher:
                 detail="marker and add remote_id were not confirmed together",
                 uncertain=True,
             )
+        try:
+            final_fields_raw = self._read_field_updates(claim, validated)
+        except Exception as exc:
+            self._heartbeat(claim)
+            return self._retry(
+                claim,
+                error_code="feishu_field_final_read_unavailable",
+                detail=type(exc).__name__,
+                uncertain=True,
+            )
+        self._heartbeat(claim)
+        final_fields, final_field_result = _strict_field_values(
+            final_fields_raw, expected_field_keys
+        )
+        if final_fields is None or not _field_updates_match(
+            final_fields, validated.field_updates
+        ):
+            detail = str(
+                final_field_result.get("error") or "field readback mismatch"
+            )
+            return self._retry(
+                claim,
+                error_code="feishu_field_final_confirmation_mismatch",
+                detail=detail,
+                uncertain=True,
+            )
         self._settle_claim(
             claim,
             lambda: self.store.complete_effect(
@@ -2321,6 +2674,7 @@ class DeliveryDispatcher:
                         else "read_after_write"
                     ),
                     "recovery_write_count": recovery_write_count,
+                    "confirmed_field_keys": list(expected_field_keys),
                 },
                 runtime_identity=self.runtime_identity,
                 now=self.now(),
@@ -2614,6 +2968,8 @@ def main(argv: list[str] | None = None) -> int:
         config=config,
         list_comments=adapter.list_comments,
         add_comment=adapter.add_comment,
+        get_fields=adapter.get_fields,
+        update_fields=adapter.update_fields,
         list_thread_replies=thread_adapter.list_replies,
         add_thread_reply=thread_adapter.add_reply,
         report_verifier=lambda url, size, sha256: default_report_verifier(

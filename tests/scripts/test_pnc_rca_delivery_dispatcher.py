@@ -211,14 +211,21 @@ class Remote:
         self.comments: list[dict[str, str]] = []
         self.list_calls = 0
         self.add_calls = 0
+        self.get_field_calls = 0
+        self.update_field_calls = 0
+        self.fields: dict[str, str] = {}
+        self.history: list[str] = []
         self.list_failure: dict | None = None
         self.add_failure: dict | None = None
+        self.get_field_failure: dict | None = None
+        self.update_field_failure: dict | None = None
         self.weak_success = False
 
     def list_comments(self, project_key, work_item_id):
         assert project_key == "t03o4q"
         assert work_item_id == "7041712812"
         self.list_calls += 1
+        self.history.append("list_comments")
         if self.list_failure is not None:
             return dict(self.list_failure)
         return {"success": True, "comments": list(self.comments)}
@@ -227,6 +234,7 @@ class Remote:
         assert project_key == "t03o4q"
         assert work_item_id == "7041712812"
         self.add_calls += 1
+        self.history.append("add_comment")
         if self.add_failure is not None:
             return dict(self.add_failure)
         remote_id = f"comment-{self.add_calls}"
@@ -234,6 +242,30 @@ class Remote:
         if self.weak_success:
             return {"success": True}
         return {"success": True, "remote_id": remote_id}
+
+    def get_fields(self, project_key, work_item_id, field_keys):
+        assert project_key == "t03o4q"
+        assert work_item_id == "7041712812"
+        self.get_field_calls += 1
+        self.history.append("get_fields")
+        if self.get_field_failure is not None:
+            return dict(self.get_field_failure)
+        return {
+            "success": True,
+            "fields": {
+                key: self.fields[key] for key in field_keys if key in self.fields
+            },
+        }
+
+    def update_fields(self, project_key, work_item_id, field_updates):
+        assert project_key == "t03o4q"
+        assert work_item_id == "7041712812"
+        self.update_field_calls += 1
+        self.history.append("update_fields")
+        if self.update_field_failure is not None:
+            return dict(self.update_field_failure)
+        self.fields.update(dict(field_updates))
+        return {"success": True}
 
 
 class ThreadRemote:
@@ -303,6 +335,8 @@ def _dispatcher(
             config=_config(tmp_path, enabled=enabled),
             list_comments=remote.list_comments,
             add_comment=remote.add_comment,
+            get_fields=remote.get_fields,
+            update_fields=remote.update_fields,
             list_thread_replies=(
                 thread_remote.list_replies if thread_remote is not None else None
             ),
@@ -553,6 +587,17 @@ def test_success_requires_read_before_http_add_and_read_after_remote_id(tmp_path
     assert outcome.remote_id == "comment-1"
     assert remote.list_calls == 2
     assert remote.add_calls == 1
+    assert remote.update_field_calls == 1
+    assert remote.get_field_calls == 3
+    assert remote.history == [
+        "list_comments",
+        "get_fields",
+        "update_fields",
+        "get_fields",
+        "add_comment",
+        "list_comments",
+        "get_fields",
+    ]
     effect = store.list_rows("rca_delivery_effects")[0]
     job = store.list_rows("rca_delivery_jobs")[0]
     attempts = store.list_rows("rca_delivery_attempts")
@@ -561,6 +606,50 @@ def test_success_requires_read_before_http_add_and_read_after_remote_id(tmp_path
     assert [row["outcome"] for row in attempts] == ["started", "ack"]
     receipt = json.loads(effect["remote_receipt_json"])
     assert receipt["remote_id"] == "comment-1"
+    assert receipt["confirmed_field_keys"] == ["field_9193cb", "field_8c912e"]
+
+
+def test_existing_marker_repairs_drifted_fields_without_duplicate_comment(tmp_path):
+    store = _seed(tmp_path)
+    payload = json.loads(store.list_rows("rca_delivery_effects")[0]["payload_json"])
+    remote = Remote()
+    remote.comments.append({"remote_id": "comment-existing", "content": payload["comment_content"]})
+    remote.fields = {"field_9193cb": "stale", "field_8c912e": ""}
+    dispatcher, _remote, _clock = _dispatcher(tmp_path, remote=remote)
+
+    outcome = dispatcher.dispatch_one()
+
+    assert outcome.status == "reconciled"
+    assert outcome.remote_id == "comment-existing"
+    assert remote.add_calls == 0
+    assert remote.update_field_calls == 1
+    assert remote.fields == {
+        item["field_key"]: item["field_value"]
+        for item in payload["field_updates"]
+    }
+    receipt = json.loads(
+        store.list_rows("rca_delivery_effects")[0]["remote_receipt_json"]
+    )
+    assert receipt["source"] == "field_repair_after_marker"
+
+
+def test_field_update_failure_blocks_comment_and_retries(tmp_path):
+    store = _seed(tmp_path)
+    remote = Remote()
+    remote.update_field_failure = {
+        "success": False,
+        "outcome_uncertain": False,
+        "error_code": "feishu_permission_denied",
+        "error": "forbidden",
+    }
+    dispatcher, _remote, _clock = _dispatcher(tmp_path, remote=remote)
+
+    outcome = dispatcher.dispatch_one()
+
+    assert outcome.status == "circuit_open"
+    assert outcome.error_code == "feishu_permission_denied"
+    assert remote.add_calls == 0
+    assert store.list_rows("rca_delivery_effects")[0]["status"] == "retry_wait"
 
 
 def test_manual_subscription_delivers_issue_comment_and_origin_topic(tmp_path):
@@ -2011,7 +2100,12 @@ def test_later_page_marker_reconciles_and_cross_page_duplicate_conflicts(
 ):
     store = _seed(tmp_path)
     effect = store.list_rows("rca_delivery_effects")[0]
-    marker = json.loads(effect["payload_json"])["marker"]
+    effect_payload = json.loads(effect["payload_json"])
+    marker = effect_payload["marker"]
+    expected_fields = {
+        item["field_key"]: item["field_value"]
+        for item in effect_payload["field_updates"]
+    }
     calls = []
 
     def runner(args):
@@ -2037,6 +2131,10 @@ def test_later_page_marker_reconciles_and_cross_page_duplicate_conflicts(
         config=_config(tmp_path),
         list_comments=adapter.list_comments,
         add_comment=lambda *_args: pytest.fail("existing marker must suppress add"),
+        get_fields=lambda *_args: {"success": True, "fields": expected_fields},
+        update_fields=lambda *_args: pytest.fail(
+            "matching fields must suppress update"
+        ),
         report_verifier=_verified_report,
         now=Clock(),
         lease_owner="delivery-dispatcher-test",
@@ -2057,6 +2155,67 @@ def test_meegle_adapter_treats_weak_success_as_uncertain():
     assert result["success"] is False
     assert result["outcome_uncertain"] is True
     assert result["error_code"] == "feishu_add_remote_id_missing"
+
+
+def test_meegle_adapter_reads_and_updates_only_attribution_fields():
+    calls = []
+
+    def runner(args):
+        calls.append(args)
+        if args[:2] == ["workitem", "get"]:
+            return 0, json.dumps({
+                "work_item_fields": [
+                    {
+                        "key": "field_9193cb",
+                        "value": "candidate conclusion",
+                    },
+                    {
+                        "key": "field_8c912e",
+                        "value": {"link": "http://report.example/index.html"},
+                    },
+                ]
+            }), ""
+        if args[:2] == ["workitem", "update"]:
+            return 0, json.dumps({"updated": True}), ""
+        raise AssertionError(args)
+
+    adapter = MeegleIssueCommentAdapter(runner)
+    fields = adapter.get_fields(
+        "t03o4q",
+        "7041712812",
+        ("field_9193cb", "field_8c912e"),
+    )
+    update = adapter.update_fields(
+        "t03o4q",
+        "7041712812",
+        (
+            ("field_9193cb", "candidate conclusion"),
+            ("field_8c912e", "http://report.example/index.html"),
+        ),
+    )
+
+    assert fields == {
+        "success": True,
+        "fields": {
+            "field_9193cb": "candidate conclusion",
+            "field_8c912e": "http://report.example/index.html",
+        },
+    }
+    assert update == {"success": True}
+    assert calls[0].count("--fields") == 2
+    update_params = json.loads(calls[1][calls[1].index("--params") + 1])
+    assert update_params == {
+        "fields": [
+            {
+                "field_key": "field_9193cb",
+                "field_value": "candidate conclusion",
+            },
+            {
+                "field_key": "field_8c912e",
+                "field_value": "http://report.example/index.html",
+            },
+        ]
+    }
 
 
 def test_default_report_verifier_performs_bounded_head_then_get(monkeypatch):

@@ -31,6 +31,7 @@ def test_kafka_launchd_candidate_is_secret_free_and_crash_restarting():
     assert set(payload["EnvironmentVariables"]) == {
         "HERMES_HOME",
         "PATH",
+        "PYTHONDONTWRITEBYTECODE",
         "PYTHONNOUSERSITE",
         "PYTHONUNBUFFERED",
         "VIRTUAL_ENV",
@@ -53,6 +54,7 @@ def test_outbox_launchd_candidate_is_secret_free_and_crash_restarting():
     assert set(payload["EnvironmentVariables"]) == {
         "HERMES_HOME",
         "PATH",
+        "PYTHONDONTWRITEBYTECODE",
         "PYTHONNOUSERSITE",
         "PYTHONUNBUFFERED",
         "VIRTUAL_ENV",

@@ -38,6 +38,8 @@ class RcaIssueContext:
     project_label: str = ""
     case_id: str = ""
     frame_id: str = ""
+    frame_lookup: dict[str, Any] = field(default_factory=dict)
+    frame_reference_error: str = ""
     function_category: str = ""
     function_domain: str = ""
     pdcl_download_cmd: str = ""
@@ -76,6 +78,14 @@ def validate_issue_context_fields(issue_context: RcaIssueContext) -> tuple[RcaIs
             "sub_kind": exc.code,
             "field": "问题数据地址_PDCL",
             "message": "主控已读取问题卡片，但 问题数据地址_PDCL 无法解析为 RemoteEventReader/RemoteClipReader 引用",
+            "retryable": True,
+        }
+    if issue_context.frame_reference_error:
+        return dataclasses_replace(issue_context, is_pdcl_format=True), {
+            "kind": "issue_field_invalid_frame_reference",
+            "sub_kind": issue_context.frame_reference_error,
+            "field": "问题发生frame_id",
+            "message": "主控已读取问题卡片，但 问题发生frame_id 既不是正整数帧号，也不是支持的精确时间格式",
             "retryable": True,
         }
     return dataclasses_replace(issue_context, is_pdcl_format=True), None
@@ -215,6 +225,16 @@ def issue_context_from_compact_text(
                 return line[len(prefix):].strip()
         return ""
 
+    frame_lookup: dict[str, Any] = {}
+    frame_lookup_text = line_value("frame_lookup")
+    if frame_lookup_text:
+        try:
+            parsed_frame_lookup = json.loads(frame_lookup_text)
+        except json.JSONDecodeError:
+            parsed_frame_lookup = None
+        if isinstance(parsed_frame_lookup, dict):
+            frame_lookup = parsed_frame_lookup
+
     blockers_value = list(blockers or [])
     if not text and not blockers_value and source_quality == "unavailable":
         blockers_value.append({"kind": "host_preread_unavailable", "message": "Feishu issue preread unavailable"})
@@ -227,6 +247,8 @@ def issue_context_from_compact_text(
         owners=[part.strip() for part in line_value("当前负责人").split(",") if part.strip()],
         project_label=line_value("所属项目"),
         frame_id=line_value("frame_id"),
+        frame_lookup=frame_lookup,
+        frame_reference_error=line_value("frame_reference_error"),
         pdcl_download_cmd=line_value("数据地址"),
         root_cause_text=line_value("根因分析字段"),
         description_markdown=text,
@@ -278,6 +300,7 @@ def build_execution_request(
         case={
             "case_id": case_id,
             "frame_id": issue_context.frame_id,
+            "frame_lookup": issue_context.frame_lookup,
             "function_category": issue_context.function_category,
             "function_domain": issue_context.function_domain,
             "project_label": issue_context.project_label,

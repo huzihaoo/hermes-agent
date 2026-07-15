@@ -48,6 +48,8 @@ from gateway.pnc_rca_delivery_contract import (
     DELIVERY_CONTRACT_SCHEMA_VERSION,
     DELIVERY_MANIFEST_SCHEMA_VERSION,
     DeliveryContractError,
+    RCA_REPORT_FIELD_KEY,
+    RCA_RESULT_FIELD_KEY,
     TERMINAL_DELIVERY_OUTCOMES,
     build_terminal_delivery,
     build_terminal_thread_reply_effect,
@@ -2729,6 +2731,12 @@ def _read_delivery_facts(
         remote_id = str(remote_receipt.get("remote_id") or "").strip()
         if not REMOTE_ID_RE.fullmatch(remote_id):
             raise CanaryCollectionError("delivery_remote_id_invalid")
+        if (
+            subscription.get("effect_kind") == "feishu_issue_comment"
+            and remote_receipt.get("confirmed_field_keys")
+            != [RCA_RESULT_FIELD_KEY, RCA_REPORT_FIELD_KEY]
+        ):
+            raise CanaryCollectionError("delivery_result_fields_not_confirmed")
         terminal_attempts = db.rows(
             """
             SELECT outcome, remote_id FROM rca_delivery_attempts
@@ -2936,7 +2944,10 @@ def read_local_canary_database_facts(
         if not isinstance(remote_receipt, dict):
             raise CanaryCollectionError("delivery_remote_receipt_invalid")
         delivery_projection["remote_receipt"] = {
-            "remote_id": str(remote_receipt.get("remote_id") or "")
+            "remote_id": str(remote_receipt.get("remote_id") or ""),
+            "confirmed_field_keys": list(
+                remote_receipt.get("confirmed_field_keys") or []
+            ),
         }
         result.update(
             {
@@ -4130,7 +4141,13 @@ class CanaryReceiptCollector:
         delivery_projection = {
             **delivery.delivery,
             "remote_receipt": {
-                "remote_id": delivery.delivery["remote_receipt"]["remote_id"]
+                "remote_id": delivery.delivery["remote_receipt"]["remote_id"],
+                "confirmed_field_keys": list(
+                    delivery.delivery["remote_receipt"].get(
+                        "confirmed_field_keys"
+                    )
+                    or []
+                ),
             },
         }
         vm = {

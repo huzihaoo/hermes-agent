@@ -150,7 +150,7 @@ PY
 | 信号 | 处置 |
 |---|---|
 | `issue_field_missing_remote_data_reference` / `issue_field_invalid_remote_data_reference` | 等 owner 在卡片补明确的 event UUID 或 clip UUID；系统只把历史命令形状解析为地址，不执行命令。 |
-| `missing_frame_id`（VM 门禁）| 等 owner 补「问题发生frameid」；不要替用户从描述里猜帧号 |
+| `missing_frame_id`（VM 门禁）| 等 owner 补「问题发生frameid」：可填写大于 0 的实际 frame_id，或精确的 `YYYY-MM-DD HH:MM:SS` / `YYYYMMDD, HH:MM:SS` 测试打点时间；不要从描述里猜值。时间按 Asia/Shanghai 解析为管理面 Unix 微秒时间戳，并在固定前视 topic 优先级中选择 100ms 内最近帧（同差值取更早帧）；无法唯一解析或超差即 fail closed。 |
 | `unsupported_function_domain` | 域不在 ACC/LCC/HMI/AEB/AWB/FCW/FCTB/DNP/ELK 内；扩域改 VM `check_case_gate.py` 的 `SUPPORTED_DOMAIN_ALIASES`（需确认有对应 evaluator）|
 
 ### 4.3 管线层（VM，看 `/mnt/tmp/<task>/pipeline_state.json`）
@@ -166,7 +166,7 @@ PY
 
 **生产禁止手工跑管线。** 紧急分析必须从受控群 `@小助手 + 分析 + 唯一问题单` 发起并执行 `run_or_join`；普通用户不能要求新代。只有 operator allowlist 用户可显式 `rerun/debug`，且上一代执行和 required delivery 真正终态、默认 `3/600s` 限速通过后，才能建立下一代并重新经过 admission、容量 reservation、fixed CLI 和 canary/release evidence。公共 `vm_task_submit`、`ssh-mini-submit` 或直接运行 pipeline 都是阻断项。
 
-**终态失败不能静默。** 当前候选会为 VM/解析/HTML `terminal_failed` 以及 VM 提交前 quarantine 原子创建问题单 failure effect，并为人工 source 创建原任务话题 failure effect；pre-submit quarantine 对外只发 `outbox_submission_quarantined`，内部错误不外泄，不生成虚假 HTML。required effect 未完成时不得 rerun/debug。5/15/60 分钟 outcome SLO 或一小时连续 3 次终态交付失败会背压新 outbox，但不能停止既有 delivery recovery。成功与失败都必须通过 marker 幂等、read-before/write/read-after 和真实飞书 canary 后才能生产放量；operator 监控、单测或用户主动查状态不能替代这一用户契约。
+**终态失败不能静默。** 当前候选会为 VM/解析/HTML `terminal_failed` 以及 VM 提交前 quarantine 原子创建问题单 failure effect，并为人工 source 创建原任务话题 failure effect；pre-submit quarantine 对外只发 `outbox_submission_quarantined`，内部错误不外泄，不生成虚假 HTML。required effect 未完成时不得 rerun/debug。5/15/60 分钟 outcome SLO 或一小时连续 3 次终态交付失败会背压新 outbox，但不能停止既有 delivery recovery。成功 delivery 必须先把非空候选结论写入「归因结果」(`field_9193cb`)，把正式 HTML 链接写入「归因报告」(`field_8c912e`)，逐字段 read-before/write/read-after 确认后再写评论；已有 marker 但字段漂移时只修复字段、不重复评论。任一字段写入或回读不确定都阻断评论并进入既有 lease/retry/circuit。成功与失败都必须通过 marker 幂等、真实飞书 canary 和读回确认后才能生产放量；operator 监控、单测或用户主动查状态不能替代这一用户契约。
 
 ## 4.4 历史 Phase2 replay（非生产）
 
@@ -235,7 +235,7 @@ test -x "$RCA_PYTHON"
 ## 7. 生产放量基线（2026-07-11 remote-read cutover）
 
 1. 首次上线保持 submit/dispatch safe-off；先完成 broker metadata/T0、最近 7 天真实 Kafka 消息的无 group/无 commit 影子回放、容量 horizon、clean BOM、受治理 canary。balanced 200-case provenance 与 24h/200-case remote-reader soak 在 `production_bootstrap` 及其前置阶段记录为上线后观察项，不作为首次上线硬阻塞；标准 steady-capacity 放大仍可重新要求。topic 必须由 broker metadata 确认精确大小写；当前 live `.env` 是 `feishu-project-workflow-event`，不得凭曾出现的 `feishu-project-workfLow-event` 交接字符串猜测。
-2. 最近 7 天回放只使用 `scripts/pnc_rca_kafka_recent_replay.py`：`group_id=None`、显式 `assign`、`offsets_for_times`、固定 end offset、`read_committed`、`enable_auto_commit=false`。真实 payload 只能进入自动销毁的临时 SQLite，必须走现有 workflow policy、control store、shadow trigger/outbox；`kafka_recent_replay.json` 只保留 offset、哈希和聚合计数。正式 receipt 还必须通过 `--e2e-canary-manifest` 绑定 owner 明确给出的真实问题单集合；release gate 会现场重读 `0600` manifest、重算 SHA/大小并要求所有 ID 在 7 天窗口内全部命中 accepted trigger/shadow outbox，少一条即 fail closed。
+2. 最近 7 天回放只使用 `scripts/pnc_rca_kafka_recent_replay.py`：`group_id=None`、显式 `assign`、`offsets_for_times`、固定 end offset、`read_committed`、`enable_auto_commit=false`。真实 payload 只能进入自动销毁的临时 SQLite，必须走现有 workflow policy、control store、shadow trigger/outbox；`kafka_recent_replay.json` 只保留 offset、哈希和聚合计数。正式 receipt 还必须通过 `--e2e-canary-manifest` 绑定 owner 明确给出的真实问题单集合；release gate 会现场重读 `0600` manifest、Feishu v2 receipt 与 frame census，重算各级 SHA/大小，逐条核对 frame 输入可解析，并要求所有 ID 在 7 天窗口内全部命中 accepted trigger/shadow outbox，少一条即 fail closed。
 3. DNP workload 分类读取飞书问题 `name`、`问题所属部门`、`问题所属部门_简洁` 三个字段，固定关键字为 `规划`、`SPP`、`OOI`；中文按 NFKC/casefold 后子串匹配，ASCII 按字母数字 token 边界匹配。原始标题和部门值不得进入 census、receipt 或 manifest；ACC/LCC/AEB/FCW 继续使用 owner-approved 精确功能分类叶子。
 4. 每单固定 `remote_read`、`allow_download=false`、`input_materialization=forbidden`；S2 只生成有 size/SHA/MCAP seal 的派生流。
 5. Worker 必须 `direct_cli + agent_backend=none`，并产出绑定 commit、入口 hash、run-id/PID/dispatch receipt 的 attestation；任何 Agent/fallback 计数非零即阻断。
@@ -352,6 +352,8 @@ EVIDENCE_DIR="$EVIDENCE_ROOT/$RUN_ID"
   --output "$EVIDENCE_DIR/broker_metadata.json"
 ```
 
+Kafka SASL principal 由 owner 提供，必须以字面量 `rca_` 开头，并且只允许 ASCII 字母、数字、下划线、点和连字符。principal 与固定 consumer Group/client/service identity `root_cause_analysis_agent` 是两个不同概念，不得强制相等。
+
 `--env-file` 是权威输入，不允许 ambient `HERMES_RCA_KAFKA_*` 静默覆盖；文件必须是 owner-only 的非 symlink UTF-8 常规文件，采集器以同一个只读 fd 完成 identity 检查和有界读取。evidence 只记录文件 identity 与去除密码后的配置哈希，不记录密码或密码哈希。owner 必须显式设置 `HERMES_RCA_KAFKA_EXPECTED_CLUSTER_ID` 和 `HERMES_RCA_KAFKA_MIN_REPLICATION_FACTOR`，不得依赖 bootstrap 地址暗示 cluster identity，也不得依赖代码猜测副本 SLO。采集器使用 pinned `kafka-python==3.0.7` 的单次精确 topic Metadata v12 响应同时读取 cluster identity、topic topology 和 topic authorized operations，不额外要求 cluster ACL；该请求强制 `allow_auto_topic_creation=false`、`include_topic_authorized_operations=true`，且 broker 返回的 cluster id 必须与权威 env 完全相等。随后仅对固定 Group `root_cause_analysis_agent` 执行一次 `DescribeGroups(include_authorized_operations=true)` 权限读取；client 可以先用无副作用的 `FindCoordinator` 定位该 group，但不得调用 OffsetFetch。只有 broker 返回的 cluster identity、精确 topic、从 0 连续的 partition、有效 leader、ISR 与 replicas 完全相等、零 offline replica、副本数达到显式策略，且 topic 与 group 都明确具备 `READ` + `DESCRIBE`、同时不具备 `WRITE` / `CREATE` / `DELETE` / `ALTER` / `ALTER_CONFIGS` / `CLUSTER_ACTION` / `IDEMPOTENT_WRITE` 等 mutation 权限时，才分别写 `topic_healthy=true`、`topic_authorized=true` 与 `group_authorized=true`。`broker_metadata.json` 是这两个资源的同源、同连接证据，不再依赖未实现的独立 `broker_acl_snapshot.json`。采集器不创建 consumer、不加入 consumer group，也不调用 subscribe、assign、poll、commit、OffsetFetch 或 ListOffsets；`DescribeGroups` 是精确 topic Metadata 之外唯一的数据/权限读取。每分区 T0 必须另由 owner 根据上线语义审定，写入 `HERMES_RCA_KAFKA_START_OFFSETS_JSON` 并形成独立 `t0_offsets.json`；不得从任何 metadata 或 group 结果自动推导 T0。
 
 若 owner 尚不知道 cluster ID/RF，不得填写占位值。先在凭证轮换后运行不可放行的观测模式：
@@ -378,13 +380,13 @@ E2E_MANIFEST='<owner-only pnc_rca_kafka_e2e_canary_manifest_v1.json>'
   --output "$EVIDENCE_DIR/kafka_policy_observation.json"
 ```
 
-该模式用永不匹配真实事件的 synthetic transport policy，只输出 `project_key/project_simple_name/work_item_type_key/status_change_type/state transition` 有界计数及 manifest ID 命中情况，固定 `production_eligible=false`，不保留标题、PDCL 地址或 raw payload。manifest 必须绑定 0600 Feishu 官方回读 receipt 的绝对路径与 SHA；release gate 会重新读取该 receipt、逐项核对 work item ID/插件来源/PDCL 与功能字段覆盖，并重新哈希用户截图，任一源文件漂移都 fail closed。owner 审批这些真实观测值后再运行同参数但去掉 `--observe-policy-only` 的正式 shadow replay；只有 manifest 全量 accepted 且 trigger/outbox 闭环的 `kafka_recent_replay.json` 才可进入 release gate。
+该模式用永不匹配真实事件的 synthetic transport policy，只输出 `project_key/project_simple_name/work_item_type_key/status_change_type/state transition` 有界计数及 manifest ID 命中情况，固定 `production_eligible=false`，不保留标题、PDCL 地址或 raw payload。manifest 必须绑定 0600 Feishu 官方 v2 回读 receipt 的绝对路径与 SHA；该 receipt 再绑定无原始字段值的 frame census。release gate 会重新读取两者，逐项核对 work item ID/插件来源/PDCL/功能字段覆盖、`问题发生frame_id` 的正整数或时间解析结果，并重新哈希用户截图；任一源文件漂移都 fail closed。owner 审批这些真实观测值后再运行同参数但去掉 `--observe-policy-only` 的正式 shadow replay；只有 manifest 全量 accepted 且 trigger/outbox 闭环的 `kafka_recent_replay.json` 才可进入 release gate。
 
 ### 7.3 单事件 canary 证据采集
 
 `canary_plan.json` 必须为 exact-shape `pnc_rca_canary_plan_v4`，固定 `admission_mode=direct_bounded`、`promotion_budget=0`、`slot_count=3`。槽位只能是 `kafka_success`、`manual_success`、`manual_terminal_failure`，每槽 `max_admissions=1`；入口分别为 `kafka_ingest/manual_admit/manual_admit`，结果分别为 `success/success/terminal_failed`。Kafka identity 只接受 exact event UID 并规范化绑定 topic/partition/offset；人工 identity 必须完整绑定 chat/requester/message/thread/canonical issue URL/`run_or_join`。三个 identity 与 submission 必须相互独立。plan raw SHA 在 preauthorization capsule 中冻结并由 preproduction 重验，之后 `authorize` 与 `transition-bounded` 都必须消费该 preproduction capsule。
 
-旧 `scripts/g1q3_rca_e2e_smoke.py` 已退休，不得把它的合成结果当生产证据。正式 Kafka canary 必须在 `bounded_active` 下由已授权的 exact `kafka_success` identity 直接 admission，并原子消费该 slot；`safe_off/preauthorized` 阶段不落 raw、不提交 offset，也不得用 shadow promotion 替代。collector 本身不 admission、不消费 Kafka、不提交 VM 任务、不写飞书；旧 promotion 仅保留历史/隔离审计兼容。
+旧 `scripts/g1q3_rca_e2e_smoke.py` 已退休，不得把它的合成结果当生产证据。正式 Kafka canary 必须在 `bounded_active` 下由已授权的 exact `kafka_success` identity 直接 admission，并原子消费该 slot；`safe_off/preauthorized` 阶段不落 raw、不提交 offset，也不得用 shadow promotion 替代。collector 本身不 admission、不消费 Kafka、不提交 VM 任务、不写飞书；它只接受 primary issue effect 的 remote receipt 精确包含 `confirmed_field_keys=[field_9193cb, field_8c912e]`，据此证明「归因结果」「归因报告」均已读回确认，且 receipt 不保存两字段值。旧 promotion 仅保留历史/隔离审计兼容。
 
 先把 Chromium 生成的 smoke evidence 写到 collector 的固定 machine source 位置：
 

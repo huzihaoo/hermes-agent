@@ -53,6 +53,8 @@ ACTIVATION_FREEZE_REQUIRED_SLOT_COUNT = 3
 SERVICE_LABEL = "local.pnc.rca-kafka-consumer"
 MAX_CONFIG_JSON_NESTING = 32
 FIXED_SERVICE_ID = "root_cause_analysis_agent"
+KAFKA_PRINCIPAL_PREFIX = "rca_"
+MAX_KAFKA_PRINCIPAL_LENGTH = 128
 FIXED_API_VERSION = (3, 9, 0)
 FIXED_REQUEST_TIMEOUT_MS = 120_000
 MIN_SESSION_TIMEOUT_MS = 10_000
@@ -73,6 +75,28 @@ def _required(env: Mapping[str, str], name: str) -> str:
     value = str(env.get(name, "")).strip()
     if not value:
         raise ValueError(f"missing required environment variable: {name}")
+    return value
+
+
+def kafka_principal_is_valid(value: str) -> bool:
+    return (
+        len(KAFKA_PRINCIPAL_PREFIX) < len(value) <= MAX_KAFKA_PRINCIPAL_LENGTH
+        and value.startswith(KAFKA_PRINCIPAL_PREFIX)
+        and all(
+            character.isascii() and (character.isalnum() or character in "_.-")
+            for character in value
+        )
+    )
+
+
+def _required_kafka_principal(env: Mapping[str, str], name: str) -> str:
+    raw = str(env.get(name, ""))
+    value = _required(env, name)
+    if raw != value or not kafka_principal_is_valid(value):
+        raise ValueError(
+            f"{name} must start with {KAFKA_PRINCIPAL_PREFIX} and contain only "
+            "ASCII letters, digits, underscore, dot, or hyphen"
+        )
     return value
 
 
@@ -247,10 +271,8 @@ class ConsumerConfig:
         if not bootstrap_servers:
             raise ValueError(f"{ENV_PREFIX}BOOTSTRAP_SERVERS must not be empty")
 
-        username = _required(source, f"{ENV_PREFIX}USER")
+        username = _required_kafka_principal(source, f"{ENV_PREFIX}USER")
         group_id = _required(source, f"{ENV_PREFIX}GROUP")
-        if username != FIXED_SERVICE_ID:
-            raise ValueError(f"{ENV_PREFIX}USER must be exactly {FIXED_SERVICE_ID}")
         if group_id != FIXED_SERVICE_ID:
             raise ValueError(f"{ENV_PREFIX}GROUP must be exactly {FIXED_SERVICE_ID}")
         api_version = _api_version(

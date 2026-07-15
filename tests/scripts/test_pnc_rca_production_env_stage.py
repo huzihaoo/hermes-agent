@@ -34,6 +34,7 @@ def _env_body(state_root: Path) -> str:
     values = {
         **stage.FIXED_PRODUCTION_VALUES,
         "HERMES_RCA_KAFKA_BOOTSTRAP_SERVERS": "broker-1:9092,broker-2:9092",
+        "HERMES_RCA_KAFKA_USER": "rca_release_agent",
         "HERMES_RCA_KAFKA_TOPIC": TOPIC,
         "HERMES_RCA_KAFKA_EXPECTED_CLUSTER_ID": "cluster-production-1",
         "HERMES_RCA_KAFKA_PASSWORD": KAFKA_SECRET,
@@ -409,6 +410,13 @@ def test_bootstrap_mode_is_static_but_release_bindings_are_not_in_env(
                 "HERMES_RCA_KAFKA_TOPIC=wrong-topic",
             ),
             "production_env_topic_mismatch",
+        ),
+        (
+            lambda raw: raw.replace(
+                "HERMES_RCA_KAFKA_USER=rca_release_agent",
+                "HERMES_RCA_KAFKA_USER=legacy-agent",
+            ),
+            "production_env_kafka_principal_invalid",
         ),
         (
             lambda raw: raw.replace(

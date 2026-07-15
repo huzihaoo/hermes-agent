@@ -55,6 +55,50 @@ def test_compact_issue_context_handles_structured_result_and_comments():
     assert "已回放\n\n优化后通过 [image]" in context
 
 
+@pytest.mark.parametrize(
+    "field_value",
+    ["2026-07-12 15:31:16", "20260708, 20:05:00"],
+)
+def test_compact_issue_context_emits_canonical_frame_lookup(field_value):
+    context = pnc_issue_context.compact_g1q3_issue_context(
+        work_item_brief={
+            "work_item_attribute": {"work_item_id": "7049071505"},
+            "work_item_fields": [
+                {
+                    "key": "field_1fda45",
+                    "name": "问题发生frame_id",
+                    "value": field_value,
+                }
+            ],
+        },
+        comments=[],
+    )
+
+    assert "- frame_lookup: " in context
+    assert '"kind": "front_camera_timestamp"' in context
+    assert '"timezone": "Asia/Shanghai"' in context
+    assert "- frame_id:" not in context
+
+
+def test_compact_issue_context_marks_invalid_frame_without_echoing_value():
+    context = pnc_issue_context.compact_g1q3_issue_context(
+        work_item_brief={
+            "work_item_attribute": {"work_item_id": "7049071505"},
+            "work_item_fields": [
+                {
+                    "key": "field_1fda45",
+                    "name": "问题发生frame_id",
+                    "value": "cyber_recorder play secret-path",
+                }
+            ],
+        },
+        comments=[],
+    )
+
+    assert "frame_reference_error: frame_reference_format_invalid" in context
+    assert "secret-path" not in context
+
+
 def test_compact_issue_context_does_not_forward_signed_file_capabilities():
     signed_url = (
         "https://project.feishu.cn/goapi/v5/platform/file/stream/download/"

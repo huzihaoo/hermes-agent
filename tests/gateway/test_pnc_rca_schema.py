@@ -96,6 +96,35 @@ def test_issue_context_from_compact_text_extracts_known_fields_without_raw_paylo
     assert ctx.blockers == []
 
 
+def test_issue_context_carries_canonical_frame_lookup_into_execution_request():
+    frame_lookup = {
+        "kind": "front_camera_timestamp",
+        "management_timestamp": 1_783_841_476_000_000,
+        "management_timestamp_unit": "microseconds_since_unix_epoch",
+        "timezone": "Asia/Shanghai",
+        "max_delta_us": 100_000,
+        "topic_priority": ["front_120", "camera1"],
+    }
+    ctx = issue_context_from_compact_text(
+        project_key="t03o4q",
+        work_item_id="7049071505",
+        compact_text="- frame_lookup: "
+        + json.dumps(frame_lookup, ensure_ascii=False, sort_keys=True)
+        + "\n- 数据地址: mdi download event -u demo -s ./",
+        source_quality="partial",
+    )
+
+    request = build_execution_request(
+        request_kind="issue_intake",
+        task_id="g1q3_rca_issue_intake_7049071505",
+        issue_context=ctx,
+    )
+
+    assert ctx.frame_id == ""
+    assert ctx.frame_lookup == frame_lookup
+    assert to_dict(request)["case"]["frame_lookup"] == frame_lookup
+
+
 def test_unavailable_issue_context_gets_structured_blocker():
     ctx = issue_context_from_compact_text(project_key="t03o4q", work_item_id="7008267126", compact_text="")
 
@@ -227,6 +256,21 @@ def test_validate_issue_context_fields_distinguishes_missing_and_invalid_pdcl():
     assert valid_ctx.is_pdcl_format is True
     assert valid_blocker is None
     assert is_valid_pdcl_download_cmd("mdi download clip -u abc -s ./") is True
+
+
+def test_validate_issue_context_fields_rejects_invalid_frame_reference():
+    context, blocker = validate_issue_context_fields(
+        RcaIssueContext(
+            work_item_id="7049071505",
+            source_quality="partial",
+            pdcl_download_cmd="mdi download event -u demo -s ./",
+            frame_reference_error="frame_reference_format_invalid",
+        )
+    )
+
+    assert context.is_pdcl_format is True
+    assert blocker["kind"] == "issue_field_invalid_frame_reference"
+    assert blocker["sub_kind"] == "frame_reference_format_invalid"
 
 
 # Host and VM must keep tests/gateway/data/pdcl_command_vectors.json and

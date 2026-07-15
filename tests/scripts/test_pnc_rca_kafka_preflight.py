@@ -29,7 +29,7 @@ def _env(**overrides: str) -> dict[str, str]:
         "HERMES_RCA_KAFKA_BOOTSTRAP_SERVERS": "broker-1:9092,broker-2:9092",
         "HERMES_RCA_KAFKA_TOPIC": TOPIC,
         "HERMES_RCA_KAFKA_EXPECTED_CLUSTER_ID": "cluster-production-1",
-        "HERMES_RCA_KAFKA_USER": "root_cause_analysis_agent",
+        "HERMES_RCA_KAFKA_USER": "rca_release_agent",
         "HERMES_RCA_KAFKA_PASSWORD": "not-for-output",
         "HERMES_RCA_KAFKA_GROUP": "root_cause_analysis_agent",
         "HERMES_RCA_KAFKA_API_VERSION": "3.9.0",
@@ -169,9 +169,20 @@ def test_config_requires_fixed_service_identity_and_safe_protocol():
     assert "not-for-output" not in repr(config)
     assert "not-for-output" not in json.dumps(config.public_dict())
 
-    for key in ("HERMES_RCA_KAFKA_USER", "HERMES_RCA_KAFKA_GROUP"):
-        with pytest.raises(ValueError, match="must be exactly"):
-            BrokerProbeConfig.from_env(_env(**{key: "legacy-identity"}))
+    for invalid_principal in (
+        "legacy-identity",
+        "rca_",
+        "rca_invalid principal",
+        "rca_" + "x" * 125,
+    ):
+        with pytest.raises(ValueError, match="must start with rca_"):
+            BrokerProbeConfig.from_env(
+                _env(HERMES_RCA_KAFKA_USER=invalid_principal)
+            )
+    with pytest.raises(ValueError, match="must be exactly"):
+        BrokerProbeConfig.from_env(
+            _env(HERMES_RCA_KAFKA_GROUP="legacy-identity")
+        )
     with pytest.raises(ValueError, match="SASL_PLAINTEXT"):
         BrokerProbeConfig.from_env(_env(HERMES_RCA_KAFKA_SECURITY_PROTOCOL="PLAINTEXT"))
     with pytest.raises(ValueError, match="exactly PLAIN"):

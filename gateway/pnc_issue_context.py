@@ -19,6 +19,11 @@ from dataclasses import dataclass
 import logging
 from typing import Any, Callable, Literal
 
+from gateway.pnc_rca_frame_reference import (
+    FrameReferenceError,
+    parse_frame_reference,
+)
+
 GatewayToolCaller = Callable[[str, dict[str, Any]], Any]
 IssueReadStatus = Literal["not_requested", "read_failed", "read_empty", "fields_extracted"]
 MeegleRunner = Callable[[list[str]], tuple[int, str, str]]
@@ -636,7 +641,23 @@ def compact_g1q3_issue_context(*, work_item_brief: dict[str, Any], comments: lis
 
     title = sanitize_issue_evidence_text(attrs.get("work_item_name") or "")
     project_name = sanitize_issue_evidence_text(by_key.get("field_052f23") or by_name.get("所属项目"))
-    frame_id = sanitize_issue_evidence_text(by_key.get("field_1fda45") or by_name.get("问题发生frameid"))
+    frame_value = sanitize_issue_evidence_text(
+        by_key.get("field_1fda45")
+        or by_name.get("问题发生frame_id")
+        or by_name.get("问题发生frameid")
+    )
+    frame_id = ""
+    frame_lookup: dict[str, Any] = {}
+    frame_reference_error = ""
+    try:
+        frame_reference = parse_frame_reference(frame_value)
+    except FrameReferenceError as exc:
+        frame_reference_error = exc.code
+    else:
+        if frame_reference.get("kind") == "frame_id":
+            frame_id = str(frame_reference["frame_id"])
+        elif frame_reference:
+            frame_lookup = frame_reference
     happened_at = sanitize_issue_evidence_text(by_name.get("发生时间"))
     data_addr = compact_value(by_key.get("field_93aa63") or by_name.get("问题数据地址_PDCL"))
     root_cause = sanitize_issue_evidence_text(by_key.get("field_842fc8") or by_name.get("问题根本原因分析"))
@@ -661,6 +682,13 @@ def compact_g1q3_issue_context(*, work_item_brief: dict[str, Any], comments: lis
         lines.append(f"- 车辆编号: {vehicle}")
     if frame_id:
         lines.append(f"- frame_id: {frame_id}")
+    if frame_lookup:
+        lines.append(
+            "- frame_lookup: "
+            + json.dumps(frame_lookup, ensure_ascii=False, sort_keys=True)
+        )
+    if frame_reference_error:
+        lines.append(f"- frame_reference_error: {frame_reference_error}")
     if happened_at:
         lines.append(f"- 发生时间: {happened_at}")
     if data_addr:
@@ -701,7 +729,7 @@ def compact_g1q3_issue_context(*, work_item_brief: dict[str, Any], comments: lis
             status_name,
             owner,
             vehicle,
-            frame_id,
+            frame_value,
             happened_at,
             data_addr,
             root_cause,

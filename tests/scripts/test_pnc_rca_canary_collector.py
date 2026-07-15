@@ -699,6 +699,7 @@ def _create_db(path: Path, *, duplicate=False, promoted=True):
                 "remote_id": "feishu-comment-1",
                 "marker": marker,
                 "source": "read_after_write",
+                "confirmed_field_keys": ["field_9193cb", "field_8c912e"],
             }),
             "2026-07-10T07:59:40+00:00",
         ),
@@ -1705,7 +1706,10 @@ def test_collects_v8_from_bound_execution_sources_without_network(tmp_path):
         "downstream_stage_receipts",
         "capacity_usage",
     }
-    assert set(result.receipt["delivery"]["remote_receipt"]) == {"remote_id"}
+    assert result.receipt["delivery"]["remote_receipt"] == {
+        "remote_id": "feishu-comment-1",
+        "confirmed_field_keys": ["field_9193cb", "field_8c912e"],
+    }
     assert {
         item["effect_kind"] for item in result.receipt["delivery_obligations"]
     } == {"feishu_issue_comment"}
@@ -2604,6 +2608,26 @@ def test_rejects_tampered_remote_receipt_reference(tmp_path):
     assert caught.value.code == "pipeline_receipt_hash_binding_invalid"
 
 
+def test_rejects_delivery_receipt_without_confirmed_result_fields(tmp_path):
+    config, reader, _submission = _fixture(tmp_path)
+    with sqlite3.connect(config.delivery_db_path) as connection:
+        row = connection.execute(
+            "SELECT effect_key, remote_receipt_json FROM rca_delivery_effects "
+            "WHERE effect_kind='feishu_issue_comment'"
+        ).fetchone()
+        receipt = json.loads(row[1])
+        receipt.pop("confirmed_field_keys")
+        connection.execute(
+            "UPDATE rca_delivery_effects SET remote_receipt_json=? WHERE effect_key=?",
+            (json.dumps(receipt), row[0]),
+        )
+
+    with pytest.raises(CanaryCollectionError) as caught:
+        CanaryReceiptCollector(config, remote_reader=reader).collect(SOURCE_ID)
+
+    assert caught.value.code == "delivery_result_fields_not_confirmed"
+
+
 def test_rejects_v1_capacity_meter_receipt(tmp_path):
     config, reader, _submission = _fixture(tmp_path)
     meter = copy.deepcopy(reader.records["capacity_meter"].body)
@@ -3205,7 +3229,10 @@ def test_public_database_facts_helper_returns_bounded_success_projection(tmp_pat
     }
     assert facts["submission_key"] == submission
     assert len(facts["host_runtime_transitions"]) == 4
-    assert set(facts["delivery"]["remote_receipt"]) == {"remote_id"}
+    assert facts["delivery"]["remote_receipt"] == {
+        "remote_id": "feishu-comment-1",
+        "confirmed_field_keys": ["field_9193cb", "field_8c912e"],
+    }
     assert len(facts["control_snapshot_sha256"]) == 64
     assert len(facts["delivery_snapshot_sha256"]) == 64
     json.dumps(facts, allow_nan=False)

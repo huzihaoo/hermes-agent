@@ -110,7 +110,7 @@ from scripts.pnc_rca_contract_drift_guard import (
 )
 from scripts import pnc_rca_cutover_guard as cutover_guard
 from scripts import pnc_rca_feishu_ingress_hold as feishu_ingress_hold
-from scripts.pnc_rca_kafka_consumer import ConsumerConfig
+from scripts.pnc_rca_kafka_consumer import ConsumerConfig, kafka_principal_is_valid
 from scripts.pnc_rca_kafka_preflight import (
     BROKER_METADATA_SCHEMA_VERSION,
     COLLECTOR_SCHEMA_VERSION as KAFKA_PREFLIGHT_COLLECTOR_SCHEMA_VERSION,
@@ -175,7 +175,10 @@ KAFKA_E2E_CANARY_MANIFEST_SCHEMA_VERSION = (
     "pnc_rca_kafka_e2e_canary_manifest_v1"
 )
 KAFKA_FEISHU_E2E_RECEIPT_SCHEMA_VERSION = (
-    "pnc_rca_feishu_kafka_e2e_receipt_v1"
+    "pnc_rca_feishu_kafka_e2e_receipt_v2"
+)
+KAFKA_FEISHU_FRAME_CENSUS_SCHEMA_VERSION = (
+    "pnc_rca_real_feishu_frame_census_v1"
 )
 KAFKA_RECENT_REPLAY_FILENAME = "kafka_recent_replay.json"
 KAFKA_RECENT_REPLAY_MODULE = "scripts/pnc_rca_kafka_recent_replay.py"
@@ -184,6 +187,9 @@ KAFKA_RECENT_REPLAY_SCHEMA = (
 )
 KAFKA_E2E_CANARY_MANIFEST_SCHEMA = (
     "docs/pnc/schemas/pnc_rca_kafka_e2e_canary_manifest_v1.schema.json"
+)
+KAFKA_FEISHU_FRAME_CENSUS_SCHEMA = (
+    "docs/pnc/schemas/pnc_rca_real_feishu_frame_census_v1.schema.json"
 )
 REMOTE_READER_HEALTH_SCHEMA_VERSION = "pnc_rca_remote_reader_health_v1"
 REMOTE_READER_SOAK_SCHEMA_VERSION = "pnc_rca_remote_reader_soak_v4"
@@ -754,6 +760,7 @@ MINIMUM_CRITICAL_FILES = frozenset({
     "gateway/feishu_task_card.py",
     "gateway/pnc_issue_capture.py",
     "gateway/pnc_issue_context.py",
+    "gateway/pnc_rca_frame_reference.py",
     "gateway/pnc_field_gap_comment.py",
     "gateway/platforms/feishu.py",
     "gateway/pnc_group_binding.py",
@@ -768,6 +775,7 @@ MINIMUM_CRITICAL_FILES = frozenset({
     REMOTE_READER_WORKLOAD_EXPORT_RECEIPT_SCHEMA,
     KAFKA_RECENT_REPLAY_SCHEMA,
     KAFKA_E2E_CANARY_MANIFEST_SCHEMA,
+    KAFKA_FEISHU_FRAME_CENSUS_SCHEMA,
     "scripts/g1q3_rca_e2e_smoke.py",
     "scripts/pnc_g1q3_governance_rca.py",
     "scripts/pnc_g1q3_truth.py",
@@ -4101,6 +4109,180 @@ def _check_remote_reader_workload_provenance(
     }
 
 
+def _check_kafka_e2e_frame_census(
+    *,
+    path_value: str,
+    expected_sha256: str,
+    manifest_task_id: str,
+    expected_work_item_ids: Sequence[str],
+    replay_observed_at: datetime,
+) -> dict[str, Any]:
+    blocker = "kafka_recent_replay_e2e_frame_census_invalid"
+    path = Path(path_value).expanduser().absolute()
+    try:
+        raw, census = _load_owner_only_json(
+            path,
+            artifact="kafka_recent_replay_e2e_frame_census",
+        )
+    except (EvidenceError, OSError, ValueError) as exc:
+        raise EvidenceError(blocker) from exc
+    if (
+        hashlib.sha256(raw).hexdigest() != expected_sha256
+        or set(census)
+        != {
+            "schema_version",
+            "generated_at",
+            "task_id",
+            "source",
+            "summary",
+            "records",
+            "contains_raw_field_values",
+            "contains_credentials",
+            "mutation_performed",
+        }
+        or census.get("schema_version")
+        != KAFKA_FEISHU_FRAME_CENSUS_SCHEMA_VERSION
+        or census.get("task_id") != manifest_task_id
+        or census.get("contains_raw_field_values") is not False
+        or census.get("contains_credentials") is not False
+        or census.get("mutation_performed") is not False
+        or _timestamp(census.get("generated_at"), f"{blocker}.generated_at")
+        > replay_observed_at
+    ):
+        raise EvidenceError(blocker)
+    source = _remote_soak_object(
+        census.get("source"),
+        field=f"{blocker}.source",
+        keys={
+            "kind",
+            "project_key",
+            "work_item_type_key",
+            "selected_field_keys",
+        },
+        blocker=blocker,
+    )
+    if source != {
+        "kind": "official_meegle_read_only",
+        "project_key": "t03o4q",
+        "work_item_type_key": "issue",
+        "selected_field_keys": [
+            "field_1fda45",
+            "field_9193cb",
+            "field_8c912e",
+        ],
+    }:
+        raise EvidenceError(blocker)
+
+    expected_count = len(expected_work_item_ids)
+    summary = _remote_soak_object(
+        census.get("summary"),
+        field=f"{blocker}.summary",
+        keys={
+            "expected_work_items",
+            "observed_work_items",
+            "fetch_status_counts",
+            "frame_reference_kind_counts",
+            "result_field_nonempty_count",
+            "report_field_nonempty_count",
+        },
+        blocker=blocker,
+    )
+    records = census.get("records")
+    if not isinstance(records, list) or len(records) != expected_count:
+        raise EvidenceError(blocker)
+    observed_ids: list[str] = []
+    kind_counts: Counter[str] = Counter()
+    result_count = 0
+    report_count = 0
+    for index, raw_record in enumerate(records):
+        record = _mapping(raw_record, f"{blocker}.records.{index}")
+        base_keys = {
+            "work_item_id",
+            "fetch_status",
+            "frame_field_present",
+            "result_field_present",
+            "report_field_present",
+            "frame_value_sha256",
+            "frame_reference_kind",
+        }
+        kind = record.get("frame_reference_kind")
+        if kind == "frame_id":
+            expected_keys = base_keys | {"frame_id"}
+        elif kind == "front_camera_timestamp":
+            expected_keys = base_keys | {
+                "management_timestamp",
+                "management_timestamp_unit",
+                "timezone",
+                "max_delta_us",
+            }
+        else:
+            raise EvidenceError(blocker)
+        if set(record) != expected_keys:
+            raise EvidenceError(blocker)
+        work_item_id = _required_text(
+            record.get("work_item_id"),
+            f"{blocker}.records.{index}.work_item_id",
+        )
+        if (
+            not work_item_id.isdigit()
+            or int(work_item_id) <= 0
+            or record.get("fetch_status") != "ok"
+            or record.get("frame_field_present") is not True
+            or not isinstance(record.get("result_field_present"), bool)
+            or not isinstance(record.get("report_field_present"), bool)
+        ):
+            raise EvidenceError(blocker)
+        _sha256_digest(
+            record.get("frame_value_sha256"),
+            f"{blocker}.records.{index}.frame_value_sha256",
+        )
+        if kind == "frame_id":
+            frame_id = _required_text(
+                record.get("frame_id"),
+                f"{blocker}.records.{index}.frame_id",
+            )
+            if not frame_id.isdigit() or int(frame_id) <= 0:
+                raise EvidenceError(blocker)
+        elif (
+            _exact_int(
+                record.get("management_timestamp"),
+                f"{blocker}.records.{index}.management_timestamp",
+                minimum=1,
+            )
+            < 946_684_800_000_000
+            or record.get("management_timestamp_unit")
+            != "microseconds_since_unix_epoch"
+            or record.get("timezone") != "Asia/Shanghai"
+            or _exact_int(
+                record.get("max_delta_us"),
+                f"{blocker}.records.{index}.max_delta_us",
+                minimum=1,
+            )
+            != 100_000
+        ):
+            raise EvidenceError(blocker)
+        observed_ids.append(work_item_id)
+        kind_counts[kind] += 1
+        result_count += int(record["result_field_present"])
+        report_count += int(record["report_field_present"])
+    if (
+        sorted(observed_ids, key=int) != list(expected_work_item_ids)
+        or summary.get("expected_work_items") != expected_count
+        or summary.get("observed_work_items") != expected_count
+        or summary.get("fetch_status_counts") != {"ok": expected_count}
+        or summary.get("frame_reference_kind_counts")
+        != dict(sorted(kind_counts.items()))
+        or summary.get("result_field_nonempty_count") != result_count
+        or summary.get("report_field_nonempty_count") != report_count
+    ):
+        raise EvidenceError(blocker)
+    return {
+        "frame_census_sha256": expected_sha256,
+        "frame_reference_parseable": expected_count,
+        "frame_reference_kind_counts": dict(sorted(kind_counts.items())),
+    }
+
+
 def _check_kafka_e2e_feishu_source(
     *,
     manifest_task_id: str,
@@ -4180,6 +4362,7 @@ def _check_kafka_e2e_feishu_source(
         keys={
             "credential_persisted",
             "person_identity_persisted",
+            "raw_frame_reference_persisted",
             "raw_pdcl_reference_persisted",
             "raw_title_persisted",
         },
@@ -4194,6 +4377,7 @@ def _check_kafka_e2e_feishu_source(
     if privacy != {
         "credential_persisted": False,
         "person_identity_persisted": False,
+        "raw_frame_reference_persisted": False,
         "raw_pdcl_reference_persisted": False,
         "raw_title_persisted": False,
     } or side_effects != {
@@ -4242,6 +4426,10 @@ def _check_kafka_e2e_feishu_source(
             "work_items_found",
             "pdcl_field_present",
             "function_field_present",
+            "frame_field_present",
+            "frame_reference_parseable",
+            "frame_census_path",
+            "frame_census_sha256",
             "creation_records_found",
             "all_exactly_one_creation_record",
             "all_identity_fields_match",
@@ -4259,6 +4447,8 @@ def _check_kafka_e2e_feishu_source(
                 "work_items_found",
                 "pdcl_field_present",
                 "function_field_present",
+                "frame_field_present",
+                "frame_reference_parseable",
                 "creation_records_found",
             )
         )
@@ -4305,10 +4495,28 @@ def _check_kafka_e2e_feishu_source(
         observed_work_item_ids.append(work_item_id)
     if sorted(observed_work_item_ids, key=int) != list(expected_work_item_ids):
         raise EvidenceError(blocker)
+    frame_census_path = _required_text(
+        result.get("frame_census_path"),
+        f"{blocker}.result.frame_census_path",
+    )
+    if not Path(frame_census_path).expanduser().is_absolute():
+        raise EvidenceError(blocker)
+    frame_census_sha256 = _sha256_digest(
+        result.get("frame_census_sha256"),
+        f"{blocker}.result.frame_census_sha256",
+    )
+    frame_census = _check_kafka_e2e_frame_census(
+        path_value=frame_census_path,
+        expected_sha256=frame_census_sha256,
+        manifest_task_id=manifest_task_id,
+        expected_work_item_ids=expected_work_item_ids,
+        replay_observed_at=replay_observed_at,
+    )
     return {
         "feishu_receipt_sha256": source["feishu_receipt_sha256"],
         "screenshot_sha256": screenshot_sha256,
         "verified_work_item_count": expected_count,
+        **frame_census,
     }
 
 
@@ -9620,12 +9828,17 @@ def _check_canary_receipt(
     remote_receipt = _mapping(
         delivery.get("remote_receipt"), "canary_receipt.delivery.remote_receipt"
     )
-    if set(remote_receipt) != {"remote_id"}:
+    if set(remote_receipt) != {"remote_id", "confirmed_field_keys"}:
         raise EvidenceError("canary_receipt_delivery_remote_receipt_shape_invalid")
     remote_id = _required_text(
         remote_receipt.get("remote_id"),
         "canary_receipt.delivery.remote_receipt.remote_id",
     )
+    if remote_receipt.get("confirmed_field_keys") != [
+        "field_9193cb",
+        "field_8c912e",
+    ]:
+        raise EvidenceError("canary_receipt_delivery_result_fields_unconfirmed")
     obligations_detail = _check_delivery_obligations(
         delivery_obligations,
         admission=admission,
@@ -19864,12 +20077,11 @@ def _check_consumer_config(
     expected_rule_version: str,
 ) -> list[str]:
     errors: list[str] = []
-    fixed_identity = (
-        consumer.username,
-        consumer.group_id,
-        consumer.client_id,
-    )
-    if any(value != FIXED_SERVICE_ID for value in fixed_identity):
+    if (
+        not kafka_principal_is_valid(consumer.username)
+        or consumer.group_id != FIXED_SERVICE_ID
+        or consumer.client_id != FIXED_SERVICE_ID
+    ):
         errors.append("consumer_identity_mismatch")
     if consumer.api_version != FIXED_API_VERSION:
         errors.append("consumer_api_version_mismatch")

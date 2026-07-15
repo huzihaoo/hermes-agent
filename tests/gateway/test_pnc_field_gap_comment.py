@@ -42,7 +42,9 @@ def test_build_comment_covers_supported_kinds_and_names_owner():
     current = build_field_gap_comment("issue_field_missing_remote_data_reference")
     assert current == build_field_gap_comment("issue_field_missing_pdcl_download_cmd")
 
-    assert build_field_gap_comment("missing_frame_id")["signature"] == "缺少 问题发生frameid"
+    frame_plan = build_field_gap_comment("missing_frame_id")
+    assert frame_plan["signature"] == "缺少 问题发生frameid"
+    assert "YYYY-MM-DD HH:MM:SS / YYYYMMDD, HH:MM:SS" in frame_plan["content"]
     assert build_field_gap_comment("host_meegle_preread_unauthenticated") is None
 
 
@@ -198,6 +200,17 @@ def test_invalid_pdcl_empty_subkind_uses_missing_remote_reference_copy():
     assert "不会执行 MDI 下载" in plan["content"]
     assert "mdi download" not in plan["content"]
     assert '<at user_id="ou_owner">张三</at>' in plan["content"]
+
+
+def test_frame_replay_command_copy_accepts_only_frame_or_exact_time_formats():
+    plan = build_field_gap_comment(
+        "missing_frame_id",
+        ["张三"],
+        sub_kind="replay_cmd",
+    )
+
+    assert "只接受触发帧号或测试打点时间" in plan["content"]
+    assert "YYYY-MM-DD HH:MM:SS / YYYYMMDD, HH:MM:SS" in plan["content"]
 
 
 def test_owner_open_id_missing_falls_back_to_name_without_raising():

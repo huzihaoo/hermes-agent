@@ -214,6 +214,16 @@ def test_valid_sealed_html_bundle_builds_one_issue_comment_effect():
     assert delivery.effect_payload["marker"] == delivery.marker
     assert delivery.marker in delivery.effect_payload["comment_content"]
     assert delivery.effect_key in delivery.marker
+    assert delivery.effect_payload["field_updates"] == [
+        {
+            "field_key": "field_9193cb",
+            "field_value": "候选因果判断：减速度请求偏重。",
+        },
+        {
+            "field_key": "field_8c912e",
+            "field_value": delivery.report_url,
+        },
+    ]
     assert delivery.target_key == "feishu_project:t03o4q:issue:7041712812"
     assert delivery.report_url == build_report_url(
         delivery.submission_key, delivery.artifact_set_id
@@ -222,6 +232,16 @@ def test_valid_sealed_html_bundle_builds_one_issue_comment_effect():
         "https://project.feishu.cn/g1q3/issue/detail/7041712812"
     )
     assert "/t03o4q/issue/detail/" not in delivery.issue_url
+
+
+def test_delivery_rejects_empty_result_field_conclusion():
+    bundle = _bundle()
+    bundle[1]["summary"] = {"short_conclusion": "  ", "l0": ""}
+
+    with pytest.raises(DeliveryContractError) as exc_info:
+        _verify(bundle)
+
+    assert exc_info.value.code == "delivery_conclusion_missing"
 
 
 def test_thread_reply_effect_is_bound_to_exact_topic_and_is_deterministic():

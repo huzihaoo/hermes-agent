@@ -61,14 +61,14 @@ _TEMPLATES = {
         "signature": "缺少 问题发生frameid",
         "body": (
             "【G1Q3 RCA 机器人提醒】本问题卡片缺少 问题发生frameid，数据已就绪但无法定位触发帧，自动根因分析停在对齐前。\n\n"
-            "请{owner}在「问题发生frameid」字段填写大于 0 的触发帧号。\n\n新建问题单由 Kafka 自动受理；"
+            "请{owner}在「问题发生frameid」字段填写大于 0 的触发帧号，或测试打点时间（格式：YYYY-MM-DD HH:MM:SS / YYYYMMDD, HH:MM:SS）。\n\n新建问题单由 Kafka 自动受理；"
             "已建单补齐字段后，可在固定群（HERMES_RCA_MANUAL_CHAT_IDS 当前启用子集）真实 @小助手并发送“分析/重跑 + 完整问题单 URL”。"
             "普通 URL、未 @ 或私聊仍只读；人工触发结果回到原任务话题。"
         ),
     },
     "missing_frame_id:replay_cmd": {
         "signature": "问题发生frameid 填成了回放命令",
-        "body": "【G1Q3 RCA 机器人提醒】本问题卡片的「问题发生frameid」字段像是填入了 cyber_recorder/数据命令，该字段只能填写触发帧号。\n\n请{owner}把数据/回放相关内容移到「问题数据地址_PDCL」或描述字段，并在「问题发生frameid」填写大于 0 的数字帧号。新建问题单由 Kafka 自动受理；已建单补齐字段后，可在固定群（HERMES_RCA_MANUAL_CHAT_IDS 当前启用子集）真实 @小助手并发送“分析/重跑 + 完整问题单 URL”。普通 URL、未 @ 或私聊仍只读；人工触发结果回到原任务话题。",
+        "body": "【G1Q3 RCA 机器人提醒】本问题卡片的「问题发生frameid」字段像是填入了 cyber_recorder/数据命令，该字段只接受触发帧号或测试打点时间。\n\n请{owner}把数据/回放相关内容移到「问题数据地址_PDCL」或描述字段，并在「问题发生frameid」填写大于 0 的数字帧号，或 YYYY-MM-DD HH:MM:SS / YYYYMMDD, HH:MM:SS 格式的时间。新建问题单由 Kafka 自动受理；已建单补齐字段后，可在固定群（HERMES_RCA_MANUAL_CHAT_IDS 当前启用子集）真实 @小助手并发送“分析/重跑 + 完整问题单 URL”。普通 URL、未 @ 或私聊仍只读；人工触发结果回到原任务话题。",
     },
 }
 
