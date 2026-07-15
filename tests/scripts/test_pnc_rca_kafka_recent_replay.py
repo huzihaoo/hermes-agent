@@ -300,23 +300,34 @@ def test_policy_observation_discovers_real_values_without_approving_them(
         }
     ]
     assert receipt["result"]["e2e_canary"]["complete"] is True
-    assert receipt["result"]["e2e_canary"]["observed_policy"] == {
-        "record_count": 1,
-        "fields": {
-            "project_key": [{"value": "project-key", "count": 1}],
-            "project_simple_name": [{"value": "g1q3", "count": 1}],
-            "work_item_type_key": [{"value": "problem-type", "count": 1}],
-            "status_change_type": [{"value": "Reached", "count": 1}],
-        },
-        "transitions": [
-            {
-                "state_key": "new-problem-state",
-                "pre_status": "1",
-                "cur_status": "2",
-                "count": 1,
-            }
-        ],
+    observed_policy = receipt["result"]["e2e_canary"]["observed_policy"]
+    assert observed_policy["record_count"] == 1
+    assert observed_policy["fields"] == {
+        "project_key": [{"value": "project-key", "count": 1}],
+        "project_simple_name": [{"value": "g1q3", "count": 1}],
+        "work_item_type_key": [{"value": "problem-type", "count": 1}],
+        "status_change_type": [{"value": "Reached", "count": 1}],
     }
+    assert observed_policy["transitions"] == [
+        {
+            "state_key": "new-problem-state",
+            "pre_status": "1",
+            "cur_status": "2",
+            "count": 1,
+        }
+    ]
+    schema = {item["field"]: item for item in observed_policy["schema"]}
+    assert schema["id"] == {
+        "field": "id",
+        "present_count": 1,
+        "types": [{"type": "integer", "count": 1}],
+    }
+    assert schema["nodes"] == {
+        "field": "nodes",
+        "present_count": 1,
+        "types": [{"type": "array", "count": 1}],
+    }
+    assert schema["name"]["types"] == [{"type": "string", "count": 1}]
     serialized = json.dumps(receipt, ensure_ascii=False)
     assert "private title" not in serialized
     assert "test-secret" not in serialized

@@ -335,6 +335,7 @@ class _PolicyObservation:
         self.expected_fields: dict[str, Counter[str]] = {
             name: Counter() for name in self.fields
         }
+        self.expected_schema: dict[str, Counter[str]] = {}
         self.transitions: Counter[tuple[str, str, str]] = Counter()
         self.expected_transitions: Counter[tuple[str, str, str]] = Counter()
 
@@ -358,6 +359,24 @@ class _PolicyObservation:
             return
         counter[key] += 1
 
+    @staticmethod
+    def _type_name(value: Any) -> str:
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return "boolean"
+        if isinstance(value, int):
+            return "integer"
+        if isinstance(value, float):
+            return "number"
+        if isinstance(value, str):
+            return "string"
+        if isinstance(value, list):
+            return "array"
+        if isinstance(value, dict):
+            return "object"
+        return "unknown"
+
     def observe(self, raw: bytes) -> None:
         self.records_seen += 1
         try:
@@ -375,6 +394,25 @@ class _PolicyObservation:
         if is_expected:
             self.expected_observed.add(work_item_id)
             self.expected_records += 1
+            for field, value in payload.items():
+                if (
+                    not field
+                    or field != field.strip()
+                    or len(field) > MAX_OBSERVED_IDENTITY_LENGTH
+                    or "\r" in field
+                    or "\n" in field
+                ):
+                    self.overflows["expected_schema_field"] += 1
+                    continue
+                if (
+                    field not in self.expected_schema
+                    and len(self.expected_schema) >= MAX_OBSERVED_IDENTITIES
+                ):
+                    self.overflows["expected_schema_fields"] += 1
+                    continue
+                self.expected_schema.setdefault(field, Counter())[
+                    self._type_name(value)
+                ] += 1
 
         for name, counter in self.fields.items():
             value = self._identity(payload, name)
@@ -479,6 +517,17 @@ class _PolicyObservation:
                 "observed_policy": {
                     "record_count": self.expected_records,
                     "fields": self._fields_receipt(self.expected_fields),
+                    "schema": [
+                        {
+                            "field": field,
+                            "present_count": sum(types.values()),
+                            "types": [
+                                {"type": type_name, "count": count}
+                                for type_name, count in sorted(types.items())
+                            ],
+                        }
+                        for field, types in sorted(self.expected_schema.items())
+                    ],
                     "transitions": self._transitions_receipt(
                         self.expected_transitions
                     ),
