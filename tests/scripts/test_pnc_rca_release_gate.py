@@ -11401,6 +11401,7 @@ def test_candidate_runtime_rejects_issue_capture_write_environment(
     tmp_path, capture_environment, blocker
 ):
     environment = {
+        "HOME": str(Path.home()),
         "HERMES_HOME": str(tmp_path / ".hermes"),
         "PATH": "/usr/bin:/bin",
         "PYTHONDONTWRITEBYTECODE": "1",
