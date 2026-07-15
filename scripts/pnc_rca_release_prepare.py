@@ -172,8 +172,13 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _strict_json(raw: bytes, *, artifact: str) -> Mapping[str, Any]:
-    if not raw or len(raw) > MAX_JSON_BYTES:
+def _strict_json(
+    raw: bytes,
+    *,
+    artifact: str,
+    max_bytes: int = MAX_JSON_BYTES,
+) -> Mapping[str, Any]:
+    if not raw or len(raw) > max_bytes:
         raise ReleasePrepareError(f"{artifact}_size_invalid")
 
     def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -199,7 +204,12 @@ def _strict_json(raw: bytes, *, artifact: str) -> Mapping[str, Any]:
     return value
 
 
-def _read_owned_file(path: Path, *, artifact: str) -> _OwnedFile:
+def _read_owned_file(
+    path: Path,
+    *,
+    artifact: str,
+    max_bytes: int = MAX_JSON_BYTES,
+) -> _OwnedFile:
     candidate = path.expanduser().absolute()
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
@@ -220,12 +230,12 @@ def _read_owned_file(path: Path, *, artifact: str) -> _OwnedFile:
         chunks: list[bytes] = []
         total = 0
         while True:
-            chunk = os.read(descriptor, min(64 * 1024, MAX_JSON_BYTES + 1 - total))
+            chunk = os.read(descriptor, min(64 * 1024, max_bytes + 1 - total))
             if not chunk:
                 break
             chunks.append(chunk)
             total += len(chunk)
-            if total > MAX_JSON_BYTES:
+            if total > max_bytes:
                 raise ReleasePrepareError(f"{artifact}_size_invalid")
         after = os.fstat(descriptor)
         try:
@@ -249,13 +259,18 @@ def _read_owned_file(path: Path, *, artifact: str) -> _OwnedFile:
         os.close(descriptor)
 
 
-def _read_owned_json(path: Path, *, artifact: str) -> _OwnedJson:
-    owned = _read_owned_file(path, artifact=artifact)
+def _read_owned_json(
+    path: Path,
+    *,
+    artifact: str,
+    max_bytes: int = MAX_JSON_BYTES,
+) -> _OwnedJson:
+    owned = _read_owned_file(path, artifact=artifact, max_bytes=max_bytes)
     return _OwnedJson(
         path=owned.path,
         raw=owned.raw,
         stat_result=owned.stat_result,
-        body=_strict_json(owned.raw, artifact=artifact),
+        body=_strict_json(owned.raw, artifact=artifact, max_bytes=max_bytes),
     )
 
 
@@ -599,7 +614,11 @@ def _validate_runtime_stage_identity(
     manifest_path = inputs.runtime_stage_manifest.expanduser().absolute()
     if manifest_path != root / runtime_stage.MANIFEST_FILENAME:
         raise ReleasePrepareError("runtime_stage_manifest_path_mismatch")
-    owned = _read_owned_json(manifest_path, artifact="runtime_stage_manifest")
+    owned = _read_owned_json(
+        manifest_path,
+        artifact="runtime_stage_manifest",
+        max_bytes=runtime_stage.MAX_JSON_BYTES,
+    )
     try:
         validated = dict(validator(root))
     except runtime_stage.RuntimeStageError as exc:

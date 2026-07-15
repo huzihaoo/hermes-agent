@@ -1211,6 +1211,31 @@ def test_candidate_plists_must_come_from_physical_stage(prepared_fixture):
     assert error.value.code == "candidate_plist_path_mismatch"
 
 
+def test_runtime_stage_reader_uses_canonical_manifest_size_limit(prepared_fixture):
+    manifest = json.loads(json.dumps(prepared_fixture.runtime_stage_manifest))
+    descriptor = next(
+        iter(manifest["content"]["source"]["runtime_files"].values())
+    )
+    descriptor["test_padding"] = "x" * (prepare.MAX_JSON_BYTES + 1)
+    manifest["content_sha256"] = prepare._sha256_json(manifest["content"])
+    _write_owner_json(prepared_fixture.inputs.runtime_stage_manifest, manifest)
+    assert prepared_fixture.inputs.runtime_stage_manifest.stat().st_size > (
+        prepare.MAX_JSON_BYTES
+    )
+    assert prepared_fixture.inputs.runtime_stage_manifest.stat().st_size < (
+        prepare.runtime_stage.MAX_JSON_BYTES
+    )
+
+    identity = prepare._validate_runtime_stage_identity(
+        prepared_fixture.inputs,
+        validator=lambda _root: manifest,
+    )
+
+    assert identity["manifest_sha256"] == hashlib.sha256(
+        prepared_fixture.inputs.runtime_stage_manifest.read_bytes()
+    ).hexdigest()
+
+
 def test_runtime_stage_manifest_is_revalidated_and_drift_fails(prepared_fixture):
     calls = 0
 
