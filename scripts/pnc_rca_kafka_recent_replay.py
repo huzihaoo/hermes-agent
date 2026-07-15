@@ -317,6 +317,7 @@ class _PolicyObservation:
     def __init__(self, expected_work_item_ids: frozenset[str]) -> None:
         self.expected_work_item_ids = expected_work_item_ids
         self.expected_observed: set[str] = set()
+        self.expected_records = 0
         self.records_seen = 0
         self.records_decoded = 0
         self.invalid_records = 0
@@ -331,7 +332,11 @@ class _PolicyObservation:
                 "status_change_type",
             )
         }
+        self.expected_fields: dict[str, Counter[str]] = {
+            name: Counter() for name in self.fields
+        }
         self.transitions: Counter[tuple[str, str, str]] = Counter()
+        self.expected_transitions: Counter[tuple[str, str, str]] = Counter()
 
     def _identity(self, payload: Mapping[str, Any], name: str) -> str | None:
         value = payload.get(name)
@@ -361,16 +366,26 @@ class _PolicyObservation:
             self.invalid_records += 1
             return
         self.records_decoded += 1
+
+        raw_work_item_id = payload.get("id")
+        work_item_id = ""
+        if not isinstance(raw_work_item_id, bool):
+            work_item_id = str(raw_work_item_id or "").strip()
+        is_expected = work_item_id in self.expected_work_item_ids
+        if is_expected:
+            self.expected_observed.add(work_item_id)
+            self.expected_records += 1
+
         for name, counter in self.fields.items():
             value = self._identity(payload, name)
             if value is not None:
                 self._bounded_add(counter, value, name)
-
-        raw_work_item_id = payload.get("id")
-        if not isinstance(raw_work_item_id, bool):
-            work_item_id = str(raw_work_item_id or "").strip()
-            if work_item_id in self.expected_work_item_ids:
-                self.expected_observed.add(work_item_id)
+                if is_expected:
+                    self._bounded_add(
+                        self.expected_fields[name],
+                        value,
+                        f"expected_{name}",
+                    )
 
         nodes = payload.get("nodes")
         if not isinstance(nodes, list) or len(nodes) > 100:
@@ -407,6 +422,38 @@ class _PolicyObservation:
                 (state_key, pre_text, cur_text),
                 "transitions",
             )
+            if is_expected:
+                self._bounded_add(
+                    self.expected_transitions,
+                    (state_key, pre_text, cur_text),
+                    "expected_transitions",
+                )
+
+    @staticmethod
+    def _fields_receipt(
+        fields: Mapping[str, Counter[str]],
+    ) -> dict[str, list[dict[str, Any]]]:
+        return {
+            name: [
+                {"value": value, "count": count}
+                for value, count in sorted(counter.items())
+            ]
+            for name, counter in fields.items()
+        }
+
+    @staticmethod
+    def _transitions_receipt(
+        transitions: Counter[tuple[str, str, str]],
+    ) -> list[dict[str, Any]]:
+        return [
+            {
+                "state_key": key[0],
+                "pre_status": key[1],
+                "cur_status": key[2],
+                "count": count,
+            }
+            for key, count in sorted(transitions.items())
+        ]
 
     def receipt(self) -> dict[str, Any]:
         expected = sorted(self.expected_work_item_ids, key=int)
@@ -417,22 +464,8 @@ class _PolicyObservation:
             "invalid_records": self.invalid_records,
             "invalid_field_counts": dict(sorted(self.invalid_fields.items())),
             "overflow_counts": dict(sorted(self.overflows.items())),
-            "fields": {
-                name: [
-                    {"value": value, "count": count}
-                    for value, count in sorted(counter.items())
-                ]
-                for name, counter in self.fields.items()
-            },
-            "transitions": [
-                {
-                    "state_key": key[0],
-                    "pre_status": key[1],
-                    "cur_status": key[2],
-                    "count": count,
-                }
-                for key, count in sorted(self.transitions.items())
-            ],
+            "fields": self._fields_receipt(self.fields),
+            "transitions": self._transitions_receipt(self.transitions),
             "e2e_canary": {
                 "required": bool(expected),
                 "expected_work_item_ids": expected,
@@ -443,6 +476,13 @@ class _PolicyObservation:
                 ),
                 "complete": bool(expected)
                 and self.expected_work_item_ids == self.expected_observed,
+                "observed_policy": {
+                    "record_count": self.expected_records,
+                    "fields": self._fields_receipt(self.expected_fields),
+                    "transitions": self._transitions_receipt(
+                        self.expected_transitions
+                    ),
+                },
             },
         }
 

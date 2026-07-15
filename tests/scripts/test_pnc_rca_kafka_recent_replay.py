@@ -266,7 +266,7 @@ def test_policy_observation_discovers_real_values_without_approving_them(
         transport_env,
         hermes_home=tmp_path,
     )
-    manifest = _manifest(tmp_path, ["7000000000", "7000000001"])
+    manifest = _manifest(tmp_path, ["7000000000"])
     expected, observation = replay.load_e2e_canary_manifest(manifest)
 
     receipt = replay.collect_recent_policy_observation(
@@ -300,6 +300,23 @@ def test_policy_observation_discovers_real_values_without_approving_them(
         }
     ]
     assert receipt["result"]["e2e_canary"]["complete"] is True
+    assert receipt["result"]["e2e_canary"]["observed_policy"] == {
+        "record_count": 1,
+        "fields": {
+            "project_key": [{"value": "project-key", "count": 1}],
+            "project_simple_name": [{"value": "g1q3", "count": 1}],
+            "work_item_type_key": [{"value": "problem-type", "count": 1}],
+            "status_change_type": [{"value": "Reached", "count": 1}],
+        },
+        "transitions": [
+            {
+                "state_key": "new-problem-state",
+                "pre_status": "1",
+                "cur_status": "2",
+                "count": 1,
+            }
+        ],
+    }
     serialized = json.dumps(receipt, ensure_ascii=False)
     assert "private title" not in serialized
     assert "test-secret" not in serialized
