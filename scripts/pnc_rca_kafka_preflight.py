@@ -30,6 +30,7 @@ from hermes_constants import get_hermes_home
 
 ENV_PREFIX = "HERMES_RCA_KAFKA_"
 FIXED_SERVICE_ID = "root_cause_analysis_agent"
+FIXED_KAFKA_GROUP_ID = "rca_root_cause_analysis_agent"
 KAFKA_PRINCIPAL_PREFIX = "rca_"
 MAX_KAFKA_PRINCIPAL_LENGTH = 128
 MAX_ENV_FILE_BYTES = 1024 * 1024
@@ -176,13 +177,13 @@ class BrokerProbeConfig:
     expected_cluster_id: str | None
     username: str
     password: str = field(repr=False)
-    configured_group_id: str = FIXED_SERVICE_ID
+    configured_group_id: str = FIXED_KAFKA_GROUP_ID
     api_version: tuple[int, int, int] = (3, 9, 0)
     security_protocol: str = "SASL_PLAINTEXT"
     sasl_mechanism: str = "PLAIN"
     request_timeout_ms: int = 120_000
     minimum_replication_factor: int | None = None
-    client_id: str = "root_cause_analysis_agent_metadata_preflight"
+    client_id: str = f"{FIXED_SERVICE_ID}_metadata_preflight"
 
     @classmethod
     def from_env(
@@ -209,8 +210,10 @@ class BrokerProbeConfig:
             )
         username = _required_kafka_principal(source, f"{ENV_PREFIX}USER")
         group_id = _required(source, f"{ENV_PREFIX}GROUP")
-        if group_id != FIXED_SERVICE_ID:
-            raise ValueError(f"{ENV_PREFIX}GROUP must be exactly {FIXED_SERVICE_ID}")
+        if group_id != FIXED_KAFKA_GROUP_ID:
+            raise ValueError(
+                f"{ENV_PREFIX}GROUP must be exactly {FIXED_KAFKA_GROUP_ID}"
+            )
         security_protocol = str(
             source.get(f"{ENV_PREFIX}SECURITY_PROTOCOL", "SASL_PLAINTEXT")
         ).strip()

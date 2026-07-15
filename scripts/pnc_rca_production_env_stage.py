@@ -61,6 +61,7 @@ SAFE_LITERAL_PATTERN = re.compile(r"[^\x00\r\n\t #]+\Z")
 
 CANONICAL_LIVE_ENV = Path.home() / ".hermes" / ".env"
 FIXED_SERVICE_ID = "root_cause_analysis_agent"
+FIXED_KAFKA_GROUP_ID = "rca_root_cause_analysis_agent"
 RELEASE_ACTION_SET = (
     "promote_host_candidate",
     "promote_scoped_workspace_closure",
@@ -110,7 +111,7 @@ PASSTHROUGH_REQUIRED_KEYS = frozenset(
 )
 
 FIXED_PRODUCTION_VALUES = {
-    "HERMES_RCA_KAFKA_GROUP": FIXED_SERVICE_ID,
+    "HERMES_RCA_KAFKA_GROUP": FIXED_KAFKA_GROUP_ID,
     "HERMES_RCA_KAFKA_CLIENT_ID": FIXED_SERVICE_ID,
     "HERMES_RCA_KAFKA_API_VERSION": "3.9.0",
     "HERMES_RCA_KAFKA_REQUEST_TIMEOUT_MS": "120000",

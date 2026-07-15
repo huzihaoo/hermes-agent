@@ -1124,7 +1124,7 @@ def _consumer_env(tmp_path: Path, mode: str) -> dict[str, str]:
         "HERMES_RCA_KAFKA_EXPECTED_CLUSTER_ID": "cluster-production-1",
         "HERMES_RCA_KAFKA_USER": "rca_release_agent",
         "HERMES_RCA_KAFKA_PASSWORD": SECRET,
-        "HERMES_RCA_KAFKA_GROUP": "root_cause_analysis_agent",
+        "HERMES_RCA_KAFKA_GROUP": "rca_root_cause_analysis_agent",
         "HERMES_RCA_KAFKA_CLIENT_ID": "root_cause_analysis_agent",
         "HERMES_RCA_KAFKA_API_VERSION": "3.9.0",
         "HERMES_RCA_KAFKA_REQUEST_TIMEOUT_MS": "120000",
@@ -3409,7 +3409,7 @@ def _write_common_evidence(evidence_dir: Path, kafka_env_file: Path) -> None:
             "schema_version": T0_OFFSETS_SCHEMA_VERSION,
             "observed_at": OBSERVED_AT,
             "explicit_t0": True,
-            "group_id": "root_cause_analysis_agent",
+            "group_id": "rca_root_cause_analysis_agent",
             "topic": TOPIC,
             "partition_offsets": {"0": 10, "1": 20},
         },
@@ -10542,7 +10542,7 @@ def _release_approval_binding_fixture(tmp_path: Path):
     t0 = {
         "schema_version": release_gate_module.RELEASE_PREPARE_T0_SCHEMA_VERSION,
         "topic": TOPIC,
-        "group_id": "root_cause_analysis_agent",
+        "group_id": "rca_root_cause_analysis_agent",
         "initial_offsets": {"0": 101, "1": 202},
     }
     rollback = {

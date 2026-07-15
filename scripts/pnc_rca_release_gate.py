@@ -436,6 +436,7 @@ MAX_CANARY_EVIDENCE_COMMIT_BYTES = 64 * 1024
 MAX_EVIDENCE_JSON_NESTING = 64
 
 FIXED_SERVICE_ID = "root_cause_analysis_agent"
+FIXED_KAFKA_GROUP_ID = "rca_root_cause_analysis_agent"
 FIXED_API_VERSION = (3, 9, 0)
 FIXED_REQUEST_TIMEOUT_MS = 120_000
 FIXED_INPUT_WAIT_MAX_AGE_SECONDS = 900
@@ -2341,7 +2342,7 @@ def _check_t0_offsets(
         raise EvidenceError("t0_offsets_not_explicit")
     if body.get("topic") != expected_topic:
         raise EvidenceError("t0_offsets_topic_mismatch")
-    if body.get("group_id") != FIXED_SERVICE_ID:
+    if body.get("group_id") != FIXED_KAFKA_GROUP_ID:
         raise EvidenceError("t0_offsets_group_mismatch")
     offsets = _partition_offsets(body.get("partition_offsets"), "partition_offsets")
     configured = dict(consumer.initial_offsets)
@@ -2351,7 +2352,7 @@ def _check_t0_offsets(
         raise EvidenceError("t0_offsets_partition_set_mismatch")
     return {
         "observed_at": observed_at,
-        "group_id": FIXED_SERVICE_ID,
+        "group_id": FIXED_KAFKA_GROUP_ID,
         "partition_count": len(offsets),
         "partition_offsets_sha256": _sha256_json({
             str(key): offsets[key] for key in sorted(offsets)
@@ -20079,7 +20080,7 @@ def _check_consumer_config(
     errors: list[str] = []
     if (
         not kafka_principal_is_valid(consumer.username)
-        or consumer.group_id != FIXED_SERVICE_ID
+        or consumer.group_id != FIXED_KAFKA_GROUP_ID
         or consumer.client_id != FIXED_SERVICE_ID
     ):
         errors.append("consumer_identity_mismatch")

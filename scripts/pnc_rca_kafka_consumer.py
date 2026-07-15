@@ -53,6 +53,7 @@ ACTIVATION_FREEZE_REQUIRED_SLOT_COUNT = 3
 SERVICE_LABEL = "local.pnc.rca-kafka-consumer"
 MAX_CONFIG_JSON_NESTING = 32
 FIXED_SERVICE_ID = "root_cause_analysis_agent"
+FIXED_KAFKA_GROUP_ID = "rca_root_cause_analysis_agent"
 KAFKA_PRINCIPAL_PREFIX = "rca_"
 MAX_KAFKA_PRINCIPAL_LENGTH = 128
 FIXED_API_VERSION = (3, 9, 0)
@@ -273,8 +274,10 @@ class ConsumerConfig:
 
         username = _required_kafka_principal(source, f"{ENV_PREFIX}USER")
         group_id = _required(source, f"{ENV_PREFIX}GROUP")
-        if group_id != FIXED_SERVICE_ID:
-            raise ValueError(f"{ENV_PREFIX}GROUP must be exactly {FIXED_SERVICE_ID}")
+        if group_id != FIXED_KAFKA_GROUP_ID:
+            raise ValueError(
+                f"{ENV_PREFIX}GROUP must be exactly {FIXED_KAFKA_GROUP_ID}"
+            )
         api_version = _api_version(
             str(source.get(f"{ENV_PREFIX}API_VERSION", "3.9.0"))
         )

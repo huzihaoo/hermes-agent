@@ -48,7 +48,7 @@ def test_release_prepare_cli_help_runs_outside_repo(tmp_path):
 
 class _Consumer:
     topic = "feishu-project-workfLow-event"
-    group_id = "root_cause_analysis_agent"
+    group_id = "rca_root_cause_analysis_agent"
     initial_offsets = ((0, 101), (1, 202))
     policy = SimpleNamespace(policy_version="g1q3_issue_created_v1", to_dict=lambda: {})
 

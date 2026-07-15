@@ -31,7 +31,7 @@ def _env(**overrides: str) -> dict[str, str]:
         "HERMES_RCA_KAFKA_EXPECTED_CLUSTER_ID": "cluster-production-1",
         "HERMES_RCA_KAFKA_USER": "rca_release_agent",
         "HERMES_RCA_KAFKA_PASSWORD": "not-for-output",
-        "HERMES_RCA_KAFKA_GROUP": "root_cause_analysis_agent",
+        "HERMES_RCA_KAFKA_GROUP": "rca_root_cause_analysis_agent",
         "HERMES_RCA_KAFKA_API_VERSION": "3.9.0",
         "HERMES_RCA_KAFKA_SECURITY_PROTOCOL": "SASL_PLAINTEXT",
         "HERMES_RCA_KAFKA_SASL_MECHANISM": "PLAIN",
@@ -126,9 +126,9 @@ class _Admin:
 
     def group_payload(self):
         return {
-            "root_cause_analysis_agent": {
+            "rca_root_cause_analysis_agent": {
                 "error": None,
-                "group_id": "root_cause_analysis_agent",
+                "group_id": "rca_root_cause_analysis_agent",
                 "authorized_operations": ["DESCRIBE", "READ"],
                 "members": [{"client_host": "must-not-enter-evidence"}],
             }
@@ -140,10 +140,10 @@ class _Admin:
         group_coordinator_id=None,
         include_authorized_operations=False,
     ):
-        assert group_ids == ["root_cause_analysis_agent"]
+        assert group_ids == ["rca_root_cause_analysis_agent"]
         assert group_coordinator_id is None
         assert include_authorized_operations is True
-        self.calls.append("describe_groups:root_cause_analysis_agent")
+        self.calls.append("describe_groups:rca_root_cause_analysis_agent")
         return self.group_payload()
 
     def close(self):
@@ -153,7 +153,7 @@ class _Admin:
 
 def test_config_requires_fixed_service_identity_and_safe_protocol():
     config = BrokerProbeConfig.from_env(_env())
-    assert config.configured_group_id == "root_cause_analysis_agent"
+    assert config.configured_group_id == "rca_root_cause_analysis_agent"
     assert config.expected_cluster_id == "cluster-production-1"
     assert config.api_version == (3, 9, 0)
     assert "group_id" not in config.admin_kwargs()
@@ -163,7 +163,7 @@ def test_config_requires_fixed_service_identity_and_safe_protocol():
     assert config.public_dict()["expected_cluster_id"] == "cluster-production-1"
     assert config.public_dict()["group_request"] == {
         "api": "DescribeGroups",
-        "group_id": "root_cause_analysis_agent",
+        "group_id": "rca_root_cause_analysis_agent",
         "include_authorized_operations": True,
     }
     assert "not-for-output" not in repr(config)
@@ -237,7 +237,7 @@ def test_collect_is_read_only_and_returns_release_gate_shape():
     assert payload["cluster_id"] == "cluster-production-1"
     assert payload["expected_cluster_id"] == "cluster-production-1"
     assert payload["topic"] == TOPIC
-    assert payload["group_id"] == "root_cause_analysis_agent"
+    assert payload["group_id"] == "rca_root_cause_analysis_agent"
     assert payload["partitions"] == [0, 1]
     assert payload["replication_factor"] == 2
     assert payload["partition_topology"] == [
@@ -264,7 +264,7 @@ def test_collect_is_read_only_and_returns_release_gate_shape():
     assert "group_id" not in admin.kwargs
     assert admin.calls == [
         f"metadata:{TOPIC}",
-        "describe_groups:root_cause_analysis_agent",
+        "describe_groups:rca_root_cause_analysis_agent",
         "close",
     ]
     assert admin.closed is True
@@ -312,7 +312,7 @@ def test_observe_only_collects_owner_candidates_but_is_not_release_evidence():
     assert payload["collector"]["mode"] == "observe_only"
     assert admin.calls == [
         f"metadata:{TOPIC}",
-        "describe_groups:root_cause_analysis_agent",
+        "describe_groups:rca_root_cause_analysis_agent",
         "close",
     ]
 
@@ -405,7 +405,7 @@ def test_collect_requires_exact_authorized_group_and_closes_admin():
 def test_collect_rejects_group_error_and_closes_admin():
     admin = _Admin()
     group_payload = admin.group_payload()
-    group_payload["root_cause_analysis_agent"]["error"] = (
+    group_payload["rca_root_cause_analysis_agent"]["error"] = (
         "GroupAuthorizationFailedError"
     )
     admin.group_payload = lambda: group_payload
@@ -441,7 +441,7 @@ def test_collect_rejects_mutation_authorization(resource, operation):
         admin.metadata_payload = lambda: metadata_payload
     else:
         group_payload = admin.group_payload()
-        group_payload["root_cause_analysis_agent"]["authorized_operations"].append(
+        group_payload["rca_root_cause_analysis_agent"]["authorized_operations"].append(
             operation
         )
         admin.group_payload = lambda: group_payload
@@ -465,7 +465,7 @@ def test_collect_rejects_missing_or_unknown_group_operations():
     ):
         admin = _Admin()
         group_payload = admin.group_payload()
-        group_payload["root_cause_analysis_agent"]["authorized_operations"] = operations
+        group_payload["rca_root_cause_analysis_agent"]["authorized_operations"] = operations
         admin.group_payload = lambda: group_payload
         with pytest.raises(RuntimeError, match=error):
             collect_broker_metadata(

@@ -31,7 +31,7 @@ def _env(tmp_path):
         "HERMES_RCA_KAFKA_TOPIC": TOPIC,
         "HERMES_RCA_KAFKA_USER": "rca_release_agent",
         "HERMES_RCA_KAFKA_PASSWORD": "top-secret-password",
-        "HERMES_RCA_KAFKA_GROUP": "root_cause_analysis_agent",
+        "HERMES_RCA_KAFKA_GROUP": "rca_root_cause_analysis_agent",
         "HERMES_RCA_KAFKA_API_VERSION": "3.9.0",
         "HERMES_RCA_KAFKA_PROJECT_KEYS": "project-key",
         "HERMES_RCA_KAFKA_PROJECT_SIMPLE_NAMES": "g1q3",
@@ -743,7 +743,8 @@ def test_create_consumer_registers_a_supported_rebalance_listener(monkeypatch, t
     assert isinstance(listener, consumer_module.ExplicitInitialOffsetListener)
     assert isinstance(listener, FakeAsyncListenerBase)
     assert asyncio.iscoroutinefunction(listener.on_partitions_assigned)
-    assert consumer.kwargs["group_id"] == "root_cause_analysis_agent"
+    assert consumer.kwargs["group_id"] == "rca_root_cause_analysis_agent"
+    assert consumer.kwargs["client_id"] == "root_cause_analysis_agent"
 
 
 def test_create_consumer_checks_materialized_store_before_kafka_client(

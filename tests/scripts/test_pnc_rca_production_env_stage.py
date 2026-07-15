@@ -30,6 +30,18 @@ def _owner_write(path: Path, raw: bytes | str) -> None:
     path.chmod(0o600)
 
 
+def test_fixed_kafka_group_is_distinct_from_client_and_service_identity() -> None:
+    assert stage.FIXED_PRODUCTION_VALUES["HERMES_RCA_KAFKA_GROUP"] == (
+        "rca_root_cause_analysis_agent"
+    )
+    assert stage.FIXED_PRODUCTION_VALUES["HERMES_RCA_KAFKA_CLIENT_ID"] == (
+        "root_cause_analysis_agent"
+    )
+    assert stage.FIXED_PRODUCTION_VALUES["HERMES_RCA_OUTBOX_SERVICE_ID"] == (
+        "root_cause_analysis_agent"
+    )
+
+
 def _env_body(state_root: Path) -> str:
     values = {
         **stage.FIXED_PRODUCTION_VALUES,

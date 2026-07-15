@@ -26,7 +26,7 @@ def _config(tmp_path: Path):
             "HERMES_RCA_KAFKA_TOPIC": TOPIC,
             "HERMES_RCA_KAFKA_USER": "rca_release_agent",
             "HERMES_RCA_KAFKA_PASSWORD": "test-secret",
-            "HERMES_RCA_KAFKA_GROUP": "root_cause_analysis_agent",
+            "HERMES_RCA_KAFKA_GROUP": "rca_root_cause_analysis_agent",
             "HERMES_RCA_KAFKA_API_VERSION": "3.9.0",
             "HERMES_RCA_KAFKA_PROJECT_KEYS": "project-key",
             "HERMES_RCA_KAFKA_PROJECT_SIMPLE_NAMES": "g1q3",
@@ -259,7 +259,7 @@ def test_policy_observation_discovers_real_values_without_approving_them(
         "HERMES_RCA_KAFKA_TOPIC": TOPIC,
         "HERMES_RCA_KAFKA_USER": "rca_release_agent",
         "HERMES_RCA_KAFKA_PASSWORD": "test-secret",
-        "HERMES_RCA_KAFKA_GROUP": "root_cause_analysis_agent",
+        "HERMES_RCA_KAFKA_GROUP": "rca_root_cause_analysis_agent",
         "HERMES_RCA_KAFKA_API_VERSION": "3.9.0",
     }
     config = replay._policy_observation_config(
