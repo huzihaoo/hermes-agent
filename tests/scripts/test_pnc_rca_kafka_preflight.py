@@ -29,7 +29,7 @@ def _env(**overrides: str) -> dict[str, str]:
         "HERMES_RCA_KAFKA_BOOTSTRAP_SERVERS": "broker-1:9092,broker-2:9092",
         "HERMES_RCA_KAFKA_TOPIC": TOPIC,
         "HERMES_RCA_KAFKA_EXPECTED_CLUSTER_ID": "cluster-production-1",
-        "HERMES_RCA_KAFKA_USER": "rca_release_agent",
+        "HERMES_RCA_KAFKA_USER": "rca",
         "HERMES_RCA_KAFKA_PASSWORD": "not-for-output",
         "HERMES_RCA_KAFKA_GROUP": "rca_root_cause_analysis_agent",
         "HERMES_RCA_KAFKA_API_VERSION": "3.9.0",
@@ -153,6 +153,7 @@ class _Admin:
 
 def test_config_requires_fixed_service_identity_and_safe_protocol():
     config = BrokerProbeConfig.from_env(_env())
+    assert config.username == "rca"
     assert config.configured_group_id == "rca_root_cause_analysis_agent"
     assert config.expected_cluster_id == "cluster-production-1"
     assert config.api_version == (3, 9, 0)
@@ -173,9 +174,9 @@ def test_config_requires_fixed_service_identity_and_safe_protocol():
         "legacy-identity",
         "rca_",
         "rca_invalid principal",
-        "rca_" + "x" * 125,
+        "rca_release_agent",
     ):
-        with pytest.raises(ValueError, match="must start with rca_"):
+        with pytest.raises(ValueError, match="must be exactly rca"):
             BrokerProbeConfig.from_env(
                 _env(HERMES_RCA_KAFKA_USER=invalid_principal)
             )

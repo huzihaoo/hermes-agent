@@ -53,9 +53,8 @@ ACTIVATION_FREEZE_REQUIRED_SLOT_COUNT = 3
 SERVICE_LABEL = "local.pnc.rca-kafka-consumer"
 MAX_CONFIG_JSON_NESTING = 32
 FIXED_SERVICE_ID = "root_cause_analysis_agent"
+FIXED_KAFKA_PRINCIPAL = "rca"
 FIXED_KAFKA_GROUP_ID = "rca_root_cause_analysis_agent"
-KAFKA_PRINCIPAL_PREFIX = "rca_"
-MAX_KAFKA_PRINCIPAL_LENGTH = 128
 FIXED_API_VERSION = (3, 9, 0)
 FIXED_REQUEST_TIMEOUT_MS = 120_000
 MIN_SESSION_TIMEOUT_MS = 10_000
@@ -80,24 +79,14 @@ def _required(env: Mapping[str, str], name: str) -> str:
 
 
 def kafka_principal_is_valid(value: str) -> bool:
-    return (
-        len(KAFKA_PRINCIPAL_PREFIX) < len(value) <= MAX_KAFKA_PRINCIPAL_LENGTH
-        and value.startswith(KAFKA_PRINCIPAL_PREFIX)
-        and all(
-            character.isascii() and (character.isalnum() or character in "_.-")
-            for character in value
-        )
-    )
+    return value == FIXED_KAFKA_PRINCIPAL
 
 
 def _required_kafka_principal(env: Mapping[str, str], name: str) -> str:
     raw = str(env.get(name, ""))
     value = _required(env, name)
     if raw != value or not kafka_principal_is_valid(value):
-        raise ValueError(
-            f"{name} must start with {KAFKA_PRINCIPAL_PREFIX} and contain only "
-            "ASCII letters, digits, underscore, dot, or hyphen"
-        )
+        raise ValueError(f"{name} must be exactly {FIXED_KAFKA_PRINCIPAL}")
     return value
 
 

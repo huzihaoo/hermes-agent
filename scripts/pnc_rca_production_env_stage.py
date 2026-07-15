@@ -56,11 +56,11 @@ SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 NONCE_PATTERN = re.compile(r"[A-Za-z0-9_-]{16,128}\Z")
 CHAT_ID_PATTERN = re.compile(r"oc_[A-Za-z0-9_-]{1,255}\Z")
 USER_ID_PATTERN = re.compile(r"ou_[A-Za-z0-9_-]{1,255}\Z")
-KAFKA_PRINCIPAL_PATTERN = re.compile(r"rca_[A-Za-z0-9_.-]{1,124}\Z")
 SAFE_LITERAL_PATTERN = re.compile(r"[^\x00\r\n\t #]+\Z")
 
 CANONICAL_LIVE_ENV = Path.home() / ".hermes" / ".env"
 FIXED_SERVICE_ID = "root_cause_analysis_agent"
+FIXED_KAFKA_PRINCIPAL = "rca"
 FIXED_KAFKA_GROUP_ID = "rca_root_cause_analysis_agent"
 RELEASE_ACTION_SET = (
     "promote_host_candidate",
@@ -715,7 +715,7 @@ def _desired_values(
     if _required_value(values, "HERMES_RCA_KAFKA_TOPIC") != expected_topic:
         raise ProductionEnvStageError("production_env_topic_mismatch")
     kafka_principal = _required_value(values, "HERMES_RCA_KAFKA_USER")
-    if KAFKA_PRINCIPAL_PATTERN.fullmatch(kafka_principal) is None:
+    if kafka_principal != FIXED_KAFKA_PRINCIPAL:
         raise ProductionEnvStageError("production_env_kafka_principal_invalid")
 
     chat_ids = _normalized_csv(

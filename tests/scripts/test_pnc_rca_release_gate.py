@@ -1122,7 +1122,7 @@ def _consumer_env(tmp_path: Path, mode: str) -> dict[str, str]:
         "HERMES_RCA_KAFKA_BOOTSTRAP_SERVERS": "broker-1:9092,broker-2:9092",
         "HERMES_RCA_KAFKA_TOPIC": TOPIC,
         "HERMES_RCA_KAFKA_EXPECTED_CLUSTER_ID": "cluster-production-1",
-        "HERMES_RCA_KAFKA_USER": "rca_release_agent",
+        "HERMES_RCA_KAFKA_USER": "rca",
         "HERMES_RCA_KAFKA_PASSWORD": SECRET,
         "HERMES_RCA_KAFKA_GROUP": "rca_root_cause_analysis_agent",
         "HERMES_RCA_KAFKA_CLIENT_ID": "root_cause_analysis_agent",

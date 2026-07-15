@@ -31,6 +31,7 @@ def _owner_write(path: Path, raw: bytes | str) -> None:
 
 
 def test_fixed_kafka_group_is_distinct_from_client_and_service_identity() -> None:
+    assert stage.FIXED_KAFKA_PRINCIPAL == "rca"
     assert stage.FIXED_PRODUCTION_VALUES["HERMES_RCA_KAFKA_GROUP"] == (
         "rca_root_cause_analysis_agent"
     )
@@ -46,7 +47,7 @@ def _env_body(state_root: Path) -> str:
     values = {
         **stage.FIXED_PRODUCTION_VALUES,
         "HERMES_RCA_KAFKA_BOOTSTRAP_SERVERS": "broker-1:9092,broker-2:9092",
-        "HERMES_RCA_KAFKA_USER": "rca_release_agent",
+        "HERMES_RCA_KAFKA_USER": "rca",
         "HERMES_RCA_KAFKA_TOPIC": TOPIC,
         "HERMES_RCA_KAFKA_EXPECTED_CLUSTER_ID": "cluster-production-1",
         "HERMES_RCA_KAFKA_PASSWORD": KAFKA_SECRET,
@@ -425,7 +426,7 @@ def test_bootstrap_mode_is_static_but_release_bindings_are_not_in_env(
         ),
         (
             lambda raw: raw.replace(
-                "HERMES_RCA_KAFKA_USER=rca_release_agent",
+                "HERMES_RCA_KAFKA_USER=rca",
                 "HERMES_RCA_KAFKA_USER=legacy-agent",
             ),
             "production_env_kafka_principal_invalid",

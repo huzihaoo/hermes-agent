@@ -29,7 +29,7 @@ def _env(tmp_path):
     return {
         "HERMES_RCA_KAFKA_BOOTSTRAP_SERVERS": "broker-1:9092,broker-2:9092",
         "HERMES_RCA_KAFKA_TOPIC": TOPIC,
-        "HERMES_RCA_KAFKA_USER": "rca_release_agent",
+        "HERMES_RCA_KAFKA_USER": "rca",
         "HERMES_RCA_KAFKA_PASSWORD": "top-secret-password",
         "HERMES_RCA_KAFKA_GROUP": "rca_root_cause_analysis_agent",
         "HERMES_RCA_KAFKA_API_VERSION": "3.9.0",
@@ -499,10 +499,10 @@ def test_consumer_env_loader_preserves_literal_expansion_syntax(tmp_path, monkey
 @pytest.mark.parametrize(
     ("name", "value", "message"),
     [
-        ("HERMES_RCA_KAFKA_USER", "legacy", "must start with rca_"),
-        ("HERMES_RCA_KAFKA_USER", "rca_", "must start with rca_"),
-        ("HERMES_RCA_KAFKA_USER", "rca_invalid principal", "must start with rca_"),
-        ("HERMES_RCA_KAFKA_USER", "rca_" + "x" * 125, "must start with rca_"),
+        ("HERMES_RCA_KAFKA_USER", "legacy", "must be exactly rca"),
+        ("HERMES_RCA_KAFKA_USER", "rca_", "must be exactly rca"),
+        ("HERMES_RCA_KAFKA_USER", "rca_invalid principal", "must be exactly rca"),
+        ("HERMES_RCA_KAFKA_USER", "rca_release_agent", "must be exactly rca"),
         ("HERMES_RCA_KAFKA_GROUP", "legacy", "must be exactly"),
         ("HERMES_RCA_KAFKA_CLIENT_ID", "legacy", "must be exactly"),
         ("HERMES_RCA_KAFKA_API_VERSION", "3.8.0", "must be exactly 3.9.0"),
@@ -743,6 +743,7 @@ def test_create_consumer_registers_a_supported_rebalance_listener(monkeypatch, t
     assert isinstance(listener, consumer_module.ExplicitInitialOffsetListener)
     assert isinstance(listener, FakeAsyncListenerBase)
     assert asyncio.iscoroutinefunction(listener.on_partitions_assigned)
+    assert consumer.kwargs["sasl_plain_username"] == "rca"
     assert consumer.kwargs["group_id"] == "rca_root_cause_analysis_agent"
     assert consumer.kwargs["client_id"] == "root_cause_analysis_agent"
 

@@ -30,9 +30,8 @@ from hermes_constants import get_hermes_home
 
 ENV_PREFIX = "HERMES_RCA_KAFKA_"
 FIXED_SERVICE_ID = "root_cause_analysis_agent"
+FIXED_KAFKA_PRINCIPAL = "rca"
 FIXED_KAFKA_GROUP_ID = "rca_root_cause_analysis_agent"
-KAFKA_PRINCIPAL_PREFIX = "rca_"
-MAX_KAFKA_PRINCIPAL_LENGTH = 128
 MAX_ENV_FILE_BYTES = 1024 * 1024
 BROKER_METADATA_SCHEMA_VERSION = "pnc_rca_broker_metadata_v3"
 BROKER_OBSERVATION_SCHEMA_VERSION = "pnc_rca_broker_observation_v1"
@@ -78,21 +77,8 @@ def _required(env: Mapping[str, str], name: str) -> str:
 def _required_kafka_principal(env: Mapping[str, str], name: str) -> str:
     raw = str(env.get(name, ""))
     value = _required(env, name)
-    valid_characters = all(
-        character.isascii() and (character.isalnum() or character in "_.-")
-        for character in value
-    )
-    if (
-        raw != value
-        or len(value) <= len(KAFKA_PRINCIPAL_PREFIX)
-        or len(value) > MAX_KAFKA_PRINCIPAL_LENGTH
-        or not value.startswith(KAFKA_PRINCIPAL_PREFIX)
-        or not valid_characters
-    ):
-        raise ValueError(
-            f"{name} must start with {KAFKA_PRINCIPAL_PREFIX} and contain only "
-            "ASCII letters, digits, underscore, dot, or hyphen"
-        )
+    if raw != value or value != FIXED_KAFKA_PRINCIPAL:
+        raise ValueError(f"{name} must be exactly {FIXED_KAFKA_PRINCIPAL}")
     return value
 
 

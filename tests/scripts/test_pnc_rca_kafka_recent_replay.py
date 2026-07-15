@@ -24,7 +24,7 @@ def _config(tmp_path: Path):
         {
             "HERMES_RCA_KAFKA_BOOTSTRAP_SERVERS": "broker-1:9092",
             "HERMES_RCA_KAFKA_TOPIC": TOPIC,
-            "HERMES_RCA_KAFKA_USER": "rca_release_agent",
+            "HERMES_RCA_KAFKA_USER": "rca",
             "HERMES_RCA_KAFKA_PASSWORD": "test-secret",
             "HERMES_RCA_KAFKA_GROUP": "rca_root_cause_analysis_agent",
             "HERMES_RCA_KAFKA_API_VERSION": "3.9.0",
@@ -257,7 +257,7 @@ def test_policy_observation_discovers_real_values_without_approving_them(
     transport_env = {
         "HERMES_RCA_KAFKA_BOOTSTRAP_SERVERS": "broker-1:9092",
         "HERMES_RCA_KAFKA_TOPIC": TOPIC,
-        "HERMES_RCA_KAFKA_USER": "rca_release_agent",
+        "HERMES_RCA_KAFKA_USER": "rca",
         "HERMES_RCA_KAFKA_PASSWORD": "test-secret",
         "HERMES_RCA_KAFKA_GROUP": "rca_root_cause_analysis_agent",
         "HERMES_RCA_KAFKA_API_VERSION": "3.9.0",
