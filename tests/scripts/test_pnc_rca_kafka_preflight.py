@@ -162,6 +162,8 @@ def test_config_requires_fixed_service_identity_and_safe_protocol():
     assert "minimum_replication_factor" not in config.admin_kwargs()
     assert config.public_dict()["minimum_replication_factor"] == 2
     assert config.public_dict()["expected_cluster_id"] == "cluster-production-1"
+    assert config.request_timeout_ms == 10_000
+    assert config.admin_kwargs()["request_timeout_ms"] == 10_000
     assert config.public_dict()["group_request"] == {
         "api": "DescribeGroups",
         "group_id": "rca_root_cause_analysis_agent",

@@ -37,6 +37,7 @@ BROKER_METADATA_SCHEMA_VERSION = "pnc_rca_broker_metadata_v3"
 BROKER_OBSERVATION_SCHEMA_VERSION = "pnc_rca_broker_observation_v1"
 COLLECTOR_SCHEMA_VERSION = "pnc_rca_kafka_preflight_v2"
 REQUIRED_AUTHORIZED_OPERATIONS = frozenset({"DESCRIBE", "READ"})
+MAX_PREFLIGHT_REQUEST_TIMEOUT_MS = 10_000
 KNOWN_AUTHORIZED_OPERATIONS = frozenset({
     "ALL",
     "ALTER",
@@ -208,6 +209,12 @@ class BrokerProbeConfig:
             raise ValueError("security protocol must be exactly SASL_PLAINTEXT")
         if sasl_mechanism != "PLAIN":
             raise ValueError("SASL mechanism must be exactly PLAIN")
+        request_timeout_ms = min(
+            _positive_integer(
+                source, f"{ENV_PREFIX}REQUEST_TIMEOUT_MS", 120_000
+            ),
+            MAX_PREFLIGHT_REQUEST_TIMEOUT_MS,
+        )
         return cls(
             bootstrap_servers=bootstrap_servers,
             topic=topic,
@@ -220,9 +227,7 @@ class BrokerProbeConfig:
             ),
             security_protocol=security_protocol,
             sasl_mechanism=sasl_mechanism,
-            request_timeout_ms=_positive_integer(
-                source, f"{ENV_PREFIX}REQUEST_TIMEOUT_MS", 120_000
-            ),
+            request_timeout_ms=request_timeout_ms,
             minimum_replication_factor=(
                 None
                 if observe_only

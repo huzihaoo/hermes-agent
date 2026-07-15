@@ -115,6 +115,7 @@ from scripts.pnc_rca_kafka_preflight import (
     BROKER_METADATA_SCHEMA_VERSION,
     COLLECTOR_SCHEMA_VERSION as KAFKA_PREFLIGHT_COLLECTOR_SCHEMA_VERSION,
     KNOWN_AUTHORIZED_OPERATIONS,
+    MAX_PREFLIGHT_REQUEST_TIMEOUT_MS,
     MUTATING_AUTHORIZED_OPERATIONS,
     REQUIRED_AUTHORIZED_OPERATIONS,
     BrokerProbeConfig,
@@ -2208,7 +2209,8 @@ def _expected_broker_probe(
         or probe.api_version != consumer.api_version
         or probe.security_protocol != consumer.security_protocol
         or probe.sasl_mechanism != consumer.sasl_mechanism
-        or probe.request_timeout_ms != consumer.request_timeout_ms
+        or probe.request_timeout_ms
+        != min(consumer.request_timeout_ms, MAX_PREFLIGHT_REQUEST_TIMEOUT_MS)
     ):
         raise EvidenceError("broker_metadata_consumer_config_mismatch")
     return probe, env_observation
