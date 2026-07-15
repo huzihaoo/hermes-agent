@@ -205,7 +205,7 @@
         "requirements": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["schema_version", "requirements_contract_version", "requirements_contract_hash", "function_domain", "requested_topics", "channel_allowlist", "requested_window", "evaluator_fingerprints", "requirements_hash"],
+          "required": ["schema_version", "requirements_contract_version", "requirements_contract_hash", "function_domain", "requested_topics", "channel_allowlist", "frame_lookup", "frame_channel_allowlist", "requested_window", "evaluator_fingerprints", "requirements_hash"],
           "properties": {
             "schema_version": {"const": "g1q3_rca_remote_evidence_requirements_v1"},
             "requirements_contract_version": {"const": "g1q3_rca_evaluator_scope_v1"},
@@ -213,6 +213,8 @@
             "function_domain": {"enum": ["ACC", "LCC", "AEB", "FCW", "DNP"]},
             "requested_topics": {"type": "array", "minItems": 1, "items": {"type": "string"}},
             "channel_allowlist": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+            "frame_lookup": {"const": {}},
+            "frame_channel_allowlist": {"const": []},
             "requested_window": {
               "const": {"end_time_ns": null, "mode": "full_reference", "start_time_ns": null}
             },

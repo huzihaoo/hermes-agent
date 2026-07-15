@@ -24,12 +24,17 @@ def _write_owner(path: Path, body: object) -> None:
     path.chmod(0o600)
 
 
-def _runtime_identity(*, pid: int = 41001, create_time: float = 1_783_650_000.0) -> dict:
+def _runtime_identity(
+    *,
+    pid: int = 41001,
+    create_time: float = 1_783_650_000.0,
+    root: Path = guard.CANONICAL_LIVE_ROOT,
+) -> dict:
     live = {
         "schema_version": guard.RUNTIME_FILES_IDENTITY_SCHEMA_VERSION,
-        "canonical_root": str(guard.CANONICAL_LIVE_ROOT),
+        "canonical_root": str(root),
         "root_identity": {
-            "path": str(guard.CANONICAL_LIVE_ROOT),
+            "path": str(root),
             "device": 1,
             "inode": 2,
             "owner_uid": os.geteuid(),
@@ -41,7 +46,7 @@ def _runtime_identity(*, pid: int = 41001, create_time: float = 1_783_650_000.0)
     }
     return {
         "schema_version": guard.GATEWAY_RUNNING_OBSERVATION_SCHEMA_VERSION,
-        "canonical_root": str(guard.CANONICAL_LIVE_ROOT),
+        "canonical_root": str(root),
         "launchd": {
             "label": guard.GATEWAY_LABEL,
             "loaded": True,
@@ -51,8 +56,8 @@ def _runtime_identity(*, pid: int = 41001, create_time: float = 1_783_650_000.0)
         "process": {
             "pid": pid,
             "process_create_time": create_time,
-            "executable": str(guard.CANONICAL_LIVE_ROOT / ".venv/bin/python"),
-            "cwd": str(guard.CANONICAL_LIVE_ROOT),
+            "executable": str(root / ".venv/bin/python"),
+            "cwd": str(root),
             "cmdline_sha256": "4" * 64,
             "loaded_runtime_closure_sha256": guard._sha256_json(live),
         },
@@ -68,6 +73,36 @@ def _sidecar_identity() -> dict:
         "sha256": "5" * 64,
         "revision": 7,
         "app_scope": "6" * 32,
+    }
+
+
+def _precutover_service_state(runtime: dict) -> dict:
+    jobs = {}
+    for label in guard.SERVICE_LABELS:
+        loaded = label == guard.GATEWAY_LABEL
+        jobs[label] = {
+            "launchd": {
+                "label": label,
+                "loaded": loaded,
+                "state": "running" if loaded else "absent",
+                "pid": runtime["process"]["pid"] if loaded else None,
+                "last_exit_status": None,
+            },
+            "plist": {
+                "path": str(guard.CANONICAL_LAUNCH_AGENTS_ROOT / f"{label}.plist"),
+                "state": "regular",
+                "sha256": hashlib.sha256(label.encode()).hexdigest(),
+                "size_bytes": len(label),
+                "mode": "0644",
+                "uid": os.geteuid(),
+                "nlink": 1,
+            },
+        }
+    return {
+        "schema_version": guard.LIVE_SERVICE_STATE_SCHEMA_VERSION,
+        "target_runtime_root": str(guard.CANONICAL_LIVE_ROOT),
+        "labels": list(guard.SERVICE_LABELS),
+        "jobs": jobs,
     }
 
 
@@ -343,6 +378,58 @@ def test_active_lease_rejects_holder_boot_process_or_machine_drift(
     assert error.value.code == "cutover_lease_holder_changed"
 
 
+def test_lease_binds_explicit_current_base_runtime_root(lease_setup, tmp_path) -> None:
+    root = Path("/Users/songying/.hermes/runtime/releases/hermes-v0.18.2-fixture")
+    runtime = _runtime_identity(root=root)
+    lease_setup["inputs"] = guard.LeaseInputs(
+        release_id=lease_setup["inputs"].release_id,
+        release_prepare_manifest=lease_setup["prepare"],
+        approval_receipt=lease_setup["approval"],
+        expected_live_runtime_identity=runtime,
+        canonical_live_root=root,
+        allow_absent_rca_files=True,
+        duration_seconds=3600,
+    )
+    lease_setup["runtime"] = runtime
+    lease_setup["lock"] = tmp_path / "locks" / "base-runtime-cutover.lock"
+    lease_setup["lock"].parent.mkdir(mode=0o700, exist_ok=True)
+
+    with _acquire(lease_setup) as lease:
+        lease.assert_active()
+        assert lease.body["expected_live_runtime_identity"]["canonical_root"] == str(
+            root
+        )
+
+
+def test_writer_stop_observation_binds_explicit_current_base_runtime_root() -> None:
+    root = Path("/Users/songying/.hermes/runtime/releases/hermes-v0.18.2-fixture")
+    runtime = _runtime_identity(root=root)
+    sidecar = _sidecar_identity()
+    observed = {
+        "schema_version": guard.GATEWAY_WRITER_STOP_OBSERVATION_SCHEMA_VERSION,
+        "canonical_root": str(root),
+        "launchd": {
+            "label": guard.GATEWAY_LABEL,
+            "loaded": False,
+            "pid": None,
+            "state": "not_running",
+        },
+        "process_census": {
+            "probe": "psutil_gateway_canonical_runtime_census_v1",
+            "canonical_root": str(root),
+            "matching_processes": [],
+        },
+        "live_runtime_identity": runtime["live_runtime_identity"],
+        "live_sidecar_identity": sidecar,
+    }
+
+    assert guard.validate_writer_stop_observation(
+        observed,
+        expected_live_runtime_identity=runtime,
+        expected_live_sidecar_identity=sidecar,
+    ) == observed
+
+
 def test_expired_lease_cannot_publish_writer_stop(lease_setup, tmp_path) -> None:
     sidecar = _sidecar_identity()
     stopped = _stopped(lease_setup["runtime"], sidecar)
@@ -355,6 +442,9 @@ def test_expired_lease_cannot_publish_writer_stop(lease_setup, tmp_path) -> None
                     plan_sha256="7" * 64,
                     receipt_path=tmp_path / "writer-stop.json",
                     expected_live_sidecar_identity=sidecar,
+                    precutover_service_state=_precutover_service_state(
+                        lease_setup["runtime"]
+                    ),
                 ),
                 writer_stop_observer=lambda: stopped,
                 now=NOW + timedelta(seconds=3601),
@@ -380,6 +470,9 @@ def test_writer_stop_receipt_reobserves_around_atomic_publication(lease_setup, t
                 plan_sha256="7" * 64,
                 receipt_path=tmp_path / "receipts" / "writer-stop.json",
                 expected_live_sidecar_identity=sidecar,
+                precutover_service_state=_precutover_service_state(
+                    lease_setup["runtime"]
+                ),
             ),
             writer_stop_observer=observer,
             now=NOW,
@@ -394,6 +487,42 @@ def test_writer_stop_receipt_reobserves_around_atomic_publication(lease_setup, t
     owned, normalized = guard.read_writer_stop_receipt(receipt, now=NOW)
     assert owned.sha256 == hashlib.sha256(receipt.read_bytes()).hexdigest()
     assert normalized == body
+
+
+def test_writer_stop_receipt_rejects_rehashed_precutover_gateway_pid(
+    lease_setup, tmp_path
+) -> None:
+    sidecar = _sidecar_identity()
+    stopped = _stopped(lease_setup["runtime"], sidecar)
+    receipt = tmp_path / "writer-stop.json"
+    with _acquire(lease_setup) as lease:
+        guard.observe_writer_stop(
+            lease,
+            guard.WriterStopInputs(
+                hold_id="hold-20260713-a",
+                plan_sha256="7" * 64,
+                receipt_path=receipt,
+                expected_live_sidecar_identity=sidecar,
+                precutover_service_state=_precutover_service_state(
+                    lease_setup["runtime"]
+                ),
+            ),
+            writer_stop_observer=lambda: stopped,
+            now=NOW,
+        )
+    body = json.loads(receipt.read_text())
+    body["precutover_service_state"]["jobs"][guard.GATEWAY_LABEL]["launchd"][
+        "pid"
+    ] += 1
+    body["precutover_service_state_sha256"] = guard._sha256_json(
+        body["precutover_service_state"]
+    )
+    _write_owner(receipt, body)
+
+    with pytest.raises(guard.CutoverGuardError) as error:
+        guard.read_writer_stop_receipt(receipt, now=NOW)
+
+    assert error.value.code == "writer_stop_precutover_gateway_state_invalid"
 
 
 @pytest.mark.parametrize(
@@ -438,6 +567,9 @@ def test_writer_stop_hostile_runtime_states_fail_closed(
                     plan_sha256="7" * 64,
                     receipt_path=tmp_path / "writer-stop.json",
                     expected_live_sidecar_identity=sidecar,
+                    precutover_service_state=_precutover_service_state(
+                        lease_setup["runtime"]
+                    ),
                 ),
                 writer_stop_observer=lambda: stopped,
                 now=NOW,
@@ -463,6 +595,9 @@ def test_writer_stop_detects_drift_before_and_after_publication(lease_setup, tmp
                     plan_sha256="7" * 64,
                     receipt_path=receipt,
                     expected_live_sidecar_identity=sidecar,
+                    precutover_service_state=_precutover_service_state(
+                        lease_setup["runtime"]
+                    ),
                 ),
                 writer_stop_observer=lambda: next(values),
                 now=NOW,
@@ -489,6 +624,9 @@ def test_writer_stop_receipt_file_attacks_fail_closed(
                 plan_sha256="7" * 64,
                 receipt_path=receipt,
                 expected_live_sidecar_identity=sidecar,
+                precutover_service_state=_precutover_service_state(
+                    lease_setup["runtime"]
+                ),
             ),
             writer_stop_observer=lambda: stopped,
             now=NOW,
@@ -528,6 +666,9 @@ def test_writer_stop_receipt_stale_or_swapped_fails(lease_setup, tmp_path) -> No
                 plan_sha256="7" * 64,
                 receipt_path=receipt,
                 expected_live_sidecar_identity=sidecar,
+                precutover_service_state=_precutover_service_state(
+                    lease_setup["runtime"]
+                ),
             ),
             writer_stop_observer=lambda: stopped,
             now=NOW,
@@ -568,6 +709,9 @@ def test_no_clobber_recovers_crash_and_rejects_conflict(
             plan_sha256="7" * 64,
             receipt_path=receipt,
             expected_live_sidecar_identity=sidecar,
+            precutover_service_state=_precutover_service_state(
+                lease_setup["runtime"]
+            ),
         )
         monkeypatch.setattr(os, "link", fail_once)
         with pytest.raises(RuntimeError, match="crash before link"):
@@ -632,7 +776,12 @@ def test_plan_and_doctor_expose_no_mutation_executor(tmp_path: Path) -> None:
     assert plan["mutation_commands_available"] is False
     assert plan["production_effects_executed"] is False
     assert doctor["state"] == "absent"
-    assert actions == {"help", "command"}
+    assert actions == {
+        "help",
+        "command",
+        "canonical_live_root",
+        "allow_absent_rca_files",
+    }
     assert not lock.exists()
 
 
@@ -671,27 +820,117 @@ def test_launchctl_observer_is_read_only_print_and_parses_variants(
     )
 
 
-@pytest.mark.parametrize(
-    ("result", "code"),
-    [
-        (
-            subprocess.CompletedProcess(
-                ["launchctl"], 0, "pid = 1\npid = 2\n", ""
-            ),
-            "cutover_guard_launchctl_output_ambiguous",
-        ),
-        (
-            subprocess.CompletedProcess(
-                ["launchctl"], 113, "", "Could not find service"
-            ),
-            "cutover_guard_gateway_label_not_loaded",
-        ),
-    ],
-)
-def test_launchctl_ambiguous_or_unloaded_fails_closed(result, code) -> None:
+def test_launchctl_observer_ignores_nested_service_states() -> None:
+    stdout = (
+        "\tstate = running\n"
+        "\tpid = 41001\n"
+        "\tspawn type = daemon (3)\n"
+        "\tproperties = {\n"
+        "\t\tstate = active\n"
+        "\t}\n"
+    )
+    result = subprocess.CompletedProcess(["launchctl"], 0, stdout, "")
+
+    observed = guard._launchctl_print(
+        runner=lambda *_args, **_kwargs: result
+    )
+
+    assert observed["pid"] == 41001
+    assert observed["state"] == "running"
+
+
+def test_plan_binds_explicit_current_runtime_root(tmp_path: Path) -> None:
+    root = tmp_path / "releases" / "hermes-v0.18.2-current"
+    runtime = _runtime_identity()
+    runtime["canonical_root"] = str(root)
+    runtime["process"]["cwd"] = str(root)
+    runtime["live_runtime_identity"]["canonical_root"] = str(root)
+    runtime["live_runtime_identity"]["root_identity"]["path"] = str(root)
+    runtime["process"]["loaded_runtime_closure_sha256"] = guard._sha256_json(
+        runtime["live_runtime_identity"]
+    )
+
+    plan = guard.plan_cutover_guard(
+        runtime_observer=lambda: runtime,
+        canonical_live_root=root,
+        lock_path=tmp_path / "lock",
+    )
+
+    assert plan["canonical_live_root"] == str(root)
+    assert plan["expected_live_runtime_identity"] == runtime
+    assert plan["absent_rca_files_allowed"] is False
+
+
+def test_runtime_observer_binds_absent_overlay_files(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "base-runtime"
+    interpreter = root / ".venv/bin/python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_bytes(b"python")
+    interpreter.chmod(0o755)
+    monkeypatch.setattr(
+        guard,
+        "GATEWAY_RCA_RUNTIME_RELATIVE_FILES",
+        ("gateway/base.py", "gateway/overlay.py"),
+    )
+    base = root / "gateway/base.py"
+    base.parent.mkdir(parents=True)
+    base.write_bytes(b"base")
+
+    observed = guard.observe_live_runtime_files(
+        root,
+        allow_absent_rca_files=True,
+    )
+
+    assert observed["files"]["gateway/base.py"]["sha256"]
+    assert observed["files"]["gateway/overlay.py"] == {
+        "path": str(root / "gateway/overlay.py"),
+        "state": "absent",
+    }
+    with pytest.raises(guard.CutoverGuardError) as error:
+        guard.observe_live_runtime_files(root)
+    assert error.value.code == "cutover_guard_live_runtime_file_unavailable"
+
+
+def test_runtime_observer_binds_external_current_interpreter(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = tmp_path / "base-runtime"
+    root.mkdir()
+    external = tmp_path / "sealed-venv/bin/python"
+    external.parent.mkdir(parents=True)
+    external.write_bytes(b"python")
+    external.chmod(0o755)
+    monkeypatch.setattr(guard, "GATEWAY_RCA_RUNTIME_RELATIVE_FILES", ())
+
+    observed = guard.observe_live_runtime_files(
+        root,
+        interpreter_path=external,
+    )
+
+    assert observed["interpreter"]["path"] == str(external)
+    assert observed["interpreter"]["sha256"] == hashlib.sha256(b"python").hexdigest()
+
+
+def test_launchctl_ambiguous_output_fails_closed() -> None:
+    result = subprocess.CompletedProcess(
+        ["launchctl"], 0, "pid = 1\npid = 2\n", ""
+    )
     with pytest.raises(guard.CutoverGuardError) as error:
         guard._launchctl_print(runner=lambda *_args, **_kwargs: result)
-    assert error.value.code == code
+    assert error.value.code == "cutover_guard_launchctl_output_ambiguous"
+
+
+def test_launchctl_unloaded_is_valid_writer_stop_state() -> None:
+    result = subprocess.CompletedProcess(
+        ["launchctl"], 113, "", "Could not find service"
+    )
+
+    assert guard._launchctl_print(runner=lambda *_args, **_kwargs: result) == {
+        "label": guard.GATEWAY_LABEL,
+        "loaded": False,
+        "pid": None,
+        "state": "absent",
+    }
 
 
 def test_doctor_rejects_duplicate_json_without_rewriting_lock(tmp_path: Path) -> None:

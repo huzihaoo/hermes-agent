@@ -1427,6 +1427,8 @@ def _requested_scope() -> dict:
             "sigmastar.1.dds2.vehicle_signal_highfreq",
             "sigmastar~1~dds2.vehicle_signal_highfreq",
         ],
+        "frame_lookup": {},
+        "frame_channel_allowlist": [],
         "requested_window": {
             "mode": "full_reference",
             "start_time_ns": None,
@@ -2682,6 +2684,8 @@ def _remote_soak_scope(function_domain: str) -> dict:
             for topic in topics
             for channel in channels_by_topic[topic]
         }),
+        "frame_lookup": {},
+        "frame_channel_allowlist": [],
         "requested_window": {
             "mode": "full_reference",
             "start_time_ns": None,
@@ -9164,6 +9168,7 @@ def _feishu_ingress_gate_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     lease_fingerprint = "9" * 64
     prepare_sha256 = "a" * 64
     old_runtime_sha256 = guard._sha256_json(old_runtime)
+    precutover_services = _cutover_precutover_service_state(4567)
     writer_stop = {
         "schema_version": guard.WRITER_STOP_RECEIPT_SCHEMA_VERSION,
         "release_id": "release-gate-20260713",
@@ -9177,6 +9182,10 @@ def _feishu_ingress_gate_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
         "old_gateway_process": old_runtime["process"],
         "old_gateway_runtime_identity": old_runtime,
         "old_gateway_runtime_identity_sha256": old_runtime_sha256,
+        "precutover_service_state": precutover_services,
+        "precutover_service_state_sha256": guard._sha256_json(
+            precutover_services
+        ),
         "writer_stop_observation": stop_observation,
         "writer_stop_observation_sha256": guard._sha256_json(stop_observation),
         "live_sidecar_identity": sidecar,
@@ -10037,6 +10046,43 @@ def test_outbox_capacity_health_accepts_dynamic_empty_ledger_bootstrap_runtime(
         )
 
 
+def _cutover_precutover_service_state(pid: int) -> dict:
+    jobs = {}
+    for label in release_gate_module.cutover_guard.SERVICE_LABELS:
+        loaded = label == release_gate_module.cutover_guard.GATEWAY_LABEL
+        jobs[label] = {
+            "launchd": {
+                "label": label,
+                "loaded": loaded,
+                "state": "running" if loaded else "absent",
+                "pid": pid if loaded else None,
+                "last_exit_status": None,
+            },
+            "plist": {
+                "path": str(
+                    release_gate_module.cutover_guard.CANONICAL_LAUNCH_AGENTS_ROOT
+                    / f"{label}.plist"
+                ),
+                "state": "regular",
+                "sha256": hashlib.sha256(label.encode()).hexdigest(),
+                "size_bytes": len(label),
+                "mode": "0644",
+                "uid": os.geteuid(),
+                "nlink": 1,
+            },
+        }
+    return {
+        "schema_version": (
+            release_gate_module.cutover_guard.LIVE_SERVICE_STATE_SCHEMA_VERSION
+        ),
+        "target_runtime_root": str(
+            release_gate_module.cutover_guard.CANONICAL_LIVE_ROOT
+        ),
+        "labels": list(release_gate_module.cutover_guard.SERVICE_LABELS),
+        "jobs": jobs,
+    }
+
+
 def _production_cutover_gate_fixture() -> tuple[dict, dict, dict]:
     names = {
         "release_prepare_manifest",
@@ -10064,6 +10110,8 @@ def _production_cutover_gate_fixture() -> tuple[dict, dict, dict]:
     candidate_env_sha = "3" * 64
     auth_raw_sha = "4" * 64
     auth_fingerprint = "5" * 64
+    old_gateway = {"process": {"pid": 41001}}
+    precutover_services = _cutover_precutover_service_state(41001)
     artifacts = {
         "release_prepare_manifest": {
             "schema_version": (
@@ -10082,13 +10130,20 @@ def _production_cutover_gate_fixture() -> tuple[dict, dict, dict]:
             "release_id": release_id,
         },
         "writer_stop_receipt": {
-            "schema_version": "pnc_rca_gateway_writer_stop_receipt_v1",
+            "schema_version": (
+                release_gate_module.cutover_guard.WRITER_STOP_RECEIPT_SCHEMA_VERSION
+            ),
             "release_id": release_id,
             "lease_fingerprint": lease,
             "release_prepare_manifest_sha256": sha[
                 "release_prepare_manifest"
             ],
             "approval_receipt_sha256": hold_approval_sha,
+            "old_gateway_runtime_identity": old_gateway,
+            "precutover_service_state": precutover_services,
+            "precutover_service_state_sha256": (
+                release_gate_module.cutover_guard._sha256_json(precutover_services)
+            ),
             "writer_stop_observation": {
                 "launchd": {"pid": None},
                 "process_census": {"matching_processes": []},
@@ -10319,7 +10374,7 @@ def _cutover_prior_receipt(
     }
 
 
-def test_production_cutover_gate_requires_writer_stop_and_bounded_receipts():
+def test_production_cutover_gate_requires_writer_stop_before_install():
     artifacts, sha, authorization = _production_cutover_gate_fixture()
     common = {
         "artifacts": artifacts,
@@ -10362,20 +10417,20 @@ def test_production_cutover_gate_requires_writer_stop_and_bounded_receipts():
         prior_step_receipt=stopped,
     )
     assert install["allowed_next_step"] == "install_feishu_sidecar"
-    bounded = _cutover_prior_receipt(
-        index=10,
-        step="transition_bounded_activation",
+    started = _cutover_prior_receipt(
+        index=8,
+        step="start_gateway_aux",
         before=live,
         after=live,
-        evidence={"state": "bounded_active", "receipt_sha256": "e" * 64},
+        started_labels=list(release_gate_module.CUTOVER_GATEWAY_AUX_START_ORDER),
     )
-    residents = release_gate_module.validate_rca_cutover_execution_authorization(
+    verified = release_gate_module.validate_rca_cutover_execution_authorization(
         **common,
-        requested_step="start_residents",
+        requested_step="verify_gateway_aux",
         live_identity_sha256=live,
-        prior_step_receipt=bounded,
+        prior_step_receipt=started,
     )
-    assert residents["allowed_next_step"] == "start_residents"
+    assert verified["allowed_next_step"] == "verify_gateway_aux"
 
 
 @pytest.mark.parametrize(
@@ -11977,6 +12032,27 @@ def test_frame_reference_is_closed_over_gateway_and_release_bom():
     relative = "gateway/pnc_rca_frame_reference.py"
 
     assert relative in release_gate_module.GATEWAY_RCA_RUNTIME_RELATIVE_FILES
+    assert relative in release_gate_module._required_critical_files(
+        release_gate_module.REPO_ROOT
+    )
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "scripts/pnc_rca_canary_finalize.py",
+        "scripts/pnc_rca_cutover_adapter.py",
+        "scripts/pnc_rca_cutover_execute.py",
+        "scripts/pnc_rca_cutover_guard.py",
+        "scripts/pnc_rca_cutover_live.py",
+        "scripts/pnc_rca_feishu_ingress_hold.py",
+        "scripts/pnc_rca_postinstall_activation.py",
+        "scripts/pnc_rca_production_cutover.py",
+        "scripts/pnc_rca_vm_promotion.py",
+        "scripts/pnc_rca_vm_promotion_remote.py",
+    ],
+)
+def test_production_control_plane_is_closed_over_release_bom(relative):
     assert relative in release_gate_module._required_critical_files(
         release_gate_module.REPO_ROOT
     )

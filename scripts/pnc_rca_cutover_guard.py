@@ -34,7 +34,8 @@ GATEWAY_RUNNING_OBSERVATION_SCHEMA_VERSION = "pnc_rca_gateway_running_observatio
 GATEWAY_WRITER_STOP_OBSERVATION_SCHEMA_VERSION = (
     "pnc_rca_gateway_writer_stop_observation_v1"
 )
-WRITER_STOP_RECEIPT_SCHEMA_VERSION = "pnc_rca_gateway_writer_stop_receipt_v1"
+WRITER_STOP_RECEIPT_SCHEMA_VERSION = "pnc_rca_gateway_writer_stop_receipt_v2"
+LIVE_SERVICE_STATE_SCHEMA_VERSION = "pnc_rca_live_service_state_v1"
 DOCTOR_SCHEMA_VERSION = "pnc_rca_cutover_guard_doctor_v1"
 PLAN_SCHEMA_VERSION = "pnc_rca_cutover_guard_plan_v1"
 
@@ -42,7 +43,17 @@ PRODUCTION_LOCK_PATH = Path(
     "/Users/songying/.hermes/runtime/locks/pnc-production-cutover.lock"
 )
 CANONICAL_LIVE_ROOT = Path("/Users/songying/.hermes/runtime/hermes-live")
+CANONICAL_LAUNCH_AGENTS_ROOT = Path("/Users/songying/Library/LaunchAgents")
 GATEWAY_LABEL = "ai.hermes.gateway"
+SERVICE_LABELS = (
+    GATEWAY_LABEL,
+    "local.pnc.completion-notice-relay",
+    "local.pnc.vm-task-sync",
+    "local.pnc.rca-kafka-consumer",
+    "local.pnc.rca-outbox-dispatcher",
+    "local.pnc.rca-delivery-collector",
+    "local.pnc.rca-delivery-dispatcher",
+)
 MAX_LEASE_SECONDS = 2 * 60 * 60
 MAX_WRITER_STOP_AGE_SECONDS = 5 * 60
 MAX_FUTURE_SKEW_SECONDS = 30
@@ -80,6 +91,8 @@ class LeaseInputs:
     release_prepare_manifest: Path
     approval_receipt: Path
     expected_live_runtime_identity: Mapping[str, Any]
+    canonical_live_root: Path = CANONICAL_LIVE_ROOT
+    allow_absent_rca_files: bool = False
     duration_seconds: int = MAX_LEASE_SECONDS
 
 
@@ -89,6 +102,7 @@ class WriterStopInputs:
     plan_sha256: str
     receipt_path: Path
     expected_live_sidecar_identity: Mapping[str, Any]
+    precutover_service_state: Mapping[str, Any]
 
 
 @dataclass
@@ -371,6 +385,9 @@ def _regular_file_identity(path: Path, *, artifact: str) -> Mapping[str, Any]:
 
 def observe_live_runtime_files(
     canonical_root: Path = CANONICAL_LIVE_ROOT,
+    *,
+    allow_absent_rca_files: bool = False,
+    interpreter_path: Path | None = None,
 ) -> Mapping[str, Any]:
     root = canonical_root.expanduser().absolute()
     try:
@@ -384,19 +401,42 @@ def observe_live_runtime_files(
     ):
         raise CutoverGuardError("cutover_guard_live_runtime_identity_invalid")
     relatives = tuple(sorted(set(GATEWAY_RCA_RUNTIME_RELATIVE_FILES)))
-    files = {
-        relative: _regular_file_identity(
-            root / relative,
-            artifact="cutover_guard_live_runtime_file",
-        )
-        for relative in relatives
-    }
+    files: dict[str, Mapping[str, Any]] = {}
+    for relative in relatives:
+        path = root / relative
+        try:
+            files[relative] = _regular_file_identity(
+                path,
+                artifact="cutover_guard_live_runtime_file",
+            )
+        except CutoverGuardError as exc:
+            if (
+                not allow_absent_rca_files
+                or exc.code != "cutover_guard_live_runtime_file_unavailable"
+                or path.exists()
+                or path.is_symlink()
+            ):
+                raise
+            files[relative] = {
+                "path": str(path),
+                "state": "absent",
+            }
+    selected_interpreter = (
+        interpreter_path.expanduser().absolute()
+        if interpreter_path is not None
+        else root / ".venv" / "bin" / "python"
+    )
     interpreter = _regular_file_identity(
-        root / ".venv" / "bin" / "python",
+        selected_interpreter,
         artifact="cutover_guard_live_runtime_interpreter",
     )
     closure = {
-        relative: descriptor["sha256"] for relative, descriptor in files.items()
+        relative: (
+            descriptor.get("sha256")
+            if descriptor.get("state") != "absent"
+            else "absent"
+        )
+        for relative, descriptor in files.items()
     }
     return {
         "schema_version": RUNTIME_FILES_IDENTITY_SCHEMA_VERSION,
@@ -428,16 +468,39 @@ def _launchctl_print(
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise CutoverGuardError("cutover_guard_launchctl_observation_failed") from exc
+    if result.returncode == 113:
+        return {
+            "label": GATEWAY_LABEL,
+            "loaded": False,
+            "pid": None,
+            "state": "absent",
+        }
     if result.returncode != 0:
         raise CutoverGuardError("cutover_guard_gateway_label_not_loaded")
-    pids = {int(value) for value in re.findall(r"(?m)^\s*pid\s*=\s*([0-9]+)\s*$", result.stdout)}
-    states = re.findall(r"(?m)^\s*state\s*=\s*([^\n]+?)\s*$", result.stdout)
-    if len(pids) > 1 or len(states) > 1:
+
+    def top_level_values(key: str, value_pattern: str) -> list[str]:
+        matches = re.findall(
+            rf"(?m)^([ \t]*){re.escape(key)}\s*=\s*({value_pattern})\s*$",
+            result.stdout,
+        )
+        if not matches:
+            return []
+        depths = [len(indent.expandtabs(8)) for indent, _value in matches]
+        minimum = min(depths)
+        return [
+            value.strip()
+            for (indent, value), depth in zip(matches, depths, strict=True)
+            if depth == minimum
+        ]
+
+    pid_values = top_level_values("pid", r"[0-9]+")
+    states = top_level_values("state", r"[^\n]+?")
+    if len(pid_values) > 1 or len(states) > 1:
         raise CutoverGuardError("cutover_guard_launchctl_output_ambiguous")
     return {
         "label": GATEWAY_LABEL,
         "loaded": True,
-        "pid": next(iter(pids), None),
+        "pid": int(pid_values[0]) if pid_values else None,
         "state": states[0].strip() if states else None,
     }
 
@@ -524,6 +587,7 @@ def observe_gateway_running(
     *,
     launchctl_observer: Callable[[], Mapping[str, Any]] | None = None,
     runtime_observer: Callable[[], Mapping[str, Any]] | None = None,
+    allow_absent_rca_files: bool = False,
 ) -> Mapping[str, Any]:
     root = canonical_root.expanduser().absolute()
     launchd = dict((launchctl_observer or _launchctl_print)())
@@ -549,7 +613,18 @@ def observe_gateway_running(
         raise CutoverGuardError("cutover_guard_gateway_process_unavailable") from exc
     if cwd != str(root) or not _gateway_cmdline(cmdline):
         raise CutoverGuardError("cutover_guard_gateway_process_mismatch")
-    runtime = dict((runtime_observer or (lambda: observe_live_runtime_files(root)))())
+    runtime = dict(
+        (
+            runtime_observer
+            or (
+                lambda: observe_live_runtime_files(
+                    root,
+                    allow_absent_rca_files=allow_absent_rca_files,
+                    interpreter_path=Path(cmdline[0]) if cmdline else None,
+                )
+            )
+        )()
+    )
     return {
         "schema_version": GATEWAY_RUNNING_OBSERVATION_SCHEMA_VERSION,
         "canonical_root": str(root),
@@ -725,9 +800,15 @@ def acquire_cutover_lease(
         artifact="cutover_guard_approval_receipt",
         require_owner_only=True,
     )
+    root = inputs.canonical_live_root.expanduser()
+    if not root.is_absolute() or ".." in root.parts:
+        raise CutoverGuardError("cutover_guard_live_runtime_root_invalid")
+    root = root.absolute()
+    if not isinstance(inputs.allow_absent_rca_files, bool):
+        raise CutoverGuardError("cutover_guard_absent_rca_policy_invalid")
     expected = _normalize_running_observation(
         inputs.expected_live_runtime_identity,
-        canonical_root=CANONICAL_LIVE_ROOT,
+        canonical_root=root,
     )
     selected = lock_path.expanduser().absolute()
     _validate_lock_parent(selected)
@@ -754,10 +835,15 @@ def acquire_cutover_lease(
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise CutoverGuardError("cutover_guard_lock_contended") from exc
-        observer = runtime_observer or observe_gateway_running
+        observer = runtime_observer or (
+            lambda: observe_gateway_running(
+                root,
+                allow_absent_rca_files=inputs.allow_absent_rca_files,
+            )
+        )
         observed = _normalize_running_observation(
             observer(),
-            canonical_root=CANONICAL_LIVE_ROOT,
+            canonical_root=root,
         )
         if observed != expected:
             raise CutoverGuardError("cutover_guard_live_runtime_changed")
@@ -827,6 +913,11 @@ def _normalize_writer_stop_observation(
     expected_runtime: Mapping[str, Any],
     expected_sidecar: Mapping[str, Any],
 ) -> Mapping[str, Any]:
+    old_root_value = expected_runtime.get("canonical_root")
+    old_root = Path(str(old_root_value or "")).expanduser()
+    if not old_root.is_absolute() or ".." in old_root.parts:
+        raise CutoverGuardError("writer_stop_old_runtime_root_invalid")
+    old_root = old_root.absolute()
     if not isinstance(value, Mapping) or set(value) != {
         "schema_version",
         "canonical_root",
@@ -839,7 +930,7 @@ def _normalize_writer_stop_observation(
     if (
         value.get("schema_version")
         != GATEWAY_WRITER_STOP_OBSERVATION_SCHEMA_VERSION
-        or value.get("canonical_root") != str(CANONICAL_LIVE_ROOT)
+        or value.get("canonical_root") != str(old_root)
     ):
         raise CutoverGuardError("writer_stop_observation_invalid")
     launchd = value.get("launchd")
@@ -847,20 +938,17 @@ def _normalize_writer_stop_observation(
     if (
         not isinstance(launchd, Mapping)
         or set(launchd) != {"label", "loaded", "pid", "state"}
-        or launchd
-        != {
-            "label": GATEWAY_LABEL,
-            "loaded": True,
-            "pid": None,
-            "state": "not_running",
-        }
+        or launchd.get("label") != GATEWAY_LABEL
+        or not isinstance(launchd.get("loaded"), bool)
+        or launchd.get("pid") is not None
+        or launchd.get("state") != "not_running"
     ):
         raise CutoverGuardError("writer_stop_launchctl_state_invalid")
     if (
         not isinstance(census, Mapping)
         or set(census) != {"probe", "canonical_root", "matching_processes"}
         or census.get("probe") != "psutil_gateway_canonical_runtime_census_v1"
-        or census.get("canonical_root") != str(CANONICAL_LIVE_ROOT)
+        or census.get("canonical_root") != str(old_root)
         or census.get("matching_processes") != []
     ):
         raise CutoverGuardError("writer_stop_process_census_invalid")
@@ -896,6 +984,11 @@ def observe_gateway_writer_stopped(
     runtime_observer: Callable[[], Mapping[str, Any]] | None = None,
     sidecar_observer: Callable[[], Mapping[str, Any]],
 ) -> Mapping[str, Any]:
+    old_root_value = expected_live_runtime_identity.get("canonical_root")
+    old_root = Path(str(old_root_value or "")).expanduser()
+    if not old_root.is_absolute() or ".." in old_root.parts:
+        raise CutoverGuardError("writer_stop_old_runtime_root_invalid")
+    old_root = old_root.absolute()
     launchd = dict((launchctl_observer or _launchctl_print)())
     if launchd.get("pid") is None:
         launchd = {
@@ -906,13 +999,30 @@ def observe_gateway_writer_stopped(
         }
     value = {
         "schema_version": GATEWAY_WRITER_STOP_OBSERVATION_SCHEMA_VERSION,
-        "canonical_root": str(CANONICAL_LIVE_ROOT),
+        "canonical_root": str(old_root),
         "launchd": launchd,
         "process_census": dict(
-            (census_observer or observe_gateway_process_census)()
+            (
+                census_observer
+                or (lambda: observe_gateway_process_census(old_root))
+            )()
         ),
         "live_runtime_identity": dict(
-            (runtime_observer or observe_live_runtime_files)()
+            (
+                runtime_observer
+                or (
+                    lambda: observe_live_runtime_files(
+                        old_root,
+                        allow_absent_rca_files=any(
+                            descriptor.get("state") == "absent"
+                            for descriptor in expected_live_runtime_identity.get(
+                                "live_runtime_identity", {}
+                            ).get("files", {}).values()
+                            if isinstance(descriptor, Mapping)
+                        ),
+                    )
+                )
+            )()
         ),
         "live_sidecar_identity": dict(sidecar_observer()),
     }
@@ -1066,6 +1176,119 @@ def _publish_no_clobber(path: Path, body: Mapping[str, Any]) -> bool:
     return False
 
 
+def _normalize_precutover_service_state(
+    value: Any,
+    *,
+    old_runtime: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != {
+        "schema_version",
+        "target_runtime_root",
+        "labels",
+        "jobs",
+    }:
+        raise CutoverGuardError("writer_stop_precutover_service_state_invalid")
+    labels = value.get("labels")
+    jobs = value.get("jobs")
+    if (
+        value.get("schema_version") != LIVE_SERVICE_STATE_SCHEMA_VERSION
+        or value.get("target_runtime_root") != str(CANONICAL_LIVE_ROOT)
+        or labels != list(SERVICE_LABELS)
+        or not isinstance(jobs, Mapping)
+        or set(jobs) != set(SERVICE_LABELS)
+    ):
+        raise CutoverGuardError("writer_stop_precutover_service_state_invalid")
+    normalized_jobs: dict[str, Mapping[str, Any]] = {}
+    old_process = old_runtime.get("process")
+    old_gateway_pid = old_process.get("pid") if isinstance(old_process, Mapping) else None
+    if (
+        isinstance(old_gateway_pid, bool)
+        or not isinstance(old_gateway_pid, int)
+        or old_gateway_pid <= 0
+    ):
+        raise CutoverGuardError("writer_stop_precutover_gateway_state_invalid")
+    for label in SERVICE_LABELS:
+        entry = jobs.get(label)
+        if not isinstance(entry, Mapping) or set(entry) != {"launchd", "plist"}:
+            raise CutoverGuardError("writer_stop_precutover_service_state_invalid")
+        launchd = entry.get("launchd")
+        plist = entry.get("plist")
+        if not isinstance(launchd, Mapping) or set(launchd) != {
+            "label",
+            "loaded",
+            "state",
+            "pid",
+            "last_exit_status",
+        }:
+            raise CutoverGuardError("writer_stop_precutover_service_state_invalid")
+        pid = launchd.get("pid")
+        last_exit = launchd.get("last_exit_status")
+        if (
+            launchd.get("label") != label
+            or not isinstance(launchd.get("loaded"), bool)
+            or not isinstance(launchd.get("state"), str)
+            or not launchd["state"]
+            or (
+                pid is not None
+                and (isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0)
+            )
+            or (
+                last_exit is not None
+                and (isinstance(last_exit, bool) or not isinstance(last_exit, int))
+            )
+        ):
+            raise CutoverGuardError("writer_stop_precutover_service_state_invalid")
+        if label == GATEWAY_LABEL and (
+            launchd["loaded"] is not True
+            or pid != old_gateway_pid
+        ):
+            raise CutoverGuardError("writer_stop_precutover_gateway_state_invalid")
+        expected_path = str(CANONICAL_LAUNCH_AGENTS_ROOT / f"{label}.plist")
+        if not isinstance(plist, Mapping) or plist.get("path") != expected_path:
+            raise CutoverGuardError("writer_stop_precutover_plist_state_invalid")
+        state = plist.get("state")
+        if state == "absent":
+            if set(plist) != {"path", "state"}:
+                raise CutoverGuardError("writer_stop_precutover_plist_state_invalid")
+        elif state == "regular":
+            if set(plist) != {
+                "path",
+                "state",
+                "sha256",
+                "size_bytes",
+                "mode",
+                "uid",
+                "nlink",
+            }:
+                raise CutoverGuardError("writer_stop_precutover_plist_state_invalid")
+            size = plist.get("size_bytes")
+            mode = plist.get("mode")
+            if (
+                SHA256_RE.fullmatch(str(plist.get("sha256") or "")) is None
+                or isinstance(size, bool)
+                or not isinstance(size, int)
+                or size < 0
+                or not isinstance(mode, str)
+                or re.fullmatch(r"[0-7]{4}", mode) is None
+                or int(mode, 8) & 0o022
+                or plist.get("uid") != os.geteuid()
+                or plist.get("nlink") != 1
+            ):
+                raise CutoverGuardError("writer_stop_precutover_plist_state_invalid")
+        else:
+            raise CutoverGuardError("writer_stop_precutover_plist_state_invalid")
+        normalized_jobs[label] = json.loads(json.dumps(entry))
+    normalized = {
+        "schema_version": LIVE_SERVICE_STATE_SCHEMA_VERSION,
+        "target_runtime_root": str(CANONICAL_LIVE_ROOT),
+        "labels": list(SERVICE_LABELS),
+        "jobs": normalized_jobs,
+    }
+    if len(_canonical_json(normalized)) > MAX_JSON_BYTES:
+        raise CutoverGuardError("writer_stop_precutover_service_state_invalid")
+    return normalized
+
+
 def _writer_stop_receipt_body(
     *,
     lease: CutoverLease,
@@ -1075,6 +1298,10 @@ def _writer_stop_receipt_body(
 ) -> Mapping[str, Any]:
     old_runtime = lease.body["expected_live_runtime_identity"]
     old_process = old_runtime["process"]
+    precutover_services = _normalize_precutover_service_state(
+        inputs.precutover_service_state,
+        old_runtime=old_runtime,
+    )
     return {
         "schema_version": WRITER_STOP_RECEIPT_SCHEMA_VERSION,
         "release_id": lease.body["release_id"],
@@ -1090,6 +1317,8 @@ def _writer_stop_receipt_body(
         "old_gateway_process": old_process,
         "old_gateway_runtime_identity": old_runtime,
         "old_gateway_runtime_identity_sha256": _sha256_json(old_runtime),
+        "precutover_service_state": precutover_services,
+        "precutover_service_state_sha256": _sha256_json(precutover_services),
         "writer_stop_observation": observation,
         "writer_stop_observation_sha256": _sha256_json(observation),
         "live_sidecar_identity": inputs.expected_live_sidecar_identity,
@@ -1169,6 +1398,8 @@ def read_writer_stop_receipt(
         "old_gateway_process",
         "old_gateway_runtime_identity",
         "old_gateway_runtime_identity_sha256",
+        "precutover_service_state",
+        "precutover_service_state_sha256",
         "writer_stop_observation",
         "writer_stop_observation_sha256",
         "live_sidecar_identity",
@@ -1190,6 +1421,7 @@ def read_writer_stop_receipt(
         "release_prepare_manifest_sha256",
         "approval_receipt_sha256",
         "old_gateway_runtime_identity_sha256",
+        "precutover_service_state_sha256",
         "writer_stop_observation_sha256",
         "live_sidecar_identity_sha256",
     ):
@@ -1197,18 +1429,28 @@ def read_writer_stop_receipt(
     if (
         body["old_gateway_runtime_identity_sha256"]
         != _sha256_json(body.get("old_gateway_runtime_identity"))
+        or body["precutover_service_state_sha256"]
+        != _sha256_json(body.get("precutover_service_state"))
         or body["writer_stop_observation_sha256"]
         != _sha256_json(body.get("writer_stop_observation"))
         or body["live_sidecar_identity_sha256"]
         != _sha256_json(body.get("live_sidecar_identity"))
     ):
         raise CutoverGuardError("writer_stop_receipt_hash_mismatch")
-    old = _normalize_running_observation(
-        body.get("old_gateway_runtime_identity"),
-        canonical_root=CANONICAL_LIVE_ROOT,
+    old_value = body.get("old_gateway_runtime_identity")
+    old_root_value = (
+        old_value.get("canonical_root") if isinstance(old_value, Mapping) else None
     )
+    old_root = Path(str(old_root_value or "")).expanduser()
+    if not old_root.is_absolute() or ".." in old_root.parts:
+        raise CutoverGuardError("writer_stop_old_runtime_root_invalid")
+    old = _normalize_running_observation(old_value, canonical_root=old_root)
     if body.get("old_gateway_process") != old["process"]:
         raise CutoverGuardError("writer_stop_receipt_old_process_mismatch")
+    services = _normalize_precutover_service_state(
+        body.get("precutover_service_state"),
+        old_runtime=old,
+    )
     normalized_stop = _normalize_writer_stop_observation(
         body.get("writer_stop_observation"),
         expected_runtime=old,
@@ -1223,6 +1465,7 @@ def read_writer_stop_receipt(
         **dict(body),
         "observed_at": observed_at.isoformat(),
         "old_gateway_runtime_identity": old,
+        "precutover_service_state": services,
         "writer_stop_observation": normalized_stop,
     }
     return owned, normalized
@@ -1230,18 +1473,31 @@ def read_writer_stop_receipt(
 
 def plan_cutover_guard(
     *,
-    runtime_observer: Callable[[], Mapping[str, Any]] = observe_gateway_running,
+    runtime_observer: Callable[[], Mapping[str, Any]] | None = None,
     lock_path: Path = PRODUCTION_LOCK_PATH,
+    canonical_live_root: Path = CANONICAL_LIVE_ROOT,
+    allow_absent_rca_files: bool = False,
 ) -> Mapping[str, Any]:
+    root = canonical_live_root.expanduser()
+    if not root.is_absolute() or ".." in root.parts:
+        raise CutoverGuardError("cutover_guard_live_runtime_root_invalid")
+    root = root.absolute()
+    observer = runtime_observer or (
+        lambda: observe_gateway_running(
+            root,
+            allow_absent_rca_files=allow_absent_rca_files,
+        )
+    )
     observed = _normalize_running_observation(
-        runtime_observer(),
-        canonical_root=CANONICAL_LIVE_ROOT,
+        observer(),
+        canonical_root=root,
     )
     return {
         "schema_version": PLAN_SCHEMA_VERSION,
         "production_effects_executed": False,
         "lock_path": str(lock_path.expanduser().absolute()),
-        "canonical_live_root": str(CANONICAL_LIVE_ROOT),
+        "canonical_live_root": str(root),
+        "absent_rca_files_allowed": allow_absent_rca_files,
         "gateway_label": GATEWAY_LABEL,
         "max_lease_seconds": MAX_LEASE_SECONDS,
         "writer_stop_receipt_max_age_seconds": MAX_WRITER_STOP_AGE_SECONDS,
@@ -1313,13 +1569,34 @@ def doctor_cutover_lock(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("plan", "doctor"))
+    parser.add_argument(
+        "--canonical-live-root",
+        type=Path,
+        default=CANONICAL_LIVE_ROOT,
+        help="Exact currently loaded Gateway runtime root for the read-only plan.",
+    )
+    parser.add_argument(
+        "--allow-absent-rca-files",
+        action="store_true",
+        help=(
+            "Bind missing RCA overlay files as explicit absent baseline state. "
+            "Use only when cutting over from a base Hermes runtime."
+        ),
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        body = plan_cutover_guard() if args.command == "plan" else doctor_cutover_lock()
+        body = (
+            plan_cutover_guard(
+                canonical_live_root=args.canonical_live_root,
+                allow_absent_rca_files=args.allow_absent_rca_files,
+            )
+            if args.command == "plan"
+            else doctor_cutover_lock()
+        )
     except (OSError, CutoverGuardError) as exc:
         code = exc.code if isinstance(exc, CutoverGuardError) else "cutover_guard_failed"
         print(json.dumps({"ok": False, "code": code}, sort_keys=True))

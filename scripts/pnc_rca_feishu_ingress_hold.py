@@ -1419,6 +1419,113 @@ def _validate_cutover(
     }
 
 
+def build_cutover_binding(
+    inputs: HoldInputs,
+    *,
+    release_id: str,
+    writer_stop_receipt: Path,
+    lease: cutover_guard.CutoverLease,
+    output_path: Path,
+    now: datetime | None = None,
+) -> Mapping[str, Any]:
+    """Publish the exact dynamic hold binding under the active cutover lease."""
+    selected = _validate_inputs(inputs, phase="plan")
+    if RELEASE_ID_RE.fullmatch(release_id) is None:
+        raise IngressHoldError("feishu_ingress_hold_cutover_release_id_invalid")
+    destination = output_path.expanduser()
+    if not destination.is_absolute() or ".." in destination.parts:
+        raise IngressHoldError("feishu_ingress_hold_cutover_output_path_invalid")
+    destination = destination.absolute()
+    lease.assert_active()
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    plan_path = selected.run_root.expanduser().absolute() / PLAN_FILENAME
+    plan_owned = _read_owned_json(plan_path, artifact="feishu_ingress_hold_plan")
+    plan = plan_owned.body
+    if (
+        plan.get("schema_version") != PLAN_SCHEMA_VERSION
+        or plan.get("hold_id") != selected.hold_id
+        or plan.get("phase") != "plan"
+        or plan.get("production_effects_executed") is not False
+    ):
+        raise IngressHoldError("feishu_ingress_hold_plan_binding_invalid")
+    try:
+        writer_owned, writer = cutover_guard.read_writer_stop_receipt(
+            writer_stop_receipt,
+            now=current,
+        )
+    except cutover_guard.CutoverGuardError as exc:
+        raise IngressHoldError(exc.code, exc.detail) from exc
+    if (
+        lease.fingerprint != writer.get("lease_fingerprint")
+        or lease.body.get("release_id") != release_id
+        or writer.get("release_id") != release_id
+        or writer.get("hold_id") != selected.hold_id
+        or writer.get("plan_sha256") != plan_owned.sha256
+        or writer.get("release_prepare_manifest_sha256")
+        != lease.body.get("release_prepare_manifest", {}).get("sha256")
+        or writer.get("approval_receipt_sha256")
+        != lease.body.get("approval_receipt", {}).get("sha256")
+    ):
+        raise IngressHoldError("feishu_ingress_hold_cutover_writer_stop_mismatch")
+    expires = min(
+        _parse_timestamp(lease.body.get("expires_at"), artifact="cutover_expires"),
+        current + timedelta(seconds=MAX_CUTOVER_WINDOW_SECONDS),
+    )
+    if expires <= current:
+        raise IngressHoldError("feishu_ingress_hold_cutover_window_invalid")
+    host = plan.get("host_adapter_identity")
+    if not isinstance(host, Mapping):
+        raise IngressHoldError("feishu_ingress_hold_plan_binding_invalid")
+    body = {
+        "schema_version": CUTOVER_BINDING_SCHEMA_VERSION,
+        "hold_id": selected.hold_id,
+        "release_id": release_id,
+        "plan_sha256": plan_owned.sha256,
+        "canonical_gateway_root": str(selected.canonical_gateway_root),
+        "canonical_sidecar_path": str(selected.live_sidecar.expanduser().absolute()),
+        "host_commit": host.get("host_commit"),
+        "adapter_sha256": host.get("adapter_sha256"),
+        "chat_set_sha256": plan.get("chat_set_sha256"),
+        "live_sidecar_identity_sha256": _sha256_json(
+            plan.get("live_sidecar_identity")
+        ),
+        "gateway_writer_state": "stopped",
+        "writer_stop_receipt_path": str(writer_owned.path),
+        "writer_stop_receipt_sha256": writer_owned.sha256,
+        "cutover_lease_fingerprint": lease.fingerprint,
+        "release_prepare_manifest_sha256": writer[
+            "release_prepare_manifest_sha256"
+        ],
+        "release_approval_receipt_sha256": writer["approval_receipt_sha256"],
+        "old_gateway_runtime_identity_sha256": writer[
+            "old_gateway_runtime_identity_sha256"
+        ],
+        "window_started_at": current.isoformat(),
+        "window_expires_at": expires.isoformat(),
+    }
+    _validate_cutover(
+        _OwnedJson(
+            path=destination,
+            raw=_canonical_json(body),
+            stat_result=writer_owned.stat_result,
+            body=body,
+        ),
+        inputs=selected,
+        plan=plan,
+        plan_sha256=plan_owned.sha256,
+        now=current,
+    )
+    _publish_no_clobber(destination, body)
+    lease.assert_active()
+    published = _read_owned_json(
+        destination,
+        artifact="feishu_ingress_hold_cutover",
+    )
+    if published.body != body:
+        raise IngressHoldError("feishu_ingress_hold_cutover_publication_invalid")
+    return body
+
+
 def _validate_writer_stop_receipt(
     *,
     cutover: _OwnedJson,

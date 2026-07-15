@@ -243,7 +243,7 @@ REMOTE_READER_SOAK_HOST_SCHEMA = (
     "docs/pnc/schemas/pnc_rca_remote_reader_soak_v4.schema.json"
 )
 REMOTE_READER_SOAK_SCHEMA_SHA256 = (
-    "1979a850be44ca190f7d468b2d2e3f1cc939fe755eb770ab9679403701c415fa"
+    "424a5c08458fcb15ef517297507b27a55115cfafa4c64ef740bb6e8e39460686"
 )
 REMOTE_READER_SOAK_MODULE_SHA256 = (
     "040f29e791086440a52f3c14e28c50df438408c89fa713bac3f73c2c8cbf38db"
@@ -267,14 +267,14 @@ REMOTE_READER_SOAK_READER_QUOTAS = {
     "RemoteEventReader": 25,
 }
 REMOTE_READER_SOAK_REQUIREMENTS_CONTRACT_SHA256 = (
-    "0bac55125b92ade6dfc6f8065832ef52373d37be4c4255a20001264c1e5e4bfd"
+    "ae72afe2d7fec8d5f22a14fca579446e48912c986671cf327b1cecccd28f28ec"
 )
 REMOTE_READER_SOAK_REQUIREMENTS_SHA256 = {
-    "ACC": "5eb9c6a5fe5615f84fad33fff2d84a35d677e273337558bd24f4afd3032bb9e6",
-    "LCC": "73212aa1df0453da885d28a6a1b36dc0e08995e74cc97b8353ac16377e96d26a",
-    "AEB": "b96b2bfa111c1b46bcf7da29ee5c221cb3dd6f8100c47aee24bc54e8e8d143e9",
-    "FCW": "7482570d2dd516b7a317522bd39e47ebdb50cd48a8c6bc51f1e0f31de9b3c04d",
-    "DNP": "b698f6213df1efba439bb4bba6c3aca796f2b455127d1eb7d457757db3de4f6b",
+    "ACC": "563c6488be2ba386cfe2f03c40abe5a947ceaf50d20fccf282af94b70a798b9f",
+    "LCC": "6038be3b90033c76492e819eb1b3971d738332ca11231513c8dcd050cd4f7b1f",
+    "AEB": "5a6ba8baa501753d0cbb0ae339c8a97af14af2af54a7666d522c44d35272beab",
+    "FCW": "b30581a52f14382c4a98b42d9cda3d6247d731327bc16059878043127e3fac1d",
+    "DNP": "ccc3610f7dea183f3fb18e19ced7bf9b0dbb1a9e10d33780a092d2264d913bcf",
 }
 REMOTE_READER_LIVE_PROBE_SCHEMA_VERSION = "pnc_rca_remote_reader_live_probe_v1"
 ACTIVATION_PRODUCTION_CANDIDATE_SCHEMA_VERSION = (
@@ -405,7 +405,7 @@ RELEASE_PREPARE_PLAN_SCHEMA_VERSION = "pnc_rca_release_prepare_plan_v1"
 RELEASE_PREPARE_ROLLBACK_SCHEMA_VERSION = "pnc_rca_rollback_config_v1"
 RELEASE_PREPARE_T0_SCHEMA_VERSION = "pnc_rca_release_t0_binding_v1"
 CUTOVER_GATE_VALIDATION_SCHEMA_VERSION = (
-    "pnc_rca_production_cutover_gate_validation_v1"
+    "pnc_rca_production_cutover_gate_validation_v2"
 )
 CUTOVER_GATEWAY_AUX_START_ORDER = (
     "ai.hermes.gateway",
@@ -428,9 +428,6 @@ CUTOVER_STEP_NAMES = (
     "install_plists",
     "start_gateway_aux",
     "verify_gateway_aux",
-    "transition_bounded_activation",
-    "start_residents",
-    "verify_services",
 )
 MAX_EVIDENCE_BYTES = 8 * 1024 * 1024
 MAX_CANARY_EVIDENCE_COMMIT_BYTES = 64 * 1024
@@ -789,7 +786,17 @@ MINIMUM_CRITICAL_FILES = frozenset({
     "scripts/pnc_rca_outbox_dispatcher.py",
     "scripts/pnc_rca_contract_drift_guard.py",
     "scripts/pnc_rca_canary_collector.py",
+    "scripts/pnc_rca_canary_finalize.py",
+    "scripts/pnc_rca_cutover_adapter.py",
+    "scripts/pnc_rca_cutover_execute.py",
+    "scripts/pnc_rca_cutover_guard.py",
+    "scripts/pnc_rca_cutover_live.py",
+    "scripts/pnc_rca_feishu_ingress_hold.py",
+    "scripts/pnc_rca_postinstall_activation.py",
+    "scripts/pnc_rca_production_cutover.py",
     "scripts/pnc_rca_release_gate.py",
+    "scripts/pnc_rca_vm_promotion.py",
+    "scripts/pnc_rca_vm_promotion_remote.py",
     REMOTE_READER_WORKLOAD_EXPORT_MODULE,
     "scripts/pnc_rca_store_migration_drill.py",
     "scripts/pnc_rca_writer_stop_evidence.py",
@@ -2989,6 +2996,8 @@ def _check_requested_scope(value: Any, *, field: str) -> dict[str, Any]:
         "function_domain",
         "requested_topics",
         "channel_allowlist",
+        "frame_lookup",
+        "frame_channel_allowlist",
         "requested_window",
         "evaluator_fingerprints",
         "requirements_hash",
@@ -3026,6 +3035,10 @@ def _check_requested_scope(value: Any, *, field: str) -> dict[str, Any]:
 
     topics = string_set("requested_topics")
     channels = string_set("channel_allowlist")
+    if requirements.get("frame_lookup") != {}:
+        raise EvidenceError("remote_requested_scope_frame_lookup_invalid")
+    if requirements.get("frame_channel_allowlist") != []:
+        raise EvidenceError("remote_requested_scope_frame_channel_allowlist_invalid")
     window = _mapping(
         requirements.get("requested_window"),
         f"{field}.requirements.requested_window",
@@ -3067,6 +3080,8 @@ def _check_requested_scope(value: Any, *, field: str) -> dict[str, Any]:
         "function_domain": function_domain,
         "requested_topics": topics,
         "channel_allowlist": channels,
+        "frame_lookup": {},
+        "frame_channel_allowlist": [],
         "requested_window": canonical_window,
         "evaluator_fingerprints": normalized_fingerprints,
     }
@@ -13928,22 +13943,10 @@ def _validate_cutover_prior_step(
             evidence_map.get("receipt_sha256"),
             "production_cutover.writer_stop_evidence.receipt_sha256",
         )
-    if requested_step == "start_residents":
-        evidence_map = _mapping(evidence, "production_cutover.activation_evidence")
-        if evidence_map.get("state") != "bounded_active":
-            raise EvidenceError("production_cutover_activation_not_bounded")
-        _sha256_digest(
-            evidence_map.get("receipt_sha256"),
-            "production_cutover.activation_evidence.receipt_sha256",
-        )
     if requested_step == "verify_gateway_aux" and result.get("started_labels") != list(
         CUTOVER_GATEWAY_AUX_START_ORDER
     ):
         raise EvidenceError("production_cutover_gateway_start_order_invalid")
-    if requested_step == "verify_services" and result.get("started_labels") != list(
-        CUTOVER_RESIDENT_START_ORDER
-    ):
-        raise EvidenceError("production_cutover_resident_start_order_invalid")
 
 
 def validate_rca_cutover_execution_authorization(
@@ -14014,7 +14017,8 @@ def validate_rca_cutover_execution_authorization(
     if hashes["approval_receipt"] == hashes["feishu_hold_approval_receipt"]:
         raise EvidenceError("production_cutover_approval_domains_not_separated")
     if (
-        writer.get("schema_version") != "pnc_rca_gateway_writer_stop_receipt_v1"
+        writer.get("schema_version")
+        != cutover_guard.WRITER_STOP_RECEIPT_SCHEMA_VERSION
         or writer.get("release_id") != release_id
         or writer.get("lease_fingerprint") != lease_fingerprint
         or writer.get("release_prepare_manifest_sha256")
@@ -14040,6 +14044,26 @@ def validate_rca_cutover_execution_authorization(
         != []
     ):
         raise EvidenceError("production_cutover_writer_not_stopped")
+    precutover_services = _mapping(
+        writer.get("precutover_service_state"),
+        "production_cutover.precutover_service_state",
+    )
+    try:
+        normalized_precutover_services = (
+            cutover_guard._normalize_precutover_service_state(
+                precutover_services,
+                old_runtime=_mapping(
+                    writer.get("old_gateway_runtime_identity"),
+                    "production_cutover.old_gateway_runtime_identity",
+                ),
+            )
+        )
+    except cutover_guard.CutoverGuardError as exc:
+        raise EvidenceError(exc.code, exc.detail) from exc
+    if writer.get("precutover_service_state_sha256") != _sha256_json(
+        normalized_precutover_services
+    ):
+        raise EvidenceError("production_cutover_precutover_service_state_invalid")
     if (
         hold_plan.get("schema_version") != feishu_ingress_hold.PLAN_SCHEMA_VERSION
         or hold_plan.get("production_effects_executed") is not False

@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import plistlib
+import stat
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -12,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from gateway import pnc_rca_workspace_runtime as workspace_runtime
+from scripts import pnc_rca_cutover_execute as cutover_execute
 from scripts import pnc_rca_cutover_guard as cutover_guard
 from scripts import pnc_rca_production_cutover as cutover
 
@@ -39,6 +41,38 @@ def _write_json(path: Path, body: dict) -> bytes:
 
 def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _precutover_service_state(pid: int) -> dict:
+    jobs = {}
+    for label in cutover_guard.SERVICE_LABELS:
+        loaded = label == cutover_guard.GATEWAY_LABEL
+        jobs[label] = {
+            "launchd": {
+                "label": label,
+                "loaded": loaded,
+                "state": "running" if loaded else "absent",
+                "pid": pid if loaded else None,
+                "last_exit_status": None,
+            },
+            "plist": {
+                "path": str(
+                    cutover_guard.CANONICAL_LAUNCH_AGENTS_ROOT / f"{label}.plist"
+                ),
+                "state": "regular",
+                "sha256": hashlib.sha256(label.encode()).hexdigest(),
+                "size_bytes": len(label),
+                "mode": "0644",
+                "uid": os.geteuid(),
+                "nlink": 1,
+            },
+        }
+    return {
+        "schema_version": cutover_guard.LIVE_SERVICE_STATE_SCHEMA_VERSION,
+        "target_runtime_root": str(cutover_guard.CANONICAL_LIVE_ROOT),
+        "labels": list(cutover_guard.SERVICE_LABELS),
+        "jobs": jobs,
+    }
 
 
 def _write_payload(path: Path, raw: bytes, *, mode: int) -> dict:
@@ -97,7 +131,11 @@ def fixture(tmp_path: Path) -> SimpleNamespace:
     }
     _write_json(paths["feishu_hold_approval_receipt"], hold_approval)
 
-    old_gateway = {"schema_version": "fake_gateway_identity_v1", "pid": 40001}
+    old_gateway = {
+        "schema_version": "fake_gateway_identity_v1",
+        "process": {"pid": 40001},
+    }
+    precutover_services = _precutover_service_state(40001)
     writer_observation = {
         "schema_version": "pnc_rca_gateway_writer_stop_observation_v1",
         "launchd": {"loaded": True, "pid": None, "state": "not_running"},
@@ -112,6 +150,10 @@ def fixture(tmp_path: Path) -> SimpleNamespace:
         "approval_receipt_sha256": _sha(paths["feishu_hold_approval_receipt"]),
         "old_gateway_runtime_identity": old_gateway,
         "old_gateway_runtime_identity_sha256": cutover._sha256_json(old_gateway),
+        "precutover_service_state": precutover_services,
+        "precutover_service_state_sha256": cutover._sha256_json(
+            precutover_services
+        ),
         "writer_stop_observation": writer_observation,
     }
     _write_json(paths["writer_stop_receipt"], writer)
@@ -181,9 +223,11 @@ def fixture(tmp_path: Path) -> SimpleNamespace:
             },
         },
         "policy": {
+            "kafka": {"activation_required": True},
             "capacity_admission": {
                 "mode": "bootstrap",
                 "resource_class": "rca_prod",
+                "bootstrap_epoch_id": "rca-bootstrap-20260713-cutover",
             }
         },
         "side_effect_contract": {
@@ -458,8 +502,22 @@ class FakeAdapter:
     def _services(self, labels, plan):
         return {
             label: {
-                "pid": 50000 + index,
-                "process_create_time": NOW.timestamp() + index,
+                "kind": (
+                    "periodic"
+                    if label in cutover.PERIODIC_SERVICE_LABELS
+                    else "resident"
+                ),
+                "loaded": True,
+                "pid": (
+                    None
+                    if label in cutover.PERIODIC_SERVICE_LABELS
+                    else 50000 + index
+                ),
+                "process_create_time": (
+                    None
+                    if label in cutover.PERIODIC_SERVICE_LABELS
+                    else NOW.timestamp() + index
+                ),
                 "runtime_sha256": plan["bindings"]["runtime_content_sha256"],
                 "health_ok": not self.unhealthy,
             }
@@ -553,12 +611,6 @@ class FakeAdapter:
                 "receipt_sha256": "b" * 64,
                 "receipt_path": "/fake/evidence/writer-stop.json",
             }
-        elif step == "transition_bounded_activation":
-            evidence = {
-                "state": "bounded_active",
-                "receipt_sha256": "c" * 64,
-                "receipt_path": "/fake/evidence/bounded-active.json",
-            }
         elif step in {
             "install_feishu_sidecar",
             "install_runtime",
@@ -598,14 +650,9 @@ class FakeAdapter:
         elif step == "start_gateway_aux":
             started_labels = list(plan["gateway_aux_start_order"])
             commands = [list(item) for item in planned_commands]
-        elif step == "start_residents":
-            started_labels = list(plan["resident_start_order"])
-            commands = [list(item) for item in planned_commands]
             self.state = dict(TARGET_LIVE)
         elif step == "verify_gateway_aux":
             services = self._services(cutover.GATEWAY_AUX_LABELS, plan)
-        elif step == "verify_services":
-            services = self._services(cutover.SERVICE_LABELS, plan)
         if self.crash_step == step:
             raise cutover.CutoverCrash(step)
         if self.fail_step == step:
@@ -772,6 +819,75 @@ def test_plan_never_observes_live_or_creates_journal_artifacts(fixture) -> None:
     assert not fixture.nonce_ledger.exists()
 
 
+def test_prepare_execution_freezes_plan_authorization_and_payloads(fixture) -> None:
+    gate = FakeGate()
+
+    prepared = cutover.prepare_cutover_execution(
+        fixture.inputs,
+        gate_validator=gate,
+        machine_identity_provider=lambda: MACHINE_IDENTITY_SHA,
+        now=NOW,
+    )
+
+    assert prepared.plan["bindings"]["cutover_lease_fingerprint"] == (
+        LEASE_FINGERPRINT
+    )
+    assert prepared.authorization["receipt_sha256"] == _sha(
+        fixture.paths["cutover_authorization_receipt"]
+    )
+    assert prepared.authorization["machine_identity_sha256"] == MACHINE_IDENTITY_SHA
+    assert set(prepared.payload_descriptors) == {
+        "candidate_environment",
+        "active_release_binding",
+        "feishu_sidecar",
+        "runtime",
+        "workspace",
+    }
+    assert prepared.machine_identity_sha256 == MACHINE_IDENTITY_SHA
+    assert [call["requested_step"] for call in gate.calls] == ["plan"]
+    assert list(fixture.journal.iterdir()) == []
+
+
+def test_authorization_builder_validates_before_no_clobber_publish(fixture) -> None:
+    authorization_path = fixture.paths["cutover_authorization_receipt"]
+    authorization_path.unlink()
+    authorization_inputs = cutover.CutoverAuthorizationInputs(
+        **{
+            field: getattr(fixture.inputs, field)
+            for field in cutover.AUTHORIZATION_ARTIFACT_FIELDS
+        },
+        cutover_lease_fingerprint=LEASE_FINGERPRINT,
+    )
+
+    projection = cutover.prepare_cutover_authorization_projection(
+        authorization_inputs
+    )
+    body = cutover.build_cutover_authorization(
+        authorization_inputs,
+        expected_live_identity_sha256=INITIAL_SHA,
+        nonce="cutover-authorization-builder-0001",
+        output_path=authorization_path,
+        machine_identity_provider=lambda: MACHINE_IDENTITY_SHA,
+        now=NOW,
+    )
+
+    assert projection.plan["bindings"]["runtime_content_sha256"] == (
+        json.loads(fixture.paths["runtime_stage_manifest"].read_text())[
+            "content_sha256"
+        ]
+    )
+    assert body["bindings"]["expected_live_identity_sha256"] == INITIAL_SHA
+    assert stat.S_IMODE(authorization_path.stat().st_mode) == 0o600
+    assert not list(authorization_path.parent.glob("*.validation"))
+    prepared = cutover.prepare_cutover_execution(
+        fixture.inputs,
+        gate_validator=FakeGate(),
+        machine_identity_provider=lambda: MACHINE_IDENTITY_SHA,
+        now=NOW,
+    )
+    assert prepared.authorization["receipt_sha256"] == _sha(authorization_path)
+
+
 def test_validate_is_read_only_and_only_observes_live(fixture) -> None:
     gate = FakeGate()
     adapter = FakeAdapter()
@@ -832,6 +948,68 @@ def test_apply_runs_exact_phases_and_writes_no_clobber_journal(fixture) -> None:
         "nlink": 1,
         "post_install_verified": True,
     }
+
+
+def test_bound_executor_wires_one_lease_authority_and_transaction(
+    fixture, tmp_path, monkeypatch
+) -> None:
+    gate = FakeGate()
+    lease = FakeLease()
+    lease.active = True
+    fake_adapter = FakeAdapter()
+    captured = {}
+
+    class Observer:
+        def __init__(self, *, plan, payloads):
+            captured["plan"] = plan
+            captured["payloads"] = payloads
+
+        def __call__(self):
+            return dict(INITIAL_LIVE)
+
+    def build_adapter(**kwargs):
+        captured["adapter_kwargs"] = kwargs
+        return fake_adapter
+
+    monkeypatch.setattr(
+        cutover_execute.live,
+        "ProjectedLiveIdentityObserver",
+        Observer,
+    )
+    monkeypatch.setattr(
+        cutover_execute.adapter,
+        "build_production_adapter",
+        build_adapter,
+    )
+
+    result = cutover_execute.execute_bound_cutover(
+        fixture.inputs,
+        lease=lease,
+        evidence_root=tmp_path / "evidence",
+        snapshot_root=tmp_path / "snapshots",
+        gate_validator=gate,
+        clock=lambda: NOW,
+        machine_identity_provider=lambda: MACHINE_IDENTITY_SHA,
+        nonce_ledger_root=fixture.nonce_ledger,
+        runner=object(),
+        service_controller=object(),
+    )
+
+    assert result.body["ok"] is True
+    assert fake_adapter.executed == list(cutover.STEP_NAMES)
+    assert captured["plan"]["bindings"]["cutover_lease_fingerprint"] == (
+        lease.fingerprint
+    )
+    assert set(captured["payloads"]) == {
+        "candidate_environment",
+        "active_release_binding",
+        "feishu_sidecar",
+        "runtime",
+        "workspace",
+    }
+    assert captured["adapter_kwargs"]["authority"].lease_fingerprint == (
+        lease.fingerprint
+    )
 
 
 def test_completed_apply_is_idempotent(fixture) -> None:
@@ -898,7 +1076,7 @@ def test_every_step_hard_crash_is_detected_on_resume(fixture, step: str) -> None
 
 @pytest.mark.parametrize(
     "step",
-    ["stop_writers", "install_runtime", "start_gateway_aux", "start_residents"],
+    ["stop_writers", "install_runtime", "start_gateway_aux"],
 )
 def test_external_command_failure_rolls_back_exact_snapshot(fixture, step: str) -> None:
     adapter = FakeAdapter(fail_step=step)
@@ -911,16 +1089,6 @@ def test_external_command_failure_rolls_back_exact_snapshot(fixture, step: str) 
     assert adapter.state == INITIAL_LIVE
     assert (fixture.journal / "failure.json").is_file()
     assert (fixture.journal / "rollback.json").is_file()
-
-
-def test_partial_resident_start_failure_rolls_back(fixture) -> None:
-    adapter = FakeAdapter(fail_step="start_residents")
-
-    with pytest.raises(cutover.ProductionCutoverError) as error:
-        _apply(fixture, adapter=adapter)
-
-    assert error.value.code == "production_cutover_apply_failed_rolled_back"
-    assert adapter.state == INITIAL_LIVE
 
 
 def test_unhealthy_service_verification_rolls_back(fixture) -> None:
@@ -1213,15 +1381,8 @@ def test_preflight_binds_exact_start_commands_and_order(fixture) -> None:
             for label in cutover.GATEWAY_AUX_LABELS[1:]
         ],
     ]
-    assert cutover._expected_start_commands("start_residents", plan) == [
-        [
-            "/bin/launchctl",
-            "bootstrap",
-            f"gui/{os.geteuid()}",
-            str(cutover.CANONICAL_LAUNCH_AGENTS_ROOT / f"{label}.plist"),
-        ]
-        for label in reversed(cutover.RESIDENT_LABELS)
-    ]
+    assert "start_residents" not in cutover.STEP_NAMES
+    assert cutover._expected_start_commands("start_residents", plan) == []
 
 
 def test_gateway_candidate_preserves_v0182_production_inheritance() -> None:
@@ -1271,7 +1432,7 @@ def test_wrong_start_command_order_fails_in_preflight(fixture) -> None:
     class WrongOrderAdapter(FakeAdapter):
         def preflight_step(self, step, **kwargs):
             result = super().preflight_step(step, **kwargs)
-            if step == "start_residents":
+            if step == "start_gateway_aux":
                 result["commands"] = list(reversed(result["commands"]))
             return result
 
@@ -1458,7 +1619,7 @@ def test_recovery_rolls_back_final_done_before_complete_after_forward_auth_expir
     def crash_after_final_done(path, body):
         nonlocal crashed
         result = original(path, body)
-        if path.name == "12-verify_services.done.json" and not crashed:
+        if path.name == "09-verify_gateway_aux.done.json" and not crashed:
             crashed = True
             raise cutover.CutoverCrash("after-final-done-before-complete")
         return result

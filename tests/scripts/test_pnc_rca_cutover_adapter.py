@@ -161,8 +161,22 @@ class FakeServices:
     def verify(self, labels, *, runtime_sha256):
         return {
             label: {
-                "pid": 50000 + index,
-                "process_create_time": 1000.0 + index,
+                "kind": (
+                    "periodic"
+                    if label in cutover.PERIODIC_SERVICE_LABELS
+                    else "resident"
+                ),
+                "loaded": True,
+                "pid": (
+                    None
+                    if label in cutover.PERIODIC_SERVICE_LABELS
+                    else 50000 + index
+                ),
+                "process_create_time": (
+                    None
+                    if label in cutover.PERIODIC_SERVICE_LABELS
+                    else 1000.0 + index
+                ),
                 "runtime_sha256": runtime_sha256,
                 "health_ok": True,
             }
@@ -172,27 +186,6 @@ class FakeServices:
     def restore_state(self, state):
         self.restored = dict(state)
         self.state["services_generation"] = int(state["generation"])
-
-
-class FakeActivation:
-    def __init__(self, state: dict, evidence_root: Path):
-        self.state = state
-        self.evidence_root = evidence_root
-
-    def transition_bounded(
-        self, activation_contract_sha256, *, lease_fingerprint, lease_token
-    ):
-        assert activation_contract_sha256 == "5" * 64
-        assert lease_fingerprint == LEASE_FINGERPRINT
-        assert lease_token == LEASE_TOKEN
-        self.state["activation"] = "bounded_active"
-        receipt = self.evidence_root / "bounded-active.json"
-        _write(receipt, b'{"state":"bounded_active"}\n')
-        return {
-            "state": "bounded_active",
-            "receipt_sha256": _sha(receipt.read_bytes()),
-            "receipt_path": str(receipt),
-        }
 
 
 class FixtureObserver:
@@ -343,7 +336,6 @@ def candidate(tmp_path: Path) -> SimpleNamespace:
     }
     services = FakeServices(state, physical("/evidence"))
     runner = FakeRunner(state)
-    activation = FakeActivation(state, physical("/evidence"))
     authority = adapter.AdapterMutationAuthority.bind(
         plan=plan,
         gate_binding=plan["bindings"],
@@ -360,7 +352,6 @@ def candidate(tmp_path: Path) -> SimpleNamespace:
             snapshot_root=Path("/snapshots"),
             runner=runner,
             service_controller=services,
-            activation_controller=activation,
             authority=authority if authorized else None,
             io_hook=io_hook,
         )
@@ -744,9 +735,6 @@ def test_snapshot_install_and_rollback_restore_exact_fake_live_state(candidate):
         snapshot_root=Path("/snapshots"),
         runner=candidate.runner,
         service_controller=candidate.services,
-        activation_controller=FakeActivation(
-            candidate.state, candidate.physical("/evidence")
-        ),
         authority=authority,
     )
     snapshot_result = instance.execute_step(
@@ -818,9 +806,6 @@ def test_rollback_transaction_resumes_after_hard_crash(candidate):
             snapshot_root=Path("/snapshots"),
             runner=candidate.runner,
             service_controller=candidate.services,
-            activation_controller=FakeActivation(
-                candidate.state, candidate.physical("/evidence")
-            ),
             authority=authority,
             io_hook=io_hook,
         )
@@ -897,9 +882,6 @@ def test_recovery_authority_new_lease_is_rollback_only(candidate):
             snapshot_root=Path("/snapshots"),
             runner=candidate.runner,
             service_controller=candidate.services,
-            activation_controller=FakeActivation(
-                candidate.state, candidate.physical("/evidence")
-            ),
             authority=authority,
         )
 
@@ -1045,9 +1027,6 @@ def test_real_executor_recovery_contract_accepts_new_process_authority(candidate
             snapshot_root=Path("/snapshots"),
             runner=candidate.runner,
             service_controller=candidate.services,
-            activation_controller=FakeActivation(
-                candidate.state, candidate.physical("/evidence")
-            ),
             authority=authority,
         )
 
@@ -1262,7 +1241,6 @@ def test_tree_snapshot_restores_root_and_empty_directory_modes(candidate):
         snapshot_root=Path("/snapshots"),
         runner=candidate.runner,
         service_controller=candidate.services,
-        activation_controller=FakeActivation(candidate.state, candidate.physical("/evidence")),
         authority=authority,
     )
     snapshot = instance.execute_step(
@@ -1309,7 +1287,6 @@ def test_snapshot_file_mode_drift_is_rejected_before_restore(candidate):
         snapshot_root=Path("/snapshots"),
         runner=candidate.runner,
         service_controller=candidate.services,
-        activation_controller=FakeActivation(candidate.state, candidate.physical("/evidence")),
         authority=authority,
     )
     snapshot = instance.execute_step(
@@ -1410,9 +1387,6 @@ def test_runtime_manifest_is_bound_but_not_installed_into_live_tree(candidate):
         snapshot_root=Path("/snapshots"),
         runner=candidate.runner,
         service_controller=candidate.services,
-        activation_controller=FakeActivation(
-            candidate.state, candidate.physical("/evidence")
-        ),
         authority=authority,
     )
     before = cutover._sha256_json(candidate.observer())

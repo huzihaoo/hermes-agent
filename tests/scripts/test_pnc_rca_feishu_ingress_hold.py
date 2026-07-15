@@ -31,6 +31,38 @@ def _sha256_json_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _precutover_service_state(old_runtime: dict) -> dict:
+    jobs = {}
+    for label in cutover_guard.SERVICE_LABELS:
+        loaded = label == cutover_guard.GATEWAY_LABEL
+        jobs[label] = {
+            "launchd": {
+                "label": label,
+                "loaded": loaded,
+                "state": "running" if loaded else "absent",
+                "pid": old_runtime["process"]["pid"] if loaded else None,
+                "last_exit_status": None,
+            },
+            "plist": {
+                "path": str(
+                    cutover_guard.CANONICAL_LAUNCH_AGENTS_ROOT / f"{label}.plist"
+                ),
+                "state": "regular",
+                "sha256": hashlib.sha256(label.encode()).hexdigest(),
+                "size_bytes": len(label),
+                "mode": "0644",
+                "uid": os.geteuid(),
+                "nlink": 1,
+            },
+        }
+    return {
+        "schema_version": cutover_guard.LIVE_SERVICE_STATE_SCHEMA_VERSION,
+        "target_runtime_root": str(cutover_guard.CANONICAL_LIVE_ROOT),
+        "labels": list(cutover_guard.SERVICE_LABELS),
+        "jobs": jobs,
+    }
+
+
 def _git(repo: Path, *args: str) -> str:
     result = subprocess.run(
         ["git", "-C", str(repo), *args],
@@ -256,6 +288,7 @@ def _authorize(setup: SimpleNamespace, plan: dict) -> None:
     release_prepare_sha256 = "b" * 64
     release_approval_sha256 = "c" * 64
     old_runtime_sha256 = cutover_guard._sha256_json(old_runtime)
+    precutover_services = _precutover_service_state(old_runtime)
     writer_stop_body = {
         "schema_version": cutover_guard.WRITER_STOP_RECEIPT_SCHEMA_VERSION,
         "release_id": "release-20260713-a",
@@ -269,6 +302,10 @@ def _authorize(setup: SimpleNamespace, plan: dict) -> None:
         "old_gateway_process": old_runtime["process"],
         "old_gateway_runtime_identity": old_runtime,
         "old_gateway_runtime_identity_sha256": old_runtime_sha256,
+        "precutover_service_state": precutover_services,
+        "precutover_service_state_sha256": cutover_guard._sha256_json(
+            precutover_services
+        ),
         "writer_stop_observation": writer_stop_observation,
         "writer_stop_observation_sha256": cutover_guard._sha256_json(
             writer_stop_observation
@@ -280,31 +317,23 @@ def _authorize(setup: SimpleNamespace, plan: dict) -> None:
     }
     _write_json(setup.writer_stop, writer_stop_body)
     setup.writer_stop_observation = writer_stop_observation
-    _write_json(
-        setup.cutover,
-        {
-            "schema_version": hold.CUTOVER_BINDING_SCHEMA_VERSION,
-            "hold_id": plan["hold_id"],
+    lease = SimpleNamespace(
+        fingerprint=lease_fingerprint,
+        body={
             "release_id": "release-20260713-a",
-            "plan_sha256": plan_sha,
-            "canonical_gateway_root": str(setup.inputs.canonical_gateway_root),
-            "canonical_sidecar_path": str(setup.live_sidecar),
-            "host_commit": host["host_commit"],
-            "adapter_sha256": host["adapter_sha256"],
-            "chat_set_sha256": plan["chat_set_sha256"],
-            "live_sidecar_identity_sha256": hold._sha256_json(
-                plan["live_sidecar_identity"]
-            ),
-            "gateway_writer_state": "stopped",
-            "writer_stop_receipt_path": str(setup.writer_stop),
-            "writer_stop_receipt_sha256": _sha256_json_file(setup.writer_stop),
-            "cutover_lease_fingerprint": lease_fingerprint,
-            "release_prepare_manifest_sha256": release_prepare_sha256,
-            "release_approval_receipt_sha256": release_approval_sha256,
-            "old_gateway_runtime_identity_sha256": old_runtime_sha256,
-            "window_started_at": (NOW - timedelta(minutes=1)).isoformat(),
-            "window_expires_at": (NOW + timedelta(minutes=30)).isoformat(),
+            "expires_at": (NOW + timedelta(minutes=30)).isoformat(),
+            "release_prepare_manifest": {"sha256": release_prepare_sha256},
+            "approval_receipt": {"sha256": release_approval_sha256},
         },
+        assert_active=lambda: None,
+    )
+    hold.build_cutover_binding(
+        setup.inputs,
+        release_id="release-20260713-a",
+        writer_stop_receipt=setup.writer_stop,
+        lease=lease,
+        output_path=setup.cutover,
+        now=NOW,
     )
 
 

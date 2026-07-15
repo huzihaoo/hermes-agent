@@ -81,16 +81,6 @@ class ServiceController(Protocol):
     def restore_state(self, state: Mapping[str, Any]) -> None: ...
 
 
-class ActivationController(Protocol):
-    def transition_bounded(
-        self,
-        activation_contract_sha256: str,
-        *,
-        lease_fingerprint: str,
-        lease_token: str,
-    ) -> Mapping[str, Any]: ...
-
-
 class SubprocessArgvRunner:
     """A shell-free runner suitable for explicit future production injection."""
 
@@ -793,7 +783,6 @@ class ProductionCutoverAdapter:
         snapshot_root: Path,
         runner: CommandRunner | None = None,
         service_controller: ServiceController | None = None,
-        activation_controller: ActivationController | None = None,
         authority: AdapterMutationAuthority | None = None,
         io_hook: Callable[[str, Path], None] | None = None,
     ):
@@ -805,7 +794,6 @@ class ProductionCutoverAdapter:
         self._transaction_root = self._snapshot_root / "transactions"
         self._runner = runner
         self._services = service_controller
-        self._activation = activation_controller
         self._authority = authority
         self._io_hook = io_hook
 
@@ -2140,36 +2128,20 @@ class ProductionCutoverAdapter:
                 else plan["bindings"]["workspace_runtime_sha256"]
             )
             evidence = {"installed_sha256": binding, "post_install_verified": True}
-        elif step in {"start_gateway_aux", "start_residents"}:
+        elif step == "start_gateway_aux":
             if self._runner is None:
                 raise CutoverAdapterError("cutover_adapter_command_runner_required")
             for command in commands:
                 result = self._runner.run(command)
                 if tuple(command) != result.argv or result.returncode != 0:
                     raise CutoverAdapterError("cutover_adapter_launchctl_failed")
-            started = (
-                plan["gateway_aux_start_order"]
-                if step == "start_gateway_aux"
-                else plan["resident_start_order"]
-            )
-        elif step in {"verify_gateway_aux", "verify_services"}:
+            started = plan["gateway_aux_start_order"]
+        elif step == "verify_gateway_aux":
             if self._services is None:
                 raise CutoverAdapterError("cutover_adapter_service_controller_required")
-            labels = (
-                cutover.GATEWAY_AUX_LABELS
-                if step == "verify_gateway_aux"
-                else cutover.SERVICE_LABELS
-            )
             services = self._services.verify(
-                labels, runtime_sha256=plan["bindings"]["runtime_content_sha256"]
-            )
-        elif step == "transition_bounded_activation":
-            if self._activation is None:
-                raise CutoverAdapterError("cutover_adapter_activation_controller_required")
-            evidence = self._activation.transition_bounded(
-                plan["bindings"]["activation_contract_sha256"],
-                lease_fingerprint=lease_fingerprint,
-                lease_token=lease_token,
+                cutover.GATEWAY_AUX_LABELS,
+                runtime_sha256=plan["bindings"]["runtime_content_sha256"],
             )
         else:
             raise CutoverAdapterError("cutover_adapter_step_unknown")
@@ -2222,7 +2194,6 @@ def build_production_adapter(
     snapshot_root: Path | None = None,
     runner: CommandRunner | None = None,
     service_controller: ServiceController | None = None,
-    activation_controller: ActivationController | None = None,
     io_hook: Callable[[str, Path], None] | None = None,
 ) -> ProductionCutoverAdapter:
     """Build the live projection only when every real boundary is injected."""
@@ -2236,7 +2207,6 @@ def build_production_adapter(
         or not snapshot_root.expanduser().is_absolute()
         or runner is None
         or service_controller is None
-        or activation_controller is None
     ):
         raise CutoverAdapterError("cutover_adapter_production_dependencies_unavailable")
     for value in (
@@ -2257,7 +2227,6 @@ def build_production_adapter(
         snapshot_root=snapshot_root,
         runner=runner,
         service_controller=service_controller,
-        activation_controller=activation_controller,
         authority=authority,
         io_hook=io_hook,
     )

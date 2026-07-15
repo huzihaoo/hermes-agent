@@ -15,6 +15,7 @@ import fcntl
 import hashlib
 import json
 import os
+import pwd
 import re
 import secrets
 import socket
@@ -28,9 +29,9 @@ from pathlib import Path
 from typing import Any, Protocol
 
 
-PLAN_SCHEMA_VERSION = "pnc_rca_production_cutover_plan_v1"
-GATE_VALIDATION_SCHEMA_VERSION = "pnc_rca_production_cutover_gate_validation_v1"
-AUTHORIZATION_SCHEMA_VERSION = "pnc_rca_production_cutover_authorization_v1"
+PLAN_SCHEMA_VERSION = "pnc_rca_production_cutover_plan_v2"
+GATE_VALIDATION_SCHEMA_VERSION = "pnc_rca_production_cutover_gate_validation_v2"
+AUTHORIZATION_SCHEMA_VERSION = "pnc_rca_production_cutover_authorization_v2"
 AUTHORIZATION_IDENTITY_SCHEMA_VERSION = (
     "pnc_rca_production_cutover_authorization_identity_v1"
 )
@@ -40,7 +41,7 @@ STEP_RESULT_SCHEMA_VERSION = "pnc_rca_production_cutover_step_result_v1"
 SNAPSHOT_SCHEMA_VERSION = "pnc_rca_production_cutover_snapshot_v1"
 FAILURE_SCHEMA_VERSION = "pnc_rca_production_cutover_failure_v1"
 ROLLBACK_SCHEMA_VERSION = "pnc_rca_production_cutover_rollback_v1"
-COMPLETE_SCHEMA_VERSION = "pnc_rca_production_cutover_complete_v1"
+COMPLETE_SCHEMA_VERSION = "pnc_rca_production_cutover_complete_v2"
 COMMAND_PREFLIGHT_SCHEMA_VERSION = "pnc_rca_production_cutover_command_preflight_v1"
 PAYLOAD_DESCRIPTOR_SCHEMA_VERSION = "pnc_rca_production_cutover_payload_descriptor_v1"
 ROLLBACK_INTENT_SCHEMA_VERSION = "pnc_rca_production_cutover_rollback_intent_v1"
@@ -52,7 +53,7 @@ RECOVERY_DONE_SCHEMA_VERSION = "pnc_rca_production_recovery_done_v1"
 
 RELEASE_PREPARE_SCHEMA_VERSION = "pnc_rca_release_prepare_manifest_v1"
 RELEASE_APPROVAL_SCHEMA_VERSION = "pnc_rca_release_approval_v1"
-WRITER_STOP_SCHEMA_VERSION = "pnc_rca_gateway_writer_stop_receipt_v1"
+WRITER_STOP_SCHEMA_VERSION = "pnc_rca_gateway_writer_stop_receipt_v2"
 FEISHU_HOLD_SCHEMA_VERSION = "pnc_rca_feishu_ingress_hold_apply_receipt_v1"
 FEISHU_HOLD_PLAN_SCHEMA_VERSION = "pnc_rca_feishu_ingress_hold_plan_v1"
 FEISHU_HOLD_APPROVAL_SCHEMA_VERSION = "pnc_rca_feishu_ingress_hold_approval_v1"
@@ -92,6 +93,7 @@ SERVICE_LABELS = (
 )
 GATEWAY_AUX_LABELS = SERVICE_LABELS[:3]
 RESIDENT_LABELS = SERVICE_LABELS[3:]
+PERIODIC_SERVICE_LABELS = ("local.pnc.vm-task-sync",)
 WRITER_LABELS = (SERVICE_LABELS[0], *RESIDENT_LABELS)
 CANDIDATE_PLISTS = (
     "ai.hermes.gateway.candidate.plist",
@@ -113,9 +115,6 @@ STEP_NAMES = (
     "install_plists",
     "start_gateway_aux",
     "verify_gateway_aux",
-    "transition_bounded_activation",
-    "start_residents",
-    "verify_services",
 )
 MUTATING_STEPS = frozenset({
     "stop_writers",
@@ -125,8 +124,6 @@ MUTATING_STEPS = frozenset({
     "install_environment",
     "install_plists",
     "start_gateway_aux",
-    "transition_bounded_activation",
-    "start_residents",
 })
 CUTOVER_ACTION_SET = (
     "acquire_global_cutover_lease",
@@ -140,9 +137,7 @@ CUTOVER_ACTION_SET = (
     "install_complete_candidate_plist_set",
     "bootstrap_or_kickstart_gateway_and_aux_services",
     "verify_gateway_and_aux_services",
-    "transition_exact_activation_to_bounded_active",
-    "bootstrap_residents_in_gate_authorized_order",
-    "verify_each_service_pid_runtime_and_health",
+    "leave_rca_residents_stopped_for_explicit_activation_and_canaries",
     "rollback_exact_snapshot_on_failure",
 )
 
@@ -159,6 +154,7 @@ ARTIFACT_FIELDS = (
     "workspace_runtime_manifest",
     "cutover_authorization_receipt",
 )
+AUTHORIZATION_ARTIFACT_FIELDS = ARTIFACT_FIELDS[:-1]
 
 
 class ProductionCutoverError(ValueError):
@@ -188,6 +184,21 @@ class CutoverInputs:
     cutover_authorization_receipt: Path
     cutover_lease_fingerprint: str
     journal_root: Path
+
+
+@dataclass(frozen=True)
+class CutoverAuthorizationInputs:
+    release_prepare_manifest: Path
+    approval_receipt: Path
+    writer_stop_receipt: Path
+    feishu_hold_plan: Path
+    feishu_hold_approval_receipt: Path
+    feishu_hold_cutover_binding: Path
+    feishu_hold_receipt: Path
+    env_stage_receipt: Path
+    runtime_stage_manifest: Path
+    workspace_runtime_manifest: Path
+    cutover_lease_fingerprint: str
 
 
 @dataclass(frozen=True)
@@ -230,6 +241,21 @@ class CutoverResult:
     phase: str
     body: Mapping[str, Any]
     resumed: bool = False
+
+
+@dataclass(frozen=True)
+class PreparedCutoverExecution:
+    plan: Mapping[str, Any]
+    authorization: Mapping[str, Any]
+    payload_descriptors: Mapping[str, Any]
+    precutover_service_state: Mapping[str, Any]
+    machine_identity_sha256: str
+
+
+@dataclass(frozen=True)
+class PreparedCutoverAuthorizationProjection:
+    plan: Mapping[str, Any]
+    payload_descriptors: Mapping[str, Any]
 
 
 class CutoverLease(Protocol):
@@ -471,6 +497,17 @@ def _load_artifacts(inputs: CutoverInputs) -> ArtifactBundle:
     })
 
 
+def _load_authorization_artifacts(
+    inputs: CutoverAuthorizationInputs,
+) -> ArtifactBundle:
+    return ArtifactBundle({
+        field: _read_owned_json(
+            getattr(inputs, field), artifact=f"production_cutover_{field}"
+        )
+        for field in AUTHORIZATION_ARTIFACT_FIELDS
+    })
+
+
 def _parse_time(value: Any, *, code: str) -> datetime:
     if not isinstance(value, str) or not value:
         raise ProductionCutoverError(code)
@@ -709,6 +746,23 @@ def _validate_local_artifact_chain(
         or writer_observation.get("process_census", {}).get("matching_processes") != []
     ):
         raise ProductionCutoverError("production_cutover_writer_not_stopped")
+    try:
+        from scripts import pnc_rca_cutover_guard as cutover_guard
+
+        precutover_services = cutover_guard._normalize_precutover_service_state(
+            writer.get("precutover_service_state"),
+            old_runtime=writer.get("old_gateway_runtime_identity"),
+        )
+    except Exception as exc:
+        raise ProductionCutoverError(
+            "production_cutover_precutover_service_state_invalid"
+        ) from exc
+    if writer.get("precutover_service_state_sha256") != _sha256_json(
+        precutover_services
+    ):
+        raise ProductionCutoverError(
+            "production_cutover_precutover_service_state_invalid"
+        )
     if (
         hold_plan.get("schema_version") != FEISHU_HOLD_PLAN_SCHEMA_VERSION
         or hold_plan.get("production_effects_executed") is not False
@@ -1065,6 +1119,9 @@ def _build_plan_from_bundle(
             "programmatic_apply_requires_active_lease": True,
             "shell_strings_forbidden": True,
             "global_lock_held_for_all_steps": True,
+            "rca_residents_started": False,
+            "activation_transition_performed": False,
+            "next_phase": "preauthorization_and_bounded_canaries",
         },
     }
 
@@ -1732,6 +1789,230 @@ def _validate_candidate_payloads(bundle: ArtifactBundle) -> Mapping[str, Any]:
     }
 
 
+def prepare_cutover_execution(
+    inputs: CutoverInputs,
+    *,
+    gate_validator: GateValidator = _default_gate_validator,
+    machine_identity_provider: MachineIdentityProvider = _default_machine_identity_sha256,
+    now: datetime | None = None,
+) -> PreparedCutoverExecution:
+    """Freeze one read-only plan, authorization and candidate payload view."""
+    bundle = _load_artifacts(inputs)
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    machine_identity_sha256 = machine_identity_provider()
+    authorization = _validate_local_artifact_chain(
+        bundle,
+        lease_fingerprint=inputs.cutover_lease_fingerprint,
+        machine_identity_sha256=machine_identity_sha256,
+        now=current,
+    )
+    plan = _build_plan_from_bundle(
+        inputs,
+        bundle,
+        gate_validator=gate_validator,
+        machine_identity_sha256=machine_identity_sha256,
+        now=current,
+    )
+    payload_descriptors = _validate_candidate_payloads(bundle)
+    precutover_service_state = json.loads(
+        json.dumps(bundle.bodies["writer_stop_receipt"]["precutover_service_state"])
+    )
+    return PreparedCutoverExecution(
+        plan=plan,
+        authorization=authorization,
+        payload_descriptors=payload_descriptors,
+        precutover_service_state=precutover_service_state,
+        machine_identity_sha256=machine_identity_sha256,
+    )
+
+
+def prepare_cutover_authorization_projection(
+    inputs: CutoverAuthorizationInputs,
+) -> PreparedCutoverAuthorizationProjection:
+    """Build the target descriptors needed to observe the pre-cutover live CAS."""
+    bundle = _load_authorization_artifacts(inputs)
+    env_stage = bundle.bodies["env_stage_receipt"]
+    runtime = bundle.bodies["runtime_stage_manifest"]
+    workspace = bundle.bodies["workspace_runtime_manifest"]
+    hold = bundle.bodies["feishu_hold_receipt"]
+    release_id = str(bundle.bodies["release_prepare_manifest"].get("release_id") or "")
+    if RELEASE_ID_RE.fullmatch(release_id) is None:
+        raise ProductionCutoverError("production_cutover_release_id_invalid")
+    env_bindings = env_stage.get("bindings")
+    env_policy = env_stage.get("policy")
+    if not isinstance(env_bindings, Mapping) or not isinstance(env_policy, Mapping):
+        raise ProductionCutoverError("production_cutover_env_stage_invalid")
+    candidate_env_sha256 = _require_sha256(
+        env_bindings.get("candidate_env", {}).get("sha256"),
+        code="production_cutover_candidate_env_sha_invalid",
+    )
+    runtime_content_sha256 = _require_sha256(
+        runtime.get("content_sha256"),
+        code="production_cutover_runtime_content_sha_invalid",
+    )
+    workspace_runtime_sha256 = _require_sha256(
+        workspace.get("closure_sha256"),
+        code="production_cutover_workspace_runtime_sha_invalid",
+    )
+    feishu_sidecar_sha256 = _require_sha256(
+        hold.get("future_install", {}).get("staged_sha256"),
+        code="production_cutover_feishu_sidecar_sha_invalid",
+    )
+    candidate_plists = runtime.get("future_canonical_projection", {}).get(
+        "candidate_plist_sha256"
+    )
+    if not isinstance(candidate_plists, Mapping) or set(candidate_plists) != set(
+        CANDIDATE_PLISTS
+    ):
+        raise ProductionCutoverError("production_cutover_candidate_plists_invalid")
+    for digest in candidate_plists.values():
+        _require_sha256(
+            digest,
+            code="production_cutover_candidate_plists_invalid",
+        )
+    capacity = env_policy.get("capacity_admission")
+    kafka = env_policy.get("kafka")
+    if not isinstance(capacity, Mapping) or not isinstance(kafka, Mapping):
+        raise ProductionCutoverError("production_cutover_env_stage_invalid")
+    activation_contract_sha256 = _sha256_json({
+        "release_id": release_id,
+        "bootstrap_epoch_id": capacity.get("bootstrap_epoch_id"),
+        "release_bom_sha256": bundle.bodies["release_prepare_manifest"].get(
+            "release_bom_sha256"
+        ),
+        "activation_required": kafka.get("activation_required"),
+    })
+    plan = {
+        "schema_version": PLAN_SCHEMA_VERSION,
+        "release_id": release_id,
+        "bindings": {
+            "runtime_content_sha256": runtime_content_sha256,
+            "workspace_runtime_sha256": workspace_runtime_sha256,
+            "candidate_env_sha256": candidate_env_sha256,
+            "feishu_sidecar_sha256": feishu_sidecar_sha256,
+            "candidate_plist_set_sha256": _sha256_json(
+                dict(sorted(candidate_plists.items()))
+            ),
+            "activation_contract_sha256": activation_contract_sha256,
+        },
+        "payload_bindings": _plan_payload_bindings(bundle),
+    }
+    return PreparedCutoverAuthorizationProjection(
+        plan=plan,
+        payload_descriptors=_validate_candidate_payloads(bundle),
+    )
+
+
+def build_cutover_authorization(
+    inputs: CutoverAuthorizationInputs,
+    *,
+    expected_live_identity_sha256: str,
+    nonce: str,
+    output_path: Path,
+    validity_seconds: int = 30 * 60,
+    machine_identity_provider: MachineIdentityProvider = _default_machine_identity_sha256,
+    now: datetime | None = None,
+) -> Mapping[str, Any]:
+    """Validate then publish one short-lived exact cutover authorization."""
+    expected_live = _require_sha256(
+        expected_live_identity_sha256,
+        code="production_cutover_expected_live_identity_invalid",
+    )
+    if NONCE_RE.fullmatch(nonce) is None:
+        raise ProductionCutoverError("production_cutover_authorization_nonce_invalid")
+    if (
+        isinstance(validity_seconds, bool)
+        or not isinstance(validity_seconds, int)
+        or validity_seconds < 1
+        or validity_seconds > MAX_AUTHORIZATION_VALIDITY_SECONDS
+    ):
+        raise ProductionCutoverError("production_cutover_authorization_time_invalid")
+    destination = output_path.expanduser()
+    if not destination.is_absolute() or ".." in destination.parts:
+        raise ProductionCutoverError("production_cutover_authorization_path_invalid")
+    destination = destination.absolute()
+    try:
+        parent = destination.parent.lstat()
+    except OSError as exc:
+        raise ProductionCutoverError(
+            "production_cutover_authorization_parent_invalid"
+        ) from exc
+    if (
+        stat.S_ISLNK(parent.st_mode)
+        or not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != os.geteuid()
+        or stat.S_IMODE(parent.st_mode) & 0o077
+    ):
+        raise ProductionCutoverError("production_cutover_authorization_parent_invalid")
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    machine_identity_sha256 = machine_identity_provider()
+    partial = _load_authorization_artifacts(inputs)
+    prepare = partial.bodies["release_prepare_manifest"]
+    release_id = str(prepare.get("release_id") or "")
+    if RELEASE_ID_RE.fullmatch(release_id) is None:
+        raise ProductionCutoverError("production_cutover_release_id_invalid")
+    bindings = {
+        **_authorization_bindings(
+            partial,
+            lease_fingerprint=inputs.cutover_lease_fingerprint,
+        ),
+        "expected_live_identity_sha256": expected_live,
+    }
+    body = {
+        "schema_version": AUTHORIZATION_SCHEMA_VERSION,
+        "release_id": release_id,
+        "decision": AUTHORIZATION_DECISION,
+        "created_at": current.isoformat(),
+        "expires_at": (
+            current + timedelta(seconds=validity_seconds)
+        ).isoformat(),
+        "nonce": nonce,
+        "action_set": list(CUTOVER_ACTION_SET),
+        "action_set_sha256": _sha256_json(list(CUTOVER_ACTION_SET)),
+        "bindings": bindings,
+        "identity": {
+            "schema_version": AUTHORIZATION_IDENTITY_SCHEMA_VERSION,
+            "method": "kernel_owner_and_machine_binding",
+            "uid": os.geteuid(),
+            "username": pwd.getpwuid(os.geteuid()).pw_name,
+            "machine_identity_sha256": machine_identity_sha256,
+        },
+    }
+    temporary = destination.parent / (
+        f".{destination.name}.{secrets.token_hex(8)}.validation"
+    )
+    try:
+        _publish_no_clobber(temporary, body)
+        full_inputs = CutoverInputs(
+            **{
+                field: getattr(inputs, field)
+                for field in AUTHORIZATION_ARTIFACT_FIELDS
+            },
+            cutover_authorization_receipt=temporary,
+            cutover_lease_fingerprint=inputs.cutover_lease_fingerprint,
+            journal_root=destination.parent,
+        )
+        bundle = _load_artifacts(full_inputs)
+        _validate_local_artifact_chain(
+            bundle,
+            lease_fingerprint=inputs.cutover_lease_fingerprint,
+            machine_identity_sha256=machine_identity_sha256,
+            now=current,
+        )
+        _publish_no_clobber(destination, body)
+    finally:
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+        _fsync_directory(destination.parent)
+    published = _read_owned_json(
+        destination,
+        artifact="production_cutover_authorization",
+    )
+    if published.body != body:
+        raise ProductionCutoverError("production_cutover_authorization_conflict")
+    return body
+
+
 def _payloads_for_step(
     step: str,
     payloads: Mapping[str, Any],
@@ -1835,24 +2116,6 @@ def _expected_commands_for_step(step: str, plan: Mapping[str, Any]) -> list[list
                 for label in plan["gateway_aux_start_order"][1:]
             ],
         ]
-    if step == "start_residents":
-        return [
-            [
-                "/bin/launchctl",
-                "bootstrap",
-                domain,
-                str(CANONICAL_LAUNCH_AGENTS_ROOT / f"{label}.plist"),
-            ]
-            for label in plan["resident_start_order"]
-        ]
-    if step == "transition_bounded_activation":
-        return [
-            [
-                adapter,
-                "transition-bounded-activation",
-                plan["bindings"]["activation_contract_sha256"],
-            ]
-        ]
     if step == "rollback":
         return [
             [
@@ -1862,13 +2125,13 @@ def _expected_commands_for_step(step: str, plan: Mapping[str, Any]) -> list[list
                 _sha256_json(plan),
             ]
         ]
-    if step in {"snapshot_live", "verify_gateway_aux", "verify_services"}:
+    if step in {"snapshot_live", "verify_gateway_aux"}:
         return []
     raise ProductionCutoverError("production_cutover_command_step_unknown")
 
 
 def _expected_start_commands(step: str, plan: Mapping[str, Any]) -> list[list[str]]:
-    if step not in {"start_gateway_aux", "start_residents"}:
+    if step != "start_gateway_aux":
         return []
     return _expected_commands_for_step(step, plan)
 
@@ -2023,8 +2286,6 @@ def _validate_step_result(
     expected_services: tuple[str, ...] = ()
     if step == "verify_gateway_aux":
         expected_services = GATEWAY_AUX_LABELS
-    elif step == "verify_services":
-        expected_services = SERVICE_LABELS
     if expected_services:
         if after != expected_before or not isinstance(services, Mapping):
             raise ProductionCutoverError(
@@ -2034,20 +2295,51 @@ def _validate_step_result(
             raise ProductionCutoverError("production_cutover_service_set_invalid")
         for label in expected_services:
             service = services[label]
+            kind = (
+                "periodic" if label in PERIODIC_SERVICE_LABELS else "resident"
+            )
+            pid = service.get("pid") if isinstance(service, Mapping) else None
+            create_time = (
+                service.get("process_create_time")
+                if isinstance(service, Mapping)
+                else None
+            )
             if (
                 not isinstance(service, Mapping)
                 or set(service)
                 != {
+                    "kind",
+                    "loaded",
                     "pid",
                     "process_create_time",
                     "runtime_sha256",
                     "health_ok",
                 }
-                or isinstance(service.get("pid"), bool)
-                or not isinstance(service.get("pid"), int)
-                or service["pid"] <= 0
-                or not isinstance(service.get("process_create_time"), (int, float))
-                or service["process_create_time"] <= 0
+                or service.get("kind") != kind
+                or service.get("loaded") is not True
+                or (
+                    kind == "resident"
+                    and (
+                        isinstance(pid, bool)
+                        or not isinstance(pid, int)
+                        or pid <= 0
+                        or not isinstance(create_time, (int, float))
+                        or create_time <= 0
+                    )
+                )
+                or (
+                    kind == "periodic"
+                    and not (
+                        (pid is None and create_time is None)
+                        or (
+                            not isinstance(pid, bool)
+                            and isinstance(pid, int)
+                            and pid > 0
+                            and isinstance(create_time, (int, float))
+                            and create_time > 0
+                        )
+                    )
+                )
                 or service.get("runtime_sha256")
                 != plan["bindings"]["runtime_content_sha256"]
                 or service.get("health_ok") is not True
@@ -2060,8 +2352,6 @@ def _validate_step_result(
     expected_started: list[str] = []
     if step == "start_gateway_aux":
         expected_started = list(plan["gateway_aux_start_order"])
-    elif step == "start_residents":
-        expected_started = list(plan["resident_start_order"])
     if started_labels != expected_started:
         raise ProductionCutoverError("production_cutover_service_start_order_invalid")
     if expected_started and commands != _expected_start_commands(step, plan):
@@ -2082,17 +2372,6 @@ def _validate_step_result(
         if not Path(str(evidence.get("receipt_path") or "")).is_absolute():
             raise ProductionCutoverError(
                 "production_cutover_writer_stop_evidence_invalid"
-            )
-    elif step == "transition_bounded_activation":
-        if evidence.get("state") != "bounded_active":
-            raise ProductionCutoverError("production_cutover_activation_not_bounded")
-        _require_sha256(
-            evidence.get("receipt_sha256"),
-            code="production_cutover_activation_evidence_invalid",
-        )
-        if not Path(str(evidence.get("receipt_path") or "")).is_absolute():
-            raise ProductionCutoverError(
-                "production_cutover_activation_evidence_invalid"
             )
     elif step in {
         "install_feishu_sidecar",
@@ -2835,7 +3114,10 @@ def apply_cutover(
                     ],
                     "final_live_identity_sha256": expected_identity,
                     "old_runtime_retained": True,
-                    "service_count": len(SERVICE_LABELS),
+                    "gateway_aux_service_count": len(GATEWAY_AUX_LABELS),
+                    "rca_residents_started": False,
+                    "activation_transition_performed": False,
+                    "next_phase": "preauthorization_and_bounded_canaries",
                     "candidate_env_sha256": plan["bindings"]["candidate_env_sha256"],
                     "active_release_binding_path": plan["payload_bindings"][
                         "active_release_binding"

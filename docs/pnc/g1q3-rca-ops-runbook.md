@@ -99,7 +99,9 @@ Feishu Lark client 和话题每次读写均为 12 秒 deadline。读超时进入
 
 安装候选 plist、修改 live `.env`、启动或重启 gateway/Kafka/outbox/delivery/VM worker 都属于生产生效动作，只能在 release gate 全绿并获得明确发布批准后，按 `pnc-business-prod-effect-chain.md` 执行。代码合入或本地测试不等于生效。
 
-`scripts/pnc_rca_production_cutover.py` 的 CLI 只提供 read-only `plan/validate`；不存在 CLI apply、默认 system adapter 或 shell runner。任何程序化 apply 都必须显式注入全局 lease、release-gate validator 和另行审核的 system adapter，并使用 owner-only no-clobber journal、live CAS、逐步授权、物理 payload SHA、rollback intent/done。该 adapter 未单独批准前，不能把 fake-only tests 解读为生产切换授权。
+`scripts/pnc_rca_production_cutover.py` 仍只是底层 transaction engine，它的 CLI 只提供 read-only `plan/validate`；`scripts/pnc_rca_cutover_adapter.py` 也不暴露独立 mutation 命令。唯一受控 apply 入口是 `scripts/pnc_rca_cutover_execute.py apply`：它只接受 owner-only exact-shape session manifest 和 exact authorization decision，在同一全局 lease 中依次执行 VM/worker promotion、writer stop、greenfield store materialization、Feishu ingress hold、短时 cutover authorization 和 rollback-armed Host cutover。engine apply 必须由该 executor 显式注入 release-gate validator 与 concrete system adapter，并继续使用 owner-only no-clobber journal、live CAS、逐步授权、物理 payload SHA、rollback intent/done；不得直接 import engine/adapter 绕过 session 控制面。
+
+VM business repo 与 VM worker repo 必须通过 `scripts/pnc_rca_vm_promotion.py` 和绑定 SHA 的 remote helper 在同一远端锁内 promotion。helper 先停止 scheduler、重新核对 exact prestate 和 active child，再为两仓 dirty state、tracked delta 与 runtime extractor 建 snapshot；任一仓 promotion、remote receipt 或 Host receipt 发布失败都必须恢复两仓和原 service state。Host cutover 完成前的后续失败由 session 自动回滚 VM/worker；Host cutover 已完成后禁止只回滚 VM 一侧形成跨组件裂脑。promotion plan、独立短时 approval、remote receipt 与 rollback receipt 都必须绑定同一 release BOM。
 
 Control store v10 与 delivery store v6 是当前 forward-only schema。上线必须按 configured DB 的 live 事实选择一条且仅一条路线：已有 exact v8/v5 时，先停写并做一致性备份/恢复，且由同 commit/BOM、`100755`、单链接的 predecessor validator 以真实 subprocess 只读验证；validator 缺失即 NO-GO。configured DB 真实缺失时走 greenfield：migration v3 只生成 seed 并声明 materialization blocker，显式 materializer 再以 maintenance marker、prepared/installed/receipted journal 和 genesis receipt 原子建立 v10/v6；不存在一个可供旧 binary 恢复的历史 live DB。`already_current` 与 DB 内六项 genesis/origin meta 只表示内部连续性，不能自证可信来源或作为 rollback evidence；后续发布必须继续消费并完整重验原始 materialization receipt/intent/journal，缺失即 NO-GO。
 
@@ -664,7 +666,7 @@ VM 统一凭据入口是 `/home/mini/.hermes/service.env`（owner `mini`、`0600
 
 2026-07-14 12:38 +08:00 的 authenticated live census（G1Q3 `t03o4q` / `issue`）完整稳定读取 5,206/5,206 条非空 PDCL 记录，得到 1,239 个可解析 work item、1,141 个唯一 remote reference（81 clip、1,158 event candidates）；这已替代旧的“无可用 workload source”结论。它仍不是生产 manifest：live 64 个 `field_e776bb` leaf 中不存在名为 `DNP` 的 option，且 VM 当前只识别显式 `DNP`，所以任何 HNOA/TSI/TSR/HMI/TJA 等组合都必须由 PDCL/data owner 在 taxonomy-bound mapping receipt 中明确批准，不能按父类或样本数推断。
 
-真实任务必须通过 long-task wrapper，work/output 仍落 `/mnt/tmp/<task_id>/`。唯一例外是 exact Host `remote_reader_health.json`：`/mnt/tmp` 为 CIFS、mode 会被合成为 `0755`，无法满足 collector 的 owner-only 检查；它必须落 VM 本地 `0700` 私有目录并保持 regular、same-euid、`0600`、no symlink，再以绝对路径传入。collector 会以 `O_NOFOLLOW` 单次快照逐字节绑定它、dependency doctor、candidate commit/tree、vendored schema SHA `1979a850be44ca190f7d468b2d2e3f1cc939fe755eb770ab9679403701c415fa`，任一不一致在开始前 fail closed：
+真实任务必须通过 long-task wrapper，work/output 仍落 `/mnt/tmp/<task_id>/`。唯一例外是 exact Host `remote_reader_health.json`：`/mnt/tmp` 为 CIFS、mode 会被合成为 `0755`，无法满足 collector 的 owner-only 检查；它必须落 VM 本地 `0700` 私有目录并保持 regular、same-euid、`0600`、no symlink，再以绝对路径传入。collector 会以 `O_NOFOLLOW` 单次快照逐字节绑定它、dependency doctor、candidate commit/tree、vendored schema SHA `424a5c08458fcb15ef517297507b27a55115cfafa4c64ef740bb6e8e39460686`，任一不一致在开始前 fail closed：
 
 ```bash
 SOAK_TASK_ID='rca-remote-reader-soak-<审批号>'
