@@ -8550,6 +8550,7 @@ def _write_candidate_plists(tmp_path, *, kafka_environment=None):
         runtime_file.write_text(f"# {relative}\n", encoding="utf-8")
     scripts.mkdir(exist_ok=True)
     default_environment = {
+        "HOME": str(Path.home()),
         "HERMES_HOME": str(tmp_path / ".hermes"),
         "PATH": "/usr/bin:/bin",
         "PYTHONDONTWRITEBYTECODE": "1",
@@ -11204,6 +11205,26 @@ def test_candidate_runtime_requires_python_no_user_site(tmp_path, filename):
         )
 
     assert error.value.code == "runtime_candidate_python_no_user_site_required"
+
+
+@pytest.mark.parametrize(
+    "filename",
+    sorted(release_gate_module.CANDIDATE_SERVICES),
+)
+def test_candidate_runtime_requires_explicit_home(tmp_path, filename):
+    _write_candidate_plists(tmp_path)
+    plist_path = tmp_path / filename
+    plist = release_gate_module.plistlib.loads(plist_path.read_bytes())
+    plist["EnvironmentVariables"].pop("HOME")
+    plist_path.write_bytes(release_gate_module.plistlib.dumps(plist))
+
+    with pytest.raises(EvidenceError) as error:
+        check_candidate_runtime_dependencies(
+            tmp_path,
+            runner=lambda *args, **kwargs: pytest.fail("probe must not run"),
+        )
+
+    assert error.value.code == "runtime_candidate_home_invalid"
 
 
 @pytest.mark.parametrize(

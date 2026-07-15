@@ -68,6 +68,7 @@ def _plist(filename: str) -> bytes:
     canonical = stage.CANONICAL_LIVE_ROOT
     arguments = stage._expected_plist_arguments(filename, canonical)
     environment = {
+        "HOME": "/Users/songying",
         "HERMES_HOME": "/Users/songying/.hermes",
         "PYTHONNOUSERSITE": "1",
         "VIRTUAL_ENV": str(canonical / ".venv"),

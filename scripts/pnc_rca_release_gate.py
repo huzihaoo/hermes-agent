@@ -15223,6 +15223,8 @@ def check_candidate_runtime_dependencies(
             raise EvidenceError("runtime_candidate_environment_invalid", filename)
         if forbidden_python_env & declared_env.keys():
             raise EvidenceError("runtime_candidate_python_path_injection", filename)
+        if declared_env.get("HOME") != str(Path.home()):
+            raise EvidenceError("runtime_candidate_home_invalid", filename)
         if declared_env.get("PYTHONNOUSERSITE") != "1":
             raise EvidenceError(
                 "runtime_candidate_python_no_user_site_required",
@@ -15825,8 +15827,10 @@ def _future_runtime_project_environment(
     ):
         raise EvidenceError("future_runtime_plist_environment_invalid", field)
     expected_hermes_home = str(CANONICAL_FUTURE_RUNTIME_ROOT.parent.parent)
+    expected_home = str(CANONICAL_FUTURE_RUNTIME_ROOT.parents[2])
     if (
-        environment.get("HERMES_HOME") != expected_hermes_home
+        environment.get("HOME") != expected_home
+        or environment.get("HERMES_HOME") != expected_hermes_home
         or environment.get("VIRTUAL_ENV") != str(physical_root / ".venv")
         or environment.get("PYTHONDONTWRITEBYTECODE") != "1"
         or environment.get("PYTHONNOUSERSITE") != "1"

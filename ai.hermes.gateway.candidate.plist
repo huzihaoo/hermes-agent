@@ -4,6 +4,8 @@
 <dict>
     <key>EnvironmentVariables</key>
     <dict>
+        <key>HOME</key>
+        <string>/Users/songying</string>
         <key>G1Q3_GOVERNANCE_DOWNLOAD_ENABLED</key>
         <string>1</string>
         <key>HERMES_DISABLE_LAZY_INSTALLS</key>

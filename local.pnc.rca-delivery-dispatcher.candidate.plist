@@ -13,6 +13,8 @@
   <string>/Users/songying/.hermes/runtime/hermes-live</string>
   <key>EnvironmentVariables</key>
   <dict>
+    <key>HOME</key>
+    <string>/Users/songying</string>
     <key>HERMES_HOME</key>
     <string>/Users/songying/.hermes</string>
     <key>PATH</key>
