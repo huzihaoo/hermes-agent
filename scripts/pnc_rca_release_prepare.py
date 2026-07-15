@@ -1582,6 +1582,16 @@ def prepare_release(
             raise ReleasePrepareError("release_prepare_env_changed")
         public_config = release_gate._public_config(consumer, dispatcher, cutover)
         runtime_config_sha256 = release_gate._sha256_json(public_config)
+        runtime_config_environment = {
+            key: value
+            for key, value in release_gate._load_env_source(
+                inputs.env_file,
+                environment={},
+            ).items()
+            if key.startswith("HERMES_RCA_")
+            or key.startswith("HERMES_G1Q3_")
+            or key == "G1Q3_GOVERNANCE_DOWNLOAD_ENABLED"
+        }
         settings = release_gate.ReleaseGateSettings(
             mode="preauthorization",
             evidence_dir=run_root,
@@ -1629,6 +1639,7 @@ def prepare_release(
                 candidate_plists=inputs.candidate_plists,
                 canonical_live_root=inputs.future_live_root,
                 runtime_verifier=runtime_verifier,
+                runtime_config_environment=runtime_config_environment,
             ))
         except release_gate.EvidenceError as exc:
             raise ReleasePrepareError(exc.code, exc.detail) from exc
@@ -1711,6 +1722,7 @@ def prepare_release(
                 candidate_plists=inputs.candidate_plists,
                 canonical_live_root=inputs.future_live_root,
                 runtime_verifier=runtime_verifier,
+                runtime_config_environment=runtime_config_environment,
             ))
         except release_gate.EvidenceError as exc:
             raise ReleasePrepareError(exc.code, exc.detail) from exc

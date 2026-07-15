@@ -10969,6 +10969,74 @@ def test_candidate_runtime_probe_uses_plist_interpreter_and_clean_environment(
     assert "aiohttp" not in json.dumps(result)
 
 
+def test_candidate_runtime_config_override_is_check_only_and_redacted(tmp_path):
+    interpreter, _working, expected_environment = _write_candidate_plists(tmp_path)
+    secret = "candidate-only-password"
+    config_environment = {
+        "HERMES_RCA_KAFKA_USER": "rca",
+        "HERMES_RCA_KAFKA_PASSWORD": secret,
+    }
+    captured = []
+
+    def runner(command, **kwargs):
+        captured.append((command, kwargs))
+        if command[1:4] == ["-I", "-B", "-c"]:
+            payload = _candidate_runtime_probe_payload(interpreter)
+        else:
+            payload = {"ok": True, "config": {}}
+            if Path(command[1]).name == "pnc_rca_delivery_collector.py":
+                payload["dependencies"] = {
+                    "remote_css_parser": dict(
+                        release_gate_module.EXPECTED_REMOTE_CSS_RUNTIME_DEPENDENCY
+                    )
+                }
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps(payload),
+            stderr="",
+        )
+
+    result = check_candidate_runtime_dependencies(
+        tmp_path,
+        runner=runner,
+        config_environment=config_environment,
+    )
+
+    assert captured[0][1]["env"] == expected_environment
+    for _command, kwargs in captured[1:]:
+        assert kwargs["env"] == {**expected_environment, **config_environment}
+    assert secret not in json.dumps(result)
+    assert all(
+        process["environment"] == expected_environment
+        for process in result["service_processes"].values()
+    )
+
+
+@pytest.mark.parametrize(
+    "config_environment",
+    [
+        {"HERMES_HOME": "/tmp/other-home"},
+        {"PATH": "/tmp/bin"},
+        {"HERMES_RCA_KAFKA_USER": "rca\x00forged"},
+    ],
+)
+def test_candidate_runtime_config_override_rejects_unsafe_keys_and_values(
+    tmp_path,
+    config_environment,
+):
+    _write_candidate_plists(tmp_path)
+
+    with pytest.raises(EvidenceError) as error:
+        check_candidate_runtime_dependencies(
+            tmp_path,
+            runner=lambda *args, **kwargs: pytest.fail("probe must not run"),
+            config_environment=config_environment,
+        )
+
+    assert error.value.code == "runtime_candidate_config_environment_invalid"
+
+
 def _resident_loaded_runtime_fixture(tmp_path: Path, service_label: str):
     interpreter, _working, _environment = _write_candidate_plists(tmp_path)
     full = _candidate_runtime_probe_payload(interpreter)["loaded_runtime"]

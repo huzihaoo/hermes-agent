@@ -15143,6 +15143,7 @@ def check_candidate_runtime_dependencies(
     *,
     runner: Any = subprocess.run,
     loaded_runtime_verifier: Any = _verify_resident_loaded_runtime_projection,
+    config_environment: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Probe all interpreters, scripts, and clean launchd candidate environments."""
     root = repo_root.expanduser().resolve()
@@ -15154,6 +15155,21 @@ def check_candidate_runtime_dependencies(
     expected_interpreter = root / ".venv" / "bin" / "python"
     candidates: dict[str, dict[str, Any]] = {}
     forbidden_python_env = {"PYTHONPATH", "PYTHONHOME", "PYTHONUSERBASE"}
+    runtime_config_environment: dict[str, str] = {}
+    for key, value in (config_environment or {}).items():
+        if (
+            not isinstance(key, str)
+            or not isinstance(value, str)
+            or not (
+                key.startswith("HERMES_RCA_")
+                or key.startswith("HERMES_G1Q3_")
+                or key == "G1Q3_GOVERNANCE_DOWNLOAD_ENABLED"
+            )
+            or "\x00" in key
+            or "\x00" in value
+        ):
+            raise EvidenceError("runtime_candidate_config_environment_invalid")
+        runtime_config_environment[key] = value
     for filename, (expected_label, expected_script_name) in CANDIDATE_SERVICES.items():
         plist_path = repo_root / filename
         try:
@@ -15464,7 +15480,10 @@ raise SystemExit(0 if payload["ok"] else 2)
             checked = runner(
                 [*candidate["arguments"], "--check-config"],
                 cwd=str(candidate["working_directory"]),
-                env=candidate["environment"],
+                env={
+                    **candidate["environment"],
+                    **runtime_config_environment,
+                },
                 text=True,
                 capture_output=True,
                 timeout=30,
@@ -16015,6 +16034,7 @@ def project_future_candidate_runtime(
     runner: Any = subprocess.run,
     runtime_verifier: Callable[[Path], Mapping[str, Any]] | None = None,
     gateway_runtime_verifier: Callable[..., Mapping[str, Any]] | None = None,
+    runtime_config_environment: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Verify a staged runtime and project only exact root-relative paths live."""
     source_root = host_candidate.expanduser().resolve()
@@ -16124,6 +16144,7 @@ def project_future_candidate_runtime(
         runtime_detail = check_candidate_runtime_dependencies(
             stage_root,
             runner=runner,
+            config_environment=runtime_config_environment,
         )
     else:
         runtime_detail = dict(runtime_verifier(stage_root))
