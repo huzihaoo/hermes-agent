@@ -14,22 +14,44 @@ MAX_WORKFLOW_EVENT_BYTES = 2 * 1024 * 1024
 MAX_WORKFLOW_NODES = 100
 MAX_TITLE_LENGTH = 2_000
 MAX_IDENTITY_LENGTH = 256
-WORKFLOW_REQUIRED_FIELDS = frozenset({
+BASE_WORK_ITEM_REQUIRED_FIELDS = frozenset({
     "id",
     "name",
-    "nodes",
     "project_key",
     "project_simple_name",
-    "status_change_type",
     "updated_at",
     "work_item_type_key",
 })
-_WORKFLOW_MARKERS = frozenset({
+WORKFLOW_REQUIRED_FIELDS = BASE_WORK_ITEM_REQUIRED_FIELDS | frozenset({
     "nodes",
+    "status_change_type",
+})
+SNAPSHOT_REQUIRED_FIELDS = BASE_WORK_ITEM_REQUIRED_FIELDS | frozenset({
+    "created_at",
+    "fields",
+    "pattern",
+    "sub_stage",
+    "work_item_status",
+})
+_WORKFLOW_MARKERS = frozenset({
+    "created_at",
+    "fields",
+    "nodes",
+    "pattern",
     "project_key",
     "status_change_type",
+    "sub_stage",
+    "work_item_status",
     "work_item_type_key",
 })
+_SNAPSHOT_MARKERS = frozenset({
+    "created_at",
+    "fields",
+    "pattern",
+    "sub_stage",
+    "work_item_status",
+})
+MAX_SNAPSHOT_FIELDS = 1_000
 
 Decision = Literal["accepted", "filtered", "invalid"]
 StatusValue = str | int
@@ -51,6 +73,14 @@ def _string_set(value: Any, field: str) -> frozenset[str]:
     if not result:
         raise ValueError(f"{field} must contain at least one exact value")
     return result
+
+
+def _optional_string_set(value: Any) -> frozenset[str]:
+    if isinstance(value, str):
+        items = value.split(",")
+    else:
+        items = value or ()
+    return frozenset(str(item).strip() for item in items if str(item).strip())
 
 
 def _status_value(value: Any, field: str) -> StatusValue:
@@ -98,8 +128,10 @@ class WorkflowEventPolicy:
     project_keys: frozenset[str]
     project_simple_names: frozenset[str]
     work_item_type_keys: frozenset[str]
-    status_change_types: frozenset[str]
-    transitions: tuple[WorkflowTransition, ...]
+    status_change_types: frozenset[str] = frozenset()
+    transitions: tuple[WorkflowTransition, ...] = ()
+    snapshot_patterns: frozenset[str] = frozenset()
+    snapshot_sub_stages: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         topic = _required_text(self.topic, "topic")
@@ -127,14 +159,34 @@ class WorkflowEventPolicy:
         object.__setattr__(
             self,
             "status_change_types",
-            _string_set(self.status_change_types, "status_change_types"),
+            _optional_string_set(self.status_change_types),
         )
         transitions = tuple(self.transitions or ())
-        if not transitions:
-            raise ValueError("transitions must contain at least one exact transition")
         if not all(isinstance(item, WorkflowTransition) for item in transitions):
             raise ValueError("transitions must contain WorkflowTransition values")
         object.__setattr__(self, "transitions", transitions)
+        object.__setattr__(
+            self,
+            "snapshot_patterns",
+            _optional_string_set(self.snapshot_patterns),
+        )
+        object.__setattr__(
+            self,
+            "snapshot_sub_stages",
+            _optional_string_set(self.snapshot_sub_stages),
+        )
+        transition_mode = bool(self.status_change_types or transitions)
+        if bool(self.status_change_types) != bool(transitions):
+            raise ValueError(
+                "status_change_types and transitions must be configured together"
+            )
+        snapshot_mode = bool(self.snapshot_patterns or self.snapshot_sub_stages)
+        if bool(self.snapshot_patterns) != bool(self.snapshot_sub_stages):
+            raise ValueError(
+                "snapshot_patterns and snapshot_sub_stages must be configured together"
+            )
+        if not transition_mode and not snapshot_mode:
+            raise ValueError("at least one exact creation policy mode is required")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -145,6 +197,8 @@ class WorkflowEventPolicy:
             "work_item_type_keys": sorted(self.work_item_type_keys),
             "status_change_types": sorted(self.status_change_types),
             "transitions": [asdict(item) for item in self.transitions],
+            "snapshot_patterns": sorted(self.snapshot_patterns),
+            "snapshot_sub_stages": sorted(self.snapshot_sub_stages),
         }
 
     @classmethod
@@ -160,14 +214,20 @@ class WorkflowEventPolicy:
             work_item_type_keys=_string_set(
                 value.get("work_item_type_keys"), "work_item_type_keys"
             ),
-            status_change_types=_string_set(
-                value.get("status_change_types"), "status_change_types"
+            status_change_types=_optional_string_set(
+                value.get("status_change_types")
             ),
             transitions=tuple(
                 item
                 if isinstance(item, WorkflowTransition)
                 else WorkflowTransition.from_mapping(item)
                 for item in transitions
+            ),
+            snapshot_patterns=_optional_string_set(
+                value.get("snapshot_patterns")
+            ),
+            snapshot_sub_stages=_optional_string_set(
+                value.get("snapshot_sub_stages")
             ),
         )
 
@@ -335,11 +395,18 @@ def classify_workflow_event(
     except ValueError as exc:
         return ClassificationResult("invalid", str(exc))
 
-    missing = WORKFLOW_REQUIRED_FIELDS - payload.keys()
+    snapshot_shape = len(_SNAPSHOT_MARKERS & payload.keys()) >= 2
+    required_fields = SNAPSHOT_REQUIRED_FIELDS if snapshot_shape else WORKFLOW_REQUIRED_FIELDS
+    missing = required_fields - payload.keys()
     if missing:
         if len(_WORKFLOW_MARKERS & payload.keys()) < 2:
             return ClassificationResult("filtered", "unsupported_message_shape")
-        return ClassificationResult("invalid", "missing_workflow_fields")
+        reason = (
+            "missing_creation_snapshot_fields"
+            if snapshot_shape
+            else "missing_workflow_fields"
+        )
+        return ClassificationResult("invalid", reason)
 
     try:
         work_item_id = _work_item_id(payload.get("id"))
@@ -351,9 +418,6 @@ def classify_workflow_event(
         work_item_type_key = _required_text(
             payload.get("work_item_type_key"), "work_item_type_key"
         )
-        status_change_type = _required_text(
-            payload.get("status_change_type"), "status_change_type"
-        )
         updated_at_ms = _timestamp_ms(payload.get("updated_at"))
         if len(title) > MAX_TITLE_LENGTH or any(
             len(value) > MAX_IDENTITY_LENGTH
@@ -361,10 +425,67 @@ def classify_workflow_event(
                 project_key,
                 project_simple_name,
                 work_item_type_key,
-                status_change_type,
             )
         ):
             raise ValueError("workflow_field_too_long")
+    except ValueError as exc:
+        return ClassificationResult("invalid", str(exc))
+
+    if project_key not in policy.project_keys:
+        return ClassificationResult("filtered", "project_key_not_allowed")
+    if project_simple_name not in policy.project_simple_names:
+        return ClassificationResult("filtered", "project_simple_name_not_allowed")
+    if work_item_type_key not in policy.work_item_type_keys:
+        return ClassificationResult("filtered", "work_item_type_not_allowed")
+    if snapshot_shape:
+        try:
+            pattern = _required_text(payload.get("pattern"), "pattern")
+            sub_stage = _required_text(payload.get("sub_stage"), "sub_stage")
+            _timestamp_ms(payload.get("created_at"))
+            raw_fields = payload.get("fields")
+            if not isinstance(raw_fields, list) or len(raw_fields) > MAX_SNAPSHOT_FIELDS:
+                raise ValueError("invalid_snapshot_fields")
+            if not isinstance(payload.get("work_item_status"), dict):
+                raise ValueError("invalid_work_item_status")
+            if "nodes" in payload or "status_change_type" in payload:
+                raise ValueError("ambiguous_creation_snapshot")
+            if any(
+                len(value) > MAX_IDENTITY_LENGTH for value in (pattern, sub_stage)
+            ):
+                raise ValueError("snapshot_field_too_long")
+        except ValueError as exc:
+            return ClassificationResult("invalid", str(exc))
+        if not policy.snapshot_patterns:
+            return ClassificationResult("filtered", "creation_snapshot_not_allowed")
+        if pattern not in policy.snapshot_patterns:
+            return ClassificationResult("filtered", "snapshot_pattern_not_allowed")
+        if sub_stage not in policy.snapshot_sub_stages:
+            return ClassificationResult("filtered", "snapshot_sub_stage_not_allowed")
+        normalized = NormalizedWorkflowEvent(
+            schema_version=NORMALIZED_EVENT_SCHEMA_VERSION,
+            creation_rule_version=policy.policy_version,
+            work_item_id=work_item_id,
+            title=title,
+            project_key=project_key,
+            project_simple_name=project_simple_name,
+            work_item_type_key=work_item_type_key,
+            status_change_type=pattern,
+            updated_at_ms=updated_at_ms,
+            issue_url=(
+                f"https://project.feishu.cn/{project_simple_name}/issue/detail/"
+                f"{work_item_id}"
+            ),
+            nodes=(),
+            matched_nodes=(),
+        )
+        return ClassificationResult(
+            "accepted", "creation_snapshot_policy_matched", normalized
+        )
+
+    try:
+        status_change_type = _required_text(
+            payload.get("status_change_type"), "status_change_type"
+        )
         raw_nodes = payload.get("nodes")
         if (
             not isinstance(raw_nodes, list)
@@ -375,13 +496,6 @@ def classify_workflow_event(
         nodes = tuple(_normalize_node(item) for item in raw_nodes)
     except ValueError as exc:
         return ClassificationResult("invalid", str(exc))
-
-    if project_key not in policy.project_keys:
-        return ClassificationResult("filtered", "project_key_not_allowed")
-    if project_simple_name not in policy.project_simple_names:
-        return ClassificationResult("filtered", "project_simple_name_not_allowed")
-    if work_item_type_key not in policy.work_item_type_keys:
-        return ClassificationResult("filtered", "work_item_type_not_allowed")
     if status_change_type not in policy.status_change_types:
         return ClassificationResult("filtered", "status_change_type_not_allowed")
 

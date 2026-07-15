@@ -477,6 +477,8 @@ def _create_db(path: Path, *, duplicate=False, promoted=True):
         "project_simple_names": ["g1q3"],
         "work_item_type_keys": ["issue"],
         "status_change_types": ["Reached"],
+        "snapshot_patterns": [],
+        "snapshot_sub_stages": [],
         "transitions": [
             {
                 "state_key": "new-problem-state",

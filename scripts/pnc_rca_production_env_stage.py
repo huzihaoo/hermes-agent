@@ -926,7 +926,7 @@ def _validate_candidate_config(raw: bytes) -> Mapping[str, str]:
         transitions = strict_json_value(
             "HERMES_RCA_KAFKA_STATE_TRANSITIONS_JSON"
         )
-        if not isinstance(transitions, list) or not transitions:
+        if not isinstance(transitions, list):
             raise ValueError
         for transition in transitions:
             if (
@@ -942,10 +942,36 @@ def _validate_candidate_config(raw: bytes) -> Mapping[str, str]:
             "HERMES_RCA_KAFKA_PROJECT_KEYS",
             "HERMES_RCA_KAFKA_PROJECT_SIMPLE_NAMES",
             "HERMES_RCA_KAFKA_WORK_ITEM_TYPE_KEYS",
-            "HERMES_RCA_KAFKA_STATUS_CHANGE_TYPES",
         ):
             if not tuple(item.strip() for item in values[key].split(",") if item.strip()):
                 raise ValueError
+        status_change_types = tuple(
+            item.strip()
+            for item in values.get(
+                "HERMES_RCA_KAFKA_STATUS_CHANGE_TYPES", ""
+            ).split(",")
+            if item.strip()
+        )
+        snapshot_patterns = tuple(
+            item.strip()
+            for item in values.get(
+                "HERMES_RCA_KAFKA_SNAPSHOT_PATTERNS", ""
+            ).split(",")
+            if item.strip()
+        )
+        snapshot_sub_stages = tuple(
+            item.strip()
+            for item in values.get(
+                "HERMES_RCA_KAFKA_SNAPSHOT_SUB_STAGES", ""
+            ).split(",")
+            if item.strip()
+        )
+        if bool(status_change_types) != bool(transitions):
+            raise ValueError
+        if bool(snapshot_patterns) != bool(snapshot_sub_stages):
+            raise ValueError
+        if not transitions and not snapshot_patterns:
+            raise ValueError
         control_paths = {
             Path(values[key])
             for key in (

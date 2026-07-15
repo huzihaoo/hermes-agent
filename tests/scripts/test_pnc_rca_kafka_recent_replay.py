@@ -47,10 +47,32 @@ def _config(tmp_path: Path):
     )
 
 
+def _snapshot_config(tmp_path: Path):
+    return pnc_rca_kafka_consumer.ConsumerConfig.from_env(
+        {
+            "HERMES_RCA_KAFKA_BOOTSTRAP_SERVERS": "broker-1:9092",
+            "HERMES_RCA_KAFKA_TOPIC": TOPIC,
+            "HERMES_RCA_KAFKA_USER": "rca",
+            "HERMES_RCA_KAFKA_PASSWORD": "test-secret",
+            "HERMES_RCA_KAFKA_GROUP": "rca_root_cause_analysis_agent",
+            "HERMES_RCA_KAFKA_API_VERSION": "3.9.0",
+            "HERMES_RCA_KAFKA_PROJECT_KEYS": "project-key",
+            "HERMES_RCA_KAFKA_PROJECT_SIMPLE_NAMES": "g1q3",
+            "HERMES_RCA_KAFKA_WORK_ITEM_TYPE_KEYS": "problem-type",
+            "HERMES_RCA_KAFKA_STATUS_CHANGE_TYPES": "",
+            "HERMES_RCA_KAFKA_STATE_TRANSITIONS_JSON": "[]",
+            "HERMES_RCA_KAFKA_SNAPSHOT_PATTERNS": "State",
+            "HERMES_RCA_KAFKA_SNAPSHOT_SUB_STAGES": "OPEN",
+            "HERMES_RCA_KAFKA_CREATION_RULE_VERSION": "issue-state-open-v1",
+            "HERMES_RCA_KAFKA_CONTROL_DB_PATH": str(tmp_path / "unused.sqlite3"),
+            "HERMES_RCA_KAFKA_HEALTH_PATH": str(tmp_path / "unused-health.json"),
+        },
+        hermes_home=tmp_path,
+    )
+
+
 def _value(work_item_id: int) -> bytes:
     return json.dumps({
-        "created_at": int(NOW.timestamp() * 1000),
-        "fields": [],
         "id": work_item_id,
         "name": f"private title {work_item_id}",
         "nodes": [
@@ -62,12 +84,27 @@ def _value(work_item_id: int) -> bytes:
         ],
         "project_key": "project-key",
         "project_simple_name": "g1q3",
-        "pattern": "work_item_created",
-        "sub_stage": "created",
         "status_change_type": "Reached",
-        "template_type": "issue",
         "updated_at": int(NOW.timestamp() * 1000),
-        "work_item_status": {},
+        "work_item_type_key": "problem-type",
+    }).encode()
+
+
+def _snapshot_value(work_item_id: int) -> bytes:
+    return json.dumps({
+        "created_at": int(NOW.timestamp() * 1000) + 1_000,
+        "created_by": "private-user",
+        "fields": [],
+        "id": work_item_id,
+        "name": f"private title {work_item_id}",
+        "pattern": "State",
+        "project_key": "project-key",
+        "project_simple_name": "g1q3",
+        "sub_stage": "OPEN",
+        "template_id": 1,
+        "template_type": "",
+        "updated_at": int(NOW.timestamp() * 1000),
+        "work_item_status": {"state_key": "open"},
         "work_item_type_key": "problem-type",
     }).encode()
 
@@ -159,6 +196,27 @@ class _FakeConsumer:
 
     def close(self, *, autocommit):
         self.closed = autocommit
+
+
+class _SnapshotFakeConsumer(_FakeConsumer):
+    def poll(self, **_kwargs):
+        self.poll_count += 1
+        if self.poll_count > 1:
+            return {}
+        return {
+            partition: [
+                SimpleNamespace(
+                    topic=TOPIC,
+                    partition=partition.partition,
+                    offset=1,
+                    value=_snapshot_value(7000000000 + partition.partition),
+                    key=None,
+                    timestamp=int(NOW.timestamp() * 1000),
+                    headers=[],
+                )
+            ]
+            for partition in self.assigned
+        }
 
 
 def test_recent_replay_uses_explicit_offsets_and_shadow_store(tmp_path: Path) -> None:
@@ -257,6 +315,38 @@ def test_recent_replay_binds_all_expected_real_work_items(tmp_path: Path) -> Non
     assert all(item["expected_e2e_work_item"] for item in receipt["result"]["records"])
 
 
+def test_recent_replay_accepts_snapshot_creation_and_builds_shadow_outbox(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(tmp_path, ["7000000000", "7000000001"])
+    expected, observation = replay.load_e2e_canary_manifest(manifest)
+
+    receipt = replay.collect_recent_replay(
+        _snapshot_config(tmp_path),
+        consumer_factory=_SnapshotFakeConsumer,
+        topic_partition_factory=_TopicPartition,
+        now=NOW,
+        max_messages=10,
+        max_bytes=1024 * 1024,
+        max_seconds=10,
+        expected_work_item_ids=expected,
+        e2e_manifest_observation=observation,
+    )
+
+    assert receipt["result"]["decision_counts"] == {"accepted": 2}
+    assert receipt["result"]["reason_counts"] == {
+        "creation_snapshot_policy_matched": 2
+    }
+    assert receipt["result"]["shadow_store"]["outbox"] == {"shadow": 2}
+    assert receipt["result"]["e2e_canary"]["complete"] is True
+    assert receipt["result"]["e2e_canary"]["unexpected_accepted_work_items"] == 0
+    assert all(item["trigger_created"] for item in receipt["result"]["records"])
+    assert all(item["outbox_created"] for item in receipt["result"]["records"])
+    serialized = json.dumps(receipt, ensure_ascii=False)
+    assert "private title" not in serialized
+    assert "private-user" not in serialized
+
+
 def test_policy_observation_discovers_real_values_without_approving_them(
     tmp_path: Path,
 ) -> None:
@@ -277,7 +367,7 @@ def test_policy_observation_discovers_real_values_without_approving_them(
 
     receipt = replay.collect_recent_policy_observation(
         config,
-        consumer_factory=_FakeConsumer,
+        consumer_factory=_SnapshotFakeConsumer,
         topic_partition_factory=_TopicPartition,
         now=NOW,
         max_messages=10,
@@ -295,51 +385,37 @@ def test_policy_observation_discovers_real_values_without_approving_them(
         "project_key": [{"value": "project-key", "count": 2}],
         "project_simple_name": [{"value": "g1q3", "count": 2}],
         "work_item_type_key": [{"value": "problem-type", "count": 2}],
-        "status_change_type": [{"value": "Reached", "count": 2}],
+        "status_change_type": [],
     }
-    assert receipt["result"]["transitions"] == [
-        {
-            "state_key": "new-problem-state",
-            "pre_status": "1",
-            "cur_status": "2",
-            "count": 2,
-        }
-    ]
+    assert receipt["result"]["transitions"] == []
     assert receipt["result"]["e2e_canary"]["complete"] is True
     observed_policy = receipt["result"]["e2e_canary"]["observed_policy"]
     assert observed_policy["record_count"] == 1
     assert observed_policy["control_fields"] == {
-        "pattern": [{"value": "work_item_created", "count": 1}],
-        "sub_stage": [{"value": "created", "count": 1}],
-        "template_type": [{"value": "issue", "count": 1}],
+        "pattern": [{"value": "State", "count": 1}],
+        "sub_stage": [{"value": "OPEN", "count": 1}],
+        "template_type": [],
     }
     assert observed_policy["fields"] == {
         "project_key": [{"value": "project-key", "count": 1}],
         "project_simple_name": [{"value": "g1q3", "count": 1}],
         "work_item_type_key": [{"value": "problem-type", "count": 1}],
-        "status_change_type": [{"value": "Reached", "count": 1}],
+        "status_change_type": [],
     }
     assert observed_policy["invariants"] == {
-        "created_at_equals_updated_at": 1,
+        "created_at_after_updated_at": 1,
         "fields_array": 1,
         "work_item_status_object": 1,
     }
-    assert observed_policy["transitions"] == [
-        {
-            "state_key": "new-problem-state",
-            "pre_status": "1",
-            "cur_status": "2",
-            "count": 1,
-        }
-    ]
+    assert observed_policy["transitions"] == []
     schema = {item["field"]: item for item in observed_policy["schema"]}
     assert schema["id"] == {
         "field": "id",
         "present_count": 1,
         "types": [{"type": "integer", "count": 1}],
     }
-    assert schema["nodes"] == {
-        "field": "nodes",
+    assert schema["fields"] == {
+        "field": "fields",
         "present_count": 1,
         "types": [{"type": "array", "count": 1}],
     }

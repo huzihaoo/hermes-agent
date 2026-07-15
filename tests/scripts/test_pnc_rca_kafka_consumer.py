@@ -542,6 +542,21 @@ def test_manual_and_consumer_share_exact_validated_workflow_policy(tmp_path):
     assert standalone.to_dict() == config.runtime_public_dict()["policy"]
 
 
+def test_snapshot_only_creation_policy_is_explicit_and_valid(tmp_path):
+    config = _config(
+        tmp_path,
+        HERMES_RCA_KAFKA_STATUS_CHANGE_TYPES="",
+        HERMES_RCA_KAFKA_STATE_TRANSITIONS_JSON="[]",
+        HERMES_RCA_KAFKA_SNAPSHOT_PATTERNS="State",
+        HERMES_RCA_KAFKA_SNAPSHOT_SUB_STAGES="OPEN",
+    )
+
+    assert config.policy.status_change_types == frozenset()
+    assert config.policy.transitions == ()
+    assert config.policy.snapshot_patterns == frozenset({"State"})
+    assert config.policy.snapshot_sub_stages == frozenset({"OPEN"})
+
+
 def test_offset_reset_is_fixed_fail_closed_and_rejects_broker_fallback(tmp_path):
     fail_closed = _config(tmp_path)
 

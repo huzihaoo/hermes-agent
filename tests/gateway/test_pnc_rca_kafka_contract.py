@@ -57,6 +57,85 @@ def _payload(**updates):
     return value
 
 
+def _snapshot_policy(**updates):
+    values = {
+        "topic": TOPIC,
+        "policy_version": "issue-state-open-v1",
+        "project_keys": frozenset({"project-key"}),
+        "project_simple_names": frozenset({"g1q3"}),
+        "work_item_type_keys": frozenset({"problem-type"}),
+        "snapshot_patterns": frozenset({"State"}),
+        "snapshot_sub_stages": frozenset({"OPEN"}),
+    }
+    values.update(updates)
+    return WorkflowEventPolicy(**values)
+
+
+def _snapshot_payload(**updates):
+    value = {
+        "created_at": 1783650001000,
+        "fields": [],
+        "id": 7041712812,
+        "name": "ACC braking issue",
+        "pattern": "State",
+        "project_key": "project-key",
+        "project_simple_name": "g1q3",
+        "sub_stage": "OPEN",
+        "updated_at": 1783650000000,
+        "work_item_status": {"state_key": "open"},
+        "work_item_type_key": "problem-type",
+    }
+    value.update(updates)
+    return value
+
+
+def test_exact_snapshot_policy_accepts_real_creation_envelope():
+    result = classify_workflow_event(
+        topic=TOPIC,
+        value=_snapshot_payload(),
+        policy=_snapshot_policy(),
+    )
+
+    assert result.decision == "accepted"
+    assert result.reason == "creation_snapshot_policy_matched"
+    assert result.normalized is not None
+    assert result.normalized.work_item_id == "7041712812"
+    assert result.normalized.status_change_type == "State"
+    assert result.normalized.nodes == ()
+    assert result.normalized.matched_nodes == ()
+
+
+@pytest.mark.parametrize(
+    ("payload_update", "reason"),
+    [
+        ({"pattern": "Changed"}, "snapshot_pattern_not_allowed"),
+        ({"sub_stage": "CLOSED"}, "snapshot_sub_stage_not_allowed"),
+        ({"fields": {}}, "invalid_snapshot_fields"),
+        ({"work_item_status": []}, "invalid_work_item_status"),
+        ({"nodes": []}, "ambiguous_creation_snapshot"),
+        ({"status_change_type": "Reached"}, "ambiguous_creation_snapshot"),
+    ],
+)
+def test_snapshot_policy_is_exact_and_rejects_ambiguous_shapes(
+    payload_update, reason
+):
+    result = classify_workflow_event(
+        topic=TOPIC,
+        value=_snapshot_payload(**payload_update),
+        policy=_snapshot_policy(),
+    )
+
+    assert result.decision in {"filtered", "invalid"}
+    assert result.reason == reason
+
+
+def test_policy_requires_one_complete_creation_mode():
+    with pytest.raises(ValueError, match="at least one exact"):
+        _snapshot_policy(snapshot_patterns=frozenset(), snapshot_sub_stages=frozenset())
+    with pytest.raises(ValueError, match="configured together"):
+        _snapshot_policy(snapshot_sub_stages=frozenset())
+
+
 def test_exact_policy_match_normalizes_observed_workflow_shape():
     result = classify_workflow_event(topic=TOPIC, value=_payload(), policy=_policy())
 

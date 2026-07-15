@@ -10064,6 +10064,8 @@ def _check_manual_admission_policy(
         "work_item_type_keys",
         "status_change_types",
         "transitions",
+        "snapshot_patterns",
+        "snapshot_sub_stages",
     }
     if set(policy) != required_policy_keys:
         raise EvidenceError(f"{artifact}_workflow_policy_invalid")

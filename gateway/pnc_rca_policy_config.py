@@ -71,6 +71,14 @@ def _csv(env: Mapping[str, str], name: str) -> frozenset[str]:
     return values
 
 
+def _optional_csv(env: Mapping[str, str], name: str) -> frozenset[str]:
+    return frozenset(
+        part.strip()
+        for part in str(env.get(name, "")).split(",")
+        if part.strip()
+    )
+
+
 def _strict_json(raw: str, name: str) -> Any:
     def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
@@ -109,9 +117,10 @@ def workflow_policy_from_env(
     """Build the exact policy consumed by Kafka and manual RCA admission."""
     source = os.environ if env is None else env
     transitions_name = f"{ENV_PREFIX}STATE_TRANSITIONS_JSON"
-    transitions = _strict_json(_required(source, transitions_name), transitions_name)
-    if not isinstance(transitions, list) or not transitions:
-        raise ValueError(f"{transitions_name} must be a non-empty JSON array")
+    raw_transitions = str(source.get(transitions_name, "[]")).strip() or "[]"
+    transitions = _strict_json(raw_transitions, transitions_name)
+    if not isinstance(transitions, list):
+        raise ValueError(f"{transitions_name} must be a JSON array")
     if not all(isinstance(item, dict) for item in transitions):
         raise ValueError(f"{transitions_name} entries must be JSON objects")
     return WorkflowEventPolicy(
@@ -120,9 +129,17 @@ def workflow_policy_from_env(
         project_keys=_csv(source, f"{ENV_PREFIX}PROJECT_KEYS"),
         project_simple_names=_csv(source, f"{ENV_PREFIX}PROJECT_SIMPLE_NAMES"),
         work_item_type_keys=_csv(source, f"{ENV_PREFIX}WORK_ITEM_TYPE_KEYS"),
-        status_change_types=_csv(source, f"{ENV_PREFIX}STATUS_CHANGE_TYPES"),
+        status_change_types=_optional_csv(
+            source, f"{ENV_PREFIX}STATUS_CHANGE_TYPES"
+        ),
         transitions=tuple(
             WorkflowTransition.from_mapping(item) for item in transitions
+        ),
+        snapshot_patterns=_optional_csv(
+            source, f"{ENV_PREFIX}SNAPSHOT_PATTERNS"
+        ),
+        snapshot_sub_stages=_optional_csv(
+            source, f"{ENV_PREFIX}SNAPSHOT_SUB_STAGES"
         ),
     )
 

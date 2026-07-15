@@ -101,6 +101,36 @@ def _json(path: Path, body: dict) -> bytes:
     return raw
 
 
+def test_candidate_config_accepts_explicit_snapshot_only_policy(tmp_path: Path):
+    raw = _env_body(tmp_path)
+    raw = raw.replace(
+        "HERMES_RCA_KAFKA_STATUS_CHANGE_TYPES=Reached\n",
+        "HERMES_RCA_KAFKA_STATUS_CHANGE_TYPES=\n",
+    ).replace(
+        'HERMES_RCA_KAFKA_STATE_TRANSITIONS_JSON=[{"state_key":"new-problem","pre_status":1,"cur_status":2}]\n',
+        "HERMES_RCA_KAFKA_STATE_TRANSITIONS_JSON=[]\n",
+    )
+    raw += (
+        "HERMES_RCA_KAFKA_SNAPSHOT_PATTERNS=State\n"
+        "HERMES_RCA_KAFKA_SNAPSHOT_SUB_STAGES=OPEN\n"
+    )
+
+    values = stage._validate_candidate_config(raw.encode("utf-8"))
+
+    assert values["HERMES_RCA_KAFKA_SNAPSHOT_PATTERNS"] == "State"
+    assert values["HERMES_RCA_KAFKA_SNAPSHOT_SUB_STAGES"] == "OPEN"
+
+
+def test_candidate_config_rejects_partial_snapshot_policy(tmp_path: Path):
+    raw = _env_body(tmp_path) + "HERMES_RCA_KAFKA_SNAPSHOT_PATTERNS=State\n"
+
+    with pytest.raises(
+        stage.ProductionEnvStageError,
+        match="production_env_candidate_config_invalid",
+    ):
+        stage._validate_candidate_config(raw.encode("utf-8"))
+
+
 @pytest.fixture
 def fixture(tmp_path: Path, monkeypatch) -> SimpleNamespace:
     secure = tmp_path / "secure"
