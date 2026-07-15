@@ -16743,6 +16743,16 @@ def test_live_build_provenance_uses_fixed_bounded_vm_probe(tmp_path):
             "run_py_json",
         ]
         assert kwargs["timeout"] == release_gate_module.VM_PROVENANCE_TIMEOUT_SECONDS
+        assert (
+            release_gate_module.VM_PROVENANCE_TIMEOUT_SECONDS
+            > release_gate_module.VM_PROVENANCE_GIT_TIMEOUT_SECONDS
+        )
+        assert (
+            f"GIT_TIMEOUT_SECONDS = "
+            f"{release_gate_module.VM_PROVENANCE_GIT_TIMEOUT_SECONDS}"
+            in kwargs["input"]
+        )
+        assert kwargs["input"].count("timeout=GIT_TIMEOUT_SECONDS") == 2
         assert 'git("rev-parse", "--show-toplevel")' in kwargs["input"]
         assert (
             'git("status", "--porcelain=v1", "--untracked-files=all")'

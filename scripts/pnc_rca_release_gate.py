@@ -689,7 +689,8 @@ RELEASE_PREPARE_ACTION_SET = (
     "transition_rca_steady",
     "rollback_rca_release",
 )
-VM_PROVENANCE_TIMEOUT_SECONDS = 15
+VM_PROVENANCE_GIT_TIMEOUT_SECONDS = 30
+VM_PROVENANCE_TIMEOUT_SECONDS = 90
 EMPTY_GIT_STATUS_SHA256 = hashlib.sha256(b"").hexdigest()
 ALLOWED_MODES = frozenset({
     "shadow",
@@ -14481,6 +14482,7 @@ import subprocess
 
 REPO_ROOT = {root_literal}
 ENTRYPOINT_RELATIVE = {entrypoint_literal}
+GIT_TIMEOUT_SECONDS = {VM_PROVENANCE_GIT_TIMEOUT_SECONDS}
 
 
 def git(*arguments):
@@ -14489,7 +14491,7 @@ def git(*arguments):
         check=False,
         capture_output=True,
         text=True,
-        timeout=5,
+        timeout=GIT_TIMEOUT_SECONDS,
     )
     if process.returncode != 0:
         raise SystemExit(2)
@@ -14501,7 +14503,7 @@ def git_bytes(*arguments):
         ["git", "-c", "core.fileMode=false", "-C", REPO_ROOT, *arguments],
         check=False,
         capture_output=True,
-        timeout=5,
+        timeout=GIT_TIMEOUT_SECONDS,
     )
     if process.returncode != 0:
         raise SystemExit(2)
