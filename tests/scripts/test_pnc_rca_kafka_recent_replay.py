@@ -60,7 +60,10 @@ def _value(work_item_id: int) -> bytes:
         ],
         "project_key": "project-key",
         "project_simple_name": "g1q3",
+        "pattern": "work_item_created",
+        "sub_stage": "created",
         "status_change_type": "Reached",
+        "template_type": "issue",
         "updated_at": int(NOW.timestamp() * 1000),
         "work_item_type_key": "problem-type",
     }).encode()
@@ -302,6 +305,11 @@ def test_policy_observation_discovers_real_values_without_approving_them(
     assert receipt["result"]["e2e_canary"]["complete"] is True
     observed_policy = receipt["result"]["e2e_canary"]["observed_policy"]
     assert observed_policy["record_count"] == 1
+    assert observed_policy["control_fields"] == {
+        "pattern": [{"value": "work_item_created", "count": 1}],
+        "sub_stage": [{"value": "created", "count": 1}],
+        "template_type": [{"value": "issue", "count": 1}],
+    }
     assert observed_policy["fields"] == {
         "project_key": [{"value": "project-key", "count": 1}],
         "project_simple_name": [{"value": "g1q3", "count": 1}],

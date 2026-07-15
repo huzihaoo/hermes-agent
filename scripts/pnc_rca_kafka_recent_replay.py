@@ -52,6 +52,11 @@ MAX_E2E_WORK_ITEMS = 200
 MAX_OBSERVED_IDENTITIES = 100
 MAX_OBSERVED_IDENTITY_LENGTH = 256
 SHA256_HEX_LENGTH = 64
+EXPECTED_CONTROL_FIELDS = (
+    "pattern",
+    "sub_stage",
+    "template_type",
+)
 
 
 class ReplayError(RuntimeError):
@@ -335,6 +340,9 @@ class _PolicyObservation:
         self.expected_fields: dict[str, Counter[str]] = {
             name: Counter() for name in self.fields
         }
+        self.expected_control_fields: dict[str, Counter[str]] = {
+            name: Counter() for name in EXPECTED_CONTROL_FIELDS
+        }
         self.expected_schema: dict[str, Counter[str]] = {}
         self.transitions: Counter[tuple[str, str, str]] = Counter()
         self.expected_transitions: Counter[tuple[str, str, str]] = Counter()
@@ -424,6 +432,11 @@ class _PolicyObservation:
                         value,
                         f"expected_{name}",
                     )
+        if is_expected:
+            for name, counter in self.expected_control_fields.items():
+                value = self._identity(payload, name)
+                if value is not None:
+                    self._bounded_add(counter, value, f"expected_{name}")
 
         nodes = payload.get("nodes")
         if not isinstance(nodes, list) or len(nodes) > 100:
@@ -516,6 +529,9 @@ class _PolicyObservation:
                 and self.expected_work_item_ids == self.expected_observed,
                 "observed_policy": {
                     "record_count": self.expected_records,
+                    "control_fields": self._fields_receipt(
+                        self.expected_control_fields
+                    ),
                     "fields": self._fields_receipt(self.expected_fields),
                     "schema": [
                         {
