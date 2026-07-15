@@ -2149,9 +2149,16 @@ def _future_runtime_binding_fixture(
         "canonical_runtime_config_sha256": LAUNCHD_CONFIG_SHA256,
         "gateway_runtime": {
             "sys_executable": str(canonical_root / ".venv/bin/python"),
+            "sys_executable_sha256": interpreter_sha256,
             "process_executable": str(canonical_root / ".venv/bin/python"),
+            "process_executable_sha256": interpreter_sha256,
             "module_origins": gateway_origins,
             "module_origins_sha256": _sha256_json(gateway_origins),
+            "dependency_versions": dict(
+                release_gate_module.EXPECTED_GATEWAY_RUNTIME_DEPENDENCY_VERSIONS
+            ),
+            "repo_module_count": 4,
+            "venv_dependency_count": 2,
         },
     }
     render_manifest_sha256 = _sha256_json(render_manifest)
@@ -8576,7 +8583,11 @@ def _write_candidate_plists(tmp_path, *, kafka_environment=None):
     return interpreter, working, default_environment
 
 
-def _candidate_runtime_probe_payload(interpreter: Path) -> dict:
+def _candidate_runtime_probe_payload(
+    interpreter: Path,
+    *,
+    process_executable: Path | None = None,
+) -> dict:
     versions = dict(release_gate_module.EXPECTED_DEPENDENCY_VERSIONS)
     dependencies = {}
     for distribution, module_name in sorted(
@@ -8593,18 +8604,19 @@ def _candidate_runtime_probe_payload(interpreter: Path) -> dict:
             "version": versions[distribution],
         }
     executable = interpreter.resolve(strict=True)
+    process_executable = (process_executable or interpreter).resolve(strict=True)
     loaded_runtime = {
         "sys_executable": str(executable),
         "sys_executable_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
-        "process_executable": str(executable),
+        "process_executable": str(process_executable),
         "process_executable_sha256": hashlib.sha256(
-            executable.read_bytes()
+            process_executable.read_bytes()
         ).hexdigest(),
         "dependencies": dependencies,
     }
     return {
         "ok": True,
-        "runtime_executable": str(executable),
+        "runtime_executable": str(process_executable),
         "loaded_runtime": loaded_runtime,
         "loaded_runtime_sha256": _sha256_json(loaded_runtime),
         "versions": versions,
@@ -8642,6 +8654,7 @@ def _future_runtime_plist_body(filename: str, root: Path) -> dict:
         "ProgramArguments": arguments,
         "WorkingDirectory": str(root),
         "EnvironmentVariables": {
+            "HOME": str(Path.home()),
             "HERMES_HOME": str(
                 release_gate_module.CANONICAL_FUTURE_RUNTIME_ROOT.parent.parent
             ),
@@ -8655,7 +8668,7 @@ def _future_runtime_plist_body(filename: str, root: Path) -> dict:
     }
 
 
-def _future_runtime_fixture(tmp_path: Path):
+def _future_runtime_fixture(tmp_path: Path, *, external_process: bool = False):
     source = tmp_path / "future-source"
     source.mkdir()
     stage = tmp_path / "future-stage"
@@ -8681,6 +8694,11 @@ def _future_runtime_fixture(tmp_path: Path):
     interpreter.parent.mkdir(parents=True)
     interpreter.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     interpreter.chmod(0o755)
+    process_executable = interpreter
+    if external_process:
+        process_executable = tmp_path / "homebrew-cellar-python"
+        process_executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        process_executable.chmod(0o755)
     (stage / ".venv").chmod(0o755)
     interpreter.parent.chmod(0o755)
     stage.chmod(0o700)
@@ -8700,12 +8718,18 @@ def _future_runtime_fixture(tmp_path: Path):
 
     def runner(command, **_kwargs):
         if command[1:4] == ["-I", "-B", "-c"]:
-            payload = _candidate_runtime_probe_payload(interpreter)
+            payload = _candidate_runtime_probe_payload(
+                interpreter,
+                process_executable=process_executable,
+            )
         elif command[1:2] == ["-c"]:
-            loaded = _candidate_runtime_probe_payload(interpreter)["loaded_runtime"]
+            loaded = _candidate_runtime_probe_payload(
+                interpreter,
+                process_executable=process_executable,
+            )["loaded_runtime"]
             payload = {
                 "sys_executable": str(interpreter),
-                "process_executable": str(interpreter),
+                "process_executable": str(process_executable),
                 "module_origins": {
                     "hermes_cli.main": str(stage / "hermes_cli" / "main.py"),
                     "gateway.run": str(stage / "gateway" / "run.py"),
@@ -8741,6 +8765,7 @@ def _future_runtime_fixture(tmp_path: Path):
         source=source,
         stage=stage,
         interpreter=interpreter,
+        process_executable=process_executable,
         runner=runner,
         candidate_plists=tuple(
             stage / filename
@@ -8788,6 +8813,112 @@ def test_future_runtime_projection_binds_real_stage_to_canonical_root(tmp_path):
         assert process["environment"]["PYTHONDONTWRITEBYTECODE"] == "1"
         assert process["environment"]["PYTHONNOUSERSITE"] == "1"
         assert str(fixture.stage) not in json.dumps(process)
+
+
+def test_future_runtime_projection_binds_external_process_executable(tmp_path):
+    fixture = _future_runtime_fixture(tmp_path, external_process=True)
+
+    result = release_gate_module.project_future_candidate_runtime(
+        fixture.source,
+        fixture.stage,
+        candidate_plists=fixture.candidate_plists,
+        runner=fixture.runner,
+        runtime_verifier=fixture.runtime_verifier,
+    )
+
+    external = str(fixture.process_executable)
+    external_sha256 = hashlib.sha256(
+        fixture.process_executable.read_bytes()
+    ).hexdigest()
+    assert result["loaded_runtime"]["sys_executable"] == str(
+        release_gate_module.CANONICAL_FUTURE_RUNTIME_ROOT / ".venv/bin/python"
+    )
+    assert result["loaded_runtime"]["process_executable"] == external
+    assert (
+        result["loaded_runtime"]["process_executable_sha256"]
+        == external_sha256
+    )
+    for process in result["service_processes"].values():
+        assert process["runtime_executable"] == external
+        assert process["loaded_runtime"]["process_executable"] == external
+        assert (
+            process["loaded_runtime"]["process_executable_sha256"]
+            == external_sha256
+        )
+    gateway = result["render_manifest"]["gateway_runtime"]
+    assert gateway["process_executable"] == external
+    assert gateway["process_executable_sha256"] == external_sha256
+
+
+def test_future_runtime_projection_rejects_external_process_hash_drift(tmp_path):
+    fixture = _future_runtime_fixture(tmp_path, external_process=True)
+
+    def forged_runtime_verifier(root):
+        detail = fixture.runtime_verifier(root)
+        detail["loaded_runtime"]["process_executable_sha256"] = "0" * 64
+        return detail
+
+    with pytest.raises(EvidenceError) as error:
+        release_gate_module.project_future_candidate_runtime(
+            fixture.source,
+            fixture.stage,
+            candidate_plists=fixture.candidate_plists,
+            runner=fixture.runner,
+            runtime_verifier=forged_runtime_verifier,
+        )
+
+    assert error.value.code == "future_runtime_process_executable_hash_mismatch"
+
+
+def test_future_runtime_release_binding_revalidates_external_process(tmp_path):
+    host_repo, host_commit = _create_host_build_repo(tmp_path)
+    binding = _future_runtime_binding_fixture(
+        stage_root=tmp_path / "future-runtime-stage",
+        host_repo=host_repo,
+        host_commit=host_commit,
+    )
+    external = tmp_path / "homebrew-cellar-python"
+    external.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    external.chmod(0o755)
+    external_sha256 = hashlib.sha256(external.read_bytes()).hexdigest()
+    gateway = binding["render_manifest"]["gateway_runtime"]
+    gateway["process_executable"] = str(external)
+    gateway["process_executable_sha256"] = external_sha256
+    render_sha256 = _sha256_json(binding["render_manifest"])
+    binding["render_manifest_sha256"] = render_sha256
+    binding["future_runtime_projection"][
+        "render_manifest_sha256"
+    ] = render_sha256
+    binding["future_runtime_projection_sha256"] = _sha256_json(
+        binding["future_runtime_projection"]
+    )
+    host_component = {
+        "repo_root": str(host_repo.resolve()),
+        "commit": host_commit,
+    }
+
+    normalized = release_gate_module._normalize_future_runtime_release_binding(
+        binding,
+        host_component=host_component,
+        expected_launchd_config_sha256=LAUNCHD_CONFIG_SHA256,
+        field="test.future_runtime",
+    )
+
+    assert (
+        normalized["render_manifest"]["gateway_runtime"][
+            "process_executable"
+        ]
+        == str(external)
+    )
+    external.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    with pytest.raises(EvidenceError) as error:
+        release_gate_module._normalize_future_runtime_release_binding(
+            binding,
+            host_component=host_component,
+            expected_launchd_config_sha256=LAUNCHD_CONFIG_SHA256,
+            field="test.future_runtime",
+        )
+    assert error.value.code == "future_runtime_gateway_binding_invalid"
 
 
 @pytest.mark.parametrize("stage_dynamic_module", [True, False])

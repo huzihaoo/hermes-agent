@@ -380,7 +380,7 @@ EXTERNAL_DEPENDENCY_PROVENANCE_SCHEMA_VERSION = (
 )
 FUTURE_RUNTIME_PROJECTION_SCHEMA_VERSION = "pnc_rca_future_runtime_projection_v1"
 FUTURE_RUNTIME_RENDER_MANIFEST_SCHEMA_VERSION = (
-    "pnc_rca_future_runtime_render_manifest_v1"
+    "pnc_rca_future_runtime_render_manifest_v2"
 )
 WORKSPACE_RUNTIME_RELEASE_BINDING_SCHEMA_VERSION = (
     "pnc_rca_workspace_runtime_release_binding_v1"
@@ -12627,24 +12627,83 @@ def _normalize_future_runtime_release_binding(
     gateway_runtime = dict(
         _mapping(render.get("gateway_runtime"), f"{field}.gateway_runtime")
     )
+    if set(gateway_runtime) != {
+        "sys_executable",
+        "sys_executable_sha256",
+        "process_executable",
+        "process_executable_sha256",
+        "module_origins",
+        "module_origins_sha256",
+        "dependency_versions",
+        "repo_module_count",
+        "venv_dependency_count",
+    }:
+        raise EvidenceError("future_runtime_gateway_binding_invalid")
     gateway_origins = _mapping(
         gateway_runtime.get("module_origins"), f"{field}.gateway_runtime.module_origins"
+    )
+    normalized_gateway_origins = {
+        str(module): _required_text(
+            raw_origin, f"{field}.gateway_runtime.module_origins.{module}"
+        )
+        for module, raw_origin in sorted(gateway_origins.items())
+    }
+    gateway_sys_executable_sha256 = _sha256_digest(
+        gateway_runtime.get("sys_executable_sha256"),
+        f"{field}.gateway_runtime.sys_executable_sha256",
+    )
+    gateway_process_executable_sha256 = _sha256_digest(
+        gateway_runtime.get("process_executable_sha256"),
+        f"{field}.gateway_runtime.process_executable_sha256",
+    )
+    gateway_process_executable = (
+        _future_runtime_validate_rendered_process_executable(
+            gateway_runtime.get("process_executable"),
+            expected_sha256=gateway_process_executable_sha256,
+            interpreter_sha256=normalized_interpreter["sha256"],
+            stage_root=stage_root,
+            canonical_root=CANONICAL_FUTURE_RUNTIME_ROOT,
+            field=f"{field}.gateway_runtime.process_executable",
+        )
+    )
+    gateway_dependency_versions = dict(
+        _mapping(
+            gateway_runtime.get("dependency_versions"),
+            f"{field}.gateway_runtime.dependency_versions",
+        )
     )
     if (
         gateway_runtime.get("sys_executable")
         != str(CANONICAL_FUTURE_RUNTIME_ROOT / ".venv/bin/python")
-        or gateway_runtime.get("process_executable")
-        != str(CANONICAL_FUTURE_RUNTIME_ROOT / ".venv/bin/python")
-        or gateway_runtime.get("module_origins_sha256") != _sha256_json(gateway_origins)
+        or gateway_sys_executable_sha256 != normalized_interpreter["sha256"]
+        or gateway_runtime.get("module_origins_sha256")
+        != _sha256_json(normalized_gateway_origins)
+        or gateway_dependency_versions
+        != EXPECTED_GATEWAY_RUNTIME_DEPENDENCY_VERSIONS
+        or gateway_runtime.get("repo_module_count") != 4
+        or gateway_runtime.get("venv_dependency_count") != 2
     ):
         raise EvidenceError("future_runtime_gateway_binding_invalid")
-    for raw_origin in gateway_origins.values():
+    for raw_origin in normalized_gateway_origins.values():
         try:
             Path(_required_text(raw_origin, f"{field}.gateway_origin")).relative_to(
                 CANONICAL_FUTURE_RUNTIME_ROOT
             )
         except ValueError as exc:
             raise EvidenceError("future_runtime_gateway_binding_invalid") from exc
+    normalized_gateway_runtime = {
+        "sys_executable": str(
+            CANONICAL_FUTURE_RUNTIME_ROOT / ".venv" / "bin" / "python"
+        ),
+        "sys_executable_sha256": gateway_sys_executable_sha256,
+        "process_executable": gateway_process_executable,
+        "process_executable_sha256": gateway_process_executable_sha256,
+        "module_origins": normalized_gateway_origins,
+        "module_origins_sha256": _sha256_json(normalized_gateway_origins),
+        "dependency_versions": gateway_dependency_versions,
+        "repo_module_count": 4,
+        "venv_dependency_count": 2,
+    }
     normalized_render = {
         **dict(render),
         "runtime_file_sha256": normalized_runtime_files,
@@ -12660,7 +12719,7 @@ def _normalize_future_runtime_release_binding(
             render.get("canonical_runtime_config_sha256"),
             f"{field}.canonical_runtime_config_sha256",
         ),
-        "gateway_runtime": gateway_runtime,
+        "gateway_runtime": normalized_gateway_runtime,
     }
     render_sha256 = _sha256_digest(
         binding.get("render_manifest_sha256"), f"{field}.render_manifest_sha256"
@@ -15945,6 +16004,10 @@ def _future_runtime_project_loaded_runtime(
         "dependencies",
     }:
         raise EvidenceError("future_runtime_loaded_runtime_invalid", field)
+    process_executable_sha256 = _sha256_digest(
+        loaded.get("process_executable_sha256"),
+        f"{field}.process_executable_sha256",
+    )
     projected = {
         "sys_executable": _future_runtime_project_path(
             loaded.get("sys_executable"),
@@ -15956,17 +16019,14 @@ def _future_runtime_project_loaded_runtime(
         "sys_executable_sha256": _sha256_digest(
             loaded.get("sys_executable_sha256"), f"{field}.sys_executable_sha256"
         ),
-        "process_executable": _future_runtime_project_path(
+        "process_executable": _future_runtime_project_process_executable(
             loaded.get("process_executable"),
-            physical_root=stage_root,
+            expected_sha256=process_executable_sha256,
+            stage_root=stage_root,
             canonical_root=canonical_root,
             field=f"{field}.process_executable",
-            allow_root=False,
         ),
-        "process_executable_sha256": _sha256_digest(
-            loaded.get("process_executable_sha256"),
-            f"{field}.process_executable_sha256",
-        ),
+        "process_executable_sha256": process_executable_sha256,
     }
     dependencies = _mapping(loaded.get("dependencies"), f"{field}.dependencies")
     projected_dependencies: dict[str, dict[str, Any]] = {}
@@ -15989,6 +16049,74 @@ def _future_runtime_project_loaded_runtime(
         }
     projected["dependencies"] = projected_dependencies
     return projected
+
+
+def _future_runtime_project_process_executable(
+    value: Any,
+    *,
+    expected_sha256: str,
+    stage_root: Path,
+    canonical_root: Path,
+    field: str,
+) -> str:
+    raw_path = Path(_required_text(value, field))
+    if not raw_path.is_absolute() or ".." in raw_path.parts:
+        raise EvidenceError("future_runtime_process_executable_invalid", field)
+    try:
+        relative = raw_path.relative_to(stage_root)
+    except ValueError:
+        observed, _info = _stable_regular_file_observation(
+            raw_path,
+            artifact="future_runtime_process_executable",
+            max_bytes=128 * 1024 * 1024,
+        )
+        if hashlib.sha256(observed).hexdigest() != expected_sha256:
+            raise EvidenceError("future_runtime_process_executable_hash_mismatch")
+        return str(raw_path)
+    if not relative.parts:
+        raise EvidenceError("future_runtime_process_executable_invalid", field)
+    observed = _future_runtime_file_observation(
+        stage_root,
+        str(relative),
+        artifact="future_runtime_process_executable",
+        require_owner=True,
+    )
+    if observed["sha256"] != expected_sha256:
+        raise EvidenceError("future_runtime_process_executable_hash_mismatch")
+    return str(canonical_root / relative)
+
+
+def _future_runtime_validate_rendered_process_executable(
+    value: Any,
+    *,
+    expected_sha256: str,
+    interpreter_sha256: str,
+    stage_root: Path,
+    canonical_root: Path,
+    field: str,
+) -> str:
+    raw_path = Path(_required_text(value, field))
+    if not raw_path.is_absolute() or ".." in raw_path.parts:
+        raise EvidenceError("future_runtime_gateway_binding_invalid")
+    canonical_interpreter = canonical_root / ".venv" / "bin" / "python"
+    if raw_path == canonical_interpreter:
+        if expected_sha256 != interpreter_sha256:
+            raise EvidenceError("future_runtime_gateway_binding_invalid")
+        return str(raw_path)
+    for forbidden_root in (stage_root, canonical_root):
+        try:
+            raw_path.relative_to(forbidden_root)
+        except ValueError:
+            continue
+        raise EvidenceError("future_runtime_gateway_binding_invalid")
+    observed, _info = _stable_regular_file_observation(
+        raw_path,
+        artifact="future_runtime_rendered_process_executable",
+        max_bytes=128 * 1024 * 1024,
+    )
+    if hashlib.sha256(observed).hexdigest() != expected_sha256:
+        raise EvidenceError("future_runtime_gateway_binding_invalid")
+    return str(raw_path)
 
 
 def _future_runtime_dependency_observations(
@@ -16030,6 +16158,7 @@ def _future_runtime_project_service_dependencies(
     *,
     stage_root: Path,
     canonical_root: Path,
+    process_executable_sha256: str,
 ) -> dict[str, Any]:
     dependencies = _mapping(value, "future_runtime.service_dependencies")
     projected = json.loads(_canonical_json(dependencies))
@@ -16038,12 +16167,14 @@ def _future_runtime_project_service_dependencies(
             raise EvidenceError("future_runtime_service_dependencies_invalid")
         feishu = service.get("feishu_outbound")
         if isinstance(feishu, dict) and "python_executable" in feishu:
-            feishu["python_executable"] = _future_runtime_project_path(
-                feishu["python_executable"],
-                physical_root=stage_root,
-                canonical_root=canonical_root,
-                field="future_runtime.feishu.python_executable",
-                allow_root=False,
+            feishu["python_executable"] = (
+                _future_runtime_project_process_executable(
+                    feishu["python_executable"],
+                    expected_sha256=process_executable_sha256,
+                    stage_root=stage_root,
+                    canonical_root=canonical_root,
+                    field="future_runtime.feishu.python_executable",
+                )
             )
     return projected
 
@@ -16180,10 +16311,7 @@ def project_future_candidate_runtime(
     )
     if (
         loaded_runtime.get("sys_executable") != interpreter_observation["path"]
-        or loaded_runtime.get("process_executable") != interpreter_observation["path"]
         or loaded_runtime.get("sys_executable_sha256")
-        != interpreter_observation["sha256"]
-        or loaded_runtime.get("process_executable_sha256")
         != interpreter_observation["sha256"]
     ):
         raise EvidenceError("future_runtime_interpreter_projection_invalid")
@@ -16204,6 +16332,11 @@ def project_future_candidate_runtime(
     service_processes = _mapping(
         runtime_detail.get("service_processes"), "future_runtime.service_processes"
     )
+    expected_service_labels = {
+        label for label, _script in CANDIDATE_SERVICES.values()
+    }
+    if set(service_processes) != expected_service_labels:
+        raise EvidenceError("future_runtime_service_process_set_invalid")
     projected_loaded_runtime = _future_runtime_project_loaded_runtime(
         loaded_runtime,
         stage_root=stage_root,
@@ -16213,9 +16346,37 @@ def project_future_candidate_runtime(
     projected_processes: dict[str, dict[str, Any]] = {}
     for label, raw_process in sorted(service_processes.items()):
         process = dict(_mapping(raw_process, f"future_runtime.processes.{label}"))
+        raw_process_loaded_runtime = _mapping(
+            process.get("loaded_runtime"),
+            f"future_runtime.processes.{label}.loaded_runtime",
+        )
+        expected_process_loaded_runtime = {
+            **{
+                key: loaded_runtime[key]
+                for key in (
+                    "sys_executable",
+                    "sys_executable_sha256",
+                    "process_executable",
+                    "process_executable_sha256",
+                )
+            },
+            "dependencies": {
+                distribution: loaded_runtime["dependencies"][distribution]
+                for distribution in sorted(
+                    RCA_LOADED_DEPENDENCIES_BY_SERVICE[label]
+                )
+            },
+        }
+        if (
+            raw_process_loaded_runtime != expected_process_loaded_runtime
+            or process.get("interpreter")
+            != raw_process_loaded_runtime.get("sys_executable")
+            or process.get("runtime_executable")
+            != raw_process_loaded_runtime.get("process_executable")
+        ):
+            raise EvidenceError("future_runtime_process_loaded_runtime_mismatch", label)
         for field in (
             "interpreter",
-            "runtime_executable",
             "script",
             "working_directory",
             "candidate_plist_path",
@@ -16242,11 +16403,14 @@ def project_future_candidate_runtime(
             field=f"future_runtime.processes.{label}.environment",
         )
         process["loaded_runtime"] = _future_runtime_project_loaded_runtime(
-            process.get("loaded_runtime"),
+            raw_process_loaded_runtime,
             stage_root=stage_root,
             canonical_root=canonical_root,
             field=f"future_runtime.processes.{label}.loaded_runtime",
         )
+        process["runtime_executable"] = process["loaded_runtime"][
+            "process_executable"
+        ]
         process["loaded_runtime_sha256"] = _sha256_json(process["loaded_runtime"])
         filename = next(
             name for name, contract in CANDIDATE_SERVICES.items() if contract[0] == label
@@ -16257,6 +16421,9 @@ def project_future_candidate_runtime(
         runtime_detail.get("service_dependencies"),
         stage_root=stage_root,
         canonical_root=canonical_root,
+        process_executable_sha256=projected_loaded_runtime[
+            "process_executable_sha256"
+        ],
     )
     gateway_checker = gateway_runtime_verifier or _gateway_interpreter_runtime_probe
     gateway_runtime = dict(
@@ -16267,14 +16434,37 @@ def project_future_candidate_runtime(
             runner=runner,
         )
     )
+    gateway_sys_executable_sha256 = _sha256_digest(
+        gateway_runtime.get("sys_executable_sha256"),
+        "future_runtime.gateway.sys_executable_sha256",
+    )
+    gateway_process_executable_sha256 = _sha256_digest(
+        gateway_runtime.get("process_executable_sha256"),
+        "future_runtime.gateway.process_executable_sha256",
+    )
     if (
         gateway_runtime.get("sys_executable") != interpreter_observation["path"]
-        or gateway_runtime.get("process_executable") != interpreter_observation["path"]
+        or gateway_sys_executable_sha256 != interpreter_observation["sha256"]
+        or gateway_runtime.get("process_executable")
+        != loaded_runtime.get("process_executable")
+        or gateway_process_executable_sha256
+        != loaded_runtime.get("process_executable_sha256")
     ):
         raise EvidenceError("future_runtime_gateway_interpreter_invalid")
+    projected_gateway_process_executable = (
+        _future_runtime_project_process_executable(
+            gateway_runtime.get("process_executable"),
+            expected_sha256=gateway_process_executable_sha256,
+            stage_root=stage_root,
+            canonical_root=canonical_root,
+            field="future_runtime.gateway.process_executable",
+        )
+    )
     gateway_origins = _mapping(
         gateway_runtime.get("module_origins"), "future_runtime.gateway.module_origins"
     )
+    if gateway_runtime.get("module_origins_sha256") != _sha256_json(gateway_origins):
+        raise EvidenceError("future_runtime_gateway_origin_hash_invalid")
     projected_gateway_origins: dict[str, str] = {}
     for module, raw_origin in sorted(gateway_origins.items()):
         origin = Path(_required_text(raw_origin, f"future_runtime.gateway.{module}"))
@@ -16362,9 +16552,9 @@ def project_future_candidate_runtime(
         "gateway_runtime": {
             **gateway_runtime,
             "sys_executable": str(canonical_root / ".venv" / "bin" / "python"),
-            "process_executable": str(
-                canonical_root / ".venv" / "bin" / "python"
-            ),
+            "sys_executable_sha256": gateway_sys_executable_sha256,
+            "process_executable": projected_gateway_process_executable,
+            "process_executable_sha256": gateway_process_executable_sha256,
             "module_origins": projected_gateway_origins,
             "module_origins_sha256": _sha256_json(projected_gateway_origins),
         },
@@ -23043,13 +23233,36 @@ print(json.dumps({
             origin.relative_to(virtual_env)
         except (OSError, ValueError) as exc:
             raise EvidenceError("manual_gateway_runtime_dependency_origin_mismatch") from exc
-    return {
-        "sys_executable": _required_text(
+    sys_executable = Path(
+        _required_text(
             body.get("sys_executable"), "gateway_interpreter.sys_executable"
-        ),
-        "process_executable": _required_text(
-            body.get("process_executable"), "gateway_interpreter.process_executable"
-        ),
+        )
+    )
+    process_executable = Path(
+        _required_text(
+            body.get("process_executable"),
+            "gateway_interpreter.process_executable",
+        )
+    )
+    sys_executable_raw, _sys_executable_info = _stable_regular_file_observation(
+        sys_executable,
+        artifact="manual_gateway_runtime_sys_executable",
+        max_bytes=128 * 1024 * 1024,
+    )
+    process_executable_raw, _process_executable_info = (
+        _stable_regular_file_observation(
+            process_executable,
+            artifact="manual_gateway_runtime_process_executable",
+            max_bytes=128 * 1024 * 1024,
+        )
+    )
+    return {
+        "sys_executable": str(sys_executable),
+        "sys_executable_sha256": hashlib.sha256(sys_executable_raw).hexdigest(),
+        "process_executable": str(process_executable),
+        "process_executable_sha256": hashlib.sha256(
+            process_executable_raw
+        ).hexdigest(),
         "module_origins_sha256": _sha256_json(origins),
         "module_origins": dict(origins),
         "dependency_versions": dict(versions),

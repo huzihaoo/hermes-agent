@@ -263,9 +263,16 @@ def _runtime_detail(host: Path, stage: Path, *, host_commit: str) -> dict:
         "canonical_runtime_config_sha256": LAUNCHD_SHA256,
         "gateway_runtime": {
             "sys_executable": str(canonical_interpreter),
+            "sys_executable_sha256": interpreter_sha256,
             "process_executable": str(canonical_interpreter),
+            "process_executable_sha256": interpreter_sha256,
             "module_origins": gateway_origins,
             "module_origins_sha256": prepare._sha256_json(gateway_origins),
+            "dependency_versions": dict(
+                release_gate.EXPECTED_GATEWAY_RUNTIME_DEPENDENCY_VERSIONS
+            ),
+            "repo_module_count": 4,
+            "venv_dependency_count": 2,
         },
     }
     render_manifest_sha256 = prepare._sha256_json(render_manifest)
