@@ -804,6 +804,30 @@ def test_prepare_emits_gate_valid_plan_without_live_side_effects(prepared_fixtur
     assert b"super-secret-value" not in all_output
 
 
+def test_redaction_distinguishes_structural_file_names_from_secret_fields():
+    descriptor = {
+        "path": "agent/credential_persistence.py",
+        "sha256": "a" * 64,
+    }
+    evidence = {
+        "runtime_file_descriptors": {
+            descriptor["path"]: descriptor,
+        },
+        "runtime_file_sha256": {
+            descriptor["path"]: descriptor["sha256"],
+        },
+    }
+
+    prepare._assert_redacted(evidence, sensitive_values=())
+
+    with pytest.raises(prepare.ReleasePrepareError) as error:
+        prepare._assert_redacted(
+            {"runtime_file_descriptors": {"credential": "configured"}},
+            sensitive_values=(),
+        )
+    assert error.value.code == "release_prepare_sensitive_key_present"
+
+
 def test_prepare_resume_is_byte_stable_and_no_clobber(prepared_fixture):
     first, _calls = _prepare(prepared_fixture)
     before = {

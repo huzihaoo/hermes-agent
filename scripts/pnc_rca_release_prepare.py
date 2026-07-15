@@ -1221,6 +1221,35 @@ def _sensitive_env_values(path: Path, *, raw: bytes | None = None) -> tuple[str,
     return tuple(sorted(set(result), key=len, reverse=True))
 
 
+def _is_structural_file_identifier(
+    path: tuple[str, ...],
+    key: str,
+    child: Any,
+) -> bool:
+    if not path or path[-1] not in {
+        "runtime_file_descriptors",
+        "runtime_file_sha256",
+        "files",
+    }:
+        return False
+    parsed = PurePosixPath(key)
+    if (
+        parsed.is_absolute()
+        or not parsed.parts
+        or str(parsed) != key
+        or any(part in {"", ".", ".."} for part in parsed.parts)
+    ):
+        return False
+    if isinstance(child, Mapping) and child.get("path") == key:
+        return True
+    return (
+        path[-1] == "runtime_file_sha256"
+        and isinstance(child, str)
+        and SHA256_PATTERN.fullmatch(child) is not None
+        and ("/" in key or bool(parsed.suffix))
+    )
+
+
 def _assert_redacted(value: Any, *, sensitive_values: Sequence[str]) -> None:
     def visit(item: Any, path: tuple[str, ...]) -> None:
         if isinstance(item, Mapping):
@@ -1231,6 +1260,7 @@ def _assert_redacted(value: Any, *, sensitive_values: Sequence[str]) -> None:
                     or key.endswith("_configured")
                     or key.endswith("_count")
                     or key in {"authentication_method"}
+                    or _is_structural_file_identifier(path, key, child)
                 ):
                     raise ReleasePrepareError(
                         "release_prepare_sensitive_key_present", ".".join((*path, key))
