@@ -13115,6 +13115,7 @@ def validate_release_prepare_approval_binding(
     approval_receipt: Mapping[str, Any],
     approval_receipt_sha256: str,
     final_manifest_schema_version: str,
+    require_fresh_request: bool = True,
     now: datetime | None = None,
     machine_identity_observer: Callable[[], Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -13156,7 +13157,9 @@ def validate_release_prepare_approval_binding(
     request_age = (current - request_created_at).total_seconds()
     if request_age < -RELEASE_APPROVAL_MAX_FUTURE_SKEW_SECONDS:
         raise EvidenceError("release_approval_request_from_future")
-    if request_age > DEFAULT_EVIDENCE_MAX_AGE_SECONDS:
+    if not isinstance(require_fresh_request, bool):
+        raise EvidenceError("release_approval_request_freshness_policy_invalid")
+    if require_fresh_request and request_age > DEFAULT_EVIDENCE_MAX_AGE_SECONDS:
         raise EvidenceError("release_approval_request_stale")
     if (
         request.get("production_effects_executed") is not False

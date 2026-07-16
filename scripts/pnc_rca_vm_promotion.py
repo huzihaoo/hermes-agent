@@ -254,6 +254,7 @@ def _default_release_binding(
             final_manifest_schema_version=(
                 release_gate.RELEASE_PREPARE_FINAL_MANIFEST_SCHEMA_VERSION
             ),
+            require_fresh_request=False,
             now=now,
             machine_identity_observer=lambda: machine,
         )

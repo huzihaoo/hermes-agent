@@ -4,6 +4,7 @@ import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -163,6 +164,74 @@ def test_build_plan_binds_bom_candidates_live_prestate_and_helper(fixture):
         inputs.vm_topic_extractor_sha256
     )
     assert inputs.plan_path.is_file()
+
+
+def test_finalized_release_binding_uses_receipt_validity_not_request_freshness(
+    fixture,
+    monkeypatch,
+):
+    inputs, _binding = fixture
+    bom = {"components": {}}
+    bom_sha256 = promotion._sha256_json(bom)
+    approval_sha256 = "c" * 64
+    manifest = {
+        "schema_version": (
+            promotion.release_prepare.RELEASE_PREPARE_MANIFEST_SCHEMA_VERSION
+        ),
+        "complete": True,
+        "plan_only": True,
+        "release_id": "rca-release-20260716",
+        "release_bom_sha256": bom_sha256,
+        "approval_receipt_sha256": approval_sha256,
+    }
+    request = {
+        "bindings": {
+            "release_bom": bom,
+            "release_bom_sha256": bom_sha256,
+        }
+    }
+    approval = {"expires_at": (NOW + timedelta(hours=1)).isoformat()}
+    artifacts = {
+        "vm_promotion_release_manifest": SimpleNamespace(
+            path=inputs.release_prepare_manifest,
+            body=manifest,
+            sha256="a" * 64,
+        ),
+        "vm_promotion_release_request": SimpleNamespace(
+            path=inputs.release_prepare_manifest.parent / "approval_request.json",
+            body=request,
+            sha256="b" * 64,
+        ),
+        "vm_promotion_release_approval": SimpleNamespace(
+            path=inputs.release_approval_receipt,
+            body=approval,
+            sha256=approval_sha256,
+        ),
+    }
+    monkeypatch.setattr(
+        promotion.cutover,
+        "_read_owned_json",
+        lambda _path, *, artifact: artifacts[artifact],
+    )
+    machine = {"fixture": "machine"}
+    monkeypatch.setattr(promotion, "_machine_identity", lambda: machine)
+    observed = {}
+
+    def validate(**kwargs):
+        observed.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        promotion.release_gate,
+        "validate_release_prepare_approval_binding",
+        validate,
+    )
+
+    result = promotion._default_release_binding(inputs, NOW)
+
+    assert observed["require_fresh_request"] is False
+    assert result["release_bom_sha256"] == bom_sha256
+    assert result["release_approval_receipt_sha256"] == approval_sha256
 
 
 def test_apply_requires_second_approval_and_publishes_remote_receipt(fixture):

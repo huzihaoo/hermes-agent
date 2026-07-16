@@ -10862,6 +10862,7 @@ def _validate_release_approval_fixture(fixture, **overrides):
             "final_schema",
             release_gate_module.RELEASE_PREPARE_FINAL_MANIFEST_SCHEMA_VERSION,
         ),
+        require_fresh_request=overrides.get("require_fresh_request", True),
         now=NOW,
         machine_identity_observer=lambda: overrides.get(
             "machine_identity", fixture.machine_identity
@@ -10886,6 +10887,44 @@ def test_release_approval_binding_accepts_exact_request_receipt_pair(tmp_path):
             release_gate_module.RELEASE_PREPARE_FINAL_MANIFEST_SCHEMA_VERSION
         ),
     }
+
+
+def test_release_approval_binding_allows_stale_request_only_after_finalize(
+    tmp_path,
+):
+    fixture = _release_approval_binding_fixture(tmp_path)
+    request = json.loads(json.dumps(fixture.request))
+    request["created_at"] = (
+        NOW
+        - timedelta(
+            seconds=release_gate_module.DEFAULT_EVIDENCE_MAX_AGE_SECONDS + 1
+        )
+    ).isoformat()
+    request_sha256 = release_gate_module._release_prepare_file_sha256(request)
+    receipt = json.loads(json.dumps(fixture.receipt))
+    receipt["approval_request_sha256"] = request_sha256
+    receipt_sha256 = release_gate_module._release_prepare_file_sha256(receipt)
+
+    with pytest.raises(EvidenceError) as error:
+        _validate_release_approval_fixture(
+            fixture,
+            request=request,
+            request_sha256=request_sha256,
+            receipt=receipt,
+            receipt_sha256=receipt_sha256,
+        )
+    assert error.value.code == "release_approval_request_stale"
+
+    result = _validate_release_approval_fixture(
+        fixture,
+        request=request,
+        request_sha256=request_sha256,
+        receipt=receipt,
+        receipt_sha256=receipt_sha256,
+        require_fresh_request=False,
+    )
+
+    assert result["ok"] is True
 
 
 def test_release_approval_binding_revalidates_staged_runtime(
