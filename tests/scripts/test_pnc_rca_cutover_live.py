@@ -530,3 +530,77 @@ def test_launchd_controller_stops_exact_writer_set_and_writes_receipt(tmp_path) 
     assert [call[2].rsplit("/", 1)[-1] for call in bootouts] == list(
         cutover.WRITER_LABELS
     )
+
+
+def test_launchd_controller_waits_for_async_bootout_and_process_exit(tmp_path) -> None:
+    jobs = {
+        label: {
+            "loaded": True,
+            "state": "running",
+            "pid": 300 + index,
+            "last_exit_status": None,
+        }
+        for index, label in enumerate(cutover.WRITER_LABELS)
+    }
+
+    class DelayedRunner(FakeRunner):
+        def __init__(self, delayed_jobs: dict[str, dict]) -> None:
+            super().__init__(delayed_jobs)
+            self.pending: dict[str, int] = {}
+
+        def run(self, argv) -> adapter.CommandResult:
+            command = tuple(argv)
+            if command[1] == "bootout":
+                self.calls.append(command)
+                self.pending[command[2].rsplit("/", 1)[-1]] = 2
+                return adapter.CommandResult(command, 0)
+            if command[1] == "print":
+                label = command[2].rsplit("/", 1)[-1]
+                if label in self.pending:
+                    remaining = self.pending[label]
+                    if remaining == 0:
+                        self.jobs[label].update(
+                            loaded=False,
+                            pid=None,
+                            state="absent",
+                        )
+                        del self.pending[label]
+                    else:
+                        self.pending[label] = remaining - 1
+            return super().run(command)
+
+    runner = DelayedRunner(jobs)
+    collector_calls = 0
+
+    class ProcessStillRunning(ValueError):
+        code = "writer_stop_process_still_running"
+
+    def collect() -> dict:
+        nonlocal collector_calls
+        collector_calls += 1
+        if collector_calls < 3:
+            raise ProcessStillRunning
+        return {"schema_version": "pnc_rca_writer_stop_evidence_v1"}
+
+    controller = live.LaunchdServiceController(
+        evidence_root=tmp_path / "evidence",
+        target_runtime_root=tmp_path / "runtime",
+        launch_agents_root=tmp_path / "LaunchAgents",
+        runner=runner,
+        writer_stop_collector=collect,
+        receipt_writer=lambda path, body: _write(
+            path,
+            (json.dumps(body, sort_keys=True) + "\n").encode(),
+        ),
+        sleeper=lambda _seconds: None,
+    )
+
+    result = controller.stop_writers(
+        cutover.WRITER_LABELS,
+        lease_fingerprint="b" * 64,
+        lease_token="fixture-lease-token-0001",
+    )
+
+    assert Path(result["receipt_path"]).is_file()
+    assert collector_calls == 3
+    assert all(not job["loaded"] for job in jobs.values())

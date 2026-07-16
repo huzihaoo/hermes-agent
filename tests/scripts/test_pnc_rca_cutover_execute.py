@@ -374,6 +374,44 @@ def test_authorized_session_restores_old_services_before_engine_intent(session):
     assert session.lease.closed is True
 
 
+def test_authorized_session_restores_host_when_vm_rollback_receipt_fails(session):
+    session.monkeypatch.setattr(
+        executor.feishu_hold,
+        "build_cutover_binding",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("binding rejected")
+        ),
+    )
+
+    def rollback_failed(*_args, **_kwargs):
+        session.events.append("promotion:rollback-failed")
+        raise RuntimeError("remote receipt unavailable")
+
+    session.monkeypatch.setattr(
+        executor.vm_promotion,
+        "rollback_promotion",
+        rollback_failed,
+    )
+
+    with pytest.raises(executor.CutoverExecutorError) as error:
+        executor.run_authorized_cutover_session(
+            session.inputs,
+            authorization_decision=executor.SESSION_AUTHORIZATION_DECISION,
+            operator="release-owner",
+            reason="approved release window",
+            clock=lambda: NOW,
+            machine_identity_provider=lambda: MACHINE_IDENTITY,
+            runner=object(),
+        )
+
+    assert error.value.code == "cutover_session_vm_promotion_rollback_failed"
+    assert session.preparation.restored is True
+    assert session.events.index("promotion:rollback-failed") < session.events.index(
+        "restore:preparation"
+    )
+    assert session.lease.closed is True
+
+
 def test_promotion_binding_is_validated_before_cutover_lease(session):
     invalid = vm_promotion.VmPromotionInputs(
         **{

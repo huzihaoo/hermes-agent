@@ -11,6 +11,7 @@ from pathlib import Path
 import plistlib
 import re
 import stat
+import time
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 import psutil
@@ -28,6 +29,8 @@ LIVE_SERVICE_STATE_SCHEMA_VERSION = cutover_guard.LIVE_SERVICE_STATE_SCHEMA_VERS
 LIVE_IDENTITY_SCHEMA_VERSION = "pnc_rca_projected_live_identity_v1"
 WRITER_STOP_FILENAME = "adapter-writer-stop-evidence.json"
 MAX_LAUNCHCTL_OUTPUT_BYTES = 4 * 1024 * 1024
+WRITER_STOP_TIMEOUT_SECONDS = 15.0
+WRITER_STOP_POLL_SECONDS = 0.1
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 
 
@@ -113,6 +116,8 @@ class LaunchdServiceController:
             write_receipt_atomic
         ),
         precutover_service_state: Mapping[str, Any] | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         self._evidence_root = evidence_root.expanduser().absolute()
         self._target_runtime_root = target_runtime_root.expanduser().absolute()
@@ -121,6 +126,8 @@ class LaunchdServiceController:
         self._process_factory = process_factory
         self._writer_stop_collector = writer_stop_collector
         self._receipt_writer = receipt_writer
+        self._monotonic = monotonic
+        self._sleeper = sleeper
         self._precutover_service_state = (
             json.loads(json.dumps(precutover_service_state))
             if precutover_service_state is not None
@@ -245,6 +252,7 @@ class LaunchdServiceController:
         )
         if not isinstance(lease_token, str) or len(lease_token) < 16:
             raise LiveBoundaryError("cutover_live_lease_token_invalid")
+        deadline = self._monotonic() + WRITER_STOP_TIMEOUT_SECONDS
         for label in normalized:
             if self._job(label)["loaded"]:
                 result = self._run(
@@ -252,9 +260,22 @@ class LaunchdServiceController:
                 )
                 if result.returncode != 0:
                     raise LiveBoundaryError("cutover_live_writer_bootout_failed")
-            if self._job(label)["loaded"]:
-                raise LiveBoundaryError("cutover_live_writer_still_loaded")
-        evidence = self._writer_stop_collector()
+            while self._job(label)["loaded"]:
+                if self._monotonic() >= deadline:
+                    raise LiveBoundaryError("cutover_live_writer_still_loaded")
+                self._sleeper(WRITER_STOP_POLL_SECONDS)
+        while True:
+            try:
+                evidence = self._writer_stop_collector()
+                break
+            except ValueError as exc:
+                if getattr(exc, "code", "") != "writer_stop_process_still_running":
+                    raise
+                if self._monotonic() >= deadline:
+                    raise LiveBoundaryError(
+                        "cutover_live_writer_process_still_running"
+                    ) from exc
+                self._sleeper(WRITER_STOP_POLL_SECONDS)
         self._evidence_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._evidence_root.chmod(0o700)
         receipt = self._evidence_root / WRITER_STOP_FILENAME

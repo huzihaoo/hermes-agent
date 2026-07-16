@@ -520,7 +520,9 @@ def run_authorized_cutover_session(
         }
         cutover._publish_no_clobber(inputs.session_receipt, receipt)
         return receipt
-    except Exception:
+    except Exception as primary_exc:
+        vm_rollback_exc: Exception | None = None
+        host_restore_exc: Exception | None = None
         if promotion_applied and not host_cutover_complete:
             try:
                 vm_promotion.rollback_promotion(
@@ -529,13 +531,22 @@ def run_authorized_cutover_session(
                     now=current_time(),
                 )
             except Exception as rollback_exc:
-                raise CutoverExecutorError(
-                    "cutover_session_vm_promotion_rollback_failed"
-                ) from rollback_exc
+                vm_rollback_exc = rollback_exc
         if precutover_services is not None and not _has_mutating_intent(
             inputs.journal_root
         ):
-            preparation_services.restore_state(precutover_services)
+            try:
+                preparation_services.restore_state(precutover_services)
+            except Exception as restore_exc:
+                host_restore_exc = restore_exc
+        if host_restore_exc is not None:
+            raise CutoverExecutorError(
+                "cutover_session_host_restore_failed"
+            ) from primary_exc
+        if vm_rollback_exc is not None:
+            raise CutoverExecutorError(
+                "cutover_session_vm_promotion_rollback_failed"
+            ) from primary_exc
         raise
     finally:
         lease.close()
