@@ -58,7 +58,9 @@ APPLY_MANIFEST_FILENAME = "feishu_ingress_hold_manifest.json"
 RUN_IDENTITY_FILENAME = "run_identity.json"
 RUN_LOCK_FILENAME = ".ingress-hold.lock"
 
-ADAPTER_RELATIVE_PATH = "gateway/platforms/feishu.py"
+# Hermes 0.18.2 keeps the historical gateway module as a compatibility alias.
+# Bind the hold contract to the committed implementation that owns the sidecar.
+ADAPTER_RELATIVE_PATH = "plugins/platforms/feishu/adapter.py"
 DEFAULT_CANONICAL_GATEWAY_ROOT = Path("/Users/songying/.hermes/runtime/hermes-live")
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 MAX_FILE_BYTES = 20 * 1024 * 1024

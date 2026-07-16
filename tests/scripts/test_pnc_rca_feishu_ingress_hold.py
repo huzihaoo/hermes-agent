@@ -80,10 +80,16 @@ def _host_repo(path: Path) -> Path:
         '_API_POLL_SIDECAR_SCHEMA = "feishu_api_poll_state_v1"\n',
         encoding="utf-8",
     )
+    alias = path / "gateway/platforms/feishu.py"
+    alias.parent.mkdir(parents=True)
+    alias.write_text(
+        "from plugins.platforms.feishu import adapter as _adapter\n",
+        encoding="utf-8",
+    )
     _git(path, "init", "-q")
     _git(path, "config", "user.email", "test@example.invalid")
     _git(path, "config", "user.name", "Ingress Hold Test")
-    _git(path, "add", hold.ADAPTER_RELATIVE_PATH)
+    _git(path, "add", hold.ADAPTER_RELATIVE_PATH, "gateway/platforms/feishu.py")
     _git(path, "commit", "-qm", "fixture")
     return path
 
@@ -446,6 +452,20 @@ def test_plan_is_read_only_owner_only_and_binds_exact_inputs(setup: SimpleNamesp
         (CHAT_A, 2_000_000_000_000, 25, 10),
         (CHAT_B, 2_000_000_000_000, 25, 10),
     ]
+
+
+def test_host_identity_binds_plugin_implementation_behind_gateway_alias(
+    setup: SimpleNamespace,
+) -> None:
+    identity = hold._host_adapter_identity(setup.repo)
+
+    assert identity["adapter_relative_path"] == (
+        "plugins/platforms/feishu/adapter.py"
+    )
+    assert identity["adapter_sidecar_schema"] == hold._API_POLL_SIDECAR_SCHEMA
+    assert identity["adapter_sha256"] == hashlib.sha256(
+        (setup.repo / hold.ADAPTER_RELATIVE_PATH).read_bytes()
+    ).hexdigest()
 
 
 def test_repeated_plan_reuses_exact_snapshot_without_refetch(setup: SimpleNamespace) -> None:
