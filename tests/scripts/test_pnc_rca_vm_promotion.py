@@ -357,7 +357,10 @@ def test_apply_requires_second_approval_and_publishes_remote_receipt(fixture):
             "release_id": binding["release_id"],
             "promotion_receipt_sha256": remote_receipt["receipt_sha256"],
             "components": [{"name": "vm_worker"}, {"name": "vm"}],
-            "service_restored": plan["prestate"]["service"],
+            "service_restored": {
+                **plan["prestate"]["service"],
+                "main_pid": 42002,
+            },
             "production_effects_executed": True,
             "rollback_complete": True,
             "receipt_path": inputs.remote_work_root
@@ -375,6 +378,49 @@ def test_apply_requires_second_approval_and_publishes_remote_receipt(fixture):
 
     assert rollback["rollback_complete"] is True
     assert inputs.rollback_receipt_path.is_file()
+
+
+def test_remote_rollback_rejects_service_state_drift(fixture):
+    inputs, binding = fixture
+    plan = promotion.build_plan(
+        inputs,
+        release_binding_provider=lambda _inputs, _now: binding,
+        remote_runner=lambda request: _observation(request),
+        now=NOW,
+    )
+    remote_receipt = {
+        "receipt_sha256": "f" * 64,
+    }
+    result = {
+        "schema_version": remote.ROLLBACK_RECEIPT_SCHEMA_VERSION,
+        "ok": True,
+        "release_id": binding["release_id"],
+        "promotion_receipt_sha256": remote_receipt["receipt_sha256"],
+        "components": [{"name": "vm_worker"}, {"name": "vm"}],
+        "service_restored": {
+            **plan["prestate"]["service"],
+            "active": False,
+            "active_state": "inactive",
+            "main_pid": 0,
+        },
+        "production_effects_executed": True,
+        "rollback_complete": True,
+        "receipt_path": (
+            inputs.remote_work_root + "/remote-rollback-receipt.json"
+        ),
+        "receipt_sha256": "a" * 64,
+    }
+
+    with pytest.raises(
+        promotion.VmPromotionError,
+        match="vm_promotion_remote_rollback_receipt_invalid",
+    ):
+        promotion._validate_remote_rollback_result(
+            result=result,
+            plan=plan,
+            inputs=inputs,
+            remote_receipt=remote_receipt,
+        )
 
 
 def test_apply_rejects_without_exact_decision_before_remote_call(fixture):

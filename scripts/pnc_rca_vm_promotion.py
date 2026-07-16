@@ -690,6 +690,30 @@ def _validate_remote_rollback_result(
     inputs: VmPromotionInputs,
     remote_receipt: Mapping[str, Any],
 ) -> None:
+    expected_service = plan.get("prestate", {}).get("service")
+    restored_service = result.get("service_restored")
+    service_matches = (
+        isinstance(expected_service, Mapping)
+        and isinstance(restored_service, Mapping)
+        and set(restored_service) == set(expected_service)
+        and {
+            key: value
+            for key, value in restored_service.items()
+            if key != "main_pid"
+        }
+        == {
+            key: value
+            for key, value in expected_service.items()
+            if key != "main_pid"
+        }
+        and not isinstance(restored_service.get("main_pid"), bool)
+        and isinstance(restored_service.get("main_pid"), int)
+        and (
+            restored_service["main_pid"] > 0
+            if restored_service.get("active") is True
+            else restored_service["main_pid"] == 0
+        )
+    )
     if (
         result.get("schema_version")
         != remote_helper.ROLLBACK_RECEIPT_SCHEMA_VERSION
@@ -702,7 +726,7 @@ def _validate_remote_rollback_result(
         or not isinstance(result.get("components"), list)
         or {item.get("name") for item in result["components"]}
         != {"vm", "vm_worker"}
-        or result.get("service_restored") != plan.get("prestate", {}).get("service")
+        or not service_matches
         or result.get("receipt_path")
         != str(
             PurePosixPath(inputs.remote_work_root) / "remote-rollback-receipt.json"

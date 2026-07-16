@@ -503,6 +503,30 @@ def test_promotion_binding_is_validated_before_cutover_lease(session):
         )
 
 
+def test_authorization_parent_is_owner_only_before_any_production_action(session):
+    session.inputs.cutover_authorization_receipt.parent.chmod(0o755)
+
+    with pytest.raises(executor.CutoverExecutorError) as error:
+        executor.run_authorized_cutover_session(
+            session.inputs,
+            authorization_decision=executor.SESSION_AUTHORIZATION_DECISION,
+            operator="release-owner",
+            reason="approved release window",
+            clock=lambda: NOW,
+            machine_identity_provider=lambda: MACHINE_IDENTITY,
+            runner=object(),
+        )
+
+    assert (
+        error.value.code
+        == "cutover_session_authorization_parent_not_owner_only"
+    )
+    assert session.phases == []
+    assert session.promotion_calls == []
+    assert session.events == []
+    assert session.lease.closed is False
+
+
 def test_owner_only_manifest_drives_read_only_cli_validation(session, capsys):
     root = session.paths["session_receipt"].parent
     runtime_root = Path("/candidate/base-runtime")

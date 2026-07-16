@@ -8,7 +8,9 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
+import stat
 from typing import Any
 
 from scripts import pnc_rca_cutover_adapter as adapter
@@ -43,6 +45,25 @@ class CutoverExecutorError(ValueError):
     def __init__(self, code: str):
         self.code = code
         super().__init__(code)
+
+
+def _require_owner_only_authorization_parent(path: Path) -> None:
+    parent = path.expanduser().absolute().parent
+    try:
+        info = parent.lstat()
+    except OSError as exc:
+        raise CutoverExecutorError(
+            "cutover_session_authorization_parent_not_owner_only"
+        ) from exc
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        raise CutoverExecutorError(
+            "cutover_session_authorization_parent_not_owner_only"
+        )
 
 
 @dataclass(frozen=True)
@@ -249,6 +270,9 @@ def run_authorized_cutover_session(
         raise CutoverExecutorError("cutover_session_operator_invalid")
     if not isinstance(reason, str) or not reason.strip():
         raise CutoverExecutorError("cutover_session_reason_invalid")
+    _require_owner_only_authorization_parent(
+        inputs.cutover_authorization_receipt
+    )
     current_time = clock or (lambda: datetime.now(timezone.utc))
     started_at = current_time()
     if started_at.tzinfo is None or started_at.utcoffset() is None:
