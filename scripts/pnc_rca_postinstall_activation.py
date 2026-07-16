@@ -51,6 +51,8 @@ class PostinstallActivationError(ValueError):
 @dataclass(frozen=True)
 class PostinstallInputs:
     candidate_python: Path
+    host_repo_root: Path
+    workspace_repo_root: Path
     control_db: Path
     evidence_dir: Path
     live_env: Path
@@ -110,6 +112,8 @@ def load_manifest(path: Path) -> PostinstallInputs:
     expected = {
         "schema_version",
         "candidate_python",
+        "host_repo_root",
+        "workspace_repo_root",
         "control_db",
         "evidence_dir",
         "live_env",
@@ -180,6 +184,10 @@ def load_manifest(path: Path) -> PostinstallInputs:
         _owner_directory(output.parent, field=field)
     return PostinstallInputs(
         candidate_python=candidate_python,
+        host_repo_root=_absolute(body.get("host_repo_root"), field="host_repo_root"),
+        workspace_repo_root=_absolute(
+            body.get("workspace_repo_root"), field="workspace_repo_root"
+        ),
         control_db=_absolute(body.get("control_db"), field="control_db"),
         evidence_dir=evidence,
         live_env=_absolute(body.get("live_env"), field="live_env"),
@@ -398,6 +406,12 @@ def _gate_argv(
         str(inputs.evidence_dir),
         "--env-file",
         str(inputs.live_env),
+        "--host-repo-root",
+        str(inputs.host_repo_root),
+        "--candidate-runtime-root",
+        str(cutover.CANONICAL_RUNTIME_ROOT),
+        "--workspace-repo-root",
+        str(inputs.workspace_repo_root),
         "--expected-topic",
         inputs.expected_topic,
         "--expected-rule-version",

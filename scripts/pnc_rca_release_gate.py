@@ -941,6 +941,7 @@ class ReleaseGateSettings:
         Path.home() / ".hermes" / "pnc_agent" / "receipts" / "g1q3_rca"
     )
     host_repo_root: Path = REPO_ROOT
+    candidate_runtime_root: Path | None = None
     workspace_repo_root: Path = DEFAULT_WORKSPACE_REPO_ROOT
     vm_repo_root: str = DEFAULT_VM_REPO_ROOT
     vm_worker_repo_root: str = DEFAULT_VM_WORKER_REPO_ROOT
@@ -959,6 +960,10 @@ class ReleaseGateSettings:
             raise ValueError("expected_topic must name one exact topic")
         if not self.expected_rule_version.strip():
             raise ValueError("expected_rule_version must not be empty")
+        if self.candidate_runtime_root is not None:
+            runtime_root = self.candidate_runtime_root.expanduser()
+            if not runtime_root.is_absolute() or ".." in runtime_root.parts:
+                raise ValueError("candidate_runtime_root must be one absolute path")
         for field_name in ("vm_repo_root", "vm_worker_repo_root"):
             raw_path = str(getattr(self, field_name) or "").strip()
             parsed_path = PurePosixPath(raw_path)
@@ -15209,6 +15214,7 @@ def _verify_resident_loaded_runtime_projection(
 def check_candidate_runtime_dependencies(
     repo_root: Path,
     *,
+    runtime_root: Path | None = None,
     runner: Any = subprocess.run,
     loaded_runtime_verifier: Any = _verify_resident_loaded_runtime_projection,
     config_environment: Mapping[str, str] | None = None,
@@ -15216,12 +15222,15 @@ def check_candidate_runtime_dependencies(
 ) -> dict[str, Any]:
     """Probe all interpreters, scripts, and clean launchd candidate environments."""
     root = repo_root.expanduser().resolve()
+    target_root = (runtime_root or root).expanduser().resolve()
+    if not target_root.is_dir():
+        raise EvidenceError("runtime_candidate_root_missing")
     try:
         runtime_file_sha256 = rca_runtime_file_hashes(root)
         runtime_files_sha256 = rca_runtime_files_sha256(root)
     except OSError as exc:
         raise EvidenceError("runtime_candidate_shared_module_missing") from exc
-    expected_interpreter = root / ".venv" / "bin" / "python"
+    expected_interpreter = target_root / ".venv" / "bin" / "python"
     candidates: dict[str, dict[str, Any]] = {}
     forbidden_python_env = {"PYTHONPATH", "PYTHONHOME", "PYTHONUSERBASE"}
     runtime_config_environment: dict[str, str] = {}
@@ -15272,14 +15281,14 @@ def check_candidate_runtime_dependencies(
             raise EvidenceError("runtime_candidate_interpreter_missing", filename)
         if interpreter != expected_interpreter:
             raise EvidenceError("runtime_candidate_interpreter_mismatch", filename)
-        expected_script = root / "scripts" / expected_script_name
+        expected_script = target_root / "scripts" / expected_script_name
         if not script.is_absolute() or not script.is_file():
             raise EvidenceError("runtime_candidate_script_missing", filename)
         if script != expected_script:
             raise EvidenceError("runtime_candidate_script_root_mismatch", filename)
         if not working_directory.is_absolute() or not working_directory.is_dir():
             raise EvidenceError("runtime_candidate_working_directory_missing", filename)
-        if working_directory != root:
+        if working_directory != target_root:
             raise EvidenceError(
                 "runtime_candidate_working_directory_mismatch", filename
             )
@@ -15542,7 +15551,7 @@ raise SystemExit(0 if payload["ok"] else 2)
     loaded_runtime, loaded_runtime_sha256 = (
         loaded_runtime_verifier(
             payload.get("loaded_runtime"),
-            virtual_env=root / ".venv",
+            virtual_env=target_root / ".venv",
             expected_sys_executable=interpreter,
             expected_process_executable=runtime_executable,
             expected_dependencies=RCA_LOADED_DEPENDENCIES,
@@ -25626,7 +25635,10 @@ def evaluate_release_gate(
         checks.fail("manual_terminal_failure_delivery", exc.code)
 
     try:
-        runtime_detail = check_candidate_runtime_dependencies(settings.host_repo_root)
+        runtime_detail = check_candidate_runtime_dependencies(
+            settings.host_repo_root,
+            runtime_root=settings.candidate_runtime_root,
+        )
         try:
             runtime_launchd_config_sha256 = _sha256_digest(
                 runtime_detail.get("launchd_config_sha256"),
@@ -29711,6 +29723,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host-contract", type=Path, default=default_host_path())
     parser.add_argument("--vm-contract", type=Path, default=default_vm_path())
     parser.add_argument("--host-repo-root", type=Path, default=REPO_ROOT)
+    parser.add_argument("--candidate-runtime-root", type=Path)
     parser.add_argument("--workspace-repo-root", type=Path)
     parser.add_argument("--vm-repo-root", default=DEFAULT_VM_REPO_ROOT)
     parser.add_argument("--vm-worker-repo-root", default=DEFAULT_VM_WORKER_REPO_ROOT)
@@ -29795,6 +29808,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 home / "pnc_agent" / "receipts" / "g1q3_rca"
             ),
             host_repo_root=args.host_repo_root.expanduser(),
+            candidate_runtime_root=(
+                args.candidate_runtime_root.expanduser()
+                if args.candidate_runtime_root is not None
+                else None
+            ),
             workspace_repo_root=(
                 args.workspace_repo_root or home / "workspace-work"
             ).expanduser(),
@@ -29835,7 +29853,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             public_config = _public_config(consumer, dispatcher, cutover)
             config_sha256 = _sha256_json(public_config)
             runtime_detail = check_candidate_runtime_dependencies(
-                settings.host_repo_root
+                settings.host_repo_root,
+                runtime_root=settings.candidate_runtime_root,
             )
             _check_candidate_service_configs(
                 runtime_detail,

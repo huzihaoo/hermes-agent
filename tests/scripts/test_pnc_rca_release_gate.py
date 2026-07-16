@@ -11173,6 +11173,53 @@ def test_candidate_runtime_probe_uses_plist_interpreter_and_clean_environment(
     assert "aiohttp" not in json.dumps(result)
 
 
+def test_candidate_runtime_probe_separates_source_and_installed_runtime(tmp_path):
+    source = tmp_path / "source"
+    runtime = tmp_path / "runtime"
+    source.mkdir()
+    runtime.mkdir()
+    _write_candidate_plists(runtime)
+    for filename in release_gate_module.CANDIDATE_SERVICES:
+        (source / filename).write_bytes((runtime / filename).read_bytes())
+    for relative in release_gate_module.RCA_RUNTIME_RELATIVE_FILES:
+        source_path = source / relative
+        runtime_path = runtime / relative
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        runtime_path.parent.mkdir(parents=True, exist_ok=True)
+        if not source_path.exists():
+            source_path.write_text("# source\n", encoding="utf-8")
+        if not runtime_path.exists():
+            runtime_path.write_bytes(source_path.read_bytes())
+    interpreter = runtime / ".venv/bin/python"
+
+    def runner(command, **_kwargs):
+        if command[1:4] == ["-I", "-B", "-c"]:
+            payload = _candidate_runtime_probe_payload(interpreter)
+        else:
+            payload = {"ok": True, "config": {}}
+            if Path(command[1]).name == "pnc_rca_delivery_collector.py":
+                payload["dependencies"] = {
+                    "remote_css_parser": dict(
+                        release_gate_module.EXPECTED_REMOTE_CSS_RUNTIME_DEPENDENCY
+                    )
+                }
+        return subprocess.CompletedProcess(
+            command, 0, stdout=json.dumps(payload), stderr=""
+        )
+
+    result = check_candidate_runtime_dependencies(
+        source,
+        runtime_root=runtime,
+        runner=runner,
+    )
+
+    assert result["python_executable"] == str(interpreter)
+    assert all(
+        process["working_directory"] == str(runtime.resolve())
+        for process in result["service_processes"].values()
+    )
+
+
 def test_candidate_runtime_config_override_is_check_only_and_redacted(tmp_path):
     interpreter, _working, expected_environment = _write_candidate_plists(tmp_path)
     secret = "candidate-only-password"

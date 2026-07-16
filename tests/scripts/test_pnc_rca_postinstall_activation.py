@@ -161,6 +161,8 @@ def scenario(tmp_path: Path):
         directory.mkdir(mode=0o700)
     inputs = postinstall.PostinstallInputs(
         candidate_python=cutover.CANONICAL_RUNTIME_ROOT / ".venv/bin/python",
+        host_repo_root=root / "host-repo",
+        workspace_repo_root=root / "workspace-repo",
         control_db=root / "control.sqlite3",
         evidence_dir=evidence,
         live_env=root / "live.env",
@@ -325,6 +327,8 @@ def test_manifest_validation_is_owner_only_and_read_only(
             "candidate_python": str(
                 cutover.CANONICAL_RUNTIME_ROOT / ".venv/bin/python"
             ),
+            "host_repo_root": str(root / "host-repo"),
+            "workspace_repo_root": str(root / "workspace-repo"),
             "control_db": str(root / "control.sqlite3"),
             "evidence_dir": str(evidence),
             "expected_rule_version": "creation-snapshot-v1",
