@@ -319,6 +319,28 @@ def test_plan_accepts_explicit_snapshot_only_kafka_policy(
     assert result.body["policy"]["kafka"]["submit_enabled"] is True
 
 
+def test_plan_accepts_disabled_manual_operator_without_user_ids(
+    fixture: SimpleNamespace,
+) -> None:
+    _rewrite_env(
+        fixture,
+        lambda raw: raw.replace(
+            "HERMES_RCA_MANUAL_OPERATOR_ENABLED=true\n",
+            "HERMES_RCA_MANUAL_OPERATOR_ENABLED=false\n",
+        ).replace(
+            "HERMES_RCA_MANUAL_OPERATOR_USER_IDS=ou_debug_operator\n",
+            "HERMES_RCA_MANUAL_OPERATOR_USER_IDS=\n",
+        ),
+    )
+    _rebind_input_env(fixture)
+
+    result = _run(fixture)
+
+    assert result.body["ok"] is True
+    assert result.body["policy"]["manual"]["operator_enabled"] is False
+    assert result.body["policy"]["manual"]["operator_user_count"] == 0
+
+
 def test_stage_preserves_credentials_unknown_keys_and_comments(
     fixture: SimpleNamespace,
 ) -> None:

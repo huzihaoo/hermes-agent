@@ -777,7 +777,10 @@ def _desired_values(
         )
         if observed != expected:
             raise ProductionEnvStageError("production_env_approved_value_mismatch")
-        if SAFE_LITERAL_PATTERN.fullmatch(expected) is None:
+        if (
+            expected
+            or key not in PASSTHROUGH_ALLOW_EMPTY_KEYS
+        ) and SAFE_LITERAL_PATTERN.fullmatch(expected) is None:
             raise ProductionEnvStageError("production_env_literal_invalid")
 
     return desired, {
