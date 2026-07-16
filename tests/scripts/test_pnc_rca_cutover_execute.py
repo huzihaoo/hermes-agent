@@ -257,6 +257,7 @@ def session(tmp_path: Path, monkeypatch):
     )
 
     def migration_drill(**kwargs):
+        assert kwargs["repo_root"] == hold_inputs.host_candidate
         _write_json(kwargs["receipt_path"], {"fixture": "migration"})
         return {"ok": True}
 

@@ -345,6 +345,7 @@ def run_authorized_cutover_session(
                 evidence_dir=store.evidence_dir,
                 writer_stop_evidence=writer_evidence,
                 receipt_path=store.migration_receipt,
+                repo_root=hold_inputs.host_candidate,
                 now=current_time(),
                 max_writer_stop_age_seconds=store.max_writer_stop_age_seconds,
             )
