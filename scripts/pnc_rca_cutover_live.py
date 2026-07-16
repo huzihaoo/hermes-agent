@@ -461,26 +461,94 @@ def _tree_component(
     paths = sorted(selected.rglob("*"), key=lambda item: item.as_posix())
     if len(paths) > adapter.MAX_TREE_FILES:
         raise LiveBoundaryError("cutover_live_tree_too_large")
+    metadata = {path: path.lstat() for path in paths}
+    inode_paths: dict[tuple[int, int], list[str]] = {}
+    for path, child in metadata.items():
+        if stat.S_ISREG(child.st_mode) and child.st_nlink > 1:
+            inode_paths.setdefault((child.st_dev, child.st_ino), []).append(
+                path.relative_to(selected).as_posix()
+            )
+    hardlink_groups: dict[str, tuple[str, ...]] = {}
+    for (device, inode), relative_paths in inode_paths.items():
+        group = tuple(sorted(relative_paths))
+        representative = metadata[selected / group[0]]
+        if len(group) != representative.st_nlink or any(
+            (
+                metadata[selected / relative].st_dev,
+                metadata[selected / relative].st_ino,
+            )
+            != (device, inode)
+            or metadata[selected / relative].st_nlink != len(group)
+            for relative in group
+        ):
+            raise LiveBoundaryError(
+                "cutover_live_tree_external_hardlink_forbidden"
+            )
+        for relative in group:
+            hardlink_groups[relative] = group
     for path in paths:
-        child = path.lstat()
+        child = metadata[path]
+        relative = path.relative_to(selected).as_posix()
         if stat.S_ISLNK(child.st_mode):
-            raise LiveBoundaryError("cutover_live_tree_symlink_forbidden")
+            if child.st_uid != os.geteuid():
+                raise LiveBoundaryError("cutover_live_tree_symlink_invalid")
+            try:
+                target = os.readlink(path)
+            except OSError as exc:
+                raise LiveBoundaryError(
+                    "cutover_live_tree_symlink_invalid"
+                ) from exc
+            target_raw = os.fsencode(target)
+            if not target_raw or len(target_raw) > 16 * 1024:
+                raise LiveBoundaryError("cutover_live_tree_symlink_invalid")
+            actual[relative] = {
+                "kind": "symlink",
+                "target": target,
+                "target_sha256": hashlib.sha256(target_raw).hexdigest(),
+            }
+            continue
         if stat.S_ISDIR(child.st_mode):
             if child.st_uid != os.geteuid() or stat.S_IMODE(child.st_mode) & 0o022:
                 raise LiveBoundaryError("cutover_live_tree_directory_invalid")
             continue
         if not stat.S_ISREG(child.st_mode):
             raise LiveBoundaryError("cutover_live_tree_special_file_forbidden")
-        observed = adapter._read_stable_owner_file(path)
-        actual[path.relative_to(selected).as_posix()] = {
+        group = hardlink_groups.get(relative)
+        observed = adapter._read_stable_owner_file(
+            path,
+            allowed_link_counts=frozenset({len(group) if group else 1}),
+        )
+        entry: dict[str, Any] = {
             "sha256": observed.sha256,
             "size_bytes": len(observed.raw),
             "mode": f"{observed.mode:04o}",
         }
+        if group is not None:
+            if relative == group[0]:
+                entry["hardlink_group"] = {
+                    "primary": group[0],
+                    "paths": list(group),
+                    "link_count": len(group),
+                }
+            else:
+                entry = {
+                    "kind": "hardlink",
+                    "primary": group[0],
+                    "sha256": observed.sha256,
+                    "size_bytes": len(observed.raw),
+                    "mode": f"{observed.mode:04o}",
+                    "link_count": len(group),
+                }
+        actual[relative] = entry
     exact = set(actual) == set(expected)
     if exact:
         for relative, expected_entry in expected.items():
             item = actual[relative]
+            if item.get("kind") in {"symlink", "hardlink"} or item.get(
+                "hardlink_group"
+            ) != expected_entry.get("hardlink_group"):
+                exact = False
+                break
             if item["sha256"] != expected_entry.get("sha256"):
                 exact = False
                 break

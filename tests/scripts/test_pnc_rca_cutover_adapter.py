@@ -1267,6 +1267,175 @@ def test_tree_snapshot_restores_root_and_empty_directory_modes(candidate):
     assert stat.S_IMODE(empty.stat().st_mode) == 0o710
 
 
+def _tree_snapshot_with_legacy_symlinks(candidate):
+    runtime = candidate.physical(str(cutover.CANONICAL_RUNTIME_ROOT))
+    runtime.mkdir(mode=0o750)
+    external = candidate.physical("/external-venv")
+    external.mkdir(mode=0o700)
+    marker = external / "must-not-be-read"
+    marker.write_bytes(b"external payload")
+    (runtime / ".venv").symlink_to(external, target_is_directory=True)
+    bin_dir = runtime / "web/node_modules/.bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "tool").symlink_to("../tool/cli.js")
+    before = cutover._sha256_json(candidate.observer())
+    candidate.plan["bindings"]["rollback_live_identity_sha256"] = before
+    candidate.plan["bindings"]["expected_live_identity_sha256"] = before
+    authority = adapter.AdapterMutationAuthority.bind(
+        plan=candidate.plan,
+        gate_binding=candidate.plan["bindings"],
+        validated_authorization=_validated_authorization(candidate.plan),
+        machine_identity_sha256=MACHINE_IDENTITY_SHA256,
+        lease_fingerprint=LEASE_FINGERPRINT,
+        lease_token=LEASE_TOKEN,
+    )
+    instance = adapter.ProductionCutoverAdapter(
+        projection=adapter.PathProjection.fake(candidate.fake),
+        identity_observer=candidate.observer,
+        snapshot_root=Path("/snapshots"),
+        runner=candidate.runner,
+        service_controller=candidate.services,
+        authority=authority,
+    )
+    snapshot = instance.execute_step(
+        "snapshot_live",
+        expected_identity_sha256=before,
+        plan=candidate.plan,
+        planned_commands=[],
+        payload_descriptors={},
+        lease_fingerprint=LEASE_FINGERPRINT,
+        lease_token=LEASE_TOKEN,
+    )["snapshot"]
+    return instance, snapshot, runtime, external, marker, before
+
+
+def test_tree_snapshot_restores_legacy_symlinks_without_following(candidate):
+    instance, snapshot, runtime, external, marker, before = (
+        _tree_snapshot_with_legacy_symlinks(candidate)
+    )
+    (runtime / ".venv").unlink()
+    (runtime / "web/node_modules/.bin/tool").unlink()
+
+    instance.rollback(
+        snapshot=snapshot,
+        expected_identity_sha256=before,
+        plan=candidate.plan,
+        planned_commands=cutover._expected_commands_for_step(
+            "rollback", candidate.plan
+        ),
+        lease_fingerprint=LEASE_FINGERPRINT,
+        lease_token=LEASE_TOKEN,
+    )
+
+    assert os.readlink(runtime / ".venv") == str(external)
+    assert os.readlink(runtime / "web/node_modules/.bin/tool") == "../tool/cli.js"
+    assert marker.read_bytes() == b"external payload"
+
+
+def test_tree_snapshot_rejects_symlink_target_tamper_before_restore(candidate):
+    instance, snapshot, runtime, _external, _marker, before = (
+        _tree_snapshot_with_legacy_symlinks(candidate)
+    )
+    restore = Path(snapshot["components"]["runtime"]["restore_ref"])
+    retained = restore / "payload/.venv"
+    retained.unlink()
+    retained.symlink_to("/tampered-target", target_is_directory=True)
+
+    with pytest.raises(
+        adapter.CutoverAdapterError,
+        match="cutover_adapter_tree_symlink_drift",
+    ):
+        instance.rollback(
+            snapshot=snapshot,
+            expected_identity_sha256=before,
+            plan=candidate.plan,
+            planned_commands=cutover._expected_commands_for_step(
+                "rollback", candidate.plan
+            ),
+            lease_fingerprint=LEASE_FINGERPRINT,
+            lease_token=LEASE_TOKEN,
+        )
+
+    assert os.readlink(runtime / ".venv") != "/tampered-target"
+
+
+def test_tree_snapshot_restores_contained_hardlink_topology(candidate):
+    runtime = candidate.physical(str(cutover.CANONICAL_RUNTIME_ROOT))
+    runtime.mkdir(mode=0o750)
+    binary = runtime / "web/node_modules/esbuild/bin/esbuild"
+    _write(binary, b"legacy binary", 0o755)
+    alias = runtime / "web/node_modules/@esbuild/darwin-x64/bin/esbuild"
+    alias.parent.mkdir(parents=True)
+    os.link(binary, alias)
+    before = cutover._sha256_json(candidate.observer())
+    candidate.plan["bindings"]["rollback_live_identity_sha256"] = before
+    candidate.plan["bindings"]["expected_live_identity_sha256"] = before
+    authority = adapter.AdapterMutationAuthority.bind(
+        plan=candidate.plan,
+        gate_binding=candidate.plan["bindings"],
+        validated_authorization=_validated_authorization(candidate.plan),
+        machine_identity_sha256=MACHINE_IDENTITY_SHA256,
+        lease_fingerprint=LEASE_FINGERPRINT,
+        lease_token=LEASE_TOKEN,
+    )
+    instance = adapter.ProductionCutoverAdapter(
+        projection=adapter.PathProjection.fake(candidate.fake),
+        identity_observer=candidate.observer,
+        snapshot_root=Path("/snapshots"),
+        runner=candidate.runner,
+        service_controller=candidate.services,
+        authority=authority,
+    )
+    snapshot = instance.execute_step(
+        "snapshot_live",
+        expected_identity_sha256=before,
+        plan=candidate.plan,
+        planned_commands=[],
+        payload_descriptors={},
+        lease_fingerprint=LEASE_FINGERPRINT,
+        lease_token=LEASE_TOKEN,
+    )["snapshot"]
+    alias.unlink()
+
+    instance.rollback(
+        snapshot=snapshot,
+        expected_identity_sha256=before,
+        plan=candidate.plan,
+        planned_commands=cutover._expected_commands_for_step(
+            "rollback", candidate.plan
+        ),
+        lease_fingerprint=LEASE_FINGERPRINT,
+        lease_token=LEASE_TOKEN,
+    )
+
+    assert binary.stat().st_ino == alias.stat().st_ino
+    assert binary.stat().st_nlink == 2
+
+
+def test_tree_snapshot_rejects_external_hardlink(candidate):
+    runtime = candidate.physical(str(cutover.CANONICAL_RUNTIME_ROOT))
+    runtime.mkdir(mode=0o750)
+    binary = runtime / "bin/tool"
+    _write(binary, b"legacy binary", 0o755)
+    external = candidate.physical("/external-hardlink")
+    os.link(binary, external)
+    before = cutover._sha256_json(candidate.observer())
+
+    with pytest.raises(
+        adapter.CutoverAdapterError,
+        match="cutover_adapter_tree_external_hardlink_forbidden",
+    ):
+        candidate.build().execute_step(
+            "snapshot_live",
+            expected_identity_sha256=before,
+            plan=candidate.plan,
+            planned_commands=[],
+            payload_descriptors={},
+            lease_fingerprint=LEASE_FINGERPRINT,
+            lease_token=LEASE_TOKEN,
+        )
+
+
 def test_snapshot_file_mode_drift_is_rejected_before_restore(candidate):
     live_env = candidate.physical(str(cutover.CANONICAL_ENV_PATH))
     _write(live_env, b"OLD=1\n", 0o600)

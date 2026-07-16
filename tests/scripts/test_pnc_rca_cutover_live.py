@@ -240,6 +240,61 @@ def test_projected_live_identity_detects_same_path_tamper(projected) -> None:
     assert after["candidate_env_sha256"] == before["candidate_env_sha256"]
 
 
+def test_projected_live_identity_fingerprints_legacy_symlink_without_following(
+    projected,
+) -> None:
+    runtime = projected["physical"](projected["logical"]["runtime"])
+    runtime.mkdir(parents=True)
+    external = projected["physical"](Path("/external-venv"))
+    external.mkdir(parents=True)
+    marker = external / "must-not-be-read"
+    marker.write_bytes(b"external payload")
+    legacy = runtime / ".venv"
+    legacy.symlink_to(external, target_is_directory=True)
+
+    first = projected["observer"]()
+    legacy.unlink()
+    legacy.symlink_to("../different-venv", target_is_directory=True)
+    second = projected["observer"]()
+
+    assert first["runtime_content_sha256"] != projected["plan"]["bindings"][
+        "runtime_content_sha256"
+    ]
+    assert second["runtime_content_sha256"] != first["runtime_content_sha256"]
+    assert marker.read_bytes() == b"external payload"
+
+
+def test_projected_live_identity_fingerprints_contained_legacy_hardlinks(
+    projected,
+) -> None:
+    runtime = projected["physical"](projected["logical"]["runtime"])
+    binary = runtime / "web/node_modules/esbuild/bin/esbuild"
+    _write(binary, b"legacy binary", 0o755)
+    alias = runtime / "web/node_modules/@esbuild/darwin-x64/bin/esbuild"
+    alias.parent.mkdir(parents=True)
+    os.link(binary, alias)
+
+    observed = projected["observer"]()
+
+    assert observed["runtime_content_sha256"] != projected["plan"]["bindings"][
+        "runtime_content_sha256"
+    ]
+    assert binary.stat().st_ino == alias.stat().st_ino
+
+
+def test_projected_live_identity_rejects_external_legacy_hardlink(projected) -> None:
+    runtime = projected["physical"](projected["logical"]["runtime"])
+    binary = runtime / "bin/tool"
+    _write(binary, b"legacy binary", 0o755)
+    external = projected["physical"](Path("/external-link"))
+    os.link(binary, external)
+
+    with pytest.raises(live.LiveBoundaryError) as error:
+        projected["observer"]()
+
+    assert error.value.code == "cutover_live_tree_external_hardlink_forbidden"
+
+
 class FakeRunner:
     def __init__(self, jobs: dict[str, dict]) -> None:
         self.jobs = jobs

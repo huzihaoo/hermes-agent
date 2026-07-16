@@ -562,10 +562,16 @@ def _read_stable_owner_file(
     path: Path,
     *,
     limit: int = MAX_OWNER_FILE_BYTES,
+    allowed_link_counts: frozenset[int] = frozenset({1}),
     io_hook: Callable[[str, Path], None] | None = None,
 ) -> _StableFile:
     if not hasattr(os, "O_NOFOLLOW"):
         raise CutoverAdapterError("cutover_adapter_no_follow_unavailable")
+    if not allowed_link_counts or any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 1
+        for value in allowed_link_counts
+    ):
+        raise CutoverAdapterError("cutover_adapter_link_policy_invalid")
     ancestors_before = _ancestor_identities(path)
     try:
         descriptor = os.open(
@@ -579,7 +585,7 @@ def _read_stable_owner_file(
         if (
             not stat.S_ISREG(before.st_mode)
             or before.st_uid != os.geteuid()
-            or before.st_nlink != 1
+            or before.st_nlink not in allowed_link_counts
             or before.st_size < 0
             or before.st_size > limit
             or stat.S_IMODE(before.st_mode) & 0o022
@@ -952,6 +958,28 @@ class ProductionCutoverAdapter:
         paths = sorted(root.rglob("*"), key=lambda item: item.as_posix())
         if len(paths) > MAX_TREE_FILES:
             raise CutoverAdapterError("cutover_adapter_tree_too_large")
+        metadata = {path: path.lstat() for path in paths}
+        inode_paths: dict[tuple[int, int], list[str]] = {}
+        for path, info in metadata.items():
+            if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+                inode_paths.setdefault((info.st_dev, info.st_ino), []).append(
+                    path.relative_to(root).as_posix()
+                )
+        hardlink_groups: dict[str, tuple[str, ...]] = {}
+        for (device, inode), relative_paths in inode_paths.items():
+            group = tuple(sorted(relative_paths))
+            representative = metadata[root / group[0]]
+            if len(group) != representative.st_nlink or any(
+                (metadata[root / relative].st_dev, metadata[root / relative].st_ino)
+                != (device, inode)
+                or metadata[root / relative].st_nlink != len(group)
+                for relative in group
+            ):
+                raise CutoverAdapterError(
+                    "cutover_adapter_tree_external_hardlink_forbidden"
+                )
+            for relative in group:
+                hardlink_groups[relative] = group
         if destination is not None:
             destination.mkdir(mode=0o700)
             destination.chmod(int(root_mode, 8))
@@ -960,9 +988,33 @@ class ProductionCutoverAdapter:
             if relative in excluded:
                 continue
             info = path.lstat()
-            if stat.S_ISLNK(info.st_mode):
-                raise CutoverAdapterError("cutover_adapter_tree_symlink_forbidden")
             target = destination / relative if destination is not None else None
+            if stat.S_ISLNK(info.st_mode):
+                if info.st_uid != os.geteuid():
+                    raise CutoverAdapterError(
+                        "cutover_adapter_tree_symlink_invalid"
+                    )
+                try:
+                    link_target = os.readlink(path)
+                except OSError as exc:
+                    raise CutoverAdapterError(
+                        "cutover_adapter_tree_symlink_invalid"
+                    ) from exc
+                target_raw = os.fsencode(link_target)
+                if not target_raw or len(target_raw) > 16 * 1024:
+                    raise CutoverAdapterError(
+                        "cutover_adapter_tree_symlink_invalid"
+                    )
+                entry = {
+                    "kind": "symlink",
+                    "target": link_target,
+                    "target_sha256": hashlib.sha256(target_raw).hexdigest(),
+                }
+                observed[relative] = entry
+                if target is not None:
+                    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    os.symlink(link_target, target)
+                continue
             if stat.S_ISDIR(info.st_mode):
                 if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o022:
                     raise CutoverAdapterError("cutover_adapter_tree_directory_invalid")
@@ -974,21 +1026,71 @@ class ProductionCutoverAdapter:
                 continue
             if not stat.S_ISREG(info.st_mode):
                 raise CutoverAdapterError("cutover_adapter_tree_special_file_forbidden")
-            stable = _read_stable_owner_file(path, io_hook=self._io_hook)
+            group = hardlink_groups.get(relative)
+            stable = _read_stable_owner_file(
+                path,
+                allowed_link_counts=frozenset({len(group) if group else 1}),
+                io_hook=self._io_hook,
+            )
             entry = {
                 "sha256": stable.sha256,
                 "size_bytes": len(stable.raw),
                 "mode": f"{stable.mode:04o}",
             }
+            if group is not None:
+                if relative == group[0]:
+                    entry["hardlink_group"] = {
+                        "primary": group[0],
+                        "paths": list(group),
+                        "link_count": len(group),
+                    }
+                else:
+                    entry = {
+                        "kind": "hardlink",
+                        "primary": group[0],
+                        "sha256": stable.sha256,
+                        "size_bytes": len(stable.raw),
+                        "mode": f"{stable.mode:04o}",
+                        "link_count": len(group),
+                    }
             observed[relative] = entry
             if target is not None:
                 target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                _write_new_file(target, stable.raw, mode=stable.mode)
+                if group is not None and relative != group[0]:
+                    os.link(
+                        destination / group[0],
+                        target,
+                        follow_symlinks=False,
+                    )
+                else:
+                    _write_new_file(target, stable.raw, mode=stable.mode)
         if expected is not None:
             if set(observed) != set(expected):
                 raise CutoverAdapterError("cutover_adapter_tree_layout_drift")
             for relative, expected_entry in expected.items():
                 actual = observed[relative]
+                if expected_entry.get("kind") == "symlink":
+                    if actual != expected_entry:
+                        raise CutoverAdapterError(
+                            "cutover_adapter_tree_symlink_drift"
+                        )
+                    continue
+                if expected_entry.get("kind") == "hardlink":
+                    if actual != expected_entry:
+                        raise CutoverAdapterError(
+                            "cutover_adapter_tree_hardlink_drift"
+                        )
+                    continue
+                if actual.get("kind") == "symlink":
+                    raise CutoverAdapterError(
+                        "cutover_adapter_tree_symlink_drift"
+                    )
+                if actual.get("kind") == "hardlink" or actual.get(
+                    "hardlink_group"
+                ) != expected_entry.get("hardlink_group"):
+                    raise CutoverAdapterError(
+                        "cutover_adapter_tree_hardlink_drift"
+                    )
                 if actual["sha256"] != expected_entry.get("sha256"):
                     raise CutoverAdapterError("cutover_adapter_tree_hash_drift")
                 if "size_bytes" in expected_entry and (
@@ -1012,7 +1114,11 @@ class ProductionCutoverAdapter:
             directories_out.update(observed_directories)
         if destination is not None:
             for directory in sorted(
-                (path for path in destination.rglob("*") if path.is_dir()),
+                (
+                    path
+                    for path in destination.rglob("*")
+                    if path.is_dir() and not path.is_symlink()
+                ),
                 key=lambda item: len(item.parts),
                 reverse=True,
             ):
