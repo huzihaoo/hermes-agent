@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -22,6 +23,62 @@ def _write_json(path: Path, body: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     path.write_text(json.dumps(body, sort_keys=True) + "\n", encoding="utf-8")
     path.chmod(0o600)
+
+
+def _migration_candidate_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "migration-candidate"
+    repo.mkdir()
+    for relative in executor.store_drill.MIGRATION_SOURCE_RELATIVE_PATHS:
+        destination = repo / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes((executor.store_drill.REPO_ROOT / relative).read_bytes())
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "test@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Migration Test"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-qm", "fixture"],
+        check=True,
+    )
+    return repo
+
+
+def test_migration_provenance_accepts_clean_repo_matching_staged_sources(
+    tmp_path: Path,
+) -> None:
+    repo = _migration_candidate_repo(tmp_path)
+
+    provenance = executor.store_drill._candidate_provenance(repo)
+
+    assert provenance["repo_root"] == str(repo)
+    assert set(provenance["migration_sources"]) == set(
+        executor.store_drill.MIGRATION_SOURCE_RELATIVE_PATHS
+    )
+
+
+def test_migration_provenance_rejects_committed_source_not_in_staged_runtime(
+    tmp_path: Path,
+) -> None:
+    repo = _migration_candidate_repo(tmp_path)
+    relative = executor.store_drill.MIGRATION_SOURCE_RELATIVE_PATHS[0]
+    with (repo / relative).open("ab") as stream:
+        stream.write(b"\n# drift\n")
+    subprocess.run(["git", "-C", str(repo), "add", relative], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-qm", "drift"],
+        check=True,
+    )
+
+    with pytest.raises(executor.store_drill.MigrationDrillError) as error:
+        executor.store_drill._candidate_provenance(repo)
+
+    assert error.value.code == "migration_candidate_runtime_source_mismatch"
 
 
 class FakeLease:

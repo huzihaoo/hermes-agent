@@ -1288,25 +1288,41 @@ def _validate_supported_pre_schema(
 def _candidate_provenance(repo_root: Path) -> dict[str, Any]:
     try:
         root = repo_root.expanduser().resolve(strict=True)
+        runtime_root = REPO_ROOT.resolve(strict=True)
     except OSError as exc:
         raise MigrationDrillError("migration_candidate_repo_invalid") from exc
-    if root != REPO_ROOT.resolve(strict=True):
-        raise MigrationDrillError("migration_candidate_repo_mismatch")
     try:
+        top_level = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
         commit = subprocess.run(
             ["git", "-C", str(root), "rev-parse", "HEAD"],
             check=True,
             capture_output=True,
             text=True,
         ).stdout.strip()
+        status = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain=v1", "--untracked-files=all"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
     except (OSError, subprocess.SubprocessError) as exc:
         raise MigrationDrillError("migration_candidate_commit_unavailable") from exc
+    if Path(top_level).resolve() != root:
+        raise MigrationDrillError("migration_candidate_repo_mismatch")
     if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
         raise MigrationDrillError("migration_candidate_commit_invalid")
+    if status:
+        raise MigrationDrillError("migration_candidate_source_dirty")
     sources: dict[str, str] = {}
     for relative in MIGRATION_SOURCE_RELATIVE_PATHS:
         path = root / relative
         observed = observe_regular_file(path)
+        runtime_observed = observe_regular_file(runtime_root / relative)
         try:
             committed = subprocess.run(
                 ["git", "-C", str(root), "show", f"{commit}:{relative}"],
@@ -1317,6 +1333,8 @@ def _candidate_provenance(repo_root: Path) -> dict[str, Any]:
             raise MigrationDrillError("migration_candidate_source_untracked") from exc
         if hashlib.sha256(committed).hexdigest() != observed["sha256"]:
             raise MigrationDrillError("migration_candidate_source_dirty")
+        if observed["sha256"] != runtime_observed["sha256"]:
+            raise MigrationDrillError("migration_candidate_runtime_source_mismatch")
         sources[relative] = str(observed["sha256"])
     return {
         "repo_root": str(root),
