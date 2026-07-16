@@ -296,6 +296,29 @@ def test_plan_is_read_only_and_redacted(fixture: SimpleNamespace) -> None:
     assert "broker-1" not in serialized
 
 
+def test_plan_accepts_explicit_snapshot_only_kafka_policy(
+    fixture: SimpleNamespace,
+) -> None:
+    _rewrite_env(
+        fixture,
+        lambda raw: raw.replace(
+            "HERMES_RCA_KAFKA_STATUS_CHANGE_TYPES=Reached\n",
+            "HERMES_RCA_KAFKA_STATUS_CHANGE_TYPES=\n",
+        ).replace(
+            'HERMES_RCA_KAFKA_STATE_TRANSITIONS_JSON=[{"state_key":"new-problem","pre_status":1,"cur_status":2}]\n',
+            "HERMES_RCA_KAFKA_STATE_TRANSITIONS_JSON=[]\n",
+        )
+        + "HERMES_RCA_KAFKA_SNAPSHOT_PATTERNS=State\n"
+        + "HERMES_RCA_KAFKA_SNAPSHOT_SUB_STAGES=OPEN\n",
+    )
+    _rebind_input_env(fixture)
+
+    result = _run(fixture)
+
+    assert result.body["ok"] is True
+    assert result.body["policy"]["kafka"]["submit_enabled"] is True
+
+
 def test_stage_preserves_credentials_unknown_keys_and_comments(
     fixture: SimpleNamespace,
 ) -> None:

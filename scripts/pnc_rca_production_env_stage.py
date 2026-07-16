@@ -109,6 +109,12 @@ PASSTHROUGH_REQUIRED_KEYS = frozenset(
         "HERMES_RCA_MANUAL_OPERATOR_RATE_WINDOW_SECONDS",
     }
 )
+PASSTHROUGH_ALLOW_EMPTY_KEYS = frozenset(
+    {
+        "HERMES_RCA_KAFKA_STATUS_CHANGE_TYPES",
+        "HERMES_RCA_MANUAL_OPERATOR_USER_IDS",
+    }
+)
 
 FIXED_PRODUCTION_VALUES = {
     "HERMES_RCA_KAFKA_GROUP": FIXED_KAFKA_GROUP_ID,
@@ -689,7 +695,7 @@ def _desired_values(
         _required_value(
             values,
             key,
-            allow_empty=(key == "HERMES_RCA_MANUAL_OPERATOR_USER_IDS"),
+            allow_empty=(key in PASSTHROUGH_ALLOW_EMPTY_KEYS),
         )
     _validate_admission_hmac_key(values["HERMES_RCA_PROD_ADMISSION_HMAC_KEY"])
     configured_release_id = _required_value(values, "HERMES_RCA_PROD_RELEASE_ID")
