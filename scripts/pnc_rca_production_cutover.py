@@ -95,6 +95,7 @@ GATEWAY_AUX_LABELS = SERVICE_LABELS[:3]
 RESIDENT_LABELS = SERVICE_LABELS[3:]
 PERIODIC_SERVICE_LABELS = ("local.pnc.vm-task-sync",)
 WRITER_LABELS = (SERVICE_LABELS[0], *RESIDENT_LABELS)
+RUNTIME_QUIESCE_LABELS = SERVICE_LABELS
 CANDIDATE_PLISTS = (
     "ai.hermes.gateway.candidate.plist",
     "local.pnc.completion-notice-relay.candidate.plist",
@@ -2035,7 +2036,7 @@ def _expected_commands_for_step(step: str, plan: Mapping[str, Any]) -> list[list
     payloads = plan["payload_bindings"]
     adapter = CUTOVER_ADAPTER_EXECUTABLE
     if step == "stop_writers":
-        return [[adapter, "stop-writers", *WRITER_LABELS]]
+        return [[adapter, "stop-writers", *RUNTIME_QUIESCE_LABELS]]
     if step == "install_feishu_sidecar":
         binding = payloads["feishu_sidecar"]
         return [
@@ -2366,10 +2367,12 @@ def _validate_step_result(
     if expected_started and commands != _expected_start_commands(step, plan):
         raise ProductionCutoverError("production_cutover_service_commands_invalid")
     if step == "stop_writers":
-        if evidence.get(
-            "schema_version"
-        ) != "pnc_rca_writer_stop_evidence_v1" or evidence.get("writer_labels") != list(
-            WRITER_LABELS
+        if (
+            evidence.get("schema_version")
+            != "pnc_rca_writer_stop_evidence_v1"
+            or evidence.get("writer_labels") != list(WRITER_LABELS)
+            or evidence.get("runtime_quiesce_labels")
+            != list(RUNTIME_QUIESCE_LABELS)
         ):
             raise ProductionCutoverError(
                 "production_cutover_writer_stop_evidence_invalid"

@@ -608,6 +608,7 @@ class FakeAdapter:
             evidence = {
                 "schema_version": "pnc_rca_writer_stop_evidence_v1",
                 "writer_labels": list(cutover.WRITER_LABELS),
+                "runtime_quiesce_labels": list(cutover.RUNTIME_QUIESCE_LABELS),
                 "receipt_sha256": "b" * 64,
                 "receipt_path": "/fake/evidence/writer-stop.json",
             }
@@ -1368,6 +1369,14 @@ def test_preflight_binds_exact_start_commands_and_order(fixture) -> None:
         "ai.hermes.gateway",
         *cutover.RESIDENT_LABELS,
     )
+    assert cutover.RUNTIME_QUIESCE_LABELS == cutover.SERVICE_LABELS
+    assert cutover._expected_commands_for_step("stop_writers", plan) == [
+        [
+            cutover.CUTOVER_ADAPTER_EXECUTABLE,
+            "stop-writers",
+            *cutover.RUNTIME_QUIESCE_LABELS,
+        ]
+    ]
     assert "ai.hermes.gateway.candidate.plist" in cutover.CANDIDATE_PLISTS
     assert cutover._expected_start_commands("start_gateway_aux", plan) == [
         [

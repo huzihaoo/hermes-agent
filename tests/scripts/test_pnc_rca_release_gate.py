@@ -374,7 +374,8 @@ def _installed_runtime_dependencies(monkeypatch):
         lambda value, **_kwargs: (dict(value), "e" * 64),
     )
 
-    def candidate_runtime(repo_root):
+    def candidate_runtime(repo_root, *, runtime_root=None):
+        del runtime_root
         root = Path(repo_root)
         task_root = root.parent
         if root.name == "unused-host-build":
@@ -10536,6 +10537,9 @@ def test_production_cutover_gate_requires_writer_stop_before_install():
         evidence={
             "schema_version": "pnc_rca_writer_stop_evidence_v1",
             "writer_labels": list(release_gate_module.CUTOVER_WRITER_LABELS),
+            "runtime_quiesce_labels": list(
+                release_gate_module.CUTOVER_RUNTIME_QUIESCE_LABELS
+            ),
             "receipt_sha256": "d" * 64,
         },
     )
@@ -10562,9 +10566,12 @@ def test_production_cutover_gate_requires_writer_stop_before_install():
     assert verified["allowed_next_step"] == "verify_gateway_aux"
 
 
-def test_production_cutover_gate_writer_set_matches_executor_and_rejects_aux():
+def test_production_cutover_gate_tracks_writers_and_runtime_quiesce_separately():
     assert release_gate_module.CUTOVER_WRITER_LABELS == (
         production_cutover_module.WRITER_LABELS
+    )
+    assert release_gate_module.CUTOVER_RUNTIME_QUIESCE_LABELS == (
+        production_cutover_module.RUNTIME_QUIESCE_LABELS
     )
     artifacts, sha, authorization = _production_cutover_gate_fixture()
     live = authorization["bindings"]["expected_live_identity_sha256"]
@@ -10575,10 +10582,10 @@ def test_production_cutover_gate_writer_set_matches_executor_and_rejects_aux():
         after=live,
         evidence={
             "schema_version": "pnc_rca_writer_stop_evidence_v1",
-            "writer_labels": [
-                *release_gate_module.CUTOVER_GATEWAY_AUX_START_ORDER,
-                *release_gate_module.CUTOVER_RESIDENT_START_ORDER,
-            ],
+            "writer_labels": list(release_gate_module.CUTOVER_WRITER_LABELS),
+            "runtime_quiesce_labels": list(
+                release_gate_module.CUTOVER_WRITER_LABELS
+            ),
             "receipt_sha256": "d" * 64,
         },
     )

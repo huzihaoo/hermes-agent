@@ -457,7 +457,7 @@ def test_launchd_controller_snapshots_and_restores_bound_precutover_state(
         launch_agents_root=plists,
         runner=runner,
     ).capture_state(cutover.SERVICE_LABELS)
-    for label in cutover.WRITER_LABELS:
+    for label in cutover.RUNTIME_QUIESCE_LABELS:
         jobs[label].update(loaded=False, state="absent", pid=None)
     controller = live.LaunchdServiceController(
         evidence_root=tmp_path / "evidence",
@@ -533,7 +533,7 @@ def test_launchd_controller_waits_for_async_bootout_before_restore_bootstrap(
         assert runner.calls.index(bootout) < runner.calls.index(bootstrap)
 
 
-def test_launchd_controller_rejects_precutover_snapshot_while_writer_loaded(
+def test_launchd_controller_rejects_snapshot_while_runtime_dependency_loaded(
     tmp_path,
 ) -> None:
     runtime = tmp_path / "runtime"
@@ -549,6 +549,13 @@ def test_launchd_controller_rejects_precutover_snapshot_while_writer_loaded(
         launch_agents_root=plists,
         runner=runner,
     ).capture_state(cutover.SERVICE_LABELS)
+    for label in cutover.RUNTIME_QUIESCE_LABELS:
+        jobs[label].update(loaded=False, state="absent", pid=None)
+    jobs["local.pnc.completion-notice-relay"].update(
+        loaded=True,
+        state="running",
+        pid=901,
+    )
     controller = live.LaunchdServiceController(
         evidence_root=tmp_path / "evidence",
         target_runtime_root=runtime,
@@ -560,7 +567,7 @@ def test_launchd_controller_rejects_precutover_snapshot_while_writer_loaded(
     with pytest.raises(live.LiveBoundaryError) as error:
         controller.capture_state(cutover.SERVICE_LABELS)
 
-    assert error.value.code == "cutover_live_writer_not_stopped_for_snapshot"
+    assert error.value.code == "cutover_live_runtime_not_quiesced_for_snapshot"
 
 
 def test_launchd_controller_starts_verifies_and_restores_exact_resident_set(
@@ -600,7 +607,9 @@ def test_launchd_controller_starts_verifies_and_restores_exact_resident_set(
     assert all(not jobs[label]["loaded"] for label in cutover.RESIDENT_LABELS)
 
 
-def test_launchd_controller_stops_exact_writer_set_and_writes_receipt(tmp_path) -> None:
+def test_launchd_controller_quiesces_exact_runtime_set_and_writes_receipt(
+    tmp_path,
+) -> None:
     jobs = {
         label: {
             "loaded": True,
@@ -608,7 +617,7 @@ def test_launchd_controller_stops_exact_writer_set_and_writes_receipt(tmp_path) 
             "pid": 100 + index,
             "last_exit_status": None,
         }
-        for index, label in enumerate(cutover.WRITER_LABELS)
+        for index, label in enumerate(cutover.RUNTIME_QUIESCE_LABELS)
     }
     runner = FakeRunner(jobs)
     evidence = {
@@ -633,18 +642,39 @@ def test_launchd_controller_stops_exact_writer_set_and_writes_receipt(tmp_path) 
     )
 
     result = controller.stop_writers(
-        cutover.WRITER_LABELS,
+        cutover.RUNTIME_QUIESCE_LABELS,
         lease_fingerprint="b" * 64,
         lease_token="fixture-lease-token-0001",
     )
 
     assert result["writer_labels"] == list(cutover.WRITER_LABELS)
+    assert result["runtime_quiesce_labels"] == list(
+        cutover.RUNTIME_QUIESCE_LABELS
+    )
     assert Path(result["receipt_path"]).is_file()
     assert all(not job["loaded"] for job in jobs.values())
     bootouts = [call for call in runner.calls if call[1] == "bootout"]
     assert [call[2].rsplit("/", 1)[-1] for call in bootouts] == list(
-        cutover.WRITER_LABELS
+        cutover.RUNTIME_QUIESCE_LABELS
     )
+
+
+def test_launchd_controller_rejects_writer_only_quiesce_set(tmp_path) -> None:
+    controller = live.LaunchdServiceController(
+        evidence_root=tmp_path / "evidence",
+        target_runtime_root=tmp_path / "runtime",
+        launch_agents_root=tmp_path / "LaunchAgents",
+        runner=FakeRunner({}),
+    )
+
+    with pytest.raises(live.LiveBoundaryError) as error:
+        controller.stop_writers(
+            cutover.WRITER_LABELS,
+            lease_fingerprint="b" * 64,
+            lease_token="fixture-lease-token-0001",
+        )
+
+    assert error.value.code == "cutover_live_runtime_quiesce_labels_invalid"
 
 
 def test_launchd_controller_waits_for_async_bootout_and_process_exit(tmp_path) -> None:
@@ -655,7 +685,7 @@ def test_launchd_controller_waits_for_async_bootout_and_process_exit(tmp_path) -
             "pid": 300 + index,
             "last_exit_status": None,
         }
-        for index, label in enumerate(cutover.WRITER_LABELS)
+        for index, label in enumerate(cutover.RUNTIME_QUIESCE_LABELS)
     }
 
     class DelayedRunner(FakeRunner):
@@ -711,7 +741,7 @@ def test_launchd_controller_waits_for_async_bootout_and_process_exit(tmp_path) -
     )
 
     result = controller.stop_writers(
-        cutover.WRITER_LABELS,
+        cutover.RUNTIME_QUIESCE_LABELS,
         lease_fingerprint="b" * 64,
         lease_token="fixture-lease-token-0001",
     )

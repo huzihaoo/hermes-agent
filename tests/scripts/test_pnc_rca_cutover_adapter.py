@@ -154,7 +154,8 @@ class FakeServices:
         _write(receipt, b'{"stopped":true}\n')
         return {
             "schema_version": "pnc_rca_writer_stop_evidence_v1",
-            "writer_labels": list(labels),
+            "writer_labels": list(cutover.WRITER_LABELS),
+            "runtime_quiesce_labels": list(labels),
             "receipt_sha256": _sha(receipt.read_bytes()),
             "receipt_path": str(receipt),
         }

@@ -422,6 +422,10 @@ CUTOVER_WRITER_LABELS = (
     CUTOVER_GATEWAY_AUX_START_ORDER[0],
     *CUTOVER_RESIDENT_START_ORDER,
 )
+CUTOVER_RUNTIME_QUIESCE_LABELS = (
+    *CUTOVER_GATEWAY_AUX_START_ORDER,
+    *CUTOVER_RESIDENT_START_ORDER,
+)
 CUTOVER_STEP_NAMES = (
     "snapshot_live",
     "stop_writers",
@@ -14009,6 +14013,8 @@ def _validate_cutover_prior_step(
             evidence_map.get("schema_version") != "pnc_rca_writer_stop_evidence_v1"
             or evidence_map.get("writer_labels")
             != list(CUTOVER_WRITER_LABELS)
+            or evidence_map.get("runtime_quiesce_labels")
+            != list(CUTOVER_RUNTIME_QUIESCE_LABELS)
         ):
             raise EvidenceError("production_cutover_writer_stop_evidence_invalid")
         _sha256_digest(

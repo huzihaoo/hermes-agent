@@ -213,9 +213,11 @@ class LaunchdServiceController:
             or set(prior["jobs"]) != set(normalized)
         ):
             raise LiveBoundaryError("cutover_live_precutover_service_state_invalid")
-        for label in cutover.WRITER_LABELS:
+        for label in cutover.RUNTIME_QUIESCE_LABELS:
             if current["jobs"][label]["launchd"]["loaded"] is not False:
-                raise LiveBoundaryError("cutover_live_writer_not_stopped_for_snapshot")
+                raise LiveBoundaryError(
+                    "cutover_live_runtime_not_quiesced_for_snapshot"
+                )
         for label in normalized:
             prior_entry = prior["jobs"].get(label)
             if not isinstance(prior_entry, Mapping) or set(prior_entry) != {
@@ -245,8 +247,8 @@ class LaunchdServiceController:
         lease_token: str,
     ) -> Mapping[str, Any]:
         normalized = _validate_labels(labels)
-        if normalized != cutover.WRITER_LABELS:
-            raise LiveBoundaryError("cutover_live_writer_labels_invalid")
+        if normalized != cutover.RUNTIME_QUIESCE_LABELS:
+            raise LiveBoundaryError("cutover_live_runtime_quiesce_labels_invalid")
         _require_sha256(
             lease_fingerprint, "cutover_live_lease_fingerprint_invalid"
         )
@@ -282,7 +284,8 @@ class LaunchdServiceController:
         self._receipt_writer(receipt, evidence)
         return {
             "schema_version": "pnc_rca_writer_stop_evidence_v1",
-            "writer_labels": list(normalized),
+            "writer_labels": list(cutover.WRITER_LABELS),
+            "runtime_quiesce_labels": list(normalized),
             "receipt_sha256": hashlib.sha256(receipt.read_bytes()).hexdigest(),
             "receipt_path": str(receipt),
         }

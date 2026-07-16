@@ -348,7 +348,7 @@ def run_authorized_cutover_session(
             cutover.SERVICE_LABELS
         )
         writer_evidence_result = preparation_services.stop_writers(
-            cutover.WRITER_LABELS,
+            cutover.RUNTIME_QUIESCE_LABELS,
             lease_fingerprint=lease.fingerprint,
             lease_token=lease.token,
         )

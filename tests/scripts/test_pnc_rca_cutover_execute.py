@@ -118,7 +118,7 @@ class FakeServices:
         return self.precutover
 
     def stop_writers(self, labels, **_kwargs):
-        assert tuple(labels) == cutover.WRITER_LABELS
+        assert tuple(labels) == cutover.RUNTIME_QUIESCE_LABELS
         self.events.append(f"stop:{self.name}")
         self.stopped = True
         return {"ok": True, "receipt_path": "/fixture/writer-evidence.json"}

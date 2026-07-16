@@ -687,7 +687,7 @@ def _validate_logical_commands(
         if executable == cutover.CUTOVER_ADAPTER_EXECUTABLE:
             subcommand = command[1] if len(command) > 1 else ""
             arity = {
-                "stop-writers": 2 + len(cutover.WRITER_LABELS),
+                "stop-writers": 2 + len(cutover.RUNTIME_QUIESCE_LABELS),
                 "install-owner-file": 5,
                 "install-retained-tree": 5,
                 "transition-bounded-activation": 3,
@@ -696,7 +696,7 @@ def _validate_logical_commands(
             if arity is None or len(command) != arity:
                 raise CutoverAdapterError("cutover_adapter_subcommand_invalid")
             if subcommand == "stop-writers" and tuple(command[2:]) != tuple(
-                cutover.WRITER_LABELS
+                cutover.RUNTIME_QUIESCE_LABELS
             ):
                 raise CutoverAdapterError("cutover_adapter_writer_labels_invalid")
             if subcommand in {"install-owner-file", "install-retained-tree"}:
@@ -2195,7 +2195,7 @@ class ProductionCutoverAdapter:
             if self._services is None:
                 raise CutoverAdapterError("cutover_adapter_service_controller_required")
             evidence = self._services.stop_writers(
-                cutover.WRITER_LABELS,
+                cutover.RUNTIME_QUIESCE_LABELS,
                 lease_fingerprint=lease_fingerprint,
                 lease_token=lease_token,
             )
