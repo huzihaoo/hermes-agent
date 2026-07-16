@@ -989,6 +989,22 @@ def observe_gateway_writer_stopped(
     if not old_root.is_absolute() or ".." in old_root.parts:
         raise CutoverGuardError("writer_stop_old_runtime_root_invalid")
     old_root = old_root.absolute()
+    expected_files = expected_live_runtime_identity.get("live_runtime_identity")
+    expected_interpreter = (
+        expected_files.get("interpreter")
+        if isinstance(expected_files, Mapping)
+        else None
+    )
+    interpreter_path = Path(
+        str(
+            expected_interpreter.get("path")
+            if isinstance(expected_interpreter, Mapping)
+            else ""
+        )
+    ).expanduser()
+    if not interpreter_path.is_absolute() or ".." in interpreter_path.parts:
+        raise CutoverGuardError("writer_stop_old_runtime_interpreter_invalid")
+    interpreter_path = interpreter_path.absolute()
     launchd = dict((launchctl_observer or _launchctl_print)())
     if launchd.get("pid") is None:
         launchd = {
@@ -1020,6 +1036,7 @@ def observe_gateway_writer_stopped(
                             ).get("files", {}).values()
                             if isinstance(descriptor, Mapping)
                         ),
+                        interpreter_path=interpreter_path,
                     )
                 )
             )()

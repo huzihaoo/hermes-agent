@@ -911,6 +911,101 @@ def test_runtime_observer_binds_external_current_interpreter(
     assert observed["interpreter"]["sha256"] == hashlib.sha256(b"python").hexdigest()
 
 
+def _external_interpreter_writer_stop_fixture(
+    tmp_path: Path, monkeypatch
+) -> tuple[dict, Path, Path]:
+    root = tmp_path / "base-runtime"
+    root.mkdir()
+    external = tmp_path / "sealed-venv/bin/python"
+    external.parent.mkdir(parents=True)
+    external.write_bytes(b"python")
+    external.chmod(0o755)
+    monkeypatch.setattr(guard, "GATEWAY_RCA_RUNTIME_RELATIVE_FILES", ())
+    runtime = guard.observe_live_runtime_files(
+        root,
+        interpreter_path=external,
+    )
+    expected = {
+        "schema_version": guard.GATEWAY_RUNNING_OBSERVATION_SCHEMA_VERSION,
+        "canonical_root": str(root),
+        "launchd": {
+            "label": guard.GATEWAY_LABEL,
+            "loaded": True,
+            "pid": 41001,
+            "state": "running",
+        },
+        "process": {
+            "pid": 41001,
+            "process_create_time": NOW.timestamp() - 60,
+            "executable": str(external),
+            "cwd": str(root),
+            "cmdline_sha256": "1" * 64,
+            "loaded_runtime_closure_sha256": guard._sha256_json(runtime),
+        },
+        "live_runtime_identity": runtime,
+    }
+    return expected, root, external
+
+
+def test_writer_stop_reuses_bound_external_interpreter(
+    tmp_path: Path, monkeypatch
+) -> None:
+    expected, root, external = _external_interpreter_writer_stop_fixture(
+        tmp_path, monkeypatch
+    )
+    sidecar = {"state": "absent"}
+
+    observed = guard.observe_gateway_writer_stopped(
+        expected_live_runtime_identity=expected,
+        expected_live_sidecar_identity=sidecar,
+        launchctl_observer=lambda: {
+            "label": guard.GATEWAY_LABEL,
+            "loaded": False,
+            "pid": None,
+            "state": "absent",
+        },
+        census_observer=lambda: {
+            "probe": "psutil_gateway_canonical_runtime_census_v1",
+            "canonical_root": str(root),
+            "matching_processes": [],
+        },
+        sidecar_observer=lambda: sidecar,
+    )
+
+    assert observed["live_runtime_identity"]["interpreter"]["path"] == str(
+        external
+    )
+
+
+def test_writer_stop_fails_closed_when_bound_external_interpreter_disappears(
+    tmp_path: Path, monkeypatch
+) -> None:
+    expected, root, external = _external_interpreter_writer_stop_fixture(
+        tmp_path, monkeypatch
+    )
+    external.unlink()
+
+    with pytest.raises(guard.CutoverGuardError) as error:
+        guard.observe_gateway_writer_stopped(
+            expected_live_runtime_identity=expected,
+            expected_live_sidecar_identity={"state": "absent"},
+            launchctl_observer=lambda: {
+                "label": guard.GATEWAY_LABEL,
+                "loaded": False,
+                "pid": None,
+                "state": "absent",
+            },
+            census_observer=lambda: {
+                "probe": "psutil_gateway_canonical_runtime_census_v1",
+                "canonical_root": str(root),
+                "matching_processes": [],
+            },
+            sidecar_observer=lambda: {"state": "absent"},
+        )
+
+    assert error.value.code == "cutover_guard_live_runtime_interpreter_unavailable"
+
+
 def test_launchctl_ambiguous_output_fails_closed() -> None:
     result = subprocess.CompletedProcess(
         ["launchctl"], 0, "pid = 1\npid = 2\n", ""
