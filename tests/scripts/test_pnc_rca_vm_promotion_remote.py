@@ -20,15 +20,16 @@ def _git(root: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def _init_repo(root: Path, *, entrypoint: str, content: str) -> str:
+def _init_repo(root: Path, *, entrypoint: str, content: str | None) -> str:
     root.mkdir()
     _git(root, "init", "-q")
     _git(root, "config", "user.email", "rca-test@example.com")
     _git(root, "config", "user.name", "RCA Test")
     (root / ".gitignore").write_text("build/\n", encoding="utf-8")
-    target = root / entrypoint
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content, encoding="utf-8")
+    if content is not None:
+        target = root / entrypoint
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
     (root / "live_state.py").write_text("STATE = 'clean'\n", encoding="utf-8")
     _git(root, "add", ".")
     _git(root, "commit", "-qm", "initial")
@@ -39,7 +40,9 @@ def _candidate_from(target: Path, candidate: Path, *, entrypoint: str) -> tuple[
     _git(target.parent, "clone", "-q", str(target), str(candidate))
     _git(candidate, "config", "user.email", "rca-test@example.com")
     _git(candidate, "config", "user.name", "RCA Test")
-    (candidate / entrypoint).write_text("new entrypoint\n", encoding="utf-8")
+    candidate_entrypoint = candidate / entrypoint
+    candidate_entrypoint.parent.mkdir(parents=True, exist_ok=True)
+    candidate_entrypoint.write_text("new entrypoint\n", encoding="utf-8")
     (candidate / "new_module.py").write_text("VALUE = 2\n", encoding="utf-8")
     _git(candidate, "add", ".")
     _git(candidate, "commit", "-qm", "candidate")
@@ -135,6 +138,72 @@ def test_apply_promotes_tracked_closure_and_locked_runtime_artifact(
     assert (target / entrypoint).read_text(encoding="utf-8") == "old entrypoint\n"
     assert (target / "new_module.py").exists() is False
     assert (target / "build" / "bin" / "topic_extract").read_bytes() == b"old runtime"
+
+
+def test_apply_and_rollback_support_first_install_entrypoint(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setenv("PNC_RCA_VM_PROMOTION_TEST_MODE", "1")
+    target = tmp_path / "target"
+    candidate = tmp_path / "candidate"
+    entrypoint = "bin/service.py"
+    old = _init_repo(target, entrypoint=entrypoint, content=None)
+    desired, _tree = _candidate_from(target, candidate, entrypoint=entrypoint)
+    component = _component(
+        name="vm", target=target, candidate=candidate, entrypoint=entrypoint
+    )
+    request = _request(tmp_path, [component])
+
+    observed = remote.observe(request)
+
+    assert observed["components"]["vm"]["target"]["entrypoint"] == {
+        "relative_path": entrypoint,
+        "path": str(target / entrypoint),
+        "state": "absent",
+    }
+    request.update(
+        mode="apply",
+        expected_observation_sha256=hashlib.sha256(
+            remote._canonical_json(observed)
+        ).hexdigest(),
+    )
+    receipt = remote.apply(request)
+
+    assert _git(target, "rev-parse", "HEAD") == desired
+    assert (target / entrypoint).read_text(encoding="utf-8") == "new entrypoint\n"
+
+    request.update(
+        mode="rollback",
+        remote_receipt_path=receipt["receipt_path"],
+        remote_receipt_sha256=receipt["receipt_sha256"],
+    )
+    rolled_back = remote.rollback(request)
+
+    assert rolled_back["rollback_complete"] is True
+    assert _git(target, "rev-parse", "HEAD") == old
+    assert _git(target, "status", "--porcelain=v1", "--untracked-files=all") == ""
+    assert (target / entrypoint).exists() is False
+
+
+def test_observe_rejects_untracked_target_entrypoint(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("PNC_RCA_VM_PROMOTION_TEST_MODE", "1")
+    target = tmp_path / "target"
+    candidate = tmp_path / "candidate"
+    entrypoint = "bin/service.py"
+    _init_repo(target, entrypoint=entrypoint, content=None)
+    _candidate_from(target, candidate, entrypoint=entrypoint)
+    target_entrypoint = target / entrypoint
+    target_entrypoint.parent.mkdir(parents=True)
+    target_entrypoint.write_text("untracked local entrypoint\n", encoding="utf-8")
+    component = _component(
+        name="vm", target=target, candidate=candidate, entrypoint=entrypoint
+    )
+
+    with pytest.raises(
+        remote.VmPromotionRemoteError,
+        match="vm_promotion_entrypoint_untracked",
+    ):
+        remote.observe(_request(tmp_path, [component]))
 
 
 def test_second_component_failure_rolls_first_back_to_dirty_prestate(

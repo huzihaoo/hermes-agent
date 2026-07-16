@@ -203,11 +203,25 @@ def _path_fingerprint(path: Path) -> Mapping[str, Any]:
     return {"kind": "unsupported"}
 
 
-def _entrypoint(root: Path, commit: str, relative: str) -> Mapping[str, Any]:
+def _entrypoint(
+    root: Path,
+    commit: str,
+    relative: str,
+    *,
+    allow_absent: bool = False,
+) -> Mapping[str, Any]:
     entry = _tree_entry(root, commit, relative)
-    if entry is None or entry["kind"] != "blob" or entry["mode"] not in {"100644", "100755"}:
-        raise VmPromotionRemoteError("vm_promotion_entrypoint_untracked")
     path = root / relative
+    if entry is None:
+        if allow_absent and _path_fingerprint(path) == {"kind": "absent"}:
+            return {
+                "relative_path": relative,
+                "path": str(path),
+                "state": "absent",
+            }
+        raise VmPromotionRemoteError("vm_promotion_entrypoint_untracked")
+    if entry["kind"] != "blob" or entry["mode"] not in {"100644", "100755"}:
+        raise VmPromotionRemoteError("vm_promotion_entrypoint_untracked")
     if path.is_symlink() or not path.is_file():
         raise VmPromotionRemoteError("vm_promotion_entrypoint_missing")
     committed = _git_bytes(root, "cat-file", "blob", f"{commit}:{relative}")
@@ -223,7 +237,12 @@ def _entrypoint(root: Path, commit: str, relative: str) -> Mapping[str, Any]:
     }
 
 
-def _repo_facts(root: Path, entrypoint_relative: str) -> Mapping[str, Any]:
+def _repo_facts(
+    root: Path,
+    entrypoint_relative: str,
+    *,
+    allow_absent_entrypoint: bool = False,
+) -> Mapping[str, Any]:
     if root.is_symlink() or not root.is_dir():
         raise VmPromotionRemoteError("vm_promotion_repo_missing")
     top = Path(_git(root, "rev-parse", "--show-toplevel")).resolve()
@@ -252,7 +271,12 @@ def _repo_facts(root: Path, entrypoint_relative: str) -> Mapping[str, Any]:
         "status_sha256": _sha256_bytes(status.encode("utf-8")),
         "tree_clean": status == "",
         "dirty_paths": dirty,
-        "entrypoint": _entrypoint(root, head, entrypoint_relative),
+        "entrypoint": _entrypoint(
+            root,
+            head,
+            entrypoint_relative,
+            allow_absent=allow_absent_entrypoint,
+        ),
     }
 
 
@@ -373,7 +397,11 @@ def observe(request: Mapping[str, Any]) -> Mapping[str, Any]:
     components = {}
     for spec in specs:
         candidate = _repo_facts(spec["candidate_root"], spec["entrypoint_relative"])
-        target = _repo_facts(spec["target_root"], spec["entrypoint_relative"])
+        target = _repo_facts(
+            spec["target_root"],
+            spec["entrypoint_relative"],
+            allow_absent_entrypoint=True,
+        )
         components[spec["name"]] = {
             "candidate": candidate,
             "target": target,
@@ -539,7 +567,11 @@ def _promote_component(
     candidate = spec["candidate_root"]
     target = spec["target_root"]
     desired = spec["desired_commit"]
-    before = _repo_facts(target, spec["entrypoint_relative"])
+    before = _repo_facts(
+        target,
+        spec["entrypoint_relative"],
+        allow_absent_entrypoint=True,
+    )
     candidate_facts = _repo_facts(candidate, spec["entrypoint_relative"])
     if (
         candidate_facts["head"] != desired
@@ -653,7 +685,15 @@ def _rollback_component(snapshot: Mapping[str, Any], component_snapshot: Path) -
             raise VmPromotionRemoteError("vm_promotion_snapshot_head_ref_invalid")
         _git(target, "symbolic-ref", "HEAD", head_ref)
         _git(target, "reset", "--mixed", old)
-    after = _repo_facts(target, str(snapshot.get("entrypoint_relative") or "")) if snapshot.get("entrypoint_relative") else None
+    after = (
+        _repo_facts(
+            target,
+            str(snapshot.get("entrypoint_relative") or ""),
+            allow_absent_entrypoint=True,
+        )
+        if snapshot.get("entrypoint_relative")
+        else None
+    )
     status, _paths = _status(target)
     if _sha256_bytes(status.encode("utf-8")) != snapshot.get("status_sha256"):
         raise VmPromotionRemoteError("vm_promotion_rollback_status_mismatch")
