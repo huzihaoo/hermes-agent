@@ -272,7 +272,7 @@ def _default_release_binding(
         _RELEASE_ID_RE.fullmatch(release_id) is None
         or approval_owned.sha256 != manifest.get("approval_receipt_sha256")
         or release_bom_sha256 != bindings.get("release_bom_sha256")
-        or _sha256_json(bom) != release_bom_sha256
+        or release_gate._sha256_json(bom) != release_bom_sha256
     ):
         raise VmPromotionError("vm_promotion_release_binding_invalid")
     return {

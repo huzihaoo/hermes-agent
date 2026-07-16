@@ -171,8 +171,9 @@ def test_finalized_release_binding_uses_receipt_validity_not_request_freshness(
     monkeypatch,
 ):
     inputs, _binding = fixture
-    bom = {"components": {}}
-    bom_sha256 = promotion._sha256_json(bom)
+    bom = {"components": {}, "label": "\u89c4\u5212"}
+    bom_sha256 = release_gate._sha256_json(bom)
+    assert bom_sha256 != promotion._sha256_json(bom)
     approval_sha256 = "c" * 64
     manifest = {
         "schema_version": (
