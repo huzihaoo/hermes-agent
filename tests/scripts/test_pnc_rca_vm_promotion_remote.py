@@ -140,6 +140,99 @@ def test_apply_promotes_tracked_closure_and_locked_runtime_artifact(
     assert (target / "build" / "bin" / "topic_extract").read_bytes() == b"old runtime"
 
 
+def test_apply_preserves_identical_runtime_artifact_without_rewriting(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setenv("PNC_RCA_VM_PROMOTION_TEST_MODE", "1")
+    target = tmp_path / "target"
+    candidate = tmp_path / "candidate"
+    entrypoint = "bin/service.py"
+    old = _init_repo(target, entrypoint=entrypoint, content="old entrypoint\n")
+    desired, _tree = _candidate_from(target, candidate, entrypoint=entrypoint)
+    component = _component(
+        name="vm", target=target, candidate=candidate, entrypoint=entrypoint
+    )
+    target_artifact = target / "build" / "bin" / "topic_extract"
+    target_artifact.parent.mkdir(parents=True)
+    target_artifact.write_bytes(b"locked runtime artifact")
+    original_write = remote._atomic_write
+
+    def reject_runtime_rewrite(path, payload, mode):
+        if path == target_artifact:
+            raise PermissionError("runtime directory is read-only")
+        return original_write(path, payload, mode)
+
+    monkeypatch.setattr(remote, "_atomic_write", reject_runtime_rewrite)
+    request = _request(tmp_path, [component])
+    observed = remote.observe(request)
+    request.update(
+        mode="apply",
+        expected_observation_sha256=hashlib.sha256(
+            remote._canonical_json(observed)
+        ).hexdigest(),
+    )
+
+    receipt = remote.apply(request)
+
+    assert _git(target, "rev-parse", "HEAD") == desired
+    assert target_artifact.read_bytes() == b"locked runtime artifact"
+    request.update(
+        mode="rollback",
+        remote_receipt_path=receipt["receipt_path"],
+        remote_receipt_sha256=receipt["receipt_sha256"],
+    )
+    remote.rollback(request)
+    assert _git(target, "rev-parse", "HEAD") == old
+    assert _git(target, "status", "--porcelain=v1", "--untracked-files=all") == ""
+    assert target_artifact.read_bytes() == b"locked runtime artifact"
+
+
+def test_runtime_artifact_write_failure_precedes_source_materialization(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setenv("PNC_RCA_VM_PROMOTION_TEST_MODE", "1")
+    target = tmp_path / "target"
+    candidate = tmp_path / "candidate"
+    entrypoint = "bin/service.py"
+    old = _init_repo(target, entrypoint=entrypoint, content="old entrypoint\n")
+    _candidate_from(target, candidate, entrypoint=entrypoint)
+    component = _component(
+        name="vm", target=target, candidate=candidate, entrypoint=entrypoint
+    )
+    target_artifact = target / "build" / "bin" / "topic_extract"
+    target_artifact.parent.mkdir(parents=True)
+    target_artifact.write_bytes(b"old runtime")
+    original_write = remote._atomic_write
+
+    def reject_runtime_write(path, payload, mode):
+        if path == target_artifact:
+            assert (target / entrypoint).read_text(encoding="utf-8") == (
+                "old entrypoint\n"
+            )
+            assert (target / "new_module.py").exists() is False
+            raise PermissionError("runtime directory is read-only")
+        return original_write(path, payload, mode)
+
+    monkeypatch.setattr(remote, "_atomic_write", reject_runtime_write)
+    request = _request(tmp_path, [component])
+    observed = remote.observe(request)
+    request.update(
+        mode="apply",
+        expected_observation_sha256=hashlib.sha256(
+            remote._canonical_json(observed)
+        ).hexdigest(),
+    )
+
+    with pytest.raises(PermissionError, match="runtime directory is read-only"):
+        remote.apply(request)
+
+    assert _git(target, "rev-parse", "HEAD") == old
+    assert _git(target, "status", "--porcelain=v1", "--untracked-files=all") == ""
+    assert (target / entrypoint).read_text(encoding="utf-8") == "old entrypoint\n"
+    assert (target / "new_module.py").exists() is False
+    assert target_artifact.read_bytes() == b"old runtime"
+
+
 def test_apply_and_rollback_support_first_install_entrypoint(
     tmp_path: Path, monkeypatch
 ):

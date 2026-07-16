@@ -506,6 +506,26 @@ def _capture_path(path: Path, blob_root: Path, index: int) -> Mapping[str, Any]:
     return row
 
 
+def _snapshot_path_matches(path: Path, row: Mapping[str, Any]) -> bool:
+    observed = _path_fingerprint(path)
+    kind = row.get("kind")
+    if kind == "absent":
+        return observed == {"kind": "absent"}
+    if kind == "file":
+        return observed == {
+            "kind": "file",
+            "mode": row.get("mode"),
+            "size": row.get("size"),
+            "sha256": row.get("sha256"),
+        }
+    if kind == "symlink":
+        return observed == {
+            "kind": "symlink",
+            "target_sha256": row.get("target_sha256"),
+        }
+    raise VmPromotionRemoteError("vm_promotion_snapshot_kind_invalid")
+
+
 def _restore_path(path: Path, row: Mapping[str, Any], blob_root: Path) -> None:
     kind = row.get("kind")
     if path.is_dir() and not path.is_symlink():
@@ -580,6 +600,19 @@ def _promote_component(
         or candidate_facts["entrypoint"]["sha256"] != spec["entrypoint_sha256"]
     ):
         raise VmPromotionRemoteError("vm_promotion_candidate_drift")
+    runtime_specs = {
+        _relative(item.get("relative_path"), field="runtime_artifact"): item
+        for item in spec["runtime_artifacts"]
+    }
+    runtime_payloads = {}
+    for relative, runtime_spec in runtime_specs.items():
+        payload = (candidate / relative).read_bytes()
+        if (
+            _sha256_bytes(payload) != runtime_spec.get("sha256")
+            or len(payload) != runtime_spec.get("size")
+        ):
+            raise VmPromotionRemoteError("vm_promotion_runtime_artifact_drift")
+        runtime_payloads[relative] = payload
     _git(target, "fetch", "--no-tags", str(candidate), desired)
     if _git(target, "cat-file", "-t", desired) != "commit":
         raise VmPromotionRemoteError("vm_promotion_candidate_commit_unavailable")
@@ -588,6 +621,10 @@ def _promote_component(
     for artifact in spec["runtime_artifacts"]:
         changed.add(_relative(artifact.get("relative_path"), field="runtime_artifact"))
     affected = sorted(changed)
+    execution_order = [relative for relative in runtime_specs if relative in changed]
+    execution_order.extend(
+        relative for relative in affected if relative not in runtime_specs
+    )
     if len(affected) > MAX_AFFECTED_PATHS:
         raise VmPromotionRemoteError("vm_promotion_affected_path_limit")
     component_snapshot = snapshot_root / spec["name"]
@@ -614,24 +651,16 @@ def _promote_component(
     }
     _atomic_write(component_snapshot / "snapshot.json", _canonical_json(snapshot), 0o600)
     try:
-        for relative in affected:
-            runtime_spec = next(
-                (
-                    item
-                    for item in spec["runtime_artifacts"]
-                    if item.get("relative_path") == relative
-                ),
-                None,
-            )
+        for relative in execution_order:
+            runtime_spec = runtime_specs.get(relative)
             if runtime_spec is not None:
-                source = candidate / relative
-                payload = source.read_bytes()
+                observed = _path_fingerprint(target / relative)
                 if (
-                    _sha256_bytes(payload) != runtime_spec.get("sha256")
-                    or len(payload) != runtime_spec.get("size")
+                    observed.get("sha256") == runtime_spec.get("sha256")
+                    and observed.get("size") == runtime_spec.get("size")
                 ):
-                    raise VmPromotionRemoteError("vm_promotion_runtime_artifact_drift")
-                _atomic_write(target / relative, payload, 0o755)
+                    continue
+                _atomic_write(target / relative, runtime_payloads[relative], 0o755)
             else:
                 _materialize_tree_path(target, desired, relative)
         _git(target, "update-ref", "--no-deref", "HEAD", desired, before["head"])
@@ -674,7 +703,9 @@ def _rollback_component(snapshot: Mapping[str, Any], component_snapshot: Path) -
         if not isinstance(row, Mapping):
             raise VmPromotionRemoteError("vm_promotion_snapshot_invalid")
         relative = _relative(row.get("relative_path"), field="rollback_path")
-        _restore_path(target / relative, row, blob_root)
+        path = target / relative
+        if not _snapshot_path_matches(path, row):
+            _restore_path(path, row, blob_root)
     old = _commit(snapshot.get("head"), field="rollback_head")
     current = _commit(_git(target, "rev-parse", "HEAD"), field="rollback_current")
     _git(target, "update-ref", "--no-deref", "HEAD", old, current)
