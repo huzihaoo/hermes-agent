@@ -54,6 +54,7 @@ VM_TOPIC_EXTRACTOR = (
 DEFAULT_SSH_MINI_AGENT = Path.home() / ".local/bin/ssh-mini-agent"
 REMOTE_HELPER_PATH = Path(__file__).with_name("pnc_rca_vm_promotion_remote.py")
 MAX_REMOTE_OUTPUT_BYTES = 2 * 1024 * 1024
+REMOTE_RUNNER_TIMEOUT_SECONDS = 180
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _RELEASE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{7,127}\Z")
 
@@ -358,6 +359,8 @@ def _remote_program(request: Mapping[str, Any]) -> str:
 
 def _default_remote_runner(request: Mapping[str, Any]) -> Mapping[str, Any]:
     program = _remote_program(request)
+    environment = os.environ.copy()
+    environment["SSH_MINI_AGENT_TIMEOUT"] = str(REMOTE_RUNNER_TIMEOUT_SECONDS)
     try:
         result = subprocess.run(
             [str(DEFAULT_SSH_MINI_AGENT), "run_py_json"],
@@ -365,7 +368,8 @@ def _default_remote_runner(request: Mapping[str, Any]) -> Mapping[str, Any]:
             check=False,
             capture_output=True,
             text=True,
-            timeout=180,
+            timeout=REMOTE_RUNNER_TIMEOUT_SECONDS + 20,
+            env=environment,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise VmPromotionError("vm_promotion_remote_unavailable") from exc

@@ -136,6 +136,32 @@ def _observation(request: dict) -> dict:
     }
 
 
+def test_default_remote_runner_extends_ssh_mini_wrapper_timeout(monkeypatch):
+    captured = {}
+
+    def run(argv, **kwargs):
+        captured["argv"] = argv
+        captured.update(kwargs)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"ok": True}),
+            stderr="",
+        )
+
+    monkeypatch.setenv("SSH_MINI_AGENT_TIMEOUT", "20")
+    monkeypatch.setattr(promotion.subprocess, "run", run)
+
+    result = promotion._default_remote_runner({"mode": "observe"})
+
+    assert result == {"ok": True}
+    assert captured["argv"] == [
+        str(promotion.DEFAULT_SSH_MINI_AGENT),
+        "run_py_json",
+    ]
+    assert captured["env"]["SSH_MINI_AGENT_TIMEOUT"] == "180"
+    assert captured["timeout"] == 200
+
+
 def test_build_plan_binds_bom_candidates_live_prestate_and_helper(fixture):
     inputs, binding = fixture
     calls = []
