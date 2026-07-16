@@ -1595,9 +1595,7 @@ def test_launchctl_start_uses_exact_argv_without_shell(candidate):
     )
     assert candidate.runner.calls == [tuple(command) for command in commands]
     assert all(call[0] == "/bin/launchctl" for call in candidate.runner.calls)
-    assert candidate.services.waited_until_unloaded == list(
-        cutover.GATEWAY_AUX_LABELS[1:]
-    )
+    assert candidate.services.waited_until_unloaded == []
     cutover._validate_step_result(
         result,
         step="start_gateway_aux",
