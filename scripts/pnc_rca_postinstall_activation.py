@@ -13,9 +13,18 @@ import json
 import os
 from pathlib import Path
 import re
+import sqlite3
 import stat
 from typing import Any
 
+from gateway.pnc_rca_control_store import (
+    CONTROL_STORE_SCHEMA_VERSION,
+    RcaControlStore,
+)
+from gateway.pnc_rca_delivery_store import (
+    DELIVERY_STORE_SCHEMA_VERSION,
+    RcaDeliveryStore,
+)
 from scripts import pnc_rca_activation as activation
 from scripts import pnc_rca_cutover_adapter as adapter
 from scripts import pnc_rca_cutover_live as live
@@ -27,6 +36,7 @@ JOURNAL_SCHEMA_VERSION = "pnc_rca_postinstall_activation_step_v1"
 RECEIPT_SCHEMA_VERSION = "pnc_rca_postinstall_activation_receipt_v1"
 RESIDENT_INTENT_SCHEMA_VERSION = "pnc_rca_resident_start_intent_v1"
 RESIDENT_DONE_SCHEMA_VERSION = "pnc_rca_resident_start_receipt_v1"
+STORE_WAL_SCHEMA_VERSION = "pnc_rca_postinstall_store_wal_v1"
 AUTHORIZATION_DECISION = "authorize_exact_rca_postinstall_bounded_canary_bootstrap"
 MAX_COMMAND_OUTPUT_BYTES = 8 * 1024 * 1024
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -407,6 +417,129 @@ def _require_gate_pair(receipt: Path, capsule: Path) -> None:
         cutover._read_owned_json(path, artifact="postinstall_gate_artifact")
 
 
+def _control_store_runtime_identity(path: Path) -> Mapping[str, Any]:
+    selected = path.expanduser().absolute()
+    try:
+        info = selected.lstat()
+    except OSError as exc:
+        raise PostinstallActivationError("postinstall_control_store_invalid") from exc
+    if (
+        not selected.is_absolute()
+        or stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_size <= 0
+    ):
+        raise PostinstallActivationError("postinstall_control_store_invalid")
+    try:
+        connection = sqlite3.connect(
+            f"{selected.resolve(strict=True).as_uri()}?mode=ro",
+            uri=True,
+        )
+        connection.execute("PRAGMA query_only=ON")
+        journal_mode = str(
+            connection.execute("PRAGMA journal_mode").fetchone()[0]
+        ).lower()
+        control_schema = connection.execute(
+            "SELECT value FROM control_meta WHERE key='schema_version'"
+        ).fetchone()
+        delivery_schema = connection.execute(
+            "SELECT value FROM rca_delivery_meta WHERE key='schema_version'"
+        ).fetchone()
+        genesis_rows = connection.execute(
+            "SELECT 'control.' || key, value FROM control_meta "
+            "WHERE key IN ('fresh_install_db_instance_id', "
+            "'fresh_install_genesis_intent_sha256', 'fresh_install_origin_commit') "
+            "UNION ALL "
+            "SELECT 'delivery.' || key, value FROM rca_delivery_meta "
+            "WHERE key IN ('fresh_install_db_instance_id', "
+            "'fresh_install_genesis_intent_sha256', 'fresh_install_origin_commit') "
+            "ORDER BY 1"
+        ).fetchall()
+        quick_check = str(connection.execute("PRAGMA quick_check").fetchone()[0])
+        foreign_key_error = connection.execute("PRAGMA foreign_key_check").fetchone()
+    except (OSError, sqlite3.Error, TypeError) as exc:
+        raise PostinstallActivationError("postinstall_control_store_invalid") from exc
+    finally:
+        if "connection" in locals():
+            connection.close()
+    if (
+        control_schema is None
+        or str(control_schema[0]) != CONTROL_STORE_SCHEMA_VERSION
+        or delivery_schema is None
+        or str(delivery_schema[0]) != DELIVERY_STORE_SCHEMA_VERSION
+        or len(genesis_rows) != 6
+        or quick_check.lower() != "ok"
+        or foreign_key_error is not None
+        or journal_mode not in {"delete", "wal"}
+    ):
+        raise PostinstallActivationError("postinstall_control_store_invalid")
+    return {
+        "path": str(selected),
+        "device": int(info.st_dev),
+        "inode": int(info.st_ino),
+        "mode": "0600",
+        "journal_mode": journal_mode,
+        "schemas": {
+            "control": str(control_schema[0]),
+            "delivery": str(delivery_schema[0]),
+        },
+        "genesis_meta": {str(key): str(value) for key, value in genesis_rows},
+    }
+
+
+def _prepare_control_store_wal(path: Path, receipt_path: Path) -> Mapping[str, Any]:
+    before = _control_store_runtime_identity(path)
+    if receipt_path.exists() or receipt_path.is_symlink():
+        receipt = cutover._read_owned_json(
+            receipt_path, artifact="postinstall_store_wal"
+        ).body
+        current = _control_store_runtime_identity(path)
+        if (
+            receipt.get("schema_version") != STORE_WAL_SCHEMA_VERSION
+            or receipt.get("ok") is not True
+            or receipt.get("database_identity")
+            != {key: current[key] for key in current if key != "journal_mode"}
+            or receipt.get("after_journal_mode") != "wal"
+            or current.get("journal_mode") != "wal"
+        ):
+            raise PostinstallActivationError("postinstall_store_wal_receipt_invalid")
+        return receipt
+    try:
+        control_settings = RcaControlStore(
+            path, require_current=True
+        ).journal_settings()
+        delivery_settings = RcaDeliveryStore(
+            path, require_current=True
+        ).journal_settings()
+    except (OSError, RuntimeError, sqlite3.Error) as exc:
+        raise PostinstallActivationError("postinstall_store_wal_prepare_failed") from exc
+    after = _control_store_runtime_identity(path)
+    if (
+        after.get("journal_mode") != "wal"
+        or control_settings.get("journal_mode") != "wal"
+        or delivery_settings.get("journal_mode") != "wal"
+        or {key: before[key] for key in before if key != "journal_mode"}
+        != {key: after[key] for key in after if key != "journal_mode"}
+    ):
+        raise PostinstallActivationError("postinstall_store_wal_prepare_failed")
+    receipt = {
+        "schema_version": STORE_WAL_SCHEMA_VERSION,
+        "ok": True,
+        "database_identity": {
+            key: after[key] for key in after if key != "journal_mode"
+        },
+        "before_journal_mode": before["journal_mode"],
+        "after_journal_mode": after["journal_mode"],
+        "control_settings": control_settings,
+        "delivery_settings": delivery_settings,
+    }
+    cutover._publish_no_clobber(receipt_path, receipt)
+    return receipt
+
+
 def _validate_initial_resident_state(value: Any) -> Mapping[str, Any]:
     if not isinstance(value, Mapping) or set(value) != {
         "schema_version",
@@ -482,6 +615,11 @@ def run_postinstall_activation(
             inputs.preauthorization_receipt,
             inputs.preauthorization_capsule,
         )
+        _prepare_control_store_wal(
+            inputs.control_db,
+            inputs.journal_root / f"{index + 1:02d}-control-store-wal.json",
+        )
+        index += 1
         created, index = _run_activation_pair(
             inputs=inputs,
             runner=active_runner,

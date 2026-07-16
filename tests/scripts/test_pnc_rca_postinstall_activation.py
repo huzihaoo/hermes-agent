@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sqlite3
 
 import pytest
 
+from gateway.pnc_rca_control_store import RcaControlStore
+from gateway.pnc_rca_delivery_store import RcaDeliveryStore
 from scripts import pnc_rca_activation as activation
 from scripts import pnc_rca_cutover_adapter as adapter
 from scripts import pnc_rca_cutover_live as live
@@ -19,6 +22,25 @@ EPOCH_ID = "rca-activation-20260716"
 def _write_json(path: Path, body: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     path.write_text(json.dumps(body, sort_keys=True) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+
+
+def _combined_store(path: Path, *, journal_mode: str = "delete") -> None:
+    RcaControlStore(path)
+    RcaDeliveryStore(path)
+    with sqlite3.connect(path) as connection:
+        for table in ("control_meta", "rca_delivery_meta"):
+            connection.executemany(
+                f"INSERT OR REPLACE INTO {table}(key, value) VALUES (?, ?)",
+                (
+                    ("fresh_install_db_instance_id", "db-instance-test"),
+                    ("fresh_install_genesis_intent_sha256", "a" * 64),
+                    ("fresh_install_origin_commit", "b" * 40),
+                ),
+            )
+        connection.commit()
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        connection.execute(f"PRAGMA journal_mode={journal_mode.upper()}")
     path.chmod(0o600)
 
 
@@ -161,6 +183,7 @@ def scenario(tmp_path: Path):
         lock_path=root / "postinstall.lock",
         receipt_path=root / "postinstall-receipt.json",
     )
+    _combined_store(inputs.control_db)
     return inputs, FakeRunner(), FakeServices()
 
 
@@ -195,7 +218,7 @@ def test_postinstall_activation_is_resumable_and_starts_exact_residents(
     assert services.verify_calls == 2
     assert services.restore_calls == 0
     assert all(services.loaded.values())
-    assert len(first["step_receipts"]) == call_count
+    assert len(first["step_receipts"]) == call_count + 1
     assert inputs.receipt_path.stat().st_mode & 0o777 == 0o600
 
 
@@ -225,7 +248,7 @@ def test_resident_health_failure_restores_initial_state_and_can_resume(scenario)
 def test_resume_revalidates_activation_journal_contract(scenario) -> None:
     inputs, runner, services = scenario
     _run(inputs, runner, services)
-    journal = inputs.journal_root / "03-activation-create-apply.json"
+    journal = inputs.journal_root / "04-activation-create-apply.json"
     body = json.loads(journal.read_text(encoding="utf-8"))
     body["result"]["applied"] = False
     _write_json(journal, body)
@@ -238,6 +261,49 @@ def test_resume_revalidates_activation_journal_contract(scenario) -> None:
         _run(inputs, runner, services)
 
     assert len(runner.calls) == call_count
+
+
+def test_prepare_control_store_wal_transitions_once_and_is_resumable(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "control.sqlite3"
+    receipt = tmp_path / "02-control-store-wal.json"
+    _combined_store(database)
+
+    first = postinstall._prepare_control_store_wal(database, receipt)
+    second = postinstall._prepare_control_store_wal(database, receipt)
+
+    assert first == second
+    assert first["before_journal_mode"] == "delete"
+    assert first["after_journal_mode"] == "wal"
+    assert database.stat().st_ino == first["database_identity"]["inode"]
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+
+
+def test_prepare_control_store_wal_rejects_noncurrent_database(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "control.sqlite3"
+    receipt = tmp_path / "02-control-store-wal.json"
+    _combined_store(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE control_meta SET value='stale' WHERE key='schema_version'"
+        )
+        connection.commit()
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        connection.execute("PRAGMA journal_mode=DELETE")
+
+    with pytest.raises(
+        postinstall.PostinstallActivationError,
+        match="postinstall_control_store_invalid",
+    ):
+        postinstall._prepare_control_store_wal(database, receipt)
+
+    assert not receipt.exists()
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
 
 
 def test_manifest_validation_is_owner_only_and_read_only(
