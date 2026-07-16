@@ -378,6 +378,14 @@ class LaunchdServiceController:
             started.append(label)
         return started
 
+    def wait_until_unloaded(self, label: str) -> None:
+        _validate_labels((label,))
+        deadline = self._monotonic() + WRITER_STOP_TIMEOUT_SECONDS
+        while self._job(label)["loaded"]:
+            if self._monotonic() >= deadline:
+                raise LiveBoundaryError("cutover_live_service_still_loaded")
+            self._sleeper(WRITER_STOP_POLL_SECONDS)
+
     def restore_state(self, state: Mapping[str, Any]) -> None:
         if (
             not isinstance(state, Mapping)
@@ -398,6 +406,7 @@ class LaunchdServiceController:
                 )
                 if result.returncode != 0:
                     raise LiveBoundaryError("cutover_live_restore_bootout_failed")
+                self.wait_until_unloaded(label)
         for label in labels:
             prior = jobs[label]
             launchd = prior.get("launchd") if isinstance(prior, Mapping) else None

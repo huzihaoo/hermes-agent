@@ -2112,8 +2112,17 @@ def _expected_commands_for_step(step: str, plan: Mapping[str, Any]) -> list[list
                 str(CANONICAL_LAUNCH_AGENTS_ROOT / "ai.hermes.gateway.plist"),
             ],
             *[
-                ["/bin/launchctl", "kickstart", "-k", f"{domain}/{label}"]
+                command
                 for label in plan["gateway_aux_start_order"][1:]
+                for command in (
+                    ["/bin/launchctl", "bootout", f"{domain}/{label}"],
+                    [
+                        "/bin/launchctl",
+                        "bootstrap",
+                        domain,
+                        str(CANONICAL_LAUNCH_AGENTS_ROOT / f"{label}.plist"),
+                    ],
+                )
             ],
         ]
     if step == "rollback":

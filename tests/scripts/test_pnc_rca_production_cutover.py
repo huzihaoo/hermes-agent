@@ -1377,8 +1377,21 @@ def test_preflight_binds_exact_start_commands_and_order(fixture) -> None:
             str(cutover.CANONICAL_LAUNCH_AGENTS_ROOT / "ai.hermes.gateway.plist"),
         ],
         *[
-            ["/bin/launchctl", "kickstart", "-k", f"gui/{os.geteuid()}/{label}"]
+            command
             for label in cutover.GATEWAY_AUX_LABELS[1:]
+            for command in (
+                [
+                    "/bin/launchctl",
+                    "bootout",
+                    f"gui/{os.geteuid()}/{label}",
+                ],
+                [
+                    "/bin/launchctl",
+                    "bootstrap",
+                    f"gui/{os.geteuid()}",
+                    str(cutover.CANONICAL_LAUNCH_AGENTS_ROOT / f"{label}.plist"),
+                ],
+            )
         ],
     ]
     assert "start_residents" not in cutover.STEP_NAMES

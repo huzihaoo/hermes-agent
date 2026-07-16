@@ -473,6 +473,66 @@ def test_launchd_controller_snapshots_and_restores_bound_precutover_state(
     assert all(jobs[label]["loaded"] for label in cutover.SERVICE_LABELS)
 
 
+def test_launchd_controller_waits_for_async_bootout_before_restore_bootstrap(
+    tmp_path,
+) -> None:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    plists = tmp_path / "LaunchAgents"
+    jobs = _service_jobs()
+    for label in jobs:
+        _plist(plists / f"{label}.plist", label, runtime)
+
+    class AsyncBootoutRunner(FakeRunner):
+        def run(self, argv) -> adapter.CommandResult:
+            command = tuple(argv)
+            if command[1] == "bootout":
+                self.calls.append(command)
+                label = command[2].rsplit("/", 1)[-1]
+                self.jobs[label]["bootout_polls"] = 2
+                return adapter.CommandResult(command, 0)
+            if command[1] == "print":
+                label = command[2].rsplit("/", 1)[-1]
+                remaining = self.jobs[label].get("bootout_polls")
+                if remaining is not None:
+                    if remaining == 0:
+                        self.jobs[label].update(
+                            loaded=False, pid=None, state="absent"
+                        )
+                        del self.jobs[label]["bootout_polls"]
+                    else:
+                        self.jobs[label]["bootout_polls"] = remaining - 1
+            if command[1] == "bootstrap":
+                label = Path(command[3]).stem
+                if self.jobs[label]["loaded"]:
+                    self.calls.append(command)
+                    return adapter.CommandResult(command, 5, "", "still loaded")
+            return super().run(argv)
+
+    runner = AsyncBootoutRunner(jobs)
+    controller = live.LaunchdServiceController(
+        evidence_root=tmp_path / "evidence",
+        target_runtime_root=runtime,
+        launch_agents_root=plists,
+        runner=runner,
+        sleeper=lambda _seconds: None,
+    )
+    original = controller.capture_state(cutover.SERVICE_LABELS)
+
+    controller.restore_state(original)
+
+    assert all(jobs[label]["loaded"] for label in cutover.SERVICE_LABELS)
+    for label in cutover.SERVICE_LABELS:
+        bootout = ("/bin/launchctl", "bootout", f"gui/{os.geteuid()}/{label}")
+        bootstrap = (
+            "/bin/launchctl",
+            "bootstrap",
+            f"gui/{os.geteuid()}",
+            str(plists / f"{label}.plist"),
+        )
+        assert runner.calls.index(bootout) < runner.calls.index(bootstrap)
+
+
 def test_launchd_controller_rejects_precutover_snapshot_while_writer_loaded(
     tmp_path,
 ) -> None:

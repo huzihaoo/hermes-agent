@@ -78,6 +78,8 @@ class ServiceController(Protocol):
         self, labels: Sequence[str], *, runtime_sha256: str
     ) -> Mapping[str, Any]: ...
 
+    def wait_until_unloaded(self, label: str) -> None: ...
+
     def restore_state(self, state: Mapping[str, Any]) -> None: ...
 
 
@@ -712,6 +714,10 @@ def _validate_logical_commands(
                 if len(command) != 4 or not command[3].startswith(f"{domain}/"):
                     raise CutoverAdapterError("cutover_adapter_launchctl_argv_invalid")
                 label = command[3].removeprefix(f"{domain}/")
+            elif command[1] == "bootout":
+                if len(command) != 3 or not command[2].startswith(f"{domain}/"):
+                    raise CutoverAdapterError("cutover_adapter_launchctl_argv_invalid")
+                label = command[2].removeprefix(f"{domain}/")
             elif command[1] == "bootstrap":
                 if len(command) != 4 or command[2] != domain:
                     raise CutoverAdapterError("cutover_adapter_launchctl_argv_invalid")
@@ -2237,10 +2243,15 @@ class ProductionCutoverAdapter:
         elif step == "start_gateway_aux":
             if self._runner is None:
                 raise CutoverAdapterError("cutover_adapter_command_runner_required")
+            if self._services is None:
+                raise CutoverAdapterError("cutover_adapter_service_controller_required")
             for command in commands:
                 result = self._runner.run(command)
                 if tuple(command) != result.argv or result.returncode != 0:
                     raise CutoverAdapterError("cutover_adapter_launchctl_failed")
+                if command[1] == "bootout":
+                    label = command[2].rsplit("/", 1)[-1]
+                    self._services.wait_until_unloaded(label)
             started = plan["gateway_aux_start_order"]
         elif step == "verify_gateway_aux":
             if self._services is None:

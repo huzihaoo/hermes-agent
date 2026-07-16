@@ -141,6 +141,7 @@ class FakeServices:
         self.state = state
         self.evidence_root = evidence_root
         self.restored: dict | None = None
+        self.waited_until_unloaded: list[str] = []
 
     def capture_state(self, labels):
         return {"labels": list(labels), "generation": self.state["services_generation"]}
@@ -182,6 +183,9 @@ class FakeServices:
             }
             for index, label in enumerate(labels, 1)
         }
+
+    def wait_until_unloaded(self, label):
+        self.waited_until_unloaded.append(label)
 
     def restore_state(self, state):
         self.restored = dict(state)
@@ -1590,6 +1594,9 @@ def test_launchctl_start_uses_exact_argv_without_shell(candidate):
     )
     assert candidate.runner.calls == [tuple(command) for command in commands]
     assert all(call[0] == "/bin/launchctl" for call in candidate.runner.calls)
+    assert candidate.services.waited_until_unloaded == list(
+        cutover.GATEWAY_AUX_LABELS[1:]
+    )
     cutover._validate_step_result(
         result,
         step="start_gateway_aux",
