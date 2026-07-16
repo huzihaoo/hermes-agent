@@ -74,6 +74,8 @@ class ServiceController(Protocol):
         lease_token: str,
     ) -> Mapping[str, Any]: ...
 
+    def quiesce_runtime(self, labels: Sequence[str]) -> Sequence[str]: ...
+
     def verify(
         self, labels: Sequence[str], *, runtime_sha256: str
     ) -> Mapping[str, Any]: ...
@@ -688,6 +690,7 @@ def _validate_logical_commands(
             subcommand = command[1] if len(command) > 1 else ""
             arity = {
                 "stop-writers": 2 + len(cutover.RUNTIME_QUIESCE_LABELS),
+                "quiesce-runtime": 2 + len(cutover.RUNTIME_QUIESCE_LABELS),
                 "install-owner-file": 5,
                 "install-retained-tree": 5,
                 "transition-bounded-activation": 3,
@@ -695,9 +698,9 @@ def _validate_logical_commands(
             }.get(subcommand)
             if arity is None or len(command) != arity:
                 raise CutoverAdapterError("cutover_adapter_subcommand_invalid")
-            if subcommand == "stop-writers" and tuple(command[2:]) != tuple(
-                cutover.RUNTIME_QUIESCE_LABELS
-            ):
+            if subcommand in {"stop-writers", "quiesce-runtime"} and tuple(
+                command[2:]
+            ) != tuple(cutover.RUNTIME_QUIESCE_LABELS):
                 raise CutoverAdapterError("cutover_adapter_writer_labels_invalid")
             if subcommand in {"install-owner-file", "install-retained-tree"}:
                 if not Path(command[2]).is_absolute() or not Path(command[3]).is_absolute():
@@ -2296,6 +2299,13 @@ class ProductionCutoverAdapter:
             != plan["bindings"]["rollback_live_identity_sha256"]
         ):
             raise CutoverAdapterError("cutover_adapter_snapshot_binding_invalid")
+        if self._services is None:
+            raise CutoverAdapterError("cutover_adapter_service_controller_required")
+        quiesced = self._services.quiesce_runtime(
+            cutover.RUNTIME_QUIESCE_LABELS
+        )
+        if tuple(quiesced) != cutover.RUNTIME_QUIESCE_LABELS:
+            raise CutoverAdapterError("cutover_adapter_runtime_quiesce_invalid")
         self._restore_snapshot(snapshot, plan)
         return self._base_result(
             step="rollback",

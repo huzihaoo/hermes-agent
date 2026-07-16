@@ -659,6 +659,33 @@ def test_launchd_controller_quiesces_exact_runtime_set_and_writes_receipt(
     )
 
 
+def test_launchd_controller_quiesces_runtime_without_writer_receipt(
+    tmp_path,
+) -> None:
+    jobs = {
+        label: {
+            "loaded": True,
+            "state": "running",
+            "pid": 200 + index,
+            "last_exit_status": None,
+        }
+        for index, label in enumerate(cutover.RUNTIME_QUIESCE_LABELS)
+    }
+    runner = FakeRunner(jobs)
+    controller = live.LaunchdServiceController(
+        evidence_root=tmp_path / "evidence",
+        target_runtime_root=tmp_path / "runtime",
+        launch_agents_root=tmp_path / "LaunchAgents",
+        runner=runner,
+    )
+
+    quiesced = controller.quiesce_runtime(cutover.RUNTIME_QUIESCE_LABELS)
+
+    assert quiesced == list(cutover.RUNTIME_QUIESCE_LABELS)
+    assert all(not job["loaded"] for job in jobs.values())
+    assert not (tmp_path / "evidence" / live.WRITER_STOP_FILENAME).exists()
+
+
 def test_launchd_controller_rejects_writer_only_quiesce_set(tmp_path) -> None:
     controller = live.LaunchdServiceController(
         evidence_root=tmp_path / "evidence",

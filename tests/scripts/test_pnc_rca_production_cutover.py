@@ -1377,6 +1377,11 @@ def test_preflight_binds_exact_start_commands_and_order(fixture) -> None:
             *cutover.RUNTIME_QUIESCE_LABELS,
         ]
     ]
+    assert cutover._expected_commands_for_step("rollback", plan)[0] == [
+        cutover.CUTOVER_ADAPTER_EXECUTABLE,
+        "quiesce-runtime",
+        *cutover.RUNTIME_QUIESCE_LABELS,
+    ]
     assert "ai.hermes.gateway.candidate.plist" in cutover.CANDIDATE_PLISTS
     assert cutover._expected_start_commands("start_gateway_aux", plan) == [
         [

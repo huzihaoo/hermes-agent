@@ -123,6 +123,11 @@ class FakeServices:
         self.stopped = True
         return {"ok": True, "receipt_path": "/fixture/writer-evidence.json"}
 
+    def quiesce_runtime(self, labels):
+        assert tuple(labels) == cutover.RUNTIME_QUIESCE_LABELS
+        self.events.append(f"quiesce:{self.name}")
+        return list(labels)
+
     def restore_state(self, state):
         assert state == self.precutover
         self.events.append(f"restore:{self.name}")

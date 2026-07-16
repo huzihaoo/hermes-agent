@@ -239,6 +239,24 @@ class LaunchdServiceController:
             raise LiveBoundaryError("cutover_live_precutover_gateway_state_invalid")
         return json.loads(json.dumps(prior))
 
+    def quiesce_runtime(self, labels: Sequence[str]) -> list[str]:
+        normalized = _validate_labels(labels)
+        if normalized != cutover.RUNTIME_QUIESCE_LABELS:
+            raise LiveBoundaryError("cutover_live_runtime_quiesce_labels_invalid")
+        deadline = self._monotonic() + WRITER_STOP_TIMEOUT_SECONDS
+        for label in normalized:
+            if self._job(label)["loaded"]:
+                result = self._run(
+                    ("/bin/launchctl", "bootout", f"{self._domain}/{label}")
+                )
+                if result.returncode != 0:
+                    raise LiveBoundaryError("cutover_live_writer_bootout_failed")
+            while self._job(label)["loaded"]:
+                if self._monotonic() >= deadline:
+                    raise LiveBoundaryError("cutover_live_writer_still_loaded")
+                self._sleeper(WRITER_STOP_POLL_SECONDS)
+        return list(normalized)
+
     def stop_writers(
         self,
         labels: Sequence[str],
@@ -254,18 +272,8 @@ class LaunchdServiceController:
         )
         if not isinstance(lease_token, str) or len(lease_token) < 16:
             raise LiveBoundaryError("cutover_live_lease_token_invalid")
+        self.quiesce_runtime(normalized)
         deadline = self._monotonic() + WRITER_STOP_TIMEOUT_SECONDS
-        for label in normalized:
-            if self._job(label)["loaded"]:
-                result = self._run(
-                    ("/bin/launchctl", "bootout", f"{self._domain}/{label}")
-                )
-                if result.returncode != 0:
-                    raise LiveBoundaryError("cutover_live_writer_bootout_failed")
-            while self._job(label)["loaded"]:
-                if self._monotonic() >= deadline:
-                    raise LiveBoundaryError("cutover_live_writer_still_loaded")
-                self._sleeper(WRITER_STOP_POLL_SECONDS)
         while True:
             try:
                 evidence = self._writer_stop_collector()

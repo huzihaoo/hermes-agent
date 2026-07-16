@@ -2116,6 +2116,7 @@ def _expected_commands_for_step(step: str, plan: Mapping[str, Any]) -> list[list
         ]
     if step == "rollback":
         return [
+            [adapter, "quiesce-runtime", *RUNTIME_QUIESCE_LABELS],
             [
                 adapter,
                 "restore-exact-snapshot",

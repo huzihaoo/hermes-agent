@@ -142,6 +142,7 @@ class FakeServices:
         self.evidence_root = evidence_root
         self.restored: dict | None = None
         self.waited_until_unloaded: list[str] = []
+        self.runtime_quiesced: list[str] = []
 
     def capture_state(self, labels):
         return {"labels": list(labels), "generation": self.state["services_generation"]}
@@ -184,6 +185,10 @@ class FakeServices:
             }
             for index, label in enumerate(labels, 1)
         }
+
+    def quiesce_runtime(self, labels):
+        self.runtime_quiesced = list(labels)
+        return list(labels)
 
     def wait_until_unloaded(self, label):
         self.waited_until_unloaded.append(label)
@@ -785,6 +790,9 @@ def test_snapshot_install_and_rollback_restore_exact_fake_live_state(candidate):
     assert live_env.read_bytes() == b"OLD=1\n"
     assert live_binding.read_bytes() == b'{"active":false}\n'
     assert rollback_result["after_identity_sha256"] == before
+    assert candidate.services.runtime_quiesced == list(
+        cutover.RUNTIME_QUIESCE_LABELS
+    )
 
 
 def test_rollback_transaction_resumes_after_hard_crash(candidate):
