@@ -1287,6 +1287,30 @@ def test_runtime_stage_reader_uses_canonical_manifest_size_limit(prepared_fixtur
     ).hexdigest()
 
 
+def test_release_approval_request_reader_uses_dedicated_size_limit(
+    tmp_path,
+):
+    path = tmp_path / "large-approval-request.json"
+    _write_owner_json(path, {"padding": "x" * (prepare.MAX_JSON_BYTES + 1)})
+    assert path.stat().st_size > prepare.MAX_JSON_BYTES
+    assert (
+        path.stat().st_size
+        < prepare.RELEASE_APPROVAL_REQUEST_MAX_BYTES
+        <= prepare.runtime_stage.MAX_JSON_BYTES + (4 * prepare.MAX_JSON_BYTES)
+    )
+
+    owned = prepare._read_owned_json(
+        path,
+        artifact="release_approval_request",
+        max_bytes=prepare.RELEASE_APPROVAL_REQUEST_MAX_BYTES,
+    )
+
+    assert len(owned.body["padding"]) == prepare.MAX_JSON_BYTES + 1
+    with pytest.raises(prepare.ReleasePrepareError) as error:
+        prepare._read_owned_json(path, artifact="ordinary_artifact")
+    assert error.value.code == "ordinary_artifact_size_invalid"
+
+
 def test_runtime_stage_manifest_is_revalidated_and_drift_fails(prepared_fixture):
     calls = 0
 

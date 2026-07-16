@@ -48,6 +48,9 @@ T0_BINDING_SCHEMA_VERSION = "pnc_rca_release_t0_binding_v1"
 APPROVAL_DECISION = "authorize_rca_production_cutover_plan"
 APPROVAL_IDENTITY_METHOD = "kernel_owner_and_machine_binding"
 MAX_JSON_BYTES = 256 * 1024
+RELEASE_APPROVAL_REQUEST_MAX_BYTES = runtime_stage.MAX_JSON_BYTES + (
+    4 * MAX_JSON_BYTES
+)
 MAX_APPROVAL_VALIDITY_SECONDS = 24 * 60 * 60
 MAX_FUTURE_SKEW_SECONDS = 300
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
@@ -1832,6 +1835,8 @@ def prepare_release(
         }
         sensitive_values = _sensitive_env_values(inputs.env_file, raw=env_owned.raw)
         _assert_redacted(approval_request, sensitive_values=sensitive_values)
+        if len(_canonical_json(approval_request)) > RELEASE_APPROVAL_REQUEST_MAX_BYTES:
+            raise ReleasePrepareError("release_approval_request_size_invalid")
         if phase == "request":
             if (
                 _read_owned_file(inputs.env_file, artifact="release_prepare_env").raw
@@ -1856,6 +1861,7 @@ def prepare_release(
         request_owned = _read_owned_json(
             run_root / APPROVAL_REQUEST_FILENAME,
             artifact="release_approval_request",
+            max_bytes=RELEASE_APPROVAL_REQUEST_MAX_BYTES,
         )
         if request_owned.body != approval_request:
             raise ReleasePrepareError("release_approval_request_drift")
