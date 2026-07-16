@@ -10535,10 +10535,7 @@ def test_production_cutover_gate_requires_writer_stop_before_install():
         after=live,
         evidence={
             "schema_version": "pnc_rca_writer_stop_evidence_v1",
-            "writer_labels": [
-                *release_gate_module.CUTOVER_GATEWAY_AUX_START_ORDER,
-                *release_gate_module.CUTOVER_RESIDENT_START_ORDER,
-            ],
+            "writer_labels": list(release_gate_module.CUTOVER_WRITER_LABELS),
             "receipt_sha256": "d" * 64,
         },
     )
@@ -10563,6 +10560,42 @@ def test_production_cutover_gate_requires_writer_stop_before_install():
         prior_step_receipt=started,
     )
     assert verified["allowed_next_step"] == "verify_gateway_aux"
+
+
+def test_production_cutover_gate_writer_set_matches_executor_and_rejects_aux():
+    assert release_gate_module.CUTOVER_WRITER_LABELS == (
+        production_cutover_module.WRITER_LABELS
+    )
+    artifacts, sha, authorization = _production_cutover_gate_fixture()
+    live = authorization["bindings"]["expected_live_identity_sha256"]
+    stopped = _cutover_prior_receipt(
+        index=2,
+        step="stop_writers",
+        before=live,
+        after=live,
+        evidence={
+            "schema_version": "pnc_rca_writer_stop_evidence_v1",
+            "writer_labels": [
+                *release_gate_module.CUTOVER_GATEWAY_AUX_START_ORDER,
+                *release_gate_module.CUTOVER_RESIDENT_START_ORDER,
+            ],
+            "receipt_sha256": "d" * 64,
+        },
+    )
+
+    with pytest.raises(
+        release_gate_module.EvidenceError,
+        match="production_cutover_writer_stop_evidence_invalid",
+    ):
+        release_gate_module.validate_rca_cutover_execution_authorization(
+            artifacts=artifacts,
+            artifact_sha256=sha,
+            cutover_lease_fingerprint="1" * 64,
+            cutover_authorization=authorization,
+            requested_step="install_feishu_sidecar",
+            live_identity_sha256=live,
+            prior_step_receipt=stopped,
+        )
 
 
 @pytest.mark.parametrize(

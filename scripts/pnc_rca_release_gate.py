@@ -418,6 +418,10 @@ CUTOVER_RESIDENT_START_ORDER = (
     "local.pnc.rca-delivery-collector",
     "local.pnc.rca-delivery-dispatcher",
 )
+CUTOVER_WRITER_LABELS = (
+    CUTOVER_GATEWAY_AUX_START_ORDER[0],
+    *CUTOVER_RESIDENT_START_ORDER,
+)
 CUTOVER_STEP_NAMES = (
     "snapshot_live",
     "stop_writers",
@@ -13999,7 +14003,7 @@ def _validate_cutover_prior_step(
         if (
             evidence_map.get("schema_version") != "pnc_rca_writer_stop_evidence_v1"
             or evidence_map.get("writer_labels")
-            != [*CUTOVER_GATEWAY_AUX_START_ORDER, *CUTOVER_RESIDENT_START_ORDER]
+            != list(CUTOVER_WRITER_LABELS)
         ):
             raise EvidenceError("production_cutover_writer_stop_evidence_invalid")
         _sha256_digest(
