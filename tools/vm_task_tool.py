@@ -160,6 +160,10 @@ _RCA_ADMISSION_JSON_BEGIN = "<!-- G1Q3_RCA_ADMISSION_JSON:BEGIN -->"
 _RCA_ADMISSION_JSON_END = "<!-- G1Q3_RCA_ADMISSION_JSON:END -->"
 _RCA_EXECUTION_REQUEST_JSON_BEGIN = "<!-- G1Q3_RCA_EXECUTION_REQUEST_JSON:BEGIN -->"
 _RCA_EXECUTION_REQUEST_JSON_END = "<!-- G1Q3_RCA_EXECUTION_REQUEST_JSON:END -->"
+_RCA_SHARED_STATE_GOAL_PREFIX = (
+    "Execute the governed G1Q3 RCA issue intake represented by the validated "
+    "contracts below."
+)
 _RCA_VM_REPO_ROOT = "/home/mini/data3/yj-evaluation-server"
 _RCA_FIXED_CLI_RELATIVE_PATH = "./api/g1q3_rca/scripts/run_rca_service_request.py"
 _RCA_VM_TASK_ROOT = "/home/mini/.hermes/shared-state/tasks"
@@ -680,6 +684,8 @@ def _rca_fixed_cli_goal(
         raise ValueError("RCA contract data contains a reserved goal marker")
     goal_path = f"{_RCA_VM_TASK_ROOT}/{safe_task_id}/goal.md"
     return "\n".join([
+        _RCA_SHARED_STATE_GOAL_PREFIX,
+        "",
         "# Governed G1Q3 RCA service request",
         "",
         "Execution contract:",
@@ -690,9 +696,12 @@ def _rca_fixed_cli_goal(
         "",
         _VM_PATH_CONTRACT,
         "",
+        "## RcaAdmission JSON",
         _RCA_ADMISSION_JSON_BEGIN,
         admission_json,
         _RCA_ADMISSION_JSON_END,
+        "",
+        "## RcaExecutionRequest JSON",
         _RCA_EXECUTION_REQUEST_JSON_BEGIN,
         request_json,
         _RCA_EXECUTION_REQUEST_JSON_END,

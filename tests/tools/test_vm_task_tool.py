@@ -79,6 +79,20 @@ def test_rca_shared_state_source_refs_use_exact_create_once_contract():
     assert projected["work_item_id"] == "7051566847"
 
 
+def test_rca_fixed_goal_matches_shared_state_create_once_markers():
+    goal = vm_task_tool.build_rca_fixed_cli_goal(
+        task_id="g1q3-rca-s1-" + "a" * 64,
+        admission={"contract": "admission"},
+        execution_request={"contract": "request"},
+    )
+
+    assert goal.startswith(vm_task_tool._RCA_SHARED_STATE_GOAL_PREFIX)
+    assert "## RcaAdmission JSON\n" in goal
+    assert "## RcaExecutionRequest JSON\n" in goal
+    assert vm_task_tool._RCA_ADMISSION_JSON_BEGIN in goal
+    assert vm_task_tool._RCA_EXECUTION_REQUEST_JSON_BEGIN in goal
+
+
 def test_vm_task_status_schema_is_raw_function_schema():
     schema = registry.get_schema("vm_task_status")
 
