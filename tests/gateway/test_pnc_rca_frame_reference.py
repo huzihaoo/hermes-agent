@@ -34,7 +34,7 @@ def test_parse_frame_reference_converts_exact_local_time_to_management_timestamp
     assert result["management_timestamp"] == expected_timestamp
     assert result["management_timestamp_unit"] == "microseconds_since_unix_epoch"
     assert result["selection"] == "nearest_timestamp"
-    assert result["max_delta_us"] == 100_000
+    assert result["max_delta_us"] == 1_000_000
 
 
 @pytest.mark.parametrize(
@@ -83,9 +83,28 @@ def test_resolve_front_camera_frame_prefers_camera1_and_nearest_earlier_frame():
     assert result["matched_management_timestamp"] == 1_769_759_070_702_000
 
 
+def test_resolve_front_camera_frame_accepts_second_precision_marker_delta():
+    lookup = parse_frame_reference("2026-01-30 15:44:30")
+    lookup["management_timestamp"] = 1_769_759_071_086_000
+    payloads = {
+        "sigmastar.2.camera4.index.json": {
+            "fields": {"timestamp": 0, "frame_id": 3},
+            "index": [["1769759070702000", 0, 0, 243514]],
+        }
+    }
+
+    result = resolve_front_camera_frame(
+        frame_lookup=lookup,
+        index_payloads=payloads,
+    )
+
+    assert result["frame_id"] == "243514"
+    assert result["delta_us"] == 384_000
+
+
 def test_resolve_front_camera_frame_fails_closed_outside_tolerance():
     lookup = parse_frame_reference("2026-01-30 15:44:30")
-    lookup["management_timestamp"] = 1_769_759_071_000_000
+    lookup["management_timestamp"] = 1_769_759_072_000_000
     payloads = {
         "d4q.1.camera1.index.json": {
             "fields": {"timestamp": 0, "frame_id": 3},

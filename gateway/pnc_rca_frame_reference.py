@@ -11,7 +11,9 @@ FRAME_FIELD_NAME = "问题发生frame_id"
 FRAME_TIMEZONE_NAME = "Asia/Shanghai"
 FRAME_TIMEZONE = timezone(timedelta(hours=8), FRAME_TIMEZONE_NAME)
 MANAGEMENT_TIMESTAMP_UNIT = "microseconds_since_unix_epoch"
-DEFAULT_MAX_FRAME_DELTA_US = 100_000
+# Feishu marker times are second-precision, so the corresponding camera frame
+# may be up to one second away after timestamp quantization.
+DEFAULT_MAX_FRAME_DELTA_US = 1_000_000
 DEFAULT_FRONT_CAMERA_TOPIC_PRIORITY = (
     "front_120",
     "camera1",
