@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import importlib
@@ -716,8 +715,11 @@ class ExplicitInitialOffsetListener:
         )
         if not isinstance(committed_offsets, Mapping):
             raise RuntimeError("async_committed_offset_fetch_invalid")
-        local_progress = await asyncio.to_thread(
-            self.store.partition_progress,
+        # kafka-python drives AsyncConsumerRebalanceListener callbacks with its
+        # own coroutine runner, not an asyncio event loop.  ``asyncio.to_thread``
+        # therefore fails here with ``RuntimeError: no running event loop``.
+        # This is one bounded SQLite read during assignment, so keep it inline.
+        local_progress = self.store.partition_progress(
             topic=self.config.topic,
             partitions=(
                 int(topic_partition.partition)

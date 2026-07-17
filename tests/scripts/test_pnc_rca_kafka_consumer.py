@@ -652,6 +652,38 @@ def test_partition_assignment_prefers_committed_offsets_and_applies_t0_only_when
     assert listener.diagnostics()["callback_errors"] == 0
 
 
+def test_partition_assignment_works_without_running_asyncio_loop(tmp_path):
+    config = _config(
+        tmp_path,
+        HERMES_RCA_KAFKA_START_OFFSETS_JSON='{"0": 676}',
+    )
+    topic_partition = namedtuple("TopicPartition", "topic partition")
+    partition = topic_partition(TOPIC, 0)
+
+    class KafkaPythonDrivenConsumer:
+        def __init__(self):
+            self._coordinator = self
+            self.seeks = []
+
+        async def fetch_committed_offsets_async(self, _partitions, **_kwargs):
+            return {partition: SimpleNamespace(offset=-1)}
+
+        def seek(self, assigned_partition, offset):
+            self.seeks.append((assigned_partition, offset))
+
+    consumer = KafkaPythonDrivenConsumer()
+    store = SimpleNamespace(partition_progress=lambda **_kwargs: {})
+    listener = consumer_module.ExplicitInitialOffsetListener(consumer, config, store)
+
+    callback = listener.on_partitions_assigned([partition])
+    with pytest.raises(StopIteration):
+        callback.send(None)
+
+    assert consumer.seeks == [(partition, 676)]
+    assert listener.diagnostics()["assigned_partitions"] == [0]
+    assert listener.diagnostics()["callback_errors"] == 0
+
+
 def test_partition_assignment_fails_closed_when_group_and_t0_offset_are_missing(
     tmp_path,
 ):
