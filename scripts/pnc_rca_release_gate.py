@@ -20688,6 +20688,58 @@ def _check_candidate_service_configs(
     }
 
 
+def _installed_runtime_launchd_config_sha256(
+    runtime_detail: Mapping[str, Any],
+    *,
+    candidate_runtime_root: Path | None,
+) -> str:
+    observed = _sha256_digest(
+        runtime_detail.get("launchd_config_sha256"),
+        "runtime_dependencies.launchd_config_sha256",
+    )
+    if (
+        candidate_runtime_root is None
+        or candidate_runtime_root.expanduser().absolute()
+        != CANONICAL_FUTURE_RUNTIME_ROOT
+    ):
+        return observed
+
+    processes = _mapping(
+        runtime_detail.get("service_processes"),
+        "runtime_dependencies.service_processes",
+    )
+    filenames = {
+        label: filename
+        for filename, (label, _script) in CANDIDATE_SERVICES.items()
+    }
+    if set(processes) != set(filenames):
+        raise EvidenceError("runtime_candidate_service_processes_incomplete")
+    normalized_processes = {
+        label: {
+            **dict(_mapping(processes[label], f"runtime_dependencies.{label}")),
+            "candidate_plist_path": str(
+                CANONICAL_FUTURE_RUNTIME_ROOT / filenames[label]
+            ),
+        }
+        for label in sorted(processes)
+    }
+    launchd = {
+        label: {
+            "program_arguments": process["program_arguments"],
+            "working_directory": process["working_directory"],
+            "environment": process["environment"],
+            "plist_sha256": process["plist_sha256"],
+        }
+        for label, process in normalized_processes.items()
+    }
+    return _sha256_json({
+        "launchd": launchd,
+        "service_configs": runtime_detail.get("service_configs"),
+        "service_dependencies": runtime_detail.get("service_dependencies"),
+        "service_processes": normalized_processes,
+    })
+
+
 REQUIRED_ACTIVATION_SLOTS = {
     "kafka_success": "kafka",
     "manual_success": "manual",
@@ -25662,17 +25714,16 @@ def evaluate_release_gate(
         checks.fail("manual_terminal_failure_delivery", exc.code)
 
     try:
-        runtime_probe_root = (
-            settings.candidate_runtime_root or settings.host_repo_root
-        )
         runtime_detail = check_candidate_runtime_dependencies(
-            runtime_probe_root,
+            settings.host_repo_root,
             runtime_root=settings.candidate_runtime_root,
         )
         try:
-            runtime_launchd_config_sha256 = _sha256_digest(
-                runtime_detail.get("launchd_config_sha256"),
-                "runtime_dependencies.launchd_config_sha256",
+            runtime_launchd_config_sha256 = (
+                _installed_runtime_launchd_config_sha256(
+                    runtime_detail,
+                    candidate_runtime_root=settings.candidate_runtime_root,
+                )
             )
         except EvidenceError as exc:
             raise EvidenceError(

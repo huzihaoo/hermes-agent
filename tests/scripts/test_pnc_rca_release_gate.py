@@ -11717,7 +11717,7 @@ def test_release_gate_blocks_when_candidate_runtime_dependencies_are_missing(
     assert "runtime_dependency_missing" in report["blockers"]
 
 
-def test_release_gate_probes_the_installed_candidate_runtime_root(
+def test_release_gate_probes_source_plists_against_installed_runtime_root(
     tmp_path, monkeypatch
 ):
     consumer, dispatcher, settings = _gate(tmp_path, "shadow")
@@ -11744,7 +11744,7 @@ def test_release_gate_probes_the_installed_candidate_runtime_root(
         now=NOW,
     )
 
-    assert observed == [(installed_root, installed_root)]
+    assert observed == [(settings.host_repo_root, installed_root)]
 
 
 @pytest.mark.parametrize(
