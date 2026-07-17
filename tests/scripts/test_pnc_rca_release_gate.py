@@ -2446,8 +2446,8 @@ def _remote_reader_health() -> dict:
         "reader_import_scope": "sidecar_only",
         "timeout_seconds": 120,
         "module_path": (
-            "/home/mini/data3/yj-evaluation-server/api/g1q3_rca/vendor/"
-            "pdcl_pyclip-0.1.6+rca.2-py3-none-any.whl/pdcl_pyclip/reader.py"
+            "/home/mini/data3/yj-evaluation-server/.rca-runtime/"
+            "site-packages/pdcl_pyclip/reader.py"
         ),
         "distribution": "pdcl_pyclip",
         "version": "0.1.6+rca.2",
@@ -14426,6 +14426,18 @@ def test_live_remote_reader_probe_uses_fixed_vm_wrapper_and_bounded_script(tmp_p
     script = kwargs["input"]
     assert release_gate_module.REMOTE_READER_WHEEL_RELATIVE in script
     assert release_gate_module.REMOTE_READER_MANIFEST_RELATIVE in script
+    assert 'ENV_FILE = Path("/home/mini/.hermes/service.env")' in script
+    assert 'RUNTIME_TARGET = REPO_ROOT / ".rca-runtime/site-packages"' in script
+    assert "sys.path[:0] = [str(WHEEL), str(REPO_ROOT)]" not in script
+    assert script.index("sys.dont_write_bytecode = True") < script.index(
+        "sys.path[:0] = [str(RUNTIME_TARGET), str(REPO_ROOT)]"
+    )
+    assert script.index("os.environ.update(environment)") < script.index(
+        "remote_reader_dependency_doctor(check_runtime_environment=True)"
+    )
+    assert script.index("str(RUNTIME_TARGET)") < script.index(
+        "remote_reader_dependency_doctor(check_runtime_environment=True)"
+    )
     assert "remote_reader_dependency_doctor(check_runtime_environment=True)" in script
     assert "pdcl_pyclip.reader" in script
 

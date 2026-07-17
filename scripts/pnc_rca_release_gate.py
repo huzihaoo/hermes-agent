@@ -2748,9 +2748,7 @@ def _check_remote_reader_health(
         != 120
     ):
         raise EvidenceError("remote_reader_dependency_domain_mismatch")
-    expected_module_suffix = (
-        f"/{PurePosixPath(REMOTE_READER_WHEEL_RELATIVE).name}/pdcl_pyclip/reader.py"
-    )
+    expected_module_suffix = "/.rca-runtime/site-packages/pdcl_pyclip/reader.py"
     if expected_module_suffix not in module_path:
         raise EvidenceError("remote_reader_module_path_unpinned")
     python_version = _required_text(
@@ -14757,7 +14755,9 @@ def _remote_reader_live_probe_script(vm_repo_root: str) -> str:
 import hashlib
 import importlib
 import json
+import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 
@@ -14765,6 +14765,14 @@ REPO_ROOT = Path({vm_repo_root!r})
 WHEEL = REPO_ROOT / {REMOTE_READER_WHEEL_RELATIVE!r}
 MANIFEST = REPO_ROOT / {REMOTE_READER_MANIFEST_RELATIVE!r}
 ADAPTER = REPO_ROOT / {REMOTE_READER_ADAPTER_RELATIVE!r}
+RUNTIME_TARGET = REPO_ROOT / ".rca-runtime/site-packages"
+ENV_FILE = Path("/home/mini/.hermes/service.env")
+REQUIRED_ENV_KEYS = {{
+    "PDCL_BASE_URL",
+    "PDCL_CACHE_MOUNT_POINT",
+    "STS_UID",
+    "STS_SECRET_KEY",
+}}
 
 def sha256_file(path):
     digest = hashlib.sha256()
@@ -14778,7 +14786,34 @@ if not REPO_ROOT.is_absolute():
 for path in (WHEEL, MANIFEST, ADAPTER):
     if path.is_symlink() or not path.is_file():
         raise RuntimeError("remote_reader_fixed_artifact_missing")
-sys.path[:0] = [str(WHEEL), str(REPO_ROOT)]
+env_identity = ENV_FILE.lstat()
+if (
+    ENV_FILE.is_symlink()
+    or not stat.S_ISREG(env_identity.st_mode)
+    or stat.S_IMODE(env_identity.st_mode) != 0o600
+    or env_identity.st_uid != os.getuid()
+):
+    raise RuntimeError("remote_reader_environment_file_invalid")
+environment = {{}}
+for raw_line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+    line = raw_line.strip()
+    if not line or line.startswith("#"):
+        continue
+    if "=" not in line:
+        raise RuntimeError("remote_reader_environment_file_invalid")
+    key, value = line.split("=", 1)
+    key = key.strip()
+    if key in REQUIRED_ENV_KEYS:
+        if key in environment or not value:
+            raise RuntimeError("remote_reader_environment_file_invalid")
+        environment[key] = value
+if set(environment) != REQUIRED_ENV_KEYS:
+    raise RuntimeError("remote_reader_environment_file_invalid")
+os.environ.update(environment)
+if not RUNTIME_TARGET.is_dir():
+    raise RuntimeError("remote_reader_runtime_not_bootstrapped")
+sys.dont_write_bytecode = True
+sys.path[:0] = [str(RUNTIME_TARGET), str(REPO_ROOT)]
 from api.g1q3_rca.remote_reader_adapter import remote_reader_dependency_doctor
 doctor = remote_reader_dependency_doctor(check_runtime_environment=True)
 reader_module = importlib.import_module("pdcl_pyclip.reader")
