@@ -53,6 +53,32 @@ def test_retired_rca_prod_resource_class_is_rejected(monkeypatch):
     assert "invalid resource_class" in trusted["error"]
 
 
+def test_rca_shared_state_source_refs_use_exact_create_once_contract():
+    source_refs = {
+        "project_key": "project-key",
+        "project_simple_name": "G1Q3",
+        "work_item_type_key": "issue",
+        "work_item_id": "7051566847",
+        "rule_version": "rule-v1",
+        "topic": "feishu-project-workflow-event",
+        "partition": 0,
+        "offset": 676,
+    }
+
+    projected = vm_task_tool._rca_shared_state_source_refs(source_refs)
+
+    assert set(projected) == {
+        "project_key",
+        "work_item_type_key",
+        "work_item_id",
+        "rule_version",
+        "topic",
+        "partition",
+        "offset",
+    }
+    assert projected["work_item_id"] == "7051566847"
+
+
 def test_vm_task_status_schema_is_raw_function_schema():
     schema = registry.get_schema("vm_task_status")
 

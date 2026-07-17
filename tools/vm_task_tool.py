@@ -590,6 +590,15 @@ _DEFAULT_VM_CANONICAL_ROOT = (
 )
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _RCA_SOURCE_ID_RE = re.compile(r"^g1q3-rca-source-v1-[0-9a-f]{64}$")
+_RCA_SHARED_STATE_SOURCE_REF_FIELDS = (
+    "project_key",
+    "work_item_type_key",
+    "work_item_id",
+    "rule_version",
+    "topic",
+    "partition",
+    "offset",
+)
 _ALLOWED_LANES = {"fast", "standard", "heavy"}
 _ALLOWED_RESOURCE_CLASSES = {"cpu", "io", "repo", "pnc_data", "network", "mixed"}
 _ALLOWED_WORKSPACE_SCOPES = {
@@ -627,6 +636,14 @@ def _goal_with_vm_path_contract(goal: str) -> str:
     if "VM path contract:" in goal:
         return goal
     return f"{goal.rstrip()}\n\n{_VM_PATH_CONTRACT}\n"
+
+
+def _rca_shared_state_source_refs(source_refs: dict[str, Any]) -> dict[str, Any]:
+    """Project admission v2 refs onto the shared-state create-once contract."""
+    return {
+        field: source_refs.get(field)
+        for field in _RCA_SHARED_STATE_SOURCE_REF_FIELDS
+    }
 
 
 def _rca_fixed_cli_goal(
@@ -1505,7 +1522,9 @@ def vm_task_submit_service(
         "rca_create_once": True,
         "rca_contract_sha256": contract_sha256,
         "rca_data_access_mode": "remote_read",
-        "rca_source_refs": admission_payload["source_refs"],
+        "rca_source_refs": _rca_shared_state_source_refs(
+            admission_payload["source_refs"]
+        ),
         "artifact_root": artifact_root,
         "artifact_cifs_root": artifact_cifs_root,
         **workspace_runtime.task_meta(),
