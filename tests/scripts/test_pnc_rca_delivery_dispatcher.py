@@ -2264,6 +2264,93 @@ def test_meegle_adapter_reads_and_updates_only_attribution_fields():
     }
 
 
+def test_meegle_adapter_verifies_omitted_attribution_fields_are_empty():
+    calls = []
+
+    def runner(args):
+        calls.append(args)
+        if args[:2] == ["workitem", "get"]:
+            return 0, json.dumps({
+                "work_item_attribute": {
+                    "work_item_id": "7041712812",
+                    "work_item_type": {"key": "issue", "name": "Issue"},
+                }
+            }), ""
+        if args[:2] == ["workitem", "meta-fields"]:
+            return 0, json.dumps({
+                "list": [
+                    {
+                        "field_key": "field_9193cb",
+                        "field_name": "归因结果",
+                        "field_type": "text",
+                    },
+                    {
+                        "field_key": "field_8c912e",
+                        "field_name": "归因报告",
+                        "field_type": "link",
+                    },
+                ]
+            }), ""
+        raise AssertionError(args)
+
+    result = MeegleIssueCommentAdapter(runner).get_fields(
+        "t03o4q",
+        "7041712812",
+        ("field_9193cb", "field_8c912e"),
+    )
+
+    assert result == {
+        "success": True,
+        "fields": {"field_9193cb": "", "field_8c912e": ""},
+    }
+    assert calls[1] == [
+        "workitem",
+        "meta-fields",
+        "--project-key",
+        "t03o4q",
+        "--work-item-type",
+        "issue",
+        "--page-num",
+        "1",
+        "--field-keys",
+        "field_9193cb",
+        "--field-keys",
+        "field_8c912e",
+        "--format",
+        "json",
+    ]
+
+
+def test_meegle_adapter_rejects_omitted_fields_without_exact_metadata():
+    def runner(args):
+        if args[:2] == ["workitem", "get"]:
+            return 0, json.dumps({
+                "work_item_attribute": {
+                    "work_item_id": "7041712812",
+                    "work_item_type": {"key": "issue", "name": "Issue"},
+                }
+            }), ""
+        if args[:2] == ["workitem", "meta-fields"]:
+            return 0, json.dumps({
+                "list": [{
+                    "field_key": "field_9193cb",
+                    "field_name": "归因结果",
+                    "field_type": "text",
+                }]
+            }), ""
+        raise AssertionError(args)
+
+    result = MeegleIssueCommentAdapter(runner).get_fields(
+        "t03o4q",
+        "7041712812",
+        ("field_9193cb", "field_8c912e"),
+    )
+
+    assert result["success"] is False
+    assert result["permanent"] is True
+    assert result["error_code"] == "feishu_field_metadata_invalid"
+
+
 def test_default_report_verifier_performs_bounded_head_then_get(monkeypatch):
     body = b"<!doctype html><title>RCA</title>"
     calls = []

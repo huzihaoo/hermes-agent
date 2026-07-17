@@ -928,6 +928,11 @@ def _error_payload(rc: int, stdout: str, stderr: str) -> dict[str, Any]:
 class MeegleIssueCommentAdapter:
     """Bounded Meegle adapter for RCA fields and issue comments."""
 
+    _RCA_FIELD_METADATA = {
+        RCA_RESULT_FIELD_KEY: ("归因结果", "text"),
+        RCA_REPORT_FIELD_KEY: ("归因报告", "link"),
+    }
+
     def __init__(
         self, runner: Callable[[list[str]], tuple[int, str, str]] | None = None
     ):
@@ -1073,12 +1078,78 @@ class MeegleIssueCommentAdapter:
                 key = str(row.get("key") or "").strip()
                 if key in field_keys:
                     normalized[key] = _field_value_text(row.get("value"))
-        else:
+        elif rows is not None:
             return {
                 "success": False,
                 "error_code": "meegle_response_invalid",
                 "error": "work item field read is missing fields",
             }
+        missing_keys = tuple(key for key in field_keys if key not in normalized)
+        if missing_keys:
+            attribute = payload.get("work_item_attribute")
+            work_item_type = (
+                attribute.get("work_item_type")
+                if isinstance(attribute, Mapping)
+                else None
+            )
+            work_item_type_key = (
+                str(work_item_type.get("key") or "").strip()
+                if isinstance(work_item_type, Mapping)
+                else ""
+            )
+            if (
+                not isinstance(attribute, Mapping)
+                or str(attribute.get("work_item_id") or "") != str(work_item_id)
+                or not work_item_type_key
+            ):
+                return {
+                    "success": False,
+                    "error_code": "meegle_response_invalid",
+                    "error": "omitted-field response identity is missing or mismatched",
+                }
+            metadata_args = [
+                "workitem",
+                "meta-fields",
+                "--project-key",
+                str(project_key),
+                "--work-item-type",
+                work_item_type_key,
+                "--page-num",
+                "1",
+            ]
+            for field_key in field_keys:
+                metadata_args.extend(["--field-keys", field_key])
+            metadata_args.extend(["--format", "json"])
+            rc, out, err = self.runner(metadata_args)
+            if rc != 0:
+                return _error_payload(rc, out, err)
+            metadata = _json_stdout(out)
+            if (
+                isinstance(metadata, Mapping)
+                and isinstance(metadata.get("data"), Mapping)
+            ):
+                metadata = metadata["data"]
+            metadata_rows = (
+                metadata.get("list") if isinstance(metadata, Mapping) else None
+            )
+            definitions = {}
+            if isinstance(metadata_rows, list):
+                definitions = {
+                    str(row.get("field_key") or "").strip(): (
+                        str(row.get("field_name") or "").strip(),
+                        str(row.get("field_type") or "").strip(),
+                    )
+                    for row in metadata_rows
+                    if isinstance(row, Mapping)
+                }
+            if definitions != self._RCA_FIELD_METADATA:
+                return {
+                    "success": False,
+                    "permanent": True,
+                    "error_code": "feishu_field_metadata_invalid",
+                    "error": "configured attribution field metadata is missing or mismatched",
+                }
+            normalized.update({key: "" for key in missing_keys})
         return {"success": True, "fields": normalized}
 
     def update_fields(
