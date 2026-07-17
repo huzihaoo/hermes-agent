@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shlex
 import shutil
@@ -1151,7 +1152,13 @@ def _vm_task_submit_trusted(
         cmd.append("--create-once")
 
     try:
-        proc = subprocess.run(cmd, text=True, capture_output=True, timeout=120)
+        proc = subprocess.run(
+            cmd,
+            text=True,
+            capture_output=True,
+            timeout=120,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
     except FileNotFoundError as exc:
         return {
             "success": False,

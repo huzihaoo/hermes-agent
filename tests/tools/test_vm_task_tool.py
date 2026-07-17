@@ -241,6 +241,7 @@ def test_general_vm_submit_keeps_workspace_work_creator_and_never_uses_rca_bundl
 
     def fake_run(cmd, **kwargs):
         captured["cmd"] = cmd
+        captured["env"] = kwargs["env"]
         return subprocess.CompletedProcess(
             cmd,
             0,
@@ -255,6 +256,7 @@ def test_general_vm_submit_keeps_workspace_work_creator_and_never_uses_rca_bundl
     assert result["success"] is True
     assert str(workspace_work_creator) in captured["cmd"]
     assert "rca-workspace-runtime" not in " ".join(captured["cmd"])
+    assert captured["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
 
 
 def test_vm_task_submit_returns_structured_launch_error(monkeypatch, tmp_path):
