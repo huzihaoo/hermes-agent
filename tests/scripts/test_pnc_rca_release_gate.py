@@ -2438,7 +2438,7 @@ def _write_contract_pair(tmp_path: Path) -> tuple[Path, Path]:
 def _remote_reader_health() -> dict:
     runtime = {
         "execution_mode": "isolated_subprocess",
-        "dependency_domain": "pdcl_pyclip_system_python_v1",
+        "dependency_domain": "pdcl_pyclip_repo_target_system_deps_v1",
         "required_python_executable": "/usr/bin/python3",
         "resolved_required_python_executable": "/usr/bin/python3.8",
         "python_executable": "/usr/bin/python3.8",
