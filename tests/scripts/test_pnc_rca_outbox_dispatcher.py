@@ -1739,6 +1739,7 @@ def test_default_submit_reloads_release_bound_bootstrap_authorization_per_call(
     )
     config = replace(
         _config(tmp_path),
+        activation_required=True,
         capacity_mode="bootstrap",
         release_id="rca-prod-20260713-001",
         bootstrap_epoch_id="rca-bootstrap-release-20260713",
@@ -1783,6 +1784,7 @@ def test_default_submit_reloads_dynamic_mode_and_holds_shared_lock(
 ):
     config = replace(
         _config(tmp_path),
+        activation_required=True,
         capacity_mode="bootstrap",
         release_id="rca-prod-20260713-001",
         bootstrap_epoch_id="rca-bootstrap-release-20260713",
@@ -1834,6 +1836,49 @@ def test_default_submit_reloads_dynamic_mode_and_holds_shared_lock(
     assert submits[0]["active_release_binding_sha256"] == "c" * 64
     assert "bootstrap_epoch_id" not in submits[1]
     assert "active_release_binding_sha256" not in submits[1]
+
+
+def test_default_submit_ignores_transition_gate_when_activation_is_disabled(
+    monkeypatch, tmp_path
+):
+    config = replace(
+        _config(tmp_path),
+        activation_required=False,
+        capacity_mode="bootstrap",
+        release_id="rca-prod-20260713-001",
+        bootstrap_epoch_id="rca-bootstrap-release-20260713",
+    )
+    capacity_runtime = FakeCapacityRuntime(
+        [_runtime_decision(state="STEADY_BLOCKED", mode="blocked", ready=False)]
+    )
+    monkeypatch.setattr(
+        dispatcher_module,
+        "_load_bound_bootstrap_authorization",
+        lambda _config: {
+            "bootstrap_epoch_id": config.bootstrap_epoch_id,
+            "release_bom_sha256": "a" * 64,
+            "started_at": "2026-07-13T00:00:00Z",
+            "deadline": "2026-07-21T00:00:00Z",
+            "receipt_fingerprint": "b" * 64,
+            "active_release_binding_sha256": "c" * 64,
+        },
+    )
+    submits = []
+    monkeypatch.setattr(
+        "tools.vm_task_tool.vm_task_submit_service",
+        lambda **kwargs: submits.append(kwargs) or {"success": False},
+    )
+
+    dispatcher_module.default_submit(
+        object(),
+        type("Request", (), {"toolchain": {}})(),
+        config=config,
+        capacity_runtime=capacity_runtime,
+    )
+
+    assert capacity_runtime.calls == 1
+    assert submits[0]["capacity_mode"] == "bootstrap"
+    assert submits[0]["bootstrap_epoch_id"] == config.bootstrap_epoch_id
 
 
 def test_default_submit_dynamic_block_never_reaches_vm_boundary(monkeypatch, tmp_path):

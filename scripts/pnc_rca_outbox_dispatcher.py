@@ -810,7 +810,10 @@ def default_submit(
         else nullcontext(None)
     )
     with decision_context as capacity_decision:
-        if capacity_decision is not None:
+        if (
+            capacity_decision is not None
+            and not (config is not None and not config.activation_required)
+        ):
             if capacity_decision.get("ready") is not True:
                 raise DispatchCircuitError(
                     "dispatcher_capacity_runtime_blocked",
@@ -3362,9 +3365,11 @@ def main(argv: list[str] | None = None) -> int:
         capacity_runtime = CapacityRuntimeResolver.from_environment(
             store=store,
             control_db_path=config.control_db_path,
-            release_id=config.release_id,
-            bootstrap_epoch_id=config.bootstrap_epoch_id,
-            initial_policy=config.capacity_mode,
+            release_id=(config.release_id if config.activation_required else ""),
+            bootstrap_epoch_id=(
+                config.bootstrap_epoch_id if config.activation_required else ""
+            ),
+            initial_policy=(config.capacity_mode if config.activation_required else "steady"),
         )
         if args.promote_shadow_event:
             expected_epoch_id = str(args.activation_epoch_id or "").strip()
