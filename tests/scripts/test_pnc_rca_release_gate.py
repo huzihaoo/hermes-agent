@@ -3410,6 +3410,7 @@ def _write_common_evidence(evidence_dir: Path, kafka_env_file: Path) -> None:
                 "dependency_versions": {"kafka-python": "3.0.7"},
                 "connection_config_sha256": _sha256_json(probe_public),
                 "config": probe_public,
+                "mode": "release_gate",
                 "env_file": env_observation,
                 "side_effect_contract": (
                     release_gate_module.KAFKA_PREFLIGHT_SIDE_EFFECT_CONTRACT
@@ -11697,7 +11698,8 @@ def test_release_gate_blocks_when_candidate_runtime_dependencies_are_missing(
 ):
     consumer, dispatcher, settings = _gate(tmp_path, "shadow")
 
-    def missing_runtime(repo_root):
+    def missing_runtime(repo_root, *, runtime_root=None):
+        del repo_root, runtime_root
         raise EvidenceError("runtime_dependency_missing")
 
     monkeypatch.setattr(
@@ -11713,6 +11715,36 @@ def test_release_gate_blocks_when_candidate_runtime_dependencies_are_missing(
 
     assert report["ok"] is False
     assert "runtime_dependency_missing" in report["blockers"]
+
+
+def test_release_gate_probes_the_installed_candidate_runtime_root(
+    tmp_path, monkeypatch
+):
+    consumer, dispatcher, settings = _gate(tmp_path, "shadow")
+    installed_root = tmp_path / "installed-runtime"
+    runtime_detail = release_gate_module.check_candidate_runtime_dependencies(
+        settings.host_repo_root
+    )
+    observed = []
+
+    def probe(repo_root, *, runtime_root=None):
+        observed.append((repo_root, runtime_root))
+        return runtime_detail
+
+    monkeypatch.setattr(
+        release_gate_module, "check_candidate_runtime_dependencies", probe
+    )
+    settings = replace(settings, candidate_runtime_root=installed_root)
+
+    evaluate_release_gate(
+        consumer=consumer,
+        dispatcher=dispatcher,
+        settings=settings,
+        cutover=_cutover("shadow"),
+        now=NOW,
+    )
+
+    assert observed == [(installed_root, installed_root)]
 
 
 @pytest.mark.parametrize(
@@ -13731,6 +13763,10 @@ def test_official_broker_preflight_v3_round_trip_is_replayed(tmp_path):
                 dependency_versions={"kafka-python": "3.0.6"}
             ),
             "broker_metadata_collector_dependency_mismatch",
+        ),
+        (
+            lambda body: body["collector"].update(mode="observe_only"),
+            "broker_metadata_collector_mode_invalid",
         ),
         (
             lambda body: body["collector"]["config"].update(

@@ -614,6 +614,7 @@ KAFKA_PREFLIGHT_COLLECTOR_FIELDS = frozenset({
     "dependency_versions",
     "connection_config_sha256",
     "config",
+    "mode",
     "env_file",
     "side_effect_contract",
 })
@@ -2321,6 +2322,8 @@ def _check_broker_metadata(
         raise EvidenceError("broker_metadata_collector_source_mismatch")
     if collector.get("dependency_versions") != {"kafka-python": "3.0.7"}:
         raise EvidenceError("broker_metadata_collector_dependency_mismatch")
+    if collector.get("mode") != "release_gate":
+        raise EvidenceError("broker_metadata_collector_mode_invalid")
     expected_probe_config = probe.public_dict()
     if collector.get("config") != expected_probe_config:
         raise EvidenceError("broker_metadata_collector_config_mismatch")
@@ -25659,8 +25662,11 @@ def evaluate_release_gate(
         checks.fail("manual_terminal_failure_delivery", exc.code)
 
     try:
+        runtime_probe_root = (
+            settings.candidate_runtime_root or settings.host_repo_root
+        )
         runtime_detail = check_candidate_runtime_dependencies(
-            settings.host_repo_root,
+            runtime_probe_root,
             runtime_root=settings.candidate_runtime_root,
         )
         try:
