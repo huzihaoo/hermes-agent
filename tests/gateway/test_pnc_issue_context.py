@@ -39,6 +39,8 @@ def test_compact_issue_context_handles_structured_result_and_comments():
                 {"name": "当前负责人", "value": [{"name": "张三"}, {"name": "李四"}]},
                 {"name": "问题发生frameid", "value": "318153"},
                 {"name": "问题数据地址_PDCL", "value": "mdi download event -u demo -s ./"},
+                {"key": "field_c7f370", "name": "问题所属部门", "value": "研发中心/规划部"},
+                {"key": "field_4bf24b", "name": "问题所属部门_简洁", "value": "规划部"},
                 {"name": "问题根本原因分析", "value": "目标误识别为CBLA法规目标"},
             ],
         },
@@ -51,6 +53,7 @@ def test_compact_issue_context_handles_structured_result_and_comments():
     assert "当前负责人: 张三, 李四" in context
     assert "frame_id: 318153" in context
     assert "数据地址: mdi download event" in context
+    assert "function_category: 研发中心/规划部 | 规划部" in context
     assert "根因分析字段: 目标误识别为CBLA法规目标" in context
     assert "已回放\n\n优化后通过 [image]" in context
 

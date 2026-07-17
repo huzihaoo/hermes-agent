@@ -660,6 +660,13 @@ def compact_g1q3_issue_context(*, work_item_brief: dict[str, Any], comments: lis
             frame_lookup = frame_reference
     happened_at = sanitize_issue_evidence_text(by_name.get("发生时间"))
     data_addr = compact_value(by_key.get("field_93aa63") or by_name.get("问题数据地址_PDCL"))
+    function_category_parts = [
+        sanitize_issue_evidence_text(by_key.get("field_c7f370")),
+        sanitize_issue_evidence_text(by_key.get("field_4bf24b")),
+    ]
+    function_category = " | ".join(
+        dict.fromkeys(part for part in function_category_parts if part)
+    )
     root_cause = sanitize_issue_evidence_text(by_key.get("field_842fc8") or by_name.get("问题根本原因分析"))
     owner = sanitize_issue_evidence_text(by_name.get("当前负责人") or by_name.get("责任人"))
     vehicle = sanitize_issue_evidence_text(by_key.get("field_9e1bd0") or by_name.get("车辆编号/台架编号"))
@@ -693,6 +700,8 @@ def compact_g1q3_issue_context(*, work_item_brief: dict[str, Any], comments: lis
         lines.append(f"- 发生时间: {happened_at}")
     if data_addr:
         lines.append(f"- 数据地址: {data_addr}")
+    if function_category:
+        lines.append(f"- function_category: {function_category}")
     if root_cause:
         lines.append(f"- 根因分析字段: {root_cause}")
     if description:

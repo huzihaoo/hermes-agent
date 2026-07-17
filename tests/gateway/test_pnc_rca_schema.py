@@ -80,6 +80,7 @@ def test_issue_context_from_compact_text_extracts_known_fields_without_raw_paylo
                 "- 当前负责人: 张三, 李四",
                 "- 所属项目: G1Q3",
                 "- frame_id: 318153",
+                "- function_category: 研发中心/规划部 | 规划部",
                 "- 数据地址: mdi download event -u demo -s ./",
                 "- 根因分析字段: 目标误识别",
             ]
@@ -92,6 +93,7 @@ def test_issue_context_from_compact_text_extracts_known_fields_without_raw_paylo
     assert ctx.status == "OPEN"
     assert ctx.owners == ["张三", "李四"]
     assert ctx.frame_id == "318153"
+    assert ctx.function_category == "研发中心/规划部 | 规划部"
     assert ctx.source_quality == "full"
     assert ctx.blockers == []
 

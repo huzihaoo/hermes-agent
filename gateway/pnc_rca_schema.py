@@ -249,6 +249,7 @@ def issue_context_from_compact_text(
         frame_id=line_value("frame_id"),
         frame_lookup=frame_lookup,
         frame_reference_error=line_value("frame_reference_error"),
+        function_category=line_value("function_category"),
         pdcl_download_cmd=line_value("数据地址"),
         root_cause_text=line_value("根因分析字段"),
         description_markdown=text,
