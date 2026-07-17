@@ -3394,6 +3394,8 @@ def _write_common_evidence(evidence_dir: Path, kafka_env_file: Path) -> None:
             "replication_factor": 2,
             "topic_authorized_operations": ["DESCRIBE", "READ"],
             "group_authorized_operations": ["DESCRIBE", "READ"],
+            "production_eligible": True,
+            "owner_approval_required": [],
             "collector": {
                 "schema_version": (
                     release_gate_module.KAFKA_PREFLIGHT_COLLECTOR_SCHEMA_VERSION
@@ -13713,6 +13715,14 @@ def test_official_broker_preflight_v3_round_trip_is_replayed(tmp_path):
             "broker_metadata_group_authorization_invalid",
         ),
         (
+            lambda body: body.update(production_eligible=False),
+            "broker_metadata_authorization_or_health_invalid",
+        ),
+        (
+            lambda body: body.update(owner_approval_required=["group_acl"]),
+            "broker_metadata_authorization_or_health_invalid",
+        ),
+        (
             lambda body: body["collector"].update(source_sha256="0" * 64),
             "broker_metadata_collector_source_mismatch",
         ),
@@ -13804,6 +13814,72 @@ def test_broker_replication_policy_has_a_hard_floor(tmp_path):
     )
 
     assert "broker_metadata_replication_policy_too_weak" in report["blockers"]
+
+
+def test_functional_bootstrap_accepts_owner_configured_single_replica(tmp_path):
+    consumer, dispatcher, settings = _gate(tmp_path, "preauthorization")
+    contents = settings.kafka_env_file.read_text(encoding="utf-8")
+    settings.kafka_env_file.write_text(
+        contents.replace(
+            "HERMES_RCA_KAFKA_MIN_REPLICATION_FACTOR=2",
+            "HERMES_RCA_KAFKA_MIN_REPLICATION_FACTOR=1",
+        ),
+        encoding="utf-8",
+    )
+    settings.kafka_env_file.chmod(0o600)
+    source, env_observation = load_kafka_preflight_environment(
+        settings.kafka_env_file
+    )
+    probe = BrokerProbeConfig.from_env(source)
+    path = settings.evidence_dir / "broker_metadata.json"
+    body = json.loads(path.read_text(encoding="utf-8"))
+    body["replication_factor"] = 1
+    for partition in body["partition_topology"]:
+        leader = partition["leader_id"]
+        partition["replicas"] = [leader]
+        partition["isr"] = [leader]
+    body["collector"]["config"] = probe.public_dict()
+    body["collector"]["connection_config_sha256"] = (
+        release_gate_module._sha256_json(probe.public_dict())
+    )
+    body["collector"]["env_file"] = env_observation
+    _write_json(path, body)
+
+    report = evaluate_release_gate(
+        consumer=ConsumerConfig.from_env(source),
+        dispatcher=dispatcher,
+        settings=settings,
+        cutover=_cutover("preauthorization"),
+        now=NOW,
+    )
+
+    check = next(item for item in report["checks"] if item["name"] == "broker_metadata")
+    assert check["ok"] is True
+    assert check["detail"]["replication_factor"] == 1
+
+
+def test_preauthorization_accepts_immutable_release_evidence_after_cutover(
+    tmp_path,
+):
+    consumer, dispatcher, settings = _gate(tmp_path, "preauthorization")
+    observed_at = (NOW - timedelta(hours=1)).isoformat()
+    for name in ("build_manifest.json", "cutover_plan.json"):
+        path = settings.evidence_dir / name
+        body = json.loads(path.read_text(encoding="utf-8"))
+        body["observed_at"] = observed_at
+        _write_json(path, body)
+
+    report = evaluate_release_gate(
+        consumer=consumer,
+        dispatcher=dispatcher,
+        settings=settings,
+        cutover=_cutover("preauthorization"),
+        now=NOW,
+    )
+
+    checks = {item["name"]: item for item in report["checks"]}
+    assert checks["build_manifest"]["ok"] is True
+    assert checks["cutover_plan"]["ok"] is True
 
 
 @pytest.mark.parametrize(

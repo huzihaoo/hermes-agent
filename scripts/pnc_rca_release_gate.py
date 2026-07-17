@@ -563,12 +563,18 @@ REMOTE_READER_PROBE_TIMEOUT_SECONDS = 30
 FIXED_STORAGE_TARGET = ("task_output", "/mnt/tmp", 13, 4)
 QUEUE_LIMITS_SOURCE_KIND = "scheduler_capacity_receipt"
 DEFAULT_EVIDENCE_MAX_AGE_SECONDS = 900
+POSTINSTALL_IMMUTABLE_EVIDENCE_MAX_AGE_SECONDS = 7_200
 ACTIVATION_STAGE_CAPSULE_MAX_AGE_SECONDS = 3600
 DEFAULT_SHADOW_SOAK_MIN_SECONDS = 86_400
 DEFAULT_MIN_STORAGE_HORIZON_DAYS = 30
 DEFAULT_TARGET_CASES_PER_DAY = 200
 DEFAULT_MIN_CAPACITY_HORIZON_DAYS = 7.0
 MIN_KAFKA_REPLICATION_FACTOR = 2
+FUNCTIONAL_BOOTSTRAP_MODES = frozenset({
+    "preauthorization",
+    "preproduction",
+    "canary_bootstrap",
+})
 KAFKA_PREFLIGHT_SIDE_EFFECT_CONTRACT = {
     "exact_topic_metadata": True,
     "group_coordinator_lookup": True,
@@ -598,6 +604,8 @@ BROKER_METADATA_FIELDS = frozenset({
     "replication_factor",
     "topic_authorized_operations",
     "group_authorized_operations",
+    "production_eligible",
+    "owner_approval_required",
     "collector",
 })
 KAFKA_PREFLIGHT_COLLECTOR_FIELDS = frozenset({
@@ -2213,13 +2221,14 @@ def _expected_broker_probe(
     *,
     consumer: ConsumerConfig,
     kafka_env_file: Path,
+    required_minimum_replication_factor: int,
 ) -> tuple[BrokerProbeConfig, dict[str, Any]]:
     try:
         source, env_observation = load_kafka_preflight_environment(kafka_env_file)
         probe = BrokerProbeConfig.from_env(source)
     except (OSError, ValueError) as exc:
         raise EvidenceError("broker_metadata_env_file_invalid") from exc
-    if probe.minimum_replication_factor < MIN_KAFKA_REPLICATION_FACTOR:
+    if probe.minimum_replication_factor < required_minimum_replication_factor:
         raise EvidenceError("broker_metadata_replication_policy_too_weak")
     if (
         probe.bootstrap_servers != consumer.bootstrap_servers
@@ -2244,6 +2253,7 @@ def _check_broker_metadata(
     kafka_env_file: Path,
     host_repo_root: Path,
     expected_topic: str,
+    release_mode: str,
     now: datetime,
     max_age_seconds: int,
 ) -> tuple[list[int], dict[str, Any]]:
@@ -2258,12 +2268,20 @@ def _check_broker_metadata(
         body.get("topic_authorized") is not True
         or body.get("topic_healthy") is not True
         or body.get("group_authorized") is not True
+        or body.get("production_eligible") is not True
+        or body.get("owner_approval_required") != []
     ):
         raise EvidenceError("broker_metadata_authorization_or_health_invalid")
 
+    minimum_replication_factor = (
+        1
+        if release_mode in FUNCTIONAL_BOOTSTRAP_MODES
+        else MIN_KAFKA_REPLICATION_FACTOR
+    )
     probe, expected_env_observation = _expected_broker_probe(
         consumer=consumer,
         kafka_env_file=kafka_env_file,
+        required_minimum_replication_factor=minimum_replication_factor,
     )
     if body.get("topic") != expected_topic or probe.topic != expected_topic:
         raise EvidenceError("broker_metadata_topic_mismatch")
@@ -25803,6 +25821,7 @@ def evaluate_release_gate(
             kafka_env_file=settings.kafka_env_file,
             host_repo_root=settings.host_repo_root,
             expected_topic=settings.expected_topic,
+            release_mode=settings.mode,
             now=current,
             max_age_seconds=settings.evidence_max_age_seconds,
         )
@@ -25858,7 +25877,11 @@ def evaluate_release_gate(
                 build_manifest,
                 settings=settings,
                 now=current,
-                max_age_seconds=settings.evidence_max_age_seconds,
+                max_age_seconds=(
+                    POSTINSTALL_IMMUTABLE_EVIDENCE_MAX_AGE_SECONDS
+                    if settings.mode in FUNCTIONAL_BOOTSTRAP_MODES
+                    else settings.evidence_max_age_seconds
+                ),
                 expected_runtime_config_sha256=config_sha256,
                 expected_launchd_config_sha256=runtime_launchd_config_sha256,
                 provenance_verifier=(
@@ -26089,7 +26112,11 @@ def evaluate_release_gate(
                 cutover_plan,
                 cutover=cutover_config,
                 now=current,
-                max_age_seconds=settings.evidence_max_age_seconds,
+                max_age_seconds=(
+                    POSTINSTALL_IMMUTABLE_EVIDENCE_MAX_AGE_SECONDS
+                    if settings.mode in FUNCTIONAL_BOOTSTRAP_MODES
+                    else settings.evidence_max_age_seconds
+                ),
             )
             checks.pass_("cutover_plan", detail)
         except EvidenceError as exc:
