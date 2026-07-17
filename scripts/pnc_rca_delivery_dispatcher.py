@@ -1903,7 +1903,15 @@ def _field_updates_match(
 def _marker_matches(
     comments: list[dict[str, str]], marker: str
 ) -> list[dict[str, str]]:
-    return [item for item in comments if marker in item["content"].splitlines()]
+    variants = {marker}
+    if marker.startswith("[") and marker.endswith("]"):
+        # Meegle preserves the marker text but strips Markdown link brackets.
+        variants.add(marker[1:-1])
+    return [
+        item
+        for item in comments
+        if variants.intersection(item["content"].splitlines())
+    ]
 
 
 class DeliveryDispatcher:

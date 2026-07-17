@@ -679,6 +679,44 @@ def test_existing_marker_repairs_drifted_fields_without_duplicate_comment(tmp_pa
     assert receipt["source"] == "field_repair_after_marker"
 
 
+def test_meegle_normalized_marker_reconciles_without_duplicate_comment(tmp_path):
+    store = _seed(tmp_path)
+    payload = json.loads(store.list_rows("rca_delivery_effects")[0]["payload_json"])
+    remote = Remote()
+    normalized_content = payload["comment_content"].replace(
+        payload["marker"], payload["marker"][1:-1], 1
+    )
+    remote.comments.append(
+        {"remote_id": "comment-existing", "content": normalized_content}
+    )
+    remote.fields = {
+        item["field_key"]: item["field_value"]
+        for item in payload["field_updates"]
+    }
+    dispatcher, _remote, _clock = _dispatcher(tmp_path, remote=remote)
+
+    outcome = dispatcher.dispatch_one()
+
+    assert outcome.status == "reconciled"
+    assert outcome.remote_id == "comment-existing"
+    assert remote.add_calls == 0
+    assert remote.update_field_calls == 0
+
+
+def test_remote_marker_matching_accepts_only_exact_meegle_normalization():
+    marker = "[RCA_DELIVERY:effect-key:artifact-key]"
+    comments = [
+        {"remote_id": "exact", "content": marker},
+        {"remote_id": "normalized", "content": marker[1:-1]},
+        {"remote_id": "prefixed", "content": f"prefix {marker[1:-1]}"},
+        {"remote_id": "suffixed", "content": f"{marker[1:-1]} suffix"},
+    ]
+
+    matches = dispatcher_module._marker_matches(comments, marker)
+
+    assert [item["remote_id"] for item in matches] == ["exact", "normalized"]
+
+
 def test_field_update_failure_blocks_comment_and_retries(tmp_path):
     store = _seed(tmp_path)
     remote = Remote()
