@@ -1904,13 +1904,18 @@ def _marker_matches(
     comments: list[dict[str, str]], marker: str
 ) -> list[dict[str, str]]:
     variants = {marker}
+    remote_marker = marker
     if marker.startswith("[") and marker.endswith("]"):
         # Meegle preserves the marker text but strips Markdown link brackets.
-        variants.add(marker[1:-1])
+        remote_marker = marker[1:-1]
+        variants.add(remote_marker)
     return [
         item
         for item in comments
-        if variants.intersection(item["content"].splitlines())
+        if any(
+            line in variants or line.replace(" ", "") == remote_marker
+            for line in item["content"].splitlines()
+        )
     ]
 
 

@@ -717,6 +717,28 @@ def test_remote_marker_matching_accepts_only_exact_meegle_normalization():
     assert [item["remote_id"] for item in matches] == ["exact", "normalized"]
 
 
+def test_remote_terminal_marker_matching_accepts_meegle_inserted_spaces():
+    marker = "[RCA_TERMINAL:effect-key:terminal_failed:2]"
+    comments = [
+        {
+            "remote_id": "normalized",
+            "content": "RCA_TERMINAL:effect-key :terminal_failed: 2",
+        },
+        {
+            "remote_id": "prefixed",
+            "content": "prefix RCA_TERMINAL:effect-key :terminal_failed: 2",
+        },
+        {
+            "remote_id": "suffixed",
+            "content": "RCA_TERMINAL:effect-key :terminal_failed: 2 suffix",
+        },
+    ]
+
+    matches = dispatcher_module._marker_matches(comments, marker)
+
+    assert [item["remote_id"] for item in matches] == ["normalized"]
+
+
 def test_field_update_failure_blocks_comment_and_retries(tmp_path):
     store = _seed(tmp_path)
     remote = Remote()
