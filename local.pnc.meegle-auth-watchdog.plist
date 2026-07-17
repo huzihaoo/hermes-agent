@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>local.pnc.meegle-auth-watchdog</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/songying/.hermes/runtime/hermes-live/.venv/bin/python</string>
+        <string>/Users/songying/.hermes/runtime/hermes-live/scripts/pnc_meegle_auth_watchdog.py</string>
+        <string>--once</string>
+        <string>--json</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/songying/.hermes/runtime/hermes-live</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/songying</string>
+        <key>HERMES_HOME</key>
+        <string>/Users/songying/.hermes</string>
+        <key>PATH</key>
+        <string>/Users/songying/.hermes/runtime/hermes-live/.venv/bin:/Users/songying/.local/bin:/Users/songying/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>VIRTUAL_ENV</key>
+        <string>/Users/songying/.hermes/runtime/hermes-live/.venv</string>
+        <key>PNC_MEEGLE_WARN_MIN</key>
+        <string>0</string>
+        <key>PNC_MEEGLE_CRIT_MIN</key>
+        <string>0</string>
+        <key>PNC_MEEGLE_QUIET_HOURS</key>
+        <string>0</string>
+        <key>PNC_MEEGLE_PROACTIVE_REINIT_HOURS</key>
+        <string>24</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>1019</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/songying/.hermes/logs/pnc-meegle-auth-watchdog.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/songying/.hermes/logs/pnc-meegle-auth-watchdog.error.log</string>
+</dict>
+</plist>
