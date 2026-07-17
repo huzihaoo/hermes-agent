@@ -45,8 +45,6 @@ RCA_RUNTIME_RELATIVE_FILES = (
     "gateway/session_context.py",
     "hermes_constants.py",
     "scripts/pnc_g1q3_truth.py",
-    "scripts/pnc_rca_activation.py",
-    "scripts/pnc_rca_capacity_transition_executor.py",
     "scripts/pnc_rca_delivery_collector.py",
     "scripts/pnc_rca_delivery_dispatcher.py",
     "scripts/pnc_rca_kafka_consumer.py",
