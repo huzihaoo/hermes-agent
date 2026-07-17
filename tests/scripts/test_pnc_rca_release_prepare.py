@@ -804,6 +804,25 @@ def test_prepare_emits_gate_valid_plan_without_live_side_effects(prepared_fixtur
     assert b"super-secret-value" not in all_output
 
 
+def test_prepare_uses_canonical_hermes_home_for_runtime_config(
+    prepared_fixture, monkeypatch
+):
+    observed_homes = []
+
+    def load_configs(_path, *, environment, hermes_home):
+        assert environment == {}
+        observed_homes.append(hermes_home)
+        return _Consumer(), _Dispatcher()
+
+    monkeypatch.setattr(release_gate, "load_redacted_configs", load_configs)
+
+    _prepare(prepared_fixture)
+
+    assert observed_homes
+    assert set(observed_homes) == {prepare.CANONICAL_HERMES_HOME}
+    assert prepare.CANONICAL_HERMES_HOME != prepared_fixture.inputs.env_file.parent
+
+
 def test_redaction_distinguishes_structural_file_names_from_secret_fields():
     descriptor = {
         "path": "agent/credential_persistence.py",

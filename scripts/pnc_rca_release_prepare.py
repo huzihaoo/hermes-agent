@@ -92,6 +92,7 @@ RUN_IDENTITY_FILENAME = "run_identity.json"
 APPROVAL_REQUEST_FILENAME = "approval_request.json"
 RUN_MANIFEST_FILENAME = "release_prepare_manifest.json"
 RUN_LOCK_FILENAME = ".prepare.lock"
+CANONICAL_HERMES_HOME = Path.home() / ".hermes"
 
 
 class ReleasePrepareError(ValueError):
@@ -1617,7 +1618,7 @@ def prepare_release(
         consumer, dispatcher = release_gate.load_redacted_configs(
             inputs.env_file,
             environment={},
-            hermes_home=inputs.env_file.expanduser().absolute().parent,
+            hermes_home=CANONICAL_HERMES_HOME,
         )
         cutover = release_gate.load_cutover_config(
             inputs.env_file,
