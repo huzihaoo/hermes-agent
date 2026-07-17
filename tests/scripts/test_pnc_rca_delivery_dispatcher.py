@@ -27,6 +27,7 @@ from gateway.pnc_rca_delivery_store import (
 )
 from gateway.pnc_rca_runtime_identity import GATEWAY_LOADED_DEPENDENCIES
 from scripts import pnc_rca_delivery_dispatcher as dispatcher_module
+from scripts.pnc_rca_delivery_collector import CollectorConfig, DeliveryCollector
 from scripts.pnc_rca_delivery_dispatcher import (
     DeliveryDispatcher,
     DispatcherConfig,
@@ -47,7 +48,6 @@ from tests.gateway.test_pnc_rca_delivery_store import (
     _insert_subscription,
 )
 from tests.gateway.test_pnc_rca_delivery_contract import _bundle
-from tests.scripts.test_pnc_rca_delivery_collector import _collector
 
 
 @pytest.fixture(autouse=True)
@@ -120,6 +120,52 @@ def _config(tmp_path, *, enabled: bool = True):
             "HERMES_RCA_DELIVERY_DISPATCHER_REPORT_HTTP_TIMEOUT_SECONDS": "10",
         },
         hermes_home=tmp_path,
+    )
+
+
+def _collector(
+    tmp_path,
+    *,
+    status_reader=None,
+    bundle_reader=None,
+    enabled: bool = True,
+    now=None,
+):
+    config = CollectorConfig.from_env(
+        {
+            "HERMES_RCA_DELIVERY_COLLECTOR_ENABLED": str(enabled).lower(),
+            "HERMES_RCA_DELIVERY_COLLECTOR_CONTROL_DB_PATH": str(
+                tmp_path / "control.sqlite3"
+            ),
+            "HERMES_RCA_DELIVERY_COLLECTOR_HEALTH_PATH": str(
+                tmp_path / "collector-health.json"
+            ),
+            "HERMES_RCA_DELIVERY_COLLECTOR_POLL_INTERVAL_SECONDS": "1",
+            "HERMES_RCA_DELIVERY_COLLECTOR_RUNNING_POLL_SECONDS": "20",
+            "HERMES_RCA_DELIVERY_COLLECTOR_MAX_POLL_SECONDS": "300",
+            "HERMES_RCA_DELIVERY_COLLECTOR_LEASE_SECONDS": "60",
+            "HERMES_RCA_DELIVERY_COLLECTOR_BATCH_SIZE": "5",
+            "HERMES_RCA_DELIVERY_COLLECTOR_BACKFILL_BATCH_SIZE": "100",
+            "HERMES_RCA_DELIVERY_COLLECTOR_HEALTH_MAX_AGE_SECONDS": "60",
+            "HERMES_RCA_DELIVERY_COLLECTOR_SSH_MINI_AGENT": "/safe/ssh-mini-agent",
+            "HERMES_RCA_DELIVERY_COLLECTOR_ARTIFACT_READ_TIMEOUT_SECONDS": "30",
+        },
+        hermes_home=tmp_path,
+    )
+    return DeliveryCollector(
+        store=RcaDeliveryStore(tmp_path / "control.sqlite3"),
+        config=config,
+        status_reader=status_reader
+        or (
+            lambda task_id: {
+                "success": True,
+                "task_id": task_id,
+                "state": "completed",
+            }
+        ),
+        artifact_bundle_reader=bundle_reader or (lambda _claim: _web_bundle_payload()),
+        now=now or (lambda: NOW),
+        lease_owner="collector-test",
     )
 
 
@@ -2357,9 +2403,9 @@ def test_default_report_verifier_enforces_one_total_stream_deadline():
     assert socket.timeouts == [10.0, 4.0]
 
 
-def test_candidate_launchd_is_secret_free_and_runs_only_dispatcher():
+def test_production_launchd_is_secret_free_and_runs_only_dispatcher():
     root = Path(__file__).resolve().parents[2]
-    path = root / "local.pnc.rca-delivery-dispatcher.candidate.plist"
+    path = root / "local.pnc.rca-delivery-dispatcher.plist"
     with path.open("rb") as handle:
         payload = plistlib.load(handle)
     assert payload["Label"] == "local.pnc.rca-delivery-dispatcher"
