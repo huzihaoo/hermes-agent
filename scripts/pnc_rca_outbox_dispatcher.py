@@ -62,7 +62,9 @@ from gateway.pnc_rca_kafka_contract import NORMALIZED_EVENT_SCHEMA_VERSION
 from gateway.pnc_rca_prod_bootstrap import (
     ACTIVE_RELEASE_BINDING_NAME,
     EPOCH_ID_RE as BOOTSTRAP_EPOCH_ID_RE,
+    MAX_ACTIVE_RELEASE_BINDING_BYTES,
     RcaBootstrapAuthorizationError,
+    _read_bound_file,
     load_active_release_binding,
     load_bootstrap_authorization,
 )
@@ -884,6 +886,20 @@ def default_submit(
 def _load_bound_bootstrap_authorization(
     config: DispatcherConfig,
 ) -> dict[str, Any]:
+    if not config.activation_required:
+        authorization = load_bootstrap_authorization(
+            expected_epoch_id=config.bootstrap_epoch_id,
+            expected_release_approval_id=config.release_id,
+        )
+        _raw, binding_sha256 = _read_bound_file(
+            config.active_release_binding_path,
+            artifact="rca_active_release_binding",
+            maximum=MAX_ACTIVE_RELEASE_BINDING_BYTES,
+        )
+        return {
+            **authorization,
+            "active_release_binding_sha256": binding_sha256,
+        }
     binding = load_active_release_binding(
         path=config.active_release_binding_path,
         live_env_path=config.live_env_path,
