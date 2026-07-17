@@ -637,7 +637,6 @@ class DispatchStats:
     delivery_backpressure_blocked: int = 0
     delivery_backpressure_resumed: int = 0
     delivery_circuit_blocked: int = 0
-    delivery_outcome_slo_blocked: int = 0
     delivery_backpressure_errors: int = 0
     lease_lost: int = 0
 
@@ -2078,7 +2077,7 @@ class OutboxDispatcher:
                 raise ValueError(
                     "delivery backpressure boundary returned an invalid contract"
                 )
-            outcome_slo_healthy = validate_delivery_outcome_slo(
+            validate_delivery_outcome_slo(
                 snapshot.outcome_slo,
                 expected_observed_at=snapshot.observed_at,
             )
@@ -2121,17 +2120,6 @@ class OutboxDispatcher:
 
         self._last_delivery_snapshot = snapshot.public_dict()
         self._last_delivery_error = None
-        if not outcome_slo_healthy:
-            self._delivery_backpressure_active = True
-            self.stats.delivery_backpressure_blocked += 1
-            self.stats.delivery_outcome_slo_blocked += 1
-            return DispatchOutcome(
-                status="downstream_backpressure",
-                error_code="delivery_outcome_slo_failed",
-                downstream_unresolved_effects=snapshot.unresolved_effects,
-                downstream_unresolved_work=snapshot.unresolved_work,
-                downstream_circuit_state=snapshot.circuit.state,
-            )
         if snapshot.circuit.is_open:
             self.stats.delivery_circuit_blocked += 1
             return DispatchOutcome(
