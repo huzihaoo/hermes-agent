@@ -848,7 +848,7 @@ def default_submit(
             active_release_binding = authorization[
                 "active_release_binding_sha256"
             ]
-            if capacity_decision is not None:
+            if capacity_decision is not None and config.activation_required:
                 runtime_active_release_binding = str(
                     capacity_decision.get("active_release_binding_sha256") or ""
                 )
