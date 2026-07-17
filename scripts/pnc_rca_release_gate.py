@@ -14944,12 +14944,26 @@ def _check_remote_reader_live_probe(
         or manifest.get("module_sha256") != expected_modules
         or manifest.get("runtime_policy")
         != {
+            "execution_mode": FIXED_REMOTE_READER_EXECUTION_MODE,
+            "python_executable": FIXED_REMOTE_READER_REQUIRED_PYTHON,
+            "dependency_domain": FIXED_REMOTE_READER_DEPENDENCY_DOMAIN,
+            "dependency_source": "system_python_exact",
+            "runtime_target": ".rca-runtime/site-packages",
+            "vendor_wheel_fallback": False,
             "credentials": "env_only",
             "cache": "pre_mounted_read_only_admission",
             "automatic_mount": False,
             "package_install": False,
+            "bootstrap_install": "explicit_offline_target_only",
             "sudo": False,
             "input_materialization": False,
+        }
+        or manifest.get("dependencies")
+        != {
+            "mcap": "1.2.2",
+            "protobuf": "3.20.3",
+            "pdcl-dss": "0.1.44",
+            "typer": "0.20.0",
         }
     ):
         raise EvidenceError("remote_reader_live_probe_manifest_mismatch")
@@ -14965,20 +14979,32 @@ def _check_remote_reader_live_probe(
 
     doctor = _mapping(probe.get("doctor"), "remote_reader_live_probe.doctor")
     checks = _mapping(doctor.get("checks"), "remote_reader_live_probe.doctor.checks")
-    required_checks = {
-        "isolated_interpreter",
-        "distribution",
-        "vendored_wheel",
-        "pdcl_pyclip/reader.py",
-        "pdcl_pyclip/_config.py",
-        "pdcl_pyclip/_storage.py",
-        "dependency:mcap",
-        "dependency:protobuf",
-        "dependency:pdcl-dss",
-        "dependency:typer",
-        "module_import",
-        "class:RemoteClipReader",
-        "class:RemoteEventReader",
+    expected_checks = {
+        "cache_mount_from_env": "ok",
+        "class:RemoteClipReader": "ok",
+        "class:RemoteEventReader": "ok",
+        "credentials_from_env": "ok",
+        "dependency:mcap": "ok",
+        "dependency:pdcl-dss": "ok",
+        "dependency:protobuf": "ok",
+        "dependency:typer": "ok",
+        "distribution": "ok",
+        "installed_source:pdcl_pyclip/_config.py": "ok",
+        "installed_source:pdcl_pyclip/_storage.py": "ok",
+        "installed_source:pdcl_pyclip/reader.py": "ok",
+        "installed_source:pdcl_pyclip/writer.py": "ok",
+        "isolated_interpreter": "ok",
+        "legacy_pdcl_url_accepted": "no",
+        "module_import": "ok",
+        "pdcl_base_url_from_env": "ok",
+        "pdcl_base_url_valid": "ok",
+        "pdcl_pyclip/_config.py": "ok",
+        "pdcl_pyclip/_storage.py": "ok",
+        "pdcl_pyclip/reader.py": "ok",
+        "pdcl_pyclip/writer.py": "ok",
+        "pre_mounted_cache": "ok",
+        "runtime_layout": "ok",
+        "vendored_wheel": "ok",
     }
     if (
         doctor.get("status") != "ready"
@@ -14991,8 +15017,7 @@ def _check_remote_reader_live_probe(
         or doctor.get("sanitized_patch_commit")
         != FIXED_REMOTE_READER_SANITIZED_SOURCE_COMMIT[:7]
         or doctor.get("sanitized_wheel_sha256") != APPROVED_SANITIZED_WHEEL_SHA256
-        or not required_checks.issubset(checks)
-        or any(value != "ok" for value in checks.values())
+        or checks != expected_checks
         or doctor.get("blocker_kind") not in {None, ""}
     ):
         raise EvidenceError("remote_reader_live_probe_doctor_failed")
@@ -15004,6 +15029,9 @@ def _check_remote_reader_live_probe(
         "remote_reader_live_probe.doctor.runtime_environment",
     )
     expected_doctor_runtime = {
+        "activation_pythonpath": (
+            f"{repo_root}/.rca-runtime/site-packages:{repo_root}"
+        ),
         "execution_mode": health_detail.get("execution_mode"),
         "dependency_domain": health_detail.get("dependency_domain"),
         "required_python_executable": health_detail.get("required_python_executable"),
@@ -15013,6 +15041,7 @@ def _check_remote_reader_live_probe(
         "python_executable": health_detail.get("python_executable"),
         "python_version": health_detail.get("python_version"),
         "reader_import_scope": health_detail.get("reader_import_scope"),
+        "runtime_target": f"{repo_root}/.rca-runtime/site-packages",
         "timeout_seconds": 120,
     }
     if (

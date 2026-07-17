@@ -1001,12 +1001,19 @@ def _local_remote_reader_probe(monkeypatch):
         checks = {
             name: "ok"
             for name in (
+                "cache_mount_from_env",
+                "credentials_from_env",
                 "isolated_interpreter",
                 "distribution",
                 "vendored_wheel",
                 "pdcl_pyclip/reader.py",
                 "pdcl_pyclip/_config.py",
                 "pdcl_pyclip/_storage.py",
+                "pdcl_pyclip/writer.py",
+                "installed_source:pdcl_pyclip/reader.py",
+                "installed_source:pdcl_pyclip/_config.py",
+                "installed_source:pdcl_pyclip/_storage.py",
+                "installed_source:pdcl_pyclip/writer.py",
                 "dependency:mcap",
                 "dependency:protobuf",
                 "dependency:pdcl-dss",
@@ -1014,8 +1021,13 @@ def _local_remote_reader_probe(monkeypatch):
                 "module_import",
                 "class:RemoteClipReader",
                 "class:RemoteEventReader",
+                "pdcl_base_url_from_env",
+                "pdcl_base_url_valid",
+                "pre_mounted_cache",
+                "runtime_layout",
             )
         }
+        checks["legacy_pdcl_url_accepted"] = "no"
         manifest = {
             "schema_version": "g1q3_rca_sanitized_dependency_v1",
             "distribution": "pdcl_pyclip",
@@ -1055,12 +1067,25 @@ def _local_remote_reader_probe(monkeypatch):
                 ),
             },
             "runtime_policy": {
+                "execution_mode": "isolated_subprocess",
+                "python_executable": "/usr/bin/python3",
+                "dependency_domain": "pdcl_pyclip_repo_target_system_deps_v1",
+                "dependency_source": "system_python_exact",
+                "runtime_target": ".rca-runtime/site-packages",
+                "vendor_wheel_fallback": False,
                 "credentials": "env_only",
                 "cache": "pre_mounted_read_only_admission",
                 "automatic_mount": False,
                 "package_install": False,
+                "bootstrap_install": "explicit_offline_target_only",
                 "sudo": False,
                 "input_materialization": False,
+            },
+            "dependencies": {
+                "mcap": "1.2.2",
+                "protobuf": "3.20.3",
+                "pdcl-dss": "0.1.44",
+                "typer": "0.20.0",
             },
         }
         return {
@@ -1092,17 +1117,23 @@ def _local_remote_reader_probe(monkeypatch):
                 "sanitized_patch_commit": "7d0d028",
                 "sanitized_wheel_sha256": SANITIZED_WHEEL_SHA256,
                 "runtime": {
-                    key: runtime[key]
-                    for key in (
-                        "execution_mode",
-                        "dependency_domain",
-                        "required_python_executable",
-                        "resolved_required_python_executable",
-                        "python_executable",
-                        "python_version",
-                        "reader_import_scope",
-                        "timeout_seconds",
-                    )
+                    **{
+                        key: runtime[key]
+                        for key in (
+                            "execution_mode",
+                            "dependency_domain",
+                            "required_python_executable",
+                            "resolved_required_python_executable",
+                            "python_executable",
+                            "python_version",
+                            "reader_import_scope",
+                            "timeout_seconds",
+                        )
+                    },
+                    "activation_pythonpath": (
+                        f"{repo_root}/.rca-runtime/site-packages:{repo_root}"
+                    ),
+                    "runtime_target": f"{repo_root}/.rca-runtime/site-packages",
                 },
                 "runtime_environment": dict(runtime["runtime_environment"]),
                 "checks": checks,
@@ -14452,6 +14483,24 @@ def test_live_remote_reader_probe_timeout_fails_closed(tmp_path):
         verify_live_remote_reader(settings, runner=runner)
 
 
+def test_canary_accepts_pinned_remote_reader_manifest_runtime_policy(tmp_path):
+    consumer, dispatcher, settings = _gate(tmp_path, "canary")
+
+    report = evaluate_release_gate(
+        consumer=consumer,
+        dispatcher=dispatcher,
+        settings=settings,
+        cutover=_cutover("canary"),
+        now=NOW,
+    )
+
+    check = next(
+        item for item in report["checks"]
+        if item["name"] == "remote_reader_live_probe"
+    )
+    assert check["ok"] is True, report["blockers"]
+
+
 @pytest.mark.parametrize(
     ("mutation", "blocker"),
     [
@@ -14478,12 +14527,24 @@ def test_live_remote_reader_probe_timeout_fails_closed(tmp_path):
             "remote_reader_live_probe_manifest_mismatch",
         ),
         (
+            lambda probe: probe["manifest"]["runtime_policy"].update(
+                dependency_domain="main_service_python"
+            ),
+            "remote_reader_live_probe_manifest_mismatch",
+        ),
+        (
             lambda probe: probe["doctor"].update(status="blocked"),
             "remote_reader_live_probe_doctor_failed",
         ),
         (
             lambda probe: probe["doctor"]["runtime"].update(
                 dependency_domain="main_service_python"
+            ),
+            "remote_reader_live_probe_health_mismatch",
+        ),
+        (
+            lambda probe: probe["doctor"]["runtime"].update(
+                runtime_target="/tmp/unpinned/site-packages"
             ),
             "remote_reader_live_probe_health_mismatch",
         ),
