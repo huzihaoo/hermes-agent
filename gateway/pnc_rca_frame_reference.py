@@ -23,7 +23,8 @@ DEFAULT_FRONT_CAMERA_TOPIC_PRIORITY = (
 _DATE_TIME_RE = re.compile(
     r"^(?P<year>\d{4})(?:-(?P<month_dash>\d{2})-(?P<day_dash>\d{2})|"
     r"(?P<month_compact>\d{2})(?P<day_compact>\d{2})\s*,)\s*"
-    r"(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})$"
+    r"(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})"
+    r"(?P<fraction>\.\d{1,6})?$"
 )
 _MIN_TIMESTAMP_US = 946_684_800_000_000  # 2000-01-01T00:00:00Z
 _MAX_TIMESTAMP_US = 4_102_444_800_000_000  # 2100-01-01T00:00:00Z
@@ -57,6 +58,7 @@ def parse_frame_reference(value: Any) -> dict[str, Any]:
     if match is None:
         raise FrameReferenceError("frame_reference_format_invalid")
     parts = match.groupdict()
+    fraction = parts.get("fraction") or ""
     try:
         marker_time = datetime(
             int(parts["year"]),
@@ -65,11 +67,17 @@ def parse_frame_reference(value: Any) -> dict[str, Any]:
             int(parts["hour"]),
             int(parts["minute"]),
             int(parts["second"]),
+            int(fraction[1:].ljust(6, "0")) if fraction else 0,
             tzinfo=FRAME_TIMEZONE,
         )
     except ValueError as exc:
         raise FrameReferenceError("frame_reference_datetime_invalid") from exc
-    management_timestamp_us = int(marker_time.timestamp()) * 1_000_000
+    utc_marker = marker_time.astimezone(timezone.utc)
+    epoch_delta = utc_marker - datetime(1970, 1, 1, tzinfo=timezone.utc)
+    management_timestamp_us = (
+        (epoch_delta.days * 86_400 + epoch_delta.seconds) * 1_000_000
+        + epoch_delta.microseconds
+    )
     return {
         "kind": "front_camera_timestamp",
         "source_field": FRAME_FIELD_NAME,
