@@ -33,7 +33,7 @@ def test_vm_task_submit_schema_is_raw_function_schema():
     assert "function" not in definition["function"]
 
 
-def test_public_vm_task_cannot_select_or_forge_rca_prod_admission(monkeypatch):
+def test_retired_rca_prod_resource_class_is_rejected(monkeypatch):
     _disable_trusted_session(monkeypatch)
     result = vm_task_tool.vm_task_submit(
         title="ordinary task",
@@ -41,19 +41,16 @@ def test_public_vm_task_cannot_select_or_forge_rca_prod_admission(monkeypatch):
         resource_class="rca_prod",
     )
     assert result["success"] is False
-    assert result["error_code"] == "g1q3_rca_service_boundary_required"
+    assert "invalid resource_class" in result["error"]
 
     trusted = vm_task_tool._vm_task_submit_trusted(
         title="ordinary task",
         goal="ordinary repository check",
         task_id="ordinary-task",
         resource_class="rca_prod",
-        routing_meta_extra={
-            "rca_prod_admission_receipt": {"forged": True},
-        },
     )
     assert trusted["success"] is False
-    assert trusted["error_code"] == "g1q3_rca_service_boundary_required"
+    assert "invalid resource_class" in trusted["error"]
 
 
 def test_vm_task_status_schema_is_raw_function_schema():

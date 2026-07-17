@@ -20,17 +20,8 @@ from gateway.pnc_rca_data_access import (
     RemoteDataAccessError,
     validate_remote_data_access,
 )
-from gateway.pnc_rca_prod_admission import (
-    RcaProdAdmissionError,
-    build_rca_prod_command_argv,
-    command_sha256 as rca_prod_command_sha256,
-    goal_sha256 as rca_prod_goal_sha256,
-    issue_rca_prod_admission,
-    validate_existing_rca_prod_meta,
-)
 from gateway.pnc_rca_workspace_runtime import (
     WorkspaceRuntimeError,
-    WorkspaceRuntimeIdentity,
     validate_workspace_runtime,
 )
 from hermes_constants import get_hermes_home
@@ -913,7 +904,6 @@ def _build_scheduler_meta(
     executor_type: str = "",
     agent_backend: str = "",
     codex_backend_enabled: bool | None = None,
-    allow_rca_prod_service: bool = False,
 ) -> tuple[dict[str, Any], str | None]:
     values = {
         "lane": str(lane or "").strip(),
@@ -926,12 +916,9 @@ def _build_scheduler_meta(
         "executor_type": str(executor_type or "coding_agent").strip(),
         "agent_backend": str(agent_backend or "codex").strip(),
     }
-    resource_classes = set(_ALLOWED_RESOURCE_CLASSES)
-    if allow_rca_prod_service:
-        resource_classes.add("rca_prod")
     checks = (
         ("lane", values["lane"], _ALLOWED_LANES),
-        ("resource_class", values["resource_class"], resource_classes),
+        ("resource_class", values["resource_class"], _ALLOWED_RESOURCE_CLASSES),
         ("workspace_scope", values["workspace_scope"], _ALLOWED_WORKSPACE_SCOPES),
         ("risk_class", values["risk_class"], _ALLOWED_RISK_CLASSES),
         ("executor_type", values["executor_type"], _ALLOWED_EXECUTOR_TYPES),
@@ -1046,8 +1033,6 @@ def _vm_task_submit_trusted(
     routing_meta_extra: dict[str, Any] | None = None,
     create_once: bool = False,
     create_task_script: Path | None = None,
-    rca_prod_service_receipt: dict[str, Any] | None = None,
-    rca_prod_workspace_runtime: Any | None = None,
 ) -> Dict[str, Any]:
     """Create a task after a public-human or dedicated-service gate allowed it."""
 
@@ -1064,22 +1049,6 @@ def _vm_task_submit_trusted(
             "success": False,
             "error": "invalid task_id: must be a safe shared-state task id",
         }
-    is_rca_prod = str(resource_class or "").strip() == "rca_prod"
-    extra_receipt = (
-        routing_meta_extra.get("rca_prod_admission_receipt")
-        if isinstance(routing_meta_extra, dict)
-        else None
-    )
-    if is_rca_prod and (
-        not isinstance(rca_prod_service_receipt, dict)
-        or extra_receipt != rca_prod_service_receipt
-        or not isinstance(rca_prod_workspace_runtime, WorkspaceRuntimeIdentity)
-    ):
-        return _reserved_rca_service_payload()
-    if not is_rca_prod and (
-        rca_prod_service_receipt is not None or rca_prod_workspace_runtime is not None
-    ):
-        return _reserved_rca_service_payload()
     scheduler_meta, scheduler_meta_error = _build_scheduler_meta(
         lane=lane,
         resource_class=resource_class,
@@ -1091,7 +1060,6 @@ def _vm_task_submit_trusted(
         executor_type=executor_type,
         agent_backend=agent_backend,
         codex_backend_enabled=codex_backend_enabled,
-        allow_rca_prod_service=is_rca_prod and rca_prod_service_receipt is not None,
     )
     if scheduler_meta_error:
         return {"success": False, "error": scheduler_meta_error}
@@ -1157,32 +1125,6 @@ def _vm_task_submit_trusted(
         cmd.append("--create-once")
 
     try:
-        if is_rca_prod:
-            try:
-                final_workspace_runtime = validate_workspace_runtime()
-            except WorkspaceRuntimeError as exc:
-                return {
-                    **_vm_task_service_denied_payload(
-                        "vm_task_service_workspace_runtime_invalid",
-                        f"fixed RCA workspace runtime changed at create boundary: {exc.code}",
-                    ),
-                    "retryable": True,
-                    "create_suppressed": True,
-                }
-            if (
-                final_workspace_runtime != rca_prod_workspace_runtime
-                or create_task != final_workspace_runtime.creator_path
-            ):
-                return {
-                    **_vm_task_service_denied_payload(
-                        "vm_task_service_workspace_runtime_drift",
-                        "fixed RCA workspace runtime identity drifted at create boundary",
-                    ),
-                    "retryable": True,
-                    "create_suppressed": True,
-                    "expected_workspace_runtime": rca_prod_workspace_runtime.to_dict(),
-                    "observed_workspace_runtime": final_workspace_runtime.to_dict(),
-                }
         proc = subprocess.run(cmd, text=True, capture_output=True, timeout=120)
     except FileNotFoundError as exc:
         return {
@@ -1250,13 +1192,6 @@ def vm_task_submit_service(
     admission: Any,
     execution_request: Any,
     reconcile_only: bool = False,
-    capacity_mode: str = "",
-    bootstrap_epoch_id: str = "",
-    release_bom_sha256: str = "",
-    bootstrap_started_at: str = "",
-    bootstrap_deadline: str = "",
-    bootstrap_authorization_fingerprint: str = "",
-    active_release_binding_sha256: str = "",
 ) -> Dict[str, Any]:
     """Submit one capability-scoped RCA intake without exposing general VM execution.
 
@@ -1269,46 +1204,6 @@ def vm_task_submit_service(
     normalized_service = str(service_id or "").strip()
     normalized_capability = str(capability or "").strip()
     normalized_operation = str(operation or "").strip()
-    normalized_capacity_mode = str(capacity_mode or "").strip()
-    normalized_bootstrap_epoch = str(bootstrap_epoch_id or "").strip()
-    normalized_release_bom = str(release_bom_sha256 or "").strip().lower()
-    normalized_bootstrap_started = str(bootstrap_started_at or "").strip()
-    normalized_bootstrap_deadline = str(bootstrap_deadline or "").strip()
-    normalized_bootstrap_fingerprint = str(
-        bootstrap_authorization_fingerprint or ""
-    ).strip().lower()
-    normalized_active_release_binding = str(
-        active_release_binding_sha256 or ""
-    ).strip().lower()
-    if normalized_capacity_mode not in {"steady", "bootstrap"}:
-        return _vm_task_service_denied_payload(
-            "vm_task_service_capacity_mode_invalid",
-            "capacity_mode must be explicitly steady or bootstrap",
-        )
-    if normalized_capacity_mode == "steady" and (
-        normalized_bootstrap_epoch
-        or normalized_release_bom
-        or normalized_bootstrap_started
-        or normalized_bootstrap_deadline
-        or normalized_bootstrap_fingerprint
-        or normalized_active_release_binding
-    ):
-        return _vm_task_service_denied_payload(
-            "vm_task_service_capacity_mode_invalid",
-            "steady capacity mode cannot carry bootstrap release bindings",
-        )
-    if normalized_capacity_mode == "bootstrap" and (
-        not normalized_bootstrap_epoch
-        or not re.fullmatch(r"[0-9a-f]{64}", normalized_release_bom)
-        or not normalized_bootstrap_started
-        or not normalized_bootstrap_deadline
-        or not re.fullmatch(r"[0-9a-f]{64}", normalized_bootstrap_fingerprint)
-        or not re.fullmatch(r"[0-9a-f]{64}", normalized_active_release_binding)
-    ):
-        return _vm_task_service_denied_payload(
-            "vm_task_service_bootstrap_binding_invalid",
-            "bootstrap capacity mode requires an epoch id and release BOM SHA",
-        )
     if not isinstance(reconcile_only, bool):
         return _vm_task_service_denied_payload(
             "vm_task_service_request_invalid",
@@ -1585,12 +1480,14 @@ def vm_task_submit_service(
     title = f"G1Q3 RCA issue intake: {refs.work_item_id}"
     contract_sha256 = _rca_contract_sha256(admission_payload, request_payload)
     fixed_execution_meta = {
-        "lane": "heavy",
-        "resource_class": "rca_prod",
-        "risk_class": "high",
-        "executor_type": "direct_cli",
-        "agent_backend": "none",
-        "codex_backend_enabled": False,
+        "lane": "standard",
+        "resource_class": "pnc_data",
+        "repo_scope": "unknown",
+        "workspace_scope": "none",
+        "risk_class": "normal",
+        "executor_type": "governed_tool",
+        "agent_backend": "codex",
+        "codex_backend_enabled": True,
         "coding_agent_fallback_enabled": False,
         "fixed_cli_entrypoint": (
             f"{_RCA_VM_REPO_ROOT}/{_RCA_FIXED_CLI_RELATIVE_PATH.removeprefix('./')}"
@@ -1625,62 +1522,7 @@ def vm_task_submit_service(
             "vm_task_service_request_invalid",
             f"fixed CLI goal contract could not be built: {type(exc).__name__}",
         )
-    reservation_identity = reservation_decision.receipt.get("reservation")
-    reservation_identity = (
-        reservation_identity if isinstance(reservation_identity, dict) else {}
-    )
-    reservation_id = str(
-        reservation_decision.receipt.get("reservation_id")
-        or reservation_identity.get("reservation_id")
-        or ""
-    ).strip()
-    reservation_fence = str(
-        reservation_decision.receipt.get("fence")
-        if reservation_decision.receipt.get("fence") is not None
-        else reservation_identity.get("fence")
-    ).strip()
-    reservation_contract_sha256 = str(
-        reservation_decision.receipt.get("contract_sha256")
-        or reservation_identity.get("contract_sha256")
-        or ""
-    ).strip()
-    try:
-        stable_rca_prod_meta = {
-            "resource_class": "rca_prod",
-            "lane": "heavy",
-            "queue_if_blocked": False,
-            "resource_gate_bypass": False,
-            "reservation_id": reservation_id,
-            "reservation_fence": reservation_fence,
-            "reservation_contract_sha256": reservation_contract_sha256,
-            "rca_prod_goal_sha256": rca_prod_goal_sha256(goal),
-            "rca_prod_command_sha256": rca_prod_command_sha256(
-                build_rca_prod_command_argv(validated_admission.submission_key)
-            ),
-            "rca_prod_contract_sha256": contract_sha256,
-        }
-    except RcaProdAdmissionError as exc:
-        return _vm_task_service_denied_payload(
-            "vm_task_service_rca_prod_command_invalid",
-            f"fixed RCA VM command contract is invalid: {exc.code}",
-        )
-    if normalized_capacity_mode == "bootstrap":
-        stable_rca_prod_meta.update(
-            {
-                "rca_prod_capacity_mode": "bootstrap",
-                "rca_prod_bootstrap_epoch_id": normalized_bootstrap_epoch,
-                "rca_prod_bootstrap_started_at": normalized_bootstrap_started,
-                "rca_prod_bootstrap_deadline": normalized_bootstrap_deadline,
-                "rca_prod_bootstrap_authorization_fingerprint": (
-                    normalized_bootstrap_fingerprint
-                ),
-                "rca_prod_release_bom_sha256": normalized_release_bom,
-                "rca_prod_active_release_binding_sha256": (
-                    normalized_active_release_binding
-                ),
-            }
-        )
-    identity_meta = {**base_identity_meta, **stable_rca_prod_meta}
+    identity_meta = base_identity_meta
     try:
         existing = vm_task_status(
             validated_admission.submission_key, include_markdown=False
@@ -1707,34 +1549,6 @@ def vm_task_submit_service(
                 **_vm_task_service_denied_payload(
                     "vm_task_service_existing_identity_conflict",
                     f"existing stable task id has conflicting RCA identity fields: {identity_error}",
-                ),
-                "existing_status": existing,
-                "admission": admission_payload,
-            }
-        try:
-            validate_existing_rca_prod_meta(
-                existing.get("meta"),
-                task_id=validated_admission.submission_key,
-                goal=goal,
-                contract_sha256=contract_sha256,
-                reservation_id=reservation_id,
-                reservation_fence=reservation_fence,
-                reservation_contract_sha256=reservation_contract_sha256,
-                capacity_mode=normalized_capacity_mode,
-                bootstrap_epoch_id=normalized_bootstrap_epoch,
-                release_bom_sha256=normalized_release_bom,
-                bootstrap_started_at=normalized_bootstrap_started,
-                bootstrap_deadline=normalized_bootstrap_deadline,
-                bootstrap_authorization_fingerprint=(
-                    normalized_bootstrap_fingerprint
-                ),
-                active_release_binding_sha256=(normalized_active_release_binding),
-            )
-        except RcaProdAdmissionError as exc:
-            return {
-                **_vm_task_service_denied_payload(
-                    "vm_task_service_existing_identity_conflict",
-                    f"existing stable task id has invalid RCA production admission: {exc.code}",
                 ),
                 "existing_status": existing,
                 "admission": admission_payload,
@@ -1777,98 +1591,24 @@ def vm_task_submit_service(
             "admission": admission_payload,
             "workspace_runtime": workspace_runtime.to_dict(),
         }
-    try:
-        create_workspace_runtime = validate_workspace_runtime()
-    except WorkspaceRuntimeError as exc:
-        return {
-            **_vm_task_service_denied_payload(
-                "vm_task_service_workspace_runtime_invalid",
-                f"fixed RCA workspace runtime changed before create: {exc.code}",
-            ),
-            "retryable": True,
-            "workspace_runtime": workspace_runtime.to_dict(),
-        }
-    if create_workspace_runtime != workspace_runtime:
-        return {
-            **_vm_task_service_denied_payload(
-                "vm_task_service_workspace_runtime_drift",
-                "fixed RCA workspace runtime identity drifted before create",
-            ),
-            "retryable": True,
-            "workspace_runtime": workspace_runtime.to_dict(),
-            "observed_workspace_runtime": create_workspace_runtime.to_dict(),
-        }
-    try:
-        prod_admission = issue_rca_prod_admission(
-            task_id=validated_admission.submission_key,
-            submission_key=validated_admission.submission_key,
-            goal=goal,
-            contract_sha256=contract_sha256,
-            reservation_id=reservation_id,
-            reservation_fence=reservation_fence,
-            reservation_contract_sha256=reservation_contract_sha256,
-            capacity_mode=normalized_capacity_mode,
-            bootstrap_epoch_id=normalized_bootstrap_epoch,
-            release_bom_sha256=normalized_release_bom,
-            bootstrap_started_at=normalized_bootstrap_started,
-            bootstrap_deadline=normalized_bootstrap_deadline,
-            bootstrap_authorization_fingerprint=normalized_bootstrap_fingerprint,
-            active_release_binding_sha256=normalized_active_release_binding,
-        )
-    except RcaProdAdmissionError as exc:
-        return {
-            **_vm_task_service_denied_payload(
-                "vm_task_service_rca_prod_admission_blocked",
-                f"RCA production admission rejected: {exc.code}",
-            ),
-            "retryable": exc.retryable,
-            "admission_reason": exc.code,
-            "create_suppressed": True,
-        }
-    try:
-        post_admission_workspace_runtime = validate_workspace_runtime()
-    except WorkspaceRuntimeError as exc:
-        return {
-            **_vm_task_service_denied_payload(
-                "vm_task_service_workspace_runtime_invalid",
-                f"fixed RCA workspace runtime changed after production admission: {exc.code}",
-            ),
-            "retryable": True,
-            "create_suppressed": True,
-            "workspace_runtime": workspace_runtime.to_dict(),
-        }
-    if post_admission_workspace_runtime != workspace_runtime:
-        return {
-            **_vm_task_service_denied_payload(
-                "vm_task_service_workspace_runtime_drift",
-                "fixed RCA workspace runtime identity drifted during production admission",
-            ),
-            "retryable": True,
-            "create_suppressed": True,
-            "workspace_runtime": workspace_runtime.to_dict(),
-            "observed_workspace_runtime": post_admission_workspace_runtime.to_dict(),
-        }
-    create_identity_meta = {**identity_meta, **prod_admission.meta}
     result = _vm_task_submit_trusted(
         title=title,
         goal=goal,
         task_id=validated_admission.submission_key,
         owner=normalized_service,
-        lane="heavy",
-        resource_class="rca_prod",
+        lane="standard",
+        resource_class="pnc_data",
         repo_scope="unknown",
         workspace_scope="none",
-        risk_class="high",
+        risk_class="normal",
         artifact_root=artifact_root,
         artifact_cifs_root=artifact_cifs_root,
-        executor_type="direct_cli",
-        agent_backend="none",
-        codex_backend_enabled=False,
-        routing_meta_extra=create_identity_meta,
+        executor_type="governed_tool",
+        agent_backend="codex",
+        codex_backend_enabled=True,
+        routing_meta_extra=identity_meta,
         create_once=True,
-        create_task_script=post_admission_workspace_runtime.creator_path,
-        rca_prod_service_receipt=prod_admission.receipt,
-        rca_prod_workspace_runtime=post_admission_workspace_runtime,
+        create_task_script=workspace_runtime.creator_path,
     )
     try:
         reconciled = vm_task_status(
@@ -1898,34 +1638,6 @@ def vm_task_submit_service(
                 "submit_result": result,
                 "admission": admission_payload,
             }
-        try:
-            validate_existing_rca_prod_meta(
-                reconciled.get("meta"),
-                task_id=validated_admission.submission_key,
-                goal=goal,
-                contract_sha256=contract_sha256,
-                reservation_id=reservation_id,
-                reservation_fence=reservation_fence,
-                reservation_contract_sha256=reservation_contract_sha256,
-                capacity_mode=normalized_capacity_mode,
-                bootstrap_epoch_id=normalized_bootstrap_epoch,
-                release_bom_sha256=normalized_release_bom,
-                bootstrap_started_at=normalized_bootstrap_started,
-                bootstrap_deadline=normalized_bootstrap_deadline,
-                bootstrap_authorization_fingerprint=(
-                    normalized_bootstrap_fingerprint
-                ),
-            )
-        except RcaProdAdmissionError as exc:
-            return {
-                **_vm_task_service_denied_payload(
-                    "vm_task_service_existing_identity_conflict",
-                    f"reconciled stable task id has invalid RCA production admission: {exc.code}",
-                ),
-                "existing_status": reconciled,
-                "submit_result": result,
-                "admission": admission_payload,
-            }
         creator_task = (
             result.get("task") if isinstance(result.get("task"), dict) else {}
         )
@@ -1946,13 +1658,20 @@ def vm_task_submit_service(
             "workspace_runtime": workspace_runtime.to_dict(),
         })
         return result
+    submit_diagnostic = {
+        "error_code": str(result.get("error_code") or ""),
+        "returncode": result.get("returncode"),
+        "error": str(result.get("error") or "")[:300],
+        "stderr_tail": str(result.get("stderr") or "")[-1000:],
+    }
     return {
         **result,
         "success": False,
         "error_code": "vm_task_service_submit_uncertain",
         "error": (
             "RCA task creation outcome is uncertain and no matching stable task is currently visible; "
-            "retry must reconcile the same submission key"
+            "retry must reconcile the same submission key; "
+            f"submit_diagnostic={json.dumps(submit_diagnostic, ensure_ascii=True, sort_keys=True)}"
         ),
         "retryable": True,
         "created": False,

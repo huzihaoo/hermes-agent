@@ -4,10 +4,8 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
-import hmac
 import json
 import logging
 import os
@@ -37,7 +35,6 @@ from gateway.pnc_rca_control_store import (
     RcaControlStore,
     StaleOutboxLeaseError,
 )
-from gateway.pnc_rca_capacity_runtime import CapacityRuntimeResolver
 from gateway.pnc_rca_delivery_store import (
     DeliveryBackpressureSnapshot,
     RcaDeliveryStore,
@@ -59,15 +56,6 @@ from gateway.pnc_rca_derived_capacity_reservation import (
     validate_derived_capacity_reservation_receipt,
 )
 from gateway.pnc_rca_kafka_contract import NORMALIZED_EVENT_SCHEMA_VERSION
-from gateway.pnc_rca_prod_bootstrap import (
-    ACTIVE_RELEASE_BINDING_NAME,
-    EPOCH_ID_RE as BOOTSTRAP_EPOCH_ID_RE,
-    MAX_ACTIVE_RELEASE_BINDING_BYTES,
-    RcaBootstrapAuthorizationError,
-    _read_bound_file,
-    load_active_release_binding,
-    load_bootstrap_authorization,
-)
 from gateway.pnc_rca_runtime_identity import (
     MAX_HEALTH_FUTURE_SKEW_SECONDS,
     RCA_OUTBOX_DISPATCHER_LOADED_DEPENDENCIES,
@@ -94,9 +82,6 @@ from hermes_constants import get_hermes_home
 
 
 ENV_PREFIX = "HERMES_RCA_OUTBOX_"
-PROD_CAPACITY_MODE_ENV = "HERMES_RCA_PROD_CAPACITY_MODE"
-PROD_RELEASE_ID_ENV = "HERMES_RCA_PROD_RELEASE_ID"
-PROD_BOOTSTRAP_EPOCH_ID_ENV = "HERMES_RCA_PROD_BOOTSTRAP_EPOCH_ID"
 DISPATCHER_HEALTH_SCHEMA_VERSION = "pnc_rca_outbox_dispatcher_health_v2"
 SERVICE_LABEL = "local.pnc.rca-outbox-dispatcher"
 OUTBOX_PAYLOAD_SCHEMA_VERSION = "pnc_rca_submission_outbox_v2"
@@ -128,7 +113,6 @@ DEFAULT_INPUT_WAIT_MAX_AGE_SECONDS = 900
 MIN_INPUT_WAIT_MAX_AGE_SECONDS = 60
 MAX_INPUT_WAIT_MAX_AGE_SECONDS = 3_600
 HEALTH_HEARTBEAT_INTERVAL_SECONDS = 10.0
-PROD_RELEASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$")
 _FORBIDDEN_MDI_COMMAND_PATTERN = re.compile(
     r"\bmdi\s+(?:download|refresh2?|clip|event)\b", re.IGNORECASE
 )
@@ -154,7 +138,6 @@ _SERVICE_ERROR_CODES = frozenset({
 
 _GLOBAL_CIRCUIT_ERROR_CODES = frozenset({
     "dispatcher_dependency_unavailable",
-    "dispatcher_bootstrap_authorization_invalid",
     "dispatcher_submit_contract_invalid",
     "derived_capacity_reservation_abort_precreate_response_invalid",
     "derived_capacity_reservation_abort_precreate_unavailable",
@@ -332,7 +315,6 @@ class PermanentDispatchError(RuntimeError):
 @dataclass(frozen=True)
 class DispatcherConfig:
     dispatch_enabled: bool
-    activation_required: bool
     control_db_path: Path
     delivery_db_path: Path
     health_path: Path
@@ -360,11 +342,6 @@ class DispatcherConfig:
     storage_reserve_percent: int
     storage_timeout_seconds: int
     derived_capacity_reservation_timeout_seconds: int
-    capacity_mode: str
-    release_id: str
-    bootstrap_epoch_id: str
-    active_release_binding_path: Path
-    live_env_path: Path
 
     @classmethod
     def from_env(
@@ -498,36 +475,8 @@ class DispatcherConfig:
                 f"{ENV_PREFIX}INPUT_WAIT_MAX_AGE_SECONDS must be at most "
                 f"{MAX_INPUT_WAIT_MAX_AGE_SECONDS}"
             )
-        capacity_mode = str(source.get(PROD_CAPACITY_MODE_ENV, "steady")).strip()
-        if capacity_mode not in {"steady", "bootstrap"}:
-            raise ValueError(
-                f"{PROD_CAPACITY_MODE_ENV} must be exactly steady or bootstrap"
-            )
-        release_id = str(source.get(PROD_RELEASE_ID_ENV, "")).strip()
-        bootstrap_epoch_id = str(
-            source.get(PROD_BOOTSTRAP_EPOCH_ID_ENV, "")
-        ).strip()
-        if bool(release_id) != bool(bootstrap_epoch_id):
-            raise ValueError(
-                f"{PROD_RELEASE_ID_ENV} and {PROD_BOOTSTRAP_EPOCH_ID_ENV} "
-                "must be configured together"
-            )
-        if release_id and (
-            PROD_RELEASE_ID_RE.fullmatch(release_id) is None
-            or BOOTSTRAP_EPOCH_ID_RE.fullmatch(bootstrap_epoch_id) is None
-        ):
-            raise ValueError("RCA production release or bootstrap epoch id is invalid")
-        if capacity_mode == "bootstrap" and not release_id:
-            raise ValueError(
-                "bootstrap RCA production capacity mode requires release and epoch ids"
-            )
         config = cls(
             dispatch_enabled=dispatch_enabled,
-            activation_required=_strict_boolean(
-                source,
-                f"{ENV_PREFIX}ACTIVATION_REQUIRED",
-                False,
-            ),
             control_db_path=control_db_path,
             delivery_db_path=delivery_db_path,
             health_path=Path(
@@ -594,13 +543,6 @@ class DispatcherConfig:
                 source, f"{ENV_PREFIX}STORAGE_TIMEOUT_SECONDS", 45
             ),
             derived_capacity_reservation_timeout_seconds=(derived_reservation_timeout),
-            capacity_mode=capacity_mode,
-            release_id=release_id,
-            bootstrap_epoch_id=bootstrap_epoch_id,
-            active_release_binding_path=(
-                control_db_path.parent / ACTIVE_RELEASE_BINDING_NAME
-            ),
-            live_env_path=home / ".env",
         )
         longest_boundary = max(
             config.storage_timeout_seconds,
@@ -622,7 +564,6 @@ class DispatcherConfig:
     def public_dict(self) -> dict[str, Any]:
         return {
             "dispatch_enabled": self.dispatch_enabled,
-            "activation_required": self.activation_required,
             "control_db_path": str(self.control_db_path),
             "delivery_db_path": str(self.delivery_db_path),
             "health_path": str(self.health_path),
@@ -665,11 +606,6 @@ class DispatcherConfig:
             "derived_capacity_reservation_timeout_seconds": (
                 self.derived_capacity_reservation_timeout_seconds
             ),
-            "capacity_mode": self.capacity_mode,
-            "release_id": self.release_id,
-            "bootstrap_epoch_id": self.bootstrap_epoch_id,
-            "active_release_binding_path": str(self.active_release_binding_path),
-            "live_env_path": str(self.live_env_path),
         }
 
     def runtime_public_dict(self) -> dict[str, Any]:
@@ -795,9 +731,6 @@ def default_enrich_event(event: Mapping[str, Any]) -> RcaIssueContext:
 def default_submit(
     admission: RcaAdmission,
     execution_request: RcaExecutionRequest,
-    *,
-    config: DispatcherConfig | None = None,
-    capacity_runtime: CapacityRuntimeResolver | None = None,
 ) -> Mapping[str, Any]:
     """Invoke only the fixed, capability-scoped VM submission wrapper."""
     from tools.vm_task_tool import vm_task_submit_service
@@ -806,128 +739,14 @@ def default_submit(
     reconcile_only = (
         isinstance(reservation, Mapping) and reservation.get("status") == "released"
     )
-    decision_context = (
-        capacity_runtime.shared_decision()
-        if capacity_runtime is not None
-        else nullcontext(None)
+    return vm_task_submit_service(
+        service_id=DEFAULT_SERVICE_ID,
+        capability=SERVICE_CAPABILITY,
+        operation=SERVICE_OPERATION,
+        admission=admission,
+        execution_request=execution_request,
+        reconcile_only=reconcile_only,
     )
-    with decision_context as capacity_decision:
-        if (
-            capacity_decision is not None
-            and not (config is not None and not config.activation_required)
-        ):
-            if capacity_decision.get("ready") is not True:
-                raise DispatchCircuitError(
-                    "dispatcher_capacity_runtime_blocked",
-                    str(
-                        capacity_decision.get("reason_code")
-                        or "rca_capacity_runtime_blocked"
-                    ),
-                )
-            capacity_mode = str(capacity_decision.get("effective_mode") or "")
-        else:
-            capacity_mode = config.capacity_mode if config is not None else "steady"
-        if capacity_mode not in {"bootstrap", "steady"}:
-            raise DispatchCircuitError(
-                "dispatcher_capacity_runtime_blocked",
-                "rca_capacity_runtime_mode_invalid",
-            )
-        capacity_bindings: dict[str, str] = {}
-        if capacity_mode == "bootstrap":
-            if config is None:
-                raise DispatchCircuitError(
-                    "dispatcher_bootstrap_authorization_invalid",
-                    "dispatcher_bootstrap_config_missing",
-                )
-            try:
-                authorization = _load_bound_bootstrap_authorization(config)
-            except RcaBootstrapAuthorizationError as exc:
-                raise DispatchCircuitError(
-                    "dispatcher_bootstrap_authorization_invalid", exc.code
-                ) from exc
-            active_release_binding = authorization[
-                "active_release_binding_sha256"
-            ]
-            if capacity_decision is not None and config.activation_required:
-                runtime_active_release_binding = str(
-                    capacity_decision.get("active_release_binding_sha256") or ""
-                )
-                if not hmac.compare_digest(
-                    runtime_active_release_binding,
-                    active_release_binding,
-                ):
-                    raise DispatchCircuitError(
-                        "dispatcher_bootstrap_authorization_invalid",
-                        "rca_bootstrap_active_release_binding_mismatch",
-                    )
-                active_release_binding = runtime_active_release_binding
-            capacity_bindings = {
-                "bootstrap_epoch_id": authorization["bootstrap_epoch_id"],
-                "release_bom_sha256": authorization["release_bom_sha256"],
-                "bootstrap_started_at": authorization["started_at"],
-                "bootstrap_deadline": authorization["deadline"],
-                "bootstrap_authorization_fingerprint": authorization[
-                    "receipt_fingerprint"
-                ],
-                "active_release_binding_sha256": active_release_binding,
-            }
-        return vm_task_submit_service(
-            service_id=DEFAULT_SERVICE_ID,
-            capability=SERVICE_CAPABILITY,
-            operation=SERVICE_OPERATION,
-            admission=admission,
-            execution_request=execution_request,
-            reconcile_only=reconcile_only,
-            capacity_mode=capacity_mode,
-            **capacity_bindings,
-        )
-
-
-def _load_bound_bootstrap_authorization(
-    config: DispatcherConfig,
-) -> dict[str, Any]:
-    if not config.activation_required:
-        authorization = load_bootstrap_authorization(
-            expected_epoch_id=config.bootstrap_epoch_id,
-            expected_release_approval_id=config.release_id,
-        )
-        _raw, binding_sha256 = _read_bound_file(
-            config.active_release_binding_path,
-            artifact="rca_active_release_binding",
-            maximum=MAX_ACTIVE_RELEASE_BINDING_BYTES,
-        )
-        return {
-            **authorization,
-            "active_release_binding_sha256": binding_sha256,
-        }
-    binding = load_active_release_binding(
-        path=config.active_release_binding_path,
-        live_env_path=config.live_env_path,
-        expected_release_id=config.release_id,
-        expected_epoch_id=config.bootstrap_epoch_id,
-    )
-    authorization = load_bootstrap_authorization(
-        expected_epoch_id=binding["bootstrap_epoch_id"],
-        expected_release_bom_sha256=binding["release_bom_sha256"],
-        expected_release_approval_id=binding["release_id"],
-        expected_approval_evidence_sha256=binding[
-            "approval_evidence_sha256"
-        ],
-    )
-    if (
-        authorization["authorization_receipt_sha256"]
-        != binding["authorization_receipt_sha256"]
-        or authorization["receipt_fingerprint"]
-        != binding["authorization_fingerprint"]
-    ):
-        raise RcaBootstrapAuthorizationError(
-            "rca_active_release_authorization_identity_mismatch"
-        )
-    return {
-        **authorization,
-        "active_release_binding_sha256": binding["binding_receipt_sha256"],
-        "candidate_env_sha256": binding["candidate_env_sha256"],
-    }
 
 
 def _remote_storage_admission_script(request: StorageAdmissionRequest) -> str:
@@ -1992,7 +1811,7 @@ class OutboxDispatcher:
             lease_owner=self.lease_owner,
             lease_seconds=self.config.lease_seconds,
             max_age_seconds=self.config.max_age_seconds,
-            activation_required=self.config.activation_required,
+            activation_required=False,
             now=current,
         )
         if claim is None:
@@ -2365,7 +2184,7 @@ class OutboxDispatcher:
             lease_token=claim.lease_token,
             lease_owner=claim.lease_owner,
             lease_seconds=self.config.lease_seconds,
-            activation_required=self.config.activation_required,
+            activation_required=False,
             now=self.now(),
         )
 
@@ -2506,7 +2325,6 @@ class OutboxDispatcher:
                 "downstream_backpressure",
                 "downstream_error",
                 "lease_lost",
-                "capacity_authorization_unavailable",
             }:
                 break
         return outcomes
@@ -2522,11 +2340,6 @@ class HealthReporter:
         workspace_runtime_observer: Callable[
             [], WorkspaceRuntimeIdentity
         ] | None = None,
-        bootstrap_authorization_observer: Callable[
-            [], Mapping[str, Any]
-        ] | None = None,
-        capacity_runtime_observer: Callable[[], Mapping[str, Any]] | None = None,
-        capacity_runtime: CapacityRuntimeResolver | None = None,
     ):
         self.config = config
         self.store = store
@@ -2538,12 +2351,6 @@ class HealthReporter:
         self._workspace_runtime_observer = (
             workspace_runtime_observer or validate_workspace_runtime
         )
-        self._bootstrap_authorization_observer = (
-            bootstrap_authorization_observer
-            or (lambda: _load_bound_bootstrap_authorization(self.config))
-        )
-        self._capacity_runtime_observer = capacity_runtime_observer
-        self._capacity_runtime = capacity_runtime
         self._bound_workspace_runtime: WorkspaceRuntimeIdentity | None = None
         self._workspace_runtime_startup_error = ""
         try:
@@ -2571,7 +2378,7 @@ class HealthReporter:
         return identity
 
     def workspace_runtime_status(self) -> dict[str, Any]:
-        required = self.config.dispatch_enabled or self.config.activation_required
+        required = self.config.dispatch_enabled
         bound = self._bound_workspace_runtime
         try:
             observed = self._observe_workspace_runtime()
@@ -2626,206 +2433,7 @@ class HealthReporter:
                 status="workspace_runtime_unavailable",
                 error_code=str(status["error_code"]),
             )
-        capacity = self.capacity_admission_status()
-        if capacity["required"] is True and capacity["ready"] is not True:
-            self.store.open_dispatcher_circuit(
-                reason_code="dispatcher_capacity_runtime_blocked",
-                reason_detail=str(capacity["error_code"]),
-            )
-            return DispatchOutcome(
-                status="capacity_authorization_unavailable",
-                error_code=str(capacity["error_code"]),
-            )
         return None
-
-    def _capacity_status_from_runtime_decision(
-        self, decision: Mapping[str, Any]
-    ) -> dict[str, Any]:
-        required = bool(
-            decision.get("configured") is True
-            and (self.config.dispatch_enabled or self.config.activation_required)
-        )
-        mode = str(decision.get("effective_mode") or "blocked")
-        if decision.get("ready") is not True or mode not in {"bootstrap", "steady"}:
-            return {
-                "required": required,
-                "ready": False,
-                "state": str(decision.get("effective_state") or "STEADY_BLOCKED"),
-                "error_code": str(
-                    decision.get("reason_code") or "rca_capacity_runtime_blocked"
-                ),
-                "capacity_mode": "blocked",
-                "authorization": None,
-                "runtime": dict(decision),
-            }
-        if mode == "steady":
-            return {
-                "required": required,
-                "ready": True,
-                "state": str(decision.get("effective_state") or "STEADY_ACTIVE"),
-                "error_code": "",
-                "capacity_mode": "steady",
-                "authorization": None,
-                "runtime": dict(decision),
-            }
-        try:
-            authorization = dict(self._bootstrap_authorization_observer())
-            runtime_active_release_binding = str(
-                decision.get("active_release_binding_sha256") or ""
-            )
-            if (
-                authorization.get("authorization_ready") is not True
-                or authorization.get("capacity_mode") != "bootstrap"
-                or authorization.get("bootstrap_epoch_id")
-                != self.config.bootstrap_epoch_id
-                or authorization.get("release_approval_id") != self.config.release_id
-                or any(
-                    re.fullmatch(r"[0-9a-f]{64}", str(authorization.get(field) or ""))
-                    is None
-                    for field in (
-                        "receipt_fingerprint",
-                        "authorization_receipt_sha256",
-                        "active_release_binding_sha256",
-                    )
-                )
-                or not hmac.compare_digest(
-                    runtime_active_release_binding,
-                    str(authorization.get("active_release_binding_sha256") or ""),
-                )
-            ):
-                raise RcaBootstrapAuthorizationError(
-                    "rca_bootstrap_authorization_projection_invalid"
-                )
-        except RcaBootstrapAuthorizationError as exc:
-            return {
-                "required": required,
-                "ready": False,
-                "state": str(decision.get("effective_state") or ""),
-                "error_code": exc.code,
-                "capacity_mode": "bootstrap",
-                "authorization": None,
-                "runtime": dict(decision),
-            }
-        return {
-            "required": required,
-            "ready": True,
-            "state": str(decision.get("effective_state") or ""),
-            "error_code": "",
-            "capacity_mode": "bootstrap",
-            "authorization": {
-                "bootstrap_epoch_id": authorization["bootstrap_epoch_id"],
-                "started_at": authorization["started_at"],
-                "deadline": authorization["deadline"],
-                "receipt_fingerprint": authorization["receipt_fingerprint"],
-                "authorization_receipt_sha256": authorization[
-                    "authorization_receipt_sha256"
-                ],
-                "active_release_binding_sha256": authorization[
-                    "active_release_binding_sha256"
-                ],
-                "candidate_env_sha256": authorization["candidate_env_sha256"],
-                "release_bom_sha256": authorization["release_bom_sha256"],
-                "release_approval_id": authorization["release_approval_id"],
-                "approval_evidence_sha256": authorization[
-                    "approval_evidence_sha256"
-                ],
-            },
-            "runtime": dict(decision),
-        }
-
-    def capacity_admission_status(self) -> dict[str, Any]:
-        if self._capacity_runtime is not None:
-            with self._capacity_runtime.shared_decision() as decision:
-                return self._capacity_status_from_runtime_decision(decision)
-        if self._capacity_runtime_observer is not None:
-            try:
-                decision = dict(self._capacity_runtime_observer())
-            except Exception:
-                decision = {
-                    "configured": bool(
-                        self.config.release_id and self.config.bootstrap_epoch_id
-                    ),
-                    "ready": False,
-                    "effective_state": "STEADY_BLOCKED",
-                    "effective_mode": "blocked",
-                    "reason_code": "rca_capacity_runtime_observation_failed",
-                }
-            return self._capacity_status_from_runtime_decision(decision)
-        required = bool(
-            self.config.capacity_mode == "bootstrap"
-            and (self.config.dispatch_enabled or self.config.activation_required)
-        )
-        if self.config.capacity_mode == "steady":
-            return {
-                "required": False,
-                "ready": True,
-                "state": "steady",
-                "error_code": "",
-                "capacity_mode": "steady",
-                "authorization": None,
-            }
-        try:
-            authorization = dict(self._bootstrap_authorization_observer())
-            if (
-                authorization.get("authorization_ready") is not True
-                or authorization.get("capacity_mode") != "bootstrap"
-                or authorization.get("bootstrap_epoch_id")
-                != self.config.bootstrap_epoch_id
-                or authorization.get("release_approval_id")
-                != self.config.release_id
-                or re.fullmatch(
-                    r"[0-9a-f]{64}",
-                    str(authorization.get("receipt_fingerprint") or ""),
-                )
-                is None
-                or re.fullmatch(
-                    r"[0-9a-f]{64}",
-                    str(authorization.get("authorization_receipt_sha256") or ""),
-                )
-                is None
-                or re.fullmatch(
-                    r"[0-9a-f]{64}",
-                    str(authorization.get("active_release_binding_sha256") or ""),
-                )
-                is None
-            ):
-                raise RcaBootstrapAuthorizationError(
-                    "rca_bootstrap_authorization_projection_invalid"
-                )
-        except RcaBootstrapAuthorizationError as exc:
-            return {
-                "required": required,
-                "ready": False,
-                "state": "unavailable",
-                "error_code": exc.code,
-                "capacity_mode": "bootstrap",
-                "authorization": None,
-            }
-        return {
-            "required": required,
-            "ready": True,
-            "state": "ready",
-            "error_code": "",
-            "capacity_mode": "bootstrap",
-            "authorization": {
-                "bootstrap_epoch_id": authorization["bootstrap_epoch_id"],
-                "started_at": authorization["started_at"],
-                "deadline": authorization["deadline"],
-                "receipt_fingerprint": authorization["receipt_fingerprint"],
-                "authorization_receipt_sha256": authorization[
-                    "authorization_receipt_sha256"
-                ],
-                "active_release_binding_sha256": authorization[
-                    "active_release_binding_sha256"
-                ],
-                "candidate_env_sha256": authorization["candidate_env_sha256"],
-                "release_bom_sha256": authorization["release_bom_sha256"],
-                "release_approval_id": authorization["release_approval_id"],
-                "approval_evidence_sha256": authorization[
-                    "approval_evidence_sha256"
-                ],
-            },
-        }
 
     def write(
         self,
@@ -2849,7 +2457,6 @@ class HealthReporter:
         )
         store_health = self.store.health()
         workspace_runtime = self.workspace_runtime_status()
-        capacity_admission = self.capacity_admission_status()
         healthy = (
             state
             not in {
@@ -2865,16 +2472,11 @@ class HealthReporter:
                 workspace_runtime["required"] is not True
                 or workspace_runtime["ready"] is True
             )
-            and (
-                capacity_admission["required"] is not True
-                or capacity_admission["ready"] is True
-            )
         )
         ready_for_dispatch = bool(
             self.config.dispatch_enabled
             and healthy
             and workspace_runtime["ready"] is True
-            and capacity_admission["ready"] is True
         )
         observed_at = _utc_iso()
         body = {
@@ -2882,7 +2484,6 @@ class HealthReporter:
             "ok": healthy,
             "healthy": healthy,
             "enabled": self.config.dispatch_enabled,
-            "activation_required": self.config.activation_required,
             "state": state,
             "started_at": self.started_at,
             "heartbeat_at": observed_at,
@@ -2900,7 +2501,6 @@ class HealthReporter:
             },
             "runtime_identity": self.runtime_identity.to_dict(),
             "workspace_runtime": workspace_runtime,
-            "capacity_admission": capacity_admission,
             "config": self.public_config,
             "stats": asdict(stats),
             "last_outcome": asdict(last_outcome) if last_outcome else None,
@@ -2923,9 +2523,7 @@ class HealthReporter:
             observed_at = _utc_iso()
             body = dict(self._last_body)
             workspace_runtime = self.workspace_runtime_status()
-            capacity_admission = self.capacity_admission_status()
             body["workspace_runtime"] = workspace_runtime
-            body["capacity_admission"] = capacity_admission
             if (
                 workspace_runtime["required"] is True
                 and workspace_runtime["ready"] is not True
@@ -2935,19 +2533,6 @@ class HealthReporter:
                 body["readiness_observed_at"] = observed_at
                 body["readiness"] = {
                     "state": "workspace_runtime_unavailable",
-                    "healthy": False,
-                    "ready_for_dispatch": False,
-                    "observed_at": observed_at,
-                }
-            elif (
-                capacity_admission["required"] is True
-                and capacity_admission["ready"] is not True
-            ):
-                body["ok"] = False
-                body["healthy"] = False
-                body["readiness_observed_at"] = observed_at
-                body["readiness"] = {
-                    "state": "capacity_authorization_unavailable",
                     "healthy": False,
                     "ready_for_dispatch": False,
                     "observed_at": observed_at,
@@ -2996,7 +2581,7 @@ def _health_workspace_runtime_ok(payload: Mapping[str, Any]) -> bool:
     status = payload.get("workspace_runtime")
     if not isinstance(status, Mapping):
         return False
-    required = payload.get("enabled") is True or payload.get("activation_required") is True
+    required = payload.get("enabled") is True
     if status.get("required") is not required:
         return False
     if not required:
@@ -3023,149 +2608,6 @@ def _health_workspace_runtime_ok(payload: Mapping[str, Any]) -> bool:
     ) and all(
         re.fullmatch(r"[0-9a-f]{64}", str(file_sha256[path] or "")) is not None
         for path in WORKSPACE_RUNTIME_FILES
-    )
-
-
-def _health_capacity_admission_ok(payload: Mapping[str, Any]) -> bool:
-    status = payload.get("capacity_admission")
-    config = payload.get("config")
-    if not isinstance(status, Mapping) or not isinstance(config, Mapping):
-        return False
-    runtime_status = status.get("runtime")
-    if isinstance(runtime_status, Mapping):
-        configured = runtime_status.get("configured") is True
-        mode = str(runtime_status.get("effective_mode") or "")
-        state = str(runtime_status.get("effective_state") or "")
-        lock = runtime_status.get("lock")
-        if (
-            runtime_status.get("schema_version")
-            != "pnc_rca_capacity_runtime_decision_v1"
-            or mode not in {"bootstrap", "steady"}
-            or status.get("capacity_mode") != mode
-            or status.get("ready") is not True
-            or not isinstance(lock, Mapping)
-            or (configured and lock.get("held") is not True)
-            or lock.get("error_code") not in {"", None}
-            or isinstance(runtime_status.get("generation"), bool)
-            or not isinstance(runtime_status.get("generation"), int)
-        ):
-            return False
-        required = bool(
-            configured
-            and (
-                payload.get("enabled") is True
-                or payload.get("activation_required") is True
-            )
-        )
-        if status.get("required") is not required:
-            return False
-        if not configured:
-            return bool(
-                runtime_status.get("legacy_compatibility") is True
-                and mode == "steady"
-                and state == "STEADY_ACTIVE"
-                and status.get("authorization") is None
-            )
-        ledger = runtime_status.get("ledger")
-        if (
-            not isinstance(ledger, Mapping)
-            or re.fullmatch(r"[0-9a-f]{64}", str(ledger.get("sha256") or ""))
-            is None
-            or isinstance(ledger.get("sample_count"), bool)
-            or not isinstance(ledger.get("sample_count"), int)
-            or runtime_status.get("current_release_id") != config.get("release_id")
-            or runtime_status.get("current_bootstrap_epoch_id")
-            != config.get("bootstrap_epoch_id")
-            or re.fullmatch(
-                r"[0-9a-f]{64}",
-                str(runtime_status.get("active_release_binding_sha256") or ""),
-            )
-            is None
-        ):
-            return False
-        if mode == "steady":
-            artifacts = runtime_status.get("artifacts")
-            return bool(
-                state == "STEADY_ACTIVE"
-                and runtime_status.get("irreversible") is True
-                and runtime_status.get("generation") >= 2
-                and status.get("authorization") is None
-                and isinstance(artifacts, Mapping)
-                and all(
-                    re.fullmatch(r"[0-9a-f]{64}", str(value or ""))
-                    is not None
-                    for value in artifacts.values()
-                )
-                and bool(runtime_status.get("ratchet_origin_release_id"))
-                and bool(runtime_status.get("ratchet_origin_bootstrap_epoch_id"))
-            )
-        authorization = status.get("authorization")
-        return bool(
-            state in {"BOOTSTRAP_PRODUCTION", "STEADY_READY"}
-            and runtime_status.get("generation") == 1
-            and runtime_status.get("irreversible") is False
-            and isinstance(authorization, Mapping)
-            and authorization.get("bootstrap_epoch_id")
-            == config.get("bootstrap_epoch_id")
-            and authorization.get("release_approval_id") == config.get("release_id")
-            and hmac.compare_digest(
-                str(runtime_status.get("active_release_binding_sha256") or ""),
-                str(authorization.get("active_release_binding_sha256") or ""),
-            )
-            and all(
-                re.fullmatch(r"[0-9a-f]{64}", str(authorization.get(field) or ""))
-                is not None
-                for field in (
-                    "receipt_fingerprint",
-                    "authorization_receipt_sha256",
-                    "active_release_binding_sha256",
-                    "candidate_env_sha256",
-                    "release_bom_sha256",
-                    "approval_evidence_sha256",
-                )
-            )
-        )
-    mode = str(config.get("capacity_mode") or "")
-    if mode not in {"steady", "bootstrap"} or status.get("capacity_mode") != mode:
-        return False
-    required = bool(
-        mode == "bootstrap"
-        and (
-            payload.get("enabled") is True
-            or payload.get("activation_required") is True
-        )
-    )
-    if status.get("required") is not required:
-        return False
-    if mode == "steady":
-        return (
-            status.get("ready") is True
-            and status.get("state") == "steady"
-            and status.get("authorization") is None
-        )
-    if not required:
-        return status.get("ready") in {True, False}
-    authorization = status.get("authorization")
-    return bool(
-        status.get("ready") is True
-        and status.get("state") == "ready"
-        and isinstance(authorization, Mapping)
-        and authorization.get("bootstrap_epoch_id")
-        == config.get("bootstrap_epoch_id")
-        and authorization.get("release_approval_id") == config.get("release_id")
-        and all(
-            re.fullmatch(r"[0-9a-f]{64}", str(authorization.get(field) or ""))
-            is not None
-            for field in (
-                "receipt_fingerprint",
-                "authorization_receipt_sha256",
-                "active_release_binding_sha256",
-                "candidate_env_sha256",
-                "release_bom_sha256",
-                "approval_evidence_sha256",
-            )
-        )
-        and bool(str(authorization.get("release_approval_id") or "").strip())
     )
 
 
@@ -3227,7 +2669,6 @@ def read_health_status(
         and isinstance(downstream, Mapping)
         and _health_runtime_identity_ok(payload)
         and _health_workspace_runtime_ok(payload)
-        and _health_capacity_admission_ok(payload)
     )
     result = dict(payload)
     result["ok"] = bool(fresh and producer_ok)
@@ -3344,17 +2785,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--health-max-age-seconds", type=int, default=60)
     parser.add_argument("--once", action="store_true")
     parser.add_argument(
-        "--promote-shadow-event",
-        metavar="EVENT_UID",
-        help="atomically promote one exact accepted shadow event and exit",
-    )
-    parser.add_argument("--operator", help="audited shadow-promotion operator")
-    parser.add_argument("--reason", help="audited shadow-promotion reason")
-    parser.add_argument(
-        "--activation-epoch-id",
-        help="exact current activation epoch required for governed promotion",
-    )
-    parser.add_argument(
         "--clear-circuit",
         action="store_true",
         help="explicitly close the persisted circuit and exit",
@@ -3378,45 +2808,6 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if result.get("ok") is True else 2
 
         store = RcaControlStore(config.control_db_path, require_current=True)
-        capacity_runtime = CapacityRuntimeResolver.from_environment(
-            store=store,
-            control_db_path=config.control_db_path,
-            release_id=(config.release_id if config.activation_required else ""),
-            bootstrap_epoch_id=(
-                config.bootstrap_epoch_id if config.activation_required else ""
-            ),
-            initial_policy=(config.capacity_mode if config.activation_required else "steady"),
-        )
-        if args.promote_shadow_event:
-            expected_epoch_id = str(args.activation_epoch_id or "").strip()
-            activation_slot_kind = ""
-            if config.activation_required:
-                if not expected_epoch_id:
-                    raise ValueError(
-                        "--activation-epoch-id is required when activation is required"
-                    )
-                epoch = store.activation_epoch()
-                if epoch is None or str(epoch["epoch_id"]) != expected_epoch_id:
-                    raise ValueError("--activation-epoch-id is not current")
-                if str(epoch["state"]) == "bounded_active":
-                    activation_slot_kind = "kafka_success"
-            promotion = store.promote_shadow_event(
-                args.promote_shadow_event,
-                operator=args.operator or "",
-                reason=args.reason or "",
-                expected_activation_epoch_id=expected_epoch_id,
-                activation_required=config.activation_required,
-                activation_slot_kind=activation_slot_kind,
-            )
-            print(
-                json.dumps(
-                    {"ok": True, "promotion": asdict(promotion)},
-                    ensure_ascii=False,
-                    indent=2,
-                    sort_keys=True,
-                )
-            )
-            return 0
         if args.clear_circuit:
             circuit = store.close_dispatcher_circuit()
             print(json.dumps({"ok": True, "circuit": asdict(circuit)}, indent=2))
@@ -3424,7 +2815,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.dry_run:
             rows = store.preview_dispatchable(
                 limit=config.batch_size,
-                activation_required=config.activation_required,
+                activation_required=False,
             )
             print(
                 json.dumps(
@@ -3432,7 +2823,6 @@ def main(argv: list[str] | None = None) -> int:
                         "ok": True,
                         "dry_run": True,
                         "dispatch_enabled": config.dispatch_enabled,
-                        "activation_required": config.activation_required,
                         "circuit": asdict(store.dispatcher_circuit()),
                         "due_count_in_sample": len(rows),
                         "rows": rows,
@@ -3451,18 +2841,12 @@ def main(argv: list[str] | None = None) -> int:
             storage_admission=default_storage_admission,
             derived_capacity_reservation=reserve_derived_capacity,
             derived_capacity_abort_precreate=abort_precreate_derived_capacity,
-            submit=lambda admission, execution_request: default_submit(
-                admission,
-                execution_request,
-                config=config,
-                capacity_runtime=capacity_runtime,
-            ),
+            submit=default_submit,
         )
         health = HealthReporter(
             config,
             store,
             delivery_backpressure_status=dispatcher.delivery_backpressure_health,
-            capacity_runtime=capacity_runtime,
         )
         dispatcher.runtime_identity = health.runtime_identity.to_dict()
         dispatcher.workspace_runtime_guard = health.dispatch_guard_outcome
