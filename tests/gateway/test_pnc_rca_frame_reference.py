@@ -22,6 +22,10 @@ def test_parse_frame_reference_keeps_positive_numeric_frame_id():
         ("2026-07-12 15:31:16", 1_783_841_476_000_000),
         ("2026-06-10 10:56:39.853000", 1_781_060_199_853_000),
         ("20260708, 20:05:00", 1_783_512_300_000_000),
+        ("20260503：09：37：34", 1_777_772_254_000_000),
+        ("20260502-08：38：00", 1_777_682_280_000_000),
+        ("2026-06-19 4:08:59.884 PM CST", 1_781_856_539_884_000),
+        ("1782290198.714", 1_782_290_198_714_000),
     ],
 )
 def test_parse_frame_reference_converts_exact_local_time_to_management_timestamp(
@@ -39,7 +43,14 @@ def test_parse_frame_reference_converts_exact_local_time_to_management_timestamp
 
 @pytest.mark.parametrize(
     "value",
-    ["0", "-1", "2026/07/12 15:31:16", "20260708 20:05:00", "20260230, 20:05:00"],
+    [
+        "0",
+        "-1",
+        "2026/07/12 15:31:16",
+        "20260230, 20:05:00",
+        "14:32:22",
+        "142624、142656",
+    ],
 )
 def test_parse_frame_reference_rejects_ambiguous_or_invalid_values(value):
     with pytest.raises(FrameReferenceError):

@@ -23,11 +23,15 @@ DEFAULT_FRONT_CAMERA_TOPIC_PRIORITY = (
     "avm_front",
 )
 _DATE_TIME_RE = re.compile(
-    r"^(?P<year>\d{4})(?:-(?P<month_dash>\d{2})-(?P<day_dash>\d{2})|"
-    r"(?P<month_compact>\d{2})(?P<day_compact>\d{2})\s*,)\s*"
-    r"(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})"
-    r"(?P<fraction>\.\d{1,6})?$"
+    r"^(?P<year>\d{4})(?:-(?P<month_dash>\d{1,2})-(?P<day_dash>\d{1,2})|"
+    r"(?P<month_compact>\d{2})(?P<day_compact>\d{2}))"
+    r"(?:\s*[,，：:-]\s*|\s+)"
+    r"(?P<hour>\d{1,2})[:：](?P<minute>\d{2})[:：](?P<second>\d{2})"
+    r"(?P<fraction>\.\d{1,6})?"
+    r"(?:\s*(?P<ampm>AM|PM)(?:\s*CST)?)?$",
+    re.IGNORECASE,
 )
+_EPOCH_SECONDS_RE = re.compile(r"^(?P<seconds>\d{10})\.(?P<fraction>\d{1,6})$")
 _MIN_TIMESTAMP_US = 946_684_800_000_000  # 2000-01-01T00:00:00Z
 _MAX_TIMESTAMP_US = 4_102_444_800_000_000  # 2100-01-01T00:00:00Z
 
@@ -56,17 +60,36 @@ def parse_frame_reference(value: Any) -> dict[str, Any]:
             "source_field": FRAME_FIELD_NAME,
         }
 
+    epoch_match = _EPOCH_SECONDS_RE.fullmatch(text)
+    if epoch_match is not None:
+        timestamp_us = (
+            int(epoch_match.group("seconds")) * 1_000_000
+            + int(epoch_match.group("fraction").ljust(6, "0"))
+        )
+        if not _MIN_TIMESTAMP_US <= timestamp_us < _MAX_TIMESTAMP_US:
+            raise FrameReferenceError("frame_reference_datetime_invalid")
+        marker_time = datetime.fromtimestamp(
+            timestamp_us / 1_000_000, timezone.utc
+        ).astimezone(FRAME_TIMEZONE)
+        return _frame_lookup(marker_time, timestamp_us)
+
     match = _DATE_TIME_RE.fullmatch(text)
     if match is None:
         raise FrameReferenceError("frame_reference_format_invalid")
     parts = match.groupdict()
     fraction = parts.get("fraction") or ""
+    hour = int(parts["hour"])
+    ampm = str(parts.get("ampm") or "").upper()
+    if ampm:
+        if not 1 <= hour <= 12:
+            raise FrameReferenceError("frame_reference_datetime_invalid")
+        hour = hour % 12 + (12 if ampm == "PM" else 0)
     try:
         marker_time = datetime(
             int(parts["year"]),
             int(parts["month_dash"] or parts["month_compact"]),
             int(parts["day_dash"] or parts["day_compact"]),
-            int(parts["hour"]),
+            hour,
             int(parts["minute"]),
             int(parts["second"]),
             int(fraction[1:].ljust(6, "0")) if fraction else 0,
@@ -80,6 +103,10 @@ def parse_frame_reference(value: Any) -> dict[str, Any]:
         (epoch_delta.days * 86_400 + epoch_delta.seconds) * 1_000_000
         + epoch_delta.microseconds
     )
+    return _frame_lookup(marker_time, management_timestamp_us)
+
+
+def _frame_lookup(marker_time: datetime, management_timestamp_us: int) -> dict[str, Any]:
     return {
         "kind": "front_camera_timestamp",
         "source_field": FRAME_FIELD_NAME,
