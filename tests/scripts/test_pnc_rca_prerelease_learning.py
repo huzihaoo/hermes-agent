@@ -373,3 +373,39 @@ def test_capture_corpus_resumes_frozen_index_without_live_requery(
         learning.capture_corpus(output_dir, workers=1)
     assert caught.value.code == "corpus_capture_incomplete"
     assert queries == 1
+
+
+def test_blind_result_batch_is_idempotent_and_rejects_conflict(tmp_path: Path) -> None:
+    corpus_dir = tmp_path / "corpus"
+    learning.write_corpus(
+        corpus_dir,
+        [{"work_item_id": "7000000001"}, {"work_item_id": "7000000002"}],
+        [{"work_item_id": "7000000001"}, {"work_item_id": "7000000002"}],
+    )
+    batch = {
+        "schema_version": learning.BLIND_RESULT_BATCH_SCHEMA_VERSION,
+        "evaluator_version": "git-a8402aa35",
+        "results": [
+            {"work_item_id": "7000000001", "result": {"status": "completed"}},
+            {"work_item_id": "7000000002", "result": {"status": "not_evaluable"}},
+        ],
+    }
+
+    first = learning.append_blind_results_batch(corpus_dir, batch=batch)
+    second = learning.append_blind_results_batch(corpus_dir, batch=batch)
+
+    assert first == {
+        "schema_version": learning.BLIND_RESULT_BATCH_SCHEMA_VERSION,
+        "evaluator_version": "git-a8402aa35",
+        "input_count": 2,
+        "appended": 2,
+        "reused": 0,
+    }
+    assert second["appended"] == 0
+    assert second["reused"] == 2
+
+    conflicting = json.loads(json.dumps(batch))
+    conflicting["results"][0]["result"]["status"] = "blocked"
+    with pytest.raises(learning.CorpusError) as caught:
+        learning.append_blind_results_batch(corpus_dir, batch=conflicting)
+    assert caught.value.code == "blind_result_conflict"

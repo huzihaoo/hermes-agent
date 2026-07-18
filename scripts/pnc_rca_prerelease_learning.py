@@ -38,6 +38,7 @@ from gateway.pnc_rca_data_access import (
 
 SCHEMA_VERSION = "g1q3_rca_prerelease_learning_v1"
 LEDGER_SCHEMA_VERSION = "g1q3_rca_prerelease_ledger_v1"
+BLIND_RESULT_BATCH_SCHEMA_VERSION = "g1q3_rca_blind_result_batch_v1"
 PROJECT_KEY = "t03o4q"
 WORK_ITEM_TYPE = "【08】问题管理"
 PAGE_SIZE = 50
@@ -809,6 +810,85 @@ def append_blind_result(
     return record
 
 
+def append_blind_results_batch(
+    corpus_dir: Path,
+    *,
+    batch: Mapping[str, Any],
+) -> dict[str, Any]:
+    version = str(batch.get("evaluator_version") or "").strip()
+    rows = batch.get("results")
+    if (
+        batch.get("schema_version") != BLIND_RESULT_BATCH_SCHEMA_VERSION
+        or not version
+        or not isinstance(rows, list)
+    ):
+        raise CorpusError("blind_result_batch_invalid")
+    blind = json.loads((corpus_dir / "blind-cases.json").read_text(encoding="utf-8"))
+    known = {str(item.get("work_item_id")) for item in blind.get("cases") or []}
+    ledger_path = corpus_dir / "learning-ledger.jsonl"
+    records = _ledger_records(ledger_path)
+    existing = {
+        str(item.get("work_item_id")): item
+        for item in records
+        if item.get("record_type") == "blind_result"
+    }
+    observed: set[str] = set()
+    normalized: list[tuple[str, dict[str, Any], str]] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise CorpusError("blind_result_batch_invalid")
+        work_item_id = str(row.get("work_item_id") or "")
+        result = row.get("result")
+        if (
+            work_item_id in observed
+            or work_item_id not in known
+            or not isinstance(result, Mapping)
+        ):
+            raise CorpusError("blind_result_batch_invalid", work_item_id)
+        observed.add(work_item_id)
+        result_sha256 = sha256_json(result)
+        normalized.append((work_item_id, dict(result), result_sha256))
+
+    for work_item_id, _result, result_sha256 in normalized:
+        prior = existing.get(work_item_id)
+        if prior is not None:
+            if (
+                prior.get("evaluator_version") != version
+                or prior.get("result_sha256") != result_sha256
+            ):
+                raise CorpusError("blind_result_conflict", work_item_id)
+
+    appended = 0
+    reused = 0
+    for work_item_id, result, result_sha256 in normalized:
+        prior = existing.get(work_item_id)
+        if prior is not None:
+            reused += 1
+            continue
+        record = {
+            "schema_version": LEDGER_SCHEMA_VERSION,
+            "record_type": "blind_result",
+            "recorded_at": _utc_now(),
+            "work_item_id": work_item_id,
+            "evaluator_version": version,
+            "result": result,
+            "result_sha256": result_sha256,
+            "previous_record_sha256": records[-1]["record_sha256"],
+        }
+        record["record_sha256"] = sha256_json(record)
+        _append_jsonl(ledger_path, record)
+        records.append(record)
+        existing[work_item_id] = record
+        appended += 1
+    return {
+        "schema_version": BLIND_RESULT_BATCH_SCHEMA_VERSION,
+        "evaluator_version": version,
+        "input_count": len(rows),
+        "appended": appended,
+        "reused": reused,
+    }
+
+
 def reveal_owner_truth(corpus_dir: Path, *, work_item_id: str) -> dict[str, Any]:
     ledger_path = corpus_dir / "learning-ledger.jsonl"
     records = _ledger_records(ledger_path)
@@ -1030,6 +1110,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     record_parser.add_argument("--result", required=True, type=Path)
     record_parser.add_argument("--evaluator-version", required=True)
 
+    batch_parser = subparsers.add_parser("record-blind-batch")
+    batch_parser.add_argument("--corpus-dir", required=True, type=Path)
+    batch_parser.add_argument("--batch", required=True, type=Path)
+
     reveal_parser = subparsers.add_parser("reveal-truth")
     reveal_parser.add_argument("--corpus-dir", required=True, type=Path)
     reveal_parser.add_argument("--work-item-id", required=True)
@@ -1052,6 +1136,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 work_item_id=args.work_item_id,
                 result=_load_object(args.result),
                 evaluator_version=args.evaluator_version,
+            )
+        elif args.command == "record-blind-batch":
+            result = append_blind_results_batch(
+                args.corpus_dir,
+                batch=_load_object(args.batch),
             )
         elif args.command == "reveal-truth":
             result = reveal_owner_truth(
