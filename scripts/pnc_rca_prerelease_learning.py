@@ -34,11 +34,13 @@ from gateway.pnc_rca_data_access import (
     RemoteDataAccessError,
     build_remote_data_access,
 )
+from gateway.pnc_rca_frame_reference import FrameReferenceError, parse_frame_reference
 
 
 SCHEMA_VERSION = "g1q3_rca_prerelease_learning_v1"
 LEDGER_SCHEMA_VERSION = "g1q3_rca_prerelease_ledger_v1"
 BLIND_RESULT_BATCH_SCHEMA_VERSION = "g1q3_rca_blind_result_batch_v1"
+BLIND_REQUEST_BATCH_SCHEMA_VERSION = "g1q3_rca_blind_request_batch_v1"
 PROJECT_KEY = "t03o4q"
 WORK_ITEM_TYPE = "【08】问题管理"
 PAGE_SIZE = 50
@@ -889,6 +891,67 @@ def append_blind_results_batch(
     }
 
 
+def prepare_blind_request_batch(corpus_dir: Path, output_path: Path) -> dict[str, Any]:
+    blind = json.loads((corpus_dir / "blind-cases.json").read_text(encoding="utf-8"))
+    rows = blind.get("cases")
+    if (
+        blind.get("schema_version") != SCHEMA_VERSION
+        or blind.get("kind") != "blind_inputs"
+        or not isinstance(rows, list)
+    ):
+        raise CorpusError("blind_corpus_invalid")
+    requests = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise CorpusError("blind_corpus_invalid")
+        work_item_id = str(row.get("work_item_id") or "")
+        if not _SAFE_ID_RE.fullmatch(work_item_id):
+            raise CorpusError("work_item_id_invalid")
+        frame_id = ""
+        frame_lookup: dict[str, Any] = {}
+        frame_reference_error = ""
+        try:
+            normalized_frame = parse_frame_reference(row.get("frame_reference"))
+        except FrameReferenceError as exc:
+            frame_reference_error = exc.code
+        else:
+            if normalized_frame.get("kind") == "frame_id":
+                frame_id = str(normalized_frame["frame_id"])
+            elif normalized_frame:
+                frame_lookup = normalized_frame
+        requests.append({
+            "work_item_id": work_item_id,
+            "title": str(row.get("title") or ""),
+            "description": str(row.get("description") or ""),
+            "function_category": str(row.get("function_category") or ""),
+            "frame_id": frame_id,
+            "frame_lookup": frame_lookup,
+            "frame_reference_error": frame_reference_error,
+            "remote_data_access_status": str(
+                row.get("remote_data_access_status") or "missing"
+            ),
+            "remote_data_access": row.get("remote_data_access"),
+            "status_at_capture": row.get("status_at_capture"),
+            "updated_at": str(row.get("updated_at") or ""),
+        })
+    payload = {
+        "schema_version": BLIND_REQUEST_BATCH_SCHEMA_VERSION,
+        "kind": "blind_requests",
+        "generated_at": _utc_now(),
+        "source_blind_cases_sha256": sha256_json(blind),
+        "case_count": len(requests),
+        "owner_truth_included": False,
+        "requests": requests,
+    }
+    _atomic_json(output_path, payload)
+    return {
+        "schema_version": BLIND_REQUEST_BATCH_SCHEMA_VERSION,
+        "case_count": len(requests),
+        "output_path": str(output_path),
+        "output_sha256": sha256_json(payload),
+    }
+
+
 def reveal_owner_truth(corpus_dir: Path, *, work_item_id: str) -> dict[str, Any]:
     ledger_path = corpus_dir / "learning-ledger.jsonl"
     records = _ledger_records(ledger_path)
@@ -1114,6 +1177,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     batch_parser.add_argument("--corpus-dir", required=True, type=Path)
     batch_parser.add_argument("--batch", required=True, type=Path)
 
+    prepare_parser = subparsers.add_parser("prepare-blind-batch")
+    prepare_parser.add_argument("--corpus-dir", required=True, type=Path)
+    prepare_parser.add_argument("--output", required=True, type=Path)
+
     reveal_parser = subparsers.add_parser("reveal-truth")
     reveal_parser.add_argument("--corpus-dir", required=True, type=Path)
     reveal_parser.add_argument("--work-item-id", required=True)
@@ -1142,6 +1209,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.corpus_dir,
                 batch=_load_object(args.batch),
             )
+        elif args.command == "prepare-blind-batch":
+            result = prepare_blind_request_batch(args.corpus_dir, args.output)
         elif args.command == "reveal-truth":
             result = reveal_owner_truth(
                 args.corpus_dir, work_item_id=args.work_item_id

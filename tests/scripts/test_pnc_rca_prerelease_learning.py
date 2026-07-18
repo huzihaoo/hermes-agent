@@ -409,3 +409,66 @@ def test_blind_result_batch_is_idempotent_and_rejects_conflict(tmp_path: Path) -
     with pytest.raises(learning.CorpusError) as caught:
         learning.append_blind_results_batch(corpus_dir, batch=conflicting)
     assert caught.value.code == "blind_result_conflict"
+
+
+def test_prepare_blind_request_batch_uses_production_frame_parser(
+    tmp_path: Path,
+) -> None:
+    corpus_dir = tmp_path / "corpus"
+    learning.write_corpus(
+        corpus_dir,
+        [
+            {
+                "work_item_id": "7000000001",
+                "title": "FCW",
+                "frame_reference": "123",
+                "remote_data_access_status": "valid",
+                "remote_data_access": {"mode": "remote_read"},
+            },
+            {
+                "work_item_id": "7000000002",
+                "title": "LCC",
+                "frame_reference": "20260708, 20:05:00",
+                "remote_data_access_status": "valid",
+                "remote_data_access": {"mode": "remote_read"},
+            },
+            {
+                "work_item_id": "7000000003",
+                "title": "ACC",
+                "frame_reference": "bad frame",
+                "remote_data_access_status": "remote_data_reference_invalid",
+                "remote_data_access": None,
+            },
+        ],
+        [
+            {"work_item_id": "7000000001", "owner_truth": "secret-1"},
+            {"work_item_id": "7000000002", "owner_truth": "secret-2"},
+            {"work_item_id": "7000000003", "owner_truth": "secret-3"},
+        ],
+    )
+    output_path = tmp_path / "blind-request-batch.json"
+
+    result = learning.prepare_blind_request_batch(corpus_dir, output_path)
+    payload = json.loads(output_path.read_text())
+
+    assert result["case_count"] == 3
+    assert payload["owner_truth_included"] is False
+    assert "secret" not in output_path.read_text()
+    assert payload["requests"][0]["frame_id"] == "123"
+    assert payload["requests"][1]["frame_lookup"] == {
+        "kind": "front_camera_timestamp",
+        "source_field": "问题发生frame_id",
+        "marker_time": "2026-07-08T20:05:00+08:00",
+        "timezone": "Asia/Shanghai",
+        "management_timestamp": 1783512300000000,
+        "management_timestamp_unit": "microseconds_since_unix_epoch",
+        "camera_scope": "front_view",
+        "selection": "nearest_timestamp",
+        "max_delta_us": 1000000,
+        "topic_priority": [
+            "front_120", "camera1", "front_190", "camera4", "front_30", "avm_front"
+        ],
+    }
+    assert payload["requests"][2]["frame_reference_error"] == (
+        "frame_reference_format_invalid"
+    )
