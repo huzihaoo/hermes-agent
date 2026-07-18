@@ -106,6 +106,17 @@ def test_fix_status_alone_is_not_owner_root_cause() -> None:
     assert truth["root_cause_field_secondary"] == "规划目标选择错误"
 
 
+def test_domain_triage_request_alone_is_not_owner_root_cause() -> None:
+    truth = learning.align_owner_truth(
+        [_comment("2026-07-02 20:58:25", "@规划 看一下 OOI", "c1")],
+        [_transition("2026-07-02T12:59:36Z", "o93u2k3ri")],
+        root_cause_text="OOI目标选择错误",
+    )
+
+    assert truth["selection_reason"] == "root_cause_field_only"
+    assert truth["selected_comment"] is None
+
+
 def test_query_status_scopes_the_project_by_pdcl_not_title(monkeypatch) -> None:
     observed = {}
     client = learning.MeegleReadClient()
@@ -471,4 +482,39 @@ def test_prepare_blind_request_batch_uses_production_frame_parser(
     }
     assert payload["requests"][2]["frame_reference_error"] == (
         "frame_reference_format_invalid"
+    )
+
+
+def test_refine_owner_truth_corpus_removes_weak_domain_only_comment(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "refined"
+    weak = _comment("2026-07-02 20:58:25", "@规划 看一下 OOI", "c1")
+    weak["causal_score"] = 4
+    learning.write_corpus(
+        source,
+        [{"work_item_id": "7000000001"}],
+        [{
+            "work_item_id": "7000000001",
+            "owner_truth": {
+                "status": "resolved",
+                "selection_reason": "last_causal_comment_before_validation_transition",
+                "validation_transition": _transition(
+                    "2026-07-02T12:59:36Z", "o93u2k3ri"
+                ),
+                "selected_comment": weak,
+                "causal_comment_timeline": [weak],
+                "root_cause_field_secondary": "OOI目标选择错误",
+            },
+        }],
+    )
+
+    result = learning.refine_owner_truth_corpus(source, output)
+    refined = json.loads((output / "owner-truth.json").read_text())
+
+    assert result["case_count"] == 1
+    assert refined["cases"][0]["owner_truth"]["selected_comment"] is None
+    assert refined["cases"][0]["owner_truth"]["selection_reason"] == (
+        "root_cause_field_only"
     )

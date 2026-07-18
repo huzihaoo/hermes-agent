@@ -65,12 +65,15 @@ DETAIL_FIELD_KEYS = (
     "field_842fc8",  # 问题根本原因分析 (truth only)
 )
 
-_CAUSAL_TERMS = (
+_CAUSAL_ANCHOR_TERMS = (
     "原因分析", "根因", "原因为", "问题在", "问题是", "导致", "异常",
     "误检", "漏检", "跳变", "抖动", "收敛", "初始化", "选错", "误选",
-    "晚选", "未选中", "触发", "控制", "感知", "规划", "spp", "ooi",
-    "cipv", "ttc", "vx", "vy", "置信度", "车道线",
+    "晚选", "未选中", "误触发", "漏触发", "不触发",
     "符合预期", "正触发", "works as designed",
+)
+_CAUSAL_DOMAIN_TERMS = (
+    "控制", "感知", "规划", "spp", "ooi", "cipv", "ttc", "vx", "vy",
+    "置信度", "车道线",
 )
 _CORRECTION_TERMS = (
     "更正", "修正", "实际原因", "最终原因", "确认原因", "根因确认", "经确认",
@@ -340,15 +343,26 @@ def causal_comment_score(text: str) -> int:
     if not normalized or any(marker in normalized for marker in _AUTOMATION_MARKERS):
         return -100
     lowered = normalized.lower()
-    score = sum(2 for term in _CAUSAL_TERMS if term.lower() in lowered)
-    if re.search(r"(?:frame|帧)\s*(?:约|[:：=])?\s*\d+", lowered):
-        score += 2
-    if re.search(r"-?\d+(?:\.\d+)?\s*(?:m/s|mps|km/h|kph|s|秒|帧|%)", lowered):
+    score = sum(
+        2 for term in _CAUSAL_ANCHOR_TERMS if term.lower() in lowered
+    )
+    metric_anchor = re.search(
+        r"-?\d+(?:\.\d+)?\s*(?:m/s|mps|km/h|kph|s|秒|帧|%)", lowered
+    ) is not None
+    if metric_anchor:
         score += 2
     if "原因" in normalized:
         score += 3
     if _is_explicit_correction(normalized):
         score += 3
+    if score < 2:
+        return 0
+    score += min(
+        2,
+        sum(1 for term in _CAUSAL_DOMAIN_TERMS if term.lower() in lowered),
+    )
+    if re.search(r"(?:frame|帧)\s*(?:约|[:：=])?\s*\d+", lowered):
+        score += 1
     return score
 
 
@@ -952,6 +966,50 @@ def prepare_blind_request_batch(corpus_dir: Path, output_path: Path) -> dict[str
     }
 
 
+def refine_owner_truth_corpus(source_dir: Path, output_dir: Path) -> dict[str, Any]:
+    blind = json.loads((source_dir / "blind-cases.json").read_text(encoding="utf-8"))
+    truth = json.loads((source_dir / "owner-truth.json").read_text(encoding="utf-8"))
+    blind_rows = blind.get("cases")
+    truth_rows = truth.get("cases")
+    if (
+        blind.get("schema_version") != SCHEMA_VERSION
+        or truth.get("schema_version") != SCHEMA_VERSION
+        or not isinstance(blind_rows, list)
+        or not isinstance(truth_rows, list)
+    ):
+        raise CorpusError("source_corpus_invalid")
+    refined = []
+    for row in truth_rows:
+        if not isinstance(row, Mapping):
+            raise CorpusError("source_corpus_invalid")
+        owner = row.get("owner_truth")
+        if not isinstance(owner, Mapping):
+            raise CorpusError("source_corpus_invalid")
+        transition = owner.get("validation_transition")
+        transitions = [transition] if isinstance(transition, Mapping) else []
+        timeline = owner.get("causal_comment_timeline")
+        comments = timeline if isinstance(timeline, list) else []
+        refined_owner = align_owner_truth(
+            comments,
+            transitions,
+            root_cause_text=str(owner.get("root_cause_field_secondary") or ""),
+        )
+        refined.append({
+            "work_item_id": str(row.get("work_item_id") or ""),
+            "owner_truth": refined_owner,
+        })
+    manifest = write_corpus(output_dir, blind_rows, refined)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "case_count": manifest["case_count"],
+        "source_manifest_sha256": sha256_json(
+            json.loads((source_dir / "manifest.json").read_text(encoding="utf-8"))
+        ),
+        "refined_manifest_sha256": sha256_json(manifest),
+        "output_dir": str(output_dir),
+    }
+
+
 def reveal_owner_truth(corpus_dir: Path, *, work_item_id: str) -> dict[str, Any]:
     ledger_path = corpus_dir / "learning-ledger.jsonl"
     records = _ledger_records(ledger_path)
@@ -1181,6 +1239,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     prepare_parser.add_argument("--corpus-dir", required=True, type=Path)
     prepare_parser.add_argument("--output", required=True, type=Path)
 
+    refine_parser = subparsers.add_parser("refine-owner-truth")
+    refine_parser.add_argument("--source-dir", required=True, type=Path)
+    refine_parser.add_argument("--output-dir", required=True, type=Path)
+
     reveal_parser = subparsers.add_parser("reveal-truth")
     reveal_parser.add_argument("--corpus-dir", required=True, type=Path)
     reveal_parser.add_argument("--work-item-id", required=True)
@@ -1211,6 +1273,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif args.command == "prepare-blind-batch":
             result = prepare_blind_request_batch(args.corpus_dir, args.output)
+        elif args.command == "refine-owner-truth":
+            result = refine_owner_truth_corpus(args.source_dir, args.output_dir)
         elif args.command == "reveal-truth":
             result = reveal_owner_truth(
                 args.corpus_dir, work_item_id=args.work_item_id
