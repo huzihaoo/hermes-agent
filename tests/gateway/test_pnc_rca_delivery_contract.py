@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 
 import pytest
 
@@ -17,6 +18,7 @@ from gateway.pnc_rca_delivery_contract import (
     MAX_FEISHU_COMMENT_BYTES,
     verify_delivery_bundle,
 )
+from scripts.pnc_foxglove_delivery import canonical_viz_mcap_path, foxglove_url
 
 
 FORMAL_SUBMISSION_KEY = "g1q3-rca-s1-" + "a" * 64
@@ -47,7 +49,7 @@ def _sha(data: bytes) -> str:
 def _bundle(
     *,
     admission=None,
-    explicit_kind: str | None = "html",
+    explicit_kind: str | None = "foxglove_viz",
     include_web_assets: bool = False,
 ):
     admission = admission or _admission()
@@ -148,12 +150,41 @@ def _bundle(
         admission.submission_key, manifest["artifact_set_id"]
     )
     report = {
-        "status": "html_delivery_ready",
+        "status": "report_ready",
         "is_deliverable": True,
         "requires_human_review": True,
     }
     if explicit_kind is not None:
         report["deliverable_kind"] = explicit_kind
+    viz_path = canonical_viz_mcap_path(admission.submission_key)
+    viz_bytes = b"verified-viz-mcap"
+    viz_manifest_base = {
+        "schema_version": "g1q3_rca_viz_publication_v1",
+        "status": "published",
+        "submission_key": admission.submission_key,
+        "path": viz_path,
+        "size": len(viz_bytes),
+        "sha256": _sha(viz_bytes),
+        "source_path": root + "cases/7041712812_acc/7041712812_acc.viz.mcap",
+        "source_sha256": _sha(viz_bytes),
+        "published_at": "2026-07-10T08:00:01+00:00",
+    }
+    viz_manifest_bytes = (
+        json.dumps(
+            viz_manifest_base,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+    viz_manifest_path = viz_path.removesuffix(".viz.mcap") + ".viz.manifest.json"
+    viz_publication = {
+        **viz_manifest_base,
+        "manifest_path": viz_manifest_path,
+        "manifest_size": len(viz_manifest_bytes),
+        "manifest_sha256": _sha(viz_manifest_bytes),
+    }
     contract = {
         "schema_version": "g1q3_delivery_contract_v1",
         "task_id": admission.submission_key,
@@ -167,6 +198,8 @@ def _bundle(
             "artifact_set_id": manifest["artifact_set_id"],
             "index_html_vm": root + "index.html",
             "report_data_vm": root + "report_data.json",
+            "viz_mcap_vm": viz_path,
+            "viz_publication": viz_publication,
         },
     }
     observed = [
@@ -180,6 +213,27 @@ def _bundle(
         }
         for path, data in contents.items()
     ]
+    observed.extend(
+        [
+            {
+                "path": viz_path,
+                "size": len(viz_bytes),
+                "sha256": _sha(viz_bytes),
+                "is_file": True,
+                "is_symlink": False,
+                "parents_symlink_free": True,
+                "sha256_attested_by_manifest": True,
+            },
+            {
+                "path": viz_manifest_path,
+                "size": len(viz_manifest_bytes),
+                "sha256": _sha(viz_manifest_bytes),
+                "is_file": True,
+                "is_symlink": False,
+                "parents_symlink_free": True,
+            },
+        ]
+    )
     dependencies = [root + "assets/media/video.mp4"]
     if include_web_assets:
         dependencies.extend([root + "assets/app.css", root + "assets/app.js"])
@@ -205,7 +259,7 @@ def _verify(bundle):
     )
 
 
-def test_valid_sealed_html_bundle_builds_one_issue_comment_effect():
+def test_valid_sealed_evidence_and_published_viz_build_issue_effect():
     delivery = _verify(_bundle())
 
     assert delivery.submission_key == _admission().submission_key
@@ -221,17 +275,64 @@ def test_valid_sealed_html_bundle_builds_one_issue_comment_effect():
         },
         {
             "field_key": "field_8c912e",
-            "field_value": delivery.report_url,
+            "field_value": delivery.foxglove_url,
         },
     ]
     assert delivery.target_key == "feishu_project:t03o4q:issue:7041712812"
     assert delivery.report_url == build_report_url(
         delivery.submission_key, delivery.artifact_set_id
     )
+    assert delivery.viz_mcap_vm == canonical_viz_mcap_path(delivery.submission_key)
+    assert delivery.foxglove_url == foxglove_url(delivery.viz_mcap_vm)
     assert delivery.issue_url == (
         "https://project.feishu.cn/g1q3/issue/detail/7041712812"
     )
     assert "/t03o4q/issue/detail/" not in delivery.issue_url
+
+
+def test_html_bundle_without_published_viz_is_not_deliverable():
+    admission, contract, manifest, observed, dependencies = _bundle()
+    publication = contract["artifacts"].pop("viz_publication")
+    contract["artifacts"].pop("viz_mcap_vm")
+    observed = [
+        item
+        for item in observed
+        if item["path"] not in {publication["path"], publication["manifest_path"]}
+    ]
+
+    with pytest.raises(DeliveryContractError) as exc:
+        _verify((admission, contract, manifest, observed, dependencies))
+
+    assert exc.value.code == "viz_publication_missing"
+
+
+def test_case_local_viz_cannot_replace_formal_published_viz():
+    admission, contract, manifest, observed, dependencies = _bundle()
+    publication = contract["artifacts"]["viz_publication"]
+    case_local = (
+        f"/mnt/tmp/{admission.submission_key}/cases/7041712812_acc/"
+        "7041712812_acc.viz.mcap"
+    )
+    contract["artifacts"]["viz_mcap_vm"] = case_local
+    publication["path"] = case_local
+
+    with pytest.raises(DeliveryContractError) as exc:
+        _verify((admission, contract, manifest, observed, dependencies))
+
+    assert exc.value.code == "viz_publication_path_invalid"
+
+
+def test_viz_observation_requires_publication_manifest_attestation():
+    admission, contract, manifest, observed, dependencies = _bundle()
+    viz_path = contract["artifacts"]["viz_mcap_vm"]
+    next(item for item in observed if item["path"] == viz_path).pop(
+        "sha256_attested_by_manifest"
+    )
+
+    with pytest.raises(DeliveryContractError) as exc:
+        _verify((admission, contract, manifest, observed, dependencies))
+
+    assert exc.value.code == "viz_publication_observation_mismatch"
 
 
 def test_delivery_rejects_empty_result_field_conclusion():
@@ -276,7 +377,8 @@ def test_thread_reply_effect_is_bound_to_exact_topic_and_is_deterministic():
     assert payload["thread_id"] == "topic:om_root123"
     assert payload["idempotency_uuid"]
     assert payload["marker"] in payload["message_content"]
-    assert delivery.report_url in payload["message_content"]
+    assert delivery.foxglove_url in payload["message_content"]
+    assert delivery.report_url not in payload["message_content"]
     assert delivery.issue_url in payload["message_content"]
 
 
@@ -399,7 +501,7 @@ def test_manifest_enforces_artifact_count_file_and_bundle_limits():
     assert exc.value.code == "delivery_manifest_artifacts_invalid"
 
 
-def test_large_conclusion_is_utf8_bounded_while_report_link_is_preserved():
+def test_large_conclusion_is_utf8_bounded_while_foxglove_link_is_preserved():
     admission, contract, manifest, observed, dependencies = _bundle()
     contract["summary"]["short_conclusion"] = "候选结论" * 10_000
 
@@ -407,7 +509,8 @@ def test_large_conclusion_is_utf8_bounded_while_report_link_is_preserved():
 
     content = delivery.effect_payload["comment_content"]
     assert len(content.encode("utf-8")) <= MAX_FEISHU_COMMENT_BYTES
-    assert manifest["report_url"] in content
+    assert delivery.foxglove_url in content
+    assert manifest["report_url"] not in content
     assert delivery.conclusion.endswith("...")
     assert {item.role for item in delivery.artifacts} == {
         "index_html",
@@ -416,9 +519,10 @@ def test_large_conclusion_is_utf8_bounded_while_report_link_is_preserved():
     }
 
 
-def test_frozen_v1_without_explicit_kind_accepts_only_manifest_proven_html():
-    delivery = _verify(_bundle(explicit_kind=None))
-    assert delivery.effect_payload["report_status"] == "html_delivery_ready"
+def test_contract_without_explicit_foxglove_kind_is_rejected():
+    with pytest.raises(DeliveryContractError) as exc:
+        _verify(_bundle(explicit_kind=None))
+    assert exc.value.code == "delivery_kind_unsupported"
 
 
 def test_viz_only_or_non_html_explicit_kind_is_rejected():
@@ -454,7 +558,9 @@ def test_html_and_json_are_both_required_even_when_contract_says_deliverable():
 
 def test_dependency_hash_mismatch_is_permanent_contract_error():
     admission, contract, manifest, observed, dependencies = _bundle()
-    observed[-1]["sha256"] = "0" * 64
+    next(item for item in observed if item["path"].endswith("video.mp4"))[
+        "sha256"
+    ] = "0" * 64
     with pytest.raises(DeliveryContractError) as exc:
         _verify((admission, contract, manifest, observed, dependencies))
     assert exc.value.code == "artifact_hash_mismatch"
@@ -471,7 +577,9 @@ def test_symlink_observation_is_rejected_even_with_matching_hash():
 
 def test_symlinked_parent_directory_is_rejected():
     admission, contract, manifest, observed, dependencies = _bundle()
-    observed[-1]["parents_symlink_free"] = False
+    next(item for item in observed if item["path"].endswith("video.mp4"))[
+        "parents_symlink_free"
+    ] = False
     with pytest.raises(DeliveryContractError) as exc:
         _verify((admission, contract, manifest, observed, dependencies))
     assert exc.value.code == "artifact_not_regular_file"

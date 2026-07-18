@@ -63,6 +63,10 @@ from gateway.pnc_rca_runtime_identity import (
     runtime_identity_is_valid,
 )
 from hermes_constants import get_hermes_home
+from scripts.pnc_foxglove_delivery import (
+    canonical_viz_mcap_path,
+    validate_foxglove_url,
+)
 
 
 ENV_PREFIX = "HERMES_RCA_DELIVERY_DISPATCHER_"
@@ -88,11 +92,7 @@ _FEISHU_ISSUE_URL_RE = re.compile(
     r"^https://project\.feishu\.cn/[A-Za-z0-9._-]+/issue/detail/([0-9]+)$"
 )
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_HTML_REPORT_STATUSES = frozenset({
-    "html_delivery_ready",
-    "report_generated_need_review",
-    "report_ready",
-})
+_VIZ_REPORT_STATUSES = frozenset({"report_ready"})
 _CIRCUIT_CODES = frozenset({
     "feishu_auth_failed",
     "feishu_permission_denied",
@@ -1557,6 +1557,7 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
             "schema_version", "delivery_id", "effect_kind", "target_key",
             "project_key", "work_item_type_key", "work_item_id", "issue_url",
             "artifact_set_id", "report_url", "report_status",
+            "viz_mcap_vm", "foxglove_url",
             "requires_human_review", "conclusion", "effect_key",
             "semantic_payload_sha256", "marker", "comment_content",
             "field_updates",
@@ -1578,6 +1579,7 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
             "schema_version", "delivery_id", "effect_kind", "target_key",
             "project_key", "work_item_type_key", "work_item_id", "issue_url",
             "artifact_set_id", "report_url", "report_status",
+            "viz_mcap_vm", "foxglove_url",
             "requires_human_review", "conclusion", "platform", "chat_id",
             "thread_id", "reply_anchor_message_id", "source_message_id",
             "requester_id", "reply_in_thread", "output_cap", "effect_key",
@@ -1620,9 +1622,17 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         submission_key=manifest_submission_key,
         artifact_set_id=claim.artifact_set_id,
     )
+    expected_viz_path = canonical_viz_mcap_path(manifest_submission_key)
+    if (
+        payload.get("viz_mcap_vm") != expected_viz_path
+        or not validate_foxglove_url(
+            payload.get("foxglove_url"), payload.get("viz_mcap_vm")
+        )
+    ):
+        raise DeliveryContractError("delivery_effect_foxglove_identity_mismatch")
     if (
         payload.get("requires_human_review") is not True
-        or payload.get("report_status") not in _HTML_REPORT_STATUSES
+        or payload.get("report_status") not in _VIZ_REPORT_STATUSES
     ):
         raise DeliveryContractError("delivery_effect_review_boundary_invalid")
     expected_field_updates = [
@@ -1632,7 +1642,7 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         },
         {
             "field_key": RCA_REPORT_FIELD_KEY,
-            "field_value": claim.report_url,
+            "field_value": payload.get("foxglove_url"),
         },
     ]
     if payload.get("field_updates") != expected_field_updates:
@@ -1713,7 +1723,7 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
                 RCA_RESULT_FIELD_KEY,
                 str(payload.get("conclusion") or ""),
             ),
-            (RCA_REPORT_FIELD_KEY, claim.report_url),
+            (RCA_REPORT_FIELD_KEY, str(payload.get("foxglove_url") or "")),
         ) if claim.effect_kind == DELIVERY_EFFECT_KIND else (),
         chat_id=str(payload.get("chat_id") or ""),
         thread_id=str(payload.get("thread_id") or ""),

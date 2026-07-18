@@ -14,6 +14,11 @@ from typing import Any, Mapping, Sequence
 from urllib.parse import quote, unquote, urlparse
 
 from gateway.pnc_rca_admission import RcaAdmission, validate_rca_admission
+from scripts.pnc_foxglove_delivery import (
+    canonical_viz_mcap_path,
+    foxglove_url,
+    validate_foxglove_url,
+)
 
 
 DELIVERY_CONTRACT_SCHEMA_VERSION = "g1q3_delivery_contract_v1"
@@ -50,6 +55,8 @@ RCA_REPORT_FIELD_KEY = "field_8c912e"
 _HTML_REPORT_STATUSES = frozenset(
     {"html_delivery_ready", "report_generated_need_review", "report_ready"}
 )
+_VIZ_REPORT_STATUSES = frozenset({"report_ready"})
+_VIZ_PUBLICATION_SCHEMA_VERSION = "g1q3_rca_viz_publication_v1"
 
 
 class DeliveryContractError(ValueError):
@@ -87,6 +94,8 @@ class VerifiedDelivery:
     target_key: str
     issue_url: str
     report_url: str
+    viz_mcap_vm: str
+    foxglove_url: str
     conclusion: str
     marker: str
     manifest: dict[str, Any]
@@ -107,6 +116,8 @@ class VerifiedDelivery:
             "target_key": self.target_key,
             "issue_url": self.issue_url,
             "report_url": self.report_url,
+            "viz_mcap_vm": self.viz_mcap_vm,
+            "foxglove_url": self.foxglove_url,
             "manifest": self.manifest,
             "contract": self.contract,
             "artifacts": [asdict(item) for item in self.artifacts],
@@ -178,6 +189,8 @@ _BASE_EFFECT_SEMANTIC_FIELDS = (
     "issue_url",
     "artifact_set_id",
     "report_url",
+    "viz_mcap_vm",
+    "foxglove_url",
     "report_status",
     "requires_human_review",
     "conclusion",
@@ -650,7 +663,7 @@ def build_thread_reply_effect(
         lines.append(f"候选结论：{conclusion}")
     lines.extend(
         [
-            f"HTML 报告：{semantic.get('report_url')}",
+            f"Foxglove 归因报告：{semantic.get('foxglove_url')}",
             f"问题单：{semantic.get('issue_url')}",
             "说明：以上为自动 RCA 候选结论，需人工复核确认后再结案。",
         ]
@@ -1179,6 +1192,98 @@ def _observations_by_path(
     return result
 
 
+def _verify_viz_publication(
+    *,
+    contract_artifacts: Mapping[str, Any],
+    observations: Mapping[str, Mapping[str, Any]],
+    submission_key: str,
+) -> tuple[str, str]:
+    publication = contract_artifacts.get("viz_publication")
+    if not isinstance(publication, Mapping):
+        raise DeliveryContractError("viz_publication_missing")
+    expected_fields = {
+        "schema_version",
+        "status",
+        "submission_key",
+        "path",
+        "size",
+        "sha256",
+        "manifest_path",
+        "manifest_size",
+        "manifest_sha256",
+        "source_path",
+        "source_sha256",
+        "published_at",
+    }
+    if set(publication) != expected_fields:
+        raise DeliveryContractError("viz_publication_shape_invalid")
+    if (
+        publication.get("schema_version") != _VIZ_PUBLICATION_SCHEMA_VERSION
+        or publication.get("status") != "published"
+        or publication.get("submission_key") != submission_key
+    ):
+        raise DeliveryContractError("viz_publication_identity_mismatch")
+
+    expected_path = canonical_viz_mcap_path(submission_key)
+    path = _required_text(publication.get("path"), "viz_publication.path")
+    if not expected_path or path != expected_path:
+        raise DeliveryContractError("viz_publication_path_invalid")
+    expected_manifest_path = expected_path.removesuffix(".viz.mcap") + ".viz.manifest.json"
+    manifest_path = _required_text(
+        publication.get("manifest_path"), "viz_publication.manifest_path"
+    )
+    if manifest_path != expected_manifest_path:
+        raise DeliveryContractError("viz_publication_manifest_path_invalid")
+
+    source_path = _required_text(publication.get("source_path"), "viz_publication.source_path")
+    source_root = canonical_artifact_root(submission_key)
+    if (
+        not source_path.startswith(source_root + "cases/")
+        or not source_path.endswith(".viz.mcap")
+        or ".." in PurePosixPath(source_path).parts
+    ):
+        raise DeliveryContractError("viz_publication_source_invalid")
+    published_sha = _sha256(publication.get("sha256"), "viz_publication.sha256")
+    if _sha256(publication.get("source_sha256"), "viz_publication.source_sha256") != published_sha:
+        raise DeliveryContractError("viz_publication_source_hash_mismatch")
+    published_size = _positive_int(publication.get("size"), "viz_publication.size")
+    manifest_size = _positive_int(
+        publication.get("manifest_size"), "viz_publication.manifest_size"
+    )
+    manifest_sha = _sha256(
+        publication.get("manifest_sha256"), "viz_publication.manifest_sha256"
+    )
+
+    observed_viz = observations.get(path)
+    observed_manifest = observations.get(manifest_path)
+    for label, observed in (("viz", observed_viz), ("manifest", observed_manifest)):
+        if (
+            not isinstance(observed, Mapping)
+            or observed.get("is_file") is not True
+            or observed.get("is_symlink") is True
+            or observed.get("parents_symlink_free") is not True
+        ):
+            raise DeliveryContractError(f"viz_publication_{label}_not_observed")
+    if (
+        _positive_int(observed_viz.get("size"), "observed_viz.size") != published_size
+        or _sha256(observed_viz.get("sha256"), "observed_viz.sha256") != published_sha
+        or observed_viz.get("sha256_attested_by_manifest") is not True
+    ):
+        raise DeliveryContractError("viz_publication_observation_mismatch")
+    if (
+        _positive_int(observed_manifest.get("size"), "observed_manifest.size")
+        != manifest_size
+        or _sha256(observed_manifest.get("sha256"), "observed_manifest.sha256")
+        != manifest_sha
+    ):
+        raise DeliveryContractError("viz_publication_manifest_observation_mismatch")
+
+    rendered = foxglove_url(path)
+    if not rendered or not validate_foxglove_url(rendered, path):
+        raise DeliveryContractError("foxglove_url_invalid")
+    return path, rendered
+
+
 def _verify_identity(
     admission: RcaAdmission,
     contract: Mapping[str, Any],
@@ -1222,7 +1327,7 @@ def verify_delivery_bundle(
     observed_files: Sequence[Mapping[str, Any]],
     html_dependencies: Sequence[str],
 ) -> VerifiedDelivery:
-    """Verify one sealed HTML bundle and build a send-free delivery effect."""
+    """Verify sealed evidence plus one published viz and build a send-free effect."""
     validated_admission = validate_rca_admission(admission)
     contract = dict(delivery_contract or {})
     manifest = dict(delivery_manifest or {})
@@ -1255,12 +1360,12 @@ def verify_delivery_bundle(
     explicit_kind = str(
         report.get("deliverable_kind") or contract.get("deliverable_kind") or ""
     ).strip()
-    if explicit_kind and explicit_kind != "html":
+    if explicit_kind != "foxglove_viz":
         raise DeliveryContractError("delivery_kind_unsupported")
     report_status = str(report.get("status") or "").strip()
-    if report_status not in _HTML_REPORT_STATUSES:
+    if report_status not in _VIZ_REPORT_STATUSES:
         raise DeliveryContractError(
-            "delivery_report_status_not_html", f"unsupported report status: {report_status}"
+            "delivery_report_status_not_viz", f"unsupported report status: {report_status}"
         )
     if report.get("requires_human_review") is not True:
         raise DeliveryContractError(
@@ -1288,6 +1393,11 @@ def verify_delivery_bundle(
         raise DeliveryContractError("artifact_set_reference_mismatch")
 
     observations = _observations_by_path(observed_files)
+    viz_mcap_vm, rendered_foxglove_url = _verify_viz_publication(
+        contract_artifacts=contract_artifacts,
+        observations=observations,
+        submission_key=validated_admission.submission_key,
+    )
     roles: dict[str, VerifiedArtifact] = {}
     verified: list[VerifiedArtifact] = []
     seen_paths: set[str] = set()
@@ -1405,6 +1515,8 @@ def verify_delivery_bundle(
         "issue_url": issue_url,
         "artifact_set_id": expected_artifact_set_id,
         "report_url": report_url,
+        "viz_mcap_vm": viz_mcap_vm,
+        "foxglove_url": rendered_foxglove_url,
         "report_status": report_status,
         "requires_human_review": True,
         "conclusion": conclusion,
@@ -1415,7 +1527,7 @@ def verify_delivery_bundle(
             },
             {
                 "field_key": RCA_REPORT_FIELD_KEY,
-                "field_value": report_url,
+                "field_value": rendered_foxglove_url,
             },
         ],
     }
@@ -1439,7 +1551,8 @@ def verify_delivery_bundle(
         comment_lines.append(f"候选结论：{conclusion}")
     comment_lines.extend(
         [
-            f"HTML 报告：{report_url}",
+
+            f"Foxglove 归因报告：{rendered_foxglove_url}",
             "说明：以上为自动 RCA 候选结论，需人工复核确认后再结案。",
         ]
     )
@@ -1467,6 +1580,8 @@ def verify_delivery_bundle(
         target_key=target_key,
         issue_url=issue_url,
         report_url=report_url,
+        viz_mcap_vm=viz_mcap_vm,
+        foxglove_url=rendered_foxglove_url,
         conclusion=conclusion,
         marker=marker,
         manifest=manifest,

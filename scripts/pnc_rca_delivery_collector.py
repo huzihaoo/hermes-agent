@@ -522,24 +522,27 @@ def _remote_bundle_script(submission_key: str) -> str:
         MAX_JSON_BYTES = 8 * 1024 * 1024
         MAX_ARTIFACTS = 512
         MAX_FILE_BYTES = 256 * 1024 * 1024
+        MAX_VIZ_BYTES = 64 * 1024 * 1024 * 1024
         MAX_TOTAL_BYTES = 512 * 1024 * 1024
         MAX_HTML_BYTES = 32 * 1024 * 1024
         MAX_TEXT_FILE_BYTES = 32 * 1024 * 1024
         MAX_TEXT_TOTAL_BYTES = 64 * 1024 * 1024
         CSS_PARSER_DISTRIBUTION = {REMOTE_CSS_PARSER_DISTRIBUTION!r}
         CSS_PARSER_VERSION = {REMOTE_CSS_PARSER_VERSION!r}
+        FORMAL_VIZ_ROOT = '/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases'
 
         def finish(value):
             print(json.dumps(value, ensure_ascii=False, sort_keys=True))
 
-        def symlink_free(path):
-            current = root_norm
+        def symlink_free(path, anchor=None):
+            anchor = anchor or root_norm
+            current = anchor
             try:
                 if stat.S_ISLNK(os.lstat(current).st_mode):
                     return False
             except FileNotFoundError:
                 return False
-            relative = posixpath.relpath(path, root_norm)
+            relative = posixpath.relpath(path, anchor)
             for part in relative.split('/'):
                 current = posixpath.join(current, part)
                 try:
@@ -549,14 +552,14 @@ def _remote_bundle_script(submission_key: str) -> str:
                     return False
             return True
 
-        def open_regular(path, missing_code, max_bytes):
+        def open_regular(path, missing_code, max_bytes, anchor=None):
             try:
                 before = os.lstat(path)
             except FileNotFoundError:
                 raise RuntimeError(missing_code)
             if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
                 raise RuntimeError(missing_code + '_not_regular')
-            if not symlink_free(path):
+            if not symlink_free(path, anchor):
                 raise RuntimeError(missing_code + '_not_regular')
             try:
                 fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
@@ -575,8 +578,8 @@ def _remote_bundle_script(submission_key: str) -> str:
                 raise RuntimeError(missing_code + '_size_invalid')
             return fd, after
 
-        def read_json(path, missing_code):
-            fd, _info = open_regular(path, missing_code, MAX_JSON_BYTES)
+        def read_json(path, missing_code, anchor=None):
+            fd, _info = open_regular(path, missing_code, MAX_JSON_BYTES, anchor)
             with os.fdopen(fd, 'rb') as handle:
                 raw = handle.read(MAX_JSON_BYTES + 1)
             try:
@@ -933,10 +936,79 @@ def _remote_bundle_script(submission_key: str) -> str:
             root_norm = posixpath.normpath(ROOT)
             contract = read_json(ROOT + 'delivery_contract.json', 'delivery_contract_missing')
             manifest = read_json(ROOT + 'delivery_manifest.json', 'delivery_manifest_missing')
+            contract_artifacts = contract.get('artifacts')
+            if not isinstance(contract_artifacts, dict):
+                raise RuntimeError('viz_publication_missing')
+            viz_publication = contract_artifacts.get('viz_publication')
+            if not isinstance(viz_publication, dict):
+                raise RuntimeError('viz_publication_missing')
+            viz_path = str(viz_publication.get('path') or '')
+            viz_manifest_path = str(viz_publication.get('manifest_path') or '')
+            submission_key = str(viz_publication.get('submission_key') or '')
+            expected_viz_path = posixpath.join(
+                FORMAL_VIZ_ROOT, submission_key, submission_key + '.viz.mcap'
+            )
+            expected_viz_manifest_path = posixpath.join(
+                FORMAL_VIZ_ROOT, submission_key,
+                submission_key + '.viz.manifest.json',
+            )
+            if (
+                not submission_key
+                or viz_path != expected_viz_path
+                or viz_manifest_path != expected_viz_manifest_path
+                or posixpath.commonpath((FORMAL_VIZ_ROOT, viz_path)) != FORMAL_VIZ_ROOT
+            ):
+                raise RuntimeError('viz_publication_path_invalid')
+            viz_fd, viz_info = open_regular(
+                viz_path, 'viz_publication_missing', MAX_VIZ_BYTES, FORMAL_VIZ_ROOT
+            )
+            os.close(viz_fd)
+            viz_manifest_fd, viz_manifest_info = open_regular(
+                viz_manifest_path,
+                'viz_publication_manifest_missing',
+                MAX_JSON_BYTES,
+                FORMAL_VIZ_ROOT,
+            )
+            with os.fdopen(viz_manifest_fd, 'rb') as handle:
+                viz_manifest_raw = handle.read(MAX_JSON_BYTES + 1)
+            try:
+                viz_manifest = json.loads(viz_manifest_raw.decode('utf-8'))
+            except Exception:
+                raise RuntimeError('viz_publication_manifest_json_invalid')
+            if not isinstance(viz_manifest, dict) or any(
+                viz_manifest.get(key) != viz_publication.get(key)
+                for key in (
+                    'schema_version', 'status', 'submission_key', 'path',
+                    'size', 'sha256', 'source_path', 'source_sha256',
+                    'published_at',
+                )
+            ):
+                raise RuntimeError('viz_publication_manifest_mismatch')
+            if viz_info.st_size != viz_publication.get('size'):
+                raise RuntimeError('viz_publication_size_mismatch')
             rows = manifest.get('artifacts')
             if not isinstance(rows, list) or not rows or len(rows) > MAX_ARTIFACTS:
                 raise RuntimeError('delivery_manifest_artifacts_invalid')
             observed = []
+            observed.extend([
+                {{
+                    'path': viz_path,
+                    'size': viz_info.st_size,
+                    'sha256': str(viz_publication.get('sha256') or ''),
+                    'is_file': True,
+                    'is_symlink': False,
+                    'parents_symlink_free': True,
+                    'sha256_attested_by_manifest': True,
+                }},
+                {{
+                    'path': viz_manifest_path,
+                    'size': viz_manifest_info.st_size,
+                    'sha256': hashlib.sha256(viz_manifest_raw).hexdigest(),
+                    'is_file': True,
+                    'is_symlink': False,
+                    'parents_symlink_free': True,
+                }},
+            ])
             artifact_meta = {{}}
             total = 0
             html_path = ''
