@@ -71,6 +71,84 @@ def test_later_explicit_correction_supersedes_validation_comment() -> None:
     assert truth["selected_comment"]["comment_ref"] == "c2"
 
 
+def test_version_question_is_not_an_explicit_correction() -> None:
+    comments = [
+        _comment(
+            "2026-07-02 20:58:25",
+            "原因分析：内八场景判断导致BLM不可用。",
+            "c1",
+        ),
+        _comment(
+            "2026-07-03 10:00:00",
+            "哪个版本优化这些是不是要写清楚呀",
+            "c2",
+        ),
+    ]
+
+    truth = learning.align_owner_truth(
+        comments,
+        [_transition("2026-07-02T12:59:36Z", "o93u2k3ri")],
+    )
+
+    assert truth["selection_reason"] != "later_explicit_owner_correction"
+    assert truth["selected_comment"]["comment_ref"] == "c1"
+
+
+def test_fix_status_alone_is_not_owner_root_cause() -> None:
+    truth = learning.align_owner_truth(
+        [_comment("2026-07-02 20:58:25", "已优化回灌，待复测", "c1")],
+        [_transition("2026-07-02T12:59:36Z", "o93u2k3ri")],
+        root_cause_text="规划目标选择错误",
+    )
+
+    assert truth["selection_reason"] == "root_cause_field_only"
+    assert truth["selected_comment"] is None
+    assert truth["root_cause_field_secondary"] == "规划目标选择错误"
+
+
+def test_query_status_scopes_the_project_by_pdcl_not_title(monkeypatch) -> None:
+    observed = {}
+    client = learning.MeegleReadClient()
+
+    def fake_json(args):
+        observed["args"] = args
+        return {"data": {}, "list": [{"count": 0}]}
+
+    monkeypatch.setattr(client, "_json", fake_json)
+
+    rows, total = client.query_status("关闭（CLOSED）", offset=50)
+
+    assert rows == []
+    assert total == 0
+    mql = observed["args"][observed["args"].index("--mql") + 1]
+    assert "`问题数据地址_PDCL` is not null" in mql
+    assert "`状态` = '关闭（CLOSED）'" in mql
+    assert "名称` like '%G1Q3%'" not in mql
+    assert "LIMIT 50,50" in mql
+
+
+def test_query_target_index_keeps_non_g1q3_titles() -> None:
+    class Client:
+        def query_status(self, status_label, *, offset):
+            if offset:
+                return [], 1
+            work_item_id = {
+                label: str(7000000001 + index)
+                for index, label in enumerate(learning.TARGET_STATUS_LABELS)
+            }[status_label]
+            return [{
+                "work_item_id": work_item_id,
+                "title": "FCW误触发，无G1Q3标题前缀",
+                "status_key": "CLOSED",
+                "status_label": status_label,
+                "updated_at": "2026-07-18",
+            }], 1
+
+    rows = learning.query_target_index(Client())
+
+    assert len(rows) == 3
+
+
 def test_split_case_keeps_owner_material_out_of_blind_input() -> None:
     owner_text = "原因分析：目标速度从0初始化导致Vx收敛慢"
     root_cause = "最终根因：速度初始化错误"
@@ -218,3 +296,80 @@ def test_write_corpus_refuses_identity_order_mismatch(tmp_path: Path) -> None:
             [{"work_item_id": "1"}],
             [{"work_item_id": "2"}],
         )
+
+
+def test_capture_corpus_resumes_completed_case_cache(
+    tmp_path: Path, monkeypatch
+) -> None:
+    index = [
+        {"work_item_id": "7000000002", "updated_at": "2026-07-18"},
+        {"work_item_id": "7000000001", "updated_at": "2026-07-17"},
+    ]
+    attempts = {item["work_item_id"]: 0 for item in index}
+
+    monkeypatch.setattr(learning, "query_target_index", lambda _client: index)
+
+    def capture(_client, item):
+        work_item_id = item["work_item_id"]
+        attempts[work_item_id] += 1
+        if work_item_id == "7000000001" and attempts[work_item_id] == 1:
+            raise learning.CorpusError("transient_read")
+        return (
+            {"work_item_id": work_item_id, "title": "blind"},
+            {"work_item_id": work_item_id, "owner_truth": {"status": "resolved"}},
+        )
+
+    monkeypatch.setattr(learning, "capture_case", capture)
+    output_dir = tmp_path / "corpus"
+
+    with pytest.raises(learning.CorpusError) as caught:
+        learning.capture_corpus(output_dir, workers=1)
+    assert caught.value.code == "corpus_capture_incomplete"
+
+    manifest = learning.capture_corpus(output_dir, workers=1)
+
+    assert manifest["case_count"] == 2
+    assert attempts == {"7000000002": 1, "7000000001": 2}
+    progress = json.loads(
+        (tmp_path / ".corpus.capture-cache" / "progress.json").read_text()
+    )
+    assert progress["completed"] == 2
+    assert progress["remaining"] == 0
+    assert progress["finished"] is True
+    blind = json.loads((output_dir / "blind-cases.json").read_text())
+    assert [item["work_item_id"] for item in blind["cases"]] == [
+        "7000000002",
+        "7000000001",
+    ]
+
+
+def test_capture_corpus_resumes_frozen_index_without_live_requery(
+    tmp_path: Path, monkeypatch
+) -> None:
+    index = [{"work_item_id": "7000000001", "updated_at": "2026-07-18"}]
+    queries = 0
+
+    def query(_client):
+        nonlocal queries
+        queries += 1
+        return index
+
+    monkeypatch.setattr(learning, "query_target_index", query)
+    monkeypatch.setattr(
+        learning,
+        "capture_case",
+        lambda _client, _item: (_ for _ in ()).throw(
+            learning.CorpusError("transient_read")
+        ),
+    )
+    output_dir = tmp_path / "corpus"
+
+    with pytest.raises(learning.CorpusError) as caught:
+        learning.capture_corpus(output_dir, workers=1)
+    assert caught.value.code == "corpus_capture_incomplete"
+
+    index[0] = {"work_item_id": "7000000001", "updated_at": "2026-07-19"}
+    with pytest.raises(learning.CorpusError) as caught:
+        learning.capture_corpus(output_dir, workers=1)
+    assert caught.value.code == "corpus_capture_incomplete"
+    assert queries == 1

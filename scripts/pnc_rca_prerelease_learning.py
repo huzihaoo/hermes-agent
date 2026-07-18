@@ -66,12 +66,12 @@ _CAUSAL_TERMS = (
     "原因分析", "根因", "原因为", "问题在", "问题是", "导致", "异常",
     "误检", "漏检", "跳变", "抖动", "收敛", "初始化", "选错", "误选",
     "晚选", "未选中", "触发", "控制", "感知", "规划", "spp", "ooi",
-    "cipv", "ttc", "vx", "vy", "置信度", "车道线", "回灌", "修复",
-    "优化", "符合预期", "正触发", "works as designed",
+    "cipv", "ttc", "vx", "vy", "置信度", "车道线",
+    "符合预期", "正触发", "works as designed",
 )
 _CORRECTION_TERMS = (
     "更正", "修正", "实际原因", "最终原因", "确认原因", "根因确认", "经确认",
-    "不是", "而是", "更新结论",
+    "更新结论",
 )
 _AUTOMATION_MARKERS = (
     "[RCA_DELIVERY:", "自动RCA未归因", "自动 RCA 未归因",
@@ -344,9 +344,18 @@ def causal_comment_score(text: str) -> int:
         score += 2
     if "原因" in normalized:
         score += 3
-    if any(term in normalized for term in _CORRECTION_TERMS):
+    if _is_explicit_correction(normalized):
         score += 3
     return score
+
+
+def _is_explicit_correction(text: str) -> bool:
+    normalized = str(text or "").strip()
+    if any(term in normalized for term in _CORRECTION_TERMS):
+        return True
+    return re.search(
+        r"(?:不是|并非).{1,160}(?:而是|实际是)", normalized, re.DOTALL
+    ) is not None
 
 
 def align_owner_truth(
@@ -407,7 +416,7 @@ def align_owner_truth(
         later_corrections = [
             item for item in timeline
             if item["_time"] > selected["_time"]
-            and any(term in str(item.get("content") or "") for term in _CORRECTION_TERMS)
+            and _is_explicit_correction(str(item.get("content") or ""))
         ]
         if later_corrections:
             selected = later_corrections[-1]
@@ -550,9 +559,9 @@ class MeegleReadClient:
         if status_label not in TARGET_STATUS_LABELS:
             raise CorpusError("target_status_invalid")
         mql = (
-            "SELECT `名称`, `工作项id`, `状态`, `更新时间` "
+            "SELECT `名称`, `工作项id`, `状态`, `更新时间`, `问题数据地址_PDCL` "
             f"FROM `{PROJECT_KEY}`.`{WORK_ITEM_TYPE}` "
-            "WHERE `名称` like '%G1Q3%' "
+            "WHERE `问题数据地址_PDCL` is not null "
             f"AND `状态` = '{status_label}' "
             "ORDER BY `更新时间` DESC, `工作项id` DESC "
             f"LIMIT {offset},{PAGE_SIZE}"
@@ -672,8 +681,7 @@ def query_target_index(client: MeegleReadClient) -> list[dict[str, Any]]:
         while True:
             rows, total = client.query_status(status_label, offset=offset)
             for row in rows:
-                if "G1Q3" in row["title"].upper():
-                    output[row["work_item_id"]] = row
+                output[row["work_item_id"]] = row
             offset += len(rows)
             if not rows or offset >= total:
                 break
@@ -886,31 +894,118 @@ def capture_corpus(
 ) -> dict[str, Any]:
     if workers < 1 or workers > 8:
         raise CorpusError("workers_invalid")
+    cache_dir = output_dir.parent / f".{output_dir.name}.capture-cache"
+    cases_cache = cache_dir / "cases"
+    cached_index_path = cache_dir / "index.json"
+    if cached_index_path.is_file():
+        index_payload = json.loads(cached_index_path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(index_payload, dict)
+            or index_payload.get("schema_version") != SCHEMA_VERSION
+            or index_payload.get("kind") != "capture_index"
+            or not isinstance(index_payload.get("cases"), list)
+            or index_payload.get("case_count") != len(index_payload["cases"])
+        ):
+            raise CorpusError("capture_index_cache_invalid")
+        index = index_payload["cases"]
+    else:
+        client = MeegleReadClient()
+        index = query_target_index(client)
+        if limit > 0:
+            index = index[:limit]
+        index_payload = {
+            "schema_version": SCHEMA_VERSION,
+            "kind": "capture_index",
+            "captured_at": _utc_now(),
+            "case_count": len(index),
+            "order": "updated_at_desc_work_item_id_desc",
+            "cases": index,
+        }
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(cache_dir, 0o700)
+        _atomic_json(cached_index_path, index_payload)
+    index_sha256 = sha256_json(index_payload)
     client = MeegleReadClient()
-    index = query_target_index(client)
-    if limit > 0:
-        index = index[:limit]
+    cases_cache.mkdir(parents=True, exist_ok=True)
+    os.chmod(cases_cache, 0o700)
     captured: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
     failures: list[dict[str, str]] = []
+    pending: list[dict[str, Any]] = []
+    for item in index:
+        work_item_id = item["work_item_id"]
+        cache_path = cases_cache / f"{work_item_id}.json"
+        if not cache_path.is_file():
+            pending.append(item)
+            continue
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(cached, dict)
+            or cached.get("schema_version") != SCHEMA_VERSION
+            or cached.get("kind") != "captured_case"
+            or cached.get("index_sha256") != index_sha256
+            or cached.get("work_item_id") != work_item_id
+            or not isinstance(cached.get("blind"), dict)
+            or not isinstance(cached.get("truth"), dict)
+        ):
+            raise CorpusError("capture_case_cache_invalid", work_item_id)
+        captured[work_item_id] = (cached["blind"], cached["truth"])
+
+    def write_progress(*, finished: bool = False) -> None:
+        _atomic_json(cache_dir / "progress.json", {
+            "schema_version": SCHEMA_VERSION,
+            "kind": "capture_progress",
+            "index_sha256": index_sha256,
+            "total": len(index),
+            "completed": len(captured),
+            "failed_this_attempt": len(failures),
+            "remaining": len(index) - len(captured),
+            "finished": finished,
+            "updated_at": _utc_now(),
+        })
+
+    write_progress()
+    processed_this_attempt = 0
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(capture_case, client, item): item for item in index}
+        futures = {executor.submit(capture_case, client, item): item for item in pending}
         for future in as_completed(futures):
             item = futures[future]
             try:
-                captured[item["work_item_id"]] = future.result()
+                blind, truth = future.result()
+                work_item_id = item["work_item_id"]
+                _atomic_json(cases_cache / f"{work_item_id}.json", {
+                    "schema_version": SCHEMA_VERSION,
+                    "kind": "captured_case",
+                    "index_sha256": index_sha256,
+                    "work_item_id": work_item_id,
+                    "blind": blind,
+                    "truth": truth,
+                })
+                captured[work_item_id] = (blind, truth)
             except Exception as exc:
                 failures.append({
                     "work_item_id": item["work_item_id"],
                     "error_code": getattr(exc, "code", type(exc).__name__),
                 })
+            processed_this_attempt += 1
+            if processed_this_attempt % 10 == 0:
+                write_progress()
     if failures:
+        _atomic_json(cache_dir / "failures.json", {
+            "schema_version": SCHEMA_VERSION,
+            "kind": "capture_failures",
+            "index_sha256": index_sha256,
+            "failures": sorted(failures, key=lambda item: item["work_item_id"]),
+        })
+        write_progress()
         raise CorpusError("corpus_capture_incomplete", json.dumps(failures, sort_keys=True))
     ordered = [captured[item["work_item_id"]] for item in index]
-    return write_corpus(
+    manifest = write_corpus(
         output_dir,
         [item[0] for item in ordered],
         [item[1] for item in ordered],
     )
+    write_progress(finished=True)
+    return manifest
 
 
 def _load_object(path: Path) -> dict[str, Any]:
