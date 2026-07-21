@@ -18,10 +18,14 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.pnc_rca_delivery_contract import (
+    DELIVERY_EFFECT_SCHEMA_VERSION_V1,
     TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1,
     DeliveryContractError,
     build_report_url,
     build_terminal_delivery,
+    compute_delivery_effect_key,
+    compute_delivery_effect_payload_sha256,
+    delivery_effect_marker,
 )
 from gateway.pnc_rca_delivery_store import (
     RcaDeliveryStore,
@@ -659,6 +663,11 @@ def test_success_requires_read_before_http_add_and_read_after_remote_id(tmp_path
     receipt = json.loads(effect["remote_receipt_json"])
     assert receipt["remote_id"] == "comment-1"
     assert receipt["confirmed_field_keys"] == ["field_9193cb", "field_8c912e"]
+    payload = json.loads(effect["payload_json"])
+    assert payload["report_link_kind"] == "manifest_html"
+    assert remote.fields["field_8c912e"] == payload["report_url"]
+    assert payload["report_url"] in remote.comments[0]["content"]
+    assert payload["foxglove_url"] not in remote.comments[0]["content"]
 
 
 def test_existing_marker_repairs_drifted_fields_without_duplicate_comment(tmp_path):
@@ -1483,6 +1492,82 @@ def test_dispatcher_rejects_report_url_for_another_submission_before_http(tmp_pa
         dispatcher_module._validate_effect(tampered)
 
     assert exc.value.code == "report_url_identity_mismatch"
+
+
+def test_dispatcher_rejects_non_manifest_report_link_kind_before_http(tmp_path):
+    store = _seed(tmp_path)
+    claim = store.claim_due_effect(lease_owner="worker-1", now=NOW)
+    assert claim is not None
+    tampered = replace(
+        claim,
+        payload={**claim.payload, "report_link_kind": "foxglove_viz"},
+    )
+
+    with pytest.raises(DeliveryContractError) as exc:
+        dispatcher_module._validate_effect(tampered)
+
+    assert exc.value.code == "delivery_effect_report_link_kind_invalid"
+
+
+def test_dispatcher_rejects_foxglove_report_field_before_http(tmp_path):
+    store = _seed(tmp_path)
+    claim = store.claim_due_effect(lease_owner="worker-1", now=NOW)
+    assert claim is not None
+    field_updates = [dict(item) for item in claim.payload["field_updates"]]
+    field_updates[1]["field_value"] = claim.payload["foxglove_url"]
+    tampered = replace(
+        claim,
+        payload={**claim.payload, "field_updates": field_updates},
+    )
+
+    with pytest.raises(DeliveryContractError) as exc:
+        dispatcher_module._validate_effect(tampered)
+
+    assert exc.value.code == "delivery_effect_field_updates_invalid"
+
+
+def test_dispatcher_validates_historical_v1_effect_without_rewriting_identity(tmp_path):
+    store = _seed(tmp_path)
+    claim = store.claim_due_effect(lease_owner="worker-1", now=NOW)
+    assert claim is not None
+    payload = dict(claim.payload)
+    payload["schema_version"] = DELIVERY_EFFECT_SCHEMA_VERSION_V1
+    payload.pop("report_link_kind")
+    field_updates = [dict(item) for item in payload["field_updates"]]
+    field_updates[1]["field_value"] = payload["foxglove_url"]
+    payload["field_updates"] = field_updates
+    payload["comment_content"] = payload["comment_content"].replace(
+        claim.report_url,
+        payload["foxglove_url"],
+    )
+    semantic_sha = compute_delivery_effect_payload_sha256(payload, claim.effect_kind)
+    effect_key = compute_delivery_effect_key(
+        delivery_id=claim.delivery_id,
+        effect_kind=claim.effect_kind,
+        target_key=claim.target_key,
+        semantic_payload_sha256=semantic_sha,
+    )
+    marker = delivery_effect_marker(effect_key, claim.artifact_set_id)
+    payload["comment_content"] = payload["comment_content"].replace(
+        claim.payload["marker"],
+        marker,
+        1,
+    )
+    payload.update(
+        effect_key=effect_key,
+        marker=marker,
+        semantic_payload_sha256=semantic_sha,
+    )
+    legacy = replace(
+        claim,
+        effect_key=effect_key,
+        payload_sha256=semantic_sha,
+        payload=payload,
+    )
+
+    validated = dispatcher_module._validate_effect(legacy)
+
+    assert validated.field_updates[1] == ("field_8c912e", payload["foxglove_url"])
 
 
 def test_dispatcher_rejects_project_alias_issue_url_before_http(tmp_path):

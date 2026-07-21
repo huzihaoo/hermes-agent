@@ -23,7 +23,8 @@ from scripts.pnc_foxglove_delivery import (
 
 DELIVERY_CONTRACT_SCHEMA_VERSION = "g1q3_delivery_contract_v1"
 DELIVERY_MANIFEST_SCHEMA_VERSION = "delivery_manifest_v2"
-DELIVERY_EFFECT_SCHEMA_VERSION = "pnc_rca_delivery_effect_v1"
+DELIVERY_EFFECT_SCHEMA_VERSION_V1 = "pnc_rca_delivery_effect_v1"
+DELIVERY_EFFECT_SCHEMA_VERSION = "pnc_rca_delivery_effect_v2"
 TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1 = "pnc_rca_terminal_delivery_effect_v1"
 TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION = "pnc_rca_terminal_delivery_effect_v2"
 TERMINAL_DIAGNOSTIC_CONTRACT_SCHEMA_VERSION = "pnc_rca_terminal_diagnostic_v1"
@@ -88,6 +89,7 @@ MAX_FEISHU_COMMENT_BYTES = 8 * 1024
 MAX_CONCLUSION_BYTES = 2 * 1024
 RCA_RESULT_FIELD_KEY = "field_9193cb"
 RCA_REPORT_FIELD_KEY = "field_8c912e"
+DELIVERY_REPORT_LINK_KIND = "manifest_html"
 _HTML_REPORT_STATUSES = frozenset(
     {"html_delivery_ready", "report_generated_need_review", "report_ready"}
 )
@@ -218,7 +220,7 @@ def _stable_key(prefix: str, material: Mapping[str, Any]) -> str:
     return f"{prefix}-{digest}"
 
 
-_BASE_EFFECT_SEMANTIC_FIELDS = (
+_V1_BASE_EFFECT_SEMANTIC_FIELDS = (
     "schema_version",
     "delivery_id",
     "effect_kind",
@@ -236,6 +238,10 @@ _BASE_EFFECT_SEMANTIC_FIELDS = (
     "requires_human_review",
     "conclusion",
     "field_updates",
+)
+_BASE_EFFECT_SEMANTIC_FIELDS = (
+    *_V1_BASE_EFFECT_SEMANTIC_FIELDS,
+    "report_link_kind",
 )
 _THREAD_EFFECT_SEMANTIC_FIELDS = (
     "platform",
@@ -353,7 +359,13 @@ def delivery_effect_semantic_payload(
 ) -> dict[str, Any]:
     if effect_kind not in DELIVERY_EFFECT_KINDS:
         raise DeliveryContractError("delivery_effect_kind_unsupported")
-    fields = list(_BASE_EFFECT_SEMANTIC_FIELDS)
+    schema_version = payload.get("schema_version")
+    if schema_version == DELIVERY_EFFECT_SCHEMA_VERSION_V1:
+        fields = list(_V1_BASE_EFFECT_SEMANTIC_FIELDS)
+    elif schema_version == DELIVERY_EFFECT_SCHEMA_VERSION:
+        fields = list(_BASE_EFFECT_SEMANTIC_FIELDS)
+    else:
+        raise DeliveryContractError("delivery_effect_schema_unsupported")
     if effect_kind == DELIVERY_THREAD_EFFECT_KIND:
         fields.extend(_THREAD_EFFECT_SEMANTIC_FIELDS)
     return {key: payload.get(key) for key in fields}
@@ -833,9 +845,16 @@ def build_thread_reply_effect(
         work_item_type_key=str(issue.get("work_item_type_key") or ""),
         work_item_id=str(issue.get("work_item_id") or ""),
     )
+    schema_version = issue.get("schema_version")
+    if schema_version == DELIVERY_EFFECT_SCHEMA_VERSION_V1:
+        semantic_fields = _V1_BASE_EFFECT_SEMANTIC_FIELDS
+    elif schema_version == DELIVERY_EFFECT_SCHEMA_VERSION:
+        semantic_fields = _BASE_EFFECT_SEMANTIC_FIELDS
+    else:
+        raise DeliveryContractError("delivery_effect_schema_unsupported")
     semantic = {
         key: issue.get(key)
-        for key in _BASE_EFFECT_SEMANTIC_FIELDS
+        for key in semantic_fields
         if key not in {"effect_kind", "target_key"}
     }
     semantic.update(
@@ -868,9 +887,19 @@ def build_thread_reply_effect(
     conclusion = str(semantic.get("conclusion") or "").strip()
     if conclusion:
         lines.append(f"候选结论：{conclusion}")
+    report_link = (
+        semantic.get("report_url")
+        if schema_version == DELIVERY_EFFECT_SCHEMA_VERSION
+        else semantic.get("foxglove_url")
+    )
+    report_label = (
+        "归因报告"
+        if schema_version == DELIVERY_EFFECT_SCHEMA_VERSION
+        else "Foxglove 归因报告"
+    )
     lines.extend(
         [
-            f"Foxglove 归因报告：{semantic.get('foxglove_url')}",
+            f"{report_label}：{report_link}",
             f"问题单：{semantic.get('issue_url')}",
             "说明：以上为自动 RCA 候选结论，需人工复核确认后再结案。",
         ]
@@ -1787,6 +1816,7 @@ def verify_delivery_bundle(
         "report_cifs_path": report_cifs_path,
         "viz_mcap_vm": viz_mcap_vm,
         "foxglove_url": rendered_foxglove_url,
+        "report_link_kind": DELIVERY_REPORT_LINK_KIND,
         "report_status": report_status,
         "requires_human_review": True,
         "conclusion": conclusion,
@@ -1797,7 +1827,7 @@ def verify_delivery_bundle(
             },
             {
                 "field_key": RCA_REPORT_FIELD_KEY,
-                "field_value": rendered_foxglove_url,
+                "field_value": report_url,
             },
         ],
     }
@@ -1822,7 +1852,7 @@ def verify_delivery_bundle(
     comment_lines.extend(
         [
 
-            f"Foxglove 归因报告：{rendered_foxglove_url}",
+            f"归因报告：{report_url}",
             f"报告文件（CIFS）：{report_cifs_path}",
             "说明：以上为自动 RCA 候选结论，需人工复核确认后再结案。",
         ]

@@ -297,9 +297,10 @@ def test_valid_sealed_evidence_and_published_viz_build_issue_effect():
         },
         {
             "field_key": "field_8c912e",
-            "field_value": delivery.foxglove_url,
+            "field_value": delivery.report_url,
         },
     ]
+    assert delivery.effect_payload["report_link_kind"] == "manifest_html"
     assert delivery.target_key == "feishu_project:t03o4q:issue:7041712812"
     assert delivery.report_url == build_report_url(
         delivery.submission_key, delivery.artifact_set_id
@@ -406,8 +407,8 @@ def test_thread_reply_effect_is_bound_to_exact_topic_and_is_deterministic():
     assert payload["thread_id"] == "topic:om_root123"
     assert payload["idempotency_uuid"]
     assert payload["marker"] in payload["message_content"]
-    assert delivery.foxglove_url in payload["message_content"]
-    assert delivery.report_url not in payload["message_content"]
+    assert delivery.report_url in payload["message_content"]
+    assert delivery.foxglove_url not in payload["message_content"]
     assert delivery.issue_url in payload["message_content"]
 
 
@@ -602,7 +603,7 @@ def test_manifest_enforces_artifact_count_file_and_bundle_limits():
     assert exc.value.code == "delivery_manifest_artifacts_invalid"
 
 
-def test_large_conclusion_is_utf8_bounded_while_foxglove_link_is_preserved():
+def test_large_conclusion_is_utf8_bounded_while_html_link_is_preserved():
     admission, contract, manifest, observed, dependencies = _bundle()
     contract["summary"]["short_conclusion"] = "候选结论" * 10_000
 
@@ -610,8 +611,8 @@ def test_large_conclusion_is_utf8_bounded_while_foxglove_link_is_preserved():
 
     content = delivery.effect_payload["comment_content"]
     assert len(content.encode("utf-8")) <= MAX_FEISHU_COMMENT_BYTES
-    assert delivery.foxglove_url in content
-    assert manifest["report_url"] not in content
+    assert manifest["report_url"] in content
+    assert delivery.foxglove_url not in content
     assert delivery.conclusion.endswith("...")
     assert {item.role for item in delivery.artifacts} == {
         "index_html",

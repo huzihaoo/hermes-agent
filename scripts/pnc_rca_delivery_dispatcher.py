@@ -32,6 +32,8 @@ from gateway.pnc_rca_delivery_contract import (
     DELIVERY_EFFECT_KIND,
     DELIVERY_EFFECT_KINDS,
     DELIVERY_EFFECT_SCHEMA_VERSION,
+    DELIVERY_EFFECT_SCHEMA_VERSION_V1,
+    DELIVERY_REPORT_LINK_KIND,
     DELIVERY_THREAD_EFFECT_KIND,
     TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
     TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1,
@@ -1583,6 +1585,17 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
     if claim.outcome != "success":
         return _validate_terminal_effect(claim)
     payload = claim.payload
+    schema_version = str(payload.get("schema_version") or "")
+    if schema_version not in {
+        DELIVERY_EFFECT_SCHEMA_VERSION_V1,
+        DELIVERY_EFFECT_SCHEMA_VERSION,
+    }:
+        raise DeliveryContractError("delivery_effect_schema_unsupported")
+    report_link_fields = (
+        {"report_link_kind"}
+        if schema_version == DELIVERY_EFFECT_SCHEMA_VERSION
+        else set()
+    )
     expected_issue_url = str(claim.issue_url or "").strip()
     issue_url_match = _FEISHU_ISSUE_URL_RE.fullmatch(expected_issue_url)
     canonical_issue_url = (
@@ -1612,7 +1625,7 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
             "viz_mcap_vm", "foxglove_url",
             "requires_human_review", "conclusion", "effect_key",
             "semantic_payload_sha256", "marker", "comment_content",
-            "field_updates",
+            "field_updates", *report_link_fields,
         }
         content_field = "comment_content"
     else:
@@ -1636,7 +1649,7 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
             "thread_id", "reply_anchor_message_id", "source_message_id",
             "requester_id", "reply_in_thread", "output_cap", "effect_key",
             "semantic_payload_sha256", "marker", "idempotency_uuid",
-            "message_content", "field_updates",
+            "message_content", "field_updates", *report_link_fields,
         }
         content_field = "message_content"
     if set(payload) != exact_payload_keys:
@@ -1650,7 +1663,7 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         work_item_id=claim.work_item_id,
     )
     expected_identity = {
-        "schema_version": DELIVERY_EFFECT_SCHEMA_VERSION,
+        "schema_version": schema_version,
         "delivery_id": claim.delivery_id,
         "effect_kind": claim.effect_kind,
         "target_key": claim.target_key,
@@ -1688,11 +1701,20 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         )
     ):
         raise DeliveryContractError("delivery_effect_foxglove_identity_mismatch")
+    if schema_version == DELIVERY_EFFECT_SCHEMA_VERSION and (
+        payload.get("report_link_kind") != DELIVERY_REPORT_LINK_KIND
+    ):
+        raise DeliveryContractError("delivery_effect_report_link_kind_invalid")
     if (
         payload.get("requires_human_review") is not True
         or payload.get("report_status") not in _VIZ_REPORT_STATUSES
     ):
         raise DeliveryContractError("delivery_effect_review_boundary_invalid")
+    expected_report_link = (
+        claim.report_url
+        if schema_version == DELIVERY_EFFECT_SCHEMA_VERSION
+        else payload.get("foxglove_url")
+    )
     expected_field_updates = [
         {
             "field_key": RCA_RESULT_FIELD_KEY,
@@ -1700,7 +1722,7 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         },
         {
             "field_key": RCA_REPORT_FIELD_KEY,
-            "field_value": payload.get("foxglove_url"),
+            "field_value": expected_report_link,
         },
     ]
     if payload.get("field_updates") != expected_field_updates:
@@ -1740,6 +1762,11 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         or content.splitlines().count(marker) != 1
     ):
         raise DeliveryContractError("delivery_effect_marker_invalid")
+    if schema_version == DELIVERY_EFFECT_SCHEMA_VERSION and (
+        content.count(claim.report_url) != 1
+        or str(payload.get("foxglove_url") or "") in content
+    ):
+        raise DeliveryContractError("delivery_effect_report_link_invalid")
     if claim.effect_kind == DELIVERY_THREAD_EFFECT_KIND:
         expected_uuid = delivery_effect_idempotency_uuid(claim.effect_key)
         if payload.get("idempotency_uuid") != expected_uuid:
@@ -1781,7 +1808,7 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
                 RCA_RESULT_FIELD_KEY,
                 str(payload.get("conclusion") or ""),
             ),
-            (RCA_REPORT_FIELD_KEY, str(payload.get("foxglove_url") or "")),
+            (RCA_REPORT_FIELD_KEY, str(expected_report_link or "")),
         ) if claim.effect_kind == DELIVERY_EFFECT_KIND else (),
         chat_id=str(payload.get("chat_id") or ""),
         thread_id=str(payload.get("thread_id") or ""),
