@@ -115,6 +115,8 @@ _PROJECT_SIMPLE_NAME_RE = object()
 class MeegleIssueCommentAdapter:
     def get_fields(self, project_key, work_item_id, field_keys): return {}
     def list_comments(self, project_key, work_item_id): return []
+    def get_fields_and_comments(self, project_key, work_item_id, field_keys):
+        return {"fields": {}, "comments": []}
 
 def verify_persisted_artifact_inventory(**kwargs): return []
 
@@ -516,6 +518,16 @@ def test_valid_plan_binds_candidates_runtime_and_gray_contract(
     assert bom["tooling"]["submission_tool"]["required_resource_class"] == (
         "rca_prod"
     )
+    assert bom["tooling"]["production_executor_present"] is True
+    execution_adapter = bom["tooling"]["governed_execution_adapter"]
+    assert execution_adapter["path"] == str(gray.GOVERNED_EXECUTION_ADAPTER_PATH)
+    assert execution_adapter["commands"] == list(
+        gray.GOVERNED_EXECUTION_ADAPTER_COMMANDS
+    )
+    assert execution_adapter["direct_control_db_writes"] is False
+    assert execution_adapter["direct_feishu_writes"] is False
+    assert execution_adapter["direct_kafka_offset_commits"] is False
+    assert execution_adapter["resident_consumer_required"] is True
     assert bom["components"]["vm"]["independent_go_receipt"]["verdict"] == "GO"
     host = bom["components"]["host"]
     assert host["independent_go_receipt"] == {
@@ -542,6 +554,9 @@ def test_valid_plan_binds_candidates_runtime_and_gray_contract(
         "api_project_key_and_url_slug_separated": True,
         "official_field_adapter": "MeegleIssueCommentAdapter.get_fields",
         "official_comment_adapter": "MeegleIssueCommentAdapter.list_comments",
+        "official_combined_adapter": (
+            "MeegleIssueCommentAdapter.get_fields_and_comments"
+        ),
         "full_content_match_call_count": 3,
         "http_artifact_verification_precedes_remote_boundary": True,
         "http_artifact_verification_call_count": 1,
@@ -570,8 +585,17 @@ def test_valid_plan_binds_candidates_runtime_and_gray_contract(
     }
     assert contract["serial_failure_fence"]["max_concurrency"] == 1
     assert contract["serial_failure_fence"]["stop_on_first_failure"] is True
-    assert contract["kafka_observation"]["enable_auto_commit"] is False
-    assert contract["kafka_observation"]["commit_api_allowed"] is False
+    exact_kafka = contract["kafka_observation"]["exact_target"]
+    assert exact_kafka["mode"] == "resident_owner_only_exact_recovery"
+    assert exact_kafka["group_id"] is None
+    assert exact_kafka["commit_api_allowed"] is False
+    assert exact_kafka["offset"] == 650
+    natural_kafka = contract["kafka_observation"]["first_natural"]
+    assert natural_kafka["mode"] == "resident_natural_canary_gate"
+    assert natural_kafka["group_id"] == "rca_root_cause_analysis_agent"
+    assert natural_kafka["max_poll_records"] == 1
+    assert natural_kafka["commit_after_durable_ingest"] is True
+    assert natural_kafka["pause_after_first_accepted"] is True
     assert contract["rca_execution"]["real_rca_required"] is True
     assert contract["delivery"]["field_keys_in_order"] == [
         "field_9193cb",
@@ -600,7 +624,9 @@ def test_valid_plan_binds_candidates_runtime_and_gray_contract(
     assert contract["delivery"]["official_readback"]["comment_adapter"] == (
         "MeegleIssueCommentAdapter.list_comments"
     )
-    assert contract["delivery"]["official_readback"]["combined_adapter"] is None
+    assert contract["delivery"]["official_readback"]["combined_adapter"] == (
+        "MeegleIssueCommentAdapter.get_fields_and_comments"
+    )
     assert contract["delivery"]["official_readback"]["api_project_key"] == (
         "68ef617fb371dc80a10641f7"
     )
@@ -929,10 +955,10 @@ def test_production_bindings_pin_current_reviewed_artifacts() -> None:
         "/Users/songying/.codex/tmp/rca-host-70c432-zero-cache"
     )
     assert gray.EXPECTED_HOST_COMMIT == (
-        "540dc0c8b6fd0ed58a919f63a17ae7d934f0f94a"
+        "ecc6c747c8abbf1f815d8783511c7f96bf080bba"
     )
     assert gray.EXPECTED_HOST_TREE == (
-        "a339f44e634ab6779b30683be3219257da10fba2"
+        "7d491dde4046138e93d874acef2c9440521d7dbe"
     )
     assert gray.EXPECTED_VM_COMMIT == (
         "4b26cc7935eb4fa0910b42abde78d7f8d4efa0d1"

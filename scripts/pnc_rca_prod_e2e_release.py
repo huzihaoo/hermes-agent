@@ -129,16 +129,16 @@ SUPERSEDED_CROSS_CONTRACT_GAP_SHA256 = (
 HOST_QUARANTINE_BASELINE_COMMIT = (
     "11b7c06af20fa0c4c09893452d4d617da3d10755"
 )
-HOST_FINAL_COMMIT = "540dc0c8b6fd0ed58a919f63a17ae7d934f0f94a"
-HOST_FINAL_TREE = "a339f44e634ab6779b30683be3219257da10fba2"
-HOST_FINAL_PARENT_COMMIT = "788f5930f9cfdbe61a67df91b719b95896f1367d"
+HOST_FINAL_COMMIT = "ecc6c747c8abbf1f815d8783511c7f96bf080bba"
+HOST_FINAL_TREE = "7d491dde4046138e93d874acef2c9440521d7dbe"
+HOST_FINAL_PARENT_COMMIT = "b354ac9d19a67eccb2eea9ee1f00b5b44e68605f"
 CANONICAL_HOST_ROOT = "/Users/songying/.codex/tmp/rca-host-70c432-zero-cache"
 HOST_CANDIDATE_IDENTITY_PATH = (
     "/Users/songying/.codex/tmp/rca-prod-e2e-release-20260721/evidence/"
-    "controlled-gray/host-independent-go-540dc0c8.json"
+    "controlled-gray/host-independent-go-ecc6c747.json"
 )
 HOST_CANDIDATE_IDENTITY_SHA256 = (
-    "517835c297b96ae21c0dddf8c2dd0f1b762172841e0bab51366a4a801da8fcc6"
+    "862e5a18f58c230e9381ac0a6126edfda2d6f5c2215e92c46198bdbe9375ef26"
 )
 CANONICAL_HOST_PYTHON = (
     "/Users/songying/.hermes/runtime/hermes-live/.venv/bin/python"
@@ -257,12 +257,14 @@ VM_WORKER_RUNTIME_FILES = (
 QUARANTINE_COUNTS = {"jobs": 39, "effects": 38, "subscriptions": 5}
 RETIRED_EXECUTOR_PATHS = (
     "scripts/pnc_rca_prod_e2e_release.py",
+    "scripts/pnc_rca_prod_execution_adapter.py",
     "scripts/pnc_rca_release_gate.py",
     "scripts/pnc_rca_store_migration_drill.py",
     "scripts/pnc_rca_cutover_execute.py",
     "scripts/pnc_rca_cutover_live.py",
     "scripts/pnc_rca_cutover_adapter.py",
     "tests/scripts/test_pnc_rca_prod_e2e_release.py",
+    "tests/scripts/test_pnc_rca_prod_execution_adapter.py",
 )
 GAP_LEDGER_FILE_SHA256 = (
     "3bb1df0a359aff4949d2d5d81b9c3de1cbf64365b1da8b204adb81a67e423368"
@@ -324,7 +326,7 @@ ACTION_SET = (
     "update_environment_and_active_binding_only_after_db_post_and_core_match",
     "restart_exact_six_host_services_and_two_vm_services",
     "verify_hermes_live_runtime_closure_and_service_program_arguments",
-    "promote_exact_kafka_partition_0_offset_650",
+    "resident_recover_exact_kafka_partition_0_offset_650_without_commit",
     "execute_rca_for_exact_issue_7051585084",
     "write_two_attribution_fields_and_one_evidence_comment",
     "read_back_exact_fields_comment_and_delivery_lineage",
@@ -6927,7 +6929,6 @@ def _validate_exact_added_lineage_graph(
         "rca_trigger_delivery_bindings": 2,
         "rca_delivery_effects": 2,
         "rca_delivery_attempts": 4,
-        "rca_shadow_promotion_audit": 1,
         "rca_host_runtime_transitions": 8,
         "rca_activation_admission_ledger": 2,
     }
@@ -7408,20 +7409,6 @@ def _validate_exact_added_lineage_graph(
             }
         )
 
-    promotion_rows = added_rows("rca_shadow_promotion_audit")
-    target_context = root_contexts[0]
-    require(
-        promotion_rows[0],
-        {
-            "event_uid": target["event_uid"],
-            "outbox_id": target_context["outbox_id"],
-            "submission_key": target["submission_key"],
-            "outcome": "promoted",
-            "from_status": "shadow",
-            "to_status": "pending",
-        },
-    )
-
     slot_contexts = [
         context for context in root_contexts if context["slot_kind"]
     ]
@@ -7639,9 +7626,6 @@ def _validate_live_database_allowed_delta(
         and row.get("submission_key") in submission_keys
         and row.get("business_key") in business_keys
         and row.get("generation") == 1,
-        "rca_shadow_promotion_audit": lambda row: row.get("event_uid")
-        == TARGET_EVENT_UID
-        and row.get("submission_key") == TARGET_SUBMISSION_KEY,
     }
     for table, predicate in predicates.items():
         delta = changes.get(table, {"added": [], "changed": []})
@@ -7657,9 +7641,9 @@ def _validate_live_database_allowed_delta(
     shadow_delta = changes.get(
         "rca_shadow_promotion_audit", {"added": [], "changed": []}
     )
-    if len(shadow_delta["added"]) != 1 or shadow_delta["changed"]:
+    if shadow_delta["added"] or shadow_delta["changed"]:
         raise ProdE2EReleaseError(
-            "prod_e2e_release_live_database_target_promotion_invalid"
+            "prod_e2e_release_live_database_unexpected_promotion"
         )
 
     progress = changes.get("kafka_partition_progress")
@@ -8163,11 +8147,26 @@ def _authorized_scope(bom: Mapping[str, Any]) -> Mapping[str, Any]:
             "required_before_target_execution": True,
             "initial_input_and_field_identity_must_match": True,
         },
-        "post_cutover_canary": {
-            "ordinary_kafka_ingest_only": True,
+        "target_exact_recovery": {
+            "resident_consumer_only": True,
             "activation_entrypoint": "kafka_ingest",
             "activation_slot_kind": "kafka_success",
             "activation_reason": "activation_bounded_slot_consumed",
+            "group_id": None,
+            "enable_auto_commit": False,
+            "commit_called": False,
+            "owner_only_request_and_receipt": True,
+            "failure_stops_ordinary_consumer": True,
+        },
+        "post_cutover_canary": {
+            "ordinary_kafka_ingest_only": True,
+            "resident_natural_gate_required": True,
+            "max_poll_records_during_gate": 1,
+            "pause_after_first_accepted": True,
+            "failure_auto_stop": True,
+            "activation_entrypoint": "kafka_ingest",
+            "activation_slot_kind": "",
+            "activation_reason": "activation_steady_active",
             "comment_terminal_outcome": "ack",
             "recovery_write_count": 0,
             "operator_recovery_provenance": [],
@@ -8176,6 +8175,7 @@ def _authorized_scope(bom: Mapping[str, Any]) -> Mapping[str, Any]:
             ),
             "fresh_exact_record_reread_required": True,
             "consumer_group_id": None,
+            "resident_consumer_group_id": "rca_root_cause_analysis_agent",
             "enable_auto_commit": False,
             "commit_called": False,
             "raw_payload_persisted": False,
@@ -8603,6 +8603,124 @@ def _validate_canary_kafka_gate(
     }
 
 
+def _validate_official_full_readback_evidence(
+    readback: Mapping[str, Any],
+    *,
+    release_id: str,
+    terminal_receipt_sha256: str,
+) -> Mapping[str, Any]:
+    owned = _read_owned_json(
+        Path(str(readback.get("evidence_path") or "")),
+        artifact="official_full_readback_evidence",
+    )
+    value = owned.body
+    expected_fields = {
+        "schema_version",
+        "release_id",
+        "adapter",
+        "source",
+        "scope",
+        "observed_at",
+        "fields",
+        "comment_id",
+        "comment_content_sha256",
+        "comment_content_utf8_bytes",
+        "marker_sha256",
+        "marker_match_count",
+        "pages_read",
+        "comments",
+        "terminal_receipt_sha256",
+        "full_bodies_persisted",
+    }
+    summary_fields = readback.get("fields")
+    evidence_fields = (
+        {
+            key: {
+                "value_sha256": item.get("sha256"),
+                "value_utf8_bytes": item.get("utf8_bytes"),
+            }
+            for key, item in value.get("fields", {}).items()
+            if isinstance(item, Mapping)
+        }
+        if isinstance(value.get("fields"), Mapping)
+        else None
+    )
+    comments = value.get("comments")
+    designated_comments = (
+        [
+            item
+            for item in comments
+            if isinstance(item, Mapping)
+            and item.get("comment_id") == value.get("comment_id")
+        ]
+        if isinstance(comments, list)
+        else []
+    )
+    if (
+        owned.sha256 != readback.get("evidence_sha256")
+        or set(value) != expected_fields
+        or value.get("schema_version") != "pnc_rca_official_full_readback_v1"
+        or value.get("release_id") != release_id
+        or value.get("adapter") != readback.get("adapter")
+        or value.get("source") != readback.get("source")
+        or value.get("scope") != readback.get("scope")
+        or value.get("observed_at") != readback.get("observed_at")
+        or evidence_fields != summary_fields
+        or value.get("comment_id") != readback.get("comment_id")
+        or value.get("comment_content_sha256")
+        != readback.get("comment_content_sha256")
+        or value.get("marker_sha256") != readback.get("marker_sha256")
+        or value.get("marker_match_count") != 1
+        or value.get("terminal_receipt_sha256") != terminal_receipt_sha256
+        or value.get("full_bodies_persisted") is not False
+        or isinstance(value.get("comment_content_utf8_bytes"), bool)
+        or not isinstance(value.get("comment_content_utf8_bytes"), int)
+        or value.get("comment_content_utf8_bytes", 0) < 1
+        or isinstance(value.get("pages_read"), bool)
+        or not isinstance(value.get("pages_read"), int)
+        or value.get("pages_read", 0) < 1
+        or not isinstance(comments, list)
+        or not comments
+        or len(comments) != len(
+            {str(item.get("comment_id") or "") for item in comments if isinstance(item, Mapping)}
+        )
+        or any(
+            not isinstance(item, Mapping)
+            or set(item)
+            != {
+                "comment_id",
+                "content_sha256",
+                "content_utf8_bytes",
+                "marker_match_count",
+            }
+            or not _required_text(
+                item.get("comment_id"), field="full_readback_comment_id"
+            )
+            or _sha256(
+                item.get("content_sha256"), field="full_readback_comment_sha256"
+            )
+            != item.get("content_sha256")
+            or isinstance(item.get("content_utf8_bytes"), bool)
+            or not isinstance(item.get("content_utf8_bytes"), int)
+            or item.get("content_utf8_bytes", -1) < 0
+            or isinstance(item.get("marker_match_count"), bool)
+            or not isinstance(item.get("marker_match_count"), int)
+            or item.get("marker_match_count", -1) < 0
+            for item in comments
+        )
+        or sum(int(item["marker_match_count"]) for item in comments) != 1
+        or len(designated_comments) != 1
+        or designated_comments[0].get("content_sha256")
+        != value.get("comment_content_sha256")
+        or designated_comments[0].get("content_utf8_bytes")
+        != value.get("comment_content_utf8_bytes")
+    ):
+        raise ProdE2EReleaseError(
+            "prod_e2e_release_official_full_readback_evidence_invalid"
+        )
+    return {"path": str(owned.path), "sha256": owned.sha256}
+
+
 def _validate_canary_remote_closeout(
     canary: Any,
     *,
@@ -8628,6 +8746,7 @@ def _validate_canary_remote_closeout(
         "delivery_source",
         "recovery_write_count",
         "operator_recovery_provenance",
+        "resident_canary_receipt",
         "kafka_preread",
         "observed_at",
         "terminal_at",
@@ -8713,11 +8832,54 @@ def _validate_canary_remote_closeout(
         expected_entrypoint="kafka_ingest",
     )
     if (
-        activation.get("slot_kind") != "kafka_success"
-        or activation.get("reason") != "activation_bounded_slot_consumed"
+        activation.get("slot_kind") != ""
+        or activation.get("reason") != "activation_steady_active"
     ):
         raise ProdE2EReleaseError(
             "prod_e2e_release_post_cutover_canary_activation_invalid"
+        )
+    resident_reference = canary.get("resident_canary_receipt")
+    if not isinstance(resident_reference, Mapping) or set(resident_reference) != {
+        "path",
+        "sha256",
+    }:
+        raise ProdE2EReleaseError(
+            "prod_e2e_release_natural_resident_receipt_invalid"
+        )
+    resident_owned = _read_owned_json(
+        Path(str(resident_reference.get("path") or "")),
+        artifact="natural_resident_receipt",
+    )
+    resident = resident_owned.body
+    if (
+        resident_owned.sha256 != resident_reference.get("sha256")
+        or resident.get("schema_version")
+        != "pnc_rca_natural_kafka_canary_receipt_v1"
+        or resident.get("release_id") != request["release_id"]
+        or resident.get("epoch_id")
+        != request["release_bom"]["bootstrap_authorization"][
+            "bootstrap_epoch_id"
+        ]
+        or resident.get("topic") != canary.get("topic")
+        or resident.get("partition") != canary.get("partition")
+        or resident.get("offset") != canary.get("offset")
+        or resident.get("event_uid") != canary.get("event_uid")
+        or resident.get("business_key") != canary.get("business_key")
+        or resident.get("submission_key") != canary.get("submission_key")
+        or resident.get("generation") != 1
+        or resident.get("decision") != "accepted"
+        or resident.get("activation_reason") != "activation_steady_active"
+        or resident.get("consumer_group_id") != "rca_root_cause_analysis_agent"
+        or resident.get("kafka_offset_committed") is not True
+        or resident.get("next_ordinary_record_held") is not True
+        or _sha256(
+            resident.get("resident_runtime_identity_sha256"),
+            field="natural_resident_runtime_identity_sha256",
+        )
+        != resident.get("resident_runtime_identity_sha256")
+    ):
+        raise ProdE2EReleaseError(
+            "prod_e2e_release_natural_resident_receipt_invalid"
         )
     host = request["release_bom"]["host_runtime"]["canonical_final"]
     live_kafka = _observe_kafka_record_live(
@@ -8876,6 +9038,8 @@ def _validate_canary_remote_closeout(
             "comment_content_sha256",
             "marker_sha256",
             "marker_match_count",
+            "evidence_path",
+            "evidence_sha256",
         }
         or readback.get("adapter")
         != "MeegleIssueCommentAdapter.get_fields_and_comments"
@@ -8916,6 +9080,11 @@ def _validate_canary_remote_closeout(
         raise ProdE2EReleaseError(
             "prod_e2e_release_canary_official_readback_invalid"
         )
+    _validate_official_full_readback_evidence(
+        readback,
+        release_id=request["release_id"],
+        terminal_receipt_sha256=str(canary["terminal_receipt_sha256"]),
+    )
 
     live_readback = _observe_official_meegle_readback_live(
         project_key=str(canary["project_key"]),
@@ -9629,8 +9798,15 @@ def _validate_completion_receipt(
         target.get("activation"),
         request=request,
         root=target,
-        expected_entrypoint="shadow_promotion",
+        expected_entrypoint="kafka_ingest",
     )
+    if (
+        target_activation.get("slot_kind") != "kafka_success"
+        or target_activation.get("reason") != "activation_bounded_slot_consumed"
+    ):
+        raise ProdE2EReleaseError(
+            "prod_e2e_release_target_activation_invalid"
+        )
     target = {**dict(target), "activation": target_activation}
     expected_fields = bundle_verification["field_values"]
     writes = body.get("field_writes")
@@ -9697,6 +9873,8 @@ def _validate_completion_receipt(
             "comment_content_sha256",
             "marker_sha256",
             "marker_match_count",
+            "evidence_path",
+            "evidence_sha256",
         }
         or readback.get("adapter") != "MeegleIssueCommentAdapter.get_fields_and_comments"
         or readback.get("source") != "official_meegle_api"
@@ -9728,6 +9906,11 @@ def _validate_completion_receipt(
         ]]
     ) or readback_at > observed_at:
         raise ProdE2EReleaseError("prod_e2e_release_official_readback_invalid")
+    _validate_official_full_readback_evidence(
+        readback,
+        release_id=request["release_id"],
+        terminal_receipt_sha256=str(target["terminal_receipt_sha256"]),
+    )
     host_identity = request["release_bom"]["host_runtime"]["canonical_final"]
     live_readback = _observe_official_meegle_readback_live(
         project_key=TARGET_PROJECT_KEY,
@@ -11337,7 +11520,7 @@ def build_blocker_bom(*, now: datetime, verified_test_count: int) -> Mapping[str
             },
         },
         "required_fresh_artifacts": [
-            "final_540dc0c8_4b26cc79_manifest_html_cross_contract_receipt",
+            "final_ecc6c747_4b26cc79_manifest_html_cross_contract_receipt",
             "fresh_component_binding_with_exact_dns_tls_and_vm_env_identity",
             "fresh_live_kafka_p0_o650_preread_receipt",
             "fresh_viewer_proxy_live_http_tls_browser_receipt",

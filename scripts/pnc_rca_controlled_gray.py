@@ -36,6 +36,9 @@ TARGET_API_PROJECT_KEY = "68ef617fb371dc80a10641f7"
 TARGET_PROJECT_SIMPLE_NAME = "t03o4q"
 TARGET_WORK_ITEM_TYPE_KEY = "issue"
 TARGET_WORK_ITEM_ID = "7051585084"
+TARGET_TOPIC = "feishu-project-workflow-event"
+TARGET_PARTITION = 0
+TARGET_OFFSET = 650
 TARGET_ISSUE_URL = (
     "https://project.feishu.cn/t03o4q/issue/detail/7051585084"
 )
@@ -46,6 +49,9 @@ REPORT_MANIFEST_SCHEMA_VERSION = "delivery_manifest_v2"
 REPORT_ROUTE_PREFIX = "/G1Q3_RCA/cases/"
 OFFICIAL_FIELD_READBACK_ADAPTER = "MeegleIssueCommentAdapter.get_fields"
 OFFICIAL_COMMENT_READBACK_ADAPTER = "MeegleIssueCommentAdapter.list_comments"
+OFFICIAL_COMBINED_READBACK_ADAPTER = (
+    "MeegleIssueCommentAdapter.get_fields_and_comments"
+)
 
 CANONICAL_RESOURCE_PATH = Path.home() / ".local/bin/ssh-mini-resource"
 CANONICAL_SUBMIT_PATH = Path.home() / ".local/bin/ssh-mini-submit"
@@ -56,18 +62,28 @@ CANONICAL_CAPACITY_VALIDATOR_PATH = (
 CANONICAL_CAPACITY_AUTHORIZATION_PATH = (
     Path.home() / ".ssh-mini/rca-capacity-authorization.json"
 )
+GOVERNED_EXECUTION_ADAPTER_PATH = (
+    REPO_ROOT / "scripts/pnc_rca_prod_execution_adapter.py"
+)
+GOVERNED_EXECUTION_ADAPTER_COMMANDS = (
+    "build-exact-request",
+    "validate-exact-receipt",
+    "official-readback",
+    "build-natural-gate",
+    "select-first-natural",
+)
 RESOURCE_CLASS = "rca_prod"
 CAPACITY_MODE = "steady"
 
 EXPECTED_HOST_ROOT = "/Users/songying/.codex/tmp/rca-host-70c432-zero-cache"
-EXPECTED_HOST_COMMIT = "540dc0c8b6fd0ed58a919f63a17ae7d934f0f94a"
-EXPECTED_HOST_TREE = "a339f44e634ab6779b30683be3219257da10fba2"
+EXPECTED_HOST_COMMIT = "ecc6c747c8abbf1f815d8783511c7f96bf080bba"
+EXPECTED_HOST_TREE = "7d491dde4046138e93d874acef2c9440521d7dbe"
 EXPECTED_HOST_GO_RECEIPT_PATH = (
     "/Users/songying/.codex/tmp/rca-prod-e2e-release-20260721/evidence/"
-    "controlled-gray/host-independent-go-540dc0c8.json"
+    "controlled-gray/host-independent-go-ecc6c747.json"
 )
 EXPECTED_HOST_GO_RECEIPT_SHA256 = (
-    "517835c297b96ae21c0dddf8c2dd0f1b762172841e0bab51366a4a801da8fcc6"
+    "862e5a18f58c230e9381ac0a6126edfda2d6f5c2215e92c46198bdbe9375ef26"
 )
 EXPECTED_VM_ROOT = (
     "/home/mini/.hermes/rca-prod-runtime/releases/"
@@ -146,9 +162,9 @@ HOST_GO_RECEIPT_FIELDS = {
 HOST_GO_EXPECTED_BLOCKERS = (
     "regular_rca_prod_capacity_authorization_absent",
     "canonical_capacity_policy_requires_at_least_20_zero_materialized_successful_samples_over_at_least_7_days",
+    "canonical_public_dns_tls_same_origin_route_absent",
     "exact_7051585084_has_no_trigger_outbox_watch_delivery_effect_or_official_postback",
     "first_natural_kafka_controlled_gray_not_completed",
-    "production_executor_not_present_or_independently_audited",
     "host_candidate_not_deployed_to_live_runtime",
 )
 RUNTIME_SCOPE_NAMES = (
@@ -722,7 +738,7 @@ def _validate_host_delivery_capabilities(
     if "project_simple_name" not in _node_strings(base_semantic_fields):
         raise ControlledGrayError("controlled_gray_host_delivery_capability_invalid")
 
-    for method in ("get_fields", "list_comments"):
+    for method in ("get_fields", "list_comments", "get_fields_and_comments"):
         _definition(
             dispatcher_tree,
             method,
@@ -836,6 +852,7 @@ def _validate_host_delivery_capabilities(
         "api_project_key_and_url_slug_separated": True,
         "official_field_adapter": OFFICIAL_FIELD_READBACK_ADAPTER,
         "official_comment_adapter": OFFICIAL_COMMENT_READBACK_ADAPTER,
+        "official_combined_adapter": OFFICIAL_COMBINED_READBACK_ADAPTER,
         "full_content_match_call_count": len(confirmed_lines),
         "http_artifact_verification_precedes_remote_boundary": True,
         "http_artifact_verification_call_count": len(verification_lines),
@@ -1186,13 +1203,32 @@ def _execution_contract() -> dict[str, Any]:
             "target_readback_must_pass_before_canary": True,
         },
         "kafka_observation": {
-            "assignment": "explicit_single_partition",
-            "group_id": None,
-            "enable_auto_commit": False,
-            "commit_api_allowed": False,
-            "commit_called": False,
-            "offset_store_mutation_allowed": False,
-            "first_natural_canary_selected_once": True,
+            "exact_target": {
+                "mode": "resident_owner_only_exact_recovery",
+                "assignment": "explicit_single_partition",
+                "topic": TARGET_TOPIC,
+                "partition": TARGET_PARTITION,
+                "offset": TARGET_OFFSET,
+                "group_id": None,
+                "enable_auto_commit": False,
+                "commit_api_allowed": False,
+                "commit_called": False,
+                "offset_store_mutation_allowed": False,
+                "activation_slot_kind": "kafka_success",
+            },
+            "first_natural": {
+                "mode": "resident_natural_canary_gate",
+                "delivery_source": "ordinary_kafka_ingest",
+                "group_id": "rca_root_cause_analysis_agent",
+                "enable_auto_commit": False,
+                "commit_api_allowed": True,
+                "commit_after_durable_ingest": True,
+                "max_poll_records": 1,
+                "pause_after_first_accepted": True,
+                "failure_auto_stop": True,
+                "activation_slot_kind": "",
+                "activation_reason": "activation_steady_active",
+            },
         },
         "rca_execution": {
             "resource_class": RESOURCE_CLASS,
@@ -1255,7 +1291,7 @@ def _execution_contract() -> dict[str, Any]:
                 "required": True,
                 "field_adapter": OFFICIAL_FIELD_READBACK_ADAPTER,
                 "comment_adapter": OFFICIAL_COMMENT_READBACK_ADAPTER,
-                "combined_adapter": None,
+                "combined_adapter": OFFICIAL_COMBINED_READBACK_ADAPTER,
                 "source": "official_meegle_api",
                 "api_project_key": TARGET_API_PROJECT_KEY,
                 "project_simple_name_for_url_only": TARGET_PROJECT_SIMPLE_NAME,
@@ -1312,6 +1348,20 @@ def _build_bom(spec: Mapping[str, Any], *, now: datetime) -> dict[str, Any]:
         artifact="submit_tool",
         maximum=MAX_SOURCE_BYTES,
     )
+    adapter_raw, adapter_sha = _read_stable_file(
+        GOVERNED_EXECUTION_ADAPTER_PATH,
+        artifact="execution_adapter",
+        maximum=MAX_SOURCE_BYTES,
+    )
+    adapter_tree = _source_tree(adapter_raw, artifact="execution_adapter")
+    for function_name in (
+        "build_exact_request",
+        "validate_exact_receipt",
+        "official_full_readback",
+        "build_natural_gate",
+        "select_first_natural",
+    ):
+        _definition(adapter_tree, function_name)
     bom: dict[str, Any] = {
         "schema_version": BOM_SCHEMA_VERSION,
         "release_id": normalized["release_id"],
@@ -1320,7 +1370,17 @@ def _build_bom(spec: Mapping[str, Any], *, now: datetime) -> dict[str, Any]:
             "sha256": source_sha,
             "size_bytes": len(source_raw),
             "mode": "validate_plan_only",
-            "production_executor_present": False,
+            "production_executor_present": True,
+            "governed_execution_adapter": {
+                "path": str(GOVERNED_EXECUTION_ADAPTER_PATH),
+                "sha256": adapter_sha,
+                "size_bytes": len(adapter_raw),
+                "commands": list(GOVERNED_EXECUTION_ADAPTER_COMMANDS),
+                "direct_control_db_writes": False,
+                "direct_feishu_writes": False,
+                "direct_kafka_offset_commits": False,
+                "resident_consumer_required": True,
+            },
             "submission_tool": {
                 "path": str(CANONICAL_SUBMIT_PATH.absolute()),
                 "sha256": submit_sha,

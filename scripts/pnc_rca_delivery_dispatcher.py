@@ -1081,6 +1081,34 @@ class MeegleIssueCommentAdapter:
             }
         return {"success": True, "fields": normalized}
 
+    def get_fields_and_comments(
+        self,
+        project_key: str,
+        work_item_id: str,
+        field_keys: tuple[str, ...] = (
+            RCA_RESULT_FIELD_KEY,
+            RCA_REPORT_FIELD_KEY,
+        ),
+    ) -> Mapping[str, Any]:
+        """Return one all-or-nothing official fields plus full comments read."""
+        fields = self.get_fields(project_key, work_item_id, field_keys)
+        if fields.get("success") is not True:
+            return fields
+        comments = self.list_comments(project_key, work_item_id)
+        if comments.get("success") is not True:
+            return comments
+        return {
+            "success": True,
+            "source": "official_meegle_api",
+            "scope": {
+                "project_key": str(project_key),
+                "work_item_id": str(work_item_id),
+            },
+            "fields": dict(fields["fields"]),
+            "comments": [dict(item) for item in comments["comments"]],
+            "pages_read": int(comments["pages_read"]),
+        }
+
     def update_fields(
         self,
         project_key: str,

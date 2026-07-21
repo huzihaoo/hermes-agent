@@ -848,7 +848,7 @@ def test_build_request_binds_new_host_services_report_and_distinct_approval(rele
     request = json.loads(release_fixture["request"].read_text())
     bom = request["bindings"]["release_bom"]
     assert bom["host_runtime"]["canonical_final"]["commit"] == release.HOST_FINAL_COMMIT
-    assert release.HOST_FINAL_COMMIT == "540dc0c8b6fd0ed58a919f63a17ae7d934f0f94a"
+    assert release.HOST_FINAL_COMMIT == "ecc6c747c8abbf1f815d8783511c7f96bf080bba"
     assert len(bom["restart_scope"]["host_launchd_labels"]) == 6
     assert "local.pnc.completion-notice-relay" in bom["restart_scope"]["host_launchd_labels"]
     assert bom["restart_scope"]["vm_systemd_units"] == list(release.VM_SERVICE_UNITS)
@@ -1405,15 +1405,15 @@ def _delta_context() -> tuple[dict, dict, dict, dict]:
     }
     target["activation"] = _delta_activation(
         target,
-        entrypoint="shadow_promotion",
-        slot_kind="",
-        reason="activation_confirmed_shadow_reconciliation",
+        entrypoint="kafka_ingest",
+        slot_kind="kafka_success",
+        reason="activation_bounded_slot_consumed",
     )
     canary["activation"] = _delta_activation(
         canary,
         entrypoint="kafka_ingest",
-        slot_kind="kafka_success",
-        reason="activation_bounded_slot_consumed",
+        slot_kind="",
+        reason="activation_steady_active",
     )
     runtime_files = {
         entrypoint: "89" * 32
@@ -1434,7 +1434,7 @@ def _delta_context() -> tuple[dict, dict, dict, dict]:
     return target, canary, host, processes
 
 
-def _create_delta_database(path: Path, *, canary: dict) -> None:
+def _create_delta_database(path: Path, *, target: dict) -> None:
     conn = sqlite3.connect(path)
     conn.executescript(
         """
@@ -1541,7 +1541,7 @@ def _create_delta_database(path: Path, *, canary: dict) -> None:
             EPOCH_ID,
             "kafka_success",
             "kafka",
-            canary["activation"]["source_identity_sha256"],
+            target["activation"]["source_identity_sha256"],
         ),
     )
     conn.commit()
@@ -1660,15 +1660,10 @@ def _add_allowed_delta(
                 (root["submission_key"], root["business_key"], label, kind, entity, json.dumps(identity, sort_keys=True, separators=(",", ":")), release._sha256_value(identity), NOW.isoformat()),
             )
         contexts.append((root, ledger_id, outbox_id))
-    target_root, _target_ledger, target_outbox = contexts[0]
-    conn.execute(
-        "INSERT INTO rca_shadow_promotion_audit(event_uid,outbox_id,submission_key,outcome,from_status,to_status) VALUES(?,?,?,'promoted','shadow','pending')",
-        (target_root["event_uid"], target_outbox, target_root["submission_key"]),
-    )
-    canary_ledger = contexts[1][1]
+    target_ledger = contexts[0][1]
     conn.execute(
         "UPDATE rca_activation_budget_slots SET consumed_ledger_id=?,consumed_at=? WHERE epoch_id=? AND slot_kind='kafka_success'",
-        (canary_ledger, NOW.isoformat(), EPOCH_ID),
+        (target_ledger, NOW.isoformat(), EPOCH_ID),
     )
     conn.execute(
         "UPDATE kafka_partition_progress SET durable_next_offset=?,last_event_uid=?,updated_at=? WHERE topic=? AND partition_id=?",
@@ -1682,7 +1677,7 @@ def _prepare_delta(tmp_path: Path) -> tuple[Path, Path, dict, dict, dict, dict]:
     baseline = tmp_path / "cutover.sqlite3"
     live = tmp_path / "live.sqlite3"
     target, canary, host, processes = _delta_context()
-    _create_delta_database(baseline, canary=canary)
+    _create_delta_database(baseline, target=target)
     shutil.copy2(baseline, live)
     _add_allowed_delta(
         live,
@@ -2678,9 +2673,9 @@ def test_success_closeout_validates_actual_fields_comment_readback_lineage_and_c
     }
     target["activation"] = _delta_activation(
         target,
-        entrypoint="shadow_promotion",
-        slot_kind="",
-        reason="activation_confirmed_shadow_reconciliation",
+        entrypoint="kafka_ingest",
+        slot_kind="kafka_success",
+        reason="activation_bounded_slot_consumed",
     )
     writes = [
         {"field_key": key, "value_sha256": value["sha256"], "value_utf8_bytes": value["utf8_bytes"], "written_at": (times[-1] + timedelta(seconds=2)).isoformat()}
@@ -2688,6 +2683,36 @@ def test_success_closeout_validates_actual_fields_comment_readback_lineage_and_c
     ]
     comment = {"comment_id": "comment-actual-7051585084", "content_sha256": comment_value["sha256"], "content_utf8_bytes": comment_value["utf8_bytes"], "written_at": (times[-1] + timedelta(seconds=3)).isoformat(), "attempt_terminal_outcome": "ack"}
     readback = {"adapter": "MeegleIssueCommentAdapter.get_fields_and_comments", "source": "official_meegle_api", "scope": {"project_key": release.TARGET_PROJECT_KEY, "work_item_id": release.TARGET_WORK_ITEM_ID}, "observed_at": (times[-1] + timedelta(seconds=4)).isoformat(), "fields": {item["field_key"]: {"value_sha256": item["value_sha256"], "value_utf8_bytes": item["value_utf8_bytes"]} for item in writes}, "comment_id": comment["comment_id"], "comment_content_sha256": comment["content_sha256"], "marker_sha256": marker_value["sha256"], "marker_match_count": 1}
+    target_readback_evidence = _write_json(
+        tmp_path / "target-full-readback.json",
+        {
+            "schema_version": "pnc_rca_official_full_readback_v1",
+            "release_id": RELEASE_ID,
+            "adapter": readback["adapter"],
+            "source": readback["source"],
+            "scope": readback["scope"],
+            "observed_at": readback["observed_at"],
+            "fields": field_values,
+            "comment_id": comment["comment_id"],
+            "comment_content_sha256": comment["content_sha256"],
+            "comment_content_utf8_bytes": comment["content_utf8_bytes"],
+            "marker_sha256": marker_value["sha256"],
+            "marker_match_count": 1,
+            "pages_read": 1,
+            "comments": [{
+                "comment_id": comment["comment_id"],
+                "content_sha256": comment["content_sha256"],
+                "content_utf8_bytes": comment["content_utf8_bytes"],
+                "marker_match_count": 1,
+            }],
+            "terminal_receipt_sha256": target["terminal_receipt_sha256"],
+            "full_bodies_persisted": False,
+        },
+    )
+    readback.update({
+        "evidence_path": str(target_readback_evidence),
+        "evidence_sha256": _sha(target_readback_evidence),
+    })
     lineage = {"business_key": release.TARGET_BUSINESS_KEY, "submission_key": target["submission_key"], "task_id": target["task_id"], "delivery_id": target["delivery_id"], "effect_key": target["effect_key"], "semantic_payload_sha256": target["semantic_payload_sha256"], "artifact_set_id": target["artifact_set_id"], "terminal_receipt_sha256": target["terminal_receipt_sha256"], "field_keys": list(release.TARGET_FIELD_KEYS), "comment_id": comment["comment_id"], "attempt_terminal_outcome": "ack"}
     lineage["lineage_sha256"] = release._sha256_value(lineage)
     canary_writes = [
@@ -2696,6 +2721,36 @@ def test_success_closeout_validates_actual_fields_comment_readback_lineage_and_c
     ]
     canary_comment = {"comment_id": "comment-canary", "content_sha256": canary_comment_value["sha256"], "content_utf8_bytes": canary_comment_value["utf8_bytes"], "written_at": (times[-1] + timedelta(seconds=7)).isoformat(), "attempt_terminal_outcome": "ack"}
     canary_readback = {"adapter": "MeegleIssueCommentAdapter.get_fields_and_comments", "source": "official_meegle_api", "scope": {"project_key": release.TARGET_PROJECT_KEY, "work_item_id": "7059999999"}, "observed_at": (times[-1] + timedelta(seconds=8)).isoformat(), "fields": {item["field_key"]: {"value_sha256": item["value_sha256"], "value_utf8_bytes": item["value_utf8_bytes"]} for item in canary_writes}, "comment_id": canary_comment["comment_id"], "comment_content_sha256": canary_comment["content_sha256"], "marker_sha256": canary_marker_value["sha256"], "marker_match_count": 1}
+    canary_readback_evidence = _write_json(
+        tmp_path / "canary-full-readback.json",
+        {
+            "schema_version": "pnc_rca_official_full_readback_v1",
+            "release_id": RELEASE_ID,
+            "adapter": canary_readback["adapter"],
+            "source": canary_readback["source"],
+            "scope": canary_readback["scope"],
+            "observed_at": canary_readback["observed_at"],
+            "fields": canary_field_values,
+            "comment_id": canary_comment["comment_id"],
+            "comment_content_sha256": canary_comment["content_sha256"],
+            "comment_content_utf8_bytes": canary_comment["content_utf8_bytes"],
+            "marker_sha256": canary_marker_value["sha256"],
+            "marker_match_count": 1,
+            "pages_read": 1,
+            "comments": [{
+                "comment_id": canary_comment["comment_id"],
+                "content_sha256": canary_comment["content_sha256"],
+                "content_utf8_bytes": canary_comment["content_utf8_bytes"],
+                "marker_match_count": 1,
+            }],
+            "terminal_receipt_sha256": _sha(canary_bundle_path),
+            "full_bodies_persisted": False,
+        },
+    )
+    canary_readback.update({
+        "evidence_path": str(canary_readback_evidence),
+        "evidence_sha256": _sha(canary_readback_evidence),
+    })
     canary_lineage = {"business_key": "canary-business", "submission_key": "canary-submission", "task_id": "canary-submission", "delivery_id": canary_bundle["delivery_id"], "effect_key": canary_bundle["effect_key"], "semantic_payload_sha256": canary_bundle["semantic_payload_sha256"], "artifact_set_id": canary_bundle["artifact_set_id"], "terminal_receipt_sha256": _sha(canary_bundle_path), "field_keys": list(release.TARGET_FIELD_KEYS), "comment_id": canary_comment["comment_id"], "attempt_terminal_outcome": "ack"}
     canary_lineage["lineage_sha256"] = release._sha256_value(canary_lineage)
     kafka_recorded_at = times[-1] + timedelta(seconds=2)
@@ -2714,9 +2769,36 @@ def test_success_closeout_validates_actual_fields_comment_readback_lineage_and_c
     canary["activation"] = _delta_activation(
         canary,
         entrypoint="kafka_ingest",
-        slot_kind="kafka_success",
-        reason="activation_bounded_slot_consumed",
+        slot_kind="",
+        reason="activation_steady_active",
     )
+    natural_receipt_path = _write_json(
+        tmp_path / "natural-canary-receipt.json",
+        {
+            "schema_version": "pnc_rca_natural_kafka_canary_receipt_v1",
+            "release_id": RELEASE_ID,
+            "epoch_id": EPOCH_ID,
+            "request_sha256": "a1" * 32,
+            "selected_at": (times[-1] + timedelta(seconds=5)).isoformat(),
+            "topic": canary["topic"],
+            "partition": canary["partition"],
+            "offset": canary["offset"],
+            "event_uid": canary["event_uid"],
+            "business_key": canary["business_key"],
+            "submission_key": canary["submission_key"],
+            "generation": 1,
+            "decision": "accepted",
+            "activation_reason": "activation_steady_active",
+            "consumer_group_id": "rca_root_cause_analysis_agent",
+            "kafka_offset_committed": True,
+            "resident_runtime_identity_sha256": "a2" * 32,
+            "next_ordinary_record_held": True,
+        },
+    )
+    canary["resident_canary_receipt"] = {
+        "path": str(natural_receipt_path),
+        "sha256": _sha(natural_receipt_path),
+    }
     observed = times[-1] + timedelta(seconds=10)
     monkeypatch.setattr(
         release,
@@ -2777,6 +2859,30 @@ def test_success_closeout_validates_actual_fields_comment_readback_lineage_and_c
     assert result["production_completed"] is True
     assert result["comment_id"] == comment["comment_id"]
     assert result["canary_event_uid"] == canary["event_uid"]
+    mismatched_full_body = json.loads(
+        target_readback_evidence.read_text(encoding="utf-8")
+    )
+    mismatched_full_body["comments"][0]["content_sha256"] = "0" * 64
+    mismatched_full_body_path = _write_json(
+        tmp_path / "target-full-readback-mismatched.json", mismatched_full_body
+    )
+    mismatched_readback = copy.deepcopy(body)
+    mismatched_readback["official_readback"]["evidence_path"] = str(
+        mismatched_full_body_path
+    )
+    mismatched_readback["official_readback"]["evidence_sha256"] = _sha(
+        mismatched_full_body_path
+    )
+    with pytest.raises(
+        release.ProdE2EReleaseError,
+        match="official_full_readback_evidence_invalid",
+    ):
+        release._validate_completion_receipt(
+            release.OwnedJson(completion_path, b"{}", mismatched_readback),
+            request=request,
+            final_validation=final_owned,
+            now=observed,
+        )
     duplicate_marker = copy.deepcopy(body)
     duplicate_marker["post_cutover_canary"]["official_readback"][
         "marker_match_count"
@@ -2879,17 +2985,16 @@ def test_forged_final_validation_receipt_cannot_authorize_completion(tmp_path):
         release._validate_final_validation_receipt(_owned(forged), request=request, execution_started_at=NOW, now=NOW)
 
 
-def test_real_zero_cache_host_and_live_dependency_probe_are_read_only_smokes():
+def test_real_zero_cache_host_probe_rejects_stale_diagnostic_prereads():
     host = release._observe_canonical_host_binding(expected_commit=release.HOST_FINAL_COMMIT, expected_tree=release.HOST_FINAL_TREE)
     dependency = release._observe_host_dependency_environment()
-    prereads = release._validate_diagnostic_target_prereads()
     assert host["commit"] == release.HOST_FINAL_COMMIT
     assert dependency["site_packages_file_count"] > 1000
     assert dependency["installed_distribution_count"] > 1
-    assert prereads["kafka"]["raw_sha256_matches"] is True
-    assert prereads["kafka"]["authorizes_release"] is False
-    assert prereads["official"]["field_preread"]["both_fields_empty"] is True
-    assert prereads["official"]["comment_preread"]["total_comment_count"] == 0
+    with pytest.raises(
+        release.ProdE2EReleaseError, match="diagnostic_preread_invalid"
+    ):
+        release._validate_diagnostic_target_prereads()
 
 
 def test_blocker_bom_exposes_validated_final_closure(monkeypatch):

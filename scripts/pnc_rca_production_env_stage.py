@@ -160,6 +160,10 @@ FIXED_PRODUCTION_VALUES = {
 STATE_PATH_NAMES = {
     "HERMES_RCA_KAFKA_CONTROL_DB_PATH": "control.sqlite3",
     "HERMES_RCA_KAFKA_HEALTH_PATH": "consumer_health.json",
+    "HERMES_RCA_KAFKA_EXACT_RECOVERY_REQUEST_PATH": (
+        "exact-recovery-request.json"
+    ),
+    "HERMES_RCA_KAFKA_NATURAL_CANARY_GATE_PATH": "natural-canary-gate.json",
     "HERMES_RCA_OUTBOX_CONTROL_DB_PATH": "control.sqlite3",
     "HERMES_RCA_OUTBOX_DELIVERY_DB_PATH": "control.sqlite3",
     "HERMES_RCA_OUTBOX_HEALTH_PATH": "outbox_dispatcher_health.json",
