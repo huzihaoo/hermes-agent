@@ -35,6 +35,8 @@ AUTO_ROLLBACK_RECEIPT_SCHEMA_VERSION = (
 )
 AUTHORIZATION_DECISION = "authorize_exact_rca_vm_and_worker_promotion"
 ACTION_SET = (
+    "require_self_contained_detached_candidate",
+    "verify_candidate_commit_tree_and_reachable_closure",
     "stop_vm_worker_scheduler",
     "verify_no_active_rca_or_worker_child",
     "snapshot_vm_and_worker_tracked_closure",
@@ -457,6 +459,8 @@ def _validate_observation(
             or candidate.get("head") != spec["desired_commit"]
             or candidate.get("tree") != spec["desired_tree"]
             or candidate.get("tree_clean") is not True
+            or candidate.get("detached_head") is not True
+            or candidate.get("git_storage", {}).get("self_contained") is not True
             or candidate.get("entrypoint", {}).get("sha256")
             != spec["entrypoint_sha256"]
             or target.get("root") != spec["target_root"]
@@ -885,11 +889,9 @@ def rollback_promotion(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for name in ("validate-manifest", "plan", "apply", "rollback"):
+    for name in ("validate-manifest", "plan"):
         command = subparsers.add_parser(name)
         command.add_argument("--manifest", type=Path, required=True)
-        if name in {"apply", "rollback"}:
-            command.add_argument("--authorization-decision", required=True)
     return parser
 
 
@@ -898,16 +900,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     inputs = load_manifest(args.manifest)
     if args.command == "validate-manifest":
         result = {"ok": True, "production_effects_executed": False}
-    elif args.command == "plan":
-        result = build_plan(inputs)
-    elif args.command == "apply":
-        result = apply_promotion(
-            inputs, authorization_decision=args.authorization_decision
-        )
     else:
-        result = rollback_promotion(
-            inputs, authorization_decision=args.authorization_decision
-        )
+        result = build_plan(inputs)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0
 

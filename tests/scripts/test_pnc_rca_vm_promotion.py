@@ -107,6 +107,8 @@ def _observation(request: dict) -> dict:
                 "head": spec["desired_commit"],
                 "tree": spec["desired_tree"],
                 "tree_clean": True,
+                "detached_head": True,
+                "git_storage": {"self_contained": True},
                 "entrypoint": {"sha256": spec["entrypoint_sha256"]},
             },
             "target": {
@@ -190,6 +192,36 @@ def test_build_plan_binds_bom_candidates_live_prestate_and_helper(fixture):
         inputs.vm_topic_extractor_sha256
     )
     assert inputs.plan_path.is_file()
+
+
+def test_build_plan_rejects_linked_or_branch_candidate(fixture):
+    inputs, binding = fixture
+
+    def linked_observation(request):
+        observed = _observation(request)
+        observed["components"]["vm"]["candidate"]["git_storage"] = {
+            "self_contained": False
+        }
+        observed["components"]["vm"]["candidate"]["detached_head"] = False
+        return observed
+
+    with pytest.raises(
+        promotion.VmPromotionError,
+        match="vm_promotion_observation_candidate_drift",
+    ):
+        promotion.build_plan(
+            inputs,
+            release_binding_provider=lambda _inputs, _now: binding,
+            remote_runner=linked_observation,
+            now=NOW,
+        )
+
+
+def test_cli_exposes_plan_only_commands():
+    actions = promotion._parser()._subparsers._group_actions[0].choices
+    assert set(actions) == {"validate-manifest", "plan"}
+    assert "apply" not in actions
+    assert "rollback" not in actions
 
 
 def test_finalized_release_binding_uses_receipt_validity_not_request_freshness(

@@ -106,21 +106,59 @@ def _run(
 
 
 def _git(root: Path, *arguments: str, check: bool = True) -> str:
-    result = _run(
+    environment = os.environ.copy()
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    completed = subprocess.run(
         ["git", "-c", "core.fileMode=false", "-C", str(root), *arguments],
-        check=check,
+        check=False,
+        capture_output=True,
+        text=True,
+        shell=False,
         timeout=60,
+        env=environment,
     )
-    return str(result.stdout or "").rstrip("\n")
+    if check and completed.returncode != 0:
+        raise VmPromotionRemoteError("vm_promotion_command_failed")
+    return str(completed.stdout or "").rstrip("\n")
 
 
 def _git_bytes(root: Path, *arguments: str) -> bytes:
-    result = _run(
+    environment = os.environ.copy()
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    result = subprocess.run(
         ["git", "-c", "core.fileMode=false", "-C", str(root), *arguments],
-        timeout=60,
+        check=False,
+        capture_output=True,
         text=False,
+        shell=False,
+        timeout=60,
+        env=environment,
     )
+    if result.returncode != 0:
+        raise VmPromotionRemoteError("vm_promotion_command_failed")
     return bytes(result.stdout or b"")
+
+
+def _git_storage(root: Path) -> Mapping[str, Any]:
+    dot_git = root / ".git"
+    fingerprint = _path_fingerprint(dot_git)
+    git_dir = Path(_git(root, "rev-parse", "--absolute-git-dir")).resolve()
+    common_raw = _git(root, "rev-parse", "--git-common-dir")
+    common_path = Path(common_raw)
+    if not common_path.is_absolute():
+        common_path = root / common_path
+    common_dir = common_path.resolve()
+    expected = dot_git.resolve()
+    return {
+        "dot_git_kind": fingerprint.get("kind"),
+        "git_dir": str(git_dir),
+        "git_common_dir": str(common_dir),
+        "self_contained": (
+            fingerprint.get("kind") == "directory"
+            and git_dir == expected
+            and common_dir == expected
+        ),
+    }
 
 
 def _commit(value: Any, *, field: str) -> str:
@@ -268,6 +306,8 @@ def _repo_facts(
         "head": head,
         "tree": tree,
         "head_ref": branch_result,
+        "detached_head": branch_result == "",
+        "git_storage": _git_storage(root),
         "status_sha256": _sha256_bytes(status.encode("utf-8")),
         "tree_clean": status == "",
         "dirty_paths": dirty,
@@ -397,6 +437,11 @@ def observe(request: Mapping[str, Any]) -> Mapping[str, Any]:
     components = {}
     for spec in specs:
         candidate = _repo_facts(spec["candidate_root"], spec["entrypoint_relative"])
+        if (
+            candidate.get("detached_head") is not True
+            or candidate.get("git_storage", {}).get("self_contained") is not True
+        ):
+            raise VmPromotionRemoteError("vm_promotion_candidate_not_sealed")
         target = _repo_facts(
             spec["target_root"],
             spec["entrypoint_relative"],

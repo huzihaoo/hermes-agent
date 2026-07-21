@@ -46,6 +46,7 @@ def _candidate_from(target: Path, candidate: Path, *, entrypoint: str) -> tuple[
     (candidate / "new_module.py").write_text("VALUE = 2\n", encoding="utf-8")
     _git(candidate, "add", ".")
     _git(candidate, "commit", "-qm", "candidate")
+    _git(candidate, "checkout", "-q", "--detach", "HEAD")
     return _git(candidate, "rev-parse", "HEAD"), _git(
         candidate, "rev-parse", "HEAD^{tree}"
     )
@@ -297,6 +298,37 @@ def test_observe_rejects_untracked_target_entrypoint(tmp_path: Path, monkeypatch
         match="vm_promotion_entrypoint_untracked",
     ):
         remote.observe(_request(tmp_path, [component]))
+
+
+def test_observe_rejects_linked_worktree_candidate(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("PNC_RCA_VM_PROMOTION_TEST_MODE", "1")
+    target = tmp_path / "target"
+    candidate_source = tmp_path / "candidate-source"
+    linked = tmp_path / "candidate-linked"
+    entrypoint = "bin/service.py"
+    _init_repo(target, entrypoint=entrypoint, content="old entrypoint\n")
+    _candidate_from(target, candidate_source, entrypoint=entrypoint)
+    _git(candidate_source, "worktree", "add", "-q", "--detach", str(linked), "HEAD")
+    artifact = linked / "build" / "bin" / "topic_extract"
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_bytes(b"locked runtime artifact")
+    component = _component(
+        name="vm", target=target, candidate=linked, entrypoint=entrypoint
+    )
+
+    with pytest.raises(
+        remote.VmPromotionRemoteError,
+        match="vm_promotion_candidate_not_sealed",
+    ):
+        remote.observe(_request(tmp_path, [component]))
+
+
+def test_git_bytes_failure_uses_stable_remote_error(tmp_path: Path):
+    with pytest.raises(
+        remote.VmPromotionRemoteError,
+        match="vm_promotion_command_failed",
+    ):
+        remote._git_bytes(tmp_path, "rev-parse", "HEAD")
 
 
 def test_second_component_failure_rolls_first_back_to_dirty_prestate(
