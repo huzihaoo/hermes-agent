@@ -8,8 +8,12 @@ from typing import Any
 from urllib.parse import quote, urlsplit
 
 
+VM_TASK_OUTPUT_PREFIX = "/mnt/tmp/"
+VM_TASK_OUTPUT_CIFS_PREFIX = (
+    "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/"
+)
 PERCEPTION_TEST_TEAM_VM_PREFIX = "/mnt/minieye/pdcl/department/perception_test_team/"
-G1Q3_RCA_FORMAL_VIZ_ROOT = (
+LEGACY_G1Q3_RCA_FORMAL_VIZ_ROOT = (
     PERCEPTION_TEST_TEAM_VM_PREFIX.rstrip("/") + "/G1Q3_RCA/cases"
 )
 FOXGLOVE_PATH_SAFE = "/._-()[]中文abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
@@ -22,27 +26,51 @@ def canonical_viz_mcap_path(submission_key: Any) -> str:
     key = str(submission_key or "").strip()
     if not _SAFE_SEGMENT_RE.fullmatch(key):
         return ""
-    return f"{G1Q3_RCA_FORMAL_VIZ_ROOT}/{key}/{key}.viz.mcap"
+    return f"{VM_TASK_OUTPUT_PREFIX}{key}/{key}.viz.mcap"
+
+
+def canonical_viz_mcap_cifs_path(submission_key: Any) -> str:
+    """Return the user-visible CIFS path paired with the VM publication."""
+    key = str(submission_key or "").strip()
+    if not _SAFE_SEGMENT_RE.fullmatch(key):
+        return ""
+    return f"{VM_TASK_OUTPUT_CIFS_PREFIX}{key}/{key}.viz.mcap"
+
+
+def _is_supported_viz_path(path: str) -> bool:
+    viz_path = PurePosixPath(path)
+    if any(part in {".", ".."} for part in viz_path.parts):
+        return False
+    key = viz_path.parent.name
+    if not _SAFE_SEGMENT_RE.fullmatch(key) or viz_path.name != f"{key}.viz.mcap":
+        return False
+    if path == canonical_viz_mcap_path(key):
+        return True
+    legacy = f"{LEGACY_G1Q3_RCA_FORMAL_VIZ_ROOT}/{key}/{key}.viz.mcap"
+    return path == legacy
 
 
 def foxglove_url(viz_mcap_vm: Any) -> str:
     """Build the CVEStudio URL for one verified delivery-contract path."""
     path = str(viz_mcap_vm or "").strip()
-    if not path.startswith(PERCEPTION_TEST_TEAM_VM_PREFIX) or not path.endswith(".viz.mcap"):
-        return ""
-    viz_path = PurePosixPath(path)
-    parts = viz_path.parts
-    if any(part in {".", ".."} for part in parts):
-        return ""
-    if viz_path.name != f"{viz_path.parent.name}.viz.mcap":
+    if not _is_supported_viz_path(path):
         return ""
 
-    configured = os.getenv("PNC_FOXGLOVE_RENDER_HOST", DEFAULT_FOXGLOVE_RENDER_HOST).strip().rstrip("/")
+    configured = (
+        os.getenv("PNC_FOXGLOVE_RENDER_HOST", DEFAULT_FOXGLOVE_RENDER_HOST)
+        .strip()
+        .rstrip("/")
+    )
     if not configured or any(ch.isspace() for ch in configured):
         return ""
     base = configured if configured.startswith(("http://", "https://")) else f"https://{configured}"
     parsed = urlsplit(base)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.query or parsed.fragment:
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.query
+        or parsed.fragment
+    ):
         return ""
     if parsed.path not in {"", "/"}:
         return ""

@@ -251,6 +251,7 @@ def test_runtime_closure_includes_prod_admission_but_not_retired_transition():
     assert {
         "gateway/pnc_rca_prod_admission.py",
         "gateway/pnc_rca_prod_bootstrap.py",
+        "scripts/pnc_foxglove_delivery.py",
     }.issubset(RCA_RUNTIME_RELATIVE_FILES)
     assert {
         "gateway/pnc_rca_capacity_runtime.py",

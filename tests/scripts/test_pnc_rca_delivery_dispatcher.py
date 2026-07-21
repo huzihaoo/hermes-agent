@@ -926,7 +926,7 @@ def test_older_terminal_generation_is_suppressed_before_any_remote_call(tmp_path
                 old_job["work_item_type_key"],
                 old_job["work_item_id"],
                 old_job["target_key"],
-                "https://project.feishu.cn/g1q3/issue/detail/7041712812",
+                "https://project.feishu.cn/t03o4q/issue/detail/7041712812",
                 build_report_url(
                     "newer-success-submission",
                     "g1q3-rca-artifact-v1-" + "8" * 64,
@@ -1482,6 +1482,42 @@ def test_dispatcher_rejects_report_url_for_another_submission_before_http(tmp_pa
         dispatcher_module._validate_effect(tampered)
 
     assert exc.value.code == "report_url_identity_mismatch"
+
+
+def test_dispatcher_rejects_project_alias_issue_url_before_http(tmp_path):
+    store = _seed(tmp_path)
+    claim = store.claim_due_effect(lease_owner="worker-1", now=NOW)
+    assert claim is not None
+    alias_url = "https://project.feishu.cn/g1q3/issue/detail/7041712812"
+    tampered = replace(
+        claim,
+        issue_url=alias_url,
+        payload={**claim.payload, "issue_url": alias_url},
+    )
+
+    with pytest.raises(DeliveryContractError) as exc:
+        dispatcher_module._validate_effect(tampered)
+
+    assert exc.value.code == "delivery_issue_url_identity_mismatch"
+
+
+def test_dispatcher_rejects_noncanonical_report_cifs_path_before_http(tmp_path):
+    store = _seed(tmp_path)
+    claim = store.claim_due_effect(lease_owner="worker-1", now=NOW)
+    assert claim is not None
+    tampered = replace(
+        claim,
+        payload={
+            **claim.payload,
+            "report_cifs_path": "//hfs.minieye.tech/department-perception_test_team/"
+            "G1Q3_RCA/cases/report/index.html",
+        },
+    )
+
+    with pytest.raises(DeliveryContractError) as exc:
+        dispatcher_module._validate_effect(tampered)
+
+    assert exc.value.code == "delivery_report_cifs_identity_mismatch"
 
 
 def test_artifact_heartbeats_keep_second_worker_fenced_across_long_bundle(

@@ -348,7 +348,7 @@ def _delivery(claim):
         foxglove_url=rendered_foxglove_url,
         conclusion="候选原因",
         marker=marker,
-        manifest={"schema_version": "delivery_manifest_v1"},
+        manifest={"schema_version": "delivery_manifest_v2"},
         contract={"schema_version": "g1q3_delivery_contract_v1"},
         artifacts=(),
         effect_payload={

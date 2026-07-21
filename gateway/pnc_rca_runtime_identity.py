@@ -44,6 +44,7 @@ RCA_RUNTIME_RELATIVE_FILES = (
     "gateway/session_context.py",
     "hermes_constants.py",
     "scripts/pnc_g1q3_truth.py",
+    "scripts/pnc_foxglove_delivery.py",
     "scripts/pnc_rca_delivery_collector.py",
     "scripts/pnc_rca_delivery_dispatcher.py",
     "scripts/pnc_rca_kafka_consumer.py",
@@ -70,6 +71,7 @@ GATEWAY_RCA_RUNTIME_RELATIVE_FILES = (
     "gateway/pnc_rca_data_access.py",
     "gateway/pnc_pdcl_contract.py",
     "gateway/pnc_rca_derived_capacity_reservation.py",
+    "scripts/pnc_foxglove_delivery.py",
 )
 MAX_HEALTH_FUTURE_SKEW_SECONDS = 30
 MAX_RUNTIME_FILE_BYTES = 32 * 1024 * 1024

@@ -13,8 +13,10 @@ from gateway.pnc_rca_delivery_contract import (
     DeliveryContractError,
     MAX_DELIVERY_ARTIFACT_BYTES,
     MAX_DELIVERY_ARTIFACTS,
+    build_report_cifs_path,
     build_report_artifact_url,
     build_report_url,
+    build_report_vm_path,
     build_terminal_delivery,
     build_thread_reply_effect,
     compute_artifact_set_id,
@@ -81,7 +83,7 @@ def _bundle(
             }
         )
     manifest = {
-        "schema_version": "delivery_manifest_v1",
+        "schema_version": "delivery_manifest_v2",
         "sealed": True,
         "submission_key": admission.submission_key,
         "business_key": admission.business_key,
@@ -150,6 +152,12 @@ def _bundle(
         )
     manifest["artifact_set_id"] = compute_artifact_set_id(manifest)
     manifest["report_url"] = build_report_url(
+        admission.submission_key, manifest["artifact_set_id"]
+    )
+    manifest["report_vm_path"] = build_report_vm_path(
+        admission.submission_key, manifest["artifact_set_id"]
+    )
+    manifest["report_cifs_path"] = build_report_cifs_path(
         admission.submission_key, manifest["artifact_set_id"]
     )
     report = {
@@ -248,6 +256,12 @@ def _reseal(contract, manifest):
     manifest["report_url"] = build_report_url(
         manifest["submission_key"], manifest["artifact_set_id"]
     )
+    manifest["report_vm_path"] = build_report_vm_path(
+        manifest["submission_key"], manifest["artifact_set_id"]
+    )
+    manifest["report_cifs_path"] = build_report_cifs_path(
+        manifest["submission_key"], manifest["artifact_set_id"]
+    )
     contract["artifacts"]["artifact_set_id"] = manifest["artifact_set_id"]
 
 
@@ -285,12 +299,19 @@ def test_valid_sealed_evidence_and_published_viz_build_issue_effect():
     assert delivery.report_url == build_report_url(
         delivery.submission_key, delivery.artifact_set_id
     )
+    assert delivery.effect_payload["report_cifs_path"] == build_report_cifs_path(
+        delivery.submission_key, delivery.artifact_set_id
+    )
+    assert (
+        delivery.effect_payload["report_cifs_path"]
+        in delivery.effect_payload["comment_content"]
+    )
     assert delivery.viz_mcap_vm == canonical_viz_mcap_path(delivery.submission_key)
     assert delivery.foxglove_url == foxglove_url(delivery.viz_mcap_vm)
     assert delivery.issue_url == (
-        "https://project.feishu.cn/g1q3/issue/detail/7041712812"
+        "https://project.feishu.cn/t03o4q/issue/detail/7041712812"
     )
-    assert "/t03o4q/issue/detail/" not in delivery.issue_url
+    assert "/g1q3/issue/detail/" not in delivery.issue_url
 
 
 def test_html_bundle_without_published_viz_is_not_deliverable():
@@ -430,6 +451,51 @@ def test_report_url_uses_live_canonical_http_root_and_content_address():
         "http://192.168.26.174:18081/G1Q3_RCA/cases/"
         f"{FORMAL_SUBMISSION_KEY}/{FORMAL_ARTIFACT_SET_ID}/index.html"
     )
+
+
+def test_report_files_use_governed_task_landing_and_share():
+    assert build_report_vm_path(FORMAL_SUBMISSION_KEY, FORMAL_ARTIFACT_SET_ID) == (
+        f"/mnt/tmp/{FORMAL_SUBMISSION_KEY}/{FORMAL_ARTIFACT_SET_ID}/index.html"
+    )
+    assert build_report_cifs_path(FORMAL_SUBMISSION_KEY, FORMAL_ARTIFACT_SET_ID) == (
+        "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/"
+        f"{FORMAL_SUBMISSION_KEY}/{FORMAL_ARTIFACT_SET_ID}/index.html"
+    )
+
+
+def test_legacy_manifest_v1_cannot_bypass_required_publication_paths():
+    admission, contract, manifest, observed, dependencies = _bundle()
+    manifest["schema_version"] = "delivery_manifest_v1"
+
+    with pytest.raises(DeliveryContractError) as exc:
+        _verify((admission, contract, manifest, observed, dependencies))
+
+    assert exc.value.code == "delivery_manifest_schema_unsupported"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        (
+            "report_vm_path",
+            "/mnt/minieye/pdcl/department/perception_test_team/"
+            "G1Q3_RCA/cases/report/index.html",
+        ),
+        (
+            "report_cifs_path",
+            "//hfs.minieye.tech/department-perception_test_team/"
+            "G1Q3_RCA/cases/report/index.html",
+        ),
+    ],
+)
+def test_report_identity_paths_reject_non_task_landing(field, value):
+    admission, contract, manifest, observed, dependencies = _bundle()
+    manifest[field] = value
+
+    with pytest.raises(DeliveryContractError) as exc:
+        _verify((admission, contract, manifest, observed, dependencies))
+
+    assert exc.value.code == "report_path_identity_mismatch"
 
 
 def test_changed_artifact_content_gets_a_different_publication_url():

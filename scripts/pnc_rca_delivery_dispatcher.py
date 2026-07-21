@@ -42,6 +42,7 @@ from gateway.pnc_rca_delivery_contract import (
     RCA_REPORT_FIELD_KEY,
     RCA_RESULT_FIELD_KEY,
     build_report_artifact_url,
+    build_report_cifs_path,
     build_terminal_delivery,
     build_terminal_thread_reply_effect,
     compute_delivery_effect_key,
@@ -1584,7 +1585,15 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
     payload = claim.payload
     expected_issue_url = str(claim.issue_url or "").strip()
     issue_url_match = _FEISHU_ISSUE_URL_RE.fullmatch(expected_issue_url)
-    if issue_url_match is None or issue_url_match.group(1) != claim.work_item_id:
+    canonical_issue_url = (
+        f"https://project.feishu.cn/{claim.project_key}"
+        f"/issue/detail/{claim.work_item_id}"
+    )
+    if (
+        issue_url_match is None
+        or issue_url_match.group(1) != claim.work_item_id
+        or expected_issue_url != canonical_issue_url
+    ):
         raise DeliveryContractError("delivery_issue_url_identity_mismatch")
     target: dict[str, Any]
     if claim.effect_kind == DELIVERY_EFFECT_KIND:
@@ -1599,7 +1608,7 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         exact_payload_keys = {
             "schema_version", "delivery_id", "effect_kind", "target_key",
             "project_key", "work_item_type_key", "work_item_id", "issue_url",
-            "artifact_set_id", "report_url", "report_status",
+            "artifact_set_id", "report_url", "report_cifs_path", "report_status",
             "viz_mcap_vm", "foxglove_url",
             "requires_human_review", "conclusion", "effect_key",
             "semantic_payload_sha256", "marker", "comment_content",
@@ -1621,7 +1630,7 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         exact_payload_keys = {
             "schema_version", "delivery_id", "effect_kind", "target_key",
             "project_key", "work_item_type_key", "work_item_id", "issue_url",
-            "artifact_set_id", "report_url", "report_status",
+            "artifact_set_id", "report_url", "report_cifs_path", "report_status",
             "viz_mcap_vm", "foxglove_url",
             "requires_human_review", "conclusion", "platform", "chat_id",
             "thread_id", "reply_anchor_message_id", "source_message_id",
@@ -1665,6 +1674,12 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         submission_key=manifest_submission_key,
         artifact_set_id=claim.artifact_set_id,
     )
+    expected_report_cifs_path = build_report_cifs_path(
+        manifest_submission_key,
+        claim.artifact_set_id,
+    )
+    if payload.get("report_cifs_path") != expected_report_cifs_path:
+        raise DeliveryContractError("delivery_report_cifs_identity_mismatch")
     expected_viz_path = canonical_viz_mcap_path(manifest_submission_key)
     if (
         payload.get("viz_mcap_vm") != expected_viz_path

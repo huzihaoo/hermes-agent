@@ -22,7 +22,7 @@ from scripts.pnc_foxglove_delivery import (
 
 
 DELIVERY_CONTRACT_SCHEMA_VERSION = "g1q3_delivery_contract_v1"
-DELIVERY_MANIFEST_SCHEMA_VERSION = "delivery_manifest_v1"
+DELIVERY_MANIFEST_SCHEMA_VERSION = "delivery_manifest_v2"
 DELIVERY_EFFECT_SCHEMA_VERSION = "pnc_rca_delivery_effect_v1"
 TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1 = "pnc_rca_terminal_delivery_effect_v1"
 TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION = "pnc_rca_terminal_delivery_effect_v2"
@@ -46,6 +46,11 @@ _ARTIFACT_SET_ID_RE = re.compile(
 _FORMAL_REPORT_SEGMENT_RE = re.compile(r"^(?:[A-Za-z0-9._~-]|%[0-9A-Fa-f]{2})+$")
 _FORMAL_REPORT_HOST = "192.168.26.174"
 _FORMAL_REPORT_PORT = 18081
+_FORMAL_REPORT_CIFS_HOST = "hfs1.minieye.tech"
+_FORMAL_REPORT_SHARE = "department-pnc_team-planning_algo-driving"
+_FORMAL_REPORT_CIFS_PREFIX = (
+    f"//{_FORMAL_REPORT_CIFS_HOST}/{_FORMAL_REPORT_SHARE}/tmp/"
+)
 MAX_DELIVERY_ARTIFACTS = 512
 MAX_DELIVERY_ARTIFACT_BYTES = 256 * 1024 * 1024
 MAX_DELIVERY_ARTIFACT_TOTAL_BYTES = 512 * 1024 * 1024
@@ -195,6 +200,7 @@ _BASE_EFFECT_SEMANTIC_FIELDS = (
     "issue_url",
     "artifact_set_id",
     "report_url",
+    "report_cifs_path",
     "viz_mcap_vm",
     "foxglove_url",
     "report_status",
@@ -1078,6 +1084,11 @@ def verify_persisted_artifact_inventory(
         submission_key=submission_key,
         artifact_set_id=expected_artifact_set_id,
     )
+    _validate_report_identity_paths(
+        manifest,
+        submission_key=submission_key,
+        artifact_set_id=expected_artifact_set_id,
+    )
     root = _normalize_root(manifest.get("artifact_root"), submission_key)
     material = _manifest_artifact_material(manifest)
     expected: list[VerifiedArtifact] = []
@@ -1221,7 +1232,9 @@ def _validate_report_asset_url(
 ) -> str:
     url = _required_text(value, "delivery_manifest.report_url")
     parsed = urlparse(url)
-    if parsed.scheme != "http" or parsed.netloc != f"{_FORMAL_REPORT_HOST}:{_FORMAL_REPORT_PORT}":
+    if parsed.scheme != "http" or parsed.netloc != (
+        f"{_FORMAL_REPORT_HOST}:{_FORMAL_REPORT_PORT}"
+    ):
         raise DeliveryContractError("report_url_invalid", f"unsafe report URL: {url}")
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise DeliveryContractError("report_url_invalid", f"unsafe report URL: {url}")
@@ -1297,6 +1310,38 @@ def build_report_url(submission_key: Any, artifact_set_id: Any) -> str:
         submission_key=submission,
         artifact_set_id=artifact_set,
     )
+
+
+def build_report_vm_path(submission_key: Any, artifact_set_id: Any) -> str:
+    submission = _required_text(submission_key, "delivery_manifest.submission_key")
+    artifact_set = _required_text(
+        artifact_set_id, "delivery_manifest.artifact_set_id"
+    )
+    if not _SAFE_KEY_RE.fullmatch(submission) or not _ARTIFACT_SET_ID_RE.fullmatch(
+        artifact_set
+    ):
+        raise DeliveryContractError("report_url_identity_invalid")
+    return f"{_VM_TMP_PREFIX}{submission}/{artifact_set}/index.html"
+
+
+def build_report_cifs_path(submission_key: Any, artifact_set_id: Any) -> str:
+    vm_path = build_report_vm_path(submission_key, artifact_set_id)
+    return _FORMAL_REPORT_CIFS_PREFIX + vm_path.removeprefix(_VM_TMP_PREFIX)
+
+
+def _validate_report_identity_paths(
+    manifest: Mapping[str, Any],
+    *,
+    submission_key: str,
+    artifact_set_id: str,
+) -> None:
+    if (
+        manifest.get("report_vm_path")
+        != build_report_vm_path(submission_key, artifact_set_id)
+        or manifest.get("report_cifs_path")
+        != build_report_cifs_path(submission_key, artifact_set_id)
+    ):
+        raise DeliveryContractError("report_path_identity_mismatch")
 
 
 def validate_report_url(
@@ -1645,6 +1690,15 @@ def verify_delivery_bundle(
         submission_key=validated_admission.submission_key,
         artifact_set_id=expected_artifact_set_id,
     )
+    _validate_report_identity_paths(
+        manifest,
+        submission_key=validated_admission.submission_key,
+        artifact_set_id=expected_artifact_set_id,
+    )
+    report_cifs_path = build_report_cifs_path(
+        validated_admission.submission_key,
+        expected_artifact_set_id,
+    )
     refs = validated_admission.source_refs
     target_key = (
         f"feishu_project:{refs.project_key}:{refs.work_item_type_key}:"
@@ -1654,7 +1708,7 @@ def verify_delivery_bundle(
     if validated_admission.schema_version != "pnc_rca_admission_v1" and not project_simple_name:
         raise DeliveryContractError("delivery_project_simple_name_missing")
     issue_url = (
-        f"https://project.feishu.cn/{project_simple_name or refs.project_key}"
+        f"https://project.feishu.cn/{refs.project_key}"
         f"/issue/detail/{refs.work_item_id}"
     )
     delivery_id = _stable_key(
@@ -1687,6 +1741,7 @@ def verify_delivery_bundle(
         "issue_url": issue_url,
         "artifact_set_id": expected_artifact_set_id,
         "report_url": report_url,
+        "report_cifs_path": report_cifs_path,
         "viz_mcap_vm": viz_mcap_vm,
         "foxglove_url": rendered_foxglove_url,
         "report_status": report_status,
@@ -1725,6 +1780,7 @@ def verify_delivery_bundle(
         [
 
             f"Foxglove 归因报告：{rendered_foxglove_url}",
+            f"报告文件（CIFS）：{report_cifs_path}",
             "说明：以上为自动 RCA 候选结论，需人工复核确认后再结案。",
         ]
     )

@@ -564,7 +564,7 @@ def _remote_bundle_script(submission_key: str) -> str:
         MAX_TEXT_TOTAL_BYTES = 64 * 1024 * 1024
         CSS_PARSER_DISTRIBUTION = {REMOTE_CSS_PARSER_DISTRIBUTION!r}
         CSS_PARSER_VERSION = {REMOTE_CSS_PARSER_VERSION!r}
-        FORMAL_VIZ_ROOT = '/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases'
+        FORMAL_VIZ_ROOT = posixpath.normpath(ROOT)
 
         def finish(value):
             print(json.dumps(value, ensure_ascii=False, sort_keys=True))
@@ -981,11 +981,10 @@ def _remote_bundle_script(submission_key: str) -> str:
             viz_manifest_path = str(viz_publication.get('manifest_path') or '')
             submission_key = str(viz_publication.get('submission_key') or '')
             expected_viz_path = posixpath.join(
-                FORMAL_VIZ_ROOT, submission_key, submission_key + '.viz.mcap'
+                FORMAL_VIZ_ROOT, submission_key + '.viz.mcap'
             )
             expected_viz_manifest_path = posixpath.join(
-                FORMAL_VIZ_ROOT, submission_key,
-                submission_key + '.viz.manifest.json',
+                FORMAL_VIZ_ROOT, submission_key + '.viz.manifest.json',
             )
             if (
                 not submission_key
