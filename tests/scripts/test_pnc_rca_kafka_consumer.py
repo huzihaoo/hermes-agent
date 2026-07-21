@@ -1217,6 +1217,15 @@ def test_resident_exact_recovery_ingests_authorized_offset_without_commit_or_pro
     assert receipt["kafka_offset_committed"] is False
     assert receipt["raw_payload_persisted"] is True
 
+    receipt["kafka_offset_committed"] = True
+    receipt_path.write_bytes(consumer_module._canonical_bytes(receipt) + b"\n")
+    with pytest.raises(consumer_module.ExactRecoveryError, match="receipt_invalid"):
+        consumer_module.recover_exact_kafka_request(
+            store=store,
+            config=config,
+            runtime_identity=resident_identity,
+        )
+
 
 def test_resident_exact_recovery_failure_stops_before_ordinary_poll(tmp_path):
     request_path = tmp_path / "exact-recovery-request.json"

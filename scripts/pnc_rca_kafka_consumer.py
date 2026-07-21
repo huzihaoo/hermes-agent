@@ -1227,6 +1227,93 @@ def _publish_exact_recovery_receipt(path: Path, value: Mapping[str, Any]) -> Non
         os.close(directory)
 
 
+def _validate_exact_recovery_receipt(
+    value: Mapping[str, Any], *, request: Mapping[str, Any]
+) -> dict[str, Any]:
+    expected_fields = {
+        "schema_version",
+        "release_id",
+        "epoch_id",
+        "request_sha256",
+        "final_validation_sha256",
+        "processed_at",
+        "event_uid",
+        "raw_sha256",
+        "business_key",
+        "submission_key",
+        "generation",
+        "outcome",
+        "activation_slot_kind",
+        "resident_runtime_identity_sha256",
+        "kafka_observation",
+        "raw_payload_persisted",
+        "kafka_offset_committed",
+    }
+    observation = value.get("kafka_observation")
+    expected_observation_fields = {
+        "assignment_mode",
+        "assigned_partitions",
+        "retained_start",
+        "retained_end",
+        "group_id",
+        "enable_auto_commit",
+        "commit_called",
+    }
+    retained_start = (
+        observation.get("retained_start") if isinstance(observation, Mapping) else None
+    )
+    retained_end = (
+        observation.get("retained_end") if isinstance(observation, Mapping) else None
+    )
+    processed_at = _parse_exact_recovery_timestamp(
+        value.get("processed_at"), field_name="receipt_processed_at"
+    )
+    if (
+        set(value) != expected_fields
+        or value.get("schema_version") != EXACT_RECOVERY_RECEIPT_SCHEMA_VERSION
+        or value.get("release_id") != request.get("release_id")
+        or value.get("epoch_id") != request.get("epoch_id")
+        or value.get("request_sha256") != request.get("request_sha256")
+        or value.get("final_validation_sha256")
+        != request.get("final_validation_sha256")
+        or value.get("event_uid") != request.get("event_uid")
+        or value.get("raw_sha256") != request.get("raw_sha256")
+        or value.get("business_key") != request.get("business_key")
+        or value.get("submission_key") != request.get("submission_key")
+        or value.get("generation") != request.get("generation")
+        or value.get("outcome") != "ingested"
+        or value.get("activation_slot_kind") != "kafka_success"
+        or _SHA256_RE.fullmatch(
+            str(value.get("resident_runtime_identity_sha256") or "")
+        )
+        is None
+        or not isinstance(observation, Mapping)
+        or set(observation) != expected_observation_fields
+        or observation.get("assignment_mode") != "explicit_single_partition"
+        or observation.get("assigned_partitions") != [request.get("partition")]
+        or isinstance(retained_start, bool)
+        or not isinstance(retained_start, int)
+        or isinstance(retained_end, bool)
+        or not isinstance(retained_end, int)
+        or not retained_start <= int(request["offset"]) < retained_end
+        or observation.get("group_id") is not None
+        or observation.get("enable_auto_commit") is not False
+        or observation.get("commit_called") is not False
+        or value.get("raw_payload_persisted") is not True
+        or value.get("kafka_offset_committed") is not False
+        or processed_at
+        < _parse_exact_recovery_timestamp(
+            request.get("created_at"), field_name="receipt_request_created_at"
+        )
+        or processed_at
+        > _parse_exact_recovery_timestamp(
+            request.get("expires_at"), field_name="receipt_request_expires_at"
+        )
+    ):
+        raise ExactRecoveryError("exact_recovery_receipt_invalid")
+    return dict(value)
+
+
 def recover_exact_kafka_request(
     *,
     store: RcaControlStore,
@@ -1252,14 +1339,7 @@ def recover_exact_kafka_request(
         ):
             raise ExactRecoveryError("exact_recovery_request_invalid")
         receipt, _receipt_raw = _read_owner_only_json(receipt_path, artifact="receipt")
-        if (
-            receipt.get("schema_version") != EXACT_RECOVERY_RECEIPT_SCHEMA_VERSION
-            or receipt.get("request_sha256") != request_value.get("request_sha256")
-            or receipt.get("event_uid") != request_value.get("event_uid")
-            or receipt.get("outcome") != "ingested"
-        ):
-            raise ExactRecoveryError("exact_recovery_receipt_invalid")
-        return receipt
+        return _validate_exact_recovery_receipt(receipt, request=request_value)
     request = _validate_exact_recovery_request(
         request_value,
         config=config,
