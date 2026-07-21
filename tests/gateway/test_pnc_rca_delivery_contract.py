@@ -477,9 +477,9 @@ def test_artifact_identity_is_independent_of_publication_location():
     assert compute_artifact_set_id(relocated) == baseline
 
 
-def test_report_url_uses_live_canonical_http_root_and_content_address():
+def test_report_url_uses_public_https_origin_and_content_address():
     assert build_report_url(FORMAL_SUBMISSION_KEY, FORMAL_ARTIFACT_SET_ID) == (
-        "http://192.168.26.174:18081/G1Q3_RCA/cases/"
+        "https://viewer.internal/G1Q3_RCA/cases/"
         f"{FORMAL_SUBMISSION_KEY}/{FORMAL_ARTIFACT_SET_ID}/index.html"
     )
 
@@ -793,27 +793,27 @@ def test_report_truth_and_seal_fail_closed(mutator, code):
 @pytest.mark.parametrize(
     "url",
     [
-        f"https://192.168.26.174:18081{FORMAL_REPORT_PATH}",
+        f"http://192.168.26.174:18081{FORMAL_REPORT_PATH}",
         f"http://192.168.26.175:18081{FORMAL_REPORT_PATH}",
         f"http://192.168.26.174:18082{FORMAL_REPORT_PATH}",
         f"http://user@192.168.26.174:18081{FORMAL_REPORT_PATH}",
-        f"http://192.168.26.174:18081{FORMAL_REPORT_PATH}?q=1",
-        f"http://192.168.26.174:18081{FORMAL_REPORT_PATH}#x",
+        f"https://viewer.internal{FORMAL_REPORT_PATH}?q=1",
+        f"https://viewer.internal{FORMAL_REPORT_PATH}#x",
         (
-            "http://192.168.26.174:18081/G1Q3_RCA/cases/%2e%2e/"
+            "https://viewer.internal/G1Q3_RCA/cases/%2e%2e/"
             f"{FORMAL_ARTIFACT_SET_ID}/index.html"
         ),
         (
-            f"http://192.168.26.174:18081/G1Q3_RCA/cases/{FORMAL_SUBMISSION_KEY}/"
+            f"https://viewer.internal/G1Q3_RCA/cases/{FORMAL_SUBMISSION_KEY}/"
             "%252e%252e/index.html"
         ),
         (
-            f"http://192.168.26.174:18081/G1Q3_RCA/cases/{FORMAL_SUBMISSION_KEY}/"
+            f"https://viewer.internal/G1Q3_RCA/cases/{FORMAL_SUBMISSION_KEY}/"
             f"{FORMAL_ARTIFACT_SET_ID}/nested/index.html"
         ),
     ],
 )
-def test_report_url_is_exactly_the_formal_internal_html_route(url):
+def test_report_url_is_exactly_the_formal_public_html_route(url):
     admission, contract, manifest, observed, dependencies = _bundle()
     manifest["report_url"] = url
 

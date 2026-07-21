@@ -15,6 +15,7 @@ from urllib.parse import quote, unquote, urlparse
 
 from gateway.pnc_rca_admission import RcaAdmission, validate_rca_admission
 from scripts.pnc_foxglove_delivery import (
+    canonical_publication_origin,
     canonical_viz_mcap_path,
     foxglove_url,
     validate_foxglove_url,
@@ -46,8 +47,6 @@ _ARTIFACT_SET_ID_RE = re.compile(
     r"^g1q3-rca-artifact-v1-[0-9a-f]{64}$"
 )
 _FORMAL_REPORT_SEGMENT_RE = re.compile(r"^(?:[A-Za-z0-9._~-]|%[0-9A-Fa-f]{2})+$")
-_FORMAL_REPORT_HOST = "192.168.26.174"
-_FORMAL_REPORT_PORT = 18081
 _FORMAL_REPORT_CIFS_HOST = "hfs1.minieye.tech"
 _FORMAL_REPORT_SHARE = "department-pnc_team-planning_algo-driving"
 _FORMAL_REPORT_CIFS_PREFIX = (
@@ -1341,9 +1340,11 @@ def _validate_report_asset_url(
 ) -> str:
     url = _required_text(value, "delivery_manifest.report_url")
     parsed = urlparse(url)
-    if parsed.scheme != "http" or parsed.netloc != (
-        f"{_FORMAL_REPORT_HOST}:{_FORMAL_REPORT_PORT}"
-    ):
+    public_origin = canonical_publication_origin()
+    if not public_origin:
+        raise DeliveryContractError("report_public_origin_invalid")
+    expected = urlparse(public_origin)
+    if parsed.scheme != expected.scheme or parsed.netloc != expected.netloc:
         raise DeliveryContractError("report_url_invalid", f"unsafe report URL: {url}")
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise DeliveryContractError("report_url_invalid", f"unsafe report URL: {url}")
@@ -1413,9 +1414,12 @@ def build_report_url(submission_key: Any, artifact_set_id: Any) -> str:
         artifact_set
     ):
         raise DeliveryContractError("report_url_identity_invalid")
+    public_origin = canonical_publication_origin()
+    if not public_origin:
+        raise DeliveryContractError("report_public_origin_invalid")
     return _validate_report_url(
-        f"http://{_FORMAL_REPORT_HOST}:{_FORMAL_REPORT_PORT}/"
-        f"G1Q3_RCA/cases/{submission}/{artifact_set}/index.html",
+        f"{public_origin}/G1Q3_RCA/cases/"
+        f"{submission}/{artifact_set}/index.html",
         submission_key=submission,
         artifact_set_id=artifact_set,
     )
@@ -1459,7 +1463,7 @@ def validate_report_url(
     submission_key: str | None = None,
     artifact_set_id: str | None = None,
 ) -> str:
-    """Validate the single production HTTP route allowed in delivery effects."""
+    """Validate the canonical public HTTPS report route used in delivery effects."""
     return _validate_report_url(
         value,
         submission_key=submission_key,
@@ -1473,7 +1477,7 @@ def validate_report_asset_url(
     submission_key: str | None = None,
     artifact_set_id: str | None = None,
 ) -> str:
-    """Validate one static asset below the single formal internal report route."""
+    """Validate one static asset below the canonical public report route."""
     return _validate_report_asset_url(
         value,
         submission_key=submission_key,

@@ -158,6 +158,23 @@ def _foxglove_base(*, require_explicit: bool = False) -> str:
     return base
 
 
+def canonical_publication_origin() -> str:
+    """Return the explicit HTTPS DNS origin used for public RCA artifacts."""
+    base = _foxglove_base(require_explicit=True)
+    if not base.startswith("https://"):
+        return ""
+    parsed = urlsplit(base)
+    hostname = parsed.hostname or ""
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        if len(hostname.split(".")) < 2:
+            return ""
+    else:
+        return ""
+    return base
+
+
 def canonical_viz_remote_file_url(submission_key: Any) -> str:
     """Return the same-origin HTTPS URL served by the scoped viewer proxy."""
     key = str(submission_key or "").strip()

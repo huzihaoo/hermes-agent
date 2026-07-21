@@ -359,7 +359,7 @@ class Clock:
 
 
 def _verified_report(url, size, sha256):
-    assert url.startswith("http://192.168.26.174:18081/G1Q3_RCA/cases/")
+    assert url.startswith("https://viewer.internal/G1Q3_RCA/cases/")
     return {
         "success": True,
         "status_code": 200,
@@ -3151,7 +3151,7 @@ def test_default_report_verifier_performs_bounded_head_then_get(monkeypatch):
         lambda handler: Opener(),
     )
     url = (
-        "http://192.168.26.174:18081/G1Q3_RCA/cases/"
+        "https://viewer.internal/G1Q3_RCA/cases/"
         f"{'g1q3-rca-s1-' + 'a' * 64}/"
         f"{'g1q3-rca-artifact-v1-' + 'b' * 64}/index.html"
     )
@@ -3238,7 +3238,7 @@ def test_default_report_verifier_enforces_one_total_stream_deadline():
     socket = Socket()
     opener = Opener(monotonic, socket)
     url = (
-        "http://192.168.26.174:18081/G1Q3_RCA/cases/"
+        "https://viewer.internal/G1Q3_RCA/cases/"
         f"{'g1q3-rca-s1-' + 'a' * 64}/"
         f"{'g1q3-rca-artifact-v1-' + 'b' * 64}/assets/media/video.mp4"
     )

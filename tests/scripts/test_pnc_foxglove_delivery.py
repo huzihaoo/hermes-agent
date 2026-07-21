@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from scripts.pnc_foxglove_delivery import (
+    canonical_publication_origin,
     canonical_viz_remote_file_url,
     canonical_viz_mcap_cifs_path,
     canonical_viz_mcap_path,
@@ -83,6 +84,27 @@ def test_task_remote_file_requires_explicit_viewer_origin(monkeypatch):
 
     assert foxglove_url(canonical_viz_mcap_path(SUBMISSION_KEY)) == ""
     assert canonical_viz_remote_file_url(SUBMISSION_KEY) == ""
+
+
+def test_publication_origin_requires_explicit_https_dns(monkeypatch):
+    for origin in (
+        "https://viewer.internal",
+        "https://viewer.internal:8443",
+    ):
+        monkeypatch.setenv("PNC_FOXGLOVE_RENDER_HOST", origin)
+        assert canonical_publication_origin() == origin
+
+    for origin in (
+        "",
+        "http://viewer.internal",
+        "https://192.168.21.217",
+        "https://localhost",
+    ):
+        monkeypatch.setenv("PNC_FOXGLOVE_RENDER_HOST", origin)
+        assert canonical_publication_origin() == ""
+
+    monkeypatch.delenv("PNC_FOXGLOVE_RENDER_HOST", raising=False)
+    assert canonical_publication_origin() == ""
 
 
 def test_malformed_viewer_origins_fail_closed(monkeypatch):
