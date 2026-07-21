@@ -119,7 +119,9 @@ HOST_CANDIDATE_IDENTITY_PATH = (
 HOST_CANDIDATE_IDENTITY_SHA256 = (
     "517835c297b96ae21c0dddf8c2dd0f1b762172841e0bab51366a4a801da8fcc6"
 )
-CANONICAL_HOST_PYTHON = "/Users/songying/.hermes/hermes-agent/.venv/bin/python"
+CANONICAL_HOST_PYTHON = (
+    "/Users/songying/.hermes/runtime/hermes-live/.venv/bin/python"
+)
 CANONICAL_HOST_ENV = "/Users/songying/.hermes/.env"
 HOST_LIVE_ROOT = "/Users/songying/.hermes/runtime/hermes-live"
 CANONICAL_RUNTIME_BOOTSTRAP_FILES = (
@@ -331,6 +333,38 @@ class ProdE2EReleaseError(ValueError):
     def __init__(self, code: str):
         self.code = str(code or "prod_e2e_release_invalid")[:160]
         super().__init__(self.code)
+
+
+def _canonical_host_interpreter_paths() -> tuple[Path, Path]:
+    """Return the venv entrypoint for execution and its real binary for hashing."""
+
+    entrypoint = Path(CANONICAL_HOST_PYTHON).expanduser()
+    if not entrypoint.is_absolute():
+        raise ProdE2EReleaseError(
+            "prod_e2e_release_canonical_python_invalid"
+        )
+    entrypoint = entrypoint.absolute()
+    try:
+        lexical = os.lstat(entrypoint)
+        binary = entrypoint.resolve(strict=True)
+        resolved = os.stat(binary)
+    except OSError as exc:
+        raise ProdE2EReleaseError(
+            "prod_e2e_release_canonical_python_invalid"
+        ) from exc
+    if (
+        not (stat.S_ISLNK(lexical.st_mode) or stat.S_ISREG(lexical.st_mode))
+        or lexical.st_uid != os.geteuid()
+        or lexical.st_nlink != 1
+        or not stat.S_ISREG(resolved.st_mode)
+        or resolved.st_uid not in {0, os.geteuid()}
+        or stat.S_IMODE(resolved.st_mode) & 0o022
+        or not os.access(entrypoint, os.X_OK)
+    ):
+        raise ProdE2EReleaseError(
+            "prod_e2e_release_canonical_python_invalid"
+        )
+    return entrypoint, binary
 
 
 @dataclass(frozen=True)
@@ -1823,17 +1857,11 @@ def _run_canonical_component_probe(
     *, desired_viewer_origin: str
 ) -> Mapping[str, Any]:
     root = Path(CANONICAL_HOST_ROOT)
-    python = Path(CANONICAL_HOST_PYTHON)
+    python, resolved_python = _canonical_host_interpreter_paths()
     desired_origin = _canonical_https_dns_origin(
         desired_viewer_origin, field="desired_viewer_origin"
     )
     try:
-        resolved_python = python.resolve(strict=True)
-        python_info = os.lstat(resolved_python)
-        if not stat.S_ISREG(python_info.st_mode):
-            raise ProdE2EReleaseError(
-                "prod_e2e_release_canonical_python_invalid"
-            )
         interpreter_sha256 = hashlib.sha256(
             resolved_python.read_bytes()
         ).hexdigest()
@@ -4999,9 +5027,8 @@ def _run_canonical_db_validator(
         raise ProdE2EReleaseError(
             "prod_e2e_release_canonical_db_validator_identity_mismatch"
         )
-    python = Path(CANONICAL_HOST_PYTHON)
+    python, resolved_python = _canonical_host_interpreter_paths()
     try:
-        resolved_python = python.resolve(strict=True)
         interpreter_sha256 = hashlib.sha256(
             resolved_python.read_bytes()
         ).hexdigest()
@@ -5305,8 +5332,8 @@ tp=TopicPartition(sys.argv[3],int(sys.argv[4]))
 commit_called=False
 try:
     consumer.assign([tp])
-    beginning=int(consumer.beginning_offsets([tp],timeout=10)[tp])
-    end=int(consumer.end_offsets([tp],timeout=10)[tp])
+    beginning=int(consumer.beginning_offsets([tp],timeout_ms=10000)[tp])
+    end=int(consumer.end_offsets([tp],timeout_ms=10000)[tp])
     target=int(sys.argv[5])
     if not beginning<=target<end:
         raise SystemExit('target_offset_not_retained')
@@ -5329,7 +5356,8 @@ try:
     if classified.decision!='accepted' or classified.normalized is None:
         raise SystemExit('target_policy_rejected')
     admission=contract_module.build_event_admission(classified.normalized,topic=record.topic,partition=record.partition,offset=record.offset)
-    if admission.business_key!=sys.argv[7] or admission.submission_key!=sys.argv[8] or admission.work_item_id!=sys.argv[9] or admission.project_key!=sys.argv[10] or admission.work_item_type_key!=sys.argv[11]:
+    refs=admission.source_refs
+    if admission.business_key!=sys.argv[7] or admission.submission_key!=sys.argv[8] or refs.work_item_id!=sys.argv[9] or refs.project_key!=sys.argv[10] or refs.work_item_type_key!=sys.argv[11]:
         raise SystemExit('target_admission_mismatch')
     position=int(consumer.position(tp))
 finally:
@@ -5340,9 +5368,9 @@ result={
  'event_uid':f'{sys.argv[3]}:{sys.argv[4]}:{sys.argv[5]}',
  'retained_start':beginning,'retained_end':end,'raw_sha256':raw_sha,
  'record_timestamp_ms':record.timestamp,'record_timestamp_type':timestamp_type,
- 'raw_size_bytes':len(raw),'work_item_id':admission.work_item_id,
+ 'raw_size_bytes':len(raw),'work_item_id':refs.work_item_id,
  'business_key':admission.business_key,'submission_key':admission.submission_key,
- 'project_key':admission.project_key,'work_item_type_key':admission.work_item_type_key,
+ 'project_key':refs.project_key,'work_item_type_key':refs.work_item_type_key,
  'classification_decision':classified.decision,
  'policy_version':classified.normalized.creation_rule_version,
  'assignment_mode':'explicit_single_partition','assigned_partitions':[int(sys.argv[4])],
@@ -5373,7 +5401,7 @@ def _observe_kafka_record_live(
     observed = _observe_canonical_host_binding(
         expected_commit=host_commit, expected_tree=host_tree
     )
-    interpreter = Path(CANONICAL_HOST_PYTHON).resolve(strict=True)
+    interpreter, interpreter_binary = _canonical_host_interpreter_paths()
     try:
         completed = subprocess.run(
             [
@@ -5504,7 +5532,9 @@ def _observe_kafka_record_live(
         "observer_script_sha256": hashlib.sha256(
             _CANONICAL_KAFKA_TARGET_PREREAD.encode("utf-8")
         ).hexdigest(),
-        "interpreter_sha256": hashlib.sha256(interpreter.read_bytes()).hexdigest(),
+        "interpreter_sha256": hashlib.sha256(
+            interpreter_binary.read_bytes()
+        ).hexdigest(),
         "host_commit": observed["commit"],
         "host_tree": observed["tree"],
     }
@@ -6028,7 +6058,7 @@ def _run_canonical_target_bundle_verifier(
         expected_commit=host_commit, expected_tree=host_tree
     )
     root = Path(CANONICAL_HOST_ROOT)
-    interpreter = Path(CANONICAL_HOST_PYTHON).resolve(strict=True)
+    interpreter, interpreter_binary = _canonical_host_interpreter_paths()
     identity = dict(
         expected
         or {
@@ -6208,7 +6238,9 @@ def _run_canonical_target_bundle_verifier(
         "host_commit": observed["commit"],
         "host_tree": observed["tree"],
         "interpreter_path": str(interpreter),
-        "interpreter_sha256": hashlib.sha256(interpreter.read_bytes()).hexdigest(),
+        "interpreter_sha256": hashlib.sha256(
+            interpreter_binary.read_bytes()
+        ).hexdigest(),
         "validator_script_sha256": hashlib.sha256(
             _CANONICAL_TARGET_BUNDLE_VERIFIER.encode("utf-8")
         ).hexdigest(),
@@ -6258,7 +6290,7 @@ def _observe_target_input_gate_live(
     observed = _observe_canonical_host_binding(
         expected_commit=host_commit, expected_tree=host_tree
     )
-    interpreter = Path(CANONICAL_HOST_PYTHON).resolve(strict=True)
+    interpreter, interpreter_binary = _canonical_host_interpreter_paths()
     try:
         completed = subprocess.run(
             [
@@ -6346,7 +6378,9 @@ def _observe_target_input_gate_live(
         "observer_script_sha256": hashlib.sha256(
             _CANONICAL_MEEGLE_INPUT_GATE.encode("utf-8")
         ).hexdigest(),
-        "interpreter_sha256": hashlib.sha256(interpreter.read_bytes()).hexdigest(),
+        "interpreter_sha256": hashlib.sha256(
+            interpreter_binary.read_bytes()
+        ).hexdigest(),
         "host_commit": observed["commit"],
         "host_tree": observed["tree"],
     }
@@ -6462,7 +6496,7 @@ def _observe_official_meegle_readback_live(
         expected_commit=host_commit, expected_tree=host_tree
     )
     root = Path(CANONICAL_HOST_ROOT)
-    interpreter = Path(CANONICAL_HOST_PYTHON).resolve(strict=True)
+    interpreter, interpreter_binary = _canonical_host_interpreter_paths()
     try:
         completed = subprocess.run(
             [
@@ -6561,7 +6595,9 @@ def _observe_official_meegle_readback_live(
         "observer_script_sha256": hashlib.sha256(
             _CANONICAL_MEEGLE_READBACK.encode("utf-8")
         ).hexdigest(),
-        "interpreter_sha256": hashlib.sha256(interpreter.read_bytes()).hexdigest(),
+        "interpreter_sha256": hashlib.sha256(
+            interpreter_binary.read_bytes()
+        ).hexdigest(),
         "host_commit": observed["commit"],
         "host_tree": observed["tree"],
     }
@@ -6593,7 +6629,7 @@ def _observe_live_baseline(
     observed = _observe_canonical_host_binding(
         expected_commit=str(host["commit"]), expected_tree=str(host["tree"])
     )
-    interpreter = Path(CANONICAL_HOST_PYTHON).resolve(strict=True)
+    interpreter, _interpreter_binary = _canonical_host_interpreter_paths()
     baseline_path = str(Path(str(cutover.get("baseline_path") or "")).absolute())
     active_binding_path = str(
         Path(str(cutover.get("active_release_binding_path") or "")).absolute()

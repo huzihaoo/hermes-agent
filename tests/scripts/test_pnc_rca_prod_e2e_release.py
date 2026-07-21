@@ -2935,6 +2935,94 @@ def test_blocker_bom_exposes_validated_final_closure(monkeypatch):
     assert bound["production_mutation"] is False
 
 
+def test_kafka_preread_executes_venv_entrypoint_without_resolving(
+    tmp_path, monkeypatch
+):
+    assert Path(release.CANONICAL_HOST_PYTHON) == (
+        Path(release.HOST_LIVE_ROOT) / ".venv/bin/python"
+    )
+    entrypoint = tmp_path / "venv/bin/python"
+    binary = tmp_path / "python-real"
+    binary.write_bytes(b"real-python-binary")
+    captured = {}
+    consumer_sha = "71" * 32
+    contract_sha = "72" * 32
+    observed = {
+        "commit": release.HOST_FINAL_COMMIT,
+        "tree": release.HOST_FINAL_TREE,
+        "required_file_sha256": {
+            "scripts/pnc_rca_kafka_consumer.py": consumer_sha,
+            "gateway/pnc_rca_kafka_contract.py": contract_sha,
+        },
+    }
+    payload = {
+        "schema_version": "pnc_rca_kafka_exact_offset_preread_v1",
+        "topic": release.TOPIC,
+        "partition": release.PARTITION,
+        "offset": release.TARGET_OFFSET,
+        "event_uid": release.TARGET_EVENT_UID,
+        "retained_start": 514,
+        "retained_end": 700,
+        "raw_sha256": release.TARGET_RAW_SHA256,
+        "record_timestamp_ms": 1,
+        "record_timestamp_type": "create_time",
+        "raw_size_bytes": 10,
+        "work_item_id": release.TARGET_WORK_ITEM_ID,
+        "business_key": release.TARGET_BUSINESS_KEY,
+        "submission_key": release.TARGET_SUBMISSION_KEY,
+        "project_key": release.TARGET_PROJECT_KEY,
+        "work_item_type_key": release.TARGET_WORK_ITEM_TYPE_KEY,
+        "classification_decision": "accepted",
+        "policy_version": "issue-created-v1",
+        "assignment_mode": "explicit_single_partition",
+        "assigned_partitions": [release.PARTITION],
+        "seek_offset": release.TARGET_OFFSET,
+        "position_after_read": release.TARGET_OFFSET + 1,
+        "group_id": None,
+        "enable_auto_commit": False,
+        "commit_called": False,
+        "raw_payload_persisted": False,
+        "secret_material_persisted": False,
+        "consumer_module_sha256": consumer_sha,
+        "contract_module_sha256": contract_sha,
+    }
+
+    class Completed:
+        returncode = 0
+        stderr = ""
+        stdout = json.dumps(payload)
+
+    def run(arguments, **_kwargs):
+        captured["arguments"] = arguments
+        return Completed()
+
+    monkeypatch.setattr(
+        release, "_observe_canonical_host_binding", lambda **_kwargs: observed
+    )
+    monkeypatch.setattr(
+        release,
+        "_canonical_host_interpreter_paths",
+        lambda: (entrypoint, binary),
+    )
+    monkeypatch.setattr(release.subprocess, "run", run)
+
+    result = release._observe_target_kafka_record_live(
+        host_commit=release.HOST_FINAL_COMMIT,
+        host_tree=release.HOST_FINAL_TREE,
+    )
+
+    assert captured["arguments"][0] == str(entrypoint)
+    assert captured["arguments"][0] != str(binary)
+    assert "beginning_offsets([tp],timeout_ms=10000)" in captured[
+        "arguments"
+    ][4]
+    assert "end_offsets([tp],timeout_ms=10000)" in captured["arguments"][4]
+    assert "refs=admission.source_refs" in captured["arguments"][4]
+    assert result["interpreter_sha256"] == hashlib.sha256(
+        binary.read_bytes()
+    ).hexdigest()
+
+
 def test_canonical_runtime_bootstrap_is_verified_before_allowlist_probe(
     tmp_path, monkeypatch
 ):
