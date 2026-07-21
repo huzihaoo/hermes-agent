@@ -32,7 +32,6 @@ from gateway.pnc_rca_delivery_contract import (
     DELIVERY_EFFECT_KIND,
     DELIVERY_EFFECT_KINDS,
     DELIVERY_EFFECT_SCHEMA_VERSION,
-    DELIVERY_EFFECT_SCHEMA_VERSION_V1,
     DELIVERY_REPORT_LINK_KIND,
     DELIVERY_THREAD_EFFECT_KIND,
     TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
@@ -43,8 +42,10 @@ from gateway.pnc_rca_delivery_contract import (
     MAX_DELIVERY_INDEX_HTML_BYTES,
     RCA_REPORT_FIELD_KEY,
     RCA_RESULT_FIELD_KEY,
+    build_issue_comment_content,
     build_report_artifact_url,
     build_report_cifs_path,
+    build_thread_reply_content,
     build_terminal_delivery,
     build_terminal_thread_reply_effect,
     compute_delivery_effect_key,
@@ -1586,16 +1587,9 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         return _validate_terminal_effect(claim)
     payload = claim.payload
     schema_version = str(payload.get("schema_version") or "")
-    if schema_version not in {
-        DELIVERY_EFFECT_SCHEMA_VERSION_V1,
-        DELIVERY_EFFECT_SCHEMA_VERSION,
-    }:
+    if schema_version != DELIVERY_EFFECT_SCHEMA_VERSION:
         raise DeliveryContractError("delivery_effect_schema_unsupported")
-    report_link_fields = (
-        {"report_link_kind"}
-        if schema_version == DELIVERY_EFFECT_SCHEMA_VERSION
-        else set()
-    )
+    report_link_fields = {"report_link_kind"}
     expected_issue_url = str(claim.issue_url or "").strip()
     issue_url_match = _FEISHU_ISSUE_URL_RE.fullmatch(expected_issue_url)
     canonical_issue_url = (
@@ -1701,20 +1695,14 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         )
     ):
         raise DeliveryContractError("delivery_effect_foxglove_identity_mismatch")
-    if schema_version == DELIVERY_EFFECT_SCHEMA_VERSION and (
-        payload.get("report_link_kind") != DELIVERY_REPORT_LINK_KIND
-    ):
+    if payload.get("report_link_kind") != DELIVERY_REPORT_LINK_KIND:
         raise DeliveryContractError("delivery_effect_report_link_kind_invalid")
     if (
         payload.get("requires_human_review") is not True
         or payload.get("report_status") not in _VIZ_REPORT_STATUSES
     ):
         raise DeliveryContractError("delivery_effect_review_boundary_invalid")
-    expected_report_link = (
-        claim.report_url
-        if schema_version == DELIVERY_EFFECT_SCHEMA_VERSION
-        else payload.get("foxglove_url")
-    )
+    expected_report_link = claim.report_url
     expected_field_updates = [
         {
             "field_key": RCA_RESULT_FIELD_KEY,
@@ -1762,11 +1750,29 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         or content.splitlines().count(marker) != 1
     ):
         raise DeliveryContractError("delivery_effect_marker_invalid")
-    if schema_version == DELIVERY_EFFECT_SCHEMA_VERSION and (
-        content.count(claim.report_url) != 1
-        or str(payload.get("foxglove_url") or "") in content
-    ):
-        raise DeliveryContractError("delivery_effect_report_link_invalid")
+    conclusion = payload.get("conclusion")
+    if not isinstance(conclusion, str) or not conclusion:
+        raise DeliveryContractError("delivery_effect_conclusion_invalid")
+    if claim.effect_kind == DELIVERY_EFFECT_KIND:
+        expected_content = build_issue_comment_content(
+            marker=marker,
+            work_item_id=claim.work_item_id,
+            report_status=str(payload.get("report_status") or ""),
+            conclusion=conclusion,
+            report_url=claim.report_url,
+            report_cifs_path=expected_report_cifs_path,
+        )
+    else:
+        expected_content = build_thread_reply_content(
+            marker=marker,
+            work_item_id=claim.work_item_id,
+            report_status=str(payload.get("report_status") or ""),
+            conclusion=conclusion,
+            report_url=claim.report_url,
+            issue_url=expected_issue_url,
+        )
+    if content != expected_content:
+        raise DeliveryContractError("delivery_effect_content_invalid")
     if claim.effect_kind == DELIVERY_THREAD_EFFECT_KIND:
         expected_uuid = delivery_effect_idempotency_uuid(claim.effect_key)
         if payload.get("idempotency_uuid") != expected_uuid:
@@ -2031,6 +2037,32 @@ def _marker_matches(
             line in variants or line.replace(" ", "") == remote_marker
             for line in item["content"].splitlines()
         )
+    ]
+
+
+def _canonical_remote_content(content: str, marker: str) -> str | None:
+    lines = content.splitlines()
+    if not lines:
+        return None
+    remote_marker = marker[1:-1] if marker.startswith("[") and marker.endswith("]") else marker
+    first_line = lines[0]
+    if (
+        first_line == marker
+        or first_line == remote_marker
+        or first_line.replace(" ", "") == remote_marker
+    ):
+        lines[0] = marker
+        return "\n".join(lines)
+    return None
+
+
+def _confirmed_content_matches(
+    comments: list[dict[str, str]], marker: str, expected_content: str
+) -> list[dict[str, str]]:
+    return [
+        item
+        for item in _marker_matches(comments, marker)
+        if _canonical_remote_content(item["content"], marker) == expected_content
     ]
 
 
@@ -2404,6 +2436,59 @@ class DeliveryDispatcher:
             validated.idempotency_uuid,
         )
 
+    def _verify_report_artifacts(
+        self,
+        claim: DeliveryEffectClaim,
+        validated: ValidatedEffect,
+        *,
+        uncertain: bool,
+    ) -> DispatchOutcome | None:
+        for role, artifact_url, expected_size, expected_sha256 in validated.artifacts:
+            self._heartbeat(claim)
+            try:
+                verification_raw = self.report_verifier(
+                    artifact_url,
+                    expected_size,
+                    expected_sha256,
+                )
+            except Exception as exc:
+                self._heartbeat(claim)
+                return self._retry(
+                    claim,
+                    error_code="report_http_unavailable",
+                    detail=type(exc).__name__,
+                    uncertain=uncertain,
+                )
+            self._heartbeat(claim)
+            if not isinstance(verification_raw, Mapping):
+                return self._open_circuit(
+                    claim,
+                    error_code="delivery_boundary_contract_invalid",
+                    detail="report_verifier must return an object",
+                    uncertain=uncertain,
+                )
+            verification = dict(verification_raw)
+            if verification.get("success") is not True:
+                if verification.get("success") is not False:
+                    verification = {
+                        "success": False,
+                        "error_code": "delivery_boundary_contract_invalid",
+                    }
+                return self._boundary_failure(
+                    claim, verification, uncertain_default=uncertain
+                )
+            if (
+                verification.get("status_code") != 200
+                or verification.get("content_length") != expected_size
+                or verification.get("sha256") != expected_sha256
+            ):
+                return self._quarantine(
+                    claim,
+                    error_code="report_http_verification_mismatch",
+                    detail=f"successful verifier response does not match sealed {role}",
+                )
+        return None
+
     def _complete_from_marker(
         self,
         claim: DeliveryEffectClaim,
@@ -2423,6 +2508,10 @@ class DeliveryDispatcher:
                     "remote_id": remote_id,
                     "marker": validated.marker,
                     "source": source,
+                    "confirmed_content_sha256": hashlib.sha256(
+                        validated.content.encode("utf-8")
+                    ).hexdigest(),
+                    "confirmed_report_url": claim.report_url,
                     "confirmed_field_keys": [
                         key for key, _value in validated.field_updates
                     ],
@@ -2461,6 +2550,14 @@ class DeliveryDispatcher:
                 attempt=claim.attempt,
                 error_code="delivery_effect_superseded_by_newer_settled_fields",
             )
+
+        verification_failure = self._verify_report_artifacts(
+            claim,
+            validated,
+            uncertain=prior_write_uncertain,
+        )
+        if verification_failure is not None:
+            return verification_failure
 
         self._heartbeat(claim)
         try:
@@ -2509,12 +2606,21 @@ class DeliveryDispatcher:
         fields_match = _field_updates_match(
             before_fields, validated.field_updates
         )
-        matches = _marker_matches(comments, validated.marker)
-        if len(matches) > 1:
+        marker_matches = _marker_matches(comments, validated.marker)
+        if len(marker_matches) > 1:
             return self._quarantine(
                 claim,
                 error_code="delivery_remote_marker_duplicate",
                 detail="multiple comments contain the exact delivery marker",
+            )
+        matches = _confirmed_content_matches(
+            comments, validated.marker, validated.content
+        )
+        if marker_matches and not matches:
+            return self._quarantine(
+                claim,
+                error_code="delivery_remote_content_mismatch",
+                detail="delivery marker exists without the canonical effect content",
             )
         existing_marker = matches[0] if matches else None
         if existing_marker is not None and fields_match:
@@ -2597,14 +2703,23 @@ class DeliveryDispatcher:
                     confirmation,
                     uncertain_default=True,
                 )
-            confirmation_matches = _marker_matches(
+            confirmation_marker_matches = _marker_matches(
                 confirmation_comments, validated.marker
             )
-            if len(confirmation_matches) > 1:
+            if len(confirmation_marker_matches) > 1:
                 return self._quarantine(
                     claim,
                     error_code="delivery_remote_marker_duplicate",
                     detail="multiple comments contain the exact delivery marker",
+                )
+            confirmation_matches = _confirmed_content_matches(
+                confirmation_comments, validated.marker, validated.content
+            )
+            if confirmation_marker_matches and not confirmation_matches:
+                return self._quarantine(
+                    claim,
+                    error_code="delivery_remote_content_mismatch",
+                    detail="delivery marker exists without the canonical effect content",
                 )
             if confirmation_matches and fields_match:
                 return self._complete_from_marker(
@@ -2636,72 +2751,24 @@ class DeliveryDispatcher:
                         exact_delay_seconds=UNCERTAIN_RECONCILIATION_POLL_SECONDS,
                     )
                 recovery_write_count = recovery_authorization
-        if not prior_write_uncertain or existing_marker is not None:
-            for role, artifact_url, expected_size, expected_sha256 in validated.artifacts:
-                self._heartbeat(claim)
-                try:
-                    verification_raw = self.report_verifier(
-                        artifact_url,
-                        expected_size,
-                        expected_sha256,
-                    )
-                except Exception as exc:
-                    self._heartbeat(claim)
-                    return self._retry(
-                        claim,
-                        error_code="report_http_unavailable",
-                        detail=type(exc).__name__,
-                        uncertain=False,
-                    )
-                self._heartbeat(claim)
-                if not isinstance(verification_raw, Mapping):
-                    return self._open_circuit(
-                        claim,
-                        error_code="delivery_boundary_contract_invalid",
-                        detail="report_verifier must return an object",
-                        uncertain=False,
-                    )
-                verification = dict(verification_raw)
-                if verification.get("success") is not True:
-                    if verification.get("success") is not False:
-                        verification = {
-                            "success": False,
-                            "error_code": "delivery_boundary_contract_invalid",
-                        }
-                    return self._boundary_failure(
-                        claim, verification, uncertain_default=False
-                    )
-                if (
-                    verification.get("status_code") != 200
-                    or verification.get("content_length") != expected_size
-                    or verification.get("sha256") != expected_sha256
-                ):
-                    return self._quarantine(
-                        claim,
-                        error_code="report_http_verification_mismatch",
-                        detail=(
-                            f"successful verifier response does not match sealed {role}"
-                        ),
-                    )
-
-            if not prior_write_uncertain:
-                self._heartbeat(claim)
-                superseded = self.store.mark_effect_write_started(
-                    claim=claim,
-                    now=self.now(),
-                    activation_required=self.config.activation_required,
+        if not prior_write_uncertain:
+            self._heartbeat(claim)
+            superseded = self.store.mark_effect_write_started(
+                claim=claim,
+                now=self.now(),
+                activation_required=self.config.activation_required,
+            )
+            if superseded is not None:
+                self.stats.reconciled += 1
+                return DispatchOutcome(
+                    status="superseded",
+                    effect_key=claim.effect_key,
+                    delivery_id=claim.delivery_id,
+                    attempt=claim.attempt,
+                    error_code=(
+                        "delivery_effect_superseded_by_newer_settled_fields"
+                    ),
                 )
-                if superseded is not None:
-                    self.stats.reconciled += 1
-                    return DispatchOutcome(
-                        status="superseded",
-                        effect_key=claim.effect_key,
-                        delivery_id=claim.delivery_id,
-                        attempt=claim.attempt,
-                        error_code=(
-                            "delivery_effect_superseded_by_newer_settled_fields"
-                        ),
-                    )
         if not fields_match:
             try:
                 update_raw = self._write_field_updates(claim, validated)
@@ -2845,16 +2912,32 @@ class DeliveryDispatcher:
                 uncertain=True,
                 retry_after=after.get("retry_after_seconds"),
             )
+        after_marker_matches = _marker_matches(after_comments, validated.marker)
+        if len(after_marker_matches) > 1:
+            return self._quarantine(
+                claim,
+                error_code="delivery_remote_marker_duplicate",
+                detail="multiple comments contain the exact delivery marker",
+            )
+        after_content_matches = _confirmed_content_matches(
+            after_comments, validated.marker, validated.content
+        )
+        if after_marker_matches and not after_content_matches:
+            return self._quarantine(
+                claim,
+                error_code="delivery_remote_content_mismatch",
+                detail="delivery marker exists without the canonical effect content",
+            )
         confirmed = [
             item
-            for item in _marker_matches(after_comments, validated.marker)
+            for item in after_content_matches
             if item["remote_id"] == remote_id
         ]
         if len(confirmed) != 1:
             return self._retry(
                 claim,
                 error_code="feishu_postwrite_confirmation_mismatch",
-                detail="marker and add remote_id were not confirmed together",
+                detail="canonical content and add remote_id were not confirmed together",
                 uncertain=True,
             )
         try:
@@ -2898,6 +2981,10 @@ class DeliveryDispatcher:
                         else "read_after_write"
                     ),
                     "recovery_write_count": recovery_write_count,
+                    "confirmed_content_sha256": hashlib.sha256(
+                        validated.content.encode("utf-8")
+                    ).hexdigest(),
+                    "confirmed_report_url": claim.report_url,
                     "confirmed_field_keys": list(expected_field_keys),
                 },
                 runtime_identity=self.runtime_identity,

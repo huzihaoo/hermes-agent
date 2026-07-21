@@ -23,9 +23,6 @@ from gateway.pnc_rca_delivery_contract import (
     DeliveryContractError,
     build_report_url,
     build_terminal_delivery,
-    compute_delivery_effect_key,
-    compute_delivery_effect_payload_sha256,
-    delivery_effect_marker,
 )
 from gateway.pnc_rca_delivery_store import (
     RcaDeliveryStore,
@@ -668,6 +665,31 @@ def test_success_requires_read_before_http_add_and_read_after_remote_id(tmp_path
     assert remote.fields["field_8c912e"] == payload["report_url"]
     assert payload["report_url"] in remote.comments[0]["content"]
     assert payload["foxglove_url"] not in remote.comments[0]["content"]
+    assert receipt["confirmed_report_url"] == payload["report_url"]
+    assert receipt["confirmed_content_sha256"] == hashlib.sha256(
+        payload["comment_content"].encode("utf-8")
+    ).hexdigest()
+
+
+def test_postwrite_marker_without_canonical_body_never_acks(tmp_path):
+    _seed(tmp_path)
+
+    class TruncatingRemote(Remote):
+        def add_comment(self, project_key, work_item_id, content):
+            result = super().add_comment(project_key, work_item_id, content)
+            self.comments[-1]["content"] = content.splitlines()[0]
+            return result
+
+    remote = TruncatingRemote()
+    dispatcher, _remote, _clock = _dispatcher(tmp_path, remote=remote)
+
+    outcome = dispatcher.dispatch_one()
+
+    assert outcome.status == "quarantined"
+    assert outcome.error_code == "delivery_remote_content_mismatch"
+    assert remote.add_calls == 1
+    assert remote.update_field_calls == 1
+    assert remote.comments[0]["content"].startswith("[RCA_DELIVERY:")
 
 
 def test_existing_marker_repairs_drifted_fields_without_duplicate_comment(tmp_path):
@@ -692,6 +714,10 @@ def test_existing_marker_repairs_drifted_fields_without_duplicate_comment(tmp_pa
         store.list_rows("rca_delivery_effects")[0]["remote_receipt_json"]
     )
     assert receipt["source"] == "field_repair_after_marker"
+    assert receipt["confirmed_report_url"] == payload["report_url"]
+    assert receipt["confirmed_content_sha256"] == hashlib.sha256(
+        payload["comment_content"].encode("utf-8")
+    ).hexdigest()
 
 
 def test_meegle_normalized_marker_reconciles_without_duplicate_comment(tmp_path):
@@ -716,6 +742,88 @@ def test_meegle_normalized_marker_reconciles_without_duplicate_comment(tmp_path)
     assert outcome.remote_id == "comment-existing"
     assert remote.add_calls == 0
     assert remote.update_field_calls == 0
+
+
+def test_marker_only_remote_comment_is_quarantined_after_artifact_reverification(
+    tmp_path,
+):
+    store = _seed(tmp_path)
+    payload = json.loads(store.list_rows("rca_delivery_effects")[0]["payload_json"])
+    remote = Remote()
+    remote.comments.append(
+        {"remote_id": "comment-marker-only", "content": payload["marker"]}
+    )
+    remote.fields = {
+        item["field_key"]: item["field_value"] for item in payload["field_updates"]
+    }
+    verifier_calls = []
+
+    def verifier(url, size, sha256):
+        verifier_calls.append(url)
+        return _verified_report(url, size, sha256)
+
+    dispatcher, _remote, _clock = _dispatcher(
+        tmp_path, remote=remote, verifier=verifier
+    )
+
+    outcome = dispatcher.dispatch_one()
+
+    assert outcome.status == "quarantined"
+    assert outcome.error_code == "delivery_remote_content_mismatch"
+    assert verifier_calls
+    assert remote.add_calls == 0
+    assert remote.update_field_calls == 0
+
+
+def test_existing_marker_cannot_reconcile_while_report_http_is_unavailable(tmp_path):
+    store = _seed(tmp_path)
+    payload = json.loads(store.list_rows("rca_delivery_effects")[0]["payload_json"])
+    remote = Remote()
+    remote.comments.append(
+        {"remote_id": "comment-existing", "content": payload["comment_content"]}
+    )
+    remote.fields = {
+        item["field_key"]: item["field_value"] for item in payload["field_updates"]
+    }
+
+    def unavailable(*_args):
+        raise OSError("report service unavailable")
+
+    dispatcher, _remote, _clock = _dispatcher(
+        tmp_path, remote=remote, verifier=unavailable
+    )
+
+    outcome = dispatcher.dispatch_one()
+
+    assert outcome.status == "retry_wait"
+    assert outcome.error_code == "report_http_unavailable"
+    assert remote.history == []
+
+
+def test_report_reverification_failure_preserves_prior_write_uncertainty(tmp_path):
+    _seed(tmp_path)
+    remote = Remote()
+    remote.weak_success = True
+    first_dispatcher, _remote, clock = _dispatcher(tmp_path, remote=remote)
+
+    first = first_dispatcher.dispatch_one()
+    assert first.status == "uncertain"
+    clock.current += timedelta(seconds=2)
+
+    def unavailable(*_args):
+        raise OSError("report service unavailable")
+
+    second_dispatcher, _remote, _clock = _dispatcher(
+        tmp_path,
+        remote=remote,
+        verifier=unavailable,
+        clock=clock,
+    )
+    second = second_dispatcher.dispatch_one()
+
+    assert second.status == "uncertain"
+    assert second.error_code == "report_http_unavailable"
+    assert remote.add_calls == 1
 
 
 def test_remote_marker_matching_accepts_only_exact_meegle_normalization():
@@ -1526,48 +1634,42 @@ def test_dispatcher_rejects_foxglove_report_field_before_http(tmp_path):
     assert exc.value.code == "delivery_effect_field_updates_invalid"
 
 
-def test_dispatcher_validates_historical_v1_effect_without_rewriting_identity(tmp_path):
+def test_dispatcher_rejects_v1_effect_even_when_forged_from_current_claim(tmp_path):
     store = _seed(tmp_path)
     claim = store.claim_due_effect(lease_owner="worker-1", now=NOW)
     assert claim is not None
-    payload = dict(claim.payload)
-    payload["schema_version"] = DELIVERY_EFFECT_SCHEMA_VERSION_V1
-    payload.pop("report_link_kind")
-    field_updates = [dict(item) for item in payload["field_updates"]]
-    field_updates[1]["field_value"] = payload["foxglove_url"]
-    payload["field_updates"] = field_updates
-    payload["comment_content"] = payload["comment_content"].replace(
-        claim.report_url,
-        payload["foxglove_url"],
-    )
-    semantic_sha = compute_delivery_effect_payload_sha256(payload, claim.effect_kind)
-    effect_key = compute_delivery_effect_key(
-        delivery_id=claim.delivery_id,
-        effect_kind=claim.effect_kind,
-        target_key=claim.target_key,
-        semantic_payload_sha256=semantic_sha,
-    )
-    marker = delivery_effect_marker(effect_key, claim.artifact_set_id)
-    payload["comment_content"] = payload["comment_content"].replace(
-        claim.payload["marker"],
-        marker,
-        1,
-    )
-    payload.update(
-        effect_key=effect_key,
-        marker=marker,
-        semantic_payload_sha256=semantic_sha,
-    )
     legacy = replace(
         claim,
-        effect_key=effect_key,
-        payload_sha256=semantic_sha,
-        payload=payload,
+        payload={
+            **claim.payload,
+            "schema_version": DELIVERY_EFFECT_SCHEMA_VERSION_V1,
+        },
     )
 
-    validated = dispatcher_module._validate_effect(legacy)
+    with pytest.raises(DeliveryContractError) as exc:
+        dispatcher_module._validate_effect(legacy)
 
-    assert validated.field_updates[1] == ("field_8c912e", payload["foxglove_url"])
+    assert exc.value.code == "delivery_effect_schema_unsupported"
+
+
+def test_dispatcher_rejects_unhashed_arbitrary_comment_body(tmp_path):
+    store = _seed(tmp_path)
+    claim = store.claim_due_effect(lease_owner="worker-1", now=NOW)
+    assert claim is not None
+    tampered = replace(
+        claim,
+        payload={
+            **claim.payload,
+            "comment_content": (
+                f"{claim.payload['marker']}\narbitrary body\n{claim.report_url}"
+            ),
+        },
+    )
+
+    with pytest.raises(DeliveryContractError) as exc:
+        dispatcher_module._validate_effect(tampered)
+
+    assert exc.value.code == "delivery_effect_content_invalid"
 
 
 def test_dispatcher_rejects_project_alias_issue_url_before_http(tmp_path):
@@ -2642,7 +2744,12 @@ def test_later_page_marker_reconciles_and_cross_page_duplicate_conflicts(
             }
         else:
             payload = {
-                "comments": [{"comment_id": "c-page-2", "content": marker}],
+                "comments": [
+                    {
+                        "comment_id": "c-page-2",
+                        "content": effect_payload["comment_content"],
+                    }
+                ],
                 "has_more": False,
             }
         return 0, json.dumps(payload), ""

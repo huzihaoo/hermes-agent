@@ -408,6 +408,66 @@ def delivery_effect_idempotency_uuid(effect_key: str) -> str:
     return str(uuid.UUID(digest[:32]))
 
 
+def build_issue_comment_content(
+    *,
+    marker: str,
+    work_item_id: str,
+    report_status: str,
+    conclusion: str,
+    report_url: str,
+    report_cifs_path: str,
+) -> str:
+    lines = [
+        marker,
+        "【G1Q3 RCA 机器人报告】RCA 报告已生成，需人工复核后结案。",
+        f"问题：{work_item_id}",
+        f"报告状态：{report_status}",
+    ]
+    if conclusion:
+        lines.append(f"候选结论：{conclusion}")
+    lines.extend(
+        [
+            f"归因报告：{report_url}",
+            f"报告文件（CIFS）：{report_cifs_path}",
+            "说明：以上为自动 RCA 候选结论，需人工复核确认后再结案。",
+        ]
+    )
+    content = "\n".join(lines)
+    if len(content.encode("utf-8")) > MAX_FEISHU_COMMENT_BYTES:
+        raise DeliveryContractError("delivery_comment_too_large")
+    return content
+
+
+def build_thread_reply_content(
+    *,
+    marker: str,
+    work_item_id: str,
+    report_status: str,
+    conclusion: str,
+    report_url: str,
+    issue_url: str,
+) -> str:
+    lines = [
+        marker,
+        "【G1Q3 RCA 任务话题交付】RCA 报告已生成，需人工复核后结案。",
+        f"问题：{work_item_id}",
+        f"报告状态：{report_status}",
+    ]
+    if conclusion:
+        lines.append(f"候选结论：{conclusion}")
+    lines.extend(
+        [
+            f"归因报告：{report_url}",
+            f"问题单：{issue_url}",
+            "说明：以上为自动 RCA 候选结论，需人工复核确认后再结案。",
+        ]
+    )
+    content = "\n".join(lines)
+    if len(content.encode("utf-8")) > MAX_FEISHU_COMMENT_BYTES:
+        raise DeliveryContractError("delivery_thread_reply_too_large")
+    return content
+
+
 def terminal_delivery_effect_semantic_payload(
     payload: Mapping[str, Any], effect_kind: str
 ) -> dict[str, Any]:
@@ -846,15 +906,11 @@ def build_thread_reply_effect(
         work_item_id=str(issue.get("work_item_id") or ""),
     )
     schema_version = issue.get("schema_version")
-    if schema_version == DELIVERY_EFFECT_SCHEMA_VERSION_V1:
-        semantic_fields = _V1_BASE_EFFECT_SEMANTIC_FIELDS
-    elif schema_version == DELIVERY_EFFECT_SCHEMA_VERSION:
-        semantic_fields = _BASE_EFFECT_SEMANTIC_FIELDS
-    else:
+    if schema_version != DELIVERY_EFFECT_SCHEMA_VERSION:
         raise DeliveryContractError("delivery_effect_schema_unsupported")
     semantic = {
         key: issue.get(key)
-        for key in semantic_fields
+        for key in _BASE_EFFECT_SEMANTIC_FIELDS
         if key not in {"effect_kind", "target_key"}
     }
     semantic.update(
@@ -878,35 +934,15 @@ def build_thread_reply_effect(
     )
     artifact_set_id = str(semantic.get("artifact_set_id") or "")
     marker = delivery_effect_marker(effect_key, artifact_set_id)
-    lines = [
-        marker,
-        "【G1Q3 RCA 任务话题交付】RCA 报告已生成，需人工复核后结案。",
-        f"问题：{semantic.get('work_item_id')}",
-        f"报告状态：{semantic.get('report_status')}",
-    ]
     conclusion = str(semantic.get("conclusion") or "").strip()
-    if conclusion:
-        lines.append(f"候选结论：{conclusion}")
-    report_link = (
-        semantic.get("report_url")
-        if schema_version == DELIVERY_EFFECT_SCHEMA_VERSION
-        else semantic.get("foxglove_url")
+    message_content = build_thread_reply_content(
+        marker=marker,
+        work_item_id=str(semantic.get("work_item_id") or ""),
+        report_status=str(semantic.get("report_status") or ""),
+        conclusion=conclusion,
+        report_url=str(semantic.get("report_url") or ""),
+        issue_url=str(semantic.get("issue_url") or ""),
     )
-    report_label = (
-        "归因报告"
-        if schema_version == DELIVERY_EFFECT_SCHEMA_VERSION
-        else "Foxglove 归因报告"
-    )
-    lines.extend(
-        [
-            f"{report_label}：{report_link}",
-            f"问题单：{semantic.get('issue_url')}",
-            "说明：以上为自动 RCA 候选结论，需人工复核确认后再结案。",
-        ]
-    )
-    message_content = "\n".join(lines)
-    if len(message_content.encode("utf-8")) > MAX_FEISHU_COMMENT_BYTES:
-        raise DeliveryContractError("delivery_thread_reply_too_large")
     payload = {
         **semantic,
         "effect_key": effect_key,
@@ -1841,25 +1877,14 @@ def verify_delivery_bundle(
         semantic_payload_sha256=semantic_payload_sha256,
     )
     marker = delivery_effect_marker(effect_key, expected_artifact_set_id)
-    comment_lines = [
-        marker,
-        "【G1Q3 RCA 机器人报告】RCA 报告已生成，需人工复核后结案。",
-        f"问题：{refs.work_item_id}",
-        f"报告状态：{report_status}",
-    ]
-    if conclusion:
-        comment_lines.append(f"候选结论：{conclusion}")
-    comment_lines.extend(
-        [
-
-            f"归因报告：{report_url}",
-            f"报告文件（CIFS）：{report_cifs_path}",
-            "说明：以上为自动 RCA 候选结论，需人工复核确认后再结案。",
-        ]
+    comment_content = build_issue_comment_content(
+        marker=marker,
+        work_item_id=refs.work_item_id,
+        report_status=report_status,
+        conclusion=conclusion,
+        report_url=report_url,
+        report_cifs_path=report_cifs_path,
     )
-    comment_content = "\n".join(comment_lines)
-    if len(comment_content.encode("utf-8")) > MAX_FEISHU_COMMENT_BYTES:
-        raise DeliveryContractError("delivery_comment_too_large")
     effect_payload = {
         **semantic_payload,
         "effect_key": effect_key,
