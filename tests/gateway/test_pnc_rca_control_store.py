@@ -15,6 +15,8 @@ from gateway.pnc_rca_control_store import (
     CapacityTransitionStateError,
     ControlStoreCapacityError,
     INPUT_WAIT_QUARANTINE_REARMED_REASON,
+    INPUT_WAIT_EXECUTION_WATCH_PRESENT_REASON,
+    INPUT_WAIT_TERMINAL_NEW_GENERATION_REASON,
     KafkaRecord,
     MANUAL_TRIGGER_SCHEMA_VERSION,
     ManualRcaAdmissionError,
@@ -1545,8 +1547,14 @@ def _quarantine_for_input_wait(
     store: RcaControlStore,
     *,
     error_code: str = "issue_field_missing_remote_data_reference",
+    submission_key: str = "",
 ) -> tuple[int, datetime]:
-    row = store.list_rows("rca_outbox")[0]
+    rows = store.list_rows("rca_outbox")
+    row = (
+        next(item for item in rows if item["submission_key"] == submission_key)
+        if submission_key
+        else rows[0]
+    )
     window_started = datetime.fromisoformat(row["retry_window_started_at"])
     claim = store.claim_outbox(
         lease_owner="input-wait-test",
@@ -1554,6 +1562,8 @@ def _quarantine_for_input_wait(
         now=window_started + timedelta(seconds=1),
     )
     assert claim is not None
+    if submission_key:
+        assert claim.submission_key == submission_key
     mutation = store.retry_outbox(
         outbox_id=claim.outbox_id,
         lease_token=claim.lease_token,
@@ -1615,6 +1625,16 @@ def _terminalize_permanent(store: RcaControlStore, submission_key: str) -> None:
     delivery = RcaDeliveryStore(store.db_path)
     assert delivery.backfill_completed_submissions() == 1
     _settle_delivery(store, submission_key)
+
+
+def _terminalize_input_wait(
+    store: RcaControlStore, submission_key: str, *, settle: bool = True
+) -> None:
+    _quarantine_for_input_wait(store)
+    delivery = RcaDeliveryStore(store.db_path)
+    assert delivery.backfill_completed_submissions() == 1
+    if settle:
+        _settle_delivery(store, submission_key)
 
 
 def _inject_conflicting_issue_scope_chain(
@@ -2495,6 +2515,304 @@ def test_input_wait_quarantine_is_atomically_rearmed_by_new_offset(tmp_path):
     )
     assert completed.status == "completed"
     assert len(store.list_rows("rca_outbox")) == 1
+
+
+def test_settled_input_wait_terminal_creates_canonical_next_generation(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    first = store.ingest_record(
+        _record(10), policy=_policy(), submit_enabled=True
+    )
+    _terminalize_input_wait(store, first.submission_key)
+    delivery = RcaDeliveryStore(store.db_path)
+    [old_trigger_before] = store.list_rows("business_triggers")
+    [old_outbox_before] = store.list_rows("rca_outbox")
+    [old_watch_before] = delivery.list_rows("rca_execution_watch")
+    [old_job_before] = delivery.list_rows("rca_delivery_jobs")
+    old_effects_before = delivery.list_rows("rca_delivery_effects")
+    old_source_id = old_trigger_before["origin_source_id"]
+    [old_binding_before] = [
+        row
+        for row in store.list_rows("rca_trigger_bindings")
+        if row["source_id"] == old_source_id
+    ]
+
+    replacement = store.ingest_record(
+        _record(11, value=_value(updated_at=1783659999999)),
+        policy=_policy(),
+        submit_enabled=True,
+    )
+    expected = build_rca_admission(
+        project_key="project-key",
+        project_simple_name="g1q3",
+        work_item_type_key="problem-type",
+        work_item_id="7041712812",
+        rule_version="issue-created-v1",
+        trigger_kind="manual_retrigger",
+        generation=2,
+        topic=TOPIC,
+        partition=2,
+        offset=11,
+    )
+
+    assert replacement.decision == "accepted"
+    assert replacement.reason == INPUT_WAIT_TERMINAL_NEW_GENERATION_REASON
+    assert replacement.rearm_reason == INPUT_WAIT_TERMINAL_NEW_GENERATION_REASON
+    assert replacement.outbox_rearmed is False
+    assert replacement.trigger_created is replacement.outbox_created is True
+    assert replacement.business_key == first.business_key == expected.business_key
+    assert replacement.submission_key == expected.submission_key
+    assert replacement.submission_key != first.submission_key
+    assert replacement.generation == 2
+
+    triggers = store.list_rows("business_triggers")
+    outboxes = store.list_rows("rca_outbox")
+    assert [row["generation"] for row in triggers] == [1, 2]
+    assert [row["generation"] for row in outboxes] == [1, 2]
+    assert triggers[0] == old_trigger_before
+    assert outboxes[0] == old_outbox_before
+    assert delivery.list_rows("rca_execution_watch") == [old_watch_before]
+    assert delivery.list_rows("rca_delivery_jobs") == [old_job_before]
+    assert delivery.list_rows("rca_delivery_effects") == old_effects_before
+
+    new_trigger = triggers[1]
+    new_outbox = outboxes[1]
+    assert new_trigger["origin_source_id"] != old_source_id
+    assert new_trigger["source_event_id"] == replacement.event_uid
+    assert new_trigger["source_offset"] == 11
+    assert new_outbox["origin_source_id"] == new_trigger["origin_source_id"]
+    assert new_outbox["status"] == "pending"
+    new_payload = json.loads(new_outbox["payload_json"])
+    assert new_payload["admission"] == expected.to_dict()
+    assert new_payload["source_event_id"] == replacement.event_uid
+    assert new_payload["offset"] == 11
+
+    bindings = store.list_rows("rca_trigger_bindings")
+    assert next(row for row in bindings if row["source_id"] == old_source_id) == (
+        old_binding_before
+    )
+    [new_binding] = [
+        row
+        for row in bindings
+        if row["source_id"] == new_trigger["origin_source_id"]
+    ]
+    assert new_binding["business_key"] == first.business_key
+    assert new_binding["generation"] == 2
+    assert new_binding["role"] == "origin"
+
+
+def test_unsettled_input_wait_terminal_blocks_rearm_and_next_generation(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    first = store.ingest_record(
+        _record(10), policy=_policy(), submit_enabled=True
+    )
+    _terminalize_input_wait(store, first.submission_key, settle=False)
+    delivery = RcaDeliveryStore(store.db_path)
+    old_trigger = dict(store.list_rows("business_triggers")[0])
+    old_outbox = dict(store.list_rows("rca_outbox")[0])
+
+    replacement = store.ingest_record(
+        _record(11, value=_value(updated_at=1783659999999)),
+        policy=_policy(),
+        submit_enabled=True,
+    )
+
+    assert replacement.decision == "deduped"
+    assert replacement.submission_key == first.submission_key
+    assert replacement.generation == 1
+    assert replacement.outbox_rearmed is False
+    assert replacement.rearm_reason == INPUT_WAIT_EXECUTION_WATCH_PRESENT_REASON
+    assert store.list_rows("business_triggers") == [old_trigger]
+    assert store.list_rows("rca_outbox") == [old_outbox]
+    assert {row["status"] for row in delivery.list_rows("rca_delivery_effects")} == {
+        "pending"
+    }
+
+
+def test_concurrent_terminal_replacements_create_one_generation_and_replay_exactly(
+    tmp_path,
+):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    first = store.ingest_record(
+        _record(10), policy=_policy(), submit_enabled=True
+    )
+    _terminalize_input_wait(store, first.submission_key)
+    payloads = {
+        offset: _value(updated_at=1783650000000 + offset)
+        for offset in range(20, 28)
+    }
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(
+            pool.map(
+                lambda offset: store.ingest_record(
+                    _record(offset, value=payloads[offset]),
+                    policy=_policy(),
+                    submit_enabled=True,
+                ),
+                range(20, 28),
+            )
+        )
+
+    creators = [result for result in results if result.trigger_created]
+    assert len(creators) == 1
+    creator = creators[0]
+    assert creator.rearm_reason == INPUT_WAIT_TERMINAL_NEW_GENERATION_REASON
+    assert {result.generation for result in results} == {2}
+    assert len({result.submission_key for result in results}) == 1
+    assert creator.submission_key != first.submission_key
+    assert [row["generation"] for row in store.list_rows("business_triggers")] == [
+        1,
+        2,
+    ]
+    assert len(store.list_rows("rca_outbox")) == 2
+
+    creator_offset = int(creator.event_uid.rsplit(":", 1)[1])
+    replay = store.ingest_record(
+        _record(creator_offset, value=payloads[creator_offset]),
+        policy=_policy(),
+        submit_enabled=True,
+    )
+    assert replay.transport_duplicate is True
+    assert replay.generation == 2
+    assert replay.submission_key == creator.submission_key
+    assert replay.rearm_reason == INPUT_WAIT_TERMINAL_NEW_GENERATION_REASON
+    assert len(store.list_rows("business_triggers")) == 2
+    assert len(store.list_rows("rca_outbox")) == 2
+
+
+def test_terminal_replacement_transaction_rolls_back_and_retries_cleanly(
+    tmp_path, monkeypatch
+):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    first = store.ingest_record(
+        _record(10), policy=_policy(), submit_enabled=True
+    )
+    _terminalize_input_wait(store, first.submission_key)
+    old_trigger = dict(store.list_rows("business_triggers")[0])
+    old_outbox = dict(store.list_rows("rca_outbox")[0])
+    replacement_record = _record(11, value=_value(updated_at=1783659999999))
+    raw = store.persist_raw(
+        replacement_record, policy=_policy(), submit_enabled=True
+    )
+    original_insert = store._insert_issue_subscription_tx
+
+    def fail_after_generation_created(*_args, **_kwargs):
+        raise RuntimeError("injected_after_generation_create")
+
+    monkeypatch.setattr(
+        store, "_insert_issue_subscription_tx", fail_after_generation_created
+    )
+    with pytest.raises(RecordProcessingBlockedError):
+        store.process_event_resilient(raw.event_uid)
+
+    assert store.list_rows("business_triggers") == [old_trigger]
+    assert store.list_rows("rca_outbox") == [old_outbox]
+    assert len(store.list_rows("rca_trigger_sources")) == 1
+    failed_inbox = store.get_inbox(raw.event_uid)
+    assert failed_inbox["decision"] == "pending"
+    assert failed_inbox["processing_attempts"] == 1
+
+    monkeypatch.setattr(store, "_insert_issue_subscription_tx", original_insert)
+    recovered = store.process_event_resilient(raw.event_uid)
+    assert recovered.trigger_created is recovered.outbox_created is True
+    assert recovered.generation == 2
+    assert recovered.rearm_reason == INPUT_WAIT_TERMINAL_NEW_GENERATION_REASON
+    assert len(store.list_rows("business_triggers")) == 2
+    assert len(store.list_rows("rca_outbox")) == 2
+
+
+def test_terminal_replacement_consumes_and_binds_exact_activation_slot(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    first = store.ingest_record(
+        _record(10), policy=_policy(), submit_enabled=True
+    )
+    _terminalize_input_wait(store, first.submission_key)
+    _begin_bounded_activation(store, kafka_offset=20)
+
+    replacement = store.ingest_record(
+        _record(20, value=_value(updated_at=1783659999999)),
+        policy=_policy(),
+        submit_enabled=True,
+        activation_required=True,
+        activation_slot_kind="kafka_success",
+    )
+
+    assert replacement.generation == 2
+    assert replacement.rearm_reason == INPUT_WAIT_TERMINAL_NEW_GENERATION_REASON
+    outboxes = store.list_rows("rca_outbox")
+    old_outbox, new_outbox = outboxes
+    assert old_outbox["activation_epoch_id"] is None
+    assert old_outbox["activation_ledger_id"] is None
+    assert new_outbox["activation_epoch_id"] == "rca-release-20260712"
+    assert new_outbox["activation_ledger_id"] is not None
+    new_trigger = store.list_rows("business_triggers")[1]
+    assert new_trigger["activation_epoch_id"] == new_outbox["activation_epoch_id"]
+    assert new_trigger["activation_ledger_id"] == new_outbox["activation_ledger_id"]
+    [ledger] = [
+        row
+        for row in store.list_rows("rca_activation_admission_ledger")
+        if row["ledger_id"] == new_outbox["activation_ledger_id"]
+    ]
+    assert ledger["source_kind"] == "kafka"
+    assert ledger["business_key"] == replacement.business_key
+    assert ledger["submission_key"] == replacement.submission_key
+    assert ledger["generation"] == 2
+    assert ledger["decision"] == "admit"
+    kafka_slot = next(
+        row
+        for row in store.list_rows("rca_activation_budget_slots")
+        if row["slot_kind"] == "kafka_success"
+    )
+    assert kafka_slot["consumed_ledger_id"] == ledger["ledger_id"]
+
+
+def test_failed_next_generation_advances_again_without_rearming_old_baseline(
+    tmp_path,
+):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    first = store.ingest_record(
+        _record(10), policy=_policy(), submit_enabled=True
+    )
+    _terminalize_input_wait(store, first.submission_key)
+    second = store.ingest_record(
+        _record(11, value=_value(updated_at=1783659999999)),
+        policy=_policy(),
+        submit_enabled=True,
+    )
+    assert second.generation == 2
+    generation_one_trigger = dict(store.list_rows("business_triggers")[0])
+    generation_one_outbox = dict(store.list_rows("rca_outbox")[0])
+    delivery = RcaDeliveryStore(store.db_path)
+    generation_one_watch = dict(delivery.list_rows("rca_execution_watch")[0])
+    generation_one_job = dict(delivery.list_rows("rca_delivery_jobs")[0])
+
+    _quarantine_for_input_wait(store, submission_key=second.submission_key)
+    assert delivery.backfill_completed_submissions() == 1
+    _settle_delivery(store, second.submission_key)
+    third = store.ingest_record(
+        _record(12, value=_value(updated_at=1783660000000)),
+        policy=_policy(),
+        submit_enabled=True,
+    )
+
+    assert third.generation == 3
+    assert third.submission_key not in {
+        first.submission_key,
+        second.submission_key,
+    }
+    assert third.rearm_reason == INPUT_WAIT_TERMINAL_NEW_GENERATION_REASON
+    assert [row["generation"] for row in store.list_rows("business_triggers")] == [
+        1,
+        2,
+        3,
+    ]
+    assert store.list_rows("business_triggers")[0] == generation_one_trigger
+    assert store.list_rows("rca_outbox")[0] == generation_one_outbox
+    assert delivery.list_rows("rca_execution_watch")[0] == generation_one_watch
+    assert delivery.list_rows("rca_delivery_jobs")[0] == generation_one_job
+    generation_two_outbox = store.list_rows("rca_outbox")[1]
+    assert generation_two_outbox["status"] == "quarantined"
+    assert generation_two_outbox["submission_key"] == second.submission_key
 
 
 @pytest.mark.parametrize(

@@ -24,7 +24,9 @@ from scripts.pnc_foxglove_delivery import (
 DELIVERY_CONTRACT_SCHEMA_VERSION = "g1q3_delivery_contract_v1"
 DELIVERY_MANIFEST_SCHEMA_VERSION = "delivery_manifest_v1"
 DELIVERY_EFFECT_SCHEMA_VERSION = "pnc_rca_delivery_effect_v1"
-TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION = "pnc_rca_terminal_delivery_effect_v1"
+TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1 = "pnc_rca_terminal_delivery_effect_v1"
+TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION = "pnc_rca_terminal_delivery_effect_v2"
+TERMINAL_DIAGNOSTIC_CONTRACT_SCHEMA_VERSION = "pnc_rca_terminal_diagnostic_v1"
 DELIVERY_KEY_VERSION = "v1"
 DELIVERY_EFFECT_KIND = "feishu_issue_comment"
 DELIVERY_THREAD_EFFECT_KIND = "feishu_thread_reply"
@@ -140,7 +142,10 @@ class VerifiedTerminalDelivery:
     work_item_type_key: str
     work_item_id: str
     target_key: str
+    diagnostic_code: str
+    diagnostic_result: str
     marker: str
+    contract: dict[str, Any]
     effect_payload: dict[str, Any]
 
     def job_payload(self) -> dict[str, Any]:
@@ -157,9 +162,10 @@ class VerifiedTerminalDelivery:
             "work_item_type_key": self.work_item_type_key,
             "work_item_id": self.work_item_id,
             "target_key": self.target_key,
+            "issue_url": "",
             "report_url": "",
             "manifest": {},
-            "contract": {},
+            "contract": self.contract,
             "artifacts": [],
         }
 
@@ -206,7 +212,7 @@ _THREAD_EFFECT_SEMANTIC_FIELDS = (
     "reply_in_thread",
     "output_cap",
 )
-_TERMINAL_BASE_EFFECT_SEMANTIC_FIELDS = (
+_TERMINAL_V1_BASE_EFFECT_SEMANTIC_FIELDS = (
     "schema_version",
     "delivery_id",
     "effect_kind",
@@ -220,6 +226,91 @@ _TERMINAL_BASE_EFFECT_SEMANTIC_FIELDS = (
     "submission_key",
     "generation",
 )
+_TERMINAL_BASE_EFFECT_SEMANTIC_FIELDS = (
+    *_TERMINAL_V1_BASE_EFFECT_SEMANTIC_FIELDS,
+    "diagnostic_code",
+    "diagnostic_result",
+    "field_updates",
+)
+
+_TERMINAL_DIAGNOSTIC_RESULTS = {
+    "input_remote_data_required": (
+        "自动归因未完成（非归因结论）：问题单缺少问题数据地址，请补充有效的 event/clip 引用后重试。"
+    ),
+    "input_remote_data_invalid": (
+        "自动归因未完成（非归因结论）：问题数据地址无法解析，请修正 event/clip 引用后重试。"
+    ),
+    "input_frame_required": (
+        "自动归因未完成（非归因结论）：缺少或无法解析问题发生 frame_id/时间，请修正后重试。"
+    ),
+    "input_required": (
+        "自动归因未完成（非归因结论）：问题单缺少自动分析所需输入，请补齐后重试。"
+    ),
+    "issue_source_unavailable": (
+        "自动归因未完成（非归因结论）：本次未能可靠读取问题单输入，请恢复读取链路后重试。"
+    ),
+    "submission_failed": (
+        "自动归因未完成（非归因结论）：任务在提交前终止，请由系统维护者排查并显式重试。"
+    ),
+    "analysis_failed": (
+        "自动归因未完成（非归因结论）：自动分析任务异常终止，请由系统维护者排查并显式重试。"
+    ),
+}
+_TERMINAL_INPUT_DIAGNOSTIC_CODES = {
+    "issue_field_missing_remote_data_reference": "input_remote_data_required",
+    "issue_field_invalid_remote_data_reference": "input_remote_data_invalid",
+    "issue_field_invalid_frame_reference": "input_frame_required",
+    "issue_fields_not_ready": "input_required",
+}
+_TERMINAL_SOURCE_DIAGNOSTIC_CODES = frozenset(
+    {
+        "host_issue_preread_empty",
+        "host_issue_preread_failed",
+        "host_issue_preread_timeout",
+        "host_issue_preread_unavailable",
+        "host_mcp_preread_empty",
+        "host_mcp_preread_failed",
+        "host_mcp_preread_timeout",
+        "host_meegle_preread_empty",
+        "host_meegle_preread_failed",
+        "host_meegle_preread_timeout",
+        "host_meegle_preread_unauthenticated",
+        "issue_enrichment_not_ready",
+        "issue_not_visible",
+    }
+)
+
+
+def _terminal_semantic_fields(schema_version: Any) -> tuple[str, ...]:
+    if schema_version == TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1:
+        return _TERMINAL_V1_BASE_EFFECT_SEMANTIC_FIELDS
+    if schema_version == TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION:
+        return _TERMINAL_BASE_EFFECT_SEMANTIC_FIELDS
+    raise DeliveryContractError("terminal_delivery_schema_unsupported")
+
+
+def terminal_diagnostic_code(
+    error_code: Any,
+    *,
+    source_error_code: Any = "",
+) -> str:
+    """Project private terminal causes into a small, non-sensitive public taxonomy."""
+
+    public_code = str(error_code or "").strip().lower()
+    source_code = str(source_error_code or "").strip().lower()
+    for candidate in (source_code, public_code):
+        mapped = _TERMINAL_INPUT_DIAGNOSTIC_CODES.get(candidate)
+        if mapped:
+            return mapped
+        if candidate in _TERMINAL_SOURCE_DIAGNOSTIC_CODES:
+            return "issue_source_unavailable"
+        if candidate.endswith("_need_keyframe"):
+            return "input_frame_required"
+        if candidate.endswith("_required_input"):
+            return "input_required"
+    if public_code == "outbox_submission_quarantined":
+        return "submission_failed"
+    return "analysis_failed"
 
 
 def delivery_effect_semantic_payload(
@@ -275,7 +366,7 @@ def terminal_delivery_effect_semantic_payload(
 ) -> dict[str, Any]:
     if effect_kind not in DELIVERY_EFFECT_KINDS:
         raise DeliveryContractError("delivery_effect_kind_unsupported")
-    fields = list(_TERMINAL_BASE_EFFECT_SEMANTIC_FIELDS)
+    fields = list(_terminal_semantic_fields(payload.get("schema_version")))
     if effect_kind == DELIVERY_THREAD_EFFECT_KIND:
         fields.extend(_THREAD_EFFECT_SEMANTIC_FIELDS)
     return {key: payload.get(key) for key in fields}
@@ -335,18 +426,37 @@ def _terminal_content(
     submission_key: str,
     generation: int,
     thread: bool,
+    diagnostic_result: str = "",
 ) -> str:
     heading = "【G1Q3 RCA 任务话题终态】" if thread else "【G1Q3 RCA 机器人终态】"
-    lines = [
-        marker,
-        f"{heading}本次自动分析未生成可交付报告。",
-        f"任务：{submission_key}",
-        f"代次：{generation}",
-        f"终态：{terminal_state}",
-        f"结果：{outcome}",
-        f"错误码：{error_code}",
-        "说明：未生成或发布 HTML 报告；请根据错误码排查后显式重试。",
-    ]
+    if diagnostic_result:
+        lines = [
+            marker,
+            f"{heading}诊断报告",
+            f"诊断结论：{diagnostic_result}",
+            f"任务：{submission_key}",
+            f"代次：{generation}",
+            f"终态：{terminal_state}",
+            f"结果：{outcome}",
+            f"错误码：{error_code}",
+            "本代归因报告：未生成（不存在已验证的 Foxglove 发布产物）。",
+            (
+                "报告字段：本终态不改写；若问题单现有值非空，可能属于其他代次，"
+                f"不代表第 {generation} 代结论。"
+            ),
+            "说明：本终态诊断不包含自动归因结论；修复输入或系统故障后需显式重试。",
+        ]
+    else:
+        lines = [
+            marker,
+            f"{heading}本次自动分析未生成可交付报告。",
+            f"任务：{submission_key}",
+            f"代次：{generation}",
+            f"终态：{terminal_state}",
+            f"结果：{outcome}",
+            f"错误码：{error_code}",
+            "说明：未生成或发布 HTML 报告；请根据错误码排查后显式重试。",
+        ]
     content = "\n".join(lines)
     if len(content.encode("utf-8")) > MAX_FEISHU_COMMENT_BYTES:
         raise DeliveryContractError("terminal_delivery_content_too_large")
@@ -364,6 +474,9 @@ def build_terminal_delivery(
     outcome: str,
     terminal_state: str,
     error_code: str,
+    source_error_code: str = "",
+    diagnostic_code: str = "",
+    schema_version: str = TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
 ) -> VerifiedTerminalDelivery:
     values = {
         "business_key": _required_text(business_key, "business_key"),
@@ -383,6 +496,11 @@ def build_terminal_delivery(
         raise DeliveryContractError("terminal_delivery_outcome_invalid")
     normalized_state = _terminal_code(terminal_state, "state")
     normalized_error = _terminal_code(error_code, "error_code")
+    if schema_version not in {
+        TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1,
+        TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
+    }:
+        raise DeliveryContractError("terminal_delivery_schema_unsupported")
     target_key = (
         f"feishu_project:{values['project_key']}:{values['work_item_type_key']}:"
         f"{values['work_item_id']}"
@@ -406,8 +524,8 @@ def build_terminal_delivery(
             "target_key": target_key,
         },
     )
-    semantic = {
-        "schema_version": TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
+    semantic: dict[str, Any] = {
+        "schema_version": schema_version,
         "delivery_id": delivery_id,
         "effect_kind": DELIVERY_EFFECT_KIND,
         "target_key": target_key,
@@ -420,6 +538,51 @@ def build_terminal_delivery(
         "submission_key": values["submission_key"],
         "generation": generation,
     }
+    diagnostic_result = ""
+    diagnostic_contract: dict[str, Any] = {}
+    if schema_version == TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION:
+        derived_diagnostic_code = terminal_diagnostic_code(
+            normalized_error,
+            source_error_code=source_error_code,
+        )
+        normalized_diagnostic_code = str(diagnostic_code or derived_diagnostic_code).strip()
+        if normalized_diagnostic_code not in _TERMINAL_DIAGNOSTIC_RESULTS:
+            raise DeliveryContractError("terminal_delivery_diagnostic_code_invalid")
+        if (
+            normalized_error != "outbox_submission_quarantined"
+            and normalized_diagnostic_code != derived_diagnostic_code
+        ):
+            raise DeliveryContractError("terminal_delivery_diagnostic_code_mismatch")
+        diagnostic_result = (
+            f"RCA 第 {generation} 代："
+            f"{_TERMINAL_DIAGNOSTIC_RESULTS[normalized_diagnostic_code]}"
+            "本代未生成已验证归因报告；问题单归因报告字段若非空，"
+            f"可能保留自其他代次，不代表第 {generation} 代结论。"
+        )
+        field_updates = [
+            {
+                "field_key": RCA_RESULT_FIELD_KEY,
+                "field_value": diagnostic_result,
+            },
+        ]
+        semantic.update(
+            {
+                "diagnostic_code": normalized_diagnostic_code,
+                "diagnostic_result": diagnostic_result,
+                "field_updates": field_updates,
+            }
+        )
+        diagnostic_contract = {
+            "schema_version": TERMINAL_DIAGNOSTIC_CONTRACT_SCHEMA_VERSION,
+            "generation": generation,
+            "diagnostic_code": normalized_diagnostic_code,
+            "diagnostic_result": diagnostic_result,
+            "diagnostic_report_status": "not_generated",
+            "report_field_write_policy": "preserve_existing",
+            "preserved_report_semantics": "other_generation_not_current",
+        }
+    else:
+        normalized_diagnostic_code = ""
     semantic_sha = compute_terminal_delivery_effect_payload_sha256(
         semantic, DELIVERY_EFFECT_KIND
     )
@@ -445,6 +608,7 @@ def build_terminal_delivery(
             submission_key=values["submission_key"],
             generation=generation,
             thread=False,
+            diagnostic_result=diagnostic_result,
         ),
     }
     return VerifiedTerminalDelivery(
@@ -462,7 +626,10 @@ def build_terminal_delivery(
         work_item_type_key=values["work_item_type_key"],
         work_item_id=values["work_item_id"],
         target_key=target_key,
+        diagnostic_code=normalized_diagnostic_code,
+        diagnostic_result=diagnostic_result,
         marker=marker,
+        contract=diagnostic_contract,
         effect_payload=payload,
     )
 
@@ -475,7 +642,11 @@ def build_terminal_thread_reply_effect(
 ) -> tuple[str, str, dict[str, Any]]:
     issue = dict(issue_effect_payload or {})
     if (
-        issue.get("schema_version") != TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION
+        issue.get("schema_version")
+        not in {
+            TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1,
+            TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
+        }
         or issue.get("effect_kind") != DELIVERY_EFFECT_KIND
     ):
         raise DeliveryContractError("terminal_delivery_primary_effect_invalid")
@@ -494,7 +665,7 @@ def build_terminal_thread_reply_effect(
     )
     semantic = {
         key: issue.get(key)
-        for key in _TERMINAL_BASE_EFFECT_SEMANTIC_FIELDS
+        for key in _terminal_semantic_fields(issue.get("schema_version"))
         if key not in {"effect_kind", "target_key"}
     }
     semantic.update(
@@ -530,6 +701,7 @@ def build_terminal_thread_reply_effect(
             submission_key=str(semantic.get("submission_key") or ""),
             generation=generation,
             thread=True,
+            diagnostic_result=str(semantic.get("diagnostic_result") or ""),
         ),
     }
     return effect_key, semantic_sha, payload

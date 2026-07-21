@@ -33,6 +33,8 @@ from gateway.pnc_rca_delivery_contract import (
     DELIVERY_EFFECT_KINDS,
     DELIVERY_EFFECT_SCHEMA_VERSION,
     DELIVERY_THREAD_EFFECT_KIND,
+    TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
+    TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1,
     TERMINAL_DELIVERY_OUTCOMES,
     DeliveryContractError,
     MAX_DELIVERY_ARTIFACT_BYTES,
@@ -1063,7 +1065,10 @@ class MeegleIssueCommentAdapter:
         work_item_id: str,
         field_keys: tuple[str, ...],
     ) -> Mapping[str, Any]:
-        if set(field_keys) != {RCA_RESULT_FIELD_KEY, RCA_REPORT_FIELD_KEY}:
+        if field_keys not in {
+            (RCA_RESULT_FIELD_KEY,),
+            (RCA_RESULT_FIELD_KEY, RCA_REPORT_FIELD_KEY),
+        }:
             return {
                 "success": False,
                 "permanent": True,
@@ -1174,8 +1179,12 @@ class MeegleIssueCommentAdapter:
                     )
                     for row in metadata_rows
                     if isinstance(row, Mapping)
+                    and str(row.get("field_key") or "").strip() in field_keys
                 }
-            if definitions != self._RCA_FIELD_METADATA:
+            expected_definitions = {
+                key: self._RCA_FIELD_METADATA[key] for key in field_keys
+            }
+            if definitions != expected_definitions:
                 return {
                     "success": False,
                     "permanent": True,
@@ -1191,10 +1200,11 @@ class MeegleIssueCommentAdapter:
         work_item_id: str,
         field_updates: tuple[tuple[str, str], ...],
     ) -> Mapping[str, Any]:
-        if (
-            tuple(key for key, _value in field_updates)
-            != (RCA_RESULT_FIELD_KEY, RCA_REPORT_FIELD_KEY)
-        ):
+        field_keys = tuple(key for key, _value in field_updates)
+        if field_keys not in {
+            (RCA_RESULT_FIELD_KEY,),
+            (RCA_RESULT_FIELD_KEY, RCA_REPORT_FIELD_KEY),
+        }:
             return {
                 "success": False,
                 "permanent": True,
@@ -1776,6 +1786,14 @@ def _validate_terminal_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         or claim.artifacts != []
     ):
         raise DeliveryContractError("terminal_delivery_artifact_boundary_invalid")
+    payload = claim.payload
+    schema_version = str(payload.get("schema_version") or "")
+    if schema_version == TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1:
+        diagnostic_code = ""
+    elif schema_version == TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION:
+        diagnostic_code = str(claim.contract.get("diagnostic_code") or "")
+    else:
+        raise DeliveryContractError("terminal_delivery_schema_unsupported")
     primary = build_terminal_delivery(
         business_key=claim.business_key,
         submission_key=claim.submission_key,
@@ -1786,8 +1804,11 @@ def _validate_terminal_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         outcome=claim.outcome,
         terminal_state=claim.terminal_state,
         error_code=claim.terminal_error_code,
+        diagnostic_code=diagnostic_code,
+        schema_version=schema_version,
     )
-    payload = claim.payload
+    if claim.contract != primary.contract:
+        raise DeliveryContractError("terminal_delivery_diagnostic_contract_invalid")
     if claim.effect_kind == DELIVERY_EFFECT_KIND:
         expected_key = primary.effect_key
         expected_sha = primary.semantic_payload_sha256
@@ -1845,11 +1866,20 @@ def _validate_terminal_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         expected_uuid = delivery_effect_idempotency_uuid(claim.effect_key)
         if payload.get("idempotency_uuid") != expected_uuid:
             raise DeliveryContractError("delivery_effect_idempotency_invalid")
+    field_updates: tuple[tuple[str, str], ...] = ()
+    if (
+        claim.effect_kind == DELIVERY_EFFECT_KIND
+        and schema_version == TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION
+    ):
+        field_updates = (
+            (RCA_RESULT_FIELD_KEY, primary.diagnostic_result),
+        )
     return ValidatedEffect(
         effect_kind=claim.effect_kind,
         marker=marker,
         content=content,
         artifacts=(),
+        field_updates=field_updates,
         chat_id=str(payload.get("chat_id") or ""),
         thread_id=str(payload.get("thread_id") or ""),
         idempotency_uuid=str(payload.get("idempotency_uuid") or ""),
@@ -2375,6 +2405,20 @@ class DeliveryDispatcher:
             validated = _validate_effect(claim)
         except DeliveryContractError as exc:
             return self._quarantine(claim, error_code=exc.code, detail=exc.detail)
+
+        superseded = self.store.suppress_terminal_effect_if_newer_success(
+            claim=claim,
+            now=self.now(),
+        )
+        if superseded is not None:
+            self.stats.reconciled += 1
+            return DispatchOutcome(
+                status="superseded",
+                effect_key=claim.effect_key,
+                delivery_id=claim.delivery_id,
+                attempt=claim.attempt,
+                error_code="delivery_effect_superseded_by_newer_success",
+            )
 
         self._heartbeat(claim)
         try:

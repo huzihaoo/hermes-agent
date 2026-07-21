@@ -18,8 +18,10 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.pnc_rca_delivery_contract import (
+    TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1,
     DeliveryContractError,
     build_report_url,
+    build_terminal_delivery,
 )
 from gateway.pnc_rca_delivery_store import (
     RcaDeliveryStore,
@@ -42,10 +44,13 @@ from scripts.pnc_rca_delivery_dispatcher import (
     retry_delay_seconds,
     run_dispatch_loop,
 )
+from scripts.pnc_foxglove_delivery import canonical_viz_mcap_path, foxglove_url
 from tests.gateway.test_pnc_rca_delivery_store import (
     NOW,
+    _bind_activation_execution,
     _control,
     _insert_subscription,
+    _switch_activation_epoch,
 )
 from tests.gateway.test_pnc_rca_delivery_contract import _bundle
 
@@ -798,13 +803,26 @@ def test_terminal_manual_delivery_skips_report_http_and_sends_both_effects(tmp_p
         thread_remote=thread_remote,
         verifier=forbidden_verifier,
     )
+    existing_report = foxglove_url(
+        canonical_viz_mcap_path("older-generation-success")
+    )
+    assert existing_report
+    remote.fields["field_8c912e"] = existing_report
 
     outcomes = [dispatcher.dispatch_one(), dispatcher.dispatch_one()]
 
     assert {outcome.status for outcome in outcomes} == {"succeeded"}
     assert verifier_calls == []
     assert remote.add_calls == 1
+    assert remote.update_field_calls == 1
+    assert "非归因结论" in remote.fields["field_9193cb"]
+    assert "第 1 代" in remote.fields["field_9193cb"]
+    assert "可能保留自其他代次" in remote.fields["field_9193cb"]
+    assert remote.fields["field_8c912e"] == existing_report
     assert thread_remote.add_calls == 1
+    assert "本终态不改写" in remote.comments[0]["content"]
+    assert "不代表第 1 代结论" in remote.comments[0]["content"]
+    assert "本终态不改写" in thread_remote.comments[0]["content"]
     assert "sensitive backend detail" not in remote.comments[0]["content"]
     assert "sensitive backend detail" not in thread_remote.comments[0]["content"]
     assert store.list_rows("rca_delivery_jobs")[0]["status"] == "delivered"
@@ -815,6 +833,181 @@ def test_terminal_manual_delivery_skips_report_http_and_sends_both_effects(tmp_p
     assert after["delivery_job_outcomes"] == {"terminal_failed": 1}
     assert after["business_ready"] is True
     assert after["business_blockers"]["unresolved_required_effects"] == 0
+
+
+def test_historical_terminal_v1_validates_as_comment_only(tmp_path):
+    store = _seed_terminal(tmp_path)
+    claim = store.claim_due_effect(
+        lease_owner="legacy-terminal-validator",
+        lease_seconds=60,
+        now=NOW,
+    )
+    assert claim is not None
+    legacy = build_terminal_delivery(
+        business_key=claim.business_key,
+        submission_key=claim.submission_key,
+        generation=claim.generation,
+        project_key=claim.project_key,
+        work_item_type_key=claim.work_item_type_key,
+        work_item_id=claim.work_item_id,
+        outcome=claim.outcome,
+        terminal_state=claim.terminal_state,
+        error_code=claim.terminal_error_code,
+        schema_version=TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1,
+    )
+    legacy_claim = replace(
+        claim,
+        effect_key=legacy.effect_key,
+        delivery_id=legacy.delivery_id,
+        target_key=legacy.target_key,
+        payload=legacy.effect_payload,
+        payload_sha256=legacy.semantic_payload_sha256,
+        artifact_set_id=legacy.outcome_key,
+        contract={},
+    )
+
+    validated = dispatcher_module._validate_effect(legacy_claim)
+
+    assert validated.field_updates == ()
+    assert validated.artifacts == ()
+    assert "field_9193cb" not in json.dumps(legacy.effect_payload)
+
+
+def test_pre_submit_quarantine_keeps_specific_safe_diagnostic_only(tmp_path):
+    control, _result = _control(tmp_path, completed=False)
+    outbox = control.claim_outbox(lease_owner="submission-worker", now=NOW)
+    assert outbox is not None
+    control.quarantine_outbox(
+        outbox_id=outbox.outbox_id,
+        lease_token=outbox.lease_token,
+        error_code="issue_field_invalid_frame_reference",
+        error_detail="private frame value SECRET-MUST-NOT-LEAK",
+        now=NOW + timedelta(seconds=1),
+    )
+    store = RcaDeliveryStore(control.db_path)
+
+    assert store.backfill_completed_submissions(now=NOW + timedelta(seconds=2)) == 1
+
+    [job] = store.list_rows("rca_delivery_jobs")
+    [effect] = store.list_rows("rca_delivery_effects")
+    contract = json.loads(job["contract_json"])
+    payload = json.loads(effect["payload_json"])
+    assert contract["diagnostic_code"] == "input_frame_required"
+    assert payload["diagnostic_code"] == "input_frame_required"
+    assert payload["error_code"] == "outbox_submission_quarantined"
+    assert "issue_field_invalid_frame_reference" not in effect["payload_json"]
+    assert "SECRET-MUST-NOT-LEAK" not in effect["payload_json"]
+
+
+def test_older_terminal_generation_is_suppressed_before_any_remote_call(tmp_path):
+    store = _seed_terminal(tmp_path)
+    [old_job] = store.list_rows("rca_delivery_jobs")
+    newer_delivery_id = "g1q3-rca-delivery-v1-" + "9" * 64
+    current = NOW.isoformat()
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO rca_delivery_jobs(
+                delivery_id, submission_key, business_key, generation,
+                artifact_set_id, project_key, work_item_type_key, work_item_id,
+                target_key, issue_url, report_url, outcome, outcome_key,
+                terminal_state, terminal_error_code, status, manifest_json,
+                contract_json, artifacts_json, created_at, updated_at
+            ) VALUES (?, ?, ?, 2, ?, ?, ?, ?, ?, ?, ?, 'success', '', '', '',
+                      'delivered', '{}', '{}', '[]', ?, ?)
+            """,
+            (
+                newer_delivery_id,
+                "newer-success-submission",
+                old_job["business_key"],
+                "g1q3-rca-artifact-v1-" + "8" * 64,
+                old_job["project_key"],
+                old_job["work_item_type_key"],
+                old_job["work_item_id"],
+                old_job["target_key"],
+                "https://project.feishu.cn/g1q3/issue/detail/7041712812",
+                build_report_url(
+                    "newer-success-submission",
+                    "g1q3-rca-artifact-v1-" + "8" * 64,
+                ),
+                current,
+                current,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO rca_delivery_effects(
+                effect_key, delivery_id, effect_kind, required, target_key,
+                payload_json, payload_sha256, outcome, write_phase, status,
+                completed_at, created_at, updated_at
+            ) VALUES (?, ?, 'feishu_issue_comment', 1, ?, '{}', ?, 'success',
+                      'settled', 'succeeded', ?, ?, ?)
+            """,
+            (
+                "g1q3-rca-effect-v1-" + "7" * 64,
+                newer_delivery_id,
+                old_job["target_key"],
+                "6" * 64,
+                current,
+                current,
+                current,
+            ),
+        )
+    dispatcher, remote, _clock = _dispatcher(tmp_path)
+
+    outcome = dispatcher.dispatch_one()
+
+    assert outcome.status == "superseded"
+    assert outcome.error_code == "delivery_effect_superseded_by_newer_success"
+    assert remote.history == []
+    [old_effect] = [
+        row
+        for row in store.list_rows("rca_delivery_effects")
+        if row["delivery_id"] == old_job["delivery_id"]
+    ]
+    assert old_effect["status"] == "suppressed"
+    assert old_effect["write_phase"] == "settled"
+
+
+def test_terminal_v2_epoch_switch_blocks_field_write_and_comment(tmp_path):
+    control, result = _control(tmp_path)
+    _bind_activation_execution(control, result, state="steady_active")
+    store = RcaDeliveryStore(control.db_path)
+    assert store.backfill_completed_submissions(now=NOW) == 1
+    watch = store.claim_due_watch(lease_owner="activation-collector", now=NOW)
+    assert watch is not None
+    store.create_terminal_delivery(
+        claim=watch,
+        status={"success": True, "state": "failed"},
+        outcome="terminal_failed",
+        terminal_state="failed",
+        error_code="vm_terminal_failed_unclassified",
+        error_detail="private detail",
+        now=NOW,
+    )
+
+    class EpochSwitchRemote(Remote):
+        switched = False
+
+        def list_comments(self, project_key, work_item_id):
+            result = super().list_comments(project_key, work_item_id)
+            if not self.switched:
+                self.switched = True
+                _switch_activation_epoch(
+                    control,
+                    old_epoch="delivery-epoch-1",
+                    new_epoch="delivery-epoch-2",
+                )
+            return result
+
+    remote = EpochSwitchRemote()
+    dispatcher, _remote, _clock = _dispatcher(tmp_path, remote=remote)
+
+    outcome = dispatcher.dispatch_one()
+
+    assert outcome.status == "lease_lost"
+    assert remote.update_field_calls == 0
+    assert remote.add_calls == 0
 
 
 def test_terminal_process_kill_reconciles_without_report_or_second_send(tmp_path):
@@ -2322,6 +2515,80 @@ def test_meegle_adapter_reads_and_updates_only_attribution_fields():
             },
         ]
     }
+
+
+def test_meegle_adapter_allows_terminal_result_only_but_never_report_only():
+    calls = []
+
+    def runner(args):
+        calls.append(args)
+        if args[:2] == ["workitem", "get"]:
+            return 0, json.dumps({
+                "work_item_fields": [
+                    {"key": "field_9193cb", "value": ""},
+                ]
+            }), ""
+        if args[:2] == ["workitem", "update"]:
+            return 0, json.dumps({"updated": True}), ""
+        raise AssertionError(args)
+
+    adapter = MeegleIssueCommentAdapter(runner)
+    assert adapter.get_fields(
+        "t03o4q", "7041712812", ("field_9193cb",)
+    ) == {"success": True, "fields": {"field_9193cb": ""}}
+    assert adapter.update_fields(
+        "t03o4q",
+        "7041712812",
+        (("field_9193cb", "自动归因未完成（非归因结论）"),),
+    ) == {"success": True}
+    assert adapter.update_fields(
+        "t03o4q",
+        "7041712812",
+        (("field_8c912e", "https://invalid.example/report"),),
+    )["error_code"] == "feishu_field_allowlist_invalid"
+    assert [item[:2] for item in calls] == [
+        ["workitem", "get"],
+        ["workitem", "update"],
+    ]
+
+
+def test_terminal_result_only_accepts_omitted_empty_field_with_full_metadata():
+    calls = []
+
+    def runner(args):
+        calls.append(args)
+        if args[:2] == ["workitem", "get"]:
+            return 0, json.dumps({
+                "work_item_attribute": {
+                    "work_item_id": "7041712812",
+                    "work_item_type": {"key": "issue", "name": "Issue"},
+                }
+            }), ""
+        if args[:2] == ["workitem", "meta-fields"]:
+            return 0, json.dumps({
+                "list": [
+                    {
+                        "field_key": "field_9193cb",
+                        "field_name": "归因结果",
+                        "field_type": "text",
+                    },
+                    {
+                        "field_key": "field_8c912e",
+                        "field_name": "归因报告",
+                        "field_type": "link",
+                    },
+                ]
+            }), ""
+        raise AssertionError(args)
+
+    result = MeegleIssueCommentAdapter(runner).get_fields(
+        "t03o4q", "7041712812", ("field_9193cb",)
+    )
+
+    assert result == {"success": True, "fields": {"field_9193cb": ""}}
+    assert calls[1].count("--field-keys") == 1
+    assert "field_9193cb" in calls[1]
+    assert "field_8c912e" not in calls[1]
 
 
 def test_meegle_adapter_verifies_omitted_attribution_fields_are_empty():

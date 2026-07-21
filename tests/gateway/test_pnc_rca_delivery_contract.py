@@ -8,11 +8,14 @@ import pytest
 from gateway.pnc_rca_admission import build_rca_admission
 from gateway.pnc_rca_delivery_contract import (
     DELIVERY_THREAD_EFFECT_KIND,
+    TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
+    TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1,
     DeliveryContractError,
     MAX_DELIVERY_ARTIFACT_BYTES,
     MAX_DELIVERY_ARTIFACTS,
     build_report_artifact_url,
     build_report_url,
+    build_terminal_delivery,
     build_thread_reply_effect,
     compute_artifact_set_id,
     MAX_FEISHU_COMMENT_BYTES,
@@ -787,3 +790,112 @@ def test_mcap_is_never_an_html_delivery_dependency():
     with pytest.raises(DeliveryContractError) as exc:
         compute_artifact_set_id(manifest)
     assert exc.value.code == "html_delivery_mcap_forbidden"
+
+
+def _terminal_delivery(**updates):
+    values = {
+        "business_key": "rca-business-test",
+        "submission_key": FORMAL_SUBMISSION_KEY,
+        "generation": 1,
+        "project_key": "t03o4q",
+        "work_item_type_key": "issue",
+        "work_item_id": "7051585084",
+        "outcome": "terminal_failed",
+        "terminal_state": "failed",
+        "error_code": "vm_terminal_failed_unclassified",
+    }
+    values.update(updates)
+    return build_terminal_delivery(**values)
+
+
+def test_terminal_v2_writes_only_honest_result_without_fake_report_url():
+    delivery = _terminal_delivery()
+
+    assert delivery.effect_payload["schema_version"] == (
+        TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION
+    )
+    assert delivery.diagnostic_code == "analysis_failed"
+    assert "非归因结论" in delivery.diagnostic_result
+    assert "第 1 代" in delivery.diagnostic_result
+    assert "可能保留自其他代次" in delivery.diagnostic_result
+    assert delivery.effect_payload["field_updates"] == [
+        {
+            "field_key": "field_9193cb",
+            "field_value": delivery.diagnostic_result,
+        }
+    ]
+    assert delivery.job_payload()["report_url"] == ""
+    assert delivery.contract == {
+        "schema_version": "pnc_rca_terminal_diagnostic_v1",
+        "generation": 1,
+        "diagnostic_code": "analysis_failed",
+        "diagnostic_result": delivery.diagnostic_result,
+        "diagnostic_report_status": "not_generated",
+        "report_field_write_policy": "preserve_existing",
+        "preserved_report_semantics": "other_generation_not_current",
+    }
+    assert "field_8c912e" not in json.dumps(
+        delivery.effect_payload, ensure_ascii=False
+    )
+    assert "不存在已验证的 Foxglove 发布产物" in delivery.effect_payload[
+        "comment_content"
+    ]
+    assert "本终态不改写" in delivery.effect_payload["comment_content"]
+    assert "不代表第 1 代结论" in delivery.effect_payload["comment_content"]
+
+
+def test_terminal_v2_result_and_preserve_policy_are_bound_to_generation():
+    first = _terminal_delivery(generation=1)
+    second = _terminal_delivery(generation=2)
+
+    assert first.diagnostic_result != second.diagnostic_result
+    assert "第 2 代" in second.diagnostic_result
+    assert "不代表第 2 代结论" in second.effect_payload["comment_content"]
+    assert second.effect_payload["generation"] == 2
+    assert second.effect_payload["field_updates"] == [
+        {
+            "field_key": "field_9193cb",
+            "field_value": second.diagnostic_result,
+        }
+    ]
+    assert second.contract["generation"] == 2
+    assert second.contract["report_field_write_policy"] == "preserve_existing"
+
+
+@pytest.mark.parametrize(
+    ("source_error_code", "expected_diagnostic_code"),
+    [
+        ("issue_field_missing_remote_data_reference", "input_remote_data_required"),
+        ("issue_field_invalid_remote_data_reference", "input_remote_data_invalid"),
+        ("issue_field_invalid_frame_reference", "input_frame_required"),
+        ("host_meegle_preread_timeout", "issue_source_unavailable"),
+    ],
+)
+def test_pre_submit_terminal_projects_specific_safe_diagnostic(
+    source_error_code, expected_diagnostic_code
+):
+    delivery = _terminal_delivery(
+        outcome="quarantined",
+        terminal_state="submission_quarantined",
+        error_code="outbox_submission_quarantined",
+        source_error_code=source_error_code,
+    )
+
+    assert delivery.diagnostic_code == expected_diagnostic_code
+    serialized = json.dumps(delivery.effect_payload, ensure_ascii=False)
+    assert source_error_code not in serialized
+    assert delivery.effect_payload["error_code"] == "outbox_submission_quarantined"
+
+
+def test_terminal_v1_remains_comment_only_for_historical_payloads():
+    delivery = _terminal_delivery(
+        schema_version=TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1
+    )
+
+    assert delivery.effect_payload["schema_version"] == (
+        TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1
+    )
+    assert "field_updates" not in delivery.effect_payload
+    assert delivery.contract == {}
+    assert delivery.diagnostic_result == ""
+    assert delivery.job_payload()["report_url"] == ""

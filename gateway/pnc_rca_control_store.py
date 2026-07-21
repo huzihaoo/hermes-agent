@@ -58,6 +58,10 @@ REPLAY_RAW_RETENTION = timedelta(days=7)
 PROCESSED_RAW_RETENTION = timedelta(days=30)
 REPLAY_RAW_PRUNE_BATCH = 1000
 INPUT_WAIT_QUARANTINE_REARMED_REASON = "input_wait_quarantine_rearmed"
+INPUT_WAIT_TERMINAL_NEW_GENERATION_REASON = (
+    "input_wait_terminal_new_generation_created"
+)
+INPUT_WAIT_EXECUTION_WATCH_PRESENT_REASON = "input_wait_execution_watch_present"
 MANUAL_SHADOW_PROMOTED_REASON = "manual_shadow_promoted"
 ISSUE_SCOPE_CONFLICT_REASON = "issue_scope_business_key_conflict"
 MANUAL_POLICY_OBSERVED_OUTCOME = "manual_active_policy_observed"
@@ -5361,24 +5365,13 @@ class RcaControlStore:
             raise ManualRcaAdmissionError("manual_outbox_source_quota_reached")
 
     @staticmethod
-    def _rearm_input_wait_quarantine(
+    def _input_wait_replacement_candidate(
         conn: sqlite3.Connection,
         *,
         inbox_row: sqlite3.Row,
-        event_uid: str,
         admission: Any,
         normalized: Any,
-        normalized_json: str,
-        payload_json: str,
-        current: str,
-    ) -> tuple[bool, str]:
-        """Rearm only a create-free input-wait quarantine under the ingest lock.
-
-        Rejections are persisted on the replacement ``kafka_inbox`` row through
-        ``rearm_reason``.  The success audit contains identities, counters, and an
-        error code only; it deliberately excludes issue payloads, field values,
-        error details, URLs, and source-data UUIDs.
-        """
+    ) -> tuple[sqlite3.Row | None, str]:
         existing = conn.execute(
             """
             SELECT
@@ -5398,19 +5391,19 @@ class RcaControlStore:
             (admission.business_key, admission.generation),
         ).fetchone()
         if existing is None:
-            return False, "trigger_missing_after_business_dedupe"
+            return None, "trigger_missing_after_business_dedupe"
         if str(inbox_row["submission_mode"]) != "pending":
-            return False, "replacement_event_not_pending"
+            return None, "replacement_event_not_pending"
         if existing["outbox_id"] is None:
-            return False, "outbox_missing"
+            return None, "outbox_missing"
         if (
             str(inbox_row["topic"]) != str(existing["source_topic"])
             or int(inbox_row["partition_id"])
             != int(existing["source_partition"])
         ):
-            return False, "replacement_source_lineage_mismatch"
+            return None, "replacement_source_lineage_mismatch"
         if int(inbox_row["offset_id"]) <= int(existing["source_offset"]):
-            return False, "replacement_offset_not_newer"
+            return None, "replacement_offset_not_newer"
         if (
             str(existing["submission_key"]) != admission.submission_key
             or str(existing["trigger_submission_key"]) != admission.submission_key
@@ -5429,30 +5422,63 @@ class RcaControlStore:
             or int(existing["trigger_source_offset"])
             != int(existing["source_offset"])
         ):
-            return False, "identity_mismatch"
+            return None, "identity_mismatch"
         if (
             existing["completed_at"] is not None
             or existing["result_json"] is not None
             or str(existing["status"]) == "completed"
         ):
-            return False, "completed_or_result_present"
+            return None, "completed_or_result_present"
         if str(existing["status"]) == "claimed":
-            return False, "outbox_claimed"
+            return None, "outbox_claimed"
         if str(existing["status"]) != "quarantined":
-            return False, "outbox_not_quarantined"
+            return None, "outbox_not_quarantined"
         error_code = str(existing["last_error_code"] or "")
         if error_code not in INPUT_WAIT_REARM_ERROR_CODES:
-            return False, "error_not_input_wait_allowlisted"
+            return None, "error_not_input_wait_allowlisted"
         if str(existing["trigger_state"]) != "quarantined":
-            return False, "trigger_state_not_quarantined"
+            return None, "trigger_state_not_quarantined"
         if existing["quarantined_at"] is None:
-            return False, "quarantine_timestamp_missing"
+            return None, "quarantine_timestamp_missing"
         if any(
             existing[name] is not None
             for name in ("lease_token", "lease_owner", "lease_expires_at")
         ):
-            return False, "lease_present"
+            return None, "lease_present"
+        return existing, ""
 
+    @classmethod
+    def _rearm_input_wait_quarantine(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        inbox_row: sqlite3.Row,
+        event_uid: str,
+        admission: Any,
+        normalized: Any,
+        normalized_json: str,
+        payload_json: str,
+        current: str,
+    ) -> tuple[bool, str]:
+        """Rearm only a create-free input-wait quarantine under the ingest lock.
+
+        Rejections are persisted on the replacement ``kafka_inbox`` row through
+        ``rearm_reason``.  The success audit contains identities, counters, and an
+        error code only; it deliberately excludes issue payloads, field values,
+        error details, URLs, and source-data UUIDs.
+        """
+        existing, reason = cls._input_wait_replacement_candidate(
+            conn,
+            inbox_row=inbox_row,
+            admission=admission,
+            normalized=normalized,
+        )
+        if existing is None:
+            return False, reason
+        if cls._execution_watch_exists_tx(conn, admission.submission_key):
+            return False, INPUT_WAIT_EXECUTION_WATCH_PRESENT_REASON
+
+        error_code = str(existing["last_error_code"] or "")
         prior_source_event_id = str(existing["source_event_id"])
         prior_attempt = int(existing["attempt"])
         prior_fence = int(existing["fence"])
@@ -6510,6 +6536,8 @@ class RcaControlStore:
             reason = result.reason
             trigger_created = False
             outbox_created = False
+            creates_generation = False
+            input_wait_terminal_generation_created = False
             outbox_rearmed = False
             rearm_reason = ""
             activation_decision: ActivationAdmissionDecision | None = None
@@ -6546,29 +6574,39 @@ class RcaControlStore:
                 else:
                     binding_row = latest
                     if latest is not None:
-                        # A creation event always observes the original issue
-                        # generation. Later manual reruns must never retarget
-                        # the Kafka source or its issue-comment subscription.
+                        # Kafka follows its latest Kafka-origin generation. A
+                        # later manual generation must never retarget Kafka
+                        # sources or issue-comment subscriptions.
+                        latest_generation = int(latest["generation"])
+                        selected_generation = (
+                            latest_generation
+                            if str(latest["source_event_id"] or "").strip()
+                            else 1
+                        )
                         binding_row = self._select_issue_generation_tx(
                             conn,
                             project_key=normalized.project_key,
                             work_item_type_key=normalized.work_item_type_key,
                             work_item_id=normalized.work_item_id,
-                            generation=1,
+                            generation=selected_generation,
                         )
                         if binding_row is None:
                             decision = "invalid"
-                            reason = "issue_scope_generation_one_missing"
+                            reason = "issue_scope_kafka_generation_missing"
                     if decision == "invalid":
                         admission = None
                     elif binding_row is None:
                         admission = candidate_admission
+                        creates_generation = True
                     else:
-                        trigger_kind = (
-                            "issue_created"
-                            if str(binding_row["source_event_id"] or "").strip()
-                            else "manual_issue_request"
-                        )
+                        bound_generation = int(binding_row["generation"])
+                        trigger_kind = "manual_retrigger"
+                        if bound_generation == 1:
+                            trigger_kind = (
+                                "issue_created"
+                                if str(binding_row["source_event_id"] or "").strip()
+                                else "manual_issue_request"
+                            )
                         admission = build_rca_admission(
                             project_key=str(binding_row["project_key"]),
                             project_simple_name=normalized.project_simple_name,
@@ -6576,7 +6614,7 @@ class RcaControlStore:
                             work_item_id=str(binding_row["work_item_id"]),
                             rule_version=str(binding_row["creation_rule_version"]),
                             trigger_kind=trigger_kind,
-                            generation=1,
+                            generation=bound_generation,
                             topic=str(row["topic"]),
                             partition=int(row["partition_id"]),
                             offset=int(row["offset_id"]),
@@ -6589,12 +6627,70 @@ class RcaControlStore:
                             raise RecordConflictError(
                                 "issue scope chain admission identity changed"
                             )
+                        same_rule_chain = (
+                            candidate_admission.business_key
+                            == admission.business_key
+                        )
+                        latest_is_bound_generation = (
+                            latest is not None
+                            and int(latest["generation"]) == bound_generation
+                        )
+                        if same_rule_chain and latest_is_bound_generation:
+                            input_wait, _replacement_reason = (
+                                self._input_wait_replacement_candidate(
+                                    conn,
+                                    inbox_row=row,
+                                    admission=admission,
+                                    normalized=normalized,
+                                )
+                            )
+                            if (
+                                input_wait is not None
+                                and self._execution_watch_exists_tx(
+                                    conn, admission.submission_key
+                                )
+                                and self._execution_terminal_tx(conn, input_wait)
+                            ):
+                                prior_submission_key = admission.submission_key
+                                admission = build_rca_admission(
+                                    project_key=str(binding_row["project_key"]),
+                                    project_simple_name=(
+                                        normalized.project_simple_name
+                                    ),
+                                    work_item_type_key=str(
+                                        binding_row["work_item_type_key"]
+                                    ),
+                                    work_item_id=str(binding_row["work_item_id"]),
+                                    rule_version=str(
+                                        binding_row["creation_rule_version"]
+                                    ),
+                                    trigger_kind="manual_retrigger",
+                                    generation=bound_generation + 1,
+                                    topic=str(row["topic"]),
+                                    partition=int(row["partition_id"]),
+                                    offset=int(row["offset_id"]),
+                                )
+                                if (
+                                    admission.business_key
+                                    != str(binding_row["business_key"])
+                                    or admission.submission_key
+                                    == prior_submission_key
+                                ):
+                                    raise RecordConflictError(
+                                        "input-wait next generation identity invalid"
+                                    )
+                                creates_generation = True
+                                input_wait_terminal_generation_created = True
+                                rearm_reason = (
+                                    INPUT_WAIT_TERMINAL_NEW_GENERATION_REASON
+                                )
 
                     if admission is None:
                         business_key = ""
                         generation = 0
                         submission_key = ""
                         kafka_source_id = ""
+                        creates_generation = False
                     else:
                         business_key = admission.business_key
                         generation = admission.generation
@@ -6617,7 +6713,7 @@ class RcaControlStore:
                                 business_key=business_key,
                                 submission_key=submission_key,
                                 generation=generation,
-                                new_execution=binding_row is None,
+                                new_execution=creates_generation,
                                 requested_slot_kind=str(
                                     row["activation_slot_kind"] or ""
                                 ),
@@ -6638,6 +6734,7 @@ class RcaControlStore:
                                 generation = 0
                                 submission_key = ""
                                 kafka_source_id = ""
+                                creates_generation = False
                             elif activation_decision.decision == "shadow":
                                 effective_submission_mode = "shadow"
                                 reason = activation_decision.reason
@@ -6649,7 +6746,7 @@ class RcaControlStore:
                             raw_sha256=str(row["raw_sha256"]),
                             current=now,
                         ) if admission is not None else ""
-                    if admission is not None and binding_row is None:
+                    if admission is not None and creates_generation:
                         inserted = conn.execute(
                             """
                             INSERT INTO business_triggers(
@@ -6735,6 +6832,10 @@ class RcaControlStore:
                             ),
                         )
                         outbox_created = outbox.rowcount == 1
+                        if input_wait_terminal_generation_created:
+                            rearm_reason = INPUT_WAIT_TERMINAL_NEW_GENERATION_REASON
+                            if effective_submission_mode == "pending":
+                                reason = INPUT_WAIT_TERMINAL_NEW_GENERATION_REASON
                         if (
                             activation_decision is not None
                             and activation_decision.decision in {"admit", "shadow"}

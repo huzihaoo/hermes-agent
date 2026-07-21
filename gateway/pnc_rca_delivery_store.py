@@ -15,6 +15,7 @@ import uuid
 from gateway.pnc_rca_delivery_contract import (
     DELIVERY_EFFECT_KIND,
     DELIVERY_THREAD_EFFECT_KIND,
+    TERMINAL_DELIVERY_OUTCOMES,
     DeliveryContractError,
     VerifiedDelivery,
     VerifiedTerminalDelivery,
@@ -220,6 +221,7 @@ class DeliveryEffectClaim:
     report_url: str
     manifest: dict[str, Any]
     artifacts: list[dict[str, Any]]
+    contract: dict[str, Any]
     write_phase: str = "prewrite"
     write_started_at: str | None = None
     reconciliation_miss_count: int = 0
@@ -1386,6 +1388,7 @@ class RcaDeliveryStore:
             outcome="quarantined",
             terminal_state=OUTBOX_QUARANTINED_TERMINAL_STATE,
             error_code=OUTBOX_QUARANTINED_PUBLIC_ERROR_CODE,
+            source_error_code=str(row["last_error_code"] or ""),
         )
         terminal_at = str(row["quarantined_at"] or current)
         status = {
@@ -2407,7 +2410,7 @@ class RcaDeliveryStore:
         existing = conn.execute(
             """
             SELECT delivery_id, outcome_key, outcome, terminal_state,
-                   terminal_error_code
+                   terminal_error_code, issue_url, report_url, contract_json
               FROM rca_delivery_jobs WHERE submission_key = ?
             """,
             (delivery.submission_key,),
@@ -2419,6 +2422,9 @@ class RcaDeliveryStore:
                 delivery.outcome,
                 delivery.terminal_state,
                 delivery.error_code,
+                "",
+                "",
+                _canonical_json(delivery.contract),
             )
             observed = tuple(
                 existing[key]
@@ -2428,6 +2434,9 @@ class RcaDeliveryStore:
                     "outcome",
                     "terminal_state",
                     "terminal_error_code",
+                    "issue_url",
+                    "report_url",
+                    "contract_json",
                 )
             )
             if observed != expected:
@@ -2457,7 +2466,7 @@ class RcaDeliveryStore:
                     terminal_error_code, status, manifest_json,
                     contract_json, artifacts_json, created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, ?,
-                          'ready', '{}', '{}', '[]', ?, ?)
+                          'ready', '{}', ?, '[]', ?, ?)
                 """,
                 (
                     delivery.delivery_id,
@@ -2473,6 +2482,7 @@ class RcaDeliveryStore:
                     delivery.outcome_key,
                     delivery.terminal_state,
                     delivery.error_code,
+                    _canonical_json(delivery.contract),
                     current,
                     current,
                 ),
@@ -2697,12 +2707,13 @@ class RcaDeliveryStore:
             status = "quarantined"
         elif (
             required
-            and all(row["status"] == "succeeded" for row in required)
+            and all(row["status"] in {"succeeded", "suppressed"} for row in required)
             and all(state == "materialized" for state in subscription_states)
         ):
             status = (
                 "partial"
-                if optional and any(row["status"] != "succeeded" for row in optional)
+                if any(row["status"] == "suppressed" for row in required)
+                or (optional and any(row["status"] != "succeeded" for row in optional))
                 else "delivered"
             )
         else:
@@ -2849,6 +2860,106 @@ class RcaDeliveryStore:
                     f"stale delivery-effect write boundary for {claim.effect_key}"
                 )
             conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def suppress_terminal_effect_if_newer_success(
+        self,
+        *,
+        claim: DeliveryEffectClaim,
+        now: datetime | None = None,
+    ) -> DeliveryEffectMutation | None:
+        """Settle a stale terminal effect before it can overwrite newer success fields."""
+
+        if claim.outcome not in TERMINAL_DELIVERY_OUTCOMES:
+            return None
+        current = _iso(now)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = self._current_effect_claim(
+                conn,
+                effect_key=claim.effect_key,
+                lease_token=claim.lease_token,
+                fence=claim.fence,
+                current=current,
+            )
+            newer = conn.execute(
+                """
+                SELECT newer.delivery_id, newer.generation
+                  FROM rca_delivery_jobs AS current_job
+                  JOIN rca_delivery_jobs AS newer
+                    ON newer.business_key = current_job.business_key
+                   AND newer.generation > current_job.generation
+                   AND newer.outcome = 'success'
+                  JOIN rca_delivery_effects AS newer_effect
+                    ON newer_effect.delivery_id = newer.delivery_id
+                   AND newer_effect.effect_kind = 'feishu_issue_comment'
+                   AND newer_effect.required = 1
+                   AND newer_effect.status = 'succeeded'
+                 WHERE current_job.delivery_id = ?
+                 ORDER BY newer.generation DESC, newer.delivery_id
+                 LIMIT 1
+                """,
+                (claim.delivery_id,),
+            ).fetchone()
+            if newer is None:
+                conn.commit()
+                return None
+            reason = "delivery_effect_superseded_by_newer_success"
+            receipt = {
+                "source": reason,
+                "superseding_delivery_id": str(newer["delivery_id"]),
+                "superseding_generation": int(newer["generation"]),
+            }
+            self._append_attempt_event(
+                conn,
+                effect_key=claim.effect_key,
+                attempt_no=claim.attempt,
+                fence=claim.fence,
+                request_id=claim.request_id,
+                outcome="reconciled",
+                current=current,
+                error_code=reason,
+                detail="newer successful generation already confirmed its issue fields",
+            )
+            updated = conn.execute(
+                """
+                UPDATE rca_delivery_effects
+                   SET status = 'suppressed', write_phase = 'settled',
+                       next_attempt_at = NULL, remote_receipt_json = ?,
+                       completed_at = ?, last_error_code = ?,
+                       last_error_detail = ?, lease_token = NULL,
+                       lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+                 WHERE effect_key = ? AND lease_token = ? AND fence = ?
+                   AND status = 'claimed'
+                """,
+                (
+                    _canonical_json(receipt),
+                    current,
+                    reason,
+                    "newer successful generation already confirmed its issue fields",
+                    current,
+                    claim.effect_key,
+                    claim.lease_token,
+                    claim.fence,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise StaleDeliveryEffectLeaseError(
+                    f"stale superseded effect claim for {claim.effect_key}"
+                )
+            job_status = self._aggregate_job_status(conn, str(row["delivery_id"]), current)
+            conn.commit()
+            return DeliveryEffectMutation(
+                claim.effect_key,
+                claim.delivery_id,
+                "suppressed",
+                job_status,
+            )
         except Exception:
             conn.rollback()
             raise
@@ -3190,7 +3301,7 @@ class RcaDeliveryStore:
                        j.generation AS job_generation,
                        j.terminal_state AS job_terminal_state,
                        j.terminal_error_code AS job_terminal_error_code,
-                       j.manifest_json, j.artifacts_json
+                       j.manifest_json, j.contract_json, j.artifacts_json
                   FROM rca_delivery_effects AS e
                   JOIN rca_delivery_jobs AS j ON j.delivery_id = e.delivery_id
                   JOIN rca_delivery_dispatcher_circuit AS circuit
@@ -3343,6 +3454,7 @@ class RcaDeliveryStore:
                 report_url=str(row["report_url"]),
                 manifest=_json_object(row["manifest_json"]),
                 artifacts=artifacts,
+                contract=_json_object(row["contract_json"]),
                 write_phase=next_write_phase,
                 write_started_at=next_write_started_at,
                 reconciliation_miss_count=next_reconciliation_miss_count,
