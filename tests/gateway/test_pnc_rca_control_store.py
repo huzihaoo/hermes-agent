@@ -39,6 +39,9 @@ PREPRODUCTION_RECEIPT_SHA256 = "d" * 64
 PREPRODUCTION_CAPSULE_SHA256 = "e" * 64
 
 
+CAPACITY_BOOTSTRAP_NOW = datetime(2026, 7, 20, 0, 0, tzinfo=timezone.utc)
+
+
 def _capacity_steady_kwargs(**overrides):
     now = datetime(2026, 7, 20, 1, 0, tzinfo=timezone.utc)
     values = {
@@ -4476,6 +4479,7 @@ def test_capacity_transition_cas_is_irreversible_bound_and_idempotent(tmp_path):
     store.initialize_capacity_transition(
         release_id="release-20260713",
         bootstrap_epoch_id="rca-bootstrap-release-20260713",
+        now=CAPACITY_BOOTSTRAP_NOW,
     )
     kwargs = _capacity_steady_kwargs()
 
@@ -4509,6 +4513,7 @@ def test_capacity_transition_rejects_stale_generation_and_binding_conflict(tmp_p
     store.initialize_capacity_transition(
         release_id="release-20260713",
         bootstrap_epoch_id="rca-bootstrap-release-20260713",
+        now=CAPACITY_BOOTSTRAP_NOW,
     )
     with pytest.raises(
         CapacityTransitionStateError, match="capacity_transition_generation_changed"
@@ -4545,6 +4550,7 @@ def test_capacity_transition_validates_hashes_identities_and_time_order(tmp_path
     store.initialize_capacity_transition(
         release_id="release-20260713",
         bootstrap_epoch_id="rca-bootstrap-release-20260713",
+        now=CAPACITY_BOOTSTRAP_NOW,
     )
     with pytest.raises(
         CapacityTransitionStateError, match="capacity_final_ledger_sha256_invalid"
@@ -4576,6 +4582,7 @@ def test_capacity_transition_sql_triggers_block_mutation_and_delete(tmp_path):
     store.initialize_capacity_transition(
         release_id="release-20260713",
         bootstrap_epoch_id="rca-bootstrap-release-20260713",
+        now=CAPACITY_BOOTSTRAP_NOW,
     )
     conn = store._connect()
     try:
@@ -4613,6 +4620,7 @@ def test_capacity_transition_replace_cannot_downgrade_or_collapse_audit(tmp_path
     store.initialize_capacity_transition(
         release_id="release-20260713",
         bootstrap_epoch_id="rca-bootstrap-release-20260713",
+        now=CAPACITY_BOOTSTRAP_NOW,
     )
     steady = store.compare_and_set_capacity_steady(**_capacity_steady_kwargs())
     bootstrap_audit = store.list_rows("rca_capacity_transition_audit")[0]
@@ -4668,6 +4676,7 @@ def test_capacity_transition_reader_and_health_fail_closed_on_broken_audit_chain
     store.initialize_capacity_transition(
         release_id="release-20260713",
         bootstrap_epoch_id="rca-bootstrap-release-20260713",
+        now=CAPACITY_BOOTSTRAP_NOW,
     )
     bindings = _capacity_steady_kwargs()
     activated_at = bindings["now"].isoformat()
@@ -4783,6 +4792,7 @@ def test_capacity_transition_rolls_back_state_when_audit_insert_fails(tmp_path):
     store.initialize_capacity_transition(
         release_id="release-20260713",
         bootstrap_epoch_id="rca-bootstrap-release-20260713",
+        now=CAPACITY_BOOTSTRAP_NOW,
     )
 
     conn = store._connect()
@@ -4810,6 +4820,7 @@ def test_capacity_transition_concurrent_conflicting_cas_has_one_winner(tmp_path)
     store.initialize_capacity_transition(
         release_id="release-20260713",
         bootstrap_epoch_id="rca-bootstrap-release-20260713",
+        now=CAPACITY_BOOTSTRAP_NOW,
     )
     candidates = [
         _capacity_steady_kwargs(commit_marker_fingerprint="a" * 64),

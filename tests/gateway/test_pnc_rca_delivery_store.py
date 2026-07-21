@@ -34,6 +34,7 @@ from gateway.pnc_rca_delivery_store import (
     StaleDeliveryWatchLeaseError,
 )
 from gateway.pnc_rca_kafka_contract import WorkflowEventPolicy, WorkflowTransition
+from scripts.pnc_foxglove_delivery import canonical_viz_mcap_path, foxglove_url
 
 
 NOW = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
@@ -300,6 +301,8 @@ def _delivery(claim):
     target = f"feishu_project:{claim.project_key}:{claim.work_item_type_key}:{claim.work_item_id}"
     issue_url = f"https://project.feishu.cn/{claim.project_key}/issue/detail/{claim.work_item_id}"
     report_url = "http://192.168.26.174:18081/rca/index.html"
+    viz_mcap_vm = canonical_viz_mcap_path(claim.submission_key)
+    rendered_foxglove_url = foxglove_url(viz_mcap_vm)
     semantic = {
         "schema_version": DELIVERY_EFFECT_SCHEMA_VERSION,
         "delivery_id": delivery_id,
@@ -311,6 +314,8 @@ def _delivery(claim):
         "issue_url": issue_url,
         "artifact_set_id": artifact_set,
         "report_url": report_url,
+        "viz_mcap_vm": viz_mcap_vm,
+        "foxglove_url": rendered_foxglove_url,
         "report_status": "html_delivery_ready",
         "requires_human_review": True,
         "conclusion": "候选原因",
@@ -339,6 +344,8 @@ def _delivery(claim):
         target_key=target,
         issue_url=issue_url,
         report_url=report_url,
+        viz_mcap_vm=viz_mcap_vm,
+        foxglove_url=rendered_foxglove_url,
         conclusion="候选原因",
         marker=marker,
         manifest={"schema_version": "delivery_manifest_v1"},
