@@ -4236,10 +4236,32 @@ class RcaControlStore:
             (project_key, work_item_type_key, work_item_id),
         ).fetchone()
 
-    @staticmethod
-    def _kafka_generation_origin_contract_valid(row: sqlite3.Row) -> bool:
+    @classmethod
+    def _kafka_generation_origin_contract_valid(
+        cls, row: sqlite3.Row
+    ) -> bool:
         try:
             generation = int(row["generation"])
+            source_dedupe_key = str(
+                row["kafka_source_dedupe_key"] or ""
+            ).strip()
+            kafka_event_uid = row["kafka_event_uid"]
+            if generation == 1:
+                origin_event_uid = str(kafka_event_uid or "").strip()
+                if not origin_event_uid or source_dedupe_key != origin_event_uid:
+                    return False
+            else:
+                generation_suffix = f":generation:{generation}"
+                if (
+                    kafka_event_uid is not None
+                    or not source_dedupe_key.endswith(generation_suffix)
+                    or len(source_dedupe_key) <= len(generation_suffix)
+                ):
+                    return False
+                origin_event_uid = source_dedupe_key[: -len(generation_suffix)]
+            current_event_uid = str(
+                row["outbox_source_event_id"] or ""
+            ).strip()
             topic = str(row["outbox_source_topic"] or "").strip()
             partition = int(row["outbox_source_partition"])
             offset = int(row["outbox_source_offset"])
@@ -4252,23 +4274,23 @@ class RcaControlStore:
         expected_trigger_kind = (
             "issue_created" if generation == 1 else "kafka_retrigger"
         )
-        source_dedupe_key = str(row["kafka_source_dedupe_key"] or "")
-        kafka_event_uid = row["kafka_event_uid"]
-        if generation == 1:
-            origin_identity_valid = bool(
-                kafka_event_uid
-                and source_dedupe_key == str(kafka_event_uid)
+        try:
+            (
+                expected_source_id,
+                expected_dedupe_key,
+                expected_kafka_event_uid,
+                expected_mode,
+            ) = cls._kafka_source_identity(
+                event_uid=origin_event_uid,
+                generation=generation,
+                trigger_kind=expected_trigger_kind,
             )
-        else:
-            generation_suffix = f":generation:{generation}"
-            origin_identity_valid = bool(
-                kafka_event_uid is None
-                and source_dedupe_key.endswith(generation_suffix)
-                and len(source_dedupe_key) > len(generation_suffix)
-            )
+        except RecordConflictError:
+            return False
         refs = admission.source_refs
         return bool(
-            str(row["outbox_source_event_id"] or "").strip()
+            origin_event_uid
+            and current_event_uid
             and topic
             and partition >= 0
             and offset >= 0
@@ -4276,10 +4298,12 @@ class RcaControlStore:
             == str(row["kafka_origin_source_id"] or "")
             == str(row["outbox_origin_source_id"] or "")
             == str(payload.get("origin_source_id") or "")
-            and str(row["kafka_source_mode"] or "") == expected_trigger_kind
-            and origin_identity_valid
+            == expected_source_id
+            and str(row["kafka_source_mode"] or "") == expected_mode
+            and source_dedupe_key == expected_dedupe_key
+            and kafka_event_uid == expected_kafka_event_uid
             and str(payload.get("source_event_id") or "")
-            == str(row["outbox_source_event_id"] or "")
+            == current_event_uid
             and str(payload.get("topic") or "") == topic
             and payload_partition == partition
             and payload_offset == offset

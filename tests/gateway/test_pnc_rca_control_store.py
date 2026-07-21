@@ -2716,6 +2716,42 @@ def test_same_kafka_event_uses_generation_bound_retrigger_source_identity(tmp_pa
         assert check.execute("PRAGMA foreign_key_check").fetchone() is None
 
 
+def test_kafka_origin_contract_rederives_complete_source_identity(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    first = store.ingest_record(
+        _record(10), policy=_policy(), submit_enabled=True
+    )
+    _terminalize_input_wait(store, first.submission_key)
+    second = store.ingest_record(
+        _record(10), policy=_policy(), submit_enabled=True
+    )
+    assert second.generation == 2
+
+    with store._connect() as conn:
+        row = store._select_latest_kafka_issue_generation_tx(
+            conn,
+            project_key="project-key",
+            work_item_type_key="problem-type",
+            work_item_id="7041712812",
+        )
+    assert row is not None
+    assert store._kafka_generation_origin_contract_valid(row) is True
+
+    forged = dict(row)
+    forged_source_id = "g1q3-rca-source-v1-" + "f" * 64
+    for field in (
+        "origin_source_id",
+        "kafka_origin_source_id",
+        "outbox_origin_source_id",
+    ):
+        forged[field] = forged_source_id
+    payload = json.loads(forged["outbox_payload_json"])
+    payload["origin_source_id"] = forged_source_id
+    forged["outbox_payload_json"] = json.dumps(payload)
+
+    assert store._kafka_generation_origin_contract_valid(forged) is False
+
+
 def test_same_kafka_event_with_pruned_raw_never_creates_retrigger(tmp_path):
     store = RcaControlStore(tmp_path / "control.sqlite3")
     first = store.ingest_record(
