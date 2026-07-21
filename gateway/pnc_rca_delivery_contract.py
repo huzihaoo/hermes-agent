@@ -39,6 +39,7 @@ TERMINAL_DELIVERY_OUTCOMES = frozenset({"terminal_failed", "quarantined"})
 _VM_TMP_PREFIX = "/mnt/tmp/"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$")
+_PROJECT_SIMPLE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _FEISHU_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{1,255}$")
 _TERMINAL_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,119}$")
 _ARTIFACT_SET_ID_RE = re.compile(
@@ -241,6 +242,7 @@ _V1_BASE_EFFECT_SEMANTIC_FIELDS = (
 )
 _BASE_EFFECT_SEMANTIC_FIELDS = (
     *_V1_BASE_EFFECT_SEMANTIC_FIELDS,
+    "project_simple_name",
     "report_link_kind",
 )
 _THREAD_EFFECT_SEMANTIC_FIELDS = (
@@ -1813,10 +1815,12 @@ def verify_delivery_bundle(
         f"{refs.work_item_id}"
     )
     project_simple_name = str(refs.project_simple_name or "").strip()
-    if validated_admission.schema_version != "pnc_rca_admission_v1" and not project_simple_name:
+    if not project_simple_name:
         raise DeliveryContractError("delivery_project_simple_name_missing")
+    if not _PROJECT_SIMPLE_NAME_RE.fullmatch(project_simple_name):
+        raise DeliveryContractError("delivery_project_simple_name_invalid")
     issue_url = (
-        f"https://project.feishu.cn/{refs.project_key}"
+        f"https://project.feishu.cn/{project_simple_name}"
         f"/issue/detail/{refs.work_item_id}"
     )
     delivery_id = _stable_key(
@@ -1844,6 +1848,7 @@ def verify_delivery_bundle(
         "effect_kind": DELIVERY_EFFECT_KIND,
         "target_key": target_key,
         "project_key": refs.project_key,
+        "project_simple_name": project_simple_name,
         "work_item_type_key": refs.work_item_type_key,
         "work_item_id": refs.work_item_id,
         "issue_url": issue_url,

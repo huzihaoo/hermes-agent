@@ -301,6 +301,8 @@ def test_valid_sealed_evidence_and_published_viz_build_issue_effect():
         },
     ]
     assert delivery.effect_payload["report_link_kind"] == "manifest_html"
+    assert delivery.effect_payload["project_key"] == "t03o4q"
+    assert delivery.effect_payload["project_simple_name"] == "g1q3"
     assert delivery.target_key == "feishu_project:t03o4q:issue:7041712812"
     assert delivery.report_url == build_report_url(
         delivery.submission_key, delivery.artifact_set_id
@@ -315,9 +317,32 @@ def test_valid_sealed_evidence_and_published_viz_build_issue_effect():
     assert delivery.viz_mcap_vm == canonical_viz_mcap_path(delivery.submission_key)
     assert delivery.foxglove_url == foxglove_url(delivery.viz_mcap_vm)
     assert delivery.issue_url == (
-        "https://project.feishu.cn/t03o4q/issue/detail/7041712812"
+        "https://project.feishu.cn/g1q3/issue/detail/7041712812"
     )
-    assert "/g1q3/issue/detail/" not in delivery.issue_url
+
+
+@pytest.mark.parametrize("project_simple_name", ["", "../wrong"])
+def test_success_delivery_requires_a_canonical_project_slug(project_simple_name):
+    admission = build_rca_admission(
+        project_key="t03o4q",
+        project_simple_name=project_simple_name,
+        work_item_type_key="issue",
+        work_item_id="7041712812",
+        rule_version="issue-created-v1",
+        topic="feishu-project-workflow-event",
+        partition=2,
+        offset=10,
+    )
+
+    with pytest.raises(DeliveryContractError) as exc:
+        _verify(_bundle(admission=admission))
+
+    expected = (
+        "delivery_project_simple_name_missing"
+        if not project_simple_name
+        else "delivery_project_simple_name_invalid"
+    )
+    assert exc.value.code == expected
 
 
 def test_html_bundle_without_published_viz_is_not_deliverable():

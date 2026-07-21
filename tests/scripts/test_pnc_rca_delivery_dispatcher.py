@@ -662,6 +662,12 @@ def test_success_requires_read_before_http_add_and_read_after_remote_id(tmp_path
     assert receipt["confirmed_field_keys"] == ["field_9193cb", "field_8c912e"]
     payload = json.loads(effect["payload_json"])
     assert payload["report_link_kind"] == "manifest_html"
+    assert payload["project_key"] == "t03o4q"
+    assert payload["project_simple_name"] == "g1q3"
+    assert payload["issue_url"] == (
+        "https://project.feishu.cn/g1q3/issue/detail/7041712812"
+    )
+    assert job["issue_url"] == payload["issue_url"]
     assert remote.fields["field_8c912e"] == payload["report_url"]
     assert payload["report_url"] in remote.comments[0]["content"]
     assert payload["foxglove_url"] not in remote.comments[0]["content"]
@@ -1676,11 +1682,26 @@ def test_dispatcher_rejects_project_alias_issue_url_before_http(tmp_path):
     store = _seed(tmp_path)
     claim = store.claim_due_effect(lease_owner="worker-1", now=NOW)
     assert claim is not None
-    alias_url = "https://project.feishu.cn/g1q3/issue/detail/7041712812"
+    alias_url = "https://project.feishu.cn/t03o4q/issue/detail/7041712812"
     tampered = replace(
         claim,
         issue_url=alias_url,
         payload={**claim.payload, "issue_url": alias_url},
+    )
+
+    with pytest.raises(DeliveryContractError) as exc:
+        dispatcher_module._validate_effect(tampered)
+
+    assert exc.value.code == "delivery_issue_url_identity_mismatch"
+
+
+def test_dispatcher_rejects_project_slug_payload_mismatch_before_http(tmp_path):
+    store = _seed(tmp_path)
+    claim = store.claim_due_effect(lease_owner="worker-1", now=NOW)
+    assert claim is not None
+    tampered = replace(
+        claim,
+        payload={**claim.payload, "project_simple_name": "wrong-slug"},
     )
 
     with pytest.raises(DeliveryContractError) as exc:

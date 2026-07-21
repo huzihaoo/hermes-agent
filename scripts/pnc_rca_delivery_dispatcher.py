@@ -100,8 +100,9 @@ UNCERTAIN_RECONCILIATION_POLL_SECONDS = 30
 MAX_RECOVERY_WRITES = 2
 _REMOTE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _FEISHU_ISSUE_URL_RE = re.compile(
-    r"^https://project\.feishu\.cn/[A-Za-z0-9._-]+/issue/detail/([0-9]+)$"
+    r"^https://project\.feishu\.cn/([A-Za-z0-9._-]+)/issue/detail/([0-9]+)$"
 )
+_PROJECT_SIMPLE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _VIZ_REPORT_STATUSES = frozenset({"report_ready"})
 _CIRCUIT_CODES = frozenset({
@@ -1591,14 +1592,17 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         raise DeliveryContractError("delivery_effect_schema_unsupported")
     report_link_fields = {"report_link_kind"}
     expected_issue_url = str(claim.issue_url or "").strip()
+    project_simple_name = str(payload.get("project_simple_name") or "").strip()
     issue_url_match = _FEISHU_ISSUE_URL_RE.fullmatch(expected_issue_url)
     canonical_issue_url = (
-        f"https://project.feishu.cn/{claim.project_key}"
+        f"https://project.feishu.cn/{project_simple_name}"
         f"/issue/detail/{claim.work_item_id}"
     )
     if (
-        issue_url_match is None
-        or issue_url_match.group(1) != claim.work_item_id
+        _PROJECT_SIMPLE_NAME_RE.fullmatch(project_simple_name) is None
+        or issue_url_match is None
+        or issue_url_match.group(1) != project_simple_name
+        or issue_url_match.group(2) != claim.work_item_id
         or expected_issue_url != canonical_issue_url
     ):
         raise DeliveryContractError("delivery_issue_url_identity_mismatch")
@@ -1614,7 +1618,8 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         }
         exact_payload_keys = {
             "schema_version", "delivery_id", "effect_kind", "target_key",
-            "project_key", "work_item_type_key", "work_item_id", "issue_url",
+            "project_key", "project_simple_name", "work_item_type_key",
+            "work_item_id", "issue_url",
             "artifact_set_id", "report_url", "report_cifs_path", "report_status",
             "viz_mcap_vm", "foxglove_url",
             "requires_human_review", "conclusion", "effect_key",
@@ -1636,7 +1641,8 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         }
         exact_payload_keys = {
             "schema_version", "delivery_id", "effect_kind", "target_key",
-            "project_key", "work_item_type_key", "work_item_id", "issue_url",
+            "project_key", "project_simple_name", "work_item_type_key",
+            "work_item_id", "issue_url",
             "artifact_set_id", "report_url", "report_cifs_path", "report_status",
             "viz_mcap_vm", "foxglove_url",
             "requires_human_review", "conclusion", "platform", "chat_id",
