@@ -260,7 +260,18 @@ def test_runtime_closure_includes_prod_admission_but_not_retired_transition():
     )
 
 
-def test_prod_admission_failure_routes_to_global_circuit(monkeypatch):
+@pytest.mark.parametrize(
+    "error_code",
+    [
+        "vm_task_service_rca_prod_admission_blocked",
+        "vm_task_service_capacity_mode_invalid",
+        "vm_task_service_bootstrap_binding_invalid",
+        "vm_task_service_rca_prod_command_invalid",
+    ],
+)
+def test_prod_admission_failure_routes_to_global_circuit(monkeypatch, error_code):
+    assert error_code in dispatcher._SERVICE_ERROR_CODES
+    assert error_code in dispatcher._GLOBAL_CIRCUIT_ERROR_CODES
     instance = object.__new__(dispatcher.OutboxDispatcher)
     claim = object()
     opened = []
@@ -287,7 +298,7 @@ def test_prod_admission_failure_routes_to_global_circuit(monkeypatch):
 
     result = instance._handle_dispatch_error(
         claim,
-        "vm_task_service_rca_prod_admission_blocked",
+        error_code,
         "rca_prod_hmac_key_invalid",
     )
 
@@ -295,7 +306,7 @@ def test_prod_admission_failure_routes_to_global_circuit(monkeypatch):
     assert opened == [
         (
             claim,
-            "vm_task_service_rca_prod_admission_blocked",
+            error_code,
             "rca_prod_hmac_key_invalid",
         )
     ]
