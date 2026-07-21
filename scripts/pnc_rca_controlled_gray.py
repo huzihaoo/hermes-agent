@@ -76,23 +76,41 @@ RESOURCE_CLASS = "rca_prod"
 CAPACITY_MODE = "steady"
 
 EXPECTED_HOST_ROOT = "/Users/songying/.codex/tmp/rca-host-70c432-zero-cache"
-EXPECTED_HOST_COMMIT = "ecc6c747c8abbf1f815d8783511c7f96bf080bba"
-EXPECTED_HOST_TREE = "7d491dde4046138e93d874acef2c9440521d7dbe"
+EXPECTED_HOST_COMMIT = "92f60f4da5df335b756da6b2e970b7096cc10d45"
+EXPECTED_HOST_TREE = "05bdbda2923841095e0f11a3e983a487dcd4593a"
 EXPECTED_HOST_GO_RECEIPT_PATH = (
     "/Users/songying/.codex/tmp/rca-prod-e2e-release-20260721/evidence/"
-    "controlled-gray/host-independent-go-ecc6c747.json"
+    "controlled-gray/host-independent-go-92f60f4d.json"
 )
 EXPECTED_HOST_GO_RECEIPT_SHA256 = (
-    "862e5a18f58c230e9381ac0a6126edfda2d6f5c2215e92c46198bdbe9375ef26"
+    "82fd1391256e983206ce941d98850718c65e52f6d3bf0afd6a7e90ba88c4bd7b"
 )
 EXPECTED_VM_ROOT = (
     "/home/mini/.hermes/rca-prod-runtime/releases/"
     "rca-e2e-hotfix-pathsafe-20260721"
 )
-EXPECTED_VM_COMMIT = "4b26cc7935eb4fa0910b42abde78d7f8d4efa0d1"
-EXPECTED_VM_TREE = "9d45fb1357c7ab054c16c898941e342b9a50d391"
+EXPECTED_VM_COMMIT = "00599fa5cd8718df3c31cd177f606a9e32b2419b"
+EXPECTED_VM_TREE = "27cb14f0cef85de51e32dca5da572ca318ebcb91"
 EXPECTED_VM_GO_RECEIPT_SHA256 = (
-    "0765e0adfb3e74abe6a1daaea626901003b9b0cb94223a0b401d626d1a48d1bf"
+    "6dd776db67ff8a0859e050a433a613c3ff1fe17a547a56326ca523b9cdfb405a"
+)
+EXPECTED_VM_GO_AUTHORITATIVE_PATH = (
+    "/home/mini/.hermes/rca-prod-runtime/audits/"
+    "00599fa5cd8718df3c31cd177f606a9e32b2419b/independent-go-receipt.json"
+)
+EXPECTED_VM_GO_REPLICA_PATH = (
+    "/mnt/tmp/g1q3-rca-00599fa-independent-audit-20260722/"
+    "receipt-go-00599fa5.json"
+)
+EXPECTED_VM_GO_CIFS_PATH = (
+    "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/"
+    "g1q3-rca-00599fa-independent-audit-20260722/receipt-go-00599fa5.json"
+)
+EXPECTED_VM_CLOSURE_SHA256 = (
+    "2a10e84f97ce20f0b1dd46586c7d12659f56626ad55c27e29518f64afd593499"
+)
+EXPECTED_VM_CLOSURE_CORE_SHA256 = (
+    "85d2211188a98a637e266fcb3623efdc0c5837cdd6b2e96ef3ea006217d37b08"
 )
 
 MAX_JSON_BYTES = 2 * 1024 * 1024
@@ -116,30 +134,32 @@ VM_SPEC_FIELDS = {
 }
 VM_RECEIPT_FIELDS = {
     "candidate",
-    "candidate_lineage",
-    "changed_files_from_validated_base",
+    "candidate_lineage_after_inherited_audit",
+    "changed_files_from_inherited_audit_candidate",
+    "current_verification",
     "deployment_authorization",
-    "final_checks",
+    "inherited_independent_audit",
     "nonblocking_notes",
     "observed_at",
     "open_blockers",
     "production_actions",
-    "receipt_storage",
+    "production_mutation",
+    "public_report_contract",
     "release_recommendation",
     "schema_version",
     "scope",
-    "superseded_findings",
-    "validated_base",
+    "source_files",
+    "source_remote_readback",
     "verdict",
 }
 VM_CANDIDATE_FIELDS = {
-    "cache_dirs",
-    "candidate_edited_by_independent_auditor",
+    "branch",
+    "cache_paths",
+    "candidate_edited_by_auditor",
     "commit",
     "git_clean",
     "git_status",
     "parent",
-    "pyc_files",
     "repo",
     "symlinks",
     "tree",
@@ -165,7 +185,12 @@ HOST_GO_EXPECTED_BLOCKERS = (
     "canonical_public_dns_tls_same_origin_route_absent",
     "exact_7051585084_has_no_trigger_outbox_watch_delivery_effect_or_official_postback",
     "first_natural_kafka_controlled_gray_not_completed",
-    "host_candidate_not_deployed_to_live_runtime",
+    "host_92f60f4d_candidate_not_deployed_to_live_runtime",
+)
+VM_GO_EXPECTED_BLOCKERS = (
+    "regular rca_prod capacity authorization absent",
+    "canonical public DNS/TLS route not installed",
+    "maintainer deployment approval absent",
 )
 RUNTIME_SCOPE_NAMES = (
     "RCA_RUNTIME_RELATIVE_FILES",
@@ -899,6 +924,11 @@ def _validate_host_go_receipt(
         if isinstance(verification, Mapping)
         else None
     )
+    publication = (
+        verification.get("publication_origin_suite")
+        if isinstance(verification, Mapping)
+        else None
+    )
     hygiene = (
         verification.get("worktree_hygiene")
         if isinstance(verification, Mapping)
@@ -923,7 +953,7 @@ def _validate_host_go_receipt(
     if (
         set(body) != HOST_GO_RECEIPT_FIELDS
         or body.get("schema_version")
-        != "pnc_rca_host_controlled_gray_independent_audit_v1"
+        != "pnc_rca_host_controlled_gray_independent_audit_v2"
         or body.get("scope") != "controlled-gray BOM binding only"
         or body.get("verdict") != "GO"
         or body.get("release_recommendation")
@@ -947,7 +977,13 @@ def _validate_host_go_receipt(
         or storage.get("integrity_algorithm") != "sha256"
         or not isinstance(focused, Mapping)
         or focused.get("result") != "PASS"
-        or int(focused.get("passed") or 0) < 171
+        or int(focused.get("passed") or 0) < 173
+        or not isinstance(publication, Mapping)
+        or publication.get("result") != "PASS"
+        or int(publication.get("passed") or 0) < 10
+        or publication.get("canonical_https_dns_only") is not True
+        or publication.get("explicit_port_rejected") is not True
+        or publication.get("ip_literal_rejected") is not True
         or not isinstance(code_checks, Mapping)
         or any(code_checks.get(key) != "PASS" for key in ("ruff", "diff_check"))
         or not isinstance(hygiene, Mapping)
@@ -1074,6 +1110,18 @@ def _validate_vm_go_receipt(
     expected_sha = _hex64(
         vm.get("independent_go_receipt_sha256"), field="vm_go_receipt_sha256"
     )
+    try:
+        receipt_info = os.lstat(path)
+    except OSError as exc:
+        raise ControlledGrayError("controlled_gray_vm_go_receipt_unavailable") from exc
+    if (
+        stat.S_ISLNK(receipt_info.st_mode)
+        or not stat.S_ISREG(receipt_info.st_mode)
+        or receipt_info.st_uid != os.geteuid()
+        or receipt_info.st_nlink != 1
+        or stat.S_IMODE(receipt_info.st_mode) != 0o600
+    ):
+        raise ControlledGrayError("controlled_gray_vm_go_receipt_identity_invalid")
     raw, receipt_sha = _read_stable_file(
         path,
         artifact="vm_go_receipt",
@@ -1082,37 +1130,41 @@ def _validate_vm_go_receipt(
     )
     body = _strict_json(raw, artifact="vm_go_receipt")
     candidate = body.get("candidate")
-    checks = body.get("final_checks")
-    hygiene = checks.get("candidate_hygiene") if isinstance(checks, Mapping) else None
-    focused = checks.get("focused_cifs_suite") if isinstance(checks, Mapping) else None
-    manifest = checks.get("delivery_manifest_v2") if isinstance(checks, Mapping) else None
-    posix = (
-        checks.get("posix_symlink_negative_coverage")
-        if isinstance(checks, Mapping)
+    verification = body.get("current_verification")
+    focused = (
+        verification.get("expanded_five_file_suite")
+        if isinstance(verification, Mapping)
         else None
     )
-    legacy = (
-        checks.get("legacy_perception_literal_classification")
-        if isinstance(checks, Mapping)
+    owner_probe = (
+        verification.get("owner_only_environment_probe")
+        if isinstance(verification, Mapping)
+        else None
+    )
+    closure = (
+        verification.get("fixed_cli_closure")
+        if isinstance(verification, Mapping)
         else None
     )
     expected_commit = _hex40(vm.get("commit"), field="vm_commit")
     expected_tree = _hex40(vm.get("tree"), field="vm_tree")
     expected_root = str(_absolute_path(vm.get("root"), field="vm_root"))
-    lineage = body.get("candidate_lineage")
-    storage = body.get("receipt_storage")
-    validated_base = body.get("validated_base")
+    lineage = body.get("candidate_lineage_after_inherited_audit")
+    inherited = body.get("inherited_independent_audit")
+    remote = body.get("source_remote_readback")
+    report = body.get("public_report_contract")
     if (
         set(body) != VM_RECEIPT_FIELDS
         or body.get("schema_version")
-        != "g1q3_rca_vm_candidate_independent_audit_v2"
+        != "g1q3_rca_vm_candidate_independent_audit_v3"
         or body.get("scope")
         != "offline VM release candidate; controlled release tooling eligibility only"
         or body.get("verdict") != "GO"
         or body.get("release_recommendation")
         != "eligible_for_controlled_release_tooling"
         or body.get("deployment_authorization") is not False
-        or body.get("open_blockers") != []
+        or body.get("production_mutation") is not False
+        or body.get("open_blockers") != list(VM_GO_EXPECTED_BLOCKERS)
         or body.get("production_actions") != []
         or not isinstance(candidate, Mapping)
         or set(candidate) != VM_CANDIDATE_FIELDS
@@ -1121,32 +1173,55 @@ def _validate_vm_go_receipt(
         or candidate.get("tree") != expected_tree
         or candidate.get("git_clean") is not True
         or candidate.get("git_status") != ""
-        or candidate.get("candidate_edited_by_independent_auditor") is not False
-        or any(candidate.get(field) != [] for field in ("cache_dirs", "pyc_files", "symlinks"))
-        or not isinstance(hygiene, Mapping)
-        or hygiene.get("git_clean") is not True
-        or any(hygiene.get(field) != 0 for field in ("cache_dirs", "pyc_files", "symlinks"))
+        or candidate.get("candidate_edited_by_auditor") is not False
+        or any(candidate.get(field) != [] for field in ("cache_paths", "symlinks"))
         or not isinstance(focused, Mapping)
         or focused.get("returncode") != 0
-        or int(focused.get("passed") or 0) < 1
-        or not isinstance(manifest, Mapping)
-        or manifest.get("checks_passed") is not True
-        or not isinstance(posix, Mapping)
-        or posix.get("all_four_cifs_skips_covered_on_symlink_capable_posix_fs")
-        is not True
-        or not isinstance(legacy, Mapping)
-        or legacy.get("true_production_write_sinks") != 0
+        or int(focused.get("passed") or 0) < 149
+        or focused.get("skipped") != 1
+        or not isinstance(owner_probe, Mapping)
+        or owner_probe.get("result") != "PASS"
+        or owner_probe.get("mode") != "0600"
+        or owner_probe.get("probe_removed") is not True
+        or not str(owner_probe.get("derived_report_url") or "").startswith(
+            "https://"
+        )
+        or not isinstance(closure, Mapping)
+        or closure.get("schema_version")
+        != "pnc_rca_fixed_cli_mcap_closure_audit_v5"
+        or closure.get("sha256") != EXPECTED_VM_CLOSURE_SHA256
+        or closure.get("evidence_core_sha256")
+        != EXPECTED_VM_CLOSURE_CORE_SHA256
+        or closure.get("candidate_commit") != expected_commit
+        or closure.get("candidate_tree") != expected_tree
         or not isinstance(lineage, list)
         or not lineage
         or not isinstance(lineage[-1], Mapping)
         or lineage[-1].get("commit") != expected_commit
         or lineage[-1].get("tree") != expected_tree
-        or not isinstance(validated_base, Mapping)
-        or validated_base.get("is_ancestor_of_candidate") is not True
-        or not isinstance(storage, Mapping)
-        or storage.get("create_once") is not True
-        or storage.get("integrity_algorithm") != "sha256"
-        or storage.get("authoritative_required_mode") != "0600"
+        or not isinstance(inherited, Mapping)
+        or inherited.get("candidate_commit")
+        != "4b26cc7935eb4fa0910b42abde78d7f8d4efa0d1"
+        or inherited.get("sha256")
+        != "0765e0adfb3e74abe6a1daaea626901003b9b0cb94223a0b401d626d1a48d1bf"
+        or inherited.get("authorizes_current_candidate") is not False
+        or not isinstance(remote, Mapping)
+        or remote.get("commit") != expected_commit
+        or remote.get("matches_candidate") is not True
+        or not isinstance(report, Mapping)
+        or report.get("manifest_schema_version") != REPORT_MANIFEST_SCHEMA_VERSION
+        or report.get("public_origin_scheme") != "https"
+        or report.get("explicit_port_forbidden") is not True
+        or report.get("ip_literal_forbidden") is not True
+        or report.get("private_upstream_publication_forbidden") is not True
+        or report.get("environment_variable") != "G1Q3_RCA_VIEWER_ORIGIN"
+        or report.get("owner_only_environment_file")
+        != "/home/mini/.config/g1q3-rca/report-http.env"
+        or report.get("public_url_pattern")
+        != (
+            "<canonical_https_dns_origin>/G1Q3_RCA/cases/<submission_key>/"
+            "<artifact_set_id>/index.html"
+        )
     ):
         raise ControlledGrayError("controlled_gray_vm_go_receipt_invalid")
     observed_at = _timestamp(body.get("observed_at"), field="vm_go_observed_at")
@@ -1162,11 +1237,9 @@ def _validate_vm_go_receipt(
             "schema_version": body["schema_version"],
             "verdict": "GO",
             "release_recommendation": body["release_recommendation"],
-            "authoritative_owner_only_path": storage.get(
-                "authoritative_owner_only_path"
-            ),
-            "replica_path": storage.get("byte_identical_vm_replica_path"),
-            "user_visible_cifs_path": storage.get("user_visible_cifs_path"),
+            "authoritative_owner_only_path": EXPECTED_VM_GO_AUTHORITATIVE_PATH,
+            "replica_path": EXPECTED_VM_GO_REPLICA_PATH,
+            "user_visible_cifs_path": EXPECTED_VM_GO_CIFS_PATH,
         },
     }
 

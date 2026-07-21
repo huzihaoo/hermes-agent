@@ -233,7 +233,7 @@ def _host_receipt(
     name: str = "host-go.json",
 ) -> tuple[Path, str]:
     body = {
-        "schema_version": "pnc_rca_host_controlled_gray_independent_audit_v1",
+        "schema_version": "pnc_rca_host_controlled_gray_independent_audit_v2",
         "scope": "controlled-gray BOM binding only",
         "observed_at": (NOW - timedelta(minutes=10)).isoformat(),
         "candidate": {
@@ -262,7 +262,14 @@ def _host_receipt(
             "serialization": "canonical JSON",
         },
         "verification": {
-            "focused_suite": {"result": "PASS", "passed": 171},
+            "focused_suite": {"result": "PASS", "passed": 173},
+            "publication_origin_suite": {
+                "result": "PASS",
+                "passed": 10,
+                "canonical_https_dns_only": True,
+                "explicit_port_rejected": True,
+                "ip_literal_rejected": True,
+            },
             "code_checks": {"ruff": "PASS", "diff_check": "PASS"},
             "worktree_hygiene": {
                 "git_clean": True,
@@ -310,7 +317,7 @@ def _vm_receipt(
     parent = "d" * 40
     root = "/home/mini/.hermes/rca-prod-runtime/releases/fixture"
     body = {
-        "schema_version": "g1q3_rca_vm_candidate_independent_audit_v2",
+        "schema_version": "g1q3_rca_vm_candidate_independent_audit_v3",
         "scope": (
             "offline VM release candidate; controlled release tooling "
             "eligibility only"
@@ -318,17 +325,17 @@ def _vm_receipt(
         "observed_at": (NOW - timedelta(minutes=10)).isoformat(),
         "candidate": {
             "repo": root,
+            "branch": "production/fixture",
             "commit": commit,
             "tree": tree,
             "parent": parent,
             "git_clean": True,
             "git_status": "",
-            "cache_dirs": [],
-            "pyc_files": [],
+            "cache_paths": [],
             "symlinks": [],
-            "candidate_edited_by_independent_auditor": False,
+            "candidate_edited_by_auditor": False,
         },
-        "candidate_lineage": [
+        "candidate_lineage_after_inherited_audit": [
             {
                 "commit": commit,
                 "tree": tree,
@@ -336,64 +343,77 @@ def _vm_receipt(
                 "subject": "fixture",
             }
         ],
-        "changed_files_from_validated_base": [
+        "changed_files_from_inherited_audit_candidate": [
             "api/g1q3_rca/scripts/run_rca_service_request.py"
         ],
         "deployment_authorization": False,
-        "final_checks": {
-            "candidate_hygiene": {
-                "git_clean": True,
-                "cache_dirs": 0,
-                "pyc_files": 0,
-                "symlinks": 0,
-            },
-            "focused_cifs_suite": {
+        "current_verification": {
+            "expanded_five_file_suite": {
                 "returncode": 0,
-                "passed": 139,
-                "skipped": 4,
+                "passed": 149,
+                "skipped": 1,
             },
-            "delivery_manifest_v2": {
-                "checks_passed": True,
-                "manifest_sha256": "1" * 64,
+            "owner_only_environment_probe": {
+                "result": "PASS",
+                "mode": "0600",
+                "probe_removed": True,
+                "derived_report_url": (
+                    "https://viewer.example.com/G1Q3_RCA/cases/"
+                    "g1q3-rca-s1-" + "a" * 64 + "/"
+                    "g1q3-rca-artifact-v1-" + "b" * 64 + "/index.html"
+                ),
             },
-            "posix_symlink_negative_coverage": {
-                "all_four_cifs_skips_covered_on_symlink_capable_posix_fs": True,
-            },
-            "legacy_perception_literal_classification": {
-                "true_production_write_sinks": 0,
+            "fixed_cli_closure": {
+                "schema_version": "pnc_rca_fixed_cli_mcap_closure_audit_v5",
+                "sha256": gray.EXPECTED_VM_CLOSURE_SHA256,
+                "evidence_core_sha256": gray.EXPECTED_VM_CLOSURE_CORE_SHA256,
+                "candidate_commit": commit,
+                "candidate_tree": tree,
             },
         },
-        "nonblocking_notes": [],
-        "open_blockers": [],
-        "production_actions": [],
-        "receipt_storage": {
-            "authoritative_owner_only_path": (
-                "/home/mini/.hermes/rca-prod-runtime/audits/fixture/receipt.json"
+        "inherited_independent_audit": {
+            "candidate_commit": (
+                "4b26cc7935eb4fa0910b42abde78d7f8d4efa0d1"
             ),
-            "authoritative_required_mode": "0600",
-            "byte_identical_vm_replica_path": "/mnt/tmp/fixture/receipt.json",
-            "create_once": True,
-            "integrity_algorithm": "sha256",
-            "replica_mount_mode_policy": "0755",
-            "serialization": "canonical JSON",
-            "user_visible_cifs_path": (
-                "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/"
-                "tmp/fixture/receipt.json"
+            "sha256": (
+                "0765e0adfb3e74abe6a1daaea626901003b9b0cb94223a0b401d626d1a48d1bf"
+            ),
+            "authorizes_current_candidate": False,
+        },
+        "nonblocking_notes": [],
+        "open_blockers": list(gray.VM_GO_EXPECTED_BLOCKERS),
+        "production_actions": [],
+        "production_mutation": False,
+        "public_report_contract": {
+            "manifest_schema_version": gray.REPORT_MANIFEST_SCHEMA_VERSION,
+            "public_origin_scheme": "https",
+            "explicit_port_forbidden": True,
+            "ip_literal_forbidden": True,
+            "private_upstream_publication_forbidden": True,
+            "private_upstream": "http://192.168.26.174:18081",
+            "environment_variable": "G1Q3_RCA_VIEWER_ORIGIN",
+            "owner_only_environment_file": (
+                "/home/mini/.config/g1q3-rca/report-http.env"
+            ),
+            "public_url_pattern": (
+                "<canonical_https_dns_origin>/G1Q3_RCA/cases/"
+                "<submission_key>/<artifact_set_id>/index.html"
             ),
         },
         "release_recommendation": "eligible_for_controlled_release_tooling",
-        "superseded_findings": [],
-        "validated_base": {
-            "commit": parent,
-            "tree": "8" * 40,
-            "is_ancestor_of_candidate": True,
-            "receipt": {"path": "/mnt/tmp/base.json", "sha256": "2" * 64},
+        "source_files": {},
+        "source_remote_readback": {
+            "commit": commit,
+            "matches_candidate": True,
+            "ref": "refs/heads/production/fixture",
+            "remote": "git@example.invalid:fixture/repo.git",
         },
         "verdict": "GO",
     }
     raw = json.dumps(body, sort_keys=True, separators=(",", ":")).encode() + b"\n"
     path = tmp_path / "vm-go.json"
     path.write_bytes(raw)
+    path.chmod(0o600)
     return path, hashlib.sha256(raw).hexdigest(), root, commit, tree
 
 
@@ -533,7 +553,7 @@ def test_valid_plan_binds_candidates_runtime_and_gray_contract(
     assert host["independent_go_receipt"] == {
         "observed_path": gray.EXPECTED_HOST_GO_RECEIPT_PATH,
         "sha256": gray.EXPECTED_HOST_GO_RECEIPT_SHA256,
-        "schema_version": "pnc_rca_host_controlled_gray_independent_audit_v1",
+            "schema_version": "pnc_rca_host_controlled_gray_independent_audit_v2",
         "verdict": "GO",
         "scope": "controlled-gray BOM binding only",
         "deployment_authorization": False,
@@ -955,19 +975,19 @@ def test_production_bindings_pin_current_reviewed_artifacts() -> None:
         "/Users/songying/.codex/tmp/rca-host-70c432-zero-cache"
     )
     assert gray.EXPECTED_HOST_COMMIT == (
-        "ecc6c747c8abbf1f815d8783511c7f96bf080bba"
+        "92f60f4da5df335b756da6b2e970b7096cc10d45"
     )
     assert gray.EXPECTED_HOST_TREE == (
-        "7d491dde4046138e93d874acef2c9440521d7dbe"
+        "05bdbda2923841095e0f11a3e983a487dcd4593a"
     )
     assert gray.EXPECTED_VM_COMMIT == (
-        "4b26cc7935eb4fa0910b42abde78d7f8d4efa0d1"
+        "00599fa5cd8718df3c31cd177f606a9e32b2419b"
     )
     assert gray.EXPECTED_VM_TREE == (
-        "9d45fb1357c7ab054c16c898941e342b9a50d391"
+        "27cb14f0cef85de51e32dca5da572ca318ebcb91"
     )
     assert gray.EXPECTED_VM_GO_RECEIPT_SHA256 == (
-        "0765e0adfb3e74abe6a1daaea626901003b9b0cb94223a0b401d626d1a48d1bf"
+        "6dd776db67ff8a0859e050a433a613c3ff1fe17a547a56326ca523b9cdfb405a"
     )
 
 
