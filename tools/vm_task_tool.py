@@ -654,6 +654,11 @@ def _goal_with_vm_path_contract(goal: str) -> str:
     return f"{goal.rstrip()}\n\n{_VM_PATH_CONTRACT}\n"
 
 
+def canonicalize_rca_goal_text(goal_text: str | None) -> str:
+    """Match the exact bytes materialized by the sealed shared-state creator."""
+    return str(goal_text or "").strip() + "\n"
+
+
 def _rca_shared_state_source_refs(source_refs: dict[str, Any]) -> dict[str, Any]:
     """Project admission v2 refs onto the shared-state create-once contract."""
     return {
@@ -695,7 +700,7 @@ def _rca_fixed_cli_goal(
     if any(marker in admission_json or marker in request_json for marker in markers):
         raise ValueError("RCA contract data contains a reserved goal marker")
     goal_path = f"{_RCA_VM_TASK_ROOT}/{safe_task_id}/goal.md"
-    return "\n".join([
+    return canonicalize_rca_goal_text("\n".join([
         _RCA_SHARED_STATE_GOAL_PREFIX,
         "",
         "# Governed G1Q3 RCA service request",
@@ -722,7 +727,7 @@ def _rca_fixed_cli_goal(
             f"- {_RCA_FIXED_CLI_RELATIVE_PATH} --task-id {safe_task_id} "
             f"--goal-path {goal_path}"
         ),
-    ])
+    ]))
 
 
 def build_rca_fixed_cli_goal(
@@ -1125,6 +1130,8 @@ def _vm_task_submit_trusted(
     if scheduler_meta_error:
         return {"success": False, "error": scheduler_meta_error}
     goal = _goal_with_vm_path_contract(goal)
+    if is_rca_prod:
+        goal = canonicalize_rca_goal_text(goal)
 
     create_task = create_task_script or _create_task_script()
     if not create_task.exists():

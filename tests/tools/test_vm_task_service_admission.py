@@ -888,6 +888,11 @@ def test_service_wrapper_allows_only_validated_rca_intake_with_fixed_envelope(mo
         ),
     ]
     assert vm_task_tool._goal_with_vm_path_contract(goal) == goal
+    assert goal.endswith("\n")
+    assert not goal.endswith("\n\n")
+    assert captured["routing_meta_extra"]["rca_prod_goal_sha256"] == hashlib.sha256(
+        goal.encode("utf-8")
+    ).hexdigest()
     assert "coding_agent" not in goal
     assert "codex" not in goal.lower()
     assert result["created"] is True

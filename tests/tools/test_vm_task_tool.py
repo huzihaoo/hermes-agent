@@ -1,5 +1,6 @@
 """Tests for shared-state VM task submission tool registration and errors."""
 
+import hashlib
 import json
 import sqlite3
 import subprocess
@@ -91,6 +92,26 @@ def test_rca_fixed_goal_matches_shared_state_create_once_markers():
     assert "## RcaExecutionRequest JSON\n" in goal
     assert vm_task_tool._RCA_ADMISSION_JSON_BEGIN in goal
     assert vm_task_tool._RCA_EXECUTION_REQUEST_JSON_BEGIN in goal
+    assert goal.endswith("\n")
+    assert not goal.endswith("\n\n")
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "governed goal",
+        "governed goal\n",
+        "governed goal\n\n\n",
+        " \t\ngoverned goal\n \t\n",
+    ],
+)
+def test_rca_goal_canonicalization_matches_creator_materialization(variant):
+    canonical = vm_task_tool.canonicalize_rca_goal_text(variant)
+
+    assert canonical == "governed goal\n"
+    assert hashlib.sha256(canonical.encode("utf-8")).hexdigest() == hashlib.sha256(
+        b"governed goal\n"
+    ).hexdigest()
 
 
 def test_vm_task_status_schema_is_raw_function_schema():
