@@ -2882,9 +2882,14 @@ def test_forged_final_validation_receipt_cannot_authorize_completion(tmp_path):
 def test_real_zero_cache_host_and_live_dependency_probe_are_read_only_smokes():
     host = release._observe_canonical_host_binding(expected_commit=release.HOST_FINAL_COMMIT, expected_tree=release.HOST_FINAL_TREE)
     dependency = release._observe_host_dependency_environment()
+    prereads = release._validate_diagnostic_target_prereads()
     assert host["commit"] == release.HOST_FINAL_COMMIT
     assert dependency["site_packages_file_count"] > 1000
     assert dependency["installed_distribution_count"] > 1
+    assert prereads["kafka"]["raw_sha256_matches"] is True
+    assert prereads["kafka"]["authorizes_release"] is False
+    assert prereads["official"]["field_preread"]["both_fields_empty"] is True
+    assert prereads["official"]["comment_preread"]["total_comment_count"] == 0
 
 
 def test_blocker_bom_exposes_validated_final_closure(monkeypatch):
@@ -2920,6 +2925,11 @@ def test_blocker_bom_exposes_validated_final_closure(monkeypatch):
     monkeypatch.setattr(
         release, "_validate_closure_audit", lambda _owned: closure
     )
+    monkeypatch.setattr(
+        release,
+        "_validate_diagnostic_target_prereads",
+        lambda: {"kafka": {"ok": True}, "official": {"ok": True}},
+    )
 
     bom = release.build_blocker_bom(now=NOW, verified_test_count=1)
     bound = bom["vm_candidate"]["fixed_cli_closure"]
@@ -2933,6 +2943,10 @@ def test_blocker_bom_exposes_validated_final_closure(monkeypatch):
     assert bound["schema_version"] == release.CLOSURE_AUDIT_SCHEMA_VERSION
     assert bound["authorizes_final_candidate"] is True
     assert bound["production_mutation"] is False
+    assert bom["target_recovery"]["diagnostic_live_preread"] == {"ok": True}
+    assert bom["delivery_closeout"]["diagnostic_official_preread"] == {
+        "ok": True
+    }
 
 
 def test_kafka_preread_executes_venv_entrypoint_without_resolving(

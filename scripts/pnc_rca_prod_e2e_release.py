@@ -99,6 +99,27 @@ PIPELINE_CLOSURE_SEALED_MIRROR_PATH = (
     "/Users/songying/.codex/tmp/rca-prod-e2e-release-20260721/evidence/"
     "fixed-cli-mcap-hard-rule-audit-4b26cc79.json"
 )
+DIAGNOSTIC_KAFKA_PREREAD_PATH = (
+    "/Users/songying/.codex/tmp/rca-prod-e2e-release-20260721/evidence/"
+    "controlled-gray/issue-7051585084-kafka-p0-o650-preread-20260722.json"
+)
+DIAGNOSTIC_KAFKA_PREREAD_SHA256 = (
+    "aa4dff9d09449e2f91b6c35569b88f2c3b6353464f771135b02350e67b70bf39"
+)
+DIAGNOSTIC_FIELD_PREREAD_PATH = (
+    "/Users/songying/.codex/tmp/rca-prod-e2e-release-20260721/evidence/"
+    "controlled-gray/issue-7051585084-official-input-field-preread-20260722.json"
+)
+DIAGNOSTIC_FIELD_PREREAD_SHA256 = (
+    "ed58ab4a3df0e2237493b2bee8103655c3d683d9dfec0e9a7512c70f12c175db"
+)
+DIAGNOSTIC_COMMENT_PREREAD_PATH = (
+    "/Users/songying/.codex/tmp/rca-prod-e2e-release-20260721/evidence/"
+    "controlled-gray/issue-7051585084-official-comment-preread-20260722.json"
+)
+DIAGNOSTIC_COMMENT_PREREAD_SHA256 = (
+    "61eabe2fe68985d4282364b7865d354e293e8b8b78f47d5bc2260eac4ce168d7"
+)
 CROSS_CONTRACT_PASS_FILE_SHA256 = (
     "8fa70b458c1676de058902123fe78bb4619d59c82072c1e251fae0f1991b949e"
 )
@@ -11010,6 +11031,108 @@ def _validate_quarantine_baseline_approval(
     }
 
 
+def _validate_diagnostic_target_prereads() -> Mapping[str, Any]:
+    kafka = _read_owned_json(
+        Path(DIAGNOSTIC_KAFKA_PREREAD_PATH), artifact="diagnostic_kafka_preread"
+    )
+    fields = _read_owned_json(
+        Path(DIAGNOSTIC_FIELD_PREREAD_PATH), artifact="diagnostic_field_preread"
+    )
+    comments = _read_owned_json(
+        Path(DIAGNOSTIC_COMMENT_PREREAD_PATH),
+        artifact="diagnostic_comment_preread",
+    )
+    kafka_body = kafka.body
+    field_body = fields.body
+    comment_body = comments.body
+    if (
+        kafka.sha256 != DIAGNOSTIC_KAFKA_PREREAD_SHA256
+        or kafka_body.get("schema_version")
+        != "pnc_rca_kafka_exact_offset_preread_v1"
+        or kafka_body.get("host_commit") != HOST_FINAL_COMMIT
+        or kafka_body.get("host_tree") != HOST_FINAL_TREE
+        or kafka_body.get("event_uid") != TARGET_EVENT_UID
+        or kafka_body.get("raw_sha256") != TARGET_RAW_SHA256
+        or kafka_body.get("business_key") != TARGET_BUSINESS_KEY
+        or kafka_body.get("submission_key") != TARGET_SUBMISSION_KEY
+        or kafka_body.get("project_key") != TARGET_PROJECT_KEY
+        or kafka_body.get("work_item_id") != TARGET_WORK_ITEM_ID
+        or kafka_body.get("classification_decision") != "accepted"
+        or kafka_body.get("assignment_mode") != "explicit_single_partition"
+        or kafka_body.get("assigned_partitions") != [PARTITION]
+        or kafka_body.get("seek_offset") != TARGET_OFFSET
+        or kafka_body.get("position_after_read") != TARGET_OFFSET + 1
+        or kafka_body.get("group_id") is not None
+        or kafka_body.get("enable_auto_commit") is not False
+        or kafka_body.get("commit_called") is not False
+        or kafka_body.get("raw_payload_persisted") is not False
+        or not isinstance(kafka_body.get("retained_start"), int)
+        or not isinstance(kafka_body.get("retained_end"), int)
+        or not kafka_body["retained_start"] <= TARGET_OFFSET < kafka_body["retained_end"]
+        or fields.sha256 != DIAGNOSTIC_FIELD_PREREAD_SHA256
+        or field_body.get("schema_version")
+        != "pnc_rca_fresh_target_input_revalidation_v1"
+        or field_body.get("host_commit") != HOST_FINAL_COMMIT
+        or field_body.get("host_tree") != HOST_FINAL_TREE
+        or field_body.get("project_key") != TARGET_PROJECT_KEY
+        or field_body.get("work_item_id") != TARGET_WORK_ITEM_ID
+        or field_body.get("source") != "official_meegle_api"
+        or field_body.get("status") != "fields_extracted"
+        or field_body.get("fields")
+        != {
+            key: {"sha256": EMPTY_SHA256, "utf8_bytes": 0}
+            for key in TARGET_FIELD_KEYS
+        }
+        or field_body.get("raw_values_persisted") is not False
+        or comments.sha256 != DIAGNOSTIC_COMMENT_PREREAD_SHA256
+        or comment_body.get("schema_version")
+        != "pnc_rca_official_comment_preread_v1"
+        or comment_body.get("host_commit") != HOST_FINAL_COMMIT
+        or comment_body.get("host_tree") != HOST_FINAL_TREE
+        or comment_body.get("project_key") != TARGET_PROJECT_KEY
+        or comment_body.get("work_item_id") != TARGET_WORK_ITEM_ID
+        or comment_body.get("source") != "official_meegle_api"
+        or comment_body.get("total_comment_count") != 0
+        or comment_body.get("rca_marker_comment_count") != 0
+        or comment_body.get("comment_digests") != []
+        or comment_body.get("marker_digests") != []
+        or comment_body.get("raw_values_persisted") is not False
+        or comment_body.get("production_mutation") is not False
+    ):
+        raise ProdE2EReleaseError(
+            "prod_e2e_release_diagnostic_preread_invalid"
+        )
+    return {
+        "kafka": {
+            "path": str(kafka.path),
+            "sha256": kafka.sha256,
+            "observed_at": kafka_body["observed_at"],
+            "retained_start": kafka_body["retained_start"],
+            "retained_end": kafka_body["retained_end"],
+            "raw_sha256_matches": True,
+            "authorizes_release": False,
+            "fresh_execution_preflight_required": True,
+        },
+        "official": {
+            "field_preread": {
+                "path": str(fields.path),
+                "sha256": fields.sha256,
+                "observed_at": field_body["observed_at"],
+                "both_fields_empty": True,
+            },
+            "comment_preread": {
+                "path": str(comments.path),
+                "sha256": comments.sha256,
+                "observed_at": comment_body["observed_at"],
+                "total_comment_count": 0,
+                "rca_marker_comment_count": 0,
+            },
+            "authorizes_release": False,
+            "fresh_execution_preflight_required": True,
+        },
+    }
+
+
 def build_blocker_bom(*, now: datetime, verified_test_count: int) -> Mapping[str, Any]:
     """Build an auditable NO-GO snapshot without exercising production paths."""
 
@@ -11026,6 +11149,7 @@ def build_blocker_bom(*, now: datetime, verified_test_count: int) -> Mapping[str
             artifact="blocker_bom_closure_audit",
         )
     )
+    diagnostic_prereads = _validate_diagnostic_target_prereads()
     source_path = Path(__file__).resolve()
     test_path = source_path.parents[1] / "tests/scripts/test_pnc_rca_prod_e2e_release.py"
     source_sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()
@@ -11150,6 +11274,7 @@ def build_blocker_bom(*, now: datetime, verified_test_count: int) -> Mapping[str
                 "business_and_submission_must_match": True,
                 "raw_payload_must_not_be_reconstructed_from_hashes": True,
             },
+            "diagnostic_live_preread": diagnostic_prereads["kafka"],
             "gap_ledger": {
                 "path": (
                     "/Users/songying/.codex/tmp/rca-prod-e2e-release-20260721/"
@@ -11169,6 +11294,7 @@ def build_blocker_bom(*, now: datetime, verified_test_count: int) -> Mapping[str
             "official_field_comment_marker_readback_required": True,
             "post_cutover_kafka_canary_required": True,
             "viewer_proxy_live_receipt_required_before_target_write": True,
+            "diagnostic_official_preread": diagnostic_prereads["official"],
         },
         "viewer_route_policy": {
             "preferred_path": "canonical_dns_https_same_origin_proxy",
@@ -11227,7 +11353,7 @@ def build_blocker_bom(*, now: datetime, verified_test_count: int) -> Mapping[str
             "vm_report_service_not_activated",
             "viewer_proxy_not_installed_or_reloaded",
             "strict_tls_and_nonintercepted_browser_proof_absent",
-            "target_kafka_live_retention_and_raw_hash_preread_absent",
+            "fresh_target_kafka_preread_after_writer_stop_absent",
             "exact_bom_owner_approvals_absent",
             "regular_rca_prod_capacity_authorization_absent",
             "regular_capacity_requires_20_zero_materialized_samples_over_7_days",
