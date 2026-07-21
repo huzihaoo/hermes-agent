@@ -32,6 +32,8 @@ RCA_RUNTIME_RELATIVE_FILES = (
     "gateway/pnc_rca_delivery_store.py",
     "gateway/pnc_rca_frame_reference.py",
     "gateway/pnc_rca_kafka_contract.py",
+    "gateway/pnc_rca_prod_admission.py",
+    "gateway/pnc_rca_prod_bootstrap.py",
     "gateway/pnc_rca_runtime_identity.py",
     "gateway/pnc_rca_runtime_transition.py",
     "gateway/pnc_rca_schema.py",

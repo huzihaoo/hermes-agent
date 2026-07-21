@@ -33,7 +33,7 @@ def test_vm_task_submit_schema_is_raw_function_schema():
     assert "function" not in definition["function"]
 
 
-def test_retired_rca_prod_resource_class_is_rejected(monkeypatch):
+def test_rca_prod_resource_class_is_reserved_for_scoped_service(monkeypatch):
     _disable_trusted_session(monkeypatch)
     result = vm_task_tool.vm_task_submit(
         title="ordinary task",
@@ -41,7 +41,7 @@ def test_retired_rca_prod_resource_class_is_rejected(monkeypatch):
         resource_class="rca_prod",
     )
     assert result["success"] is False
-    assert "invalid resource_class" in result["error"]
+    assert "capability-scoped vm_task_submit_service API" in result["error"]
 
     trusted = vm_task_tool._vm_task_submit_trusted(
         title="ordinary task",
@@ -50,7 +50,7 @@ def test_retired_rca_prod_resource_class_is_rejected(monkeypatch):
         resource_class="rca_prod",
     )
     assert trusted["success"] is False
-    assert "invalid resource_class" in trusted["error"]
+    assert "capability-scoped vm_task_submit_service API" in trusted["error"]
 
 
 def test_rca_shared_state_source_refs_use_exact_create_once_contract():

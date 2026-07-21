@@ -56,6 +56,17 @@ from gateway.pnc_rca_derived_capacity_reservation import (
     validate_derived_capacity_reservation_receipt,
 )
 from gateway.pnc_rca_kafka_contract import NORMALIZED_EVENT_SCHEMA_VERSION
+from gateway.pnc_rca_prod_bootstrap import (
+    ACTIVE_RELEASE_BINDING_NAME,
+    EPOCH_ID_RE as BOOTSTRAP_EPOCH_ID_RE,
+    RcaBootstrapAuthorizationError,
+    load_active_release_binding,
+    load_bootstrap_authorization,
+)
+from gateway.pnc_rca_prod_admission import (
+    RcaProdAdmissionError,
+    hmac_key_fingerprint,
+)
 from gateway.pnc_rca_runtime_identity import (
     MAX_HEALTH_FUTURE_SKEW_SECONDS,
     RCA_OUTBOX_DISPATCHER_LOADED_DEPENDENCIES,
@@ -82,6 +93,9 @@ from hermes_constants import get_hermes_home
 
 
 ENV_PREFIX = "HERMES_RCA_OUTBOX_"
+PROD_CAPACITY_MODE_ENV = "HERMES_RCA_PROD_CAPACITY_MODE"
+PROD_RELEASE_ID_ENV = "HERMES_RCA_PROD_RELEASE_ID"
+PROD_BOOTSTRAP_EPOCH_ID_ENV = "HERMES_RCA_PROD_BOOTSTRAP_EPOCH_ID"
 DISPATCHER_HEALTH_SCHEMA_VERSION = "pnc_rca_outbox_dispatcher_health_v2"
 SERVICE_LABEL = "local.pnc.rca-outbox-dispatcher"
 OUTBOX_PAYLOAD_SCHEMA_VERSION = "pnc_rca_submission_outbox_v2"
@@ -113,6 +127,7 @@ DEFAULT_INPUT_WAIT_MAX_AGE_SECONDS = 900
 MIN_INPUT_WAIT_MAX_AGE_SECONDS = 60
 MAX_INPUT_WAIT_MAX_AGE_SECONDS = 3_600
 HEALTH_HEARTBEAT_INTERVAL_SECONDS = 10.0
+PROD_RELEASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$")
 _FORBIDDEN_MDI_COMMAND_PATTERN = re.compile(
     r"\bmdi\s+(?:download|refresh2?|clip|event)\b", re.IGNORECASE
 )
@@ -123,6 +138,7 @@ _SERVICE_ERROR_CODES = frozenset({
     "vm_task_service_capability_denied",
     "vm_task_service_operation_denied",
     "vm_task_service_permission_denied",
+    "vm_task_service_rca_prod_admission_blocked",
     "vm_task_permission_policy_unavailable",
     "vm_task_service_admission_invalid",
     "vm_task_service_request_invalid",
@@ -137,6 +153,7 @@ _SERVICE_ERROR_CODES = frozenset({
 })
 
 _GLOBAL_CIRCUIT_ERROR_CODES = frozenset({
+    "dispatcher_bootstrap_authorization_invalid",
     "dispatcher_dependency_unavailable",
     "dispatcher_submit_contract_invalid",
     "derived_capacity_reservation_abort_precreate_response_invalid",
@@ -152,6 +169,7 @@ _GLOBAL_CIRCUIT_ERROR_CODES = frozenset({
     "vm_task_service_capability_denied",
     "vm_task_service_operation_denied",
     "vm_task_service_permission_denied",
+    "vm_task_service_rca_prod_admission_blocked",
     "vm_task_permission_policy_unavailable",
     "vm_task_service_workspace_runtime_drift",
     "vm_task_service_workspace_runtime_invalid",
@@ -342,6 +360,11 @@ class DispatcherConfig:
     storage_reserve_percent: int
     storage_timeout_seconds: int
     derived_capacity_reservation_timeout_seconds: int
+    capacity_mode: str
+    release_id: str
+    bootstrap_epoch_id: str
+    active_release_binding_path: Path
+    live_env_path: Path
 
     @classmethod
     def from_env(
@@ -475,6 +498,24 @@ class DispatcherConfig:
                 f"{ENV_PREFIX}INPUT_WAIT_MAX_AGE_SECONDS must be at most "
                 f"{MAX_INPUT_WAIT_MAX_AGE_SECONDS}"
             )
+        capacity_mode = str(source.get(PROD_CAPACITY_MODE_ENV, "")).strip()
+        if capacity_mode != "bootstrap":
+            raise ValueError(
+                f"{PROD_CAPACITY_MODE_ENV} must be exactly bootstrap until "
+                "steady capacity health is implemented"
+            )
+        release_id = str(source.get(PROD_RELEASE_ID_ENV, "")).strip()
+        bootstrap_epoch_id = str(
+            source.get(PROD_BOOTSTRAP_EPOCH_ID_ENV, "")
+        ).strip()
+        if (
+            PROD_RELEASE_ID_RE.fullmatch(release_id) is None
+            or BOOTSTRAP_EPOCH_ID_RE.fullmatch(bootstrap_epoch_id) is None
+        ):
+            raise ValueError(
+                "bootstrap RCA production capacity requires valid release and "
+                "epoch ids"
+            )
         config = cls(
             dispatch_enabled=dispatch_enabled,
             control_db_path=control_db_path,
@@ -543,6 +584,13 @@ class DispatcherConfig:
                 source, f"{ENV_PREFIX}STORAGE_TIMEOUT_SECONDS", 45
             ),
             derived_capacity_reservation_timeout_seconds=(derived_reservation_timeout),
+            capacity_mode=capacity_mode,
+            release_id=release_id,
+            bootstrap_epoch_id=bootstrap_epoch_id,
+            active_release_binding_path=(
+                control_db_path.parent / ACTIVE_RELEASE_BINDING_NAME
+            ),
+            live_env_path=home / ".env",
         )
         longest_boundary = max(
             config.storage_timeout_seconds,
@@ -606,6 +654,11 @@ class DispatcherConfig:
             "derived_capacity_reservation_timeout_seconds": (
                 self.derived_capacity_reservation_timeout_seconds
             ),
+            "capacity_mode": self.capacity_mode,
+            "release_id": self.release_id,
+            "bootstrap_epoch_id": self.bootstrap_epoch_id,
+            "active_release_binding_path": str(self.active_release_binding_path),
+            "live_env_path": str(self.live_env_path),
         }
 
     def runtime_public_dict(self) -> dict[str, Any]:
@@ -730,6 +783,8 @@ def default_enrich_event(event: Mapping[str, Any]) -> RcaIssueContext:
 def default_submit(
     admission: RcaAdmission,
     execution_request: RcaExecutionRequest,
+    *,
+    config: DispatcherConfig,
 ) -> Mapping[str, Any]:
     """Invoke only the fixed, capability-scoped VM submission wrapper."""
     from tools.vm_task_tool import vm_task_submit_service
@@ -738,6 +793,25 @@ def default_submit(
     reconcile_only = (
         isinstance(reservation, Mapping) and reservation.get("status") == "released"
     )
+    capacity_bindings: dict[str, str] = {}
+    try:
+        authorization = _load_bound_bootstrap_authorization(config)
+    except RcaBootstrapAuthorizationError as exc:
+        raise DispatchCircuitError(
+            "dispatcher_bootstrap_authorization_invalid", exc.code
+        ) from exc
+    capacity_bindings = {
+        "bootstrap_epoch_id": authorization["bootstrap_epoch_id"],
+        "release_bom_sha256": authorization["release_bom_sha256"],
+        "bootstrap_started_at": authorization["started_at"],
+        "bootstrap_deadline": authorization["deadline"],
+        "bootstrap_authorization_fingerprint": authorization[
+            "receipt_fingerprint"
+        ],
+        "active_release_binding_sha256": authorization[
+            "active_release_binding_sha256"
+        ],
+    }
     return vm_task_submit_service(
         service_id=DEFAULT_SERVICE_ID,
         capability=SERVICE_CAPABILITY,
@@ -745,7 +819,41 @@ def default_submit(
         admission=admission,
         execution_request=execution_request,
         reconcile_only=reconcile_only,
+        capacity_mode=config.capacity_mode,
+        **capacity_bindings,
     )
+
+
+def _load_bound_bootstrap_authorization(
+    config: DispatcherConfig,
+) -> dict[str, Any]:
+    binding = load_active_release_binding(
+        path=config.active_release_binding_path,
+        live_env_path=config.live_env_path,
+        expected_release_id=config.release_id,
+        expected_epoch_id=config.bootstrap_epoch_id,
+        verify_live_env=False,
+    )
+    authorization = load_bootstrap_authorization(
+        expected_epoch_id=binding["bootstrap_epoch_id"],
+        expected_release_bom_sha256=binding["release_bom_sha256"],
+        expected_release_approval_id=binding["release_id"],
+        expected_approval_evidence_sha256=binding["approval_evidence_sha256"],
+    )
+    if (
+        authorization["authorization_receipt_sha256"]
+        != binding["authorization_receipt_sha256"]
+        or authorization["receipt_fingerprint"]
+        != binding["authorization_fingerprint"]
+    ):
+        raise RcaBootstrapAuthorizationError(
+            "rca_active_release_authorization_identity_mismatch"
+        )
+    return {
+        **authorization,
+        "active_release_binding_sha256": binding["binding_receipt_sha256"],
+        "candidate_env_sha256": binding["candidate_env_sha256"],
+    }
 
 
 def _remote_storage_admission_script(request: StorageAdmissionRequest) -> str:
@@ -2310,6 +2418,7 @@ class OutboxDispatcher:
                 "disabled",
                 "idle",
                 "circuit_open",
+                "capacity_authorization_unavailable",
                 "downstream_backpressure",
                 "downstream_error",
                 "lease_lost",
@@ -2328,6 +2437,10 @@ class HealthReporter:
         workspace_runtime_observer: Callable[
             [], WorkspaceRuntimeIdentity
         ] | None = None,
+        bootstrap_authorization_observer: Callable[
+            [], Mapping[str, Any]
+        ] | None = None,
+        admission_key_fingerprint_observer: Callable[[], str] | None = None,
     ):
         self.config = config
         self.store = store
@@ -2338,6 +2451,13 @@ class HealthReporter:
         self._last_body: dict[str, Any] | None = None
         self._workspace_runtime_observer = (
             workspace_runtime_observer or validate_workspace_runtime
+        )
+        self._bootstrap_authorization_observer = (
+            bootstrap_authorization_observer
+            or (lambda: _load_bound_bootstrap_authorization(self.config))
+        )
+        self._admission_key_fingerprint_observer = (
+            admission_key_fingerprint_observer or hmac_key_fingerprint
         )
         self._bound_workspace_runtime: WorkspaceRuntimeIdentity | None = None
         self._workspace_runtime_startup_error = ""
@@ -2421,7 +2541,120 @@ class HealthReporter:
                 status="workspace_runtime_unavailable",
                 error_code=str(status["error_code"]),
             )
+        capacity = self.capacity_admission_status()
+        if capacity["required"] is True and capacity["ready"] is not True:
+            self.store.open_dispatcher_circuit(
+                reason_code="dispatcher_bootstrap_authorization_invalid",
+                reason_detail=str(capacity["error_code"]),
+            )
+            return DispatchOutcome(
+                status="capacity_authorization_unavailable",
+                error_code=str(capacity["error_code"]),
+            )
         return None
+
+    def capacity_admission_status(self) -> dict[str, Any]:
+        required = self.config.dispatch_enabled
+        try:
+            admission_key_fingerprint = str(
+                self._admission_key_fingerprint_observer()
+            ).strip()
+            if re.fullmatch(r"[0-9a-f]{64}", admission_key_fingerprint) is None:
+                raise RcaProdAdmissionError(
+                    "rca_prod_hmac_key_invalid", retryable=False
+                )
+        except RcaProdAdmissionError as exc:
+            return {
+                "required": required,
+                "ready": False,
+                "state": "unavailable",
+                "error_code": exc.code,
+                "capacity_mode": self.config.capacity_mode,
+                "admission_key_fingerprint": None,
+                "authorization": None,
+            }
+        except Exception:
+            return {
+                "required": required,
+                "ready": False,
+                "state": "unavailable",
+                "error_code": "rca_prod_hmac_key_observation_failed",
+                "capacity_mode": self.config.capacity_mode,
+                "admission_key_fingerprint": None,
+                "authorization": None,
+            }
+        try:
+            authorization = dict(self._bootstrap_authorization_observer())
+            sha_fields = (
+                "receipt_fingerprint",
+                "authorization_receipt_sha256",
+                "active_release_binding_sha256",
+                "candidate_env_sha256",
+                "release_bom_sha256",
+                "approval_evidence_sha256",
+            )
+            if (
+                authorization.get("authorization_ready") is not True
+                or authorization.get("capacity_mode") != "bootstrap"
+                or authorization.get("bootstrap_epoch_id")
+                != self.config.bootstrap_epoch_id
+                or authorization.get("release_approval_id")
+                != self.config.release_id
+                or any(
+                    re.fullmatch(r"[0-9a-f]{64}", str(authorization.get(field) or ""))
+                    is None
+                    for field in sha_fields
+                )
+            ):
+                raise RcaBootstrapAuthorizationError(
+                    "rca_bootstrap_authorization_projection_invalid"
+                )
+        except RcaBootstrapAuthorizationError as exc:
+            return {
+                "required": required,
+                "ready": False,
+                "state": "unavailable",
+                "error_code": exc.code,
+                "capacity_mode": "bootstrap",
+                "admission_key_fingerprint": admission_key_fingerprint,
+                "authorization": None,
+            }
+        except Exception:
+            return {
+                "required": required,
+                "ready": False,
+                "state": "unavailable",
+                "error_code": "rca_bootstrap_authorization_observation_failed",
+                "capacity_mode": "bootstrap",
+                "admission_key_fingerprint": admission_key_fingerprint,
+                "authorization": None,
+            }
+        return {
+            "required": required,
+            "ready": True,
+            "state": "ready",
+            "error_code": "",
+            "capacity_mode": "bootstrap",
+            "admission_key_fingerprint": admission_key_fingerprint,
+            "authorization": {
+                "bootstrap_epoch_id": authorization["bootstrap_epoch_id"],
+                "started_at": authorization["started_at"],
+                "deadline": authorization["deadline"],
+                "receipt_fingerprint": authorization["receipt_fingerprint"],
+                "authorization_receipt_sha256": authorization[
+                    "authorization_receipt_sha256"
+                ],
+                "active_release_binding_sha256": authorization[
+                    "active_release_binding_sha256"
+                ],
+                "candidate_env_sha256": authorization["candidate_env_sha256"],
+                "release_bom_sha256": authorization["release_bom_sha256"],
+                "release_approval_id": authorization["release_approval_id"],
+                "approval_evidence_sha256": authorization[
+                    "approval_evidence_sha256"
+                ],
+            },
+        }
 
     def write(
         self,
@@ -2445,6 +2678,7 @@ class HealthReporter:
         )
         store_health = self.store.health()
         workspace_runtime = self.workspace_runtime_status()
+        capacity_admission = self.capacity_admission_status()
         healthy = (
             state
             not in {
@@ -2460,11 +2694,16 @@ class HealthReporter:
                 workspace_runtime["required"] is not True
                 or workspace_runtime["ready"] is True
             )
+            and (
+                capacity_admission["required"] is not True
+                or capacity_admission["ready"] is True
+            )
         )
         ready_for_dispatch = bool(
             self.config.dispatch_enabled
             and healthy
             and workspace_runtime["ready"] is True
+            and capacity_admission["ready"] is True
         )
         observed_at = _utc_iso()
         body = {
@@ -2489,6 +2728,7 @@ class HealthReporter:
             },
             "runtime_identity": self.runtime_identity.to_dict(),
             "workspace_runtime": workspace_runtime,
+            "capacity_admission": capacity_admission,
             "config": self.public_config,
             "stats": asdict(stats),
             "last_outcome": asdict(last_outcome) if last_outcome else None,
@@ -2511,7 +2751,9 @@ class HealthReporter:
             observed_at = _utc_iso()
             body = dict(self._last_body)
             workspace_runtime = self.workspace_runtime_status()
+            capacity_admission = self.capacity_admission_status()
             body["workspace_runtime"] = workspace_runtime
+            body["capacity_admission"] = capacity_admission
             if (
                 workspace_runtime["required"] is True
                 and workspace_runtime["ready"] is not True
@@ -2521,6 +2763,19 @@ class HealthReporter:
                 body["readiness_observed_at"] = observed_at
                 body["readiness"] = {
                     "state": "workspace_runtime_unavailable",
+                    "healthy": False,
+                    "ready_for_dispatch": False,
+                    "observed_at": observed_at,
+                }
+            elif (
+                capacity_admission["required"] is True
+                and capacity_admission["ready"] is not True
+            ):
+                body["ok"] = False
+                body["healthy"] = False
+                body["readiness_observed_at"] = observed_at
+                body["readiness"] = {
+                    "state": "capacity_authorization_unavailable",
                     "healthy": False,
                     "ready_for_dispatch": False,
                     "observed_at": observed_at,
@@ -2599,6 +2854,50 @@ def _health_workspace_runtime_ok(payload: Mapping[str, Any]) -> bool:
     )
 
 
+def _health_capacity_admission_ok(payload: Mapping[str, Any]) -> bool:
+    status = payload.get("capacity_admission")
+    config = payload.get("config")
+    if not isinstance(status, Mapping) or not isinstance(config, Mapping):
+        return False
+    required = payload.get("enabled") is True
+    mode = str(config.get("capacity_mode") or "")
+    if status.get("required") is not required or status.get("capacity_mode") != mode:
+        return False
+    if not required:
+        return status.get("ready") in {True, False}
+    if (
+        re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(status.get("admission_key_fingerprint") or ""),
+        )
+        is None
+    ):
+        return False
+    authorization = status.get("authorization")
+    if (
+        mode != "bootstrap"
+        or status.get("ready") is not True
+        or status.get("state") != "ready"
+        or not isinstance(authorization, Mapping)
+        or authorization.get("bootstrap_epoch_id")
+        != config.get("bootstrap_epoch_id")
+        or authorization.get("release_approval_id") != config.get("release_id")
+    ):
+        return False
+    return all(
+        re.fullmatch(r"[0-9a-f]{64}", str(authorization.get(field) or ""))
+        is not None
+        for field in (
+            "receipt_fingerprint",
+            "authorization_receipt_sha256",
+            "active_release_binding_sha256",
+            "candidate_env_sha256",
+            "release_bom_sha256",
+            "approval_evidence_sha256",
+        )
+    )
+
+
 def read_health_status(
     config: DispatcherConfig,
     *,
@@ -2657,6 +2956,7 @@ def read_health_status(
         and isinstance(downstream, Mapping)
         and _health_runtime_identity_ok(payload)
         and _health_workspace_runtime_ok(payload)
+        and _health_capacity_admission_ok(payload)
     )
     result = dict(payload)
     result["ok"] = bool(fresh and producer_ok)
@@ -2829,7 +3129,11 @@ def main(argv: list[str] | None = None) -> int:
             storage_admission=default_storage_admission,
             derived_capacity_reservation=reserve_derived_capacity,
             derived_capacity_abort_precreate=abort_precreate_derived_capacity,
-            submit=default_submit,
+            submit=lambda admission, execution_request: default_submit(
+                admission,
+                execution_request,
+                config=config,
+            ),
         )
         health = HealthReporter(
             config,
