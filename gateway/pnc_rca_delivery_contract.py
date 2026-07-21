@@ -51,6 +51,35 @@ _FORMAL_REPORT_SHARE = "department-pnc_team-planning_algo-driving"
 _FORMAL_REPORT_CIFS_PREFIX = (
     f"//{_FORMAL_REPORT_CIFS_HOST}/{_FORMAL_REPORT_SHARE}/tmp/"
 )
+_DELIVERY_MANIFEST_V2_FIELDS = frozenset(
+    {
+        "schema_version",
+        "sealed",
+        "submission_key",
+        "business_key",
+        "generation",
+        "project_key",
+        "work_item_type_key",
+        "work_item_id",
+        "artifact_revision",
+        "sealed_at",
+        "deliverable_kind",
+        "dependencies_complete",
+        "artifact_root",
+        "html_validation",
+        "artifacts",
+        "artifact_set_id",
+        "report_vm_path",
+        "report_cifs_path",
+        "report_url",
+    }
+)
+_DELIVERY_MANIFEST_ARTIFACT_FIELDS = frozenset(
+    {"role", "path", "size", "sha256", "media_type", "required"}
+)
+_DELIVERY_HTML_VALIDATION_FIELDS = frozenset(
+    {"state", "report_data_sha256", "blockers", "fidelity_ok"}
+)
 MAX_DELIVERY_ARTIFACTS = 512
 MAX_DELIVERY_ARTIFACT_BYTES = 256 * 1024 * 1024
 MAX_DELIVERY_ARTIFACT_TOTAL_BYTES = 512 * 1024 * 1024
@@ -949,6 +978,11 @@ def _manifest_artifact_material(manifest: Mapping[str, Any]) -> list[dict[str, A
             raise DeliveryContractError(
                 "delivery_manifest_artifacts_invalid", f"artifact[{index}] must be an object"
             )
+        if set(item) != _DELIVERY_MANIFEST_ARTIFACT_FIELDS:
+            raise DeliveryContractError(
+                "delivery_manifest_artifact_shape_invalid",
+                f"artifact[{index}] fields do not match delivery_manifest_v2",
+            )
         role = _required_text(item.get("role"), f"artifact[{index}].role")
         path = _required_text(item.get("path"), f"artifact[{index}].path")
         media_type = _required_text(
@@ -1003,6 +1037,8 @@ def _html_validation_material(manifest: Mapping[str, Any]) -> dict[str, Any]:
     value = manifest.get("html_validation")
     if not isinstance(value, Mapping):
         raise DeliveryContractError("html_validation_missing")
+    if set(value) != _DELIVERY_HTML_VALIDATION_FIELDS:
+        raise DeliveryContractError("html_validation_shape_invalid")
     if value.get("state") != "html_delivery_ready":
         raise DeliveryContractError("html_validation_state_invalid")
     blockers = value.get("blockers")
@@ -1019,6 +1055,11 @@ def _html_validation_material(manifest: Mapping[str, Any]) -> dict[str, Any]:
         "blockers": [],
         "fidelity_ok": True,
     }
+
+
+def _validate_manifest_v2_shape(manifest: Mapping[str, Any]) -> None:
+    if set(manifest) != _DELIVERY_MANIFEST_V2_FIELDS:
+        raise DeliveryContractError("delivery_manifest_shape_invalid")
 
 
 def compute_artifact_set_id(manifest: Mapping[str, Any]) -> str:
@@ -1070,6 +1111,7 @@ def verify_persisted_artifact_inventory(
     if manifest.get("dependencies_complete") is not True:
         raise DeliveryContractError("delivery_dependencies_incomplete")
     computed_artifact_set_id = compute_artifact_set_id(manifest)
+    _validate_manifest_v2_shape(manifest)
     if (
         manifest.get("artifact_set_id") != expected_artifact_set_id
         or computed_artifact_set_id != expected_artifact_set_id
@@ -1566,7 +1608,7 @@ def verify_delivery_bundle(
         raise DeliveryContractError(
             "delivery_dependencies_incomplete",
             "manifest must attest a complete HTML dependency inventory",
-        )
+    )
     _verify_identity(validated_admission, contract, manifest)
 
     if str(contract.get("business_state") or "").strip() != "report_completed":
@@ -1592,6 +1634,7 @@ def verify_delivery_bundle(
     root = _normalize_root(manifest.get("artifact_root"), validated_admission.submission_key)
     artifact_material = _manifest_artifact_material(manifest)
     expected_artifact_set_id = compute_artifact_set_id(manifest)
+    _validate_manifest_v2_shape(manifest)
     if manifest.get("artifact_set_id") != expected_artifact_set_id:
         raise DeliveryContractError("artifact_set_id_mismatch")
 

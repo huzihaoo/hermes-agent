@@ -249,9 +249,15 @@ def test_capacity_guard_fails_before_claim_when_admission_key_is_invalid(tmp_pat
 
 def test_runtime_closure_includes_prod_admission_but_not_retired_transition():
     assert {
+        "gateway/__init__.py",
         "gateway/pnc_rca_prod_admission.py",
         "gateway/pnc_rca_prod_bootstrap.py",
+        "gateway/record_only/runtime.py",
+        "gateway/record_only/transport.py",
+        "scripts/pnc_completion_notice_relay.py",
         "scripts/pnc_foxglove_delivery.py",
+        "scripts/pnc_vm_task_sync.py",
+        "tools/__init__.py",
     }.issubset(RCA_RUNTIME_RELATIVE_FILES)
     assert {
         "gateway/pnc_rca_capacity_runtime.py",

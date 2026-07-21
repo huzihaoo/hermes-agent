@@ -6,6 +6,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import pwd
@@ -57,7 +58,7 @@ OPERATIONS = {
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 FEISHU_ID_RE = re.compile(r"\b(?:ou|oc|om|on)_[A-Za-z0-9_-]+\b")
-HTTP_LINK_RE = re.compile(r"https?://[^\s<>'\"\]\)]+")
+HTTP_LINK_RE = re.compile(r"https?://[^\s<>'\"\]\)]+", re.IGNORECASE)
 CIFS_LINK_RE = re.compile(r"(?<!:)//(?:hfs1?|[^/\s]+)/[^\s<>'\"\]\)]+")
 SECRET_TEXT_RE = re.compile(
     r"(?i)[\"']?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|"
@@ -389,24 +390,158 @@ def _validate_json_shape(value: Any, *, field: str) -> None:
             _validate_json_shape(item, field=field)
 
 
-FOXGLOVE_MCAP_PREFIX = "/mnt/minieye/pdcl/department/perception_test_team/"
+FOXGLOVE_LEGACY_MCAP_PREFIX = (
+    "/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases/"
+)
+FOXGLOVE_REMOTE_ROUTE_PREFIX = "/g1q3-rca-artifacts/v1/"
 FOXGLOVE_PATH_SAFE = "/._-()[]中文abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+FOXGLOVE_REMOTE_PATH_RE = re.compile(
+    rf"^{re.escape(FOXGLOVE_REMOTE_ROUTE_PREFIX)}"
+    r"(?P<key>[A-Za-z0-9][A-Za-z0-9._-]{0,191})/"
+    r"(?P=key)\.viz\.mcap$"
+)
+FOXGLOVE_LEGACY_KEY_PUNCTUATION = frozenset("._-")
+FOXGLOVE_DNS_LABEL_RE = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+)
 
 
-def _validate_foxglove_query(link: str) -> None:
-    parsed = urlsplit(link)
-    if parsed.fragment:
-        raise RecordOnlyError("HTTP link fragments are not recordable")
+def _is_whatwg_ipv4_number(value: str) -> bool:
+    if value.startswith("0x"):
+        return len(value) > 2 and all(char in "0123456789abcdef" for char in value[2:])
+    if len(value) > 1 and value.startswith("0"):
+        return all(char in "01234567" for char in value[1:])
+    return value.isdigit()
+
+
+def _is_safe_legacy_foxglove_key(key: str) -> bool:
+    try:
+        encoded = key.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return (
+        0 < len(encoded) <= 768
+        and all(
+            char.isalnum() or char in FOXGLOVE_LEGACY_KEY_PUNCTUATION
+            for char in key
+        )
+    )
+
+
+def _is_approved_legacy_foxglove_mcap_path(mcap_path: str) -> bool:
+    path = PurePosixPath(mcap_path)
+    if not path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts[1:]):
+        return False
+    key = path.parent.name
+    if path.name != f"{key}.viz.mcap":
+        return False
+    legacy_path = f"{FOXGLOVE_LEGACY_MCAP_PREFIX}{key}/{key}.viz.mcap"
+    return _is_safe_legacy_foxglove_key(key) and mcap_path == legacy_path
+
+
+def _canonical_http_host(hostname: str) -> str:
+    if (
+        not hostname
+        or not hostname.isascii()
+        or hostname != hostname.lower()
+        or any(char in hostname for char in "\\%")
+    ):
+        return ""
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        labels = hostname.split(".")
+        if (
+            len(hostname) > 253
+            or any(FOXGLOVE_DNS_LABEL_RE.fullmatch(label) is None for label in labels)
+            or any(label.startswith("xn--") for label in labels)
+            or not any(char.isalpha() for char in labels[-1])
+            or _is_whatwg_ipv4_number(labels[-1])
+        ):
+            return ""
+        return hostname
+    if address.version != 4:
+        return ""
+    canonical = address.compressed.lower()
+    if hostname != canonical:
+        return ""
+    return canonical
+
+
+def _canonical_http_authority(parsed, *, context: str) -> tuple[str, int | None]:
     try:
         port = parsed.port
     except ValueError as exc:
-        raise RecordOnlyError("invalid HTTP link port") from exc
-    if not parsed.hostname or port is not None and not 1 <= port <= 65535:
-        raise RecordOnlyError("invalid HTTP link host")
+        raise RecordOnlyError(f"invalid {context} port") from exc
+    host = _canonical_http_host(parsed.hostname or "")
+    netloc = host if port is None else f"{host}:{port}"
+    if (
+        not host
+        or parsed.scheme not in {"http", "https"}
+        or port is not None and not 1 <= port <= 65535
+        or parsed.scheme == "https" and port == 443
+        or parsed.scheme == "http" and port == 80
+        or parsed.username
+        or parsed.password
+        or parsed.netloc != netloc
+    ):
+        raise RecordOnlyError(f"invalid {context} authority")
+    return netloc, port
+
+
+def _validate_remote_file_url(*, viewer, raw_url: str, remote_url: str) -> None:
+    if (
+        not remote_url
+        or not remote_url.startswith("https://")
+        or not remote_url.isascii()
+        or "\x00" in remote_url
+        or "\\" in remote_url
+        or "%" in remote_url
+        or any(ord(char) < 0x20 or ord(char) == 0x7F for char in remote_url)
+        or quote(remote_url, safe="") != raw_url
+    ):
+        raise RecordOnlyError("remote file URL must use canonical single encoding")
+    try:
+        remote = urlsplit(remote_url)
+    except ValueError as exc:
+        raise RecordOnlyError("invalid remote file URL") from exc
+    remote_netloc, remote_port = _canonical_http_authority(
+        remote,
+        context="remote file URL",
+    )
+    if (
+        viewer.scheme != "https"
+        or remote.scheme != "https"
+        or remote_netloc != viewer.netloc
+        or remote.hostname != viewer.hostname
+        or remote_port != viewer.port
+        or remote.query
+        or remote.fragment
+        or FOXGLOVE_REMOTE_PATH_RE.fullmatch(remote.path) is None
+    ):
+        raise RecordOnlyError("remote file URL is outside the approved HTTPS route")
+
+
+def _validate_foxglove_query(link: str) -> None:
+    if (
+        not link.startswith(("http://", "https://"))
+        or not link.isascii()
+        or "\\" in link
+        or any(ord(char) < 0x20 or ord(char) == 0x7F for char in link)
+    ):
+        raise RecordOnlyError("Foxglove link must be canonical ASCII")
+    try:
+        parsed = urlsplit(link)
+    except ValueError as exc:
+        raise RecordOnlyError("invalid Foxglove URL") from exc
+    if parsed.fragment:
+        raise RecordOnlyError("HTTP link fragments are not recordable")
+    _canonical_http_authority(parsed, context="HTTP link")
     if parsed.path not in {"", "/"}:
         raise RecordOnlyError("Foxglove link path must be root")
-    prefix = "ds=foxglove-http&ds.mcapPath="
-    if not parsed.query.startswith(prefix) or parsed.query.count("&") != 1:
+    legacy_prefix = "ds=foxglove-http&ds.mcapPath="
+    remote_prefix = "ds=remote-file&ds.url="
+    if parsed.query.count("&") != 1:
         raise RecordOnlyError("unsupported HTTP query contract")
     try:
         pairs = parse_qsl(
@@ -417,9 +552,35 @@ def _validate_foxglove_query(link: str) -> None:
         )
     except (ValueError, UnicodeError) as exc:
         raise RecordOnlyError("invalid Foxglove query encoding") from exc
-    if len(pairs) != 2 or pairs[0] != ("ds", "foxglove-http") or pairs[1][0] != "ds.mcapPath":
+    if (
+        len(pairs) == 2
+        and pairs[0] == ("ds", "remote-file")
+        and pairs[1][0] == "ds.url"
+        and parsed.query.startswith(remote_prefix)
+    ):
+        if not link.startswith("https://"):
+            raise RecordOnlyError("remote file viewer URL must use canonical HTTPS")
+        raw_url = parsed.query[len(remote_prefix) :]
+        try:
+            remote_url = unquote(raw_url, encoding="utf-8", errors="strict")
+        except (UnicodeDecodeError, UnicodeError) as exc:
+            raise RecordOnlyError("invalid remote file URL encoding") from exc
+        if pairs[1][1] != remote_url:
+            raise RecordOnlyError("remote file URL encoding mismatch")
+        _validate_remote_file_url(
+            viewer=parsed,
+            raw_url=raw_url,
+            remote_url=remote_url,
+        )
+        return
+    if not (
+        len(pairs) == 2
+        and pairs[0] == ("ds", "foxglove-http")
+        and pairs[1][0] == "ds.mcapPath"
+        and parsed.query.startswith(legacy_prefix)
+    ):
         raise RecordOnlyError("unsupported HTTP query contract")
-    raw_path = parsed.query[len(prefix) :]
+    raw_path = parsed.query[len(legacy_prefix) :]
     try:
         mcap_path = unquote(raw_path, encoding="utf-8", errors="strict")
     except (UnicodeDecodeError, UnicodeError) as exc:
@@ -432,14 +593,7 @@ def _validate_foxglove_query(link: str) -> None:
         or pairs[1][1] != mcap_path
     ):
         raise RecordOnlyError("Foxglove path must use canonical single encoding")
-    path = PurePosixPath(mcap_path)
-    if (
-        not mcap_path.startswith(FOXGLOVE_MCAP_PREFIX)
-        or not path.is_absolute()
-        or any(part in {"", ".", ".."} for part in path.parts[1:])
-        or not path.name.endswith(".viz.mcap")
-        or path.name != f"{path.parent.name}.viz.mcap"
-    ):
+    if not _is_approved_legacy_foxglove_mcap_path(mcap_path):
         raise RecordOnlyError("Foxglove path is outside the approved MCAP contract")
 
 
@@ -449,7 +603,10 @@ def _reject_credential_links(links: list[str]) -> None:
     )
     for link in links:
         if link.lower().startswith(("http://", "https://")):
-            parsed = urlsplit(link)
+            try:
+                parsed = urlsplit(link)
+            except ValueError as exc:
+                raise RecordOnlyError("invalid HTTP link") from exc
             if parsed.username is not None or parsed.password is not None:
                 raise RecordOnlyError("credential-bearing HTTP link refused")
             if sensitive_query_key.search("?" + parsed.query):

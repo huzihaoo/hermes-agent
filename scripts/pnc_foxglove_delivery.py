@@ -1,6 +1,7 @@
 """Shared Foxglove delivery URL contract for PNC host writers."""
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 from pathlib import PurePosixPath
@@ -18,7 +19,29 @@ LEGACY_G1Q3_RCA_FORMAL_VIZ_ROOT = (
 )
 FOXGLOVE_PATH_SAFE = "/._-()[]中文abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 DEFAULT_FOXGLOVE_RENDER_HOST = "192.168.21.217"
+RCA_REMOTE_FILE_ROUTE_PREFIX = "/g1q3-rca-artifacts/v1/"
 _SAFE_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$")
+_DNS_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_LEGACY_KEY_PUNCTUATION = frozenset("._-")
+
+
+def _is_whatwg_ipv4_number(value: str) -> bool:
+    if value.startswith("0x"):
+        return len(value) > 2 and all(char in "0123456789abcdef" for char in value[2:])
+    if len(value) > 1 and value.startswith("0"):
+        return all(char in "01234567" for char in value[1:])
+    return value.isdigit()
+
+
+def _is_safe_legacy_key(key: str) -> bool:
+    try:
+        encoded = key.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return (
+        0 < len(encoded) <= 768
+        and all(char.isalnum() or char in _LEGACY_KEY_PUNCTUATION for char in key)
+    )
 
 
 def canonical_viz_mcap_path(submission_key: Any) -> str:
@@ -39,15 +62,102 @@ def canonical_viz_mcap_cifs_path(submission_key: Any) -> str:
 
 def _is_supported_viz_path(path: str) -> bool:
     viz_path = PurePosixPath(path)
-    if any(part in {".", ".."} for part in viz_path.parts):
+    if (
+        not viz_path.is_absolute()
+        or "\x00" in path
+        or "\\" in path
+        or any(part in {"", ".", ".."} for part in viz_path.parts[1:])
+    ):
         return False
     key = viz_path.parent.name
-    if not _SAFE_SEGMENT_RE.fullmatch(key) or viz_path.name != f"{key}.viz.mcap":
+    if viz_path.name != f"{key}.viz.mcap":
         return False
-    if path == canonical_viz_mcap_path(key):
+    if _SAFE_SEGMENT_RE.fullmatch(key) and path == canonical_viz_mcap_path(key):
         return True
     legacy = f"{LEGACY_G1Q3_RCA_FORMAL_VIZ_ROOT}/{key}/{key}.viz.mcap"
-    return path == legacy
+    return _is_safe_legacy_key(key) and path == legacy
+
+
+def _canonical_origin_host(hostname: str) -> str:
+    if (
+        not hostname
+        or not hostname.isascii()
+        or hostname != hostname.lower()
+        or any(char in hostname for char in "\\%")
+    ):
+        return ""
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        labels = hostname.split(".")
+        if (
+            len(hostname) > 253
+            or any(_DNS_LABEL_RE.fullmatch(label) is None for label in labels)
+            or any(label.startswith("xn--") for label in labels)
+            or not any(char.isalpha() for char in labels[-1])
+            or _is_whatwg_ipv4_number(labels[-1])
+        ):
+            return ""
+        return hostname
+    if address.version != 4:
+        return ""
+    canonical = address.compressed.lower()
+    if hostname != canonical:
+        return ""
+    return canonical
+
+
+def _foxglove_base() -> str:
+    raw = os.getenv("PNC_FOXGLOVE_RENDER_HOST", DEFAULT_FOXGLOVE_RENDER_HOST)
+    if (
+        not raw
+        or not raw.isascii()
+        or any(ord(char) < 0x20 or ord(char) == 0x7F for char in raw)
+        or any(char in raw for char in "\\%")
+        or any(char.isspace() for char in raw)
+    ):
+        return ""
+    configured = raw.rstrip("/")
+    base = (
+        configured
+        if configured.startswith(("http://", "https://"))
+        else f"https://{configured}"
+    )
+    try:
+        parsed = urlsplit(base)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return ""
+    expected_host = _canonical_origin_host(hostname or "")
+    expected_netloc = (
+        expected_host if port is None else f"{expected_host}:{port}"
+    )
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not expected_host
+        or (port is not None and not 1 <= port <= 65535)
+        or (parsed.scheme == "https" and port == 443)
+        or (parsed.scheme == "http" and port == 80)
+        or parsed.netloc != expected_netloc
+        or base != f"{parsed.scheme}://{parsed.netloc}"
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        return ""
+    return base
+
+
+def canonical_viz_remote_file_url(submission_key: Any) -> str:
+    """Return the same-origin HTTPS URL served by the scoped viewer proxy."""
+    key = str(submission_key or "").strip()
+    base = _foxglove_base()
+    if not _SAFE_SEGMENT_RE.fullmatch(key) or not base.startswith("https://"):
+        return ""
+    return f"{base}{RCA_REMOTE_FILE_ROUTE_PREFIX}{key}/{key}.viz.mcap"
 
 
 def foxglove_url(viz_mcap_vm: Any) -> str:
@@ -56,24 +166,15 @@ def foxglove_url(viz_mcap_vm: Any) -> str:
     if not _is_supported_viz_path(path):
         return ""
 
-    configured = (
-        os.getenv("PNC_FOXGLOVE_RENDER_HOST", DEFAULT_FOXGLOVE_RENDER_HOST)
-        .strip()
-        .rstrip("/")
-    )
-    if not configured or any(ch.isspace() for ch in configured):
+    base = _foxglove_base()
+    if not base:
         return ""
-    base = configured if configured.startswith(("http://", "https://")) else f"https://{configured}"
-    parsed = urlsplit(base)
-    if (
-        parsed.scheme not in {"http", "https"}
-        or not parsed.netloc
-        or parsed.query
-        or parsed.fragment
-    ):
-        return ""
-    if parsed.path not in {"", "/"}:
-        return ""
+    if path.startswith(VM_TASK_OUTPUT_PREFIX):
+        key = PurePosixPath(path).parent.name
+        remote_file_url = canonical_viz_remote_file_url(key)
+        if not remote_file_url:
+            return ""
+        return f"{base}/?ds=remote-file&ds.url={quote(remote_file_url, safe='')}"
     return f"{base}/?ds=foxglove-http&ds.mcapPath={quote(path, safe=FOXGLOVE_PATH_SAFE)}"
 
 

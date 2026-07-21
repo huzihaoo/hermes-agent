@@ -20,6 +20,7 @@ import psutil
 
 
 RCA_RUNTIME_RELATIVE_FILES = (
+    "gateway/__init__.py",
     "gateway/feishu_task_card.py",
     "gateway/pnc_issue_capture.py",
     "gateway/pnc_issue_context.py",
@@ -41,23 +42,35 @@ RCA_RUNTIME_RELATIVE_FILES = (
     "gateway/pnc_rca_schema.py",
     "gateway/pnc_rca_stage_lineage.py",
     "gateway/pnc_rca_workspace_runtime.py",
+    "gateway/record_only/__init__.py",
+    "gateway/record_only/census_binding.py",
+    "gateway/record_only/external_census_binding.py",
+    "gateway/record_only/runtime.py",
+    "gateway/record_only/transport.py",
     "gateway/session_context.py",
     "hermes_constants.py",
     "scripts/pnc_g1q3_truth.py",
+    "scripts/pnc_completion_notice_relay.py",
     "scripts/pnc_foxglove_delivery.py",
     "scripts/pnc_rca_delivery_collector.py",
     "scripts/pnc_rca_delivery_dispatcher.py",
     "scripts/pnc_rca_kafka_consumer.py",
     "scripts/pnc_rca_outbox_dispatcher.py",
+    "scripts/pnc_status_projection.py",
+    "scripts/pnc_vm_task_sync.py",
+    "tools/__init__.py",
     "tools/permission_policy.py",
     "tools/registry.py",
     "tools/vm_task_tool.py",
 )
 DELIVERY_RUNTIME_RELATIVE_FILES = RCA_RUNTIME_RELATIVE_FILES
 GATEWAY_RCA_RUNTIME_RELATIVE_FILES = (
+    "hermes_cli/__init__.py",
     "hermes_cli/main.py",
+    "gateway/__init__.py",
     "gateway/run.py",
     "gateway/pnc_group_binding.py",
+    "gateway/platforms/__init__.py",
     "gateway/platforms/feishu.py",
     "gateway/pnc_rca_runtime_identity.py",
     "gateway/pnc_rca_runtime_transition.py",
@@ -71,6 +84,11 @@ GATEWAY_RCA_RUNTIME_RELATIVE_FILES = (
     "gateway/pnc_rca_data_access.py",
     "gateway/pnc_pdcl_contract.py",
     "gateway/pnc_rca_derived_capacity_reservation.py",
+    "gateway/record_only/__init__.py",
+    "gateway/record_only/census_binding.py",
+    "gateway/record_only/external_census_binding.py",
+    "gateway/record_only/runtime.py",
+    "gateway/record_only/transport.py",
     "scripts/pnc_foxglove_delivery.py",
 )
 MAX_HEALTH_FUTURE_SKEW_SECONDS = 30

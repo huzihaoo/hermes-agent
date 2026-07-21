@@ -160,6 +160,117 @@ class RecordOnlyTests(unittest.TestCase):
         )
         self.assertEqual(self.transport.read_all()[0]["links"], [link])
 
+    def test_exact_task_landing_foxglove_query_is_recordable(self) -> None:
+        key = "g1q3-rca-s1-" + "a" * 64
+        remote_url = (
+            "https://192.168.21.217/g1q3-rca-artifacts/v1/"
+            f"{key}/{key}.viz.mcap"
+        )
+        link = (
+            "https://192.168.21.217/?ds=remote-file&ds.url="
+            + quote(remote_url, safe="")
+        )
+        self.transport.record(
+            operation="card_send",
+            platform="feishu",
+            destination_kind="chat",
+            destination_id="oc_foxglove_task_landing",
+            payload_type="interactive_card",
+            payload={"url": link},
+            update_mode="create",
+        )
+        self.assertEqual(self.transport.read_all()[0]["links"], [link])
+
+    def test_unicode_legacy_foxglove_query_remains_recordable(self) -> None:
+        key = "6986500860_fcw_合肥-G1Q3_6028车-自车右转"
+        path = (
+            "/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases/"
+            f"{key}/{key}.viz.mcap"
+        )
+        link = (
+            "https://192.168.21.217/?ds=foxglove-http&ds.mcapPath="
+            + quote(path, safe=FOXGLOVE_PATH_SAFE)
+        )
+        self.transport.record(
+            operation="card_send",
+            platform="feishu",
+            destination_kind="chat",
+            destination_id="oc_foxglove_legacy_unicode",
+            payload_type="interactive_card",
+            payload={"url": link},
+            update_mode="create",
+        )
+        self.assertEqual(self.transport.read_all()[0]["links"], [link])
+
+    def test_remote_file_query_rejects_noncanonical_or_cross_origin_urls(self) -> None:
+        key = "g1q3-rca-s1-" + "a" * 64
+        viewer = "https://192.168.21.217/?ds=remote-file&ds.url="
+        valid_path = f"/g1q3-rca-artifacts/v1/{key}/{key}.viz.mcap"
+        bad_remote_urls = (
+            "http://192.168.21.217" + valid_path,
+            "https://viewer.invalid" + valid_path,
+            f"https://192.168.21.217/g1q3-rca-artifacts/v1/{key}/other.viz.mcap",
+            f"https://192.168.21.217/g1q3-rca-artifacts/v1/{key}/nested/{key}.viz.mcap",
+            "https://192.168.21.217/g1q3-rca-artifacts/v1/中文/中文.viz.mcap",
+            "https://192.168.21.217" + valid_path + "?download=1",
+            "https://192.168.21.217" + valid_path + "#fragment",
+            "https://[bad" + valid_path,
+        )
+        bad_links = [viewer + quote(url, safe="") for url in bad_remote_urls]
+        good_remote = "https://192.168.21.217" + valid_path
+        bad_links.extend(
+            [
+                "https://192.168.21.217/?ds.url="
+                + quote(good_remote, safe="")
+                + "&ds=remote-file",
+                viewer + quote(quote(good_remote, safe=""), safe=""),
+                "https://viewer\\evil.internal/?ds=remote-file&ds.url="
+                + quote(
+                    "https://viewer\\evil.internal" + valid_path,
+                    safe="",
+                ),
+                "https://[fe80::1%25en0]/?ds=remote-file&ds.url="
+                + quote("https://[fe80::1%25en0]" + valid_path, safe=""),
+                "https://viewer.invalid:0/?ds=remote-file&ds.url="
+                + quote("https://viewer.invalid:0" + valid_path, safe=""),
+                "https://viewer.invalid:443/?ds=remote-file&ds.url="
+                + quote("https://viewer.invalid:443" + valid_path, safe=""),
+                "https://0x7f000001/?ds=remote-file&ds.url="
+                + quote("https://0x7f000001" + valid_path, safe=""),
+                "https://127.0.0.0x1/?ds=remote-file&ds.url="
+                + quote("https://127.0.0.0x1" + valid_path, safe=""),
+                "https://0x7f.0x0.0x0.0x1/?ds=remote-file&ds.url="
+                + quote("https://0x7f.0x0.0x0.0x1" + valid_path, safe=""),
+                "https://xn--a.internal/?ds=remote-file&ds.url="
+                + quote("https://xn--a.internal" + valid_path, safe=""),
+                "https://foo.xn--a/?ds=remote-file&ds.url="
+                + quote("https://foo.xn--a" + valid_path, safe=""),
+                "https://[::ffff:192.0.2.128]/?ds=remote-file&ds.url="
+                + quote("https://[::ffff:192.0.2.128]" + valid_path, safe=""),
+                "https://[::1]/?ds=remote-file&ds.url="
+                + quote("https://[::1]" + valid_path, safe=""),
+                "https://[::ffff:c000:280]/?ds=remote-file&ds.url="
+                + quote("https://[::ffff:c000:280]" + valid_path, safe=""),
+                "HTTPS://192.168.21.217/?ds=remote-file&ds.url="
+                + quote(good_remote, safe=""),
+                viewer + quote("HTTPS://192.168.21.217" + valid_path, safe=""),
+            ]
+        )
+
+        for index, link in enumerate(bad_links):
+            with self.subTest(index=index, link=link):
+                with self.assertRaises(RecordOnlyError):
+                    self.transport.record(
+                        operation="card_send",
+                        platform="feishu",
+                        destination_kind="chat",
+                        destination_id=f"oc_remote_file_bad_{index}",
+                        payload_type="interactive_card",
+                        payload={"url": link},
+                        update_mode="create",
+                    )
+        self.assertFalse(self.transport.ledger.exists())
+
     def test_foxglove_query_rejects_noncanonical_or_escaped_paths(self) -> None:
         prefix = "https://viewer.invalid/?ds=foxglove-http&ds.mcapPath="
         good = (
@@ -184,6 +295,13 @@ class RecordOnlyTests(unittest.TestCase):
                 "/mnt/minieye/pdcl/department/perception_test_team_evil/case/case.viz.mcap",
                 safe=FOXGLOVE_PATH_SAFE,
             ),
+            prefix + quote("/mnt/tmp/case-a/case-b.viz.mcap", safe=FOXGLOVE_PATH_SAFE),
+            prefix
+            + quote(
+                "/mnt/tmp/case-a/nested/case-a.viz.mcap",
+                safe=FOXGLOVE_PATH_SAFE,
+            ),
+            prefix + quote("/mnt/tmp/../case-a/case-a.viz.mcap", safe=FOXGLOVE_PATH_SAFE),
             prefix + quote(quote(good, safe=""), safe=""),
         )
         for index, link in enumerate(bad_links):

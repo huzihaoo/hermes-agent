@@ -474,6 +474,33 @@ def test_legacy_manifest_v1_cannot_bypass_required_publication_paths():
 
 
 @pytest.mark.parametrize(
+    ("target", "field", "code"),
+    [
+        ("manifest", "unbound_extra", "delivery_manifest_shape_invalid"),
+        (
+            "artifact",
+            "unbound_extra",
+            "delivery_manifest_artifact_shape_invalid",
+        ),
+        ("html_validation", "unbound_extra", "html_validation_shape_invalid"),
+    ],
+)
+def test_manifest_v2_rejects_unbound_fields(target, field, code):
+    admission, contract, manifest, observed, dependencies = _bundle()
+    if target == "manifest":
+        manifest[field] = {"not": "identity-bound"}
+    elif target == "artifact":
+        manifest["artifacts"][0][field] = "not-identity-bound"
+    else:
+        manifest["html_validation"][field] = "not-identity-bound"
+
+    with pytest.raises(DeliveryContractError) as exc:
+        _verify((admission, contract, manifest, observed, dependencies))
+
+    assert exc.value.code == code
+
+
+@pytest.mark.parametrize(
     ("field", "value"),
     [
         (

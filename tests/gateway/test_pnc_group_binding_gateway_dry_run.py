@@ -842,6 +842,13 @@ def test_manual_gateway_passes_exact_kafka_policy_and_high_watermark(
     assert public_config["creation_rule_version"] == "issue-created-v2"
     assert public_config["kafka_outbox_high_watermark"] == 7
     assert "gateway/pnc_rca_policy_config.py" in GATEWAY_RCA_RUNTIME_RELATIVE_FILES
+    assert {
+        "hermes_cli/__init__.py",
+        "gateway/__init__.py",
+        "gateway/platforms/__init__.py",
+        "gateway/record_only/runtime.py",
+        "gateway/record_only/transport.py",
+    }.issubset(GATEWAY_RCA_RUNTIME_RELATIVE_FILES)
 
     monkeypatch.setenv(
         "HERMES_RCA_KAFKA_CREATION_RULE_VERSION",
