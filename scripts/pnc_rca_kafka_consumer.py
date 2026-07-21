@@ -5,12 +5,15 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import hashlib
 import importlib
 import json
 import os
 from pathlib import Path
+import re
 import signal
+import stat
 import sys
 import time
 from typing import Any, Callable, Mapping
@@ -64,6 +67,16 @@ MAX_POLL_TIMEOUT_MS = 5_000
 MAX_POLL_RECORDS = 10
 MAX_OFFSET_LOOKUP_TIMEOUT_MS = 10_000
 MAX_OUTBOX_HIGH_WATERMARK = 1_000
+EXACT_RECOVERY_REQUEST_SCHEMA_VERSION = "pnc_rca_exact_kafka_recovery_request_v1"
+EXACT_RECOVERY_RECEIPT_SCHEMA_VERSION = "pnc_rca_exact_kafka_recovery_receipt_v1"
+NATURAL_CANARY_GATE_SCHEMA_VERSION = "pnc_rca_natural_kafka_canary_gate_v1"
+NATURAL_CANARY_RECEIPT_SCHEMA_VERSION = "pnc_rca_natural_kafka_canary_receipt_v1"
+MAX_EXACT_RECOVERY_DOCUMENT_BYTES = 64 * 1024
+MAX_EXACT_RECOVERY_VALIDITY = timedelta(minutes=15)
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_RELEASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$")
+_EPOCH_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_NONCE_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 
 
 def _utc_now() -> str:
@@ -228,6 +241,8 @@ class ConsumerConfig:
     client_id: str
     control_db_path: Path
     health_path: Path
+    exact_recovery_request_path: Path | None
+    natural_canary_gate_path: Path | None
     submit_enabled: bool
     activation_required: bool
     outbox_high_watermark: int
@@ -337,6 +352,43 @@ class ConsumerConfig:
         policy = workflow_policy_from_env(source)
         if policy.topic != topic:
             raise ValueError("workflow policy topic must match consumer topic")
+        exact_recovery_path_text = str(
+            source.get(f"{ENV_PREFIX}EXACT_RECOVERY_REQUEST_PATH", "")
+        ).strip()
+        exact_recovery_request_path = (
+            Path(exact_recovery_path_text).expanduser()
+            if exact_recovery_path_text
+            else None
+        )
+        if exact_recovery_request_path is not None:
+            if not exact_recovery_request_path.is_absolute():
+                raise ValueError(
+                    f"{ENV_PREFIX}EXACT_RECOVERY_REQUEST_PATH must be absolute"
+                )
+            if not (
+                _strict_boolean(source, f"{ENV_PREFIX}ACTIVATION_REQUIRED", False)
+                and _boolean(source, f"{ENV_PREFIX}SUBMIT_ENABLED", False)
+            ):
+                raise ValueError(
+                    "exact recovery request path requires submit and activation"
+                )
+        natural_gate_path_text = str(
+            source.get(f"{ENV_PREFIX}NATURAL_CANARY_GATE_PATH", "")
+        ).strip()
+        natural_canary_gate_path = (
+            Path(natural_gate_path_text).expanduser()
+            if natural_gate_path_text
+            else None
+        )
+        if natural_canary_gate_path is not None:
+            if not natural_canary_gate_path.is_absolute():
+                raise ValueError(
+                    f"{ENV_PREFIX}NATURAL_CANARY_GATE_PATH must be absolute"
+                )
+            if exact_recovery_request_path is None:
+                raise ValueError(
+                    "natural canary gate requires the exact recovery request path"
+                )
         return cls(
             bootstrap_servers=bootstrap_servers,
             topic=topic,
@@ -392,6 +444,8 @@ class ConsumerConfig:
                     / "health.json",
                 )
             ).expanduser(),
+            exact_recovery_request_path=exact_recovery_request_path,
+            natural_canary_gate_path=natural_canary_gate_path,
             submit_enabled=_boolean(source, f"{ENV_PREFIX}SUBMIT_ENABLED", False),
             activation_required=_strict_boolean(
                 source,
@@ -431,6 +485,18 @@ class ConsumerConfig:
             "client_id": self.client_id,
             "control_db_path": str(self.control_db_path),
             "health_path": str(self.health_path),
+            "exact_recovery_request_path": (
+                str(self.exact_recovery_request_path)
+                if self.exact_recovery_request_path is not None
+                else None
+            ),
+            "exact_recovery_mode": "resident_owner_only_single_event",
+            "natural_canary_gate_path": (
+                str(self.natural_canary_gate_path)
+                if self.natural_canary_gate_path is not None
+                else None
+            ),
+            "natural_canary_mode": "first_accepted_then_pause",
             "submit_enabled": self.submit_enabled,
             "activation_required": self.activation_required,
             "activation_ingress_freeze_mode": "automatic_bounded_completion",
@@ -497,6 +563,10 @@ class PollStats:
     activation_freezes: int = 0
     activation_freeze_rebuilds: int = 0
     activation_freeze_releases: int = 0
+    exact_recovery_attempts: int = 0
+    exact_recovery_succeeded: int = 0
+    natural_canary_selected: int = 0
+    natural_canary_holds: int = 0
 
 
 class ConsumerLoopError(RuntimeError):
@@ -849,6 +919,615 @@ def _record_from_message(message: Any) -> KafkaRecord:
         timestamp_ms=getattr(message, "timestamp", None),
         headers=tuple(getattr(message, "headers", ()) or ()),
     )
+
+
+class ExactRecoveryError(RuntimeError):
+    """A resident exact-offset recovery request failed closed."""
+
+
+def _canonical_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _exact_recovery_receipt_path(request_path: Path) -> Path:
+    return request_path.with_name(f"{request_path.name}.receipt.json")
+
+
+def _read_owner_only_json(path: Path, *, artifact: str) -> tuple[dict[str, Any], bytes]:
+    selected = Path(path)
+    try:
+        parent = selected.parent.lstat()
+    except OSError as exc:
+        raise ExactRecoveryError(f"exact_recovery_{artifact}_parent_unavailable") from exc
+    if (
+        not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != os.geteuid()
+        or stat.S_IMODE(parent.st_mode) & 0o077
+    ):
+        raise ExactRecoveryError(f"exact_recovery_{artifact}_parent_not_owner_only")
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise ExactRecoveryError("exact_recovery_nofollow_unavailable")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
+    try:
+        before = selected.lstat()
+        descriptor = os.open(selected, flags)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise ExactRecoveryError(f"exact_recovery_{artifact}_open_failed") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or stat.S_IMODE(before.st_mode) & 0o077
+            or before.st_nlink != 1
+            or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+            or before.st_size < 2
+            or before.st_size > MAX_EXACT_RECOVERY_DOCUMENT_BYTES
+        ):
+            raise ExactRecoveryError(f"exact_recovery_{artifact}_not_owner_only")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(
+                descriptor,
+                min(64 * 1024, MAX_EXACT_RECOVERY_DOCUMENT_BYTES + 1 - total),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > MAX_EXACT_RECOVERY_DOCUMENT_BYTES:
+                raise ExactRecoveryError(f"exact_recovery_{artifact}_too_large")
+        after = os.fstat(descriptor)
+        visible = selected.lstat()
+        if (
+            (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            or (visible.st_dev, visible.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise ExactRecoveryError(f"exact_recovery_{artifact}_changed_during_read")
+    finally:
+        os.close(descriptor)
+    raw = b"".join(chunks)
+    try:
+        value = _strict_json(raw.decode("utf-8"), artifact)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ExactRecoveryError(f"exact_recovery_{artifact}_json_invalid") from exc
+    if not isinstance(value, dict):
+        raise ExactRecoveryError(f"exact_recovery_{artifact}_json_invalid")
+    return value, raw
+
+
+def _parse_exact_recovery_timestamp(value: Any, *, field_name: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ExactRecoveryError(f"exact_recovery_{field_name}_invalid") from exc
+    if parsed.tzinfo is None:
+        raise ExactRecoveryError(f"exact_recovery_{field_name}_invalid")
+    return parsed.astimezone(timezone.utc)
+
+
+def _validate_exact_recovery_request(
+    value: Mapping[str, Any],
+    *,
+    config: ConsumerConfig,
+    store: RcaControlStore,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    expected_fields = {
+        "schema_version",
+        "release_id",
+        "epoch_id",
+        "created_at",
+        "expires_at",
+        "topic",
+        "partition",
+        "offset",
+        "event_uid",
+        "raw_sha256",
+        "project_key",
+        "work_item_type_key",
+        "work_item_id",
+        "business_key",
+        "submission_key",
+        "generation",
+        "final_validation_sha256",
+        "nonce",
+        "request_sha256",
+    }
+    body = dict(value)
+    request_sha256 = str(body.pop("request_sha256", "")).strip().lower()
+    calculated = hashlib.sha256(_canonical_bytes(body)).hexdigest()
+    partition = body.get("partition")
+    offset = body.get("offset")
+    generation = body.get("generation")
+    event_uid = str(body.get("event_uid") or "").strip()
+    if (
+        set(value) != expected_fields
+        or body.get("schema_version") != EXACT_RECOVERY_REQUEST_SCHEMA_VERSION
+        or _RELEASE_ID_RE.fullmatch(str(body.get("release_id") or "")) is None
+        or _EPOCH_ID_RE.fullmatch(str(body.get("epoch_id") or "")) is None
+        or body.get("topic") != config.topic
+        or isinstance(partition, bool)
+        or not isinstance(partition, int)
+        or partition < 0
+        or isinstance(offset, bool)
+        or not isinstance(offset, int)
+        or offset < 0
+        or event_uid != f"{config.topic}:{partition}:{offset}"
+        or _SHA256_RE.fullmatch(str(body.get("raw_sha256") or "")) is None
+        or not all(
+            isinstance(body.get(field_name), str)
+            and 0 < len(str(body[field_name])) <= 500
+            for field_name in (
+                "project_key",
+                "work_item_type_key",
+                "work_item_id",
+                "business_key",
+                "submission_key",
+            )
+        )
+        or generation != 1
+        or _SHA256_RE.fullmatch(
+            str(body.get("final_validation_sha256") or "")
+        )
+        is None
+        or _NONCE_RE.fullmatch(str(body.get("nonce") or "")) is None
+        or _SHA256_RE.fullmatch(request_sha256) is None
+        or request_sha256 != calculated
+    ):
+        raise ExactRecoveryError("exact_recovery_request_invalid")
+    created_at = _parse_exact_recovery_timestamp(
+        body.get("created_at"), field_name="created_at"
+    )
+    expires_at = _parse_exact_recovery_timestamp(
+        body.get("expires_at"), field_name="expires_at"
+    )
+    observed_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    if (
+        expires_at <= created_at
+        or expires_at - created_at > MAX_EXACT_RECOVERY_VALIDITY
+        or created_at > observed_at + timedelta(seconds=MAX_HEALTH_FUTURE_SKEW_SECONDS)
+        or observed_at >= expires_at
+    ):
+        raise ExactRecoveryError("exact_recovery_request_expired")
+    epoch = store.activation_epoch()
+    epoch_id = str(body["epoch_id"])
+    if (
+        epoch is None
+        or epoch.get("epoch_id") != epoch_id
+        or epoch.get("state") != "bounded_active"
+    ):
+        raise ExactRecoveryError("exact_recovery_epoch_not_bounded")
+    source_identity = {
+        "event_uid": event_uid,
+        "offset": offset,
+        "partition": partition,
+        "topic": config.topic,
+    }
+    authorization = store.activation_slot_authorizations(epoch_id=epoch_id).get(
+        "kafka_success"
+    )
+    if authorization != {
+        "source_kind": "kafka",
+        "source_identity_sha256": canonical_json_sha256(source_identity),
+    }:
+        raise ExactRecoveryError("exact_recovery_slot_not_authorized")
+    return {**body, "request_sha256": request_sha256}
+
+
+def _default_exact_recovery_reader(
+    config: ConsumerConfig, request: Mapping[str, Any]
+) -> tuple[Any, dict[str, Any]]:
+    try:
+        kafka_module = importlib.import_module("kafka")
+        KafkaConsumer = kafka_module.KafkaConsumer
+        TopicPartition = importlib.import_module("kafka.structs").TopicPartition
+    except ImportError as exc:
+        raise ExactRecoveryError("exact_recovery_kafka_dependency_unavailable") from exc
+    kwargs = config.kafka_kwargs()
+    kwargs.update(
+        {
+            "group_id": None,
+            "enable_auto_commit": False,
+            "client_id": f"{FIXED_SERVICE_ID}_exact_recovery",
+        }
+    )
+    consumer = KafkaConsumer(**kwargs)
+    topic_partition = TopicPartition(request["topic"], request["partition"])
+    try:
+        consumer.assign([topic_partition])
+        beginning = int(
+            consumer.beginning_offsets(
+                [topic_partition], timeout=config.offset_lookup_timeout_ms / 1000
+            )[topic_partition]
+        )
+        end = int(
+            consumer.end_offsets(
+                [topic_partition], timeout=config.offset_lookup_timeout_ms / 1000
+            )[topic_partition]
+        )
+        if request["offset"] < beginning or request["offset"] >= end:
+            raise ExactRecoveryError("exact_recovery_offset_not_retained")
+        consumer.seek(topic_partition, request["offset"])
+        batch = consumer.poll(
+            timeout_ms=config.poll_timeout_ms,
+            max_records=1,
+        )
+        messages = tuple(batch.get(topic_partition, ()))
+        if len(messages) != 1:
+            raise ExactRecoveryError("exact_recovery_record_not_found")
+        message = messages[0]
+        if (
+            message.topic != request["topic"]
+            or message.partition != request["partition"]
+            or message.offset != request["offset"]
+        ):
+            raise ExactRecoveryError("exact_recovery_coordinate_mismatch")
+        return message, {
+            "assignment_mode": "explicit_single_partition",
+            "assigned_partitions": [request["partition"]],
+            "retained_start": beginning,
+            "retained_end": end,
+            "group_id": None,
+            "enable_auto_commit": False,
+            "commit_called": False,
+        }
+    finally:
+        consumer.close(autocommit=False)
+
+
+def _publish_exact_recovery_receipt(path: Path, value: Mapping[str, Any]) -> None:
+    payload = _canonical_bytes(dict(value)) + b"\n"
+    if len(payload) > MAX_EXACT_RECOVERY_DOCUMENT_BYTES:
+        raise ExactRecoveryError("exact_recovery_receipt_too_large")
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except FileExistsError:
+        existing, _raw = _read_owner_only_json(path, artifact="receipt")
+        if existing != dict(value):
+            raise ExactRecoveryError("exact_recovery_receipt_conflict")
+        return
+    try:
+        written = 0
+        while written < len(payload):
+            count = os.write(descriptor, payload[written:])
+            if count <= 0:
+                raise ExactRecoveryError("exact_recovery_receipt_write_failed")
+            written += count
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    directory = os.open(
+        path.parent,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def recover_exact_kafka_request(
+    *,
+    store: RcaControlStore,
+    config: ConsumerConfig,
+    runtime_identity: Mapping[str, Any],
+    reader: Callable[[ConsumerConfig, Mapping[str, Any]], tuple[Any, dict[str, Any]]]
+    | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    request_path = config.exact_recovery_request_path
+    if request_path is None or not request_path.exists():
+        return None
+    request_value, _request_raw = _read_owner_only_json(request_path, artifact="request")
+    receipt_path = _exact_recovery_receipt_path(request_path)
+    if receipt_path.exists():
+        claimed_request_sha256 = str(request_value.get("request_sha256") or "")
+        request_body = dict(request_value)
+        request_body.pop("request_sha256", None)
+        if (
+            _SHA256_RE.fullmatch(claimed_request_sha256) is None
+            or hashlib.sha256(_canonical_bytes(request_body)).hexdigest()
+            != claimed_request_sha256
+        ):
+            raise ExactRecoveryError("exact_recovery_request_invalid")
+        receipt, _receipt_raw = _read_owner_only_json(receipt_path, artifact="receipt")
+        if (
+            receipt.get("schema_version") != EXACT_RECOVERY_RECEIPT_SCHEMA_VERSION
+            or receipt.get("request_sha256") != request_value.get("request_sha256")
+            or receipt.get("event_uid") != request_value.get("event_uid")
+            or receipt.get("outcome") != "ingested"
+        ):
+            raise ExactRecoveryError("exact_recovery_receipt_invalid")
+        return receipt
+    request = _validate_exact_recovery_request(
+        request_value,
+        config=config,
+        store=store,
+        now=now,
+    )
+    message, observation = (reader or _default_exact_recovery_reader)(config, request)
+    record = _record_from_message(message)
+    raw_sha256 = hashlib.sha256(record.value).hexdigest()
+    if raw_sha256 != request["raw_sha256"]:
+        raise ExactRecoveryError("exact_recovery_raw_sha256_mismatch")
+    result = store.ingest_record(
+        record,
+        policy=config.policy,
+        submit_enabled=config.submit_enabled,
+        activation_required=True,
+        activation_slot_kind="kafka_success",
+        runtime_identity=runtime_identity,
+    )
+    if (
+        result.decision != "accepted"
+        or result.business_key != request["business_key"]
+        or result.submission_key != request["submission_key"]
+        or result.generation != request["generation"]
+    ):
+        raise ExactRecoveryError("exact_recovery_ingest_identity_mismatch")
+    inbox = store.get_inbox(request["event_uid"])
+    if (
+        inbox.get("raw_sha256") != request["raw_sha256"]
+        or inbox.get("decision") != "accepted"
+        or inbox.get("business_key") != request["business_key"]
+        or inbox.get("submission_key") != request["submission_key"]
+        or inbox.get("generation") != request["generation"]
+    ):
+        raise ExactRecoveryError("exact_recovery_durable_readback_mismatch")
+    observed_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    receipt = {
+        "schema_version": EXACT_RECOVERY_RECEIPT_SCHEMA_VERSION,
+        "release_id": request["release_id"],
+        "epoch_id": request["epoch_id"],
+        "request_sha256": request["request_sha256"],
+        "final_validation_sha256": request["final_validation_sha256"],
+        "processed_at": observed_at.isoformat(),
+        "event_uid": request["event_uid"],
+        "raw_sha256": request["raw_sha256"],
+        "business_key": request["business_key"],
+        "submission_key": request["submission_key"],
+        "generation": request["generation"],
+        "outcome": "ingested",
+        "activation_slot_kind": "kafka_success",
+        "resident_runtime_identity_sha256": canonical_json_sha256(
+            dict(runtime_identity)
+        ),
+        "kafka_observation": observation,
+        "raw_payload_persisted": True,
+        "kafka_offset_committed": False,
+    }
+    _publish_exact_recovery_receipt(receipt_path, receipt)
+    return receipt
+
+
+def _natural_canary_receipt_path(gate_path: Path) -> Path:
+    return gate_path.with_name(f"{gate_path.name}.receipt.json")
+
+
+def _validate_natural_canary_gate(
+    value: Mapping[str, Any],
+    *,
+    config: ConsumerConfig,
+    store: RcaControlStore,
+    now: datetime | None = None,
+    allow_expired: bool = False,
+) -> dict[str, Any]:
+    expected_fields = {
+        "schema_version",
+        "release_id",
+        "epoch_id",
+        "created_at",
+        "expires_at",
+        "exact_readback_sha256",
+        "exact_recovery_receipt_sha256",
+        "minimum_offset",
+        "request_sha256",
+    }
+    body = dict(value)
+    request_sha256 = str(body.pop("request_sha256", ""))
+    minimum_offset = body.get("minimum_offset")
+    if (
+        set(value) != expected_fields
+        or body.get("schema_version") != NATURAL_CANARY_GATE_SCHEMA_VERSION
+        or _RELEASE_ID_RE.fullmatch(str(body.get("release_id") or "")) is None
+        or _EPOCH_ID_RE.fullmatch(str(body.get("epoch_id") or "")) is None
+        or _SHA256_RE.fullmatch(str(body.get("exact_readback_sha256") or ""))
+        is None
+        or _SHA256_RE.fullmatch(
+            str(body.get("exact_recovery_receipt_sha256") or "")
+        )
+        is None
+        or isinstance(minimum_offset, bool)
+        or not isinstance(minimum_offset, int)
+        or minimum_offset < 0
+        or _SHA256_RE.fullmatch(request_sha256) is None
+        or hashlib.sha256(_canonical_bytes(body)).hexdigest() != request_sha256
+    ):
+        raise ExactRecoveryError("natural_canary_gate_invalid")
+    created_at = _parse_exact_recovery_timestamp(
+        body.get("created_at"), field_name="natural_gate_created_at"
+    )
+    expires_at = _parse_exact_recovery_timestamp(
+        body.get("expires_at"), field_name="natural_gate_expires_at"
+    )
+    observed_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    if (
+        expires_at <= created_at
+        or expires_at - created_at > MAX_EXACT_RECOVERY_VALIDITY
+        or created_at > observed_at + timedelta(seconds=MAX_HEALTH_FUTURE_SKEW_SECONDS)
+        or (not allow_expired and observed_at >= expires_at)
+    ):
+        raise ExactRecoveryError("natural_canary_gate_expired")
+    epoch = store.activation_epoch()
+    if (
+        epoch is None
+        or epoch.get("epoch_id") != body["epoch_id"]
+        or epoch.get("state") != "steady_active"
+    ):
+        raise ExactRecoveryError("natural_canary_epoch_not_steady")
+    exact_path = config.exact_recovery_request_path
+    if exact_path is None:
+        raise ExactRecoveryError("natural_canary_exact_request_unconfigured")
+    exact_receipt_path = _exact_recovery_receipt_path(exact_path)
+    try:
+        _exact_receipt, exact_raw = _read_owner_only_json(
+            exact_receipt_path, artifact="exact_receipt"
+        )
+    except FileNotFoundError as exc:
+        raise ExactRecoveryError("natural_canary_exact_receipt_missing") from exc
+    if hashlib.sha256(exact_raw).hexdigest() != body["exact_recovery_receipt_sha256"]:
+        raise ExactRecoveryError("natural_canary_exact_receipt_mismatch")
+    return {**body, "request_sha256": request_sha256}
+
+
+def _natural_canary_existing_candidate(
+    store: RcaControlStore, gate: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    candidates = sorted(
+        (
+            row
+            for row in store.list_rows("kafka_inbox")
+            if row.get("topic")
+            and row.get("offset_id") is not None
+            and int(row["offset_id"]) >= int(gate["minimum_offset"])
+            and row.get("decision") == "accepted"
+            and str(row.get("processed_at") or "") >= str(gate["created_at"])
+        ),
+        key=lambda row: (int(row["offset_id"]), str(row["event_uid"])),
+    )
+    return candidates[0] if candidates else None
+
+
+def _validate_natural_canary_receipt(
+    value: Mapping[str, Any],
+    *,
+    gate: Mapping[str, Any],
+    config: ConsumerConfig,
+) -> dict[str, Any]:
+    expected_fields = {
+        "schema_version",
+        "release_id",
+        "epoch_id",
+        "request_sha256",
+        "selected_at",
+        "topic",
+        "partition",
+        "offset",
+        "event_uid",
+        "business_key",
+        "submission_key",
+        "generation",
+        "decision",
+        "activation_reason",
+        "consumer_group_id",
+        "kafka_offset_committed",
+        "resident_runtime_identity_sha256",
+        "next_ordinary_record_held",
+    }
+    body = dict(value)
+    partition = body.get("partition")
+    offset = body.get("offset")
+    if (
+        set(body) != expected_fields
+        or body.get("schema_version") != NATURAL_CANARY_RECEIPT_SCHEMA_VERSION
+        or body.get("release_id") != gate["release_id"]
+        or body.get("epoch_id") != gate["epoch_id"]
+        or body.get("request_sha256") != gate["request_sha256"]
+        or body.get("topic") != config.topic
+        or isinstance(partition, bool)
+        or not isinstance(partition, int)
+        or partition < 0
+        or isinstance(offset, bool)
+        or not isinstance(offset, int)
+        or offset < int(gate["minimum_offset"])
+        or body.get("event_uid") != f"{config.topic}:{partition}:{offset}"
+        or not str(body.get("business_key") or "").strip()
+        or not str(body.get("submission_key") or "").strip()
+        or body.get("generation") != 1
+        or body.get("decision") != "accepted"
+        or body.get("activation_reason") != "activation_steady_active"
+        or body.get("consumer_group_id") != config.group_id
+        or body.get("kafka_offset_committed") is not True
+        or _SHA256_RE.fullmatch(
+            str(body.get("resident_runtime_identity_sha256") or "")
+        )
+        is None
+        or body.get("next_ordinary_record_held") is not True
+    ):
+        raise ExactRecoveryError("natural_canary_receipt_invalid")
+    _parse_exact_recovery_timestamp(
+        body.get("selected_at"), field_name="natural_receipt_selected_at"
+    )
+    return body
+
+
+def _publish_natural_canary_receipt(
+    *,
+    config: ConsumerConfig,
+    gate: Mapping[str, Any],
+    result: Any,
+    message: Any,
+    runtime_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    gate_path = config.natural_canary_gate_path
+    if gate_path is None:
+        raise ExactRecoveryError("natural_canary_gate_unconfigured")
+    receipt = {
+        "schema_version": NATURAL_CANARY_RECEIPT_SCHEMA_VERSION,
+        "release_id": gate["release_id"],
+        "epoch_id": gate["epoch_id"],
+        "request_sha256": gate["request_sha256"],
+        "selected_at": _utc_now(),
+        "topic": str(message.topic),
+        "partition": int(message.partition),
+        "offset": int(message.offset),
+        "event_uid": str(result.event_uid),
+        "business_key": str(result.business_key),
+        "submission_key": str(result.submission_key),
+        "generation": int(result.generation),
+        "decision": str(result.decision),
+        "activation_reason": "activation_steady_active",
+        "consumer_group_id": config.group_id,
+        "kafka_offset_committed": True,
+        "resident_runtime_identity_sha256": canonical_json_sha256(
+            dict(runtime_identity)
+        ),
+        "next_ordinary_record_held": True,
+    }
+    _publish_exact_recovery_receipt(
+        _natural_canary_receipt_path(gate_path), receipt
+    )
+    return receipt
+
+
+def _pause_all_assignments(consumer: Any) -> tuple[Any, ...]:
+    assignment = (
+        tuple(consumer.assignment()) if hasattr(consumer, "assignment") else ()
+    )
+    if assignment and hasattr(consumer, "pause"):
+        consumer.pause(*assignment)
+    return assignment
 
 
 def _count_decision(stats: PollStats, decision: str) -> None:
@@ -1425,6 +2104,11 @@ def run_poll_loop(
     max_polls: int | None = None,
     stats: PollStats | None = None,
     recover_on_start: bool = True,
+    exact_recovery_reader: Callable[
+        [ConsumerConfig, Mapping[str, Any]], tuple[Any, dict[str, Any]]
+    ]
+    | None = None,
+    exact_recovery_runtime_identity: Mapping[str, Any] | None = None,
 ) -> PollStats:
     """Poll indefinitely; an empty poll is a heartbeat, never an exit signal."""
     stats = stats or PollStats()
@@ -1440,6 +2124,9 @@ def run_poll_loop(
     blocked_partitions: set[Any] = set()
     deferred_messages: dict[Any, list[tuple[Any, bool]]] = {}
     freeze = ActivationIngressFreezeController(config, health)
+    exact_recovery_handled = False
+    gray_exact_paused = False
+    natural_canary_selected = False
 
     def reconcile_activation(
         *, verify_active: bool = True
@@ -1479,7 +2166,119 @@ def run_poll_loop(
     while not stop_requested():
         if max_polls is not None and stats.polls >= max_polls:
             break
+        if (
+            not exact_recovery_handled
+            and config.exact_recovery_request_path is not None
+            and config.exact_recovery_request_path.exists()
+        ):
+            runtime_identity = exact_recovery_runtime_identity
+            if runtime_identity is None and health is not None:
+                runtime_identity = health.runtime_identity.to_dict()
+            try:
+                if runtime_identity is None:
+                    raise ExactRecoveryError(
+                        "exact_recovery_runtime_identity_unavailable"
+                    )
+                receipt = recover_exact_kafka_request(
+                    store=store,
+                    config=config,
+                    runtime_identity=runtime_identity,
+                    reader=exact_recovery_reader,
+                )
+                if receipt is not None:
+                    stats.exact_recovery_attempts += 1
+                    stats.exact_recovery_succeeded += 1
+                    exact_recovery_handled = True
+                    if health:
+                        health.event()
+                        health.write(
+                            state="exact_recovery_ingested", stats=stats, force=True
+                        )
+            except Exception as exc:
+                stats.exact_recovery_attempts += 1
+                stats.ingest_errors += 1
+                if health:
+                    health.error("exact_recovery", exc)
+                    health.write(state="error", stats=stats, force=True)
+                raise ConsumerLoopError("exact_recovery", stats) from exc
         readiness = reconcile_activation(verify_active=False)
+        exact_gray_hold = bool(
+            config.exact_recovery_request_path is not None
+            and readiness is not None
+            and readiness["state"] in {"bounded_active", "confirmed"}
+        )
+        if (
+            gray_exact_paused
+            and readiness is not None
+            and readiness["state"] == "steady_active"
+        ):
+            assignment = (
+                tuple(consumer.assignment())
+                if hasattr(consumer, "assignment")
+                else ()
+            )
+            if assignment and not backpressure_active:
+                consumer.resume(*assignment)
+            gray_exact_paused = False
+
+        natural_gate: dict[str, Any] | None = None
+        natural_gate_path = config.natural_canary_gate_path
+        if (
+            readiness is not None
+            and readiness["state"] == "steady_active"
+            and natural_gate_path is not None
+        ):
+            natural_receipt_path = _natural_canary_receipt_path(natural_gate_path)
+            try:
+                if natural_gate_path.exists():
+                    gate_value, _raw = _read_owner_only_json(
+                        natural_gate_path, artifact="natural_gate"
+                    )
+                    natural_gate = _validate_natural_canary_gate(
+                        gate_value,
+                        config=config,
+                        store=store,
+                        allow_expired=natural_receipt_path.exists(),
+                    )
+                    if natural_receipt_path.exists():
+                        receipt, _raw = _read_owner_only_json(
+                            natural_receipt_path, artifact="natural_receipt"
+                        )
+                        _validate_natural_canary_receipt(
+                            receipt,
+                            gate=natural_gate,
+                            config=config,
+                        )
+                        natural_canary_selected = True
+                    else:
+                        existing = _natural_canary_existing_candidate(
+                            store, natural_gate
+                        )
+                        if existing is not None:
+                            raise ExactRecoveryError(
+                                "natural_canary_receipt_missing"
+                            )
+                elif natural_receipt_path.exists():
+                    raise ExactRecoveryError("natural_canary_gate_missing")
+                else:
+                    _pause_all_assignments(consumer)
+                    stats.natural_canary_holds += 1
+                    if health:
+                        health.write(state="natural_canary_waiting", stats=stats)
+                    time.sleep(min(config.poll_timeout_ms / 1000, 1.0))
+                    continue
+            except Exception as exc:
+                if health:
+                    health.error("natural_canary_gate", exc)
+                    health.write(state="error", stats=stats, force=True)
+                raise ConsumerLoopError("natural_canary_gate", stats) from exc
+            if natural_canary_selected:
+                _pause_all_assignments(consumer)
+                stats.natural_canary_holds += 1
+                if health:
+                    health.write(state="natural_canary_held", stats=stats)
+                time.sleep(min(config.poll_timeout_ms / 1000, 1.0))
+                continue
         for partition, queue in (
             () if freeze.active else tuple(deferred_messages.items())
         ):
@@ -1608,7 +2407,7 @@ def run_poll_loop(
         try:
             batch = consumer.poll(
                 timeout_ms=config.poll_timeout_ms,
-                max_records=config.max_poll_records,
+                max_records=(1 if natural_gate is not None else config.max_poll_records),
             )
         except Exception as exc:
             if health:
@@ -1616,6 +2415,23 @@ def run_poll_loop(
                 health.write(state="error", stats=stats, force=True)
             raise ConsumerLoopError("poll", stats) from exc
         stats.polls += 1
+        if natural_gate is not None and sum(len(items) for items in batch.values()) > 1:
+            raise ConsumerLoopError("natural_canary_batch_width", stats)
+        if exact_gray_hold:
+            assignment = (
+                tuple(consumer.assignment())
+                if hasattr(consumer, "assignment")
+                else ()
+            )
+            if assignment:
+                freeze._rewind_to_committed(consumer, assignment)
+                consumer.pause(*assignment)
+            gray_exact_paused = True
+            if not batch:
+                stats.idle_polls += 1
+            if health:
+                health.write(state="exact_recovery_gate_held", stats=stats)
+            continue
         was_frozen = freeze.active
         if (
             readiness is not None
@@ -1751,6 +2567,38 @@ def run_poll_loop(
                         health.write(state="error", stats=stats, force=True)
                     raise ConsumerLoopError("commit", stats) from exc
                 stats.records_committed += 1
+                if natural_gate is not None:
+                    if result.decision in {"invalid", "deduped"}:
+                        error = ExactRecoveryError(
+                            "natural_canary_first_candidate_failed"
+                        )
+                        if health:
+                            health.error("natural_canary", error)
+                            health.write(state="error", stats=stats, force=True)
+                        raise ConsumerLoopError("natural_canary", stats) from error
+                    if result.decision == "accepted":
+                        if (
+                            int(message.offset) < int(natural_gate["minimum_offset"])
+                            or result.generation != 1
+                        ):
+                            raise ConsumerLoopError("natural_canary_identity", stats)
+                        runtime_identity = (
+                            health.runtime_identity.to_dict()
+                            if getattr(health, "runtime_identity", None) is not None
+                            else exact_recovery_runtime_identity
+                        )
+                        if runtime_identity is None:
+                            raise ConsumerLoopError("natural_canary_identity", stats)
+                        _publish_natural_canary_receipt(
+                            config=config,
+                            gate=natural_gate,
+                            result=result,
+                            message=message,
+                            runtime_identity=runtime_identity,
+                        )
+                        natural_canary_selected = True
+                        stats.natural_canary_selected += 1
+                        _pause_all_assignments(consumer)
                 if health:
                     health.committed(clear_error=not blocked_partitions)
                     health.write(
@@ -1761,6 +2609,9 @@ def run_poll_loop(
                         ),
                         stats=stats,
                     )
+                if natural_canary_selected:
+                    batch_frozen = True
+                    break
             if batch_frozen:
                 break
 

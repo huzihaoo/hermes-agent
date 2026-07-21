@@ -2868,6 +2868,96 @@ def test_meegle_adapter_reads_and_updates_only_attribution_fields():
     }
 
 
+def test_meegle_adapter_combines_exact_fields_with_all_full_comment_bodies():
+    calls = []
+    marker = "[RCA_DELIVERY:effect-705:artifact-705]"
+
+    def runner(args):
+        calls.append(args)
+        if args[:2] == ["workitem", "get"]:
+            return 0, json.dumps({
+                "work_item_fields": [
+                    {"key": "field_9193cb", "value": "root cause"},
+                    {
+                        "key": "field_8c912e",
+                        "value": {"link": "https://rca.example/report/index.html"},
+                    },
+                ]
+            }), ""
+        if args[:2] == ["comment", "list"]:
+            page = int(args[args.index("--page-num") + 1])
+            if page == 1:
+                return 0, json.dumps({
+                    "comments": [
+                        {"comment_id": "c-unrelated", "content": "full unrelated body"}
+                    ],
+                    "has_more": True,
+                }), ""
+            return 0, json.dumps({
+                "comments": [
+                    {
+                        "comment_id": "c-rca",
+                        "content": f"canonical report\n{marker}\nfull tail",
+                    }
+                ],
+                "has_more": False,
+            }), ""
+        raise AssertionError(args)
+
+    result = MeegleIssueCommentAdapter(runner).get_fields_and_comments(
+        "68ef617fb371dc80a10641f7",
+        "7051585084",
+    )
+
+    assert result == {
+        "success": True,
+        "source": "official_meegle_api",
+        "scope": {
+            "project_key": "68ef617fb371dc80a10641f7",
+            "work_item_id": "7051585084",
+        },
+        "fields": {
+            "field_9193cb": "root cause",
+            "field_8c912e": "https://rca.example/report/index.html",
+        },
+        "comments": [
+            {"remote_id": "c-unrelated", "content": "full unrelated body"},
+            {
+                "remote_id": "c-rca",
+                "content": f"canonical report\n{marker}\nfull tail",
+            },
+        ],
+        "pages_read": 2,
+    }
+    assert [call[:2] for call in calls] == [
+        ["workitem", "get"],
+        ["comment", "list"],
+        ["comment", "list"],
+    ]
+
+
+def test_meegle_combined_readback_never_returns_partial_success():
+    def runner(args):
+        if args[:2] == ["workitem", "get"]:
+            return 0, json.dumps({
+                "work_item_fields": [
+                    {"key": "field_9193cb", "value": "root cause"},
+                    {"key": "field_8c912e", "value": "https://rca.example/report"},
+                ]
+            }), ""
+        if args[:2] == ["comment", "list"]:
+            return 1, "", "permission denied"
+        raise AssertionError(args)
+
+    result = MeegleIssueCommentAdapter(runner).get_fields_and_comments(
+        "68ef617fb371dc80a10641f7", "7051585084"
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == "feishu_permission_denied"
+    assert "fields" not in result
+
+
 def test_meegle_adapter_allows_terminal_result_only_but_never_report_only():
     calls = []
 

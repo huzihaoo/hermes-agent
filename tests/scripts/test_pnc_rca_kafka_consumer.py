@@ -1,5 +1,6 @@
 import asyncio
 from collections import namedtuple
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -87,6 +88,75 @@ def _message(offset=10, value=None):
         timestamp=1783650000000,
         headers=[],
     )
+
+
+def _exact_recovery_request(
+    path,
+    *,
+    config,
+    store,
+    message,
+    expected,
+    raw_sha256=None,
+):
+    epoch = store.activation_epoch()
+    assert epoch is not None
+    now = datetime.now(timezone.utc)
+    body = {
+        "schema_version": consumer_module.EXACT_RECOVERY_REQUEST_SCHEMA_VERSION,
+        "release_id": "rca-gray-test-20260722",
+        "epoch_id": epoch["epoch_id"],
+        "created_at": now.isoformat(),
+        "expires_at": (now + timedelta(minutes=5)).isoformat(),
+        "topic": message.topic,
+        "partition": message.partition,
+        "offset": message.offset,
+        "event_uid": f"{message.topic}:{message.partition}:{message.offset}",
+        "raw_sha256": raw_sha256 or hashlib.sha256(message.value).hexdigest(),
+        "project_key": "project-key",
+        "work_item_type_key": "problem-type",
+        "work_item_id": "7041712812",
+        "business_key": expected.business_key,
+        "submission_key": expected.submission_key,
+        "generation": expected.generation,
+        "final_validation_sha256": "9" * 64,
+        "nonce": "resident-exact-recovery-test-nonce",
+    }
+    body["request_sha256"] = hashlib.sha256(
+        consumer_module._canonical_bytes(body)
+    ).hexdigest()
+    path.write_bytes(consumer_module._canonical_bytes(body) + b"\n")
+    os.chmod(path, 0o600)
+    return body
+
+
+def _natural_canary_gate(path, *, config, store, minimum_offset=21):
+    exact_receipt_path = consumer_module._exact_recovery_receipt_path(
+        config.exact_recovery_request_path
+    )
+    exact_receipt_path.write_bytes(b"{}\n")
+    os.chmod(exact_receipt_path, 0o600)
+    now = datetime.now(timezone.utc)
+    epoch = store.activation_epoch()
+    assert epoch is not None
+    body = {
+        "schema_version": consumer_module.NATURAL_CANARY_GATE_SCHEMA_VERSION,
+        "release_id": "rca-gray-test-20260722",
+        "epoch_id": epoch["epoch_id"],
+        "created_at": now.isoformat(),
+        "expires_at": (now + timedelta(minutes=5)).isoformat(),
+        "exact_readback_sha256": "8" * 64,
+        "exact_recovery_receipt_sha256": hashlib.sha256(
+            exact_receipt_path.read_bytes()
+        ).hexdigest(),
+        "minimum_offset": minimum_offset,
+    }
+    body["request_sha256"] = hashlib.sha256(
+        consumer_module._canonical_bytes(body)
+    ).hexdigest()
+    path.write_bytes(consumer_module._canonical_bytes(body) + b"\n")
+    os.chmod(path, 0o600)
+    return body
 
 
 def _activation_manual_identity(message_id, *, mode="run_or_join", issue_id=7041712813):
@@ -1050,6 +1120,328 @@ def test_activation_bounded_exact_authorized_ingest_is_pending_and_commits(
     assert outbox["status"] == "pending"
     assert outbox["activation_ledger_id"] is not None
     assert slot["consumed_ledger_id"] == outbox["activation_ledger_id"]
+
+
+def test_resident_exact_recovery_ingests_authorized_offset_without_commit_or_progress_regression(
+    tmp_path,
+):
+    request_path = tmp_path / "exact-recovery-request.json"
+    config = _config(
+        tmp_path,
+        HERMES_RCA_KAFKA_SUBMIT_ENABLED="true",
+        HERMES_RCA_KAFKA_ACTIVATION_REQUIRED="true",
+        HERMES_RCA_KAFKA_EXACT_RECOVERY_REQUEST_PATH=str(request_path),
+    )
+    store = RcaControlStore(config.control_db_path)
+    store.ingest_record(
+        KafkaRecord(
+            topic=TOPIC,
+            partition=0,
+            offset=50,
+            value=b"{}",
+        ),
+        policy=config.policy,
+    )
+    _prepare_activation_epoch(
+        store,
+        kafka_offset=20,
+        bounded=True,
+        partition_start_fence={TOPIC: {"0": 20}},
+    )
+    message = _message(offset=20)
+    probe = RcaControlStore(tmp_path / "probe.sqlite3")
+    expected = probe.ingest_record(
+        KafkaRecord(topic=TOPIC, partition=0, offset=20, value=message.value),
+        policy=config.policy,
+        submit_enabled=True,
+    )
+    request = _exact_recovery_request(
+        request_path,
+        config=config,
+        store=store,
+        message=message,
+        expected=expected,
+    )
+    observation = {
+        "assignment_mode": "explicit_single_partition",
+        "assigned_partitions": [0],
+        "retained_start": 10,
+        "retained_end": 80,
+        "group_id": None,
+        "enable_auto_commit": False,
+        "commit_called": False,
+    }
+    resident_identity = consumer_module.HealthReporter(
+        config, store
+    ).runtime_identity.to_dict()
+    ordinary_consumer = FakeConsumer([{}])
+
+    stats = consumer_module.run_poll_loop(
+        ordinary_consumer,
+        store,
+        config,
+        max_polls=1,
+        recover_on_start=False,
+        exact_recovery_reader=lambda _config, _request: (message, observation),
+        exact_recovery_runtime_identity=resident_identity,
+    )
+
+    assert stats.exact_recovery_attempts == 1
+    assert stats.exact_recovery_succeeded == 1
+    assert ordinary_consumer.commits == []
+    assert store.partition_progress(topic=TOPIC, partitions=[0]) == {0: 51}
+    inbox = store.get_inbox(request["event_uid"])
+    assert inbox["decision"] == "accepted"
+    assert inbox["business_key"] == expected.business_key
+    target_outbox = next(
+        row
+        for row in store.list_rows("rca_outbox")
+        if row["source_event_id"] == request["event_uid"]
+    )
+    assert target_outbox["status"] == "pending"
+    kafka_slot = next(
+        row
+        for row in store.list_rows("rca_activation_budget_slots")
+        if row["slot_kind"] == "kafka_success"
+    )
+    assert kafka_slot["consumed_ledger_id"] == target_outbox["activation_ledger_id"]
+    [transition] = [
+        row
+        for row in store.list_rows("rca_host_runtime_transitions")
+        if row["entity_key"] == request["event_uid"]
+    ]
+    assert transition["service_label"] == consumer_module.SERVICE_LABEL
+    receipt_path = consumer_module._exact_recovery_receipt_path(request_path)
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["request_sha256"] == request["request_sha256"]
+    assert receipt["kafka_offset_committed"] is False
+    assert receipt["raw_payload_persisted"] is True
+
+
+def test_resident_exact_recovery_failure_stops_before_ordinary_poll(tmp_path):
+    request_path = tmp_path / "exact-recovery-request.json"
+    config = _config(
+        tmp_path,
+        HERMES_RCA_KAFKA_SUBMIT_ENABLED="true",
+        HERMES_RCA_KAFKA_ACTIVATION_REQUIRED="true",
+        HERMES_RCA_KAFKA_EXACT_RECOVERY_REQUEST_PATH=str(request_path),
+    )
+    store = RcaControlStore(config.control_db_path)
+    _prepare_activation_epoch(store, kafka_offset=20, bounded=True)
+    message = _message(offset=20)
+    probe = RcaControlStore(tmp_path / "probe.sqlite3")
+    expected = probe.ingest_record(
+        KafkaRecord(topic=TOPIC, partition=0, offset=20, value=message.value),
+        policy=config.policy,
+        submit_enabled=True,
+    )
+    _exact_recovery_request(
+        request_path,
+        config=config,
+        store=store,
+        message=message,
+        expected=expected,
+        raw_sha256="f" * 64,
+    )
+    ordinary_consumer = FakeConsumer([{}])
+
+    with pytest.raises(consumer_module.ConsumerLoopError) as caught:
+        consumer_module.run_poll_loop(
+            ordinary_consumer,
+            store,
+            config,
+            max_polls=1,
+            recover_on_start=False,
+            exact_recovery_reader=lambda _config, _request: (
+                message,
+                {
+                    "group_id": None,
+                    "enable_auto_commit": False,
+                    "commit_called": False,
+                },
+            ),
+            exact_recovery_runtime_identity=consumer_module.HealthReporter(
+                config, store
+            ).runtime_identity.to_dict(),
+        )
+
+    assert caught.value.phase == "exact_recovery"
+    assert ordinary_consumer.poll_calls == []
+    assert ordinary_consumer.commits == []
+    assert store.get_inbox(f"{TOPIC}:0:20") is None
+    assert not consumer_module._exact_recovery_receipt_path(request_path).exists()
+
+
+def test_exact_gray_gate_rewinds_and_holds_unrelated_bounded_kafka(tmp_path):
+    request_path = tmp_path / "exact-recovery-request.json"
+    config = _config(
+        tmp_path,
+        HERMES_RCA_KAFKA_SUBMIT_ENABLED="true",
+        HERMES_RCA_KAFKA_ACTIVATION_REQUIRED="true",
+        HERMES_RCA_KAFKA_EXACT_RECOVERY_REQUEST_PATH=str(request_path),
+    )
+    store = RcaControlStore(config.control_db_path)
+    _prepare_activation_epoch(store, kafka_offset=20, bounded=True)
+    consumer = FreezeCapableConsumer(
+        [{FreezeTopicPartition(TOPIC, 0): [_message(offset=21)]}],
+        committed_offsets={0: 20},
+    )
+
+    stats = consumer_module.run_poll_loop(
+        consumer,
+        store,
+        config,
+        max_polls=1,
+        recover_on_start=False,
+    )
+
+    assert stats.polls == 1
+    assert consumer.commits == []
+    assert consumer.seek_calls[-1] == (FreezeTopicPartition(TOPIC, 0), 20)
+    assert consumer.paused_calls[-1] == (FreezeTopicPartition(TOPIC, 0),)
+    assert store.get_inbox(f"{TOPIC}:0:21") is None
+
+
+def test_natural_gray_gate_commits_one_steady_issue_then_holds_batch_tail(tmp_path):
+    request_path = tmp_path / "exact-recovery-request.json"
+    gate_path = tmp_path / "natural-canary-gate.json"
+    config = _config(
+        tmp_path,
+        HERMES_RCA_KAFKA_SUBMIT_ENABLED="true",
+        HERMES_RCA_KAFKA_ACTIVATION_REQUIRED="true",
+        HERMES_RCA_KAFKA_EXACT_RECOVERY_REQUEST_PATH=str(request_path),
+        HERMES_RCA_KAFKA_NATURAL_CANARY_GATE_PATH=str(gate_path),
+    )
+    store = RcaControlStore(config.control_db_path)
+    _advance_activation_to_steady(store, kafka_offset=20)
+    _natural_canary_gate(gate_path, config=config, store=store, minimum_offset=21)
+    partition = FreezeTopicPartition(TOPIC, 0)
+    consumer = FreezeCapableConsumer(
+        [{
+            partition: [
+                _message(offset=21, value=_value(work_item_id=7041712901)),
+            ]
+        }],
+        committed_offsets={0: 21},
+    )
+    runtime_identity = consumer_module.HealthReporter(
+        config, store
+    ).runtime_identity.to_dict()
+
+    stats = consumer_module.run_poll_loop(
+        consumer,
+        store,
+        config,
+        max_polls=1,
+        recover_on_start=False,
+        exact_recovery_runtime_identity=runtime_identity,
+        commit_payload=lambda message: {("tp", 0): message.offset + 1},
+    )
+
+    assert consumer.poll_calls[0]["max_records"] == 1
+    assert consumer.commits == [{"offsets": {("tp", 0): 22}}]
+    assert store.get_inbox(f"{TOPIC}:0:21")["decision"] == "accepted"
+    assert store.get_inbox(f"{TOPIC}:0:22") is None
+    assert stats.natural_canary_selected == 1
+    assert consumer.paused_calls[-1] == (partition,)
+    receipt = json.loads(
+        consumer_module._natural_canary_receipt_path(gate_path).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert receipt["event_uid"] == f"{TOPIC}:0:21"
+    assert receipt["activation_reason"] == "activation_steady_active"
+    assert receipt["next_ordinary_record_held"] is True
+
+    receipt["request_sha256"] = "f" * 64
+    receipt_path = consumer_module._natural_canary_receipt_path(gate_path)
+    receipt_path.write_bytes(consumer_module._canonical_bytes(receipt) + b"\n")
+    restart_consumer = FreezeCapableConsumer([{}], committed_offsets={0: 22})
+    with pytest.raises(consumer_module.ConsumerLoopError) as caught:
+        consumer_module.run_poll_loop(
+            restart_consumer,
+            store,
+            config,
+            max_polls=1,
+            recover_on_start=False,
+            exact_recovery_runtime_identity=runtime_identity,
+        )
+
+    assert caught.value.phase == "natural_canary_gate"
+    assert restart_consumer.poll_calls == []
+
+
+def test_natural_existing_candidate_preserves_zero_offset():
+    class CandidateStore:
+        @staticmethod
+        def list_rows(table):
+            assert table == "kafka_inbox"
+            return [
+                {
+                    "topic": TOPIC,
+                    "offset_id": 0,
+                    "decision": "accepted",
+                    "processed_at": "2026-07-22T00:00:01+00:00",
+                    "event_uid": f"{TOPIC}:0:0",
+                }
+            ]
+
+    candidate = consumer_module._natural_canary_existing_candidate(
+        CandidateStore(),
+        {
+            "minimum_offset": 0,
+            "created_at": "2026-07-22T00:00:00+00:00",
+        },
+    )
+
+    assert candidate is not None
+    assert candidate["offset_id"] == 0
+
+
+def test_natural_gray_gate_stops_on_first_invalid_candidate(tmp_path):
+    request_path = tmp_path / "exact-recovery-request.json"
+    gate_path = tmp_path / "natural-canary-gate.json"
+    config = _config(
+        tmp_path,
+        HERMES_RCA_KAFKA_SUBMIT_ENABLED="true",
+        HERMES_RCA_KAFKA_ACTIVATION_REQUIRED="true",
+        HERMES_RCA_KAFKA_EXACT_RECOVERY_REQUEST_PATH=str(request_path),
+        HERMES_RCA_KAFKA_NATURAL_CANARY_GATE_PATH=str(gate_path),
+    )
+    store = RcaControlStore(config.control_db_path)
+    _advance_activation_to_steady(store, kafka_offset=20)
+    _natural_canary_gate(gate_path, config=config, store=store, minimum_offset=21)
+    partition = FreezeTopicPartition(TOPIC, 0)
+    consumer = FreezeCapableConsumer(
+        [{
+            partition: [
+                _message(
+                    offset=21,
+                    value=b"x" * (consumer_module.MAX_WORKFLOW_EVENT_BYTES + 1),
+                ),
+            ]
+        }],
+        committed_offsets={0: 21},
+    )
+
+    with pytest.raises(consumer_module.ConsumerLoopError) as caught:
+        consumer_module.run_poll_loop(
+            consumer,
+            store,
+            config,
+            max_polls=1,
+            recover_on_start=False,
+            exact_recovery_runtime_identity=consumer_module.HealthReporter(
+                config, store
+            ).runtime_identity.to_dict(),
+            commit_payload=lambda message: {("tp", 0): message.offset + 1},
+        )
+
+    assert caught.value.phase == "natural_canary"
+    assert consumer.commits == [{"offsets": {("tp", 0): 22}}]
+    assert store.get_inbox(f"{TOPIC}:0:21")["decision"] == "invalid"
+    assert store.get_inbox(f"{TOPIC}:0:22") is None
+    assert not consumer_module._natural_canary_receipt_path(gate_path).exists()
 
 
 def test_activation_bounded_unauthorized_ingest_stays_shadow_and_commits(tmp_path):
