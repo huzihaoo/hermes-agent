@@ -23,6 +23,10 @@ from gateway.pnc_rca_delivery_contract import (
     build_thread_reply_effect,
     validate_delivery_subscription_target,
 )
+from gateway.pnc_rca_delivery_quarantine_baseline import (
+    BASELINE_NAME as DELIVERY_QUARANTINE_BASELINE_NAME,
+    quarantine_baseline_status_tx,
+)
 from gateway.pnc_rca_runtime_transition import (
     ensure_host_runtime_transition_schema,
     insert_host_runtime_transition,
@@ -30,7 +34,8 @@ from gateway.pnc_rca_runtime_transition import (
 )
 
 
-DELIVERY_STORE_SCHEMA_VERSION = "pnc_rca_delivery_store_v6"
+DELIVERY_STORE_SCHEMA_VERSION = "pnc_rca_delivery_store_v7"
+DELIVERY_STORE_SCHEMA_PREDECESSOR_VERSION = "pnc_rca_delivery_store_v6"
 DELIVERY_BACKPRESSURE_SNAPSHOT_SCHEMA_VERSION = (
     "pnc_rca_delivery_backpressure_snapshot_v2"
 )
@@ -63,6 +68,7 @@ SUPPORTED_DELIVERY_STORE_SCHEMA_VERSIONS = frozenset(
         "pnc_rca_delivery_store_v3",
         "pnc_rca_delivery_store_v4",
         "pnc_rca_delivery_store_v5",
+        DELIVERY_STORE_SCHEMA_PREDECESSOR_VERSION,
         DELIVERY_STORE_SCHEMA_VERSION,
     }
 )
@@ -350,6 +356,24 @@ def _canonical_json(value: Any) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def _execute_schema_script_in_transaction(
+    conn: sqlite3.Connection,
+    script: str,
+) -> None:
+    """Execute complete DDL statements without sqlite3's implicit COMMIT."""
+
+    pending = ""
+    for line in script.splitlines(keepends=True):
+        pending += line
+        if sqlite3.complete_statement(pending):
+            statement = pending.strip()
+            if statement:
+                conn.execute(statement)
+            pending = ""
+    if pending.strip():
+        raise RuntimeError("incomplete_delivery_store_schema_script")
 
 
 def _json_object(value: Any) -> dict[str, Any]:
@@ -928,6 +952,10 @@ class RcaDeliveryStore:
     @staticmethod
     def _migrate_schema(conn: sqlite3.Connection) -> None:
         # Serialize schema inspection and migration across resident processes.
+        marker = conn.execute(
+            "SELECT value FROM rca_delivery_meta WHERE key = 'schema_version'"
+        ).fetchone()
+        initial_schema_version = str(marker["value"]) if marker is not None else ""
         initial_watch_info = list(conn.execute("PRAGMA table_info(rca_execution_watch)"))
         relax_task_id = any(
             str(row["name"]) == "task_id" and int(row["notnull"]) == 1
@@ -1131,6 +1159,197 @@ class RcaDeliveryStore:
                 CREATE INDEX IF NOT EXISTS idx_delivery_attempts_request
                     ON rca_delivery_attempts(request_id)
                 """
+            )
+        _execute_schema_script_in_transaction(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS rca_delivery_quarantine_mutation_audit (
+                audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_kind TEXT NOT NULL CHECK (
+                    entity_kind IN ('job', 'effect', 'subscription')
+                ),
+                entity_key TEXT NOT NULL,
+                operation TEXT NOT NULL CHECK (
+                    operation IN ('migration_observed', 'entered', 'left', 'deleted')
+                ),
+                old_status TEXT NOT NULL DEFAULT '',
+                new_status TEXT NOT NULL DEFAULT '',
+                observed_at TEXT NOT NULL
+            );
+
+            CREATE TRIGGER IF NOT EXISTS trg_rca_quarantine_audit_no_update
+            BEFORE UPDATE ON rca_delivery_quarantine_mutation_audit
+            BEGIN
+                SELECT RAISE(ABORT, 'rca_delivery_quarantine_audit_immutable');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_rca_quarantine_audit_no_delete
+            BEFORE DELETE ON rca_delivery_quarantine_mutation_audit
+            BEGIN
+                SELECT RAISE(ABORT, 'rca_delivery_quarantine_audit_immutable');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_rca_delivery_job_quarantine_insert
+            AFTER INSERT ON rca_delivery_jobs
+            WHEN NEW.status = 'quarantined'
+            BEGIN
+                INSERT INTO rca_delivery_quarantine_mutation_audit(
+                    entity_kind, entity_key, operation, old_status,
+                    new_status, observed_at
+                ) VALUES (
+                    'job', NEW.delivery_id, 'entered', '', NEW.status,
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                );
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_rca_delivery_job_quarantine_update
+            AFTER UPDATE OF status ON rca_delivery_jobs
+            WHEN OLD.status != NEW.status
+             AND (OLD.status = 'quarantined' OR NEW.status = 'quarantined')
+            BEGIN
+                INSERT INTO rca_delivery_quarantine_mutation_audit(
+                    entity_kind, entity_key, operation, old_status,
+                    new_status, observed_at
+                ) VALUES (
+                    'job', NEW.delivery_id,
+                    CASE WHEN NEW.status = 'quarantined' THEN 'entered' ELSE 'left' END,
+                    OLD.status, NEW.status,
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                );
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_rca_delivery_job_quarantine_delete
+            AFTER DELETE ON rca_delivery_jobs
+            WHEN OLD.status = 'quarantined'
+            BEGIN
+                INSERT INTO rca_delivery_quarantine_mutation_audit(
+                    entity_kind, entity_key, operation, old_status,
+                    new_status, observed_at
+                ) VALUES (
+                    'job', OLD.delivery_id, 'deleted', OLD.status, '',
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                );
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_rca_delivery_effect_quarantine_insert
+            AFTER INSERT ON rca_delivery_effects
+            WHEN NEW.status = 'quarantined'
+            BEGIN
+                INSERT INTO rca_delivery_quarantine_mutation_audit(
+                    entity_kind, entity_key, operation, old_status,
+                    new_status, observed_at
+                ) VALUES (
+                    'effect', NEW.effect_key, 'entered', '', NEW.status,
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                );
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_rca_delivery_effect_quarantine_update
+            AFTER UPDATE OF status ON rca_delivery_effects
+            WHEN OLD.status != NEW.status
+             AND (OLD.status = 'quarantined' OR NEW.status = 'quarantined')
+            BEGIN
+                INSERT INTO rca_delivery_quarantine_mutation_audit(
+                    entity_kind, entity_key, operation, old_status,
+                    new_status, observed_at
+                ) VALUES (
+                    'effect', NEW.effect_key,
+                    CASE WHEN NEW.status = 'quarantined' THEN 'entered' ELSE 'left' END,
+                    OLD.status, NEW.status,
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                );
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_rca_delivery_effect_quarantine_delete
+            AFTER DELETE ON rca_delivery_effects
+            WHEN OLD.status = 'quarantined'
+            BEGIN
+                INSERT INTO rca_delivery_quarantine_mutation_audit(
+                    entity_kind, entity_key, operation, old_status,
+                    new_status, observed_at
+                ) VALUES (
+                    'effect', OLD.effect_key, 'deleted', OLD.status, '',
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                );
+            END;
+
+            """
+        )
+        subscriptions_ready = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'rca_delivery_subscriptions'"
+        ).fetchone() is not None
+        if subscriptions_ready:
+            _execute_schema_script_in_transaction(
+                conn,
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_rca_delivery_subscription_quarantine_insert
+                AFTER INSERT ON rca_delivery_subscriptions
+                WHEN NEW.status = 'quarantined'
+                BEGIN
+                    INSERT INTO rca_delivery_quarantine_mutation_audit(
+                        entity_kind, entity_key, operation, old_status,
+                        new_status, observed_at
+                    ) VALUES (
+                        'subscription', NEW.subscription_key, 'entered', '', NEW.status,
+                        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    );
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS trg_rca_delivery_subscription_quarantine_update
+                AFTER UPDATE OF status ON rca_delivery_subscriptions
+                WHEN OLD.status != NEW.status
+                 AND (OLD.status = 'quarantined' OR NEW.status = 'quarantined')
+                BEGIN
+                    INSERT INTO rca_delivery_quarantine_mutation_audit(
+                        entity_kind, entity_key, operation, old_status,
+                        new_status, observed_at
+                    ) VALUES (
+                        'subscription', NEW.subscription_key,
+                        CASE WHEN NEW.status = 'quarantined' THEN 'entered' ELSE 'left' END,
+                        OLD.status, NEW.status,
+                        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    );
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS trg_rca_delivery_subscription_quarantine_delete
+                AFTER DELETE ON rca_delivery_subscriptions
+                WHEN OLD.status = 'quarantined'
+                BEGIN
+                    INSERT INTO rca_delivery_quarantine_mutation_audit(
+                        entity_kind, entity_key, operation, old_status,
+                        new_status, observed_at
+                    ) VALUES (
+                        'subscription', OLD.subscription_key, 'deleted', OLD.status, '',
+                        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    );
+                END;
+                """
+            )
+        if conn.execute(
+            "SELECT 1 FROM rca_delivery_quarantine_mutation_audit LIMIT 1"
+        ).fetchone() is None:
+            for entity_kind, table, key in (
+                ("job", "rca_delivery_jobs", "delivery_id"),
+                ("effect", "rca_delivery_effects", "effect_key"),
+                *(
+                    (("subscription", "rca_delivery_subscriptions", "subscription_key"),)
+                    if subscriptions_ready
+                    else ()
+                ),
+            ):
+                conn.execute(
+                    "INSERT INTO rca_delivery_quarantine_mutation_audit("
+                    "entity_kind, entity_key, operation, old_status, new_status, "
+                    "observed_at) SELECT ?, " + key + ", 'migration_observed', '', "
+                    "'quarantined', updated_at FROM " + table + " "
+                    "WHERE status = 'quarantined' ORDER BY " + key,
+                    (entity_kind,),
+                )
+        if initial_schema_version == DELIVERY_STORE_SCHEMA_PREDECESSOR_VERSION:
+            conn.execute(
+                "UPDATE rca_delivery_meta SET value = ? WHERE key = 'schema_version'",
+                (DELIVERY_STORE_SCHEMA_VERSION,),
             )
         conn.commit()
         if relax_task_id:
@@ -4528,6 +4747,12 @@ class RcaDeliveryStore:
         *,
         now: datetime | None = None,
         activation_required: bool = False,
+        quarantine_baseline_path: str | Path | None = None,
+        expected_quarantine_baseline_sha256: str = "",
+        quarantine_release_id: str = "",
+        quarantine_bootstrap_epoch_id: str = "",
+        quarantine_active_release_binding_path: str | Path = "",
+        quarantine_live_env_path: str | Path = "",
     ) -> dict[str, Any]:
         self._validate_activation_required(activation_required)
         current_dt = _utc_datetime(now)
@@ -4647,6 +4872,21 @@ class RcaDeliveryStore:
                     (stalled_cutoff,),
                 ).fetchone()[0]
             )
+            quarantine_baseline = quarantine_baseline_status_tx(
+                conn,
+                db_path=self.db_path,
+                baseline_path=(
+                    quarantine_baseline_path
+                    if quarantine_baseline_path is not None
+                    else self.db_path.parent / DELIVERY_QUARANTINE_BASELINE_NAME
+                ),
+                expected_sha256=expected_quarantine_baseline_sha256,
+                expected_release_id=quarantine_release_id,
+                bootstrap_epoch_id=quarantine_bootstrap_epoch_id,
+                active_release_binding_path=quarantine_active_release_binding_path,
+                live_env_path=quarantine_live_env_path,
+            )
+            unacknowledged_quarantine = quarantine_baseline["unacknowledged"]
             business_blockers = {
                 "activation_schema_unavailable": int(
                     activation["required"] and not activation["schema_ready"]
@@ -4654,11 +4894,14 @@ class RcaDeliveryStore:
                 "stalled_watches": stalled_watch_count,
                 "terminal_failed_watches": int(watch.get("terminal_failed", 0)),
                 "quarantined_watches": int(watch.get("quarantined", 0)),
-                "quarantined_jobs": int(jobs.get("quarantined", 0)),
+                "quarantined_jobs": int(unacknowledged_quarantine["jobs"]),
                 "uncertain_effects": int(effects.get("uncertain", 0)),
-                "quarantined_effects": int(effects.get("quarantined", 0)),
+                "quarantined_effects": int(unacknowledged_quarantine["effects"]),
                 "quarantined_subscriptions": int(
-                    subscriptions.get("quarantined", 0)
+                    unacknowledged_quarantine["subscriptions"]
+                ),
+                "quarantine_baseline_invalid": int(
+                    not quarantine_baseline["ready"]
                 ),
                 "pending_required_subscriptions": pending_required_subscriptions,
                 "unresolved_required_effects": unresolved_required_effects,
@@ -4693,6 +4936,7 @@ class RcaDeliveryStore:
                 "delivery_effects": effects,
                 "delivery_attempts": attempts,
                 "delivery_subscriptions": subscriptions,
+                "delivery_quarantine": quarantine_baseline,
                 "delivery_dispatcher_circuit": circuit,
                 "delivery_dispatcher_circuits": circuits,
                 "activation": activation,

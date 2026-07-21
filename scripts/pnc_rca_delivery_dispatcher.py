@@ -51,6 +51,11 @@ from gateway.pnc_rca_delivery_contract import (
     validate_delivery_subscription_target,
     verify_persisted_artifact_inventory,
 )
+from gateway.pnc_rca_delivery_quarantine_baseline import (
+    disabled_quarantine_baseline_status,
+    quarantine_baseline_settings,
+    read_quarantine_baseline_status,
+)
 from gateway.pnc_rca_delivery_store import (
     DeliveryEffectClaim,
     RcaDeliveryStore,
@@ -339,6 +344,12 @@ class DispatcherConfig:
     reconciliation_visibility_grace_seconds: int
     reconciliation_min_missing_reads: int
     recovery_write_interval_seconds: int
+    quarantine_baseline_path: Path
+    quarantine_baseline_sha256: str
+    quarantine_release_id: str
+    quarantine_bootstrap_epoch_id: str
+    quarantine_active_release_binding_path: Path
+    quarantine_live_env_path: Path
 
     def __post_init__(self) -> None:
         minimum_lease = (
@@ -368,6 +379,21 @@ class DispatcherConfig:
             raise ValueError(
                 f"{ENV_PREFIX}REPORT_HTTP_TIMEOUT_SECONDS must be at most 15"
             )
+        control_db_path = Path(
+            source.get(
+                f"{ENV_PREFIX}CONTROL_DB_PATH",
+                home
+                / "runtime"
+                / "pnc_agent"
+                / "feishu_issue_kafka_rca"
+                / "control.sqlite3",
+            )
+        ).expanduser()
+        quarantine = quarantine_baseline_settings(
+            source,
+            hermes_home=home,
+            control_db_path=control_db_path,
+        )
         return cls(
             enabled=_boolean(source, f"{ENV_PREFIX}ENABLED", False),
             activation_required=_strict_boolean(
@@ -375,16 +401,7 @@ class DispatcherConfig:
                 f"{ENV_PREFIX}ACTIVATION_REQUIRED",
                 False,
             ),
-            control_db_path=Path(
-                source.get(
-                    f"{ENV_PREFIX}CONTROL_DB_PATH",
-                    home
-                    / "runtime"
-                    / "pnc_agent"
-                    / "feishu_issue_kafka_rca"
-                    / "control.sqlite3",
-                )
-            ).expanduser(),
+            control_db_path=control_db_path,
             health_path=Path(
                 source.get(
                     f"{ENV_PREFIX}HEALTH_PATH",
@@ -427,6 +444,14 @@ class DispatcherConfig:
                 300,
                 minimum=60,
             ),
+            quarantine_baseline_path=quarantine.baseline_path,
+            quarantine_baseline_sha256=quarantine.baseline_sha256,
+            quarantine_release_id=quarantine.release_id,
+            quarantine_bootstrap_epoch_id=quarantine.bootstrap_epoch_id,
+            quarantine_active_release_binding_path=(
+                quarantine.active_release_binding_path
+            ),
+            quarantine_live_env_path=quarantine.live_env_path,
         )
 
     def public_dict(self) -> dict[str, Any]:
@@ -451,6 +476,14 @@ class DispatcherConfig:
             "recovery_write_interval_seconds": (
                 self.recovery_write_interval_seconds
             ),
+            "quarantine_baseline_path": str(self.quarantine_baseline_path),
+            "quarantine_baseline_sha256": self.quarantine_baseline_sha256,
+            "quarantine_release_id": self.quarantine_release_id,
+            "quarantine_bootstrap_epoch_id": self.quarantine_bootstrap_epoch_id,
+            "quarantine_active_release_binding_path": str(
+                self.quarantine_active_release_binding_path
+            ),
+            "quarantine_live_env_path": str(self.quarantine_live_env_path),
             "max_recovery_writes": MAX_RECOVERY_WRITES,
             "lease_boundary_margin_seconds": LEASE_BOUNDARY_MARGIN_SECONDS,
             "effect_lease_keeper_enabled": True,
@@ -2815,7 +2848,19 @@ class HealthReporter:
         circuits = self.store.delivery_dispatcher_circuits()
         circuit = circuits[DELIVERY_EFFECT_KIND]
         store_health = self.store.health(
-            activation_required=self.config.activation_required
+            activation_required=self.config.activation_required,
+            quarantine_baseline_path=self.config.quarantine_baseline_path,
+            expected_quarantine_baseline_sha256=(
+                self.config.quarantine_baseline_sha256
+            ),
+            quarantine_release_id=self.config.quarantine_release_id,
+            quarantine_bootstrap_epoch_id=(
+                self.config.quarantine_bootstrap_epoch_id
+            ),
+            quarantine_active_release_binding_path=(
+                self.config.quarantine_active_release_binding_path
+            ),
+            quarantine_live_env_path=self.config.quarantine_live_env_path,
         )
         body = {
             "schema_version": HEALTH_SCHEMA_VERSION,
@@ -3000,10 +3045,35 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
         return 2
     if args.check_config:
-        print(
-            json.dumps({"ok": True, "config": config.public_dict()}, ensure_ascii=False)
+        quarantine_baseline = (
+            read_quarantine_baseline_status(
+                config.control_db_path,
+                baseline_path=config.quarantine_baseline_path,
+                expected_sha256=config.quarantine_baseline_sha256,
+                expected_release_id=config.quarantine_release_id,
+                bootstrap_epoch_id=config.quarantine_bootstrap_epoch_id,
+                active_release_binding_path=(
+                    config.quarantine_active_release_binding_path
+                ),
+                live_env_path=config.quarantine_live_env_path,
+            )
+            if config.enabled
+            else disabled_quarantine_baseline_status(
+                baseline_path=config.quarantine_baseline_path,
+                expected_sha256=config.quarantine_baseline_sha256,
+            )
         )
-        return 0
+        print(
+            json.dumps(
+                {
+                    "ok": quarantine_baseline["ready"],
+                    "config": config.public_dict(),
+                    "quarantine_baseline": quarantine_baseline,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0 if quarantine_baseline["ready"] else 2
     if args.health:
         healthy, payload = read_health(
             config.health_path,

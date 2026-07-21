@@ -29,6 +29,8 @@ RCA_RUNTIME_RELATIVE_FILES = (
     "gateway/pnc_rca_data_access.py",
     "gateway/pnc_rca_derived_capacity_reservation.py",
     "gateway/pnc_rca_delivery_contract.py",
+    "gateway/pnc_rca_delivery_quarantine_baseline.py",
+    "gateway/pnc_rca_delivery_quarantine_migration.py",
     "gateway/pnc_rca_delivery_store.py",
     "gateway/pnc_rca_frame_reference.py",
     "gateway/pnc_rca_kafka_contract.py",

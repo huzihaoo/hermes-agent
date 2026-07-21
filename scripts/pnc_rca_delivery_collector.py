@@ -37,6 +37,11 @@ from gateway.pnc_rca_delivery_contract import (
     canonical_artifact_root,
     verify_delivery_bundle,
 )
+from gateway.pnc_rca_delivery_quarantine_baseline import (
+    disabled_quarantine_baseline_status,
+    quarantine_baseline_settings,
+    read_quarantine_baseline_status,
+)
 from gateway.pnc_rca_delivery_store import (
     DeliveryRecordConflictError,
     ExecutionWatchClaim,
@@ -254,6 +259,12 @@ class CollectorConfig:
     ssh_mini_agent: str
     artifact_read_timeout_seconds: int
     terminal_artifact_grace_seconds: int
+    quarantine_baseline_path: Path
+    quarantine_baseline_sha256: str
+    quarantine_release_id: str
+    quarantine_bootstrap_epoch_id: str
+    quarantine_active_release_binding_path: Path
+    quarantine_live_env_path: Path
 
     @classmethod
     def from_env(
@@ -293,18 +304,24 @@ class CollectorConfig:
                 f"{ENV_PREFIX}LEASE_SECONDS must exceed "
                 "ARTIFACT_READ_TIMEOUT_SECONDS plus the lease margin"
             )
+        control_db_path = Path(
+            source.get(
+                f"{ENV_PREFIX}CONTROL_DB_PATH",
+                home
+                / "runtime"
+                / "pnc_agent"
+                / "feishu_issue_kafka_rca"
+                / "control.sqlite3",
+            )
+        ).expanduser()
+        quarantine = quarantine_baseline_settings(
+            source,
+            hermes_home=home,
+            control_db_path=control_db_path,
+        )
         return cls(
             enabled=enabled,
-            control_db_path=Path(
-                source.get(
-                    f"{ENV_PREFIX}CONTROL_DB_PATH",
-                    home
-                    / "runtime"
-                    / "pnc_agent"
-                    / "feishu_issue_kafka_rca"
-                    / "control.sqlite3",
-                )
-            ).expanduser(),
+            control_db_path=control_db_path,
             health_path=Path(
                 source.get(
                     f"{ENV_PREFIX}HEALTH_PATH",
@@ -331,6 +348,14 @@ class CollectorConfig:
             terminal_artifact_grace_seconds=_integer(
                 source, f"{ENV_PREFIX}TERMINAL_ARTIFACT_GRACE_SECONDS", 900
             ),
+            quarantine_baseline_path=quarantine.baseline_path,
+            quarantine_baseline_sha256=quarantine.baseline_sha256,
+            quarantine_release_id=quarantine.release_id,
+            quarantine_bootstrap_epoch_id=quarantine.bootstrap_epoch_id,
+            quarantine_active_release_binding_path=(
+                quarantine.active_release_binding_path
+            ),
+            quarantine_live_env_path=quarantine.live_env_path,
         )
 
     def public_dict(self) -> dict[str, Any]:
@@ -348,6 +373,14 @@ class CollectorConfig:
             "ssh_mini_agent": self.ssh_mini_agent,
             "artifact_read_timeout_seconds": self.artifact_read_timeout_seconds,
             "terminal_artifact_grace_seconds": self.terminal_artifact_grace_seconds,
+            "quarantine_baseline_path": str(self.quarantine_baseline_path),
+            "quarantine_baseline_sha256": self.quarantine_baseline_sha256,
+            "quarantine_release_id": self.quarantine_release_id,
+            "quarantine_bootstrap_epoch_id": self.quarantine_bootstrap_epoch_id,
+            "quarantine_active_release_binding_path": str(
+                self.quarantine_active_release_binding_path
+            ),
+            "quarantine_live_env_path": str(self.quarantine_live_env_path),
             "remote_css_parser": {
                 **expected_remote_css_runtime_dependency(),
             },
@@ -1834,7 +1867,21 @@ class HealthReporter:
     ) -> None:
         if refresh_dependencies:
             self._refresh_remote_css_parser_receipt()
-        store_health = self.store.health(activation_required=False)
+        store_health = self.store.health(
+            activation_required=False,
+            quarantine_baseline_path=self.config.quarantine_baseline_path,
+            expected_quarantine_baseline_sha256=(
+                self.config.quarantine_baseline_sha256
+            ),
+            quarantine_release_id=self.config.quarantine_release_id,
+            quarantine_bootstrap_epoch_id=(
+                self.config.quarantine_bootstrap_epoch_id
+            ),
+            quarantine_active_release_binding_path=(
+                self.config.quarantine_active_release_binding_path
+            ),
+            quarantine_live_env_path=self.config.quarantine_live_env_path,
+        )
         dependency_error = self.dependency_error
         payload = {
             "schema_version": HEALTH_SCHEMA_VERSION,
@@ -2035,6 +2082,24 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
         return 2
     if args.check_config:
+        quarantine_baseline = (
+            read_quarantine_baseline_status(
+                config.control_db_path,
+                baseline_path=config.quarantine_baseline_path,
+                expected_sha256=config.quarantine_baseline_sha256,
+                expected_release_id=config.quarantine_release_id,
+                bootstrap_epoch_id=config.quarantine_bootstrap_epoch_id,
+                active_release_binding_path=(
+                    config.quarantine_active_release_binding_path
+                ),
+                live_env_path=config.quarantine_live_env_path,
+            )
+            if config.enabled
+            else disabled_quarantine_baseline_status(
+                baseline_path=config.quarantine_baseline_path,
+                expected_sha256=config.quarantine_baseline_sha256,
+            )
+        )
         try:
             remote_css_parser = probe_remote_css_parser(
                 config.ssh_mini_agent,
@@ -2052,14 +2117,15 @@ def main(argv: list[str] | None = None) -> int:
         print(
             json.dumps(
                 {
-                    "ok": True,
+                    "ok": quarantine_baseline["ready"],
                     "config": config.public_dict(),
                     "dependencies": {"remote_css_parser": remote_css_parser},
+                    "quarantine_baseline": quarantine_baseline,
                 },
                 ensure_ascii=False,
             )
         )
-        return 0
+        return 0 if quarantine_baseline["ready"] else 2
     if args.health:
         healthy, payload = read_health(
             config.health_path,
