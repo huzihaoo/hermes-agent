@@ -57,6 +57,7 @@ from tests.gateway.test_pnc_rca_delivery_contract import _bundle
 
 @pytest.fixture(autouse=True)
 def _seal_dependencies_available_in_the_test_interpreter(monkeypatch):
+    monkeypatch.setenv("PNC_FOXGLOVE_RENDER_HOST", "https://viewer.internal")
     original = dispatcher_module.build_runtime_identity
 
     def build_test_identity(**kwargs):

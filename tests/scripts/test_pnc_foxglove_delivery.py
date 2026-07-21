@@ -21,7 +21,8 @@ def test_canonical_viz_paths_use_governed_task_landing():
     )
 
 
-def test_foxglove_url_accepts_exact_task_landing_path():
+def test_foxglove_url_accepts_exact_task_landing_path(monkeypatch):
+    monkeypatch.setenv("PNC_FOXGLOVE_RENDER_HOST", "https://192.168.21.217")
     path = canonical_viz_mcap_path(SUBMISSION_KEY)
     assert foxglove_url(path) == (
         "https://192.168.21.217/?ds=remote-file&ds.url="
@@ -72,6 +73,16 @@ def test_task_remote_file_requires_https_viewer_origin(monkeypatch):
 
     assert foxglove_url(canonical_viz_mcap_path(SUBMISSION_KEY)) == ""
     assert canonical_viz_remote_file_url(SUBMISSION_KEY) == ""
+    monkeypatch.setenv("PNC_FOXGLOVE_RENDER_HOST", "")
+    assert foxglove_url(canonical_viz_mcap_path(SUBMISSION_KEY)) == ""
+    assert canonical_viz_remote_file_url(SUBMISSION_KEY) == ""
+
+
+def test_task_remote_file_requires_explicit_viewer_origin(monkeypatch):
+    monkeypatch.delenv("PNC_FOXGLOVE_RENDER_HOST", raising=False)
+
+    assert foxglove_url(canonical_viz_mcap_path(SUBMISSION_KEY)) == ""
+    assert canonical_viz_remote_file_url(SUBMISSION_KEY) == ""
 
 
 def test_malformed_viewer_origins_fail_closed(monkeypatch):
@@ -103,6 +114,8 @@ def test_malformed_viewer_origins_fail_closed(monkeypatch):
         monkeypatch.setenv("PNC_FOXGLOVE_RENDER_HOST", origin)
         assert foxglove_url(path) == ""
         assert canonical_viz_remote_file_url(SUBMISSION_KEY) == ""
+
+
 def test_nondefault_https_viewer_port_is_supported(monkeypatch):
     monkeypatch.setenv("PNC_FOXGLOVE_RENDER_HOST", "https://viewer.internal:8443")
 

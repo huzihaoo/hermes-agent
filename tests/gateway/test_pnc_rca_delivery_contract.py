@@ -34,6 +34,11 @@ FORMAL_REPORT_PATH = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _configured_viewer_origin(monkeypatch):
+    monkeypatch.setenv("PNC_FOXGLOVE_RENDER_HOST", "https://viewer.internal")
+
+
 def _admission(*, offset: int = 10):
     return build_rca_admission(
         project_key="t03o4q",

@@ -107,8 +107,15 @@ def _canonical_origin_host(hostname: str) -> str:
     return canonical
 
 
-def _foxglove_base() -> str:
-    raw = os.getenv("PNC_FOXGLOVE_RENDER_HOST", DEFAULT_FOXGLOVE_RENDER_HOST)
+def _foxglove_base(*, require_explicit: bool = False) -> str:
+    configured_origin = os.getenv("PNC_FOXGLOVE_RENDER_HOST")
+    if require_explicit and configured_origin is None:
+        return ""
+    raw = (
+        DEFAULT_FOXGLOVE_RENDER_HOST
+        if configured_origin is None
+        else configured_origin
+    )
     if (
         not raw
         or not raw.isascii()
@@ -154,7 +161,7 @@ def _foxglove_base() -> str:
 def canonical_viz_remote_file_url(submission_key: Any) -> str:
     """Return the same-origin HTTPS URL served by the scoped viewer proxy."""
     key = str(submission_key or "").strip()
-    base = _foxglove_base()
+    base = _foxglove_base(require_explicit=True)
     if not _SAFE_SEGMENT_RE.fullmatch(key) or not base.startswith("https://"):
         return ""
     return f"{base}{RCA_REMOTE_FILE_ROUTE_PREFIX}{key}/{key}.viz.mcap"

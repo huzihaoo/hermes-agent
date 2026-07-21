@@ -41,6 +41,11 @@ NOW = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
 TOPIC = "feishu-project-workflow-event"
 
 
+@pytest.fixture(autouse=True)
+def _configured_viewer_origin(monkeypatch):
+    monkeypatch.setenv("PNC_FOXGLOVE_RENDER_HOST", "https://viewer.internal")
+
+
 def _policy():
     return WorkflowEventPolicy(
         topic=TOPIC,
