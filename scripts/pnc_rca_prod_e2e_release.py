@@ -119,6 +119,10 @@ DIAGNOSTIC_COMMENT_PREREAD_PATH = (
 DIAGNOSTIC_COMMENT_PREREAD_SHA256 = (
     "61eabe2fe68985d4282364b7865d354e293e8b8b78f47d5bc2260eac4ce168d7"
 )
+DIAGNOSTIC_PREREAD_HOST_COMMIT = (
+    "540dc0c8b6fd0ed58a919f63a17ae7d934f0f94a"
+)
+DIAGNOSTIC_PREREAD_HOST_TREE = "a339f44e634ab6779b30683be3219257da10fba2"
 CROSS_CONTRACT_PASS_FILE_SHA256 = (
     "8fa70b458c1676de058902123fe78bb4619d59c82072c1e251fae0f1991b949e"
 )
@@ -11436,7 +11440,9 @@ def _validate_quarantine_baseline_approval(
     }
 
 
-def _validate_diagnostic_target_prereads() -> Mapping[str, Any]:
+def _validate_diagnostic_target_prereads(
+    *, allow_superseded_candidate: bool = False
+) -> Mapping[str, Any]:
     kafka = _read_owned_json(
         Path(DIAGNOSTIC_KAFKA_PREREAD_PATH), artifact="diagnostic_kafka_preread"
     )
@@ -11450,12 +11456,32 @@ def _validate_diagnostic_target_prereads() -> Mapping[str, Any]:
     kafka_body = kafka.body
     field_body = fields.body
     comment_body = comments.body
+    bound_host_identity = (
+        kafka_body.get("host_commit"),
+        kafka_body.get("host_tree"),
+    )
+    candidate_identities = {(HOST_FINAL_COMMIT, HOST_FINAL_TREE)}
+    if allow_superseded_candidate:
+        candidate_identities.add(
+            (DIAGNOSTIC_PREREAD_HOST_COMMIT, DIAGNOSTIC_PREREAD_HOST_TREE)
+        )
+    candidate_identity_matches = bound_host_identity == (
+        HOST_FINAL_COMMIT,
+        HOST_FINAL_TREE,
+    )
     if (
         kafka.sha256 != DIAGNOSTIC_KAFKA_PREREAD_SHA256
         or kafka_body.get("schema_version")
         != "pnc_rca_kafka_exact_offset_preread_v1"
-        or kafka_body.get("host_commit") != HOST_FINAL_COMMIT
-        or kafka_body.get("host_tree") != HOST_FINAL_TREE
+        or bound_host_identity not in candidate_identities
+        or (
+            field_body.get("host_commit"), field_body.get("host_tree")
+        )
+        != bound_host_identity
+        or (
+            comment_body.get("host_commit"), comment_body.get("host_tree")
+        )
+        != bound_host_identity
         or kafka_body.get("event_uid") != TARGET_EVENT_UID
         or kafka_body.get("raw_sha256") != TARGET_RAW_SHA256
         or kafka_body.get("business_key") != TARGET_BUSINESS_KEY
@@ -11477,8 +11503,6 @@ def _validate_diagnostic_target_prereads() -> Mapping[str, Any]:
         or fields.sha256 != DIAGNOSTIC_FIELD_PREREAD_SHA256
         or field_body.get("schema_version")
         != "pnc_rca_fresh_target_input_revalidation_v1"
-        or field_body.get("host_commit") != HOST_FINAL_COMMIT
-        or field_body.get("host_tree") != HOST_FINAL_TREE
         or field_body.get("project_key") != TARGET_PROJECT_KEY
         or field_body.get("work_item_id") != TARGET_WORK_ITEM_ID
         or field_body.get("source") != "official_meegle_api"
@@ -11492,8 +11516,6 @@ def _validate_diagnostic_target_prereads() -> Mapping[str, Any]:
         or comments.sha256 != DIAGNOSTIC_COMMENT_PREREAD_SHA256
         or comment_body.get("schema_version")
         != "pnc_rca_official_comment_preread_v1"
-        or comment_body.get("host_commit") != HOST_FINAL_COMMIT
-        or comment_body.get("host_tree") != HOST_FINAL_TREE
         or comment_body.get("project_key") != TARGET_PROJECT_KEY
         or comment_body.get("work_item_id") != TARGET_WORK_ITEM_ID
         or comment_body.get("source") != "official_meegle_api"
@@ -11515,6 +11537,10 @@ def _validate_diagnostic_target_prereads() -> Mapping[str, Any]:
             "retained_start": kafka_body["retained_start"],
             "retained_end": kafka_body["retained_end"],
             "raw_sha256_matches": True,
+            "bound_host_commit": bound_host_identity[0],
+            "bound_host_tree": bound_host_identity[1],
+            "matches_final_candidate": candidate_identity_matches,
+            "superseded_candidate": not candidate_identity_matches,
             "authorizes_release": False,
             "fresh_execution_preflight_required": True,
         },
@@ -11532,6 +11558,10 @@ def _validate_diagnostic_target_prereads() -> Mapping[str, Any]:
                 "total_comment_count": 0,
                 "rca_marker_comment_count": 0,
             },
+            "bound_host_commit": bound_host_identity[0],
+            "bound_host_tree": bound_host_identity[1],
+            "matches_final_candidate": candidate_identity_matches,
+            "superseded_candidate": not candidate_identity_matches,
             "authorizes_release": False,
             "fresh_execution_preflight_required": True,
         },
@@ -11554,7 +11584,14 @@ def build_blocker_bom(*, now: datetime, verified_test_count: int) -> Mapping[str
             artifact="blocker_bom_closure_audit",
         )
     )
-    diagnostic_prereads = _validate_diagnostic_target_prereads()
+    try:
+        diagnostic_prereads = _validate_diagnostic_target_prereads()
+    except ProdE2EReleaseError as exc:
+        if exc.code != "prod_e2e_release_diagnostic_preread_invalid":
+            raise
+        diagnostic_prereads = _validate_diagnostic_target_prereads(
+            allow_superseded_candidate=True
+        )
     source_path = Path(__file__).resolve()
     test_path = source_path.parents[1] / "tests/scripts/test_pnc_rca_prod_e2e_release.py"
     source_sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()

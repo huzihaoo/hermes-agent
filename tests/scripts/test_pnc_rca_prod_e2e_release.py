@@ -3061,6 +3061,13 @@ def test_real_zero_cache_host_probe_rejects_stale_diagnostic_prereads():
         release.ProdE2EReleaseError, match="diagnostic_preread_invalid"
     ):
         release._validate_diagnostic_target_prereads()
+    superseded = release._validate_diagnostic_target_prereads(
+        allow_superseded_candidate=True
+    )
+    assert superseded["kafka"]["matches_final_candidate"] is False
+    assert superseded["kafka"]["superseded_candidate"] is True
+    assert superseded["official"]["matches_final_candidate"] is False
+    assert superseded["official"]["authorizes_release"] is False
 
 
 def test_blocker_bom_exposes_validated_final_closure(monkeypatch):
