@@ -28,7 +28,9 @@ MAX_TTL_SECONDS = 120
 MAX_RESOURCE_OUTPUT_BYTES = 1024 * 1024
 DEFAULT_RESOURCE_TIMEOUT_SECONDS = 15
 DEFAULT_RESOURCE_PATH = Path.home() / ".local" / "bin" / "ssh-mini-resource"
-VM_REPO_ROOT = "/home/mini/data3/yj-evaluation-server"
+VM_REPO_ROOT = (
+    "/home/mini/.hermes/rca-prod-runtime/releases/rca-e2e-hotfix-20260721"
+)
 VM_FIXED_CLI = "./api/g1q3_rca/scripts/run_rca_service_request.py"
 VM_TASK_ROOT = "/home/mini/.hermes/shared-state/tasks"
 MIN_ROOT_AVAILABLE_BYTES = 400 * 1024**3

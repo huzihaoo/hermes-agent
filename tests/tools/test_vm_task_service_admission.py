@@ -360,7 +360,8 @@ def _matching_status(
             "codex_backend_enabled": False,
             "coding_agent_fallback_enabled": False,
             "fixed_cli_entrypoint": (
-                "/home/mini/data3/yj-evaluation-server/"
+                "/home/mini/.hermes/rca-prod-runtime/releases/"
+                "rca-e2e-hotfix-20260721/"
                 "api/g1q3_rca/scripts/run_rca_service_request.py"
             ),
             **(bootstrap_meta or {}),
@@ -876,7 +877,10 @@ def test_service_wrapper_allows_only_validated_rca_intake_with_fixed_envelope(mo
     assert goal.count("- executor: fixed-cli under VM worker") == 1
     task_id = admission.submission_key
     assert goal.splitlines()[-2:] == [
-        "- cd /home/mini/data3/yj-evaluation-server",
+        (
+            "- cd /home/mini/.hermes/rca-prod-runtime/releases/"
+            "rca-e2e-hotfix-20260721"
+        ),
         (
             "- ./api/g1q3_rca/scripts/run_rca_service_request.py "
             f"--task-id {task_id} --goal-path "
@@ -1075,7 +1079,10 @@ def test_fixed_cli_goal_keeps_caller_text_inside_json_and_commands_are_immutable
     ]
     task_id = admission.submission_key
     assert executable_lines == [
-        "- cd /home/mini/data3/yj-evaluation-server",
+        (
+            "- cd /home/mini/.hermes/rca-prod-runtime/releases/"
+            "rca-e2e-hotfix-20260721"
+        ),
         (
             "- ./api/g1q3_rca/scripts/run_rca_service_request.py "
             f"--task-id {task_id} --goal-path "

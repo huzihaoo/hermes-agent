@@ -112,7 +112,8 @@ DERIVED_CAPACITY_REQUEST_SCOPE = "this_capacity_admission_only"
 REMOTE_DATA_ACCESS_MODE = "remote_read"
 DEFAULT_SSH_MINI_AGENT = str(Path.home() / ".local" / "bin" / "ssh-mini-agent")
 REMOTE_STORAGE_ADMISSION_MODULE = (
-    "/home/mini/data3/yj-evaluation-server/api/g1q3_rca/storage_admission.py"
+    "/home/mini/.hermes/rca-prod-runtime/releases/"
+    "rca-e2e-hotfix-20260721/api/g1q3_rca/storage_admission.py"
 )
 VM_ARTIFACT_PREFIX = "/mnt/tmp/"
 CIFS_ARTIFACT_PREFIX = (

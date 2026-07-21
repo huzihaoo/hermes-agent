@@ -174,7 +174,9 @@ _RCA_SHARED_STATE_GOAL_PREFIX = (
     "Execute the governed G1Q3 RCA issue intake represented by the validated "
     "contracts below."
 )
-_RCA_VM_REPO_ROOT = "/home/mini/data3/yj-evaluation-server"
+_RCA_VM_REPO_ROOT = (
+    "/home/mini/.hermes/rca-prod-runtime/releases/rca-e2e-hotfix-20260721"
+)
 _RCA_FIXED_CLI_RELATIVE_PATH = "./api/g1q3_rca/scripts/run_rca_service_request.py"
 _RCA_VM_TASK_ROOT = "/home/mini/.hermes/shared-state/tasks"
 _RCA_STORAGE_ADMISSION_SCHEMA_VERSION = "pnc_rca_derived_capacity_admission_v2"

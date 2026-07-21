@@ -14,6 +14,13 @@ RELEASE_ID = "rca-v0182-test-release"
 EPOCH_ID = "rca-bootstrap-v0182-test-epoch"
 
 
+def test_storage_admission_uses_isolated_production_runtime():
+    assert dispatcher.REMOTE_STORAGE_ADMISSION_MODULE == (
+        "/home/mini/.hermes/rca-prod-runtime/releases/"
+        "rca-e2e-hotfix-20260721/api/g1q3_rca/storage_admission.py"
+    )
+
+
 def _config_env(tmp_path, *, enabled: bool = False) -> dict[str, str]:
     return {
         "HERMES_RCA_OUTBOX_DISPATCH_ENABLED": str(enabled).lower(),

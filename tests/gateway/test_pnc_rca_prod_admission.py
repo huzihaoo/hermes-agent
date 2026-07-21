@@ -120,7 +120,8 @@ def test_command_matches_vm_fixed_cli_contract():
         "bash",
         "-lc",
         (
-            "set -euo pipefail; cd /home/mini/data3/yj-evaluation-server; "
+            "set -euo pipefail; cd /home/mini/.hermes/rca-prod-runtime/"
+            "releases/rca-e2e-hotfix-20260721; "
             "./api/g1q3_rca/scripts/run_rca_service_request.py "
             f"--task-id {TASK_ID} --goal-path "
             f"/home/mini/.hermes/shared-state/tasks/{TASK_ID}/goal.md"
