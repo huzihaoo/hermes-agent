@@ -2406,7 +2406,7 @@ class DeliveryDispatcher:
         except DeliveryContractError as exc:
             return self._quarantine(claim, error_code=exc.code, detail=exc.detail)
 
-        superseded = self.store.suppress_terminal_effect_if_newer_success(
+        superseded = self.store.suppress_terminal_effect_if_newer_settled_fields(
             claim=claim,
             now=self.now(),
         )
@@ -2417,7 +2417,7 @@ class DeliveryDispatcher:
                 effect_key=claim.effect_key,
                 delivery_id=claim.delivery_id,
                 attempt=claim.attempt,
-                error_code="delivery_effect_superseded_by_newer_success",
+                error_code="delivery_effect_superseded_by_newer_settled_fields",
             )
 
         self._heartbeat(claim)
@@ -2644,11 +2644,22 @@ class DeliveryDispatcher:
 
             if not prior_write_uncertain:
                 self._heartbeat(claim)
-                self.store.mark_effect_write_started(
+                superseded = self.store.mark_effect_write_started(
                     claim=claim,
                     now=self.now(),
                     activation_required=self.config.activation_required,
                 )
+                if superseded is not None:
+                    self.stats.reconciled += 1
+                    return DispatchOutcome(
+                        status="superseded",
+                        effect_key=claim.effect_key,
+                        delivery_id=claim.delivery_id,
+                        attempt=claim.attempt,
+                        error_code=(
+                            "delivery_effect_superseded_by_newer_settled_fields"
+                        ),
+                    )
         if not fields_match:
             try:
                 update_raw = self._write_field_updates(claim, validated)

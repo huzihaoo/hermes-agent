@@ -16,10 +16,12 @@ from typing import Any, Callable, Iterable, Literal, Mapping
 import uuid
 
 from gateway.pnc_rca_admission import (
+    RCA_KAFKA_TRIGGER_KINDS,
     RcaAdmission,
     build_rca_admission,
     build_rca_issue_scope_key,
     build_rca_trigger_context,
+    validate_rca_admission,
 )
 from gateway.pnc_rca_kafka_contract import (
     WorkflowEventPolicy,
@@ -64,6 +66,9 @@ INPUT_WAIT_TERMINAL_NEW_GENERATION_REASON = (
 INPUT_WAIT_EXECUTION_WATCH_PRESENT_REASON = "input_wait_execution_watch_present"
 MANUAL_SHADOW_PROMOTED_REASON = "manual_shadow_promoted"
 ISSUE_SCOPE_CONFLICT_REASON = "issue_scope_business_key_conflict"
+LEGACY_KAFKA_GENERATION_REASON = (
+    "issue_scope_legacy_kafka_generation_requires_migration"
+)
 MANUAL_POLICY_OBSERVED_OUTCOME = "manual_active_policy_observed"
 INPUT_WAIT_REARM_ERROR_CODES = frozenset(
     {
@@ -4192,6 +4197,121 @@ class RcaControlStore:
             (project_key, work_item_type_key, work_item_id, generation),
         ).fetchone()
 
+    @staticmethod
+    def _select_latest_kafka_issue_generation_tx(
+        conn: sqlite3.Connection,
+        *,
+        project_key: str,
+        work_item_type_key: str,
+        work_item_id: str,
+    ) -> sqlite3.Row | None:
+        """Return the latest generation whose immutable origin is Kafka."""
+        return conn.execute(
+            """
+            SELECT t.*, o.outbox_id, o.status AS outbox_status,
+                   o.attempt, o.completed_at, o.result_json, o.quarantined_at,
+                   o.last_error_code, o.lease_token, o.lease_owner,
+                   o.lease_expires_at,
+                   o.origin_source_id AS outbox_origin_source_id,
+                   o.source_event_id AS outbox_source_event_id,
+                   o.source_topic AS outbox_source_topic,
+                   o.source_partition AS outbox_source_partition,
+                   o.source_offset AS outbox_source_offset,
+                   o.payload_json AS outbox_payload_json,
+                   origin.source_id AS kafka_origin_source_id,
+                   origin.source_dedupe_key AS kafka_source_dedupe_key,
+                   origin.kafka_event_uid AS kafka_event_uid,
+                   origin.mode AS kafka_source_mode
+              FROM business_triggers AS t
+              JOIN rca_outbox AS o
+                ON o.business_key = t.business_key AND o.generation = t.generation
+              JOIN rca_trigger_sources AS origin
+                ON origin.source_id = t.origin_source_id
+               AND origin.source_kind = 'kafka_workflow_event'
+             WHERE t.project_key = ? AND t.work_item_type_key = ?
+               AND t.work_item_id = ?
+             ORDER BY t.generation DESC, t.created_at DESC, o.outbox_id DESC
+            LIMIT 1
+            """,
+            (project_key, work_item_type_key, work_item_id),
+        ).fetchone()
+
+    @staticmethod
+    def _kafka_generation_origin_contract_valid(row: sqlite3.Row) -> bool:
+        try:
+            generation = int(row["generation"])
+            topic = str(row["outbox_source_topic"] or "").strip()
+            partition = int(row["outbox_source_partition"])
+            offset = int(row["outbox_source_offset"])
+            payload = json.loads(str(row["outbox_payload_json"] or "{}"))
+            payload_partition = int(payload.get("partition"))
+            payload_offset = int(payload.get("offset"))
+            admission = validate_rca_admission(payload.get("admission") or {})
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return False
+        expected_trigger_kind = (
+            "issue_created" if generation == 1 else "kafka_retrigger"
+        )
+        source_dedupe_key = str(row["kafka_source_dedupe_key"] or "")
+        kafka_event_uid = row["kafka_event_uid"]
+        if generation == 1:
+            origin_identity_valid = bool(
+                kafka_event_uid
+                and source_dedupe_key == str(kafka_event_uid)
+            )
+        else:
+            generation_suffix = f":generation:{generation}"
+            origin_identity_valid = bool(
+                kafka_event_uid is None
+                and source_dedupe_key.endswith(generation_suffix)
+                and len(source_dedupe_key) > len(generation_suffix)
+            )
+        refs = admission.source_refs
+        return bool(
+            str(row["outbox_source_event_id"] or "").strip()
+            and topic
+            and partition >= 0
+            and offset >= 0
+            and str(row["origin_source_id"] or "")
+            == str(row["kafka_origin_source_id"] or "")
+            == str(row["outbox_origin_source_id"] or "")
+            == str(payload.get("origin_source_id") or "")
+            and str(row["kafka_source_mode"] or "") == expected_trigger_kind
+            and origin_identity_valid
+            and str(payload.get("source_event_id") or "")
+            == str(row["outbox_source_event_id"] or "")
+            and str(payload.get("topic") or "") == topic
+            and payload_partition == partition
+            and payload_offset == offset
+            and admission.trigger_kind == expected_trigger_kind
+            and admission.generation == generation
+            and admission.business_key == str(row["business_key"])
+            and admission.submission_key == str(row["submission_key"])
+            and refs.topic == topic
+            and refs.partition == partition
+            and refs.offset == offset
+        )
+
+    @classmethod
+    def _kafka_generation_contract_valid(
+        cls, row: sqlite3.Row
+    ) -> bool:
+        if not cls._kafka_generation_origin_contract_valid(row):
+            return False
+        try:
+            return bool(
+                str(row["source_event_id"] or "")
+                == str(row["outbox_source_event_id"] or "")
+                and str(row["source_topic"] or "")
+                == str(row["outbox_source_topic"] or "")
+                and int(row["source_partition"])
+                == int(row["outbox_source_partition"])
+                and int(row["source_offset"])
+                == int(row["outbox_source_offset"])
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
+
     @classmethod
     def _audit_issue_scope_conflict_tx(
         cls,
@@ -4317,12 +4437,15 @@ class RcaControlStore:
         raw_sha256: str,
         business_key: str,
         generation: int,
+        trigger_kind: str,
         current: str,
     ) -> str:
         source_id = cls._ensure_kafka_source_tx(
             conn,
             event_uid=event_uid,
             raw_sha256=raw_sha256,
+            generation=generation,
+            trigger_kind=trigger_kind,
             current=current,
         )
         conn.execute(
@@ -4346,14 +4469,105 @@ class RcaControlStore:
         return source_id
 
     @classmethod
+    def _kafka_source_identity(
+        cls,
+        *,
+        event_uid: str,
+        generation: int,
+        trigger_kind: str,
+    ) -> tuple[str, str, str | None, str]:
+        mode = str(trigger_kind or "").strip()
+        if mode not in RCA_KAFKA_TRIGGER_KINDS:
+            raise RecordConflictError(f"Kafka source mode is invalid: {event_uid}")
+        if mode == "issue_created":
+            if generation != 1:
+                raise RecordConflictError(
+                    f"Kafka issue-created source generation is invalid: {event_uid}"
+                )
+            dedupe_key = event_uid
+            kafka_event_uid: str | None = event_uid
+            material: dict[str, Any] = {
+                "source_kind": "kafka_workflow_event",
+                "dedupe": event_uid,
+            }
+        else:
+            if generation < 2:
+                raise RecordConflictError(
+                    f"Kafka retrigger source generation is invalid: {event_uid}"
+                )
+            dedupe_key = f"{event_uid}:generation:{generation}"
+            kafka_event_uid = None
+            material = {
+                "source_kind": "kafka_workflow_event",
+                "dedupe": event_uid,
+                "generation": generation,
+                "mode": mode,
+            }
+        return (
+            _stable_key("g1q3-rca-source-v1", material),
+            dedupe_key,
+            kafka_event_uid,
+            mode,
+        )
+
+    @classmethod
     def _ensure_kafka_source_tx(
         cls,
         conn: sqlite3.Connection,
         *,
         event_uid: str,
         raw_sha256: str,
+        generation: int,
+        trigger_kind: str,
         current: str,
     ) -> str:
+        source_id, dedupe_key, kafka_event_uid, mode = cls._kafka_source_identity(
+            event_uid=event_uid,
+            generation=generation,
+            trigger_kind=trigger_kind,
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO rca_trigger_sources(
+                source_id, source_kind, source_dedupe_key, payload_sha256,
+                kafka_event_uid, mode, created_at
+            ) VALUES (?, 'kafka_workflow_event', ?, ?, ?, ?, ?)
+            """,
+            (
+                source_id,
+                dedupe_key,
+                raw_sha256,
+                kafka_event_uid,
+                mode,
+                current,
+            ),
+        )
+        source = conn.execute(
+            "SELECT * FROM rca_trigger_sources WHERE source_id = ?", (source_id,)
+        ).fetchone()
+        if (
+            source is None
+            or source["source_kind"] != "kafka_workflow_event"
+            or source["source_dedupe_key"] != dedupe_key
+            or source["payload_sha256"] != raw_sha256
+            or source["kafka_event_uid"] != kafka_event_uid
+            or source["mode"] != mode
+        ):
+            raise RecordConflictError(f"Kafka source binding conflict: {event_uid}")
+        return source_id
+
+    @classmethod
+    def _bind_legacy_kafka_source_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        event_uid: str,
+        raw_sha256: str,
+        business_key: str,
+        generation: int,
+        current: str,
+    ) -> str:
+        """Preserve a pre-contract Kafka/manual generation without reinterpreting it."""
         source_id = _stable_key(
             "g1q3-rca-source-v1",
             {"source_kind": "kafka_workflow_event", "dedupe": event_uid},
@@ -4376,8 +4590,30 @@ class RcaControlStore:
             or source["source_dedupe_key"] != event_uid
             or source["payload_sha256"] != raw_sha256
             or source["kafka_event_uid"] != event_uid
+            or source["mode"] != "issue_created"
         ):
-            raise RecordConflictError(f"Kafka source binding conflict: {event_uid}")
+            raise RecordConflictError(
+                f"Legacy Kafka source binding conflict: {event_uid}"
+            )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO rca_trigger_bindings(
+                source_id, business_key, generation, role, bound_at
+            ) VALUES (?, ?, ?, 'origin', ?)
+            """,
+            (source_id, business_key, generation, current),
+        )
+        binding = conn.execute(
+            "SELECT * FROM rca_trigger_bindings WHERE source_id = ?", (source_id,)
+        ).fetchone()
+        if (
+            binding is None
+            or str(binding["business_key"]) != business_key
+            or int(binding["generation"]) != generation
+        ):
+            raise RecordConflictError(
+                f"Legacy Kafka source requires explicit migration: {event_uid}"
+            )
         return source_id
 
     @classmethod
@@ -4518,41 +4754,76 @@ class RcaControlStore:
             cls._register_policy_snapshot_tx(conn, policy, current)
         rows = conn.execute(
             """
-            SELECT t.*, i.raw_sha256
+            SELECT t.*, i.raw_sha256, o.payload_json AS outbox_payload_json
               FROM business_triggers AS t
               LEFT JOIN kafka_inbox AS i ON i.event_uid = t.source_event_id
+              JOIN rca_outbox AS o
+                ON o.business_key = t.business_key AND o.generation = t.generation
             """
         ).fetchall()
         for row in rows:
             event_uid = str(row["source_event_id"] or "")
+            generation = int(row["generation"])
+            try:
+                durable_payload = json.loads(
+                    str(row["outbox_payload_json"] or "{}")
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                durable_payload = {}
+            durable_admission = durable_payload.get("admission")
+            durable_trigger_kind = (
+                str(durable_admission.get("trigger_kind") or "").strip()
+                if isinstance(durable_admission, Mapping)
+                else ""
+            )
+            legacy_kafka_generation = bool(
+                event_uid
+                and generation > 1
+                and durable_trigger_kind != "kafka_retrigger"
+            )
+            trigger_kind = (
+                "issue_created"
+                if event_uid and generation == 1
+                else "kafka_retrigger"
+                if event_uid and not legacy_kafka_generation
+                else "manual_retrigger"
+                if legacy_kafka_generation
+                else "manual_issue_request"
+                if generation == 1
+                else "manual_retrigger"
+            )
             source_id = ""
             if event_uid:
-                source_id = _stable_key(
-                    "g1q3-rca-source-v1",
-                    {"source_kind": "kafka_workflow_event", "dedupe": event_uid},
-                )
+                if legacy_kafka_generation:
+                    source_id = cls._bind_legacy_kafka_source_tx(
+                        conn,
+                        event_uid=event_uid,
+                        raw_sha256=str(row["raw_sha256"] or "0" * 64),
+                        business_key=str(row["business_key"]),
+                        generation=generation,
+                        current=current,
+                    )
+                else:
+                    source_id = cls._bind_kafka_source_tx(
+                        conn,
+                        event_uid=event_uid,
+                        raw_sha256=str(row["raw_sha256"] or "0" * 64),
+                        business_key=str(row["business_key"]),
+                        generation=generation,
+                        trigger_kind=trigger_kind,
+                        current=current,
+                    )
+                durable_origin = row["origin_source_id"]
+                if durable_origin is not None and str(durable_origin) != source_id:
+                    raise RecordConflictError(
+                        f"Kafka origin requires explicit migration: {event_uid}"
+                    )
                 conn.execute(
                     """
-                    INSERT OR IGNORE INTO rca_trigger_sources(
-                        source_id, source_kind, source_dedupe_key, payload_sha256,
-                        kafka_event_uid, mode, created_at
-                    ) VALUES (?, 'kafka_workflow_event', ?, ?, ?, 'issue_created', ?)
+                    UPDATE rca_trigger_bindings SET role = 'origin'
+                     WHERE source_id = ?
                     """,
-                    (
-                        source_id,
-                        event_uid,
-                        str(row["raw_sha256"] or "0" * 64),
-                        event_uid,
-                        current,
-                    ),
-                )
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO rca_trigger_bindings(
-                        source_id, business_key, generation, role, bound_at
-                    ) VALUES (?, ?, ?, 'origin', ?)
-                    """,
-                    (source_id, row["business_key"], row["generation"], current),
+                    (source_id,),
                 )
                 conn.execute(
                     """
@@ -4571,14 +4842,22 @@ class RcaControlStore:
                     (source_id, row["business_key"], row["generation"]),
                 )
             normalized = json.loads(str(row["normalized_json"] or "{}"))
+            admission_kwargs: dict[str, Any] = {}
+            if event_uid and not legacy_kafka_generation:
+                admission_kwargs = {
+                    "topic": str(row["source_topic"] or ""),
+                    "partition": row["source_partition"],
+                    "offset": row["source_offset"],
+                }
             admission = build_rca_admission(
                 project_key=row["project_key"],
                 project_simple_name=str(normalized.get("project_simple_name") or ""),
                 work_item_type_key=row["work_item_type_key"],
                 work_item_id=row["work_item_id"],
                 rule_version=row["creation_rule_version"],
-                trigger_kind=("issue_created" if int(row["generation"]) == 1 else "manual_retrigger"),
-                generation=int(row["generation"]),
+                trigger_kind=trigger_kind,
+                generation=generation,
+                **admission_kwargs,
             )
             issue_subscription_key = cls._insert_issue_subscription_tx(
                 conn, admission=admission, current=current
@@ -5371,6 +5650,7 @@ class RcaControlStore:
         inbox_row: sqlite3.Row,
         admission: Any,
         normalized: Any,
+        allow_same_event: bool = False,
     ) -> tuple[sqlite3.Row | None, str]:
         existing = conn.execute(
             """
@@ -5402,7 +5682,14 @@ class RcaControlStore:
             != int(existing["source_partition"])
         ):
             return None, "replacement_source_lineage_mismatch"
-        if int(inbox_row["offset_id"]) <= int(existing["source_offset"]):
+        same_event = (
+            str(inbox_row["event_uid"])
+            == str(existing["source_event_id"])
+            and int(inbox_row["offset_id"]) == int(existing["source_offset"])
+        )
+        if int(inbox_row["offset_id"]) <= int(existing["source_offset"]) and not (
+            allow_same_event and same_event
+        ):
             return None, "replacement_offset_not_newer"
         if (
             str(existing["submission_key"]) != admission.submission_key
@@ -5855,6 +6142,71 @@ class RcaControlStore:
                         return False
                 return True
         return False
+
+    @classmethod
+    def _terminal_duplicate_retrigger_eligible_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        inbox_row: sqlite3.Row,
+    ) -> bool:
+        raw_value = bytes(inbox_row["raw_value"] or b"")
+        if (
+            str(inbox_row["decision"] or "") not in {"accepted", "deduped"}
+            or str(inbox_row["submission_mode"] or "") != "pending"
+            or not str(inbox_row["business_key"] or "").strip()
+            or not str(inbox_row["submission_key"] or "").strip()
+            or int(inbox_row["generation"] or 0) < 1
+            or not raw_value
+            or len(raw_value) != int(inbox_row["raw_size_bytes"] or 0)
+            or hashlib.sha256(raw_value).hexdigest()
+            != str(inbox_row["raw_sha256"] or "")
+        ):
+            return False
+        try:
+            normalized = json.loads(str(inbox_row["normalized_json"] or "{}"))
+            project_key = str(normalized["project_key"])
+            work_item_type_key = str(normalized["work_item_type_key"])
+            work_item_id = str(normalized["work_item_id"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return False
+        generation = cls._select_latest_kafka_issue_generation_tx(
+            conn,
+            project_key=project_key,
+            work_item_type_key=work_item_type_key,
+            work_item_id=work_item_id,
+        )
+        if generation is None or not cls._kafka_generation_contract_valid(generation):
+            return False
+        event_uid = str(inbox_row["event_uid"])
+        if (
+            str(generation["business_key"]) != str(inbox_row["business_key"])
+            or str(generation["submission_key"])
+            != str(inbox_row["submission_key"])
+            or int(generation["generation"]) != int(inbox_row["generation"])
+            or int(generation["generation"]) != 1
+            or str(generation["kafka_source_mode"] or "") != "issue_created"
+            or str(generation["source_event_id"]) != event_uid
+            or str(generation["source_topic"]) != str(inbox_row["topic"])
+            or int(generation["source_partition"])
+            != int(inbox_row["partition_id"])
+            or int(generation["source_offset"]) != int(inbox_row["offset_id"])
+            or str(generation["state"] or "") != "quarantined"
+            or str(generation["outbox_status"] or "") != "quarantined"
+            or str(generation["last_error_code"] or "")
+            not in INPUT_WAIT_REARM_ERROR_CODES
+            or generation["completed_at"] is not None
+            or generation["result_json"] is not None
+            or generation["quarantined_at"] is None
+            or any(
+                generation[name] is not None
+                for name in ("lease_token", "lease_owner", "lease_expires_at")
+            )
+        ):
+            return False
+        return cls._execution_watch_exists_tx(
+            conn, str(generation["submission_key"])
+        ) and cls._execution_terminal_tx(conn, generation)
 
     def admit_manual_trigger(
         self,
@@ -6492,6 +6844,7 @@ class RcaControlStore:
         event_uid: str,
         *,
         runtime_identity: Mapping[str, Any] | None = None,
+        allow_terminal_duplicate_retrigger: bool = False,
     ) -> IngestResult:
         """Classify one durable inbox row and atomically create trigger/outbox state."""
         conn = self._connect()
@@ -6502,7 +6855,16 @@ class RcaControlStore:
             ).fetchone()
             if row is None:
                 raise KeyError(f"unknown inbox event: {event_uid}")
-            if row["decision"] != "pending":
+            transport_duplicate = row["decision"] != "pending"
+            terminal_duplicate_retrigger = (
+                transport_duplicate
+                and allow_terminal_duplicate_retrigger
+                and self._terminal_duplicate_retrigger_eligible_tx(
+                    conn,
+                    inbox_row=row,
+                )
+            )
+            if transport_duplicate and not terminal_duplicate_retrigger:
                 conn.commit()
                 return IngestResult(
                     event_uid=event_uid,
@@ -6574,23 +6936,32 @@ class RcaControlStore:
                 else:
                     binding_row = latest
                     if latest is not None:
-                        # Kafka follows its latest Kafka-origin generation. A
-                        # later manual generation must never retarget Kafka
-                        # sources or issue-comment subscriptions.
-                        latest_generation = int(latest["generation"])
-                        selected_generation = (
-                            latest_generation
-                            if str(latest["source_event_id"] or "").strip()
-                            else 1
-                        )
-                        binding_row = self._select_issue_generation_tx(
+                        # Manual generations do not retarget the Kafka chain.
+                        # Query the latest immutable Kafka origin explicitly.
+                        binding_row = self._select_latest_kafka_issue_generation_tx(
                             conn,
                             project_key=normalized.project_key,
                             work_item_type_key=normalized.work_item_type_key,
                             work_item_id=normalized.work_item_id,
-                            generation=selected_generation,
                         )
-                        if binding_row is None:
+                        if (
+                            binding_row is not None
+                            and not self._kafka_generation_origin_contract_valid(
+                                binding_row
+                            )
+                        ):
+                            decision = "invalid"
+                            reason = LEGACY_KAFKA_GENERATION_REASON
+                            binding_row = None
+                        elif binding_row is None:
+                            binding_row = self._select_issue_generation_tx(
+                                conn,
+                                project_key=normalized.project_key,
+                                work_item_type_key=normalized.work_item_type_key,
+                                work_item_id=normalized.work_item_id,
+                                generation=1,
+                            )
+                        if binding_row is None and decision != "invalid":
                             decision = "invalid"
                             reason = "issue_scope_kafka_generation_missing"
                     if decision == "invalid":
@@ -6600,13 +6971,20 @@ class RcaControlStore:
                         creates_generation = True
                     else:
                         bound_generation = int(binding_row["generation"])
-                        trigger_kind = "manual_retrigger"
+                        trigger_kind = "kafka_retrigger"
                         if bound_generation == 1:
                             trigger_kind = (
                                 "issue_created"
                                 if str(binding_row["source_event_id"] or "").strip()
                                 else "manual_issue_request"
                             )
+                        admission_kwargs: dict[str, Any] = {}
+                        if trigger_kind in RCA_KAFKA_TRIGGER_KINDS:
+                            admission_kwargs = {
+                                "topic": str(row["topic"]),
+                                "partition": int(row["partition_id"]),
+                                "offset": int(row["offset_id"]),
+                            }
                         admission = build_rca_admission(
                             project_key=str(binding_row["project_key"]),
                             project_simple_name=normalized.project_simple_name,
@@ -6615,9 +6993,7 @@ class RcaControlStore:
                             rule_version=str(binding_row["creation_rule_version"]),
                             trigger_kind=trigger_kind,
                             generation=bound_generation,
-                            topic=str(row["topic"]),
-                            partition=int(row["partition_id"]),
-                            offset=int(row["offset_id"]),
+                            **admission_kwargs,
                         )
                         if (
                             admission.business_key != str(binding_row["business_key"])
@@ -6642,6 +7018,7 @@ class RcaControlStore:
                                     inbox_row=row,
                                     admission=admission,
                                     normalized=normalized,
+                                    allow_same_event=terminal_duplicate_retrigger,
                                 )
                             )
                             if (
@@ -6664,7 +7041,7 @@ class RcaControlStore:
                                     rule_version=str(
                                         binding_row["creation_rule_version"]
                                     ),
-                                    trigger_kind="manual_retrigger",
+                                    trigger_kind="kafka_retrigger",
                                     generation=bound_generation + 1,
                                     topic=str(row["topic"]),
                                     partition=int(row["partition_id"]),
@@ -6744,6 +7121,12 @@ class RcaControlStore:
                             conn,
                             event_uid=event_uid,
                             raw_sha256=str(row["raw_sha256"]),
+                            generation=admission.generation,
+                            trigger_kind=(
+                                admission.trigger_kind
+                                if admission.trigger_kind in RCA_KAFKA_TRIGGER_KINDS
+                                else "issue_created"
+                            ),
                             current=now,
                         ) if admission is not None else ""
                     if admission is not None and creates_generation:
@@ -6887,6 +7270,11 @@ class RcaControlStore:
                         raw_sha256=str(row["raw_sha256"]),
                         business_key=admission.business_key,
                         generation=admission.generation,
+                        trigger_kind=(
+                            admission.trigger_kind
+                            if admission.trigger_kind in RCA_KAFKA_TRIGGER_KINDS
+                            else "issue_created"
+                        ),
                         current=now,
                     ) if admission is not None else ""
                     if admission is not None and trigger_created:
@@ -6987,7 +7375,7 @@ class RcaControlStore:
                 decision=decision,
                 reason=reason,
                 raw_inserted=False,
-                transport_duplicate=False,
+                transport_duplicate=transport_duplicate,
                 trigger_created=trigger_created,
                 outbox_created=outbox_created,
                 business_key=business_key,
@@ -7026,6 +7414,7 @@ class RcaControlStore:
         result = self.process_event_resilient(
             raw_result.event_uid,
             runtime_identity=runtime_identity,
+            allow_terminal_duplicate_retrigger=not raw_result.inserted,
         )
         return replace(result, raw_inserted=raw_result.inserted)
 
@@ -7034,12 +7423,16 @@ class RcaControlStore:
         event_uid: str,
         *,
         runtime_identity: Mapping[str, Any] | None = None,
+        allow_terminal_duplicate_retrigger: bool = False,
     ) -> IngestResult:
         """Classify one event while keeping unknown failures unacknowledged."""
         try:
             return self.process_event(
                 event_uid,
                 runtime_identity=runtime_identity,
+                allow_terminal_duplicate_retrigger=(
+                    allow_terminal_duplicate_retrigger
+                ),
             )
         except (sqlite3.Error, OSError):
             raise

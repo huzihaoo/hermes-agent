@@ -124,18 +124,66 @@ def test_manual_retrigger_requires_explicit_new_generation():
 
     generation_two = build_rca_admission(**BASE, trigger_kind="manual_retrigger", generation=2)
     generation_two_replay = build_rca_admission(
-        **BASE,
-        trigger_kind="manual_retrigger",
-        generation=2,
-        topic="workflow",
-        partition=0,
-        offset=7,
+        **BASE, trigger_kind="manual_retrigger", generation=2
     )
+    with pytest.raises(RcaAdmissionError, match="must not carry Kafka coordinates"):
+        build_rca_admission(
+            **BASE,
+            trigger_kind="manual_retrigger",
+            generation=2,
+            topic="workflow",
+            partition=0,
+            offset=7,
+        )
     generation_three = build_rca_admission(**BASE, trigger_kind="manual_retrigger", generation=3)
 
     assert generation_two.business_key == generation_three.business_key
     assert generation_two.submission_key == generation_two_replay.submission_key
     assert generation_two.submission_key != generation_three.submission_key
+
+
+def test_kafka_retrigger_requires_new_generation_and_exact_coordinates():
+    with pytest.raises(RcaAdmissionError, match="explicit generation"):
+        build_rca_admission(
+            **BASE,
+            trigger_kind="kafka_retrigger",
+            topic="workflow",
+            partition=0,
+            offset=7,
+        )
+    with pytest.raises(RcaAdmissionError, match="Kafka coordinates"):
+        build_rca_admission(
+            **BASE,
+            trigger_kind="kafka_retrigger",
+            generation=2,
+        )
+
+    kafka = build_rca_admission(
+        **BASE,
+        trigger_kind="kafka_retrigger",
+        generation=2,
+        topic="workflow",
+        partition=0,
+        offset=7,
+    )
+    replay = build_rca_admission(
+        **BASE,
+        trigger_kind="kafka_retrigger",
+        generation=2,
+        topic="workflow",
+        partition=0,
+        offset=8,
+    )
+    manual = build_rca_admission(
+        **BASE,
+        trigger_kind="manual_retrigger",
+        generation=2,
+    )
+
+    assert kafka.trigger_kind == "kafka_retrigger"
+    assert kafka.generation == 2
+    assert kafka.submission_key == replay.submission_key == manual.submission_key
+    assert validate_rca_admission(kafka.to_dict()) == kafka
 
 
 def test_validator_rederives_keys_and_rejects_forgery():

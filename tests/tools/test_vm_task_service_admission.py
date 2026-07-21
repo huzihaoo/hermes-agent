@@ -207,6 +207,7 @@ def _contracts(
     reservation_status: str = "reserved",
     expected_artifact_cache_bytes: int = 1_000_000_000,
     manual: bool = False,
+    kafka_generation: int = 1,
 ):
     if manual:
         admission = build_rca_admission(
@@ -224,6 +225,12 @@ def _contracts(
             work_item_type_key="issue",
             work_item_id="7041712812",
             rule_version="issue-created-v1",
+            trigger_kind=(
+                "issue_created"
+                if kafka_generation == 1
+                else "kafka_retrigger"
+            ),
+            generation=kafka_generation,
             topic="feishu-project-workflow-event",
             partition=1,
             offset=99,
@@ -1023,6 +1030,82 @@ def test_service_wrapper_accepts_manual_origin_without_kafka_coordinates(
     assert captured["routing_meta_extra"]["rca_contract_sha256"]
     assert result["created"] is True
     assert result["deduped"] is False
+
+
+def test_service_wrapper_accepts_kafka_retrigger_with_exact_coordinates(
+    monkeypatch, tmp_path
+):
+    _configure_service_policy(monkeypatch, tmp_path)
+    admission, request = _contracts(kafka_generation=2)
+    captured = {}
+
+    monkeypatch.setattr(
+        vm_task_tool,
+        "vm_task_status",
+        lambda task_id, include_markdown=False: (
+            {"success": False, "state": "missing", "task_id": task_id}
+            if not captured
+            else _matching_status(admission, request)
+        ),
+    )
+    monkeypatch.setattr(
+        vm_task_tool,
+        "_vm_task_submit_trusted",
+        lambda **kwargs: (
+            captured.update(kwargs)
+            or {
+                "success": True,
+                "task": {"task_id": kwargs["task_id"], "status": "created"},
+            }
+        ),
+    )
+
+    result = _submit_service(
+        service_id=SERVICE_ID,
+        capability=CAPABILITY,
+        operation=OPERATION,
+        admission=admission,
+        execution_request=request,
+    )
+
+    assert result["success"] is True
+    assert admission.trigger_kind == "kafka_retrigger"
+    assert admission.generation == 2
+    assert request.source_refs["source_kind"] == "kafka_workflow_event"
+    assert request.source_refs["source_event_id"] == (
+        "feishu-project-workflow-event:1:99"
+    )
+    assert captured["routing_meta_extra"]["rca_trigger_kind"] == (
+        "kafka_retrigger"
+    )
+    assert captured["routing_meta_extra"]["rca_generation"] == 2
+    assert captured["routing_meta_extra"]["rca_source_refs"] == {
+        "project_key": "t03o4q",
+        "work_item_type_key": "issue",
+        "work_item_id": "7041712812",
+        "rule_version": "issue-created-v1",
+        "topic": "feishu-project-workflow-event",
+        "partition": 1,
+        "offset": 99,
+    }
+    goal = captured["goal"]
+    goal_admission = _strict_marker_json(
+        goal,
+        "<!-- G1Q3_RCA_ADMISSION_JSON:BEGIN -->",
+        "<!-- G1Q3_RCA_ADMISSION_JSON:END -->",
+    )
+    goal_request = _strict_marker_json(
+        goal,
+        "<!-- G1Q3_RCA_EXECUTION_REQUEST_JSON:BEGIN -->",
+        "<!-- G1Q3_RCA_EXECUTION_REQUEST_JSON:END -->",
+    )
+    assert goal_admission == admission.to_dict()
+    assert goal_admission["trigger_kind"] == "kafka_retrigger"
+    assert goal_request == rca_to_dict(request)
+    assert goal_request["source_refs"]["source_event_id"] == (
+        "feishu-project-workflow-event:1:99"
+    )
+    assert result["created"] is True
 
 
 def test_fixed_cli_goal_keeps_caller_text_inside_json_and_commands_are_immutable(

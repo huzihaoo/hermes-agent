@@ -26,6 +26,8 @@ if str(REPO_ROOT) not in sys.path:
 from dotenv import load_dotenv
 
 from gateway.pnc_rca_admission import (
+    RCA_KAFKA_TRIGGER_KINDS,
+    RCA_MANUAL_TRIGGER_KINDS,
     build_rca_admission,
     validate_rca_admission,
     validate_rca_trigger_context,
@@ -1245,7 +1247,9 @@ def _submission_admission(claim: ExecutionWatchClaim):
         normalized = payload.get("normalized_event")
         if not isinstance(normalized, Mapping):
             raise DeliveryContractError("submission_outbox_contract_invalid")
-        expected_trigger_kind = "issue_created"
+        expected_trigger_kind = (
+            "issue_created" if claim.generation == 1 else "kafka_retrigger"
+        )
         try:
             expected_admission = build_rca_admission(
                 project_key=trigger_context.project_key,
@@ -1254,6 +1258,7 @@ def _submission_admission(claim: ExecutionWatchClaim):
                 work_item_id=trigger_context.work_item_id,
                 rule_version=trigger_context.creation_rule_version,
                 trigger_kind=expected_trigger_kind,
+                generation=claim.generation,
                 topic=payload.get("topic", ""),
                 partition=payload.get("partition"),
                 offset=payload.get("offset"),
@@ -1280,6 +1285,7 @@ def _submission_admission(claim: ExecutionWatchClaim):
         if (
             payload.get("source_event_id") != event_uid
             or normalized_identity != trigger_identity
+            or admission.trigger_kind not in RCA_KAFKA_TRIGGER_KINDS
         ):
             raise DeliveryContractError("submission_outbox_contract_invalid")
     elif source_kind == "feishu_group_manual":
@@ -1300,6 +1306,8 @@ def _submission_admission(claim: ExecutionWatchClaim):
         except Exception as exc:
             raise DeliveryContractError("submission_outbox_contract_invalid") from exc
         if refs.topic != "" or refs.partition is not None or refs.offset is not None:
+            raise DeliveryContractError("submission_outbox_contract_invalid")
+        if admission.trigger_kind not in RCA_MANUAL_TRIGGER_KINDS:
             raise DeliveryContractError("submission_outbox_contract_invalid")
     else:
         raise DeliveryContractError("submission_outbox_contract_invalid")

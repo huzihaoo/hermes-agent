@@ -1383,7 +1383,11 @@ def vm_task_submit_service(
         )
 
     try:
-        from gateway.pnc_rca_admission import validate_rca_admission
+        from gateway.pnc_rca_admission import (
+            RCA_KAFKA_TRIGGER_KINDS,
+            RCA_MANUAL_TRIGGER_KINDS,
+            validate_rca_admission,
+        )
 
         validated_admission = validate_rca_admission(admission)
     except Exception as exc:
@@ -1482,11 +1486,12 @@ def vm_task_submit_service(
         else {}
     )
     origin_source_id = str(source_refs.get("origin_source_id") or "").strip()
+    kafka_trigger = validated_admission.trigger_kind in RCA_KAFKA_TRIGGER_KINDS
     expected_source_refs = {
         "task_id": validated_admission.submission_key,
         "source_kind": (
             "kafka_workflow_event"
-            if validated_admission.trigger_kind == "issue_created"
+            if kafka_trigger
             else "feishu_group_manual"
         ),
         "origin_source_id": origin_source_id,
@@ -1495,7 +1500,16 @@ def vm_task_submit_service(
         "business_key": validated_admission.business_key,
         "submission_key": validated_admission.submission_key,
     }
-    if validated_admission.trigger_kind == "issue_created":
+    if kafka_trigger:
+        if (
+            not refs.topic
+            or refs.partition is None
+            or refs.offset is None
+        ):
+            return _vm_task_service_denied_payload(
+                "vm_task_service_admission_invalid",
+                "Kafka execution admission is missing source coordinates",
+            )
         expected_source_refs.update(
             {
                 "source_event_id": (f"{refs.topic}:{refs.partition}:{refs.offset}"),
@@ -1505,8 +1519,7 @@ def vm_task_submit_service(
             }
         )
     elif (
-        validated_admission.trigger_kind
-        not in {"manual_issue_request", "manual_retrigger"}
+        validated_admission.trigger_kind not in RCA_MANUAL_TRIGGER_KINDS
         or refs.topic != ""
         or refs.partition is not None
         or refs.offset is not None

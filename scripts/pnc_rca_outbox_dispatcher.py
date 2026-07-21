@@ -26,6 +26,8 @@ if str(REPO_ROOT) not in sys.path:
 from dotenv import load_dotenv
 
 from gateway.pnc_rca_admission import (
+    RCA_KAFKA_TRIGGER_KINDS,
+    RCA_MANUAL_TRIGGER_KINDS,
     RcaAdmission,
     validate_rca_admission,
     validate_rca_trigger_context,
@@ -1484,8 +1486,13 @@ def _validated_claim_contract(
     source_kind = str(event.get("source_kind") or "")
     if payload_schema == OUTBOX_PAYLOAD_SCHEMA_VERSION:
         if source_kind == "kafka_workflow_event":
+            expected_trigger_kind = (
+                "issue_created" if claim.generation == 1 else "kafka_retrigger"
+            )
             if (
-                not refs.topic
+                admission.trigger_kind not in RCA_KAFKA_TRIGGER_KINDS
+                or admission.trigger_kind != expected_trigger_kind
+                or not refs.topic
                 or refs.partition is None
                 or refs.offset is None
                 or refs.topic != claim.source_topic
@@ -1497,8 +1504,15 @@ def _validated_claim_contract(
                     "Kafka trigger coordinates disagree with durable lineage",
                 )
         elif source_kind == "feishu_group_manual":
+            expected_trigger_kind = (
+                "manual_issue_request"
+                if claim.generation == 1
+                else "manual_retrigger"
+            )
             if (
-                refs.topic
+                admission.trigger_kind not in RCA_MANUAL_TRIGGER_KINDS
+                or admission.trigger_kind != expected_trigger_kind
+                or refs.topic
                 or refs.partition is not None
                 or refs.offset is not None
                 or any(

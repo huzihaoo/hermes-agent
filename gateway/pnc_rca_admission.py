@@ -19,7 +19,16 @@ RCA_ADMISSION_KEY_VERSION = "v1"
 RCA_ISSUE_SCOPE_KEY_VERSION = "v1"
 RCA_TRIGGER_CONTEXT_SCHEMA_VERSION = "pnc_rca_trigger_context_v1"
 
-TriggerKind = Literal["issue_created", "manual_issue_request", "manual_retrigger"]
+TriggerKind = Literal[
+    "issue_created",
+    "kafka_retrigger",
+    "manual_issue_request",
+    "manual_retrigger",
+]
+RCA_KAFKA_TRIGGER_KINDS = frozenset({"issue_created", "kafka_retrigger"})
+RCA_MANUAL_TRIGGER_KINDS = frozenset(
+    {"manual_issue_request", "manual_retrigger"}
+)
 
 
 class RcaAdmissionError(ValueError):
@@ -135,9 +144,10 @@ def build_rca_admission(
 ) -> RcaAdmission:
     """Build stable business/submission identities for one RCA generation.
 
-    ``issue_created`` is always generation 1.  A deliberate rerun must use
-    ``manual_retrigger`` and explicitly select a generation greater than 1.
-    Kafka coordinates are all-or-none and never participate in deduplication.
+    ``issue_created`` and ``manual_issue_request`` are always generation 1.
+    Kafka and manual reruns use distinct trigger kinds and explicitly select a
+    generation greater than 1. Kafka coordinates are all-or-none and never
+    participate in deduplication.
     """
 
     project = _required_text("project_key", project_key)
@@ -149,6 +159,7 @@ def build_rca_admission(
     normalized_trigger = str(trigger_kind or "").strip()
     if normalized_trigger not in {
         "issue_created",
+        "kafka_retrigger",
         "manual_issue_request",
         "manual_retrigger",
     }:
@@ -159,7 +170,9 @@ def build_rca_admission(
         normalized_generation = 1
     else:
         if isinstance(generation, bool) or not isinstance(generation, int) or generation < 2:
-            raise RcaAdmissionError("manual_retrigger requires an explicit generation >= 2")
+            raise RcaAdmissionError(
+                f"{normalized_trigger} requires an explicit generation >= 2"
+            )
         normalized_generation = generation
 
     normalized_topic = str(topic or "").strip()
@@ -168,6 +181,10 @@ def build_rca_admission(
     transport_parts = (bool(normalized_topic), normalized_partition is not None, normalized_offset is not None)
     if any(transport_parts) and not all(transport_parts):
         raise RcaAdmissionError("topic, partition, and offset must be provided together")
+    if normalized_trigger == "kafka_retrigger" and not all(transport_parts):
+        raise RcaAdmissionError("kafka_retrigger requires Kafka coordinates")
+    if normalized_trigger in RCA_MANUAL_TRIGGER_KINDS and any(transport_parts):
+        raise RcaAdmissionError("manual triggers must not carry Kafka coordinates")
 
     refs = RcaSourceRefs(
         project_key=project,

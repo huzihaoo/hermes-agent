@@ -18,6 +18,7 @@ from gateway.pnc_rca_control_store import (
     INPUT_WAIT_EXECUTION_WATCH_PRESENT_REASON,
     INPUT_WAIT_TERMINAL_NEW_GENERATION_REASON,
     KafkaRecord,
+    LEGACY_KAFKA_GENERATION_REASON,
     MANUAL_TRIGGER_SCHEMA_VERSION,
     ManualRcaAdmissionError,
     ManualRcaTriggerRequest,
@@ -1630,7 +1631,7 @@ def _terminalize_permanent(store: RcaControlStore, submission_key: str) -> None:
 def _terminalize_input_wait(
     store: RcaControlStore, submission_key: str, *, settle: bool = True
 ) -> None:
-    _quarantine_for_input_wait(store)
+    _quarantine_for_input_wait(store, submission_key=submission_key)
     delivery = RcaDeliveryStore(store.db_path)
     assert delivery.backfill_completed_submissions() == 1
     if settle:
@@ -2547,7 +2548,7 @@ def test_settled_input_wait_terminal_creates_canonical_next_generation(tmp_path)
         work_item_type_key="problem-type",
         work_item_id="7041712812",
         rule_version="issue-created-v1",
-        trigger_kind="manual_retrigger",
+        trigger_kind="kafka_retrigger",
         generation=2,
         topic=TOPIC,
         partition=2,
@@ -2581,7 +2582,17 @@ def test_settled_input_wait_terminal_creates_canonical_next_generation(tmp_path)
     assert new_trigger["source_offset"] == 11
     assert new_outbox["origin_source_id"] == new_trigger["origin_source_id"]
     assert new_outbox["status"] == "pending"
+    [new_source] = [
+        row
+        for row in store.list_rows("rca_trigger_sources")
+        if row["source_id"] == new_trigger["origin_source_id"]
+    ]
+    assert new_source["source_kind"] == "kafka_workflow_event"
+    assert new_source["mode"] == "kafka_retrigger"
+    assert new_source["kafka_event_uid"] is None
+    assert new_source["source_dedupe_key"].endswith(":generation:2")
     new_payload = json.loads(new_outbox["payload_json"])
+    assert new_payload["admission"]["trigger_kind"] == "kafka_retrigger"
     assert new_payload["admission"] == expected.to_dict()
     assert new_payload["source_event_id"] == replacement.event_uid
     assert new_payload["offset"] == 11
@@ -2598,6 +2609,143 @@ def test_settled_input_wait_terminal_creates_canonical_next_generation(tmp_path)
     assert new_binding["business_key"] == first.business_key
     assert new_binding["generation"] == 2
     assert new_binding["role"] == "origin"
+
+
+def test_same_kafka_event_uses_generation_bound_retrigger_source_identity(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    first = store.ingest_record(
+        _record(10), policy=_policy(), submit_enabled=True
+    )
+    _terminalize_input_wait(store, first.submission_key)
+    [original_trigger] = store.list_rows("business_triggers")
+    [original_outbox] = store.list_rows("rca_outbox")
+    [original_source] = store.list_rows("rca_trigger_sources")
+    [original_binding] = store.list_rows("rca_trigger_bindings")
+
+    second = store.ingest_record(
+        _record(10), policy=_policy(), submit_enabled=True
+    )
+    expected = build_rca_admission(
+        project_key="project-key",
+        project_simple_name="g1q3",
+        work_item_type_key="problem-type",
+        work_item_id="7041712812",
+        rule_version="issue-created-v1",
+        trigger_kind="kafka_retrigger",
+        generation=2,
+        topic=TOPIC,
+        partition=2,
+        offset=10,
+    )
+
+    assert second.decision == "accepted"
+    assert second.reason == INPUT_WAIT_TERMINAL_NEW_GENERATION_REASON
+    assert second.rearm_reason == INPUT_WAIT_TERMINAL_NEW_GENERATION_REASON
+    assert second.transport_duplicate is True
+    assert second.raw_inserted is False
+    assert second.trigger_created is second.outbox_created is True
+    assert second.business_key == first.business_key == expected.business_key
+    assert second.submission_key == expected.submission_key
+    assert second.generation == 2
+
+    sources = store.list_rows("rca_trigger_sources")
+    bindings = store.list_rows("rca_trigger_bindings")
+    triggers = store.list_rows("business_triggers")
+    outboxes = store.list_rows("rca_outbox")
+    assert triggers[0] == original_trigger
+    assert outboxes[0] == original_outbox
+    assert next(
+        row for row in sources if row["source_id"] == original_source["source_id"]
+    ) == original_source
+    assert next(
+        row for row in bindings if row["source_id"] == original_binding["source_id"]
+    ) == original_binding
+    derived_source_id = triggers[1]["origin_source_id"]
+    assert derived_source_id != original_source["source_id"]
+    assert outboxes[1]["origin_source_id"] == derived_source_id
+    assert triggers[1]["source_event_id"] == first.event_uid
+    assert outboxes[1]["source_event_id"] == first.event_uid
+    derived_source = next(
+        row for row in sources if row["source_id"] == derived_source_id
+    )
+    derived_binding = next(
+        row for row in bindings if row["source_id"] == derived_source_id
+    )
+    assert derived_source["source_dedupe_key"].endswith(":generation:2")
+    assert derived_source["kafka_event_uid"] is None
+    assert derived_source["mode"] == "kafka_retrigger"
+    assert derived_source["payload_sha256"] == original_source["payload_sha256"]
+    assert derived_binding["generation"] == 2
+    assert derived_binding["role"] == "origin"
+    payload = json.loads(outboxes[1]["payload_json"])
+    assert payload["admission"] == expected.to_dict()
+    assert payload["origin_source_id"] == derived_source_id
+    assert payload["source_event_id"] == first.event_uid
+    assert (payload["topic"], payload["partition"], payload["offset"]) == (
+        TOPIC,
+        2,
+        10,
+    )
+
+    third = store.ingest_record(
+        _record(10), policy=_policy(), submit_enabled=True
+    )
+    assert third.transport_duplicate is True
+    assert third.raw_inserted is False
+    assert third.trigger_created is third.outbox_created is False
+    assert third.submission_key == second.submission_key
+    assert third.generation == 2
+    assert len(store.list_rows("rca_trigger_sources")) == 2
+    assert len(store.list_rows("rca_trigger_bindings")) == 2
+    assert len(store.list_rows("business_triggers")) == 2
+    assert len(store.list_rows("rca_outbox")) == 2
+
+    _terminalize_input_wait(store, second.submission_key)
+    terminal_triggers = store.list_rows("business_triggers")
+    terminal_outboxes = store.list_rows("rca_outbox")
+    fourth = store.ingest_record(
+        _record(10), policy=_policy(), submit_enabled=True
+    )
+    assert fourth.transport_duplicate is True
+    assert fourth.generation == 2
+    assert fourth.submission_key == second.submission_key
+    assert fourth.trigger_created is fourth.outbox_created is False
+    assert store.list_rows("business_triggers") == terminal_triggers
+    assert store.list_rows("rca_outbox") == terminal_outboxes
+    with store._connect() as check:
+        assert check.execute("PRAGMA foreign_key_check").fetchone() is None
+
+
+def test_same_kafka_event_with_pruned_raw_never_creates_retrigger(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    first = store.ingest_record(
+        _record(10), policy=_policy(), submit_enabled=True
+    )
+    _terminalize_input_wait(store, first.submission_key)
+    current = datetime.now(timezone.utc).isoformat()
+    conn = store._connect()
+    try:
+        conn.execute(
+            "UPDATE kafka_inbox SET raw_value=X'', raw_pruned_at=? WHERE event_uid=?",
+            (current, first.event_uid),
+        )
+    finally:
+        conn.close()
+    terminal_triggers = store.list_rows("business_triggers")
+    terminal_outboxes = store.list_rows("rca_outbox")
+    terminal_inbox = store.get_inbox(first.event_uid)
+
+    replay = store.ingest_record(
+        _record(10), policy=_policy(), submit_enabled=True
+    )
+
+    assert replay.transport_duplicate is True
+    assert replay.generation == 1
+    assert replay.submission_key == first.submission_key
+    assert replay.trigger_created is replay.outbox_created is False
+    assert store.list_rows("business_triggers") == terminal_triggers
+    assert store.list_rows("rca_outbox") == terminal_outboxes
+    assert store.get_inbox(first.event_uid) == terminal_inbox
 
 
 def test_unsettled_input_wait_terminal_blocks_rearm_and_next_generation(tmp_path):
@@ -2813,6 +2961,126 @@ def test_failed_next_generation_advances_again_without_rearming_old_baseline(
     generation_two_outbox = store.list_rows("rca_outbox")[1]
     assert generation_two_outbox["status"] == "quarantined"
     assert generation_two_outbox["submission_key"] == second.submission_key
+
+
+def test_kafka_update_binds_latest_kafka_origin_after_newer_manual_generation(
+    tmp_path,
+):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    first = store.ingest_record(
+        _record(10), policy=_policy(), submit_enabled=True
+    )
+    _terminalize_input_wait(store, first.submission_key)
+    second = store.ingest_record(
+        _record(11, value=_value(updated_at=1783659999999)),
+        policy=_policy(),
+        submit_enabled=True,
+    )
+    assert second.generation == 2
+    _terminalize_permanent(store, second.submission_key)
+    manual = store.admit_manual_trigger(
+        _manual_request(
+            "om_generation_three",
+            mode="rerun",
+            thread_id="topic:om_generation_three_root",
+        ),
+        allowed_chat_ids={"oc_allowed"},
+        submit_enabled=True,
+        operator_authorized=True,
+    )
+    assert manual.generation == 3
+
+    observed = store.ingest_record(
+        _record(12, value=_value(updated_at=1783660000000)),
+        policy=_policy(),
+        submit_enabled=True,
+    )
+
+    assert observed.decision == "deduped"
+    assert observed.generation == 2
+    assert observed.submission_key == second.submission_key
+    observed_source = next(
+        row
+        for row in store.list_rows("rca_trigger_sources")
+        if row["source_dedupe_key"]
+        == f"{observed.event_uid}:generation:{second.generation}"
+    )
+    observed_binding = next(
+        row
+        for row in store.list_rows("rca_trigger_bindings")
+        if row["source_id"] == observed_source["source_id"]
+    )
+    assert observed_source["mode"] == "kafka_retrigger"
+    assert observed_binding["generation"] == 2
+    assert observed_binding["role"] == "observer"
+    assert [row["generation"] for row in store.list_rows("business_triggers")] == [
+        1,
+        2,
+        3,
+    ]
+
+
+def test_legacy_kafka_manual_retrigger_generation_requires_explicit_migration(
+    tmp_path,
+):
+    path = tmp_path / "control.sqlite3"
+    store = RcaControlStore(path)
+    first = store.ingest_record(
+        _record(10), policy=_policy(), submit_enabled=True
+    )
+    _terminalize_input_wait(store, first.submission_key)
+    second = store.ingest_record(
+        _record(11, value=_value(updated_at=1783659999999)),
+        policy=_policy(),
+        submit_enabled=True,
+    )
+    [generation_two] = [
+        row for row in store.list_rows("rca_outbox") if row["generation"] == 2
+    ]
+    payload = json.loads(generation_two["payload_json"])
+    payload["admission"]["trigger_kind"] = "manual_retrigger"
+    conn = store._connect()
+    try:
+        conn.execute(
+            "UPDATE rca_outbox SET payload_json=? WHERE outbox_id=?",
+            (
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                generation_two["outbox_id"],
+            ),
+        )
+    finally:
+        conn.close()
+
+    sources_before = store.list_rows("rca_trigger_sources")
+    conn = store._connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        with pytest.raises(RecordConflictError, match="explicit migration"):
+            store._backfill_kafka_sources_and_subscriptions(conn)
+        conn.rollback()
+    finally:
+        conn.close()
+    assert store.list_rows("rca_trigger_sources") == sources_before
+
+    observed = store.ingest_record(
+        _record(12, value=_value(updated_at=1783660000000)),
+        policy=_policy(),
+        submit_enabled=True,
+    )
+    assert observed.decision == "invalid"
+    assert observed.reason == LEGACY_KAFKA_GENERATION_REASON
+    assert observed.generation == 0
+    assert observed.submission_key == ""
+    assert [row["generation"] for row in store.list_rows("business_triggers")] == [
+        1,
+        2,
+    ]
+    [dead_letter] = [
+        row
+        for row in store.list_rows("kafka_dead_letters")
+        if row["source_event_id"] == observed.event_uid
+    ]
+    assert dead_letter["error_code"] == LEGACY_KAFKA_GENERATION_REASON
 
 
 @pytest.mark.parametrize(

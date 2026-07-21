@@ -913,7 +913,8 @@ def test_older_terminal_generation_is_suppressed_before_any_remote_call(tmp_path
                 target_key, issue_url, report_url, outcome, outcome_key,
                 terminal_state, terminal_error_code, status, manifest_json,
                 contract_json, artifacts_json, created_at, updated_at
-            ) VALUES (?, ?, ?, 2, ?, ?, ?, ?, ?, ?, ?, 'success', '', '', '',
+            ) VALUES (?, ?, ?, 2, ?, ?, ?, ?, ?, ?, ?, 'terminal_failed', '',
+                      'failed', 'vm_terminal_failed_unclassified',
                       'delivered', '{}', '{}', '[]', ?, ?)
             """,
             (
@@ -940,13 +941,23 @@ def test_older_terminal_generation_is_suppressed_before_any_remote_call(tmp_path
                 effect_key, delivery_id, effect_kind, required, target_key,
                 payload_json, payload_sha256, outcome, write_phase, status,
                 completed_at, created_at, updated_at
-            ) VALUES (?, ?, 'feishu_issue_comment', 1, ?, '{}', ?, 'success',
+            ) VALUES (?, ?, 'feishu_issue_comment', 1, ?, ?, ?, 'terminal_failed',
                       'settled', 'succeeded', ?, ?, ?)
             """,
             (
                 "g1q3-rca-effect-v1-" + "7" * 64,
                 newer_delivery_id,
                 old_job["target_key"],
+                json.dumps(
+                    {
+                        "field_updates": [
+                            {
+                                "field_key": "field_9193cb",
+                                "field_value": "newer terminal result",
+                            }
+                        ]
+                    }
+                ),
                 "6" * 64,
                 current,
                 current,
@@ -958,7 +969,9 @@ def test_older_terminal_generation_is_suppressed_before_any_remote_call(tmp_path
     outcome = dispatcher.dispatch_one()
 
     assert outcome.status == "superseded"
-    assert outcome.error_code == "delivery_effect_superseded_by_newer_success"
+    assert outcome.error_code == (
+        "delivery_effect_superseded_by_newer_settled_fields"
+    )
     assert remote.history == []
     [old_effect] = [
         row
@@ -967,6 +980,94 @@ def test_older_terminal_generation_is_suppressed_before_any_remote_call(tmp_path
     ]
     assert old_effect["status"] == "suppressed"
     assert old_effect["write_phase"] == "settled"
+
+
+def test_write_boundary_rechecks_newer_settled_terminal_field_effect(tmp_path):
+    store = _seed_terminal(tmp_path)
+    claim = store.claim_due_effect(
+        lease_owner="write-boundary-race",
+        lease_seconds=60,
+        now=NOW,
+    )
+    assert claim is not None
+    assert store.suppress_terminal_effect_if_newer_settled_fields(
+        claim=claim,
+        now=NOW,
+    ) is None
+    newer_delivery_id = "g1q3-rca-terminal-delivery-v1-" + "5" * 64
+    newer_effect_key = "g1q3-rca-terminal-effect-v1-" + "4" * 64
+    current = NOW.isoformat()
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO rca_delivery_jobs(
+                delivery_id, submission_key, business_key, generation,
+                artifact_set_id, project_key, work_item_type_key, work_item_id,
+                target_key, issue_url, report_url, outcome, outcome_key,
+                terminal_state, terminal_error_code, status, manifest_json,
+                contract_json, artifacts_json, created_at, updated_at
+            ) VALUES (?, ?, ?, 2, ?, ?, ?, ?, ?, '', '', 'terminal_failed', ?,
+                      'failed', 'vm_terminal_failed_unclassified', 'delivered',
+                      '{}', '{}', '[]', ?, ?)
+            """,
+            (
+                newer_delivery_id,
+                "newer-terminal-submission",
+                claim.business_key,
+                "g1q3-rca-terminal-v1-" + "3" * 64,
+                claim.project_key,
+                claim.work_item_type_key,
+                claim.work_item_id,
+                claim.target_key,
+                "g1q3-rca-terminal-v1-" + "3" * 64,
+                current,
+                current,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO rca_delivery_effects(
+                effect_key, delivery_id, effect_kind, required, target_key,
+                payload_json, payload_sha256, outcome, write_phase, status,
+                completed_at, created_at, updated_at
+            ) VALUES (?, ?, 'feishu_issue_comment', 1, ?, ?, ?,
+                      'terminal_failed', 'settled', 'succeeded', ?, ?, ?)
+            """,
+            (
+                newer_effect_key,
+                newer_delivery_id,
+                claim.target_key,
+                json.dumps(
+                    {
+                        "field_updates": [
+                            {
+                                "field_key": "field_9193cb",
+                                "field_value": "newer terminal result",
+                            }
+                        ]
+                    }
+                ),
+                "2" * 64,
+                current,
+                current,
+                current,
+            ),
+        )
+
+    mutation = store.mark_effect_write_started(claim=claim, now=NOW)
+
+    assert mutation is not None
+    assert mutation.effect_status == "suppressed"
+    old_effect = next(
+        row
+        for row in store.list_rows("rca_delivery_effects")
+        if row["effect_key"] == claim.effect_key
+    )
+    assert old_effect["status"] == "suppressed"
+    assert old_effect["write_phase"] == "settled"
+    receipt = json.loads(old_effect["remote_receipt_json"])
+    assert receipt["superseding_effect_key"] == newer_effect_key
+    assert receipt["superseding_outcome"] == "terminal_failed"
 
 
 def test_terminal_v2_epoch_switch_blocks_field_write_and_comment(tmp_path):

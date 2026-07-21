@@ -15,6 +15,8 @@ import uuid
 from gateway.pnc_rca_delivery_contract import (
     DELIVERY_EFFECT_KIND,
     DELIVERY_THREAD_EFFECT_KIND,
+    RCA_REPORT_FIELD_KEY,
+    RCA_RESULT_FIELD_KEY,
     TERMINAL_DELIVERY_OUTCOMES,
     DeliveryContractError,
     VerifiedDelivery,
@@ -2802,14 +2804,139 @@ class RcaDeliveryStore:
         finally:
             conn.close()
 
+    @staticmethod
+    def _payload_updates_issue_fields(payload_json: Any) -> bool:
+        try:
+            payload = json.loads(str(payload_json or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        updates = payload.get("field_updates") if isinstance(payload, dict) else None
+        if not isinstance(updates, list):
+            return False
+        field_keys = {
+            str(update.get("field_key") or "").strip()
+            for update in updates
+            if isinstance(update, dict)
+        }
+        return bool(field_keys & {RCA_RESULT_FIELD_KEY, RCA_REPORT_FIELD_KEY})
+
+    @classmethod
+    def _newer_settled_issue_field_effect_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        delivery_id: str,
+    ) -> sqlite3.Row | None:
+        rows = conn.execute(
+            """
+            SELECT newer.delivery_id, newer.generation, newer.outcome,
+                   newer_effect.effect_key, newer_effect.payload_json
+              FROM rca_delivery_jobs AS current_job
+              JOIN rca_delivery_jobs AS newer
+                ON newer.business_key = current_job.business_key
+               AND newer.generation > current_job.generation
+              JOIN rca_delivery_effects AS newer_effect
+                ON newer_effect.delivery_id = newer.delivery_id
+               AND newer_effect.effect_kind = 'feishu_issue_comment'
+               AND newer_effect.required = 1
+               AND newer_effect.status = 'succeeded'
+               AND newer_effect.write_phase = 'settled'
+             WHERE current_job.delivery_id = ?
+             ORDER BY newer.generation DESC, newer.delivery_id,
+                      newer_effect.effect_key
+            """,
+            (delivery_id,),
+        ).fetchall()
+        return next(
+            (
+                row
+                for row in rows
+                if cls._payload_updates_issue_fields(row["payload_json"])
+            ),
+            None,
+        )
+
+    @classmethod
+    def _suppress_terminal_effect_if_newer_settled_fields_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        claim: DeliveryEffectClaim,
+        row: sqlite3.Row,
+        current: str,
+    ) -> DeliveryEffectMutation | None:
+        if claim.outcome not in TERMINAL_DELIVERY_OUTCOMES:
+            return None
+        newer = cls._newer_settled_issue_field_effect_tx(
+            conn,
+            delivery_id=claim.delivery_id,
+        )
+        if newer is None:
+            return None
+        reason = "delivery_effect_superseded_by_newer_settled_fields"
+        detail = "newer generation already confirmed its issue fields"
+        receipt = {
+            "source": reason,
+            "superseding_delivery_id": str(newer["delivery_id"]),
+            "superseding_effect_key": str(newer["effect_key"]),
+            "superseding_generation": int(newer["generation"]),
+            "superseding_outcome": str(newer["outcome"]),
+        }
+        cls._append_attempt_event(
+            conn,
+            effect_key=claim.effect_key,
+            attempt_no=claim.attempt,
+            fence=claim.fence,
+            request_id=claim.request_id,
+            outcome="reconciled",
+            current=current,
+            error_code=reason,
+            detail=detail,
+        )
+        updated = conn.execute(
+            """
+            UPDATE rca_delivery_effects
+               SET status = 'suppressed', write_phase = 'settled',
+                   next_attempt_at = NULL, remote_receipt_json = ?,
+                   completed_at = ?, last_error_code = ?,
+                   last_error_detail = ?, lease_token = NULL,
+                   lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+             WHERE effect_key = ? AND lease_token = ? AND fence = ?
+               AND status = 'claimed'
+            """,
+            (
+                _canonical_json(receipt),
+                current,
+                reason,
+                detail,
+                current,
+                claim.effect_key,
+                claim.lease_token,
+                claim.fence,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise StaleDeliveryEffectLeaseError(
+                f"stale superseded effect claim for {claim.effect_key}"
+            )
+        job_status = cls._aggregate_job_status(
+            conn, str(row["delivery_id"]), current
+        )
+        return DeliveryEffectMutation(
+            claim.effect_key,
+            claim.delivery_id,
+            "suppressed",
+            job_status,
+        )
+
     def mark_effect_write_started(
         self,
         *,
         claim: DeliveryEffectClaim,
         now: datetime | None = None,
         activation_required: bool = False,
-    ) -> None:
-        """Persist the remote-write ambiguity boundary before invoking it."""
+    ) -> DeliveryEffectMutation | None:
+        """Persist and revalidate the fenced remote-write ambiguity boundary."""
         self._validate_activation_required(activation_required)
         current = _iso(now)
         conn = self._connect()
@@ -2835,6 +2962,15 @@ class RcaDeliveryStore:
                 raise StaleDeliveryEffectLeaseError(
                     f"delivery activation changed for {claim.effect_key}"
                 )
+            suppressed = self._suppress_terminal_effect_if_newer_settled_fields_tx(
+                conn,
+                claim=claim,
+                row=row,
+                current=current,
+            )
+            if suppressed is not None:
+                conn.commit()
+                return suppressed
             if str(row["write_phase"] or "") != "prewrite":
                 raise DeliveryRecordConflictError(
                     "delivery effect crossed its write boundary more than once"
@@ -2860,19 +2996,20 @@ class RcaDeliveryStore:
                     f"stale delivery-effect write boundary for {claim.effect_key}"
                 )
             conn.commit()
+            return None
         except Exception:
             conn.rollback()
             raise
         finally:
             conn.close()
 
-    def suppress_terminal_effect_if_newer_success(
+    def suppress_terminal_effect_if_newer_settled_fields(
         self,
         *,
         claim: DeliveryEffectClaim,
         now: datetime | None = None,
     ) -> DeliveryEffectMutation | None:
-        """Settle a stale terminal effect before it can overwrite newer success fields."""
+        """Settle a stale terminal before it can overwrite newer settled fields."""
 
         if claim.outcome not in TERMINAL_DELIVERY_OUTCOMES:
             return None
@@ -2887,79 +3024,14 @@ class RcaDeliveryStore:
                 fence=claim.fence,
                 current=current,
             )
-            newer = conn.execute(
-                """
-                SELECT newer.delivery_id, newer.generation
-                  FROM rca_delivery_jobs AS current_job
-                  JOIN rca_delivery_jobs AS newer
-                    ON newer.business_key = current_job.business_key
-                   AND newer.generation > current_job.generation
-                   AND newer.outcome = 'success'
-                  JOIN rca_delivery_effects AS newer_effect
-                    ON newer_effect.delivery_id = newer.delivery_id
-                   AND newer_effect.effect_kind = 'feishu_issue_comment'
-                   AND newer_effect.required = 1
-                   AND newer_effect.status = 'succeeded'
-                 WHERE current_job.delivery_id = ?
-                 ORDER BY newer.generation DESC, newer.delivery_id
-                 LIMIT 1
-                """,
-                (claim.delivery_id,),
-            ).fetchone()
-            if newer is None:
-                conn.commit()
-                return None
-            reason = "delivery_effect_superseded_by_newer_success"
-            receipt = {
-                "source": reason,
-                "superseding_delivery_id": str(newer["delivery_id"]),
-                "superseding_generation": int(newer["generation"]),
-            }
-            self._append_attempt_event(
+            suppressed = self._suppress_terminal_effect_if_newer_settled_fields_tx(
                 conn,
-                effect_key=claim.effect_key,
-                attempt_no=claim.attempt,
-                fence=claim.fence,
-                request_id=claim.request_id,
-                outcome="reconciled",
+                claim=claim,
+                row=row,
                 current=current,
-                error_code=reason,
-                detail="newer successful generation already confirmed its issue fields",
             )
-            updated = conn.execute(
-                """
-                UPDATE rca_delivery_effects
-                   SET status = 'suppressed', write_phase = 'settled',
-                       next_attempt_at = NULL, remote_receipt_json = ?,
-                       completed_at = ?, last_error_code = ?,
-                       last_error_detail = ?, lease_token = NULL,
-                       lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
-                 WHERE effect_key = ? AND lease_token = ? AND fence = ?
-                   AND status = 'claimed'
-                """,
-                (
-                    _canonical_json(receipt),
-                    current,
-                    reason,
-                    "newer successful generation already confirmed its issue fields",
-                    current,
-                    claim.effect_key,
-                    claim.lease_token,
-                    claim.fence,
-                ),
-            )
-            if updated.rowcount != 1:
-                raise StaleDeliveryEffectLeaseError(
-                    f"stale superseded effect claim for {claim.effect_key}"
-                )
-            job_status = self._aggregate_job_status(conn, str(row["delivery_id"]), current)
             conn.commit()
-            return DeliveryEffectMutation(
-                claim.effect_key,
-                claim.delivery_id,
-                "suppressed",
-                job_status,
-            )
+            return suppressed
         except Exception:
             conn.rollback()
             raise
