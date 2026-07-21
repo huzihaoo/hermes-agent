@@ -25,6 +25,21 @@ EPOCH_ID = "rca-bootstrap-prod-e2e-20260721-c85f9db1"
 STAGING_ROOT = "/mnt/tmp/rca-prod-e2e-c85f9db1/pipeline"
 FINAL_ROOT = "/home/mini/.hermes/rca-prod-runtime/releases/rca-prod-c85f9db1"
 MACHINE_IDENTITY = {"source": "test_machine_id", "sha256": "a1" * 32}
+DIAGNOSTIC_ARTIFACT_SET_ID = "g1q3-rca-artifact-v1-" + "c" * 64
+DIAGNOSTIC_REPORT_SHA256 = "d1" * 32
+DIAGNOSTIC_REPORT_BYTES = 1234
+
+
+def _diagnostic_report_descriptor() -> dict:
+    return {
+        "report_url": (
+            f"{VIEWER_ORIGIN}{release.VIEWER_REPORT_ROUTE_PREFIX}"
+            f"{release.TARGET_SUBMISSION_KEY}/{DIAGNOSTIC_ARTIFACT_SET_ID}/index.html"
+        ),
+        "diagnostic_report_sha256": DIAGNOSTIC_REPORT_SHA256,
+        "diagnostic_report_bytes": DIAGNOSTIC_REPORT_BYTES,
+        "diagnostic_artifact_set_id": DIAGNOSTIC_ARTIFACT_SET_ID,
+    }
 
 
 def test_exact_target_separates_internal_project_key_from_browser_slug():
@@ -270,7 +285,10 @@ def _viewer_proxy_candidate() -> dict:
         "observed_at": NOW.isoformat(),
         "public_origin": VIEWER_ORIGIN,
         "expected_viewer_address": release.VIEWER_EXPECTED_ADDRESS,
-        "route_prefix": release.VIEWER_PROXY_ROUTE_PREFIX,
+        "route_prefixes": {
+            "manifest_html": release.VIEWER_REPORT_ROUTE_PREFIX,
+            "viz_mcap": release.VIEWER_PROXY_ROUTE_PREFIX,
+        },
         "upstream_origin": release.VIEWER_PROXY_UPSTREAM_ORIGIN,
         "config": {
             "path": release.VIEWER_PROXY_CONFIG_PATH,
@@ -327,6 +345,7 @@ def _viewer_proxy_live_body(
     viewer_url = (
         f"{origin}/?ds=remote-file&ds.url={release.quote(artifact_url, safe='')}"
     )
+    report = _diagnostic_report_descriptor()
     common = {
         "content_type": "application/octet-stream",
         "accept_ranges": "bytes",
@@ -356,7 +375,7 @@ def _viewer_proxy_live_body(
             "process_cwd": candidate["nginx_prestate"]["process_cwd"],
             "nginx_config_test_passed": True,
             "effective_config_sha256": "88" * 32,
-            "effective_location_count": 1,
+            "effective_location_count": 2,
             "reload_performed": True,
             "reloaded_at": reloaded_at.isoformat(),
         },
@@ -369,7 +388,7 @@ def _viewer_proxy_live_body(
                 "candidate_unit_sha256"
             ],
             "report_main_pid": report_restart["new_pid"],
-            "legacy_html_health_passed": True,
+            "public_manifest_html_health_passed": True,
             "exact_artifact_contract_passed": True,
         },
         "http_contract": {
@@ -431,6 +450,49 @@ def _viewer_proxy_live_body(
                 "traversal": 404,
                 "encoded_separator": 404,
                 "query_string": 404,
+            },
+            "rejected_methods": {
+                "CONNECT": 403,
+                "DELETE": 403,
+                "PATCH": 403,
+                "POST": 403,
+                "PUT": 403,
+                "TRACE": 403,
+            },
+            "server_header_absent": True,
+        },
+        "report_contract": {
+            "report_url": report["report_url"],
+            "submission_key": release.TARGET_SUBMISSION_KEY,
+            "artifact_set_id": report["diagnostic_artifact_set_id"],
+            "report_sha256": report["diagnostic_report_sha256"],
+            "report_bytes": report["diagnostic_report_bytes"],
+            "head": {
+                "method": "HEAD",
+                "status": 200,
+                "body_bytes": 0,
+                "body_sha256": release.EMPTY_SHA256,
+                "content_length": report["diagnostic_report_bytes"],
+                "content_type": "text/html; charset=utf-8",
+                "accept_ranges": "bytes",
+                "cors_allow_origin": origin,
+            },
+            "get": {
+                "method": "GET",
+                "status": 200,
+                "body_bytes": report["diagnostic_report_bytes"],
+                "body_sha256": report["diagnostic_report_sha256"],
+                "content_length": report["diagnostic_report_bytes"],
+                "content_type": "text/html; charset=utf-8",
+                "accept_ranges": "bytes",
+                "cors_allow_origin": origin,
+            },
+            "rejected_paths": {
+                "directory": 404,
+                "traversal": 404,
+                "encoded_separator": 404,
+                "query_string": 404,
+                "wrong_artifact_set": 404,
             },
             "rejected_methods": {
                 "CONNECT": 403,
@@ -734,6 +796,7 @@ def release_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
             "path": str(owned.path),
             "sha256": owned.sha256,
             "issue_id": release.TARGET_WORK_ITEM_ID,
+            **_diagnostic_report_descriptor(),
             "structural_contract": {
                 "project_key": release.TARGET_PROJECT_KEY,
                 "project_simple_name": release.TARGET_PROJECT_SIMPLE_NAME,
@@ -848,7 +911,7 @@ def test_build_request_binds_new_host_services_report_and_distinct_approval(rele
     request = json.loads(release_fixture["request"].read_text())
     bom = request["bindings"]["release_bom"]
     assert bom["host_runtime"]["canonical_final"]["commit"] == release.HOST_FINAL_COMMIT
-    assert release.HOST_FINAL_COMMIT == "ecc6c747c8abbf1f815d8783511c7f96bf080bba"
+    assert release.HOST_FINAL_COMMIT == "92f60f4da5df335b756da6b2e970b7096cc10d45"
     assert len(bom["restart_scope"]["host_launchd_labels"]) == 6
     assert "local.pnc.completion-notice-relay" in bom["restart_scope"]["host_launchd_labels"]
     assert bom["restart_scope"]["vm_systemd_units"] == list(release.VM_SERVICE_UNITS)
@@ -1172,11 +1235,8 @@ def test_viewer_proxy_candidate_rejects_origin_dns_tls_config_and_prestate_drift
 def test_cross_receipt_is_structural_and_rejects_host_binding_drift(tmp_path, monkeypatch):
     component_path = _write_json(tmp_path / "component.json", {"component": True})
     components = _component_value(component_path)
-    report_url = (
-        f"{release.VIEWER_PROXY_UPSTREAM_ORIGIN}{release.VM_REPORT_ROUTE_PREFIX}"
-        "g1q3-rca-s1-" + "a" * 64 + "/g1q3-rca-artifact-v1-" + "b" * 64
-        + "/index.html"
-    )
+    report = _diagnostic_report_descriptor()
+    report_url = report["report_url"]
     field_values = {
         release.RESULT_FIELD_KEY: "candidate attribution",
         release.REPORT_FIELD_KEY: report_url,
@@ -1236,6 +1296,9 @@ def test_cross_receipt_is_structural_and_rejects_host_binding_drift(tmp_path, mo
             "docker_started_by_payload": False,
             "sha256": "81" * 32,
             "diagnostic_viz_sha256": "82" * 32,
+            "diagnostic_report_sha256": report["diagnostic_report_sha256"],
+            "diagnostic_report_bytes": report["diagnostic_report_bytes"],
+            "diagnostic_artifact_set_id": report["diagnostic_artifact_set_id"],
         },
         "supersedes": {"verdict": "gap", "sha256": release.SUPERSEDED_CROSS_CONTRACT_GAP_SHA256},
     }
@@ -2425,6 +2488,9 @@ def _completion_context(tmp_path: Path, monkeypatch, *, rollback: bool = False):
         "release_bom_sha256": "c6" * 32,
         "release_bom": {
             "host_runtime": {"canonical_final": host},
+            "feishu_completion": {
+                "terminal_cross_contract_pass": _diagnostic_report_descriptor()
+            },
             "component_identities": {
                 "evidence_path": str(tmp_path / "component.json"),
                 "evidence_sha256": "c7" * 32,

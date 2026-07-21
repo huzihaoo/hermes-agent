@@ -69,7 +69,7 @@ BYTE_RANGE_RE = re.compile(r"bytes=([0-9]{0,20})-([0-9]{0,20})\\Z")
 def canonical_viewer_origin(value: str):
     return value
 
-def contract(decoded, file_parts, before, self, viewer_origin):
+def contract(decoded, file_parts, before, self, viewer_origin, manifest_report_url, relative_report):
     assert len(decoded.encode("utf-8")) > MAX_PATH_BYTES
     assert len(file_parts) > MAX_FILE_DEPTH
     assert getattr(os, "O_DIRECTORY", 0)
@@ -77,6 +77,8 @@ def contract(decoded, file_parts, before, self, viewer_origin):
     assert not stat.S_ISREG(before.st_mode)
     assert self.headers.get("Range")
     self.send_header("Access-Control-Allow-Origin", viewer_origin)
+    public_origin = canonical_viewer_origin(viewer_origin)
+    assert manifest_report_url != f"{public_origin}/G1Q3_RCA/cases/{relative_report}"
 
 def parse_byte_range(value, size): pass
 
@@ -131,10 +133,13 @@ DELIVERY_MANIFEST_SCHEMA = "delivery_manifest_v2"
 TASK_ARTIFACT_ROOT = Path("/mnt/tmp")
 TASK_ARTIFACT_CIFS_ROOT = "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp"
 FORMAL_REPORT_ROOT = TASK_ARTIFACT_ROOT
+REPORT_VIEWER_ORIGIN_ENV = "G1Q3_RCA_VIEWER_ORIGIN"
+REPORT_VIEWER_ENV_PATH = Path("/home/mini/.config/g1q3-rca/report-http.env")
 def build_report_vm_path(): pass
 def build_report_cifs_path(): pass
+def configured_publication_origin(): pass
 def build_report_url():
-    return f"http://{FORMAL_REPORT_HOST}:{FORMAL_REPORT_PORT}/G1Q3_RCA/cases/"
+    return f"{configured_publication_origin()}/G1Q3_RCA/cases/"
 def contract(submission_key, parent, artifact_set_id):
     expected_root = Path("/mnt/tmp") / submission_key
     expected_artifact_root = TASK_ARTIFACT_ROOT / submission_key
@@ -341,6 +346,7 @@ def test_audit_records_exact_task_output_and_zero_cache_seal(tmp_path: Path):
     assert remote_file["single_byte_range"] is True
     assert remote_file["suffix_byte_range"] is True
     assert remote_file["viewer_same_origin_https_proxy_required"] is True
+    assert remote_file["manifest_html_same_origin_https_proxy_required"] is True
     assert remote_file["viewer_proxy_live_observed"] is False
     assert remote_file["release_blocked_until_viewer_proxy_proven"] is True
     delivery = result["delivery_manifest_contract"]
@@ -349,6 +355,10 @@ def test_audit_records_exact_task_output_and_zero_cache_seal(tmp_path: Path):
     assert delivery["perception_test_team_output"] is False
     assert delivery["report_vm_path_pattern"] == (
         "/mnt/tmp/<submission_key>/<artifact_set_id>/index.html"
+    )
+    assert delivery["report_url_pattern"] == (
+        "<canonical_https_dns_origin>/G1Q3_RCA/cases/"
+        "<submission_key>/<artifact_set_id>/index.html"
     )
 
 

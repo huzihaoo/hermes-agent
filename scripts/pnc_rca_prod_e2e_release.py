@@ -45,11 +45,11 @@ CANDIDATE_OBSERVATION_SCHEMA_VERSION = (
 GAP_LEDGER_SCHEMA_VERSION = "pnc_rca_pre_t0_accepted_gap_ledger_v1"
 FIELD_PREREAD_SCHEMA_VERSION = "pnc_rca_official_meegle_field_preread_v1"
 INPUT_PREREAD_SCHEMA_VERSION = "pnc_rca_issue_input_preread_v1"
-CLOSURE_AUDIT_SCHEMA_VERSION = "pnc_rca_fixed_cli_mcap_closure_audit_v4"
-CROSS_CONTRACT_PASS_SCHEMA_VERSION = "pnc_rca_terminal_cross_contract_pass_v4"
+CLOSURE_AUDIT_SCHEMA_VERSION = "pnc_rca_fixed_cli_mcap_closure_audit_v5"
+CROSS_CONTRACT_PASS_SCHEMA_VERSION = "pnc_rca_terminal_cross_contract_pass_v5"
 COMPONENT_BINDING_SCHEMA_VERSION = "pnc_rca_prod_component_binding_v4"
 VIEWER_PROXY_CANDIDATE_SCHEMA_VERSION = (
-    "pnc_rca_viewer_proxy_candidate_binding_v1"
+    "pnc_rca_viewer_proxy_candidate_binding_v2"
 )
 DB_CUTOVER_BINDING_SCHEMA_VERSION = "pnc_rca_delivery_store_cutover_binding_v1"
 EXECUTION_PREFLIGHT_SCHEMA_VERSION = "pnc_rca_execution_preflight_v5"
@@ -58,8 +58,8 @@ APPROVAL_DECISION = "authorize_exact_rca_prod_e2e_release"
 RELEASE_APPROVAL_IDENTITY_SCHEMA_VERSION = "pnc_rca_release_approval_identity_v1"
 RELEASE_APPROVAL_IDENTITY_METHOD = "kernel_owner_and_machine_binding"
 
-PIPELINE_COMMIT = "4b26cc7935eb4fa0910b42abde78d7f8d4efa0d1"
-PIPELINE_TREE = "9d45fb1357c7ab054c16c898941e342b9a50d391"
+PIPELINE_COMMIT = "00599fa5cd8718df3c31cd177f606a9e32b2419b"
+PIPELINE_TREE = "27cb14f0cef85de51e32dca5da572ca318ebcb91"
 PIPELINE_ENTRYPOINT = "api/g1q3_rca/scripts/run_rca_service_request.py"
 PIPELINE_ENTRYPOINT_SHA256 = (
     "1c74abb1781b6b147787879747e84c22aaaa01fdf0507790cb104b33f5773982"
@@ -70,34 +70,33 @@ PIPELINE_SOURCE_ROOT = (
 )
 PIPELINE_CANDIDATE_AUDIT_VM_PATH = (
     "/home/mini/.hermes/rca-prod-runtime/audits/"
-    "4b26cc7935eb4fa0910b42abde78d7f8d4efa0d1/independent-go-receipt.json"
+    "00599fa5cd8718df3c31cd177f606a9e32b2419b/independent-go-receipt.json"
 )
 PIPELINE_CANDIDATE_AUDIT_CIFS_PATH = (
     "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/"
-    "019f8243-88a6-7b42-a0b3-abbfd5427767/vm_candidate_audit/"
-    "independent-4b26cc79/receipt-go-4b26cc79.json"
+    "g1q3-rca-00599fa-independent-audit-20260722/receipt-go-00599fa5.json"
 )
 PIPELINE_CANDIDATE_AUDIT_SHA256 = (
-    "0765e0adfb3e74abe6a1daaea626901003b9b0cb94223a0b401d626d1a48d1bf"
+    "6dd776db67ff8a0859e050a433a613c3ff1fe17a547a56326ca523b9cdfb405a"
 )
 PIPELINE_CLOSURE_CORE_SHA256 = (
-    "6e8bc92415624af37ebdbebb9562e6051cc8c5d094516796ce26f582635cd710"
+    "85d2211188a98a637e266fcb3623efdc0c5837cdd6b2e96ef3ea006217d37b08"
 )
 PIPELINE_CLOSURE_FILE_SHA256 = (
-    "d56e6432d4275adc80f5a2a0a2d8f4646b12ce255d5b293ff3005391d04d0509"
+    "2a10e84f97ce20f0b1dd46586c7d12659f56626ad55c27e29518f64afd593499"
 )
 PIPELINE_CLOSURE_VM_PATH = (
-    "/mnt/tmp/g1q3-rca-4b26-closure-audit-20260722/"
-    "fixed-cli-mcap-hard-rule-audit-4b26cc79.json"
+    "/mnt/tmp/g1q3-rca-00599fa-closure-audit-20260722/"
+    "fixed-cli-mcap-hard-rule-audit-00599fa5.json"
 )
 PIPELINE_CLOSURE_CIFS_PATH = (
     "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/"
-    "g1q3-rca-4b26-closure-audit-20260722/"
-    "fixed-cli-mcap-hard-rule-audit-4b26cc79.json"
+    "g1q3-rca-00599fa-closure-audit-20260722/"
+    "fixed-cli-mcap-hard-rule-audit-00599fa5.json"
 )
 PIPELINE_CLOSURE_SEALED_MIRROR_PATH = (
     "/Users/songying/.codex/tmp/rca-prod-e2e-release-20260721/evidence/"
-    "fixed-cli-mcap-hard-rule-audit-4b26cc79.json"
+    "fixed-cli-mcap-hard-rule-audit-00599fa5.json"
 )
 DIAGNOSTIC_KAFKA_PREREAD_PATH = (
     "/Users/songying/.codex/tmp/rca-prod-e2e-release-20260721/evidence/"
@@ -129,16 +128,16 @@ SUPERSEDED_CROSS_CONTRACT_GAP_SHA256 = (
 HOST_QUARANTINE_BASELINE_COMMIT = (
     "11b7c06af20fa0c4c09893452d4d617da3d10755"
 )
-HOST_FINAL_COMMIT = "ecc6c747c8abbf1f815d8783511c7f96bf080bba"
-HOST_FINAL_TREE = "7d491dde4046138e93d874acef2c9440521d7dbe"
-HOST_FINAL_PARENT_COMMIT = "b354ac9d19a67eccb2eea9ee1f00b5b44e68605f"
+HOST_FINAL_COMMIT = "92f60f4da5df335b756da6b2e970b7096cc10d45"
+HOST_FINAL_TREE = "05bdbda2923841095e0f11a3e983a487dcd4593a"
+HOST_FINAL_PARENT_COMMIT = "00edede48b9ebdd68d22acd185c79727ee9adeb5"
 CANONICAL_HOST_ROOT = "/Users/songying/.codex/tmp/rca-host-70c432-zero-cache"
 HOST_CANDIDATE_IDENTITY_PATH = (
     "/Users/songying/.codex/tmp/rca-prod-e2e-release-20260721/evidence/"
-    "controlled-gray/host-independent-go-ecc6c747.json"
+    "controlled-gray/host-independent-go-92f60f4d.json"
 )
 HOST_CANDIDATE_IDENTITY_SHA256 = (
-    "862e5a18f58c230e9381ac0a6126edfda2d6f5c2215e92c46198bdbe9375ef26"
+    "82fd1391256e983206ce941d98850718c65e52f6d3bf0afd6a7e90ba88c4bd7b"
 )
 CANONICAL_HOST_PYTHON = (
     "/Users/songying/.hermes/runtime/hermes-live/.venv/bin/python"
@@ -170,21 +169,24 @@ ADMISSION_HMAC_ENV = "HERMES_RCA_PROD_ADMISSION_HMAC_KEY"
 VIEWER_ORIGIN_ENV = "PNC_FOXGLOVE_RENDER_HOST"
 VIEWER_EXPECTED_ADDRESS = "192.168.21.217"
 VIEWER_PROXY_ROUTE_PREFIX = "/g1q3-rca-artifacts/v1/"
+VIEWER_REPORT_ROUTE_PREFIX = "/G1Q3_RCA/cases/"
 VIEWER_PROXY_UPSTREAM_ORIGIN = "http://192.168.26.174:18081"
-VIEWER_PROXY_CONFIG_PATH = (
-    "/Users/songying/.codex/tmp/rca-prod-e2e-release-20260721/evidence/"
-    "pathsafe-integration/g1q3-rca-artifacts-proxy-candidate.conf"
+VIEWER_PROXY_CONFIG_RELATIVE = "deploy/nginx/g1q3-rca-publication.conf"
+VIEWER_PROXY_CONFIG_PATH = str(
+    Path(__file__).resolve().parents[1] / VIEWER_PROXY_CONFIG_RELATIVE
 )
 VIEWER_PROXY_CONFIG_SHA256 = (
-    "62b229afaceef49b4d48a15a8cb9e43f7ea2584785ae0ef003496e28f7466fe7"
+    "ba142e7c87f8b30f96449b544df2c7fb3ecb1b9bb9983bf6996fadbb184f40a7"
 )
-VIEWER_PROXY_CONFIG_BYTES = 1100
-VIEWER_PROXY_STATIC_RECEIPT_PATH = (
-    "/Users/songying/.codex/tmp/rca-prod-e2e-release-20260721/evidence/"
-    "pathsafe-integration/g1q3-rca-artifacts-proxy-static-test-v2.json"
+VIEWER_PROXY_CONFIG_BYTES = 2123
+VIEWER_PROXY_STATIC_RECEIPT_RELATIVE = (
+    "deploy/nginx/g1q3-rca-publication-static-test-v3.json"
+)
+VIEWER_PROXY_STATIC_RECEIPT_PATH = str(
+    Path(__file__).resolve().parents[1] / VIEWER_PROXY_STATIC_RECEIPT_RELATIVE
 )
 VIEWER_PROXY_STATIC_RECEIPT_SHA256 = (
-    "653b80a0681389861459fbbbd8b7daffa2ffa5bbc2a4a6c3759f2ba8c1c085fe"
+    "2e18deb33f1726cb6e4541b38009ae0a945a9062f729b7016f039e88d9893a2c"
 )
 VIEWER_PROXY_ROLLBACK_BASELINE_PATH = (
     "/Users/songying/.codex/tmp/rca-prod-e2e-release-20260721/evidence/"
@@ -193,7 +195,7 @@ VIEWER_PROXY_ROLLBACK_BASELINE_PATH = (
 VIEWER_PROXY_ROLLBACK_BASELINE_SHA256 = (
     "21948eb8611dfa2171952b13178a8c76bd77060280b6a1f4c94db07257bae9b7"
 )
-VIEWER_PROXY_LIVE_SCHEMA_VERSION = "pnc_rca_viewer_proxy_live_observation_v1"
+VIEWER_PROXY_LIVE_SCHEMA_VERSION = "pnc_rca_viewer_proxy_live_observation_v2"
 VIEWER_DIAGNOSTIC_SHA256 = (
     "fb72eb58b4360e56f34bc04031b1fa96a17f5b60022bfcf4cd8056e33bc0bc46"
 )
@@ -223,7 +225,7 @@ VM_REPORT_UNIT = "g1q3-rca-report-http.service"
 VM_SERVICE_UNITS = (VM_DAEMON_UNIT, VM_REPORT_UNIT)
 VM_REPORT_ENTRYPOINT_RELATIVE = "api/g1q3_rca/scripts/serve_rca_reports.py"
 VM_REPORT_ENTRYPOINT_SHA256 = (
-    "545e8e076a81e9e273363a297ec7d9711ba6d7e490513dbc57540a4ad0c5b4e7"
+    "cea854467fd3225c13ba55160af44ce176a03c3fb927817d680e4eb699cb6f78"
 )
 VM_REPORT_UNIT_RELATIVE = "api/g1q3_rca/systemd/g1q3-rca-report-http.service"
 VM_REPORT_UNIT_SHA256 = (
@@ -347,6 +349,7 @@ APPROVAL_NONCE_LEDGER_ROOT = Path(
     "approval-nonce-ledger"
 )
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+ARTIFACT_SET_RE = re.compile(r"g1q3-rca-artifact-v1-[0-9a-f]{64}\Z")
 RELEASE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{7,127}\Z")
 NONCE_RE = re.compile(r"[A-Za-z0-9_-]{16,128}\Z")
 GIT_OID_RE = re.compile(r"[0-9a-f]{40}\Z")
@@ -1063,6 +1066,11 @@ def _validate_host_candidate_identity() -> Mapping[str, Any]:
     verification = body.get("verification")
     focused = verification.get("focused_suite") if isinstance(verification, Mapping) else None
     checks = verification.get("code_checks") if isinstance(verification, Mapping) else None
+    publication = (
+        verification.get("publication_origin_suite")
+        if isinstance(verification, Mapping)
+        else None
+    )
     reproductions = (
         verification.get("blocker_reproductions")
         if isinstance(verification, Mapping)
@@ -1082,7 +1090,7 @@ def _validate_host_candidate_identity() -> Mapping[str, Any]:
     if (
         owned.sha256 != HOST_CANDIDATE_IDENTITY_SHA256
         or body.get("schema_version")
-        != "pnc_rca_host_controlled_gray_independent_audit_v1"
+        != "pnc_rca_host_controlled_gray_independent_audit_v2"
         or body.get("scope") != "controlled-gray BOM binding only"
         or body.get("verdict") != "GO"
         or body.get("release_recommendation")
@@ -1104,6 +1112,18 @@ def _validate_host_candidate_identity() -> Mapping[str, Any]:
         or focused.get("passed", 0) < 171
         or not isinstance(checks, Mapping)
         or checks != {"diff_check": "PASS", "ruff": "PASS"}
+        or publication
+        != {
+            "command": (
+                "pytest -q -p no:cacheprovider "
+                "tests/scripts/test_pnc_foxglove_delivery.py"
+            ),
+            "passed": 10,
+            "result": "PASS",
+            "canonical_https_dns_only": True,
+            "ip_literal_rejected": True,
+            "explicit_port_rejected": True,
+        }
         or not isinstance(reproductions, Mapping)
         or set(reproductions)
         != {
@@ -3601,6 +3621,16 @@ def _validate_cross_contract_pass(
     bindings = body.get("bindings")
     updates = delivery.get("field_updates") if isinstance(delivery, Mapping) else None
     report_url = str(delivery.get("report_url") or "") if isinstance(delivery, Mapping) else ""
+    report_artifact_set_id = (
+        str(vm_bundle.get("diagnostic_artifact_set_id") or "")
+        if isinstance(vm_bundle, Mapping)
+        else ""
+    )
+    expected_report_url = (
+        f"{components['viewer_proxy']['public_origin']}"
+        f"{VIEWER_REPORT_ROUTE_PREFIX}{TARGET_SUBMISSION_KEY}/"
+        f"{report_artifact_set_id}/index.html"
+    )
     expected_bindings = {
         "component_binding_sha256": components["sha256"],
         "host_commit": components["host"]["commit"],
@@ -3645,10 +3675,8 @@ def _validate_cross_contract_pass(
         or delivery.get("issue_url")
         != TARGET_ISSUE_URL
         or delivery.get("report_link_kind") != "manifest_html"
-        or not report_url.startswith(
-            f"{VIEWER_PROXY_UPSTREAM_ORIGIN}{VM_REPORT_ROUTE_PREFIX}"
-        )
-        or not report_url.endswith("/index.html")
+        or ARTIFACT_SET_RE.fullmatch(report_artifact_set_id) is None
+        or report_url != expected_report_url
         or not isinstance(updates, list)
         or len(updates) != 2
         or [item.get("field_key") for item in updates if isinstance(item, Mapping)]
@@ -3674,6 +3702,13 @@ def _validate_cross_contract_pass(
             str(vm_bundle.get("diagnostic_viz_sha256") or "")
         )
         is None
+        or SHA256_RE.fullmatch(
+            str(vm_bundle.get("diagnostic_report_sha256") or "")
+        )
+        is None
+        or not isinstance(vm_bundle.get("diagnostic_report_bytes"), int)
+        or isinstance(vm_bundle.get("diagnostic_report_bytes"), bool)
+        or not 1 <= vm_bundle.get("diagnostic_report_bytes", 0) <= 32 * 1024 * 1024
         or not isinstance(supersedes, Mapping)
         or supersedes.get("verdict") != "gap"
         or supersedes.get("sha256") != SUPERSEDED_CROSS_CONTRACT_GAP_SHA256
@@ -3689,6 +3724,10 @@ def _validate_cross_contract_pass(
         "vm_tree": PIPELINE_TREE,
         "vm_bundle_sha256": str(vm_bundle["sha256"]),
         "diagnostic_viz_sha256": str(vm_bundle["diagnostic_viz_sha256"]),
+        "diagnostic_report_sha256": str(vm_bundle["diagnostic_report_sha256"]),
+        "diagnostic_report_bytes": int(vm_bundle["diagnostic_report_bytes"]),
+        "diagnostic_artifact_set_id": report_artifact_set_id,
+        "report_url": report_url,
         "field_keys": ["field_9193cb", "field_8c912e"],
         "structural_contract": {
             "project_key": TARGET_PROJECT_KEY,
@@ -3722,55 +3761,82 @@ def _certificate_dns_name_matches(hostname: str, san_dns_name: str) -> bool:
 
 
 def _validate_viewer_proxy_static_evidence() -> Mapping[str, Any]:
-    config_path = Path(VIEWER_PROXY_CONFIG_PATH)
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    def read_repo_artifact(path: Path, *, maximum: int, artifact: str) -> bytes:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        try:
+            descriptor = os.open(path, flags | os.O_NOFOLLOW)
+            try:
+                before = os.fstat(descriptor)
+                raw = os.read(descriptor, maximum + 1)
+                after = os.fstat(descriptor)
+                lexical = os.lstat(path)
+            finally:
+                os.close(descriptor)
+        except OSError as exc:
+            raise ProdE2EReleaseError(
+                f"prod_e2e_release_{artifact}_unavailable"
+            ) from exc
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_IMODE(before.st_mode) != 0o644
+            or before.st_uid != os.geteuid()
+            or before.st_nlink != 1
+            or stat.S_ISLNK(lexical.st_mode)
+            or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            or (after.st_dev, after.st_ino) != (lexical.st_dev, lexical.st_ino)
+            or len(raw) > maximum
+        ):
+            raise ProdE2EReleaseError(f"prod_e2e_release_{artifact}_invalid")
+        return raw
+
     if not hasattr(os, "O_NOFOLLOW"):
         raise ProdE2EReleaseError(
             "prod_e2e_release_viewer_proxy_config_no_follow_unavailable"
         )
-    try:
-        descriptor = os.open(config_path, flags | os.O_NOFOLLOW)
-        try:
-            before = os.fstat(descriptor)
-            raw = os.read(descriptor, VIEWER_PROXY_CONFIG_BYTES + 1)
-            after = os.fstat(descriptor)
-            lexical = os.lstat(config_path)
-        finally:
-            os.close(descriptor)
-    except OSError as exc:
-        raise ProdE2EReleaseError(
-            "prod_e2e_release_viewer_proxy_config_unavailable"
-        ) from exc
+    config_path = Path(VIEWER_PROXY_CONFIG_PATH)
+    raw = read_repo_artifact(
+        config_path,
+        maximum=VIEWER_PROXY_CONFIG_BYTES,
+        artifact="viewer_proxy_config",
+    )
     if (
-        not stat.S_ISREG(before.st_mode)
-        or stat.S_IMODE(before.st_mode) != 0o644
-        or before.st_uid != os.geteuid()
-        or before.st_nlink != 1
-        or stat.S_ISLNK(lexical.st_mode)
-        or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-        != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-        or (after.st_dev, after.st_ino) != (lexical.st_dev, lexical.st_ino)
-        or len(raw) != VIEWER_PROXY_CONFIG_BYTES
+        len(raw) != VIEWER_PROXY_CONFIG_BYTES
         or hashlib.sha256(raw).hexdigest() != VIEWER_PROXY_CONFIG_SHA256
     ):
         raise ProdE2EReleaseError(
             "prod_e2e_release_viewer_proxy_config_invalid"
         )
 
-    static = _read_owned_json(
-        Path(VIEWER_PROXY_STATIC_RECEIPT_PATH),
+    static_path = Path(VIEWER_PROXY_STATIC_RECEIPT_PATH)
+    static_raw = read_repo_artifact(
+        static_path,
+        maximum=MAX_JSON_BYTES,
         artifact="viewer_proxy_static_receipt",
+    )
+    static = OwnedJson(
+        static_path.absolute(),
+        static_raw,
+        _strict_json(static_raw, artifact="viewer_proxy_static_receipt"),
     )
     body = static.body
     scope = body.get("scope")
     config = body.get("config")
-    route = body.get("route")
+    test = body.get("test")
+    routes = body.get("routes")
     checks = body.get("checks")
     method_matrix = body.get("method_matrix")
+    expected_methods = ["GET", "HEAD", "OPTIONS"]
+    expected_route = {
+        "allowed_methods": expected_methods,
+        "directory_listing": False,
+        "sealed_manifest_revalidation": True,
+        "upstream": VIEWER_PROXY_UPSTREAM_ORIGIN,
+    }
     if (
         static.sha256 != VIEWER_PROXY_STATIC_RECEIPT_SHA256
         or body.get("schema_version")
-        != "g1q3_rca_nginx_proxy_static_test_v2"
+        != "g1q3_rca_nginx_proxy_static_test_v3"
         or body.get("ok") is not True
         or not isinstance(scope, Mapping)
         or scope
@@ -3785,18 +3851,48 @@ def _validate_viewer_proxy_static_evidence() -> Mapping[str, Any]:
         or config
         != {
             "bytes": VIEWER_PROXY_CONFIG_BYTES,
-            "path": VIEWER_PROXY_CONFIG_PATH,
+            "relative_path": VIEWER_PROXY_CONFIG_RELATIVE,
             "sha256": VIEWER_PROXY_CONFIG_SHA256,
         }
-        or not isinstance(route, Mapping)
-        or route.get("allowed_methods") != ["GET", "HEAD", "OPTIONS"]
-        or route.get("directory_listing") is not False
-        or route.get("public_prefix") != "/g1q3-rca-artifacts/"
-        or route.get("upstream") != VIEWER_PROXY_UPSTREAM_ORIGIN
-        or route.get("passes_range") is not True
-        or route.get("passes_if_range") is not True
+        or not isinstance(test, Mapping)
+        or test.get("relative_path")
+        != "tests/scripts/test_pnc_rca_viewer_proxy_config.py"
+        or _sha256(test.get("sha256"), field="viewer_proxy_static_test_sha256")
+        != test.get("sha256")
+        or not isinstance(test.get("bytes"), int)
+        or isinstance(test.get("bytes"), bool)
+        or test.get("bytes", 0) < 1
+        or not isinstance(routes, Mapping)
+        or set(routes) != {"manifest_html", "viz_mcap"}
+        or routes.get("manifest_html")
+        != {
+            **expected_route,
+            "public_prefix": VIEWER_REPORT_ROUTE_PREFIX,
+        }
+        or routes.get("viz_mcap")
+        != {
+            **expected_route,
+            "public_prefix": VIEWER_PROXY_ROUTE_PREFIX,
+            "passes_range": True,
+            "passes_if_range": True,
+        }
         or not isinstance(checks, Mapping)
-        or len(checks) < 25
+        or set(checks)
+        != {
+            "accept_encoding_disabled",
+            "autoindex_disabled",
+            "buffering_disabled",
+            "guards_accept_exact_html_and_viz_paths",
+            "guards_reject_directories_queries_traversal_and_identity_drift",
+            "methods_exact",
+            "no_rewrite_alias_or_root",
+            "origin_forwarded",
+            "range_headers_forwarded",
+            "request_body_disabled",
+            "two_exact_prefix_locations",
+            "upstream_fixed",
+            "upstream_status_preserved",
+        }
         or any(value is not True for value in checks.values())
         or method_matrix
         != {
@@ -3813,6 +3909,19 @@ def _validate_viewer_proxy_static_evidence() -> Mapping[str, Any]:
     ):
         raise ProdE2EReleaseError(
             "prod_e2e_release_viewer_proxy_static_receipt_invalid"
+        )
+    test_path = Path(__file__).resolve().parents[1] / str(test["relative_path"])
+    test_raw = read_repo_artifact(
+        test_path,
+        maximum=int(test["bytes"]),
+        artifact="viewer_proxy_static_test",
+    )
+    if (
+        len(test_raw) != test["bytes"]
+        or hashlib.sha256(test_raw).hexdigest() != test["sha256"]
+    ):
+        raise ProdE2EReleaseError(
+            "prod_e2e_release_viewer_proxy_static_test_invalid"
         )
     return {
         "config": {
@@ -3839,7 +3948,7 @@ def _validate_viewer_proxy_candidate(
         "observed_at",
         "public_origin",
         "expected_viewer_address",
-        "route_prefix",
+        "route_prefixes",
         "upstream_origin",
         "config",
         "static_validation",
@@ -4053,7 +4162,11 @@ def _validate_viewer_proxy_candidate(
         value.get("schema_version") != VIEWER_PROXY_CANDIDATE_SCHEMA_VERSION
         or public_origin != expected_origin
         or value.get("expected_viewer_address") != VIEWER_EXPECTED_ADDRESS
-        or value.get("route_prefix") != VIEWER_PROXY_ROUTE_PREFIX
+        or value.get("route_prefixes")
+        != {
+            "manifest_html": VIEWER_REPORT_ROUTE_PREFIX,
+            "viz_mcap": VIEWER_PROXY_ROUTE_PREFIX,
+        }
         or value.get("upstream_origin") != VIEWER_PROXY_UPSTREAM_ORIGIN
         or value.get("config") != static["config"]
         or value.get("static_validation") != static["static_validation"]
@@ -4083,6 +4196,7 @@ def _validate_viewer_proxy_live_observation(
     reference: Any,
     *,
     candidate: Mapping[str, Any],
+    expected_report: Mapping[str, Any],
     report_service: Mapping[str, Any],
     report_restart: Mapping[str, Any],
     earliest_observed_at: datetime,
@@ -4113,6 +4227,7 @@ def _validate_viewer_proxy_live_observation(
         "nginx_live",
         "upstream",
         "http_contract",
+        "report_contract",
         "browser",
         "production_mutation",
     }
@@ -4200,7 +4315,7 @@ def _validate_viewer_proxy_live_observation(
         != nginx.get("effective_config_sha256")
         or nginx.get("effective_config_sha256")
         == prestate.get("effective_config_sha256")
-        or nginx.get("effective_location_count") != 1
+        or nginx.get("effective_location_count") != 2
         or nginx.get("reload_performed") is not True
         or reloaded_at < earliest_observed_at
         or reloaded_at > observed_at
@@ -4217,7 +4332,7 @@ def _validate_viewer_proxy_live_observation(
         "report_entrypoint_sha256",
         "report_unit_config_sha256",
         "report_main_pid",
-        "legacy_html_health_passed",
+        "public_manifest_html_health_passed",
         "exact_artifact_contract_passed",
     }
     if (
@@ -4231,7 +4346,7 @@ def _validate_viewer_proxy_live_observation(
         or upstream.get("report_unit_config_sha256")
         != report_service.get("candidate_unit_sha256")
         or upstream.get("report_main_pid") != report_restart.get("new_pid")
-        or upstream.get("legacy_html_health_passed") is not True
+        or upstream.get("public_manifest_html_health_passed") is not True
         or upstream.get("exact_artifact_contract_passed") is not True
     ):
         raise ProdE2EReleaseError(
@@ -4387,6 +4502,105 @@ def _validate_viewer_proxy_live_observation(
             "prod_e2e_release_viewer_proxy_http_contract_invalid"
         )
 
+    report_url = str(expected_report.get("report_url") or "")
+    report_sha256 = str(expected_report.get("diagnostic_report_sha256") or "")
+    report_bytes = expected_report.get("diagnostic_report_bytes")
+    report_artifact_set_id = str(
+        expected_report.get("diagnostic_artifact_set_id") or ""
+    )
+    expected_report_url = (
+        f"{origin}{VIEWER_REPORT_ROUTE_PREFIX}{TARGET_SUBMISSION_KEY}/"
+        f"{report_artifact_set_id}/index.html"
+    )
+    report_contract = body.get("report_contract")
+    expected_report_fields = {
+        "report_url",
+        "submission_key",
+        "artifact_set_id",
+        "report_sha256",
+        "report_bytes",
+        "head",
+        "get",
+        "rejected_paths",
+        "rejected_methods",
+        "server_header_absent",
+    }
+    report_response_fields = {
+        "method",
+        "status",
+        "body_bytes",
+        "body_sha256",
+        "content_length",
+        "content_type",
+        "accept_ranges",
+        "cors_allow_origin",
+    }
+    if not isinstance(report_contract, Mapping) or set(report_contract) != expected_report_fields:
+        raise ProdE2EReleaseError(
+            "prod_e2e_release_viewer_proxy_report_contract_invalid"
+        )
+    report_head = report_contract.get("head")
+    report_get = report_contract.get("get")
+    if (
+        report_url != expected_report_url
+        or _sha256(report_sha256, field="viewer_report_sha256") != report_sha256
+        or not isinstance(report_bytes, int)
+        or isinstance(report_bytes, bool)
+        or not 1 <= report_bytes <= 32 * 1024 * 1024
+        or report_contract.get("report_url") != report_url
+        or report_contract.get("submission_key") != TARGET_SUBMISSION_KEY
+        or report_contract.get("artifact_set_id") != report_artifact_set_id
+        or report_contract.get("report_sha256") != report_sha256
+        or report_contract.get("report_bytes") != report_bytes
+        or not isinstance(report_head, Mapping)
+        or set(report_head) != report_response_fields
+        or dict(report_head)
+        != {
+            "method": "HEAD",
+            "status": 200,
+            "body_bytes": 0,
+            "body_sha256": EMPTY_SHA256,
+            "content_length": report_bytes,
+            "content_type": "text/html; charset=utf-8",
+            "accept_ranges": "bytes",
+            "cors_allow_origin": origin,
+        }
+        or not isinstance(report_get, Mapping)
+        or set(report_get) != report_response_fields
+        or dict(report_get)
+        != {
+            "method": "GET",
+            "status": 200,
+            "body_bytes": report_bytes,
+            "body_sha256": report_sha256,
+            "content_length": report_bytes,
+            "content_type": "text/html; charset=utf-8",
+            "accept_ranges": "bytes",
+            "cors_allow_origin": origin,
+        }
+        or report_contract.get("rejected_paths")
+        != {
+            "directory": 404,
+            "traversal": 404,
+            "encoded_separator": 404,
+            "query_string": 404,
+            "wrong_artifact_set": 404,
+        }
+        or report_contract.get("rejected_methods")
+        != {
+            "CONNECT": 403,
+            "DELETE": 403,
+            "PATCH": 403,
+            "POST": 403,
+            "PUT": 403,
+            "TRACE": 403,
+        }
+        or report_contract.get("server_header_absent") is not True
+    ):
+        raise ProdE2EReleaseError(
+            "prod_e2e_release_viewer_proxy_report_contract_invalid"
+        )
+
     browser = body.get("browser")
     viewer_url = f"{origin}/?ds=remote-file&ds.url={quote(artifact_url, safe='')}"
     expected_browser_fields = {
@@ -4459,6 +4673,7 @@ def _validate_viewer_proxy_live_observation(
         "observed_at": observed_at.isoformat(),
         "public_origin": origin,
         "artifact_url": artifact_url,
+        "report_url": report_url,
         "viewer_url": viewer_url,
         "reloaded_at": reloaded_at.isoformat(),
         "nginx_effective_config_sha256": nginx["effective_config_sha256"],
@@ -9663,6 +9878,9 @@ def _validate_completion_receipt(
     viewer_proxy_live = _validate_viewer_proxy_live_observation(
         body.get("viewer_proxy_closeout"),
         candidate=component_descriptor["viewer_proxy"],
+        expected_report=request["release_bom"]["feishu_completion"][
+            "terminal_cross_contract_pass"
+        ],
         report_service=component_descriptor["pipeline"]["report_service"],
         report_restart=vm_restarts[VM_REPORT_UNIT],
         earliest_observed_at=cutover_time_by_field["services_restarted_at"],
@@ -10586,9 +10804,13 @@ def _build_bom(
             "remote_reader_contract_reachable": True,
             "artifact_transport": {
                 "mode": "manifest_bound_path_safe_proxy_only",
-                "public_route_pattern": (
+                "viz_public_route_pattern": (
                     "/g1q3-rca-artifacts/v1/"
                     "<submission_key>/<same_submission_key>.viz.mcap"
+                ),
+                "html_public_route_pattern": (
+                    "/G1Q3_RCA/cases/<submission_key>/"
+                    "<artifact_set_id>/<manifest_bound_asset>"
                 ),
                 "same_submission_directory_and_filename_required": True,
                 "delivery_manifest_binding_required": True,
@@ -11397,12 +11619,13 @@ def build_blocker_bom(*, now: datetime, verified_test_count: int) -> Mapping[str
                 "vm_path": PIPELINE_CANDIDATE_AUDIT_VM_PATH,
                 "cifs_path": PIPELINE_CANDIDATE_AUDIT_CIFS_PATH,
                 "sha256": PIPELINE_CANDIDATE_AUDIT_SHA256,
-                "schema_version": "g1q3_rca_vm_candidate_independent_audit_v2",
+                "schema_version": "g1q3_rca_vm_candidate_independent_audit_v3",
                 "verdict": "GO",
                 "deployment_authorization": False,
-                "focused_tests_passed": 139,
-                "symlink_environment_skips": 4,
-                "posix_symlink_negative_coverage": True,
+                "focused_tests_passed": 149,
+                "filesystem_environment_skips": 1,
+                "owner_only_ext4_probe": True,
+                "inherited_posix_symlink_negative_coverage": True,
             },
             "fixed_cli_closure": {
                 **closure,
@@ -11416,7 +11639,10 @@ def build_blocker_bom(*, now: datetime, verified_test_count: int) -> Mapping[str
         "viewer_proxy_candidate": {
             **proxy_static,
             "expected_viewer_address": VIEWER_EXPECTED_ADDRESS,
-            "route_prefix": VIEWER_PROXY_ROUTE_PREFIX,
+            "route_prefixes": {
+                "manifest_html": VIEWER_REPORT_ROUTE_PREFIX,
+                "viz_mcap": VIEWER_PROXY_ROUTE_PREFIX,
+            },
             "upstream_origin": VIEWER_PROXY_UPSTREAM_ORIGIN,
             "public_dns_origin": None,
             "live_observation_receipt": None,
@@ -11430,9 +11656,9 @@ def build_blocker_bom(*, now: datetime, verified_test_count: int) -> Mapping[str
                     "viewer-proxy-maintainer-request.md"
                 ),
                 "sha256": (
-                    "e1d361392c5a6e99fc2fd7af65f84580e036e3267ceac168a628a01df1b7de94"
+                    "26c3b98060e07101b94204211184058a9d4e26ab6b0403a862bd3463626106a1"
                 ),
-                "binds_final_vm_4b26cc79": True,
+                "binds_final_vm_00599fa5": True,
             },
         },
         "target_recovery": {
@@ -11501,7 +11727,7 @@ def build_blocker_bom(*, now: datetime, verified_test_count: int) -> Mapping[str
                     "51d8769e765f5750cbdbf4f02b1258086652ae917aad9a8be1468aba0997264e"
                 ),
                 "classification": "immutable_ancestor_reference_only",
-                "authorizes_final_4b26cc79": False,
+                "authorizes_final_00599fa5": False,
             },
             "cross_contract_receipt_sha256": CROSS_CONTRACT_PASS_FILE_SHA256,
             "cross_contract_authorizes_final_candidates": False,
@@ -11520,7 +11746,7 @@ def build_blocker_bom(*, now: datetime, verified_test_count: int) -> Mapping[str
             },
         },
         "required_fresh_artifacts": [
-            "final_ecc6c747_4b26cc79_manifest_html_cross_contract_receipt",
+            "final_92f60f4d_00599fa5_manifest_html_cross_contract_receipt",
             "fresh_component_binding_with_exact_dns_tls_and_vm_env_identity",
             "fresh_live_kafka_p0_o650_preread_receipt",
             "fresh_viewer_proxy_live_http_tls_browser_receipt",

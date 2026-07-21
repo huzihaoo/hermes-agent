@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 
-SCHEMA_VERSION = "pnc_rca_fixed_cli_mcap_closure_audit_v4"
+SCHEMA_VERSION = "pnc_rca_fixed_cli_mcap_closure_audit_v5"
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
 MAX_MODULES = 512
 MAX_FILESYSTEM_ENTRIES = 200_000
@@ -349,6 +349,8 @@ def _report_service_binding(
         "def list_directory(self, _path: str)",
         'self.headers.get("Range")',
         "def canonical_viewer_origin(value: str)",
+        "public_origin = canonical_viewer_origin(viewer_origin)",
+        '!= f"{public_origin}/G1Q3_RCA/cases/{relative_report}"',
         'self.send_header("Access-Control-Allow-Origin", viewer_origin)',
         "class BoundedHTTPServer(HTTPServer)",
         "ThreadPoolExecutor(",
@@ -445,12 +447,17 @@ def _remote_file_transport_binding(
         "<canonical_https_dns_origin>/g1q3-rca-artifacts/v1/"
         "<submission_key>/<submission_key>.viz.mcap"
     )
+    report_https_pattern = (
+        "<canonical_https_dns_origin>/G1Q3_RCA/cases/"
+        "<submission_key>/<artifact_set_id>/<manifest_bound_asset>"
+    )
     return {
         "source_id": "remote-file",
         "viewer_query_parameter": "ds.url",
         "vm_route_prefix": REMOTE_FILE_ROUTE_PREFIX,
         "vm_http_url_pattern": vm_pattern,
         "public_https_url_pattern": https_pattern,
+        "public_manifest_html_url_pattern": report_https_pattern,
         "viewer_origin": "runtime_environment:G1Q3_RCA_VIEWER_ORIGIN",
         "viewer_url_contract": (
             "<canonical_https_dns_origin>/?ds=remote-file&ds.url="
@@ -467,6 +474,7 @@ def _remote_file_transport_binding(
         "regular_file_only": True,
         "symlink_escape": False,
         "viewer_same_origin_https_proxy_required": True,
+        "manifest_html_same_origin_https_proxy_required": True,
         "viewer_proxy_live_observed": False,
         "direct_http_browser_viable": False,
         "release_blocked_until_viewer_proxy_proven": True,
@@ -495,7 +503,10 @@ def _delivery_manifest_binding(
         "def build_report_vm_path(",
         "def build_report_cifs_path(",
         "def build_report_url(",
-        'f"http://{FORMAL_REPORT_HOST}:{FORMAL_REPORT_PORT}/G1Q3_RCA/cases/"',
+        'REPORT_VIEWER_ORIGIN_ENV = "G1Q3_RCA_VIEWER_ORIGIN"',
+        'REPORT_VIEWER_ENV_PATH = Path("/home/mini/.config/g1q3-rca/report-http.env")',
+        "def configured_publication_origin(",
+        'f"{configured_publication_origin()}/G1Q3_RCA/cases/"',
         'expected_root = Path("/mnt/tmp") / submission_key',
         "expected_artifact_root = TASK_ARTIFACT_ROOT / submission_key",
         "destination = parent / artifact_set_id",
@@ -525,9 +536,13 @@ def _delivery_manifest_binding(
             "tmp/<submission_key>/<artifact_set_id>/index.html"
         ),
         "report_url_pattern": (
-            "http://192.168.26.174:18081/G1Q3_RCA/cases/"
+            "<canonical_https_dns_origin>/G1Q3_RCA/cases/"
             "<submission_key>/<artifact_set_id>/index.html"
         ),
+        "report_public_origin_sources": [
+            "environment:G1Q3_RCA_VIEWER_ORIGIN",
+            "owner_only_file:/home/mini/.config/g1q3-rca/report-http.env",
+        ],
         "viz_vm_path_pattern": (
             "/mnt/tmp/<submission_key>/<submission_key>.viz.mcap"
         ),

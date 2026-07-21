@@ -1,0 +1,74 @@
+{
+  "checks": {
+    "accept_encoding_disabled": true,
+    "autoindex_disabled": true,
+    "buffering_disabled": true,
+    "guards_accept_exact_html_and_viz_paths": true,
+    "guards_reject_directories_queries_traversal_and_identity_drift": true,
+    "methods_exact": true,
+    "no_rewrite_alias_or_root": true,
+    "origin_forwarded": true,
+    "range_headers_forwarded": true,
+    "request_body_disabled": true,
+    "two_exact_prefix_locations": true,
+    "upstream_fixed": true,
+    "upstream_status_preserved": true
+  },
+  "config": {
+    "bytes": 2123,
+    "relative_path": "deploy/nginx/g1q3-rca-publication.conf",
+    "sha256": "ba142e7c87f8b30f96449b544df2c7fb3ecb1b9bb9983bf6996fadbb184f40a7"
+  },
+  "method_matrix": {
+    "CONNECT": false,
+    "DELETE": false,
+    "GET": true,
+    "HEAD": true,
+    "OPTIONS": true,
+    "PATCH": false,
+    "POST": false,
+    "PUT": false,
+    "TRACE": false
+  },
+  "ok": true,
+  "routes": {
+    "manifest_html": {
+      "allowed_methods": [
+        "GET",
+        "HEAD",
+        "OPTIONS"
+      ],
+      "directory_listing": false,
+      "public_prefix": "/G1Q3_RCA/cases/",
+      "sealed_manifest_revalidation": true,
+      "upstream": "http://192.168.26.174:18081"
+    },
+    "viz_mcap": {
+      "allowed_methods": [
+        "GET",
+        "HEAD",
+        "OPTIONS"
+      ],
+      "directory_listing": false,
+      "passes_if_range": true,
+      "passes_range": true,
+      "public_prefix": "/g1q3-rca-artifacts/v1/",
+      "sealed_manifest_revalidation": true,
+      "upstream": "http://192.168.26.174:18081"
+    }
+  },
+  "schema_version": "g1q3_rca_nginx_proxy_static_test_v3",
+  "scope": {
+    "live_proxy_observed": false,
+    "live_viewer_config_modified": false,
+    "live_viewer_reloaded": false,
+    "nginx_binary_available_locally": false,
+    "nginx_t_executed": false,
+    "static_config_test_only": true
+  },
+  "test": {
+    "bytes": 3181,
+    "relative_path": "tests/scripts/test_pnc_rca_viewer_proxy_config.py",
+    "sha256": "011ed19c7e5cfbf169341498c2bec51b42abaa0ca1ad84e98067660f241b3920"
+  }
+}
