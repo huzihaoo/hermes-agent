@@ -95,6 +95,10 @@ PIPELINE_CLOSURE_CIFS_PATH = (
     "g1q3-rca-4b26-closure-audit-20260722/"
     "fixed-cli-mcap-hard-rule-audit-4b26cc79.json"
 )
+PIPELINE_CLOSURE_SEALED_MIRROR_PATH = (
+    "/Users/songying/.codex/tmp/rca-prod-e2e-release-20260721/evidence/"
+    "fixed-cli-mcap-hard-rule-audit-4b26cc79.json"
+)
 CROSS_CONTRACT_PASS_FILE_SHA256 = (
     "8fa70b458c1676de058902123fe78bb4619d59c82072c1e251fae0f1991b949e"
 )
@@ -10980,6 +10984,12 @@ def build_blocker_bom(*, now: datetime, verified_test_count: int) -> Mapping[str
         expected_commit=HOST_FINAL_COMMIT, expected_tree=HOST_FINAL_TREE
     )
     proxy_static = _validate_viewer_proxy_static_evidence()
+    closure = _validate_closure_audit(
+        _read_owned_json(
+            Path(PIPELINE_CLOSURE_SEALED_MIRROR_PATH),
+            artifact="blocker_bom_closure_audit",
+        )
+    )
     source_path = Path(__file__).resolve()
     test_path = source_path.parents[1] / "tests/scripts/test_pnc_rca_prod_e2e_release.py"
     source_sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()
@@ -11050,6 +11060,12 @@ def build_blocker_bom(*, now: datetime, verified_test_count: int) -> Mapping[str
                 "focused_tests_passed": 139,
                 "symlink_environment_skips": 4,
                 "posix_symlink_negative_coverage": True,
+            },
+            "fixed_cli_closure": {
+                **closure,
+                "schema_version": CLOSURE_AUDIT_SCHEMA_VERSION,
+                "authorizes_final_candidate": True,
+                "production_mutation": False,
             },
             "runtime_installed": False,
             "services_restarted": False,

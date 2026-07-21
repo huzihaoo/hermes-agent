@@ -2887,6 +2887,54 @@ def test_real_zero_cache_host_and_live_dependency_probe_are_read_only_smokes():
     assert dependency["installed_distribution_count"] > 1
 
 
+def test_blocker_bom_exposes_validated_final_closure(monkeypatch):
+    closure = {
+        "path": release.PIPELINE_CLOSURE_SEALED_MIRROR_PATH,
+        "sha256": release.PIPELINE_CLOSURE_FILE_SHA256,
+        "evidence_core_sha256": release.PIPELINE_CLOSURE_CORE_SHA256,
+        "entrypoint": release.PIPELINE_ENTRYPOINT,
+        "reachable_hit_count": 0,
+    }
+    observed_path = None
+
+    def read_owned(path, *, artifact):
+        nonlocal observed_path
+        observed_path = (path, artifact)
+        return object()
+
+    monkeypatch.setattr(
+        release,
+        "_observe_canonical_host_binding",
+        lambda **_kwargs: {
+            "commit": release.HOST_FINAL_COMMIT,
+            "tree": release.HOST_FINAL_TREE,
+            "runtime_allowlists": {},
+            "required_file_sha256": {},
+            "candidate_identity_evidence": {},
+        },
+    )
+    monkeypatch.setattr(
+        release, "_validate_viewer_proxy_static_evidence", lambda: {}
+    )
+    monkeypatch.setattr(release, "_read_owned_json", read_owned)
+    monkeypatch.setattr(
+        release, "_validate_closure_audit", lambda _owned: closure
+    )
+
+    bom = release.build_blocker_bom(now=NOW, verified_test_count=1)
+    bound = bom["vm_candidate"]["fixed_cli_closure"]
+
+    assert observed_path == (
+        Path(release.PIPELINE_CLOSURE_SEALED_MIRROR_PATH),
+        "blocker_bom_closure_audit",
+    )
+    assert bound["sha256"] == release.PIPELINE_CLOSURE_FILE_SHA256
+    assert bound["evidence_core_sha256"] == release.PIPELINE_CLOSURE_CORE_SHA256
+    assert bound["schema_version"] == release.CLOSURE_AUDIT_SCHEMA_VERSION
+    assert bound["authorizes_final_candidate"] is True
+    assert bound["production_mutation"] is False
+
+
 def test_canonical_runtime_bootstrap_is_verified_before_allowlist_probe(
     tmp_path, monkeypatch
 ):
