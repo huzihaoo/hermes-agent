@@ -89,7 +89,6 @@ def test_task_remote_file_requires_explicit_viewer_origin(monkeypatch):
 def test_publication_origin_requires_explicit_https_dns(monkeypatch):
     for origin in (
         "https://viewer.internal",
-        "https://viewer.internal:8443",
     ):
         monkeypatch.setenv("PNC_FOXGLOVE_RENDER_HOST", origin)
         assert canonical_publication_origin() == origin
@@ -99,6 +98,7 @@ def test_publication_origin_requires_explicit_https_dns(monkeypatch):
         "http://viewer.internal",
         "https://192.168.21.217",
         "https://localhost",
+        "https://viewer.internal:8443",
     ):
         monkeypatch.setenv("PNC_FOXGLOVE_RENDER_HOST", origin)
         assert canonical_publication_origin() == ""

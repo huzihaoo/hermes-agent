@@ -165,6 +165,8 @@ def canonical_publication_origin() -> str:
         return ""
     parsed = urlsplit(base)
     hostname = parsed.hostname or ""
+    if parsed.port is not None:
+        return ""
     try:
         ipaddress.ip_address(hostname)
     except ValueError:
