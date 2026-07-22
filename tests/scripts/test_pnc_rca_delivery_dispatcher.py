@@ -2965,6 +2965,37 @@ def test_meegle_combined_readback_never_returns_partial_success():
     assert "fields" not in result
 
 
+def test_meegle_work_item_not_found_is_permanent_but_other_server_errors_retry():
+    missing = dispatcher_module._error_payload(
+        1,
+        json.dumps({
+            "data": None,
+            "error": {
+                "code": "SERVER_CALL_FAILED",
+                "message": "work_item_id not found\nlogid: exact-request-id",
+                "retryable": True,
+            },
+        }),
+        "",
+    )
+    transient = dispatcher_module._error_payload(
+        1,
+        json.dumps({
+            "error": {
+                "code": "SERVER_CALL_FAILED",
+                "message": "upstream unavailable",
+                "retryable": True,
+            },
+        }),
+        "",
+    )
+
+    assert missing["error_code"] == "feishu_work_item_not_found"
+    assert missing["permanent"] is True
+    assert transient["error_code"] == "meegle_call_failed"
+    assert "permanent" not in transient
+
+
 def test_meegle_adapter_allows_terminal_result_only_but_never_report_only():
     calls = []
 

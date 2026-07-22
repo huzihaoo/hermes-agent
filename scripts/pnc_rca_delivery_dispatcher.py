@@ -944,6 +944,8 @@ def _error_payload(rc: int, stdout: str, stderr: str) -> dict[str, Any]:
         retry_after = int(match.group(1)) if match else None
     if rc == 127:
         code = "meegle_dependency_unavailable"
+    elif "work_item_id not found" in lowered:
+        code = "feishu_work_item_not_found"
     elif any(
         token in lowered
         for token in ("unauth", "not logged", "login required", "token expired", "401")
@@ -955,13 +957,16 @@ def _error_payload(rc: int, stdout: str, stderr: str) -> dict[str, Any]:
         code = "feishu_rate_limited"
     else:
         code = "meegle_call_failed"
-    return {
+    result = {
         "success": False,
         "outcome_uncertain": False,
         "error_code": code,
         "error": text[:1000] or f"meegle rc={rc}",
         "retry_after_seconds": retry_after,
     }
+    if code == "feishu_work_item_not_found":
+        result["permanent"] = True
+    return result
 
 
 class MeegleIssueCommentAdapter:
