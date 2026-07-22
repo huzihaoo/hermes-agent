@@ -867,6 +867,27 @@ def test_remote_terminal_marker_matching_accepts_meegle_inserted_spaces():
     assert [item["remote_id"] for item in matches] == ["normalized"]
 
 
+def test_remote_content_matching_accepts_strict_meegle_rendering_only():
+    marker = "[RCA_DELIVERY:effect-key:artifact-key]"
+    url = "https://192.168.21.217/?ds=foxglove-http&ds.mcapPath=/formal.viz.mcap"
+    expected = f"{marker}\nFoxglove 归因报告：{url}\n说明：需人工复核。"
+    rendered = (
+        f"{marker[1:-1]}\n\nFoxglove 归因报告：[{url}]({url})"
+        "\n\n说明：需人工复核。\n"
+    )
+    mismatched = rendered.replace(f"]({url})", "](https://example.invalid/)")
+    comments = [
+        {"remote_id": "rendered", "content": rendered},
+        {"remote_id": "mismatched", "content": mismatched},
+    ]
+
+    matches = dispatcher_module._confirmed_content_matches(
+        comments, marker, expected
+    )
+
+    assert [item["remote_id"] for item in matches] == ["rendered"]
+
+
 def test_field_update_failure_blocks_comment_and_retries(tmp_path):
     store = _seed(tmp_path)
     remote = Remote()

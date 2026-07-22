@@ -2071,7 +2071,7 @@ def _marker_matches(
 
 
 def _canonical_remote_content(content: str, marker: str) -> str | None:
-    lines = content.splitlines()
+    lines = [line for line in content.splitlines() if line != ""]
     if not lines:
         return None
     remote_marker = marker[1:-1] if marker.startswith("[") and marker.endswith("]") else marker
@@ -2082,7 +2082,20 @@ def _canonical_remote_content(content: str, marker: str) -> str | None:
         or first_line.replace(" ", "") == remote_marker
     ):
         lines[0] = marker
-        return "\n".join(lines)
+        normalized: list[str] = []
+        for line in lines:
+            normalized.append(
+                re.sub(
+                    r"\[([^\]\n]+)\]\(([^)\n]+)\)",
+                    lambda match: (
+                        match.group(1)
+                        if match.group(1) == match.group(2)
+                        else match.group(0)
+                    ),
+                    line,
+                )
+            )
+        return "\n".join(normalized)
     return None
 
 
