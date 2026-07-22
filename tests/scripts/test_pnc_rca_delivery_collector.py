@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from pathlib import PurePosixPath
 from types import SimpleNamespace
 
 from scripts import pnc_rca_delivery_collector as collector
+from scripts.pnc_foxglove_delivery import canonical_viz_mcap_path
 
 
 def _config_env(tmp_path) -> dict[str, str]:
@@ -18,6 +20,15 @@ def _config_env(tmp_path) -> dict[str, str]:
         "HERMES_RCA_DELIVERY_COLLECTOR_CAPACITY_SAMPLE_ENABLED": "true",
         "HERMES_RCA_DELIVERY_COLLECTOR_ACTIVATION_REQUIRED": "true",
     }
+
+
+def test_remote_bundle_reader_uses_formal_viz_publication_root():
+    submission_key = "g1q3-rca-s1-" + "a" * 64
+    formal_root = str(PurePosixPath(canonical_viz_mcap_path(submission_key)).parent)
+    script = collector._remote_bundle_script(submission_key)
+
+    assert f"FORMAL_VIZ_ROOT = {formal_root!r}" in script
+    assert "FORMAL_VIZ_ROOT = posixpath.normpath(ROOT)" not in script
 
 
 def test_config_exposes_capacity_sampling_without_restoring_activation_gate(tmp_path):

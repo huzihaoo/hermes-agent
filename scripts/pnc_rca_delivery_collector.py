@@ -76,6 +76,7 @@ from gateway.pnc_rca_runtime_identity import (
     runtime_identity_is_valid,
 )
 from hermes_constants import get_hermes_home
+from scripts.pnc_foxglove_delivery import canonical_viz_mcap_path
 
 
 ENV_PREFIX = "HERMES_RCA_DELIVERY_COLLECTOR_"
@@ -610,6 +611,12 @@ def probe_remote_css_parser(
 
 def _remote_bundle_script(submission_key: str) -> str:
     root = canonical_artifact_root(submission_key)
+    formal_viz_path = canonical_viz_mcap_path(submission_key)
+    if not formal_viz_path:
+        raise ArtifactBundleReadError(
+            "viz_publication_path_invalid", permanent=True
+        )
+    formal_viz_root = str(PurePosixPath(formal_viz_path).parent)
     return textwrap.dedent(
         f"""
         import hashlib
@@ -638,7 +645,7 @@ def _remote_bundle_script(submission_key: str) -> str:
         MAX_TEXT_TOTAL_BYTES = 64 * 1024 * 1024
         CSS_PARSER_DISTRIBUTION = {REMOTE_CSS_PARSER_DISTRIBUTION!r}
         CSS_PARSER_VERSION = {REMOTE_CSS_PARSER_VERSION!r}
-        FORMAL_VIZ_ROOT = posixpath.normpath(ROOT)
+        FORMAL_VIZ_ROOT = {formal_viz_root!r}
 
         def finish(value):
             print(json.dumps(value, ensure_ascii=False, sort_keys=True))
