@@ -690,7 +690,6 @@ def _component_value(component_path: Path) -> dict:
             "cifs_path": release.PIPELINE_CANDIDATE_AUDIT_CIFS_PATH,
             "sha256": release.PIPELINE_CANDIDATE_AUDIT_SHA256,
         },
-        "report_service": _report_service(),
     }
     admission = {
         "mode": "hmac_sha256",
@@ -723,7 +722,6 @@ def _component_value(component_path: Path) -> dict:
         "workspace": workspace,
         "worker": worker,
         "pipeline": pipeline,
-        "viewer_proxy": _viewer_proxy_candidate(),
         "admission_security": admission,
     }
 
@@ -911,11 +909,12 @@ def test_build_request_binds_new_host_services_report_and_distinct_approval(rele
     request = json.loads(release_fixture["request"].read_text())
     bom = request["bindings"]["release_bom"]
     assert bom["host_runtime"]["canonical_final"]["commit"] == release.HOST_FINAL_COMMIT
-    assert release.HOST_FINAL_COMMIT == "92f60f4da5df335b756da6b2e970b7096cc10d45"
+    assert release.HOST_FINAL_COMMIT == "6aad7dadf8a5c570d60875093cd31af1b0e74266"
     assert len(bom["restart_scope"]["host_launchd_labels"]) == 6
     assert "local.pnc.completion-notice-relay" in bom["restart_scope"]["host_launchd_labels"]
     assert bom["restart_scope"]["vm_systemd_units"] == list(release.VM_SERVICE_UNITS)
-    assert bom["component_identities"]["pipeline"]["report_service"]["directory_listing"] is False
+    assert bom["pipeline"]["artifact_transport"]["viewer_host_control_required"] is False
+    assert bom["pipeline"]["artifact_transport"]["remote_file_proxy_required"] is False
     baseline = request["quarantine_baseline_approval_requirement"]
     assert baseline["decision"] == release.BASELINE_APPROVAL_DECISION
     assert baseline["must_be_distinct_from_prod_e2e_approval"] is True
@@ -1052,7 +1051,7 @@ def test_publish_no_clobber_writes_all_bytes_and_rejects_zero_progress(tmp_path,
     assert not failed.exists()
 
 
-def test_component_binding_pins_superseding_host_and_report_service(tmp_path, monkeypatch):
+def test_component_binding_pins_superseding_host_and_formal_viz_pipeline(tmp_path, monkeypatch):
     component_path = _write_json(tmp_path / "component.json", {"placeholder": True})
     template_host = _component_value(component_path)["host"]
     dependency = template_host["dependency_environment"]
@@ -1088,8 +1087,6 @@ def test_component_binding_pins_superseding_host_and_report_service(tmp_path, mo
     }
     workspace = {"runtime_sha256": "78" * 32}
     worker = copy.deepcopy(_component_value(component_path)["worker"])
-    report = _report_service()
-    worker["report_unit_config_sha256"] = report["candidate_unit_sha256"]
     pipeline = {
         "root": release.PIPELINE_SOURCE_ROOT,
         "commit": release.PIPELINE_COMMIT,
@@ -1103,7 +1100,6 @@ def test_component_binding_pins_superseding_host_and_report_service(tmp_path, mo
             "cifs_path": release.PIPELINE_CANDIDATE_AUDIT_CIFS_PATH,
             "sha256": release.PIPELINE_CANDIDATE_AUDIT_SHA256,
         },
-        "report_service": report,
     }
     hmac_ref = {"observation_path": str(tmp_path / "hmac.json"), "observation_sha256": "79" * 32}
     hmac = {
@@ -1166,7 +1162,6 @@ def test_component_binding_pins_superseding_host_and_report_service(tmp_path, mo
         "workspace": {"stub": True},
         "worker": {"stub": True},
         "pipeline": pipeline,
-        "viewer_proxy": _viewer_proxy_candidate(),
         "admission_security": security,
         "production_mutation": False,
     }
@@ -1183,7 +1178,8 @@ def test_component_binding_pins_superseding_host_and_report_service(tmp_path, mo
         owned, release_id=RELEASE_ID, now=NOW, require_fresh=True
     )
     assert result["host"]["commit"] == release.HOST_FINAL_COMMIT
-    assert result["pipeline"]["report_service"]["unit"] == release.VM_REPORT_UNIT
+    assert "report_service" not in result["pipeline"]
+    assert "viewer_proxy" not in result
     bad = copy.deepcopy(body)
     bad["host"]["commit"] = "3fe69b39ca3cd118fa60ef5015fd0ee1fe65c698"
     with pytest.raises(release.ProdE2EReleaseError, match="host_binding_invalid"):
@@ -1235,8 +1231,18 @@ def test_viewer_proxy_candidate_rejects_origin_dns_tls_config_and_prestate_drift
 def test_cross_receipt_is_structural_and_rejects_host_binding_drift(tmp_path, monkeypatch):
     component_path = _write_json(tmp_path / "component.json", {"component": True})
     components = _component_value(component_path)
-    report = _diagnostic_report_descriptor()
-    report_url = report["report_url"]
+    formal_viz_path = (
+        "/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases/"
+        f"{release.TARGET_SUBMISSION_KEY}/{release.TARGET_SUBMISSION_KEY}.viz.mcap"
+    )
+    formal_viz_cifs_path = (
+        "//hfs.minieye.tech/department-perception_test_team/G1Q3_RCA/cases/"
+        f"{release.TARGET_SUBMISSION_KEY}/{release.TARGET_SUBMISSION_KEY}.viz.mcap"
+    )
+    report_url = (
+        "https://192.168.21.217/?ds=foxglove-http&ds.mcapPath="
+        f"{formal_viz_path}"
+    )
     field_values = {
         release.RESULT_FIELD_KEY: "candidate attribution",
         release.REPORT_FIELD_KEY: report_url,
@@ -1265,10 +1271,12 @@ def test_cross_receipt_is_structural_and_rejects_host_binding_drift(tmp_path, mo
             "pipeline_tree": release.PIPELINE_TREE,
                 "pipeline_closure_file_sha256": release.PIPELINE_CLOSURE_FILE_SHA256,
                 "pipeline_closure_core_sha256": release.PIPELINE_CLOSURE_CORE_SHA256,
-                "viewer_origin": components["viewer_proxy"]["public_origin"],
-                "viewer_proxy_config_sha256": components["viewer_proxy"][
-                    "config"
-                ]["sha256"],
+                "formal_viz_root": (
+                    "/mnt/minieye/pdcl/department/perception_test_team/"
+                    "G1Q3_RCA/cases"
+                ),
+                "fixed_foxglove_origin": "https://192.168.21.217",
+                "viewer_host_control_required": False,
         },
         "verdict": "pass",
         "issue_id": release.TARGET_WORK_ITEM_ID,
@@ -1277,7 +1285,8 @@ def test_cross_receipt_is_structural_and_rejects_host_binding_drift(tmp_path, mo
             "canonical_host_verifier_passed": True,
             "exact_issue_target": True,
             "production_write_not_performed": True,
-            "report_field_is_manifest_html_url": True,
+            "report_field_is_fixed_foxglove_url": True,
+            "formal_viz_path_bound": True,
             "result_field_nonempty": True,
         },
         "verified_delivery": {
@@ -1287,7 +1296,7 @@ def test_cross_receipt_is_structural_and_rejects_host_binding_drift(tmp_path, mo
             "work_item_id": release.TARGET_WORK_ITEM_ID,
             "issue_url": release.TARGET_ISSUE_URL,
             "report_url": report_url,
-            "report_link_kind": "manifest_html",
+            "report_link_kind": "foxglove_viz",
             "field_updates": updates,
         },
         "vm_bundle": {
@@ -1295,10 +1304,15 @@ def test_cross_receipt_is_structural_and_rejects_host_binding_drift(tmp_path, mo
             "raw_payload_read": False,
             "docker_started_by_payload": False,
             "sha256": "81" * 32,
-            "diagnostic_viz_sha256": "82" * 32,
-            "diagnostic_report_sha256": report["diagnostic_report_sha256"],
-            "diagnostic_report_bytes": report["diagnostic_report_bytes"],
-            "diagnostic_artifact_set_id": report["diagnostic_artifact_set_id"],
+            "formal_viz_path": formal_viz_path,
+            "formal_viz_cifs_path": formal_viz_cifs_path,
+            "foxglove_url": report_url,
+            "viz_sha256": "82" * 32,
+            "viz_size_bytes": 4096,
+            "publication_manifest_sha256": "83" * 32,
+            "artifact_set_id": "g1q3-rca-artifact-v1-" + "84" * 32,
+            "viewer_host_control_required": False,
+            "remote_file_proxy_required": False,
         },
         "supersedes": {"verdict": "gap", "sha256": release.SUPERSEDED_CROSS_CONTRACT_GAP_SHA256},
     }
@@ -1918,7 +1932,7 @@ def _vm_service(unit: str, *, active: bool) -> dict:
     }
 
 
-def test_preflight_requires_host_runtime_baseline_approval_and_both_vm_services(tmp_path, monkeypatch):
+def test_preflight_requires_host_runtime_baseline_approval_and_vm_daemon(tmp_path, monkeypatch):
     backup = tmp_path / "backup.sqlite3"
     conn = sqlite3.connect(backup)
     conn.execute("CREATE TABLE backup(value TEXT)")
@@ -2044,7 +2058,6 @@ def test_preflight_requires_host_runtime_baseline_approval_and_both_vm_services(
     )
     worker = {
         "daemon_unit_config_sha256": vm_services[release.VM_DAEMON_UNIT]["unit_config_sha256"],
-        "report_unit_config_sha256": vm_services[release.VM_REPORT_UNIT]["unit_config_sha256"],
         "report_environment_transition": _vm_report_environment_transition(),
     }
     kwargs = {
@@ -2079,7 +2092,7 @@ def test_preflight_requires_host_runtime_baseline_approval_and_both_vm_services(
     result = release._validate_execution_preflight(_owned(path), **kwargs)
     assert set(result["vm_services"]) == set(release.VM_SERVICE_UNITS)
     bad = copy.deepcopy(body)
-    bad["vm_services"].pop(release.VM_REPORT_UNIT)
+    bad["vm_services"].pop(release.VM_DAEMON_UNIT)
     with pytest.raises(release.ProdE2EReleaseError, match="vm_writer"):
         release._validate_execution_preflight(
             release.OwnedJson(path, b"{}", bad), **kwargs
@@ -2091,51 +2104,21 @@ def test_preflight_requires_host_runtime_baseline_approval_and_both_vm_services(
 
 
 def test_vm_live_observer_rejects_dropins_and_process_argv_drift(monkeypatch):
+    daemon = _vm_service(release.VM_DAEMON_UNIT, active=True)
     value = {
-        "worker": {},
-        "hmac": {},
+        "worker": {
+            "daemon_unit_config_sha256": daemon["unit_config_sha256"],
+            "interpreter_path": release.VM_INTERPRETER_PATH,
+            "interpreter_sha256": daemon["interpreter_sha256"],
+            "loaded_runtime_sha256": "a4" * 32,
+        },
+        "hmac": {
+            "configured": True,
+            "environment_variable": release.ADMISSION_HMAC_ENV,
+            "loaded_runtime_sha256": "a4" * 32,
+        },
         "machine_identity_sha256": "a5" * 32,
-        "report_environment": {
-            "path": release.VM_REPORT_ENV_PATH,
-            "exists": True,
-            "sha256": _report_service()["environment_file_sha256"],
-            "bytes": _report_service()["environment_file_bytes"],
-            "owner_uid": 1000,
-            "mode": "0600",
-            "variable": release.VM_REPORT_ENV_VARIABLE,
-            "viewer_origin": VIEWER_ORIGIN,
-        },
-        "report_environment_transition": {
-            **_vm_report_environment_transition(),
-            "pre_exists": True,
-            "pre_sha256": _report_service()["environment_file_sha256"],
-            "pre_bytes": _report_service()["environment_file_bytes"],
-            "pre_owner_uid": 1000,
-            "pre_mode": "0600",
-            "pre_parent_exists": True,
-            "pre_parent_owner_uid": 1000,
-            "pre_parent_mode": "0700",
-            "write_required": False,
-        },
-        "services": {
-            unit: _vm_service(unit, active=True)
-            for unit in release.VM_SERVICE_UNITS
-        },
-        "report_policy": {
-            "root": release.VM_REPORT_ROOT,
-            "route_prefix": release.VM_REPORT_ROUTE_PREFIX,
-            "port": release.VM_REPORT_PORT,
-            "directory_listing": False,
-            "path_traversal": False,
-            "symlink_escape": False,
-            "read_only": True,
-            "broad_http_server_processes": [],
-            "viewer_origin": VIEWER_ORIGIN,
-            "delivery_manifest_schema": "delivery_manifest_v2",
-            "viz_manifest_schema": "g1q3_rca_viz_publication_v1",
-            "max_concurrent_requests": 4,
-            "request_queue_size": 16,
-        },
+        "services": {release.VM_DAEMON_UNIT: daemon},
         "secret_material_persisted": False,
     }
 
@@ -2152,16 +2135,16 @@ def test_vm_live_observer_rejects_dropins_and_process_argv_drift(monkeypatch):
     )
     assert set(observed["services"]) == set(release.VM_SERVICE_UNITS)
 
-    value["services"][release.VM_REPORT_UNIT]["drop_in_paths"] = [
-        "/home/mini/.config/systemd/user/g1q3-rca-report-http.service.d/override.conf"
+    value["services"][release.VM_DAEMON_UNIT]["drop_in_paths"] = [
+        "/home/mini/.config/systemd/user/hermes-vm-coding-worker-daemon.service.d/override.conf"
     ]
     with pytest.raises(release.ProdE2EReleaseError, match="live_observation_invalid"):
         release._observe_vm_components_live(expected_viewer_origin=VIEWER_ORIGIN)
 
-    value["services"][release.VM_REPORT_UNIT] = _vm_service(
-        release.VM_REPORT_UNIT, active=True
+    value["services"][release.VM_DAEMON_UNIT] = _vm_service(
+        release.VM_DAEMON_UNIT, active=True
     )
-    value["services"][release.VM_REPORT_UNIT]["process_arguments"][-1] = "18082"
+    value["services"][release.VM_DAEMON_UNIT]["process_arguments"][-1] = "unexpected.py"
     with pytest.raises(release.ProdE2EReleaseError, match="live_observation_invalid"):
         release._observe_vm_components_live(expected_viewer_origin=VIEWER_ORIGIN)
 
@@ -2630,8 +2613,12 @@ def test_success_closeout_validates_actual_fields_comment_readback_lineage_and_c
         "artifact_set_id": "artifact-target",
         "target_key": f"feishu_project:{release.TARGET_PROJECT_KEY}:issue:{release.TARGET_WORK_ITEM_ID}",
         "issue_url": release.TARGET_ISSUE_URL,
-        "report_url": "http://192.168.26.174:18081/G1Q3_RCA/cases/target/index.html",
-        "report_link_kind": "manifest_html",
+        "report_url": (
+            "https://192.168.21.217/?ds=foxglove-http&ds.mcapPath="
+            "/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/"
+            f"cases/{release.TARGET_SUBMISSION_KEY}/{release.TARGET_SUBMISSION_KEY}.viz.mcap"
+        ),
+        "report_link_kind": "foxglove_viz",
         "field_values": field_values,
         "comment_content": comment_value,
         "marker": marker_value,
@@ -2659,8 +2646,12 @@ def test_success_closeout_validates_actual_fields_comment_readback_lineage_and_c
             f"https://project.feishu.cn/{release.TARGET_PROJECT_SIMPLE_NAME}"
             "/issue/detail/7059999999"
         ),
-        "report_url": "http://192.168.26.174:18081/G1Q3_RCA/cases/canary/index.html",
-        "report_link_kind": "manifest_html",
+        "report_url": (
+            "https://192.168.21.217/?ds=foxglove-http&ds.mcapPath="
+            "/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/"
+            "cases/canary-submission/canary-submission.viz.mcap"
+        ),
+        "report_link_kind": "foxglove_viz",
         "field_values": canary_field_values,
         "comment_content": canary_comment_value,
         "marker": canary_marker_value,
@@ -2875,7 +2866,7 @@ def test_success_closeout_validates_actual_fields_comment_readback_lineage_and_c
             "observed_at": (observed - timedelta(milliseconds=100)).isoformat(),
         },
     )
-    cutover = {name: value.isoformat() for name, value in zip(("writers_stopped_at", "backup_captured_at", "database_installed_at", "post_digest_verified_at", "core_verified_at", "baseline_bound_at", "environment_written_at", "active_binding_written_at", "services_restarted_at", "viewer_proxy_reloaded_at"), times)}
+    cutover = {name: value.isoformat() for name, value in zip(("writers_stopped_at", "backup_captured_at", "database_installed_at", "post_digest_verified_at", "core_verified_at", "baseline_bound_at", "environment_written_at", "active_binding_written_at", "services_restarted_at", "formal_viz_published_at"), times)}
     gate_body = {
         "schema_version": "pnc_rca_post_cutover_kafka_end_gate_v1",
         "release_id": RELEASE_ID,
@@ -2900,26 +2891,28 @@ def test_success_closeout_validates_actual_fields_comment_readback_lineage_and_c
         "consumer_config_sha256": host_restart["local.pnc.rca-kafka-consumer"]["config_sha256"],
     }
     gate_path = _write_json(tmp_path / "canary-kafka-gate.json", gate_body)
-    cutover.update({"post_logical_sha256": request["release_bom"]["delivery_store_cutover"]["approved_post_migration_logical_sha256"], "post_install_checkpoint": {"placeholder": True}, "quarantine_core_sha256": request["release_bom"]["delivery_store_cutover"]["quarantine_core"]["core_sha256"], "baseline_approval_sha256": verified["baseline_approval"]["sha256"], "baseline_file_sha256": "d6" * 32, "baseline_path": str(tmp_path / "baseline.json"), "active_release_binding_path": str(tmp_path / "active.json"), "live_env_path": release.CANONICAL_HOST_ENV, "live_env_pre_sha256": _host_environment_transition()["pre_sha256"], "live_env_post_sha256": _host_environment_transition()["post_sha256"], "live_env_post_bytes": _host_environment_transition()["post_bytes"], "live_env_atomic_replace": True, "live_env_written_after_core_gate": True, "vm_report_env_path": release.VM_REPORT_ENV_PATH, "vm_report_env_pre_exists": False, "vm_report_env_pre_sha256": release.EMPTY_SHA256, "vm_report_env_post_sha256": _vm_report_environment_transition()["post_sha256"], "vm_report_env_post_bytes": _vm_report_environment_transition()["post_bytes"], "vm_report_env_atomic_replace": True, "vm_report_env_written_after_core_gate": True, "host_restart": host_restart, "vm_restarts": vm_restarts, "canary_kafka_gate": {"evidence_path": str(gate_path), "evidence_sha256": _sha(gate_path)}, "restore_required": False, "restore_performed": False})
-    proxy_path = _write_json(
-        tmp_path / "viewer-proxy-live.json",
-        _viewer_proxy_live_body(
-            candidate=request["release_bom"]["component_identities"][
-                "viewer_proxy"
-            ],
-            report_service=request["release_bom"]["component_identities"][
-                "pipeline"
-            ]["report_service"],
-            report_restart=vm_restarts[release.VM_REPORT_UNIT],
-            reloaded_at=times[-1],
-            observed_at=times[-1] + timedelta(milliseconds=500),
+    cutover.update({"post_logical_sha256": request["release_bom"]["delivery_store_cutover"]["approved_post_migration_logical_sha256"], "post_install_checkpoint": {"placeholder": True}, "quarantine_core_sha256": request["release_bom"]["delivery_store_cutover"]["quarantine_core"]["core_sha256"], "baseline_approval_sha256": verified["baseline_approval"]["sha256"], "baseline_file_sha256": "d6" * 32, "baseline_path": str(tmp_path / "baseline.json"), "active_release_binding_path": str(tmp_path / "active.json"), "live_env_path": release.CANONICAL_HOST_ENV, "live_env_pre_sha256": _host_environment_transition()["pre_sha256"], "live_env_post_sha256": _host_environment_transition()["post_sha256"], "live_env_post_bytes": _host_environment_transition()["post_bytes"], "live_env_atomic_replace": True, "live_env_written_after_core_gate": True, "host_restart": host_restart, "vm_restarts": vm_restarts, "canary_kafka_gate": {"evidence_path": str(gate_path), "evidence_sha256": _sha(gate_path)}, "restore_required": False, "restore_performed": False})
+    formal_viz_closeout = {
+        "submission_key": release.TARGET_SUBMISSION_KEY,
+        "vm_path": (
+            "/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/"
+            f"cases/{release.TARGET_SUBMISSION_KEY}/{release.TARGET_SUBMISSION_KEY}.viz.mcap"
         ),
-    )
-    proxy_closeout = {
-        "observation_path": str(proxy_path),
-        "observation_sha256": _sha(proxy_path),
+        "cifs_path": (
+            "//hfs.minieye.tech/department-perception_test_team/G1Q3_RCA/"
+            f"cases/{release.TARGET_SUBMISSION_KEY}/{release.TARGET_SUBMISSION_KEY}.viz.mcap"
+        ),
+        "foxglove_url": verified_bundle["report_url"],
+        "size_bytes": 4096,
+        "sha256": "d7" * 32,
+        "publication_manifest_sha256": "d8" * 32,
+        "published_at": times[-1].isoformat(),
+        "create_once": True,
+        "size_and_sha256_verified": True,
+        "viewer_host_control_required": False,
+        "remote_file_proxy_required": False,
     }
-    body = {"schema_version": release.COMPLETION_RECEIPT_SCHEMA_VERSION, "release_id": RELEASE_ID, "observed_at": observed.isoformat(), "execution_started_at": execution.isoformat(), "final_validation_sha256": final_owned.sha256, "request_sha256": request["request_sha256"], "release_bom_sha256": request["release_bom_sha256"], "outcome": "success", "cutover": cutover, "target_delivery": target, "field_writes": writes, "comment_write": comment, "official_readback": readback, "delivery_lineage": lineage, "post_cutover_canary": canary, "viewer_proxy_closeout": proxy_closeout, "production_effects": {"live_database_mutated": True, "environment_written": True, "active_binding_written": True, "services_restarted": True, "viewer_proxy_deployed": True, "viewer_proxy_verified": True, "target_o650_executed": True, "feishu_written": True, "canary_executed": True}}
+    body = {"schema_version": release.COMPLETION_RECEIPT_SCHEMA_VERSION, "release_id": RELEASE_ID, "observed_at": observed.isoformat(), "execution_started_at": execution.isoformat(), "final_validation_sha256": final_owned.sha256, "request_sha256": request["request_sha256"], "release_bom_sha256": request["release_bom_sha256"], "outcome": "success", "cutover": cutover, "target_delivery": target, "field_writes": writes, "comment_write": comment, "official_readback": readback, "delivery_lineage": lineage, "post_cutover_canary": canary, "formal_viz_closeout": formal_viz_closeout, "production_effects": {"live_database_mutated": True, "environment_written": True, "active_binding_written": True, "services_restarted": True, "formal_viz_published": True, "formal_viz_verified": True, "target_o650_executed": True, "feishu_written": True, "canary_executed": True}}
     completion_path = _write_json(tmp_path / "completion.json", body)
     result = release._validate_completion_receipt(_owned(completion_path), request=request, final_validation=final_owned, now=observed)
     assert result["production_completed"] is True
@@ -2982,7 +2975,7 @@ def test_success_closeout_validates_actual_fields_comment_readback_lineage_and_c
         release._validate_completion_receipt(release.OwnedJson(completion_path, b"{}", old), request=request, final_validation=final_owned, now=observed)
 
 
-def test_rollback_closeout_requires_exact_restore_and_both_vm_restarts(tmp_path, monkeypatch):
+def test_rollback_closeout_requires_exact_restore_and_vm_daemon_restart(tmp_path, monkeypatch):
     request, final_owned, verified, backup, anchors, host, worker, running_host, vm_services, _host_live = _completion_context(tmp_path, monkeypatch, rollback=True)
     execution = NOW + timedelta(minutes=1)
     failure = execution + timedelta(seconds=1)
@@ -3028,18 +3021,12 @@ def test_rollback_closeout_requires_exact_restore_and_both_vm_restarts(tmp_path,
         "live_env_restored_sha256": host["host_environment_transition"][
             "pre_sha256"
         ],
-        "vm_report_env_restored_exists": worker[
-            "report_environment_transition"
-        ]["pre_exists"],
-        "vm_report_env_restored_sha256": worker[
-            "report_environment_transition"
-        ]["pre_sha256"],
     }
-    body = {"schema_version": release.COMPLETION_RECEIPT_SCHEMA_VERSION, "release_id": RELEASE_ID, "observed_at": observed.isoformat(), "execution_started_at": execution.isoformat(), "final_validation_sha256": final_owned.sha256, "request_sha256": request["request_sha256"], "release_bom_sha256": request["release_bom_sha256"], "outcome": "rolled_back", "cutover": cutover, "target_delivery": None, "field_writes": [], "comment_write": None, "official_readback": None, "delivery_lineage": None, "post_cutover_canary": None, "viewer_proxy_closeout": None, "production_effects": {"live_database_restored": True, "environment_written": False, "active_binding_written": False, "target_o650_executed": False, "feishu_written": False, "canary_executed": False}}
+    body = {"schema_version": release.COMPLETION_RECEIPT_SCHEMA_VERSION, "release_id": RELEASE_ID, "observed_at": observed.isoformat(), "execution_started_at": execution.isoformat(), "final_validation_sha256": final_owned.sha256, "request_sha256": request["request_sha256"], "release_bom_sha256": request["release_bom_sha256"], "outcome": "rolled_back", "cutover": cutover, "target_delivery": None, "field_writes": [], "comment_write": None, "official_readback": None, "delivery_lineage": None, "post_cutover_canary": None, "formal_viz_closeout": None, "production_effects": {"live_database_restored": True, "environment_written": False, "active_binding_written": False, "target_o650_executed": False, "feishu_written": False, "canary_executed": False}}
     path = _write_json(tmp_path / "rollback.json", body)
     result = release._validate_completion_receipt(_owned(path), request=request, final_validation=final_owned, now=observed)
     assert result["production_completed"] is False
-    body["cutover"]["vm_restore"].pop(release.VM_REPORT_UNIT)
+    body["cutover"]["vm_restore"].pop(release.VM_DAEMON_UNIT)
     with pytest.raises(release.ProdE2EReleaseError, match="rollback_restart_invalid"):
         release._validate_completion_receipt(release.OwnedJson(path, b"{}", body), request=request, final_validation=final_owned, now=observed)
 

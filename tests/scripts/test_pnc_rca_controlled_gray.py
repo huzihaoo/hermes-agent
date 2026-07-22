@@ -59,7 +59,7 @@ def _host_candidate(tmp_path: Path) -> tuple[Path, str, str]:
     (root / "gateway/pnc_rca_delivery_contract.py").write_text(
         '''DELIVERY_MANIFEST_SCHEMA_VERSION = "delivery_manifest_v2"
 DELIVERY_EFFECT_SCHEMA_VERSION = "pnc_rca_delivery_effect_v2"
-DELIVERY_REPORT_LINK_KIND = "manifest_html"
+DELIVERY_REPORT_LINK_KIND = "foxglove_viz"
 RCA_RESULT_FIELD_KEY = "field_9193cb"
 RCA_REPORT_FIELD_KEY = "field_8c912e"
 _BASE_EFFECT_SEMANTIC_FIELDS = (
@@ -119,6 +119,9 @@ class MeegleIssueCommentAdapter:
         return {"fields": {}, "comments": []}
 
 def verify_persisted_artifact_inventory(**kwargs): return []
+def canonical_viz_mcap_path(value): return "/formal/" + str(value)
+def canonical_viz_mcap_cifs_path(value): return "//formal/" + str(value)
+def validate_foxglove_url(url, path): return bool(url and path)
 
 def _validate_effect(claim):
     payload = claim.payload
@@ -130,6 +133,10 @@ def _validate_effect(claim):
         raise DeliveryContractError("delivery_effect_report_link_kind_invalid")
     if _PROJECT_SIMPLE_NAME_RE.fullmatch(project_simple_name) is None:
         raise DeliveryContractError("delivery_issue_url_identity_mismatch")
+    expected_viz = canonical_viz_mcap_path(claim.submission_key)
+    expected_cifs = canonical_viz_mcap_cifs_path(claim.submission_key)
+    if not validate_foxglove_url(claim.report_url, expected_viz):
+        raise DeliveryContractError("delivery_effect_report_url_invalid")
     verify_persisted_artifact_inventory(manifest=claim.manifest)
     if claim.issue:
         expected_content = build_issue_comment_content(
@@ -263,12 +270,12 @@ def _host_receipt(
         },
         "verification": {
             "focused_suite": {"result": "PASS", "passed": 173},
-            "publication_origin_suite": {
+            "foxglove_delivery_suite": {
                 "result": "PASS",
-                "passed": 10,
-                "canonical_https_dns_only": True,
-                "explicit_port_rejected": True,
-                "ip_literal_rejected": True,
+                "passed": 8,
+                "fixed_existing_foxglove_origin": True,
+                "formal_perception_path_only": True,
+                "remote_file_proxy_not_required": True,
             },
             "code_checks": {"ruff": "PASS", "diff_check": "PASS"},
             "worktree_hygiene": {
@@ -317,9 +324,9 @@ def _vm_receipt(
     parent = "d" * 40
     root = "/home/mini/.hermes/rca-prod-runtime/releases/fixture"
     body = {
-        "schema_version": "g1q3_rca_vm_candidate_independent_audit_v4",
+        "schema_version": "g1q3_rca_vm_candidate_independent_audit_v5",
         "scope": (
-            "live VM report-service candidate; controlled release tooling "
+            "VM formal Foxglove publication candidate; controlled release tooling "
             "eligibility only"
         ),
         "observed_at": (NOW - timedelta(minutes=10)).isoformat(),
@@ -348,35 +355,13 @@ def _vm_receipt(
         ],
         "deployment_authorization": False,
         "current_verification": {
-            "expanded_five_file_suite": {
+            "foxglove_contract_suite": {
                 "returncode": 0,
-                "passed": 149,
-                "skipped": 1,
-            },
-            "live_owner_environment_file": {
-                "result": "PASS",
-                "mode": "0600",
-                "path": "/home/mini/.config/g1q3-rca/report-http.env",
-                "sha256": gray.EXPECTED_VM_REPORT_ENV_SHA256,
-                "viewer_origin": gray.EXPECTED_VM_REPORT_ORIGIN,
-            },
-            "live_report_service": {
-                "active": True,
-                "activation_receipt_sha256": gray.EXPECTED_VM_REPORT_ACTIVATION_SHA256,
-                "unit_sha256": gray.EXPECTED_VM_REPORT_UNIT_SHA256,
-                "environment_sha256": gray.EXPECTED_VM_REPORT_ENV_SHA256,
-                "live_smoke": {
-                    "broad_directory_status": 404,
-                    "get_bytes": 41,
-                    "root_status": 404,
-                    "sealed_get_status": 200,
-                    "sealed_head_status": 200,
-                    "sealed_range_bytes": 8,
-                    "sealed_range_status": 206,
-                },
+                "passed": 39,
+                "skipped": 0,
             },
             "fixed_cli_closure": {
-                "schema_version": "pnc_rca_fixed_cli_mcap_closure_audit_v5",
+                "schema_version": "pnc_rca_fixed_cli_mcap_closure_audit_v6",
                 "sha256": gray.EXPECTED_VM_CLOSURE_SHA256,
                 "evidence_core_sha256": gray.EXPECTED_VM_CLOSURE_CORE_SHA256,
                 "candidate_commit": commit,
@@ -385,10 +370,10 @@ def _vm_receipt(
         },
         "inherited_independent_audit": {
             "candidate_commit": (
-                "00599fa5cd8718df3c31cd177f606a9e32b2419b"
+                "b6b4240727d784da5adb9df825ca10ab51e9d3bb"
             ),
             "sha256": (
-                "6dd776db67ff8a0859e050a433a613c3ff1fe17a547a56326ca523b9cdfb405a"
+                "f2d4769576356c5d1350a176d7d1afbf19a7d5374bd52afff0b9469bb2b45a7a"
             ),
             "authorizes_current_candidate": False,
         },
@@ -396,21 +381,29 @@ def _vm_receipt(
         "open_blockers": list(gray.VM_GO_EXPECTED_BLOCKERS),
         "production_actions": [],
         "production_mutation": False,
-        "public_report_contract": {
-            "manifest_schema_version": gray.REPORT_MANIFEST_SCHEMA_VERSION,
-            "public_origin_scheme": "https",
-            "explicit_port_forbidden": True,
-            "ip_literal_forbidden": True,
-            "private_upstream_publication_forbidden": True,
-            "private_upstream": "http://192.168.26.174:18081",
-            "environment_variable": "G1Q3_RCA_VIEWER_ORIGIN",
-            "owner_only_environment_file": (
-                "/home/mini/.config/g1q3-rca/report-http.env"
+        "formal_viz_contract": {
+            "manifest_schema_version": "g1q3_rca_viz_publication_v1",
+            "intermediate_root_pattern": "/mnt/tmp/<submission_key>/",
+            "formal_vm_path_pattern": (
+                f"{gray.FORMAL_VIZ_ROOT}/<submission_key>/"
+                "<submission_key>.viz.mcap"
             ),
-            "public_url_pattern": (
-                "<canonical_https_dns_origin>/G1Q3_RCA/cases/"
-                "<submission_key>/<artifact_set_id>/index.html"
+            "formal_cifs_path_pattern": (
+                "//hfs.minieye.tech/department-perception_test_team/G1Q3_RCA/"
+                "cases/<submission_key>/<submission_key>.viz.mcap"
             ),
+            "viewer_url_pattern": (
+                f"{gray.FIXED_FOXGLOVE_ORIGIN}/?ds=foxglove-http&ds.mcapPath="
+                f"{gray.FORMAL_VIZ_ROOT}/<submission_key>/"
+                "<submission_key>.viz.mcap"
+            ),
+            "viewer_host_control_required": False,
+            "dns_tls_proxy_required": False,
+            "remote_file_route_required": False,
+            "same_submission_directory_and_filename_required": True,
+            "create_once": True,
+            "size_and_sha256_bound": True,
+            "publication_manifest_required": True,
         },
         "release_recommendation": "eligible_for_controlled_release_tooling",
         "source_files": {},
@@ -579,7 +572,7 @@ def test_valid_plan_binds_candidates_runtime_and_gray_contract(
     assert host["delivery_capabilities"] == {
         "delivery_manifest_schema_version": "delivery_manifest_v2",
         "delivery_effect_schema_version": "pnc_rca_delivery_effect_v2",
-        "report_link_kind": "manifest_html",
+        "report_link_kind": "foxglove_viz",
         "field_keys": ["field_9193cb", "field_8c912e"],
         "legacy_v1_success_effect_rejected": True,
         "canonical_content_reconstruction": True,
@@ -590,8 +583,8 @@ def test_valid_plan_binds_candidates_runtime_and_gray_contract(
             "MeegleIssueCommentAdapter.get_fields_and_comments"
         ),
         "full_content_match_call_count": 3,
-        "http_artifact_verification_precedes_remote_boundary": True,
-        "http_artifact_verification_call_count": 1,
+            "formal_viz_identity_revalidated_before_remote_boundary": True,
+            "supporting_html_http_required": False,
         "receipt_fields": ["confirmed_content_sha256", "confirmed_report_url"],
         "contract_verify_calls": {
             "build_issue_comment_content": 1,
@@ -637,17 +630,17 @@ def test_valid_plan_binds_candidates_runtime_and_gray_contract(
         "pnc_rca_delivery_effect_v2"
     )
     assert contract["delivery"]["legacy_effect_schema_v1_forbidden"] is True
-    assert contract["delivery"]["report_link_kind"] == "manifest_html"
+    assert contract["delivery"]["report_link_kind"] == "foxglove_viz"
     assert (
         contract["delivery"]["report_field"]["source"]
-        == "delivery_manifest_v2.report_url"
+        == "verified_viz_publication.foxglove_url"
     )
     assert contract["delivery"]["evidence_comment"]["exact_count"] == 1
     assert contract["delivery"]["evidence_comment"]["must_bind"] == [
         "effect_key_via_marker",
         "artifact_set_id",
         "attribution_result_text",
-        "manifest_html_report_url",
+        "foxglove_report_url",
     ]
     assert contract["delivery"]["official_readback"]["required"] is True
     assert contract["delivery"]["official_readback"]["field_adapter"] == (
@@ -878,8 +871,8 @@ def test_host_ignored_cache_is_static_no_go(
         ),
         (
             lambda raw: raw.replace(
-                b'DELIVERY_REPORT_LINK_KIND = "manifest_html"',
                 b'DELIVERY_REPORT_LINK_KIND = "foxglove_viz"',
+                b'DELIVERY_REPORT_LINK_KIND = "manifest_html"',
             ),
             lambda raw: raw,
         ),
@@ -987,19 +980,19 @@ def test_production_bindings_pin_current_reviewed_artifacts() -> None:
         "/Users/songying/.codex/tmp/rca-host-70c432-zero-cache"
     )
     assert gray.EXPECTED_HOST_COMMIT == (
-        "92f60f4da5df335b756da6b2e970b7096cc10d45"
+        "6aad7dadf8a5c570d60875093cd31af1b0e74266"
     )
     assert gray.EXPECTED_HOST_TREE == (
-        "05bdbda2923841095e0f11a3e983a487dcd4593a"
+        "c7dc551e996da1f61ef619d9d51b6a29c24343e5"
     )
     assert gray.EXPECTED_VM_COMMIT == (
-        "b6b4240727d784da5adb9df825ca10ab51e9d3bb"
+        "47cf458e966c576976bdf1bd7f10fa869e9dc083"
     )
     assert gray.EXPECTED_VM_TREE == (
-        "25776345f2b806b0d3bc1e03f70502b1cad2467a"
+        "92143d24fa9c7b9e9017dc2aad7411010ea132d8"
     )
     assert gray.EXPECTED_VM_GO_RECEIPT_SHA256 == (
-        "f2d4769576356c5d1350a176d7d1afbf19a7d5374bd52afff0b9469bb2b45a7a"
+        "cbde85e2822ddc61e328df250f309d64ccdc47e78b48e9f4bac762b44ee70328"
     )
 
 

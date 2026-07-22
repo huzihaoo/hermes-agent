@@ -128,12 +128,18 @@ RestrictAddressFamilies=AF_INET AF_INET6
     lineage.parent.mkdir(parents=True, exist_ok=True)
     lineage.write_text(
         '''from pathlib import Path
+import os
 DELIVERY_MANIFEST_SCHEMA = "delivery_manifest_v2"
 TASK_ARTIFACT_ROOT = Path("/mnt/tmp")
 TASK_ARTIFACT_CIFS_ROOT = "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp"
 FORMAL_REPORT_ROOT = TASK_ARTIFACT_ROOT
+FORMAL_VIZ_ROOT = Path(
+    "/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases"
+)
 REPORT_VIEWER_ORIGIN_ENV = "G1Q3_RCA_VIEWER_ORIGIN"
 REPORT_VIEWER_ENV_PATH = Path("/home/mini/.config/g1q3-rca/report-http.env")
+class DeliveryLineageError(Exception): pass
+def file_sha256(path): return "a" * 64
 def build_report_vm_path(): pass
 def build_report_cifs_path(): pass
 def configured_publication_origin(): pass
@@ -149,6 +155,28 @@ def contract(submission_key, parent, artifact_set_id):
         "report_cifs_path": "",
         "report_url": "",
     }
+def publish_viz_mcap(
+    *, source_path, artifact_root, submission_key,
+    published_at, formal_root: Path = FORMAL_VIZ_ROOT,
+):
+    expected_artifact_root = Path("/mnt/tmp") / submission_key
+    source = source_path
+    root = formal_root.resolve(strict=True)
+    if root != formal_root or root.is_symlink():
+        raise DeliveryLineageError("viz_publication_root_invalid")
+    parent = root / submission_key
+    if root not in parent.parents:
+        raise DeliveryLineageError("viz_publication_root_invalid")
+    destination = parent / f"{submission_key}.viz.mcap"
+    manifest_path = parent / f"{submission_key}.viz.manifest.json"
+    flags = os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    source_size = source.stat().st_size
+    source_sha = file_sha256(source)
+    if destination.exists():
+        raise DeliveryLineageError("viz_publication_conflict")
+    if source_size < 1 or not source_sha:
+        raise DeliveryLineageError("viz_publication_copy_mismatch")
+    return expected_artifact_root, manifest_path, flags
 ''',
         encoding="utf-8",
     )
@@ -249,7 +277,7 @@ def test_audit_rejects_unclassified_perception_reference(tmp_path: Path):
 
     kinds = [item["kind"] for item in result["reachable"]["blockers"]]
     assert "unclassified_forbidden_output_root_reference" in kinds
-    assert result["production_path"]["perception_test_team_write_reachable"] is False
+    assert result["production_path"]["perception_test_team_write_reachable"] is True
 
 
 def test_main_returns_nonzero_when_audit_reports_blocker(monkeypatch, tmp_path: Path):
@@ -324,64 +352,46 @@ def test_audit_records_exact_task_output_and_zero_cache_seal(tmp_path: Path):
             "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/"
             "tmp/<submission_key>/"
         ),
-        "generated_artifacts_must_remain_inside_task_root": True,
+        "intermediate_artifacts_must_remain_inside_task_root": True,
         "forbidden_output_roots": [
             "/mnt/minieye/pdcl/department/perception_test_team"
         ],
-        "perception_test_team_input_only": True,
+        "formal_viz_publication_root": audit.FORMAL_VIZ_ROOT,
+        "formal_viz_publication_is_exact_exception": True,
     }
-    report_service = result["report_service"]
-    assert report_service["root"] == "/mnt/tmp"
-    assert report_service["route_prefix"] == "/G1Q3_RCA/cases/"
-    assert report_service["entrypoint_git_mode"] == "100755"
-    assert report_service["candidate_unit_git_mode"] == "100644"
-    assert report_service["directory_listing"] is False
-    assert report_service["path_traversal"] is False
-    assert report_service["symlink_escape"] is False
-    assert report_service["read_only"] is True
-    assert report_service["private_devices_omitted_for_user_manager_compatibility"] is True
-    remote_file = result["remote_file_transport"]
-    assert remote_file["source_id"] == "remote-file"
-    assert remote_file["viewer_query_parameter"] == "ds.url"
-    assert remote_file["single_byte_range"] is True
-    assert remote_file["suffix_byte_range"] is True
-    assert remote_file["viewer_same_origin_https_proxy_required"] is True
-    assert remote_file["manifest_html_same_origin_https_proxy_required"] is True
-    assert remote_file["viewer_proxy_live_observed"] is False
-    assert remote_file["release_blocked_until_viewer_proxy_proven"] is True
+    transport = result["formal_viz_transport"]
+    assert transport["source_id"] == "foxglove-http"
+    assert transport["viewer_query_parameter"] == "ds.mcapPath"
+    assert transport["formal_vm_root"] == audit.FORMAL_VIZ_ROOT
+    assert transport["remote_file_proxy_required"] is False
+    assert transport["viewer_host_control_required"] is False
+    assert transport["size_and_sha256_bound"] is True
     delivery = result["delivery_manifest_contract"]
     assert delivery["schema_version"] == "delivery_manifest_v2"
     assert delivery["legacy_v1_deliverable"] is False
-    assert delivery["perception_test_team_output"] is False
+    assert delivery["formal_viz_is_primary_user_entry"] is True
+    assert delivery["html_is_primary_user_entry"] is False
     assert delivery["report_vm_path_pattern"] == (
         "/mnt/tmp/<submission_key>/<artifact_set_id>/index.html"
     )
-    assert delivery["report_url_pattern"] == (
-        "<canonical_https_dns_origin>/G1Q3_RCA/cases/"
-        "<submission_key>/<artifact_set_id>/index.html"
-    )
+    assert delivery["report_url_pattern"] == "internal_audit_only"
 
 
-def test_audit_rejects_broad_report_http_service(tmp_path: Path):
+def test_audit_rejects_formal_viz_root_drift(tmp_path: Path):
     root, _commit, _tree = _repo(tmp_path)
-    unit = root / audit.REPORT_SERVICE_UNIT
-    unit.write_text(
-        unit.read_text(encoding="utf-8").replace(
-            next(
-                line
-                for line in unit.read_text(encoding="utf-8").splitlines()
-                if line.startswith("ExecStart=")
-            ),
-            "ExecStart=/usr/bin/python3 -m http.server 18081 --directory /mnt/tmp",
+    lineage = root / audit.DELIVERY_LINEAGE_PATH
+    lineage.write_text(
+        lineage.read_text(encoding="utf-8").replace(
+            audit.FORMAL_VIZ_ROOT, "/mnt/tmp/not-formal"
         ),
         encoding="utf-8",
     )
-    _git(root, "add", str(unit.relative_to(root)))
-    _git(root, "commit", "-qm", "weaken report service")
+    _git(root, "add", str(lineage.relative_to(root)))
+    _git(root, "commit", "-qm", "drift formal viz root")
 
     with pytest.raises(
         audit.ClosureAuditError,
-        match="fixed_cli_closure_report_service_invalid",
+        match="fixed_cli_closure_formal_viz_transport_invalid",
     ):
         audit.audit(
             repo_root=root,
@@ -391,22 +401,21 @@ def test_audit_rejects_broad_report_http_service(tmp_path: Path):
         )
 
 
-def test_audit_rejects_private_devices_in_user_service(tmp_path: Path):
+def test_audit_rejects_missing_viz_no_follow_guard(tmp_path: Path):
     root, _commit, _tree = _repo(tmp_path)
-    unit = root / audit.REPORT_SERVICE_UNIT
-    unit.write_text(
-        unit.read_text(encoding="utf-8").replace(
-            "NoNewPrivileges=true\n",
-            "NoNewPrivileges=true\nPrivateDevices=true\n",
+    lineage = root / audit.DELIVERY_LINEAGE_PATH
+    lineage.write_text(
+        lineage.read_text(encoding="utf-8").replace(
+            'getattr(os, "O_NOFOLLOW", 0)', "0"
         ),
         encoding="utf-8",
     )
-    _git(root, "add", str(unit.relative_to(root)))
-    _git(root, "commit", "-qm", "add incompatible user-service directive")
+    _git(root, "add", str(lineage.relative_to(root)))
+    _git(root, "commit", "-qm", "remove no-follow guard")
 
     with pytest.raises(
         audit.ClosureAuditError,
-        match="fixed_cli_closure_report_service_invalid",
+        match="fixed_cli_closure_formal_viz_transport_invalid",
     ):
         audit.audit(
             repo_root=root,

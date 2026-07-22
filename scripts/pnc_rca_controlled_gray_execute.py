@@ -343,7 +343,7 @@ def _validate_plan(owned: OwnedDocument, *, now: datetime) -> Mapping[str, Any]:
         not isinstance(capabilities, Mapping)
         or capabilities.get("delivery_effect_schema_version")
         != "pnc_rca_delivery_effect_v2"
-        or capabilities.get("report_link_kind") != "manifest_html"
+        or capabilities.get("report_link_kind") != "foxglove_viz"
         or capabilities.get("legacy_v1_success_effect_rejected") is not True
         or capabilities.get("canonical_content_reconstruction") is not True
         or capabilities.get("api_project_key_and_url_slug_separated") is not True
@@ -351,8 +351,11 @@ def _validate_plan(owned: OwnedDocument, *, now: datetime) -> Mapping[str, Any]:
         != gray.OFFICIAL_FIELD_READBACK_ADAPTER
         or capabilities.get("official_comment_adapter")
         != gray.OFFICIAL_COMMENT_READBACK_ADAPTER
-        or capabilities.get("http_artifact_verification_precedes_remote_boundary")
+        or capabilities.get(
+            "formal_viz_identity_revalidated_before_remote_boundary"
+        )
         is not True
+        or capabilities.get("supporting_html_http_required") is not False
     ):
         raise ControlledGrayExecutionError(
             "controlled_gray_execution_host_capability_invalid"

@@ -33,33 +33,33 @@ from gateway import pnc_rca_prod_bootstrap as prod_bootstrap
 from gateway import pnc_rca_workspace_runtime as workspace_runtime
 
 
-BOM_SCHEMA_VERSION = "pnc_rca_prod_e2e_release_bom_v5"
-REQUEST_SCHEMA_VERSION = "pnc_rca_prod_e2e_release_request_v5"
+BOM_SCHEMA_VERSION = "pnc_rca_prod_e2e_release_bom_v6"
+REQUEST_SCHEMA_VERSION = "pnc_rca_prod_e2e_release_request_v6"
 APPROVAL_SCHEMA_VERSION = "pnc_rca_prod_e2e_release_approval_v1"
 BASELINE_APPROVAL_SCHEMA_VERSION = "pnc_rca_release_approval_v1"
 BASELINE_APPROVAL_DECISION = "authorize_rca_delivery_quarantine_baseline"
-VALIDATION_SCHEMA_VERSION = "pnc_rca_prod_e2e_release_validation_v5"
+VALIDATION_SCHEMA_VERSION = "pnc_rca_prod_e2e_release_validation_v6"
 CANDIDATE_OBSERVATION_SCHEMA_VERSION = (
     "pnc_rca_pipeline_candidate_observation_v2"
 )
 GAP_LEDGER_SCHEMA_VERSION = "pnc_rca_pre_t0_accepted_gap_ledger_v1"
 FIELD_PREREAD_SCHEMA_VERSION = "pnc_rca_official_meegle_field_preread_v1"
 INPUT_PREREAD_SCHEMA_VERSION = "pnc_rca_issue_input_preread_v1"
-CLOSURE_AUDIT_SCHEMA_VERSION = "pnc_rca_fixed_cli_mcap_closure_audit_v5"
-CROSS_CONTRACT_PASS_SCHEMA_VERSION = "pnc_rca_terminal_cross_contract_pass_v5"
-COMPONENT_BINDING_SCHEMA_VERSION = "pnc_rca_prod_component_binding_v4"
+CLOSURE_AUDIT_SCHEMA_VERSION = "pnc_rca_fixed_cli_mcap_closure_audit_v6"
+CROSS_CONTRACT_PASS_SCHEMA_VERSION = "pnc_rca_terminal_cross_contract_pass_v6"
+COMPONENT_BINDING_SCHEMA_VERSION = "pnc_rca_prod_component_binding_v5"
 VIEWER_PROXY_CANDIDATE_SCHEMA_VERSION = (
     "pnc_rca_viewer_proxy_candidate_binding_v2"
 )
 DB_CUTOVER_BINDING_SCHEMA_VERSION = "pnc_rca_delivery_store_cutover_binding_v1"
-EXECUTION_PREFLIGHT_SCHEMA_VERSION = "pnc_rca_execution_preflight_v5"
-COMPLETION_RECEIPT_SCHEMA_VERSION = "pnc_rca_prod_e2e_completion_v5"
+EXECUTION_PREFLIGHT_SCHEMA_VERSION = "pnc_rca_execution_preflight_v6"
+COMPLETION_RECEIPT_SCHEMA_VERSION = "pnc_rca_prod_e2e_completion_v6"
 APPROVAL_DECISION = "authorize_exact_rca_prod_e2e_release"
 RELEASE_APPROVAL_IDENTITY_SCHEMA_VERSION = "pnc_rca_release_approval_identity_v1"
 RELEASE_APPROVAL_IDENTITY_METHOD = "kernel_owner_and_machine_binding"
 
-PIPELINE_COMMIT = "b6b4240727d784da5adb9df825ca10ab51e9d3bb"
-PIPELINE_TREE = "25776345f2b806b0d3bc1e03f70502b1cad2467a"
+PIPELINE_COMMIT = "47cf458e966c576976bdf1bd7f10fa869e9dc083"
+PIPELINE_TREE = "92143d24fa9c7b9e9017dc2aad7411010ea132d8"
 PIPELINE_ENTRYPOINT = "api/g1q3_rca/scripts/run_rca_service_request.py"
 PIPELINE_ENTRYPOINT_SHA256 = (
     "1c74abb1781b6b147787879747e84c22aaaa01fdf0507790cb104b33f5773982"
@@ -70,33 +70,33 @@ PIPELINE_SOURCE_ROOT = (
 )
 PIPELINE_CANDIDATE_AUDIT_VM_PATH = (
     "/home/mini/.hermes/rca-prod-runtime/audits/"
-    "b6b4240727d784da5adb9df825ca10ab51e9d3bb/independent-go-receipt.json"
+    "47cf458e966c576976bdf1bd7f10fa869e9dc083/independent-go-receipt-v2.json"
 )
 PIPELINE_CANDIDATE_AUDIT_CIFS_PATH = (
     "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/"
-    "g1q3-rca-b6b4240-independent-audit-20260722/receipt-go-b6b4240.json"
+    "g1q3-rca-47cf458-independent-audit-20260722/receipt-go-47cf458e-v2.json"
 )
 PIPELINE_CANDIDATE_AUDIT_SHA256 = (
-    "f2d4769576356c5d1350a176d7d1afbf19a7d5374bd52afff0b9469bb2b45a7a"
+    "cbde85e2822ddc61e328df250f309d64ccdc47e78b48e9f4bac762b44ee70328"
 )
 PIPELINE_CLOSURE_CORE_SHA256 = (
-    "fb6e6a0e59b7666726741adf2f84943fde19fef1dcd1cc79aa61307913ca28bc"
+    "1e477b0a552aafd2cb3fdf66d691ed70d836042ec6e50b08f9e2dcee090b2112"
 )
 PIPELINE_CLOSURE_FILE_SHA256 = (
-    "44be0ccc297c16a9e02dfb73ef66762fac1f97299787d8972c29c2c50ef5ccd8"
+    "7a054aa3e12ab0fa3599c18abe7cc155259f1e088019b7b1179885275f56ea6e"
 )
 PIPELINE_CLOSURE_VM_PATH = (
-    "/mnt/tmp/g1q3-rca-b6b4240-closure-audit-20260722/"
-    "fixed-cli-mcap-hard-rule-audit-b6b4240.json"
+    "/mnt/tmp/g1q3-rca-47cf458-closure-audit6-20260722/"
+    "fixed-cli-mcap-hard-rule-audit-47cf458e.json"
 )
 PIPELINE_CLOSURE_CIFS_PATH = (
     "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/"
-    "g1q3-rca-b6b4240-closure-audit-20260722/"
-    "fixed-cli-mcap-hard-rule-audit-b6b4240.json"
+    "g1q3-rca-47cf458-closure-audit6-20260722/"
+    "fixed-cli-mcap-hard-rule-audit-47cf458e.json"
 )
 PIPELINE_CLOSURE_SEALED_MIRROR_PATH = (
     "/Users/songying/.codex/tmp/rca-prod-e2e-release-20260721/evidence/"
-    "fixed-cli-mcap-hard-rule-audit-b6b4240.json"
+    "fixed-cli-mcap-hard-rule-audit-47cf458e-v2.json"
 )
 DIAGNOSTIC_KAFKA_PREREAD_PATH = (
     "/Users/songying/.codex/tmp/rca-prod-e2e-release-20260721/evidence/"
@@ -132,16 +132,16 @@ SUPERSEDED_CROSS_CONTRACT_GAP_SHA256 = (
 HOST_QUARANTINE_BASELINE_COMMIT = (
     "11b7c06af20fa0c4c09893452d4d617da3d10755"
 )
-HOST_FINAL_COMMIT = "92f60f4da5df335b756da6b2e970b7096cc10d45"
-HOST_FINAL_TREE = "05bdbda2923841095e0f11a3e983a487dcd4593a"
-HOST_FINAL_PARENT_COMMIT = "00edede48b9ebdd68d22acd185c79727ee9adeb5"
+HOST_FINAL_COMMIT = "6aad7dadf8a5c570d60875093cd31af1b0e74266"
+HOST_FINAL_TREE = "c7dc551e996da1f61ef619d9d51b6a29c24343e5"
+HOST_FINAL_PARENT_COMMIT = "92f60f4da5df335b756da6b2e970b7096cc10d45"
 CANONICAL_HOST_ROOT = "/Users/songying/.codex/tmp/rca-host-70c432-zero-cache"
 HOST_CANDIDATE_IDENTITY_PATH = (
     "/Users/songying/.codex/tmp/rca-prod-e2e-release-20260721/evidence/"
-    "controlled-gray/host-independent-go-92f60f4d.json"
+    "controlled-gray/host-independent-go-6aad7dad.json"
 )
 HOST_CANDIDATE_IDENTITY_SHA256 = (
-    "82fd1391256e983206ce941d98850718c65e52f6d3bf0afd6a7e90ba88c4bd7b"
+    "ebda6ac8260ee2b7cc2b7ef3dfd5fcc9f0988f691a46c61e08df532fd60b1a36"
 )
 CANONICAL_HOST_PYTHON = (
     "/Users/songying/.hermes/runtime/hermes-live/.venv/bin/python"
@@ -226,7 +226,7 @@ HOST_SERVICE_ENTRYPOINTS = {
 }
 VM_DAEMON_UNIT = "hermes-vm-coding-worker-daemon.service"
 VM_REPORT_UNIT = "g1q3-rca-report-http.service"
-VM_SERVICE_UNITS = (VM_DAEMON_UNIT, VM_REPORT_UNIT)
+VM_SERVICE_UNITS = (VM_DAEMON_UNIT,)
 VM_REPORT_ENTRYPOINT_RELATIVE = "api/g1q3_rca/scripts/serve_rca_reports.py"
 VM_REPORT_ENTRYPOINT_SHA256 = (
     "cea854467fd3225c13ba55160af44ce176a03c3fb927817d680e4eb699cb6f78"
@@ -1071,7 +1071,7 @@ def _validate_host_candidate_identity() -> Mapping[str, Any]:
     focused = verification.get("focused_suite") if isinstance(verification, Mapping) else None
     checks = verification.get("code_checks") if isinstance(verification, Mapping) else None
     publication = (
-        verification.get("publication_origin_suite")
+        verification.get("foxglove_delivery_suite")
         if isinstance(verification, Mapping)
         else None
     )
@@ -1113,7 +1113,7 @@ def _validate_host_candidate_identity() -> Mapping[str, Any]:
         or candidate.get("cache_dirs") != []
         or not isinstance(focused, Mapping)
         or focused.get("result") != "PASS"
-        or focused.get("passed", 0) < 171
+        or focused.get("passed", 0) < 173
         or not isinstance(checks, Mapping)
         or checks != {"diff_check": "PASS", "ruff": "PASS"}
         or publication
@@ -1122,11 +1122,11 @@ def _validate_host_candidate_identity() -> Mapping[str, Any]:
                 "pytest -q -p no:cacheprovider "
                 "tests/scripts/test_pnc_foxglove_delivery.py"
             ),
-            "passed": 10,
+            "passed": 8,
             "result": "PASS",
-            "canonical_https_dns_only": True,
-            "ip_literal_rejected": True,
-            "explicit_port_rejected": True,
+            "fixed_existing_foxglove_origin": True,
+            "formal_perception_path_only": True,
+            "remote_file_proxy_not_required": True,
         }
         or not isinstance(reproductions, Mapping)
         or set(reproductions)
@@ -2180,9 +2180,6 @@ def _validate_vm_worker_observation(
         "interpreter_path",
         "interpreter_sha256",
         "daemon_unit_config_sha256",
-        "report_unit_config_sha256",
-        "report_environment",
-        "report_environment_transition",
         "observer",
         "production_mutation",
     }
@@ -2194,23 +2191,11 @@ def _validate_vm_worker_observation(
         body.get("entrypoint"), field="worker_entrypoint"
     )
     runtime = body.get("runtime_artifact_sha256")
-    report_environment = body.get("report_environment")
-    report_environment_transition = body.get("report_environment_transition")
     observer = body.get("observer")
-    report_origin = (
-        report_environment.get("viewer_origin")
-        if isinstance(report_environment, Mapping)
-        else None
-    )
-    expected_report_env = (
-        f"{VM_REPORT_ENV_VARIABLE}={report_origin}\n".encode("utf-8")
-        if isinstance(report_origin, str)
-        else b""
-    )
     if (
         set(body) != expected_fields
         or body.get("schema_version")
-        != "pnc_rca_vm_worker_identity_observation_v2"
+        != "pnc_rca_vm_worker_identity_observation_v3"
         or body.get("production_mutation") is not False
         or not root.startswith("/home/mini/.hermes/")
         or not entrypoint.startswith(root.rstrip("/") + "/")
@@ -2238,136 +2223,6 @@ def _validate_vm_worker_observation(
             field="worker_daemon_unit_config_sha256",
         )
         != body.get("daemon_unit_config_sha256")
-        or _sha256(
-            body.get("report_unit_config_sha256"),
-            field="worker_report_unit_config_sha256",
-        )
-        != body.get("report_unit_config_sha256")
-        or body.get("report_unit_config_sha256") != VM_REPORT_UNIT_SHA256
-        or not isinstance(report_environment, Mapping)
-        or report_environment
-        != {
-            "path": VM_REPORT_ENV_PATH,
-            "sha256": hashlib.sha256(expected_report_env).hexdigest(),
-            "bytes": len(expected_report_env),
-            "owner_uid": 1000,
-            "mode": "0600",
-            "variable": VM_REPORT_ENV_VARIABLE,
-            "viewer_origin": report_origin,
-        }
-        or _canonical_https_dns_origin(
-            report_origin, field="vm_report_viewer_origin"
-        )
-        != report_origin
-        or not isinstance(report_environment_transition, Mapping)
-        or set(report_environment_transition)
-        != {
-            "path",
-            "pre_exists",
-            "pre_sha256",
-            "pre_bytes",
-            "pre_owner_uid",
-            "pre_mode",
-            "post_sha256",
-            "post_bytes",
-            "post_owner_uid",
-            "post_mode",
-            "post_viewer_origin",
-            "parent_path",
-            "pre_parent_exists",
-            "pre_parent_owner_uid",
-            "pre_parent_mode",
-            "post_parent_owner_uid",
-            "post_parent_mode",
-            "parent_create_after_database_post_and_core_gate",
-            "rollback_restores_exact_parent_prestate",
-            "write_required",
-            "write_after_database_post_and_core_gate",
-            "rollback_restores_exact_prestate",
-        }
-        or report_environment_transition.get("path") != VM_REPORT_ENV_PATH
-        or _sha256(
-            report_environment_transition.get("pre_sha256"),
-            field="vm_report_env_pre_sha256",
-        )
-        != report_environment_transition.get("pre_sha256")
-        or _sha256(
-            report_environment_transition.get("post_sha256"),
-            field="vm_report_env_post_sha256",
-        )
-        != report_environment_transition.get("post_sha256")
-        or report_environment_transition.get("post_sha256")
-        != report_environment.get("sha256")
-        or report_environment_transition.get("post_bytes")
-        != report_environment.get("bytes")
-        or report_environment_transition.get("post_owner_uid") != 1000
-        or report_environment_transition.get("post_mode") != "0600"
-        or report_environment_transition.get("post_viewer_origin")
-        != report_origin
-        or report_environment_transition.get("parent_path")
-        != str(Path(VM_REPORT_ENV_PATH).parent)
-        or report_environment_transition.get("pre_parent_exists")
-        not in {True, False}
-        or (
-            report_environment_transition.get("pre_parent_exists") is False
-            and (
-                report_environment_transition.get("pre_parent_owner_uid")
-                is not None
-                or report_environment_transition.get("pre_parent_mode") is not None
-            )
-        )
-        or (
-            report_environment_transition.get("pre_parent_exists") is True
-            and (
-                report_environment_transition.get("pre_parent_owner_uid") != 1000
-                or report_environment_transition.get("pre_parent_mode") != "0700"
-            )
-        )
-        or (
-            report_environment_transition.get("pre_exists") is True
-            and report_environment_transition.get("pre_parent_exists") is not True
-        )
-        or report_environment_transition.get("post_parent_owner_uid") != 1000
-        or report_environment_transition.get("post_parent_mode") != "0700"
-        or report_environment_transition.get(
-            "parent_create_after_database_post_and_core_gate"
-        )
-        is not True
-        or report_environment_transition.get(
-            "rollback_restores_exact_parent_prestate"
-        )
-        is not True
-        or report_environment_transition.get("pre_exists") not in {True, False}
-        or not isinstance(report_environment_transition.get("pre_bytes"), int)
-        or isinstance(report_environment_transition.get("pre_bytes"), bool)
-        or report_environment_transition.get("pre_bytes", -1) < 0
-        or (
-            report_environment_transition.get("pre_exists") is False
-            and (
-                report_environment_transition.get("pre_sha256") != EMPTY_SHA256
-                or report_environment_transition.get("pre_bytes") != 0
-                or report_environment_transition.get("pre_owner_uid") is not None
-                or report_environment_transition.get("pre_mode") is not None
-            )
-        )
-        or (
-            report_environment_transition.get("pre_exists") is True
-            and (
-                report_environment_transition.get("pre_owner_uid") != 1000
-                or report_environment_transition.get("pre_mode") != "0600"
-            )
-        )
-        or report_environment_transition.get("write_required")
-        is not (
-            report_environment_transition.get("pre_sha256")
-            != report_environment_transition.get("post_sha256")
-        )
-        or report_environment_transition.get(
-            "write_after_database_post_and_core_gate"
-        )
-        is not True
-        or report_environment_transition.get("rollback_restores_exact_prestate")
-        is not True
         or not isinstance(runtime, Mapping)
         or not runtime
         or any(
@@ -2378,17 +2233,16 @@ def _validate_vm_worker_observation(
             or _sha256(digest, field="worker_runtime_sha256") != digest
             for path, digest in runtime.items()
         )
-        or observer
-        != {
-            "transport": "ssh-mini-agent",
-            "host": "mini@192.168.26.174",
-            "command_sha256": _vm_component_probe_script_sha256(
-                str(report_origin or ""), environment_phase="pre"
-            ),
-            "machine_identity_sha256": observer.get("machine_identity_sha256")
-            if isinstance(observer, Mapping) else None,
-        }
         or not isinstance(observer, Mapping)
+        or set(observer)
+        != {"transport", "host", "command_sha256", "machine_identity_sha256"}
+        or observer.get("transport") != "ssh-mini-agent"
+        or observer.get("host") != "mini@192.168.26.174"
+        or _sha256(
+            observer.get("command_sha256"),
+            field="worker_observer_command_sha256",
+        )
+        != observer.get("command_sha256")
         or _sha256(
             observer.get("machine_identity_sha256"),
             field="worker_observer_machine_identity_sha256",
@@ -2603,7 +2457,7 @@ def _observe_vm_candidate_live(root: str) -> Mapping[str, Any]:
     }
 
 
-_VM_COMPONENT_PROBE = r'''import base64,hashlib,json,os,pathlib,re,shlex,stat,subprocess,sys
+_LEGACY_VM_COMPONENT_PROBE = r'''import base64,hashlib,json,os,pathlib,re,shlex,stat,subprocess,sys
 sys.dont_write_bytecode=True
 root=pathlib.Path('/home/mini/.hermes/worker-state')
 entrypoint=root/'vm_coding_worker_scheduler.py'
@@ -2831,7 +2685,118 @@ print(json.dumps(result,sort_keys=True,separators=(',',':')))
 '''
 
 
-def _render_vm_component_probe(
+_VM_COMPONENT_PROBE = r'''import hashlib,json,os,pathlib,re,shlex,stat,subprocess,sys
+sys.dont_write_bytecode=True
+root=pathlib.Path('/home/mini/.hermes/worker-state')
+entrypoint=root/'vm_coding_worker_scheduler.py'
+runtime_files=__RUNTIME_FILES__
+unit='hermes-vm-coding-worker-daemon.service'
+unit_path=pathlib.Path('/home/mini/.config/systemd/user')/unit
+interpreter=pathlib.Path('/usr/bin/python3')
+exec_start=__DAEMON_EXEC_START__
+required_environment={'PYTHONDONTWRITEBYTECODE':'1','PYTHONNOUSERSITE':'1'}
+def run(argv):
+ value=subprocess.run(argv,check=False,capture_output=True,text=True,timeout=8,env={**os.environ,'GIT_OPTIONAL_LOCKS':'0'})
+ if value.returncode!=0 or value.stderr:
+  raise SystemExit('vm_component_probe_command_failed')
+ return value
+def sha(path):
+ return hashlib.sha256(path.read_bytes()).hexdigest()
+def cache_paths():
+ return sorted(str(candidate.relative_to(root)) for candidate in root.rglob('*') if '.git' not in candidate.parts and (candidate.name.endswith('.pyc') or candidate.name in {'__pycache__','.pytest_cache'}))
+if cache_paths():
+ raise SystemExit('worker_python_cache_forbidden')
+interpreter_info=os.lstat(interpreter)
+if stat.S_ISLNK(interpreter_info.st_mode) or not stat.S_ISREG(interpreter_info.st_mode) or interpreter.resolve(strict=True)!=interpreter:
+ raise SystemExit('worker_interpreter_invalid')
+machine_value=pathlib.Path('/etc/machine-id').read_text(encoding='ascii').strip()
+machine_sha=hashlib.sha256(('etc_machine_id\0'+machine_value).encode()).hexdigest()
+head=run(['git','-C',str(root),'rev-parse','HEAD^{commit}']).stdout.strip()
+tree=run(['git','-C',str(root),'rev-parse','HEAD^{tree}']).stdout.strip()
+status=run(['git','-C',str(root),'status','--porcelain=v1','--untracked-files=all']).stdout.strip()
+artifact_sha={name:sha(root/name) for name in runtime_files}
+mode=run(['git','-C',str(root),'ls-tree','HEAD','--',entrypoint.name]).stdout.split()[0]
+sys.path.insert(0,str(root))
+import vm_rca_prod_admission as admission
+env_path=pathlib.Path('/home/mini/.hermes/service.env')
+env_info=os.lstat(env_path)
+if stat.S_ISLNK(env_info.st_mode) or not stat.S_ISREG(env_info.st_mode) or env_info.st_uid!=os.geteuid() or stat.S_IMODE(env_info.st_mode)&0o077:
+ raise SystemExit('vm_service_env_invalid')
+env_raw=env_path.read_bytes()
+values={}
+for raw_line in env_raw.decode('utf-8').splitlines():
+ line=raw_line.strip()
+ if not line or line.startswith('#') or '=' not in line:
+  continue
+ key,value=line.split('=',1)
+ if key.strip() in values:
+  raise SystemExit('vm_service_env_duplicate_key')
+ values[key.strip()]=value.strip().strip('"').strip("'")
+encoded=values.get(admission.HMAC_ENV,'')
+fingerprint=hashlib.sha256(admission._load_hmac_key(encoded)).hexdigest() if encoded else ''
+show=run(['systemctl','--user','show',unit,'--property=ActiveState,SubState,MainPID,FragmentPath,DropInPaths,ExecStart,Environment,EnvironmentFiles,WorkingDirectory']).stdout
+unit_state={line.split('=',1)[0]:line.split('=',1)[1] for line in show.splitlines() if '=' in line}
+unit_info=os.lstat(unit_path)
+if stat.S_ISLNK(unit_info.st_mode) or not stat.S_ISREG(unit_info.st_mode):
+ raise SystemExit('vm_unit_file_invalid')
+unit_raw=unit_path.read_bytes()
+unit_lines={line.strip() for line in unit_raw.decode('utf-8').splitlines() if line.strip() and not line.lstrip().startswith('#')}
+exec_matches=re.findall(r'argv\[\]=(.*?)(?:\s+;|\s+\})',unit_state.get('ExecStart',''))
+effective_exec=shlex.split(exec_matches[0]) if len(exec_matches)==1 else []
+effective_values={}
+for item in shlex.split(unit_state.get('Environment','')):
+ if '=' not in item:
+  raise SystemExit('vm_effective_environment_invalid')
+ key,value=item.split('=',1)
+ if not key or key in effective_values:
+  raise SystemExit('vm_effective_environment_invalid')
+ effective_values[key]=value
+if ('ExecStart='+' '.join(exec_start) not in unit_lines or 'WorkingDirectory='+str(root) not in unit_lines or unit_state.get('FragmentPath','')!=str(unit_path) or unit_state.get('DropInPaths','') or unit_state.get('EnvironmentFiles','') or effective_exec!=exec_start or unit_state.get('WorkingDirectory','')!=str(root) or any(effective_values.get(key)!=value for key,value in required_environment.items())):
+ raise SystemExit('vm_unit_hardening_invalid')
+main_pid=int(unit_state.get('MainPID','0'))
+process_executable=''
+process_arguments=[]
+process_working_directory=''
+process_environment=[]
+if main_pid:
+ process_root=pathlib.Path('/proc')/str(main_pid)
+ process_executable=str((process_root/'exe').resolve(strict=True))
+ process_arguments=[os.fsdecode(item) for item in (process_root/'cmdline').read_bytes().split(b'\0') if item]
+ process_working_directory=str((process_root/'cwd').resolve(strict=True))
+ process_values={}
+ for item in (process_root/'environ').read_bytes().split(b'\0'):
+  if item and b'=' in item:
+   key,value=item.split(b'=',1)
+   process_values[os.fsdecode(key)]=os.fsdecode(value)
+ process_environment=[f'{key}={process_values.get(key,"")}' for key in sorted(required_environment)]
+ if process_executable!=str(interpreter) or process_arguments!=exec_start or process_working_directory!=str(root) or any(process_values.get(key)!=value for key,value in required_environment.items()):
+  raise SystemExit('vm_process_identity_mismatch')
+head_after=run(['git','-C',str(root),'rev-parse','HEAD^{commit}']).stdout.strip()
+tree_after=run(['git','-C',str(root),'rev-parse','HEAD^{tree}']).stdout.strip()
+status_after=run(['git','-C',str(root),'status','--porcelain=v1','--untracked-files=all']).stdout.strip()
+if head_after!=head or tree_after!=tree or status_after!=status or {name:sha(root/name) for name in runtime_files}!=artifact_sha or cache_paths():
+ raise SystemExit('worker_probe_mutated_source_tree')
+interpreter_sha=sha(interpreter)
+loaded_runtime_sha=hashlib.sha256(json.dumps(artifact_sha,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+service={
+ 'unit':unit,'active_state':unit_state.get('ActiveState',''),'sub_state':unit_state.get('SubState',''),'main_pid':main_pid,
+ 'unit_config_sha256':hashlib.sha256(unit_raw).hexdigest(),'entrypoint':str(entrypoint),'entrypoint_sha256':sha(entrypoint),
+ 'exec_start':exec_start,'environment':['PYTHONDONTWRITEBYTECODE=1','PYTHONNOUSERSITE=1'],'fragment_path':str(unit_path),'drop_in_paths':[],
+ 'effective_exec_start':effective_exec,'effective_environment':[f'{key}={effective_values[key]}' for key in sorted(required_environment)],
+ 'environment_files':[],'working_directory':str(root),'interpreter_path':str(interpreter),'interpreter_sha256':interpreter_sha,
+ 'process_executable':process_executable,'process_arguments':process_arguments,'process_working_directory':process_working_directory,
+ 'process_environment':process_environment,'viewer_origin':'',
+}
+result={
+ 'worker':{'root':str(root),'commit':head,'tree':tree,'tree_clean':status=='','status_sha256':hashlib.sha256(status.encode()).hexdigest(),'entrypoint':str(entrypoint),'entrypoint_sha256':sha(entrypoint),'entrypoint_git_mode':mode,'runtime_artifact_sha256':artifact_sha,'loaded_runtime_sha256':loaded_runtime_sha,'interpreter_path':str(interpreter),'interpreter_sha256':interpreter_sha,'daemon_unit_config_sha256':service['unit_config_sha256']},
+ 'hmac':{'method':'prod_admission_hmac_key_fingerprint_v1','environment_variable':admission.HMAC_ENV,'key_fingerprint':fingerprint,'configured':bool(encoded),'config_path':str(env_path),'config_sha256':hashlib.sha256(env_raw).hexdigest(),'loaded_runtime_sha256':loaded_runtime_sha},
+ 'machine_identity_sha256':machine_sha,'services':{unit:service},'secret_material_persisted':False,
+}
+print(json.dumps(result,sort_keys=True,separators=(',',':')))
+'''
+
+
+def _legacy_render_vm_component_probe(
     viewer_origin: str, *, environment_phase: str = "post"
 ) -> str:
     origin = _canonical_https_dns_origin(
@@ -2875,17 +2840,17 @@ def _render_vm_component_probe(
     )
 
 
-def _vm_component_probe_script_sha256(
+def _legacy_vm_component_probe_script_sha256(
     viewer_origin: str, *, environment_phase: str = "post"
 ) -> str:
     return hashlib.sha256(
-        _render_vm_component_probe(
+        _legacy_render_vm_component_probe(
             viewer_origin, environment_phase=environment_phase
         ).encode("utf-8")
     ).hexdigest()
 
 
-def _observe_vm_components_live(
+def _legacy_observe_vm_components_live(
     *,
     expected_viewer_origin: str | None = None,
     environment_phase: str = "post",
@@ -3240,21 +3205,6 @@ def _observe_vm_components_live(
         value["worker"]["daemon_unit_config_sha256"] = services[
             VM_DAEMON_UNIT
         ].get("unit_config_sha256")
-        value["worker"]["report_unit_config_sha256"] = services[
-            VM_REPORT_UNIT
-        ].get("unit_config_sha256")
-        value["worker"]["report_environment"] = {
-            "path": VM_REPORT_ENV_PATH,
-            "sha256": report_environment_transition["post_sha256"],
-            "bytes": report_environment_transition["post_bytes"],
-            "owner_uid": report_environment_transition["post_owner_uid"],
-            "mode": report_environment_transition["post_mode"],
-            "variable": VM_REPORT_ENV_VARIABLE,
-            "viewer_origin": origin,
-        }
-        value["worker"]["report_environment_transition"] = dict(
-            report_environment_transition
-        )
         value["worker"]["interpreter_path"] = services[VM_DAEMON_UNIT].get(
             "interpreter_path"
         )
@@ -3268,6 +3218,158 @@ def _observe_vm_components_live(
         "observer_script_sha256": _vm_component_probe_script_sha256(
             origin, environment_phase=environment_phase
         ),
+    }
+
+
+def _render_vm_component_probe(
+    viewer_origin: str | None = None, *, environment_phase: str = "post"
+) -> str:
+    del viewer_origin
+    if environment_phase not in {"pre", "post"}:
+        raise ProdE2EReleaseError(
+            "prod_e2e_release_vm_environment_phase_invalid"
+        )
+    return _VM_COMPONENT_PROBE.replace(
+        "__RUNTIME_FILES__", repr(VM_WORKER_RUNTIME_FILES)
+    ).replace(
+        "__DAEMON_EXEC_START__",
+        repr([VM_INTERPRETER_PATH, "-I", "-B", VM_WORKER_ENTRYPOINT]),
+    )
+
+
+def _vm_component_probe_script_sha256(
+    viewer_origin: str | None = None, *, environment_phase: str = "post"
+) -> str:
+    return hashlib.sha256(
+        _render_vm_component_probe(
+            viewer_origin, environment_phase=environment_phase
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _observe_vm_components_live(
+    *,
+    expected_viewer_origin: str | None = None,
+    environment_phase: str = "post",
+) -> Mapping[str, Any]:
+    script = _render_vm_component_probe(
+        expected_viewer_origin, environment_phase=environment_phase
+    )
+    wrapper = Path.home() / ".local/bin/ssh-mini-agent"
+    try:
+        completed = subprocess.run(
+            [str(wrapper), "run_py_json"],
+            input=script,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env={
+                **os.environ,
+                "SSH_MINI_AGENT_TIMEOUT": "20",
+                "SSH_MINI_TTY": "0",
+                "SSH_MINI_TTY_INHERITED": "1",
+            },
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ProdE2EReleaseError(
+            "prod_e2e_release_vm_component_live_observation_failed"
+        ) from exc
+    if completed.returncode != 0 or completed.stderr or not completed.stdout:
+        raise ProdE2EReleaseError(
+            "prod_e2e_release_vm_component_live_observation_failed"
+        )
+    try:
+        value = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise ProdE2EReleaseError(
+            "prod_e2e_release_vm_component_live_observation_invalid"
+        ) from exc
+    expected_top_level = {
+        "worker",
+        "hmac",
+        "machine_identity_sha256",
+        "services",
+        "secret_material_persisted",
+    }
+    worker = value.get("worker") if isinstance(value, Mapping) else None
+    hmac = value.get("hmac") if isinstance(value, Mapping) else None
+    services = value.get("services") if isinstance(value, Mapping) else None
+    service = services.get(VM_DAEMON_UNIT) if isinstance(services, Mapping) else None
+    expected_exec = [VM_INTERPRETER_PATH, "-I", "-B", VM_WORKER_ENTRYPOINT]
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected_top_level
+        or value.get("secret_material_persisted") is not False
+        or _sha256(
+            value.get("machine_identity_sha256"),
+            field="vm_machine_identity_sha256",
+        )
+        != value.get("machine_identity_sha256")
+        or not isinstance(worker, dict)
+        or not isinstance(hmac, dict)
+        or not isinstance(services, dict)
+        or set(services) != {VM_DAEMON_UNIT}
+        or not isinstance(service, dict)
+        or service.get("unit") != VM_DAEMON_UNIT
+        or service.get("entrypoint") != VM_WORKER_ENTRYPOINT
+        or service.get("exec_start") != expected_exec
+        or service.get("fragment_path") != VM_DAEMON_LIVE_UNIT_PATH
+        or service.get("drop_in_paths") != []
+        or service.get("effective_exec_start") != expected_exec
+        or service.get("environment_files") != []
+        or service.get("working_directory") != VM_WORKER_ROOT
+        or service.get("interpreter_path") != VM_INTERPRETER_PATH
+        or service.get("viewer_origin") != ""
+        or worker.get("daemon_unit_config_sha256")
+        != service.get("unit_config_sha256")
+        or worker.get("interpreter_path") != VM_INTERPRETER_PATH
+        or worker.get("interpreter_sha256")
+        != service.get("interpreter_sha256")
+        or hmac.get("configured") is not True
+        or hmac.get("environment_variable") != ADMISSION_HMAC_ENV
+        or hmac.get("loaded_runtime_sha256")
+        != worker.get("loaded_runtime_sha256")
+    ):
+        raise ProdE2EReleaseError(
+            "prod_e2e_release_vm_component_live_observation_invalid"
+        )
+    main_pid = service.get("main_pid")
+    if (
+        not isinstance(main_pid, int)
+        or isinstance(main_pid, bool)
+        or main_pid < 0
+        or (
+            main_pid > 0
+            and (
+                service.get("process_executable") != VM_INTERPRETER_PATH
+                or service.get("process_arguments") != expected_exec
+                or service.get("process_working_directory") != VM_WORKER_ROOT
+            )
+        )
+        or (
+            main_pid == 0
+            and any(
+                service.get(field) not in {"", ()}
+                for field in (
+                    "process_executable",
+                    "process_working_directory",
+                )
+            )
+        )
+        or (main_pid == 0 and service.get("process_arguments") != [])
+        or (main_pid == 0 and service.get("process_environment") != [])
+    ):
+        raise ProdE2EReleaseError(
+            "prod_e2e_release_vm_component_live_observation_invalid"
+        )
+    return {
+        **value,
+        "observer_transport": "ssh-mini-agent",
+        "observer_host": "mini@192.168.26.174",
+        "observer_script_sha256": hashlib.sha256(
+            script.encode("utf-8")
+        ).hexdigest(),
     }
 
 
@@ -3525,6 +3627,7 @@ def _validate_closure_audit(owned: OwnedJson) -> Mapping[str, Any]:
     reachable = body.get("reachable")
     production = body.get("production_path")
     side_effects = body.get("side_effects")
+    formal_viz = body.get("formal_viz_transport")
     classified_references = (
         reachable.get("classified_forbidden_root_references")
         if isinstance(reachable, Mapping)
@@ -3557,10 +3660,19 @@ def _validate_closure_audit(owned: OwnedJson) -> Mapping[str, Any]:
         or production.get("raw_mcap_execution_reachable") is not False
         or production.get("remote_reader_contract_reachable") is not True
         or production.get("forbidden_output_root_reachable") is not False
-        or production.get("perception_test_team_write_reachable") is not False
-        or production.get("classified_forbidden_root_reference_count") != 12
+        or production.get("perception_test_team_write_reachable") is not True
+        or production.get("classified_forbidden_root_reference_count") != 13
         or not isinstance(classified_references, list)
-        or len(classified_references) != 12
+        or len(classified_references) != 13
+        or not isinstance(formal_viz, Mapping)
+        or formal_viz.get("formal_vm_root")
+        != "/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases"
+        or formal_viz.get("viewer_origin") != "https://192.168.21.217"
+        or formal_viz.get("viewer_query_parameter") != "ds.mcapPath"
+        or formal_viz.get("remote_file_proxy_required") is not False
+        or formal_viz.get("viewer_host_control_required") is not False
+        or formal_viz.get("create_once") is not True
+        or formal_viz.get("size_and_sha256_bound") is not True
         or not isinstance(output_binding, Mapping)
         or output_binding.get("applicable") is not True
         or output_binding.get("enforced") is not True
@@ -3602,9 +3714,10 @@ def _validate_closure_audit(owned: OwnedJson) -> Mapping[str, Any]:
         "entrypoint": PIPELINE_ENTRYPOINT,
         "reachable_module_count": reachable["module_count"],
         "reachable_hit_count": 0,
-        "classified_forbidden_root_reference_count": 12,
+        "classified_forbidden_root_reference_count": 13,
         "raw_mcap_execution_reachable": False,
-        "perception_test_team_write_reachable": False,
+        "perception_test_team_write_reachable": True,
+        "formal_viz_transport": dict(formal_viz),
         "fixed_service_output_root_enforced": True,
         "remote_reader_contract_reachable": True,
     }
@@ -3626,14 +3739,21 @@ def _validate_cross_contract_pass(
     updates = delivery.get("field_updates") if isinstance(delivery, Mapping) else None
     report_url = str(delivery.get("report_url") or "") if isinstance(delivery, Mapping) else ""
     report_artifact_set_id = (
-        str(vm_bundle.get("diagnostic_artifact_set_id") or "")
+        str(vm_bundle.get("artifact_set_id") or "")
         if isinstance(vm_bundle, Mapping)
         else ""
     )
+    expected_viz_path = (
+        "/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases/"
+        f"{TARGET_SUBMISSION_KEY}/{TARGET_SUBMISSION_KEY}.viz.mcap"
+    )
+    expected_viz_cifs_path = (
+        "//hfs.minieye.tech/department-perception_test_team/G1Q3_RCA/cases/"
+        f"{TARGET_SUBMISSION_KEY}/{TARGET_SUBMISSION_KEY}.viz.mcap"
+    )
     expected_report_url = (
-        f"{components['viewer_proxy']['public_origin']}"
-        f"{VIEWER_REPORT_ROUTE_PREFIX}{TARGET_SUBMISSION_KEY}/"
-        f"{report_artifact_set_id}/index.html"
+        "https://192.168.21.217/?ds=foxglove-http&ds.mcapPath="
+        f"{expected_viz_path}"
     )
     expected_bindings = {
         "component_binding_sha256": components["sha256"],
@@ -3647,10 +3767,11 @@ def _validate_cross_contract_pass(
         "pipeline_tree": PIPELINE_TREE,
         "pipeline_closure_file_sha256": PIPELINE_CLOSURE_FILE_SHA256,
         "pipeline_closure_core_sha256": PIPELINE_CLOSURE_CORE_SHA256,
-        "viewer_origin": components["viewer_proxy"]["public_origin"],
-        "viewer_proxy_config_sha256": components["viewer_proxy"]["config"][
-            "sha256"
-        ],
+        "formal_viz_root": (
+            "/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases"
+        ),
+        "fixed_foxglove_origin": "https://192.168.21.217",
+        "viewer_host_control_required": False,
     }
     if (
         owned.sha256 != CROSS_CONTRACT_PASS_FILE_SHA256
@@ -3668,7 +3789,8 @@ def _validate_cross_contract_pass(
             "canonical_host_verifier_passed": True,
             "exact_issue_target": True,
             "production_write_not_performed": True,
-            "report_field_is_manifest_html_url": True,
+            "report_field_is_fixed_foxglove_url": True,
+            "formal_viz_path_bound": True,
             "result_field_nonempty": True,
         }
         or not isinstance(delivery, Mapping)
@@ -3678,7 +3800,7 @@ def _validate_cross_contract_pass(
         or delivery.get("work_item_id") != TARGET_WORK_ITEM_ID
         or delivery.get("issue_url")
         != TARGET_ISSUE_URL
-        or delivery.get("report_link_kind") != "manifest_html"
+        or delivery.get("report_link_kind") != "foxglove_viz"
         or ARTIFACT_SET_RE.fullmatch(report_artifact_set_id) is None
         or report_url != expected_report_url
         or not isinstance(updates, list)
@@ -3702,17 +3824,18 @@ def _validate_cross_contract_pass(
         or vm_bundle.get("raw_payload_read") is not False
         or vm_bundle.get("docker_started_by_payload") is not False
         or SHA256_RE.fullmatch(str(vm_bundle.get("sha256") or "")) is None
+        or vm_bundle.get("formal_viz_path") != expected_viz_path
+        or vm_bundle.get("formal_viz_cifs_path") != expected_viz_cifs_path
+        or vm_bundle.get("foxglove_url") != expected_report_url
+        or SHA256_RE.fullmatch(str(vm_bundle.get("viz_sha256") or "")) is None
         or SHA256_RE.fullmatch(
-            str(vm_bundle.get("diagnostic_viz_sha256") or "")
-        )
-        is None
-        or SHA256_RE.fullmatch(
-            str(vm_bundle.get("diagnostic_report_sha256") or "")
-        )
-        is None
-        or not isinstance(vm_bundle.get("diagnostic_report_bytes"), int)
-        or isinstance(vm_bundle.get("diagnostic_report_bytes"), bool)
-        or not 1 <= vm_bundle.get("diagnostic_report_bytes", 0) <= 32 * 1024 * 1024
+            str(vm_bundle.get("publication_manifest_sha256") or "")
+        ) is None
+        or not isinstance(vm_bundle.get("viz_size_bytes"), int)
+        or isinstance(vm_bundle.get("viz_size_bytes"), bool)
+        or vm_bundle.get("viz_size_bytes", 0) <= 0
+        or vm_bundle.get("viewer_host_control_required") is not False
+        or vm_bundle.get("remote_file_proxy_required") is not False
         or not isinstance(supersedes, Mapping)
         or supersedes.get("verdict") != "gap"
         or supersedes.get("sha256") != SUPERSEDED_CROSS_CONTRACT_GAP_SHA256
@@ -3727,10 +3850,14 @@ def _validate_cross_contract_pass(
         "vm_head": PIPELINE_COMMIT,
         "vm_tree": PIPELINE_TREE,
         "vm_bundle_sha256": str(vm_bundle["sha256"]),
-        "diagnostic_viz_sha256": str(vm_bundle["diagnostic_viz_sha256"]),
-        "diagnostic_report_sha256": str(vm_bundle["diagnostic_report_sha256"]),
-        "diagnostic_report_bytes": int(vm_bundle["diagnostic_report_bytes"]),
-        "diagnostic_artifact_set_id": report_artifact_set_id,
+        "formal_viz_path": expected_viz_path,
+        "formal_viz_cifs_path": expected_viz_cifs_path,
+        "viz_sha256": str(vm_bundle["viz_sha256"]),
+        "viz_size_bytes": int(vm_bundle["viz_size_bytes"]),
+        "publication_manifest_sha256": str(
+            vm_bundle["publication_manifest_sha256"]
+        ),
+        "artifact_set_id": report_artifact_set_id,
         "report_url": report_url,
         "field_keys": ["field_9193cb", "field_8c912e"],
         "structural_contract": {
@@ -3740,7 +3867,8 @@ def _validate_cross_contract_pass(
             "issue_url": TARGET_ISSUE_URL,
             "field_keys": list(TARGET_FIELD_KEYS),
             "result_nonempty": True,
-            "report_is_manifest_html_url": True,
+            "report_is_fixed_foxglove_url": True,
+            "viewer_host_control_required": False,
             "production_values_predetermined": False,
             "production_lineage_predetermined": False,
         },
@@ -4705,7 +4833,6 @@ def _validate_component_binding(
         "workspace",
         "worker",
         "pipeline",
-        "viewer_proxy",
         "admission_security",
         "production_mutation",
     }
@@ -4725,11 +4852,10 @@ def _validate_component_binding(
     workspace = body.get("workspace")
     worker = body.get("worker")
     pipeline = body.get("pipeline")
-    viewer_proxy = body.get("viewer_proxy")
     security = body.get("admission_security")
     if not all(
         isinstance(item, Mapping)
-        for item in (host, workspace, worker, pipeline, viewer_proxy, security)
+        for item in (host, workspace, worker, pipeline, security)
     ):
         raise ProdE2EReleaseError("prod_e2e_release_component_binding_invalid")
 
@@ -4739,7 +4865,7 @@ def _validate_component_binding(
     ):
         raise ProdE2EReleaseError("prod_e2e_release_host_binding_invalid")
     desired_origin = _canonical_https_dns_origin(
-        viewer_proxy.get("public_origin"), field="component_desired_viewer_origin"
+        host.get("viewer_origin"), field="component_desired_viewer_origin"
     )
     if environment_phase not in {"pre", "post"}:
         raise ProdE2EReleaseError(
@@ -4840,13 +4966,6 @@ def _validate_component_binding(
     if dict(host) != expected_host:
         raise ProdE2EReleaseError("prod_e2e_release_host_binding_invalid")
 
-    viewer_proxy_identity = _validate_viewer_proxy_candidate(
-        viewer_proxy,
-        expected_origin=desired_origin,
-        now=now,
-        require_fresh=require_fresh,
-    )
-
     workspace_identity = _validate_staged_workspace_binding(workspace)
 
     worker_identity = _validate_vm_worker_observation(
@@ -4872,14 +4991,7 @@ def _validate_component_binding(
                     "interpreter_path",
                     "interpreter_sha256",
                     "daemon_unit_config_sha256",
-                    "report_unit_config_sha256",
-                    "report_environment",
                 )
-            )
-            or (
-                environment_phase == "pre"
-                and worker_identity.get("report_environment_transition")
-                != live_worker.get("report_environment_transition")
             )
             or worker_identity["observer"]["machine_identity_sha256"]
             != vm_live.get("machine_identity_sha256")
@@ -4900,14 +5012,6 @@ def _validate_component_binding(
                 "prod_e2e_release_worker_live_observation_mismatch"
             )
     if (
-        worker_identity.get("report_environment", {}).get("viewer_origin")
-        != desired_origin
-    ):
-        raise ProdE2EReleaseError(
-            "prod_e2e_release_vm_report_viewer_origin_mismatch"
-        )
-
-    if (
         set(pipeline)
         != {
             "root",
@@ -4918,7 +5022,6 @@ def _validate_component_binding(
             "entrypoint_sha256",
             "entrypoint_git_mode",
             "candidate_audit",
-            "report_service",
         }
         or pipeline.get("root") != PIPELINE_SOURCE_ROOT
         or pipeline.get("commit") != PIPELINE_COMMIT
@@ -4936,161 +5039,6 @@ def _validate_component_binding(
         }
     ):
         raise ProdE2EReleaseError("prod_e2e_release_pipeline_binding_invalid")
-    report_service = pipeline.get("report_service")
-    expected_report_fields = {
-        "unit",
-        "entrypoint_relative",
-        "entrypoint_path",
-        "entrypoint_sha256",
-        "entrypoint_git_mode",
-        "candidate_unit_relative",
-        "candidate_unit_path",
-        "candidate_unit_sha256",
-        "candidate_unit_git_mode",
-        "live_unit_path",
-        "exec_start",
-        "effective_exec_start",
-        "environment_file_path",
-        "environment_file_sha256",
-        "environment_file_bytes",
-        "environment_file_owner_uid",
-        "environment_file_mode",
-        "environment_variable",
-        "viewer_origin",
-        "working_directory",
-        "root",
-        "route_prefix",
-        "port",
-        "directory_listing",
-        "path_traversal",
-        "symlink_escape",
-        "read_only",
-        "old_broad_http_server_forbidden",
-        "delivery_manifest_schema",
-        "viz_manifest_schema",
-        "max_concurrent_requests",
-        "request_queue_size",
-    }
-    if (
-        not isinstance(report_service, Mapping)
-        or set(report_service) != expected_report_fields
-        or report_service.get("unit") != VM_REPORT_UNIT
-        or report_service.get("entrypoint_relative")
-        != VM_REPORT_ENTRYPOINT_RELATIVE
-        or report_service.get("entrypoint_path")
-        != f"{PIPELINE_SOURCE_ROOT}/{VM_REPORT_ENTRYPOINT_RELATIVE}"
-        or report_service.get("entrypoint_sha256")
-        != VM_REPORT_ENTRYPOINT_SHA256
-        or report_service.get("entrypoint_git_mode") != "100755"
-        or report_service.get("candidate_unit_relative") != VM_REPORT_UNIT_RELATIVE
-        or report_service.get("candidate_unit_path")
-        != f"{PIPELINE_SOURCE_ROOT}/{VM_REPORT_UNIT_RELATIVE}"
-        or report_service.get("candidate_unit_sha256") != VM_REPORT_UNIT_SHA256
-        or report_service.get("candidate_unit_git_mode") != "100644"
-        or report_service.get("live_unit_path") != VM_REPORT_LIVE_UNIT_PATH
-        or report_service.get("exec_start")
-        != [
-            "/usr/bin/python3",
-            "-I",
-            "-B",
-            f"{PIPELINE_SOURCE_ROOT}/{VM_REPORT_ENTRYPOINT_RELATIVE}",
-            "--root",
-            VM_REPORT_ROOT,
-            "--bind",
-            "0.0.0.0",
-            "--port",
-            str(VM_REPORT_PORT),
-            "--viewer-origin",
-            f"${{{VM_REPORT_ENV_VARIABLE}}}",
-        ]
-        or report_service.get("effective_exec_start")
-        != [
-            VM_INTERPRETER_PATH,
-            "-I",
-            "-B",
-            f"{PIPELINE_SOURCE_ROOT}/{VM_REPORT_ENTRYPOINT_RELATIVE}",
-            "--root",
-            VM_REPORT_ROOT,
-            "--bind",
-            "0.0.0.0",
-            "--port",
-            str(VM_REPORT_PORT),
-            "--viewer-origin",
-            desired_origin,
-        ]
-        or report_service.get("environment_file_path") != VM_REPORT_ENV_PATH
-        or report_service.get("environment_file_sha256")
-        != worker_identity["report_environment"]["sha256"]
-        or report_service.get("environment_file_bytes")
-        != worker_identity["report_environment"]["bytes"]
-        or report_service.get("environment_file_owner_uid") != 1000
-        or report_service.get("environment_file_mode") != "0600"
-        or report_service.get("environment_variable") != VM_REPORT_ENV_VARIABLE
-        or report_service.get("viewer_origin") != desired_origin
-        or report_service.get("working_directory") != "/"
-        or report_service.get("root") != VM_REPORT_ROOT
-        or report_service.get("route_prefix") != VM_REPORT_ROUTE_PREFIX
-        or report_service.get("port") != VM_REPORT_PORT
-        or report_service.get("directory_listing") is not False
-        or report_service.get("path_traversal") is not False
-        or report_service.get("symlink_escape") is not False
-        or report_service.get("read_only") is not True
-        or report_service.get("old_broad_http_server_forbidden") is not True
-        or report_service.get("delivery_manifest_schema")
-        != "delivery_manifest_v2"
-        or report_service.get("viz_manifest_schema")
-        != "g1q3_rca_viz_publication_v1"
-        or report_service.get("max_concurrent_requests") != 4
-        or report_service.get("request_queue_size") != 16
-        or worker_identity.get("report_unit_config_sha256")
-        != report_service.get("candidate_unit_sha256")
-    ):
-        raise ProdE2EReleaseError(
-            "prod_e2e_release_report_service_binding_invalid"
-        )
-    if vm_live is not None:
-        live_report = vm_live.get("services", {}).get(VM_REPORT_UNIT)
-        if (
-            not isinstance(live_report, Mapping)
-            or live_report.get("entrypoint") != report_service["entrypoint_path"]
-            or live_report.get("entrypoint_sha256")
-            != report_service["entrypoint_sha256"]
-            or live_report.get("unit_config_sha256")
-            != report_service["candidate_unit_sha256"]
-            or (
-                environment_phase == "post"
-                and live_report.get("effective_exec_start")
-                != report_service["effective_exec_start"]
-            )
-            or live_report.get("environment_files") != [VM_REPORT_ENV_PATH]
-            or live_report.get("viewer_origin")
-            != (report_service["viewer_origin"] if environment_phase == "post" else "")
-            or (
-                environment_phase == "pre"
-                and vm_live.get("report_environment_transition")
-                != worker_identity.get("report_environment_transition")
-            )
-            or (
-                environment_phase == "post"
-                and vm_live.get("report_environment")
-                != {
-                    "path": VM_REPORT_ENV_PATH,
-                    "exists": True,
-                    "sha256": worker_identity["report_environment"]["sha256"],
-                    "bytes": worker_identity["report_environment"]["bytes"],
-                    "owner_uid": 1000,
-                    "mode": "0600",
-                    "variable": VM_REPORT_ENV_VARIABLE,
-                    "viewer_origin": desired_origin,
-                }
-            )
-            or vm_live.get("report_policy", {}).get("broad_http_server_processes")
-            != []
-        ):
-            raise ProdE2EReleaseError(
-                "prod_e2e_release_report_service_live_mismatch"
-            )
-
     vm_hmac_ref = security.get("vm_observation")
     if not isinstance(vm_hmac_ref, Mapping):
         raise ProdE2EReleaseError("prod_e2e_release_admission_security_invalid")
@@ -5159,7 +5107,6 @@ def _validate_component_binding(
         "workspace": dict(workspace_identity),
         "worker": dict(worker_identity),
         "pipeline": dict(pipeline),
-        "viewer_proxy": dict(viewer_proxy_identity),
         "admission_security": {
             **expected_security,
             "vm_observation_evidence": {
@@ -6074,8 +6021,6 @@ def _validate_execution_preflight(
         )
         or expected_vm_services[VM_DAEMON_UNIT].get("unit_config_sha256")
         != worker.get("daemon_unit_config_sha256")
-        or expected_vm_services[VM_REPORT_UNIT].get("unit_config_sha256")
-        != worker.get("report_unit_config_sha256")
     ):
         raise ProdE2EReleaseError("prod_e2e_release_vm_writer_config_mismatch")
     live_executor = _observe_executor_closure_live()
@@ -6261,7 +6206,9 @@ if not field_values['field_9193cb'].strip() or field_values['field_8c912e']!=ver
     raise SystemExit('field_value_invalid')
 comment=str(verified.effect_payload.get('comment_content') or '')
 marker=str(verified.effect_payload.get('marker') or '')
-if verified.effect_payload.get('report_link_kind')!='manifest_html' or verified.report_url not in comment or verified.foxglove_url in comment:
+expected_viz_path=f'/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases/{expected["submission_key"]}/{expected["submission_key"]}.viz.mcap'
+expected_report_url=f'https://192.168.21.217/?ds=foxglove-http&ds.mcapPath={expected_viz_path}'
+if verified.effect_payload.get('report_link_kind')!='foxglove_viz' or verified.report_url!=expected_report_url or verified.foxglove_url!=expected_report_url or verified.report_url not in comment:
     raise SystemExit('report_link_contract_invalid')
 if not comment.strip() or not marker or comment.splitlines()[0]!=marker or comment.splitlines().count(marker)!=1:
     raise SystemExit('comment_content_invalid')
@@ -6436,7 +6383,13 @@ def _run_canonical_target_bundle_verifier(
         or value.get("project_simple_name") != identity["project_simple_name"]
         or value.get("work_item_id") != identity["work_item_id"]
         or value.get("issue_url") != issue_url
-        or value.get("report_link_kind") != "manifest_html"
+        or value.get("report_link_kind") != "foxglove_viz"
+        or value.get("report_url")
+        != (
+            "https://192.168.21.217/?ds=foxglove-http&ds.mcapPath="
+            "/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/"
+            f"cases/{identity['submission_key']}/{identity['submission_key']}.viz.mcap"
+        )
         or value.get("field_values", {}).get(REPORT_FIELD_KEY, {}).get("sha256")
         != hashlib.sha256(str(value.get("report_url") or "").encode("utf-8")).hexdigest()
         or set(value.get("field_values") or {}) != set(TARGET_FIELD_KEYS)
@@ -8352,10 +8305,8 @@ def _authorized_scope(bom: Mapping[str, Any]) -> Mapping[str, Any]:
         ],
         "worker_commit": bom["component_identities"]["worker"]["commit"],
         "worker_tree": bom["component_identities"]["worker"]["tree"],
-        "viewer_origin": bom["component_identities"]["viewer_proxy"]
-        ["public_origin"],
-        "viewer_proxy_config_sha256": bom["component_identities"]
-        ["viewer_proxy"]["config"]["sha256"],
+        "fixed_foxglove_origin": "https://192.168.21.217",
+        "viewer_host_control_required": False,
         "admission_hmac_key_fingerprint": bom["admission_security"]
         ["host_key_fingerprint"],
         "delivery_store_cutover": bom["delivery_store_cutover"],
@@ -8390,7 +8341,7 @@ def _authorized_scope(bom: Mapping[str, Any]) -> Mapping[str, Any]:
             "recovery_write_count": 0,
             "operator_recovery_provenance": [],
             "minimum_offset_source": (
-                "post_viewer_proxy_reload_owner_only_no_commit_end_offset_gate"
+                "post_formal_viz_publication_owner_only_no_commit_end_offset_gate"
             ),
             "fresh_exact_record_reread_required": True,
             "consumer_group_id": None,
@@ -9388,6 +9339,68 @@ def _validate_canary_remote_closeout(
     }
 
 
+def _validate_formal_viz_closeout(
+    value: Any,
+    *,
+    submission_key: str,
+    expected_report_url: str,
+    published_at: datetime,
+) -> Mapping[str, Any]:
+    expected_path = (
+        "/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases/"
+        f"{submission_key}/{submission_key}.viz.mcap"
+    )
+    expected_cifs = (
+        "//hfs.minieye.tech/department-perception_test_team/G1Q3_RCA/cases/"
+        f"{submission_key}/{submission_key}.viz.mcap"
+    )
+    expected_url = (
+        "https://192.168.21.217/?ds=foxglove-http&ds.mcapPath="
+        f"{expected_path}"
+    )
+    if (
+        not isinstance(value, Mapping)
+        or set(value)
+        != {
+            "submission_key",
+            "vm_path",
+            "cifs_path",
+            "foxglove_url",
+            "size_bytes",
+            "sha256",
+            "publication_manifest_sha256",
+            "published_at",
+            "create_once",
+            "size_and_sha256_verified",
+            "viewer_host_control_required",
+            "remote_file_proxy_required",
+        }
+        or value.get("submission_key") != submission_key
+        or value.get("vm_path") != expected_path
+        or value.get("cifs_path") != expected_cifs
+        or value.get("foxglove_url") != expected_url
+        or value.get("foxglove_url") != expected_report_url
+        or not isinstance(value.get("size_bytes"), int)
+        or isinstance(value.get("size_bytes"), bool)
+        or value.get("size_bytes", 0) <= 0
+        or _sha256(value.get("sha256"), field="formal_viz_sha256")
+        != value.get("sha256")
+        or _sha256(
+            value.get("publication_manifest_sha256"),
+            field="formal_viz_publication_manifest_sha256",
+        )
+        != value.get("publication_manifest_sha256")
+        or _timestamp(value.get("published_at"), field="formal_viz_published_at")
+        != published_at
+        or value.get("create_once") is not True
+        or value.get("size_and_sha256_verified") is not True
+        or value.get("viewer_host_control_required") is not False
+        or value.get("remote_file_proxy_required") is not False
+    ):
+        raise ProdE2EReleaseError("prod_e2e_release_formal_viz_closeout_invalid")
+    return dict(value)
+
+
 def _validate_completion_receipt(
     owned: OwnedJson,
     *,
@@ -9412,7 +9425,7 @@ def _validate_completion_receipt(
         "official_readback",
         "delivery_lineage",
         "post_cutover_canary",
-        "viewer_proxy_closeout",
+        "formal_viz_closeout",
         "production_effects",
     }
     observed_at = _timestamp(
@@ -9481,8 +9494,6 @@ def _validate_completion_receipt(
                 "environment_written",
                 "active_binding_written",
                 "live_env_restored_sha256",
-                "vm_report_env_restored_exists",
-                "vm_report_env_restored_sha256",
             }
             or not _required_text(
                 cutover.get("failure_step"), field="cutover_failure_step"
@@ -9506,12 +9517,6 @@ def _validate_completion_receipt(
             or cutover.get("live_env_restored_sha256")
             != request["release_bom"]["host_runtime"]["canonical_final"]
             ["host_environment_transition"]["pre_sha256"]
-            or cutover.get("vm_report_env_restored_exists")
-            is not request["release_bom"]["component_identities"]["worker"]
-            ["report_environment_transition"]["pre_exists"]
-            or cutover.get("vm_report_env_restored_sha256")
-            != request["release_bom"]["component_identities"]["worker"]
-            ["report_environment_transition"]["pre_sha256"]
             or cutover.get("activation_anchors_restored")
             != preflight_anchors
             or any(
@@ -9523,7 +9528,7 @@ def _validate_completion_receipt(
                     "official_readback",
                     "delivery_lineage",
                     "post_cutover_canary",
-                    "viewer_proxy_closeout",
+                    "formal_viz_closeout",
                 )
             )
             or dict(effects)
@@ -9617,16 +9622,11 @@ def _validate_completion_receipt(
             ],
             require_running=True,
         )
-        live_vm = _observe_vm_components_live(
-            expected_viewer_origin=request["release_bom"]
-            ["component_identities"]["viewer_proxy"]["public_origin"],
-            environment_phase="pre",
-        )
+        live_vm = _observe_vm_components_live(environment_phase="pre")
         live_vm_services = live_vm.get("services")
         worker_identity = request["release_bom"]["component_identities"]["worker"]
         expected_vm_configs = {
             VM_DAEMON_UNIT: worker_identity["daemon_unit_config_sha256"],
-            VM_REPORT_UNIT: worker_identity["report_unit_config_sha256"],
         }
         if not isinstance(live_vm_services, Mapping) or any(
             not isinstance(live_vm_services.get(unit), Mapping)
@@ -9643,8 +9643,6 @@ def _validate_completion_receipt(
             or live_vm_services[unit].get("entrypoint_sha256")
             != rollback_vm_restore[unit].get("entrypoint_sha256")
             for unit in VM_SERVICE_UNITS
-        ) or live_vm.get("report_environment_transition") != worker_identity.get(
-            "report_environment_transition"
         ):
             raise ProdE2EReleaseError(
                 "prod_e2e_release_rollback_restart_invalid"
@@ -9669,7 +9667,7 @@ def _validate_completion_receipt(
         "environment_written_at",
         "active_binding_written_at",
         "services_restarted_at",
-        "viewer_proxy_reloaded_at",
+        "formal_viz_published_at",
     )
     if set(cutover) != {
         *required_cutover_fields,
@@ -9686,13 +9684,6 @@ def _validate_completion_receipt(
         "live_env_post_bytes",
         "live_env_atomic_replace",
         "live_env_written_after_core_gate",
-        "vm_report_env_path",
-        "vm_report_env_pre_exists",
-        "vm_report_env_pre_sha256",
-        "vm_report_env_post_sha256",
-        "vm_report_env_post_bytes",
-        "vm_report_env_atomic_replace",
-        "vm_report_env_written_after_core_gate",
         "host_restart",
         "vm_restarts",
         "canary_kafka_gate",
@@ -9709,9 +9700,6 @@ def _validate_completion_receipt(
     environment_transition = request["release_bom"]["host_runtime"][
         "canonical_final"
     ]["host_environment_transition"]
-    vm_environment_transition = request["release_bom"]["component_identities"][
-        "worker"
-    ]["report_environment_transition"]
     if (
         cutover_times != sorted(cutover_times)
         or cutover_times[0] < execution_started_at
@@ -9739,17 +9727,6 @@ def _validate_completion_receipt(
         != environment_transition["post_bytes"]
         or cutover.get("live_env_atomic_replace") is not True
         or cutover.get("live_env_written_after_core_gate") is not True
-        or cutover.get("vm_report_env_path") != VM_REPORT_ENV_PATH
-        or cutover.get("vm_report_env_pre_exists")
-        is not vm_environment_transition["pre_exists"]
-        or cutover.get("vm_report_env_pre_sha256")
-        != vm_environment_transition["pre_sha256"]
-        or cutover.get("vm_report_env_post_sha256")
-        != vm_environment_transition["post_sha256"]
-        or cutover.get("vm_report_env_post_bytes")
-        != vm_environment_transition["post_bytes"]
-        or cutover.get("vm_report_env_atomic_replace") is not True
-        or cutover.get("vm_report_env_written_after_core_gate") is not True
         or cutover.get("restore_required") is not False
         or cutover.get("restore_performed") is not False
     ):
@@ -9845,16 +9822,11 @@ def _validate_completion_receipt(
         verify_vm_live=True,
         environment_phase="post",
     )
-    live_vm = _observe_vm_components_live(
-        expected_viewer_origin=component_descriptor["viewer_proxy"]
-        ["public_origin"],
-        environment_phase="post",
-    )
+    live_vm = _observe_vm_components_live(environment_phase="post")
     live_vm_services = live_vm.get("services")
     worker_identity = request["release_bom"]["component_identities"]["worker"]
     expected_vm_configs = {
         VM_DAEMON_UNIT: worker_identity["daemon_unit_config_sha256"],
-        VM_REPORT_UNIT: worker_identity["report_unit_config_sha256"],
     }
     if (
         not isinstance(live_vm_services, Mapping)
@@ -9879,24 +9851,6 @@ def _validate_completion_receipt(
         raise ProdE2EReleaseError(
             "prod_e2e_release_vm_restart_live_mismatch"
         )
-    viewer_proxy_live = _validate_viewer_proxy_live_observation(
-        body.get("viewer_proxy_closeout"),
-        candidate=component_descriptor["viewer_proxy"],
-        expected_report=request["release_bom"]["feishu_completion"][
-            "terminal_cross_contract_pass"
-        ],
-        report_service=component_descriptor["pipeline"]["report_service"],
-        report_restart=vm_restarts[VM_REPORT_UNIT],
-        earliest_observed_at=cutover_time_by_field["services_restarted_at"],
-        completion_observed_at=observed_at,
-    )
-    if (
-        viewer_proxy_live["reloaded_at"]
-        != cutover_time_by_field["viewer_proxy_reloaded_at"].isoformat()
-    ):
-        raise ProdE2EReleaseError(
-            "prod_e2e_release_viewer_proxy_reload_binding_invalid"
-        )
     preflight_target_kafka = verified_final["preflight"].get(
         "target_kafka_preread"
     )
@@ -9912,7 +9866,7 @@ def _validate_completion_receipt(
         cutover.get("canary_kafka_gate"),
         request=request,
         host_restart=host_restart,
-        gate_not_before=cutover_time_by_field["viewer_proxy_reloaded_at"],
+        gate_not_before=cutover_time_by_field["formal_viz_published_at"],
         gate_not_after=observed_at,
         preflight_retained_end=preflight_target_kafka["retained_end"],
     )
@@ -10016,6 +9970,16 @@ def _validate_completion_receipt(
         or terminal_at > observed_at
     ):
         raise ProdE2EReleaseError("prod_e2e_release_target_delivery_invalid")
+    formal_viz_closeout = _validate_formal_viz_closeout(
+        body.get("formal_viz_closeout"),
+        submission_key=TARGET_SUBMISSION_KEY,
+        expected_report_url=str(bundle_verification.get("report_url") or ""),
+        published_at=cutover_time_by_field["formal_viz_published_at"],
+    )
+    if bundle_verification.get("report_link_kind") != "foxglove_viz":
+        raise ProdE2EReleaseError(
+            "prod_e2e_release_formal_viz_closeout_invalid"
+        )
     target_activation = _validate_activation_receipt(
         target.get("activation"),
         request=request,
@@ -10224,8 +10188,8 @@ def _validate_completion_receipt(
         "environment_written": True,
         "active_binding_written": True,
         "services_restarted": True,
-        "viewer_proxy_deployed": True,
-        "viewer_proxy_verified": True,
+        "formal_viz_published": True,
+        "formal_viz_verified": True,
         "target_o650_executed": True,
         "feishu_written": True,
         "canary_executed": True,
@@ -10259,7 +10223,7 @@ def _validate_completion_receipt(
         "official_readback": live_readback,
         "target_input_revalidation": dict(target_input_gate),
         "host_live_runtime": host_live_runtime,
-        "viewer_proxy_live": viewer_proxy_live,
+        "formal_viz_closeout": formal_viz_closeout,
         "canary_kafka_gate": canary_kafka_gate,
     }
 
@@ -10784,7 +10748,6 @@ def _build_bom(
             "workspace": dict(components["workspace"]),
             "worker": dict(components["worker"]),
             "pipeline": dict(components["pipeline"]),
-            "viewer_proxy": dict(components["viewer_proxy"]),
         },
         "admission_security": dict(components["admission_security"]),
         "pipeline": {
@@ -10807,19 +10770,28 @@ def _build_bom(
             "raw_mcap_execution_reachable": False,
             "remote_reader_contract_reachable": True,
             "artifact_transport": {
-                "mode": "manifest_bound_path_safe_proxy_only",
-                "viz_public_route_pattern": (
-                    "/g1q3-rca-artifacts/v1/"
-                    "<submission_key>/<same_submission_key>.viz.mcap"
+                "mode": "formal_perception_viz_with_fixed_foxglove_url",
+                "intermediate_root_pattern": "/mnt/tmp/<submission_key>/",
+                "formal_vm_path_pattern": (
+                    "/mnt/minieye/pdcl/department/perception_test_team/"
+                    "G1Q3_RCA/cases/<submission_key>/<submission_key>.viz.mcap"
                 ),
-                "html_public_route_pattern": (
-                    "/G1Q3_RCA/cases/<submission_key>/"
-                    "<artifact_set_id>/<manifest_bound_asset>"
+                "formal_cifs_path_pattern": (
+                    "//hfs.minieye.tech/department-perception_test_team/"
+                    "G1Q3_RCA/cases/<submission_key>/<submission_key>.viz.mcap"
+                ),
+                "viewer_url_pattern": (
+                    "https://192.168.21.217/?ds=foxglove-http&ds.mcapPath="
+                    "/mnt/minieye/pdcl/department/perception_test_team/"
+                    "G1Q3_RCA/cases/<submission_key>/<submission_key>.viz.mcap"
                 ),
                 "same_submission_directory_and_filename_required": True,
-                "delivery_manifest_binding_required": True,
-                "legacy_foxglove_http_forbidden": True,
-                "legacy_mcap_path_parameter_forbidden": True,
+                "viz_publication_manifest_binding_required": True,
+                "create_once_size_sha256_required": True,
+                "html_primary_user_entry_forbidden": True,
+                "remote_file_proxy_required": False,
+                "viewer_host_control_required": False,
+                "dns_tls_proxy_required": False,
                 "legacy_get_mcap_metadata_forbidden": True,
                 "legacy_backend_reachable": False,
                 "silent_fallback_authorized": False,
@@ -10872,14 +10844,8 @@ def _build_bom(
             "host_service_count": len(HOST_SERVICE_LABELS),
             "vm_systemd_units": list(VM_SERVICE_UNITS),
             "vm_service_count": len(VM_SERVICE_UNITS),
-            "viewer_proxy_public_origin": components["viewer_proxy"][
-                "public_origin"
-            ],
-            "viewer_proxy_config_sha256": components["viewer_proxy"][
-                "config"
-            ]["sha256"],
-            "viewer_proxy_reload_required": True,
-            "viewer_proxy_rollback_required_on_failure": True,
+            "viewer_proxy_reload_required": False,
+            "viewer_host_control_required": False,
             "stop_before_delivery_db_cutover": True,
             "restart_after_database_baseline_environment_and_binding": True,
             "partial_restart_forbidden": True,
@@ -10909,8 +10875,8 @@ def _build_bom(
             "quarantine_baseline_issued_and_bound",
             "environment_and_active_binding_committed",
             "exact_six_host_services_and_vm_services_restarted",
-            "vm_report_upstream_contract_verified",
-            "viewer_proxy_reloaded_dns_tls_http_and_browser_verified",
+            "formal_viz_mcap_published_with_size_sha256_manifest",
+            "fixed_foxglove_url_bound_to_exact_formal_path",
             "target_input_gate_revalidated",
             "exact_o650_ingested",
             "rca_terminal_success",
@@ -11577,7 +11543,6 @@ def build_blocker_bom(*, now: datetime, verified_test_count: int) -> Mapping[str
     host = _observe_canonical_host_binding(
         expected_commit=HOST_FINAL_COMMIT, expected_tree=HOST_FINAL_TREE
     )
-    proxy_static = _validate_viewer_proxy_static_evidence()
     closure = _validate_closure_audit(
         _read_owned_json(
             Path(PIPELINE_CLOSURE_SEALED_MIRROR_PATH),
@@ -11625,7 +11590,7 @@ def build_blocker_bom(*, now: datetime, verified_test_count: int) -> Mapping[str
             "runtime_allowlists": host["runtime_allowlists"],
             "required_file_sha256": host["required_file_sha256"],
             "identity_evidence": host["candidate_identity_evidence"],
-            "explicit_viewer_origin_required_for_new_remote_file": True,
+            "fixed_foxglove_url_requires_viewer_host_control": False,
             "runtime_installed": False,
             "services_restarted": False,
         },
@@ -11638,40 +11603,36 @@ def build_blocker_bom(*, now: datetime, verified_test_count: int) -> Mapping[str
                 "sha256": PIPELINE_ENTRYPOINT_SHA256,
                 "git_mode": "100755",
             },
-            "report_server": {
-                "relative": VM_REPORT_ENTRYPOINT_RELATIVE,
-                "sha256": VM_REPORT_ENTRYPOINT_SHA256,
-                "git_mode": "100755",
-                "unit_relative": VM_REPORT_UNIT_RELATIVE,
-                "unit_sha256": VM_REPORT_UNIT_SHA256,
-                "unit_git_mode": "100644",
-                "environment_file": VM_REPORT_ENV_PATH,
-                "environment_variable": VM_REPORT_ENV_VARIABLE,
-                "delivery_manifest_schema": "delivery_manifest_v2",
+            "formal_viz_publication": {
                 "viz_manifest_schema": "g1q3_rca_viz_publication_v1",
-                "max_concurrent_requests": 4,
-                "request_queue_size": 16,
-                "activated": True,
-                "environment_sha256": (
-                    "d045dd6d73d81e2cbbee604ea2fe2b663794552f5d63e60b26c6eab2077c218d"
+                "intermediate_root_pattern": "/mnt/tmp/<submission_key>/",
+                "formal_vm_path_pattern": (
+                    "/mnt/minieye/pdcl/department/perception_test_team/"
+                    "G1Q3_RCA/cases/<submission_key>/<submission_key>.viz.mcap"
                 ),
-                "activation_receipt_sha256": (
-                    "668b69e9d89a313473b821995f74155edf80d75f4a2710add3cda987e78f2093"
+                "formal_cifs_path_pattern": (
+                    "//hfs.minieye.tech/department-perception_test_team/"
+                    "G1Q3_RCA/cases/<submission_key>/<submission_key>.viz.mcap"
                 ),
+                "viewer_url_pattern": (
+                    "https://192.168.21.217/?ds=foxglove-http&ds.mcapPath="
+                    "/mnt/minieye/pdcl/department/perception_test_team/"
+                    "G1Q3_RCA/cases/<submission_key>/<submission_key>.viz.mcap"
+                ),
+                "create_once": True,
+                "size_and_sha256_bound": True,
+                "viewer_host_control_required": False,
+                "dns_tls_proxy_required": False,
             },
             "postcommit_receipt": {
                 "vm_path": PIPELINE_CANDIDATE_AUDIT_VM_PATH,
                 "cifs_path": PIPELINE_CANDIDATE_AUDIT_CIFS_PATH,
                 "sha256": PIPELINE_CANDIDATE_AUDIT_SHA256,
-                "schema_version": "g1q3_rca_vm_candidate_independent_audit_v4",
+                "schema_version": "g1q3_rca_vm_candidate_independent_audit_v5",
                 "verdict": "GO",
                 "deployment_authorization": False,
-                "focused_tests_passed": 149,
-                "filesystem_environment_skips": 1,
-                "live_owner_only_environment_file": True,
-                "live_report_service_activation_receipt": (
-                    "668b69e9d89a313473b821995f74155edf80d75f4a2710add3cda987e78f2093"
-                ),
+                "focused_tests_passed": 39,
+                "filesystem_environment_skips": 0,
                 "inherited_posix_symlink_negative_coverage": True,
             },
             "fixed_cli_closure": {
@@ -11683,30 +11644,20 @@ def build_blocker_bom(*, now: datetime, verified_test_count: int) -> Mapping[str
             "runtime_installed": False,
             "services_restarted": False,
         },
-        "viewer_proxy_candidate": {
-            **proxy_static,
-            "expected_viewer_address": VIEWER_EXPECTED_ADDRESS,
-            "route_prefixes": {
-                "manifest_html": VIEWER_REPORT_ROUTE_PREFIX,
-                "viz_mcap": VIEWER_PROXY_ROUTE_PREFIX,
-            },
-            "upstream_origin": VIEWER_PROXY_UPSTREAM_ORIGIN,
-            "public_dns_origin": None,
-            "live_observation_receipt": None,
-            "deployed": False,
-            "tls_hostname_verified": False,
-            "browser_ignore_https_errors_required": False,
-            "maintainer_request": {
-                "path": (
-                    "/Users/songying/.codex/tmp/rca-prod-e2e-release-20260721/"
-                    "evidence/pathsafe-integration/"
-                    "viewer-proxy-maintainer-request.md"
-                ),
-                "sha256": (
-                    "26c3b98060e07101b94204211184058a9d4e26ab6b0403a862bd3463626106a1"
-                ),
-                "binds_final_vm_b6b4240": True,
-            },
+        "formal_viz_delivery": {
+            "vm_root": (
+                "/mnt/minieye/pdcl/department/perception_test_team/"
+                "G1Q3_RCA/cases"
+            ),
+            "cifs_root": (
+                "//hfs.minieye.tech/department-perception_test_team/"
+                "G1Q3_RCA/cases"
+            ),
+            "fixed_viewer_origin": "https://192.168.21.217",
+            "viewer_query": "ds=foxglove-http&ds.mcapPath=<exact_vm_path>",
+            "viewer_host_control_required": False,
+            "dns_tls_proxy_required": False,
+            "source": "vm_candidate.fixed_cli_closure.formal_viz_transport",
         },
         "target_recovery": {
             "topic": TOPIC,
@@ -11749,15 +11700,15 @@ def build_blocker_bom(*, now: datetime, verified_test_count: int) -> Mapping[str
             "exact_comment_count": 1,
             "official_field_comment_marker_readback_required": True,
             "post_cutover_kafka_canary_required": True,
-            "viewer_proxy_live_receipt_required_before_target_write": True,
+            "formal_viz_publication_receipt_required_before_target_write": True,
             "diagnostic_official_preread": diagnostic_prereads["official"],
         },
         "viewer_route_policy": {
-            "preferred_path": "canonical_dns_https_same_origin_proxy",
-            "preferred_path_authorized": False,
-            "legacy_ip_or_perception_fallback": "not_default",
-            "legacy_fallback_requires_separate_explicit_authorization": True,
-            "historical_browser_success_is_not_current_tls_or_deployment_proof": True,
+            "required_path": "formal_perception_viz_plus_fixed_foxglove_url",
+            "fixed_viewer_origin": "https://192.168.21.217",
+            "viewer_host_control_required": False,
+            "remote_file_proxy_forbidden": True,
+            "manifest_html_primary_entry_forbidden": True,
         },
         "superseded_evidence": {
             "host_b611_identity_receipt_sha256": (
@@ -11774,7 +11725,7 @@ def build_blocker_bom(*, now: datetime, verified_test_count: int) -> Mapping[str
                     "51d8769e765f5750cbdbf4f02b1258086652ae917aad9a8be1468aba0997264e"
                 ),
                 "classification": "immutable_ancestor_reference_only",
-                "authorizes_final_b6b4240": False,
+                "authorizes_final_47cf458e": False,
             },
             "cross_contract_receipt_sha256": CROSS_CONTRACT_PASS_FILE_SHA256,
             "cross_contract_authorizes_final_candidates": False,
@@ -11794,10 +11745,9 @@ def build_blocker_bom(*, now: datetime, verified_test_count: int) -> Mapping[str
             },
         },
         "required_fresh_artifacts": [
-            "final_92f60f4d_b6b4240_manifest_html_cross_contract_receipt",
-            "fresh_component_binding_with_exact_dns_tls_and_vm_env_identity",
+            "final_6aad7dad_47cf458e_foxglove_cross_contract_receipt",
+            "fresh_formal_viz_publication_receipt_for_exact_submission",
             "fresh_live_kafka_p0_o650_preread_receipt",
-            "fresh_viewer_proxy_live_http_tls_browser_receipt",
             "exact_bom_owner_release_approval",
             "exact_bom_quarantine_baseline_approval",
             "exact_bom_rca_prod_capacity_authorization",
@@ -11805,9 +11755,7 @@ def build_blocker_bom(*, now: datetime, verified_test_count: int) -> Mapping[str
         ],
         "blockers": [
             "final_cross_contract_receipt_absent",
-            "canonical_dns_origin_unset",
-            "viewer_proxy_not_installed_or_reloaded",
-            "strict_tls_and_nonintercepted_browser_proof_absent",
+            "exact_submission_viz_mcap_not_generated_or_published",
             "fresh_target_kafka_preread_after_writer_stop_absent",
             "exact_bom_owner_approvals_absent",
             "regular_rca_prod_capacity_authorization_absent",
@@ -11939,8 +11887,6 @@ def validate_only(
             != component_descriptor.get("worker")
             or fresh_components["pipeline"]
             != component_descriptor.get("pipeline")
-            or fresh_components["viewer_proxy"]
-            != component_descriptor.get("viewer_proxy")
             or fresh_components["admission_security"]
             != bom["admission_security"]
         ):

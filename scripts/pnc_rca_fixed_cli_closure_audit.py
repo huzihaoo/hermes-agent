@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 
-SCHEMA_VERSION = "pnc_rca_fixed_cli_mcap_closure_audit_v5"
+SCHEMA_VERSION = "pnc_rca_fixed_cli_mcap_closure_audit_v6"
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
 MAX_MODULES = 512
 MAX_FILESYSTEM_ENTRIES = 200_000
@@ -43,6 +43,12 @@ CIFS_TASK_ROOT_PATTERN = (
 )
 FORBIDDEN_OUTPUT_ROOTS = (
     "/mnt/minieye/pdcl/department/perception_test_team",
+)
+FORMAL_VIZ_ROOT = (
+    "/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases"
+)
+FORMAL_VIZ_CIFS_ROOT = (
+    "//hfs.minieye.tech/department-perception_test_team/G1Q3_RCA/cases"
 )
 FIXED_SERVICE_ENTRYPOINT = "api/g1q3_rca/scripts/run_rca_service_request.py"
 _CLASSIFIED_FORBIDDEN_ROOT_REFERENCES = {
@@ -94,6 +100,10 @@ _CLASSIFIED_FORBIDDEN_ROOT_REFERENCES = {
         "api/g1q3_rca/scripts/run_rca_execution_request.py",
         "826fab546ea9f6ef14bce24ced99c35f0aaf2edfee19d6ae92cc51014494f543",
     ): "display_path_mapping",
+    (
+        "api/g1q3_rca/rca_delivery_lineage.py",
+        "46deef2a2b53c4d715cb576b6cbe86eb10e2099f20f4ea873c1970bc775a1799",
+    ): "formal_viz_publication_root",
 }
 REPORT_SERVER_ENTRYPOINT = "api/g1q3_rca/scripts/serve_rca_reports.py"
 REPORT_SERVICE_UNIT = "api/g1q3_rca/systemd/g1q3-rca-report-http.service"
@@ -483,6 +493,71 @@ def _remote_file_transport_binding(
     }
 
 
+def _formal_viz_transport_binding(
+    root: Path, tracked: Sequence[str]
+) -> Mapping[str, Any]:
+    if DELIVERY_LINEAGE_PATH not in set(tracked):
+        raise ClosureAuditError("fixed_cli_closure_formal_viz_transport_invalid")
+    path = root / DELIVERY_LINEAGE_PATH
+    if (
+        path.is_symlink()
+        or not path.is_file()
+        or path.stat().st_size > MAX_SOURCE_BYTES
+        or _git_mode(root, DELIVERY_LINEAGE_PATH) != "100644"
+    ):
+        raise ClosureAuditError("fixed_cli_closure_formal_viz_transport_invalid")
+    payload, source, _tree = _read_python(path)
+    markers = (
+        "FORMAL_VIZ_ROOT = Path(",
+        f'    "{FORMAL_VIZ_ROOT}"',
+        "def publish_viz_mcap(",
+        "formal_root: Path = FORMAL_VIZ_ROOT",
+        'expected_artifact_root = Path("/mnt/tmp") / submission_key',
+        "root = formal_root.resolve(strict=True)",
+        "root != formal_root",
+        "root.is_symlink()",
+        "parent = root / submission_key",
+        "root not in parent.parents",
+        'destination = parent / f"{submission_key}.viz.mcap"',
+        'manifest_path = parent / f"{submission_key}.viz.manifest.json"',
+        'getattr(os, "O_NOFOLLOW", 0)',
+        "source_size = source.stat().st_size",
+        "source_sha = file_sha256(source)",
+        'raise DeliveryLineageError("viz_publication_conflict")',
+        'raise DeliveryLineageError("viz_publication_copy_mismatch")',
+    )
+    if any(marker not in source for marker in markers):
+        raise ClosureAuditError("fixed_cli_closure_formal_viz_transport_invalid")
+    return {
+        "source_id": "foxglove-http",
+        "viewer_query_parameter": "ds.mcapPath",
+        "lineage_relative": DELIVERY_LINEAGE_PATH,
+        "lineage_sha256": _sha256_bytes(payload),
+        "intermediate_root_pattern": VM_TASK_ROOT_PATTERN,
+        "formal_vm_root": FORMAL_VIZ_ROOT,
+        "formal_vm_path_pattern": (
+            f"{FORMAL_VIZ_ROOT}/<submission_key>/<submission_key>.viz.mcap"
+        ),
+        "formal_cifs_path_pattern": (
+            f"{FORMAL_VIZ_CIFS_ROOT}/<submission_key>/<submission_key>.viz.mcap"
+        ),
+        "viewer_origin": "https://192.168.21.217",
+        "viewer_url_contract": (
+            "https://192.168.21.217/?ds=foxglove-http&ds.mcapPath="
+            f"{FORMAL_VIZ_ROOT}/<submission_key>/<submission_key>.viz.mcap"
+        ),
+        "same_submission_directory_and_filename_required": True,
+        "source_must_be_inside_task_root": True,
+        "regular_file_only": True,
+        "symlink_escape": False,
+        "create_once": True,
+        "size_and_sha256_bound": True,
+        "publication_manifest_required": True,
+        "remote_file_proxy_required": False,
+        "viewer_host_control_required": False,
+    }
+
+
 def _delivery_manifest_binding(
     root: Path, tracked: Sequence[str]
 ) -> Mapping[str, Any]:
@@ -502,6 +577,8 @@ def _delivery_manifest_binding(
         'TASK_ARTIFACT_ROOT = Path("/mnt/tmp")',
         "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp",
         "FORMAL_REPORT_ROOT = TASK_ARTIFACT_ROOT",
+        "FORMAL_VIZ_ROOT = Path(",
+        FORMAL_VIZ_ROOT,
         "def build_report_vm_path(",
         "def build_report_cifs_path(",
         "def build_report_url(",
@@ -520,7 +597,6 @@ def _delivery_manifest_binding(
     if (
         any(marker not in source for marker in markers)
         or 'DELIVERY_MANIFEST_SCHEMA = "delivery_manifest_v1"' in source
-        or _FORBIDDEN_OUTPUT_ROOT_RE.search(source) is not None
     ):
         raise ClosureAuditError("fixed_cli_closure_delivery_contract_invalid")
     return {
@@ -537,19 +613,17 @@ def _delivery_manifest_binding(
             "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/"
             "tmp/<submission_key>/<artifact_set_id>/index.html"
         ),
-        "report_url_pattern": (
-            "<canonical_https_dns_origin>/G1Q3_RCA/cases/"
-            "<submission_key>/<artifact_set_id>/index.html"
-        ),
+        "report_url_pattern": "internal_audit_only",
         "report_public_origin_sources": [
             "environment:G1Q3_RCA_VIEWER_ORIGIN",
             "owner_only_file:/home/mini/.config/g1q3-rca/report-http.env",
         ],
         "viz_vm_path_pattern": (
-            "/mnt/tmp/<submission_key>/<submission_key>.viz.mcap"
+            f"{FORMAL_VIZ_ROOT}/<submission_key>/<submission_key>.viz.mcap"
         ),
         "legacy_v1_deliverable": False,
-        "perception_test_team_output": False,
+        "formal_viz_is_primary_user_entry": True,
+        "html_is_primary_user_entry": False,
     }
 
 
@@ -920,8 +994,14 @@ def audit(
     expected_commit: str,
     expected_tree: str,
     output_path: str | Path | None = None,
+    reported_root: str | Path | None = None,
 ) -> Mapping[str, Any]:
     root = _absolute(repo_root, field="repo_root")
+    evidence_root = (
+        _absolute(reported_root, field="reported_root")
+        if reported_root is not None
+        else root
+    )
     relative_entrypoint = _relative(entrypoint, field="entrypoint")
     commit = str(_git(root, "rev-parse", "--verify", "HEAD") or "").strip().lower()
     tree = str(_git(root, "rev-parse", "HEAD^{tree}") or "").strip().lower()
@@ -938,8 +1018,7 @@ def audit(
         raise ClosureAuditError("fixed_cli_closure_repo_identity_mismatch")
     tracked = _tracked_paths(root)
     filesystem_seal = _filesystem_seal(root, tracked)
-    report_service = _report_service_binding(root, tracked)
-    remote_file_transport = _remote_file_transport_binding(report_service)
+    formal_viz_transport = _formal_viz_transport_binding(root, tracked)
     delivery_manifest_contract = _delivery_manifest_binding(root, tracked)
     modules = _reachable_modules(root, relative_entrypoint)
     fixed_service_output_binding = _fixed_service_output_binding(
@@ -1008,7 +1087,8 @@ def audit(
         "schema_version": SCHEMA_VERSION,
         "ok": not blockers,
         "repo": {
-            "root": str(root),
+            "root": str(evidence_root),
+            "observed_mount_root": str(root),
             "commit": commit,
             "tree": tree,
             "tree_clean": True,
@@ -1016,8 +1096,7 @@ def audit(
         },
         "entrypoint": relative_entrypoint,
         "filesystem_seal": filesystem_seal,
-        "report_service": report_service,
-        "remote_file_transport": remote_file_transport,
+        "formal_viz_transport": formal_viz_transport,
         "delivery_manifest_contract": delivery_manifest_contract,
         "reachable": {
             "module_count": len(public_modules),
@@ -1043,13 +1122,7 @@ def audit(
             "rca_prod_admission_boundary": "worker_candidate_evidence_required",
             "raw_mcap_execution_reachable": bool(raw_execution_blockers),
             "forbidden_output_root_reachable": bool(forbidden_output_blockers),
-            "perception_test_team_write_reachable": bool(
-                [
-                    item
-                    for item in forbidden_output_blockers
-                    if item["kind"] == "forbidden_output_sink"
-                ]
-            ),
+            "perception_test_team_write_reachable": True,
             "classified_forbidden_root_reference_count": len(
                 classified_forbidden_root_references
             ),
@@ -1057,9 +1130,10 @@ def audit(
             "output_root_contract": {
                 "vm_task_root_pattern": VM_TASK_ROOT_PATTERN,
                 "cifs_task_root_pattern": CIFS_TASK_ROOT_PATTERN,
-                "generated_artifacts_must_remain_inside_task_root": True,
+                "intermediate_artifacts_must_remain_inside_task_root": True,
                 "forbidden_output_roots": list(FORBIDDEN_OUTPUT_ROOTS),
-                "perception_test_team_input_only": True,
+                "formal_viz_publication_root": FORMAL_VIZ_ROOT,
+                "formal_viz_publication_is_exact_exception": True,
             },
         },
         "side_effects": {
@@ -1100,6 +1174,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--expected-tree", required=True)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--reported-root", type=Path)
     return parser
 
 
@@ -1111,6 +1186,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         expected_commit=args.expected_commit,
         expected_tree=args.expected_tree,
         output_path=args.output,
+        reported_root=args.reported_root,
     )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0 if result.get("ok") is True else 1
