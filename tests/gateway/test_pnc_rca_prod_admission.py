@@ -117,15 +117,11 @@ def issue(**overrides):
 def test_command_matches_vm_fixed_cli_contract():
     command = admission.build_rca_prod_command_argv(TASK_ID)
     assert command == [
-        "bash",
-        "-lc",
-        (
-            "set -euo pipefail; cd /home/mini/.hermes/rca-prod-runtime/"
-            "releases/rca-e2e-hotfix-20260721; "
-            "./api/g1q3_rca/scripts/run_rca_service_request.py "
-            f"--task-id {TASK_ID} --goal-path "
-            f"/home/mini/.hermes/shared-state/tasks/{TASK_ID}/goal.md"
-        ),
+        "./api/g1q3_rca/scripts/run_rca_service_request.py",
+        "--task-id",
+        TASK_ID,
+        "--goal-path",
+        f"/home/mini/.hermes/shared-state/tasks/{TASK_ID}/goal.md",
     ]
 
 

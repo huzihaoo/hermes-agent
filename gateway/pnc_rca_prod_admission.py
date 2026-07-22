@@ -140,14 +140,13 @@ def build_rca_prod_command_argv(task_id: str) -> list[str]:
     if not TASK_ID_RE.fullmatch(normalized):
         raise RcaProdAdmissionError("rca_prod_task_id_invalid", retryable=False)
     goal_path = f"{VM_TASK_ROOT}/{normalized}/goal.md"
-    run_command = (
-        f"{VM_FIXED_CLI} --task-id {normalized} "
-        f"--goal-path {goal_path}"
-    )
-    shell_command = (
-        f"set -euo pipefail; cd {shlex.quote(VM_REPO_ROOT)}; {run_command}"
-    )
-    return ["bash", "-lc", shell_command]
+    return [
+        VM_FIXED_CLI,
+        "--task-id",
+        normalized,
+        "--goal-path",
+        goal_path,
+    ]
 
 
 def command_sha256(command: list[str]) -> str:
