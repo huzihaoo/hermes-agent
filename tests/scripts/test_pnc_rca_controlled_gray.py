@@ -317,9 +317,9 @@ def _vm_receipt(
     parent = "d" * 40
     root = "/home/mini/.hermes/rca-prod-runtime/releases/fixture"
     body = {
-        "schema_version": "g1q3_rca_vm_candidate_independent_audit_v3",
+        "schema_version": "g1q3_rca_vm_candidate_independent_audit_v4",
         "scope": (
-            "offline VM release candidate; controlled release tooling "
+            "live VM report-service candidate; controlled release tooling "
             "eligibility only"
         ),
         "observed_at": (NOW - timedelta(minutes=10)).isoformat(),
@@ -353,15 +353,27 @@ def _vm_receipt(
                 "passed": 149,
                 "skipped": 1,
             },
-            "owner_only_environment_probe": {
+            "live_owner_environment_file": {
                 "result": "PASS",
                 "mode": "0600",
-                "probe_removed": True,
-                "derived_report_url": (
-                    "https://viewer.example.com/G1Q3_RCA/cases/"
-                    "g1q3-rca-s1-" + "a" * 64 + "/"
-                    "g1q3-rca-artifact-v1-" + "b" * 64 + "/index.html"
-                ),
+                "path": "/home/mini/.config/g1q3-rca/report-http.env",
+                "sha256": gray.EXPECTED_VM_REPORT_ENV_SHA256,
+                "viewer_origin": gray.EXPECTED_VM_REPORT_ORIGIN,
+            },
+            "live_report_service": {
+                "active": True,
+                "activation_receipt_sha256": gray.EXPECTED_VM_REPORT_ACTIVATION_SHA256,
+                "unit_sha256": gray.EXPECTED_VM_REPORT_UNIT_SHA256,
+                "environment_sha256": gray.EXPECTED_VM_REPORT_ENV_SHA256,
+                "live_smoke": {
+                    "broad_directory_status": 404,
+                    "get_bytes": 41,
+                    "root_status": 404,
+                    "sealed_get_status": 200,
+                    "sealed_head_status": 200,
+                    "sealed_range_bytes": 8,
+                    "sealed_range_status": 206,
+                },
             },
             "fixed_cli_closure": {
                 "schema_version": "pnc_rca_fixed_cli_mcap_closure_audit_v5",
@@ -373,10 +385,10 @@ def _vm_receipt(
         },
         "inherited_independent_audit": {
             "candidate_commit": (
-                "4b26cc7935eb4fa0910b42abde78d7f8d4efa0d1"
+                "00599fa5cd8718df3c31cd177f606a9e32b2419b"
             ),
             "sha256": (
-                "0765e0adfb3e74abe6a1daaea626901003b9b0cb94223a0b401d626d1a48d1bf"
+                "6dd776db67ff8a0859e050a433a613c3ff1fe17a547a56326ca523b9cdfb405a"
             ),
             "authorizes_current_candidate": False,
         },
@@ -981,13 +993,13 @@ def test_production_bindings_pin_current_reviewed_artifacts() -> None:
         "05bdbda2923841095e0f11a3e983a487dcd4593a"
     )
     assert gray.EXPECTED_VM_COMMIT == (
-        "00599fa5cd8718df3c31cd177f606a9e32b2419b"
+        "b6b4240727d784da5adb9df825ca10ab51e9d3bb"
     )
     assert gray.EXPECTED_VM_TREE == (
-        "27cb14f0cef85de51e32dca5da572ca318ebcb91"
+        "25776345f2b806b0d3bc1e03f70502b1cad2467a"
     )
     assert gray.EXPECTED_VM_GO_RECEIPT_SHA256 == (
-        "6dd776db67ff8a0859e050a433a613c3ff1fe17a547a56326ca523b9cdfb405a"
+        "f2d4769576356c5d1350a176d7d1afbf19a7d5374bd52afff0b9469bb2b45a7a"
     )
 
 

@@ -89,29 +89,39 @@ EXPECTED_VM_ROOT = (
     "/home/mini/.hermes/rca-prod-runtime/releases/"
     "rca-e2e-hotfix-pathsafe-20260721"
 )
-EXPECTED_VM_COMMIT = "00599fa5cd8718df3c31cd177f606a9e32b2419b"
-EXPECTED_VM_TREE = "27cb14f0cef85de51e32dca5da572ca318ebcb91"
+EXPECTED_VM_COMMIT = "b6b4240727d784da5adb9df825ca10ab51e9d3bb"
+EXPECTED_VM_TREE = "25776345f2b806b0d3bc1e03f70502b1cad2467a"
 EXPECTED_VM_GO_RECEIPT_SHA256 = (
-    "6dd776db67ff8a0859e050a433a613c3ff1fe17a547a56326ca523b9cdfb405a"
+    "f2d4769576356c5d1350a176d7d1afbf19a7d5374bd52afff0b9469bb2b45a7a"
 )
 EXPECTED_VM_GO_AUTHORITATIVE_PATH = (
     "/home/mini/.hermes/rca-prod-runtime/audits/"
-    "00599fa5cd8718df3c31cd177f606a9e32b2419b/independent-go-receipt.json"
+    "b6b4240727d784da5adb9df825ca10ab51e9d3bb/independent-go-receipt.json"
 )
 EXPECTED_VM_GO_REPLICA_PATH = (
-    "/mnt/tmp/g1q3-rca-00599fa-independent-audit-20260722/"
-    "receipt-go-00599fa5.json"
+    "/mnt/tmp/g1q3-rca-b6b4240-independent-audit-20260722/"
+    "receipt-go-b6b4240.json"
 )
 EXPECTED_VM_GO_CIFS_PATH = (
     "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/"
-    "g1q3-rca-00599fa-independent-audit-20260722/receipt-go-00599fa5.json"
+    "g1q3-rca-b6b4240-independent-audit-20260722/receipt-go-b6b4240.json"
 )
 EXPECTED_VM_CLOSURE_SHA256 = (
-    "2a10e84f97ce20f0b1dd46586c7d12659f56626ad55c27e29518f64afd593499"
+    "44be0ccc297c16a9e02dfb73ef66762fac1f97299787d8972c29c2c50ef5ccd8"
 )
 EXPECTED_VM_CLOSURE_CORE_SHA256 = (
-    "85d2211188a98a637e266fcb3623efdc0c5837cdd6b2e96ef3ea006217d37b08"
+    "fb6e6a0e59b7666726741adf2f84943fde19fef1dcd1cc79aa61307913ca28bc"
 )
+EXPECTED_VM_REPORT_UNIT_SHA256 = (
+    "ee50b2845ee6a587c4f7b12f795c673bb9d9175139e68d800c330abbdf68bfd4"
+)
+EXPECTED_VM_REPORT_ENV_SHA256 = (
+    "d045dd6d73d81e2cbbee604ea2fe2b663794552f5d63e60b26c6eab2077c218d"
+)
+EXPECTED_VM_REPORT_ACTIVATION_SHA256 = (
+    "668b69e9d89a313473b821995f74155edf80d75f4a2710add3cda987e78f2093"
+)
+EXPECTED_VM_REPORT_ORIGIN = "https://g1q3-rca.minieye.tech"
 
 MAX_JSON_BYTES = 2 * 1024 * 1024
 MAX_SOURCE_BYTES = 8 * 1024 * 1024
@@ -190,7 +200,6 @@ HOST_GO_EXPECTED_BLOCKERS = (
 VM_GO_EXPECTED_BLOCKERS = (
     "regular rca_prod capacity authorization absent",
     "canonical public DNS/TLS route not installed",
-    "maintainer deployment approval absent",
 )
 RUNTIME_SCOPE_NAMES = (
     "RCA_RUNTIME_RELATIVE_FILES",
@@ -1136,8 +1145,13 @@ def _validate_vm_go_receipt(
         if isinstance(verification, Mapping)
         else None
     )
-    owner_probe = (
-        verification.get("owner_only_environment_probe")
+    owner_environment = (
+        verification.get("live_owner_environment_file")
+        if isinstance(verification, Mapping)
+        else None
+    )
+    live_report = (
+        verification.get("live_report_service")
         if isinstance(verification, Mapping)
         else None
     )
@@ -1156,9 +1170,9 @@ def _validate_vm_go_receipt(
     if (
         set(body) != VM_RECEIPT_FIELDS
         or body.get("schema_version")
-        != "g1q3_rca_vm_candidate_independent_audit_v3"
+        != "g1q3_rca_vm_candidate_independent_audit_v4"
         or body.get("scope")
-        != "offline VM release candidate; controlled release tooling eligibility only"
+        != "live VM report-service candidate; controlled release tooling eligibility only"
         or body.get("verdict") != "GO"
         or body.get("release_recommendation")
         != "eligible_for_controlled_release_tooling"
@@ -1179,13 +1193,29 @@ def _validate_vm_go_receipt(
         or focused.get("returncode") != 0
         or int(focused.get("passed") or 0) < 149
         or focused.get("skipped") != 1
-        or not isinstance(owner_probe, Mapping)
-        or owner_probe.get("result") != "PASS"
-        or owner_probe.get("mode") != "0600"
-        or owner_probe.get("probe_removed") is not True
-        or not str(owner_probe.get("derived_report_url") or "").startswith(
-            "https://"
-        )
+        or not isinstance(owner_environment, Mapping)
+        or owner_environment.get("result") != "PASS"
+        or owner_environment.get("mode") != "0600"
+        or owner_environment.get("path")
+        != "/home/mini/.config/g1q3-rca/report-http.env"
+        or owner_environment.get("sha256") != EXPECTED_VM_REPORT_ENV_SHA256
+        or owner_environment.get("viewer_origin") != EXPECTED_VM_REPORT_ORIGIN
+        or not isinstance(live_report, Mapping)
+        or live_report.get("active") is not True
+        or live_report.get("activation_receipt_sha256")
+        != EXPECTED_VM_REPORT_ACTIVATION_SHA256
+        or live_report.get("unit_sha256") != EXPECTED_VM_REPORT_UNIT_SHA256
+        or live_report.get("environment_sha256") != EXPECTED_VM_REPORT_ENV_SHA256
+        or live_report.get("live_smoke")
+        != {
+            "broad_directory_status": 404,
+            "get_bytes": 41,
+            "root_status": 404,
+            "sealed_get_status": 200,
+            "sealed_head_status": 200,
+            "sealed_range_bytes": 8,
+            "sealed_range_status": 206,
+        }
         or not isinstance(closure, Mapping)
         or closure.get("schema_version")
         != "pnc_rca_fixed_cli_mcap_closure_audit_v5"
@@ -1201,9 +1231,9 @@ def _validate_vm_go_receipt(
         or lineage[-1].get("tree") != expected_tree
         or not isinstance(inherited, Mapping)
         or inherited.get("candidate_commit")
-        != "4b26cc7935eb4fa0910b42abde78d7f8d4efa0d1"
+        != "00599fa5cd8718df3c31cd177f606a9e32b2419b"
         or inherited.get("sha256")
-        != "0765e0adfb3e74abe6a1daaea626901003b9b0cb94223a0b401d626d1a48d1bf"
+        != "6dd776db67ff8a0859e050a433a613c3ff1fe17a547a56326ca523b9cdfb405a"
         or inherited.get("authorizes_current_candidate") is not False
         or not isinstance(remote, Mapping)
         or remote.get("commit") != expected_commit

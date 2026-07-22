@@ -385,7 +385,6 @@ def _report_service_binding(
         "WorkingDirectory": "/",
         "UMask": "0077",
         "NoNewPrivileges": "true",
-        "PrivateDevices": "true",
         "PrivateTmp": "true",
         "ProtectSystem": "strict",
         "ProtectHome": "read-only",
@@ -401,6 +400,8 @@ def _report_service_binding(
         observed = [line for line in lines if line.startswith(f"{key}=")]
         if observed != [f"{key}={value}"]:
             raise ClosureAuditError("fixed_cli_closure_report_service_invalid")
+    if any(line.startswith("PrivateDevices=") for line in lines):
+        raise ClosureAuditError("fixed_cli_closure_report_service_invalid")
     if " -m http.server" in unit_text or "SimpleHTTPServer" in unit_text:
         raise ClosureAuditError("fixed_cli_closure_report_service_invalid")
 
@@ -423,6 +424,7 @@ def _report_service_binding(
         "path_traversal": False,
         "symlink_escape": False,
         "read_only": True,
+        "private_devices_omitted_for_user_manager_compatibility": True,
         "old_broad_http_server_forbidden": True,
         "environment_file": REPORT_ENVIRONMENT_FILE,
         "viewer_origin_variable": REPORT_VIEWER_ORIGIN_VARIABLE,

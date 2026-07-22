@@ -112,7 +112,6 @@ ExecStart=/usr/bin/python3 -I -B {root}/{audit.REPORT_SERVER_ENTRYPOINT} --root 
 WorkingDirectory=/
 UMask=0077
 NoNewPrivileges=true
-PrivateDevices=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
@@ -340,6 +339,7 @@ def test_audit_records_exact_task_output_and_zero_cache_seal(tmp_path: Path):
     assert report_service["path_traversal"] is False
     assert report_service["symlink_escape"] is False
     assert report_service["read_only"] is True
+    assert report_service["private_devices_omitted_for_user_manager_compatibility"] is True
     remote_file = result["remote_file_transport"]
     assert remote_file["source_id"] == "remote-file"
     assert remote_file["viewer_query_parameter"] == "ds.url"
@@ -378,6 +378,31 @@ def test_audit_rejects_broad_report_http_service(tmp_path: Path):
     )
     _git(root, "add", str(unit.relative_to(root)))
     _git(root, "commit", "-qm", "weaken report service")
+
+    with pytest.raises(
+        audit.ClosureAuditError,
+        match="fixed_cli_closure_report_service_invalid",
+    ):
+        audit.audit(
+            repo_root=root,
+            entrypoint="pkg/entry.py",
+            expected_commit=_git(root, "rev-parse", "HEAD"),
+            expected_tree=_git(root, "rev-parse", "HEAD^{tree}"),
+        )
+
+
+def test_audit_rejects_private_devices_in_user_service(tmp_path: Path):
+    root, _commit, _tree = _repo(tmp_path)
+    unit = root / audit.REPORT_SERVICE_UNIT
+    unit.write_text(
+        unit.read_text(encoding="utf-8").replace(
+            "NoNewPrivileges=true\n",
+            "NoNewPrivileges=true\nPrivateDevices=true\n",
+        ),
+        encoding="utf-8",
+    )
+    _git(root, "add", str(unit.relative_to(root)))
+    _git(root, "commit", "-qm", "add incompatible user-service directive")
 
     with pytest.raises(
         audit.ClosureAuditError,

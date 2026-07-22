@@ -58,8 +58,8 @@ APPROVAL_DECISION = "authorize_exact_rca_prod_e2e_release"
 RELEASE_APPROVAL_IDENTITY_SCHEMA_VERSION = "pnc_rca_release_approval_identity_v1"
 RELEASE_APPROVAL_IDENTITY_METHOD = "kernel_owner_and_machine_binding"
 
-PIPELINE_COMMIT = "00599fa5cd8718df3c31cd177f606a9e32b2419b"
-PIPELINE_TREE = "27cb14f0cef85de51e32dca5da572ca318ebcb91"
+PIPELINE_COMMIT = "b6b4240727d784da5adb9df825ca10ab51e9d3bb"
+PIPELINE_TREE = "25776345f2b806b0d3bc1e03f70502b1cad2467a"
 PIPELINE_ENTRYPOINT = "api/g1q3_rca/scripts/run_rca_service_request.py"
 PIPELINE_ENTRYPOINT_SHA256 = (
     "1c74abb1781b6b147787879747e84c22aaaa01fdf0507790cb104b33f5773982"
@@ -70,33 +70,33 @@ PIPELINE_SOURCE_ROOT = (
 )
 PIPELINE_CANDIDATE_AUDIT_VM_PATH = (
     "/home/mini/.hermes/rca-prod-runtime/audits/"
-    "00599fa5cd8718df3c31cd177f606a9e32b2419b/independent-go-receipt.json"
+    "b6b4240727d784da5adb9df825ca10ab51e9d3bb/independent-go-receipt.json"
 )
 PIPELINE_CANDIDATE_AUDIT_CIFS_PATH = (
     "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/"
-    "g1q3-rca-00599fa-independent-audit-20260722/receipt-go-00599fa5.json"
+    "g1q3-rca-b6b4240-independent-audit-20260722/receipt-go-b6b4240.json"
 )
 PIPELINE_CANDIDATE_AUDIT_SHA256 = (
-    "6dd776db67ff8a0859e050a433a613c3ff1fe17a547a56326ca523b9cdfb405a"
+    "f2d4769576356c5d1350a176d7d1afbf19a7d5374bd52afff0b9469bb2b45a7a"
 )
 PIPELINE_CLOSURE_CORE_SHA256 = (
-    "85d2211188a98a637e266fcb3623efdc0c5837cdd6b2e96ef3ea006217d37b08"
+    "fb6e6a0e59b7666726741adf2f84943fde19fef1dcd1cc79aa61307913ca28bc"
 )
 PIPELINE_CLOSURE_FILE_SHA256 = (
-    "2a10e84f97ce20f0b1dd46586c7d12659f56626ad55c27e29518f64afd593499"
+    "44be0ccc297c16a9e02dfb73ef66762fac1f97299787d8972c29c2c50ef5ccd8"
 )
 PIPELINE_CLOSURE_VM_PATH = (
-    "/mnt/tmp/g1q3-rca-00599fa-closure-audit-20260722/"
-    "fixed-cli-mcap-hard-rule-audit-00599fa5.json"
+    "/mnt/tmp/g1q3-rca-b6b4240-closure-audit-20260722/"
+    "fixed-cli-mcap-hard-rule-audit-b6b4240.json"
 )
 PIPELINE_CLOSURE_CIFS_PATH = (
     "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/"
-    "g1q3-rca-00599fa-closure-audit-20260722/"
-    "fixed-cli-mcap-hard-rule-audit-00599fa5.json"
+    "g1q3-rca-b6b4240-closure-audit-20260722/"
+    "fixed-cli-mcap-hard-rule-audit-b6b4240.json"
 )
 PIPELINE_CLOSURE_SEALED_MIRROR_PATH = (
     "/Users/songying/.codex/tmp/rca-prod-e2e-release-20260721/evidence/"
-    "fixed-cli-mcap-hard-rule-audit-00599fa5.json"
+    "fixed-cli-mcap-hard-rule-audit-b6b4240.json"
 )
 DIAGNOSTIC_KAFKA_PREREAD_PATH = (
     "/Users/songying/.codex/tmp/rca-prod-e2e-release-20260721/evidence/"
@@ -233,7 +233,7 @@ VM_REPORT_ENTRYPOINT_SHA256 = (
 )
 VM_REPORT_UNIT_RELATIVE = "api/g1q3_rca/systemd/g1q3-rca-report-http.service"
 VM_REPORT_UNIT_SHA256 = (
-    "dbd102d1b63ebcb6ee6615d171fba141a3444c72b333ab68c54ea468340938fa"
+    "ee50b2845ee6a587c4f7b12f795c673bb9d9175139e68d800c330abbdf68bfd4"
 )
 VM_REPORT_LIVE_UNIT_PATH = "/home/mini/.config/systemd/user/g1q3-rca-report-http.service"
 VM_REPORT_ENV_PATH = "/home/mini/.config/g1q3-rca/report-http.env"
@@ -11651,17 +11651,27 @@ def build_blocker_bom(*, now: datetime, verified_test_count: int) -> Mapping[str
                 "viz_manifest_schema": "g1q3_rca_viz_publication_v1",
                 "max_concurrent_requests": 4,
                 "request_queue_size": 16,
+                "activated": True,
+                "environment_sha256": (
+                    "d045dd6d73d81e2cbbee604ea2fe2b663794552f5d63e60b26c6eab2077c218d"
+                ),
+                "activation_receipt_sha256": (
+                    "668b69e9d89a313473b821995f74155edf80d75f4a2710add3cda987e78f2093"
+                ),
             },
             "postcommit_receipt": {
                 "vm_path": PIPELINE_CANDIDATE_AUDIT_VM_PATH,
                 "cifs_path": PIPELINE_CANDIDATE_AUDIT_CIFS_PATH,
                 "sha256": PIPELINE_CANDIDATE_AUDIT_SHA256,
-                "schema_version": "g1q3_rca_vm_candidate_independent_audit_v3",
+                "schema_version": "g1q3_rca_vm_candidate_independent_audit_v4",
                 "verdict": "GO",
                 "deployment_authorization": False,
                 "focused_tests_passed": 149,
                 "filesystem_environment_skips": 1,
-                "owner_only_ext4_probe": True,
+                "live_owner_only_environment_file": True,
+                "live_report_service_activation_receipt": (
+                    "668b69e9d89a313473b821995f74155edf80d75f4a2710add3cda987e78f2093"
+                ),
                 "inherited_posix_symlink_negative_coverage": True,
             },
             "fixed_cli_closure": {
@@ -11695,7 +11705,7 @@ def build_blocker_bom(*, now: datetime, verified_test_count: int) -> Mapping[str
                 "sha256": (
                     "26c3b98060e07101b94204211184058a9d4e26ab6b0403a862bd3463626106a1"
                 ),
-                "binds_final_vm_00599fa5": True,
+                "binds_final_vm_b6b4240": True,
             },
         },
         "target_recovery": {
@@ -11764,7 +11774,7 @@ def build_blocker_bom(*, now: datetime, verified_test_count: int) -> Mapping[str
                     "51d8769e765f5750cbdbf4f02b1258086652ae917aad9a8be1468aba0997264e"
                 ),
                 "classification": "immutable_ancestor_reference_only",
-                "authorizes_final_00599fa5": False,
+                "authorizes_final_b6b4240": False,
             },
             "cross_contract_receipt_sha256": CROSS_CONTRACT_PASS_FILE_SHA256,
             "cross_contract_authorizes_final_candidates": False,
@@ -11774,16 +11784,17 @@ def build_blocker_bom(*, now: datetime, verified_test_count: int) -> Mapping[str
                     "rca-bootstrap-capacity-authorization.json"
                 ),
                 "sha256": (
-                    "20864b402b5a1dbef329ee482a8dd533c12622f80c01842f351a0223a2726697"
+                    "7243493a8a54d1fd205c4c13157cd9a8f2c09c425ad5a632f11ade2c9df77aab"
                 ),
                 "bound_release_bom_sha256": (
-                    "50cc8cf0cd222b66c3df6395c2d954e3ab9fa00b3662178b08d0d4a3240efb61"
+                    "bf9746615bb9e62b3dc8d5c3478fcdbc3a3a7556f524f8a2cdbdaaee406ce64d"
                 ),
+                "scope": "publication_infrastructure_bootstrap_only",
                 "reusable_for_this_bom": False,
             },
         },
         "required_fresh_artifacts": [
-            "final_92f60f4d_00599fa5_manifest_html_cross_contract_receipt",
+            "final_92f60f4d_b6b4240_manifest_html_cross_contract_receipt",
             "fresh_component_binding_with_exact_dns_tls_and_vm_env_identity",
             "fresh_live_kafka_p0_o650_preread_receipt",
             "fresh_viewer_proxy_live_http_tls_browser_receipt",
@@ -11795,8 +11806,6 @@ def build_blocker_bom(*, now: datetime, verified_test_count: int) -> Mapping[str
         "blockers": [
             "final_cross_contract_receipt_absent",
             "canonical_dns_origin_unset",
-            "vm_report_environment_file_unprovisioned",
-            "vm_report_service_not_activated",
             "viewer_proxy_not_installed_or_reloaded",
             "strict_tls_and_nonintercepted_browser_proof_absent",
             "fresh_target_kafka_preread_after_writer_stop_absent",
