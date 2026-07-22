@@ -247,7 +247,7 @@ def test_capacity_guard_fails_before_claim_when_admission_key_is_invalid(tmp_pat
     assert opened[0]["reason_code"] == "dispatcher_bootstrap_authorization_invalid"
 
 
-def test_runtime_closure_includes_prod_admission_but_not_retired_transition():
+def test_runtime_closure_includes_prod_admission_and_capacity_sampling():
     assert {
         "gateway/__init__.py",
         "gateway/pnc_rca_prod_admission.py",
@@ -263,7 +263,9 @@ def test_runtime_closure_includes_prod_admission_but_not_retired_transition():
         "gateway/pnc_rca_capacity_runtime.py",
         "gateway/pnc_rca_capacity_sample_evidence.py",
         "gateway/pnc_rca_capacity_transition.py",
-    }.isdisjoint(RCA_RUNTIME_RELATIVE_FILES)
+        "scripts/pnc_rca_activation.py",
+        "scripts/pnc_rca_capacity_transition_executor.py",
+    }.issubset(RCA_RUNTIME_RELATIVE_FILES)
     assert (
         "vm_task_service_rca_prod_admission_blocked"
         in dispatcher._SERVICE_ERROR_CODES

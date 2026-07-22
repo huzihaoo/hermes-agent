@@ -32,6 +32,24 @@ from gateway.pnc_rca_admission import (
     validate_rca_admission,
     validate_rca_trigger_context,
 )
+from gateway import pnc_rca_capacity_transition as capacity_transition
+from gateway.pnc_rca_capacity_runtime import (
+    CapacityRuntimePaths,
+    load_capacity_hmac_key,
+)
+from gateway.pnc_rca_capacity_sample_evidence import (
+    CapacitySampleEvidenceError,
+    TERMINAL_HMAC_ENV,
+    build_capacity_sample,
+    ensure_owner_only_lock_file,
+    host_success_receipt_path,
+    producer_activation_path,
+    read_and_validate_producer_activation,
+    read_remote_vm_terminal_receipt,
+    validate_host_success_receipt,
+    write_owner_only_create_once,
+)
+from gateway.pnc_rca_control_store import RcaControlStore
 from gateway.pnc_rca_delivery_contract import (
     TERMINAL_DELIVERY_OUTCOMES,
     DeliveryContractError,
@@ -135,6 +153,7 @@ _PUBLIC_TERMINAL_FALLBACK_CODE = "terminal_failure_unclassified"
 
 StatusReader = Callable[[str], Mapping[str, Any]]
 ArtifactBundleReader = Callable[[ExecutionWatchClaim], Mapping[str, Any]]
+TerminalReceiptReader = Callable[[str, str], bytes]
 
 
 def _utc_now() -> datetime:
@@ -267,6 +286,10 @@ class CollectorConfig:
     quarantine_bootstrap_epoch_id: str
     quarantine_active_release_binding_path: Path
     quarantine_live_env_path: Path
+    capacity_sample_enabled: bool = False
+    capacity_sample_batch_size: int = 20
+    capacity_sample_lock_timeout_seconds: int = 5
+    capacity_terminal_receipt_timeout_seconds: int = 15
 
     @classmethod
     def from_env(
@@ -278,6 +301,13 @@ class CollectorConfig:
         source = os.environ if env is None else env
         home = Path(hermes_home or get_hermes_home()).expanduser()
         enabled = _boolean(source, f"{ENV_PREFIX}ENABLED", False)
+        capacity_sample_enabled = _strict_boolean(
+            source, f"{ENV_PREFIX}CAPACITY_SAMPLE_ENABLED", False
+        )
+        if capacity_sample_enabled and not enabled:
+            raise ValueError(
+                f"{ENV_PREFIX}CAPACITY_SAMPLE_ENABLED requires collector ENABLED"
+            )
         poll = _integer(source, f"{ENV_PREFIX}POLL_INTERVAL_SECONDS", 5)
         running_poll = _integer(source, f"{ENV_PREFIX}RUNNING_POLL_SECONDS", 20)
         max_poll = _integer(source, f"{ENV_PREFIX}MAX_POLL_SECONDS", 300)
@@ -305,6 +335,27 @@ class CollectorConfig:
             raise ValueError(
                 f"{ENV_PREFIX}LEASE_SECONDS must exceed "
                 "ARTIFACT_READ_TIMEOUT_SECONDS plus the lease margin"
+            )
+        capacity_batch = _integer(
+            source,
+            f"{ENV_PREFIX}CAPACITY_SAMPLE_BATCH_SIZE",
+            20,
+            minimum=1,
+        )
+        if capacity_batch > 100:
+            raise ValueError(
+                f"{ENV_PREFIX}CAPACITY_SAMPLE_BATCH_SIZE must be at most 100"
+            )
+        terminal_receipt_timeout = _integer(
+            source,
+            f"{ENV_PREFIX}CAPACITY_TERMINAL_RECEIPT_TIMEOUT_SECONDS",
+            15,
+            minimum=1,
+        )
+        if terminal_receipt_timeout > 30:
+            raise ValueError(
+                f"{ENV_PREFIX}CAPACITY_TERMINAL_RECEIPT_TIMEOUT_SECONDS "
+                "must be at most 30"
             )
         control_db_path = Path(
             source.get(
@@ -358,6 +409,15 @@ class CollectorConfig:
                 quarantine.active_release_binding_path
             ),
             quarantine_live_env_path=quarantine.live_env_path,
+            capacity_sample_enabled=capacity_sample_enabled,
+            capacity_sample_batch_size=capacity_batch,
+            capacity_sample_lock_timeout_seconds=_integer(
+                source,
+                f"{ENV_PREFIX}CAPACITY_SAMPLE_LOCK_TIMEOUT_SECONDS",
+                5,
+                minimum=1,
+            ),
+            capacity_terminal_receipt_timeout_seconds=terminal_receipt_timeout,
         )
 
     def public_dict(self) -> dict[str, Any]:
@@ -383,6 +443,14 @@ class CollectorConfig:
                 self.quarantine_active_release_binding_path
             ),
             "quarantine_live_env_path": str(self.quarantine_live_env_path),
+            "capacity_sample_enabled": self.capacity_sample_enabled,
+            "capacity_sample_batch_size": self.capacity_sample_batch_size,
+            "capacity_sample_lock_timeout_seconds": (
+                self.capacity_sample_lock_timeout_seconds
+            ),
+            "capacity_terminal_receipt_timeout_seconds": (
+                self.capacity_terminal_receipt_timeout_seconds
+            ),
             "remote_css_parser": {
                 **expected_remote_css_runtime_dependency(),
             },
@@ -411,6 +479,12 @@ class CollectorStats:
     retried: int = 0
     idle: int = 0
     stale_lease: int = 0
+    capacity_scanned: int = 0
+    capacity_eligible: int = 0
+    capacity_appended: int = 0
+    capacity_rejected: int = 0
+    capacity_frozen: int = 0
+    capacity_last_error: str = ""
 
 
 @dataclass(frozen=True)
@@ -1380,6 +1454,8 @@ class DeliveryCollector:
         config: CollectorConfig,
         status_reader: StatusReader = default_status_reader,
         artifact_bundle_reader: ArtifactBundleReader | None = None,
+        terminal_receipt_reader: TerminalReceiptReader | None = None,
+        capacity_control_store: RcaControlStore | None = None,
         now: Callable[[], datetime] = _utc_now,
         lease_owner: str | None = None,
     ):
@@ -1399,6 +1475,19 @@ class DeliveryCollector:
         )
         self.stats = CollectorStats()
         self.runtime_identity: Mapping[str, Any] | None = None
+        self.capacity_control_store = capacity_control_store
+        self.terminal_receipt_reader = terminal_receipt_reader or (
+            lambda task_id, attempt_id: read_remote_vm_terminal_receipt(
+                ssh_mini_agent=self.config.ssh_mini_agent,
+                task_id=task_id,
+                attempt_id=attempt_id,
+                timeout_seconds=(
+                    self.config.capacity_terminal_receipt_timeout_seconds
+                ),
+            )
+        )
+        self.capacity_last_error = ""
+        self.capacity_last_outcome = "disabled"
 
     def backfill(self) -> int:
         inserted = self.store.backfill_completed_submissions(
@@ -1746,7 +1835,209 @@ class DeliveryCollector:
             outcomes.append(outcome)
             if outcome.status in {"disabled", "idle"}:
                 break
+        try:
+            self.collect_capacity_samples()
+        except Exception as exc:
+            self.stats.capacity_rejected += 1
+            code = getattr(exc, "code", "rca_capacity_sample_collection_failed")
+            self.capacity_last_error = str(code)[:120]
+            self.stats.capacity_last_error = self.capacity_last_error
+            self.capacity_last_outcome = "rejected"
+            raise
         return outcomes
+
+    def _capacity_store(self) -> RcaControlStore:
+        if self.capacity_control_store is None:
+            self.capacity_control_store = RcaControlStore(
+                self.config.control_db_path, require_current=True
+            )
+        return self.capacity_control_store
+
+    def _capacity_ledger_identities(
+        self, paths: CapacityRuntimePaths, *, hmac_key: bytes
+    ) -> set[tuple[str, str]]:
+        try:
+            paths.sample_ledger.lstat()
+        except FileNotFoundError:
+            return set()
+        ledger = capacity_transition.read_sample_ledger(
+            paths.sample_ledger,
+            hmac_key=hmac_key,
+            timeout_seconds=self.config.capacity_sample_lock_timeout_seconds,
+        )
+        return {
+            (str(sample["task_id"]), str(sample["attempt_id"]))
+            for sample in ledger.samples
+        }
+
+    def collect_capacity_samples(self) -> None:
+        if not self.config.capacity_sample_enabled:
+            self.capacity_last_outcome = "disabled"
+            self.capacity_last_error = ""
+            self.stats.capacity_last_error = ""
+            return
+        paths = CapacityRuntimePaths.from_control_db(self.config.control_db_path)
+        key = load_capacity_hmac_key()
+        raw_terminal_key = os.environ.get(TERMINAL_HMAC_ENV, "").strip()
+        terminal_key = (
+            load_capacity_hmac_key(raw_terminal_key) if raw_terminal_key else None
+        )
+        control = self._capacity_store()
+        self.capacity_last_error = ""
+        self.stats.capacity_last_error = ""
+        ensure_owner_only_lock_file(paths.global_lock)
+        with capacity_transition.capacity_flock(
+            paths.global_lock,
+            exclusive=False,
+            timeout_seconds=self.config.capacity_sample_lock_timeout_seconds,
+        ):
+            state = control.capacity_transition_state()
+            if state is None:
+                raise CapacitySampleEvidenceError(
+                    "rca_capacity_persisted_state_missing"
+                )
+            if state.get("state") == capacity_transition.STEADY_ACTIVE:
+                self.stats.capacity_frozen += 1
+                self.capacity_last_outcome = "frozen"
+                return
+            if state.get("state") != capacity_transition.BOOTSTRAP_PRODUCTION:
+                raise CapacitySampleEvidenceError(
+                    "rca_capacity_sample_producer_not_bootstrap"
+                )
+            activation, activation_sha = read_and_validate_producer_activation(
+                producer_activation_path(paths.state_root),
+                hmac_key=key,
+                expected_release_id=str(state.get("release_id") or ""),
+                expected_bootstrap_epoch_id=str(
+                    state.get("bootstrap_epoch_id") or ""
+                ),
+            )
+            excluded = self._capacity_ledger_identities(paths, hmac_key=key)
+        activated_at = datetime.fromisoformat(
+            str(activation["activated_at"]).replace("Z", "+00:00")
+        ).astimezone(timezone.utc)
+        snapshots = self.store.capacity_sample_candidates(
+            activated_at=activated_at,
+            limit=self.config.capacity_sample_batch_size,
+            excluded_task_attempts=excluded,
+        )
+        self.stats.capacity_scanned += len(snapshots)
+        if not snapshots:
+            self.capacity_last_outcome = "idle"
+            return
+        for snapshot in snapshots:
+            payload = snapshot.payload
+            task_id = str(payload.get("task_id") or "")
+            attempt_id = str(payload.get("attempt_id") or "")
+            try:
+                if not task_id or not attempt_id:
+                    raise CapacitySampleEvidenceError(
+                        "rca_capacity_delivery_snapshot_identity_invalid"
+                    )
+                terminal_raw = self.terminal_receipt_reader(task_id, attempt_id)
+                observed_at = datetime.fromisoformat(
+                    str(payload.get("snapshot_at") or "").replace(
+                        "Z", "+00:00"
+                    )
+                ).astimezone(timezone.utc)
+                built = build_capacity_sample(
+                    snapshot=payload,
+                    delivery_snapshot_sha256=snapshot.snapshot_sha256,
+                    task_meta=payload.get("task_meta") or {},
+                    vm_terminal_raw=terminal_raw,
+                    producer_activation=activation,
+                    producer_activation_receipt_sha256=activation_sha,
+                    admission_hmac_key=key,
+                    terminal_hmac_key=terminal_key,
+                    observed_at=observed_at,
+                )
+                self.stats.capacity_eligible += 1
+                with capacity_transition.capacity_flock(
+                    paths.global_lock,
+                    exclusive=True,
+                    timeout_seconds=(
+                        self.config.capacity_sample_lock_timeout_seconds
+                    ),
+                ):
+                    current_state = control.capacity_transition_state()
+                    if current_state is None:
+                        raise CapacitySampleEvidenceError(
+                            "rca_capacity_persisted_state_missing"
+                        )
+                    if current_state.get("state") == capacity_transition.STEADY_ACTIVE:
+                        self.stats.capacity_frozen += 1
+                        self.capacity_last_outcome = "frozen"
+                        return
+                    if (
+                        current_state.get("state")
+                        != capacity_transition.BOOTSTRAP_PRODUCTION
+                        or current_state.get("release_id") != state.get("release_id")
+                        or current_state.get("bootstrap_epoch_id")
+                        != state.get("bootstrap_epoch_id")
+                    ):
+                        raise CapacitySampleEvidenceError(
+                            "rca_capacity_sample_producer_state_changed"
+                        )
+                    current_activation, current_activation_sha = (
+                        read_and_validate_producer_activation(
+                            producer_activation_path(paths.state_root),
+                            hmac_key=key,
+                            expected_release_id=str(
+                                current_state.get("release_id") or ""
+                            ),
+                            expected_bootstrap_epoch_id=str(
+                                current_state.get("bootstrap_epoch_id") or ""
+                            ),
+                        )
+                    )
+                    if (
+                        current_activation != activation
+                        or current_activation_sha != activation_sha
+                    ):
+                        raise CapacitySampleEvidenceError(
+                            "rca_capacity_producer_receipt_changed"
+                        )
+                    excluded = self._capacity_ledger_identities(
+                        paths, hmac_key=key
+                    )
+                    if (task_id, attempt_id) in excluded:
+                        self.capacity_last_outcome = "deduped"
+                        continue
+                    host_path = host_success_receipt_path(
+                        paths.state_root,
+                        task_id=task_id,
+                        attempt_id=attempt_id,
+                    )
+                    host_sha = write_owner_only_create_once(
+                        host_path, built.host_success_receipt
+                    )
+                    if host_sha != built.host_success_receipt_sha256:
+                        raise CapacitySampleEvidenceError(
+                            "rca_capacity_host_receipt_publish_mismatch"
+                        )
+                    validate_host_success_receipt(
+                        built.host_success_receipt, hmac_key=key
+                    )
+                    capacity_transition.append_capacity_sample(
+                        paths.sample_ledger,
+                        built.sample,
+                        hmac_key=key,
+                        persisted_state_loader=control.capacity_transition_state,
+                        timeout_seconds=(
+                            self.config.capacity_sample_lock_timeout_seconds
+                        ),
+                    )
+                    excluded.add((task_id, attempt_id))
+                    self.stats.capacity_appended += 1
+                    self.capacity_last_outcome = "appended"
+            except Exception as exc:
+                self.stats.capacity_rejected += 1
+                code = getattr(
+                    exc, "code", "rca_capacity_sample_collection_failed"
+                )
+                self.capacity_last_error = str(code)[:120]
+                self.stats.capacity_last_error = self.capacity_last_error
+                self.capacity_last_outcome = "rejected"
 
     def dry_run_once(self) -> dict[str, Any]:
         rows = self.store.preview_unwatched_completed(
@@ -1897,6 +2188,10 @@ class HealthReporter:
                 state in {"running", "idle", "disabled"}
                 and not error
                 and not dependency_error
+                and not (
+                    self.config.capacity_sample_enabled
+                    and stats.capacity_last_error
+                )
                 and self.dependencies_ready
                 and (
                     not self.config.enabled or store_health.get("ok") is True
@@ -1913,6 +2208,15 @@ class HealthReporter:
             },
             "dependency_error": dependency_error,
             "stats": asdict(stats),
+            "capacity_samples": {
+                "enabled": self.config.capacity_sample_enabled,
+                "scanned": stats.capacity_scanned,
+                "eligible": stats.capacity_eligible,
+                "appended": stats.capacity_appended,
+                "rejected": stats.capacity_rejected,
+                "frozen": stats.capacity_frozen,
+                "last_error": stats.capacity_last_error,
+            },
             "store": store_health,
             "last_outcome": asdict(last_outcome) if last_outcome else None,
             "error": str(error or "")[:1000],
