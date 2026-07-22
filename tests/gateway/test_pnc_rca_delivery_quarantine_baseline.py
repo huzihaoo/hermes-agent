@@ -490,6 +490,75 @@ def test_offline_preapproval_core_exactly_matches_post_migration_live_core(tmp_p
     }
 
 
+def test_baseline_can_be_reissued_after_monotonic_quarantine_audit_events(tmp_path):
+    bundle = _build_bundle(tmp_path)
+    with sqlite3.connect(bundle["store"].db_path) as conn:
+        conn.execute(
+            "UPDATE rca_delivery_subscriptions SET status = 'quarantined', "
+            "updated_at = ? WHERE effect_kind = 'feishu_issue_comment'",
+            ((NOW + timedelta(seconds=6)).isoformat(),),
+        )
+        conn.execute(
+            "UPDATE rca_delivery_subscriptions SET status = 'materialized', "
+            "updated_at = ? WHERE effect_kind = 'feishu_issue_comment'",
+            ((NOW + timedelta(seconds=7)).isoformat(),),
+        )
+
+    assert _health(bundle)["business_ready"] is False
+    core = build_quarantine_core(
+        bundle["store"].db_path,
+        **_migration_kwargs(bundle["migration"]),
+        release_id="release-baseline-002",
+        snapshot_at=NOW + timedelta(seconds=8),
+        settlement_receipt_paths=[bundle["receipt"]],
+        analyzed_by="forensic-operator",
+        reason="reissue after legitimate monotonic quarantine audit events",
+    )
+    release_manifest_sha256 = _write(
+        tmp_path / "release_prepare_manifest-002.json",
+        {
+            "schema_version": "pnc_rca_release_prepare_manifest_v1",
+            "release_id": core["release_id"],
+            "release_bom_sha256": bundle["release_bom_sha256"],
+            "quarantine_core_sha256": core["core_sha256"],
+            "created_at": (NOW + timedelta(seconds=9)).isoformat(),
+            "complete": True,
+            "side_effect_contract": {
+                "live_files_written": False,
+                "launchctl_invoked": False,
+            },
+        },
+    )
+    approval_sha256 = _write(
+        tmp_path / "approval-002.json",
+        {
+            "schema_version": APPROVAL_SCHEMA_VERSION,
+            "release_id": core["release_id"],
+            "quarantine_core_sha256": core["core_sha256"],
+            "release_bom_sha256": bundle["release_bom_sha256"],
+            "decision": "authorize_rca_delivery_quarantine_baseline",
+            "identity": {"uid": os.geteuid(), "username": "owner-user"},
+            "created_at": (NOW + timedelta(seconds=10)).isoformat(),
+        },
+    )
+
+    baseline = issue_quarantine_baseline(
+        bundle["store"].db_path,
+        quarantine_core=core,
+        release_manifest_path=tmp_path / "release_prepare_manifest-002.json",
+        expected_release_manifest_sha256=release_manifest_sha256,
+        expected_release_bom_sha256=bundle["release_bom_sha256"],
+        approval_evidence_path=tmp_path / "approval-002.json",
+        expected_approval_evidence_sha256=approval_sha256,
+        baseline_id="baseline-release-002",
+        issued_at=NOW + timedelta(seconds=11),
+    )
+
+    assert baseline["quarantine_core"]["quarantine_event_projection"] == (
+        core["quarantine_event_projection"]
+    )
+
+
 @pytest.mark.parametrize(
     "drift",
     ["clone_replaced", "missing_table", "trigger_drift", "index_drift"],

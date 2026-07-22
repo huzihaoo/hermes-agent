@@ -1711,13 +1711,15 @@ def _build_quarantine_core(
     observed_at = _iso(snapshot_at)
     descriptors = _receipt_descriptors(settlement_receipt_paths)
     target_path = Path(target_live_db_path).expanduser().absolute()
+    source_path = Path(db_path).expanduser().absolute()
+    is_offline_clone = source_path != target_path
     try:
         migration_binding = validate_migration_receipt(
             receipt_path=migration_receipt_path,
             expected_sha256=expected_migration_receipt_sha256,
             target_live_db_path=target_path,
-            migrated_db_path=db_path,
-            migrated_db_is_live=(Path(db_path).expanduser().absolute() == target_path),
+            migrated_db_path=source_path if is_offline_clone else None,
+            migrated_db_is_live=False,
             expected_migration_runtime_sha256=migration_runtime_sha256,
         )
     except QuarantineMigrationError as exc:
@@ -1776,7 +1778,7 @@ def _build_quarantine_core(
             db_path=db_path,
             identity_db_path=target_path,
             value=core,
-            require_post_migration_match=True,
+            require_post_migration_match=is_offline_clone,
         )
         conn.rollback()
         return core
@@ -1886,7 +1888,6 @@ def issue_quarantine_baseline(
             conn,
             db_path=db_path,
             value=core_value,
-            require_post_migration_match=True,
         )
         release_manifest = _validate_release_manifest(
             manifest_path=release_manifest_path,
