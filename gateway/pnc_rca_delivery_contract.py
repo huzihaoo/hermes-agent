@@ -16,6 +16,7 @@ from urllib.parse import quote, unquote, urlparse
 from gateway.pnc_rca_admission import RcaAdmission, validate_rca_admission
 from scripts.pnc_foxglove_delivery import (
     canonical_publication_origin,
+    canonical_viz_mcap_cifs_path,
     canonical_viz_mcap_path,
     foxglove_url,
     validate_foxglove_url,
@@ -89,7 +90,7 @@ MAX_FEISHU_COMMENT_BYTES = 8 * 1024
 MAX_CONCLUSION_BYTES = 2 * 1024
 RCA_RESULT_FIELD_KEY = "field_9193cb"
 RCA_REPORT_FIELD_KEY = "field_8c912e"
-DELIVERY_REPORT_LINK_KIND = "manifest_html"
+DELIVERY_REPORT_LINK_KIND = "foxglove_viz"
 _HTML_REPORT_STATUSES = frozenset(
     {"html_delivery_ready", "report_generated_need_review", "report_ready"}
 )
@@ -428,8 +429,8 @@ def build_issue_comment_content(
         lines.append(f"候选结论：{conclusion}")
     lines.extend(
         [
-            f"归因报告：{report_url}",
-            f"报告文件（CIFS）：{report_cifs_path}",
+            f"Foxglove 归因报告：{report_url}",
+            f"可视化文件（CIFS）：{report_cifs_path}",
             "说明：以上为自动 RCA 候选结论，需人工复核确认后再结案。",
         ]
     )
@@ -458,7 +459,7 @@ def build_thread_reply_content(
         lines.append(f"候选结论：{conclusion}")
     lines.extend(
         [
-            f"归因报告：{report_url}",
+            f"Foxglove 归因报告：{report_url}",
             f"问题单：{issue_url}",
             "说明：以上为自动 RCA 候选结论，需人工复核确认后再结案。",
         ]
@@ -1799,7 +1800,7 @@ def verify_delivery_bundle(
             "contract HTML/JSON paths do not match the sealed manifest",
         )
 
-    report_url = _validate_report_url(
+    _validate_report_url(
         manifest.get("report_url"),
         submission_key=validated_admission.submission_key,
         artifact_set_id=expected_artifact_set_id,
@@ -1809,10 +1810,11 @@ def verify_delivery_bundle(
         submission_key=validated_admission.submission_key,
         artifact_set_id=expected_artifact_set_id,
     )
-    report_cifs_path = build_report_cifs_path(
-        validated_admission.submission_key,
-        expected_artifact_set_id,
+    report_cifs_path = canonical_viz_mcap_cifs_path(
+        validated_admission.submission_key
     )
+    if not report_cifs_path:
+        raise DeliveryContractError("viz_publication_cifs_path_invalid")
     refs = validated_admission.source_refs
     target_key = (
         f"feishu_project:{refs.project_key}:{refs.work_item_type_key}:"
@@ -1857,7 +1859,7 @@ def verify_delivery_bundle(
         "work_item_id": refs.work_item_id,
         "issue_url": issue_url,
         "artifact_set_id": expected_artifact_set_id,
-        "report_url": report_url,
+        "report_url": rendered_foxglove_url,
         "report_cifs_path": report_cifs_path,
         "viz_mcap_vm": viz_mcap_vm,
         "foxglove_url": rendered_foxglove_url,
@@ -1872,7 +1874,7 @@ def verify_delivery_bundle(
             },
             {
                 "field_key": RCA_REPORT_FIELD_KEY,
-                "field_value": report_url,
+                "field_value": rendered_foxglove_url,
             },
         ],
     }
@@ -1891,7 +1893,7 @@ def verify_delivery_bundle(
         work_item_id=refs.work_item_id,
         report_status=report_status,
         conclusion=conclusion,
-        report_url=report_url,
+        report_url=rendered_foxglove_url,
         report_cifs_path=report_cifs_path,
     )
     effect_payload = {
@@ -1914,7 +1916,7 @@ def verify_delivery_bundle(
         work_item_id=refs.work_item_id,
         target_key=target_key,
         issue_url=issue_url,
-        report_url=report_url,
+        report_url=rendered_foxglove_url,
         viz_mcap_vm=viz_mcap_vm,
         foxglove_url=rendered_foxglove_url,
         conclusion=conclusion,

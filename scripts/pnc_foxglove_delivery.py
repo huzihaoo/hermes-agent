@@ -9,20 +9,18 @@ from typing import Any
 from urllib.parse import quote, urlsplit
 
 
-VM_TASK_OUTPUT_PREFIX = "/mnt/tmp/"
-VM_TASK_OUTPUT_CIFS_PREFIX = (
-    "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/"
-)
 PERCEPTION_TEST_TEAM_VM_PREFIX = "/mnt/minieye/pdcl/department/perception_test_team/"
-LEGACY_G1Q3_RCA_FORMAL_VIZ_ROOT = (
+G1Q3_RCA_FORMAL_VIZ_ROOT = (
     PERCEPTION_TEST_TEAM_VM_PREFIX.rstrip("/") + "/G1Q3_RCA/cases"
+)
+G1Q3_RCA_FORMAL_VIZ_CIFS_ROOT = (
+    "//hfs.minieye.tech/department-perception_test_team/G1Q3_RCA/cases"
 )
 FOXGLOVE_PATH_SAFE = "/._-()[]中文abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 DEFAULT_FOXGLOVE_RENDER_HOST = "192.168.21.217"
-RCA_REMOTE_FILE_ROUTE_PREFIX = "/g1q3-rca-artifacts/v1/"
+FIXED_FOXGLOVE_ORIGIN = f"https://{DEFAULT_FOXGLOVE_RENDER_HOST}"
 _SAFE_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$")
 _DNS_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
-_LEGACY_KEY_PUNCTUATION = frozenset("._-")
 
 
 def _is_whatwg_ipv4_number(value: str) -> bool:
@@ -33,23 +31,12 @@ def _is_whatwg_ipv4_number(value: str) -> bool:
     return value.isdigit()
 
 
-def _is_safe_legacy_key(key: str) -> bool:
-    try:
-        encoded = key.encode("utf-8")
-    except UnicodeEncodeError:
-        return False
-    return (
-        0 < len(encoded) <= 768
-        and all(char.isalnum() or char in _LEGACY_KEY_PUNCTUATION for char in key)
-    )
-
-
 def canonical_viz_mcap_path(submission_key: Any) -> str:
     """Return the immutable Foxglove-visible path for one RCA submission."""
     key = str(submission_key or "").strip()
     if not _SAFE_SEGMENT_RE.fullmatch(key):
         return ""
-    return f"{VM_TASK_OUTPUT_PREFIX}{key}/{key}.viz.mcap"
+    return f"{G1Q3_RCA_FORMAL_VIZ_ROOT}/{key}/{key}.viz.mcap"
 
 
 def canonical_viz_mcap_cifs_path(submission_key: Any) -> str:
@@ -57,7 +44,7 @@ def canonical_viz_mcap_cifs_path(submission_key: Any) -> str:
     key = str(submission_key or "").strip()
     if not _SAFE_SEGMENT_RE.fullmatch(key):
         return ""
-    return f"{VM_TASK_OUTPUT_CIFS_PREFIX}{key}/{key}.viz.mcap"
+    return f"{G1Q3_RCA_FORMAL_VIZ_CIFS_ROOT}/{key}/{key}.viz.mcap"
 
 
 def _is_supported_viz_path(path: str) -> bool:
@@ -72,10 +59,7 @@ def _is_supported_viz_path(path: str) -> bool:
     key = viz_path.parent.name
     if viz_path.name != f"{key}.viz.mcap":
         return False
-    if _SAFE_SEGMENT_RE.fullmatch(key) and path == canonical_viz_mcap_path(key):
-        return True
-    legacy = f"{LEGACY_G1Q3_RCA_FORMAL_VIZ_ROOT}/{key}/{key}.viz.mcap"
-    return _is_safe_legacy_key(key) and path == legacy
+    return _SAFE_SEGMENT_RE.fullmatch(key) is not None and path == canonical_viz_mcap_path(key)
 
 
 def _canonical_origin_host(hostname: str) -> str:
@@ -177,31 +161,16 @@ def canonical_publication_origin() -> str:
     return base
 
 
-def canonical_viz_remote_file_url(submission_key: Any) -> str:
-    """Return the same-origin HTTPS URL served by the scoped viewer proxy."""
-    key = str(submission_key or "").strip()
-    base = _foxglove_base(require_explicit=True)
-    if not _SAFE_SEGMENT_RE.fullmatch(key) or not base.startswith("https://"):
-        return ""
-    return f"{base}{RCA_REMOTE_FILE_ROUTE_PREFIX}{key}/{key}.viz.mcap"
-
-
 def foxglove_url(viz_mcap_vm: Any) -> str:
     """Build the CVEStudio URL for one verified delivery-contract path."""
     path = str(viz_mcap_vm or "").strip()
     if not _is_supported_viz_path(path):
         return ""
 
-    base = _foxglove_base()
-    if not base:
-        return ""
-    if path.startswith(VM_TASK_OUTPUT_PREFIX):
-        key = PurePosixPath(path).parent.name
-        remote_file_url = canonical_viz_remote_file_url(key)
-        if not remote_file_url:
-            return ""
-        return f"{base}/?ds=remote-file&ds.url={quote(remote_file_url, safe='')}"
-    return f"{base}/?ds=foxglove-http&ds.mcapPath={quote(path, safe=FOXGLOVE_PATH_SAFE)}"
+    return (
+        f"{FIXED_FOXGLOVE_ORIGIN}/?ds=foxglove-http&ds.mcapPath="
+        f"{quote(path, safe=FOXGLOVE_PATH_SAFE)}"
+    )
 
 
 def validate_foxglove_url(value: Any, viz_mcap_vm: Any) -> bool:

@@ -43,8 +43,6 @@ from gateway.pnc_rca_delivery_contract import (
     RCA_REPORT_FIELD_KEY,
     RCA_RESULT_FIELD_KEY,
     build_issue_comment_content,
-    build_report_artifact_url,
-    build_report_cifs_path,
     build_thread_reply_content,
     build_terminal_delivery,
     build_terminal_thread_reply_effect,
@@ -75,6 +73,7 @@ from gateway.pnc_rca_runtime_identity import (
 )
 from hermes_constants import get_hermes_home
 from scripts.pnc_foxglove_delivery import (
+    canonical_viz_mcap_cifs_path,
     canonical_viz_mcap_path,
     validate_foxglove_url,
 )
@@ -1716,20 +1715,17 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
     manifest_submission_key = str(claim.manifest.get("submission_key") or "").strip()
     if not manifest_submission_key:
         raise DeliveryContractError("delivery_manifest_store_identity_mismatch")
-    validate_report_url(
-        claim.report_url,
-        submission_key=manifest_submission_key,
-        artifact_set_id=claim.artifact_set_id,
-    )
-    expected_report_cifs_path = build_report_cifs_path(
-        manifest_submission_key,
-        claim.artifact_set_id,
+    expected_viz_path = canonical_viz_mcap_path(manifest_submission_key)
+    if not validate_foxglove_url(claim.report_url, expected_viz_path):
+        raise DeliveryContractError("delivery_effect_report_url_invalid")
+    expected_report_cifs_path = canonical_viz_mcap_cifs_path(
+        manifest_submission_key
     )
     if payload.get("report_cifs_path") != expected_report_cifs_path:
         raise DeliveryContractError("delivery_report_cifs_identity_mismatch")
-    expected_viz_path = canonical_viz_mcap_path(manifest_submission_key)
     if (
         payload.get("viz_mcap_vm") != expected_viz_path
+        or payload.get("foxglove_url") != claim.report_url
         or not validate_foxglove_url(
             payload.get("foxglove_url"), payload.get("viz_mcap_vm")
         )
@@ -1755,8 +1751,11 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
     ]
     if payload.get("field_updates") != expected_field_updates:
         raise DeliveryContractError("delivery_effect_field_updates_invalid")
-    if claim.manifest.get("report_url") != claim.report_url:
-        raise DeliveryContractError("delivery_manifest_store_identity_mismatch")
+    validate_report_url(
+        claim.manifest.get("report_url"),
+        submission_key=manifest_submission_key,
+        artifact_set_id=claim.artifact_set_id,
+    )
     verified_artifacts = verify_persisted_artifact_inventory(
         manifest=claim.manifest,
         stored_artifacts=claim.artifacts,
@@ -1835,20 +1834,11 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         != artifacts_by_role["report_data"].sha256
     ):
         raise DeliveryContractError("html_validation_report_data_hash_mismatch")
-    artifact_requests = tuple(
-        (
-            artifact.role,
-            build_report_artifact_url(claim.report_url, artifact.relative_path),
-            artifact.size,
-            artifact.sha256,
-        )
-        for artifact in verified_artifacts
-    )
     return ValidatedEffect(
         effect_kind=claim.effect_kind,
         marker=marker,
         content=content,
-        artifacts=artifact_requests,
+        artifacts=(),
         field_updates=(
             (
                 RCA_RESULT_FIELD_KEY,
