@@ -747,6 +747,41 @@ def test_consecutive_permanent_watch_failures_open_circuit_until_manual_reset(
     assert store.permanent_failure_circuit_state()["consecutive_failures"] == 1
 
 
+def test_missing_work_item_quarantine_does_not_open_pipeline_circuit(tmp_path):
+    store, effect = _claimed_effect(tmp_path)
+    conn = store._connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        store._record_permanent_failure_in_transaction(
+            conn,
+            circuit_name=DELIVERY_EFFECT_KIND,
+            subject_key="prior-pipeline-failure",
+            failure_state="quarantined",
+            error_code="report_http_verification_mismatch",
+            error_detail="sealed report mismatch",
+            current=NOW.isoformat(),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert store.permanent_failure_circuit_state()["consecutive_failures"] == 1
+
+    store.quarantine_effect(
+        claim=effect,
+        error_code="feishu_work_item_not_found",
+        error_detail="deterministic missing target",
+        now=NOW,
+    )
+
+    assert store.delivery_dispatcher_circuit().is_open is False
+    assert store.permanent_failure_circuit_state() == {
+        "threshold": PERMANENT_FAILURE_CIRCUIT_THRESHOLD,
+        "consecutive_failures": 0,
+        "last_failure": {},
+    }
+    assert store.list_rows("rca_delivery_effects")[0]["status"] == "quarantined"
+
+
 def test_successful_required_delivery_breaks_permanent_failure_streak(tmp_path):
     store = _completed_cases(tmp_path, 3)
 

@@ -64,6 +64,7 @@ DELIVERY_WATCH_SLA_SECONDS = 86_400
 PERMANENT_FAILURE_CIRCUIT_THRESHOLD = 2
 _PERMANENT_FAILURE_STREAK_META_KEY = "permanent_failure_streak"
 _PERMANENT_FAILURE_LAST_META_KEY = "permanent_failure_last"
+_NON_PIPELINE_QUARANTINE_CODES = frozenset({"feishu_work_item_not_found"})
 SUPPORTED_DELIVERY_STORE_SCHEMA_VERSIONS = frozenset(
     {
         "pnc_rca_delivery_store_v1",
@@ -3937,15 +3938,22 @@ class RcaDeliveryStore:
         job_status = self._aggregate_job_status(
             conn, str(row["delivery_id"]), current
         )
-        self._record_permanent_failure_in_transaction(
-            conn,
-            circuit_name=claim.effect_kind,
-            subject_key=claim.effect_key,
-            failure_state="quarantined",
-            error_code=error_code,
-            error_detail=error_detail,
-            current=current,
-        )
+        if error_code in _NON_PIPELINE_QUARANTINE_CODES:
+            self._reset_permanent_failure_streak_in_transaction(
+                conn,
+                circuit_name=claim.effect_kind,
+                require_closed_circuit=True,
+            )
+        else:
+            self._record_permanent_failure_in_transaction(
+                conn,
+                circuit_name=claim.effect_kind,
+                subject_key=claim.effect_key,
+                failure_state="quarantined",
+                error_code=error_code,
+                error_detail=error_detail,
+                current=current,
+            )
         return DeliveryEffectMutation(
             claim.effect_key, claim.delivery_id, "quarantined", job_status
         )
