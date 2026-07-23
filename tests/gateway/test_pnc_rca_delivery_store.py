@@ -2239,6 +2239,25 @@ def test_capacity_sample_candidates_are_bounded_read_only_snapshots(tmp_path):
         now=NOW + timedelta(seconds=2),
     )
 
+    assert store.capacity_sample_candidates(
+        activated_at=NOW - timedelta(seconds=1), limit=1
+    ) == []
+    with sqlite3.connect(store.db_path) as conn:
+        row = conn.execute(
+            "SELECT last_status_json FROM rca_execution_watch WHERE task_id = ?",
+            (watch.task_id,),
+        ).fetchone()
+        assert row is not None
+        status = json.loads(row[0])
+        status["meta"]["rca_prod_capacity_sample_eligible"] = True
+        conn.execute(
+            "UPDATE rca_execution_watch SET last_status_json = ? WHERE task_id = ?",
+            (
+                json.dumps(status, sort_keys=True, separators=(",", ":")),
+                watch.task_id,
+            ),
+        )
+
     snapshots = store.capacity_sample_candidates(
         activated_at=NOW - timedelta(seconds=1), limit=1
     )
@@ -2281,7 +2300,10 @@ def test_capacity_sample_candidates_ignore_pre_activation_and_failures(tmp_path)
         status={
             "success": True,
             "state": "completed",
-            "meta": {"rca_prod_attempt_id": "attempt-bootstrap-1"},
+            "meta": {
+                "rca_prod_attempt_id": "attempt-bootstrap-1",
+                "rca_prod_capacity_sample_eligible": True,
+            },
         },
         now=NOW,
     )

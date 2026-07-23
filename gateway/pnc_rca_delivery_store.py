@@ -4798,6 +4798,8 @@ class RcaDeliveryStore:
                 status = _json_object(row["last_status_json"])
                 task_meta = status.get("meta")
                 task_meta = dict(task_meta) if isinstance(task_meta, Mapping) else {}
+                if task_meta.get("rca_prod_capacity_sample_eligible") is not True:
+                    continue
                 task_id = str(row["task_id"] or "")
                 attempt_id = str(task_meta.get("rca_prod_attempt_id") or "")
                 if (task_id, attempt_id) in excluded:
