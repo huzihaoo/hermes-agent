@@ -244,7 +244,7 @@ def test_pinned_release_goal_bytes_survive_creator_and_vm_admission(
         "coding_agent_fallback_enabled": False,
         "fixed_cli_entrypoint": (
             "/home/mini/.hermes/rca-prod-runtime/releases/"
-            "rca-e2e-hotfix-20260721/"
+            "rca-e2e-hotfix-20260723-remote-viz/"
             "api/g1q3_rca/scripts/run_rca_service_request.py"
         ),
         **workspace.task_meta(),

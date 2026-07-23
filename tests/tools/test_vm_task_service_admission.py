@@ -368,7 +368,7 @@ def _matching_status(
             "coding_agent_fallback_enabled": False,
             "fixed_cli_entrypoint": (
                 "/home/mini/.hermes/rca-prod-runtime/releases/"
-                "rca-e2e-hotfix-20260721/"
+                "rca-e2e-hotfix-20260723-remote-viz/"
                 "api/g1q3_rca/scripts/run_rca_service_request.py"
             ),
             **(bootstrap_meta or {}),
@@ -886,7 +886,7 @@ def test_service_wrapper_allows_only_validated_rca_intake_with_fixed_envelope(mo
     assert goal.splitlines()[-2:] == [
         (
             "- cd /home/mini/.hermes/rca-prod-runtime/releases/"
-            "rca-e2e-hotfix-20260721"
+            "rca-e2e-hotfix-20260723-remote-viz"
         ),
         (
             "- ./api/g1q3_rca/scripts/run_rca_service_request.py "
@@ -1169,7 +1169,7 @@ def test_fixed_cli_goal_keeps_caller_text_inside_json_and_commands_are_immutable
     assert executable_lines == [
         (
             "- cd /home/mini/.hermes/rca-prod-runtime/releases/"
-            "rca-e2e-hotfix-20260721"
+            "rca-e2e-hotfix-20260723-remote-viz"
         ),
         (
             "- ./api/g1q3_rca/scripts/run_rca_service_request.py "

@@ -115,7 +115,7 @@ REMOTE_DATA_ACCESS_MODE = "remote_read"
 DEFAULT_SSH_MINI_AGENT = str(Path.home() / ".local" / "bin" / "ssh-mini-agent")
 REMOTE_STORAGE_ADMISSION_MODULE = (
     "/home/mini/.hermes/rca-prod-runtime/releases/"
-    "rca-e2e-hotfix-20260721/api/g1q3_rca/storage_admission.py"
+    "rca-e2e-hotfix-20260723-remote-viz/api/g1q3_rca/storage_admission.py"
 )
 VM_ARTIFACT_PREFIX = "/mnt/tmp/"
 CIFS_ARTIFACT_PREFIX = (

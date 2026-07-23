@@ -175,7 +175,8 @@ _RCA_SHARED_STATE_GOAL_PREFIX = (
     "contracts below."
 )
 _RCA_VM_REPO_ROOT = (
-    "/home/mini/.hermes/rca-prod-runtime/releases/rca-e2e-hotfix-20260721"
+    "/home/mini/.hermes/rca-prod-runtime/releases/"
+    "rca-e2e-hotfix-20260723-remote-viz"
 )
 _RCA_FIXED_CLI_RELATIVE_PATH = "./api/g1q3_rca/scripts/run_rca_service_request.py"
 _RCA_VM_TASK_ROOT = "/home/mini/.hermes/shared-state/tasks"
