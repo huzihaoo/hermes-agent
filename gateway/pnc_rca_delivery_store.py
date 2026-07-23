@@ -2711,11 +2711,15 @@ class RcaDeliveryStore:
         elif (
             required
             and all(row["status"] in {"succeeded", "suppressed"} for row in required)
-            and all(state == "materialized" for state in subscription_states)
+            and all(
+                state in {"materialized", "suppressed"}
+                for state in subscription_states
+            )
         ):
             status = (
                 "partial"
                 if any(row["status"] == "suppressed" for row in required)
+                or "suppressed" in subscription_states
                 or (optional and any(row["status"] != "succeeded" for row in optional))
                 else "delivered"
             )
@@ -2726,6 +2730,35 @@ class RcaDeliveryStore:
             (status, current, delivery_id),
         )
         return status
+
+    def reconcile_delivery_job_status(
+        self,
+        *,
+        delivery_id: str,
+        now: datetime | None = None,
+    ) -> str:
+        """Recompute one job status from its durable effects and subscriptions."""
+        exact_delivery_id = str(delivery_id or "").strip()
+        if not exact_delivery_id:
+            raise ValueError("delivery_id is required")
+        current = _iso(now)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            exists = conn.execute(
+                "SELECT 1 FROM rca_delivery_jobs WHERE delivery_id = ?",
+                (exact_delivery_id,),
+            ).fetchone()
+            if exists is None:
+                raise DeliveryRecordConflictError("delivery job is missing")
+            status = self._aggregate_job_status(conn, exact_delivery_id, current)
+            conn.commit()
+            return status
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     @staticmethod
     def _current_effect_claim(

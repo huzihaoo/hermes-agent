@@ -1520,6 +1520,65 @@ def test_late_topic_subscription_reopens_delivered_job_for_catchup(tmp_path):
     assert thread_effect["status"] == "pending"
 
 
+def test_suppressed_required_subscription_terminates_job_as_partial(tmp_path):
+    _control(tmp_path)
+    store = RcaDeliveryStore(tmp_path / "control.sqlite3")
+    _install_subscription_table(store)
+    store.backfill_completed_submissions(now=NOW)
+    claim = store.claim_due_watch(lease_owner="collector", now=NOW)
+    assert claim is not None
+    _insert_subscription(store, claim, effect_kind="feishu_thread_reply")
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_delivery_subscriptions SET status = 'suppressed' "
+            "WHERE effect_kind = 'feishu_thread_reply'"
+        )
+
+    store.create_delivery(
+        claim=claim,
+        delivery=_delivery(claim),
+        status={"success": True, "state": "completed"},
+        now=NOW,
+    )
+    issue_claim = store.claim_due_effect(lease_owner="dispatcher", now=NOW)
+    assert issue_claim is not None
+    mutation = store.complete_effect(
+        claim=issue_claim,
+        outcome="ack",
+        remote_id="comment-1",
+        receipt={"remote_id": "comment-1"},
+        now=NOW,
+    )
+
+    assert mutation.job_status == "partial"
+    assert store.list_rows("rca_delivery_jobs")[0]["status"] == "partial"
+
+
+def test_reconcile_delivery_job_status_repairs_stale_ready_status(tmp_path):
+    store, effect = _claimed_effect(tmp_path)
+    store.complete_effect(
+        claim=effect,
+        outcome="ack",
+        remote_id="comment-1",
+        receipt={"remote_id": "comment-1"},
+        now=NOW,
+    )
+    [job] = store.list_rows("rca_delivery_jobs")
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_delivery_jobs SET status = 'ready' WHERE delivery_id = ?",
+            (job["delivery_id"],),
+        )
+
+    status = store.reconcile_delivery_job_status(
+        delivery_id=job["delivery_id"],
+        now=NOW + timedelta(seconds=1),
+    )
+
+    assert status == "delivered"
+    assert store.list_rows("rca_delivery_jobs")[0]["status"] == "delivered"
+
+
 def test_concurrent_late_subscription_materialization_creates_one_effect(tmp_path):
     _control(tmp_path)
     store = RcaDeliveryStore(tmp_path / "control.sqlite3")
