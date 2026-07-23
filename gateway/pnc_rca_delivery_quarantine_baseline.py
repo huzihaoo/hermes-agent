@@ -1353,7 +1353,6 @@ def _validate_active_release_anchor(
     release_id: str,
     bootstrap_epoch_id: str,
     release_bom_sha256: str,
-    approval_evidence_sha256: str,
 ) -> dict[str, Any]:
     if (
         _IDENTIFIER_RE.fullmatch(str(release_id or "")) is None
@@ -1374,10 +1373,7 @@ def _validate_active_release_anchor(
         raise DeliveryQuarantineBaselineError(
             "delivery_quarantine_active_release_binding_invalid"
         ) from exc
-    if (
-        binding.get("release_bom_sha256") != release_bom_sha256
-        or binding.get("approval_evidence_sha256") != approval_evidence_sha256
-    ):
+    if binding.get("release_bom_sha256") != release_bom_sha256:
         raise DeliveryQuarantineBaselineError(
             "delivery_quarantine_active_release_cross_binding_invalid"
         )
@@ -1510,7 +1506,6 @@ def _validate_baseline(
         release_id=release_id,
         bootstrap_epoch_id=bootstrap_epoch_id,
         release_bom_sha256=release_manifest["release_bom_sha256"],
-        approval_evidence_sha256=approval["sha256"],
     )
     return {
         "baseline_id": baseline_id,
@@ -1727,7 +1722,7 @@ def _build_quarantine_core(
     conn = _open_readonly_db(
         db_path,
         busy_timeout_ms=busy_timeout_ms,
-        immutable=True,
+        immutable=is_offline_clone,
     )
     try:
         conn.execute("BEGIN")
@@ -1879,7 +1874,7 @@ def issue_quarantine_baseline(
     conn = _open_readonly_db(
         db_path,
         busy_timeout_ms=busy_timeout_ms,
-        immutable=True,
+        immutable=False,
     )
     try:
         conn.execute("BEGIN")

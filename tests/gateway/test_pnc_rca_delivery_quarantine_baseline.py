@@ -508,7 +508,7 @@ def test_baseline_can_be_reissued_after_monotonic_quarantine_audit_events(tmp_pa
     core = build_quarantine_core(
         bundle["store"].db_path,
         **_migration_kwargs(bundle["migration"]),
-        release_id="release-baseline-002",
+        release_id=bundle["core"]["release_id"],
         snapshot_at=NOW + timedelta(seconds=8),
         settlement_receipt_paths=[bundle["receipt"]],
         analyzed_by="forensic-operator",
@@ -554,9 +554,21 @@ def test_baseline_can_be_reissued_after_monotonic_quarantine_audit_events(tmp_pa
         issued_at=NOW + timedelta(seconds=11),
     )
 
+    reissued_path = tmp_path / "delivery-quarantine-baseline-002.json"
+    reissued_sha256 = _write(reissued_path, baseline)
+    health = _health(bundle, path=reissued_path, sha256=reissued_sha256)
+
     assert baseline["quarantine_core"]["quarantine_event_projection"] == (
         core["quarantine_event_projection"]
     )
+    assert health["business_ready"] is True, health
+    assert core["quarantine_event_projection"]["event_count"] == 5
+    identity = health["delivery_quarantine"]["baseline_identity"]
+    assert identity["quarantine_core_sha256"] == core["core_sha256"]
+    assert identity["approval_evidence_sha256"] == approval_sha256
+    assert identity["active_release_binding_sha256"] == hashlib.sha256(
+        bundle["active_release_binding_path"].read_bytes()
+    ).hexdigest()
 
 
 @pytest.mark.parametrize(
