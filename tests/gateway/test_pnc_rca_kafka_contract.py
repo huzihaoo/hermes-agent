@@ -103,6 +103,38 @@ def test_exact_snapshot_policy_accepts_real_creation_envelope():
     assert result.normalized.status_change_type == "State"
     assert result.normalized.nodes == ()
     assert result.normalized.matched_nodes == ()
+    assert result.normalized.business_profile_observed is True
+
+
+def test_snapshot_carries_stable_business_profile_option_ids():
+    policy = _snapshot_policy(
+        project_keys=frozenset({"t03o4q"}),
+        project_simple_names=frozenset({"t03o4q"}),
+        work_item_type_keys=frozenset({"issue"}),
+    )
+    result = classify_workflow_event(
+        topic=TOPIC,
+        value=_snapshot_payload(
+            project_key="t03o4q",
+            project_simple_name="t03o4q",
+            work_item_type_key="issue",
+            fields=[
+                {
+                    "field_key": "field_052f23",
+                    "field_value": ["7019637554"],
+                }
+            ],
+        ),
+        policy=policy,
+    )
+
+    assert result.decision == "accepted"
+    assert result.normalized is not None
+    assert result.normalized.business_profile_resolution["status"] == "matched"
+    assert result.normalized.business_profile_resolution["profile_id"] == "mdrive4"
+    assert result.normalized.business_profile_resolution["project_option_ids"] == [
+        "7019637554"
+    ]
 
 
 @pytest.mark.parametrize(

@@ -23,12 +23,12 @@ pytestmark = pytest.mark.integration
 
 WORKSPACE_RUNTIME_ENV = "HERMES_RCA_RELEASE_WORKSPACE_RUNTIME"
 VM_ADMISSION_MODULE_ENV = "HERMES_RCA_RELEASE_VM_ADMISSION_MODULE"
-WORKSPACE_SOURCE_COMMIT = "c7e911ddc4292c555977800212d93304f1f87f1c"
+WORKSPACE_SOURCE_COMMIT = "8bc9446b39010129546005cde4ba49d6d679748a"
 WORKSPACE_CLOSURE_SHA256 = (
-    "26db9cf6b5070d1c9434f5632ec88f08290c1f1c92d78a244026395b522b898b"
+    "b4f404b861d7d8b6ea1fc2b703ebf704e65f6fc8eb58a2714363f93ca741aa67"
 )
 VM_ADMISSION_SHA256 = (
-    "a7df5bd4ee2c7d8232858dcc2837c006e2940b3097eda64b02becd30c536353b"
+    "8b4f926b1129857bfe0e8dcef0c546e1bb3014fe299dc8dce00b938e34a0d76d"
 )
 HMAC_KEY = "hex:" + ("42" * 32)
 NOW = datetime(2026, 7, 21, 5, 0, tzinfo=timezone.utc)
@@ -79,33 +79,6 @@ def _snapshot(now: datetime = NOW) -> dict:
 
 def _resource_report() -> dict:
     snapshot = _snapshot()
-    capacity = {
-        "schema_version": "context-rca-capacity-authorization/v1",
-        "policy_version": "context-rca-capacity-model/2026-07-12-v1",
-        "receipt_path": "/offline/test-capacity-authorization.json",
-        "authorization_ready": True,
-        "status": "valid",
-        "reason_codes": [],
-        "receipt_id": "offline-capacity-receipt",
-        "receipt_fingerprint": "11" * 32,
-        "sample_set_fingerprint": "22" * 32,
-        "issued_at": (NOW - timedelta(minutes=5)).isoformat(),
-        "expires_at": (NOW + timedelta(hours=1)).isoformat(),
-        "successful_sample_count": 20,
-        "input_materialized_sample_count": 0,
-        "max_concurrency": 1,
-        "root_peak_declared_bytes": 12 * 1024**3,
-        "root_peak_observed_bytes": 10 * 1024**3,
-        "delivery_peak_p95_bytes": 2 * 1024**3,
-        "delivery_peak_p99_bytes": 3 * 1024**3,
-        "delivery_growth_7d_bytes": 4 * 1024**3,
-        "active_delivery_commitment_bytes": 5 * 1024**3,
-        "capacity_horizon_days": 7,
-        "root_required_available_bytes": 500 * 1024**3,
-        "delivery_required_available_bytes": 600 * 1024**3,
-        "approval_evidence_sha256": "33" * 32,
-        "authorization_receipt_sha256": "44" * 32,
-    }
     return {
         "ok": True,
         "ok_for_submit": True,
@@ -113,7 +86,6 @@ def _resource_report() -> dict:
         "resource_class": "rca_prod",
         "reasons": [],
         "rca_prod_reasons": [],
-        "rca_capacity_authorization": capacity,
         "rca_prod_snapshot": snapshot,
         "rca_prod_snapshot_sha256": pnc_rca_prod_admission.sha256_value(snapshot),
     }
@@ -211,9 +183,9 @@ def test_pinned_release_goal_bytes_survive_creator_and_vm_admission(
     )
     meta = {
         "actor_kind": "service",
-        "business_line": "g1q3_rca",
-        "service_capability": "submit_g1q3_rca_issue_intake",
-        "service_operation": "g1q3_rca_issue_intake",
+        "business_line": "rca",
+        "service_capability": "submit_rca_issue_intake",
+        "service_operation": "rca_issue_intake",
         "rca_business_key": admission.business_key,
         "rca_submission_key": task_id,
         "rca_generation": admission.generation,
@@ -244,13 +216,13 @@ def test_pinned_release_goal_bytes_survive_creator_and_vm_admission(
         "coding_agent_fallback_enabled": False,
         "fixed_cli_entrypoint": (
             "/home/mini/.hermes/rca-prod-runtime/releases/"
-            "rca-e2e-hotfix-20260723-remote-viz/"
+            "rca-platform-20260724/"
             "api/g1q3_rca/scripts/run_rca_service_request.py"
         ),
         **workspace.task_meta(),
         **prod_admission.meta,
     }
-    title = f"G1Q3 RCA issue intake: {refs['work_item_id']}"
+    title = f"RCA issue intake: {refs['work_item_id']}"
     goal_input = tmp_path / "goal-input.md"
     goal_input.write_text(canonical_goal, encoding="utf-8")
     shared_state = tmp_path / "shared-state"

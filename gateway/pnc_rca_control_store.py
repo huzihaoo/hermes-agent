@@ -4236,6 +4236,48 @@ class RcaControlStore:
             (project_key, work_item_type_key, work_item_id),
         ).fetchone()
 
+    @staticmethod
+    def _business_profile_observation_sha256(value: Any) -> str:
+        try:
+            payload = json.loads(value) if isinstance(value, str) else value
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return ""
+        if not isinstance(payload, Mapping) or payload.get(
+            "business_profile_observed"
+        ) is not True:
+            return ""
+        resolution = payload.get("business_profile_resolution")
+        if not isinstance(resolution, Mapping):
+            return ""
+        return _canonical_sha256(
+            {"observed": True, "resolution": dict(resolution)}
+        )
+
+    @classmethod
+    def _latest_business_profile_observation_sha256_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        project_key: str,
+        work_item_type_key: str,
+        work_item_id: str,
+    ) -> str:
+        rows = conn.execute(
+            """
+            SELECT normalized_json FROM business_triggers
+             WHERE project_key = ? AND work_item_type_key = ? AND work_item_id = ?
+             ORDER BY generation DESC, created_at DESC
+            """,
+            (project_key, work_item_type_key, work_item_id),
+        ).fetchall()
+        for row in rows:
+            fingerprint = cls._business_profile_observation_sha256(
+                row["normalized_json"]
+            )
+            if fingerprint:
+                return fingerprint
+        return ""
+
     @classmethod
     def _kafka_generation_origin_contract_valid(
         cls, row: sqlite3.Row
@@ -7050,7 +7092,64 @@ class RcaControlStore:
                             latest is not None
                             and int(latest["generation"]) == bound_generation
                         )
-                        if same_rule_chain and latest_is_bound_generation:
+                        current_profile_sha256 = (
+                            self._business_profile_observation_sha256(
+                                normalized.to_dict()
+                            )
+                        )
+                        previous_profile_sha256 = (
+                            self._latest_business_profile_observation_sha256_tx(
+                                conn,
+                                project_key=normalized.project_key,
+                                work_item_type_key=normalized.work_item_type_key,
+                                work_item_id=normalized.work_item_id,
+                            )
+                        )
+                        profile_changed = bool(
+                            current_profile_sha256
+                            and current_profile_sha256 != previous_profile_sha256
+                        )
+                        if profile_changed:
+                            if latest is None or not same_rule_chain:
+                                decision = "invalid"
+                                reason = "business_profile_change_chain_invalid"
+                                admission = None
+                            elif not self._execution_terminal_tx(conn, latest):
+                                decision = "invalid"
+                                reason = "business_profile_change_requires_terminal_generation"
+                                admission = None
+                            else:
+                                prior_submission_key = str(latest["submission_key"])
+                                admission = build_rca_admission(
+                                    project_key=str(latest["project_key"]),
+                                    project_simple_name=(
+                                        normalized.project_simple_name
+                                    ),
+                                    work_item_type_key=str(
+                                        latest["work_item_type_key"]
+                                    ),
+                                    work_item_id=str(latest["work_item_id"]),
+                                    rule_version=str(
+                                        latest["creation_rule_version"]
+                                    ),
+                                    trigger_kind="kafka_retrigger",
+                                    generation=int(latest["generation"]) + 1,
+                                    topic=str(row["topic"]),
+                                    partition=int(row["partition_id"]),
+                                    offset=int(row["offset_id"]),
+                                )
+                                if (
+                                    admission.business_key
+                                    != str(latest["business_key"])
+                                    or admission.submission_key
+                                    == prior_submission_key
+                                ):
+                                    raise RecordConflictError(
+                                        "business profile next generation identity invalid"
+                                    )
+                                creates_generation = True
+                                rearm_reason = "business_profile_observation_changed"
+                        elif same_rule_chain and latest_is_bound_generation:
                             input_wait, _replacement_reason = (
                                 self._input_wait_replacement_candidate(
                                     conn,

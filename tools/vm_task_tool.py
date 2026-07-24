@@ -1743,6 +1743,7 @@ def vm_task_submit_service(
             "lane": "heavy",
             "queue_if_blocked": False,
             "resource_gate_bypass": False,
+            "rca_prod_capacity_mode": normalized_capacity_mode,
             "reservation_id": reservation_id,
             "reservation_fence": reservation_fence,
             "reservation_contract_sha256": reservation_contract_sha256,

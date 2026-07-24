@@ -19,9 +19,10 @@ from typing import Any, Callable, Mapping
 from gateway import pnc_rca_prod_bootstrap as bootstrap
 
 
-SCHEMA_VERSION = "hermes-rca-prod-admission/v1"
+SCHEMA_VERSION = "hermes-rca-prod-live-admission/v1"
 BOOTSTRAP_SCHEMA_VERSION = "hermes-rca-prod-bootstrap-admission/v1"
 SNAPSHOT_SCHEMA_VERSION = "hermes-rca-prod-resource-snapshot/v1"
+RESOURCE_POLICY_VERSION = "hermes-rca-prod-live-resource-policy/v1"
 TRUST_SCOPE = "trusted_host_service_create_once_bridge"
 HMAC_ENV = "HERMES_RCA_PROD_ADMISSION_HMAC_KEY"
 MAX_TTL_SECONDS = 120
@@ -43,13 +44,14 @@ MAX_DNP_REAL = 4
 MAX_DNP_LIKE = 12
 MAX_MCAP_RSS_BYTES = 24 * 1024**3
 MAX_MCAP_PROCESS_COUNT = 2
+MAX_CONCURRENCY = 1
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 RECEIPT_FIELDS = {
     "schema_version", "receipt_id", "issued_at", "expires_at", "decision",
-    "resource_class", "trust_scope", "single_task", "queue_if_blocked",
-    "bypass_requested", "bindings", "capacity_authorization",
+    "resource_class", "capacity_mode", "trust_scope", "single_task",
+    "queue_if_blocked", "bypass_requested", "bindings", "resource_policy",
     "resource_snapshot", "resource_snapshot_sha256", "receipt_fingerprint",
     "hmac_sha256",
 }
@@ -65,10 +67,9 @@ BINDING_FIELDS = {
     "reservation_fence", "reservation_contract_sha256", "goal_sha256",
     "command_sha256", "contract_sha256",
 }
-CAPACITY_FIELDS = {
-    "receipt_id", "receipt_fingerprint", "approval_evidence_sha256",
-    "authorization_receipt_sha256", "expires_at", "successful_sample_count",
-    "input_materialized_sample_count", "root_required_available_bytes",
+RESOURCE_POLICY_FIELDS = {
+    "policy_version", "resource_check", "max_concurrency",
+    "input_materialization", "root_required_available_bytes",
     "delivery_required_available_bytes",
 }
 BOOTSTRAP_AUTHORIZATION_FIELDS = {
@@ -287,64 +288,24 @@ def _validate_snapshot(
             raise RcaProdAdmissionError(code)
 
 
-def _capacity_contract(
-    value: Any,
-    *,
-    now: datetime,
-    admission_expires_at: datetime | None = None,
-) -> dict[str, Any]:
-    if not isinstance(value, Mapping):
-        raise RcaProdAdmissionError("rca_prod_capacity_authorization_invalid")
-    if value.get("authorization_ready") is not True or value.get("status") != "valid":
-        raise RcaProdAdmissionError("rca_prod_capacity_not_authorized")
-    if list(value.get("reason_codes") or []):
-        raise RcaProdAdmissionError("rca_prod_capacity_not_authorized")
-    expires_at = _timestamp(value.get("expires_at"))
-    if expires_at <= now or (
-        admission_expires_at is not None and expires_at < admission_expires_at
-    ):
-        raise RcaProdAdmissionError("rca_prod_capacity_authorization_expired")
-    successful = _require_int(
-        value.get("successful_sample_count"), "rca_prod_capacity_samples_invalid"
-    )
-    input_materialized = _require_int(
-        value.get("input_materialized_sample_count"),
-        "rca_prod_capacity_samples_invalid",
-    )
-    if successful < 20 or input_materialized != 0:
-        raise RcaProdAdmissionError("rca_prod_capacity_samples_invalid")
-    root_required = _require_int(
-        value.get("root_required_available_bytes"),
-        "rca_prod_capacity_requirements_invalid",
-        minimum=MIN_ROOT_AVAILABLE_BYTES,
-    )
-    delivery_required = _require_int(
-        value.get("delivery_required_available_bytes"),
-        "rca_prod_capacity_requirements_invalid",
-        minimum=MIN_DELIVERY_AVAILABLE_BYTES,
-    )
-    receipt_id = str(value.get("receipt_id") or "").strip()
-    if not receipt_id or len(receipt_id) > 256:
-        raise RcaProdAdmissionError("rca_prod_capacity_fingerprint_invalid")
+def live_resource_policy() -> dict[str, Any]:
     return {
-        "receipt_id": receipt_id,
-        "receipt_fingerprint": _require_hex(
-            value.get("receipt_fingerprint"), "rca_prod_capacity_fingerprint_invalid"
-        ),
-        "approval_evidence_sha256": _require_hex(
-            value.get("approval_evidence_sha256"),
-            "rca_prod_capacity_approval_invalid",
-        ),
-        "authorization_receipt_sha256": _require_hex(
-            value.get("authorization_receipt_sha256"),
-            "rca_prod_capacity_fingerprint_invalid",
-        ),
-        "expires_at": str(value.get("expires_at")),
-        "successful_sample_count": successful,
-        "input_materialized_sample_count": input_materialized,
-        "root_required_available_bytes": root_required,
-        "delivery_required_available_bytes": delivery_required,
+        "policy_version": RESOURCE_POLICY_VERSION,
+        "resource_check": "per_task_live_snapshot",
+        "max_concurrency": MAX_CONCURRENCY,
+        "input_materialization": "forbidden",
+        "root_required_available_bytes": MIN_ROOT_AVAILABLE_BYTES,
+        "delivery_required_available_bytes": MIN_DELIVERY_AVAILABLE_BYTES,
     }
+
+
+def _live_resource_policy(value: Any) -> dict[str, Any]:
+    expected = live_resource_policy()
+    if not isinstance(value, Mapping) or set(value) != RESOURCE_POLICY_FIELDS:
+        raise RcaProdAdmissionError("rca_prod_resource_policy_invalid", retryable=False)
+    if dict(value) != expected:
+        raise RcaProdAdmissionError("rca_prod_resource_policy_invalid", retryable=False)
+    return expected
 
 
 def _bootstrap_capacity_contract(
@@ -466,9 +427,7 @@ def validate_resource_report(
     if sha256_value(snapshot) != str(report.get("rca_prod_snapshot_sha256") or ""):
         raise RcaProdAdmissionError("rca_prod_snapshot_hash_invalid")
     if capacity_mode == "steady":
-        capacity = _capacity_contract(
-            report.get("rca_capacity_authorization"), now=current
-        )
+        capacity = live_resource_policy()
     else:
         capacity = _bootstrap_capacity_contract(
             report.get("rca_bootstrap_authorization"),
@@ -561,14 +520,15 @@ def validate_rca_prod_receipt(
     if not isinstance(receipt, Mapping) or set(receipt) != RECEIPT_FIELDS:
         raise RcaProdAdmissionError("rca_prod_receipt_schema_invalid", retryable=False)
     bindings = receipt.get("bindings")
-    capacity = receipt.get("capacity_authorization")
+    capacity = receipt.get("resource_policy")
     snapshot = receipt.get("resource_snapshot")
     if not isinstance(bindings, Mapping) or set(bindings) != BINDING_FIELDS:
         raise RcaProdAdmissionError("rca_prod_receipt_schema_invalid", retryable=False)
-    if not isinstance(capacity, Mapping) or set(capacity) != CAPACITY_FIELDS:
+    if not isinstance(capacity, Mapping) or set(capacity) != RESOURCE_POLICY_FIELDS:
         raise RcaProdAdmissionError("rca_prod_receipt_schema_invalid", retryable=False)
     if (
         receipt.get("schema_version") != SCHEMA_VERSION
+        or receipt.get("capacity_mode") != "steady"
         or receipt.get("trust_scope") != TRUST_SCOPE
         or receipt.get("decision") != "allow"
         or receipt.get("resource_class") != "rca_prod"
@@ -607,31 +567,9 @@ def validate_rca_prod_receipt(
         key: str(value) for key, value in bindings.items()
     } != normalized_expected:
         raise RcaProdAdmissionError("rca_prod_receipt_binding_invalid", retryable=False)
-    root_required = _require_int(
-        capacity.get("root_required_available_bytes"),
-        "rca_prod_capacity_requirements_invalid",
-        minimum=MIN_ROOT_AVAILABLE_BYTES,
-    )
-    delivery_required = _require_int(
-        capacity.get("delivery_required_available_bytes"),
-        "rca_prod_capacity_requirements_invalid",
-        minimum=MIN_DELIVERY_AVAILABLE_BYTES,
-    )
-    if _require_int(capacity.get("successful_sample_count"), "rca_prod_capacity_samples_invalid") < 20:
-        raise RcaProdAdmissionError("rca_prod_capacity_samples_invalid")
-    if _require_int(capacity.get("input_materialized_sample_count"), "rca_prod_capacity_samples_invalid") != 0:
-        raise RcaProdAdmissionError("rca_prod_capacity_samples_invalid")
-    for field in (
-        "receipt_fingerprint", "approval_evidence_sha256",
-        "authorization_receipt_sha256",
-    ):
-        _require_hex(capacity.get(field), "rca_prod_capacity_fingerprint_invalid")
-    try:
-        capacity_expires = _timestamp(capacity.get("expires_at"))
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise RcaProdAdmissionError("rca_prod_capacity_authorization_expired") from exc
-    if capacity_expires < expires:
-        raise RcaProdAdmissionError("rca_prod_capacity_authorization_expired")
+    policy = _live_resource_policy(capacity)
+    root_required = policy["root_required_available_bytes"]
+    delivery_required = policy["delivery_required_available_bytes"]
     if sha256_value(snapshot) != str(receipt.get("resource_snapshot_sha256") or ""):
         raise RcaProdAdmissionError("rca_prod_snapshot_hash_invalid")
     snapshot_now = issued if allow_historical else current
@@ -878,15 +816,9 @@ def issue_rca_prod_admission(
             bootstrap_authorization_fingerprint
         ),
     )
-    authorization_expires_at = (
-        capacity["expires_at"]
-        if normalized_mode == "steady"
-        else capacity["deadline"]
-    )
-    expires = min(
-        current + timedelta(seconds=MAX_TTL_SECONDS),
-        _timestamp(authorization_expires_at),
-    )
+    expires = current + timedelta(seconds=MAX_TTL_SECONDS)
+    if normalized_mode == "bootstrap":
+        expires = min(expires, _timestamp(capacity["deadline"]))
     if expires <= current:
         raise RcaProdAdmissionError("rca_prod_capacity_authorization_expired")
     normalized_attempt = str(attempt_id or f"attempt-{secrets.token_hex(16)}")
@@ -916,17 +848,19 @@ def issue_rca_prod_admission(
             "expires_at": expires.replace(microsecond=0).isoformat(),
             "decision": "allow",
             "resource_class": "rca_prod",
+            "capacity_mode": "steady",
             "trust_scope": TRUST_SCOPE,
             "single_task": True,
             "queue_if_blocked": False,
             "bypass_requested": False,
             "bindings": bindings,
-            "capacity_authorization": capacity,
+            "resource_policy": capacity,
             "resource_snapshot": snapshot,
             "resource_snapshot_sha256": sha256_value(snapshot),
         }
     if normalized_mode == "bootstrap":
-        receipt_body.pop("capacity_authorization")
+        receipt_body.pop("resource_policy")
+        receipt_body.pop("capacity_mode")
         capacity = {
             **capacity,
             "active_release_binding_sha256": str(
@@ -965,6 +899,7 @@ def issue_rca_prod_admission(
         "lane": "heavy",
         "queue_if_blocked": False,
         "resource_gate_bypass": False,
+        "rca_prod_capacity_mode": normalized_mode,
         "rca_prod_attempt_id": normalized_attempt,
         "reservation_id": normalized_reservation,
         "reservation_fence": normalized_fence,
@@ -1074,6 +1009,8 @@ def validate_existing_rca_prod_meta(
         raise RcaProdAdmissionError(
             "rca_prod_capacity_mode_binding_invalid", retryable=False
         )
+    else:
+        stable["rca_prod_capacity_mode"] = "steady"
     if any(meta.get(key) != value for key, value in stable.items()):
         raise RcaProdAdmissionError("rca_prod_existing_identity_invalid", retryable=False)
     attempt_id = str(meta.get("rca_prod_attempt_id") or "").strip()

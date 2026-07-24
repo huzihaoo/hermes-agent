@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import json
 from typing import Any, Literal, Mapping
 
 from gateway.pnc_rca_admission import RcaAdmission, build_rca_admission
+from gateway.pnc_rca_business_profiles import resolve_business_profile
 
 
 NORMALIZED_EVENT_SCHEMA_VERSION = "pnc_rca_workflow_event_v1"
@@ -254,6 +255,8 @@ class NormalizedWorkflowEvent:
     issue_url: str
     nodes: tuple[NormalizedWorkflowNode, ...]
     matched_nodes: tuple[NormalizedWorkflowNode, ...]
+    business_profile_observed: bool = False
+    business_profile_resolution: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -477,6 +480,12 @@ def classify_workflow_event(
             ),
             nodes=(),
             matched_nodes=(),
+            business_profile_observed=True,
+            business_profile_resolution=resolve_business_profile(
+                project_key=project_key,
+                work_item_type_key=work_item_type_key,
+                work_item_brief=payload,
+            ).to_dict(),
         )
         return ClassificationResult(
             "accepted", "creation_snapshot_policy_matched", normalized
@@ -522,5 +531,11 @@ def classify_workflow_event(
         ),
         nodes=nodes,
         matched_nodes=matched,
+        business_profile_observed=False,
+        business_profile_resolution=resolve_business_profile(
+            project_key=project_key,
+            work_item_type_key=work_item_type_key,
+            work_item_brief={},
+        ).to_dict(),
     )
     return ClassificationResult("accepted", "creation_policy_matched", normalized)

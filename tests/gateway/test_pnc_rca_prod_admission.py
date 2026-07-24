@@ -40,36 +40,6 @@ def snapshot(*, observed_at: datetime = NOW) -> dict:
     }
 
 
-def capacity() -> dict:
-    return {
-        "schema_version": "context-rca-capacity-authorization/v1",
-        "policy_version": "context-rca-capacity-model/2026-07-12-v1",
-        "receipt_path": "/redacted/rca-capacity-authorization.json",
-        "authorization_ready": True,
-        "status": "valid",
-        "reason_codes": [],
-        "receipt_id": "capacity-receipt-1",
-        "receipt_fingerprint": "11" * 32,
-        "sample_set_fingerprint": "22" * 32,
-        "issued_at": (NOW - timedelta(minutes=5)).isoformat(),
-        "expires_at": (NOW + timedelta(hours=1)).isoformat(),
-        "successful_sample_count": 20,
-        "input_materialized_sample_count": 0,
-        "max_concurrency": 1,
-        "root_peak_declared_bytes": 12 * 1024**3,
-        "root_peak_observed_bytes": 10 * 1024**3,
-        "delivery_peak_p95_bytes": 2 * 1024**3,
-        "delivery_peak_p99_bytes": 3 * 1024**3,
-        "delivery_growth_7d_bytes": 4 * 1024**3,
-        "active_delivery_commitment_bytes": 5 * 1024**3,
-        "capacity_horizon_days": 7,
-        "root_required_available_bytes": 500 * 1024**3,
-        "delivery_required_available_bytes": 600 * 1024**3,
-        "approval_evidence_sha256": "33" * 32,
-        "authorization_receipt_sha256": "44" * 32,
-    }
-
-
 def report() -> dict:
     resource_snapshot = snapshot()
     return {
@@ -79,7 +49,6 @@ def report() -> dict:
         "resource_class": "rca_prod",
         "reasons": [],
         "rca_prod_reasons": [],
-        "rca_capacity_authorization": capacity(),
         "rca_prod_snapshot": resource_snapshot,
         "rca_prod_snapshot_sha256": admission.sha256_value(resource_snapshot),
     }
@@ -137,7 +106,7 @@ def test_issue_builds_exact_signed_receipt_and_strips_key_from_resource_env():
     receipt = result.receipt
     assert set(receipt) == admission.RECEIPT_FIELDS
     assert set(receipt["bindings"]) == admission.BINDING_FIELDS
-    assert set(receipt["capacity_authorization"]) == admission.CAPACITY_FIELDS
+    assert receipt["resource_policy"] == admission.live_resource_policy()
     assert set(receipt["resource_snapshot"]) == admission.SNAPSHOT_FIELDS
     assert captured["command"][-2:] == ["--resource-class", "rca_prod"]
     assert admission.HMAC_ENV not in captured["env"]
@@ -209,41 +178,18 @@ def test_stale_snapshot_and_snapshot_hash_tamper_fail_closed():
         issue(run_func=lambda *args, **kwargs: completed(tampered))
 
 
-@pytest.mark.parametrize(
-    "mutation,code",
-    [
-        (
-            lambda value: value["rca_capacity_authorization"].update(
-                authorization_ready=False
-            ),
-            "rca_prod_capacity_not_authorized",
-        ),
-        (
-            lambda value: value["rca_capacity_authorization"].update(
-                input_materialized_sample_count=1
-            ),
-            "rca_prod_capacity_samples_invalid",
-        ),
-        (
-            lambda value: value["rca_capacity_authorization"].update(
-                approval_evidence_sha256="bad"
-            ),
-            "rca_prod_capacity_approval_invalid",
-        ),
-        (
-            lambda value: value["rca_capacity_authorization"].update(
-                root_required_available_bytes=399 * 1024**3
-            ),
-            "rca_prod_capacity_requirements_invalid",
-        ),
-    ],
-)
-def test_capacity_authorization_tamper_fails_closed(mutation, code):
-    value = report()
-    mutation(value)
-    with pytest.raises(admission.RcaProdAdmissionError) as raised:
-        issue(run_func=lambda *args, **kwargs: completed(value))
-    assert raised.value.code == code
+def test_live_resource_policy_tamper_fails_closed():
+    result = issue()
+    tampered = copy.deepcopy(result.receipt)
+    tampered["resource_policy"]["max_concurrency"] = 2
+    tampered = admission._sign_receipt(tampered, admission._load_hmac_key(KEY))
+    with pytest.raises(admission.RcaProdAdmissionError, match="resource_policy_invalid"):
+        admission.validate_rca_prod_receipt(
+            tampered,
+            expected_bindings=result.receipt["bindings"],
+            hmac_key=KEY,
+            now=NOW,
+        )
 
 
 def test_key_missing_bad_format_and_short_key_fail_before_resource(monkeypatch):

@@ -69,20 +69,43 @@ def test_config_requires_and_projects_production_capacity_binding(tmp_path):
     assert config.live_env_path == tmp_path / ".env"
 
 
-def test_config_fails_closed_without_bootstrap_capacity_mode(tmp_path):
+def test_config_fails_closed_without_production_capacity_mode(tmp_path):
     env = _config_env(tmp_path)
     env.pop("HERMES_RCA_PROD_CAPACITY_MODE")
 
-    with pytest.raises(ValueError, match="must be exactly bootstrap"):
+    with pytest.raises(ValueError, match="must be exactly steady or bootstrap"):
         dispatcher.DispatcherConfig.from_env(env, hermes_home=tmp_path)
 
 
-def test_steady_capacity_remains_disabled_until_health_is_implemented(tmp_path):
+def test_steady_capacity_uses_per_task_live_resource_contract(tmp_path):
     env = _config_env(tmp_path)
     env["HERMES_RCA_PROD_CAPACITY_MODE"] = "steady"
 
-    with pytest.raises(ValueError, match="must be exactly bootstrap"):
-        dispatcher.DispatcherConfig.from_env(env, hermes_home=tmp_path)
+    config = dispatcher.DispatcherConfig.from_env(env, hermes_home=tmp_path)
+    assert config.capacity_mode == "steady"
+
+
+def test_default_submit_steady_does_not_load_bootstrap_authorization(
+    monkeypatch, tmp_path
+):
+    calls = []
+    monkeypatch.setattr(
+        "tools.vm_task_tool.vm_task_submit_service",
+        lambda **kwargs: calls.append(kwargs) or {"success": True},
+    )
+    monkeypatch.setattr(
+        dispatcher,
+        "_load_bound_bootstrap_authorization",
+        lambda _config: pytest.fail("steady mode must not load bootstrap authority"),
+    )
+    env = _config_env(tmp_path)
+    env["HERMES_RCA_PROD_CAPACITY_MODE"] = "steady"
+    config = dispatcher.DispatcherConfig.from_env(env, hermes_home=tmp_path)
+    dispatcher.default_submit(
+        object(), SimpleNamespace(toolchain={}), config=config
+    )
+    assert calls[0]["capacity_mode"] == "steady"
+    assert "bootstrap_deadline" not in calls[0]
 
 
 def test_default_submit_uses_bound_bootstrap_contract(monkeypatch, tmp_path):
@@ -190,6 +213,29 @@ def test_capacity_health_projection_is_release_bound(tmp_path):
     )
 
 
+def test_steady_health_requires_hmac_and_has_no_expiring_authorization(tmp_path):
+    env = _config_env(tmp_path, enabled=True)
+    env["HERMES_RCA_PROD_CAPACITY_MODE"] = "steady"
+    config = dispatcher.DispatcherConfig.from_env(env, hermes_home=tmp_path)
+    reporter = object.__new__(dispatcher.HealthReporter)
+    reporter.config = config
+    reporter._admission_key_fingerprint_observer = lambda: "7" * 64
+
+    status = reporter.capacity_admission_status()
+
+    assert status["ready"] is True
+    assert status["capacity_mode"] == "steady"
+    assert "deadline" not in status["authorization"]
+    assert "successful_sample_count" not in status["authorization"]
+    assert dispatcher._health_capacity_admission_ok(
+        {
+            "enabled": True,
+            "config": config.public_dict(),
+            "capacity_admission": status,
+        }
+    )
+
+
 def test_capacity_guard_opens_circuit_when_bootstrap_binding_is_unavailable(tmp_path):
     config = dispatcher.DispatcherConfig.from_env(
         _config_env(tmp_path, enabled=True), hermes_home=tmp_path
@@ -214,7 +260,7 @@ def test_capacity_guard_opens_circuit_when_bootstrap_binding_is_unavailable(tmp_
     assert outcome.error_code == "rca_bootstrap_expired_or_deadline_invalid"
     assert opened == [
         {
-            "reason_code": "dispatcher_bootstrap_authorization_invalid",
+            "reason_code": "dispatcher_prod_admission_invalid",
             "reason_detail": "rca_bootstrap_expired_or_deadline_invalid",
         }
     ]
@@ -244,7 +290,7 @@ def test_capacity_guard_fails_before_claim_when_admission_key_is_invalid(tmp_pat
 
     assert outcome.status == "capacity_authorization_unavailable"
     assert outcome.error_code == "rca_prod_hmac_key_invalid"
-    assert opened[0]["reason_code"] == "dispatcher_bootstrap_authorization_invalid"
+    assert opened[0]["reason_code"] == "dispatcher_prod_admission_invalid"
 
 
 def test_runtime_closure_includes_prod_admission_and_capacity_sampling():

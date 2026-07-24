@@ -694,7 +694,7 @@ def compact_rca_issue_context(
         str(work_item_type.get("key") or "").strip()
         if isinstance(work_item_type, dict)
         else ""
-    ) or "issue"
+    )
     profile_resolution = resolve_business_profile(
         project_key=project_key,
         work_item_type_key=work_item_type_key,

@@ -144,6 +144,37 @@ def _record(offset=10, *, value=None, partition=2):
     )
 
 
+def _profile_snapshot_policy():
+    return WorkflowEventPolicy(
+        topic=TOPIC,
+        policy_version="issue-profile-snapshot-v1",
+        project_keys=frozenset({"t03o4q"}),
+        project_simple_names=frozenset({"t03o4q"}),
+        work_item_type_keys=frozenset({"issue"}),
+        snapshot_patterns=frozenset({"State"}),
+        snapshot_sub_stages=frozenset({"OPEN"}),
+    )
+
+
+def _profile_snapshot_record(offset: int, option_id: str) -> KafkaRecord:
+    value = {
+        "created_at": 1783650001000,
+        "fields": [
+            {"field_key": "field_052f23", "field_value": [option_id]}
+        ],
+        "id": 7041712812,
+        "name": "ACC braking issue",
+        "pattern": "State",
+        "project_key": "t03o4q",
+        "project_simple_name": "t03o4q",
+        "sub_stage": "OPEN",
+        "updated_at": 1783650000000 + offset,
+        "work_item_status": {"state_key": "open"},
+        "work_item_type_key": "issue",
+    }
+    return _record(offset=offset, value=json.dumps(value, sort_keys=True).encode())
+
+
 def _manual_request(
     message_id: str,
     *,
@@ -1734,6 +1765,46 @@ def _terminalize_input_wait(
     assert delivery.backfill_completed_submissions() == 1
     if settle:
         _settle_delivery(store, submission_key)
+
+
+def test_official_business_profile_option_change_creates_next_generation(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    policy = _profile_snapshot_policy()
+    first = store.ingest_record(
+        _profile_snapshot_record(101, "6670325063"),
+        policy=policy,
+        submit_enabled=True,
+    )
+    assert first.decision == "accepted"
+    assert first.generation == 1
+    _terminalize_permanent(store, first.submission_key)
+
+    unchanged = store.ingest_record(
+        _profile_snapshot_record(102, "6670325063"),
+        policy=policy,
+        submit_enabled=True,
+    )
+    assert unchanged.generation == 1
+    assert unchanged.submission_key == first.submission_key
+
+    changed = store.ingest_record(
+        _profile_snapshot_record(103, "7019637554"),
+        policy=policy,
+        submit_enabled=True,
+    )
+    assert changed.decision == "accepted"
+    assert changed.generation == 2
+    assert changed.business_key == first.business_key
+    assert changed.submission_key != first.submission_key
+    latest = max(store.list_rows("business_triggers"), key=lambda row: row["generation"])
+    normalized = json.loads(latest["normalized_json"])
+    assert normalized["business_profile_resolution"]["profile_id"] == "mdrive4"
+    [source] = [
+        row
+        for row in store.list_rows("rca_trigger_sources")
+        if row["source_id"] == latest["origin_source_id"]
+    ]
+    assert source["source_kind"] == "kafka_workflow_event"
 
 
 def _inject_conflicting_issue_scope_chain(
@@ -4059,6 +4130,44 @@ def test_manual_active_policy_snapshot_bootstraps_empty_store(tmp_path):
     [active] = store.list_rows("rca_policy_snapshots")
     assert active["active"] == 1
     assert active["policy_version"] == "issue-created-v1"
+
+
+def test_different_allowed_groups_converge_on_one_issue_generation(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    _register_policy_without_classifying(store)
+    first_request = ManualRcaTriggerRequest(
+        **{
+            **_manual_request(
+                "om_group_a", thread_id="topic:om_group_a_root"
+            ).to_dict(),
+            "chat_id": "oc_group_a",
+        }
+    )
+    second_request = ManualRcaTriggerRequest(
+        **{
+            **_manual_request(
+                "om_group_b", thread_id="topic:om_group_b_root"
+            ).to_dict(),
+            "chat_id": "oc_group_b",
+        }
+    )
+    first = store.admit_manual_trigger(
+        first_request,
+        allowed_chat_ids={"oc_group_a", "oc_group_b"},
+        submit_enabled=True,
+    )
+    second = store.admit_manual_trigger(
+        second_request,
+        allowed_chat_ids={"oc_group_a", "oc_group_b"},
+        submit_enabled=True,
+    )
+
+    assert second.business_key == first.business_key
+    assert second.submission_key == first.submission_key
+    assert second.generation == first.generation == 1
+    subscriptions = store.list_rows("rca_delivery_subscriptions")
+    assert sum(row["effect_kind"] == "feishu_issue_comment" for row in subscriptions) == 1
+    assert sum(row["effect_kind"] == "feishu_thread_reply" for row in subscriptions) == 2
 
 
 def test_manual_active_policy_snapshot_overrides_stale_policy(

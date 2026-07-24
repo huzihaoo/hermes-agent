@@ -68,6 +68,7 @@ from gateway.pnc_rca_prod_bootstrap import (
 from gateway.pnc_rca_prod_admission import (
     RcaProdAdmissionError,
     hmac_key_fingerprint,
+    live_resource_policy,
 )
 from gateway.pnc_rca_runtime_identity import (
     MAX_HEALTH_FUTURE_SKEW_SECONDS,
@@ -508,18 +509,18 @@ class DispatcherConfig:
                 f"{MAX_INPUT_WAIT_MAX_AGE_SECONDS}"
             )
         capacity_mode = str(source.get(PROD_CAPACITY_MODE_ENV, "")).strip()
-        if capacity_mode != "bootstrap":
+        if capacity_mode not in {"steady", "bootstrap"}:
             raise ValueError(
-                f"{PROD_CAPACITY_MODE_ENV} must be exactly bootstrap until "
-                "steady capacity health is implemented"
+                f"{PROD_CAPACITY_MODE_ENV} must be exactly steady or bootstrap"
             )
         release_id = str(source.get(PROD_RELEASE_ID_ENV, "")).strip()
         bootstrap_epoch_id = str(
             source.get(PROD_BOOTSTRAP_EPOCH_ID_ENV, "")
         ).strip()
-        if (
-            PROD_RELEASE_ID_RE.fullmatch(release_id) is None
-            or BOOTSTRAP_EPOCH_ID_RE.fullmatch(bootstrap_epoch_id) is None
+        if PROD_RELEASE_ID_RE.fullmatch(release_id) is None:
+            raise ValueError("RCA production capacity requires a valid release id")
+        if capacity_mode == "bootstrap" and (
+            BOOTSTRAP_EPOCH_ID_RE.fullmatch(bootstrap_epoch_id) is None
         ):
             raise ValueError(
                 "bootstrap RCA production capacity requires valid release and "
@@ -804,24 +805,25 @@ def default_submit(
         isinstance(reservation, Mapping) and reservation.get("status") == "released"
     )
     capacity_bindings: dict[str, str] = {}
-    try:
-        authorization = _load_bound_bootstrap_authorization(config)
-    except RcaBootstrapAuthorizationError as exc:
-        raise DispatchCircuitError(
-            "dispatcher_bootstrap_authorization_invalid", exc.code
-        ) from exc
-    capacity_bindings = {
-        "bootstrap_epoch_id": authorization["bootstrap_epoch_id"],
-        "release_bom_sha256": authorization["release_bom_sha256"],
-        "bootstrap_started_at": authorization["started_at"],
-        "bootstrap_deadline": authorization["deadline"],
-        "bootstrap_authorization_fingerprint": authorization[
-            "receipt_fingerprint"
-        ],
-        "active_release_binding_sha256": authorization[
-            "active_release_binding_sha256"
-        ],
-    }
+    if config.capacity_mode == "bootstrap":
+        try:
+            authorization = _load_bound_bootstrap_authorization(config)
+        except RcaBootstrapAuthorizationError as exc:
+            raise DispatchCircuitError(
+                "dispatcher_bootstrap_authorization_invalid", exc.code
+            ) from exc
+        capacity_bindings = {
+            "bootstrap_epoch_id": authorization["bootstrap_epoch_id"],
+            "release_bom_sha256": authorization["release_bom_sha256"],
+            "bootstrap_started_at": authorization["started_at"],
+            "bootstrap_deadline": authorization["deadline"],
+            "bootstrap_authorization_fingerprint": authorization[
+                "receipt_fingerprint"
+            ],
+            "active_release_binding_sha256": authorization[
+                "active_release_binding_sha256"
+            ],
+        }
     return vm_task_submit_service(
         service_id=DEFAULT_SERVICE_ID,
         capability=SERVICE_CAPABILITY,
@@ -2566,7 +2568,7 @@ class HealthReporter:
         capacity = self.capacity_admission_status()
         if capacity["required"] is True and capacity["ready"] is not True:
             self.store.open_dispatcher_circuit(
-                reason_code="dispatcher_bootstrap_authorization_invalid",
+                reason_code="dispatcher_prod_admission_invalid",
                 reason_detail=str(capacity["error_code"]),
             )
             return DispatchOutcome(
@@ -2604,6 +2606,16 @@ class HealthReporter:
                 "capacity_mode": self.config.capacity_mode,
                 "admission_key_fingerprint": None,
                 "authorization": None,
+            }
+        if self.config.capacity_mode == "steady":
+            return {
+                "required": required,
+                "ready": True,
+                "state": "ready",
+                "error_code": "",
+                "capacity_mode": "steady",
+                "admission_key_fingerprint": admission_key_fingerprint,
+                "authorization": live_resource_policy(),
             }
         try:
             authorization = dict(self._bootstrap_authorization_observer())
@@ -2896,6 +2908,12 @@ def _health_capacity_admission_ok(payload: Mapping[str, Any]) -> bool:
     ):
         return False
     authorization = status.get("authorization")
+    if mode == "steady":
+        return (
+            status.get("ready") is True
+            and status.get("state") == "ready"
+            and authorization == live_resource_policy()
+        )
     if (
         mode != "bootstrap"
         or status.get("ready") is not True

@@ -91,6 +91,28 @@ def test_compact_rca_context_publishes_isolated_business_profile_contract():
     assert profile["evaluator_scope"] == "ct_evaluator_217_20260722"
 
 
+def test_compact_rca_context_does_not_guess_missing_work_item_type():
+    context = pnc_issue_context.compact_rca_issue_context(
+        project_key="t03o4q",
+        work_item_brief={
+            "work_item_attribute": {"work_item_id": "7044346306"},
+            "work_item_fields": [
+                {"key": "field_052f23", "value": [{"id": 6670325063}]}
+            ],
+        },
+        comments=[],
+    )
+    profile_line = next(
+        line
+        for line in context.splitlines()
+        if line.startswith("- business_profile_contract: ")
+    )
+    profile = json.loads(profile_line.split(": ", 1)[1])
+    assert "- work_item_type: \n" in context + "\n"
+    assert profile["status"] == "unresolved"
+    assert profile["reason"] == "official_project_or_work_item_type_missing"
+
+
 @pytest.mark.parametrize(
     "field_value",
     ["2026-07-12 15:31:16", "20260708, 20:05:00"],
