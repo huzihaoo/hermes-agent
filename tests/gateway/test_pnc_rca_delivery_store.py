@@ -1268,7 +1268,7 @@ def test_v4_watch_schema_migrates_task_id_to_nullable(tmp_path):
     assert version == DELIVERY_STORE_SCHEMA_VERSION
 
 
-def test_delivery_health_fails_readiness_for_stalled_watch(tmp_path):
+def test_delivery_health_observes_stalled_watch_without_blocking_readiness(tmp_path):
     _control(tmp_path)
     store = RcaDeliveryStore(tmp_path / "control.sqlite3")
     assert store.backfill_completed_submissions(now=NOW) == 1
@@ -1285,9 +1285,13 @@ def test_delivery_health_fails_readiness_for_stalled_watch(tmp_path):
     watch = store.list_rows("rca_execution_watch")[0]
 
     assert health["process_healthy"] is True
-    assert health["business_ready"] is False
-    assert health["ok"] is False
+    assert health["business_ready"] is True
+    assert health["ok"] is True
     assert health["business_blockers"]["stalled_watches"] == 1
+    assert health["production_blockers"] == {
+        "activation_schema_unavailable": 0,
+        "uncertain_effects": 0,
+    }
     assert watch["state"] == "pending"
 
 

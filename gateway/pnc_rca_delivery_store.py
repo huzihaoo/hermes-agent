@@ -5153,6 +5153,15 @@ class RcaDeliveryStore:
                 "unresolved_required_effects": unresolved_required_effects,
                 "outcome_slo_breached": int(not outcome_slo["healthy"]),
             }
+            # Keep backlog and historical outcome counts visible without turning
+            # them into admission gates. Only conditions that make a new external
+            # write unsafe affect production readiness.
+            production_blockers = {
+                "activation_schema_unavailable": business_blockers[
+                    "activation_schema_unavailable"
+                ],
+                "uncertain_effects": business_blockers["uncertain_effects"],
+            }
             required_circuits = {
                 DELIVERY_EFFECT_KIND,
                 DELIVERY_THREAD_EFFECT_KIND,
@@ -5162,7 +5171,7 @@ class RcaDeliveryStore:
                 for name in required_circuits
             )
             circuit = circuits.get(DELIVERY_EFFECT_KIND, {"state": "missing"})
-            ready = not any(business_blockers.values()) and circuits_ready
+            ready = not any(production_blockers.values()) and circuits_ready
             permanent_failure_circuit = {
                 "threshold": PERMANENT_FAILURE_CIRCUIT_THRESHOLD,
                 "consecutive_failures": (
@@ -5191,6 +5200,7 @@ class RcaDeliveryStore:
                 "oldest_active_watch_created_at": oldest_active_created_at,
                 "watch_sla_seconds": DELIVERY_WATCH_SLA_SECONDS,
                 "business_blockers": business_blockers,
+                "production_blockers": production_blockers,
                 "expired_watch_leases": expired,
             }
         finally:

@@ -969,8 +969,12 @@ def test_terminal_manual_delivery_skips_report_http_and_sends_both_effects(tmp_p
     store = _seed_terminal(tmp_path, with_thread=True)
     before = store.health(now=NOW)
     assert before["delivery_job_outcomes"] == {"terminal_failed": 1}
-    assert before["business_ready"] is False
+    assert before["business_ready"] is True
     assert before["business_blockers"]["unresolved_required_effects"] == 2
+    assert before["production_blockers"] == {
+        "activation_schema_unavailable": 0,
+        "uncertain_effects": 0,
+    }
     thread_remote = ThreadRemote()
     verifier_calls = []
 
