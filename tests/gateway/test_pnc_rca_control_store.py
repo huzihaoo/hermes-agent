@@ -165,6 +165,25 @@ def _manual_request(
     )
 
 
+def _operator_request(
+    message_id: str,
+    *,
+    issue_url: str = "https://project.feishu.cn/g1q3/issue/detail/7041712812",
+    requester_id: str = "operator-songying",
+):
+    return ManualRcaTriggerRequest(
+        schema_version=MANUAL_TRIGGER_SCHEMA_VERSION,
+        issue_url=issue_url,
+        mode="rerun",
+        reason="production_batch_rerun",
+        platform="operator",
+        chat_id="",
+        thread_id="",
+        message_id=message_id,
+        requester_id=requester_id,
+    )
+
+
 def _manual_activation_identity(
     message_id: str,
     *,
@@ -183,6 +202,75 @@ def _manual_activation_identity(
         "issue_url": request.issue_url,
         "mode": request.mode,
     }
+
+
+def test_operator_rerun_is_issue_only_and_idempotent(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    _register_policy_without_classifying(store)
+    first = store.admit_manual_trigger(
+        _manual_request("om_operator_seed"),
+        allowed_chat_ids={"oc_allowed"},
+        submit_enabled=True,
+    )
+    _terminalize_permanent(store, first.submission_key)
+
+    request = _operator_request("batch-20260724-7041712812-attempt-1")
+    rerun = store.admit_manual_trigger(
+        request,
+        allowed_chat_ids=set(),
+        submit_enabled=True,
+        operator_authorized=True,
+        operator_rate_limit=1,
+        operator_rate_window_seconds=1,
+    )
+    replay = store.admit_manual_trigger(
+        request,
+        allowed_chat_ids=set(),
+        submit_enabled=True,
+        operator_authorized=True,
+        operator_rate_limit=1,
+        operator_rate_window_seconds=1,
+    )
+
+    assert rerun.generation == 2
+    assert replay.submission_key == rerun.submission_key
+    assert replay.reason == "idempotent_source_replay"
+    subscriptions = [
+        row
+        for row in store.list_rows("rca_delivery_subscriptions")
+        if row["business_key"] == rerun.business_key
+        and row["generation"] == rerun.generation
+    ]
+    assert [row["effect_kind"] for row in subscriptions] == [
+        "feishu_issue_comment"
+    ]
+    source = next(
+        row
+        for row in store.list_rows("rca_trigger_sources")
+        if row["source_id"] == rerun.source_id
+    )
+    assert source["platform"] == "operator"
+    assert source["chat_id"] == source["thread_id"] == ""
+
+
+def test_operator_rerun_requires_authorization_and_existing_issue(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    _register_policy_without_classifying(store)
+    request = _operator_request("batch-20260724-missing-attempt-1")
+
+    with pytest.raises(ManualRcaAdmissionError, match="operator_not_authorized"):
+        store.admit_manual_trigger(
+            request,
+            allowed_chat_ids=set(),
+            submit_enabled=True,
+        )
+    with pytest.raises(ManualRcaAdmissionError, match="issue_scope_missing"):
+        store.admit_manual_trigger(
+            request,
+            allowed_chat_ids=set(),
+            submit_enabled=True,
+            operator_authorized=True,
+        )
 
 
 def _create_activation_epoch(

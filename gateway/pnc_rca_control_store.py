@@ -5900,25 +5900,27 @@ class RcaControlStore:
             raise ManualRcaAdmissionError("manual_request_schema_unsupported")
         if normalized.mode not in {"run_or_join", "rerun", "debug"}:
             raise ManualRcaAdmissionError("manual_request_mode_invalid")
-        if normalized.platform != "feishu":
+        if normalized.platform not in {"feishu", "operator"}:
             raise ManualRcaAdmissionError("manual_request_platform_invalid")
         if not all(
-            (
-                normalized.chat_id,
-                normalized.thread_id,
-                normalized.message_id,
-                normalized.requester_id,
-                normalized.reason,
-            )
+            (normalized.message_id, normalized.requester_id, normalized.reason)
         ):
             raise ManualRcaAdmissionError("manual_request_source_incomplete")
         if len(normalized.reason.encode("utf-8")) > 500:
             raise ManualRcaAdmissionError("manual_request_reason_too_long")
-        if not normalized.thread_id.startswith("topic:"):
-            raise ManualRcaAdmissionError("manual_request_thread_invalid")
-        root = normalized.thread_id.split("topic:", 1)[1]
-        if not root or not re.fullmatch(r"[A-Za-z0-9_-]{3,200}", root):
-            raise ManualRcaAdmissionError("manual_request_thread_invalid")
+        if normalized.platform == "operator":
+            if normalized.mode not in {"rerun", "debug"}:
+                raise ManualRcaAdmissionError("manual_operator_mode_invalid")
+            if normalized.chat_id or normalized.thread_id:
+                raise ManualRcaAdmissionError("manual_operator_source_invalid")
+        else:
+            if not normalized.chat_id or not normalized.thread_id:
+                raise ManualRcaAdmissionError("manual_request_source_incomplete")
+            if not normalized.thread_id.startswith("topic:"):
+                raise ManualRcaAdmissionError("manual_request_thread_invalid")
+            root = normalized.thread_id.split("topic:", 1)[1]
+            if not root or not re.fullmatch(r"[A-Za-z0-9_-]{3,200}", root):
+                raise ManualRcaAdmissionError("manual_request_thread_invalid")
         if not _ISSUE_URL_RE.fullmatch(normalized.issue_url):
             raise ManualRcaAdmissionError("manual_request_issue_url_invalid")
         return normalized
@@ -6247,8 +6249,9 @@ class RcaControlStore:
         activation_slot_kind: str = "",
         now: datetime | None = None,
     ) -> ManualRcaAdmissionResult:
-        """Atomically create or join one manual RCA generation and topic subscription."""
+        """Atomically create or join one manual RCA generation and delivery target."""
         manual = self._normalize_manual_request(request)
+        issue_only_operator = manual.platform == "operator"
         if not isinstance(activation_required, bool):
             raise ManualRcaAdmissionError("manual_activation_required_invalid")
         activation_slot = str(activation_slot_kind or "").strip()
@@ -6257,10 +6260,10 @@ class RcaControlStore:
         allowed = {str(item or "").strip() for item in allowed_chat_ids}
         if not submit_enabled:
             raise ManualRcaAdmissionError("manual_intake_disabled")
-        if manual.chat_id not in allowed:
+        if not issue_only_operator and manual.chat_id not in allowed:
             raise ManualRcaAdmissionError("manual_intake_chat_not_allowed")
         operator_requested = manual.mode in {"rerun", "debug"}
-        if operator_requested and not operator_authorized:
+        if (operator_requested or issue_only_operator) and not operator_authorized:
             raise ManualRcaAdmissionError("manual_operator_not_authorized")
         try:
             high_watermark = int(outbox_high_watermark)
@@ -6272,7 +6275,7 @@ class RcaControlStore:
             raise ManualRcaAdmissionError("manual_outbox_high_watermark_invalid")
         rate_limit = DEFAULT_MANUAL_OPERATOR_RATE_LIMIT
         rate_window_seconds = DEFAULT_MANUAL_OPERATOR_RATE_WINDOW_SECONDS
-        if operator_requested:
+        if operator_requested and not issue_only_operator:
             try:
                 rate_limit = int(operator_rate_limit)
                 rate_window_seconds = int(operator_rate_window_seconds)
@@ -6304,11 +6307,23 @@ class RcaControlStore:
             raise ManualRcaAdmissionError("manual_request_issue_url_invalid")
         project_simple_name, work_item_id = url_match.groups()
         payload_sha = _canonical_sha256(manual.to_dict())
-        source_dedupe_key = f"feishu:{manual.message_id}"
+        source_dedupe_key = f"{manual.platform}:{manual.message_id}"
         source_id = _stable_key(
             "g1q3-rca-source-v1",
             {"source_kind": "feishu_group_manual", "dedupe": source_dedupe_key},
         )
+        activation_source_identity = {
+            "chat_id": manual.chat_id,
+            "thread_id": manual.thread_id,
+            "requester_id": manual.requester_id,
+            "message_id": manual.message_id,
+            "issue_url": manual.issue_url,
+            "mode": manual.mode,
+        }
+        if issue_only_operator:
+            activation_source_identity.update(
+                {"chat_id": "operator", "thread_id": "operator:issue-only"}
+            )
         current = _iso(now)
         conn = self._connect()
         try:
@@ -6346,14 +6361,7 @@ class RcaControlStore:
                     conn,
                     entrypoint="manual_admit",
                     source_kind="manual",
-                    source_identity={
-                        "chat_id": manual.chat_id,
-                        "thread_id": manual.thread_id,
-                        "requester_id": manual.requester_id,
-                        "message_id": manual.message_id,
-                        "issue_url": manual.issue_url,
-                        "mode": manual.mode,
-                    },
+                    source_identity=activation_source_identity,
                     business_key=str(binding["business_key"]),
                     submission_key=str(binding["submission_key"]),
                     generation=int(binding["generation"]),
@@ -6387,17 +6395,6 @@ class RcaControlStore:
                         "UPDATE rca_trigger_sources SET outcome = ? WHERE source_id = ?",
                         (replay_outcome, source_id),
                     )
-                root = manual.thread_id.split("topic:", 1)[1]
-                target_key = f"feishu_thread:{manual.chat_id}:{root}"
-                subscription_key = _stable_key(
-                    "g1q3-rca-sub-v1",
-                    {
-                        "business_key": binding["business_key"],
-                        "generation": int(binding["generation"]),
-                        "effect_kind": "feishu_thread_reply",
-                        "target_key": target_key,
-                    },
-                )
                 required_subscriptions = conn.execute(
                     """
                     SELECT subscription_key, effect_kind
@@ -6413,7 +6410,28 @@ class RcaControlStore:
                     str(row["effect_kind"]): str(row["subscription_key"])
                     for row in required_subscriptions
                 }
-                if subscriptions_by_kind.get("feishu_thread_reply") != subscription_key:
+                expected_kinds = {"feishu_issue_comment"}
+                subscription_key = subscriptions_by_kind.get(
+                    "feishu_issue_comment", ""
+                )
+                if not issue_only_operator:
+                    root = manual.thread_id.split("topic:", 1)[1]
+                    target_key = f"feishu_thread:{manual.chat_id}:{root}"
+                    subscription_key = _stable_key(
+                        "g1q3-rca-sub-v1",
+                        {
+                            "business_key": binding["business_key"],
+                            "generation": int(binding["generation"]),
+                            "effect_kind": "feishu_thread_reply",
+                            "target_key": target_key,
+                        },
+                    )
+                    expected_kinds.add("feishu_thread_reply")
+                if not subscription_key or (
+                    not issue_only_operator
+                    and subscriptions_by_kind.get("feishu_thread_reply")
+                    != subscription_key
+                ):
                     raise ManualRcaAdmissionError(
                         "manual_source_subscription_missing"
                     )
@@ -6427,10 +6445,7 @@ class RcaControlStore:
                     ).fetchone()
                     is None
                 ]
-                if set(subscriptions_by_kind) != {
-                    "feishu_issue_comment",
-                    "feishu_thread_reply",
-                }:
+                if set(subscriptions_by_kind) != expected_kinds:
                     raise ManualRcaAdmissionError(
                         "manual_source_subscription_missing"
                     )
@@ -6456,7 +6471,7 @@ class RcaControlStore:
                     reason=replay_reason,
                 )
 
-            if operator_requested:
+            if operator_requested and not issue_only_operator:
                 window_start = _iso(
                     _utc_datetime(now) - timedelta(seconds=rate_window_seconds)
                 )
@@ -6514,6 +6529,8 @@ class RcaControlStore:
                 work_item_type_key=work_item_type_key,
                 work_item_id=work_item_id,
             )
+            if issue_only_operator and latest is None:
+                raise ManualRcaAdmissionError("manual_operator_issue_scope_missing")
             if business_key_count > 1:
                 self._audit_issue_scope_conflict_tx(
                     conn,
@@ -6632,14 +6649,7 @@ class RcaControlStore:
                 conn,
                 entrypoint="manual_admit",
                 source_kind="manual",
-                source_identity={
-                    "chat_id": manual.chat_id,
-                    "thread_id": manual.thread_id,
-                    "requester_id": manual.requester_id,
-                    "message_id": manual.message_id,
-                    "issue_url": manual.issue_url,
-                    "mode": manual.mode,
-                },
+                source_identity=activation_source_identity,
                 business_key=admission.business_key,
                 submission_key=admission.submission_key,
                 generation=admission.generation,
@@ -6679,12 +6689,13 @@ class RcaControlStore:
                     source_id, source_kind, source_dedupe_key, payload_sha256,
                     platform, chat_id, thread_id, message_id, requester_id,
                     kafka_event_uid, mode, outcome, created_at
-                ) VALUES (?, 'feishu_group_manual', ?, ?, 'feishu', ?, ?, ?, ?, NULL, ?, ?, ?)
+                ) VALUES (?, 'feishu_group_manual', ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
                 """,
                 (
                     source_id,
                     source_dedupe_key,
                     payload_sha,
+                    manual.platform,
                     manual.chat_id,
                     manual.thread_id,
                     manual.message_id,
@@ -6803,32 +6814,38 @@ class RcaControlStore:
             issue_subscription_key = self._insert_issue_subscription_tx(
                 conn, admission=admission, current=current
             )
-            subscription_key, _subscription_created = self._insert_thread_subscription_tx(
-                conn,
-                admission=admission,
-                source_id=source_id,
-                request=manual,
-                current=current,
-            )
+            subscription_key = issue_subscription_key
+            if not issue_only_operator:
+                subscription_key, _subscription_created = (
+                    self._insert_thread_subscription_tx(
+                        conn,
+                        admission=admission,
+                        source_id=source_id,
+                        request=manual,
+                        current=current,
+                    )
+                )
             self._bind_source_subscription_tx(
                 conn,
                 source_id=source_id,
                 subscription_key=issue_subscription_key,
                 current=current,
             )
-            self._bind_source_subscription_tx(
-                conn,
-                source_id=source_id,
-                subscription_key=subscription_key,
-                current=current,
-            )
-            late_catchup = self._mark_late_catchup_tx(
-                conn,
-                subscription_key=subscription_key,
-                business_key=admission.business_key,
-                generation=admission.generation,
-                current=current,
-            )
+            late_catchup = False
+            if not issue_only_operator:
+                self._bind_source_subscription_tx(
+                    conn,
+                    source_id=source_id,
+                    subscription_key=subscription_key,
+                    current=current,
+                )
+                late_catchup = self._mark_late_catchup_tx(
+                    conn,
+                    subscription_key=subscription_key,
+                    business_key=admission.business_key,
+                    generation=admission.generation,
+                    current=current,
+                )
             if late_catchup and outcome == "joined":
                 outcome = "catchup_attached"
                 conn.execute(
