@@ -1,4 +1,11 @@
-from scripts.pnc_rca_batch_rerun import _approval, _request, _terminal_failure
+import sqlite3
+
+from scripts.pnc_rca_batch_rerun import (
+    _approval,
+    _issue_snapshot,
+    _request,
+    _terminal_failure,
+)
 
 
 def _snapshot(
@@ -65,3 +72,72 @@ def test_batch_request_is_operator_issue_only_and_deterministic():
     assert request.platform == "operator"
     assert request.chat_id == request.thread_id == ""
     assert request.message_id == "gray-20260724-7048803418-try-1"
+
+
+def test_issue_snapshot_tracks_new_outbox_before_execution_watch_exists(tmp_path):
+    db_path = tmp_path / "control.sqlite3"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE business_triggers (
+            business_key TEXT,
+            generation INTEGER,
+            submission_key TEXT,
+            work_item_id TEXT
+        );
+        CREATE TABLE rca_outbox (
+            outbox_id INTEGER,
+            business_key TEXT,
+            generation INTEGER,
+            status TEXT,
+            last_error_code TEXT,
+            last_error_detail TEXT,
+            completed_at TEXT
+        );
+        CREATE TABLE rca_execution_watch (
+            submission_outbox_id INTEGER
+        );
+        CREATE TABLE rca_delivery_jobs (
+            submission_key TEXT,
+            delivery_id TEXT,
+            status TEXT,
+            outcome TEXT,
+            outcome_key TEXT,
+            terminal_state TEXT,
+            terminal_error_code TEXT,
+            issue_url TEXT,
+            report_url TEXT,
+            manifest_json TEXT,
+            contract_json TEXT,
+            artifacts_json TEXT,
+            updated_at TEXT
+        );
+        CREATE TABLE rca_delivery_effects (
+            delivery_id TEXT,
+            effect_key TEXT,
+            effect_kind TEXT,
+            required INTEGER,
+            target_key TEXT,
+            status TEXT,
+            remote_receipt_json TEXT,
+            last_error_code TEXT,
+            completed_at TEXT,
+            updated_at TEXT
+        );
+        INSERT INTO business_triggers VALUES (
+            'business-1', 6, 'submission-6', '7048803418'
+        );
+        INSERT INTO rca_outbox VALUES (
+            378, 'business-1', 6, 'pending', '', '', NULL
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    snapshot = _issue_snapshot(db_path, "7048803418", submission_key="submission-6")
+
+    assert snapshot is not None
+    assert snapshot["generation"] == 6
+    assert snapshot["submission_key"] == "submission-6"
+    assert snapshot["outbox_status"] == "pending"

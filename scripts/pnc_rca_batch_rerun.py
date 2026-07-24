@@ -174,13 +174,21 @@ def _json_object(raw: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
 
 
-def _issue_snapshot(db_path: Path, issue_id: str) -> dict[str, Any] | None:
+def _issue_snapshot(
+    db_path: Path, issue_id: str, *, submission_key: str = ""
+) -> dict[str, Any] | None:
     conn = sqlite3.connect(db_path, timeout=10)
     conn.row_factory = sqlite3.Row
     try:
+        submission_filter = ""
+        params: tuple[str, ...] = (issue_id,)
+        if submission_key:
+            submission_filter = " AND b.submission_key = ?"
+            params = (issue_id, submission_key)
         row = conn.execute(
-            """
-            SELECT w.*, o.status AS outbox_status,
+            f"""
+            SELECT b.generation, b.submission_key,
+                   o.status AS outbox_status,
                    o.last_error_code AS outbox_error_code,
                    o.last_error_detail AS outbox_error_detail,
                    o.completed_at AS outbox_completed_at,
@@ -190,16 +198,19 @@ def _issue_snapshot(db_path: Path, issue_id: str) -> dict[str, Any] | None:
                    j.issue_url, j.report_url, j.manifest_json,
                    j.contract_json, j.artifacts_json,
                    j.updated_at AS job_updated_at
-              FROM rca_execution_watch AS w
+              FROM business_triggers AS b
               JOIN rca_outbox AS o
-                ON o.outbox_id = w.submission_outbox_id
+                ON o.business_key = b.business_key
+               AND o.generation = b.generation
+         LEFT JOIN rca_execution_watch AS w
+                ON w.submission_outbox_id = o.outbox_id
          LEFT JOIN rca_delivery_jobs AS j
-                ON j.submission_key = w.submission_key
-             WHERE w.work_item_id = ?
-             ORDER BY w.generation DESC
+                ON j.submission_key = b.submission_key
+             WHERE b.work_item_id = ?{submission_filter}
+             ORDER BY b.generation DESC
              LIMIT 1
             """,
-            (issue_id,),
+            params,
         ).fetchone()
         if row is None:
             return None
@@ -392,8 +403,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             _write_state(state_path, state)
         deadline = time.monotonic() + args.item_timeout_seconds
         while True:
-            latest = _issue_snapshot(Path(args.control_db), issue_id)
-            if latest is None or latest["submission_key"] != item["submission_key"]:
+            current = _issue_snapshot(Path(args.control_db), issue_id)
+            if current is None or int(current["generation"]) > int(item["generation"]):
+                raise BatchRerunError("batch_issue_generation_drift")
+            latest = _issue_snapshot(
+                Path(args.control_db),
+                issue_id,
+                submission_key=str(item["submission_key"]),
+            )
+            if latest is None:
                 raise BatchRerunError("batch_issue_generation_drift")
             accepted = _approval(latest)
             if accepted is not None:
