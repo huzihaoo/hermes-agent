@@ -1406,6 +1406,11 @@ class RcaDeliveryStore:
             terminal_state=OUTBOX_QUARANTINED_TERMINAL_STATE,
             error_code=public_error_code,
             source_error_code=source_error_code,
+            diagnostic_detail=(
+                str(row["last_error_detail"] or "")
+                if source_error_code in OUTBOX_PUBLIC_PROFILE_ERROR_CODES
+                else ""
+            ),
         )
         terminal_at = str(row["quarantined_at"] or current)
         status = {

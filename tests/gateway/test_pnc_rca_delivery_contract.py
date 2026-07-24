@@ -352,11 +352,19 @@ def test_mdrive4_readiness_terminal_is_explicit_and_business_neutral():
         terminal_state="submission_quarantined",
         error_code="business_profile_adapter_not_ready",
         source_error_code="business_profile_adapter_not_ready",
+        diagnostic_detail=(
+            "已按官方字段路由到 mdrive4（数据 resolver=mdrive4_recorder_mcap_reference_v1，"
+            "评测器=ct_evaluator_217_20260722，命名空间=rca/mdrive4），输入适配状态为 "
+            "input_adapter_pending；本次不生成归因结论，不会进入 G1Q3，也不会回退到其他项目评测器"
+        ),
     )
 
     assert terminal.diagnostic_code == "business_adapter_not_ready"
-    assert "已按官方字段路由" in terminal.diagnostic_result
-    assert "未跨项目回退" in terminal.diagnostic_result
+    assert "已按官方字段路由到 mdrive4" in terminal.diagnostic_result
+    assert "mdrive4_recorder_mcap_reference_v1" in terminal.diagnostic_result
+    assert "ct_evaluator_217_20260722" in terminal.diagnostic_result
+    assert "rca/mdrive4" in terminal.diagnostic_result
+    assert "不会进入 G1Q3" in terminal.diagnostic_result
     assert "【RCA 机器人终态】" in terminal.effect_payload["comment_content"]
     assert "G1Q3 RCA 机器人终态" not in terminal.effect_payload["comment_content"]
 

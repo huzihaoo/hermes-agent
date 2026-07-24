@@ -312,6 +312,14 @@ _TERMINAL_DIAGNOSTIC_RESULTS = {
         "自动归因未完成（非归因结论）：自动分析任务异常终止，请由系统维护者排查并显式重试。"
     ),
 }
+_BUSINESS_ROUTE_DIAGNOSTIC_CODES = frozenset(
+    {
+        "business_route_unresolved",
+        "business_route_unsupported",
+        "business_route_conflict",
+        "business_adapter_not_ready",
+    }
+)
 _TERMINAL_INPUT_DIAGNOSTIC_CODES = {
     "business_profile_unresolved": "business_route_unresolved",
     "business_profile_unsupported": "business_route_unsupported",
@@ -606,6 +614,7 @@ def build_terminal_delivery(
     error_code: str,
     source_error_code: str = "",
     diagnostic_code: str = "",
+    diagnostic_detail: str = "",
     schema_version: str = TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
 ) -> VerifiedTerminalDelivery:
     values = {
@@ -683,9 +692,27 @@ def build_terminal_delivery(
             and normalized_diagnostic_code != derived_diagnostic_code
         ):
             raise DeliveryContractError("terminal_delivery_diagnostic_code_mismatch")
+        public_detail = str(diagnostic_detail or "").strip()
+        if public_detail:
+            if (
+                normalized_diagnostic_code not in _BUSINESS_ROUTE_DIAGNOSTIC_CODES
+                or "\n" in public_detail
+                or "\r" in public_detail
+                or len(public_detail.encode("utf-8")) > 1500
+            ):
+                raise DeliveryContractError(
+                    "terminal_delivery_diagnostic_detail_invalid"
+                )
+            diagnostic_message = (
+                f"自动归因未完成（非归因结论）：{public_detail.rstrip('。')}。"
+            )
+        else:
+            diagnostic_message = _TERMINAL_DIAGNOSTIC_RESULTS[
+                normalized_diagnostic_code
+            ]
         diagnostic_result = (
             f"RCA 第 {generation} 代："
-            f"{_TERMINAL_DIAGNOSTIC_RESULTS[normalized_diagnostic_code]}"
+            f"{diagnostic_message}"
             "本代未生成已验证归因报告；问题单归因报告字段若非空，"
             f"可能保留自其他代次，不代表第 {generation} 代结论。"
         )

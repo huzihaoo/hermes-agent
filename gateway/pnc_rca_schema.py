@@ -78,12 +78,24 @@ def validate_issue_context_fields(issue_context: RcaIssueContext) -> tuple[RcaIs
             }
         readiness = _sanitize_string(profile.get("execution_readiness"))
         if readiness != "ready":
+            profile_id = _sanitize_string(profile.get("profile_id")) or "unknown"
+            data_resolver = (
+                _sanitize_string(profile.get("data_resolver")) or "unknown"
+            )
+            evaluator_scope = (
+                _sanitize_string(profile.get("evaluator_scope")) or "unknown"
+            )
+            artifact_namespace = (
+                _sanitize_string(profile.get("artifact_namespace")) or "unknown"
+            )
             return issue_context, {
                 "kind": "business_profile_adapter_not_ready",
                 "message": (
-                    f"已按官方字段路由到 {profile.get('profile_id') or 'unknown'}，"
-                    f"但该项目输入适配状态为 {readiness or 'unknown'}；"
-                    "本次不生成归因结论，也不会回退到其他项目评测器"
+                    f"已按官方字段路由到 {profile_id}"
+                    f"（数据 resolver={data_resolver}，评测器={evaluator_scope}，"
+                    f"命名空间={artifact_namespace}），输入适配状态为 "
+                    f"{readiness or 'unknown'}；本次不生成归因结论，"
+                    "不会进入 G1Q3，也不会回退到其他项目评测器"
                 ),
                 "retryable": False,
                 "business_profile": profile,
