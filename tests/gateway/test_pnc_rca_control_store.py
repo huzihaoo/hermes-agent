@@ -253,7 +253,7 @@ def test_operator_rerun_is_issue_only_and_idempotent(tmp_path):
     assert source["chat_id"] == source["thread_id"] == ""
 
 
-def test_operator_rerun_requires_authorization_and_existing_issue(tmp_path):
+def test_operator_rerun_requires_authorization_and_can_create_issue_only(tmp_path):
     store = RcaControlStore(tmp_path / "control.sqlite3")
     _register_policy_without_classifying(store)
     request = _operator_request("batch-20260724-missing-attempt-1")
@@ -264,13 +264,23 @@ def test_operator_rerun_requires_authorization_and_existing_issue(tmp_path):
             allowed_chat_ids=set(),
             submit_enabled=True,
         )
-    with pytest.raises(ManualRcaAdmissionError, match="issue_scope_missing"):
-        store.admit_manual_trigger(
-            request,
-            allowed_chat_ids=set(),
-            submit_enabled=True,
-            operator_authorized=True,
-        )
+    admitted = store.admit_manual_trigger(
+        request,
+        allowed_chat_ids=set(),
+        submit_enabled=True,
+        operator_authorized=True,
+    )
+
+    assert admitted.outcome == "created"
+    assert admitted.generation == 1
+    subscriptions = [
+        row
+        for row in store.list_rows("rca_delivery_subscriptions")
+        if row["business_key"] == admitted.business_key
+    ]
+    assert [row["effect_kind"] for row in subscriptions] == [
+        "feishu_issue_comment"
+    ]
 
 
 def _create_activation_epoch(

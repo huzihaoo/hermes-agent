@@ -352,9 +352,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         issue_id = queue_item["issue_id"]
         item = dict(state["items"].get(issue_id) or {})
         latest = _issue_snapshot(Path(args.control_db), issue_id)
-        if latest is None:
-            raise BatchRerunError("batch_issue_scope_missing")
-        accepted = _approval(latest)
+        accepted = _approval(latest) if latest is not None else None
         queue_submission = queue_item["queue_submission_key"]
         if accepted is not None and (
             item.get("status") == "accepted"

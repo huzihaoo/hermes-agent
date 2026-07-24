@@ -6529,8 +6529,6 @@ class RcaControlStore:
                 work_item_type_key=work_item_type_key,
                 work_item_id=work_item_id,
             )
-            if issue_only_operator and latest is None:
-                raise ManualRcaAdmissionError("manual_operator_issue_scope_missing")
             if business_key_count > 1:
                 self._audit_issue_scope_conflict_tx(
                     conn,
