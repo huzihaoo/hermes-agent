@@ -1,4 +1,4 @@
-"""Schemas for host-side PNC/G1Q3 RCA intake and VM execution handoff."""
+"""Schemas for host-side PNC RCA intake and VM execution handoff."""
 
 from __future__ import annotations
 
@@ -36,6 +36,7 @@ class RcaIssueContext:
     status: str = ""
     owners: list[str] = field(default_factory=list)
     project_label: str = ""
+    business_profile: dict[str, Any] = field(default_factory=dict)
     case_id: str = ""
     frame_id: str = ""
     frame_lookup: dict[str, Any] = field(default_factory=dict)
@@ -61,6 +62,32 @@ def validate_issue_context_fields(issue_context: RcaIssueContext) -> tuple[RcaIs
     """
     if issue_context.source_quality == "unavailable":
         return issue_context, None
+    profile = issue_context.business_profile
+    if profile:
+        resolution = _sanitize_string(profile.get("status"))
+        if resolution != "matched":
+            return issue_context, {
+                "kind": f"business_profile_{resolution or 'unresolved'}",
+                "field": str(profile.get("routing_field_key") or "field_052f23"),
+                "message": (
+                    "官方项目字段未唯一匹配已注册 RCA 业务；任务已停止，"
+                    "不会按标题、负责人或群聊猜测，也不会进入 G1Q3 评测链"
+                ),
+                "retryable": False,
+                "business_profile": profile,
+            }
+        readiness = _sanitize_string(profile.get("execution_readiness"))
+        if readiness != "ready":
+            return issue_context, {
+                "kind": "business_profile_adapter_not_ready",
+                "message": (
+                    f"已按官方字段路由到 {profile.get('profile_id') or 'unknown'}，"
+                    f"但该项目输入适配状态为 {readiness or 'unknown'}；"
+                    "本次不生成归因结论，也不会回退到其他项目评测器"
+                ),
+                "retryable": False,
+                "business_profile": profile,
+            }
     source_value = _sanitize_string(issue_context.pdcl_download_cmd)
     if not source_value:
         return dataclasses_replace(issue_context, is_pdcl_format=False), {
@@ -235,6 +262,16 @@ def issue_context_from_compact_text(
         if isinstance(parsed_frame_lookup, dict):
             frame_lookup = parsed_frame_lookup
 
+    business_profile: dict[str, Any] = {}
+    business_profile_text = line_value("business_profile_contract")
+    if business_profile_text:
+        try:
+            parsed_profile = json.loads(business_profile_text)
+        except json.JSONDecodeError:
+            parsed_profile = None
+        if isinstance(parsed_profile, dict):
+            business_profile = parsed_profile
+
     blockers_value = list(blockers or [])
     if not text and not blockers_value and source_quality == "unavailable":
         blockers_value.append({"kind": "host_preread_unavailable", "message": "Feishu issue preread unavailable"})
@@ -246,6 +283,7 @@ def issue_context_from_compact_text(
         status=line_value("当前状态"),
         owners=[part.strip() for part in line_value("当前负责人").split(",") if part.strip()],
         project_label=line_value("所属项目"),
+        business_profile=business_profile,
         frame_id=line_value("frame_id"),
         frame_lookup=frame_lookup,
         frame_reference_error=line_value("frame_reference_error"),
@@ -287,25 +325,61 @@ def build_execution_request(
             issue_context.pdcl_download_cmd, exc
         )
     case_id = issue_context.case_id or ""
+    business_profile = _sanitize_mapping(issue_context.business_profile)
+    work_item = {
+        "project_key": issue_context.project_key,
+        "work_item_type": issue_context.work_item_type,
+        "work_item_id": issue_context.work_item_id,
+        "url": issue_context.url,
+        "title": issue_context.title,
+        "status": issue_context.status,
+        "owners": issue_context.owners,
+    }
+    case = {
+        "case_id": case_id,
+        "frame_id": issue_context.frame_id,
+        "frame_lookup": issue_context.frame_lookup,
+        "function_category": issue_context.function_category,
+        "function_domain": issue_context.function_domain,
+        "project_label": issue_context.project_label,
+    }
+    execution_policy = {
+        "mode": (
+            "remote_read"
+            if data_access.get("status") != "blocked"
+            else "remote_read_blocked"
+        ),
+        "data_access_mode": "remote_read",
+        "allow_download": False,
+        "input_materialization": "forbidden",
+        "derived_artifacts_allowed": True,
+        "allow_feishu_writeback": bool(allow_feishu_writeback),
+        "group_response_cap": group_response_cap,
+        "artifact_root": artifact_root,
+        "translate_baseline": _sanitize_string(
+            translate_baseline or "production", limit=80
+        ),
+        "translate_contract_path": _sanitize_string(
+            translate_contract_path, limit=500
+        ),
+    }
+    toolchain_payload = dict(toolchain or {})
+    if isinstance(business_profile, dict) and business_profile:
+        work_item["business_profile"] = business_profile
+        case["artifact_namespace"] = business_profile.get(
+            "artifact_namespace", ""
+        )
+        execution_policy["resource_class"] = business_profile.get(
+            "resource_class", ""
+        )
+        execution_policy["artifact_kind"] = business_profile.get(
+            "artifact_kind", ""
+        )
+        toolchain_payload["business_profile"] = business_profile
     return RcaExecutionRequest(
         request_kind=request_kind,
-        work_item={
-            "project_key": issue_context.project_key,
-            "work_item_type": issue_context.work_item_type,
-            "work_item_id": issue_context.work_item_id,
-            "url": issue_context.url,
-            "title": issue_context.title,
-            "status": issue_context.status,
-            "owners": issue_context.owners,
-        },
-        case={
-            "case_id": case_id,
-            "frame_id": issue_context.frame_id,
-            "frame_lookup": issue_context.frame_lookup,
-            "function_category": issue_context.function_category,
-            "function_domain": issue_context.function_domain,
-            "project_label": issue_context.project_label,
-        },
+        work_item=work_item,
+        case=case,
         data={
             "data_access": data_access,
             "artifact_root": artifact_root,
@@ -319,28 +393,13 @@ def build_execution_request(
             "media_refs": issue_context.media_refs,
             "blockers": issue_context.blockers,
         }, issue_context.pdcl_download_cmd),
-        execution_policy={
-            "mode": (
-                "remote_read"
-                if data_access.get("status") != "blocked"
-                else "remote_read_blocked"
-            ),
-            "data_access_mode": "remote_read",
-            "allow_download": False,
-            "input_materialization": "forbidden",
-            "derived_artifacts_allowed": True,
-            "allow_feishu_writeback": bool(allow_feishu_writeback),
-            "group_response_cap": group_response_cap,
-            "artifact_root": artifact_root,
-            "translate_baseline": _sanitize_string(translate_baseline or "production", limit=80),
-            "translate_contract_path": _sanitize_string(translate_contract_path, limit=500),
-        },
+        execution_policy=execution_policy,
         source_refs={
             "task_id": task_id,
             "source_group_id": source_group_id,
             "source_message_id": source_message_id,
             "request_text_excerpt": _sanitize_string(request_text_excerpt, limit=1200),
         },
-        toolchain=_sanitize_mapping(toolchain or {}),
+        toolchain=_sanitize_mapping(toolchain_payload),
     )
 # === RCA_REQUEST_CONTRACT:END ===

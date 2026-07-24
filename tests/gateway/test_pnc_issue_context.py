@@ -58,6 +58,39 @@ def test_compact_issue_context_handles_structured_result_and_comments():
     assert "已回放\n\n优化后通过 [image]" in context
 
 
+def test_compact_rca_context_publishes_isolated_business_profile_contract():
+    context = pnc_issue_context.compact_rca_issue_context(
+        project_key="t03o4q",
+        work_item_brief={
+            "work_item_attribute": {
+                "work_item_id": "7044346306",
+                "work_item_name": "display text is not routing evidence",
+                "work_item_type": {"key": "issue"},
+            },
+            "work_item_fields": [
+                {
+                    "key": "field_052f23",
+                    "name": "所属项目",
+                    "value": [{"id": 7019637554, "name": "Y1M4_Mdrive4"}],
+                }
+            ],
+        },
+        comments=[],
+    )
+
+    profile_line = next(
+        line
+        for line in context.splitlines()
+        if line.startswith("- business_profile_contract: ")
+    )
+    profile = json.loads(profile_line.split(": ", 1)[1])
+    assert profile["status"] == "matched"
+    assert profile["profile_id"] == "mdrive4"
+    assert profile["project_option_ids"] == ["7019637554"]
+    assert profile["artifact_namespace"] == "rca/mdrive4"
+    assert profile["evaluator_scope"] == "ct_evaluator_217_20260722"
+
+
 @pytest.mark.parametrize(
     "field_value",
     ["2026-07-12 15:31:16", "20260708, 20:05:00"],
@@ -304,6 +337,14 @@ def test_url_project_key_wins_over_fixed_group_fallback():
         work_item_id="7008267126",
         source_group_id=pnc_issue_context.G1Q3_RCA_GROUP_ID,
     ) == "other_space"
+
+
+def test_all_business_group_does_not_imply_g1q3_project():
+    assert pnc_issue_context.resolve_feishu_issue_project_key(
+        "@胡子豪的小助手 分析这个问题",
+        work_item_id="7008267126",
+        source_group_id=pnc_issue_context.PNC_ALL_BUSINESS_TEST_GROUP_ID,
+    ) == ""
 
 def test_no_context_fallback_empty_inputs():
     assert pnc_issue_context.compact_g1q3_issue_context(work_item_brief={}, comments=[]) == ""

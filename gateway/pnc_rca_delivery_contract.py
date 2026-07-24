@@ -88,6 +88,7 @@ MAX_DELIVERY_ARTIFACT_TOTAL_BYTES = 512 * 1024 * 1024
 MAX_DELIVERY_INDEX_HTML_BYTES = 32 * 1024 * 1024
 MAX_FEISHU_COMMENT_BYTES = 8 * 1024
 MAX_CONCLUSION_BYTES = 2 * 1024
+CONSUMER_CAPABILITY_SCHEMA_VERSION = "rca_consumer_capability_publication_v1"
 RCA_RESULT_FIELD_KEY = "field_9193cb"
 RCA_REPORT_FIELD_KEY = "field_8c912e"
 DELIVERY_REPORT_LINK_KIND = "foxglove_viz"
@@ -277,6 +278,18 @@ _TERMINAL_BASE_EFFECT_SEMANTIC_FIELDS = (
 )
 
 _TERMINAL_DIAGNOSTIC_RESULTS = {
+    "business_route_unresolved": (
+        "自动归因未完成（非归因结论）：官方所属项目字段缺失，无法唯一选择业务归因能力；未按标题、负责人或群聊猜测。"
+    ),
+    "business_route_unsupported": (
+        "自动归因未完成（非归因结论）：官方所属项目尚未注册对应归因能力；未进入 G1Q3 或其他项目评测器。"
+    ),
+    "business_route_conflict": (
+        "自动归因未完成（非归因结论）：官方所属项目字段存在冲突，无法唯一选择业务归因能力。"
+    ),
+    "business_adapter_not_ready": (
+        "自动归因未完成（非归因结论）：已按官方字段路由到对应业务，但该项目输入适配尚未就绪；未跨项目回退或伪造归因。"
+    ),
     "input_remote_data_required": (
         "自动归因未完成（非归因结论）：问题单缺少问题数据地址，请补充有效的 event/clip 引用后重试。"
     ),
@@ -300,6 +313,10 @@ _TERMINAL_DIAGNOSTIC_RESULTS = {
     ),
 }
 _TERMINAL_INPUT_DIAGNOSTIC_CODES = {
+    "business_profile_unresolved": "business_route_unresolved",
+    "business_profile_unsupported": "business_route_unsupported",
+    "business_profile_conflict": "business_route_conflict",
+    "business_profile_adapter_not_ready": "business_adapter_not_ready",
     "issue_field_missing_remote_data_reference": "input_remote_data_required",
     "issue_field_invalid_remote_data_reference": "input_remote_data_invalid",
     "issue_field_invalid_frame_reference": "input_frame_required",
@@ -537,7 +554,11 @@ def _terminal_content(
     thread: bool,
     diagnostic_result: str = "",
 ) -> str:
-    heading = "【G1Q3 RCA 任务话题终态】" if thread else "【G1Q3 RCA 机器人终态】"
+    platform_route_terminal = str(error_code or "").startswith("business_profile_")
+    if platform_route_terminal:
+        heading = "【RCA 任务话题终态】" if thread else "【RCA 机器人终态】"
+    else:
+        heading = "【G1Q3 RCA 任务话题终态】" if thread else "【G1Q3 RCA 机器人终态】"
     if diagnostic_result:
         lines = [
             marker,
@@ -970,6 +991,84 @@ def _truncate_utf8(value: str, limit: int) -> str:
     suffix = "..."
     body = encoded[: max(0, limit - len(suffix))].decode("utf-8", errors="ignore")
     return body.rstrip() + suffix
+
+
+def _consumer_capability_summary(contract: Mapping[str, Any]) -> str:
+    capability = contract.get("consumer_capability")
+    if capability is None:
+        summary = contract.get("summary")
+        capability = (
+            summary.get("consumer_capability")
+            if isinstance(summary, Mapping)
+            else None
+        )
+    if not capability:
+        return ""
+    if not isinstance(capability, Mapping):
+        raise DeliveryContractError("consumer_capability_invalid")
+    if capability.get("schema_version") != CONSUMER_CAPABILITY_SCHEMA_VERSION:
+        raise DeliveryContractError("consumer_capability_schema_unsupported")
+    profile = _required_text(
+        capability.get("capability_profile"), "consumer_capability.capability_profile"
+    )
+    version = _required_text(
+        capability.get("capability_version"), "consumer_capability.capability_version"
+    )
+    evaluator_scope = _required_text(
+        capability.get("evaluator_scope"), "consumer_capability.evaluator_scope"
+    )
+    applicability = str(capability.get("applicability") or "").strip()
+    if applicability not in {"applied", "not_applied"}:
+        raise DeliveryContractError("consumer_capability_applicability_invalid")
+    signals = capability.get("actual_signals")
+    fields = capability.get("actual_fields")
+    evaluators = capability.get("actual_evaluators")
+    unused = capability.get("unused_capabilities")
+    if not all(isinstance(value, list) for value in (signals, fields, evaluators, unused)):
+        raise DeliveryContractError("consumer_capability_inventory_invalid")
+    for item in evaluators:
+        if (
+            not isinstance(item, Mapping)
+            or not str(item.get("evaluator_id") or "").strip()
+            or not str(item.get("status") or "").strip()
+        ):
+            raise DeliveryContractError("consumer_capability_evaluator_invalid")
+    for item in unused:
+        if (
+            not isinstance(item, Mapping)
+            or not str(item.get("evaluator_id") or "").strip()
+            or not str(item.get("status") or "").strip()
+            or not str(item.get("reason") or "").strip()
+        ):
+            raise DeliveryContractError("consumer_capability_unused_reason_missing")
+    actual_count = len(signals) + len(fields) + len(evaluators)
+    if applicability == "applied" and actual_count < 1:
+        raise DeliveryContractError("consumer_capability_false_applied")
+    reason = str(capability.get("not_applied_reason") or "").strip()
+    if applicability == "not_applied" and not reason:
+        raise DeliveryContractError("consumer_capability_reason_missing")
+    evidence = capability.get("evidence")
+    if not isinstance(evidence, Mapping):
+        raise DeliveryContractError("consumer_capability_evidence_invalid")
+    field_lineage = evidence.get("field_lineage")
+    if not isinstance(field_lineage, Mapping):
+        raise DeliveryContractError("consumer_capability_field_lineage_invalid")
+    viz = evidence.get("viz_lineage")
+    if not isinstance(viz, Mapping):
+        raise DeliveryContractError("consumer_capability_viz_lineage_invalid")
+    frame = evidence.get("issue_frame_id")
+    frame_text = str(frame) if frame not in {None, ""} else "未指定"
+    if applicability == "not_applied":
+        return (
+            f"能力出版：{profile}@{version}（{evaluator_scope}）未调用；"
+            f"原因：{reason}；证据帧：{frame_text}；viz：{str(viz.get('status') or '未生成')}"
+        )
+    return (
+        f"能力出版：{profile}@{version}（{evaluator_scope}）；"
+        f"实际 signals/fields/evaluators={len(signals)}/{len(fields)}/{len(evaluators)}；"
+        f"未调用={len(unused)}；证据帧：{frame_text}；"
+        f"viz：{str(viz.get('status') or '未生成')}"
+    )
 
 
 def _positive_int(value: Any, field: str) -> int:
@@ -1839,10 +1938,13 @@ def verify_delivery_bundle(
         },
     )
     summary = contract.get("summary") if isinstance(contract.get("summary"), Mapping) else {}
-    conclusion = _truncate_utf8(
-        str(summary.get("short_conclusion") or summary.get("l0") or "").strip(),
-        MAX_CONCLUSION_BYTES,
-    )
+    conclusion_text = str(
+        summary.get("short_conclusion") or summary.get("l0") or ""
+    ).strip()
+    capability_summary = _consumer_capability_summary(contract)
+    if capability_summary:
+        conclusion_text = f"{conclusion_text}\n{capability_summary}".strip()
+    conclusion = _truncate_utf8(conclusion_text, MAX_CONCLUSION_BYTES)
     if not conclusion:
         raise DeliveryContractError(
             "delivery_conclusion_missing",

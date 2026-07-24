@@ -2130,7 +2130,6 @@ def _g1q3_manual_intake_enabled() -> bool:
 
 
 def _g1q3_manual_chat_allowlist() -> tuple[frozenset[str], bool, str]:
-    maximum = frozenset({G1Q3_RCA_GROUP_ID, PNC_ALL_BUSINESS_TEST_GROUP_ID})
     requested = frozenset(
         item.strip()
         for item in str(os.getenv("HERMES_RCA_MANUAL_CHAT_IDS", "") or "").split(",")
@@ -2141,7 +2140,10 @@ def _g1q3_manual_chat_allowlist() -> tuple[frozenset[str], bool, str]:
             sorted(requested), ensure_ascii=True, separators=(",", ":")
         ).encode("utf-8")
     ).hexdigest()
-    valid = bool(requested) and requested.issubset(maximum)
+    valid = bool(requested) and len(requested) <= 64 and all(
+        re.fullmatch(r"oc_[A-Za-z0-9_-]{8,255}", item)
+        for item in requested
+    )
     return (requested if valid else frozenset(), valid, digest)
 
 
@@ -2326,8 +2328,10 @@ def _admit_g1q3_manual_trigger(
     allowed_chats = frozenset(
         str(item or "").strip() for item in allowed_chat_ids if str(item or "").strip()
     )
-    maximum = frozenset({G1Q3_RCA_GROUP_ID, PNC_ALL_BUSINESS_TEST_GROUP_ID})
-    if not allowed_chats or not allowed_chats.issubset(maximum):
+    if not allowed_chats or len(allowed_chats) > 64 or not all(
+        re.fullmatch(r"oc_[A-Za-z0-9_-]{8,255}", item)
+        for item in allowed_chats
+    ):
         raise ManualRcaAdmissionError("manual_chat_allowlist_invalid")
     try:
         resolved_admission_config = (

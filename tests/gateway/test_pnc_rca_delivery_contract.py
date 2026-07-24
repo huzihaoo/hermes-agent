@@ -260,6 +260,107 @@ def _bundle(
     return admission, contract, manifest, observed, dependencies
 
 
+def _consumer_capability(*, applicability="applied"):
+    return {
+        "schema_version": "rca_consumer_capability_publication_v1",
+        "capability_profile": "g1q3_863_consumer",
+        "capability_version": "g1q3_863_consumer_v1",
+        "evaluator_scope": "g1q3_rca_evaluator_scope_v4",
+        "applicability": applicability,
+        "not_applied_reason": (
+            ""
+            if applicability == "applied"
+            else "no_decoded_signal_or_evaluator_evidence"
+        ),
+        "actual_signals": ["AEBReq"] if applicability == "applied" else [],
+        "actual_fields": ["OOI_ID"] if applicability == "applied" else [],
+        "actual_evaluators": (
+            [{"evaluator_id": "aeb_trigger", "status": "supported"}]
+            if applicability == "applied"
+            else []
+        ),
+        "unused_capabilities": [
+            {
+                "evaluator_id": "fcw_trigger",
+                "status": "not_applicable",
+                "reason": "not applicable",
+            }
+        ],
+        "evidence": {
+            "issue_frame_id": 123,
+            "field_lineage": {
+                "schema_version": "g1q3_field_lineage_v2",
+                "fidelity_ok": True,
+            },
+            "viz_lineage": {"ok": True, "status": "pass"},
+        },
+    }
+
+
+def test_delivery_projects_consumer_capability_into_field_and_comment():
+    admission, contract, manifest, observed, dependencies = _bundle()
+    contract["consumer_capability"] = _consumer_capability()
+
+    verified = verify_delivery_bundle(
+        admission=admission,
+        delivery_contract=contract,
+        delivery_manifest=manifest,
+        observed_files=observed,
+        html_dependencies=dependencies,
+    )
+
+    assert "g1q3_863_consumer@g1q3_863_consumer_v1" in verified.conclusion
+    assert "signals/fields/evaluators=1/1/1" in verified.conclusion
+    assert "证据帧：123" in verified.conclusion
+    assert "viz：pass" in verified.effect_payload["comment_content"]
+    assert (
+        verified.effect_payload["field_updates"][0]["field_value"]
+        == verified.conclusion
+    )
+
+
+def test_delivery_rejects_false_applied_consumer_capability():
+    admission, contract, manifest, observed, dependencies = _bundle()
+    capability = _consumer_capability()
+    capability["actual_signals"] = []
+    capability["actual_fields"] = []
+    capability["actual_evaluators"] = []
+    contract["consumer_capability"] = capability
+
+    with pytest.raises(DeliveryContractError) as raised:
+        verify_delivery_bundle(
+            admission=admission,
+            delivery_contract=contract,
+            delivery_manifest=manifest,
+            observed_files=observed,
+            html_dependencies=dependencies,
+        )
+
+    assert raised.value.code == "consumer_capability_false_applied"
+
+
+def test_mdrive4_readiness_terminal_is_explicit_and_business_neutral():
+    admission = _admission()
+    terminal = build_terminal_delivery(
+        business_key=admission.business_key,
+        submission_key=admission.submission_key,
+        generation=admission.generation,
+        project_key=admission.source_refs.project_key,
+        work_item_type_key=admission.source_refs.work_item_type_key,
+        work_item_id="7044346306",
+        outcome="quarantined",
+        terminal_state="submission_quarantined",
+        error_code="business_profile_adapter_not_ready",
+        source_error_code="business_profile_adapter_not_ready",
+    )
+
+    assert terminal.diagnostic_code == "business_adapter_not_ready"
+    assert "已按官方字段路由" in terminal.diagnostic_result
+    assert "未跨项目回退" in terminal.diagnostic_result
+    assert "【RCA 机器人终态】" in terminal.effect_payload["comment_content"]
+    assert "G1Q3 RCA 机器人终态" not in terminal.effect_payload["comment_content"]
+
+
 def _reseal(contract, manifest):
     manifest["artifact_set_id"] = compute_artifact_set_id(manifest)
     manifest["report_url"] = build_report_url(

@@ -1,4 +1,4 @@
-"""Host-side Feishu issue context helpers for PNC/G1Q3 RCA intake.
+"""Host-side Feishu issue context helpers for the shared PNC RCA intake.
 
 This module keeps Feishu Project field/comment reads out of gateway.run so the
 G1Q3 RCA intake path has a fixed, testable host-side scaffold.  It is
@@ -23,6 +23,7 @@ from gateway.pnc_rca_frame_reference import (
     FrameReferenceError,
     parse_frame_reference,
 )
+from gateway.pnc_rca_business_profiles import resolve_business_profile
 
 GatewayToolCaller = Callable[[str, dict[str, Any]], Any]
 IssueReadStatus = Literal["not_requested", "read_failed", "read_empty", "fields_extracted"]
@@ -47,6 +48,10 @@ class G1Q3IssueReadResult:
     @property
     def source_quality(self) -> str:
         return "partial" if self.context_text else "unavailable"
+
+
+# Compatibility name for scripts imported before the multi-business release.
+RcaIssueReadResult = G1Q3IssueReadResult
 
 
 
@@ -172,7 +177,9 @@ def resolve_feishu_issue_project_key(
     project_key = extract_feishu_issue_project_key(text or "", work_item_id=work_item_id)
     if project_key:
         return project_key
-    if str(source_group_id or "").strip() in {G1Q3_RCA_GROUP_ID, PNC_ALL_BUSINESS_TEST_GROUP_ID} and str(work_item_id or "").strip():
+    # Legacy compatibility only. The all-business test group and every new
+    # business group must provide project identity through the issue URL/event.
+    if str(source_group_id or "").strip() == G1Q3_RCA_GROUP_ID and str(work_item_id or "").strip():
         return G1Q3_RCA_FEISHU_PROJECT_KEY
     return ""
 
@@ -567,9 +574,13 @@ def fetch_g1q3_issue_context_result_via_meegle(
     except Exception as exc:
         errors.append({"tool": "meegle comment list", "error_class": type(exc).__name__, "message": str(exc)[:200]})
 
-    context_text = compact_g1q3_issue_context(
-        work_item_brief=_normalize_meegle_workitem_payload(workitem_payload, work_item_id=issue_id),
+    work_item_brief = _normalize_meegle_workitem_payload(
+        workitem_payload, work_item_id=issue_id
+    )
+    context_text = compact_rca_issue_context(
+        work_item_brief=work_item_brief,
         comments=_normalize_meegle_comments_payload(comments_payload),
+        project_key=project,
     )
     if context_text:
         _capture_g1q3_issue_context(project_key=project, work_item_id=issue_id, read_source="meegle", context_text=context_text, read_status="fields_extracted", errors=errors or None)
@@ -635,8 +646,13 @@ def compact_value(value: Any) -> str:
     return str(value).strip()
 
 
-def compact_g1q3_issue_context(*, work_item_brief: dict[str, Any], comments: list[dict[str, Any]]) -> str:
-    """Build a compact, recipient-safe issue context block for VM intake."""
+def compact_rca_issue_context(
+    *,
+    work_item_brief: dict[str, Any],
+    comments: list[dict[str, Any]],
+    project_key: str = "",
+) -> str:
+    """Build compact issue context plus a field-driven business contract."""
     attrs, by_key, by_name = _field_maps(work_item_brief)
 
     title = sanitize_issue_evidence_text(attrs.get("work_item_name") or "")
@@ -673,12 +689,40 @@ def compact_g1q3_issue_context(*, work_item_brief: dict[str, Any], comments: lis
     status_name = sanitize_issue_evidence_text((attrs.get("work_item_status") or {}).get("name"))
     description = sanitize_issue_evidence_text(by_name.get("描述"))[:1200]
 
+    work_item_type = attrs.get("work_item_type")
+    work_item_type_key = (
+        str(work_item_type.get("key") or "").strip()
+        if isinstance(work_item_type, dict)
+        else ""
+    ) or "issue"
+    profile_resolution = resolve_business_profile(
+        project_key=project_key,
+        work_item_type_key=work_item_type_key,
+        work_item_brief=work_item_brief,
+    )
+
     lines = ["## Feishu issue 已解析字段（主控侧读取）"]
     if title:
         lines.append(f"- title: {title}")
     work_item_id = str(attrs.get("work_item_id") or "").strip()
     if work_item_id:
         lines.append(f"- work_item_id: {work_item_id}")
+    if project_key:
+        lines.append(f"- project_key: {project_key}")
+    lines.append(f"- work_item_type: {work_item_type_key}")
+    lines.append(
+        "- business_profile_contract: "
+        + json.dumps(
+            profile_resolution.to_dict(), ensure_ascii=False, sort_keys=True
+        )
+    )
+    lines.append(
+        f"- business_profile_resolution: {profile_resolution.status}"
+    )
+    if profile_resolution.profile is not None:
+        lines.append(
+            f"- business_profile_id: {profile_resolution.profile.profile_id}"
+        )
     if project_name:
         lines.append(f"- 所属项目: {project_name}")
     if status_name:
@@ -748,6 +792,16 @@ def compact_g1q3_issue_context(*, work_item_brief: dict[str, Any], comments: lis
     if not has_substantive_field and not compact_comments:
         return ""
     return "\n".join(line for line in lines if line).strip()
+
+
+def compact_g1q3_issue_context(
+    *, work_item_brief: dict[str, Any], comments: list[dict[str, Any]]
+) -> str:
+    """Compatibility wrapper for the former G1Q3-only helper."""
+    return compact_rca_issue_context(
+        work_item_brief=work_item_brief,
+        comments=comments,
+    )
 
 
 def fetch_g1q3_issue_context_result_via_mcp(
@@ -862,9 +916,10 @@ def fetch_g1q3_issue_context_result_via_mcp(
         })
 
     comments = comments_payload.get("comments") if isinstance(comments_payload, dict) else comments_payload
-    context_text = compact_g1q3_issue_context(
+    context_text = compact_rca_issue_context(
         work_item_brief=brief_payload if isinstance(brief_payload, dict) else {},
         comments=comments if isinstance(comments, list) else [],
+        project_key=project_key,
     )
     if context_text:
         _capture_g1q3_issue_context(project_key=project_key, work_item_id=issue_id, read_source="mcp", context_text=context_text, read_status="fields_extracted", errors=errors or None)
@@ -1046,3 +1101,9 @@ def fetch_g1q3_issue_context(
         use_meegle_fallback=use_meegle_fallback,
         meegle_runner=meegle_runner,
     ).context_text
+
+
+# Business-neutral entry points. The former names remain import-compatible for
+# old scripts and immutable receipts.
+fetch_rca_issue_context_result = fetch_g1q3_issue_context_result
+fetch_rca_issue_context = fetch_g1q3_issue_context

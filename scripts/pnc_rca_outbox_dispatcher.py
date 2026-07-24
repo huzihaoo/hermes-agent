@@ -104,8 +104,8 @@ OUTBOX_PAYLOAD_SCHEMA_VERSION = "pnc_rca_submission_outbox_v2"
 SUPPORTED_OUTBOX_PAYLOAD_SCHEMA_VERSIONS = frozenset(
     {"pnc_rca_submission_outbox_v1", OUTBOX_PAYLOAD_SCHEMA_VERSION}
 )
-SERVICE_CAPABILITY = "submit_g1q3_rca_issue_intake"
-SERVICE_OPERATION = "g1q3_rca_issue_intake"
+SERVICE_CAPABILITY = "submit_rca_issue_intake"
+SERVICE_OPERATION = "rca_issue_intake"
 DEFAULT_SERVICE_ID = "root_cause_analysis_agent"
 STORAGE_ADMISSION_SCHEMA_VERSION = "g1q3_rca_storage_admission_v2"
 DERIVED_CAPACITY_SUMMARY_SCHEMA_VERSION = "pnc_rca_derived_capacity_admission_v2"
@@ -115,7 +115,7 @@ REMOTE_DATA_ACCESS_MODE = "remote_read"
 DEFAULT_SSH_MINI_AGENT = str(Path.home() / ".local" / "bin" / "ssh-mini-agent")
 REMOTE_STORAGE_ADMISSION_MODULE = (
     "/home/mini/.hermes/rca-prod-runtime/releases/"
-    "rca-e2e-hotfix-20260723-remote-viz/api/g1q3_rca/storage_admission.py"
+    "rca-platform-20260724/api/g1q3_rca/storage_admission.py"
 )
 VM_ARTIFACT_PREFIX = "/mnt/tmp/"
 CIFS_ARTIFACT_PREFIX = (
@@ -729,9 +729,9 @@ def default_enrich_event(event: Mapping[str, Any]) -> RcaIssueContext:
             "normalized event is missing project/work-item identity",
         )
 
-    from gateway.pnc_issue_context import fetch_g1q3_issue_context_result
+    from gateway.pnc_issue_context import fetch_rca_issue_context_result
 
-    result = fetch_g1q3_issue_context_result(
+    result = fetch_rca_issue_context_result(
         project_key=project_key,
         work_item_id=work_item_id,
     )
@@ -782,10 +782,11 @@ def default_enrich_event(event: Mapping[str, Any]) -> RcaIssueContext:
     )
     context, blocker = validate_issue_context_fields(context)
     if blocker:
-        raise EnrichmentNotReady(
-            str(blocker.get("kind") or "issue_fields_not_ready"),
-            str(blocker.get("message") or "issue fields are not ready"),
-        )
+        code = str(blocker.get("kind") or "issue_fields_not_ready")
+        detail = str(blocker.get("message") or "issue fields are not ready")
+        if blocker.get("retryable") is False:
+            raise PermanentDispatchError(code, detail)
+        raise EnrichmentNotReady(code, detail)
     return context
 
 

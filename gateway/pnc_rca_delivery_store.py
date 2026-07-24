@@ -60,6 +60,14 @@ DELIVERY_OUTCOME_CONSECUTIVE_WINDOW_SECONDS = 3600
 DELIVERY_OUTCOME_CONSECUTIVE_FAILURE_THRESHOLD = 3
 OUTBOX_QUARANTINED_TERMINAL_STATE = "submission_quarantined"
 OUTBOX_QUARANTINED_PUBLIC_ERROR_CODE = "outbox_submission_quarantined"
+OUTBOX_PUBLIC_PROFILE_ERROR_CODES = frozenset(
+    {
+        "business_profile_unresolved",
+        "business_profile_unsupported",
+        "business_profile_conflict",
+        "business_profile_adapter_not_ready",
+    }
+)
 DELIVERY_WATCH_SLA_SECONDS = 86_400
 PERMANENT_FAILURE_CIRCUIT_THRESHOLD = 2
 _PERMANENT_FAILURE_STREAK_META_KEY = "permanent_failure_streak"
@@ -1381,6 +1389,12 @@ class RcaDeliveryStore:
         row: sqlite3.Row,
         current: str,
     ) -> None:
+        source_error_code = str(row["last_error_code"] or "").strip()
+        public_error_code = (
+            source_error_code
+            if source_error_code in OUTBOX_PUBLIC_PROFILE_ERROR_CODES
+            else OUTBOX_QUARANTINED_PUBLIC_ERROR_CODE
+        )
         delivery = build_terminal_delivery(
             business_key=str(row["business_key"]),
             submission_key=str(row["submission_key"]),
@@ -1390,14 +1404,14 @@ class RcaDeliveryStore:
             work_item_id=str(row["work_item_id"]),
             outcome="quarantined",
             terminal_state=OUTBOX_QUARANTINED_TERMINAL_STATE,
-            error_code=OUTBOX_QUARANTINED_PUBLIC_ERROR_CODE,
-            source_error_code=str(row["last_error_code"] or ""),
+            error_code=public_error_code,
+            source_error_code=source_error_code,
         )
         terminal_at = str(row["quarantined_at"] or current)
         status = {
             "success": False,
             "state": OUTBOX_QUARANTINED_TERMINAL_STATE,
-            "error_code": OUTBOX_QUARANTINED_PUBLIC_ERROR_CODE,
+            "error_code": public_error_code,
         }
         inserted = conn.execute(
             """

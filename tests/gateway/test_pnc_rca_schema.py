@@ -260,6 +260,35 @@ def test_validate_issue_context_fields_distinguishes_missing_and_invalid_pdcl():
     assert is_valid_pdcl_download_cmd("mdi download clip -u abc -s ./") is True
 
 
+def test_business_profile_is_parsed_bound_and_fail_closed_before_data_resolution():
+    profile = {
+        "status": "matched",
+        "profile_id": "mdrive4",
+        "execution_readiness": "input_adapter_pending",
+        "resource_class": "rca_prod",
+        "artifact_kind": "mdrive4_ct_evaluation",
+        "artifact_namespace": "rca/mdrive4",
+        "routing_field_key": "field_052f23",
+    }
+    ctx = issue_context_from_compact_text(
+        project_key="t03o4q",
+        work_item_id="7044346306",
+        compact_text=(
+            "- business_profile_contract: "
+            + json.dumps(profile, ensure_ascii=False, sort_keys=True)
+            + "\n- title: recorder packet issue"
+        ),
+        source_quality="partial",
+    )
+
+    _, blocker = validate_issue_context_fields(ctx)
+
+    assert ctx.business_profile == profile
+    assert blocker["kind"] == "business_profile_adapter_not_ready"
+    assert blocker["retryable"] is False
+    assert "不会回退" in blocker["message"]
+
+
 def test_validate_issue_context_fields_rejects_invalid_frame_reference():
     context, blocker = validate_issue_context_fields(
         RcaIssueContext(

@@ -161,8 +161,10 @@ def _check_vm_task_permission(
     return None
 
 
-_RCA_SERVICE_CAPABILITY = "submit_g1q3_rca_issue_intake"
-_RCA_SERVICE_OPERATION = "g1q3_rca_issue_intake"
+_RCA_SERVICE_CAPABILITY = "submit_rca_issue_intake"
+_RCA_SERVICE_OPERATION = "rca_issue_intake"
+_RCA_LEGACY_SERVICE_CAPABILITY = "submit_g1q3_rca_issue_intake"
+_RCA_LEGACY_SERVICE_OPERATION = "g1q3_rca_issue_intake"
 _RCA_RESERVATION_MAX_OBSERVED_AGE_SECONDS = 120
 _RCA_RESERVATION_MIN_REMAINING_LEASE_SECONDS = 150
 _RCA_MAX_EXPECTED_ARTIFACT_CACHE_BYTES = 1_000_000_000_000
@@ -176,7 +178,7 @@ _RCA_SHARED_STATE_GOAL_PREFIX = (
 )
 _RCA_VM_REPO_ROOT = (
     "/home/mini/.hermes/rca-prod-runtime/releases/"
-    "rca-e2e-hotfix-20260723-remote-viz"
+    "rca-platform-20260724"
 )
 _RCA_FIXED_CLI_RELATIVE_PATH = "./api/g1q3_rca/scripts/run_rca_service_request.py"
 _RCA_VM_TASK_ROOT = "/home/mini/.hermes/shared-state/tasks"
@@ -495,6 +497,8 @@ def canonical_rca_contract_sha256(
         "source_refs": stable_source_refs,
         "intake_dispatcher": toolchain.get("intake_dispatcher"),
     }
+    if isinstance(toolchain.get("business_profile"), dict):
+        stable_request["business_profile"] = toolchain["business_profile"]
     canonical = json.dumps(
         {"admission": admission, "execution_request": stable_request},
         ensure_ascii=True,
@@ -579,7 +583,10 @@ def _vm_task_service_denied_payload(error_code: str, error: str) -> dict[str, An
 def _check_vm_task_service_permission(
     service_id: str, capability: str
 ) -> dict[str, Any] | None:
-    if capability != _RCA_SERVICE_CAPABILITY:
+    if capability not in {
+        _RCA_SERVICE_CAPABILITY,
+        _RCA_LEGACY_SERVICE_CAPABILITY,
+    }:
         return _vm_task_service_denied_payload(
             "vm_task_service_capability_denied",
             "service capability is not authorized for G1Q3 RCA issue intake",
@@ -1357,7 +1364,10 @@ def vm_task_submit_service(
             "vm_task_service_request_invalid",
             "reconcile_only must be boolean",
         )
-    if normalized_operation != _RCA_SERVICE_OPERATION:
+    if normalized_operation not in {
+        _RCA_SERVICE_OPERATION,
+        _RCA_LEGACY_SERVICE_OPERATION,
+    }:
         return _vm_task_service_denied_payload(
             "vm_task_service_operation_denied",
             "service operation is not the fixed G1Q3 RCA issue intake operation",
@@ -1451,6 +1461,26 @@ def vm_task_submit_service(
             "vm_task_service_request_identity_mismatch",
             "execution request work item does not match the validated admission",
         )
+
+    if normalized_capability == _RCA_SERVICE_CAPABILITY:
+        toolchain = (
+            request_payload.get("toolchain")
+            if isinstance(request_payload.get("toolchain"), dict)
+            else {}
+        )
+        profile = toolchain.get("business_profile")
+        work_item_profile = work_item.get("business_profile")
+        if (
+            not isinstance(profile, dict)
+            or profile != work_item_profile
+            or profile.get("status") != "matched"
+            or profile.get("execution_readiness") != "ready"
+            or profile.get("resource_class") != "rca_prod"
+        ):
+            return _vm_task_service_denied_payload(
+                "vm_task_service_request_invalid",
+                "platform RCA submission requires one ready, hash-bound business profile",
+            )
 
     data = (
         request_payload.get("data")
@@ -1638,7 +1668,12 @@ def vm_task_submit_service(
             "retryable": True,
         }
 
-    title = f"G1Q3 RCA issue intake: {refs.work_item_id}"
+    platform_contract = normalized_capability == _RCA_SERVICE_CAPABILITY
+    title = (
+        f"RCA issue intake: {refs.work_item_id}"
+        if platform_contract
+        else f"G1Q3 RCA issue intake: {refs.work_item_id}"
+    )
     contract_sha256 = _rca_contract_sha256(admission_payload, request_payload)
     fixed_execution_meta = {
         "lane": "heavy",
@@ -1654,7 +1689,7 @@ def vm_task_submit_service(
     }
     base_identity_meta = {
         "actor_kind": "service",
-        "business_line": "g1q3_rca",
+        "business_line": "rca" if platform_contract else "g1q3_rca",
         "service_capability": normalized_capability,
         "service_operation": normalized_operation,
         "rca_business_key": validated_admission.business_key,

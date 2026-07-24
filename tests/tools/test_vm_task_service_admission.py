@@ -31,6 +31,8 @@ from tools.registry import registry
 SERVICE_ID = "root_cause_analysis_agent"
 CAPABILITY = "submit_g1q3_rca_issue_intake"
 OPERATION = "g1q3_rca_issue_intake"
+PLATFORM_CAPABILITY = "submit_rca_issue_intake"
+PLATFORM_OPERATION = "rca_issue_intake"
 OBSERVED_AT = "2026-07-11T04:00:00+00:00"
 NOW = datetime(2026, 7, 11, 4, 0, 30, tzinfo=timezone.utc)
 ORIGIN_SOURCE_ID = "g1q3-rca-source-v1-" + "a" * 64
@@ -312,6 +314,8 @@ def _matching_status(
     *,
     state="pending",
     bootstrap_meta=None,
+    capability=CAPABILITY,
+    operation=OPERATION,
 ):
     admission_payload = admission.to_dict()
     request_payload = rca_to_dict(request)
@@ -327,13 +331,17 @@ def _matching_status(
         "success": True,
         "task_id": admission.submission_key,
         "state": state,
-        "title": f"G1Q3 RCA issue intake: {admission.source_refs.work_item_id}",
+        "title": (
+            f"RCA issue intake: {admission.source_refs.work_item_id}"
+            if capability == PLATFORM_CAPABILITY
+            else f"G1Q3 RCA issue intake: {admission.source_refs.work_item_id}"
+        ),
         "owner": SERVICE_ID,
         "meta": {
             "actor_kind": "service",
-            "business_line": "g1q3_rca",
-            "service_capability": CAPABILITY,
-            "service_operation": OPERATION,
+            "business_line": "rca" if capability == PLATFORM_CAPABILITY else "g1q3_rca",
+            "service_capability": capability,
+            "service_operation": operation,
             "rca_business_key": admission.business_key,
             "rca_submission_key": admission.submission_key,
             "rca_generation": admission.generation,
@@ -368,7 +376,7 @@ def _matching_status(
             "coding_agent_fallback_enabled": False,
             "fixed_cli_entrypoint": (
                 "/home/mini/.hermes/rca-prod-runtime/releases/"
-                "rca-e2e-hotfix-20260723-remote-viz/"
+                "rca-platform-20260724/"
                 "api/g1q3_rca/scripts/run_rca_service_request.py"
             ),
             **(bootstrap_meta or {}),
@@ -476,6 +484,76 @@ def test_rca_prod_gate_is_bracketed_by_runtime_checks_before_create(
     assert result["success"] is True
     assert events == ["runtime", "runtime", "admission", "runtime", "create"]
     assert captured["rca_prod_workspace_runtime"] == WORKSPACE_RUNTIME
+
+
+def test_platform_rca_service_requires_and_binds_ready_business_profile(
+    monkeypatch, tmp_path
+):
+    _configure_service_policy(
+        monkeypatch, tmp_path, capability=PLATFORM_CAPABILITY
+    )
+    admission, legacy_request = _contracts()
+    monkeypatch.setattr(
+        vm_task_tool,
+        "_vm_task_submit_trusted",
+        lambda **kwargs: pytest.fail("missing profile must fail before submit"),
+    )
+    missing = _submit_service(
+        service_id=SERVICE_ID,
+        capability=PLATFORM_CAPABILITY,
+        operation=PLATFORM_OPERATION,
+        admission=admission,
+        execution_request=legacy_request,
+    )
+    assert missing["error_code"] == "vm_task_service_request_invalid"
+
+    profile = {
+        "status": "matched",
+        "profile_id": "g1q3",
+        "execution_readiness": "ready",
+        "resource_class": "rca_prod",
+        "artifact_namespace": "rca/g1q3",
+    }
+    request = replace(
+        legacy_request,
+        work_item={**legacy_request.work_item, "business_profile": profile},
+        toolchain={**legacy_request.toolchain, "business_profile": profile},
+    )
+    captured = {}
+    monkeypatch.setattr(
+        vm_task_tool,
+        "vm_task_status",
+        lambda task_id, include_markdown=False: (
+            {"success": False, "state": "missing", "task_id": task_id}
+            if not captured
+            else _matching_status(
+                admission,
+                request,
+                capability=PLATFORM_CAPABILITY,
+                operation=PLATFORM_OPERATION,
+            )
+        ),
+    )
+
+    def create(**kwargs):
+        captured.update(kwargs)
+        return {
+            "success": True,
+            "task": {"task_id": kwargs["task_id"], "status": "created"},
+        }
+
+    monkeypatch.setattr(vm_task_tool, "_vm_task_submit_trusted", create)
+    result = _submit_service(
+        service_id=SERVICE_ID,
+        capability=PLATFORM_CAPABILITY,
+        operation=PLATFORM_OPERATION,
+        admission=admission,
+        execution_request=request,
+    )
+
+    assert result["success"] is True
+    assert captured["routing_meta_extra"]["business_line"] == "rca"
+    assert captured["routing_meta_extra"]["service_capability"] == PLATFORM_CAPABILITY
 
 
 def test_service_capacity_mode_is_required_and_bootstrap_is_explicit(
@@ -885,8 +963,8 @@ def test_service_wrapper_allows_only_validated_rca_intake_with_fixed_envelope(mo
     task_id = admission.submission_key
     assert goal.splitlines()[-2:] == [
         (
-            "- cd /home/mini/.hermes/rca-prod-runtime/releases/"
-            "rca-e2e-hotfix-20260723-remote-viz"
+                "- cd /home/mini/.hermes/rca-prod-runtime/releases/"
+                "rca-platform-20260724"
         ),
         (
             "- ./api/g1q3_rca/scripts/run_rca_service_request.py "
@@ -1168,8 +1246,8 @@ def test_fixed_cli_goal_keeps_caller_text_inside_json_and_commands_are_immutable
     task_id = admission.submission_key
     assert executable_lines == [
         (
-            "- cd /home/mini/.hermes/rca-prod-runtime/releases/"
-            "rca-e2e-hotfix-20260723-remote-viz"
+                "- cd /home/mini/.hermes/rca-prod-runtime/releases/"
+                "rca-platform-20260724"
         ),
         (
             "- ./api/g1q3_rca/scripts/run_rca_service_request.py "

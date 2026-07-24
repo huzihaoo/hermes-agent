@@ -17,7 +17,7 @@ EPOCH_ID = "rca-bootstrap-v0182-test-epoch"
 def test_storage_admission_uses_isolated_production_runtime():
     assert dispatcher.REMOTE_STORAGE_ADMISSION_MODULE == (
         "/home/mini/.hermes/rca-prod-runtime/releases/"
-        "rca-e2e-hotfix-20260723-remote-viz/api/g1q3_rca/storage_admission.py"
+        "rca-platform-20260724/api/g1q3_rca/storage_admission.py"
     )
 
 

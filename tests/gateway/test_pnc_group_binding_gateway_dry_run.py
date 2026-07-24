@@ -29,6 +29,19 @@ from hermes_constants import reset_hermes_home_override, set_hermes_home_overrid
 G1Q3_GROUP_ID = "oc_6cfc782212009ff4cd815349909dd423"
 
 
+def test_rca_manual_chat_allowlist_accepts_explicit_non_g1q3_groups(monkeypatch):
+    groups = {
+        "oc_mdrive4_authorized_group_001",
+        "oc_cross_business_authorized_group_002",
+    }
+    monkeypatch.setenv("HERMES_RCA_MANUAL_CHAT_IDS", ",".join(sorted(groups)))
+
+    allowed, valid, _digest = gateway_run._g1q3_manual_chat_allowlist()
+
+    assert valid is True
+    assert allowed == frozenset(groups)
+
+
 def _gateway_runtime_identity() -> dict:
     return {
         "service_label": "ai.hermes.gateway",
@@ -565,6 +578,8 @@ async def test_manual_requires_real_self_mention_even_when_group_mention_gate_is
 def test_debug_authorization_snapshot_is_allowlist_bound_and_privacy_light(monkeypatch):
     monkeypatch.setenv("HERMES_RCA_MANUAL_INTAKE_ENABLED", "true")
     monkeypatch.setenv("HERMES_RCA_MANUAL_CHAT_IDS", G1Q3_GROUP_ID)
+    monkeypatch.delenv("HERMES_RCA_MANUAL_OPERATOR_ENABLED", raising=False)
+    monkeypatch.delenv("HERMES_RCA_MANUAL_OPERATOR_USER_IDS", raising=False)
     monkeypatch.setenv("HERMES_RCA_MANUAL_DEBUG_ENABLED", "true")
     monkeypatch.setenv(
         "HERMES_RCA_MANUAL_DEBUG_USER_IDS", "ou_second,ou_test_user"
