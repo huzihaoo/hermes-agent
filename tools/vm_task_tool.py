@@ -173,7 +173,7 @@ _RCA_ADMISSION_JSON_END = "<!-- G1Q3_RCA_ADMISSION_JSON:END -->"
 _RCA_EXECUTION_REQUEST_JSON_BEGIN = "<!-- G1Q3_RCA_EXECUTION_REQUEST_JSON:BEGIN -->"
 _RCA_EXECUTION_REQUEST_JSON_END = "<!-- G1Q3_RCA_EXECUTION_REQUEST_JSON:END -->"
 _RCA_SHARED_STATE_GOAL_PREFIX = (
-    "Execute the governed G1Q3 RCA issue intake represented by the validated "
+    "Execute the governed RCA issue intake represented by the validated "
     "contracts below."
 )
 _RCA_VM_REPO_ROOT = (
