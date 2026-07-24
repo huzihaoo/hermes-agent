@@ -1875,8 +1875,11 @@ def _validate_terminal_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         diagnostic_code = ""
     elif schema_version == TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION:
         diagnostic_code = str(claim.contract.get("diagnostic_code") or "")
+        diagnostic_detail = str(claim.contract.get("diagnostic_detail") or "")
     else:
         raise DeliveryContractError("terminal_delivery_schema_unsupported")
+    if schema_version == TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1:
+        diagnostic_detail = ""
     primary = build_terminal_delivery(
         business_key=claim.business_key,
         submission_key=claim.submission_key,
@@ -1888,6 +1891,7 @@ def _validate_terminal_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         terminal_state=claim.terminal_state,
         error_code=claim.terminal_error_code,
         diagnostic_code=diagnostic_code,
+        diagnostic_detail=diagnostic_detail,
         schema_version=schema_version,
     )
     if claim.contract != primary.contract:

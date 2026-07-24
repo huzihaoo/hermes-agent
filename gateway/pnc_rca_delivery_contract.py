@@ -738,6 +738,8 @@ def build_terminal_delivery(
             "report_field_write_policy": "preserve_existing",
             "preserved_report_semantics": "other_generation_not_current",
         }
+        if public_detail:
+            diagnostic_contract["diagnostic_detail"] = public_detail
     else:
         normalized_diagnostic_code = ""
     semantic_sha = compute_terminal_delivery_effect_payload_sha256(

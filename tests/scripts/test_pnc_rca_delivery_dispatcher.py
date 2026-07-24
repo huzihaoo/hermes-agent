@@ -1053,6 +1053,51 @@ def test_historical_terminal_v1_validates_as_comment_only(tmp_path):
     assert "field_9193cb" not in json.dumps(legacy.effect_payload)
 
 
+def test_profile_readiness_terminal_validates_with_explicit_detail(tmp_path):
+    store = _seed_terminal(tmp_path)
+    claim = store.claim_due_effect(
+        lease_owner="profile-readiness-validator",
+        lease_seconds=60,
+        now=NOW,
+    )
+    assert claim is not None
+    detail = (
+        "已按官方字段路由到 mdrive4（数据 resolver=mdrive4_recorder_mcap_reference_v1，"
+        "评测器=ct_evaluator_217_20260722，命名空间=rca/mdrive4），输入适配状态为 "
+        "input_adapter_pending；本次不生成归因结论，不会进入 G1Q3，也不会回退到其他项目评测器"
+    )
+    readiness = build_terminal_delivery(
+        business_key=claim.business_key,
+        submission_key=claim.submission_key,
+        generation=claim.generation,
+        project_key=claim.project_key,
+        work_item_type_key=claim.work_item_type_key,
+        work_item_id=claim.work_item_id,
+        outcome=claim.outcome,
+        terminal_state=claim.terminal_state,
+        error_code="business_profile_adapter_not_ready",
+        diagnostic_code="business_adapter_not_ready",
+        diagnostic_detail=detail,
+    )
+    readiness_claim = replace(
+        claim,
+        effect_key=readiness.effect_key,
+        delivery_id=readiness.delivery_id,
+        target_key=readiness.target_key,
+        payload=readiness.effect_payload,
+        payload_sha256=readiness.semantic_payload_sha256,
+        artifact_set_id=readiness.outcome_key,
+        outcome_key=readiness.outcome_key,
+        terminal_error_code="business_profile_adapter_not_ready",
+        contract=readiness.contract,
+    )
+
+    validated = dispatcher_module._validate_effect(readiness_claim)
+
+    assert "ct_evaluator_217_20260722" in validated.content
+    assert validated.field_updates[0][1] == readiness.diagnostic_result
+
+
 def test_pre_submit_quarantine_keeps_specific_safe_diagnostic_only(tmp_path):
     control, _result = _control(tmp_path, completed=False)
     outbox = control.claim_outbox(lease_owner="submission-worker", now=NOW)

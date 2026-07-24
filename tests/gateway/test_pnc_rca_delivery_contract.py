@@ -365,6 +365,9 @@ def test_mdrive4_readiness_terminal_is_explicit_and_business_neutral():
     assert "ct_evaluator_217_20260722" in terminal.diagnostic_result
     assert "rca/mdrive4" in terminal.diagnostic_result
     assert "不会进入 G1Q3" in terminal.diagnostic_result
+    assert terminal.contract["diagnostic_detail"].startswith(
+        "已按官方字段路由到 mdrive4"
+    )
     assert "【RCA 机器人终态】" in terminal.effect_payload["comment_content"]
     assert "G1Q3 RCA 机器人终态" not in terminal.effect_payload["comment_content"]
 
