@@ -2139,6 +2139,19 @@ def _read_text_if_present(path: Path, *, limit_chars: int = 12000) -> str:
     return text[:limit_chars] + "\n...[truncated]"
 
 
+def _read_status_state(path: Path) -> str:
+    if not path.is_file():
+        return ""
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("- state:") or stripped.startswith("state:"):
+                return stripped.split(":", 1)[1].strip().lower()
+    except OSError:
+        return ""
+    return ""
+
+
 def _read_json_if_present(path: Path) -> dict[str, Any]:
     if not path.is_file():
         return {}
@@ -2187,6 +2200,8 @@ def vm_task_status(task_id: str, include_markdown: bool = True) -> Dict[str, Any
             roots.append(root_path)
 
     checked_roots: list[str] = []
+    host_fallback: Dict[str, Any] | None = None
+    terminal_states = {"completed", "failed", "abandoned", "blocked"}
     for root in roots:
         checked_roots.append(str(root))
         task_dir = root / "tasks" / task_id
@@ -2206,7 +2221,14 @@ def vm_task_status(task_id: str, include_markdown: bool = True) -> Dict[str, Any
         result_path = task_dir / "result.md"
         meta_path = task_dir / "meta.json"
         meta = _read_json_if_present(meta_path)
-        db_row = _read_task_db_row(root, task_id)
+        is_vm_root = root == Path(_DEFAULT_VM_CANONICAL_ROOT)
+        mounted_vm_prefix = str(Path.home() / "Mounts" / "mini_root") + os.sep
+        db_row = (
+            {}
+            if is_vm_root and str(root).startswith(mounted_vm_prefix)
+            else _read_task_db_row(root, task_id)
+        )
+        status_state = _read_status_state(status_path)
         db_meta: dict[str, Any] = {}
         raw_db_meta = db_row.get("meta_json")
         if isinstance(raw_db_meta, str) and raw_db_meta.strip():
@@ -2225,6 +2247,7 @@ def vm_task_status(task_id: str, include_markdown: bool = True) -> Dict[str, Any
             _first_non_empty(
                 dispatch_payload.get("state"),
                 db_row.get("state"),
+                status_state,
                 meta.get("state"),
                 dispatch_queue,
                 "unknown",
@@ -2273,7 +2296,19 @@ def vm_task_status(task_id: str, include_markdown: bool = True) -> Dict[str, Any
         if include_markdown:
             payload["status_md"] = _read_text_if_present(status_path)
             payload["result_md"] = _read_text_if_present(result_path)
+        if state in terminal_states:
+            return payload
+        if not is_vm_root:
+            host_fallback = payload
+            continue
+        if host_fallback is not None:
+            host_fallback["paths"]["checked_roots"] = checked_roots
+            return host_fallback
         return payload
+
+    if host_fallback is not None:
+        host_fallback["paths"]["checked_roots"] = checked_roots
+        return host_fallback
 
     return {
         "success": False,

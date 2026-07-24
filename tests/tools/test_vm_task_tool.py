@@ -209,6 +209,42 @@ def test_vm_task_status_falls_back_to_vm_canonical_root(monkeypatch, tmp_path):
     assert result["paths"]["checked_roots"] == [str(host_root), str(vm_root)]
 
 
+def test_vm_task_status_uses_vm_terminal_truth_over_stale_host_copy(
+    monkeypatch, tmp_path
+):
+    host_root = tmp_path / "host-shared-state"
+    vm_root = tmp_path / "vm-shared-state"
+    task_id = "g1q3-rca-s1-" + "a" * 64
+    host_dir = host_root / "tasks" / task_id
+    vm_dir = vm_root / "tasks" / task_id
+    host_dir.mkdir(parents=True)
+    vm_dir.mkdir(parents=True)
+    (host_dir / "meta.json").write_text(
+        json.dumps({"state": "in_progress", "sync_version": 4}),
+        encoding="utf-8",
+    )
+    (host_dir / "status.md").write_text("- state: in_progress\n", encoding="utf-8")
+    (vm_dir / "meta.json").write_text(
+        json.dumps({
+            "state": "pending",
+            "sync_version": 5,
+            "rca_prod_capacity_sample_eligible": True,
+        }),
+        encoding="utf-8",
+    )
+    (vm_dir / "status.md").write_text("- state: completed\n", encoding="utf-8")
+    (vm_dir / "result.md").write_text("# Result\n- exit_code: 0\n", encoding="utf-8")
+    monkeypatch.setattr(vm_task_tool, "_DEFAULT_HOST_CANONICAL_ROOT", host_root)
+    monkeypatch.setattr(vm_task_tool, "_DEFAULT_VM_CANONICAL_ROOT", vm_root)
+
+    result = vm_task_tool.vm_task_status(task_id)
+
+    assert result["state"] == "completed"
+    assert result["paths"]["root"] == str(vm_root)
+    assert result["paths"]["checked_roots"] == [str(host_root), str(vm_root)]
+    assert result["meta"]["rca_prod_capacity_sample_eligible"] is True
+
+
 def test_vm_task_status_reports_missing_task(monkeypatch, tmp_path):
     host_root = tmp_path / "host-shared-state"
     vm_root = tmp_path / "vm-shared-state"
