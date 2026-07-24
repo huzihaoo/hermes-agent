@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import PurePosixPath
 from types import SimpleNamespace
 
@@ -73,3 +74,27 @@ def test_collector_stats_expose_capacity_counters_without_activation_counter():
     assert public["capacity_frozen"] == 0
     assert public["capacity_last_error"] == ""
     assert public["stale_lease"] == 0
+
+
+def test_capacity_observation_error_does_not_mark_delivery_unhealthy(tmp_path):
+    config = collector.CollectorConfig.from_env(
+        _config_env(tmp_path), hermes_home=tmp_path
+    )
+    reporter = object.__new__(collector.HealthReporter)
+    reporter.config = config
+    reporter.store = SimpleNamespace(health=lambda **_kwargs: {"ok": True})
+    reporter.started_at = collector._utc_iso()
+    reporter.runtime_identity = SimpleNamespace(to_dict=lambda: {})
+    reporter._remote_css_parser_receipt = {"status": "ok"}
+    reporter._remote_css_parser_error = ""
+    reporter._remote_css_parser_observed_at = collector._utc_now()
+
+    stats = collector.CollectorStats(
+        capacity_last_error="rca_capacity_vm_measurement_time_invalid"
+    )
+    reporter.write(state="idle", stats=stats, refresh_dependencies=False)
+
+    payload = json.loads(config.health_path.read_text(encoding="utf-8"))
+    assert payload["healthy"] is True
+    assert payload["capacity_samples"]["observation_healthy"] is False
+    assert payload["capacity_samples"]["blocks_delivery_health"] is False

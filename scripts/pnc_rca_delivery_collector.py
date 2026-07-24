@@ -2195,10 +2195,6 @@ class HealthReporter:
                 state in {"running", "idle", "disabled"}
                 and not error
                 and not dependency_error
-                and not (
-                    self.config.capacity_sample_enabled
-                    and stats.capacity_last_error
-                )
                 and self.dependencies_ready
                 and (
                     not self.config.enabled or store_health.get("ok") is True
@@ -2217,6 +2213,11 @@ class HealthReporter:
             "stats": asdict(stats),
             "capacity_samples": {
                 "enabled": self.config.capacity_sample_enabled,
+                "observation_healthy": (
+                    not self.config.capacity_sample_enabled
+                    or not stats.capacity_last_error
+                ),
+                "blocks_delivery_health": False,
                 "scanned": stats.capacity_scanned,
                 "eligible": stats.capacity_eligible,
                 "appended": stats.capacity_appended,
