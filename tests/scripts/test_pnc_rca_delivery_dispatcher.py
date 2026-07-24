@@ -888,6 +888,42 @@ def test_remote_content_matching_accepts_strict_meegle_rendering_only():
     assert [item["remote_id"] for item in matches] == ["rendered"]
 
 
+def test_remote_content_matching_accepts_meegle_numeric_list_rendering():
+    marker = "[RCA_DELIVERY:effect-key:artifact-key]"
+    expected = (
+        f"{marker}\n候选结论：目标 ID [1, 67]（活动槽位 [5, 9, 14, 16]）"
+    )
+    comments = [
+        {
+            "remote_id": "rendered",
+            "content": (
+                f"{marker[1:-1]}\n\n候选结论："
+                "目标 ID 1, 67（活动槽位 5, 9, 14, 16）\n"
+            ),
+        },
+        {
+            "remote_id": "changed-value",
+            "content": (
+                f"{marker[1:-1]}\n\n候选结论："
+                "目标 ID 1, 68（活动槽位 5, 9, 14, 16）\n"
+            ),
+        },
+        {
+            "remote_id": "changed-text-brackets",
+            "content": (
+                f"{marker[1:-1]}\n\n候选结论："
+                "目标 ID [1, 67]（活动槽位 5, 9, 14, 16）\n"
+            ).replace("候选结论：", "候选结论"),
+        },
+    ]
+
+    matches = dispatcher_module._confirmed_content_matches(
+        comments, marker, expected
+    )
+
+    assert [item["remote_id"] for item in matches] == ["rendered"]
+
+
 def test_field_update_failure_blocks_comment_and_retries(tmp_path):
     store = _seed(tmp_path)
     remote = Remote()

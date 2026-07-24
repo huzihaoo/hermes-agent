@@ -2104,13 +2104,28 @@ def _canonical_remote_content(content: str, marker: str) -> str | None:
     return None
 
 
+_MEEGLE_NUMERIC_LIST_RE = re.compile(
+    r"\[((?:-?\d+(?:\.\d+)?\s*,\s*)+-?\d+(?:\.\d+)?)\]"
+)
+
+
+def _canonical_meegle_numeric_lists(content: str) -> str:
+    """Match Meegle readback after it removes numeric-list brackets."""
+    return _MEEGLE_NUMERIC_LIST_RE.sub(r"\1", content)
+
+
 def _confirmed_content_matches(
     comments: list[dict[str, str]], marker: str, expected_content: str
 ) -> list[dict[str, str]]:
+    canonical_expected = _canonical_meegle_numeric_lists(expected_content)
     return [
         item
         for item in _marker_matches(comments, marker)
-        if _canonical_remote_content(item["content"], marker) == expected_content
+        if (
+            (remote := _canonical_remote_content(item["content"], marker))
+            is not None
+            and _canonical_meegle_numeric_lists(remote) == canonical_expected
+        )
     ]
 
 
