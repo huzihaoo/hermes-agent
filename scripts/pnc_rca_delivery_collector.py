@@ -706,6 +706,55 @@ def _remote_bundle_script(submission_key: str) -> str:
                 raise RuntimeError(missing_code.replace('_missing', '') + '_json_invalid')
             return value
 
+        def public_report_projection(report_data):
+            # Extract only decision-bearing RCA fields for Feishu projection.
+            summary = report_data.get('summary') if isinstance(report_data.get('summary'), dict) else {{}}
+            receipt = report_data.get('rca_receipt') if isinstance(report_data.get('rca_receipt'), dict) else {{}}
+            responsibility = report_data.get('responsibility') if isinstance(report_data.get('responsibility'), dict) else {{}}
+            if not responsibility and isinstance(receipt.get('responsibility'), dict):
+                responsibility = receipt.get('responsibility')
+            attribution = receipt.get('attribution_expression') if isinstance(receipt.get('attribution_expression'), dict) else {{}}
+            slots = attribution.get('slots') if isinstance(attribution.get('slots'), dict) else {{}}
+            candidate = (
+                responsibility.get('candidate')
+                or responsibility.get('owner')
+                or report_data.get('candidate_responsibility')
+                or report_data.get('responsibility_candidate')
+                or slots.get('responsibility_candidate')
+            )
+            causal = report_data.get('causal_chain') if isinstance(report_data.get('causal_chain'), dict) else {{}}
+            if not causal and isinstance(receipt.get('causal_chain'), dict):
+                causal = receipt.get('causal_chain')
+            narrative = causal.get('narrative') if isinstance(causal.get('narrative'), list) else []
+            narrative = [
+                {{'role': str(item.get('role') or ''), 'text': str(item.get('text') or '')[:1400]}}
+                for item in narrative[:8] if isinstance(item, dict) and (item.get('role') or item.get('text'))
+            ]
+            hypotheses = causal.get('hypotheses') if isinstance(causal.get('hypotheses'), list) else []
+            hypotheses = [
+                {{k: item.get(k) for k in ('narrative', 'text', 'summary') if item.get(k)}}
+                for item in hypotheses[:8] if isinstance(item, dict)
+            ]
+            evidence = report_data.get('evidence_summary') if isinstance(report_data.get('evidence_summary'), dict) else {{}}
+            refs = evidence.get('refs') if isinstance(evidence.get('refs'), list) else []
+            compact_refs = []
+            for item in refs[:8]:
+                if isinstance(item, dict):
+                    compact_refs.append({{k: item.get(k) for k in ('summary', 'field', 'check', 'fit_source') if item.get(k)}})
+                elif item:
+                    compact_refs.append(str(item)[:400])
+            terminal = report_data.get('terminal_diagnostic') if isinstance(report_data.get('terminal_diagnostic'), dict) else {{}}
+            return {{
+                'summary': {{k: summary.get(k) for k in ('short_conclusion', 'l0', 'status', 'rca_pattern', 'rca_domain', 'high_confidence_boundary') if summary.get(k)}},
+                'responsibility': {{k: responsibility.get(k) for k in ('candidate', 'owner', 'status', 'boundary', 'missing_evidence') if responsibility.get(k)}},
+                'causal_chain': {{'narrative': narrative, 'hypotheses': hypotheses}},
+                'evidence_summary': {{'refs': compact_refs, 'missing_evidence': [str(x)[:400] for x in (evidence.get('missing_evidence') or [])[:20]]}},
+                'evidence_boundary': [str(x)[:500] for x in (report_data.get('evidence_boundary') or [])[:8]],
+                'user_action': report_data.get('user_action') if isinstance(report_data.get('user_action'), dict) else {{}},
+                'terminal_diagnostic': {{k: terminal.get(k) for k in ('blocker_kind', 'attribution_status', 'stage') if terminal.get(k)}},
+                'candidate': str(candidate or '')[:500],
+            }}
+
         def read_text_artifact(path, expected):
             fd, info = open_regular(path, 'html_dependency_missing', MAX_TEXT_FILE_BYTES)
             with os.fdopen(fd, 'rb') as handle:
@@ -1052,6 +1101,13 @@ def _remote_bundle_script(submission_key: str) -> str:
             root_norm = posixpath.normpath(ROOT)
             contract = read_json(ROOT + 'delivery_contract.json', 'delivery_contract_missing')
             manifest = read_json(ROOT + 'delivery_manifest.json', 'delivery_manifest_missing')
+            try:
+                report_data = read_json(ROOT + 'report_data.json', 'report_data_missing')
+            except RuntimeError:
+                report_data = {{}}
+            if report_data:
+                contract = dict(contract)
+                contract['public_result'] = public_report_projection(report_data)
             contract_artifacts = contract.get('artifacts')
             if not isinstance(contract_artifacts, dict):
                 raise RuntimeError('viz_publication_missing')

@@ -447,18 +447,15 @@ def build_issue_comment_content(
 ) -> str:
     lines = [
         marker,
-        "【G1Q3 RCA 机器人报告】RCA 报告已生成，需人工复核后结案。",
+        "【RCA 结果】自动分析已完成，待人工审批。",
         f"问题：{work_item_id}",
-        f"报告状态：{report_status}",
     ]
     if conclusion:
-        lines.append(f"候选结论：{conclusion}")
+        lines.append(conclusion)
     lines.extend(
         [
-            f"HTML 归因报告：{report_url}",
-            f"Foxglove 可视化：{foxglove_url}",
-            f"可视化文件（CIFS）：{report_cifs_path}",
-            "说明：以上为自动 RCA 候选结论，需人工复核确认后再结案。",
+            f"详细证据报告：{report_url}",
+            "请人工审批归因结论；报告页用于查看证据和完整过程。",
         ]
     )
     content = "\n".join(lines)
@@ -479,18 +476,16 @@ def build_thread_reply_content(
 ) -> str:
     lines = [
         marker,
-        "【G1Q3 RCA 任务话题交付】RCA 报告已生成，需人工复核后结案。",
+        "【RCA 结果】自动分析已完成，待人工审批。",
         f"问题：{work_item_id}",
-        f"报告状态：{report_status}",
     ]
     if conclusion:
-        lines.append(f"候选结论：{conclusion}")
+        lines.append(conclusion)
     lines.extend(
         [
-            f"HTML 归因报告：{report_url}",
-            f"Foxglove 可视化：{foxglove_url}",
+            f"详细证据报告：{report_url}",
             f"问题单：{issue_url}",
-            "说明：以上为自动 RCA 候选结论，需人工复核确认后再结案。",
+            "请人工审批归因结论；报告页用于查看证据和完整过程。",
         ]
     )
     content = "\n".join(lines)
@@ -566,38 +561,17 @@ def _terminal_content(
     thread: bool,
     diagnostic_result: str = "",
 ) -> str:
-    platform_route_terminal = str(error_code or "").startswith("business_profile_")
-    if platform_route_terminal:
-        heading = "【RCA 任务话题终态】" if thread else "【RCA 机器人终态】"
-    else:
-        heading = "【G1Q3 RCA 任务话题终态】" if thread else "【G1Q3 RCA 机器人终态】"
-    if diagnostic_result:
-        lines = [
-            marker,
-            f"{heading}诊断报告",
-            f"诊断结论：{diagnostic_result}",
-            f"任务：{submission_key}",
-            f"代次：{generation}",
-            f"终态：{terminal_state}",
-            f"结果：{outcome}",
-            f"错误码：{error_code}",
-            "本代归因报告：未生成（不存在已验证的 Foxglove 发布产物）。",
-            (
-                "报告字段：本终态不改写；若问题单现有值非空，可能属于其他代次，"
-                f"不代表第 {generation} 代结论。"
-            ),
-            "说明：本终态诊断不包含自动归因结论；修复输入或系统故障后需显式重试。",
-        ]
+    if diagnostic_result and "\n" in diagnostic_result:
+        lines = [marker, "【RCA 结果】"] + diagnostic_result.splitlines()
     else:
         lines = [
             marker,
-            f"{heading}本次自动分析未生成可交付报告。",
-            f"任务：{submission_key}",
-            f"代次：{generation}",
-            f"终态：{terminal_state}",
-            f"结果：{outcome}",
-            f"错误码：{error_code}",
-            "说明：未生成或发布 HTML 报告；请根据错误码排查后显式重试。",
+            "【RCA 结果】本次未形成可确认的自动归因。",
+            "责任候选：暂无法判断。",
+            "因果链：暂无足够证据建立可确认的因果链。",
+            f"当前卡点：{diagnostic_result or '自动分析未生成可交付证据。'}",
+            "关键证据：本次未生成可供审批的归因证据。",
+            "下一步：请补齐问题数据或修复输入后重新发起 RCA；人工可先行分流。",
         ]
     content = "\n".join(lines)
     if len(content.encode("utf-8")) > MAX_FEISHU_COMMENT_BYTES:
@@ -707,18 +681,9 @@ def build_terminal_delivery(
                 raise DeliveryContractError(
                     "terminal_delivery_diagnostic_detail_invalid"
                 )
-            diagnostic_message = (
-                f"自动归因未完成（非归因结论）：{public_detail.rstrip('。')}。"
-            )
-        else:
-            diagnostic_message = _TERMINAL_DIAGNOSTIC_RESULTS[
-                normalized_diagnostic_code
-            ]
-        diagnostic_result = (
-            f"RCA 第 {generation} 代："
-            f"{diagnostic_message}"
-            "本代未生成已验证归因报告；问题单归因报告字段若非空，"
-            f"可能保留自其他代次，不代表第 {generation} 代结论。"
+        diagnostic_result = _render_terminal_user_result(
+            normalized_diagnostic_code,
+            public_detail,
         )
         field_updates = [
             {
@@ -1102,6 +1067,227 @@ def _consumer_capability_summary(contract: Mapping[str, Any]) -> str:
         f"实际 signals/fields/evaluators={len(signals)}/{len(fields)}/{len(evaluators)}；"
         f"未调用={len(unused)}；证据帧：{frame_text}；"
         f"viz：{str(viz.get('status') or '未生成')}"
+    )
+
+
+_PUBLIC_INTERNAL_FRAGMENTS = (
+    "能力出版",
+    "evaluator_scope",
+    "signals/fields/evaluators",
+    "未调用=",
+    "执行代次",
+    "代次：",
+    "错误码",
+    "terminal_diagnostic",
+    "RCA 第 ",
+)
+
+
+def _public_text(value: Any, *, limit: int = 900) -> str:
+    """Keep user-facing RCA text free of execution metadata and debug noise."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    kept = [
+        line.strip()
+        for line in raw.splitlines()
+        if line.strip() and not any(fragment in line for fragment in _PUBLIC_INTERNAL_FRAGMENTS)
+    ]
+    text = "；".join(kept)
+    for prefix in ("候选因果判断：", "候选原因：", "诊断结论："):
+        if text.startswith(prefix):
+            text = text[len(prefix):].strip()
+    return _truncate_utf8(text.rstrip("。； ") + ("。" if text else ""), limit)
+
+
+def _public_first_text(*values: Any, limit: int = 900) -> str:
+    for value in values:
+        text = _public_text(value, limit=limit)
+        if text:
+            return text
+    return ""
+
+
+def _public_terminal_blocker(code: str) -> tuple[str, str, str]:
+    """Map internal terminal categories to a stable human explanation."""
+    mapping = {
+        "remote_event_not_found": (
+            "问题数据事件在当前生产数据源中不存在。",
+            "无法读取对应证据，因此不能判断责任方或因果链。",
+            "请核对问题单中的 PDCL 事件地址，修正后重新发起 RCA。",
+        ),
+        "unsupported_function_domain": (
+            "当前问题域暂不在自动 RCA 覆盖范围内。",
+            "现有证据不足以对该问题域形成自动归因。",
+            "请人工分流；补充该问题域的证据后再纳入自动 RCA。",
+        ),
+        "business_adapter_not_ready": (
+            "该问题已识别到所属业务，但对应数据适配尚未就绪。",
+            "当前没有可验证的业务证据，不能跨项目借用其他归因能力。",
+            "请人工分流；完成该业务的数据适配后重新发起 RCA。",
+        ),
+    }
+    return mapping.get(
+        code,
+        (
+            "本次未生成可确认的自动归因。",
+            "当前没有足够的可验证证据建立责任和因果链。",
+            "请补齐问题数据或输入后重新发起 RCA；人工可先行分流。",
+        ),
+    )
+
+
+def build_public_rca_result(contract: Mapping[str, Any]) -> dict[str, Any]:
+    """Project a delivery contract into the small result a Feishu user reviews.
+
+    The report keeps its full machine-readable lineage.  This projection is
+    deliberately limited to decision-bearing fields and never exposes model,
+    evaluator, generation, or terminal implementation details.
+    """
+    contract = contract if isinstance(contract, Mapping) else {}
+    public = contract.get("public_result")
+    public = public if isinstance(public, Mapping) else {}
+    summary = public.get("summary") if isinstance(public.get("summary"), Mapping) else {}
+    if not summary:
+        raw_summary = contract.get("summary")
+        summary = raw_summary if isinstance(raw_summary, Mapping) else {}
+    report = contract.get("report") if isinstance(contract.get("report"), Mapping) else {}
+    responsibility = public.get("responsibility") if isinstance(public.get("responsibility"), Mapping) else {}
+    causal = public.get("causal_chain") if isinstance(public.get("causal_chain"), Mapping) else {}
+    evidence = public.get("evidence_summary") if isinstance(public.get("evidence_summary"), Mapping) else {}
+    terminal = public.get("terminal_diagnostic") if isinstance(public.get("terminal_diagnostic"), Mapping) else {}
+
+    terminal_code = str(terminal.get("blocker_kind") or "").strip()
+    short = _public_first_text(
+        summary.get("short_conclusion"),
+        summary.get("l0"),
+        limit=1200,
+    )
+    no_attribution = bool(terminal_code) or any(
+        marker in short
+        for marker in ("不能自动归因", "未形成归因", "未找到", "不存在，请核对", "暂不在自动")
+    )
+    responsibility_candidate = _public_first_text(
+        responsibility.get("candidate"),
+        responsibility.get("owner"),
+        public.get("candidate"),
+        report.get("candidate_owner"),
+        report.get("candidate_owner_domain"),
+        limit=260,
+    )
+
+    narrative = causal.get("narrative")
+    narrative = narrative if isinstance(narrative, list) else []
+    evidence_text = ""
+    causal_text = ""
+    for item in narrative:
+        if not isinstance(item, Mapping):
+            continue
+        role = str(item.get("role") or "").strip()
+        text = _public_text(item.get("text"), limit=1000)
+        if not text:
+            continue
+        if role == "因果判断" and not causal_text:
+            causal_text = text
+        elif role == "证据" and not evidence_text:
+            evidence_text = text
+    if not causal_text:
+        hypotheses = causal.get("hypotheses")
+        if isinstance(hypotheses, list):
+            for item in hypotheses:
+                if isinstance(item, Mapping):
+                    causal_text = _public_first_text(item.get("narrative"), item.get("text"), item.get("summary"), limit=1000)
+                    if causal_text:
+                        break
+    if not evidence_text:
+        refs = evidence.get("refs")
+        if isinstance(refs, list):
+            compact_refs: list[str] = []
+            for item in refs[:6]:
+                if isinstance(item, Mapping):
+                    compact = item.get("summary") or item.get("field") or item.get("check") or item.get("fit_source")
+                else:
+                    compact = item
+                text = _public_text(compact, limit=220)
+                if text and text not in compact_refs:
+                    compact_refs.append(text)
+            evidence_text = "；".join(compact_refs)
+    boundary = _public_first_text(
+        responsibility.get("boundary"),
+        summary.get("high_confidence_boundary"),
+        *(public.get("evidence_boundary") if isinstance(public.get("evidence_boundary"), list) else ()),
+        limit=800,
+    )
+    action = public.get("user_action") if isinstance(public.get("user_action"), Mapping) else {}
+    next_action = _public_first_text(action.get("next_action_text"), action.get("next_action"), limit=500)
+
+    if no_attribution:
+        conclusion, impact, default_action = _public_terminal_blocker(terminal_code)
+        if not terminal_code and short:
+            conclusion = "本次未形成可确认的自动归因。"
+            impact = "问题现象、证据或因果链尚未达到可确认标准。"
+        return {
+            "conclusion": conclusion,
+            "responsibility": "暂无法判断。",
+            "causal_chain": "暂无足够证据建立可确认的因果链。",
+            "evidence": evidence_text or "未取得可用于责任判断的充分证据。",
+            "boundary": boundary or impact,
+            "next_action": next_action or default_action,
+            "attribution_ready": False,
+        }
+
+    if not causal_text:
+        causal_text = "暂无结构化因果链；请在详细证据报告中复核候选判断。"
+    if not evidence_text:
+        evidence_text = boundary or "详细证据已写入报告页，待人工复核。"
+    return {
+        "conclusion": short or "已生成候选归因，待人工审批。",
+        "responsibility": responsibility_candidate or "待人工确认。",
+        "causal_chain": causal_text,
+        "evidence": evidence_text,
+        "boundary": boundary or "无额外自动处理卡点；需人工确认责任边界。",
+        "next_action": next_action or "请人工确认责任候选、因果链和证据边界。",
+        "attribution_ready": True,
+    }
+
+
+def render_public_rca_result(contract: Mapping[str, Any]) -> str:
+    result = build_public_rca_result(contract)
+    lines = [
+        f"归因结论：{result['conclusion']}",
+        f"责任候选：{result['responsibility']}",
+        f"因果链：{result['causal_chain']}",
+        f"关键证据：{result['evidence']}",
+        f"当前卡点/边界：{result['boundary']}",
+        f"下一步：{result['next_action']}",
+        (
+            "里程碑：数据读取 → 证据提取 → 候选归因 → 详细报告"
+            if result.get("attribution_ready")
+            else "里程碑：业务路由 → 数据校验 → 卡点确认 → 人工处理"
+        ),
+    ]
+    return "\n".join(_truncate_utf8(line, 1800) for line in lines)
+
+
+def _render_terminal_user_result(code: str, detail: str = "") -> str:
+    conclusion, impact, action = _public_terminal_blocker(code)
+    detail_text = _public_text(detail, limit=500)
+    if detail_text and code == "business_adapter_not_ready":
+        # Keep the route decision useful without leaking resolver/evaluator
+        # implementation names into the issue field.
+        route = detail_text.split("（", 1)[0].rstrip("。； ")
+        if route:
+            conclusion = f"未形成归因：{route}。"
+    return "\n".join(
+        (
+            f"归因结论：{conclusion}",
+            "责任候选：暂无法判断。",
+            "因果链：暂无足够证据建立可确认的因果链。",
+            f"关键证据：{impact}",
+            f"当前卡点/边界：{impact}",
+            f"下一步：{action}",
+            "里程碑：业务路由 → 数据校验 → 卡点确认 → 人工处理",
+        )
     )
 
 
@@ -1971,13 +2157,24 @@ def verify_delivery_bundle(
             "target_key": target_key,
         },
     )
-    summary = contract.get("summary") if isinstance(contract.get("summary"), Mapping) else {}
-    conclusion_text = str(
-        summary.get("short_conclusion") or summary.get("l0") or ""
-    ).strip()
-    capability_summary = _consumer_capability_summary(contract)
-    if capability_summary:
-        conclusion_text = f"{conclusion_text}\n{capability_summary}".strip()
+    # Keep the complete capability contract in the sealed report, but project
+    # only user-decision fields into Feishu.  Validation still runs so a false
+    # or malformed publication cannot pass through silently.
+    _consumer_capability_summary(contract)
+    raw_public = contract.get("public_result") if isinstance(contract.get("public_result"), Mapping) else {}
+    raw_public_summary = raw_public.get("summary") if isinstance(raw_public.get("summary"), Mapping) else {}
+    raw_summary = contract.get("summary") if isinstance(contract.get("summary"), Mapping) else {}
+    if not str(
+        raw_public_summary.get("short_conclusion")
+        or raw_public_summary.get("l0")
+        or raw_summary.get("short_conclusion")
+        or raw_summary.get("l0")
+    ).strip():
+        raise DeliveryContractError(
+            "delivery_conclusion_missing",
+            "a non-empty RCA conclusion is required for the result field",
+        )
+    conclusion_text = render_public_rca_result(contract)
     conclusion = _truncate_utf8(conclusion_text, MAX_CONCLUSION_BYTES)
     if not conclusion:
         raise DeliveryContractError(

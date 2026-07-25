@@ -19,6 +19,10 @@ G1Q3_RCA_FORMAL_VIZ_CIFS_ROOT = (
 FOXGLOVE_PATH_SAFE = "/._-()[]中文abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 DEFAULT_FOXGLOVE_RENDER_HOST = "192.168.21.217"
 FIXED_FOXGLOVE_ORIGIN = f"https://{DEFAULT_FOXGLOVE_RENDER_HOST}"
+# The report service is an internal, authenticated-network endpoint.  Keep it
+# exact and bounded until a real DNS/TLS publication is provisioned; accepting
+# arbitrary IP origins would make sealed report links unsafe.
+INTERNAL_RCA_REPORT_ORIGIN = "http://192.168.26.174:18081"
 _SAFE_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$")
 _DNS_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
@@ -143,8 +147,10 @@ def _foxglove_base(*, require_explicit: bool = False) -> str:
 
 
 def canonical_publication_origin() -> str:
-    """Return the explicit HTTPS DNS origin used for public RCA artifacts."""
+    """Return the exact production report origin used for RCA artifacts."""
     base = _foxglove_base(require_explicit=True)
+    if base == INTERNAL_RCA_REPORT_ORIGIN:
+        return base
     if not base.startswith("https://"):
         return ""
     parsed = urlsplit(base)

@@ -2395,22 +2395,7 @@ def _admit_g1q3_manual_trigger(
 
 
 def _format_g1q3_manual_admission(result: Mapping[str, Any]) -> str:
-    outcome = str(result.get("outcome") or "")
-    labels = {
-        "created": "已创建",
-        "joined": "已绑定到既有任务",
-        "rearmed": "已恢复等待输入的既有任务",
-        "catchup_attached": "已绑定既有结果并安排回帖",
-    }
-    return "\n".join(
-        (
-            f"G1Q3 RCA {labels.get(outcome, '已受理')}。",
-            f"追踪号：{str(result.get('submission_key') or '')}",
-            f"执行代次：{int(result.get('generation') or 0)}",
-            "最终结果会回到当前话题（成功时为 HTML 报告，失败时为终态说明）；"
-            "本入口复用固定生产链路。",
-        )
-    )
+    return "RCA 已受理。\n结果会回到当前话题，并同步到问题单；完成后只展示归因结论、责任候选、证据和下一步。"
 
 
 def _resolve_g1q3_issue_identity(

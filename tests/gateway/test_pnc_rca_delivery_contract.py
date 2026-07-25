@@ -309,10 +309,10 @@ def test_delivery_projects_consumer_capability_into_field_and_comment():
         html_dependencies=dependencies,
     )
 
-    assert "g1q3_863_consumer@g1q3_863_consumer_v1" in verified.conclusion
-    assert "signals/fields/evaluators=1/1/1" in verified.conclusion
-    assert "证据帧：123" in verified.conclusion
-    assert "viz：pass" in verified.effect_payload["comment_content"]
+    assert "归因结论：减速度请求偏重。" in verified.conclusion
+    assert "g1q3_863_consumer" not in verified.conclusion
+    assert "signals/fields/evaluators" not in verified.effect_payload["comment_content"]
+    assert "报告页用于查看证据" in verified.effect_payload["comment_content"]
     assert (
         verified.effect_payload["field_updates"][0]["field_value"]
         == verified.conclusion
@@ -361,14 +361,14 @@ def test_mdrive4_readiness_terminal_is_explicit_and_business_neutral():
 
     assert terminal.diagnostic_code == "business_adapter_not_ready"
     assert "已按官方字段路由到 mdrive4" in terminal.diagnostic_result
-    assert "mdrive4_recorder_mcap_reference_v1" in terminal.diagnostic_result
-    assert "ct_evaluator_217_20260722" in terminal.diagnostic_result
-    assert "rca/mdrive4" in terminal.diagnostic_result
-    assert "不会进入 G1Q3" in terminal.diagnostic_result
+    assert "mdrive4_recorder_mcap_reference_v1" not in terminal.diagnostic_result
+    assert "ct_evaluator_217_20260722" not in terminal.diagnostic_result
+    assert "rca/mdrive4" not in terminal.diagnostic_result
+    assert "不能跨项目借用其他归因能力" in terminal.diagnostic_result
     assert terminal.contract["diagnostic_detail"].startswith(
         "已按官方字段路由到 mdrive4"
     )
-    assert "【RCA 机器人终态】" in terminal.effect_payload["comment_content"]
+    assert "【RCA 结果】" in terminal.effect_payload["comment_content"]
     assert "G1Q3 RCA 机器人终态" not in terminal.effect_payload["comment_content"]
 
 
@@ -409,7 +409,7 @@ def test_valid_sealed_evidence_and_published_viz_build_issue_effect():
     assert delivery.effect_payload["field_updates"] == [
         {
             "field_key": "field_9193cb",
-            "field_value": "候选因果判断：减速度请求偏重。",
+            "field_value": delivery.conclusion,
         },
         {
             "field_key": "field_8c912e",
@@ -425,14 +425,11 @@ def test_valid_sealed_evidence_and_published_viz_build_issue_effect():
     assert delivery.effect_payload["report_cifs_path"] == canonical_viz_mcap_cifs_path(
         delivery.submission_key
     )
-    assert (
-        delivery.effect_payload["report_cifs_path"]
-        in delivery.effect_payload["comment_content"]
-    )
+    assert delivery.effect_payload["report_cifs_path"] not in delivery.effect_payload["comment_content"]
     assert delivery.viz_mcap_vm == canonical_viz_mcap_path(delivery.submission_key)
     assert delivery.foxglove_url == foxglove_url(delivery.viz_mcap_vm)
     assert delivery.report_url in delivery.effect_payload["comment_content"]
-    assert delivery.foxglove_url in delivery.effect_payload["comment_content"]
+    assert delivery.foxglove_url not in delivery.effect_payload["comment_content"]
     assert delivery.issue_url == (
         "https://project.feishu.cn/g1q3/issue/detail/7041712812"
     )
@@ -550,7 +547,7 @@ def test_thread_reply_effect_is_bound_to_exact_topic_and_is_deterministic():
     assert payload["idempotency_uuid"]
     assert payload["marker"] in payload["message_content"]
     assert delivery.report_url in payload["message_content"]
-    assert delivery.foxglove_url in payload["message_content"]
+    assert delivery.foxglove_url not in payload["message_content"]
     assert delivery.report_url != delivery.foxglove_url
     assert delivery.issue_url in payload["message_content"]
 
@@ -754,9 +751,9 @@ def test_large_conclusion_is_utf8_bounded_while_report_links_are_preserved():
 
     content = delivery.effect_payload["comment_content"]
     assert len(content.encode("utf-8")) <= MAX_FEISHU_COMMENT_BYTES
-    assert delivery.foxglove_url in content
+    assert delivery.foxglove_url not in content
     assert manifest["report_url"] in content
-    assert delivery.conclusion.endswith("...")
+    assert delivery.conclusion.splitlines()[0].endswith("...")
     assert {item.role for item in delivery.artifacts} == {
         "index_html",
         "report_data",
@@ -911,7 +908,6 @@ def test_report_truth_and_seal_fail_closed(mutator, code):
 @pytest.mark.parametrize(
     "url",
     [
-        f"http://192.168.26.174:18081{FORMAL_REPORT_PATH}",
         f"http://192.168.26.175:18081{FORMAL_REPORT_PATH}",
         f"http://192.168.26.174:18082{FORMAL_REPORT_PATH}",
         f"http://user@192.168.26.174:18081{FORMAL_REPORT_PATH}",
@@ -938,6 +934,16 @@ def test_report_url_is_exactly_the_formal_public_html_route(url):
     with pytest.raises(DeliveryContractError) as exc:
         _verify((admission, contract, manifest, observed, dependencies))
     assert exc.value.code == "report_url_invalid"
+
+
+def test_report_url_accepts_the_exact_verified_internal_service(monkeypatch):
+    monkeypatch.setenv("PNC_FOXGLOVE_RENDER_HOST", "http://192.168.26.174:18081")
+    bundle = list(_bundle())
+    bundle[2]["report_url"] = (
+        f"http://192.168.26.174:18081/G1Q3_RCA/cases/"
+        f"{bundle[2]['submission_key']}/{bundle[2]['artifact_set_id']}/index.html"
+    )
+    assert _verify(tuple(bundle)).report_url == bundle[2]["report_url"]
 
 
 @pytest.mark.parametrize(
@@ -1057,9 +1063,9 @@ def test_terminal_v2_writes_only_honest_result_without_fake_report_url():
         TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION
     )
     assert delivery.diagnostic_code == "analysis_failed"
-    assert "非归因结论" in delivery.diagnostic_result
-    assert "第 1 代" in delivery.diagnostic_result
-    assert "可能保留自其他代次" in delivery.diagnostic_result
+    assert "本次未生成可确认的自动归因" in delivery.diagnostic_result
+    assert "第 1 代" not in delivery.diagnostic_result
+    assert "可能保留自其他代次" not in delivery.diagnostic_result
     assert delivery.effect_payload["field_updates"] == [
         {
             "field_key": "field_9193cb",
@@ -1079,20 +1085,18 @@ def test_terminal_v2_writes_only_honest_result_without_fake_report_url():
     assert "field_8c912e" not in json.dumps(
         delivery.effect_payload, ensure_ascii=False
     )
-    assert "不存在已验证的 Foxglove 发布产物" in delivery.effect_payload[
-        "comment_content"
-    ]
-    assert "本终态不改写" in delivery.effect_payload["comment_content"]
-    assert "不代表第 1 代结论" in delivery.effect_payload["comment_content"]
+    assert "本次未生成可确认的自动归因" in delivery.effect_payload["comment_content"]
+    assert "本终态不改写" not in delivery.effect_payload["comment_content"]
+    assert "不代表第 1 代结论" not in delivery.effect_payload["comment_content"]
 
 
 def test_terminal_v2_result_and_preserve_policy_are_bound_to_generation():
     first = _terminal_delivery(generation=1)
     second = _terminal_delivery(generation=2)
 
-    assert first.diagnostic_result != second.diagnostic_result
-    assert "第 2 代" in second.diagnostic_result
-    assert "不代表第 2 代结论" in second.effect_payload["comment_content"]
+    assert first.diagnostic_result == second.diagnostic_result
+    assert "第 2 代" not in second.diagnostic_result
+    assert "不代表第 2 代结论" not in second.effect_payload["comment_content"]
     assert second.effect_payload["generation"] == 2
     assert second.effect_payload["field_updates"] == [
         {
