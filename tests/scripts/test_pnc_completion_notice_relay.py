@@ -1,5 +1,6 @@
 import json
 import os
+import plistlib
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -306,8 +307,8 @@ def test_completion_notice_relay_launchd_guard_requires_keepalive_watch(monkeypa
     from scripts import hermes_live_drift_guard
 
     raw_without_watch = """
-    program = /Users/songying/.hermes/runtime/venvs/hermes-live-v0.14.6/bin/python
-    /Users/songying/.hermes/runtime/hermes-live/scripts/pnc_completion_notice_relay.py
+    program = /Users/songying/.hermes/runtime/governance-tools/pnc_live_exec.py
+    /usr/bin/python3 /Users/songying/.hermes/runtime/governance-tools/pnc_live_exec.py local.pnc.completion-notice-relay
     --send --retry-failed-after 600 --max-attempts 3
     """
     monkeypatch.setattr(
@@ -328,11 +329,30 @@ def test_completion_notice_relay_launchd_guard_accepts_keepalive_watch(tmp_path,
 
     plist = tmp_path / "Library" / "LaunchAgents" / "local.pnc.completion-notice-relay.plist"
     plist.parent.mkdir(parents=True)
-    plist.write_text("<plist/>", encoding="utf-8")
+    plist.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": "local.pnc.completion-notice-relay",
+                "ProgramArguments": [
+                    "/usr/bin/python3",
+                    str(tmp_path / ".hermes/runtime/governance-tools/pnc_live_exec.py"),
+                    "local.pnc.completion-notice-relay",
+                    "--send",
+                    "--watch",
+                    "--retry-failed-after",
+                    "600",
+                    "--max-attempts",
+                    "3",
+                ],
+                "WorkingDirectory": str(tmp_path / ".hermes/runtime"),
+                "EnvironmentVariables": {"HERMES_HOME": str(tmp_path / ".hermes")},
+            }
+        )
+    )
     monkeypatch.setattr(hermes_live_drift_guard.Path, "home", staticmethod(lambda: tmp_path))
     raw_with_watch = f"""
-    program = {tmp_path}/.hermes/runtime/venvs/hermes-live-v0.14.6/bin/python
-    {tmp_path}/.hermes/runtime/hermes-live/scripts/pnc_completion_notice_relay.py
+    program = /usr/bin/python3
+    /usr/bin/python3 {tmp_path}/.hermes/runtime/governance-tools/pnc_live_exec.py local.pnc.completion-notice-relay
     --send --watch --retry-failed-after 600 --max-attempts 3
     KeepAlive => true
     """

@@ -1,0 +1,5 @@
+#!/bin/zsh
+set -euo pipefail
+export HERMES_RUNTIME_SYNC_DISABLE=1
+exec /usr/bin/python3 "${HOME}/.hermes/runtime/governance-tools/pnc_live_exec.py" \
+  local.pnc.governance-check "$@"

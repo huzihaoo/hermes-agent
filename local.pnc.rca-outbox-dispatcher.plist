@@ -6,11 +6,12 @@
   <string>local.pnc.rca-outbox-dispatcher</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/songying/.hermes/runtime/hermes-live/.venv/bin/python</string>
-    <string>/Users/songying/.hermes/runtime/hermes-live/scripts/pnc_rca_outbox_dispatcher.py</string>
+    <string>/usr/bin/python3</string>
+    <string>/Users/songying/.hermes/runtime/governance-tools/pnc_live_exec.py</string>
+    <string>local.pnc.rca-outbox-dispatcher</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>/Users/songying/.hermes/runtime/hermes-live</string>
+  <string>/Users/songying/.hermes/runtime</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>HOME</key>
@@ -25,8 +26,6 @@
     <string>1</string>
     <key>PYTHONDONTWRITEBYTECODE</key>
     <string>1</string>
-    <key>VIRTUAL_ENV</key>
-    <string>/Users/songying/.hermes/runtime/hermes-live/.venv</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

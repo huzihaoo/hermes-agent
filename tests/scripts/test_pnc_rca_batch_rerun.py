@@ -127,12 +127,13 @@ def test_batch_request_is_operator_issue_only_and_deterministic():
         batch_id="gray-20260724",
         issue_id="7048803418",
         request_index=1,
-        requester_id="operator-songying",
+        requester_id="automation:rca-batch-rerun",
     )
 
     assert request.platform == "operator"
     assert request.chat_id == request.thread_id == ""
     assert request.message_id == "gray-20260724-7048803418-try-1"
+    assert request.requester_id == "automation:rca-batch-rerun"
 
 
 def test_issue_snapshot_tracks_new_outbox_before_execution_watch_exists(tmp_path):

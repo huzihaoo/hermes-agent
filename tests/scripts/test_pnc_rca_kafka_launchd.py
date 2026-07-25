@@ -11,7 +11,11 @@ RCA_RESIDENT_PLIST_PATHS = (
     REPO_ROOT / "local.pnc.rca-delivery-collector.plist",
     REPO_ROOT / "local.pnc.rca-delivery-dispatcher.plist",
 )
-EXPECTED_VIRTUAL_ENV = "/Users/songying/.hermes/runtime/hermes-live/.venv"
+LIVE_EXEC = "/Users/songying/.hermes/runtime/governance-tools/pnc_live_exec.py"
+
+
+def _expected_arguments(label: str) -> list[str]:
+    return ["/usr/bin/python3", LIVE_EXEC, label]
 
 
 def test_kafka_launchd_production_is_secret_free_and_crash_restarting():
@@ -19,10 +23,9 @@ def test_kafka_launchd_production_is_secret_free_and_crash_restarting():
     payload = plistlib.loads(raw)
 
     assert payload["Label"] == "local.pnc.rca-kafka-consumer"
-    assert payload["ProgramArguments"] == [
-        "/Users/songying/.hermes/runtime/hermes-live/.venv/bin/python",
-        "/Users/songying/.hermes/runtime/hermes-live/scripts/pnc_rca_kafka_consumer.py",
-    ]
+    assert payload["ProgramArguments"] == _expected_arguments(
+        "local.pnc.rca-kafka-consumer"
+    )
     assert payload["RunAtLoad"] is True
     assert payload["KeepAlive"] == {"SuccessfulExit": False}
     assert payload["Umask"] == 0o77
@@ -35,8 +38,9 @@ def test_kafka_launchd_production_is_secret_free_and_crash_restarting():
         "PYTHONDONTWRITEBYTECODE",
         "PYTHONNOUSERSITE",
         "PYTHONUNBUFFERED",
-        "VIRTUAL_ENV",
     }
+    assert "/runtime/releases/" not in raw.decode("utf-8")
+    assert "/runtime/venvs/" not in raw.decode("utf-8")
 
 
 def test_outbox_launchd_production_is_secret_free_and_crash_restarting():
@@ -44,10 +48,9 @@ def test_outbox_launchd_production_is_secret_free_and_crash_restarting():
     payload = plistlib.loads(raw)
 
     assert payload["Label"] == "local.pnc.rca-outbox-dispatcher"
-    assert payload["ProgramArguments"] == [
-        "/Users/songying/.hermes/runtime/hermes-live/.venv/bin/python",
-        "/Users/songying/.hermes/runtime/hermes-live/scripts/pnc_rca_outbox_dispatcher.py",
-    ]
+    assert payload["ProgramArguments"] == _expected_arguments(
+        "local.pnc.rca-outbox-dispatcher"
+    )
     assert payload["RunAtLoad"] is True
     assert payload["KeepAlive"] == {"SuccessfulExit": False}
     assert payload["Umask"] == 0o77
@@ -59,13 +62,18 @@ def test_outbox_launchd_production_is_secret_free_and_crash_restarting():
         "PYTHONDONTWRITEBYTECODE",
         "PYTHONNOUSERSITE",
         "PYTHONUNBUFFERED",
-        "VIRTUAL_ENV",
     }
+    assert "/runtime/releases/" not in raw.decode("utf-8")
+    assert "/runtime/venvs/" not in raw.decode("utf-8")
 
 
-def test_all_rca_residents_bind_the_canonical_virtual_environment():
+def test_all_rca_residents_resolve_the_active_manifest_without_runtime_literals():
     for path in RCA_RESIDENT_PLIST_PATHS:
         payload = plistlib.loads(path.read_bytes())
-        assert payload["EnvironmentVariables"]["VIRTUAL_ENV"] == (
-            EXPECTED_VIRTUAL_ENV
-        )
+        label = payload["Label"]
+        assert payload["ProgramArguments"][:3] == _expected_arguments(label)
+        assert "VIRTUAL_ENV" not in payload["EnvironmentVariables"]
+        text = path.read_text(encoding="utf-8")
+        assert "/runtime/releases/" not in text
+        assert "/runtime/venvs/" not in text
+        assert "/runtime/hermes-live" not in text

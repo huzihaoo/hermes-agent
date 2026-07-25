@@ -6,8 +6,9 @@
   <string>local.pnc.completion-notice-relay</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/songying/.hermes/runtime/hermes-live/.venv/bin/python</string>
-    <string>/Users/songying/.hermes/runtime/hermes-live/scripts/pnc_completion_notice_relay.py</string>
+    <string>/usr/bin/python3</string>
+    <string>/Users/songying/.hermes/runtime/governance-tools/pnc_live_exec.py</string>
+    <string>local.pnc.completion-notice-relay</string>
     <string>--send</string>
     <string>--watch</string>
     <string>--limit</string>
@@ -23,7 +24,7 @@
     <string>--json</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>/Users/songying/.hermes/runtime/hermes-live</string>
+  <string>/Users/songying/.hermes/runtime</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>HOME</key>
@@ -31,7 +32,7 @@
     <key>HERMES_HOME</key>
     <string>/Users/songying/.hermes</string>
     <key>PATH</key>
-    <string>/Users/songying/.hermes/runtime/hermes-live/.venv/bin:/Users/songying/.local/bin:/Users/songying/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>/Users/songying/.local/bin:/Users/songying/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>PNC_RELAY_WATCH_CANARY_LOOPS</key>
     <string>3</string>
     <key>PNC_COMPLETION_NOTICE_RELAY_HEALTH_PATH</key>
@@ -44,8 +45,6 @@
     <string>1</string>
     <key>PYTHONUNBUFFERED</key>
     <string>1</string>
-    <key>VIRTUAL_ENV</key>
-    <string>/Users/songying/.hermes/runtime/hermes-live/.venv</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>local.pnc.watcher-staleness-watchdog</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>/Users/songying/.hermes/runtime/governance-tools/watcher-staleness-watchdog.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/songying/.hermes/runtime</string>
+  <key>StartInterval</key>
+  <integer>1009</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HERMES_WATCHER_STALENESS_FEISHU_CHAT</key>
+    <string>oc_16614f4ba25b8c88b69c0b8e9ebc2fb5</string>
+    <key>HERMES_WATCHER_STALENESS_REALERT_HOURS</key>
+    <string>6</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/Users/songying/.hermes/logs/watcher-staleness-watchdog.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/songying/.hermes/logs/watcher-staleness-watchdog.err.log</string>
+</dict>
+</plist>

@@ -200,7 +200,7 @@ def _operator_request(
     message_id: str,
     *,
     issue_url: str = "https://project.feishu.cn/g1q3/issue/detail/7041712812",
-    requester_id: str = "operator-songying",
+    requester_id: str = "automation:test-operator",
 ):
     return ManualRcaTriggerRequest(
         schema_version=MANUAL_TRIGGER_SCHEMA_VERSION,

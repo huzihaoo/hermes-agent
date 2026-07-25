@@ -6,13 +6,14 @@
     <string>local.pnc.meegle-auth-watchdog</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/songying/.hermes/runtime/hermes-live/.venv/bin/python</string>
-        <string>/Users/songying/.hermes/runtime/hermes-live/scripts/pnc_meegle_auth_watchdog.py</string>
+        <string>/usr/bin/python3</string>
+        <string>/Users/songying/.hermes/runtime/governance-tools/pnc_live_exec.py</string>
+        <string>local.pnc.meegle-auth-watchdog</string>
         <string>--once</string>
         <string>--json</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/Users/songying/.hermes/runtime/hermes-live</string>
+    <string>/Users/songying/.hermes/runtime</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>HOME</key>
@@ -20,9 +21,7 @@
         <key>HERMES_HOME</key>
         <string>/Users/songying/.hermes</string>
         <key>PATH</key>
-        <string>/Users/songying/.hermes/runtime/hermes-live/.venv/bin:/Users/songying/.local/bin:/Users/songying/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-        <key>VIRTUAL_ENV</key>
-        <string>/Users/songying/.hermes/runtime/hermes-live/.venv</string>
+        <string>/Users/songying/.local/bin:/Users/songying/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>PNC_MEEGLE_WARN_MIN</key>
         <string>0</string>
         <key>PNC_MEEGLE_CRIT_MIN</key>

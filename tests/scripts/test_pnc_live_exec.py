@@ -35,7 +35,7 @@ print(json.dumps({
     'manifest_sha256': os.environ.get('PNC_LIVE_MANIFEST_SHA256'),
     'runtime_commit': os.environ.get('PNC_LIVE_RUNTIME_COMMIT'),
     'service_label': os.environ.get('PNC_LIVE_SERVICE_LABEL'),
-    'pythonpath_present': 'PYTHONPATH' in os.environ,
+    'pythonpath': os.environ.get('PYTHONPATH'),
 }))
 """,
         encoding="utf-8",
@@ -115,7 +115,7 @@ def test_check_and_exec_use_the_manifest_bound_release(tmp_path: Path):
         "args": ["--probe", "value"],
         "cwd": str(root),
         "manifest_sha256": evidence["manifest_sha256"],
-        "pythonpath_present": False,
+        "pythonpath": str(root),
         "runtime_commit": commit,
         "service_label": SERVICE_LABEL,
     }
@@ -146,6 +146,30 @@ def test_stale_runtime_commit_fails_closed_with_nonzero_exit(tmp_path: Path):
         "error": "active_runtime_commit_mismatch",
         "ok": False,
     }
+
+
+def test_stable_governance_and_native_cli_targets_are_manifest_bound(tmp_path: Path):
+    home = tmp_path / "hermes"
+    root, venv, commit, tree = _create_runtime(home, "active")
+    _write_manifest(home, root, venv, commit, tree)
+    governance = home / "runtime" / "governance-tools" / "hermes_governance_check.py"
+    governance.parent.mkdir(parents=True)
+    governance.write_text("print('ok')\n", encoding="utf-8")
+    native = venv / "bin" / "hermes"
+    native.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    native.chmod(0o755)
+
+    governance_result = _run(home, "--check", "local.pnc.governance-check")
+    assert governance_result.returncode == 0, governance_result.stderr
+    governance_evidence = json.loads(governance_result.stdout)
+    assert governance_evidence["target_kind"] == "governance_tool"
+    assert governance_evidence["script"] == str(governance)
+
+    cli_result = _run(home, "--check", "local.pnc.hermes-cli")
+    assert cli_result.returncode == 0, cli_result.stderr
+    cli_evidence = json.loads(cli_result.stdout)
+    assert cli_evidence["target_kind"] == "runtime_executable"
+    assert cli_evidence["script"] == str(native)
 
 
 def _dynamic_plist(home: Path) -> dict[str, object]:

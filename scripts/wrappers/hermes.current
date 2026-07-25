@@ -1,0 +1,216 @@
+#!/bin/zsh
+set -euo pipefail
+
+HOME_DIR="${HOME:-$(python3 -c 'from pathlib import Path; print(Path.home())')}"
+[[ -f "$HOME_DIR/bin/malloc-env-clean" ]] && source "$HOME_DIR/bin/malloc-env-clean"
+# The live manifest is the only permitted local CLI target.
+unset HERMES_FRAMEWORK_ROOT
+unset HERMES_NATIVE_BIN
+if [[ "${HERMES_ALLOW_CONFIG_PATH_ENV:-0}" != "1" ]]; then
+  unset HERMES_CONFIG_PATH
+  unset OPENCLAW_CONFIG_PATH
+fi
+[[ -f "$HOME_DIR/.hermes/env.sh" ]] && source "$HOME_DIR/.hermes/env.sh"
+
+# OPENAI_BASE_URL from the parent shell can silently poison Hermes auxiliary
+# routing even when provider/base_url are already pinned in ~/.hermes/config.yaml.
+# Ignore it by default for Hermes launches; allow explicit opt-in escape hatch.
+if [[ "${HERMES_ALLOW_OPENAI_BASE_URL:-0}" != "1" ]]; then
+  unset OPENAI_BASE_URL
+fi
+
+sync_script="${HERMES_RUNTIME_SYNC_SCRIPT:-$HOME_DIR/bin/hermes-sync-runtime}"
+if [[ ! -x "$sync_script" ]]; then
+  sync_script="$HOME_DIR/bin/hermes-sync-openclaw-runtime"
+fi
+if [[ "${HERMES_RUNTIME_SYNC_DISABLE:-0}" != "1" && -x "$sync_script" ]]; then
+  "$sync_script" --quiet >/dev/null 2>&1 || true
+fi
+
+launchd_label="${HERMES_LAUNCHD_LABEL:-ai.hermes.gateway}"
+launchd_plist="${HERMES_LAUNCHD_PLIST:-$HOME_DIR/Library/LaunchAgents/${launchd_label}.plist}"
+compat_api_host="${HERMES_COMPAT_API_HOST:-127.0.0.1}"
+compat_api_port="${HERMES_COMPAT_API_PORT:-18789}"
+
+launchctl_domain() {
+  local uid
+  uid="$(id -u)"
+  printf 'gui/%s' "$uid"
+}
+
+launchctl_service_target() {
+  printf '%s/%s' "$(launchctl_domain)" "$launchd_label"
+}
+
+service_is_loaded() {
+  launchctl print "$(launchctl_service_target)" >/dev/null 2>&1
+}
+
+wait_for_service_state() {
+  local want="$1"
+  local attempts="${2:-25}"
+  local delay="${3:-0.2}"
+  local i
+  for ((i = 1; i <= attempts; i++)); do
+    if [[ "$want" == "loaded" ]]; then
+      service_is_loaded && return 0
+    else
+      service_is_loaded || return 0
+    fi
+    sleep "$delay"
+  done
+  return 1
+}
+
+wait_for_local_api() {
+  local attempts="${1:-20}"
+  local delay="${2:-0.5}"
+  local i
+  local health=""
+  if ! command -v curl >/dev/null 2>&1; then
+    return 0
+  fi
+  for ((i = 1; i <= attempts; i++)); do
+    health="$(curl -fsS --max-time 2 "http://${compat_api_host}:${compat_api_port}/health" 2>/dev/null || true)"
+    [[ -n "$health" ]] && return 0
+    sleep "$delay"
+  done
+  return 1
+}
+
+print_gateway_status() {
+  local service_dump=""
+  local pid=""
+  local state=""
+  local health=""
+
+  echo "Launchd plist: $launchd_plist"
+  if [[ ! -f "$launchd_plist" ]]; then
+    echo "✗ Service definition is missing"
+    echo "  Expected: $launchd_plist"
+    return 1
+  fi
+
+  if ! service_dump="$(launchctl print "$(launchctl_service_target)" 2>/dev/null)"; then
+    echo "✗ Gateway service is not loaded"
+    echo "  Service definition exists locally but launchd has not loaded it."
+    echo "  Run: hermes gateway start"
+    return 1
+  fi
+
+  pid="$(print -- "$service_dump" | sed -n 's/^[[:space:]]*pid = //p' | head -n 1)"
+  state="$(print -- "$service_dump" | sed -n 's/^[[:space:]]*state = //p' | head -n 1)"
+
+  echo "✓ Wrapper-managed Hermes gateway is loaded"
+  [[ -n "$state" ]] && echo "  State: $state"
+  [[ -n "$pid" ]] && echo "  Launchd PID: $pid"
+
+  if command -v curl >/dev/null 2>&1; then
+    health="$(curl -fsS --max-time 2 "http://${compat_api_host}:${compat_api_port}/health" 2>/dev/null || true)"
+    if [[ -n "$health" ]]; then
+      echo "  Local API: reachable on ${compat_api_host}:${compat_api_port}"
+      echo "  Health: $health"
+    else
+      echo "  Local API: not reachable on ${compat_api_host}:${compat_api_port}"
+    fi
+  fi
+
+  local budget_checker="$HOME_DIR/bin/hermes-turn-budget-check"
+  local budget_json=""
+  local budget_line=""
+  if [[ -x "$budget_checker" ]] && command -v python3 >/dev/null 2>&1; then
+    budget_json="$($budget_checker --json 2>/dev/null || true)"
+    if [[ -n "$budget_json" ]]; then
+      budget_line="$(BUDGET_JSON="$budget_json" python3 -c 'import json, os; d=json.loads(os.environ["BUDGET_JSON"]); status="OK" if d.get("ok") else "WARN"; print("{} current={} recommended>={} observed_max={}".format(status, d.get("current"), d.get("recommended"), d.get("observed_max")))' 2>/dev/null || true)"
+      [[ -n "$budget_line" ]] && echo "  Turn budget: $budget_line"
+    fi
+  fi
+}
+
+start_gateway_service() {
+  local domain target
+  local attempt=1
+  local bootstrap_output=""
+  local bootstrap_exit=0
+  domain="$(launchctl_domain)"
+  target="$(launchctl_service_target)"
+
+  if [[ ! -f "$launchd_plist" ]]; then
+    echo "ERROR: missing launchd plist: $launchd_plist" >&2
+    return 1
+  fi
+
+  launchctl bootout "$target" >/dev/null 2>&1 || true
+  wait_for_service_state unloaded 25 0.2 || true
+
+  while (( attempt <= 5 )); do
+    bootstrap_output="$(launchctl bootstrap "$domain" "$launchd_plist" 2>&1)" && bootstrap_exit=0 || bootstrap_exit=$?
+    if [[ "$bootstrap_exit" -eq 0 ]]; then
+      launchctl kickstart -k "$target" >/dev/null 2>&1 || true
+      wait_for_service_state loaded 25 0.2 || true
+      wait_for_local_api 20 0.5 || true
+      echo "✓ Service started"
+      return 0
+    fi
+
+    if wait_for_service_state loaded 10 0.2; then
+      launchctl kickstart -k "$target" >/dev/null 2>&1 || true
+      wait_for_local_api 20 0.5 || true
+      echo "✓ Service started"
+      return 0
+    fi
+
+    if (( attempt < 5 )); then
+      sleep 1
+      launchctl bootout "$target" >/dev/null 2>&1 || true
+      wait_for_service_state unloaded 15 0.2 || true
+    fi
+    attempt=$((attempt + 1))
+  done
+
+  [[ -n "$bootstrap_output" ]] && print -r -- "$bootstrap_output" >&2
+  return "${bootstrap_exit:-1}"
+}
+
+stop_gateway_service() {
+  local target
+  target="$(launchctl_service_target)"
+  if launchctl bootout "$target" >/dev/null 2>&1; then
+    echo "✓ Service stopped"
+    return 0
+  fi
+  echo "Service not loaded: $target"
+}
+
+restart_gateway_service() {
+  stop_gateway_service >/dev/null 2>&1 || true
+  start_gateway_service
+}
+
+if [[ "${1-}" == "gateway" ]]; then
+  case "${2-}" in
+    status)
+      print_gateway_status
+      exit $?
+      ;;
+    start)
+      start_gateway_service
+      exit $?
+      ;;
+    stop)
+      stop_gateway_service
+      exit $?
+      ;;
+    restart)
+      restart_gateway_service
+      exit $?
+      ;;
+  esac
+fi
+
+live_exec="$HOME_DIR/.hermes/runtime/governance-tools/pnc_live_exec.py"
+if [[ ! -f "$live_exec" ]]; then
+  echo "ERROR: active runtime launcher not found: $live_exec" >&2
+  exit 78
+fi
+exec /usr/bin/python3 "$live_exec" local.pnc.hermes-cli "$@"

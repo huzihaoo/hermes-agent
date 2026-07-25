@@ -33,6 +33,7 @@ from gateway.pnc_rca_runtime_transition import (
     insert_host_runtime_transition,
     validate_host_runtime_transition_schema,
 )
+from gateway.pnc_rca_requester_identity import validate_rca_requester
 
 
 CONTROL_STORE_SCHEMA_VERSION = "pnc_rca_control_store_v10"
@@ -5963,6 +5964,13 @@ class RcaControlStore:
             root = normalized.thread_id.split("topic:", 1)[1]
             if not root or not re.fullmatch(r"[A-Za-z0-9_-]{3,200}", root):
                 raise ManualRcaAdmissionError("manual_request_thread_invalid")
+        try:
+            validate_rca_requester(
+                platform=normalized.platform,
+                requester_id=normalized.requester_id,
+            )
+        except ValueError as exc:
+            raise ManualRcaAdmissionError(str(exc)) from exc
         if not _ISSUE_URL_RE.fullmatch(normalized.issue_url):
             raise ManualRcaAdmissionError("manual_request_issue_url_invalid")
         return normalized

@@ -6,27 +6,30 @@
   <string>local.pnc.rca-delivery-dispatcher</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/songying/.hermes/runtime/hermes-live/.venv/bin/python</string>
-    <string>/Users/songying/.hermes/runtime/hermes-live/scripts/pnc_rca_delivery_dispatcher.py</string>
+    <string>/usr/bin/python3</string>
+    <string>/Users/songying/.hermes/runtime/governance-tools/pnc_live_exec.py</string>
+    <string>local.pnc.rca-delivery-dispatcher</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>/Users/songying/.hermes/runtime/hermes-live</string>
+  <string>/Users/songying/.hermes/runtime</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>HOME</key>
     <string>/Users/songying</string>
     <key>HERMES_HOME</key>
     <string>/Users/songying/.hermes</string>
+    <key>HERMES_RCA_DELIVERY_QUARANTINE_BASELINE_SHA256</key>
+    <string>04db01355ab86ed1b739c00cc3f530ddef832f42df8b12772fb9e67e2ecf1ac2</string>
     <key>PATH</key>
     <string>/Users/songying/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PNC_FOXGLOVE_RENDER_HOST</key>
+    <string>http://192.168.26.174:18081</string>
     <key>PYTHONUNBUFFERED</key>
     <string>1</string>
     <key>PYTHONNOUSERSITE</key>
     <string>1</string>
     <key>PYTHONDONTWRITEBYTECODE</key>
     <string>1</string>
-    <key>VIRTUAL_ENV</key>
-    <string>/Users/songying/.hermes/runtime/hermes-live/.venv</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

@@ -15,10 +15,114 @@ from typing import Any
 
 
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
-SERVICE_SCRIPTS = {
-    "local.pnc.feishu-delivery-repair": "scripts/pnc_feishu_delivery_guard.py",
-    "local.pnc.vm-task-sync": "scripts/pnc_vm_task_sync.py",
+SERVICE_TARGETS = {
+    "local.pnc.completion-notice-relay": (
+        "runtime_script",
+        "scripts/pnc_completion_notice_relay.py",
+    ),
+    "local.pnc.feishu-credential-health": (
+        "runtime_script",
+        "scripts/feishu_credential_cron.py",
+    ),
+    "local.pnc.feishu-delivery-repair": (
+        "runtime_script",
+        "scripts/pnc_feishu_delivery_guard.py",
+    ),
+    "local.pnc.meegle-auth-watchdog": (
+        "runtime_script",
+        "scripts/pnc_meegle_auth_watchdog.py",
+    ),
+    "local.pnc.rca-delivery-collector": (
+        "runtime_script",
+        "scripts/pnc_rca_delivery_collector.py",
+    ),
+    "local.pnc.rca-delivery-dispatcher": (
+        "runtime_script",
+        "scripts/pnc_rca_delivery_dispatcher.py",
+    ),
+    "local.pnc.rca-kafka-consumer": (
+        "runtime_script",
+        "scripts/pnc_rca_kafka_consumer.py",
+    ),
+    "local.pnc.rca-outbox-dispatcher": (
+        "runtime_script",
+        "scripts/pnc_rca_outbox_dispatcher.py",
+    ),
+    "local.pnc.task-dashboard.viewer": (
+        "runtime_file",
+        "restricted_task_dashboard_proxy.py",
+    ),
+    "local.pnc.vm-task-sync": (
+        "runtime_script",
+        "scripts/pnc_vm_task_sync.py",
+    ),
+    "local.pnc.release-fingerprint-check": (
+        "governance_tool",
+        "hermes_release_fingerprint_check.py",
+    ),
+    "local.pnc.live-drift-guard": (
+        "governance_tool",
+        "hermes_live_drift_guard.py",
+    ),
+    "local.pnc.feishu-ops-alert": (
+        "governance_tool",
+        "feishu_ops_alert.py",
+    ),
+    "local.pnc.governance-check": (
+        "governance_tool",
+        "hermes_governance_check.py",
+    ),
+    "local.pnc.provider-failure-audit": (
+        "governance_tool",
+        "hermes_provider_failure_audit.py",
+    ),
+    "local.pnc.release-freshness-gate": (
+        "governance_tool",
+        "pnc_rca_release_freshness_gate.py",
+    ),
+    "local.pnc.safe-worktree-remove": (
+        "governance_tool",
+        "hermes_safe_worktree_remove.py",
+    ),
+    "local.pnc.worktree-hygiene": (
+        "governance_tool",
+        "hermes_worktree_hygiene.py",
+    ),
+    "local.pnc.g1q3-e2e-smoke": (
+        "runtime_script",
+        "scripts/g1q3_rca_e2e_smoke.py",
+    ),
+    "local.pnc.live-promote": (
+        "runtime_script",
+        "scripts/hermes_live_promote.py",
+    ),
+    "local.pnc.hermes-cli": (
+        "runtime_executable",
+        "bin/hermes",
+    ),
 }
+
+PNC_PYTHON_LAUNCHD_LABELS = (
+    "local.pnc.completion-notice-relay",
+    "local.pnc.feishu-credential-health",
+    "local.pnc.feishu-delivery-repair",
+    "local.pnc.meegle-auth-watchdog",
+    "local.pnc.rca-delivery-collector",
+    "local.pnc.rca-delivery-dispatcher",
+    "local.pnc.rca-kafka-consumer",
+    "local.pnc.rca-outbox-dispatcher",
+    "local.pnc.task-dashboard.viewer",
+    "local.pnc.vm-task-sync",
+)
+
+PNC_RESIDENT_LABELS = (
+    "local.pnc.completion-notice-relay",
+    "local.pnc.rca-delivery-collector",
+    "local.pnc.rca-delivery-dispatcher",
+    "local.pnc.rca-kafka-consumer",
+    "local.pnc.rca-outbox-dispatcher",
+    "local.pnc.task-dashboard.viewer",
+)
 
 
 class LiveExecError(RuntimeError):
@@ -144,8 +248,8 @@ def _git_identity(runtime_root: Path) -> tuple[str, str]:
 def _resolve_once(
     *, manifest_path: Path, hermes_home: Path, service_label: str
 ) -> tuple[bytes, dict[str, str]]:
-    relative_script = SERVICE_SCRIPTS.get(service_label)
-    if relative_script is None:
+    target_spec = SERVICE_TARGETS.get(service_label)
+    if target_spec is None:
         raise LiveExecError("active_runtime_service_not_allowed")
 
     raw, manifest = _load_manifest(manifest_path)
@@ -207,13 +311,24 @@ def _resolve_once(
     if actual_tree != expected_tree:
         raise LiveExecError("active_runtime_tree_mismatch")
 
-    target = runtime_root / relative_script
+    target_kind, relative_target = target_spec
+    if target_kind == "runtime_script":
+        target = runtime_root / relative_target
+    elif target_kind == "runtime_executable":
+        target = runtime_venv / relative_target
+    elif target_kind == "runtime_file":
+        target = hermes_home / "runtime" / relative_target
+    elif target_kind == "governance_tool":
+        target = hermes_home / "runtime" / "governance-tools" / relative_target
+    else:
+        raise LiveExecError("active_runtime_service_target_invalid")
     try:
         target_raw = _read_owner_file(target, max_bytes=64 * 1024 * 1024)
     except LiveExecError as exc:
         raise LiveExecError("active_runtime_script_invalid") from exc
     return raw, {
         "service_label": service_label,
+        "target_kind": target_kind,
         "manifest_path": str(manifest_path),
         "manifest_sha256": hashlib.sha256(raw).hexdigest(),
         "runtime_root": str(runtime_root),
@@ -246,6 +361,7 @@ def _exec_environment(resolved: dict[str, str], hermes_home: Path) -> dict[str, 
     home = Path.home()
     stable_paths = (
         runtime_venv / "bin",
+        Path(resolved["runtime_root"]) / "node_modules" / ".bin",
         home / ".local" / "bin",
         home / "bin",
         Path("/opt/homebrew/bin"),
@@ -269,6 +385,7 @@ def _exec_environment(resolved: dict[str, str], hermes_home: Path) -> dict[str, 
         "PNC_LIVE_MANIFEST_SHA256": resolved["manifest_sha256"],
         "PNC_LIVE_RUNTIME_COMMIT": resolved["runtime_commit"],
         "PNC_LIVE_SERVICE_LABEL": resolved["service_label"],
+        "PYTHONPATH": resolved["runtime_root"],
         "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONNOUSERSITE": "1",
         "PYTHONUNBUFFERED": "1",
@@ -300,10 +417,14 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         os.chdir(resolved["runtime_root"])
         runtime_python = resolved["runtime_python"]
+        environment = _exec_environment(resolved, hermes_home)
+        if resolved["target_kind"] == "runtime_executable":
+            executable = resolved["script"]
+            os.execve(executable, [executable, *args.service_args], environment)
         os.execve(
             runtime_python,
             [runtime_python, resolved["script"], *args.service_args],
-            _exec_environment(resolved, hermes_home),
+            environment,
         )
     except LiveExecError as exc:
         print(

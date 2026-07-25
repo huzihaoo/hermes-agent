@@ -512,7 +512,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--state", required=True)
     parser.add_argument("--batch-id", required=True)
     parser.add_argument("--expected-runtime-commit", required=True)
-    parser.add_argument("--requester-id", default="operator-songying")
+    parser.add_argument("--requester-id", default="automation:rca-batch-rerun")
     parser.add_argument("--poll-seconds", type=int, default=5)
     parser.add_argument("--item-timeout-seconds", type=int, default=7200)
     parser.add_argument("--retry-failed", action="store_true")

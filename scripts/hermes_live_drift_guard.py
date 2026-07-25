@@ -22,7 +22,15 @@ OLD_WORKTREE_MARKERS = (
 )
 
 DYNAMIC_PNC_SERVICES = {
+    "local.pnc.completion-notice-relay": "pnc_completion_notice_relay.py",
+    "local.pnc.feishu-credential-health": "feishu_credential_cron.py",
     "local.pnc.feishu-delivery-repair": "pnc_feishu_delivery_guard.py",
+    "local.pnc.meegle-auth-watchdog": "pnc_meegle_auth_watchdog.py",
+    "local.pnc.rca-delivery-collector": "pnc_rca_delivery_collector.py",
+    "local.pnc.rca-delivery-dispatcher": "pnc_rca_delivery_dispatcher.py",
+    "local.pnc.rca-kafka-consumer": "pnc_rca_kafka_consumer.py",
+    "local.pnc.rca-outbox-dispatcher": "pnc_rca_outbox_dispatcher.py",
+    "local.pnc.task-dashboard.viewer": "restricted_task_dashboard_proxy.py",
     "local.pnc.vm-task-sync": "pnc_vm_task_sync.py",
 }
 FORBIDDEN_PNC_RUNTIME_MARKERS = (

@@ -3,12 +3,18 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>local.pnc.rca-delivery-collector</string>
+  <string>local.pnc.task-dashboard.viewer</string>
   <key>ProgramArguments</key>
   <array>
     <string>/usr/bin/python3</string>
     <string>/Users/songying/.hermes/runtime/governance-tools/pnc_live_exec.py</string>
-    <string>local.pnc.rca-delivery-collector</string>
+    <string>local.pnc.task-dashboard.viewer</string>
+    <string>--host</string>
+    <string>0.0.0.0</string>
+    <string>--port</string>
+    <string>9125</string>
+    <string>--profile</string>
+    <string>viewer</string>
   </array>
   <key>WorkingDirectory</key>
   <string>/Users/songying/.hermes/runtime</string>
@@ -18,35 +24,26 @@
     <string>/Users/songying</string>
     <key>HERMES_HOME</key>
     <string>/Users/songying/.hermes</string>
-    <key>HERMES_RCA_DELIVERY_QUARANTINE_BASELINE_SHA256</key>
-    <string>04db01355ab86ed1b739c00cc3f530ddef832f42df8b12772fb9e67e2ecf1ac2</string>
     <key>PATH</key>
-    <string>/Users/songying/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-    <key>PNC_FOXGLOVE_RENDER_HOST</key>
-    <string>http://192.168.26.174:18081</string>
-    <key>PYTHONUNBUFFERED</key>
-    <string>1</string>
+    <string>/Users/songying/.local/bin:/Users/songying/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PNC_TASK_DASHBOARD_UPSTREAM_HOST</key>
+    <string>127.0.0.1</string>
+    <key>PNC_TASK_DASHBOARD_UPSTREAM_PORT</key>
+    <string>9121</string>
     <key>PYTHONNOUSERSITE</key>
     <string>1</string>
     <key>PYTHONDONTWRITEBYTECODE</key>
+    <string>1</string>
+    <key>PYTHONUNBUFFERED</key>
     <string>1</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
-  <dict>
-    <key>SuccessfulExit</key>
-    <false/>
-  </dict>
-  <key>ThrottleInterval</key>
-  <integer>10</integer>
-  <key>ExitTimeOut</key>
-  <integer>30</integer>
-  <key>Umask</key>
-  <integer>63</integer>
+  <true/>
   <key>StandardOutPath</key>
-  <string>/Users/songying/.hermes/logs/pnc-rca-delivery-collector.log</string>
+  <string>/Users/songying/.hermes/logs/pnc-task-dashboard-viewer.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/songying/.hermes/logs/pnc-rca-delivery-collector.error.log</string>
+  <string>/Users/songying/.hermes/logs/pnc-task-dashboard-viewer.error.log</string>
 </dict>
 </plist>
