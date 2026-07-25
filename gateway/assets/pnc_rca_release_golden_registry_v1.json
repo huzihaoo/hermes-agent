@@ -1,14 +1,14 @@
 {
   "schema_version": "pnc_rca_release_golden_registry_v1",
-  "pipeline_commit": "20ea44bdfaa862b2a366c33bc90552f1fcb13557",
-  "pipeline_tree": "5d009bc14e197694bc5f03af16c8c5e9ff60af37",
+  "pipeline_commit": "d94bddf886c864a25adf341d89ef17102e903c19",
+  "pipeline_tree": "95b53a350eb6d30a857eaaf3d77d3315c0ec2722",
   "low_tier_suite": {
-    "status": "failing",
+    "status": "passed",
     "positive_case_count": 1,
     "negative_case_count": 4,
-    "receipt_sha256": "84565d5f3bb93578d0d7ab3f65ca4fce9a3d967a70230f13bd821a4d7be749af",
-    "vm_path": "/mnt/tmp/20260725-rca-ga-w1-golden/pytest.out",
-    "user_visible_path": "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/20260725-rca-ga-w1-golden/"
+    "receipt_sha256": "612cd2d8b69a946b29398fb5f76b317ce9f34d37da65e6ab1c6bbbac385d14f9",
+    "vm_path": "/mnt/tmp/20260725-rca-ga-phasea-pipeline/final-golden-run-v2/stdout.log",
+    "user_visible_path": "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/20260725-rca-ga-phasea-pipeline/"
   },
   "evaluators": []
 }
