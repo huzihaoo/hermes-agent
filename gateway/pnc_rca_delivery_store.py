@@ -3091,6 +3091,91 @@ class RcaDeliveryStore:
         finally:
             conn.close()
 
+    def suppress_effect_for_quality_regression(
+        self,
+        *,
+        claim: DeliveryEffectClaim,
+        error_code: str,
+        error_detail: str,
+        receipt: dict[str, Any],
+        now: datetime | None = None,
+    ) -> DeliveryEffectMutation:
+        """Settle a pre-write effect that would degrade an existing RCA result.
+
+        This is deliberately a separate terminal state from ``succeeded``: no
+        Feishu write happened, so the delivery cannot be represented as an
+        acknowledged external update.  The suppressed effect remains visible in
+        the attempt/effect receipt for operators while the already-published
+        higher-quality result stays authoritative.
+        """
+        current = _iso(now)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = self._current_effect_claim(
+                conn,
+                effect_key=claim.effect_key,
+                lease_token=claim.lease_token,
+                fence=claim.fence,
+                current=current,
+            )
+            if str(row["write_phase"] or "") != "prewrite":
+                raise DeliveryRecordConflictError(
+                    "quality regression guard crossed the remote-write boundary"
+                )
+            self._append_attempt_event(
+                conn,
+                effect_key=claim.effect_key,
+                attempt_no=claim.attempt,
+                fence=claim.fence,
+                request_id=claim.request_id,
+                outcome="reconciled",
+                current=current,
+                error_code=error_code,
+                detail=error_detail,
+            )
+            updated = conn.execute(
+                """
+                UPDATE rca_delivery_effects
+                   SET status = 'suppressed', write_phase = 'settled',
+                       next_attempt_at = NULL, remote_receipt_json = ?,
+                       completed_at = ?, last_error_code = ?,
+                       last_error_detail = ?, lease_token = NULL,
+                       lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+                 WHERE effect_key = ? AND lease_token = ? AND fence = ?
+                   AND status = 'claimed' AND write_phase = 'prewrite'
+                """,
+                (
+                    _canonical_json(receipt),
+                    current,
+                    str(error_code or "")[:120],
+                    str(error_detail or "")[:1000],
+                    current,
+                    claim.effect_key,
+                    claim.lease_token,
+                    claim.fence,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise StaleDeliveryEffectLeaseError(
+                    f"stale quality-regression effect claim for {claim.effect_key}"
+                )
+            job_status = self._aggregate_job_status(
+                conn, str(row["delivery_id"]), current
+            )
+            conn.commit()
+            return DeliveryEffectMutation(
+                claim.effect_key,
+                claim.delivery_id,
+                "suppressed",
+                job_status,
+            )
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def record_effect_reconciliation_miss(
         self,
         *,

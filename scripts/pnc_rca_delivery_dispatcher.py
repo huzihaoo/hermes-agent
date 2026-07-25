@@ -2074,6 +2074,46 @@ def _field_updates_match(
     return all(fields.get(key) == value for key, value in updates)
 
 
+_NON_CAUSAL_RESULT_MARKERS = (
+    "暂无法判断",
+    "自动RCA未归因",
+    "自动 RCA 未归因",
+    "未形成归因",
+    "未生成可确认",
+    "无法形成确认归因",
+    "事件在当前生产数据源中不存在",
+    "问题数据事件在当前生产数据源中不存在",
+    "无法建立可确认的因果链",
+    "问题现象描述不足",
+    "当前问题域暂不在",
+    "证据不足以",
+)
+
+
+def _is_causal_result(value: str) -> bool:
+    """Return whether a published result contains a concrete responsibility."""
+    text = str(value or "").strip()
+    if not text or any(marker in text for marker in _NON_CAUSAL_RESULT_MARKERS):
+        return False
+    for line in text.splitlines():
+        if not line.startswith("责任模块："):
+            continue
+        responsibility = line.split("：", 1)[1].strip().rstrip("。")
+        return bool(responsibility and responsibility not in {"暂无法判断", "未知"})
+    return False
+
+
+def _quality_regression_guard(
+    before_fields: Mapping[str, str],
+    updates: tuple[tuple[str, str], ...],
+) -> bool:
+    """Whether this issue-field update would replace a causal result with a non-causal one."""
+    update_map = dict(updates)
+    existing = str(before_fields.get(RCA_RESULT_FIELD_KEY) or "")
+    proposed = str(update_map.get(RCA_RESULT_FIELD_KEY) or "")
+    return _is_causal_result(existing) and not _is_causal_result(proposed)
+
+
 def _marker_matches(
     comments: list[dict[str, str]], marker: str
 ) -> list[dict[str, str]]:
@@ -2610,6 +2650,51 @@ class DeliveryDispatcher:
             remote_id=remote_id,
         )
 
+    def _suppress_quality_regression(
+        self,
+        claim: DeliveryEffectClaim,
+        before_fields: Mapping[str, str],
+        validated: ValidatedEffect,
+    ) -> DispatchOutcome:
+        error_code = "delivery_result_quality_regression_prevented"
+        detail = (
+            "existing Feishu RCA result has a concrete responsibility; proposed "
+            "result is non-causal, so fields and comment were left unchanged"
+        )
+        self._settle_claim(
+            claim,
+            lambda: self.store.suppress_effect_for_quality_regression(
+                claim=claim,
+                error_code=error_code,
+                error_detail=detail,
+                receipt={
+                    "source": error_code,
+                    "existing_result_sha256": hashlib.sha256(
+                        str(before_fields.get(RCA_RESULT_FIELD_KEY) or "")
+                        .encode("utf-8")
+                    ).hexdigest(),
+                    "proposed_result_sha256": hashlib.sha256(
+                        dict(validated.field_updates)
+                        .get(RCA_RESULT_FIELD_KEY, "")
+                        .encode("utf-8")
+                    ).hexdigest(),
+                    "preserved_field_keys": [
+                        RCA_RESULT_FIELD_KEY,
+                        RCA_REPORT_FIELD_KEY,
+                    ],
+                },
+                now=self.now(),
+            ),
+        )
+        self.stats.reconciled += 1
+        return DispatchOutcome(
+            status="superseded",
+            effect_key=claim.effect_key,
+            delivery_id=claim.delivery_id,
+            attempt=claim.attempt,
+            error_code=error_code,
+        )
+
     def _dispatch_claim(self, claim: DeliveryEffectClaim) -> DispatchOutcome:
         prior_write_uncertain = claim.previous_status == "uncertain"
         self._heartbeat(claim)
@@ -2683,6 +2768,13 @@ class DeliveryDispatcher:
                 before_field_result["outcome_uncertain"] = True
             return self._boundary_failure(
                 claim, before_field_result, uncertain_default=False
+            )
+        if (
+            claim.effect_kind == DELIVERY_EFFECT_KIND
+            and _quality_regression_guard(before_fields, validated.field_updates)
+        ):
+            return self._suppress_quality_regression(
+                claim, before_fields, validated
             )
         fields_match = _field_updates_match(
             before_fields, validated.field_updates

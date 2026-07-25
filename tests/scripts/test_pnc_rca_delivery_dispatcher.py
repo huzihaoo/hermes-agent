@@ -697,6 +697,72 @@ def test_success_requires_read_before_http_add_and_read_after_remote_id(tmp_path
     ).hexdigest()
 
 
+def test_quality_regression_guard_preserves_existing_causal_result(tmp_path):
+    store = _seed_terminal(tmp_path)
+    dispatcher, remote, _clock = _dispatcher(tmp_path)
+    existing_result = (
+        "归因结论：ACC 异常退出判据命中。\n"
+        "责任模块：ACC 功能链\n"
+        "因果关系：状态机抑制标志异常导致 ACC 退出。\n"
+        "关键证据：退出判据与抑制标志在同一时间窗内命中。"
+    )
+    existing_report = "https://viewer.internal/G1Q3_RCA/cases/previous/index.html"
+    remote.fields.update(
+        {
+            "field_9193cb": existing_result,
+            "field_8c912e": existing_report,
+        }
+    )
+
+    outcome = dispatcher.dispatch_one()
+
+    assert outcome.status == "superseded"
+    assert outcome.error_code == "delivery_result_quality_regression_prevented"
+    assert remote.add_calls == 0
+    assert remote.update_field_calls == 0
+    assert remote.fields["field_9193cb"] == existing_result
+    assert remote.fields["field_8c912e"] == existing_report
+    effect = store.list_rows("rca_delivery_effects")[0]
+    assert effect["status"] == "suppressed"
+    assert effect["write_phase"] == "settled"
+    assert effect["last_error_code"] == (
+        "delivery_result_quality_regression_prevented"
+    )
+    receipt = json.loads(effect["remote_receipt_json"])
+    assert receipt["source"] == "delivery_result_quality_regression_prevented"
+    assert receipt["preserved_field_keys"] == ["field_9193cb", "field_8c912e"]
+    assert store.list_rows("rca_delivery_jobs")[0]["status"] == "partial"
+
+
+@pytest.mark.parametrize(
+    ("existing", "proposed", "guarded"),
+    [
+        (
+            "归因结论：ACC 退出。\n责任模块：ACC 功能链",
+            "自动RCA未归因：事件在当前生产数据源中不存在。",
+            True,
+        ),
+        (
+            "",
+            "自动RCA未归因：事件在当前生产数据源中不存在。",
+            False,
+        ),
+        (
+            "归因结论：ACC 退出。\n责任模块：ACC 功能链",
+            "归因结论：ACC 状态机退出。\n责任模块：ACC 功能链",
+            False,
+        ),
+    ],
+)
+def test_quality_regression_guard_only_blocks_causal_to_noncausal(
+    existing, proposed, guarded
+):
+    assert dispatcher_module._quality_regression_guard(
+        {"field_9193cb": existing},
+        (("field_9193cb", proposed),),
+    ) is guarded
+
+
 def test_html_only_causal_result_is_delivered_without_foxglove_surface(tmp_path):
     store = _seed(tmp_path, bundle_payload=_html_only_bundle_payload())
     dispatcher, remote, _clock = _dispatcher(tmp_path)
