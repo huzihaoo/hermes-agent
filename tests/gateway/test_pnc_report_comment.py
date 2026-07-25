@@ -37,23 +37,26 @@ def _record_only_env(tmp_path: Path, monkeypatch):
     return root
 
 
-def test_build_report_comment_contains_rca_and_html():
+def test_build_report_comment_contains_compact_causal_result():
     plan = build_report_comment(
         work_item_id="7017699515",
         title="AWB 误触发",
         rca_status={
-            "report_status": "html_delivery_ready",
-            "attribution_status": "hypothesis_ready",
             "candidate_cause": "TTC/gate 风险上下文不足",
             "candidate_responsibility": "刘培瑞",
-            "html_link": "https://project.feishu.cn/goapi/v5/platform/file/stream/download/token701",
+            "causal_chain": "目标风险证据不足，无法确认触发条件。",
+            "evidence": "TTC/gate 关键字段缺少有效值。",
         },
         boundaries=["需人工复核"],
     )
     assert "G1Q3 RCA 报告已生成" in plan["signature"]
     assert "7017699515" in plan["content"]
-    assert "hypothesis_ready" in plan["content"]
-    assert "https://project.feishu.cn/goapi/v5/platform/file/stream/download/token701" in plan["content"]
+    assert "归因结论：TTC/gate 风险上下文不足" in plan["content"]
+    assert "责任模块：刘培瑞" in plan["content"]
+    assert "因果关系：目标风险证据不足" in plan["content"]
+    assert "关键证据：TTC/gate 关键字段缺少有效值" in plan["content"]
+    assert "报告状态：" not in plan["content"]
+    assert "HTML 报告：" not in plan["content"]
 
 
 def test_disabled_is_plan_only(tmp_path, monkeypatch):

@@ -77,24 +77,17 @@ def build_report_comment(*, work_item_id: str, title: str = "", rca_status: dict
     attribution = str(status.get("attribution_status") or "").strip()
     cause = str(status.get("candidate_cause") or "").strip()
     responsibility = str(status.get("candidate_responsibility") or "").strip()
-    html = str(status.get("html_link") or "").strip()
-    if report_status:
-        lines.append(f"报告状态：{report_status}")
-    if attribution:
-        lines.append(f"归因状态：{attribution}")
+    causal_chain = str(status.get("causal_chain") or cause).strip()
+    evidence = str(status.get("evidence") or "").strip()
     if cause:
-        lines.append(f"候选原因：{cause}")
+        lines.append(f"归因结论：{cause}")
     if responsibility:
-        lines.append(f"责任候选：{responsibility}")
-    if html:
-        lines.append(f"HTML 报告：{html}")
+        lines.append(f"责任模块：{responsibility}")
+    if causal_chain:
+        lines.append(f"因果关系：{causal_chain}")
     clean_boundaries = [str(item).strip() for item in (boundaries or []) if str(item).strip()]
-    if clean_boundaries:
-        lines.append("证据边界：" + "；".join(clean_boundaries[:3]))
-    lines.extend([
-        "",
-        "说明：以上为自动 RCA 候选结论，需人工复核确认后再结案。",
-    ])
+    evidence = evidence or ("；".join(clean_boundaries[:3]) if clean_boundaries else "未提供可核验的关键证据。")
+    lines.append(f"关键证据：{evidence}")
     return {"signature": SIGNATURE_SENTENCE, "content": "\n".join(lines)}
 
 
