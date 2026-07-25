@@ -123,6 +123,65 @@ _FAILURE_ROUTE_REQUIRED_COLUMNS = frozenset({
     "created_at",
     "updated_at",
 })
+_FAILURE_ROUTE_TABLE_INFO_CONTRACT = (
+    ("route_key", "TEXT", 0, None, 1),
+    ("dedupe_key", "TEXT", 1, None, 0),
+    ("submission_key", "TEXT", 1, None, 0),
+    ("business_key", "TEXT", 1, None, 0),
+    ("generation", "INTEGER", 1, None, 0),
+    ("task_id", "TEXT", 1, None, 0),
+    ("terminal_error_code", "TEXT", 1, None, 0),
+    ("lane", "TEXT", 1, None, 0),
+    ("route_kind", "TEXT", 1, None, 0),
+    ("owner", "TEXT", 1, None, 0),
+    ("status", "TEXT", 1, None, 0),
+    ("work_started_at", "TEXT", 1, None, 0),
+    ("deadline_at", "TEXT", 1, None, 0),
+    ("first_observed_at", "TEXT", 1, None, 0),
+    ("last_observed_at", "TEXT", 1, None, 0),
+    ("remediation_attempt_count", "INTEGER", 1, "0", 0),
+    ("observation_count", "INTEGER", 1, "1", 0),
+    ("retry_count", "INTEGER", 1, "0", 0),
+    ("remediation_attempted_at", "TEXT", 0, None, 0),
+    ("remediation_result_json", "TEXT", 1, "'{}'", 0),
+    ("next_retry_at", "TEXT", 0, None, 0),
+    ("retry_exhausted", "INTEGER", 1, "0", 0),
+    ("audit_json", "TEXT", 1, None, 0),
+    ("route_payload_json", "TEXT", 1, None, 0),
+    ("completed_at", "TEXT", 0, None, 0),
+    ("created_at", "TEXT", 1, None, 0),
+    ("updated_at", "TEXT", 1, None, 0),
+)
+_FAILURE_ROUTE_INDEX_CONTRACT = frozenset(
+    {
+        ("idx_failure_routes_submission", 0, "c", 0, ("submission_key", "created_at")),
+        ("idx_failure_routes_status", 0, "c", 0, ("status", "owner", "deadline_at")),
+        (None, 1, "u", 0, ("dedupe_key",)),
+        (None, 1, "pk", 0, ("route_key",)),
+    }
+)
+_FAILURE_ROUTE_FOREIGN_KEY_CONTRACT = (
+    (
+        "rca_execution_watch",
+        "submission_key",
+        "submission_key",
+        "NO ACTION",
+        "NO ACTION",
+        "NONE",
+    ),
+)
+_FAILURE_ROUTE_REQUIRED_CHECKS = frozenset(
+    {
+        "check(generation>=1)",
+        "check(lanein('infra_self_healable','needs_human_input','hard_defect'))",
+        "check(route_kindin('infra_remediation_hold','internal_backlog','internal_alert'))",
+        "check(statusin('remediation_pending','remediation_started','remediation_succeeded','remediation_held','backlog_pending','alert_pending','terminal_fallback','resolved'))",
+        "check(remediation_attempt_countbetween0and1)",
+        "check(observation_count>=1)",
+        "check(retry_count>=0)",
+        "check(retry_exhaustedin(0,1))",
+    }
+)
 WATCH_ACTIVE_STATES = frozenset({"pending", "running"})
 WATCH_TERMINAL_STATES = frozenset({
     "terminal_failed",
@@ -801,28 +860,158 @@ class RcaDeliveryStore:
 
     @staticmethod
     def _validate_failure_route_schema(conn: sqlite3.Connection) -> None:
-        columns = {
-            str(row[1]) for row in conn.execute("PRAGMA table_info(rca_failure_routes)")
-        }
+        table_info = list(conn.execute("PRAGMA table_info(rca_failure_routes)"))
+        columns = {str(row[1]) for row in table_info}
         if not _FAILURE_ROUTE_REQUIRED_COLUMNS.issubset(columns):
             raise RuntimeError("incompatible_delivery_store_schema:failure_routes")
-        dedupe_unique = False
+        observed_table_info = tuple(
+            (
+                str(row[1]),
+                str(row[2]).upper(),
+                int(row[3]),
+                row[4],
+                int(row[5]),
+            )
+            for row in table_info
+        )
+        if observed_table_info != _FAILURE_ROUTE_TABLE_INFO_CONTRACT:
+            raise RuntimeError(
+                "incompatible_delivery_store_schema:failure_routes_contract"
+            )
+        observed_indexes: set[tuple[Any, ...]] = set()
         for index in conn.execute("PRAGMA index_list(rca_failure_routes)"):
-            if int(index[2]) != 1:
-                continue
-            indexed_columns = [
+            origin = str(index[3])
+            indexed_columns = tuple(
                 str(row[0])
                 for row in conn.execute(
                     "SELECT name FROM pragma_index_info(?) ORDER BY seqno",
                     (str(index[1]),),
                 )
-            ]
-            if indexed_columns == ["dedupe_key"]:
-                dedupe_unique = True
-                break
-        if not dedupe_unique:
+            )
+            observed_indexes.add(
+                (
+                    str(index[1]) if origin == "c" else None,
+                    int(index[2]),
+                    origin,
+                    int(index[4]),
+                    indexed_columns,
+                )
+            )
+        if observed_indexes != _FAILURE_ROUTE_INDEX_CONTRACT:
             raise RuntimeError(
-                "incompatible_delivery_store_schema:failure_routes_dedupe"
+                "incompatible_delivery_store_schema:failure_routes_contract"
+            )
+        observed_foreign_keys = tuple(
+            (
+                str(row[2]),
+                str(row[3]),
+                str(row[4]),
+                str(row[5]).upper(),
+                str(row[6]).upper(),
+                str(row[7]).upper(),
+            )
+            for row in conn.execute("PRAGMA foreign_key_list(rca_failure_routes)")
+        )
+        schema_row = conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'rca_failure_routes'"
+        ).fetchone()
+        normalized_sql = "".join(
+            str(schema_row[0] if schema_row else "").split()
+        ).lower()
+        if (
+            observed_foreign_keys != _FAILURE_ROUTE_FOREIGN_KEY_CONTRACT
+            or normalized_sql.count("check(") != len(_FAILURE_ROUTE_REQUIRED_CHECKS)
+            or not all(
+                required in normalized_sql
+                for required in _FAILURE_ROUTE_REQUIRED_CHECKS
+            )
+        ):
+            raise RuntimeError(
+                "incompatible_delivery_store_schema:failure_routes_contract"
+            )
+
+    @staticmethod
+    def _validate_v9_predecessor_variant(
+        conn: sqlite3.Connection,
+        *,
+        schema_version: str,
+    ) -> None:
+        tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        effect_columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(rca_delivery_effects)")
+        }
+        attempt_columns = {
+            "adjudication_comment_attempt_count",
+            "adjudication_comment_attempted_at",
+        }
+        adjudication_table = "rca_conclusion_adjudications"
+        repair_table = "rca_conclusion_adjudication_repairs"
+        failure_table = "rca_failure_routes"
+        if schema_version == DELIVERY_STORE_SCHEMA_PREDECESSOR_VERSION:
+            if (
+                {adjudication_table, repair_table, failure_table} & tables
+                or attempt_columns & effect_columns
+            ):
+                raise RuntimeError(
+                    "incompatible_delivery_store_schema:"
+                    "pre_v9_source_variant_operator_remediation"
+                )
+            return
+        if schema_version != DELIVERY_STORE_W2_SCHEMA_VERSION:
+            return
+        if repair_table in tables:
+            repair_columns = {
+                str(row[1])
+                for row in conn.execute(
+                    "PRAGMA table_info(rca_conclusion_adjudication_repairs)"
+                )
+            }
+            if "status" in repair_columns and conn.execute(
+                "SELECT 1 FROM rca_conclusion_adjudication_repairs "
+                "WHERE status = 'succeeded' LIMIT 1"
+            ).fetchone() is not None:
+                raise RuntimeError(
+                    "incompatible_delivery_store_schema:"
+                    "legacy_adjudication_receipt_operator_remediation"
+                )
+            raise RuntimeError(
+                "incompatible_delivery_store_schema:"
+                "pre_v9_source_variant_operator_remediation"
+            )
+        if (
+            adjudication_table not in tables
+            or failure_table not in tables
+            or attempt_columns & effect_columns
+        ):
+            raise RuntimeError(
+                "incompatible_delivery_store_schema:"
+                "pre_v9_source_variant_operator_remediation"
+            )
+        adjudication_columns = {
+            str(row[1])
+            for row in conn.execute(
+                "PRAGMA table_info(rca_conclusion_adjudications)"
+            )
+        }
+        if "activation_epoch_id" not in adjudication_columns:
+            raise RuntimeError(
+                "incompatible_delivery_store_schema:"
+                "pre_v9_source_variant_operator_remediation"
+            )
+        if conn.execute(
+            "SELECT 1 FROM rca_conclusion_adjudications "
+            "WHERE TRIM(activation_epoch_id) = '' LIMIT 1"
+        ).fetchone() is not None:
+            raise RuntimeError(
+                "incompatible_delivery_store_schema:"
+                "legacy_adjudication_activation_operator_remediation"
             )
 
     def _initialize(self) -> None:
@@ -1117,6 +1306,10 @@ class RcaDeliveryStore:
             conn.execute("PRAGMA foreign_keys=OFF")
             conn.execute("PRAGMA legacy_alter_table=ON")
         conn.execute("BEGIN IMMEDIATE")
+        RcaDeliveryStore._validate_v9_predecessor_variant(
+            conn,
+            schema_version=initial_schema_version,
+        )
         watch_columns = {
             str(row["name"])
             for row in conn.execute("PRAGMA table_info(rca_execution_watch)")

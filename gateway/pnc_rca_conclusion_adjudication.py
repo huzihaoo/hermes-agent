@@ -435,16 +435,14 @@ def ensure_conclusion_adjudication_schema(conn: sqlite3.Connection) -> None:
                 "ALTER TABLE rca_conclusion_adjudication_repairs "
                 f"ADD COLUMN {name} {definition}"
             )
-    current = datetime.now(timezone.utc).isoformat()
     conn.execute(
         """
         INSERT OR IGNORE INTO rca_conclusion_adjudication_repairs(
             adjudication_id, status, created_at, updated_at
         )
-        SELECT adjudication_id, 'pending', created_at, ?
+        SELECT adjudication_id, 'pending', created_at, created_at
           FROM rca_conclusion_adjudications
-        """,
-        (current,),
+        """
     )
 
 

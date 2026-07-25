@@ -526,7 +526,17 @@ def test_v7_marker_requires_explicit_v9_migration(tmp_path):
             "UPDATE rca_delivery_meta SET value = 'pnc_rca_delivery_store_v7' "
             "WHERE key = 'schema_version'"
         )
-        conn.execute("DROP TABLE rca_conclusion_adjudication_repairs")
+        conn.executescript(
+            """
+            DROP TABLE rca_conclusion_adjudication_repairs;
+            DROP TABLE rca_conclusion_adjudications;
+            DROP TABLE rca_failure_routes;
+            ALTER TABLE rca_delivery_effects
+                DROP COLUMN adjudication_comment_attempted_at;
+            ALTER TABLE rca_delivery_effects
+                DROP COLUMN adjudication_comment_attempt_count;
+            """
+        )
 
     with pytest.raises(RuntimeError, match="rca_delivery_store_schema_not_current"):
         RcaDeliveryStore(store.db_path, require_current=True)
@@ -613,7 +623,6 @@ def test_w2_v8_migrates_explicitly_to_combined_v9_schema(tmp_path):
         conn.executescript(
             """
             DROP TABLE rca_conclusion_adjudication_repairs;
-            DROP TABLE rca_conclusion_adjudications;
             ALTER TABLE rca_delivery_effects
                 DROP COLUMN adjudication_comment_attempted_at;
             ALTER TABLE rca_delivery_effects
@@ -659,7 +668,6 @@ def test_predecessor_schema_and_marker_rollback_together_on_w16_fault(
         conn.executescript(
             """
             DROP TABLE rca_conclusion_adjudication_repairs;
-            DROP TABLE rca_conclusion_adjudications;
             ALTER TABLE rca_delivery_effects
                 DROP COLUMN adjudication_comment_attempted_at;
             ALTER TABLE rca_delivery_effects
@@ -667,6 +675,7 @@ def test_predecessor_schema_and_marker_rollback_together_on_w16_fault(
             """
         )
         if source_version == "pnc_rca_delivery_store_v7":
+            conn.execute("DROP TABLE rca_conclusion_adjudications")
             conn.execute("DROP TABLE rca_failure_routes")
         conn.execute(
             "UPDATE rca_delivery_meta SET value = ? WHERE key = 'schema_version'",

@@ -21,11 +21,14 @@ from gateway.pnc_rca_delivery_quarantine_baseline import (
 )
 from gateway.pnc_rca_delivery_quarantine_migration import (
     QuarantineMigrationError,
+    assert_combined_live_post_migration_matches,
+    assert_combined_live_pre_migration_matches,
     assert_live_post_migration_matches,
     assert_live_pre_migration_matches,
     build_combined_offline_migration_receipt,
     build_offline_migration_receipt,
     canonical_migration_receipt_bytes,
+    logical_database_projection,
     validate_combined_migration_receipt,
 )
 from gateway.pnc_rca_delivery_store import RcaDeliveryStore
@@ -222,7 +225,12 @@ def _prepare_offline_migration(store: RcaDeliveryStore, root: Path) -> dict:
     }
 
 
-def _prepare_combined_schema_migration(root: Path, source_version: str) -> dict:
+def _prepare_combined_schema_migration(
+    root: Path,
+    source_version: str,
+    *,
+    seed_w2_adjudication: bool = False,
+) -> dict:
     root.mkdir(parents=True, exist_ok=True)
     live_path = root / "live-control.sqlite3"
     RcaDeliveryStore(live_path)
@@ -230,7 +238,6 @@ def _prepare_combined_schema_migration(root: Path, source_version: str) -> dict:
         conn.executescript(
             """
             DROP TABLE rca_conclusion_adjudication_repairs;
-            DROP TABLE rca_conclusion_adjudications;
             ALTER TABLE rca_delivery_effects
                 DROP COLUMN adjudication_comment_attempted_at;
             ALTER TABLE rca_delivery_effects
@@ -238,11 +245,85 @@ def _prepare_combined_schema_migration(root: Path, source_version: str) -> dict:
             """
         )
         if source_version == "pnc_rca_delivery_store_v7":
+            conn.execute("DROP TABLE rca_conclusion_adjudications")
             conn.execute("DROP TABLE rca_failure_routes")
         conn.execute(
             "UPDATE rca_delivery_meta SET value = ? WHERE key = 'schema_version'",
             (source_version,),
         )
+        if seed_w2_adjudication:
+            assert source_version == "pnc_rca_delivery_store_v8"
+            created_at = "2026-07-25T11:30:00+00:00"
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS rca_outbox("
+                "outbox_id INTEGER PRIMARY KEY)"
+            )
+            conn.execute("INSERT INTO rca_outbox(outbox_id) VALUES(1)")
+            conn.execute(
+                """
+                INSERT INTO rca_execution_watch(
+                    submission_key, submission_outbox_id, business_key,
+                    generation, project_key, work_item_type_key, work_item_id,
+                    task_id, state, next_poll_at, created_at, updated_at
+                ) VALUES (
+                    'w2-submission', 1, 'w2-business', 1, 'project', 'issue',
+                    '123', 'w2-task', 'delivery_created', ?, ?, ?
+                )
+                """,
+                (created_at, created_at, created_at),
+            )
+            conn.execute(
+                """
+                INSERT INTO rca_delivery_jobs(
+                    delivery_id, submission_key, business_key, generation,
+                    artifact_set_id, project_key, work_item_type_key,
+                    work_item_id, target_key, issue_url, report_url, status,
+                    manifest_json, contract_json, artifacts_json,
+                    created_at, updated_at
+                ) VALUES (
+                    'w2-delivery', 'w2-submission', 'w2-business', 1,
+                    'w2-artifacts', 'project', 'issue', '123', 'w2-target',
+                    'https://issue/123', 'https://report/123', 'delivered',
+                    '{}', '{}', '[]', ?, ?
+                )
+                """,
+                (created_at, created_at),
+            )
+            conn.executemany(
+                """
+                INSERT INTO rca_delivery_effects(
+                    effect_key, delivery_id, effect_kind, required, target_key,
+                    payload_json, payload_sha256, status, created_at, updated_at
+                ) VALUES (?, 'w2-delivery', 'feishu_issue_comment', 1, ?,
+                          '{}', ?, 'succeeded', ?, ?)
+                """,
+                (
+                    ("w2-original", "w2-original-target", "b" * 64, created_at, created_at),
+                    ("w2-correction", "w2-correction-target", "c" * 64, created_at, created_at),
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO rca_conclusion_adjudications(
+                    adjudication_id, schema_version, business_key, generation,
+                    project_key, work_item_type_key, work_item_id, action,
+                    conclusion_state, reason, replacement_conclusion, actor_id,
+                    actor_name, source_json, original_delivery_id,
+                    original_effect_key, correction_effect_key,
+                    activation_epoch_id, evaluator_refs_json,
+                    responsibility_domain, impact_window_start,
+                    impact_window_end, lineage_json, lineage_sha256, created_at
+                ) VALUES (
+                    'w2-adjudication', 'pnc_rca_conclusion_adjudication_v1',
+                    'w2-business', 1, 'project', 'issue', '123', 'retract',
+                    'invalidated', 'verified legacy row', '', 'owner', '', '{}',
+                    'w2-delivery', 'w2-original', 'w2-correction',
+                    'epoch-safe', '["evaluator"]', 'unknown', ?, ?, '{}', ?, ?
+                )
+                """,
+                (created_at, created_at, "d" * 64, created_at),
+            )
+    live_path.chmod(0o600)
     source_backup = root / f"control.{source_version.rsplit('_', 1)[-1]}.backup.sqlite3"
     source = sqlite3.connect(live_path)
     destination = sqlite3.connect(source_backup)
@@ -308,6 +389,388 @@ def test_combined_v2_offline_receipt_requires_quick_checked_copy_and_rollback(
         migration["source_backup"].read_bytes()
     ).hexdigest()
     assert binding["no_live_database_writes"] is True
+    preservation = migration["receipt"]["cross_projection_preservation"]
+    assert preservation["policy"] == "all_source_owned_rows_exact_v1"
+    assert preservation["deterministic_transforms"][0] == {
+        "rule": "replace_exact_schema_version_marker_v1",
+        "table": "rca_delivery_meta",
+        "selector": {"key": "schema_version"},
+        "column": "value",
+        "source_value": source_version,
+        "target_value": "pnc_rca_delivery_store_v9",
+    }
+    expected_variant = (
+        "active_prod_v7_no_adjudication_v1"
+        if source_version == "pnc_rca_delivery_store_v7"
+        else "w2_v8_failure_routes_adjudication_v1"
+    )
+    assert migration["receipt"]["source_schema_variant"] == expected_variant
+    if source_version == "pnc_rca_delivery_store_v8":
+        assert preservation["deterministic_transforms"][1]["rule"] == (
+            "backfill_pending_repairs_from_adjudication_created_at_v1"
+        )
+    assert preservation["source_owned_tables"]["rca_delivery_effects"][
+        "added_target_columns"
+    ] == [
+        {
+            "name": "adjudication_comment_attempt_count",
+            "existing_row_value": 0,
+        },
+        {
+            "name": "adjudication_comment_attempted_at",
+            "existing_row_value": None,
+        },
+    ]
+
+
+def test_combined_v2_w2_repair_backfill_is_deterministic_and_receipted(tmp_path):
+    migration = _prepare_combined_schema_migration(
+        tmp_path,
+        "pnc_rca_delivery_store_v8",
+        seed_w2_adjudication=True,
+    )
+
+    preservation = migration["receipt"]["cross_projection_preservation"]
+    repairs = preservation["added_target_tables"][
+        "rca_conclusion_adjudication_repairs"
+    ]
+    assert repairs["expected_row_count"] == 1
+    assert repairs["observed_row_count"] == 1
+    assert repairs["expected_rows_sha256"] == repairs["observed_rows_sha256"]
+    with sqlite3.connect(migration["clone_path"]) as conn:
+        repair = conn.execute(
+            "SELECT adjudication_id, status, attempt_count, created_at, "
+            "updated_at, receipt_path FROM rca_conclusion_adjudication_repairs"
+        ).fetchone()
+    assert repair == (
+        "w2-adjudication",
+        "pending",
+        0,
+        "2026-07-25T11:30:00+00:00",
+        "2026-07-25T11:30:00+00:00",
+        "",
+    )
+
+
+def _unrelated_v9_clone(path: Path) -> Path:
+    RcaDeliveryStore(path)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "INSERT INTO rca_delivery_meta(key, value) "
+            "VALUES('unrelated_business_state', 'B')"
+        )
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.execute("PRAGMA journal_mode=DELETE")
+    path.chmod(0o600)
+    return path
+
+
+def test_combined_v2_offline_receipt_rejects_unrelated_healthy_v9_clone(tmp_path):
+    migration = _prepare_combined_schema_migration(
+        tmp_path / "source-a", "pnc_rca_delivery_store_v7"
+    )
+    unrelated = _unrelated_v9_clone(tmp_path / "unrelated-b.sqlite3")
+
+    with pytest.raises(
+        QuarantineMigrationError,
+        match="delivery_store_combined_migration_cross_schema_mismatch",
+    ):
+        build_combined_offline_migration_receipt(
+            source_backup_path=migration["source_backup"],
+            migrated_clone_path=unrelated,
+            target_live_db_path=migration["live_path"],
+            migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+        )
+
+
+def test_combined_v2_validator_rejects_forged_unrelated_clone_binding(tmp_path):
+    migration = _prepare_combined_schema_migration(
+        tmp_path / "source-a", "pnc_rca_delivery_store_v8"
+    )
+    unrelated = _unrelated_v9_clone(tmp_path / "unrelated-b.sqlite3")
+    with sqlite3.connect(unrelated) as conn:
+        conn.row_factory = sqlite3.Row
+        unrelated_projection = logical_database_projection(conn)
+    forged = dict(migration["receipt"])
+    unrelated_raw = unrelated.read_bytes()
+    forged["migrated_clone"] = {
+        "path": str(unrelated),
+        "sha256": hashlib.sha256(unrelated_raw).hexdigest(),
+        "size_bytes": len(unrelated_raw),
+    }
+    forged["post_migration_logical_projection"] = unrelated_projection
+    forged_path = tmp_path / "forged-unrelated-receipt.json"
+    forged_sha256 = _write(forged_path, forged)
+
+    with pytest.raises(
+        QuarantineMigrationError,
+        match="delivery_store_combined_migration_cross_schema_mismatch",
+    ):
+        validate_combined_migration_receipt(
+            receipt_path=forged_path,
+            expected_sha256=forged_sha256,
+            target_live_db_path=migration["live_path"],
+            migrated_db_path=unrelated,
+            expected_migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+        )
+
+
+@pytest.mark.parametrize(
+    "source_version",
+    ["pnc_rca_delivery_store_v7", "pnc_rca_delivery_store_v8"],
+)
+def test_combined_v2_live_pre_and_post_gates_bind_exact_source_clone_and_rollback(
+    tmp_path,
+    source_version,
+):
+    migration = _prepare_combined_schema_migration(tmp_path, source_version)
+
+    pre = assert_combined_live_pre_migration_matches(
+        receipt_path=migration["receipt_path"],
+        expected_sha256=migration["receipt_sha256"],
+        live_db_path=migration["live_path"],
+        expected_migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+    )
+
+    assert pre["live_validation"]["schema_version"] == source_version
+    assert pre["live_validation"]["quick_check"] == "ok"
+    assert pre["live_validation"]["sidecars"] == []
+    assert pre["rollback_path"] == str(migration["source_backup"])
+    assert pre["rollback_sha256"] == hashlib.sha256(
+        migration["source_backup"].read_bytes()
+    ).hexdigest()
+
+    RcaDeliveryStore(migration["live_path"])
+    with sqlite3.connect(migration["live_path"]) as conn:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.execute("PRAGMA journal_mode=DELETE")
+    migration["live_path"].chmod(0o600)
+    post = assert_combined_live_post_migration_matches(
+        receipt_path=migration["receipt_path"],
+        expected_sha256=migration["receipt_sha256"],
+        live_db_path=migration["live_path"],
+        expected_migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+    )
+
+    assert post["live_validation"]["schema_version"] == (
+        "pnc_rca_delivery_store_v9"
+    )
+    assert post["live_validation"]["quick_check"] == "ok"
+    assert post["live_validation"]["sidecars"] == []
+    assert post["rollback_path"] == str(migration["source_backup"])
+
+
+def _combined_receipt_for_target(
+    migration: dict,
+    *,
+    target: Path,
+    receipt_path: Path,
+) -> tuple[Path, str]:
+    receipt = build_combined_offline_migration_receipt(
+        source_backup_path=migration["source_backup"],
+        migrated_clone_path=migration["clone_path"],
+        target_live_db_path=target,
+        migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+    )
+    return receipt_path, _write(receipt_path, receipt)
+
+
+def test_combined_v2_live_pre_gate_rejects_nonexistent_target(tmp_path):
+    migration = _prepare_combined_schema_migration(
+        tmp_path / "migration", "pnc_rca_delivery_store_v7"
+    )
+    missing = tmp_path / "missing-live.sqlite3"
+    receipt_path, receipt_sha256 = _combined_receipt_for_target(
+        migration,
+        target=missing,
+        receipt_path=tmp_path / "missing-live-receipt.json",
+    )
+
+    with pytest.raises(
+        QuarantineMigrationError,
+        match="delivery_quarantine_live_database_unavailable",
+    ):
+        assert_combined_live_pre_migration_matches(
+            receipt_path=receipt_path,
+            expected_sha256=receipt_sha256,
+            live_db_path=missing,
+            expected_migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+        )
+
+
+def test_combined_v2_live_gates_reject_wrong_pre_and_unmigrated_post(tmp_path):
+    migration = _prepare_combined_schema_migration(
+        tmp_path / "migration", "pnc_rca_delivery_store_v7"
+    )
+    wrong_live = tmp_path / "wrong-live.sqlite3"
+    shutil.copyfile(migration["source_backup"], wrong_live)
+    with sqlite3.connect(wrong_live) as conn:
+        conn.execute(
+            "INSERT INTO rca_delivery_meta(key, value) "
+            "VALUES('unrelated_business_state', 'wrong')"
+        )
+        conn.execute("PRAGMA journal_mode=DELETE")
+    wrong_live.chmod(0o600)
+    receipt_path, receipt_sha256 = _combined_receipt_for_target(
+        migration,
+        target=wrong_live,
+        receipt_path=tmp_path / "wrong-live-receipt.json",
+    )
+
+    with pytest.raises(
+        QuarantineMigrationError,
+        match="delivery_store_combined_live_pre_migration_drift",
+    ):
+        assert_combined_live_pre_migration_matches(
+            receipt_path=receipt_path,
+            expected_sha256=receipt_sha256,
+            live_db_path=wrong_live,
+            expected_migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+        )
+    with pytest.raises(
+        QuarantineMigrationError,
+        match="delivery_store_combined_live_post_migration_drift",
+    ):
+        assert_combined_live_post_migration_matches(
+            receipt_path=migration["receipt_path"],
+            expected_sha256=migration["receipt_sha256"],
+            live_db_path=migration["live_path"],
+            expected_migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+        )
+
+
+@pytest.mark.parametrize("mutation", ["delete_trigger", "weaken_check"])
+def test_combined_v2_cross_schema_rejects_source_owned_schema_drift(
+    tmp_path,
+    mutation,
+):
+    migration = _prepare_combined_schema_migration(
+        tmp_path, "pnc_rca_delivery_store_v7"
+    )
+    with sqlite3.connect(migration["clone_path"]) as conn:
+        if mutation == "delete_trigger":
+            conn.execute("DROP TRIGGER trg_rca_quarantine_audit_no_update")
+        else:
+            before = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'rca_delivery_effects'"
+            ).fetchone()[0]
+            conn.execute("PRAGMA writable_schema=ON")
+            conn.execute(
+                "UPDATE sqlite_master SET sql = REPLACE(sql, ?, ?) "
+                "WHERE type = 'table' AND name = 'rca_delivery_effects'",
+                ("CHECK (attempt >= 0)", "CHECK (attempt >= -1)"),
+            )
+            schema_version = conn.execute("PRAGMA schema_version").fetchone()[0]
+            conn.execute(f"PRAGMA schema_version = {schema_version + 1}")
+            conn.execute("PRAGMA writable_schema=OFF")
+            after = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'rca_delivery_effects'"
+            ).fetchone()[0]
+            assert after != before
+        conn.execute("PRAGMA journal_mode=DELETE")
+    migration["clone_path"].chmod(0o600)
+
+    with pytest.raises(
+        QuarantineMigrationError,
+        match="delivery_store_combined_migration_cross_schema_mismatch",
+    ):
+        build_combined_offline_migration_receipt(
+            source_backup_path=migration["source_backup"],
+            migrated_clone_path=migration["clone_path"],
+            target_live_db_path=migration["live_path"],
+            migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+        )
+
+
+@pytest.mark.parametrize("mutation", ["extra_trigger", "weaken_new_table_check"])
+def test_combined_v2_rejects_noncanonical_added_v9_objects(tmp_path, mutation):
+    migration = _prepare_combined_schema_migration(
+        tmp_path, "pnc_rca_delivery_store_v7"
+    )
+    with sqlite3.connect(migration["clone_path"]) as conn:
+        if mutation == "extra_trigger":
+            conn.execute(
+                "CREATE TRIGGER forged_repair_trigger "
+                "AFTER INSERT ON rca_conclusion_adjudication_repairs "
+                "BEGIN SELECT 1; END"
+            )
+        else:
+            before = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'rca_conclusion_adjudication_repairs'"
+            ).fetchone()[0]
+            conn.execute("PRAGMA writable_schema=ON")
+            conn.execute(
+                "UPDATE sqlite_master SET sql = REPLACE(sql, ?, ?) "
+                "WHERE type = 'table' "
+                "AND name = 'rca_conclusion_adjudication_repairs'",
+                (
+                    "status IN ('pending', 'succeeded')",
+                    "status IN ('pending', 'succeeded', 'forged')",
+                ),
+            )
+            schema_version = conn.execute("PRAGMA schema_version").fetchone()[0]
+            conn.execute(f"PRAGMA schema_version = {schema_version + 1}")
+            conn.execute("PRAGMA writable_schema=OFF")
+            after = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'rca_conclusion_adjudication_repairs'"
+            ).fetchone()[0]
+            assert after != before
+        conn.execute("PRAGMA journal_mode=DELETE")
+    migration["clone_path"].chmod(0o600)
+
+    with pytest.raises(
+        QuarantineMigrationError,
+        match="delivery_store_combined_migration_target_schema_contract_invalid",
+    ):
+        build_combined_offline_migration_receipt(
+            source_backup_path=migration["source_backup"],
+            migrated_clone_path=migration["clone_path"],
+            target_live_db_path=migration["live_path"],
+            migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+        )
+
+
+def test_combined_v2_rejects_malformed_w2_source_schema_as_self_proof(tmp_path):
+    migration = _prepare_combined_schema_migration(
+        tmp_path, "pnc_rca_delivery_store_v8"
+    )
+    with sqlite3.connect(migration["source_backup"]) as conn:
+        before = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'rca_failure_routes'"
+        ).fetchone()[0]
+        conn.execute("PRAGMA writable_schema=ON")
+        conn.execute(
+            "UPDATE sqlite_master SET sql = REPLACE(sql, ?, ?) "
+            "WHERE type = 'table' AND name = 'rca_failure_routes'",
+            ("CHECK (generation >= 1)", "CHECK (generation >= 0)"),
+        )
+        schema_version = conn.execute("PRAGMA schema_version").fetchone()[0]
+        conn.execute(f"PRAGMA schema_version = {schema_version + 1}")
+        conn.execute("PRAGMA writable_schema=OFF")
+        after = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'rca_failure_routes'"
+        ).fetchone()[0]
+        assert after != before
+        conn.execute("PRAGMA journal_mode=DELETE")
+    migration["source_backup"].chmod(0o600)
+
+    with pytest.raises(
+        QuarantineMigrationError,
+        match="delivery_store_combined_migration_source_schema_contract_invalid",
+    ):
+        build_combined_offline_migration_receipt(
+            source_backup_path=migration["source_backup"],
+            migrated_clone_path=migration["clone_path"],
+            target_live_db_path=migration["live_path"],
+            migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+        )
 
 
 def _migration_kwargs(migration: dict) -> dict:
@@ -792,6 +1255,181 @@ def test_v6_to_v7_audit_schema_failure_rolls_back_atomically(tmp_path, monkeypat
     assert schema_version == "pnc_rca_delivery_store_v6"
     assert partial is None
     assert audit is None
+
+
+def test_w2_v8_malformed_failure_route_contract_rolls_back_before_v9_marker(
+    tmp_path,
+):
+    migration = _prepare_combined_schema_migration(
+        tmp_path, "pnc_rca_delivery_store_v8"
+    )
+    live_path = migration["live_path"]
+    with sqlite3.connect(live_path) as conn:
+        conn.executescript(
+            """
+            ALTER TABLE rca_failure_routes RENAME TO rca_failure_routes_valid;
+            CREATE TABLE rca_failure_routes AS
+                SELECT * FROM rca_failure_routes_valid;
+            CREATE UNIQUE INDEX malformed_failure_routes_dedupe
+                ON rca_failure_routes(dedupe_key);
+            DROP TABLE rca_failure_routes_valid;
+            """
+        )
+        malformed_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'rca_failure_routes'"
+        ).fetchone()[0]
+
+    with pytest.raises(
+        RuntimeError,
+        match="incompatible_delivery_store_schema:failure_routes_contract",
+    ):
+        RcaDeliveryStore(live_path)
+
+    with sqlite3.connect(live_path) as conn:
+        marker = conn.execute(
+            "SELECT value FROM rca_delivery_meta WHERE key = 'schema_version'"
+        ).fetchone()[0]
+        observed_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'rca_failure_routes'"
+        ).fetchone()[0]
+        repair_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'rca_conclusion_adjudication_repairs'"
+        ).fetchone()
+        effect_columns = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(rca_delivery_effects)")
+        }
+    assert marker == "pnc_rca_delivery_store_v8"
+    assert observed_sql == malformed_sql
+    assert repair_table is None
+    assert "adjudication_comment_attempt_count" not in effect_columns
+    assert "adjudication_comment_attempted_at" not in effect_columns
+
+
+def test_candidate_v7_schema_variant_requires_operator_remediation(tmp_path):
+    migration = _prepare_combined_schema_migration(
+        tmp_path, "pnc_rca_delivery_store_v7"
+    )
+    live_path = migration["live_path"]
+    with sqlite3.connect(live_path) as conn:
+        conn.execute(
+            "CREATE TABLE rca_conclusion_adjudications("
+            "adjudication_id TEXT PRIMARY KEY)"
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match="pre_v9_source_variant_operator_remediation",
+    ):
+        RcaDeliveryStore(live_path)
+
+    with sqlite3.connect(live_path) as conn:
+        marker = conn.execute(
+            "SELECT value FROM rca_delivery_meta WHERE key = 'schema_version'"
+        ).fetchone()[0]
+        repair_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'rca_conclusion_adjudication_repairs'"
+        ).fetchone()
+    assert marker == "pnc_rca_delivery_store_v7"
+    assert repair_table is None
+
+
+def test_w2_v8_blank_legacy_activation_requires_operator_remediation(tmp_path):
+    migration = _prepare_combined_schema_migration(
+        tmp_path, "pnc_rca_delivery_store_v8"
+    )
+    live_path = migration["live_path"]
+    with sqlite3.connect(live_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO rca_conclusion_adjudications(
+                adjudication_id, schema_version, business_key, generation,
+                project_key, work_item_type_key, work_item_id, action,
+                conclusion_state, reason, replacement_conclusion, actor_id,
+                actor_name, source_json, original_delivery_id,
+                original_effect_key, correction_effect_key, activation_epoch_id,
+                evaluator_refs_json, responsibility_domain,
+                impact_window_start, impact_window_end, lineage_json,
+                lineage_sha256, created_at
+            ) VALUES (
+                'legacy-adjudication', 'pnc_rca_conclusion_adjudication_v1',
+                'legacy-business', 1, 'project', 'issue', '123', 'retract',
+                'invalidated', 'legacy', '', 'owner', '', '{}',
+                'missing-delivery', 'missing-original', 'missing-correction', '',
+                '["evaluator"]', 'unknown', '2026-01-01T00:00:00+00:00',
+                '2026-01-01T01:00:00+00:00', '{}', ?,
+                '2026-01-01T01:00:00+00:00'
+            )
+            """,
+            ("a" * 64,),
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match="legacy_adjudication_activation_operator_remediation",
+    ):
+        RcaDeliveryStore(live_path)
+
+    with sqlite3.connect(live_path) as conn:
+        marker = conn.execute(
+            "SELECT value FROM rca_delivery_meta WHERE key = 'schema_version'"
+        ).fetchone()[0]
+        repair_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'rca_conclusion_adjudication_repairs'"
+        ).fetchone()
+    assert marker == "pnc_rca_delivery_store_v8"
+    assert repair_table is None
+
+
+def test_w16_v8_succeeded_repair_without_receipt_requires_operator_remediation(
+    tmp_path,
+):
+    migration = _prepare_combined_schema_migration(
+        tmp_path, "pnc_rca_delivery_store_v8"
+    )
+    live_path = migration["live_path"]
+    with sqlite3.connect(live_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE rca_conclusion_adjudication_repairs(
+                adjudication_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO rca_conclusion_adjudication_repairs(
+                adjudication_id, status, created_at, updated_at
+            ) VALUES (
+                'legacy-adjudication', 'succeeded',
+                '2026-01-01T00:00:00+00:00',
+                '2026-01-01T00:00:00+00:00'
+            );
+            """
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match="legacy_adjudication_receipt_operator_remediation",
+    ):
+        RcaDeliveryStore(live_path)
+
+    with sqlite3.connect(live_path) as conn:
+        marker = conn.execute(
+            "SELECT value FROM rca_delivery_meta WHERE key = 'schema_version'"
+        ).fetchone()[0]
+        columns = {
+            str(row[1])
+            for row in conn.execute(
+                "PRAGMA table_info(rca_conclusion_adjudication_repairs)"
+            )
+        }
+    assert marker == "pnc_rca_delivery_store_v8"
+    assert "receipt_sha256" not in columns
 
 
 def test_require_current_rejects_v6_without_mutating_it(tmp_path):

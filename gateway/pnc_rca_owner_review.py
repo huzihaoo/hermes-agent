@@ -552,11 +552,14 @@ def _validate_persisted_owner_review_artifacts(
     if (
         sidecar.get("case_id") != f"G1Q3-{issue_id}"
         or owner_review.get("review_event_id") != record.get("review_event_id")
-        or owner_review.get("adjudication_id") != record.get("adjudication_id")
-        or owner_review.get("original_effect_key")
-        != record.get("original_effect_key")
-        or owner_review.get("correction_effect_key")
-        != record.get("correction_effect_key")
+        or any(
+            str(owner_review.get(key) or "") != str(record.get(key) or "")
+            for key in (
+                "adjudication_id",
+                "original_effect_key",
+                "correction_effect_key",
+            )
+        )
     ):
         raise ValueError("owner review sidecar does not bind the adjudication event")
 
