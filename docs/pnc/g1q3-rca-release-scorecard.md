@@ -33,8 +33,8 @@ high-confidence truth. W1 owns the oracle recomputation.
 
 Requester identities are split as `human` (`ou_*`), `automation`
 (`automation:*`), `legacy_automation` (`operator-`, `operator_`, `codex-`, or
-`codex_`), and `unknown`. When W10 is integrated, this projection should
-delegate to `gateway.pnc_rca_requester_identity.classify_rca_requester`.
+`codex_`), and `unknown` by the W10 authority
+`gateway.pnc_rca_requester_identity.classify_rca_requester`.
 
 ## Failure behavior
 

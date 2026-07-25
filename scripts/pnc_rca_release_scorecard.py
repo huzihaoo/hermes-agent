@@ -27,6 +27,12 @@ from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from gateway.pnc_rca_requester_identity import classify_rca_requester
+
 
 SCHEMA_VERSION = "pnc_rca_release_scorecard_v1"
 RELEASE_STATUS = "NOT_GA"
@@ -539,15 +545,7 @@ def _requester_identity_denominators(connection: sqlite3.Connection) -> dict[str
         """
     ).fetchall()
     for row in rows:
-        requester = str(row["requester_id"] or "").strip().lower()
-        if requester.startswith("ou_"):
-            identity_kind = "human"
-        elif requester.startswith("automation:"):
-            identity_kind = "automation"
-        elif requester.startswith(("operator-", "operator_", "codex-", "codex_")):
-            identity_kind = "legacy_automation"
-        else:
-            identity_kind = "unknown"
+        identity_kind = classify_rca_requester(str(row["requester_id"] or ""))
         row_count = int(row["row_count"])
         counts[identity_kind] += row_count
         by_source.setdefault(str(row["source_kind"]), Counter())[identity_kind] += (
@@ -566,14 +564,11 @@ def _requester_identity_denominators(connection: sqlite3.Connection) -> dict[str
             for source, values in sorted(by_source.items())
         },
         "classifier": {
+            "authority": "gateway.pnc_rca_requester_identity.classify_rca_requester",
             "human": "ou_*",
             "automation": "automation:*",
             "legacy_automation": "operator-/operator_/codex-/codex_",
             "unknown": "all other or empty requester IDs",
-            "integration_touchpoint": (
-                "delegate to gateway.pnc_rca_requester_identity.classify_rca_requester "
-                "when W10 is integrated"
-            ),
         },
     }
 
