@@ -22,12 +22,13 @@ from gateway.pnc_rca_conclusion_adjudication import (
     ADJUDICATION_SCHEMA_VERSION,
     validate_adjudication_effect_claim,
     validate_adjudication_effect_ledger_binding,
+    validate_conclusion_adjudication_artifact_receipt,
     validate_conclusion_adjudication_schema,
 )
 
 
 AUDIT_SCHEMA_VERSION = "pnc_rca_conclusion_adjudication_audit_v2"
-EXPECTED_DELIVERY_STORE_SCHEMA_VERSION = "pnc_rca_delivery_store_v8"
+EXPECTED_DELIVERY_STORE_SCHEMA_VERSION = "pnc_rca_delivery_store_v9"
 _UNRESOLVED_EFFECT_STATUSES = frozenset(
     {"pending", "claimed", "retry_wait", "uncertain"}
 )
@@ -100,7 +101,16 @@ def _recompute_adjudication_bindings(
                original_job.target_key AS original_job_target_key,
                original_job.outcome AS original_job_outcome,
                epoch.state AS activation_state,
-               epoch.is_current AS activation_is_current
+               epoch.is_current AS activation_is_current,
+               repair.status AS artifact_repair_status,
+               repair.receipt_schema_version AS artifact_receipt_schema_version,
+               repair.receipt_path AS artifact_receipt_path,
+               repair.receipt_offset AS artifact_receipt_offset,
+               repair.receipt_length AS artifact_receipt_length,
+               repair.receipt_sha256 AS artifact_receipt_sha256,
+               repair.receipt_device AS artifact_receipt_device,
+               repair.receipt_inode AS artifact_receipt_inode,
+               repair.receipt_event_id AS artifact_receipt_event_id
           FROM rca_conclusion_adjudications AS a
      LEFT JOIN rca_delivery_effects AS correction
             ON correction.effect_key = a.correction_effect_key
@@ -112,6 +122,8 @@ def _recompute_adjudication_bindings(
             ON original_job.delivery_id = a.original_delivery_id
      LEFT JOIN rca_activation_epochs AS epoch
             ON epoch.epoch_id = a.activation_epoch_id
+     LEFT JOIN rca_conclusion_adjudication_repairs AS repair
+            ON repair.adjudication_id = a.adjudication_id
       ORDER BY a.adjudication_id
         """
     ).fetchall()
@@ -164,6 +176,22 @@ def _recompute_adjudication_bindings(
                     correction_status in _UNRESOLVED_EFFECT_STATUSES
                 ),
             )
+            if row["artifact_repair_status"] is None:
+                raise RuntimeError("adjudication_artifact_repair_row_missing")
+            if str(row["artifact_repair_status"] or "") == "succeeded":
+                validate_conclusion_adjudication_artifact_receipt(
+                    {
+                        "schema_version": row["artifact_receipt_schema_version"],
+                        "path": row["artifact_receipt_path"],
+                        "offset": row["artifact_receipt_offset"],
+                        "length": row["artifact_receipt_length"],
+                        "sha256": row["artifact_receipt_sha256"],
+                        "device": row["artifact_receipt_device"],
+                        "inode": row["artifact_receipt_inode"],
+                        "review_event_id": row["artifact_receipt_event_id"],
+                    },
+                    adjudication=dict(row),
+                )
         except Exception as exc:
             failures.append(
                 {

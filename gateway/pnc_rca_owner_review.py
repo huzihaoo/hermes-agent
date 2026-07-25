@@ -12,10 +12,16 @@ import hashlib
 import json
 import os
 import re
+import stat
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from gateway.pnc_rca_conclusion_adjudication import (
+    ADJUDICATION_ARTIFACT_RECEIPT_SCHEMA_VERSION,
+    MAX_ADJUDICATION_RECEIPT_LINE_BYTES,
+)
 
 OWNER_ENV = "HERMES_G1Q3_REVIEW_OWNERS"
 OWNER_USER_ID_ENV = "HERMES_G1Q3_REVIEW_OWNER_USER_IDS"
@@ -185,6 +191,7 @@ def _handle_owner_review_message(
             adjudication_store.mark_conclusion_adjudication_artifact_repair(
                 adjudication_id=adjudication_result.adjudication_id,
                 succeeded=True,
+                receipt_binding=persisted["receipt_binding"],
                 now=now,
             )
         except Exception as exc:
@@ -317,10 +324,20 @@ def _persist_owner_review_artifacts(
     adjudication_result: Any,
     now: datetime,
 ) -> dict[str, Any]:
+    review_dir = review_dir.expanduser().absolute()
+    reviewed_at = now
+    if adjudication_result is not None:
+        try:
+            reviewed_at = datetime.fromisoformat(str(adjudication_result.created_at))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("adjudication creation time is invalid") from exc
+        if reviewed_at.tzinfo is None or reviewed_at.utcoffset() is None:
+            raise ValueError("adjudication creation time must be timezone-aware")
+        reviewed_at = reviewed_at.astimezone(timezone.utc)
     artifact_info = _find_report_generated_at(hermes_home, issue_id)
     report_generated_at = artifact_info.get("report_generated_at")
     latency_seconds = (
-        _latency_seconds(report_generated_at, now)
+        _latency_seconds(report_generated_at, reviewed_at)
         if report_generated_at
         else None
     )
@@ -332,7 +349,7 @@ def _persist_owner_review_artifacts(
         "reason": reason,
         "owner_id": owner_id,
         "owner_name": owner_name,
-        "reviewed_at": now.isoformat(),
+        "reviewed_at": reviewed_at.isoformat(),
         "report_generated_at": report_generated_at,
         "report_generated_at_source": artifact_info.get("source"),
         "latency_seconds": latency_seconds,
@@ -388,8 +405,17 @@ def _persist_owner_review_artifacts(
         receipt_time = datetime.fromisoformat(str(record["reviewed_at"]))
     except (KeyError, TypeError, ValueError):
         receipt_time = now
-    _append_receipt(review_dir, receipt, now=receipt_time)
-    return {"idempotent": idempotent, "record": record}
+    _validate_persisted_owner_review_artifacts(
+        review_dir=review_dir,
+        issue_id=issue_id,
+        record=record,
+    )
+    receipt_binding = _append_receipt(review_dir, receipt, now=receipt_time)
+    return {
+        "idempotent": idempotent,
+        "record": record,
+        "receipt_binding": receipt_binding,
+    }
 
 
 def _usage_message() -> str:
@@ -399,7 +425,18 @@ def _usage_message() -> str:
 def _write_ledger(*, review_dir: Path, issue_id: str, record: dict[str, Any], override: bool) -> dict[str, Any]:
     review_dir.mkdir(parents=True, exist_ok=True)
     ledger_path = review_dir / "ledger.json"
-    with open(ledger_path, "a+", encoding="utf-8") as fh:
+    descriptor = os.open(
+        ledger_path,
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    with os.fdopen(descriptor, "r+", encoding="utf-8") as fh:
+        observed = os.fstat(fh.fileno())
+        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+            raise OSError("owner review ledger must be a single-link regular file")
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
         fh.seek(0)
         try:
@@ -428,28 +465,174 @@ def _write_ledger(*, review_dir: Path, issue_id: str, record: dict[str, Any], ov
         fh.seek(0)
         fh.truncate()
         fh.write(json.dumps(ledger, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
         return {"idempotent": False, "current": record}
+
+
+def _read_owner_review_artifact(path: Path, *, label: str) -> dict[str, Any]:
+    selected = path.expanduser()
+    if not selected.is_absolute() or not hasattr(os, "O_NOFOLLOW"):
+        raise OSError(f"{label} path must be absolute and no-follow capable")
+    descriptor = os.open(
+        selected,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW,
+    )
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size <= 1
+            or before.st_size > 16 * 1024 * 1024
+        ):
+            raise OSError(f"{label} must be a bounded single-link regular file")
+        chunks: list[bytes] = []
+        total = 0
+        while total <= 16 * 1024 * 1024:
+            chunk = os.read(descriptor, min(65536, 16 * 1024 * 1024 + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        after = os.fstat(descriptor)
+        lexical = os.lstat(selected)
+        if (
+            total > 16 * 1024 * 1024
+            or stat.S_ISLNK(lexical.st_mode)
+            or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            or (after.st_dev, after.st_ino) != (lexical.st_dev, lexical.st_ino)
+        ):
+            raise OSError(f"{label} changed while being verified")
+        value = json.loads(b"".join(chunks).decode("utf-8"))
+    finally:
+        os.close(descriptor)
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must contain a JSON object")
+    return value
+
+
+def _validate_persisted_owner_review_artifacts(
+    *, review_dir: Path, issue_id: str, record: dict[str, Any]
+) -> None:
+    ledger_path = (review_dir / "ledger.json").absolute()
+    sidecar_path = _business_state_sidecar_path(
+        review_dir=review_dir,
+        issue_id=issue_id,
+    ).absolute()
+    ledger = _read_owner_review_artifact(ledger_path, label="owner review ledger")
+    issues = ledger.get("issues") if isinstance(ledger.get("issues"), dict) else {}
+    entry = issues.get(issue_id) if isinstance(issues.get(issue_id), dict) else {}
+    current = entry.get("current") if isinstance(entry.get("current"), dict) else {}
+    binding_fields = (
+        "review_event_id",
+        "adjudication_id",
+        "original_effect_key",
+        "correction_effect_key",
+        "issue_id",
+        "action",
+        "owner_id",
+        "source",
+        "impact_lineage",
+    )
+    if (
+        ledger.get("schema_version") != LEDGER_SCHEMA_VERSION
+        or any(current.get(key) != record.get(key) for key in binding_fields)
+    ):
+        raise ValueError("owner review ledger does not bind the adjudication event")
+    sidecar = _read_owner_review_artifact(
+        sidecar_path, label="owner review business-state sidecar"
+    )
+    owner_review = (
+        sidecar.get("owner_review")
+        if isinstance(sidecar.get("owner_review"), dict)
+        else {}
+    )
+    if (
+        sidecar.get("case_id") != f"G1Q3-{issue_id}"
+        or owner_review.get("review_event_id") != record.get("review_event_id")
+        or owner_review.get("adjudication_id") != record.get("adjudication_id")
+        or owner_review.get("original_effect_key")
+        != record.get("original_effect_key")
+        or owner_review.get("correction_effect_key")
+        != record.get("correction_effect_key")
+    ):
+        raise ValueError("owner review sidecar does not bind the adjudication event")
 
 
 def _append_receipt(
     review_dir: Path, receipt: dict[str, Any], *, now: datetime
-) -> bool:
+) -> dict[str, Any]:
     review_dir.mkdir(parents=True, exist_ok=True)
-    path = review_dir / f"owner_review-{now.date().isoformat()}.jsonl"
-    with open(path, "a+", encoding="utf-8") as fh:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-        fh.seek(0)
-        event_id = str(receipt.get("review_event_id") or "")
-        for line in fh:
-            try:
-                existing = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if event_id and existing.get("review_event_id") == event_id:
-                return False
-        fh.seek(0, os.SEEK_END)
-        fh.write(json.dumps(receipt, ensure_ascii=False, sort_keys=True) + "\n")
-        return True
+    path = (review_dir / f"owner_review-{now.date().isoformat()}.jsonl").absolute()
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise OSError("owner review receipt requires O_NOFOLLOW")
+    descriptor = os.open(
+        path,
+        os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        observed = os.fstat(descriptor)
+        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+            raise OSError("owner review receipt must be a single-link regular file")
+        event_id = str(receipt.get("review_event_id") or "").strip()
+        if not event_id:
+            raise ValueError("owner review receipt event id is required")
+        matched: tuple[int, bytes] | None = None
+        offset = 0
+        with os.fdopen(os.dup(descriptor), "rb") as reader:
+            for raw_line in reader:
+                if len(raw_line) > MAX_ADJUDICATION_RECEIPT_LINE_BYTES:
+                    raise OSError("owner review receipt line is too large")
+                line_offset = offset
+                offset += len(raw_line)
+                if not raw_line.strip():
+                    continue
+                try:
+                    existing = json.loads(raw_line.decode("utf-8"))
+                except (UnicodeError, json.JSONDecodeError):
+                    continue
+                if event_id and existing.get("review_event_id") == event_id:
+                    if matched is not None:
+                        raise OSError("owner review receipt event is duplicated")
+                    matched = (line_offset, raw_line)
+        if matched is None:
+            raw_line = (
+                json.dumps(receipt, ensure_ascii=False, sort_keys=True) + "\n"
+            ).encode("utf-8")
+            if len(raw_line) > MAX_ADJUDICATION_RECEIPT_LINE_BYTES:
+                raise OSError("owner review receipt line is too large")
+            line_offset = os.lseek(descriptor, 0, os.SEEK_END)
+            written = 0
+            while written < len(raw_line):
+                written += os.write(descriptor, raw_line[written:])
+            os.fsync(descriptor)
+        else:
+            line_offset, raw_line = matched
+        final = os.fstat(descriptor)
+        lexical = os.lstat(path)
+        if (
+            stat.S_ISLNK(lexical.st_mode)
+            or (final.st_dev, final.st_ino) != (lexical.st_dev, lexical.st_ino)
+            or final.st_nlink != 1
+            or final.st_size < line_offset + len(raw_line)
+        ):
+            raise OSError("owner review receipt identity changed")
+        return {
+            "schema_version": ADJUDICATION_ARTIFACT_RECEIPT_SCHEMA_VERSION,
+            "path": str(path),
+            "offset": line_offset,
+            "length": len(raw_line),
+            "sha256": hashlib.sha256(raw_line).hexdigest(),
+            "device": int(final.st_dev),
+            "inode": int(final.st_ino),
+            "review_event_id": event_id,
+        }
+    finally:
+        os.close(descriptor)
 
 
 def _business_state_sidecar_path(*, review_dir: Path, issue_id: str) -> Path:
@@ -486,11 +669,30 @@ def _write_business_state_sidecar(*, review_dir: Path, issue_id: str, record: di
             "action": str(record.get("action") or ""),
             "reviewed_at": reviewed_at,
             "ledger_schema_version": LEDGER_SCHEMA_VERSION,
+            "review_event_id": str(record.get("review_event_id") or ""),
+            "adjudication_id": str(record.get("adjudication_id") or ""),
+            "original_effect_key": str(record.get("original_effect_key") or ""),
+            "correction_effect_key": str(record.get("correction_effect_key") or ""),
         },
     }
-    with open(path, "w", encoding="utf-8") as fh:
+    descriptor = os.open(
+        path,
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    with os.fdopen(descriptor, "r+", encoding="utf-8") as fh:
+        observed = os.fstat(fh.fileno())
+        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+            raise OSError("owner review sidecar must be a single-link regular file")
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        fh.seek(0)
+        fh.truncate()
         fh.write(json.dumps(doc, ensure_ascii=False, indent=2, sort_keys=False) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
     return path
 
 

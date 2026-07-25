@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 import json
+import os
 import sqlite3
 from types import SimpleNamespace
 
 import pytest
 
+from gateway import pnc_rca_delivery_store as delivery_store_module
 from gateway import pnc_rca_owner_review as owner_review_module
 from gateway.pnc_rca_conclusion_adjudication import (
     ADJUDICATION_EFFECT_SCHEMA_VERSION,
@@ -24,6 +27,7 @@ from gateway.pnc_rca_delivery_contract import (
 )
 from gateway.pnc_rca_delivery_store import (
     DELIVERY_STORE_SCHEMA_VERSION,
+    DeliveryRecordConflictError,
     RcaDeliveryStore,
 )
 from gateway.pnc_rca_owner_review import handle_owner_review_message
@@ -216,6 +220,46 @@ def _dispatcher(
     )
 
 
+def _complete_artifact_repair(
+    store: RcaDeliveryStore,
+    artifact_root,
+    result,
+    *,
+    mark_succeeded: bool = True,
+) -> dict:
+    [adjudication] = store.list_rows("rca_conclusion_adjudications")
+    event = SimpleNamespace(
+        message_id="om_command",
+        source=SimpleNamespace(
+            platform=Platform.FEISHU,
+            chat_id="oc_g1q3",
+            thread_id="omt_topic",
+        ),
+    )
+    review_dir = artifact_root / "pnc_agent" / "reviews" / "g1q3_rca"
+    persisted = owner_review_module._persist_owner_review_artifacts(
+        event=event,
+        hermes_home=artifact_root,
+        review_dir=review_dir,
+        issue_id=ISSUE_ID,
+        action="撤回",
+        reason=adjudication["reason"],
+        owner_id="ou_owner",
+        owner_name="RCA Owner",
+        override=True,
+        adjudication_result=result,
+        now=NOW,
+    )
+    if mark_succeeded:
+        store.mark_conclusion_adjudication_artifact_repair(
+            adjudication_id=result.adjudication_id,
+            succeeded=True,
+            receipt_binding=persisted["receipt_binding"],
+            now=NOW,
+        )
+    return persisted
+
+
 def test_retract_is_atomic_idempotent_budgeted_and_has_impact_lineage(tmp_path):
     store = _seed_published_conclusion(tmp_path)
 
@@ -266,6 +310,57 @@ def test_invalid_retraction_fails_before_queue_mutation(tmp_path):
         _record_retraction(store, reason="bad\x00reason")
 
     assert store.list_rows("rca_conclusion_adjudications") == []
+    [effect] = store.list_rows("rca_delivery_effects")
+    assert effect["effect_key"] == ORIGINAL_EFFECT_KEY
+    [job] = store.list_rows("rca_delivery_jobs")
+    assert job["status"] == "delivered"
+
+
+@pytest.mark.parametrize(
+    ("lineage_case", "error_code"),
+    [
+        (
+            "empty_evaluators",
+            "conclusion_adjudication_evaluator_refs_unresolved",
+        ),
+        (
+            "honest_non_attribution",
+            "conclusion_adjudication_responsibility_domain_unresolved",
+        ),
+    ],
+)
+def test_unresolved_impact_lineage_fails_before_queue_mutation(
+    tmp_path, lineage_case, error_code
+):
+    store = _seed_published_conclusion(tmp_path)
+    with sqlite3.connect(store.db_path) as conn:
+        contract = json.loads(
+            conn.execute("SELECT contract_json FROM rca_delivery_jobs").fetchone()[0]
+        )
+        if lineage_case == "empty_evaluators":
+            contract["consumer_capability"]["actual_evaluators"] = []
+        else:
+            contract["report"] = {}
+            contract["public_result"] = {
+                "responsibility": {"status": "not_attributable"},
+                "summary": {"short_conclusion": "当前证据不足，无法定责"},
+            }
+        conn.execute(
+            "UPDATE rca_delivery_jobs SET contract_json = ?",
+            (json.dumps(contract),),
+        )
+
+    with pytest.raises(ConclusionAdjudicationError, match=error_code):
+        _record_retraction(store)
+
+    assert store.list_rows("rca_conclusion_adjudications") == []
+    with sqlite3.connect(store.db_path) as conn:
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM rca_conclusion_adjudication_repairs"
+            ).fetchone()[0]
+            == 0
+        )
     [effect] = store.list_rows("rca_delivery_effects")
     assert effect["effect_key"] == ORIGINAL_EFFECT_KEY
     [job] = store.list_rows("rca_delivery_jobs")
@@ -423,7 +518,7 @@ def test_current_delivery_store_fails_closed_without_adjudication_schema(
         RcaDeliveryStore(store.db_path, require_current=True)
 
 
-def test_v7_marker_requires_explicit_v8_migration(tmp_path):
+def test_v7_marker_requires_explicit_v9_migration(tmp_path):
     assert EXPECTED_DELIVERY_STORE_SCHEMA_VERSION == DELIVERY_STORE_SCHEMA_VERSION
     store = RcaDeliveryStore(tmp_path / "control.sqlite3")
     with sqlite3.connect(store.db_path) as conn:
@@ -449,7 +544,7 @@ def test_v7_marker_requires_explicit_v8_migration(tmp_path):
     assert repair_table is not None
 
 
-def test_v7_migrates_to_combined_w2_w16_v8_schema(tmp_path):
+def test_v7_migrates_to_combined_w2_w16_v9_schema(tmp_path):
     path = tmp_path / "combined-control.sqlite3"
     RcaDeliveryStore(path)
     with sqlite3.connect(path) as conn:
@@ -497,7 +592,123 @@ def test_v7_migrates_to_combined_w2_w16_v8_schema(tmp_path):
     assert {"route_key", "dedupe_key", "remediation_attempt_count"} <= (
         failure_route_columns
     )
-    assert {"adjudication_id", "status", "attempt_count"} <= repair_columns
+    assert {
+        "adjudication_id",
+        "status",
+        "attempt_count",
+        "receipt_path",
+        "receipt_offset",
+        "receipt_length",
+        "receipt_sha256",
+        "receipt_device",
+        "receipt_inode",
+        "receipt_event_id",
+    } <= repair_columns
+
+
+def test_w2_v8_migrates_explicitly_to_combined_v9_schema(tmp_path):
+    path = tmp_path / "w2-v8-control.sqlite3"
+    RcaDeliveryStore(path)
+    with sqlite3.connect(path) as conn:
+        conn.executescript(
+            """
+            DROP TABLE rca_conclusion_adjudication_repairs;
+            DROP TABLE rca_conclusion_adjudications;
+            ALTER TABLE rca_delivery_effects
+                DROP COLUMN adjudication_comment_attempted_at;
+            ALTER TABLE rca_delivery_effects
+                DROP COLUMN adjudication_comment_attempt_count;
+            UPDATE rca_delivery_meta
+               SET value = 'pnc_rca_delivery_store_v8'
+             WHERE key = 'schema_version';
+            """
+        )
+
+    with pytest.raises(RuntimeError, match="rca_delivery_store_schema_not_current"):
+        RcaDeliveryStore(path, require_current=True)
+
+    RcaDeliveryStore(path)
+    RcaDeliveryStore(path, require_current=True)
+    with sqlite3.connect(path) as conn:
+        marker = conn.execute(
+            "SELECT value FROM rca_delivery_meta WHERE key = 'schema_version'"
+        ).fetchone()[0]
+        failure_routes = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'rca_failure_routes'"
+        ).fetchone()
+        repairs = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'rca_conclusion_adjudication_repairs'"
+        ).fetchone()
+    assert marker == "pnc_rca_delivery_store_v9"
+    assert failure_routes is not None
+    assert repairs is not None
+
+
+@pytest.mark.parametrize(
+    "source_version",
+    ["pnc_rca_delivery_store_v7", "pnc_rca_delivery_store_v8"],
+)
+def test_predecessor_schema_and_marker_rollback_together_on_w16_fault(
+    tmp_path, monkeypatch, source_version
+):
+    path = tmp_path / f"{source_version}-rollback.sqlite3"
+    RcaDeliveryStore(path)
+    with sqlite3.connect(path) as conn:
+        conn.executescript(
+            """
+            DROP TABLE rca_conclusion_adjudication_repairs;
+            DROP TABLE rca_conclusion_adjudications;
+            ALTER TABLE rca_delivery_effects
+                DROP COLUMN adjudication_comment_attempted_at;
+            ALTER TABLE rca_delivery_effects
+                DROP COLUMN adjudication_comment_attempt_count;
+            """
+        )
+        if source_version == "pnc_rca_delivery_store_v7":
+            conn.execute("DROP TABLE rca_failure_routes")
+        conn.execute(
+            "UPDATE rca_delivery_meta SET value = ? WHERE key = 'schema_version'",
+            (source_version,),
+        )
+    real_ensure = delivery_store_module.ensure_conclusion_adjudication_schema
+
+    def fail_after_w16_schema(conn):
+        real_ensure(conn)
+        raise RuntimeError("injected failure before v9 marker")
+
+    monkeypatch.setattr(
+        delivery_store_module,
+        "ensure_conclusion_adjudication_schema",
+        fail_after_w16_schema,
+    )
+
+    with pytest.raises(RuntimeError, match="injected failure before v9 marker"):
+        RcaDeliveryStore(path)
+
+    with sqlite3.connect(path) as conn:
+        marker = conn.execute(
+            "SELECT value FROM rca_delivery_meta WHERE key = 'schema_version'"
+        ).fetchone()[0]
+        effect_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(rca_delivery_effects)")
+        }
+        repairs = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'rca_conclusion_adjudication_repairs'"
+        ).fetchone()
+        failure_routes = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'rca_failure_routes'"
+        ).fetchone()
+    assert marker == source_version
+    assert "adjudication_comment_attempt_count" not in effect_columns
+    assert "adjudication_comment_attempted_at" not in effect_columns
+    assert repairs is None
+    assert (failure_routes is not None) is (
+        source_version == "pnc_rca_delivery_store_v8"
+    )
 
 
 def test_current_schema_rejects_missing_w16_attempt_token_column(tmp_path):
@@ -742,6 +953,286 @@ def test_invisible_correction_success_never_repeats_remote_comment_write(
     assert effect["recovery_write_count"] == 0
 
 
+def test_consumed_comment_token_blocks_field_rewrite_after_epoch_rotates_on_read(
+    tmp_path,
+):
+    store = _seed_published_conclusion(tmp_path)
+    result = _record_retraction(store)
+    fields = {RCA_RESULT_FIELD_KEY: "候选结论：感知车道线责任域"}
+    calls = {"get": 0, "update": 0, "add": 0}
+
+    class Clock:
+        current = NOW
+
+        def __call__(self):
+            return self.current
+
+    clock = Clock()
+
+    def list_comments(_project_key, _work_item_id):
+        return {
+            "success": True,
+            "comments": [
+                {
+                    "remote_id": "original-comment",
+                    "content": "[RCA_DELIVERY:original] candidate conclusion",
+                }
+            ],
+            "pages_read": 1,
+        }
+
+    def get_fields(_project_key, _work_item_id, field_keys):
+        calls["get"] += 1
+        if calls["get"] == 3:
+            with sqlite3.connect(store.db_path) as conn:
+                conn.execute(
+                    "UPDATE rca_activation_epochs SET is_current = 0 "
+                    "WHERE epoch_id = 'epoch-w16-active'"
+                )
+                conn.execute(
+                    "INSERT INTO rca_activation_epochs VALUES "
+                    "('epoch-w16-rotated', 'steady_active', 1)"
+                )
+        return {
+            "success": True,
+            "fields": {key: fields.get(key, "") for key in field_keys},
+        }
+
+    def update_fields(_project_key, _work_item_id, updates):
+        calls["update"] += 1
+        fields.update(dict(updates))
+        return {"success": True}
+
+    def add_comment(_project_key, _work_item_id, _content):
+        calls["add"] += 1
+        return {"success": True, "remote_id": "invisible-correction"}
+
+    dispatcher = _dispatcher(
+        store,
+        now=clock,
+        list_comments=list_comments,
+        add_comment=add_comment,
+        get_fields=get_fields,
+        update_fields=update_fields,
+    )
+    first = dispatcher.dispatch_one()
+    assert first.status == "uncertain"
+    assert calls == {"get": 2, "update": 1, "add": 1}
+    fields[RCA_RESULT_FIELD_KEY] = "字段被外部漂移"
+    clock.current = datetime.fromisoformat(first.next_attempt_at)
+
+    second = dispatcher.dispatch_one()
+
+    assert second.status == "uncertain"
+    assert second.error_code == "conclusion_adjudication_reconciliation_read_only"
+    assert calls == {"get": 3, "update": 1, "add": 1}
+    effect = next(
+        row
+        for row in store.list_rows("rca_delivery_effects")
+        if row["effect_key"] == result.correction_effect_key
+    )
+    assert effect["write_phase"] == "write_started"
+    assert effect["adjudication_comment_attempt_count"] == 1
+    with sqlite3.connect(store.db_path) as conn:
+        epochs = conn.execute(
+            "SELECT epoch_id, is_current FROM rca_activation_epochs ORDER BY epoch_id"
+        ).fetchall()
+    assert epochs == [("epoch-w16-active", 0), ("epoch-w16-rotated", 1)]
+
+
+@pytest.mark.parametrize("field_update_applied", [False, True])
+def test_unknown_field_update_is_never_repeated_on_adjudication_retry(
+    tmp_path, field_update_applied
+):
+    store = _seed_published_conclusion(tmp_path)
+    result = _record_retraction(store)
+    fields = {RCA_RESULT_FIELD_KEY: "候选结论：感知车道线责任域"}
+    comments = [
+        {
+            "remote_id": "original-comment",
+            "content": "[RCA_DELIVERY:original] candidate conclusion",
+        }
+    ]
+    calls = {"update": 0, "add": 0}
+
+    class Clock:
+        current = NOW
+
+        def __call__(self):
+            return self.current
+
+    clock = Clock()
+
+    def list_comments(_project_key, _work_item_id):
+        return {"success": True, "comments": list(comments), "pages_read": 1}
+
+    def get_fields(_project_key, _work_item_id, field_keys):
+        return {
+            "success": True,
+            "fields": {key: fields.get(key, "") for key in field_keys},
+        }
+
+    def update_fields(_project_key, _work_item_id, updates):
+        calls["update"] += 1
+        if field_update_applied:
+            fields.update(dict(updates))
+        raise TimeoutError("field update outcome is unknown")
+
+    def add_comment(_project_key, _work_item_id, content):
+        calls["add"] += 1
+        comments.append({"remote_id": "correction-comment", "content": content})
+        return {"success": True, "remote_id": "correction-comment"}
+
+    dispatcher = _dispatcher(
+        store,
+        now=clock,
+        list_comments=list_comments,
+        add_comment=add_comment,
+        get_fields=get_fields,
+        update_fields=update_fields,
+    )
+    first = dispatcher.dispatch_one()
+    assert first.status == "uncertain"
+    assert first.error_code == "feishu_field_update_outcome_unknown"
+    clock.current = datetime.fromisoformat(first.next_attempt_at)
+
+    second = dispatcher.dispatch_one()
+
+    assert calls["update"] == 1
+    effect = next(
+        row
+        for row in store.list_rows("rca_delivery_effects")
+        if row["effect_key"] == result.correction_effect_key
+    )
+    if field_update_applied:
+        assert second.status == "succeeded"
+        assert calls["add"] == 1
+        assert effect["write_phase"] == "settled"
+        assert effect["adjudication_comment_attempt_count"] == 1
+    else:
+        assert second.status == "uncertain"
+        assert (
+            second.error_code
+            == "conclusion_adjudication_field_reconciliation_read_only"
+        )
+        assert calls["add"] == 0
+        assert effect["write_phase"] == "write_started"
+        assert effect["adjudication_comment_attempt_count"] == 0
+    with sqlite3.connect(store.db_path) as conn:
+        [epoch] = conn.execute(
+            "SELECT epoch_id, state, is_current FROM rca_activation_epochs"
+        ).fetchall()
+    assert epoch == ("epoch-w16-active", "bounded_active", 1)
+
+
+def test_definite_field_prewrite_failure_can_retry_normally(tmp_path):
+    store = _seed_published_conclusion(tmp_path)
+    _record_retraction(store)
+    fields = {RCA_RESULT_FIELD_KEY: "候选结论：感知车道线责任域"}
+    comments = [
+        {
+            "remote_id": "original-comment",
+            "content": "[RCA_DELIVERY:original] candidate conclusion",
+        }
+    ]
+    calls = {"update": 0, "add": 0}
+
+    class Clock:
+        current = NOW
+
+        def __call__(self):
+            return self.current
+
+    clock = Clock()
+
+    def update_fields(_project_key, _work_item_id, updates):
+        calls["update"] += 1
+        if calls["update"] == 1:
+            return {
+                "success": False,
+                "outcome_uncertain": False,
+                "error_code": "meegle_field_update_rejected_prewrite",
+            }
+        fields.update(dict(updates))
+        return {"success": True}
+
+    def add_comment(_project_key, _work_item_id, content):
+        calls["add"] += 1
+        comments.append({"remote_id": "correction-comment", "content": content})
+        return {"success": True, "remote_id": "correction-comment"}
+
+    dispatcher = _dispatcher(
+        store,
+        now=clock,
+        list_comments=lambda *_args: {
+            "success": True,
+            "comments": list(comments),
+            "pages_read": 1,
+        },
+        add_comment=add_comment,
+        get_fields=lambda _project, _issue, keys: {
+            "success": True,
+            "fields": {key: fields.get(key, "") for key in keys},
+        },
+        update_fields=update_fields,
+    )
+    first = dispatcher.dispatch_one()
+    assert first.status == "retry_wait"
+    assert first.error_code == "meegle_field_update_rejected_prewrite"
+    correction = [
+        row
+        for row in store.list_rows("rca_delivery_effects")
+        if row["effect_key"] != ORIGINAL_EFFECT_KEY
+    ][0]
+    assert correction["write_phase"] == "prewrite"
+    clock.current = datetime.fromisoformat(first.next_attempt_at)
+
+    second = dispatcher.dispatch_one()
+
+    assert second.status == "succeeded"
+    assert calls == {"update": 2, "add": 1}
+
+
+def test_existing_correction_marker_with_field_drift_is_read_only(tmp_path):
+    store = _seed_published_conclusion(tmp_path)
+    result = _record_retraction(store)
+    correction = next(
+        row
+        for row in store.list_rows("rca_delivery_effects")
+        if row["effect_key"] == result.correction_effect_key
+    )
+    payload = json.loads(correction["payload_json"])
+    calls = {"update": 0, "add": 0}
+
+    dispatcher = _dispatcher(
+        store,
+        list_comments=lambda *_args: {
+            "success": True,
+            "comments": [
+                {"remote_id": "existing-correction", "content": payload["comment_content"]}
+            ],
+            "pages_read": 1,
+        },
+        add_comment=lambda *_args: calls.__setitem__("add", calls["add"] + 1),
+        get_fields=lambda _project, _issue, keys: {
+            "success": True,
+            "fields": {key: "field drift" for key in keys},
+        },
+        update_fields=lambda *_args: calls.__setitem__(
+            "update", calls["update"] + 1
+        ),
+    )
+
+    outcome = dispatcher.dispatch_one()
+
+    assert outcome.status == "uncertain"
+    assert (
+        outcome.error_code
+        == "conclusion_adjudication_field_reconciliation_read_only"
+    )
+    assert calls == {"update": 0, "add": 0}
+
+
 def test_owner_review_retract_command_uses_shared_adjudication_entrypoint(
     tmp_path, monkeypatch
 ):
@@ -788,11 +1279,7 @@ def test_owner_review_retract_command_uses_shared_adjudication_entrypoint(
 def test_read_only_audit_recomputes_budget_and_lineage_counts(tmp_path):
     store = _seed_published_conclusion(tmp_path)
     result = _record_retraction(store)
-    store.mark_conclusion_adjudication_artifact_repair(
-        adjudication_id=result.adjudication_id,
-        succeeded=True,
-        now=NOW,
-    )
+    _complete_artifact_repair(store, tmp_path, result)
     with sqlite3.connect(store.db_path) as conn:
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
@@ -811,6 +1298,177 @@ def test_read_only_audit_recomputes_budget_and_lineage_counts(tmp_path):
     assert audit["ga_acceptance_claimed"] is False
 
 
+def test_artifact_repair_cannot_be_marked_succeeded_without_exact_receipt(tmp_path):
+    store = _seed_published_conclusion(tmp_path)
+    result = _record_retraction(store)
+
+    with pytest.raises(
+        DeliveryRecordConflictError,
+        match="conclusion adjudication artifact receipt is required",
+    ):
+        store.mark_conclusion_adjudication_artifact_repair(
+            adjudication_id=result.adjudication_id,
+            succeeded=True,
+            now=NOW,
+        )
+
+    repair = store.conclusion_adjudication_artifact_repair(result.adjudication_id)
+    assert repair is not None
+    assert repair["status"] == "pending"
+    assert repair["receipt_path"] == ""
+    assert repair["receipt_length"] == 0
+
+
+def test_read_only_audit_rejects_tampered_exact_owner_review_receipt_line(
+    tmp_path,
+):
+    store = _seed_published_conclusion(tmp_path)
+    result = _record_retraction(store)
+    persisted = _complete_artifact_repair(store, tmp_path, result)
+    binding = persisted["receipt_binding"]
+    receipt_path = binding["path"]
+    with open(receipt_path, "r+b") as handle:
+        handle.seek(binding["offset"])
+        raw = handle.read(binding["length"])
+        assert b"ou_owner" in raw
+        tampered = raw.replace(b"ou_owner", b"ou_ownez", 1)
+        assert len(tampered) == len(raw)
+        handle.seek(binding["offset"])
+        handle.write(tampered)
+        handle.flush()
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    audit = audit_conclusion_adjudications(store.db_path)
+
+    assert audit["ok"] is False
+    assert audit["counts"]["ledger_payload_binding_mismatches"] == 1
+    assert any(
+        "conclusion_adjudication_artifact_receipt_hash_invalid" in item["error"]
+        for item in audit["binding_validation_errors"]
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["reason", "owner_name", "reviewed_at", "verdict", "action", "event_id"],
+)
+def test_read_only_audit_rejects_semantically_substituted_owner_receipt(
+    tmp_path, mutation
+):
+    store = _seed_published_conclusion(tmp_path)
+    result = _record_retraction(store)
+    persisted = _complete_artifact_repair(store, tmp_path, result)
+    binding = persisted["receipt_binding"]
+    path = binding["path"]
+    with open(path, "rb") as handle:
+        handle.seek(binding["offset"])
+        receipt = json.loads(handle.read(binding["length"]))
+    if mutation == "reason":
+        receipt["reason"] = "替换后的内部理由"
+    elif mutation == "owner_name":
+        receipt["owner_name"] = "Different Owner"
+    elif mutation == "reviewed_at":
+        receipt["reviewed_at"] = "2026-07-25T11:31:00+00:00"
+    elif mutation == "verdict":
+        receipt["verdict"] = "approved"
+    elif mutation == "action":
+        receipt["action"] = "通过"
+    else:
+        receipt["review_event_id"] = "g1q3-rca-owner-review-v1-" + "f" * 64
+    if mutation != "event_id":
+        material = {
+            key: receipt.get(key)
+            for key in (
+                "issue_id",
+                "action",
+                "reason",
+                "owner_id",
+                "adjudication_id",
+                "source",
+            )
+        }
+        receipt["review_event_id"] = "g1q3-rca-owner-review-v1-" + hashlib.sha256(
+            json.dumps(
+                material,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+    replacement = (json.dumps(receipt, ensure_ascii=False, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
+    with open(path, "ab") as handle:
+        replacement_offset = handle.tell()
+        handle.write(replacement)
+        handle.flush()
+    observed = os.stat(path)
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            """
+            UPDATE rca_conclusion_adjudication_repairs
+               SET receipt_offset = ?, receipt_length = ?, receipt_sha256 = ?,
+                   receipt_device = ?, receipt_inode = ?, receipt_event_id = ?
+             WHERE adjudication_id = ?
+            """,
+            (
+                replacement_offset,
+                len(replacement),
+                hashlib.sha256(replacement).hexdigest(),
+                observed.st_dev,
+                observed.st_ino,
+                receipt["review_event_id"],
+                result.adjudication_id,
+            ),
+        )
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    audit = audit_conclusion_adjudications(store.db_path)
+
+    assert audit["ok"] is False
+    assert audit["counts"]["ledger_payload_binding_mismatches"] == 1
+    assert any(
+        "conclusion_adjudication_artifact_receipt_ledger_mismatch" in item["error"]
+        for item in audit["binding_validation_errors"]
+    )
+
+
+@pytest.mark.parametrize("link_kind", ["hardlink", "symlink"])
+def test_artifact_repair_rejects_linked_receipt_paths(tmp_path, link_kind):
+    store = _seed_published_conclusion(tmp_path)
+    result = _record_retraction(store)
+    persisted = _complete_artifact_repair(
+        store,
+        tmp_path,
+        result,
+        mark_succeeded=False,
+    )
+    binding = dict(persisted["receipt_binding"])
+    linked = tmp_path / f"linked-{link_kind}.jsonl"
+    if link_kind == "hardlink":
+        os.link(binding["path"], linked)
+    else:
+        os.symlink(binding["path"], linked)
+    binding["path"] = str(linked)
+
+    with pytest.raises(
+        ConclusionAdjudicationError,
+        match="conclusion_adjudication_artifact_receipt_",
+    ):
+        store.mark_conclusion_adjudication_artifact_repair(
+            adjudication_id=result.adjudication_id,
+            succeeded=True,
+            receipt_binding=binding,
+            now=NOW,
+        )
+
+    repair = store.conclusion_adjudication_artifact_repair(result.adjudication_id)
+    assert repair is not None
+    assert repair["status"] == "pending"
+
+
 @pytest.mark.parametrize(
     ("tamper", "error_fragment"),
     [
@@ -827,11 +1485,7 @@ def test_read_only_audit_recomputes_every_binding_and_rejects_tampering(
 ):
     store = _seed_published_conclusion(tmp_path)
     result = _record_retraction(store)
-    store.mark_conclusion_adjudication_artifact_repair(
-        adjudication_id=result.adjudication_id,
-        succeeded=True,
-        now=NOW,
-    )
+    _complete_artifact_repair(store, tmp_path, result)
     with sqlite3.connect(store.db_path) as conn:
         if tamper == "content":
             row = conn.execute(
@@ -919,11 +1573,7 @@ def test_read_only_audit_recomputes_every_binding_and_rejects_tampering(
 def test_audit_keeps_succeeded_correction_valid_after_epoch_rotation(tmp_path):
     store = _seed_published_conclusion(tmp_path)
     result = _record_retraction(store)
-    store.mark_conclusion_adjudication_artifact_repair(
-        adjudication_id=result.adjudication_id,
-        succeeded=True,
-        now=NOW,
-    )
+    _complete_artifact_repair(store, tmp_path, result)
     with sqlite3.connect(store.db_path) as conn:
         conn.execute(
             "UPDATE rca_delivery_effects "
@@ -953,11 +1603,7 @@ def test_audit_keeps_succeeded_correction_valid_after_epoch_rotation(tmp_path):
 def test_audit_rejects_unresolved_correction_after_epoch_rotation(tmp_path):
     store = _seed_published_conclusion(tmp_path)
     result = _record_retraction(store)
-    store.mark_conclusion_adjudication_artifact_repair(
-        adjudication_id=result.adjudication_id,
-        succeeded=True,
-        now=NOW,
-    )
+    _complete_artifact_repair(store, tmp_path, result)
     with sqlite3.connect(store.db_path) as conn:
         conn.execute(
             "UPDATE rca_activation_epochs SET is_current = 0 "

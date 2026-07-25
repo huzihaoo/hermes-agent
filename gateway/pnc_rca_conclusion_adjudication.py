@@ -6,8 +6,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
+from pathlib import Path
 import re
 import sqlite3
+import stat
 from typing import Any, Literal, Mapping
 
 from gateway.pnc_rca_delivery_contract import (
@@ -33,6 +36,22 @@ ADJUDICATION_STATES = {
 _WORK_ITEM_ID_RE = re.compile(r"^[0-9]{1,32}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+ADJUDICATION_ARTIFACT_RECEIPT_SCHEMA_VERSION = (
+    "g1q3_rca_owner_review_artifact_receipt_v1"
+)
+MAX_ADJUDICATION_RECEIPT_LINE_BYTES = 1024 * 1024
+_ARTIFACT_RECEIPT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "path",
+        "offset",
+        "length",
+        "sha256",
+        "device",
+        "inode",
+        "review_event_id",
+    }
+)
 
 
 class ConclusionAdjudicationError(RuntimeError):
@@ -51,6 +70,7 @@ class ConclusionAdjudicationResult:
     original_effect_key: str
     correction_effect_key: str
     created: bool
+    created_at: str
     impact_lineage: dict[str, Any]
     artifact_repair_status: str = "pending"
 
@@ -90,9 +110,229 @@ def _json_object(value: Any, *, field: str) -> dict[str, Any]:
     return parsed
 
 
+def _execute_schema_script(conn: sqlite3.Connection, script: str) -> None:
+    pending = ""
+    for line in script.splitlines(keepends=True):
+        pending += line
+        if sqlite3.complete_statement(pending):
+            statement = pending.strip()
+            if statement:
+                conn.execute(statement)
+            pending = ""
+    if pending.strip():
+        raise RuntimeError("incomplete_conclusion_adjudication_schema_script")
+
+
+def _normalized_artifact_receipt(value: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != _ARTIFACT_RECEIPT_FIELDS:
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_artifact_receipt_shape_invalid"
+        )
+    path = Path(str(value.get("path") or "")).expanduser()
+    if not path.is_absolute() or str(path) != str(path.absolute()):
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_artifact_receipt_path_invalid"
+        )
+    offset = value.get("offset")
+    length = value.get("length")
+    device = value.get("device")
+    inode = value.get("inode")
+    if (
+        value.get("schema_version")
+        != ADJUDICATION_ARTIFACT_RECEIPT_SCHEMA_VERSION
+        or isinstance(offset, bool)
+        or not isinstance(offset, int)
+        or offset < 0
+        or isinstance(length, bool)
+        or not isinstance(length, int)
+        or length <= 1
+        or length > MAX_ADJUDICATION_RECEIPT_LINE_BYTES
+        or isinstance(device, bool)
+        or not isinstance(device, int)
+        or device <= 0
+        or isinstance(inode, bool)
+        or not isinstance(inode, int)
+        or inode <= 0
+        or _SHA256_RE.fullmatch(str(value.get("sha256") or "")) is None
+        or not str(value.get("review_event_id") or "").strip()
+    ):
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_artifact_receipt_shape_invalid"
+        )
+    return {
+        "schema_version": ADJUDICATION_ARTIFACT_RECEIPT_SCHEMA_VERSION,
+        "path": str(path),
+        "offset": offset,
+        "length": length,
+        "sha256": str(value["sha256"]),
+        "device": device,
+        "inode": inode,
+        "review_event_id": str(value["review_event_id"]),
+    }
+
+
+def validate_conclusion_adjudication_artifact_receipt(
+    value: Mapping[str, Any], *, adjudication: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Recompute one immutable owner-review JSONL line and its ledger binding."""
+
+    normalized = _normalized_artifact_receipt(value)
+    path = Path(normalized["path"])
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "pread"):
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_artifact_receipt_nofollow_unavailable"
+        )
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW,
+        )
+    except OSError as exc:
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_artifact_receipt_unavailable"
+        ) from exc
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_dev != normalized["device"]
+            or before.st_ino != normalized["inode"]
+            or before.st_size < normalized["offset"] + normalized["length"]
+        ):
+            raise ConclusionAdjudicationError(
+                "conclusion_adjudication_artifact_receipt_identity_invalid"
+            )
+        raw = os.pread(descriptor, normalized["length"], normalized["offset"])
+        after = os.fstat(descriptor)
+        lexical = os.lstat(path)
+        if (
+            len(raw) != normalized["length"]
+            or stat.S_ISLNK(lexical.st_mode)
+            or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            or (after.st_dev, after.st_ino) != (lexical.st_dev, lexical.st_ino)
+        ):
+            raise ConclusionAdjudicationError(
+                "conclusion_adjudication_artifact_receipt_identity_invalid"
+            )
+    except ConclusionAdjudicationError:
+        raise
+    except OSError as exc:
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_artifact_receipt_unavailable"
+        ) from exc
+    finally:
+        os.close(descriptor)
+    if (
+        not raw.endswith(b"\n")
+        or raw.count(b"\n") != 1
+        or hashlib.sha256(raw).hexdigest() != normalized["sha256"]
+    ):
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_artifact_receipt_hash_invalid"
+        )
+    def unique_object(items: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, item in items:
+            if key in result:
+                raise ConclusionAdjudicationError(
+                    "conclusion_adjudication_artifact_receipt_json_invalid"
+                )
+            result[key] = item
+        return result
+
+    def invalid_number(_value: str) -> None:
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_artifact_receipt_json_invalid"
+        )
+
+    try:
+        receipt = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=unique_object,
+            parse_constant=invalid_number,
+        )
+    except ConclusionAdjudicationError:
+        raise
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_artifact_receipt_json_invalid"
+        ) from exc
+    try:
+        source = json.loads(str(adjudication.get("source_json") or ""))
+        lineage = json.loads(str(adjudication.get("lineage_json") or ""))
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_artifact_receipt_ledger_invalid"
+        ) from exc
+    expected_action = {"retract": "撤回", "recognize": "通过"}.get(
+        str(adjudication.get("action") or ""), ""
+    )
+    expected_verdict = {"retract": "retracted", "recognize": "approved"}.get(
+        str(adjudication.get("action") or ""), ""
+    )
+    if not isinstance(receipt, dict):
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_artifact_receipt_json_invalid"
+        )
+    event_material = {
+        key: receipt.get(key)
+        for key in (
+            "issue_id",
+            "action",
+            "reason",
+            "owner_id",
+            "adjudication_id",
+            "source",
+        )
+    }
+    expected_event_id = "g1q3-rca-owner-review-v1-" + hashlib.sha256(
+        _canonical_json(event_material).encode("utf-8")
+    ).hexdigest()
+    receipt_parent = path.parent
+    ledger_path = Path(str(receipt.get("ledger_path") or ""))
+    sidecar_path = Path(str(receipt.get("business_state_sidecar_path") or ""))
+    if (
+        receipt.get("schema_version") != "g1q3_rca_owner_review_v1"
+        or receipt.get("event_type") != "owner_review"
+        or receipt.get("review_event_id") != normalized["review_event_id"]
+        or receipt.get("review_event_id") != expected_event_id
+        or receipt.get("adjudication_id") != adjudication.get("adjudication_id")
+        or receipt.get("issue_id") != adjudication.get("work_item_id")
+        or receipt.get("action") != expected_action
+        or receipt.get("verdict") != expected_verdict
+        or receipt.get("reason") != adjudication.get("reason")
+        or receipt.get("owner_id") != adjudication.get("actor_id")
+        or receipt.get("owner_name") != adjudication.get("actor_name")
+        or receipt.get("reviewed_at") != adjudication.get("created_at")
+        or receipt.get("original_effect_key")
+        != adjudication.get("original_effect_key")
+        or receipt.get("correction_effect_key")
+        != adjudication.get("correction_effect_key")
+        or receipt.get("conclusion_state")
+        != adjudication.get("conclusion_state")
+        or receipt.get("source") != source
+        or receipt.get("impact_lineage") != lineage
+        or receipt.get("override") is not True
+        or not ledger_path.is_absolute()
+        or ledger_path != receipt_parent / "ledger.json"
+        or not sidecar_path.is_absolute()
+        or sidecar_path
+        != receipt_parent
+        / "business-states"
+        / f"G1Q3-{adjudication.get('work_item_id')}.business-state.yaml"
+    ):
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_artifact_receipt_ledger_mismatch"
+        )
+    return normalized
+
+
 def ensure_conclusion_adjudication_schema(conn: sqlite3.Connection) -> None:
     """Install the immutable adjudication ledger in the delivery database."""
-    conn.executescript(
+    _execute_schema_script(
+        conn,
         """
         CREATE TABLE IF NOT EXISTS rca_conclusion_adjudications (
             adjudication_id TEXT PRIMARY KEY,
@@ -153,6 +393,14 @@ def ensure_conclusion_adjudication_schema(conn: sqlite3.Connection) -> None:
             attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
             last_error_code TEXT NOT NULL DEFAULT '',
             last_error_detail TEXT NOT NULL DEFAULT '',
+            receipt_schema_version TEXT NOT NULL DEFAULT '',
+            receipt_path TEXT NOT NULL DEFAULT '',
+            receipt_offset INTEGER NOT NULL DEFAULT -1 CHECK (receipt_offset >= -1),
+            receipt_length INTEGER NOT NULL DEFAULT 0 CHECK (receipt_length >= 0),
+            receipt_sha256 TEXT NOT NULL DEFAULT '',
+            receipt_device INTEGER NOT NULL DEFAULT 0 CHECK (receipt_device >= 0),
+            receipt_inode INTEGER NOT NULL DEFAULT 0 CHECK (receipt_inode >= 0),
+            receipt_event_id TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             completed_at TEXT,
@@ -162,8 +410,31 @@ def ensure_conclusion_adjudication_schema(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_rca_conclusion_adjudication_repairs_status
             ON rca_conclusion_adjudication_repairs(status, updated_at);
-        """
+        """,
     )
+    repair_columns = {
+        str(row[1])
+        for row in conn.execute(
+            "PRAGMA table_info(rca_conclusion_adjudication_repairs)"
+        ).fetchall()
+    }
+    for name, definition in {
+        "receipt_schema_version": "TEXT NOT NULL DEFAULT ''",
+        "receipt_path": "TEXT NOT NULL DEFAULT ''",
+        "receipt_offset": (
+            "INTEGER NOT NULL DEFAULT -1 CHECK (receipt_offset >= -1)"
+        ),
+        "receipt_length": "INTEGER NOT NULL DEFAULT 0 CHECK (receipt_length >= 0)",
+        "receipt_sha256": "TEXT NOT NULL DEFAULT ''",
+        "receipt_device": "INTEGER NOT NULL DEFAULT 0 CHECK (receipt_device >= 0)",
+        "receipt_inode": "INTEGER NOT NULL DEFAULT 0 CHECK (receipt_inode >= 0)",
+        "receipt_event_id": "TEXT NOT NULL DEFAULT ''",
+    }.items():
+        if name not in repair_columns:
+            conn.execute(
+                "ALTER TABLE rca_conclusion_adjudication_repairs "
+                f"ADD COLUMN {name} {definition}"
+            )
     current = datetime.now(timezone.utc).isoformat()
     conn.execute(
         """
@@ -228,6 +499,14 @@ def validate_conclusion_adjudication_schema(conn: sqlite3.Connection) -> None:
         "attempt_count",
         "last_error_code",
         "last_error_detail",
+        "receipt_schema_version",
+        "receipt_path",
+        "receipt_offset",
+        "receipt_length",
+        "receipt_sha256",
+        "receipt_device",
+        "receipt_inode",
+        "receipt_event_id",
         "created_at",
         "updated_at",
         "completed_at",
@@ -301,9 +580,25 @@ def validate_conclusion_adjudication_schema(conn: sqlite3.Connection) -> None:
          WHERE a.schema_version != ?
             OR TRIM(a.activation_epoch_id) = ''
             OR r.adjudication_id IS NULL
+            OR (
+                r.status = 'succeeded'
+                AND (
+                    r.receipt_schema_version != ?
+                    OR TRIM(r.receipt_path) = ''
+                    OR r.receipt_offset < 0
+                    OR r.receipt_length <= 0
+                    OR LENGTH(r.receipt_sha256) != 64
+                    OR r.receipt_device <= 0
+                    OR r.receipt_inode <= 0
+                    OR TRIM(r.receipt_event_id) = ''
+                )
+            )
          LIMIT 1
         """,
-        (ADJUDICATION_SCHEMA_VERSION,),
+        (
+            ADJUDICATION_SCHEMA_VERSION,
+            ADJUDICATION_ARTIFACT_RECEIPT_SCHEMA_VERSION,
+        ),
     ).fetchone()
     if invalid is not None:
         raise RuntimeError("rca_conclusion_adjudication_schema_not_current")
@@ -337,6 +632,14 @@ def _impact_lineage(row: sqlite3.Row) -> dict[str, Any]:
         raise ConclusionAdjudicationError(
             "conclusion_adjudication_impact_window_unavailable"
         )
+    if not evaluator_refs:
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_evaluator_refs_unresolved"
+        )
+    if not responsibility_domain or responsibility_domain.lower() == "unresolved":
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_responsibility_domain_unresolved"
+        )
     return {
         "schema_version": "pnc_rca_conclusion_impact_lineage_v1",
         "business_key": str(row["business_key"]),
@@ -347,8 +650,8 @@ def _impact_lineage(row: sqlite3.Row) -> dict[str, Any]:
         "original_delivery_id": str(row["delivery_id"]),
         "original_effect_key": str(row["effect_key"]),
         "evaluator_refs": evaluator_refs,
-        "evaluator_resolution": "resolved" if evaluator_refs else "unresolved",
-        "responsibility_domain": responsibility_domain or "unresolved",
+        "evaluator_resolution": "resolved",
+        "responsibility_domain": responsibility_domain,
         "impact_window": {"start": start, "end": end},
     }
 
@@ -658,6 +961,7 @@ def record_conclusion_adjudication_tx(
             original_effect_key=str(row["effect_key"]),
             correction_effect_key=str(existing["correction_effect_key"]),
             created=False,
+            created_at=str(existing["created_at"]),
             impact_lineage=lineage,
             artifact_repair_status=(
                 str(repair["status"]) if repair is not None else "pending"
@@ -784,6 +1088,7 @@ def record_conclusion_adjudication_tx(
         original_effect_key=str(row["effect_key"]),
         correction_effect_key=effect_key,
         created=True,
+        created_at=current,
         impact_lineage=lineage,
         artifact_repair_status="pending",
     )

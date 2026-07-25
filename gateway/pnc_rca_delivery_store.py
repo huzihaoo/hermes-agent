@@ -39,6 +39,7 @@ from gateway.pnc_rca_conclusion_adjudication import (
     ensure_conclusion_adjudication_schema,
     identifies_adjudication_effect,
     record_conclusion_adjudication_tx,
+    validate_conclusion_adjudication_artifact_receipt,
     validate_adjudication_effect_ledger_binding,
     validate_conclusion_adjudication_schema,
 )
@@ -49,8 +50,9 @@ from gateway.pnc_rca_runtime_transition import (
 )
 
 
-DELIVERY_STORE_SCHEMA_VERSION = "pnc_rca_delivery_store_v8"
+DELIVERY_STORE_SCHEMA_VERSION = "pnc_rca_delivery_store_v9"
 DELIVERY_STORE_SCHEMA_PREDECESSOR_VERSION = "pnc_rca_delivery_store_v7"
+DELIVERY_STORE_W2_SCHEMA_VERSION = "pnc_rca_delivery_store_v8"
 DELIVERY_BACKPRESSURE_SNAPSHOT_SCHEMA_VERSION = (
     "pnc_rca_delivery_backpressure_snapshot_v2"
 )
@@ -89,6 +91,7 @@ SUPPORTED_DELIVERY_STORE_SCHEMA_VERSIONS = frozenset({
     "pnc_rca_delivery_store_v5",
     "pnc_rca_delivery_store_v6",
     DELIVERY_STORE_SCHEMA_PREDECESSOR_VERSION,
+    DELIVERY_STORE_W2_SCHEMA_VERSION,
     DELIVERY_STORE_SCHEMA_VERSION,
 })
 _FAILURE_ROUTE_REQUIRED_COLUMNS = frozenset({
@@ -878,61 +881,6 @@ class RcaDeliveryStore:
                     FOREIGN KEY(submission_outbox_id) REFERENCES rca_outbox(outbox_id)
                 );
 
-                CREATE TABLE IF NOT EXISTS rca_failure_routes (
-                    route_key TEXT PRIMARY KEY,
-                    dedupe_key TEXT NOT NULL UNIQUE,
-                    submission_key TEXT NOT NULL,
-                    business_key TEXT NOT NULL,
-                    generation INTEGER NOT NULL CHECK (generation >= 1),
-                    task_id TEXT NOT NULL,
-                    terminal_error_code TEXT NOT NULL,
-                    lane TEXT NOT NULL CHECK (
-                        lane IN (
-                            'infra_self_healable', 'needs_human_input',
-                            'hard_defect'
-                        )
-                    ),
-                    route_kind TEXT NOT NULL CHECK (
-                        route_kind IN (
-                            'infra_remediation_hold', 'internal_backlog',
-                            'internal_alert'
-                        )
-                    ),
-                    owner TEXT NOT NULL,
-                    status TEXT NOT NULL CHECK (
-                        status IN (
-                            'remediation_pending', 'remediation_started',
-                            'remediation_succeeded', 'remediation_held',
-                            'backlog_pending', 'alert_pending',
-                            'terminal_fallback', 'resolved'
-                        )
-                    ),
-                    work_started_at TEXT NOT NULL,
-                    deadline_at TEXT NOT NULL,
-                    first_observed_at TEXT NOT NULL,
-                    last_observed_at TEXT NOT NULL,
-                    remediation_attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (
-                        remediation_attempt_count BETWEEN 0 AND 1
-                    ),
-                    observation_count INTEGER NOT NULL DEFAULT 1 CHECK (
-                        observation_count >= 1
-                    ),
-                    retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
-                    remediation_attempted_at TEXT,
-                    remediation_result_json TEXT NOT NULL DEFAULT '{}',
-                    next_retry_at TEXT,
-                    retry_exhausted INTEGER NOT NULL DEFAULT 0 CHECK (
-                        retry_exhausted IN (0, 1)
-                    ),
-                    audit_json TEXT NOT NULL,
-                    route_payload_json TEXT NOT NULL,
-                    completed_at TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    FOREIGN KEY(submission_key)
-                        REFERENCES rca_execution_watch(submission_key)
-                );
-
                 CREATE TABLE IF NOT EXISTS rca_delivery_jobs (
                     delivery_id TEXT PRIMARY KEY,
                     submission_key TEXT NOT NULL UNIQUE,
@@ -1046,10 +994,6 @@ class RcaDeliveryStore:
 
                 CREATE INDEX IF NOT EXISTS idx_execution_watch_due
                     ON rca_execution_watch(state, next_poll_at, lease_expires_at);
-                CREATE INDEX IF NOT EXISTS idx_failure_routes_status
-                    ON rca_failure_routes(status, owner, deadline_at);
-                CREATE INDEX IF NOT EXISTS idx_failure_routes_submission
-                    ON rca_failure_routes(submission_key, created_at);
                 CREATE INDEX IF NOT EXISTS idx_delivery_jobs_status
                     ON rca_delivery_jobs(status, created_at);
                 CREATE INDEX IF NOT EXISTS idx_delivery_jobs_updated_at
@@ -1059,7 +1003,6 @@ class RcaDeliveryStore:
                 """
             )
             ensure_host_runtime_transition_schema(conn)
-            ensure_conclusion_adjudication_schema(conn)
             self._migrate_schema(conn)
             validate_host_runtime_transition_schema(
                 conn,
@@ -1316,6 +1259,7 @@ class RcaDeliveryStore:
             "SET write_started_at = COALESCE(write_started_at, updated_at, created_at) "
             "WHERE write_phase = 'write_started' AND write_started_at IS NULL"
         )
+        ensure_conclusion_adjudication_schema(conn)
 
         attempt_columns = {
             str(row["name"])
@@ -1638,9 +1582,15 @@ class RcaDeliveryStore:
                 ON rca_failure_routes(submission_key, created_at);
             """,
         )
+        validate_conclusion_adjudication_schema(conn)
+        RcaDeliveryStore._validate_failure_route_schema(conn)
+        quick_check = conn.execute("PRAGMA quick_check").fetchone()
+        if quick_check is None or str(quick_check[0]).lower() != "ok":
+            raise RuntimeError("incompatible_delivery_store_schema:quick_check")
         if initial_schema_version in {
             "pnc_rca_delivery_store_v6",
             DELIVERY_STORE_SCHEMA_PREDECESSOR_VERSION,
+            DELIVERY_STORE_W2_SCHEMA_VERSION,
         }:
             conn.execute(
                 "UPDATE rca_delivery_meta SET value = ? WHERE key = 'schema_version'",
@@ -1783,6 +1733,7 @@ class RcaDeliveryStore:
         *,
         adjudication_id: str,
         succeeded: bool,
+        receipt_binding: Mapping[str, Any] | None = None,
         error_code: str = "",
         error_detail: str = "",
         now: datetime | None = None,
@@ -1792,11 +1743,48 @@ class RcaDeliveryStore:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            repair_row = conn.execute(
+                "SELECT status FROM rca_conclusion_adjudication_repairs "
+                "WHERE adjudication_id = ?",
+                (adjudication_id,),
+            ).fetchone()
+            if repair_row is None:
+                raise DeliveryRecordConflictError(
+                    "conclusion adjudication repair row is missing"
+                )
+            if not succeeded and str(repair_row["status"] or "") == "succeeded":
+                conn.commit()
+                return "succeeded"
+            normalized_receipt: dict[str, Any] | None = None
+            if succeeded:
+                adjudication = conn.execute(
+                    "SELECT * FROM rca_conclusion_adjudications "
+                    "WHERE adjudication_id = ?",
+                    (adjudication_id,),
+                ).fetchone()
+                if adjudication is None:
+                    raise DeliveryRecordConflictError(
+                        "conclusion adjudication repair row is missing"
+                    )
+                if receipt_binding is None:
+                    raise DeliveryRecordConflictError(
+                        "conclusion adjudication artifact receipt is required"
+                    )
+                normalized_receipt = (
+                    validate_conclusion_adjudication_artifact_receipt(
+                        receipt_binding,
+                        adjudication=dict(adjudication),
+                    )
+                )
             updated = conn.execute(
                 """
                 UPDATE rca_conclusion_adjudication_repairs
                    SET status = ?, attempt_count = attempt_count + 1,
                        last_error_code = ?, last_error_detail = ?,
+                       receipt_schema_version = ?, receipt_path = ?,
+                       receipt_offset = ?, receipt_length = ?,
+                       receipt_sha256 = ?, receipt_device = ?,
+                       receipt_inode = ?, receipt_event_id = ?,
                        completed_at = CASE WHEN ? = 'succeeded' THEN ? ELSE NULL END,
                        updated_at = ?
                  WHERE adjudication_id = ?
@@ -1805,6 +1793,14 @@ class RcaDeliveryStore:
                     status,
                     "" if succeeded else str(error_code or "artifact_repair_failed")[:120],
                     "" if succeeded else str(error_detail or "")[:1000],
+                    normalized_receipt["schema_version"] if normalized_receipt else "",
+                    normalized_receipt["path"] if normalized_receipt else "",
+                    normalized_receipt["offset"] if normalized_receipt else -1,
+                    normalized_receipt["length"] if normalized_receipt else 0,
+                    normalized_receipt["sha256"] if normalized_receipt else "",
+                    normalized_receipt["device"] if normalized_receipt else 0,
+                    normalized_receipt["inode"] if normalized_receipt else 0,
+                    normalized_receipt["review_event_id"] if normalized_receipt else "",
                     status,
                     current,
                     current,
@@ -4085,6 +4081,10 @@ class RcaDeliveryStore:
                 raise StaleDeliveryEffectLeaseError(
                     f"delivery activation changed for {claim.effect_key}"
                 )
+            if str(row["write_phase"] or "") != "write_started":
+                raise DeliveryRecordConflictError(
+                    "adjudication comment requires an entered write boundary"
+                )
             if int(row["adjudication_comment_attempt_count"]) != 0:
                 conn.commit()
                 return False
@@ -4095,6 +4095,7 @@ class RcaDeliveryStore:
                        adjudication_comment_attempted_at = ?, updated_at = ?
                  WHERE effect_key = ? AND lease_token = ? AND fence = ?
                    AND status = 'claimed'
+                   AND write_phase = 'write_started'
                    AND adjudication_comment_attempt_count = 0
                 """,
                 (

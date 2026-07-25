@@ -23,8 +23,10 @@ from gateway.pnc_rca_delivery_quarantine_migration import (
     QuarantineMigrationError,
     assert_live_post_migration_matches,
     assert_live_pre_migration_matches,
+    build_combined_offline_migration_receipt,
     build_offline_migration_receipt,
     canonical_migration_receipt_bytes,
+    validate_combined_migration_receipt,
 )
 from gateway.pnc_rca_delivery_store import RcaDeliveryStore
 from tests.gateway.test_pnc_rca_delivery_store import (
@@ -191,6 +193,14 @@ def _prepare_offline_migration(store: RcaDeliveryStore, root: Path) -> dict:
     shutil.copyfile(source_backup, clone_path)
     clone_path.chmod(0o600)
     RcaDeliveryStore(clone_path)
+    with sqlite3.connect(clone_path) as conn:
+        conn.execute(
+            "UPDATE rca_delivery_meta SET value = 'pnc_rca_delivery_store_v8' "
+            "WHERE key = 'schema_version'"
+        )
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.execute("PRAGMA journal_mode=DELETE")
     clone_path.chmod(0o600)
     receipt = build_offline_migration_receipt(
         source_backup_path=source_backup,
@@ -210,6 +220,94 @@ def _prepare_offline_migration(store: RcaDeliveryStore, root: Path) -> dict:
         "runtime_sha256": MIGRATION_RUNTIME_SHA256,
         "live_path": live_path,
     }
+
+
+def _prepare_combined_schema_migration(root: Path, source_version: str) -> dict:
+    root.mkdir(parents=True, exist_ok=True)
+    live_path = root / "live-control.sqlite3"
+    RcaDeliveryStore(live_path)
+    with sqlite3.connect(live_path) as conn:
+        conn.executescript(
+            """
+            DROP TABLE rca_conclusion_adjudication_repairs;
+            DROP TABLE rca_conclusion_adjudications;
+            ALTER TABLE rca_delivery_effects
+                DROP COLUMN adjudication_comment_attempted_at;
+            ALTER TABLE rca_delivery_effects
+                DROP COLUMN adjudication_comment_attempt_count;
+            """
+        )
+        if source_version == "pnc_rca_delivery_store_v7":
+            conn.execute("DROP TABLE rca_failure_routes")
+        conn.execute(
+            "UPDATE rca_delivery_meta SET value = ? WHERE key = 'schema_version'",
+            (source_version,),
+        )
+    source_backup = root / f"control.{source_version.rsplit('_', 1)[-1]}.backup.sqlite3"
+    source = sqlite3.connect(live_path)
+    destination = sqlite3.connect(source_backup)
+    try:
+        source.backup(destination)
+        destination.execute("PRAGMA journal_mode=DELETE")
+        destination.commit()
+    finally:
+        destination.close()
+        source.close()
+    source_backup.chmod(0o600)
+    clone_path = root / "control.v9.offline-clone.sqlite3"
+    shutil.copyfile(source_backup, clone_path)
+    clone_path.chmod(0o600)
+    RcaDeliveryStore(clone_path)
+    with sqlite3.connect(clone_path) as conn:
+        assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.execute("PRAGMA journal_mode=DELETE")
+    clone_path.chmod(0o600)
+    receipt = build_combined_offline_migration_receipt(
+        source_backup_path=source_backup,
+        migrated_clone_path=clone_path,
+        target_live_db_path=live_path,
+        migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+    )
+    receipt_path = root / "combined-offline-migration-receipt.json"
+    receipt_path.write_bytes(canonical_migration_receipt_bytes(receipt))
+    receipt_path.chmod(0o600)
+    return {
+        "live_path": live_path,
+        "source_backup": source_backup,
+        "clone_path": clone_path,
+        "receipt": receipt,
+        "receipt_path": receipt_path,
+        "receipt_sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+    }
+
+
+@pytest.mark.parametrize(
+    "source_version",
+    ["pnc_rca_delivery_store_v7", "pnc_rca_delivery_store_v8"],
+)
+def test_combined_v2_offline_receipt_requires_quick_checked_copy_and_rollback(
+    tmp_path, source_version
+):
+    migration = _prepare_combined_schema_migration(tmp_path, source_version)
+
+    binding = validate_combined_migration_receipt(
+        receipt_path=migration["receipt_path"],
+        expected_sha256=migration["receipt_sha256"],
+        target_live_db_path=migration["live_path"],
+        migrated_db_path=migration["clone_path"],
+        expected_migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+    )
+
+    assert binding["source_schema_version"] == source_version
+    assert binding["target_schema_version"] == "pnc_rca_delivery_store_v9"
+    assert binding["source_quick_check"] == "ok"
+    assert binding["target_quick_check"] == "ok"
+    assert binding["rollback_path"] == str(migration["source_backup"])
+    assert binding["rollback_sha256"] == hashlib.sha256(
+        migration["source_backup"].read_bytes()
+    ).hexdigest()
+    assert binding["no_live_database_writes"] is True
 
 
 def _migration_kwargs(migration: dict) -> dict:
@@ -243,6 +341,14 @@ def _migrate_live(migration: dict) -> None:
     assert precheck["live_validation"]["sidecars"] == []
     assert precheck["live_validation"]["journal_mode"] in {"delete", "wal"}
     RcaDeliveryStore(migration["live_path"])
+    with sqlite3.connect(migration["live_path"]) as conn:
+        conn.execute(
+            "UPDATE rca_delivery_meta SET value = 'pnc_rca_delivery_store_v8' "
+            "WHERE key = 'schema_version'"
+        )
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.execute("PRAGMA journal_mode=DELETE")
     migration["live_path"].chmod(0o600)
     before_postcheck = _live_file_state(migration["live_path"])
     postcheck = assert_live_post_migration_matches(

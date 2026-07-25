@@ -2939,6 +2939,30 @@ class DeliveryDispatcher:
                 existing_marker,
                 source="read_before_write",
             )
+        if adjudication_effect and claim.adjudication_comment_attempt_count > 0:
+            return self._retry(
+                claim,
+                error_code="conclusion_adjudication_reconciliation_read_only",
+                detail=(
+                    "the single correction-comment attempt was already consumed; "
+                    "fields and comments are read-only until the exact effect is visible"
+                ),
+                uncertain=True,
+                exact_delay_seconds=UNCERTAIN_RECONCILIATION_POLL_SECONDS,
+            )
+        if adjudication_effect and not fields_match and (
+            claim.write_phase == "write_started" or existing_marker is not None
+        ):
+            return self._retry(
+                claim,
+                error_code="conclusion_adjudication_field_reconciliation_read_only",
+                detail=(
+                    "the correction crossed an outward-write boundary; mismatched fields "
+                    "must not be rewritten during reconciliation"
+                ),
+                uncertain=True,
+                exact_delay_seconds=UNCERTAIN_RECONCILIATION_POLL_SECONDS,
+            )
 
         recovery_write_count = 0
         if (
@@ -3152,17 +3176,6 @@ class DeliveryDispatcher:
                 source="field_repair_after_marker",
             )
         if adjudication_effect:
-            if claim.adjudication_comment_attempt_count > 0:
-                return self._retry(
-                    claim,
-                    error_code="conclusion_adjudication_reconciliation_read_only",
-                    detail=(
-                        "the single correction-comment attempt was already consumed; "
-                        "only marker reconciliation is allowed"
-                    ),
-                    uncertain=True,
-                    exact_delay_seconds=UNCERTAIN_RECONCILIATION_POLL_SECONDS,
-                )
             authorized = self.store.authorize_adjudication_comment_attempt(
                 claim=claim,
                 now=self.now(),
