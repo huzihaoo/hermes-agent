@@ -1,3 +1,4 @@
+import json
 import sqlite3
 
 from scripts.pnc_rca_batch_rerun import (
@@ -9,8 +10,37 @@ from scripts.pnc_rca_batch_rerun import (
 
 
 def _snapshot(
-    *, job_status="delivered", job_outcome="success", effect_status="succeeded"
+    *,
+    job_status="delivered",
+    job_outcome="success",
+    effect_status="succeeded",
+    causal=True,
 ):
+    contract = (
+        {
+            "report": {
+                "candidate_owner": "ACC decoded 证据",
+                "diagnostic_only": False,
+            },
+            "artifacts": {
+                "attribution_causal_text": "ACC 退出判据命中，指向状态机抑制标志。"
+            },
+            "public_result": {
+                "summary": {"status": "candidate"},
+                "responsibility": {"status": "candidate"},
+                "terminal_diagnostic": {},
+            },
+        }
+        if causal
+        else {
+            "report": {"candidate_owner": "", "diagnostic_only": True},
+            "artifacts": {"attribution_causal_text": ""},
+            "public_result": {
+                "summary": {"status": "diagnostic_report_ready"},
+                "terminal_diagnostic": {"blocker_kind": "remote_event_not_found"},
+            },
+        }
+    )
     return {
         "generation": 6,
         "submission_key": "submission-6",
@@ -23,6 +53,7 @@ def _snapshot(
         "issue_url": "https://project.feishu.cn/t03o4q/issue/detail/7048803418",
         "report_url": "https://g1q3-rca.minieye.tech/report.html",
         "manifest_json": "{}",
+        "contract_json": json.dumps(contract),
         "artifacts_json": "{}",
         "effects": [
             {
@@ -48,6 +79,17 @@ def test_approval_accepts_issue_only_official_readback():
     assert approval["generation"] == 6
     assert approval["official_comment_id"] == "7665000000000000000"
     assert approval["official_field_keys"] == ["field_8c912e", "field_9193cb"]
+    assert approval["quality"]["status"] == "causal_candidate"
+    assert approval["quality"]["responsibility"] == "ACC decoded 证据"
+
+
+def test_approval_rejects_delivered_noncausal_result():
+    snapshot = _snapshot(causal=False)
+
+    assert _approval(snapshot) is None
+    failure = _terminal_failure(snapshot)
+    assert failure is not None
+    assert failure["job_status"] == "delivered"
 
 
 def test_approval_waits_for_required_effect_and_surfaces_terminal_failure():

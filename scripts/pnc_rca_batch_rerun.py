@@ -174,6 +174,42 @@ def _json_object(raw: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
 
 
+def _causal_delivery_quality(contract_raw: Any) -> dict[str, str] | None:
+    """Return the user-facing causal evidence that qualifies for approval."""
+    contract = _json_object(contract_raw)
+    report = contract.get("report")
+    artifacts = contract.get("artifacts")
+    public_result = contract.get("public_result")
+    if not isinstance(report, Mapping) or not isinstance(artifacts, Mapping):
+        return None
+    if report.get("diagnostic_only") is True:
+        return None
+    responsibility = str(report.get("candidate_owner") or "").strip()
+    causal_text = str(artifacts.get("attribution_causal_text") or "").strip()
+    if not responsibility or not causal_text:
+        return None
+    if isinstance(public_result, Mapping):
+        summary = public_result.get("summary")
+        responsibility_result = public_result.get("responsibility")
+        if isinstance(summary, Mapping) and summary.get("status") in {
+            "blocked",
+            "diagnostic_report_ready",
+        }:
+            return None
+        if isinstance(responsibility_result, Mapping) and str(
+            responsibility_result.get("status") or ""
+        ).startswith("suppressed"):
+            return None
+        terminal = public_result.get("terminal_diagnostic")
+        if isinstance(terminal, Mapping) and terminal:
+            return None
+    return {
+        "status": "causal_candidate",
+        "responsibility": responsibility,
+        "causal_text_sha256": _sha256_bytes(causal_text.encode("utf-8")),
+    }
+
+
 def _issue_snapshot(
     db_path: Path, issue_id: str, *, submission_key: str = ""
 ) -> dict[str, Any] | None:
@@ -260,6 +296,9 @@ def _approval(snapshot: Mapping[str, Any]) -> dict[str, Any] | None:
     field_keys = sorted(str(value) for value in receipt.get("confirmed_field_keys", []))
     if not receipt.get("remote_id") or field_keys != ["field_8c912e", "field_9193cb"]:
         return None
+    quality = _causal_delivery_quality(snapshot.get("contract_json"))
+    if quality is None:
+        return None
     return {
         "generation": int(snapshot["generation"]),
         "submission_key": str(snapshot["submission_key"]),
@@ -270,6 +309,7 @@ def _approval(snapshot: Mapping[str, Any]) -> dict[str, Any] | None:
         "official_comment_id": str(receipt["remote_id"]),
         "official_field_keys": field_keys,
         "official_readback_source": str(receipt.get("source") or ""),
+        "quality": quality,
         "manifest": _json_object(snapshot.get("manifest_json")),
         "artifacts": _json_object(snapshot.get("artifacts_json")),
         "completed_at": str(issue_effects[0].get("completed_at") or ""),
