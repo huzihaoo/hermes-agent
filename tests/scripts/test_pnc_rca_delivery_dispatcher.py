@@ -3511,12 +3511,20 @@ def test_production_launchd_is_secret_free_and_runs_only_dispatcher():
     with path.open("rb") as handle:
         payload = plistlib.load(handle)
     assert payload["Label"] == "local.pnc.rca-delivery-dispatcher"
-    assert payload["ProgramArguments"][-1].endswith(
-        "/scripts/pnc_rca_delivery_dispatcher.py"
-    )
+    assert payload["ProgramArguments"] == [
+        "/usr/bin/python3",
+        "/Users/songying/.hermes/runtime/governance-tools/pnc_live_exec.py",
+        "local.pnc.rca-delivery-dispatcher",
+    ]
+    assert payload["WorkingDirectory"] == "/Users/songying/.hermes/runtime"
     environment = payload["EnvironmentVariables"]
     assert environment["HERMES_HOME"] == "/Users/songying/.hermes"
     assert environment["PYTHONNOUSERSITE"] == "1"
+    assert "VIRTUAL_ENV" not in environment
+    serialized = json.dumps(payload, sort_keys=True)
+    assert "/runtime/releases/" not in serialized
+    assert "/runtime/venvs/" not in serialized
+    assert "/runtime/hermes-live" not in serialized
     assert not any(
         token in key.upper()
         for key in environment
