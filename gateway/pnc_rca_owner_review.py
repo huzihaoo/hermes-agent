@@ -8,6 +8,7 @@ JSONL receipts, and otherwise lets normal intake routing continue.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -54,7 +55,10 @@ def handle_owner_review_message(
         ):
             return OwnerReviewResult(
                 handled=True,
-                response=f"RCA owner review 失败并已安全停止：{type(exc).__name__}",
+                response=(
+                    "RCA owner review 处理失败，提交状态需核验："
+                    f"{type(exc).__name__}"
+                ),
             )
         raise
 
@@ -75,10 +79,13 @@ def _handle_owner_review_message(
         return OwnerReviewResult(handled=False)
 
     owners = _owner_allowlist()
-    if not (owners.user_ids or owners.names or owners.legacy):
+    if not owners.user_ids:
         return OwnerReviewResult(
             handled=True,
-            response="owner review 未启用,请配置 HERMES_G1Q3_REVIEW_OWNERS",
+            response=(
+                "owner review 未启用,请配置 "
+                "HERMES_G1Q3_REVIEW_OWNER_USER_IDS"
+            ),
         )
     if not parsed.get("valid"):
         return OwnerReviewResult(handled=True, response=_usage_message())
@@ -99,6 +106,7 @@ def _handle_owner_review_message(
     review_dir = Path(hermes_home) / "pnc_agent" / "reviews" / "g1q3_rca"
     now = datetime.now(timezone.utc)
     adjudication_result = None
+    adjudication_store = None
     if action == "撤回":
         from gateway.pnc_rca_delivery_store import RcaDeliveryStore
 
@@ -110,9 +118,10 @@ def _handle_owner_review_message(
             / "control.sqlite3"
         )
         try:
-            adjudication_result = RcaDeliveryStore(
+            adjudication_store = RcaDeliveryStore(
                 control_db_path, require_current=True
-            ).record_conclusion_adjudication(
+            )
+            adjudication_result = adjudication_store.record_conclusion_adjudication(
                 work_item_id=issue_id,
                 action="retract",
                 reason=reason,
@@ -127,63 +136,78 @@ def _handle_owner_review_message(
                 response=f"RCA 撤回未执行：{exc}",
             )
         override = True
-    artifact_info = _find_report_generated_at(Path(hermes_home), issue_id)
-    report_generated_at = artifact_info.get("report_generated_at")
-    latency_seconds = _latency_seconds(report_generated_at, now) if report_generated_at else None
-    latency_unavailable = latency_seconds is None
-
-    record = {
-        "schema_version": REVIEW_SCHEMA_VERSION,
-        "issue_id": issue_id,
-        "verdict": _verdict_for_action(action),
-        "action": action,
-        "reason": reason,
-        "owner_id": owner_id,
-        "owner_name": owner_name,
-        "reviewed_at": now.isoformat(),
-        "report_generated_at": report_generated_at,
-        "report_generated_at_source": artifact_info.get("source"),
-        "latency_seconds": latency_seconds,
-        "override": override,
-        "source": _source_record(event),
-    }
-    if adjudication_result is not None:
-        record["adjudication_id"] = adjudication_result.adjudication_id
-        record["original_effect_key"] = adjudication_result.original_effect_key
-        record["correction_effect_key"] = adjudication_result.correction_effect_key
-        record["conclusion_state"] = adjudication_result.conclusion_state
-        record["impact_lineage"] = adjudication_result.impact_lineage
-
-    sidecar_path = _business_state_sidecar_path(review_dir=review_dir, issue_id=issue_id)
-    record["business_state_sidecar_path"] = str(sidecar_path)
-
-    write_result = _write_ledger(review_dir=review_dir, issue_id=issue_id, record=record, override=override)
-    if write_result.get("idempotent"):
-        current = write_result.get("current") or {}
+    try:
+        persisted = _persist_owner_review_artifacts(
+            event=event,
+            hermes_home=Path(hermes_home),
+            review_dir=review_dir,
+            issue_id=issue_id,
+            action=action,
+            reason=reason,
+            owner_id=owner_id,
+            owner_name=owner_name,
+            override=override,
+            adjudication_result=adjudication_result,
+            now=now,
+        )
+    except Exception as exc:
+        if adjudication_result is None or adjudication_store is None:
+            raise
+        try:
+            adjudication_store.mark_conclusion_adjudication_artifact_repair(
+                adjudication_id=adjudication_result.adjudication_id,
+                succeeded=False,
+                error_code=type(exc).__name__,
+                error_detail=str(exc),
+                now=now,
+            )
+        except Exception:
+            pass
         return OwnerReviewResult(
             handled=True,
             response=(
-                f"issue {issue_id} 已有 current 结论：{current.get('action') or current.get('verdict')}；"
+                f"RCA 撤回已提交：issue {issue_id}；更正已入队，"
+                f"审计材料待修复：{type(exc).__name__}"
+            ),
+        )
+    if persisted["idempotent"] and adjudication_result is None:
+        current = persisted["record"]
+        return OwnerReviewResult(
+            handled=True,
+            response=(
+                f"issue {issue_id} 已有 current 结论："
+                f"{current.get('action') or current.get('verdict')}；"
                 "如需改判请在指令中加入 覆盖。"
             ),
         )
+    if adjudication_result is not None and adjudication_store is not None:
+        try:
+            adjudication_store.mark_conclusion_adjudication_artifact_repair(
+                adjudication_id=adjudication_result.adjudication_id,
+                succeeded=True,
+                now=now,
+            )
+        except Exception as exc:
+            return OwnerReviewResult(
+                handled=True,
+                response=(
+                    f"RCA 撤回已提交：issue {issue_id}；更正已入队，"
+                    f"审计状态待修复：{type(exc).__name__}"
+                ),
+            )
 
-    _write_business_state_sidecar(review_dir=review_dir, issue_id=issue_id, record=record)
-
-    receipt = {
-        "schema_version": REVIEW_SCHEMA_VERSION,
-        "event_type": "owner_review",
-        **record,
-        "latency_unavailable": latency_unavailable,
-        "ledger_path": str(review_dir / "ledger.json"),
-        "business_state_sidecar_path": str(sidecar_path),
-    }
-    _append_receipt(review_dir, receipt, now=now)
-
-    latency_text = "耗时不可算" if latency_unavailable else _format_latency(latency_seconds or 0)
+    latency_seconds = persisted["record"].get("latency_seconds")
+    latency_text = (
+        "耗时不可算"
+        if latency_seconds is None
+        else _format_latency(int(latency_seconds))
+    )
     return OwnerReviewResult(
         handled=True,
-        response=f"RCA owner review 已记录：issue {issue_id} / {action} / owner {owner_name or owner_id or 'unknown'} / {latency_text}",
+        response=(
+            f"RCA owner review 已记录：issue {issue_id} / {action} / owner "
+            f"{owner_name or owner_id or 'unknown'} / {latency_text}"
+        ),
     )
 
 
@@ -229,19 +253,13 @@ def _owner_allowlist() -> OwnerAllowlist:
         elif item.startswith(("name:", "user_name:")):
             names.add(item.split(":", 1)[1].strip())
         else:
-            # Backward compatibility: existing deployments used display names in
-            # HERMES_G1Q3_REVIEW_OWNERS. Keep accepting those, but do not treat
-            # arbitrary bare tokens as a substitute for typed user-id entries.
             legacy.add(item)
     return OwnerAllowlist(user_ids={x for x in user_ids if x}, names={x for x in names if x}, legacy={x for x in legacy if x})
 
 
 def _is_allowed_owner(*, owner_id: str, owner_name: str, owners: OwnerAllowlist) -> bool:
-    return bool(
-        (owner_id and owner_id in owners.user_ids)
-        or (owner_name and owner_name in owners.names)
-        or (owner_name and owner_name in owners.legacy)
-    )
+    del owner_name
+    return bool(owner_id and owner_id in owners.user_ids)
 
 
 def _verdict_for_action(action: str) -> str:
@@ -262,6 +280,116 @@ def _source_record(event: Any) -> dict[str, Any]:
         "thread_id": str(getattr(source, "thread_id", "") or ""),
         "message_id": str(getattr(event, "message_id", "") or ""),
     }
+
+
+def _review_event_id(record: dict[str, Any]) -> str:
+    material = {
+        key: record.get(key)
+        for key in (
+            "issue_id",
+            "action",
+            "reason",
+            "owner_id",
+            "adjudication_id",
+            "source",
+        )
+    }
+    encoded = json.dumps(
+        material,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return f"g1q3-rca-owner-review-v1-{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _persist_owner_review_artifacts(
+    *,
+    event: Any,
+    hermes_home: Path,
+    review_dir: Path,
+    issue_id: str,
+    action: str,
+    reason: str,
+    owner_id: str,
+    owner_name: str,
+    override: bool,
+    adjudication_result: Any,
+    now: datetime,
+) -> dict[str, Any]:
+    artifact_info = _find_report_generated_at(hermes_home, issue_id)
+    report_generated_at = artifact_info.get("report_generated_at")
+    latency_seconds = (
+        _latency_seconds(report_generated_at, now)
+        if report_generated_at
+        else None
+    )
+    record: dict[str, Any] = {
+        "schema_version": REVIEW_SCHEMA_VERSION,
+        "issue_id": issue_id,
+        "verdict": _verdict_for_action(action),
+        "action": action,
+        "reason": reason,
+        "owner_id": owner_id,
+        "owner_name": owner_name,
+        "reviewed_at": now.isoformat(),
+        "report_generated_at": report_generated_at,
+        "report_generated_at_source": artifact_info.get("source"),
+        "latency_seconds": latency_seconds,
+        "override": override,
+        "source": _source_record(event),
+    }
+    if adjudication_result is not None:
+        record.update(
+            adjudication_id=adjudication_result.adjudication_id,
+            original_effect_key=adjudication_result.original_effect_key,
+            correction_effect_key=adjudication_result.correction_effect_key,
+            conclusion_state=adjudication_result.conclusion_state,
+            impact_lineage=adjudication_result.impact_lineage,
+        )
+    sidecar_path = _business_state_sidecar_path(
+        review_dir=review_dir,
+        issue_id=issue_id,
+    )
+    record["business_state_sidecar_path"] = str(sidecar_path)
+    record["review_event_id"] = _review_event_id(record)
+    write_result = _write_ledger(
+        review_dir=review_dir,
+        issue_id=issue_id,
+        record=record,
+        override=override,
+    )
+    idempotent = bool(write_result.get("idempotent"))
+    if idempotent:
+        current = write_result.get("current")
+        if isinstance(current, dict):
+            record = dict(current)
+        if adjudication_result is None:
+            return {"idempotent": True, "record": record}
+
+    sidecar_path = _business_state_sidecar_path(
+        review_dir=review_dir,
+        issue_id=issue_id,
+    )
+    _write_business_state_sidecar(
+        review_dir=review_dir,
+        issue_id=issue_id,
+        record=record,
+    )
+    receipt = {
+        "schema_version": REVIEW_SCHEMA_VERSION,
+        "event_type": "owner_review",
+        **record,
+        "latency_unavailable": record.get("latency_seconds") is None,
+        "ledger_path": str(review_dir / "ledger.json"),
+        "business_state_sidecar_path": str(sidecar_path),
+    }
+    try:
+        receipt_time = datetime.fromisoformat(str(record["reviewed_at"]))
+    except (KeyError, TypeError, ValueError):
+        receipt_time = now
+    _append_receipt(review_dir, receipt, now=receipt_time)
+    return {"idempotent": idempotent, "record": record}
 
 
 def _usage_message() -> str:
@@ -303,12 +431,25 @@ def _write_ledger(*, review_dir: Path, issue_id: str, record: dict[str, Any], ov
         return {"idempotent": False, "current": record}
 
 
-def _append_receipt(review_dir: Path, receipt: dict[str, Any], *, now: datetime) -> None:
+def _append_receipt(
+    review_dir: Path, receipt: dict[str, Any], *, now: datetime
+) -> bool:
     review_dir.mkdir(parents=True, exist_ok=True)
     path = review_dir / f"owner_review-{now.date().isoformat()}.jsonl"
-    with open(path, "a", encoding="utf-8") as fh:
+    with open(path, "a+", encoding="utf-8") as fh:
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        fh.seek(0)
+        event_id = str(receipt.get("review_event_id") or "")
+        for line in fh:
+            try:
+                existing = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event_id and existing.get("review_event_id") == event_id:
+                return False
+        fh.seek(0, os.SEEK_END)
         fh.write(json.dumps(receipt, ensure_ascii=False, sort_keys=True) + "\n")
+        return True
 
 
 def _business_state_sidecar_path(*, review_dir: Path, issue_id: str) -> Path:

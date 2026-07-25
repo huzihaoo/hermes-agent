@@ -75,7 +75,7 @@ from gateway.pnc_rca_delivery_store import (
 )
 from gateway.pnc_rca_conclusion_adjudication import (
     ConclusionAdjudicationError,
-    is_adjudication_effect_payload,
+    identifies_adjudication_effect,
     validate_adjudication_effect_claim,
 )
 from gateway.pnc_rca_runtime_identity import (
@@ -1632,7 +1632,7 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
     if claim.outcome != "success":
         return _validate_terminal_effect(claim)
     payload = claim.payload
-    if is_adjudication_effect_payload(payload):
+    if identifies_adjudication_effect(payload, target_key=claim.target_key):
         try:
             marker, content, field_updates = validate_adjudication_effect_claim(claim)
         except ConclusionAdjudicationError as exc:
@@ -2821,11 +2821,26 @@ class DeliveryDispatcher:
 
     def _dispatch_claim(self, claim: DeliveryEffectClaim) -> DispatchOutcome:
         prior_write_uncertain = claim.previous_status == "uncertain"
+        adjudication_effect = identifies_adjudication_effect(
+            claim.payload, target_key=claim.target_key
+        )
         self._heartbeat(claim)
         try:
             validated = _validate_effect(claim)
         except DeliveryContractError as exc:
             return self._quarantine(claim, error_code=exc.code, detail=exc.detail)
+        if adjudication_effect:
+            try:
+                self.store.validate_adjudication_effect_binding(
+                    claim=claim,
+                    now=self.now(),
+                )
+            except ConclusionAdjudicationError as exc:
+                return self._quarantine(
+                    claim,
+                    error_code=str(exc),
+                    detail="adjudication effect is not bound to its immutable ledger",
+                )
 
         superseded = self.store.suppress_terminal_effect_if_newer_settled_fields(
             claim=claim,
@@ -2895,7 +2910,7 @@ class DeliveryDispatcher:
             )
         if (
             claim.effect_kind == DELIVERY_EFFECT_KIND
-            and not is_adjudication_effect_payload(claim.payload)
+            and not adjudication_effect
             and _quality_regression_guard(before_fields, validated.field_updates)
         ):
             return self._suppress_quality_regression(claim, before_fields, validated)
@@ -2926,7 +2941,11 @@ class DeliveryDispatcher:
             )
 
         recovery_write_count = 0
-        if prior_write_uncertain and existing_marker is None:
+        if (
+            prior_write_uncertain
+            and existing_marker is None
+            and not adjudication_effect
+        ):
             reconciliation = self.store.record_effect_reconciliation_miss(
                 claim=claim,
                 visibility_grace_seconds=(
@@ -3045,7 +3064,13 @@ class DeliveryDispatcher:
                         exact_delay_seconds=UNCERTAIN_RECONCILIATION_POLL_SECONDS,
                     )
                 recovery_write_count = recovery_authorization
-        if not prior_write_uncertain:
+        if (
+            not prior_write_uncertain
+            and not (
+                adjudication_effect
+                and claim.adjudication_comment_attempt_count > 0
+            )
+        ):
             self._heartbeat(claim)
             superseded = self.store.mark_effect_write_started(
                 claim=claim,
@@ -3126,6 +3151,31 @@ class DeliveryDispatcher:
                 existing_marker,
                 source="field_repair_after_marker",
             )
+        if adjudication_effect:
+            if claim.adjudication_comment_attempt_count > 0:
+                return self._retry(
+                    claim,
+                    error_code="conclusion_adjudication_reconciliation_read_only",
+                    detail=(
+                        "the single correction-comment attempt was already consumed; "
+                        "only marker reconciliation is allowed"
+                    ),
+                    uncertain=True,
+                    exact_delay_seconds=UNCERTAIN_RECONCILIATION_POLL_SECONDS,
+                )
+            authorized = self.store.authorize_adjudication_comment_attempt(
+                claim=claim,
+                now=self.now(),
+                activation_required=self.config.activation_required,
+            )
+            if not authorized:
+                return self._retry(
+                    claim,
+                    error_code="conclusion_adjudication_reconciliation_read_only",
+                    detail="the correction-comment attempt token was already consumed",
+                    uncertain=True,
+                    exact_delay_seconds=UNCERTAIN_RECONCILIATION_POLL_SECONDS,
+                )
         try:
             add_raw = self._add_remote_effect(claim, validated)
         except Exception as exc:

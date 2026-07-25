@@ -11,6 +11,7 @@ from pathlib import Path
 import sqlite3
 import stat
 import sys
+from types import SimpleNamespace
 from typing import Any
 
 if __package__ in {None, ""}:
@@ -19,10 +20,26 @@ if __package__ in {None, ""}:
 from gateway.pnc_rca_conclusion_adjudication import (
     ADJUDICATION_EFFECT_SCHEMA_VERSION,
     ADJUDICATION_SCHEMA_VERSION,
+    validate_adjudication_effect_claim,
+    validate_adjudication_effect_ledger_binding,
+    validate_conclusion_adjudication_schema,
 )
 
 
-AUDIT_SCHEMA_VERSION = "pnc_rca_conclusion_adjudication_audit_v1"
+AUDIT_SCHEMA_VERSION = "pnc_rca_conclusion_adjudication_audit_v2"
+EXPECTED_DELIVERY_STORE_SCHEMA_VERSION = "pnc_rca_delivery_store_v8"
+_UNRESOLVED_EFFECT_STATUSES = frozenset(
+    {"pending", "claimed", "retry_wait", "uncertain"}
+)
+_VALID_EFFECT_WRITE_PHASES = {
+    "pending": {"prewrite"},
+    "claimed": {"prewrite", "write_started"},
+    "retry_wait": {"prewrite"},
+    "uncertain": {"write_started"},
+    "succeeded": {"settled"},
+    "quarantined": {"settled"},
+    "suppressed": {"settled"},
+}
 
 
 def _sha256(path: Path) -> str:
@@ -43,6 +60,118 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
 def _scalar(conn: sqlite3.Connection, sql: str, parameters: tuple[Any, ...] = ()) -> int:
     row = conn.execute(sql, parameters).fetchone()
     return int(row[0] or 0) if row is not None else 0
+
+
+def _recompute_adjudication_bindings(
+    conn: sqlite3.Connection,
+) -> tuple[int, list[dict[str, str]]]:
+    rows = conn.execute(
+        """
+        SELECT a.*,
+               correction.effect_key AS correction_row_effect_key,
+               correction.delivery_id AS correction_delivery_id,
+               correction.effect_kind AS correction_effect_kind,
+               correction.required AS correction_required,
+               correction.target_key AS correction_target_key,
+               correction.payload_json AS correction_payload_json,
+               correction.payload_sha256 AS correction_payload_sha256,
+               correction.status AS correction_status,
+               correction.write_phase AS correction_write_phase,
+               correction_job.artifact_set_id AS correction_artifact_set_id,
+               correction_job.project_key AS correction_project_key,
+               correction_job.work_item_type_key
+                   AS correction_work_item_type_key,
+               correction_job.work_item_id AS correction_work_item_id,
+               correction_job.business_key AS correction_business_key,
+               correction_job.generation AS correction_generation,
+               original.status AS original_effect_status,
+               original.write_phase AS original_effect_write_phase,
+               original.delivery_id AS original_effect_delivery_id,
+               original.effect_kind AS original_effect_kind,
+               original.required AS original_effect_required,
+               original.outcome AS original_effect_outcome,
+               original.target_key AS original_effect_target_key,
+               original_job.business_key AS original_job_business_key,
+               original_job.generation AS original_job_generation,
+               original_job.project_key AS original_job_project_key,
+               original_job.work_item_type_key
+                   AS original_job_work_item_type_key,
+               original_job.work_item_id AS original_job_work_item_id,
+               original_job.target_key AS original_job_target_key,
+               original_job.outcome AS original_job_outcome,
+               epoch.state AS activation_state,
+               epoch.is_current AS activation_is_current
+          FROM rca_conclusion_adjudications AS a
+     LEFT JOIN rca_delivery_effects AS correction
+            ON correction.effect_key = a.correction_effect_key
+     LEFT JOIN rca_delivery_jobs AS correction_job
+            ON correction_job.delivery_id = correction.delivery_id
+     LEFT JOIN rca_delivery_effects AS original
+            ON original.effect_key = a.original_effect_key
+     LEFT JOIN rca_delivery_jobs AS original_job
+            ON original_job.delivery_id = a.original_delivery_id
+     LEFT JOIN rca_activation_epochs AS epoch
+            ON epoch.epoch_id = a.activation_epoch_id
+      ORDER BY a.adjudication_id
+        """
+    ).fetchall()
+    failures: list[dict[str, str]] = []
+    for row in rows:
+        adjudication_id = str(row["adjudication_id"] or "")
+        try:
+            if (
+                row["correction_row_effect_key"] is None
+                or row["correction_artifact_set_id"] is None
+                or row["original_effect_status"] is None
+                or row["original_job_business_key"] is None
+            ):
+                raise RuntimeError("adjudication_related_row_missing")
+            correction_status = str(row["correction_status"] or "")
+            correction_write_phase = str(row["correction_write_phase"] or "")
+            if (
+                row["correction_effect_kind"] != "feishu_issue_comment"
+                or row["correction_required"] != 1
+                or row["correction_delivery_id"] != row["original_delivery_id"]
+                or correction_write_phase
+                not in _VALID_EFFECT_WRITE_PHASES.get(correction_status, set())
+            ):
+                raise RuntimeError("adjudication_correction_storage_binding_invalid")
+            payload = json.loads(str(row["correction_payload_json"] or ""))
+            if not isinstance(payload, dict):
+                raise ValueError("correction_payload_not_object")
+            claim = SimpleNamespace(
+                payload=payload,
+                delivery_id=str(row["correction_delivery_id"] or ""),
+                effect_kind=str(row["correction_effect_kind"] or ""),
+                required=row["correction_required"],
+                target_key=str(row["correction_target_key"] or ""),
+                project_key=str(row["correction_project_key"] or ""),
+                work_item_type_key=str(
+                    row["correction_work_item_type_key"] or ""
+                ),
+                work_item_id=str(row["correction_work_item_id"] or ""),
+                business_key=str(row["correction_business_key"] or ""),
+                generation=int(row["correction_generation"] or 0),
+                payload_sha256=str(row["correction_payload_sha256"] or ""),
+                effect_key=str(row["correction_row_effect_key"] or ""),
+                artifact_set_id=str(row["correction_artifact_set_id"] or ""),
+            )
+            validate_adjudication_effect_claim(claim)
+            validate_adjudication_effect_ledger_binding(
+                claim,
+                dict(row),
+                require_current_activation=(
+                    correction_status in _UNRESOLVED_EFFECT_STATUSES
+                ),
+            )
+        except Exception as exc:
+            failures.append(
+                {
+                    "adjudication_id": adjudication_id,
+                    "error": f"{type(exc).__name__}:{exc}"[:500],
+                }
+            )
+    return len(failures), failures[:20]
 
 
 def audit_conclusion_adjudications(control_db: str | Path) -> dict[str, Any]:
@@ -90,7 +219,22 @@ def audit_conclusion_adjudications(control_db: str | Path) -> dict[str, Any]:
                 "SELECT value FROM rca_delivery_meta WHERE key = 'schema_version'"
             ).fetchone()
             delivery_marker = str(marker["value"] or "") if marker else ""
-        schema_ready = "rca_conclusion_adjudications" in available
+        schema_errors: list[str] = []
+        schema_ready = False
+        if delivery_marker != EXPECTED_DELIVERY_STORE_SCHEMA_VERSION:
+            schema_errors.append("delivery_schema_version_not_current")
+        adjudication_tables_present = {
+            "rca_conclusion_adjudications",
+            "rca_conclusion_adjudication_repairs",
+        }.issubset(available)
+        if not adjudication_tables_present:
+            schema_errors.append("adjudication_schema_missing")
+        else:
+            try:
+                validate_conclusion_adjudication_schema(conn)
+            except RuntimeError as exc:
+                schema_errors.append(str(exc))
+        schema_ready = not schema_errors
         published = _scalar(
             conn,
             """
@@ -105,27 +249,27 @@ def audit_conclusion_adjudications(control_db: str | Path) -> dict[str, Any]:
                AND e.write_phase = 'settled'
             """,
         )
-        effect_pattern = (
-            f'%"schema_version":"{ADJUDICATION_EFFECT_SCHEMA_VERSION}"%'
-        )
         adjudication_effects = _scalar(
             conn,
-            "SELECT COUNT(*) FROM rca_delivery_effects WHERE payload_json LIKE ?",
-            (effect_pattern,),
+            "SELECT COUNT(*) FROM rca_delivery_effects "
+            "WHERE json_valid(payload_json) "
+            "AND json_extract(payload_json, '$.schema_version') = ?",
+            (ADJUDICATION_EFFECT_SCHEMA_VERSION,),
         )
         status_rows = conn.execute(
             """
             SELECT status, COUNT(*) AS count
               FROM rca_delivery_effects
-             WHERE payload_json LIKE ?
+             WHERE json_valid(payload_json)
+               AND json_extract(payload_json, '$.schema_version') = ?
              GROUP BY status ORDER BY status
             """,
-            (effect_pattern,),
+            (ADJUDICATION_EFFECT_SCHEMA_VERSION,),
         ).fetchall()
         adjudication_statuses = {
             str(row["status"]): int(row["count"]) for row in status_rows
         }
-        if schema_ready:
+        if adjudication_tables_present:
             adjudications = _scalar(
                 conn, "SELECT COUNT(*) FROM rca_conclusion_adjudications"
             )
@@ -143,11 +287,36 @@ def audit_conclusion_adjudications(control_db: str | Path) -> dict[str, Any]:
                 conn,
                 """
                 SELECT COUNT(*) FROM (
-                    SELECT business_key
-                      FROM rca_conclusion_adjudications
-                     GROUP BY business_key HAVING COUNT(*) > 1
+                    SELECT j.business_key
+                      FROM rca_delivery_effects AS e
+                      JOIN rca_delivery_jobs AS j
+                        ON j.delivery_id = e.delivery_id
+                     WHERE json_valid(e.payload_json)
+                       AND json_extract(
+                               e.payload_json, '$.schema_version'
+                           ) = ?
+                     GROUP BY j.business_key HAVING COUNT(*) > 1
                 )
                 """,
+                (ADJUDICATION_EFFECT_SCHEMA_VERSION,),
+            )
+            attempt_violations = _scalar(
+                conn,
+                """
+                SELECT COUNT(*)
+                  FROM rca_delivery_effects
+                 WHERE json_valid(payload_json)
+                   AND json_extract(payload_json, '$.schema_version') = ?
+                   AND (
+                        recovery_write_count != 0
+                        OR adjudication_comment_attempt_count NOT IN (0, 1)
+                        OR (
+                            status = 'succeeded'
+                            AND adjudication_comment_attempt_count != 1
+                        )
+                   )
+                """,
+                (ADJUDICATION_EFFECT_SCHEMA_VERSION,),
             )
             lineage_unresolved = _scalar(
                 conn,
@@ -167,6 +336,67 @@ def audit_conclusion_adjudications(control_db: str | Path) -> dict[str, Any]:
                  WHERE e.effect_key IS NULL
                 """,
             )
+            orphan_effects = _scalar(
+                conn,
+                """
+                SELECT COUNT(*)
+                  FROM rca_delivery_effects AS e
+             LEFT JOIN rca_conclusion_adjudications AS a
+                    ON a.correction_effect_key = e.effect_key
+                 WHERE json_valid(e.payload_json)
+                   AND json_extract(
+                           e.payload_json, '$.schema_version'
+                       ) = ?
+                   AND a.adjudication_id IS NULL
+                """,
+                (ADJUDICATION_EFFECT_SCHEMA_VERSION,),
+            )
+            try:
+                binding_mismatches, binding_validation_errors = (
+                    _recompute_adjudication_bindings(conn)
+                )
+            except Exception as exc:
+                binding_mismatches = max(1, adjudications)
+                binding_validation_errors = [
+                    {
+                        "adjudication_id": "",
+                        "error": f"{type(exc).__name__}:{exc}"[:500],
+                    }
+                ]
+            activation_violations = _scalar(
+                conn,
+                """
+                SELECT COUNT(*)
+                  FROM rca_conclusion_adjudications AS a
+                  JOIN rca_delivery_effects AS e
+                    ON e.effect_key = a.correction_effect_key
+             LEFT JOIN rca_activation_epochs AS epoch
+                    ON epoch.epoch_id = a.activation_epoch_id
+                 WHERE epoch.epoch_id IS NULL
+                    OR (
+                        e.status IN (
+                            'pending', 'claimed', 'retry_wait', 'uncertain'
+                        )
+                        AND (
+                            epoch.is_current != 1
+                            OR epoch.state NOT IN (
+                                'bounded_active', 'steady_active'
+                            )
+                        )
+                    )
+                """,
+            )
+            repair_pending = _scalar(
+                conn,
+                "SELECT COUNT(*) FROM rca_conclusion_adjudication_repairs "
+                "WHERE status != 'succeeded'",
+            )
+            invalid_schema_versions = _scalar(
+                conn,
+                "SELECT COUNT(*) FROM rca_conclusion_adjudications "
+                "WHERE schema_version != ?",
+                (ADJUDICATION_SCHEMA_VERSION,),
+            )
             schema_versions = [
                 str(row[0])
                 for row in conn.execute(
@@ -176,7 +406,10 @@ def audit_conclusion_adjudications(control_db: str | Path) -> dict[str, Any]:
             ]
         else:
             adjudications = invalidated = recognized = 0
-            budget_violations = lineage_unresolved = dangling = 0
+            budget_violations = attempt_violations = lineage_unresolved = 0
+            dangling = orphan_effects = binding_mismatches = 0
+            binding_validation_errors = []
+            activation_violations = repair_pending = invalid_schema_versions = 0
             schema_versions = []
         conn.commit()
     finally:
@@ -190,6 +423,18 @@ def audit_conclusion_adjudications(control_db: str | Path) -> dict[str, Any]:
         or final_observed.st_mtime_ns != observed.st_mtime_ns
     ):
         raise RuntimeError("control DB changed during immutable audit")
+    invariants = {
+        "schema_current": schema_ready,
+        "ledger_effect_count_equal": adjudications == adjudication_effects,
+        "comment_budget_clean": budget_violations == 0,
+        "correction_attempts_bounded": attempt_violations == 0,
+        "correction_effects_linked": dangling == 0 and orphan_effects == 0,
+        "ledger_payload_bindings_valid": binding_mismatches == 0,
+        "activation_bindings_valid": activation_violations == 0,
+        "lineage_resolved": lineage_unresolved == 0,
+        "artifact_repairs_complete": repair_pending == 0,
+        "schema_versions_current": invalid_schema_versions == 0,
+    }
     return {
         "schema_version": AUDIT_SCHEMA_VERSION,
         "observed_at": datetime.now(timezone.utc).isoformat(),
@@ -207,6 +452,8 @@ def audit_conclusion_adjudications(control_db: str | Path) -> dict[str, Any]:
         },
         "adjudication_schema": {
             "ready": schema_ready,
+            "errors": schema_errors,
+            "expected_delivery_version": EXPECTED_DELIVERY_STORE_SCHEMA_VERSION,
             "expected_version": ADJUDICATION_SCHEMA_VERSION,
             "observed_versions": schema_versions,
         },
@@ -218,14 +465,18 @@ def audit_conclusion_adjudications(control_db: str | Path) -> dict[str, Any]:
             "adjudication_effects": adjudication_effects,
             "adjudication_effect_statuses": adjudication_statuses,
             "comment_budget_violations": budget_violations,
+            "correction_attempt_violations": attempt_violations,
             "lineage_unresolved": lineage_unresolved,
             "dangling_correction_effects": dangling,
+            "orphan_correction_effects": orphan_effects,
+            "ledger_payload_binding_mismatches": binding_mismatches,
+            "activation_binding_violations": activation_violations,
+            "artifact_repairs_pending": repair_pending,
+            "invalid_schema_versions": invalid_schema_versions,
         },
-        "invariants": {
-            "ledger_effect_count_equal": adjudications == adjudication_effects,
-            "comment_budget_clean": budget_violations == 0,
-            "correction_effects_linked": dangling == 0,
-        },
+        "binding_validation_errors": binding_validation_errors,
+        "invariants": invariants,
+        "ok": schema_ready and all(invariants.values()),
         "ga_acceptance_claimed": False,
     }
 
@@ -245,8 +496,6 @@ def main() -> int:
             "ok": False,
             "error": f"{type(exc).__name__}:{exc}",
         }
-    else:
-        result["ok"] = True
     encoded = json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

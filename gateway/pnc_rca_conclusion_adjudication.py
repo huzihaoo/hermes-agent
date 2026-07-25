@@ -17,10 +17,12 @@ from gateway.pnc_rca_delivery_contract import (
     compute_delivery_effect_key,
     delivery_effect_marker,
 )
+from gateway.pnc_rca_quality_oracle import evaluate_structural_tier
 
 
 ADJUDICATION_SCHEMA_VERSION = "pnc_rca_conclusion_adjudication_v1"
-ADJUDICATION_EFFECT_SCHEMA_VERSION = "pnc_rca_conclusion_adjudication_effect_v1"
+ADJUDICATION_EFFECT_SCHEMA_VERSION_V1 = "pnc_rca_conclusion_adjudication_effect_v1"
+ADJUDICATION_EFFECT_SCHEMA_VERSION = "pnc_rca_conclusion_adjudication_effect_v2"
 ADJUDICATION_EFFECT_TARGET_PREFIX = "g1q3-rca-adjudication-target-v1"
 ADJUDICATION_ID_PREFIX = "g1q3-rca-adjudication-v1"
 ADJUDICATION_ACTIONS = frozenset({"retract", "recognize"})
@@ -29,6 +31,7 @@ ADJUDICATION_STATES = {
     "recognize": "recognized",
 }
 _WORK_ITEM_ID_RE = re.compile(r"^[0-9]{1,32}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
@@ -49,6 +52,7 @@ class ConclusionAdjudicationResult:
     correction_effect_key: str
     created: bool
     impact_lineage: dict[str, Any]
+    artifact_repair_status: str = "pending"
 
 
 def _canonical_json(value: Any) -> str:
@@ -142,11 +146,47 @@ def ensure_conclusion_adjudication_schema(conn: sqlite3.Connection) -> None:
         BEGIN
             SELECT RAISE(ABORT, 'rca_conclusion_adjudication_immutable');
         END;
+
+        CREATE TABLE IF NOT EXISTS rca_conclusion_adjudication_repairs (
+            adjudication_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL CHECK (status IN ('pending', 'succeeded')),
+            attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+            last_error_code TEXT NOT NULL DEFAULT '',
+            last_error_detail TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            FOREIGN KEY(adjudication_id)
+                REFERENCES rca_conclusion_adjudications(adjudication_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_rca_conclusion_adjudication_repairs_status
+            ON rca_conclusion_adjudication_repairs(status, updated_at);
         """
+    )
+    current = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO rca_conclusion_adjudication_repairs(
+            adjudication_id, status, created_at, updated_at
+        )
+        SELECT adjudication_id, 'pending', created_at, ?
+          FROM rca_conclusion_adjudications
+        """,
+        (current,),
     )
 
 
 def validate_conclusion_adjudication_schema(conn: sqlite3.Connection) -> None:
+    effect_columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(rca_delivery_effects)").fetchall()
+    }
+    if not {
+        "adjudication_comment_attempt_count",
+        "adjudication_comment_attempted_at",
+    }.issubset(effect_columns):
+        raise RuntimeError("rca_conclusion_adjudication_schema_not_current")
     required_columns = {
         "adjudication_id",
         "schema_version",
@@ -180,7 +220,25 @@ def validate_conclusion_adjudication_schema(conn: sqlite3.Connection) -> None:
             "PRAGMA table_info(rca_conclusion_adjudications)"
         ).fetchall()
     }
-    if not required_columns.issubset(observed_columns):
+    if observed_columns != required_columns:
+        raise RuntimeError("rca_conclusion_adjudication_schema_not_current")
+    repair_columns = {
+        "adjudication_id",
+        "status",
+        "attempt_count",
+        "last_error_code",
+        "last_error_detail",
+        "created_at",
+        "updated_at",
+        "completed_at",
+    }
+    observed_repair_columns = {
+        str(row[1])
+        for row in conn.execute(
+            "PRAGMA table_info(rca_conclusion_adjudication_repairs)"
+        ).fetchall()
+    }
+    if observed_repair_columns != repair_columns:
         raise RuntimeError("rca_conclusion_adjudication_schema_not_current")
     triggers = {
         str(row[0])
@@ -195,92 +253,84 @@ def validate_conclusion_adjudication_schema(conn: sqlite3.Connection) -> None:
     }.issubset(triggers):
         raise RuntimeError("rca_conclusion_adjudication_schema_not_current")
 
+    unique_column_sets = {
+        tuple(
+            str(info[2])
+            for info in conn.execute(f"PRAGMA index_info({row[1]})").fetchall()
+        )
+        for row in conn.execute(
+            "PRAGMA index_list(rca_conclusion_adjudications)"
+        ).fetchall()
+        if int(row[2]) == 1
+    }
+    if not {
+        ("business_key",),
+        ("original_effect_key",),
+        ("correction_effect_key",),
+    }.issubset(unique_column_sets):
+        raise RuntimeError("rca_conclusion_adjudication_schema_not_current")
+
+    foreign_keys = {
+        (str(row[3]), str(row[2]), str(row[4]))
+        for row in conn.execute(
+            "PRAGMA foreign_key_list(rca_conclusion_adjudications)"
+        ).fetchall()
+    }
+    if foreign_keys != {
+        ("original_delivery_id", "rca_delivery_jobs", "delivery_id"),
+        ("original_effect_key", "rca_delivery_effects", "effect_key"),
+        ("correction_effect_key", "rca_delivery_effects", "effect_key"),
+    }:
+        raise RuntimeError("rca_conclusion_adjudication_schema_not_current")
+    repair_foreign_keys = {
+        (str(row[3]), str(row[2]), str(row[4]))
+        for row in conn.execute(
+            "PRAGMA foreign_key_list(rca_conclusion_adjudication_repairs)"
+        ).fetchall()
+    }
+    if repair_foreign_keys != {
+        ("adjudication_id", "rca_conclusion_adjudications", "adjudication_id")
+    }:
+        raise RuntimeError("rca_conclusion_adjudication_schema_not_current")
+    invalid = conn.execute(
+        """
+        SELECT 1
+          FROM rca_conclusion_adjudications AS a
+     LEFT JOIN rca_conclusion_adjudication_repairs AS r
+            ON r.adjudication_id = a.adjudication_id
+         WHERE a.schema_version != ?
+            OR TRIM(a.activation_epoch_id) = ''
+            OR r.adjudication_id IS NULL
+         LIMIT 1
+        """,
+        (ADJUDICATION_SCHEMA_VERSION,),
+    ).fetchone()
+    if invalid is not None:
+        raise RuntimeError("rca_conclusion_adjudication_schema_not_current")
+
 
 def is_adjudication_effect_payload(payload: Mapping[str, Any]) -> bool:
-    return payload.get("schema_version") == ADJUDICATION_EFFECT_SCHEMA_VERSION
+    return payload.get("schema_version") in {
+        ADJUDICATION_EFFECT_SCHEMA_VERSION_V1,
+        ADJUDICATION_EFFECT_SCHEMA_VERSION,
+    }
 
 
-def _collect_evaluator_refs(value: Any, *, depth: int = 0) -> list[str]:
-    if depth > 6:
-        return []
-    refs: list[str] = []
-    if isinstance(value, Mapping):
-        for key, item in value.items():
-            normalized = str(key).strip().lower()
-            if normalized in {
-                "evaluator_id",
-                "evaluator_ids",
-                "evaluator_ref",
-                "evaluator_refs",
-                "matched_evaluators",
-            }:
-                candidates = item if isinstance(item, (list, tuple, set)) else [item]
-                for candidate in candidates:
-                    if isinstance(candidate, Mapping):
-                        candidate = (
-                            candidate.get("id")
-                            or candidate.get("ref")
-                            or candidate.get("name")
-                        )
-                    text = str(candidate or "").strip()
-                    if text and len(text) <= 160:
-                        refs.append(text)
-            refs.extend(_collect_evaluator_refs(item, depth=depth + 1))
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            refs.extend(_collect_evaluator_refs(item, depth=depth + 1))
-    return refs
+def identifies_adjudication_effect(
+    payload: Mapping[str, Any], *, target_key: str
+) -> bool:
+    """Recognize current, legacy, and schema-laundered correction effects."""
 
-
-def _responsibility_domain(*values: Mapping[str, Any]) -> str:
-    priority = (
-        "responsibility_domain",
-        "responsibility_domain_ref",
-        "domain_id",
-        "domain_ref",
-        "domain",
+    return is_adjudication_effect_payload(payload) or str(target_key).startswith(
+        f"{ADJUDICATION_EFFECT_TARGET_PREFIX}-"
     )
-
-    def find(value: Any, depth: int = 0) -> str:
-        if depth > 6:
-            return ""
-        if isinstance(value, Mapping):
-            for key in priority:
-                candidate = value.get(key)
-                if isinstance(candidate, Mapping):
-                    candidate = (
-                        candidate.get("id")
-                        or candidate.get("ref")
-                        or candidate.get("name")
-                    )
-                text = str(candidate or "").strip()
-                if text and len(text) <= 160:
-                    return text
-            for item in value.values():
-                found = find(item, depth + 1)
-                if found:
-                    return found
-        elif isinstance(value, (list, tuple)):
-            for item in value:
-                found = find(item, depth + 1)
-                if found:
-                    return found
-        return ""
-
-    return next((found for value in values if (found := find(value))), "unresolved")
 
 
 def _impact_lineage(row: sqlite3.Row) -> dict[str, Any]:
     contract = _json_object(row["contract_json"], field="contract")
-    manifest = _json_object(row["manifest_json"], field="manifest")
-    original_payload = _json_object(row["payload_json"], field="original_payload")
-    evaluator_refs = sorted(
-        set(
-            _collect_evaluator_refs(contract)
-            + _collect_evaluator_refs(manifest)
-            + _collect_evaluator_refs(original_payload)
-        )
-    )[:64]
+    oracle = evaluate_structural_tier(contract)
+    evaluator_refs = list(oracle.facts.supported_evaluator_keys)[:64]
+    responsibility_domain = str(oracle.facts.responsibility or "").strip()
     start = str(row["effect_created_at"] or row["job_created_at"] or "").strip()
     end = str(row["effect_completed_at"] or start).strip()
     if not start or not end:
@@ -298,9 +348,7 @@ def _impact_lineage(row: sqlite3.Row) -> dict[str, Any]:
         "original_effect_key": str(row["effect_key"]),
         "evaluator_refs": evaluator_refs,
         "evaluator_resolution": "resolved" if evaluator_refs else "unresolved",
-        "responsibility_domain": _responsibility_domain(
-            contract, manifest, original_payload
-        ),
+        "responsibility_domain": responsibility_domain or "unresolved",
         "impact_window": {"start": start, "end": end},
     }
 
@@ -314,26 +362,20 @@ def _adjudication_content(
     reason: str,
     replacement_conclusion: str,
 ) -> tuple[str, str]:
-    if action == "retract":
-        field_value = "原自动 RCA 结论已撤回并标记作废；不可作为定责依据。"
-        lines = [
-            marker,
-            "【RCA 更正】原自动分析结论已撤回并标记作废。",
-            f"问题：{work_item_id}",
-            "原结论不可作为定责依据；后续以重新复核后的结论为准。",
-            f"失效结论标识：{original_effect_key}",
-            f"更正原因：{reason}",
-        ]
-    else:
-        field_value = f"人工追认：{replacement_conclusion}"
-        lines = [
-            marker,
-            "【RCA 追认】候选结论已经人工复核。",
-            f"问题：{work_item_id}",
-            f"追认结论：{replacement_conclusion}",
-            f"原结论标识：{original_effect_key}",
-            f"追认依据：{reason}",
-        ]
+    # Free-form owner input is internal audit evidence, never publication text.
+    del original_effect_key, reason, replacement_conclusion
+    if action != "retract":
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_recognize_publication_contract_unavailable"
+        )
+    field_value = "原自动 RCA 结论已撤回并标记作废；不可作为定责依据。"
+    lines = [
+        marker,
+        "【RCA 更正】原自动分析结论已撤回并标记作废。",
+        f"问题：{work_item_id}",
+        "原结论不可作为定责依据；后续以重新复核后的结论为准。",
+        "更正依据已保留在内部不可变审计记录中。",
+    ]
     content = "\n".join(lines)
     if len(content.encode("utf-8")) > MAX_FEISHU_COMMENT_BYTES:
         raise ConclusionAdjudicationError(
@@ -351,6 +393,8 @@ def _build_effect(
     replacement_conclusion: str,
     actor_id: str,
     actor_name: str,
+    source: Mapping[str, str],
+    activation_epoch_id: str,
     lineage: Mapping[str, Any],
 ) -> tuple[str, str, dict[str, Any]]:
     target_key = _stable_key(
@@ -368,6 +412,8 @@ def _build_effect(
         "project_key": str(row["project_key"]),
         "work_item_type_key": str(row["work_item_type_key"]),
         "work_item_id": str(row["work_item_id"]),
+        "business_key": str(row["business_key"]),
+        "generation": int(row["generation"]),
         "adjudication_id": adjudication_id,
         "action": action,
         "conclusion_state": ADJUDICATION_STATES[action],
@@ -378,6 +424,10 @@ def _build_effect(
         "replacement_conclusion": replacement_conclusion,
         "actor_id": actor_id,
         "actor_name": actor_name,
+        "activation_epoch_id": activation_epoch_id,
+        "source_sha256": hashlib.sha256(
+            _canonical_json(source).encode("utf-8")
+        ).hexdigest(),
         "lineage_sha256": hashlib.sha256(
             _canonical_json(lineage).encode("utf-8")
         ).hexdigest(),
@@ -416,6 +466,8 @@ def _build_effect(
 def _validate_source(source: Mapping[str, Any]) -> dict[str, str]:
     if not isinstance(source, Mapping):
         raise ConclusionAdjudicationError("conclusion_adjudication_source_invalid")
+    if set(source) != {"platform", "chat_id", "thread_id", "message_id"}:
+        raise ConclusionAdjudicationError("conclusion_adjudication_source_invalid")
     normalized = {
         key: _clean_text(source.get(key), field=f"source_{key}", maximum=256, required=False)
         for key in ("platform", "chat_id", "thread_id", "message_id")
@@ -423,6 +475,39 @@ def _validate_source(source: Mapping[str, Any]) -> dict[str, str]:
     if normalized["platform"] != "feishu" or not normalized["chat_id"]:
         raise ConclusionAdjudicationError("conclusion_adjudication_source_invalid")
     return normalized
+
+
+def _require_current_activation_epoch(conn: sqlite3.Connection) -> str:
+    columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(rca_activation_epochs)").fetchall()
+    }
+    if not {"epoch_id", "state", "is_current"}.issubset(columns):
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_activation_unavailable"
+        )
+    rows = conn.execute(
+        "SELECT epoch_id, state FROM rca_activation_epochs "
+        "WHERE is_current = 1 ORDER BY epoch_id LIMIT 2"
+    ).fetchall()
+    if not rows:
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_activation_unavailable"
+        )
+    if len(rows) != 1:
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_activation_ambiguous"
+        )
+    if str(rows[0]["state"] or "") not in {"bounded_active", "steady_active"}:
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_activation_inactive"
+        )
+    return _clean_text(
+        rows[0]["epoch_id"],
+        field="activation_epoch_id",
+        maximum=160,
+        required=True,
+    )
 
 
 def _candidate_row(
@@ -496,6 +581,10 @@ def record_conclusion_adjudication_tx(
     normalized_action = str(action or "").strip()
     if normalized_action not in ADJUDICATION_ACTIONS:
         raise ConclusionAdjudicationError("conclusion_adjudication_action_invalid")
+    if normalized_action == "recognize":
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_recognize_publication_contract_unavailable"
+        )
     normalized_reason = _clean_text(
         reason, field="reason", maximum=300, required=True
     )
@@ -553,6 +642,11 @@ def record_conclusion_adjudication_tx(
             raise ConclusionAdjudicationError(
                 "conclusion_adjudication_comment_budget_exhausted"
             )
+        repair = conn.execute(
+            "SELECT status FROM rca_conclusion_adjudication_repairs "
+            "WHERE adjudication_id = ?",
+            (adjudication_id,),
+        ).fetchone()
         return ConclusionAdjudicationResult(
             adjudication_id=adjudication_id,
             action=normalized_action,
@@ -565,6 +659,9 @@ def record_conclusion_adjudication_tx(
             correction_effect_key=str(existing["correction_effect_key"]),
             created=False,
             impact_lineage=lineage,
+            artifact_repair_status=(
+                str(repair["status"]) if repair is not None else "pending"
+            ),
         )
     legacy_effect = conn.execute(
         """
@@ -572,38 +669,23 @@ def record_conclusion_adjudication_tx(
           FROM rca_delivery_effects AS e
           JOIN rca_delivery_jobs AS j ON j.delivery_id = e.delivery_id
          WHERE j.business_key = ?
-           AND e.payload_json LIKE ?
+           AND (
+                e.payload_json LIKE ?
+                OR e.payload_json LIKE ?
+           )
          LIMIT 1
         """,
         (
             row["business_key"],
             f'%"schema_version":"{ADJUDICATION_EFFECT_SCHEMA_VERSION}"%',
+            f'%"schema_version":"{ADJUDICATION_EFFECT_SCHEMA_VERSION_V1}"%',
         ),
     ).fetchone()
     if legacy_effect is not None:
         raise ConclusionAdjudicationError(
             "conclusion_adjudication_comment_budget_exhausted"
         )
-    current_epoch = conn.execute(
-        """
-        SELECT epoch_id, state FROM rca_activation_epochs
-         WHERE is_current = 1 LIMIT 2
-        """
-    ).fetchall() if conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-        "AND name = 'rca_activation_epochs'"
-    ).fetchone() else []
-    if len(current_epoch) > 1:
-        raise ConclusionAdjudicationError(
-            "conclusion_adjudication_activation_ambiguous"
-        )
-    activation_epoch_id = ""
-    if current_epoch:
-        if str(current_epoch[0]["state"]) not in {"bounded_active", "steady_active"}:
-            raise ConclusionAdjudicationError(
-                "conclusion_adjudication_activation_inactive"
-            )
-        activation_epoch_id = str(current_epoch[0]["epoch_id"])
+    activation_epoch_id = _require_current_activation_epoch(conn)
     effect_key, payload_sha256, payload = _build_effect(
         row=row,
         adjudication_id=adjudication_id,
@@ -612,6 +694,8 @@ def record_conclusion_adjudication_tx(
         replacement_conclusion=normalized_replacement,
         actor_id=normalized_actor_id,
         actor_name=normalized_actor_name,
+        source=normalized_source,
+        activation_epoch_id=activation_epoch_id,
         lineage=lineage,
     )
     current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
@@ -677,6 +761,14 @@ def record_conclusion_adjudication_tx(
         ),
     )
     conn.execute(
+        """
+        INSERT INTO rca_conclusion_adjudication_repairs(
+            adjudication_id, status, created_at, updated_at
+        ) VALUES (?, 'pending', ?, ?)
+        """,
+        (adjudication_id, current, current),
+    )
+    conn.execute(
         "UPDATE rca_delivery_jobs SET status = 'ready', updated_at = ? "
         "WHERE delivery_id = ?",
         (current, row["delivery_id"]),
@@ -693,20 +785,32 @@ def record_conclusion_adjudication_tx(
         correction_effect_key=effect_key,
         created=True,
         impact_lineage=lineage,
+        artifact_repair_status="pending",
     )
 
 
-def validate_adjudication_effect_claim(claim: Any) -> tuple[str, str, tuple[tuple[str, str], ...]]:
+def validate_adjudication_effect_claim(
+    claim: Any,
+) -> tuple[str, str, tuple[tuple[str, str], ...]]:
     """Recompute an adjudication effect before the dispatcher touches Feishu."""
     payload = claim.payload
-    if not isinstance(payload, Mapping) or not is_adjudication_effect_payload(payload):
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("schema_version") != ADJUDICATION_EFFECT_SCHEMA_VERSION
+    ):
         raise ConclusionAdjudicationError("conclusion_adjudication_effect_schema_invalid")
+    if claim.effect_kind != DELIVERY_EFFECT_KIND or claim.required != 1:
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_effect_identity_invalid"
+        )
     exact_keys = {
         "schema_version", "delivery_id", "effect_kind", "target_key",
-        "project_key", "work_item_type_key", "work_item_id", "adjudication_id",
+        "project_key", "work_item_type_key", "work_item_id", "business_key",
+        "generation", "adjudication_id",
         "action", "conclusion_state", "original_delivery_id",
         "original_effect_key", "original_target_key", "reason",
-        "replacement_conclusion", "actor_id", "actor_name", "lineage_sha256",
+        "replacement_conclusion", "actor_id", "actor_name",
+        "activation_epoch_id", "source_sha256", "lineage_sha256",
         "effect_key", "semantic_payload_sha256", "marker", "comment_content",
         "field_updates",
     }
@@ -721,6 +825,8 @@ def validate_adjudication_effect_claim(claim: Any) -> tuple[str, str, tuple[tupl
         "project_key": claim.project_key,
         "work_item_type_key": claim.work_item_type_key,
         "work_item_id": claim.work_item_id,
+        "business_key": claim.business_key,
+        "generation": claim.generation,
         "original_delivery_id": claim.delivery_id,
     }
     if any(payload.get(key) != value for key, value in identity.items()):
@@ -732,15 +838,63 @@ def validate_adjudication_effect_claim(claim: Any) -> tuple[str, str, tuple[tupl
         raise ConclusionAdjudicationError(
             "conclusion_adjudication_effect_action_invalid"
         )
+    if action == "recognize":
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_recognize_publication_contract_unavailable"
+        )
+    reason = _clean_text(
+        payload.get("reason"), field="reason", maximum=300, required=True
+    )
+    actor_id = _clean_text(
+        payload.get("actor_id"), field="actor_id", maximum=160, required=True
+    )
+    actor_name = _clean_text(
+        payload.get("actor_name"), field="actor_name", maximum=160, required=False
+    )
+    replacement = _clean_text(
+        payload.get("replacement_conclusion"),
+        field="replacement_conclusion",
+        maximum=500,
+        required=action == "recognize",
+    )
+    if action == "retract" and replacement:
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_retraction_replacement_invalid"
+        )
+    activation_epoch_id = _clean_text(
+        payload.get("activation_epoch_id"),
+        field="activation_epoch_id",
+        maximum=160,
+        required=True,
+    )
+    if (
+        _SHA256_RE.fullmatch(str(payload.get("source_sha256") or "")) is None
+        or _SHA256_RE.fullmatch(str(payload.get("lineage_sha256") or "")) is None
+    ):
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_effect_lineage_invalid"
+        )
+    expected_target_key = _stable_key(
+        ADJUDICATION_EFFECT_TARGET_PREFIX,
+        {
+            "adjudication_id": str(payload.get("adjudication_id") or ""),
+            "original_target_key": str(payload.get("original_target_key") or ""),
+        },
+    )
+    if claim.target_key != expected_target_key:
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_effect_identity_invalid"
+        )
     semantic = {
         key: payload.get(key)
         for key in (
             "schema_version", "delivery_id", "effect_kind", "target_key",
-            "project_key", "work_item_type_key", "work_item_id",
+            "project_key", "work_item_type_key", "work_item_id", "business_key",
+            "generation",
             "adjudication_id", "action", "conclusion_state",
             "original_delivery_id", "original_effect_key", "original_target_key",
             "reason", "replacement_conclusion", "actor_id", "actor_name",
-            "lineage_sha256",
+            "activation_epoch_id", "source_sha256", "lineage_sha256",
         )
     }
     payload_sha256 = hashlib.sha256(
@@ -767,8 +921,8 @@ def validate_adjudication_effect_claim(claim: Any) -> tuple[str, str, tuple[tupl
         action=action,
         work_item_id=claim.work_item_id,
         original_effect_key=str(payload.get("original_effect_key") or ""),
-        reason=str(payload.get("reason") or ""),
-        replacement_conclusion=str(payload.get("replacement_conclusion") or ""),
+        reason=reason,
+        replacement_conclusion=replacement,
     )
     expected_updates = [
         {"field_key": RCA_RESULT_FIELD_KEY, "field_value": field_value}
@@ -782,3 +936,141 @@ def validate_adjudication_effect_claim(claim: Any) -> tuple[str, str, tuple[tupl
             "conclusion_adjudication_effect_content_invalid"
         )
     return marker, content, ((RCA_RESULT_FIELD_KEY, field_value),)
+
+
+def validate_adjudication_effect_ledger_binding(
+    claim: Any,
+    adjudication: Mapping[str, Any],
+    *,
+    require_current_activation: bool = True,
+) -> None:
+    """Bind one self-consistent effect to its immutable authorized ledger row."""
+
+    row = dict(adjudication)
+    payload = claim.payload
+    if not isinstance(payload, Mapping):
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_effect_ledger_mismatch"
+        )
+    expected = {
+        "adjudication_id": row.get("adjudication_id"),
+        "business_key": row.get("business_key"),
+        "generation": row.get("generation"),
+        "project_key": row.get("project_key"),
+        "work_item_type_key": row.get("work_item_type_key"),
+        "work_item_id": row.get("work_item_id"),
+        "action": row.get("action"),
+        "conclusion_state": row.get("conclusion_state"),
+        "reason": row.get("reason"),
+        "replacement_conclusion": row.get("replacement_conclusion"),
+        "actor_id": row.get("actor_id"),
+        "actor_name": row.get("actor_name"),
+        "original_delivery_id": row.get("original_delivery_id"),
+        "original_effect_key": row.get("original_effect_key"),
+        "activation_epoch_id": row.get("activation_epoch_id"),
+        "lineage_sha256": row.get("lineage_sha256"),
+    }
+    if (
+        row.get("schema_version") != ADJUDICATION_SCHEMA_VERSION
+        or row.get("correction_effect_key") != claim.effect_key
+        or any(payload.get(key) != value for key, value in expected.items())
+        or row.get("original_effect_status") != "succeeded"
+        or row.get("original_effect_write_phase") != "settled"
+        or row.get("original_effect_delivery_id")
+        != row.get("original_delivery_id")
+        or row.get("original_effect_kind") != DELIVERY_EFFECT_KIND
+        or row.get("original_effect_required") != 1
+        or row.get("original_effect_outcome") != "success"
+        or payload.get("original_target_key")
+        != row.get("original_effect_target_key")
+        or row.get("original_job_business_key") != row.get("business_key")
+        or row.get("original_job_generation") != row.get("generation")
+        or row.get("original_job_project_key") != row.get("project_key")
+        or row.get("original_job_work_item_type_key")
+        != row.get("work_item_type_key")
+        or row.get("original_job_work_item_id") != row.get("work_item_id")
+        or row.get("original_job_target_key")
+        != row.get("original_effect_target_key")
+        or row.get("original_job_outcome") != "success"
+    ):
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_effect_ledger_mismatch"
+        )
+    if require_current_activation and (
+        row.get("activation_is_current") != 1
+        or row.get("activation_state") not in {"bounded_active", "steady_active"}
+    ):
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_effect_activation_stale"
+        )
+
+    source = _json_object(row.get("source_json"), field="source")
+    normalized_source = _validate_source(source)
+    expected_source_sha256 = hashlib.sha256(
+        _canonical_json(normalized_source).encode("utf-8")
+    ).hexdigest()
+    lineage = _json_object(row.get("lineage_json"), field="lineage")
+    lineage_keys = {
+        "schema_version",
+        "business_key",
+        "generation",
+        "project_key",
+        "work_item_type_key",
+        "work_item_id",
+        "original_delivery_id",
+        "original_effect_key",
+        "evaluator_refs",
+        "evaluator_resolution",
+        "responsibility_domain",
+        "impact_window",
+    }
+    if (
+        set(lineage) != lineage_keys
+        or lineage.get("schema_version")
+        != "pnc_rca_conclusion_impact_lineage_v1"
+    ):
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_effect_lineage_invalid"
+        )
+    expected_lineage_sha256 = hashlib.sha256(
+        _canonical_json(lineage).encode("utf-8")
+    ).hexdigest()
+    try:
+        evaluator_refs = json.loads(str(row.get("evaluator_refs_json") or ""))
+    except json.JSONDecodeError as exc:
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_effect_lineage_invalid"
+        ) from exc
+    if (
+        not isinstance(evaluator_refs, list)
+        or any(not isinstance(item, str) or not item for item in evaluator_refs)
+        or evaluator_refs != sorted(set(evaluator_refs))
+        or lineage.get("evaluator_resolution")
+        != ("resolved" if evaluator_refs else "unresolved")
+    ):
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_effect_lineage_invalid"
+        )
+    lineage_expected = {
+        "business_key": row.get("business_key"),
+        "generation": row.get("generation"),
+        "project_key": row.get("project_key"),
+        "work_item_type_key": row.get("work_item_type_key"),
+        "work_item_id": row.get("work_item_id"),
+        "original_delivery_id": row.get("original_delivery_id"),
+        "original_effect_key": row.get("original_effect_key"),
+        "evaluator_refs": evaluator_refs,
+        "responsibility_domain": row.get("responsibility_domain"),
+        "impact_window": {
+            "start": row.get("impact_window_start"),
+            "end": row.get("impact_window_end"),
+        },
+    }
+    if (
+        payload.get("source_sha256") != expected_source_sha256
+        or row.get("lineage_sha256") != expected_lineage_sha256
+        or any(lineage.get(key) != value for key, value in lineage_expected.items())
+    ):
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_effect_lineage_invalid"
+        )

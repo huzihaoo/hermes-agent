@@ -33,9 +33,13 @@ from gateway.pnc_rca_delivery_quarantine_baseline import (
     quarantine_baseline_status_tx,
 )
 from gateway.pnc_rca_conclusion_adjudication import (
+    ADJUDICATION_EFFECT_SCHEMA_VERSION,
+    ConclusionAdjudicationError,
     ConclusionAdjudicationResult,
     ensure_conclusion_adjudication_schema,
+    identifies_adjudication_effect,
     record_conclusion_adjudication_tx,
+    validate_adjudication_effect_ledger_binding,
     validate_conclusion_adjudication_schema,
 )
 from gateway.pnc_rca_runtime_transition import (
@@ -296,6 +300,8 @@ class DeliveryEffectClaim:
     business_key: str = ""
     submission_key: str = ""
     generation: int = 0
+    adjudication_comment_attempt_count: int = 0
+    adjudication_comment_attempted_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -759,20 +765,35 @@ class RcaDeliveryStore:
         effect_key: str,
         submission_key: str,
     ) -> bool:
-        if cls._execution_activation_eligible_tx(conn, submission_key=submission_key):
-            return True
-        return (
-            conn.execute(
-                f"""
-                SELECT 1
-                  FROM rca_delivery_effects AS e
-                 WHERE e.effect_key = ?
-                   AND {_ADJUDICATION_ACTIVATION_ELIGIBLE_SQL}
-                 LIMIT 1
-                """,
-                (effect_key,),
-            ).fetchone()
-            is not None
+        row = conn.execute(
+            "SELECT payload_json, target_key FROM rca_delivery_effects "
+            "WHERE effect_key = ?",
+            (effect_key,),
+        ).fetchone()
+        if row is None:
+            return False
+        try:
+            payload = json.loads(str(row["payload_json"] or ""))
+        except (TypeError, json.JSONDecodeError):
+            return False
+        if isinstance(payload, Mapping) and identifies_adjudication_effect(
+            payload, target_key=str(row["target_key"] or "")
+        ):
+            return (
+                conn.execute(
+                    f"""
+                    SELECT 1
+                      FROM rca_delivery_effects AS e
+                     WHERE e.effect_key = ?
+                       AND {_ADJUDICATION_ACTIVATION_ELIGIBLE_SQL}
+                     LIMIT 1
+                    """,
+                    (effect_key,),
+                ).fetchone()
+                is not None
+            )
+        return cls._execution_activation_eligible_tx(
+            conn, submission_key=submission_key
         )
 
     @staticmethod
@@ -966,6 +987,9 @@ class RcaDeliveryStore:
                         recovery_write_count >= 0
                     ),
                     last_recovery_write_at TEXT,
+                    adjudication_comment_attempt_count INTEGER NOT NULL DEFAULT 0
+                        CHECK (adjudication_comment_attempt_count IN (0, 1)),
+                    adjudication_comment_attempted_at TEXT,
                     status TEXT NOT NULL CHECK (
                         status IN (
                             'pending', 'claimed', 'retry_wait', 'uncertain',
@@ -1035,12 +1059,13 @@ class RcaDeliveryStore:
                 """
             )
             ensure_host_runtime_transition_schema(conn)
-            self._migrate_schema(conn)
             ensure_conclusion_adjudication_schema(conn)
+            self._migrate_schema(conn)
             validate_host_runtime_transition_schema(
                 conn,
                 error_prefix="incompatible_delivery_store_schema",
             )
+            validate_conclusion_adjudication_schema(conn)
             self._validate_failure_route_schema(conn)
             marker = conn.execute(
                 "SELECT value FROM rca_delivery_meta WHERE key = 'schema_version'"
@@ -1276,6 +1301,11 @@ class RcaDeliveryStore:
                 "INTEGER NOT NULL DEFAULT 0 CHECK (recovery_write_count >= 0)"
             ),
             "last_recovery_write_at": "TEXT",
+            "adjudication_comment_attempt_count": (
+                "INTEGER NOT NULL DEFAULT 0 CHECK "
+                "(adjudication_comment_attempt_count IN (0, 1))"
+            ),
+            "adjudication_comment_attempted_at": "TEXT",
         }.items():
             if name not in effect_columns:
                 conn.execute(
@@ -1670,6 +1700,140 @@ class RcaDeliveryStore:
         except Exception:
             conn.rollback()
             raise
+        finally:
+            conn.close()
+
+    def validate_adjudication_effect_binding(
+        self,
+        *,
+        claim: DeliveryEffectClaim,
+        now: datetime | None = None,
+    ) -> None:
+        """Verify an adjudication claim against its immutable ledger and epoch."""
+
+        current = _iso(now)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            self._current_effect_claim(
+                conn,
+                effect_key=claim.effect_key,
+                lease_token=claim.lease_token,
+                fence=claim.fence,
+                current=current,
+            )
+            validate_conclusion_adjudication_schema(conn)
+            activation_columns = {
+                str(row["name"])
+                for row in conn.execute(
+                    "PRAGMA table_info(rca_activation_epochs)"
+                ).fetchall()
+            }
+            if not {"epoch_id", "state", "is_current"}.issubset(
+                activation_columns
+            ):
+                raise ConclusionAdjudicationError(
+                    "conclusion_adjudication_effect_activation_stale"
+                )
+            row = conn.execute(
+                """
+                SELECT a.*,
+                       original.status AS original_effect_status,
+                       original.write_phase AS original_effect_write_phase,
+                       original.delivery_id AS original_effect_delivery_id,
+                       original.effect_kind AS original_effect_kind,
+                       original.required AS original_effect_required,
+                       original.outcome AS original_effect_outcome,
+                       original.target_key AS original_effect_target_key,
+                       original_job.business_key AS original_job_business_key,
+                       original_job.generation AS original_job_generation,
+                       original_job.project_key AS original_job_project_key,
+                       original_job.work_item_type_key
+                           AS original_job_work_item_type_key,
+                       original_job.work_item_id AS original_job_work_item_id,
+                       original_job.target_key AS original_job_target_key,
+                       original_job.outcome AS original_job_outcome,
+                       epoch.state AS activation_state,
+                       epoch.is_current AS activation_is_current
+                  FROM rca_conclusion_adjudications AS a
+                  JOIN rca_delivery_effects AS original
+                    ON original.effect_key = a.original_effect_key
+                  JOIN rca_delivery_jobs AS original_job
+                    ON original_job.delivery_id = a.original_delivery_id
+                  LEFT JOIN rca_activation_epochs AS epoch
+                    ON epoch.epoch_id = a.activation_epoch_id
+                 WHERE a.correction_effect_key = ?
+                """,
+                (claim.effect_key,),
+            ).fetchone()
+            if row is None:
+                raise ConclusionAdjudicationError(
+                    "conclusion_adjudication_effect_ledger_missing"
+                )
+            validate_adjudication_effect_ledger_binding(claim, dict(row))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def mark_conclusion_adjudication_artifact_repair(
+        self,
+        *,
+        adjudication_id: str,
+        succeeded: bool,
+        error_code: str = "",
+        error_detail: str = "",
+        now: datetime | None = None,
+    ) -> str:
+        current = _iso(now)
+        status = "succeeded" if succeeded else "pending"
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            updated = conn.execute(
+                """
+                UPDATE rca_conclusion_adjudication_repairs
+                   SET status = ?, attempt_count = attempt_count + 1,
+                       last_error_code = ?, last_error_detail = ?,
+                       completed_at = CASE WHEN ? = 'succeeded' THEN ? ELSE NULL END,
+                       updated_at = ?
+                 WHERE adjudication_id = ?
+                """,
+                (
+                    status,
+                    "" if succeeded else str(error_code or "artifact_repair_failed")[:120],
+                    "" if succeeded else str(error_detail or "")[:1000],
+                    status,
+                    current,
+                    current,
+                    adjudication_id,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise DeliveryRecordConflictError(
+                    "conclusion adjudication repair row is missing"
+                )
+            conn.commit()
+            return status
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def conclusion_adjudication_artifact_repair(
+        self, adjudication_id: str
+    ) -> dict[str, Any] | None:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM rca_conclusion_adjudication_repairs "
+                "WHERE adjudication_id = ?",
+                (adjudication_id,),
+            ).fetchone()
+            return dict(row) if row is not None else None
         finally:
             conn.close()
 
@@ -2759,11 +2923,11 @@ class RcaDeliveryStore:
                 return SubscriptionMaterializationResult()
             activation_joins = (
                 """
-                  JOIN rca_execution_watch AS w
+             LEFT JOIN rca_execution_watch AS w
                     ON w.submission_key = j.submission_key
-                  JOIN rca_outbox AS o
+             LEFT JOIN rca_outbox AS o
                     ON o.outbox_id = w.submission_outbox_id
-                  JOIN business_triggers AS t
+             LEFT JOIN business_triggers AS t
                     ON t.business_key = o.business_key
                    AND t.generation = o.generation
                 """
@@ -3869,6 +4033,90 @@ class RcaDeliveryStore:
         finally:
             conn.close()
 
+    def authorize_adjudication_comment_attempt(
+        self,
+        *,
+        claim: DeliveryEffectClaim,
+        now: datetime | None = None,
+        activation_required: bool = False,
+    ) -> bool:
+        """Consume the correction's single remote comment-attempt token."""
+
+        self._validate_activation_required(activation_required)
+        current = _iso(now)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = self._current_effect_claim(
+                conn,
+                effect_key=claim.effect_key,
+                lease_token=claim.lease_token,
+                fence=claim.fence,
+                current=current,
+            )
+            try:
+                payload = json.loads(str(row["payload_json"] or ""))
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise DeliveryRecordConflictError(
+                    "adjudication effect payload is invalid"
+                ) from exc
+            if (
+                not isinstance(payload, Mapping)
+                or payload.get("schema_version")
+                != ADJUDICATION_EFFECT_SCHEMA_VERSION
+            ):
+                raise DeliveryRecordConflictError(
+                    "comment-attempt token is only valid for adjudication effects"
+                )
+            activation_enforced = self._activation_enforced_tx(
+                conn,
+                activation_required=activation_required,
+            )
+            if not activation_enforced:
+                raise StaleDeliveryEffectLeaseError(
+                    f"delivery activation unavailable for {claim.effect_key}"
+                )
+            self._require_activation_schema(conn)
+            if not self._effect_activation_eligible_tx(
+                conn,
+                effect_key=claim.effect_key,
+                submission_key=str(row["job_submission_key"]),
+            ):
+                raise StaleDeliveryEffectLeaseError(
+                    f"delivery activation changed for {claim.effect_key}"
+                )
+            if int(row["adjudication_comment_attempt_count"]) != 0:
+                conn.commit()
+                return False
+            updated = conn.execute(
+                """
+                UPDATE rca_delivery_effects
+                   SET adjudication_comment_attempt_count = 1,
+                       adjudication_comment_attempted_at = ?, updated_at = ?
+                 WHERE effect_key = ? AND lease_token = ? AND fence = ?
+                   AND status = 'claimed'
+                   AND adjudication_comment_attempt_count = 0
+                """,
+                (
+                    current,
+                    current,
+                    claim.effect_key,
+                    claim.lease_token,
+                    claim.fence,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise StaleDeliveryEffectLeaseError(
+                    f"stale adjudication comment attempt for {claim.effect_key}"
+                )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def authorize_effect_recovery_write(
         self,
         *,
@@ -4020,11 +4268,11 @@ class RcaDeliveryStore:
                 self._require_activation_schema(conn)
             activation_joins = (
                 """
-                  JOIN rca_execution_watch AS w
+             LEFT JOIN rca_execution_watch AS w
                     ON w.submission_key = j.submission_key
-                  JOIN rca_outbox AS o
+             LEFT JOIN rca_outbox AS o
                     ON o.outbox_id = w.submission_outbox_id
-                  JOIN business_triggers AS t
+             LEFT JOIN business_triggers AS t
                     ON t.business_key = o.business_key
                    AND t.generation = o.generation
                 """
@@ -4281,6 +4529,14 @@ class RcaDeliveryStore:
                 business_key=str(row["job_business_key"] or ""),
                 submission_key=str(row["job_submission_key"] or ""),
                 generation=int(row["job_generation"]),
+                adjudication_comment_attempt_count=int(
+                    row["adjudication_comment_attempt_count"]
+                ),
+                adjudication_comment_attempted_at=(
+                    str(row["adjudication_comment_attempted_at"])
+                    if row["adjudication_comment_attempted_at"]
+                    else None
+                ),
             )
         except Exception:
             conn.rollback()
@@ -5235,11 +5491,11 @@ class RcaDeliveryStore:
                 self._require_activation_schema(conn)
             activation_joins = (
                 """
-                  JOIN rca_execution_watch AS w
+             LEFT JOIN rca_execution_watch AS w
                     ON w.submission_key = j.submission_key
-                  JOIN rca_outbox AS o
+             LEFT JOIN rca_outbox AS o
                     ON o.outbox_id = w.submission_outbox_id
-                  JOIN business_triggers AS t
+             LEFT JOIN business_triggers AS t
                     ON t.business_key = o.business_key
                    AND t.generation = o.generation
                 """

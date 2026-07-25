@@ -67,11 +67,14 @@ def test_non_bound_chat_is_ignored(tmp_path, monkeypatch):
 
 def test_explicit_rca_disabled_is_handled_without_files(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_G1Q3_REVIEW_OWNERS", raising=False)
+    monkeypatch.delenv("HERMES_G1Q3_REVIEW_OWNER_USER_IDS", raising=False)
 
     result = handle_owner_review_message(make_event("rca 通过 123"), hermes_home=tmp_path)
 
     assert result.handled is True
-    assert result.response == "owner review 未启用,请配置 HERMES_G1Q3_REVIEW_OWNERS"
+    assert result.response == (
+        "owner review 未启用,请配置 HERMES_G1Q3_REVIEW_OWNER_USER_IDS"
+    )
     assert not review_dir(tmp_path).exists()
 
 
@@ -98,22 +101,39 @@ def test_typed_user_id_allowlist_is_accepted(tmp_path, monkeypatch):
 
 def test_bare_user_id_in_legacy_owner_env_is_not_accepted(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_G1Q3_REVIEW_OWNERS", "ou_owner")
+    monkeypatch.delenv("HERMES_G1Q3_REVIEW_OWNER_USER_IDS", raising=False)
 
     result = handle_owner_review_message(make_event("rca 通过 123", user_name="Different Display Name"), hermes_home=tmp_path)
 
     assert result.handled is True
-    assert "不在 G1Q3 RCA owner review allowlist" in result.response
+    assert "未启用" in result.response
     assert not review_dir(tmp_path).exists()
 
 
-def test_owner_name_allowlist_is_accepted(tmp_path, monkeypatch):
+def test_owner_name_allowlist_is_not_authorization(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_G1Q3_REVIEW_OWNERS", "Owner A")
+    monkeypatch.delenv("HERMES_G1Q3_REVIEW_OWNER_USER_IDS", raising=False)
 
     result = handle_owner_review_message(make_event("RCA 通过 123"), hermes_home=tmp_path)
 
     assert result.handled is True
-    assert "issue 123 / 通过 / owner Owner A" in result.response
-    assert ledger(tmp_path)["issues"]["123"]["current"]["owner_name"] == "Owner A"
+    assert "未启用" in result.response
+    assert not review_dir(tmp_path).exists()
+
+
+def test_matching_display_name_cannot_override_stable_user_id(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_G1Q3_REVIEW_OWNER_USER_IDS", "ou_real_owner")
+    monkeypatch.setenv("HERMES_G1Q3_REVIEW_OWNERS", "Owner A")
+
+    result = handle_owner_review_message(
+        make_event("RCA 通过 123", user_id="ou_other", user_name="Owner A"),
+        hermes_home=tmp_path,
+    )
+
+    assert "不在 G1Q3 RCA owner review allowlist" in result.response
+    assert not review_dir(tmp_path).exists()
 
 
 def test_malformed_command_returns_usage_after_feature_enabled(tmp_path, monkeypatch):
@@ -234,6 +254,7 @@ async def test_gateway_connection_consumes_disabled_rca_before_agent(monkeypatch
     runner = make_runner()
     event = make_event("rca 通过 123")
     monkeypatch.delenv("HERMES_G1Q3_REVIEW_OWNERS", raising=False)
+    monkeypatch.delenv("HERMES_G1Q3_REVIEW_OWNER_USER_IDS", raising=False)
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run.GatewayRunner, "_is_user_authorized", lambda self, source: True)
 
@@ -244,7 +265,9 @@ async def test_gateway_connection_consumes_disabled_rca_before_agent(monkeypatch
 
     response = await gateway_run.GatewayRunner._handle_message(runner, event)
 
-    assert response == "owner review 未启用,请配置 HERMES_G1Q3_REVIEW_OWNERS"
+    assert response == (
+        "owner review 未启用,请配置 HERMES_G1Q3_REVIEW_OWNER_USER_IDS"
+    )
 
 
 @pytest.mark.asyncio
