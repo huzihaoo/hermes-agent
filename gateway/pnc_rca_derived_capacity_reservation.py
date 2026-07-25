@@ -50,6 +50,8 @@ RESERVATION_TTL_SECONDS = 1800
 DEFAULT_BOUNDARY_TIMEOUT_SECONDS = 120
 MAX_BOUNDARY_TIMEOUT_SECONDS = 120
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_DERIVED_RESERVATION_RECEIPT_BYTES = 64 * 1024
+MAX_RESERVATION_TIMESTAMP_TEXT_BYTES = 64
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_SUBMISSION_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$")
@@ -352,6 +354,11 @@ def _timestamp(value: Any, field_name: str, *, optional: bool = False) -> str | 
     if value is None and optional:
         return None
     text = str(value or "").strip()
+    if len(text.encode("utf-8")) > MAX_RESERVATION_TIMESTAMP_TEXT_BYTES:
+        raise _fail(
+            "derived_capacity_reservation_schema_invalid",
+            f"{field_name} is too long",
+        )
     try:
         parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError as exc:
@@ -743,7 +750,13 @@ def validate_derived_capacity_reservation_receipt(
             "derived_capacity_reservation_schema_invalid",
             "released reservation blocker mismatch",
         )
-    canonical_receipt = _strict_json_loads(_canonical_json(receipt))
+    canonical_text = _canonical_json(receipt)
+    if len(canonical_text.encode("utf-8")) > MAX_DERIVED_RESERVATION_RECEIPT_BYTES:
+        raise _fail(
+            "derived_capacity_reservation_schema_invalid",
+            "reservation receipt exceeds the fixed VM envelope",
+        )
+    canonical_receipt = _strict_json_loads(canonical_text)
     return DerivedCapacityReservationDecision(
         admitted=admitted,
         status=status,

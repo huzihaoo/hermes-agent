@@ -49,6 +49,7 @@ from gateway.pnc_rca_data_access import (
 )
 from gateway.pnc_rca_derived_capacity_reservation import (
     DEFAULT_BOUNDARY_TIMEOUT_SECONDS as DERIVED_RESERVATION_TIMEOUT_SECONDS,
+    MAX_DERIVED_RESERVATION_RECEIPT_BYTES,
     DerivedCapacityReservationDecision,
     DerivedCapacityReservationError,
     DerivedCapacityReservationRequest,
@@ -83,7 +84,6 @@ from gateway.pnc_rca_runtime_identity import (
     runtime_identity_is_valid,
 )
 from gateway.pnc_rca_schema import (
-    RCA_VM_DERIVED_RESERVATION_RECEIPT_HEADROOM_BYTES,
     RCA_VM_MAX_EXECUTION_REQUEST_JSON_BYTES,
     RcaExecutionRequest,
     RcaIssueContext,
@@ -1938,7 +1938,7 @@ def build_dispatch_execution_request(
             request,
             max_bytes=(
                 RCA_VM_MAX_EXECUTION_REQUEST_JSON_BYTES
-                - RCA_VM_DERIVED_RESERVATION_RECEIPT_HEADROOM_BYTES
+                - MAX_DERIVED_RESERVATION_RECEIPT_BYTES
             ),
         )
     except ValueError as exc:

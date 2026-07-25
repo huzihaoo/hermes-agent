@@ -23,9 +23,6 @@ RCA_EXECUTION_REQUEST_SCHEMA_VERSION = "g1q3_rca_execution_request_v2"
 RCA_EXECUTION_RESULT_SCHEMA_VERSION = "g1q3_rca_execution_result_v1"
 RCA_TOOLCHAIN_FINGERPRINT_SCHEMA_VERSION = "g1q3_rca_toolchain_v1"
 RCA_VM_MAX_EXECUTION_REQUEST_JSON_BYTES = 1024 * 1024
-# The dispatcher appends this fixed-shape receipt after its pre-reservation
-# request check. Keep deterministic space for the validated receipt envelope.
-RCA_VM_DERIVED_RESERVATION_RECEIPT_HEADROOM_BYTES = 64 * 1024
 RCA_VM_MAX_JSON_DEPTH = 32
 RCA_VM_MAX_JSON_NODES = 50_000
 

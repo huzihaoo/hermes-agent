@@ -283,6 +283,15 @@ def test_receipt_tampering_fails_closed(mutate):
         validate_derived_capacity_reservation_receipt(receipt, request)
 
 
+def test_receipt_timestamp_and_total_size_limits_fail_closed():
+    request = _request()
+    receipt = _receipt(request)
+    receipt["observed_at"] = "2026-07-11T04:00:00." + "1" * 70_000 + "+00:00"
+
+    with pytest.raises(DerivedCapacityReservationError):
+        validate_derived_capacity_reservation_receipt(receipt, request)
+
+
 def test_boundary_uses_fixed_module_and_returns_detached_receipt():
     request = _request()
     receipt = _receipt(request)
