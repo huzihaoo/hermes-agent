@@ -872,6 +872,10 @@ def test_thread_reply_effect_is_bound_to_exact_topic_and_is_deterministic():
     assert delivery.foxglove_url not in payload["message_content"]
     assert delivery.report_url != delivery.foxglove_url
     assert delivery.issue_url in payload["message_content"]
+    assert (
+        '<at user_id="ou_requester789"></at>'
+        in payload["message_content"]
+    )
 
 
 def test_thread_reply_effect_refuses_target_or_topic_fallback_drift():

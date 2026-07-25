@@ -1891,6 +1891,7 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
             report_url=claim.report_url,
             foxglove_url=str(payload.get("foxglove_url") or ""),
             issue_url=expected_issue_url,
+            requester_id=str(payload.get("requester_id") or ""),
             terminal_class=str(payload.get("terminal_class") or ""),
         )
     if content != expected_content:

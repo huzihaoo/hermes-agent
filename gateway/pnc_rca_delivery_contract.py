@@ -14,6 +14,7 @@ from typing import Any, Mapping, Sequence
 from urllib.parse import quote, unquote, urlparse
 
 from gateway.pnc_rca_admission import RcaAdmission, validate_rca_admission
+from gateway.feishu_mention import build_at_mention
 from gateway.pnc_rca_quality_oracle import (
     CANDIDATE_HYPOTHESIS,
     HONEST_NON_ATTRIBUTION,
@@ -520,6 +521,7 @@ def build_thread_reply_content(
     report_url: str,
     foxglove_url: str,
     issue_url: str,
+    requester_id: str,
     terminal_class: str = "",
 ) -> str:
     tier = terminal_class or public_tier_from_rendered_text(conclusion)
@@ -539,6 +541,7 @@ def build_thread_reply_content(
         f"详细证据报告：{report_url}",
         f"问题单：{issue_url}",
         "报告页包含证据和完整分析过程。",
+        f"发起人：{build_at_mention(requester_id)}",
     ])
     content = "\n".join(lines)
     if len(content.encode("utf-8")) > MAX_FEISHU_COMMENT_BYTES:
@@ -617,6 +620,7 @@ def _terminal_content(
     generation: int,
     thread: bool,
     diagnostic_result: str = "",
+    requester_id: str = "",
 ) -> str:
     if diagnostic_result and "\n" in diagnostic_result:
         lines = [
@@ -633,6 +637,8 @@ def _terminal_content(
             "关键证据：本次未生成可供审批的归因证据。",
             "处理状态：系统已记录内部处理路径，不要求问题发起人执行维护操作。",
         ]
+    if thread:
+        lines.append(f"发起人：{build_at_mention(requester_id)}")
     content = "\n".join(lines)
     if len(content.encode("utf-8")) > MAX_FEISHU_COMMENT_BYTES:
         raise DeliveryContractError("terminal_delivery_content_too_large")
@@ -721,12 +727,17 @@ def _validate_terminal_fallback_publication(
         raise DeliveryContractError("terminal_fallback_unbacked_evidence_claim")
 
 
-def _terminal_fallback_content(*, marker: str, conclusion: str) -> str:
-    content = "\n".join((
+def _terminal_fallback_content(
+    *, marker: str, conclusion: str, requester_id: str = ""
+) -> str:
+    lines = [
         marker,
         "【RCA 结果】本次未形成可确认归因。",
         *conclusion.splitlines(),
-    ))
+    ]
+    if requester_id:
+        lines.append(f"发起人：{build_at_mention(requester_id)}")
+    content = "\n".join(lines)
     if len(content.encode("utf-8")) > MAX_FEISHU_COMMENT_BYTES:
         raise DeliveryContractError("terminal_delivery_content_too_large")
     return content
@@ -1059,6 +1070,7 @@ def build_terminal_thread_reply_effect(
         message_content = _terminal_fallback_content(
             marker=marker,
             conclusion=str(semantic.get("conclusion") or ""),
+            requester_id=str(semantic.get("requester_id") or ""),
         )
     else:
         message_content = _terminal_content(
@@ -1070,6 +1082,7 @@ def build_terminal_thread_reply_effect(
             generation=generation,
             thread=True,
             diagnostic_result=str(semantic.get("diagnostic_result") or ""),
+            requester_id=str(semantic.get("requester_id") or ""),
         )
     payload = {
         **semantic,
@@ -1206,6 +1219,7 @@ def build_thread_reply_effect(
         report_url=str(semantic.get("report_url") or ""),
         foxglove_url=str(semantic.get("foxglove_url") or ""),
         issue_url=str(semantic.get("issue_url") or ""),
+        requester_id=str(semantic.get("requester_id") or ""),
         terminal_class=str(semantic.get("terminal_class") or ""),
     )
     payload = {

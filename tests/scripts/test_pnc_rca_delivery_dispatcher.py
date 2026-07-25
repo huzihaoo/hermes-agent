@@ -1133,6 +1133,10 @@ def test_terminal_manual_delivery_skips_report_http_and_sends_both_effects(tmp_p
     assert "本终态不改写" not in thread_remote.comments[0]["content"]
     assert "sensitive backend detail" not in remote.comments[0]["content"]
     assert "sensitive backend detail" not in thread_remote.comments[0]["content"]
+    assert (
+        '<at user_id="ou_requester789"></at>'
+        in thread_remote.comments[0]["content"]
+    )
     assert store.list_rows("rca_delivery_jobs")[0]["status"] == "delivered"
     assert {row["outcome"] for row in store.list_rows("rca_delivery_effects")} == {
         "terminal_failed"
