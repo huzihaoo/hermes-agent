@@ -91,7 +91,7 @@ MAX_CONCLUSION_BYTES = 2 * 1024
 CONSUMER_CAPABILITY_SCHEMA_VERSION = "rca_consumer_capability_publication_v1"
 RCA_RESULT_FIELD_KEY = "field_9193cb"
 RCA_REPORT_FIELD_KEY = "field_8c912e"
-DELIVERY_REPORT_LINK_KIND = "foxglove_viz"
+DELIVERY_REPORT_LINK_KIND = "html_report"
 _HTML_REPORT_STATUSES = frozenset(
     {"html_delivery_ready", "report_generated_need_review", "report_ready"}
 )
@@ -442,6 +442,7 @@ def build_issue_comment_content(
     report_status: str,
     conclusion: str,
     report_url: str,
+    foxglove_url: str,
     report_cifs_path: str,
 ) -> str:
     lines = [
@@ -454,7 +455,8 @@ def build_issue_comment_content(
         lines.append(f"候选结论：{conclusion}")
     lines.extend(
         [
-            f"Foxglove 归因报告：{report_url}",
+            f"HTML 归因报告：{report_url}",
+            f"Foxglove 可视化：{foxglove_url}",
             f"可视化文件（CIFS）：{report_cifs_path}",
             "说明：以上为自动 RCA 候选结论，需人工复核确认后再结案。",
         ]
@@ -472,6 +474,7 @@ def build_thread_reply_content(
     report_status: str,
     conclusion: str,
     report_url: str,
+    foxglove_url: str,
     issue_url: str,
 ) -> str:
     lines = [
@@ -484,7 +487,8 @@ def build_thread_reply_content(
         lines.append(f"候选结论：{conclusion}")
     lines.extend(
         [
-            f"Foxglove 归因报告：{report_url}",
+            f"HTML 归因报告：{report_url}",
+            f"Foxglove 可视化：{foxglove_url}",
             f"问题单：{issue_url}",
             "说明：以上为自动 RCA 候选结论，需人工复核确认后再结案。",
         ]
@@ -993,6 +997,7 @@ def build_thread_reply_effect(
         report_status=str(semantic.get("report_status") or ""),
         conclusion=conclusion,
         report_url=str(semantic.get("report_url") or ""),
+        foxglove_url=str(semantic.get("foxglove_url") or ""),
         issue_url=str(semantic.get("issue_url") or ""),
     )
     payload = {
@@ -1928,7 +1933,7 @@ def verify_delivery_bundle(
             "contract HTML/JSON paths do not match the sealed manifest",
         )
 
-    _validate_report_url(
+    html_report_url = _validate_report_url(
         manifest.get("report_url"),
         submission_key=validated_admission.submission_key,
         artifact_set_id=expected_artifact_set_id,
@@ -1990,7 +1995,7 @@ def verify_delivery_bundle(
         "work_item_id": refs.work_item_id,
         "issue_url": issue_url,
         "artifact_set_id": expected_artifact_set_id,
-        "report_url": rendered_foxglove_url,
+        "report_url": html_report_url,
         "report_cifs_path": report_cifs_path,
         "viz_mcap_vm": viz_mcap_vm,
         "foxglove_url": rendered_foxglove_url,
@@ -2005,7 +2010,7 @@ def verify_delivery_bundle(
             },
             {
                 "field_key": RCA_REPORT_FIELD_KEY,
-                "field_value": rendered_foxglove_url,
+                "field_value": html_report_url,
             },
         ],
     }
@@ -2024,7 +2029,8 @@ def verify_delivery_bundle(
         work_item_id=refs.work_item_id,
         report_status=report_status,
         conclusion=conclusion,
-        report_url=rendered_foxglove_url,
+        report_url=html_report_url,
+        foxglove_url=rendered_foxglove_url,
         report_cifs_path=report_cifs_path,
     )
     effect_payload = {
@@ -2047,7 +2053,7 @@ def verify_delivery_bundle(
         work_item_id=refs.work_item_id,
         target_key=target_key,
         issue_url=issue_url,
-        report_url=rendered_foxglove_url,
+        report_url=html_report_url,
         viz_mcap_vm=viz_mcap_vm,
         foxglove_url=rendered_foxglove_url,
         conclusion=conclusion,

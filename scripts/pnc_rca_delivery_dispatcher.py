@@ -1721,7 +1721,15 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
     if not manifest_submission_key:
         raise DeliveryContractError("delivery_manifest_store_identity_mismatch")
     expected_viz_path = canonical_viz_mcap_path(manifest_submission_key)
-    if not validate_foxglove_url(claim.report_url, expected_viz_path):
+    try:
+        manifest_report_url = validate_report_url(
+            claim.manifest.get("report_url"),
+            submission_key=manifest_submission_key,
+            artifact_set_id=claim.artifact_set_id,
+        )
+    except DeliveryContractError as exc:
+        raise DeliveryContractError("delivery_effect_report_url_invalid") from exc
+    if claim.report_url != manifest_report_url:
         raise DeliveryContractError("delivery_effect_report_url_invalid")
     expected_report_cifs_path = canonical_viz_mcap_cifs_path(
         manifest_submission_key
@@ -1730,7 +1738,6 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         raise DeliveryContractError("delivery_report_cifs_identity_mismatch")
     if (
         payload.get("viz_mcap_vm") != expected_viz_path
-        or payload.get("foxglove_url") != claim.report_url
         or not validate_foxglove_url(
             payload.get("foxglove_url"), payload.get("viz_mcap_vm")
         )
@@ -1756,11 +1763,6 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
     ]
     if payload.get("field_updates") != expected_field_updates:
         raise DeliveryContractError("delivery_effect_field_updates_invalid")
-    validate_report_url(
-        claim.manifest.get("report_url"),
-        submission_key=manifest_submission_key,
-        artifact_set_id=claim.artifact_set_id,
-    )
     verified_artifacts = verify_persisted_artifact_inventory(
         manifest=claim.manifest,
         stored_artifacts=claim.artifacts,
@@ -1804,6 +1806,7 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
             report_status=str(payload.get("report_status") or ""),
             conclusion=conclusion,
             report_url=claim.report_url,
+            foxglove_url=str(payload.get("foxglove_url") or ""),
             report_cifs_path=expected_report_cifs_path,
         )
     else:
@@ -1813,6 +1816,7 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
             report_status=str(payload.get("report_status") or ""),
             conclusion=conclusion,
             report_url=claim.report_url,
+            foxglove_url=str(payload.get("foxglove_url") or ""),
             issue_url=expected_issue_url,
         )
     if content != expected_content:

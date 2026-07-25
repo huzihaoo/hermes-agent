@@ -661,7 +661,7 @@ def test_success_requires_read_before_http_add_and_read_after_remote_id(tmp_path
     assert receipt["remote_id"] == "comment-1"
     assert receipt["confirmed_field_keys"] == ["field_9193cb", "field_8c912e"]
     payload = json.loads(effect["payload_json"])
-    assert payload["report_link_kind"] == "foxglove_viz"
+    assert payload["report_link_kind"] == "html_report"
     assert payload["project_key"] == "t03o4q"
     assert payload["project_simple_name"] == "g1q3"
     assert payload["issue_url"] == (
@@ -670,7 +670,8 @@ def test_success_requires_read_before_http_add_and_read_after_remote_id(tmp_path
     assert job["issue_url"] == payload["issue_url"]
     assert remote.fields["field_8c912e"] == payload["report_url"]
     assert payload["report_url"] in remote.comments[0]["content"]
-    assert payload["foxglove_url"] == payload["report_url"]
+    assert payload["foxglove_url"] != payload["report_url"]
+    assert payload["foxglove_url"] in remote.comments[0]["content"]
     assert receipt["confirmed_report_url"] == payload["report_url"]
     assert receipt["confirmed_content_sha256"] == hashlib.sha256(
         payload["comment_content"].encode("utf-8")
@@ -1705,13 +1706,13 @@ def test_dispatcher_rejects_report_url_for_another_submission_before_http(tmp_pa
     assert exc.value.code == "delivery_effect_report_url_invalid"
 
 
-def test_dispatcher_rejects_non_foxglove_report_link_kind_before_write(tmp_path):
+def test_dispatcher_rejects_non_html_report_link_kind_before_write(tmp_path):
     store = _seed(tmp_path)
     claim = store.claim_due_effect(lease_owner="worker-1", now=NOW)
     assert claim is not None
     tampered = replace(
         claim,
-        payload={**claim.payload, "report_link_kind": "manifest_html"},
+        payload={**claim.payload, "report_link_kind": "foxglove_viz"},
     )
 
     with pytest.raises(DeliveryContractError) as exc:
@@ -1720,12 +1721,12 @@ def test_dispatcher_rejects_non_foxglove_report_link_kind_before_write(tmp_path)
     assert exc.value.code == "delivery_effect_report_link_kind_invalid"
 
 
-def test_dispatcher_rejects_manifest_html_report_field_before_write(tmp_path):
+def test_dispatcher_rejects_foxglove_report_field_before_write(tmp_path):
     store = _seed(tmp_path)
     claim = store.claim_due_effect(lease_owner="worker-1", now=NOW)
     assert claim is not None
     field_updates = [dict(item) for item in claim.payload["field_updates"]]
-    field_updates[1]["field_value"] = claim.manifest["report_url"]
+    field_updates[1]["field_value"] = claim.payload["foxglove_url"]
     tampered = replace(
         claim,
         payload={**claim.payload, "field_updates": field_updates},
