@@ -92,6 +92,25 @@ def test_approval_rejects_delivered_noncausal_result():
     assert failure["job_status"] == "delivered"
 
 
+def test_approval_accepts_decoded_data_binding_conflict_as_a_cause():
+    snapshot = _snapshot()
+    contract = json.loads(snapshot["contract_json"])
+    contract["report"]["candidate_owner"] = "问题数据/回灌链路"
+    contract["artifacts"]["attribution_causal_text"] = (
+        "问题描述目标与绑定数据不一致，责任指向问题数据/回灌链路。"
+    )
+    contract["public_result"]["summary"]["status"] = "blocked"
+    contract["public_result"]["responsibility"]["status"] = (
+        "candidate_data_integrity_conflict"
+    )
+    snapshot["contract_json"] = json.dumps(contract)
+
+    approval = _approval(snapshot)
+
+    assert approval is not None
+    assert approval["quality"]["responsibility"] == "问题数据/回灌链路"
+
+
 def test_approval_waits_for_required_effect_and_surfaces_terminal_failure():
     pending = _snapshot(job_status="partial", effect_status="retry_wait")
     failed = _snapshot(job_status="partial", job_outcome="terminal_failed")

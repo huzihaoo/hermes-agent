@@ -349,6 +349,56 @@ def test_public_projection_keeps_evidence_conflict_without_debug_terms():
     assert "槽位" not in rendered
 
 
+def test_public_projection_attributes_data_binding_conflict_without_blame_shift():
+    contract = {
+        "summary": {
+            "short_conclusion": (
+                "问题数据/回灌链路不一致：绑定数据未出现问题描述中的目标，"
+                "当前不能将误触发归责于 AEB。"
+            )
+        },
+        "report": {
+            "candidate_owner": "问题数据/回灌链路",
+            "candidate_owner_domain": "问题数据/回灌链路",
+        },
+        "artifacts": {
+            "attribution_causal_text": (
+                "问题描述目标与绑定数据不一致，责任指向问题数据/回灌链路。"
+            )
+        },
+        "public_result": {
+            "summary": {
+                "status": "blocked",
+                "short_conclusion": (
+                    "问题数据/回灌链路不一致：绑定数据未出现问题描述中的目标，"
+                    "当前不能将误触发归责于 AEB。"
+                ),
+            },
+            "responsibility": {
+                "status": "candidate_data_integrity_conflict",
+            },
+            "causal_chain": {
+                "narrative": [
+                    {
+                        "role": "因果判断",
+                        "text": "描述目标未在绑定数据中出现，责任指向问题数据/回灌链路。",
+                    }
+                ]
+            },
+            "evidence_boundary": [
+                "绑定数据未观测到问题描述中的目标。"
+            ],
+        },
+    }
+
+    result = build_public_rca_result(contract)
+
+    assert result["attribution_ready"] is True
+    assert result["responsibility"] == "问题数据/回灌链路"
+    assert "问题数据/回灌链路" in result["causal_chain"]
+    assert "不能将误触发归责于 AEB" in result["conclusion"]
+
+
 def test_public_projection_humanizes_evaluator_and_responsibility_domain():
     contract = {
         "summary": {

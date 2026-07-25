@@ -191,10 +191,19 @@ def _causal_delivery_quality(contract_raw: Any) -> dict[str, str] | None:
     if isinstance(public_result, Mapping):
         summary = public_result.get("summary")
         responsibility_result = public_result.get("responsibility")
-        if isinstance(summary, Mapping) and summary.get("status") in {
-            "blocked",
-            "diagnostic_report_ready",
-        }:
+        responsibility_status = (
+            str(responsibility_result.get("status") or "")
+            if isinstance(responsibility_result, Mapping)
+            else ""
+        )
+        data_integrity_cause = (
+            responsibility_status == "candidate_data_integrity_conflict"
+        )
+        if (
+            isinstance(summary, Mapping)
+            and summary.get("status") in {"blocked", "diagnostic_report_ready"}
+            and not data_integrity_cause
+        ):
             return None
         if isinstance(responsibility_result, Mapping) and str(
             responsibility_result.get("status") or ""

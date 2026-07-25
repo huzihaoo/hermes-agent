@@ -1101,6 +1101,7 @@ _PUBLIC_RESPONSIBILITY_LABELS = {
     "PERCEPTION_LANE": "车道线感知",
     "PERCEPTION_OBJECT": "目标感知/融合",
     "PLANNING": "规划",
+    "问题数据/回灌链路": "问题数据/回灌链路",
 }
 
 
