@@ -21,9 +21,7 @@ def test_kafka_terminal_rerun_contract_crosses_control_outbox_and_collector(
     tmp_path,
 ):
     store = RcaControlStore(tmp_path / "control.sqlite3")
-    first = store.ingest_record(
-        _record(10), policy=_policy(), submit_enabled=True
-    )
+    first = store.ingest_record(_record(10), policy=_policy(), submit_enabled=True)
     _terminalize_input_wait(store, first.submission_key)
     second = store.ingest_record(
         _record(11, value=_value(updated_at=1783659999999)),
@@ -33,9 +31,7 @@ def test_kafka_terminal_rerun_contract_crosses_control_outbox_and_collector(
     assert second.generation == 2
 
     outbox = next(
-        row
-        for row in store.list_rows("rca_outbox")
-        if row["generation"] == 2
+        row for row in store.list_rows("rca_outbox") if row["generation"] == 2
     )
     claim = store.claim_outbox(
         lease_owner="kafka-rerun-contract",
@@ -43,9 +39,7 @@ def test_kafka_terminal_rerun_contract_crosses_control_outbox_and_collector(
         + timedelta(seconds=1),
     )
     assert claim is not None
-    admission, trigger_context = outbox_dispatcher._validated_claim_contract(
-        claim
-    )
+    admission, trigger_context = outbox_dispatcher._validated_claim_contract(claim)
 
     assert admission.trigger_kind == "kafka_retrigger"
     assert admission.generation == claim.generation == 2
@@ -76,6 +70,7 @@ def test_kafka_terminal_rerun_contract_crosses_control_outbox_and_collector(
         lease_token="collector-lease",
         lease_owner="collector",
         lease_expires_at=claim.lease_expires_at,
+        work_started_at=claim.created_at,
         terminal_first_seen_at=None,
         submission_payload=claim.payload,
         submission_result={

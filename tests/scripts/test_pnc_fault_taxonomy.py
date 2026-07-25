@@ -1,112 +1,325 @@
-"""Unit tests for the three-lane fault taxonomy (pnc_fault_taxonomy).
+"""Real-function regression tests for the fail-closed RCA fault taxonomy."""
 
-Pins the classification that prevents the 7028467612 failure mode: a retryable
-VM filesystem/permission fault must be ``infra_self_healable`` (self-heal +
-retry / ops), NEVER ``needs_human_input`` (which @-pings an issue originator who
-cannot fix a VM ownership error). Pure-function tests, no mocks — the real
-control flow is exercised directly.
-"""
+import pytest
+
 from scripts import pnc_fault_taxonomy as tax
 
 
-# --- the live incident -----------------------------------------------------
+@pytest.mark.parametrize(
+    ("kind", "lane", "route"),
+    [
+        (
+            "translate_workdir_permission",
+            tax.INFRA_SELF_HEALABLE,
+            tax.INFRA_REMEDIATION_HOLD,
+        ),
+        (
+            "frame_id_unresolved_after_auto_discovery",
+            tax.NEEDS_HUMAN_INPUT,
+            tax.INTERNAL_BACKLOG,
+        ),
+        (
+            "html_capability_payload_mismatch",
+            tax.HARD_DEFECT,
+            tax.INTERNAL_ALERT,
+        ),
+        ("service_provenance_unavailable", tax.HARD_DEFECT, tax.INTERNAL_ALERT),
+        ("delivery_lineage_unavailable", tax.HARD_DEFECT, tax.INTERNAL_ALERT),
+        ("viz_mcap_build_failed", tax.HARD_DEFECT, tax.INTERNAL_ALERT),
+    ],
+)
+def test_named_production_blockers_have_exactly_one_lane(kind, lane, route):
+    decision = tax.decide_failure({"kind": kind})
 
-def test_7028467612_permission_fault_is_infra_not_human():
-    """The exact live blocker that wrongly became need_input @originator."""
+    assert decision.known is True
+    assert decision.raw_code == kind
+    assert decision.terminal_error_code == kind
+    assert decision.lane == lane
+    assert decision.internal_route == route
+
+
+def test_remote_event_not_found_requires_self_proving_parse_audit():
+    reference_sha256 = "a" * 64
     blocker = {
-        "kind": "translate_service_unavailable",
-        "message": "mcap_data_translate 调用失败：PermissionError: [Errno 13] Permission denied: "
-                   "'.../7028467612_fcw/_dt_work/converted/_runtime_config/g1q3_topics_full.txt'",
-        "retryable": True,
+        "kind": "remote_event_not_found",
+        "retryable": False,
+        "audit": {
+            "parse_attempts": [
+                {
+                    "attempt_id": "parse-attempt-1",
+                    "parser": "remote_event_reader",
+                    "status": "parsed",
+                    "reference_sha256": reference_sha256,
+                }
+            ],
+            "data_sources": [
+                {
+                    "source_id": "data-source-1",
+                    "source_kind": "pdcl_event",
+                    "status": "not_found",
+                    "reference_sha256": reference_sha256,
+                }
+            ],
+            "results": [
+                {
+                    "attempt_id": "parse-attempt-1",
+                    "source_id": "data-source-1",
+                    "status": "not_found",
+                    "returned_count": 0,
+                    "reference_sha256": reference_sha256,
+                }
+            ],
+        },
     }
-    assert tax.classify_blocker(blocker) == tax.INFRA_SELF_HEALABLE
-    assert tax.is_self_healable(blocker) is True
-    assert tax.needs_human_input(blocker) is False
-    assert tax.is_retryable(blocker) is True
+
+    decision = tax.decide_failure(blocker, require_complete=True)
+
+    assert decision.known is True
+    assert decision.terminal_error_code == "remote_event_not_found"
+    assert decision.lane == tax.NEEDS_HUMAN_INPUT
+    assert set(decision.audit) == {"parse_attempts", "data_sources", "results"}
 
 
-def test_new_workdir_permission_kind_is_infra():
-    blocker = {"kind": "translate_workdir_permission", "retryable": True}
-    assert tax.classify_blocker(blocker) == tax.INFRA_SELF_HEALABLE
+def test_remote_event_without_audit_fails_closed_to_internal_alert():
+    decision = tax.decide_failure({"kind": "remote_event_not_found"})
+
+    assert decision.terminal_error_code == "remote_event_not_found"
+    assert decision.lane == tax.HARD_DEFECT
+    assert decision.internal_route == tax.INTERNAL_ALERT
+    assert decision.known is False
+    with pytest.raises(tax.TaxonomyContractError):
+        tax.decide_failure({"kind": "remote_event_not_found"}, require_complete=True)
 
 
-# --- explicit fault_class wins ---------------------------------------------
+@pytest.mark.parametrize(
+    "audit",
+    [
+        {
+            "parse_attempts": [{}],
+            "data_sources": [{}],
+            "results": [{}],
+        },
+        {
+            "parse_attempts": [
+                {
+                    "attempt_id": "parse-attempt-1",
+                    "parser": "remote_event_reader",
+                    "status": "parsed",
+                    "reference_sha256": "a" * 64,
+                }
+            ],
+            "data_sources": [
+                {
+                    "source_id": "data-source-1",
+                    "source_kind": "pdcl_event",
+                    "status": "not_found",
+                    "reference_sha256": "a" * 64,
+                }
+            ],
+            "results": [
+                {
+                    "attempt_id": "other-attempt",
+                    "source_id": "data-source-1",
+                    "status": "not_found",
+                    "returned_count": 0,
+                    "reference_sha256": "a" * 64,
+                }
+            ],
+        },
+        {
+            "parse_attempts": [
+                {
+                    "attempt_id": "opaque-event-id",
+                    "parser": "remote_event_reader",
+                    "status": "parsed",
+                    "reference_sha256": "a" * 64,
+                }
+            ],
+            "data_sources": [
+                {
+                    "source_id": "data-source-1",
+                    "source_kind": "pdcl_event",
+                    "status": "available",
+                    "reference_sha256": "b" * 64,
+                }
+            ],
+            "results": [
+                {
+                    "attempt_id": "opaque-event-id",
+                    "source_id": "data-source-1",
+                    "status": "empty",
+                    "returned_count": 1,
+                    "reference_sha256": "c" * 64,
+                }
+            ],
+        },
+    ],
+)
+def test_remote_event_malformed_or_uncorrelated_audit_is_rejected(audit):
+    decision = tax.decide_failure({
+        "kind": "remote_event_not_found",
+        "retryable": False,
+        "audit": audit,
+    })
 
-def test_explicit_fault_class_overrides_kind():
-    # Producer stamped an explicit class; honor it even if the kind would map
-    # elsewhere.
-    blocker = {"kind": "need_source_or_evidence", "fault_class": tax.INFRA_SELF_HEALABLE}
-    assert tax.classify_blocker(blocker) == tax.INFRA_SELF_HEALABLE
-    blocker2 = {"kind": "translate_service_unavailable", "fault_class": tax.HARD_DEFECT}
-    assert tax.classify_blocker(blocker2) == tax.HARD_DEFECT
+    assert decision.known is False
+    assert decision.lane == tax.HARD_DEFECT
+    assert decision.internal_route == tax.INTERNAL_ALERT
+    with pytest.raises(tax.TaxonomyContractError):
+        tax.decide_failure(
+            {"kind": "remote_event_not_found", "retryable": False, "audit": audit},
+            require_complete=True,
+        )
 
 
-def test_unknown_explicit_fault_class_is_ignored():
-    blocker = {"kind": "translate_workdir_permission", "fault_class": "bogus"}
-    assert tax.classify_blocker(blocker) == tax.INFRA_SELF_HEALABLE
+def _valid_remote_event_audit():
+    reference_sha256 = "a" * 64
+    return {
+        "parse_attempts": [
+            {
+                "attempt_id": "parse-attempt-1",
+                "parser": "remote_event_reader",
+                "status": "parsed",
+                "reference_sha256": reference_sha256,
+            }
+        ],
+        "data_sources": [
+            {
+                "source_id": "data-source-1",
+                "source_kind": "pdcl_event",
+                "status": "not_found",
+                "reference_sha256": reference_sha256,
+            }
+        ],
+        "results": [
+            {
+                "attempt_id": "parse-attempt-1",
+                "source_id": "data-source-1",
+                "status": "not_found",
+                "returned_count": 0,
+                "reference_sha256": reference_sha256,
+            }
+        ],
+    }
 
 
-# --- human-input lane ------------------------------------------------------
+@pytest.mark.parametrize(
+    ("mutate", "expected_error"),
+    [
+        (
+            lambda audit: audit["parse_attempts"][0].update(extra="producer-trusted"),
+            "remote_event_not_found_parse_attempts_invalid",
+        ),
+        (
+            lambda audit: audit["parse_attempts"][0].update(parser="event_url_v2"),
+            "remote_event_not_found_parse_attempts_invalid",
+        ),
+        (
+            lambda audit: audit["data_sources"][0].update(source_kind="pdcl_prod"),
+            "remote_event_not_found_data_sources_invalid",
+        ),
+        (
+            lambda audit: audit["data_sources"][0].update(status="empty"),
+            "remote_event_not_found_data_sources_invalid",
+        ),
+        (
+            lambda audit: audit["results"][0].update(reference_sha256="b" * 64),
+            "remote_event_not_found_reference_sha256_mismatch",
+        ),
+        (
+            lambda audit: audit["results"][0].update(status="empty"),
+            "remote_event_not_found_results_invalid",
+        ),
+        (
+            lambda audit: audit["results"][0].update(returned_count=1),
+            "remote_event_not_found_results_invalid",
+        ),
+    ],
+)
+def test_remote_event_audit_contract_is_independently_validated(mutate, expected_error):
+    audit = _valid_remote_event_audit()
+    mutate(audit)
 
-def test_needs_human_input_kinds():
-    for kind in ("need_source_or_evidence", "missing_frame_id", "data_address_missing"):
-        assert tax.classify_blocker({"kind": kind}) == tax.NEEDS_HUMAN_INPUT, kind
+    decision = tax.decide_failure({
+        "kind": "remote_event_not_found",
+        "retryable": False,
+        "audit": audit,
+    })
 
-
-# --- hard-defect lane ------------------------------------------------------
-
-def test_hard_defect_kinds():
-    for kind in ("translate_tool_missing", "invalid_schema_version", "request_not_visible_on_vm"):
-        assert tax.classify_blocker({"kind": kind}) == tax.HARD_DEFECT, kind
-
-
-# --- unknown-kind tie-breakers ---------------------------------------------
-
-def test_unknown_kind_retryable_true_is_infra():
-    assert tax.classify_blocker({"kind": "weird_new_thing", "retryable": True}) == tax.INFRA_SELF_HEALABLE
-
-
-def test_unknown_kind_retryable_false_is_hard_defect():
-    assert tax.classify_blocker({"kind": "weird_new_thing", "retryable": False}) == tax.HARD_DEFECT
-
-
-def test_unknown_kind_no_retryable_falls_to_default():
-    assert tax.classify_blocker({"kind": "weird_new_thing"}) == tax.NEEDS_HUMAN_INPUT
-    # caller can choose to surface unknowns to ops instead
-    assert tax.classify_blocker({"kind": "weird_new_thing"}, default=tax.HARD_DEFECT) == tax.HARD_DEFECT
-
-
-# --- no structured blocker: gate-decision fallback -------------------------
-
-def test_no_blocker_data_gate_is_human():
-    for gate in ("ready_to_download", "need_evidence", "need_source_or_evidence", "requires_download"):
-        assert tax.classify_blocker(None, gate_decision=gate) == tax.NEEDS_HUMAN_INPUT, gate
-
-
-def test_no_blocker_no_gate_is_default():
-    assert tax.classify_blocker(None) == tax.NEEDS_HUMAN_INPUT
-    assert tax.classify_blocker({}, default=tax.HARD_DEFECT) == tax.HARD_DEFECT
-
-
-def test_is_retryable_defaults_false():
-    assert tax.is_retryable({"kind": "x"}) is False
-    assert tax.is_retryable(None) is False
-    assert tax.is_retryable({"kind": "x", "retryable": "true"}) is True
-
-
-# --- remediation -----------------------------------------------------------
-
-def test_remediation_for_permission_kind():
-    rem = tax.remediation_for({"kind": "translate_workdir_permission"})
-    assert rem and rem["op"] == "normalize_workdir_ownership"
-    assert rem["resume_from_stage"] == "s3b_translate"
+    assert decision.known is False
+    assert decision.lane == tax.HARD_DEFECT
+    assert expected_error in decision.contract_errors
 
 
-def test_remediation_explicit_wins():
-    rem = tax.remediation_for({"kind": "translate_workdir_permission",
-                               "remediation": {"op": "custom", "detail": "x"}})
-    assert rem == {"op": "custom", "detail": "x"}
+def test_unknown_injection_becomes_taxonomy_gap_and_gate_is_nonzero():
+    decision = tax.decide_failure({"kind": "Future VM / Wild Error", "retryable": True})
+
+    assert decision.terminal_error_code == "taxonomy_gap:future_vm_wild_error"
+    assert decision.lane == tax.HARD_DEFECT
+    assert decision.internal_route == tax.INTERNAL_ALERT
+    assert decision.known is False
+    with pytest.raises(tax.TaxonomyContractError) as raised:
+        tax.decide_failure(
+            {"kind": "Future VM / Wild Error", "retryable": True},
+            require_complete=True,
+        )
+    assert raised.value.decision.terminal_error_code == decision.terminal_error_code
 
 
-def test_remediation_none_for_human_kind():
-    assert tax.remediation_for({"kind": "need_source_or_evidence"}) is None
+def test_missing_blocker_never_collapses_to_unclassified():
+    decision = tax.decide_failure(None)
+
+    assert decision.terminal_error_code == "taxonomy_gap:missing_blocker"
+    assert "unclassified" not in decision.terminal_error_code
+    assert decision.lane == tax.HARD_DEFECT
+
+
+def test_explicit_classification_conflict_is_a_taxonomy_gap():
+    decision = tax.decide_failure({
+        "kind": "translate_workdir_permission",
+        "fault_class": tax.NEEDS_HUMAN_INPUT,
+    })
+
+    assert decision.terminal_error_code == "taxonomy_gap:translate_workdir_permission"
+    assert decision.contract_errors == ("explicit_fault_class_conflict",)
+    assert decision.lane == tax.HARD_DEFECT
+
+
+def test_retryable_is_validation_not_an_unknown_kind_tiebreaker():
+    unknown = tax.decide_failure({"kind": "unknown_retryable", "retryable": True})
+    conflict = tax.decide_failure({
+        "kind": "html_capability_payload_mismatch",
+        "retryable": True,
+    })
+
+    assert unknown.lane == tax.HARD_DEFECT
+    assert unknown.terminal_error_code == "taxonomy_gap:unknown_retryable"
+    assert conflict.lane == tax.HARD_DEFECT
+    assert "retryable_contract_conflict" in conflict.contract_errors
+
+
+def test_data_gate_without_blocker_is_a_known_internal_backlog():
+    decision = tax.decide_failure(None, gate_decision="need_download")
+
+    assert decision.terminal_error_code == "need_source_or_evidence"
+    assert decision.lane == tax.NEEDS_HUMAN_INPUT
+    assert decision.internal_route == tax.INTERNAL_BACKLOG
+
+
+@pytest.mark.parametrize("gate", ["need_user_data", "need_input", "need_keyframe"])
+def test_stable_user_input_gate_names_are_not_treated_as_unknown_blockers(gate):
+    decision = tax.decide_failure(None, gate_decision=gate)
+
+    assert decision.known is True
+    assert decision.lane == tax.NEEDS_HUMAN_INPUT
+
+
+def test_remediation_is_same_generation_stage_specific():
+    remediation = tax.remediation_for({"kind": "translate_workdir_permission"})
+
+    assert remediation == {
+        "op": "normalize_workdir_ownership",
+        "detail": "normalize the pipeline-owned translate workdir, then retry",
+        "resume_from_stage": "s3b_translate",
+    }
+    assert tax.TERMINAL_FALLBACK_SECONDS == 1800

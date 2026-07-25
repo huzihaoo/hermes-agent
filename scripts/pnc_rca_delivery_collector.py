@@ -51,6 +51,7 @@ from gateway.pnc_rca_capacity_sample_evidence import (
 )
 from gateway.pnc_rca_control_store import RcaControlStore
 from gateway.pnc_rca_delivery_contract import (
+    TERMINAL_FALLBACK_CONTRACT_SCHEMA_VERSION,
     TERMINAL_DELIVERY_OUTCOMES,
     DeliveryContractError,
     VerifiedDelivery,
@@ -78,6 +79,7 @@ from gateway.pnc_rca_runtime_identity import (
 )
 from hermes_constants import get_hermes_home
 from scripts.pnc_foxglove_delivery import canonical_viz_mcap_path
+from scripts import pnc_fault_taxonomy
 
 
 ENV_PREFIX = "HERMES_RCA_DELIVERY_COLLECTOR_"
@@ -106,6 +108,10 @@ DEFAULT_SSH_MINI_AGENT = str(Path.home() / ".local" / "bin" / "ssh-mini-agent")
 MAX_ARTIFACT_READ_TIMEOUT_SECONDS = 110
 ARTIFACT_READ_LEASE_MARGIN_SECONDS = 15
 MAX_HEALTH_HEARTBEAT_INTERVAL_SECONDS = 15.0
+MAX_FAILURE_RECEIPT_BYTES = 256 * 1024
+FAILURE_RECEIPT_SCHEMA_VERSION = "g1q3_rca_service_result_v2"
+INFRA_REMEDIATION_SCHEMA_VERSION = "pnc_rca_infra_remediation_receipt_v1"
+MAX_INFRA_REMEDIATION_SECONDS = 10
 _EVENTUAL_ARTIFACT_CODES = frozenset({
     "delivery_contract_missing",
     "delivery_manifest_missing",
@@ -153,11 +159,16 @@ _PUBLIC_TERMINAL_ERROR_CODES = frozenset({
     "submission_watch_identity_mismatch",
     "terminal_artifact_grace_exceeded",
 })
-_PUBLIC_TERMINAL_FALLBACK_CODE = "terminal_failure_unclassified"
+_PUBLIC_TERMINAL_FALLBACK_CODE = "taxonomy_gap:missing_terminal_error_code"
 
 
 StatusReader = Callable[[str], Mapping[str, Any]]
 ArtifactBundleReader = Callable[[ExecutionWatchClaim], Mapping[str, Any]]
+FailureReceiptReader = Callable[[ExecutionWatchClaim], Mapping[str, Any]]
+InfraRemediationRunner = Callable[
+    [ExecutionWatchClaim, Mapping[str, Any], Mapping[str, Any], int],
+    Mapping[str, Any],
+]
 TerminalReceiptReader = Callable[[str, str], bytes]
 
 
@@ -177,6 +188,108 @@ def _heartbeat_interval_seconds(max_age_seconds: int) -> float:
         1.0,
         min(MAX_HEALTH_HEARTBEAT_INTERVAL_SECONDS, max_age_seconds / 3),
     )
+
+
+def _utc_datetime(value: Any, *, field: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{field} is invalid") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise RuntimeError(f"{field} is invalid")
+    return parsed.astimezone(timezone.utc)
+
+
+def _work_window(
+    claim: ExecutionWatchClaim,
+    now: datetime,
+) -> tuple[datetime, datetime, float]:
+    started = _utc_datetime(claim.work_started_at, field="work_started_at")
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise RuntimeError("current time is invalid")
+    current = now.astimezone(timezone.utc)
+    deadline = started + timedelta(seconds=pnc_fault_taxonomy.TERMINAL_FALLBACK_SECONDS)
+    return started, deadline, (current - started).total_seconds()
+
+
+def default_infra_remediation_runner(
+    claim: ExecutionWatchClaim,
+    blocker: Mapping[str, Any],
+    remediation: Mapping[str, Any],
+    timeout_seconds: int,
+) -> Mapping[str, Any]:
+    """Fail closed when no post-terminal same-task resume primitive exists.
+
+    The active pipeline already performs its bounded in-process remediation
+    before declaring terminal.  The host must not replay a raw stage command or
+    pretend polling is remediation; it records this held result exactly once.
+    """
+
+    return {
+        "schema_version": INFRA_REMEDIATION_SCHEMA_VERSION,
+        "success": False,
+        "status": "held",
+        "submission_key": claim.submission_key,
+        "business_key": claim.business_key,
+        "generation": claim.generation,
+        "task_id": claim.task_id,
+        "operation": str(remediation.get("op") or "") or "unavailable",
+        "blocker_kind": pnc_fault_taxonomy.blocker_kind(blocker),
+        "resumed_same_task": False,
+        "external_writes": False,
+        "timeout_seconds": timeout_seconds,
+        "error_code": "infra_remediation_primitive_unavailable",
+    }
+
+
+def _validated_remediation_result(
+    value: Mapping[str, Any],
+    *,
+    claim: ExecutionWatchClaim,
+    operation: str,
+) -> tuple[dict[str, Any], bool]:
+    result = dict(value) if isinstance(value, Mapping) else {}
+    expected_keys = {
+        "schema_version",
+        "success",
+        "status",
+        "submission_key",
+        "business_key",
+        "generation",
+        "task_id",
+        "operation",
+        "blocker_kind",
+        "resumed_same_task",
+        "external_writes",
+        "timeout_seconds",
+        "error_code",
+    }
+    if (
+        set(result) != expected_keys
+        or result.get("schema_version") != INFRA_REMEDIATION_SCHEMA_VERSION
+        or result.get("submission_key") != claim.submission_key
+        or result.get("business_key") != claim.business_key
+        or result.get("generation") != claim.generation
+        or result.get("task_id") != claim.task_id
+        or result.get("operation") != operation
+        or result.get("external_writes") is not False
+        or type(result.get("timeout_seconds")) is not int
+        or not 1 <= int(result["timeout_seconds"]) <= MAX_INFRA_REMEDIATION_SECONDS
+        or type(result.get("success")) is not bool
+        or type(result.get("resumed_same_task")) is not bool
+        or result.get("status") not in {"succeeded", "held", "failed"}
+        or not isinstance(result.get("error_code"), str)
+    ):
+        raise RuntimeError("infra_remediation_receipt_invalid")
+    succeeded = (
+        result["success"] is True
+        and result["status"] == "succeeded"
+        and result["resumed_same_task"] is True
+        and result["error_code"] == ""
+    )
+    if result["success"] is not succeeded:
+        raise RuntimeError("infra_remediation_receipt_invalid")
+    return result, succeeded
 
 
 class _PeriodicHeartbeat:
@@ -229,9 +342,7 @@ def _boolean(env: Mapping[str, str], name: str, default: bool = False) -> bool:
     raise ValueError(f"{name} must be true or false")
 
 
-def _strict_boolean(
-    env: Mapping[str, str], name: str, default: bool = False
-) -> bool:
+def _strict_boolean(env: Mapping[str, str], name: str, default: bool = False) -> bool:
     value = str(env.get(name, "true" if default else "false")).strip().lower()
     if value == "true":
         return True
@@ -471,6 +582,13 @@ class ArtifactBundleReadError(RuntimeError):
         super().__init__(self.detail)
 
 
+class FailureReceiptReadError(RuntimeError):
+    def __init__(self, code: str, detail: str = ""):
+        self.code = str(code or "failure_receipt_unavailable")[:120]
+        self.detail = str(detail or self.code)[:1000]
+        super().__init__(self.detail)
+
+
 @dataclass
 class CollectorStats:
     loops: int = 0
@@ -484,6 +602,14 @@ class CollectorStats:
     retried: int = 0
     idle: int = 0
     stale_lease: int = 0
+    failure_holds: int = 0
+    remediation_attempted: int = 0
+    remediation_succeeded: int = 0
+    remediation_held: int = 0
+    internal_backlog: int = 0
+    internal_alert: int = 0
+    taxonomy_gaps: int = 0
+    terminal_fallbacks: int = 0
     capacity_scanned: int = 0
     capacity_eligible: int = 0
     capacity_appended: int = 0
@@ -510,6 +636,119 @@ def default_status_reader(task_id: str) -> Mapping[str, Any]:
     return vm_task_status(task_id, include_markdown=False)
 
 
+def _remote_failure_receipt_script(claim: ExecutionWatchClaim) -> str:
+    root = canonical_artifact_root(claim.submission_key).rstrip("/")
+    receipt_path = f"{root}/rca_service_result.json"
+    return textwrap.dedent(
+        f"""
+        import json
+        import os
+        import stat
+
+        ROOT = {root!r}
+        PATH = {receipt_path!r}
+        EXPECTED_TASK_ID = {claim.task_id!r}
+        EXPECTED_SUBMISSION_KEY = {claim.submission_key!r}
+        MAX_BYTES = {MAX_FAILURE_RECEIPT_BYTES}
+
+        def finish(value):
+            print(json.dumps(value, ensure_ascii=False, sort_keys=True))
+            raise SystemExit(0)
+
+        try:
+            current = '/'
+            for part in ROOT.strip('/').split('/'):
+                current = os.path.join(current, part)
+                info = os.lstat(current)
+                if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                    raise RuntimeError('failure_receipt_parent_invalid')
+            flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)
+            fd = os.open(PATH, flags)
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise RuntimeError('failure_receipt_file_invalid')
+                if info.st_size <= 0 or info.st_size > MAX_BYTES:
+                    raise RuntimeError('failure_receipt_size_invalid')
+                raw = os.read(fd, MAX_BYTES + 1)
+            finally:
+                os.close(fd)
+            if len(raw) > MAX_BYTES:
+                raise RuntimeError('failure_receipt_size_invalid')
+            receipt = json.loads(raw.decode('utf-8'))
+            if not isinstance(receipt, dict):
+                raise RuntimeError('failure_receipt_shape_invalid')
+            blocker = receipt.get('blocker')
+            if (
+                receipt.get('schema_version') != {FAILURE_RECEIPT_SCHEMA_VERSION!r}
+                or receipt.get('task_id') != EXPECTED_TASK_ID
+                or os.path.normpath(str(receipt.get('output_dir') or '')) != ROOT
+                or EXPECTED_TASK_ID != EXPECTED_SUBMISSION_KEY
+                or not isinstance(blocker, dict)
+                or not str(blocker.get('kind') or '').strip()
+            ):
+                raise RuntimeError('failure_receipt_identity_invalid')
+            if len(json.dumps(blocker, ensure_ascii=False).encode('utf-8')) > 32768:
+                raise RuntimeError('failure_receipt_blocker_too_large')
+            finish({{
+                'ok': True,
+                'schema_version': receipt['schema_version'],
+                'task_id': receipt['task_id'],
+                'status': str(receipt.get('status') or ''),
+                'pipeline_status': str(receipt.get('pipeline_status') or ''),
+                'pipeline_stage': str(receipt.get('pipeline_stage') or ''),
+                'blocker': blocker,
+            }})
+        except FileNotFoundError:
+            finish({{'ok': False, 'error_code': 'failure_receipt_missing'}})
+        except (UnicodeError, ValueError):
+            finish({{'ok': False, 'error_code': 'failure_receipt_json_invalid'}})
+        except RuntimeError as exc:
+            finish({{'ok': False, 'error_code': str(exc)}})
+        """
+    ).strip()
+
+
+def default_failure_receipt_reader(
+    claim: ExecutionWatchClaim,
+    *,
+    ssh_mini_agent: str = DEFAULT_SSH_MINI_AGENT,
+    timeout_seconds: int = 30,
+) -> Mapping[str, Any]:
+    """Read the identity-bound VM service receipt without materializing input."""
+
+    try:
+        proc = subprocess.run(
+            [ssh_mini_agent, "run_py_json"],
+            input=_remote_failure_receipt_script(claim),
+            text=True,
+            capture_output=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise FailureReceiptReadError(
+            "failure_receipt_reader_unavailable", type(exc).__name__
+        ) from exc
+    if proc.returncode != 0:
+        raise FailureReceiptReadError(
+            "failure_receipt_reader_unavailable",
+            (proc.stderr or proc.stdout or f"ssh-mini-agent rc={proc.returncode}")[
+                -1000:
+            ],
+        )
+    try:
+        payload = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise FailureReceiptReadError("failure_receipt_response_invalid") from exc
+    if not isinstance(payload, dict):
+        raise FailureReceiptReadError("failure_receipt_response_invalid")
+    if payload.get("ok") is not True:
+        code = str(payload.get("error_code") or "failure_receipt_unavailable")
+        raise FailureReceiptReadError(code)
+    return payload
+
+
 def probe_remote_css_parser(
     ssh_mini_agent: str,
     *,
@@ -529,7 +768,9 @@ def probe_remote_css_parser(
             "html_css_parser_probe_root_invalid",
             permanent=True,
         )
-    checker_path = str(selected_root / PurePosixPath(REMOTE_CSS_RUNTIME_CHECKER_PATH).name)
+    checker_path = str(
+        selected_root / PurePosixPath(REMOTE_CSS_RUNTIME_CHECKER_PATH).name
+    )
     requirements_path = str(
         selected_root / PurePosixPath(REMOTE_CSS_RUNTIME_REQUIREMENTS_PATH).name
     )
@@ -617,9 +858,7 @@ def _remote_bundle_script(submission_key: str) -> str:
     root = canonical_artifact_root(submission_key)
     formal_viz_path = canonical_viz_mcap_path(submission_key)
     if not formal_viz_path:
-        raise ArtifactBundleReadError(
-            "viz_publication_path_invalid", permanent=True
-        )
+        raise ArtifactBundleReadError("viz_publication_path_invalid", permanent=True)
     formal_viz_root = str(PurePosixPath(formal_viz_path).parent)
     return textwrap.dedent(
         f"""
@@ -1415,8 +1654,7 @@ def _submission_admission(claim: ExecutionWatchClaim):
         except Exception as exc:
             raise DeliveryContractError("submission_outbox_contract_invalid") from exc
         event_uid = (
-            f"{payload.get('topic')}:{payload.get('partition')}:"
-            f"{payload.get('offset')}"
+            f"{payload.get('topic')}:{payload.get('partition')}:{payload.get('offset')}"
         )
         normalized_identity = {
             "schema_version": normalized.get("schema_version"),
@@ -1497,27 +1735,179 @@ def _status_state(status: Mapping[str, Any]) -> str:
     )
 
 
-def _terminal_failure(status: Mapping[str, Any], state: str) -> tuple[str, str]:
-    blocker = (
-        status.get("blocker") if isinstance(status.get("blocker"), Mapping) else {}
+def _terminal_failure(
+    status: Mapping[str, Any],
+    state: str,
+    *,
+    failure_receipt: Mapping[str, Any] | None = None,
+) -> tuple[
+    pnc_fault_taxonomy.FailureDecision,
+    str,
+    dict[str, Any],
+    dict[str, Any],
+]:
+    status_blocker = (
+        dict(status.get("blocker"))
+        if isinstance(status.get("blocker"), Mapping)
+        else {}
     )
-    blocker_kind = str(blocker.get("kind") or "").strip().lower()
-    public_blocker = _PUBLIC_TERMINAL_BLOCKER_CODES.get(blocker_kind)
-    code = f"vm_terminal_{state}_{public_blocker or 'unclassified'}"
+    receipt_blocker = (
+        dict(failure_receipt.get("blocker"))
+        if isinstance(failure_receipt, Mapping)
+        and isinstance(failure_receipt.get("blocker"), Mapping)
+        else {}
+    )
+    blocker = receipt_blocker or status_blocker
+    source = "rca_service_result" if receipt_blocker else "vm_status"
+    source_conflict = bool(
+        receipt_blocker
+        and status_blocker
+        and pnc_fault_taxonomy.blocker_kind(receipt_blocker)
+        != pnc_fault_taxonomy.blocker_kind(status_blocker)
+    )
+    if source_conflict:
+        blocker = {
+            **receipt_blocker,
+            "fault_class": "receipt_status_blocker_conflict",
+        }
+    decision = pnc_fault_taxonomy.decide_failure(blocker)
     detail = str(
-        blocker.get("message") or status.get("summary") or status.get("error") or state
+        blocker.get("message")
+        or blocker.get("detail")
+        or blocker.get("reason")
+        or status.get("summary")
+        or status.get("error")
+        or state
     )
-    return code, detail
+    projection = {
+        **decision.as_dict(),
+        "observed_state": state,
+        "source": source,
+        "source_conflict": source_conflict,
+    }
+    if isinstance(failure_receipt, Mapping):
+        projection["receipt"] = {
+            key: failure_receipt.get(key)
+            for key in (
+                "schema_version",
+                "task_id",
+                "status",
+                "pipeline_status",
+                "pipeline_stage",
+            )
+        }
+    return decision, detail, projection, blocker
+
+
+def _observed_failure(
+    code: str,
+    *,
+    detail: str,
+    state: str,
+    source: str,
+    retryable: bool | None = None,
+) -> tuple[
+    pnc_fault_taxonomy.FailureDecision,
+    dict[str, Any],
+    dict[str, Any],
+]:
+    blocker: dict[str, Any] = {
+        "kind": str(code or "").strip().lower(),
+        "message": str(detail or code)[:1000],
+    }
+    if retryable is not None:
+        blocker["retryable"] = retryable
+    decision = pnc_fault_taxonomy.decide_failure(blocker)
+    projection = {
+        **decision.as_dict(),
+        "observed_state": state,
+        "source": source,
+        "source_conflict": False,
+    }
+    return decision, blocker, projection
+
+
+def _durable_failure_decision(
+    route: Mapping[str, Any],
+) -> pnc_fault_taxonomy.FailureDecision:
+    payload = route.get("route_payload")
+    data = payload.get("decision") if isinstance(payload, Mapping) else None
+    if not isinstance(data, Mapping):
+        raise RuntimeError("durable_failure_route_decision_invalid")
+    try:
+        decision = pnc_fault_taxonomy.FailureDecision(
+            raw_code=str(data["raw_code"]),
+            terminal_error_code=str(data["terminal_error_code"]),
+            lane=str(data["lane"]),
+            internal_route=str(data["internal_route"]),
+            known=data["known"],
+            retryable=data["retryable"],
+            external_comment_policy=str(data["external_comment_policy"]),
+            terminal_fallback_seconds=data["terminal_fallback_seconds"],
+            audit=dict(data["audit"]),
+            contract_errors=tuple(data["contract_errors"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("durable_failure_route_decision_invalid") from exc
+    expected_route = {
+        pnc_fault_taxonomy.INFRA_SELF_HEALABLE: (
+            pnc_fault_taxonomy.INFRA_REMEDIATION_HOLD,
+            "suppress_until_terminal_fallback",
+            True,
+        ),
+        pnc_fault_taxonomy.NEEDS_HUMAN_INPUT: (
+            pnc_fault_taxonomy.INTERNAL_BACKLOG,
+            "honest_non_attribution_only",
+            False,
+        ),
+        pnc_fault_taxonomy.HARD_DEFECT: (
+            pnc_fault_taxonomy.INTERNAL_ALERT,
+            "honest_non_attribution_only",
+            False,
+        ),
+    }.get(decision.lane)
+    if (
+        not isinstance(data.get("audit"), Mapping)
+        or not isinstance(data.get("contract_errors"), list)
+        or type(decision.known) is not bool
+        or type(decision.retryable) is not bool
+        or type(decision.terminal_fallback_seconds) is not int
+        or decision.terminal_fallback_seconds
+        != pnc_fault_taxonomy.TERMINAL_FALLBACK_SECONDS
+        or expected_route is None
+        or decision.internal_route != expected_route[0]
+        or decision.external_comment_policy != expected_route[1]
+        or decision.retryable is not expected_route[2]
+        or decision.internal_route
+        not in {
+            pnc_fault_taxonomy.INFRA_REMEDIATION_HOLD,
+            pnc_fault_taxonomy.INTERNAL_BACKLOG,
+            pnc_fault_taxonomy.INTERNAL_ALERT,
+        }
+        or decision.terminal_error_code != route.get("terminal_error_code")
+        or decision.lane != route.get("lane")
+        or decision.internal_route != route.get("route_kind")
+    ):
+        raise RuntimeError("durable_failure_route_decision_invalid")
+    return decision
 
 
 def _public_terminal_error_code(value: Any) -> str:
-    candidate = str(value or "").strip()
-    vm_codes = {
-        f"vm_terminal_{state}_{suffix}"
-        for state in _FAILED_TERMINAL_STATES
-        for suffix in {*_PUBLIC_TERMINAL_BLOCKER_CODES.values(), "unclassified"}
-    }
-    if candidate in _PUBLIC_TERMINAL_ERROR_CODES or candidate in vm_codes:
+    candidate = str(value or "").strip().lower()
+    known_blockers = (
+        pnc_fault_taxonomy.INFRA_SELF_HEALABLE_KINDS
+        | pnc_fault_taxonomy.NEEDS_HUMAN_INPUT_KINDS
+        | pnc_fault_taxonomy.HARD_DEFECT_KINDS
+        | frozenset(_PUBLIC_TERMINAL_BLOCKER_CODES.values())
+    )
+    taxonomy_gap = candidate.startswith("taxonomy_gap:") and all(
+        char.islower() or char.isdigit() or char in "_.-:" for char in candidate
+    )
+    if (
+        candidate in _PUBLIC_TERMINAL_ERROR_CODES
+        or candidate in known_blockers
+        or taxonomy_gap
+    ):
         return candidate
     return _PUBLIC_TERMINAL_FALLBACK_CODE
 
@@ -1530,6 +1920,8 @@ class DeliveryCollector:
         config: CollectorConfig,
         status_reader: StatusReader = default_status_reader,
         artifact_bundle_reader: ArtifactBundleReader | None = None,
+        failure_receipt_reader: FailureReceiptReader | None = None,
+        infra_remediation_runner: InfraRemediationRunner | None = None,
         terminal_receipt_reader: TerminalReceiptReader | None = None,
         capacity_control_store: RcaControlStore | None = None,
         now: Callable[[], datetime] = _utc_now,
@@ -1545,6 +1937,16 @@ class DeliveryCollector:
                 timeout_seconds=config.artifact_read_timeout_seconds,
             )
         )
+        self.failure_receipt_reader = failure_receipt_reader or (
+            lambda claim: default_failure_receipt_reader(
+                claim,
+                ssh_mini_agent=config.ssh_mini_agent,
+                timeout_seconds=min(config.artifact_read_timeout_seconds, 30),
+            )
+        )
+        self.infra_remediation_runner = (
+            infra_remediation_runner or default_infra_remediation_runner
+        )
         self.now = now
         self.lease_owner = lease_owner or (
             f"rca-delivery-collector:{socket.gethostname()}:{os.getpid()}"
@@ -1557,9 +1959,7 @@ class DeliveryCollector:
                 ssh_mini_agent=self.config.ssh_mini_agent,
                 task_id=task_id,
                 attempt_id=attempt_id,
-                timeout_seconds=(
-                    self.config.capacity_terminal_receipt_timeout_seconds
-                ),
+                timeout_seconds=(self.config.capacity_terminal_receipt_timeout_seconds),
             )
         )
         self.capacity_last_error = ""
@@ -1595,8 +1995,11 @@ class DeliveryCollector:
         error_code: str,
         error_detail: str,
         running: bool = False,
+        not_after: datetime | None = None,
     ) -> CollectOutcome:
         next_poll = self._next_poll(claim.poll_attempt, running=running)
+        if not_after is not None:
+            next_poll = min(next_poll, not_after.astimezone(timezone.utc))
         self.store.reschedule_watch(
             submission_key=claim.submission_key,
             lease_token=claim.lease_token,
@@ -1620,6 +2023,196 @@ class DeliveryCollector:
             next_poll_at=_utc_iso(next_poll),
         )
 
+    @staticmethod
+    def _failure_route_owner(lane: str) -> str:
+        return {
+            pnc_fault_taxonomy.INFRA_SELF_HEALABLE: "rca-infra",
+            pnc_fault_taxonomy.NEEDS_HUMAN_INPUT: "rca-triage",
+            pnc_fault_taxonomy.HARD_DEFECT: "rca-engineering",
+        }[lane]
+
+    def _handle_failure_until_deadline(
+        self,
+        claim: ExecutionWatchClaim,
+        *,
+        status: dict[str, Any],
+        decision: pnc_fault_taxonomy.FailureDecision,
+        blocker: Mapping[str, Any],
+        detail: str,
+        taxonomy: Mapping[str, Any],
+    ) -> CollectOutcome:
+        now = self.now()
+        started, deadline, elapsed_seconds = _work_window(claim, now)
+        owner = self._failure_route_owner(decision.lane)
+        remediation = pnc_fault_taxonomy.remediation_for(blocker) or {}
+        enriched = dict(status)
+        projection = dict(taxonomy)
+        projection["work_window"] = {
+            "work_started_at": _utc_iso(started),
+            "deadline_at": _utc_iso(deadline),
+            "elapsed_seconds": max(0, int(elapsed_seconds)),
+        }
+        enriched["failure_taxonomy"] = projection
+        route = self.store.upsert_failure_route(
+            claim=claim,
+            terminal_error_code=decision.terminal_error_code,
+            lane=decision.lane,
+            route_kind=decision.internal_route,
+            owner=owner,
+            work_started_at=_utc_iso(started),
+            deadline_at=_utc_iso(deadline),
+            audit={
+                "schema_version": "pnc_rca_failure_route_audit_v1",
+                "taxonomy_audit": decision.audit,
+                "contract_errors": list(decision.contract_errors),
+                "source": projection.get("source", "host_observation"),
+                "receipt": projection.get("receipt", {}),
+            },
+            route_payload={
+                "schema_version": "pnc_rca_failure_route_payload_v1",
+                "decision": decision.as_dict(),
+                "remediation": remediation,
+                "blocker": dict(blocker),
+            },
+            now=now,
+        )
+        projection["durable_route"] = {
+            "route_key": route.route_key,
+            "owner": route.owner,
+            "status": route.status,
+            "created": route.created,
+            "remediation_attempt_count": route.remediation_attempt_count,
+        }
+        if route.created:
+            if decision.internal_route == pnc_fault_taxonomy.INTERNAL_BACKLOG:
+                self.stats.internal_backlog += 1
+            elif decision.internal_route == pnc_fault_taxonomy.INTERNAL_ALERT:
+                self.stats.internal_alert += 1
+            if not decision.known:
+                self.stats.taxonomy_gaps += 1
+
+        deadline_reached = elapsed_seconds >= decision.terminal_fallback_seconds
+        if (
+            not deadline_reached
+            and decision.internal_route == pnc_fault_taxonomy.INFRA_REMEDIATION_HOLD
+            and self.store.claim_failure_remediation(
+                claim=claim,
+                route_key=route.route_key,
+                now=now,
+            )
+        ):
+            self.stats.remediation_attempted += 1
+            operation = str(remediation.get("op") or "") or "unavailable"
+            try:
+                raw_result = self.infra_remediation_runner(
+                    claim,
+                    blocker,
+                    remediation,
+                    MAX_INFRA_REMEDIATION_SECONDS,
+                )
+                result, succeeded = _validated_remediation_result(
+                    raw_result,
+                    claim=claim,
+                    operation=operation,
+                )
+            except Exception as exc:
+                result = {
+                    "schema_version": INFRA_REMEDIATION_SCHEMA_VERSION,
+                    "success": False,
+                    "status": "failed",
+                    "submission_key": claim.submission_key,
+                    "business_key": claim.business_key,
+                    "generation": claim.generation,
+                    "task_id": claim.task_id,
+                    "operation": operation,
+                    "blocker_kind": pnc_fault_taxonomy.blocker_kind(blocker),
+                    "resumed_same_task": False,
+                    "external_writes": False,
+                    "timeout_seconds": MAX_INFRA_REMEDIATION_SECONDS,
+                    "error_code": (
+                        f"infra_remediation_runner_failed:{type(exc).__name__}"
+                    )[:120],
+                }
+                succeeded = False
+            now = self.now()
+            self.store.finish_failure_remediation(
+                claim=claim,
+                route_key=route.route_key,
+                succeeded=succeeded,
+                result=result,
+                now=now,
+            )
+            started, deadline, elapsed_seconds = _work_window(claim, now)
+            deadline_reached = elapsed_seconds >= decision.terminal_fallback_seconds
+            projection["work_window"] = {
+                "work_started_at": _utc_iso(started),
+                "deadline_at": _utc_iso(deadline),
+                "elapsed_seconds": max(0, int(elapsed_seconds)),
+            }
+            projection["durable_route"]["status"] = (
+                "remediation_succeeded" if succeeded else "remediation_held"
+            )
+            projection["durable_route"]["remediation_attempt_count"] = 1
+            projection["durable_route"]["remediation_result"] = result
+            if succeeded:
+                self.stats.remediation_succeeded += 1
+            else:
+                self.stats.remediation_held += 1
+
+        enriched["failure_taxonomy"] = projection
+        if not deadline_reached:
+            next_poll = min(
+                self._next_poll(claim.poll_attempt, running=False),
+                deadline,
+            )
+            self.store.reschedule_failure_route(
+                claim=claim,
+                route_key=route.route_key,
+                next_retry_at=next_poll,
+                now=now,
+            )
+            self.store.reschedule_watch(
+                submission_key=claim.submission_key,
+                lease_token=claim.lease_token,
+                observed_state=claim.state,
+                status=enriched,
+                next_poll_at=next_poll,
+                error_code=decision.terminal_error_code,
+                error_detail=detail,
+                now=now,
+            )
+            self.stats.failure_holds += 1
+            return CollectOutcome(
+                status="failure_hold",
+                submission_key=claim.submission_key,
+                error_code=decision.terminal_error_code,
+                next_poll_at=_utc_iso(next_poll),
+            )
+
+        fallback = {
+            "schema_version": TERMINAL_FALLBACK_CONTRACT_SCHEMA_VERSION,
+            "work_started_at": _utc_iso(started),
+            "deadline_at": _utc_iso(deadline),
+            "elapsed_seconds": max(0, int(elapsed_seconds)),
+            "confidence_tier": "low",
+            "terminal_class": "honest_non_attribution",
+            "route_key": route.route_key,
+            "route_kind": decision.internal_route,
+            "route_owner": owner,
+        }
+        projection["terminal_fallback"] = fallback
+        enriched["failure_taxonomy"] = projection
+        self.stats.terminal_fallbacks += 1
+        return self._durable_terminal_outcome(
+            claim,
+            status=enriched,
+            outcome="terminal_failed",
+            terminal_state="failed",
+            error_code=decision.terminal_error_code,
+            error_detail=detail,
+            terminal_fallback=fallback,
+        )
+
     def _durable_terminal_outcome(
         self,
         claim: ExecutionWatchClaim,
@@ -1629,6 +2222,7 @@ class DeliveryCollector:
         terminal_state: str,
         error_code: str,
         error_detail: str,
+        terminal_fallback: Mapping[str, Any] | None = None,
     ) -> CollectOutcome:
         safe_outcome = (
             outcome if outcome in TERMINAL_DELIVERY_OUTCOMES else "quarantined"
@@ -1647,6 +2241,7 @@ class DeliveryCollector:
                 terminal_state=safe_state,
                 error_code=safe_error_code,
                 error_detail=error_detail,
+                terminal_fallback=terminal_fallback,
                 runtime_identity=self.runtime_identity,
                 now=self.now(),
                 activation_required=False,
@@ -1683,41 +2278,82 @@ class DeliveryCollector:
             created=result.created,
         )
 
-    def _terminal_artifact_pending_or_expired(
+    def _handle_observed_failure(
         self,
         claim: ExecutionWatchClaim,
         *,
         status: dict[str, Any],
-        terminal_first_seen_at: str,
-        source_code: str,
-        source_detail: str,
+        code: str,
+        detail: str,
+        state: str,
+        source: str,
     ) -> CollectOutcome:
-        try:
-            first_seen = datetime.fromisoformat(
-                terminal_first_seen_at.replace("Z", "+00:00")
-            ).astimezone(timezone.utc)
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError("stored terminal_first_seen_at is invalid") from exc
-        age = (self.now().astimezone(timezone.utc) - first_seen).total_seconds()
-        if age < self.config.terminal_artifact_grace_seconds:
-            return self._retry(
-                claim,
-                status=status,
-                observed_state="completed",
-                error_code="terminal_artifact_pending",
-                error_detail=f"{source_code}: {source_detail}"[:1000],
-            )
-        detail = (
-            f"{source_code} remained unresolved for {int(age)}s after VM completion: "
-            f"{source_detail}"
+        decision, blocker, taxonomy = _observed_failure(
+            code,
+            detail=detail,
+            state=state,
+            source=source,
         )
-        return self._durable_terminal_outcome(
+        return self._handle_failure_until_deadline(
             claim,
             status=status,
-            outcome="quarantined",
-            terminal_state="quarantined",
-            error_code="terminal_artifact_grace_exceeded",
-            error_detail=detail,
+            decision=decision,
+            blocker=blocker,
+            detail=detail,
+            taxonomy=taxonomy,
+        )
+
+    def _deadline_outcome(
+        self,
+        claim: ExecutionWatchClaim,
+        *,
+        status: dict[str, Any],
+        state: str,
+        source: str,
+    ) -> CollectOutcome | None:
+        now = self.now()
+        _started, _deadline, elapsed_seconds = _work_window(claim, now)
+        if elapsed_seconds < pnc_fault_taxonomy.TERMINAL_FALLBACK_SECONDS:
+            return None
+        route = self.store.failure_route_for_deadline(claim=claim, now=now)
+        if route is not None:
+            try:
+                decision = _durable_failure_decision(route)
+            except RuntimeError:
+                pass
+            else:
+                blocker: dict[str, Any] = {
+                    "kind": decision.raw_code,
+                    "retryable": decision.retryable,
+                }
+                if decision.audit:
+                    blocker["audit"] = decision.audit
+                taxonomy = {
+                    **decision.as_dict(),
+                    "observed_state": state,
+                    "source": "durable_failure_route_deadline",
+                    "source_conflict": False,
+                    "deadline_observation_source": source,
+                    "resumed_route_key": route.get("route_key"),
+                }
+                return self._handle_failure_until_deadline(
+                    claim,
+                    status=status,
+                    decision=decision,
+                    blocker=blocker,
+                    detail=(
+                        f"{decision.terminal_error_code} remained unresolved at "
+                        "the RCA work deadline"
+                    ),
+                    taxonomy=taxonomy,
+                )
+        return self._handle_observed_failure(
+            claim,
+            status=status,
+            code="rca_work_deadline_exceeded",
+            detail="RCA work did not produce a deliverable result within 30 minutes",
+            state=state,
+            source=source,
         )
 
     def collect_one(self) -> CollectOutcome:
@@ -1735,22 +2371,46 @@ class DeliveryCollector:
             return CollectOutcome(status="idle")
         self.stats.claimed += 1
         status: dict[str, Any] = {}
+        deadline_outcome = self._deadline_outcome(
+            claim,
+            status=status,
+            state=claim.state,
+            source="before_admission",
+        )
+        if deadline_outcome is not None:
+            return deadline_outcome
         try:
             admission = _submission_admission(claim)
         except Exception as exc:
+            deadline_outcome = self._deadline_outcome(
+                claim,
+                status=status,
+                state=claim.state,
+                source="submission_admission",
+            )
+            if deadline_outcome is not None:
+                return deadline_outcome
             code = (
                 exc.code
                 if isinstance(exc, DeliveryContractError)
                 else "submission_admission_invalid"
             )
-            return self._durable_terminal_outcome(
+            return self._handle_observed_failure(
                 claim,
                 status=status,
-                outcome="quarantined",
-                terminal_state="quarantined",
-                error_code=code,
-                error_detail=f"{code}: {exc}",
+                code=code,
+                detail=f"{code}: {exc}",
+                state=claim.state,
+                source="submission_admission",
             )
+        deadline_outcome = self._deadline_outcome(
+            claim,
+            status=status,
+            state=claim.state,
+            source="after_admission",
+        )
+        if deadline_outcome is not None:
+            return deadline_outcome
 
         try:
             raw_status = self.status_reader(claim.task_id)
@@ -1758,27 +2418,46 @@ class DeliveryCollector:
                 raise TypeError("status_reader must return an object")
             status = dict(raw_status)
         except Exception as exc:
-            return self._retry(
+            deadline_outcome = self._deadline_outcome(
                 claim,
                 status=status,
-                observed_state=claim.state,
-                error_code="vm_status_reader_unavailable",
-                error_detail=type(exc).__name__,
+                state=claim.state,
+                source="vm_status_reader",
+            )
+            if deadline_outcome is not None:
+                return deadline_outcome
+            return self._handle_observed_failure(
+                claim,
+                status=status,
+                code="vm_status_reader_unavailable",
+                detail=type(exc).__name__,
+                state=claim.state,
+                source="vm_status_reader",
             )
 
         state = _status_state(status)
+        deadline_outcome = self._deadline_outcome(
+            claim,
+            status=status,
+            state=state,
+            source="after_vm_status_read",
+        )
+        if deadline_outcome is not None:
+            return deadline_outcome
         if status.get("success") is not True:
             code = (
                 "vm_status_missing" if state == "missing" else "vm_status_unavailable"
             )
-            return self._retry(
+            return self._handle_observed_failure(
                 claim,
                 status=status,
-                observed_state=state,
-                error_code=code,
-                error_detail=str(status.get("error") or code),
+                code=code,
+                detail=str(status.get("error") or code),
+                state=state,
+                source="vm_status",
             )
         if state in _RUNNING_STATES:
+            _started, deadline, _elapsed_seconds = _work_window(claim, self.now())
             return self._retry(
                 claim,
                 status=status,
@@ -1786,32 +2465,52 @@ class DeliveryCollector:
                 error_code="",
                 error_detail="",
                 running=True,
+                not_after=deadline,
             )
         if state in _FAILED_TERMINAL_STATES:
-            code, detail = _terminal_failure(status, state)
-            return self._durable_terminal_outcome(
+            failure_receipt: Mapping[str, Any] | None = None
+            try:
+                failure_receipt = self.failure_receipt_reader(claim)
+            except FailureReceiptReadError as exc:
+                return self._handle_observed_failure(
+                    claim,
+                    status=status,
+                    code=exc.code,
+                    detail=exc.detail,
+                    state=state,
+                    source="failure_receipt_reader",
+                )
+            except Exception as exc:
+                return self._handle_observed_failure(
+                    claim,
+                    status=status,
+                    code="failure_receipt_reader_unavailable",
+                    detail=type(exc).__name__,
+                    state=state,
+                    source="failure_receipt_reader",
+                )
+            decision, detail, taxonomy, blocker = _terminal_failure(
+                status,
+                state,
+                failure_receipt=failure_receipt,
+            )
+            return self._handle_failure_until_deadline(
                 claim,
                 status=status,
-                outcome="terminal_failed",
-                terminal_state=state,
-                error_code=code,
-                error_detail=detail,
+                decision=decision,
+                blocker=blocker,
+                detail=detail,
+                taxonomy=taxonomy,
             )
         if state not in _COMPLETED_STATES:
-            return self._retry(
+            return self._handle_observed_failure(
                 claim,
                 status=status,
-                observed_state=state,
-                error_code="vm_status_unknown",
-                error_detail=f"unrecognized VM state: {state or 'missing'}",
+                code="vm_status_unknown",
+                detail=f"unrecognized VM state: {state or 'missing'}",
+                state=state,
+                source="vm_status",
             )
-
-        terminal_first_seen_at = self.store.note_terminal_completion(
-            submission_key=claim.submission_key,
-            lease_token=claim.lease_token,
-            status=status,
-            now=self.now(),
-        )
 
         try:
             bundle = self.artifact_bundle_reader(claim)
@@ -1825,47 +2524,72 @@ class DeliveryCollector:
                 html_dependencies=bundle.get("html_dependencies") or [],
             )
         except ArtifactBundleReadError as exc:
-            if _eventual_artifact_error(exc.code):
-                return self._terminal_artifact_pending_or_expired(
-                    claim,
-                    status=status,
-                    terminal_first_seen_at=terminal_first_seen_at,
-                    source_code=exc.code,
-                    source_detail=exc.detail,
-                )
-            if not exc.permanent:
-                return self._retry(
-                    claim,
-                    status=status,
-                    observed_state=state,
-                    error_code=exc.code,
-                    error_detail=exc.detail,
-                )
-            return self._durable_terminal_outcome(
+            deadline_outcome = self._deadline_outcome(
                 claim,
                 status=status,
-                outcome="quarantined",
-                terminal_state="quarantined",
-                error_code=exc.code,
-                error_detail=f"{exc.code}: {exc.detail}",
+                state=state,
+                source="artifact_bundle_reader",
+            )
+            if deadline_outcome is not None:
+                return deadline_outcome
+            return self._handle_observed_failure(
+                claim,
+                status=status,
+                code=exc.code,
+                detail=f"{exc.code}: {exc.detail}",
+                state=state,
+                source="artifact_bundle_reader",
             )
         except DeliveryContractError as exc:
-            if _eventual_artifact_error(exc.code):
-                return self._terminal_artifact_pending_or_expired(
-                    claim,
-                    status=status,
-                    terminal_first_seen_at=terminal_first_seen_at,
-                    source_code=exc.code,
-                    source_detail=exc.detail,
-                )
-            return self._durable_terminal_outcome(
+            deadline_outcome = self._deadline_outcome(
                 claim,
                 status=status,
-                outcome="quarantined",
-                terminal_state="quarantined",
-                error_code=exc.code,
-                error_detail=f"{exc.code}: {exc.detail}",
+                state=state,
+                source="delivery_contract_verifier",
             )
+        except Exception as exc:
+            deadline_outcome = self._deadline_outcome(
+                claim,
+                status=status,
+                state=state,
+                source="delivery_contract_verifier",
+            )
+            if deadline_outcome is not None:
+                return deadline_outcome
+            return self._handle_observed_failure(
+                claim,
+                status=status,
+                code="artifact_verifier_unavailable",
+                detail=type(exc).__name__,
+                state=state,
+                source="delivery_contract_verifier",
+            )
+            if deadline_outcome is not None:
+                return deadline_outcome
+            return self._handle_observed_failure(
+                claim,
+                status=status,
+                code=exc.code,
+                detail=f"{exc.code}: {exc.detail}",
+                state=state,
+                source="delivery_contract_verifier",
+            )
+        deadline_outcome = self._deadline_outcome(
+            claim,
+            status=status,
+            state=state,
+            source="after_artifact_verification",
+        )
+        if deadline_outcome is not None:
+            return deadline_outcome
+        deadline_outcome = self._deadline_outcome(
+            claim,
+            status=status,
+            state=state,
+            source="before_delivery_create",
+        )
+        if deadline_outcome is not None:
+            return deadline_outcome
         try:
             result = self.store.create_delivery(
                 claim=claim,
@@ -1883,13 +2607,13 @@ class DeliveryCollector:
                 error_code="stale_delivery_watch_lease",
             )
         except DeliveryRecordConflictError as exc:
-            return self._durable_terminal_outcome(
+            return self._handle_observed_failure(
                 claim,
                 status=status,
-                outcome="quarantined",
-                terminal_state="quarantined",
-                error_code="delivery_record_conflict",
-                error_detail=str(exc),
+                code="delivery_record_conflict",
+                detail=str(exc),
+                state=state,
+                source="delivery_store",
             )
         if result.created:
             self.stats.delivery_created += 1
@@ -1984,9 +2708,7 @@ class DeliveryCollector:
                 producer_activation_path(paths.state_root),
                 hmac_key=key,
                 expected_release_id=str(state.get("release_id") or ""),
-                expected_bootstrap_epoch_id=str(
-                    state.get("bootstrap_epoch_id") or ""
-                ),
+                expected_bootstrap_epoch_id=str(state.get("bootstrap_epoch_id") or ""),
             )
             excluded = self._capacity_ledger_identities(paths, hmac_key=key)
         activated_at = datetime.fromisoformat(
@@ -2012,9 +2734,7 @@ class DeliveryCollector:
                     )
                 terminal_raw = self.terminal_receipt_reader(task_id, attempt_id)
                 observed_at = datetime.fromisoformat(
-                    str(payload.get("snapshot_at") or "").replace(
-                        "Z", "+00:00"
-                    )
+                    str(payload.get("snapshot_at") or "").replace("Z", "+00:00")
                 ).astimezone(timezone.utc)
                 built = build_capacity_sample(
                     snapshot=payload,
@@ -2031,9 +2751,7 @@ class DeliveryCollector:
                 with capacity_transition.capacity_flock(
                     paths.global_lock,
                     exclusive=True,
-                    timeout_seconds=(
-                        self.config.capacity_sample_lock_timeout_seconds
-                    ),
+                    timeout_seconds=(self.config.capacity_sample_lock_timeout_seconds),
                 ):
                     current_state = control.capacity_transition_state()
                     if current_state is None:
@@ -2073,9 +2791,7 @@ class DeliveryCollector:
                         raise CapacitySampleEvidenceError(
                             "rca_capacity_producer_receipt_changed"
                         )
-                    excluded = self._capacity_ledger_identities(
-                        paths, hmac_key=key
-                    )
+                    excluded = self._capacity_ledger_identities(paths, hmac_key=key)
                     if (task_id, attempt_id) in excluded:
                         self.capacity_last_outcome = "deduped"
                         continue
@@ -2108,9 +2824,7 @@ class DeliveryCollector:
                     self.capacity_last_outcome = "appended"
             except Exception as exc:
                 self.stats.capacity_rejected += 1
-                code = getattr(
-                    exc, "code", "rca_capacity_sample_collection_failed"
-                )
+                code = getattr(exc, "code", "rca_capacity_sample_collection_failed")
                 self.capacity_last_error = str(code)[:120]
                 self.stats.capacity_last_error = self.capacity_last_error
                 self.capacity_last_outcome = "rejected"
@@ -2248,9 +2962,7 @@ class HealthReporter:
                 self.config.quarantine_baseline_sha256
             ),
             quarantine_release_id=self.config.quarantine_release_id,
-            quarantine_bootstrap_epoch_id=(
-                self.config.quarantine_bootstrap_epoch_id
-            ),
+            quarantine_bootstrap_epoch_id=(self.config.quarantine_bootstrap_epoch_id),
             quarantine_active_release_binding_path=(
                 self.config.quarantine_active_release_binding_path
             ),
@@ -2265,9 +2977,7 @@ class HealthReporter:
                 and not error
                 and not dependency_error
                 and self.dependencies_ready
-                and (
-                    not self.config.enabled or store_health.get("ok") is True
-                )
+                and (not self.config.enabled or store_health.get("ok") is True)
             ),
             "enabled": self.config.enabled,
             "external_writes": False,

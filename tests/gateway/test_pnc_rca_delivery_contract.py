@@ -5,12 +5,15 @@ import json
 
 import pytest
 
+from gateway import pnc_rca_delivery_contract as delivery_contract_module
 from gateway import pnc_rca_quality_oracle as quality_oracle_module
 from gateway.pnc_rca_admission import build_rca_admission
 from gateway.pnc_rca_delivery_contract import (
     DELIVERY_THREAD_EFFECT_KIND,
     TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
     TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1,
+    TERMINAL_FALLBACK_CONTRACT_SCHEMA_VERSION,
+    TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
     DeliveryContractError,
     MAX_DELIVERY_ARTIFACT_BYTES,
     MAX_DELIVERY_ARTIFACTS,
@@ -37,8 +40,7 @@ from gateway.pnc_rca_quality_oracle import MEDIUM_TIER_DISCLAIMER
 FORMAL_SUBMISSION_KEY = "g1q3-rca-s1-" + "a" * 64
 FORMAL_ARTIFACT_SET_ID = "g1q3-rca-artifact-v1-" + "b" * 64
 FORMAL_REPORT_PATH = (
-    f"/G1Q3_RCA/cases/{FORMAL_SUBMISSION_KEY}/"
-    f"{FORMAL_ARTIFACT_SET_ID}/index.html"
+    f"/G1Q3_RCA/cases/{FORMAL_SUBMISSION_KEY}/{FORMAL_ARTIFACT_SET_ID}/index.html"
 )
 
 
@@ -73,12 +75,11 @@ def _bundle(
     admission = admission or _admission()
     root = f"/mnt/tmp/{admission.submission_key}/"
     index_html = (
-        b'<!doctype html><title>RCA</title>'
-        b'<video src="assets/media/video.mp4"></video>'
+        b'<!doctype html><title>RCA</title><video src="assets/media/video.mp4"></video>'
     )
     if include_web_assets:
         index_html = (
-            b'<!doctype html><title>RCA</title>'
+            b"<!doctype html><title>RCA</title>"
             b'<link rel="stylesheet" href="assets/app.css">'
             b'<script src="assets/app.js"></script>'
             b'<video src="assets/media/video.mp4"></video>'
@@ -89,12 +90,10 @@ def _bundle(
         "assets/media/video.mp4": b"fake-video-bytes",
     }
     if include_web_assets:
-        contents.update(
-            {
-                "assets/app.css": b"body{color:#111}",
-                "assets/app.js": b"globalThis.RCA_READY=true;",
-            }
-        )
+        contents.update({
+            "assets/app.css": b"body{color:#111}",
+            "assets/app.js": b"globalThis.RCA_READY=true;",
+        })
     manifest = {
         "schema_version": "delivery_manifest_v2",
         "sealed": True,
@@ -143,26 +142,24 @@ def _bundle(
         ],
     }
     if include_web_assets:
-        manifest["artifacts"].extend(
-            [
-                {
-                    "role": "stylesheet",
-                    "path": "assets/app.css",
-                    "size": len(contents["assets/app.css"]),
-                    "sha256": _sha(contents["assets/app.css"]),
-                    "media_type": "text/css; charset=utf-8",
-                    "required": True,
-                },
-                {
-                    "role": "javascript",
-                    "path": "assets/app.js",
-                    "size": len(contents["assets/app.js"]),
-                    "sha256": _sha(contents["assets/app.js"]),
-                    "media_type": "text/javascript; charset=utf-8",
-                    "required": True,
-                },
-            ]
-        )
+        manifest["artifacts"].extend([
+            {
+                "role": "stylesheet",
+                "path": "assets/app.css",
+                "size": len(contents["assets/app.css"]),
+                "sha256": _sha(contents["assets/app.css"]),
+                "media_type": "text/css; charset=utf-8",
+                "required": True,
+            },
+            {
+                "role": "javascript",
+                "path": "assets/app.js",
+                "size": len(contents["assets/app.js"]),
+                "sha256": _sha(contents["assets/app.js"]),
+                "media_type": "text/javascript; charset=utf-8",
+                "required": True,
+            },
+        ])
     manifest["artifact_set_id"] = compute_artifact_set_id(manifest)
     manifest["report_url"] = build_report_url(
         admission.submission_key, manifest["artifact_set_id"]
@@ -239,27 +236,25 @@ def _bundle(
         }
         for path, data in contents.items()
     ]
-    observed.extend(
-        [
-            {
-                "path": viz_path,
-                "size": len(viz_bytes),
-                "sha256": _sha(viz_bytes),
-                "is_file": True,
-                "is_symlink": False,
-                "parents_symlink_free": True,
-                "sha256_attested_by_manifest": True,
-            },
-            {
-                "path": viz_manifest_path,
-                "size": len(viz_manifest_bytes),
-                "sha256": _sha(viz_manifest_bytes),
-                "is_file": True,
-                "is_symlink": False,
-                "parents_symlink_free": True,
-            },
-        ]
-    )
+    observed.extend([
+        {
+            "path": viz_path,
+            "size": len(viz_bytes),
+            "sha256": _sha(viz_bytes),
+            "is_file": True,
+            "is_symlink": False,
+            "parents_symlink_free": True,
+            "sha256_attested_by_manifest": True,
+        },
+        {
+            "path": viz_manifest_path,
+            "size": len(viz_manifest_bytes),
+            "sha256": _sha(viz_manifest_bytes),
+            "is_file": True,
+            "is_symlink": False,
+            "parents_symlink_free": True,
+        },
+    ])
     dependencies = [root + "assets/media/video.mp4"]
     if include_web_assets:
         dependencies.extend([root + "assets/app.css", root + "assets/app.js"])
@@ -391,9 +386,7 @@ def test_supported_tier_requires_golden_and_does_not_request_human_review(
         "summary": {"short_conclusion": conclusion},
         "candidate": "AEB",
         "responsibility": {"status": "supported"},
-        "evidence_summary": {
-            "refs": [{"evidence_ref": "frame:123/aeb_trigger"}]
-        },
+        "evidence_summary": {"refs": [{"evidence_ref": "frame:123/aeb_trigger"}]},
         "causal_chain": {
             "narrative": [
                 {"role": "现象", "text": "车辆发生制动。"},
@@ -426,12 +419,8 @@ def test_public_projection_keeps_evidence_conflict_without_debug_terms():
                 "未找到该目标组合；问题描述证据与生产数据源不一致，本次禁止输出责任归因。"
             )
         },
-        "evidence_boundary": [
-            "问题描述证据与生产数据源不一致，未找到该目标组合。"
-        ],
-        "artifacts": {
-            "attribution_causal_text": "问题描述证据与生产数据源不一致。"
-        },
+        "evidence_boundary": ["问题描述证据与生产数据源不一致，未找到该目标组合。"],
+        "artifacts": {"attribution_causal_text": "问题描述证据与生产数据源不一致。"},
     }
 
     result = build_public_rca_result(contract)
@@ -481,9 +470,7 @@ def test_public_projection_attributes_data_binding_conflict_without_blame_shift(
                     }
                 ]
             },
-            "evidence_boundary": [
-                "绑定数据未观测到问题描述中的目标。"
-            ],
+            "evidence_boundary": ["绑定数据未观测到问题描述中的目标。"],
         },
     }
 
@@ -633,9 +620,7 @@ def test_delivery_blocks_supported_claim_without_emitted_supported_key():
 
 def test_delivery_blocks_banned_public_phrase():
     admission, contract, manifest, observed, dependencies = _bundle()
-    contract["summary"]["short_conclusion"] = (
-        "自动RCA未归因：请核对问题数据地址。"
-    )
+    contract["summary"]["short_conclusion"] = "自动RCA未归因：请核对问题数据地址。"
 
     with pytest.raises(DeliveryContractError) as raised:
         verify_delivery_bundle(
@@ -756,7 +741,10 @@ def test_valid_sealed_evidence_and_published_viz_build_issue_effect():
     assert delivery.effect_payload["report_cifs_path"] == canonical_viz_mcap_cifs_path(
         delivery.submission_key
     )
-    assert delivery.effect_payload["report_cifs_path"] not in delivery.effect_payload["comment_content"]
+    assert (
+        delivery.effect_payload["report_cifs_path"]
+        not in delivery.effect_payload["comment_content"]
+    )
     assert delivery.viz_mcap_vm == canonical_viz_mcap_path(delivery.submission_key)
     assert delivery.foxglove_url == foxglove_url(delivery.viz_mcap_vm)
     assert delivery.report_url in delivery.effect_payload["comment_content"]
@@ -1015,8 +1003,9 @@ def test_changed_artifact_content_gets_a_different_publication_url():
     changed_id = compute_artifact_set_id(changed)
 
     assert changed_id != manifest["artifact_set_id"]
-    assert build_report_url(admission.submission_key, changed_id) != (
-        manifest["report_url"]
+    assert (
+        build_report_url(admission.submission_key, changed_id)
+        != (manifest["report_url"])
     )
 
 
@@ -1041,9 +1030,7 @@ def test_report_url_identity_must_match_submission_and_artifact_set(identity_kin
 
 def test_report_asset_url_is_confined_to_the_content_addressed_directory():
     admission, _contract, manifest, _observed, _dependencies = _bundle()
-    report_url = build_report_url(
-        admission.submission_key, manifest["artifact_set_id"]
-    )
+    report_url = build_report_url(admission.submission_key, manifest["artifact_set_id"])
 
     assert build_report_artifact_url(report_url, "assets/app.css") == (
         report_url.rsplit("/", 1)[0] + "/assets/app.css"
@@ -1136,9 +1123,9 @@ def test_html_and_json_are_both_required_even_when_contract_says_deliverable():
 
 def test_dependency_hash_mismatch_is_permanent_contract_error():
     admission, contract, manifest, observed, dependencies = _bundle()
-    next(item for item in observed if item["path"].endswith("video.mp4"))[
-        "sha256"
-    ] = "0" * 64
+    next(item for item in observed if item["path"].endswith("video.mp4"))["sha256"] = (
+        "0" * 64
+    )
     with pytest.raises(DeliveryContractError) as exc:
         _verify((admission, contract, manifest, observed, dependencies))
     assert exc.value.code == "artifact_hash_mismatch"
@@ -1226,9 +1213,18 @@ def test_every_html_dependency_must_be_manifested_and_hash_verified():
 @pytest.mark.parametrize(
     ("mutator", "code"),
     [
-        (lambda c, m: c.update(business_state="final_closed"), "delivery_business_state_not_ready"),
-        (lambda c, m: c["report"].update(is_deliverable=False), "delivery_report_not_deliverable"),
-        (lambda c, m: c["report"].update(requires_human_review="yes"), "delivery_review_boundary_invalid"),
+        (
+            lambda c, m: c.update(business_state="final_closed"),
+            "delivery_business_state_not_ready",
+        ),
+        (
+            lambda c, m: c["report"].update(is_deliverable=False),
+            "delivery_report_not_deliverable",
+        ),
+        (
+            lambda c, m: c["report"].update(requires_human_review="yes"),
+            "delivery_review_boundary_invalid",
+        ),
         (lambda c, m: m.update(sealed=False), "delivery_manifest_not_sealed"),
         (lambda c, m: m.update(artifact_set_id="0" * 64), "artifact_set_id_mismatch"),
     ],
@@ -1361,16 +1357,14 @@ def test_formal_cases_artifact_cannot_replace_task_root_sealed_bundle():
 
 def test_mcap_is_never_an_html_delivery_dependency():
     _admission, _contract, manifest, _observed, _dependencies = _bundle()
-    manifest["artifacts"].append(
-        {
-            "role": "viz_mcap",
-            "path": "viz.mcap",
-            "size": 100,
-            "sha256": "a" * 64,
-            "media_type": "application/octet-stream",
-            "required": False,
-        }
-    )
+    manifest["artifacts"].append({
+        "role": "viz_mcap",
+        "path": "viz.mcap",
+        "size": 100,
+        "sha256": "a" * 64,
+        "media_type": "application/octet-stream",
+        "required": False,
+    })
     with pytest.raises(DeliveryContractError) as exc:
         compute_artifact_set_id(manifest)
     assert exc.value.code == "html_delivery_mcap_forbidden"
@@ -1418,9 +1412,7 @@ def test_terminal_v2_writes_only_honest_result_without_fake_report_url():
         "report_field_write_policy": "preserve_existing",
         "preserved_report_semantics": "other_generation_not_current",
     }
-    assert "field_8c912e" not in json.dumps(
-        delivery.effect_payload, ensure_ascii=False
-    )
+    assert "field_8c912e" not in json.dumps(delivery.effect_payload, ensure_ascii=False)
     assert "本次未生成可确认的自动归因" in delivery.effect_payload["comment_content"]
     assert "本终态不改写" not in delivery.effect_payload["comment_content"]
     assert "不代表第 1 代结论" not in delivery.effect_payload["comment_content"]
@@ -1442,6 +1434,89 @@ def test_terminal_v2_result_and_preserve_policy_are_bound_to_generation():
     ]
     assert second.contract["generation"] == 2
     assert second.contract["report_field_write_policy"] == "preserve_existing"
+
+
+def _terminal_fallback(*, elapsed_seconds=1800):
+    return {
+        "schema_version": TERMINAL_FALLBACK_CONTRACT_SCHEMA_VERSION,
+        "work_started_at": "2026-07-10T08:00:00+00:00",
+        "deadline_at": "2026-07-10T08:30:00+00:00",
+        "elapsed_seconds": elapsed_seconds,
+        "confidence_tier": "low",
+        "terminal_class": "honest_non_attribution",
+        "route_key": "rca-failure-route-" + "a" * 64,
+        "route_kind": "internal_alert",
+        "route_owner": "rca-engineering",
+    }
+
+
+def test_terminal_fallback_v3_is_oracle_low_not_legacy_diagnostic():
+    delivery = _terminal_delivery(
+        error_code="service_pipeline_runner_failed",
+        terminal_fallback=_terminal_fallback(),
+        schema_version=TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
+    )
+
+    payload = delivery.effect_payload
+    assert payload["schema_version"] == TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION
+    assert payload["terminal_class"] == "honest_non_attribution"
+    assert payload["confidence_tier"] == "low"
+    assert payload["quality_oracle"]["schema_version"] == (
+        "pnc_rca_structural_tier_oracle_v2"
+    )
+    assert (
+        payload["quality_oracle_sha256"]
+        == hashlib.sha256(
+            json.dumps(
+                payload["quality_oracle"],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+    )
+    assert delivery.diagnostic_code == ""
+    assert delivery.diagnostic_result == ""
+    assert "diagnostic_code" not in delivery.contract
+    assert "service_pipeline_runner_failed" not in payload["comment_content"]
+    assert (
+        "evidence_summary" not in delivery.contract["public_contract"]["public_result"]
+    )
+    assert all(
+        phrase not in payload["comment_content"]
+        for phrase in ("已取得的证据", "关键证据", "证据包")
+    )
+
+
+def test_terminal_fallback_v3_rejects_predeadline_receipt():
+    with pytest.raises(DeliveryContractError) as exc:
+        _terminal_delivery(
+            terminal_fallback=_terminal_fallback(elapsed_seconds=1799),
+            schema_version=TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
+        )
+
+    assert exc.value.code == "terminal_fallback_contract_invalid"
+
+
+def test_terminal_fallback_v3_rejects_unbacked_evidence_wording(monkeypatch):
+    original = delivery_contract_module._terminal_fallback_public_contract()
+    tampered = json.loads(json.dumps(original, ensure_ascii=False))
+    tampered["public_result"]["summary"]["short_conclusion"] = (
+        "自动RCA未归因：已取得的证据尚不足以归因。"
+    )
+    monkeypatch.setattr(
+        delivery_contract_module,
+        "_terminal_fallback_public_contract",
+        lambda: tampered,
+    )
+
+    with pytest.raises(DeliveryContractError) as exc:
+        _terminal_delivery(
+            terminal_fallback=_terminal_fallback(),
+            schema_version=TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
+        )
+
+    assert exc.value.code == "terminal_fallback_unbacked_evidence_claim"
 
 
 @pytest.mark.parametrize(

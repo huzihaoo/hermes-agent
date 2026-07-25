@@ -55,9 +55,7 @@ def _policy():
         work_item_type_keys=frozenset({"issue"}),
         status_change_types=frozenset({"Reached"}),
         transitions=(
-            WorkflowTransition(
-                state_key="new-problem", pre_status=1, cur_status=2
-            ),
+            WorkflowTransition(state_key="new-problem", pre_status=1, cur_status=2),
         ),
     )
 
@@ -67,24 +65,22 @@ def _record(*, offset: int = 10, issue_id: int = 7041712812):
         topic=TOPIC,
         partition=2,
         offset=offset,
-        value=json.dumps(
-            {
-                "id": issue_id,
-                "name": "ACC braking issue",
-                "nodes": [
-                    {
-                        "state_key": "new-problem",
-                        "pre_status": 1,
-                        "cur_status": 2,
-                    }
-                ],
-                "project_key": "t03o4q",
-                "project_simple_name": "g1q3",
-                "status_change_type": "Reached",
-                "updated_at": 1783650000000,
-                "work_item_type_key": "issue",
-            }
-        ).encode(),
+        value=json.dumps({
+            "id": issue_id,
+            "name": "ACC braking issue",
+            "nodes": [
+                {
+                    "state_key": "new-problem",
+                    "pre_status": 1,
+                    "cur_status": 2,
+                }
+            ],
+            "project_key": "t03o4q",
+            "project_simple_name": "g1q3",
+            "status_change_type": "Reached",
+            "updated_at": 1783650000000,
+            "work_item_type_key": "issue",
+        }).encode(),
     )
 
 
@@ -149,9 +145,7 @@ def _bind_activation_execution(
             expected_preauthorization_gate_receipt_sha256="c" * 64,
             expected_preauthorization_capsule_sha256="d" * 64,
             expected_config_sha256=created["config_sha256"],
-            expected_db_logical_identity_sha256=created[
-                "db_logical_identity_sha256"
-            ],
+            expected_db_logical_identity_sha256=created["db_logical_identity_sha256"],
             expected_partition_start_fence_sha256=created[
                 "partition_start_fence_sha256"
             ],
@@ -243,12 +237,8 @@ def _switch_activation_epoch(control, *, old_epoch, new_epoch):
         expected_preauthorization_gate_receipt_sha256="f" * 64,
         expected_preauthorization_capsule_sha256="1" * 64,
         expected_config_sha256=created["config_sha256"],
-        expected_db_logical_identity_sha256=created[
-            "db_logical_identity_sha256"
-        ],
-        expected_partition_start_fence_sha256=created[
-            "partition_start_fence_sha256"
-        ],
+        expected_db_logical_identity_sha256=created["db_logical_identity_sha256"],
+        expected_partition_start_fence_sha256=created["partition_start_fence_sha256"],
         operator="delivery-test",
         reason="bind exact preproduction capsule for delivery epoch switch",
         now=NOW + timedelta(seconds=1),
@@ -576,9 +566,7 @@ def test_backpressure_snapshot_counts_all_unresolved_effect_states_atomically(
         "retry_wait": 1,
         "uncertain": 1,
     }
-    store.open_delivery_dispatcher_circuit(
-        reason_code="feishu_auth_failed", now=NOW
-    )
+    store.open_delivery_dispatcher_circuit(reason_code="feishu_auth_failed", now=NOW)
     circuit_snapshot = store.backpressure_snapshot(now=NOW)
     assert circuit_snapshot.circuit.is_open is True
     assert circuit_snapshot.circuit.reason_code == "feishu_auth_failed"
@@ -866,8 +854,7 @@ def test_permanent_failure_and_circuit_open_roll_back_atomically(
         )
 
     rows = {
-        row["submission_key"]: row
-        for row in store.list_rows("rca_execution_watch")
+        row["submission_key"]: row for row in store.list_rows("rca_execution_watch")
     }
     assert rows[second.submission_key]["state"] == "pending"
     assert rows[second.submission_key]["lease_token"] == second.lease_token
@@ -924,7 +911,9 @@ def test_future_delivery_schema_is_rejected_before_tables_are_changed(tmp_path):
     finally:
         conn.close()
 
-    with pytest.raises(RuntimeError, match="incompatible_delivery_store_schema:version"):
+    with pytest.raises(
+        RuntimeError, match="incompatible_delivery_store_schema:version"
+    ):
         RcaDeliveryStore(path)
 
     conn = sqlite3.connect(path)
@@ -979,6 +968,18 @@ def test_require_current_delivery_store_opens_current_regular_file(tmp_path):
     reopened = RcaDeliveryStore(path, require_current=True)
 
     assert reopened.db_path == path
+
+
+def test_require_current_rejects_v8_marker_without_failure_route_sink(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    RcaDeliveryStore(path)
+    with sqlite3.connect(path) as conn:
+        conn.execute("DROP TABLE rca_failure_routes")
+
+    with pytest.raises(
+        RuntimeError, match="incompatible_delivery_store_schema:failure_routes"
+    ):
+        RcaDeliveryStore(path, require_current=True)
 
 
 def test_require_current_delivery_store_rejects_symlink(tmp_path):
@@ -1114,9 +1115,9 @@ def test_manual_quarantined_backfill_rolls_back_then_materializes_issue_and_topi
     assert store.list_rows("rca_execution_watch") == []
     assert store.list_rows("rca_delivery_jobs") == []
     assert store.list_rows("rca_delivery_effects") == []
-    assert {
-        row["status"] for row in store.list_rows("rca_delivery_subscriptions")
-    } == {"pending"}
+    assert {row["status"] for row in store.list_rows("rca_delivery_subscriptions")} == {
+        "pending"
+    }
 
     monkeypatch.setattr(
         store, "_materialize_delivery_subscriptions_in_transaction", original
@@ -1129,12 +1130,10 @@ def test_manual_quarantined_backfill_rolls_back_then_materializes_issue_and_topi
         "feishu_thread_reply",
     }
     assert {row["status"] for row in effects} == {"pending"}
-    assert {
-        row["status"] for row in store.list_rows("rca_delivery_subscriptions")
-    } == {"materialized"}
-    assert all(
-        "SECRET-MUST-NOT-LEAK" not in row["payload_json"] for row in effects
-    )
+    assert {row["status"] for row in store.list_rows("rca_delivery_subscriptions")} == {
+        "materialized"
+    }
+    assert all("SECRET-MUST-NOT-LEAK" not in row["payload_json"] for row in effects)
 
 
 def test_quarantined_manual_rerun_waits_for_all_required_effects_to_settle(
@@ -1258,13 +1257,27 @@ def test_v4_watch_schema_migrates_task_id_to_nullable(tmp_path):
 
     with sqlite3.connect(path) as conn:
         columns = {
-            row[1]: row for row in conn.execute("PRAGMA table_info(rca_execution_watch)")
+            row[1]: row
+            for row in conn.execute("PRAGMA table_info(rca_execution_watch)")
+        }
+        failure_route_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(rca_failure_routes)")
         }
         version = conn.execute(
             "SELECT value FROM rca_delivery_meta WHERE key='schema_version'"
         ).fetchone()[0]
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
     assert columns["task_id"][3] == 0
+    assert {
+        "route_key",
+        "dedupe_key",
+        "owner",
+        "status",
+        "observation_count",
+        "retry_count",
+        "audit_json",
+        "remediation_result_json",
+    } <= failure_route_columns
     assert version == DELIVERY_STORE_SCHEMA_VERSION
 
 
@@ -1330,9 +1343,7 @@ def test_expired_lease_reclaim_fences_stale_collector(tmp_path):
     _control(tmp_path)
     store = RcaDeliveryStore(tmp_path / "control.sqlite3")
     store.backfill_completed_submissions(now=NOW)
-    first = store.claim_due_watch(
-        lease_owner="collector-1", lease_seconds=30, now=NOW
-    )
+    first = store.claim_due_watch(lease_owner="collector-1", lease_seconds=30, now=NOW)
     assert first is not None
     second = store.claim_due_watch(
         lease_owner="collector-2",
@@ -1357,9 +1368,7 @@ def test_expired_unreclaimed_lease_cannot_commit(tmp_path):
     _control(tmp_path)
     store = RcaDeliveryStore(tmp_path / "control.sqlite3")
     store.backfill_completed_submissions(now=NOW)
-    claim = store.claim_due_watch(
-        lease_owner="collector-1", lease_seconds=30, now=NOW
-    )
+    claim = store.claim_due_watch(lease_owner="collector-1", lease_seconds=30, now=NOW)
     assert claim is not None
 
     with pytest.raises(StaleDeliveryWatchLeaseError):
@@ -1607,9 +1616,7 @@ def test_concurrent_late_subscription_materialization_creates_one_effect(tmp_pat
 
     assert sum(result.materialized for result in results) == 1
     effects = store.list_rows("rca_delivery_effects")
-    assert [row["effect_kind"] for row in effects].count(
-        "feishu_thread_reply"
-    ) == 1
+    assert [row["effect_kind"] for row in effects].count("feishu_thread_reply") == 1
     subscriptions = store.list_rows("rca_delivery_subscriptions")
     assert subscriptions[-1]["status"] == "materialized"
 
@@ -1668,12 +1675,8 @@ def test_thread_circuit_does_not_block_issue_comment_effect(tmp_path):
 
     assert issue_claim is not None
     assert issue_claim.effect_kind == "feishu_issue_comment"
-    assert store.delivery_dispatcher_circuit(
-        "feishu_issue_comment"
-    ).is_open is False
-    assert store.delivery_dispatcher_circuit(
-        "feishu_thread_reply"
-    ).is_open is True
+    assert store.delivery_dispatcher_circuit("feishu_issue_comment").is_open is False
+    assert store.delivery_dispatcher_circuit("feishu_thread_reply").is_open is True
 
 
 def test_thread_only_open_circuit_blocks_aggregate_backpressure(tmp_path):
@@ -1693,9 +1696,10 @@ def test_thread_only_open_circuit_blocks_aggregate_backpressure(tmp_path):
     assert snapshot.circuits["feishu_issue_comment"].is_open is False
     assert snapshot.circuits["feishu_thread_reply"].is_open is True
     assert public["delivery_dispatcher_circuit"]["state"] == "open"
-    assert public["delivery_dispatcher_circuits"]["feishu_issue_comment"][
-        "state"
-    ] == "closed"
+    assert (
+        public["delivery_dispatcher_circuits"]["feishu_issue_comment"]["state"]
+        == "closed"
+    )
     assert public["delivery_dispatcher_circuits"]["feishu_thread_reply"] == {
         "state": "open",
         "reason_code": "feishu_thread_read_unavailable",
@@ -1725,18 +1729,20 @@ def test_thread_permanent_failure_streak_cannot_open_issue_circuit(tmp_path):
     finally:
         conn.close()
 
-    assert store.delivery_dispatcher_circuit(
-        "feishu_thread_reply"
-    ).is_open is True
-    assert store.delivery_dispatcher_circuit(
-        "feishu_issue_comment"
-    ).is_open is False
-    assert store.permanent_failure_circuit_state(
-        "feishu_thread_reply"
-    )["consecutive_failures"] == PERMANENT_FAILURE_CIRCUIT_THRESHOLD
-    assert store.permanent_failure_circuit_state(
-        "feishu_issue_comment"
-    )["consecutive_failures"] == 0
+    assert store.delivery_dispatcher_circuit("feishu_thread_reply").is_open is True
+    assert store.delivery_dispatcher_circuit("feishu_issue_comment").is_open is False
+    assert (
+        store.permanent_failure_circuit_state("feishu_thread_reply")[
+            "consecutive_failures"
+        ]
+        == PERMANENT_FAILURE_CIRCUIT_THRESHOLD
+    )
+    assert (
+        store.permanent_failure_circuit_state("feishu_issue_comment")[
+            "consecutive_failures"
+        ]
+        == 0
+    )
 
 
 def test_reschedule_effect_and_open_circuit_commit_together(tmp_path):
@@ -1753,17 +1759,16 @@ def test_reschedule_effect_and_open_circuit_commit_together(tmp_path):
 
     assert mutation.effect_status == "retry_wait"
     assert store.list_rows("rca_delivery_effects")[0]["status"] == "retry_wait"
-    assert [
-        row["outcome"] for row in store.list_rows("rca_delivery_attempts")
-    ] == ["started", "nack"]
+    assert [row["outcome"] for row in store.list_rows("rca_delivery_attempts")] == [
+        "started",
+        "nack",
+    ]
     circuit = store.delivery_dispatcher_circuit()
     assert circuit.is_open is True
     assert circuit.reason_code == "feishu_auth_failed"
 
 
-def test_reschedule_effect_and_open_circuit_rolls_back_together(
-    tmp_path, monkeypatch
-):
+def test_reschedule_effect_and_open_circuit_rolls_back_together(tmp_path, monkeypatch):
     store, claim = _claimed_effect(tmp_path)
 
     def fail_circuit_write(*_args, **_kwargs):
@@ -1787,9 +1792,9 @@ def test_reschedule_effect_and_open_circuit_rolls_back_together(
     effect = store.list_rows("rca_delivery_effects")[0]
     assert effect["status"] == "claimed"
     assert effect["lease_token"] == claim.lease_token
-    assert [
-        row["outcome"] for row in store.list_rows("rca_delivery_attempts")
-    ] == ["started"]
+    assert [row["outcome"] for row in store.list_rows("rca_delivery_attempts")] == [
+        "started"
+    ]
     assert store.delivery_dispatcher_circuit().is_open is False
 
 
@@ -1883,14 +1888,17 @@ def test_recovery_write_requires_grace_multiple_reads_and_rate_limit(tmp_path):
     assert second.recovery_eligible is False
     assert third.recovery_eligible is True
     assert third.missing_read_count == 3
-    assert store.authorize_effect_recovery_write(
-        claim=claim,
-        visibility_grace_seconds=120,
-        minimum_missing_reads=3,
-        recovery_interval_seconds=300,
-        max_recovery_writes=2,
-        now=NOW + timedelta(seconds=121),
-    ) == 1
+    assert (
+        store.authorize_effect_recovery_write(
+            claim=claim,
+            visibility_grace_seconds=120,
+            minimum_missing_reads=3,
+            recovery_interval_seconds=300,
+            max_recovery_writes=2,
+            now=NOW + timedelta(seconds=121),
+        )
+        == 1
+    )
 
     for seconds in (151, 181, 211):
         state = store.record_effect_reconciliation_miss(
@@ -1903,14 +1911,17 @@ def test_recovery_write_requires_grace_multiple_reads_and_rate_limit(tmp_path):
         )
     assert state.missing_read_count == 3
     assert state.recovery_interval_elapsed is False
-    assert store.authorize_effect_recovery_write(
-        claim=claim,
-        visibility_grace_seconds=120,
-        minimum_missing_reads=3,
-        recovery_interval_seconds=300,
-        max_recovery_writes=2,
-        now=NOW + timedelta(seconds=211),
-    ) is None
+    assert (
+        store.authorize_effect_recovery_write(
+            claim=claim,
+            visibility_grace_seconds=120,
+            minimum_missing_reads=3,
+            recovery_interval_seconds=300,
+            max_recovery_writes=2,
+            now=NOW + timedelta(seconds=211),
+        )
+        is None
+    )
 
     due = store.record_effect_reconciliation_miss(
         claim=claim,
@@ -1921,14 +1932,17 @@ def test_recovery_write_requires_grace_multiple_reads_and_rate_limit(tmp_path):
         now=NOW + timedelta(seconds=421),
     )
     assert due.recovery_eligible is True
-    assert store.authorize_effect_recovery_write(
-        claim=claim,
-        visibility_grace_seconds=120,
-        minimum_missing_reads=3,
-        recovery_interval_seconds=300,
-        max_recovery_writes=2,
-        now=NOW + timedelta(seconds=421),
-    ) == 2
+    assert (
+        store.authorize_effect_recovery_write(
+            claim=claim,
+            visibility_grace_seconds=120,
+            minimum_missing_reads=3,
+            recovery_interval_seconds=300,
+            max_recovery_writes=2,
+            now=NOW + timedelta(seconds=421),
+        )
+        == 2
+    )
     for seconds in (451, 481, 541):
         exhausted = store.record_effect_reconciliation_miss(
             claim=claim,
@@ -1940,21 +1954,24 @@ def test_recovery_write_requires_grace_multiple_reads_and_rate_limit(tmp_path):
         )
     assert exhausted.recovery_eligible is False
     assert exhausted.recovery_limit_exceeded is True
-    assert store.authorize_effect_recovery_write(
-        claim=claim,
-        visibility_grace_seconds=120,
-        minimum_missing_reads=3,
-        recovery_interval_seconds=300,
-        max_recovery_writes=2,
-        now=NOW + timedelta(seconds=541),
-    ) is None
+    assert (
+        store.authorize_effect_recovery_write(
+            claim=claim,
+            visibility_grace_seconds=120,
+            minimum_missing_reads=3,
+            recovery_interval_seconds=300,
+            max_recovery_writes=2,
+            now=NOW + timedelta(seconds=541),
+        )
+        is None
+    )
     effect = store.list_rows("rca_delivery_effects")[0]
     assert effect["write_started_at"] == NOW.isoformat()
     assert effect["reconciliation_miss_count"] == 3
     assert effect["recovery_write_count"] == 2
-    assert effect["last_recovery_write_at"] == (
-        NOW + timedelta(seconds=421)
-    ).isoformat()
+    assert (
+        effect["last_recovery_write_at"] == (NOW + timedelta(seconds=421)).isoformat()
+    )
 
 
 def test_terminal_failure_closes_watch_without_delivery_effect(tmp_path):
@@ -1998,12 +2015,7 @@ def test_current_epoch_holds_preauthorized_even_when_caller_uses_legacy_flag(
     _bind_activation_execution(control, result, state="preauthorized")
     store = RcaDeliveryStore(control.db_path)
 
-    assert (
-        store.backfill_completed_submissions(
-            now=NOW, activation_required=True
-        )
-        == 0
-    )
+    assert store.backfill_completed_submissions(now=NOW, activation_required=True) == 0
     health = store.health(now=NOW, activation_required=False)
     assert health["activation"]["required"] is True
     assert health["activation"]["current_epoch_state"] == "preauthorized"
@@ -2037,13 +2049,9 @@ def test_bounded_activation_allows_exact_execution_and_reuses_one_budget_slot(
     tmp_path,
 ):
     control, result = _control(tmp_path)
-    ledger_id = _bind_activation_execution(
-        control, result, state="bounded_active"
-    )
+    ledger_id = _bind_activation_execution(control, result, state="bounded_active")
     store = RcaDeliveryStore(control.db_path)
-    assert store.backfill_completed_submissions(
-        now=NOW, activation_required=True
-    ) == 1
+    assert store.backfill_completed_submissions(now=NOW, activation_required=True) == 1
     claim = store.claim_due_watch(
         lease_owner="activation-collector",
         now=NOW,
@@ -2189,9 +2197,7 @@ def test_epoch_switch_blocks_historical_watch_materialization_and_effect_aging(
     _bind_activation_execution(control, result, state="steady_active")
     _bind_activation_execution(control, pending_result, state="steady_active")
     store = RcaDeliveryStore(control.db_path)
-    assert store.backfill_completed_submissions(
-        now=NOW, activation_required=True
-    ) == 2
+    assert store.backfill_completed_submissions(now=NOW, activation_required=True) == 2
     claim = store.claim_due_watch(
         lease_owner="activation-collector",
         now=NOW,
@@ -2218,30 +2224,40 @@ def test_epoch_switch_blocks_historical_watch_materialization_and_effect_aging(
         new_epoch="delivery-epoch-2",
     )
 
-    assert store.materialize_pending_subscriptions(
-        now=NOW + timedelta(days=2), activation_required=True
-    ).materialized == 0
-    assert store.claim_due_effect(
-        lease_owner="activation-dispatcher",
-        now=NOW + timedelta(days=2),
-        activation_required=True,
-    ) is None
-    assert store.claim_due_watch(
-        lease_owner="activation-collector-after-switch",
-        now=NOW + timedelta(days=2),
-        activation_required=True,
-    ) is None
+    assert (
+        store.materialize_pending_subscriptions(
+            now=NOW + timedelta(days=2), activation_required=True
+        ).materialized
+        == 0
+    )
+    assert (
+        store.claim_due_effect(
+            lease_owner="activation-dispatcher",
+            now=NOW + timedelta(days=2),
+            activation_required=True,
+        )
+        is None
+    )
+    assert (
+        store.claim_due_watch(
+            lease_owner="activation-collector-after-switch",
+            now=NOW + timedelta(days=2),
+            activation_required=True,
+        )
+        is None
+    )
     assert [row["status"] for row in store.list_rows("rca_delivery_effects")] == [
         "pending"
     ]
     assert store.list_rows("rca_delivery_attempts") == []
-    assert sorted(
-        row["state"] for row in store.list_rows("rca_execution_watch")
-    ) == ["delivery_created", "pending"]
+    assert sorted(row["state"] for row in store.list_rows("rca_execution_watch")) == [
+        "delivery_created",
+        "pending",
+    ]
     assert store.list_rows("rca_delivery_subscriptions")[-1]["status"] == "pending"
-    activation = store.health(
-        now=NOW + timedelta(days=2), activation_required=True
-    )["activation"]
+    activation = store.health(now=NOW + timedelta(days=2), activation_required=True)[
+        "activation"
+    ]
     assert activation["blocked_historical_counts"]["dispatchable_effects"] == 1
     assert activation["blocked_historical_counts"]["pending_subscriptions"] == 1
 
@@ -2302,9 +2318,12 @@ def test_capacity_sample_candidates_are_bounded_read_only_snapshots(tmp_path):
         now=NOW + timedelta(seconds=2),
     )
 
-    assert store.capacity_sample_candidates(
-        activated_at=NOW - timedelta(seconds=1), limit=1
-    ) == []
+    assert (
+        store.capacity_sample_candidates(
+            activated_at=NOW - timedelta(seconds=1), limit=1
+        )
+        == []
+    )
     with sqlite3.connect(store.db_path) as conn:
         row = conn.execute(
             "SELECT last_status_json FROM rca_execution_watch WHERE task_id = ?",
@@ -2336,19 +2355,25 @@ def test_capacity_sample_candidates_are_bounded_read_only_snapshots(tmp_path):
         "remote_id": "comment-1",
         "request_id": effect.request_id,
     }
-    assert snapshot.snapshot_sha256 == hashlib.sha256(
-        json.dumps(
-            snapshot.payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-    ).hexdigest()
-    assert store.capacity_sample_candidates(
-        activated_at=NOW - timedelta(seconds=1),
-        limit=1,
-        excluded_task_attempts={(watch.task_id, "attempt-bootstrap-1")},
-    ) == []
+    assert (
+        snapshot.snapshot_sha256
+        == hashlib.sha256(
+            json.dumps(
+                snapshot.payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+    )
+    assert (
+        store.capacity_sample_candidates(
+            activated_at=NOW - timedelta(seconds=1),
+            limit=1,
+            excluded_task_attempts={(watch.task_id, "attempt-bootstrap-1")},
+        )
+        == []
+    )
 
 
 def test_capacity_sample_candidates_ignore_pre_activation_and_failures(tmp_path):
@@ -2370,6 +2395,9 @@ def test_capacity_sample_candidates_ignore_pre_activation_and_failures(tmp_path)
         },
         now=NOW,
     )
-    assert store.capacity_sample_candidates(
-        activated_at=NOW + timedelta(seconds=1), limit=1
-    ) == []
+    assert (
+        store.capacity_sample_candidates(
+            activated_at=NOW + timedelta(seconds=1), limit=1
+        )
+        == []
+    )

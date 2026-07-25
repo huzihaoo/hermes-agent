@@ -40,13 +40,20 @@ DELIVERY_EFFECT_SCHEMA_VERSION_V2 = "pnc_rca_delivery_effect_v2"
 DELIVERY_EFFECT_SCHEMA_VERSION = "pnc_rca_delivery_effect_v3"
 TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1 = "pnc_rca_terminal_delivery_effect_v1"
 TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION = "pnc_rca_terminal_delivery_effect_v2"
+TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION = "pnc_rca_terminal_delivery_effect_v3"
 TERMINAL_DIAGNOSTIC_CONTRACT_SCHEMA_VERSION = "pnc_rca_terminal_diagnostic_v1"
+TERMINAL_FALLBACK_CONTRACT_SCHEMA_VERSION = "pnc_rca_bounded_terminal_fallback_v1"
+TERMINAL_FALLBACK_PUBLIC_CONTRACT_SCHEMA_VERSION = (
+    "pnc_rca_bounded_terminal_public_result_v1"
+)
+_TERMINAL_FALLBACK_UNBACKED_EVIDENCE_RE = re.compile(
+    r"已取得的证据|关键证据|证据包|evidence[_ -]?ref",
+    re.IGNORECASE,
+)
 DELIVERY_KEY_VERSION = "v1"
 DELIVERY_EFFECT_KIND = "feishu_issue_comment"
 DELIVERY_THREAD_EFFECT_KIND = "feishu_thread_reply"
-DELIVERY_EFFECT_KINDS = frozenset(
-    {DELIVERY_EFFECT_KIND, DELIVERY_THREAD_EFFECT_KIND}
-)
+DELIVERY_EFFECT_KINDS = frozenset({DELIVERY_EFFECT_KIND, DELIVERY_THREAD_EFFECT_KIND})
 DELIVERY_TARGET_SCHEMA_VERSION = "pnc_rca_delivery_target_v1"
 TERMINAL_DELIVERY_OUTCOMES = frozenset({"terminal_failed", "quarantined"})
 _VM_TMP_PREFIX = "/mnt/tmp/"
@@ -55,44 +62,49 @@ _SAFE_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$")
 _PROJECT_SIMPLE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _FEISHU_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{1,255}$")
 _TERMINAL_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,119}$")
-_ARTIFACT_SET_ID_RE = re.compile(
-    r"^g1q3-rca-artifact-v1-[0-9a-f]{64}$"
+_TERMINAL_ERROR_CODE_RE = re.compile(
+    r"^(?:[a-z][a-z0-9_]{0,119}|taxonomy_gap:[a-z0-9_.-]{1,96})$"
 )
+_ARTIFACT_SET_ID_RE = re.compile(r"^g1q3-rca-artifact-v1-[0-9a-f]{64}$")
 _FORMAL_REPORT_SEGMENT_RE = re.compile(r"^(?:[A-Za-z0-9._~-]|%[0-9A-Fa-f]{2})+$")
 _FORMAL_REPORT_CIFS_HOST = "hfs1.minieye.tech"
 _FORMAL_REPORT_SHARE = "department-pnc_team-planning_algo-driving"
-_FORMAL_REPORT_CIFS_PREFIX = (
-    f"//{_FORMAL_REPORT_CIFS_HOST}/{_FORMAL_REPORT_SHARE}/tmp/"
-)
-_DELIVERY_MANIFEST_V2_FIELDS = frozenset(
-    {
-        "schema_version",
-        "sealed",
-        "submission_key",
-        "business_key",
-        "generation",
-        "project_key",
-        "work_item_type_key",
-        "work_item_id",
-        "artifact_revision",
-        "sealed_at",
-        "deliverable_kind",
-        "dependencies_complete",
-        "artifact_root",
-        "html_validation",
-        "artifacts",
-        "artifact_set_id",
-        "report_vm_path",
-        "report_cifs_path",
-        "report_url",
-    }
-)
-_DELIVERY_MANIFEST_ARTIFACT_FIELDS = frozenset(
-    {"role", "path", "size", "sha256", "media_type", "required"}
-)
-_DELIVERY_HTML_VALIDATION_FIELDS = frozenset(
-    {"state", "report_data_sha256", "blockers", "fidelity_ok"}
-)
+_FORMAL_REPORT_CIFS_PREFIX = f"//{_FORMAL_REPORT_CIFS_HOST}/{_FORMAL_REPORT_SHARE}/tmp/"
+_DELIVERY_MANIFEST_V2_FIELDS = frozenset({
+    "schema_version",
+    "sealed",
+    "submission_key",
+    "business_key",
+    "generation",
+    "project_key",
+    "work_item_type_key",
+    "work_item_id",
+    "artifact_revision",
+    "sealed_at",
+    "deliverable_kind",
+    "dependencies_complete",
+    "artifact_root",
+    "html_validation",
+    "artifacts",
+    "artifact_set_id",
+    "report_vm_path",
+    "report_cifs_path",
+    "report_url",
+})
+_DELIVERY_MANIFEST_ARTIFACT_FIELDS = frozenset({
+    "role",
+    "path",
+    "size",
+    "sha256",
+    "media_type",
+    "required",
+})
+_DELIVERY_HTML_VALIDATION_FIELDS = frozenset({
+    "state",
+    "report_data_sha256",
+    "blockers",
+    "fidelity_ok",
+})
 MAX_DELIVERY_ARTIFACTS = 512
 MAX_DELIVERY_ARTIFACT_BYTES = 256 * 1024 * 1024
 MAX_DELIVERY_ARTIFACT_TOTAL_BYTES = 512 * 1024 * 1024
@@ -103,9 +115,11 @@ CONSUMER_CAPABILITY_SCHEMA_VERSION = "rca_consumer_capability_publication_v1"
 RCA_RESULT_FIELD_KEY = "field_9193cb"
 RCA_REPORT_FIELD_KEY = "field_8c912e"
 DELIVERY_REPORT_LINK_KIND = "html_report"
-_HTML_REPORT_STATUSES = frozenset(
-    {"html_delivery_ready", "report_generated_need_review", "report_ready"}
-)
+_HTML_REPORT_STATUSES = frozenset({
+    "html_delivery_ready",
+    "report_generated_need_review",
+    "report_ready",
+})
 _VIZ_REPORT_STATUSES = frozenset({"report_ready"})
 _VIZ_PUBLICATION_SCHEMA_VERSION = "g1q3_rca_viz_publication_v1"
 
@@ -294,6 +308,16 @@ _TERMINAL_BASE_EFFECT_SEMANTIC_FIELDS = (
     "diagnostic_result",
     "field_updates",
 )
+_TERMINAL_FALLBACK_BASE_EFFECT_SEMANTIC_FIELDS = (
+    *_TERMINAL_V1_BASE_EFFECT_SEMANTIC_FIELDS,
+    "conclusion",
+    "terminal_class",
+    "confidence_tier",
+    "quality_oracle",
+    "quality_oracle_sha256",
+    "field_updates",
+    "terminal_fallback",
+)
 
 _TERMINAL_DIAGNOSTIC_RESULTS = {
     "business_route_unresolved": (
@@ -309,16 +333,16 @@ _TERMINAL_DIAGNOSTIC_RESULTS = {
         "自动归因未完成（非归因结论）：已按官方字段路由到对应业务，但该项目输入适配尚未就绪；未跨项目回退或伪造归因。"
     ),
     "input_remote_data_required": (
-        "自动归因未完成（非归因结论）：问题单缺少问题数据地址，请补充有效的 event/clip 引用后重试。"
+        "自动归因未完成（非归因结论）：当前输入中没有可读取的问题数据地址；已转内部待办。"
     ),
     "input_remote_data_invalid": (
-        "自动归因未完成（非归因结论）：问题数据地址无法解析，请修正 event/clip 引用后重试。"
+        "自动归因未完成（非归因结论）：当前问题数据地址无法解析；已转内部待办。"
     ),
     "input_frame_required": (
-        "自动归因未完成（非归因结论）：缺少或无法解析问题发生 frame_id/时间，请修正后重试。"
+        "自动归因未完成（非归因结论）：缺少或无法解析问题发生 frame_id/时间；已转内部待办。"
     ),
     "input_required": (
-        "自动归因未完成（非归因结论）：问题单缺少自动分析所需输入，请补齐后重试。"
+        "自动归因未完成（非归因结论）：当前输入不足以完成自动分析；已转内部待办。"
     ),
     "issue_source_unavailable": (
         "自动归因未完成（非归因结论）：本次未能可靠读取问题单输入，请恢复读取链路后重试。"
@@ -330,14 +354,12 @@ _TERMINAL_DIAGNOSTIC_RESULTS = {
         "自动归因未完成（非归因结论）：自动分析任务异常终止，请由系统维护者排查并显式重试。"
     ),
 }
-_BUSINESS_ROUTE_DIAGNOSTIC_CODES = frozenset(
-    {
-        "business_route_unresolved",
-        "business_route_unsupported",
-        "business_route_conflict",
-        "business_adapter_not_ready",
-    }
-)
+_BUSINESS_ROUTE_DIAGNOSTIC_CODES = frozenset({
+    "business_route_unresolved",
+    "business_route_unsupported",
+    "business_route_conflict",
+    "business_adapter_not_ready",
+})
 _TERMINAL_INPUT_DIAGNOSTIC_CODES = {
     "business_profile_unresolved": "business_route_unresolved",
     "business_profile_unsupported": "business_route_unsupported",
@@ -348,23 +370,21 @@ _TERMINAL_INPUT_DIAGNOSTIC_CODES = {
     "issue_field_invalid_frame_reference": "input_frame_required",
     "issue_fields_not_ready": "input_required",
 }
-_TERMINAL_SOURCE_DIAGNOSTIC_CODES = frozenset(
-    {
-        "host_issue_preread_empty",
-        "host_issue_preread_failed",
-        "host_issue_preread_timeout",
-        "host_issue_preread_unavailable",
-        "host_mcp_preread_empty",
-        "host_mcp_preread_failed",
-        "host_mcp_preread_timeout",
-        "host_meegle_preread_empty",
-        "host_meegle_preread_failed",
-        "host_meegle_preread_timeout",
-        "host_meegle_preread_unauthenticated",
-        "issue_enrichment_not_ready",
-        "issue_not_visible",
-    }
-)
+_TERMINAL_SOURCE_DIAGNOSTIC_CODES = frozenset({
+    "host_issue_preread_empty",
+    "host_issue_preread_failed",
+    "host_issue_preread_timeout",
+    "host_issue_preread_unavailable",
+    "host_mcp_preread_empty",
+    "host_mcp_preread_failed",
+    "host_mcp_preread_timeout",
+    "host_meegle_preread_empty",
+    "host_meegle_preread_failed",
+    "host_meegle_preread_timeout",
+    "host_meegle_preread_unauthenticated",
+    "issue_enrichment_not_ready",
+    "issue_not_visible",
+})
 
 
 def _terminal_semantic_fields(schema_version: Any) -> tuple[str, ...]:
@@ -372,6 +392,8 @@ def _terminal_semantic_fields(schema_version: Any) -> tuple[str, ...]:
         return _TERMINAL_V1_BASE_EFFECT_SEMANTIC_FIELDS
     if schema_version == TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION:
         return _TERMINAL_BASE_EFFECT_SEMANTIC_FIELDS
+    if schema_version == TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION:
+        return _TERMINAL_FALLBACK_BASE_EFFECT_SEMANTIC_FIELDS
     raise DeliveryContractError("terminal_delivery_schema_unsupported")
 
 
@@ -479,12 +501,10 @@ def build_issue_comment_content(
     ]
     if conclusion:
         lines.append(conclusion)
-    lines.extend(
-        [
-            f"详细证据报告：{report_url}",
-            "报告页包含证据和完整分析过程。",
-        ]
-    )
+    lines.extend([
+        f"详细证据报告：{report_url}",
+        "报告页包含证据和完整分析过程。",
+    ])
     content = "\n".join(lines)
     if len(content.encode("utf-8")) > MAX_FEISHU_COMMENT_BYTES:
         raise DeliveryContractError("delivery_comment_too_large")
@@ -515,13 +535,11 @@ def build_thread_reply_content(
     ]
     if conclusion:
         lines.append(conclusion)
-    lines.extend(
-        [
-            f"详细证据报告：{report_url}",
-            f"问题单：{issue_url}",
-            "报告页包含证据和完整分析过程。",
-        ]
-    )
+    lines.extend([
+        f"详细证据报告：{report_url}",
+        f"问题单：{issue_url}",
+        "报告页包含证据和完整分析过程。",
+    ])
     content = "\n".join(lines)
     if len(content.encode("utf-8")) > MAX_FEISHU_COMMENT_BYTES:
         raise DeliveryContractError("delivery_thread_reply_too_large")
@@ -572,14 +590,19 @@ def terminal_delivery_effect_marker(
 ) -> str:
     if outcome not in TERMINAL_DELIVERY_OUTCOMES:
         raise DeliveryContractError("terminal_delivery_outcome_invalid")
-    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+    if (
+        isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation < 1
+    ):
         raise DeliveryContractError("terminal_delivery_generation_invalid")
     return f"[RCA_TERMINAL:{effect_key}:{outcome}:{generation}]"
 
 
 def _terminal_code(value: Any, field: str) -> str:
     text = str(value or "").strip().lower()
-    if not _TERMINAL_CODE_RE.fullmatch(text):
+    pattern = _TERMINAL_ERROR_CODE_RE if field == "error_code" else _TERMINAL_CODE_RE
+    if not pattern.fullmatch(text):
         raise DeliveryContractError(f"terminal_delivery_{field}_invalid")
     return text
 
@@ -596,18 +619,114 @@ def _terminal_content(
     diagnostic_result: str = "",
 ) -> str:
     if diagnostic_result and "\n" in diagnostic_result:
-        lines = [marker, "【RCA 结果】"] + diagnostic_result.splitlines()
+        lines = [
+            marker,
+            "【RCA 结果】低置信终态：本次未形成可确认归因。",
+        ] + diagnostic_result.splitlines()
     else:
         lines = [
             marker,
-            "【RCA 结果】本次未形成可确认的自动归因。",
+            "【RCA 结果】低置信终态：本次未形成可确认归因。",
             "责任候选：暂无法判断。",
             "因果链：暂无足够证据建立可确认的因果链。",
             f"当前卡点：{diagnostic_result or '自动分析未生成可交付证据。'}",
             "关键证据：本次未生成可供审批的归因证据。",
-            "下一步：请补齐问题数据或修复输入后重新发起 RCA；人工可先行分流。",
+            "处理状态：系统已记录内部处理路径，不要求问题发起人执行维护操作。",
         ]
     content = "\n".join(lines)
+    if len(content.encode("utf-8")) > MAX_FEISHU_COMMENT_BYTES:
+        raise DeliveryContractError("terminal_delivery_content_too_large")
+    return content
+
+
+def _validated_terminal_fallback(value: Any) -> dict[str, Any]:
+    fallback = dict(value) if isinstance(value, Mapping) else {}
+    expected_keys = {
+        "schema_version",
+        "work_started_at",
+        "deadline_at",
+        "elapsed_seconds",
+        "confidence_tier",
+        "terminal_class",
+        "route_key",
+        "route_kind",
+        "route_owner",
+    }
+    if set(fallback) != expected_keys:
+        raise DeliveryContractError("terminal_fallback_contract_invalid")
+    try:
+        started = datetime.fromisoformat(
+            str(fallback["work_started_at"]).replace("Z", "+00:00")
+        )
+        deadline = datetime.fromisoformat(
+            str(fallback["deadline_at"]).replace("Z", "+00:00")
+        )
+    except (TypeError, ValueError) as exc:
+        raise DeliveryContractError("terminal_fallback_contract_invalid") from exc
+    if (
+        started.tzinfo is None
+        or started.utcoffset() is None
+        or deadline.tzinfo is None
+        or deadline.utcoffset() is None
+        or int((deadline - started).total_seconds()) != 30 * 60
+        or type(fallback.get("elapsed_seconds")) is not int
+        or int(fallback["elapsed_seconds"]) < 30 * 60
+        or fallback.get("schema_version") != TERMINAL_FALLBACK_CONTRACT_SCHEMA_VERSION
+        or fallback.get("confidence_tier") != "low"
+        or fallback.get("terminal_class") != HONEST_NON_ATTRIBUTION
+        or re.fullmatch(
+            r"rca-failure-route-[0-9a-f]{64}", str(fallback.get("route_key") or "")
+        )
+        is None
+        or fallback.get("route_kind")
+        not in {"infra_remediation_hold", "internal_backlog", "internal_alert"}
+        or _SAFE_KEY_RE.fullmatch(str(fallback.get("route_owner") or "")) is None
+    ):
+        raise DeliveryContractError("terminal_fallback_contract_invalid")
+    return fallback
+
+
+def _terminal_fallback_public_contract() -> dict[str, Any]:
+    return {
+        "schema_version": TERMINAL_FALLBACK_PUBLIC_CONTRACT_SCHEMA_VERSION,
+        "terminal_class": HONEST_NON_ATTRIBUTION,
+        "public_result": {
+            "terminal_class": HONEST_NON_ATTRIBUTION,
+            "summary": {
+                "short_conclusion": "自动RCA未归因：本次自动处理未形成可确认的归因结论。",
+            },
+            "responsibility": {
+                "status": "not_attributed",
+                "candidate": "暂无法判断",
+            },
+            "causal_chain": {"narrative": []},
+        },
+    }
+
+
+def _terminal_fallback_public_result() -> str:
+    return "\n".join((
+        "归因结论：本次自动处理未形成可确认的归因结论。",
+        "责任模块：暂无法判断。",
+        "因果关系：本次处理记录不足以支持责任因果判断。",
+        "处理记录：自动处理已结束，内部状态已记录。",
+    ))
+
+
+def _validate_terminal_fallback_publication(
+    public_contract: Mapping[str, Any], publication_text: str
+) -> None:
+    inspected = f"{_canonical_json(dict(public_contract))}\n{publication_text}"
+    if _TERMINAL_FALLBACK_UNBACKED_EVIDENCE_RE.search(inspected):
+        raise DeliveryContractError("terminal_fallback_unbacked_evidence_claim")
+
+
+def _terminal_fallback_content(*, marker: str, conclusion: str) -> str:
+    content = "\n".join((
+        marker,
+        "【RCA 结果】本次未形成可确认归因。",
+        *conclusion.splitlines(),
+    ))
     if len(content.encode("utf-8")) > MAX_FEISHU_COMMENT_BYTES:
         raise DeliveryContractError("terminal_delivery_content_too_large")
     return content
@@ -627,20 +746,23 @@ def build_terminal_delivery(
     source_error_code: str = "",
     diagnostic_code: str = "",
     diagnostic_detail: str = "",
+    terminal_fallback: Mapping[str, Any] | None = None,
     schema_version: str = TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
 ) -> VerifiedTerminalDelivery:
     values = {
         "business_key": _required_text(business_key, "business_key"),
         "submission_key": _required_text(submission_key, "submission_key"),
         "project_key": _required_text(project_key, "project_key"),
-        "work_item_type_key": _required_text(
-            work_item_type_key, "work_item_type_key"
-        ),
+        "work_item_type_key": _required_text(work_item_type_key, "work_item_type_key"),
         "work_item_id": _required_text(work_item_id, "work_item_id"),
     }
     if not all(_SAFE_KEY_RE.fullmatch(value) for value in values.values()):
         raise DeliveryContractError("terminal_delivery_identity_invalid")
-    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+    if (
+        isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation < 1
+    ):
         raise DeliveryContractError("terminal_delivery_generation_invalid")
     normalized_outcome = _terminal_code(outcome, "outcome")
     if normalized_outcome not in TERMINAL_DELIVERY_OUTCOMES:
@@ -650,6 +772,7 @@ def build_terminal_delivery(
     if schema_version not in {
         TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1,
         TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
+        TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
     }:
         raise DeliveryContractError("terminal_delivery_schema_unsupported")
     target_key = (
@@ -691,12 +814,70 @@ def build_terminal_delivery(
     }
     diagnostic_result = ""
     diagnostic_contract: dict[str, Any] = {}
-    if schema_version == TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION:
+    fallback_conclusion = ""
+    fallback_contract: dict[str, Any] = {}
+    if schema_version == TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION:
+        fallback = _validated_terminal_fallback(terminal_fallback)
+        public_contract = _terminal_fallback_public_contract()
+        fallback_conclusion = _terminal_fallback_public_result()
+        _validate_terminal_fallback_publication(
+            public_contract,
+            fallback_conclusion,
+        )
+        oracle = evaluate_structural_tier(
+            public_contract,
+            publication_text=fallback_conclusion,
+        )
+        try:
+            require_publishable(oracle)
+        except TierOracleConflict as exc:
+            raise DeliveryContractError(
+                "classification_conflict",
+                ",".join(exc.result.violations)
+                or f"{exc.result.terminal_class}_not_publishable",
+            ) from exc
+        if (
+            oracle.schema_version != "pnc_rca_structural_tier_oracle_v2"
+            or oracle.terminal_class != HONEST_NON_ATTRIBUTION
+            or oracle.confidence_tier != "low"
+        ):
+            raise DeliveryContractError("terminal_fallback_oracle_invalid")
+        semantic.update({
+            "conclusion": fallback_conclusion,
+            "terminal_class": oracle.terminal_class,
+            "confidence_tier": oracle.confidence_tier,
+            "quality_oracle": oracle.as_dict(),
+            "quality_oracle_sha256": oracle.sha256(),
+            "field_updates": [
+                {
+                    "field_key": RCA_RESULT_FIELD_KEY,
+                    "field_value": fallback_conclusion,
+                },
+            ],
+            "terminal_fallback": fallback,
+        })
+        fallback_contract = {
+            "schema_version": TERMINAL_FALLBACK_CONTRACT_SCHEMA_VERSION,
+            "generation": generation,
+            "terminal_fallback": fallback,
+            "public_contract": public_contract,
+            "terminal_class": oracle.terminal_class,
+            "confidence_tier": oracle.confidence_tier,
+            "quality_oracle": oracle.as_dict(),
+            "quality_oracle_sha256": oracle.sha256(),
+            "report_field_write_policy": "preserve_existing",
+        }
+        normalized_diagnostic_code = ""
+    elif schema_version == TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION:
+        if terminal_fallback is not None:
+            raise DeliveryContractError("terminal_fallback_schema_invalid")
         derived_diagnostic_code = terminal_diagnostic_code(
             normalized_error,
             source_error_code=source_error_code,
         )
-        normalized_diagnostic_code = str(diagnostic_code or derived_diagnostic_code).strip()
+        normalized_diagnostic_code = str(
+            diagnostic_code or derived_diagnostic_code
+        ).strip()
         if normalized_diagnostic_code not in _TERMINAL_DIAGNOSTIC_RESULTS:
             raise DeliveryContractError("terminal_delivery_diagnostic_code_invalid")
         if (
@@ -725,13 +906,11 @@ def build_terminal_delivery(
                 "field_value": diagnostic_result,
             },
         ]
-        semantic.update(
-            {
-                "diagnostic_code": normalized_diagnostic_code,
-                "diagnostic_result": diagnostic_result,
-                "field_updates": field_updates,
-            }
-        )
+        semantic.update({
+            "diagnostic_code": normalized_diagnostic_code,
+            "diagnostic_result": diagnostic_result,
+            "field_updates": field_updates,
+        })
         diagnostic_contract = {
             "schema_version": TERMINAL_DIAGNOSTIC_CONTRACT_SCHEMA_VERSION,
             "generation": generation,
@@ -744,6 +923,8 @@ def build_terminal_delivery(
         if public_detail:
             diagnostic_contract["diagnostic_detail"] = public_detail
     else:
+        if terminal_fallback is not None:
+            raise DeliveryContractError("terminal_fallback_schema_invalid")
         normalized_diagnostic_code = ""
     semantic_sha = compute_terminal_delivery_effect_payload_sha256(
         semantic, DELIVERY_EFFECT_KIND
@@ -754,15 +935,35 @@ def build_terminal_delivery(
         target_key=target_key,
         semantic_payload_sha256=semantic_sha,
     )
-    marker = terminal_delivery_effect_marker(
-        effect_key, normalized_outcome, generation
-    )
-    payload = {
-        **semantic,
-        "effect_key": effect_key,
-        "semantic_payload_sha256": semantic_sha,
-        "marker": marker,
-        "comment_content": _terminal_content(
+    marker = terminal_delivery_effect_marker(effect_key, normalized_outcome, generation)
+    if schema_version == TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION:
+        comment_content = _terminal_fallback_content(
+            marker=marker,
+            conclusion=fallback_conclusion,
+        )
+        _validate_terminal_fallback_publication(
+            fallback_contract["public_contract"],
+            comment_content,
+        )
+        replayed_oracle = evaluate_structural_tier(
+            fallback_contract["public_contract"],
+            publication_text=f"{fallback_conclusion}\n{comment_content}",
+        )
+        try:
+            require_publishable(replayed_oracle)
+        except TierOracleConflict as exc:
+            raise DeliveryContractError(
+                "classification_conflict",
+                ",".join(exc.result.violations)
+                or f"{exc.result.terminal_class}_not_publishable",
+            ) from exc
+        if replayed_oracle.as_dict() != semantic["quality_oracle"]:
+            raise DeliveryContractError(
+                "classification_conflict",
+                "terminal fallback oracle changed after final rendering",
+            )
+    else:
+        comment_content = _terminal_content(
             marker=marker,
             outcome=normalized_outcome,
             terminal_state=normalized_state,
@@ -771,7 +972,13 @@ def build_terminal_delivery(
             generation=generation,
             thread=False,
             diagnostic_result=diagnostic_result,
-        ),
+        )
+    payload = {
+        **semantic,
+        "effect_key": effect_key,
+        "semantic_payload_sha256": semantic_sha,
+        "marker": marker,
+        "comment_content": comment_content,
     }
     return VerifiedTerminalDelivery(
         delivery_id=delivery_id,
@@ -791,7 +998,7 @@ def build_terminal_delivery(
         diagnostic_code=normalized_diagnostic_code,
         diagnostic_result=diagnostic_result,
         marker=marker,
-        contract=diagnostic_contract,
+        contract=fallback_contract or diagnostic_contract,
         effect_payload=payload,
     )
 
@@ -808,6 +1015,7 @@ def build_terminal_thread_reply_effect(
         not in {
             TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1,
             TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
+            TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
         }
         or issue.get("effect_kind") != DELIVERY_EFFECT_KIND
     ):
@@ -830,13 +1038,11 @@ def build_terminal_thread_reply_effect(
         for key in _terminal_semantic_fields(issue.get("schema_version"))
         if key not in {"effect_kind", "target_key"}
     }
-    semantic.update(
-        {
-            "effect_kind": DELIVERY_THREAD_EFFECT_KIND,
-            "target_key": target_key,
-            **{key: validated_target[key] for key in _THREAD_EFFECT_SEMANTIC_FIELDS},
-        }
-    )
+    semantic.update({
+        "effect_kind": DELIVERY_THREAD_EFFECT_KIND,
+        "target_key": target_key,
+        **{key: validated_target[key] for key in _THREAD_EFFECT_SEMANTIC_FIELDS},
+    })
     semantic_sha = compute_terminal_delivery_effect_payload_sha256(
         semantic, DELIVERY_THREAD_EFFECT_KIND
     )
@@ -849,13 +1055,13 @@ def build_terminal_thread_reply_effect(
     outcome = str(semantic.get("outcome") or "")
     generation = semantic.get("generation")
     marker = terminal_delivery_effect_marker(effect_key, outcome, generation)
-    payload = {
-        **semantic,
-        "effect_key": effect_key,
-        "semantic_payload_sha256": semantic_sha,
-        "marker": marker,
-        "idempotency_uuid": delivery_effect_idempotency_uuid(effect_key),
-        "message_content": _terminal_content(
+    if issue.get("schema_version") == TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION:
+        message_content = _terminal_fallback_content(
+            marker=marker,
+            conclusion=str(semantic.get("conclusion") or ""),
+        )
+    else:
+        message_content = _terminal_content(
             marker=marker,
             outcome=outcome,
             terminal_state=str(semantic.get("terminal_state") or ""),
@@ -864,7 +1070,14 @@ def build_terminal_thread_reply_effect(
             generation=generation,
             thread=True,
             diagnostic_result=str(semantic.get("diagnostic_result") or ""),
-        ),
+        )
+    payload = {
+        **semantic,
+        "effect_key": effect_key,
+        "semantic_payload_sha256": semantic_sha,
+        "marker": marker,
+        "idempotency_uuid": delivery_effect_idempotency_uuid(effect_key),
+        "message_content": message_content,
     }
     return effect_key, semantic_sha, payload
 
@@ -968,16 +1181,11 @@ def build_thread_reply_effect(
         for key in _BASE_EFFECT_SEMANTIC_FIELDS
         if key not in {"effect_kind", "target_key"}
     }
-    semantic.update(
-        {
-            "effect_kind": DELIVERY_THREAD_EFFECT_KIND,
-            "target_key": target_key,
-            **{
-                key: validated_target[key]
-                for key in _THREAD_EFFECT_SEMANTIC_FIELDS
-            },
-        }
-    )
+    semantic.update({
+        "effect_kind": DELIVERY_THREAD_EFFECT_KIND,
+        "target_key": target_key,
+        **{key: validated_target[key] for key in _THREAD_EFFECT_SEMANTIC_FIELDS},
+    })
     semantic_sha = compute_delivery_effect_payload_sha256(
         semantic, DELIVERY_THREAD_EFFECT_KIND
     )
@@ -1032,9 +1240,7 @@ def _consumer_capability_summary(contract: Mapping[str, Any]) -> str:
     if capability is None:
         summary = contract.get("summary")
         capability = (
-            summary.get("consumer_capability")
-            if isinstance(summary, Mapping)
-            else None
+            summary.get("consumer_capability") if isinstance(summary, Mapping) else None
         )
     if not capability:
         return ""
@@ -1058,7 +1264,9 @@ def _consumer_capability_summary(contract: Mapping[str, Any]) -> str:
     fields = capability.get("actual_fields")
     evaluators = capability.get("actual_evaluators")
     unused = capability.get("unused_capabilities")
-    if not all(isinstance(value, list) for value in (signals, fields, evaluators, unused)):
+    if not all(
+        isinstance(value, list) for value in (signals, fields, evaluators, unused)
+    ):
         raise DeliveryContractError("consumer_capability_inventory_invalid")
     for item in evaluators:
         if (
@@ -1123,7 +1331,10 @@ _PUBLIC_TEXT_REPLACEMENTS = (
     ("OOI 槽位", "目标跟踪记录"),
     ("活动槽位", "有效记录位置"),
     ("OOI", "前方目标"),
-    ("原始 mcap 已解码出函数级证据，可直接进入 RCA", "生产数据已成功读取，并提取到可核验的功能证据"),
+    (
+        "原始 mcap 已解码出函数级证据，可直接进入 RCA",
+        "生产数据已成功读取，并提取到可核验的功能证据",
+    ),
 )
 
 _PUBLIC_RESPONSIBILITY_LABELS = {
@@ -1148,7 +1359,8 @@ def _public_text(value: Any, *, limit: int = 900) -> str:
     kept = [
         line.strip()
         for line in raw.splitlines()
-        if line.strip() and not any(fragment in line for fragment in _PUBLIC_INTERNAL_FRAGMENTS)
+        if line.strip()
+        and not any(fragment in line for fragment in _PUBLIC_INTERNAL_FRAGMENTS)
     ]
     text = "；".join(kept)
     for source, replacement in _PUBLIC_TEXT_REPLACEMENTS:
@@ -1156,7 +1368,7 @@ def _public_text(value: Any, *, limit: int = 900) -> str:
     text = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", text)
     for prefix in ("候选因果判断：", "候选原因：", "诊断结论："):
         if text.startswith(prefix):
-            text = text[len(prefix):].strip()
+            text = text[len(prefix) :].strip()
     return _truncate_utf8(text.rstrip("。； ") + ("。" if text else ""), limit)
 
 
@@ -1213,7 +1425,7 @@ def _public_terminal_blocker(code: str) -> tuple[str, str, str]:
         "remote_event_not_found": (
             "问题数据事件在当前生产数据源中不存在。",
             "无法读取对应证据，因此不能判断责任方或因果链。",
-            "请核对问题单中的 PDCL 事件地址，修正后重新发起 RCA。",
+            "系统已转入内部证据待办，不要求问题发起人执行操作。",
         ),
         "unsupported_function_domain": (
             "本次任务未进入功能证据分析，不能作为归因结果。",
@@ -1246,7 +1458,7 @@ def _public_terminal_blocker(code: str) -> tuple[str, str, str]:
         (
             "本次未生成可确认的自动归因。",
             "当前没有足够的可验证证据建立责任和因果链。",
-            "请补齐问题数据或输入后重新发起 RCA；人工可先行分流。",
+            "系统已记录内部处理路径，不要求问题发起人执行维护操作。",
         ),
     )
 
@@ -1261,15 +1473,35 @@ def build_public_rca_result(contract: Mapping[str, Any]) -> dict[str, Any]:
     contract = contract if isinstance(contract, Mapping) else {}
     public = contract.get("public_result")
     public = public if isinstance(public, Mapping) else {}
-    summary = public.get("summary") if isinstance(public.get("summary"), Mapping) else {}
+    summary = (
+        public.get("summary") if isinstance(public.get("summary"), Mapping) else {}
+    )
     if not summary:
         raw_summary = contract.get("summary")
         summary = raw_summary if isinstance(raw_summary, Mapping) else {}
-    report = contract.get("report") if isinstance(contract.get("report"), Mapping) else {}
-    responsibility = public.get("responsibility") if isinstance(public.get("responsibility"), Mapping) else {}
-    causal = public.get("causal_chain") if isinstance(public.get("causal_chain"), Mapping) else {}
-    evidence = public.get("evidence_summary") if isinstance(public.get("evidence_summary"), Mapping) else {}
-    terminal = public.get("terminal_diagnostic") if isinstance(public.get("terminal_diagnostic"), Mapping) else {}
+    report = (
+        contract.get("report") if isinstance(contract.get("report"), Mapping) else {}
+    )
+    responsibility = (
+        public.get("responsibility")
+        if isinstance(public.get("responsibility"), Mapping)
+        else {}
+    )
+    causal = (
+        public.get("causal_chain")
+        if isinstance(public.get("causal_chain"), Mapping)
+        else {}
+    )
+    evidence = (
+        public.get("evidence_summary")
+        if isinstance(public.get("evidence_summary"), Mapping)
+        else {}
+    )
+    terminal = (
+        public.get("terminal_diagnostic")
+        if isinstance(public.get("terminal_diagnostic"), Mapping)
+        else {}
+    )
 
     terminal_code = str(terminal.get("blocker_kind") or "").strip()
     raw_short = _public_first_text(
@@ -1299,12 +1531,18 @@ def build_public_rca_result(contract: Mapping[str, Any]) -> dict[str, Any]:
         or report.get("candidate_owner")
     )
 
-    artifacts = contract.get("artifacts") if isinstance(contract.get("artifacts"), Mapping) else {}
-    fallback_causal_text, fallback_boundary = _public_attribution_text(_public_first_text(
-        artifacts.get("attribution_causal_text"),
-        summary.get("short_conclusion"),
-        limit=1000,
-    ))
+    artifacts = (
+        contract.get("artifacts")
+        if isinstance(contract.get("artifacts"), Mapping)
+        else {}
+    )
+    fallback_causal_text, fallback_boundary = _public_attribution_text(
+        _public_first_text(
+            artifacts.get("attribution_causal_text"),
+            summary.get("short_conclusion"),
+            limit=1000,
+        )
+    )
     if not derived_boundary:
         derived_boundary = fallback_boundary
 
@@ -1342,7 +1580,10 @@ def build_public_rca_result(contract: Mapping[str, Any]) -> dict[str, Any]:
             continue
         if not hypothesis_claim:
             hypothesis_claim = _public_first_text(
-                item.get("claim"), item.get("narrative"), item.get("text"), item.get("summary"),
+                item.get("claim"),
+                item.get("narrative"),
+                item.get("text"),
+                item.get("summary"),
                 limit=700,
             )
         supporting = item.get("supporting_evidence")
@@ -1352,7 +1593,8 @@ def build_public_rca_result(contract: Mapping[str, Any]) -> dict[str, Any]:
             if not isinstance(evidence_item, Mapping):
                 continue
             detail = _public_first_text(
-                evidence_item.get("evidence"), evidence_item.get("summary"),
+                evidence_item.get("evidence"),
+                evidence_item.get("summary"),
                 limit=420,
             )
             if not detail:
@@ -1364,7 +1606,9 @@ def build_public_rca_result(contract: Mapping[str, Any]) -> dict[str, Any]:
     if structured_evidence:
         evidence_text = "；".join(structured_evidence)
         if hypothesis_claim:
-            causal_text = f"{structured_evidence[0].rstrip('。')}，因此{hypothesis_claim}"
+            causal_text = (
+                f"{structured_evidence[0].rstrip('。')}，因此{hypothesis_claim}"
+            )
     elif not causal_text and hypothesis_claim:
         causal_text = hypothesis_claim
     if not causal_text:
@@ -1375,7 +1619,12 @@ def build_public_rca_result(contract: Mapping[str, Any]) -> dict[str, Any]:
             compact_refs: list[str] = []
             for item in refs[:6]:
                 if isinstance(item, Mapping):
-                    compact = item.get("summary") or item.get("field") or item.get("check") or item.get("fit_source")
+                    compact = (
+                        item.get("summary")
+                        or item.get("field")
+                        or item.get("check")
+                        or item.get("fit_source")
+                    )
                 else:
                     compact = item
                 text = _public_text(compact, limit=220)
@@ -1395,25 +1644,37 @@ def build_public_rca_result(contract: Mapping[str, Any]) -> dict[str, Any]:
         *evidence_boundary,
         limit=800,
     )
-    action = public.get("user_action") if isinstance(public.get("user_action"), Mapping) else {}
+    action = (
+        public.get("user_action")
+        if isinstance(public.get("user_action"), Mapping)
+        else {}
+    )
     if not action:
         raw_action = contract.get("user_action")
         action = raw_action if isinstance(raw_action, Mapping) else {}
-    next_action = _public_action(action.get("next_action_text") or action.get("next_action"))
+    next_action = _public_action(
+        action.get("next_action_text") or action.get("next_action")
+    )
 
     if no_attribution:
         conclusion, impact, default_action = _public_terminal_blocker(terminal_code)
         specific = evidence_text or fallback_causal_text or short
         causal_boundary = "暂无足够证据建立可确认的因果链。"
-        if not terminal_code and any(marker in short for marker in ("数据源不一致", "证据冲突", "未找到该目标")):
+        if not terminal_code and any(
+            marker in short for marker in ("数据源不一致", "证据冲突", "未找到该目标")
+        ):
             conclusion = "问题单描述的目标与生产数据不一致，当前不能确认责任归因。"
             impact = "问题单中的目标信息无法在绑定的生产数据中匹配。"
-            causal_boundary = "问题单目标描述 → 生产数据核验 → 关键目标不匹配 → 无法验证责任因果链。"
+            causal_boundary = (
+                "问题单目标描述 → 生产数据核验 → 关键目标不匹配 → 无法验证责任因果链。"
+            )
             default_action = "请核对绑定的 PDCL 事件及目标信息；修正数据地址、时间或目标后重新发起 RCA。"
         elif not terminal_code and "未提供可核验的现象描述" in short:
             conclusion = "生产数据已读取，但问题现象描述不足，当前不能确认归因。"
             impact = "缺少可核验的异常现象，无法选择并验证对应因果机制。"
-            causal_boundary = "生产数据读取 → 问题现象不明确 → 无法选择归因机制 → 转人工补充。"
+            causal_boundary = (
+                "生产数据读取 → 问题现象不明确 → 无法选择归因机制 → 转人工补充。"
+            )
             default_action = "请补充发生了什么、预期行为及实际异常后重新发起 RCA。"
         elif not terminal_code and any(
             marker in short
@@ -1457,14 +1718,12 @@ def render_public_rca_result(
 ) -> str:
     result = build_public_rca_result(contract)
     if terminal_class == HONEST_NON_ATTRIBUTION:
-        return "\n".join(
-            (
-                "归因结论：系统已完成现有可用证据的自动分析，但未形成可确认的归因结论。",
-                "责任模块：暂无法判断。",
-                "因果关系：现有证据不足以闭合责任因果链。",
-                "关键证据：已取得的证据仅能支持记录分析边界，不能支持责任判断。",
-            )
-        )
+        return "\n".join((
+            "归因结论：系统已完成现有可用证据的自动分析，但未形成可确认的归因结论。",
+            "责任模块：暂无法判断。",
+            "因果关系：现有证据不足以闭合责任因果链。",
+            "关键证据：已取得的证据仅能支持记录分析边界，不能支持责任判断。",
+        ))
     lines = [
         f"归因结论：{result['conclusion']}",
         f"责任模块：{result['responsibility']}",
@@ -1485,21 +1744,24 @@ def _render_terminal_user_result(code: str, detail: str = "") -> str:
         route = detail_text.split("（", 1)[0].rstrip("。； ")
         if route:
             conclusion = f"未形成归因：{route}。"
-    return "\n".join(
-        (
-            f"归因结论：{conclusion}",
-            "责任模块：暂无法判断。",
-            "因果关系：暂无足够证据建立可确认的因果链。",
-            f"关键证据：{impact}",
-        )
-    )
+    return "\n".join((
+        "置信档：低置信（未归因）。",
+        f"归因结论：{conclusion}",
+        "责任模块：暂无法判断。",
+        "因果关系：暂无足够证据建立可确认的因果链。",
+        f"关键证据：{impact}",
+    ))
 
 
 def _positive_int(value: Any, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
-        raise DeliveryContractError("delivery_field_invalid", f"{field} must be positive")
+        raise DeliveryContractError(
+            "delivery_field_invalid", f"{field} must be positive"
+        )
     if value <= 0:
-        raise DeliveryContractError("delivery_field_invalid", f"{field} must be positive")
+        raise DeliveryContractError(
+            "delivery_field_invalid", f"{field} must be positive"
+        )
     return value
 
 
@@ -1523,7 +1785,9 @@ def _normalize_root(value: Any, submission_key: str) -> str:
     expected = canonical_artifact_root(submission_key)
     raw = _required_text(value, "delivery_manifest.artifact_root")
     if not raw.startswith("/") or ".." in PurePosixPath(raw).parts or "\x00" in raw:
-        raise DeliveryContractError("artifact_root_invalid", f"invalid artifact_root: {raw}")
+        raise DeliveryContractError(
+            "artifact_root_invalid", f"invalid artifact_root: {raw}"
+        )
     normalized = posixpath.normpath(raw).rstrip("/") + "/"
     if normalized != expected:
         raise DeliveryContractError(
@@ -1536,8 +1800,12 @@ def _normalize_root(value: Any, submission_key: str) -> str:
 def _artifact_path(root: str, value: Any) -> tuple[str, str]:
     raw = _required_text(value, "artifact.path")
     if "\x00" in raw or ".." in PurePosixPath(raw).parts or "\\" in raw:
-        raise DeliveryContractError("artifact_path_invalid", f"unsafe artifact path: {raw}")
-    absolute = posixpath.normpath(raw if raw.startswith("/") else posixpath.join(root, raw))
+        raise DeliveryContractError(
+            "artifact_path_invalid", f"unsafe artifact path: {raw}"
+        )
+    absolute = posixpath.normpath(
+        raw if raw.startswith("/") else posixpath.join(root, raw)
+    )
     root_no_slash = root.rstrip("/")
     try:
         common = posixpath.commonpath((root_no_slash, absolute))
@@ -1555,18 +1823,21 @@ def _manifest_artifact_material(manifest: Mapping[str, Any]) -> list[dict[str, A
     rows = manifest.get("artifacts")
     if not isinstance(rows, list) or not rows:
         raise DeliveryContractError(
-            "delivery_manifest_artifacts_invalid", "manifest artifacts must be non-empty"
+            "delivery_manifest_artifacts_invalid",
+            "manifest artifacts must be non-empty",
         )
     if len(rows) > MAX_DELIVERY_ARTIFACTS:
         raise DeliveryContractError(
-            "delivery_manifest_artifacts_invalid", "manifest contains too many artifacts"
+            "delivery_manifest_artifacts_invalid",
+            "manifest contains too many artifacts",
         )
     material: list[dict[str, Any]] = []
     total_size = 0
     for index, item in enumerate(rows):
         if not isinstance(item, Mapping):
             raise DeliveryContractError(
-                "delivery_manifest_artifacts_invalid", f"artifact[{index}] must be an object"
+                "delivery_manifest_artifacts_invalid",
+                f"artifact[{index}] must be an object",
             )
         if set(item) != _DELIVERY_MANIFEST_ARTIFACT_FIELDS:
             raise DeliveryContractError(
@@ -1593,22 +1864,18 @@ def _manifest_artifact_material(manifest: Mapping[str, Any]) -> list[dict[str, A
             )
         size = _positive_int(item.get("size"), f"artifact[{index}].size")
         if size > MAX_DELIVERY_ARTIFACT_BYTES:
-            raise DeliveryContractError(
-                "delivery_artifact_file_too_large", path
-            )
+            raise DeliveryContractError("delivery_artifact_file_too_large", path)
         total_size += size
         if total_size > MAX_DELIVERY_ARTIFACT_TOTAL_BYTES:
             raise DeliveryContractError("delivery_artifact_bundle_too_large")
-        material.append(
-            {
-                "role": role,
-                "path": path,
-                "size": size,
-                "sha256": _sha256(item.get("sha256"), f"artifact[{index}].sha256"),
-                "media_type": media_type,
-                "required": item["required"],
-            }
-        )
+        material.append({
+            "role": role,
+            "path": path,
+            "size": size,
+            "sha256": _sha256(item.get("sha256"), f"artifact[{index}].sha256"),
+            "media_type": media_type,
+            "required": item["required"],
+        })
     return sorted(material, key=lambda row: (row["role"], row["path"]))
 
 
@@ -1736,14 +2003,10 @@ def verify_persisted_artifact_inventory(
             or absolute in expected_paths
             or relative in expected_relative_paths
         ):
-            raise DeliveryContractError(
-                "delivery_manifest_duplicate_artifact", role
-            )
+            raise DeliveryContractError("delivery_manifest_duplicate_artifact", role)
         size = item["size"]
         if size > MAX_DELIVERY_ARTIFACT_BYTES:
-            raise DeliveryContractError(
-                "delivery_artifact_file_too_large", absolute
-            )
+            raise DeliveryContractError("delivery_artifact_file_too_large", absolute)
         expected_total += size
         if expected_total > MAX_DELIVERY_ARTIFACT_TOTAL_BYTES:
             raise DeliveryContractError("delivery_artifact_bundle_too_large")
@@ -1780,9 +2043,7 @@ def verify_persisted_artifact_inventory(
                 f"stored artifact[{index}] must be an object",
             )
         role = _required_text(row.get("role"), f"stored artifact[{index}].role")
-        raw_path = _required_text(
-            row.get("path"), f"stored artifact[{index}].path"
-        )
+        raw_path = _required_text(row.get("path"), f"stored artifact[{index}].path")
         absolute, path_relative = _artifact_path(root, raw_path)
         relative = _required_text(
             row.get("relative_path"),
@@ -1810,12 +2071,8 @@ def verify_persisted_artifact_inventory(
             raise DeliveryContractError("html_delivery_mcap_forbidden")
         size = _positive_int(row.get("size"), f"stored artifact[{index}].size")
         if size > MAX_DELIVERY_ARTIFACT_BYTES:
-            raise DeliveryContractError(
-                "delivery_artifact_file_too_large", absolute
-            )
-        sha256 = _sha256(
-            row.get("sha256"), f"stored artifact[{index}].sha256"
-        )
+            raise DeliveryContractError("delivery_artifact_file_too_large", absolute)
+        sha256 = _sha256(row.get("sha256"), f"stored artifact[{index}].sha256")
         required = row.get("required")
         if not isinstance(required, bool):
             raise DeliveryContractError(
@@ -1827,9 +2084,7 @@ def verify_persisted_artifact_inventory(
             or absolute in stored_paths
             or relative in stored_relative_paths
         ):
-            raise DeliveryContractError(
-                "delivery_artifact_inventory_duplicate", role
-            )
+            raise DeliveryContractError("delivery_artifact_inventory_duplicate", role)
         stored_total += size
         if stored_total > MAX_DELIVERY_ARTIFACT_TOTAL_BYTES:
             raise DeliveryContractError("delivery_artifact_bundle_too_large")
@@ -1877,17 +2132,12 @@ def _validate_report_asset_url(
         raise DeliveryContractError("report_url_invalid", f"unsafe report URL: {url}")
     route_submission_key = parts[3]
     route_artifact_set_id = parts[4]
-    if (
-        not _SAFE_KEY_RE.fullmatch(route_submission_key)
-        or not _ARTIFACT_SET_ID_RE.fullmatch(route_artifact_set_id)
-    ):
+    if not _SAFE_KEY_RE.fullmatch(
+        route_submission_key
+    ) or not _ARTIFACT_SET_ID_RE.fullmatch(route_artifact_set_id):
         raise DeliveryContractError("report_url_invalid", f"unsafe report URL: {url}")
-    if (
-        submission_key is not None
-        and route_submission_key != submission_key
-    ) or (
-        artifact_set_id is not None
-        and route_artifact_set_id != artifact_set_id
+    if (submission_key is not None and route_submission_key != submission_key) or (
+        artifact_set_id is not None and route_artifact_set_id != artifact_set_id
     ):
         raise DeliveryContractError(
             "report_url_identity_mismatch",
@@ -1895,7 +2145,9 @@ def _validate_report_asset_url(
         )
     for segment in parts[5:]:
         if not _FORMAL_REPORT_SEGMENT_RE.fullmatch(segment):
-            raise DeliveryContractError("report_url_invalid", f"unsafe report URL: {url}")
+            raise DeliveryContractError(
+                "report_url_invalid", f"unsafe report URL: {url}"
+            )
         decoded = unquote(segment)
         if (
             decoded in {"", ".", ".."}
@@ -1904,7 +2156,9 @@ def _validate_report_asset_url(
             or "%" in decoded
             or any(ord(char) < 32 for char in decoded)
         ):
-            raise DeliveryContractError("report_url_invalid", f"unsafe report URL: {url}")
+            raise DeliveryContractError(
+                "report_url_invalid", f"unsafe report URL: {url}"
+            )
     return url
 
 
@@ -1931,9 +2185,7 @@ def _validate_report_url(
 def build_report_url(submission_key: Any, artifact_set_id: Any) -> str:
     """Build the one immutable publication URL for a sealed artifact set."""
     submission = _required_text(submission_key, "delivery_manifest.submission_key")
-    artifact_set = _required_text(
-        artifact_set_id, "delivery_manifest.artifact_set_id"
-    )
+    artifact_set = _required_text(artifact_set_id, "delivery_manifest.artifact_set_id")
     if not _SAFE_KEY_RE.fullmatch(submission) or not _ARTIFACT_SET_ID_RE.fullmatch(
         artifact_set
     ):
@@ -1942,8 +2194,7 @@ def build_report_url(submission_key: Any, artifact_set_id: Any) -> str:
     if not public_origin:
         raise DeliveryContractError("report_public_origin_invalid")
     return _validate_report_url(
-        f"{public_origin}/G1Q3_RCA/cases/"
-        f"{submission}/{artifact_set}/index.html",
+        f"{public_origin}/G1Q3_RCA/cases/{submission}/{artifact_set}/index.html",
         submission_key=submission,
         artifact_set_id=artifact_set,
     )
@@ -1951,9 +2202,7 @@ def build_report_url(submission_key: Any, artifact_set_id: Any) -> str:
 
 def build_report_vm_path(submission_key: Any, artifact_set_id: Any) -> str:
     submission = _required_text(submission_key, "delivery_manifest.submission_key")
-    artifact_set = _required_text(
-        artifact_set_id, "delivery_manifest.artifact_set_id"
-    )
+    artifact_set = _required_text(artifact_set_id, "delivery_manifest.artifact_set_id")
     if not _SAFE_KEY_RE.fullmatch(submission) or not _ARTIFACT_SET_ID_RE.fullmatch(
         artifact_set
     ):
@@ -1972,11 +2221,10 @@ def _validate_report_identity_paths(
     submission_key: str,
     artifact_set_id: str,
 ) -> None:
-    if (
-        manifest.get("report_vm_path")
-        != build_report_vm_path(submission_key, artifact_set_id)
-        or manifest.get("report_cifs_path")
-        != build_report_cifs_path(submission_key, artifact_set_id)
+    if manifest.get("report_vm_path") != build_report_vm_path(
+        submission_key, artifact_set_id
+    ) or manifest.get("report_cifs_path") != build_report_cifs_path(
+        submission_key, artifact_set_id
     ):
         raise DeliveryContractError("report_path_identity_mismatch")
 
@@ -2040,7 +2288,8 @@ def _observations_by_path(
         path = str(item.get("path") or "").strip()
         if not path or path in result:
             raise DeliveryContractError(
-                "artifact_observation_invalid", f"duplicate or missing observed path: {path}"
+                "artifact_observation_invalid",
+                f"duplicate or missing observed path: {path}",
             )
         result[path] = item
     return result
@@ -2082,14 +2331,18 @@ def _verify_viz_publication(
     path = _required_text(publication.get("path"), "viz_publication.path")
     if not expected_path or path != expected_path:
         raise DeliveryContractError("viz_publication_path_invalid")
-    expected_manifest_path = expected_path.removesuffix(".viz.mcap") + ".viz.manifest.json"
+    expected_manifest_path = (
+        expected_path.removesuffix(".viz.mcap") + ".viz.manifest.json"
+    )
     manifest_path = _required_text(
         publication.get("manifest_path"), "viz_publication.manifest_path"
     )
     if manifest_path != expected_manifest_path:
         raise DeliveryContractError("viz_publication_manifest_path_invalid")
 
-    source_path = _required_text(publication.get("source_path"), "viz_publication.source_path")
+    source_path = _required_text(
+        publication.get("source_path"), "viz_publication.source_path"
+    )
     source_root = canonical_artifact_root(submission_key)
     if (
         not source_path.startswith(source_root + "cases/")
@@ -2098,7 +2351,10 @@ def _verify_viz_publication(
     ):
         raise DeliveryContractError("viz_publication_source_invalid")
     published_sha = _sha256(publication.get("sha256"), "viz_publication.sha256")
-    if _sha256(publication.get("source_sha256"), "viz_publication.source_sha256") != published_sha:
+    if (
+        _sha256(publication.get("source_sha256"), "viz_publication.source_sha256")
+        != published_sha
+    ):
         raise DeliveryContractError("viz_publication_source_hash_mismatch")
     published_size = _positive_int(publication.get("size"), "viz_publication.size")
     manifest_size = _positive_int(
@@ -2160,16 +2416,19 @@ def _verify_identity(
             )
     if str(contract.get("task_id") or "").strip() != admission.submission_key:
         raise DeliveryContractError(
-            "delivery_identity_mismatch", "contract task_id does not match submission_key"
+            "delivery_identity_mismatch",
+            "contract task_id does not match submission_key",
         )
     run_id = str(contract.get("run_id") or "").strip()
     if run_id and run_id != admission.submission_key:
         raise DeliveryContractError(
-            "delivery_identity_mismatch", "contract run_id does not match submission_key"
+            "delivery_identity_mismatch",
+            "contract run_id does not match submission_key",
         )
     if str(contract.get("work_item_id") or "").strip() != refs.work_item_id:
         raise DeliveryContractError(
-            "delivery_identity_mismatch", "contract work_item_id does not match admission"
+            "delivery_identity_mismatch",
+            "contract work_item_id does not match admission",
         )
 
 
@@ -2207,12 +2466,14 @@ def verify_delivery_bundle(
         raise DeliveryContractError(
             "delivery_dependencies_incomplete",
             "manifest must attest a complete HTML dependency inventory",
-    )
+        )
     _verify_identity(validated_admission, contract, manifest)
 
     if str(contract.get("business_state") or "").strip() != "report_completed":
         raise DeliveryContractError("delivery_business_state_not_ready")
-    report = contract.get("report") if isinstance(contract.get("report"), Mapping) else {}
+    report = (
+        contract.get("report") if isinstance(contract.get("report"), Mapping) else {}
+    )
     if report.get("is_deliverable") is not True:
         raise DeliveryContractError("delivery_report_not_deliverable")
     explicit_kind = str(
@@ -2228,7 +2489,8 @@ def verify_delivery_bundle(
     )
     if report_status not in allowed_report_statuses:
         raise DeliveryContractError(
-            "delivery_report_status_invalid", f"unsupported report status: {report_status}"
+            "delivery_report_status_invalid",
+            f"unsupported report status: {report_status}",
         )
     if not isinstance(report.get("requires_human_review"), bool):
         raise DeliveryContractError(
@@ -2236,7 +2498,9 @@ def verify_delivery_bundle(
             "RCA review metadata must be an explicit boolean",
         )
 
-    root = _normalize_root(manifest.get("artifact_root"), validated_admission.submission_key)
+    root = _normalize_root(
+        manifest.get("artifact_root"), validated_admission.submission_key
+    )
     artifact_material = _manifest_artifact_material(manifest)
     expected_artifact_set_id = compute_artifact_set_id(manifest)
     _validate_manifest_v2_shape(manifest)
@@ -2244,7 +2508,9 @@ def verify_delivery_bundle(
         raise DeliveryContractError("artifact_set_id_mismatch")
 
     contract_artifacts = (
-        contract.get("artifacts") if isinstance(contract.get("artifacts"), Mapping) else {}
+        contract.get("artifacts")
+        if isinstance(contract.get("artifacts"), Mapping)
+        else {}
     )
     manifest_vm = _contract_artifact_path(
         contract_artifacts, "delivery_manifest_vm", "manifest_vm"
@@ -2289,9 +2555,15 @@ def verify_delivery_bundle(
             or observed.get("parents_symlink_free") is not True
         ):
             raise DeliveryContractError("artifact_not_regular_file", absolute)
-        if _positive_int(observed.get("size"), f"observed[{absolute}].size") != item["size"]:
+        if (
+            _positive_int(observed.get("size"), f"observed[{absolute}].size")
+            != item["size"]
+        ):
             raise DeliveryContractError("artifact_size_mismatch", absolute)
-        if _sha256(observed.get("sha256"), f"observed[{absolute}].sha256") != item["sha256"]:
+        if (
+            _sha256(observed.get("sha256"), f"observed[{absolute}].sha256")
+            != item["sha256"]
+        ):
             raise DeliveryContractError("artifact_hash_mismatch", absolute)
         artifact = VerifiedArtifact(
             role=item["role"],
@@ -2334,7 +2606,10 @@ def verify_delivery_bundle(
         contract_artifacts, "index_html_vm", "primary_report_vm"
     )
     report_data = _contract_artifact_path(contract_artifacts, "report_data_vm")
-    if primary_report != roles["index_html"].path or report_data != roles["report_data"].path:
+    if (
+        primary_report != roles["index_html"].path
+        or report_data != roles["report_data"].path
+    ):
         raise DeliveryContractError(
             "delivery_artifact_reference_mismatch",
             "contract HTML/JSON paths do not match the sealed manifest",
@@ -2384,9 +2659,19 @@ def verify_delivery_bundle(
     # only user-decision fields into Feishu.  Validation still runs so a false
     # or malformed publication cannot pass through silently.
     _consumer_capability_summary(contract)
-    raw_public = contract.get("public_result") if isinstance(contract.get("public_result"), Mapping) else {}
-    raw_public_summary = raw_public.get("summary") if isinstance(raw_public.get("summary"), Mapping) else {}
-    raw_summary = contract.get("summary") if isinstance(contract.get("summary"), Mapping) else {}
+    raw_public = (
+        contract.get("public_result")
+        if isinstance(contract.get("public_result"), Mapping)
+        else {}
+    )
+    raw_public_summary = (
+        raw_public.get("summary")
+        if isinstance(raw_public.get("summary"), Mapping)
+        else {}
+    )
+    raw_summary = (
+        contract.get("summary") if isinstance(contract.get("summary"), Mapping) else {}
+    )
     if not str(
         raw_public_summary.get("short_conclusion")
         or raw_public_summary.get("l0")

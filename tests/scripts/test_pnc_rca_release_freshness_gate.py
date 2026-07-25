@@ -193,13 +193,9 @@ def test_release_golden_registry_must_be_green_and_pipeline_bound(tmp_path: Path
     commit = "a" * 40
     tree = "b" * 40
     (runtime / "LIVE_MANIFEST.json").write_text(
-        json.dumps(
-            {
-                "face_git_bindings": {
-                    "g1q3_rca_pipeline": {"commit": commit, "tree": tree}
-                }
-            }
-        ),
+        json.dumps({
+            "face_git_bindings": {"g1q3_rca_pipeline": {"commit": commit, "tree": tree}}
+        }),
         encoding="utf-8",
     )
     base = {
@@ -309,10 +305,19 @@ def test_release_preflight_rejects_only_unresolved_incompatible_effects(
             "uncertain",
             {"schema_version": gate.TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1},
         ),
+        (
+            "terminal-fallback-v3",
+            "terminal_failed",
+            "pending",
+            {"schema_version": gate.TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION},
+        ),
     ]
     conn.executemany(
         "INSERT INTO rca_delivery_effects VALUES (?, ?, ?, ?)",
-        [(key, outcome, status, json.dumps(payload)) for key, outcome, status, payload in rows],
+        [
+            (key, outcome, status, json.dumps(payload))
+            for key, outcome, status, payload in rows
+        ],
     )
     conn.commit()
     conn.close()
@@ -322,7 +327,7 @@ def test_release_preflight_rejects_only_unresolved_incompatible_effects(
         control_db_path=db_path,
     )
 
-    assert evidence["unresolved_effect_count"] == 4
+    assert evidence["unresolved_effect_count"] == 5
     assert evidence["incompatible_effect_count"] == 1
     assert evidence["incompatible_effect_keys"] == ["legacy-v2"]
     assert {item["code"] for item in errors} == {
@@ -330,14 +335,16 @@ def test_release_preflight_rejects_only_unresolved_incompatible_effects(
     }
 
     conn = sqlite3.connect(db_path)
-    conn.execute("UPDATE rca_delivery_effects SET status = 'succeeded' WHERE effect_key = 'legacy-v2'")
+    conn.execute(
+        "UPDATE rca_delivery_effects SET status = 'succeeded' WHERE effect_key = 'legacy-v2'"
+    )
     conn.commit()
     conn.close()
     evidence, errors = gate.audit_unresolved_effect_schema_compatibility(
         hermes_home=tmp_path,
         control_db_path=db_path,
     )
-    assert evidence["unresolved_effect_count"] == 3
+    assert evidence["unresolved_effect_count"] == 4
     assert evidence["incompatible_effect_count"] == 0
     assert errors == []
 

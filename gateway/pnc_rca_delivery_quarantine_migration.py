@@ -14,7 +14,7 @@ from typing import Any, Iterator, Mapping
 
 SCHEMA_VERSION = "pnc_rca_delivery_quarantine_offline_migration_v1"
 SOURCE_SCHEMA_VERSION = "pnc_rca_delivery_store_v6"
-TARGET_SCHEMA_VERSION = "pnc_rca_delivery_store_v7"
+TARGET_SCHEMA_VERSION = "pnc_rca_delivery_store_v8"
 MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
 _HEX64 = frozenset("0123456789abcdef")
 _FIELDS = frozenset({

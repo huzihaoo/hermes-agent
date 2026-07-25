@@ -20,6 +20,7 @@ import pytest
 from gateway.pnc_rca_delivery_contract import (
     DELIVERY_EFFECT_SCHEMA_VERSION_V1,
     TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1,
+    TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
     DeliveryContractError,
     build_report_url,
     build_terminal_delivery,
@@ -139,6 +140,7 @@ def _collector(
     *,
     status_reader=None,
     bundle_reader=None,
+    failure_receipt_reader=None,
     enabled: bool = True,
     now=None,
 ):
@@ -175,6 +177,20 @@ def _collector(
             }
         ),
         artifact_bundle_reader=bundle_reader or (lambda _claim: _web_bundle_payload()),
+        failure_receipt_reader=failure_receipt_reader
+        or (
+            lambda claim: {
+                "schema_version": "g1q3_rca_service_result_v2",
+                "task_id": claim.task_id,
+                "status": "pipeline_not_successful",
+                "pipeline_status": "failed",
+                "pipeline_stage": "execution",
+                "blocker": {
+                    "kind": "service_pipeline_runner_failed",
+                    "retryable": False,
+                },
+            }
+        ),
         now=now or (lambda: NOW),
         lease_owner="collector-test",
     )
@@ -219,6 +235,16 @@ def _seed_with_thread_subscription(tmp_path, *, bundle_payload=None):
 
 def _seed_terminal(tmp_path, *, with_thread: bool = False):
     control, _result = _control(tmp_path)
+    admitted_at = (NOW - timedelta(seconds=1800)).isoformat()
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute(
+            "UPDATE business_triggers SET created_at = ?",
+            (admitted_at,),
+        )
+        conn.execute(
+            "UPDATE rca_outbox SET created_at = ?, retry_window_started_at = ?",
+            (admitted_at, admitted_at),
+        )
     if with_thread:
         trigger = control.list_rows("business_triggers")[0]
         _insert_subscription(
@@ -626,9 +652,7 @@ def test_feishu_thread_write_timeout_is_outcome_uncertain(monkeypatch):
         0.01,
     )
 
-    result = FeishuThreadReplyAdapter(
-        SimpleNamespace(send=slow_send)
-    ).add_reply(
+    result = FeishuThreadReplyAdapter(SimpleNamespace(send=slow_send)).add_reply(
         "oc_group123",
         "topic:om_root123",
         "marker\nreport",
@@ -696,9 +720,10 @@ def test_success_requires_read_before_http_add_and_read_after_remote_id(tmp_path
     assert payload["foxglove_url"] != payload["report_url"]
     assert payload["foxglove_url"] not in remote.comments[0]["content"]
     assert receipt["confirmed_report_url"] == payload["report_url"]
-    assert receipt["confirmed_content_sha256"] == hashlib.sha256(
-        payload["comment_content"].encode("utf-8")
-    ).hexdigest()
+    assert (
+        receipt["confirmed_content_sha256"]
+        == hashlib.sha256(payload["comment_content"].encode("utf-8")).hexdigest()
+    )
 
 
 def test_quality_regression_guard_preserves_existing_causal_result(tmp_path):
@@ -711,12 +736,10 @@ def test_quality_regression_guard_preserves_existing_causal_result(tmp_path):
         "关键证据：退出判据与抑制标志在同一时间窗内命中。"
     )
     existing_report = "https://viewer.internal/G1Q3_RCA/cases/previous/index.html"
-    remote.fields.update(
-        {
-            "field_9193cb": existing_result,
-            "field_8c912e": existing_report,
-        }
-    )
+    remote.fields.update({
+        "field_9193cb": existing_result,
+        "field_8c912e": existing_report,
+    })
 
     outcome = dispatcher.dispatch_one()
 
@@ -729,9 +752,7 @@ def test_quality_regression_guard_preserves_existing_causal_result(tmp_path):
     effect = store.list_rows("rca_delivery_effects")[0]
     assert effect["status"] == "suppressed"
     assert effect["write_phase"] == "settled"
-    assert effect["last_error_code"] == (
-        "delivery_result_quality_regression_prevented"
-    )
+    assert effect["last_error_code"] == ("delivery_result_quality_regression_prevented")
     receipt = json.loads(effect["remote_receipt_json"])
     assert receipt["source"] == "delivery_result_quality_regression_prevented"
     assert receipt["preserved_field_keys"] == ["field_9193cb", "field_8c912e"]
@@ -761,10 +782,13 @@ def test_quality_regression_guard_preserves_existing_causal_result(tmp_path):
 def test_quality_regression_guard_only_blocks_causal_to_noncausal(
     existing, proposed, guarded
 ):
-    assert dispatcher_module._quality_regression_guard(
-        {"field_9193cb": existing},
-        (("field_9193cb", proposed),),
-    ) is guarded
+    assert (
+        dispatcher_module._quality_regression_guard(
+            {"field_9193cb": existing},
+            (("field_9193cb", proposed),),
+        )
+        is guarded
+    )
 
 
 def test_html_only_causal_result_is_delivered_without_foxglove_surface(tmp_path):
@@ -808,7 +832,10 @@ def test_existing_marker_repairs_drifted_fields_without_duplicate_comment(tmp_pa
     store = _seed(tmp_path)
     payload = json.loads(store.list_rows("rca_delivery_effects")[0]["payload_json"])
     remote = Remote()
-    remote.comments.append({"remote_id": "comment-existing", "content": payload["comment_content"]})
+    remote.comments.append({
+        "remote_id": "comment-existing",
+        "content": payload["comment_content"],
+    })
     remote.fields = {"field_9193cb": "stale", "field_8c912e": ""}
     dispatcher, _remote, _clock = _dispatcher(tmp_path, remote=remote)
 
@@ -819,17 +846,17 @@ def test_existing_marker_repairs_drifted_fields_without_duplicate_comment(tmp_pa
     assert remote.add_calls == 0
     assert remote.update_field_calls == 1
     assert remote.fields == {
-        item["field_key"]: item["field_value"]
-        for item in payload["field_updates"]
+        item["field_key"]: item["field_value"] for item in payload["field_updates"]
     }
     receipt = json.loads(
         store.list_rows("rca_delivery_effects")[0]["remote_receipt_json"]
     )
     assert receipt["source"] == "field_repair_after_marker"
     assert receipt["confirmed_report_url"] == payload["report_url"]
-    assert receipt["confirmed_content_sha256"] == hashlib.sha256(
-        payload["comment_content"].encode("utf-8")
-    ).hexdigest()
+    assert (
+        receipt["confirmed_content_sha256"]
+        == hashlib.sha256(payload["comment_content"].encode("utf-8")).hexdigest()
+    )
 
 
 def test_meegle_normalized_marker_reconciles_without_duplicate_comment(tmp_path):
@@ -839,12 +866,12 @@ def test_meegle_normalized_marker_reconciles_without_duplicate_comment(tmp_path)
     normalized_content = payload["comment_content"].replace(
         payload["marker"], payload["marker"][1:-1], 1
     )
-    remote.comments.append(
-        {"remote_id": "comment-existing", "content": normalized_content}
-    )
+    remote.comments.append({
+        "remote_id": "comment-existing",
+        "content": normalized_content,
+    })
     remote.fields = {
-        item["field_key"]: item["field_value"]
-        for item in payload["field_updates"]
+        item["field_key"]: item["field_value"] for item in payload["field_updates"]
     }
     dispatcher, _remote, _clock = _dispatcher(tmp_path, remote=remote)
 
@@ -862,9 +889,10 @@ def test_marker_only_remote_comment_is_quarantined_without_html_network_dependen
     store = _seed(tmp_path)
     payload = json.loads(store.list_rows("rca_delivery_effects")[0]["payload_json"])
     remote = Remote()
-    remote.comments.append(
-        {"remote_id": "comment-marker-only", "content": payload["marker"]}
-    )
+    remote.comments.append({
+        "remote_id": "comment-marker-only",
+        "content": payload["marker"],
+    })
     remote.fields = {
         item["field_key"]: item["field_value"] for item in payload["field_updates"]
     }
@@ -891,9 +919,10 @@ def test_existing_marker_reconciles_without_html_report_service(tmp_path):
     store = _seed(tmp_path)
     payload = json.loads(store.list_rows("rca_delivery_effects")[0]["payload_json"])
     remote = Remote()
-    remote.comments.append(
-        {"remote_id": "comment-existing", "content": payload["comment_content"]}
-    )
+    remote.comments.append({
+        "remote_id": "comment-existing",
+        "content": payload["comment_content"],
+    })
     remote.fields = {
         item["field_key"]: item["field_value"] for item in payload["field_updates"]
     }
@@ -978,8 +1007,7 @@ def test_remote_content_matching_accepts_strict_meegle_rendering_only():
     url = "https://192.168.21.217/?ds=foxglove-http&ds.mcapPath=/formal.viz.mcap"
     expected = f"{marker}\nFoxglove 归因报告：{url}\n说明：需人工复核。"
     rendered = (
-        f"{marker[1:-1]}\n\nFoxglove 归因报告：[{url}]({url})"
-        "\n\n说明：需人工复核。\n"
+        f"{marker[1:-1]}\n\nFoxglove 归因报告：[{url}]({url})\n\n说明：需人工复核。\n"
     )
     mismatched = rendered.replace(f"]({url})", "](https://example.invalid/)")
     comments = [
@@ -987,31 +1015,25 @@ def test_remote_content_matching_accepts_strict_meegle_rendering_only():
         {"remote_id": "mismatched", "content": mismatched},
     ]
 
-    matches = dispatcher_module._confirmed_content_matches(
-        comments, marker, expected
-    )
+    matches = dispatcher_module._confirmed_content_matches(comments, marker, expected)
 
     assert [item["remote_id"] for item in matches] == ["rendered"]
 
 
 def test_remote_content_matching_accepts_meegle_numeric_list_rendering():
     marker = "[RCA_DELIVERY:effect-key:artifact-key]"
-    expected = (
-        f"{marker}\n候选结论：目标 ID [1, 67]（活动槽位 [5, 9, 14, 16]）"
-    )
+    expected = f"{marker}\n候选结论：目标 ID [1, 67]（活动槽位 [5, 9, 14, 16]）"
     comments = [
         {
             "remote_id": "rendered",
             "content": (
-                f"{marker[1:-1]}\n\n候选结论："
-                "目标 ID 1, 67（活动槽位 5, 9, 14, 16）\n"
+                f"{marker[1:-1]}\n\n候选结论：目标 ID 1, 67（活动槽位 5, 9, 14, 16）\n"
             ),
         },
         {
             "remote_id": "changed-value",
             "content": (
-                f"{marker[1:-1]}\n\n候选结论："
-                "目标 ID 1, 68（活动槽位 5, 9, 14, 16）\n"
+                f"{marker[1:-1]}\n\n候选结论：目标 ID 1, 68（活动槽位 5, 9, 14, 16）\n"
             ),
         },
         {
@@ -1023,9 +1045,7 @@ def test_remote_content_matching_accepts_meegle_numeric_list_rendering():
         },
     ]
 
-    matches = dispatcher_module._confirmed_content_matches(
-        comments, marker, expected
-    )
+    matches = dispatcher_module._confirmed_content_matches(comments, marker, expected)
 
     assert [item["remote_id"] for item in matches] == ["rendered"]
 
@@ -1052,9 +1072,7 @@ def test_field_update_failure_blocks_comment_and_retries(tmp_path):
 def test_manual_subscription_delivers_issue_comment_and_origin_topic(tmp_path):
     store = _seed_with_thread_subscription(tmp_path)
     thread_remote = ThreadRemote()
-    dispatcher, remote, _clock = _dispatcher(
-        tmp_path, thread_remote=thread_remote
-    )
+    dispatcher, remote, _clock = _dispatcher(tmp_path, thread_remote=thread_remote)
 
     outcomes = [dispatcher.dispatch_one(), dispatcher.dispatch_one()]
 
@@ -1093,9 +1111,7 @@ def test_terminal_manual_delivery_skips_report_http_and_sends_both_effects(tmp_p
         thread_remote=thread_remote,
         verifier=forbidden_verifier,
     )
-    existing_report = foxglove_url(
-        canonical_viz_mcap_path("older-generation-success")
-    )
+    existing_report = foxglove_url(canonical_viz_mcap_path("older-generation-success"))
     assert existing_report
     remote.fields["field_8c912e"] = existing_report
 
@@ -1105,9 +1121,9 @@ def test_terminal_manual_delivery_skips_report_http_and_sends_both_effects(tmp_p
     assert verifier_calls == []
     assert remote.add_calls == 1
     assert remote.update_field_calls == 1
-    assert "归因结论：本次未生成可确认的自动归因。" in remote.fields[
-        "field_9193cb"
-    ]
+    assert (
+        "归因结论：本次自动处理未形成可确认的归因结论" in remote.fields["field_9193cb"]
+    )
     assert "第 1 代" not in remote.fields["field_9193cb"]
     assert "其他代次" not in remote.fields["field_9193cb"]
     assert remote.fields["field_8c912e"] == existing_report
@@ -1163,6 +1179,28 @@ def test_historical_terminal_v1_validates_as_comment_only(tmp_path):
     assert validated.field_updates == ()
     assert validated.artifacts == ()
     assert "field_9193cb" not in json.dumps(legacy.effect_payload)
+
+
+def test_bounded_terminal_v3_replays_oracle_low_at_dispatch_boundary(tmp_path):
+    store = _seed_terminal(tmp_path)
+    claim = store.claim_due_effect(
+        lease_owner="fallback-v3-validator",
+        lease_seconds=60,
+        now=NOW,
+    )
+    assert claim is not None
+    assert claim.payload["schema_version"] == (
+        TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION
+    )
+
+    validated = dispatcher_module._validate_effect(claim)
+
+    assert validated.field_updates == (("field_9193cb", claim.payload["conclusion"]),)
+    assert claim.payload["terminal_class"] == "honest_non_attribution"
+    assert claim.payload["confidence_tier"] == "low"
+    assert claim.payload["quality_oracle"]["schema_version"] == (
+        "pnc_rca_structural_tier_oracle_v2"
+    )
 
 
 def test_profile_readiness_terminal_validates_with_explicit_detail(tmp_path):
@@ -1286,16 +1324,14 @@ def test_older_terminal_generation_is_suppressed_before_any_remote_call(tmp_path
                 "g1q3-rca-effect-v1-" + "7" * 64,
                 newer_delivery_id,
                 old_job["target_key"],
-                json.dumps(
-                    {
-                        "field_updates": [
-                            {
-                                "field_key": "field_9193cb",
-                                "field_value": "newer terminal result",
-                            }
-                        ]
-                    }
-                ),
+                json.dumps({
+                    "field_updates": [
+                        {
+                            "field_key": "field_9193cb",
+                            "field_value": "newer terminal result",
+                        }
+                    ]
+                }),
                 "6" * 64,
                 current,
                 current,
@@ -1307,9 +1343,7 @@ def test_older_terminal_generation_is_suppressed_before_any_remote_call(tmp_path
     outcome = dispatcher.dispatch_one()
 
     assert outcome.status == "superseded"
-    assert outcome.error_code == (
-        "delivery_effect_superseded_by_newer_settled_fields"
-    )
+    assert outcome.error_code == ("delivery_effect_superseded_by_newer_settled_fields")
     assert remote.history == []
     [old_effect] = [
         row
@@ -1328,10 +1362,13 @@ def test_write_boundary_rechecks_newer_settled_terminal_field_effect(tmp_path):
         now=NOW,
     )
     assert claim is not None
-    assert store.suppress_terminal_effect_if_newer_settled_fields(
-        claim=claim,
-        now=NOW,
-    ) is None
+    assert (
+        store.suppress_terminal_effect_if_newer_settled_fields(
+            claim=claim,
+            now=NOW,
+        )
+        is None
+    )
     newer_delivery_id = "g1q3-rca-terminal-delivery-v1-" + "5" * 64
     newer_effect_key = "g1q3-rca-terminal-effect-v1-" + "4" * 64
     current = NOW.isoformat()
@@ -1375,16 +1412,14 @@ def test_write_boundary_rechecks_newer_settled_terminal_field_effect(tmp_path):
                 newer_effect_key,
                 newer_delivery_id,
                 claim.target_key,
-                json.dumps(
-                    {
-                        "field_updates": [
-                            {
-                                "field_key": "field_9193cb",
-                                "field_value": "newer terminal result",
-                            }
-                        ]
-                    }
-                ),
+                json.dumps({
+                    "field_updates": [
+                        {
+                            "field_key": "field_9193cb",
+                            "field_value": "newer terminal result",
+                        }
+                    ]
+                }),
                 "2" * 64,
                 current,
                 current,
@@ -1753,9 +1788,7 @@ def test_thread_circuit_opens_without_blocking_issue_comment(tmp_path):
         "error_code": "feishu_auth_failed",
         "error": "token expired",
     }
-    dispatcher, remote, _clock = _dispatcher(
-        tmp_path, thread_remote=thread_remote
-    )
+    dispatcher, remote, _clock = _dispatcher(tmp_path, thread_remote=thread_remote)
 
     first = dispatcher.dispatch_one()
     second = dispatcher.dispatch_one()
@@ -1764,17 +1797,14 @@ def test_thread_circuit_opens_without_blocking_issue_comment(tmp_path):
     assert first.error_code == "feishu_auth_failed"
     assert second.status == "succeeded"
     assert remote.add_calls == 1
-    assert store.delivery_dispatcher_circuit(
-        "feishu_thread_reply"
-    ).is_open is True
-    assert store.delivery_dispatcher_circuit(
-        "feishu_issue_comment"
-    ).is_open is False
+    assert store.delivery_dispatcher_circuit("feishu_thread_reply").is_open is True
+    assert store.delivery_dispatcher_circuit("feishu_issue_comment").is_open is False
 
 
 def test_delivery_does_not_fetch_supporting_html_before_foxglove_comment(tmp_path):
     _seed(tmp_path, bundle_payload=_web_bundle_payload())
     calls = []
+
     def verifier(url, size, sha256):
         calls.append((url, size, sha256))
         return _verified_report(url, size, sha256)
@@ -1798,9 +1828,7 @@ def test_dispatcher_rejects_report_url_for_another_submission_before_http(tmp_pa
     store = _seed(tmp_path)
     claim = store.claim_due_effect(lease_owner="worker-1", now=NOW)
     assert claim is not None
-    bad_url = build_report_url(
-        "g1q3-rca-s1-" + "f" * 64, claim.artifact_set_id
-    )
+    bad_url = build_report_url("g1q3-rca-s1-" + "f" * 64, claim.artifact_set_id)
     tampered = replace(
         claim,
         report_url=bad_url,
@@ -2013,12 +2041,9 @@ def test_effect_lease_keeper_fences_contender_past_original_lease(
 
     def observed_extend(**kwargs):
         result = original_extend(**kwargs)
-        if (
-            threading.current_thread().name.startswith(
-                f"{dispatcher_module.SERVICE_LABEL}-effect-lease-"
-            )
-            and kwargs["now"] >= NOW + timedelta(seconds=80)
-        ):
+        if threading.current_thread().name.startswith(
+            f"{dispatcher_module.SERVICE_LABEL}-effect-lease-"
+        ) and kwargs["now"] >= NOW + timedelta(seconds=80):
             renewed_after_clock_advance.set()
         return result
 
@@ -2079,11 +2104,8 @@ def test_effect_lease_keeper_failure_after_write_yields_lease_lost(
     original_extend = dispatcher.store.extend_effect_lease
 
     def fail_keeper_after_write(**kwargs):
-        if (
-            write_entered.is_set()
-            and threading.current_thread().name.startswith(
-                f"{dispatcher_module.SERVICE_LABEL}-effect-lease-"
-            )
+        if write_entered.is_set() and threading.current_thread().name.startswith(
+            f"{dispatcher_module.SERVICE_LABEL}-effect-lease-"
         ):
             keeper_failed.set()
             raise StaleDeliveryEffectLeaseError("injected keeper fence loss")
@@ -3029,18 +3051,22 @@ def test_meegle_adapter_reads_and_updates_only_attribution_fields():
     def runner(args):
         calls.append(args)
         if args[:2] == ["workitem", "get"]:
-            return 0, json.dumps({
-                "work_item_fields": [
-                    {
-                        "key": "field_9193cb",
-                        "value": "candidate conclusion",
-                    },
-                    {
-                        "key": "field_8c912e",
-                        "value": {"link": "http://report.example/index.html"},
-                    },
-                ]
-            }), ""
+            return (
+                0,
+                json.dumps({
+                    "work_item_fields": [
+                        {
+                            "key": "field_9193cb",
+                            "value": "candidate conclusion",
+                        },
+                        {
+                            "key": "field_8c912e",
+                            "value": {"link": "http://report.example/index.html"},
+                        },
+                    ]
+                }),
+                "",
+            )
         if args[:2] == ["workitem", "update"]:
             return 0, json.dumps({"updated": True}), ""
         raise AssertionError(args)
@@ -3091,33 +3117,48 @@ def test_meegle_adapter_combines_exact_fields_with_all_full_comment_bodies():
     def runner(args):
         calls.append(args)
         if args[:2] == ["workitem", "get"]:
-            return 0, json.dumps({
-                "work_item_fields": [
-                    {"key": "field_9193cb", "value": "root cause"},
-                    {
-                        "key": "field_8c912e",
-                        "value": {"link": "https://rca.example/report/index.html"},
-                    },
-                ]
-            }), ""
+            return (
+                0,
+                json.dumps({
+                    "work_item_fields": [
+                        {"key": "field_9193cb", "value": "root cause"},
+                        {
+                            "key": "field_8c912e",
+                            "value": {"link": "https://rca.example/report/index.html"},
+                        },
+                    ]
+                }),
+                "",
+            )
         if args[:2] == ["comment", "list"]:
             page = int(args[args.index("--page-num") + 1])
             if page == 1:
-                return 0, json.dumps({
+                return (
+                    0,
+                    json.dumps({
+                        "comments": [
+                            {
+                                "comment_id": "c-unrelated",
+                                "content": "full unrelated body",
+                            }
+                        ],
+                        "has_more": True,
+                    }),
+                    "",
+                )
+            return (
+                0,
+                json.dumps({
                     "comments": [
-                        {"comment_id": "c-unrelated", "content": "full unrelated body"}
+                        {
+                            "comment_id": "c-rca",
+                            "content": f"canonical report\n{marker}\nfull tail",
+                        }
                     ],
-                    "has_more": True,
-                }), ""
-            return 0, json.dumps({
-                "comments": [
-                    {
-                        "comment_id": "c-rca",
-                        "content": f"canonical report\n{marker}\nfull tail",
-                    }
-                ],
-                "has_more": False,
-            }), ""
+                    "has_more": False,
+                }),
+                "",
+            )
         raise AssertionError(args)
 
     result = MeegleIssueCommentAdapter(runner).get_fields_and_comments(
@@ -3155,12 +3196,16 @@ def test_meegle_adapter_combines_exact_fields_with_all_full_comment_bodies():
 def test_meegle_combined_readback_never_returns_partial_success():
     def runner(args):
         if args[:2] == ["workitem", "get"]:
-            return 0, json.dumps({
-                "work_item_fields": [
-                    {"key": "field_9193cb", "value": "root cause"},
-                    {"key": "field_8c912e", "value": "https://rca.example/report"},
-                ]
-            }), ""
+            return (
+                0,
+                json.dumps({
+                    "work_item_fields": [
+                        {"key": "field_9193cb", "value": "root cause"},
+                        {"key": "field_8c912e", "value": "https://rca.example/report"},
+                    ]
+                }),
+                "",
+            )
         if args[:2] == ["comment", "list"]:
             return 1, "", "permission denied"
         raise AssertionError(args)
@@ -3211,29 +3256,37 @@ def test_meegle_adapter_allows_terminal_result_only_but_never_report_only():
     def runner(args):
         calls.append(args)
         if args[:2] == ["workitem", "get"]:
-            return 0, json.dumps({
-                "work_item_fields": [
-                    {"key": "field_9193cb", "value": ""},
-                ]
-            }), ""
+            return (
+                0,
+                json.dumps({
+                    "work_item_fields": [
+                        {"key": "field_9193cb", "value": ""},
+                    ]
+                }),
+                "",
+            )
         if args[:2] == ["workitem", "update"]:
             return 0, json.dumps({"updated": True}), ""
         raise AssertionError(args)
 
     adapter = MeegleIssueCommentAdapter(runner)
-    assert adapter.get_fields(
-        "t03o4q", "7041712812", ("field_9193cb",)
-    ) == {"success": True, "fields": {"field_9193cb": ""}}
+    assert adapter.get_fields("t03o4q", "7041712812", ("field_9193cb",)) == {
+        "success": True,
+        "fields": {"field_9193cb": ""},
+    }
     assert adapter.update_fields(
         "t03o4q",
         "7041712812",
         (("field_9193cb", "自动归因未完成（非归因结论）"),),
     ) == {"success": True}
-    assert adapter.update_fields(
-        "t03o4q",
-        "7041712812",
-        (("field_8c912e", "https://invalid.example/report"),),
-    )["error_code"] == "feishu_field_allowlist_invalid"
+    assert (
+        adapter.update_fields(
+            "t03o4q",
+            "7041712812",
+            (("field_8c912e", "https://invalid.example/report"),),
+        )["error_code"]
+        == "feishu_field_allowlist_invalid"
+    )
     assert [item[:2] for item in calls] == [
         ["workitem", "get"],
         ["workitem", "update"],
@@ -3246,27 +3299,35 @@ def test_terminal_result_only_accepts_omitted_empty_field_with_full_metadata():
     def runner(args):
         calls.append(args)
         if args[:2] == ["workitem", "get"]:
-            return 0, json.dumps({
-                "work_item_attribute": {
-                    "work_item_id": "7041712812",
-                    "work_item_type": {"key": "issue", "name": "Issue"},
-                }
-            }), ""
+            return (
+                0,
+                json.dumps({
+                    "work_item_attribute": {
+                        "work_item_id": "7041712812",
+                        "work_item_type": {"key": "issue", "name": "Issue"},
+                    }
+                }),
+                "",
+            )
         if args[:2] == ["workitem", "meta-fields"]:
-            return 0, json.dumps({
-                "list": [
-                    {
-                        "field_key": "field_9193cb",
-                        "field_name": "归因结果",
-                        "field_type": "text",
-                    },
-                    {
-                        "field_key": "field_8c912e",
-                        "field_name": "归因报告",
-                        "field_type": "link",
-                    },
-                ]
-            }), ""
+            return (
+                0,
+                json.dumps({
+                    "list": [
+                        {
+                            "field_key": "field_9193cb",
+                            "field_name": "归因结果",
+                            "field_type": "text",
+                        },
+                        {
+                            "field_key": "field_8c912e",
+                            "field_name": "归因报告",
+                            "field_type": "link",
+                        },
+                    ]
+                }),
+                "",
+            )
         raise AssertionError(args)
 
     result = MeegleIssueCommentAdapter(runner).get_fields(
@@ -3285,27 +3346,35 @@ def test_meegle_adapter_verifies_omitted_attribution_fields_are_empty():
     def runner(args):
         calls.append(args)
         if args[:2] == ["workitem", "get"]:
-            return 0, json.dumps({
-                "work_item_attribute": {
-                    "work_item_id": "7041712812",
-                    "work_item_type": {"key": "issue", "name": "Issue"},
-                }
-            }), ""
+            return (
+                0,
+                json.dumps({
+                    "work_item_attribute": {
+                        "work_item_id": "7041712812",
+                        "work_item_type": {"key": "issue", "name": "Issue"},
+                    }
+                }),
+                "",
+            )
         if args[:2] == ["workitem", "meta-fields"]:
-            return 0, json.dumps({
-                "list": [
-                    {
-                        "field_key": "field_9193cb",
-                        "field_name": "归因结果",
-                        "field_type": "text",
-                    },
-                    {
-                        "field_key": "field_8c912e",
-                        "field_name": "归因报告",
-                        "field_type": "link",
-                    },
-                ]
-            }), ""
+            return (
+                0,
+                json.dumps({
+                    "list": [
+                        {
+                            "field_key": "field_9193cb",
+                            "field_name": "归因结果",
+                            "field_type": "text",
+                        },
+                        {
+                            "field_key": "field_8c912e",
+                            "field_name": "归因报告",
+                            "field_type": "link",
+                        },
+                    ]
+                }),
+                "",
+            )
         raise AssertionError(args)
 
     result = MeegleIssueCommentAdapter(runner).get_fields(
@@ -3339,20 +3408,30 @@ def test_meegle_adapter_verifies_omitted_attribution_fields_are_empty():
 def test_meegle_adapter_rejects_omitted_fields_without_exact_metadata():
     def runner(args):
         if args[:2] == ["workitem", "get"]:
-            return 0, json.dumps({
-                "work_item_attribute": {
-                    "work_item_id": "7041712812",
-                    "work_item_type": {"key": "issue", "name": "Issue"},
-                }
-            }), ""
+            return (
+                0,
+                json.dumps({
+                    "work_item_attribute": {
+                        "work_item_id": "7041712812",
+                        "work_item_type": {"key": "issue", "name": "Issue"},
+                    }
+                }),
+                "",
+            )
         if args[:2] == ["workitem", "meta-fields"]:
-            return 0, json.dumps({
-                "list": [{
-                    "field_key": "field_9193cb",
-                    "field_name": "归因结果",
-                    "field_type": "text",
-                }]
-            }), ""
+            return (
+                0,
+                json.dumps({
+                    "list": [
+                        {
+                            "field_key": "field_9193cb",
+                            "field_name": "归因结果",
+                            "field_type": "text",
+                        }
+                    ]
+                }),
+                "",
+            )
         raise AssertionError(args)
 
     result = MeegleIssueCommentAdapter(runner).get_fields(

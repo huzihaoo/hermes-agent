@@ -36,6 +36,7 @@ from gateway.pnc_rca_delivery_contract import (
     DELIVERY_THREAD_EFFECT_KIND,
     TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
     TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1,
+    TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
     TERMINAL_DELIVERY_OUTCOMES,
     DeliveryContractError,
     MAX_DELIVERY_ARTIFACT_BYTES,
@@ -57,6 +58,7 @@ from gateway.pnc_rca_delivery_contract import (
 )
 from gateway.pnc_rca_quality_oracle import (
     CANDIDATE_HYPOTHESIS,
+    HONEST_NON_ATTRIBUTION,
     TierOracleConflict,
     evaluate_structural_tier,
     require_publishable,
@@ -97,8 +99,8 @@ MAX_EFFECT_AGE_SECONDS = 86_400
 MEEGLE_COMMENT_PAGE_TIMEOUT_SECONDS = 12
 MAX_MEEGLE_COMMENT_PAGES = 5
 MAX_MEEGLE_COMMENTS = 500
-MAX_EXTERNAL_BOUNDARY_TIMEOUT_SECONDS = (
-    MEEGLE_COMMENT_PAGE_TIMEOUT_SECONDS * (MAX_MEEGLE_COMMENT_PAGES + 1)
+MAX_EXTERNAL_BOUNDARY_TIMEOUT_SECONDS = MEEGLE_COMMENT_PAGE_TIMEOUT_SECONDS * (
+    MAX_MEEGLE_COMMENT_PAGES + 1
 )
 LEASE_BOUNDARY_MARGIN_SECONDS = 15
 EFFECT_LEASE_RENEW_INTERVAL_SECONDS = 10
@@ -115,9 +117,11 @@ _FEISHU_ISSUE_URL_RE = re.compile(
 _PROJECT_SIMPLE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _VIZ_REPORT_STATUSES = frozenset({"report_ready"})
-_HTML_REPORT_STATUSES = frozenset(
-    {"html_delivery_ready", "report_generated_need_review", "report_ready"}
-)
+_HTML_REPORT_STATUSES = frozenset({
+    "html_delivery_ready",
+    "report_generated_need_review",
+    "report_ready",
+})
 _CIRCUIT_CODES = frozenset({
     "feishu_auth_failed",
     "feishu_permission_denied",
@@ -132,9 +136,7 @@ _CIRCUIT_CODES = frozenset({
 ListComments = Callable[[str, str], Mapping[str, Any]]
 AddComment = Callable[[str, str, str], Mapping[str, Any]]
 GetFields = Callable[[str, str, tuple[str, ...]], Mapping[str, Any]]
-UpdateFields = Callable[
-    [str, str, tuple[tuple[str, str], ...]], Mapping[str, Any]
-]
+UpdateFields = Callable[[str, str, tuple[tuple[str, str], ...]], Mapping[str, Any]]
 ListThreadReplies = Callable[[str, str], Mapping[str, Any]]
 AddThreadReply = Callable[[str, str, str, str], Mapping[str, Any]]
 ReportVerifier = Callable[[str, int, str], Mapping[str, Any]]
@@ -291,9 +293,7 @@ class _EffectLeaseKeeper:
         self._stop.set()
         if not self._started:
             return
-        self._thread.join(
-            timeout=max(1.0, self._interval_seconds + 6.0)
-        )
+        self._thread.join(timeout=max(1.0, self._interval_seconds + 6.0))
         if self._thread.is_alive():
             raise RuntimeError("delivery_effect_lease_keeper_stop_timeout")
 
@@ -316,9 +316,7 @@ def _boolean(env: Mapping[str, str], name: str, default: bool = False) -> bool:
     raise ValueError(f"{name} must be true or false")
 
 
-def _strict_boolean(
-    env: Mapping[str, str], name: str, default: bool = False
-) -> bool:
+def _strict_boolean(env: Mapping[str, str], name: str, default: bool = False) -> bool:
     value = str(env.get(name, "true" if default else "false")).strip().lower()
     if value == "true":
         return True
@@ -490,12 +488,8 @@ class DispatcherConfig:
             "reconciliation_visibility_grace_seconds": (
                 self.reconciliation_visibility_grace_seconds
             ),
-            "reconciliation_min_missing_reads": (
-                self.reconciliation_min_missing_reads
-            ),
-            "recovery_write_interval_seconds": (
-                self.recovery_write_interval_seconds
-            ),
+            "reconciliation_min_missing_reads": (self.reconciliation_min_missing_reads),
+            "recovery_write_interval_seconds": (self.recovery_write_interval_seconds),
             "quarantine_baseline_path": str(self.quarantine_baseline_path),
             "quarantine_baseline_sha256": self.quarantine_baseline_sha256,
             "quarantine_release_id": self.quarantine_release_id,
@@ -1185,9 +1179,8 @@ class MeegleIssueCommentAdapter:
             if rc != 0:
                 return _error_payload(rc, out, err)
             metadata = _json_stdout(out)
-            if (
-                isinstance(metadata, Mapping)
-                and isinstance(metadata.get("data"), Mapping)
+            if isinstance(metadata, Mapping) and isinstance(
+                metadata.get("data"), Mapping
             ):
                 metadata = metadata["data"]
             metadata_rows = (
@@ -1268,8 +1261,7 @@ class MeegleIssueCommentAdapter:
                 "error_code": "feishu_field_allowlist_invalid",
             }
         fields = [
-            {"field_key": key, "field_value": value}
-            for key, value in field_updates
+            {"field_key": key, "field_value": value} for key, value in field_updates
         ]
         rc, out, err = self.runner([
             "workitem",
@@ -1376,7 +1368,7 @@ class FeishuThreadReplyAdapter:
         value = str(thread_id or "").strip()
         if not value.startswith("topic:"):
             raise ValueError("thread_id must be a topic root reference")
-        anchor = value[len("topic:"):].strip()
+        anchor = value[len("topic:") :].strip()
         if not _REMOTE_ID_RE.fullmatch(anchor):
             raise ValueError("thread_id contains an invalid topic root")
         return anchor
@@ -1457,7 +1449,8 @@ class FeishuThreadReplyAdapter:
             if page_token:
                 queries.append(("page_token", page_token))
             request = (
-                BaseRequest.builder()
+                BaseRequest
+                .builder()
                 .http_method(HttpMethod.GET)
                 .uri("/open-apis/im/v1/messages")
                 .queries(queries)
@@ -1641,9 +1634,7 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
     payload = claim.payload
     if is_adjudication_effect_payload(payload):
         try:
-            marker, content, field_updates = validate_adjudication_effect_claim(
-                claim
-            )
+            marker, content, field_updates = validate_adjudication_effect_claim(claim)
         except ConclusionAdjudicationError as exc:
             raise DeliveryContractError(str(exc)) from exc
         return ValidatedEffect(
@@ -1683,15 +1674,33 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
             "output_cap": "L1",
         }
         exact_payload_keys = {
-            "schema_version", "delivery_id", "effect_kind", "target_key",
-            "project_key", "project_simple_name", "work_item_type_key",
-            "work_item_id", "issue_url",
-            "artifact_set_id", "report_url", "report_cifs_path", "report_status",
-            "viz_mcap_vm", "foxglove_url",
-            "requires_human_review", "conclusion", "effect_key",
-            "semantic_payload_sha256", "marker", "comment_content",
-            "field_updates", "terminal_class", "confidence_tier",
-            "quality_oracle", "quality_oracle_sha256", *report_link_fields,
+            "schema_version",
+            "delivery_id",
+            "effect_kind",
+            "target_key",
+            "project_key",
+            "project_simple_name",
+            "work_item_type_key",
+            "work_item_id",
+            "issue_url",
+            "artifact_set_id",
+            "report_url",
+            "report_cifs_path",
+            "report_status",
+            "viz_mcap_vm",
+            "foxglove_url",
+            "requires_human_review",
+            "conclusion",
+            "effect_key",
+            "semantic_payload_sha256",
+            "marker",
+            "comment_content",
+            "field_updates",
+            "terminal_class",
+            "confidence_tier",
+            "quality_oracle",
+            "quality_oracle_sha256",
+            *report_link_fields,
         }
         content_field = "comment_content"
     else:
@@ -1707,17 +1716,41 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
             "output_cap": payload.get("output_cap"),
         }
         exact_payload_keys = {
-            "schema_version", "delivery_id", "effect_kind", "target_key",
-            "project_key", "project_simple_name", "work_item_type_key",
-            "work_item_id", "issue_url",
-            "artifact_set_id", "report_url", "report_cifs_path", "report_status",
-            "viz_mcap_vm", "foxglove_url",
-            "requires_human_review", "conclusion", "platform", "chat_id",
-            "thread_id", "reply_anchor_message_id", "source_message_id",
-            "requester_id", "reply_in_thread", "output_cap", "effect_key",
-            "semantic_payload_sha256", "marker", "idempotency_uuid",
-            "message_content", "field_updates", "terminal_class",
-            "confidence_tier", "quality_oracle", "quality_oracle_sha256",
+            "schema_version",
+            "delivery_id",
+            "effect_kind",
+            "target_key",
+            "project_key",
+            "project_simple_name",
+            "work_item_type_key",
+            "work_item_id",
+            "issue_url",
+            "artifact_set_id",
+            "report_url",
+            "report_cifs_path",
+            "report_status",
+            "viz_mcap_vm",
+            "foxglove_url",
+            "requires_human_review",
+            "conclusion",
+            "platform",
+            "chat_id",
+            "thread_id",
+            "reply_anchor_message_id",
+            "source_message_id",
+            "requester_id",
+            "reply_in_thread",
+            "output_cap",
+            "effect_key",
+            "semantic_payload_sha256",
+            "marker",
+            "idempotency_uuid",
+            "message_content",
+            "field_updates",
+            "terminal_class",
+            "confidence_tier",
+            "quality_oracle",
+            "quality_oracle_sha256",
             *report_link_fields,
         }
         content_field = "message_content"
@@ -1771,11 +1804,8 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
     if payload.get("report_cifs_path") != expected_report_cifs_path:
         raise DeliveryContractError("delivery_report_cifs_identity_mismatch")
     if has_viz_surface:
-        if (
-            payload.get("viz_mcap_vm") != expected_viz_path
-            or not validate_foxglove_url(
-                payload.get("foxglove_url"), payload.get("viz_mcap_vm")
-            )
+        if payload.get("viz_mcap_vm") != expected_viz_path or not validate_foxglove_url(
+            payload.get("foxglove_url"), payload.get("viz_mcap_vm")
         ):
             raise DeliveryContractError("delivery_effect_foxglove_identity_mismatch")
     elif payload.get("viz_mcap_vm") or payload.get("foxglove_url"):
@@ -1783,11 +1813,9 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
     if payload.get("report_link_kind") != DELIVERY_REPORT_LINK_KIND:
         raise DeliveryContractError("delivery_effect_report_link_kind_invalid")
     expected_human_review = payload.get("terminal_class") == CANDIDATE_HYPOTHESIS
-    if (
-        payload.get("requires_human_review") is not expected_human_review
-        or payload.get("report_status")
-        not in (_VIZ_REPORT_STATUSES if has_viz_surface else _HTML_REPORT_STATUSES)
-    ):
+    if payload.get("requires_human_review") is not expected_human_review or payload.get(
+        "report_status"
+    ) not in (_VIZ_REPORT_STATUSES if has_viz_surface else _HTML_REPORT_STATUSES):
         raise DeliveryContractError("delivery_effect_review_boundary_invalid")
     expected_report_link = claim.report_url
     expected_field_updates = [
@@ -1807,9 +1835,7 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         stored_artifacts=claim.artifacts,
         expected_artifact_set_id=claim.artifact_set_id,
     )
-    semantic_sha = compute_delivery_effect_payload_sha256(
-        payload, claim.effect_kind
-    )
+    semantic_sha = compute_delivery_effect_payload_sha256(payload, claim.effect_kind)
     if (
         semantic_sha != claim.payload_sha256
         or payload.get("semantic_payload_sha256") != semantic_sha
@@ -1917,7 +1943,9 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
                 str(payload.get("conclusion") or ""),
             ),
             (RCA_REPORT_FIELD_KEY, str(expected_report_link or "")),
-        ) if claim.effect_kind == DELIVERY_EFFECT_KIND else (),
+        )
+        if claim.effect_kind == DELIVERY_EFFECT_KIND
+        else (),
         chat_id=str(payload.get("chat_id") or ""),
         thread_id=str(payload.get("thread_id") or ""),
         idempotency_uuid=str(payload.get("idempotency_uuid") or ""),
@@ -1943,6 +1971,9 @@ def _validate_terminal_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
     elif schema_version == TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION:
         diagnostic_code = str(claim.contract.get("diagnostic_code") or "")
         diagnostic_detail = str(claim.contract.get("diagnostic_detail") or "")
+    elif schema_version == TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION:
+        diagnostic_code = ""
+        diagnostic_detail = ""
     else:
         raise DeliveryContractError("terminal_delivery_schema_unsupported")
     if schema_version == TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1:
@@ -1959,6 +1990,11 @@ def _validate_terminal_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         error_code=claim.terminal_error_code,
         diagnostic_code=diagnostic_code,
         diagnostic_detail=diagnostic_detail,
+        terminal_fallback=(
+            claim.contract.get("terminal_fallback")
+            if schema_version == TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION
+            else None
+        ),
         schema_version=schema_version,
     )
     if claim.contract != primary.contract:
@@ -2016,17 +2052,52 @@ def _validate_terminal_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
     marker = str(payload.get("marker") or "")
     if not content or content.splitlines().count(marker) != 1:
         raise DeliveryContractError("terminal_delivery_effect_marker_invalid")
+    if schema_version == TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION:
+        public_contract = claim.contract.get("public_contract")
+        replayed_oracle = evaluate_structural_tier(
+            public_contract if isinstance(public_contract, Mapping) else {},
+            publication_text=f"{payload.get('conclusion') or ''}\n{content}",
+        )
+        try:
+            require_publishable(replayed_oracle)
+        except TierOracleConflict as exc:
+            raise DeliveryContractError(
+                "classification_conflict",
+                ",".join(exc.result.violations)
+                or f"{exc.result.terminal_class}_not_publishable",
+            ) from exc
+        if (
+            replayed_oracle.schema_version != "pnc_rca_structural_tier_oracle_v2"
+            or replayed_oracle.terminal_class != HONEST_NON_ATTRIBUTION
+            or replayed_oracle.confidence_tier != "low"
+            or payload.get("terminal_class") != replayed_oracle.terminal_class
+            or payload.get("confidence_tier") != replayed_oracle.confidence_tier
+            or payload.get("quality_oracle") != replayed_oracle.as_dict()
+            or payload.get("quality_oracle_sha256") != replayed_oracle.sha256()
+        ):
+            raise DeliveryContractError(
+                "classification_conflict",
+                "terminal fallback quality oracle replay mismatch",
+            )
     if claim.effect_kind == DELIVERY_THREAD_EFFECT_KIND:
         expected_uuid = delivery_effect_idempotency_uuid(claim.effect_key)
         if payload.get("idempotency_uuid") != expected_uuid:
             raise DeliveryContractError("delivery_effect_idempotency_invalid")
     field_updates: tuple[tuple[str, str], ...] = ()
-    if (
-        claim.effect_kind == DELIVERY_EFFECT_KIND
-        and schema_version == TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION
-    ):
+    if claim.effect_kind == DELIVERY_EFFECT_KIND and schema_version in {
+        TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
+        TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
+    }:
         field_updates = (
-            (RCA_RESULT_FIELD_KEY, primary.diagnostic_result),
+            (
+                RCA_RESULT_FIELD_KEY,
+                (
+                    str(primary.effect_payload.get("conclusion") or "")
+                    if schema_version
+                    == TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION
+                    else primary.diagnostic_result
+                ),
+            ),
         )
     return ValidatedEffect(
         effect_kind=claim.effect_kind,
@@ -2190,7 +2261,9 @@ def _canonical_remote_content(content: str, marker: str) -> str | None:
     lines = [line for line in content.splitlines() if line != ""]
     if not lines:
         return None
-    remote_marker = marker[1:-1] if marker.startswith("[") and marker.endswith("]") else marker
+    remote_marker = (
+        marker[1:-1] if marker.startswith("[") and marker.endswith("]") else marker
+    )
     first_line = lines[0]
     if (
         first_line == marker
@@ -2233,8 +2306,7 @@ def _confirmed_content_matches(
         item
         for item in _marker_matches(comments, marker)
         if (
-            (remote := _canonical_remote_content(item["content"], marker))
-            is not None
+            (remote := _canonical_remote_content(item["content"], marker)) is not None
             and _canonical_meegle_numeric_lists(remote) == canonical_expected
         )
     ]
@@ -2297,8 +2369,7 @@ class DeliveryDispatcher:
         keeper = self._active_effect_lease_keeper
         if (
             keeper is None
-            or self._active_effect_lease_identity
-            != self._claim_lease_identity(claim)
+            or self._active_effect_lease_identity != self._claim_lease_identity(claim)
         ):
             raise RuntimeError("delivery_effect_lease_keeper_not_active")
         return keeper
@@ -2320,8 +2391,7 @@ class DeliveryDispatcher:
             lambda: self._extend_effect_lease(claim),
             interval_seconds=self._effect_lease_renew_interval_seconds,
             thread_name=(
-                f"{SERVICE_LABEL}-effect-lease-{claim.fence}-"
-                f"{claim.lease_token[:8]}"
+                f"{SERVICE_LABEL}-effect-lease-{claim.fence}-{claim.lease_token[:8]}"
             ),
             on_background_renewal=lambda: setattr(
                 self.stats,
@@ -2723,8 +2793,9 @@ class DeliveryDispatcher:
                 receipt={
                     "source": error_code,
                     "existing_result_sha256": hashlib.sha256(
-                        str(before_fields.get(RCA_RESULT_FIELD_KEY) or "")
-                        .encode("utf-8")
+                        str(before_fields.get(RCA_RESULT_FIELD_KEY) or "").encode(
+                            "utf-8"
+                        )
                     ).hexdigest(),
                     "proposed_result_sha256": hashlib.sha256(
                         dict(validated.field_updates)
@@ -2827,12 +2898,8 @@ class DeliveryDispatcher:
             and not is_adjudication_effect_payload(claim.payload)
             and _quality_regression_guard(before_fields, validated.field_updates)
         ):
-            return self._suppress_quality_regression(
-                claim, before_fields, validated
-            )
-        fields_match = _field_updates_match(
-            before_fields, validated.field_updates
-        )
+            return self._suppress_quality_regression(claim, before_fields, validated)
+        fields_match = _field_updates_match(before_fields, validated.field_updates)
         marker_matches = _marker_matches(comments, validated.marker)
         if len(marker_matches) > 1:
             return self._quarantine(
@@ -2992,9 +3059,7 @@ class DeliveryDispatcher:
                     effect_key=claim.effect_key,
                     delivery_id=claim.delivery_id,
                     attempt=claim.attempt,
-                    error_code=(
-                        "delivery_effect_superseded_by_newer_settled_fields"
-                    ),
+                    error_code=("delivery_effect_superseded_by_newer_settled_fields"),
                 )
         if not fields_match:
             try:
@@ -3156,9 +3221,7 @@ class DeliveryDispatcher:
                 detail="delivery marker exists without the canonical effect content",
             )
         confirmed = [
-            item
-            for item in after_content_matches
-            if item["remote_id"] == remote_id
+            item for item in after_content_matches if item["remote_id"] == remote_id
         ]
         if len(confirmed) != 1:
             return self._retry(
@@ -3184,9 +3247,7 @@ class DeliveryDispatcher:
         if final_fields is None or not _field_updates_match(
             final_fields, validated.field_updates
         ):
-            detail = str(
-                final_field_result.get("error") or "field readback mismatch"
-            )
+            detail = str(final_field_result.get("error") or "field readback mismatch")
             return self._retry(
                 claim,
                 error_code="feishu_field_final_confirmation_mismatch",
@@ -3265,9 +3326,7 @@ class HealthReporter:
                 self.config.quarantine_baseline_sha256
             ),
             quarantine_release_id=self.config.quarantine_release_id,
-            quarantine_bootstrap_epoch_id=(
-                self.config.quarantine_bootstrap_epoch_id
-            ),
+            quarantine_bootstrap_epoch_id=(self.config.quarantine_bootstrap_epoch_id),
             quarantine_active_release_binding_path=(
                 self.config.quarantine_active_release_binding_path
             ),
@@ -3285,9 +3344,7 @@ class HealthReporter:
                     "lease_lost",
                 }
                 and not any(value.is_open for value in circuits.values())
-                and (
-                    not self.config.enabled or store_health.get("ok") is True
-                )
+                and (not self.config.enabled or store_health.get("ok") is True)
             ),
             "state": state,
             "started_at": self.started_at,
@@ -3307,8 +3364,7 @@ class HealthReporter:
             "last_outcome": asdict(last_outcome) if last_outcome else None,
             "circuit": asdict(circuit),
             "circuits": {
-                effect_kind: asdict(value)
-                for effect_kind, value in circuits.items()
+                effect_kind: asdict(value) for effect_kind, value in circuits.items()
             },
             "store": store_health,
         }
@@ -3505,9 +3561,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     if args.clear_circuit:
-        circuit = store.close_delivery_dispatcher_circuit(
-            effect_kind=args.effect_kind
-        )
+        circuit = store.close_delivery_dispatcher_circuit(effect_kind=args.effect_kind)
         print(json.dumps({"ok": True, "circuit": asdict(circuit)}, ensure_ascii=False))
         return 0
     if args.dry_run:

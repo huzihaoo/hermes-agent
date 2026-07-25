@@ -36,6 +36,7 @@ from gateway.pnc_rca_delivery_contract import (
     DELIVERY_EFFECT_SCHEMA_VERSION,
     TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
     TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1,
+    TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
 )
 
 
@@ -46,9 +47,12 @@ FORBIDDEN_RUNTIME_MARKERS = (
     "/runtime/venvs/",
     "/runtime/hermes-live",
 )
-UNRESOLVED_EFFECT_STATUSES = frozenset(
-    {"pending", "claimed", "retry_wait", "uncertain"}
-)
+UNRESOLVED_EFFECT_STATUSES = frozenset({
+    "pending",
+    "claimed",
+    "retry_wait",
+    "uncertain",
+})
 
 
 def _error(code: str, **detail: Any) -> dict[str, Any]:
@@ -375,13 +379,11 @@ def audit_versioned_stable_entrypoints(
         wrapper_paths = sorted(wrapper_source.iterdir())
     except OSError:
         wrapper_paths = []
-        pairs.append(
-            (
-                "scripts/wrappers",
-                home / "bin" / ".pnc-wrapper-source-missing",
-                wrapper_source,
-            )
-        )
+        pairs.append((
+            "scripts/wrappers",
+            home / "bin" / ".pnc-wrapper-source-missing",
+            wrapper_source,
+        ))
     else:
         pairs.extend(
             (f"wrapper:{path.name}", home / "bin" / path.name, path)
@@ -460,15 +462,13 @@ def audit_stable_targets(
             evidence.append({"label": label, "errors": [exc.code]})
             errors.append(_error(exc.code, label=label))
             continue
-        evidence.append(
-            {
-                "label": label,
-                "script": resolved["script"],
-                "script_sha256": resolved["script_sha256"],
-                "runtime_commit": resolved["runtime_commit"],
-                "errors": [],
-            }
-        )
+        evidence.append({
+            "label": label,
+            "script": resolved["script"],
+            "script_sha256": resolved["script_sha256"],
+            "runtime_commit": resolved["runtime_commit"],
+            "errors": [],
+        })
     return evidence, errors
 
 
@@ -489,8 +489,12 @@ def audit_release_golden_registry(
         errors.append(_error("pnc_release_manifest_unreadable_for_golden"))
     faces = manifest.get("face_git_bindings") if isinstance(manifest, Mapping) else {}
     pipeline = faces.get("g1q3_rca_pipeline") if isinstance(faces, Mapping) else {}
-    active_commit = str(pipeline.get("commit") or "") if isinstance(pipeline, Mapping) else ""
-    active_tree = str(pipeline.get("tree") or "") if isinstance(pipeline, Mapping) else ""
+    active_commit = (
+        str(pipeline.get("commit") or "") if isinstance(pipeline, Mapping) else ""
+    )
+    active_tree = (
+        str(pipeline.get("tree") or "") if isinstance(pipeline, Mapping) else ""
+    )
     if (
         observed.get("pipeline_commit") != active_commit
         or observed.get("pipeline_tree") != active_tree
@@ -573,6 +577,7 @@ def audit_unresolved_effect_schema_compatibility(
             in {
                 TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1,
                 TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
+                TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
             }
         )
         if not accepted:
@@ -615,9 +620,7 @@ def run_gate(*, home: Path, hermes_home: Path) -> dict[str, Any]:
     golden_registry, golden_errors = audit_release_golden_registry(
         hermes_home=hermes_home
     )
-    stable_targets, stable_target_errors = audit_stable_targets(
-        hermes_home=hermes_home
-    )
+    stable_targets, stable_target_errors = audit_stable_targets(hermes_home=hermes_home)
     effect_schema_preflight, effect_schema_errors = (
         audit_unresolved_effect_schema_compatibility(hermes_home=hermes_home)
     )

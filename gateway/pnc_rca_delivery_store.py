@@ -17,6 +17,8 @@ from gateway.pnc_rca_delivery_contract import (
     DELIVERY_THREAD_EFFECT_KIND,
     RCA_REPORT_FIELD_KEY,
     RCA_RESULT_FIELD_KEY,
+    TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
+    TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
     TERMINAL_DELIVERY_OUTCOMES,
     DeliveryContractError,
     VerifiedDelivery,
@@ -43,14 +45,12 @@ from gateway.pnc_rca_runtime_transition import (
 )
 
 
-DELIVERY_STORE_SCHEMA_VERSION = "pnc_rca_delivery_store_v7"
-DELIVERY_STORE_SCHEMA_PREDECESSOR_VERSION = "pnc_rca_delivery_store_v6"
+DELIVERY_STORE_SCHEMA_VERSION = "pnc_rca_delivery_store_v8"
+DELIVERY_STORE_SCHEMA_PREDECESSOR_VERSION = "pnc_rca_delivery_store_v7"
 DELIVERY_BACKPRESSURE_SNAPSHOT_SCHEMA_VERSION = (
     "pnc_rca_delivery_backpressure_snapshot_v2"
 )
-DELIVERY_CAPACITY_SNAPSHOT_SCHEMA_VERSION = (
-    "pnc_rca_delivery_capacity_snapshot_v1"
-)
+DELIVERY_CAPACITY_SNAPSHOT_SCHEMA_VERSION = "pnc_rca_delivery_capacity_snapshot_v1"
 MAX_DELIVERY_CAPACITY_CANDIDATES = 100
 MAX_DELIVERY_CAPACITY_EVIDENCE_ROWS = 33
 MAX_DELIVERY_CAPACITY_SNAPSHOT_BYTES = 2 * 1024 * 1024
@@ -66,45 +66,71 @@ DELIVERY_OUTCOME_CONSECUTIVE_WINDOW_SECONDS = 3600
 DELIVERY_OUTCOME_CONSECUTIVE_FAILURE_THRESHOLD = 3
 OUTBOX_QUARANTINED_TERMINAL_STATE = "submission_quarantined"
 OUTBOX_QUARANTINED_PUBLIC_ERROR_CODE = "outbox_submission_quarantined"
-OUTBOX_PUBLIC_PROFILE_ERROR_CODES = frozenset(
-    {
-        "business_profile_unresolved",
-        "business_profile_unsupported",
-        "business_profile_conflict",
-        "business_profile_adapter_not_ready",
-    }
-)
+OUTBOX_PUBLIC_PROFILE_ERROR_CODES = frozenset({
+    "business_profile_unresolved",
+    "business_profile_unsupported",
+    "business_profile_conflict",
+    "business_profile_adapter_not_ready",
+})
 DELIVERY_WATCH_SLA_SECONDS = 86_400
 PERMANENT_FAILURE_CIRCUIT_THRESHOLD = 2
 _PERMANENT_FAILURE_STREAK_META_KEY = "permanent_failure_streak"
 _PERMANENT_FAILURE_LAST_META_KEY = "permanent_failure_last"
 _NON_PIPELINE_QUARANTINE_CODES = frozenset({"feishu_work_item_not_found"})
-SUPPORTED_DELIVERY_STORE_SCHEMA_VERSIONS = frozenset(
-    {
-        "pnc_rca_delivery_store_v1",
-        "pnc_rca_delivery_store_v2",
-        "pnc_rca_delivery_store_v3",
-        "pnc_rca_delivery_store_v4",
-        "pnc_rca_delivery_store_v5",
-        DELIVERY_STORE_SCHEMA_PREDECESSOR_VERSION,
-        DELIVERY_STORE_SCHEMA_VERSION,
-    }
-)
+SUPPORTED_DELIVERY_STORE_SCHEMA_VERSIONS = frozenset({
+    "pnc_rca_delivery_store_v1",
+    "pnc_rca_delivery_store_v2",
+    "pnc_rca_delivery_store_v3",
+    "pnc_rca_delivery_store_v4",
+    "pnc_rca_delivery_store_v5",
+    "pnc_rca_delivery_store_v6",
+    DELIVERY_STORE_SCHEMA_PREDECESSOR_VERSION,
+    DELIVERY_STORE_SCHEMA_VERSION,
+})
+_FAILURE_ROUTE_REQUIRED_COLUMNS = frozenset({
+    "route_key",
+    "dedupe_key",
+    "submission_key",
+    "business_key",
+    "generation",
+    "task_id",
+    "terminal_error_code",
+    "lane",
+    "route_kind",
+    "owner",
+    "status",
+    "work_started_at",
+    "deadline_at",
+    "first_observed_at",
+    "last_observed_at",
+    "remediation_attempt_count",
+    "observation_count",
+    "retry_count",
+    "remediation_attempted_at",
+    "remediation_result_json",
+    "next_retry_at",
+    "retry_exhausted",
+    "audit_json",
+    "route_payload_json",
+    "completed_at",
+    "created_at",
+    "updated_at",
+})
 WATCH_ACTIVE_STATES = frozenset({"pending", "running"})
-WATCH_TERMINAL_STATES = frozenset(
-    {"terminal_failed", "quarantined", "delivery_created"}
-)
-DELIVERY_EFFECT_STATES = frozenset(
-    {
-        "pending",
-        "claimed",
-        "retry_wait",
-        "uncertain",
-        "succeeded",
-        "quarantined",
-        "suppressed",
-    }
-)
+WATCH_TERMINAL_STATES = frozenset({
+    "terminal_failed",
+    "quarantined",
+    "delivery_created",
+})
+DELIVERY_EFFECT_STATES = frozenset({
+    "pending",
+    "claimed",
+    "retry_wait",
+    "uncertain",
+    "succeeded",
+    "quarantined",
+    "suppressed",
+})
 DELIVERY_EFFECT_UNRESOLVED_STATES = (
     "pending",
     "claimed",
@@ -114,15 +140,13 @@ DELIVERY_EFFECT_UNRESOLVED_STATES = (
 DELIVERY_WATCH_STATES = WATCH_ACTIVE_STATES | WATCH_TERMINAL_STATES
 REQUIRED_DELIVERY_EFFECT_KINDS = (DELIVERY_EFFECT_KIND, DELIVERY_THREAD_EFFECT_KIND)
 ACTIVATION_DELIVERY_STATES = frozenset({"bounded_active", "steady_active"})
-_ACTIVATION_REQUIRED_TABLES = frozenset(
-    {
-        "rca_activation_epochs",
-        "rca_activation_budget_slots",
-        "rca_activation_admission_ledger",
-        "business_triggers",
-        "rca_outbox",
-    }
-)
+_ACTIVATION_REQUIRED_TABLES = frozenset({
+    "rca_activation_epochs",
+    "rca_activation_budget_slots",
+    "rca_activation_admission_ledger",
+    "business_triggers",
+    "rca_outbox",
+})
 _ACTIVATION_EXECUTION_ELIGIBLE_SQL = """
 EXISTS (
     SELECT 1
@@ -204,6 +228,7 @@ class ExecutionWatchClaim:
     lease_token: str
     lease_owner: str
     lease_expires_at: str
+    work_started_at: str
     terminal_first_seen_at: str | None
     submission_payload: dict[str, Any]
     submission_result: dict[str, Any]
@@ -216,6 +241,15 @@ class DeliveryCreateResult:
     delivery_id: str
     effect_key: str
     created: bool
+
+
+@dataclass(frozen=True)
+class FailureRouteMutation:
+    route_key: str
+    created: bool
+    status: str
+    owner: str
+    remediation_attempt_count: int
 
 
 @dataclass(frozen=True)
@@ -464,9 +498,12 @@ def validate_delivery_outcome_slo(
         "failure_rate",
         "breached",
     }
-    for name, window_seconds, min_samples, max_failure_rate in (
-        DELIVERY_OUTCOME_SLO_WINDOWS
-    ):
+    for (
+        name,
+        window_seconds,
+        min_samples,
+        max_failure_rate,
+    ) in DELIVERY_OUTCOME_SLO_WINDOWS:
         window = windows.get(name)
         if not isinstance(window, Mapping) or set(window) != window_keys:
             raise ValueError("delivery outcome SLO window contract is invalid")
@@ -491,13 +528,13 @@ def validate_delivery_outcome_slo(
             if window["sample_count"]
             else 0.0
         )
-        if isinstance(window.get("failure_rate"), bool) or abs(
-            float(window.get("failure_rate", -1)) - expected_rate
-        ) > 1e-12:
+        if (
+            isinstance(window.get("failure_rate"), bool)
+            or abs(float(window.get("failure_rate", -1)) - expected_rate) > 1e-12
+        ):
             raise ValueError("delivery outcome SLO failure rate is invalid")
         expected_breached = (
-            window["sample_count"] >= min_samples
-            and expected_rate > max_failure_rate
+            window["sample_count"] >= min_samples and expected_rate > max_failure_rate
         )
         if type(window.get("breached")) is not bool or (
             window["breached"] is not expected_breached
@@ -522,11 +559,12 @@ def validate_delivery_outcome_slo(
     if type(value.get("contract_valid")) is not bool:
         raise ValueError("delivery outcome contract validity is invalid")
     expected_healthy = (
-        value["contract_valid"]
-        and not any_window_breached
-        and not consecutive_breached
+        value["contract_valid"] and not any_window_breached and not consecutive_breached
     )
-    if type(value.get("healthy")) is not bool or value["healthy"] is not expected_healthy:
+    if (
+        type(value.get("healthy")) is not bool
+        or value["healthy"] is not expected_healthy
+    ):
         raise ValueError("delivery outcome SLO health is invalid")
     return expected_healthy
 
@@ -675,12 +713,10 @@ class RcaDeliveryStore:
             "rca_outbox": {"activation_epoch_id", "activation_ledger_id"},
         }
         return all(
-            columns.issubset(
-                {
-                    str(row["name"])
-                    for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
-                }
-            )
+            columns.issubset({
+                str(row["name"])
+                for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            })
             for table, columns in required_columns.items()
         )
 
@@ -723,9 +759,7 @@ class RcaDeliveryStore:
         effect_key: str,
         submission_key: str,
     ) -> bool:
-        if cls._execution_activation_eligible_tx(
-            conn, submission_key=submission_key
-        ):
+        if cls._execution_activation_eligible_tx(conn, submission_key=submission_key):
             return True
         return (
             conn.execute(
@@ -741,6 +775,32 @@ class RcaDeliveryStore:
             is not None
         )
 
+    @staticmethod
+    def _validate_failure_route_schema(conn: sqlite3.Connection) -> None:
+        columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(rca_failure_routes)")
+        }
+        if not _FAILURE_ROUTE_REQUIRED_COLUMNS.issubset(columns):
+            raise RuntimeError("incompatible_delivery_store_schema:failure_routes")
+        dedupe_unique = False
+        for index in conn.execute("PRAGMA index_list(rca_failure_routes)"):
+            if int(index[2]) != 1:
+                continue
+            indexed_columns = [
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM pragma_index_info(?) ORDER BY seqno",
+                    (str(index[1]),),
+                )
+            ]
+            if indexed_columns == ["dedupe_key"]:
+                dedupe_unique = True
+                break
+        if not dedupe_unique:
+            raise RuntimeError(
+                "incompatible_delivery_store_schema:failure_routes_dedupe"
+            )
+
     def _initialize(self) -> None:
         marker_value = self._preflight_schema_version()
         if self.require_current:
@@ -750,6 +810,7 @@ class RcaDeliveryStore:
             conn = sqlite3.connect(uri, uri=True)
             try:
                 validate_conclusion_adjudication_schema(conn)
+                self._validate_failure_route_schema(conn)
             finally:
                 conn.close()
             return
@@ -794,6 +855,61 @@ class RcaDeliveryStore:
                     updated_at TEXT NOT NULL,
                     UNIQUE(business_key, generation),
                     FOREIGN KEY(submission_outbox_id) REFERENCES rca_outbox(outbox_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS rca_failure_routes (
+                    route_key TEXT PRIMARY KEY,
+                    dedupe_key TEXT NOT NULL UNIQUE,
+                    submission_key TEXT NOT NULL,
+                    business_key TEXT NOT NULL,
+                    generation INTEGER NOT NULL CHECK (generation >= 1),
+                    task_id TEXT NOT NULL,
+                    terminal_error_code TEXT NOT NULL,
+                    lane TEXT NOT NULL CHECK (
+                        lane IN (
+                            'infra_self_healable', 'needs_human_input',
+                            'hard_defect'
+                        )
+                    ),
+                    route_kind TEXT NOT NULL CHECK (
+                        route_kind IN (
+                            'infra_remediation_hold', 'internal_backlog',
+                            'internal_alert'
+                        )
+                    ),
+                    owner TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (
+                        status IN (
+                            'remediation_pending', 'remediation_started',
+                            'remediation_succeeded', 'remediation_held',
+                            'backlog_pending', 'alert_pending',
+                            'terminal_fallback', 'resolved'
+                        )
+                    ),
+                    work_started_at TEXT NOT NULL,
+                    deadline_at TEXT NOT NULL,
+                    first_observed_at TEXT NOT NULL,
+                    last_observed_at TEXT NOT NULL,
+                    remediation_attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (
+                        remediation_attempt_count BETWEEN 0 AND 1
+                    ),
+                    observation_count INTEGER NOT NULL DEFAULT 1 CHECK (
+                        observation_count >= 1
+                    ),
+                    retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+                    remediation_attempted_at TEXT,
+                    remediation_result_json TEXT NOT NULL DEFAULT '{}',
+                    next_retry_at TEXT,
+                    retry_exhausted INTEGER NOT NULL DEFAULT 0 CHECK (
+                        retry_exhausted IN (0, 1)
+                    ),
+                    audit_json TEXT NOT NULL,
+                    route_payload_json TEXT NOT NULL,
+                    completed_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(submission_key)
+                        REFERENCES rca_execution_watch(submission_key)
                 );
 
                 CREATE TABLE IF NOT EXISTS rca_delivery_jobs (
@@ -906,6 +1022,10 @@ class RcaDeliveryStore:
 
                 CREATE INDEX IF NOT EXISTS idx_execution_watch_due
                     ON rca_execution_watch(state, next_poll_at, lease_expires_at);
+                CREATE INDEX IF NOT EXISTS idx_failure_routes_status
+                    ON rca_failure_routes(status, owner, deadline_at);
+                CREATE INDEX IF NOT EXISTS idx_failure_routes_submission
+                    ON rca_failure_routes(submission_key, created_at);
                 CREATE INDEX IF NOT EXISTS idx_delivery_jobs_status
                     ON rca_delivery_jobs(status, created_at);
                 CREATE INDEX IF NOT EXISTS idx_delivery_jobs_updated_at
@@ -921,13 +1041,13 @@ class RcaDeliveryStore:
                 conn,
                 error_prefix="incompatible_delivery_store_schema",
             )
+            self._validate_failure_route_schema(conn)
             marker = conn.execute(
                 "SELECT value FROM rca_delivery_meta WHERE key = 'schema_version'"
             ).fetchone()
             if (
                 marker is not None
-                and str(marker["value"])
-                not in SUPPORTED_DELIVERY_STORE_SCHEMA_VERSIONS
+                and str(marker["value"]) not in SUPPORTED_DELIVERY_STORE_SCHEMA_VERSIONS
             ):
                 raise RuntimeError("incompatible_delivery_store_schema:version")
             conn.execute(
@@ -1006,8 +1126,7 @@ class RcaDeliveryStore:
                 conn.close()
         if (
             marker is not None
-            and str(marker["value"])
-            not in SUPPORTED_DELIVERY_STORE_SCHEMA_VERSIONS
+            and str(marker["value"]) not in SUPPORTED_DELIVERY_STORE_SCHEMA_VERSIONS
         ):
             raise RuntimeError("incompatible_delivery_store_schema:version")
         return str(marker["value"]) if marker is not None else None
@@ -1019,7 +1138,9 @@ class RcaDeliveryStore:
             "SELECT value FROM rca_delivery_meta WHERE key = 'schema_version'"
         ).fetchone()
         initial_schema_version = str(marker["value"]) if marker is not None else ""
-        initial_watch_info = list(conn.execute("PRAGMA table_info(rca_execution_watch)"))
+        initial_watch_info = list(
+            conn.execute("PRAGMA table_info(rca_execution_watch)")
+        )
         relax_task_id = any(
             str(row["name"]) == "task_id" and int(row["notnull"]) == 1
             for row in initial_watch_info
@@ -1171,7 +1292,9 @@ class RcaDeliveryStore:
             for row in conn.execute("PRAGMA table_info(rca_delivery_attempts)")
         }
         if attempt_columns and "event_seq" not in attempt_columns:
-            conn.execute("ALTER TABLE rca_delivery_attempts RENAME TO rca_delivery_attempts_v1")
+            conn.execute(
+                "ALTER TABLE rca_delivery_attempts RENAME TO rca_delivery_attempts_v1"
+            )
             conn.execute(
                 """
                 CREATE TABLE rca_delivery_attempts (
@@ -1336,12 +1459,15 @@ class RcaDeliveryStore:
                 );
             END;
 
-            """
+            """,
         )
-        subscriptions_ready = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-            "AND name = 'rca_delivery_subscriptions'"
-        ).fetchone() is not None
+        subscriptions_ready = (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'rca_delivery_subscriptions'"
+            ).fetchone()
+            is not None
+        )
         if subscriptions_ready:
             _execute_schema_script_in_transaction(
                 conn,
@@ -1387,16 +1513,25 @@ class RcaDeliveryStore:
                         strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                     );
                 END;
-                """
+                """,
             )
-        if conn.execute(
-            "SELECT 1 FROM rca_delivery_quarantine_mutation_audit LIMIT 1"
-        ).fetchone() is None:
+        if (
+            conn.execute(
+                "SELECT 1 FROM rca_delivery_quarantine_mutation_audit LIMIT 1"
+            ).fetchone()
+            is None
+        ):
             for entity_kind, table, key in (
                 ("job", "rca_delivery_jobs", "delivery_id"),
                 ("effect", "rca_delivery_effects", "effect_key"),
                 *(
-                    (("subscription", "rca_delivery_subscriptions", "subscription_key"),)
+                    (
+                        (
+                            "subscription",
+                            "rca_delivery_subscriptions",
+                            "subscription_key",
+                        ),
+                    )
                     if subscriptions_ready
                     else ()
                 ),
@@ -1409,7 +1544,74 @@ class RcaDeliveryStore:
                     "WHERE status = 'quarantined' ORDER BY " + key,
                     (entity_kind,),
                 )
-        if initial_schema_version == DELIVERY_STORE_SCHEMA_PREDECESSOR_VERSION:
+        _execute_schema_script_in_transaction(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS rca_failure_routes (
+                route_key TEXT PRIMARY KEY,
+                dedupe_key TEXT NOT NULL UNIQUE,
+                submission_key TEXT NOT NULL,
+                business_key TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK (generation >= 1),
+                task_id TEXT NOT NULL,
+                terminal_error_code TEXT NOT NULL,
+                lane TEXT NOT NULL CHECK (
+                    lane IN (
+                        'infra_self_healable', 'needs_human_input',
+                        'hard_defect'
+                    )
+                ),
+                route_kind TEXT NOT NULL CHECK (
+                    route_kind IN (
+                        'infra_remediation_hold', 'internal_backlog',
+                        'internal_alert'
+                    )
+                ),
+                owner TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (
+                    status IN (
+                        'remediation_pending', 'remediation_started',
+                        'remediation_succeeded', 'remediation_held',
+                        'backlog_pending', 'alert_pending',
+                        'terminal_fallback', 'resolved'
+                    )
+                ),
+                work_started_at TEXT NOT NULL,
+                deadline_at TEXT NOT NULL,
+                first_observed_at TEXT NOT NULL,
+                last_observed_at TEXT NOT NULL,
+                remediation_attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (
+                    remediation_attempt_count BETWEEN 0 AND 1
+                ),
+                observation_count INTEGER NOT NULL DEFAULT 1 CHECK (
+                    observation_count >= 1
+                ),
+                retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+                remediation_attempted_at TEXT,
+                remediation_result_json TEXT NOT NULL DEFAULT '{}',
+                next_retry_at TEXT,
+                retry_exhausted INTEGER NOT NULL DEFAULT 0 CHECK (
+                    retry_exhausted IN (0, 1)
+                ),
+                audit_json TEXT NOT NULL,
+                route_payload_json TEXT NOT NULL,
+                completed_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(submission_key)
+                    REFERENCES rca_execution_watch(submission_key)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_failure_routes_status
+                ON rca_failure_routes(status, owner, deadline_at);
+            CREATE INDEX IF NOT EXISTS idx_failure_routes_submission
+                ON rca_failure_routes(submission_key, created_at);
+            """,
+        )
+        if initial_schema_version in {
+            "pnc_rca_delivery_store_v6",
+            DELIVERY_STORE_SCHEMA_PREDECESSOR_VERSION,
+        }:
             conn.execute(
                 "UPDATE rca_delivery_meta SET value = ? WHERE key = 'schema_version'",
                 (DELIVERY_STORE_SCHEMA_VERSION,),
@@ -1425,7 +1627,9 @@ class RcaDeliveryStore:
         conn = self._connect()
         try:
             return {
-                "journal_mode": str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower(),
+                "journal_mode": str(
+                    conn.execute("PRAGMA journal_mode").fetchone()[0]
+                ).lower(),
                 "synchronous": int(conn.execute("PRAGMA synchronous").fetchone()[0]),
                 "foreign_keys": int(conn.execute("PRAGMA foreign_keys").fetchone()[0]),
             }
@@ -1739,7 +1943,13 @@ class RcaDeliveryStore:
                 SELECT w.*, o.payload_json AS submission_payload_json,
                        o.result_json AS submission_result_json,
                        o.origin_source_id AS origin_source_id,
-                       t.origin_source_id AS trigger_origin_source_id
+                       t.origin_source_id AS trigger_origin_source_id,
+                       MIN(
+                           t.created_at,
+                           o.created_at,
+                           COALESCE(o.retry_window_started_at, o.created_at),
+                           w.created_at
+                       ) AS work_started_at
                   FROM rca_execution_watch AS w
                   JOIN rca_outbox AS o ON o.outbox_id = w.submission_outbox_id
                   JOIN business_triggers AS t
@@ -1776,7 +1986,15 @@ class RcaDeliveryStore:
                    )
                    {activation_update_filter}
                 """,
-                (token, owner, expires, current, row["submission_key"], current, current),
+                (
+                    token,
+                    owner,
+                    expires,
+                    current,
+                    row["submission_key"],
+                    current,
+                    current,
+                ),
             )
             if updated.rowcount != 1:
                 conn.rollback()
@@ -1786,7 +2004,13 @@ class RcaDeliveryStore:
                 SELECT w.*, o.payload_json AS submission_payload_json,
                        o.result_json AS submission_result_json,
                        o.origin_source_id AS origin_source_id,
-                       t.origin_source_id AS trigger_origin_source_id
+                       t.origin_source_id AS trigger_origin_source_id,
+                       MIN(
+                           t.created_at,
+                           o.created_at,
+                           COALESCE(o.retry_window_started_at, o.created_at),
+                           w.created_at
+                       ) AS work_started_at
                   FROM rca_execution_watch AS w
                   JOIN rca_outbox AS o ON o.outbox_id = w.submission_outbox_id
                   JOIN business_triggers AS t
@@ -1817,6 +2041,7 @@ class RcaDeliveryStore:
             lease_token=str(claimed["lease_token"]),
             lease_owner=str(claimed["lease_owner"]),
             lease_expires_at=str(claimed["lease_expires_at"]),
+            work_started_at=str(claimed["work_started_at"]),
             terminal_first_seen_at=(
                 str(claimed["terminal_first_seen_at"])
                 if claimed["terminal_first_seen_at"]
@@ -1898,47 +2123,297 @@ class RcaDeliveryStore:
         finally:
             conn.close()
 
-    def note_terminal_completion(
-        self,
+    @staticmethod
+    def _failure_route_identity(
         *,
         submission_key: str,
-        lease_token: str,
-        status: dict[str, Any],
+        terminal_error_code: str,
+        lane: str,
+        route_kind: str,
+    ) -> tuple[str, str]:
+        material = "\0".join((
+            submission_key,
+            terminal_error_code,
+            lane,
+            route_kind,
+        )).encode("utf-8")
+        digest = hashlib.sha256(material).hexdigest()
+        return f"rca-failure-route-{digest}", digest
+
+    def upsert_failure_route(
+        self,
+        *,
+        claim: ExecutionWatchClaim,
+        terminal_error_code: str,
+        lane: str,
+        route_kind: str,
+        owner: str,
+        work_started_at: str,
+        deadline_at: str,
+        audit: Mapping[str, Any],
+        route_payload: Mapping[str, Any],
         now: datetime | None = None,
-    ) -> str:
-        """Persist the first completed observation while retaining the claim."""
+    ) -> FailureRouteMutation:
+        allowed_lanes = {
+            "infra_self_healable",
+            "needs_human_input",
+            "hard_defect",
+        }
+        initial_status = {
+            "infra_remediation_hold": "remediation_pending",
+            "internal_backlog": "backlog_pending",
+            "internal_alert": "alert_pending",
+        }.get(route_kind)
+        code = str(terminal_error_code or "").strip()
+        selected_owner = str(owner or "").strip()
+        if lane not in allowed_lanes or initial_status is None:
+            raise ValueError("failure route lane/kind is invalid")
+        if not code or len(code.encode("utf-8")) > 120:
+            raise ValueError("failure route error code is invalid")
+        if not selected_owner or len(selected_owner.encode("utf-8")) > 120:
+            raise ValueError("failure route owner is invalid")
+        audit_json = _canonical_json(dict(audit))
+        payload_json = _canonical_json(dict(route_payload))
+        if len(audit_json.encode("utf-8")) > 65_536:
+            raise ValueError("failure route audit is too large")
+        if len(payload_json.encode("utf-8")) > 65_536:
+            raise ValueError("failure route payload is too large")
+        route_key, dedupe_key = self._failure_route_identity(
+            submission_key=claim.submission_key,
+            terminal_error_code=code,
+            lane=lane,
+            route_kind=route_kind,
+        )
         current = _iso(now)
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            self._current_claim(conn, submission_key, lease_token, current)
-            updated = conn.execute(
+            self._current_claim(conn, claim.submission_key, claim.lease_token, current)
+            existing = conn.execute(
+                "SELECT route_key FROM rca_failure_routes WHERE route_key = ?",
+                (route_key,),
+            ).fetchone()
+            conn.execute(
                 """
-                UPDATE rca_execution_watch
-                   SET terminal_first_seen_at = COALESCE(terminal_first_seen_at, ?),
-                       last_observed_at = ?, last_status_json = ?, updated_at = ?
-                 WHERE submission_key = ? AND lease_token = ?
+                INSERT INTO rca_failure_routes(
+                    route_key, dedupe_key, submission_key, business_key,
+                    generation, task_id, terminal_error_code, lane, route_kind,
+                    owner, status, work_started_at, deadline_at,
+                    first_observed_at, last_observed_at, audit_json,
+                    route_payload_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(route_key) DO UPDATE SET
+                    owner = excluded.owner,
+                    deadline_at = excluded.deadline_at,
+                    last_observed_at = excluded.last_observed_at,
+                    observation_count = rca_failure_routes.observation_count + 1,
+                    audit_json = excluded.audit_json,
+                    route_payload_json = excluded.route_payload_json,
+                    updated_at = excluded.updated_at
                 """,
                 (
+                    route_key,
+                    dedupe_key,
+                    claim.submission_key,
+                    claim.business_key,
+                    claim.generation,
+                    claim.task_id,
+                    code,
+                    lane,
+                    route_kind,
+                    selected_owner,
+                    initial_status,
+                    work_started_at,
+                    deadline_at,
                     current,
                     current,
-                    _canonical_json(status),
+                    audit_json,
+                    payload_json,
                     current,
-                    submission_key,
-                    lease_token,
+                    current,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT route_key, status, owner, remediation_attempt_count
+                  FROM rca_failure_routes WHERE route_key = ?
+                """,
+                (route_key,),
+            ).fetchone()
+            conn.commit()
+            if row is None:
+                raise RuntimeError("failure route was not persisted")
+            return FailureRouteMutation(
+                route_key=str(row["route_key"]),
+                created=existing is None,
+                status=str(row["status"]),
+                owner=str(row["owner"]),
+                remediation_attempt_count=int(row["remediation_attempt_count"]),
+            )
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def reschedule_failure_route(
+        self,
+        *,
+        claim: ExecutionWatchClaim,
+        route_key: str,
+        next_retry_at: datetime,
+        now: datetime | None = None,
+    ) -> None:
+        current = _iso(now)
+        retry_at = _iso(next_retry_at)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._current_claim(conn, claim.submission_key, claim.lease_token, current)
+            updated = conn.execute(
+                """
+                UPDATE rca_failure_routes
+                   SET next_retry_at = ?, retry_count = retry_count + 1,
+                       last_observed_at = ?, updated_at = ?
+                 WHERE route_key = ? AND submission_key = ?
+                   AND status != 'terminal_fallback'
+                   AND status != 'resolved'
+                """,
+                (
+                    retry_at,
+                    current,
+                    current,
+                    route_key,
+                    claim.submission_key,
                 ),
             )
             if updated.rowcount != 1:
-                raise StaleDeliveryWatchLeaseError(submission_key)
-            first_seen = conn.execute(
-                """
-                SELECT terminal_first_seen_at FROM rca_execution_watch
-                 WHERE submission_key = ?
-                """,
-                (submission_key,),
-            ).fetchone()[0]
+                raise StaleDeliveryWatchLeaseError(
+                    f"failure route state changed for {route_key}"
+                )
             conn.commit()
-            return str(first_seen)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def failure_route_for_deadline(
+        self,
+        *,
+        claim: ExecutionWatchClaim,
+        now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        current = _iso(now)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            self._current_claim(conn, claim.submission_key, claim.lease_token, current)
+            row = conn.execute(
+                """
+                SELECT route_key, terminal_error_code, lane, route_kind,
+                       owner, status, audit_json, route_payload_json
+                  FROM rca_failure_routes
+                 WHERE submission_key = ?
+                   AND status NOT IN ('terminal_fallback', 'resolved')
+                 ORDER BY last_observed_at DESC, created_at DESC, route_key DESC
+                 LIMIT 1
+                """,
+                (claim.submission_key,),
+            ).fetchone()
+            conn.commit()
+            if row is None:
+                return None
+            return {
+                "route_key": str(row["route_key"]),
+                "terminal_error_code": str(row["terminal_error_code"]),
+                "lane": str(row["lane"]),
+                "route_kind": str(row["route_kind"]),
+                "owner": str(row["owner"]),
+                "status": str(row["status"]),
+                "audit": json.loads(str(row["audit_json"])),
+                "route_payload": json.loads(str(row["route_payload_json"])),
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def claim_failure_remediation(
+        self,
+        *,
+        claim: ExecutionWatchClaim,
+        route_key: str,
+        now: datetime | None = None,
+    ) -> bool:
+        current = _iso(now)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._current_claim(conn, claim.submission_key, claim.lease_token, current)
+            updated = conn.execute(
+                """
+                UPDATE rca_failure_routes
+                   SET status = 'remediation_started',
+                       remediation_attempt_count = 1,
+                       remediation_attempted_at = ?, updated_at = ?
+                 WHERE route_key = ? AND submission_key = ?
+                   AND status = 'remediation_pending'
+                   AND remediation_attempt_count = 0
+                """,
+                (current, current, route_key, claim.submission_key),
+            )
+            conn.commit()
+            return updated.rowcount == 1
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def finish_failure_remediation(
+        self,
+        *,
+        claim: ExecutionWatchClaim,
+        route_key: str,
+        succeeded: bool,
+        result: Mapping[str, Any],
+        now: datetime | None = None,
+    ) -> None:
+        current = _iso(now)
+        result_json = _canonical_json(dict(result))
+        if len(result_json.encode("utf-8")) > 65_536:
+            raise ValueError("failure remediation result is too large")
+        status = "remediation_succeeded" if succeeded else "remediation_held"
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._current_claim(conn, claim.submission_key, claim.lease_token, current)
+            updated = conn.execute(
+                """
+                UPDATE rca_failure_routes
+                   SET status = ?, remediation_result_json = ?,
+                       retry_exhausted = ?, next_retry_at = NULL,
+                       updated_at = ?
+                 WHERE route_key = ? AND submission_key = ?
+                   AND status = 'remediation_started'
+                   AND remediation_attempt_count = 1
+                """,
+                (
+                    status,
+                    result_json,
+                    0 if succeeded else 1,
+                    current,
+                    route_key,
+                    claim.submission_key,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise StaleDeliveryWatchLeaseError(
+                    f"failure remediation state changed for {route_key}"
+                )
+            conn.commit()
         except Exception:
             conn.rollback()
             raise
@@ -2090,9 +2565,7 @@ class RcaDeliveryStore:
         try:
             target = json.loads(str(subscription["target_json"] or ""))
         except (TypeError, json.JSONDecodeError) as exc:
-            raise DeliveryContractError(
-                "delivery_subscription_target_invalid"
-            ) from exc
+            raise DeliveryContractError("delivery_subscription_target_invalid") from exc
         if not isinstance(target, dict):
             raise DeliveryContractError("delivery_subscription_target_invalid")
         validate_delivery_subscription_target(
@@ -2116,9 +2589,8 @@ class RcaDeliveryStore:
             raise DeliveryContractError("delivery_primary_effect_missing")
 
         if effect_kind == DELIVERY_EFFECT_KIND:
-            if (
-                target_key != str(issue_effect["target_key"])
-                or target_key != str(job["target_key"])
+            if target_key != str(issue_effect["target_key"]) or target_key != str(
+                job["target_key"]
             ):
                 raise DeliveryContractError("delivery_primary_effect_invalid")
             effect_key = str(issue_effect["effect_key"])
@@ -2370,9 +2842,7 @@ class RcaDeliveryStore:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            self._current_claim(
-                conn, claim.submission_key, claim.lease_token, current
-            )
+            self._current_claim(conn, claim.submission_key, claim.lease_token, current)
             activation_enforced = self._activation_enforced_tx(
                 conn,
                 activation_required=activation_required,
@@ -2641,6 +3111,7 @@ class RcaDeliveryStore:
         terminal_state: str,
         error_code: str,
         error_detail: str,
+        terminal_fallback: Mapping[str, Any] | None = None,
         runtime_identity: Mapping[str, Any] | None = None,
         now: datetime | None = None,
         activation_required: bool = False,
@@ -2657,14 +3128,18 @@ class RcaDeliveryStore:
             outcome=outcome,
             terminal_state=terminal_state,
             error_code=error_code,
+            terminal_fallback=terminal_fallback,
+            schema_version=(
+                TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION
+                if terminal_fallback is not None
+                else TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION
+            ),
         )
         current = _iso(now)
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            self._current_claim(
-                conn, claim.submission_key, claim.lease_token, current
-            )
+            self._current_claim(conn, claim.submission_key, claim.lease_token, current)
             activation_enforced = self._activation_enforced_tx(
                 conn,
                 activation_required=activation_required,
@@ -2711,6 +3186,34 @@ class RcaDeliveryStore:
             )
             if updated.rowcount != 1:
                 raise StaleDeliveryWatchLeaseError(claim.submission_key)
+            if terminal_fallback is not None:
+                fallback = dict(terminal_fallback)
+                route_updated = conn.execute(
+                    """
+                    UPDATE rca_failure_routes
+                       SET status = 'terminal_fallback', completed_at = ?,
+                           next_retry_at = NULL, updated_at = ?
+                     WHERE route_key = ? AND submission_key = ?
+                       AND terminal_error_code = ? AND route_kind = ?
+                       AND owner = ? AND work_started_at = ? AND deadline_at = ?
+                       AND status != 'resolved'
+                    """,
+                    (
+                        current,
+                        current,
+                        fallback.get("route_key"),
+                        claim.submission_key,
+                        delivery.error_code,
+                        fallback.get("route_kind"),
+                        fallback.get("route_owner"),
+                        fallback.get("work_started_at"),
+                        fallback.get("deadline_at"),
+                    ),
+                )
+                if route_updated.rowcount != 1:
+                    raise StaleDeliveryWatchLeaseError(
+                        f"failure route changed for {claim.submission_key}"
+                    )
             if runtime_identity is not None:
                 insert_host_runtime_transition(
                     conn,
@@ -2784,7 +3287,9 @@ class RcaDeliveryStore:
         )
 
     @staticmethod
-    def _aggregate_job_status(conn: sqlite3.Connection, delivery_id: str, current: str) -> str:
+    def _aggregate_job_status(
+        conn: sqlite3.Connection, delivery_id: str, current: str
+    ) -> str:
         rows = conn.execute(
             """
             SELECT required, status FROM rca_delivery_effects
@@ -2821,8 +3326,7 @@ class RcaDeliveryStore:
             required
             and all(row["status"] in {"succeeded", "suppressed"} for row in required)
             and all(
-                state in {"materialized", "suppressed"}
-                for state in subscription_states
+                state in {"materialized", "suppressed"} for state in subscription_states
             )
         ):
             status = (
@@ -3062,9 +3566,7 @@ class RcaDeliveryStore:
             raise StaleDeliveryEffectLeaseError(
                 f"stale superseded effect claim for {claim.effect_key}"
             )
-        job_status = cls._aggregate_job_status(
-            conn, str(row["delivery_id"]), current
-        )
+        job_status = cls._aggregate_job_status(conn, str(row["delivery_id"]), current)
         return DeliveryEffectMutation(
             claim.effect_key,
             claim.delivery_id,
@@ -3647,7 +4149,9 @@ class RcaDeliveryStore:
                     effect_key=str(row["effect_key"]),
                     attempt_no=int(row["attempt"]),
                     fence=old_fence,
-                    request_id=self._effect_request_id(str(row["effect_key"]), old_fence),
+                    request_id=self._effect_request_id(
+                        str(row["effect_key"]), old_fence
+                    ),
                     outcome="unknown" if write_was_started else "nack",
                     current=current,
                     error_code=(
@@ -3662,7 +4166,10 @@ class RcaDeliveryStore:
                     ),
                 )
                 previous_status = "uncertain" if write_was_started else "retry_wait"
-            elif previous_status == "uncertain" and previous_write_phase != "write_started":
+            elif (
+                previous_status == "uncertain"
+                and previous_write_phase != "write_started"
+            ):
                 raise DeliveryRecordConflictError(
                     "uncertain delivery effect is missing its write boundary"
                 )
@@ -3729,9 +4236,7 @@ class RcaDeliveryStore:
             artifacts = json.loads(str(row["artifacts_json"] or "[]"))
             if not isinstance(artifacts, list):
                 artifacts = []
-            if str(row["outcome"] or "success") != str(
-                row["job_outcome"] or "success"
-            ):
+            if str(row["outcome"] or "success") != str(row["job_outcome"] or "success"):
                 raise DeliveryRecordConflictError(
                     "delivery effect outcome does not match its job"
                 )
@@ -4037,9 +4542,7 @@ class RcaDeliveryStore:
                 claim.fence,
             ),
         )
-        job_status = self._aggregate_job_status(
-            conn, str(row["delivery_id"]), current
-        )
+        job_status = self._aggregate_job_status(conn, str(row["delivery_id"]), current)
         if effect_status == "quarantined":
             self._record_permanent_failure_in_transaction(
                 conn,
@@ -4167,9 +4670,7 @@ class RcaDeliveryStore:
                 claim.fence,
             ),
         )
-        job_status = self._aggregate_job_status(
-            conn, str(row["delivery_id"]), current
-        )
+        job_status = self._aggregate_job_status(conn, str(row["delivery_id"]), current)
         if error_code in _NON_PIPELINE_QUARANTINE_CODES:
             self._reset_permanent_failure_streak_in_transaction(
                 conn,
@@ -4202,8 +4703,8 @@ class RcaDeliveryStore:
                 SELECT state, reason_code, reason_detail, opened_at, updated_at
                   FROM rca_delivery_dispatcher_circuit
                  WHERE circuit_name = ?
-                """
-                , (effect_kind,)
+                """,
+                (effect_kind,),
             ).fetchone()
             if row is None:
                 return DeliveryDispatcherCircuit(
@@ -4288,9 +4789,7 @@ class RcaDeliveryStore:
             if circuit_name == DELIVERY_EFFECT_KIND
             else f"{_PERMANENT_FAILURE_LAST_META_KEY}:{circuit_name}"
         )
-        streak = self._permanent_failure_streak_in_transaction(
-            conn, circuit_name
-        ) + 1
+        streak = self._permanent_failure_streak_in_transaction(conn, circuit_name) + 1
         last_failure = {
             "subject_key": str(subject_key or "")[:256],
             "state": str(failure_state or "")[:120],
@@ -4376,9 +4875,7 @@ class RcaDeliveryStore:
         )
         conn = self._connect()
         try:
-            streak = self._permanent_failure_streak_in_transaction(
-                conn, effect_kind
-            )
+            streak = self._permanent_failure_streak_in_transaction(conn, effect_kind)
             row = conn.execute(
                 "SELECT value FROM rca_delivery_meta WHERE key = ?",
                 (last_key,),
@@ -4467,8 +4964,7 @@ class RcaDeliveryStore:
     ) -> dict[str, Any]:
         observed_at = _iso(current_dt)
         cutoff = _iso(
-            current_dt
-            - timedelta(seconds=DELIVERY_OUTCOME_CONSECUTIVE_WINDOW_SECONDS)
+            current_dt - timedelta(seconds=DELIVERY_OUTCOME_CONSECUTIVE_WINDOW_SECONDS)
         )
         rows = conn.execute(
             """
@@ -4499,9 +4995,12 @@ class RcaDeliveryStore:
             recent.append((status in failure_statuses, updated_at))
 
         windows: dict[str, dict[str, Any]] = {}
-        for name, window_seconds, min_samples, max_failure_rate in (
-            DELIVERY_OUTCOME_SLO_WINDOWS
-        ):
+        for (
+            name,
+            window_seconds,
+            min_samples,
+            max_failure_rate,
+        ) in DELIVERY_OUTCOME_SLO_WINDOWS:
             window_cutoff = current_dt - timedelta(seconds=window_seconds)
             delivery_failures = [
                 failed for failed, updated_at in recent if updated_at >= window_cutoff
@@ -4534,12 +5033,8 @@ class RcaDeliveryStore:
         outcome_slo = {
             "schema_version": DELIVERY_OUTCOME_SLO_SCHEMA_VERSION,
             "observed_at": observed_at,
-            "success_delivery_statuses": sorted(
-                DELIVERY_OUTCOME_SLO_SUCCESS_STATUSES
-            ),
-            "failure_delivery_statuses": sorted(
-                DELIVERY_OUTCOME_SLO_FAILURE_STATUSES
-            ),
+            "success_delivery_statuses": sorted(DELIVERY_OUTCOME_SLO_SUCCESS_STATUSES),
+            "failure_delivery_statuses": sorted(DELIVERY_OUTCOME_SLO_FAILURE_STATUSES),
             "windows": windows,
             "consecutive_failure_window_seconds": (
                 DELIVERY_OUTCOME_CONSECUTIVE_WINDOW_SECONDS
@@ -4556,9 +5051,7 @@ class RcaDeliveryStore:
                 and not any(window["breached"] for window in windows.values())
             ),
         }
-        validate_delivery_outcome_slo(
-            outcome_slo, expected_observed_at=observed_at
-        )
+        validate_delivery_outcome_slo(outcome_slo, expected_observed_at=observed_at)
         return outcome_slo
 
     @classmethod
@@ -4592,8 +5085,7 @@ class RcaDeliveryStore:
             ).fetchone()
             if (
                 marker is None
-                or str(marker["value"])
-                not in SUPPORTED_DELIVERY_STORE_SCHEMA_VERSIONS
+                or str(marker["value"]) not in SUPPORTED_DELIVERY_STORE_SCHEMA_VERSIONS
             ):
                 raise RuntimeError(
                     "delivery_backpressure_contract_invalid:schema_version"
@@ -4612,15 +5104,11 @@ class RcaDeliveryStore:
                 "SELECT state, COUNT(*) AS count "
                 "FROM rca_execution_watch GROUP BY state"
             ).fetchall()
-            watch_counts = {
-                str(row["state"]): int(row["count"]) for row in watch_rows
-            }
+            watch_counts = {str(row["state"]): int(row["count"]) for row in watch_rows}
             if set(watch_counts) - DELIVERY_WATCH_STATES or any(
                 value < 0 for value in watch_counts.values()
             ):
-                raise RuntimeError(
-                    "delivery_backpressure_contract_invalid:watch_state"
-                )
+                raise RuntimeError("delivery_backpressure_contract_invalid:watch_state")
             untracked_completed = int(
                 conn.execute(
                     """
@@ -4665,9 +5153,7 @@ class RcaDeliveryStore:
                         "delivery_backpressure_contract_invalid:circuit_state"
                     )
                 circuits[circuit_name] = item
-            open_names = sorted(
-                name for name, item in circuits.items() if item.is_open
-            )
+            open_names = sorted(name for name, item in circuits.items() if item.is_open)
             circuit = (
                 circuits[open_names[0]]
                 if open_names
@@ -4680,7 +5166,9 @@ class RcaDeliveryStore:
         except sqlite3.Error as exc:
             if "conn" in locals():
                 conn.rollback()
-            raise RuntimeError("delivery_backpressure_store_unavailable:sqlite") from exc
+            raise RuntimeError(
+                "delivery_backpressure_store_unavailable:sqlite"
+            ) from exc
         except Exception:
             if "conn" in locals():
                 conn.rollback()
@@ -4690,8 +5178,7 @@ class RcaDeliveryStore:
                 conn.close()
 
         unresolved = {
-            state: counts.get(state, 0)
-            for state in DELIVERY_EFFECT_UNRESOLVED_STATES
+            state: counts.get(state, 0) for state in DELIVERY_EFFECT_UNRESOLVED_STATES
         }
         unresolved_effects = sum(unresolved.values())
         pending_watches = watch_counts.get("pending", 0)
@@ -4795,6 +5282,7 @@ class RcaDeliveryStore:
             "rca_delivery_dispatcher_circuit",
             "rca_conclusion_adjudications",
             "rca_delivery_subscriptions",
+            "rca_failure_routes",
         }
         if table not in allowed:
             raise ValueError(f"unsupported delivery table: {table}")
@@ -4958,8 +5446,7 @@ class RcaDeliveryStore:
                 name: values["eligible"] for name, values in sorted(rows.items())
             },
             "held_current_counts": {
-                name: values["held_current"]
-                for name, values in sorted(rows.items())
+                name: values["held_current"] for name, values in sorted(rows.items())
             },
             "blocked_historical_counts": {
                 name: values["blocked_historical"]
@@ -4981,8 +5468,10 @@ class RcaDeliveryStore:
         create-once evidence files and the signed ledger own deduplication.
         """
         activation = _utc_datetime(activated_at)
-        if isinstance(limit, bool) or not isinstance(limit, int) or not (
-            1 <= limit <= MAX_DELIVERY_CAPACITY_CANDIDATES
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not (1 <= limit <= MAX_DELIVERY_CAPACITY_CANDIDATES)
         ):
             raise ValueError("capacity candidate limit is invalid")
         excluded = set(excluded_task_attempts or set())
@@ -5027,9 +5516,7 @@ class RcaDeliveryStore:
                 ),
             ).fetchall()
             snapshots: list[DeliveryCapacitySnapshot] = []
-            subscriptions_ready = self._table_exists(
-                conn, "rca_delivery_subscriptions"
-            )
+            subscriptions_ready = self._table_exists(conn, "rca_delivery_subscriptions")
             for row in rows:
                 status = _json_object(row["last_status_json"])
                 task_meta = status.get("meta")
@@ -5068,9 +5555,7 @@ class RcaDeliveryStore:
                         "required": int(effect["required"]) == 1,
                         "target_key": str(effect["target_key"]),
                         "status": str(effect["status"]),
-                        "remote_receipt": _json_object(
-                            effect["remote_receipt_json"]
-                        ),
+                        "remote_receipt": _json_object(effect["remote_receipt_json"]),
                         "remote_id": str(effect["remote_id"] or ""),
                         "completed_at": (
                             str(effect["completed_at"])
@@ -5242,8 +5727,11 @@ class RcaDeliveryStore:
                 str(row["circuit_name"]): {
                     key: row[key]
                     for key in (
-                        "state", "reason_code", "reason_detail",
-                        "opened_at", "updated_at",
+                        "state",
+                        "reason_code",
+                        "reason_detail",
+                        "opened_at",
+                        "updated_at",
                     )
                 }
                 for row in circuit_rows
@@ -5330,9 +5818,7 @@ class RcaDeliveryStore:
                 "quarantined_subscriptions": int(
                     unacknowledged_quarantine["subscriptions"]
                 ),
-                "quarantine_baseline_invalid": int(
-                    not quarantine_baseline["ready"]
-                ),
+                "quarantine_baseline_invalid": int(not quarantine_baseline["ready"]),
                 "pending_required_subscriptions": pending_required_subscriptions,
                 "unresolved_required_effects": unresolved_required_effects,
                 "outcome_slo_breached": int(not outcome_slo["healthy"]),
