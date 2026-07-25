@@ -18,7 +18,8 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from gateway.pnc_rca_conclusion_adjudication import (
-    ADJUDICATION_EFFECT_SCHEMA_VERSION,
+    ADJUDICATION_EFFECT_SCHEMA_VERSIONS,
+    ADJUDICATION_EFFECT_TARGET_KEY_PREFIX,
     ADJUDICATION_SCHEMA_VERSION,
     validate_adjudication_effect_claim,
     validate_adjudication_effect_ledger_binding,
@@ -41,6 +42,29 @@ _VALID_EFFECT_WRITE_PHASES = {
     "quarantined": {"settled"},
     "suppressed": {"settled"},
 }
+_ADJUDICATION_EFFECT_IDENTITY_SQL = """
+(
+    (
+        json_valid(payload_json)
+        AND json_extract(payload_json, '$.schema_version') IN (?, ?)
+    )
+    OR substr(target_key, 1, ?) = ?
+)
+"""
+_ADJUDICATION_EFFECT_IDENTITY_SQL_E = """
+(
+    (
+        json_valid(e.payload_json)
+        AND json_extract(e.payload_json, '$.schema_version') IN (?, ?)
+    )
+    OR substr(e.target_key, 1, ?) = ?
+)
+"""
+_ADJUDICATION_EFFECT_IDENTITY_PARAMETERS = (
+    *ADJUDICATION_EFFECT_SCHEMA_VERSIONS,
+    len(ADJUDICATION_EFFECT_TARGET_KEY_PREFIX),
+    ADJUDICATION_EFFECT_TARGET_KEY_PREFIX,
+)
 
 
 def _sha256(path: Path) -> str:
@@ -279,20 +303,18 @@ def audit_conclusion_adjudications(control_db: str | Path) -> dict[str, Any]:
         )
         adjudication_effects = _scalar(
             conn,
-            "SELECT COUNT(*) FROM rca_delivery_effects "
-            "WHERE json_valid(payload_json) "
-            "AND json_extract(payload_json, '$.schema_version') = ?",
-            (ADJUDICATION_EFFECT_SCHEMA_VERSION,),
+            "SELECT COUNT(*) FROM rca_delivery_effects WHERE "
+            + _ADJUDICATION_EFFECT_IDENTITY_SQL,
+            _ADJUDICATION_EFFECT_IDENTITY_PARAMETERS,
         )
         status_rows = conn.execute(
-            """
+            f"""
             SELECT status, COUNT(*) AS count
               FROM rca_delivery_effects
-             WHERE json_valid(payload_json)
-               AND json_extract(payload_json, '$.schema_version') = ?
+             WHERE {_ADJUDICATION_EFFECT_IDENTITY_SQL}
              GROUP BY status ORDER BY status
             """,
-            (ADJUDICATION_EFFECT_SCHEMA_VERSION,),
+            _ADJUDICATION_EFFECT_IDENTITY_PARAMETERS,
         ).fetchall()
         adjudication_statuses = {
             str(row["status"]): int(row["count"]) for row in status_rows
@@ -313,28 +335,24 @@ def audit_conclusion_adjudications(control_db: str | Path) -> dict[str, Any]:
             )
             budget_violations = _scalar(
                 conn,
-                """
+                f"""
                 SELECT COUNT(*) FROM (
                     SELECT j.business_key
                       FROM rca_delivery_effects AS e
                       JOIN rca_delivery_jobs AS j
                         ON j.delivery_id = e.delivery_id
-                     WHERE json_valid(e.payload_json)
-                       AND json_extract(
-                               e.payload_json, '$.schema_version'
-                           ) = ?
+                     WHERE {_ADJUDICATION_EFFECT_IDENTITY_SQL_E}
                      GROUP BY j.business_key HAVING COUNT(*) > 1
                 )
                 """,
-                (ADJUDICATION_EFFECT_SCHEMA_VERSION,),
+                _ADJUDICATION_EFFECT_IDENTITY_PARAMETERS,
             )
             attempt_violations = _scalar(
                 conn,
-                """
+                f"""
                 SELECT COUNT(*)
                   FROM rca_delivery_effects
-                 WHERE json_valid(payload_json)
-                   AND json_extract(payload_json, '$.schema_version') = ?
+                 WHERE {_ADJUDICATION_EFFECT_IDENTITY_SQL}
                    AND (
                         recovery_write_count != 0
                         OR adjudication_comment_attempt_count NOT IN (0, 1)
@@ -344,7 +362,7 @@ def audit_conclusion_adjudications(control_db: str | Path) -> dict[str, Any]:
                         )
                    )
                 """,
-                (ADJUDICATION_EFFECT_SCHEMA_VERSION,),
+                _ADJUDICATION_EFFECT_IDENTITY_PARAMETERS,
             )
             lineage_unresolved = _scalar(
                 conn,
@@ -366,18 +384,15 @@ def audit_conclusion_adjudications(control_db: str | Path) -> dict[str, Any]:
             )
             orphan_effects = _scalar(
                 conn,
-                """
+                f"""
                 SELECT COUNT(*)
                   FROM rca_delivery_effects AS e
              LEFT JOIN rca_conclusion_adjudications AS a
                     ON a.correction_effect_key = e.effect_key
-                 WHERE json_valid(e.payload_json)
-                   AND json_extract(
-                           e.payload_json, '$.schema_version'
-                       ) = ?
+                 WHERE {_ADJUDICATION_EFFECT_IDENTITY_SQL_E}
                    AND a.adjudication_id IS NULL
                 """,
-                (ADJUDICATION_EFFECT_SCHEMA_VERSION,),
+                _ADJUDICATION_EFFECT_IDENTITY_PARAMETERS,
             )
             try:
                 binding_mismatches, binding_validation_errors = (

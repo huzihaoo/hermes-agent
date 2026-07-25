@@ -64,6 +64,7 @@ _COMBINED_FIELDS = frozenset(
         "source_backup",
         "source_schema_version",
         "source_schema_variant",
+        "source_schema_contract",
         "source_logical_projection",
         "source_health",
         "migrated_clone",
@@ -560,6 +561,25 @@ def _combined_source_schema_variant(
             "legacy_adjudication_activation_operator_remediation"
         )
     return _COMBINED_W2_V8_VARIANT
+
+
+def _combined_source_schema_contract(
+    *,
+    source_variant: str,
+    source_projection: Mapping[str, Any],
+    expected_source_schema_sha256: str,
+) -> dict[str, Any]:
+    expected_sha256 = _hex64(expected_source_schema_sha256)
+    if source_projection.get("schema_sha256") != expected_sha256:
+        raise QuarantineMigrationError(
+            "delivery_store_combined_migration_source_schema_contract_invalid"
+        )
+    return {
+        "contract_id": f"external_full_schema_{source_variant}",
+        "schema_sha256": expected_sha256,
+        "table_count": len(source_projection.get("tables", {})),
+        "authority": "caller_supplied_external_predecessor_schema",
+    }
 
 
 def _combined_deterministic_transforms(
@@ -1309,6 +1329,7 @@ def build_combined_offline_migration_receipt(
     migrated_clone_path: str | Path,
     target_live_db_path: str | Path,
     migration_runtime_sha256: str,
+    expected_source_schema_sha256: str,
 ) -> dict[str, Any]:
     """Build a v7/W2-v8 to combined-v9 receipt from offline copies only."""
 
@@ -1367,6 +1388,11 @@ def build_combined_offline_migration_receipt(
             source_version=source_version,
         )
         source_projection = logical_database_projection(source)
+        source_schema_contract = _combined_source_schema_contract(
+            source_variant=source_variant,
+            source_projection=source_projection,
+            expected_source_schema_sha256=expected_source_schema_sha256,
+        )
         target_projection = logical_database_projection(clone)
         cross_projection_preservation = _combined_cross_projection_preservation(
             source=source,
@@ -1385,6 +1411,7 @@ def build_combined_offline_migration_receipt(
             },
             "source_schema_version": source_version,
             "source_schema_variant": source_variant,
+            "source_schema_contract": source_schema_contract,
             "source_logical_projection": source_projection,
             "source_health": source_health,
             "migrated_clone": {
@@ -1470,6 +1497,7 @@ def validate_combined_migration_receipt(
     expected_sha256: str,
     target_live_db_path: str | Path,
     expected_migration_runtime_sha256: str,
+    expected_source_schema_sha256: str,
     migrated_db_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Recompute a v2 combined-schema migration receipt and its rollback copy."""
@@ -1507,6 +1535,11 @@ def validate_combined_migration_receipt(
     expected_runtime_sha256 = _hex64(expected_migration_runtime_sha256)
     source_version = str(value.get("source_schema_version") or "")
     source_variant = str(value.get("source_schema_variant") or "")
+    source_schema_contract = _combined_source_schema_contract(
+        source_variant=source_variant,
+        source_projection=source_projection,
+        expected_source_schema_sha256=expected_source_schema_sha256,
+    )
     expected_source_variant = {
         "pnc_rca_delivery_store_v7": _COMBINED_ACTIVE_PROD_V7_VARIANT,
         "pnc_rca_delivery_store_v8": _COMBINED_W2_V8_VARIANT,
@@ -1516,6 +1549,7 @@ def validate_combined_migration_receipt(
         or value.get("schema_version") != COMBINED_SCHEMA_VERSION
         or source_version not in COMBINED_SOURCE_SCHEMA_VERSIONS
         or source_variant != expected_source_variant
+        or value.get("source_schema_contract") != source_schema_contract
         or value.get("target_schema_version") != COMBINED_TARGET_SCHEMA_VERSION
         or value.get("target_live_db_path") != target
         or len({str(source_path), str(clone_path), target}) != 3
@@ -1568,6 +1602,11 @@ def validate_combined_migration_receipt(
             source,
             source_version=observed_source_version,
         )
+        observed_source_schema_contract = _combined_source_schema_contract(
+            source_variant=observed_source_variant,
+            source_projection=observed_source_projection,
+            expected_source_schema_sha256=expected_source_schema_sha256,
+        )
         observed_cross_projection_preservation = (
             _combined_cross_projection_preservation(
                 source=source,
@@ -1587,6 +1626,7 @@ def validate_combined_migration_receipt(
         or len(clone_raw) != clone_size
         or observed_source_version != value.get("source_schema_version")
         or observed_source_variant != source_variant
+        or observed_source_schema_contract != source_schema_contract
         or observed_target_version != COMBINED_TARGET_SCHEMA_VERSION
         or observed_source_health != source_health
         or observed_target_health != target_health
@@ -1674,6 +1714,7 @@ def assert_combined_live_pre_migration_matches(
     expected_sha256: str,
     live_db_path: str | Path,
     expected_migration_runtime_sha256: str,
+    expected_source_schema_sha256: str,
 ) -> dict[str, Any]:
     """Require an immutable live snapshot to exactly match the v2 source."""
 
@@ -1682,6 +1723,7 @@ def assert_combined_live_pre_migration_matches(
         expected_sha256=expected_sha256,
         target_live_db_path=live_db_path,
         expected_migration_runtime_sha256=expected_migration_runtime_sha256,
+        expected_source_schema_sha256=expected_source_schema_sha256,
     )
     source_projection, _target_projection = _combined_receipt_projections(
         receipt_path=receipt_path,
@@ -1714,6 +1756,7 @@ def assert_combined_live_post_migration_matches(
     expected_sha256: str,
     live_db_path: str | Path,
     expected_migration_runtime_sha256: str,
+    expected_source_schema_sha256: str,
 ) -> dict[str, Any]:
     """Require the stopped live database to exactly match the v2 v9 clone."""
 
@@ -1722,6 +1765,7 @@ def assert_combined_live_post_migration_matches(
         expected_sha256=expected_sha256,
         target_live_db_path=live_db_path,
         expected_migration_runtime_sha256=expected_migration_runtime_sha256,
+        expected_source_schema_sha256=expected_source_schema_sha256,
     )
     _source_projection, target_projection = _combined_receipt_projections(
         receipt_path=receipt_path,

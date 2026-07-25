@@ -335,6 +335,9 @@ def _prepare_combined_schema_migration(
         destination.close()
         source.close()
     source_backup.chmod(0o600)
+    with sqlite3.connect(source_backup) as conn:
+        conn.row_factory = sqlite3.Row
+        source_schema_sha256 = logical_database_projection(conn)["schema_sha256"]
     clone_path = root / "control.v9.offline-clone.sqlite3"
     shutil.copyfile(source_backup, clone_path)
     clone_path.chmod(0o600)
@@ -349,6 +352,7 @@ def _prepare_combined_schema_migration(
         migrated_clone_path=clone_path,
         target_live_db_path=live_path,
         migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+        expected_source_schema_sha256=source_schema_sha256,
     )
     receipt_path = root / "combined-offline-migration-receipt.json"
     receipt_path.write_bytes(canonical_migration_receipt_bytes(receipt))
@@ -360,6 +364,7 @@ def _prepare_combined_schema_migration(
         "receipt": receipt,
         "receipt_path": receipt_path,
         "receipt_sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+        "source_schema_sha256": source_schema_sha256,
     }
 
 
@@ -378,6 +383,7 @@ def test_combined_v2_offline_receipt_requires_quick_checked_copy_and_rollback(
         target_live_db_path=migration["live_path"],
         migrated_db_path=migration["clone_path"],
         expected_migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+        expected_source_schema_sha256=migration["source_schema_sha256"],
     )
 
     assert binding["source_schema_version"] == source_version
@@ -481,6 +487,7 @@ def test_combined_v2_offline_receipt_rejects_unrelated_healthy_v9_clone(tmp_path
             migrated_clone_path=unrelated,
             target_live_db_path=migration["live_path"],
             migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+            expected_source_schema_sha256=migration["source_schema_sha256"],
         )
 
 
@@ -513,6 +520,7 @@ def test_combined_v2_validator_rejects_forged_unrelated_clone_binding(tmp_path):
             target_live_db_path=migration["live_path"],
             migrated_db_path=unrelated,
             expected_migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+            expected_source_schema_sha256=migration["source_schema_sha256"],
         )
 
 
@@ -531,6 +539,7 @@ def test_combined_v2_live_pre_and_post_gates_bind_exact_source_clone_and_rollbac
         expected_sha256=migration["receipt_sha256"],
         live_db_path=migration["live_path"],
         expected_migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+        expected_source_schema_sha256=migration["source_schema_sha256"],
     )
 
     assert pre["live_validation"]["schema_version"] == source_version
@@ -551,6 +560,7 @@ def test_combined_v2_live_pre_and_post_gates_bind_exact_source_clone_and_rollbac
         expected_sha256=migration["receipt_sha256"],
         live_db_path=migration["live_path"],
         expected_migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+        expected_source_schema_sha256=migration["source_schema_sha256"],
     )
 
     assert post["live_validation"]["schema_version"] == (
@@ -572,6 +582,7 @@ def _combined_receipt_for_target(
         migrated_clone_path=migration["clone_path"],
         target_live_db_path=target,
         migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+        expected_source_schema_sha256=migration["source_schema_sha256"],
     )
     return receipt_path, _write(receipt_path, receipt)
 
@@ -596,6 +607,7 @@ def test_combined_v2_live_pre_gate_rejects_nonexistent_target(tmp_path):
             expected_sha256=receipt_sha256,
             live_db_path=missing,
             expected_migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+            expected_source_schema_sha256=migration["source_schema_sha256"],
         )
 
 
@@ -627,6 +639,7 @@ def test_combined_v2_live_gates_reject_wrong_pre_and_unmigrated_post(tmp_path):
             expected_sha256=receipt_sha256,
             live_db_path=wrong_live,
             expected_migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+            expected_source_schema_sha256=migration["source_schema_sha256"],
         )
     with pytest.raises(
         QuarantineMigrationError,
@@ -637,6 +650,7 @@ def test_combined_v2_live_gates_reject_wrong_pre_and_unmigrated_post(tmp_path):
             expected_sha256=migration["receipt_sha256"],
             live_db_path=migration["live_path"],
             expected_migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+            expected_source_schema_sha256=migration["source_schema_sha256"],
         )
 
 
@@ -682,6 +696,7 @@ def test_combined_v2_cross_schema_rejects_source_owned_schema_drift(
             migrated_clone_path=migration["clone_path"],
             target_live_db_path=migration["live_path"],
             migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+            expected_source_schema_sha256=migration["source_schema_sha256"],
         )
 
 
@@ -732,6 +747,7 @@ def test_combined_v2_rejects_noncanonical_added_v9_objects(tmp_path, mutation):
             migrated_clone_path=migration["clone_path"],
             target_live_db_path=migration["live_path"],
             migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+            expected_source_schema_sha256=migration["source_schema_sha256"],
         )
 
 
@@ -770,6 +786,84 @@ def test_combined_v2_rejects_malformed_w2_source_schema_as_self_proof(tmp_path):
             migrated_clone_path=migration["clone_path"],
             target_live_db_path=migration["live_path"],
             migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+            expected_source_schema_sha256=migration["source_schema_sha256"],
+        )
+
+
+def _mutate_inherited_schema(path: Path, mutation: str) -> None:
+    with sqlite3.connect(path) as conn:
+        if mutation == "delete_trigger":
+            conn.execute("DROP TRIGGER trg_rca_quarantine_audit_no_update")
+        else:
+            conn.execute("PRAGMA writable_schema=ON")
+            conn.execute(
+                "UPDATE sqlite_master SET sql = REPLACE(sql, ?, ?) "
+                "WHERE type = 'table' AND name = 'rca_delivery_effects'",
+                ("CHECK (attempt >= 0)", "CHECK (attempt >= -1)"),
+            )
+            schema_version = conn.execute("PRAGMA schema_version").fetchone()[0]
+            conn.execute(f"PRAGMA schema_version = {schema_version + 1}")
+            conn.execute("PRAGMA writable_schema=OFF")
+        conn.execute("PRAGMA journal_mode=DELETE")
+    path.chmod(0o600)
+
+
+@pytest.mark.parametrize(
+    "source_version",
+    ["pnc_rca_delivery_store_v7", "pnc_rca_delivery_store_v8"],
+)
+@pytest.mark.parametrize("mutation", ["delete_trigger", "weaken_check"])
+def test_combined_v2_external_schema_anchor_rejects_synchronized_drift(
+    tmp_path,
+    source_version,
+    mutation,
+):
+    migration = _prepare_combined_schema_migration(tmp_path, source_version)
+    _mutate_inherited_schema(migration["source_backup"], mutation)
+    _mutate_inherited_schema(migration["clone_path"], mutation)
+
+    with pytest.raises(
+        QuarantineMigrationError,
+        match="delivery_store_combined_migration_source_schema_contract_invalid",
+    ):
+        build_combined_offline_migration_receipt(
+            source_backup_path=migration["source_backup"],
+            migrated_clone_path=migration["clone_path"],
+            target_live_db_path=migration["live_path"],
+            migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+            expected_source_schema_sha256=migration["source_schema_sha256"],
+        )
+
+
+def test_combined_v2_validator_requires_external_not_receipt_schema_anchor(tmp_path):
+    migration = _prepare_combined_schema_migration(
+        tmp_path, "pnc_rca_delivery_store_v8"
+    )
+    _mutate_inherited_schema(migration["source_backup"], "weaken_check")
+    _mutate_inherited_schema(migration["clone_path"], "weaken_check")
+    with sqlite3.connect(migration["source_backup"]) as conn:
+        conn.row_factory = sqlite3.Row
+        self_attested_sha256 = logical_database_projection(conn)["schema_sha256"]
+    forged = build_combined_offline_migration_receipt(
+        source_backup_path=migration["source_backup"],
+        migrated_clone_path=migration["clone_path"],
+        target_live_db_path=migration["live_path"],
+        migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+        expected_source_schema_sha256=self_attested_sha256,
+    )
+    forged_path = tmp_path / "self-attested-schema-receipt.json"
+    forged_sha256 = _write(forged_path, forged)
+
+    with pytest.raises(
+        QuarantineMigrationError,
+        match="delivery_store_combined_migration_source_schema_contract_invalid",
+    ):
+        validate_combined_migration_receipt(
+            receipt_path=forged_path,
+            expected_sha256=forged_sha256,
+            target_live_db_path=migration["live_path"],
+            expected_migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+            expected_source_schema_sha256=migration["source_schema_sha256"],
         )
 
 

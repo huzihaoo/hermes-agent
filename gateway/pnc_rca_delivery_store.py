@@ -1860,60 +1860,9 @@ class RcaDeliveryStore:
             conn.execute("BEGIN")
             self._current_effect_claim(
                 conn,
-                effect_key=claim.effect_key,
-                lease_token=claim.lease_token,
-                fence=claim.fence,
+                claim=claim,
                 current=current,
             )
-            validate_conclusion_adjudication_schema(conn)
-            activation_columns = {
-                str(row["name"])
-                for row in conn.execute(
-                    "PRAGMA table_info(rca_activation_epochs)"
-                ).fetchall()
-            }
-            if not {"epoch_id", "state", "is_current"}.issubset(
-                activation_columns
-            ):
-                raise ConclusionAdjudicationError(
-                    "conclusion_adjudication_effect_activation_stale"
-                )
-            row = conn.execute(
-                """
-                SELECT a.*,
-                       original.status AS original_effect_status,
-                       original.write_phase AS original_effect_write_phase,
-                       original.delivery_id AS original_effect_delivery_id,
-                       original.effect_kind AS original_effect_kind,
-                       original.required AS original_effect_required,
-                       original.outcome AS original_effect_outcome,
-                       original.target_key AS original_effect_target_key,
-                       original_job.business_key AS original_job_business_key,
-                       original_job.generation AS original_job_generation,
-                       original_job.project_key AS original_job_project_key,
-                       original_job.work_item_type_key
-                           AS original_job_work_item_type_key,
-                       original_job.work_item_id AS original_job_work_item_id,
-                       original_job.target_key AS original_job_target_key,
-                       original_job.outcome AS original_job_outcome,
-                       epoch.state AS activation_state,
-                       epoch.is_current AS activation_is_current
-                  FROM rca_conclusion_adjudications AS a
-                  JOIN rca_delivery_effects AS original
-                    ON original.effect_key = a.original_effect_key
-                  JOIN rca_delivery_jobs AS original_job
-                    ON original_job.delivery_id = a.original_delivery_id
-                  LEFT JOIN rca_activation_epochs AS epoch
-                    ON epoch.epoch_id = a.activation_epoch_id
-                 WHERE a.correction_effect_key = ?
-                """,
-                (claim.effect_key,),
-            ).fetchone()
-            if row is None:
-                raise ConclusionAdjudicationError(
-                    "conclusion_adjudication_effect_ledger_missing"
-                )
-            validate_adjudication_effect_ledger_binding(claim, dict(row))
             conn.commit()
         except Exception:
             conn.rollback()
@@ -3727,13 +3676,91 @@ class RcaDeliveryStore:
             conn.close()
 
     @staticmethod
-    def _current_effect_claim(
+    def _validate_current_adjudication_binding_tx(
         conn: sqlite3.Connection,
         *,
-        effect_key: str,
-        lease_token: str,
-        fence: int,
+        claim: DeliveryEffectClaim,
+        require_immutable_binding: bool = True,
+    ) -> None:
+        validate_conclusion_adjudication_schema(conn)
+        activation_columns = {
+            str(row["name"])
+            for row in conn.execute(
+                "PRAGMA table_info(rca_activation_epochs)"
+            ).fetchall()
+        }
+        if not {"epoch_id", "state", "is_current"}.issubset(activation_columns):
+            raise ConclusionAdjudicationError(
+                "conclusion_adjudication_effect_activation_stale"
+            )
+        row = conn.execute(
+            """
+            SELECT a.*,
+                   original.status AS original_effect_status,
+                   original.write_phase AS original_effect_write_phase,
+                   original.delivery_id AS original_effect_delivery_id,
+                   original.effect_kind AS original_effect_kind,
+                   original.required AS original_effect_required,
+                   original.outcome AS original_effect_outcome,
+                   original.target_key AS original_effect_target_key,
+                   original_job.business_key AS original_job_business_key,
+                   original_job.generation AS original_job_generation,
+                   original_job.project_key AS original_job_project_key,
+                   original_job.work_item_type_key
+                       AS original_job_work_item_type_key,
+                   original_job.work_item_id AS original_job_work_item_id,
+                   original_job.target_key AS original_job_target_key,
+                   original_job.outcome AS original_job_outcome,
+                   epoch.state AS activation_state,
+                   epoch.is_current AS activation_is_current
+              FROM rca_conclusion_adjudications AS a
+              JOIN rca_delivery_effects AS original
+                ON original.effect_key = a.original_effect_key
+              JOIN rca_delivery_jobs AS original_job
+                ON original_job.delivery_id = a.original_delivery_id
+              LEFT JOIN rca_activation_epochs AS epoch
+                ON epoch.epoch_id = a.activation_epoch_id
+             WHERE a.correction_effect_key = ?
+            """,
+            (claim.effect_key,),
+        ).fetchone()
+        if row is None:
+            if not require_immutable_binding and isinstance(claim.payload, Mapping):
+                payload_epoch_id = str(
+                    claim.payload.get("activation_epoch_id") or ""
+                )
+                active_payload_epoch = conn.execute(
+                    "SELECT 1 FROM rca_activation_epochs "
+                    "WHERE epoch_id = ? AND is_current = 1 "
+                    "AND state IN ('bounded_active', 'steady_active')",
+                    (payload_epoch_id,),
+                ).fetchone()
+                if active_payload_epoch is not None:
+                    return
+                raise ConclusionAdjudicationError(
+                    "conclusion_adjudication_effect_activation_stale"
+                )
+            raise ConclusionAdjudicationError(
+                "conclusion_adjudication_effect_ledger_missing"
+            )
+        if (
+            row["activation_is_current"] != 1
+            or row["activation_state"] not in {"bounded_active", "steady_active"}
+        ):
+            raise ConclusionAdjudicationError(
+                "conclusion_adjudication_effect_activation_stale"
+            )
+        if require_immutable_binding:
+            validate_adjudication_effect_ledger_binding(claim, dict(row))
+
+    @classmethod
+    def _current_effect_claim(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        claim: DeliveryEffectClaim,
         current: str,
+        allow_invalid_adjudication: bool = False,
     ) -> sqlite3.Row:
         row = conn.execute(
             """
@@ -3745,11 +3772,45 @@ class RcaDeliveryStore:
                AND e.status = 'claimed'
                AND e.lease_expires_at IS NOT NULL AND e.lease_expires_at > ?
             """,
-            (effect_key, lease_token, fence, current),
+            (claim.effect_key, claim.lease_token, claim.fence, current),
         ).fetchone()
         if row is None:
             raise StaleDeliveryEffectLeaseError(
-                f"stale delivery-effect lease for {effect_key} fence {fence}"
+                f"stale delivery-effect lease for {claim.effect_key} "
+                f"fence {claim.fence}"
+            )
+        try:
+            current_payload = json.loads(str(row["payload_json"] or ""))
+        except (TypeError, json.JSONDecodeError):
+            current_payload = {}
+        claim_is_adjudication = isinstance(
+            claim.payload, Mapping
+        ) and identifies_adjudication_effect(
+            claim.payload,
+            target_key=claim.target_key,
+        )
+        row_is_adjudication = isinstance(
+            current_payload, Mapping
+        ) and identifies_adjudication_effect(
+            current_payload,
+            target_key=str(row["target_key"] or ""),
+        )
+        if claim_is_adjudication or row_is_adjudication:
+            if not allow_invalid_adjudication and (
+                current_payload != claim.payload
+                or str(row["delivery_id"] or "") != claim.delivery_id
+                or str(row["effect_kind"] or "") != claim.effect_kind
+                or int(row["required"]) != int(claim.required)
+                or str(row["target_key"] or "") != claim.target_key
+                or str(row["payload_sha256"] or "") != claim.payload_sha256
+            ):
+                raise ConclusionAdjudicationError(
+                    "conclusion_adjudication_effect_ledger_mismatch"
+                )
+            cls._validate_current_adjudication_binding_tx(
+                conn,
+                claim=claim,
+                require_immutable_binding=not allow_invalid_adjudication,
             )
         return row
 
@@ -3772,6 +3833,7 @@ class RcaDeliveryStore:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            self._current_effect_claim(conn, claim=claim, current=current)
             updated = conn.execute(
                 """
                 UPDATE rca_delivery_effects
@@ -3942,9 +4004,7 @@ class RcaDeliveryStore:
             conn.execute("BEGIN IMMEDIATE")
             row = self._current_effect_claim(
                 conn,
-                effect_key=claim.effect_key,
-                lease_token=claim.lease_token,
-                fence=claim.fence,
+                claim=claim,
                 current=current,
             )
             activation_enforced = self._activation_enforced_tx(
@@ -4018,9 +4078,7 @@ class RcaDeliveryStore:
             conn.execute("BEGIN IMMEDIATE")
             row = self._current_effect_claim(
                 conn,
-                effect_key=claim.effect_key,
-                lease_token=claim.lease_token,
-                fence=claim.fence,
+                claim=claim,
                 current=current,
             )
             suppressed = self._suppress_terminal_effect_if_newer_settled_fields_tx(
@@ -4060,9 +4118,7 @@ class RcaDeliveryStore:
             conn.execute("BEGIN IMMEDIATE")
             row = self._current_effect_claim(
                 conn,
-                effect_key=claim.effect_key,
-                lease_token=claim.lease_token,
-                fence=claim.fence,
+                claim=claim,
                 current=current,
             )
             if str(row["write_phase"] or "") != "prewrite":
@@ -4147,9 +4203,7 @@ class RcaDeliveryStore:
             conn.execute("BEGIN IMMEDIATE")
             row = self._current_effect_claim(
                 conn,
-                effect_key=claim.effect_key,
-                lease_token=claim.lease_token,
-                fence=claim.fence,
+                claim=claim,
                 current=current,
             )
             if str(row["write_phase"] or "") != "write_started":
@@ -4238,9 +4292,7 @@ class RcaDeliveryStore:
             conn.execute("BEGIN IMMEDIATE")
             row = self._current_effect_claim(
                 conn,
-                effect_key=claim.effect_key,
-                lease_token=claim.lease_token,
-                fence=claim.fence,
+                claim=claim,
                 current=current,
             )
             try:
@@ -4338,9 +4390,7 @@ class RcaDeliveryStore:
             conn.execute("BEGIN IMMEDIATE")
             row = self._current_effect_claim(
                 conn,
-                effect_key=claim.effect_key,
-                lease_token=claim.lease_token,
-                fence=claim.fence,
+                claim=claim,
                 current=current,
             )
             activation_enforced = self._activation_enforced_tx(
@@ -4758,9 +4808,7 @@ class RcaDeliveryStore:
             conn.execute("BEGIN IMMEDIATE")
             row = self._current_effect_claim(
                 conn,
-                effect_key=claim.effect_key,
-                lease_token=claim.lease_token,
-                fence=claim.fence,
+                claim=claim,
                 current=current,
             )
             self._append_attempt_event(
@@ -4930,9 +4978,7 @@ class RcaDeliveryStore:
     ) -> DeliveryEffectMutation:
         row = self._current_effect_claim(
             conn,
-            effect_key=claim.effect_key,
-            lease_token=claim.lease_token,
-            fence=claim.fence,
+            claim=claim,
             current=current,
         )
         age = (current_dt - _parse_iso(str(row["created_at"]))).total_seconds()
@@ -5084,10 +5130,9 @@ class RcaDeliveryStore:
     ) -> DeliveryEffectMutation:
         row = self._current_effect_claim(
             conn,
-            effect_key=claim.effect_key,
-            lease_token=claim.lease_token,
-            fence=claim.fence,
+            claim=claim,
             current=current,
+            allow_invalid_adjudication=True,
         )
         self._append_attempt_event(
             conn,

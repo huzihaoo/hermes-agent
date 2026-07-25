@@ -26,7 +26,12 @@ from gateway.pnc_rca_quality_oracle import evaluate_structural_tier
 ADJUDICATION_SCHEMA_VERSION = "pnc_rca_conclusion_adjudication_v1"
 ADJUDICATION_EFFECT_SCHEMA_VERSION_V1 = "pnc_rca_conclusion_adjudication_effect_v1"
 ADJUDICATION_EFFECT_SCHEMA_VERSION = "pnc_rca_conclusion_adjudication_effect_v2"
+ADJUDICATION_EFFECT_SCHEMA_VERSIONS = (
+    ADJUDICATION_EFFECT_SCHEMA_VERSION_V1,
+    ADJUDICATION_EFFECT_SCHEMA_VERSION,
+)
 ADJUDICATION_EFFECT_TARGET_PREFIX = "g1q3-rca-adjudication-target-v1"
+ADJUDICATION_EFFECT_TARGET_KEY_PREFIX = f"{ADJUDICATION_EFFECT_TARGET_PREFIX}-"
 ADJUDICATION_ID_PREFIX = "g1q3-rca-adjudication-v1"
 ADJUDICATION_ACTIONS = frozenset({"retract", "recognize"})
 ADJUDICATION_STATES = {
@@ -603,10 +608,7 @@ def validate_conclusion_adjudication_schema(conn: sqlite3.Connection) -> None:
 
 
 def is_adjudication_effect_payload(payload: Mapping[str, Any]) -> bool:
-    return payload.get("schema_version") in {
-        ADJUDICATION_EFFECT_SCHEMA_VERSION_V1,
-        ADJUDICATION_EFFECT_SCHEMA_VERSION,
-    }
+    return payload.get("schema_version") in ADJUDICATION_EFFECT_SCHEMA_VERSIONS
 
 
 def identifies_adjudication_effect(
@@ -615,7 +617,7 @@ def identifies_adjudication_effect(
     """Recognize current, legacy, and schema-laundered correction effects."""
 
     return is_adjudication_effect_payload(payload) or str(target_key).startswith(
-        f"{ADJUDICATION_EFFECT_TARGET_PREFIX}-"
+        ADJUDICATION_EFFECT_TARGET_KEY_PREFIX
     )
 
 
@@ -972,15 +974,19 @@ def record_conclusion_adjudication_tx(
           JOIN rca_delivery_jobs AS j ON j.delivery_id = e.delivery_id
          WHERE j.business_key = ?
            AND (
-                e.payload_json LIKE ?
-                OR e.payload_json LIKE ?
+                (
+                    json_valid(e.payload_json)
+                    AND json_extract(e.payload_json, '$.schema_version') IN (?, ?)
+                )
+                OR substr(e.target_key, 1, ?) = ?
            )
          LIMIT 1
         """,
         (
             row["business_key"],
-            f'%"schema_version":"{ADJUDICATION_EFFECT_SCHEMA_VERSION}"%',
-            f'%"schema_version":"{ADJUDICATION_EFFECT_SCHEMA_VERSION_V1}"%',
+            *ADJUDICATION_EFFECT_SCHEMA_VERSIONS,
+            len(ADJUDICATION_EFFECT_TARGET_KEY_PREFIX),
+            ADJUDICATION_EFFECT_TARGET_KEY_PREFIX,
         ),
     ).fetchone()
     if legacy_effect is not None:

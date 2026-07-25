@@ -289,6 +289,13 @@ class _EffectLeaseKeeper:
             self._stop.set()
             return mutation()
 
+    def settle_without_renewal(self, mutation: Callable[[], Any]) -> Any:
+        """Stop renewals and let the fenced mutation validate in its transaction."""
+        with self._lock:
+            self._raise_if_failed_locked()
+            self._stop.set()
+            return mutation()
+
     def stop(self) -> None:
         self._stop.set()
         if not self._started:
@@ -2434,8 +2441,13 @@ class DeliveryDispatcher:
         self,
         claim: DeliveryEffectClaim,
         mutation: Callable[[], Any],
+        *,
+        renew: bool = True,
     ) -> Any:
-        return self._keeper_for_claim(claim).settle(mutation)
+        keeper = self._keeper_for_claim(claim)
+        if renew:
+            return keeper.settle(mutation)
+        return keeper.settle_without_renewal(mutation)
 
     def _lease_lost(self, claim: DeliveryEffectClaim) -> DispatchOutcome:
         self.stats.lease_lost += 1
@@ -2445,6 +2457,49 @@ class DeliveryDispatcher:
             delivery_id=claim.delivery_id,
             attempt=claim.attempt,
             error_code="stale_delivery_effect_lease",
+        )
+
+    def _adjudication_binding_gate(
+        self,
+        claim: DeliveryEffectClaim,
+        *,
+        after_outward_boundary: bool,
+    ) -> DispatchOutcome | None:
+        try:
+            self.store.validate_adjudication_effect_binding(
+                claim=claim,
+                now=self.now(),
+            )
+        except ConclusionAdjudicationError as exc:
+            error_code = str(exc)
+            if (
+                error_code == "conclusion_adjudication_effect_activation_stale"
+                or after_outward_boundary
+            ):
+                return self._adjudication_error_outcome(claim, exc)
+            return self._quarantine(
+                claim,
+                error_code=error_code,
+                detail="adjudication effect is not bound to its immutable ledger",
+            )
+        return None
+
+    @staticmethod
+    def _adjudication_error_outcome(
+        claim: DeliveryEffectClaim,
+        exc: ConclusionAdjudicationError,
+    ) -> DispatchOutcome:
+        error_code = str(exc)
+        return DispatchOutcome(
+            status=(
+                "activation_stale"
+                if error_code == "conclusion_adjudication_effect_activation_stale"
+                else "adjudication_invalid"
+            ),
+            effect_key=claim.effect_key,
+            delivery_id=claim.delivery_id,
+            attempt=claim.attempt,
+            error_code=error_code,
         )
 
     def _retry(
@@ -2499,6 +2554,9 @@ class DeliveryDispatcher:
                 error_code=error_code,
                 error_detail=detail,
                 now=self.now(),
+            ),
+            renew=not identifies_adjudication_effect(
+                claim.payload, target_key=claim.target_key
             ),
         )
         self.stats.quarantined += 1
@@ -2606,7 +2664,21 @@ class DeliveryDispatcher:
                 outcome = self._dispatch_claim(claim)
                 keeper.checkpoint()
                 return outcome
+            except ConclusionAdjudicationError as exc:
+                return self._adjudication_error_outcome(claim, exc)
             except StaleDeliveryEffectLeaseError:
+                if identifies_adjudication_effect(
+                    claim.payload, target_key=claim.target_key
+                ):
+                    try:
+                        binding_failure = self._adjudication_binding_gate(
+                            claim,
+                            after_outward_boundary=True,
+                        )
+                    except StaleDeliveryEffectLeaseError:
+                        binding_failure = None
+                    if binding_failure is not None:
+                        return binding_failure
                 return self._lease_lost(claim)
         finally:
             self._stop_effect_lease_keeper(keeper)
@@ -2824,23 +2896,18 @@ class DeliveryDispatcher:
         adjudication_effect = identifies_adjudication_effect(
             claim.payload, target_key=claim.target_key
         )
-        self._heartbeat(claim)
         try:
             validated = _validate_effect(claim)
         except DeliveryContractError as exc:
             return self._quarantine(claim, error_code=exc.code, detail=exc.detail)
         if adjudication_effect:
-            try:
-                self.store.validate_adjudication_effect_binding(
-                    claim=claim,
-                    now=self.now(),
-                )
-            except ConclusionAdjudicationError as exc:
-                return self._quarantine(
-                    claim,
-                    error_code=str(exc),
-                    detail="adjudication effect is not bound to its immutable ledger",
-                )
+            binding_failure = self._adjudication_binding_gate(
+                claim,
+                after_outward_boundary=False,
+            )
+            if binding_failure is not None:
+                return binding_failure
+        self._heartbeat(claim)
 
         superseded = self.store.suppress_terminal_effect_if_newer_settled_fields(
             claim=claim,
@@ -2868,6 +2935,13 @@ class DeliveryDispatcher:
         try:
             before_raw = self._list_remote_effect(claim, validated)
         except Exception as exc:
+            if adjudication_effect:
+                binding_failure = self._adjudication_binding_gate(
+                    claim,
+                    after_outward_boundary=True,
+                )
+                if binding_failure is not None:
+                    return binding_failure
             self._heartbeat(claim)
             return self._retry(
                 claim,
@@ -2879,6 +2953,13 @@ class DeliveryDispatcher:
                 detail=type(exc).__name__,
                 uncertain=prior_write_uncertain,
             )
+        if adjudication_effect:
+            binding_failure = self._adjudication_binding_gate(
+                claim,
+                after_outward_boundary=True,
+            )
+            if binding_failure is not None:
+                return binding_failure
         self._heartbeat(claim)
         comments, before = _strict_comments(before_raw)
         if comments is None:
@@ -2890,6 +2971,13 @@ class DeliveryDispatcher:
         try:
             before_fields_raw = self._read_field_updates(claim, validated)
         except Exception as exc:
+            if adjudication_effect:
+                binding_failure = self._adjudication_binding_gate(
+                    claim,
+                    after_outward_boundary=True,
+                )
+                if binding_failure is not None:
+                    return binding_failure
             self._heartbeat(claim)
             return self._retry(
                 claim,
@@ -2897,6 +2985,13 @@ class DeliveryDispatcher:
                 detail=type(exc).__name__,
                 uncertain=prior_write_uncertain,
             )
+        if adjudication_effect:
+            binding_failure = self._adjudication_binding_gate(
+                claim,
+                after_outward_boundary=True,
+            )
+            if binding_failure is not None:
+                return binding_failure
         self._heartbeat(claim)
         before_fields, before_field_result = _strict_field_values(
             before_fields_raw, expected_field_keys
@@ -3096,11 +3191,14 @@ class DeliveryDispatcher:
             )
         ):
             self._heartbeat(claim)
-            superseded = self.store.mark_effect_write_started(
-                claim=claim,
-                now=self.now(),
-                activation_required=self.config.activation_required,
-            )
+            try:
+                superseded = self.store.mark_effect_write_started(
+                    claim=claim,
+                    now=self.now(),
+                    activation_required=self.config.activation_required,
+                )
+            except ConclusionAdjudicationError as exc:
+                return self._adjudication_error_outcome(claim, exc)
             if superseded is not None:
                 self.stats.reconciled += 1
                 return DispatchOutcome(
@@ -3114,6 +3212,13 @@ class DeliveryDispatcher:
             try:
                 update_raw = self._write_field_updates(claim, validated)
             except Exception as exc:
+                if adjudication_effect:
+                    binding_failure = self._adjudication_binding_gate(
+                        claim,
+                        after_outward_boundary=True,
+                    )
+                    if binding_failure is not None:
+                        return binding_failure
                 self._heartbeat(claim)
                 return self._retry(
                     claim,
@@ -3121,6 +3226,13 @@ class DeliveryDispatcher:
                     detail=type(exc).__name__,
                     uncertain=True,
                 )
+            if adjudication_effect:
+                binding_failure = self._adjudication_binding_gate(
+                    claim,
+                    after_outward_boundary=True,
+                )
+                if binding_failure is not None:
+                    return binding_failure
             self._heartbeat(claim)
             if not isinstance(update_raw, Mapping):
                 return self._open_circuit(
@@ -3143,6 +3255,13 @@ class DeliveryDispatcher:
             try:
                 confirmed_fields_raw = self._read_field_updates(claim, validated)
             except Exception as exc:
+                if adjudication_effect:
+                    binding_failure = self._adjudication_binding_gate(
+                        claim,
+                        after_outward_boundary=True,
+                    )
+                    if binding_failure is not None:
+                        return binding_failure
                 self._heartbeat(claim)
                 return self._retry(
                     claim,
@@ -3150,6 +3269,13 @@ class DeliveryDispatcher:
                     detail=type(exc).__name__,
                     uncertain=True,
                 )
+            if adjudication_effect:
+                binding_failure = self._adjudication_binding_gate(
+                    claim,
+                    after_outward_boundary=True,
+                )
+                if binding_failure is not None:
+                    return binding_failure
             self._heartbeat(claim)
             confirmed_fields, confirmed_field_result = _strict_field_values(
                 confirmed_fields_raw, expected_field_keys
@@ -3176,11 +3302,14 @@ class DeliveryDispatcher:
                 source="field_repair_after_marker",
             )
         if adjudication_effect:
-            authorized = self.store.authorize_adjudication_comment_attempt(
-                claim=claim,
-                now=self.now(),
-                activation_required=self.config.activation_required,
-            )
+            try:
+                authorized = self.store.authorize_adjudication_comment_attempt(
+                    claim=claim,
+                    now=self.now(),
+                    activation_required=self.config.activation_required,
+                )
+            except ConclusionAdjudicationError as exc:
+                return self._adjudication_error_outcome(claim, exc)
             if not authorized:
                 return self._retry(
                     claim,
@@ -3192,6 +3321,13 @@ class DeliveryDispatcher:
         try:
             add_raw = self._add_remote_effect(claim, validated)
         except Exception as exc:
+            if adjudication_effect:
+                binding_failure = self._adjudication_binding_gate(
+                    claim,
+                    after_outward_boundary=True,
+                )
+                if binding_failure is not None:
+                    return binding_failure
             self._heartbeat(claim)
             return self._retry(
                 claim,
@@ -3203,6 +3339,13 @@ class DeliveryDispatcher:
                 detail=type(exc).__name__,
                 uncertain=True,
             )
+        if adjudication_effect:
+            binding_failure = self._adjudication_binding_gate(
+                claim,
+                after_outward_boundary=True,
+            )
+            if binding_failure is not None:
+                return binding_failure
         self._heartbeat(claim)
         if not isinstance(add_raw, Mapping):
             return self._open_circuit(
@@ -3241,6 +3384,13 @@ class DeliveryDispatcher:
         try:
             after_raw = self._list_remote_effect(claim, validated)
         except Exception as exc:
+            if adjudication_effect:
+                binding_failure = self._adjudication_binding_gate(
+                    claim,
+                    after_outward_boundary=True,
+                )
+                if binding_failure is not None:
+                    return binding_failure
             self._heartbeat(claim)
             return self._retry(
                 claim,
@@ -3248,6 +3398,13 @@ class DeliveryDispatcher:
                 detail=type(exc).__name__,
                 uncertain=True,
             )
+        if adjudication_effect:
+            binding_failure = self._adjudication_binding_gate(
+                claim,
+                after_outward_boundary=True,
+            )
+            if binding_failure is not None:
+                return binding_failure
         self._heartbeat(claim)
         after_comments, after = _strict_comments(after_raw)
         if after_comments is None:
@@ -3296,6 +3453,13 @@ class DeliveryDispatcher:
         try:
             final_fields_raw = self._read_field_updates(claim, validated)
         except Exception as exc:
+            if adjudication_effect:
+                binding_failure = self._adjudication_binding_gate(
+                    claim,
+                    after_outward_boundary=True,
+                )
+                if binding_failure is not None:
+                    return binding_failure
             self._heartbeat(claim)
             return self._retry(
                 claim,
@@ -3303,6 +3467,13 @@ class DeliveryDispatcher:
                 detail=type(exc).__name__,
                 uncertain=True,
             )
+        if adjudication_effect:
+            binding_failure = self._adjudication_binding_gate(
+                claim,
+                after_outward_boundary=True,
+            )
+            if binding_failure is not None:
+                return binding_failure
         self._heartbeat(claim)
         final_fields, final_field_result = _strict_field_values(
             final_fields_raw, expected_field_keys

@@ -220,6 +220,30 @@ def _dispatcher(
     )
 
 
+def _effect_attempt_snapshot(
+    store: RcaDeliveryStore,
+    *,
+    effect_key: str,
+) -> dict[str, object]:
+    with sqlite3.connect(store.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        effect = dict(
+            conn.execute(
+                "SELECT * FROM rca_delivery_effects WHERE effect_key = ?",
+                (effect_key,),
+            ).fetchone()
+        )
+        attempts = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM rca_delivery_attempts WHERE effect_key = ? "
+                "ORDER BY attempt_id",
+                (effect_key,),
+            )
+        ]
+    return {"effect": effect, "attempts": attempts}
+
+
 def _complete_artifact_repair(
     store: RcaDeliveryStore,
     artifact_root,
@@ -483,6 +507,135 @@ def test_epoch_rotation_after_claim_fails_before_remote_boundary(tmp_path):
         store.validate_adjudication_effect_binding(claim=claim, now=NOW)
 
 
+def test_dispatcher_epoch_rotation_after_claim_has_zero_effect_or_attempt_mutation(
+    tmp_path,
+    monkeypatch,
+):
+    store = _seed_published_conclusion(tmp_path)
+    result = _record_retraction(store)
+    frozen: dict[str, object] = {}
+    real_validate = store.validate_adjudication_effect_binding
+
+    def rotate_then_validate(*, claim, now):
+        with sqlite3.connect(store.db_path) as conn:
+            conn.execute(
+                "UPDATE rca_activation_epochs SET is_current = 0 "
+                "WHERE epoch_id = 'epoch-w16-active'"
+            )
+            conn.execute(
+                "INSERT INTO rca_activation_epochs VALUES "
+                "('epoch-w16-rotated', 'steady_active', 1)"
+            )
+        frozen.update(
+            _effect_attempt_snapshot(store, effect_key=result.correction_effect_key)
+        )
+        return real_validate(claim=claim, now=now)
+
+    monkeypatch.setattr(
+        store,
+        "validate_adjudication_effect_binding",
+        rotate_then_validate,
+    )
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("stale adjudication must stop before remote boundaries")
+
+    dispatcher = _dispatcher(
+        store,
+        list_comments=unexpected,
+        add_comment=unexpected,
+        get_fields=unexpected,
+        update_fields=unexpected,
+    )
+    outcome = dispatcher.dispatch_one()
+
+    assert outcome.status == "activation_stale"
+    assert outcome.error_code == "conclusion_adjudication_effect_activation_stale"
+    assert _effect_attempt_snapshot(
+        store, effect_key=result.correction_effect_key
+    ) == frozen
+
+
+def test_epoch_rotation_after_successful_remote_gate_fences_next_local_mutation(
+    tmp_path,
+    monkeypatch,
+):
+    store = _seed_published_conclusion(tmp_path)
+    result = _record_retraction(store)
+    frozen: dict[str, object] = {}
+    calls = {"list": 0, "fields": 0}
+
+    def list_comments(_project_key, _work_item_id):
+        calls["list"] += 1
+        return {
+            "success": True,
+            "comments": [
+                {
+                    "remote_id": "original-comment",
+                    "content": "[RCA_DELIVERY:original] candidate conclusion",
+                }
+            ],
+            "pages_read": 1,
+        }
+
+    def get_fields(*_args):
+        calls["fields"] += 1
+        raise AssertionError("stale epoch must fence the next outward boundary")
+
+    dispatcher = _dispatcher(
+        store,
+        list_comments=list_comments,
+        add_comment=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("stale epoch must prevent remote writes")
+        ),
+        get_fields=get_fields,
+        update_fields=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("stale epoch must prevent remote writes")
+        ),
+    )
+    real_gate = dispatcher._adjudication_binding_gate
+
+    def rotate_after_successful_gate(claim, *, after_outward_boundary):
+        outcome = real_gate(
+            claim,
+            after_outward_boundary=after_outward_boundary,
+        )
+        if after_outward_boundary and not frozen:
+            assert outcome is None
+            with sqlite3.connect(store.db_path) as conn:
+                conn.execute(
+                    "UPDATE rca_activation_epochs SET is_current = 0 "
+                    "WHERE epoch_id = 'epoch-w16-active'"
+                )
+                conn.execute(
+                    "INSERT INTO rca_activation_epochs VALUES "
+                    "('epoch-w16-after-gate', 'steady_active', 1)"
+                )
+            frozen.update(
+                _effect_attempt_snapshot(
+                    store,
+                    effect_key=result.correction_effect_key,
+                )
+            )
+        return outcome
+
+    monkeypatch.setattr(
+        dispatcher,
+        "_adjudication_binding_gate",
+        rotate_after_successful_gate,
+    )
+
+    outcome = dispatcher.dispatch_one()
+
+    assert outcome.status == "activation_stale"
+    assert outcome.error_code == "conclusion_adjudication_effect_activation_stale"
+    assert calls == {"list": 1, "fields": 0}
+    assert _effect_attempt_snapshot(
+        store,
+        effect_key=result.correction_effect_key,
+    ) == frozen
+
+
 def test_historical_correction_is_visible_to_activation_preview(tmp_path):
     store = _seed_published_conclusion(tmp_path)
     result = _record_retraction(store)
@@ -503,6 +656,77 @@ def test_correction_identity_covers_legacy_schema_and_reserved_target():
         {"schema_version": DELIVERY_EFFECT_SCHEMA_VERSION},
         target_key=f"{ADJUDICATION_EFFECT_TARGET_PREFIX}-{'a' * 64}",
     )
+
+
+@pytest.mark.parametrize(
+    "identity_case",
+    ["v1_json_whitespace", "reserved_target_schema_laundering"],
+)
+def test_correction_identity_blocks_duplicate_and_fails_orphan_audit(
+    tmp_path,
+    identity_case,
+):
+    store = _seed_published_conclusion(tmp_path)
+    if identity_case == "v1_json_whitespace":
+        payload_json = json.dumps(
+            {"schema_version": ADJUDICATION_EFFECT_SCHEMA_VERSION_V1}
+        )
+        assert '": "' in payload_json
+        target_key = "legacy-correction-target"
+    else:
+        payload_json = json.dumps(
+            {"schema_version": DELIVERY_EFFECT_SCHEMA_VERSION},
+            separators=(",", ":"),
+        )
+        target_key = f"{ADJUDICATION_EFFECT_TARGET_PREFIX}-{'b' * 64}"
+    effect_key = "g1q3-rca-effect-v1-" + (
+        "8" * 64 if identity_case == "v1_json_whitespace" else "9" * 64
+    )
+    current = NOW.isoformat()
+    with sqlite3.connect(store.db_path) as conn:
+        [delivery_id] = conn.execute(
+            "SELECT delivery_id FROM rca_delivery_jobs"
+        ).fetchone()
+        conn.execute(
+            """
+            INSERT INTO rca_delivery_effects(
+                effect_key, delivery_id, effect_kind, required, target_key,
+                payload_json, payload_sha256, outcome, write_phase, status,
+                adjudication_comment_attempt_count,
+                adjudication_comment_attempted_at,
+                completed_at, created_at, updated_at
+            ) VALUES (?, ?, 'feishu_issue_comment', 1, ?, ?, ?, 'success',
+                      'settled', 'succeeded', 1, ?, ?, ?, ?)
+            """,
+            (
+                effect_key,
+                delivery_id,
+                target_key,
+                payload_json,
+                hashlib.sha256(payload_json.encode("utf-8")).hexdigest(),
+                current,
+                current,
+                current,
+                current,
+            ),
+        )
+
+    with pytest.raises(
+        ConclusionAdjudicationError,
+        match="conclusion_adjudication_comment_budget_exhausted",
+    ):
+        _record_retraction(store)
+
+    assert store.list_rows("rca_conclusion_adjudications") == []
+    assert len(store.list_rows("rca_delivery_effects")) == 2
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    audit = audit_conclusion_adjudications(store.db_path)
+    assert audit["ok"] is False
+    assert audit["counts"]["adjudication_effects"] == 1
+    assert audit["counts"]["orphan_correction_effects"] == 1
+    assert audit["invariants"]["ledger_effect_count_equal"] is False
+    assert audit["invariants"]["correction_effects_linked"] is False
 
 
 def test_current_delivery_store_fails_closed_without_adjudication_schema(
@@ -969,6 +1193,7 @@ def test_consumed_comment_token_blocks_field_rewrite_after_epoch_rotates_on_read
     result = _record_retraction(store)
     fields = {RCA_RESULT_FIELD_KEY: "候选结论：感知车道线责任域"}
     calls = {"get": 0, "update": 0, "add": 0}
+    frozen: dict[str, object] = {}
 
     class Clock:
         current = NOW
@@ -1002,6 +1227,12 @@ def test_consumed_comment_token_blocks_field_rewrite_after_epoch_rotates_on_read
                     "INSERT INTO rca_activation_epochs VALUES "
                     "('epoch-w16-rotated', 'steady_active', 1)"
                 )
+            frozen.update(
+                _effect_attempt_snapshot(
+                    store,
+                    effect_key=result.correction_effect_key,
+                )
+            )
         return {
             "success": True,
             "fields": {key: fields.get(key, "") for key in field_keys},
@@ -1032,14 +1263,18 @@ def test_consumed_comment_token_blocks_field_rewrite_after_epoch_rotates_on_read
 
     second = dispatcher.dispatch_one()
 
-    assert second.status == "uncertain"
-    assert second.error_code == "conclusion_adjudication_reconciliation_read_only"
+    assert second.status == "activation_stale"
+    assert second.error_code == "conclusion_adjudication_effect_activation_stale"
     assert calls == {"get": 3, "update": 1, "add": 1}
-    effect = next(
-        row
-        for row in store.list_rows("rca_delivery_effects")
-        if row["effect_key"] == result.correction_effect_key
-    )
+    assert _effect_attempt_snapshot(
+        store,
+        effect_key=result.correction_effect_key,
+    ) == frozen
+    effect = frozen["effect"]
+    assert isinstance(effect, dict)
+    assert effect["status"] == "claimed"
+    assert effect["lease_token"]
+    assert effect["lease_owner"]
     assert effect["write_phase"] == "write_started"
     assert effect["adjudication_comment_attempt_count"] == 1
     with sqlite3.connect(store.db_path) as conn:
