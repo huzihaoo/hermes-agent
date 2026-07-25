@@ -65,8 +65,8 @@ SERVICE_TARGETS = {
         "hermes_release_fingerprint_check.py",
     ),
     "local.pnc.live-drift-guard": (
-        "governance_tool",
-        "hermes_live_drift_guard.py",
+        "runtime_script",
+        "scripts/hermes_live_drift_guard.py",
     ),
     "local.pnc.feishu-ops-alert": (
         "governance_tool",

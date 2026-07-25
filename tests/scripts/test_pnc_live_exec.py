@@ -43,10 +43,18 @@ print(json.dumps({
     gateway = root / "hermes_cli" / "main.py"
     gateway.parent.mkdir(parents=True)
     gateway.write_text("print('gateway fixture')\n", encoding="utf-8")
+    drift_guard = root / "scripts" / "hermes_live_drift_guard.py"
+    drift_guard.write_text("print('drift guard fixture')\n", encoding="utf-8")
     subprocess.run(["/usr/bin/git", "init", "-q", str(root)], check=True)
     _git(root, "config", "user.name", "PNC launcher test")
     _git(root, "config", "user.email", "pnc-launcher-test@example.invalid")
-    _git(root, "add", "scripts/pnc_vm_task_sync.py", "hermes_cli/main.py")
+    _git(
+        root,
+        "add",
+        "scripts/pnc_vm_task_sync.py",
+        "scripts/hermes_live_drift_guard.py",
+        "hermes_cli/main.py",
+    )
     _git(root, "commit", "-q", "-m", f"fixture {name}")
     commit = _git(root, "rev-parse", "HEAD")
     tree = _git(root, "rev-parse", "HEAD^{tree}")
@@ -179,6 +187,14 @@ def test_stable_governance_and_native_cli_targets_are_manifest_bound(tmp_path: P
     gateway_evidence = json.loads(gateway_result.stdout)
     assert gateway_evidence["target_kind"] == "runtime_script"
     assert gateway_evidence["script"] == str(root / "hermes_cli/main.py")
+
+    drift_result = _run(home, "--check", "local.pnc.live-drift-guard")
+    assert drift_result.returncode == 0, drift_result.stderr
+    drift_evidence = json.loads(drift_result.stdout)
+    assert drift_evidence["target_kind"] == "runtime_script"
+    assert drift_evidence["script"] == str(
+        root / "scripts" / "hermes_live_drift_guard.py"
+    )
 
 
 def _dynamic_plist(home: Path) -> dict[str, object]:

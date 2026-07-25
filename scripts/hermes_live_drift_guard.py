@@ -230,6 +230,7 @@ def main() -> int:
     runtime_root = str(manifest.get("runtime_root") or "")
     runtime_python = str(manifest.get("runtime_python") or "")
     runtime_venv = str(manifest.get("runtime_venv") or "")
+    runtime_layout = str(manifest.get("runtime_layout") or "")
     wrapper_target = read_wrapper_target()
     launchd = read_launchd_runtime("ai.hermes.gateway")
     health = read_health_status()
@@ -246,7 +247,12 @@ def main() -> int:
     if runtime_root:
         venv_link = Path(runtime_root) / ".venv"
         if not venv_link.exists():
-            errors.append(f"runtime .venv missing: {venv_link}")
+            if not (
+                runtime_layout == "sealed_pair"
+                and runtime_venv
+                and Path(runtime_venv).is_dir()
+            ):
+                errors.append(f"runtime .venv missing: {venv_link}")
         elif runtime_venv and venv_link.resolve() != Path(runtime_venv).resolve():
             errors.append(f"runtime .venv drift: {venv_link.resolve()} != {Path(runtime_venv).resolve()}")
     if runtime_venv and "/worktrees/" in runtime_venv:
