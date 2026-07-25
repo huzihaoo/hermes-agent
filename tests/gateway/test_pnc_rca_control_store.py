@@ -13,6 +13,7 @@ from gateway.pnc_rca_control_store import (
     ActivationEpochError,
     ActivationIngressDeferredError,
     CapacityTransitionStateError,
+    CONTROL_STORE_SCHEMA_VERSION,
     ControlStoreCapacityError,
     INPUT_WAIT_QUARANTINE_REARMED_REASON,
     INPUT_WAIT_EXECUTION_WATCH_PRESENT_REASON,
@@ -551,7 +552,7 @@ def test_v7_store_without_runtime_transition_table_migrates_to_v9(tmp_path):
 
     upgraded = RcaControlStore(path)
 
-    assert upgraded.health()["schema_version"] == "pnc_rca_control_store_v10"
+    assert upgraded.health()["schema_version"] == CONTROL_STORE_SCHEMA_VERSION
     conn = upgraded._connect()
     try:
         assert conn.execute(
@@ -580,7 +581,7 @@ def test_v8_store_migrates_forward_to_durable_activation_schema(tmp_path):
 
     upgraded = RcaControlStore(path)
 
-    assert upgraded.health()["schema_version"] == "pnc_rca_control_store_v10"
+    assert upgraded.health()["schema_version"] == CONTROL_STORE_SCHEMA_VERSION
     assert upgraded.activation_epoch() is None
     assert upgraded.list_rows("rca_activation_admission_ledger") == []
     conn = upgraded._connect()
@@ -2094,7 +2095,7 @@ def test_default_control_store_ignores_installation_markers(tmp_path, suffix):
 
     store = RcaControlStore(path)
 
-    assert store.health()["schema_version"] == "pnc_rca_control_store_v10"
+    assert store.health()["schema_version"] == CONTROL_STORE_SCHEMA_VERSION
 
 
 def test_v4_store_is_upgraded_with_retry_window_and_rearm_audit(tmp_path):
@@ -2117,7 +2118,7 @@ def test_v4_store_is_upgraded_with_retry_window_and_rearm_audit(tmp_path):
     [outbox] = upgraded.list_rows("rca_outbox")
     assert outbox["retry_window_started_at"] == outbox["created_at"]
     assert upgraded.list_rows("rca_outbox_rearm_audit") == []
-    assert upgraded.health()["schema_version"] == "pnc_rca_control_store_v10"
+    assert upgraded.health()["schema_version"] == CONTROL_STORE_SCHEMA_VERSION
     assert upgraded.initialization_observation() == {
         "mode": "migration",
         "backfill_runs": 1,
@@ -2160,7 +2161,7 @@ def test_v6_store_migrates_issue_scope_and_operator_rate_indexes(tmp_path):
     finally:
         conn.close()
 
-    assert upgraded.health()["schema_version"] == "pnc_rca_control_store_v10"
+    assert upgraded.health()["schema_version"] == CONTROL_STORE_SCHEMA_VERSION
     assert upgraded.initialization_observation()["mode"] == "migration"
     assert {
         "idx_business_triggers_issue_scope",
@@ -2230,6 +2231,10 @@ def test_v5_kafka_bound_parent_rows_are_atomically_migrated_and_backfilled(tmp_p
                        claimed_at,completed_at,quarantined_at,last_error_code,
                        last_error_detail,result_json,retry_window_started_at,
                        created_at,updated_at FROM rca_outbox;
+            DROP TABLE rca_snapshot_source_envelopes;
+            DROP TABLE rca_admission_snapshots;
+            DROP TABLE rca_source_authority_receipts;
+            DROP TABLE rca_canonical_requests;
             DROP TABLE rca_trigger_delivery_bindings;
             DROP TABLE rca_delivery_subscriptions;
             DROP TABLE rca_trigger_bindings;
@@ -2298,7 +2303,7 @@ def test_v5_kafka_bound_parent_rows_are_atomically_migrated_and_backfilled(tmp_p
     assert outbox["origin_source_id"] == source["source_id"]
     assert binding["role"] == "origin"
     assert len(upgraded.list_rows("rca_delivery_subscriptions")) == 1
-    assert upgraded.health()["schema_version"] == "pnc_rca_control_store_v10"
+    assert upgraded.health()["schema_version"] == CONTROL_STORE_SCHEMA_VERSION
 
 
 def test_current_marker_with_missing_progress_foreign_key_is_rejected(tmp_path):
@@ -5676,6 +5681,279 @@ def test_capacity_transition_concurrent_conflicting_cas_has_one_winner(tmp_path)
     assert len(store.list_rows("rca_capacity_transition_audit")) == 2
 
 
+V11_SNAPSHOT_TABLES = {
+    "rca_canonical_requests",
+    "rca_admission_snapshots",
+    "rca_source_authority_receipts",
+    "rca_snapshot_source_envelopes",
+}
+
+
+def _downgrade_current_store_to_v10(store):
+    conn = store._connect()
+    try:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        for table in (
+            "rca_snapshot_source_envelopes",
+            "rca_admission_snapshots",
+            "rca_source_authority_receipts",
+            "rca_canonical_requests",
+        ):
+            conn.execute(f"DROP TABLE {table}")
+        conn.execute(
+            "UPDATE control_meta SET value='pnc_rca_control_store_v10' "
+            "WHERE key='schema_version'"
+        )
+    finally:
+        conn.close()
+
+
+def test_v10_store_migrates_to_empty_inert_v11_snapshot_schema(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    _downgrade_current_store_to_v10(RcaControlStore(path))
+
+    upgraded = RcaControlStore(path)
+
+    assert upgraded.health()["schema_version"] == CONTROL_STORE_SCHEMA_VERSION
+    assert upgraded.initialization_observation() == {
+        "mode": "migration",
+        "backfill_runs": 0,
+    }
+    assert all(upgraded.list_rows(table) == [] for table in V11_SNAPSHOT_TABLES)
+    conn = upgraded._connect()
+    try:
+        snapshot_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='rca_admission_snapshots'"
+        ).fetchone()["sql"]
+    finally:
+        conn.close()
+    assert "DEFERRABLE INITIALLY DEFERRED" in snapshot_sql
+
+
+def test_v10_to_v11_migration_rolls_back_all_ddl_and_marker_on_validation_failure(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "control.sqlite3"
+    _downgrade_current_store_to_v10(RcaControlStore(path))
+
+    def reject_migrated_schema(_conn, *, integrity_check):
+        assert integrity_check is True
+        raise RuntimeError("injected_v11_schema_validation_failure")
+
+    monkeypatch.setattr(
+        RcaControlStore,
+        "_validate_structural_contract",
+        staticmethod(reject_migrated_schema),
+    )
+    with pytest.raises(
+        RuntimeError, match="injected_v11_schema_validation_failure"
+    ):
+        RcaControlStore(path)
+
+    conn = sqlite3.connect(path)
+    try:
+        marker = conn.execute(
+            "SELECT value FROM control_meta WHERE key='schema_version'"
+        ).fetchone()[0]
+        v11_tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        } & V11_SNAPSHOT_TABLES
+        v11_objects = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE name LIKE 'trg_rca_snapshot%' "
+                "OR name LIKE 'idx_rca_snapshot%' "
+                "OR name LIKE 'trg_rca_source_authority%' "
+                "OR name LIKE 'idx_rca_source_authority%'"
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+    assert marker == "pnc_rca_control_store_v10"
+    assert v11_tables == set()
+    assert v11_objects == set()
+
+
+def test_v10_to_v11_marker_last_compare_and_swap_rejects_marker_drift(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "control.sqlite3"
+    _downgrade_current_store_to_v10(RcaControlStore(path))
+    create_schema = RcaControlStore._create_v11_snapshot_schema
+
+    def create_after_marker_drift(cls, conn):
+        create_schema(conn)
+        conn.execute(
+            "UPDATE control_meta SET value='pnc_rca_control_store_v9' "
+            "WHERE key='schema_version'"
+        )
+
+    monkeypatch.setattr(
+        RcaControlStore,
+        "_create_v11_snapshot_schema",
+        classmethod(create_after_marker_drift),
+    )
+    with pytest.raises(
+        RuntimeError, match="incompatible_control_store_schema:version_marker"
+    ):
+        RcaControlStore(path)
+
+    conn = sqlite3.connect(path)
+    try:
+        marker = conn.execute(
+            "SELECT value FROM control_meta WHERE key='schema_version'"
+        ).fetchone()[0]
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+    assert marker == "pnc_rca_control_store_v10"
+    assert tables.isdisjoint(V11_SNAPSHOT_TABLES)
+
+
+def test_v10_stale_migration_starter_converges_on_committed_v11(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    store = RcaControlStore(path)
+
+    assert store._migrate_v10_to_v11() is False
+    assert RcaControlStore(path, require_current=True).initialization_observation() == {
+        "mode": "steady",
+        "backfill_runs": 0,
+    }
+
+
+def test_current_v11_missing_source_authority_guard_is_rejected(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    store = RcaControlStore(path)
+    conn = store._connect()
+    try:
+        conn.execute("DROP TRIGGER trg_rca_source_authority_source_guard")
+    finally:
+        conn.close()
+
+    with pytest.raises(
+        RuntimeError, match="incompatible_control_store_schema:v11_triggers"
+    ):
+        RcaControlStore(path, require_current=True)
+
+
+def test_current_v11_redefined_source_authority_guard_is_rejected(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    store = RcaControlStore(path)
+    conn = store._connect()
+    try:
+        conn.execute("DROP TRIGGER trg_rca_source_authority_source_guard")
+        conn.execute(
+            """
+            CREATE TRIGGER trg_rca_source_authority_source_guard
+            BEFORE INSERT ON rca_source_authority_receipts
+            WHEN 0
+            BEGIN
+                SELECT RAISE(ABORT, 'rca_source_authority_source_mismatch');
+            END
+            """
+        )
+    finally:
+        conn.close()
+
+    with pytest.raises(
+        RuntimeError, match="incompatible_control_store_schema:v11_trigger_sql"
+    ):
+        RcaControlStore(path, require_current=True)
+
+
+@pytest.mark.parametrize("redefine", [False, True])
+def test_current_v11_missing_or_redefined_source_authority_index_is_rejected(
+    tmp_path, redefine
+):
+    path = tmp_path / "control.sqlite3"
+    store = RcaControlStore(path)
+    conn = store._connect()
+    try:
+        conn.execute("DROP INDEX idx_rca_source_authority_source")
+        if redefine:
+            conn.execute(
+                "CREATE INDEX idx_rca_source_authority_source "
+                "ON rca_source_authority_receipts(source_kind)"
+            )
+    finally:
+        conn.close()
+
+    expected = "v11_index_contract" if redefine else "v11_indexes"
+    with pytest.raises(RuntimeError, match=expected):
+        RcaControlStore(path, require_current=True)
+
+
+def test_current_v11_redefined_table_constraint_is_rejected(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    store = RcaControlStore(path)
+    conn = store._connect()
+    try:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='rca_canonical_requests'"
+        ).fetchone()
+        original = str(row["sql"])
+        weakened = original.replace(
+            "CHECK(schema_version = 'pnc_rca_canonical_request_v1')",
+            "CHECK(length(schema_version) > 0)",
+        )
+        assert weakened != original
+        schema_version = int(conn.execute("PRAGMA schema_version").fetchone()[0])
+        conn.execute("PRAGMA writable_schema=ON")
+        conn.execute(
+            "UPDATE sqlite_master SET sql=? WHERE type='table' "
+            "AND name='rca_canonical_requests'",
+            (weakened,),
+        )
+        conn.execute("PRAGMA writable_schema=OFF")
+        conn.execute(f"PRAGMA schema_version={schema_version + 1}")
+    finally:
+        conn.close()
+
+    with pytest.raises(
+        RuntimeError, match="incompatible_control_store_schema:v11_table_sql"
+    ):
+        RcaControlStore(path, require_current=True)
+
+
+def test_v11_canonical_request_projection_guard_rejects_mismatched_json(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    conn = store._connect()
+    try:
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="rca_canonical_request_projection_mismatch",
+        ):
+            conn.execute(
+                """
+                INSERT INTO rca_canonical_requests(
+                    request_sha256, schema_version, ticket_title_sha256,
+                    creation_policy_sha256, business_profile_sha256,
+                    execution_policy_sha256, publication_policy_sha256,
+                    correction_lineage_policy_sha256, generation_reason,
+                    generation_authorization_evidence_sha256,
+                    canonical_request_json, persisted_at
+                ) VALUES(?, 'pnc_rca_canonical_request_v1', ?, ?, ?, ?, ?, ?,
+                         'initial', NULL, '{}', ?)
+                """,
+                tuple(f"{value:x}" * 64 for value in range(1, 8))
+                + ("2026-07-25T10:00:00+00:00",),
+            )
+    finally:
+        conn.close()
+    assert store.list_rows("rca_canonical_requests") == []
+
+
 def test_v9_store_migrates_to_empty_explicit_capacity_latch(tmp_path):
     path = tmp_path / "control.sqlite3"
     store = RcaControlStore(path)
@@ -5691,7 +5969,7 @@ def test_v9_store_migrates_to_empty_explicit_capacity_latch(tmp_path):
         conn.close()
 
     upgraded = RcaControlStore(path)
-    assert upgraded.health()["schema_version"] == "pnc_rca_control_store_v10"
+    assert upgraded.health()["schema_version"] == CONTROL_STORE_SCHEMA_VERSION
     assert upgraded.capacity_transition_state() is None
     assert upgraded.list_rows("rca_capacity_transition_audit") == []
     assert upgraded.initialization_observation() == {

@@ -36,7 +36,7 @@ from gateway.pnc_rca_runtime_transition import (
 from gateway.pnc_rca_requester_identity import validate_rca_requester
 
 
-CONTROL_STORE_SCHEMA_VERSION = "pnc_rca_control_store_v10"
+CONTROL_STORE_SCHEMA_VERSION = "pnc_rca_control_store_v11"
 SUPPORTED_CONTROL_STORE_SCHEMA_VERSIONS = frozenset(
     {
         "pnc_rca_control_store_v3",
@@ -46,6 +46,7 @@ SUPPORTED_CONTROL_STORE_SCHEMA_VERSIONS = frozenset(
         "pnc_rca_control_store_v7",
         "pnc_rca_control_store_v8",
         "pnc_rca_control_store_v9",
+        "pnc_rca_control_store_v10",
         CONTROL_STORE_SCHEMA_VERSION,
     }
 )
@@ -563,6 +564,12 @@ class RcaControlStore:
             if self.require_current:
                 self._validate_no_installation_marker()
             self._initialization_mode = "steady"
+            return
+
+        if marker_value == "pnc_rca_control_store_v10":
+            self._initialization_mode = (
+                "migration" if self._migrate_v10_to_v11() else "steady"
+            )
             return
 
         self._initialization_mode = "migration"
@@ -1234,6 +1241,7 @@ class RcaControlStore:
                     ON rca_trigger_sources(source_kind, outcome, source_id)
                 """
             )
+            self._create_v11_snapshot_schema(conn)
             self._validate_structural_contract(
                 conn,
                 integrity_check=marker_value != CONTROL_STORE_SCHEMA_VERSION,
@@ -1258,6 +1266,962 @@ class RcaControlStore:
             raise
         finally:
             conn.close()
+
+    def _migrate_v10_to_v11(self) -> bool:
+        """Install the inert W3 snapshot schema in one rollback-safe transaction."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            marker = conn.execute(
+                "SELECT value FROM control_meta WHERE key = 'schema_version'"
+            ).fetchone()
+            marker_value = str(marker["value"]) if marker is not None else ""
+            if marker_value == CONTROL_STORE_SCHEMA_VERSION:
+                self._validate_structural_contract(conn, integrity_check=False)
+                conn.commit()
+                return False
+            if marker_value != "pnc_rca_control_store_v10":
+                raise RuntimeError("incompatible_control_store_schema:version_marker")
+            self._create_v11_snapshot_schema(conn)
+            self._validate_structural_contract(conn, integrity_check=True)
+            conn.execute(
+                "UPDATE control_meta SET value = ? "
+                "WHERE key = 'schema_version' AND value = ?",
+                (
+                    CONTROL_STORE_SCHEMA_VERSION,
+                    "pnc_rca_control_store_v10",
+                ),
+            )
+            if conn.execute("SELECT changes()").fetchone()[0] != 1:
+                raise RuntimeError("incompatible_control_store_schema:version_marker")
+            conn.commit()
+            return True
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _v11_snapshot_schema_statements() -> tuple[str, ...]:
+        """Return the exact inert W3 DDL used by migration and validation."""
+        statements = (
+            """
+            CREATE TABLE IF NOT EXISTS rca_canonical_requests (
+                request_sha256 TEXT PRIMARY KEY
+                    CHECK(length(request_sha256) = 64
+                          AND request_sha256 NOT GLOB '*[^0-9a-f]*'),
+                schema_version TEXT NOT NULL
+                    CHECK(schema_version = 'pnc_rca_canonical_request_v1'),
+                ticket_title_sha256 TEXT NOT NULL
+                    CHECK(length(ticket_title_sha256) = 64
+                          AND ticket_title_sha256 NOT GLOB '*[^0-9a-f]*'),
+                creation_policy_sha256 TEXT NOT NULL
+                    CHECK(length(creation_policy_sha256) = 64
+                          AND creation_policy_sha256 NOT GLOB '*[^0-9a-f]*'),
+                business_profile_sha256 TEXT NOT NULL
+                    CHECK(length(business_profile_sha256) = 64
+                          AND business_profile_sha256 NOT GLOB '*[^0-9a-f]*'),
+                execution_policy_sha256 TEXT NOT NULL
+                    CHECK(length(execution_policy_sha256) = 64
+                          AND execution_policy_sha256 NOT GLOB '*[^0-9a-f]*'),
+                publication_policy_sha256 TEXT NOT NULL
+                    CHECK(length(publication_policy_sha256) = 64
+                          AND publication_policy_sha256 NOT GLOB '*[^0-9a-f]*'),
+                correction_lineage_policy_sha256 TEXT NOT NULL
+                    CHECK(length(correction_lineage_policy_sha256) = 64
+                          AND correction_lineage_policy_sha256 NOT GLOB '*[^0-9a-f]*'),
+                generation_reason TEXT NOT NULL
+                    CHECK(generation_reason IN ('initial', 'explicit_user_rerun')),
+                generation_authorization_evidence_sha256 TEXT
+                    CHECK(generation_authorization_evidence_sha256 IS NULL OR (
+                        length(generation_authorization_evidence_sha256) = 64
+                        AND generation_authorization_evidence_sha256
+                            NOT GLOB '*[^0-9a-f]*'
+                        AND generation_authorization_evidence_sha256 != printf('%064d', 0)
+                    )),
+                canonical_request_json TEXT NOT NULL
+                    CHECK(json_valid(canonical_request_json)
+                          AND json_type(canonical_request_json) = 'object'),
+                persisted_at TEXT NOT NULL CHECK(length(trim(persisted_at)) > 0),
+                CHECK(
+                    (generation_reason = 'initial'
+                     AND generation_authorization_evidence_sha256 IS NULL)
+                    OR
+                    (generation_reason = 'explicit_user_rerun'
+                     AND generation_authorization_evidence_sha256 IS NOT NULL)
+                )
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS rca_source_authority_receipts (
+                authority_sha256 TEXT PRIMARY KEY
+                    CHECK(length(authority_sha256) = 64
+                          AND authority_sha256 NOT GLOB '*[^0-9a-f]*'),
+                schema_version TEXT NOT NULL
+                    CHECK(schema_version = 'pnc_rca_source_authority_receipt_v1'),
+                source_id TEXT NOT NULL CHECK(length(trim(source_id)) > 0),
+                source_kind TEXT NOT NULL CHECK(source_kind IN (
+                    'kafka_workflow_event', 'feishu_group_manual'
+                )),
+                payload_sha256 TEXT NOT NULL
+                    CHECK(length(payload_sha256) = 64
+                          AND payload_sha256 NOT GLOB '*[^0-9a-f]*'
+                          AND payload_sha256 != printf('%064d', 0)),
+                authorization_evidence_sha256 TEXT NOT NULL
+                    CHECK(length(authorization_evidence_sha256) = 64
+                          AND authorization_evidence_sha256 NOT GLOB '*[^0-9a-f]*'
+                          AND authorization_evidence_sha256 != printf('%064d', 0)),
+                binding_action TEXT NOT NULL
+                    CHECK(binding_action IN ('create', 'join')),
+                decision TEXT NOT NULL CHECK(decision IN ('admit', 'shadow')),
+                source_metadata_sha256 TEXT NOT NULL
+                    CHECK(length(source_metadata_sha256) = 64
+                          AND source_metadata_sha256 NOT GLOB '*[^0-9a-f]*'),
+                anchor_sha256 TEXT NOT NULL
+                    CHECK(length(anchor_sha256) = 64
+                          AND anchor_sha256 NOT GLOB '*[^0-9a-f]*'),
+                ingress_decision_sha256 TEXT NOT NULL
+                    CHECK(length(ingress_decision_sha256) = 64
+                          AND ingress_decision_sha256 NOT GLOB '*[^0-9a-f]*'),
+                source_metadata_json TEXT NOT NULL
+                    CHECK(json_valid(source_metadata_json)
+                          AND json_type(source_metadata_json) = 'object'),
+                anchor_json TEXT NOT NULL
+                    CHECK(json_valid(anchor_json) AND json_type(anchor_json) = 'object'),
+                ingress_decision_json TEXT NOT NULL
+                    CHECK(json_valid(ingress_decision_json)
+                          AND json_type(ingress_decision_json) = 'object'),
+                authority_receipt_json TEXT NOT NULL
+                    CHECK(json_valid(authority_receipt_json)
+                          AND json_type(authority_receipt_json) = 'object'),
+                persisted_at TEXT NOT NULL CHECK(length(trim(persisted_at)) > 0),
+                FOREIGN KEY(source_id) REFERENCES rca_trigger_sources(source_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS rca_admission_snapshots (
+                snapshot_sha256 TEXT PRIMARY KEY
+                    CHECK(length(snapshot_sha256) = 64
+                          AND snapshot_sha256 NOT GLOB '*[^0-9a-f]*'),
+                snapshot_id TEXT NOT NULL UNIQUE
+                    CHECK(snapshot_id = 'pnc-rca-snapshot-v1-' || snapshot_sha256),
+                schema_version TEXT NOT NULL
+                    CHECK(schema_version = 'pnc_rca_admission_snapshot_v1'),
+                request_sha256 TEXT NOT NULL
+                    CHECK(length(request_sha256) = 64
+                          AND request_sha256 NOT GLOB '*[^0-9a-f]*'),
+                business_key TEXT NOT NULL CHECK(length(trim(business_key)) > 0),
+                submission_key TEXT NOT NULL CHECK(length(trim(submission_key)) > 0),
+                generation INTEGER NOT NULL CHECK(generation >= 1),
+                activation_epoch_id TEXT NOT NULL DEFAULT '' CHECK(
+                    activation_epoch_id = trim(activation_epoch_id)
+                ),
+                activation_ledger_id INTEGER CHECK(activation_ledger_id >= 1),
+                execution_decision TEXT NOT NULL
+                    CHECK(execution_decision IN ('admit', 'shadow')),
+                execution_reason TEXT NOT NULL
+                    CHECK(length(trim(execution_reason)) > 0),
+                execution_state TEXT NOT NULL CHECK(execution_state IN (
+                    'legacy_unconfigured', 'unconfigured', 'safe_off',
+                    'preauthorized', 'bounded_active', 'confirmed',
+                    'steady_active', 'aborted'
+                )),
+                legacy_unconfigured INTEGER NOT NULL
+                    CHECK(legacy_unconfigured IN (0, 1)),
+                creator_source_envelope_sha256 TEXT NOT NULL
+                    CHECK(length(creator_source_envelope_sha256) = 64
+                          AND creator_source_envelope_sha256 NOT GLOB '*[^0-9a-f]*'),
+                creator_authority_sha256 TEXT NOT NULL
+                    CHECK(length(creator_authority_sha256) = 64
+                          AND creator_authority_sha256 NOT GLOB '*[^0-9a-f]*'),
+                creator_source_id TEXT NOT NULL
+                    CHECK(length(trim(creator_source_id)) > 0),
+                admission_snapshot_json TEXT NOT NULL
+                    CHECK(json_valid(admission_snapshot_json)
+                          AND json_type(admission_snapshot_json) = 'object'),
+                persisted_at TEXT NOT NULL CHECK(length(trim(persisted_at)) > 0),
+                FOREIGN KEY(request_sha256)
+                    REFERENCES rca_canonical_requests(request_sha256),
+                FOREIGN KEY(activation_ledger_id)
+                    REFERENCES rca_activation_admission_ledger(ledger_id),
+                FOREIGN KEY(
+                    creator_source_envelope_sha256,
+                    creator_authority_sha256,
+                    creator_source_id
+                ) REFERENCES rca_snapshot_source_envelopes(
+                    source_envelope_sha256,
+                    source_authority_sha256,
+                    source_id
+                ) DEFERRABLE INITIALLY DEFERRED,
+                CHECK(
+                    (
+                        execution_state = 'legacy_unconfigured'
+                        AND legacy_unconfigured = 1
+                        AND activation_epoch_id = ''
+                        AND activation_ledger_id IS NULL
+                        AND execution_decision = 'admit'
+                        AND execution_reason = 'activation_legacy_unconfigured'
+                    ) OR (
+                        execution_state = 'unconfigured'
+                        AND legacy_unconfigured = 0
+                        AND activation_epoch_id = ''
+                        AND activation_ledger_id IS NULL
+                        AND execution_decision = 'shadow'
+                        AND execution_reason = 'activation_epoch_held_unconfigured'
+                    ) OR (
+                        execution_state = 'safe_off'
+                        AND legacy_unconfigured = 0
+                        AND activation_epoch_id != ''
+                        AND activation_ledger_id IS NOT NULL
+                        AND execution_decision = 'shadow'
+                        AND execution_reason IN (
+                            'activation_epoch_held_safe_off',
+                            'activation_epoch_held_ingress_safe_off'
+                        )
+                    ) OR (
+                        execution_state = 'preauthorized'
+                        AND legacy_unconfigured = 0
+                        AND activation_epoch_id != ''
+                        AND activation_ledger_id IS NOT NULL
+                        AND execution_decision = 'shadow'
+                        AND execution_reason IN (
+                            'activation_epoch_held_preauthorized',
+                            'activation_epoch_held_ingress_preauthorized'
+                        )
+                    ) OR (
+                        execution_state = 'bounded_active'
+                        AND legacy_unconfigured = 0
+                        AND activation_epoch_id != ''
+                        AND activation_ledger_id IS NOT NULL
+                        AND (
+                            (
+                                execution_decision = 'admit'
+                                AND execution_reason IN (
+                                    'activation_bounded_slot_consumed',
+                                    'activation_admission_idempotent'
+                                )
+                            ) OR (
+                                execution_decision = 'shadow'
+                                AND execution_reason IN (
+                                    'activation_bounded_slot_required',
+                                    'activation_bounded_identity_not_authorized',
+                                    'activation_kafka_partition_not_fenced',
+                                    'activation_kafka_before_start_fence',
+                                    'activation_kafka_at_or_after_end_fence',
+                                    'activation_bounded_slot_consumed'
+                                )
+                            )
+                        )
+                    ) OR (
+                        execution_state = 'confirmed'
+                        AND legacy_unconfigured = 0
+                        AND activation_epoch_id != ''
+                        AND activation_ledger_id IS NOT NULL
+                        AND (
+                            (
+                                execution_decision = 'admit'
+                                AND execution_reason IN (
+                                    'activation_confirmed_shadow_reconciliation',
+                                    'activation_admission_idempotent'
+                                )
+                            ) OR (
+                                execution_decision = 'shadow'
+                                AND execution_reason IN (
+                                    'activation_epoch_held_confirmed',
+                                    'activation_epoch_held_ingress_confirmed'
+                                )
+                            )
+                        )
+                    ) OR (
+                        execution_state = 'steady_active'
+                        AND legacy_unconfigured = 0
+                        AND activation_epoch_id != ''
+                        AND activation_ledger_id IS NOT NULL
+                        AND execution_decision = 'admit'
+                        AND execution_reason IN (
+                            'activation_steady_active',
+                            'activation_admission_idempotent'
+                        )
+                    ) OR (
+                        execution_state = 'aborted'
+                        AND legacy_unconfigured = 0
+                        AND activation_epoch_id != ''
+                        AND activation_ledger_id IS NOT NULL
+                        AND execution_decision = 'shadow'
+                        AND execution_reason =
+                            'activation_epoch_held_ingress_aborted'
+                    )
+                )
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS rca_snapshot_source_envelopes (
+                source_envelope_sha256 TEXT PRIMARY KEY
+                    CHECK(length(source_envelope_sha256) = 64
+                          AND source_envelope_sha256 NOT GLOB '*[^0-9a-f]*'),
+                source_envelope_id TEXT NOT NULL UNIQUE CHECK(
+                    source_envelope_id =
+                        'pnc-rca-source-envelope-v1-' || source_envelope_sha256
+                ),
+                schema_version TEXT NOT NULL CHECK(
+                    schema_version = 'pnc_rca_snapshot_source_envelope_v1'
+                ),
+                snapshot_sha256 TEXT NOT NULL
+                    CHECK(length(snapshot_sha256) = 64
+                          AND snapshot_sha256 NOT GLOB '*[^0-9a-f]*'),
+                snapshot_id TEXT NOT NULL CHECK(
+                    snapshot_id = 'pnc-rca-snapshot-v1-' || snapshot_sha256
+                ),
+                submission_key TEXT NOT NULL CHECK(length(trim(submission_key)) > 0),
+                source_authority_sha256 TEXT NOT NULL
+                    CHECK(length(source_authority_sha256) = 64
+                          AND source_authority_sha256 NOT GLOB '*[^0-9a-f]*'),
+                source_id TEXT NOT NULL CHECK(length(trim(source_id)) > 0),
+                source_kind TEXT NOT NULL CHECK(source_kind IN (
+                    'kafka_workflow_event', 'feishu_group_manual'
+                )),
+                payload_sha256 TEXT NOT NULL
+                    CHECK(length(payload_sha256) = 64
+                          AND payload_sha256 NOT GLOB '*[^0-9a-f]*'
+                          AND payload_sha256 != printf('%064d', 0)),
+                authorization_evidence_sha256 TEXT NOT NULL
+                    CHECK(length(authorization_evidence_sha256) = 64
+                          AND authorization_evidence_sha256 NOT GLOB '*[^0-9a-f]*'
+                          AND authorization_evidence_sha256 != printf('%064d', 0)),
+                binding_action TEXT NOT NULL
+                    CHECK(binding_action IN ('create', 'join')),
+                decision TEXT NOT NULL CHECK(decision IN ('admit', 'shadow')),
+                source_metadata_json TEXT NOT NULL
+                    CHECK(json_valid(source_metadata_json)
+                          AND json_type(source_metadata_json) = 'object'),
+                anchor_json TEXT NOT NULL
+                    CHECK(json_valid(anchor_json) AND json_type(anchor_json) = 'object'),
+                ingress_decision_json TEXT NOT NULL
+                    CHECK(json_valid(ingress_decision_json)
+                          AND json_type(ingress_decision_json) = 'object'),
+                source_envelope_json TEXT NOT NULL
+                    CHECK(json_valid(source_envelope_json)
+                          AND json_type(source_envelope_json) = 'object'),
+                persisted_at TEXT NOT NULL CHECK(length(trim(persisted_at)) > 0),
+                FOREIGN KEY(snapshot_sha256)
+                    REFERENCES rca_admission_snapshots(snapshot_sha256),
+                FOREIGN KEY(
+                    source_authority_sha256, source_id, source_kind, payload_sha256
+                ) REFERENCES rca_source_authority_receipts(
+                    authority_sha256, source_id, source_kind, payload_sha256
+                ),
+                FOREIGN KEY(source_id) REFERENCES rca_trigger_sources(source_id)
+            )
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_rca_snapshot_submission
+                ON rca_admission_snapshots(submission_key)
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_rca_snapshot_business_generation
+                ON rca_admission_snapshots(business_key, generation)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_rca_snapshot_request
+                ON rca_admission_snapshots(request_sha256, snapshot_sha256)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_rca_snapshot_creator
+                ON rca_admission_snapshots(
+                    creator_source_envelope_sha256,
+                    creator_authority_sha256,
+                    creator_source_id
+                )
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_rca_source_authority_source
+                ON rca_source_authority_receipts(source_id)
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_rca_source_authority_reference
+                ON rca_source_authority_receipts(
+                    authority_sha256, source_id, source_kind, payload_sha256
+                )
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_rca_snapshot_envelope_source
+                ON rca_snapshot_source_envelopes(source_id)
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_rca_snapshot_envelope_creator_reference
+                ON rca_snapshot_source_envelopes(
+                    source_envelope_sha256, source_authority_sha256, source_id
+                )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_rca_snapshot_envelope_snapshot
+                ON rca_snapshot_source_envelopes(
+                    snapshot_sha256, binding_action, source_envelope_sha256
+                )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_rca_snapshot_envelope_authority
+                ON rca_snapshot_source_envelopes(
+                    source_authority_sha256, source_id, source_kind, payload_sha256
+                )
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_rca_one_create_envelope_per_snapshot
+                ON rca_snapshot_source_envelopes(snapshot_sha256)
+                WHERE binding_action = 'create'
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_rca_canonical_request_no_update
+            BEFORE UPDATE ON rca_canonical_requests
+            BEGIN
+                SELECT RAISE(ABORT, 'rca_canonical_request_update_forbidden');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_rca_canonical_request_no_delete
+            BEFORE DELETE ON rca_canonical_requests
+            BEGIN
+                SELECT RAISE(ABORT, 'rca_canonical_request_delete_forbidden');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_rca_canonical_request_no_replace
+            BEFORE INSERT ON rca_canonical_requests
+            WHEN EXISTS (
+                SELECT 1 FROM rca_canonical_requests
+                 WHERE request_sha256 = NEW.request_sha256
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'rca_canonical_request_replace_forbidden');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_rca_canonical_request_projection_guard
+            BEFORE INSERT ON rca_canonical_requests
+            WHEN NOT COALESCE((
+                json_extract(NEW.canonical_request_json, '$.schema_version') =
+                    NEW.schema_version
+                AND json_extract(
+                    NEW.canonical_request_json, '$.ticket.title_sha256'
+                ) = NEW.ticket_title_sha256
+                AND json_extract(
+                    NEW.canonical_request_json, '$.creation_policy.sha256'
+                ) = NEW.creation_policy_sha256
+                AND json_extract(
+                    NEW.canonical_request_json, '$.business_profile.sha256'
+                ) = NEW.business_profile_sha256
+                AND json_extract(
+                    NEW.canonical_request_json, '$.execution_policy.sha256'
+                ) = NEW.execution_policy_sha256
+                AND json_extract(
+                    NEW.canonical_request_json, '$.publication_policy.sha256'
+                ) = NEW.publication_policy_sha256
+                AND json_extract(
+                    NEW.canonical_request_json,
+                    '$.correction_lineage_policy.sha256'
+                ) = NEW.correction_lineage_policy_sha256
+                AND json_extract(
+                    NEW.canonical_request_json,
+                    '$.execution_intent.generation_reason'
+                ) = NEW.generation_reason
+                AND json_extract(
+                    NEW.canonical_request_json,
+                    '$.execution_intent.generation_authorization_evidence_sha256'
+                ) IS NEW.generation_authorization_evidence_sha256
+            ), 0)
+            BEGIN
+                SELECT RAISE(ABORT, 'rca_canonical_request_projection_mismatch');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_rca_source_authority_no_update
+            BEFORE UPDATE ON rca_source_authority_receipts
+            BEGIN
+                SELECT RAISE(ABORT, 'rca_source_authority_update_forbidden');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_rca_source_authority_no_delete
+            BEFORE DELETE ON rca_source_authority_receipts
+            BEGIN
+                SELECT RAISE(ABORT, 'rca_source_authority_delete_forbidden');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_rca_source_authority_no_replace
+            BEFORE INSERT ON rca_source_authority_receipts
+            WHEN EXISTS (
+                SELECT 1 FROM rca_source_authority_receipts
+                 WHERE authority_sha256 = NEW.authority_sha256
+                    OR source_id = NEW.source_id
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'rca_source_authority_replace_forbidden');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_rca_source_authority_source_guard
+            BEFORE INSERT ON rca_source_authority_receipts
+            WHEN NOT EXISTS (
+                SELECT 1
+                  FROM rca_trigger_sources AS source
+             LEFT JOIN kafka_inbox AS inbox
+                    ON inbox.event_uid = json_extract(
+                        NEW.source_metadata_json, '$.event_uid'
+                    )
+                 WHERE source.source_id = NEW.source_id
+                   AND source.source_kind = NEW.source_kind
+                   AND source.payload_sha256 = NEW.payload_sha256
+                   AND source.created_at = json_extract(
+                       NEW.source_metadata_json, '$.observed_at'
+                   )
+                   AND (
+                        (
+                            NEW.source_kind = 'feishu_group_manual'
+                            AND source.platform = json_extract(
+                                NEW.source_metadata_json, '$.platform'
+                            )
+                            AND source.chat_id = json_extract(
+                                NEW.source_metadata_json, '$.chat_id'
+                            )
+                            AND source.thread_id = json_extract(
+                                NEW.source_metadata_json, '$.thread_id'
+                            )
+                            AND source.message_id = json_extract(
+                                NEW.source_metadata_json, '$.message_id'
+                            )
+                            AND source.requester_id = json_extract(
+                                NEW.source_metadata_json, '$.requester_id'
+                            )
+                            AND source.mode = json_extract(
+                                NEW.source_metadata_json, '$.mode'
+                            )
+                        ) OR (
+                            NEW.source_kind = 'kafka_workflow_event'
+                            AND inbox.topic = json_extract(
+                                NEW.source_metadata_json, '$.topic'
+                            )
+                            AND inbox.partition_id = json_extract(
+                                NEW.source_metadata_json, '$.partition'
+                            )
+                            AND inbox.offset_id = json_extract(
+                                NEW.source_metadata_json, '$.offset'
+                            )
+                            AND inbox.raw_sha256 = NEW.payload_sha256
+                            AND (
+                                source.kafka_event_uid IS NULL
+                                OR source.kafka_event_uid = inbox.event_uid
+                            )
+                            AND (
+                                source.source_dedupe_key = inbox.event_uid
+                                OR substr(
+                                    source.source_dedupe_key,
+                                    1,
+                                    length(inbox.event_uid) + 12
+                                ) = inbox.event_uid || ':generation:'
+                            )
+                        )
+                   )
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'rca_source_authority_source_mismatch');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_rca_source_authority_projection_guard
+            BEFORE INSERT ON rca_source_authority_receipts
+            WHEN NOT COALESCE((
+                json_extract(NEW.authority_receipt_json, '$.schema_version') =
+                    NEW.schema_version
+                AND json_extract(
+                    NEW.authority_receipt_json, '$.authority_sha256'
+                ) = NEW.authority_sha256
+                AND json_extract(NEW.authority_receipt_json, '$.source_id') =
+                    NEW.source_id
+                AND json_extract(NEW.authority_receipt_json, '$.source_kind') =
+                    NEW.source_kind
+                AND json_extract(
+                    NEW.authority_receipt_json, '$.source_metadata_sha256'
+                ) = NEW.source_metadata_sha256
+                AND json_extract(
+                    NEW.authority_receipt_json, '$.anchor_sha256'
+                ) = NEW.anchor_sha256
+                AND json_extract(
+                    NEW.authority_receipt_json, '$.ingress_decision_sha256'
+                ) = NEW.ingress_decision_sha256
+                AND json_extract(NEW.source_metadata_json, '$.source_kind') =
+                    NEW.source_kind
+                AND json_extract(NEW.source_metadata_json, '$.payload_sha256') =
+                    NEW.payload_sha256
+                AND json_extract(
+                    NEW.ingress_decision_json,
+                    '$.authorization_evidence_sha256'
+                ) = NEW.authorization_evidence_sha256
+                AND json_extract(
+                    NEW.ingress_decision_json, '$.binding_action'
+                ) = NEW.binding_action
+                AND json_extract(NEW.ingress_decision_json, '$.decision') =
+                    NEW.decision
+            ), 0)
+            BEGIN
+                SELECT RAISE(ABORT, 'rca_source_authority_projection_mismatch');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_rca_admission_snapshot_no_update
+            BEFORE UPDATE ON rca_admission_snapshots
+            BEGIN
+                SELECT RAISE(ABORT, 'rca_admission_snapshot_update_forbidden');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_rca_admission_snapshot_no_delete
+            BEFORE DELETE ON rca_admission_snapshots
+            BEGIN
+                SELECT RAISE(ABORT, 'rca_admission_snapshot_delete_forbidden');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_rca_admission_snapshot_no_replace
+            BEFORE INSERT ON rca_admission_snapshots
+            WHEN EXISTS (
+                SELECT 1 FROM rca_admission_snapshots
+                 WHERE snapshot_sha256 = NEW.snapshot_sha256
+                    OR snapshot_id = NEW.snapshot_id
+                    OR submission_key = NEW.submission_key
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'rca_admission_snapshot_replace_forbidden');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_rca_admission_snapshot_execution_guard
+            BEFORE INSERT ON rca_admission_snapshots
+            WHEN (
+                NEW.activation_ledger_id IS NOT NULL AND NOT EXISTS (
+                    SELECT 1
+                      FROM rca_activation_admission_ledger AS ledger
+                      JOIN rca_activation_epochs AS epoch
+                        ON epoch.epoch_id = ledger.epoch_id
+                     WHERE ledger.ledger_id = NEW.activation_ledger_id
+                       AND ledger.epoch_id = NEW.activation_epoch_id
+                       AND ledger.business_key = NEW.business_key
+                       AND ledger.submission_key = NEW.submission_key
+                       AND ledger.generation = NEW.generation
+                       AND ledger.decision = NEW.execution_decision
+                       AND epoch.state = NEW.execution_state
+                       AND epoch.is_current = 1
+                       AND (
+                            ledger.reason = NEW.execution_reason
+                            OR (
+                                NEW.execution_reason =
+                                    'activation_admission_idempotent'
+                                AND NEW.execution_decision = 'admit'
+                            )
+                       )
+                )
+            ) OR (
+                NEW.activation_ledger_id IS NULL AND EXISTS (
+                    SELECT 1 FROM rca_activation_epochs WHERE is_current = 1
+                )
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'rca_admission_snapshot_execution_mismatch');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_rca_admission_snapshot_projection_guard
+            BEFORE INSERT ON rca_admission_snapshots
+            WHEN NOT COALESCE((
+                json_extract(NEW.admission_snapshot_json, '$.schema_version') =
+                    NEW.schema_version
+                AND json_extract(
+                    NEW.admission_snapshot_json, '$.snapshot_id'
+                ) = NEW.snapshot_id
+                AND json_extract(
+                    NEW.admission_snapshot_json, '$.snapshot_sha256'
+                ) = NEW.snapshot_sha256
+                AND json_extract(
+                    NEW.admission_snapshot_json, '$.request_sha256'
+                ) = NEW.request_sha256
+                AND json_extract(
+                    NEW.admission_snapshot_json,
+                    '$.resolved_admission.business_key'
+                ) = NEW.business_key
+                AND json_extract(
+                    NEW.admission_snapshot_json,
+                    '$.resolved_admission.submission_key'
+                ) = NEW.submission_key
+                AND json_extract(
+                    NEW.admission_snapshot_json,
+                    '$.resolved_admission.generation'
+                ) = NEW.generation
+                AND json_extract(
+                    NEW.admission_snapshot_json,
+                    '$.execution_admission.activation_epoch_id'
+                ) = NEW.activation_epoch_id
+                AND json_extract(
+                    NEW.admission_snapshot_json,
+                    '$.execution_admission.activation_ledger_id'
+                ) IS NEW.activation_ledger_id
+                AND json_extract(
+                    NEW.admission_snapshot_json,
+                    '$.execution_admission.decision'
+                ) = NEW.execution_decision
+                AND json_extract(
+                    NEW.admission_snapshot_json,
+                    '$.execution_admission.reason'
+                ) = NEW.execution_reason
+                AND json_extract(
+                    NEW.admission_snapshot_json,
+                    '$.execution_admission.state'
+                ) = NEW.execution_state
+                AND json_extract(
+                    NEW.admission_snapshot_json,
+                    '$.execution_admission.legacy_unconfigured'
+                ) = NEW.legacy_unconfigured
+                AND json_extract(
+                    NEW.admission_snapshot_json, '$.write_fence.schema_version'
+                ) = 'pnc_rca_write_fence_slot_v1'
+                AND json_extract(
+                    NEW.admission_snapshot_json, '$.write_fence.state'
+                ) = 'unissued'
+            ), 0)
+            BEGIN
+                SELECT RAISE(ABORT, 'rca_admission_snapshot_projection_mismatch');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_rca_snapshot_envelope_no_update
+            BEFORE UPDATE ON rca_snapshot_source_envelopes
+            BEGIN
+                SELECT RAISE(ABORT, 'rca_snapshot_envelope_update_forbidden');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_rca_snapshot_envelope_no_delete
+            BEFORE DELETE ON rca_snapshot_source_envelopes
+            BEGIN
+                SELECT RAISE(ABORT, 'rca_snapshot_envelope_delete_forbidden');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_rca_snapshot_envelope_no_replace
+            BEFORE INSERT ON rca_snapshot_source_envelopes
+            WHEN EXISTS (
+                SELECT 1 FROM rca_snapshot_source_envelopes
+                 WHERE source_envelope_sha256 = NEW.source_envelope_sha256
+                    OR source_envelope_id = NEW.source_envelope_id
+                    OR source_id = NEW.source_id
+                    OR (
+                        NEW.binding_action = 'create'
+                        AND snapshot_sha256 = NEW.snapshot_sha256
+                        AND binding_action = 'create'
+                    )
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'rca_snapshot_envelope_replace_forbidden');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_rca_snapshot_envelope_authority_guard
+            BEFORE INSERT ON rca_snapshot_source_envelopes
+            WHEN NOT EXISTS (
+                SELECT 1 FROM rca_source_authority_receipts AS authority
+                 WHERE authority.authority_sha256 = NEW.source_authority_sha256
+                   AND authority.source_id = NEW.source_id
+                   AND authority.source_kind = NEW.source_kind
+                   AND authority.payload_sha256 = NEW.payload_sha256
+                   AND authority.authorization_evidence_sha256 =
+                       NEW.authorization_evidence_sha256
+                   AND authority.binding_action = NEW.binding_action
+                   AND authority.decision = NEW.decision
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'rca_snapshot_envelope_authority_mismatch');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_rca_snapshot_envelope_projection_guard
+            BEFORE INSERT ON rca_snapshot_source_envelopes
+            WHEN NOT COALESCE((
+                json_extract(NEW.source_envelope_json, '$.schema_version') =
+                    NEW.schema_version
+                AND json_extract(
+                    NEW.source_envelope_json, '$.source_envelope_id'
+                ) = NEW.source_envelope_id
+                AND json_extract(
+                    NEW.source_envelope_json, '$.source_envelope_sha256'
+                ) = NEW.source_envelope_sha256
+                AND json_extract(
+                    NEW.source_envelope_json, '$.source_authority_sha256'
+                ) = NEW.source_authority_sha256
+                AND json_extract(NEW.source_envelope_json, '$.snapshot_id') =
+                    NEW.snapshot_id
+                AND json_extract(
+                    NEW.source_envelope_json, '$.snapshot_sha256'
+                ) = NEW.snapshot_sha256
+                AND json_extract(
+                    NEW.source_envelope_json, '$.submission_key'
+                ) = NEW.submission_key
+                AND json_extract(NEW.source_envelope_json, '$.source_id') =
+                    NEW.source_id
+                AND json_extract(NEW.source_envelope_json, '$.source_kind') =
+                    NEW.source_kind
+                AND json_extract(
+                    NEW.source_envelope_json,
+                    '$.ingress_decision.authorization_evidence_sha256'
+                ) = NEW.authorization_evidence_sha256
+                AND json_extract(
+                    NEW.source_envelope_json,
+                    '$.ingress_decision.binding_action'
+                ) = NEW.binding_action
+                AND json_extract(
+                    NEW.source_envelope_json, '$.ingress_decision.decision'
+                ) = NEW.decision
+                AND json(json_extract(
+                    NEW.source_envelope_json, '$.source_metadata'
+                )) = json(NEW.source_metadata_json)
+                AND json(json_extract(
+                    NEW.source_envelope_json, '$.anchor'
+                )) = json(NEW.anchor_json)
+                AND json(json_extract(
+                    NEW.source_envelope_json, '$.ingress_decision'
+                )) = json(NEW.ingress_decision_json)
+            ), 0)
+            BEGIN
+                SELECT RAISE(ABORT, 'rca_snapshot_envelope_projection_mismatch');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_rca_snapshot_envelope_source_binding_guard
+            BEFORE INSERT ON rca_snapshot_source_envelopes
+            WHEN NOT EXISTS (
+                SELECT 1
+                  FROM rca_admission_snapshots AS snapshot
+                  JOIN rca_trigger_bindings AS binding
+                    ON binding.source_id = NEW.source_id
+                   AND binding.business_key = snapshot.business_key
+                   AND binding.generation = snapshot.generation
+                  JOIN business_triggers AS trigger
+                    ON trigger.business_key = binding.business_key
+                   AND trigger.generation = binding.generation
+                  JOIN rca_trigger_sources AS source
+                    ON source.source_id = binding.source_id
+                 WHERE snapshot.snapshot_sha256 = NEW.snapshot_sha256
+                   AND snapshot.snapshot_id = NEW.snapshot_id
+                   AND snapshot.submission_key = NEW.submission_key
+                   AND trigger.submission_key = snapshot.submission_key
+                   AND binding.role = CASE NEW.binding_action
+                       WHEN 'create' THEN 'origin' ELSE 'observer' END
+                   AND (
+                        NEW.source_kind != 'kafka_workflow_event'
+                        OR source.mode = CASE
+                            WHEN snapshot.generation = 1
+                                THEN 'issue_created'
+                            ELSE 'kafka_retrigger'
+                        END
+                   )
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'rca_snapshot_source_binding_mismatch');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_rca_snapshot_envelope_create_guard
+            BEFORE INSERT ON rca_snapshot_source_envelopes
+            WHEN NEW.binding_action = 'create' AND NOT EXISTS (
+                SELECT 1
+                  FROM rca_admission_snapshots AS snapshot
+                  JOIN rca_canonical_requests AS request
+                    ON request.request_sha256 = snapshot.request_sha256
+                  JOIN rca_source_authority_receipts AS authority
+                    ON authority.authority_sha256 = NEW.source_authority_sha256
+                 WHERE snapshot.snapshot_sha256 = NEW.snapshot_sha256
+                   AND snapshot.snapshot_id = NEW.snapshot_id
+                   AND snapshot.submission_key = NEW.submission_key
+                   AND snapshot.execution_decision = NEW.decision
+                   AND snapshot.creator_source_envelope_sha256 =
+                       NEW.source_envelope_sha256
+                   AND snapshot.creator_authority_sha256 =
+                       NEW.source_authority_sha256
+                   AND snapshot.creator_source_id = NEW.source_id
+                   AND (
+                        (
+                            snapshot.generation = 1
+                            AND request.generation_reason = 'initial'
+                            AND request.generation_authorization_evidence_sha256
+                                IS NULL
+                        )
+                        OR (
+                            snapshot.generation > 1
+                            AND request.generation_reason =
+                                'explicit_user_rerun'
+                            AND request.generation_authorization_evidence_sha256
+                                IS NOT NULL
+                            AND authority.binding_action = 'create'
+                            AND authority.source_kind = 'feishu_group_manual'
+                            AND authority.authorization_evidence_sha256 =
+                                request.generation_authorization_evidence_sha256
+                            AND json_extract(
+                                authority.source_metadata_json, '$.platform'
+                            ) = 'feishu'
+                            AND json_extract(
+                                authority.source_metadata_json, '$.mode'
+                            ) = 'rerun'
+                            AND substr(
+                                json_extract(
+                                    authority.source_metadata_json, '$.requester_id'
+                                ),
+                                1,
+                                3
+                            ) = 'ou_'
+                            AND length(
+                                json_extract(
+                                    authority.source_metadata_json, '$.requester_id'
+                                )
+                            ) > 3
+                        )
+                   )
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'rca_snapshot_creator_binding_mismatch');
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_rca_snapshot_envelope_join_guard
+            BEFORE INSERT ON rca_snapshot_source_envelopes
+            WHEN NEW.binding_action = 'join' AND NOT EXISTS (
+                SELECT 1
+                  FROM rca_admission_snapshots AS snapshot
+                  JOIN rca_snapshot_source_envelopes AS creator
+                    ON creator.source_envelope_sha256 =
+                       snapshot.creator_source_envelope_sha256
+                   AND creator.source_authority_sha256 =
+                       snapshot.creator_authority_sha256
+                   AND creator.source_id = snapshot.creator_source_id
+                 WHERE snapshot.snapshot_sha256 = NEW.snapshot_sha256
+                   AND snapshot.snapshot_id = NEW.snapshot_id
+                   AND snapshot.submission_key = NEW.submission_key
+                   AND snapshot.execution_decision = NEW.decision
+                   AND creator.snapshot_sha256 = snapshot.snapshot_sha256
+                   AND creator.binding_action = 'create'
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'rca_snapshot_join_before_creator_forbidden');
+            END
+            """,
+        )
+        return statements
+
+    @classmethod
+    def _create_v11_snapshot_schema(cls, conn: sqlite3.Connection) -> None:
+        """Create only the inert, immutable W3 authority and snapshot relations."""
+        statements = cls._v11_snapshot_schema_statements()
+        for statement in statements:
+            conn.execute(statement)
 
     def _preflight_schema_version(self) -> str | None:
         """Reject a future schema using a read-only connection before any pragma/DDL."""
@@ -5040,6 +6004,687 @@ class RcaControlStore:
                     )
 
     @staticmethod
+    def _validate_v11_snapshot_schema(conn: sqlite3.Connection) -> None:
+        normalize_sql = lambda value: " ".join(str(value).split()).rstrip(";")
+        required_columns = {
+            "rca_canonical_requests": {
+                "request_sha256",
+                "schema_version",
+                "ticket_title_sha256",
+                "creation_policy_sha256",
+                "business_profile_sha256",
+                "execution_policy_sha256",
+                "publication_policy_sha256",
+                "correction_lineage_policy_sha256",
+                "generation_reason",
+                "generation_authorization_evidence_sha256",
+                "canonical_request_json",
+                "persisted_at",
+            },
+            "rca_source_authority_receipts": {
+                "authority_sha256",
+                "schema_version",
+                "source_id",
+                "source_kind",
+                "payload_sha256",
+                "authorization_evidence_sha256",
+                "binding_action",
+                "decision",
+                "source_metadata_sha256",
+                "anchor_sha256",
+                "ingress_decision_sha256",
+                "source_metadata_json",
+                "anchor_json",
+                "ingress_decision_json",
+                "authority_receipt_json",
+                "persisted_at",
+            },
+            "rca_admission_snapshots": {
+                "snapshot_sha256",
+                "snapshot_id",
+                "schema_version",
+                "request_sha256",
+                "business_key",
+                "submission_key",
+                "generation",
+                "activation_epoch_id",
+                "activation_ledger_id",
+                "execution_decision",
+                "execution_reason",
+                "execution_state",
+                "legacy_unconfigured",
+                "creator_source_envelope_sha256",
+                "creator_authority_sha256",
+                "creator_source_id",
+                "admission_snapshot_json",
+                "persisted_at",
+            },
+            "rca_snapshot_source_envelopes": {
+                "source_envelope_sha256",
+                "source_envelope_id",
+                "schema_version",
+                "snapshot_sha256",
+                "snapshot_id",
+                "submission_key",
+                "source_authority_sha256",
+                "source_id",
+                "source_kind",
+                "payload_sha256",
+                "authorization_evidence_sha256",
+                "binding_action",
+                "decision",
+                "source_metadata_json",
+                "anchor_json",
+                "ingress_decision_json",
+                "source_envelope_json",
+                "persisted_at",
+            },
+        }
+        for table, expected in required_columns.items():
+            observed = {
+                str(row["name"])
+                for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if observed != expected:
+                raise RuntimeError(
+                    f"incompatible_control_store_schema:{table}_columns"
+                )
+
+        expected_table_sql: dict[str, str] = {}
+        table_prefix = "CREATE TABLE IF NOT EXISTS "
+        for statement in RcaControlStore._v11_snapshot_schema_statements():
+            normalized = normalize_sql(statement)
+            if normalized.startswith(table_prefix):
+                table = normalized[len(table_prefix) :].split(" ", 1)[0]
+                expected_table_sql[table] = normalized.replace(
+                    table_prefix,
+                    "CREATE TABLE ",
+                    1,
+                )
+        observed_table_sql = {
+            str(row["name"]): normalize_sql(row["sql"] or "")
+            for row in conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+            if str(row["name"]) in required_columns
+        }
+        if observed_table_sql != expected_table_sql:
+            raise RuntimeError("incompatible_control_store_schema:v11_table_sql")
+
+        def foreign_key_groups(
+            table: str,
+        ) -> set[tuple[str, frozenset[tuple[str, str]], str, str, str]]:
+            grouped: dict[
+                tuple[int, str, str, str, str], set[tuple[str, str]]
+            ] = {}
+            for row in conn.execute(f"PRAGMA foreign_key_list({table})").fetchall():
+                key = (
+                    int(row["id"]),
+                    str(row["table"]),
+                    str(row["on_update"]),
+                    str(row["on_delete"]),
+                    str(row["match"]),
+                )
+                grouped.setdefault(key, set()).add(
+                    (str(row["from"]), str(row["to"]))
+                )
+            return {
+                (parent, frozenset(pairs), on_update, on_delete, match)
+                for (_identifier, parent, on_update, on_delete, match), pairs
+                in grouped.items()
+            }
+
+        expected_foreign_keys = {
+            "rca_canonical_requests": set(),
+            "rca_source_authority_receipts": {
+                (
+                    "rca_trigger_sources",
+                    frozenset({("source_id", "source_id")}),
+                    "NO ACTION",
+                    "NO ACTION",
+                    "NONE",
+                )
+            },
+            "rca_admission_snapshots": {
+                (
+                    "rca_canonical_requests",
+                    frozenset({("request_sha256", "request_sha256")}),
+                    "NO ACTION",
+                    "NO ACTION",
+                    "NONE",
+                ),
+                (
+                    "rca_activation_admission_ledger",
+                    frozenset(
+                        {("activation_ledger_id", "ledger_id")}
+                    ),
+                    "NO ACTION",
+                    "NO ACTION",
+                    "NONE",
+                ),
+                (
+                    "rca_snapshot_source_envelopes",
+                    frozenset(
+                        {
+                            (
+                                "creator_source_envelope_sha256",
+                                "source_envelope_sha256",
+                            ),
+                            (
+                                "creator_authority_sha256",
+                                "source_authority_sha256",
+                            ),
+                            ("creator_source_id", "source_id"),
+                        }
+                    ),
+                    "NO ACTION",
+                    "NO ACTION",
+                    "NONE",
+                ),
+            },
+            "rca_snapshot_source_envelopes": {
+                (
+                    "rca_admission_snapshots",
+                    frozenset({("snapshot_sha256", "snapshot_sha256")}),
+                    "NO ACTION",
+                    "NO ACTION",
+                    "NONE",
+                ),
+                (
+                    "rca_source_authority_receipts",
+                    frozenset(
+                        {
+                            (
+                                "source_authority_sha256",
+                                "authority_sha256",
+                            ),
+                            ("source_id", "source_id"),
+                            ("source_kind", "source_kind"),
+                            ("payload_sha256", "payload_sha256"),
+                        }
+                    ),
+                    "NO ACTION",
+                    "NO ACTION",
+                    "NONE",
+                ),
+                (
+                    "rca_trigger_sources",
+                    frozenset({("source_id", "source_id")}),
+                    "NO ACTION",
+                    "NO ACTION",
+                    "NONE",
+                ),
+            },
+        }
+        for table, expected in expected_foreign_keys.items():
+            if foreign_key_groups(table) != expected:
+                raise RuntimeError(
+                    f"incompatible_control_store_schema:{table}_foreign_keys"
+                )
+
+        snapshot_table = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'rca_admission_snapshots'"
+        ).fetchone()
+        deferred_creator_clause = normalize_sql(
+            """
+            FOREIGN KEY(
+                creator_source_envelope_sha256,
+                creator_authority_sha256,
+                creator_source_id
+            ) REFERENCES rca_snapshot_source_envelopes(
+                source_envelope_sha256,
+                source_authority_sha256,
+                source_id
+            ) DEFERRABLE INITIALLY DEFERRED
+            """
+        )
+        normalized_snapshot_table = normalize_sql(
+            snapshot_table["sql"] if snapshot_table is not None else ""
+        )
+        if (
+            deferred_creator_clause not in normalized_snapshot_table
+            or normalized_snapshot_table.count("DEFERRABLE INITIALLY DEFERRED") != 1
+        ):
+            raise RuntimeError(
+                "incompatible_control_store_schema:admission_snapshot_deferred_creator"
+            )
+
+        expected_indexes = {
+            "idx_rca_snapshot_submission": (
+                "rca_admission_snapshots",
+                1,
+                0,
+                ["submission_key"],
+            ),
+            "idx_rca_snapshot_business_generation": (
+                "rca_admission_snapshots",
+                1,
+                0,
+                ["business_key", "generation"],
+            ),
+            "idx_rca_snapshot_request": (
+                "rca_admission_snapshots",
+                0,
+                0,
+                ["request_sha256", "snapshot_sha256"],
+            ),
+            "idx_rca_snapshot_creator": (
+                "rca_admission_snapshots",
+                0,
+                0,
+                [
+                    "creator_source_envelope_sha256",
+                    "creator_authority_sha256",
+                    "creator_source_id",
+                ],
+            ),
+            "idx_rca_source_authority_source": (
+                "rca_source_authority_receipts",
+                1,
+                0,
+                ["source_id"],
+            ),
+            "idx_rca_source_authority_reference": (
+                "rca_source_authority_receipts",
+                1,
+                0,
+                ["authority_sha256", "source_id", "source_kind", "payload_sha256"],
+            ),
+            "idx_rca_snapshot_envelope_source": (
+                "rca_snapshot_source_envelopes",
+                1,
+                0,
+                ["source_id"],
+            ),
+            "idx_rca_snapshot_envelope_creator_reference": (
+                "rca_snapshot_source_envelopes",
+                1,
+                0,
+                [
+                    "source_envelope_sha256",
+                    "source_authority_sha256",
+                    "source_id",
+                ],
+            ),
+            "idx_rca_snapshot_envelope_snapshot": (
+                "rca_snapshot_source_envelopes",
+                0,
+                0,
+                ["snapshot_sha256", "binding_action", "source_envelope_sha256"],
+            ),
+            "idx_rca_snapshot_envelope_authority": (
+                "rca_snapshot_source_envelopes",
+                0,
+                0,
+                [
+                    "source_authority_sha256",
+                    "source_id",
+                    "source_kind",
+                    "payload_sha256",
+                ],
+            ),
+            "idx_rca_one_create_envelope_per_snapshot": (
+                "rca_snapshot_source_envelopes",
+                1,
+                1,
+                ["snapshot_sha256"],
+            ),
+        }
+        v11_tables = set(required_columns)
+        observed_explicit_indexes = {
+            str(row["name"]): (str(row["tbl_name"]), str(row["sql"] or ""))
+            for row in conn.execute(
+                "SELECT name, tbl_name, sql FROM sqlite_master "
+                "WHERE type = 'index' AND sql IS NOT NULL"
+            ).fetchall()
+            if str(row["tbl_name"]) in v11_tables
+        }
+        if set(observed_explicit_indexes) != set(expected_indexes):
+            raise RuntimeError("incompatible_control_store_schema:v11_indexes")
+        for name, (table, unique, partial, columns) in expected_indexes.items():
+            index_row = next(
+                (
+                    row
+                    for row in conn.execute(f"PRAGMA index_list({table})").fetchall()
+                    if str(row["name"]) == name
+                ),
+                None,
+            )
+            observed_columns = [
+                str(row["name"])
+                for row in conn.execute(f"PRAGMA index_info({name})").fetchall()
+            ]
+            if (
+                index_row is None
+                or int(index_row["unique"]) != unique
+                or int(index_row["partial"]) != partial
+                or observed_columns != columns
+                or observed_explicit_indexes[name][0] != table
+            ):
+                raise RuntimeError(
+                    f"incompatible_control_store_schema:v11_index_contract:{name}"
+                )
+        expected_partial_index_sql = normalize_sql(
+            """
+            CREATE UNIQUE INDEX idx_rca_one_create_envelope_per_snapshot
+                ON rca_snapshot_source_envelopes(snapshot_sha256)
+                WHERE binding_action = 'create'
+            """
+        )
+        if normalize_sql(
+            observed_explicit_indexes[
+                "idx_rca_one_create_envelope_per_snapshot"
+            ][1]
+        ) != expected_partial_index_sql:
+            raise RuntimeError(
+                "incompatible_control_store_schema:v11_partial_index_sql"
+            )
+
+        expected_trigger_sql = {}
+        trigger_prefix = "CREATE TRIGGER IF NOT EXISTS "
+        for statement in RcaControlStore._v11_snapshot_schema_statements():
+            normalized = normalize_sql(statement)
+            if normalized.startswith(trigger_prefix):
+                name = normalized[len(trigger_prefix) :].split(" ", 1)[0]
+                expected_trigger_sql[name] = normalized.replace(
+                    trigger_prefix,
+                    "CREATE TRIGGER ",
+                    1,
+                )
+        observed_triggers = {
+            str(row["name"]): str(row["sql"] or "")
+            for row in conn.execute(
+                "SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'"
+            ).fetchall()
+            if str(row["tbl_name"]) in v11_tables
+        }
+        if set(observed_triggers) != set(expected_trigger_sql):
+            raise RuntimeError("incompatible_control_store_schema:v11_triggers")
+        if any(
+            normalize_sql(observed_triggers[name]) != normalize_sql(expected)
+            for name, expected in expected_trigger_sql.items()
+        ):
+            raise RuntimeError("incompatible_control_store_schema:v11_trigger_sql")
+
+        integrity_queries = {
+            "v11_snapshot_request_binding": """
+                SELECT 1 FROM rca_admission_snapshots AS snapshot
+             LEFT JOIN rca_canonical_requests AS request
+                    ON request.request_sha256 = snapshot.request_sha256
+                 WHERE request.request_sha256 IS NULL
+                 LIMIT 1
+            """,
+            "v11_source_authority_binding": """
+                SELECT 1 FROM rca_source_authority_receipts AS authority
+             LEFT JOIN rca_trigger_sources AS source
+                    ON source.source_id = authority.source_id
+                   AND source.source_kind = authority.source_kind
+                   AND source.payload_sha256 = authority.payload_sha256
+                 WHERE source.source_id IS NULL
+                 LIMIT 1
+            """,
+            "v11_source_authority_transport_binding": """
+                SELECT 1
+                  FROM rca_source_authority_receipts AS authority
+             LEFT JOIN rca_trigger_sources AS source
+                    ON source.source_id = authority.source_id
+             LEFT JOIN kafka_inbox AS inbox
+                    ON inbox.event_uid = json_extract(
+                        authority.source_metadata_json, '$.event_uid'
+                    )
+                 WHERE source.source_id IS NULL
+                    OR source.source_kind != authority.source_kind
+                    OR source.payload_sha256 != authority.payload_sha256
+                    OR source.created_at != json_extract(
+                        authority.source_metadata_json, '$.observed_at'
+                    )
+                    OR (
+                        authority.source_kind = 'feishu_group_manual'
+                        AND NOT COALESCE((
+                            source.platform = json_extract(
+                                authority.source_metadata_json, '$.platform'
+                            )
+                            AND source.chat_id = json_extract(
+                                authority.source_metadata_json, '$.chat_id'
+                            )
+                            AND source.thread_id = json_extract(
+                                authority.source_metadata_json, '$.thread_id'
+                            )
+                            AND source.message_id = json_extract(
+                                authority.source_metadata_json, '$.message_id'
+                            )
+                            AND source.requester_id = json_extract(
+                                authority.source_metadata_json, '$.requester_id'
+                            )
+                            AND source.mode = json_extract(
+                                authority.source_metadata_json, '$.mode'
+                            )
+                        ), 0)
+                    ) OR (
+                        authority.source_kind = 'kafka_workflow_event'
+                        AND NOT COALESCE((
+                            inbox.topic = json_extract(
+                                authority.source_metadata_json, '$.topic'
+                            )
+                            AND inbox.partition_id = json_extract(
+                                authority.source_metadata_json, '$.partition'
+                            )
+                            AND inbox.offset_id = json_extract(
+                                authority.source_metadata_json, '$.offset'
+                            )
+                            AND inbox.raw_sha256 = authority.payload_sha256
+                            AND (
+                                source.kafka_event_uid IS NULL
+                                OR source.kafka_event_uid = inbox.event_uid
+                            )
+                            AND (
+                                source.source_dedupe_key = inbox.event_uid
+                                OR substr(
+                                    source.source_dedupe_key,
+                                    1,
+                                    length(inbox.event_uid) + 12
+                                ) = inbox.event_uid || ':generation:'
+                            )
+                        ), 0)
+                    )
+                 LIMIT 1
+            """,
+            "v11_envelope_authority_binding": """
+                SELECT 1 FROM rca_snapshot_source_envelopes AS envelope
+             LEFT JOIN rca_admission_snapshots AS snapshot
+                    ON snapshot.snapshot_sha256 = envelope.snapshot_sha256
+                   AND snapshot.snapshot_id = envelope.snapshot_id
+                   AND snapshot.submission_key = envelope.submission_key
+             LEFT JOIN rca_source_authority_receipts AS authority
+                    ON authority.authority_sha256 = envelope.source_authority_sha256
+                   AND authority.source_id = envelope.source_id
+                   AND authority.source_kind = envelope.source_kind
+                   AND authority.payload_sha256 = envelope.payload_sha256
+                   AND authority.authorization_evidence_sha256 =
+                       envelope.authorization_evidence_sha256
+                   AND authority.binding_action = envelope.binding_action
+                   AND authority.decision = envelope.decision
+             LEFT JOIN rca_trigger_sources AS source
+                    ON source.source_id = envelope.source_id
+                   AND source.source_kind = envelope.source_kind
+                   AND source.payload_sha256 = envelope.payload_sha256
+                 WHERE snapshot.snapshot_sha256 IS NULL
+                    OR authority.authority_sha256 IS NULL
+                    OR source.source_id IS NULL
+                 LIMIT 1
+            """,
+            "v11_envelope_source_business_binding": """
+                SELECT 1
+                  FROM rca_snapshot_source_envelopes AS envelope
+             LEFT JOIN rca_admission_snapshots AS snapshot
+                    ON snapshot.snapshot_sha256 = envelope.snapshot_sha256
+                   AND snapshot.snapshot_id = envelope.snapshot_id
+                   AND snapshot.submission_key = envelope.submission_key
+             LEFT JOIN rca_trigger_bindings AS binding
+                    ON binding.source_id = envelope.source_id
+                   AND binding.business_key = snapshot.business_key
+                   AND binding.generation = snapshot.generation
+             LEFT JOIN business_triggers AS trigger
+                    ON trigger.business_key = binding.business_key
+                   AND trigger.generation = binding.generation
+                   AND trigger.submission_key = snapshot.submission_key
+             LEFT JOIN rca_trigger_sources AS source
+                    ON source.source_id = binding.source_id
+             LEFT JOIN kafka_inbox AS inbox
+                    ON inbox.event_uid = json_extract(
+                        envelope.source_metadata_json, '$.event_uid'
+                    )
+                 WHERE snapshot.snapshot_sha256 IS NULL
+                    OR binding.source_id IS NULL
+                    OR trigger.business_key IS NULL
+                    OR source.source_id IS NULL
+                    OR binding.role != CASE envelope.binding_action
+                        WHEN 'create' THEN 'origin' ELSE 'observer' END
+                    OR (
+                        envelope.source_kind = 'kafka_workflow_event'
+                        AND NOT COALESCE((
+                            source.mode = CASE
+                                WHEN snapshot.generation = 1
+                                    THEN 'issue_created'
+                                ELSE 'kafka_retrigger'
+                            END
+                            AND source.source_dedupe_key = CASE
+                                WHEN snapshot.generation = 1
+                                    THEN json_extract(
+                                        envelope.source_metadata_json, '$.event_uid'
+                                    )
+                                ELSE json_extract(
+                                    envelope.source_metadata_json, '$.event_uid'
+                                ) || ':generation:' || snapshot.generation
+                            END
+                            AND source.kafka_event_uid IS CASE
+                                WHEN snapshot.generation = 1
+                                    THEN json_extract(
+                                        envelope.source_metadata_json, '$.event_uid'
+                                    )
+                                ELSE NULL
+                            END
+                            AND inbox.topic = json_extract(
+                                envelope.source_metadata_json, '$.topic'
+                            )
+                            AND inbox.partition_id = json_extract(
+                                envelope.source_metadata_json, '$.partition'
+                            )
+                            AND inbox.offset_id = json_extract(
+                                envelope.source_metadata_json, '$.offset'
+                            )
+                            AND inbox.raw_sha256 = envelope.payload_sha256
+                        ), 0)
+                    )
+                 LIMIT 1
+            """,
+            "v11_snapshot_creator_binding": """
+                SELECT 1 FROM rca_admission_snapshots AS snapshot
+             LEFT JOIN rca_snapshot_source_envelopes AS creator
+                    ON creator.source_envelope_sha256 =
+                       snapshot.creator_source_envelope_sha256
+                   AND creator.source_authority_sha256 =
+                       snapshot.creator_authority_sha256
+                   AND creator.source_id = snapshot.creator_source_id
+                   AND creator.snapshot_sha256 = snapshot.snapshot_sha256
+                   AND creator.snapshot_id = snapshot.snapshot_id
+                   AND creator.submission_key = snapshot.submission_key
+                   AND creator.binding_action = 'create'
+                   AND creator.decision = snapshot.execution_decision
+                 WHERE creator.source_envelope_sha256 IS NULL
+                 LIMIT 1
+            """,
+            "v11_create_envelope_binding": """
+                SELECT 1 FROM rca_snapshot_source_envelopes AS creator
+             LEFT JOIN rca_admission_snapshots AS snapshot
+                    ON snapshot.snapshot_sha256 = creator.snapshot_sha256
+                   AND snapshot.snapshot_id = creator.snapshot_id
+                   AND snapshot.submission_key = creator.submission_key
+                   AND snapshot.creator_source_envelope_sha256 =
+                       creator.source_envelope_sha256
+                   AND snapshot.creator_authority_sha256 =
+                       creator.source_authority_sha256
+                   AND snapshot.creator_source_id = creator.source_id
+                   AND snapshot.execution_decision = creator.decision
+             LEFT JOIN rca_canonical_requests AS request
+                    ON request.request_sha256 = snapshot.request_sha256
+             LEFT JOIN rca_source_authority_receipts AS authority
+                    ON authority.authority_sha256 =
+                       creator.source_authority_sha256
+                 WHERE creator.binding_action = 'create'
+                   AND (
+                        snapshot.snapshot_sha256 IS NULL
+                        OR (
+                            snapshot.generation = 1
+                            AND NOT (
+                                request.generation_reason = 'initial'
+                                AND request.generation_authorization_evidence_sha256
+                                    IS NULL
+                            )
+                        )
+                        OR (
+                            snapshot.generation > 1
+                            AND NOT (
+                                request.generation_reason =
+                                    'explicit_user_rerun'
+                                AND request.generation_authorization_evidence_sha256
+                                    IS NOT NULL
+                                AND authority.binding_action = 'create'
+                                AND authority.source_kind =
+                                    'feishu_group_manual'
+                                AND authority.authorization_evidence_sha256 =
+                                    request.generation_authorization_evidence_sha256
+                                AND json_extract(
+                                    authority.source_metadata_json, '$.platform'
+                                ) = 'feishu'
+                                AND json_extract(
+                                    authority.source_metadata_json, '$.mode'
+                                ) = 'rerun'
+                                AND substr(
+                                    json_extract(
+                                        authority.source_metadata_json,
+                                        '$.requester_id'
+                                    ),
+                                    1,
+                                    3
+                                ) = 'ou_'
+                                AND length(
+                                    json_extract(
+                                        authority.source_metadata_json,
+                                        '$.requester_id'
+                                    )
+                                ) > 3
+                            )
+                        )
+                   )
+                 LIMIT 1
+            """,
+            "v11_join_envelope_binding": """
+                SELECT 1 FROM rca_snapshot_source_envelopes AS joined
+             LEFT JOIN rca_admission_snapshots AS snapshot
+                    ON snapshot.snapshot_sha256 = joined.snapshot_sha256
+                   AND snapshot.snapshot_id = joined.snapshot_id
+                   AND snapshot.submission_key = joined.submission_key
+             LEFT JOIN rca_snapshot_source_envelopes AS creator
+                    ON creator.source_envelope_sha256 =
+                       snapshot.creator_source_envelope_sha256
+                   AND creator.source_authority_sha256 =
+                       snapshot.creator_authority_sha256
+                   AND creator.source_id = snapshot.creator_source_id
+                   AND creator.snapshot_sha256 = snapshot.snapshot_sha256
+                   AND creator.binding_action = 'create'
+                   AND joined.decision = snapshot.execution_decision
+                 WHERE joined.binding_action = 'join'
+                   AND creator.source_envelope_sha256 IS NULL
+                 LIMIT 1
+            """,
+        }
+        for error, query in integrity_queries.items():
+            if conn.execute(query).fetchone() is not None:
+                raise RuntimeError(f"incompatible_control_store_schema:{error}")
+
+    @staticmethod
     def _validate_structural_contract(
         conn: sqlite3.Connection,
         *,
@@ -5060,6 +6705,7 @@ class RcaControlStore:
             conn,
             error_prefix="incompatible_control_store_schema",
         )
+        RcaControlStore._validate_v11_snapshot_schema(conn)
 
         def foreign_key_groups(table: str) -> dict[tuple[int, str], set[tuple[str, str]]]:
             groups: dict[tuple[int, str], set[tuple[str, str]]] = {}
@@ -5450,6 +7096,481 @@ class RcaControlStore:
                 "synchronous": int(conn.execute("PRAGMA synchronous").fetchone()[0]),
                 "foreign_keys": int(conn.execute("PRAGMA foreign_keys").fetchone()[0]),
             }
+        finally:
+            conn.close()
+
+    def persist_admission_snapshot_source(
+        self,
+        *,
+        snapshot: Any,
+        source_envelope: Any,
+        expected_source_authority: Mapping[str, Any],
+        expected_snapshot_sha256: str,
+        expected_generation_authorization_evidence_sha256: str | None = None,
+        expected_ticket_title_sha256: str,
+        expected_source_payload_sha256: str,
+        expected_authorization_evidence_sha256: str,
+        expected_policy_sha256s: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Persist one validated W3 creator or join without exposing partial roots."""
+        from gateway.pnc_rca_snapshot import (
+            canonical_json_bytes as canonical_w3_json_bytes,
+            validate_admission_snapshot,
+            validate_snapshot_source_envelope,
+        )
+
+        receipt = dict(expected_source_authority)
+        policy_pins = dict(expected_policy_sha256s)
+        core = validate_admission_snapshot(
+            snapshot,
+            expected_snapshot_sha256=expected_snapshot_sha256,
+            expected_generation_authorization_evidence_sha256=(
+                expected_generation_authorization_evidence_sha256
+            ),
+            expected_ticket_title_sha256=expected_ticket_title_sha256,
+            expected_policy_sha256s=policy_pins,
+        )
+        envelope = validate_snapshot_source_envelope(
+            source_envelope,
+            expected_snapshot=core,
+            expected_authorization_evidence_sha256=(
+                expected_authorization_evidence_sha256
+            ),
+            expected_generation_authorization_evidence_sha256=(
+                expected_generation_authorization_evidence_sha256
+            ),
+            expected_ticket_title_sha256=expected_ticket_title_sha256,
+            expected_source_payload_sha256=expected_source_payload_sha256,
+            expected_policy_sha256s=policy_pins,
+            expected_snapshot_sha256=expected_snapshot_sha256,
+            expected_source_authority=receipt,
+        )
+        request = core.canonical_request
+        request_json = canonical_w3_json_bytes(request.to_dict()).decode("utf-8")
+        snapshot_json = canonical_w3_json_bytes(core.to_dict()).decode("utf-8")
+        metadata_json = canonical_w3_json_bytes(
+            dict(envelope.source_metadata)
+        ).decode("utf-8")
+        anchor_json = canonical_w3_json_bytes(dict(envelope.anchor)).decode("utf-8")
+        ingress_json = canonical_w3_json_bytes(
+            dict(envelope.ingress_decision)
+        ).decode("utf-8")
+        receipt_json = canonical_w3_json_bytes(receipt).decode("utf-8")
+        envelope_json = canonical_w3_json_bytes(envelope.to_dict()).decode("utf-8")
+        persisted_at = _now_iso()
+        binding_action = str(envelope.ingress_decision["binding_action"])
+
+        request_values = {
+            "request_sha256": request.request_sha256,
+            "schema_version": request.schema_version,
+            "ticket_title_sha256": str(request.ticket["title_sha256"]),
+            "creation_policy_sha256": str(request.creation_policy["sha256"]),
+            "business_profile_sha256": str(request.business_profile["sha256"]),
+            "execution_policy_sha256": str(request.execution_policy["sha256"]),
+            "publication_policy_sha256": str(
+                request.publication_policy["sha256"]
+            ),
+            "correction_lineage_policy_sha256": str(
+                request.correction_lineage_policy["sha256"]
+            ),
+            "generation_reason": str(
+                request.execution_intent["generation_reason"]
+            ),
+            "generation_authorization_evidence_sha256": (
+                request.execution_intent[
+                    "generation_authorization_evidence_sha256"
+                ]
+            ),
+            "canonical_request_json": request_json,
+            "persisted_at": persisted_at,
+        }
+        authority_values = {
+            "authority_sha256": str(receipt["authority_sha256"]),
+            "schema_version": str(receipt["schema_version"]),
+            "source_id": envelope.source_id,
+            "source_kind": envelope.source_kind,
+            "payload_sha256": str(envelope.source_metadata["payload_sha256"]),
+            "authorization_evidence_sha256": str(
+                envelope.ingress_decision["authorization_evidence_sha256"]
+            ),
+            "binding_action": binding_action,
+            "decision": str(envelope.ingress_decision["decision"]),
+            "source_metadata_sha256": str(receipt["source_metadata_sha256"]),
+            "anchor_sha256": str(receipt["anchor_sha256"]),
+            "ingress_decision_sha256": str(receipt["ingress_decision_sha256"]),
+            "source_metadata_json": metadata_json,
+            "anchor_json": anchor_json,
+            "ingress_decision_json": ingress_json,
+            "authority_receipt_json": receipt_json,
+            "persisted_at": persisted_at,
+        }
+        snapshot_values = {
+            "snapshot_sha256": core.snapshot_sha256,
+            "snapshot_id": core.snapshot_id,
+            "schema_version": core.schema_version,
+            "request_sha256": core.request_sha256,
+            "business_key": str(core.resolved_admission["business_key"]),
+            "submission_key": str(core.resolved_admission["submission_key"]),
+            "generation": int(core.resolved_admission["generation"]),
+            "activation_epoch_id": str(
+                core.execution_admission["activation_epoch_id"]
+            ),
+            "activation_ledger_id": core.execution_admission[
+                "activation_ledger_id"
+            ],
+            "execution_decision": str(core.execution_admission["decision"]),
+            "execution_reason": str(core.execution_admission["reason"]),
+            "execution_state": str(core.execution_admission["state"]),
+            "legacy_unconfigured": int(
+                bool(core.execution_admission["legacy_unconfigured"])
+            ),
+            "creator_source_envelope_sha256": envelope.source_envelope_sha256,
+            "creator_authority_sha256": envelope.source_authority_sha256,
+            "creator_source_id": envelope.source_id,
+            "admission_snapshot_json": snapshot_json,
+            "persisted_at": persisted_at,
+        }
+        envelope_values = {
+            "source_envelope_sha256": envelope.source_envelope_sha256,
+            "source_envelope_id": envelope.source_envelope_id,
+            "schema_version": envelope.schema_version,
+            "snapshot_sha256": envelope.snapshot_sha256,
+            "snapshot_id": envelope.snapshot_id,
+            "submission_key": envelope.submission_key,
+            "source_authority_sha256": envelope.source_authority_sha256,
+            "source_id": envelope.source_id,
+            "source_kind": envelope.source_kind,
+            "payload_sha256": str(envelope.source_metadata["payload_sha256"]),
+            "authorization_evidence_sha256": str(
+                envelope.ingress_decision["authorization_evidence_sha256"]
+            ),
+            "binding_action": binding_action,
+            "decision": str(envelope.ingress_decision["decision"]),
+            "source_metadata_json": metadata_json,
+            "anchor_json": anchor_json,
+            "ingress_decision_json": ingress_json,
+            "source_envelope_json": envelope_json,
+            "persisted_at": persisted_at,
+        }
+
+        def ensure_exact_tx(
+            conn: sqlite3.Connection,
+            *,
+            table: str,
+            key: str,
+            values: Mapping[str, Any],
+        ) -> bool:
+            immutable_columns = tuple(
+                column for column in values if column != "persisted_at"
+            )
+            row = conn.execute(
+                f"SELECT {', '.join(immutable_columns)} FROM {table} WHERE {key} = ?",
+                (values[key],),
+            ).fetchone()
+            if row is not None:
+                if any(row[column] != values[column] for column in immutable_columns):
+                    raise RecordConflictError(f"w3_{table}_binding_conflict")
+                return False
+            columns = tuple(values)
+            conn.execute(
+                f"INSERT INTO {table}({', '.join(columns)}) "
+                f"VALUES ({', '.join('?' for _ in columns)})",
+                tuple(values[column] for column in columns),
+            )
+            return True
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            snapshot_row = conn.execute(
+                "SELECT * FROM rca_admission_snapshots WHERE snapshot_sha256 = ?",
+                (core.snapshot_sha256,),
+            ).fetchone()
+            durable_source = conn.execute(
+                "SELECT * FROM rca_trigger_sources WHERE source_id = ?",
+                (envelope.source_id,),
+            ).fetchone()
+            if durable_source is None:
+                raise RecordConflictError("w3_snapshot_source_authority_mismatch")
+
+            def normalized_timestamp(value: Any) -> str:
+                text = str(value or "").strip()
+                candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
+                try:
+                    parsed = datetime.fromisoformat(candidate)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise RecordConflictError(
+                        "w3_snapshot_source_authority_mismatch"
+                    ) from exc
+                if parsed.tzinfo is None or parsed.utcoffset() is None:
+                    raise RecordConflictError(
+                        "w3_snapshot_source_authority_mismatch"
+                    )
+                return parsed.astimezone(timezone.utc).isoformat()
+
+            metadata = envelope.source_metadata
+            source_matches = (
+                durable_source["source_kind"] == envelope.source_kind
+                and durable_source["payload_sha256"] == metadata["payload_sha256"]
+                and normalized_timestamp(durable_source["created_at"])
+                == metadata["observed_at"]
+            )
+            if envelope.source_kind == "feishu_group_manual":
+                source_matches = source_matches and all(
+                    durable_source[column] == metadata[column]
+                    for column in (
+                        "platform",
+                        "chat_id",
+                        "thread_id",
+                        "message_id",
+                        "requester_id",
+                        "mode",
+                    )
+                )
+            else:
+                generation = int(core.resolved_admission["generation"])
+                event_uid = str(metadata["event_uid"])
+                expected_mode = "issue_created" if generation == 1 else "kafka_retrigger"
+                expected_dedupe = (
+                    event_uid
+                    if generation == 1
+                    else f"{event_uid}:generation:{generation}"
+                )
+                expected_kafka_event_uid = event_uid if generation == 1 else None
+                inbox = conn.execute(
+                    """
+                    SELECT 1 FROM kafka_inbox
+                     WHERE event_uid = ? AND topic = ?
+                       AND partition_id = ? AND offset_id = ?
+                       AND raw_sha256 = ?
+                    """,
+                    (
+                        event_uid,
+                        metadata["topic"],
+                        metadata["partition"],
+                        metadata["offset"],
+                        metadata["payload_sha256"],
+                    ),
+                ).fetchone()
+                source_matches = source_matches and (
+                    durable_source["source_dedupe_key"] == expected_dedupe
+                    and durable_source["mode"] == expected_mode
+                    and durable_source["kafka_event_uid"]
+                    == expected_kafka_event_uid
+                    and inbox is not None
+                )
+            if not source_matches:
+                raise RecordConflictError("w3_snapshot_source_authority_mismatch")
+
+            expected_role = "origin" if binding_action == "create" else "observer"
+            durable_binding = conn.execute(
+                """
+                SELECT 1
+                  FROM rca_trigger_bindings AS binding
+                  JOIN business_triggers AS trigger
+                    ON trigger.business_key = binding.business_key
+                   AND trigger.generation = binding.generation
+                 WHERE binding.source_id = ?
+                   AND binding.business_key = ?
+                   AND binding.generation = ?
+                   AND binding.role = ?
+                   AND trigger.submission_key = ?
+                """,
+                (
+                    envelope.source_id,
+                    core.resolved_admission["business_key"],
+                    core.resolved_admission["generation"],
+                    expected_role,
+                    core.resolved_admission["submission_key"],
+                ),
+            ).fetchone()
+            if durable_binding is None:
+                raise RecordConflictError("w3_snapshot_source_binding_mismatch")
+
+            activation_ledger_id = core.execution_admission["activation_ledger_id"]
+            establishing_snapshot = binding_action == "create" and snapshot_row is None
+            if establishing_snapshot and activation_ledger_id is not None:
+                activation_source_kind = (
+                    "manual"
+                    if envelope.source_kind == "feishu_group_manual"
+                    else "kafka"
+                )
+                activation_identity: dict[str, Any]
+                if activation_source_kind == "manual":
+                    activation_chat_id = metadata["chat_id"]
+                    activation_thread_id = metadata["thread_id"]
+                    if metadata["platform"] == "operator":
+                        activation_chat_id = "operator"
+                        activation_thread_id = "operator:issue-only"
+                    activation_identity = {
+                        "chat_id": activation_chat_id,
+                        "requester_id": metadata["requester_id"],
+                        "message_id": metadata["message_id"],
+                        "thread_id": activation_thread_id,
+                        "issue_url": core.canonical_request.ticket["issue_url"],
+                        "mode": metadata["mode"],
+                    }
+                else:
+                    activation_identity = {"event_uid": metadata["event_uid"]}
+                source_identity_sha256, _normalized_identity = (
+                    self._normalize_activation_source_identity(
+                        activation_source_kind,
+                        activation_identity,
+                    )
+                )
+                admission_key = self._activation_admission_key(
+                    source_kind=activation_source_kind,
+                    source_identity_sha256=source_identity_sha256,
+                    business_key=str(core.resolved_admission["business_key"]),
+                    submission_key=str(core.resolved_admission["submission_key"]),
+                    generation=int(core.resolved_admission["generation"]),
+                )
+                expected_entrypoint = (
+                    "shadow_promotion"
+                    if core.execution_admission["reason"]
+                    == "activation_confirmed_shadow_reconciliation"
+                    else (
+                        "manual_admit"
+                        if activation_source_kind == "manual"
+                        else "kafka_ingest"
+                    )
+                )
+                durable_execution = conn.execute(
+                    """
+                    SELECT ledger.reason
+                      FROM rca_activation_admission_ledger AS ledger
+                      JOIN rca_activation_epochs AS epoch
+                        ON epoch.epoch_id = ledger.epoch_id
+                     WHERE ledger.ledger_id = ?
+                       AND ledger.epoch_id = ?
+                       AND ledger.business_key = ?
+                       AND ledger.submission_key = ?
+                       AND ledger.generation = ?
+                       AND ledger.admission_key = ?
+                       AND ledger.entrypoint = ?
+                       AND ledger.source_kind = ?
+                       AND ledger.source_identity_sha256 = ?
+                       AND ledger.decision = ?
+                       AND epoch.state = ?
+                       AND epoch.is_current = 1
+                    """,
+                    (
+                        activation_ledger_id,
+                        core.execution_admission["activation_epoch_id"],
+                        core.resolved_admission["business_key"],
+                        core.resolved_admission["submission_key"],
+                        core.resolved_admission["generation"],
+                        admission_key,
+                        expected_entrypoint,
+                        activation_source_kind,
+                        source_identity_sha256,
+                        core.execution_admission["decision"],
+                        core.execution_admission["state"],
+                    ),
+                ).fetchone()
+                if durable_execution is None or (
+                    str(durable_execution["reason"])
+                    != str(core.execution_admission["reason"])
+                    and core.execution_admission["reason"]
+                    != "activation_admission_idempotent"
+                ):
+                    raise RecordConflictError(
+                        "w3_snapshot_execution_authority_mismatch"
+                    )
+            elif establishing_snapshot and conn.execute(
+                "SELECT 1 FROM rca_activation_epochs WHERE is_current = 1"
+            ).fetchone() is not None:
+                raise RecordConflictError("w3_snapshot_execution_authority_mismatch")
+            if binding_action == "join":
+                if snapshot_row is None:
+                    raise RecordConflictError("w3_snapshot_creator_missing")
+                expected_snapshot_columns = {
+                    key: value
+                    for key, value in snapshot_values.items()
+                    if key
+                    not in {
+                        "creator_source_envelope_sha256",
+                        "creator_authority_sha256",
+                        "creator_source_id",
+                        "persisted_at",
+                    }
+                }
+                if any(
+                    snapshot_row[key] != value
+                    for key, value in expected_snapshot_columns.items()
+                ):
+                    raise RecordConflictError("w3_snapshot_durable_binding_conflict")
+                creator = conn.execute(
+                    """
+                    SELECT 1
+                      FROM rca_snapshot_source_envelopes AS envelope
+                     WHERE envelope.source_envelope_sha256 = ?
+                       AND envelope.source_authority_sha256 = ?
+                       AND envelope.source_id = ?
+                       AND envelope.snapshot_sha256 = ?
+                       AND envelope.binding_action = 'create'
+                    """,
+                    (
+                        snapshot_row["creator_source_envelope_sha256"],
+                        snapshot_row["creator_authority_sha256"],
+                        snapshot_row["creator_source_id"],
+                        core.snapshot_sha256,
+                    ),
+                ).fetchone()
+                if creator is None:
+                    raise RecordConflictError("w3_snapshot_creator_missing")
+            elif binding_action != "create":
+                raise RecordConflictError("w3_snapshot_binding_action_invalid")
+
+            ensure_exact_tx(
+                conn,
+                table="rca_canonical_requests",
+                key="request_sha256",
+                values=request_values,
+            )
+            ensure_exact_tx(
+                conn,
+                table="rca_source_authority_receipts",
+                key="authority_sha256",
+                values=authority_values,
+            )
+            snapshot_created = False
+            if binding_action == "create":
+                snapshot_created = ensure_exact_tx(
+                    conn,
+                    table="rca_admission_snapshots",
+                    key="snapshot_sha256",
+                    values=snapshot_values,
+                )
+            source_envelope_created = ensure_exact_tx(
+                conn,
+                table="rca_snapshot_source_envelopes",
+                key="source_envelope_sha256",
+                values=envelope_values,
+            )
+            conn.commit()
+            return {
+                "snapshot_sha256": core.snapshot_sha256,
+                "source_envelope_sha256": envelope.source_envelope_sha256,
+                "source_id": envelope.source_id,
+                "binding_action": binding_action,
+                "snapshot_created": snapshot_created,
+                "source_envelope_created": source_envelope_created,
+            }
+        except RecordConflictError:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        except sqlite3.IntegrityError as exc:
+            if conn.in_transaction:
+                conn.rollback()
+            raise RecordConflictError(
+                f"w3_snapshot_authority_integrity_conflict:{exc}"
+            ) from exc
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
         finally:
             conn.close()
 
@@ -9116,6 +11237,10 @@ class RcaControlStore:
             "rca_activation_transition_audit",
             "rca_capacity_transition_state",
             "rca_capacity_transition_audit",
+            "rca_canonical_requests",
+            "rca_admission_snapshots",
+            "rca_source_authority_receipts",
+            "rca_snapshot_source_envelopes",
         }
         if table not in allowed:
             raise ValueError(f"unsupported table: {table}")

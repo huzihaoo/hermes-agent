@@ -9,6 +9,7 @@ from gateway.pnc_rca_admission import (
     build_rca_admission,
     build_rca_trigger_context,
 )
+from gateway.pnc_rca_control_store import RcaControlStore, RecordConflictError
 from gateway.pnc_rca_snapshot import (
     ADMISSION_SNAPSHOT_SCHEMA_VERSION,
     CANONICAL_RCA_REQUEST_SCHEMA_VERSION,
@@ -1827,3 +1828,681 @@ def test_public_validators_and_envelope_constructor_fail_closed():
             anchor={"issue_target": BASE_URL, "thread_target": None},
             ingress_decision=_ingress(),
         )
+
+
+def _seed_control_source(
+    store,
+    *,
+    snapshot,
+    source_id,
+    source_kind,
+    source_metadata,
+    binding_action,
+):
+    conn = store._connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        generation = int(snapshot.resolved_admission["generation"])
+        if source_kind == "kafka_workflow_event":
+            event_uid = source_metadata["event_uid"]
+            mode = "issue_created" if generation == 1 else "kafka_retrigger"
+            source_dedupe_key = (
+                event_uid
+                if generation == 1
+                else f"{event_uid}:generation:{generation}"
+            )
+            kafka_event_uid = event_uid if generation == 1 else None
+            conn.execute(
+                """
+                INSERT INTO kafka_inbox(
+                    event_uid, topic, partition_id, offset_id,
+                    raw_value, raw_size_bytes, raw_sha256,
+                    headers_json, policy_json, creation_rule_version,
+                    submission_mode, received_at
+                ) VALUES(?, ?, ?, ?, X'', 0, ?, '[]', '{}', ?, 'shadow', ?)
+                """,
+                (
+                    event_uid,
+                    source_metadata["topic"],
+                    source_metadata["partition"],
+                    source_metadata["offset"],
+                    source_metadata["payload_sha256"],
+                    snapshot.resolved_admission["creation_rule_version"],
+                    source_metadata["observed_at"],
+                ),
+            )
+            manual_values = ("", "", "", "", "")
+        else:
+            source_dedupe_key = f"w3-test:{source_id}"
+            kafka_event_uid = None
+            mode = source_metadata["mode"]
+            manual_values = tuple(
+                source_metadata[column]
+                for column in (
+                    "platform",
+                    "chat_id",
+                    "thread_id",
+                    "message_id",
+                    "requester_id",
+                )
+            )
+        conn.execute(
+            """
+            INSERT INTO rca_trigger_sources(
+                source_id, source_kind, source_dedupe_key, payload_sha256,
+                platform, chat_id, thread_id, message_id, requester_id,
+                kafka_event_uid, mode, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                source_id,
+                source_kind,
+                source_dedupe_key,
+                source_metadata["payload_sha256"],
+                *manual_values,
+                kafka_event_uid,
+                mode,
+                source_metadata["observed_at"],
+            ),
+        )
+        ticket = snapshot.canonical_request.ticket
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO business_triggers(
+                business_key, generation, submission_key, creation_rule_version,
+                work_item_id, project_key, work_item_type_key,
+                normalized_json, state, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, '{}', 'accepted', ?)
+            """,
+            (
+                snapshot.resolved_admission["business_key"],
+                generation,
+                snapshot.resolved_admission["submission_key"],
+                snapshot.resolved_admission["creation_rule_version"],
+                ticket["work_item_id"],
+                ticket["project_key"],
+                ticket["work_item_type_key"],
+                source_metadata["observed_at"],
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO rca_trigger_bindings(
+                source_id, business_key, generation, role, bound_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                source_id,
+                snapshot.resolved_admission["business_key"],
+                generation,
+                "origin" if binding_action == "create" else "observer",
+                source_metadata["observed_at"],
+            ),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _persist_snapshot_source(
+    store,
+    *,
+    snapshot,
+    envelope,
+    expected_generation_authorization_evidence_sha256=None,
+    expected_ticket_title_sha256=TITLE_AUTHORITY,
+):
+    return store.persist_admission_snapshot_source(
+        snapshot=snapshot,
+        source_envelope=envelope,
+        expected_source_authority=_source_authority(
+            source_id=envelope.source_id,
+            source_kind=envelope.source_kind,
+            source_metadata=envelope.source_metadata,
+            anchor=envelope.anchor,
+            ingress_decision=envelope.ingress_decision,
+        ),
+        expected_snapshot_sha256=snapshot.snapshot_sha256,
+        expected_generation_authorization_evidence_sha256=(
+            expected_generation_authorization_evidence_sha256
+        ),
+        expected_ticket_title_sha256=expected_ticket_title_sha256,
+        expected_source_payload_sha256=envelope.source_metadata["payload_sha256"],
+        expected_authorization_evidence_sha256=envelope.ingress_decision[
+            "authorization_evidence_sha256"
+        ],
+        expected_policy_sha256s=_policy_authorities(),
+    )
+
+
+def test_control_store_persists_exact_creator_before_generation_two_join(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    _request, snapshot = _rerun_snapshot()
+    creator_metadata = _manual_metadata(mode="rerun")
+    creator = build_snapshot_source_envelope(
+        snapshot=snapshot,
+        source_id="human-rerun-source",
+        source_kind="feishu_group_manual",
+        source_metadata=creator_metadata,
+        anchor={"issue_target": BASE_URL, "thread_target": "topic:omt_root"},
+        ingress_decision=_ingress(evidence=AUTHORITY_A),
+        expected_generation_authorization_evidence_sha256=AUTHORITY_A,
+    )
+    _seed_control_source(
+        store,
+        snapshot=snapshot,
+        source_id=creator.source_id,
+        source_kind=creator.source_kind,
+        source_metadata=creator_metadata,
+        binding_action="create",
+    )
+
+    created = _persist_snapshot_source(
+        store,
+        snapshot=snapshot,
+        envelope=creator,
+        expected_generation_authorization_evidence_sha256=AUTHORITY_A,
+    )
+    assert created["snapshot_created"] is True
+    assert created["source_envelope_created"] is True
+
+    join_metadata = _kafka_metadata(event_uid="topic:0:2", offset=2)
+    joined = build_snapshot_source_envelope(
+        snapshot=snapshot,
+        source_id="authorized-kafka-join",
+        source_kind="kafka_workflow_event",
+        source_metadata=join_metadata,
+        anchor={"issue_target": BASE_URL, "thread_target": None},
+        ingress_decision=_ingress(
+            binding_action="join",
+            evidence=AUTHORITY_B,
+        ),
+        expected_authorization_evidence_sha256=AUTHORITY_B,
+        expected_generation_authorization_evidence_sha256=AUTHORITY_A,
+    )
+    _seed_control_source(
+        store,
+        snapshot=snapshot,
+        source_id=joined.source_id,
+        source_kind=joined.source_kind,
+        source_metadata=join_metadata,
+        binding_action="join",
+    )
+    result = _persist_snapshot_source(
+        store,
+        snapshot=snapshot,
+        envelope=joined,
+        expected_generation_authorization_evidence_sha256=AUTHORITY_A,
+    )
+
+    assert result["snapshot_created"] is False
+    assert result["source_envelope_created"] is True
+    assert len(store.list_rows("rca_canonical_requests")) == 1
+    assert len(store.list_rows("rca_admission_snapshots")) == 1
+    assert len(store.list_rows("rca_source_authority_receipts")) == 2
+    assert len(store.list_rows("rca_snapshot_source_envelopes")) == 2
+    assert (
+        store.list_rows("rca_admission_snapshots")[0][
+            "creator_source_envelope_sha256"
+        ]
+        == creator.source_envelope_sha256
+    )
+
+
+def test_control_store_rejects_join_before_creator_without_partial_authority(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    _request, snapshot = _rerun_snapshot()
+    metadata = _kafka_metadata(event_uid="topic:0:2", offset=2)
+    joined = build_snapshot_source_envelope(
+        snapshot=snapshot,
+        source_id="join-before-create",
+        source_kind="kafka_workflow_event",
+        source_metadata=metadata,
+        anchor={"issue_target": BASE_URL, "thread_target": None},
+        ingress_decision=_ingress(
+            binding_action="join",
+            evidence=AUTHORITY_B,
+        ),
+        expected_authorization_evidence_sha256=AUTHORITY_B,
+        expected_generation_authorization_evidence_sha256=AUTHORITY_A,
+    )
+    _seed_control_source(
+        store,
+        snapshot=snapshot,
+        source_id=joined.source_id,
+        source_kind=joined.source_kind,
+        source_metadata=metadata,
+        binding_action="join",
+    )
+
+    with pytest.raises(RecordConflictError, match="w3_snapshot_creator_missing"):
+        _persist_snapshot_source(
+            store,
+            snapshot=snapshot,
+            envelope=joined,
+            expected_generation_authorization_evidence_sha256=AUTHORITY_A,
+        )
+    assert store.list_rows("rca_canonical_requests") == []
+    assert store.list_rows("rca_admission_snapshots") == []
+    assert store.list_rows("rca_source_authority_receipts") == []
+    assert store.list_rows("rca_snapshot_source_envelopes") == []
+
+
+@pytest.mark.parametrize("drift", ["binding", "transport"])
+def test_control_store_rejects_unbound_or_transport_drifted_source(tmp_path, drift):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    _request, snapshot = _snapshot()
+    metadata = _kafka_metadata()
+    envelope = build_snapshot_source_envelope(
+        snapshot=snapshot,
+        source_id="drifted-kafka-source",
+        source_kind="kafka_workflow_event",
+        source_metadata=metadata,
+        anchor={"issue_target": BASE_URL, "thread_target": None},
+        ingress_decision=_ingress(),
+    )
+    _seed_control_source(
+        store,
+        snapshot=snapshot,
+        source_id=envelope.source_id,
+        source_kind=envelope.source_kind,
+        source_metadata=metadata,
+        binding_action="create",
+    )
+    conn = store._connect()
+    try:
+        if drift == "binding":
+            conn.execute(
+                "DELETE FROM rca_trigger_bindings WHERE source_id = ?",
+                (envelope.source_id,),
+            )
+        else:
+            conn.execute(
+                "UPDATE kafka_inbox SET offset_id = 99 WHERE event_uid = ?",
+                (metadata["event_uid"],),
+            )
+    finally:
+        conn.close()
+
+    expected = (
+        "w3_snapshot_source_binding_mismatch"
+        if drift == "binding"
+        else "w3_snapshot_source_authority_mismatch"
+    )
+    with pytest.raises(RecordConflictError, match=expected):
+        _persist_snapshot_source(
+            store,
+            snapshot=snapshot,
+            envelope=envelope,
+        )
+    assert store.list_rows("rca_canonical_requests") == []
+    assert store.list_rows("rca_source_authority_receipts") == []
+
+
+@pytest.mark.parametrize("drift", ["offset", "event_uid", "generation_dedupe"])
+def test_control_store_current_validation_detects_post_persist_transport_drift(
+    tmp_path, drift
+):
+    path = tmp_path / "control.sqlite3"
+    store = RcaControlStore(path)
+    _request, snapshot = _snapshot()
+    metadata = _kafka_metadata()
+    envelope = build_snapshot_source_envelope(
+        snapshot=snapshot,
+        source_id="post-persist-drift-source",
+        source_kind="kafka_workflow_event",
+        source_metadata=metadata,
+        anchor={"issue_target": BASE_URL, "thread_target": None},
+        ingress_decision=_ingress(),
+    )
+    _seed_control_source(
+        store,
+        snapshot=snapshot,
+        source_id=envelope.source_id,
+        source_kind=envelope.source_kind,
+        source_metadata=metadata,
+        binding_action="create",
+    )
+    _persist_snapshot_source(
+        store,
+        snapshot=snapshot,
+        envelope=envelope,
+    )
+    conn = store._connect()
+    try:
+        if drift == "offset":
+            conn.execute(
+                "UPDATE kafka_inbox SET offset_id=99 WHERE event_uid=?",
+                (metadata["event_uid"],),
+            )
+        elif drift == "event_uid":
+            conn.execute(
+                "UPDATE rca_trigger_sources SET kafka_event_uid=NULL "
+                "WHERE source_id=?",
+                (envelope.source_id,),
+            )
+        else:
+            conn.execute(
+                "UPDATE rca_trigger_sources SET source_dedupe_key=? "
+                "WHERE source_id=?",
+                (
+                    f"{metadata['event_uid']}:generation:999",
+                    envelope.source_id,
+                ),
+            )
+    finally:
+        conn.close()
+
+    with pytest.raises(
+        RuntimeError,
+        match="incompatible_control_store_schema:"
+        "(v11_source_authority_transport_binding|"
+        "v11_envelope_source_business_binding)",
+    ):
+        RcaControlStore(path, require_current=True)
+
+
+def test_control_store_authority_pins_fail_closed_and_exact_retry_is_idempotent(
+    tmp_path,
+):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    _request, snapshot = _snapshot()
+    metadata = _kafka_metadata()
+    envelope = build_snapshot_source_envelope(
+        snapshot=snapshot,
+        source_id="kafka-source",
+        source_kind="kafka_workflow_event",
+        source_metadata=metadata,
+        anchor={"issue_target": BASE_URL, "thread_target": None},
+        ingress_decision=_ingress(),
+    )
+    _seed_control_source(
+        store,
+        snapshot=snapshot,
+        source_id=envelope.source_id,
+        source_kind=envelope.source_kind,
+        source_metadata=metadata,
+        binding_action="create",
+    )
+
+    with pytest.raises(RcaAdmissionError, match="ticket_title_authority_mismatch"):
+        _persist_snapshot_source(
+            store,
+            snapshot=snapshot,
+            envelope=envelope,
+            expected_ticket_title_sha256="f" * 64,
+        )
+    assert store.list_rows("rca_canonical_requests") == []
+
+    first = _persist_snapshot_source(
+        store,
+        snapshot=snapshot,
+        envelope=envelope,
+    )
+    second = _persist_snapshot_source(
+        store,
+        snapshot=snapshot,
+        envelope=envelope,
+    )
+    assert first["snapshot_created"] is True
+    assert first["source_envelope_created"] is True
+    assert second["snapshot_created"] is False
+    assert second["source_envelope_created"] is False
+
+
+def _seed_steady_execution(
+    store,
+    admission,
+    *,
+    source_kind="kafka",
+    source_identity=None,
+):
+    if source_identity is None:
+        source_identity = {"event_uid": "topic:0:1"}
+    source_identity_sha256, _normalized = store._normalize_activation_source_identity(
+        source_kind,
+        source_identity,
+    )
+    admission_key = store._activation_admission_key(
+        source_kind=source_kind,
+        source_identity_sha256=source_identity_sha256,
+        business_key=admission.business_key,
+        submission_key=admission.submission_key,
+        generation=admission.generation,
+    )
+    conn = store._connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            INSERT INTO rca_activation_epochs(
+                epoch_id, state, is_current,
+                preauthorization_fingerprint,
+                preauthorization_gate_receipt_sha256,
+                preauthorization_capsule_sha256,
+                preproduction_fingerprint,
+                preproduction_gate_receipt_sha256,
+                preproduction_capsule_sha256,
+                config_sha256,
+                db_logical_identity_json, db_logical_identity_sha256,
+                partition_start_fence_json, partition_start_fence_sha256,
+                created_at, updated_at, steady_activated_at
+            ) VALUES(
+                'epoch-w3-test', 'steady_active', 1,
+                ?, ?, ?, ?, ?, ?, ?, '{}', ?, '{}', ?, ?, ?, ?
+            )
+            """,
+            tuple(f"{value:x}" * 64 for value in range(1, 10))
+            + (OBSERVED_AT, OBSERVED_AT, OBSERVED_AT),
+        )
+        cursor = conn.execute(
+            """
+            INSERT INTO rca_activation_admission_ledger(
+                epoch_id, admission_key, entrypoint, source_kind,
+                source_identity_sha256, slot_kind, decision, reason,
+                business_key, submission_key, generation,
+                first_adjudicated_at, last_adjudicated_at, admitted_at
+            ) VALUES(
+                'epoch-w3-test', ?, ?, ?,
+                ?, NULL, 'admit', 'activation_steady_active', ?, ?, ?, ?, ?, ?
+            )
+            """,
+            (
+                admission_key,
+                "manual_admit" if source_kind == "manual" else "kafka_ingest",
+                source_kind,
+                source_identity_sha256,
+                admission.business_key,
+                admission.submission_key,
+                admission.generation,
+                OBSERVED_AT,
+                OBSERVED_AT,
+                OBSERVED_AT,
+            ),
+        )
+        ledger_id = int(cursor.lastrowid)
+        conn.commit()
+        return ledger_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def test_control_store_roots_active_snapshot_in_exact_execution_ledger(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    admission, context = _admission_and_context()
+    ledger_id = _seed_steady_execution(store, admission)
+    request = build_canonical_rca_request(
+        admission=admission,
+        trigger_context=context,
+        **_contract_kwargs(),
+    )
+
+    def active_snapshot(bound_ledger_id):
+        return build_admission_snapshot(
+            request=request,
+            admission=admission,
+            execution_admission={
+                "activation_epoch_id": "epoch-w3-test",
+                "activation_ledger_id": bound_ledger_id,
+                "decision": "admit",
+                "reason": "activation_steady_active",
+                "state": "steady_active",
+                "legacy_unconfigured": False,
+            },
+        )
+
+    metadata = _kafka_metadata()
+    wrong_snapshot = active_snapshot(ledger_id + 1)
+    wrong_envelope = build_snapshot_source_envelope(
+        snapshot=wrong_snapshot,
+        source_id="active-kafka-source",
+        source_kind="kafka_workflow_event",
+        source_metadata=metadata,
+        anchor={"issue_target": BASE_URL, "thread_target": None},
+        ingress_decision=_ingress(),
+    )
+    _seed_control_source(
+        store,
+        snapshot=wrong_snapshot,
+        source_id=wrong_envelope.source_id,
+        source_kind=wrong_envelope.source_kind,
+        source_metadata=metadata,
+        binding_action="create",
+    )
+
+    legacy_snapshot = build_admission_snapshot(
+        request=request,
+        admission=admission,
+        execution_admission=_execution_admission(),
+    )
+    legacy_envelope = build_snapshot_source_envelope(
+        snapshot=legacy_snapshot,
+        source_id="active-kafka-source",
+        source_kind="kafka_workflow_event",
+        source_metadata=metadata,
+        anchor={"issue_target": BASE_URL, "thread_target": None},
+        ingress_decision=_ingress(),
+    )
+    with pytest.raises(
+        RecordConflictError, match="w3_snapshot_execution_authority_mismatch"
+    ):
+        _persist_snapshot_source(
+            store,
+            snapshot=legacy_snapshot,
+            envelope=legacy_envelope,
+        )
+
+    with pytest.raises(
+        RecordConflictError, match="w3_snapshot_execution_authority_mismatch"
+    ):
+        _persist_snapshot_source(
+            store,
+            snapshot=wrong_snapshot,
+            envelope=wrong_envelope,
+        )
+    assert store.list_rows("rca_canonical_requests") == []
+    assert store.list_rows("rca_source_authority_receipts") == []
+
+    snapshot = active_snapshot(ledger_id)
+    envelope = build_snapshot_source_envelope(
+        snapshot=snapshot,
+        source_id="active-kafka-source",
+        source_kind="kafka_workflow_event",
+        source_metadata=metadata,
+        anchor={"issue_target": BASE_URL, "thread_target": None},
+        ingress_decision=_ingress(),
+    )
+    result = _persist_snapshot_source(
+        store,
+        snapshot=snapshot,
+        envelope=envelope,
+    )
+    assert result["snapshot_created"] is True
+    assert (
+        store.list_rows("rca_admission_snapshots")[0]["activation_ledger_id"]
+        == ledger_id
+    )
+
+    conn = store._connect()
+    try:
+        conn.execute(
+            "UPDATE rca_activation_epochs SET state='confirmed' "
+            "WHERE epoch_id='epoch-w3-test'"
+        )
+    finally:
+        conn.close()
+    retry = _persist_snapshot_source(
+        store,
+        snapshot=snapshot,
+        envelope=envelope,
+    )
+    assert retry["snapshot_created"] is False
+    assert retry["source_envelope_created"] is False
+
+
+def test_control_store_persists_active_operator_identity_with_durable_placeholders(
+    tmp_path,
+):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    admission, context = _admission_and_context(trigger_kind="manual_issue_request")
+    metadata = _manual_metadata(platform="operator", mode="debug")
+    ledger_id = _seed_steady_execution(
+        store,
+        admission,
+        source_kind="manual",
+        source_identity={
+            "chat_id": "operator",
+            "requester_id": metadata["requester_id"],
+            "message_id": metadata["message_id"],
+            "thread_id": "operator:issue-only",
+            "issue_url": BASE_URL,
+            "mode": metadata["mode"],
+        },
+    )
+    request = build_canonical_rca_request(
+        admission=admission,
+        trigger_context=context,
+        **_contract_kwargs(),
+    )
+    snapshot = build_admission_snapshot(
+        request=request,
+        admission=admission,
+        execution_admission={
+            "activation_epoch_id": "epoch-w3-test",
+            "activation_ledger_id": ledger_id,
+            "decision": "admit",
+            "reason": "activation_steady_active",
+            "state": "steady_active",
+            "legacy_unconfigured": False,
+        },
+    )
+    envelope = build_snapshot_source_envelope(
+        snapshot=snapshot,
+        source_id="active-operator-source",
+        source_kind="feishu_group_manual",
+        source_metadata=metadata,
+        anchor={"issue_target": BASE_URL, "thread_target": None},
+        ingress_decision=_ingress(),
+    )
+    _seed_control_source(
+        store,
+        snapshot=snapshot,
+        source_id=envelope.source_id,
+        source_kind=envelope.source_kind,
+        source_metadata=metadata,
+        binding_action="create",
+    )
+
+    result = _persist_snapshot_source(
+        store,
+        snapshot=snapshot,
+        envelope=envelope,
+    )
+    assert result["snapshot_created"] is True
+    assert result["source_envelope_created"] is True
