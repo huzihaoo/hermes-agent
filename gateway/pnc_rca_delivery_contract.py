@@ -1082,6 +1082,27 @@ _PUBLIC_INTERNAL_FRAGMENTS = (
     "RCA 第 ",
 )
 
+_PUBLIC_TEXT_REPLACEMENTS = (
+    ("decoded evaluator", "已解码证据"),
+    ("decoded 证据", "已解码证据"),
+    ("OOI 槽位", "目标跟踪记录"),
+    ("活动槽位", "有效记录位置"),
+    ("OOI", "前方目标"),
+    ("原始 mcap 已解码出函数级证据，可直接进入 RCA", "生产数据已成功读取，并提取到可核验的功能证据"),
+)
+
+_PUBLIC_RESPONSIBILITY_LABELS = {
+    "ACC": "ACC 功能链",
+    "AEB_FCW": "AEB/FCW 功能链",
+    "CONTROL_LONGITUDINAL": "纵向控制",
+    "DNP_SPP": "规划功能链",
+    "LANE_PERCEPTION": "车道线感知",
+    "LCC": "LCC 功能链",
+    "PERCEPTION_LANE": "车道线感知",
+    "PERCEPTION_OBJECT": "目标感知/融合",
+    "PLANNING": "规划",
+}
+
 
 def _public_text(value: Any, *, limit: int = 900) -> str:
     """Keep user-facing RCA text free of execution metadata and debug noise."""
@@ -1094,10 +1115,52 @@ def _public_text(value: Any, *, limit: int = 900) -> str:
         if line.strip() and not any(fragment in line for fragment in _PUBLIC_INTERNAL_FRAGMENTS)
     ]
     text = "；".join(kept)
+    for source, replacement in _PUBLIC_TEXT_REPLACEMENTS:
+        text = re.sub(re.escape(source), replacement, text, flags=re.IGNORECASE)
+    text = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", text)
     for prefix in ("候选因果判断：", "候选原因：", "诊断结论："):
         if text.startswith(prefix):
             text = text[len(prefix):].strip()
     return _truncate_utf8(text.rstrip("。； ") + ("。" if text else ""), limit)
+
+
+def _public_responsibility(value: Any) -> str:
+    text = _public_text(value, limit=260)
+    if not text:
+        return ""
+    normalized = text.rstrip("。 ").upper()
+    return _PUBLIC_RESPONSIBILITY_LABELS.get(normalized, text)
+
+
+def _public_action(value: Any) -> str:
+    text = _public_text(value, limit=500)
+    if any(
+        marker in text
+        for marker in ("已受理", "待受控远程读取", "自动管线", "无需发起人补数据")
+    ):
+        return ""
+    return text
+
+
+def _public_attribution_text(value: Any) -> tuple[str, str]:
+    """Split a legacy evaluator sentence into conclusion and review boundary."""
+    text = _public_text(value, limit=1200)
+    if not text:
+        return "", ""
+    boundary = ""
+    boundary_match = re.search(r"(?:；|。)(当前缺少[^。；]*[。]?)", text)
+    if boundary_match:
+        boundary = boundary_match.group(1).rstrip("。； ") + "。"
+        text = text[: boundary_match.start()].rstrip("。； ") + "。"
+    text = re.sub(r"^当前工况下，[^。]{1,120}-无描述。", "", text)
+    text = re.sub(r"已解码证据\s*已支持候选归因方向：", "", text)
+    text = re.sub(r"\b[A-Z][A-Z0-9_/ -]{0,40}\s+已解码证据：", "", text)
+    text = re.sub(r"责任候选：[^。；]+(?:，需人工复核)?[。]?$", "", text)
+    text = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", text)
+    text = text.strip("。； ")
+    if text and not text.endswith("..."):
+        text += "。"
+    return (text, boundary)
 
 
 def _public_first_text(*values: Any, limit: int = 900) -> str:
@@ -1125,6 +1188,21 @@ def _public_terminal_blocker(code: str) -> tuple[str, str, str]:
             "该问题已识别到所属业务，但对应数据适配尚未就绪。",
             "当前没有可验证的业务证据，不能跨项目借用其他归因能力。",
             "请人工分流；完成该业务的数据适配后重新发起 RCA。",
+        ),
+        "business_route_unresolved": (
+            "问题单缺少可确认的业务归属，当前不能自动归因。",
+            "无法唯一选择对应业务的数据和归因能力，系统未按标题、负责人或群聊猜测。",
+            "请补齐或修正问题单的业务归属字段后重新发起 RCA。",
+        ),
+        "business_route_unsupported": (
+            "问题所属业务尚未接入自动 RCA，当前不能自动归因。",
+            "系统已停止在业务边界，未借用其他项目的数据或归因能力。",
+            "请人工分流；该业务接入后重新发起 RCA。",
+        ),
+        "business_route_conflict": (
+            "问题单的业务归属字段相互冲突，当前不能自动归因。",
+            "无法唯一选择对应业务的数据和归因能力。",
+            "请修正冲突的业务归属字段后重新发起 RCA。",
         ),
     }
     return mapping.get(
@@ -1158,23 +1236,42 @@ def build_public_rca_result(contract: Mapping[str, Any]) -> dict[str, Any]:
     terminal = public.get("terminal_diagnostic") if isinstance(public.get("terminal_diagnostic"), Mapping) else {}
 
     terminal_code = str(terminal.get("blocker_kind") or "").strip()
-    short = _public_first_text(
+    raw_short = _public_first_text(
         summary.get("short_conclusion"),
         summary.get("l0"),
         limit=1200,
     )
+    short, derived_boundary = _public_attribution_text(raw_short)
     no_attribution = bool(terminal_code) or any(
         marker in short
         for marker in ("不能自动归因", "未形成归因", "未找到", "不存在，请核对", "暂不在自动")
     )
-    responsibility_candidate = _public_first_text(
+    responsibility_candidate = _public_responsibility(
+        report.get("candidate_owner_domain")
+        or responsibility.get("candidate")
+        or responsibility.get("owner")
+        or public.get("candidate")
+        or report.get("candidate_owner")
+    )
+
+    artifacts = contract.get("artifacts") if isinstance(contract.get("artifacts"), Mapping) else {}
+    fallback_causal_text, fallback_boundary = _public_attribution_text(_public_first_text(
+        artifacts.get("attribution_causal_text"),
+        summary.get("short_conclusion"),
+        limit=1000,
+    ))
+    if not derived_boundary:
+        derived_boundary = fallback_boundary
+
+    responsibility_fallback = _public_first_text(
         responsibility.get("candidate"),
         responsibility.get("owner"),
         public.get("candidate"),
         report.get("candidate_owner"),
-        report.get("candidate_owner_domain"),
         limit=260,
     )
+    if not responsibility_candidate:
+        responsibility_candidate = responsibility_fallback
 
     narrative = causal.get("narrative")
     narrative = narrative if isinstance(narrative, list) else []
@@ -1199,6 +1296,8 @@ def build_public_rca_result(contract: Mapping[str, Any]) -> dict[str, Any]:
                     causal_text = _public_first_text(item.get("narrative"), item.get("text"), item.get("summary"), limit=1000)
                     if causal_text:
                         break
+    if not causal_text:
+        causal_text = fallback_causal_text
     if not evidence_text:
         refs = evidence.get("refs")
         if isinstance(refs, list):
@@ -1212,26 +1311,48 @@ def build_public_rca_result(contract: Mapping[str, Any]) -> dict[str, Any]:
                 if text and text not in compact_refs:
                     compact_refs.append(text)
             evidence_text = "；".join(compact_refs)
+    evidence_boundary = public.get("evidence_boundary")
+    if not isinstance(evidence_boundary, list):
+        evidence_boundary = contract.get("evidence_boundary")
+    evidence_boundary = evidence_boundary if isinstance(evidence_boundary, list) else []
+    if not evidence_text:
+        evidence_text = _public_first_text(*evidence_boundary, limit=1000)
     boundary = _public_first_text(
         responsibility.get("boundary"),
         summary.get("high_confidence_boundary"),
-        *(public.get("evidence_boundary") if isinstance(public.get("evidence_boundary"), list) else ()),
+        derived_boundary,
+        *evidence_boundary,
         limit=800,
     )
     action = public.get("user_action") if isinstance(public.get("user_action"), Mapping) else {}
-    next_action = _public_first_text(action.get("next_action_text"), action.get("next_action"), limit=500)
+    if not action:
+        raw_action = contract.get("user_action")
+        action = raw_action if isinstance(raw_action, Mapping) else {}
+    next_action = _public_action(action.get("next_action_text") or action.get("next_action"))
 
     if no_attribution:
         conclusion, impact, default_action = _public_terminal_blocker(terminal_code)
-        if not terminal_code and short:
-            conclusion = "本次未形成可确认的自动归因。"
-            impact = "问题现象、证据或因果链尚未达到可确认标准。"
+        specific = evidence_text or fallback_causal_text or short
+        causal_boundary = "暂无足够证据建立可确认的因果链。"
+        if not terminal_code and any(marker in short for marker in ("数据源不一致", "证据冲突", "未找到该目标")):
+            conclusion = "问题单描述的目标与生产数据不一致，当前不能确认责任归因。"
+            impact = "问题单中的目标信息无法在绑定的生产数据中匹配。"
+            causal_boundary = "问题单目标描述 → 生产数据核验 → 关键目标不匹配 → 无法验证责任因果链。"
+            default_action = "请核对绑定的 PDCL 事件及目标信息；修正数据地址、时间或目标后重新发起 RCA。"
+        elif not terminal_code and "未提供可核验的现象描述" in short:
+            conclusion = "生产数据已读取，但问题现象描述不足，当前不能确认归因。"
+            impact = "缺少可核验的异常现象，无法选择并验证对应因果机制。"
+            causal_boundary = "生产数据读取 → 问题现象不明确 → 无法选择归因机制 → 转人工补充。"
+            default_action = "请补充发生了什么、预期行为及实际异常后重新发起 RCA。"
+        elif not terminal_code and short:
+            conclusion = short
+            impact = boundary or "问题现象、证据或因果链尚未达到可确认标准。"
         return {
             "conclusion": conclusion,
             "responsibility": "暂无法判断。",
-            "causal_chain": "暂无足够证据建立可确认的因果链。",
-            "evidence": evidence_text or "未取得可用于责任判断的充分证据。",
-            "boundary": boundary or impact,
+            "causal_chain": causal_boundary,
+            "evidence": specific or "未取得可用于责任判断的充分证据。",
+            "boundary": impact,
             "next_action": next_action or default_action,
             "attribution_ready": False,
         }

@@ -13,6 +13,7 @@ from gateway.pnc_rca_delivery_contract import (
     DeliveryContractError,
     MAX_DELIVERY_ARTIFACT_BYTES,
     MAX_DELIVERY_ARTIFACTS,
+    build_public_rca_result,
     build_report_cifs_path,
     build_report_artifact_url,
     build_report_url,
@@ -21,6 +22,7 @@ from gateway.pnc_rca_delivery_contract import (
     build_thread_reply_effect,
     compute_artifact_set_id,
     MAX_FEISHU_COMMENT_BYTES,
+    render_public_rca_result,
     verify_delivery_bundle,
 )
 from scripts.pnc_foxglove_delivery import (
@@ -317,6 +319,75 @@ def test_delivery_projects_consumer_capability_into_field_and_comment():
         verified.effect_payload["field_updates"][0]["field_value"]
         == verified.conclusion
     )
+
+
+def test_public_projection_keeps_evidence_conflict_without_debug_terms():
+    contract = {
+        "summary": {
+            "short_conclusion": (
+                "问题评论声称 ID 75 / age 226 / 速度 0.0，但绑定 PDCL 事件的 "
+                "28 个 OOI 槽位仅观测到目标 ID [1, 67]（活动槽位 [5, 9]），"
+                "未找到该目标组合；问题描述证据与生产数据源不一致，本次禁止输出责任归因。"
+            )
+        },
+        "evidence_boundary": [
+            "问题描述证据与生产数据源不一致，未找到该目标组合。"
+        ],
+        "artifacts": {
+            "attribution_causal_text": "问题描述证据与生产数据源不一致。"
+        },
+    }
+
+    result = build_public_rca_result(contract)
+    rendered = render_public_rca_result(contract)
+
+    assert result["attribution_ready"] is False
+    assert "问题单描述的目标与生产数据不一致" in result["conclusion"]
+    assert "关键目标不匹配" in result["causal_chain"]
+    assert "核对绑定的 PDCL 事件" in result["next_action"]
+    assert "OOI" not in rendered
+    assert "槽位" not in rendered
+
+
+def test_public_projection_humanizes_evaluator_and_responsibility_domain():
+    contract = {
+        "summary": {
+            "short_conclusion": (
+                "decoded evaluator 已支持候选归因方向：ACC decoded 证据显示实际减速度偏重。"
+            )
+        },
+        "report": {
+            "candidate_owner": "ACC decoded 证据",
+            "candidate_owner_domain": "ACC",
+        },
+        "evidence_boundary": ["原始 mcap 已解码出函数级证据。"],
+        "artifacts": {
+            "attribution_causal_text": "目标状态与减速度请求不匹配，导致车辆减速度偏重。"
+        },
+    }
+
+    rendered = render_public_rca_result(contract)
+
+    assert "责任候选：ACC 功能链" in rendered
+    assert "因果链：目标状态与减速度请求不匹配" in rendered
+    assert "decoded" not in rendered
+    assert "evaluator" not in rendered
+
+
+def test_public_projection_rejects_stale_pipeline_next_action():
+    contract = {
+        "summary": {
+            "short_conclusion": "生产数据已读取，但问题单未提供可核验的现象描述，不能自动归因。"
+        },
+        "user_action": {
+            "next_action_text": "已受理；数据待受控远程读取（自动管线），无需发起人补数据。"
+        },
+    }
+
+    rendered = render_public_rca_result(contract)
+
+    assert "请补充发生了什么" in rendered
+    assert "待受控远程读取" not in rendered
 
 
 def test_delivery_rejects_false_applied_consumer_capability():
