@@ -3,16 +3,15 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>local.pnc.vm-task-sync</string>
+  <string>local.pnc.feishu-delivery-repair</string>
   <key>ProgramArguments</key>
   <array>
     <string>/usr/bin/python3</string>
     <string>/Users/songying/.hermes/runtime/governance-tools/pnc_live_exec.py</string>
-    <string>local.pnc.vm-task-sync</string>
-    <string>--limit</string>
-    <string>50</string>
-    <string>--include-terminal</string>
+    <string>local.pnc.feishu-delivery-repair</string>
+    <string>--repair</string>
     <string>--json</string>
+    <string>--no-backup</string>
   </array>
   <key>WorkingDirectory</key>
   <string>/Users/songying/.hermes/runtime</string>
@@ -24,8 +23,6 @@
     <string>/Users/songying/.hermes</string>
     <key>PATH</key>
     <string>/Users/songying/.local/bin:/Users/songying/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-    <key>PNC_VM_TASK_SYNC_RECEIPT_PATH</key>
-    <string>/Users/songying/.hermes/runtime/pnc_agent/feishu_issue_kafka_rca/vm_task_sync_completion.json</string>
     <key>PYTHONNOUSERSITE</key>
     <string>1</string>
     <key>PYTHONDONTWRITEBYTECODE</key>
@@ -44,8 +41,8 @@
   <key>Umask</key>
   <integer>63</integer>
   <key>StandardOutPath</key>
-  <string>/Users/songying/.hermes/logs/pnc-vm-task-sync.log</string>
+  <string>/Users/songying/.hermes/logs/pnc-feishu-delivery-repair.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/songying/.hermes/logs/pnc-vm-task-sync.error.log</string>
+  <string>/Users/songying/.hermes/logs/pnc-feishu-delivery-repair.error.log</string>
 </dict>
 </plist>

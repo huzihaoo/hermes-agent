@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import plistlib
 import subprocess
 import sys
 from pathlib import Path
@@ -18,6 +19,16 @@ from hermes_constants import get_live_manifest_path
 OLD_WORKTREE_MARKERS = (
     "hermes-agent-sync-v0.14-overlay-20260522",
     ".venv-v014-candidate",
+)
+
+DYNAMIC_PNC_SERVICES = {
+    "local.pnc.feishu-delivery-repair": "pnc_feishu_delivery_guard.py",
+    "local.pnc.vm-task-sync": "pnc_vm_task_sync.py",
+}
+FORBIDDEN_PNC_RUNTIME_MARKERS = (
+    "/runtime/releases/",
+    "/runtime/venvs/",
+    "/runtime/hermes-live",
 )
 
 
@@ -74,9 +85,42 @@ def _validate_pnc_launchd_timer(label: str, expected_script_name: str) -> dict[s
     if not plist.exists():
         errors.append(f"{label} plist missing: {plist}")
     raw = str(launchd.get("raw") or "")
-    expected_script = str(Path.home() / ".hermes" / "runtime" / "hermes-live" / "scripts" / expected_script_name)
-    if raw and expected_script not in raw:
-        errors.append(f"{label} does not point at live {expected_script_name}")
+    if label in DYNAMIC_PNC_SERVICES:
+        launcher = str(
+            Path.home()
+            / ".hermes"
+            / "runtime"
+            / "governance-tools"
+            / "pnc_live_exec.py"
+        )
+        if raw and (launcher not in raw or label not in raw):
+            errors.append(f"{label} loaded definition bypasses the active runtime launcher")
+        if any(marker in raw for marker in FORBIDDEN_PNC_RUNTIME_MARKERS):
+            errors.append(f"{label} loaded definition contains a pinned runtime path")
+        try:
+            body = plistlib.loads(plist.read_bytes())
+        except (OSError, ValueError, plistlib.InvalidFileException):
+            body = {}
+        arguments = body.get("ProgramArguments") if isinstance(body, dict) else None
+        environment = body.get("EnvironmentVariables") if isinstance(body, dict) else None
+        persisted_text = json.dumps(body, sort_keys=True) if body else ""
+        if arguments is not None and arguments[:3] != ["/usr/bin/python3", launcher, label]:
+            errors.append(f"{label} persisted definition bypasses the active runtime launcher")
+        if not isinstance(environment, dict) or "VIRTUAL_ENV" in environment:
+            errors.append(f"{label} persisted definition pins a virtual environment")
+        if any(marker in persisted_text for marker in FORBIDDEN_PNC_RUNTIME_MARKERS):
+            errors.append(f"{label} persisted definition contains a pinned runtime path")
+    else:
+        expected_script = str(
+            Path.home()
+            / ".hermes"
+            / "runtime"
+            / "hermes-live"
+            / "scripts"
+            / expected_script_name
+        )
+        if raw and expected_script not in raw:
+            errors.append(f"{label} does not point at live {expected_script_name}")
     if expected_script_name == "pnc_vm_task_sync.py" and "--include-terminal" not in raw:
         errors.append(f"{label} must include --include-terminal so completed VM tasks keep syncing")
     if expected_script_name == "pnc_completion_notice_relay.py":
