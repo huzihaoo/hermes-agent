@@ -55,6 +55,13 @@ def test_vm_execution_request_envelope_matches_fixed_service_limits(payload, err
         validate_vm_execution_request_envelope(payload)
 
 
+def test_vm_execution_request_envelope_supports_dispatcher_headroom_limit():
+    payload = {"toolchain": {}, "evidence": {"text": "x" * 256}}
+
+    with pytest.raises(ValueError, match="rca_vm_request_json_bytes_exceeded"):
+        validate_vm_execution_request_envelope(payload, max_bytes=128)
+
+
 def test_issue_context_defaults_are_safe_and_privacy_light():
     ctx = RcaIssueContext()
     data = to_dict(ctx)

@@ -23,6 +23,9 @@ RCA_EXECUTION_REQUEST_SCHEMA_VERSION = "g1q3_rca_execution_request_v2"
 RCA_EXECUTION_RESULT_SCHEMA_VERSION = "g1q3_rca_execution_result_v1"
 RCA_TOOLCHAIN_FINGERPRINT_SCHEMA_VERSION = "g1q3_rca_toolchain_v1"
 RCA_VM_MAX_EXECUTION_REQUEST_JSON_BYTES = 1024 * 1024
+# The dispatcher appends this fixed-shape receipt after its pre-reservation
+# request check. Keep deterministic space for the validated receipt envelope.
+RCA_VM_DERIVED_RESERVATION_RECEIPT_HEADROOM_BYTES = 64 * 1024
 RCA_VM_MAX_JSON_DEPTH = 32
 RCA_VM_MAX_JSON_NODES = 50_000
 
@@ -272,9 +275,25 @@ def to_json(value: Any) -> str:
     return json.dumps(to_dict(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def validate_vm_execution_request_envelope(value: Any) -> dict[str, Any]:
+def validate_vm_execution_request_envelope(
+    value: Any,
+    *,
+    max_bytes: int | None = None,
+) -> dict[str, Any]:
     """Mirror the fixed VM service JSON byte, depth, and node limits."""
     payload = to_dict(value)
+    byte_limit = (
+        RCA_VM_MAX_EXECUTION_REQUEST_JSON_BYTES
+        if max_bytes is None
+        else max_bytes
+    )
+    if (
+        isinstance(byte_limit, bool)
+        or not isinstance(byte_limit, int)
+        or byte_limit <= 0
+        or byte_limit > RCA_VM_MAX_EXECUTION_REQUEST_JSON_BYTES
+    ):
+        raise ValueError("rca_vm_request_json_limit_invalid")
     try:
         canonical = json.dumps(
             payload,
@@ -285,7 +304,7 @@ def validate_vm_execution_request_envelope(value: Any) -> dict[str, Any]:
         ).encode("utf-8")
     except (TypeError, ValueError) as exc:
         raise ValueError("rca_vm_request_json_invalid") from exc
-    if len(canonical) > RCA_VM_MAX_EXECUTION_REQUEST_JSON_BYTES:
+    if len(canonical) > byte_limit:
         raise ValueError("rca_vm_request_json_bytes_exceeded")
 
     nodes = 0

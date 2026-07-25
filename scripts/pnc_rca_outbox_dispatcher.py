@@ -83,6 +83,8 @@ from gateway.pnc_rca_runtime_identity import (
     runtime_identity_is_valid,
 )
 from gateway.pnc_rca_schema import (
+    RCA_VM_DERIVED_RESERVATION_RECEIPT_HEADROOM_BYTES,
+    RCA_VM_MAX_EXECUTION_REQUEST_JSON_BYTES,
     RcaExecutionRequest,
     RcaIssueContext,
     SourceQuality,
@@ -1932,7 +1934,13 @@ def build_dispatch_execution_request(
     )
     _validate_remote_read_execution_request(request)
     try:
-        validate_vm_execution_request_envelope(request)
+        validate_vm_execution_request_envelope(
+            request,
+            max_bytes=(
+                RCA_VM_MAX_EXECUTION_REQUEST_JSON_BYTES
+                - RCA_VM_DERIVED_RESERVATION_RECEIPT_HEADROOM_BYTES
+            ),
+        )
     except ValueError as exc:
         raise DispatchCircuitError(
             "dispatcher_execution_request_envelope_invalid",

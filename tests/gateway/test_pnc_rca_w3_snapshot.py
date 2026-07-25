@@ -3610,14 +3610,18 @@ def test_execution_request_preserves_valid_w3_bundle_policy_semantics(tmp_path):
         rca_to_dict(tampered_request)
 
 
-def test_dispatcher_rejects_vm_shape_excess_before_capacity_reservation(tmp_path):
+@pytest.mark.parametrize("shape_kind", ["depth", "bytes"])
+def test_dispatcher_rejects_vm_envelope_excess_before_capacity_reservation(
+    tmp_path, shape_kind
+):
     nested = "leaf"
     for _index in range(30):
         nested = {"n": nested}
+    oversized = nested if shape_kind == "depth" else "x" * 1_000_000
     policies = _contract_kwargs()
     policies["publication_policy"] = _policy(
         "publication_policy",
-        {"target": "issue", "nested": nested},
+        {"target": "issue", "nested": oversized},
     )
     authority = _runtime_authority(policies)
     store = RcaControlStore(tmp_path / "control.sqlite3")
@@ -3659,7 +3663,11 @@ def test_dispatcher_rejects_vm_shape_excess_before_capacity_reservation(tmp_path
             snapshot_bundle=bundle,
         )
     assert raised.value.code == "dispatcher_execution_request_envelope_invalid"
-    assert raised.value.detail == "rca_vm_request_json_shape_exceeded"
+    assert raised.value.detail == (
+        "rca_vm_request_json_shape_exceeded"
+        if shape_kind == "depth"
+        else "rca_vm_request_json_bytes_exceeded"
+    )
 
 
 def test_dispatcher_missing_w3_snapshot_stops_before_external_boundaries(tmp_path):
