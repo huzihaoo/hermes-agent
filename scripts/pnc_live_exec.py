@@ -15,6 +15,8 @@ from typing import Any
 
 
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+STABLE_TARGET_REGISTRY_RELATIVE = "gateway/assets/pnc_stable_target_registry_v1.json"
+STABLE_TARGET_REGISTRY_SCHEMA_VERSION = "pnc_stable_target_registry_v1"
 SERVICE_TARGETS = {
     "ai.hermes.gateway": (
         "runtime_script",
@@ -81,8 +83,8 @@ SERVICE_TARGETS = {
         "hermes_provider_failure_audit.py",
     ),
     "local.pnc.release-freshness-gate": (
-        "governance_tool",
-        "pnc_rca_release_freshness_gate.py",
+        "runtime_script",
+        "scripts/pnc_rca_release_freshness_gate.py",
     ),
     "local.pnc.safe-worktree-remove": (
         "governance_tool",
@@ -101,8 +103,8 @@ SERVICE_TARGETS = {
         "scripts/hermes_live_promote.py",
     ),
     "local.pnc.hermes-cli": (
-        "runtime_executable",
-        "bin/hermes",
+        "runtime_script",
+        "hermes_cli/main.py",
     ),
 }
 
@@ -223,6 +225,11 @@ def _require_direct_child(path: Path, parent: Path, *, code: str) -> None:
 
 
 def _git_identity(runtime_root: Path) -> tuple[str, str]:
+    environment = {
+        "HOME": str(Path.home()),
+        "PATH": "/usr/bin:/bin",
+        "GIT_CONFIG_NOSYSTEM": "1",
+    }
     try:
         result = subprocess.run(
             [
@@ -237,18 +244,79 @@ def _git_identity(runtime_root: Path) -> tuple[str, str]:
             capture_output=True,
             text=True,
             timeout=10,
-            env={
-                "HOME": str(Path.home()),
-                "PATH": "/usr/bin:/bin",
-                "GIT_CONFIG_NOSYSTEM": "1",
-            },
+            env=environment,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise LiveExecError("active_runtime_git_identity_unavailable") from exc
     lines = result.stdout.splitlines()
     if len(lines) != 2:
         raise LiveExecError("active_runtime_git_identity_invalid")
+    try:
+        status = subprocess.run(
+            [
+                "/usr/bin/git",
+                "-C",
+                str(runtime_root),
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            env=environment,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise LiveExecError("active_runtime_git_identity_unavailable") from exc
+    if status.stdout:
+        raise LiveExecError("active_runtime_worktree_dirty")
     return lines[0].strip(), lines[1].strip()
+
+
+def _stable_target_registry(runtime_root: Path) -> dict[str, dict[str, Any]]:
+    path = runtime_root / STABLE_TARGET_REGISTRY_RELATIVE
+    try:
+        raw = _read_owner_file(path, max_bytes=1024 * 1024)
+    except LiveExecError as exc:
+        raise LiveExecError("active_runtime_stable_target_registry_invalid") from exc
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise LiveExecError("active_runtime_stable_target_registry_invalid") from exc
+    entries = payload.get("targets") if isinstance(payload, dict) else None
+    expected_labels = {
+        label
+        for label, (target_kind, _relative) in SERVICE_TARGETS.items()
+        if target_kind in {"governance_tool", "runtime_file"}
+    }
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version")
+        != STABLE_TARGET_REGISTRY_SCHEMA_VERSION
+        or not isinstance(entries, dict)
+        or set(entries) != expected_labels
+    ):
+        raise LiveExecError("active_runtime_stable_target_registry_invalid")
+    normalized: dict[str, dict[str, Any]] = {}
+    for label in sorted(expected_labels):
+        item = entries.get(label)
+        relative_target = SERVICE_TARGETS[label][1]
+        expected_sha = str(item.get("sha256") or "") if isinstance(item, dict) else ""
+        expected_size = item.get("size") if isinstance(item, dict) else None
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"target_kind", "relative_path", "sha256", "size"}
+            or item.get("target_kind") != SERVICE_TARGETS[label][0]
+            or item.get("relative_path") != relative_target
+            or len(expected_sha) != 64
+            or any(char not in "0123456789abcdef" for char in expected_sha)
+            or type(expected_size) is not int
+            or expected_size <= 0
+        ):
+            raise LiveExecError("active_runtime_stable_target_registry_invalid")
+        normalized[label] = dict(item)
+    return normalized
 
 
 def _resolve_once(
@@ -332,6 +400,13 @@ def _resolve_once(
         target_raw = _read_owner_file(target, max_bytes=64 * 1024 * 1024)
     except LiveExecError as exc:
         raise LiveExecError("active_runtime_script_invalid") from exc
+    if target_kind in {"governance_tool", "runtime_file"}:
+        registered = _stable_target_registry(runtime_root)[service_label]
+        if (
+            len(target_raw) != registered["size"]
+            or hashlib.sha256(target_raw).hexdigest() != registered["sha256"]
+        ):
+            raise LiveExecError("active_runtime_stable_target_mismatch")
     return raw, {
         "service_label": service_label,
         "target_kind": target_kind,
@@ -424,9 +499,6 @@ def main(argv: list[str] | None = None) -> int:
         os.chdir(resolved["runtime_root"])
         runtime_python = resolved["runtime_python"]
         environment = _exec_environment(resolved, hermes_home)
-        if resolved["target_kind"] == "runtime_executable":
-            executable = resolved["script"]
-            os.execve(executable, [executable, *args.service_args], environment)
         os.execve(
             runtime_python,
             [runtime_python, resolved["script"], *args.service_args],

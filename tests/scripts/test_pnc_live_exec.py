@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import plistlib
@@ -10,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from scripts import hermes_live_drift_guard as drift_guard
+from scripts import pnc_live_exec as live_exec
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -45,6 +47,34 @@ print(json.dumps({
     gateway.write_text("print('gateway fixture')\n", encoding="utf-8")
     drift_guard = root / "scripts" / "hermes_live_drift_guard.py"
     drift_guard.write_text("print('drift guard fixture')\n", encoding="utf-8")
+    governance_root = home / "runtime" / "governance-tools"
+    governance_root.mkdir(parents=True, exist_ok=True)
+    tools = {}
+    for label, (target_kind, relative_path) in live_exec.SERVICE_TARGETS.items():
+        if target_kind not in {"governance_tool", "runtime_file"}:
+            continue
+        raw = f"print({label!r})\n".encode()
+        stable_root = (
+            governance_root if target_kind == "governance_tool" else home / "runtime"
+        )
+        (stable_root / relative_path).write_bytes(raw)
+        tools[label] = {
+            "target_kind": target_kind,
+            "relative_path": relative_path,
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "size": len(raw),
+        }
+    registry = root / live_exec.STABLE_TARGET_REGISTRY_RELATIVE
+    registry.parent.mkdir(parents=True)
+    registry.write_text(
+        json.dumps(
+            {
+                "schema_version": live_exec.STABLE_TARGET_REGISTRY_SCHEMA_VERSION,
+                "targets": tools,
+            }
+        ),
+        encoding="utf-8",
+    )
     subprocess.run(["/usr/bin/git", "init", "-q", str(root)], check=True)
     _git(root, "config", "user.name", "PNC launcher test")
     _git(root, "config", "user.email", "pnc-launcher-test@example.invalid")
@@ -54,6 +84,7 @@ print(json.dumps({
         "scripts/pnc_vm_task_sync.py",
         "scripts/hermes_live_drift_guard.py",
         "hermes_cli/main.py",
+        live_exec.STABLE_TARGET_REGISTRY_RELATIVE,
     )
     _git(root, "commit", "-q", "-m", f"fixture {name}")
     commit = _git(root, "rev-parse", "HEAD")
@@ -159,16 +190,11 @@ def test_stale_runtime_commit_fails_closed_with_nonzero_exit(tmp_path: Path):
     }
 
 
-def test_stable_governance_and_native_cli_targets_are_manifest_bound(tmp_path: Path):
+def test_stable_governance_and_cli_source_are_manifest_bound(tmp_path: Path):
     home = tmp_path / "hermes"
     root, venv, commit, tree = _create_runtime(home, "active")
     _write_manifest(home, root, venv, commit, tree)
     governance = home / "runtime" / "governance-tools" / "hermes_governance_check.py"
-    governance.parent.mkdir(parents=True)
-    governance.write_text("print('ok')\n", encoding="utf-8")
-    native = venv / "bin" / "hermes"
-    native.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    native.chmod(0o755)
 
     governance_result = _run(home, "--check", "local.pnc.governance-check")
     assert governance_result.returncode == 0, governance_result.stderr
@@ -176,11 +202,19 @@ def test_stable_governance_and_native_cli_targets_are_manifest_bound(tmp_path: P
     assert governance_evidence["target_kind"] == "governance_tool"
     assert governance_evidence["script"] == str(governance)
 
+    dashboard_result = _run(home, "--check", "local.pnc.task-dashboard.viewer")
+    assert dashboard_result.returncode == 0, dashboard_result.stderr
+    dashboard_evidence = json.loads(dashboard_result.stdout)
+    assert dashboard_evidence["target_kind"] == "runtime_file"
+    assert dashboard_evidence["script"] == str(
+        home / "runtime" / "restricted_task_dashboard_proxy.py"
+    )
+
     cli_result = _run(home, "--check", "local.pnc.hermes-cli")
     assert cli_result.returncode == 0, cli_result.stderr
     cli_evidence = json.loads(cli_result.stdout)
-    assert cli_evidence["target_kind"] == "runtime_executable"
-    assert cli_evidence["script"] == str(native)
+    assert cli_evidence["target_kind"] == "runtime_script"
+    assert cli_evidence["script"] == str(root / "hermes_cli/main.py")
 
     gateway_result = _run(home, "--check", "ai.hermes.gateway")
     assert gateway_result.returncode == 0, gateway_result.stderr
@@ -195,6 +229,40 @@ def test_stable_governance_and_native_cli_targets_are_manifest_bound(tmp_path: P
     assert drift_evidence["script"] == str(
         root / "scripts" / "hermes_live_drift_guard.py"
     )
+
+
+def test_stable_target_hash_drift_fails_closed(tmp_path: Path):
+    home = tmp_path / "hermes"
+    root, venv, commit, tree = _create_runtime(home, "active")
+    _write_manifest(home, root, venv, commit, tree)
+    governance = home / "runtime" / "governance-tools" / "hermes_governance_check.py"
+    governance.write_text("print('drifted')\n", encoding="utf-8")
+
+    result = _run(home, "--check", "local.pnc.governance-check")
+
+    assert result.returncode != 0
+    assert json.loads(result.stderr) == {
+        "error": "active_runtime_stable_target_mismatch",
+        "ok": False,
+    }
+
+
+def test_dirty_active_release_fails_closed(tmp_path: Path):
+    home = tmp_path / "hermes"
+    root, venv, commit, tree = _create_runtime(home, "active")
+    _write_manifest(home, root, venv, commit, tree)
+    (root / "scripts" / "pnc_vm_task_sync.py").write_text(
+        "print('dirty')\n",
+        encoding="utf-8",
+    )
+
+    result = _run(home, "--check", SERVICE_LABEL)
+
+    assert result.returncode != 0
+    assert json.loads(result.stderr) == {
+        "error": "active_runtime_worktree_dirty",
+        "ok": False,
+    }
 
 
 def _dynamic_plist(home: Path) -> dict[str, object]:

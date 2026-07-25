@@ -106,6 +106,14 @@ def test_source_registry_has_no_pinned_plist_or_wrapper():
     for name in wrapper_names:
         text = (REPO_ROOT / "scripts" / "wrappers" / name).read_text(encoding="utf-8")
         assert not any(marker in text for marker in gate.FORBIDDEN_RUNTIME_MARKERS)
+    assert gate.SERVICE_TARGETS["local.pnc.hermes-cli"] == (
+        "runtime_script",
+        "hermes_cli/main.py",
+    )
+    assert gate.SERVICE_TARGETS["local.pnc.release-freshness-gate"] == (
+        "runtime_script",
+        "scripts/pnc_rca_release_freshness_gate.py",
+    )
 
 
 def test_loaded_gate_rejects_a_stale_launchd_snapshot(tmp_path: Path):
@@ -227,6 +235,38 @@ def test_release_golden_registry_must_be_green_and_pipeline_bound(tmp_path: Path
     assert {item["code"] for item in errors} == {
         "pnc_release_golden_pipeline_binding_mismatch"
     }
+
+
+def test_stable_target_audit_resolves_every_hash_bound_target(tmp_path: Path):
+    expected = {
+        label
+        for label, (kind, _relative) in gate.SERVICE_TARGETS.items()
+        if kind in {"governance_tool", "runtime_file"}
+    }
+    failed = sorted(expected)[0]
+
+    def resolver(*, manifest_path, hermes_home, service_label):
+        assert manifest_path == hermes_home / "runtime" / "LIVE_MANIFEST.json"
+        if service_label == failed:
+            raise gate.LiveExecError("active_runtime_stable_target_mismatch")
+        return {
+            "script": f"/stable/{service_label}.py",
+            "script_sha256": "a" * 64,
+            "runtime_commit": "b" * 40,
+        }
+
+    evidence, errors = gate.audit_stable_targets(
+        hermes_home=tmp_path,
+        runtime_resolver=resolver,
+    )
+
+    assert {item["label"] for item in evidence} == expected
+    assert errors == [
+        {
+            "code": "active_runtime_stable_target_mismatch",
+            "label": failed,
+        }
+    ]
 
 
 def test_release_preflight_rejects_only_unresolved_incompatible_effects(

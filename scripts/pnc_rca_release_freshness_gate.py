@@ -24,6 +24,7 @@ if str(REPO_ROOT) not in sys.path:
 from scripts.pnc_live_exec import (
     PNC_PYTHON_LAUNCHD_LABELS,
     PNC_RESIDENT_LABELS,
+    SERVICE_TARGETS,
     LiveExecError,
     resolve_active_runtime,
 )
@@ -435,6 +436,42 @@ def audit_versioned_stable_entrypoints(
     return evidence, errors
 
 
+def audit_stable_targets(
+    *,
+    hermes_home: Path,
+    runtime_resolver: Callable[..., dict[str, str]] = resolve_active_runtime,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    manifest_path = hermes_home / "runtime" / "LIVE_MANIFEST.json"
+    labels = sorted(
+        label
+        for label, (target_kind, _relative) in SERVICE_TARGETS.items()
+        if target_kind in {"governance_tool", "runtime_file"}
+    )
+    evidence: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for label in labels:
+        try:
+            resolved = runtime_resolver(
+                manifest_path=manifest_path,
+                hermes_home=hermes_home,
+                service_label=label,
+            )
+        except LiveExecError as exc:
+            evidence.append({"label": label, "errors": [exc.code]})
+            errors.append(_error(exc.code, label=label))
+            continue
+        evidence.append(
+            {
+                "label": label,
+                "script": resolved["script"],
+                "script_sha256": resolved["script_sha256"],
+                "runtime_commit": resolved["runtime_commit"],
+                "errors": [],
+            }
+        )
+    return evidence, errors
+
+
 def audit_release_golden_registry(
     *, hermes_home: Path, registry: Mapping[str, Any] | None = None
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -578,6 +615,9 @@ def run_gate(*, home: Path, hermes_home: Path) -> dict[str, Any]:
     golden_registry, golden_errors = audit_release_golden_registry(
         hermes_home=hermes_home
     )
+    stable_targets, stable_target_errors = audit_stable_targets(
+        hermes_home=hermes_home
+    )
     effect_schema_preflight, effect_schema_errors = (
         audit_unresolved_effect_schema_compatibility(hermes_home=hermes_home)
     )
@@ -589,6 +629,7 @@ def run_gate(*, home: Path, hermes_home: Path) -> dict[str, Any]:
         *wrapper_errors,
         *stable_entrypoint_errors,
         *golden_errors,
+        *stable_target_errors,
         *effect_schema_errors,
     ]
     return {
@@ -604,6 +645,7 @@ def run_gate(*, home: Path, hermes_home: Path) -> dict[str, Any]:
         "wrappers": wrappers,
         "stable_entrypoints": stable_entrypoints,
         "golden_registry": golden_registry,
+        "stable_targets": stable_targets,
         "effect_schema_preflight": effect_schema_preflight,
         "errors": errors,
     }

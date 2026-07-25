@@ -1,0 +1,47 @@
+{
+  "schema_version": "pnc_stable_target_registry_v1",
+  "targets": {
+    "local.pnc.feishu-ops-alert": {
+      "target_kind": "governance_tool",
+      "relative_path": "feishu_ops_alert.py",
+      "sha256": "07eeaad73f2173b00edabb4d35caf10f75aed7bfc7b9c2b51c49a8b6d0393f34",
+      "size": 1477
+    },
+    "local.pnc.governance-check": {
+      "target_kind": "governance_tool",
+      "relative_path": "hermes_governance_check.py",
+      "sha256": "36f8a4d369e6a453e65ac6d9dc0d85273a20cc4263ac9e537789d7a6ea82f388",
+      "size": 7540
+    },
+    "local.pnc.provider-failure-audit": {
+      "target_kind": "governance_tool",
+      "relative_path": "hermes_provider_failure_audit.py",
+      "sha256": "bbdbd57055f225bfac8a1015b379a6b9c147c03b7dbc02513148b4fa57b56331",
+      "size": 12113
+    },
+    "local.pnc.release-fingerprint-check": {
+      "target_kind": "governance_tool",
+      "relative_path": "hermes_release_fingerprint_check.py",
+      "sha256": "45730a9f5ea00508bd6302c315a9374eb4211b1323ab4dd398a6f5115407f0de",
+      "size": 52259
+    },
+    "local.pnc.safe-worktree-remove": {
+      "target_kind": "governance_tool",
+      "relative_path": "hermes_safe_worktree_remove.py",
+      "sha256": "d4a49ac02f072cb85b974203437614a7548ddc09252b5b37728db7445f38a051",
+      "size": 9427
+    },
+    "local.pnc.task-dashboard.viewer": {
+      "target_kind": "runtime_file",
+      "relative_path": "restricted_task_dashboard_proxy.py",
+      "sha256": "9b08e9906e2f77a93fe0a29f6015ce143bd27ed026319553b5cc53a82ef69c9f",
+      "size": 13889
+    },
+    "local.pnc.worktree-hygiene": {
+      "target_kind": "governance_tool",
+      "relative_path": "hermes_worktree_hygiene.py",
+      "sha256": "9351da1eac66a908ea1f7967def4d9766441187305494c62da7a874d662eee66",
+      "size": 4425
+    }
+  }
+}
