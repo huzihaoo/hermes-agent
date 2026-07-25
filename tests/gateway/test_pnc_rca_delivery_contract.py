@@ -390,6 +390,23 @@ def test_public_projection_rejects_stale_pipeline_next_action():
     assert "待受控远程读取" not in rendered
 
 
+def test_public_projection_humanizes_legacy_success_wrapped_terminal_result():
+    contract = {
+        "summary": {
+            "short_conclusion": (
+                "自动RCA未归因：当前问题域不在已验证的自动分析域内，已生成诊断报告并转人工分流。"
+            )
+        },
+        "report": {"status": "report_ready"},
+    }
+
+    rendered = render_public_rca_result(contract)
+
+    assert "当前问题域暂不在自动 RCA 覆盖范围内" in rendered
+    assert "自动RCA未归因" not in rendered
+    assert "已生成诊断报告" not in rendered
+
+
 def test_delivery_rejects_false_applied_consumer_capability():
     admission, contract, manifest, observed, dependencies = _bundle()
     capability = _consumer_capability()

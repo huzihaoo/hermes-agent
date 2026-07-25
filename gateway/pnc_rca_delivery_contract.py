@@ -1244,7 +1244,16 @@ def build_public_rca_result(contract: Mapping[str, Any]) -> dict[str, Any]:
     short, derived_boundary = _public_attribution_text(raw_short)
     no_attribution = bool(terminal_code) or any(
         marker in short
-        for marker in ("不能自动归因", "未形成归因", "未找到", "不存在，请核对", "暂不在自动")
+        for marker in (
+            "不能自动归因",
+            "未形成归因",
+            "未找到",
+            "不存在，请核对",
+            "暂不在自动",
+            "自动RCA未归因",
+            "当前问题域不在已验证",
+            "已生成诊断报告",
+        )
     )
     responsibility_candidate = _public_responsibility(
         report.get("candidate_owner_domain")
@@ -1344,6 +1353,15 @@ def build_public_rca_result(contract: Mapping[str, Any]) -> dict[str, Any]:
             impact = "缺少可核验的异常现象，无法选择并验证对应因果机制。"
             causal_boundary = "生产数据读取 → 问题现象不明确 → 无法选择归因机制 → 转人工补充。"
             default_action = "请补充发生了什么、预期行为及实际异常后重新发起 RCA。"
+        elif not terminal_code and any(
+            marker in short
+            for marker in ("自动RCA未归因", "当前问题域不在已验证", "已生成诊断报告")
+        ):
+            conclusion = "当前问题域暂不在自动 RCA 覆盖范围内，不能形成确认归因。"
+            impact = "现有证据不足以对该问题域形成自动归因，已转人工分流。"
+            causal_boundary = "业务域识别 → 证据范围核验 → 当前域未覆盖 → 转人工分流。"
+            default_action = "请人工分流；补充该问题域的证据后再纳入自动 RCA。"
+            specific = impact
         elif not terminal_code and short:
             conclusion = short
             impact = boundary or "问题现象、证据或因果链尚未达到可确认标准。"
