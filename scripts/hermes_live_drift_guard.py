@@ -251,11 +251,25 @@ def main() -> int:
             errors.append(f"runtime .venv drift: {venv_link.resolve()} != {Path(runtime_venv).resolve()}")
     if runtime_venv and "/worktrees/" in runtime_venv:
         errors.append(f"runtime venv must not live under worktrees: {runtime_venv}")
-    if runtime_python and launchd.get("program") and Path(launchd["program"]).resolve() != Path(runtime_python).resolve():
-        errors.append(f"launchd program drift: {launchd['program']}")
-    manifest_workdir = str(manifest.get("gateway_working_directory") or runtime_root)
-    if manifest_workdir and launchd.get("working_directory") and Path(launchd["working_directory"]).resolve() != Path(manifest_workdir).resolve():
-        errors.append(f"launchd working directory drift: {launchd['working_directory']}")
+    gateway_launcher = str(
+        Path.home()
+        / ".hermes"
+        / "runtime"
+        / "governance-tools"
+        / "pnc_live_exec.py"
+    )
+    gateway_raw = str(launchd.get("raw") or "")
+    if launchd.get("found") == "true":
+        if launchd.get("program") != "/usr/bin/python3":
+            errors.append(f"launchd program drift: {launchd['program']}")
+        if launchd.get("working_directory") != str(Path.home() / ".hermes/runtime"):
+            errors.append(
+                f"launchd working directory drift: {launchd['working_directory']}"
+            )
+        if gateway_launcher not in gateway_raw or "ai.hermes.gateway" not in gateway_raw:
+            errors.append("launchd gateway bypasses the active runtime launcher")
+        if any(marker in gateway_raw for marker in FORBIDDEN_PNC_RUNTIME_MARKERS):
+            errors.append("launchd gateway contains a pinned runtime path")
     if not health.get("ok"):
         errors.append(f"health check failed: {health.get('raw')}")
     if dirty_count > 0:

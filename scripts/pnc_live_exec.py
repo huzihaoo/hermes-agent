@@ -16,6 +16,10 @@ from typing import Any
 
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 SERVICE_TARGETS = {
+    "ai.hermes.gateway": (
+        "runtime_script",
+        "hermes_cli/main.py",
+    ),
     "local.pnc.completion-notice-relay": (
         "runtime_script",
         "scripts/pnc_completion_notice_relay.py",
@@ -103,6 +107,7 @@ SERVICE_TARGETS = {
 }
 
 PNC_PYTHON_LAUNCHD_LABELS = (
+    "ai.hermes.gateway",
     "local.pnc.completion-notice-relay",
     "local.pnc.feishu-credential-health",
     "local.pnc.feishu-delivery-repair",
@@ -116,6 +121,7 @@ PNC_PYTHON_LAUNCHD_LABELS = (
 )
 
 PNC_RESIDENT_LABELS = (
+    "ai.hermes.gateway",
     "local.pnc.completion-notice-relay",
     "local.pnc.rca-delivery-collector",
     "local.pnc.rca-delivery-dispatcher",

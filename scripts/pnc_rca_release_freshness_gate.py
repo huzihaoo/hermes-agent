@@ -60,7 +60,13 @@ def audit_persisted_definitions(
     launch_agent_dir = home / "Library" / "LaunchAgents"
     discovered: dict[str, Path] = {}
     errors: list[dict[str, Any]] = []
-    for path in sorted(launch_agent_dir.glob("local.pnc.*.plist")):
+    paths = [
+        *sorted(launch_agent_dir.glob("local.pnc.*.plist")),
+        launch_agent_dir / "ai.hermes.gateway.plist",
+    ]
+    for path in paths:
+        if not path.exists():
+            continue
         try:
             payload = _read_plist(path)
         except ValueError as exc:

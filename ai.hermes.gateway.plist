@@ -17,13 +17,11 @@
         <key>HERMES_LAZY_INSTALL_TARGET</key>
         <string>/Users/songying/.hermes/runtime/lazy-packages/v0182-py311</string>
         <key>PATH</key>
-        <string>/Users/songying/.hermes/runtime/hermes-live/.venv/bin:/Users/songying/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>/Users/songying/.local/bin:/Users/songying/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>PYTHONNOUSERSITE</key>
         <string>1</string>
         <key>PYTHONDONTWRITEBYTECODE</key>
         <string>1</string>
-        <key>VIRTUAL_ENV</key>
-        <string>/Users/songying/.hermes/runtime/hermes-live/.venv</string>
     </dict>
     <key>ExitTimeOut</key>
     <integer>30</integer>
@@ -36,9 +34,9 @@
     <string>ai.hermes.gateway</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/songying/.hermes/runtime/hermes-live/.venv/bin/python</string>
-        <string>-m</string>
-        <string>hermes_cli.main</string>
+        <string>/usr/bin/python3</string>
+        <string>/Users/songying/.hermes/runtime/governance-tools/pnc_live_exec.py</string>
+        <string>ai.hermes.gateway</string>
         <string>gateway</string>
         <string>run</string>
         <string>--replace</string>
@@ -56,6 +54,6 @@
     <key>Umask</key>
     <integer>63</integer>
     <key>WorkingDirectory</key>
-    <string>/Users/songying/.hermes/runtime/hermes-live</string>
+    <string>/Users/songying/.hermes/runtime</string>
 </dict>
 </plist>

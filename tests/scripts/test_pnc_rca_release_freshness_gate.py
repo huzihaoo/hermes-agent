@@ -67,12 +67,26 @@ def test_persisted_gate_rejects_a_pinned_definition(tmp_path: Path):
 
 def test_source_registry_has_no_pinned_plist_or_wrapper():
     plist_labels = set()
-    for path in REPO_ROOT.glob("local.pnc.*.plist"):
+    plist_paths = [
+        *REPO_ROOT.glob("local.pnc.*.plist"),
+        REPO_ROOT / "ai.hermes.gateway.plist",
+    ]
+    for path in plist_paths:
         payload = plistlib.loads(path.read_bytes())
         plist_labels.add(payload["Label"])
         text = path.read_text(encoding="utf-8")
         assert not any(marker in text for marker in gate.FORBIDDEN_RUNTIME_MARKERS)
     assert plist_labels == set(gate.EXPECTED_LAUNCHD_LABELS)
+    gateway = plistlib.loads((REPO_ROOT / "ai.hermes.gateway.plist").read_bytes())
+    assert gateway["ProgramArguments"] == [
+        "/usr/bin/python3",
+        "/Users/songying/.hermes/runtime/governance-tools/pnc_live_exec.py",
+        "ai.hermes.gateway",
+        "gateway",
+        "run",
+        "--replace",
+    ]
+    assert "VIRTUAL_ENV" not in gateway["EnvironmentVariables"]
 
     wrapper_names = {
         "hermes-g1q3-e2e-smoke",
