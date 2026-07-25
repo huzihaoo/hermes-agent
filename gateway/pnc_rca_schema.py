@@ -22,6 +22,9 @@ RCA_INTAKE_STATE_SCHEMA_VERSION = "pnc_rca_intake_state_v1"
 RCA_EXECUTION_REQUEST_SCHEMA_VERSION = "g1q3_rca_execution_request_v2"
 RCA_EXECUTION_RESULT_SCHEMA_VERSION = "g1q3_rca_execution_result_v1"
 RCA_TOOLCHAIN_FINGERPRINT_SCHEMA_VERSION = "g1q3_rca_toolchain_v1"
+RCA_VM_MAX_EXECUTION_REQUEST_JSON_BYTES = 1024 * 1024
+RCA_VM_MAX_JSON_DEPTH = 32
+RCA_VM_MAX_JSON_NODES = 50_000
 
 SourceQuality = Literal["full", "partial", "fallback_raw_text", "unavailable"]
 RequestKind = Literal["issue_intake", "status_check"]
@@ -213,6 +216,34 @@ def _sanitize_mapping(value: Any) -> Any:
     return value
 
 
+def _sanitize_mapping_preserving_w3(value: Any) -> Any:
+    raw = asdict(value) if is_dataclass(value) else value
+    if not isinstance(raw, dict):
+        return _sanitize_mapping(raw)
+    raw_copy = dict(raw)
+    toolchain = raw_copy.get("toolchain")
+    if not isinstance(toolchain, dict) or "w3_execution_snapshot" not in toolchain:
+        return _sanitize_mapping(raw_copy)
+
+    toolchain_copy = dict(toolchain)
+    raw_w3_bundle = toolchain_copy.pop("w3_execution_snapshot")
+    raw_copy["toolchain"] = toolchain_copy
+    from gateway.pnc_rca_snapshot import validate_snapshot_execution_bundle
+
+    validated_w3_bundle = validate_snapshot_execution_bundle(raw_w3_bundle)
+    sanitized = _sanitize_mapping(raw_copy)
+    if not isinstance(sanitized, dict):  # pragma: no cover - raw_copy is a dict
+        return sanitized
+    sanitized_toolchain = sanitized.get("toolchain")
+    if not isinstance(sanitized_toolchain, dict):
+        sanitized_toolchain = {}
+        sanitized["toolchain"] = sanitized_toolchain
+    sanitized_toolchain["w3_execution_snapshot"] = deepcopy(
+        validated_w3_bundle.to_dict()
+    )
+    return sanitized
+
+
 def _redact_remote_source_value(value: Any, source_value: str) -> Any:
     """Remove the legacy address envelope from every VM-bound evidence field."""
     source = str(source_value or "").strip()
@@ -232,13 +263,43 @@ def _redact_remote_source_value(value: Any, source_value: str) -> Any:
 
 def to_dict(value: Any) -> dict[str, Any]:
     """Convert schema dataclasses to a deterministic, privacy-light dict."""
-    data = _sanitize_mapping(value)
+    data = _sanitize_mapping_preserving_w3(value)
     return data if isinstance(data, dict) else {}
 
 
 def to_json(value: Any) -> str:
     """Serialize schema dataclasses with stable ordering for receipts/tests."""
     return json.dumps(to_dict(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def validate_vm_execution_request_envelope(value: Any) -> dict[str, Any]:
+    """Mirror the fixed VM service JSON byte, depth, and node limits."""
+    payload = to_dict(value)
+    try:
+        canonical = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("rca_vm_request_json_invalid") from exc
+    if len(canonical) > RCA_VM_MAX_EXECUTION_REQUEST_JSON_BYTES:
+        raise ValueError("rca_vm_request_json_bytes_exceeded")
+
+    nodes = 0
+    stack = [(payload, 1)]
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        if nodes > RCA_VM_MAX_JSON_NODES or depth > RCA_VM_MAX_JSON_DEPTH:
+            raise ValueError("rca_vm_request_json_shape_exceeded")
+        if isinstance(current, dict):
+            stack.extend((item, depth + 1) for item in current.values())
+        elif isinstance(current, list):
+            stack.extend((item, depth + 1) for item in current)
+    return payload
 
 
 def issue_context_from_compact_text(

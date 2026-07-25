@@ -89,6 +89,7 @@ from gateway.pnc_rca_schema import (
     build_execution_request,
     issue_context_from_compact_text,
     validate_issue_context_fields,
+    validate_vm_execution_request_envelope,
 )
 from gateway.pnc_rca_snapshot import (
     AdmissionSnapshotExecutionBundle,
@@ -1930,6 +1931,13 @@ def build_dispatch_execution_request(
         source_refs=durable_source_refs,
     )
     _validate_remote_read_execution_request(request)
+    try:
+        validate_vm_execution_request_envelope(request)
+    except ValueError as exc:
+        raise DispatchCircuitError(
+            "dispatcher_execution_request_envelope_invalid",
+            str(exc),
+        ) from exc
     return request
 
 

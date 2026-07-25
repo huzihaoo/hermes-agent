@@ -168,6 +168,8 @@ _RCA_LEGACY_SERVICE_OPERATION = "g1q3_rca_issue_intake"
 _RCA_RESERVATION_MAX_OBSERVED_AGE_SECONDS = 120
 _RCA_RESERVATION_MIN_REMAINING_LEASE_SECONDS = 150
 _RCA_MAX_EXPECTED_ARTIFACT_CACHE_BYTES = 1_000_000_000_000
+_RCA_VM_MAX_GOAL_BYTES = 2 * 1024 * 1024
+_RCA_VM_MAX_ADMISSION_JSON_BYTES = 64 * 1024
 _RCA_ADMISSION_JSON_BEGIN = "<!-- G1Q3_RCA_ADMISSION_JSON:BEGIN -->"
 _RCA_ADMISSION_JSON_END = "<!-- G1Q3_RCA_ADMISSION_JSON:END -->"
 _RCA_EXECUTION_REQUEST_JSON_BEGIN = "<!-- G1Q3_RCA_EXECUTION_REQUEST_JSON:BEGIN -->"
@@ -718,6 +720,9 @@ def _rca_fixed_cli_goal(
     safe_task_id = str(task_id or "").strip()
     if not _TASK_ID_RE.fullmatch(safe_task_id):
         raise ValueError("RCA task id is not a safe shared-state path segment")
+    from gateway.pnc_rca_schema import validate_vm_execution_request_envelope
+
+    execution_request = validate_vm_execution_request_envelope(execution_request)
     admission_json = json.dumps(
         admission,
         ensure_ascii=False,
@@ -725,6 +730,8 @@ def _rca_fixed_cli_goal(
         separators=(",", ":"),
         allow_nan=False,
     )
+    if len(admission_json.encode("utf-8")) > _RCA_VM_MAX_ADMISSION_JSON_BYTES:
+        raise ValueError("RCA admission JSON exceeds the fixed VM envelope")
     request_json = json.dumps(
         execution_request,
         ensure_ascii=False,
@@ -741,7 +748,7 @@ def _rca_fixed_cli_goal(
     if any(marker in admission_json or marker in request_json for marker in markers):
         raise ValueError("RCA contract data contains a reserved goal marker")
     goal_path = f"{_RCA_VM_TASK_ROOT}/{safe_task_id}/goal.md"
-    return canonicalize_rca_goal_text("\n".join([
+    goal = canonicalize_rca_goal_text("\n".join([
         _RCA_SHARED_STATE_GOAL_PREFIX,
         "",
         "# Governed G1Q3 RCA service request",
@@ -769,6 +776,9 @@ def _rca_fixed_cli_goal(
             f"--goal-path {goal_path}"
         ),
     ]))
+    if len(goal.encode("utf-8")) > _RCA_VM_MAX_GOAL_BYTES:
+        raise ValueError("RCA goal exceeds the fixed VM envelope")
+    return goal
 
 
 def build_rca_fixed_cli_goal(
@@ -1450,9 +1460,11 @@ def vm_task_submit_service(
         from gateway.pnc_rca_schema import (
             RCA_EXECUTION_REQUEST_SCHEMA_VERSION,
             to_dict as rca_to_dict,
+            validate_vm_execution_request_envelope,
         )
 
         request_payload = rca_to_dict(execution_request)
+        request_payload = validate_vm_execution_request_envelope(request_payload)
     except Exception as exc:
         return _vm_task_service_denied_payload(
             "vm_task_service_request_invalid",

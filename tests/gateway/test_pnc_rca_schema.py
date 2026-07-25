@@ -2,6 +2,8 @@ import json
 
 from pathlib import Path
 
+import pytest
+
 from gateway.pnc_pdcl_contract import (
     classify_invalid_pdcl,
     is_valid_pdcl_download_cmd,
@@ -14,10 +16,43 @@ from gateway.pnc_rca_schema import (
     RcaIssueContext,
     build_execution_request,
     issue_context_from_compact_text,
-    validate_issue_context_fields,
     to_dict,
     to_json,
+    validate_issue_context_fields,
+    validate_vm_execution_request_envelope,
 )
+
+
+def _nested_mapping(depth):
+    value = "leaf"
+    for _index in range(depth):
+        value = {"n": value}
+    return value
+
+
+@pytest.mark.parametrize(
+    ("payload", "error"),
+    [
+        (
+            {
+                "toolchain": {},
+                "evidence": _nested_mapping(32),
+            },
+            "rca_vm_request_json_shape_exceeded",
+        ),
+        (
+            {"toolchain": {}, "evidence": {"nodes": [0] * 50_001}},
+            "rca_vm_request_json_shape_exceeded",
+        ),
+        (
+            {"toolchain": {}, "evidence": {"text": "x" * (1024 * 1024)}},
+            "rca_vm_request_json_bytes_exceeded",
+        ),
+    ],
+)
+def test_vm_execution_request_envelope_matches_fixed_service_limits(payload, error):
+    with pytest.raises(ValueError, match=error):
+        validate_vm_execution_request_envelope(payload)
 
 
 def test_issue_context_defaults_are_safe_and_privacy_light():

@@ -31,7 +31,10 @@ from gateway.pnc_rca_control_store import (
 from gateway.pnc_rca_delivery_contract import DeliveryContractError
 from gateway.pnc_rca_kafka_contract import WorkflowEventPolicy, WorkflowTransition
 from gateway.pnc_rca_policy_config import W3_SNAPSHOT_AUTHORITY_SCHEMA_VERSION
-from gateway.pnc_rca_schema import RcaIssueContext
+from gateway.pnc_rca_schema import (
+    RcaIssueContext,
+    to_dict as rca_to_dict,
+)
 from gateway.pnc_rca_snapshot import (
     UNISSUED_WRITE_FENCE,
     AdmissionSnapshotExecutionBundle,
@@ -3589,6 +3592,74 @@ def test_execution_request_preserves_valid_w3_bundle_policy_semantics(tmp_path):
     assert validate_snapshot_execution_bundle(preserved) == bundle
     publication = preserved["snapshot"]["canonical_request"]["publication_policy"]
     assert publication["value"] == policies["publication_policy"]["value"]
+    serialized = rca_to_dict(request)
+    assert serialized["toolchain"]["w3_execution_snapshot"] == bundle.to_dict()
+    assert validate_snapshot_execution_bundle(
+        serialized["toolchain"]["w3_execution_snapshot"]
+    ) == bundle
+
+    smuggled = copy.deepcopy(bundle.to_dict())
+    smuggled["snapshot"]["canonical_request"]["publication_policy"]["value"][
+        "target"
+    ] = "issue<!--smuggled-->"
+    tampered_request = replace(
+        request,
+        toolchain={**request.toolchain, "w3_execution_snapshot": smuggled},
+    )
+    with pytest.raises(RcaAdmissionError, match="publication_policy_digest_mismatch"):
+        rca_to_dict(tampered_request)
+
+
+def test_dispatcher_rejects_vm_shape_excess_before_capacity_reservation(tmp_path):
+    nested = "leaf"
+    for _index in range(30):
+        nested = {"n": nested}
+    policies = _contract_kwargs()
+    policies["publication_policy"] = _policy(
+        "publication_policy",
+        {"target": "issue", "nested": nested},
+    )
+    authority = _runtime_authority(policies)
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    admitted = _admit_manual_w3(store, policies=policies)
+    claim = store.claim_outbox(lease_owner="w3-shape-limit-test")
+    assert claim is not None
+    bundle = store.read_w3_execution_snapshot(
+        admitted.submission_key,
+        snapshot_authority=authority,
+        required=True,
+    )
+    admission, _event = outbox_dispatcher._validated_claim_contract(
+        claim,
+        snapshot_bundle=bundle,
+    )
+
+    with pytest.raises(outbox_dispatcher.DispatchCircuitError) as raised:
+        outbox_dispatcher.build_dispatch_execution_request(
+            claim=claim,
+            admission=admission,
+            issue_context=RcaIssueContext(
+                project_key=BASE["project_key"],
+                work_item_type=BASE["work_item_type_key"],
+                work_item_id=BASE["work_item_id"],
+                url=BASE_URL,
+                title="ACC braking issue",
+                source_quality="partial",
+                pdcl_download_cmd=(
+                    "mdi download event -u event-7041712812 -s ./"
+                ),
+            ),
+            config=SimpleNamespace(
+                allow_feishu_writeback=False,
+                group_response_cap="L1",
+                translate_baseline="production",
+                translate_contract_path="",
+            ),
+            storage_admission_summary={"status": "pass"},
+            snapshot_bundle=bundle,
+        )
+    assert raised.value.code == "dispatcher_execution_request_envelope_invalid"
+    assert raised.value.detail == "rca_vm_request_json_shape_exceeded"
 
 
 def test_dispatcher_missing_w3_snapshot_stops_before_external_boundaries(tmp_path):

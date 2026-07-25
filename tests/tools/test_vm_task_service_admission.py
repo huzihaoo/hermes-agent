@@ -1222,7 +1222,7 @@ def test_snapshot_required_service_rejects_malformed_bundle_before_create(
 
     assert result["success"] is False
     assert result["error_code"] == "vm_task_service_request_invalid"
-    assert "invalid W3 execution snapshot" in result["error"]
+    assert "w3_execution_bundle_exact_fields_invalid" in result["error"]
 
 
 @pytest.mark.parametrize(
@@ -1321,6 +1321,7 @@ def test_snapshot_service_rejects_policy_projection_drift_before_create(
             source_id=ORIGIN_SOURCE_ID,
             source_envelope_sha256="5" * 64,
         ),
+        to_dict=lambda: {"fixture": "validated-bundle"},
     )
     monkeypatch.setattr(
         snapshot_module,
@@ -1361,6 +1362,34 @@ def test_snapshot_service_rejects_policy_projection_drift_before_create(
     assert result["success"] is False
     assert result["error_code"] == "vm_task_service_request_identity_mismatch"
     assert "policy projection" in result["error"]
+
+
+def test_service_rejects_vm_json_shape_before_status_or_create(monkeypatch, tmp_path):
+    _configure_service_policy(monkeypatch, tmp_path)
+    admission, request = _contracts()
+    nested = "leaf"
+    for _index in range(32):
+        nested = {"n": nested}
+    request = replace(request, evidence={"nested": nested})
+
+    def forbidden_side_effect(*_args, **_kwargs):
+        pytest.fail("VM JSON shape drift reached a task side effect")
+
+    monkeypatch.setattr(vm_task_tool, "vm_task_status", forbidden_side_effect)
+    monkeypatch.setattr(vm_task_tool, "_vm_task_submit_trusted", forbidden_side_effect)
+    monkeypatch.setattr(vm_task_tool, "issue_rca_prod_admission", forbidden_side_effect)
+
+    result = _submit_service(
+        service_id=SERVICE_ID,
+        capability=CAPABILITY,
+        operation=OPERATION,
+        admission=admission,
+        execution_request=request,
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == "vm_task_service_request_invalid"
+    assert "rca_vm_request_json_shape_exceeded" in result["error"]
 
 
 def test_canonical_rca_contract_hash_binds_w3_execution_snapshot_bytes():
