@@ -216,7 +216,9 @@ def _bundle(
         "work_item_id": admission.source_refs.work_item_id,
         "business_state": "report_completed",
         "report": report,
-        "summary": {"short_conclusion": "候选因果判断：减速度请求偏重。"},
+        "summary": {
+            "short_conclusion": "自动RCA未归因：现有证据未形成可确认的因果链。"
+        },
         "artifacts": {
             "delivery_manifest_vm": root + "delivery_manifest.json",
             "artifact_set_id": manifest["artifact_set_id"],
@@ -648,31 +650,24 @@ def test_delivery_blocks_banned_public_phrase():
     assert "banned_public_phrase" in raised.value.detail
 
 
-def test_delivery_low_tier_has_no_blame_or_user_action():
+def test_delivery_rejects_low_tier_blame_or_user_action_in_sealed_contract():
     admission, contract, manifest, observed, dependencies = _bundle()
     contract["summary"]["short_conclusion"] = (
         "问题单缺少问题数据地址，不能自动归因，请补齐后重新发起。"
     )
 
-    delivery = verify_delivery_bundle(
-        admission=admission,
-        delivery_contract=contract,
-        delivery_manifest=manifest,
-        observed_files=observed,
-        html_dependencies=dependencies,
-    )
+    with pytest.raises(DeliveryContractError) as raised:
+        verify_delivery_bundle(
+            admission=admission,
+            delivery_contract=contract,
+            delivery_manifest=manifest,
+            observed_files=observed,
+            html_dependencies=dependencies,
+        )
 
-    publication = (
-        delivery.effect_payload["field_updates"][0]["field_value"]
-        + "\n"
-        + delivery.effect_payload["comment_content"]
-    )
-    assert "问题单缺少" not in publication
-    assert "请补齐" not in publication
-    assert "重新发起" not in publication
-    assert "责任模块：暂无法判断" in publication
-    assert delivery.effect_payload["terminal_class"] == "honest_non_attribution"
-    assert delivery.effect_payload["requires_human_review"] is False
+    assert raised.value.code == "classification_conflict"
+    assert "honest_non_attribution_user_action" in raised.value.detail
+    assert "honest_non_attribution_blame_wording" in raised.value.detail
 
 
 def test_mdrive4_readiness_terminal_is_explicit_and_business_neutral():

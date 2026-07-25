@@ -725,19 +725,21 @@ def evaluate_structural_tier(
 
     if not decision and _APPROVAL_READY_RE.search(rendered):
         violations.append("approval_ready_without_human_decision")
+    if terminal_class == HONEST_NON_ATTRIBUTION:
+        if responsibility:
+            violations.append("honest_non_attribution_responsibility_present")
+        if any(marker in classification_text for marker in _CANDIDATE_MARKERS):
+            violations.append("honest_non_attribution_candidate_wording")
+        if _LOW_TIER_USER_ACTION_RE.search(classification_text):
+            violations.append("honest_non_attribution_user_action")
+        if _LOW_TIER_BLAME_RE.search(classification_text):
+            violations.append("honest_non_attribution_blame_wording")
     if rendered:
         if (
             terminal_class == CANDIDATE_HYPOTHESIS
             and MEDIUM_TIER_DISCLAIMER not in rendered
         ):
             violations.append("candidate_disclaimer_missing")
-        if terminal_class == HONEST_NON_ATTRIBUTION:
-            if any(marker in rendered for marker in _CANDIDATE_MARKERS):
-                violations.append("honest_non_attribution_candidate_wording")
-            if _LOW_TIER_USER_ACTION_RE.search(rendered):
-                violations.append("honest_non_attribution_user_action")
-            if _LOW_TIER_BLAME_RE.search(rendered):
-                violations.append("honest_non_attribution_blame_wording")
         if terminal_class == SUPPORTED_ATTRIBUTION and any(
             marker.lower() in rendered.lower() for marker in _NON_ATTRIBUTION_MARKERS
         ):

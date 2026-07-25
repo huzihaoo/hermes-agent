@@ -464,6 +464,8 @@ def test_empty_human_decision_rejects_approval_ready_text(publication_text):
 
 def test_low_tier_rejects_user_action_and_blame_wording():
     contract = _contract(evaluator_status="refuted", refs=False)
+    contract["public_result"]["candidate"] = ""
+    contract["public_result"]["responsibility"] = {"status": "unsupported"}
     result = evaluate_structural_tier(
         contract,
         publication_text=(
@@ -475,6 +477,20 @@ def test_low_tier_rejects_user_action_and_blame_wording():
     assert result.terminal_class == HONEST_NON_ATTRIBUTION
     assert "honest_non_attribution_user_action" in result.violations
     assert "honest_non_attribution_blame_wording" in result.violations
+
+
+def test_low_tier_rejects_named_responsibility_in_sealed_public_contract():
+    contract = _contract(
+        evaluator_status="refuted",
+        refs=False,
+        conclusion="自动RCA未归因：现有证据不能确认归因。",
+    )
+
+    result = evaluate_structural_tier(contract)
+
+    assert result.terminal_class == HONEST_NON_ATTRIBUTION
+    assert "honest_non_attribution_responsibility_present" in result.violations
+    assert result.publication_allowed is False
 
 
 def test_banned_phrase_is_rejected_even_when_renderer_would_hide_it():
