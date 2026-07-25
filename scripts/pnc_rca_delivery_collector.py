@@ -116,6 +116,8 @@ _EVENTUAL_ARTIFACT_CODES = frozenset({
 _RETRYABLE_INFRASTRUCTURE_ARTIFACT_CODES = frozenset({
     "html_css_parser_dependency_missing",
     "html_css_parser_version_mismatch",
+    "viz_publication_missing",
+    "viz_publication_path_invalid",
 })
 _RUNNING_STATES = frozenset({
     "pending",
@@ -1112,74 +1114,77 @@ def _remote_bundle_script(submission_key: str) -> str:
             if not isinstance(contract_artifacts, dict):
                 raise RuntimeError('viz_publication_missing')
             viz_publication = contract_artifacts.get('viz_publication')
+            if viz_publication is None:
+                viz_publication = {{}}
             if not isinstance(viz_publication, dict):
                 raise RuntimeError('viz_publication_missing')
-            viz_path = str(viz_publication.get('path') or '')
-            viz_manifest_path = str(viz_publication.get('manifest_path') or '')
-            submission_key = str(viz_publication.get('submission_key') or '')
-            expected_viz_path = posixpath.join(
-                FORMAL_VIZ_ROOT, submission_key + '.viz.mcap'
-            )
-            expected_viz_manifest_path = posixpath.join(
-                FORMAL_VIZ_ROOT, submission_key + '.viz.manifest.json',
-            )
-            if (
-                not submission_key
-                or viz_path != expected_viz_path
-                or viz_manifest_path != expected_viz_manifest_path
-                or posixpath.commonpath((FORMAL_VIZ_ROOT, viz_path)) != FORMAL_VIZ_ROOT
-            ):
-                raise RuntimeError('viz_publication_path_invalid')
-            viz_fd, viz_info = open_regular(
-                viz_path, 'viz_publication_missing', MAX_VIZ_BYTES, FORMAL_VIZ_ROOT
-            )
-            os.close(viz_fd)
-            viz_manifest_fd, viz_manifest_info = open_regular(
-                viz_manifest_path,
-                'viz_publication_manifest_missing',
-                MAX_JSON_BYTES,
-                FORMAL_VIZ_ROOT,
-            )
-            with os.fdopen(viz_manifest_fd, 'rb') as handle:
-                viz_manifest_raw = handle.read(MAX_JSON_BYTES + 1)
-            try:
-                viz_manifest = json.loads(viz_manifest_raw.decode('utf-8'))
-            except Exception:
-                raise RuntimeError('viz_publication_manifest_json_invalid')
-            if not isinstance(viz_manifest, dict) or any(
-                viz_manifest.get(key) != viz_publication.get(key)
-                for key in (
-                    'schema_version', 'status', 'submission_key', 'path',
-                    'size', 'sha256', 'source_path', 'source_sha256',
-                    'published_at',
-                )
-            ):
-                raise RuntimeError('viz_publication_manifest_mismatch')
-            if viz_info.st_size != viz_publication.get('size'):
-                raise RuntimeError('viz_publication_size_mismatch')
             rows = manifest.get('artifacts')
             if not isinstance(rows, list) or not rows or len(rows) > MAX_ARTIFACTS:
                 raise RuntimeError('delivery_manifest_artifacts_invalid')
             observed = []
-            observed.extend([
-                {{
-                    'path': viz_path,
-                    'size': viz_info.st_size,
-                    'sha256': str(viz_publication.get('sha256') or ''),
-                    'is_file': True,
-                    'is_symlink': False,
-                    'parents_symlink_free': True,
-                    'sha256_attested_by_manifest': True,
-                }},
-                {{
-                    'path': viz_manifest_path,
-                    'size': viz_manifest_info.st_size,
-                    'sha256': hashlib.sha256(viz_manifest_raw).hexdigest(),
-                    'is_file': True,
-                    'is_symlink': False,
-                    'parents_symlink_free': True,
-                }},
-            ])
+            if viz_publication:
+                viz_path = str(viz_publication.get('path') or '')
+                viz_manifest_path = str(viz_publication.get('manifest_path') or '')
+                submission_key = str(viz_publication.get('submission_key') or '')
+                expected_viz_path = posixpath.join(
+                    FORMAL_VIZ_ROOT, submission_key + '.viz.mcap'
+                )
+                expected_viz_manifest_path = posixpath.join(
+                    FORMAL_VIZ_ROOT, submission_key + '.viz.manifest.json',
+                )
+                if (
+                    not submission_key
+                    or viz_path != expected_viz_path
+                    or viz_manifest_path != expected_viz_manifest_path
+                    or posixpath.commonpath((FORMAL_VIZ_ROOT, viz_path)) != FORMAL_VIZ_ROOT
+                ):
+                    raise RuntimeError('viz_publication_path_invalid')
+                viz_fd, viz_info = open_regular(
+                    viz_path, 'viz_publication_missing', MAX_VIZ_BYTES, FORMAL_VIZ_ROOT
+                )
+                os.close(viz_fd)
+                viz_manifest_fd, viz_manifest_info = open_regular(
+                    viz_manifest_path,
+                    'viz_publication_manifest_missing',
+                    MAX_JSON_BYTES,
+                    FORMAL_VIZ_ROOT,
+                )
+                with os.fdopen(viz_manifest_fd, 'rb') as handle:
+                    viz_manifest_raw = handle.read(MAX_JSON_BYTES + 1)
+                try:
+                    viz_manifest = json.loads(viz_manifest_raw.decode('utf-8'))
+                except Exception:
+                    raise RuntimeError('viz_publication_manifest_json_invalid')
+                if not isinstance(viz_manifest, dict) or any(
+                    viz_manifest.get(key) != viz_publication.get(key)
+                    for key in (
+                        'schema_version', 'status', 'submission_key', 'path',
+                        'size', 'sha256', 'source_path', 'source_sha256',
+                        'published_at',
+                    )
+                ):
+                    raise RuntimeError('viz_publication_manifest_mismatch')
+                if viz_info.st_size != viz_publication.get('size'):
+                    raise RuntimeError('viz_publication_size_mismatch')
+                observed.extend([
+                    {{
+                        'path': viz_path,
+                        'size': viz_info.st_size,
+                        'sha256': str(viz_publication.get('sha256') or ''),
+                        'is_file': True,
+                        'is_symlink': False,
+                        'parents_symlink_free': True,
+                        'sha256_attested_by_manifest': True,
+                    }},
+                    {{
+                        'path': viz_manifest_path,
+                        'size': viz_manifest_info.st_size,
+                        'sha256': hashlib.sha256(viz_manifest_raw).hexdigest(),
+                        'is_file': True,
+                        'is_symlink': False,
+                        'parents_symlink_free': True,
+                    }},
+                ])
             artifact_meta = {{}}
             total = 0
             html_path = ''

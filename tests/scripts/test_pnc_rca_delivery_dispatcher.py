@@ -253,6 +253,25 @@ def _web_bundle_payload():
     }
 
 
+def _html_only_bundle_payload():
+    _admission, contract, manifest, observed, dependencies = _bundle()
+    publication = contract["artifacts"].pop("viz_publication")
+    contract["artifacts"].pop("viz_mcap_vm")
+    contract["report"]["deliverable_kind"] = "html"
+    contract["report"]["status"] = "html_delivery_ready"
+    observed = [
+        item
+        for item in observed
+        if item["path"] not in {publication["path"], publication["manifest_path"]}
+    ]
+    return {
+        "delivery_contract": contract,
+        "delivery_manifest": manifest,
+        "observed_files": observed,
+        "html_dependencies": dependencies,
+    }
+
+
 def _asset_relative(url):
     route = url.split("/G1Q3_RCA/cases/", 1)[1]
     _submission_key, _artifact_set_id, relative = route.split("/", 2)
@@ -671,11 +690,27 @@ def test_success_requires_read_before_http_add_and_read_after_remote_id(tmp_path
     assert remote.fields["field_8c912e"] == payload["report_url"]
     assert payload["report_url"] in remote.comments[0]["content"]
     assert payload["foxglove_url"] != payload["report_url"]
-    assert payload["foxglove_url"] in remote.comments[0]["content"]
+    assert payload["foxglove_url"] not in remote.comments[0]["content"]
     assert receipt["confirmed_report_url"] == payload["report_url"]
     assert receipt["confirmed_content_sha256"] == hashlib.sha256(
         payload["comment_content"].encode("utf-8")
     ).hexdigest()
+
+
+def test_html_only_causal_result_is_delivered_without_foxglove_surface(tmp_path):
+    store = _seed(tmp_path, bundle_payload=_html_only_bundle_payload())
+    dispatcher, remote, _clock = _dispatcher(tmp_path)
+
+    outcome = dispatcher.dispatch_one()
+
+    assert outcome.status == "succeeded"
+    effect = store.list_rows("rca_delivery_effects")[0]
+    payload = json.loads(effect["payload_json"])
+    assert payload["report_status"] == "html_delivery_ready"
+    assert payload["viz_mcap_vm"] == ""
+    assert payload["foxglove_url"] == ""
+    assert payload["report_cifs_path"].endswith("/index.html")
+    assert payload["report_url"] in remote.comments[0]["content"]
 
 
 def test_postwrite_marker_without_canonical_body_never_acks(tmp_path):
@@ -1000,14 +1035,16 @@ def test_terminal_manual_delivery_skips_report_http_and_sends_both_effects(tmp_p
     assert verifier_calls == []
     assert remote.add_calls == 1
     assert remote.update_field_calls == 1
-    assert "非归因结论" in remote.fields["field_9193cb"]
-    assert "第 1 代" in remote.fields["field_9193cb"]
-    assert "可能保留自其他代次" in remote.fields["field_9193cb"]
+    assert "归因结论：本次未生成可确认的自动归因。" in remote.fields[
+        "field_9193cb"
+    ]
+    assert "第 1 代" not in remote.fields["field_9193cb"]
+    assert "其他代次" not in remote.fields["field_9193cb"]
     assert remote.fields["field_8c912e"] == existing_report
     assert thread_remote.add_calls == 1
-    assert "本终态不改写" in remote.comments[0]["content"]
-    assert "不代表第 1 代结论" in remote.comments[0]["content"]
-    assert "本终态不改写" in thread_remote.comments[0]["content"]
+    assert "本终态不改写" not in remote.comments[0]["content"]
+    assert "第 1 代" not in remote.comments[0]["content"]
+    assert "本终态不改写" not in thread_remote.comments[0]["content"]
     assert "sensitive backend detail" not in remote.comments[0]["content"]
     assert "sensitive backend detail" not in thread_remote.comments[0]["content"]
     assert store.list_rows("rca_delivery_jobs")[0]["status"] == "delivered"
@@ -1099,7 +1136,8 @@ def test_profile_readiness_terminal_validates_with_explicit_detail(tmp_path):
 
     validated = dispatcher_module._validate_effect(readiness_claim)
 
-    assert "ct_evaluator_217_20260722" in validated.content
+    assert "ct_evaluator_217_20260722" not in validated.content
+    assert "不能跨项目借用其他归因能力" in validated.content
     assert validated.field_updates[0][1] == readiness.diagnostic_result
 
 

@@ -32,6 +32,16 @@ def test_remote_bundle_reader_uses_formal_viz_publication_root():
     assert "FORMAL_VIZ_ROOT = posixpath.normpath(ROOT)" not in script
 
 
+def test_viz_surface_errors_retry_internally_instead_of_becoming_user_results():
+    assert "viz_publication_missing" in collector._RETRYABLE_INFRASTRUCTURE_ARTIFACT_CODES
+    assert (
+        "viz_publication_path_invalid"
+        in collector._RETRYABLE_INFRASTRUCTURE_ARTIFACT_CODES
+    )
+    script = collector._remote_bundle_script("g1q3-rca-s1-" + "b" * 64)
+    assert "if viz_publication:" in script
+
+
 def test_config_exposes_capacity_sampling_without_restoring_activation_gate(tmp_path):
     config = collector.CollectorConfig.from_env(
         _config_env(tmp_path), hermes_home=tmp_path

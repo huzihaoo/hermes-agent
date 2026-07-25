@@ -104,6 +104,9 @@ _FEISHU_ISSUE_URL_RE = re.compile(
 _PROJECT_SIMPLE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _VIZ_REPORT_STATUSES = frozenset({"report_ready"})
+_HTML_REPORT_STATUSES = frozenset(
+    {"html_delivery_ready", "report_generated_need_review", "report_ready"}
+)
 _CIRCUIT_CODES = frozenset({
     "feishu_auth_failed",
     "feishu_permission_denied",
@@ -1731,23 +1734,30 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         raise DeliveryContractError("delivery_effect_report_url_invalid") from exc
     if claim.report_url != manifest_report_url:
         raise DeliveryContractError("delivery_effect_report_url_invalid")
-    expected_report_cifs_path = canonical_viz_mcap_cifs_path(
-        manifest_submission_key
+    has_viz_surface = bool(payload.get("viz_mcap_vm") or payload.get("foxglove_url"))
+    expected_report_cifs_path = (
+        canonical_viz_mcap_cifs_path(manifest_submission_key)
+        if has_viz_surface
+        else str(claim.manifest.get("report_cifs_path") or "").strip()
     )
     if payload.get("report_cifs_path") != expected_report_cifs_path:
         raise DeliveryContractError("delivery_report_cifs_identity_mismatch")
-    if (
-        payload.get("viz_mcap_vm") != expected_viz_path
-        or not validate_foxglove_url(
-            payload.get("foxglove_url"), payload.get("viz_mcap_vm")
-        )
-    ):
+    if has_viz_surface:
+        if (
+            payload.get("viz_mcap_vm") != expected_viz_path
+            or not validate_foxglove_url(
+                payload.get("foxglove_url"), payload.get("viz_mcap_vm")
+            )
+        ):
+            raise DeliveryContractError("delivery_effect_foxglove_identity_mismatch")
+    elif payload.get("viz_mcap_vm") or payload.get("foxglove_url"):
         raise DeliveryContractError("delivery_effect_foxglove_identity_mismatch")
     if payload.get("report_link_kind") != DELIVERY_REPORT_LINK_KIND:
         raise DeliveryContractError("delivery_effect_report_link_kind_invalid")
     if (
         payload.get("requires_human_review") is not True
-        or payload.get("report_status") not in _VIZ_REPORT_STATUSES
+        or payload.get("report_status")
+        not in (_VIZ_REPORT_STATUSES if has_viz_surface else _HTML_REPORT_STATUSES)
     ):
         raise DeliveryContractError("delivery_effect_review_boundary_invalid")
     expected_report_link = claim.report_url

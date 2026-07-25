@@ -585,20 +585,23 @@ def test_success_delivery_requires_a_canonical_project_slug(project_simple_name)
     assert exc.value.code == expected
 
 
-def test_html_bundle_without_published_viz_is_not_deliverable():
+def test_html_bundle_without_published_viz_is_deliverable_without_viz_surface():
     admission, contract, manifest, observed, dependencies = _bundle()
     publication = contract["artifacts"].pop("viz_publication")
     contract["artifacts"].pop("viz_mcap_vm")
+    contract["report"]["deliverable_kind"] = "html"
+    contract["report"]["status"] = "html_delivery_ready"
     observed = [
         item
         for item in observed
         if item["path"] not in {publication["path"], publication["manifest_path"]}
     ]
 
-    with pytest.raises(DeliveryContractError) as exc:
-        _verify((admission, contract, manifest, observed, dependencies))
+    delivery = _verify((admission, contract, manifest, observed, dependencies))
 
-    assert exc.value.code == "viz_publication_missing"
+    assert delivery.viz_mcap_vm == ""
+    assert delivery.foxglove_url == ""
+    assert delivery.effect_payload["report_cifs_path"] == manifest["report_cifs_path"]
 
 
 def test_case_local_viz_cannot_replace_formal_published_viz():

@@ -2132,7 +2132,11 @@ def verify_delivery_bundle(
     observed_files: Sequence[Mapping[str, Any]],
     html_dependencies: Sequence[str],
 ) -> VerifiedDelivery:
-    """Verify sealed evidence plus one published viz and build a send-free effect."""
+    """Verify one sealed report and build a send-free delivery effect.
+
+    A published Foxglove surface is verified when claimed, but it is not required
+    when the sealed HTML report already carries the causal result and evidence.
+    """
     validated_admission = validate_rca_admission(admission)
     contract = dict(delivery_contract or {})
     manifest = dict(delivery_manifest or {})
@@ -2165,12 +2169,17 @@ def verify_delivery_bundle(
     explicit_kind = str(
         report.get("deliverable_kind") or contract.get("deliverable_kind") or ""
     ).strip()
-    if explicit_kind != "foxglove_viz":
+    if explicit_kind not in {"html", "foxglove_viz"}:
         raise DeliveryContractError("delivery_kind_unsupported")
     report_status = str(report.get("status") or "").strip()
-    if report_status not in _VIZ_REPORT_STATUSES:
+    allowed_report_statuses = (
+        _VIZ_REPORT_STATUSES
+        if explicit_kind == "foxglove_viz"
+        else _HTML_REPORT_STATUSES
+    )
+    if report_status not in allowed_report_statuses:
         raise DeliveryContractError(
-            "delivery_report_status_not_viz", f"unsupported report status: {report_status}"
+            "delivery_report_status_invalid", f"unsupported report status: {report_status}"
         )
     if report.get("requires_human_review") is not True:
         raise DeliveryContractError(
@@ -2199,11 +2208,18 @@ def verify_delivery_bundle(
         raise DeliveryContractError("artifact_set_reference_mismatch")
 
     observations = _observations_by_path(observed_files)
-    viz_mcap_vm, rendered_foxglove_url = _verify_viz_publication(
-        contract_artifacts=contract_artifacts,
-        observations=observations,
-        submission_key=validated_admission.submission_key,
-    )
+    if explicit_kind == "foxglove_viz":
+        viz_mcap_vm, rendered_foxglove_url = _verify_viz_publication(
+            contract_artifacts=contract_artifacts,
+            observations=observations,
+            submission_key=validated_admission.submission_key,
+        )
+    else:
+        if contract_artifacts.get("viz_publication") or contract_artifacts.get(
+            "viz_mcap_vm"
+        ):
+            raise DeliveryContractError("html_delivery_must_not_claim_viz")
+        viz_mcap_vm, rendered_foxglove_url = "", ""
     roles: dict[str, VerifiedArtifact] = {}
     verified: list[VerifiedArtifact] = []
     seen_paths: set[str] = set()
@@ -2284,11 +2300,13 @@ def verify_delivery_bundle(
         submission_key=validated_admission.submission_key,
         artifact_set_id=expected_artifact_set_id,
     )
-    report_cifs_path = canonical_viz_mcap_cifs_path(
-        validated_admission.submission_key
+    report_cifs_path = (
+        canonical_viz_mcap_cifs_path(validated_admission.submission_key)
+        if explicit_kind == "foxglove_viz"
+        else str(manifest.get("report_cifs_path") or "").strip()
     )
     if not report_cifs_path:
-        raise DeliveryContractError("viz_publication_cifs_path_invalid")
+        raise DeliveryContractError("delivery_report_cifs_path_invalid")
     refs = validated_admission.source_refs
     target_key = (
         f"feishu_project:{refs.project_key}:{refs.work_item_type_key}:"
