@@ -55,6 +55,11 @@ from gateway.pnc_rca_delivery_contract import (
     validate_delivery_subscription_target,
     verify_persisted_artifact_inventory,
 )
+from gateway.pnc_rca_quality_oracle import (
+    TierOracleConflict,
+    evaluate_structural_tier,
+    require_publishable,
+)
 from gateway.pnc_rca_delivery_quarantine_baseline import (
     disabled_quarantine_baseline_status,
     quarantine_baseline_settings,
@@ -1665,7 +1670,8 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
             "viz_mcap_vm", "foxglove_url",
             "requires_human_review", "conclusion", "effect_key",
             "semantic_payload_sha256", "marker", "comment_content",
-            "field_updates", *report_link_fields,
+            "field_updates", "terminal_class", "confidence_tier",
+            "quality_oracle", "quality_oracle_sha256", *report_link_fields,
         }
         content_field = "comment_content"
     else:
@@ -1690,7 +1696,9 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
             "thread_id", "reply_anchor_message_id", "source_message_id",
             "requester_id", "reply_in_thread", "output_cap", "effect_key",
             "semantic_payload_sha256", "marker", "idempotency_uuid",
-            "message_content", "field_updates", *report_link_fields,
+            "message_content", "field_updates", "terminal_class",
+            "confidence_tier", "quality_oracle", "quality_oracle_sha256",
+            *report_link_fields,
         }
         content_field = "message_content"
     if set(payload) != exact_payload_keys:
@@ -1818,6 +1826,7 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
             report_url=claim.report_url,
             foxglove_url=str(payload.get("foxglove_url") or ""),
             report_cifs_path=expected_report_cifs_path,
+            terminal_class=str(payload.get("terminal_class") or ""),
         )
     else:
         expected_content = build_thread_reply_content(
@@ -1828,9 +1837,32 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
             report_url=claim.report_url,
             foxglove_url=str(payload.get("foxglove_url") or ""),
             issue_url=expected_issue_url,
+            terminal_class=str(payload.get("terminal_class") or ""),
         )
     if content != expected_content:
         raise DeliveryContractError("delivery_effect_content_invalid")
+    replayed_oracle = evaluate_structural_tier(
+        claim.contract,
+        publication_text=f"{conclusion}\n{content}",
+    )
+    try:
+        require_publishable(replayed_oracle)
+    except TierOracleConflict as exc:
+        raise DeliveryContractError(
+            "classification_conflict",
+            ",".join(exc.result.violations)
+            or f"{exc.result.terminal_class}_not_publishable",
+        ) from exc
+    if (
+        payload.get("terminal_class") != replayed_oracle.terminal_class
+        or payload.get("confidence_tier") != replayed_oracle.confidence_tier
+        or payload.get("quality_oracle") != replayed_oracle.as_dict()
+        or payload.get("quality_oracle_sha256") != replayed_oracle.sha256()
+    ):
+        raise DeliveryContractError(
+            "classification_conflict",
+            "persisted quality oracle does not match replayed contract",
+        )
     if claim.effect_kind == DELIVERY_THREAD_EFFECT_KIND:
         expected_uuid = delivery_effect_idempotency_uuid(claim.effect_key)
         if payload.get("idempotency_uuid") != expected_uuid:

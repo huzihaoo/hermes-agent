@@ -53,7 +53,11 @@ from tests.gateway.test_pnc_rca_delivery_store import (
     _insert_subscription,
     _switch_activation_epoch,
 )
-from tests.gateway.test_pnc_rca_delivery_contract import _bundle
+from tests.gateway.test_pnc_rca_delivery_contract import (
+    _add_structural_candidate,
+    _bundle,
+    _consumer_capability,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -1878,6 +1882,21 @@ def test_dispatcher_rejects_unhashed_arbitrary_comment_body(tmp_path):
         dispatcher_module._validate_effect(tampered)
 
     assert exc.value.code == "delivery_effect_content_invalid"
+
+
+def test_dispatcher_replays_oracle_and_rejects_tampered_contract_before_http(tmp_path):
+    store = _seed(tmp_path)
+    claim = store.claim_due_effect(lease_owner="worker-1", now=NOW)
+    assert claim is not None
+    contract = json.loads(json.dumps(claim.contract))
+    contract["consumer_capability"] = _consumer_capability()
+    _add_structural_candidate(contract)
+    tampered = replace(claim, contract=contract)
+
+    with pytest.raises(DeliveryContractError) as exc:
+        dispatcher_module._validate_effect(tampered)
+
+    assert exc.value.code == "classification_conflict"
 
 
 def test_dispatcher_rejects_project_alias_issue_url_before_http(tmp_path):

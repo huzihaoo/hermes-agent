@@ -30,6 +30,7 @@ from scripts.pnc_foxglove_delivery import (
     canonical_viz_mcap_path,
     foxglove_url,
 )
+from gateway.pnc_rca_quality_oracle import MEDIUM_TIER_DISCLAIMER
 
 
 FORMAL_SUBMISSION_KEY = "g1q3-rca-s1-" + "a" * 64
@@ -290,6 +291,7 @@ def _consumer_capability(*, applicability="applied"):
         ],
         "evidence": {
             "issue_frame_id": 123,
+            "focus_window": {"start_ts": 0.0, "end_ts": 1.0},
             "field_lineage": {
                 "schema_version": "g1q3_field_lineage_v2",
                 "fidelity_ok": True,
@@ -299,9 +301,31 @@ def _consumer_capability(*, applicability="applied"):
     }
 
 
+def _add_structural_candidate(contract, conclusion="减速度请求偏重。"):
+    contract["report"]["candidate_owner_domain"] = "ACC"
+    contract["report"]["is_candidate"] = True
+    contract["summary"]["short_conclusion"] = conclusion
+    contract["public_result"] = {
+        "summary": {"short_conclusion": conclusion},
+        "candidate": "ACC",
+        "responsibility": {"status": "candidate"},
+        "evidence_summary": {"refs": []},
+        "causal_chain": {
+            "narrative": [
+                {"role": "现象", "text": "车辆减速度偏重。"},
+                {"role": "证据", "text": "减速度请求与目标状态不匹配。"},
+                {"role": "因果判断", "text": conclusion},
+            ]
+        },
+        "user_action": {},
+    }
+    return contract
+
+
 def test_delivery_projects_consumer_capability_into_field_and_comment():
     admission, contract, manifest, observed, dependencies = _bundle()
     contract["consumer_capability"] = _consumer_capability()
+    _add_structural_candidate(contract)
 
     verified = verify_delivery_bundle(
         admission=admission,
@@ -312,9 +336,10 @@ def test_delivery_projects_consumer_capability_into_field_and_comment():
     )
 
     assert "归因结论：减速度请求偏重。" in verified.conclusion
+    assert MEDIUM_TIER_DISCLAIMER in verified.conclusion
     assert "g1q3_863_consumer" not in verified.conclusion
     assert "signals/fields/evaluators" not in verified.effect_payload["comment_content"]
-    assert "报告页用于查看证据" in verified.effect_payload["comment_content"]
+    assert "报告页包含证据" in verified.effect_payload["comment_content"]
     assert (
         verified.effect_payload["field_updates"][0]["field_value"]
         == verified.conclusion
@@ -513,6 +538,70 @@ def test_delivery_rejects_false_applied_consumer_capability():
         )
 
     assert raised.value.code == "consumer_capability_false_applied"
+
+
+def test_delivery_blocks_supported_claim_without_emitted_supported_key():
+    admission, contract, manifest, observed, dependencies = _bundle()
+    capability = _consumer_capability()
+    capability["actual_evaluators"][0]["status"] = "refuted"
+    contract["consumer_capability"] = capability
+    contract["quality_classification"] = "supported_attribution"
+
+    with pytest.raises(DeliveryContractError) as raised:
+        verify_delivery_bundle(
+            admission=admission,
+            delivery_contract=contract,
+            delivery_manifest=manifest,
+            observed_files=observed,
+            html_dependencies=dependencies,
+        )
+
+    assert raised.value.code == "classification_conflict"
+    assert "supported_attribution_evaluator_count_zero" in raised.value.detail
+
+
+def test_delivery_blocks_banned_public_phrase():
+    admission, contract, manifest, observed, dependencies = _bundle()
+    contract["summary"]["short_conclusion"] = (
+        "自动RCA未归因：请核对问题数据地址。"
+    )
+
+    with pytest.raises(DeliveryContractError) as raised:
+        verify_delivery_bundle(
+            admission=admission,
+            delivery_contract=contract,
+            delivery_manifest=manifest,
+            observed_files=observed,
+            html_dependencies=dependencies,
+        )
+
+    assert raised.value.code == "classification_conflict"
+    assert "banned_public_phrase" in raised.value.detail
+
+
+def test_delivery_low_tier_has_no_blame_or_user_action():
+    admission, contract, manifest, observed, dependencies = _bundle()
+    contract["summary"]["short_conclusion"] = (
+        "问题单缺少问题数据地址，不能自动归因，请补齐后重新发起。"
+    )
+
+    delivery = verify_delivery_bundle(
+        admission=admission,
+        delivery_contract=contract,
+        delivery_manifest=manifest,
+        observed_files=observed,
+        html_dependencies=dependencies,
+    )
+
+    publication = (
+        delivery.effect_payload["field_updates"][0]["field_value"]
+        + "\n"
+        + delivery.effect_payload["comment_content"]
+    )
+    assert "问题单缺少" not in publication
+    assert "请补齐" not in publication
+    assert "重新发起" not in publication
+    assert "责任模块：暂无法判断" in publication
 
 
 def test_mdrive4_readiness_terminal_is_explicit_and_business_neutral():
@@ -924,7 +1013,8 @@ def test_manifest_enforces_artifact_count_file_and_bundle_limits():
 
 def test_large_conclusion_is_utf8_bounded_while_report_links_are_preserved():
     admission, contract, manifest, observed, dependencies = _bundle()
-    contract["summary"]["short_conclusion"] = "候选结论" * 10_000
+    contract["consumer_capability"] = _consumer_capability()
+    _add_structural_candidate(contract, "候选结论" * 10_000)
 
     delivery = _verify((admission, contract, manifest, observed, dependencies))
 
@@ -932,7 +1022,8 @@ def test_large_conclusion_is_utf8_bounded_while_report_links_are_preserved():
     assert len(content.encode("utf-8")) <= MAX_FEISHU_COMMENT_BYTES
     assert delivery.foxglove_url not in content
     assert manifest["report_url"] in content
-    assert delivery.conclusion.splitlines()[0].endswith("...")
+    assert delivery.conclusion.splitlines()[0].endswith(MEDIUM_TIER_DISCLAIMER)
+    assert delivery.conclusion.endswith("...")
     assert {item.role for item in delivery.artifacts} == {
         "index_html",
         "report_data",

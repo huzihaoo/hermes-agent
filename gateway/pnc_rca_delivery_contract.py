@@ -14,6 +14,16 @@ from typing import Any, Mapping, Sequence
 from urllib.parse import quote, unquote, urlparse
 
 from gateway.pnc_rca_admission import RcaAdmission, validate_rca_admission
+from gateway.pnc_rca_quality_oracle import (
+    CANDIDATE_HYPOTHESIS,
+    HONEST_NON_ATTRIBUTION,
+    MEDIUM_TIER_DISCLAIMER,
+    SUPPORTED_ATTRIBUTION,
+    TierOracleConflict,
+    evaluate_structural_tier,
+    public_tier_from_rendered_text,
+    require_publishable,
+)
 from scripts.pnc_foxglove_delivery import (
     canonical_publication_origin,
     canonical_viz_mcap_cifs_path,
@@ -26,7 +36,8 @@ from scripts.pnc_foxglove_delivery import (
 DELIVERY_CONTRACT_SCHEMA_VERSION = "g1q3_delivery_contract_v1"
 DELIVERY_MANIFEST_SCHEMA_VERSION = "delivery_manifest_v2"
 DELIVERY_EFFECT_SCHEMA_VERSION_V1 = "pnc_rca_delivery_effect_v1"
-DELIVERY_EFFECT_SCHEMA_VERSION = "pnc_rca_delivery_effect_v2"
+DELIVERY_EFFECT_SCHEMA_VERSION_V2 = "pnc_rca_delivery_effect_v2"
+DELIVERY_EFFECT_SCHEMA_VERSION = "pnc_rca_delivery_effect_v3"
 TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1 = "pnc_rca_terminal_delivery_effect_v1"
 TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION = "pnc_rca_terminal_delivery_effect_v2"
 TERMINAL_DIAGNOSTIC_CONTRACT_SCHEMA_VERSION = "pnc_rca_terminal_diagnostic_v1"
@@ -241,10 +252,17 @@ _V1_BASE_EFFECT_SEMANTIC_FIELDS = (
     "conclusion",
     "field_updates",
 )
-_BASE_EFFECT_SEMANTIC_FIELDS = (
+_V2_BASE_EFFECT_SEMANTIC_FIELDS = (
     *_V1_BASE_EFFECT_SEMANTIC_FIELDS,
     "project_simple_name",
     "report_link_kind",
+)
+_BASE_EFFECT_SEMANTIC_FIELDS = (
+    *_V2_BASE_EFFECT_SEMANTIC_FIELDS,
+    "terminal_class",
+    "confidence_tier",
+    "quality_oracle",
+    "quality_oracle_sha256",
 )
 _THREAD_EFFECT_SEMANTIC_FIELDS = (
     "platform",
@@ -389,6 +407,8 @@ def delivery_effect_semantic_payload(
     schema_version = payload.get("schema_version")
     if schema_version == DELIVERY_EFFECT_SCHEMA_VERSION_V1:
         fields = list(_V1_BASE_EFFECT_SEMANTIC_FIELDS)
+    elif schema_version == DELIVERY_EFFECT_SCHEMA_VERSION_V2:
+        fields = list(_V2_BASE_EFFECT_SEMANTIC_FIELDS)
     elif schema_version == DELIVERY_EFFECT_SCHEMA_VERSION:
         fields = list(_BASE_EFFECT_SEMANTIC_FIELDS)
     else:
@@ -444,10 +464,17 @@ def build_issue_comment_content(
     report_url: str,
     foxglove_url: str,
     report_cifs_path: str,
+    terminal_class: str = "",
 ) -> str:
+    tier = terminal_class or public_tier_from_rendered_text(conclusion)
+    heading = {
+        SUPPORTED_ATTRIBUTION: "【RCA 结果】自动定责结论。",
+        CANDIDATE_HYPOTHESIS: "【RCA 结果】候选结论。",
+        HONEST_NON_ATTRIBUTION: "【RCA 结果】本次未形成可确认归因。",
+    }.get(tier, "【RCA 结果】本次未形成可确认归因。")
     lines = [
         marker,
-        "【RCA 结果】自动分析已完成，待人工审批。",
+        heading,
         f"问题：{work_item_id}",
     ]
     if conclusion:
@@ -455,7 +482,7 @@ def build_issue_comment_content(
     lines.extend(
         [
             f"详细证据报告：{report_url}",
-            "请人工审批归因结论；报告页用于查看证据和完整过程。",
+            "报告页包含证据和完整分析过程。",
         ]
     )
     content = "\n".join(lines)
@@ -473,10 +500,17 @@ def build_thread_reply_content(
     report_url: str,
     foxglove_url: str,
     issue_url: str,
+    terminal_class: str = "",
 ) -> str:
+    tier = terminal_class or public_tier_from_rendered_text(conclusion)
+    heading = {
+        SUPPORTED_ATTRIBUTION: "【RCA 结果】自动定责结论。",
+        CANDIDATE_HYPOTHESIS: "【RCA 结果】候选结论。",
+        HONEST_NON_ATTRIBUTION: "【RCA 结果】本次未形成可确认归因。",
+    }.get(tier, "【RCA 结果】本次未形成可确认归因。")
     lines = [
         marker,
-        "【RCA 结果】自动分析已完成，待人工审批。",
+        heading,
         f"问题：{work_item_id}",
     ]
     if conclusion:
@@ -485,7 +519,7 @@ def build_thread_reply_content(
         [
             f"详细证据报告：{report_url}",
             f"问题单：{issue_url}",
-            "请人工审批归因结论；报告页用于查看证据和完整过程。",
+            "报告页包含证据和完整分析过程。",
         ]
     )
     content = "\n".join(lines)
@@ -964,6 +998,7 @@ def build_thread_reply_effect(
         report_url=str(semantic.get("report_url") or ""),
         foxglove_url=str(semantic.get("foxglove_url") or ""),
         issue_url=str(semantic.get("issue_url") or ""),
+        terminal_class=str(semantic.get("terminal_class") or ""),
     )
     payload = {
         **semantic,
@@ -1417,14 +1452,27 @@ def build_public_rca_result(contract: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def render_public_rca_result(contract: Mapping[str, Any]) -> str:
+def render_public_rca_result(
+    contract: Mapping[str, Any], *, terminal_class: str = ""
+) -> str:
     result = build_public_rca_result(contract)
+    if terminal_class == HONEST_NON_ATTRIBUTION:
+        return "\n".join(
+            (
+                "归因结论：系统已完成现有可用证据的自动分析，但未形成可确认的归因结论。",
+                "责任模块：暂无法判断。",
+                "因果关系：现有证据不足以闭合责任因果链。",
+                "关键证据：已取得的证据仅能支持记录分析边界，不能支持责任判断。",
+            )
+        )
     lines = [
         f"归因结论：{result['conclusion']}",
         f"责任模块：{result['responsibility']}",
         f"因果关系：{result['causal_chain']}",
         f"关键证据：{result['evidence']}",
     ]
+    if terminal_class == CANDIDATE_HYPOTHESIS:
+        lines.insert(0, f"置信说明：{MEDIUM_TIER_DISCLAIMER}")
     return "\n".join(_truncate_utf8(line, 1800) for line in lines)
 
 
@@ -2348,13 +2396,28 @@ def verify_delivery_bundle(
             "delivery_conclusion_missing",
             "a non-empty RCA conclusion is required for the result field",
         )
-    conclusion_text = render_public_rca_result(contract)
+    structural_tier = evaluate_structural_tier(contract)
+    conclusion_text = render_public_rca_result(
+        contract, terminal_class=structural_tier.terminal_class
+    )
     conclusion = _truncate_utf8(conclusion_text, MAX_CONCLUSION_BYTES)
     if not conclusion:
         raise DeliveryContractError(
             "delivery_conclusion_missing",
             "a non-empty RCA conclusion is required for the result field",
         )
+    publication_tier = evaluate_structural_tier(
+        contract,
+        publication_text=conclusion,
+    )
+    try:
+        require_publishable(publication_tier)
+    except TierOracleConflict as exc:
+        raise DeliveryContractError(
+            "classification_conflict",
+            ",".join(exc.result.violations)
+            or f"{exc.result.terminal_class}_not_publishable",
+        ) from exc
     semantic_payload = {
         "schema_version": DELIVERY_EFFECT_SCHEMA_VERSION,
         "delivery_id": delivery_id,
@@ -2374,6 +2437,10 @@ def verify_delivery_bundle(
         "report_status": report_status,
         "requires_human_review": True,
         "conclusion": conclusion,
+        "terminal_class": publication_tier.terminal_class,
+        "confidence_tier": publication_tier.confidence_tier,
+        "quality_oracle": publication_tier.as_dict(),
+        "quality_oracle_sha256": publication_tier.sha256(),
         "field_updates": [
             {
                 "field_key": RCA_RESULT_FIELD_KEY,
@@ -2403,7 +2470,25 @@ def verify_delivery_bundle(
         report_url=html_report_url,
         foxglove_url=rendered_foxglove_url,
         report_cifs_path=report_cifs_path,
+        terminal_class=publication_tier.terminal_class,
     )
+    final_publication_tier = evaluate_structural_tier(
+        contract,
+        publication_text=f"{conclusion}\n{comment_content}",
+    )
+    try:
+        require_publishable(final_publication_tier)
+    except TierOracleConflict as exc:
+        raise DeliveryContractError(
+            "classification_conflict",
+            ",".join(exc.result.violations)
+            or f"{exc.result.terminal_class}_not_publishable",
+        ) from exc
+    if final_publication_tier.as_dict() != publication_tier.as_dict():
+        raise DeliveryContractError(
+            "classification_conflict",
+            "quality oracle changed after final comment rendering",
+        )
     effect_payload = {
         **semantic_payload,
         "effect_key": effect_key,
