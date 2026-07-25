@@ -129,6 +129,54 @@ def test_loaded_gate_rejects_a_stale_launchd_snapshot(tmp_path: Path):
     )
 
 
+def test_versioned_stable_entrypoints_reject_stale_launcher_and_wrapper(
+    tmp_path: Path,
+):
+    home = tmp_path
+    hermes_home = home / ".hermes"
+    runtime_root = hermes_home / "runtime" / "releases" / "active"
+    scripts = runtime_root / "scripts"
+    wrappers = scripts / "wrappers"
+    governance = hermes_home / "runtime" / "governance-tools"
+    wrappers.mkdir(parents=True)
+    governance.mkdir(parents=True)
+    (home / "bin").mkdir()
+
+    versioned = {
+        scripts / "pnc_live_exec.py": b"active launcher\n",
+        scripts / "pnc_rca_release_freshness_gate.py": b"active gate\n",
+        scripts / "watcher_staleness_watchdog.sh": b"active watchdog\n",
+        wrappers / "hermes.current": b"active wrapper\n",
+    }
+    for path, raw in versioned.items():
+        path.write_bytes(raw)
+    (governance / "pnc_live_exec.py").write_bytes(b"stale launcher\n")
+    (governance / "pnc_rca_release_freshness_gate.py").write_bytes(
+        versioned[scripts / "pnc_rca_release_freshness_gate.py"]
+    )
+    (governance / "watcher-staleness-watchdog.sh").write_bytes(
+        versioned[scripts / "watcher_staleness_watchdog.sh"]
+    )
+    (home / "bin" / "hermes.current").write_bytes(b"stale wrapper\n")
+
+    evidence, errors = gate.audit_versioned_stable_entrypoints(
+        home=home,
+        hermes_home=hermes_home,
+        runtime_root=runtime_root,
+    )
+
+    stale_names = {
+        item["name"]
+        for item in errors
+        if item["code"] == "pnc_release_stable_entrypoint_stale"
+    }
+    assert stale_names == {"pnc_live_exec.py", "wrapper:hermes.current"}
+    assert {item["name"] for item in evidence if item["exact"]} == {
+        "pnc_rca_release_freshness_gate.py",
+        "watcher-staleness-watchdog.sh",
+    }
+
+
 def test_process_evidence_reads_real_process_identity(tmp_path: Path):
     script = tmp_path / "resident.py"
     script.write_text("import time; time.sleep(30)\n", encoding="utf-8")

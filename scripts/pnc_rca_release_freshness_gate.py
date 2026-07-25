@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import plistlib
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -327,6 +328,100 @@ def audit_wrappers(home: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any
     return evidence, errors
 
 
+def audit_versioned_stable_entrypoints(
+    *, home: Path, hermes_home: Path, runtime_root: Path
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Require stable bootstrap files to equal their active-release sources."""
+
+    pairs = [
+        (
+            "pnc_live_exec.py",
+            hermes_home / "runtime" / "governance-tools" / "pnc_live_exec.py",
+            runtime_root / "scripts" / "pnc_live_exec.py",
+        ),
+        (
+            "pnc_rca_release_freshness_gate.py",
+            hermes_home
+            / "runtime"
+            / "governance-tools"
+            / "pnc_rca_release_freshness_gate.py",
+            runtime_root / "scripts" / "pnc_rca_release_freshness_gate.py",
+        ),
+        (
+            "watcher-staleness-watchdog.sh",
+            hermes_home
+            / "runtime"
+            / "governance-tools"
+            / "watcher-staleness-watchdog.sh",
+            runtime_root / "scripts" / "watcher_staleness_watchdog.sh",
+        ),
+    ]
+    wrapper_source = runtime_root / "scripts" / "wrappers"
+    try:
+        wrapper_paths = sorted(wrapper_source.iterdir())
+    except OSError:
+        wrapper_paths = []
+        pairs.append(
+            (
+                "scripts/wrappers",
+                home / "bin" / ".pnc-wrapper-source-missing",
+                wrapper_source,
+            )
+        )
+    else:
+        pairs.extend(
+            (f"wrapper:{path.name}", home / "bin" / path.name, path)
+            for path in wrapper_paths
+        )
+
+    evidence: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for name, stable_path, source_path in pairs:
+        item: dict[str, Any] = {
+            "name": name,
+            "stable_path": str(stable_path),
+            "source_path": str(source_path),
+            "stable_sha256": "",
+            "source_sha256": "",
+            "exact": False,
+            "errors": [],
+        }
+        item_errors: list[str] = []
+        try:
+            source_stat = source_path.lstat()
+            source_raw = source_path.read_bytes()
+        except OSError:
+            item_errors.append("pnc_release_versioned_source_missing")
+            source_stat = None
+            source_raw = b""
+        if source_stat is not None and (
+            not stat.S_ISREG(source_stat.st_mode) or stat.S_ISLNK(source_stat.st_mode)
+        ):
+            item_errors.append("pnc_release_versioned_source_invalid")
+        try:
+            stable_stat = stable_path.lstat()
+            stable_raw = stable_path.read_bytes()
+        except OSError:
+            item_errors.append("pnc_release_stable_entrypoint_missing")
+            stable_stat = None
+            stable_raw = b""
+        if stable_stat is not None and (
+            not stat.S_ISREG(stable_stat.st_mode) or stat.S_ISLNK(stable_stat.st_mode)
+        ):
+            item_errors.append("pnc_release_stable_entrypoint_invalid")
+        if source_raw:
+            item["source_sha256"] = hashlib.sha256(source_raw).hexdigest()
+        if stable_raw:
+            item["stable_sha256"] = hashlib.sha256(stable_raw).hexdigest()
+        if source_raw and stable_raw and source_raw != stable_raw:
+            item_errors.append("pnc_release_stable_entrypoint_stale")
+        item["exact"] = bool(source_raw and stable_raw and not item_errors)
+        item["errors"] = item_errors
+        evidence.append(item)
+        errors.extend(_error(code, name=name) for code in item_errors)
+    return evidence, errors
+
+
 def run_gate(*, home: Path, hermes_home: Path) -> dict[str, Any]:
     persisted, persisted_errors = audit_persisted_definitions(
         home=home, hermes_home=hermes_home
@@ -335,14 +430,25 @@ def run_gate(*, home: Path, hermes_home: Path) -> dict[str, Any]:
     resolved, resolution_errors = _resolve_targets(hermes_home=hermes_home)
     residents, resident_errors = audit_residents(loaded=loaded, resolved=resolved)
     wrappers, wrapper_errors = audit_wrappers(home)
+    runtime = next(iter(resolved.values()), {})
+    stable_entrypoints: list[dict[str, Any]] = []
+    stable_entrypoint_errors: list[dict[str, Any]] = []
+    if runtime.get("runtime_root"):
+        stable_entrypoints, stable_entrypoint_errors = (
+            audit_versioned_stable_entrypoints(
+                home=home,
+                hermes_home=hermes_home,
+                runtime_root=Path(runtime["runtime_root"]),
+            )
+        )
     errors = [
         *persisted_errors,
         *loaded_errors,
         *resolution_errors,
         *resident_errors,
         *wrapper_errors,
+        *stable_entrypoint_errors,
     ]
-    runtime = next(iter(resolved.values()), {})
     return {
         "schema_version": "pnc_rca_release_freshness_gate_v1",
         "ok": not errors,
@@ -354,6 +460,7 @@ def run_gate(*, home: Path, hermes_home: Path) -> dict[str, Any]:
         "resolved_targets": [resolved[label] for label in sorted(resolved)],
         "residents": residents,
         "wrappers": wrappers,
+        "stable_entrypoints": stable_entrypoints,
         "errors": errors,
     }
 
