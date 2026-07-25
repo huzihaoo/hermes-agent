@@ -2230,9 +2230,10 @@ def verify_delivery_bundle(
         raise DeliveryContractError(
             "delivery_report_status_invalid", f"unsupported report status: {report_status}"
         )
-    if report.get("requires_human_review") is not True:
+    if not isinstance(report.get("requires_human_review"), bool):
         raise DeliveryContractError(
-            "delivery_review_boundary_missing", "RCA delivery must require human review"
+            "delivery_review_boundary_invalid",
+            "RCA review metadata must be an explicit boolean",
         )
 
     root = _normalize_root(manifest.get("artifact_root"), validated_admission.submission_key)
@@ -2435,7 +2436,9 @@ def verify_delivery_bundle(
         "foxglove_url": rendered_foxglove_url,
         "report_link_kind": DELIVERY_REPORT_LINK_KIND,
         "report_status": report_status,
-        "requires_human_review": True,
+        "requires_human_review": (
+            publication_tier.terminal_class == CANDIDATE_HYPOTHESIS
+        ),
         "conclusion": conclusion,
         "terminal_class": publication_tier.terminal_class,
         "confidence_tier": publication_tier.confidence_tier,

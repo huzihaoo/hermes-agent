@@ -1,0 +1,14 @@
+{
+  "schema_version": "pnc_rca_release_golden_registry_v1",
+  "pipeline_commit": "20ea44bdfaa862b2a366c33bc90552f1fcb13557",
+  "pipeline_tree": "5d009bc14e197694bc5f03af16c8c5e9ff60af37",
+  "low_tier_suite": {
+    "status": "failing",
+    "positive_case_count": 1,
+    "negative_case_count": 4,
+    "receipt_sha256": "84565d5f3bb93578d0d7ab3f65ca4fce9a3d967a70230f13bd821a4d7be749af",
+    "vm_path": "/mnt/tmp/20260725-rca-ga-w1-golden/pytest.out",
+    "user_visible_path": "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/20260725-rca-ga-w1-golden/"
+  },
+  "evaluators": []
+}

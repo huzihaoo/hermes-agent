@@ -32,6 +32,17 @@ def test_remote_bundle_reader_uses_formal_viz_publication_root():
     assert "FORMAL_VIZ_ROOT = posixpath.normpath(ROOT)" not in script
 
 
+def test_remote_bundle_reader_scans_sealed_public_artifacts_for_banned_phrases():
+    script = collector._remote_bundle_script("g1q3-rca-s1-" + "c" * 64)
+
+    assert repr(tuple(collector.BANNED_PUBLIC_PHRASES)) in script
+    assert "raise RuntimeError('public_artifact_banned_phrase')" in script
+    assert "json.dumps(report_data, ensure_ascii=False, sort_keys=True)" in script
+    assert "reject_banned_public_phrase(text)" in script
+    assert "except RuntimeError:\n            report_data = {}" not in script
+    assert "report_data_missing" in collector._EVENTUAL_ARTIFACT_CODES
+
+
 def test_viz_surface_errors_retry_internally_instead_of_becoming_user_results():
     assert "viz_publication_missing" in collector._RETRYABLE_INFRASTRUCTURE_ARTIFACT_CODES
     assert (

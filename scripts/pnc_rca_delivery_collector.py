@@ -69,6 +69,7 @@ from gateway.pnc_rca_delivery_store import (
     StaleDeliveryWatchLeaseError,
 )
 from gateway.pnc_rca_kafka_contract import NORMALIZED_EVENT_SCHEMA_VERSION
+from gateway.pnc_rca_quality_oracle import BANNED_PUBLIC_PHRASES
 from gateway.pnc_rca_runtime_identity import (
     MAX_HEALTH_FUTURE_SKEW_SECONDS,
     RCA_DELIVERY_COLLECTOR_LOADED_DEPENDENCIES,
@@ -108,6 +109,7 @@ MAX_HEALTH_HEARTBEAT_INTERVAL_SECONDS = 15.0
 _EVENTUAL_ARTIFACT_CODES = frozenset({
     "delivery_contract_missing",
     "delivery_manifest_missing",
+    "report_data_missing",
     "artifact_missing",
     "html_dependency_missing",
     "html_dependency_changed_during_read",
@@ -648,9 +650,15 @@ def _remote_bundle_script(submission_key: str) -> str:
         CSS_PARSER_DISTRIBUTION = {REMOTE_CSS_PARSER_DISTRIBUTION!r}
         CSS_PARSER_VERSION = {REMOTE_CSS_PARSER_VERSION!r}
         FORMAL_VIZ_ROOT = {formal_viz_root!r}
+        BANNED_PUBLIC_PHRASES = {tuple(BANNED_PUBLIC_PHRASES)!r}
 
         def finish(value):
             print(json.dumps(value, ensure_ascii=False, sort_keys=True))
+
+        def reject_banned_public_phrase(text):
+            decoded = html.unescape(str(text or ''))
+            if any(phrase in decoded for phrase in BANNED_PUBLIC_PHRASES):
+                raise RuntimeError('public_artifact_banned_phrase')
 
         def symlink_free(path, anchor=None):
             anchor = anchor or root_norm
@@ -742,7 +750,7 @@ def _remote_bundle_script(submission_key: str) -> str:
             compact_refs = []
             for item in refs[:8]:
                 if isinstance(item, dict):
-                    compact_refs.append({{k: item.get(k) for k in ('summary', 'field', 'check', 'fit_source') if item.get(k)}})
+                    compact_refs.append({{k: item.get(k) for k in ('evidence_ref', 'summary', 'field', 'check', 'fit_source') if item.get(k)}})
                 elif item:
                     compact_refs.append(str(item)[:400])
             terminal = report_data.get('terminal_diagnostic') if isinstance(report_data.get('terminal_diagnostic'), dict) else {{}}
@@ -1103,13 +1111,12 @@ def _remote_bundle_script(submission_key: str) -> str:
             root_norm = posixpath.normpath(ROOT)
             contract = read_json(ROOT + 'delivery_contract.json', 'delivery_contract_missing')
             manifest = read_json(ROOT + 'delivery_manifest.json', 'delivery_manifest_missing')
-            try:
-                report_data = read_json(ROOT + 'report_data.json', 'report_data_missing')
-            except RuntimeError:
-                report_data = {{}}
-            if report_data:
-                contract = dict(contract)
-                contract['public_result'] = public_report_projection(report_data)
+            report_data = read_json(ROOT + 'report_data.json', 'report_data_missing')
+            reject_banned_public_phrase(
+                json.dumps(report_data, ensure_ascii=False, sort_keys=True)
+            )
+            contract = dict(contract)
+            contract['public_result'] = public_report_projection(report_data)
             contract_artifacts = contract.get('artifacts')
             if not isinstance(contract_artifacts, dict):
                 raise RuntimeError('viz_publication_missing')
@@ -1270,6 +1277,7 @@ def _remote_bundle_script(submission_key: str) -> str:
                     continue
                 visited.add(visit_key)
                 text, text_size = read_text_artifact(source_path, source_meta)
+                reject_banned_public_phrase(text)
                 text_total += text_size
                 if text_total > MAX_TEXT_TOTAL_BYTES:
                     raise RuntimeError('html_dependency_text_total_too_large')

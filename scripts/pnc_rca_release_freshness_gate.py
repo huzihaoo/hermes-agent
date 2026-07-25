@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import plistlib
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -26,6 +27,15 @@ from scripts.pnc_live_exec import (
     LiveExecError,
     resolve_active_runtime,
 )
+from gateway.pnc_rca_quality_oracle import release_golden_registry_status
+from gateway.pnc_rca_conclusion_adjudication import (
+    ADJUDICATION_EFFECT_SCHEMA_VERSION,
+)
+from gateway.pnc_rca_delivery_contract import (
+    DELIVERY_EFFECT_SCHEMA_VERSION,
+    TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
+    TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1,
+)
 
 
 WATCHDOG_LABEL = "local.pnc.watcher-staleness-watchdog"
@@ -34,6 +44,9 @@ FORBIDDEN_RUNTIME_MARKERS = (
     "/runtime/releases/",
     "/runtime/venvs/",
     "/runtime/hermes-live",
+)
+UNRESOLVED_EFFECT_STATUSES = frozenset(
+    {"pending", "claimed", "retry_wait", "uncertain"}
 )
 
 
@@ -422,6 +435,127 @@ def audit_versioned_stable_entrypoints(
     return evidence, errors
 
 
+def audit_release_golden_registry(
+    *, hermes_home: Path, registry: Mapping[str, Any] | None = None
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    observed = dict(registry or release_golden_registry_status())
+    errors: list[dict[str, Any]] = []
+    if observed.get("valid") is not True:
+        errors.append(_error("pnc_release_golden_registry_invalid"))
+    if observed.get("low_tier_golden_ready") is not True:
+        errors.append(_error("pnc_release_low_tier_golden_not_ready"))
+    manifest_path = hermes_home / "runtime" / "LIVE_MANIFEST.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        manifest = {}
+        errors.append(_error("pnc_release_manifest_unreadable_for_golden"))
+    faces = manifest.get("face_git_bindings") if isinstance(manifest, Mapping) else {}
+    pipeline = faces.get("g1q3_rca_pipeline") if isinstance(faces, Mapping) else {}
+    active_commit = str(pipeline.get("commit") or "") if isinstance(pipeline, Mapping) else ""
+    active_tree = str(pipeline.get("tree") or "") if isinstance(pipeline, Mapping) else ""
+    if (
+        observed.get("pipeline_commit") != active_commit
+        or observed.get("pipeline_tree") != active_tree
+    ):
+        errors.append(
+            _error(
+                "pnc_release_golden_pipeline_binding_mismatch",
+                active_commit=active_commit,
+                active_tree=active_tree,
+            )
+        )
+    evidence = {
+        **observed,
+        "manifest_path": str(manifest_path),
+        "active_pipeline_commit": active_commit,
+        "active_pipeline_tree": active_tree,
+        "errors": [item["code"] for item in errors],
+    }
+    return evidence, errors
+
+
+def audit_unresolved_effect_schema_compatibility(
+    *, hermes_home: Path, control_db_path: Path | None = None
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    db_path = control_db_path or (
+        hermes_home
+        / "runtime"
+        / "pnc_agent"
+        / "feishu_issue_kafka_rca"
+        / "control.sqlite3"
+    )
+    evidence: dict[str, Any] = {
+        "control_db_path": str(db_path),
+        "unresolved_effect_count": 0,
+        "incompatible_effect_count": 0,
+        "schema_counts": {},
+        "incompatible_effect_keys": [],
+    }
+    errors: list[dict[str, Any]] = []
+    try:
+        uri = f"{db_path.resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=5)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA query_only = ON")
+            rows = conn.execute(
+                """
+                SELECT effect_key, outcome, status, payload_json
+                  FROM rca_delivery_effects
+                 WHERE status IN ('pending', 'claimed', 'retry_wait', 'uncertain')
+                 ORDER BY effect_key
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error) as exc:
+        evidence["read_error"] = type(exc).__name__
+        errors.append(_error("pnc_release_control_db_effect_preflight_unavailable"))
+        return evidence, errors
+
+    incompatible: list[str] = []
+    schema_counts: dict[str, int] = {}
+    for row in rows:
+        try:
+            payload = json.loads(str(row["payload_json"] or ""))
+        except (TypeError, json.JSONDecodeError):
+            payload = None
+        schema_version = (
+            str(payload.get("schema_version") or "")
+            if isinstance(payload, Mapping)
+            else "<invalid-json>"
+        )
+        schema_counts[schema_version] = schema_counts.get(schema_version, 0) + 1
+        outcome = str(row["outcome"] or "")
+        accepted = (
+            schema_version
+            in {DELIVERY_EFFECT_SCHEMA_VERSION, ADJUDICATION_EFFECT_SCHEMA_VERSION}
+            if outcome == "success"
+            else schema_version
+            in {
+                TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1,
+                TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
+            }
+        )
+        if not accepted:
+            incompatible.append(str(row["effect_key"] or ""))
+    evidence.update(
+        unresolved_effect_count=len(rows),
+        incompatible_effect_count=len(incompatible),
+        schema_counts=dict(sorted(schema_counts.items())),
+        incompatible_effect_keys=incompatible[:20],
+    )
+    if incompatible:
+        errors.append(
+            _error(
+                "pnc_release_unresolved_effect_schema_incompatible",
+                count=len(incompatible),
+            )
+        )
+    return evidence, errors
+
+
 def run_gate(*, home: Path, hermes_home: Path) -> dict[str, Any]:
     persisted, persisted_errors = audit_persisted_definitions(
         home=home, hermes_home=hermes_home
@@ -441,6 +575,12 @@ def run_gate(*, home: Path, hermes_home: Path) -> dict[str, Any]:
                 runtime_root=Path(runtime["runtime_root"]),
             )
         )
+    golden_registry, golden_errors = audit_release_golden_registry(
+        hermes_home=hermes_home
+    )
+    effect_schema_preflight, effect_schema_errors = (
+        audit_unresolved_effect_schema_compatibility(hermes_home=hermes_home)
+    )
     errors = [
         *persisted_errors,
         *loaded_errors,
@@ -448,6 +588,8 @@ def run_gate(*, home: Path, hermes_home: Path) -> dict[str, Any]:
         *resident_errors,
         *wrapper_errors,
         *stable_entrypoint_errors,
+        *golden_errors,
+        *effect_schema_errors,
     ]
     return {
         "schema_version": "pnc_rca_release_freshness_gate_v1",
@@ -461,6 +603,8 @@ def run_gate(*, home: Path, hermes_home: Path) -> dict[str, Any]:
         "residents": residents,
         "wrappers": wrappers,
         "stable_entrypoints": stable_entrypoints,
+        "golden_registry": golden_registry,
+        "effect_schema_preflight": effect_schema_preflight,
         "errors": errors,
     }
 

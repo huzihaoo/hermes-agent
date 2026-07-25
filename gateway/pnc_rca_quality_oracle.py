@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import math
+from pathlib import Path
 import re
 from typing import Any, Mapping, Sequence
 
@@ -31,6 +33,15 @@ TERMINAL_CLASSES = frozenset({
 
 MEDIUM_TIER_DISCLAIMER = "候选结论，待人工确认，不可作为定责依据"
 BANNED_PUBLIC_PHRASES = ("请核对问题数据地址",)
+GOLDEN_REGISTRY_SCHEMA_VERSION = "pnc_rca_release_golden_registry_v1"
+GOLDEN_REGISTRY_PATH = (
+    Path(__file__).resolve().parent
+    / "assets"
+    / "pnc_rca_release_golden_registry_v1.json"
+)
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_GIT_OID_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+_EVALUATOR_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$")
 
 _NON_ATTRIBUTION_MARKERS = (
     "自动RCA未归因",
@@ -64,7 +75,8 @@ _LOW_TIER_BLAME_RE = re.compile(
     r"(?:数据|地址).{0,16}(?:错误|有误|无效|不对|无法解析)"
 )
 _APPROVAL_READY_RE = re.compile(
-    r"\bquality[-_]approved\b|\bapproval_ready\s*(?:[:=]|为)\s*(?:true|1|是)",
+    r"\bquality[-_]approved\b|[\"']?approval_ready[\"']?"
+    r"\s*(?:[:=]|为)\s*(?:true|1|是)",
     re.IGNORECASE,
 )
 _RESPONSIBILITY_PLACEHOLDERS = frozenset({
@@ -119,6 +131,11 @@ class StructuralTierFacts:
     supported_evaluator_count: int
     actual_evaluator_inventory_present: bool
     actual_evaluator_inventory_valid: bool
+    golden_covered_evaluator_keys: tuple[str, ...]
+    golden_registry_present: bool
+    golden_registry_valid: bool
+    low_tier_golden_ready: bool
+    golden_coverage_complete: bool
     evidence_ref_count: int
     issue_frame_present: bool
     focus_window_present: bool
@@ -283,25 +300,9 @@ def _evidence_refs(contract: Mapping[str, Any]) -> tuple[str, ...]:
     evidence_items = evidence.get("refs")
     for item in evidence_items if isinstance(evidence_items, list) else ():
         if isinstance(item, Mapping):
-            value = next(
-                (
-                    _string(item.get(key))
-                    for key in (
-                        "evidence_ref",
-                        "ref",
-                        "id",
-                        "path",
-                        "field",
-                        "check",
-                        "name",
-                        "summary",
-                    )
-                    if _string(item.get(key))
-                ),
-                "",
-            )
+            value = _string(item.get("evidence_ref"))
         else:
-            value = _string(item)
+            value = ""
         if value:
             refs.append(value)
     causal = _mapping(public.get("causal_chain"))
@@ -312,19 +313,99 @@ def _evidence_refs(contract: Mapping[str, Any]) -> tuple[str, ...]:
         supporting = hypothesis.get("supporting_evidence")
         for item in supporting if isinstance(supporting, list) else ():
             if isinstance(item, Mapping):
-                value = next(
-                    (
-                        _string(item.get(key))
-                        for key in ("evidence_ref", "ref", "id", "path")
-                        if _string(item.get(key))
-                    ),
-                    "",
-                )
+                value = _string(item.get("evidence_ref"))
             else:
                 value = ""
             if value:
                 refs.append(value)
     return tuple(sorted(set(refs)))
+
+
+def release_golden_registry_status(
+    path: Path = GOLDEN_REGISTRY_PATH,
+) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {"present": False, "valid": False, "evaluators": {}}
+    if not isinstance(payload, Mapping):
+        return {"present": True, "valid": False, "evaluators": {}}
+    low = payload.get("low_tier_suite")
+    entries = payload.get("evaluators")
+    commit = _string(payload.get("pipeline_commit"))
+    tree = _string(payload.get("pipeline_tree"))
+    valid = (
+        payload.get("schema_version") == GOLDEN_REGISTRY_SCHEMA_VERSION
+        and _GIT_OID_RE.fullmatch(commit) is not None
+        and _GIT_OID_RE.fullmatch(tree) is not None
+        and isinstance(low, Mapping)
+        and low.get("status") in {"passed", "failing", "pending"}
+        and type(low.get("positive_case_count")) is int
+        and int(low.get("positive_case_count")) >= 0
+        and type(low.get("negative_case_count")) is int
+        and int(low.get("negative_case_count")) >= 0
+        and _SHA256_RE.fullmatch(_string(low.get("receipt_sha256"))) is not None
+        and _string(low.get("vm_path")).startswith("/mnt/tmp/")
+        and _string(low.get("user_visible_path")).startswith("//hfs1.minieye.tech/")
+        and isinstance(entries, list)
+    )
+    covered: set[str] = set()
+    normalized: dict[str, dict[str, Any]] = {}
+    for item in entries if isinstance(entries, list) else ():
+        if not isinstance(item, Mapping):
+            valid = False
+            continue
+        evaluator_id = _string(item.get("evaluator_id"))
+        source = _string(item.get("evaluator_source_sha256"))
+        positive = _string(item.get("positive_golden_sha256"))
+        negative = _string(item.get("negative_golden_sha256"))
+        receipt = _string(item.get("test_receipt_sha256"))
+        if (
+            _EVALUATOR_ID_RE.fullmatch(evaluator_id) is None
+            or evaluator_id in covered
+            or item.get("status") != "passed"
+            or _SHA256_RE.fullmatch(source) is None
+            or _SHA256_RE.fullmatch(positive) is None
+            or _SHA256_RE.fullmatch(negative) is None
+            or _SHA256_RE.fullmatch(receipt) is None
+            or positive == negative
+        ):
+            valid = False
+            continue
+        covered.add(evaluator_id)
+        normalized[evaluator_id] = dict(item)
+    return {
+        "present": True,
+        "valid": bool(valid),
+        "pipeline_commit": commit,
+        "pipeline_tree": tree,
+        "low_tier_golden_ready": bool(
+            valid
+            and isinstance(low, Mapping)
+            and low.get("status") == "passed"
+            and int(low.get("positive_case_count", 0)) > 0
+            and int(low.get("negative_case_count", 0)) > 0
+        ),
+        "evaluators": normalized,
+    }
+
+
+def _golden_coverage(
+    evaluator_keys: Sequence[str],
+) -> tuple[tuple[str, ...], bool, bool, bool, bool]:
+    registry = release_golden_registry_status()
+    evaluator_registry = registry.get("evaluators")
+    covered = set(evaluator_registry) if isinstance(evaluator_registry, Mapping) else set()
+    required = set(evaluator_keys)
+    valid = registry.get("valid") is True
+    complete = bool(required) and valid and required.issubset(covered)
+    return (
+        tuple(sorted(covered)),
+        registry.get("present") is True,
+        valid,
+        registry.get("low_tier_golden_ready") is True,
+        complete,
+    )
 
 
 def _actual_supported_evaluator_keys(
@@ -391,25 +472,53 @@ def _causal_roles(contract: Mapping[str, Any]) -> tuple[tuple[str, ...], bool]:
 def _structural_evidence(
     contract: Mapping[str, Any], refs: Sequence[str]
 ) -> dict[str, bool]:
+    def bounded_number(value: Any) -> bool:
+        if type(value) is int:
+            return abs(value) <= 10**18
+        return (
+            type(value) is float
+            and math.isfinite(value)
+            and abs(value) <= 10**18
+        )
+
     capability = _mapping(contract.get("consumer_capability"))
     if not capability:
         summary = _mapping(contract.get("summary"))
         capability = _mapping(summary.get("consumer_capability"))
     evidence = _mapping(capability.get("evidence"))
-    frame_present = evidence.get("issue_frame_id") not in {None, ""}
+    frame = evidence.get("issue_frame_id")
+    frame_present = type(frame) is int and frame >= 0
     focus = _mapping(evidence.get("focus_window"))
-    focus_present = any(
-        focus.get(key) not in {None, ""} for key in ("start_ts", "start_frame")
-    ) and any(focus.get(key) not in {None, ""} for key in ("end_ts", "end_frame"))
+    start_ts = focus.get("start_ts")
+    end_ts = focus.get("end_ts")
+    ts_pair = (
+        bounded_number(start_ts)
+        and bounded_number(end_ts)
+        and start_ts <= end_ts
+    )
+    start_frame = focus.get("start_frame")
+    end_frame = focus.get("end_frame")
+    frame_pair = (
+        type(start_frame) is int
+        and type(end_frame) is int
+        and start_frame >= 0
+        and start_frame <= end_frame
+    )
+    focus_present = ts_pair or frame_pair
     lineage = _mapping(evidence.get("field_lineage"))
-    field_complete = lineage.get("fidelity_ok") is True
+    field_complete = (
+        lineage.get("schema_version") == "g1q3_field_lineage_v2"
+        and lineage.get("fidelity_ok") is True
+        and _text(lineage.get("status")).lower() in {"pass", "passed", "verified"}
+        and not lineage.get("errors")
+    )
     viz = _mapping(evidence.get("viz_lineage"))
-    viz_complete = viz.get("ok") is True or _text(viz.get("status")).lower() in {
-        "pass",
-        "passed",
-        "completed",
-        "verified",
-    }
+    viz_complete = (
+        viz.get("schema_version") == "g1q3_viz_lineage_v1"
+        and viz.get("ok") is True
+        and _text(viz.get("status")).lower() in {"pass", "passed", "verified"}
+        and not viz.get("errors")
+    )
     return {
         "issue_frame_present": frame_present,
         "focus_window_present": focus_present,
@@ -500,8 +609,10 @@ def evaluate_structural_tier(
     material = contract if isinstance(contract, Mapping) else {}
     public_parts = _public_parts(material)
     combined_public = "\n".join(public_parts)
+    rendered = _text(publication_text)
+    classification_text = f"{combined_public}\n{rendered}"
     conclusion = _conclusion(material)
-    lowered_public = combined_public.lower()
+    lowered_public = classification_text.lower()
     explicit_non_attribution = any(
         marker.lower() in lowered_public for marker in _NON_ATTRIBUTION_MARKERS
     )
@@ -510,7 +621,7 @@ def evaluate_structural_tier(
     responsibility_structure = _mapping(public.get("responsibility"))
     responsibility_status = _string(responsibility_structure.get("status")).lower()
     candidate_wording = (
-        any(marker in combined_public for marker in _CANDIDATE_MARKERS)
+        any(marker in classification_text for marker in _CANDIDATE_MARKERS)
         or report.get("is_candidate") is True
         or responsibility_status.startswith("candidate")
         or responsibility_status in {"hypothesis", "needs_review", "待人工确认"}
@@ -518,6 +629,13 @@ def evaluate_structural_tier(
     evaluator_keys, inventory_present, inventory_valid = (
         _actual_supported_evaluator_keys(material)
     )
+    (
+        golden_keys,
+        golden_present,
+        golden_valid,
+        low_golden_ready,
+        golden_complete,
+    ) = _golden_coverage(evaluator_keys)
     refs = _evidence_refs(material)
     evidence = _structural_evidence(material, refs)
     roles, causal_closed = _causal_roles(material)
@@ -528,12 +646,15 @@ def evaluate_structural_tier(
     normalized_error = _text(terminal_error_code).lower()
     if normalized_consumer_status in _CONSUMER_FAILURE_STATES:
         terminal_class = CONSUMER_DELIVERY_FAILURE
-    elif normalized_error and normalized_error not in _ROUTE_BOUNDARY_ERROR_CODES:
+    elif normalized_error in _ROUTE_BOUNDARY_ERROR_CODES:
+        terminal_class = HONEST_NON_ATTRIBUTION
+    elif normalized_error:
         terminal_class = TECHNICAL_FAILURE
     elif normalized_outcome in _TECHNICAL_OUTCOMES:
         terminal_class = TECHNICAL_FAILURE
     elif (
         evaluator_keys
+        and golden_complete
         and evidence["evidence_complete"]
         and causal_closed
         and responsibility
@@ -582,6 +703,8 @@ def evaluate_structural_tier(
             violations.append("supported_attribution_evaluator_count_zero")
         if not refs:
             violations.append("supported_attribution_evidence_ref_empty")
+        if not golden_complete:
+            violations.append("supported_attribution_golden_coverage_missing")
         if not responsibility:
             violations.append("supported_attribution_responsibility_empty")
         if explicit_non_attribution:
@@ -600,7 +723,6 @@ def evaluate_structural_tier(
     if approval_claim and not decision:
         violations.append("approval_ready_without_human_decision")
 
-    rendered = _text(publication_text)
     if not decision and _APPROVAL_READY_RE.search(rendered):
         violations.append("approval_ready_without_human_decision")
     if rendered:
@@ -610,6 +732,8 @@ def evaluate_structural_tier(
         ):
             violations.append("candidate_disclaimer_missing")
         if terminal_class == HONEST_NON_ATTRIBUTION:
+            if any(marker in rendered for marker in _CANDIDATE_MARKERS):
+                violations.append("honest_non_attribution_candidate_wording")
             if _LOW_TIER_USER_ACTION_RE.search(rendered):
                 violations.append("honest_non_attribution_user_action")
             if _LOW_TIER_BLAME_RE.search(rendered):
@@ -624,6 +748,11 @@ def evaluate_structural_tier(
         supported_evaluator_count=len(evaluator_keys),
         actual_evaluator_inventory_present=inventory_present,
         actual_evaluator_inventory_valid=inventory_valid,
+        golden_covered_evaluator_keys=golden_keys,
+        golden_registry_present=golden_present,
+        golden_registry_valid=golden_valid,
+        low_tier_golden_ready=low_golden_ready,
+        golden_coverage_complete=golden_complete,
         evidence_ref_count=len(refs),
         issue_frame_present=evidence["issue_frame_present"],
         focus_window_present=evidence["focus_window_present"],
@@ -645,7 +774,7 @@ def evaluate_structural_tier(
         and not unique_violations
     )
     return TierOracleResult(
-        schema_version="pnc_rca_structural_tier_oracle_v1",
+        schema_version="pnc_rca_structural_tier_oracle_v2",
         terminal_class=terminal_class,
         confidence_tier=confidence_tier,
         publication_allowed=publication_allowed,

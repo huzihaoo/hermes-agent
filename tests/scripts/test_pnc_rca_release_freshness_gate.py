@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import plistlib
+import sqlite3
 import subprocess
 import sys
 import time
@@ -175,6 +176,130 @@ def test_versioned_stable_entrypoints_reject_stale_launcher_and_wrapper(
         "pnc_rca_release_freshness_gate.py",
         "watcher-staleness-watchdog.sh",
     }
+
+
+def test_release_golden_registry_must_be_green_and_pipeline_bound(tmp_path: Path):
+    hermes_home = tmp_path / ".hermes"
+    runtime = hermes_home / "runtime"
+    runtime.mkdir(parents=True)
+    commit = "a" * 40
+    tree = "b" * 40
+    (runtime / "LIVE_MANIFEST.json").write_text(
+        json.dumps(
+            {
+                "face_git_bindings": {
+                    "g1q3_rca_pipeline": {"commit": commit, "tree": tree}
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    base = {
+        "present": True,
+        "valid": True,
+        "low_tier_golden_ready": True,
+        "pipeline_commit": commit,
+        "pipeline_tree": tree,
+        "evaluators": {},
+    }
+
+    evidence, errors = gate.audit_release_golden_registry(
+        hermes_home=hermes_home,
+        registry=base,
+    )
+    assert errors == []
+    assert evidence["active_pipeline_commit"] == commit
+
+    failing = {**base, "low_tier_golden_ready": False}
+    _evidence, errors = gate.audit_release_golden_registry(
+        hermes_home=hermes_home,
+        registry=failing,
+    )
+    assert {item["code"] for item in errors} == {
+        "pnc_release_low_tier_golden_not_ready"
+    }
+
+    stale = {**base, "pipeline_commit": "c" * 40}
+    _evidence, errors = gate.audit_release_golden_registry(
+        hermes_home=hermes_home,
+        registry=stale,
+    )
+    assert {item["code"] for item in errors} == {
+        "pnc_release_golden_pipeline_binding_mismatch"
+    }
+
+
+def test_release_preflight_rejects_only_unresolved_incompatible_effects(
+    tmp_path: Path,
+):
+    db_path = tmp_path / "control.sqlite3"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE rca_delivery_effects (
+            effect_key TEXT PRIMARY KEY,
+            outcome TEXT NOT NULL,
+            status TEXT NOT NULL,
+            payload_json TEXT NOT NULL
+        )
+        """
+    )
+    rows = [
+        (
+            "legacy-v2",
+            "success",
+            "pending",
+            {"schema_version": "pnc_rca_delivery_effect_v2"},
+        ),
+        (
+            "current-v3",
+            "success",
+            "claimed",
+            {"schema_version": gate.DELIVERY_EFFECT_SCHEMA_VERSION},
+        ),
+        (
+            "adjudication",
+            "success",
+            "retry_wait",
+            {"schema_version": gate.ADJUDICATION_EFFECT_SCHEMA_VERSION},
+        ),
+        (
+            "terminal-v1",
+            "terminal_failed",
+            "uncertain",
+            {"schema_version": gate.TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1},
+        ),
+    ]
+    conn.executemany(
+        "INSERT INTO rca_delivery_effects VALUES (?, ?, ?, ?)",
+        [(key, outcome, status, json.dumps(payload)) for key, outcome, status, payload in rows],
+    )
+    conn.commit()
+    conn.close()
+
+    evidence, errors = gate.audit_unresolved_effect_schema_compatibility(
+        hermes_home=tmp_path,
+        control_db_path=db_path,
+    )
+
+    assert evidence["unresolved_effect_count"] == 4
+    assert evidence["incompatible_effect_count"] == 1
+    assert evidence["incompatible_effect_keys"] == ["legacy-v2"]
+    assert {item["code"] for item in errors} == {
+        "pnc_release_unresolved_effect_schema_incompatible"
+    }
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE rca_delivery_effects SET status = 'succeeded' WHERE effect_key = 'legacy-v2'")
+    conn.commit()
+    conn.close()
+    evidence, errors = gate.audit_unresolved_effect_schema_compatibility(
+        hermes_home=tmp_path,
+        control_db_path=db_path,
+    )
+    assert evidence["unresolved_effect_count"] == 3
+    assert evidence["incompatible_effect_count"] == 0
+    assert errors == []
 
 
 def test_process_evidence_reads_real_process_identity(tmp_path: Path):

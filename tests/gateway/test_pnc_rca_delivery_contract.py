@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+from gateway import pnc_rca_quality_oracle as quality_oracle_module
 from gateway.pnc_rca_admission import build_rca_admission
 from gateway.pnc_rca_delivery_contract import (
     DELIVERY_THREAD_EFFECT_KIND,
@@ -295,8 +296,13 @@ def _consumer_capability(*, applicability="applied"):
             "field_lineage": {
                 "schema_version": "g1q3_field_lineage_v2",
                 "fidelity_ok": True,
+                "status": "pass",
             },
-            "viz_lineage": {"ok": True, "status": "pass"},
+            "viz_lineage": {
+                "schema_version": "g1q3_viz_lineage_v1",
+                "ok": True,
+                "status": "pass",
+            },
         },
     }
 
@@ -344,6 +350,69 @@ def test_delivery_projects_consumer_capability_into_field_and_comment():
         verified.effect_payload["field_updates"][0]["field_value"]
         == verified.conclusion
     )
+    assert verified.effect_payload["terminal_class"] == "candidate_hypothesis"
+    assert verified.effect_payload["requires_human_review"] is True
+
+
+def test_supported_tier_requires_golden_and_does_not_request_human_review(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        quality_oracle_module,
+        "release_golden_registry_status",
+        lambda: {
+            "present": True,
+            "valid": True,
+            "low_tier_golden_ready": True,
+            "evaluators": {
+                "aeb_trigger": {
+                    "evaluator_id": "aeb_trigger",
+                    "status": "passed",
+                    "evaluator_source_sha256": "c" * 64,
+                    "positive_golden_sha256": "a" * 64,
+                    "negative_golden_sha256": "b" * 64,
+                    "test_receipt_sha256": "d" * 64,
+                }
+            },
+        },
+    )
+    admission, contract, manifest, observed, dependencies = _bundle()
+    contract["consumer_capability"] = _consumer_capability()
+    conclusion = "AEB 触发请求持续成立并经控制链传导，导致本次制动。"
+    contract["report"].update(
+        candidate_owner_domain="AEB",
+        is_candidate=False,
+    )
+    contract["summary"]["short_conclusion"] = conclusion
+    contract["quality_classification"] = "supported_attribution"
+    contract["public_result"] = {
+        "summary": {"short_conclusion": conclusion},
+        "candidate": "AEB",
+        "responsibility": {"status": "supported"},
+        "evidence_summary": {
+            "refs": [{"evidence_ref": "frame:123/aeb_trigger"}]
+        },
+        "causal_chain": {
+            "narrative": [
+                {"role": "现象", "text": "车辆发生制动。"},
+                {"role": "证据", "text": "AEB 触发请求持续成立。"},
+                {"role": "因果判断", "text": conclusion},
+            ]
+        },
+        "user_action": {},
+    }
+
+    verified = verify_delivery_bundle(
+        admission=admission,
+        delivery_contract=contract,
+        delivery_manifest=manifest,
+        observed_files=observed,
+        html_dependencies=dependencies,
+    )
+
+    assert verified.effect_payload["terminal_class"] == "supported_attribution"
+    assert verified.effect_payload["confidence_tier"] == "high"
+    assert verified.effect_payload["requires_human_review"] is False
 
 
 def test_public_projection_keeps_evidence_conflict_without_debug_terms():
@@ -602,6 +671,8 @@ def test_delivery_low_tier_has_no_blame_or_user_action():
     assert "请补齐" not in publication
     assert "重新发起" not in publication
     assert "责任模块：暂无法判断" in publication
+    assert delivery.effect_payload["terminal_class"] == "honest_non_attribution"
+    assert delivery.effect_payload["requires_human_review"] is False
 
 
 def test_mdrive4_readiness_terminal_is_explicit_and_business_neutral():
@@ -1162,7 +1233,7 @@ def test_every_html_dependency_must_be_manifested_and_hash_verified():
     [
         (lambda c, m: c.update(business_state="final_closed"), "delivery_business_state_not_ready"),
         (lambda c, m: c["report"].update(is_deliverable=False), "delivery_report_not_deliverable"),
-        (lambda c, m: c["report"].update(requires_human_review=False), "delivery_review_boundary_missing"),
+        (lambda c, m: c["report"].update(requires_human_review="yes"), "delivery_review_boundary_invalid"),
         (lambda c, m: m.update(sealed=False), "delivery_manifest_not_sealed"),
         (lambda c, m: m.update(artifact_set_id="0" * 64), "artifact_set_id_mismatch"),
     ],

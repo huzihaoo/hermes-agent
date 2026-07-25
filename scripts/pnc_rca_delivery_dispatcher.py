@@ -56,6 +56,7 @@ from gateway.pnc_rca_delivery_contract import (
     verify_persisted_artifact_inventory,
 )
 from gateway.pnc_rca_quality_oracle import (
+    CANDIDATE_HYPOTHESIS,
     TierOracleConflict,
     evaluate_structural_tier,
     require_publishable,
@@ -1781,8 +1782,9 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         raise DeliveryContractError("delivery_effect_foxglove_identity_mismatch")
     if payload.get("report_link_kind") != DELIVERY_REPORT_LINK_KIND:
         raise DeliveryContractError("delivery_effect_report_link_kind_invalid")
+    expected_human_review = payload.get("terminal_class") == CANDIDATE_HYPOTHESIS
     if (
-        payload.get("requires_human_review") is not True
+        payload.get("requires_human_review") is not expected_human_review
         or payload.get("report_status")
         not in (_VIZ_REPORT_STATUSES if has_viz_surface else _HTML_REPORT_STATUSES)
     ):
