@@ -1180,9 +1180,9 @@ def _public_terminal_blocker(code: str) -> tuple[str, str, str]:
             "请核对问题单中的 PDCL 事件地址，修正后重新发起 RCA。",
         ),
         "unsupported_function_domain": (
-            "当前问题域暂不在自动 RCA 覆盖范围内。",
-            "现有证据不足以对该问题域形成自动归因。",
-            "请人工分流；补充该问题域的证据后再纳入自动 RCA。",
+            "本次任务未进入功能证据分析，不能作为归因结果。",
+            "问题数据尚未经过通用信号扫描和因果评测。",
+            "请由系统重新执行完整证据分析。",
         ),
         "business_adapter_not_ready": (
             "该问题已识别到所属业务，但对应数据适配尚未就绪。",
@@ -1297,14 +1297,40 @@ def build_public_rca_result(contract: Mapping[str, Any]) -> dict[str, Any]:
             causal_text = text
         elif role == "证据" and not evidence_text:
             evidence_text = text
-    if not causal_text:
-        hypotheses = causal.get("hypotheses")
-        if isinstance(hypotheses, list):
-            for item in hypotheses:
-                if isinstance(item, Mapping):
-                    causal_text = _public_first_text(item.get("narrative"), item.get("text"), item.get("summary"), limit=1000)
-                    if causal_text:
-                        break
+    hypotheses = causal.get("hypotheses")
+    hypotheses = hypotheses if isinstance(hypotheses, list) else []
+    structured_evidence: list[str] = []
+    hypothesis_claim = ""
+    for item in hypotheses:
+        if not isinstance(item, Mapping):
+            continue
+        if not hypothesis_claim:
+            hypothesis_claim = _public_first_text(
+                item.get("claim"), item.get("narrative"), item.get("text"), item.get("summary"),
+                limit=700,
+            )
+        supporting = item.get("supporting_evidence")
+        if not isinstance(supporting, list):
+            continue
+        for evidence_item in supporting[:4]:
+            if not isinstance(evidence_item, Mapping):
+                continue
+            detail = _public_first_text(
+                evidence_item.get("evidence"), evidence_item.get("summary"),
+                limit=420,
+            )
+            if not detail:
+                continue
+            name = _public_text(evidence_item.get("name"), limit=100).rstrip("。")
+            rendered = f"{name}：{detail}" if name else detail
+            if rendered not in structured_evidence:
+                structured_evidence.append(rendered)
+    if structured_evidence:
+        evidence_text = "；".join(structured_evidence)
+        if hypothesis_claim:
+            causal_text = f"{structured_evidence[0].rstrip('。')}，因此{hypothesis_claim}"
+    elif not causal_text and hypothesis_claim:
+        causal_text = hypothesis_claim
     if not causal_text:
         causal_text = fallback_causal_text
     if not evidence_text:
@@ -1357,10 +1383,10 @@ def build_public_rca_result(contract: Mapping[str, Any]) -> dict[str, Any]:
             marker in short
             for marker in ("自动RCA未归因", "当前问题域不在已验证", "已生成诊断报告")
         ):
-            conclusion = "当前问题域暂不在自动 RCA 覆盖范围内，不能形成确认归因。"
-            impact = "现有证据不足以对该问题域形成自动归因，已转人工分流。"
-            causal_boundary = "业务域识别 → 证据范围核验 → 当前域未覆盖 → 转人工分流。"
-            default_action = "请人工分流；补充该问题域的证据后再纳入自动 RCA。"
+            conclusion = "本次旧任务未进入功能证据分析，不能作为归因结果。"
+            impact = "问题数据尚未经过通用信号扫描和因果评测。"
+            causal_boundary = "任务在功能证据分析前结束，尚无可审核的缺陷因果链。"
+            default_action = "请由系统重新执行完整证据分析。"
             specific = impact
         elif not terminal_code and short:
             conclusion = short
@@ -1394,16 +1420,9 @@ def render_public_rca_result(contract: Mapping[str, Any]) -> str:
     result = build_public_rca_result(contract)
     lines = [
         f"归因结论：{result['conclusion']}",
-        f"责任候选：{result['responsibility']}",
-        f"因果链：{result['causal_chain']}",
+        f"责任模块：{result['responsibility']}",
+        f"因果关系：{result['causal_chain']}",
         f"关键证据：{result['evidence']}",
-        f"当前卡点/边界：{result['boundary']}",
-        f"下一步：{result['next_action']}",
-        (
-            "里程碑：数据读取 → 证据提取 → 候选归因 → 详细报告"
-            if result.get("attribution_ready")
-            else "里程碑：业务路由 → 数据校验 → 卡点确认 → 人工处理"
-        ),
     ]
     return "\n".join(_truncate_utf8(line, 1800) for line in lines)
 
@@ -1420,12 +1439,9 @@ def _render_terminal_user_result(code: str, detail: str = "") -> str:
     return "\n".join(
         (
             f"归因结论：{conclusion}",
-            "责任候选：暂无法判断。",
-            "因果链：暂无足够证据建立可确认的因果链。",
+            "责任模块：暂无法判断。",
+            "因果关系：暂无足够证据建立可确认的因果链。",
             f"关键证据：{impact}",
-            f"当前卡点/边界：{impact}",
-            f"下一步：{action}",
-            "里程碑：业务路由 → 数据校验 → 卡点确认 → 人工处理",
         )
     )
 

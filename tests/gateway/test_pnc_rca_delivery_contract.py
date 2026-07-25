@@ -368,8 +368,8 @@ def test_public_projection_humanizes_evaluator_and_responsibility_domain():
 
     rendered = render_public_rca_result(contract)
 
-    assert "责任候选：ACC 功能链" in rendered
-    assert "因果链：目标状态与减速度请求不匹配" in rendered
+    assert "责任模块：ACC 功能链" in rendered
+    assert "因果关系：目标状态与减速度请求不匹配" in rendered
     assert "decoded" not in rendered
     assert "evaluator" not in rendered
 
@@ -386,8 +386,9 @@ def test_public_projection_rejects_stale_pipeline_next_action():
 
     rendered = render_public_rca_result(contract)
 
-    assert "请补充发生了什么" in rendered
     assert "待受控远程读取" not in rendered
+    assert "下一步：" not in rendered
+    assert "里程碑：" not in rendered
 
 
 def test_public_projection_humanizes_legacy_success_wrapped_terminal_result():
@@ -402,9 +403,46 @@ def test_public_projection_humanizes_legacy_success_wrapped_terminal_result():
 
     rendered = render_public_rca_result(contract)
 
-    assert "当前问题域暂不在自动 RCA 覆盖范围内" in rendered
+    assert "本次旧任务未进入功能证据分析" in rendered
+    assert "问题域" not in rendered
     assert "自动RCA未归因" not in rendered
     assert "已生成诊断报告" not in rendered
+
+
+def test_public_projection_prefers_specific_causal_evidence_and_four_lines():
+    contract = {
+        "summary": {
+            "short_conclusion": "ACC 异常退出判据命中，建议核查 ACC 状态机/抑制标志。"
+        },
+        "report": {"candidate_owner_domain": "ACC"},
+        "public_result": {
+            "causal_chain": {
+                "hypotheses": [
+                    {
+                        "claim": "ACC 异常退出判据命中，建议核查 ACC 状态机/抑制标志。",
+                        "supporting_evidence": [
+                            {
+                                "name": "异常退出",
+                                "evidence": "STM_ACC_Mode 4/7/8 -> 2/9/10",
+                            }
+                        ],
+                    }
+                ]
+            }
+        },
+    }
+
+    rendered = render_public_rca_result(contract)
+
+    assert rendered.splitlines() == [
+        "归因结论：ACC 异常退出判据命中，建议核查 ACC 状态机/抑制标志。",
+        "责任模块：ACC 功能链",
+        (
+            "因果关系：异常退出：STM_ACC_Mode 4/7/8 -> 2/9/10，"
+            "因此ACC 异常退出判据命中，建议核查 ACC 状态机/抑制标志。"
+        ),
+        "关键证据：异常退出：STM_ACC_Mode 4/7/8 -> 2/9/10。",
+    ]
 
 
 def test_delivery_rejects_false_applied_consumer_capability():
