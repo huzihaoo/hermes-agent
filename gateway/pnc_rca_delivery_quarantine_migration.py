@@ -754,6 +754,23 @@ def _validate_combined_target_schema_contract(conn: sqlite3.Connection) -> None:
     )
 
 
+def validate_combined_target_schema(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Validate the complete combined-v9 target without mutating it."""
+
+    schema_version = _schema_version(conn)
+    if schema_version != COMBINED_TARGET_SCHEMA_VERSION:
+        raise QuarantineMigrationError(
+            "delivery_store_combined_migration_target_schema_invalid"
+        )
+    _validate_combined_target_schema_contract(conn)
+    health = _combined_database_health(conn)
+    return {
+        "schema_version": schema_version,
+        "canonical_object_count": len(_COMBINED_CANONICAL_V9_OBJECTS),
+        **health,
+    }
+
+
 def _expected_effects_v9_schema_sql(source_sql: str) -> str:
     scratch = sqlite3.connect(":memory:")
     try:

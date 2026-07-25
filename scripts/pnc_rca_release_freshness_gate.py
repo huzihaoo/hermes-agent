@@ -38,6 +38,11 @@ from gateway.pnc_rca_delivery_contract import (
     TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1,
     TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
 )
+from gateway.pnc_rca_delivery_quarantine_migration import (
+    COMBINED_TARGET_SCHEMA_VERSION,
+    QuarantineMigrationError,
+    validate_combined_target_schema,
+)
 
 
 WATCHDOG_LABEL = "local.pnc.watcher-staleness-watchdog"
@@ -598,6 +603,93 @@ def audit_unresolved_effect_schema_compatibility(
     return evidence, errors
 
 
+def audit_delivery_store_schema(
+    *, hermes_home: Path, control_db_path: Path | None = None
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    db_path = (
+        (
+            control_db_path
+            or hermes_home
+            / "runtime"
+            / "pnc_agent"
+            / "feishu_issue_kafka_rca"
+            / "control.sqlite3"
+        )
+        .expanduser()
+        .absolute()
+    )
+    evidence: dict[str, Any] = {
+        "control_db_path": str(db_path),
+        "read_mode": "ro+query_only",
+        "expected_schema_version": COMBINED_TARGET_SCHEMA_VERSION,
+        "observed_schema_version": "",
+        "schema_valid": False,
+        "errors": [],
+    }
+    errors: list[dict[str, Any]] = []
+    conn: sqlite3.Connection | None = None
+    try:
+        before = db_path.lstat()
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size <= 0
+        ):
+            raise OSError("delivery store path is not a single regular file")
+        uri = f"{db_path.as_uri()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=5, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only = ON")
+        conn.execute("BEGIN")
+        marker = conn.execute(
+            "SELECT value FROM rca_delivery_meta WHERE key = 'schema_version'"
+        ).fetchone()
+        evidence["observed_schema_version"] = (
+            str(marker["value"] or "") if marker is not None else ""
+        )
+        validation = validate_combined_target_schema(conn)
+        conn.rollback()
+        after = db_path.lstat()
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_nlink,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_nlink,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise OSError("delivery store changed during schema audit")
+    except (OSError, sqlite3.Error, QuarantineMigrationError) as exc:
+        if conn is not None and conn.in_transaction:
+            conn.rollback()
+        reason = (
+            exc.code
+            if isinstance(exc, QuarantineMigrationError)
+            else type(exc).__name__
+        )
+        evidence["errors"] = [reason]
+        errors.append(
+            _error("pnc_release_delivery_store_schema_not_current", reason=reason)
+        )
+        return evidence, errors
+    finally:
+        if conn is not None:
+            conn.close()
+    evidence.update(validation)
+    evidence["schema_valid"] = True
+    return evidence, errors
+
+
 def run_gate(*, home: Path, hermes_home: Path) -> dict[str, Any]:
     persisted, persisted_errors = audit_persisted_definitions(
         home=home, hermes_home=hermes_home
@@ -621,6 +713,9 @@ def run_gate(*, home: Path, hermes_home: Path) -> dict[str, Any]:
         hermes_home=hermes_home
     )
     stable_targets, stable_target_errors = audit_stable_targets(hermes_home=hermes_home)
+    delivery_store_schema, delivery_store_schema_errors = audit_delivery_store_schema(
+        hermes_home=hermes_home
+    )
     effect_schema_preflight, effect_schema_errors = (
         audit_unresolved_effect_schema_compatibility(hermes_home=hermes_home)
     )
@@ -633,6 +728,7 @@ def run_gate(*, home: Path, hermes_home: Path) -> dict[str, Any]:
         *stable_entrypoint_errors,
         *golden_errors,
         *stable_target_errors,
+        *delivery_store_schema_errors,
         *effect_schema_errors,
     ]
     return {
@@ -649,6 +745,7 @@ def run_gate(*, home: Path, hermes_home: Path) -> dict[str, Any]:
         "stable_entrypoints": stable_entrypoints,
         "golden_registry": golden_registry,
         "stable_targets": stable_targets,
+        "delivery_store_schema": delivery_store_schema,
         "effect_schema_preflight": effect_schema_preflight,
         "errors": errors,
     }

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import plistlib
@@ -10,6 +11,7 @@ import time
 from pathlib import Path
 
 from scripts import pnc_rca_release_freshness_gate as gate
+from gateway.pnc_rca_delivery_store import RcaDeliveryStore
 from scripts.pnc_live_exec import PNC_PYTHON_LAUNCHD_LABELS
 
 
@@ -347,6 +349,87 @@ def test_release_preflight_rejects_only_unresolved_incompatible_effects(
     assert evidence["unresolved_effect_count"] == 4
     assert evidence["incompatible_effect_count"] == 0
     assert errors == []
+
+
+def _delivery_store_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_release_preflight_accepts_complete_v9_delivery_store_without_writes(
+    tmp_path: Path,
+):
+    db_path = tmp_path / "control.sqlite3"
+    RcaDeliveryStore(db_path)
+    before_sha256 = _delivery_store_sha256(db_path)
+
+    evidence, errors = gate.audit_delivery_store_schema(
+        hermes_home=tmp_path,
+        control_db_path=db_path,
+    )
+
+    assert errors == []
+    assert evidence["schema_valid"] is True
+    assert evidence["observed_schema_version"] == "pnc_rca_delivery_store_v9"
+    assert evidence["quick_check"] == "ok"
+    assert evidence["integrity_check"] == "ok"
+    assert evidence["foreign_key_violation_count"] == 0
+    assert evidence["canonical_object_count"] > 0
+    assert _delivery_store_sha256(db_path) == before_sha256
+
+
+def test_release_preflight_rejects_v8_delivery_store_marker_without_writes(
+    tmp_path: Path,
+):
+    db_path = tmp_path / "control.sqlite3"
+    RcaDeliveryStore(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE rca_delivery_meta SET value = 'pnc_rca_delivery_store_v8' "
+            "WHERE key = 'schema_version'"
+        )
+    before_sha256 = _delivery_store_sha256(db_path)
+
+    evidence, errors = gate.audit_delivery_store_schema(
+        hermes_home=tmp_path,
+        control_db_path=db_path,
+    )
+
+    assert evidence["schema_valid"] is False
+    assert evidence["observed_schema_version"] == "pnc_rca_delivery_store_v8"
+    assert errors == [
+        {
+            "code": "pnc_release_delivery_store_schema_not_current",
+            "reason": "delivery_store_combined_migration_target_schema_invalid",
+        }
+    ]
+    assert _delivery_store_sha256(db_path) == before_sha256
+
+
+def test_release_preflight_rejects_missing_immutable_trigger_without_writes(
+    tmp_path: Path,
+):
+    db_path = tmp_path / "control.sqlite3"
+    RcaDeliveryStore(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DROP TRIGGER trg_rca_conclusion_adjudication_no_delete")
+    before_sha256 = _delivery_store_sha256(db_path)
+
+    evidence, errors = gate.audit_delivery_store_schema(
+        hermes_home=tmp_path,
+        control_db_path=db_path,
+    )
+
+    assert evidence["schema_valid"] is False
+    assert evidence["observed_schema_version"] == "pnc_rca_delivery_store_v9"
+    assert errors == [
+        {
+            "code": "pnc_release_delivery_store_schema_not_current",
+            "reason": (
+                "delivery_store_combined_migration_target_schema_contract_invalid"
+            ),
+        }
+    ]
+    assert _delivery_store_sha256(db_path) == before_sha256
 
 
 def test_process_evidence_reads_real_process_identity(tmp_path: Path):
