@@ -14,13 +14,17 @@ import stat
 from typing import Any, Literal, Mapping
 
 from gateway.pnc_rca_delivery_contract import (
+    DELIVERY_EFFECT_SCHEMA_VERSION,
     DELIVERY_EFFECT_KIND,
     MAX_FEISHU_COMMENT_BYTES,
     RCA_RESULT_FIELD_KEY,
     compute_delivery_effect_key,
     delivery_effect_marker,
 )
-from gateway.pnc_rca_quality_oracle import evaluate_structural_tier
+from gateway.pnc_rca_quality_oracle import (
+    CANDIDATE_HYPOTHESIS,
+    evaluate_structural_tier,
+)
 
 
 ADJUDICATION_SCHEMA_VERSION = "pnc_rca_conclusion_adjudication_v1"
@@ -78,6 +82,17 @@ class ConclusionAdjudicationResult:
     created_at: str
     impact_lineage: dict[str, Any]
     artifact_repair_status: str = "pending"
+
+
+@dataclass(frozen=True)
+class ConclusionReviewQueueItem:
+    business_key: str
+    generation: int
+    work_item_id: str
+    original_effect_key: str
+    conclusion: str
+    responsibility_domain: str
+    completed_at: str
 
 
 def _canonical_json(value: Any) -> str:
@@ -271,9 +286,10 @@ def validate_conclusion_adjudication_artifact_receipt(
         raise ConclusionAdjudicationError(
             "conclusion_adjudication_artifact_receipt_ledger_invalid"
         ) from exc
-    expected_action = {"retract": "撤回", "recognize": "通过"}.get(
-        str(adjudication.get("action") or ""), ""
-    )
+    expected_actions = {
+        "retract": {"撤回"},
+        "recognize": {"通过", "追认"},
+    }.get(str(adjudication.get("action") or ""), set())
     expected_verdict = {"retract": "retracted", "recognize": "approved"}.get(
         str(adjudication.get("action") or ""), ""
     )
@@ -305,7 +321,7 @@ def validate_conclusion_adjudication_artifact_receipt(
         or receipt.get("review_event_id") != expected_event_id
         or receipt.get("adjudication_id") != adjudication.get("adjudication_id")
         or receipt.get("issue_id") != adjudication.get("work_item_id")
-        or receipt.get("action") != expected_action
+        or receipt.get("action") not in expected_actions
         or receipt.get("verdict") != expected_verdict
         or receipt.get("reason") != adjudication.get("reason")
         or receipt.get("owner_id") != adjudication.get("actor_id")
@@ -666,19 +682,29 @@ def _adjudication_content(
     replacement_conclusion: str,
 ) -> tuple[str, str]:
     # Free-form owner input is internal audit evidence, never publication text.
-    del original_effect_key, reason, replacement_conclusion
-    if action != "retract":
+    del original_effect_key, reason
+    if action == "retract":
+        field_value = "原自动 RCA 结论已撤回并标记作废；不可作为定责依据。"
+        lines = [
+            marker,
+            "【RCA 更正】原自动分析结论已撤回并标记作废。",
+            f"问题：{work_item_id}",
+            "原结论不可作为定责依据；后续以重新复核后的结论为准。",
+            "更正依据已保留在内部不可变审计记录中。",
+        ]
+    elif action == "recognize":
+        field_value = replacement_conclusion
+        lines = [
+            marker,
+            "【RCA 追认】上一条候选结论已由 owner 确认。",
+            f"问题：{work_item_id}",
+            "已确认结论以本问题单上一条自动 RCA 候选评论为准。",
+            "确认依据已保留在内部不可变审计记录中。",
+        ]
+    else:
         raise ConclusionAdjudicationError(
-            "conclusion_adjudication_recognize_publication_contract_unavailable"
+            "conclusion_adjudication_action_invalid"
         )
-    field_value = "原自动 RCA 结论已撤回并标记作废；不可作为定责依据。"
-    lines = [
-        marker,
-        "【RCA 更正】原自动分析结论已撤回并标记作废。",
-        f"问题：{work_item_id}",
-        "原结论不可作为定责依据；后续以重新复核后的结论为准。",
-        "更正依据已保留在内部不可变审计记录中。",
-    ]
     content = "\n".join(lines)
     if len(content.encode("utf-8")) > MAX_FEISHU_COMMENT_BYTES:
         raise ConclusionAdjudicationError(
@@ -856,6 +882,110 @@ def _candidate_row(
     return rows[0]
 
 
+def _medium_review_material(row: sqlite3.Row) -> tuple[str, str]:
+    contract = _json_object(row["contract_json"], field="contract")
+    oracle = evaluate_structural_tier(contract)
+    payload = _json_object(row["payload_json"], field="original_effect_payload")
+    conclusion = _clean_text(
+        payload.get("conclusion"),
+        field="original_conclusion",
+        maximum=500,
+        required=True,
+    )
+    expected_identity = {
+        "schema_version": DELIVERY_EFFECT_SCHEMA_VERSION,
+        "effect_key": str(row["effect_key"]),
+        "delivery_id": str(row["delivery_id"]),
+        "target_key": str(row["target_key"]),
+        "project_key": str(row["project_key"]),
+        "work_item_type_key": str(row["work_item_type_key"]),
+        "work_item_id": str(row["work_item_id"]),
+        "terminal_class": CANDIDATE_HYPOTHESIS,
+        "confidence_tier": "medium",
+        "requires_human_review": True,
+    }
+    if (
+        oracle.terminal_class != CANDIDATE_HYPOTHESIS
+        or oracle.confidence_tier != "medium"
+        or any(payload.get(key) != value for key, value in expected_identity.items())
+    ):
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_medium_candidate_required"
+        )
+    responsibility = str(oracle.facts.responsibility or "").strip()
+    if not responsibility or responsibility.lower() == "unresolved":
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_responsibility_domain_unresolved"
+        )
+    return conclusion, responsibility
+
+
+def list_conclusion_review_queue_tx(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = 20,
+) -> tuple[ConclusionReviewQueueItem, ...]:
+    """Return recomputed, latest-generation medium candidates awaiting review."""
+
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+        raise ConclusionAdjudicationError(
+            "conclusion_adjudication_queue_limit_invalid"
+        )
+    rows = conn.execute(
+        """
+        SELECT j.*, e.effect_key, e.target_key, e.payload_json,
+               e.created_at AS effect_created_at,
+               e.completed_at AS effect_completed_at,
+               j.created_at AS job_created_at
+          FROM rca_delivery_jobs AS j
+          JOIN rca_delivery_effects AS e
+            ON e.delivery_id = j.delivery_id
+           AND e.effect_kind = 'feishu_issue_comment'
+           AND e.target_key = j.target_key
+     LEFT JOIN rca_conclusion_adjudications AS a
+            ON a.business_key = j.business_key
+         WHERE j.outcome = 'success'
+           AND e.status = 'succeeded'
+           AND e.write_phase = 'settled'
+           AND a.adjudication_id IS NULL
+           AND json_valid(e.payload_json)
+           AND json_extract(e.payload_json, '$.terminal_class') = ?
+           AND json_extract(e.payload_json, '$.confidence_tier') = 'medium'
+           AND json_extract(e.payload_json, '$.requires_human_review') = 1
+           AND NOT EXISTS (
+                SELECT 1
+                  FROM rca_delivery_jobs AS newer
+                 WHERE newer.business_key = j.business_key
+                   AND newer.outcome = 'success'
+                   AND newer.generation > j.generation
+           )
+         ORDER BY e.completed_at, j.work_item_id, e.effect_key
+         LIMIT 2000
+        """,
+        (CANDIDATE_HYPOTHESIS,),
+    ).fetchall()
+    items: list[ConclusionReviewQueueItem] = []
+    for row in rows:
+        try:
+            conclusion, responsibility = _medium_review_material(row)
+        except ConclusionAdjudicationError:
+            continue
+        items.append(
+            ConclusionReviewQueueItem(
+                business_key=str(row["business_key"]),
+                generation=int(row["generation"]),
+                work_item_id=str(row["work_item_id"]),
+                original_effect_key=str(row["effect_key"]),
+                conclusion=conclusion,
+                responsibility_domain=responsibility,
+                completed_at=str(row["effect_completed_at"] or ""),
+            )
+        )
+        if len(items) >= limit:
+            break
+    return tuple(items)
+
+
 def record_conclusion_adjudication_tx(
     conn: sqlite3.Connection,
     *,
@@ -867,6 +997,7 @@ def record_conclusion_adjudication_tx(
     source: Mapping[str, Any],
     replacement_conclusion: str = "",
     original_effect_key: str = "",
+    require_medium_candidate: bool = False,
     now: datetime | None = None,
 ) -> ConclusionAdjudicationResult:
     """Invalidate or recognize one published conclusion in the caller transaction."""
@@ -884,9 +1015,9 @@ def record_conclusion_adjudication_tx(
     normalized_action = str(action or "").strip()
     if normalized_action not in ADJUDICATION_ACTIONS:
         raise ConclusionAdjudicationError("conclusion_adjudication_action_invalid")
-    if normalized_action == "recognize":
+    if not isinstance(require_medium_candidate, bool):
         raise ConclusionAdjudicationError(
-            "conclusion_adjudication_recognize_publication_contract_unavailable"
+            "conclusion_adjudication_medium_requirement_invalid"
         )
     normalized_reason = _clean_text(
         reason, field="reason", maximum=300, required=True
@@ -901,7 +1032,7 @@ def record_conclusion_adjudication_tx(
         replacement_conclusion,
         field="replacement_conclusion",
         maximum=500,
-        required=normalized_action == "recognize",
+        required=False,
     )
     if normalized_action == "retract" and normalized_replacement:
         raise ConclusionAdjudicationError(
@@ -919,6 +1050,15 @@ def record_conclusion_adjudication_tx(
         work_item_id=issue_id,
         original_effect_key=normalized_original_effect,
     )
+    candidate_conclusion = ""
+    if normalized_action == "recognize" or require_medium_candidate:
+        candidate_conclusion, _responsibility = _medium_review_material(row)
+    if normalized_action == "recognize":
+        if normalized_replacement and normalized_replacement != candidate_conclusion:
+            raise ConclusionAdjudicationError(
+                "conclusion_adjudication_recognition_replacement_invalid"
+            )
+        normalized_replacement = candidate_conclusion
     lineage = _impact_lineage(row)
     adjudication_id = _stable_key(
         ADJUDICATION_ID_PREFIX,
@@ -1147,17 +1287,13 @@ def validate_adjudication_effect_claim(
         raise ConclusionAdjudicationError(
             "conclusion_adjudication_effect_action_invalid"
         )
-    if action == "recognize":
-        raise ConclusionAdjudicationError(
-            "conclusion_adjudication_recognize_publication_contract_unavailable"
-        )
     reason = _clean_text(
         payload.get("reason"), field="reason", maximum=300, required=True
     )
-    actor_id = _clean_text(
+    _clean_text(
         payload.get("actor_id"), field="actor_id", maximum=160, required=True
     )
-    actor_name = _clean_text(
+    _clean_text(
         payload.get("actor_name"), field="actor_name", maximum=160, required=False
     )
     replacement = _clean_text(
@@ -1170,7 +1306,7 @@ def validate_adjudication_effect_claim(
         raise ConclusionAdjudicationError(
             "conclusion_adjudication_retraction_replacement_invalid"
         )
-    activation_epoch_id = _clean_text(
+    _clean_text(
         payload.get("activation_epoch_id"),
         field="activation_epoch_id",
         maximum=160,

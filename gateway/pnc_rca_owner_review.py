@@ -30,9 +30,12 @@ LEDGER_SCHEMA_VERSION = "g1q3_rca_owner_review_ledger_v1"
 REVIEW_SCHEMA_VERSION = "g1q3_rca_owner_review_v1"
 
 _COMMAND_RE = re.compile(
-    r"^(?:rca|RCA)\s+(通过|驳回|补证据|撤回)\s+(\d+)(?:\s+(.*))?$",
+    r"^(?:rca|RCA)\s+(通过|驳回|补证据|撤回|追认|更正)\s+"
+    r"(\d+(?:\s*[,，]\s*\d+)*)(?:\s+(.*))?$",
     re.DOTALL,
 )
+_QUEUE_RE = re.compile(r"^(?:rca|RCA)\s+(?:待追认|队列)\s*$")
+_MAX_BATCH_SIZE = 50
 
 
 @dataclass(frozen=True)
@@ -103,9 +106,22 @@ def _handle_owner_review_message(
         return OwnerReviewResult(handled=True, response="你不在 G1Q3 RCA owner review allowlist 中，本次不写入 ledger。")
 
     action = str(parsed["action"])
-    issue_id = str(parsed["issue_id"])
+    issue_ids = tuple(str(item) for item in parsed.get("issue_ids") or ())
+    issue_id = str(parsed.get("issue_id") or "")
     reason = str(parsed.get("reason") or "").strip()
     override = bool(parsed.get("override"))
+    if action == "待追认":
+        return _handle_review_queue(hermes_home=Path(hermes_home))
+    if action in {"追认", "更正"}:
+        return _handle_w13_adjudication(
+            event=event,
+            hermes_home=Path(hermes_home),
+            issue_ids=issue_ids,
+            requested_action=action,
+            reason=reason,
+            owner_id=owner_id,
+            owner_name=owner_name,
+        )
     if action in {"驳回", "补证据", "撤回"} and not reason:
         return OwnerReviewResult(handled=True, response=f"{action} 必须填写理由。格式：rca {action} {issue_id} <理由>")
 
@@ -218,6 +234,135 @@ def _handle_owner_review_message(
     )
 
 
+def _handle_review_queue(*, hermes_home: Path) -> OwnerReviewResult:
+    from gateway.pnc_rca_delivery_store import RcaDeliveryStore
+
+    control_db_path = (
+        hermes_home
+        / "runtime"
+        / "pnc_agent"
+        / "feishu_issue_kafka_rca"
+        / "control.sqlite3"
+    )
+    try:
+        store = RcaDeliveryStore(control_db_path, require_current=True)
+        items = store.list_conclusion_review_queue(limit=10)
+    except Exception as exc:
+        return OwnerReviewResult(
+            handled=True,
+            response=f"RCA 待追认队列不可用：{exc}",
+        )
+    if not items:
+        return OwnerReviewResult(handled=True, response="RCA 待追认队列为空。")
+    lines = [f"RCA 待追认队列（{len(items)}）："]
+    for item in items:
+        conclusion = item.conclusion
+        if len(conclusion) > 80:
+            conclusion = conclusion[:77] + "..."
+        lines.append(
+            f"- {item.work_item_id} / gen {item.generation} / {conclusion}"
+        )
+    lines.append("回复：rca 追认 <issue_id[,issue_id...]> [理由]；错误结论用 rca 更正 <issue_id> <理由>。")
+    return OwnerReviewResult(handled=True, response="\n".join(lines))
+
+
+def _handle_w13_adjudication(
+    *,
+    event: Any,
+    hermes_home: Path,
+    issue_ids: tuple[str, ...],
+    requested_action: str,
+    reason: str,
+    owner_id: str,
+    owner_name: str,
+) -> OwnerReviewResult:
+    from gateway.pnc_rca_delivery_store import RcaDeliveryStore
+
+    if requested_action == "更正" and not reason:
+        return OwnerReviewResult(
+            handled=True,
+            response="更正必须填写理由。格式：rca 更正 <issue_id> <理由>",
+        )
+    if not issue_ids:
+        return OwnerReviewResult(handled=True, response=_usage_message())
+    adjudication_action = "recognize" if requested_action == "追认" else "retract"
+    artifact_action = "追认" if requested_action == "追认" else "撤回"
+    audit_reason = reason or "owner_confirmed_medium_confidence_candidate"
+    control_db_path = (
+        hermes_home
+        / "runtime"
+        / "pnc_agent"
+        / "feishu_issue_kafka_rca"
+        / "control.sqlite3"
+    )
+    now = datetime.now(timezone.utc)
+    try:
+        store = RcaDeliveryStore(control_db_path, require_current=True)
+        results = store.record_conclusion_adjudications(
+            work_item_ids=issue_ids,
+            action=adjudication_action,
+            reason=audit_reason,
+            actor_id=owner_id,
+            actor_name=owner_name,
+            source=_source_record(event),
+            require_medium_candidate=True,
+            now=now,
+        )
+    except Exception as exc:
+        return OwnerReviewResult(
+            handled=True,
+            response=f"RCA {requested_action}未执行：{exc}",
+        )
+
+    review_dir = hermes_home / "pnc_agent" / "reviews" / "g1q3_rca"
+    artifact_failures: list[str] = []
+    for result in results:
+        try:
+            persisted = _persist_owner_review_artifacts(
+                event=event,
+                hermes_home=hermes_home,
+                review_dir=review_dir,
+                issue_id=result.work_item_id,
+                action=artifact_action,
+                reason=audit_reason,
+                owner_id=owner_id,
+                owner_name=owner_name,
+                override=True,
+                adjudication_result=result,
+                now=now,
+            )
+            store.mark_conclusion_adjudication_artifact_repair(
+                adjudication_id=result.adjudication_id,
+                succeeded=True,
+                receipt_binding=persisted["receipt_binding"],
+                now=now,
+            )
+        except Exception as exc:
+            artifact_failures.append(result.work_item_id)
+            try:
+                store.mark_conclusion_adjudication_artifact_repair(
+                    adjudication_id=result.adjudication_id,
+                    succeeded=False,
+                    error_code=type(exc).__name__,
+                    error_detail=str(exc),
+                    now=now,
+                )
+            except Exception:
+                pass
+    if artifact_failures:
+        return OwnerReviewResult(
+            handled=True,
+            response=(
+                f"RCA {requested_action}已提交 {len(results)} 单；"
+                f"{len(artifact_failures)} 单审计材料待修复。"
+            ),
+        )
+    return OwnerReviewResult(
+        handled=True,
+        response=f"RCA {requested_action}已完成 {len(results)} 单。",
+    )
+
+
 def _is_g1q3_bound_group_source(source: Any) -> bool:
     from gateway.pnc_group_binding import is_g1q3_rca_bound_chat, _is_feishu
 
@@ -227,12 +372,40 @@ def _is_g1q3_bound_group_source(source: Any) -> bool:
 def _parse_command(text: str) -> dict[str, Any] | None:
     if not (text.startswith("rca ") or text.startswith("RCA ")):
         return None
+    if _QUEUE_RE.match(text.strip()):
+        return {
+            "valid": True,
+            "action": "待追认",
+            "issue_id": "",
+            "issue_ids": (),
+            "reason": "",
+            "override": False,
+        }
     match = _COMMAND_RE.match(text.strip())
     if not match:
         return {"valid": False}
-    action, issue_id, tail = match.groups()
+    action, raw_issue_ids, tail = match.groups()
+    issue_ids = tuple(
+        item.strip()
+        for item in re.split(r"[,，]", raw_issue_ids)
+        if item.strip()
+    )
+    if (
+        not issue_ids
+        or len(issue_ids) > _MAX_BATCH_SIZE
+        or len(set(issue_ids)) != len(issue_ids)
+        or (len(issue_ids) > 1 and action not in {"追认", "更正"})
+    ):
+        return {"valid": False}
     reason, override = _extract_reason_and_override(tail or "")
-    return {"valid": True, "action": action, "issue_id": issue_id, "reason": reason, "override": override}
+    return {
+        "valid": True,
+        "action": action,
+        "issue_id": issue_ids[0],
+        "issue_ids": issue_ids,
+        "reason": reason,
+        "override": override,
+    }
 
 
 def _extract_reason_and_override(tail: str) -> tuple[str, bool]:
@@ -272,6 +445,7 @@ def _is_allowed_owner(*, owner_id: str, owner_name: str, owners: OwnerAllowlist)
 def _verdict_for_action(action: str) -> str:
     return {
         "通过": "approved",
+        "追认": "approved",
         "驳回": "rejected",
         "补证据": "need_evidence",
         "撤回": "retracted",
@@ -419,7 +593,11 @@ def _persist_owner_review_artifacts(
 
 
 def _usage_message() -> str:
-    return "格式：rca <通过|驳回|补证据|撤回> <issue_id数字> [理由] [覆盖]；驳回/补证据/撤回理由必填。"
+    return (
+        "格式：rca <通过|驳回|补证据|撤回|追认|更正> "
+        "<issue_id数字[,issue_id...]> [理由] [覆盖]；"
+        "驳回/补证据/撤回/更正理由必填；队列查询用 rca 待追认。"
+    )
 
 
 def _write_ledger(*, review_dir: Path, issue_id: str, record: dict[str, Any], override: bool) -> dict[str, Any]:

@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 import sqlite3
 import stat
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping, Sequence
 import uuid
 
 from gateway.pnc_rca_delivery_contract import (
@@ -36,8 +36,10 @@ from gateway.pnc_rca_conclusion_adjudication import (
     ADJUDICATION_EFFECT_SCHEMA_VERSION,
     ConclusionAdjudicationError,
     ConclusionAdjudicationResult,
+    ConclusionReviewQueueItem,
     ensure_conclusion_adjudication_schema,
     identifies_adjudication_effect,
+    list_conclusion_review_queue_tx,
     record_conclusion_adjudication_tx,
     validate_conclusion_adjudication_artifact_receipt,
     validate_adjudication_effect_ledger_binding,
@@ -1840,6 +1842,70 @@ class RcaDeliveryStore:
             )
             conn.commit()
             return result
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def list_conclusion_review_queue(
+        self,
+        *,
+        limit: int = 20,
+    ) -> tuple[ConclusionReviewQueueItem, ...]:
+        """List recomputed medium-confidence conclusions awaiting owner review."""
+
+        uri = f"{self.db_path.resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA query_only=ON")
+            return list_conclusion_review_queue_tx(conn, limit=limit)
+        finally:
+            conn.close()
+
+    def record_conclusion_adjudications(
+        self,
+        *,
+        work_item_ids: Sequence[str],
+        action: Literal["retract", "recognize"],
+        reason: str,
+        actor_id: str,
+        actor_name: str = "",
+        source: Mapping[str, Any],
+        require_medium_candidate: bool = True,
+        now: datetime | None = None,
+    ) -> tuple[ConclusionAdjudicationResult, ...]:
+        """Atomically record one bounded batch of owner adjudications."""
+
+        issue_ids = tuple(str(item or "").strip() for item in work_item_ids)
+        if (
+            not issue_ids
+            or len(issue_ids) > 50
+            or len(set(issue_ids)) != len(issue_ids)
+        ):
+            raise ConclusionAdjudicationError(
+                "conclusion_adjudication_batch_invalid"
+            )
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            results = tuple(
+                record_conclusion_adjudication_tx(
+                    conn,
+                    work_item_id=work_item_id,
+                    action=action,
+                    reason=reason,
+                    actor_id=actor_id,
+                    actor_name=actor_name,
+                    source=source,
+                    require_medium_candidate=require_medium_candidate,
+                    now=now,
+                )
+                for work_item_id in issue_ids
+            )
+            conn.commit()
+            return results
         except Exception:
             conn.rollback()
             raise

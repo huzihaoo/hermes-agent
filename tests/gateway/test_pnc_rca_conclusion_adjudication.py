@@ -17,6 +17,7 @@ from gateway.pnc_rca_conclusion_adjudication import (
     ADJUDICATION_EFFECT_TARGET_PREFIX,
     ConclusionAdjudicationError,
     identifies_adjudication_effect,
+    validate_adjudication_effect_claim,
 )
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
@@ -75,12 +76,31 @@ def _seed_published_conclusion(tmp_path) -> RcaDeliveryStore:
             "candidate": "PERCEPTION_LANE",
             "responsibility": {"status": "candidate"},
             "summary": {"short_conclusion": "候选结论：感知车道线责任域"},
+            "causal_chain": {
+                "narrative": [
+                    {"role": "现象", "text": "车辆横向控制异常。"},
+                    {"role": "证据", "text": "车道线质量判据命中。"},
+                    {
+                        "role": "因果判断",
+                        "text": "候选结论：感知车道线责任域",
+                    },
+                ]
+            },
         },
     }
     manifest = {"submission_key": submission_key}
     payload = {
         "schema_version": DELIVERY_EFFECT_SCHEMA_VERSION,
+        "effect_key": ORIGINAL_EFFECT_KEY,
+        "delivery_id": delivery_id,
+        "target_key": target_key,
+        "project_key": "t03o4q",
+        "work_item_type_key": "issue",
+        "work_item_id": ISSUE_ID,
         "conclusion": "候选结论：感知车道线责任域",
+        "terminal_class": "candidate_hypothesis",
+        "confidence_tier": "medium",
+        "requires_human_review": True,
     }
     with sqlite3.connect(store.db_path) as conn:
         conn.execute("PRAGMA foreign_keys=OFF")
@@ -172,6 +192,112 @@ def _seed_published_conclusion(tmp_path) -> RcaDeliveryStore:
             ),
         )
     return store
+
+
+def _add_published_conclusion(store: RcaDeliveryStore, issue_id: str) -> None:
+    digest = hashlib.sha256(issue_id.encode("ascii")).hexdigest()
+    delivery_id = "g1q3-rca-delivery-v1-" + digest
+    submission_key = "g1q3-rca-s1-" + hashlib.sha256(
+        f"submission:{issue_id}".encode("ascii")
+    ).hexdigest()
+    business_key = "g1q3-rca-b1-" + hashlib.sha256(
+        f"business:{issue_id}".encode("ascii")
+    ).hexdigest()
+    artifact_set_id = "g1q3-rca-artifact-v1-" + hashlib.sha256(
+        f"artifact:{issue_id}".encode("ascii")
+    ).hexdigest()
+    target_key = "g1q3-rca-target-v1-" + hashlib.sha256(
+        f"target:{issue_id}".encode("ascii")
+    ).hexdigest()
+    effect_key = "g1q3-rca-effect-v1-" + hashlib.sha256(
+        f"effect:{issue_id}".encode("ascii")
+    ).hexdigest()
+    current = NOW.isoformat()
+    with sqlite3.connect(store.db_path) as conn:
+        template = conn.execute(
+            "SELECT contract_json FROM rca_delivery_jobs LIMIT 1"
+        ).fetchone()[0]
+        contract = json.loads(template)
+        conclusion = f"候选结论：{issue_id} 感知车道线责任域"
+        contract["public_result"]["summary"]["short_conclusion"] = conclusion
+        contract["public_result"]["causal_chain"]["narrative"][-1][
+            "text"
+        ] = conclusion
+        payload = {
+            "schema_version": DELIVERY_EFFECT_SCHEMA_VERSION,
+            "effect_key": effect_key,
+            "delivery_id": delivery_id,
+            "target_key": target_key,
+            "project_key": "t03o4q",
+            "work_item_type_key": "issue",
+            "work_item_id": issue_id,
+            "conclusion": conclusion,
+            "terminal_class": "candidate_hypothesis",
+            "confidence_tier": "medium",
+            "requires_human_review": True,
+        }
+        conn.execute(
+            """
+            INSERT INTO rca_delivery_jobs(
+                delivery_id, submission_key, business_key, generation,
+                artifact_set_id, project_key, work_item_type_key, work_item_id,
+                target_key, issue_url, report_url, outcome, status,
+                manifest_json, contract_json, artifacts_json, created_at, updated_at
+            ) VALUES (?, ?, ?, 7, ?, 't03o4q', 'issue', ?, ?, ?, ?, 'success',
+                      'delivered', ?, ?, '[]', ?, ?)
+            """,
+            (
+                delivery_id,
+                submission_key,
+                business_key,
+                artifact_set_id,
+                issue_id,
+                target_key,
+                f"https://project.feishu.cn/g1q3/issue/detail/{issue_id}",
+                f"https://reports.example/G1Q3_RCA/cases/{issue_id}/index.html",
+                json.dumps({"submission_key": submission_key}),
+                json.dumps(contract),
+                current,
+                current,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO rca_delivery_effects(
+                effect_key, delivery_id, effect_kind, required, target_key,
+                payload_json, payload_sha256, outcome, write_phase, status,
+                completed_at, created_at, updated_at
+            ) VALUES (?, ?, 'feishu_issue_comment', 1, ?, ?, ?, 'success',
+                      'settled', 'succeeded', ?, ?, ?)
+            """,
+            (
+                effect_key,
+                delivery_id,
+                target_key,
+                json.dumps(payload),
+                hashlib.sha256(json.dumps(payload).encode()).hexdigest(),
+                current,
+                current,
+                current,
+            ),
+        )
+
+
+def _owner_event(text: str, *, message_id: str) -> MessageEvent:
+    return MessageEvent(
+        text=text,
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.FEISHU,
+            user_id="ou_owner",
+            user_name="RCA Owner",
+            chat_id=G1Q3_RCA_GROUP_ID,
+            chat_name="G1Q3 RCA",
+            chat_type="group",
+            thread_id="topic:om_owner_root",
+        ),
+        message_id=message_id,
+    )
 
 
 def _record_retraction(store: RcaDeliveryStore, *, reason: str = "证据归属有误"):
@@ -423,29 +549,279 @@ def test_retraction_publication_never_echoes_free_form_owner_reason(
     assert "更正依据已保留在内部不可变审计记录中" in publication
 
 
-def test_recognize_fails_closed_without_validated_publication_contract(tmp_path):
+def test_recognize_medium_candidate_enqueues_confirmation_without_echoing_reason(
+    tmp_path,
+):
     store = _seed_published_conclusion(tmp_path)
 
+    result = store.record_conclusion_adjudication(
+        work_item_id=ISSUE_ID,
+        action="recognize",
+        reason="owner reviewed internal evidence",
+        actor_id="ou_owner",
+        actor_name="RCA Owner",
+        source={
+            "platform": "feishu",
+            "chat_id": "oc_g1q3",
+            "thread_id": "topic:om_root",
+            "message_id": "om_recognize",
+        },
+        now=NOW,
+    )
+
+    assert result.conclusion_state == "recognized"
+    [adjudication] = store.list_rows("rca_conclusion_adjudications")
+    assert adjudication["replacement_conclusion"] == "候选结论：感知车道线责任域"
+    effect = next(
+        row
+        for row in store.list_rows("rca_delivery_effects")
+        if row["effect_key"] == result.correction_effect_key
+    )
+    payload = json.loads(effect["payload_json"])
+    publication = payload["comment_content"] + "\n" + "\n".join(
+        update["field_value"] for update in payload["field_updates"]
+    )
+    assert "【RCA 追认】" in publication
+    assert "候选结论：感知车道线责任域" in publication
+    assert "owner reviewed internal evidence" not in publication
+    claim = store.claim_due_effect(
+        lease_owner="recognition-contract",
+        lease_seconds=120,
+        now=NOW,
+        activation_required=False,
+    )
+    assert claim is not None and claim.effect_key == result.correction_effect_key
+    marker, content, updates = validate_adjudication_effect_claim(claim)
+    assert marker == payload["marker"]
+    assert content == payload["comment_content"]
+    assert updates == ((RCA_RESULT_FIELD_KEY, "候选结论：感知车道线责任域"),)
+
+
+def test_review_queue_and_recognition_reject_non_medium_effect(tmp_path):
+    store = _seed_published_conclusion(tmp_path)
+    [item] = store.list_conclusion_review_queue()
+    assert item.work_item_id == ISSUE_ID
+    assert item.conclusion == "候选结论：感知车道线责任域"
+
+    with sqlite3.connect(store.db_path) as conn:
+        payload = json.loads(
+            conn.execute(
+                "SELECT payload_json FROM rca_delivery_effects"
+            ).fetchone()[0]
+        )
+        payload["requires_human_review"] = False
+        conn.execute(
+            "UPDATE rca_delivery_effects SET payload_json = ?",
+            (json.dumps(payload),),
+        )
+
+    assert store.list_conclusion_review_queue() == ()
     with pytest.raises(
         ConclusionAdjudicationError,
-        match=(
-            "conclusion_adjudication_recognize_"
-            "publication_contract_unavailable"
-        ),
+        match="conclusion_adjudication_medium_candidate_required",
     ):
         store.record_conclusion_adjudication(
             work_item_id=ISSUE_ID,
             action="recognize",
-            reason="问题单缺少问题数据地址",
-            replacement_conclusion="请核对问题数据地址",
+            reason="must remain medium only",
             actor_id="ou_owner",
-            actor_name="RCA Owner",
-            source={"platform": "feishu", "chat_id": "oc_g1q3"},
+            source={
+                "platform": "feishu",
+                "chat_id": "oc_g1q3",
+                "thread_id": "topic:om_root",
+                "message_id": "om_recognize",
+            },
+            now=NOW,
+        )
+    assert store.list_rows("rca_conclusion_adjudications") == []
+
+
+def test_recognition_cannot_replace_or_inject_a_different_conclusion(tmp_path):
+    store = _seed_published_conclusion(tmp_path)
+
+    with pytest.raises(
+        ConclusionAdjudicationError,
+        match="conclusion_adjudication_recognition_replacement_invalid",
+    ):
+        store.record_conclusion_adjudication(
+            work_item_id=ISSUE_ID,
+            action="recognize",
+            reason="attempted replacement",
+            replacement_conclusion="different owner-authored conclusion",
+            actor_id="ou_owner",
+            source={
+                "platform": "feishu",
+                "chat_id": "oc_g1q3",
+                "thread_id": "topic:om_root",
+                "message_id": "om_recognize",
+            },
             now=NOW,
         )
 
     assert store.list_rows("rca_conclusion_adjudications") == []
     assert len(store.list_rows("rca_delivery_effects")) == 1
+
+
+def test_batch_recognition_of_five_is_atomic_and_drains_queue(tmp_path):
+    store = _seed_published_conclusion(tmp_path)
+    issue_ids = (ISSUE_ID, "7054691975", "7054691976", "7054691977", "7054691978")
+    for issue_id in issue_ids[1:]:
+        _add_published_conclusion(store, issue_id)
+
+    assert {item.work_item_id for item in store.list_conclusion_review_queue()} == set(
+        issue_ids
+    )
+    results = store.record_conclusion_adjudications(
+        work_item_ids=issue_ids,
+        action="recognize",
+        reason="batch owner recognition",
+        actor_id="ou_owner",
+        actor_name="RCA Owner",
+        source={
+            "platform": "feishu",
+            "chat_id": "oc_g1q3",
+            "thread_id": "topic:om_batch",
+            "message_id": "om_batch",
+        },
+        now=NOW,
+    )
+
+    assert len(results) == 5
+    assert all(result.conclusion_state == "recognized" for result in results)
+    assert len(store.list_rows("rca_conclusion_adjudications")) == 5
+    assert len(store.list_rows("rca_delivery_effects")) == 10
+    assert store.list_conclusion_review_queue() == ()
+
+
+@pytest.mark.parametrize("action", ["recognize", "retract"])
+def test_batch_review_rolls_back_all_when_one_item_is_not_medium(
+    tmp_path, action
+):
+    store = _seed_published_conclusion(tmp_path)
+    other_issue_id = "7054691975"
+    _add_published_conclusion(store, other_issue_id)
+    with sqlite3.connect(store.db_path) as conn:
+        row = conn.execute(
+            "SELECT effect_key, payload_json FROM rca_delivery_effects "
+            "WHERE json_extract(payload_json, '$.work_item_id') = ?",
+            (other_issue_id,),
+        ).fetchone()
+        payload = json.loads(row[1])
+        payload["requires_human_review"] = False
+        conn.execute(
+            "UPDATE rca_delivery_effects SET payload_json = ? WHERE effect_key = ?",
+            (json.dumps(payload), row[0]),
+        )
+
+    with pytest.raises(
+        ConclusionAdjudicationError,
+        match="conclusion_adjudication_medium_candidate_required",
+    ):
+        store.record_conclusion_adjudications(
+            work_item_ids=(ISSUE_ID, other_issue_id),
+            action=action,
+            reason="must be all or nothing",
+            actor_id="ou_owner",
+            source={
+                "platform": "feishu",
+                "chat_id": "oc_g1q3",
+                "thread_id": "topic:om_batch",
+                "message_id": "om_batch",
+            },
+            now=NOW,
+        )
+
+    assert store.list_rows("rca_conclusion_adjudications") == []
+    assert len(store.list_rows("rca_delivery_effects")) == 2
+
+
+def test_owner_group_batch_recognition_closes_five_item_queue(
+    tmp_path, monkeypatch
+):
+    control_dir = (
+        tmp_path
+        / "runtime"
+        / "pnc_agent"
+        / "feishu_issue_kafka_rca"
+    )
+    control_dir.mkdir(parents=True)
+    store = _seed_published_conclusion(control_dir)
+    issue_ids = (ISSUE_ID, "7054691975", "7054691976", "7054691977", "7054691978")
+    for issue_id in issue_ids[1:]:
+        _add_published_conclusion(store, issue_id)
+    monkeypatch.setenv("HERMES_G1Q3_REVIEW_OWNER_USER_IDS", "ou_owner")
+
+    queue = handle_owner_review_message(
+        _owner_event("rca 待追认", message_id="om_queue"),
+        hermes_home=tmp_path,
+    )
+    result = handle_owner_review_message(
+        _owner_event(
+            "rca 追认 " + ",".join(issue_ids) + " owner batch confirmed",
+            message_id="om_batch_recognize",
+        ),
+        hermes_home=tmp_path,
+    )
+
+    assert queue.handled is True
+    assert all(issue_id in str(queue.response) for issue_id in issue_ids)
+    assert result.response == "RCA 追认已完成 5 单。"
+    assert len(store.list_rows("rca_conclusion_adjudications")) == 5
+    assert {
+        row["action"] for row in store.list_rows("rca_conclusion_adjudications")
+    } == {"recognize"}
+    with sqlite3.connect(store.db_path) as conn:
+        repairs = conn.execute(
+            "SELECT status FROM rca_conclusion_adjudication_repairs"
+        ).fetchall()
+    assert {row[0] for row in repairs} == {"succeeded"}
+    ledger = json.loads(
+        (
+            tmp_path
+            / "pnc_agent"
+            / "reviews"
+            / "g1q3_rca"
+            / "ledger.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert {
+        entry["current"]["action"] for entry in ledger["issues"].values()
+    } == {"追认"}
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    audit = audit_conclusion_adjudications(store.db_path)
+    assert audit["ok"] is True
+    assert audit["counts"]["recognized"] == 5
+
+
+def test_owner_group_correction_alias_reuses_medium_only_retraction(
+    tmp_path, monkeypatch
+):
+    control_dir = (
+        tmp_path
+        / "runtime"
+        / "pnc_agent"
+        / "feishu_issue_kafka_rca"
+    )
+    control_dir.mkdir(parents=True)
+    store = _seed_published_conclusion(control_dir)
+    monkeypatch.setenv("HERMES_G1Q3_REVIEW_OWNER_USER_IDS", "ou_owner")
+
+    result = handle_owner_review_message(
+        _owner_event(
+            f"rca 更正 {ISSUE_ID} owner evidence disproved candidate",
+            message_id="om_correct",
+        ),
+        hermes_home=tmp_path,
+    )
+
+    assert result.response == "RCA 更正已完成 1 单。"
+    [adjudication] = store.list_rows("rca_conclusion_adjudications")
+    assert adjudication["action"] == "retract"
+    repair = store.conclusion_adjudication_artifact_repair(
+        adjudication["adjudication_id"]
+    )
+    assert repair is not None and repair["status"] == "succeeded"
 
 
 @pytest.mark.parametrize(
@@ -1110,6 +1486,63 @@ def test_candidate_retract_correction_dispatches_one_budgeted_comment(tmp_path):
     assert fields[RCA_RESULT_FIELD_KEY].startswith("原自动 RCA 结论已撤回")
     [job] = store.list_rows("rca_delivery_jobs")
     assert job["status"] == "delivered"
+
+
+def test_medium_recognition_dispatches_one_confirmation_comment(tmp_path):
+    store = _seed_published_conclusion(tmp_path)
+    result = store.record_conclusion_adjudication(
+        work_item_id=ISSUE_ID,
+        action="recognize",
+        reason="owner confirmed internal evidence",
+        actor_id="ou_owner",
+        actor_name="RCA Owner",
+        source={
+            "platform": "feishu",
+            "chat_id": "oc_g1q3",
+            "thread_id": "topic:om_root",
+            "message_id": "om_recognize",
+        },
+        now=NOW,
+    )
+    comments = [
+        {
+            "remote_id": "original-comment",
+            "content": "[RCA_DELIVERY:original] candidate conclusion",
+        }
+    ]
+    fields = {RCA_RESULT_FIELD_KEY: "候选结论：感知车道线责任域"}
+
+    def list_comments(_project_key, _work_item_id):
+        return {"success": True, "comments": list(comments), "pages_read": 1}
+
+    def add_comment(_project_key, _work_item_id, content):
+        comments.append({"remote_id": "recognition-comment", "content": content})
+        return {"success": True, "remote_id": "recognition-comment"}
+
+    def get_fields(_project_key, _work_item_id, field_keys):
+        return {
+            "success": True,
+            "fields": {key: fields.get(key, "") for key in field_keys},
+        }
+
+    def update_fields(_project_key, _work_item_id, updates):
+        fields.update(dict(updates))
+        return {"success": True}
+
+    outcome = _dispatcher(
+        store,
+        list_comments=list_comments,
+        add_comment=add_comment,
+        get_fields=get_fields,
+        update_fields=update_fields,
+    ).dispatch_one()
+
+    assert outcome.status == "succeeded"
+    assert outcome.effect_key == result.correction_effect_key
+    assert len(comments) == 2
+    assert comments[-1]["content"].count("【RCA 追认】") == 1
+    assert "上一条自动 RCA 候选评论为准" in comments[-1]["content"]
+    assert fields[RCA_RESULT_FIELD_KEY] == "候选结论：感知车道线责任域"
 
 
 def test_invisible_correction_success_never_repeats_remote_comment_write(

@@ -1,5 +1,4 @@
 import json
-from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -143,6 +142,39 @@ def test_malformed_command_returns_usage_after_feature_enabled(tmp_path, monkeyp
 
     assert result.handled is True
     assert "格式：rca" in result.response
+    assert not review_dir(tmp_path).exists()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "rca 追认 123,123",
+        "rca 通过 123,124",
+        "rca 追认 " + ",".join(str(1000 + item) for item in range(51)),
+    ],
+)
+def test_invalid_owner_review_batch_is_consumed_without_writes(
+    text, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_G1Q3_REVIEW_OWNER_USER_IDS", "ou_owner")
+
+    result = handle_owner_review_message(make_event(text), hermes_home=tmp_path)
+
+    assert result.handled is True
+    assert "格式：rca" in str(result.response)
+    assert not review_dir(tmp_path).exists()
+
+
+def test_non_owner_cannot_read_recognition_queue(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_G1Q3_REVIEW_OWNER_USER_IDS", "ou_owner")
+
+    result = handle_owner_review_message(
+        make_event("rca 待追认", user_id="ou_other", user_name="Other"),
+        hermes_home=tmp_path,
+    )
+
+    assert result.handled is True
+    assert "不在 G1Q3 RCA owner review allowlist" in str(result.response)
     assert not review_dir(tmp_path).exists()
 
 
