@@ -452,9 +452,34 @@ def _rca_reservation_freshness_error(
     return None
 
 
-def canonical_rca_contract_sha256(
+_RCA_CONTRACT_BASE_SOURCE_REF_FIELDS = (
+    "task_id",
+    "source_kind",
+    "origin_source_id",
+    "rule_version",
+    "generation",
+    "business_key",
+    "submission_key",
+)
+_RCA_CONTRACT_KAFKA_SOURCE_REF_FIELDS = (
+    "source_event_id",
+    "topic",
+    "partition",
+    "offset",
+)
+_RCA_CONTRACT_W3_SOURCE_REF_FIELDS = (
+    "snapshot_id",
+    "snapshot_sha256",
+    "request_sha256",
+    "snapshot_bundle_sha256",
+    "creator_source_envelope_sha256",
+)
+
+
+def canonical_rca_contract_material(
     admission: dict[str, Any], execution_request: dict[str, Any]
-) -> str:
+) -> dict[str, Any]:
+    """Return the stable, cross-runtime Host/VM request contract material."""
     work_item = execution_request.get("work_item")
     work_item = work_item if isinstance(work_item, dict) else {}
     data = execution_request.get("data")
@@ -465,21 +490,21 @@ def canonical_rca_contract_sha256(
     toolchain = toolchain if isinstance(toolchain, dict) else {}
     stable_source_refs = {
         key: source_refs.get(key)
-        for key in (
-            "task_id",
-            "source_kind",
-            "origin_source_id",
-            "rule_version",
-            "generation",
-            "business_key",
-            "submission_key",
-        )
+        for key in _RCA_CONTRACT_BASE_SOURCE_REF_FIELDS
     }
     if source_refs.get("source_kind") == "kafka_workflow_event":
         stable_source_refs.update(
             {
                 key: source_refs.get(key)
-                for key in ("source_event_id", "topic", "partition", "offset")
+                for key in _RCA_CONTRACT_KAFKA_SOURCE_REF_FIELDS
+            }
+        )
+    w3_execution_snapshot = toolchain.get("w3_execution_snapshot")
+    if isinstance(w3_execution_snapshot, dict):
+        stable_source_refs.update(
+            {
+                key: source_refs.get(key)
+                for key in _RCA_CONTRACT_W3_SOURCE_REF_FIELDS
             }
         )
     stable_request = {
@@ -499,8 +524,16 @@ def canonical_rca_contract_sha256(
     }
     if isinstance(toolchain.get("business_profile"), dict):
         stable_request["business_profile"] = toolchain["business_profile"]
+    if isinstance(w3_execution_snapshot, dict):
+        stable_request["w3_execution_snapshot"] = w3_execution_snapshot
+    return {"admission": admission, "execution_request": stable_request}
+
+
+def canonical_rca_contract_sha256(
+    admission: dict[str, Any], execution_request: dict[str, Any]
+) -> str:
     canonical = json.dumps(
-        {"admission": admission, "execution_request": stable_request},
+        canonical_rca_contract_material(admission, execution_request),
         ensure_ascii=True,
         sort_keys=True,
         separators=(",", ":"),
@@ -1307,6 +1340,7 @@ def vm_task_submit_service(
     bootstrap_deadline: str = "",
     bootstrap_authorization_fingerprint: str = "",
     active_release_binding_sha256: str = "",
+    snapshot_required: bool = False,
 ) -> Dict[str, Any]:
     """Submit one capability-scoped RCA intake without exposing general VM execution.
 
@@ -1363,6 +1397,11 @@ def vm_task_submit_service(
         return _vm_task_service_denied_payload(
             "vm_task_service_request_invalid",
             "reconcile_only must be boolean",
+        )
+    if not isinstance(snapshot_required, bool):
+        return _vm_task_service_denied_payload(
+            "vm_task_service_request_invalid",
+            "snapshot_required must be boolean",
         )
     if normalized_operation not in {
         _RCA_SERVICE_OPERATION,
@@ -1462,12 +1501,12 @@ def vm_task_submit_service(
             "execution request work item does not match the validated admission",
         )
 
+    toolchain = (
+        request_payload.get("toolchain")
+        if isinstance(request_payload.get("toolchain"), dict)
+        else {}
+    )
     if normalized_capability == _RCA_SERVICE_CAPABILITY:
-        toolchain = (
-            request_payload.get("toolchain")
-            if isinstance(request_payload.get("toolchain"), dict)
-            else {}
-        )
         profile = toolchain.get("business_profile")
         work_item_profile = work_item.get("business_profile")
         if (
@@ -1481,6 +1520,100 @@ def vm_task_submit_service(
                 "vm_task_service_request_invalid",
                 "platform RCA submission requires one ready, hash-bound business profile",
             )
+
+    w3_bundle = None
+    w3_binding: dict[str, Any] = {}
+    raw_w3_bundle = toolchain.get("w3_execution_snapshot")
+    if snapshot_required and raw_w3_bundle is None:
+        return _vm_task_service_denied_payload(
+            "vm_task_service_request_invalid",
+            "snapshot-required submission is missing the W3 execution snapshot",
+        )
+    if raw_w3_bundle is not None:
+        try:
+            from gateway.pnc_rca_snapshot import (
+                snapshot_execution_inputs,
+                snapshot_execution_request_inputs,
+                validate_snapshot_execution_bundle,
+            )
+
+            w3_bundle = validate_snapshot_execution_bundle(raw_w3_bundle)
+            snapshot_admission, snapshot_context = snapshot_execution_inputs(w3_bundle)
+            frozen_profile, frozen_execution_policy = (
+                snapshot_execution_request_inputs(w3_bundle)
+            )
+        except Exception as exc:
+            return _vm_task_service_denied_payload(
+                "vm_task_service_request_invalid",
+                f"invalid W3 execution snapshot: {type(exc).__name__}",
+            )
+        if snapshot_admission != validated_admission:
+            return _vm_task_service_denied_payload(
+                "vm_task_service_request_identity_mismatch",
+                "W3 execution snapshot does not match the submitted admission",
+            )
+        if (
+            str(work_item.get("url") or "").rstrip("/")
+            != snapshot_context.issue_url.rstrip("/")
+            or str(work_item.get("title") or "").strip() != snapshot_context.title
+        ):
+            return _vm_task_service_denied_payload(
+                "vm_task_service_request_identity_mismatch",
+                "execution request ticket does not match the W3 snapshot",
+            )
+        case = (
+            request_payload.get("case")
+            if isinstance(request_payload.get("case"), dict)
+            else {}
+        )
+        snapshot_data = (
+            request_payload.get("data")
+            if isinstance(request_payload.get("data"), dict)
+            else {}
+        )
+        data_access = (
+            snapshot_data.get("data_access")
+            if isinstance(snapshot_data.get("data_access"), dict)
+            else {}
+        )
+        expected_execution_policy = {
+            "mode": (
+                "remote_read_blocked"
+                if data_access.get("status") == "blocked"
+                else "remote_read"
+            ),
+            **{
+                key: value
+                for key, value in frozen_execution_policy.items()
+                if key != "request_schema"
+            },
+            "artifact_root": snapshot_data.get("artifact_root"),
+            "resource_class": frozen_profile.get("resource_class"),
+            "artifact_kind": frozen_profile.get("artifact_kind"),
+        }
+        if not (
+            work_item.get("business_profile") == frozen_profile
+            and toolchain.get("business_profile") == frozen_profile
+            and case.get("artifact_namespace")
+            == frozen_profile.get("artifact_namespace")
+            and request_payload.get("execution_policy")
+            == expected_execution_policy
+        ):
+            return _vm_task_service_denied_payload(
+                "vm_task_service_request_identity_mismatch",
+                "execution request policy projection does not match the W3 snapshot",
+            )
+        w3_binding = {
+            "schema_version": w3_bundle.schema_version,
+            "bundle_sha256": w3_bundle.bundle_sha256,
+            "snapshot_authority_sha256": w3_bundle.snapshot_authority_sha256,
+            "snapshot_id": w3_bundle.snapshot.snapshot_id,
+            "snapshot_sha256": w3_bundle.snapshot.snapshot_sha256,
+            "request_sha256": w3_bundle.snapshot.request_sha256,
+            "creator_source_envelope_sha256": (
+                w3_bundle.creator_source_envelope.source_envelope_sha256
+            ),
+        }
 
     data = (
         request_payload.get("data")
@@ -1517,6 +1650,14 @@ def vm_task_submit_service(
         else {}
     )
     origin_source_id = str(source_refs.get("origin_source_id") or "").strip()
+    if (
+        w3_bundle is not None
+        and origin_source_id != w3_bundle.creator_source_envelope.source_id
+    ):
+        return _vm_task_service_denied_payload(
+            "vm_task_service_request_identity_mismatch",
+            "execution request origin does not match the W3 creator envelope",
+        )
     kafka_trigger = validated_admission.trigger_kind in RCA_KAFKA_TRIGGER_KINDS
     expected_source_refs = {
         "task_id": validated_admission.submission_key,
@@ -1531,6 +1672,18 @@ def vm_task_submit_service(
         "business_key": validated_admission.business_key,
         "submission_key": validated_admission.submission_key,
     }
+    if w3_bundle is not None:
+        expected_source_refs.update(
+            {
+                "snapshot_id": w3_binding["snapshot_id"],
+                "snapshot_sha256": w3_binding["snapshot_sha256"],
+                "request_sha256": w3_binding["request_sha256"],
+                "snapshot_bundle_sha256": w3_binding["bundle_sha256"],
+                "creator_source_envelope_sha256": w3_binding[
+                    "creator_source_envelope_sha256"
+                ],
+            }
+        )
     if kafka_trigger:
         if (
             not refs.topic
@@ -1707,6 +1860,20 @@ def vm_task_submit_service(
         **workspace_runtime.task_meta(),
         **fixed_execution_meta,
     }
+    if w3_binding:
+        base_identity_meta.update(
+            {
+                "rca_w3_snapshot_bundle_sha256": w3_binding["bundle_sha256"],
+                "rca_w3_snapshot_authority_sha256": w3_binding[
+                    "snapshot_authority_sha256"
+                ],
+                "rca_w3_snapshot_sha256": w3_binding["snapshot_sha256"],
+                "rca_w3_request_sha256": w3_binding["request_sha256"],
+                "rca_w3_creator_source_envelope_sha256": w3_binding[
+                    "creator_source_envelope_sha256"
+                ],
+            }
+        )
     try:
         goal = _rca_fixed_cli_goal(
             task_id=validated_admission.submission_key,
@@ -1844,6 +2011,11 @@ def vm_task_submit_service(
             "existing_status": existing,
             "admission": admission_payload,
             "workspace_runtime": workspace_runtime.to_dict(),
+            **(
+                {"w3_execution_snapshot": dict(w3_binding)}
+                if w3_binding
+                else {}
+            ),
         }
     if existing.get("state") != "missing":
         return {
@@ -2041,6 +2213,11 @@ def vm_task_submit_service(
             "existing_status": reconciled,
             "admission": admission_payload,
             "workspace_runtime": workspace_runtime.to_dict(),
+            **(
+                {"w3_execution_snapshot": dict(w3_binding)}
+                if w3_binding
+                else {}
+            ),
         })
         return result
     return {

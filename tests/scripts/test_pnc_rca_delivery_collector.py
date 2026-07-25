@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import hashlib
 from datetime import timedelta
@@ -17,6 +18,7 @@ from gateway.pnc_rca_delivery_store import RcaDeliveryStore
 from scripts import pnc_rca_delivery_collector as collector
 from scripts.pnc_foxglove_delivery import canonical_viz_mcap_path
 from tests.gateway.test_pnc_rca_delivery_store import NOW, _control, _delivery
+from tests.gateway.test_pnc_rca_w3_snapshot import _runtime_authority
 
 
 def _config_env(tmp_path) -> dict[str, str]:
@@ -222,6 +224,33 @@ def _age_work_start(instance, *, seconds):
             "UPDATE rca_outbox SET created_at = ?, retry_window_started_at = ?",
             (started_at, started_at),
         )
+
+
+def test_snapshot_required_collector_quarantines_missing_snapshot_without_effect(
+    tmp_path,
+):
+    status_calls = []
+    instance = _real_terminal_collector(
+        tmp_path,
+        clock=[NOW],
+        status_reader=lambda task_id: status_calls.append(task_id),
+    )
+    instance.config = replace(
+        instance.config,
+        w3_snapshot_read_mode="snapshot_required",
+        w3_snapshot_authority=_runtime_authority(),
+    )
+
+    outcome = instance.collect_one()
+
+    assert outcome.status == "quarantined"
+    assert outcome.error_code == "w3_execution_snapshot_missing"
+    assert status_calls == []
+    assert instance.store.list_rows("rca_delivery_effects") == []
+    assert instance.store.list_rows("rca_delivery_jobs") == []
+    assert instance.store.list_rows("rca_execution_watch")[0]["state"] == (
+        "quarantined"
+    )
 
 
 @pytest.mark.parametrize(

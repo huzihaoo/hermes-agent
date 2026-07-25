@@ -49,7 +49,7 @@ from gateway.pnc_rca_capacity_sample_evidence import (
     validate_host_success_receipt,
     write_owner_only_create_once,
 )
-from gateway.pnc_rca_control_store import RcaControlStore
+from gateway.pnc_rca_control_store import RcaControlStore, RecordConflictError
 from gateway.pnc_rca_delivery_contract import (
     TERMINAL_FALLBACK_CONTRACT_SCHEMA_VERSION,
     TERMINAL_DELIVERY_OUTCOMES,
@@ -70,12 +70,21 @@ from gateway.pnc_rca_delivery_store import (
     StaleDeliveryWatchLeaseError,
 )
 from gateway.pnc_rca_kafka_contract import NORMALIZED_EVENT_SCHEMA_VERSION
+from gateway.pnc_rca_policy_config import (
+    W3SnapshotAuthority,
+    w3_snapshot_read_config_from_env,
+)
 from gateway.pnc_rca_quality_oracle import BANNED_PUBLIC_PHRASES
 from gateway.pnc_rca_runtime_identity import (
     MAX_HEALTH_FUTURE_SKEW_SECONDS,
     RCA_DELIVERY_COLLECTOR_LOADED_DEPENDENCIES,
     build_runtime_identity,
     runtime_identity_is_valid,
+)
+from gateway.pnc_rca_snapshot import (
+    AdmissionSnapshotExecutionBundle,
+    snapshot_execution_inputs,
+    validate_snapshot_execution_bundle,
 )
 from hermes_constants import get_hermes_home
 from scripts.pnc_foxglove_delivery import canonical_viz_mcap_path
@@ -406,6 +415,8 @@ class CollectorConfig:
     capacity_sample_batch_size: int = 20
     capacity_sample_lock_timeout_seconds: int = 5
     capacity_terminal_receipt_timeout_seconds: int = 15
+    w3_snapshot_read_mode: str = "legacy"
+    w3_snapshot_authority: W3SnapshotAuthority | None = None
 
     @classmethod
     def from_env(
@@ -488,6 +499,9 @@ class CollectorConfig:
             hermes_home=home,
             control_db_path=control_db_path,
         )
+        w3_snapshot_read_mode, w3_snapshot_authority = (
+            w3_snapshot_read_config_from_env(source)
+        )
         return cls(
             enabled=enabled,
             control_db_path=control_db_path,
@@ -534,6 +548,8 @@ class CollectorConfig:
                 minimum=1,
             ),
             capacity_terminal_receipt_timeout_seconds=terminal_receipt_timeout,
+            w3_snapshot_read_mode=w3_snapshot_read_mode,
+            w3_snapshot_authority=w3_snapshot_authority,
         )
 
     def public_dict(self) -> dict[str, Any]:
@@ -571,6 +587,14 @@ class CollectorConfig:
                 **expected_remote_css_runtime_dependency(),
             },
             "external_writes": False,
+            "w3_snapshot_read": (
+                {
+                    "mode": self.w3_snapshot_read_mode,
+                    **self.w3_snapshot_authority.to_public_dict(),
+                }
+                if self.w3_snapshot_authority is not None
+                else {"enabled": False, "mode": self.w3_snapshot_read_mode}
+            ),
         }
 
 
@@ -1601,7 +1625,63 @@ def default_artifact_bundle_reader(
     return payload
 
 
-def _submission_admission(claim: ExecutionWatchClaim):
+def _w3_execution_binding(
+    snapshot_bundle: AdmissionSnapshotExecutionBundle,
+) -> dict[str, str]:
+    bundle = validate_snapshot_execution_bundle(snapshot_bundle)
+    return {
+        "schema_version": bundle.schema_version,
+        "bundle_sha256": bundle.bundle_sha256,
+        "snapshot_authority_sha256": bundle.snapshot_authority_sha256,
+        "snapshot_id": bundle.snapshot.snapshot_id,
+        "snapshot_sha256": bundle.snapshot.snapshot_sha256,
+        "request_sha256": bundle.snapshot.request_sha256,
+        "creator_source_envelope_sha256": (
+            bundle.creator_source_envelope.source_envelope_sha256
+        ),
+    }
+
+
+def _snapshot_submission_admission(
+    claim: ExecutionWatchClaim,
+    snapshot_bundle: AdmissionSnapshotExecutionBundle,
+):
+    try:
+        bundle = validate_snapshot_execution_bundle(snapshot_bundle)
+        admission, _context = snapshot_execution_inputs(bundle)
+    except Exception as exc:
+        raise DeliveryContractError("w3_execution_snapshot_invalid") from exc
+    envelope = bundle.creator_source_envelope
+    refs = admission.source_refs
+    if (
+        admission.submission_key != claim.submission_key
+        or admission.business_key != claim.business_key
+        or admission.generation != claim.generation
+        or refs.project_key != claim.project_key
+        or refs.work_item_type_key != claim.work_item_type_key
+        or refs.work_item_id != claim.work_item_id
+        or claim.task_id != claim.submission_key
+        or claim.origin_source_id != envelope.source_id
+        or claim.trigger_origin_source_id != envelope.source_id
+    ):
+        raise DeliveryContractError("w3_execution_snapshot_identity_mismatch")
+    result = claim.submission_result
+    if (
+        result.get("success") is not True
+        or str(result.get("submission_key") or "").strip() != claim.submission_key
+        or str(result.get("task_id") or "").strip() != claim.task_id
+        or result.get("w3_execution_snapshot") != _w3_execution_binding(bundle)
+    ):
+        raise DeliveryContractError("w3_execution_snapshot_receipt_mismatch")
+    return admission
+
+
+def _submission_admission(
+    claim: ExecutionWatchClaim,
+    snapshot_bundle: AdmissionSnapshotExecutionBundle | None = None,
+):
+    if snapshot_bundle is not None:
+        return _snapshot_submission_admission(claim, snapshot_bundle)
     payload = claim.submission_payload
     if payload.get("schema_version") != SUBMISSION_OUTBOX_SCHEMA_VERSION:
         raise DeliveryContractError("submission_outbox_contract_invalid")
@@ -1727,6 +1807,40 @@ def _submission_admission(claim: ExecutionWatchClaim):
     ):
         raise DeliveryContractError("submission_receipt_identity_mismatch")
     return admission
+
+
+def _validate_w3_task_status(
+    status: Mapping[str, Any],
+    snapshot_bundle: AdmissionSnapshotExecutionBundle,
+) -> None:
+    binding = _w3_execution_binding(snapshot_bundle)
+    meta = status.get("meta")
+    meta = meta if isinstance(meta, Mapping) else {}
+    expected_meta = {
+        "rca_w3_snapshot_bundle_sha256": binding["bundle_sha256"],
+        "rca_w3_snapshot_authority_sha256": binding[
+            "snapshot_authority_sha256"
+        ],
+        "rca_w3_snapshot_sha256": binding["snapshot_sha256"],
+        "rca_w3_request_sha256": binding["request_sha256"],
+        "rca_w3_creator_source_envelope_sha256": binding[
+            "creator_source_envelope_sha256"
+        ],
+    }
+    if any(meta.get(name) != value for name, value in expected_meta.items()):
+        raise DeliveryContractError("w3_execution_snapshot_task_mismatch")
+
+
+def _validate_w3_delivery_bundle(
+    delivery_bundle: Mapping[str, Any],
+    snapshot_bundle: AdmissionSnapshotExecutionBundle,
+) -> None:
+    expected = _w3_execution_binding(snapshot_bundle)
+    for field in ("delivery_contract", "delivery_manifest"):
+        value = delivery_bundle.get(field)
+        value = value if isinstance(value, Mapping) else {}
+        if value.get("w3_execution_snapshot") != expected:
+            raise DeliveryContractError("w3_execution_snapshot_delivery_mismatch")
 
 
 def _status_state(status: Mapping[str, Any]) -> str:
@@ -2303,6 +2417,42 @@ class DeliveryCollector:
             taxonomy=taxonomy,
         )
 
+    def _quarantine_w3_snapshot_failure(
+        self,
+        claim: ExecutionWatchClaim,
+        *,
+        code: str,
+        detail: str,
+    ) -> CollectOutcome:
+        status = {
+            "schema_version": "pnc_rca_w3_snapshot_quarantine_v1",
+            "external_writes": False,
+            "error_code": code,
+        }
+        try:
+            self.store.quarantine_watch(
+                submission_key=claim.submission_key,
+                lease_token=claim.lease_token,
+                status=status,
+                error_code=code,
+                error_detail=detail,
+                now=self.now(),
+            )
+        except StaleDeliveryWatchLeaseError:
+            self.stats.stale_lease += 1
+            return CollectOutcome(
+                status="lease_lost",
+                submission_key=claim.submission_key,
+                error_code="stale_delivery_watch_lease",
+            )
+        self.stats.quarantined += 1
+        self.stats.internal_alert += 1
+        return CollectOutcome(
+            status="quarantined",
+            submission_key=claim.submission_key,
+            error_code=code,
+        )
+
     def _deadline_outcome(
         self,
         claim: ExecutionWatchClaim,
@@ -2371,6 +2521,40 @@ class DeliveryCollector:
             return CollectOutcome(status="idle")
         self.stats.claimed += 1
         status: dict[str, Any] = {}
+        snapshot_bundle: AdmissionSnapshotExecutionBundle | None = None
+        admission = None
+        if self.config.w3_snapshot_read_mode == "snapshot_required":
+            try:
+                snapshot_bundle = self._control_store().read_w3_execution_snapshot(
+                    claim.submission_key,
+                    snapshot_authority=self.config.w3_snapshot_authority,
+                    required=True,
+                )
+                if not isinstance(
+                    snapshot_bundle,
+                    AdmissionSnapshotExecutionBundle,
+                ):
+                    raise RecordConflictError("w3_execution_snapshot_missing")
+                admission = _submission_admission(claim, snapshot_bundle)
+            except Exception as exc:
+                code = (
+                    exc.code
+                    if isinstance(exc, DeliveryContractError)
+                    else str(exc) or "w3_execution_snapshot_invalid"
+                )
+                if code not in {
+                    "w3_execution_snapshot_missing",
+                    "w3_execution_snapshot_authority_mismatch",
+                    "w3_execution_snapshot_invalid",
+                    "w3_execution_snapshot_identity_mismatch",
+                    "w3_execution_snapshot_receipt_mismatch",
+                }:
+                    code = "w3_execution_snapshot_invalid"
+                return self._quarantine_w3_snapshot_failure(
+                    claim,
+                    code=code,
+                    detail=f"{code}: {type(exc).__name__}",
+                )
         deadline_outcome = self._deadline_outcome(
             claim,
             status=status,
@@ -2379,30 +2563,31 @@ class DeliveryCollector:
         )
         if deadline_outcome is not None:
             return deadline_outcome
-        try:
-            admission = _submission_admission(claim)
-        except Exception as exc:
-            deadline_outcome = self._deadline_outcome(
-                claim,
-                status=status,
-                state=claim.state,
-                source="submission_admission",
-            )
-            if deadline_outcome is not None:
-                return deadline_outcome
-            code = (
-                exc.code
-                if isinstance(exc, DeliveryContractError)
-                else "submission_admission_invalid"
-            )
-            return self._handle_observed_failure(
-                claim,
-                status=status,
-                code=code,
-                detail=f"{code}: {exc}",
-                state=claim.state,
-                source="submission_admission",
-            )
+        if admission is None:
+            try:
+                admission = _submission_admission(claim)
+            except Exception as exc:
+                deadline_outcome = self._deadline_outcome(
+                    claim,
+                    status=status,
+                    state=claim.state,
+                    source="submission_admission",
+                )
+                if deadline_outcome is not None:
+                    return deadline_outcome
+                code = (
+                    exc.code
+                    if isinstance(exc, DeliveryContractError)
+                    else "submission_admission_invalid"
+                )
+                return self._handle_observed_failure(
+                    claim,
+                    status=status,
+                    code=code,
+                    detail=f"{code}: {exc}",
+                    state=claim.state,
+                    source="submission_admission",
+                )
         deadline_outcome = self._deadline_outcome(
             claim,
             status=status,
@@ -2417,7 +2602,18 @@ class DeliveryCollector:
             if not isinstance(raw_status, Mapping):
                 raise TypeError("status_reader must return an object")
             status = dict(raw_status)
+            if snapshot_bundle is not None and status.get("success") is True:
+                _validate_w3_task_status(status, snapshot_bundle)
         except Exception as exc:
+            if snapshot_bundle is not None and isinstance(
+                exc,
+                DeliveryContractError,
+            ):
+                return self._quarantine_w3_snapshot_failure(
+                    claim,
+                    code=exc.code,
+                    detail=exc.detail,
+                )
             deadline_outcome = self._deadline_outcome(
                 claim,
                 status=status,
@@ -2516,6 +2712,8 @@ class DeliveryCollector:
             bundle = self.artifact_bundle_reader(claim)
             if not isinstance(bundle, Mapping):
                 raise ArtifactBundleReadError("artifact_reader_response_invalid")
+            if snapshot_bundle is not None:
+                _validate_w3_delivery_bundle(bundle, snapshot_bundle)
             delivery: VerifiedDelivery = verify_delivery_bundle(
                 admission=admission,
                 delivery_contract=bundle.get("delivery_contract") or {},
@@ -2541,9 +2739,27 @@ class DeliveryCollector:
                 source="artifact_bundle_reader",
             )
         except DeliveryContractError as exc:
+            if snapshot_bundle is not None and exc.code.startswith(
+                "w3_execution_snapshot_"
+            ):
+                return self._quarantine_w3_snapshot_failure(
+                    claim,
+                    code=exc.code,
+                    detail=exc.detail,
+                )
             deadline_outcome = self._deadline_outcome(
                 claim,
                 status=status,
+                state=state,
+                source="delivery_contract_verifier",
+            )
+            if deadline_outcome is not None:
+                return deadline_outcome
+            return self._handle_observed_failure(
+                claim,
+                status=status,
+                code=exc.code,
+                detail=f"{exc.code}: {exc.detail}",
                 state=state,
                 source="delivery_contract_verifier",
             )
@@ -2561,16 +2777,6 @@ class DeliveryCollector:
                 status=status,
                 code="artifact_verifier_unavailable",
                 detail=type(exc).__name__,
-                state=state,
-                source="delivery_contract_verifier",
-            )
-            if deadline_outcome is not None:
-                return deadline_outcome
-            return self._handle_observed_failure(
-                claim,
-                status=status,
-                code=exc.code,
-                detail=f"{exc.code}: {exc.detail}",
                 state=state,
                 source="delivery_contract_verifier",
             )
@@ -2646,12 +2852,15 @@ class DeliveryCollector:
             raise
         return outcomes
 
-    def _capacity_store(self) -> RcaControlStore:
+    def _control_store(self) -> RcaControlStore:
         if self.capacity_control_store is None:
             self.capacity_control_store = RcaControlStore(
                 self.config.control_db_path, require_current=True
             )
         return self.capacity_control_store
+
+    def _capacity_store(self) -> RcaControlStore:
+        return self._control_store()
 
     def _capacity_ledger_identities(
         self, paths: CapacityRuntimePaths, *, hmac_key: bytes

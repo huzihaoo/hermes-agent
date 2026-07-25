@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field, is_dataclass, replace as dataclass_replace
 from datetime import datetime, timezone
 import json
@@ -375,7 +376,22 @@ def build_execution_request(
             translate_contract_path, limit=500
         ),
     }
-    toolchain_payload = dict(toolchain or {})
+    raw_toolchain = dict(toolchain or {})
+    missing_w3_bundle = object()
+    raw_w3_bundle = raw_toolchain.pop(
+        "w3_execution_snapshot",
+        missing_w3_bundle,
+    )
+    validated_w3_bundle = None
+    if raw_w3_bundle is not missing_w3_bundle:
+        from gateway.pnc_rca_snapshot import validate_snapshot_execution_bundle
+
+        validated_w3_bundle = validate_snapshot_execution_bundle(raw_w3_bundle)
+    toolchain_payload = _sanitize_mapping(raw_toolchain)
+    if validated_w3_bundle is not None:
+        toolchain_payload["w3_execution_snapshot"] = deepcopy(
+            validated_w3_bundle.to_dict()
+        )
     if isinstance(business_profile, dict) and business_profile:
         work_item["business_profile"] = business_profile
         case["artifact_namespace"] = business_profile.get(
@@ -412,6 +428,6 @@ def build_execution_request(
             "source_message_id": source_message_id,
             "request_text_excerpt": _sanitize_string(request_text_excerpt, limit=1200),
         },
-        toolchain=_sanitize_mapping(toolchain_payload),
+        toolchain=toolchain_payload,
     )
 # === RCA_REQUEST_CONTRACT:END ===

@@ -34,7 +34,11 @@ from gateway.pnc_rca_kafka_contract import (
     MAX_WORKFLOW_EVENT_BYTES,
     WorkflowEventPolicy,
 )
-from gateway.pnc_rca_policy_config import workflow_policy_from_env
+from gateway.pnc_rca_policy_config import (
+    W3SnapshotAuthority,
+    w3_snapshot_authority_from_env,
+    workflow_policy_from_env,
+)
 from gateway.pnc_rca_runtime_identity import (
     MAX_HEALTH_FUTURE_SKEW_SECONDS,
     RCA_KAFKA_CONSUMER_LOADED_DEPENDENCIES,
@@ -248,6 +252,7 @@ class ConsumerConfig:
     outbox_high_watermark: int
     outbox_resume_watermark: int
     policy: WorkflowEventPolicy
+    w3_snapshot_authority: W3SnapshotAuthority | None = None
 
     @classmethod
     def from_env(
@@ -352,6 +357,10 @@ class ConsumerConfig:
         policy = workflow_policy_from_env(source)
         if policy.topic != topic:
             raise ValueError("workflow policy topic must match consumer topic")
+        w3_snapshot_authority = w3_snapshot_authority_from_env(
+            source,
+            active_policy=policy,
+        )
         exact_recovery_path_text = str(
             source.get(f"{ENV_PREFIX}EXACT_RECOVERY_REQUEST_PATH", "")
         ).strip()
@@ -455,6 +464,7 @@ class ConsumerConfig:
             outbox_high_watermark=outbox_high_watermark,
             outbox_resume_watermark=outbox_resume_watermark,
             policy=policy,
+            w3_snapshot_authority=w3_snapshot_authority,
         )
 
     def public_dict(self) -> dict[str, Any]:
@@ -505,6 +515,11 @@ class ConsumerConfig:
             "outbox_resume_watermark": self.outbox_resume_watermark,
             "external_dispatch_wired": False,
             "creation_rule_version": self.policy.policy_version,
+            "w3_snapshot_shadow": (
+                self.w3_snapshot_authority.to_public_dict()
+                if self.w3_snapshot_authority is not None
+                else {"enabled": False}
+            ),
         }
 
     def runtime_public_dict(self) -> dict[str, Any]:
@@ -1351,6 +1366,11 @@ def recover_exact_kafka_request(
     raw_sha256 = hashlib.sha256(record.value).hexdigest()
     if raw_sha256 != request["raw_sha256"]:
         raise ExactRecoveryError("exact_recovery_raw_sha256_mismatch")
+    snapshot_kwargs = (
+        {"snapshot_authority": config.w3_snapshot_authority}
+        if config.w3_snapshot_authority is not None
+        else {}
+    )
     result = store.ingest_record(
         record,
         policy=config.policy,
@@ -1358,6 +1378,7 @@ def recover_exact_kafka_request(
         activation_required=True,
         activation_slot_kind="kafka_success",
         runtime_identity=runtime_identity,
+        **snapshot_kwargs,
     )
     if (
         result.decision != "accepted"
@@ -1620,6 +1641,7 @@ def recover_pending(
     stats: PollStats,
     *,
     health: HealthReporter | None = None,
+    snapshot_authority: W3SnapshotAuthority | None = None,
 ) -> None:
     """Drain raw-first crash remnants without requiring a Kafka connection."""
     while True:
@@ -1630,6 +1652,8 @@ def recover_pending(
             pending_kwargs: dict[str, Any] = {"limit": 1000}
             if runtime_identity is not None:
                 pending_kwargs["runtime_identity"] = runtime_identity.to_dict()
+            if snapshot_authority is not None:
+                pending_kwargs["snapshot_authority"] = snapshot_authority
             recovered = store.process_pending(**pending_kwargs)
         except RecordProcessingBlockedError as exc:
             stats.record_processing_blocks += 1
@@ -2198,7 +2222,12 @@ def run_poll_loop(
         health.write(state="starting", stats=stats, force=True)
 
     if recover_on_start:
-        recover_pending(store, stats, health=health)
+        recover_pending(
+            store,
+            stats,
+            health=health,
+            snapshot_authority=config.w3_snapshot_authority,
+        )
 
     backpressure_active = False
     blocked_partitions: set[Any] = set()
@@ -2406,6 +2435,11 @@ def run_poll_loop(
                             if getattr(health, "runtime_identity", None) is not None
                             else None
                         ),
+                        **(
+                            {"snapshot_authority": config.w3_snapshot_authority}
+                            if config.w3_snapshot_authority is not None
+                            else {}
+                        ),
                     )
                 except ActivationIngressDeferredError:
                     break
@@ -2579,6 +2613,11 @@ def run_poll_loop(
                             health.runtime_identity.to_dict()
                             if getattr(health, "runtime_identity", None) is not None
                             else None
+                        ),
+                        **(
+                            {"snapshot_authority": config.w3_snapshot_authority}
+                            if config.w3_snapshot_authority is not None
+                            else {}
                         ),
                     )
                 except ActivationIngressDeferredError as exc:
@@ -2854,7 +2893,12 @@ def main(argv: list[str] | None = None) -> int:
         health = HealthReporter(config, store)
         stats = PollStats()
         _require_activation_ingress_open(store, config)
-        recover_pending(store, stats, health=health)
+        recover_pending(
+            store,
+            stats,
+            health=health,
+            snapshot_authority=config.w3_snapshot_authority,
+        )
         health.write(state="starting", stats=stats, force=True)
         stopping = False
 

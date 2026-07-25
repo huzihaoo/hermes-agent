@@ -17,6 +17,7 @@ from gateway.pnc_rca_admission import (
     RcaAdmissionError,
     RcaTriggerContext,
     build_rca_admission,
+    build_rca_trigger_context,
     validate_rca_admission,
     validate_rca_trigger_context,
 )
@@ -27,6 +28,7 @@ CANONICAL_RCA_REQUEST_SCHEMA_VERSION = "pnc_rca_canonical_request_v1"
 ADMISSION_SNAPSHOT_SCHEMA_VERSION = "pnc_rca_admission_snapshot_v1"
 SOURCE_ENVELOPE_SCHEMA_VERSION = "pnc_rca_snapshot_source_envelope_v1"
 SOURCE_AUTHORITY_SCHEMA_VERSION = "pnc_rca_source_authority_receipt_v1"
+EXECUTION_SNAPSHOT_BUNDLE_SCHEMA_VERSION = "pnc_rca_execution_snapshot_bundle_v1"
 
 _SNAPSHOT_ID_PREFIX = "pnc-rca-snapshot-v1-"
 _SOURCE_ENVELOPE_ID_PREFIX = "pnc-rca-source-envelope-v1-"
@@ -72,6 +74,19 @@ _INTENT_FIELDS = frozenset(
     {"kind", "generation_reason", "generation_authorization_evidence_sha256"}
 )
 _POLICY_FIELDS = frozenset({"version", "sha256", "value"})
+_EXECUTION_REQUEST_POLICY_VALUE_FIELDS = frozenset(
+    {
+        "request_schema",
+        "data_access_mode",
+        "allow_download",
+        "input_materialization",
+        "derived_artifacts_allowed",
+        "allow_feishu_writeback",
+        "group_response_cap",
+        "translate_baseline",
+        "translate_contract_path",
+    }
+)
 _POLICY_NAMES = (
     "creation_policy",
     "business_profile",
@@ -138,6 +153,16 @@ _SOURCE_AUTHORITY_FIELDS = frozenset(
         "source_metadata_sha256",
         "anchor_sha256",
         "ingress_decision_sha256",
+    }
+)
+_EXECUTION_SNAPSHOT_BUNDLE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "bundle_sha256",
+        "snapshot_authority_sha256",
+        "snapshot",
+        "creator_source_envelope",
+        "creator_source_authority",
     }
 )
 _INGRESS_DECISION_FIELDS = frozenset(
@@ -343,6 +368,76 @@ def _policy(name: str, value: Any) -> dict[str, Any]:
     }
     if name == "creation_policy":
         _creation_rule(normalized)
+    elif observed.get("state") != "unbound" and name == "business_profile":
+        _business_profile_value(normalized["value"])
+    elif observed.get("state") != "unbound" and name == "execution_policy":
+        _execution_request_policy_value(normalized["value"])
+    return normalized
+
+
+def _business_profile_value(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise RcaAdmissionError("w3_business_profile_value_invalid")
+    profile = _thaw(_freeze(value))
+    required = (
+        "profile_id",
+        "artifact_kind",
+        "artifact_namespace",
+    )
+    if (
+        profile.get("status") != "matched"
+        or profile.get("execution_readiness") != "ready"
+        or profile.get("resource_class") != "rca_prod"
+        or any(not _text(f"business_profile_{key}", profile.get(key)) for key in required)
+    ):
+        raise RcaAdmissionError("w3_business_profile_not_execution_ready")
+    return profile
+
+
+def _execution_request_policy_value(value: Any) -> dict[str, Any]:
+    policy = _exact_mapping(
+        "execution_request_policy_value",
+        value,
+        _EXECUTION_REQUEST_POLICY_VALUE_FIELDS,
+    )
+    normalized = {
+        "request_schema": _text(
+            "execution_request_schema", policy.get("request_schema")
+        ),
+        "data_access_mode": _text(
+            "execution_data_access_mode", policy.get("data_access_mode")
+        ),
+        "allow_download": policy.get("allow_download"),
+        "input_materialization": _text(
+            "execution_input_materialization",
+            policy.get("input_materialization"),
+        ),
+        "derived_artifacts_allowed": policy.get("derived_artifacts_allowed"),
+        "allow_feishu_writeback": policy.get("allow_feishu_writeback"),
+        "group_response_cap": _text(
+            "execution_group_response_cap", policy.get("group_response_cap")
+        ),
+        "translate_baseline": _text(
+            "execution_translate_baseline", policy.get("translate_baseline")
+        ),
+        "translate_contract_path": _text(
+            "execution_translate_contract_path",
+            policy.get("translate_contract_path"),
+            allow_empty=True,
+        ),
+    }
+    if (
+        normalized["request_schema"] != "g1q3_rca_execution_request_v2"
+        or normalized["data_access_mode"] != "remote_read"
+        or normalized["allow_download"] is not False
+        or normalized["input_materialization"] != "forbidden"
+        or normalized["derived_artifacts_allowed"] is not True
+        or normalized["allow_feishu_writeback"] is not False
+        or normalized["group_response_cap"] not in {"L0", "L1"}
+    ):
+        raise RcaAdmissionError("w3_execution_request_policy_invalid")
+    if normalized != dict(policy):
+        raise RcaAdmissionError("w3_execution_request_policy_not_canonical")
     return normalized
 
 
@@ -739,6 +834,25 @@ def _assert_policy_authority(request: CanonicalRcaRequest) -> None:
         policy = getattr(request, policy_name)
         if not policy["value"] or policy["value"].get("state") == "unbound":
             raise RcaAdmissionError(f"w3_{policy_name}_not_switch_ready")
+
+
+def validate_snapshot_policy_authority(
+    value: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Validate the exact switch-ready policy set before intake starts."""
+    policies = _exact_mapping(
+        "snapshot_policy_authority",
+        value,
+        frozenset(_POLICY_NAMES),
+    )
+    normalized = {name: _policy(name, policies[name]) for name in _POLICY_NAMES}
+    if any(
+        not normalized[name]["value"]
+        or normalized[name]["value"].get("state") == "unbound"
+        for name in _POLICY_NAMES
+    ):
+        raise RcaAdmissionError("w3_snapshot_policy_authority_not_switch_ready")
+    return normalized
 
 
 def _validate_expected_policy_sha256s(
@@ -1518,6 +1632,274 @@ def validate_snapshot_source_envelope(
     if envelope.to_dict() != original:
         raise RcaAdmissionError("w3_source_envelope_not_canonical")
     return envelope
+
+
+@dataclass(frozen=True)
+class AdmissionSnapshotExecutionBundle:
+    """Content-addressed W3 authority passed through execution and readback."""
+
+    schema_version: str
+    bundle_sha256: str
+    snapshot_authority_sha256: str
+    snapshot: AdmissionSnapshot
+    creator_source_envelope: AdmissionSnapshotSourceEnvelope
+    creator_source_authority: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        if self.schema_version != EXECUTION_SNAPSHOT_BUNDLE_SCHEMA_VERSION:
+            raise RcaAdmissionError("w3_execution_bundle_schema_version_invalid")
+        if not isinstance(self.snapshot, AdmissionSnapshot):
+            raise RcaAdmissionError("w3_execution_bundle_snapshot_invalid")
+        authority_body = {
+            "schema_version": "pnc_rca_w3_snapshot_authority_v1",
+            "policies": {
+                name: _thaw(getattr(self.snapshot.canonical_request, name))
+                for name in _POLICY_NAMES
+            },
+        }
+        if self.snapshot_authority_sha256 != canonical_json_sha256(authority_body):
+            raise RcaAdmissionError("w3_execution_bundle_snapshot_authority_mismatch")
+        if not isinstance(
+            self.creator_source_envelope,
+            AdmissionSnapshotSourceEnvelope,
+        ):
+            raise RcaAdmissionError("w3_execution_bundle_envelope_invalid")
+        envelope = self.creator_source_envelope
+        receipt = _exact_mapping(
+            "execution_bundle_source_authority",
+            self.creator_source_authority,
+            _SOURCE_AUTHORITY_FIELDS,
+        )
+        authority_sha256 = _validate_expected_source_authority(
+            source_id=envelope.source_id,
+            source_kind=envelope.source_kind,
+            source_metadata=envelope.source_metadata,
+            anchor=envelope.anchor,
+            ingress_decision=envelope.ingress_decision,
+            expected_source_authority=receipt,
+        )
+        if (
+            envelope.source_authority_sha256 != authority_sha256
+            or envelope.snapshot_id != self.snapshot.snapshot_id
+            or envelope.snapshot_sha256 != self.snapshot.snapshot_sha256
+            or envelope.submission_key
+            != self.snapshot.resolved_admission["submission_key"]
+        ):
+            raise RcaAdmissionError("w3_execution_bundle_binding_mismatch")
+        if envelope.ingress_decision["binding_action"] != "create":
+            raise RcaAdmissionError("w3_execution_bundle_creator_required")
+        if (
+            envelope.ingress_decision["decision"] != "admit"
+            or self.snapshot.execution_admission["decision"] != "admit"
+        ):
+            raise RcaAdmissionError("w3_execution_bundle_not_admitted")
+        object.__setattr__(
+            self,
+            "creator_source_authority",
+            _freeze(dict(receipt)),
+        )
+        expected_sha256 = canonical_json_sha256(self.identity_payload)
+        if self.bundle_sha256 != expected_sha256:
+            raise RcaAdmissionError("w3_execution_bundle_hash_mismatch")
+
+    @property
+    def identity_payload(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "snapshot_authority_sha256": self.snapshot_authority_sha256,
+            "snapshot": self.snapshot.to_dict(),
+            "creator_source_envelope": self.creator_source_envelope.to_dict(),
+            "creator_source_authority": _thaw(self.creator_source_authority),
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "bundle_sha256": self.bundle_sha256,
+            "snapshot_authority_sha256": self.snapshot_authority_sha256,
+            "snapshot": self.snapshot.to_dict(),
+            "creator_source_envelope": self.creator_source_envelope.to_dict(),
+            "creator_source_authority": _thaw(self.creator_source_authority),
+        }
+
+
+def build_snapshot_execution_bundle(
+    *,
+    snapshot: AdmissionSnapshot,
+    snapshot_authority_sha256: str,
+    creator_source_envelope: AdmissionSnapshotSourceEnvelope,
+    creator_source_authority: Mapping[str, Any],
+) -> AdmissionSnapshotExecutionBundle:
+    payload = {
+        "schema_version": EXECUTION_SNAPSHOT_BUNDLE_SCHEMA_VERSION,
+        "snapshot_authority_sha256": snapshot_authority_sha256,
+        "snapshot": snapshot.to_dict(),
+        "creator_source_envelope": creator_source_envelope.to_dict(),
+        "creator_source_authority": dict(creator_source_authority),
+    }
+    return AdmissionSnapshotExecutionBundle(
+        bundle_sha256=canonical_json_sha256(payload),
+        snapshot_authority_sha256=snapshot_authority_sha256,
+        snapshot=snapshot,
+        creator_source_envelope=creator_source_envelope,
+        creator_source_authority=creator_source_authority,
+        schema_version=EXECUTION_SNAPSHOT_BUNDLE_SCHEMA_VERSION,
+    )
+
+
+def validate_snapshot_execution_bundle(
+    value: AdmissionSnapshotExecutionBundle | Mapping[str, Any],
+) -> AdmissionSnapshotExecutionBundle:
+    if not isinstance(value, (AdmissionSnapshotExecutionBundle, Mapping)):
+        raise RcaAdmissionError("w3_execution_bundle_type_invalid")
+    original = (
+        value.to_dict()
+        if isinstance(value, AdmissionSnapshotExecutionBundle)
+        else dict(value)
+    )
+    bundle_mapping = _exact_mapping(
+        "execution_bundle",
+        original,
+        _EXECUTION_SNAPSHOT_BUNDLE_FIELDS,
+    )
+    snapshot_mapping = _exact_mapping(
+        "execution_bundle_snapshot",
+        bundle_mapping["snapshot"],
+        _SNAPSHOT_FIELDS,
+    )
+    request_mapping = _exact_mapping(
+        "execution_bundle_request",
+        snapshot_mapping["canonical_request"],
+        _REQUEST_FIELDS,
+    )
+    ticket = _ticket(request_mapping["ticket"])
+    intent = _execution_intent(request_mapping["execution_intent"])
+    policies = {
+        name: _policy(name, request_mapping[name]) for name in _POLICY_NAMES
+    }
+    policy_sha256s = {name: str(policies[name]["sha256"]) for name in _POLICY_NAMES}
+    snapshot = validate_admission_snapshot(
+        snapshot_mapping,
+        expected_snapshot_sha256=str(snapshot_mapping["snapshot_sha256"]),
+        expected_generation_authorization_evidence_sha256=intent[
+            "generation_authorization_evidence_sha256"
+        ],
+        expected_ticket_title_sha256=str(ticket["title_sha256"]),
+        expected_policy_sha256s=policy_sha256s,
+    )
+
+    envelope_mapping = _exact_mapping(
+        "execution_bundle_creator_envelope",
+        bundle_mapping["creator_source_envelope"],
+        _SOURCE_ENVELOPE_FIELDS,
+    )
+    source_kind = _text(
+        "execution_bundle_source_kind",
+        envelope_mapping["source_kind"],
+    )
+    metadata = _source_metadata(source_kind, envelope_mapping["source_metadata"])
+    ingress = _ingress_decision(envelope_mapping["ingress_decision"])
+    authority = _exact_mapping(
+        "execution_bundle_source_authority",
+        bundle_mapping["creator_source_authority"],
+        _SOURCE_AUTHORITY_FIELDS,
+    )
+    envelope = validate_snapshot_source_envelope(
+        envelope_mapping,
+        expected_snapshot=snapshot,
+        expected_authorization_evidence_sha256=str(
+            ingress["authorization_evidence_sha256"]
+        ),
+        expected_generation_authorization_evidence_sha256=intent[
+            "generation_authorization_evidence_sha256"
+        ],
+        expected_ticket_title_sha256=str(ticket["title_sha256"]),
+        expected_source_payload_sha256=str(metadata["payload_sha256"]),
+        expected_policy_sha256s=policy_sha256s,
+        expected_snapshot_sha256=snapshot.snapshot_sha256,
+        expected_source_authority=authority,
+    )
+    bundle = AdmissionSnapshotExecutionBundle(
+        schema_version=bundle_mapping["schema_version"],
+        bundle_sha256=bundle_mapping["bundle_sha256"],
+        snapshot_authority_sha256=bundle_mapping["snapshot_authority_sha256"],
+        snapshot=snapshot,
+        creator_source_envelope=envelope,
+        creator_source_authority=authority,
+    )
+    if bundle.to_dict() != original:
+        raise RcaAdmissionError("w3_execution_bundle_not_canonical")
+    return bundle
+
+
+def snapshot_execution_request_inputs(
+    value: AdmissionSnapshotExecutionBundle | Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return the frozen business profile and stable VM policy projection."""
+    bundle = validate_snapshot_execution_bundle(value)
+    request = bundle.snapshot.canonical_request
+    return (
+        _business_profile_value(request.business_profile["value"]),
+        _execution_request_policy_value(request.execution_policy["value"]),
+    )
+
+
+def snapshot_execution_inputs(
+    value: AdmissionSnapshotExecutionBundle | Mapping[str, Any],
+) -> tuple[RcaAdmission, RcaTriggerContext]:
+    """Derive the compatibility admission and ticket input only from W3 bytes."""
+    bundle = validate_snapshot_execution_bundle(value)
+    snapshot = bundle.snapshot
+    envelope = bundle.creator_source_envelope
+    ticket = snapshot.canonical_request.ticket
+    resolved = snapshot.resolved_admission
+    generation = int(resolved["generation"])
+    if envelope.source_kind == "kafka_workflow_event":
+        trigger_kind = "issue_created" if generation == 1 else "kafka_retrigger"
+        transport = {
+            "topic": str(envelope.source_metadata["topic"]),
+            "partition": int(envelope.source_metadata["partition"]),
+            "offset": int(envelope.source_metadata["offset"]),
+        }
+    elif envelope.source_kind == "feishu_group_manual":
+        trigger_kind = (
+            "manual_issue_request" if generation == 1 else "manual_retrigger"
+        )
+        transport = {}
+    else:  # pragma: no cover - guarded by the envelope validator
+        raise RcaAdmissionError("w3_execution_bundle_source_kind_invalid")
+    admission = build_rca_admission(
+        project_key=str(ticket["project_key"]),
+        project_simple_name=str(ticket["project_simple_name"]),
+        work_item_type_key=str(ticket["work_item_type_key"]),
+        work_item_id=str(ticket["work_item_id"]),
+        rule_version=str(resolved["creation_rule_version"]),
+        trigger_kind=trigger_kind,
+        generation=generation,
+        **transport,
+    )
+    expected_resolved = {
+        "key_version": admission.key_version,
+        "creation_rule_version": admission.source_refs.rule_version,
+        "business_key": admission.business_key,
+        "submission_key": admission.submission_key,
+        "generation": admission.generation,
+        "create_once": admission.create_once,
+        "dedupe_scope": admission.dedupe_scope,
+    }
+    if expected_resolved != dict(resolved):
+        raise RcaAdmissionError("w3_execution_bundle_admission_mismatch")
+    context = build_rca_trigger_context(
+        source_kind=envelope.source_kind,
+        project_key=str(ticket["project_key"]),
+        project_simple_name=str(ticket["project_simple_name"]),
+        work_item_type_key=str(ticket["work_item_type_key"]),
+        work_item_id=str(ticket["work_item_id"]),
+        rule_version=str(resolved["creation_rule_version"]),
+        issue_url=str(ticket["issue_url"]),
+        title=str(ticket["title"]),
+    )
+    return admission, context
 
 
 def _projection_source(

@@ -13,7 +13,12 @@ from gateway.admission.controller import AdmissionController
 from gateway.admission.worker import QueueWorker
 from gateway.config import Platform
 from gateway.pnc_rca_kafka_contract import WorkflowEventPolicy, WorkflowTransition
-from gateway.pnc_rca_policy_config import ManualRcaAdmissionRuntimeConfig
+from gateway.pnc_rca_policy_config import (
+    ManualRcaAdmissionRuntimeConfig,
+    W3SnapshotAuthority,
+    W3_SNAPSHOT_AUTHORITY_SCHEMA_VERSION,
+)
+from gateway.pnc_rca_snapshot import canonical_json_sha256
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.platforms.feishu import FeishuAdapter
 from gateway.pnc_group_binding import (
@@ -81,6 +86,77 @@ def _manual_admission_runtime_config(
         ),
         outbox_high_watermark=outbox_high_watermark,
     )
+
+
+def _w3_manual_admission_runtime_config() -> ManualRcaAdmissionRuntimeConfig:
+    config = _manual_admission_runtime_config()
+    policy = config.active_policy
+    values = {
+        "creation_policy": {
+            "rule_version": policy.policy_version,
+            "workflow_event_policy_sha256": hashlib.sha256(
+                json.dumps(
+                    policy.to_dict(),
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+        },
+        "business_profile": {
+            "registry_version": "rca_business_profiles_v1",
+            "status": "matched",
+            "profile_id": "g1q3",
+            "execution_readiness": "ready",
+            "resource_class": "rca_prod",
+            "artifact_kind": "rca_html_report_and_viz_mcap",
+            "artifact_namespace": "rca/g1q3",
+        },
+        "execution_policy": {
+            "request_schema": "g1q3_rca_execution_request_v2",
+            "data_access_mode": "remote_read",
+            "allow_download": False,
+            "input_materialization": "forbidden",
+            "derived_artifacts_allowed": True,
+            "allow_feishu_writeback": False,
+            "group_response_cap": "L1",
+            "translate_baseline": "production",
+            "translate_contract_path": "",
+        },
+        "publication_policy": {"delivery_contract": "g1q3_delivery_contract_v1"},
+        "correction_lineage_policy": {"generation_rule": "explicit_user_rerun"},
+    }
+    policies = {}
+    for name, value in values.items():
+        version = f"{name}-v1"
+        policies[name] = {
+            "version": version,
+            "sha256": canonical_json_sha256({"version": version, "value": value}),
+            "value": value,
+        }
+    body = {
+        "schema_version": W3_SNAPSHOT_AUTHORITY_SCHEMA_VERSION,
+        "policies": policies,
+    }
+    return ManualRcaAdmissionRuntimeConfig(
+        active_policy=policy,
+        outbox_high_watermark=config.outbox_high_watermark,
+        w3_snapshot_authority=W3SnapshotAuthority(
+            authority_sha256=canonical_json_sha256(body),
+            policies=policies,
+        ),
+    )
+
+
+def _manual_authorization() -> dict:
+    return {
+        "schema_version": "pnc_rca_manual_authorization_v2",
+        "manual_intake_enabled": True,
+        "manual_chat_allowlist_valid": True,
+        "chat_allowed": True,
+        "mention_verified": True,
+        "authorized": True,
+    }
 
 
 def make_runner(receipt_dir=None):
@@ -248,10 +324,13 @@ async def test_explicit_issue_action_uses_manual_control_store_and_acks_current_
 
     response = await gateway_run.GatewayRunner._handle_message(runner, event)
 
-    assert "已创建" in response
-    assert "成功时为 HTML 报告，失败时为终态说明" in response
-    assert calls == [
-        {
+    assert "RCA 已受理" in response
+    assert "结果会回到当前话题" in response
+    assert len(calls) == 1
+    observed_call = dict(calls[0])
+    observed_authorization = observed_call.pop("manual_authorization")
+    observed_runtime_identity = observed_call.pop("gateway_runtime_identity")
+    assert observed_call == {
             "issue_url": issue_url,
             "mode": "run_or_join",
             "chat_id": G1Q3_GROUP_ID,
@@ -267,7 +346,8 @@ async def test_explicit_issue_action_uses_manual_control_store_and_acks_current_
                 runner._rca_manual_admission_runtime_config
             ),
         }
-    ]
+    assert observed_authorization == event.metadata["pnc_manual_authorization"]
+    assert observed_runtime_identity == _gateway_runtime_identity()
     assert event.metadata["pnc_manual_rca_admission"]["outcome"] == "created"
     authorization = event.metadata["pnc_manual_authorization"]
     assert authorization["schema_version"] == "pnc_rca_manual_authorization_v2"
@@ -367,8 +447,11 @@ async def test_admission_enabled_feishu_queue_reaches_manual_control_store_from_
     assert dequeued is item
     await worker._process_item(item)
 
-    assert calls == [
-        {
+    assert len(calls) == 1
+    observed_call = dict(calls[0])
+    observed_authorization = observed_call.pop("manual_authorization")
+    observed_runtime_identity = observed_call.pop("gateway_runtime_identity")
+    assert observed_call == {
             "issue_url": issue_url,
             "mode": "run_or_join",
             "chat_id": G1Q3_GROUP_ID,
@@ -384,7 +467,11 @@ async def test_admission_enabled_feishu_queue_reaches_manual_control_store_from_
                 runner._rca_manual_admission_runtime_config
             ),
         }
-    ]
+    assert observed_authorization["schema_version"] == (
+        "pnc_rca_manual_authorization_v2"
+    )
+    assert observed_authorization["authorized"] is True
+    assert observed_runtime_identity == _gateway_runtime_identity()
     assert item.status == "completed"
     assert item.result["durable_admission"] is True
     assert item.result["durable_feishu_completion"] is True
@@ -449,7 +536,7 @@ async def test_reply_to_single_issue_card_can_supply_identity_only(monkeypatch):
 
     response = await gateway_run.GatewayRunner._handle_message(runner, event)
 
-    assert "已创建" in response
+    assert "RCA 已受理" in response
     assert calls[0]["issue_url"] == issue_url
     assert calls[0]["mode"] == "run_or_join"
 
@@ -737,7 +824,7 @@ async def test_rerun_operator_reaches_control_store_with_operator_proof(monkeypa
 
     response = await gateway_run.GatewayRunner._handle_message(runner, event)
 
-    assert "已创建" in response
+    assert "RCA 已受理" in response
     assert calls[0]["mode"] == "rerun"
     assert calls[0]["operator_authorized"] is True
 
@@ -898,6 +985,119 @@ def test_manual_gateway_passes_exact_kafka_policy_and_high_watermark(
     assert policy["policy_version"] == "issue-created-v2"
 
 
+def test_manual_gateway_w3_uses_official_preread_before_admission(
+    monkeypatch, tmp_path
+):
+    from gateway.pnc_rca_control_store import RcaControlStore
+
+    control_path = tmp_path / "control.sqlite3"
+    monkeypatch.setenv("HERMES_RCA_KAFKA_CONTROL_DB_PATH", str(control_path))
+    RcaControlStore(control_path)
+    config = _w3_manual_admission_runtime_config()
+    preread_calls = []
+
+    def preread(**kwargs):
+        preread_calls.append(kwargs)
+        return SimpleNamespace(
+            status="fields_extracted",
+            source="meegle",
+            context_text=(
+                "## Feishu issue 已解析字段（主控侧读取）\n"
+                "- title: Official ACC title\n"
+                "- work_item_id: 7013527412\n"
+                "- project_key: project-key\n"
+                "- work_item_type: problem-type\n"
+                "- business_profile_contract: "
+                '{"profile_id":"g1q3","status":"matched"}\n'
+            ),
+        )
+
+    result = gateway_run._admit_g1q3_manual_trigger(
+        issue_url="https://project.feishu.cn/g1q3/issue/detail/7013527412",
+        mode="run_or_join",
+        chat_id=G1Q3_GROUP_ID,
+        thread_id="topic:om_w3_root",
+        message_id="om_w3_source",
+        requester_id="ou_test_user",
+        submit_enabled=True,
+        operator_authorized=False,
+        operator_rate_limit=3,
+        operator_rate_window_seconds=600,
+        allowed_chat_ids=(G1Q3_GROUP_ID,),
+        admission_runtime_config=config,
+        manual_authorization=_manual_authorization(),
+        gateway_runtime_identity=_gateway_runtime_identity(),
+        issue_preread=preread,
+    )
+
+    assert preread_calls == [
+        {"project_key": "project-key", "work_item_id": "7013527412"}
+    ]
+    assert result["outcome"] == "created"
+    store = RcaControlStore(control_path)
+    [snapshot] = store.list_rows("rca_admission_snapshots")
+    snapshot_json = json.loads(snapshot["admission_snapshot_json"])
+    assert snapshot_json["canonical_request"]["ticket"]["title"] == (
+        "Official ACC title"
+    )
+    assert len(store.list_rows("rca_snapshot_source_envelopes")) == 1
+
+
+def test_manual_gateway_w3_rejects_missing_official_title_before_business_rows(
+    monkeypatch, tmp_path
+):
+    from gateway.pnc_rca_control_store import ManualRcaAdmissionError, RcaControlStore
+
+    control_path = tmp_path / "control.sqlite3"
+    monkeypatch.setenv("HERMES_RCA_KAFKA_CONTROL_DB_PATH", str(control_path))
+    RcaControlStore(control_path)
+    config = _w3_manual_admission_runtime_config()
+
+    def preread(**_kwargs):
+        return SimpleNamespace(
+            status="fields_extracted",
+            source="meegle",
+            context_text=(
+                "## Feishu issue 已解析字段（主控侧读取）\n"
+                "- business_profile_contract: "
+                '{"profile_id":"g1q3","status":"matched"}\n'
+            ),
+        )
+
+    with pytest.raises(
+        ManualRcaAdmissionError,
+        match="w3_manual_official_ticket_title_missing",
+    ):
+        gateway_run._admit_g1q3_manual_trigger(
+            issue_url="https://project.feishu.cn/g1q3/issue/detail/7013527412",
+            mode="run_or_join",
+            chat_id=G1Q3_GROUP_ID,
+            thread_id="topic:om_w3_root",
+            message_id="om_w3_source",
+            requester_id="ou_test_user",
+            submit_enabled=True,
+            operator_authorized=False,
+            operator_rate_limit=3,
+            operator_rate_window_seconds=600,
+            allowed_chat_ids=(G1Q3_GROUP_ID,),
+            admission_runtime_config=config,
+            manual_authorization=_manual_authorization(),
+            gateway_runtime_identity=_gateway_runtime_identity(),
+            issue_preread=preread,
+        )
+
+    store = RcaControlStore(control_path)
+    for table in (
+        "business_triggers",
+        "rca_outbox",
+        "rca_trigger_sources",
+        "rca_trigger_bindings",
+        "rca_admission_snapshots",
+        "rca_snapshot_source_envelopes",
+    ):
+        assert store.list_rows(table) == []
+
+
 def test_manual_gateway_activation_switch_is_strict_and_public(monkeypatch):
     config = _manual_admission_runtime_config()
 
@@ -1019,7 +1219,7 @@ async def test_duplicate_manual_source_event_fails_closed_before_second_admissio
         runner, make_feishu_event(f"@PNC-Agent 分析这个问题 {issue_url}")
     )
 
-    assert "已创建" in first
+    assert "RCA 已受理" in first
     assert "授权回执写入失败" in replay
     assert "安全中止" in replay
     assert len(calls) == 1

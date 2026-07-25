@@ -35,6 +35,7 @@ from gateway.pnc_rca_admission import (
 from gateway.pnc_rca_control_store import (
     OutboxClaim,
     RcaControlStore,
+    RecordConflictError,
     StaleOutboxLeaseError,
 )
 from gateway.pnc_rca_delivery_store import (
@@ -70,6 +71,10 @@ from gateway.pnc_rca_prod_admission import (
     hmac_key_fingerprint,
     live_resource_policy,
 )
+from gateway.pnc_rca_policy_config import (
+    W3SnapshotAuthority,
+    w3_snapshot_read_config_from_env,
+)
 from gateway.pnc_rca_runtime_identity import (
     MAX_HEALTH_FUTURE_SKEW_SECONDS,
     RCA_OUTBOX_DISPATCHER_LOADED_DEPENDENCIES,
@@ -84,6 +89,12 @@ from gateway.pnc_rca_schema import (
     build_execution_request,
     issue_context_from_compact_text,
     validate_issue_context_fields,
+)
+from gateway.pnc_rca_snapshot import (
+    AdmissionSnapshotExecutionBundle,
+    snapshot_execution_inputs,
+    snapshot_execution_request_inputs,
+    validate_snapshot_execution_bundle,
 )
 from gateway.pnc_rca_workspace_runtime import (
     WORKSPACE_RUNTIME_FILES,
@@ -162,6 +173,7 @@ _SERVICE_ERROR_CODES = frozenset({
 _GLOBAL_CIRCUIT_ERROR_CODES = frozenset({
     "dispatcher_bootstrap_authorization_invalid",
     "dispatcher_dependency_unavailable",
+    "dispatcher_snapshot_authority_mismatch",
     "dispatcher_submit_contract_invalid",
     "derived_capacity_reservation_abort_precreate_response_invalid",
     "derived_capacity_reservation_abort_precreate_unavailable",
@@ -193,6 +205,9 @@ _PER_CASE_QUARANTINE_ERROR_CODES = frozenset({
     "dispatcher_outbox_contract_invalid",
     "dispatcher_outbox_identity_mismatch",
     "dispatcher_remote_data_access_invalid",
+    "dispatcher_snapshot_contract_invalid",
+    "dispatcher_snapshot_identity_mismatch",
+    "dispatcher_snapshot_missing",
     "dispatcher_submit_identity_mismatch",
     "derived_capacity_reservation_contract_invalid",
     "derived_capacity_reservation_identity_mismatch",
@@ -375,6 +390,8 @@ class DispatcherConfig:
     bootstrap_epoch_id: str
     active_release_binding_path: Path
     live_env_path: Path
+    w3_snapshot_read_mode: str
+    w3_snapshot_authority: W3SnapshotAuthority | None
 
     @classmethod
     def from_env(
@@ -526,6 +543,9 @@ class DispatcherConfig:
                 "bootstrap RCA production capacity requires valid release and "
                 "epoch ids"
             )
+        w3_snapshot_read_mode, w3_snapshot_authority = (
+            w3_snapshot_read_config_from_env(source)
+        )
         config = cls(
             dispatch_enabled=dispatch_enabled,
             control_db_path=control_db_path,
@@ -601,6 +621,8 @@ class DispatcherConfig:
                 control_db_path.parent / ACTIVE_RELEASE_BINDING_NAME
             ),
             live_env_path=home / ".env",
+            w3_snapshot_read_mode=w3_snapshot_read_mode,
+            w3_snapshot_authority=w3_snapshot_authority,
         )
         longest_boundary = max(
             config.storage_timeout_seconds,
@@ -669,6 +691,14 @@ class DispatcherConfig:
             "bootstrap_epoch_id": self.bootstrap_epoch_id,
             "active_release_binding_path": str(self.active_release_binding_path),
             "live_env_path": str(self.live_env_path),
+            "w3_snapshot_read": (
+                {
+                    "mode": self.w3_snapshot_read_mode,
+                    **self.w3_snapshot_authority.to_public_dict(),
+                }
+                if self.w3_snapshot_authority is not None
+                else {"enabled": False, "mode": self.w3_snapshot_read_mode}
+            ),
         }
 
     def runtime_public_dict(self) -> dict[str, Any]:
@@ -824,6 +854,11 @@ def default_submit(
                 "active_release_binding_sha256"
             ],
         }
+    snapshot_requirement = (
+        {"snapshot_required": True}
+        if config.w3_snapshot_read_mode == "snapshot_required"
+        else {}
+    )
     return vm_task_submit_service(
         service_id=DEFAULT_SERVICE_ID,
         capability=SERVICE_CAPABILITY,
@@ -832,6 +867,7 @@ def default_submit(
         execution_request=execution_request,
         reconcile_only=reconcile_only,
         capacity_mode=config.capacity_mode,
+        **snapshot_requirement,
         **capacity_bindings,
     )
 
@@ -1396,9 +1432,75 @@ def default_storage_admission(
     return payload
 
 
+def _validated_snapshot_claim_contract(
+    claim: OutboxClaim,
+    snapshot_bundle: AdmissionSnapshotExecutionBundle,
+) -> tuple[RcaAdmission, dict[str, Any]]:
+    try:
+        bundle = validate_snapshot_execution_bundle(snapshot_bundle)
+        admission, context = snapshot_execution_inputs(bundle)
+    except Exception as exc:
+        raise DispatchCircuitError(
+            "dispatcher_snapshot_contract_invalid",
+            f"invalid immutable execution snapshot: {type(exc).__name__}",
+        ) from exc
+    envelope = bundle.creator_source_envelope
+    refs = admission.source_refs
+    resolved = bundle.snapshot.resolved_admission
+    if claim.action != "submit_rca_issue_intake":
+        raise DispatchCircuitError(
+            "dispatcher_outbox_action_invalid",
+            "unsupported outbox action",
+        )
+    if (
+        claim.business_key != resolved["business_key"]
+        or claim.submission_key != resolved["submission_key"]
+        or claim.creation_rule_version != resolved["creation_rule_version"]
+        or claim.generation != resolved["generation"]
+        or claim.origin_source_id != envelope.source_id
+    ):
+        raise DispatchCircuitError(
+            "dispatcher_snapshot_identity_mismatch",
+            "durable outbox identity disagrees with the immutable execution snapshot",
+        )
+    if envelope.source_kind == "kafka_workflow_event":
+        metadata = envelope.source_metadata
+        if (
+            claim.source_event_id != metadata["event_uid"]
+            or claim.source_topic != metadata["topic"]
+            or claim.source_partition != metadata["partition"]
+            or claim.source_offset != metadata["offset"]
+            or refs.topic != metadata["topic"]
+            or refs.partition != metadata["partition"]
+            or refs.offset != metadata["offset"]
+        ):
+            raise DispatchCircuitError(
+                "dispatcher_snapshot_identity_mismatch",
+                "durable Kafka lineage disagrees with the immutable creator envelope",
+            )
+    elif any(
+        value is not None
+        for value in (
+            claim.source_event_id,
+            claim.source_topic,
+            claim.source_partition,
+            claim.source_offset,
+        )
+    ):
+        raise DispatchCircuitError(
+            "dispatcher_snapshot_identity_mismatch",
+            "manual snapshot creator must not carry Kafka lineage",
+        )
+    return admission, context.to_dict()
+
+
 def _validated_claim_contract(
     claim: OutboxClaim,
+    *,
+    snapshot_bundle: AdmissionSnapshotExecutionBundle | None = None,
 ) -> tuple[RcaAdmission, dict[str, Any]]:
+    if snapshot_bundle is not None:
+        return _validated_snapshot_claim_contract(claim, snapshot_bundle)
     payload = claim.payload
     payload_schema = str(payload.get("schema_version") or "")
     if payload_schema not in SUPPORTED_OUTBOX_PAYLOAD_SCHEMA_VERSIONS:
@@ -1662,6 +1764,7 @@ def build_dispatch_execution_request(
     issue_context: RcaIssueContext,
     config: DispatcherConfig,
     storage_admission_summary: Mapping[str, Any],
+    snapshot_bundle: AdmissionSnapshotExecutionBundle | None = None,
 ) -> RcaExecutionRequest:
     """Build a source-neutral request bound to the canonical submission paths."""
     refs = admission.source_refs
@@ -1674,6 +1777,47 @@ def build_dispatch_execution_request(
             "dispatcher_enrichment_identity_mismatch",
             "enriched issue identity does not match admission",
         )
+    bundle: AdmissionSnapshotExecutionBundle | None = None
+    frozen_profile: dict[str, Any] | None = None
+    frozen_execution_policy: dict[str, Any] | None = None
+    if snapshot_bundle is not None:
+        try:
+            bundle = validate_snapshot_execution_bundle(snapshot_bundle)
+            snapshot_admission, snapshot_context = snapshot_execution_inputs(bundle)
+            frozen_profile, frozen_execution_policy = (
+                snapshot_execution_request_inputs(bundle)
+            )
+        except Exception as exc:
+            raise DispatchCircuitError(
+                "dispatcher_snapshot_contract_invalid",
+                f"invalid immutable execution snapshot: {type(exc).__name__}",
+            ) from exc
+        ticket = bundle.snapshot.canonical_request.ticket
+        if (
+            snapshot_admission != admission
+            or snapshot_context.project_key != issue_context.project_key
+            or snapshot_context.work_item_type_key != issue_context.work_item_type
+            or snapshot_context.work_item_id != issue_context.work_item_id
+            or snapshot_context.issue_url.rstrip("/")
+            != issue_context.url.rstrip("/")
+            or (
+                issue_context.title
+                and snapshot_context.title != issue_context.title.strip()
+            )
+        ):
+            raise DispatchCircuitError(
+                "dispatcher_enrichment_identity_mismatch",
+                "live enrichment disagrees with the immutable snapshot ticket",
+            )
+        issue_context = replace(
+            issue_context,
+            project_key=str(ticket["project_key"]),
+            work_item_type=str(ticket["work_item_type_key"]),
+            work_item_id=str(ticket["work_item_id"]),
+            url=str(ticket["issue_url"]),
+            title=str(ticket["title"]),
+            business_profile=frozen_profile,
+        )
     artifact_root, artifact_cifs_root = canonical_artifact_paths(
         admission.submission_key
     )
@@ -1684,20 +1828,63 @@ def build_dispatch_execution_request(
         artifact_root=artifact_root,
         artifact_cifs_root=artifact_cifs_root,
         allow_download=False,
-        allow_feishu_writeback=config.allow_feishu_writeback,
-        group_response_cap=config.group_response_cap,
-        translate_baseline=config.translate_baseline,
-        translate_contract_path=config.translate_contract_path,
+        allow_feishu_writeback=(
+            frozen_execution_policy["allow_feishu_writeback"]
+            if frozen_execution_policy is not None
+            else config.allow_feishu_writeback
+        ),
+        group_response_cap=(
+            frozen_execution_policy["group_response_cap"]
+            if frozen_execution_policy is not None
+            else config.group_response_cap
+        ),
+        translate_baseline=(
+            frozen_execution_policy["translate_baseline"]
+            if frozen_execution_policy is not None
+            else config.translate_baseline
+        ),
+        translate_contract_path=(
+            frozen_execution_policy["translate_contract_path"]
+            if frozen_execution_policy is not None
+            else config.translate_contract_path
+        ),
         toolchain={
             "intake_dispatcher": DISPATCHER_HEALTH_SCHEMA_VERSION,
             "storage_admission": dict(storage_admission_summary),
+            **(
+                {"w3_execution_snapshot": bundle.to_dict()}
+                if bundle is not None
+                else {}
+            ),
         },
     )
-    trigger_context = claim.payload.get("trigger_context")
-    trigger_context = trigger_context if isinstance(trigger_context, Mapping) else {}
-    source_kind = str(
-        trigger_context.get("source_kind") or "kafka_workflow_event"
-    ).strip()
+    if frozen_execution_policy is not None:
+        observed_policy = {
+            key: request.execution_policy.get(key)
+            for key in frozen_execution_policy
+            if key != "request_schema"
+        }
+        expected_policy = {
+            key: value
+            for key, value in frozen_execution_policy.items()
+            if key != "request_schema"
+        }
+        if observed_policy != expected_policy:
+            raise DispatchCircuitError(
+                "dispatcher_snapshot_policy_projection_mismatch",
+                "VM execution policy does not match immutable W3 authority",
+            )
+    if bundle is not None:
+        envelope = bundle.creator_source_envelope
+        source_kind = envelope.source_kind
+        origin_source_id = envelope.source_id
+    else:
+        trigger_context = claim.payload.get("trigger_context")
+        trigger_context = trigger_context if isinstance(trigger_context, Mapping) else {}
+        source_kind = str(
+            trigger_context.get("source_kind") or "kafka_workflow_event"
+        ).strip()
+        origin_source_id = claim.origin_source_id
     durable_source_refs: dict[str, Any] = {
         "task_id": admission.submission_key,
         "source_kind": source_kind,
@@ -1705,16 +1892,39 @@ def build_dispatch_execution_request(
         "generation": claim.generation,
         "business_key": admission.business_key,
         "submission_key": admission.submission_key,
-        "origin_source_id": claim.origin_source_id,
+        "origin_source_id": origin_source_id,
     }
-    if claim.source_event_id is not None:
-        durable_source_refs["source_event_id"] = claim.source_event_id
-    if claim.source_topic is not None:
-        durable_source_refs["topic"] = claim.source_topic
-    if claim.source_partition is not None:
-        durable_source_refs["partition"] = claim.source_partition
-    if claim.source_offset is not None:
-        durable_source_refs["offset"] = claim.source_offset
+    if bundle is not None:
+        durable_source_refs.update(
+            {
+                "snapshot_id": bundle.snapshot.snapshot_id,
+                "snapshot_sha256": bundle.snapshot.snapshot_sha256,
+                "request_sha256": bundle.snapshot.request_sha256,
+                "snapshot_bundle_sha256": bundle.bundle_sha256,
+                "creator_source_envelope_sha256": (
+                    bundle.creator_source_envelope.source_envelope_sha256
+                ),
+            }
+        )
+        if source_kind == "kafka_workflow_event":
+            metadata = bundle.creator_source_envelope.source_metadata
+            durable_source_refs.update(
+                {
+                    "source_event_id": metadata["event_uid"],
+                    "topic": metadata["topic"],
+                    "partition": metadata["partition"],
+                    "offset": metadata["offset"],
+                }
+            )
+    else:
+        if claim.source_event_id is not None:
+            durable_source_refs["source_event_id"] = claim.source_event_id
+        if claim.source_topic is not None:
+            durable_source_refs["topic"] = claim.source_topic
+        if claim.source_partition is not None:
+            durable_source_refs["partition"] = claim.source_partition
+        if claim.source_offset is not None:
+            durable_source_refs["offset"] = claim.source_offset
     request = replace(
         request,
         source_refs=durable_source_refs,
@@ -1774,6 +1984,7 @@ def _submission_receipt(
     submission_key: str,
     capacity_admission_summary: Mapping[str, Any],
     derived_capacity_reservation_receipt: Mapping[str, Any],
+    snapshot_bundle: AdmissionSnapshotExecutionBundle | None = None,
 ) -> dict[str, Any]:
     task = result.get("task")
     task = task if isinstance(task, Mapping) else {}
@@ -1783,7 +1994,7 @@ def _submission_receipt(
             "dispatcher_submit_identity_mismatch",
             "successful submit did not return the canonical submission task id",
         )
-    return {
+    receipt = {
         "success": True,
         "submission_key": submission_key,
         "task_id": task_id,
@@ -1821,6 +2032,26 @@ def _submission_receipt(
             ),
         },
     }
+    if snapshot_bundle is not None:
+        bundle = validate_snapshot_execution_bundle(snapshot_bundle)
+        expected_w3_binding = {
+            "schema_version": bundle.schema_version,
+            "bundle_sha256": bundle.bundle_sha256,
+            "snapshot_authority_sha256": bundle.snapshot_authority_sha256,
+            "snapshot_id": bundle.snapshot.snapshot_id,
+            "snapshot_sha256": bundle.snapshot.snapshot_sha256,
+            "request_sha256": bundle.snapshot.request_sha256,
+            "creator_source_envelope_sha256": (
+                bundle.creator_source_envelope.source_envelope_sha256
+            ),
+        }
+        if result.get("w3_execution_snapshot") != expected_w3_binding:
+            raise DispatchCircuitError(
+                "dispatcher_submit_identity_mismatch",
+                "successful submit did not echo the immutable W3 snapshot binding",
+            )
+        receipt["w3_execution_snapshot"] = expected_w3_binding
+    return receipt
 
 
 def _is_definitive_precreate_failure(result: Mapping[str, Any]) -> bool:
@@ -1950,7 +2181,35 @@ class OutboxDispatcher:
             return DispatchOutcome(status="idle")
         self.stats.claimed += 1
         try:
-            admission, event = _validated_claim_contract(claim)
+            snapshot_bundle: AdmissionSnapshotExecutionBundle | None = None
+            if self.config.w3_snapshot_read_mode == "snapshot_required":
+                try:
+                    snapshot_bundle = self.store.read_w3_execution_snapshot(
+                        claim.submission_key,
+                        snapshot_authority=self.config.w3_snapshot_authority,
+                        required=True,
+                    )
+                except RecordConflictError as exc:
+                    reason = str(exc)
+                    if reason == "w3_execution_snapshot_missing":
+                        code = "dispatcher_snapshot_missing"
+                    elif reason == "w3_execution_snapshot_authority_mismatch":
+                        code = "dispatcher_snapshot_authority_mismatch"
+                    else:
+                        code = "dispatcher_snapshot_contract_invalid"
+                    raise DispatchCircuitError(code, reason) from exc
+                if not isinstance(
+                    snapshot_bundle,
+                    AdmissionSnapshotExecutionBundle,
+                ):
+                    raise DispatchCircuitError(
+                        "dispatcher_snapshot_contract_invalid",
+                        "control store returned no immutable execution snapshot",
+                    )
+            admission, event = _validated_claim_contract(
+                claim,
+                snapshot_bundle=snapshot_bundle,
+            )
             self._renew(claim)
             issue_context = self.enrich(event)
             if not isinstance(issue_context, RcaIssueContext):
@@ -2009,6 +2268,7 @@ class OutboxDispatcher:
                     issue_context=issue_context,
                     config=self.config,
                     storage_admission_summary=storage_summary,
+                    snapshot_bundle=snapshot_bundle,
                 )
             except DispatchCircuitError:
                 raise
@@ -2136,6 +2396,7 @@ class OutboxDispatcher:
                     derived_capacity_reservation_receipt=(
                         validated_reservation.receipt
                     ),
+                    snapshot_bundle=snapshot_bundle,
                 )
                 self._renew(claim)
                 self.store.complete_outbox(

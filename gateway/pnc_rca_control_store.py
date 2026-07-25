@@ -67,11 +67,21 @@ INPUT_WAIT_TERMINAL_NEW_GENERATION_REASON = (
 )
 INPUT_WAIT_EXECUTION_WATCH_PRESENT_REASON = "input_wait_execution_watch_present"
 MANUAL_SHADOW_PROMOTED_REASON = "manual_shadow_promoted"
+W3_KAFKA_OBSERVATION_JOIN_REASON = "w3_automatic_generation_observation_joined"
+W3_LEGACY_PARENT_SNAPSHOT_MISSING_REASON = "w3_legacy_parent_snapshot_missing"
+W3_AUTOMATIC_OBSERVATION_SNAPSHOT_MISMATCH_REASON = (
+    "w3_automatic_observation_snapshot_mismatch"
+)
 ISSUE_SCOPE_CONFLICT_REASON = "issue_scope_business_key_conflict"
 LEGACY_KAFKA_GENERATION_REASON = (
     "issue_scope_legacy_kafka_generation_requires_migration"
 )
 MANUAL_POLICY_OBSERVED_OUTCOME = "manual_active_policy_observed"
+W3_TICKET_AUTHORITY_SCHEMA_VERSION = "pnc_rca_w3_ticket_authority_v1"
+W3_INGRESS_AUTHORIZATION_SCHEMA_VERSION = (
+    "pnc_rca_w3_ingress_authorization_evidence_v1"
+)
+W3_MANUAL_AUTHORITY_SCHEMA_VERSION = "pnc_rca_w3_manual_ingress_authority_v1"
 INPUT_WAIT_REARM_ERROR_CODES = frozenset(
     {
         "host_issue_preread_empty",
@@ -144,6 +154,270 @@ def _canonical_json(value: Any) -> str:
 
 def _canonical_sha256(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def build_w3_ticket_authority_receipt(
+    *,
+    source_kind: str,
+    source_evidence_sha256: str,
+    observed_at: str,
+    project_key: str,
+    project_simple_name: str,
+    work_item_type_key: str,
+    work_item_id: str,
+    issue_url: str,
+    title: str,
+) -> dict[str, Any]:
+    """Build the external title pin consumed by W3 admission."""
+    from gateway.pnc_rca_snapshot import canonical_ticket_title_sha256
+
+    source = str(source_kind or "").strip()
+    evidence = str(source_evidence_sha256 or "").strip()
+    if source not in {"kafka_durable_inbox", "feishu_official_preread"}:
+        raise ValueError("w3_ticket_authority_source_invalid")
+    if _ACTIVATION_SHA256_RE.fullmatch(evidence) is None or evidence == "0" * 64:
+        raise ValueError("w3_ticket_authority_evidence_invalid")
+    current = _iso(datetime.fromisoformat(str(observed_at).replace("Z", "+00:00")))
+    ticket = {
+        "project_key": str(project_key or "").strip(),
+        "project_simple_name": str(project_simple_name or "").strip(),
+        "work_item_type_key": str(work_item_type_key or "").strip(),
+        "work_item_id": str(work_item_id or "").strip(),
+        "issue_url": str(issue_url or "").strip().rstrip("/"),
+        "title": str(title or "").strip(),
+    }
+    if not all(ticket.values()):
+        raise ValueError("w3_ticket_authority_ticket_invalid")
+    expected_url = (
+        f"https://project.feishu.cn/{ticket['project_simple_name']}/issue/detail/"
+        f"{ticket['work_item_id']}"
+    )
+    if ticket["issue_url"] != expected_url:
+        raise ValueError("w3_ticket_authority_issue_url_invalid")
+    ticket["title_sha256"] = canonical_ticket_title_sha256(ticket["title"])
+    payload = {
+        "schema_version": W3_TICKET_AUTHORITY_SCHEMA_VERSION,
+        "source_kind": source,
+        "source_evidence_sha256": evidence,
+        "observed_at": current,
+        "ticket": ticket,
+    }
+    return {**payload, "ticket_authority_sha256": _canonical_sha256(payload)}
+
+
+def _validate_w3_ticket_authority_receipt(value: Mapping[str, Any]) -> dict[str, Any]:
+    expected_fields = {
+        "schema_version",
+        "ticket_authority_sha256",
+        "source_kind",
+        "source_evidence_sha256",
+        "observed_at",
+        "ticket",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected_fields:
+        raise ValueError("w3_ticket_authority_schema_invalid")
+    ticket = value.get("ticket")
+    if not isinstance(ticket, Mapping) or set(ticket) != {
+        "project_key",
+        "project_simple_name",
+        "work_item_type_key",
+        "work_item_id",
+        "issue_url",
+        "title",
+        "title_sha256",
+    }:
+        raise ValueError("w3_ticket_authority_schema_invalid")
+    rebuilt = build_w3_ticket_authority_receipt(
+        source_kind=str(value.get("source_kind") or ""),
+        source_evidence_sha256=str(value.get("source_evidence_sha256") or ""),
+        observed_at=str(value.get("observed_at") or ""),
+        project_key=str(ticket.get("project_key") or ""),
+        project_simple_name=str(ticket.get("project_simple_name") or ""),
+        work_item_type_key=str(ticket.get("work_item_type_key") or ""),
+        work_item_id=str(ticket.get("work_item_id") or ""),
+        issue_url=str(ticket.get("issue_url") or ""),
+        title=str(ticket.get("title") or ""),
+    )
+    if rebuilt != dict(value):
+        raise ValueError("w3_ticket_authority_binding_invalid")
+    return rebuilt
+
+
+def build_w3_manual_ingress_authority(
+    *,
+    manual_authorization: Mapping[str, Any],
+    gateway_runtime_identity: Mapping[str, Any],
+    source_identity: Mapping[str, Any],
+    ticket_authority_sha256: str,
+    snapshot_authority_sha256: str,
+) -> dict[str, Any]:
+    """Bind a human Gateway decision to one exact manual source identity."""
+    from gateway.pnc_rca_runtime_identity import runtime_identity_is_valid
+
+    authorization = dict(manual_authorization)
+    if (
+        authorization.get("schema_version") != "pnc_rca_manual_authorization_v2"
+        or authorization.get("authorized") is not True
+        or authorization.get("manual_intake_enabled") is not True
+        or authorization.get("manual_chat_allowlist_valid") is not True
+        or authorization.get("chat_allowed") is not True
+        or authorization.get("mention_verified") is not True
+    ):
+        raise ValueError("w3_manual_authorization_invalid")
+    runtime_identity = dict(gateway_runtime_identity)
+    if not runtime_identity_is_valid(
+        runtime_identity,
+        service_label="ai.hermes.gateway",
+    ):
+        raise ValueError("w3_manual_gateway_runtime_identity_invalid")
+    identity = {
+        str(key): value for key, value in dict(source_identity).items()
+    }
+    required_identity = {
+        "platform",
+        "chat_id",
+        "thread_id",
+        "message_id",
+        "requester_id",
+        "issue_url",
+        "mode",
+    }
+    if set(identity) != required_identity or not all(
+        isinstance(identity[name], str) and identity[name].strip()
+        for name in required_identity
+    ):
+        raise ValueError("w3_manual_source_identity_invalid")
+    ticket_authority = str(ticket_authority_sha256 or "").strip()
+    snapshot_authority = str(snapshot_authority_sha256 or "").strip()
+    if any(
+        _ACTIVATION_SHA256_RE.fullmatch(item) is None or item == "0" * 64
+        for item in (ticket_authority, snapshot_authority)
+    ):
+        raise ValueError("w3_manual_root_authority_invalid")
+    payload = {
+        "schema_version": W3_MANUAL_AUTHORITY_SCHEMA_VERSION,
+        "manual_authorization_sha256": _canonical_sha256(authorization),
+        "gateway_runtime_identity_sha256": _canonical_sha256(runtime_identity),
+        "source_identity_sha256": _canonical_sha256(identity),
+        "ticket_authority_sha256": ticket_authority,
+        "snapshot_authority_sha256": snapshot_authority,
+    }
+    return {**payload, "authority_sha256": _canonical_sha256(payload)}
+
+
+def _validate_w3_manual_ingress_authority(
+    value: Mapping[str, Any],
+    *,
+    expected_source_identity: Mapping[str, Any],
+    expected_ticket_authority_sha256: str,
+    expected_snapshot_authority_sha256: str,
+) -> dict[str, Any]:
+    expected_fields = {
+        "schema_version",
+        "manual_authorization_sha256",
+        "gateway_runtime_identity_sha256",
+        "source_identity_sha256",
+        "ticket_authority_sha256",
+        "snapshot_authority_sha256",
+        "authority_sha256",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected_fields:
+        raise ValueError("w3_manual_ingress_authority_schema_invalid")
+    normalized = {str(key): item for key, item in value.items()}
+    if normalized["schema_version"] != W3_MANUAL_AUTHORITY_SCHEMA_VERSION:
+        raise ValueError("w3_manual_ingress_authority_schema_invalid")
+    for name in expected_fields - {"schema_version"}:
+        if (
+            not isinstance(normalized[name], str)
+            or _ACTIVATION_SHA256_RE.fullmatch(normalized[name]) is None
+            or normalized[name] == "0" * 64
+        ):
+            raise ValueError("w3_manual_ingress_authority_hash_invalid")
+    if normalized["source_identity_sha256"] != _canonical_sha256(
+        dict(expected_source_identity)
+    ):
+        raise ValueError("w3_manual_ingress_authority_source_mismatch")
+    if (
+        normalized["ticket_authority_sha256"]
+        != expected_ticket_authority_sha256
+        or normalized["snapshot_authority_sha256"]
+        != expected_snapshot_authority_sha256
+    ):
+        raise ValueError("w3_manual_ingress_authority_root_mismatch")
+    payload = {
+        key: normalized[key] for key in expected_fields if key != "authority_sha256"
+    }
+    if normalized["authority_sha256"] != _canonical_sha256(payload):
+        raise ValueError("w3_manual_ingress_authority_binding_invalid")
+    return normalized
+
+
+def _normalize_w3_snapshot_authority(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    runtime_value = (
+        value.to_runtime_dict() if hasattr(value, "to_runtime_dict") else value
+    )
+    if not isinstance(runtime_value, Mapping) or set(runtime_value) != {
+        "schema_version",
+        "authority_sha256",
+        "policies",
+    }:
+        raise ValueError("w3_snapshot_authority_schema_invalid")
+    from gateway.pnc_rca_policy_config import (
+        W3_SNAPSHOT_AUTHORITY_SCHEMA_VERSION,
+        W3_SNAPSHOT_POLICY_NAMES,
+    )
+    from gateway.pnc_rca_snapshot import canonical_json_sha256
+
+    if runtime_value["schema_version"] != W3_SNAPSHOT_AUTHORITY_SCHEMA_VERSION:
+        raise ValueError("w3_snapshot_authority_schema_invalid")
+    policies = runtime_value["policies"]
+    if not isinstance(policies, Mapping) or set(policies) != set(
+        W3_SNAPSHOT_POLICY_NAMES
+    ):
+        raise ValueError("w3_snapshot_authority_policy_invalid")
+    normalized_policies: dict[str, dict[str, Any]] = {}
+    for name in W3_SNAPSHOT_POLICY_NAMES:
+        policy = policies[name]
+        if not isinstance(policy, Mapping) or set(policy) != {
+            "version",
+            "sha256",
+            "value",
+        }:
+            raise ValueError("w3_snapshot_authority_policy_invalid")
+        version = str(policy["version"] or "").strip()
+        policy_sha256 = str(policy["sha256"] or "").strip()
+        policy_value = policy["value"]
+        if (
+            not version
+            or _ACTIVATION_SHA256_RE.fullmatch(policy_sha256) is None
+            or not isinstance(policy_value, Mapping)
+            or not policy_value
+            or policy_value.get("state") == "unbound"
+        ):
+            raise ValueError("w3_snapshot_authority_policy_invalid")
+        normalized_policy = {
+            "version": version,
+            "sha256": policy_sha256,
+            "value": dict(policy_value),
+        }
+        if canonical_json_sha256(
+            {"version": version, "value": normalized_policy["value"]}
+        ) != policy_sha256:
+            raise ValueError("w3_snapshot_authority_policy_invalid")
+        normalized_policies[name] = normalized_policy
+    authority_body = {
+        "schema_version": W3_SNAPSHOT_AUTHORITY_SCHEMA_VERSION,
+        "policies": normalized_policies,
+    }
+    authority_sha256 = str(runtime_value["authority_sha256"] or "").strip()
+    if (
+        _ACTIVATION_SHA256_RE.fullmatch(authority_sha256) is None
+        or authority_sha256 != canonical_json_sha256(authority_body)
+    ):
+        raise ValueError("w3_snapshot_authority_hash_invalid")
+    return {**authority_body, "authority_sha256": authority_sha256}
 
 
 def _stable_key(prefix: str, material: Mapping[str, Any]) -> str:
@@ -7099,8 +7373,392 @@ class RcaControlStore:
         finally:
             conn.close()
 
+    def read_w3_execution_snapshot(
+        self,
+        submission_key: str,
+        *,
+        snapshot_authority: Any,
+        required: bool = False,
+    ) -> Any | None:
+        """Read and independently validate the immutable W3 execution authority."""
+        key = str(submission_key or "").strip()
+        if not key:
+            raise ValueError("w3_execution_snapshot_submission_key_required")
+        if not isinstance(required, bool):
+            raise TypeError("required must be true or false")
+        approved_authority = _normalize_w3_snapshot_authority(snapshot_authority)
+        if approved_authority is None:
+            raise ValueError("w3_snapshot_authority_required")
+        approved_policy_pins = {
+            name: str(policy["sha256"])
+            for name, policy in approved_authority["policies"].items()
+        }
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            snapshot_row = conn.execute(
+                "SELECT * FROM rca_admission_snapshots WHERE submission_key = ?",
+                (key,),
+            ).fetchone()
+            if snapshot_row is None:
+                conn.commit()
+                if required:
+                    raise RecordConflictError("w3_execution_snapshot_missing")
+                return None
+            request_row = conn.execute(
+                "SELECT * FROM rca_canonical_requests WHERE request_sha256 = ?",
+                (snapshot_row["request_sha256"],),
+            ).fetchone()
+            envelope_row = conn.execute(
+                """
+                SELECT * FROM rca_snapshot_source_envelopes
+                 WHERE source_envelope_sha256 = ?
+                   AND source_authority_sha256 = ?
+                   AND source_id = ?
+                   AND binding_action = 'create'
+                """,
+                (
+                    snapshot_row["creator_source_envelope_sha256"],
+                    snapshot_row["creator_authority_sha256"],
+                    snapshot_row["creator_source_id"],
+                ),
+            ).fetchone()
+            authority_row = (
+                conn.execute(
+                    """
+                    SELECT * FROM rca_source_authority_receipts
+                     WHERE authority_sha256 = ? AND source_id = ?
+                    """,
+                    (
+                        snapshot_row["creator_authority_sha256"],
+                        snapshot_row["creator_source_id"],
+                    ),
+                ).fetchone()
+                if envelope_row is not None
+                else None
+            )
+            lineage_row = conn.execute(
+                """
+                SELECT outbox.origin_source_id AS outbox_origin_source_id,
+                       trigger.origin_source_id AS trigger_origin_source_id,
+                       binding.role AS binding_role,
+                       binding.business_key AS binding_business_key,
+                       binding.generation AS binding_generation,
+                       trigger.submission_key AS trigger_submission_key
+                  FROM rca_outbox AS outbox
+                  JOIN business_triggers AS trigger
+                    ON trigger.business_key = outbox.business_key
+                   AND trigger.generation = outbox.generation
+                  JOIN rca_trigger_bindings AS binding
+                    ON binding.source_id = outbox.origin_source_id
+                   AND binding.business_key = outbox.business_key
+                   AND binding.generation = outbox.generation
+                 WHERE outbox.submission_key = ?
+                """,
+                (key,),
+            ).fetchone()
+            conn.commit()
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+        if request_row is None or envelope_row is None or authority_row is None:
+            raise RecordConflictError("w3_execution_snapshot_authority_missing")
+        if lineage_row is None:
+            raise RecordConflictError("w3_execution_snapshot_lineage_missing")
+
+        from gateway.pnc_rca_snapshot import (
+            build_snapshot_execution_bundle,
+            strict_canonical_json_loads,
+            validate_admission_snapshot,
+            validate_snapshot_source_envelope,
+        )
+
+        def canonical_object(row: sqlite3.Row, column: str) -> dict[str, Any]:
+            value = strict_canonical_json_loads(str(row[column]))
+            if not isinstance(value, dict):
+                raise ValueError(f"w3_execution_snapshot_{column}_invalid")
+            return value
+
+        try:
+            snapshot_payload = canonical_object(
+                snapshot_row,
+                "admission_snapshot_json",
+            )
+            request_payload = canonical_object(request_row, "canonical_request_json")
+            envelope_payload = canonical_object(envelope_row, "source_envelope_json")
+            metadata_payload = canonical_object(envelope_row, "source_metadata_json")
+            anchor_payload = canonical_object(envelope_row, "anchor_json")
+            ingress_payload = canonical_object(envelope_row, "ingress_decision_json")
+            authority_payload = canonical_object(
+                authority_row,
+                "authority_receipt_json",
+            )
+            authority_metadata = canonical_object(
+                authority_row,
+                "source_metadata_json",
+            )
+            authority_anchor = canonical_object(authority_row, "anchor_json")
+            authority_ingress = canonical_object(
+                authority_row,
+                "ingress_decision_json",
+            )
+            policy_pins = {
+                "creation_policy": str(request_row["creation_policy_sha256"]),
+                "business_profile": str(request_row["business_profile_sha256"]),
+                "execution_policy": str(request_row["execution_policy_sha256"]),
+                "publication_policy": str(request_row["publication_policy_sha256"]),
+                "correction_lineage_policy": str(
+                    request_row["correction_lineage_policy_sha256"]
+                ),
+            }
+            if policy_pins != approved_policy_pins:
+                raise RecordConflictError(
+                    "w3_execution_snapshot_authority_mismatch"
+                )
+            snapshot = validate_admission_snapshot(
+                snapshot_payload,
+                expected_snapshot_sha256=str(snapshot_row["snapshot_sha256"]),
+                expected_generation_authorization_evidence_sha256=request_row[
+                    "generation_authorization_evidence_sha256"
+                ],
+                expected_ticket_title_sha256=str(
+                    request_row["ticket_title_sha256"]
+                ),
+                expected_policy_sha256s=policy_pins,
+            )
+            envelope = validate_snapshot_source_envelope(
+                envelope_payload,
+                expected_snapshot=snapshot,
+                expected_authorization_evidence_sha256=str(
+                    authority_row["authorization_evidence_sha256"]
+                ),
+                expected_generation_authorization_evidence_sha256=request_row[
+                    "generation_authorization_evidence_sha256"
+                ],
+                expected_ticket_title_sha256=str(
+                    request_row["ticket_title_sha256"]
+                ),
+                expected_source_payload_sha256=str(authority_row["payload_sha256"]),
+                expected_policy_sha256s=policy_pins,
+                expected_snapshot_sha256=str(snapshot_row["snapshot_sha256"]),
+                expected_source_authority=authority_payload,
+            )
+            if request_payload != snapshot.canonical_request.to_dict():
+                raise ValueError("w3_execution_snapshot_request_json_mismatch")
+            if (
+                metadata_payload != envelope_payload["source_metadata"]
+                or anchor_payload != envelope_payload["anchor"]
+                or ingress_payload != envelope_payload["ingress_decision"]
+                or authority_metadata != metadata_payload
+                or authority_anchor != anchor_payload
+                or authority_ingress != ingress_payload
+            ):
+                raise ValueError("w3_execution_snapshot_projection_mismatch")
+
+            request_columns = {
+                "request_sha256": snapshot.canonical_request.request_sha256,
+                "schema_version": snapshot.canonical_request.schema_version,
+                "ticket_title_sha256": snapshot.canonical_request.ticket[
+                    "title_sha256"
+                ],
+                **{
+                    f"{name}_sha256": getattr(
+                        snapshot.canonical_request,
+                        name,
+                    )["sha256"]
+                    for name in (
+                        "creation_policy",
+                        "business_profile",
+                        "execution_policy",
+                        "publication_policy",
+                        "correction_lineage_policy",
+                    )
+                },
+                "generation_reason": snapshot.canonical_request.execution_intent[
+                    "generation_reason"
+                ],
+                "generation_authorization_evidence_sha256": (
+                    snapshot.canonical_request.execution_intent[
+                        "generation_authorization_evidence_sha256"
+                    ]
+                ),
+            }
+            snapshot_columns = {
+                "snapshot_sha256": snapshot.snapshot_sha256,
+                "snapshot_id": snapshot.snapshot_id,
+                "schema_version": snapshot.schema_version,
+                "request_sha256": snapshot.request_sha256,
+                "business_key": snapshot.resolved_admission["business_key"],
+                "submission_key": snapshot.resolved_admission["submission_key"],
+                "generation": snapshot.resolved_admission["generation"],
+                "activation_epoch_id": snapshot.execution_admission[
+                    "activation_epoch_id"
+                ],
+                "activation_ledger_id": snapshot.execution_admission[
+                    "activation_ledger_id"
+                ],
+                "execution_decision": snapshot.execution_admission["decision"],
+                "execution_reason": snapshot.execution_admission["reason"],
+                "execution_state": snapshot.execution_admission["state"],
+                "legacy_unconfigured": int(
+                    bool(snapshot.execution_admission["legacy_unconfigured"])
+                ),
+                "creator_source_envelope_sha256": envelope.source_envelope_sha256,
+                "creator_authority_sha256": envelope.source_authority_sha256,
+                "creator_source_id": envelope.source_id,
+            }
+            envelope_columns = {
+                "source_envelope_sha256": envelope.source_envelope_sha256,
+                "source_envelope_id": envelope.source_envelope_id,
+                "schema_version": envelope.schema_version,
+                "snapshot_sha256": envelope.snapshot_sha256,
+                "snapshot_id": envelope.snapshot_id,
+                "submission_key": envelope.submission_key,
+                "source_authority_sha256": envelope.source_authority_sha256,
+                "source_id": envelope.source_id,
+                "source_kind": envelope.source_kind,
+                "payload_sha256": envelope.source_metadata["payload_sha256"],
+                "authorization_evidence_sha256": envelope.ingress_decision[
+                    "authorization_evidence_sha256"
+                ],
+                "binding_action": envelope.ingress_decision["binding_action"],
+                "decision": envelope.ingress_decision["decision"],
+            }
+            authority_columns = {
+                "authority_sha256": authority_payload["authority_sha256"],
+                "schema_version": authority_payload["schema_version"],
+                "source_id": envelope.source_id,
+                "source_kind": envelope.source_kind,
+                "payload_sha256": envelope.source_metadata["payload_sha256"],
+                "authorization_evidence_sha256": envelope.ingress_decision[
+                    "authorization_evidence_sha256"
+                ],
+                "binding_action": envelope.ingress_decision["binding_action"],
+                "decision": envelope.ingress_decision["decision"],
+                "source_metadata_sha256": authority_payload[
+                    "source_metadata_sha256"
+                ],
+                "anchor_sha256": authority_payload["anchor_sha256"],
+                "ingress_decision_sha256": authority_payload[
+                    "ingress_decision_sha256"
+                ],
+            }
+            for row, expected in (
+                (request_row, request_columns),
+                (snapshot_row, snapshot_columns),
+                (envelope_row, envelope_columns),
+                (authority_row, authority_columns),
+            ):
+                if any(row[column] != expected_value for column, expected_value in expected.items()):
+                    raise ValueError("w3_execution_snapshot_column_mismatch")
+            if (
+                lineage_row["outbox_origin_source_id"] != envelope.source_id
+                or lineage_row["trigger_origin_source_id"] != envelope.source_id
+                or lineage_row["binding_role"] != "origin"
+                or lineage_row["binding_business_key"]
+                != snapshot.resolved_admission["business_key"]
+                or lineage_row["binding_generation"]
+                != snapshot.resolved_admission["generation"]
+                or lineage_row["trigger_submission_key"]
+                != snapshot.resolved_admission["submission_key"]
+            ):
+                raise ValueError("w3_execution_snapshot_origin_lineage_mismatch")
+            return build_snapshot_execution_bundle(
+                snapshot=snapshot,
+                snapshot_authority_sha256=str(
+                    approved_authority["authority_sha256"]
+                ),
+                creator_source_envelope=envelope,
+                creator_source_authority=authority_payload,
+            )
+        except RecordConflictError:
+            raise
+        except Exception as exc:
+            raise RecordConflictError("w3_execution_snapshot_invalid") from exc
+
     def persist_admission_snapshot_source(
         self,
+        *,
+        snapshot: Any,
+        source_envelope: Any,
+        expected_source_authority: Mapping[str, Any],
+        expected_snapshot_sha256: str,
+        expected_generation_authorization_evidence_sha256: str | None = None,
+        expected_ticket_title_sha256: str,
+        expected_source_payload_sha256: str,
+        expected_authorization_evidence_sha256: str,
+        expected_policy_sha256s: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Persist one validated W3 creator or join in a private transaction."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            result = self.persist_admission_snapshot_source_tx(
+                conn,
+                snapshot=snapshot,
+                source_envelope=source_envelope,
+                expected_source_authority=expected_source_authority,
+                expected_snapshot_sha256=expected_snapshot_sha256,
+                expected_generation_authorization_evidence_sha256=(
+                    expected_generation_authorization_evidence_sha256
+                ),
+                expected_ticket_title_sha256=expected_ticket_title_sha256,
+                expected_source_payload_sha256=expected_source_payload_sha256,
+                expected_authorization_evidence_sha256=(
+                    expected_authorization_evidence_sha256
+                ),
+                expected_policy_sha256s=expected_policy_sha256s,
+            )
+            conn.commit()
+            return result
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def persist_admission_snapshot_source_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        snapshot: Any,
+        source_envelope: Any,
+        expected_source_authority: Mapping[str, Any],
+        expected_snapshot_sha256: str,
+        expected_generation_authorization_evidence_sha256: str | None = None,
+        expected_ticket_title_sha256: str,
+        expected_source_payload_sha256: str,
+        expected_authorization_evidence_sha256: str,
+        expected_policy_sha256s: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Persist W3 authority inside the caller's existing transaction."""
+        if not isinstance(conn, sqlite3.Connection) or not conn.in_transaction:
+            raise RuntimeError("w3_snapshot_transaction_required")
+        return self._persist_admission_snapshot_source(
+            conn,
+            snapshot=snapshot,
+            source_envelope=source_envelope,
+            expected_source_authority=expected_source_authority,
+            expected_snapshot_sha256=expected_snapshot_sha256,
+            expected_generation_authorization_evidence_sha256=(
+                expected_generation_authorization_evidence_sha256
+            ),
+            expected_ticket_title_sha256=expected_ticket_title_sha256,
+            expected_source_payload_sha256=expected_source_payload_sha256,
+            expected_authorization_evidence_sha256=(
+                expected_authorization_evidence_sha256
+            ),
+            expected_policy_sha256s=expected_policy_sha256s,
+        )
+
+    def _persist_admission_snapshot_source(
+        self,
+        conn: sqlite3.Connection,
         *,
         snapshot: Any,
         source_envelope: Any,
@@ -7279,9 +7937,7 @@ class RcaControlStore:
             )
             return True
 
-        conn = self._connect()
         try:
-            conn.execute("BEGIN IMMEDIATE")
             snapshot_row = conn.execute(
                 "SELECT * FROM rca_admission_snapshots WHERE snapshot_sha256 = ?",
                 (core.snapshot_sha256,),
@@ -7548,7 +8204,6 @@ class RcaControlStore:
                 key="source_envelope_sha256",
                 values=envelope_values,
             )
-            conn.commit()
             return {
                 "snapshot_sha256": core.snapshot_sha256,
                 "source_envelope_sha256": envelope.source_envelope_sha256,
@@ -7558,21 +8213,462 @@ class RcaControlStore:
                 "source_envelope_created": source_envelope_created,
             }
         except RecordConflictError:
-            if conn.in_transaction:
-                conn.rollback()
             raise
         except sqlite3.IntegrityError as exc:
-            if conn.in_transaction:
-                conn.rollback()
             raise RecordConflictError(
                 f"w3_snapshot_authority_integrity_conflict:{exc}"
             ) from exc
-        except Exception:
-            if conn.in_transaction:
-                conn.rollback()
-            raise
-        finally:
-            conn.close()
+
+    def persist_w3_admission_shadow_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        admission: RcaAdmission,
+        trigger_context: Any,
+        source_id: str,
+        snapshot_authority: Any,
+        ticket_authority: Mapping[str, Any] | None,
+        activation_decision: ActivationAdmissionDecision | None,
+        manual_ingress_authority: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Project and persist one legacy admission through the W3 shadow oracle."""
+        from gateway.pnc_rca_admission import validate_rca_trigger_context
+        from gateway.pnc_rca_snapshot import (
+            build_admission_snapshot,
+            build_canonical_rca_request,
+            build_snapshot_source_envelope,
+            build_source_authority_receipt,
+            compare_snapshot_shadow,
+            compose_snapshot_projection,
+            legacy_semantic_projection,
+            validate_admission_snapshot,
+        )
+
+        if not isinstance(conn, sqlite3.Connection) or not conn.in_transaction:
+            raise RuntimeError("w3_snapshot_transaction_required")
+        authority = _normalize_w3_snapshot_authority(snapshot_authority)
+        if authority is None:
+            raise ValueError("w3_snapshot_authority_required")
+        legacy_admission = validate_rca_admission(admission)
+        context = validate_rca_trigger_context(trigger_context)
+        policy_names = (
+            "creation_policy",
+            "business_profile",
+            "execution_policy",
+            "publication_policy",
+            "correction_lineage_policy",
+        )
+        policies = {name: dict(authority["policies"][name]) for name in policy_names}
+        policy_sha256s = {
+            name: str(policies[name]["sha256"]) for name in policy_names
+        }
+
+        source = conn.execute(
+            "SELECT * FROM rca_trigger_sources WHERE source_id = ?",
+            (str(source_id),),
+        ).fetchone()
+        binding = conn.execute(
+            """
+            SELECT binding.business_key, binding.generation, binding.role,
+                   trigger.submission_key, trigger.state,
+                   outbox.status AS outbox_status
+              FROM rca_trigger_bindings AS binding
+              JOIN business_triggers AS trigger
+                ON trigger.business_key = binding.business_key
+               AND trigger.generation = binding.generation
+              JOIN rca_outbox AS outbox
+                ON outbox.business_key = binding.business_key
+               AND outbox.generation = binding.generation
+             WHERE binding.source_id = ?
+            """,
+            (str(source_id),),
+        ).fetchone()
+        if source is None or binding is None:
+            raise RecordConflictError("w3_snapshot_legacy_authority_missing")
+        if (
+            str(binding["business_key"]) != legacy_admission.business_key
+            or int(binding["generation"]) != legacy_admission.generation
+            or str(binding["submission_key"]) != legacy_admission.submission_key
+        ):
+            raise RecordConflictError("w3_snapshot_legacy_binding_mismatch")
+        role = str(binding["role"])
+        if role not in {"origin", "observer"}:
+            raise RecordConflictError("w3_snapshot_legacy_role_invalid")
+        binding_action = "create" if role == "origin" else "join"
+
+        source_kind = str(source["source_kind"])
+        if context.source_kind != source_kind:
+            raise RecordConflictError("w3_snapshot_context_source_mismatch")
+        ticket_receipt: dict[str, Any]
+        if source_kind == "kafka_workflow_event":
+            event_uid = str(source["source_dedupe_key"]).split(
+                ":generation:", 1
+            )[0]
+            inbox = conn.execute(
+                "SELECT * FROM kafka_inbox WHERE event_uid = ?",
+                (event_uid,),
+            ).fetchone()
+            if inbox is None or str(inbox["raw_sha256"]) != str(
+                source["payload_sha256"]
+            ):
+                raise RecordConflictError("w3_snapshot_kafka_inbox_mismatch")
+            source_metadata = {
+                "source_kind": source_kind,
+                "event_uid": event_uid,
+                "topic": str(inbox["topic"]),
+                "partition": int(inbox["partition_id"]),
+                "offset": int(inbox["offset_id"]),
+                "payload_sha256": str(inbox["raw_sha256"]),
+                "observed_at": str(source["created_at"]),
+            }
+            ticket_receipt = build_w3_ticket_authority_receipt(
+                source_kind="kafka_durable_inbox",
+                source_evidence_sha256=str(inbox["raw_sha256"]),
+                observed_at=str(source["created_at"]),
+                project_key=context.project_key,
+                project_simple_name=context.project_simple_name,
+                work_item_type_key=context.work_item_type_key,
+                work_item_id=context.work_item_id,
+                issue_url=context.issue_url,
+                title=context.title,
+            )
+            if ticket_authority is not None and dict(ticket_authority) != ticket_receipt:
+                raise RecordConflictError("w3_ticket_authority_kafka_mismatch")
+            anchor = {"issue_target": context.issue_url, "thread_target": None}
+        elif source_kind == "feishu_group_manual":
+            if ticket_authority is None:
+                raise ValueError("w3_manual_ticket_authority_required")
+            ticket_receipt = _validate_w3_ticket_authority_receipt(ticket_authority)
+            if ticket_receipt["source_kind"] != "feishu_official_preread":
+                raise ValueError("w3_manual_ticket_authority_source_invalid")
+            source_metadata = {
+                "source_kind": source_kind,
+                "platform": str(source["platform"]),
+                "chat_id": str(source["chat_id"]),
+                "thread_id": str(source["thread_id"]),
+                "message_id": str(source["message_id"]),
+                "requester_id": str(source["requester_id"]),
+                "mode": str(source["mode"]),
+                "payload_sha256": str(source["payload_sha256"]),
+                "observed_at": str(source["created_at"]),
+            }
+            anchor = {
+                "issue_target": context.issue_url,
+                "thread_target": (
+                    str(source["thread_id"])
+                    if str(source["platform"]) == "feishu"
+                    else None
+                ),
+            }
+        else:
+            raise RecordConflictError("w3_snapshot_source_kind_invalid")
+
+        ticket = ticket_receipt["ticket"]
+        expected_ticket = {
+            "project_key": context.project_key,
+            "project_simple_name": context.project_simple_name,
+            "work_item_type_key": context.work_item_type_key,
+            "work_item_id": context.work_item_id,
+            "issue_url": context.issue_url,
+            "title": context.title,
+        }
+        if any(ticket[name] != value for name, value in expected_ticket.items()):
+            raise RecordConflictError("w3_ticket_authority_context_mismatch")
+        expected_title_sha256 = str(ticket["title_sha256"])
+
+        source_identity = {
+            "platform": str(source["platform"]),
+            "chat_id": str(source["chat_id"]),
+            "thread_id": str(source["thread_id"]),
+            "message_id": str(source["message_id"]),
+            "requester_id": str(source["requester_id"]),
+            "issue_url": context.issue_url,
+            "mode": str(source["mode"]),
+        }
+        if source_kind == "feishu_group_manual":
+            if manual_ingress_authority is None:
+                raise ValueError("w3_manual_ingress_authority_required")
+            manual_authority = _validate_w3_manual_ingress_authority(
+                manual_ingress_authority,
+                expected_source_identity=source_identity,
+                expected_ticket_authority_sha256=str(
+                    ticket_receipt["ticket_authority_sha256"]
+                ),
+                expected_snapshot_authority_sha256=str(
+                    authority["authority_sha256"]
+                ),
+            )
+            authorization_evidence_sha256 = str(
+                manual_authority["authority_sha256"]
+            )
+        else:
+            authorization_evidence_sha256 = _canonical_sha256(
+                {
+                    "schema_version": W3_INGRESS_AUTHORIZATION_SCHEMA_VERSION,
+                    "source_id": str(source_id),
+                    "source_payload_sha256": str(source["payload_sha256"]),
+                    "ticket_authority_sha256": str(
+                        ticket_receipt["ticket_authority_sha256"]
+                    ),
+                    "snapshot_authority_sha256": str(
+                        authority["authority_sha256"]
+                    ),
+                    "business_key": legacy_admission.business_key,
+                    "submission_key": legacy_admission.submission_key,
+                    "generation": legacy_admission.generation,
+                    "binding_action": binding_action,
+                }
+            )
+
+        persisted_snapshot_row = conn.execute(
+            """
+            SELECT * FROM rca_admission_snapshots
+             WHERE business_key = ? AND generation = ?
+            """,
+            (legacy_admission.business_key, legacy_admission.generation),
+        ).fetchone()
+        generation_evidence: str | None = None
+        if persisted_snapshot_row is not None:
+            if (
+                binding_action == "create"
+                and str(persisted_snapshot_row["creator_source_id"])
+                != str(source_id)
+            ):
+                raise RecordConflictError("w3_snapshot_creator_binding_conflict")
+            persisted_value = json.loads(
+                str(persisted_snapshot_row["admission_snapshot_json"])
+            )
+            generation_evidence = persisted_value["canonical_request"][
+                "execution_intent"
+            ]["generation_authorization_evidence_sha256"]
+            snapshot = validate_admission_snapshot(
+                persisted_value,
+                expected_snapshot_sha256=str(
+                    persisted_snapshot_row["snapshot_sha256"]
+                ),
+                expected_generation_authorization_evidence_sha256=(
+                    generation_evidence
+                ),
+                expected_ticket_title_sha256=expected_title_sha256,
+                expected_policy_sha256s=policy_sha256s,
+            )
+            execution_admission = dict(snapshot.execution_admission)
+            if (
+                execution_admission["decision"] == "shadow"
+                and str(binding["outbox_status"]) == "pending"
+            ):
+                raise RecordConflictError("w3_snapshot_promotion_lineage_required")
+        else:
+            if binding_action == "join":
+                raise RecordConflictError("w3_snapshot_creator_missing")
+            if activation_decision is None or activation_decision.legacy_unconfigured:
+                shadow_observation = str(binding["outbox_status"]) == "shadow"
+                execution_admission = (
+                    {
+                        "activation_epoch_id": "",
+                        "activation_ledger_id": None,
+                        "decision": "shadow",
+                        "reason": "activation_epoch_held_unconfigured",
+                        "state": "unconfigured",
+                        "legacy_unconfigured": False,
+                    }
+                    if shadow_observation
+                    else {
+                        "activation_epoch_id": "",
+                        "activation_ledger_id": None,
+                        "decision": "admit",
+                        "reason": "activation_legacy_unconfigured",
+                        "state": "legacy_unconfigured",
+                        "legacy_unconfigured": True,
+                    }
+                )
+            else:
+                if activation_decision.decision not in {"admit", "shadow"}:
+                    raise RecordConflictError("w3_snapshot_activation_decision_invalid")
+                execution_admission = {
+                    "activation_epoch_id": activation_decision.epoch_id,
+                    "activation_ledger_id": activation_decision.ledger_id,
+                    "decision": activation_decision.decision,
+                    "reason": activation_decision.reason,
+                    "state": activation_decision.epoch_state,
+                    "legacy_unconfigured": False,
+                }
+            if legacy_admission.generation > 1:
+                if (
+                    source_kind != "feishu_group_manual"
+                    or str(source["platform"]) != "feishu"
+                    or str(source["mode"]) != "rerun"
+                ):
+                    raise RecordConflictError("w3_explicit_rerun_authority_invalid")
+                generation_evidence = authorization_evidence_sha256
+
+            request = build_canonical_rca_request(
+                admission=legacy_admission,
+                trigger_context=context,
+                creation_policy=policies["creation_policy"],
+                business_profile=policies["business_profile"],
+                execution_policy=policies["execution_policy"],
+                publication_policy=policies["publication_policy"],
+                correction_lineage_policy=policies[
+                    "correction_lineage_policy"
+                ],
+                generation_reason=(
+                    "explicit_user_rerun"
+                    if legacy_admission.generation > 1
+                    else "initial"
+                ),
+                generation_authorization_evidence_sha256=generation_evidence,
+                expected_generation_authorization_evidence_sha256=(
+                    generation_evidence
+                ),
+                expected_ticket_title_sha256=expected_title_sha256,
+                expected_policy_sha256s=policy_sha256s,
+            )
+            snapshot = build_admission_snapshot(
+                request=request,
+                admission=legacy_admission,
+                execution_admission=execution_admission,
+                expected_generation_authorization_evidence_sha256=(
+                    generation_evidence
+                ),
+                expected_ticket_title_sha256=expected_title_sha256,
+                expected_policy_sha256s=policy_sha256s,
+            )
+
+        ingress_decision = {
+            "requested_mode": (
+                "pending"
+                if snapshot.execution_admission["decision"] == "admit"
+                else "shadow"
+            ),
+            "binding_action": binding_action,
+            "decision": str(snapshot.execution_admission["decision"]),
+            "authorization_evidence_sha256": authorization_evidence_sha256,
+        }
+        source_authority = build_source_authority_receipt(
+            source_id=str(source_id),
+            source_kind=source_kind,
+            source_metadata=source_metadata,
+            anchor=anchor,
+            ingress_decision=ingress_decision,
+            expected_issue_target=context.issue_url,
+        )
+        envelope = build_snapshot_source_envelope(
+            snapshot=snapshot,
+            source_id=str(source_id),
+            source_kind=source_kind,
+            source_metadata=source_metadata,
+            anchor=anchor,
+            ingress_decision=ingress_decision,
+            expected_authorization_evidence_sha256=(
+                authorization_evidence_sha256
+            ),
+            expected_generation_authorization_evidence_sha256=(
+                generation_evidence
+            ),
+            expected_ticket_title_sha256=expected_title_sha256,
+            expected_source_payload_sha256=str(source["payload_sha256"]),
+            expected_policy_sha256s=policy_sha256s,
+            expected_snapshot_sha256=snapshot.snapshot_sha256,
+            expected_source_authority=source_authority,
+        )
+        legacy_projection = legacy_semantic_projection(
+            admission=legacy_admission,
+            trigger_context=context,
+            creation_policy=policies["creation_policy"],
+            business_profile=policies["business_profile"],
+            execution_policy=policies["execution_policy"],
+            publication_policy=policies["publication_policy"],
+            correction_lineage_policy=policies["correction_lineage_policy"],
+            execution_admission=execution_admission,
+            source_id=str(source_id),
+            source_metadata=source_metadata,
+            anchor=anchor,
+            ingress_decision=ingress_decision,
+            expected_authorization_evidence_sha256=(
+                authorization_evidence_sha256
+            ),
+            generation_reason=(
+                "explicit_user_rerun"
+                if legacy_admission.generation > 1
+                else "initial"
+            ),
+            generation_authorization_evidence_sha256=generation_evidence,
+            expected_generation_authorization_evidence_sha256=(
+                generation_evidence
+            ),
+            expected_ticket_title_sha256=expected_title_sha256,
+            expected_source_payload_sha256=str(source["payload_sha256"]),
+            expected_policy_sha256s=policy_sha256s,
+            expected_source_authority=source_authority,
+        )
+        candidate_projection = compose_snapshot_projection(
+            snapshot,
+            envelope,
+            expected_authorization_evidence_sha256=(
+                authorization_evidence_sha256
+            ),
+            expected_generation_authorization_evidence_sha256=(
+                generation_evidence
+            ),
+            expected_ticket_title_sha256=expected_title_sha256,
+            expected_source_payload_sha256=str(source["payload_sha256"]),
+            expected_policy_sha256s=policy_sha256s,
+            expected_snapshot_sha256=snapshot.snapshot_sha256,
+            expected_source_authority=source_authority,
+        )
+        comparison = compare_snapshot_shadow(
+            legacy_projection,
+            candidate_projection,
+            expected_legacy_authorization_evidence_sha256=(
+                authorization_evidence_sha256
+            ),
+            expected_candidate_authorization_evidence_sha256=(
+                authorization_evidence_sha256
+            ),
+            expected_legacy_generation_authorization_evidence_sha256=(
+                generation_evidence
+            ),
+            expected_candidate_generation_authorization_evidence_sha256=(
+                generation_evidence
+            ),
+            expected_legacy_ticket_title_sha256=expected_title_sha256,
+            expected_candidate_ticket_title_sha256=expected_title_sha256,
+            expected_legacy_source_payload_sha256=str(source["payload_sha256"]),
+            expected_candidate_source_payload_sha256=str(source["payload_sha256"]),
+            expected_legacy_policy_sha256s=policy_sha256s,
+            expected_candidate_policy_sha256s=policy_sha256s,
+            expected_legacy_snapshot_sha256=snapshot.snapshot_sha256,
+            expected_candidate_snapshot_sha256=snapshot.snapshot_sha256,
+            expected_legacy_source_authority=source_authority,
+            expected_candidate_source_authority=source_authority,
+        )
+        if comparison["outcome"] != "match":
+            raise RecordConflictError("w3_snapshot_shadow_mismatch")
+        persisted = self.persist_admission_snapshot_source_tx(
+            conn,
+            snapshot=snapshot,
+            source_envelope=envelope,
+            expected_source_authority=source_authority,
+            expected_snapshot_sha256=snapshot.snapshot_sha256,
+            expected_generation_authorization_evidence_sha256=(
+                generation_evidence
+            ),
+            expected_ticket_title_sha256=expected_title_sha256,
+            expected_source_payload_sha256=str(source["payload_sha256"]),
+            expected_authorization_evidence_sha256=(
+                authorization_evidence_sha256
+            ),
+            expected_policy_sha256s=policy_sha256s,
+        )
+        return {
+            **persisted,
+            "snapshot_authority_sha256": authority["authority_sha256"],
+            "ticket_authority_sha256": ticket_receipt[
+                "ticket_authority_sha256"
+            ],
+            "shadow_comparison": comparison,
+        }
 
     def persist_raw(
         self,
@@ -8163,6 +9259,16 @@ class RcaControlStore:
             return False
         if str(row["state"] or "") != "shadow":
             raise ManualRcaAdmissionError("manual_shadow_state_inconsistent")
+        if conn.execute(
+            """
+            SELECT 1 FROM rca_admission_snapshots
+             WHERE business_key = ? AND generation = ?
+            """,
+            (row["business_key"], row["generation"]),
+        ).fetchone() is not None:
+            raise ManualRcaAdmissionError(
+                "w3_snapshot_promotion_lineage_required"
+            )
         event_uid = str(row["source_event_id"] or "").strip()
         if not event_uid:
             raise ManualRcaAdmissionError("manual_shadow_source_missing")
@@ -8418,6 +9524,9 @@ class RcaControlStore:
         outbox_high_watermark: int = DEFAULT_OUTBOX_HIGH_WATERMARK,
         activation_required: bool = False,
         activation_slot_kind: str = "",
+        snapshot_authority: Any = None,
+        snapshot_ticket_authority: Mapping[str, Any] | None = None,
+        snapshot_manual_ingress_authority: Mapping[str, Any] | None = None,
         now: datetime | None = None,
     ) -> ManualRcaAdmissionResult:
         """Atomically create or join one manual RCA generation and delivery target."""
@@ -8477,6 +9586,29 @@ class RcaControlStore:
         if url_match is None:
             raise ManualRcaAdmissionError("manual_request_issue_url_invalid")
         project_simple_name, work_item_id = url_match.groups()
+        try:
+            w3_authority = _normalize_w3_snapshot_authority(snapshot_authority)
+            if w3_authority is None:
+                if (
+                    snapshot_ticket_authority is not None
+                    or snapshot_manual_ingress_authority is not None
+                ):
+                    raise ValueError("w3_snapshot_authority_required")
+                w3_ticket_authority = None
+                w3_manual_authority = None
+            else:
+                if issue_only_operator:
+                    raise ValueError("w3_manual_operator_source_unsupported")
+                if snapshot_ticket_authority is None:
+                    raise ValueError("w3_manual_ticket_authority_required")
+                if snapshot_manual_ingress_authority is None:
+                    raise ValueError("w3_manual_ingress_authority_required")
+                w3_ticket_authority = _validate_w3_ticket_authority_receipt(
+                    snapshot_ticket_authority
+                )
+                w3_manual_authority = dict(snapshot_manual_ingress_authority)
+        except (TypeError, ValueError, KeyError) as exc:
+            raise ManualRcaAdmissionError(str(exc)) from exc
         payload_sha = _canonical_sha256(manual.to_dict())
         source_dedupe_key = f"{manual.platform}:{manual.message_id}"
         source_id = _stable_key(
@@ -8513,6 +9645,8 @@ class RcaControlStore:
                 binding = conn.execute(
                     """
                     SELECT b.*, t.submission_key, t.state, t.source_event_id,
+                           t.creation_rule_version, t.work_item_id, t.project_key,
+                           t.work_item_type_key,
                            o.outbox_id, o.status AS outbox_status, o.attempt,
                            o.completed_at, o.result_json, o.quarantined_at,
                            o.last_error_code, o.lease_token, o.lease_owner,
@@ -8543,17 +9677,29 @@ class RcaControlStore:
                 )
                 if replay_activation.decision not in {"admit", "join"}:
                     raise ManualRcaAdmissionError(replay_activation.reason)
-                if str(binding["outbox_status"] or "") == "shadow":
+                w3_shadow_observation = bool(
+                    w3_authority is not None
+                    and manual.mode == "run_or_join"
+                    and str(binding["outbox_status"] or "") == "shadow"
+                )
+                if (
+                    str(binding["outbox_status"] or "") == "shadow"
+                    and not w3_shadow_observation
+                ):
                     self._assert_manual_storage_capacity()
                     self._assert_manual_dispatch_capacity_tx(
                         conn,
                         outbox_high_watermark=high_watermark,
                     )
-                shadow_promoted = self._manual_shadow_promote_tx(
-                    conn,
-                    row=binding,
-                    request=manual,
-                    current=current,
+                shadow_promoted = (
+                    False
+                    if w3_shadow_observation
+                    else self._manual_shadow_promote_tx(
+                        conn,
+                        row=binding,
+                        request=manual,
+                        current=current,
+                    )
                 )
                 replay_outcome = str(existing_source["outcome"] or "joined")
                 replay_state = str(binding["state"])
@@ -8629,6 +9775,66 @@ class RcaControlStore:
                             subscription_key=required_key,
                             current=current,
                         )
+                if w3_authority is not None:
+                    existing_snapshot = conn.execute(
+                        """
+                        SELECT 1 FROM rca_admission_snapshots
+                         WHERE business_key = ? AND generation = ?
+                        """,
+                        (binding["business_key"], int(binding["generation"])),
+                    ).fetchone()
+                    if existing_snapshot is None:
+                        raise ManualRcaAdmissionError(
+                            "w3_manual_legacy_snapshot_missing"
+                        )
+                    replay_generation = int(binding["generation"])
+                    replay_admission = build_rca_admission(
+                        project_key=str(binding["project_key"]),
+                        project_simple_name=project_simple_name,
+                        work_item_type_key=str(binding["work_item_type_key"]),
+                        work_item_id=str(binding["work_item_id"]),
+                        rule_version=str(binding["creation_rule_version"]),
+                        trigger_kind=(
+                            "manual_retrigger"
+                            if replay_generation > 1
+                            else (
+                                "issue_created"
+                                if str(binding["source_event_id"] or "").strip()
+                                else "manual_issue_request"
+                            )
+                        ),
+                        generation=replay_generation,
+                    )
+                    if (
+                        replay_admission.business_key != str(binding["business_key"])
+                        or replay_admission.submission_key
+                        != str(binding["submission_key"])
+                    ):
+                        raise ManualRcaAdmissionError(
+                            "w3_manual_replay_identity_mismatch"
+                        )
+                    replay_context = build_rca_trigger_context(
+                        source_kind="feishu_group_manual",
+                        project_key=replay_admission.source_refs.project_key,
+                        project_simple_name=project_simple_name,
+                        work_item_type_key=(
+                            replay_admission.source_refs.work_item_type_key
+                        ),
+                        work_item_id=replay_admission.source_refs.work_item_id,
+                        rule_version=replay_admission.source_refs.rule_version,
+                        issue_url=manual.issue_url,
+                        title=str(w3_ticket_authority["ticket"]["title"]),
+                    )
+                    self.persist_w3_admission_shadow_tx(
+                        conn,
+                        admission=replay_admission,
+                        trigger_context=replay_context,
+                        source_id=source_id,
+                        snapshot_authority=w3_authority,
+                        ticket_authority=w3_ticket_authority,
+                        activation_decision=replay_activation,
+                        manual_ingress_authority=w3_manual_authority,
+                    )
                 conn.commit()
                 return ManualRcaAdmissionResult(
                     schema_version=MANUAL_ADMISSION_RESULT_SCHEMA_VERSION,
@@ -8760,6 +9966,15 @@ class RcaControlStore:
                 )
                 admission = base_admission
                 outcome = "created"
+            elif (
+                str(latest["outbox_status"] or "") == "shadow"
+                and w3_authority is not None
+                and manual.mode == "run_or_join"
+            ):
+                admission = existing_admission(
+                    generation=int(latest["generation"])
+                )
+                outcome = "joined"
             elif str(latest["outbox_status"] or "") == "shadow":
                 self._assert_manual_dispatch_capacity_tx(
                     conn,
@@ -8851,6 +10066,11 @@ class RcaControlStore:
                 work_item_id=work_item_id,
                 rule_version=admission.source_refs.rule_version,
                 issue_url=manual.issue_url,
+                title=(
+                    str(w3_ticket_authority["ticket"]["title"])
+                    if w3_ticket_authority is not None
+                    else ""
+                ),
             )
             conn.execute(
                 """
@@ -8980,6 +10200,17 @@ class RcaControlStore:
                     current,
                 ),
             )
+            if w3_authority is not None:
+                self.persist_w3_admission_shadow_tx(
+                    conn,
+                    admission=admission,
+                    trigger_context=trigger_context,
+                    source_id=source_id,
+                    snapshot_authority=w3_authority,
+                    ticket_authority=w3_ticket_authority,
+                    activation_decision=activation_decision,
+                    manual_ingress_authority=w3_manual_authority,
+                )
             issue_subscription_key = self._insert_issue_subscription_tx(
                 conn, admission=admission, current=current
             )
@@ -9055,6 +10286,7 @@ class RcaControlStore:
         *,
         runtime_identity: Mapping[str, Any] | None = None,
         allow_terminal_duplicate_retrigger: bool = False,
+        snapshot_authority: Any = None,
     ) -> IngestResult:
         """Classify one durable inbox row and atomically create trigger/outbox state."""
         conn = self._connect()
@@ -9110,6 +10342,7 @@ class RcaControlStore:
             outbox_created = False
             creates_generation = False
             input_wait_terminal_generation_created = False
+            w3_automatic_observation_joined = False
             outbox_rearmed = False
             rearm_reason = ""
             activation_decision: ActivationAdmissionDecision | None = None
@@ -9329,6 +10562,118 @@ class RcaControlStore:
                                     INPUT_WAIT_TERMINAL_NEW_GENERATION_REASON
                                 )
 
+                        if (
+                            snapshot_authority is not None
+                            and admission is not None
+                            and admission.generation > 1
+                            and creates_generation
+                        ):
+                            if latest is None:
+                                raise RecordConflictError(
+                                    "w3_automatic_generation_parent_missing"
+                                )
+                            observed_generation = int(latest["generation"])
+                            observed_trigger_kind = (
+                                "issue_created"
+                                if observed_generation == 1
+                                else "kafka_retrigger"
+                            )
+                            admission = build_rca_admission(
+                                project_key=str(latest["project_key"]),
+                                project_simple_name=normalized.project_simple_name,
+                                work_item_type_key=str(
+                                    latest["work_item_type_key"]
+                                ),
+                                work_item_id=str(latest["work_item_id"]),
+                                rule_version=str(latest["creation_rule_version"]),
+                                trigger_kind=observed_trigger_kind,
+                                generation=observed_generation,
+                                topic=str(row["topic"]),
+                                partition=int(row["partition_id"]),
+                                offset=int(row["offset_id"]),
+                            )
+                            if (
+                                admission.business_key
+                                != str(latest["business_key"])
+                                or admission.submission_key
+                                != str(latest["submission_key"])
+                            ):
+                                raise RecordConflictError(
+                                    "w3_automatic_observation_identity_mismatch"
+                                )
+                            creates_generation = False
+                            input_wait_terminal_generation_created = False
+                            rearm_reason = ""
+                            w3_automatic_observation_joined = True
+
+                    parent_snapshot_row = None
+                    if (
+                        snapshot_authority is not None
+                        and admission is not None
+                        and not creates_generation
+                    ):
+                        parent_snapshot_row = conn.execute(
+                            """
+                            SELECT admission_snapshot_json
+                              FROM rca_admission_snapshots
+                             WHERE business_key = ? AND generation = ?
+                            """,
+                            (admission.business_key, admission.generation),
+                        ).fetchone()
+                    if (
+                        snapshot_authority is not None
+                        and admission is not None
+                        and not creates_generation
+                        and parent_snapshot_row is None
+                    ):
+                        decision = "invalid"
+                        reason = W3_LEGACY_PARENT_SNAPSHOT_MISSING_REASON
+                        admission = None
+                        creates_generation = False
+                        input_wait_terminal_generation_created = False
+                        w3_automatic_observation_joined = False
+                        rearm_reason = ""
+                    elif (
+                        w3_automatic_observation_joined
+                        and parent_snapshot_row is not None
+                    ):
+                        try:
+                            parent_snapshot = json.loads(
+                                str(parent_snapshot_row["admission_snapshot_json"])
+                            )
+                            parent_ticket = parent_snapshot["canonical_request"][
+                                "ticket"
+                            ]
+                        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                            raise RecordConflictError(
+                                "w3_automatic_observation_parent_snapshot_invalid"
+                            ) from exc
+                        if not isinstance(parent_ticket, Mapping):
+                            raise RecordConflictError(
+                                "w3_automatic_observation_parent_snapshot_invalid"
+                            )
+                        observed_ticket = {
+                            "project_key": normalized.project_key,
+                            "project_simple_name": normalized.project_simple_name,
+                            "work_item_type_key": normalized.work_item_type_key,
+                            "work_item_id": normalized.work_item_id,
+                            "issue_url": normalized.issue_url.rstrip("/"),
+                            "title": normalized.title,
+                        }
+                        if any(
+                            str(parent_ticket.get(name) or "") != value
+                            for name, value in observed_ticket.items()
+                        ):
+                            decision = "invalid"
+                            reason = (
+                                W3_AUTOMATIC_OBSERVATION_SNAPSHOT_MISMATCH_REASON
+                            )
+                            admission = None
+                            creates_generation = False
+                            input_wait_terminal_generation_created = False
+                            w3_automatic_observation_joined = False
+                            rearm_reason = ""
+
                     if admission is None:
                         business_key = ""
                         generation = 0
@@ -9530,6 +10875,8 @@ class RcaControlStore:
                             )
                             if outbox_rearmed:
                                 reason = INPUT_WAIT_QUARANTINE_REARMED_REASON
+                            elif w3_automatic_observation_joined:
+                                reason = W3_KAFKA_OBSERVATION_JOIN_REASON
 
                     bound_source_id = self._bind_kafka_source_tx(
                         conn,
@@ -9562,6 +10909,26 @@ class RcaControlStore:
                             subscription_key=issue_subscription_key,
                             current=now,
                         )
+                        if snapshot_authority is not None:
+                            snapshot_context = build_rca_trigger_context(
+                                source_kind="kafka_workflow_event",
+                                project_key=normalized.project_key,
+                                project_simple_name=normalized.project_simple_name,
+                                work_item_type_key=normalized.work_item_type_key,
+                                work_item_id=normalized.work_item_id,
+                                rule_version=admission.source_refs.rule_version,
+                                issue_url=normalized.issue_url,
+                                title=normalized.title,
+                            )
+                            self.persist_w3_admission_shadow_tx(
+                                conn,
+                                admission=admission,
+                                trigger_context=snapshot_context,
+                                source_id=bound_source_id,
+                                snapshot_authority=snapshot_authority,
+                                ticket_authority=None,
+                                activation_decision=activation_decision,
+                            )
 
             if decision == "invalid":
                 conn.execute(
@@ -9667,6 +11034,7 @@ class RcaControlStore:
         activation_slot_kind: str = "",
         runtime_identity: Mapping[str, Any] | None = None,
         after_raw_persisted: Callable[[RawPersistResult], None] | None = None,
+        snapshot_authority: Any = None,
     ) -> IngestResult:
         """Persist raw, then classify; callers may commit only after this returns."""
         raw_result = self.persist_raw(
@@ -9682,6 +11050,7 @@ class RcaControlStore:
             raw_result.event_uid,
             runtime_identity=runtime_identity,
             allow_terminal_duplicate_retrigger=not raw_result.inserted,
+            snapshot_authority=snapshot_authority,
         )
         return replace(result, raw_inserted=raw_result.inserted)
 
@@ -9691,6 +11060,7 @@ class RcaControlStore:
         *,
         runtime_identity: Mapping[str, Any] | None = None,
         allow_terminal_duplicate_retrigger: bool = False,
+        snapshot_authority: Any = None,
     ) -> IngestResult:
         """Classify one event while keeping unknown failures unacknowledged."""
         try:
@@ -9700,6 +11070,7 @@ class RcaControlStore:
                 allow_terminal_duplicate_retrigger=(
                     allow_terminal_duplicate_retrigger
                 ),
+                snapshot_authority=snapshot_authority,
             )
         except (sqlite3.Error, OSError):
             raise
@@ -9881,12 +11252,14 @@ class RcaControlStore:
         *,
         limit: int = 1000,
         runtime_identity: Mapping[str, Any] | None = None,
+        snapshot_authority: Any = None,
     ) -> list[IngestResult]:
         """Recover raw rows from a prior crash before polling new Kafka records."""
         return [
             self.process_event_resilient(
                 event_uid,
                 runtime_identity=runtime_identity,
+                snapshot_authority=snapshot_authority,
             )
             for event_uid in self.pending_event_uids(limit=limit)
         ]
@@ -9944,6 +11317,11 @@ class RcaControlStore:
                        o.outbox_id, o.submission_key, o.status AS outbox_status,
                        o.business_key, o.generation, o.activation_epoch_id,
                        o.activation_ledger_id,
+                       EXISTS (
+                           SELECT 1 FROM rca_admission_snapshots AS snapshot
+                            WHERE snapshot.business_key = o.business_key
+                              AND snapshot.generation = o.generation
+                       ) AS has_w3_snapshot,
                        t.state AS trigger_state
                   FROM kafka_inbox AS i
              LEFT JOIN rca_outbox AS o ON o.source_event_id = i.event_uid
@@ -9969,6 +11347,13 @@ class RcaControlStore:
                 if row["outbox_status"] != "shadow" or row["trigger_state"] != "shadow":
                     denied = (
                         "shadow_state_inconsistent_or_completed",
+                        int(row["outbox_id"]),
+                        str(row["submission_key"]),
+                        str(row["outbox_status"] or ""),
+                    )
+                elif int(row["has_w3_snapshot"] or 0) == 1:
+                    denied = (
+                        "w3_snapshot_promotion_lineage_required",
                         int(row["outbox_id"]),
                         str(row["submission_key"]),
                         str(row["outbox_status"] or ""),

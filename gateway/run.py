@@ -2299,6 +2299,100 @@ def _g1q3_manual_authorization_snapshot(
     }
 
 
+def _build_g1q3_manual_w3_authorities(
+    *,
+    issue_url: str,
+    mode: str,
+    chat_id: str,
+    thread_id: str,
+    message_id: str,
+    requester_id: str,
+    active_policy: Any,
+    snapshot_authority: Any,
+    manual_authorization: Mapping[str, Any],
+    gateway_runtime_identity: Mapping[str, Any],
+    issue_preread: Callable[..., Any] | None = None,
+    now: datetime | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    from gateway.pnc_issue_context import fetch_g1q3_issue_context_result
+    from gateway.pnc_rca_control_store import (
+        build_w3_manual_ingress_authority,
+        build_w3_ticket_authority_receipt,
+    )
+    from gateway.pnc_rca_schema import issue_context_from_compact_text
+
+    match = re.fullmatch(
+        r"https://project\.feishu\.cn/([A-Za-z0-9._-]+)/issue/detail/([0-9]+)/*",
+        str(issue_url or "").strip(),
+    )
+    if match is None:
+        raise ValueError("w3_manual_ticket_issue_url_invalid")
+    project_simple_name, work_item_id = match.groups()
+    if (
+        len(active_policy.project_keys) != 1
+        or len(active_policy.work_item_type_keys) != 1
+        or project_simple_name not in active_policy.project_simple_names
+    ):
+        raise ValueError("w3_manual_ticket_policy_identity_invalid")
+    project_key = next(iter(active_policy.project_keys))
+    work_item_type_key = next(iter(active_policy.work_item_type_keys))
+    reader = issue_preread or fetch_g1q3_issue_context_result
+    result = reader(project_key=project_key, work_item_id=work_item_id)
+    context_text = str(getattr(result, "context_text", "") or "")
+    read_source = str(getattr(result, "source", "") or "")
+    read_status = str(getattr(result, "status", "") or "")
+    if (
+        not context_text
+        or read_status != "fields_extracted"
+        or read_source not in {"meegle", "mcp", "mcp_auto_degraded"}
+    ):
+        raise ValueError("w3_manual_official_ticket_preread_unavailable")
+    issue_context = issue_context_from_compact_text(
+        project_key=project_key,
+        work_item_id=work_item_id,
+        url=str(issue_url).rstrip("/"),
+        compact_text=context_text,
+        source_quality="full",
+    )
+    profile = issue_context.business_profile
+    if not issue_context.title:
+        raise ValueError("w3_manual_official_ticket_title_missing")
+    if not isinstance(profile, dict) or profile.get("status") != "matched":
+        raise ValueError("w3_manual_official_business_profile_unresolved")
+    observed_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    ticket = build_w3_ticket_authority_receipt(
+        source_kind="feishu_official_preread",
+        source_evidence_sha256=hashlib.sha256(
+            context_text.encode("utf-8")
+        ).hexdigest(),
+        observed_at=observed_at.isoformat(),
+        project_key=project_key,
+        project_simple_name=project_simple_name,
+        work_item_type_key=work_item_type_key,
+        work_item_id=work_item_id,
+        issue_url=str(issue_url).rstrip("/"),
+        title=issue_context.title,
+    )
+    runtime_authority = snapshot_authority.to_runtime_dict()
+    source_identity = {
+        "platform": "feishu",
+        "chat_id": str(chat_id),
+        "thread_id": str(thread_id),
+        "message_id": str(message_id),
+        "requester_id": str(requester_id),
+        "issue_url": str(issue_url).rstrip("/"),
+        "mode": str(mode),
+    }
+    ingress = build_w3_manual_ingress_authority(
+        manual_authorization=manual_authorization,
+        gateway_runtime_identity=gateway_runtime_identity,
+        source_identity=source_identity,
+        ticket_authority_sha256=ticket["ticket_authority_sha256"],
+        snapshot_authority_sha256=runtime_authority["authority_sha256"],
+    )
+    return ticket, ingress
+
+
 def _admit_g1q3_manual_trigger(
     *,
     issue_url: str,
@@ -2313,6 +2407,9 @@ def _admit_g1q3_manual_trigger(
     operator_rate_window_seconds: int,
     allowed_chat_ids: tuple[str, ...],
     admission_runtime_config: Any | None = None,
+    manual_authorization: Mapping[str, Any] | None = None,
+    gateway_runtime_identity: Mapping[str, Any] | None = None,
+    issue_preread: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     from gateway.pnc_rca_control_store import (
         MANUAL_TRIGGER_SCHEMA_VERSION,
@@ -2369,6 +2466,39 @@ def _admit_g1q3_manual_trigger(
         message_id=message_id,
         requester_id=requester_id,
     )
+    snapshot_kwargs: dict[str, Any] = {}
+    if resolved_admission_config.w3_snapshot_authority is not None:
+        if not isinstance(manual_authorization, Mapping) or not isinstance(
+            gateway_runtime_identity, Mapping
+        ):
+            raise ManualRcaAdmissionError("w3_manual_gateway_authority_missing")
+        try:
+            ticket_authority, ingress_authority = (
+                _build_g1q3_manual_w3_authorities(
+                    issue_url=issue_url,
+                    mode=mode,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    message_id=message_id,
+                    requester_id=requester_id,
+                    active_policy=resolved_admission_config.active_policy,
+                    snapshot_authority=(
+                        resolved_admission_config.w3_snapshot_authority
+                    ),
+                    manual_authorization=manual_authorization,
+                    gateway_runtime_identity=gateway_runtime_identity,
+                    issue_preread=issue_preread,
+                )
+            )
+        except (TypeError, ValueError, KeyError) as exc:
+            raise ManualRcaAdmissionError(str(exc)) from exc
+        snapshot_kwargs = {
+            "snapshot_authority": (
+                resolved_admission_config.w3_snapshot_authority
+            ),
+            "snapshot_ticket_authority": ticket_authority,
+            "snapshot_manual_ingress_authority": ingress_authority,
+        }
     try:
         store = RcaControlStore(
             _g1q3_rca_control_db_path(),
@@ -2390,6 +2520,7 @@ def _admit_g1q3_manual_trigger(
         # the immutable message identity, so success/failure canaries do not
         # require a Gateway restart or a mutable per-request mode switch.
         activation_slot_kind="",
+        **snapshot_kwargs,
     )
     return result.to_dict()
 
@@ -11407,6 +11538,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 ),
                                 admission_runtime_config=(
                                     _manual_admission_runtime_config
+                                ),
+                                manual_authorization=_manual_authorization,
+                                gateway_runtime_identity=(
+                                    _manual_gateway_runtime_identity
                                 ),
                             )
                         except Exception as _manual_exc:

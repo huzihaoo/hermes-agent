@@ -96,6 +96,190 @@ def _sha256_json(value) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _w3_contract_golden_vector():
+    snapshot_id = "pnc-rca-snapshot-v1-" + "1" * 64
+    snapshot_sha256 = "2" * 64
+    request_sha256 = "3" * 64
+    bundle_sha256 = "4" * 64
+    source_envelope_sha256 = "5" * 64
+    origin_source_id = "g1q3-rca-source-v1-" + "6" * 64
+    business_profile = {
+        "status": "matched",
+        "profile_id": "g1q3",
+        "execution_readiness": "ready",
+        "resource_class": "rca_prod",
+        "artifact_namespace": "rca/g1q3",
+    }
+    w3_execution_snapshot = {
+        "schema_version": "pnc_rca_execution_snapshot_bundle_v1",
+        "bundle_sha256": bundle_sha256,
+        "snapshot_authority_sha256": "7" * 64,
+        "snapshot": {
+            "schema_version": "pnc_rca_admission_snapshot_v1",
+            "snapshot_id": snapshot_id,
+            "snapshot_sha256": snapshot_sha256,
+            "request_sha256": request_sha256,
+            "canonical_request": {
+                "schema_version": "pnc_rca_canonical_request_v1",
+                "ticket": {
+                    "issue_url": (
+                        "https://project.feishu.cn/g1q3/issue/detail/7041712812"
+                    ),
+                    "title": "制动问题",
+                },
+                "creation_policy": {"version": "creation-v1", "sha256": "8" * 64},
+                "business_profile": {"version": "profile-v1", "sha256": "9" * 64},
+                "execution_policy": {"version": "execution-v1", "sha256": "a" * 64},
+                "publication_policy": {"version": "publish-v1", "sha256": "b" * 64},
+                "correction_lineage_policy": {
+                    "version": "lineage-v1",
+                    "sha256": "c" * 64,
+                },
+            },
+            "resolved_admission": {
+                "submission_key": "g1q3-rca-v1-7041712812-g1",
+                "generation": 1,
+            },
+            "execution_admission": {
+                "state": "steady_active",
+                "decision": "admit",
+                "reason": "activation_steady_active",
+            },
+            "write_fence": {
+                "state": "unissued",
+                "fence": None,
+                "owner": None,
+            },
+        },
+        "creator_source_envelope": {
+            "schema_version": "pnc_rca_snapshot_source_envelope_v1",
+            "source_envelope_id": (
+                "pnc-rca-source-envelope-v1-" + source_envelope_sha256
+            ),
+            "source_envelope_sha256": source_envelope_sha256,
+            "source_id": origin_source_id,
+            "source_kind": "kafka_workflow_event",
+            "snapshot_id": snapshot_id,
+            "snapshot_sha256": snapshot_sha256,
+            "ingress_decision": {
+                "decision": "admit",
+                "binding_action": "create",
+            },
+        },
+        "creator_source_authority": {
+            "schema_version": "pnc_rca_source_authority_receipt_v1",
+            "source_authority_sha256": "d" * 64,
+            "source_id": origin_source_id,
+            "source_kind": "kafka_workflow_event",
+        },
+    }
+    source_refs = {
+        "task_id": "g1q3-rca-v1-7041712812-g1",
+        "source_kind": "kafka_workflow_event",
+        "origin_source_id": origin_source_id,
+        "rule_version": "issue-created-v1",
+        "generation": 1,
+        "business_key": "g1q3:issue:7041712812",
+        "submission_key": "g1q3-rca-v1-7041712812-g1",
+        "source_event_id": "feishu-project-workflow-event:1:99",
+        "topic": "feishu-project-workflow-event",
+        "partition": 1,
+        "offset": 99,
+        "snapshot_id": snapshot_id,
+        "snapshot_sha256": snapshot_sha256,
+        "request_sha256": request_sha256,
+        "snapshot_bundle_sha256": bundle_sha256,
+        "creator_source_envelope_sha256": source_envelope_sha256,
+        "observer_source_envelope_sha256": "ignored-volatile-observer",
+    }
+    admission = {
+        "schema_version": "g1q3_rca_admission_v1",
+        "generation": 1,
+        "business_key": "g1q3:issue:7041712812",
+        "submission_key": "g1q3-rca-v1-7041712812-g1",
+    }
+    execution_request = {
+        "schema_version": "g1q3_rca_execution_request_v2",
+        "request_kind": "issue_intake",
+        "work_item": {
+            "project_key": "t03o4q",
+            "work_item_type": "issue",
+            "work_item_id": "7041712812",
+            "title": "ignored mutable title",
+        },
+        "data": {
+            "artifact_root": "/mnt/tmp/g1q3-rca-v1-7041712812-g1/",
+            "artifact_cifs_root": (
+                "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/"
+                "tmp/g1q3-rca-v1-7041712812-g1/"
+            ),
+            "data_access": {
+                "mode": "remote_read",
+                "references": [{"event_uuid": "event-7041712812"}],
+            },
+            "ignored_capacity_probe": {"available_bytes": 123},
+        },
+        "execution_policy": {
+            "data_access_mode": "remote_read",
+            "input_materialization": "forbidden",
+        },
+        "source_refs": source_refs,
+        "toolchain": {
+            "intake_dispatcher": "pnc_rca_outbox_dispatcher_v1",
+            "business_profile": business_profile,
+            "w3_execution_snapshot": w3_execution_snapshot,
+            "storage_admission": {"observed_at": "ignored-volatile-receipt"},
+        },
+        "evidence": {"comments_timeline": ["ignored mutable evidence"]},
+    }
+    expected_material = {
+        "admission": admission,
+        "execution_request": {
+            "schema_version": "g1q3_rca_execution_request_v2",
+            "request_kind": "issue_intake",
+            "work_item": {
+                "project_key": "t03o4q",
+                "work_item_type": "issue",
+                "work_item_id": "7041712812",
+            },
+            "data_paths": {
+                "artifact_root": "/mnt/tmp/g1q3-rca-v1-7041712812-g1/",
+                "artifact_cifs_root": (
+                    "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/"
+                    "tmp/g1q3-rca-v1-7041712812-g1/"
+                ),
+            },
+            "data_access": execution_request["data"]["data_access"],
+            "execution_policy": execution_request["execution_policy"],
+            "source_refs": {
+                key: source_refs[key]
+                for key in (
+                    "task_id",
+                    "source_kind",
+                    "origin_source_id",
+                    "rule_version",
+                    "generation",
+                    "business_key",
+                    "submission_key",
+                    "source_event_id",
+                    "topic",
+                    "partition",
+                    "offset",
+                    "snapshot_id",
+                    "snapshot_sha256",
+                    "request_sha256",
+                    "snapshot_bundle_sha256",
+                    "creator_source_envelope_sha256",
+                )
+            },
+            "intake_dispatcher": "pnc_rca_outbox_dispatcher_v1",
+            "business_profile": business_profile,
+            "w3_execution_snapshot": w3_execution_snapshot,
+        },
+    }
+    return admission, execution_request, expected_material
+
+
 def _byte_totals(tmp: int, hfs: int) -> dict[str, int]:
     return {"tmp": tmp, "hfs": hfs, "total": tmp + hfs}
 
@@ -983,6 +1167,270 @@ def test_service_wrapper_allows_only_validated_rca_intake_with_fixed_envelope(mo
     assert result["created"] is True
     assert result["deduped"] is False
     assert result["workspace_runtime"] == WORKSPACE_RUNTIME.to_dict()
+
+
+def test_snapshot_required_service_rejects_missing_bundle_before_create(
+    monkeypatch,
+    tmp_path,
+):
+    _configure_service_policy(monkeypatch, tmp_path)
+    admission, request = _contracts()
+    monkeypatch.setattr(
+        vm_task_tool,
+        "_vm_task_submit_trusted",
+        lambda **_kwargs: pytest.fail("missing W3 snapshot reached task creation"),
+    )
+
+    result = _submit_service(
+        service_id=SERVICE_ID,
+        capability=CAPABILITY,
+        operation=OPERATION,
+        admission=admission,
+        execution_request=request,
+        snapshot_required=True,
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == "vm_task_service_request_invalid"
+    assert "missing the W3 execution snapshot" in result["error"]
+
+
+def test_snapshot_required_service_rejects_malformed_bundle_before_create(
+    monkeypatch,
+    tmp_path,
+):
+    _configure_service_policy(monkeypatch, tmp_path)
+    admission, request = _contracts()
+    request = replace(
+        request,
+        toolchain={**request.toolchain, "w3_execution_snapshot": {"invalid": True}},
+    )
+    monkeypatch.setattr(
+        vm_task_tool,
+        "_vm_task_submit_trusted",
+        lambda **_kwargs: pytest.fail("malformed W3 snapshot reached task creation"),
+    )
+
+    result = _submit_service(
+        service_id=SERVICE_ID,
+        capability=CAPABILITY,
+        operation=OPERATION,
+        admission=admission,
+        execution_request=request,
+        snapshot_required=True,
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == "vm_task_service_request_invalid"
+    assert "invalid W3 execution snapshot" in result["error"]
+
+
+@pytest.mark.parametrize(
+    ("projection", "key", "replacement"),
+    [
+        ("execution_policy", "group_response_cap", "L0"),
+        ("execution_policy", "translate_baseline", "forged-live-baseline"),
+        ("execution_policy", "allow_feishu_writeback", True),
+        ("case", "artifact_namespace", "forged/live"),
+        ("business_profile", "profile_id", "forged-live-profile"),
+    ],
+)
+def test_snapshot_service_rejects_policy_projection_drift_before_create(
+    monkeypatch,
+    tmp_path,
+    projection,
+    key,
+    replacement,
+):
+    import gateway.pnc_rca_snapshot as snapshot_module
+
+    _configure_service_policy(monkeypatch, tmp_path)
+    admission, request = _contracts()
+    frozen_profile = {
+        "status": "matched",
+        "profile_id": "g1q3",
+        "execution_readiness": "ready",
+        "resource_class": "rca_prod",
+        "artifact_kind": "rca_html_report_and_viz_mcap",
+        "artifact_namespace": "rca/g1q3",
+    }
+    frozen_execution_policy = {
+        "request_schema": "g1q3_rca_execution_request_v2",
+        "data_access_mode": "remote_read",
+        "allow_download": False,
+        "input_materialization": "forbidden",
+        "derived_artifacts_allowed": True,
+        "allow_feishu_writeback": False,
+        "group_response_cap": "L1",
+        "translate_baseline": "production",
+        "translate_contract_path": "",
+    }
+    expected_execution_policy = {
+        "mode": "remote_read",
+        **{
+            name: value
+            for name, value in frozen_execution_policy.items()
+            if name != "request_schema"
+        },
+        "artifact_root": request.data["artifact_root"],
+        "resource_class": frozen_profile["resource_class"],
+        "artifact_kind": frozen_profile["artifact_kind"],
+    }
+    work_item = {**request.work_item, "business_profile": frozen_profile}
+    case = {
+        **request.case,
+        "artifact_namespace": frozen_profile["artifact_namespace"],
+    }
+    toolchain = {
+        **request.toolchain,
+        "business_profile": frozen_profile,
+        "w3_execution_snapshot": {"fixture": "validated-bundle"},
+    }
+    if projection == "execution_policy":
+        expected_execution_policy[key] = replacement
+    elif projection == "case":
+        case[key] = replacement
+    else:
+        changed_profile = {**frozen_profile, key: replacement}
+        work_item["business_profile"] = changed_profile
+        toolchain["business_profile"] = changed_profile
+    request = replace(
+        request,
+        work_item=work_item,
+        case=case,
+        execution_policy=expected_execution_policy,
+        toolchain=toolchain,
+    )
+    fake_snapshot = SimpleNamespace(
+        canonical_request=SimpleNamespace(
+            ticket={
+                "issue_url": request.work_item.get("url", ""),
+                "title": request.work_item.get("title", ""),
+            }
+        ),
+        snapshot_id="pnc-rca-snapshot-v1-" + "1" * 64,
+        snapshot_sha256="1" * 64,
+        request_sha256="2" * 64,
+    )
+    fake_bundle = SimpleNamespace(
+        schema_version="pnc_rca_execution_snapshot_bundle_v1",
+        bundle_sha256="3" * 64,
+        snapshot_authority_sha256="4" * 64,
+        snapshot=fake_snapshot,
+        creator_source_envelope=SimpleNamespace(
+            source_id=ORIGIN_SOURCE_ID,
+            source_envelope_sha256="5" * 64,
+        ),
+    )
+    monkeypatch.setattr(
+        snapshot_module,
+        "validate_snapshot_execution_bundle",
+        lambda _value: fake_bundle,
+    )
+    monkeypatch.setattr(
+        snapshot_module,
+        "snapshot_execution_inputs",
+        lambda _value: (
+            admission,
+            SimpleNamespace(
+                issue_url=request.work_item.get("url", ""),
+                title=request.work_item.get("title", ""),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        snapshot_module,
+        "snapshot_execution_request_inputs",
+        lambda _value: (frozen_profile, frozen_execution_policy),
+    )
+    monkeypatch.setattr(
+        vm_task_tool,
+        "_vm_task_submit_trusted",
+        lambda **_kwargs: pytest.fail("W3 projection drift reached task creation"),
+    )
+
+    result = _submit_service(
+        service_id=SERVICE_ID,
+        capability=CAPABILITY,
+        operation=OPERATION,
+        admission=admission,
+        execution_request=request,
+        snapshot_required=True,
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == "vm_task_service_request_identity_mismatch"
+    assert "policy projection" in result["error"]
+
+
+def test_canonical_rca_contract_hash_binds_w3_execution_snapshot_bytes():
+    admission, request = _contracts()
+    baseline = rca_to_dict(request)
+    first = copy.deepcopy(baseline)
+    first["toolchain"]["w3_execution_snapshot"] = {
+        "schema_version": "pnc_rca_execution_snapshot_bundle_v1",
+        "bundle_sha256": "1" * 64,
+    }
+    second = copy.deepcopy(first)
+    second["toolchain"]["w3_execution_snapshot"]["bundle_sha256"] = "2" * 64
+
+    assert vm_task_tool.canonical_rca_contract_sha256(
+        admission.to_dict(),
+        first,
+    ) != vm_task_tool.canonical_rca_contract_sha256(
+        admission.to_dict(),
+        second,
+    )
+
+
+def test_canonical_rca_contract_w3_golden_vector_and_exact_material():
+    admission, request, expected_material = _w3_contract_golden_vector()
+
+    assert vm_task_tool.canonical_rca_contract_material(
+        admission,
+        request,
+    ) == expected_material
+    assert vm_task_tool.canonical_rca_contract_sha256(
+        admission,
+        request,
+    ) == "c2f8dfe2864b84fb96b7380e3ddff655fe9b188484bd922e5e57ab569aa9ac95"
+
+
+@pytest.mark.parametrize(
+    ("path", "replacement"),
+    [
+        (("source_refs", "snapshot_id"), "changed-snapshot-id"),
+        (("source_refs", "snapshot_sha256"), "e" * 64),
+        (("source_refs", "request_sha256"), "f" * 64),
+        (("source_refs", "snapshot_bundle_sha256"), "0" * 64),
+        (("source_refs", "creator_source_envelope_sha256"), "1" * 64),
+        (("toolchain", "business_profile", "profile_id"), "changed-profile"),
+        (
+            (
+                "toolchain",
+                "w3_execution_snapshot",
+                "snapshot",
+                "canonical_request",
+                "ticket",
+                "title",
+            ),
+            "changed immutable title",
+        ),
+    ],
+)
+def test_canonical_rca_contract_w3_binds_every_extension_field(path, replacement):
+    admission, request, _expected_material = _w3_contract_golden_vector()
+    baseline = vm_task_tool.canonical_rca_contract_sha256(admission, request)
+    changed = copy.deepcopy(request)
+    target = changed
+    for field in path[:-1]:
+        target = target[field]
+    target[path[-1]] = replacement
+
+    assert vm_task_tool.canonical_rca_contract_sha256(
+        admission,
+        changed,
+    ) != baseline
 
 
 def test_service_wrapper_fails_closed_when_workspace_runtime_is_missing(
