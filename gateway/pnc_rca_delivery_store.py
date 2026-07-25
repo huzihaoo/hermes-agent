@@ -30,6 +30,12 @@ from gateway.pnc_rca_delivery_quarantine_baseline import (
     BASELINE_NAME as DELIVERY_QUARANTINE_BASELINE_NAME,
     quarantine_baseline_status_tx,
 )
+from gateway.pnc_rca_conclusion_adjudication import (
+    ConclusionAdjudicationResult,
+    ensure_conclusion_adjudication_schema,
+    record_conclusion_adjudication_tx,
+    validate_conclusion_adjudication_schema,
+)
 from gateway.pnc_rca_runtime_transition import (
     ensure_host_runtime_transition_schema,
     insert_host_runtime_transition,
@@ -155,6 +161,17 @@ EXISTS (
        AND t.activation_epoch_id = activation_epoch.epoch_id
        AND o.activation_ledger_id IS NOT NULL
        AND t.activation_ledger_id = o.activation_ledger_id
+)
+"""
+_ADJUDICATION_ACTIVATION_ELIGIBLE_SQL = """
+EXISTS (
+    SELECT 1
+      FROM rca_conclusion_adjudications AS adjudication
+      JOIN rca_activation_epochs AS adjudication_epoch
+        ON adjudication_epoch.epoch_id = adjudication.activation_epoch_id
+       AND adjudication_epoch.is_current = 1
+     WHERE adjudication.correction_effect_key = e.effect_key
+       AND adjudication_epoch.state IN ('bounded_active', 'steady_active')
 )
 """
 
@@ -698,11 +715,43 @@ class RcaDeliveryStore:
             is not None
         )
 
+    @classmethod
+    def _effect_activation_eligible_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        effect_key: str,
+        submission_key: str,
+    ) -> bool:
+        if cls._execution_activation_eligible_tx(
+            conn, submission_key=submission_key
+        ):
+            return True
+        return (
+            conn.execute(
+                f"""
+                SELECT 1
+                  FROM rca_delivery_effects AS e
+                 WHERE e.effect_key = ?
+                   AND {_ADJUDICATION_ACTIVATION_ELIGIBLE_SQL}
+                 LIMIT 1
+                """,
+                (effect_key,),
+            ).fetchone()
+            is not None
+        )
+
     def _initialize(self) -> None:
         marker_value = self._preflight_schema_version()
         if self.require_current:
             if marker_value != DELIVERY_STORE_SCHEMA_VERSION:
                 raise RuntimeError("rca_delivery_store_schema_not_current")
+            uri = f"{self.db_path.resolve().as_uri()}?mode=ro"
+            conn = sqlite3.connect(uri, uri=True)
+            try:
+                validate_conclusion_adjudication_schema(conn)
+            finally:
+                conn.close()
             return
         conn = self._connect()
         try:
@@ -867,6 +916,7 @@ class RcaDeliveryStore:
             )
             ensure_host_runtime_transition_schema(conn)
             self._migrate_schema(conn)
+            ensure_conclusion_adjudication_schema(conn)
             validate_host_runtime_transition_schema(
                 conn,
                 error_prefix="incompatible_delivery_store_schema",
@@ -1379,6 +1429,43 @@ class RcaDeliveryStore:
                 "synchronous": int(conn.execute("PRAGMA synchronous").fetchone()[0]),
                 "foreign_keys": int(conn.execute("PRAGMA foreign_keys").fetchone()[0]),
             }
+        finally:
+            conn.close()
+
+    def record_conclusion_adjudication(
+        self,
+        *,
+        work_item_id: str,
+        action: Literal["retract", "recognize"],
+        reason: str,
+        actor_id: str,
+        actor_name: str = "",
+        source: Mapping[str, Any],
+        replacement_conclusion: str = "",
+        original_effect_key: str = "",
+        now: datetime | None = None,
+    ) -> ConclusionAdjudicationResult:
+        """Atomically invalidate/recognize a conclusion and enqueue its comment."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            result = record_conclusion_adjudication_tx(
+                conn,
+                work_item_id=work_item_id,
+                action=action,
+                reason=reason,
+                actor_id=actor_id,
+                actor_name=actor_name,
+                source=source,
+                replacement_conclusion=replacement_conclusion,
+                original_effect_key=original_effect_key,
+                now=now,
+            )
+            conn.commit()
+            return result
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 
@@ -2021,8 +2108,9 @@ class RcaDeliveryStore:
             SELECT effect_key, target_key, payload_json, payload_sha256, required
               FROM rca_delivery_effects
              WHERE delivery_id = ? AND effect_kind = 'feishu_issue_comment'
+               AND target_key = ?
             """,
-            (delivery_id,),
+            (delivery_id, job["target_key"]),
         ).fetchone()
         if issue_effect is None or int(issue_effect["required"]) != 1:
             raise DeliveryContractError("delivery_primary_effect_missing")
@@ -2312,8 +2400,9 @@ class RcaDeliveryStore:
                     )
                 effect = conn.execute(
                     "SELECT effect_key FROM rca_delivery_effects "
-                    "WHERE delivery_id = ? AND effect_kind = 'feishu_issue_comment'",
-                    (delivery.delivery_id,),
+                    "WHERE delivery_id = ? AND effect_kind = 'feishu_issue_comment' "
+                    "AND target_key = ?",
+                    (delivery.delivery_id, delivery.target_key),
                 ).fetchone()
                 if effect is None or effect["effect_key"] != delivery.effect_key:
                     raise DeliveryRecordConflictError(
@@ -2469,8 +2558,9 @@ class RcaDeliveryStore:
                 """
                 SELECT effect_key FROM rca_delivery_effects
                  WHERE delivery_id = ? AND effect_kind = 'feishu_issue_comment'
+                   AND target_key = ?
                 """,
-                (delivery.delivery_id,),
+                (delivery.delivery_id, delivery.target_key),
             ).fetchone()
             if effect is None or effect["effect_key"] != delivery.effect_key:
                 raise DeliveryRecordConflictError(
@@ -3008,8 +3098,9 @@ class RcaDeliveryStore:
             )
             if activation_enforced:
                 self._require_activation_schema(conn)
-            if activation_enforced and not self._execution_activation_eligible_tx(
+            if activation_enforced and not self._effect_activation_eligible_tx(
                 conn,
+                effect_key=claim.effect_key,
                 submission_key=str(row["job_submission_key"]),
             ):
                 raise StaleDeliveryEffectLeaseError(
@@ -3314,8 +3405,9 @@ class RcaDeliveryStore:
             )
             if activation_enforced:
                 self._require_activation_schema(conn)
-            if activation_enforced and not self._execution_activation_eligible_tx(
+            if activation_enforced and not self._effect_activation_eligible_tx(
                 conn,
+                effect_key=claim.effect_key,
                 submission_key=str(row["job_submission_key"]),
             ):
                 raise StaleDeliveryEffectLeaseError(
@@ -3438,7 +3530,10 @@ class RcaDeliveryStore:
                 else ""
             )
             activation_filter = (
-                f"AND {_ACTIVATION_EXECUTION_ELIGIBLE_SQL}"
+                "AND ("
+                f"({_ACTIVATION_EXECUTION_ELIGIBLE_SQL}) OR "
+                f"({_ADJUDICATION_ACTIVATION_ELIGIBLE_SQL})"
+                ")"
                 if activation_enforced
                 else ""
             )
@@ -4665,7 +4760,10 @@ class RcaDeliveryStore:
                 else ""
             )
             activation_filter = (
-                f"AND {_ACTIVATION_EXECUTION_ELIGIBLE_SQL}"
+                "AND ("
+                f"({_ACTIVATION_EXECUTION_ELIGIBLE_SQL}) OR "
+                f"({_ADJUDICATION_ACTIVATION_ELIGIBLE_SQL})"
+                ")"
                 if activation_enforced
                 else ""
             )
@@ -4695,6 +4793,7 @@ class RcaDeliveryStore:
             "rca_delivery_effects",
             "rca_delivery_attempts",
             "rca_delivery_dispatcher_circuit",
+            "rca_conclusion_adjudications",
             "rca_delivery_subscriptions",
         }
         if table not in allowed:

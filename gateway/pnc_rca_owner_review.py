@@ -22,7 +22,10 @@ BUSINESS_STATE_SCHEMA_VERSION = "pnc_business_state_sidecar_from_owner_review_v1
 LEDGER_SCHEMA_VERSION = "g1q3_rca_owner_review_ledger_v1"
 REVIEW_SCHEMA_VERSION = "g1q3_rca_owner_review_v1"
 
-_COMMAND_RE = re.compile(r"^(?:rca|RCA)\s+(通过|驳回|补证据)\s+(\d+)(?:\s+(.*))?$", re.DOTALL)
+_COMMAND_RE = re.compile(
+    r"^(?:rca|RCA)\s+(通过|驳回|补证据|撤回)\s+(\d+)(?:\s+(.*))?$",
+    re.DOTALL,
+)
 
 
 @dataclass(frozen=True)
@@ -38,7 +41,27 @@ class OwnerReviewResult:
     response: str | None = None
 
 
-def handle_owner_review_message(event: Any, *, hermes_home: str | Path) -> OwnerReviewResult:
+def handle_owner_review_message(
+    event: Any, *, hermes_home: str | Path
+) -> OwnerReviewResult:
+    """Consume explicit owner commands even when their audited handler fails."""
+    try:
+        return _handle_owner_review_message(event, hermes_home=hermes_home)
+    except Exception as exc:
+        parsed = _parse_command(getattr(event, "text", "") or "")
+        if parsed is not None and _is_g1q3_bound_group_source(
+            getattr(event, "source", None)
+        ):
+            return OwnerReviewResult(
+                handled=True,
+                response=f"RCA owner review 失败并已安全停止：{type(exc).__name__}",
+            )
+        raise
+
+
+def _handle_owner_review_message(
+    event: Any, *, hermes_home: str | Path
+) -> OwnerReviewResult:
     """Handle an explicit owner-review command if ``event.text`` is one.
 
     Returns ``handled=False`` for unrelated messages.  All explicit ``rca``
@@ -70,11 +93,40 @@ def handle_owner_review_message(event: Any, *, hermes_home: str | Path) -> Owner
     issue_id = str(parsed["issue_id"])
     reason = str(parsed.get("reason") or "").strip()
     override = bool(parsed.get("override"))
-    if action in {"驳回", "补证据"} and not reason:
+    if action in {"驳回", "补证据", "撤回"} and not reason:
         return OwnerReviewResult(handled=True, response=f"{action} 必须填写理由。格式：rca {action} {issue_id} <理由>")
 
     review_dir = Path(hermes_home) / "pnc_agent" / "reviews" / "g1q3_rca"
     now = datetime.now(timezone.utc)
+    adjudication_result = None
+    if action == "撤回":
+        from gateway.pnc_rca_delivery_store import RcaDeliveryStore
+
+        control_db_path = (
+            Path(hermes_home)
+            / "runtime"
+            / "pnc_agent"
+            / "feishu_issue_kafka_rca"
+            / "control.sqlite3"
+        )
+        try:
+            adjudication_result = RcaDeliveryStore(
+                control_db_path, require_current=True
+            ).record_conclusion_adjudication(
+                work_item_id=issue_id,
+                action="retract",
+                reason=reason,
+                actor_id=owner_id,
+                actor_name=owner_name,
+                source=_source_record(event),
+                now=now,
+            )
+        except Exception as exc:
+            return OwnerReviewResult(
+                handled=True,
+                response=f"RCA 撤回未执行：{exc}",
+            )
+        override = True
     artifact_info = _find_report_generated_at(Path(hermes_home), issue_id)
     report_generated_at = artifact_info.get("report_generated_at")
     latency_seconds = _latency_seconds(report_generated_at, now) if report_generated_at else None
@@ -95,6 +147,12 @@ def handle_owner_review_message(event: Any, *, hermes_home: str | Path) -> Owner
         "override": override,
         "source": _source_record(event),
     }
+    if adjudication_result is not None:
+        record["adjudication_id"] = adjudication_result.adjudication_id
+        record["original_effect_key"] = adjudication_result.original_effect_key
+        record["correction_effect_key"] = adjudication_result.correction_effect_key
+        record["conclusion_state"] = adjudication_result.conclusion_state
+        record["impact_lineage"] = adjudication_result.impact_lineage
 
     sidecar_path = _business_state_sidecar_path(review_dir=review_dir, issue_id=issue_id)
     record["business_state_sidecar_path"] = str(sidecar_path)
@@ -187,7 +245,12 @@ def _is_allowed_owner(*, owner_id: str, owner_name: str, owners: OwnerAllowlist)
 
 
 def _verdict_for_action(action: str) -> str:
-    return {"通过": "approved", "驳回": "rejected", "补证据": "need_evidence"}.get(action, "unknown")
+    return {
+        "通过": "approved",
+        "驳回": "rejected",
+        "补证据": "need_evidence",
+        "撤回": "retracted",
+    }.get(action, "unknown")
 
 
 def _source_record(event: Any) -> dict[str, Any]:
@@ -202,7 +265,7 @@ def _source_record(event: Any) -> dict[str, Any]:
 
 
 def _usage_message() -> str:
-    return "格式：rca <通过|驳回|补证据> <issue_id数字> [理由] [覆盖]；驳回/补证据理由必填。"
+    return "格式：rca <通过|驳回|补证据|撤回> <issue_id数字> [理由] [覆盖]；驳回/补证据/撤回理由必填。"
 
 
 def _write_ledger(*, review_dir: Path, issue_id: str, record: dict[str, Any], override: bool) -> dict[str, Any]:
@@ -220,6 +283,11 @@ def _write_ledger(*, review_dir: Path, issue_id: str, record: dict[str, Any], ov
         issues = ledger.setdefault("issues", {})
         entry = issues.setdefault(issue_id, {"history": []})
         current = entry.get("current") if isinstance(entry, dict) else None
+        if current and all(
+            current.get(key) == record.get(key)
+            for key in ("action", "reason", "owner_id", "adjudication_id")
+        ):
+            return {"idempotent": True, "current": current}
         if current and not override:
             return {"idempotent": True, "current": current}
         if current and override:
@@ -292,6 +360,8 @@ def _business_state_for_verdict(verdict: str) -> tuple[str, str]:
         return "need_input", "owner 要求补证据；补齐后重新提交 RCA review"
     if verdict == "rejected":
         return "need_input", "owner 驳回当前 RCA；补充/重跑证据后重新提交 RCA review"
+    if verdict == "retracted":
+        return "need_input", "当前 RCA 结论已作废；重新复核证据后再提交 RCA review"
     return "rca_review", "复核 owner review verdict 后再推进"
 
 

@@ -70,6 +70,11 @@ from gateway.pnc_rca_delivery_store import (
     RcaDeliveryStore,
     StaleDeliveryEffectLeaseError,
 )
+from gateway.pnc_rca_conclusion_adjudication import (
+    ConclusionAdjudicationError,
+    is_adjudication_effect_payload,
+    validate_adjudication_effect_claim,
+)
 from gateway.pnc_rca_runtime_identity import (
     MAX_HEALTH_FUTURE_SKEW_SECONDS,
     RCA_DELIVERY_DISPATCHER_LOADED_DEPENDENCIES,
@@ -1633,6 +1638,20 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
     if claim.outcome != "success":
         return _validate_terminal_effect(claim)
     payload = claim.payload
+    if is_adjudication_effect_payload(payload):
+        try:
+            marker, content, field_updates = validate_adjudication_effect_claim(
+                claim
+            )
+        except ConclusionAdjudicationError as exc:
+            raise DeliveryContractError(str(exc)) from exc
+        return ValidatedEffect(
+            effect_kind=DELIVERY_EFFECT_KIND,
+            marker=marker,
+            content=content,
+            artifacts=(),
+            field_updates=field_updates,
+        )
     schema_version = str(payload.get("schema_version") or "")
     if schema_version != DELIVERY_EFFECT_SCHEMA_VERSION:
         raise DeliveryContractError("delivery_effect_schema_unsupported")
@@ -2803,6 +2822,7 @@ class DeliveryDispatcher:
             )
         if (
             claim.effect_kind == DELIVERY_EFFECT_KIND
+            and not is_adjudication_effect_payload(claim.payload)
             and _quality_regression_guard(before_fields, validated.field_updates)
         ):
             return self._suppress_quality_regression(
