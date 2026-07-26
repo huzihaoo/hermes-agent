@@ -1304,6 +1304,10 @@ def test_delivery_health_observes_stalled_watch_without_blocking_readiness(tmp_p
     assert health["production_blockers"] == {
         "activation_schema_unavailable": 0,
         "uncertain_effects": 0,
+        "quarantined_jobs": 0,
+        "quarantined_effects": 0,
+        "quarantined_subscriptions": 0,
+        "quarantine_baseline_invalid": 0,
     }
     assert watch["state"] == "pending"
 

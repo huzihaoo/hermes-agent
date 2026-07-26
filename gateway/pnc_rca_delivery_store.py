@@ -7149,14 +7149,23 @@ class RcaDeliveryStore:
                 "unresolved_required_effects": unresolved_required_effects,
                 "outcome_slo_breached": int(not outcome_slo["healthy"]),
             }
-            # Keep backlog and historical outcome counts visible without turning
-            # them into admission gates. Only conditions that make a new external
-            # write unsafe affect production readiness.
+            # Keep ordinary backlog and historical outcome counts visible without
+            # turning them into admission gates.  The release-scoped quarantine
+            # baseline is different: missing authority or rows outside its exact
+            # acknowledged snapshot make a new external write unsafe.
             production_blockers = {
                 "activation_schema_unavailable": business_blockers[
                     "activation_schema_unavailable"
                 ],
                 "uncertain_effects": business_blockers["uncertain_effects"],
+                "quarantined_jobs": business_blockers["quarantined_jobs"],
+                "quarantined_effects": business_blockers["quarantined_effects"],
+                "quarantined_subscriptions": business_blockers[
+                    "quarantined_subscriptions"
+                ],
+                "quarantine_baseline_invalid": business_blockers[
+                    "quarantine_baseline_invalid"
+                ],
             }
             required_circuits = {
                 DELIVERY_EFFECT_KIND,

@@ -1091,6 +1091,14 @@ def test_exact_approved_baseline_acknowledges_lifetime_without_db_writes(tmp_pat
     missing = store.health(now=NOW + timedelta(seconds=5))
     assert missing["business_ready"] is False
     assert missing["business_blockers"]["quarantined_jobs"] == 1
+    assert missing["production_blockers"] == {
+        "activation_schema_unavailable": 0,
+        "uncertain_effects": 0,
+        "quarantined_jobs": 1,
+        "quarantined_effects": 1,
+        "quarantined_subscriptions": 1,
+        "quarantine_baseline_invalid": 1,
+    }
     before_backpressure = store.backpressure_snapshot(
         now=NOW + timedelta(seconds=5)
     ).public_dict()
@@ -1098,6 +1106,7 @@ def test_exact_approved_baseline_acknowledges_lifetime_without_db_writes(tmp_pat
     health = _health(bundle)
 
     assert health["business_ready"] is True
+    assert not any(health["production_blockers"].values())
     assert health["delivery_jobs"]["quarantined"] == 1
     assert health["delivery_effects"]["quarantined"] == 1
     assert health["delivery_subscriptions"]["quarantined"] == 1
