@@ -40,7 +40,10 @@ from scripts.pnc_rca_conclusion_adjudication_audit import (
 )
 
 
-NOW = datetime(2026, 7, 25, 11, 30, tzinfo=timezone.utc)
+# These hand-built delivery rows model the pre-W5 historical corpus.  New
+# effects must carry a live W3/W5 binding; historical fixtures are explicitly
+# timestamped before the durable fence cutoff so they exercise the legacy path.
+NOW = datetime(2026, 7, 24, 11, 30, tzinfo=timezone.utc)
 ISSUE_ID = "7054691974"
 ORIGINAL_EFFECT_KEY = "g1q3-rca-effect-v1-" + "1" * 64
 

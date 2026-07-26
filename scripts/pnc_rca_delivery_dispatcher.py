@@ -2961,6 +2961,13 @@ class DeliveryDispatcher:
             validated = _validate_effect(claim)
         except DeliveryContractError as exc:
             return self._quarantine(claim, error_code=exc.code, detail=exc.detail)
+        if adjudication_effect:
+            binding_failure = self._adjudication_binding_gate(
+                claim,
+                after_outward_boundary=False,
+            )
+            if binding_failure is not None:
+                return binding_failure
         initial_operation = (
             "feishu_thread_reply"
             if claim.effect_kind == DELIVERY_THREAD_EFFECT_KIND
@@ -2983,13 +2990,6 @@ class DeliveryDispatcher:
             )
         except ExternalWriteFenceError as exc:
             return self._quarantine(claim, error_code=exc.code, detail=exc.detail)
-        if adjudication_effect:
-            binding_failure = self._adjudication_binding_gate(
-                claim,
-                after_outward_boundary=False,
-            )
-            if binding_failure is not None:
-                return binding_failure
         self._heartbeat(claim)
 
         superseded = self.store.suppress_terminal_effect_if_newer_settled_fields(
