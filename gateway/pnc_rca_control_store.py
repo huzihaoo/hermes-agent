@@ -10763,6 +10763,10 @@ class RcaControlStore:
             elif manual.mode in {"rerun", "debug"} and self._execution_terminal_tx(
                 conn, latest
             ):
+                if manual.platform != "feishu" or manual.mode != "rerun":
+                    raise ManualRcaAdmissionError(
+                        "manual_generation_requires_explicit_user_rerun"
+                    )
                 self._assert_manual_dispatch_capacity_tx(
                     conn,
                     outbox_high_watermark=high_watermark,

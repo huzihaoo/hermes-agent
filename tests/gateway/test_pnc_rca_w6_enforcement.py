@@ -16,6 +16,7 @@ from gateway.pnc_rca_control_store import (
 )
 from gateway.pnc_rca_delivery_contract import DeliveryContractError
 from gateway.pnc_rca_delivery_store import (
+    LEARNING_LANE_ADMISSION_MISSING_ERROR,
     LEARNING_LANE_EXTERNAL_EFFECT_ERROR,
     RcaDeliveryStore,
 )
@@ -107,6 +108,7 @@ def _insert_business_trigger(
     submission_key: str,
     work_item_id: str,
     created_at: str,
+    origin_source_id: str | None = None,
 ) -> None:
     conn.execute(
         """
@@ -125,6 +127,12 @@ def _insert_business_trigger(
             created_at,
         ),
     )
+    if origin_source_id is not None:
+        conn.execute(
+            "UPDATE business_triggers SET origin_source_id = ? "
+            "WHERE business_key = ? AND generation = ?",
+            (origin_source_id, business_key, generation),
+        )
 
 
 def _seed_learning_lane(tmp_path: Path):
@@ -187,9 +195,177 @@ def _seed_learning_lane(tmp_path: Path):
         raise
     finally:
         conn.close()
+
     return control, delivery, admission, cohort, db_path
 
 
+def test_stock_member_without_admission_fails_closed_at_all_write_boundaries(tmp_path):
+    _control, delivery, _admission, _cohort, db_path = _seed_learning_lane(tmp_path)
+    business_key = "missing-admission-business"
+    submission_key = "missing-admission-submission"
+    delivery_id = "missing-admission-delivery"
+    target = "feishu_project:g1q3:issue:1001"
+    current = AFTER_STOCK_CUTOFF.isoformat()
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        _insert_business_trigger(
+            conn,
+            business_key=business_key,
+            generation=1,
+            submission_key=submission_key,
+            work_item_id="1001",
+            created_at=current,
+        )
+        _insert_job(
+            conn,
+            delivery_id=delivery_id,
+            submission_key=submission_key,
+            business_key=business_key,
+            generation=1,
+            work_item_id="1001",
+            target_key=target,
+            created_at=current,
+        )
+
+        with pytest.raises(
+            sqlite3.IntegrityError, match=LEARNING_LANE_ADMISSION_MISSING_ERROR
+        ):
+            conn.execute(
+                """
+                INSERT INTO rca_delivery_subscriptions(
+                    subscription_key, business_key, generation, source_id,
+                    effect_kind, target_key, target_json, required, status,
+                    created_at, updated_at
+                ) VALUES (?, ?, 1, NULL, 'feishu_issue_comment', ?, '{}', 1,
+                          'pending', ?, ?)
+                """,
+                (
+                    "missing-admission-subscription",
+                    business_key,
+                    target,
+                    current,
+                    current,
+                ),
+            )
+
+        with pytest.raises(
+            sqlite3.IntegrityError, match=LEARNING_LANE_ADMISSION_MISSING_ERROR
+        ):
+            _insert_issue_effect(
+                conn,
+                effect_key="missing-admission-effect",
+                delivery_id=delivery_id,
+                target_key=target,
+                created_at=current,
+                status="pending",
+            )
+
+    with pytest.raises(RuntimeError, match=LEARNING_LANE_ADMISSION_MISSING_ERROR):
+        delivery.validate_learning_lane_external_operation(
+            business_key=business_key,
+            generation=1,
+            operation="feishu_issue_comment",
+        )
+
+    conn = delivery._connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        with pytest.raises(
+            DeliveryContractError, match=LEARNING_LANE_ADMISSION_MISSING_ERROR
+        ):
+            delivery.enforce_issue_comment_budget_tx(
+                conn,
+                delivery_id=delivery_id,
+                business_key=business_key,
+                generation=1,
+                target_key=target,
+                payload={"schema_version": "pnc_rca_delivery_effect_v1"},
+            )
+        conn.rollback()
+    finally:
+        conn.close()
+
+    dispatcher = object.__new__(DeliveryDispatcher)
+    dispatcher.store = delivery
+    claim = SimpleNamespace(business_key=business_key, generation=1)
+    with pytest.raises(
+        ExternalWriteFenceError, match=LEARNING_LANE_ADMISSION_MISSING_ERROR
+    ):
+        dispatcher._validate_external_write(
+            claim,
+            operation="feishu_issue_comment",
+            target=target,
+        )
+
+
+def test_comment_budget_cannot_borrow_rerun_authority_from_another_business_key(tmp_path):
+    _control, delivery, _admission, _cohort, db_path = _seed_learning_lane(tmp_path)
+    current = AFTER_STOCK_CUTOFF.isoformat()
+    target = "feishu_project:g1q3:issue:3001"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        for business_key in ("borrow-authority", "borrow-target"):
+            _insert_business_trigger(
+                conn,
+                business_key=business_key,
+                generation=2,
+                submission_key=f"{business_key}-submission",
+                work_item_id="3001",
+                created_at=current,
+            )
+            _insert_job(
+                conn,
+                delivery_id=f"{business_key}-delivery",
+                submission_key=f"{business_key}-submission",
+                business_key=business_key,
+                generation=2,
+                work_item_id="3001",
+                target_key=target,
+                created_at=current,
+            )
+        conn.execute(
+            """
+            INSERT INTO rca_trigger_sources(
+                source_id, source_kind, source_dedupe_key, payload_sha256,
+                platform, chat_id, thread_id, message_id, requester_id, mode,
+                created_at
+            ) VALUES ('borrow-source', 'feishu_group_manual', 'borrow-dedupe',
+                      ?, 'feishu', 'oc_test', 'topic:root', 'om_test', ?,
+                      'rerun', ?)
+            """,
+            ("c" * 64, "ou_" + "b" * 32, current),
+        )
+        conn.execute(
+            """
+            INSERT INTO rca_trigger_bindings(
+                source_id, business_key, generation, role, bound_at
+            ) VALUES ('borrow-source', 'borrow-authority', 2, 'origin', ?)
+            """,
+            (current,),
+        )
+        conn.execute(
+            "UPDATE business_triggers SET origin_source_id = 'borrow-source' "
+            "WHERE business_key = 'borrow-authority' AND generation = 2"
+        )
+
+    conn = delivery._connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        with pytest.raises(
+            DeliveryContractError,
+            match="delivery_comment_budget_generation_not_user_rerun",
+        ):
+            delivery.enforce_issue_comment_budget_tx(
+                conn,
+                delivery_id="borrow-target-delivery",
+                business_key="borrow-target",
+                generation=2,
+                target_key=target,
+                payload={"schema_version": "pnc_rca_delivery_effect_v1"},
+            )
+        conn.rollback()
+    finally:
+        conn.close()
 def test_v11_marker_migrates_the_v12_learning_schema(tmp_path):
     db_path = tmp_path / "migration.sqlite3"
     store = RcaControlStore(db_path)
@@ -509,6 +685,11 @@ def test_issue_comment_budget_allows_initial_adjudication_and_explicit_rerun_onl
             ) VALUES ('rerun-source-2', 'normal-business-2', 2, 'origin', ?)
             """,
             (current,),
+        )
+        conn.execute(
+            "UPDATE business_triggers SET origin_source_id = ? "
+            "WHERE business_key = ? AND generation = 2",
+            ("rerun-source-2", "normal-business-2"),
         )
 
     conn = delivery._connect()

@@ -201,12 +201,13 @@ def _operator_request(
     message_id: str,
     *,
     issue_url: str = "https://project.feishu.cn/g1q3/issue/detail/7041712812",
+    mode: str = "rerun",
     requester_id: str = "automation:test-operator",
 ):
     return ManualRcaTriggerRequest(
         schema_version=MANUAL_TRIGGER_SCHEMA_VERSION,
         issue_url=issue_url,
-        mode="rerun",
+        mode=mode,
         reason="production_batch_rerun",
         platform="operator",
         chat_id="",
@@ -236,7 +237,7 @@ def _manual_activation_identity(
     }
 
 
-def test_operator_rerun_is_issue_only_and_idempotent(tmp_path):
+def test_operator_terminal_rerun_is_rejected_without_generation(tmp_path):
     store = RcaControlStore(tmp_path / "control.sqlite3")
     _register_policy_without_classifying(store)
     first = store.admit_manual_trigger(
@@ -246,43 +247,33 @@ def test_operator_rerun_is_issue_only_and_idempotent(tmp_path):
     )
     _terminalize_permanent(store, first.submission_key)
 
-    request = _operator_request("batch-20260724-7041712812-attempt-1")
-    rerun = store.admit_manual_trigger(
-        request,
-        allowed_chat_ids=set(),
-        submit_enabled=True,
-        operator_authorized=True,
-        operator_rate_limit=1,
-        operator_rate_window_seconds=1,
-    )
-    replay = store.admit_manual_trigger(
-        request,
-        allowed_chat_ids=set(),
-        submit_enabled=True,
-        operator_authorized=True,
-        operator_rate_limit=1,
-        operator_rate_window_seconds=1,
-    )
-
-    assert rerun.generation == 2
-    assert replay.submission_key == rerun.submission_key
-    assert replay.reason == "idempotent_source_replay"
-    subscriptions = [
-        row
-        for row in store.list_rows("rca_delivery_subscriptions")
-        if row["business_key"] == rerun.business_key
-        and row["generation"] == rerun.generation
-    ]
-    assert [row["effect_kind"] for row in subscriptions] == [
-        "feishu_issue_comment"
-    ]
-    source = next(
-        row
-        for row in store.list_rows("rca_trigger_sources")
-        if row["source_id"] == rerun.source_id
-    )
-    assert source["platform"] == "operator"
-    assert source["chat_id"] == source["thread_id"] == ""
+    before = {
+        table: len(store.list_rows(table))
+        for table in (
+            "business_triggers",
+            "rca_outbox",
+            "rca_trigger_sources",
+            "rca_delivery_subscriptions",
+        )
+    }
+    for index, mode in enumerate(("rerun", "debug"), start=1):
+        with pytest.raises(
+            ManualRcaAdmissionError,
+            match="manual_generation_requires_explicit_user_rerun",
+        ):
+            store.admit_manual_trigger(
+                _operator_request(
+                    f"batch-20260724-7041712812-attempt-{index}",
+                    mode=mode,
+                ),
+                allowed_chat_ids=set(),
+                submit_enabled=True,
+                operator_authorized=True,
+            )
+    assert {
+        table: len(store.list_rows(table))
+        for table in before
+    } == before
 
 
 def test_operator_rerun_requires_authorization_and_can_create_issue_only(tmp_path):
@@ -4224,7 +4215,6 @@ def test_manual_active_policy_snapshot_overrides_stale_policy(
         ("shadow", "debug", "rearmed", 1, 1),
         ("terminal", "run_or_join", "catchup_attached", 1, 1),
         ("terminal", "rerun", "created", 2, 2),
-        ("terminal", "debug", "created", 2, 2),
     ),
 )
 def test_manual_cross_rule_uses_first_issue_chain_and_global_generation(
@@ -4269,6 +4259,31 @@ def test_manual_cross_rule_uses_first_issue_chain_and_global_generation(
     assert policy_audits[0]["submission_key"] == manual.submission_key
     assert policy_audits[0]["from_status"] == "issue-created-v1"
     assert policy_audits[0]["to_status"] == "issue-created-v2"
+
+
+def test_terminal_debug_requires_explicit_user_rerun(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    _register_policy_without_classifying(store)
+    first = store.admit_manual_trigger(
+        _manual_request("om_terminal_debug_initial"),
+        allowed_chat_ids={"oc_allowed"},
+        submit_enabled=True,
+    )
+    _terminalize_permanent(store, first.submission_key)
+    before = len(store.list_rows("business_triggers"))
+
+    with pytest.raises(
+        ManualRcaAdmissionError,
+        match="manual_generation_requires_explicit_user_rerun",
+    ):
+        store.admit_manual_trigger(
+            _manual_request("om_terminal_debug", mode="debug"),
+            allowed_chat_ids={"oc_allowed"},
+            submit_enabled=True,
+            operator_authorized=True,
+        )
+
+    assert len(store.list_rows("business_triggers")) == before
 
 
 @pytest.mark.parametrize("initial_state", ["pending", "shadow", "terminal"])

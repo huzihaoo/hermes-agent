@@ -2504,7 +2504,10 @@ class DeliveryDispatcher:
                 operation=operation,
             )
         except RuntimeError as exc:
-            if str(exc) == "learning_lane_external_effect_forbidden":
+            if str(exc) in {
+                "learning_lane_external_effect_forbidden",
+                "learning_lane_admission_missing",
+            }:
                 raise ExternalWriteFenceError(str(exc)) from exc
             raise
         contract = claim.contract if isinstance(claim.contract, Mapping) else {}

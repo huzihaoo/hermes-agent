@@ -98,6 +98,13 @@ _PERMANENT_FAILURE_STREAK_META_KEY = "permanent_failure_streak"
 _PERMANENT_FAILURE_LAST_META_KEY = "permanent_failure_last"
 _NON_PIPELINE_QUARANTINE_CODES = frozenset({"feishu_work_item_not_found"})
 LEARNING_LANE_EXTERNAL_EFFECT_ERROR = "learning_lane_external_effect_forbidden"
+LEARNING_LANE_ADMISSION_MISSING_ERROR = "learning_lane_admission_missing"
+_W6_STOCK_CUTOFF = "2026-07-25T10:15:43.473251+00:00"
+_TERMINAL_EFFECT_SCHEMA_VERSIONS = frozenset({
+    "pnc_rca_terminal_delivery_effect_v1",
+    "pnc_rca_terminal_delivery_effect_v2",
+    "pnc_rca_terminal_delivery_effect_v3",
+})
 _LEARNING_ADJUDICATION_SCHEMAS = frozenset({
     "pnc_rca_conclusion_adjudication_effect_v1",
     "pnc_rca_conclusion_adjudication_effect_v2",
@@ -750,23 +757,17 @@ class RcaDeliveryStore:
         """Reject every provider-side Feishu operation for a learning admission."""
         conn = self._connect()
         try:
-            row = self._learning_lane_row_tx(
+            if not str(operation or "").strip().startswith("feishu_"):
+                return
+            state = self._learning_lane_guard_state_tx(
                 conn, business_key=business_key, generation=generation
             )
         finally:
             conn.close()
-        if (
-            row is not None
-            and str(row["lane"] or "") == "learning"
-            and int(
-                row["external_write_allowed"]
-                if row["external_write_allowed"] is not None
-                else 1
-            )
-            == 0
-            and str(operation or "").strip().startswith("feishu_")
-        ):
+        if state == "admitted" or state == "unknown":
             raise RuntimeError(LEARNING_LANE_EXTERNAL_EFFECT_ERROR)
+        if state == "admission_missing":
+            raise RuntimeError(LEARNING_LANE_ADMISSION_MISSING_ERROR)
 
     @staticmethod
     def _validate_activation_required(activation_required: bool) -> None:
@@ -1016,9 +1017,11 @@ class RcaDeliveryStore:
                 raise RuntimeError("rca_delivery_store_schema_not_current")
             uri = f"{self.db_path.resolve().as_uri()}?mode=ro"
             conn = sqlite3.connect(uri, uri=True)
+            conn.row_factory = sqlite3.Row
             try:
                 validate_conclusion_adjudication_schema(conn)
                 self._validate_failure_route_schema(conn)
+                self._validate_w6_effect_guards(conn)
             finally:
                 conn.close()
             return
@@ -1808,34 +1811,219 @@ class RcaDeliveryStore:
 
     @staticmethod
     def _install_w6_effect_guards(conn: sqlite3.Connection) -> None:
-        """Install a DB-level backstop when the shared control tables are present."""
-        if not RcaDeliveryStore._table_exists(
+        """Install DB-level W6 backstops when the shared control schema exists."""
+        admissions_ready = RcaDeliveryStore._table_exists(
             conn, "rca_learning_lane_admissions"
-        ):
-            return
-        conn.execute(
-            """
-            CREATE TRIGGER IF NOT EXISTS trg_learning_lane_effect_insert_forbidden
-            BEFORE INSERT ON rca_delivery_effects
-            WHEN NEW.effect_kind LIKE 'feishu_%'
-             AND EXISTS (
-                 SELECT 1 FROM rca_learning_lane_admissions AS admission
-                  WHERE admission.business_key = (
-                      SELECT business_key FROM rca_delivery_jobs
-                       WHERE delivery_id = NEW.delivery_id
-                  )
-                    AND admission.generation = (
-                      SELECT generation FROM rca_delivery_jobs
-                       WHERE delivery_id = NEW.delivery_id
-                    )
-                    AND admission.lane = 'learning'
-                    AND admission.external_write_allowed = 0
-             )
-            BEGIN
-                SELECT RAISE(ABORT, 'learning_lane_external_effect_forbidden');
-            END
-            """
         )
+        if admissions_ready:
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_learning_lane_effect_insert_forbidden
+                BEFORE INSERT ON rca_delivery_effects
+                WHEN NEW.effect_kind LIKE 'feishu_%'
+                 AND EXISTS (
+                     SELECT 1 FROM rca_learning_lane_admissions AS admission
+                      WHERE admission.business_key = (
+                          SELECT business_key FROM rca_delivery_jobs
+                           WHERE delivery_id = NEW.delivery_id
+                      )
+                        AND admission.generation = (
+                          SELECT generation FROM rca_delivery_jobs
+                           WHERE delivery_id = NEW.delivery_id
+                        )
+                        AND admission.lane = 'learning'
+                        AND admission.external_write_allowed = 0
+                 )
+                BEGIN
+                    SELECT RAISE(ABORT, 'learning_lane_external_effect_forbidden');
+                END
+                """
+            )
+
+        cohort_ready = all(
+            RcaDeliveryStore._table_exists(conn, table)
+            for table in (
+                "business_triggers",
+                "rca_learning_lane_cohorts",
+                "rca_learning_lane_stock_items",
+            )
+        )
+        # This trigger deliberately checks stock membership rather than only the
+        # admission table.  A missing admission is itself a fail-closed state.
+        if cohort_ready and admissions_ready:
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS
+                    trg_learning_lane_stock_effect_insert_forbidden
+                BEFORE INSERT ON rca_delivery_effects
+                WHEN NEW.effect_kind LIKE 'feishu_%'
+                 AND EXISTS (
+                     SELECT 1
+                       FROM rca_delivery_jobs AS job
+                       JOIN business_triggers AS bt
+                         ON bt.business_key = job.business_key
+                        AND bt.generation = job.generation
+                       JOIN rca_learning_lane_cohorts AS cohort
+                       JOIN rca_learning_lane_stock_items AS item
+                         ON item.cohort_id = cohort.cohort_id
+                        AND item.work_item_id = job.work_item_id
+                      WHERE job.delivery_id = NEW.delivery_id
+                        AND (
+                            julianday(bt.created_at) IS NULL
+                            OR julianday(cohort.stock_cutoff) IS NULL
+                            OR julianday(bt.created_at) >
+                               julianday(cohort.stock_cutoff)
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1
+                              FROM rca_learning_lane_admissions AS admission
+                             WHERE admission.business_key = job.business_key
+                               AND admission.generation = job.generation
+                               AND admission.lane = 'learning'
+                               AND admission.external_write_allowed = 0
+                        )
+                 )
+                BEGIN
+                    SELECT RAISE(ABORT, 'learning_lane_admission_missing');
+                END
+                """
+            )
+            if RcaDeliveryStore._table_exists(
+                conn, "rca_delivery_subscriptions"
+            ):
+                conn.execute(
+                    """
+                    CREATE TRIGGER IF NOT EXISTS
+                        trg_learning_lane_stock_subscription_insert_forbidden
+                        BEFORE INSERT ON rca_delivery_subscriptions
+                        WHEN NEW.effect_kind LIKE 'feishu_%'
+                         AND EXISTS (
+                             SELECT 1
+                               FROM business_triggers AS bt
+                               JOIN rca_learning_lane_cohorts AS cohort
+                               JOIN rca_learning_lane_stock_items AS item
+                                 ON item.cohort_id = cohort.cohort_id
+                                AND item.work_item_id = bt.work_item_id
+                              WHERE bt.business_key = NEW.business_key
+                                AND bt.generation = NEW.generation
+                                AND (
+                                    julianday(bt.created_at) IS NULL
+                                    OR julianday(cohort.stock_cutoff) IS NULL
+                                    OR julianday(bt.created_at) >
+                                       julianday(cohort.stock_cutoff)
+                                )
+                                AND NOT EXISTS (
+                                    SELECT 1
+                                      FROM rca_learning_lane_admissions AS admission
+                                     WHERE admission.business_key = NEW.business_key
+                                       AND admission.generation = NEW.generation
+                                       AND admission.lane = 'learning'
+                                       AND admission.external_write_allowed = 0
+                                )
+                         )
+                        BEGIN
+                            SELECT RAISE(ABORT, 'learning_lane_admission_missing');
+                        END
+                        """
+                )
+                conn.execute(
+                    """
+                    CREATE TRIGGER IF NOT EXISTS
+                        trg_learning_lane_stock_subscription_update_forbidden
+                    BEFORE UPDATE OF business_key, generation, effect_kind
+                        ON rca_delivery_subscriptions
+                    WHEN NEW.effect_kind LIKE 'feishu_%'
+                     AND EXISTS (
+                         SELECT 1
+                           FROM business_triggers AS bt
+                           JOIN rca_learning_lane_cohorts AS cohort
+                           JOIN rca_learning_lane_stock_items AS item
+                             ON item.cohort_id = cohort.cohort_id
+                            AND item.work_item_id = bt.work_item_id
+                          WHERE bt.business_key = NEW.business_key
+                            AND bt.generation = NEW.generation
+                            AND (
+                                julianday(bt.created_at) IS NULL
+                                OR julianday(cohort.stock_cutoff) IS NULL
+                                OR julianday(bt.created_at) >
+                                   julianday(cohort.stock_cutoff)
+                            )
+                            AND NOT EXISTS (
+                                SELECT 1
+                                  FROM rca_learning_lane_admissions AS admission
+                                 WHERE admission.business_key = NEW.business_key
+                                   AND admission.generation = NEW.generation
+                                   AND admission.lane = 'learning'
+                                   AND admission.external_write_allowed = 0
+                            )
+                     )
+                    BEGIN
+                        SELECT RAISE(ABORT, 'learning_lane_admission_missing');
+                    END
+                    """
+                )
+
+    @staticmethod
+    def _validate_w6_effect_guards(conn: sqlite3.Connection) -> None:
+        """Fail closed when a current control DB has a partial W6 backstop."""
+        w6_authority_tables = {
+            "rca_learning_lane_cohorts",
+            "rca_learning_lane_stock_items",
+            "rca_learning_lane_admissions",
+        }
+        present = {
+            table
+            for table in w6_authority_tables
+            if RcaDeliveryStore._table_exists(conn, table)
+        }
+        # Delivery-only test/migration databases predate W6 entirely.
+        if not present:
+            return
+        if present != w6_authority_tables or not RcaDeliveryStore._table_exists(
+            conn, "business_triggers"
+        ):
+            raise RuntimeError(
+                "incompatible_delivery_store_schema:w6_authority_tables"
+            )
+        trigger_rows = {
+            str(row["name"]): " ".join(
+                str(row["sql"] or "").lower().split()
+            )
+            for row in conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'trigger'"
+            ).fetchall()
+        }
+        required = {
+            "trg_learning_lane_effect_insert_forbidden": (
+                "before insert on rca_delivery_effects",
+                "learning_lane_external_effect_forbidden",
+            ),
+            "trg_learning_lane_stock_effect_insert_forbidden": (
+                "before insert on rca_delivery_effects",
+                "learning_lane_admission_missing",
+            ),
+        }
+        if RcaDeliveryStore._table_exists(
+            conn, "rca_delivery_subscriptions"
+        ):
+            required[
+                "trg_learning_lane_stock_subscription_insert_forbidden"
+            ] = (
+                "before insert on rca_delivery_subscriptions",
+                "learning_lane_admission_missing",
+            )
+            required[
+                "trg_learning_lane_stock_subscription_update_forbidden"
+            ] = (
+                "before update of business_key, generation, effect_kind",
+                "learning_lane_admission_missing",
+            )
+        for name, markers in required.items():
+            sql = trigger_rows.get(name)
+            if sql is None or any(marker not in sql for marker in markers):
+                raise RuntimeError(
+                    f"incompatible_delivery_store_schema:w6_trigger:{name}"
+                )
 
     def journal_settings(self) -> dict[str, Any]:
         conn = self._connect()
@@ -2943,23 +3131,266 @@ class RcaDeliveryStore:
             (business_key, generation),
         ).fetchone()
 
+    @staticmethod
+    def _table_columns_tx(
+        conn: sqlite3.Connection, table_name: str
+    ) -> set[str]:
+        return {
+            str(row[1])
+            for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        }
+
+    @classmethod
+    def _explicit_user_rerun_keys_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        business_key: str,
+        work_item_id: str,
+    ) -> set[tuple[str, int]] | None:
+        """Return exact human-origin reruns, or None when authority is unavailable."""
+        required_tables = (
+            "business_triggers",
+            "rca_trigger_bindings",
+            "rca_trigger_sources",
+        )
+        if not all(cls._table_exists(conn, table) for table in required_tables):
+            return None
+        required_columns = {
+            "business_triggers": {
+                "business_key",
+                "generation",
+                "work_item_id",
+                "origin_source_id",
+            },
+            "rca_trigger_bindings": {
+                "source_id",
+                "business_key",
+                "generation",
+                "role",
+            },
+            "rca_trigger_sources": {
+                "source_id",
+                "source_kind",
+                "platform",
+                "chat_id",
+                "thread_id",
+                "message_id",
+                "requester_id",
+                "mode",
+            },
+        }
+        if any(
+            not required.issubset(cls._table_columns_tx(conn, table))
+            for table, required in required_columns.items()
+        ):
+            return None
+        rows = conn.execute(
+            """
+            SELECT b.business_key, b.generation, s.requester_id
+              FROM rca_trigger_bindings AS b
+              JOIN business_triggers AS t
+                ON t.business_key = b.business_key
+               AND t.generation = b.generation
+               AND t.origin_source_id = b.source_id
+              JOIN rca_trigger_sources AS s ON s.source_id = b.source_id
+             WHERE b.business_key = ?
+               AND t.work_item_id = ?
+               AND b.role = 'origin'
+               AND s.source_kind = 'feishu_group_manual'
+               AND s.platform = 'feishu'
+               AND s.mode = 'rerun'
+               AND TRIM(s.chat_id) != ''
+               AND TRIM(s.thread_id) != ''
+               AND TRIM(s.message_id) != ''
+            """,
+            (business_key, work_item_id),
+        ).fetchall()
+        return {
+            (str(row["business_key"]), int(row["generation"]))
+            for row in rows
+            if _OPEN_ID_RE.fullmatch(str(row["requester_id"] or ""))
+        }
+
     @classmethod
     def is_learning_lane_tx(
         cls, conn: sqlite3.Connection, *, business_key: str, generation: int
     ) -> bool:
-        row = cls._learning_lane_row_tx(
+        return (
+            cls._learning_lane_guard_state_tx(
+                conn,
+                business_key=business_key,
+                generation=generation,
+            )
+            == "admitted"
+        )
+
+    @classmethod
+    def _learning_lane_guard_state_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        business_key: str,
+        generation: int,
+        work_item_id: str | None = None,
+    ) -> Literal["admitted", "admission_missing", "not_learning", "unknown"]:
+        """Resolve the W6 lane from immutable admission and stock authority.
+
+        A stock member is learning even when its admission row is missing.  The
+        latter must fail closed instead of falling through to ordinary delivery.
+        Legacy isolated delivery fixtures without the control schema remain
+        non-learning for compatibility.
+        """
+        admission = cls._learning_lane_row_tx(
             conn, business_key=business_key, generation=generation
         )
-        return (
-            row is not None
-            and str(row["lane"] or "") == "learning"
-            and int(
-                row["external_write_allowed"]
-                if row["external_write_allowed"] is not None
-                else 1
+        if admission is not None:
+            admission_columns = cls._table_columns_tx(
+                conn, "rca_learning_lane_admissions"
             )
-            == 0
+            required_admission_columns = {
+                "business_key",
+                "generation",
+                "work_item_id",
+                "lane",
+                "external_write_allowed",
+                "cohort_id",
+                "stock_cutoff",
+                "stock_ids_sha256",
+                "admitted_at",
+            }
+            if not required_admission_columns.issubset(admission_columns):
+                return "unknown"
+            if (
+                str(admission["lane"] or "") != "learning"
+                or int(
+                    admission["external_write_allowed"]
+                    if admission["external_write_allowed"] is not None
+                    else 1
+                )
+                != 0
+            ):
+                return "unknown"
+            if not all(
+                cls._table_exists(conn, table)
+                for table in (
+                    "business_triggers",
+                    "rca_learning_lane_cohorts",
+                    "rca_learning_lane_stock_items",
+                )
+            ):
+                return "unknown"
+            trigger = conn.execute(
+                "SELECT work_item_id, created_at FROM business_triggers "
+                "WHERE business_key = ? AND generation = ?",
+                (business_key, generation),
+            ).fetchone()
+            cohort = conn.execute(
+                "SELECT stock_cutoff, stock_ids_sha256 FROM "
+                "rca_learning_lane_cohorts WHERE cohort_id = ?",
+                (str(admission["cohort_id"] or ""),),
+            ).fetchone()
+            if trigger is None or cohort is None:
+                return "unknown"
+            try:
+                trigger_created = _parse_iso(str(trigger["created_at"]))
+                stock_cutoff = _parse_iso(str(cohort["stock_cutoff"]))
+                admitted_at = _parse_iso(str(admission["admitted_at"]))
+            except (TypeError, ValueError, OverflowError):
+                return "unknown"
+            if (
+                str(trigger["work_item_id"] or "")
+                != str(admission["work_item_id"] or "")
+                or str(admission["stock_cutoff"] or "")
+                != str(cohort["stock_cutoff"] or "")
+                or str(admission["stock_ids_sha256"] or "")
+                != str(cohort["stock_ids_sha256"] or "")
+                or admitted_at <= stock_cutoff
+                or trigger_created <= stock_cutoff
+            ):
+                return "unknown"
+            member = conn.execute(
+                "SELECT 1 FROM rca_learning_lane_stock_items "
+                "WHERE cohort_id = ? AND work_item_id = ?",
+                (str(admission["cohort_id"]), str(admission["work_item_id"])),
+            ).fetchone()
+            return "admitted" if member is not None else "unknown"
+
+        cohort_tables = {
+            "rca_learning_lane_cohorts",
+            "rca_learning_lane_stock_items",
+        }
+        present = {
+            table
+            for table in cohort_tables
+            if cls._table_exists(conn, table)
+        }
+        # A standalone delivery database has no W6 authority at all.
+        if not present and not cls._table_exists(
+            conn, "rca_learning_lane_admissions"
+        ):
+            return "not_learning"
+        if present != cohort_tables:
+            return "unknown"
+        trigger_tables = {"business_triggers"}
+        if not all(cls._table_exists(conn, table) for table in trigger_tables):
+            return "unknown"
+        trigger_columns = cls._table_columns_tx(conn, "business_triggers")
+        if not {"business_key", "generation", "work_item_id", "created_at"}.issubset(
+            trigger_columns
+        ):
+            return "unknown"
+        trigger = conn.execute(
+            "SELECT work_item_id, created_at FROM business_triggers "
+            "WHERE business_key = ? AND generation = ?",
+            (business_key, generation),
+        ).fetchone()
+        if trigger is None:
+            return "unknown"
+        item_id = str(work_item_id or trigger["work_item_id"] or "").strip()
+        if not item_id:
+            return "unknown"
+        cohort = conn.execute(
+            "SELECT cohort_id, stock_cutoff FROM rca_learning_lane_cohorts "
+            "ORDER BY sealed_at, cohort_id LIMIT 1"
+        ).fetchone()
+        if cohort is None:
+            return "not_learning"
+        try:
+            created_at = _parse_iso(str(trigger["created_at"]))
+            stock_cutoff = _parse_iso(str(cohort["stock_cutoff"]))
+        except (TypeError, ValueError, OverflowError):
+            return "unknown"
+        if created_at <= stock_cutoff:
+            return "not_learning"
+        member = conn.execute(
+            "SELECT 1 FROM rca_learning_lane_stock_items "
+            "WHERE cohort_id = ? AND work_item_id = ?",
+            (str(cohort["cohort_id"]), item_id),
+        ).fetchone()
+        return "admission_missing" if member is not None else "not_learning"
+
+    @classmethod
+    def _require_learning_lane_guard_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        business_key: str,
+        generation: int,
+        work_item_id: str | None = None,
+    ) -> None:
+        state = cls._learning_lane_guard_state_tx(
+            conn,
+            business_key=business_key,
+            generation=generation,
+            work_item_id=work_item_id,
         )
+        if state == "admitted":
+            raise DeliveryContractError(LEARNING_LANE_EXTERNAL_EFFECT_ERROR)
+        if state == "admission_missing":
+            raise DeliveryContractError(LEARNING_LANE_ADMISSION_MISSING_ERROR)
+        if state == "unknown":
+            raise DeliveryContractError(LEARNING_LANE_EXTERNAL_EFFECT_ERROR)
 
     @staticmethod
     def _is_adjudication_comment_payload(
@@ -2968,6 +3399,76 @@ class RcaDeliveryStore:
         return (
             str(payload.get("schema_version") or "") in _LEARNING_ADJUDICATION_SCHEMAS
             or str(target_key or "").startswith(_ADJUDICATION_TARGET_PREFIX)
+        )
+
+    @classmethod
+    def _is_pre_w6_terminal_generation_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        business_key: str,
+        generation: int,
+    ) -> bool:
+        """Recognize immutable pre-cutover terminal history only.
+
+        Legacy Kafka generations created before the W6 cutoff may still need a
+        single terminal comment.  New/post-cutover generations remain subject
+        to the explicit-human-rerun authority check below.
+        """
+        if not cls._table_exists(conn, "business_triggers"):
+            return False
+        row = conn.execute(
+            "SELECT created_at FROM business_triggers "
+            "WHERE business_key = ? AND generation = ?",
+            (business_key, generation),
+        ).fetchone()
+        if row is None:
+            return False
+        try:
+            return _parse_iso(str(row["created_at"])) <= _parse_iso(_W6_STOCK_CUTOFF)
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+    @classmethod
+    def _is_automatic_kafka_terminal_generation_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        business_key: str,
+        generation: int,
+    ) -> bool:
+        """Allow one terminal result for a durable Kafka retrigger lineage.
+
+        Kafka re-observation is an existing execution lineage (not a user
+        correction).  It may publish its one terminal result, while ordinary
+        post-cutover comments still require the explicit Feishu rerun binding.
+        """
+        required = (
+            "business_triggers",
+            "rca_trigger_bindings",
+            "rca_trigger_sources",
+        )
+        if not all(cls._table_exists(conn, table) for table in required):
+            return False
+        row = conn.execute(
+            """
+            SELECT s.source_kind, s.mode
+              FROM business_triggers AS t
+              JOIN rca_trigger_bindings AS b
+                ON b.business_key = t.business_key
+               AND b.generation = t.generation
+               AND b.source_id = t.origin_source_id
+              JOIN rca_trigger_sources AS s ON s.source_id = b.source_id
+             WHERE t.business_key = ?
+               AND t.generation = ?
+               AND b.role = 'origin'
+             LIMIT 1
+            """,
+            (business_key, generation),
+        ).fetchone()
+        return row is not None and (
+            str(row["source_kind"] or "") == "kafka_workflow_event"
+            or str(row["mode"] or "") == "kafka_retrigger"
         )
 
     @classmethod
@@ -2982,16 +3483,26 @@ class RcaDeliveryStore:
         payload: Mapping[str, Any],
     ) -> None:
         """Reserve one outward issue-comment slot inside the caller transaction."""
-        if cls.is_learning_lane_tx(
-            conn, business_key=business_key, generation=generation
-        ):
-            raise DeliveryContractError(LEARNING_LANE_EXTERNAL_EFFECT_ERROR)
         job = conn.execute(
-            "SELECT work_item_id, target_key FROM rca_delivery_jobs WHERE delivery_id = ?",
+            "SELECT business_key, generation, work_item_id, target_key "
+            "FROM rca_delivery_jobs WHERE delivery_id = ?",
             (delivery_id,),
         ).fetchone()
         if job is None:
             raise DeliveryRecordConflictError("delivery_comment_budget_job_missing")
+        if (
+            str(job["business_key"]) != str(business_key)
+            or int(job["generation"]) != int(generation)
+        ):
+            raise DeliveryRecordConflictError(
+                "delivery_comment_budget_job_identity_mismatch"
+            )
+        cls._require_learning_lane_guard_tx(
+            conn,
+            business_key=str(business_key),
+            generation=int(generation),
+            work_item_id=str(job["work_item_id"]),
+        )
         job_target = str(job["target_key"] or "")
         is_adjudication = cls._is_adjudication_comment_payload(payload, target_key)
         if not is_adjudication and str(target_key) != job_target:
@@ -3000,9 +3511,10 @@ class RcaDeliveryStore:
             existing = conn.execute(
                 """
                 SELECT COUNT(*)
-                  FROM rca_delivery_effects AS e
-                  JOIN rca_delivery_jobs AS j ON j.delivery_id = e.delivery_id
-                 WHERE j.work_item_id = ?
+                 FROM rca_delivery_effects AS e
+                 JOIN rca_delivery_jobs AS j ON j.delivery_id = e.delivery_id
+                 WHERE j.business_key = ?
+                   AND j.work_item_id = ?
                    AND e.effect_kind = 'feishu_issue_comment'
                    AND (
                         json_extract(e.payload_json, '$.schema_version') IN (?, ?)
@@ -3010,6 +3522,7 @@ class RcaDeliveryStore:
                    )
                 """,
                 (
+                    str(business_key),
                     str(job["work_item_id"]),
                     *_LEARNING_ADJUDICATION_SCHEMAS,
                     len(_ADJUDICATION_TARGET_PREFIX),
@@ -3022,54 +3535,64 @@ class RcaDeliveryStore:
                 )
             return
 
-        source_tables_ready = all(
-            cls._table_exists(conn, table)
-            for table in ("rca_trigger_sources", "rca_trigger_bindings", "business_triggers")
+        is_terminal = (
+            str(payload.get("schema_version") or "")
+            in _TERMINAL_EFFECT_SCHEMA_VERSIONS
         )
-        explicit_generations: set[int] = set()
-        if source_tables_ready:
-            rows = conn.execute(
-                """
-                SELECT DISTINCT b.generation, s.requester_id, s.chat_id,
-                                s.thread_id, s.message_id, s.source_kind, s.mode
-                  FROM rca_trigger_bindings AS b
-                  JOIN rca_trigger_sources AS s ON s.source_id = b.source_id
-                  JOIN business_triggers AS t
-                    ON t.business_key = b.business_key AND t.generation = b.generation
-                 WHERE t.work_item_id = ?
-                """,
-                (str(job["work_item_id"]),),
-            ).fetchall()
-            for row in rows:
-                if (
-                    str(row["source_kind"] or "") == "feishu_group_manual"
-                    and str(row["mode"] or "") == "rerun"
-                    and _OPEN_ID_RE.fullmatch(str(row["requester_id"] or ""))
-                    and str(row["chat_id"] or "").strip()
-                    and str(row["thread_id"] or "").strip()
-                    and str(row["message_id"] or "").strip()
-                ):
-                    explicit_generations.add(int(row["generation"]))
-        w6_cohort_sealed = (
-            cls._table_exists(conn, "rca_learning_lane_cohorts")
-            and conn.execute(
-                "SELECT 1 FROM rca_learning_lane_cohorts "
-                "WHERE stock_count > 0 LIMIT 1"
-            ).fetchone()
-            is not None
-        )
-        if generation > 1 and generation not in explicit_generations:
-            if w6_cohort_sealed:
-                raise DeliveryContractError(
-                    "delivery_comment_budget_generation_not_user_rerun"
-                )
-        primary_count = int(
-            conn.execute(
+        if is_terminal and generation > 1 and (
+            cls._is_pre_w6_terminal_generation_tx(
+                conn,
+                business_key=str(business_key),
+                generation=int(generation),
+            )
+            or cls._is_automatic_kafka_terminal_generation_tx(
+                conn,
+                business_key=str(business_key),
+                generation=int(generation),
+            )
+        ):
+            existing = conn.execute(
                 """
                 SELECT COUNT(*)
                   FROM rca_delivery_effects AS e
                   JOIN rca_delivery_jobs AS j ON j.delivery_id = e.delivery_id
-                 WHERE j.work_item_id = ?
+                 WHERE j.business_key = ?
+                   AND j.generation = ?
+                   AND e.effect_kind = 'feishu_issue_comment'
+                   AND e.target_key = j.target_key
+                """,
+                (str(business_key), int(generation)),
+            ).fetchone()[0]
+            if int(existing) >= 1:
+                raise DeliveryContractError("delivery_comment_budget_exhausted")
+            return
+
+        explicit_keys = cls._explicit_user_rerun_keys_tx(
+            conn,
+            business_key=str(job["business_key"]),
+            work_item_id=str(job["work_item_id"]),
+        )
+        if generation > 1 and (
+            explicit_keys is None
+            or (str(business_key), int(generation)) not in explicit_keys
+        ):
+            raise DeliveryContractError(
+                "delivery_comment_budget_generation_not_user_rerun"
+            )
+        explicit_generations = {
+            rerun_generation
+            for rerun_business_key, rerun_generation in (explicit_keys or set())
+            if rerun_business_key == str(business_key)
+            and rerun_generation <= int(generation)
+        }
+        primary_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                 FROM rca_delivery_effects AS e
+                  JOIN rca_delivery_jobs AS j ON j.delivery_id = e.delivery_id
+                 WHERE j.business_key = ?
+                   AND j.work_item_id = ?
                    AND e.effect_kind = 'feishu_issue_comment'
                    AND e.target_key = j.target_key
                    AND NOT (
@@ -3078,6 +3601,7 @@ class RcaDeliveryStore:
                    )
                 """,
                 (
+                    str(business_key),
                     str(job["work_item_id"]),
                     *_LEARNING_ADJUDICATION_SCHEMAS,
                     len(_ADJUDICATION_TARGET_PREFIX),
@@ -3085,11 +3609,22 @@ class RcaDeliveryStore:
                 ),
             ).fetchone()[0]
         )
-        allowed_primary = 1 + len(explicit_generations)
-        if generation > 1 and not w6_cohort_sealed and generation not in explicit_generations:
-            # Pre-W6 fixtures have no durable cohort authority; preserve their
-            # legacy generation behavior until the sealed contract is present.
-            allowed_primary += 1
+        has_initial_generation = (
+            conn.execute(
+                "SELECT 1 FROM business_triggers "
+                "WHERE business_key = ? AND generation = 1 LIMIT 1",
+                (str(business_key),),
+            ).fetchone()
+            is not None
+            if cls._table_exists(conn, "business_triggers")
+            else generation == 1
+        )
+        allowed_primary = (
+            (1 if has_initial_generation else 0)
+            + len(explicit_generations)
+        )
+        if allowed_primary < 1:
+            allowed_primary = 1
         if primary_count >= allowed_primary:
             raise DeliveryContractError("delivery_comment_budget_exhausted")
 
@@ -3129,12 +3664,12 @@ class RcaDeliveryStore:
         effect_kind = str(subscription["effect_kind"])
         target_key = str(subscription["target_key"])
         delivery_id = str(job["delivery_id"])
-        if cls.is_learning_lane_tx(
+        cls._require_learning_lane_guard_tx(
             conn,
             business_key=str(job["business_key"]),
             generation=int(job["generation"]),
-        ):
-            raise DeliveryContractError(LEARNING_LANE_EXTERNAL_EFFECT_ERROR)
+            work_item_id=str(job["work_item_id"]),
+        )
         if int(subscription["required"]) != 1:
             raise DeliveryContractError("delivery_subscription_required_invalid")
         try:
