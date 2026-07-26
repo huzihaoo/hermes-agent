@@ -146,7 +146,7 @@ def build_report(db_path: Path, *, baseline: str = DEFAULT_BASELINE) -> dict[str
                 SELECT j.delivery_id, j.submission_key, j.terminal_error_code,
                        j.outcome, j.created_at, w.last_status_json
                   FROM rca_delivery_jobs AS j
-                  JOIN rca_execution_watch AS w
+             LEFT JOIN rca_execution_watch AS w
                     ON w.submission_key = j.submission_key
                  WHERE j.outcome IN ('terminal_failed', 'quarantined')
                  ORDER BY j.created_at, j.delivery_id

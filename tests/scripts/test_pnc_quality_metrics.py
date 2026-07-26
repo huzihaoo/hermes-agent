@@ -661,6 +661,53 @@ def test_normalizer_rejects_an_implicit_denominator_scope() -> None:
     assert error.value.code == "metrics_dimension_required"
 
 
+def test_daily_report_rejects_duplicate_record_ids() -> None:
+    first = _record(
+        pair_id="duplicate-record-id",
+        entry="kafka",
+        scope="business",
+        tier="medium",
+    )
+    second = _record(
+        pair_id="duplicate-record-id",
+        entry="feishu",
+        scope="business",
+        tier="medium",
+    )
+    second["record_id"] = first["record_id"]
+
+    with pytest.raises(business_metrics.MetricsValidationError) as error:
+        quality_metrics.build_daily_report([first, second], observed_at=OBSERVED_AT)
+
+    assert error.value.code == "metrics_duplicate_record_id"
+
+
+def test_daily_report_rejects_duplicate_pair_entry_observations() -> None:
+    first = _record(
+        pair_id="duplicate-pair-entry",
+        entry="kafka",
+        scope="business",
+        tier="medium",
+    )
+    second = dict(first)
+    second["record_id"] = "duplicate-pair-entry-kafka-retry"
+
+    with pytest.raises(business_metrics.MetricsValidationError) as error:
+        quality_metrics.build_daily_report([first, second], observed_at=OBSERVED_AT)
+
+    assert error.value.code == "metrics_duplicate_pair_entry"
+
+
+def test_daily_report_rejects_malformed_already_normalized_row() -> None:
+    with pytest.raises(business_metrics.MetricsValidationError) as error:
+        quality_metrics.build_daily_report(
+            [{"schema_version": business_metrics.SCHEMA_VERSION}],
+            observed_at=OBSERVED_AT,
+        )
+
+    assert error.value.code == "metrics_normalized_dimensions_missing"
+
+
 def test_negative_mixed_scope_pair_injection_exits_nonzero(tmp_path: Path) -> None:
     injected = [
         _record(

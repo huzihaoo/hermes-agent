@@ -168,17 +168,92 @@ def _normalization(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]
             "metrics_records_invalid", "records must be an array"
         )
     normalized: list[dict[str, Any]] = []
+    record_ids: set[str] = set()
+    pair_entries: set[tuple[str, str, str, str, str]] = set()
     for index, row in enumerate(records):
         if (
             isinstance(row, Mapping)
             and row.get("schema_version") == "pnc_business_metrics_w12_v1"
         ):
-            normalized.append(dict(row))
+            # Already-normalized observations still come from an external
+            # report producer.  Validate the dimensions used by the
+            # denominator before allowing them to bypass raw normalization;
+            # otherwise a forged schema marker reaches the aggregator and
+            # raises a KeyError (or silently duplicates a denominator).
+            required_dimensions = (
+                "record_id",
+                "pair_id",
+                "release",
+                "business",
+                "entry",
+                "confidence_tier",
+                "denominator_kind",
+            )
+            missing = [
+                field for field in required_dimensions if field not in row
+            ]
+            if missing:
+                raise MetricsValidationError(
+                    "metrics_normalized_dimensions_missing",
+                    f"normalized observation is missing {missing}",
+                    index=index,
+                )
+            item = dict(row)
+            for field in required_dimensions:
+                if not isinstance(item[field], str) or not item[field].strip():
+                    raise MetricsValidationError(
+                        "metrics_normalized_dimension_invalid",
+                        f"normalized {field} must be non-empty text",
+                        index=index,
+                    )
+            if item["entry"] not in ENTRYPOINTS:
+                raise MetricsValidationError(
+                    "metrics_entry_invalid",
+                    f"unsupported normalized entry {item['entry']!r}",
+                    index=index,
+                )
+            if item["confidence_tier"] not in CONFIDENCE_TIERS:
+                raise MetricsValidationError(
+                    "metrics_confidence_tier_invalid",
+                    f"unsupported normalized tier {item['confidence_tier']!r}",
+                    index=index,
+                )
+            if item["denominator_kind"] not in DENOMINATOR_KINDS:
+                raise MetricsValidationError(
+                    "metrics_denominator_kind_invalid",
+                    f"unsupported normalized scope {item['denominator_kind']!r}",
+                    index=index,
+                )
+            normalized.append(item)
         else:
             # Keep the index in normalization errors for negative-injection
             # diagnostics, while accepting both raw and already-normalized
             # fixtures.
             normalized.append(normalize_record(row, index=index))
+        item = normalized[-1]
+        record_id = str(item["record_id"])
+        if record_id in record_ids:
+            raise MetricsValidationError(
+                "metrics_duplicate_record_id",
+                f"record_id is repeated: {record_id}",
+                index=index,
+            )
+        record_ids.add(record_id)
+        pair_entry = (
+            str(item["release"]),
+            str(item["business"]),
+            str(item["confidence_tier"]),
+            str(item["pair_id"]),
+            str(item["entry"]),
+        )
+        if pair_entry in pair_entries:
+            raise MetricsValidationError(
+                "metrics_duplicate_pair_entry",
+                "pair has more than one observation for the same entry: "
+                f"{item['pair_id']}/{item['entry']}",
+                index=index,
+            )
+        pair_entries.add(pair_entry)
     return normalized
 
 

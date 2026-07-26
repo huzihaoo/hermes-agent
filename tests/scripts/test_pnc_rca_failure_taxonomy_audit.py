@@ -259,6 +259,29 @@ def test_historical_unclassified_without_source_is_not_guessed(tmp_path):
     assert report["historical"]["history_rewrite_policy"] == "forbidden"
 
 
+def test_terminal_delivery_without_execution_watch_is_not_hidden(tmp_path):
+    path = _db(tmp_path, [])
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "INSERT INTO rca_delivery_jobs VALUES (?, ?, ?, 'terminal_failed', ?)",
+            (
+                "delivery-orphan-watch",
+                "submission-orphan-watch",
+                "vm_terminal_failed_unclassified",
+                "2026-07-25T10:16:00+00:00",
+            ),
+        )
+
+    report = audit.build_report(path)
+
+    assert report["historical"]["terminal_rows"] == 1
+    assert report["historical"]["unclassified_rows"] == 1
+    assert report["historical"]["evidence_unrecoverable_rows"] == 1
+    assert report["historical"]["evidence_unrecoverable_submission_keys"] == [
+        "submission-orphan-watch"
+    ]
+
+
 def test_missing_route_table_keeps_all_three_live_gates_fail_closed(tmp_path):
     path = _db(tmp_path, [])
 
