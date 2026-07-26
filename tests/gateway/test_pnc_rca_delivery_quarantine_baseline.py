@@ -429,6 +429,51 @@ def test_combined_v2_offline_receipt_requires_quick_checked_copy_and_rollback(
     ]
 
 
+def test_combined_v2_receipt_binds_w5_cutoff_backfill_for_legacy_v7_source(
+    tmp_path,
+):
+    migration = _prepare_combined_schema_migration(
+        tmp_path / "seed",
+        "pnc_rca_delivery_store_v7",
+    )
+    source_backup = tmp_path / "legacy-v7.sqlite3"
+    shutil.copyfile(migration["source_backup"], source_backup)
+    source_backup.chmod(0o600)
+    with sqlite3.connect(source_backup) as conn:
+        conn.execute(
+            "DELETE FROM rca_delivery_meta "
+            "WHERE key = 'w5_external_write_fence_cutoff'"
+        )
+        conn.commit()
+        conn.execute("PRAGMA journal_mode=DELETE")
+    clone = tmp_path / "legacy-v7-migrated-v9.sqlite3"
+    shutil.copyfile(source_backup, clone)
+    clone.chmod(0o600)
+    RcaDeliveryStore(clone)
+    with sqlite3.connect(clone) as conn:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.execute("PRAGMA journal_mode=DELETE")
+    clone.chmod(0o600)
+    with sqlite3.connect(source_backup) as conn:
+        conn.row_factory = sqlite3.Row
+        source_schema_sha256 = logical_database_projection(conn)["schema_sha256"]
+    receipt = build_combined_offline_migration_receipt(
+        source_backup_path=source_backup,
+        migrated_clone_path=clone,
+        target_live_db_path=migration["live_path"],
+        migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+        expected_source_schema_sha256=source_schema_sha256,
+    )
+    assert receipt["cross_projection_preservation"]["deterministic_transforms"][1] == {
+        "rule": "backfill_w5_external_write_fence_cutoff_v1",
+        "table": "rca_delivery_meta",
+        "selector": {"key": "w5_external_write_fence_cutoff"},
+        "column": "value",
+        "source_value": None,
+        "target_value": "2026-07-25T00:00:00+00:00",
+    }
+
+
 def test_combined_v2_w2_repair_backfill_is_deterministic_and_receipted(tmp_path):
     migration = _prepare_combined_schema_migration(
         tmp_path,

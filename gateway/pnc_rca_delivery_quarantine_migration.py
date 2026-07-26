@@ -95,6 +95,8 @@ _COMBINED_PRESERVATION_POLICY = "all_source_owned_rows_exact_v1"
 _COMBINED_ADDED_SCHEMA_POLICY = (
     "allowlisted_deterministic_tables_and_constant_default_columns_v1"
 )
+_COMBINED_W5_CUTOFF_META_KEY = "w5_external_write_fence_cutoff"
+_COMBINED_W5_CUTOFF_META_VALUE = "2026-07-25T00:00:00+00:00"
 _COMBINED_ACTIVE_PROD_V7_VARIANT = "active_prod_v7_no_adjudication_v1"
 _COMBINED_W2_V8_VARIANT = "w2_v8_failure_routes_adjudication_v1"
 _COMBINED_ALLOWED_ADDED_TABLES = {
@@ -586,6 +588,7 @@ def _combined_deterministic_transforms(
     source_version: str,
     *,
     source_variant: str,
+    source_meta_keys: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     transforms = [
         {
@@ -597,6 +600,17 @@ def _combined_deterministic_transforms(
             "target_value": COMBINED_TARGET_SCHEMA_VERSION,
         }
     ]
+    if source_meta_keys is not None and _COMBINED_W5_CUTOFF_META_KEY not in source_meta_keys:
+        transforms.append(
+            {
+                "rule": "backfill_w5_external_write_fence_cutoff_v1",
+                "table": "rca_delivery_meta",
+                "selector": {"key": _COMBINED_W5_CUTOFF_META_KEY},
+                "column": "value",
+                "source_value": None,
+                "target_value": _COMBINED_W5_CUTOFF_META_VALUE,
+            }
+        )
     if source_variant == _COMBINED_W2_V8_VARIANT:
         transforms.append(
             {
@@ -632,6 +646,25 @@ def _expected_combined_target_rows(
             "delivery_store_combined_migration_cross_projection_mismatch"
         )
     markers[0]["value"] = COMBINED_TARGET_SCHEMA_VERSION
+    cutoff_rows = [
+        row
+        for row in expected
+        if row.get("key") == _COMBINED_W5_CUTOFF_META_KEY
+    ]
+    if len(cutoff_rows) > 1 or (
+        cutoff_rows
+        and cutoff_rows[0].get("value") != _COMBINED_W5_CUTOFF_META_VALUE
+    ):
+        raise QuarantineMigrationError(
+            "delivery_store_combined_migration_cross_projection_mismatch"
+        )
+    if not cutoff_rows:
+        expected.append(
+            {
+                "key": _COMBINED_W5_CUTOFF_META_KEY,
+                "value": _COMBINED_W5_CUTOFF_META_VALUE,
+            }
+        )
     return expected
 
 
@@ -910,6 +943,16 @@ def _combined_cross_projection_preservation(
         allowed_added_tables=allowed_added_tables,
     )
     table_evidence: dict[str, Any] = {}
+    source_meta_keys = (
+        {
+            str(row["key"])
+            for row in source.execute(
+                "SELECT key FROM rca_delivery_meta"
+            ).fetchall()
+        }
+        if "rca_delivery_meta" in source_names
+        else set()
+    )
     for table in sorted(source_names):
         source_table = source_tables[table]
         target_table = target_tables[table]
@@ -1031,6 +1074,7 @@ def _combined_cross_projection_preservation(
         "deterministic_transforms": _combined_deterministic_transforms(
             source_version,
             source_variant=source_variant,
+            source_meta_keys=source_meta_keys,
         ),
         "source_owned_schema": schema_preservation,
         "source_owned_tables": table_evidence,

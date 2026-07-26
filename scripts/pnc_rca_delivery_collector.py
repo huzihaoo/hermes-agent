@@ -96,6 +96,10 @@ from gateway.pnc_rca_write_fence import (
 from hermes_constants import get_hermes_home
 from scripts.pnc_foxglove_delivery import canonical_viz_mcap_path
 from scripts import pnc_fault_taxonomy
+from scripts.pnc_rca_failure_route_outlet import (
+    FailureRouteOutlet,
+    FailureRouteOutletError,
+)
 
 
 ENV_PREFIX = "HERMES_RCA_DELIVERY_COLLECTOR_"
@@ -418,6 +422,9 @@ class CollectorConfig:
     quarantine_bootstrap_epoch_id: str
     quarantine_active_release_binding_path: Path
     quarantine_live_env_path: Path
+    failure_route_outlet_root: Path
+    failure_route_outlet_lease_seconds: int
+    failure_route_outlet_max_attempts: int
     capacity_sample_enabled: bool = False
     capacity_sample_batch_size: int = 20
     capacity_sample_lock_timeout_seconds: int = 5
@@ -501,6 +508,12 @@ class CollectorConfig:
                 / "control.sqlite3",
             )
         ).expanduser()
+        failure_route_outlet_root = Path(
+            source.get(
+                f"{ENV_PREFIX}FAILURE_ROUTE_OUTLET_ROOT",
+                control_db_path.parent / "failure-route-outlet",
+            )
+        ).expanduser()
         quarantine = quarantine_baseline_settings(
             source,
             hermes_home=home,
@@ -546,6 +559,19 @@ class CollectorConfig:
                 quarantine.active_release_binding_path
             ),
             quarantine_live_env_path=quarantine.live_env_path,
+            failure_route_outlet_root=failure_route_outlet_root,
+            failure_route_outlet_lease_seconds=_integer(
+                source,
+                f"{ENV_PREFIX}FAILURE_ROUTE_OUTLET_LEASE_SECONDS",
+                60,
+                minimum=1,
+            ),
+            failure_route_outlet_max_attempts=_integer(
+                source,
+                f"{ENV_PREFIX}FAILURE_ROUTE_OUTLET_MAX_ATTEMPTS",
+                5,
+                minimum=1,
+            ),
             capacity_sample_enabled=capacity_sample_enabled,
             capacity_sample_batch_size=capacity_batch,
             capacity_sample_lock_timeout_seconds=_integer(
@@ -582,6 +608,19 @@ class CollectorConfig:
                 self.quarantine_active_release_binding_path
             ),
             "quarantine_live_env_path": str(self.quarantine_live_env_path),
+            "failure_route_outlet_root": str(self.failure_route_outlet_root),
+            "failure_route_outlet": {
+                "root": str(self.failure_route_outlet_root),
+                "lease_seconds": self.failure_route_outlet_lease_seconds,
+                "max_attempts": self.failure_route_outlet_max_attempts,
+                "external_writes": False,
+            },
+            "failure_route_outlet_lease_seconds": (
+                self.failure_route_outlet_lease_seconds
+            ),
+            "failure_route_outlet_max_attempts": (
+                self.failure_route_outlet_max_attempts
+            ),
             "capacity_sample_enabled": self.capacity_sample_enabled,
             "capacity_sample_batch_size": self.capacity_sample_batch_size,
             "capacity_sample_lock_timeout_seconds": (
@@ -639,6 +678,10 @@ class CollectorStats:
     remediation_held: int = 0
     internal_backlog: int = 0
     internal_alert: int = 0
+    internal_outlet_settled: int = 0
+    internal_outlet_retry_wait: int = 0
+    internal_outlet_quarantined: int = 0
+    internal_outlet_errors: int = 0
     taxonomy_gaps: int = 0
     terminal_fallbacks: int = 0
     capacity_scanned: int = 0
@@ -2055,6 +2098,7 @@ class DeliveryCollector:
         infra_remediation_runner: InfraRemediationRunner | None = None,
         terminal_receipt_reader: TerminalReceiptReader | None = None,
         capacity_control_store: RcaControlStore | None = None,
+        failure_route_outlet: FailureRouteOutlet | None = None,
         now: Callable[[], datetime] = _utc_now,
         lease_owner: str | None = None,
     ):
@@ -2085,6 +2129,7 @@ class DeliveryCollector:
         self.stats = CollectorStats()
         self.runtime_identity: Mapping[str, Any] | None = None
         self.capacity_control_store = capacity_control_store
+        self._failure_route_outlet = failure_route_outlet
         self.terminal_receipt_reader = terminal_receipt_reader or (
             lambda task_id, attempt_id: read_remote_vm_terminal_receipt(
                 ssh_mini_agent=self.config.ssh_mini_agent,
@@ -2095,6 +2140,18 @@ class DeliveryCollector:
         )
         self.capacity_last_error = ""
         self.capacity_last_outcome = "disabled"
+
+    def _internal_failure_route_outlet(self) -> FailureRouteOutlet:
+        if self._failure_route_outlet is None:
+            self._failure_route_outlet = FailureRouteOutlet(
+                self.store,
+                self.config.failure_route_outlet_root,
+                lease_owner=f"{self.lease_owner}:internal-route",
+                lease_seconds=self.config.failure_route_outlet_lease_seconds,
+                max_attempts=self.config.failure_route_outlet_max_attempts,
+                now=self.now,
+            )
+        return self._failure_route_outlet
 
     def backfill(self) -> int:
         inserted = self.store.backfill_completed_submissions(
@@ -2214,6 +2271,34 @@ class DeliveryCollector:
             "created": route.created,
             "remediation_attempt_count": route.remediation_attempt_count,
         }
+        if decision.internal_route in {
+            pnc_fault_taxonomy.INTERNAL_BACKLOG,
+            pnc_fault_taxonomy.INTERNAL_ALERT,
+        }:
+            try:
+                outlet_result = self._internal_failure_route_outlet().process_route(
+                    route.route_key,
+                    now=now,
+                )
+            except (FailureRouteOutletError, OSError, sqlite3.Error) as exc:
+                # Keep the user-facing 30-minute fallback independent from a
+                # temporarily unavailable internal sink; the route remains
+                # durable in the main store for the next outlet attempt.
+                outlet_result = {
+                    "route_key": route.route_key,
+                    "status": "outlet_error",
+                    "error_code": str(exc)[:120],
+                    "external_effects": 0,
+                }
+                self.stats.internal_outlet_errors += 1
+            projection["durable_route"]["internal_outlet"] = outlet_result
+            outlet_status = str(outlet_result.get("status") or "")
+            if outlet_status == "settled":
+                self.stats.internal_outlet_settled += 1
+            elif outlet_status == "retry_wait":
+                self.stats.internal_outlet_retry_wait += 1
+            elif outlet_status == "quarantined":
+                self.stats.internal_outlet_quarantined += 1
         if route.created:
             if decision.internal_route == pnc_fault_taxonomy.INTERNAL_BACKLOG:
                 self.stats.internal_backlog += 1
