@@ -39,6 +39,7 @@ def _config() -> dict[str, Any]:
     return {
         "consumer": {
             "topic": TOPIC,
+            "health_path": "/tmp/activation-consumer-health.json",
             "policy": {"policy_version": "issue-created-v1"},
         },
         "release": {"lane": "gray"},
@@ -47,9 +48,17 @@ def _config() -> dict[str, Any]:
 
 def _gateway_binding() -> dict[str, Any]:
     identity = {
+        "service_label": "ai.hermes.gateway",
+        "boot_time": 1_700_000_000.0,
+        "executable": "/candidate/.venv/bin/python",
         "cwd": "/candidate",
         "script": "/candidate/gateway/run.py",
         "pid": 42001,
+        "script_sha256": "1" * 64,
+        "runtime_files_sha256": "2" * 64,
+        "public_config_sha256": "3" * 64,
+        "loaded_runtime_sha256": "4" * 64,
+        "process_create_time": 1_785_000_000.0,
     }
     return {
         "state": "running_safe",
@@ -59,6 +68,26 @@ def _gateway_binding() -> dict[str, Any]:
         "runtime_identity_sha256": capsules._sha256_json(identity),
         "verified_runtime_sha256": "a" * 64,
     }
+
+
+@pytest.fixture(autouse=True)
+def _stub_live_runtime_probes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Builder tests use synthetic process identities; probe tests are separate."""
+    monkeypatch.setattr(
+        capsules, "_recheck_live_gateway_binding", lambda _value, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        capsules,
+        "_recheck_live_consumer_freeze",
+        lambda _value, **_kwargs: {
+            "runtime_identity": {
+                "loaded_runtime_sha256": "3" * 64,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        capsules, "_recheck_live_resident_projection", lambda *_args, **_kwargs: None
+    )
 
 
 def _database_identity(
@@ -637,7 +666,7 @@ def _confirmation_receipt(
     freeze = {
         "schema_version": "pnc_rca_activation_ingress_freeze_binding_v1",
         "epoch_id": EPOCH_ID,
-        "health_path": str((tmp_path / "consumer-health.json").absolute()),
+        "health_path": "/tmp/activation-consumer-health.json",
         "paused_at": now.isoformat(),
         "freeze_receipt_sha256": "5" * 64,
         "freeze_token_sha256": "6" * 64,

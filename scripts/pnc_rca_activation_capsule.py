@@ -7,11 +7,14 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
+import psutil
 import re
 import sqlite3
 import stat
+import subprocess
 import sys
 import tempfile
 from typing import Any, Mapping, Sequence
@@ -26,7 +29,13 @@ from gateway.pnc_rca_control_store import (
     RcaControlStore,
 )
 from gateway.pnc_rca_delivery_store import DELIVERY_STORE_SCHEMA_VERSION
-from gateway.pnc_rca_runtime_identity import MAX_HEALTH_FUTURE_SKEW_SECONDS
+from gateway.pnc_rca_runtime_identity import (
+    GATEWAY_RCA_RUNTIME_RELATIVE_FILES,
+    MAX_HEALTH_FUTURE_SKEW_SECONDS,
+    file_sha256,
+    runtime_file_snapshot,
+    runtime_identity_is_valid,
+)
 
 
 RELEASE_GATE_SCHEMA_VERSION = "pnc_rca_release_gate_v1"
@@ -48,6 +57,52 @@ MAX_CAPSULE_BYTES = 256 * 1024
 MAX_RECEIPT_BYTES = 4 * 1024 * 1024
 MAX_GATE_EVIDENCE_AGE_SECONDS = 900
 MAX_STAGE_CAPSULE_AGE_SECONDS = 3600
+LIVE_HEALTH_MAX_AGE_SECONDS = 60
+GATEWAY_SERVICE_LABEL = "ai.hermes.gateway"
+CONSUMER_SERVICE_LABEL = "local.pnc.rca-kafka-consumer"
+CONSUMER_HEALTH_SCHEMA_VERSION = "pnc_rca_kafka_consumer_health_v2"
+ACTIVATION_FREEZE_SCHEMA_VERSION = "pnc_rca_activation_ingress_freeze_v1"
+_RESIDENT_LABELS = {
+    "kafka_consumer_health": "local.pnc.rca-kafka-consumer",
+    "outbox_dispatcher_health": "local.pnc.rca-outbox-dispatcher",
+    "delivery_collector_health": "local.pnc.rca-delivery-collector",
+    "delivery_dispatcher_health": "local.pnc.rca-delivery-dispatcher",
+}
+
+
+def _process_create_time_matches(observed: Any, expected: Any) -> bool:
+    try:
+        return math.isclose(float(observed), float(expected), rel_tol=0.0, abs_tol=0.05)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _unsafe_process_environment(
+    environment: Mapping[str, Any],
+    *,
+    expected_root: str | Path | None = None,
+) -> bool:
+    """Reject loader overrides while allowing the release's own Python path."""
+    allowed_python = {
+        "PYTHONDONTWRITEBYTECODE",
+        "PYTHONNOUSERSITE",
+        "PYTHONUNBUFFERED",
+    }
+    normalized_root = None
+    if expected_root is not None:
+        normalized_root = str(Path(expected_root).expanduser().absolute())
+    for raw_key, raw_value in environment.items():
+        key = str(raw_key)
+        if key.startswith(("DYLD_", "LD_")):
+            return True
+        if key == "PYTHONPATH":
+            if normalized_root is None or str(raw_value) != normalized_root:
+                return True
+            continue
+        if key.startswith("PYTHON") and key not in allowed_python:
+            return True
+    return False
+
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -730,9 +785,329 @@ def _normalize_gateway_binding(value: Any) -> dict[str, Any]:
     runtime_identity = binding.get("runtime_identity")
     if not isinstance(runtime_identity, Mapping) or not runtime_identity:
         raise CapsuleError("activation_capsule_gateway_binding_invalid")
+    if not runtime_identity_is_valid(
+        runtime_identity, service_label=GATEWAY_SERVICE_LABEL
+    ) or not str(runtime_identity.get("script") or "").endswith("/gateway/run.py"):
+        raise CapsuleError("activation_capsule_gateway_binding_invalid")
     if binding["runtime_identity_sha256"] != _sha256_json(runtime_identity):
         raise CapsuleError("activation_capsule_gateway_binding_invalid")
+    if (
+        runtime_identity.get("pid") != pid
+        or runtime_identity.get("process_create_time") != create_time
+    ):
+        raise CapsuleError("activation_capsule_gateway_binding_invalid")
     return binding
+
+
+def _live_launchd_pid(
+    service_label: str,
+    *,
+    runner: Any = subprocess.run,
+) -> int:
+    """Return the one running launchd PID for a resident service."""
+    try:
+        completed = runner(
+            ["/bin/launchctl", "print", f"gui/{os.getuid()}/{service_label}"],
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise CapsuleError("activation_capsule_launchd_unavailable") from exc
+    stdout = str(completed.stdout or "")
+    if completed.returncode != 0 or len(stdout.encode("utf-8")) > 65_536:
+        raise CapsuleError("activation_capsule_launchd_unavailable")
+    if re.search(r"(?m)^\s*state\s*=\s*running\s*$", stdout) is None:
+        raise CapsuleError("activation_capsule_launchd_not_running")
+    pids = {
+        int(match) for match in re.findall(r"(?m)^\s*pid\s*=\s*([0-9]+)\s*$", stdout)
+    }
+    if len(pids) != 1:
+        raise CapsuleError("activation_capsule_launchd_pid_invalid")
+    return next(iter(pids))
+
+
+def _recheck_live_gateway_binding(value: Mapping[str, Any]) -> None:
+    """Recheck the gateway process and loaded tree after a gate was written.
+
+    A gate receipt is a point-in-time observation.  Activation must not consume
+    it after launchd has restarted the gateway or the resident tree has drifted.
+    This deliberately uses only the small runtime-identity API, keeping the
+    retired release-gate module out of the activation path.
+    """
+    binding = _normalize_gateway_binding(value)
+    identity = binding.get("runtime_identity")
+    if not runtime_identity_is_valid(identity, service_label=GATEWAY_SERVICE_LABEL):
+        raise CapsuleError("activation_capsule_gateway_runtime_invalid")
+    assert isinstance(identity, Mapping)
+    script = Path(str(identity["script"])).expanduser().absolute()
+    root = Path(str(identity["cwd"])).expanduser().absolute()
+    if not str(script).endswith("/gateway/run.py"):
+        raise CapsuleError("activation_capsule_gateway_runtime_invalid")
+    try:
+        if _live_launchd_pid(GATEWAY_SERVICE_LABEL) != int(identity["pid"]):
+            raise CapsuleError("activation_capsule_gateway_restarted")
+        process = psutil.Process(int(identity["pid"]))
+        if not process.is_running() or process.status() in {
+            psutil.STATUS_DEAD,
+            psutil.STATUS_ZOMBIE,
+        }:
+            raise CapsuleError("activation_capsule_gateway_restarted")
+        if not _process_create_time_matches(
+            process.create_time(), identity["process_create_time"]
+        ):
+            raise CapsuleError("activation_capsule_gateway_restarted")
+        if Path(process.cwd()).expanduser().absolute() != root:
+            raise CapsuleError("activation_capsule_gateway_restarted")
+        if (
+            Path(process.exe()).expanduser().absolute()
+            != Path(str(identity["executable"])).expanduser().absolute()
+        ):
+            raise CapsuleError("activation_capsule_gateway_restarted")
+        cmdline = process.cmdline()
+        rendered_cmdline = "\x00".join(str(item) for item in cmdline)
+        if (
+            not cmdline
+            or "gateway" not in rendered_cmdline
+            or "run" not in rendered_cmdline
+        ):
+            raise CapsuleError("activation_capsule_gateway_runtime_invalid")
+        if _unsafe_process_environment(process.environ(), expected_root=root):
+            raise CapsuleError("activation_capsule_gateway_environment_invalid")
+        if file_sha256(script) != identity["script_sha256"]:
+            raise CapsuleError("activation_capsule_gateway_runtime_changed")
+        _hashes, runtime_sha256 = runtime_file_snapshot(
+            root, GATEWAY_RCA_RUNTIME_RELATIVE_FILES
+        )
+    except CapsuleError:
+        raise
+    except (OSError, ValueError, psutil.Error) as exc:
+        raise CapsuleError("activation_capsule_gateway_restarted") from exc
+    if runtime_sha256 != identity["runtime_files_sha256"]:
+        raise CapsuleError("activation_capsule_gateway_runtime_changed")
+
+
+def _recheck_live_resident_projection(
+    value: Mapping[str, Any],
+    *,
+    consumer_health: Mapping[str, Any],
+) -> None:
+    """Recheck resident PIDs and loaded-runtime projections from the gate."""
+    residents = value.get("residents")
+    if not isinstance(residents, Mapping) or set(residents) != set(_RESIDENT_LABELS):
+        raise CapsuleError("activation_capsule_residents_invalid")
+    consumer_identity = consumer_health.get("runtime_identity")
+    if not isinstance(consumer_identity, Mapping):
+        raise CapsuleError("activation_capsule_consumer_runtime_invalid")
+    consumer_expected = residents.get("kafka_consumer_health")
+    if isinstance(consumer_expected, Mapping):
+        expected_runtime = consumer_expected.get("runtime_identity_sha256")
+        expected_loaded = consumer_expected.get("loaded_runtime_sha256")
+        if (
+            expected_runtime is not None
+            and _sha256_json(consumer_identity) != expected_runtime
+        ):
+            raise CapsuleError("activation_capsule_consumer_runtime_changed")
+        if expected_loaded is not None and str(
+            consumer_identity.get("loaded_runtime_sha256")
+        ) != str(expected_loaded):
+            raise CapsuleError("activation_capsule_consumer_loaded_runtime_changed")
+    for artifact, expected_value in residents.items():
+        if not isinstance(expected_value, Mapping):
+            raise CapsuleError("activation_capsule_residents_invalid")
+        required = {"pid", "process_create_time", "executable", "cwd"}
+        if not required.issubset(expected_value):
+            raise CapsuleError("activation_capsule_resident_identity_invalid")
+        label = _RESIDENT_LABELS.get(str(artifact))
+        if label is None:
+            raise CapsuleError("activation_capsule_resident_label_invalid")
+        pid = expected_value.get("pid")
+        create_time = expected_value.get("process_create_time")
+        if (
+            isinstance(pid, bool)
+            or not isinstance(pid, int)
+            or pid < 1
+            or isinstance(create_time, bool)
+            or not isinstance(create_time, (int, float))
+            or create_time <= 0
+        ):
+            raise CapsuleError("activation_capsule_resident_identity_invalid")
+        try:
+            if _live_launchd_pid(label) != pid:
+                raise CapsuleError("activation_capsule_resident_restarted")
+            process = psutil.Process(pid)
+            if (
+                not process.is_running()
+                or process.status() in {psutil.STATUS_DEAD, psutil.STATUS_ZOMBIE}
+                or not _process_create_time_matches(process.create_time(), create_time)
+                or Path(process.exe()).expanduser().absolute()
+                != Path(str(expected_value["executable"])).expanduser().absolute()
+                or Path(process.cwd()).expanduser().absolute()
+                != Path(str(expected_value["cwd"])).expanduser().absolute()
+            ):
+                raise CapsuleError("activation_capsule_resident_restarted")
+            cmdline_sha = expected_value.get("cmdline_sha256")
+            if cmdline_sha is not None:
+                actual_cmdline = process.cmdline()
+                if _digest(
+                    cmdline_sha, "activation_capsule_resident_identity_invalid"
+                ) != _sha256_json([str(item) for item in actual_cmdline]):
+                    raise CapsuleError("activation_capsule_resident_runtime_changed")
+            if _unsafe_process_environment(
+                process.environ(), expected_root=expected_value["cwd"]
+            ):
+                raise CapsuleError("activation_capsule_resident_environment_invalid")
+        except CapsuleError:
+            raise
+        except (OSError, ValueError, psutil.Error) as exc:
+            raise CapsuleError("activation_capsule_resident_restarted") from exc
+        expected_runtime = expected_value.get("runtime_identity_sha256")
+        expected_loaded = expected_value.get("loaded_runtime_sha256")
+        if expected_loaded is not None:
+            _digest(expected_loaded, "activation_capsule_resident_runtime_invalid")
+
+
+def _recheck_live_consumer_freeze(
+    value: Mapping[str, Any],
+    *,
+    epoch_id: str,
+    partition_end_fence: Mapping[str, Any],
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Re-read the resident consumer heartbeat and exact pause receipt."""
+    binding = _normalize_ingress_freeze_binding(value, epoch_id=epoch_id)
+    _raw, health = _read_owner_json(
+        Path(str(binding["health_path"])),
+        artifact="activation_consumer_health",
+    )
+    if health.get("schema_version") != CONSUMER_HEALTH_SCHEMA_VERSION:
+        raise CapsuleError("activation_capsule_consumer_health_invalid")
+    config = health.get("config")
+    identity = health.get("runtime_identity")
+    if not isinstance(config, Mapping) or not runtime_identity_is_valid(
+        identity,
+        service_label=CONSUMER_SERVICE_LABEL,
+        public_config=config,
+    ):
+        raise CapsuleError("activation_capsule_consumer_runtime_invalid")
+    assert isinstance(identity, Mapping)
+    if _sha256_json(identity) != binding["consumer_runtime_identity_sha256"]:
+        raise CapsuleError("activation_capsule_consumer_runtime_changed")
+    pid = identity.get("pid")
+    create_time = identity.get("process_create_time")
+    if (
+        isinstance(pid, bool)
+        or not isinstance(pid, int)
+        or pid < 1
+        or isinstance(create_time, bool)
+        or not isinstance(create_time, (int, float))
+        or create_time <= 0
+    ):
+        raise CapsuleError("activation_capsule_consumer_runtime_invalid")
+    try:
+        if _live_launchd_pid(CONSUMER_SERVICE_LABEL) != pid:
+            raise CapsuleError("activation_capsule_consumer_restarted")
+        process = psutil.Process(pid)
+        if (
+            not process.is_running()
+            or process.status() in {psutil.STATUS_DEAD, psutil.STATUS_ZOMBIE}
+            or not _process_create_time_matches(process.create_time(), create_time)
+            or Path(process.exe()).expanduser().absolute()
+            != Path(str(identity["executable"])).expanduser().absolute()
+            or Path(process.cwd()).expanduser().absolute()
+            != Path(str(identity["cwd"])).expanduser().absolute()
+        ):
+            raise CapsuleError("activation_capsule_consumer_restarted")
+        rendered_cmdline = "\x00".join(str(item) for item in process.cmdline())
+        if "pnc_rca_kafka_consumer" not in rendered_cmdline:
+            raise CapsuleError("activation_capsule_consumer_runtime_invalid")
+        if _unsafe_process_environment(
+            process.environ(), expected_root=identity["cwd"]
+        ):
+            raise CapsuleError("activation_capsule_consumer_environment_invalid")
+    except CapsuleError:
+        raise
+    except (OSError, ValueError, psutil.Error) as exc:
+        raise CapsuleError("activation_capsule_consumer_restarted") from exc
+    if (
+        health.get("ok") is not True
+        or health.get("healthy") is not True
+        or health.get("enabled") is not True
+        or health.get("activation_required") is not True
+        or health.get("state") != "activation_frozen"
+    ):
+        raise CapsuleError("activation_capsule_consumer_not_frozen")
+    stats = health.get("stats")
+    if (
+        not isinstance(stats, Mapping)
+        or isinstance(stats.get("blocked_partitions"), bool)
+        or not isinstance(stats.get("blocked_partitions"), int)
+        or stats.get("blocked_partitions") != 0
+    ):
+        raise CapsuleError("activation_capsule_consumer_not_frozen")
+    heartbeat = _timestamp(
+        health.get("heartbeat_at"), "activation_capsule_consumer_health_time_invalid"
+    )
+    observed_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    age = (observed_at - heartbeat).total_seconds()
+    if age < -MAX_HEALTH_FUTURE_SKEW_SECONDS:
+        raise CapsuleError("activation_capsule_consumer_health_from_future")
+    if age > LIVE_HEALTH_MAX_AGE_SECONDS:
+        raise CapsuleError("activation_capsule_consumer_health_stale")
+    freeze = health.get("activation_freeze")
+    if not isinstance(freeze, Mapping) or set(freeze) != {
+        "schema_version",
+        "epoch_id",
+        "state",
+        "freeze_token",
+        "paused_at",
+        "observed_at",
+        "consumer_runtime_identity_sha256",
+        "partition_positions",
+        "restart_required",
+    }:
+        raise CapsuleError("activation_capsule_consumer_freeze_invalid")
+    if (
+        freeze.get("schema_version") != ACTIVATION_FREEZE_SCHEMA_VERSION
+        or freeze.get("epoch_id") != epoch_id
+        or freeze.get("state") != "partitions_paused"
+        or freeze.get("restart_required") is not False
+        or not isinstance(freeze.get("freeze_token"), str)
+        or not str(freeze.get("freeze_token")).strip()
+        or freeze.get("consumer_runtime_identity_sha256")
+        != binding["consumer_runtime_identity_sha256"]
+    ):
+        raise CapsuleError("activation_capsule_consumer_freeze_invalid")
+    _timestamp(freeze.get("paused_at"), "activation_capsule_consumer_freeze_invalid")
+    freeze_observed = _timestamp(
+        freeze.get("observed_at"), "activation_capsule_consumer_freeze_invalid"
+    )
+    freeze_age = (observed_at - freeze_observed).total_seconds()
+    if freeze_age < -MAX_HEALTH_FUTURE_SKEW_SECONDS:
+        raise CapsuleError("activation_capsule_consumer_freeze_from_future")
+    if freeze_age > LIVE_HEALTH_MAX_AGE_SECONDS:
+        raise CapsuleError("activation_capsule_consumer_freeze_stale")
+    positions = _normalize_fence(
+        freeze.get("partition_positions"),
+        "activation_capsule_consumer_partition_positions_invalid",
+    )
+    expected_positions = _normalize_fence(
+        partition_end_fence,
+        "activation_capsule_partition_end_fence_invalid",
+    )
+    if positions != expected_positions:
+        raise CapsuleError("activation_capsule_consumer_freeze_position_changed")
+    stable_freeze = dict(freeze)
+    stable_freeze.pop("observed_at", None)
+    if (
+        _sha256_json(stable_freeze) != binding["freeze_receipt_sha256"]
+        or hashlib.sha256(str(freeze["freeze_token"]).encode("utf-8")).hexdigest()
+        != binding["freeze_token_sha256"]
+        or _sha256_json(positions) != binding["partition_positions_sha256"]
+    ):
+        raise CapsuleError("activation_capsule_consumer_freeze_binding_invalid")
+    return health
 
 
 def _normalize_canary_slot_plan(value: Any) -> dict[str, dict[str, Any]]:
@@ -1152,6 +1527,7 @@ def _preauthorization_material(
         material["activation_input"], control_db_path=control_db_path
     )
     gateway_binding = _normalize_gateway_binding(material["gateway_binding"])
+    _recheck_live_gateway_binding(gateway_binding)
     if activation_input["config_sha256"] != _sha256_json(report["config"]):
         raise CapsuleError("activation_capsule_preauthorization_binding_invalid")
     return evidence_dir, activation_input, gateway_binding
@@ -1327,6 +1703,7 @@ def _preproduction_material(
     )
     gateway_binding = _normalize_gateway_binding(material["gateway_binding"])
     canary_plan = _normalize_canary_slot_plan(material["canary_slot_plan"])
+    _recheck_live_gateway_binding(gateway_binding)
     declared_prior = _absolute_path(
         _text(
             material["preauthorization_capsule"],
@@ -1803,6 +2180,7 @@ def _confirmation_material(
     *,
     report: Mapping[str, Any],
     checks: Mapping[str, Mapping[str, Any]],
+    live_recheck: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     barrier = checks.get("activation_writer_barrier")
     if barrier is None or not isinstance(barrier.get("detail"), Mapping):
@@ -1812,6 +2190,21 @@ def _confirmation_material(
     freeze = _normalize_ingress_freeze_binding(
         detail.get("ingress_freeze_binding"), epoch_id=confirm_input["epoch_id"]
     )
+    config = report.get("config")
+    consumer_config = config.get("consumer") if isinstance(config, Mapping) else None
+    trusted_health_path = (
+        consumer_config.get("health_path")
+        if isinstance(consumer_config, Mapping)
+        else None
+    )
+    if not isinstance(trusted_health_path, str) or not trusted_health_path:
+        raise CapsuleError("activation_capsule_consumer_health_path_missing")
+    if freeze["health_path"] != str(
+        _absolute_path(
+            trusted_health_path, "activation_capsule_consumer_health_path_invalid"
+        )
+    ):
+        raise CapsuleError("activation_capsule_consumer_health_path_changed")
     if (
         detail.get("state") != "bounded_active"
         or detail.get("production_confirmation_required") is not True
@@ -1822,6 +2215,17 @@ def _confirmation_material(
     ):
         raise CapsuleError("activation_capsule_confirmation_barrier_invalid")
     continuity = _runtime_continuity_binding(checks)
+    if live_recheck:
+        _recheck_live_gateway_binding(continuity["gateway"])
+        consumer_health = _recheck_live_consumer_freeze(
+            freeze,
+            epoch_id=confirm_input["epoch_id"],
+            partition_end_fence=confirm_input["partition_end_fence"],
+        )
+        _recheck_live_resident_projection(
+            continuity,
+            consumer_health=consumer_health,
+        )
     if (
         continuity["gateway"].get("runtime_identity_sha256")
         != freeze.get("consumer_runtime_identity_sha256")
@@ -1910,7 +2314,8 @@ def build_confirmation_capsule(
         expected_state="bounded_active",
     )
     confirm_input, freeze, continuity = _confirmation_material(
-        report=report, checks=checks
+        report=report,
+        checks=checks,
     )
     live = live_release_binding(
         control_db_path,
@@ -2054,7 +2459,9 @@ def read_confirmation_capsule(
     ):
         raise CapsuleError("activation_confirmation_capsule_receipt_changed")
     confirm_input, freeze, continuity = _confirmation_material(
-        report=report, checks=checks
+        report=report,
+        checks=checks,
+        live_recheck=current_activation.get("state") != "confirmed",
     )
     observed_live = live_release_binding(
         control_db_path,
@@ -2108,12 +2515,13 @@ def read_confirmation_capsule(
         or capsule.get("same_file_descriptor_verification_required") is not True
     ):
         raise CapsuleError("activation_confirmation_capsule_binding_invalid")
-    _check_freshness(
-        report,
-        capsule["created_at"],
-        now=None,
-        max_age_seconds=int(report["gate_policy"]["evidence_max_age_seconds"]),
-    )
+    if current_activation.get("state") != "confirmed":
+        _check_freshness(
+            report,
+            capsule["created_at"],
+            now=None,
+            max_age_seconds=int(report["gate_policy"]["evidence_max_age_seconds"]),
+        )
     _read_confirmation_pair(
         report=report,
         receipt_path=receipt,
