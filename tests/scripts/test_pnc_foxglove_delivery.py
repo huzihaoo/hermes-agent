@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from scripts.pnc_foxglove_delivery import (
+    canonical_https_report_origin,
     canonical_publication_origin,
+    canonical_report_url_from_vm_path,
     canonical_viz_mcap_cifs_path,
     canonical_viz_mcap_path,
     foxglove_url,
+    validate_canonical_report_url,
 )
 
 
@@ -88,6 +91,37 @@ def test_publication_origin_requires_explicit_https_dns(monkeypatch):
 
     monkeypatch.delenv("PNC_FOXGLOVE_RENDER_HOST", raising=False)
     assert canonical_publication_origin() == ""
+
+
+def test_canonical_report_origin_rejects_private_http_and_accepts_explicit_https():
+    assert canonical_https_report_origin("http://192.168.26.174:18081") == ""
+    assert canonical_https_report_origin("https://192.168.21.217") == ""
+    assert canonical_https_report_origin("https://g1q3-rca.minieye.tech") == (
+        "https://g1q3-rca.minieye.tech"
+    )
+
+
+def test_canonical_report_url_requires_index_html_and_exact_origin():
+    origin = "https://g1q3-rca.minieye.tech"
+    vm_path = (
+        "/mnt/minieye/pdcl/department/perception_test_team/"
+        "G1Q3_RCA/cases/g1q3-rca-s1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        "aaaaaaaaaaaaaaaaaaaaaaaa/index.html"
+    )
+    expected = (
+        "https://g1q3-rca.minieye.tech/G1Q3_RCA/cases/"
+        "g1q3-rca-s1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/"
+        "index.html"
+    )
+
+    assert canonical_report_url_from_vm_path(vm_path, origin) == expected
+    assert validate_canonical_report_url(expected, origin) == expected
+    assert validate_canonical_report_url(
+        "http://192.168.26.174:18081/G1Q3_RCA/cases/x/index.html", origin
+    ) == ""
+    assert validate_canonical_report_url(
+        "https://g1q3-rca.minieye.tech/G1Q3_RCA/cases/x/report.viz.mcap", origin
+    ) == ""
 
 
 def test_malformed_publication_origins_do_not_change_fixed_foxglove_url(monkeypatch):

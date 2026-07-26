@@ -45,7 +45,11 @@ from gateway.pnc_rca_write_fence import (  # noqa: E402
 from hermes_cli.config import get_hermes_home  # noqa: E402
 from scripts.vm_task_state_bridge import _atomic_write_json, _load_existing, sidecar_path  # noqa: E402
 from gateway.feishu_task_card import render_status_line, stable_render_hash, render_task_card  # noqa: E402
-from scripts.pnc_foxglove_delivery import foxglove_delivery_fields  # noqa: E402
+from scripts.pnc_foxglove_delivery import (  # noqa: E402
+    canonical_https_report_origin,
+    canonical_report_url_from_vm_path,
+    foxglove_delivery_fields,
+)
 from scripts.pnc_status_projection import PIPELINE_RUNNING_STAGES, PIPELINE_STAGE_DEFINITIONS, PIPELINE_STAGE_LABELS, derive_presentation  # noqa: E402
 from scripts.vm_task_status_collect import collect_vm_task_status, write_collected_status_to_sidecar  # noqa: E402
 from tools import vm_task_completion_probe  # noqa: E402
@@ -62,6 +66,7 @@ REPORT_FS_PREFIX = "/mnt/minieye/pdcl/department/perception_test_team/"
 REPORT_ATTACHMENT_CODEC_VERSION = "bom-utf8-v1"
 UTF8_BOM = b"\xef\xbb\xbf"
 REPORT_INTERNAL_HTTP_BASE = "http://192.168.26.174:18081"
+REPORT_PUBLICATION_HTTP_BASE = os.getenv("PNC_PERCEPTION_TEST_TEAM_HTTP_BASE", "").strip().rstrip("/")
 PNC_FEISHU_BUSINESS_TZ = timezone(timedelta(hours=8))
 _L4_EVENT_EPOCH_MAX = 4_102_444_800.0  # 2100-01-01T00:00:00Z
 FIXTURE_SCHEMA_VERSION = "pnc_vm_task_sync_fixture_v1"
@@ -1188,6 +1193,13 @@ def _report_internal_http_link(index_html: str) -> str:
     return base + "/" + quote(rel, safe="/._-")
 
 
+def _report_publication_url(index_html: str) -> str:
+    """Return a canonical HTTPS report URL, or empty when not provisioned."""
+
+    origin = canonical_https_report_origin(REPORT_PUBLICATION_HTTP_BASE)
+    return canonical_report_url_from_vm_path(index_html, origin)
+
+
 def _report_attachment_ledger_path() -> Path:
     return get_hermes_home() / "pnc_agent" / "quota" / "g1q3_report_attachments.json"
 
@@ -1437,7 +1449,8 @@ def _delivery_from_contract(task: Task, payload_or_contract: dict[str, Any]) -> 
     boundaries = contract.get("evidence_boundary") if isinstance(contract.get("evidence_boundary"), list) else []
     boundaries = [str(item).strip() for item in boundaries if str(item).strip()]
     if report_ready:
-        html_link = _report_internal_http_link(index_html)
+        internal_html_link = _report_internal_http_link(index_html)
+        public_html_link = _report_publication_url(index_html)
         attribution = str(verification.get("pipeline_status") or report.get("status") or "report_generated_need_review").strip()
         # candidate cause must be the report's crisp conclusion, never summary.l0 (a status line);
         # omit the line when absent rather than showing a stale intake/status summary as the cause.
@@ -1453,7 +1466,7 @@ def _delivery_from_contract(task: Task, payload_or_contract: dict[str, Any]) -> 
             conclusion_parts.append(f"责任候选：{reviewer}")
         case_dir_vm = str(artifacts.get("case_dir_vm") or "").strip()
         report_data_vm = str(artifacts.get("report_data_vm") or "").strip()
-        html_fallback = html_link or ((str(artifacts.get("primary_report_cifs") or "").strip() or None) if index_html else None)
+        html_fallback = public_html_link or ((str(artifacts.get("primary_report_cifs") or "").strip() or None) if index_html else None)
         primary_delivery_link = viz_fields["foxglove_url"] or html_fallback
         return {
             "conclusion": "；".join(part for part in conclusion_parts if part),
@@ -1467,6 +1480,8 @@ def _delivery_from_contract(task: Task, payload_or_contract: dict[str, Any]) -> 
             "business_case_dir_cifs": str(artifacts.get("case_dir_cifs") or _perception_test_team_cifs(case_dir_vm) or "").strip() or None,
             "report_index_html_vm": index_html or None,
             "report_index_html_cifs": (str(artifacts.get("primary_report_cifs") or _perception_test_team_cifs(index_html) or "").strip() or None) if index_html else None,
+            "publication_url_status": "ready" if public_html_link else "blocked_missing_canonical_https",
+            "internal_report_url": internal_html_link or None,
             "report_data_vm": report_data_vm or None,
             "report_data_cifs": str(artifacts.get("report_data_cifs") or _perception_test_team_cifs(report_data_vm) or "").strip() or None,
             "boundaries": boundaries,
@@ -1484,7 +1499,8 @@ def _delivery_from_contract(task: Task, payload_or_contract: dict[str, Any]) -> 
                 "work_item_id": work_item_id,
                 "attribution_status": "hypothesis_ready" if report.get("is_candidate") is not False else "reviewed",
                 "report_status": delivery_status,
-                "html_link": html_link,
+                "html_link": public_html_link,
+                "internal_html_link": internal_html_link,
                 "foxglove_url": viz_fields["foxglove_url"],
                 "attribution_causal_text": viz_fields["attribution_causal_text"],
                 "candidate_cause": candidate_cause,
@@ -1670,7 +1686,8 @@ def _extract_g1q3_delivery_from_result(task: Task, state: str) -> dict[str, Any]
             attribution = str(summary.get("attribution_status") or observation.get("status") or "hypothesis_ready").strip()
             cause = str(observation.get("short_conclusion") or "").strip()
             reviewer = str(observation.get("candidate_owner_domain") or "").strip()
-            html_link = _report_internal_http_link(index_html)
+            internal_html_link = _report_internal_http_link(index_html)
+            public_html_link = _report_publication_url(index_html)
             delivery_status = "report_ready" if viz_fields["foxglove_url"] else "html_delivery_ready"
             conclusion_parts = [f"{work_item_id} RCA 报告已生成" if work_item_id else "RCA 报告已生成"]
             if attribution:
@@ -1687,7 +1704,7 @@ def _extract_g1q3_delivery_from_result(task: Task, state: str) -> dict[str, Any]
             report_data_vm = str(artifacts.get("report_data_vm") or "").strip()
             return {
                 "conclusion": "；".join(part for part in conclusion_parts if part),
-                "artifact_path": viz_fields["foxglove_url"] or html_link or None,
+                "artifact_path": viz_fields["foxglove_url"] or public_html_link or _perception_test_team_cifs(index_html) or None,
                 "artifact_label": "打开 foxglove 可视化" if viz_fields["foxglove_url"] else "打开 HTML 报告",
                 "artifact_root": str(artifacts.get("artifact_root_cifs") or artifacts.get("artifact_root_vm") or "").strip() or None,
                 "agent_artifact_root_vm": str(artifacts.get("artifact_root_vm") or "").strip() or None,
@@ -1696,6 +1713,8 @@ def _extract_g1q3_delivery_from_result(task: Task, state: str) -> dict[str, Any]
                 "business_case_dir_cifs": _perception_test_team_cifs(case_dir_vm) or None,
                 "report_index_html_vm": index_html_vm or None,
                 "report_index_html_cifs": _perception_test_team_cifs(index_html_vm) or None,
+                "publication_url_status": "ready" if public_html_link else "blocked_missing_canonical_https",
+                "internal_report_url": internal_html_link or None,
                 "report_data_vm": report_data_vm or None,
                 "report_data_cifs": _perception_test_team_cifs(report_data_vm) or None,
                 "boundaries": boundaries,
@@ -1709,7 +1728,8 @@ def _extract_g1q3_delivery_from_result(task: Task, state: str) -> dict[str, Any]
                     "work_item_id": work_item_id,
                     "attribution_status": attribution,
                     "report_status": delivery_status,
-                    "html_link": html_link,
+                    "html_link": public_html_link,
+                    "internal_html_link": internal_html_link,
                     "foxglove_url": viz_fields["foxglove_url"],
                     "attribution_causal_text": viz_fields["attribution_causal_text"],
                     "candidate_cause": cause,
@@ -1744,7 +1764,8 @@ def _extract_g1q3_delivery_from_result(task: Task, state: str) -> dict[str, Any]
             from urllib.parse import unquote
             index_html = REPORT_FS_PREFIX + unquote(match.group(1)).lstrip("/")
 
-    html_link = _report_internal_http_link(index_html)
+    internal_html_link = _report_internal_http_link(index_html)
+    public_html_link = _report_publication_url(index_html)
     if not (index_html or viz_fields["foxglove_url"]):
         return {}
     if viz_fields["foxglove_url"]:
@@ -1773,7 +1794,7 @@ def _extract_g1q3_delivery_from_result(task: Task, state: str) -> dict[str, Any]
         if text_item:
             boundaries.append(text_item)
 
-    artifact_path = viz_fields["foxglove_url"] or html_link
+    artifact_path = viz_fields["foxglove_url"] or public_html_link or _perception_test_team_cifs(index_html)
     return {
         "conclusion": "；".join(part for part in conclusion_parts if part),
         "artifact_path": artifact_path or None,
@@ -1781,13 +1802,16 @@ def _extract_g1q3_delivery_from_result(task: Task, state: str) -> dict[str, Any]
         "boundaries": boundaries,
         "next_options": [],
         "report_status": report_status,
+        "publication_url_status": "ready" if public_html_link else "blocked_missing_canonical_https",
+        "internal_report_url": internal_html_link or None,
         "candidate_cause": cause,
         **viz_fields,
         "rca_status": {
             "work_item_id": work_item_id,
             "attribution_status": attribution,
             "report_status": report_status,
-            "html_link": html_link,
+            "html_link": public_html_link,
+            "internal_html_link": internal_html_link,
             "foxglove_url": viz_fields["foxglove_url"],
             "attribution_causal_text": viz_fields["attribution_causal_text"],
             "candidate_cause": cause,

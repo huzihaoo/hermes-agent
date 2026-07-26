@@ -34,7 +34,13 @@ if str(REPO_ROOT) not in sys.path:
 
 from hermes_cli.config import get_hermes_home, reload_env  # noqa: E402
 from scripts.pnc_vm_task_sync import DEFAULT_CHAT_IDS  # noqa: E402
-from scripts.pnc_foxglove_delivery import foxglove_delivery_fields  # noqa: E402
+from scripts.pnc_foxglove_delivery import (  # noqa: E402
+    canonical_https_report_origin,
+    canonical_report_url_from_vm_path,
+    foxglove_delivery_fields,
+    validate_canonical_report_url,
+    validate_foxglove_url,
+)
 from scripts.vm_task_state_bridge import _atomic_write_json  # noqa: E402
 from gateway.feishu_task_card import render_task_card, stable_render_hash  # noqa: E402
 from gateway.pnc_rca_artifacts import local_candidates_for_vm_path  # noqa: E402
@@ -154,6 +160,43 @@ PNC_FEISHU_BUSINESS_TZ = timezone(timedelta(hours=8))
 PERCEPTION_TEST_TEAM_VM_PREFIX = "/mnt/minieye/pdcl/department/perception_test_team/"
 PERCEPTION_TEST_TEAM_CIFS_PREFIX = "//hfs.minieye.tech/department-perception_test_team/"
 PERCEPTION_TEST_TEAM_HTTP_BASE = os.getenv("PNC_PERCEPTION_TEST_TEAM_HTTP_BASE", "http://192.168.26.174:18081/").strip().rstrip("/") + "/"
+
+
+def _canonical_publication_report_origin() -> str:
+    """Return the explicitly configured canonical HTTPS report origin."""
+
+    return canonical_https_report_origin(str(PERCEPTION_TEST_TEAM_HTTP_BASE or "").rstrip("/"))
+
+
+def _canonical_publication_report_url(vm_path: str) -> str:
+    """Map one report index path to the configured canonical HTTPS origin."""
+
+    origin = _canonical_publication_report_origin()
+    return canonical_report_url_from_vm_path(vm_path, origin)
+
+
+def _validated_canonical_report_link(value: Any) -> str:
+    """Accept only a URL matching the configured canonical report origin."""
+
+    return validate_canonical_report_url(value, _canonical_publication_report_origin())
+
+
+def _validated_foxglove_link(value: Any, viz_mcap_vm: Any) -> str:
+    """Keep Foxglove as a separate, byte-identical visualization contract."""
+
+    text = str(value or "").strip()
+    if not text or not validate_foxglove_url(text, viz_mcap_vm):
+        return ""
+    return text
+
+
+def _non_publication_fallback(value: Any) -> str:
+    """Keep local/share paths as evidence, never arbitrary clickable URLs."""
+
+    text = str(value or "").strip()
+    if not text or "://" in text or text.startswith("//"):
+        return ""
+    return text
 
 
 def _perception_test_team_cifs(vm_path: str) -> str:
@@ -2181,6 +2224,7 @@ def enrich_g1q3_task_card_delivery(task_id: str, body: dict[str, Any]) -> dict[s
     report_data_vm = str(report_ready_truth.get("report_data_vm") or "").strip()
     report_viz_mcap_vm = str(report_ready_truth.get("viz_mcap_vm") or "").strip()
     report_foxglove_url = str(report_ready_truth.get("foxglove_url") or "").strip()
+    validated_foxglove_url = _validated_foxglove_link(report_foxglove_url, report_viz_mcap_vm)
     attribution_causal_text = str(report_ready_truth.get("attribution_causal_text") or candidate_cause or "").strip()
     report_case_dir_cifs = _perception_test_team_cifs(report_case_dir_vm)
     report_index_html_cifs = _perception_test_team_cifs(report_index_html_vm)
@@ -2190,31 +2234,27 @@ def enrich_g1q3_task_card_delivery(task_id: str, body: dict[str, Any]) -> dict[s
         report_case_dir_cifs = verified_report_index.rsplit("/", 1)[0] + "/"
     report_case_dir_http = _perception_test_team_http(report_case_dir_vm)
     report_index_html_http = _perception_test_team_http(report_index_html_vm)
+    canonical_report_from_vm = _canonical_publication_report_url(report_index_html_vm)
     agent_artifact_root_vm = str(report_ready_truth.get("artifact_root_vm") or artifact_root or "").strip()
     agent_artifact_root_cifs = str(report_ready_truth.get("artifact_root_cifs") or artifact_cifs_root or "").strip()
     input_display = str(report_ready_truth.get("input_display") or "").strip()
     input_resolved_display = str(report_ready_truth.get("input_resolved") or "").strip()
     existing_artifact_path = str(delivery.get("artifact_path") or "").strip()
     existing_artifact_link = _extract_markdown_link(existing_artifact_path) or existing_artifact_path
-    # Prefer the directory HTTP URL that actually renders the report.  Legacy
-    # Feishu attachment links (https://project.feishu.cn/...) uploaded the lone
-    # index.html and opened it in Feishu's file preview, which shows raw HTML
-    # source and cannot load the report's relative assets, so they are no longer
-    # used as the card link.  Any other already-renderable web URL (e.g. a
-    # future stable report host set via PNC_PERCEPTION_TEST_TEAM_HTTP_BASE) is
-    # kept as a fallback below; the project.feishu.cn attachment URL is dropped.
-    existing_report_link = (
-        existing_artifact_link
-        if str(existing_artifact_link).startswith(("http://", "https://"))
-        and "project.feishu.cn" not in str(existing_artifact_link)
-        else ""
+    # Only an explicitly configured canonical HTTPS report origin may become a
+    # user-facing HTML link.  The VM HTTP URL remains an internal evidence field;
+    # without a valid canonical origin we keep a non-clickable CIFS/VM path so
+    # the Publication gate fails closed instead of leaking a private URL.
+    existing_report_link = _validated_canonical_report_link(existing_artifact_link)
+    canonical_report_link = _validated_canonical_report_link(canonical_report_from_vm) or existing_report_link
+    report_delivery_path = (
+        validated_foxglove_url
+        or canonical_report_link
+        or report_index_html_cifs
+        or report_index_html_vm
+        or _non_publication_fallback(artifact_path)
     )
-    # The renderable HTTP URL is the primary user-facing link.  CIFS/UNC
-    # (//hfs...) and VM (/mnt/...) share paths stay as non-clickable text
-    # fallbacks; the card only renders http/https/file URLs as clickable links.
-    # vm_task_sync emits the byte-identical http URL, so the two writers no
-    # longer alternate and the card render hash stays stable.
-    report_delivery_path = report_foxglove_url or report_index_html_http or existing_report_link or report_index_html_cifs or report_index_html_vm or artifact_path
+    publication_url_status = "ready" if canonical_report_link else "blocked_missing_canonical_https"
     report_delivery_root = report_case_dir_cifs or report_case_dir_vm or report_case_dir_http or artifact_dir
     if blocked_keyframe_pipeline:
         report_delivery_path = ""
@@ -2264,8 +2304,9 @@ def enrich_g1q3_task_card_delivery(task_id: str, body: dict[str, Any]) -> dict[s
         )
     delivery.update({
         "conclusion": honest_conclusion if honest_conclusion else (_first_text(delivery.get("conclusion"), notice.get("text"), limit=120) if not report_status else ""),
-        "artifact_label": "打开 foxglove 可视化" if (report_foxglove_url and real_report) else ("打开 HTML 报告" if (report_delivery_path.lower().endswith(".html") and real_report) else "报告目录"),
+        "artifact_label": "打开 foxglove 可视化" if (validated_foxglove_url and real_report) else ("打开 HTML 报告" if (canonical_report_link and real_report) else "报告目录"),
         "gate_decision": str(truth.get("gate_decision") or ""),
+        "publication_url_status": publication_url_status,
     })
     if blocked_keyframe_pipeline:
         delivery.pop("artifact_path", None)
@@ -2318,9 +2359,9 @@ def enrich_g1q3_task_card_delivery(task_id: str, body: dict[str, Any]) -> dict[s
         delivery["report_data_vm"] = report_data_vm
     if report_data_cifs:
         delivery["report_data_cifs"] = report_data_cifs
-    if report_viz_mcap_vm and report_foxglove_url:
+    if report_viz_mcap_vm and validated_foxglove_url:
         delivery["viz_mcap_vm"] = report_viz_mcap_vm
-        delivery["foxglove_url"] = report_foxglove_url
+        delivery["foxglove_url"] = validated_foxglove_url
     if attribution_causal_text:
         delivery["attribution_causal_text"] = attribution_causal_text
     if input_display:

@@ -3541,7 +3541,9 @@ need_source_or_evidence
     assert "需补齐数据" not in out["task_card"]["status_line"]
     assert not any("问题数据地址_PDCL" in str(item) for item in delivery.get("boundaries", []))
     assert not any("need_input" in str(item.get("label", "")) or "gate=" in str(item.get("label", "")) for item in out["task_card"].get("milestones", []))
-    assert delivery["artifact_path"] == "http://192.168.26.174:18081/G1Q3_RCA/cases/7026690721_acc/index.html"
+    assert delivery["artifact_path"] == delivery["report_index_html_cifs"]
+    assert not str(delivery["artifact_path"]).startswith("http://")
+    assert delivery["publication_url_status"] == "blocked_missing_canonical_https"
     assert delivery["artifact_root"] == "//hfs.minieye.tech/department-perception_test_team/G1Q3_RCA/cases/7026690721_acc"
     assert delivery["business_case_dir_cifs"] == "//hfs.minieye.tech/department-perception_test_team/G1Q3_RCA/cases/7026690721_acc"
     assert delivery["agent_artifact_root_vm"] == "/mnt/tmp/g1q3_rca_issue_intake_7026690721_13e562/"
@@ -3921,7 +3923,9 @@ def test_g1q3_report_ready_enrichment_uses_report_html_and_issue_input(tmp_path,
     finally:
         reset_hermes_home_override(token)
     delivery = out["task_card"]["delivery"]
-    assert delivery["artifact_path"] == "http://192.168.26.174:18081/G1Q3_RCA/cases/7026726390_acc/index.html"
+    assert delivery["artifact_path"] == delivery["report_index_html_cifs"]
+    assert not str(delivery["artifact_path"]).startswith("http://")
+    assert delivery["publication_url_status"] == "blocked_missing_canonical_https"
     assert delivery["artifact_root"] == "//hfs.minieye.tech/department-perception_test_team/G1Q3_RCA/cases/7026726390_acc"
     assert delivery["report_index_html_http"] == "http://192.168.26.174:18081/G1Q3_RCA/cases/7026726390_acc/index.html"
     assert delivery["business_case_dir_http"] == "http://192.168.26.174:18081/G1Q3_RCA/cases/7026726390_acc"
@@ -4012,6 +4016,77 @@ def test_perception_test_team_http_rejects_path_traversal():
     assert pnc_completion_notice_relay._perception_test_team_http(
         "/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/../secret/index.html"
     ) == ""
+
+
+def test_publication_origin_rejects_default_private_http(monkeypatch):
+    monkeypatch.setattr(
+        pnc_completion_notice_relay,
+        "PERCEPTION_TEST_TEAM_HTTP_BASE",
+        "http://192.168.26.174:18081/",
+    )
+
+    assert pnc_completion_notice_relay._canonical_publication_report_origin() == ""
+    assert pnc_completion_notice_relay._canonical_publication_report_url(
+        "/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases/demo/index.html"
+    ) == ""
+    assert pnc_completion_notice_relay._validated_canonical_report_link(
+        "http://192.168.26.174:18081/G1Q3_RCA/cases/demo/index.html"
+    ) == ""
+
+
+def test_publication_origin_accepts_explicit_https_and_preserves_report_identity(monkeypatch):
+    monkeypatch.setattr(
+        pnc_completion_notice_relay,
+        "PERCEPTION_TEST_TEAM_HTTP_BASE",
+        "https://g1q3-rca.minieye.tech/",
+    )
+    vm_path = (
+        "/mnt/minieye/pdcl/department/perception_test_team/"
+        "G1Q3_RCA/cases/g1q3-rca-s1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        "aaaaaaaaaaaaaaaaaaaaaaaa/index.html"
+    )
+    expected = (
+        "https://g1q3-rca.minieye.tech/G1Q3_RCA/cases/"
+        "g1q3-rca-s1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/"
+        "index.html"
+    )
+
+    assert pnc_completion_notice_relay._canonical_publication_report_origin() == (
+        "https://g1q3-rca.minieye.tech"
+    )
+    assert pnc_completion_notice_relay._canonical_publication_report_url(vm_path) == expected
+    assert pnc_completion_notice_relay._validated_canonical_report_link(expected) == expected
+
+
+def test_private_or_unbound_foxglove_link_cannot_become_artifact_path():
+    viz_path = (
+        "/mnt/minieye/pdcl/department/perception_test_team/"
+        "G1Q3_RCA/cases/demo/demo.viz.mcap"
+    )
+
+    assert pnc_completion_notice_relay._validated_foxglove_link(
+        "https://192.168.21.217/?ds=foxglove-http&ds.mcapPath=/private.viz.mcap",
+        viz_path,
+    ) == ""
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [
+        "https://192.168.21.217/",
+        "https://g1q3-rca.minieye.tech:443/",
+        "https://g1q3-rca.minieye.tech/reports/",
+        "https://G1Q3-RCA.MINIEYE.TECH/",
+    ],
+)
+def test_publication_origin_rejects_noncanonical_https_shapes(monkeypatch, configured):
+    monkeypatch.setattr(
+        pnc_completion_notice_relay,
+        "PERCEPTION_TEST_TEAM_HTTP_BASE",
+        configured,
+    )
+
+    assert pnc_completion_notice_relay._canonical_publication_report_origin() == ""
 
 
 def _write_blocked_keyframe_case(tmp_path, task_id="20260627-120000-g1q3-rca-issue-intake-7029488224-real"):

@@ -900,7 +900,8 @@ def test_g1q3_completed_task_card_prefers_rca_readback_html_and_attribution(monk
     assert delivery["artifact_path"] == delivery["foxglove_url"]
     assert delivery["artifact_label"] == "打开 foxglove 可视化"
     assert delivery["report_status"] == "report_ready"
-    assert delivery["rca_status"]["html_link"] == "http://192.168.26.174:18081/G1Q3_RCA/cases/7017699515/index.html"
+    assert delivery["rca_status"]["html_link"] == ""
+    assert delivery["internal_report_url"] == "http://192.168.26.174:18081/G1Q3_RCA/cases/7017699515/index.html"
     assert delivery["foxglove_url"].endswith("/7017699515/7017699515.viz.mcap")
     assert delivery["attribution_causal_text"] == "触发请求异常 -> 提前制动候选"
     assert "需要人工确认候选原因" in delivery["boundaries"][0]
@@ -1085,11 +1086,75 @@ def test_g1q3_task_card_prefers_delivery_contract_report_completed(monkeypatch):
     assert card["user_state"] == "done"
     assert delivery["source"] == "delivery_contract_v1"
     assert delivery["report_status"] == "html_delivery_ready"
-    assert delivery["artifact_path"] == "http://192.168.26.174:18081/G1Q3_RCA/cases/7026690721_acc/index.html"
+    assert delivery["artifact_path"] == delivery["report_index_html_cifs"]
+    assert delivery["publication_url_status"] == "blocked_missing_canonical_https"
     assert delivery["business_case_dir_cifs"].startswith("//hfs.minieye.tech/department-perception_test_team/")
     assert delivery["agent_artifact_root_vm"] == "/mnt/tmp/vm-contract/"
     assert "责任候选：殷莉奇" in delivery["conclusion"]
     assert "parsed/L2 assets 缺失" in delivery["boundaries"]
+
+
+def test_vm_sync_html_artifact_fails_closed_without_canonical_https(monkeypatch):
+    monkeypatch.setattr(
+        pnc_vm_task_sync,
+        "REPORT_PUBLICATION_HTTP_BASE",
+        "http://192.168.26.174:18081",
+    )
+    contract = {
+        "schema_version": "g1q3_delivery_contract_v1",
+        "work_item_id": "vm-sync-private-http",
+        "business_state": "report_completed",
+        "report": {"is_deliverable": True, "is_candidate": True},
+        "summary": {"short_conclusion": "候选报告"},
+        "artifacts": {
+            "case_dir_vm": "/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases/private-http",
+            "index_html_vm": "/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases/private-http/index.html",
+            "primary_report_cifs": "//hfs.minieye.tech/department-perception_test_team/G1Q3_RCA/cases/private-http/index.html",
+        },
+        "verification": {"pipeline_status": "report_generated_need_review"},
+    }
+
+    delivery = pnc_vm_task_sync._delivery_from_contract(_task("vm-sync-private-http"), contract)
+
+    assert delivery["artifact_path"] == delivery["report_index_html_cifs"]
+    assert not str(delivery["artifact_path"]).startswith("http://")
+    assert delivery["publication_url_status"] == "blocked_missing_canonical_https"
+    assert delivery["rca_status"]["html_link"] == ""
+    assert delivery["internal_report_url"].startswith("http://192.168.26.174:18081/")
+
+
+def test_vm_sync_html_artifact_uses_explicit_canonical_https(monkeypatch):
+    monkeypatch.setattr(
+        pnc_vm_task_sync,
+        "REPORT_PUBLICATION_HTTP_BASE",
+        "https://g1q3-rca.minieye.tech",
+    )
+    submission = "g1q3-rca-s1-" + "a" * 64
+    artifact_path = (
+        f"/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases/"
+        f"{submission}/index.html"
+    )
+    contract = {
+        "schema_version": "g1q3_delivery_contract_v1",
+        "work_item_id": "vm-sync-public-https",
+        "business_state": "report_completed",
+        "report": {"is_deliverable": True, "is_candidate": True},
+        "summary": {"short_conclusion": "候选报告"},
+        "artifacts": {
+            "case_dir_vm": artifact_path.rsplit("/", 1)[0],
+            "index_html_vm": artifact_path,
+            "primary_report_cifs": "//hfs.minieye.tech/department-perception_test_team/G1Q3_RCA/cases/" + submission + "/index.html",
+        },
+        "verification": {"pipeline_status": "report_generated_need_review"},
+    }
+
+    delivery = pnc_vm_task_sync._delivery_from_contract(_task("vm-sync-public-https"), contract)
+
+    assert delivery["artifact_path"] == (
+        "https://g1q3-rca.minieye.tech/G1Q3_RCA/cases/" + submission + "/index.html"
+    )
+    assert delivery["publication_url_status"] == "ready"
+    assert delivery["rca_status"]["html_link"] == delivery["artifact_path"]
 
 
 def test_g1q3_contract_foxglove_url_is_byte_identical_across_host_writers(monkeypatch):
@@ -1270,7 +1335,8 @@ def test_g1q3_task_card_stitches_latest_governance_report_contract(tmp_path, mon
 
     assert card["user_state"] == "done"
     assert card["delivery"]["report_status"] == "html_delivery_ready"
-    assert card["delivery"]["artifact_path"] == "http://192.168.26.174:18081/G1Q3_RCA/cases/7029768863_acc/index.html"
+    assert card["delivery"]["artifact_path"] == card["delivery"]["report_index_html_cifs"]
+    assert card["delivery"]["publication_url_status"] == "blocked_missing_canonical_https"
     assert "需要发起人补充" not in card["delivery"]["conclusion"]
     assert "7029768863 RCA 报告已生成" in card["delivery"]["conclusion"]
     boundary_text = "；".join(card["delivery"].get("boundaries") or [])

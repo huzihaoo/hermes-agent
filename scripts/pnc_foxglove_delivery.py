@@ -27,6 +27,98 @@ _SAFE_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$")
 _DNS_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
 
+def canonical_https_report_origin(value: Any) -> str:
+    """Validate one explicit hostname-based HTTPS origin for report links."""
+
+    raw = str(value or "")
+    if (
+        not raw
+        or raw != raw.strip()
+        or not raw.isascii()
+        or raw.endswith("/")
+        or any(char.isspace() or ord(char) < 0x20 or ord(char) == 0x7F for char in raw)
+        or "\\" in raw
+    ):
+        return ""
+    try:
+        parsed = urlsplit(raw)
+        port = parsed.port
+    except ValueError:
+        return ""
+    host = parsed.hostname or ""
+    if (
+        parsed.scheme != "https"
+        or not host
+        or host != host.lower()
+        or parsed.netloc != host
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or raw != f"https://{host}"
+    ):
+        return ""
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        labels = host.split(".")
+        if len(labels) < 2 or any(_DNS_LABEL_RE.fullmatch(label) is None for label in labels):
+            return ""
+    else:
+        return ""
+    return raw
+
+
+def canonical_report_url_from_vm_path(vm_path: Any, origin: Any) -> str:
+    """Map one sealed report index path to a validated HTTPS URL."""
+
+    canonical_origin = canonical_https_report_origin(origin)
+    text = str(vm_path or "").strip()
+    if not canonical_origin or not text.startswith(PERCEPTION_TEST_TEAM_VM_PREFIX):
+        return ""
+    relative = text[len(PERCEPTION_TEST_TEAM_VM_PREFIX):].lstrip("/")
+    if (
+        not relative.startswith("G1Q3_RCA/cases/")
+        or not relative.endswith("/index.html")
+        or "%" in relative
+        or any(part in {"", ".", ".."} for part in relative.split("/"))
+    ):
+        return ""
+    return canonical_origin + "/" + quote(
+        relative,
+        safe=FOXGLOVE_PATH_SAFE,
+    )
+
+
+def validate_canonical_report_url(value: Any, origin: Any) -> str:
+    """Accept only an index.html URL under the explicit HTTPS report origin."""
+
+    canonical_origin = canonical_https_report_origin(origin)
+    text = str(value or "").strip()
+    if not canonical_origin or not text:
+        return ""
+    try:
+        parsed = urlsplit(text)
+    except ValueError:
+        return ""
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != urlsplit(canonical_origin).netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or not parsed.path.startswith("/G1Q3_RCA/cases/")
+        or not parsed.path.endswith("/index.html")
+        or "%" in parsed.path
+        or any(part in {"", ".", ".."} for part in parsed.path.strip("/").split("/"))
+    ):
+        return ""
+    return text
+
+
 def _is_whatwg_ipv4_number(value: str) -> bool:
     if value.startswith("0x"):
         return len(value) > 2 and all(char in "0123456789abcdef" for char in value[2:])
