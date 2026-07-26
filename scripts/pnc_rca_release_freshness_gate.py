@@ -48,6 +48,11 @@ from gateway.pnc_rca_delivery_quarantine_migration import (
     QuarantineMigrationError,
     validate_combined_target_schema,
 )
+from gateway.pnc_rca_control_store import (
+    CONTROL_STORE_SCHEMA_VERSION,
+    RcaControlStore,
+)
+from gateway.pnc_rca_delivery_store import RcaDeliveryStore
 
 
 WATCHDOG_LABEL = "local.pnc.watcher-staleness-watchdog"
@@ -1019,6 +1024,8 @@ def audit_delivery_store_schema(
     evidence: dict[str, Any] = {
         "control_db_path": str(db_path),
         "read_mode": "ro+query_only",
+        "expected_control_schema_version": CONTROL_STORE_SCHEMA_VERSION,
+        "observed_control_schema_version": "",
         "expected_schema_version": COMBINED_TARGET_SCHEMA_VERSION,
         "observed_schema_version": "",
         "schema_valid": False,
@@ -1040,6 +1047,12 @@ def audit_delivery_store_schema(
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA query_only = ON")
         conn.execute("BEGIN")
+        control_marker = conn.execute(
+            "SELECT value FROM control_meta WHERE key = 'schema_version'"
+        ).fetchone()
+        evidence["observed_control_schema_version"] = (
+            str(control_marker["value"] or "") if control_marker is not None else ""
+        )
         marker = conn.execute(
             "SELECT value FROM rca_delivery_meta WHERE key = 'schema_version'"
         ).fetchone()
@@ -1047,6 +1060,11 @@ def audit_delivery_store_schema(
             str(marker["value"] or "") if marker is not None else ""
         )
         validation = validate_combined_target_schema(conn)
+        # The production control DB is one shared SQLite file.  Validating only
+        # delivery v9 can miss a stale control schema or W6 cross-table guards
+        # installed in the wrong migration order.
+        RcaControlStore(db_path, require_current=True)
+        RcaDeliveryStore(db_path, require_current=True)
         conn.rollback()
         after = db_path.lstat()
         if (
@@ -1067,13 +1085,13 @@ def audit_delivery_store_schema(
             after.st_ctime_ns,
         ):
             raise OSError("delivery store changed during schema audit")
-    except (OSError, sqlite3.Error, QuarantineMigrationError) as exc:
+    except (OSError, RuntimeError, sqlite3.Error, QuarantineMigrationError) as exc:
         if conn is not None and conn.in_transaction:
             conn.rollback()
         reason = (
             exc.code
             if isinstance(exc, QuarantineMigrationError)
-            else type(exc).__name__
+            else str(exc) or type(exc).__name__
         )
         evidence["errors"] = [reason]
         errors.append(

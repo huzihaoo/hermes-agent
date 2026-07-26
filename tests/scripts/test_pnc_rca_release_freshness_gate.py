@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from scripts import pnc_rca_release_freshness_gate as gate
+from gateway.pnc_rca_control_store import RcaControlStore
 from gateway.pnc_rca_delivery_store import RcaDeliveryStore
 from scripts.pnc_live_exec import PNC_PYTHON_LAUNCHD_LABELS
 
@@ -691,6 +692,7 @@ def test_release_preflight_accepts_complete_v9_delivery_store_without_writes(
     tmp_path: Path,
 ):
     db_path = tmp_path / "control.sqlite3"
+    RcaControlStore(db_path)
     RcaDeliveryStore(db_path)
     before_sha256 = _delivery_store_sha256(db_path)
 
@@ -701,6 +703,7 @@ def test_release_preflight_accepts_complete_v9_delivery_store_without_writes(
 
     assert errors == []
     assert evidence["schema_valid"] is True
+    assert evidence["observed_control_schema_version"] == "pnc_rca_control_store_v12"
     assert evidence["observed_schema_version"] == "pnc_rca_delivery_store_v9"
     assert evidence["quick_check"] == "ok"
     assert evidence["integrity_check"] == "ok"
@@ -713,6 +716,7 @@ def test_release_preflight_rejects_v8_delivery_store_marker_without_writes(
     tmp_path: Path,
 ):
     db_path = tmp_path / "control.sqlite3"
+    RcaControlStore(db_path)
     RcaDeliveryStore(db_path)
     with sqlite3.connect(db_path) as conn:
         conn.execute(
@@ -741,6 +745,7 @@ def test_release_preflight_rejects_missing_immutable_trigger_without_writes(
     tmp_path: Path,
 ):
     db_path = tmp_path / "control.sqlite3"
+    RcaControlStore(db_path)
     RcaDeliveryStore(db_path)
     with sqlite3.connect(db_path) as conn:
         conn.execute("DROP TRIGGER trg_rca_conclusion_adjudication_no_delete")
@@ -762,6 +767,48 @@ def test_release_preflight_rejects_missing_immutable_trigger_without_writes(
         }
     ]
     assert _delivery_store_sha256(db_path) == before_sha256
+
+
+def test_release_preflight_rejects_wrong_cross_store_migration_order_without_writes(
+    tmp_path: Path,
+):
+    db_path = tmp_path / "control.sqlite3"
+    # This reproduces the old offline rehearsal: delivery v9 is installed
+    # before control v12, so the W6 cross-table triggers do not exist.
+    RcaDeliveryStore(db_path)
+    RcaControlStore(db_path)
+    before_sha256 = _delivery_store_sha256(db_path)
+
+    evidence, errors = gate.audit_delivery_store_schema(
+        hermes_home=tmp_path,
+        control_db_path=db_path,
+    )
+
+    assert evidence["observed_control_schema_version"] == ("pnc_rca_control_store_v12")
+    assert evidence["observed_schema_version"] == "pnc_rca_delivery_store_v9"
+    assert evidence["schema_valid"] is False
+    assert errors == [
+        {
+            "code": "pnc_release_delivery_store_schema_not_current",
+            "reason": (
+                "incompatible_delivery_store_schema:w6_trigger:"
+                "trg_learning_lane_effect_insert_forbidden"
+            ),
+        }
+    ]
+    assert _delivery_store_sha256(db_path) == before_sha256
+
+    # The governed migration sequence reopens delivery after control v12 so it
+    # can install and validate the cross-table guards.
+    RcaDeliveryStore(db_path)
+    recovered_sha256 = _delivery_store_sha256(db_path)
+    evidence, errors = gate.audit_delivery_store_schema(
+        hermes_home=tmp_path,
+        control_db_path=db_path,
+    )
+    assert errors == []
+    assert evidence["schema_valid"] is True
+    assert _delivery_store_sha256(db_path) == recovered_sha256
 
 
 def test_process_evidence_reads_real_process_identity(tmp_path: Path):
