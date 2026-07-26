@@ -34,6 +34,7 @@ from gateway.pnc_rca_delivery_store import (
 from gateway.pnc_rca_owner_review import handle_owner_review_message
 from gateway.pnc_rca_write_fence import (
     build_issued_write_fence,
+    canonical_write_fence_sha256,
     snapshot_core_sha256,
 )
 from gateway.session import SessionSource
@@ -1533,6 +1534,13 @@ def test_post_cutoff_retract_correction_uses_current_w3_w5_fence(tmp_path):
         now=fence_issued_at,
         expires_at=fenced_now + timedelta(hours=2),
     )
+    snapshot_identity = {**snapshot, "write_fence": fence}
+    snapshot_sha256 = canonical_write_fence_sha256(snapshot_identity)
+    snapshot = {
+        **snapshot_identity,
+        "snapshot_id": f"pnc-rca-snapshot-v1-{snapshot_sha256}",
+        "snapshot_sha256": snapshot_sha256,
+    }
     assert fence["issued_at"] < candidate_at.isoformat().replace("+00:00", "Z")
     assert not store.is_historical_external_write_effect(candidate_at.isoformat())
     contract = json.loads(job["contract_json"])
@@ -1558,6 +1566,154 @@ def test_post_cutoff_retract_correction_uses_current_w3_w5_fence(tmp_path):
                 job["business_key"],
                 job["submission_key"],
                 job["generation"],
+            ),
+        )
+        # This test uses a small, exact projection of the immutable W3 rows.
+        # The production store joins these rows before accepting a post-cutoff
+        # effect; hand-built historical fixtures do not contain them.
+        conn.executescript(
+            """
+            CREATE TABLE rca_admission_snapshots(
+                snapshot_sha256 TEXT,
+                snapshot_id TEXT,
+                schema_version TEXT,
+                request_sha256 TEXT,
+                business_key TEXT,
+                submission_key TEXT,
+                generation INTEGER,
+                activation_epoch_id TEXT,
+                activation_ledger_id INTEGER,
+                execution_decision TEXT,
+                execution_reason TEXT,
+                execution_state TEXT,
+                legacy_unconfigured INTEGER,
+                creator_source_envelope_sha256 TEXT,
+                creator_authority_sha256 TEXT,
+                creator_source_id TEXT,
+                admission_snapshot_json TEXT
+            );
+            CREATE TABLE rca_snapshot_source_envelopes(
+                source_envelope_sha256 TEXT,
+                source_envelope_id TEXT,
+                schema_version TEXT,
+                snapshot_sha256 TEXT,
+                snapshot_id TEXT,
+                submission_key TEXT,
+                source_authority_sha256 TEXT,
+                source_id TEXT,
+                source_kind TEXT,
+                payload_sha256 TEXT,
+                authorization_evidence_sha256 TEXT,
+                binding_action TEXT,
+                decision TEXT,
+                source_metadata_json TEXT,
+                anchor_json TEXT,
+                ingress_decision_json TEXT,
+                source_envelope_json TEXT
+            );
+            """
+        )
+        source_envelope_identity = {
+            "schema_version": "pnc_rca_snapshot_source_envelope_v1",
+            "source_authority_sha256": "b" * 64,
+            "snapshot_id": snapshot["snapshot_id"],
+            "snapshot_sha256": snapshot["snapshot_sha256"],
+            "submission_key": job["submission_key"],
+            "source_id": "w16-test-source",
+            "source_kind": "kafka_workflow_event",
+            "ingress_decision": {
+                "requested_mode": "pending",
+                "binding_action": "create",
+                "decision": "admit",
+                "authorization_evidence_sha256": "d" * 64,
+            },
+            "source_metadata": {
+                "source_kind": "kafka_workflow_event",
+                "event_uid": "w16-test-topic:0:1",
+                "topic": "w16-test-topic",
+                "partition": 0,
+                "offset": 1,
+                "payload_sha256": "c" * 64,
+                "observed_at": fence_issued_at.isoformat(),
+            },
+            "anchor": {
+                "issue_target": job["issue_url"],
+                "thread_target": None,
+            },
+        }
+        source_envelope_sha256 = canonical_write_fence_sha256(
+            source_envelope_identity
+        )
+        source_envelope = {
+            **source_envelope_identity,
+            "source_envelope_id": (
+                f"pnc-rca-source-envelope-v1-{source_envelope_sha256}"
+            ),
+            "source_envelope_sha256": source_envelope_sha256,
+        }
+        conn.execute(
+            """
+            INSERT INTO rca_admission_snapshots(
+                snapshot_sha256, snapshot_id, schema_version, request_sha256,
+                business_key, submission_key, generation,
+                activation_epoch_id, activation_ledger_id,
+                execution_decision, execution_reason, execution_state,
+                legacy_unconfigured, creator_source_envelope_sha256,
+                creator_authority_sha256, creator_source_id,
+                admission_snapshot_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                snapshot["snapshot_sha256"],
+                snapshot["snapshot_id"],
+                snapshot["schema_version"],
+                snapshot["request_sha256"],
+                job["business_key"],
+                job["submission_key"],
+                job["generation"],
+                "epoch-w16-active",
+                7,
+                "admit",
+                "activation_bounded_slot_consumed",
+                "bounded_active",
+                0,
+                source_envelope["source_envelope_sha256"],
+                source_envelope["source_authority_sha256"],
+                source_envelope["source_id"],
+                json.dumps(snapshot),
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO rca_snapshot_source_envelopes(
+                source_envelope_sha256, source_envelope_id, schema_version,
+                snapshot_sha256, snapshot_id, submission_key,
+                source_authority_sha256, source_id, source_kind,
+                payload_sha256, authorization_evidence_sha256,
+                binding_action, decision, source_metadata_json, anchor_json,
+                ingress_decision_json, source_envelope_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                source_envelope["source_envelope_sha256"],
+                source_envelope["source_envelope_id"],
+                source_envelope["schema_version"],
+                source_envelope["snapshot_sha256"],
+                source_envelope["snapshot_id"],
+                source_envelope["submission_key"],
+                source_envelope["source_authority_sha256"],
+                source_envelope["source_id"],
+                source_envelope["source_kind"],
+                source_envelope["source_metadata"]["payload_sha256"],
+                source_envelope["ingress_decision"][
+                    "authorization_evidence_sha256"
+                ],
+                source_envelope["ingress_decision"]["binding_action"],
+                source_envelope["ingress_decision"]["decision"],
+                json.dumps(source_envelope["source_metadata"]),
+                json.dumps(source_envelope["anchor"]),
+                json.dumps(source_envelope["ingress_decision"]),
+                json.dumps(source_envelope),
             ),
         )
         conn.execute(
