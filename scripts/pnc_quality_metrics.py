@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Produce the offline W12 four-metric daily report.
+"""Produce the W12 four-metric daily report from offline or DB observations.
 
 The report is deliberately a pure aggregation surface.  It consumes bounded
 JSON/JSONL observations, groups them by ``release x business x entry x
 confidence_tier``, and keeps business/system denominators in separate buckets.
-No runtime database, network endpoint, launchd service, or delivery writer is
-opened by this module.
+The SQLite mode accepts only a checkpointed immutable read-only snapshot.  No
+runtime network endpoint, launchd service, or delivery writer is opened.
 """
 
 from __future__ import annotations
@@ -31,7 +31,10 @@ from scripts.pnc_business_metrics import (
     DENOMINATOR_KINDS,
     ENTRYPOINTS,
     MetricsValidationError,
+    SUPPORTED_CONTROL_STORE_SCHEMA_VERSIONS,
+    SUPPORTED_DELIVERY_STORE_SCHEMA_VERSIONS,
     load_records,
+    load_sqlite_observations,
     normalize_record,
 )
 
@@ -619,9 +622,17 @@ def render_markdown(report: Mapping[str, Any]) -> str:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--input", required=True, help="offline JSON/JSONL observations"
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--input", help="offline JSON/JSONL observations")
+    mode.add_argument(
+        "--control-db",
+        help="checkpointed control v11/v12 + delivery v9 SQLite snapshot",
     )
+    parser.add_argument("--release-id")
+    parser.add_argument("--pipeline-commit")
+    parser.add_argument("--window-start")
+    parser.add_argument("--window-end")
+    parser.add_argument("--golden-input")
     parser.add_argument("--observed-at", default=None)
     parser.add_argument("--markdown", action="store_true")
     parser.add_argument(
@@ -631,10 +642,73 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
-        rows = load_records(args.input)
+        if args.control_db:
+            required = {
+                "release_id": args.release_id,
+                "pipeline_commit": args.pipeline_commit,
+                "window_start": args.window_start,
+                "window_end": args.window_end,
+                "golden_input": args.golden_input,
+            }
+            missing = sorted(name for name, value in required.items() if not value)
+            if missing:
+                raise MetricsValidationError(
+                    "metrics_sqlite_cli_input_missing",
+                    f"SQLite mode requires {missing}",
+                )
+            if args.observed_at and args.observed_at != args.window_end:
+                raise MetricsValidationError(
+                    "metrics_observed_at_window_mismatch",
+                    "observed_at must equal window_end in SQLite mode",
+                )
+            rows = load_sqlite_observations(
+                args.control_db,
+                release_id=args.release_id,
+                pipeline_commit=args.pipeline_commit,
+                window_start=args.window_start,
+                window_end=args.window_end,
+                golden_input=args.golden_input,
+            )
+            observed_at = args.window_end
+        else:
+            sqlite_only = {
+                "release_id": args.release_id,
+                "pipeline_commit": args.pipeline_commit,
+                "window_start": args.window_start,
+                "window_end": args.window_end,
+                "golden_input": args.golden_input,
+            }
+            unexpected = sorted(
+                name for name, value in sqlite_only.items() if value is not None
+            )
+            if unexpected:
+                raise MetricsValidationError(
+                    "metrics_cli_mode_invalid",
+                    f"--input cannot be combined with {unexpected}",
+                )
+            rows = load_records(args.input)
+            observed_at = args.observed_at
         report = build_daily_report(
-            rows, observed_at=args.observed_at, strict=not args.non_strict
+            rows, observed_at=observed_at, strict=not args.non_strict
         )
+        if args.control_db:
+            report["source"] = {
+                "mode": "sqlite_uri_mode_ro_immutable",
+                "control_db": str(Path(args.control_db).expanduser().absolute()),
+                "control_schema_versions_supported": sorted(
+                    SUPPORTED_CONTROL_STORE_SCHEMA_VERSIONS
+                ),
+                "delivery_schema_versions_supported": sorted(
+                    SUPPORTED_DELIVERY_STORE_SCHEMA_VERSIONS
+                ),
+                "release_id": args.release_id,
+                "pipeline_commit": args.pipeline_commit,
+                "window_start": args.window_start,
+                "window_end": args.window_end,
+                "runtime_mutation_performed": False,
+                "external_effects_triggered": False,
+                "wal_created": False,
+            }
     except MetricsValidationError as exc:
         print(
             json.dumps(exc.as_dict(), ensure_ascii=False, sort_keys=True),

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 
@@ -12,6 +14,335 @@ from scripts import pnc_quality_metrics as quality_metrics
 
 
 OBSERVED_AT = "2026-07-26T00:00:00Z"
+SQLITE_WINDOW_START = "2026-07-26T00:00:00Z"
+SQLITE_WINDOW_END = "2026-07-27T00:00:00Z"
+SQLITE_RELEASE = "release-20260726"
+SQLITE_PIPELINE_COMMIT = "a" * 40
+
+
+def _digest(label: str) -> str:
+    return hashlib.sha256(label.encode("utf-8")).hexdigest()
+
+
+def _oracle(terminal_class: str, tier: str) -> dict:
+    return {
+        "schema_version": "pnc_rca_structural_tier_oracle_v2",
+        "terminal_class": terminal_class,
+        "confidence_tier": tier,
+        "publication_allowed": True,
+        "classification_conflict": False,
+        "violations": [],
+        "facts": {"golden_coverage_complete": tier != "none"},
+    }
+
+
+@pytest.fixture
+def sqlite_observation_fixture(tmp_path: Path) -> tuple[Path, Path]:
+    db_path = tmp_path / "control.sqlite3"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE control_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE rca_delivery_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE rca_admission_snapshots(
+            snapshot_sha256 TEXT PRIMARY KEY,
+            business_key TEXT NOT NULL,
+            submission_key TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            execution_decision TEXT NOT NULL
+        );
+        CREATE TABLE rca_source_authority_receipts(
+            authority_sha256 TEXT PRIMARY KEY,
+            source_id TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            payload_sha256 TEXT NOT NULL,
+            authorization_evidence_sha256 TEXT NOT NULL,
+            binding_action TEXT NOT NULL,
+            decision TEXT NOT NULL
+        );
+        CREATE TABLE rca_snapshot_source_envelopes(
+            source_envelope_sha256 TEXT PRIMARY KEY,
+            snapshot_sha256 TEXT NOT NULL,
+            submission_key TEXT NOT NULL,
+            source_authority_sha256 TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            payload_sha256 TEXT NOT NULL,
+            authorization_evidence_sha256 TEXT NOT NULL,
+            binding_action TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            source_metadata_json TEXT NOT NULL
+        );
+        CREATE TABLE rca_delivery_jobs(
+            delivery_id TEXT PRIMARY KEY,
+            submission_key TEXT NOT NULL,
+            business_key TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            project_key TEXT NOT NULL,
+            work_item_id TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            outcome_key TEXT NOT NULL,
+            terminal_state TEXT NOT NULL,
+            terminal_error_code TEXT NOT NULL,
+            status TEXT NOT NULL,
+            contract_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE rca_delivery_effects(
+            effect_key TEXT PRIMARY KEY,
+            delivery_id TEXT NOT NULL,
+            effect_kind TEXT NOT NULL,
+            required INTEGER NOT NULL,
+            payload_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            write_phase TEXT NOT NULL,
+            remote_receipt_json TEXT,
+            completed_at TEXT,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE rca_conclusion_adjudications(
+            adjudication_id TEXT PRIMARY KEY,
+            schema_version TEXT NOT NULL,
+            business_key TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            work_item_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            conclusion_state TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            original_delivery_id TEXT NOT NULL,
+            original_effect_key TEXT NOT NULL,
+            correction_effect_key TEXT NOT NULL,
+            activation_epoch_id TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE rca_conclusion_adjudication_repairs(
+            adjudication_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO control_meta VALUES('schema_version', ?)",
+        (business_metrics.CONTROL_STORE_SCHEMA_VERSION,),
+    )
+    conn.execute(
+        "INSERT INTO rca_delivery_meta VALUES('schema_version', ?)",
+        (business_metrics.DELIVERY_STORE_SCHEMA_VERSION,),
+    )
+    immutable_tables = {
+        "source_authority": "rca_source_authority_receipts",
+        "admission_snapshot": "rca_admission_snapshots",
+        "snapshot_envelope": "rca_snapshot_source_envelopes",
+        "conclusion_adjudication": "rca_conclusion_adjudications",
+    }
+    for prefix, table in immutable_tables.items():
+        for operation in ("UPDATE", "DELETE"):
+            suffix = operation.lower()
+            conn.execute(
+                f"CREATE TRIGGER trg_rca_{prefix}_no_{suffix} "
+                f"BEFORE {operation} ON {table} "
+                "BEGIN SELECT RAISE(ABORT, 'immutable'); END"
+            )
+
+    cases = [
+        {
+            "name": "recognized",
+            "generation": 1,
+            "outcome": "success",
+            "error": "",
+            "diagnostic": "",
+            "oracle": _oracle("candidate_hypothesis", "medium"),
+            "golden": (True, False, False, "candidate_hypothesis", "allow"),
+        },
+        {
+            "name": "unsupported",
+            "generation": 1,
+            "outcome": "terminal_failed",
+            "error": "business_profile_unsupported",
+            "diagnostic": "business_route_unsupported",
+            "oracle": None,
+            "golden": (False, None, None, "business_route_unsupported", "block"),
+        },
+        {
+            "name": "event-not-found",
+            "generation": 1,
+            "outcome": "terminal_failed",
+            "error": "remote_event_not_found",
+            "diagnostic": "",
+            "oracle": _oracle("honest_non_attribution", "low"),
+            "golden": (False, None, None, "honest_non_attribution", "allow"),
+        },
+        {
+            "name": "system-failure",
+            "generation": 1,
+            "outcome": "terminal_failed",
+            "error": "analysis_failed",
+            "diagnostic": "analysis_failed",
+            "oracle": None,
+            "golden": (True, False, True, "analysis_failed", "block"),
+        },
+    ]
+    golden_records = []
+    for ordinal, case in enumerate(cases, start=1):
+        name = case["name"]
+        business_key = f"business-{name}"
+        submission_key = f"submission-{name}"
+        delivery_id = f"delivery-{name}"
+        snapshot_sha = _digest(f"snapshot:{name}")
+        created_at = f"2026-07-26T0{ordinal}:00:00+00:00"
+        conn.execute(
+            "INSERT INTO rca_admission_snapshots VALUES(?, ?, ?, ?, 'admit')",
+            (snapshot_sha, business_key, submission_key, case["generation"]),
+        )
+        for entry_index, source_kind in enumerate((
+            "kafka_workflow_event",
+            "feishu_group_manual",
+        )):
+            source_id = f"source-{name}-{entry_index}"
+            envelope_sha = _digest(f"envelope:{source_id}")
+            authority_sha = _digest(f"authority:{source_id}")
+            payload_sha = _digest(f"payload:{source_id}")
+            evidence_sha = _digest(f"evidence:{source_id}")
+            binding_action = "create" if entry_index == 0 else "join"
+            conn.execute(
+                "INSERT INTO rca_source_authority_receipts "
+                "VALUES(?, ?, ?, ?, ?, ?, 'admit')",
+                (
+                    authority_sha,
+                    source_id,
+                    source_kind,
+                    payload_sha,
+                    evidence_sha,
+                    binding_action,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO rca_snapshot_source_envelopes "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'admit', ?)",
+                (
+                    envelope_sha,
+                    snapshot_sha,
+                    submission_key,
+                    authority_sha,
+                    source_id,
+                    source_kind,
+                    payload_sha,
+                    evidence_sha,
+                    binding_action,
+                    json.dumps({"requester_id": f"requester-{source_id}"}),
+                ),
+            )
+        conn.execute(
+            "INSERT INTO rca_delivery_jobs VALUES(?, ?, ?, ?, 't03o4q', ?, ?, '', "
+            "?, ?, 'delivered', '{}', ?, ?)",
+            (
+                delivery_id,
+                submission_key,
+                business_key,
+                case["generation"],
+                str(7000 + ordinal),
+                case["outcome"],
+                "completed",
+                case["error"],
+                created_at,
+                created_at,
+            ),
+        )
+        payload = {
+            "schema_version": "pnc_rca_delivery_effect_v3",
+            "outcome": case["outcome"],
+        }
+        if case["diagnostic"]:
+            payload["diagnostic_code"] = case["diagnostic"]
+        if case["oracle"] is not None:
+            payload.update({
+                "terminal_class": case["oracle"]["terminal_class"],
+                "confidence_tier": case["oracle"]["confidence_tier"],
+                "quality_oracle": case["oracle"],
+                "quality_oracle_sha256": hashlib.sha256(
+                    json.dumps(
+                        case["oracle"],
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest(),
+            })
+        effect_key = f"effect-{name}"
+        conn.execute(
+            "INSERT INTO rca_delivery_effects VALUES(?, ?, 'feishu_issue_comment', "
+            "1, ?, 'succeeded', 'settled', ?, ?, ?)",
+            (
+                effect_key,
+                delivery_id,
+                json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                json.dumps({"source": "read_after_write", "remote_id": effect_key}),
+                created_at,
+                created_at,
+            ),
+        )
+        if name == "recognized":
+            correction_key = "effect-recognized-correction"
+            conn.execute(
+                "INSERT INTO rca_delivery_effects VALUES(?, ?, "
+                "'feishu_issue_comment', 1, ?, 'succeeded', 'settled', ?, ?, ?)",
+                (
+                    correction_key,
+                    delivery_id,
+                    json.dumps({
+                        "schema_version": ("pnc_rca_conclusion_adjudication_effect_v2"),
+                        "action": "recognize",
+                    }),
+                    json.dumps({"source": "read_after_write", "remote_id": "owner"}),
+                    created_at,
+                    created_at,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO rca_conclusion_adjudications VALUES(?, ?, ?, 1, ?, "
+                "'recognize', 'recognized', 'owner-1', ?, ?, ?, 'epoch-1', ?)",
+                (
+                    "adjudication-recognized",
+                    business_metrics.ADJUDICATION_SCHEMA_VERSION,
+                    business_key,
+                    str(7000 + ordinal),
+                    delivery_id,
+                    effect_key,
+                    correction_key,
+                    created_at,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO rca_conclusion_adjudication_repairs "
+                "VALUES('adjudication-recognized', 'succeeded')"
+            )
+        evaluated, false_high, regression, expected_class, expected_gate = case[
+            "golden"
+        ]
+        golden_records.append({
+            "business_key": business_key,
+            "generation": case["generation"],
+            "release_id": SQLITE_RELEASE,
+            "pipeline_commit": SQLITE_PIPELINE_COMMIT,
+            "evaluated": evaluated,
+            "false_high_confidence": false_high,
+            "regression": regression,
+            "expected_terminal_class": expected_class,
+            "expected_gate_decision": expected_gate,
+        })
+    conn.commit()
+    conn.close()
+
+    golden_path = tmp_path / "golden.json"
+    golden_path.write_text(
+        json.dumps({
+            "schema_version": business_metrics.GOLDEN_INPUT_SCHEMA_VERSION,
+            "records": golden_records,
+        }),
+        encoding="utf-8",
+    )
+    return db_path, golden_path
 
 
 def _record(
@@ -367,3 +698,167 @@ def test_negative_mixed_scope_pair_injection_exits_nonzero(tmp_path: Path) -> No
     assert failure["ok"] is False
     assert failure["code"] == "metrics_report_not_clean"
     assert "metrics_pair_denominator_mixed" in failure["detail"]
+
+
+def test_sqlite_observation_producer_joins_identity_w13_oracle_and_golden(
+    sqlite_observation_fixture: tuple[Path, Path],
+) -> None:
+    db_path, golden_path = sqlite_observation_fixture
+    before = db_path.stat()
+
+    rows = business_metrics.load_sqlite_observations(
+        db_path,
+        release_id=SQLITE_RELEASE,
+        pipeline_commit=SQLITE_PIPELINE_COMMIT,
+        window_start=SQLITE_WINDOW_START,
+        window_end=SQLITE_WINDOW_END,
+        golden_input=golden_path,
+    )
+    report = quality_metrics.build_daily_report(rows, observed_at=SQLITE_WINDOW_END)
+
+    after = db_path.stat()
+    assert (before.st_ino, before.st_size, before.st_mtime_ns) == (
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    )
+    assert not Path(f"{db_path}-wal").exists()
+    assert len(rows) == 8
+    assert len({row["record_id"] for row in rows}) == 8
+    assert {row["entry"] for row in rows} == {"kafka", "feishu"}
+    assert all(row["identity_provenance"]["source_id"] for row in rows)
+    assert all(row["entry_provenance"]["entry"] == row["entry"] for row in rows)
+    assert all(
+        row["quality_oracle_sha256"] for row in rows if row["confidence_tier"] != "none"
+    )
+    assert all(
+        row["golden_provenance"]["pipeline_commit"] == SQLITE_PIPELINE_COMMIT
+        for row in rows
+    )
+
+    recognized = _group(report, entry="kafka", tier="medium")
+    assert recognized["metrics"]["useful_attribution"]["by_denominator"][
+        "business"
+    ] == {"numerator": 1, "denominator": 1, "rate_pct": 100.0}
+    assert recognized["metrics"]["false_high_confidence_no_regression"][
+        "by_denominator"
+    ]["business"] == {"numerator": 1, "denominator": 1, "rate_pct": 100.0}
+
+    shared_none_tier = _group(report, entry="kafka", tier="none")
+    assert shared_none_tier["denominators"] == {"business": 1, "system": 1}
+    assert shared_none_tier["metrics"]["false_high_confidence_no_regression"][
+        "by_denominator"
+    ]["system"] == {
+        "numerator": 0,
+        "denominator": 1,
+        "rate_pct": 0.0,
+    }
+    assert report["auxiliary"]["attribution_exclusions"] == {
+        "event_not_found": 2,
+        "unsupported": 2,
+    }
+    assert report["ok"] is True
+
+
+def test_sqlite_cli_feeds_existing_daily_report(
+    sqlite_observation_fixture: tuple[Path, Path],
+) -> None:
+    db_path, golden_path = sqlite_observation_fixture
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(Path(quality_metrics.__file__).resolve()),
+            "--control-db",
+            str(db_path),
+            "--release-id",
+            SQLITE_RELEASE,
+            "--pipeline-commit",
+            SQLITE_PIPELINE_COMMIT,
+            "--window-start",
+            SQLITE_WINDOW_START,
+            "--window-end",
+            SQLITE_WINDOW_END,
+            "--golden-input",
+            str(golden_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    report = json.loads(completed.stdout)
+    assert report["ok"] is True
+    assert report["source"]["mode"] == "sqlite_uri_mode_ro_immutable"
+    assert report["source"]["runtime_mutation_performed"] is False
+    assert report["source"]["wal_created"] is False
+
+
+def test_sqlite_observation_accepts_integrated_control_v12(
+    sqlite_observation_fixture: tuple[Path, Path],
+) -> None:
+    db_path, golden_path = sqlite_observation_fixture
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "UPDATE control_meta SET value = 'pnc_rca_control_store_v12' "
+        "WHERE key = 'schema_version'"
+    )
+    conn.commit()
+    conn.close()
+
+    rows = business_metrics.load_sqlite_observations(
+        db_path,
+        release_id=SQLITE_RELEASE,
+        pipeline_commit=SQLITE_PIPELINE_COMMIT,
+        window_start=SQLITE_WINDOW_START,
+        window_end=SQLITE_WINDOW_END,
+        golden_input=golden_path,
+    )
+    assert len(rows) == 8
+
+
+@pytest.mark.parametrize("corruption", ["missing_schema", "malformed_marker"])
+def test_sqlite_cli_missing_or_malformed_schema_exits_two(
+    sqlite_observation_fixture: tuple[Path, Path], corruption: str
+) -> None:
+    db_path, golden_path = sqlite_observation_fixture
+    conn = sqlite3.connect(db_path)
+    if corruption == "missing_schema":
+        conn.execute("DROP TABLE rca_conclusion_adjudications")
+    else:
+        conn.execute(
+            "UPDATE rca_delivery_meta SET value = 'pnc_rca_delivery_store_v7' "
+            "WHERE key = 'schema_version'"
+        )
+    conn.commit()
+    conn.close()
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(Path(quality_metrics.__file__).resolve()),
+            "--control-db",
+            str(db_path),
+            "--release-id",
+            SQLITE_RELEASE,
+            "--pipeline-commit",
+            SQLITE_PIPELINE_COMMIT,
+            "--window-start",
+            SQLITE_WINDOW_START,
+            "--window-end",
+            SQLITE_WINDOW_END,
+            "--golden-input",
+            str(golden_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 2
+    failure = json.loads(completed.stderr)
+    assert failure["code"] in {
+        "metrics_control_db_schema_missing",
+        "metrics_control_db_schema_mismatch",
+    }
+    assert not Path(f"{db_path}-wal").exists()
