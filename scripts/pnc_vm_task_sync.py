@@ -46,7 +46,7 @@ from hermes_cli.config import get_hermes_home  # noqa: E402
 from scripts.vm_task_state_bridge import _atomic_write_json, _load_existing, sidecar_path  # noqa: E402
 from gateway.feishu_task_card import render_status_line, stable_render_hash, render_task_card  # noqa: E402
 from scripts.pnc_foxglove_delivery import (  # noqa: E402
-    canonical_https_report_origin,
+    canonical_publication_origin,
     canonical_report_url_from_vm_path,
     foxglove_delivery_fields,
 )
@@ -66,7 +66,6 @@ REPORT_FS_PREFIX = "/mnt/minieye/pdcl/department/perception_test_team/"
 REPORT_ATTACHMENT_CODEC_VERSION = "bom-utf8-v1"
 UTF8_BOM = b"\xef\xbb\xbf"
 REPORT_INTERNAL_HTTP_BASE = "http://192.168.26.174:18081"
-REPORT_PUBLICATION_HTTP_BASE = os.getenv("PNC_PERCEPTION_TEST_TEAM_HTTP_BASE", "").strip().rstrip("/")
 PNC_FEISHU_BUSINESS_TZ = timezone(timedelta(hours=8))
 _L4_EVENT_EPOCH_MAX = 4_102_444_800.0  # 2100-01-01T00:00:00Z
 FIXTURE_SCHEMA_VERSION = "pnc_vm_task_sync_fixture_v1"
@@ -1194,9 +1193,9 @@ def _report_internal_http_link(index_html: str) -> str:
 
 
 def _report_publication_url(index_html: str) -> str:
-    """Return a canonical HTTPS report URL, or empty when not provisioned."""
+    """Return an approved report URL, or empty when not provisioned."""
 
-    origin = canonical_https_report_origin(REPORT_PUBLICATION_HTTP_BASE)
+    origin = canonical_publication_origin()
     return canonical_report_url_from_vm_path(index_html, origin)
 
 

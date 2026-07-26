@@ -35,7 +35,7 @@ if str(REPO_ROOT) not in sys.path:
 from hermes_cli.config import get_hermes_home, reload_env  # noqa: E402
 from scripts.pnc_vm_task_sync import DEFAULT_CHAT_IDS  # noqa: E402
 from scripts.pnc_foxglove_delivery import (  # noqa: E402
-    canonical_https_report_origin,
+    canonical_publication_origin,
     canonical_report_url_from_vm_path,
     foxglove_delivery_fields,
     validate_canonical_report_url,
@@ -163,13 +163,13 @@ PERCEPTION_TEST_TEAM_HTTP_BASE = os.getenv("PNC_PERCEPTION_TEST_TEAM_HTTP_BASE",
 
 
 def _canonical_publication_report_origin() -> str:
-    """Return the explicitly configured canonical HTTPS report origin."""
+    """Return the explicitly configured approved report origin."""
 
-    return canonical_https_report_origin(str(PERCEPTION_TEST_TEAM_HTTP_BASE or "").rstrip("/"))
+    return canonical_publication_origin()
 
 
 def _canonical_publication_report_url(vm_path: str) -> str:
-    """Map one report index path to the configured canonical HTTPS origin."""
+    """Map one report index path to the configured publication origin."""
 
     origin = _canonical_publication_report_origin()
     return canonical_report_url_from_vm_path(vm_path, origin)

@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import plistlib
+from pathlib import Path
+
+import pytest
+
 from scripts.pnc_foxglove_delivery import (
     canonical_https_report_origin,
     canonical_publication_origin,
+    canonical_report_origin,
     canonical_report_url_from_vm_path,
     canonical_viz_mcap_cifs_path,
     canonical_viz_mcap_path,
@@ -72,9 +78,10 @@ def test_foxglove_url_uses_fixed_existing_surface(monkeypatch):
         )
 
 
-def test_publication_origin_requires_explicit_https_dns(monkeypatch):
+def test_publication_origin_requires_explicit_approved_origin(monkeypatch):
     for origin in (
         "https://viewer.internal",
+        "http://192.168.26.174:18081",
     ):
         monkeypatch.setenv("PNC_FOXGLOVE_RENDER_HOST", origin)
         assert canonical_publication_origin() == origin
@@ -82,6 +89,8 @@ def test_publication_origin_requires_explicit_https_dns(monkeypatch):
     for origin in (
         "",
         "http://viewer.internal",
+        "http://192.168.26.175:18081",
+        "http://192.168.26.174:18082",
         "https://192.168.21.217",
         "https://localhost",
         "https://viewer.internal:8443",
@@ -98,6 +107,24 @@ def test_canonical_report_origin_rejects_private_http_and_accepts_explicit_https
     assert canonical_https_report_origin("https://192.168.21.217") == ""
     assert canonical_https_report_origin("https://g1q3-rca.minieye.tech") == (
         "https://g1q3-rca.minieye.tech"
+    )
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "",
+        "http://192.168.26.175:18081",
+        "http://192.168.26.174:18082",
+        "http://user@192.168.26.174:18081",
+        "http://192.168.26.174:18081/reports",
+        "http://192.168.26.174:18081?query=1",
+    ],
+)
+def test_report_origin_accepts_only_the_approved_internal_http_service(origin):
+    assert canonical_report_origin(origin) == ""
+    assert canonical_report_origin("http://192.168.26.174:18081") == (
+        "http://192.168.26.174:18081"
     )
 
 
@@ -122,6 +149,44 @@ def test_canonical_report_url_requires_index_html_and_exact_origin():
     assert validate_canonical_report_url(
         "https://g1q3-rca.minieye.tech/G1Q3_RCA/cases/x/report.viz.mcap", origin
     ) == ""
+
+
+def test_canonical_report_url_accepts_exact_internal_service_only():
+    origin = "http://192.168.26.174:18081"
+    vm_path = (
+        "/mnt/minieye/pdcl/department/perception_test_team/"
+        "G1Q3_RCA/cases/demo/index.html"
+    )
+    expected = f"{origin}/G1Q3_RCA/cases/demo/index.html"
+
+    assert canonical_report_url_from_vm_path(vm_path, origin) == expected
+    assert validate_canonical_report_url(expected, origin) == expected
+    for rejected in (
+        "",
+        f"{origin}/G1Q3_RCA/cases/demo/demo.viz.mcap",
+        "http://192.168.26.175:18081/G1Q3_RCA/cases/demo/index.html",
+        "http://192.168.26.174:18082/G1Q3_RCA/cases/demo/index.html",
+    ):
+        assert validate_canonical_report_url(rejected, origin) == ""
+
+
+@pytest.mark.parametrize(
+    "plist_name",
+    [
+        "local.pnc.rca-delivery-collector.plist",
+        "local.pnc.rca-delivery-dispatcher.plist",
+        "local.pnc.completion-notice-relay.plist",
+        "local.pnc.vm-task-sync.plist",
+    ],
+)
+def test_publication_host_writers_pin_approved_internal_origin(plist_name):
+    root = Path(__file__).resolve().parents[2]
+    with (root / plist_name).open("rb") as handle:
+        payload = plistlib.load(handle)
+
+    assert payload["EnvironmentVariables"]["PNC_FOXGLOVE_RENDER_HOST"] == (
+        "http://192.168.26.174:18081"
+    )
 
 
 def test_malformed_publication_origins_do_not_change_fixed_foxglove_url(monkeypatch):

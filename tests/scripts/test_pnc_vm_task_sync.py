@@ -1094,10 +1094,9 @@ def test_g1q3_task_card_prefers_delivery_contract_report_completed(monkeypatch):
     assert "parsed/L2 assets 缺失" in delivery["boundaries"]
 
 
-def test_vm_sync_html_artifact_fails_closed_without_canonical_https(monkeypatch):
-    monkeypatch.setattr(
-        pnc_vm_task_sync,
-        "REPORT_PUBLICATION_HTTP_BASE",
+def test_vm_sync_html_artifact_uses_explicit_approved_internal_service(monkeypatch):
+    monkeypatch.setenv(
+        "PNC_FOXGLOVE_RENDER_HOST",
         "http://192.168.26.174:18081",
     )
     contract = {
@@ -1116,17 +1115,45 @@ def test_vm_sync_html_artifact_fails_closed_without_canonical_https(monkeypatch)
 
     delivery = pnc_vm_task_sync._delivery_from_contract(_task("vm-sync-private-http"), contract)
 
-    assert delivery["artifact_path"] == delivery["report_index_html_cifs"]
-    assert not str(delivery["artifact_path"]).startswith("http://")
-    assert delivery["publication_url_status"] == "blocked_missing_canonical_https"
-    assert delivery["rca_status"]["html_link"] == ""
+    assert delivery["artifact_path"] == (
+        "http://192.168.26.174:18081/G1Q3_RCA/cases/private-http/index.html"
+    )
+    assert delivery["publication_url_status"] == "ready"
+    assert delivery["rca_status"]["html_link"] == delivery["artifact_path"]
     assert delivery["internal_report_url"].startswith("http://192.168.26.174:18081/")
 
 
+def test_vm_sync_html_artifact_rejects_unapproved_http_origin(monkeypatch):
+    monkeypatch.setenv(
+        "PNC_FOXGLOVE_RENDER_HOST",
+        "http://192.168.26.175:18081",
+    )
+    contract = {
+        "schema_version": "g1q3_delivery_contract_v1",
+        "work_item_id": "vm-sync-unapproved-http",
+        "business_state": "report_completed",
+        "report": {"is_deliverable": True, "is_candidate": True},
+        "summary": {"short_conclusion": "候选报告"},
+        "artifacts": {
+            "case_dir_vm": "/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases/unapproved-http",
+            "index_html_vm": "/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases/unapproved-http/index.html",
+            "primary_report_cifs": "//hfs.minieye.tech/department-perception_test_team/G1Q3_RCA/cases/unapproved-http/index.html",
+        },
+        "verification": {"pipeline_status": "report_generated_need_review"},
+    }
+
+    delivery = pnc_vm_task_sync._delivery_from_contract(
+        _task("vm-sync-unapproved-http"), contract
+    )
+
+    assert delivery["artifact_path"] == delivery["report_index_html_cifs"]
+    assert delivery["publication_url_status"] == "blocked_missing_canonical_https"
+    assert delivery["rca_status"]["html_link"] == ""
+
+
 def test_vm_sync_html_artifact_uses_explicit_canonical_https(monkeypatch):
-    monkeypatch.setattr(
-        pnc_vm_task_sync,
-        "REPORT_PUBLICATION_HTTP_BASE",
+    monkeypatch.setenv(
+        "PNC_FOXGLOVE_RENDER_HOST",
         "https://g1q3-rca.minieye.tech",
     )
     submission = "g1q3-rca-s1-" + "a" * 64

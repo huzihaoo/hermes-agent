@@ -4018,7 +4018,8 @@ def test_perception_test_team_http_rejects_path_traversal():
     ) == ""
 
 
-def test_publication_origin_rejects_default_private_http(monkeypatch):
+def test_publication_origin_requires_explicit_shared_origin(monkeypatch):
+    monkeypatch.delenv("PNC_FOXGLOVE_RENDER_HOST", raising=False)
     monkeypatch.setattr(
         pnc_completion_notice_relay,
         "PERCEPTION_TEST_TEAM_HTTP_BASE",
@@ -4034,11 +4035,37 @@ def test_publication_origin_rejects_default_private_http(monkeypatch):
     ) == ""
 
 
+def test_publication_origin_accepts_explicit_internal_service(monkeypatch):
+    monkeypatch.setenv(
+        "PNC_FOXGLOVE_RENDER_HOST",
+        "http://192.168.26.174:18081",
+    )
+    vm_path = (
+        "/mnt/minieye/pdcl/department/perception_test_team/"
+        "G1Q3_RCA/cases/demo/index.html"
+    )
+    expected = (
+        "http://192.168.26.174:18081/G1Q3_RCA/cases/demo/index.html"
+    )
+
+    assert pnc_completion_notice_relay._canonical_publication_report_origin() == (
+        "http://192.168.26.174:18081"
+    )
+    assert pnc_completion_notice_relay._canonical_publication_report_url(vm_path) == (
+        expected
+    )
+    assert pnc_completion_notice_relay._validated_canonical_report_link(expected) == (
+        expected
+    )
+    assert pnc_completion_notice_relay._validated_canonical_report_link(
+        "http://192.168.26.174:18081/G1Q3_RCA/cases/demo/demo.viz.mcap"
+    ) == ""
+
+
 def test_publication_origin_accepts_explicit_https_and_preserves_report_identity(monkeypatch):
-    monkeypatch.setattr(
-        pnc_completion_notice_relay,
-        "PERCEPTION_TEST_TEAM_HTTP_BASE",
-        "https://g1q3-rca.minieye.tech/",
+    monkeypatch.setenv(
+        "PNC_FOXGLOVE_RENDER_HOST",
+        "https://g1q3-rca.minieye.tech",
     )
     vm_path = (
         "/mnt/minieye/pdcl/department/perception_test_team/"
@@ -4080,11 +4107,7 @@ def test_private_or_unbound_foxglove_link_cannot_become_artifact_path():
     ],
 )
 def test_publication_origin_rejects_noncanonical_https_shapes(monkeypatch, configured):
-    monkeypatch.setattr(
-        pnc_completion_notice_relay,
-        "PERCEPTION_TEST_TEAM_HTTP_BASE",
-        configured,
-    )
+    monkeypatch.setenv("PNC_FOXGLOVE_RENDER_HOST", configured)
 
     assert pnc_completion_notice_relay._canonical_publication_report_origin() == ""
 

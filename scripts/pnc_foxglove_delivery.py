@@ -71,10 +71,19 @@ def canonical_https_report_origin(value: Any) -> str:
     return raw
 
 
-def canonical_report_url_from_vm_path(vm_path: Any, origin: Any) -> str:
-    """Map one sealed report index path to a validated HTTPS URL."""
+def canonical_report_origin(value: Any) -> str:
+    """Validate one approved report origin for user-facing publication."""
 
-    canonical_origin = canonical_https_report_origin(origin)
+    raw = str(value or "")
+    if raw == INTERNAL_RCA_REPORT_ORIGIN:
+        return raw
+    return canonical_https_report_origin(raw)
+
+
+def canonical_report_url_from_vm_path(vm_path: Any, origin: Any) -> str:
+    """Map one sealed report index path to an approved publication URL."""
+
+    canonical_origin = canonical_report_origin(origin)
     text = str(vm_path or "").strip()
     if not canonical_origin or not text.startswith(PERCEPTION_TEST_TEAM_VM_PREFIX):
         return ""
@@ -93,9 +102,9 @@ def canonical_report_url_from_vm_path(vm_path: Any, origin: Any) -> str:
 
 
 def validate_canonical_report_url(value: Any, origin: Any) -> str:
-    """Accept only an index.html URL under the explicit HTTPS report origin."""
+    """Accept only an index.html URL under an approved report origin."""
 
-    canonical_origin = canonical_https_report_origin(origin)
+    canonical_origin = canonical_report_origin(origin)
     text = str(value or "").strip()
     if not canonical_origin or not text:
         return ""
@@ -103,9 +112,10 @@ def validate_canonical_report_url(value: Any, origin: Any) -> str:
         parsed = urlsplit(text)
     except ValueError:
         return ""
+    expected = urlsplit(canonical_origin)
     if (
-        parsed.scheme != "https"
-        or parsed.netloc != urlsplit(canonical_origin).netloc
+        parsed.scheme != expected.scheme
+        or parsed.netloc != expected.netloc
         or parsed.username is not None
         or parsed.password is not None
         or parsed.query
@@ -240,23 +250,7 @@ def _foxglove_base(*, require_explicit: bool = False) -> str:
 
 def canonical_publication_origin() -> str:
     """Return the exact production report origin used for RCA artifacts."""
-    base = _foxglove_base(require_explicit=True)
-    if base == INTERNAL_RCA_REPORT_ORIGIN:
-        return base
-    if not base.startswith("https://"):
-        return ""
-    parsed = urlsplit(base)
-    hostname = parsed.hostname or ""
-    if parsed.port is not None:
-        return ""
-    try:
-        ipaddress.ip_address(hostname)
-    except ValueError:
-        if len(hostname.split(".")) < 2:
-            return ""
-    else:
-        return ""
-    return base
+    return canonical_report_origin(_foxglove_base(require_explicit=True))
 
 
 def foxglove_url(viz_mcap_vm: Any) -> str:

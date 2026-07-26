@@ -37,6 +37,8 @@
     <string>3</string>
     <key>PNC_COMPLETION_NOTICE_RELAY_HEALTH_PATH</key>
     <string>/Users/songying/.hermes/runtime/pnc_agent/feishu_issue_kafka_rca/completion_notice_relay_health.json</string>
+    <key>PNC_FOXGLOVE_RENDER_HOST</key>
+    <string>http://192.168.26.174:18081</string>
     <key>PNC_TASK_CARD_MAX_FALLBACKS_PER_LOOP</key>
     <string>0</string>
     <key>PYTHONNOUSERSITE</key>

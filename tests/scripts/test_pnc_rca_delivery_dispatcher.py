@@ -2517,8 +2517,15 @@ def test_stored_artifact_inventory_corruption_quarantines_before_boundaries(
     assert remote.list_calls == remote.add_calls == 0
 
 
-def test_primary_report_network_failure_blocks_external_comment(tmp_path):
+def test_primary_report_network_failure_blocks_external_comment(tmp_path, monkeypatch):
+    monkeypatch.setenv(
+        "PNC_FOXGLOVE_RENDER_HOST",
+        "http://192.168.26.174:18081",
+    )
     store = _seed(tmp_path)
+    assert store.list_rows("rca_delivery_jobs")[0]["report_url"].startswith(
+        "http://192.168.26.174:18081/"
+    )
     dispatcher, remote, _clock = _dispatcher(
         tmp_path,
         verifier=lambda *_args: {
@@ -3485,6 +3492,10 @@ def test_meegle_adapter_rejects_omitted_fields_without_exact_metadata():
 
 
 def test_default_report_verifier_performs_bounded_head_then_get(monkeypatch):
+    monkeypatch.setenv(
+        "PNC_FOXGLOVE_RENDER_HOST",
+        "http://192.168.26.174:18081",
+    )
     body = b"<!doctype html><title>RCA</title>"
     calls = []
 
@@ -3516,7 +3527,7 @@ def test_default_report_verifier_performs_bounded_head_then_get(monkeypatch):
         lambda handler: Opener(),
     )
     url = (
-        "https://viewer.internal/G1Q3_RCA/cases/"
+        "http://192.168.26.174:18081/G1Q3_RCA/cases/"
         f"{'g1q3-rca-s1-' + 'a' * 64}/"
         f"{'g1q3-rca-artifact-v1-' + 'b' * 64}/index.html"
     )
@@ -3534,6 +3545,36 @@ def test_default_report_verifier_performs_bounded_head_then_get(monkeypatch):
         ("GET", url),
     ]
     assert all(0 < timeout <= 7 for _method, _url, timeout in calls)
+
+
+def test_default_report_verifier_fails_closed_when_internal_service_is_unreachable(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "PNC_FOXGLOVE_RENDER_HOST",
+        "http://192.168.26.174:18081",
+    )
+
+    class UnreachableOpener:
+        def open(self, request, timeout):
+            del request, timeout
+            raise dispatcher_module.urllib_error.URLError("unreachable")
+
+    url = (
+        "http://192.168.26.174:18081/G1Q3_RCA/cases/"
+        f"{'g1q3-rca-s1-' + 'a' * 64}/"
+        f"{'g1q3-rca-artifact-v1-' + 'b' * 64}/index.html"
+    )
+
+    result = default_report_verifier(
+        url,
+        1,
+        "0" * 64,
+        opener=UnreachableOpener(),
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == "report_http_unavailable"
 
 
 def test_default_report_verifier_enforces_one_total_stream_deadline():

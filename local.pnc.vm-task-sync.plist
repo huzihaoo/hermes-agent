@@ -24,6 +24,8 @@
     <string>/Users/songying/.hermes</string>
     <key>PATH</key>
     <string>/Users/songying/.local/bin:/Users/songying/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PNC_FOXGLOVE_RENDER_HOST</key>
+    <string>http://192.168.26.174:18081</string>
     <key>PNC_VM_TASK_SYNC_RECEIPT_PATH</key>
     <string>/Users/songying/.hermes/runtime/pnc_agent/feishu_issue_kafka_rca/vm_task_sync_completion.json</string>
     <key>PYTHONNOUSERSITE</key>
