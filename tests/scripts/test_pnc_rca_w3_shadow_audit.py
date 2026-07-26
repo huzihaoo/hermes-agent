@@ -246,9 +246,7 @@ def _insert_pair(
             request["ticket"]["title_sha256"],
             *(request[name]["sha256"] for name in audit._POLICY_NAMES),
             request["execution_intent"]["generation_reason"],
-            request["execution_intent"][
-                "generation_authorization_evidence_sha256"
-            ],
+            request["execution_intent"]["generation_authorization_evidence_sha256"],
             _canonical(request),
             NOW,
         ),
@@ -422,9 +420,7 @@ def test_strict_acceptance_rejects_a_weakened_minimum(
     assert exit_code == 2
     assert report["ok"] is False
     assert report["external_writes"] is False
-    assert report["error"] == (
-        "ShadowAuditError:min_real_pairs_below_strict_floor"
-    )
+    assert report["error"] == ("ShadowAuditError:min_real_pairs_below_strict_floor")
 
 
 @pytest.mark.parametrize(

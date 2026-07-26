@@ -335,11 +335,15 @@ def _require_schema(conn: sqlite3.Connection) -> tuple[str, str]:
     ).fetchone()
     control_schema = str(meta[0] if meta is not None else "")
     if control_schema not in SUPPORTED_CONTROL_SCHEMAS:
-        raise ShadowAuditError(f"control_schema_unsupported:{control_schema or 'missing'}")
+        raise ShadowAuditError(
+            f"control_schema_unsupported:{control_schema or 'missing'}"
+        )
     return control_schema, _canonical_json_sha256(schema_sql)
 
 
-def _diff_paths(left: Any, right: Any, path: tuple[str, ...] = ()) -> list[tuple[str, ...]]:
+def _diff_paths(
+    left: Any, right: Any, path: tuple[str, ...] = ()
+) -> list[tuple[str, ...]]:
     if isinstance(left, dict) and isinstance(right, dict):
         result: list[tuple[str, ...]] = []
         for key in sorted(set(left) | set(right)):
@@ -364,9 +368,7 @@ def _diff_paths(left: Any, right: Any, path: tuple[str, ...] = ()) -> list[tuple
 
 
 def _pointer(path: tuple[str, ...]) -> str:
-    return "/" + "/".join(
-        part.replace("~", "~0").replace("/", "~1") for part in path
-    )
+    return "/" + "/".join(part.replace("~", "~0").replace("/", "~1") for part in path)
 
 
 def _validate_policy(name: str, value: Any) -> dict[str, Any]:
@@ -442,9 +444,8 @@ def _validate_request(row: sqlite3.Row) -> dict[str, Any]:
         )
     if row["generation_reason"] != intent.get("generation_reason"):
         raise ShadowAuditError("canonical_request_generation_reason_mismatch")
-    if (
-        row["generation_authorization_evidence_sha256"]
-        != intent.get("generation_authorization_evidence_sha256")
+    if row["generation_authorization_evidence_sha256"] != intent.get(
+        "generation_authorization_evidence_sha256"
     ):
         raise ShadowAuditError("canonical_request_generation_authority_mismatch")
     return request
@@ -491,9 +492,7 @@ def _validate_snapshot(
     )
     ledger_id = execution["activation_ledger_id"]
     if ledger_id is not None and (
-        not isinstance(ledger_id, int)
-        or isinstance(ledger_id, bool)
-        or ledger_id < 1
+        not isinstance(ledger_id, int) or isinstance(ledger_id, bool) or ledger_id < 1
     ):
         raise ShadowAuditError("execution_admission_ledger_invalid")
     if execution["decision"] not in {"admit", "shadow"}:
@@ -544,9 +543,7 @@ def _validate_snapshot(
     }
     for column, expected in expected_columns.items():
         if row[column] != expected:
-            raise ShadowAuditError(
-                f"forbidden_diff:/execution_core/column/{column}"
-            )
+            raise ShadowAuditError(f"forbidden_diff:/execution_core/column/{column}")
     execution_core = {
         key: snapshot[key]
         for key in (
@@ -645,9 +642,7 @@ def _validate_envelope(
         "submission_key": envelope["submission_key"],
         "source_id": envelope["source_id"],
         "source_kind": envelope["source_kind"],
-        "authorization_evidence_sha256": ingress[
-            "authorization_evidence_sha256"
-        ],
+        "authorization_evidence_sha256": ingress["authorization_evidence_sha256"],
         "binding_action": ingress["binding_action"],
         "decision": ingress["decision"],
     }
@@ -746,24 +741,28 @@ def audit_w3_shadow(
                       source_envelope_sha256
             """
         ).fetchall()
-        orphan_request_count = int(conn.execute(
-            """
+        orphan_request_count = int(
+            conn.execute(
+                """
             SELECT COUNT(*) FROM rca_canonical_requests AS request
              WHERE NOT EXISTS (
                 SELECT 1 FROM rca_admission_snapshots AS snapshot
                  WHERE snapshot.request_sha256 = request.request_sha256
              )
             """
-        ).fetchone()[0])
-        orphan_envelope_count = int(conn.execute(
-            """
+            ).fetchone()[0]
+        )
+        orphan_envelope_count = int(
+            conn.execute(
+                """
             SELECT COUNT(*) FROM rca_snapshot_source_envelopes AS envelope
              WHERE NOT EXISTS (
                 SELECT 1 FROM rca_admission_snapshots AS snapshot
                  WHERE snapshot.snapshot_sha256 = envelope.snapshot_sha256
              )
             """
-        ).fetchone()[0])
+            ).fetchone()[0]
+        )
         conn.rollback()
     finally:
         conn.close()
@@ -840,17 +839,14 @@ def audit_w3_shadow(
             if (
                 creator["source_envelope_sha256"]
                 != row["creator_source_envelope_sha256"]
-                or creator["source_authority_sha256"]
-                != row["creator_authority_sha256"]
+                or creator["source_authority_sha256"] != row["creator_authority_sha256"]
                 or creator["source_id"] != row["creator_source_id"]
             ):
                 raise ShadowAuditError("creator_source_envelope_binding_mismatch")
             joined_envelopes = [
                 envelope for envelope in envelopes if envelope is not creator
             ]
-            source_kinds = {
-                str(envelope["source_kind"]) for envelope in envelopes
-            }
+            source_kinds = {str(envelope["source_kind"]) for envelope in envelopes}
             real_pair_qualified = bool(joined_envelopes) and len(source_kinds) >= 2
             baseline = {
                 "execution_core": execution_core,
