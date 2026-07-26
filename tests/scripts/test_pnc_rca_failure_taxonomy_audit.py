@@ -249,6 +249,67 @@ def test_terminal_route_audit_requires_bound_oracle_v2_effect(tmp_path):
     assert report["route_contract_errors"] == []
 
 
+def test_terminal_route_audit_ignores_optional_fallback_effect(tmp_path):
+    path = _routed_db(tmp_path)
+    store = RcaDeliveryStore(path)
+    with sqlite3.connect(path) as conn:
+        hard = conn.execute(
+            "SELECT submission_key FROM rca_failure_routes "
+            "WHERE lane = 'hard_defect'"
+        ).fetchone()
+        assert hard is not None
+        conn.execute(
+            "UPDATE rca_execution_watch SET next_poll_at = ? WHERE submission_key != ?",
+            ((NOW + timedelta(days=1)).isoformat(), hard[0]),
+        )
+    claim = store.claim_due_watch(
+        lease_owner="terminal-optional-audit-test",
+        now=NOW + timedelta(seconds=1800),
+    )
+    assert claim is not None
+    [route] = [
+        row
+        for row in store.list_rows("rca_failure_routes")
+        if row["submission_key"] == claim.submission_key
+    ]
+    fallback = {
+        "schema_version": "pnc_rca_bounded_terminal_fallback_v1",
+        "work_started_at": route["work_started_at"],
+        "deadline_at": route["deadline_at"],
+        "elapsed_seconds": 1800,
+        "confidence_tier": "low",
+        "terminal_class": "honest_non_attribution",
+        "route_key": route["route_key"],
+        "route_kind": route["route_kind"],
+        "route_owner": route["owner"],
+    }
+    store.create_terminal_delivery(
+        claim=claim,
+        status={
+            "failure_taxonomy": json.loads(route["route_payload_json"])["decision"]
+        },
+        outcome="terminal_failed",
+        terminal_state="failed",
+        error_code=route["terminal_error_code"],
+        error_detail="private detail",
+        terminal_fallback=fallback,
+        now=NOW + timedelta(seconds=1800),
+    )
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "UPDATE rca_delivery_effects SET required = 0 "
+            "WHERE delivery_id = (SELECT delivery_id FROM rca_delivery_jobs "
+            "WHERE submission_key = ?)",
+            (claim.submission_key,),
+        )
+
+    report = audit.build_report(path, baseline=(NOW - timedelta(seconds=1)).isoformat())
+
+    assert report["ga_acceptance_ready"] is False
+    assert report["post_baseline"]["terminal_route_effects"] == 0
+    assert "durable_route_contract_invalid" in report["gate_errors"]
+
+
 def test_historical_unclassified_without_source_is_not_guessed(tmp_path):
     path = _db(tmp_path, [("vm_terminal_failed_unclassified", {})])
 

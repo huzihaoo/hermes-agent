@@ -171,6 +171,7 @@ def build_report(db_path: Path, *, baseline: str = DEFAULT_BASELINE) -> dict[str
                         ON e.delivery_id = j.delivery_id
                        AND e.effect_kind = 'feishu_issue_comment'
                        AND e.target_key = j.target_key
+                       AND e.required = 1
                      WHERE r.created_at > ?
                      ORDER BY r.created_at, r.route_key
                     """,
