@@ -68,6 +68,24 @@ _RESIDENT_LABELS = {
     "delivery_collector_health": "local.pnc.rca-delivery-collector",
     "delivery_dispatcher_health": "local.pnc.rca-delivery-dispatcher",
 }
+_RESIDENT_HEALTH_SPECS = {
+    "kafka_consumer_health": (
+        CONSUMER_HEALTH_SCHEMA_VERSION,
+        "heartbeat_at",
+    ),
+    "outbox_dispatcher_health": (
+        "pnc_rca_outbox_dispatcher_health_v2",
+        "heartbeat_at",
+    ),
+    "delivery_collector_health": (
+        "pnc_rca_delivery_collector_health_v2",
+        "updated_at",
+    ),
+    "delivery_dispatcher_health": (
+        "pnc_rca_delivery_dispatcher_health_v2",
+        "updated_at",
+    ),
+}
 
 
 def _process_create_time_matches(observed: Any, expected: Any) -> bool:
@@ -892,11 +910,22 @@ def _recheck_live_resident_projection(
     value: Mapping[str, Any],
     *,
     consumer_health: Mapping[str, Any],
+    consumer_health_path: str | Path | None = None,
+    service_configs: Mapping[str, Any] | None = None,
+    now: datetime | None = None,
 ) -> None:
     """Recheck resident PIDs and loaded-runtime projections from the gate."""
     residents = value.get("residents")
     if not isinstance(residents, Mapping) or set(residents) != set(_RESIDENT_LABELS):
         raise CapsuleError("activation_capsule_residents_invalid")
+    if not isinstance(service_configs, Mapping):
+        raise CapsuleError("activation_capsule_resident_health_config_missing")
+    if consumer_health_path is None:
+        raise CapsuleError("activation_capsule_resident_health_path_invalid")
+    trusted_consumer_health_path = _absolute_path(
+        consumer_health_path,
+        "activation_capsule_resident_health_path_invalid",
+    )
     consumer_identity = consumer_health.get("runtime_identity")
     if not isinstance(consumer_identity, Mapping):
         raise CapsuleError("activation_capsule_consumer_runtime_invalid")
@@ -962,10 +991,74 @@ def _recheck_live_resident_projection(
             raise
         except (OSError, ValueError, psutil.Error) as exc:
             raise CapsuleError("activation_capsule_resident_restarted") from exc
-        expected_runtime = expected_value.get("runtime_identity_sha256")
-        expected_loaded = expected_value.get("loaded_runtime_sha256")
-        if expected_loaded is not None:
-            _digest(expected_loaded, "activation_capsule_resident_runtime_invalid")
+    observed_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    for artifact, label in _RESIDENT_LABELS.items():
+        raw_config = service_configs.get(label)
+        if not isinstance(raw_config, Mapping):
+            raise CapsuleError("activation_capsule_resident_health_config_missing")
+        config = dict(raw_config)
+        health_path = _absolute_path(
+            _text(
+                config.get("health_path"),
+                "activation_capsule_resident_health_path_invalid",
+            ),
+            "activation_capsule_resident_health_path_invalid",
+        )
+        if artifact == "kafka_consumer_health":
+            health = consumer_health
+            if health_path != trusted_consumer_health_path:
+                raise CapsuleError("activation_capsule_resident_health_path_changed")
+        else:
+            _raw, health = _read_owner_json(
+                health_path,
+                artifact=f"activation_{artifact}",
+            )
+        schema, timestamp_field = _RESIDENT_HEALTH_SPECS[artifact]
+        if health.get("schema_version") != schema:
+            raise CapsuleError("activation_capsule_resident_health_invalid")
+        if health.get("healthy") is not True:
+            raise CapsuleError("activation_capsule_resident_unhealthy")
+        if label in {
+            CONSUMER_SERVICE_LABEL,
+            _RESIDENT_LABELS["outbox_dispatcher_health"],
+        }:
+            if health.get("ok") is not True:
+                raise CapsuleError("activation_capsule_resident_unhealthy")
+        heartbeat = _timestamp(
+            health.get(timestamp_field),
+            "activation_capsule_resident_health_time_invalid",
+        )
+        age = (observed_at - heartbeat).total_seconds()
+        if age < -MAX_HEALTH_FUTURE_SKEW_SECONDS:
+            raise CapsuleError("activation_capsule_resident_health_from_future")
+        if age > LIVE_HEALTH_MAX_AGE_SECONDS:
+            raise CapsuleError("activation_capsule_resident_health_stale")
+        health_config = health.get("config")
+        identity = health.get("runtime_identity")
+        if not isinstance(health_config, Mapping) or _sha256_json(
+            health_config
+        ) != _sha256_json(config):
+            raise CapsuleError("activation_capsule_resident_health_config_changed")
+        if not runtime_identity_is_valid(
+            identity,
+            service_label=label,
+            public_config=config,
+        ):
+            raise CapsuleError("activation_capsule_resident_runtime_invalid")
+        assert isinstance(identity, Mapping)
+        expected_value = residents[artifact]
+        expected_identity = _digest(
+            expected_value.get("runtime_identity_sha256"),
+            "activation_capsule_resident_runtime_invalid",
+        )
+        expected_loaded = _digest(
+            expected_value.get("loaded_runtime_sha256"),
+            "activation_capsule_resident_runtime_invalid",
+        )
+        if identity.get("loaded_runtime_sha256") != expected_loaded:
+            raise CapsuleError("activation_capsule_resident_loaded_runtime_changed")
+        if _sha256_json(identity) != expected_identity:
+            raise CapsuleError("activation_capsule_resident_runtime_changed")
 
 
 def _recheck_live_consumer_freeze(
@@ -2216,6 +2309,19 @@ def _confirmation_material(
         raise CapsuleError("activation_capsule_confirmation_barrier_invalid")
     continuity = _runtime_continuity_binding(checks)
     if live_recheck:
+        runtime_dependencies = checks.get("runtime_dependencies")
+        runtime_detail = (
+            runtime_dependencies.get("detail")
+            if isinstance(runtime_dependencies, Mapping)
+            else None
+        )
+        service_configs = (
+            runtime_detail.get("service_configs")
+            if isinstance(runtime_detail, Mapping)
+            else None
+        )
+        if not isinstance(service_configs, Mapping):
+            raise CapsuleError("activation_capsule_resident_health_config_missing")
         _recheck_live_gateway_binding(continuity["gateway"])
         consumer_health = _recheck_live_consumer_freeze(
             freeze,
@@ -2225,6 +2331,8 @@ def _confirmation_material(
         _recheck_live_resident_projection(
             continuity,
             consumer_health=consumer_health,
+            consumer_health_path=freeze["health_path"],
+            service_configs=service_configs,
         )
     if (
         continuity["gateway"].get("runtime_identity_sha256")

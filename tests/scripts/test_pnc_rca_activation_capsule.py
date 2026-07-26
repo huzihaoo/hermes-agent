@@ -46,6 +46,21 @@ def _config() -> dict[str, Any]:
     }
 
 
+def _service_configs() -> dict[str, dict[str, Any]]:
+    return {
+        "local.pnc.rca-kafka-consumer": dict(_config()["consumer"]),
+        "local.pnc.rca-outbox-dispatcher": {
+            "health_path": "/tmp/activation-outbox-health.json"
+        },
+        "local.pnc.rca-delivery-collector": {
+            "health_path": "/tmp/activation-collector-health.json"
+        },
+        "local.pnc.rca-delivery-dispatcher": {
+            "health_path": "/tmp/activation-dispatcher-health.json"
+        },
+    }
+
+
 def _gateway_binding() -> dict[str, Any]:
     identity = {
         "service_label": "ai.hermes.gateway",
@@ -698,6 +713,12 @@ def _confirmation_receipt(
                 "ok": True,
                 "code": "pass",
                 "detail": continuity,
+            },
+            {
+                "name": "runtime_dependencies",
+                "ok": True,
+                "code": "pass",
+                "detail": {"service_configs": _service_configs()},
             },
         ],
     )

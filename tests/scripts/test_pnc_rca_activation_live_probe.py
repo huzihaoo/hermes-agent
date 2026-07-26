@@ -214,4 +214,100 @@ def test_resident_probe_rejects_loaded_runtime_drift() -> None:
                 }
             },
             consumer_health={"runtime_identity": identity},
+            consumer_health_path="/tmp/consumer-health.json",
+            service_configs={},
+        )
+
+
+def test_resident_probe_rereads_all_health_and_rejects_loaded_hash_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_at = datetime.now(timezone.utc)
+    observed_text = observed_at.isoformat()
+    service_configs: dict[str, dict[str, Any]] = {}
+    identities: dict[str, dict[str, Any]] = {}
+    residents: dict[str, dict[str, Any]] = {}
+    health_payloads: dict[str, dict[str, Any]] = {}
+    for artifact, label in capsules._RESIDENT_LABELS.items():
+        config = {"health_path": str((tmp_path / f"{artifact}.json").absolute())}
+        identity = {
+            "service_label": label,
+            "pid": 1234,
+            "process_create_time": 42.0,
+            "boot_time": 1.0,
+            "executable": "/bin/python3",
+            "script": f"/tmp/scripts/{artifact}.py",
+            "cwd": "/tmp",
+            "script_sha256": "1" * 64,
+            "runtime_files_sha256": "2" * 64,
+            "public_config_sha256": capsules._sha256_json(config),
+            "loaded_runtime_sha256": "4" * 64,
+        }
+        schema, timestamp_field = capsules._RESIDENT_HEALTH_SPECS[artifact]
+        health = {
+            "schema_version": schema,
+            "healthy": True,
+            timestamp_field: observed_text,
+            "config": config,
+            "runtime_identity": identity,
+        }
+        if artifact in {"kafka_consumer_health", "outbox_dispatcher_health"}:
+            health["ok"] = True
+        service_configs[label] = config
+        identities[artifact] = identity
+        residents[artifact] = {
+            "runtime_identity_sha256": capsules._sha256_json(identity),
+            "loaded_runtime_sha256": identity["loaded_runtime_sha256"],
+            "pid": identity["pid"],
+            "process_create_time": identity["process_create_time"],
+            "executable": identity["executable"],
+            "cwd": identity["cwd"],
+        }
+        health_payloads[artifact] = health
+        if artifact != "kafka_consumer_health":
+            path = Path(config["health_path"])
+            path.write_text(json.dumps(health, sort_keys=True) + "\n", encoding="utf-8")
+            path.chmod(0o600)
+
+    monkeypatch.setattr(capsules, "_live_launchd_pid", lambda _label: 1234)
+    monkeypatch.setattr(
+        capsules,
+        "psutil",
+        SimpleNamespace(
+            Process=lambda _pid: _FakeProcess(),
+            STATUS_DEAD="dead",
+            STATUS_ZOMBIE="zombie",
+            Error=RuntimeError,
+        ),
+    )
+    continuity = {"residents": residents}
+    consumer_path = service_configs[capsules.CONSUMER_SERVICE_LABEL]["health_path"]
+    capsules._recheck_live_resident_projection(
+        continuity,
+        consumer_health=health_payloads["kafka_consumer_health"],
+        consumer_health_path=consumer_path,
+        service_configs=service_configs,
+        now=observed_at,
+    )
+
+    outbox = health_payloads["outbox_dispatcher_health"]
+    outbox["runtime_identity"] = {
+        **identities["outbox_dispatcher_health"],
+        "loaded_runtime_sha256": "9" * 64,
+    }
+    outbox_path = Path(
+        service_configs[capsules._RESIDENT_LABELS["outbox_dispatcher_health"]][
+            "health_path"
+        ]
+    )
+    outbox_path.write_text(json.dumps(outbox, sort_keys=True) + "\n", encoding="utf-8")
+    outbox_path.chmod(0o600)
+    with pytest.raises(capsules.CapsuleError, match="loaded_runtime_changed"):
+        capsules._recheck_live_resident_projection(
+            continuity,
+            consumer_health=health_payloads["kafka_consumer_health"],
+            consumer_health_path=consumer_path,
+            service_configs=service_configs,
+            now=observed_at,
         )
