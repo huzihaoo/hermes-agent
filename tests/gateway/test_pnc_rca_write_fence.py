@@ -263,6 +263,13 @@ def test_w13_shaped_claim_cannot_change_authoritative_issue_target():
     )
 
     class Store:
+        def validate_learning_lane_external_operation(
+            self, *, business_key, generation, operation
+        ):
+            assert business_key == "business-1"
+            assert generation == 1
+            assert operation == "feishu_issue_comment"
+
         def is_historical_external_write_effect(self, _created_at):
             return False
 
@@ -499,12 +506,21 @@ def test_dispatcher_grandfather_is_immutable_but_new_missing_fence_blocks():
         def __init__(self, historical):
             self.historical = historical
 
+        def validate_learning_lane_external_operation(
+            self, *, business_key, generation, operation
+        ):
+            assert business_key == "business-1"
+            assert generation == 1
+            assert operation == "feishu_issue_comment"
+
         def is_historical_external_write_effect(self, _created_at):
             return self.historical
 
     claim = SimpleNamespace(
         contract={},
         effect_created_at="2026-07-25T00:00:01+00:00",
+        business_key="business-1",
+        generation=1,
     )
     historical_dispatcher = DeliveryDispatcher.__new__(DeliveryDispatcher)
     historical_dispatcher.store = Store(True)
