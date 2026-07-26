@@ -26,11 +26,19 @@ from gateway.pnc_rca_conclusion_adjudication import (
     validate_conclusion_adjudication_artifact_receipt,
     validate_conclusion_adjudication_schema,
 )
+from gateway.pnc_rca_delivery_contract import RCA_RESULT_FIELD_KEY
 
 
 AUDIT_SCHEMA_VERSION = "pnc_rca_conclusion_adjudication_audit_v2"
 EXPECTED_DELIVERY_STORE_SCHEMA_VERSION = "pnc_rca_delivery_store_v9"
 MIN_GA_RECOGNITION_BATCH_SIZE = 5
+_SETTLED_READBACK_SOURCES = frozenset({
+    "read_before_write",
+    "recovery_read_before_write",
+    "field_repair_after_marker",
+    "read_after_write",
+    "read_after_recovery_write",
+})
 _UNRESOLVED_EFFECT_STATUSES = frozenset({
     "pending",
     "claimed",
@@ -97,77 +105,104 @@ def _scalar(
 
 
 def _strict_acceptance_evidence(conn: sqlite3.Connection) -> dict[str, Any]:
-    settled_readback = """
-        e.status = 'succeeded'
-        AND e.write_phase = 'settled'
-        AND e.adjudication_comment_attempt_count = 1
-        AND json_valid(e.remote_receipt_json)
-        AND trim(json_extract(e.remote_receipt_json, '$.remote_id')) != ''
-        AND trim(json_extract(e.remote_receipt_json, '$.marker')) != ''
-        AND length(
-            json_extract(e.remote_receipt_json, '$.confirmed_content_sha256')
-        ) = 64
-        AND trim(json_extract(e.remote_receipt_json, '$.source')) != ''
-        AND json_type(
-            e.remote_receipt_json, '$.confirmed_field_keys'
-        ) = 'array'
-        AND json_array_length(
-            json_extract(e.remote_receipt_json, '$.confirmed_field_keys')
-        ) >= 1
-        AND repair.status = 'succeeded'
-    """
-    recognition_rows = conn.execute(
-        f"""
-        SELECT a.actor_id, a.source_json, COUNT(*) AS item_count
-          FROM rca_conclusion_adjudications AS a
-          JOIN rca_delivery_effects AS e
-            ON e.effect_key = a.correction_effect_key
-          JOIN rca_conclusion_adjudication_repairs AS repair
-            ON repair.adjudication_id = a.adjudication_id
-         WHERE a.action = 'recognize'
-           AND a.conclusion_state = 'recognized'
-           AND substr(a.actor_id, 1, 3) = 'ou_'
-           AND json_valid(a.source_json)
-           AND json_extract(a.source_json, '$.platform') = 'feishu'
-           AND trim(json_extract(a.source_json, '$.chat_id')) != ''
-           AND trim(json_extract(a.source_json, '$.thread_id')) != ''
-           AND trim(json_extract(a.source_json, '$.message_id')) != ''
-           AND {settled_readback}
-      GROUP BY a.actor_id, a.source_json
-      ORDER BY item_count DESC, a.actor_id, a.source_json
+    rows = conn.execute(
         """
-    ).fetchall()
-    largest_batch = max((int(row["item_count"]) for row in recognition_rows), default=0)
-    qualifying_batches = sum(
-        int(row["item_count"]) >= MIN_GA_RECOGNITION_BATCH_SIZE
-        for row in recognition_rows
-    )
-    qualifying_items = sum(
-        int(row["item_count"])
-        for row in recognition_rows
-        if int(row["item_count"]) >= MIN_GA_RECOGNITION_BATCH_SIZE
-    )
-    retraction_rows = conn.execute(
-        f"""
-        SELECT a.adjudication_id
+        SELECT a.adjudication_id, a.actor_id, a.source_json, a.action,
+               a.conclusion_state, e.status AS effect_status,
+               e.write_phase, e.adjudication_comment_attempt_count,
+               e.payload_json, e.remote_receipt_json,
+               repair.status AS repair_status
           FROM rca_conclusion_adjudications AS a
           JOIN rca_delivery_effects AS e
             ON e.effect_key = a.correction_effect_key
           JOIN rca_conclusion_adjudication_repairs AS repair
             ON repair.adjudication_id = a.adjudication_id
-         WHERE a.action = 'retract'
-           AND a.conclusion_state = 'invalidated'
-           AND {settled_readback}
       ORDER BY a.adjudication_id
         """
     ).fetchall()
+
+    def object_json(raw: Any) -> dict[str, Any] | None:
+        try:
+            value = json.loads(str(raw or ""))
+        except (TypeError, ValueError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    def settled_readback(row: sqlite3.Row) -> bool:
+        if (
+            row["effect_status"] != "succeeded"
+            or row["write_phase"] != "settled"
+            or int(row["adjudication_comment_attempt_count"] or 0) != 1
+            or row["repair_status"] != "succeeded"
+        ):
+            return False
+        payload = object_json(row["payload_json"])
+        receipt = object_json(row["remote_receipt_json"])
+        if payload is None or receipt is None:
+            return False
+        content = payload.get("comment_content")
+        marker = payload.get("marker")
+        if not isinstance(content, str) or not isinstance(marker, str) or not marker:
+            return False
+        return (
+            isinstance(receipt.get("remote_id"), str)
+            and bool(receipt["remote_id"].strip())
+            and receipt.get("marker") == marker
+            and receipt.get("source") in _SETTLED_READBACK_SOURCES
+            and receipt.get("confirmed_field_keys") == [RCA_RESULT_FIELD_KEY]
+            and receipt.get("confirmed_content_sha256")
+            == hashlib.sha256(content.encode("utf-8")).hexdigest()
+        )
+
+    def source_identity(row: sqlite3.Row) -> tuple[str, str] | None:
+        actor_id = str(row["actor_id"] or "")
+        source_raw = str(row["source_json"] or "")
+        source = object_json(source_raw)
+        if (
+            not actor_id.startswith("ou_")
+            or source is None
+            or source.get("platform") != "feishu"
+            or any(
+                not isinstance(source.get(key), str) or not str(source[key]).strip()
+                for key in ("chat_id", "thread_id", "message_id")
+            )
+        ):
+            return None
+        return actor_id, source_raw
+
+    recognition_groups: dict[tuple[str, str], int] = {}
+    settled_retractions = 0
+    settled_readbacks = 0
+    for row in rows:
+        if not settled_readback(row):
+            continue
+        settled_readbacks += 1
+        if row["action"] == "recognize" and row["conclusion_state"] == "recognized":
+            identity = source_identity(row)
+            if identity is not None:
+                recognition_groups[identity] = recognition_groups.get(identity, 0) + 1
+        elif row["action"] == "retract" and row["conclusion_state"] == "invalidated":
+            settled_retractions += 1
+
+    recognition_counts = list(recognition_groups.values())
+    largest_batch = max(recognition_counts, default=0)
+    qualifying_batches = sum(
+        item_count >= MIN_GA_RECOGNITION_BATCH_SIZE for item_count in recognition_counts
+    )
+    qualifying_items = sum(
+        item_count
+        for item_count in recognition_counts
+        if item_count >= MIN_GA_RECOGNITION_BATCH_SIZE
+    )
     return {
         "minimum_recognition_batch_size": MIN_GA_RECOGNITION_BATCH_SIZE,
-        "eligible_recognition_source_groups": len(recognition_rows),
+        "candidate_adjudications": len(rows),
+        "settled_readback_adjudications": settled_readbacks,
+        "eligible_recognition_source_groups": len(recognition_groups),
         "qualifying_recognition_batches": qualifying_batches,
         "qualifying_recognition_items": qualifying_items,
         "largest_recognition_batch_size": largest_batch,
-        "settled_retract_correction_readbacks": len(retraction_rows),
+        "settled_retract_correction_readbacks": settled_retractions,
     }
 
 
