@@ -365,6 +365,7 @@ def test_supported_tier_requires_golden_and_does_not_request_human_review(
                 "aeb_trigger": {
                     "evaluator_id": "aeb_trigger",
                     "status": "passed",
+                    "source_kind": "owner_confirmed_case",
                     "evaluator_source_sha256": "c" * 64,
                     "positive_golden_sha256": "a" * 64,
                     "negative_golden_sha256": "b" * 64,

@@ -48,6 +48,25 @@ _GOLDEN_HASH_FIELDS = (
     "negative_golden_sha256",
     "test_receipt_sha256",
 )
+_GOLDEN_SOURCE_KIND_FIELD = "source_kind"
+_OWNER_GOLDEN_SOURCE_KINDS = frozenset({
+    "owner_confirmed",
+    "owner_confirmed_case",
+    "owner_confirmed_fixture",
+    "owner_confirmed_production_case",
+    "owner_grounded",
+    "owner_approved_fixture",
+})
+_MACHINE_GOLDEN_SOURCE_KINDS = frozenset({
+    "machine",
+    "machine_observation",
+    "live_machine_observation",
+    "runtime_observation",
+    "observed",
+    "synthetic",
+    "unit_fixture",
+    "decoded_observation",
+})
 
 _NON_ATTRIBUTION_MARKERS = (
     "自动RCA未归因",
@@ -206,6 +225,31 @@ def _string(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+def _normalize_golden_source_kind(value: Any) -> str:
+    return _string(value).lower().replace("-", "_").replace(" ", "_")
+
+
+def _golden_source_validation(item: Mapping[str, Any]) -> tuple[bool, str]:
+    """Require an owner-grounded source before an entry can unlock high tier."""
+
+    provenance = _mapping(item.get("provenance"))
+    raw_kind = item.get(_GOLDEN_SOURCE_KIND_FIELD)
+    if raw_kind in (None, ""):
+        raw_kind = item.get("golden_source_kind")
+    if raw_kind in (None, ""):
+        raw_kind = provenance.get("kind")
+    kind = _normalize_golden_source_kind(raw_kind)
+    if not kind:
+        return False, "golden_source_kind_missing"
+    if kind in _MACHINE_GOLDEN_SOURCE_KINDS or (
+        "machine" in kind and "observation" in kind
+    ):
+        return False, "golden_source_kind_machine_observation"
+    if kind not in _OWNER_GOLDEN_SOURCE_KINDS:
+        return False, "golden_source_kind_unqualified"
+    return True, ""
+
+
 def _append_values(target: list[Any], value: Any) -> None:
     if isinstance(value, (list, tuple)):
         target.extend(value)
@@ -344,6 +388,11 @@ def _empty_golden_registry_status(*, present: bool, valid: bool = False) -> dict
         "invalid_evaluator_ids": (),
         "duplicate_evaluator_ids": (),
         "non_distinct_evaluator_ids": (),
+        "invalid_golden_source_ids": (),
+        "machine_observation_evaluator_ids": (),
+        "golden_scope_evaluator_ids": (),
+        "golden_scope_explicit": False,
+        "golden_scope_errors": (),
     }
 
 
@@ -432,6 +481,27 @@ def validate_golden_registry_inventory(
     }
 
 
+def _normalize_golden_scope_ids(value: Any) -> tuple[tuple[str, ...], bool, tuple[str, ...]]:
+    """Normalize the explicit high-confidence scope; an empty scope is valid."""
+
+    if not isinstance(value, (list, tuple)):
+        return (), False, ("golden_scope_evaluator_ids_not_list",)
+    normalized: list[str] = []
+    seen: set[str] = set()
+    errors: list[str] = []
+    for item in value:
+        evaluator_id = _string(item)
+        if _EVALUATOR_ID_RE.fullmatch(evaluator_id) is None:
+            errors.append("golden_scope_evaluator_id_invalid")
+            continue
+        if evaluator_id in seen:
+            errors.append("golden_scope_evaluator_ids_duplicate")
+            continue
+        seen.add(evaluator_id)
+        normalized.append(evaluator_id)
+    return tuple(sorted(normalized)), not errors, tuple(sorted(set(errors)))
+
+
 def release_golden_registry_status(
     path: Path = GOLDEN_REGISTRY_PATH,
     *,
@@ -469,6 +539,8 @@ def release_golden_registry_status(
     invalid_ids: list[str] = []
     duplicate_ids: list[str] = []
     non_distinct_ids: list[str] = []
+    source_invalid_ids: list[str] = []
+    machine_observation_ids: list[str] = []
     for item in entries if isinstance(entries, list) else ():
         if not isinstance(item, Mapping):
             valid = False
@@ -486,6 +558,11 @@ def release_golden_registry_status(
         hashes_distinct = hashes_valid and len(set(hashes)) == len(hashes)
         if hashes_valid and not hashes_distinct:
             non_distinct_ids.append(evaluator_id)
+        source_valid, source_error = _golden_source_validation(item)
+        if not source_valid:
+            source_invalid_ids.append(evaluator_id)
+            if source_error == "golden_source_kind_machine_observation":
+                machine_observation_ids.append(evaluator_id)
         if (
             _EVALUATOR_ID_RE.fullmatch(evaluator_id) is None
             or evaluator_id in covered
@@ -495,11 +572,27 @@ def release_golden_registry_status(
             or _SHA256_RE.fullmatch(negative) is None
             or _SHA256_RE.fullmatch(receipt) is None
             or not hashes_distinct
+            or not source_valid
         ):
             valid = False
             continue
         covered.add(evaluator_id)
         normalized[evaluator_id] = dict(item)
+    scope_present = "golden_scope_evaluator_ids" in payload
+    scope_raw = payload.get("golden_scope_evaluator_ids")
+    if scope_present:
+        golden_scope, scope_valid, scope_errors = _normalize_golden_scope_ids(scope_raw)
+        if set(golden_scope) != covered:
+            scope_errors = tuple(sorted({*scope_errors, "golden_scope_evaluator_set_mismatch"}))
+            scope_valid = False
+        if not scope_valid:
+            valid = False
+    else:
+        # The entry list is itself an explicit scope for v1 registries that do
+        # not carry the optional declaration. No active-inventory coverage is
+        # inferred from this fallback.
+        golden_scope = tuple(sorted(covered))
+        scope_errors = ()
     payload_required_present = "required_evaluator_ids" in payload
     payload_required = payload.get("required_evaluator_ids")
     payload_binding = validate_golden_registry_inventory(
@@ -554,6 +647,13 @@ def release_golden_registry_status(
         "invalid_evaluator_ids": tuple(sorted(set(invalid_ids))),
         "duplicate_evaluator_ids": tuple(sorted(set(duplicate_ids))),
         "non_distinct_evaluator_ids": tuple(sorted(set(non_distinct_ids))),
+        "invalid_golden_source_ids": tuple(sorted(set(source_invalid_ids))),
+        "machine_observation_evaluator_ids": tuple(
+            sorted(set(machine_observation_ids))
+        ),
+        "golden_scope_evaluator_ids": golden_scope,
+        "golden_scope_explicit": scope_present,
+        "golden_scope_errors": tuple(scope_errors),
     }
 
 

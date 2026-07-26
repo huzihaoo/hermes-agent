@@ -30,6 +30,7 @@ def _release_registry(evaluator_id: str = "lane_geometry_quality") -> dict:
             evaluator_id: {
                 "evaluator_id": evaluator_id,
                 "status": "passed",
+                "source_kind": "owner_confirmed_case",
                 "evaluator_source_sha256": "c" * 64,
                 "positive_golden_sha256": "a" * 64,
                 "negative_golden_sha256": "b" * 64,
@@ -69,6 +70,7 @@ def _golden_entry(evaluator_id: str, *, hash_char: str = "a") -> dict:
     return {
         "evaluator_id": evaluator_id,
         "status": "passed",
+        "source_kind": "owner_confirmed_case",
         "evaluator_source_sha256": hashes[0] * 64,
         "positive_golden_sha256": hashes[1] * 64,
         "negative_golden_sha256": hashes[2] * 64,
@@ -218,6 +220,39 @@ def test_registry_rejects_non_distinct_controlled_evaluator_hashes(tmp_path):
 
     assert status["valid"] is False
     assert status["non_distinct_evaluator_ids"] == ("lane_geometry_quality",)
+
+
+@pytest.mark.parametrize("source_kind", ["machine_observation", "synthetic"])
+def test_registry_rejects_machine_or_synthetic_observations_as_goldens(
+    tmp_path, source_kind
+):
+    entry = _golden_entry("lane_geometry_quality")
+    entry["source_kind"] = source_kind
+    path = tmp_path / "registry.json"
+    path.write_text(json.dumps(_registry_payload(entry)), encoding="utf-8")
+
+    status = oracle_module.release_golden_registry_status(path)
+
+    assert status["valid"] is False
+    assert status["evaluators"] == {}
+    assert status["invalid_golden_source_ids"] == ("lane_geometry_quality",)
+    if source_kind == "machine_observation":
+        assert status["machine_observation_evaluator_ids"] == (
+            "lane_geometry_quality",
+        )
+
+
+def test_registry_requires_owner_grounded_source_for_high_scope(tmp_path):
+    entry = _golden_entry("lane_geometry_quality")
+    entry.pop("source_kind")
+    path = tmp_path / "registry.json"
+    path.write_text(json.dumps(_registry_payload(entry)), encoding="utf-8")
+
+    status = oracle_module.release_golden_registry_status(path)
+
+    assert status["valid"] is False
+    assert status["evaluators"] == {}
+    assert status["invalid_golden_source_ids"] == ("lane_geometry_quality",)
 
 
 def _contract(
@@ -381,6 +416,20 @@ def test_missing_release_controlled_evaluator_goldens_prevents_high_tier():
     result = evaluate_structural_tier(contract)
 
     assert result.terminal_class == CANDIDATE_HYPOTHESIS
+    assert result.facts.golden_coverage_complete is False
+
+
+def test_evaluator_outside_golden_scope_never_reaches_high_tier(monkeypatch):
+    monkeypatch.setattr(
+        oracle_module,
+        "release_golden_registry_status",
+        lambda: _release_registry("acc_decel_heavy"),
+    )
+
+    result = evaluate_structural_tier(_contract())
+
+    assert result.terminal_class == CANDIDATE_HYPOTHESIS
+    assert result.confidence_tier == "medium"
     assert result.facts.golden_coverage_complete is False
 
 

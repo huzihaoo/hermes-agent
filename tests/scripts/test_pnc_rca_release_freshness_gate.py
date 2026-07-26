@@ -473,6 +473,7 @@ def test_release_golden_registry_must_be_green_and_pipeline_bound(tmp_path: Path
             "acc_decel_heavy": {
                 "status": "passed",
                 "evaluator_id": "acc_decel_heavy",
+                "source_kind": "owner_confirmed_case",
             }
         },
     }
@@ -486,15 +487,18 @@ def test_release_golden_registry_must_be_green_and_pipeline_bound(tmp_path: Path
     assert evidence["active_pipeline_commit"] == commit
 
     empty = {**base, "evaluators": {}}
-    _evidence, errors = gate.audit_release_golden_registry(
+    evidence, errors = gate.audit_release_golden_registry(
         hermes_home=hermes_home,
         registry=empty,
         required_evaluator_ids=required,
     )
-    assert {item["code"] for item in errors} == {
-        "pnc_release_golden_evaluator_set_empty",
-        "pnc_release_golden_required_evaluator_missing",
-    }
+    assert errors == []
+    assert evidence["inventory_binding_valid"] is True
+    assert evidence["golden_scope_evaluator_ids"] == []
+    assert evidence["uncovered_evaluator_ids"] == required
+    assert evidence["high_confidence_ready"] is False
+    assert evidence["safe_downgrade"] is True
+    assert evidence["safe_downgrade_reason"] == "no_genuine_high_scope"
 
     failing = {**base, "low_tier_golden_ready": False}
     _evidence, errors = gate.audit_release_golden_registry(
@@ -539,6 +543,7 @@ def test_release_golden_registry_binds_explicit_active_inventory(tmp_path: Path)
             "lane_geometry_quality": {
                 "status": "passed",
                 "evaluator_id": "lane_geometry_quality",
+                "source_kind": "owner_confirmed_case",
             }
         },
     }
@@ -549,11 +554,15 @@ def test_release_golden_registry_binds_explicit_active_inventory(tmp_path: Path)
         required_evaluator_ids=["lane_geometry_quality", "new_evaluator"],
     )
 
-    assert evidence["missing_required_evaluator_ids"] == ["new_evaluator"]
-    assert evidence["inventory_binding_valid"] is False
-    assert {item["code"] for item in errors} == {
-        "pnc_release_golden_required_evaluator_missing"
-    }
+    assert errors == []
+    assert evidence["required_evaluator_ids"] == [
+        "lane_geometry_quality",
+        "new_evaluator",
+    ]
+    assert evidence["golden_scope_evaluator_ids"] == ["lane_geometry_quality"]
+    assert evidence["uncovered_evaluator_ids"] == ["new_evaluator"]
+    assert evidence["inventory_binding_valid"] is True
+    assert evidence["high_confidence_ready"] is True
 
     unexpected = {
         **registry,
@@ -562,6 +571,7 @@ def test_release_golden_registry_binds_explicit_active_inventory(tmp_path: Path)
             "legacy_alias": {
                 "status": "passed",
                 "evaluator_id": "legacy_alias",
+                "source_kind": "owner_confirmed_case",
             },
         },
     }
@@ -573,6 +583,88 @@ def test_release_golden_registry_binds_explicit_active_inventory(tmp_path: Path)
     assert evidence["unexpected_evaluator_ids"] == ["legacy_alias"]
     assert {item["code"] for item in errors} == {
         "pnc_release_golden_evaluator_inventory_unexpected"
+    }
+
+
+def test_release_golden_registry_requires_exact_declared_high_scope(tmp_path: Path):
+    hermes_home = tmp_path / ".hermes"
+    runtime = hermes_home / "runtime"
+    runtime.mkdir(parents=True)
+    commit = "a" * 40
+    tree = "b" * 40
+    (runtime / "LIVE_MANIFEST.json").write_text(
+        json.dumps({
+            "face_git_bindings": {"g1q3_rca_pipeline": {"commit": commit, "tree": tree}}
+        }),
+        encoding="utf-8",
+    )
+    registry = {
+        "present": True,
+        "valid": True,
+        "low_tier_golden_ready": True,
+        "pipeline_commit": commit,
+        "pipeline_tree": tree,
+        "golden_scope_explicit": True,
+        "golden_scope_evaluator_ids": ["lane_geometry_quality", "acc_decel_heavy"],
+        "evaluators": {
+            "lane_geometry_quality": {
+                "status": "passed",
+                "evaluator_id": "lane_geometry_quality",
+                "source_kind": "owner_confirmed_case",
+            }
+        },
+    }
+
+    evidence, errors = gate.audit_release_golden_registry(
+        hermes_home=hermes_home,
+        registry=registry,
+        required_evaluator_ids=["lane_geometry_quality", "acc_decel_heavy"],
+    )
+
+    assert evidence["golden_scope_exact"] is False
+    assert {item["code"] for item in errors} == {
+        "pnc_release_golden_high_scope_invalid"
+    }
+
+
+def test_release_golden_registry_rejects_machine_observation_as_golden(
+    tmp_path: Path,
+):
+    hermes_home = tmp_path / ".hermes"
+    runtime = hermes_home / "runtime"
+    runtime.mkdir(parents=True)
+    commit = "a" * 40
+    tree = "b" * 40
+    (runtime / "LIVE_MANIFEST.json").write_text(
+        json.dumps({
+            "face_git_bindings": {"g1q3_rca_pipeline": {"commit": commit, "tree": tree}}
+        }),
+        encoding="utf-8",
+    )
+    registry = {
+        "present": True,
+        "valid": True,
+        "low_tier_golden_ready": True,
+        "pipeline_commit": commit,
+        "pipeline_tree": tree,
+        "evaluators": {
+            "lane_geometry_quality": {
+                "status": "passed",
+                "evaluator_id": "lane_geometry_quality",
+                "source_kind": "machine_observation",
+            }
+        },
+    }
+
+    evidence, errors = gate.audit_release_golden_registry(
+        hermes_home=hermes_home,
+        registry=registry,
+        required_evaluator_ids=["lane_geometry_quality"],
+    )
+
+    assert evidence["high_confidence_ready"] is False
+    assert {item["code"] for item in errors} == {
+        "pnc_release_golden_machine_observation_not_golden"
     }
 
 
