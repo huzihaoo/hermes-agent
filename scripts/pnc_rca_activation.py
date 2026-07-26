@@ -31,6 +31,7 @@ from gateway import pnc_rca_capacity_runtime as capacity_runtime
 from gateway import pnc_rca_capacity_sample_evidence as capacity_evidence
 from gateway import pnc_rca_capacity_transition as capacity_transition
 from gateway import pnc_rca_prod_bootstrap as prod_bootstrap
+from scripts import pnc_rca_activation_capsule as activation_capsule
 
 
 ACTIVATION_CLI_SCHEMA_VERSION = "pnc_rca_activation_cli_v1"
@@ -264,9 +265,7 @@ def _read_preauthorization_capsule(
     control_db_path: Path,
 ) -> Mapping[str, Any]:
     try:
-        from scripts import pnc_rca_release_gate as release_gate
-
-        return release_gate.read_activation_preauthorization_capsule(
+        return activation_capsule.read_preauthorization_capsule(
             capsule_path,
             control_db_path=control_db_path,
         )
@@ -372,9 +371,7 @@ def _read_preproduction_capsule(
     current_activation: Mapping[str, Any],
 ) -> Mapping[str, Any]:
     try:
-        from scripts import pnc_rca_release_gate as release_gate
-
-        return release_gate.read_activation_preproduction_capsule(
+        return activation_capsule.read_preproduction_capsule(
             capsule_path,
             control_db_path=control_db_path,
             current_activation=current_activation,
@@ -449,15 +446,16 @@ def _canonical_preproduction_transition(
 def _live_release_binding(
     control_db_path: Path,
     *,
+    epoch_id: str,
     expected_config_sha256: str,
+    partition_end_fence: Mapping[str, Any],
 ) -> dict[str, Any]:
     try:
-        from scripts import pnc_rca_release_gate as release_gate
-
-        return release_gate._check_activation_epoch(
-            control_db_path=control_db_path,
-            mode="production",
+        return activation_capsule.live_release_binding(
+            control_db_path,
+            epoch_id=epoch_id,
             expected_config_sha256=expected_config_sha256,
+            partition_end_fence=partition_end_fence,
         )
     except Exception as exc:
         raise ActivationCliError(
@@ -465,7 +463,9 @@ def _live_release_binding(
         ) from exc
 
 
-def _confirmation_capsule_scope(capsule_path: Path) -> tuple[Path, str, str]:
+def _confirmation_capsule_scope(
+    capsule_path: Path,
+) -> tuple[Path, str, str, dict[str, dict[str, int]]]:
     capsule, _capsule_raw = _read_json_document(
         capsule_path,
         "confirmation_capsule",
@@ -487,7 +487,13 @@ def _confirmation_capsule_scope(capsule_path: Path) -> tuple[Path, str, str]:
     config_sha256 = _normalized_sha256(
         str(transition.get("config_sha256") or ""), "config_sha256"
     )
-    return receipt_path, epoch_id, config_sha256
+    raw_end_fence = transition.get("partition_end_fence")
+    if not isinstance(raw_end_fence, Mapping):
+        raise ActivationCliError("activation_confirmation_capsule_scope_invalid")
+    partition_end_fence = _normalize_fence(
+        raw_end_fence, "confirmation_partition_end_fence"
+    )
+    return receipt_path, epoch_id, config_sha256, partition_end_fence
 
 
 def _normalize_confirmation_transition(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -556,14 +562,14 @@ def _canonical_confirmation_transition(
     *,
     capsule_path: Path,
     receipt_path: Path,
+    control_db_path: Path,
     current_activation: Mapping[str, Any],
 ) -> dict[str, Any]:
     try:
-        from scripts import pnc_rca_release_gate as release_gate
-
-        transition = release_gate.read_activation_confirmation_capsule(
+        transition = activation_capsule.read_confirmation_capsule(
             capsule_path,
             receipt_path=receipt_path,
+            control_db_path=control_db_path,
             current_activation=current_activation,
         )
     except Exception as exc:
@@ -1744,8 +1750,8 @@ def _transition_steady(
 
 def _confirm(store: RcaControlStore, args: argparse.Namespace) -> dict[str, Any]:
     operator, reason = _normalized_audit(args.operator, args.reason)
-    receipt_path, epoch_id, config_sha256 = _confirmation_capsule_scope(
-        args.confirmation_capsule
+    receipt_path, epoch_id, config_sha256, partition_end_fence = (
+        _confirmation_capsule_scope(args.confirmation_capsule)
     )
     current = _current_epoch(
         store, epoch_id, frozenset({"bounded_active", "confirmed"})
@@ -1756,11 +1762,14 @@ def _confirm(store: RcaControlStore, args: argparse.Namespace) -> dict[str, Any]
     if current["state"] == "bounded_active":
         validation_activation = _live_release_binding(
             args.control_db,
+            epoch_id=epoch_id,
             expected_config_sha256=config_sha256,
+            partition_end_fence=partition_end_fence,
         )
     transition = _canonical_confirmation_transition(
         capsule_path=args.confirmation_capsule,
         receipt_path=receipt_path,
+        control_db_path=args.control_db,
         current_activation=validation_activation,
     )
     for field in (
