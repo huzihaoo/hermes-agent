@@ -13,7 +13,7 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 import psutil
 
@@ -28,7 +28,10 @@ from scripts.pnc_live_exec import (
     LiveExecError,
     resolve_active_runtime,
 )
-from gateway.pnc_rca_quality_oracle import release_golden_registry_status
+from gateway.pnc_rca_quality_oracle import (
+    release_golden_registry_status,
+    validate_golden_registry_inventory,
+)
 from gateway.pnc_rca_conclusion_adjudication import (
     ADJUDICATION_EFFECT_SCHEMA_VERSION,
 )
@@ -478,9 +481,21 @@ def audit_stable_targets(
 
 
 def audit_release_golden_registry(
-    *, hermes_home: Path, registry: Mapping[str, Any] | None = None
+    *,
+    hermes_home: Path,
+    registry: Mapping[str, Any] | None = None,
+    required_evaluator_ids: Sequence[str] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    observed = dict(registry or release_golden_registry_status())
+    if registry is not None:
+        observed = dict(registry)
+    elif required_evaluator_ids is None:
+        observed = dict(release_golden_registry_status())
+    else:
+        observed = dict(
+            release_golden_registry_status(
+                required_evaluator_ids=required_evaluator_ids
+            )
+        )
     errors: list[dict[str, Any]] = []
     if observed.get("valid") is not True:
         errors.append(_error("pnc_release_golden_registry_invalid"))
@@ -489,6 +504,95 @@ def audit_release_golden_registry(
     evaluator_entries = observed.get("evaluators")
     if not isinstance(evaluator_entries, Mapping) or not evaluator_entries:
         errors.append(_error("pnc_release_golden_evaluator_set_empty"))
+
+    # A registry may remain deliberately low-tier-only while the active
+    # inventory is unknown. Once an explicit inventory is supplied (in the
+    # registry or by the caller), enforce an exact, non-empty binding so a new
+    # evaluator cannot quietly ship without its four controlled hashes.
+    observed_required_present = bool(observed.get("required_evaluator_ids_present"))
+    if "required_evaluator_ids_present" not in observed:
+        observed_required_present = "required_evaluator_ids" in observed
+    observed_required = observed.get("required_evaluator_ids")
+    if required_evaluator_ids is not None:
+        binding = validate_golden_registry_inventory(
+            required_evaluator_ids,
+            tuple(evaluator_entries) if isinstance(evaluator_entries, Mapping) else (),
+            present=True,
+        )
+        if observed_required_present:
+            observed_binding = validate_golden_registry_inventory(
+                observed_required,
+                tuple(evaluator_entries)
+                if isinstance(evaluator_entries, Mapping)
+                else (),
+                present=True,
+            )
+            if tuple(observed_binding["required_evaluator_ids"]) != tuple(
+                binding["required_evaluator_ids"]
+            ):
+                errors.append(
+                    _error("pnc_release_golden_required_evaluator_ids_binding_mismatch")
+                )
+    elif observed_required_present:
+        binding = validate_golden_registry_inventory(
+            observed_required,
+            tuple(evaluator_entries) if isinstance(evaluator_entries, Mapping) else (),
+            present=True,
+        )
+    else:
+        binding = validate_golden_registry_inventory(
+            None,
+            tuple(evaluator_entries) if isinstance(evaluator_entries, Mapping) else (),
+            present=False,
+        )
+    if not binding["valid"]:
+        for code in binding["errors"]:
+            if code in {
+                "required_evaluator_ids_not_list",
+                "required_evaluator_ids_empty",
+                "required_evaluator_id_invalid",
+                "required_evaluator_ids_duplicate",
+                "required_evaluator_ids_binding_mismatch",
+            }:
+                errors.append(_error("pnc_release_golden_required_evaluator_ids_invalid"))
+            elif code == "required_evaluator_missing":
+                errors.append(
+                    _error(
+                        "pnc_release_golden_required_evaluator_missing",
+                        evaluator_ids=list(binding["missing_required_evaluator_ids"]),
+                    )
+                )
+            elif code == "evaluator_inventory_unexpected":
+                errors.append(
+                    _error(
+                        "pnc_release_golden_evaluator_inventory_unexpected",
+                        evaluator_ids=list(binding["unexpected_evaluator_ids"]),
+                    )
+                )
+    invalid_ids = observed.get("invalid_evaluator_ids")
+    if isinstance(invalid_ids, (list, tuple)) and invalid_ids:
+        errors.append(
+            _error(
+                "pnc_release_golden_evaluator_id_invalid",
+                evaluator_ids=list(invalid_ids),
+            )
+        )
+    duplicate_ids = observed.get("duplicate_evaluator_ids")
+    if isinstance(duplicate_ids, (list, tuple)) and duplicate_ids:
+        errors.append(
+            _error(
+                "pnc_release_golden_evaluator_id_duplicate",
+                evaluator_ids=list(duplicate_ids),
+            )
+        )
+    non_distinct_ids = observed.get("non_distinct_evaluator_ids")
+    if isinstance(non_distinct_ids, (list, tuple)) and non_distinct_ids:
+        errors.append(
+            _error(
+                "pnc_release_golden_evaluator_hashes_not_distinct",
+                evaluator_ids=list(non_distinct_ids),
+            )
+        )
     manifest_path = hermes_home / "runtime" / "LIVE_MANIFEST.json"
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -519,6 +623,14 @@ def audit_release_golden_registry(
         "manifest_path": str(manifest_path),
         "active_pipeline_commit": active_commit,
         "active_pipeline_tree": active_tree,
+        "required_evaluator_ids": list(binding["required_evaluator_ids"]),
+        "required_evaluator_ids_present": binding["present"],
+        "inventory_binding_valid": bool(binding["present"] and binding["valid"]),
+        "missing_required_evaluator_ids": list(
+            binding["missing_required_evaluator_ids"]
+        ),
+        "unexpected_evaluator_ids": list(binding["unexpected_evaluator_ids"]),
+        "inventory_binding_errors": list(binding["errors"]),
         "errors": [item["code"] for item in errors],
     }
     return evidence, errors

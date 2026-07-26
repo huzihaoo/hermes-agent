@@ -42,6 +42,12 @@ GOLDEN_REGISTRY_PATH = (
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _GIT_OID_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _EVALUATOR_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$")
+_GOLDEN_HASH_FIELDS = (
+    "evaluator_source_sha256",
+    "positive_golden_sha256",
+    "negative_golden_sha256",
+    "test_receipt_sha256",
+)
 
 _NON_ATTRIBUTION_MARKERS = (
     "自动RCA未归因",
@@ -321,20 +327,127 @@ def _evidence_refs(contract: Mapping[str, Any]) -> tuple[str, ...]:
     return tuple(sorted(set(refs)))
 
 
+def _empty_golden_registry_status(*, present: bool, valid: bool = False) -> dict[str, Any]:
+    return {
+        "present": present,
+        "valid": valid,
+        "pipeline_commit": "",
+        "pipeline_tree": "",
+        "low_tier_golden_ready": False,
+        "evaluators": {},
+        "required_evaluator_ids": (),
+        "required_evaluator_ids_present": False,
+        "inventory_binding_valid": False,
+        "missing_required_evaluator_ids": (),
+        "unexpected_evaluator_ids": (),
+        "inventory_binding_errors": (),
+        "invalid_evaluator_ids": (),
+        "duplicate_evaluator_ids": (),
+        "non_distinct_evaluator_ids": (),
+    }
+
+
+def _normalize_required_evaluator_ids(
+    value: Any,
+    *,
+    present: bool,
+) -> tuple[tuple[str, ...], bool, tuple[str, ...]]:
+    """Normalize an optional active evaluator inventory binding.
+
+    A missing field means the registry is intentionally low-tier-only and does
+    not claim full evaluator coverage.  Once the field is present, an empty,
+    malformed, or duplicate list is invalid rather than silently becoming an
+    empty requirement.
+    """
+
+    if not present:
+        return (), True, ()
+    if not isinstance(value, (list, tuple)):
+        return (), False, ("required_evaluator_ids_not_list",)
+    if not value:
+        return (), False, ("required_evaluator_ids_empty",)
+    normalized: list[str] = []
+    seen: set[str] = set()
+    errors: list[str] = []
+    for item in value:
+        evaluator_id = _string(item)
+        if _EVALUATOR_ID_RE.fullmatch(evaluator_id) is None:
+            errors.append("required_evaluator_id_invalid")
+            continue
+        if evaluator_id in seen:
+            errors.append("required_evaluator_ids_duplicate")
+            continue
+        seen.add(evaluator_id)
+        normalized.append(evaluator_id)
+    return tuple(sorted(normalized)), not errors, tuple(sorted(set(errors)))
+
+
+def validate_golden_registry_inventory(
+    required_evaluator_ids: Any,
+    covered_evaluator_ids: Sequence[str],
+    *,
+    present: bool = True,
+) -> dict[str, Any]:
+    """Validate an explicit evaluator inventory against registry entries.
+
+    ``present=False`` is the compatibility path for a low-tier-only registry:
+    it reports no binding requirement and does not turn the empty evaluator
+    set into a false claim of full coverage.
+    """
+
+    required, valid, format_errors = _normalize_required_evaluator_ids(
+        required_evaluator_ids,
+        present=present,
+    )
+    covered = tuple(sorted({
+        _string(value)
+        for value in covered_evaluator_ids
+        if _string(value)
+    }))
+    if not present:
+        return {
+            "present": False,
+            "valid": True,
+            "required_evaluator_ids": (),
+            "missing_required_evaluator_ids": (),
+            "unexpected_evaluator_ids": (),
+            "errors": (),
+        }
+    covered_set = set(covered)
+    required_set = set(required)
+    missing = tuple(sorted(required_set - covered_set))
+    unexpected = tuple(sorted(covered_set - required_set))
+    errors = list(format_errors)
+    if missing:
+        errors.append("required_evaluator_missing")
+    if unexpected:
+        errors.append("evaluator_inventory_unexpected")
+    return {
+        "present": True,
+        "valid": bool(valid and not missing and not unexpected),
+        "required_evaluator_ids": required,
+        "missing_required_evaluator_ids": missing,
+        "unexpected_evaluator_ids": unexpected,
+        "errors": tuple(sorted(set(errors))),
+    }
+
+
 def release_golden_registry_status(
     path: Path = GOLDEN_REGISTRY_PATH,
+    *,
+    required_evaluator_ids: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return {"present": False, "valid": False, "evaluators": {}}
+        return _empty_golden_registry_status(present=False)
     if not isinstance(payload, Mapping):
-        return {"present": True, "valid": False, "evaluators": {}}
+        return _empty_golden_registry_status(present=True)
     low = payload.get("low_tier_suite")
     entries = payload.get("evaluators")
     commit = _string(payload.get("pipeline_commit"))
     tree = _string(payload.get("pipeline_tree"))
-    valid = (
+    base_valid = (
         payload.get("schema_version") == GOLDEN_REGISTRY_SCHEMA_VERSION
         and _GIT_OID_RE.fullmatch(commit) is not None
         and _GIT_OID_RE.fullmatch(tree) is not None
@@ -349,17 +462,30 @@ def release_golden_registry_status(
         and _string(low.get("user_visible_path")).startswith("//hfs1.minieye.tech/")
         and isinstance(entries, list)
     )
+    entry_shape_valid = isinstance(entries, list)
+    valid = bool(base_valid)
     covered: set[str] = set()
     normalized: dict[str, dict[str, Any]] = {}
+    invalid_ids: list[str] = []
+    duplicate_ids: list[str] = []
+    non_distinct_ids: list[str] = []
     for item in entries if isinstance(entries, list) else ():
         if not isinstance(item, Mapping):
             valid = False
             continue
         evaluator_id = _string(item.get("evaluator_id"))
-        source = _string(item.get("evaluator_source_sha256"))
-        positive = _string(item.get("positive_golden_sha256"))
-        negative = _string(item.get("negative_golden_sha256"))
-        receipt = _string(item.get("test_receipt_sha256"))
+        source, positive, negative, receipt = tuple(
+            _string(item.get(field)) for field in _GOLDEN_HASH_FIELDS
+        )
+        if _EVALUATOR_ID_RE.fullmatch(evaluator_id) is None:
+            invalid_ids.append(evaluator_id)
+        elif evaluator_id in covered:
+            duplicate_ids.append(evaluator_id)
+        hashes = (source, positive, negative, receipt)
+        hashes_valid = all(_SHA256_RE.fullmatch(value) is not None for value in hashes)
+        hashes_distinct = hashes_valid and len(set(hashes)) == len(hashes)
+        if hashes_valid and not hashes_distinct:
+            non_distinct_ids.append(evaluator_id)
         if (
             _EVALUATOR_ID_RE.fullmatch(evaluator_id) is None
             or evaluator_id in covered
@@ -368,25 +494,66 @@ def release_golden_registry_status(
             or _SHA256_RE.fullmatch(positive) is None
             or _SHA256_RE.fullmatch(negative) is None
             or _SHA256_RE.fullmatch(receipt) is None
-            or positive == negative
+            or not hashes_distinct
         ):
             valid = False
             continue
         covered.add(evaluator_id)
         normalized[evaluator_id] = dict(item)
+    payload_required_present = "required_evaluator_ids" in payload
+    payload_required = payload.get("required_evaluator_ids")
+    payload_binding = validate_golden_registry_inventory(
+        payload_required,
+        tuple(sorted(covered)),
+        present=payload_required_present,
+    )
+    external_binding = validate_golden_registry_inventory(
+        required_evaluator_ids,
+        tuple(sorted(covered)),
+        present=required_evaluator_ids is not None,
+    )
+    binding_errors = set(payload_binding["errors"])
+    if required_evaluator_ids is not None:
+        binding_errors.update(external_binding["errors"])
+        if payload_required_present and (
+            tuple(payload_binding["required_evaluator_ids"])
+            != tuple(external_binding["required_evaluator_ids"])
+        ):
+            binding_errors.add("required_evaluator_ids_binding_mismatch")
+    effective_binding = external_binding if required_evaluator_ids is not None else payload_binding
+    if not entry_shape_valid or not valid or binding_errors:
+        valid = False
+    low_tier_ready = bool(
+        base_valid
+        and isinstance(low, Mapping)
+        and low.get("status") == "passed"
+        and int(low.get("positive_case_count", 0)) > 0
+        and int(low.get("negative_case_count", 0)) > 0
+    )
     return {
         "present": True,
         "valid": bool(valid),
         "pipeline_commit": commit,
         "pipeline_tree": tree,
-        "low_tier_golden_ready": bool(
-            valid
-            and isinstance(low, Mapping)
-            and low.get("status") == "passed"
-            and int(low.get("positive_case_count", 0)) > 0
-            and int(low.get("negative_case_count", 0)) > 0
-        ),
+        "low_tier_golden_ready": low_tier_ready,
         "evaluators": normalized,
+        "required_evaluator_ids": effective_binding["required_evaluator_ids"],
+        "required_evaluator_ids_present": bool(
+            payload_required_present or required_evaluator_ids is not None
+        ),
+        "inventory_binding_valid": bool(
+            (payload_required_present or required_evaluator_ids is not None)
+            and effective_binding["valid"]
+            and not binding_errors
+        ),
+        "missing_required_evaluator_ids": effective_binding[
+            "missing_required_evaluator_ids"
+        ],
+        "unexpected_evaluator_ids": effective_binding["unexpected_evaluator_ids"],
+        "inventory_binding_errors": tuple(sorted(binding_errors)),
+        "invalid_evaluator_ids": tuple(sorted(set(invalid_ids))),
+        "duplicate_evaluator_ids": tuple(sorted(set(duplicate_ids))),
+        "non_distinct_evaluator_ids": tuple(sorted(set(non_distinct_ids))),
     }
 
 

@@ -249,6 +249,49 @@ def test_release_golden_registry_must_be_green_and_pipeline_bound(tmp_path: Path
     }
 
 
+def test_release_golden_registry_binds_explicit_active_inventory(tmp_path: Path):
+    hermes_home = tmp_path / ".hermes"
+    runtime = hermes_home / "runtime"
+    runtime.mkdir(parents=True)
+    commit = "a" * 40
+    tree = "b" * 40
+    (runtime / "LIVE_MANIFEST.json").write_text(
+        json.dumps(
+            {
+                "face_git_bindings": {
+                    "g1q3_rca_pipeline": {"commit": commit, "tree": tree}
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    registry = {
+        "present": True,
+        "valid": True,
+        "low_tier_golden_ready": True,
+        "pipeline_commit": commit,
+        "pipeline_tree": tree,
+        "evaluators": {
+            "lane_geometry_quality": {
+                "status": "passed",
+                "evaluator_id": "lane_geometry_quality",
+            }
+        },
+    }
+
+    evidence, errors = gate.audit_release_golden_registry(
+        hermes_home=hermes_home,
+        registry=registry,
+        required_evaluator_ids=["lane_geometry_quality", "new_evaluator"],
+    )
+
+    assert evidence["missing_required_evaluator_ids"] == ["new_evaluator"]
+    assert evidence["inventory_binding_valid"] is False
+    assert {
+        item["code"] for item in errors
+    } == {"pnc_release_golden_required_evaluator_missing"}
+
+
 def test_stable_target_audit_resolves_every_hash_bound_target(tmp_path: Path):
     expected = {
         label

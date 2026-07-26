@@ -18,6 +18,9 @@ from gateway.pnc_rca_quality_oracle import (
 )
 
 
+_MISSING = object()
+
+
 def _release_registry(evaluator_id: str = "lane_geometry_quality") -> dict:
     return {
         "present": True,
@@ -33,6 +36,43 @@ def _release_registry(evaluator_id: str = "lane_geometry_quality") -> dict:
                 "test_receipt_sha256": "d" * 64,
             }
         },
+    }
+
+
+def _registry_payload(*entries: dict, required=_MISSING):
+    payload = {
+        "schema_version": "pnc_rca_release_golden_registry_v1",
+        "pipeline_commit": "a" * 40,
+        "pipeline_tree": "b" * 40,
+        "low_tier_suite": {
+            "status": "passed",
+            "positive_case_count": 1,
+            "negative_case_count": 1,
+            "receipt_sha256": "c" * 64,
+            "vm_path": "/mnt/tmp/w1/receipt.json",
+            "user_visible_path": "//hfs1.minieye.tech/share/w1/",
+        },
+        "evaluators": list(entries),
+    }
+    if required is not _MISSING:
+        payload["required_evaluator_ids"] = required
+    return payload
+
+
+def _golden_entry(evaluator_id: str, *, hash_char: str = "a") -> dict:
+    hashes = [
+        hash_char,
+        chr(ord(hash_char) + 1),
+        chr(ord(hash_char) + 2),
+        chr(ord(hash_char) + 3),
+    ]
+    return {
+        "evaluator_id": evaluator_id,
+        "status": "passed",
+        "evaluator_source_sha256": hashes[0] * 64,
+        "positive_golden_sha256": hashes[1] * 64,
+        "negative_golden_sha256": hashes[2] * 64,
+        "test_receipt_sha256": hashes[3] * 64,
     }
 
 
@@ -92,6 +132,92 @@ def test_release_registry_rejects_malformed_git_object_id(tmp_path):
     )
 
     assert oracle_module.release_golden_registry_status(path)["valid"] is False
+
+
+def test_low_tier_only_registry_does_not_claim_full_inventory_coverage(tmp_path):
+    path = tmp_path / "registry.json"
+    path.write_text(json.dumps(_registry_payload()), encoding="utf-8")
+
+    status = oracle_module.release_golden_registry_status(path)
+
+    assert status["valid"] is True
+    assert status["low_tier_golden_ready"] is True
+    assert status["evaluators"] == {}
+    assert status["required_evaluator_ids_present"] is False
+    assert status["inventory_binding_valid"] is False
+
+
+def test_explicit_inventory_rejects_missing_active_evaluator(tmp_path):
+    path = tmp_path / "registry.json"
+    path.write_text(
+        json.dumps(_registry_payload(_golden_entry("lane_geometry_quality"))),
+        encoding="utf-8",
+    )
+
+    status = oracle_module.release_golden_registry_status(
+        path,
+        required_evaluator_ids=["lane_geometry_quality", "new_evaluator"],
+    )
+
+    assert status["valid"] is False
+    assert status["low_tier_golden_ready"] is True
+    assert status["missing_required_evaluator_ids"] == ("new_evaluator",)
+    assert "required_evaluator_missing" in status["inventory_binding_errors"]
+
+
+@pytest.mark.parametrize(
+    "required, expected_error",
+    [
+        ([], "required_evaluator_ids_empty"),
+        (["lane_geometry_quality", "lane_geometry_quality"], "required_evaluator_ids_duplicate"),
+        ([""], "required_evaluator_id_invalid"),
+    ],
+)
+def test_explicit_inventory_rejects_empty_or_duplicate_ids(
+    tmp_path, required, expected_error
+):
+    path = tmp_path / "registry.json"
+    path.write_text(
+        json.dumps(_registry_payload(_golden_entry("lane_geometry_quality"), required=required)),
+        encoding="utf-8",
+    )
+
+    status = oracle_module.release_golden_registry_status(path)
+
+    assert status["valid"] is False
+    assert expected_error in status["inventory_binding_errors"]
+
+
+def test_registry_rejects_empty_and_duplicate_evaluator_entries(tmp_path):
+    path = tmp_path / "registry.json"
+    path.write_text(
+        json.dumps(
+            _registry_payload(
+                _golden_entry("lane_geometry_quality"),
+                _golden_entry("lane_geometry_quality", hash_char="e"),
+                _golden_entry("", hash_char="i"),
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    status = oracle_module.release_golden_registry_status(path)
+
+    assert status["valid"] is False
+    assert status["duplicate_evaluator_ids"] == ("lane_geometry_quality",)
+    assert status["invalid_evaluator_ids"] == ("",)
+
+
+def test_registry_rejects_non_distinct_controlled_evaluator_hashes(tmp_path):
+    entry = _golden_entry("lane_geometry_quality")
+    entry["test_receipt_sha256"] = entry["positive_golden_sha256"]
+    path = tmp_path / "registry.json"
+    path.write_text(json.dumps(_registry_payload(entry)), encoding="utf-8")
+
+    status = oracle_module.release_golden_registry_status(path)
+
+    assert status["valid"] is False
+    assert status["non_distinct_evaluator_ids"] == ("lane_geometry_quality",)
 
 
 def _contract(
