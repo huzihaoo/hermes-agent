@@ -2313,6 +2313,30 @@ def test_read_only_audit_recomputes_budget_and_lineage_counts(tmp_path):
     assert audit["ga_acceptance_claimed"] is False
 
 
+def test_read_only_audit_rejects_optional_original_effect(tmp_path):
+    store = _seed_published_conclusion(tmp_path)
+    result = _record_retraction(store)
+    _complete_artifact_repair(store, tmp_path, result)
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_delivery_effects SET required = 0 "
+            "WHERE effect_key = ?",
+            (ORIGINAL_EFFECT_KEY,),
+        )
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    audit = audit_conclusion_adjudications(store.db_path)
+
+    assert audit["ok"] is False
+    assert audit["counts"]["published_conclusions"] == 0
+    assert audit["counts"]["ledger_payload_binding_mismatches"] == 1
+    assert any(
+        "conclusion_adjudication_effect_ledger_mismatch" in item["error"]
+        for item in audit["binding_validation_errors"]
+    )
+
+
 def test_artifact_repair_cannot_be_marked_succeeded_without_exact_receipt(tmp_path):
     store = _seed_published_conclusion(tmp_path)
     result = _record_retraction(store)

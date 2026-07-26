@@ -296,6 +296,7 @@ def audit_conclusion_adjudications(control_db: str | Path) -> dict[str, Any]:
                 ON e.delivery_id = j.delivery_id
                AND e.effect_kind = 'feishu_issue_comment'
                AND e.target_key = j.target_key
+               AND e.required = 1
              WHERE j.outcome = 'success'
                AND e.status = 'succeeded'
                AND e.write_phase = 'settled'
