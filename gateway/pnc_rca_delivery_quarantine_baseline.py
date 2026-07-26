@@ -19,7 +19,9 @@ from gateway.pnc_rca_delivery_contract import (
     validate_delivery_subscription_target,
 )
 from gateway.pnc_rca_delivery_quarantine_migration import (
+    COMBINED_SCHEMA_VERSION,
     QuarantineMigrationError,
+    validate_combined_migration_receipt,
     validate_migration_receipt,
 )
 from gateway.pnc_rca_prod_bootstrap import (
@@ -1087,6 +1089,75 @@ def _open_readonly_db(
         os.close(descriptor)
 
 
+def _validate_migration_artifact(
+    *,
+    receipt_path: str,
+    expected_sha256: str,
+    target_live_db_path: str | Path,
+    migrated_db_path: str | Path | None,
+    migrated_db_is_live: bool,
+    expected_migration_runtime_sha256: str,
+) -> dict[str, Any]:
+    try:
+        # Combined-v9 receipts are the release target; retain the older
+        # validator for pre-v9 rehearsal artifacts.  The source schema hash is
+        # carried by the combined receipt's external predecessor contract and
+        # is rechecked against its immutable source copy by the validator.
+        try:
+            raw, _probe_sha256 = _read_stable_file(
+                receipt_path,
+                artifact="delivery_quarantine_migration_receipt_probe",
+                maximum_bytes=MAX_EVIDENCE_BYTES,
+                owner_only=True,
+            )
+            parsed = json.loads(raw)
+            receipt_schema = (
+                parsed.get("schema_version")
+                if isinstance(parsed, Mapping)
+                else None
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            receipt_schema = None
+        if receipt_schema == COMBINED_SCHEMA_VERSION:
+            source_contract = parsed.get("source_schema_contract")
+            expected_source_schema_sha256 = (
+                source_contract.get("schema_sha256")
+                if isinstance(source_contract, Mapping)
+                else ""
+            )
+            combined = validate_combined_migration_receipt(
+                receipt_path=receipt_path,
+                expected_sha256=expected_sha256,
+                target_live_db_path=target_live_db_path,
+                migrated_db_path=migrated_db_path,
+                expected_migration_runtime_sha256=expected_migration_runtime_sha256,
+                expected_source_schema_sha256=str(expected_source_schema_sha256 or ""),
+            )
+            binding = {
+                "receipt_path": combined["receipt_path"],
+                "receipt_sha256": combined["receipt_sha256"],
+                "source_backup_sha256": combined["source_backup_sha256"],
+                "source_logical_sha256": combined["source_logical_sha256"],
+                "post_migration_logical_sha256": combined[
+                    "target_logical_sha256"
+                ],
+                "migration_runtime_sha256": combined["migration_runtime_sha256"],
+                "target_live_db_path": combined["target_live_db_path"],
+            }
+        else:
+            binding = validate_migration_receipt(
+                receipt_path=receipt_path,
+                expected_sha256=expected_sha256,
+                target_live_db_path=target_live_db_path,
+                migrated_db_path=migrated_db_path,
+                migrated_db_is_live=migrated_db_is_live,
+                expected_migration_runtime_sha256=expected_migration_runtime_sha256,
+            )
+    except QuarantineMigrationError as exc:
+        raise DeliveryQuarantineBaselineError(exc.code) from exc
+    return binding
+
+
 def _migration_binding(
     value: Any,
     *,
@@ -1099,7 +1170,7 @@ def _migration_binding(
             "delivery_quarantine_migration_binding_invalid"
         )
     try:
-        binding = validate_migration_receipt(
+        binding = _validate_migration_artifact(
             receipt_path=str(value.get("receipt_path") or ""),
             expected_sha256=str(value.get("receipt_sha256") or ""),
             target_live_db_path=target_live_db_path,
@@ -1708,17 +1779,14 @@ def _build_quarantine_core(
     target_path = Path(target_live_db_path).expanduser().absolute()
     source_path = Path(db_path).expanduser().absolute()
     is_offline_clone = source_path != target_path
-    try:
-        migration_binding = validate_migration_receipt(
-            receipt_path=migration_receipt_path,
-            expected_sha256=expected_migration_receipt_sha256,
-            target_live_db_path=target_path,
-            migrated_db_path=source_path if is_offline_clone else None,
-            migrated_db_is_live=False,
-            expected_migration_runtime_sha256=migration_runtime_sha256,
-        )
-    except QuarantineMigrationError as exc:
-        raise DeliveryQuarantineBaselineError(exc.code) from exc
+    migration_binding = _validate_migration_artifact(
+        receipt_path=str(migration_receipt_path),
+        expected_sha256=expected_migration_receipt_sha256,
+        target_live_db_path=target_path,
+        migrated_db_path=source_path if is_offline_clone else None,
+        migrated_db_is_live=False,
+        expected_migration_runtime_sha256=migration_runtime_sha256,
+    )
     conn = _open_readonly_db(
         db_path,
         busy_timeout_ms=busy_timeout_ms,

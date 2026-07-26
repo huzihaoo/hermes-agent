@@ -368,6 +368,61 @@ def _prepare_combined_schema_migration(
     }
 
 
+def _prepare_combined_quarantine_migration(
+    store: RcaDeliveryStore,
+    root: Path,
+) -> dict:
+    root.mkdir(parents=True, exist_ok=True)
+    source_backup = root / "control.v7.backup.sqlite3"
+    with sqlite3.connect(store.db_path) as source, sqlite3.connect(
+        source_backup
+    ) as destination:
+        source.backup(destination)
+    with sqlite3.connect(source_backup) as conn:
+        conn.executescript(
+            """
+            DROP TABLE rca_conclusion_adjudication_repairs;
+            DROP TABLE rca_conclusion_adjudications;
+            DROP TABLE rca_failure_routes;
+            ALTER TABLE rca_delivery_effects
+                DROP COLUMN adjudication_comment_attempted_at;
+            ALTER TABLE rca_delivery_effects
+                DROP COLUMN adjudication_comment_attempt_count;
+            UPDATE rca_delivery_meta SET value = 'pnc_rca_delivery_store_v7'
+             WHERE key = 'schema_version';
+            """
+        )
+        conn.execute("PRAGMA journal_mode=DELETE")
+    source_backup.chmod(0o600)
+    clone = root / "control.v9.offline-clone.sqlite3"
+    shutil.copyfile(source_backup, clone)
+    clone.chmod(0o600)
+    RcaDeliveryStore(clone)
+    with sqlite3.connect(clone) as conn:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.execute("PRAGMA journal_mode=DELETE")
+    clone.chmod(0o600)
+    with sqlite3.connect(source_backup) as conn:
+        conn.row_factory = sqlite3.Row
+        source_schema_sha256 = logical_database_projection(conn)["schema_sha256"]
+    receipt = build_combined_offline_migration_receipt(
+        source_backup_path=source_backup,
+        migrated_clone_path=clone,
+        target_live_db_path=store.db_path,
+        migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+        expected_source_schema_sha256=source_schema_sha256,
+    )
+    receipt_path = root / "combined-offline-migration-receipt.json"
+    receipt_path.write_bytes(canonical_migration_receipt_bytes(receipt))
+    receipt_path.chmod(0o600)
+    return {
+        "clone_path": clone,
+        "receipt_path": receipt_path,
+        "receipt_sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+        "source_schema_sha256": source_schema_sha256,
+    }
+
+
 @pytest.mark.parametrize(
     "source_version",
     ["pnc_rca_delivery_store_v7", "pnc_rca_delivery_store_v8"],
@@ -471,6 +526,42 @@ def test_combined_v2_receipt_binds_w5_cutoff_backfill_for_legacy_v7_source(
         "column": "value",
         "source_value": None,
         "target_value": "2026-07-25T00:00:00+00:00",
+    }
+
+
+def test_combined_v2_receipt_builds_quarantine_core_from_offline_v9_clone(
+    tmp_path,
+):
+    store, effect_key = _seed_quarantine(tmp_path / "live")
+    settlement = _settlement_receipt(effect_key, tmp_path / "live")
+    migration = _prepare_combined_quarantine_migration(
+        store,
+        tmp_path / "migration",
+    )
+
+    core = build_quarantine_core_from_offline_clone(
+        migration["clone_path"],
+        target_live_db_path=store.db_path,
+        migration_receipt_path=migration["receipt_path"],
+        expected_migration_receipt_sha256=migration["receipt_sha256"],
+        migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+        release_id="release-combined-v9-001",
+        snapshot_at=NOW + timedelta(seconds=2),
+        settlement_receipt_paths=[settlement],
+        analyzed_by="forensic-operator",
+        reason="exact combined-v9 quarantine evidence",
+    )
+
+    assert core["migration_binding"]["receipt_sha256"] == migration[
+        "receipt_sha256"
+    ]
+    assert core["migration_binding"]["target_live_db_path"] == str(
+        store.db_path.absolute()
+    )
+    assert core["quarantine_snapshot"]["counts"] == {
+        "jobs": 1,
+        "effects": 1,
+        "subscriptions": 1,
     }
 
 
