@@ -1225,6 +1225,264 @@ def test_snapshot_required_service_rejects_malformed_bundle_before_create(
     assert "w3_execution_bundle_exact_fields_invalid" in result["error"]
 
 
+def _issued_service_snapshot_fixture(monkeypatch, admission, request):
+    """Install a small issued-fence W3 bundle without touching the control DB."""
+    import gateway.pnc_rca_snapshot as snapshot_module
+    import gateway.pnc_rca_write_fence as fence_module
+
+    profile = {
+        "resource_class": "rca_prod",
+        "artifact_kind": "rca_html_report_and_viz_mcap",
+        "artifact_namespace": "rca/g1q3",
+    }
+    policy = {
+        **request.execution_policy,
+        "resource_class": profile["resource_class"],
+        "artifact_kind": profile["artifact_kind"],
+    }
+    request = replace(
+        request,
+        work_item={
+            **request.work_item,
+            "business_profile": profile,
+            "url": "",
+            "title": "",
+        },
+        case={**request.case, "artifact_namespace": profile["artifact_namespace"]},
+        execution_policy=policy,
+        toolchain={
+            **request.toolchain,
+            "business_profile": profile,
+            "w3_execution_snapshot": {"fixture": "issued"},
+        },
+    )
+    fence = {
+        "state": "issued",
+        "activation_epoch_id": "rca-epoch-live",
+        "activation_ledger_id": 17,
+        "admission_key": admission.submission_key,
+        "business_key": admission.business_key,
+        "submission_key": admission.submission_key,
+        "generation": admission.generation,
+        "target_set_sha256": "target-set-sha",
+    }
+    snapshot = SimpleNamespace(
+        canonical_request=SimpleNamespace(ticket={"issue_url": "", "title": ""}),
+        snapshot_id="pnc-rca-snapshot-v1-" + "1" * 64,
+        snapshot_sha256="2" * 64,
+        request_sha256="3" * 64,
+        write_fence=fence,
+    )
+    source_envelope = SimpleNamespace(
+        source_id=ORIGIN_SOURCE_ID,
+        source_envelope_sha256="4" * 64,
+    )
+    bundle = SimpleNamespace(
+        schema_version="pnc_rca_execution_snapshot_bundle_v1",
+        bundle_sha256="5" * 64,
+        snapshot_authority_sha256="6" * 64,
+        snapshot=snapshot,
+        creator_source_envelope=source_envelope,
+        to_dict=lambda: {"fixture": "issued"},
+    )
+    request = replace(
+        request,
+        source_refs={
+            **request.source_refs,
+            "snapshot_id": snapshot.snapshot_id,
+            "snapshot_sha256": snapshot.snapshot_sha256,
+            "request_sha256": snapshot.request_sha256,
+            "snapshot_bundle_sha256": bundle.bundle_sha256,
+            "creator_source_envelope_sha256": (
+                source_envelope.source_envelope_sha256
+            ),
+        },
+    )
+    targets = {
+        "issue_target": "feishu_issue:t03o4q:7041712812",
+        "thread_target": "feishu_thread:oc_test:root",
+        "chat_id": "oc_test",
+        "target_set_sha256": "target-set-sha",
+    }
+    validate_calls = []
+    monkeypatch.setattr(
+        snapshot_module,
+        "validate_snapshot_execution_bundle",
+        lambda _value: bundle,
+    )
+    monkeypatch.setattr(
+        snapshot_module,
+        "snapshot_execution_inputs",
+        lambda _value: (
+            admission,
+            SimpleNamespace(issue_url="", title=""),
+        ),
+    )
+    monkeypatch.setattr(
+        snapshot_module,
+        "snapshot_execution_request_inputs",
+        lambda _value: (profile, policy),
+    )
+    monkeypatch.setattr(
+        fence_module,
+        "write_fence_binding",
+        lambda _value: {"write_fence": dict(fence)},
+    )
+    monkeypatch.setattr(
+        fence_module,
+        "validate_write_fence_source_binding",
+        lambda *_args, **_kwargs: dict(targets),
+    )
+    monkeypatch.setattr(
+        fence_module,
+        "validate_write_fence",
+        lambda _fence, **kwargs: validate_calls.append(kwargs),
+    )
+    return request, fence, targets, validate_calls
+
+
+def test_issued_snapshot_requires_live_fence_authority_before_vm_create(
+    monkeypatch, tmp_path
+):
+    _configure_service_policy(monkeypatch, tmp_path)
+    admission, request = _contracts()
+    request, _fence, _targets, _validate_calls = _issued_service_snapshot_fixture(
+        monkeypatch, admission, request
+    )
+    monkeypatch.setattr(
+        vm_task_tool,
+        "vm_task_status",
+        lambda *_args, **_kwargs: pytest.fail(
+            "missing live W5 authority must fail before dedupe/create"
+        ),
+    )
+    monkeypatch.setattr(
+        vm_task_tool,
+        "_vm_task_submit_trusted",
+        lambda **_kwargs: pytest.fail("missing live W5 authority reached VM create"),
+    )
+
+    result = _submit_service(
+        service_id=SERVICE_ID,
+        capability=CAPABILITY,
+        operation=OPERATION,
+        admission=admission,
+        execution_request=request,
+        snapshot_required=True,
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == "vm_task_service_request_invalid"
+    assert "live activation authority" in result["error"]
+
+
+def test_live_fence_authority_binds_epoch_and_ledger_before_vm_create(
+    monkeypatch, tmp_path
+):
+    _configure_service_policy(monkeypatch, tmp_path)
+    admission, request = _contracts()
+    request, fence, targets, validate_calls = _issued_service_snapshot_fixture(
+        monkeypatch, admission, request
+    )
+    authority_calls = []
+    submitted = []
+    monkeypatch.setattr(
+        vm_task_tool,
+        "vm_task_status",
+        lambda *_args, **_kwargs: {
+            "success": False,
+            "state": "missing",
+            "task_id": admission.submission_key,
+        },
+    )
+    monkeypatch.setattr(
+        vm_task_tool,
+        "_vm_task_submit_trusted",
+        lambda **kwargs: submitted.append(kwargs)
+        or {
+            "success": True,
+            "task": {"task_id": kwargs["task_id"], "status": "created"},
+        },
+    )
+
+    def live_authority(observed_fence):
+        authority_calls.append(dict(observed_fence))
+        return {
+            **targets,
+            "epoch_id": fence["activation_epoch_id"],
+            "ledger_id": fence["activation_ledger_id"],
+            "admission_key": fence["admission_key"],
+            "business_key": admission.business_key,
+            "submission_key": admission.submission_key,
+            "generation": admission.generation,
+        }
+
+    result = _submit_service(
+        service_id=SERVICE_ID,
+        capability=CAPABILITY,
+        operation=OPERATION,
+        admission=admission,
+        execution_request=request,
+        snapshot_required=True,
+        live_write_fence_authority=live_authority,
+    )
+
+    assert authority_calls == [fence]
+    assert validate_calls
+    assert validate_calls[0]["expected_epoch_id"] == fence["activation_epoch_id"]
+    assert validate_calls[0]["expected_ledger_id"] == fence["activation_ledger_id"]
+    assert submitted
+    # The post-create status remains intentionally missing in this offline
+    # fixture, so the service returns an uncertain result after proving that
+    # the provider boundary was reached only with the live binding.
+    assert result["error_code"] == "vm_task_service_submit_uncertain"
+
+
+def test_live_fence_authority_target_mismatch_blocks_before_vm_create(
+    monkeypatch, tmp_path
+):
+    _configure_service_policy(monkeypatch, tmp_path)
+    admission, request = _contracts()
+    request, fence, targets, _validate_calls = _issued_service_snapshot_fixture(
+        monkeypatch, admission, request
+    )
+    monkeypatch.setattr(
+        vm_task_tool,
+        "vm_task_status",
+        lambda *_args, **_kwargs: pytest.fail(
+            "live target mismatch must fail before dedupe/create"
+        ),
+    )
+    monkeypatch.setattr(
+        vm_task_tool,
+        "_vm_task_submit_trusted",
+        lambda **_kwargs: pytest.fail("live target mismatch reached VM create"),
+    )
+
+    result = _submit_service(
+        service_id=SERVICE_ID,
+        capability=CAPABILITY,
+        operation=OPERATION,
+        admission=admission,
+        execution_request=request,
+        snapshot_required=True,
+        live_write_fence_authority=lambda _fence: {
+            **targets,
+            "target_set_sha256": "wrong-target-set",
+            "epoch_id": fence["activation_epoch_id"],
+            "ledger_id": fence["activation_ledger_id"],
+            "admission_key": fence["admission_key"],
+            "business_key": admission.business_key,
+            "submission_key": admission.submission_key,
+            "generation": admission.generation,
+        },
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == "vm_task_service_request_identity_mismatch"
+    assert "targets disagree" in result["error"]
+
+
 @pytest.mark.parametrize(
     ("projection", "key", "replacement"),
     [

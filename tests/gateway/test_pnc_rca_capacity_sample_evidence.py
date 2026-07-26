@@ -366,6 +366,43 @@ def test_vm_terminal_receipt_binds_raw_meta_hmac_and_independent_key():
     )
 
 
+def test_vm_terminal_receipt_rejects_truncated_created_at_before_fractional_finish():
+    raw, meta, activation, admission_result = _terminal()
+    value = json.loads(raw)
+    value["created_at"] = evidence._iso(NOW + timedelta(seconds=20))
+    value["measurement"]["finished_at"] = evidence._iso(
+        NOW + timedelta(seconds=20, microseconds=1)
+    )
+    body = {
+        key: item
+        for key, item in value.items()
+        if key not in {"receipt_fingerprint", "hmac_sha256"}
+    }
+    body_raw = evidence.canonical_bytes(body)
+    value["receipt_fingerprint"] = hashlib.sha256(body_raw).hexdigest()
+    effective = hmac.new(
+        KEY, evidence.VM_TERMINAL_RECEIPT_HMAC_DOMAIN, hashlib.sha256
+    ).digest()
+    value["hmac_sha256"] = hmac.new(
+        effective, body_raw, hashlib.sha256
+    ).hexdigest()
+    malformed = evidence.canonical_bytes(value)
+    meta["rca_prod_terminal_receipt_sha256"] = hashlib.sha256(malformed).hexdigest()
+    meta["rca_prod_terminal_receipt_fingerprint"] = value["receipt_fingerprint"]
+
+    with pytest.raises(
+        evidence.CapacitySampleEvidenceError,
+        match="rca_capacity_vm_measurement_time_invalid",
+    ):
+        evidence.validate_vm_terminal_receipt(
+            malformed,
+            task_meta=meta,
+            admission_receipt=admission_result.receipt,
+            producer_activation=activation,
+            admission_hmac_key=KEY,
+        )
+
+
 @pytest.mark.parametrize("mode", ["raw", "meta", "hmac"])
 def test_vm_terminal_receipt_rejects_raw_meta_and_hmac_tamper(mode):
     raw, meta, activation, admission_result = _terminal()

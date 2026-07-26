@@ -15,7 +15,7 @@ import tempfile
 from dataclasses import fields, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Mapping
+from typing import Any, Callable, Dict, Mapping
 
 from gateway.pnc_rca_data_access import (
     RemoteDataAccessError,
@@ -1351,6 +1351,9 @@ def vm_task_submit_service(
     bootstrap_authorization_fingerprint: str = "",
     active_release_binding_sha256: str = "",
     snapshot_required: bool = False,
+    live_write_fence_authority: Callable[
+        [Mapping[str, Any]], Mapping[str, Any]
+    ] | None = None,
 ) -> Dict[str, Any]:
     """Submit one capability-scoped RCA intake without exposing general VM execution.
 
@@ -1634,27 +1637,80 @@ def vm_task_submit_service(
             ),
         }
         w3_binding.update(write_fence_binding(w3_bundle.snapshot))
-        if snapshot_required:
-            fence = dict(w3_bundle.snapshot.write_fence)
-            if fence.get("state") != "issued":
-                raise ExternalWriteFenceError("external_write_fence_missing")
+        fence = dict(w3_bundle.snapshot.write_fence)
+        if fence.get("state") == "issued":
+            # A signed fence is an external-write capability.  The immutable
+            # snapshot proves what was authorized; the live authority proves
+            # that its activation epoch and target ledger are still current.
             source_targets = validate_write_fence_source_binding(
                 fence,
                 snapshot=w3_bundle.snapshot,
                 source_envelope=w3_bundle.creator_source_envelope,
             )
+            if not callable(live_write_fence_authority):
+                return _vm_task_service_denied_payload(
+                    "vm_task_service_request_invalid",
+                    "issued W3 write fence requires live activation authority",
+                )
+            try:
+                live_binding = live_write_fence_authority(fence)
+            except Exception as exc:
+                return _vm_task_service_denied_payload(
+                    "vm_task_service_request_identity_mismatch",
+                    "live W3 write-fence authority rejected the submission "
+                    f"({type(exc).__name__})",
+                )
+            if not isinstance(live_binding, Mapping):
+                return _vm_task_service_denied_payload(
+                    "vm_task_service_request_invalid",
+                    "live W3 write-fence authority returned an invalid binding",
+                )
+            if any(
+                live_binding.get(name) != source_targets.get(name)
+                for name in (
+                    "issue_target",
+                    "thread_target",
+                    "chat_id",
+                    "target_set_sha256",
+                )
+            ):
+                return _vm_task_service_denied_payload(
+                    "vm_task_service_request_identity_mismatch",
+                    "live W3 write-fence targets disagree with the immutable snapshot",
+                )
+            live_epoch_id = str(live_binding.get("epoch_id") or "").strip()
+            live_ledger_id = live_binding.get("ledger_id")
+            if (
+                not live_epoch_id
+                or isinstance(live_ledger_id, bool)
+                or not isinstance(live_ledger_id, int)
+                or live_ledger_id < 1
+                or live_binding.get("admission_key") != fence.get("admission_key")
+                or live_binding.get("business_key")
+                != validated_admission.business_key
+                or live_binding.get("submission_key")
+                != validated_admission.submission_key
+                or live_binding.get("generation")
+                != validated_admission.generation
+            ):
+                return _vm_task_service_denied_payload(
+                    "vm_task_service_request_identity_mismatch",
+                    "live W3 write-fence ledger does not match the admission",
+                )
             validate_write_fence(
                 fence,
                 snapshot=w3_bundle.snapshot,
                 operation="vm_submit",
                 target=validated_admission.submission_key,
+                expected_epoch_id=live_epoch_id,
+                expected_ledger_id=live_ledger_id,
                 expected_business_key=validated_admission.business_key,
                 expected_submission_key=validated_admission.submission_key,
                 expected_generation=validated_admission.generation,
-                expected_target_set_sha256=source_targets[
-                    "target_set_sha256"
-                ],
+                expected_target_set_sha256=source_targets["target_set_sha256"],
             )
+        elif snapshot_required:
+            raise ExternalWriteFenceError("external_write_fence_missing")
 
     data = (
         request_payload.get("data")

@@ -884,6 +884,7 @@ def default_submit(
     execution_request: RcaExecutionRequest,
     *,
     config: DispatcherConfig,
+    control_store: RcaControlStore | None = None,
 ) -> Mapping[str, Any]:
     """Invoke only the fixed, capability-scoped VM submission wrapper."""
     from tools.vm_task_tool import vm_task_submit_service
@@ -928,6 +929,7 @@ def default_submit(
                 ),
                 admission=admission,
                 now=datetime.now(timezone.utc),
+                control_store=control_store,
             )
         except ExternalWriteFenceError:
             raise
@@ -936,17 +938,22 @@ def default_submit(
                 "external_write_fence_schema_invalid",
                 type(exc).__name__,
             ) from exc
-    return vm_task_submit_service(
-        service_id=DEFAULT_SERVICE_ID,
-        capability=SERVICE_CAPABILITY,
-        operation=SERVICE_OPERATION,
-        admission=admission,
-        execution_request=execution_request,
-        reconcile_only=reconcile_only,
-        capacity_mode=config.capacity_mode,
+    submit_kwargs: dict[str, Any] = {
+        "service_id": DEFAULT_SERVICE_ID,
+        "capability": SERVICE_CAPABILITY,
+        "operation": SERVICE_OPERATION,
+        "admission": admission,
+        "execution_request": execution_request,
+        "reconcile_only": reconcile_only,
+        "capacity_mode": config.capacity_mode,
         **snapshot_requirement,
         **capacity_bindings,
-    )
+    }
+    if control_store is not None:
+        submit_kwargs["live_write_fence_authority"] = (
+            control_store.validate_external_write_fence_binding
+        )
+    return vm_task_submit_service(**submit_kwargs)
 
 
 def _load_bound_bootstrap_authorization(
@@ -3535,6 +3542,7 @@ def main(argv: list[str] | None = None) -> int:
                 admission,
                 execution_request,
                 config=config,
+                control_store=store,
             ),
         )
         health = HealthReporter(
