@@ -383,11 +383,18 @@ def _complete_artifact_repair(
     artifact_root,
     result,
     *,
+    issue_id: str = ISSUE_ID,
+    action: str = "撤回",
+    message_id: str = "om_command",
     mark_succeeded: bool = True,
 ) -> dict:
-    [adjudication] = store.list_rows("rca_conclusion_adjudications")
+    [adjudication] = [
+        row
+        for row in store.list_rows("rca_conclusion_adjudications")
+        if row["adjudication_id"] == result.adjudication_id
+    ]
     event = SimpleNamespace(
-        message_id="om_command",
+        message_id=message_id,
         source=SimpleNamespace(
             platform=Platform.FEISHU,
             chat_id="oc_g1q3",
@@ -399,8 +406,8 @@ def _complete_artifact_repair(
         event=event,
         hermes_home=artifact_root,
         review_dir=review_dir,
-        issue_id=ISSUE_ID,
-        action="撤回",
+        issue_id=issue_id,
+        action=action,
         reason=adjudication["reason"],
         owner_id="ou_owner",
         owner_name="RCA Owner",
@@ -2311,6 +2318,187 @@ def test_read_only_audit_recomputes_budget_and_lineage_counts(tmp_path):
     assert audit["ok"] is True
     assert all(audit["invariants"].values())
     assert audit["ga_acceptance_claimed"] is False
+
+
+def test_strict_acceptance_fails_closed_on_empty_adjudication_ledger(tmp_path):
+    store = _seed_published_conclusion(tmp_path)
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    regular = audit_conclusion_adjudications(store.db_path)
+    strict = audit_conclusion_adjudications(store.db_path, acceptance=True)
+
+    assert regular["ok"] is True
+    assert strict["ok"] is False
+    assert strict["acceptance"]["requested"] is True
+    assert strict["acceptance"]["invariants"] == {
+        "base_audit_clean": True,
+        "recognition_batch_minimum_met": False,
+        "settled_retract_correction_readback_present": False,
+    }
+    assert strict["acceptance"]["evidence"]["largest_recognition_batch_size"] == 0
+    assert strict["acceptance"]["evidence"][
+        "settled_retract_correction_readbacks"
+    ] == 0
+
+
+def test_strict_acceptance_requires_settled_batch_and_retraction(tmp_path):
+    control_dir = (
+        tmp_path / "runtime" / "pnc_agent" / "feishu_issue_kafka_rca"
+    )
+    control_dir.mkdir(parents=True)
+    store = _seed_published_conclusion(control_dir)
+    issue_ids = (
+        ISSUE_ID,
+        "7054691975",
+        "7054691976",
+        "7054691977",
+        "7054691978",
+        "7054691979",
+    )
+    for issue_id in issue_ids[1:]:
+        _add_published_conclusion(store, issue_id)
+
+    comments = {
+        issue_id: [
+            {
+                "remote_id": f"original-{issue_id}",
+                "content": f"original candidate {issue_id}",
+            }
+        ]
+        for issue_id in issue_ids
+    }
+    fields = {
+        issue_id: {
+            RCA_RESULT_FIELD_KEY: (
+                "候选结论：感知车道线责任域"
+                if issue_id == ISSUE_ID
+                else f"候选结论：{issue_id} 感知车道线责任域"
+            )
+        }
+        for issue_id in issue_ids
+    }
+
+    def list_comments(_project_key, work_item_id):
+        return {
+            "success": True,
+            "comments": list(comments[work_item_id]),
+            "pages_read": 1,
+        }
+
+    def add_comment(_project_key, work_item_id, content):
+        remote_id = f"adjudication-{work_item_id}"
+        comments[work_item_id].append(
+            {"remote_id": remote_id, "content": content}
+        )
+        return {"success": True, "remote_id": remote_id}
+
+    def get_fields(_project_key, work_item_id, field_keys):
+        return {
+            "success": True,
+            "fields": {
+                key: fields[work_item_id].get(key, "") for key in field_keys
+            },
+        }
+
+    def update_fields(_project_key, work_item_id, updates):
+        fields[work_item_id].update(dict(updates))
+        return {"success": True}
+
+    dispatcher = _dispatcher(
+        store,
+        list_comments=list_comments,
+        add_comment=add_comment,
+        get_fields=get_fields,
+        update_fields=update_fields,
+    )
+    batch_results = store.record_conclusion_adjudications(
+        work_item_ids=issue_ids[:5],
+        action="recognize",
+        reason="acceptance batch",
+        actor_id="ou_owner",
+        actor_name="RCA Owner",
+        source={
+            "platform": "feishu",
+            "chat_id": "oc_g1q3",
+            "thread_id": "omt_topic",
+            "message_id": "om_acceptance_batch",
+        },
+        now=NOW,
+    )
+    assert len(batch_results) == 5
+    for issue_id, result in zip(issue_ids[:5], batch_results, strict=True):
+        _complete_artifact_repair(
+            store,
+            tmp_path,
+            result,
+            issue_id=issue_id,
+            action="追认",
+            message_id="om_acceptance_batch",
+        )
+    for _ in range(5):
+        outcome = dispatcher.dispatch_one()
+        assert outcome.status == "succeeded", outcome
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    batch_only = audit_conclusion_adjudications(store.db_path, acceptance=True)
+    assert batch_only["ok"] is False
+    assert batch_only["acceptance"]["evidence"][
+        "largest_recognition_batch_size"
+    ] == 5
+    assert batch_only["acceptance"]["invariants"][
+        "recognition_batch_minimum_met"
+    ] is True
+    assert batch_only["acceptance"]["invariants"][
+        "settled_retract_correction_readback_present"
+    ] is False
+
+    retraction = store.record_conclusion_adjudication(
+        work_item_id=issue_ids[5],
+        action="retract",
+        reason="acceptance correction",
+        actor_id="ou_owner",
+        actor_name="RCA Owner",
+        source={
+            "platform": "feishu",
+            "chat_id": "oc_g1q3",
+            "thread_id": "omt_topic",
+            "message_id": "om_acceptance_retraction",
+        },
+        now=NOW,
+    )
+    _complete_artifact_repair(
+        store,
+        tmp_path,
+        retraction,
+        issue_id=issue_ids[5],
+        action="撤回",
+        message_id="om_acceptance_retraction",
+    )
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    pending = audit_conclusion_adjudications(store.db_path, acceptance=True)
+    assert pending["ok"] is False
+    assert pending["acceptance"]["evidence"][
+        "settled_retract_correction_readbacks"
+    ] == 0
+
+    assert dispatcher.dispatch_one().status == "succeeded"
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    complete = audit_conclusion_adjudications(store.db_path, acceptance=True)
+
+    assert complete["ok"] is True
+    assert complete["acceptance"]["invariants"] == {
+        "base_audit_clean": True,
+        "recognition_batch_minimum_met": True,
+        "settled_retract_correction_readback_present": True,
+    }
+    assert complete["acceptance"]["evidence"][
+        "settled_retract_correction_readbacks"
+    ] == 1
+    assert complete["ga_acceptance_claimed"] is False
 
 
 def test_read_only_audit_rejects_optional_original_effect(tmp_path):

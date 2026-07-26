@@ -30,9 +30,13 @@ from gateway.pnc_rca_conclusion_adjudication import (
 
 AUDIT_SCHEMA_VERSION = "pnc_rca_conclusion_adjudication_audit_v2"
 EXPECTED_DELIVERY_STORE_SCHEMA_VERSION = "pnc_rca_delivery_store_v9"
-_UNRESOLVED_EFFECT_STATUSES = frozenset(
-    {"pending", "claimed", "retry_wait", "uncertain"}
-)
+MIN_GA_RECOGNITION_BATCH_SIZE = 5
+_UNRESOLVED_EFFECT_STATUSES = frozenset({
+    "pending",
+    "claimed",
+    "retry_wait",
+    "uncertain",
+})
 _VALID_EFFECT_WRITE_PHASES = {
     "pending": {"prewrite"},
     "claimed": {"prewrite", "write_started"},
@@ -76,15 +80,95 @@ def _sha256(path: Path) -> str:
 
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
-    return conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-        (table,),
-    ).fetchone() is not None
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        is not None
+    )
 
 
-def _scalar(conn: sqlite3.Connection, sql: str, parameters: tuple[Any, ...] = ()) -> int:
+def _scalar(
+    conn: sqlite3.Connection, sql: str, parameters: tuple[Any, ...] = ()
+) -> int:
     row = conn.execute(sql, parameters).fetchone()
     return int(row[0] or 0) if row is not None else 0
+
+
+def _strict_acceptance_evidence(conn: sqlite3.Connection) -> dict[str, Any]:
+    settled_readback = """
+        e.status = 'succeeded'
+        AND e.write_phase = 'settled'
+        AND e.adjudication_comment_attempt_count = 1
+        AND json_valid(e.remote_receipt_json)
+        AND trim(json_extract(e.remote_receipt_json, '$.remote_id')) != ''
+        AND trim(json_extract(e.remote_receipt_json, '$.marker')) != ''
+        AND length(
+            json_extract(e.remote_receipt_json, '$.confirmed_content_sha256')
+        ) = 64
+        AND trim(json_extract(e.remote_receipt_json, '$.source')) != ''
+        AND json_type(
+            e.remote_receipt_json, '$.confirmed_field_keys'
+        ) = 'array'
+        AND json_array_length(
+            json_extract(e.remote_receipt_json, '$.confirmed_field_keys')
+        ) >= 1
+        AND repair.status = 'succeeded'
+    """
+    recognition_rows = conn.execute(
+        f"""
+        SELECT a.actor_id, a.source_json, COUNT(*) AS item_count
+          FROM rca_conclusion_adjudications AS a
+          JOIN rca_delivery_effects AS e
+            ON e.effect_key = a.correction_effect_key
+          JOIN rca_conclusion_adjudication_repairs AS repair
+            ON repair.adjudication_id = a.adjudication_id
+         WHERE a.action = 'recognize'
+           AND a.conclusion_state = 'recognized'
+           AND substr(a.actor_id, 1, 3) = 'ou_'
+           AND json_valid(a.source_json)
+           AND json_extract(a.source_json, '$.platform') = 'feishu'
+           AND trim(json_extract(a.source_json, '$.chat_id')) != ''
+           AND trim(json_extract(a.source_json, '$.thread_id')) != ''
+           AND trim(json_extract(a.source_json, '$.message_id')) != ''
+           AND {settled_readback}
+      GROUP BY a.actor_id, a.source_json
+      ORDER BY item_count DESC, a.actor_id, a.source_json
+        """
+    ).fetchall()
+    largest_batch = max((int(row["item_count"]) for row in recognition_rows), default=0)
+    qualifying_batches = sum(
+        int(row["item_count"]) >= MIN_GA_RECOGNITION_BATCH_SIZE
+        for row in recognition_rows
+    )
+    qualifying_items = sum(
+        int(row["item_count"])
+        for row in recognition_rows
+        if int(row["item_count"]) >= MIN_GA_RECOGNITION_BATCH_SIZE
+    )
+    retraction_rows = conn.execute(
+        f"""
+        SELECT a.adjudication_id
+          FROM rca_conclusion_adjudications AS a
+          JOIN rca_delivery_effects AS e
+            ON e.effect_key = a.correction_effect_key
+          JOIN rca_conclusion_adjudication_repairs AS repair
+            ON repair.adjudication_id = a.adjudication_id
+         WHERE a.action = 'retract'
+           AND a.conclusion_state = 'invalidated'
+           AND {settled_readback}
+      ORDER BY a.adjudication_id
+        """
+    ).fetchall()
+    return {
+        "minimum_recognition_batch_size": MIN_GA_RECOGNITION_BATCH_SIZE,
+        "eligible_recognition_source_groups": len(recognition_rows),
+        "qualifying_recognition_batches": qualifying_batches,
+        "qualifying_recognition_items": qualifying_items,
+        "largest_recognition_batch_size": largest_batch,
+        "settled_retract_correction_readbacks": len(retraction_rows),
+    }
 
 
 def _recompute_adjudication_bindings(
@@ -182,9 +266,7 @@ def _recompute_adjudication_bindings(
                 required=row["correction_required"],
                 target_key=str(row["correction_target_key"] or ""),
                 project_key=str(row["correction_project_key"] or ""),
-                work_item_type_key=str(
-                    row["correction_work_item_type_key"] or ""
-                ),
+                work_item_type_key=str(row["correction_work_item_type_key"] or ""),
                 work_item_id=str(row["correction_work_item_id"] or ""),
                 business_key=str(row["correction_business_key"] or ""),
                 generation=int(row["correction_generation"] or 0),
@@ -217,16 +299,16 @@ def _recompute_adjudication_bindings(
                     adjudication=dict(row),
                 )
         except Exception as exc:
-            failures.append(
-                {
-                    "adjudication_id": adjudication_id,
-                    "error": f"{type(exc).__name__}:{exc}"[:500],
-                }
-            )
+            failures.append({
+                "adjudication_id": adjudication_id,
+                "error": f"{type(exc).__name__}:{exc}"[:500],
+            })
     return len(failures), failures[:20]
 
 
-def audit_conclusion_adjudications(control_db: str | Path) -> dict[str, Any]:
+def audit_conclusion_adjudications(
+    control_db: str | Path, *, acceptance: bool = False
+) -> dict[str, Any]:
     path = Path(control_db).expanduser()
     if not path.is_absolute():
         raise ValueError("control DB path must be absolute")
@@ -448,6 +530,7 @@ def audit_conclusion_adjudications(control_db: str | Path) -> dict[str, Any]:
                     "FROM rca_conclusion_adjudications ORDER BY schema_version"
                 ).fetchall()
             ]
+            acceptance_evidence = _strict_acceptance_evidence(conn)
         else:
             adjudications = invalidated = recognized = 0
             budget_violations = attempt_violations = lineage_unresolved = 0
@@ -455,6 +538,14 @@ def audit_conclusion_adjudications(control_db: str | Path) -> dict[str, Any]:
             binding_validation_errors = []
             activation_violations = repair_pending = invalid_schema_versions = 0
             schema_versions = []
+            acceptance_evidence = {
+                "minimum_recognition_batch_size": MIN_GA_RECOGNITION_BATCH_SIZE,
+                "eligible_recognition_source_groups": 0,
+                "qualifying_recognition_batches": 0,
+                "qualifying_recognition_items": 0,
+                "largest_recognition_batch_size": 0,
+                "settled_retract_correction_readbacks": 0,
+            }
         conn.commit()
     finally:
         conn.close()
@@ -478,6 +569,25 @@ def audit_conclusion_adjudications(control_db: str | Path) -> dict[str, Any]:
         "lineage_resolved": lineage_unresolved == 0,
         "artifact_repairs_complete": repair_pending == 0,
         "schema_versions_current": invalid_schema_versions == 0,
+    }
+    base_ok = schema_ready and all(invariants.values())
+    acceptance_invariants = {
+        "base_audit_clean": base_ok,
+        "recognition_batch_minimum_met": (
+            acceptance_evidence["largest_recognition_batch_size"]
+            >= MIN_GA_RECOGNITION_BATCH_SIZE
+        ),
+        "settled_retract_correction_readback_present": (
+            acceptance_evidence["settled_retract_correction_readbacks"] >= 1
+        ),
+    }
+    acceptance_ok = all(acceptance_invariants.values())
+    acceptance_result = {
+        "requested": acceptance,
+        "ok": acceptance_ok,
+        "evidence": acceptance_evidence,
+        "invariants": acceptance_invariants,
+        "unmet": [name for name, passed in acceptance_invariants.items() if not passed],
     }
     return {
         "schema_version": AUDIT_SCHEMA_VERSION,
@@ -520,7 +630,8 @@ def audit_conclusion_adjudications(control_db: str | Path) -> dict[str, Any]:
         },
         "binding_validation_errors": binding_validation_errors,
         "invariants": invariants,
-        "ok": schema_ready and all(invariants.values()),
+        "acceptance": acceptance_result,
+        "ok": acceptance_ok if acceptance else base_ok,
         "ga_acceptance_claimed": False,
     }
 
@@ -529,14 +640,25 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--control-db", type=Path, required=True)
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--acceptance",
+        action="store_true",
+        help=(
+            "require one settled Feishu recognition batch of at least five and "
+            "one settled retract/correction readback"
+        ),
+    )
     args = parser.parse_args()
     try:
-        result = audit_conclusion_adjudications(args.control_db)
+        result = audit_conclusion_adjudications(
+            args.control_db, acceptance=args.acceptance
+        )
     except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
         result = {
             "schema_version": AUDIT_SCHEMA_VERSION,
             "observed_at": datetime.now(timezone.utc).isoformat(),
             "external_writes": False,
+            "acceptance": {"requested": args.acceptance, "ok": False},
             "ok": False,
             "error": f"{type(exc).__name__}:{exc}",
         }
