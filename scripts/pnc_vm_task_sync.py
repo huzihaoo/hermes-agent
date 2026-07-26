@@ -18,6 +18,7 @@ import pwd
 import re
 import stat
 import secrets
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -35,6 +36,11 @@ if str(REPO_ROOT) not in sys.path:
 
 from gateway.tasks.store import TaskStore  # noqa: E402
 from gateway.tasks.types import Task, TaskStatus  # noqa: E402
+from gateway.pnc_rca_write_fence import (  # noqa: E402
+    ExternalWriteFenceError,
+    snapshot_core_sha256,
+    validate_write_fence,
+)
 from hermes_cli.config import get_hermes_home  # noqa: E402
 from scripts.vm_task_state_bridge import _atomic_write_json, _load_existing, sidecar_path  # noqa: E402
 from gateway.feishu_task_card import render_status_line, stable_render_hash, render_task_card  # noqa: E402
@@ -1202,6 +1208,76 @@ def _save_report_attachment_ledger(payload: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+def _validate_report_attachment_fence(*, vm_task_id: str, work_item_id: str) -> None:
+    """Require the live W5 fence before the legacy attachment provider call."""
+    if "g1q3" not in str(vm_task_id or "").lower():
+        return
+    configured = os.getenv("HERMES_RCA_CONTROL_DB_PATH", "").strip()
+    db_path = Path(configured).expanduser() if configured else (
+        get_hermes_home()
+        / "runtime/pnc_agent/feishu_issue_kafka_rca/control.sqlite3"
+    )
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT admission_snapshot_json FROM rca_admission_snapshots WHERE submission_key = ?",
+            (str(vm_task_id).strip(),),
+        ).fetchone()
+        if row is None:
+            raise ExternalWriteFenceError("external_write_fence_missing")
+        snapshot = json.loads(str(row["admission_snapshot_json"]))
+        fence = snapshot.get("write_fence") if isinstance(snapshot, dict) else None
+        if not isinstance(fence, dict) or fence.get("state") != "issued":
+            raise ExternalWriteFenceError("external_write_fence_missing")
+        ticket = (
+            ((snapshot.get("canonical_request") or {}).get("ticket"))
+            if isinstance(snapshot, dict)
+            else {}
+        )
+        issue_target = str((ticket or {}).get("issue_url") or "").strip()
+        if not issue_target:
+            raise ExternalWriteFenceError("external_write_fence_target_mismatch")
+        epoch_row = conn.execute(
+            """
+            SELECT epoch.epoch_id, epoch.state, epoch.is_current,
+                   ledger.ledger_id, ledger.business_key, ledger.submission_key,
+                   ledger.generation, ledger.decision, ledger.bound_at
+              FROM rca_activation_epochs AS epoch
+              JOIN rca_activation_admission_ledger AS ledger
+                ON ledger.epoch_id = epoch.epoch_id
+               AND ledger.ledger_id = ?
+             WHERE epoch.epoch_id = ? AND ledger.admission_key = ?
+            """,
+            (fence.get("activation_ledger_id"), fence.get("activation_epoch_id"), fence.get("admission_key")),
+        ).fetchone()
+    except ExternalWriteFenceError:
+        raise
+    except (OSError, sqlite3.Error, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ExternalWriteFenceError("external_write_fence_missing", type(exc).__name__) from exc
+    finally:
+        try:
+            conn.close()
+        except UnboundLocalError:
+            pass
+    if epoch_row is None or int(epoch_row["is_current"]) != 1 or str(epoch_row["state"]) not in {"bounded_active", "steady_active"}:
+        raise ExternalWriteFenceError("external_write_fence_epoch_not_current")
+    if str(epoch_row["decision"]) != "admit" or not epoch_row["bound_at"]:
+        raise ExternalWriteFenceError("external_write_fence_operation_denied")
+    validate_write_fence(
+        fence,
+        snapshot_core_sha256_value=snapshot_core_sha256(snapshot),
+        operation="feishu_attachment_upload",
+        target=issue_target,
+        expected_epoch_id=str(epoch_row["epoch_id"]),
+        expected_ledger_id=int(epoch_row["ledger_id"]),
+        expected_business_key=str(fence.get("business_key") or ""),
+        expected_submission_key=str(vm_task_id),
+        expected_generation=int(fence.get("generation") or 0),
+        expected_issue_target=issue_target,
+    )
+
+
 def _feishu_report_attachment_link(*, work_item_id: str, vm_task_id: str, index_html: str) -> str:
     """Upload report HTML as a Feishu Project attachment and return file_url.
 
@@ -1246,6 +1322,14 @@ def _feishu_report_attachment_link(*, work_item_id: str, vm_task_id: str, index_
 
     source_url = _report_internal_http_link(index_html)
     if not source_url:
+        return ""
+
+    try:
+        _validate_report_attachment_fence(
+            vm_task_id=vm_task_id,
+            work_item_id=work_item_id,
+        )
+    except ExternalWriteFenceError:
         return ""
 
     try:

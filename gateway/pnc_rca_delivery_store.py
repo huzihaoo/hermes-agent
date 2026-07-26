@@ -53,6 +53,9 @@ from gateway.pnc_rca_runtime_transition import (
 
 
 DELIVERY_STORE_SCHEMA_VERSION = "pnc_rca_delivery_store_v9"
+W5_EXTERNAL_WRITE_FENCE_CUTOFF_META_KEY = "w5_external_write_fence_cutoff"
+# Persisted once at delivery-store initialization; never controlled by env.
+W5_EXTERNAL_WRITE_FENCE_CUTOFF = "2026-07-25T00:00:00+00:00"
 DELIVERY_STORE_SCHEMA_PREDECESSOR_VERSION = "pnc_rca_delivery_store_v7"
 DELIVERY_STORE_W2_SCHEMA_VERSION = "pnc_rca_delivery_store_v8"
 DELIVERY_BACKPRESSURE_SNAPSHOT_SCHEMA_VERSION = (
@@ -712,6 +715,78 @@ class RcaDeliveryStore:
                 raise
         return conn
 
+    def validate_external_write_fence_binding(
+        self,
+        fence: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Validate the exact current activation ledger for a delivery fence."""
+        epoch_id = str(fence.get("activation_epoch_id") or "").strip()
+        ledger_id = fence.get("activation_ledger_id")
+        admission_key = str(fence.get("admission_key") or "").strip()
+        if not epoch_id or isinstance(ledger_id, bool) or not isinstance(ledger_id, int) or not admission_key:
+            raise RuntimeError("external_write_fence_schema_invalid")
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT epoch.epoch_id, epoch.state, epoch.is_current,
+                       ledger.ledger_id, ledger.admission_key,
+                       ledger.business_key, ledger.submission_key,
+                       ledger.generation, ledger.decision, ledger.bound_at
+                  FROM rca_activation_epochs AS epoch
+                  JOIN rca_activation_admission_ledger AS ledger
+                    ON ledger.epoch_id = epoch.epoch_id
+                   AND ledger.ledger_id = ?
+                 WHERE epoch.epoch_id = ? AND ledger.admission_key = ?
+                """,
+                (ledger_id, epoch_id, admission_key),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None or int(row["is_current"]) != 1:
+            raise RuntimeError("external_write_fence_epoch_not_current")
+        if str(row["state"]) not in {"bounded_active", "steady_active"}:
+            raise RuntimeError("external_write_fence_epoch_not_current")
+        if str(row["decision"]) != "admit" or not row["bound_at"]:
+            raise RuntimeError("external_write_fence_operation_denied")
+        return {
+            "epoch_id": str(row["epoch_id"]),
+            "state": str(row["state"]),
+            "ledger_id": int(row["ledger_id"]),
+            "admission_key": str(row["admission_key"]),
+            "business_key": str(row["business_key"]),
+            "submission_key": str(row["submission_key"]),
+            "generation": int(row["generation"]),
+        }
+
+    def is_historical_external_write_effect(self, created_at: str) -> bool:
+        """Grandfather only effects predating the durable W5 rollout marker."""
+        conn = self._connect()
+        try:
+            marker = conn.execute(
+                "SELECT value FROM rca_delivery_meta WHERE key = ?",
+                (W5_EXTERNAL_WRITE_FENCE_CUTOFF_META_KEY,),
+            ).fetchone()
+        finally:
+            conn.close()
+        cutoff = (
+            str(marker["value"])
+            if marker is not None
+            else W5_EXTERNAL_WRITE_FENCE_CUTOFF
+        )
+        try:
+            observed = datetime.fromisoformat(
+                str(created_at).replace("Z", "+00:00")
+            )
+            boundary = datetime.fromisoformat(cutoff.replace("Z", "+00:00"))
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if observed.tzinfo is None or observed.utcoffset() is None:
+            return False
+        if boundary.tzinfo is None or boundary.utcoffset() is None:
+            return False
+        return observed.astimezone(timezone.utc) < boundary.astimezone(timezone.utc)
+
     @staticmethod
     def _validate_activation_required(activation_required: bool) -> None:
         if not isinstance(activation_required, bool):
@@ -1240,6 +1315,17 @@ class RcaDeliveryStore:
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value
                 """,
                 (DELIVERY_STORE_SCHEMA_VERSION,),
+            )
+            conn.execute(
+                """
+                INSERT INTO rca_delivery_meta(key, value)
+                VALUES(?, ?)
+                ON CONFLICT(key) DO NOTHING
+                """,
+                (
+                    W5_EXTERNAL_WRITE_FENCE_CUTOFF_META_KEY,
+                    W5_EXTERNAL_WRITE_FENCE_CUTOFF,
+                ),
             )
             conn.execute(
                 """
@@ -3503,6 +3589,13 @@ class RcaDeliveryStore:
                 else TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION
             ),
         )
+        # Preserve the immutable W3/W5 lineage on terminal effects as well as
+        # successful report deliveries.  The contract JSON is already copied
+        # into every materialized subscription, so no parallel authority column
+        # is needed in this candidate schema.
+        submission_binding = claim.submission_result.get("w3_execution_snapshot")
+        if isinstance(submission_binding, Mapping):
+            delivery.contract["w3_execution_snapshot"] = dict(submission_binding)
         current = _iso(now)
         conn = self._connect()
         try:

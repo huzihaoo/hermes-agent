@@ -73,6 +73,10 @@ from gateway.pnc_rca_delivery_store import (
     RcaDeliveryStore,
     StaleDeliveryEffectLeaseError,
 )
+from gateway.pnc_rca_write_fence import (
+    ExternalWriteFenceError,
+    validate_write_fence,
+)
 from gateway.pnc_rca_conclusion_adjudication import (
     ConclusionAdjudicationError,
     identifies_adjudication_effect,
@@ -2485,6 +2489,62 @@ class DeliveryDispatcher:
             )
         return None
 
+    def _validate_external_write(
+        self,
+        claim: DeliveryEffectClaim,
+        *,
+        operation: str,
+        target: str,
+    ) -> None:
+        """Revalidate the immutable W5 fence immediately before a provider call."""
+        contract = claim.contract if isinstance(claim.contract, Mapping) else {}
+        binding = contract.get("w3_execution_snapshot")
+        if not isinstance(binding, Mapping):
+            if self.store.is_historical_external_write_effect(
+                claim.effect_created_at
+            ):
+                return
+            raise ExternalWriteFenceError("external_write_fence_missing")
+        fence = binding.get("write_fence")
+        core_sha = binding.get("snapshot_core_sha256")
+        if not isinstance(fence, Mapping) or not core_sha:
+            if self.store.is_historical_external_write_effect(
+                claim.effect_created_at
+            ):
+                return
+            raise ExternalWriteFenceError("external_write_fence_missing")
+        try:
+            live = self.store.validate_external_write_fence_binding(fence)
+        except Exception as exc:
+            code = str(exc) or "external_write_fence_epoch_not_current"
+            if code not in {
+                "external_write_fence_schema_invalid",
+                "external_write_fence_epoch_not_current",
+                "external_write_fence_operation_denied",
+                "external_write_fence_identity_mismatch",
+            }:
+                code = "external_write_fence_epoch_not_current"
+            raise ExternalWriteFenceError(code, str(exc)) from exc
+        expected_thread = (
+            str(claim.payload.get("thread_id") or "").strip()
+            if claim.effect_kind == DELIVERY_THREAD_EFFECT_KIND
+            else None
+        )
+        validate_write_fence(
+            fence,
+            snapshot_core_sha256_value=str(core_sha),
+            operation=operation,
+            target=target,
+            expected_epoch_id=live["epoch_id"],
+            expected_ledger_id=live["ledger_id"],
+            expected_business_key=claim.business_key,
+            expected_submission_key=claim.submission_key,
+            expected_generation=claim.generation,
+            expected_issue_target=claim.issue_url,
+            expected_thread_target=expected_thread,
+            now=self.now(),
+        )
+
     @staticmethod
     def _adjudication_error_outcome(
         claim: DeliveryEffectClaim,
@@ -2901,6 +2961,28 @@ class DeliveryDispatcher:
             validated = _validate_effect(claim)
         except DeliveryContractError as exc:
             return self._quarantine(claim, error_code=exc.code, detail=exc.detail)
+        initial_operation = (
+            "feishu_thread_reply"
+            if claim.effect_kind == DELIVERY_THREAD_EFFECT_KIND
+            else (
+                "feishu_issue_field_update"
+                if validated.field_updates
+                else "feishu_issue_comment"
+            )
+        )
+        initial_target = (
+            str(claim.payload.get("thread_id") or "").strip()
+            if claim.effect_kind == DELIVERY_THREAD_EFFECT_KIND
+            else claim.issue_url
+        )
+        try:
+            self._validate_external_write(
+                claim,
+                operation=initial_operation,
+                target=initial_target,
+            )
+        except ExternalWriteFenceError as exc:
+            return self._quarantine(claim, error_code=exc.code, detail=exc.detail)
         if adjudication_effect:
             binding_failure = self._adjudication_binding_gate(
                 claim,
@@ -3191,6 +3273,26 @@ class DeliveryDispatcher:
                 and claim.adjudication_comment_attempt_count > 0
             )
         ):
+            try:
+                self._validate_external_write(
+                    claim,
+                    operation=(
+                        "feishu_issue_field_update"
+                        if validated.field_updates
+                        else (
+                            "feishu_thread_reply"
+                            if claim.effect_kind == DELIVERY_THREAD_EFFECT_KIND
+                            else "feishu_issue_comment"
+                        )
+                    ),
+                    target=(
+                        str(claim.payload.get("thread_id") or "").strip()
+                        if claim.effect_kind == DELIVERY_THREAD_EFFECT_KIND
+                        else claim.issue_url
+                    ),
+                )
+            except ExternalWriteFenceError as exc:
+                return self._quarantine(claim, error_code=exc.code, detail=exc.detail)
             self._heartbeat(claim)
             try:
                 superseded = self.store.mark_effect_write_started(
@@ -3210,6 +3312,14 @@ class DeliveryDispatcher:
                     error_code=("delivery_effect_superseded_by_newer_settled_fields"),
                 )
         if not fields_match:
+            try:
+                self._validate_external_write(
+                    claim,
+                    operation="feishu_issue_field_update",
+                    target=claim.issue_url,
+                )
+            except ExternalWriteFenceError as exc:
+                return self._quarantine(claim, error_code=exc.code, detail=exc.detail)
             try:
                 update_raw = self._write_field_updates(claim, validated)
             except Exception as exc:
@@ -3320,7 +3430,22 @@ class DeliveryDispatcher:
                     exact_delay_seconds=UNCERTAIN_RECONCILIATION_POLL_SECONDS,
                 )
         try:
+            self._validate_external_write(
+                claim,
+                operation=(
+                    "feishu_thread_reply"
+                    if claim.effect_kind == DELIVERY_THREAD_EFFECT_KIND
+                    else "feishu_issue_comment"
+                ),
+                target=(
+                    str(claim.payload.get("thread_id") or "").strip()
+                    if claim.effect_kind == DELIVERY_THREAD_EFFECT_KIND
+                    else claim.issue_url
+                ),
+            )
             add_raw = self._add_remote_effect(claim, validated)
+        except ExternalWriteFenceError as exc:
+            return self._quarantine(claim, error_code=exc.code, detail=exc.detail)
         except Exception as exc:
             if adjudication_effect:
                 binding_failure = self._adjudication_binding_gate(

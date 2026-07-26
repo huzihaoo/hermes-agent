@@ -2453,6 +2453,7 @@ def verify_delivery_bundle(
     delivery_manifest: Mapping[str, Any],
     observed_files: Sequence[Mapping[str, Any]],
     html_dependencies: Sequence[str],
+    w3_execution_binding: Mapping[str, Any] | None = None,
 ) -> VerifiedDelivery:
     """Verify one sealed report and build a send-free delivery effect.
 
@@ -2462,6 +2463,11 @@ def verify_delivery_bundle(
     validated_admission = validate_rca_admission(admission)
     contract = dict(delivery_contract or {})
     manifest = dict(delivery_manifest or {})
+    if w3_execution_binding is not None:
+        if not isinstance(w3_execution_binding, Mapping):
+            raise DeliveryContractError("w3_execution_snapshot_invalid")
+        contract["w3_execution_snapshot"] = dict(w3_execution_binding)
+        manifest["w3_execution_snapshot"] = dict(w3_execution_binding)
     if not contract:
         raise DeliveryContractError("delivery_contract_missing")
     if not manifest:

@@ -86,6 +86,12 @@ from gateway.pnc_rca_snapshot import (
     snapshot_execution_inputs,
     validate_snapshot_execution_bundle,
 )
+from gateway.pnc_rca_write_fence import (
+    ExternalWriteFenceError,
+    canonical_write_fence_sha256,
+    validate_write_fence,
+    write_fence_binding,
+)
 from hermes_constants import get_hermes_home
 from scripts.pnc_foxglove_delivery import canonical_viz_mcap_path
 from scripts import pnc_fault_taxonomy
@@ -1629,7 +1635,7 @@ def _w3_execution_binding(
     snapshot_bundle: AdmissionSnapshotExecutionBundle,
 ) -> dict[str, str]:
     bundle = validate_snapshot_execution_bundle(snapshot_bundle)
-    return {
+    binding = {
         "schema_version": bundle.schema_version,
         "bundle_sha256": bundle.bundle_sha256,
         "snapshot_authority_sha256": bundle.snapshot_authority_sha256,
@@ -1640,6 +1646,8 @@ def _w3_execution_binding(
             bundle.creator_source_envelope.source_envelope_sha256
         ),
     }
+    binding.update(write_fence_binding(bundle.snapshot))
+    return binding
 
 
 def _snapshot_submission_admission(
@@ -1827,6 +1835,14 @@ def _validate_w3_task_status(
             "creator_source_envelope_sha256"
         ],
     }
+    fence = binding.get("write_fence")
+    if isinstance(fence, Mapping):
+        expected_meta.update(
+            {
+                "rca_w3_write_fence_id": str(fence.get("fence_id") or ""),
+                "rca_w3_write_fence_sha256": canonical_write_fence_sha256(fence),
+            }
+        )
     if any(meta.get(name) != value for name, value in expected_meta.items()):
         raise DeliveryContractError("w3_execution_snapshot_task_mismatch")
 
@@ -2712,14 +2728,41 @@ class DeliveryCollector:
             bundle = self.artifact_bundle_reader(claim)
             if not isinstance(bundle, Mapping):
                 raise ArtifactBundleReadError("artifact_reader_response_invalid")
+            w3_binding = None
             if snapshot_bundle is not None:
                 _validate_w3_delivery_bundle(bundle, snapshot_bundle)
+                w3_binding = _w3_execution_binding(snapshot_bundle)
+                fence = w3_binding.get("write_fence")
+                if not isinstance(fence, Mapping):
+                    raise DeliveryContractError("external_write_fence_missing")
+                try:
+                    live = self._control_store().validate_external_write_fence_binding(
+                        fence
+                    )
+                    validate_write_fence(
+                        fence,
+                        snapshot=snapshot_bundle.snapshot,
+                        expected_epoch_id=live["epoch_id"],
+                        expected_ledger_id=live["ledger_id"],
+                        expected_business_key=claim.business_key,
+                        expected_submission_key=claim.submission_key,
+                        expected_generation=claim.generation,
+                        now=self.now(),
+                    )
+                except ExternalWriteFenceError as exc:
+                    raise DeliveryContractError(exc.code, exc.detail) from exc
+                except Exception as exc:
+                    raise DeliveryContractError(
+                        "external_write_fence_epoch_not_current",
+                        type(exc).__name__,
+                    ) from exc
             delivery: VerifiedDelivery = verify_delivery_bundle(
                 admission=admission,
                 delivery_contract=bundle.get("delivery_contract") or {},
                 delivery_manifest=bundle.get("delivery_manifest") or {},
                 observed_files=bundle.get("observed_files") or [],
                 html_dependencies=bundle.get("html_dependencies") or [],
+                w3_execution_binding=w3_binding,
             )
         except ArtifactBundleReadError as exc:
             deadline_outcome = self._deadline_outcome(

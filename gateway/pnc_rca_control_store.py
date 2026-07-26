@@ -2206,6 +2206,9 @@ class RcaControlStore:
             END
             """,
             """
+            DROP TRIGGER IF EXISTS trg_rca_admission_snapshot_projection_guard
+            """,
+            """
             CREATE TRIGGER IF NOT EXISTS trg_rca_admission_snapshot_projection_guard
             BEFORE INSERT ON rca_admission_snapshots
             WHEN NOT COALESCE((
@@ -2258,10 +2261,10 @@ class RcaControlStore:
                 ) = NEW.legacy_unconfigured
                 AND json_extract(
                     NEW.admission_snapshot_json, '$.write_fence.schema_version'
-                ) = 'pnc_rca_write_fence_slot_v1'
+                ) IN ('pnc_rca_write_fence_slot_v1', 'pnc_rca_write_fence_v1')
                 AND json_extract(
                     NEW.admission_snapshot_json, '$.write_fence.state'
-                ) = 'unissued'
+                ) IN ('unissued', 'issued')
             ), 0)
             BEGIN
                 SELECT RAISE(ABORT, 'rca_admission_snapshot_projection_mismatch');
@@ -3307,6 +3310,56 @@ class RcaControlStore:
             return self._public_activation_epoch(row) if row is not None else None
         finally:
             conn.close()
+
+    def validate_external_write_fence_binding(
+        self,
+        fence: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Return the live ledger binding for a W5 fence or fail closed.
+
+        This query is intentionally independent of dispatcher enable switches;
+        a fence is live only while its exact admitted ledger row belongs to the
+        current bounded/steady activation epoch.
+        """
+        epoch_id = str(fence.get("activation_epoch_id") or "").strip()
+        ledger_id = fence.get("activation_ledger_id")
+        admission_key = str(fence.get("admission_key") or "").strip()
+        if not epoch_id or isinstance(ledger_id, bool) or not isinstance(ledger_id, int):
+            raise RecordConflictError("external_write_fence_schema_invalid")
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT epoch.epoch_id, epoch.state, epoch.is_current,
+                       ledger.ledger_id, ledger.admission_key,
+                       ledger.business_key, ledger.submission_key,
+                       ledger.generation, ledger.decision, ledger.bound_at
+                  FROM rca_activation_epochs AS epoch
+                  JOIN rca_activation_admission_ledger AS ledger
+                    ON ledger.epoch_id = epoch.epoch_id
+                   AND ledger.ledger_id = ?
+                 WHERE epoch.epoch_id = ?
+                   AND ledger.admission_key = ?
+                """,
+                (ledger_id, epoch_id, admission_key),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None or int(row["is_current"]) != 1:
+            raise RecordConflictError("external_write_fence_epoch_not_current")
+        if str(row["state"]) not in {"bounded_active", "steady_active"}:
+            raise RecordConflictError("external_write_fence_epoch_not_current")
+        if str(row["decision"]) != "admit" or not row["bound_at"]:
+            raise RecordConflictError("external_write_fence_operation_denied")
+        return {
+            "epoch_id": str(row["epoch_id"]),
+            "state": str(row["state"]),
+            "ledger_id": int(row["ledger_id"]),
+            "admission_key": str(row["admission_key"]),
+            "business_key": str(row["business_key"]),
+            "submission_key": str(row["submission_key"]),
+            "generation": int(row["generation"]),
+        }
 
     def capacity_transition_state(self) -> dict[str, Any] | None:
         """Return the durable capacity latch; derived readiness lives elsewhere."""
@@ -8535,6 +8588,79 @@ class RcaControlStore:
                 expected_policy_sha256s=policy_sha256s,
             )
 
+        legacy_snapshot_sha256 = snapshot.snapshot_sha256
+
+        # W5 issues the one external-write fence only after W3 has produced an
+        # admitted snapshot and the activation ledger binding is durable in this
+        # transaction.  Shadow and legacy-unconfigured snapshots retain the
+        # unissued slot and therefore cannot authorize any provider call.
+        if (
+            snapshot.execution_admission["decision"] == "admit"
+            and not snapshot.execution_admission["legacy_unconfigured"]
+        ):
+            if snapshot.write_fence.get("state") == "unissued":
+                if persisted_snapshot_row is not None:
+                    raise RecordConflictError("external_write_fence_missing")
+                if (
+                    activation_decision is None
+                    or activation_decision.ledger_id is None
+                    or not activation_decision.epoch_id
+                ):
+                    raise RecordConflictError("external_write_fence_identity_mismatch")
+                if source_kind == "feishu_group_manual":
+                    activation_identity: dict[str, Any] = {
+                        "chat_id": source_metadata["chat_id"],
+                        "requester_id": source_metadata["requester_id"],
+                        "message_id": source_metadata["message_id"],
+                        "thread_id": source_metadata["thread_id"],
+                        "issue_url": context.issue_url,
+                        "mode": source_metadata["mode"],
+                    }
+                    if source_metadata["platform"] == "operator":
+                        activation_identity.update(
+                            {"chat_id": "operator", "thread_id": "operator:issue-only"}
+                        )
+                    activation_source_kind = "manual"
+                else:
+                    activation_identity = {"event_uid": source_metadata["event_uid"]}
+                    activation_source_kind = "kafka"
+                source_identity_sha256, _normalized_identity = (
+                    self._normalize_activation_source_identity(
+                        activation_source_kind,
+                        activation_identity,
+                    )
+                )
+                admission_key = self._activation_admission_key(
+                    source_kind=activation_source_kind,
+                    source_identity_sha256=source_identity_sha256,
+                    business_key=str(snapshot.resolved_admission["business_key"]),
+                    submission_key=str(snapshot.resolved_admission["submission_key"]),
+                    generation=int(snapshot.resolved_admission["generation"]),
+                )
+                try:
+                    from gateway.pnc_rca_write_fence import (
+                        issue_snapshot_write_fence,
+                    )
+
+                    target_set: dict[str, Any] = {
+                        "issue_target": str(anchor["issue_target"]),
+                        "thread_target": anchor.get("thread_target"),
+                    }
+                    if source_kind == "feishu_group_manual":
+                        target_set["chat_id"] = str(source_metadata["chat_id"])
+                    snapshot = issue_snapshot_write_fence(
+                        snapshot,
+                        activation_epoch_id=str(activation_decision.epoch_id),
+                        activation_ledger_id=int(activation_decision.ledger_id),
+                        admission_key=admission_key,
+                        target_set=target_set,
+                        now=datetime.now(timezone.utc),
+                    )
+                except Exception as exc:
+                    raise RecordConflictError(
+                        f"external_write_fence_issue_failed:{getattr(exc, 'code', type(exc).__name__)}"
+                    ) from exc
+
         ingress_decision = {
             "requested_mode": (
                 "pending"
@@ -8638,7 +8764,7 @@ class RcaControlStore:
             expected_candidate_source_payload_sha256=str(source["payload_sha256"]),
             expected_legacy_policy_sha256s=policy_sha256s,
             expected_candidate_policy_sha256s=policy_sha256s,
-            expected_legacy_snapshot_sha256=snapshot.snapshot_sha256,
+            expected_legacy_snapshot_sha256=legacy_snapshot_sha256,
             expected_candidate_snapshot_sha256=snapshot.snapshot_sha256,
             expected_legacy_source_authority=source_authority,
             expected_candidate_source_authority=source_authority,

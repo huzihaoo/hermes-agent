@@ -15,7 +15,7 @@ import tempfile
 from dataclasses import fields, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Mapping
 
 from gateway.pnc_rca_data_access import (
     RemoteDataAccessError,
@@ -1548,6 +1548,12 @@ def vm_task_submit_service(
                 snapshot_execution_request_inputs,
                 validate_snapshot_execution_bundle,
             )
+            from gateway.pnc_rca_write_fence import (
+                ExternalWriteFenceError,
+                canonical_write_fence_sha256,
+                validate_write_fence,
+                write_fence_binding,
+            )
 
             w3_bundle = validate_snapshot_execution_bundle(raw_w3_bundle)
             snapshot_admission, snapshot_context = snapshot_execution_inputs(w3_bundle)
@@ -1626,6 +1632,20 @@ def vm_task_submit_service(
                 w3_bundle.creator_source_envelope.source_envelope_sha256
             ),
         }
+        w3_binding.update(write_fence_binding(w3_bundle.snapshot))
+        if snapshot_required:
+            fence = dict(w3_bundle.snapshot.write_fence)
+            if fence.get("state") != "issued":
+                raise ExternalWriteFenceError("external_write_fence_missing")
+            validate_write_fence(
+                fence,
+                snapshot=w3_bundle.snapshot,
+                operation="vm_submit",
+                target=validated_admission.submission_key,
+                expected_business_key=validated_admission.business_key,
+                expected_submission_key=validated_admission.submission_key,
+                expected_generation=validated_admission.generation,
+            )
 
     data = (
         request_payload.get("data")
@@ -1886,6 +1906,17 @@ def vm_task_submit_service(
                 ],
             }
         )
+        if isinstance(w3_binding.get("write_fence"), Mapping):
+            base_identity_meta.update(
+                {
+                    "rca_w3_write_fence_id": str(
+                        w3_binding["write_fence"].get("fence_id") or ""
+                    ),
+                    "rca_w3_write_fence_sha256": canonical_write_fence_sha256(
+                        w3_binding["write_fence"]
+                    ),
+                }
+            )
     try:
         goal = _rca_fixed_cli_goal(
             task_id=validated_admission.submission_key,

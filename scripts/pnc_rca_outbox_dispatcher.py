@@ -99,6 +99,11 @@ from gateway.pnc_rca_snapshot import (
     snapshot_execution_request_inputs,
     validate_snapshot_execution_bundle,
 )
+from gateway.pnc_rca_write_fence import (
+    ExternalWriteFenceError,
+    validate_write_fence,
+    write_fence_binding,
+)
 from gateway.pnc_rca_workspace_runtime import (
     WORKSPACE_RUNTIME_FILES,
     WORKSPACE_RUNTIME_IDENTITY_SCHEMA_VERSION,
@@ -252,6 +257,37 @@ _DEFINITIVE_PRECREATE_ERROR_CODES = frozenset({
 
 EnrichFunc = Callable[[Mapping[str, Any]], RcaIssueContext]
 SubmitFunc = Callable[[RcaAdmission, RcaExecutionRequest], Mapping[str, Any]]
+
+
+def _validate_vm_submit_fence(
+    *,
+    bundle: AdmissionSnapshotExecutionBundle | None,
+    admission: RcaAdmission,
+    now: datetime,
+    control_store: RcaControlStore | None = None,
+) -> None:
+    """Validate W5 immediately before crossing the VM submit boundary."""
+    if bundle is None:
+        raise ExternalWriteFenceError("external_write_fence_missing")
+    bundle = validate_snapshot_execution_bundle(bundle)
+    fence = dict(bundle.snapshot.write_fence)
+    if fence.get("state") != "issued":
+        raise ExternalWriteFenceError("external_write_fence_missing")
+    live = None
+    if control_store is not None:
+        live = control_store.validate_external_write_fence_binding(fence)
+    validate_write_fence(
+        fence,
+        snapshot=bundle.snapshot,
+        operation="vm_submit",
+        target=admission.submission_key,
+        expected_epoch_id=(live or {}).get("epoch_id") if live else None,
+        expected_ledger_id=(live or {}).get("ledger_id") if live else None,
+        expected_business_key=admission.business_key,
+        expected_submission_key=admission.submission_key,
+        expected_generation=admission.generation,
+        now=now,
+    )
 
 
 @dataclass(frozen=True)
@@ -862,6 +898,25 @@ def default_submit(
         if config.w3_snapshot_read_mode == "snapshot_required"
         else {}
     )
+    raw_bundle = execution_request.toolchain.get("w3_execution_snapshot")
+    if config.w3_snapshot_read_mode == "snapshot_required":
+        try:
+            _validate_vm_submit_fence(
+                bundle=(
+                    validate_snapshot_execution_bundle(raw_bundle)
+                    if raw_bundle is not None
+                    else None
+                ),
+                admission=admission,
+                now=datetime.now(timezone.utc),
+            )
+        except ExternalWriteFenceError:
+            raise
+        except Exception as exc:
+            raise ExternalWriteFenceError(
+                "external_write_fence_schema_invalid",
+                type(exc).__name__,
+            ) from exc
     return vm_task_submit_service(
         service_id=DEFAULT_SERVICE_ID,
         capability=SERVICE_CAPABILITY,
@@ -2061,6 +2116,7 @@ def _submission_receipt(
                 bundle.creator_source_envelope.source_envelope_sha256
             ),
         }
+        expected_w3_binding.update(write_fence_binding(bundle.snapshot))
         if result.get("w3_execution_snapshot") != expected_w3_binding:
             raise DispatchCircuitError(
                 "dispatcher_submit_identity_mismatch",
@@ -2354,6 +2410,16 @@ class OutboxDispatcher:
                 request, validated_reservation
             )
             self._renew(claim)
+            if snapshot_bundle is not None or self.config.w3_snapshot_read_mode == "snapshot_required":
+                try:
+                    _validate_vm_submit_fence(
+                        bundle=snapshot_bundle,
+                        admission=admission,
+                        now=self.now(),
+                        control_store=self.store,
+                    )
+                except ExternalWriteFenceError as exc:
+                    raise DispatchCircuitError(exc.code, exc.detail) from exc
             result = self.submit(admission, request)
             if not isinstance(result, Mapping):
                 raise DispatchCircuitError(

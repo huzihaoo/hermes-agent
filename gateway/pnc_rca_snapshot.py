@@ -1012,9 +1012,33 @@ class AdmissionSnapshot:
             "execution_admission",
             _freeze(_execution_admission(self.execution_admission)),
         )
-        if _thaw(self.write_fence) != _unissued_write_fence():
-            raise RcaAdmissionError("w3_write_fence_must_be_unissued")
-        object.__setattr__(self, "write_fence", _freeze(_unissued_write_fence()))
+        observed_fence = _thaw(self.write_fence)
+        if observed_fence == _unissued_write_fence():
+            object.__setattr__(self, "write_fence", _freeze(_unissued_write_fence()))
+        else:
+            # W3 creates an unissued slot; W5 may replace it exactly once with
+            # an immutable issued fence after activation admission.  Keep the
+            # detailed schema/hash checks in the dedicated fence module.
+            try:
+                from gateway.pnc_rca_write_fence import validate_write_fence
+
+                validate_write_fence(
+                    observed_fence,
+                    snapshot_core_sha256_value=self.snapshot_core_sha256,
+                    # Snapshot construction validates immutable shape/hash only;
+                    # live expiry and epoch checks belong to the provider fence
+                    # boundary where the current clock is available.
+                    now=datetime.fromisoformat(
+                        str(observed_fence["issued_at"]).replace("Z", "+00:00")
+                    ),
+                )
+            except Exception as exc:
+                if isinstance(exc, RcaAdmissionError):
+                    raise
+                raise RcaAdmissionError(
+                    getattr(exc, "code", "w3_write_fence_invalid")
+                ) from exc
+            object.__setattr__(self, "write_fence", _freeze(observed_fence))
         expected_sha = canonical_json_sha256(self.identity_payload)
         if self.snapshot_sha256 != expected_sha:
             raise RcaAdmissionError("w3_snapshot_hash_mismatch")
@@ -1031,6 +1055,21 @@ class AdmissionSnapshot:
             "execution_admission": _thaw(self.execution_admission),
             "write_fence": _thaw(self.write_fence),
         }
+
+    @property
+    def core_payload(self) -> dict[str, Any]:
+        """Snapshot identity excluding the mutable W5 issuance slot."""
+        return {
+            "schema_version": self.schema_version,
+            "request_sha256": self.request_sha256,
+            "canonical_request": self.canonical_request.to_dict(),
+            "resolved_admission": _thaw(self.resolved_admission),
+            "execution_admission": _thaw(self.execution_admission),
+        }
+
+    @property
+    def snapshot_core_sha256(self) -> str:
+        return canonical_json_sha256(self.core_payload)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -2151,11 +2190,33 @@ def compare_snapshot_shadow(
         allowed_segments = [
             path
             for path in paths
-            if path and path[0] in {"source_metadata", "anchor"}
+            if path
+            and (
+                path[0] in {"source_metadata", "anchor"}
+                or (
+                    path[0] == "snapshot_core"
+                    and len(path) > 1
+                    and path[1] in {"snapshot_id", "snapshot_sha256", "write_fence"}
+                )
+            )
         ]
         forbidden_segments = [path for path in paths if path not in allowed_segments]
-    legacy_core_sha = canonical_json_sha256(legacy["snapshot_core"])
-    candidate_core_sha = canonical_json_sha256(candidate["snapshot_core"])
+
+    def _shadow_core(value: Mapping[str, Any]) -> dict[str, Any]:
+        snapshot = dict(value)
+        return {
+            key: snapshot[key]
+            for key in (
+                "schema_version",
+                "request_sha256",
+                "canonical_request",
+                "resolved_admission",
+                "execution_admission",
+            )
+        }
+
+    legacy_core_sha = canonical_json_sha256(_shadow_core(legacy["snapshot_core"]))
+    candidate_core_sha = canonical_json_sha256(_shadow_core(candidate["snapshot_core"]))
     matches = (
         not validation_errors
         and not forbidden_segments

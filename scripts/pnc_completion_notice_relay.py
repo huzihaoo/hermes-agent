@@ -17,6 +17,7 @@ import math
 import os
 import re
 import stat
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -24,7 +25,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import urlsplit, urlunsplit
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -37,6 +38,11 @@ from scripts.pnc_foxglove_delivery import foxglove_delivery_fields  # noqa: E402
 from scripts.vm_task_state_bridge import _atomic_write_json  # noqa: E402
 from gateway.feishu_task_card import render_task_card, stable_render_hash  # noqa: E402
 from gateway.pnc_rca_artifacts import local_candidates_for_vm_path  # noqa: E402
+from gateway.pnc_rca_write_fence import (  # noqa: E402
+    ExternalWriteFenceError,
+    snapshot_core_sha256,
+    validate_write_fence,
+)
 from gateway.feishu_mention import (  # noqa: E402
     build_at_mention,
     build_need_input_notify_text,
@@ -4024,6 +4030,144 @@ def _record_only_task_senders(
     return _send_text, _send_card
 
 
+def _relay_control_db_path() -> Path:
+    configured = os.getenv("HERMES_RCA_CONTROL_DB_PATH", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return (
+        Path(get_hermes_home()).expanduser()
+        / "runtime"
+        / "pnc_agent"
+        / "feishu_issue_kafka_rca"
+        / "control.sqlite3"
+    )
+
+
+def _load_task_write_fence(task_id: str) -> dict[str, Any]:
+    """Read the immutable W3 snapshot; sidecar metadata is never authoritative."""
+    key = str(task_id or "").strip()
+    if not key:
+        raise ExternalWriteFenceError("external_write_fence_identity_mismatch")
+    path = _relay_control_db_path()
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT admission_snapshot_json FROM rca_admission_snapshots WHERE submission_key = ?",
+            (key,),
+        ).fetchone()
+    except (OSError, sqlite3.Error) as exc:
+        raise ExternalWriteFenceError(
+            "external_write_fence_missing", type(exc).__name__
+        ) from exc
+    finally:
+        try:
+            conn.close()
+        except UnboundLocalError:
+            pass
+    if row is None:
+        raise ExternalWriteFenceError("external_write_fence_missing")
+    try:
+        snapshot = json.loads(str(row["admission_snapshot_json"]))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ExternalWriteFenceError("external_write_fence_schema_invalid") from exc
+    fence = snapshot.get("write_fence") if isinstance(snapshot, dict) else None
+    if not isinstance(fence, dict) or fence.get("state") != "issued":
+        raise ExternalWriteFenceError("external_write_fence_missing")
+    return {
+        "snapshot": snapshot,
+        "snapshot_core_sha256": snapshot_core_sha256(snapshot),
+        "write_fence": fence,
+    }
+
+
+def _relay_live_fence_binding(fence: Mapping[str, Any]) -> dict[str, Any]:
+    path = _relay_control_db_path()
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            """
+            SELECT epoch.epoch_id, epoch.state, epoch.is_current,
+                   ledger.ledger_id, ledger.admission_key,
+                   ledger.business_key, ledger.submission_key,
+                   ledger.generation, ledger.decision, ledger.bound_at
+              FROM rca_activation_epochs AS epoch
+              JOIN rca_activation_admission_ledger AS ledger
+                ON ledger.epoch_id = epoch.epoch_id
+               AND ledger.ledger_id = ?
+             WHERE epoch.epoch_id = ? AND ledger.admission_key = ?
+            """,
+            (
+                fence.get("activation_ledger_id"),
+                fence.get("activation_epoch_id"),
+                fence.get("admission_key"),
+            ),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None or int(row["is_current"]) != 1:
+        raise ExternalWriteFenceError("external_write_fence_epoch_not_current")
+    if str(row["state"]) not in {"bounded_active", "steady_active"}:
+        raise ExternalWriteFenceError("external_write_fence_epoch_not_current")
+    if str(row["decision"]) != "admit" or not row["bound_at"]:
+        raise ExternalWriteFenceError("external_write_fence_operation_denied")
+    return {
+        "epoch_id": str(row["epoch_id"]),
+        "ledger_id": int(row["ledger_id"]),
+        "business_key": str(row["business_key"]),
+        "submission_key": str(row["submission_key"]),
+        "generation": int(row["generation"]),
+    }
+
+
+def _fenced_task_senders(
+    task_id: str,
+    send_func: Callable[[dict[str, Any]], str] | None,
+    send_card_func: Callable[..., dict[str, Any]] | None,
+) -> tuple[Callable[[dict[str, Any]], str], Callable[..., dict[str, Any]]]:
+    """Wrap every task-bound relay provider call with a live fence check."""
+    binding = _load_task_write_fence(task_id)
+    snapshot = binding["snapshot"]
+    fence = binding["write_fence"]
+    core_sha = binding["snapshot_core_sha256"]
+    resolved = snapshot.get("resolved_admission") or {}
+    ticket = (snapshot.get("canonical_request") or {}).get("ticket") or {}
+    issue_target = str(ticket.get("issue_url") or "")
+
+    def _check(operation: str, target: str) -> None:
+        live = _relay_live_fence_binding(fence)
+        validate_write_fence(
+            fence,
+            snapshot_core_sha256_value=core_sha,
+            operation=operation,
+            target=target,
+            expected_epoch_id=live["epoch_id"],
+            expected_ledger_id=live["ledger_id"],
+            expected_business_key=str(resolved.get("business_key") or ""),
+            expected_submission_key=str(resolved.get("submission_key") or task_id),
+            expected_generation=int(resolved.get("generation") or 0),
+            now=datetime.now(timezone.utc),
+        )
+
+    def _send(args: dict[str, Any]) -> str:
+        target = str(args.get("target") or "")
+        operation = "internal_alert"
+        if target.count(":") >= 2:
+            operation = "feishu_thread_reply"
+        _check(operation, str(task_id) if operation == "internal_alert" else target)
+        return (send_func or send_message_tool)(args)
+
+    def _card(target: str, card_payload: dict[str, Any], message_id: str | None = None) -> dict[str, Any]:
+        operation = "feishu_card_patch" if message_id else "feishu_card_create"
+        _check(operation, issue_target)
+        if send_card_func is None:
+            return {"success": False, "error_code": "external_write_fence_operation_denied", "error": "card sender unavailable"}
+        return send_card_func(target, card_payload, message_id=message_id)
+
+    return _send, _card
+
+
 def relay_pending_notices(*, task_ids: Iterable[str] | None = None, send: bool = False, limit: int = 20, retry_failed_after_seconds: int = 0, max_attempts: int = 3, send_func: Callable[[dict[str, Any]], str] | None = None, send_card_func: Callable[..., dict[str, Any]] | None = None, since_ts: float | None = None, explicit_completion_delivery: bool | None = None, max_card_fallbacks_per_loop: int | None = None, crash_hook: Callable[[str, dict[str, Any]], None] | None = None) -> dict[str, Any]:
     record_sender = None
     if send:
@@ -4107,6 +4251,24 @@ def relay_pending_notices(*, task_ids: Iterable[str] | None = None, send: bool =
                 body=body,
                 notice=notice,
             )
+        # Explicit task filters are also used by generic PNC notices.  Only the
+        # canonical G1Q3 task namespace consumes the RCA admission fence.
+        if send and "g1q3-rca" in task_id.lower():
+            try:
+                task_send_func, task_card_func = _fenced_task_senders(
+                    task_id,
+                    task_send_func,
+                    task_card_func,
+                )
+            except ExternalWriteFenceError as exc:
+                return {
+                    "task_id": task_id,
+                    "dry_run": False,
+                    "sent": False,
+                    "error": exc.code,
+                    "error_detail": exc.detail,
+                    "external_write_blocked": True,
+                }, [f"{task_id}: {exc.code}"]
         try:
             card_result = sync_task_card(task_id=task_id, path=path, body=body, send=send, send_card_func=task_card_func)
         except Exception as exc:
