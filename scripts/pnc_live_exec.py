@@ -26,6 +26,10 @@ SERVICE_TARGETS = {
         "runtime_script",
         "scripts/pnc_completion_notice_relay.py",
     ),
+    "local.pnc.context-budget-check": (
+        "runtime_script",
+        "scripts/hermes_context_budget_check.py",
+    ),
     "local.pnc.feishu-credential-health": (
         "runtime_script",
         "scripts/feishu_credential_cron.py",

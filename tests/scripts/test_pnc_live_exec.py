@@ -58,6 +58,8 @@ print(json.dumps({
     gateway.write_text("print('gateway fixture')\n", encoding="utf-8")
     drift_guard = root / "scripts" / "hermes_live_drift_guard.py"
     drift_guard.write_text("print('drift guard fixture')\n", encoding="utf-8")
+    context_budget = root / "scripts" / "hermes_context_budget_check.py"
+    context_budget.write_text("print('context budget fixture')\n", encoding="utf-8")
     governance_root = home / "runtime" / "governance-tools"
     governance_root.mkdir(parents=True, exist_ok=True)
     tools = {}
@@ -94,6 +96,7 @@ print(json.dumps({
         "add",
         "scripts/pnc_vm_task_sync.py",
         "scripts/hermes_live_drift_guard.py",
+        "scripts/hermes_context_budget_check.py",
         "hermes_cli/main.py",
         live_exec.STABLE_TARGET_REGISTRY_RELATIVE,
     )
@@ -239,6 +242,14 @@ def test_stable_governance_and_cli_source_are_manifest_bound(tmp_path: Path):
     assert drift_evidence["target_kind"] == "runtime_script"
     assert drift_evidence["script"] == str(
         root / "scripts" / "hermes_live_drift_guard.py"
+    )
+
+    context_result = _run(home, "--check", "local.pnc.context-budget-check")
+    assert context_result.returncode == 0, context_result.stderr
+    context_evidence = json.loads(context_result.stdout)
+    assert context_evidence["target_kind"] == "runtime_script"
+    assert context_evidence["script"] == str(
+        root / "scripts" / "hermes_context_budget_check.py"
     )
 
 

@@ -55,6 +55,10 @@ FORBIDDEN_RUNTIME_MARKERS = (
     "/runtime/venvs/",
     "/runtime/hermes-live",
 )
+RETIRED_STABLE_ENTRYPOINTS = (
+    "hermes-g1q3-e2e-smoke",
+    "hermes-live",
+)
 UNRESOLVED_EFFECT_STATUSES = frozenset({
     "pending",
     "claimed",
@@ -351,6 +355,51 @@ def audit_wrappers(home: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any
                     markers=markers,
                 )
             )
+    return evidence, errors
+
+
+def audit_retired_stable_entrypoints(
+    home: Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Require source-retired stable commands to be absent after release."""
+
+    evidence: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for name in RETIRED_STABLE_ENTRYPOINTS:
+        path = home / "bin" / name
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            evidence.append({"name": name, "path": str(path), "present": False})
+            continue
+        except OSError as exc:
+            evidence.append({
+                "name": name,
+                "path": str(path),
+                "present": None,
+                "error": type(exc).__name__,
+            })
+            errors.append(
+                _error(
+                    "pnc_release_retired_entrypoint_unreadable",
+                    name=name,
+                    path=str(path),
+                )
+            )
+            continue
+        evidence.append({
+            "name": name,
+            "path": str(path),
+            "present": True,
+            "mode": stat.S_IMODE(metadata.st_mode),
+        })
+        errors.append(
+            _error(
+                "pnc_release_retired_entrypoint_present",
+                name=name,
+                path=str(path),
+            )
+        )
     return evidence, errors
 
 
@@ -813,6 +862,9 @@ def run_gate(*, home: Path, hermes_home: Path) -> dict[str, Any]:
     resolved, resolution_errors = _resolve_targets(hermes_home=hermes_home)
     residents, resident_errors = audit_residents(loaded=loaded, resolved=resolved)
     wrappers, wrapper_errors = audit_wrappers(home)
+    retired_entrypoints, retired_entrypoint_errors = (
+        audit_retired_stable_entrypoints(home)
+    )
     runtime = next(iter(resolved.values()), {})
     stable_entrypoints: list[dict[str, Any]] = []
     stable_entrypoint_errors: list[dict[str, Any]] = []
@@ -840,6 +892,7 @@ def run_gate(*, home: Path, hermes_home: Path) -> dict[str, Any]:
         *resolution_errors,
         *resident_errors,
         *wrapper_errors,
+        *retired_entrypoint_errors,
         *stable_entrypoint_errors,
         *golden_errors,
         *stable_target_errors,
@@ -857,6 +910,7 @@ def run_gate(*, home: Path, hermes_home: Path) -> dict[str, Any]:
         "resolved_targets": [resolved[label] for label in sorted(resolved)],
         "residents": residents,
         "wrappers": wrappers,
+        "retired_entrypoints": retired_entrypoints,
         "stable_entrypoints": stable_entrypoints,
         "golden_registry": golden_registry,
         "stable_targets": stable_targets,

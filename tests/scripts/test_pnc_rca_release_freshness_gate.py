@@ -92,6 +92,7 @@ def test_source_registry_has_no_pinned_plist_or_wrapper():
     assert "VIRTUAL_ENV" not in gateway["EnvironmentVariables"]
 
     wrapper_names = {
+        "hermes-context-budget-check",
         "hermes-governance-check",
         "hermes-live-drift-guard",
         "hermes-provider-failure-audit",
@@ -106,6 +107,13 @@ def test_source_registry_has_no_pinned_plist_or_wrapper():
     for name in wrapper_names:
         text = (REPO_ROOT / "scripts" / "wrappers" / name).read_text(encoding="utf-8")
         assert not any(marker in text for marker in gate.FORBIDDEN_RUNTIME_MARKERS)
+    context_wrapper = (
+        REPO_ROOT / "scripts" / "wrappers" / "hermes-context-budget-check"
+    ).read_text(encoding="utf-8")
+    assert "local.pnc.context-budget-check" in context_wrapper
+    assert "--repo-root ." in context_wrapper
+    assert "HERMES_CONTEXT_BUDGET_SCRIPT" not in context_wrapper
+    assert "HERMES_CONTEXT_BUDGET_REPO_ROOT" not in context_wrapper
     assert gate.SERVICE_TARGETS["local.pnc.hermes-cli"] == (
         "runtime_script",
         "hermes_cli/main.py",
@@ -118,6 +126,36 @@ def test_source_registry_has_no_pinned_plist_or_wrapper():
     assert "local.pnc.live-promote" not in gate.SERVICE_TARGETS
     assert not (REPO_ROOT / "scripts/wrappers/hermes-g1q3-e2e-smoke").exists()
     assert not (REPO_ROOT / "scripts/wrappers/hermes-live").exists()
+
+
+def test_retired_stable_entrypoints_must_be_absent(tmp_path: Path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name in gate.RETIRED_STABLE_ENTRYPOINTS:
+        (bin_dir / name).write_text(
+            "#!/bin/zsh\nexec pnc_live_exec retired-label\n",
+            encoding="utf-8",
+        )
+
+    evidence, errors = gate.audit_retired_stable_entrypoints(tmp_path)
+
+    assert {item["name"] for item in evidence if item["present"]} == set(
+        gate.RETIRED_STABLE_ENTRYPOINTS
+    )
+    assert {
+        (item["code"], item["name"])
+        for item in errors
+    } == {
+        ("pnc_release_retired_entrypoint_present", name)
+        for name in gate.RETIRED_STABLE_ENTRYPOINTS
+    }
+
+
+def test_absent_retired_stable_entrypoints_pass(tmp_path: Path):
+    evidence, errors = gate.audit_retired_stable_entrypoints(tmp_path)
+
+    assert errors == []
+    assert all(item["present"] is False for item in evidence)
 
 
 def test_loaded_gate_rejects_a_stale_launchd_snapshot(tmp_path: Path):

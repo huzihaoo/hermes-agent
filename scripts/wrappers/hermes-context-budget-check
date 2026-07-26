@@ -1,0 +1,9 @@
+#!/bin/zsh
+set -euo pipefail
+
+config="${HERMES_CONTEXT_BUDGET_CONFIG:-${HOME}/.hermes/config.yaml}"
+db="${HERMES_CONTEXT_BUDGET_DB:-${HOME}/.hermes/state.db}"
+
+exec /usr/bin/python3 "${HOME}/.hermes/runtime/governance-tools/pnc_live_exec.py" \
+  local.pnc.context-budget-check "$@" \
+  --config "$config" --repo-root . --db "$db"
