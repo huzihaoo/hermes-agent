@@ -170,6 +170,20 @@ def test_current_face_complete_registry_is_contract_ready_but_not_ga():
     assert report["registry"]["hard_gate_count"] == 3  # type: ignore[index]
 
 
+def test_delegated_d38_owner_phrase_is_accepted():
+    inventory, registry = _pair()
+    registry["owner_approval"] = {  # type: ignore[index]
+        "phrase": audit.DELEGATED_OWNER_PHRASE,
+        "approval_ref": "design-authority:decision-38",
+        "status": "approved",
+    }
+
+    report = _audit(inventory, registry)
+
+    assert report["registry_contract_ready"] is True
+    assert report["registry"]["owner_approval_phrase"] == "委托规则自裁"  # type: ignore[index]
+
+
 def test_missing_row_is_not_adjudicated():
     inventory, registry = _pair()
     registry["rows"].pop()  # type: ignore[index]

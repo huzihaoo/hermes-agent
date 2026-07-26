@@ -28,6 +28,11 @@ LEGACY_REFERENCE_EMISSION_SITE_COUNT = 149
 MAX_HARD_GATE_COUNT = 15
 MIN_HARD_GATE_COUNT = 1
 REQUIRED_OWNER_PHRASE = "采纳 W4 C1-C8 推荐值"
+DELEGATED_OWNER_PHRASE = "委托规则自裁"
+ACCEPTED_OWNER_PHRASES = frozenset({
+    REQUIRED_OWNER_PHRASE,
+    DELEGATED_OWNER_PHRASE,
+})
 _HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 _GATE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_.:-]{0,127}$")
@@ -367,7 +372,7 @@ def _validate_owner_approval(
         return dict(owner)
     if owner.get("status") != "approved":
         errors.append(_error("owner_approval_not_approved"))
-    if owner.get("phrase") != REQUIRED_OWNER_PHRASE:
+    if owner.get("phrase") not in ACCEPTED_OWNER_PHRASES:
         errors.append(_error("owner_approval_phrase_invalid"))
     try:
         _required_text(owner.get("approval_ref"), code="owner_approval_ref_missing")
@@ -639,11 +644,12 @@ def audit_registry(
             ),
             "hard_gate_ids": sorted(gate_ids),
             "owner_approval_ref": owner.get("approval_ref", ""),
+            "owner_approval_phrase": owner.get("phrase", ""),
         },
         "errors": error_items,
         "non_ga_limitations": [
             "execution_refs_not_verified_against filesystem or live runtime",
-            "three publication counterexamples and canonical HTTPS are not verified",
+            "three publication counterexamples and live readback are not verified",
         ],
     }
 
