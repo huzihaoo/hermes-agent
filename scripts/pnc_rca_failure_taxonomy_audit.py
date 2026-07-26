@@ -20,10 +20,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from gateway.pnc_rca_failure_route_schema import (
+    failure_route_schema_errors as _failure_route_schema_errors,
+)
 from scripts import pnc_fault_taxonomy
 
 
-SCHEMA_VERSION = "pnc_rca_failure_taxonomy_audit_v2"
+SCHEMA_VERSION = "pnc_rca_failure_taxonomy_audit_v3"
 DEFAULT_DB = (
     Path.home() / ".hermes/runtime/pnc_agent/feishu_issue_kafka_rca/control.sqlite3"
 )
@@ -150,6 +153,11 @@ def build_report(db_path: Path, *, baseline: str = DEFAULT_BASELINE) -> dict[str
                 """
             ).fetchall()
             failure_route_table_present = _table_exists(conn, "rca_failure_routes")
+            failure_route_schema_errors = (
+                _failure_route_schema_errors(conn)
+                if failure_route_table_present
+                else []
+            )
             route_rows = (
                 conn.execute(
                     """
@@ -168,7 +176,7 @@ def build_report(db_path: Path, *, baseline: str = DEFAULT_BASELINE) -> dict[str
                     """,
                     (baseline,),
                 ).fetchall()
-                if failure_route_table_present
+                if failure_route_table_present and not failure_route_schema_errors
                 else []
             )
         finally:
@@ -403,6 +411,8 @@ def build_report(db_path: Path, *, baseline: str = DEFAULT_BASELINE) -> dict[str
     gate_errors: list[str] = []
     if not failure_route_table_present:
         gate_errors.append("failure_route_table_missing")
+    if failure_route_schema_errors:
+        gate_errors.append("durable_route_schema_invalid")
     if not route_rows:
         gate_errors.append("no_post_baseline_durable_route_evidence")
     if new_unclassified:
@@ -454,6 +464,7 @@ def build_report(db_path: Path, *, baseline: str = DEFAULT_BASELINE) -> dict[str
             "terminal_route_effects": terminal_route_effects,
         },
         "failure_route_table_present": failure_route_table_present,
+        "failure_route_schema_errors": failure_route_schema_errors,
         "lanes": dict(sorted(post_lanes.items())),
         "internal_routes": dict(sorted(post_routes.items())),
         "route_statuses": dict(sorted(post_statuses.items())),

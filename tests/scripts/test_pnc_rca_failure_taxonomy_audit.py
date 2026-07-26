@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import json
 from datetime import timedelta
+from pathlib import Path
+import shutil
 import sqlite3
+import subprocess
+import sys
 
 from gateway.pnc_rca_delivery_store import RcaDeliveryStore
 from scripts import pnc_fault_taxonomy
@@ -159,6 +163,7 @@ def test_read_only_report_recomputes_three_lanes_and_event_audit(tmp_path):
     assert report["post_baseline"]["failure_route_rows"] == 3
     assert report["post_baseline"]["terminal_rows"] == 0
     assert report["route_contract_errors"] == []
+    assert report["failure_route_schema_errors"] == []
     assert (before.st_ino, before.st_size, before.st_mtime_ns) == (
         after.st_ino,
         after.st_size,
@@ -254,6 +259,21 @@ def test_historical_unclassified_without_source_is_not_guessed(tmp_path):
     assert report["historical"]["history_rewrite_policy"] == "forbidden"
 
 
+def test_missing_route_table_keeps_all_three_live_gates_fail_closed(tmp_path):
+    path = _db(tmp_path, [])
+
+    report = audit.build_report(path)
+
+    assert report["failure_route_table_present"] is False
+    assert report["failure_route_schema_errors"] == []
+    assert report["gate_errors"] == [
+        "failure_route_table_missing",
+        "no_post_baseline_durable_route_evidence",
+        "three_lane_live_evidence_incomplete",
+    ]
+    assert report["ga_acceptance_ready"] is False
+
+
 def test_unknown_injection_cli_is_nonzero_and_emits_taxonomy_gap(capsys):
     result = audit.main(["--inject-unknown", "brand-new-vm-code"])
 
@@ -263,3 +283,51 @@ def test_unknown_injection_cli_is_nonzero_and_emits_taxonomy_gap(capsys):
     assert payload["decision"]["terminal_error_code"] == (
         "taxonomy_gap:brand-new-vm-code"
     )
+
+
+def test_system_python_help_and_injection_are_dependency_light():
+    interpreter = shutil.which("python3")
+    assert interpreter is not None
+    script = str(Path(audit.__file__).resolve())
+
+    help_result = subprocess.run(
+        [interpreter, script, "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert help_result.returncode == 0
+    assert "Read-only W2 migration/audit report" in help_result.stdout
+
+    injection_result = subprocess.run(
+        [interpreter, script, "--inject-unknown", "system-python-gap"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert injection_result.returncode == 2
+    payload = json.loads(injection_result.stdout)
+    assert payload["decision"]["terminal_error_code"] == (
+        "taxonomy_gap:system-python-gap"
+    )
+
+
+def test_schema_index_injection_cli_is_nonzero_and_fail_closed(tmp_path, capsys):
+    path = _routed_db(tmp_path)
+    with sqlite3.connect(path) as conn:
+        conn.execute("DROP INDEX idx_failure_routes_status")
+
+    result = audit.main([
+        "--db",
+        str(path),
+        "--baseline",
+        (NOW - timedelta(seconds=1)).isoformat(),
+        "--gate-new",
+    ])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert result == 1
+    assert payload["ga_acceptance_ready"] is False
+    assert "durable_route_schema_invalid" in payload["gate_errors"]
+    assert payload["failure_route_schema_errors"] == ["index_contract"]
+    assert payload["post_baseline"]["failure_route_rows"] == 0
