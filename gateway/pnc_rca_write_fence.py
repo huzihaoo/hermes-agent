@@ -172,10 +172,212 @@ def _request_ticket(snapshot: Any) -> Mapping[str, Any]:
 
 
 def target_set_sha256(target_set: Mapping[str, Any]) -> str:
-    normalized = dict(target_set)
-    if "issue_target" not in normalized:
+    if not isinstance(target_set, Mapping):
         raise ExternalWriteFenceError("external_write_fence_schema_invalid")
+    normalized = dict(target_set)
+    allowed_fields = {"issue_target", "thread_target"}
+    if "chat_id" in normalized:
+        allowed_fields.add("chat_id")
+    if set(normalized) != allowed_fields:
+        raise ExternalWriteFenceError("external_write_fence_schema_invalid")
+    normalized["issue_target"] = _text(
+        "target_set.issue_target", normalized.get("issue_target")
+    )
+    thread_target = normalized.get("thread_target")
+    if thread_target is not None:
+        normalized["thread_target"] = _text(
+            "target_set.thread_target", thread_target
+        )
+    if "chat_id" in normalized:
+        normalized["chat_id"] = _text(
+            "target_set.chat_id", normalized.get("chat_id"), allow_empty=True
+        )
     return canonical_write_fence_sha256(normalized)
+
+
+def write_target_set_from_source_envelope(
+    source_envelope: Any,
+) -> dict[str, Any]:
+    """Rebuild the only target set authorized by the immutable W3 source."""
+
+    envelope = _mapping_to_dict(source_envelope)
+    source_kind = _text("source_kind", envelope.get("source_kind"))
+    anchor = _mapping_to_dict(envelope.get("anchor"))
+    metadata = _mapping_to_dict(envelope.get("source_metadata"))
+    if set(anchor) != {"issue_target", "thread_target"}:
+        raise ExternalWriteFenceError("external_write_fence_schema_invalid")
+    issue_target = _text("anchor.issue_target", anchor.get("issue_target"))
+    raw_thread_target = anchor.get("thread_target")
+    thread_target = (
+        None
+        if raw_thread_target is None
+        else _text("anchor.thread_target", raw_thread_target)
+    )
+    target_set: dict[str, Any] = {
+        "issue_target": issue_target,
+        "thread_target": thread_target,
+    }
+    if source_kind == "kafka_workflow_event":
+        if thread_target is not None:
+            raise ExternalWriteFenceError("external_write_fence_target_mismatch")
+    elif source_kind == "feishu_group_manual":
+        platform = _text("source_metadata.platform", metadata.get("platform"))
+        chat_id = _text(
+            "source_metadata.chat_id",
+            metadata.get("chat_id"),
+            allow_empty=platform == "operator",
+        )
+        metadata_thread = _text(
+            "source_metadata.thread_id",
+            metadata.get("thread_id"),
+            allow_empty=platform == "operator",
+        )
+        if platform == "feishu":
+            if not chat_id or thread_target != metadata_thread:
+                raise ExternalWriteFenceError(
+                    "external_write_fence_target_mismatch"
+                )
+        elif platform == "operator":
+            if chat_id or metadata_thread or thread_target is not None:
+                raise ExternalWriteFenceError(
+                    "external_write_fence_target_mismatch"
+                )
+        else:
+            raise ExternalWriteFenceError("external_write_fence_schema_invalid")
+        target_set["chat_id"] = chat_id
+    else:
+        raise ExternalWriteFenceError("external_write_fence_schema_invalid")
+    # Normalize and reject any shape drift before returning the raw targets.
+    target_set_sha256(target_set)
+    return target_set
+
+
+def validate_write_fence_source_binding(
+    fence: Any,
+    *,
+    snapshot: Any,
+    source_envelope: Any,
+) -> dict[str, Any]:
+    """Bind a fence to its exact immutable W3 snapshot and source targets."""
+
+    snapshot_value = _mapping_to_dict(snapshot)
+    envelope_value = _mapping_to_dict(source_envelope)
+    snapshot_fields = {
+        "schema_version",
+        "snapshot_id",
+        "snapshot_sha256",
+        "request_sha256",
+        "canonical_request",
+        "resolved_admission",
+        "execution_admission",
+        "write_fence",
+    }
+    if set(snapshot_value) != snapshot_fields:
+        raise ExternalWriteFenceError("external_write_fence_schema_invalid")
+    snapshot_identity = {
+        key: snapshot_value[key]
+        for key in (
+            "schema_version",
+            "request_sha256",
+            "canonical_request",
+            "resolved_admission",
+            "execution_admission",
+            "write_fence",
+        )
+    }
+    final_snapshot_sha256 = canonical_write_fence_sha256(snapshot_identity)
+    if (
+        snapshot_value.get("snapshot_sha256") != final_snapshot_sha256
+        or snapshot_value.get("snapshot_id")
+        != f"pnc-rca-snapshot-v1-{final_snapshot_sha256}"
+    ):
+        raise ExternalWriteFenceError("external_write_fence_identity_mismatch")
+
+    envelope_fields = {
+        "schema_version",
+        "source_envelope_id",
+        "source_envelope_sha256",
+        "source_authority_sha256",
+        "snapshot_id",
+        "snapshot_sha256",
+        "submission_key",
+        "source_id",
+        "source_kind",
+        "ingress_decision",
+        "source_metadata",
+        "anchor",
+    }
+    if (
+        set(envelope_value) != envelope_fields
+        or envelope_value.get("schema_version")
+        != "pnc_rca_snapshot_source_envelope_v1"
+    ):
+        raise ExternalWriteFenceError("external_write_fence_schema_invalid")
+    envelope_identity = {
+        key: envelope_value[key]
+        for key in (
+            "schema_version",
+            "source_authority_sha256",
+            "snapshot_id",
+            "snapshot_sha256",
+            "submission_key",
+            "source_id",
+            "source_kind",
+            "ingress_decision",
+            "source_metadata",
+            "anchor",
+        )
+    }
+    envelope_sha256 = canonical_write_fence_sha256(envelope_identity)
+    if (
+        envelope_value.get("source_envelope_sha256") != envelope_sha256
+        or envelope_value.get("source_envelope_id")
+        != f"pnc-rca-source-envelope-v1-{envelope_sha256}"
+    ):
+        raise ExternalWriteFenceError("external_write_fence_identity_mismatch")
+    try:
+        fence_value = _mapping_to_dict(fence)
+    except ExternalWriteFenceError:
+        raise
+    observed_fence = snapshot_value.get("write_fence")
+    if (
+        not isinstance(observed_fence, Mapping)
+        or canonical_write_fence_sha256(observed_fence)
+        != canonical_write_fence_sha256(fence_value)
+    ):
+        raise ExternalWriteFenceError("external_write_fence_identity_mismatch")
+    resolved = _mapping_to_dict(snapshot_value.get("resolved_admission"))
+    if (
+        envelope_value.get("snapshot_id") != snapshot_value.get("snapshot_id")
+        or envelope_value.get("snapshot_sha256")
+        != snapshot_value.get("snapshot_sha256")
+        or envelope_value.get("submission_key")
+        != resolved.get("submission_key")
+        or envelope_value.get("submission_key")
+        != fence_value.get("submission_key")
+    ):
+        raise ExternalWriteFenceError("external_write_fence_identity_mismatch")
+    targets = write_target_set_from_source_envelope(envelope_value)
+    request = _mapping_to_dict(snapshot_value.get("canonical_request"))
+    ticket = _mapping_to_dict(request.get("ticket"))
+    if (
+        str(targets["issue_target"]).rstrip("/")
+        != str(ticket.get("issue_url") or "").strip().rstrip("/")
+    ):
+        raise ExternalWriteFenceError("external_write_fence_target_mismatch")
+    issued_at = _utc(fence_value.get("issued_at"), "issued_at")
+    validate_write_fence(
+        fence,
+        snapshot=snapshot_value,
+        expected_target_set_sha256=target_set_sha256(targets),
+        # Validate immutable shape at its issuance instant. Live callers still
+        # perform the expiry and current-epoch check at the provider boundary.
+        now=issued_at,
+    )
+    return {
+        **targets,
+        "target_set_sha256": target_set_sha256(targets),
+    }
 
 
 def write_fence_binding(snapshot: Any) -> dict[str, Any]:
@@ -436,5 +638,7 @@ __all__ = [
     "snapshot_core_sha256",
     "target_set_sha256",
     "validate_write_fence",
+    "validate_write_fence_source_binding",
+    "write_target_set_from_source_envelope",
     "write_fence_binding",
 ]

@@ -102,6 +102,7 @@ from gateway.pnc_rca_snapshot import (
 from gateway.pnc_rca_write_fence import (
     ExternalWriteFenceError,
     validate_write_fence,
+    validate_write_fence_source_binding,
     write_fence_binding,
 )
 from gateway.pnc_rca_workspace_runtime import (
@@ -273,9 +274,26 @@ def _validate_vm_submit_fence(
     fence = dict(bundle.snapshot.write_fence)
     if fence.get("state") != "issued":
         raise ExternalWriteFenceError("external_write_fence_missing")
+    source_targets = validate_write_fence_source_binding(
+        fence,
+        snapshot=bundle.snapshot,
+        source_envelope=bundle.creator_source_envelope,
+    )
     live = None
     if control_store is not None:
         live = control_store.validate_external_write_fence_binding(fence)
+        if any(
+            live.get(name) != source_targets.get(name)
+            for name in (
+                "issue_target",
+                "thread_target",
+                "chat_id",
+                "target_set_sha256",
+            )
+        ):
+            raise ExternalWriteFenceError(
+                "external_write_fence_target_mismatch"
+            )
     validate_write_fence(
         fence,
         snapshot=bundle.snapshot,
@@ -286,6 +304,7 @@ def _validate_vm_submit_fence(
         expected_business_key=admission.business_key,
         expected_submission_key=admission.submission_key,
         expected_generation=admission.generation,
+        expected_target_set_sha256=source_targets["target_set_sha256"],
         now=now,
     )
 

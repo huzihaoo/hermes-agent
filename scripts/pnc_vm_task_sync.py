@@ -40,6 +40,7 @@ from gateway.pnc_rca_write_fence import (  # noqa: E402
     ExternalWriteFenceError,
     snapshot_core_sha256,
     validate_write_fence,
+    validate_write_fence_source_binding,
 )
 from hermes_cli.config import get_hermes_home  # noqa: E402
 from scripts.vm_task_state_bridge import _atomic_write_json, _load_existing, sidecar_path  # noqa: E402
@@ -1210,7 +1211,9 @@ def _save_report_attachment_ledger(payload: dict[str, Any]) -> None:
 
 def _validate_report_attachment_fence(*, vm_task_id: str, work_item_id: str) -> None:
     """Require the live W5 fence before the legacy attachment provider call."""
-    if "g1q3" not in str(vm_task_id or "").lower():
+    # Date-prefixed task ids are pre-W3 historical records.  New admitted RCA
+    # submissions use the immutable g1q3-rca-s1-* key and require the fence.
+    if not str(vm_task_id or "").lower().startswith("g1q3-rca-s1-"):
         return
     configured = os.getenv("HERMES_RCA_CONTROL_DB_PATH", "").strip()
     db_path = Path(configured).expanduser() if configured else (
@@ -1221,7 +1224,17 @@ def _validate_report_attachment_fence(*, vm_task_id: str, work_item_id: str) -> 
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         row = conn.execute(
-            "SELECT admission_snapshot_json FROM rca_admission_snapshots WHERE submission_key = ?",
+            """
+            SELECT snapshot.admission_snapshot_json,
+                   envelope.source_envelope_json
+              FROM rca_admission_snapshots AS snapshot
+              JOIN rca_snapshot_source_envelopes AS envelope
+                ON envelope.snapshot_sha256 = snapshot.snapshot_sha256
+               AND envelope.source_envelope_sha256 =
+                   snapshot.creator_source_envelope_sha256
+               AND envelope.source_id = snapshot.creator_source_id
+             WHERE snapshot.submission_key = ?
+            """,
             (str(vm_task_id).strip(),),
         ).fetchone()
         if row is None:
@@ -1230,13 +1243,23 @@ def _validate_report_attachment_fence(*, vm_task_id: str, work_item_id: str) -> 
         fence = snapshot.get("write_fence") if isinstance(snapshot, dict) else None
         if not isinstance(fence, dict) or fence.get("state") != "issued":
             raise ExternalWriteFenceError("external_write_fence_missing")
+        source_targets = validate_write_fence_source_binding(
+            fence,
+            snapshot=snapshot,
+            source_envelope=json.loads(str(row["source_envelope_json"])),
+        )
         ticket = (
             ((snapshot.get("canonical_request") or {}).get("ticket"))
             if isinstance(snapshot, dict)
             else {}
         )
         issue_target = str((ticket or {}).get("issue_url") or "").strip()
-        if not issue_target:
+        if (
+            not issue_target
+            or issue_target != source_targets["issue_target"]
+            or str((ticket or {}).get("work_item_id") or "").strip()
+            != str(work_item_id or "").strip()
+        ):
             raise ExternalWriteFenceError("external_write_fence_target_mismatch")
         epoch_row = conn.execute(
             """
@@ -1275,6 +1298,7 @@ def _validate_report_attachment_fence(*, vm_task_id: str, work_item_id: str) -> 
         expected_submission_key=str(vm_task_id),
         expected_generation=int(fence.get("generation") or 0),
         expected_issue_target=issue_target,
+        expected_target_set_sha256=source_targets["target_set_sha256"],
     )
 
 

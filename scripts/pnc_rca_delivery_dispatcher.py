@@ -2526,10 +2526,18 @@ class DeliveryDispatcher:
                 code = "external_write_fence_epoch_not_current"
             raise ExternalWriteFenceError(code, str(exc)) from exc
         expected_thread = (
-            str(claim.payload.get("thread_id") or "").strip()
+            str(live.get("thread_target") or "").strip()
             if claim.effect_kind == DELIVERY_THREAD_EFFECT_KIND
             else None
         )
+        expected_issue = str(live.get("issue_target") or "").strip()
+        expected_target_set_sha256 = str(
+            live.get("target_set_sha256") or ""
+        ).strip()
+        if not expected_issue or not expected_target_set_sha256:
+            raise ExternalWriteFenceError(
+                "external_write_fence_target_mismatch"
+            )
         validate_write_fence(
             fence,
             snapshot_core_sha256_value=str(core_sha),
@@ -2540,8 +2548,9 @@ class DeliveryDispatcher:
             expected_business_key=claim.business_key,
             expected_submission_key=claim.submission_key,
             expected_generation=claim.generation,
-            expected_issue_target=claim.issue_url,
+            expected_issue_target=expected_issue,
             expected_thread_target=expected_thread,
+            expected_target_set_sha256=expected_target_set_sha256,
             now=self.now(),
         )
 

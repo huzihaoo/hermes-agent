@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -6,8 +7,10 @@ import pytest
 from gateway.pnc_rca_write_fence import (
     ExternalWriteFenceError,
     build_issued_write_fence,
+    canonical_write_fence_sha256,
     snapshot_core_sha256,
     validate_write_fence,
+    validate_write_fence_source_binding,
 )
 
 
@@ -54,6 +57,59 @@ def _fence():
         now=NOW,
         expires_at=NOW + timedelta(hours=2),
     )
+
+
+def _bound_snapshot_and_envelope(
+    *, fence_now: datetime = NOW, submission_key: str = "submission-1"
+):
+    base = _snapshot()
+    base["resolved_admission"]["submission_key"] = submission_key
+    fence = build_issued_write_fence(
+        snapshot=base,
+        activation_epoch_id="epoch-1",
+        activation_ledger_id=7,
+        admission_key="admission-1",
+        target_set={
+            "issue_target": "https://project.feishu.cn/g1q3/issue/detail/123",
+            "thread_target": "topic:abc",
+            "chat_id": "oc_1",
+        },
+        now=fence_now,
+        expires_at=fence_now + timedelta(hours=2),
+    )
+    snapshot_identity = {**base, "write_fence": fence}
+    snapshot_sha256 = canonical_write_fence_sha256(snapshot_identity)
+    snapshot = {
+        **snapshot_identity,
+        "snapshot_id": f"pnc-rca-snapshot-v1-{snapshot_sha256}",
+        "snapshot_sha256": snapshot_sha256,
+    }
+    envelope_identity = {
+        "schema_version": "pnc_rca_snapshot_source_envelope_v1",
+        "source_authority_sha256": "2" * 64,
+        "snapshot_id": snapshot["snapshot_id"],
+        "snapshot_sha256": snapshot_sha256,
+        "submission_key": submission_key,
+        "source_id": "source-1",
+        "source_kind": "feishu_group_manual",
+        "ingress_decision": {},
+        "source_metadata": {
+            "platform": "feishu",
+            "chat_id": "oc_1",
+            "thread_id": "topic:abc",
+        },
+        "anchor": {
+            "issue_target": "https://project.feishu.cn/g1q3/issue/detail/123",
+            "thread_target": "topic:abc",
+        },
+    }
+    envelope_sha256 = canonical_write_fence_sha256(envelope_identity)
+    envelope = {
+        **envelope_identity,
+        "source_envelope_id": f"pnc-rca-source-envelope-v1-{envelope_sha256}",
+        "source_envelope_sha256": envelope_sha256,
+    }
+    return snapshot, envelope, fence
 
 
 def test_issued_fence_is_bound_to_core_and_operation():
@@ -105,6 +161,264 @@ def test_legacy_boolean_does_not_grant_without_fence():
     with pytest.raises(ExternalWriteFenceError) as exc:
         validate_write_fence({}, operation="feishu_issue_comment", target="issue", now=NOW)
     assert exc.value.code == "external_write_fence_missing"
+
+
+def test_source_binding_rejects_target_and_envelope_hash_mutations():
+    snapshot, envelope, fence = _bound_snapshot_and_envelope()
+    targets = validate_write_fence_source_binding(
+        fence,
+        snapshot=snapshot,
+        source_envelope=envelope,
+    )
+    assert targets["issue_target"].endswith("/123")
+    assert targets["target_set_sha256"] == fence["target_set_sha256"]
+
+    changed_anchor = dict(envelope)
+    changed_anchor["anchor"] = {
+        "issue_target": "https://project.feishu.cn/g1q3/issue/detail/999",
+        "thread_target": "topic:abc",
+    }
+    with pytest.raises(ExternalWriteFenceError) as exc:
+        validate_write_fence_source_binding(
+            fence,
+            snapshot=snapshot,
+            source_envelope=changed_anchor,
+        )
+    assert exc.value.code == "external_write_fence_identity_mismatch"
+
+    forged_envelope = dict(envelope)
+    forged_envelope["source_envelope_sha256"] = "3" * 64
+    with pytest.raises(ExternalWriteFenceError) as exc:
+        validate_write_fence_source_binding(
+            fence,
+            snapshot=snapshot,
+            source_envelope=forged_envelope,
+        )
+    assert exc.value.code == "external_write_fence_identity_mismatch"
+
+
+def test_w13_shaped_claim_cannot_change_authoritative_issue_target():
+    from scripts.pnc_rca_delivery_dispatcher import DeliveryDispatcher
+
+    snapshot, envelope, fence = _bound_snapshot_and_envelope()
+    source_targets = validate_write_fence_source_binding(
+        fence,
+        snapshot=snapshot,
+        source_envelope=envelope,
+    )
+
+    class Store:
+        def is_historical_external_write_effect(self, _created_at):
+            return False
+
+        def validate_external_write_fence_binding(self, _fence):
+            return {
+                "epoch_id": "epoch-1",
+                "ledger_id": 7,
+                "business_key": "business-1",
+                "submission_key": "submission-1",
+                "generation": 1,
+                **source_targets,
+            }
+
+    claim = SimpleNamespace(
+        contract={
+            "w3_execution_snapshot": {
+                "write_fence": fence,
+                "snapshot_core_sha256": snapshot_core_sha256(snapshot),
+            }
+        },
+        effect_created_at=NOW.isoformat(),
+        effect_kind="feishu_issue_comment",
+        payload={
+            "schema_version": "pnc_rca_conclusion_adjudication_effect_v2"
+        },
+        business_key="business-1",
+        submission_key="submission-1",
+        generation=1,
+        issue_url="https://project.feishu.cn/g1q3/issue/detail/123",
+    )
+    dispatcher = DeliveryDispatcher.__new__(DeliveryDispatcher)
+    dispatcher.store = Store()
+    dispatcher.now = lambda: NOW
+    dispatcher._validate_external_write(
+        claim,
+        operation="feishu_issue_comment",
+        target=claim.issue_url,
+    )
+
+    forged_claim = SimpleNamespace(**vars(claim))
+    forged_claim.issue_url = "https://project.feishu.cn/g1q3/issue/detail/999"
+    with pytest.raises(ExternalWriteFenceError) as exc:
+        dispatcher._validate_external_write(
+            forged_claim,
+            operation="feishu_issue_comment",
+            target=forged_claim.issue_url,
+        )
+    assert exc.value.code == "external_write_fence_target_mismatch"
+
+
+def test_relay_boundary_uses_live_bound_thread_and_rejects_forged_target(
+    monkeypatch,
+):
+    from scripts import pnc_completion_notice_relay as relay
+
+    submission_key = "g1q3-rca-s1-submission-1"
+    snapshot, envelope, fence = _bound_snapshot_and_envelope(
+        fence_now=datetime.now(timezone.utc) - timedelta(minutes=1),
+        submission_key=submission_key,
+    )
+    source_targets = validate_write_fence_source_binding(
+        fence,
+        snapshot=snapshot,
+        source_envelope=envelope,
+    )
+    binding = {
+        "snapshot": snapshot,
+        "snapshot_core_sha256": snapshot_core_sha256(snapshot),
+        "write_fence": fence,
+        **source_targets,
+    }
+    live = {
+        "epoch_id": "epoch-1",
+        "ledger_id": 7,
+        "business_key": "business-1",
+        "submission_key": submission_key,
+        "generation": 1,
+        **source_targets,
+    }
+    monkeypatch.setattr(relay, "_load_task_write_fence", lambda _task: binding)
+    monkeypatch.setattr(relay, "_relay_live_fence_binding", lambda _fence: live)
+    sent: list[dict[str, str]] = []
+    cards: list[str] = []
+    send, send_card = relay._fenced_task_senders(
+        "g1q3-rca-s1-submission-1",
+        lambda args: sent.append(args) or "ok",
+        lambda target, _payload, **_kwargs: cards.append(target)
+        or {"success": True},
+    )
+    assert send({"target": "feishu:oc_1:abc", "message": "ok"}) == "ok"
+    assert send_card(
+        "feishu:oc_1:abc", {"title": "ok"}
+    )["success"] is True
+    with pytest.raises(ExternalWriteFenceError) as exc:
+        send({"target": "feishu:oc_1:attacker", "message": "bad"})
+    assert exc.value.code == "external_write_fence_target_mismatch"
+    assert len(sent) == 1
+    assert cards == ["feishu:oc_1:abc"]
+
+
+def test_attachment_boundary_rejects_mutated_source_anchor(monkeypatch):
+    from scripts import pnc_vm_task_sync as vm_sync
+
+    submission_key = "g1q3-rca-s1-submission-1"
+    fence_now = datetime.now(timezone.utc) - timedelta(minutes=1)
+    snapshot, envelope, fence = _bound_snapshot_and_envelope(
+        fence_now=fence_now,
+        submission_key=submission_key,
+    )
+    snapshot["canonical_request"]["ticket"]["work_item_id"] = "123"
+    # Rebuild the final snapshot/fence identity after adding the immutable item id.
+    fence = build_issued_write_fence(
+        snapshot={key: value for key, value in snapshot.items() if key not in {"snapshot_id", "snapshot_sha256", "write_fence"}},
+        activation_epoch_id="epoch-1",
+        activation_ledger_id=7,
+        admission_key="admission-1",
+        target_set={
+            "issue_target": "https://project.feishu.cn/g1q3/issue/detail/123",
+            "thread_target": "topic:abc",
+            "chat_id": "oc_1",
+        },
+        now=fence_now,
+        expires_at=fence_now + timedelta(hours=2),
+    )
+    snapshot_identity = {
+        key: value
+        for key, value in snapshot.items()
+        if key not in {"snapshot_id", "snapshot_sha256", "write_fence"}
+    }
+    snapshot_identity["write_fence"] = fence
+    snapshot_sha256 = canonical_write_fence_sha256(snapshot_identity)
+    snapshot = {
+        **snapshot_identity,
+        "snapshot_id": f"pnc-rca-snapshot-v1-{snapshot_sha256}",
+        "snapshot_sha256": snapshot_sha256,
+    }
+    envelope["snapshot_id"] = snapshot["snapshot_id"]
+    envelope["snapshot_sha256"] = snapshot_sha256
+    envelope_identity = {
+        key: envelope[key]
+        for key in (
+            "schema_version",
+            "source_authority_sha256",
+            "snapshot_id",
+            "snapshot_sha256",
+            "submission_key",
+            "source_id",
+            "source_kind",
+            "ingress_decision",
+            "source_metadata",
+            "anchor",
+        )
+    }
+    envelope_sha256 = canonical_write_fence_sha256(envelope_identity)
+    envelope["source_envelope_sha256"] = envelope_sha256
+    envelope["source_envelope_id"] = f"pnc-rca-source-envelope-v1-{envelope_sha256}"
+
+    class Row(dict):
+        pass
+
+    class Cursor:
+        def __init__(self, row):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class Connection:
+        row_factory = None
+
+        def execute(self, sql, _params=()):
+            if "admission_snapshot_json" in sql:
+                return Cursor(Row(
+                    {
+                        "admission_snapshot_json": json.dumps(snapshot),
+                        "source_envelope_json": json.dumps(envelope),
+                    }
+                ))
+            return Cursor(Row(
+                {
+                    "epoch_id": "epoch-1",
+                    "state": "bounded_active",
+                    "is_current": 1,
+                    "ledger_id": 7,
+                    "business_key": "business-1",
+                    "submission_key": submission_key,
+                    "generation": 1,
+                    "decision": "admit",
+                    "bound_at": fence_now.isoformat(),
+                }
+            ))
+
+        def close(self):
+            return None
+
+    monkeypatch.setenv("HERMES_RCA_CONTROL_DB_PATH", "/tmp/w5-fence-test.sqlite3")
+    monkeypatch.setattr(vm_sync.sqlite3, "connect", lambda *_args, **_kwargs: Connection())
+    vm_sync._validate_report_attachment_fence(
+        vm_task_id="g1q3-rca-s1-submission-1",
+        work_item_id="123",
+    )
+    envelope["anchor"] = {
+        "issue_target": "https://project.feishu.cn/g1q3/issue/detail/999",
+        "thread_target": "topic:abc",
+    }
+    with pytest.raises(ExternalWriteFenceError) as exc:
+        vm_sync._validate_report_attachment_fence(
+            vm_task_id="g1q3-rca-s1-submission-1",
+            work_item_id="123",
+        )
+    assert exc.value.code == "external_write_fence_identity_mismatch"
 
 
 def test_delivery_cutoff_is_durable_and_grandfathers_only_old_rows(tmp_path):

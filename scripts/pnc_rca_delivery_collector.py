@@ -90,6 +90,7 @@ from gateway.pnc_rca_write_fence import (
     ExternalWriteFenceError,
     canonical_write_fence_sha256,
     validate_write_fence,
+    validate_write_fence_source_binding,
     write_fence_binding,
 )
 from hermes_constants import get_hermes_home
@@ -2736,9 +2737,28 @@ class DeliveryCollector:
                 if not isinstance(fence, Mapping):
                     raise DeliveryContractError("external_write_fence_missing")
                 try:
+                    source_targets = validate_write_fence_source_binding(
+                        fence,
+                        snapshot=snapshot_bundle.snapshot,
+                        source_envelope=(
+                            snapshot_bundle.creator_source_envelope
+                        ),
+                    )
                     live = self._control_store().validate_external_write_fence_binding(
                         fence
                     )
+                    if any(
+                        live.get(name) != source_targets.get(name)
+                        for name in (
+                            "issue_target",
+                            "thread_target",
+                            "chat_id",
+                            "target_set_sha256",
+                        )
+                    ):
+                        raise ExternalWriteFenceError(
+                            "external_write_fence_target_mismatch"
+                        )
                     validate_write_fence(
                         fence,
                         snapshot=snapshot_bundle.snapshot,
@@ -2747,6 +2767,9 @@ class DeliveryCollector:
                         expected_business_key=claim.business_key,
                         expected_submission_key=claim.submission_key,
                         expected_generation=claim.generation,
+                        expected_target_set_sha256=source_targets[
+                            "target_set_sha256"
+                        ],
                         now=self.now(),
                     )
                 except ExternalWriteFenceError as exc:

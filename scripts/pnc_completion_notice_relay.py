@@ -42,6 +42,7 @@ from gateway.pnc_rca_write_fence import (  # noqa: E402
     ExternalWriteFenceError,
     snapshot_core_sha256,
     validate_write_fence,
+    validate_write_fence_source_binding,
 )
 from gateway.feishu_mention import (  # noqa: E402
     build_at_mention,
@@ -4053,7 +4054,17 @@ def _load_task_write_fence(task_id: str) -> dict[str, Any]:
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         row = conn.execute(
-            "SELECT admission_snapshot_json FROM rca_admission_snapshots WHERE submission_key = ?",
+            """
+            SELECT snapshot.admission_snapshot_json,
+                   envelope.source_envelope_json
+              FROM rca_admission_snapshots AS snapshot
+              JOIN rca_snapshot_source_envelopes AS envelope
+                ON envelope.snapshot_sha256 = snapshot.snapshot_sha256
+               AND envelope.source_envelope_sha256 =
+                   snapshot.creator_source_envelope_sha256
+               AND envelope.source_id = snapshot.creator_source_id
+             WHERE snapshot.submission_key = ?
+            """,
             (key,),
         ).fetchone()
     except (OSError, sqlite3.Error) as exc:
@@ -4074,10 +4085,24 @@ def _load_task_write_fence(task_id: str) -> dict[str, Any]:
     fence = snapshot.get("write_fence") if isinstance(snapshot, dict) else None
     if not isinstance(fence, dict) or fence.get("state") != "issued":
         raise ExternalWriteFenceError("external_write_fence_missing")
+    try:
+        source_envelope = json.loads(str(row["source_envelope_json"]))
+        targets = validate_write_fence_source_binding(
+            fence,
+            snapshot=snapshot,
+            source_envelope=source_envelope,
+        )
+    except ExternalWriteFenceError:
+        raise
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ExternalWriteFenceError(
+            "external_write_fence_schema_invalid"
+        ) from exc
     return {
         "snapshot": snapshot,
         "snapshot_core_sha256": snapshot_core_sha256(snapshot),
         "write_fence": fence,
+        **targets,
     }
 
 
@@ -4091,11 +4116,24 @@ def _relay_live_fence_binding(fence: Mapping[str, Any]) -> dict[str, Any]:
             SELECT epoch.epoch_id, epoch.state, epoch.is_current,
                    ledger.ledger_id, ledger.admission_key,
                    ledger.business_key, ledger.submission_key,
-                   ledger.generation, ledger.decision, ledger.bound_at
+                   ledger.generation, ledger.decision, ledger.bound_at,
+                   snapshot.admission_snapshot_json,
+                   envelope.source_envelope_json
               FROM rca_activation_epochs AS epoch
               JOIN rca_activation_admission_ledger AS ledger
                 ON ledger.epoch_id = epoch.epoch_id
                AND ledger.ledger_id = ?
+              JOIN rca_admission_snapshots AS snapshot
+                ON snapshot.business_key = ledger.business_key
+               AND snapshot.submission_key = ledger.submission_key
+               AND snapshot.generation = ledger.generation
+               AND snapshot.activation_epoch_id = ledger.epoch_id
+               AND snapshot.activation_ledger_id = ledger.ledger_id
+              JOIN rca_snapshot_source_envelopes AS envelope
+                ON envelope.snapshot_sha256 = snapshot.snapshot_sha256
+               AND envelope.source_envelope_sha256 =
+                   snapshot.creator_source_envelope_sha256
+               AND envelope.source_id = snapshot.creator_source_id
              WHERE epoch.epoch_id = ? AND ledger.admission_key = ?
             """,
             (
@@ -4112,12 +4150,25 @@ def _relay_live_fence_binding(fence: Mapping[str, Any]) -> dict[str, Any]:
         raise ExternalWriteFenceError("external_write_fence_epoch_not_current")
     if str(row["decision"]) != "admit" or not row["bound_at"]:
         raise ExternalWriteFenceError("external_write_fence_operation_denied")
+    try:
+        targets = validate_write_fence_source_binding(
+            fence,
+            snapshot=json.loads(str(row["admission_snapshot_json"])),
+            source_envelope=json.loads(str(row["source_envelope_json"])),
+        )
+    except ExternalWriteFenceError:
+        raise
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ExternalWriteFenceError(
+            "external_write_fence_schema_invalid"
+        ) from exc
     return {
         "epoch_id": str(row["epoch_id"]),
         "ledger_id": int(row["ledger_id"]),
         "business_key": str(row["business_key"]),
         "submission_key": str(row["submission_key"]),
         "generation": int(row["generation"]),
+        **targets,
     }
 
 
@@ -4132,21 +4183,53 @@ def _fenced_task_senders(
     fence = binding["write_fence"]
     core_sha = binding["snapshot_core_sha256"]
     resolved = snapshot.get("resolved_admission") or {}
-    ticket = (snapshot.get("canonical_request") or {}).get("ticket") or {}
-    issue_target = str(ticket.get("issue_url") or "")
-
     def _check(operation: str, target: str) -> None:
         live = _relay_live_fence_binding(fence)
+        chat_id = str(live.get("chat_id") or "").strip()
+        thread_target = str(live.get("thread_target") or "").strip()
+        thread_anchor = thread_target.removeprefix("topic:")
+        bare_target = f"feishu:{chat_id}" if chat_id else ""
+        threaded_target = (
+            f"{bare_target}:{thread_anchor}"
+            if bare_target and thread_anchor
+            else ""
+        )
+        expected_provider_target = (
+            threaded_target
+            if operation
+            in {
+                "feishu_thread_reply",
+                "feishu_card_create",
+                "feishu_card_patch",
+            }
+            else bare_target
+        )
+        if not expected_provider_target or target != expected_provider_target:
+            raise ExternalWriteFenceError(
+                "external_write_fence_target_mismatch"
+            )
+        authorization_target = (
+            thread_target
+            if operation == "feishu_thread_reply"
+            else (
+                str(live["issue_target"])
+                if operation in {"feishu_card_create", "feishu_card_patch"}
+                else str(task_id)
+            )
+        )
         validate_write_fence(
             fence,
             snapshot_core_sha256_value=core_sha,
             operation=operation,
-            target=target,
+            target=authorization_target,
             expected_epoch_id=live["epoch_id"],
             expected_ledger_id=live["ledger_id"],
             expected_business_key=str(resolved.get("business_key") or ""),
             expected_submission_key=str(resolved.get("submission_key") or task_id),
             expected_generation=int(resolved.get("generation") or 0),
+            expected_issue_target=str(live["issue_target"]),
+            expected_thread_target=thread_target or None,
+            expected_target_set_sha256=str(live["target_set_sha256"]),
             now=datetime.now(timezone.utc),
         )
 
@@ -4155,12 +4238,12 @@ def _fenced_task_senders(
         operation = "internal_alert"
         if target.count(":") >= 2:
             operation = "feishu_thread_reply"
-        _check(operation, str(task_id) if operation == "internal_alert" else target)
+        _check(operation, target)
         return (send_func or send_message_tool)(args)
 
     def _card(target: str, card_payload: dict[str, Any], message_id: str | None = None) -> dict[str, Any]:
         operation = "feishu_card_patch" if message_id else "feishu_card_create"
-        _check(operation, issue_target)
+        _check(operation, target)
         if send_card_func is None:
             return {"success": False, "error_code": "external_write_fence_operation_denied", "error": "card sender unavailable"}
         return send_card_func(target, card_payload, message_id=message_id)
@@ -4251,9 +4334,9 @@ def relay_pending_notices(*, task_ids: Iterable[str] | None = None, send: bool =
                 body=body,
                 notice=notice,
             )
-        # Explicit task filters are also used by generic PNC notices.  Only the
-        # canonical G1Q3 task namespace consumes the RCA admission fence.
-        if send and "g1q3-rca" in task_id.lower():
+        # Legacy date-prefixed task ids predate W3 and remain grandfathered.
+        # Only canonical W3 submission keys consume the RCA admission fence.
+        if send and task_id.lower().startswith("g1q3-rca-s1-"):
             try:
                 task_send_func, task_card_func = _fenced_task_senders(
                     task_id,

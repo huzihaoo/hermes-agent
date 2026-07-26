@@ -1552,6 +1552,7 @@ def vm_task_submit_service(
                 ExternalWriteFenceError,
                 canonical_write_fence_sha256,
                 validate_write_fence,
+                validate_write_fence_source_binding,
                 write_fence_binding,
             )
 
@@ -1637,6 +1638,11 @@ def vm_task_submit_service(
             fence = dict(w3_bundle.snapshot.write_fence)
             if fence.get("state") != "issued":
                 raise ExternalWriteFenceError("external_write_fence_missing")
+            source_targets = validate_write_fence_source_binding(
+                fence,
+                snapshot=w3_bundle.snapshot,
+                source_envelope=w3_bundle.creator_source_envelope,
+            )
             validate_write_fence(
                 fence,
                 snapshot=w3_bundle.snapshot,
@@ -1645,6 +1651,9 @@ def vm_task_submit_service(
                 expected_business_key=validated_admission.business_key,
                 expected_submission_key=validated_admission.submission_key,
                 expected_generation=validated_admission.generation,
+                expected_target_set_sha256=source_targets[
+                    "target_set_sha256"
+                ],
             )
 
     data = (

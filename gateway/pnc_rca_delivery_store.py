@@ -652,11 +652,24 @@ class RcaDeliveryStore:
                 SELECT epoch.epoch_id, epoch.state, epoch.is_current,
                        ledger.ledger_id, ledger.admission_key,
                        ledger.business_key, ledger.submission_key,
-                       ledger.generation, ledger.decision, ledger.bound_at
+                       ledger.generation, ledger.decision, ledger.bound_at,
+                       snapshot.admission_snapshot_json,
+                       envelope.source_envelope_json
                   FROM rca_activation_epochs AS epoch
                   JOIN rca_activation_admission_ledger AS ledger
                     ON ledger.epoch_id = epoch.epoch_id
                    AND ledger.ledger_id = ?
+                  JOIN rca_admission_snapshots AS snapshot
+                    ON snapshot.business_key = ledger.business_key
+                   AND snapshot.submission_key = ledger.submission_key
+                   AND snapshot.generation = ledger.generation
+                   AND snapshot.activation_epoch_id = ledger.epoch_id
+                   AND snapshot.activation_ledger_id = ledger.ledger_id
+                  JOIN rca_snapshot_source_envelopes AS envelope
+                    ON envelope.snapshot_sha256 = snapshot.snapshot_sha256
+                   AND envelope.source_envelope_sha256 =
+                       snapshot.creator_source_envelope_sha256
+                   AND envelope.source_id = snapshot.creator_source_id
                  WHERE epoch.epoch_id = ? AND ledger.admission_key = ?
                 """,
                 (ledger_id, epoch_id, admission_key),
@@ -669,6 +682,21 @@ class RcaDeliveryStore:
             raise RuntimeError("external_write_fence_epoch_not_current")
         if str(row["decision"]) != "admit" or not row["bound_at"]:
             raise RuntimeError("external_write_fence_operation_denied")
+        try:
+            from gateway.pnc_rca_write_fence import (
+                ExternalWriteFenceError,
+                validate_write_fence_source_binding,
+            )
+
+            targets = validate_write_fence_source_binding(
+                fence,
+                snapshot=json.loads(str(row["admission_snapshot_json"])),
+                source_envelope=json.loads(str(row["source_envelope_json"])),
+            )
+        except ExternalWriteFenceError as exc:
+            raise RuntimeError(exc.code) from exc
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError("external_write_fence_schema_invalid") from exc
         return {
             "epoch_id": str(row["epoch_id"]),
             "state": str(row["state"]),
@@ -677,6 +705,7 @@ class RcaDeliveryStore:
             "business_key": str(row["business_key"]),
             "submission_key": str(row["submission_key"]),
             "generation": int(row["generation"]),
+            **targets,
         }
 
     def is_historical_external_write_effect(self, created_at: str) -> bool:
