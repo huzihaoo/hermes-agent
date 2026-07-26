@@ -260,6 +260,30 @@ EnrichFunc = Callable[[Mapping[str, Any]], RcaIssueContext]
 SubmitFunc = Callable[[RcaAdmission, RcaExecutionRequest], Mapping[str, Any]]
 
 
+def _live_write_fence_binding(
+    control_store: RcaControlStore,
+    fence: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    try:
+        return control_store.validate_external_write_fence_binding(fence)
+    except RecordConflictError as exc:
+        code = str(exc).strip()
+        if code not in {
+            "external_write_fence_schema_invalid",
+            "external_write_fence_epoch_not_current",
+            "external_write_fence_operation_denied",
+            "external_write_fence_identity_mismatch",
+            "external_write_fence_target_mismatch",
+        }:
+            code = "external_write_fence_epoch_not_current"
+        raise ExternalWriteFenceError(code, str(exc)) from exc
+    except Exception as exc:
+        raise ExternalWriteFenceError(
+            "external_write_fence_epoch_not_current",
+            type(exc).__name__,
+        ) from exc
+
+
 def _validate_vm_submit_fence(
     *,
     bundle: AdmissionSnapshotExecutionBundle | None,
@@ -279,21 +303,21 @@ def _validate_vm_submit_fence(
         snapshot=bundle.snapshot,
         source_envelope=bundle.creator_source_envelope,
     )
-    live = None
-    if control_store is not None:
-        live = control_store.validate_external_write_fence_binding(fence)
-        if any(
-            live.get(name) != source_targets.get(name)
-            for name in (
-                "issue_target",
-                "thread_target",
-                "chat_id",
-                "target_set_sha256",
-            )
-        ):
-            raise ExternalWriteFenceError(
-                "external_write_fence_target_mismatch"
-            )
+    if control_store is None:
+        return
+    live = _live_write_fence_binding(control_store, fence)
+    if any(
+        live.get(name) != source_targets.get(name)
+        for name in (
+            "issue_target",
+            "thread_target",
+            "chat_id",
+            "target_set_sha256",
+        )
+    ):
+        raise ExternalWriteFenceError(
+            "external_write_fence_target_mismatch"
+        )
     validate_write_fence(
         fence,
         snapshot=bundle.snapshot,
@@ -929,7 +953,6 @@ def default_submit(
                 ),
                 admission=admission,
                 now=datetime.now(timezone.utc),
-                control_store=control_store,
             )
         except ExternalWriteFenceError:
             raise
@@ -950,8 +973,8 @@ def default_submit(
         **capacity_bindings,
     }
     if control_store is not None:
-        submit_kwargs["live_write_fence_authority"] = (
-            control_store.validate_external_write_fence_binding
+        submit_kwargs["live_write_fence_authority"] = lambda fence: (
+            _live_write_fence_binding(control_store, fence)
         )
     return vm_task_submit_service(**submit_kwargs)
 
@@ -2442,7 +2465,6 @@ class OutboxDispatcher:
                         bundle=snapshot_bundle,
                         admission=admission,
                         now=self.now(),
-                        control_store=self.store,
                     )
                 except ExternalWriteFenceError as exc:
                     raise DispatchCircuitError(exc.code, exc.detail) from exc

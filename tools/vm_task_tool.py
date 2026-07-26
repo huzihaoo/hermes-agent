@@ -1133,6 +1133,7 @@ def _vm_task_submit_trusted(
     create_task_script: Path | None = None,
     rca_prod_service_receipt: dict[str, Any] | None = None,
     rca_prod_workspace_runtime: Any | None = None,
+    pre_create_guard: Callable[[], Mapping[str, Any] | None] | None = None,
 ) -> Dict[str, Any]:
     """Create a task after a public-human or dedicated-service gate allowed it."""
 
@@ -1270,6 +1271,30 @@ def _vm_task_submit_trusted(
                     "expected_workspace_runtime": rca_prod_workspace_runtime.to_dict(),
                     "observed_workspace_runtime": final_workspace_runtime.to_dict(),
                 }
+        if pre_create_guard is not None:
+            try:
+                guard_result = pre_create_guard()
+            except Exception as exc:
+                return {
+                    **_vm_task_service_denied_payload(
+                        "vm_task_service_request_invalid",
+                        f"pre-create authorization guard failed: {type(exc).__name__}",
+                    ),
+                    "create_suppressed": True,
+                }
+            if guard_result is not None:
+                if (
+                    not isinstance(guard_result, Mapping)
+                    or guard_result.get("success") is not False
+                ):
+                    return {
+                        **_vm_task_service_denied_payload(
+                            "vm_task_service_request_invalid",
+                            "pre-create authorization guard returned an invalid result",
+                        ),
+                        "create_suppressed": True,
+                    }
+                return dict(guard_result)
         proc = subprocess.run(
             cmd,
             text=True,
@@ -1538,6 +1563,8 @@ def vm_task_submit_service(
 
     w3_bundle = None
     w3_binding: dict[str, Any] = {}
+    issued_w3_fence: dict[str, Any] | None = None
+    w3_source_targets: dict[str, Any] | None = None
     raw_w3_bundle = toolchain.get("w3_execution_snapshot")
     if snapshot_required and raw_w3_bundle is None:
         return _vm_task_service_denied_payload(
@@ -1639,75 +1666,14 @@ def vm_task_submit_service(
         w3_binding.update(write_fence_binding(w3_bundle.snapshot))
         fence = dict(w3_bundle.snapshot.write_fence)
         if fence.get("state") == "issued":
-            # A signed fence is an external-write capability.  The immutable
-            # snapshot proves what was authorized; the live authority proves
-            # that its activation epoch and target ledger are still current.
-            source_targets = validate_write_fence_source_binding(
+            # Validate the immutable source binding before any dedupe/read path.
+            # The current epoch/ledger is checked only on the create path, where
+            # it can be revalidated immediately before the provider call.
+            issued_w3_fence = fence
+            w3_source_targets = validate_write_fence_source_binding(
                 fence,
                 snapshot=w3_bundle.snapshot,
                 source_envelope=w3_bundle.creator_source_envelope,
-            )
-            if not callable(live_write_fence_authority):
-                return _vm_task_service_denied_payload(
-                    "vm_task_service_request_invalid",
-                    "issued W3 write fence requires live activation authority",
-                )
-            try:
-                live_binding = live_write_fence_authority(fence)
-            except Exception as exc:
-                return _vm_task_service_denied_payload(
-                    "vm_task_service_request_identity_mismatch",
-                    "live W3 write-fence authority rejected the submission "
-                    f"({type(exc).__name__})",
-                )
-            if not isinstance(live_binding, Mapping):
-                return _vm_task_service_denied_payload(
-                    "vm_task_service_request_invalid",
-                    "live W3 write-fence authority returned an invalid binding",
-                )
-            if any(
-                live_binding.get(name) != source_targets.get(name)
-                for name in (
-                    "issue_target",
-                    "thread_target",
-                    "chat_id",
-                    "target_set_sha256",
-                )
-            ):
-                return _vm_task_service_denied_payload(
-                    "vm_task_service_request_identity_mismatch",
-                    "live W3 write-fence targets disagree with the immutable snapshot",
-                )
-            live_epoch_id = str(live_binding.get("epoch_id") or "").strip()
-            live_ledger_id = live_binding.get("ledger_id")
-            if (
-                not live_epoch_id
-                or isinstance(live_ledger_id, bool)
-                or not isinstance(live_ledger_id, int)
-                or live_ledger_id < 1
-                or live_binding.get("admission_key") != fence.get("admission_key")
-                or live_binding.get("business_key")
-                != validated_admission.business_key
-                or live_binding.get("submission_key")
-                != validated_admission.submission_key
-                or live_binding.get("generation")
-                != validated_admission.generation
-            ):
-                return _vm_task_service_denied_payload(
-                    "vm_task_service_request_identity_mismatch",
-                    "live W3 write-fence ledger does not match the admission",
-                )
-            validate_write_fence(
-                fence,
-                snapshot=w3_bundle.snapshot,
-                operation="vm_submit",
-                target=validated_admission.submission_key,
-                expected_epoch_id=live_epoch_id,
-                expected_ledger_id=live_ledger_id,
-                expected_business_key=validated_admission.business_key,
-                expected_submission_key=validated_admission.submission_key,
-                expected_generation=validated_admission.generation,
-                expected_target_set_sha256=source_targets["target_set_sha256"],
             )
         elif snapshot_required:
             raise ExternalWriteFenceError("external_write_fence_missing")
@@ -2151,6 +2117,128 @@ def vm_task_submit_service(
             "admission": admission_payload,
             "workspace_runtime": workspace_runtime.to_dict(),
         }
+
+    pre_create_guard: Callable[[], Mapping[str, Any] | None] | None = None
+    if issued_w3_fence is not None:
+        if not callable(live_write_fence_authority):
+            return _vm_task_service_denied_payload(
+                "vm_task_service_request_invalid",
+                "issued W3 write fence requires live activation authority",
+            )
+        if w3_source_targets is None:
+            return _vm_task_service_denied_payload(
+                "vm_task_service_request_invalid",
+                "issued W3 write fence source binding is unavailable",
+            )
+        authority = live_write_fence_authority
+        source_targets = dict(w3_source_targets)
+        fence = dict(issued_w3_fence)
+
+        def _live_write_fence_guard() -> Mapping[str, Any] | None:
+            known_fence_codes = {
+                "external_write_fence_schema_invalid",
+                "external_write_fence_epoch_not_current",
+                "external_write_fence_operation_denied",
+                "external_write_fence_identity_mismatch",
+                "external_write_fence_target_mismatch",
+                "external_write_fence_expired",
+            }
+
+            def denied(
+                code: str,
+                detail: str,
+                *,
+                fence_error_code: str = "",
+            ) -> dict[str, Any]:
+                result = {
+                    **_vm_task_service_denied_payload(code, detail),
+                    "create_suppressed": True,
+                }
+                if fence_error_code:
+                    result["fence_error_code"] = fence_error_code
+                return result
+
+            def known_fence_code(exc: Exception) -> str:
+                candidate = str(getattr(exc, "code", "") or str(exc)).strip()
+                return candidate if candidate in known_fence_codes else ""
+
+            try:
+                live_binding = authority(dict(fence))
+            except Exception as exc:
+                fence_error_code = known_fence_code(exc)
+                detail = (
+                    "live W3 write-fence authority rejected the submission "
+                    f"({fence_error_code or type(exc).__name__})"
+                )
+                return denied(
+                    "vm_task_service_request_identity_mismatch",
+                    detail,
+                    fence_error_code=fence_error_code,
+                )
+            if not isinstance(live_binding, Mapping):
+                return denied(
+                    "vm_task_service_request_invalid",
+                    "live W3 write-fence authority returned an invalid binding",
+                )
+            if any(
+                live_binding.get(name) != source_targets.get(name)
+                for name in (
+                    "issue_target",
+                    "thread_target",
+                    "chat_id",
+                    "target_set_sha256",
+                )
+            ):
+                return denied(
+                    "vm_task_service_request_identity_mismatch",
+                    "live W3 write-fence targets disagree with the immutable snapshot",
+                    fence_error_code="external_write_fence_target_mismatch",
+                )
+            live_epoch_id = str(live_binding.get("epoch_id") or "").strip()
+            live_ledger_id = live_binding.get("ledger_id")
+            if (
+                not live_epoch_id
+                or isinstance(live_ledger_id, bool)
+                or not isinstance(live_ledger_id, int)
+                or live_ledger_id < 1
+                or live_binding.get("admission_key") != fence.get("admission_key")
+                or live_binding.get("business_key")
+                != validated_admission.business_key
+                or live_binding.get("submission_key")
+                != validated_admission.submission_key
+                or live_binding.get("generation")
+                != validated_admission.generation
+            ):
+                return denied(
+                    "vm_task_service_request_identity_mismatch",
+                    "live W3 write-fence ledger does not match the admission",
+                    fence_error_code="external_write_fence_identity_mismatch",
+                )
+            try:
+                validate_write_fence(
+                    fence,
+                    snapshot=w3_bundle.snapshot,
+                    operation="vm_submit",
+                    target=validated_admission.submission_key,
+                    expected_epoch_id=live_epoch_id,
+                    expected_ledger_id=live_ledger_id,
+                    expected_business_key=validated_admission.business_key,
+                    expected_submission_key=validated_admission.submission_key,
+                    expected_generation=validated_admission.generation,
+                    expected_target_set_sha256=source_targets["target_set_sha256"],
+                )
+            except Exception as exc:
+                fence_error_code = known_fence_code(exc)
+                return denied(
+                    "vm_task_service_request_identity_mismatch",
+                    "live W3 write-fence validation rejected the submission "
+                    f"({fence_error_code or type(exc).__name__})",
+                    fence_error_code=fence_error_code,
+                )
+            return None
+
+        pre_create_guard = _live_write_fence_guard
+
     try:
         create_workspace_runtime = validate_workspace_runtime()
     except WorkspaceRuntimeError as exc:
@@ -2243,7 +2331,19 @@ def vm_task_submit_service(
         create_task_script=post_admission_workspace_runtime.creator_path,
         rca_prod_service_receipt=prod_admission.receipt,
         rca_prod_workspace_runtime=post_admission_workspace_runtime,
+        pre_create_guard=pre_create_guard,
     )
+    if result.get("success") is False and result.get("create_suppressed") is True:
+        return {
+            **result,
+            "admission": admission_payload,
+            "workspace_runtime": workspace_runtime.to_dict(),
+            **(
+                {"w3_execution_snapshot": dict(w3_binding)}
+                if w3_binding
+                else {}
+            ),
+        }
     try:
         reconciled = vm_task_status(
             validated_admission.submission_key, include_markdown=False

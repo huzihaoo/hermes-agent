@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -190,6 +191,52 @@ def test_default_submit_preserves_reconcile_only_dedupe(monkeypatch, tmp_path):
     assert calls[0]["reconcile_only"] is True
 
 
+def test_default_submit_defers_live_store_check_to_service_create_guard(
+    monkeypatch, tmp_path
+):
+    submit_calls = []
+    fence_checks = []
+    monkeypatch.setattr(
+        "tools.vm_task_tool.vm_task_submit_service",
+        lambda **kwargs: submit_calls.append(kwargs) or {"success": True},
+    )
+    monkeypatch.setattr(
+        dispatcher, "_load_bound_bootstrap_authorization", lambda _config: _authorization()
+    )
+    monkeypatch.setattr(
+        dispatcher,
+        "validate_snapshot_execution_bundle",
+        lambda _value: SimpleNamespace(snapshot="immutable-bundle"),
+    )
+    monkeypatch.setattr(
+        dispatcher,
+        "_validate_vm_submit_fence",
+        lambda **kwargs: fence_checks.append(kwargs),
+    )
+    config = replace(
+        dispatcher.DispatcherConfig.from_env(
+            _config_env(tmp_path), hermes_home=tmp_path
+        ),
+        w3_snapshot_read_mode="snapshot_required",
+    )
+    live_binding = {"epoch_id": "epoch-live", "ledger_id": 17}
+    store = SimpleNamespace(
+        validate_external_write_fence_binding=lambda _fence: live_binding
+    )
+
+    dispatcher.default_submit(
+        object(),
+        SimpleNamespace(toolchain={"w3_execution_snapshot": {"fixture": True}}),
+        config=config,
+        control_store=store,
+    )
+
+    assert len(fence_checks) == 1
+    assert "control_store" not in fence_checks[0]
+    authority = submit_calls[0]["live_write_fence_authority"]
+    assert authority({"state": "issued"}) == live_binding
+
+
 def test_capacity_health_projection_is_release_bound(tmp_path):
     config = dispatcher.DispatcherConfig.from_env(
         _config_env(tmp_path, enabled=True), hermes_home=tmp_path
@@ -320,6 +367,50 @@ def test_runtime_closure_includes_prod_admission_and_capacity_sampling():
         "vm_task_service_rca_prod_admission_blocked"
         in dispatcher._GLOBAL_CIRCUIT_ERROR_CODES
     )
+
+
+def test_vm_submit_fence_normalizes_stale_control_store_conflict(monkeypatch):
+    fence = {"state": "issued", "activation_epoch_id": "epoch-old"}
+    bundle = SimpleNamespace(
+        snapshot=SimpleNamespace(write_fence=fence),
+        creator_source_envelope=SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        dispatcher,
+        "validate_snapshot_execution_bundle",
+        lambda value: value,
+    )
+    monkeypatch.setattr(
+        dispatcher,
+        "validate_write_fence_source_binding",
+        lambda *_args, **_kwargs: {
+            "issue_target": "issue",
+            "thread_target": None,
+            "chat_id": "chat",
+            "target_set_sha256": "1" * 64,
+        },
+    )
+    monkeypatch.setattr(dispatcher, "validate_write_fence", lambda *_args, **_kwargs: None)
+
+    class StaleStore:
+        def validate_external_write_fence_binding(self, _fence):
+            raise dispatcher.RecordConflictError(
+                "external_write_fence_epoch_not_current"
+            )
+
+    with pytest.raises(dispatcher.ExternalWriteFenceError) as raised:
+        dispatcher._validate_vm_submit_fence(
+            bundle=bundle,
+            admission=SimpleNamespace(
+                submission_key="submission",
+                business_key="business",
+                generation=1,
+            ),
+            now=datetime.now(timezone.utc),
+            control_store=StaleStore(),
+        )
+
+    assert raised.value.code == "external_write_fence_epoch_not_current"
 
 
 @pytest.mark.parametrize(

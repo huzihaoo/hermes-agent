@@ -1047,6 +1047,74 @@ def test_trusted_create_boundary_revalidates_workspace_runtime(
     assert result["create_suppressed"] is True
 
 
+def test_trusted_create_boundary_runs_live_guard_after_final_runtime_check(
+    monkeypatch, tmp_path
+):
+    creator = tmp_path / "bin/create_task_v2.py"
+    creator.parent.mkdir(parents=True)
+    creator.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    expected = replace(
+        WORKSPACE_RUNTIME,
+        root=tmp_path,
+        manifest_path=tmp_path / "manifest.json",
+        creator_path=creator,
+    )
+    events = []
+    monkeypatch.setattr(
+        vm_task_tool,
+        "validate_workspace_runtime",
+        lambda: events.append("runtime") or expected,
+    )
+    monkeypatch.setattr(
+        vm_task_tool.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("revoked fence reached task creator"),
+    )
+    receipt = {"fixture": "signed-rca-prod-admission"}
+
+    def guard():
+        events.append("guard")
+        return {
+            "success": False,
+            "error_code": "vm_task_service_request_identity_mismatch",
+            "error": "live W3 write-fence authority rejected the submission",
+            "retryable": False,
+            "returncode": None,
+            "create_suppressed": True,
+        }
+
+    result = vm_task_tool._vm_task_submit_trusted(
+        title="fixed RCA",
+        goal="fixed goal",
+        task_id="g1q3-rca-s1-" + "a" * 64,
+        owner=SERVICE_ID,
+        lane="heavy",
+        resource_class="rca_prod",
+        repo_scope="unknown",
+        workspace_scope="none",
+        risk_class="high",
+        artifact_root="/mnt/tmp/g1q3-rca-s1-" + "a" * 64 + "/",
+        artifact_cifs_root=(
+            "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/"
+            "g1q3-rca-s1-" + "a" * 64 + "/"
+        ),
+        executor_type="direct_cli",
+        agent_backend="none",
+        codex_backend_enabled=False,
+        routing_meta_extra={"rca_prod_admission_receipt": receipt},
+        create_once=True,
+        create_task_script=creator,
+        rca_prod_service_receipt=receipt,
+        rca_prod_workspace_runtime=expected,
+        pre_create_guard=guard,
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == "vm_task_service_request_identity_mismatch"
+    assert result["create_suppressed"] is True
+    assert events == ["runtime", "guard"]
+
+
 def test_old_pnc_data_dedupe_identity_conflicts_before_new_admission(monkeypatch, tmp_path):
     _configure_service_policy(monkeypatch, tmp_path)
     admission, request = _contracts()
@@ -1352,9 +1420,11 @@ def test_issued_snapshot_requires_live_fence_authority_before_vm_create(
     monkeypatch.setattr(
         vm_task_tool,
         "vm_task_status",
-        lambda *_args, **_kwargs: pytest.fail(
-            "missing live W5 authority must fail before dedupe/create"
-        ),
+        lambda *_args, **_kwargs: {
+            "success": False,
+            "state": "missing",
+            "task_id": admission.submission_key,
+        },
     )
     monkeypatch.setattr(
         vm_task_tool,
@@ -1398,11 +1468,14 @@ def test_live_fence_authority_binds_epoch_and_ledger_before_vm_create(
     monkeypatch.setattr(
         vm_task_tool,
         "_vm_task_submit_trusted",
-        lambda **kwargs: submitted.append(kwargs)
-        or {
-            "success": True,
-            "task": {"task_id": kwargs["task_id"], "status": "created"},
-        },
+        lambda **kwargs: (
+            submitted.append(kwargs)
+            or kwargs["pre_create_guard"]()
+            or {
+                "success": True,
+                "task": {"task_id": kwargs["task_id"], "status": "created"},
+            }
+        ),
     )
 
     def live_authority(observed_fence):
@@ -1429,13 +1502,212 @@ def test_live_fence_authority_binds_epoch_and_ledger_before_vm_create(
 
     assert authority_calls == [fence]
     assert validate_calls
-    assert validate_calls[0]["expected_epoch_id"] == fence["activation_epoch_id"]
-    assert validate_calls[0]["expected_ledger_id"] == fence["activation_ledger_id"]
+    assert validate_calls[-1]["expected_epoch_id"] == fence["activation_epoch_id"]
+    assert validate_calls[-1]["expected_ledger_id"] == fence["activation_ledger_id"]
     assert submitted
+    assert submitted[0]["pre_create_guard"] is not None
     # The post-create status remains intentionally missing in this offline
     # fixture, so the service returns an uncertain result after proving that
     # the provider boundary was reached only with the live binding.
     assert result["error_code"] == "vm_task_service_submit_uncertain"
+
+
+def test_live_fence_rechecks_after_epoch_revocation_before_create(
+    monkeypatch, tmp_path
+):
+    _configure_service_policy(monkeypatch, tmp_path)
+    admission, request = _contracts()
+    request, fence, targets, _validate_calls = _issued_service_snapshot_fixture(
+        monkeypatch, admission, request
+    )
+    revoked = False
+    authority_calls = []
+    created = []
+
+    def live_authority(observed_fence):
+        authority_calls.append(dict(observed_fence))
+        if revoked:
+            raise RuntimeError("external_write_fence_epoch_not_current")
+        return {
+            **targets,
+            "epoch_id": fence["activation_epoch_id"],
+            "ledger_id": fence["activation_ledger_id"],
+            "admission_key": fence["admission_key"],
+            "business_key": admission.business_key,
+            "submission_key": admission.submission_key,
+            "generation": admission.generation,
+        }
+
+    def status(*_args, **_kwargs):
+        nonlocal revoked
+        revoked = True
+        return {
+            "success": False,
+            "state": "missing",
+            "task_id": admission.submission_key,
+        }
+
+    monkeypatch.setattr(vm_task_tool, "vm_task_status", status)
+
+    def create(**kwargs):
+        guard_result = kwargs["pre_create_guard"]()
+        if guard_result is not None:
+            return guard_result
+        created.append(kwargs)
+        return {
+            "success": True,
+            "task": {"task_id": kwargs["task_id"], "status": "created"},
+        }
+
+    monkeypatch.setattr(vm_task_tool, "_vm_task_submit_trusted", create)
+    result = _submit_service(
+        service_id=SERVICE_ID,
+        capability=CAPABILITY,
+        operation=OPERATION,
+        admission=admission,
+        execution_request=request,
+        snapshot_required=True,
+        live_write_fence_authority=live_authority,
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == "vm_task_service_request_identity_mismatch"
+    assert result["fence_error_code"] == "external_write_fence_epoch_not_current"
+    assert result["create_suppressed"] is True
+    assert created == []
+    assert authority_calls == [fence]
+
+
+def test_existing_task_reconciles_after_epoch_rotation_and_expiry_without_write(
+    monkeypatch, tmp_path
+):
+    _configure_service_policy(monkeypatch, tmp_path)
+    admission, request = _contracts()
+    request, fence, targets, _validate_calls = _issued_service_snapshot_fixture(
+        monkeypatch, admission, request
+    )
+    revoked = False
+    expired = False
+    force_missing = False
+    authority_calls = []
+    status_calls = 0
+    created = []
+    import gateway.pnc_rca_write_fence as fence_module
+
+    validate_calls = []
+
+    def validate_fence(_fence, **kwargs):
+        validate_calls.append(kwargs)
+        if expired:
+            raise fence_module.ExternalWriteFenceError(
+                "external_write_fence_expired"
+            )
+
+    monkeypatch.setattr(fence_module, "validate_write_fence", validate_fence)
+
+    def live_authority(observed_fence):
+        authority_calls.append(dict(observed_fence))
+        if revoked:
+            raise RuntimeError("external_write_fence_epoch_not_current")
+        return {
+            **targets,
+            "epoch_id": fence["activation_epoch_id"],
+            "ledger_id": fence["activation_ledger_id"],
+            "admission_key": fence["admission_key"],
+            "business_key": admission.business_key,
+            "submission_key": admission.submission_key,
+            "generation": admission.generation,
+        }
+
+    existing = {
+        "success": True,
+        "task_id": admission.submission_key,
+        "state": "pending",
+        "meta": {},
+    }
+
+    def status(*_args, **_kwargs):
+        nonlocal expired, revoked, status_calls
+        status_calls += 1
+        if force_missing:
+            return {
+                "success": False,
+                "state": "missing",
+                "task_id": admission.submission_key,
+            }
+        if status_calls == 1:
+            return {
+                "success": False,
+                "state": "missing",
+                "task_id": admission.submission_key,
+            }
+        if status_calls == 2:
+            revoked = True
+            expired = True
+            return {
+                "success": False,
+                "state": "unknown",
+                "task_id": admission.submission_key,
+            }
+        return existing
+
+    monkeypatch.setattr(vm_task_tool, "vm_task_status", status)
+    monkeypatch.setattr(vm_task_tool, "_rca_existing_identity_error", lambda *a, **k: "")
+
+    def create(**kwargs):
+        guard_result = kwargs["pre_create_guard"]()
+        if guard_result is not None:
+            return guard_result
+        created.append(kwargs)
+        return {
+            "success": True,
+            "task": {"task_id": kwargs["task_id"], "status": "created"},
+        }
+
+    monkeypatch.setattr(vm_task_tool, "_vm_task_submit_trusted", create)
+    first = _submit_service(
+        service_id=SERVICE_ID,
+        capability=CAPABILITY,
+        operation=OPERATION,
+        admission=admission,
+        execution_request=request,
+        snapshot_required=True,
+        live_write_fence_authority=live_authority,
+    )
+    revoked = True
+    second = _submit_service(
+        service_id=SERVICE_ID,
+        capability=CAPABILITY,
+        operation=OPERATION,
+        admission=admission,
+        execution_request=request,
+        snapshot_required=True,
+        live_write_fence_authority=live_authority,
+    )
+    assert len(validate_calls) == 1
+    revoked = False
+    force_missing = True
+    third = _submit_service(
+        service_id=SERVICE_ID,
+        capability=CAPABILITY,
+        operation=OPERATION,
+        admission=admission,
+        execution_request=request,
+        snapshot_required=True,
+        live_write_fence_authority=live_authority,
+    )
+
+    assert first["error_code"] == "vm_task_service_submit_uncertain"
+    assert second["success"] is True
+    assert second["deduped"] is True
+    assert second["created"] is False
+    assert third["success"] is False
+    assert third["fence_error_code"] == "external_write_fence_expired"
+    assert third["create_suppressed"] is True
+    assert len(created) == 1
+    assert len(authority_calls) == 2
+    assert status_calls == 4
+    assert len(validate_calls) == 2
 
 
 def test_live_fence_authority_target_mismatch_blocks_before_vm_create(
@@ -1449,14 +1721,16 @@ def test_live_fence_authority_target_mismatch_blocks_before_vm_create(
     monkeypatch.setattr(
         vm_task_tool,
         "vm_task_status",
-        lambda *_args, **_kwargs: pytest.fail(
-            "live target mismatch must fail before dedupe/create"
-        ),
+        lambda *_args, **_kwargs: {
+            "success": False,
+            "state": "missing",
+            "task_id": admission.submission_key,
+        },
     )
     monkeypatch.setattr(
         vm_task_tool,
         "_vm_task_submit_trusted",
-        lambda **_kwargs: pytest.fail("live target mismatch reached VM create"),
+        lambda **kwargs: kwargs["pre_create_guard"](),
     )
 
     result = _submit_service(
