@@ -97,6 +97,7 @@ from hermes_constants import get_hermes_home
 from scripts.pnc_foxglove_delivery import canonical_viz_mcap_path
 from scripts import pnc_fault_taxonomy
 from scripts.pnc_rca_failure_route_outlet import (
+    OUTLET_INSPECTION_SCHEMA_VERSION,
     FailureRouteOutlet,
     FailureRouteOutletError,
 )
@@ -3229,6 +3230,9 @@ class HealthReporter:
         store: RcaDeliveryStore,
         *,
         remote_css_probe: Callable[..., Mapping[str, Any]] | None = None,
+        failure_route_outlet_inspector: (
+            Callable[..., Mapping[str, Any]] | None
+        ) = None,
     ):
         self.config = config
         self.store = store
@@ -3247,19 +3251,38 @@ class HealthReporter:
         self._remote_css_parser_observed_at: datetime | None = None
         self._remote_css_parser_last_probe_at: datetime | None = None
         self._remote_css_parser_error = ""
+        self._failure_route_outlet_inspector = (
+            failure_route_outlet_inspector or FailureRouteOutlet.inspect
+        )
+        self._failure_route_outlet_receipt = FailureRouteOutlet.inspect(
+            self.config.control_db_path,
+            self.config.failure_route_outlet_root,
+            enabled=False,
+        )
+        self._failure_route_outlet_last_probe_at: datetime | None = None
+        self._failure_route_outlet_error = ""
         if self.config.enabled:
-            self._refresh_remote_css_parser_receipt(force=True)
+            self._refresh_dependencies(force=True)
 
     @property
     def dependencies_ready(self) -> bool:
         return not self.config.enabled or (
             not self._remote_css_parser_error
             and self._remote_css_parser_observed_at is not None
+            and not self._failure_route_outlet_error
+            and self._failure_route_outlet_receipt.get("ready") is True
         )
 
     @property
     def dependency_error(self) -> str:
-        return self._remote_css_parser_error
+        return (
+            self._remote_css_parser_error or self._failure_route_outlet_error
+        )
+
+    def _refresh_dependencies(self, *, force: bool = False) -> bool:
+        remote_ready = self._refresh_remote_css_parser_receipt(force=force)
+        outlet_ready = self._refresh_failure_route_outlet_receipt(force=force)
+        return remote_ready and outlet_ready
 
     def _refresh_remote_css_parser_receipt(self, *, force: bool = False) -> bool:
         if not self.config.enabled:
@@ -3271,7 +3294,10 @@ class HealthReporter:
             and (now - self._remote_css_parser_last_probe_at).total_seconds()
             < DEPENDENCY_PROBE_REFRESH_SECONDS
         ):
-            return self.dependencies_ready
+            return (
+                not self._remote_css_parser_error
+                and self._remote_css_parser_observed_at is not None
+            )
         self._remote_css_parser_last_probe_at = now
         try:
             probe = dict(
@@ -3304,6 +3330,69 @@ class HealthReporter:
         }
         return True
 
+    def _refresh_failure_route_outlet_receipt(
+        self, *, force: bool = False
+    ) -> bool:
+        if not self.config.enabled:
+            return True
+        now = _utc_now()
+        if (
+            not force
+            and self._failure_route_outlet_last_probe_at is not None
+            and (
+                now - self._failure_route_outlet_last_probe_at
+            ).total_seconds()
+            < DEPENDENCY_PROBE_REFRESH_SECONDS
+        ):
+            return (
+                not self._failure_route_outlet_error
+                and self._failure_route_outlet_receipt.get("ready") is True
+            )
+        self._failure_route_outlet_last_probe_at = now
+        try:
+            receipt = dict(
+                self._failure_route_outlet_inspector(
+                    self.config.control_db_path,
+                    self.config.failure_route_outlet_root,
+                )
+            )
+        except (
+            FailureRouteOutletError,
+            OSError,
+            sqlite3.Error,
+            TypeError,
+            ValueError,
+        ) as exc:
+            error = "failure_route_outlet_inspection_unavailable"
+            self._failure_route_outlet_error = error
+            self._failure_route_outlet_receipt = {
+                "schema_version": OUTLET_INSPECTION_SCHEMA_VERSION,
+                "status": "unavailable",
+                "ready": False,
+                "observed_at": _utc_iso(now),
+                "root": str(self.config.failure_route_outlet_root),
+                "read_only": True,
+                "external_writes": False,
+                "error": error,
+                "detail": f"{type(exc).__name__}: {exc}"[:500],
+            }
+            return False
+        if (
+            receipt.get("schema_version") != OUTLET_INSPECTION_SCHEMA_VERSION
+            or receipt.get("ready") is not True
+            or receipt.get("status") not in {"ready", "uninitialized"}
+        ):
+            error = str(
+                receipt.get("error")
+                or "failure_route_outlet_inspection_invalid"
+            )[:120]
+            self._failure_route_outlet_error = error
+            self._failure_route_outlet_receipt = receipt
+            return False
+        self._failure_route_outlet_error = ""
+        self._failure_route_outlet_receipt = receipt
+        return True
+
     def write(
         self,
         *,
@@ -3314,7 +3403,7 @@ class HealthReporter:
         refresh_dependencies: bool = True,
     ) -> None:
         if refresh_dependencies:
-            self._refresh_remote_css_parser_receipt()
+            self._refresh_dependencies()
         store_health = self.store.health(
             activation_required=False,
             quarantine_baseline_path=self.config.quarantine_baseline_path,
@@ -3347,6 +3436,9 @@ class HealthReporter:
             "config": self.config.public_dict(),
             "dependencies": {
                 "remote_css_parser": dict(self._remote_css_parser_receipt),
+                "failure_route_outlet": dict(
+                    self._failure_route_outlet_receipt
+                ),
             },
             "dependency_error": dependency_error,
             "stats": asdict(stats),
@@ -3407,7 +3499,7 @@ def run_collector_loop(
     last: CollectOutcome | None = None
     try:
         while not stop:
-            if not reporter._refresh_remote_css_parser_receipt():
+            if not reporter._refresh_dependencies():
                 reporter.write(
                     state="error",
                     stats=collector.stats,
@@ -3572,18 +3664,28 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             return 2
+        failure_route_outlet = FailureRouteOutlet.inspect(
+            config.control_db_path,
+            config.failure_route_outlet_root,
+            enabled=config.enabled,
+        )
+        dependencies_ready = failure_route_outlet.get("ready") is True
+        ready = quarantine_baseline["ready"] and dependencies_ready
         print(
             json.dumps(
                 {
-                    "ok": quarantine_baseline["ready"],
+                    "ok": ready,
                     "config": config.public_dict(),
-                    "dependencies": {"remote_css_parser": remote_css_parser},
+                    "dependencies": {
+                        "remote_css_parser": remote_css_parser,
+                        "failure_route_outlet": failure_route_outlet,
+                    },
                     "quarantine_baseline": quarantine_baseline,
                 },
                 ensure_ascii=False,
             )
         )
-        return 0 if quarantine_baseline["ready"] else 2
+        return 0 if ready else 2
     if args.health:
         healthy, payload = read_health(
             config.health_path,

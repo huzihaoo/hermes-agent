@@ -31,11 +31,39 @@ from gateway.pnc_rca_delivery_store import RcaDeliveryStore
 
 
 OUTLET_SCHEMA_VERSION = "pnc_rca_failure_route_outlet_v1"
+OUTLET_INSPECTION_SCHEMA_VERSION = "pnc_rca_failure_route_outlet_inspection_v1"
 RECEIPT_SCHEMA_VERSION = "pnc_rca_internal_failure_route_receipt_v1"
 INTERNAL_ROUTE_KINDS = frozenset({"internal_backlog", "internal_alert"})
 INTERNAL_ROUTE_STATUSES = frozenset({"backlog_pending", "alert_pending"})
 OUTLET_TERMINAL_STATUSES = frozenset({"settled", "resolved", "quarantined"})
 DEFAULT_RETRY_DELAYS_SECONDS = (2, 5, 10, 30, 60, 300)
+OUTLET_TABLE_COLUMNS = frozenset({
+    "route_key",
+    "outlet_kind",
+    "submission_key",
+    "business_key",
+    "generation",
+    "task_id",
+    "terminal_error_code",
+    "lane",
+    "route_owner",
+    "route_status",
+    "audit_json",
+    "route_payload_json",
+    "status",
+    "attempt",
+    "next_attempt_at",
+    "lease_token",
+    "lease_owner",
+    "lease_expires_at",
+    "receipt_path",
+    "receipt_sha256",
+    "last_error_code",
+    "last_error_detail",
+    "created_at",
+    "updated_at",
+    "completed_at",
+})
 _HEX = frozenset("0123456789abcdef")
 
 
@@ -151,6 +179,236 @@ def _external_effect_marker(value: Any) -> bool:
 
 class FailureRouteOutlet:
     """Synchronize internal routes into a leased local receipt outlet."""
+
+    @staticmethod
+    def _inspection_paths(
+        route_store: RcaDeliveryStore | str | Path,
+        outlet_root: str | Path | None,
+        outlet_db_path: str | Path | None,
+    ) -> tuple[Path, Path, Path]:
+        delivery_db_path = Path(
+            route_store.db_path
+            if isinstance(route_store, RcaDeliveryStore)
+            else route_store
+        ).expanduser().absolute()
+        selected_root = (
+            Path(outlet_root).expanduser()
+            if outlet_root is not None
+            else delivery_db_path.parent / "failure-route-outlet"
+        ).absolute()
+        selected_db = (
+            Path(outlet_db_path).expanduser().absolute()
+            if outlet_db_path is not None
+            else selected_root / "outlet.sqlite3"
+        )
+        return delivery_db_path, selected_root, selected_db
+
+    @staticmethod
+    def _permission_ready(path: Path, *, directory: bool) -> bool:
+        observed = path.lstat()
+        permission_bits = stat.S_IMODE(observed.st_mode)
+        required_modes = [0o444, 0o222]
+        if directory:
+            required_modes.append(0o111)
+        required_access = os.R_OK | os.W_OK | (os.X_OK if directory else 0)
+        return all(permission_bits & mode for mode in required_modes) and os.access(
+            path,
+            required_access,
+        )
+
+    @classmethod
+    def _inspection_payload(
+        cls,
+        route_store: RcaDeliveryStore | str | Path,
+        outlet_root: str | Path | None,
+        outlet_db_path: str | Path | None,
+    ) -> dict[str, Any]:
+        delivery_db_path, selected_root, selected_db = cls._inspection_paths(
+            route_store, outlet_root, outlet_db_path
+        )
+        return {
+            "schema_version": OUTLET_INSPECTION_SCHEMA_VERSION,
+            "status": "invalid",
+            "ready": False,
+            "initialized": False,
+            "observed_at": _iso(),
+            "delivery_db_path": str(delivery_db_path),
+            "root": str(selected_root),
+            "db_path": str(selected_db),
+            "outlet_schema_version": "",
+            "read_only": True,
+            "external_writes": False,
+            "error": "",
+        }
+
+    @classmethod
+    def inspect(
+        cls,
+        route_store: RcaDeliveryStore | str | Path,
+        outlet_root: str | Path | None = None,
+        *,
+        outlet_db_path: str | Path | None = None,
+        enabled: bool = True,
+    ) -> dict[str, Any]:
+        """Return a read-only readiness receipt without materializing the outlet."""
+        payload = cls._inspection_payload(
+            route_store, outlet_root, outlet_db_path
+        )
+        if not enabled:
+            return {**payload, "status": "disabled", "ready": True}
+        try:
+            return cls.validate(
+                route_store,
+                outlet_root,
+                outlet_db_path=outlet_db_path,
+            )
+        except (FailureRouteOutletError, OSError, sqlite3.Error, ValueError) as exc:
+            error = str(exc).strip() or "failure_route_outlet_inspection_failed"
+            return {
+                **payload,
+                "error": error[:120],
+                "detail": f"{type(exc).__name__}: {exc}"[:500],
+            }
+
+    @classmethod
+    def validate(
+        cls,
+        route_store: RcaDeliveryStore | str | Path,
+        outlet_root: str | Path | None = None,
+        *,
+        outlet_db_path: str | Path | None = None,
+    ) -> dict[str, Any]:
+        """Validate outlet readiness using filesystem metadata and read-only SQLite."""
+        payload = cls._inspection_payload(
+            route_store, outlet_root, outlet_db_path
+        )
+        delivery_db_path, selected_root, selected_db = cls._inspection_paths(
+            route_store, outlet_root, outlet_db_path
+        )
+        if selected_db == delivery_db_path:
+            raise FailureRouteOutletSchemaError(
+                "failure_route_outlet_database_not_sidecar"
+            )
+        if selected_db.parent != selected_root:
+            raise FailureRouteOutletSchemaError(
+                "failure_route_outlet_database_parent_invalid"
+            )
+        try:
+            root_stat = selected_root.lstat()
+        except FileNotFoundError:
+            parent = selected_root.parent
+            while True:
+                try:
+                    parent_stat = parent.lstat()
+                    break
+                except FileNotFoundError:
+                    if parent == parent.parent:
+                        raise FailureRouteOutletSchemaError(
+                            "failure_route_outlet_root_invalid"
+                        ) from None
+                    parent = parent.parent
+            if stat.S_ISLNK(parent_stat.st_mode) or not stat.S_ISDIR(
+                parent_stat.st_mode
+            ):
+                raise FailureRouteOutletSchemaError(
+                    "failure_route_outlet_root_invalid"
+                )
+            if not cls._permission_ready(parent, directory=True):
+                raise FailureRouteOutletSchemaError(
+                    "failure_route_outlet_root_permission_denied"
+                )
+            return {
+                **payload,
+                "status": "uninitialized",
+                "ready": True,
+                "error": "",
+            }
+        if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
+            raise FailureRouteOutletSchemaError("failure_route_outlet_root_invalid")
+        if not cls._permission_ready(selected_root, directory=True):
+            raise FailureRouteOutletSchemaError(
+                "failure_route_outlet_root_permission_denied"
+            )
+        try:
+            db_stat = selected_db.lstat()
+        except FileNotFoundError:
+            return {
+                **payload,
+                "status": "uninitialized",
+                "ready": True,
+                "error": "",
+            }
+        if stat.S_ISLNK(db_stat.st_mode) or not stat.S_ISREG(db_stat.st_mode):
+            raise FailureRouteOutletSchemaError("failure_route_outlet_db_invalid")
+        if not cls._permission_ready(selected_db, directory=False):
+            raise FailureRouteOutletSchemaError(
+                "failure_route_outlet_db_permission_denied"
+            )
+        wal_path = selected_db.with_name(selected_db.name + "-wal")
+        shm_path = selected_db.with_name(selected_db.name + "-shm")
+        try:
+            wal_stat = wal_path.lstat()
+        except FileNotFoundError:
+            wal_stat = None
+        if wal_stat is None:
+            uri = f"{selected_db.as_uri()}?mode=ro&immutable=1"
+        else:
+            if stat.S_ISLNK(wal_stat.st_mode) or not stat.S_ISREG(wal_stat.st_mode):
+                raise FailureRouteOutletSchemaError(
+                    "failure_route_outlet_wal_invalid"
+                )
+            try:
+                shm_stat = shm_path.lstat()
+            except FileNotFoundError:
+                raise FailureRouteOutletSchemaError(
+                    "failure_route_outlet_wal_readonly_unavailable"
+                ) from None
+            if stat.S_ISLNK(shm_stat.st_mode) or not stat.S_ISREG(shm_stat.st_mode):
+                raise FailureRouteOutletSchemaError(
+                    "failure_route_outlet_wal_invalid"
+                )
+            uri = f"{selected_db.as_uri()}?mode=ro"
+        try:
+            conn = sqlite3.connect(uri, uri=True, timeout=5)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only=ON")
+            marker = conn.execute(
+                "SELECT value FROM failure_route_outlet_meta "
+                "WHERE key = 'schema_version'"
+            ).fetchone()
+            columns = {
+                str(row[1])
+                for row in conn.execute(
+                    "PRAGMA table_info(failure_route_outlets)"
+                )
+            }
+        except sqlite3.Error as exc:
+            raise FailureRouteOutletSchemaError(
+                "failure_route_outlet_schema_unavailable"
+            ) from exc
+        finally:
+            if "conn" in locals():
+                conn.close()
+        if (wal_stat is None) != (not wal_path.exists()):
+            raise FailureRouteOutletSchemaError(
+                "failure_route_outlet_inspection_raced"
+            )
+        if marker is None or str(marker["value"]) != OUTLET_SCHEMA_VERSION:
+            raise FailureRouteOutletSchemaError(
+                "failure_route_outlet_schema_not_current"
+            )
+        if columns != OUTLET_TABLE_COLUMNS:
+            raise FailureRouteOutletSchemaError(
+                "failure_route_outlet_schema_invalid"
+            )
+        return {
+            **payload,
+            "status": "ready",
+            "ready": True,
+            "initialized": True,
+            "outlet_schema_version": OUTLET_SCHEMA_VERSION,
+            "error": "",
+        }
 
     def __init__(
         self,
@@ -290,20 +548,11 @@ class FailureRouteOutlet:
                 raise FailureRouteOutletSchemaError(
                     "failure_route_outlet_schema_not_current"
                 )
-            expected = {
-                "route_key", "outlet_kind", "submission_key", "business_key",
-                "generation", "task_id", "terminal_error_code", "lane",
-                "route_owner", "route_status", "audit_json", "route_payload_json",
-                "status", "attempt", "next_attempt_at", "lease_token",
-                "lease_owner", "lease_expires_at", "receipt_path",
-                "receipt_sha256", "last_error_code", "last_error_detail",
-                "created_at", "updated_at", "completed_at",
-            }
             columns = {
                 str(row[1])
                 for row in conn.execute("PRAGMA table_info(failure_route_outlets)")
             }
-            if columns != expected:
+            if columns != OUTLET_TABLE_COLUMNS:
                 raise FailureRouteOutletSchemaError(
                     "failure_route_outlet_schema_invalid"
                 )

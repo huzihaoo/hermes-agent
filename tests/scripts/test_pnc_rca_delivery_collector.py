@@ -122,6 +122,8 @@ def test_capacity_observation_error_does_not_mark_delivery_unhealthy(tmp_path):
     reporter._remote_css_parser_receipt = {"status": "ok"}
     reporter._remote_css_parser_error = ""
     reporter._remote_css_parser_observed_at = collector._utc_now()
+    reporter._failure_route_outlet_receipt = {"ready": True, "status": "ready"}
+    reporter._failure_route_outlet_error = ""
 
     stats = collector.CollectorStats(
         capacity_last_error="rca_capacity_vm_measurement_time_invalid"
