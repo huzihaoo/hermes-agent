@@ -1098,6 +1098,10 @@ def test_terminal_manual_delivery_skips_report_http_and_sends_both_effects(tmp_p
     assert before["production_blockers"] == {
         "activation_schema_unavailable": 0,
         "uncertain_effects": 0,
+        "quarantined_jobs": 0,
+        "quarantined_effects": 0,
+        "quarantined_subscriptions": 0,
+        "quarantine_baseline_invalid": 0,
     }
     thread_remote = ThreadRemote()
     verifier_calls = []
