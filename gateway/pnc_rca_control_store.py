@@ -1459,6 +1459,10 @@ class RcaControlStore:
             # The source backfill below may classify post-cutoff stock rows;
             # install its durable target schema before invoking that path.
             self._create_v12_learning_lane_schema(conn)
+            if self._learning_delivery_schema_present(conn):
+                self._ensure_learning_lane_cohort_tx(
+                    conn, sealed_at=_now_iso()
+                )
             self._initialization_backfill_runs += 1
             self._backfill_kafka_sources_and_subscriptions(conn)
             marker = conn.execute(
@@ -1610,6 +1614,10 @@ class RcaControlStore:
             if marker_value != "pnc_rca_control_store_v11":
                 raise RuntimeError("incompatible_control_store_schema:version_marker")
             self._create_v12_learning_lane_schema(conn)
+            if self._learning_delivery_schema_present(conn):
+                self._ensure_learning_lane_cohort_tx(
+                    conn, sealed_at=_now_iso()
+                )
             self._validate_structural_contract(conn, integrity_check=True)
             updated = conn.execute(
                 "UPDATE control_meta SET value = ? "
@@ -5561,6 +5569,30 @@ class RcaControlStore:
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
             (table,),
         ).fetchone() is not None
+
+    @classmethod
+    def _learning_delivery_schema_present(cls, conn: sqlite3.Connection) -> bool:
+        required = {
+            "rca_delivery_jobs": {"delivery_id", "target_key", "work_item_id"},
+            "rca_delivery_effects": {
+                "delivery_id",
+                "effect_kind",
+                "target_key",
+                "status",
+                "payload_json",
+                "created_at",
+            },
+        }
+        for table, columns in required.items():
+            if not cls._table_exists(conn, table):
+                return False
+            observed = {
+                str(row["name"])
+                for row in conn.execute(f"PRAGMA table_info({table})")
+            }
+            if not columns.issubset(observed):
+                return False
+        return True
 
     @staticmethod
     def _learning_cutoff_datetime() -> datetime:
