@@ -939,6 +939,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ledger-output", type=Path, required=True)
     parser.add_argument("--summary-output", type=Path, required=True)
     parser.add_argument("--registry-output", type=Path, required=True)
+    parser.add_argument(
+        "--expected-pipeline-commit",
+        default=EXPECTED_PIPELINE_COMMIT,
+        help="Exact pipeline face commit to bind (defaults to the recorded candidate).",
+    )
+    parser.add_argument(
+        "--expected-pipeline-tree",
+        default=EXPECTED_PIPELINE_TREE,
+        help="Exact pipeline face tree to bind (defaults to the recorded candidate).",
+    )
+    parser.add_argument(
+        "--expected-host-commit",
+        default=EXPECTED_HOST_COMMIT,
+        help="Exact host face commit to bind (defaults to the D37 candidate).",
+    )
+    parser.add_argument(
+        "--expected-host-tree",
+        default=EXPECTED_HOST_TREE,
+        help="Exact host face tree to bind (defaults to the D37 candidate).",
+    )
     args = parser.parse_args(argv)
 
     observed_at = _parse_timestamp(args.observed_at)
@@ -947,14 +967,14 @@ def main(argv: list[str] | None = None) -> int:
     authority = verify_authority(args.authority, args.authority_sha256)
     pipeline_face = verify_git_face(
         args.pipeline_repo,
-        expected_commit=EXPECTED_PIPELINE_COMMIT,
-        expected_tree=EXPECTED_PIPELINE_TREE,
+        expected_commit=args.expected_pipeline_commit,
+        expected_tree=args.expected_pipeline_tree,
         label="pipeline",
     )
     host_face = verify_git_face(
         args.host_repo,
-        expected_commit=EXPECTED_HOST_COMMIT,
-        expected_tree=EXPECTED_HOST_TREE,
+        expected_commit=args.expected_host_commit,
+        expected_tree=args.expected_host_tree,
         label="host",
     )
     registry_tool_face = {
