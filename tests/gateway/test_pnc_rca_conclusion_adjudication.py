@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -32,6 +32,10 @@ from gateway.pnc_rca_delivery_store import (
     RcaDeliveryStore,
 )
 from gateway.pnc_rca_owner_review import handle_owner_review_message
+from gateway.pnc_rca_write_fence import (
+    build_issued_write_fence,
+    snapshot_core_sha256,
+)
 from gateway.session import SessionSource
 from scripts.pnc_rca_delivery_dispatcher import DeliveryDispatcher
 from scripts.pnc_rca_conclusion_adjudication_audit import (
@@ -1489,6 +1493,163 @@ def test_candidate_retract_correction_dispatches_one_budgeted_comment(tmp_path):
     assert fields[RCA_RESULT_FIELD_KEY].startswith("原自动 RCA 结论已撤回")
     [job] = store.list_rows("rca_delivery_jobs")
     assert job["status"] == "delivered"
+
+
+def test_post_cutoff_retract_correction_uses_current_w3_w5_fence(tmp_path):
+    fenced_now = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
+    candidate_at = fenced_now - timedelta(minutes=30)
+    fence_issued_at = candidate_at - timedelta(minutes=5)
+    store = _seed_published_conclusion(tmp_path)
+    [job] = store.list_rows("rca_delivery_jobs")
+    snapshot = {
+        "schema_version": "pnc_rca_admission_snapshot_v1",
+        "request_sha256": "a" * 64,
+        "canonical_request": {
+            "schema_version": "pnc_rca_canonical_request_v1",
+            "ticket": {
+                "project_key": job["project_key"],
+                "issue_url": job["issue_url"],
+            },
+            "business_profile": {"value": {"profile_id": "g1q3"}},
+        },
+        "resolved_admission": {
+            "business_key": job["business_key"],
+            "submission_key": job["submission_key"],
+            "generation": job["generation"],
+        },
+        "execution_admission": {
+            "activation_epoch_id": "epoch-w16-active",
+            "activation_ledger_id": 7,
+            "decision": "admit",
+            "legacy_unconfigured": False,
+        },
+    }
+    fence = build_issued_write_fence(
+        snapshot=snapshot,
+        activation_epoch_id="epoch-w16-active",
+        activation_ledger_id=7,
+        admission_key="admission-w16-current",
+        target_set={"issue_target": job["issue_url"], "thread_target": None},
+        now=fence_issued_at,
+        expires_at=fenced_now + timedelta(hours=2),
+    )
+    assert fence["issued_at"] < candidate_at.isoformat().replace("+00:00", "Z")
+    assert not store.is_historical_external_write_effect(candidate_at.isoformat())
+    contract = json.loads(job["contract_json"])
+    contract["w3_execution_snapshot"] = {
+        "write_fence": fence,
+        "snapshot_core_sha256": snapshot_core_sha256(snapshot),
+    }
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "ALTER TABLE rca_activation_admission_ledger "
+            "ADD COLUMN admission_key TEXT"
+        )
+        conn.execute(
+            """
+            INSERT INTO rca_activation_admission_ledger(
+                ledger_id, epoch_id, admission_key, slot_kind, decision,
+                bound_at, business_key, submission_key, generation
+            ) VALUES(7, 'epoch-w16-active', 'admission-w16-current',
+                     'manual_success', 'admit', ?, ?, ?, ?)
+            """,
+            (
+                fence_issued_at.isoformat(),
+                job["business_key"],
+                job["submission_key"],
+                job["generation"],
+            ),
+        )
+        conn.execute(
+            "UPDATE rca_delivery_jobs "
+            "SET contract_json = ?, created_at = ?, updated_at = ? "
+            "WHERE delivery_id = ?",
+            (
+                json.dumps(contract),
+                candidate_at.isoformat(),
+                candidate_at.isoformat(),
+                job["delivery_id"],
+            ),
+        )
+        conn.execute(
+            "UPDATE rca_delivery_effects "
+            "SET created_at = ?, completed_at = ?, updated_at = ? "
+            "WHERE effect_key = ?",
+            (
+                candidate_at.isoformat(),
+                candidate_at.isoformat(),
+                candidate_at.isoformat(),
+                ORIGINAL_EFFECT_KEY,
+            ),
+        )
+
+    result = store.record_conclusion_adjudication(
+        work_item_id=ISSUE_ID,
+        action="retract",
+        reason="current candidate attribution is invalid",
+        actor_id="ou_owner",
+        actor_name="RCA Owner",
+        source={
+            "platform": "feishu",
+            "chat_id": "oc_g1q3",
+            "thread_id": "omt_topic",
+            "message_id": "om_current_command",
+        },
+        now=fenced_now,
+    )
+    comments = [
+        {
+            "remote_id": "original-comment",
+            "content": "[RCA_DELIVERY:original] candidate conclusion",
+        }
+    ]
+    fields = {RCA_RESULT_FIELD_KEY: "候选结论：感知车道线责任域"}
+    boundary_calls: list[str] = []
+
+    def list_comments(_project_key, _work_item_id):
+        boundary_calls.append("list_comments")
+        return {"success": True, "comments": list(comments), "pages_read": 1}
+
+    def add_comment(_project_key, _work_item_id, content):
+        boundary_calls.append("add_comment")
+        comments.append({"remote_id": "correction-comment", "content": content})
+        return {"success": True, "remote_id": "correction-comment"}
+
+    def get_fields(_project_key, _work_item_id, field_keys):
+        boundary_calls.append("get_fields")
+        return {
+            "success": True,
+            "fields": {key: fields.get(key, "") for key in field_keys},
+        }
+
+    def update_fields(_project_key, _work_item_id, updates):
+        boundary_calls.append("update_fields")
+        fields.update(dict(updates))
+        return {"success": True}
+
+    dispatcher = _dispatcher(
+        store,
+        now=lambda: fenced_now,
+        list_comments=list_comments,
+        add_comment=add_comment,
+        get_fields=get_fields,
+        update_fields=update_fields,
+    )
+
+    outcome = dispatcher.dispatch_one()
+
+    assert outcome.status == "succeeded"
+    assert outcome.effect_key == result.correction_effect_key
+    [correction] = [
+        row
+        for row in store.list_rows("rca_delivery_effects")
+        if row["effect_key"] == result.correction_effect_key
+    ]
+    assert not store.is_historical_external_write_effect(correction["created_at"])
+    assert boundary_calls.count("update_fields") == 1
+    assert boundary_calls.count("add_comment") == 1
+    assert len(comments) == 2
+    assert fields[RCA_RESULT_FIELD_KEY].startswith("原自动 RCA 结论已撤回")
 
 
 def test_medium_recognition_dispatches_one_confirmation_comment(tmp_path):
