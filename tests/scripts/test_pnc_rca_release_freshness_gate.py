@@ -10,12 +10,102 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 from scripts import pnc_rca_release_freshness_gate as gate
 from gateway.pnc_rca_delivery_store import RcaDeliveryStore
 from scripts.pnc_live_exec import PNC_PYTHON_LAUNCHD_LABELS
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _active_evaluator_inventory_binding(
+    *, commit: str, tree: str, evaluator_ids: list[str]
+) -> dict[str, object]:
+    normalized = sorted(evaluator_ids)
+    evaluator_scope = "g1q3_rca_evaluator_scope_v4"
+    return {
+        "schema_version": gate.ACTIVE_EVALUATOR_INVENTORY_SCHEMA_VERSION,
+        "pipeline_commit": commit,
+        "pipeline_tree": tree,
+        "source_path": gate.ACTIVE_EVALUATOR_INVENTORY_SOURCE_PATH,
+        "source_symbol": gate.ACTIVE_EVALUATOR_INVENTORY_SOURCE_SYMBOL,
+        "source_blob_sha256": "c" * 64,
+        "evaluator_scope": evaluator_scope,
+        "evaluator_ids": normalized,
+        "inventory_sha256": gate._evaluator_inventory_sha256(
+            evaluator_scope,
+            normalized,
+        ),
+    }
+
+
+def _write_pipeline_manifest(
+    runtime: Path,
+    *,
+    commit: str,
+    tree: str,
+    evaluator_ids: list[str] | None,
+    binding_updates: dict[str, object] | None = None,
+) -> None:
+    face: dict[str, object] = {"commit": commit, "tree": tree}
+    if evaluator_ids is not None:
+        binding = _active_evaluator_inventory_binding(
+            commit=commit,
+            tree=tree,
+            evaluator_ids=evaluator_ids,
+        )
+        binding.update(binding_updates or {})
+        face["evaluator_inventory"] = binding
+    (runtime / "LIVE_MANIFEST.json").write_text(
+        json.dumps({"face_git_bindings": {"g1q3_rca_pipeline": face}}),
+        encoding="utf-8",
+    )
+
+
+def test_materialize_active_evaluator_inventory_uses_ast_and_exact_keys(
+    tmp_path: Path,
+):
+    source_root = tmp_path / "pipeline"
+    source = source_root / gate.ACTIVE_EVALUATOR_INVENTORY_SOURCE_PATH
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        """
+G1Q3_EVALUATOR_SCOPE = 'g1q3_rca_evaluator_scope_v4'
+G1Q3_EVALUATOR_INVENTORY = (
+    'lane_geometry_quality',
+    'acc_decel_heavy',
+)
+""",
+        encoding="utf-8",
+    )
+    binding = gate.materialize_active_evaluator_inventory_binding(
+        pipeline_source_root=source_root,
+        pipeline_commit="a" * 40,
+        pipeline_tree="b" * 40,
+    )
+
+    assert binding["evaluator_ids"] == ["acc_decel_heavy", "lane_geometry_quality"]
+    assert (
+        binding["source_blob_sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
+    )
+    assert binding["inventory_sha256"] == gate._evaluator_inventory_sha256(
+        "g1q3_rca_evaluator_scope_v4",
+        ["acc_decel_heavy", "lane_geometry_quality"],
+    )
+
+    source.write_text(
+        "G1Q3_EVALUATOR_SCOPE='scope'\n"
+        "G1Q3_EVALUATOR_INVENTORY=('duplicate', 'duplicate')\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="source_invalid"):
+        gate.materialize_active_evaluator_inventory_binding(
+            pipeline_source_root=source_root,
+            pipeline_commit="a" * 40,
+            pipeline_tree="b" * 40,
+        )
 
 
 def _write_plist(home: Path, label: str, *, stale: bool = False) -> Path:
@@ -142,10 +232,7 @@ def test_retired_stable_entrypoints_must_be_absent(tmp_path: Path):
     assert {item["name"] for item in evidence if item["present"]} == set(
         gate.RETIRED_STABLE_ENTRYPOINTS
     )
-    assert {
-        (item["code"], item["name"])
-        for item in errors
-    } == {
+    assert {(item["code"], item["name"]) for item in errors} == {
         ("pnc_release_retired_entrypoint_present", name)
         for name in gate.RETIRED_STABLE_ENTRYPOINTS
     }
@@ -234,11 +321,12 @@ def test_release_golden_registry_must_be_green_and_pipeline_bound(tmp_path: Path
     runtime.mkdir(parents=True)
     commit = "a" * 40
     tree = "b" * 40
-    (runtime / "LIVE_MANIFEST.json").write_text(
-        json.dumps({
-            "face_git_bindings": {"g1q3_rca_pipeline": {"commit": commit, "tree": tree}}
-        }),
-        encoding="utf-8",
+    required = ["acc_decel_heavy"]
+    _write_pipeline_manifest(
+        runtime,
+        commit=commit,
+        tree=tree,
+        evaluator_ids=required,
     )
     base = {
         "present": True,
@@ -257,6 +345,7 @@ def test_release_golden_registry_must_be_green_and_pipeline_bound(tmp_path: Path
     evidence, errors = gate.audit_release_golden_registry(
         hermes_home=hermes_home,
         registry=base,
+        required_evaluator_ids=required,
     )
     assert errors == []
     assert evidence["active_pipeline_commit"] == commit
@@ -265,15 +354,18 @@ def test_release_golden_registry_must_be_green_and_pipeline_bound(tmp_path: Path
     _evidence, errors = gate.audit_release_golden_registry(
         hermes_home=hermes_home,
         registry=empty,
+        required_evaluator_ids=required,
     )
     assert {item["code"] for item in errors} == {
-        "pnc_release_golden_evaluator_set_empty"
+        "pnc_release_golden_evaluator_set_empty",
+        "pnc_release_golden_required_evaluator_missing",
     }
 
     failing = {**base, "low_tier_golden_ready": False}
     _evidence, errors = gate.audit_release_golden_registry(
         hermes_home=hermes_home,
         registry=failing,
+        required_evaluator_ids=required,
     )
     assert {item["code"] for item in errors} == {
         "pnc_release_low_tier_golden_not_ready"
@@ -283,6 +375,7 @@ def test_release_golden_registry_must_be_green_and_pipeline_bound(tmp_path: Path
     _evidence, errors = gate.audit_release_golden_registry(
         hermes_home=hermes_home,
         registry=stale,
+        required_evaluator_ids=required,
     )
     assert {item["code"] for item in errors} == {
         "pnc_release_golden_pipeline_binding_mismatch"
@@ -296,13 +389,9 @@ def test_release_golden_registry_binds_explicit_active_inventory(tmp_path: Path)
     commit = "a" * 40
     tree = "b" * 40
     (runtime / "LIVE_MANIFEST.json").write_text(
-        json.dumps(
-            {
-                "face_git_bindings": {
-                    "g1q3_rca_pipeline": {"commit": commit, "tree": tree}
-                }
-            }
-        ),
+        json.dumps({
+            "face_git_bindings": {"g1q3_rca_pipeline": {"commit": commit, "tree": tree}}
+        }),
         encoding="utf-8",
     )
     registry = {
@@ -327,9 +416,155 @@ def test_release_golden_registry_binds_explicit_active_inventory(tmp_path: Path)
 
     assert evidence["missing_required_evaluator_ids"] == ["new_evaluator"]
     assert evidence["inventory_binding_valid"] is False
-    assert {
-        item["code"] for item in errors
-    } == {"pnc_release_golden_required_evaluator_missing"}
+    assert {item["code"] for item in errors} == {
+        "pnc_release_golden_required_evaluator_missing"
+    }
+
+    unexpected = {
+        **registry,
+        "evaluators": {
+            **registry["evaluators"],
+            "legacy_alias": {
+                "status": "passed",
+                "evaluator_id": "legacy_alias",
+            },
+        },
+    }
+    evidence, errors = gate.audit_release_golden_registry(
+        hermes_home=hermes_home,
+        registry=unexpected,
+        required_evaluator_ids=["lane_geometry_quality"],
+    )
+    assert evidence["unexpected_evaluator_ids"] == ["legacy_alias"]
+    assert {item["code"] for item in errors} == {
+        "pnc_release_golden_evaluator_inventory_unexpected"
+    }
+
+
+def test_active_evaluator_inventory_binding_is_required_and_digest_bound(
+    tmp_path: Path,
+):
+    hermes_home = tmp_path / ".hermes"
+    runtime = hermes_home / "runtime"
+    runtime.mkdir(parents=True)
+    commit = "a" * 40
+    tree = "b" * 40
+
+    _write_pipeline_manifest(
+        runtime,
+        commit=commit,
+        tree=tree,
+        evaluator_ids=None,
+    )
+    evidence, evaluator_ids, errors = gate.audit_active_evaluator_inventory(
+        hermes_home=hermes_home
+    )
+    assert evidence["valid"] is False
+    assert evaluator_ids == ()
+    assert errors[0]["code"] == (
+        "pnc_release_golden_active_evaluator_inventory_invalid"
+    )
+    assert "binding_missing" in errors[0]["reasons"]
+
+    _write_pipeline_manifest(
+        runtime,
+        commit=commit,
+        tree=tree,
+        evaluator_ids=[],
+    )
+    evidence, evaluator_ids, errors = gate.audit_active_evaluator_inventory(
+        hermes_home=hermes_home
+    )
+    assert evidence["valid"] is False
+    assert evaluator_ids == ()
+    assert "required_evaluator_ids_empty" in errors[0]["reasons"]
+
+    _write_pipeline_manifest(
+        runtime,
+        commit=commit,
+        tree=tree,
+        evaluator_ids=["lane_geometry_quality"],
+        binding_updates={"inventory_sha256": "d" * 64},
+    )
+    _evidence, _evaluator_ids, errors = gate.audit_active_evaluator_inventory(
+        hermes_home=hermes_home
+    )
+    assert "inventory_sha256_mismatch" in errors[0]["reasons"]
+
+    _write_pipeline_manifest(
+        runtime,
+        commit=commit,
+        tree=tree,
+        evaluator_ids=["lane_geometry_quality"],
+        binding_updates={"pipeline_tree": "e" * 40},
+    )
+    _evidence, _evaluator_ids, errors = gate.audit_active_evaluator_inventory(
+        hermes_home=hermes_home
+    )
+    assert "pipeline_tree_mismatch" in errors[0]["reasons"]
+
+    _write_pipeline_manifest(
+        runtime,
+        commit=commit,
+        tree=tree,
+        evaluator_ids=["lane_geometry_quality", "acc_decel_heavy"],
+    )
+    evidence, evaluator_ids, errors = gate.audit_active_evaluator_inventory(
+        hermes_home=hermes_home
+    )
+    assert errors == []
+    assert evidence["valid"] is True
+    assert evaluator_ids == ("acc_decel_heavy", "lane_geometry_quality")
+
+
+def test_run_gate_passes_manifest_inventory_to_golden_audit(
+    tmp_path: Path, monkeypatch
+):
+    home = tmp_path
+    hermes_home = home / ".hermes"
+    runtime = hermes_home / "runtime"
+    runtime.mkdir(parents=True)
+    expected_ids = ["acc_decel_heavy", "lane_geometry_quality"]
+    _write_pipeline_manifest(
+        runtime,
+        commit="a" * 40,
+        tree="b" * 40,
+        evaluator_ids=expected_ids,
+    )
+
+    monkeypatch.setattr(gate, "audit_persisted_definitions", lambda **_kwargs: ([], []))
+    monkeypatch.setattr(gate, "audit_loaded_definitions", lambda **_kwargs: ([], []))
+    monkeypatch.setattr(gate, "_resolve_targets", lambda **_kwargs: ({}, []))
+    monkeypatch.setattr(gate, "audit_residents", lambda **_kwargs: ([], []))
+    monkeypatch.setattr(gate, "audit_wrappers", lambda *_args: ([], []))
+    monkeypatch.setattr(
+        gate, "audit_retired_stable_entrypoints", lambda *_args: ([], [])
+    )
+    monkeypatch.setattr(gate, "audit_stable_targets", lambda **_kwargs: ([], []))
+    monkeypatch.setattr(
+        gate,
+        "audit_delivery_store_schema",
+        lambda **_kwargs: ({"schema_valid": True}, []),
+    )
+    monkeypatch.setattr(
+        gate,
+        "audit_unresolved_effect_schema_compatibility",
+        lambda **_kwargs: ({"compatible": True}, []),
+    )
+    captured: dict[str, tuple[str, ...]] = {}
+
+    def golden_audit(*, hermes_home: Path, required_evaluator_ids):
+        assert hermes_home == home / ".hermes"
+        captured["ids"] = tuple(required_evaluator_ids)
+        return {"inventory_binding_valid": True}, []
+
+    monkeypatch.setattr(gate, "audit_release_golden_registry", golden_audit)
+
+    result = gate.run_gate(home=home, hermes_home=hermes_home)
+
+    assert result["ok"] is True
+    assert captured["ids"] == tuple(sorted(expected_ids))
+    assert result["active_evaluator_inventory"]["valid"] is True
 
 
 def test_stable_target_audit_resolves_every_hash_bound_target(tmp_path: Path):

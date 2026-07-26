@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import os
 import plistlib
+import re
 import sqlite3
 import stat
 import subprocess
@@ -65,10 +67,241 @@ UNRESOLVED_EFFECT_STATUSES = frozenset({
     "retry_wait",
     "uncertain",
 })
+ACTIVE_EVALUATOR_INVENTORY_SCHEMA_VERSION = (
+    "g1q3_rca_active_evaluator_inventory_binding_v1"
+)
+ACTIVE_EVALUATOR_INVENTORY_SOURCE_PATH = "api/g1q3_rca/consumer_capability.py"
+ACTIVE_EVALUATOR_INVENTORY_SOURCE_SYMBOL = "G1Q3_EVALUATOR_INVENTORY"
+_ACTIVE_EVALUATOR_INVENTORY_FIELDS = frozenset({
+    "schema_version",
+    "pipeline_commit",
+    "pipeline_tree",
+    "source_path",
+    "source_symbol",
+    "source_blob_sha256",
+    "evaluator_scope",
+    "evaluator_ids",
+    "inventory_sha256",
+})
+_HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
+_HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+_EVALUATOR_SCOPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 
 
 def _error(code: str, **detail: Any) -> dict[str, Any]:
     return {"code": code, **detail}
+
+
+def _evaluator_inventory_sha256(
+    evaluator_scope: str, evaluator_ids: Sequence[str]
+) -> str:
+    body = {
+        "evaluator_scope": evaluator_scope,
+        "evaluator_ids": list(evaluator_ids),
+    }
+    raw = json.dumps(
+        body,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def materialize_active_evaluator_inventory_binding(
+    *,
+    pipeline_source_root: Path,
+    pipeline_commit: str,
+    pipeline_tree: str,
+) -> dict[str, Any]:
+    """Extract the evaluator tuple from an exact pipeline source without importing it."""
+
+    commit = str(pipeline_commit or "").strip().lower()
+    tree = str(pipeline_tree or "").strip().lower()
+    if _HEX40_RE.fullmatch(commit) is None or _HEX40_RE.fullmatch(tree) is None:
+        raise ValueError("pnc_release_evaluator_inventory_pipeline_binding_invalid")
+
+    source_root = Path(pipeline_source_root).expanduser().absolute().resolve()
+    source_path = source_root / ACTIVE_EVALUATOR_INVENTORY_SOURCE_PATH
+    try:
+        resolved_source_path = source_path.resolve(strict=True)
+        resolved_source_path.relative_to(source_root)
+        source_stat = source_path.lstat()
+        if (
+            resolved_source_path != source_path
+            or stat.S_ISLNK(source_stat.st_mode)
+            or not stat.S_ISREG(source_stat.st_mode)
+        ):
+            raise ValueError("pnc_release_evaluator_inventory_source_invalid")
+        source_bytes = source_path.read_bytes()
+    except (OSError, ValueError) as exc:
+        if isinstance(exc, ValueError):
+            raise
+        raise ValueError("pnc_release_evaluator_inventory_source_unreadable") from exc
+
+    try:
+        module = ast.parse(source_bytes.decode("utf-8"), filename=str(source_path))
+    except (UnicodeDecodeError, SyntaxError) as exc:
+        raise ValueError("pnc_release_evaluator_inventory_source_invalid") from exc
+
+    assignments: dict[str, ast.AST] = {}
+    for node in module.body:
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        else:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name) and target.id in {
+                "G1Q3_EVALUATOR_SCOPE",
+                ACTIVE_EVALUATOR_INVENTORY_SOURCE_SYMBOL,
+            }:
+                if target.id in assignments:
+                    raise ValueError("pnc_release_evaluator_inventory_source_invalid")
+                assignments[target.id] = node.value
+
+    try:
+        evaluator_scope = ast.literal_eval(assignments["G1Q3_EVALUATOR_SCOPE"])
+        raw_evaluator_ids = ast.literal_eval(
+            assignments[ACTIVE_EVALUATOR_INVENTORY_SOURCE_SYMBOL]
+        )
+    except (KeyError, ValueError, TypeError, SyntaxError) as exc:
+        raise ValueError("pnc_release_evaluator_inventory_source_invalid") from exc
+
+    if not isinstance(evaluator_scope, str) or not isinstance(
+        raw_evaluator_ids, (list, tuple)
+    ):
+        raise ValueError("pnc_release_evaluator_inventory_source_invalid")
+    inventory = validate_golden_registry_inventory(
+        raw_evaluator_ids,
+        tuple(raw_evaluator_ids),
+        present=True,
+    )
+    if not inventory["valid"] or _EVALUATOR_SCOPE_RE.fullmatch(evaluator_scope) is None:
+        raise ValueError("pnc_release_evaluator_inventory_source_invalid")
+    evaluator_ids = tuple(inventory["required_evaluator_ids"])
+    source_blob_sha256 = hashlib.sha256(source_bytes).hexdigest()
+    return {
+        "schema_version": ACTIVE_EVALUATOR_INVENTORY_SCHEMA_VERSION,
+        "pipeline_commit": commit,
+        "pipeline_tree": tree,
+        "source_path": ACTIVE_EVALUATOR_INVENTORY_SOURCE_PATH,
+        "source_symbol": ACTIVE_EVALUATOR_INVENTORY_SOURCE_SYMBOL,
+        "source_blob_sha256": source_blob_sha256,
+        "evaluator_scope": evaluator_scope,
+        "evaluator_ids": list(evaluator_ids),
+        "inventory_sha256": _evaluator_inventory_sha256(
+            evaluator_scope,
+            evaluator_ids,
+        ),
+    }
+
+
+def audit_active_evaluator_inventory(
+    *, hermes_home: Path
+) -> tuple[dict[str, Any], tuple[str, ...], list[dict[str, Any]]]:
+    """Load the exact active pipeline inventory materialized during release."""
+
+    manifest_path = hermes_home / "runtime" / "LIVE_MANIFEST.json"
+    errors: list[dict[str, Any]] = []
+    reasons: list[str] = []
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        manifest = {}
+        reasons.append("manifest_unreadable")
+
+    faces = manifest.get("face_git_bindings") if isinstance(manifest, Mapping) else {}
+    pipeline = faces.get("g1q3_rca_pipeline") if isinstance(faces, Mapping) else {}
+    pipeline = pipeline if isinstance(pipeline, Mapping) else {}
+    active_commit = str(pipeline.get("commit") or "").strip().lower()
+    active_tree = str(pipeline.get("tree") or "").strip().lower()
+    binding = pipeline.get("evaluator_inventory")
+    binding = binding if isinstance(binding, Mapping) else {}
+
+    if _HEX40_RE.fullmatch(active_commit) is None:
+        reasons.append("active_pipeline_commit_invalid")
+    if _HEX40_RE.fullmatch(active_tree) is None:
+        reasons.append("active_pipeline_tree_invalid")
+    if not binding:
+        reasons.append("binding_missing")
+    elif set(binding) != _ACTIVE_EVALUATOR_INVENTORY_FIELDS:
+        reasons.append("binding_shape_invalid")
+
+    schema_version = str(binding.get("schema_version") or "").strip()
+    bound_commit = str(binding.get("pipeline_commit") or "").strip().lower()
+    bound_tree = str(binding.get("pipeline_tree") or "").strip().lower()
+    source_path = str(binding.get("source_path") or "").strip()
+    source_symbol = str(binding.get("source_symbol") or "").strip()
+    source_blob_sha256 = str(binding.get("source_blob_sha256") or "").strip().lower()
+    evaluator_scope = str(binding.get("evaluator_scope") or "").strip()
+    observed_inventory_sha256 = (
+        str(binding.get("inventory_sha256") or "").strip().lower()
+    )
+    raw_evaluator_ids = binding.get("evaluator_ids")
+    covered_ids = (
+        tuple(raw_evaluator_ids) if isinstance(raw_evaluator_ids, (list, tuple)) else ()
+    )
+    inventory_binding = validate_golden_registry_inventory(
+        raw_evaluator_ids,
+        covered_ids,
+        present=True,
+    )
+    evaluator_ids = tuple(inventory_binding["required_evaluator_ids"])
+
+    if schema_version != ACTIVE_EVALUATOR_INVENTORY_SCHEMA_VERSION:
+        reasons.append("schema_version_invalid")
+    if bound_commit != active_commit or _HEX40_RE.fullmatch(bound_commit) is None:
+        reasons.append("pipeline_commit_mismatch")
+    if bound_tree != active_tree or _HEX40_RE.fullmatch(bound_tree) is None:
+        reasons.append("pipeline_tree_mismatch")
+    if source_path != ACTIVE_EVALUATOR_INVENTORY_SOURCE_PATH:
+        reasons.append("source_path_invalid")
+    if source_symbol != ACTIVE_EVALUATOR_INVENTORY_SOURCE_SYMBOL:
+        reasons.append("source_symbol_invalid")
+    if _HEX64_RE.fullmatch(source_blob_sha256) is None:
+        reasons.append("source_blob_sha256_invalid")
+    if _EVALUATOR_SCOPE_RE.fullmatch(evaluator_scope) is None:
+        reasons.append("evaluator_scope_invalid")
+    reasons.extend(str(code) for code in inventory_binding["errors"])
+    expected_inventory_sha256 = _evaluator_inventory_sha256(
+        evaluator_scope,
+        evaluator_ids,
+    )
+    if (
+        _HEX64_RE.fullmatch(observed_inventory_sha256) is None
+        or observed_inventory_sha256 != expected_inventory_sha256
+    ):
+        reasons.append("inventory_sha256_mismatch")
+
+    normalized_reasons = sorted(set(reasons))
+    if normalized_reasons:
+        errors.append(
+            _error(
+                "pnc_release_golden_active_evaluator_inventory_invalid",
+                reasons=normalized_reasons,
+            )
+        )
+    evidence = {
+        "manifest_path": str(manifest_path),
+        "valid": not normalized_reasons,
+        "active_pipeline_commit": active_commit,
+        "active_pipeline_tree": active_tree,
+        "schema_version": schema_version,
+        "pipeline_commit": bound_commit,
+        "pipeline_tree": bound_tree,
+        "source_path": source_path,
+        "source_symbol": source_symbol,
+        "source_blob_sha256": source_blob_sha256,
+        "evaluator_scope": evaluator_scope,
+        "evaluator_ids": list(evaluator_ids),
+        "evaluator_count": len(evaluator_ids),
+        "inventory_sha256": observed_inventory_sha256,
+        "expected_inventory_sha256": expected_inventory_sha256,
+        "errors": normalized_reasons,
+    }
+    return evidence, evaluator_ids, errors
 
 
 def _read_plist(path: Path) -> Mapping[str, Any]:
@@ -554,10 +787,9 @@ def audit_release_golden_registry(
     if not isinstance(evaluator_entries, Mapping) or not evaluator_entries:
         errors.append(_error("pnc_release_golden_evaluator_set_empty"))
 
-    # A registry may remain deliberately low-tier-only while the active
-    # inventory is unknown. Once an explicit inventory is supplied (in the
-    # registry or by the caller), enforce an exact, non-empty binding so a new
-    # evaluator cannot quietly ship without its four controlled hashes.
+    # The active inventory must come from the exact pipeline face binding, not
+    # from the registry being audited. Otherwise a registry can omit both a new
+    # evaluator and its requirement while still appearing internally complete.
     observed_required_present = bool(observed.get("required_evaluator_ids_present"))
     if "required_evaluator_ids_present" not in observed:
         observed_required_present = "required_evaluator_ids" in observed
@@ -582,17 +814,17 @@ def audit_release_golden_registry(
                 errors.append(
                     _error("pnc_release_golden_required_evaluator_ids_binding_mismatch")
                 )
-    elif observed_required_present:
-        binding = validate_golden_registry_inventory(
-            observed_required,
-            tuple(evaluator_entries) if isinstance(evaluator_entries, Mapping) else (),
-            present=True,
-        )
     else:
         binding = validate_golden_registry_inventory(
             None,
             tuple(evaluator_entries) if isinstance(evaluator_entries, Mapping) else (),
             present=False,
+        )
+        errors.append(
+            _error(
+                "pnc_release_golden_active_evaluator_inventory_invalid",
+                reasons=["active_inventory_not_supplied"],
+            )
         )
     if not binding["valid"]:
         for code in binding["errors"]:
@@ -603,7 +835,9 @@ def audit_release_golden_registry(
                 "required_evaluator_ids_duplicate",
                 "required_evaluator_ids_binding_mismatch",
             }:
-                errors.append(_error("pnc_release_golden_required_evaluator_ids_invalid"))
+                errors.append(
+                    _error("pnc_release_golden_required_evaluator_ids_invalid")
+                )
             elif code == "required_evaluator_missing":
                 errors.append(
                     _error(
@@ -862,8 +1096,8 @@ def run_gate(*, home: Path, hermes_home: Path) -> dict[str, Any]:
     resolved, resolution_errors = _resolve_targets(hermes_home=hermes_home)
     residents, resident_errors = audit_residents(loaded=loaded, resolved=resolved)
     wrappers, wrapper_errors = audit_wrappers(home)
-    retired_entrypoints, retired_entrypoint_errors = (
-        audit_retired_stable_entrypoints(home)
+    retired_entrypoints, retired_entrypoint_errors = audit_retired_stable_entrypoints(
+        home
     )
     runtime = next(iter(resolved.values()), {})
     stable_entrypoints: list[dict[str, Any]] = []
@@ -876,8 +1110,12 @@ def run_gate(*, home: Path, hermes_home: Path) -> dict[str, Any]:
                 runtime_root=Path(runtime["runtime_root"]),
             )
         )
+    active_evaluator_inventory, active_evaluator_ids, active_evaluator_errors = (
+        audit_active_evaluator_inventory(hermes_home=hermes_home)
+    )
     golden_registry, golden_errors = audit_release_golden_registry(
-        hermes_home=hermes_home
+        hermes_home=hermes_home,
+        required_evaluator_ids=active_evaluator_ids,
     )
     stable_targets, stable_target_errors = audit_stable_targets(hermes_home=hermes_home)
     delivery_store_schema, delivery_store_schema_errors = audit_delivery_store_schema(
@@ -894,6 +1132,7 @@ def run_gate(*, home: Path, hermes_home: Path) -> dict[str, Any]:
         *wrapper_errors,
         *retired_entrypoint_errors,
         *stable_entrypoint_errors,
+        *active_evaluator_errors,
         *golden_errors,
         *stable_target_errors,
         *delivery_store_schema_errors,
@@ -912,6 +1151,7 @@ def run_gate(*, home: Path, hermes_home: Path) -> dict[str, Any]:
         "wrappers": wrappers,
         "retired_entrypoints": retired_entrypoints,
         "stable_entrypoints": stable_entrypoints,
+        "active_evaluator_inventory": active_evaluator_inventory,
         "golden_registry": golden_registry,
         "stable_targets": stable_targets,
         "delivery_store_schema": delivery_store_schema,
@@ -925,7 +1165,32 @@ def main() -> int:
         description="Require every PNC definition and resident to use the active release"
     )
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--materialize-evaluator-inventory",
+        type=Path,
+        metavar="PIPELINE_SOURCE_ROOT",
+        help="print an AST-derived evaluator inventory binding for a staged pipeline",
+    )
+    parser.add_argument("--pipeline-commit")
+    parser.add_argument("--pipeline-tree")
     args = parser.parse_args()
+    if args.materialize_evaluator_inventory is not None:
+        if not args.pipeline_commit or not args.pipeline_tree:
+            parser.error(
+                "--materialize-evaluator-inventory requires --pipeline-commit and "
+                "--pipeline-tree"
+            )
+        try:
+            binding = materialize_active_evaluator_inventory_binding(
+                pipeline_source_root=args.materialize_evaluator_inventory,
+                pipeline_commit=args.pipeline_commit,
+                pipeline_tree=args.pipeline_tree,
+            )
+        except ValueError as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}))
+            return 2
+        print(json.dumps(binding, ensure_ascii=True, indent=2, sort_keys=True))
+        return 0
     home = Path.home().absolute()
     hermes_home = Path(os.environ.get("HERMES_HOME") or home / ".hermes").absolute()
     result = run_gate(home=home, hermes_home=hermes_home)
