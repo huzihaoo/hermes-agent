@@ -2497,6 +2497,16 @@ class DeliveryDispatcher:
         target: str,
     ) -> None:
         """Revalidate the immutable W5 fence immediately before a provider call."""
+        try:
+            self.store.validate_learning_lane_external_operation(
+                business_key=claim.business_key,
+                generation=claim.generation,
+                operation=operation,
+            )
+        except RuntimeError as exc:
+            if str(exc) == "learning_lane_external_effect_forbidden":
+                raise ExternalWriteFenceError(str(exc)) from exc
+            raise
         contract = claim.contract if isinstance(claim.contract, Mapping) else {}
         binding = contract.get("w3_execution_snapshot")
         if not isinstance(binding, Mapping):

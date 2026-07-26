@@ -36,7 +36,8 @@ from gateway.pnc_rca_runtime_transition import (
 from gateway.pnc_rca_requester_identity import validate_rca_requester
 
 
-CONTROL_STORE_SCHEMA_VERSION = "pnc_rca_control_store_v11"
+CONTROL_STORE_SCHEMA_VERSION = "pnc_rca_control_store_v12"
+CONTROL_STORE_SCHEMA_PREDECESSOR_VERSION = "pnc_rca_control_store_v11"
 SUPPORTED_CONTROL_STORE_SCHEMA_VERSIONS = frozenset(
     {
         "pnc_rca_control_store_v3",
@@ -47,6 +48,7 @@ SUPPORTED_CONTROL_STORE_SCHEMA_VERSIONS = frozenset(
         "pnc_rca_control_store_v8",
         "pnc_rca_control_store_v9",
         "pnc_rca_control_store_v10",
+        "pnc_rca_control_store_v11",
         CONTROL_STORE_SCHEMA_VERSION,
     }
 )
@@ -98,6 +100,11 @@ MANUAL_TRIGGER_SCHEMA_VERSION = "pnc_rca_manual_trigger_v1"
 MANUAL_ADMISSION_RESULT_SCHEMA_VERSION = "pnc_rca_manual_admission_result_v1"
 OUTBOX_PAYLOAD_SCHEMA_VERSION = "pnc_rca_submission_outbox_v2"
 DELIVERY_TARGET_SCHEMA_VERSION = "pnc_rca_delivery_target_v1"
+LEARNING_LANE_ADMISSION_SCHEMA_VERSION = "g1q3_rca_learning_lane_admission_v1"
+LEARNING_LANE_COHORT_SCHEMA_VERSION = "g1q3_rca_learning_lane_cohort_v1"
+# The W6 stock boundary is a release contract, not an operator-controlled flag.
+STOCK_CUTOFF = "2026-07-25T10:15:43.473251+00:00"
+LEARNING_LANE_ALLOWED_WRITE_KINDS = ("internal_alert", "vm_submit")
 ACTIVATION_EPOCH_STATES = frozenset(
     {
         "safe_off",
@@ -841,8 +848,14 @@ class RcaControlStore:
             return
 
         if marker_value == "pnc_rca_control_store_v10":
+            migrated = self._migrate_v10_to_v11()
+            migrated = self._migrate_v11_to_v12() or migrated
+            self._initialization_mode = "migration" if migrated else "steady"
+            return
+
+        if marker_value == "pnc_rca_control_store_v11":
             self._initialization_mode = (
-                "migration" if self._migrate_v10_to_v11() else "steady"
+                "migration" if self._migrate_v11_to_v12() else "steady"
             )
             return
 
@@ -1443,6 +1456,9 @@ class RcaControlStore:
             self._migrate_inbox_columns(conn)
             self._migrate_outbox_columns(conn)
             self._migrate_activation_columns(conn)
+            # The source backfill below may classify post-cutoff stock rows;
+            # install its durable target schema before invoking that path.
+            self._create_v12_learning_lane_schema(conn)
             self._initialization_backfill_runs += 1
             self._backfill_kafka_sources_and_subscriptions(conn)
             marker = conn.execute(
@@ -1516,6 +1532,7 @@ class RcaControlStore:
                 """
             )
             self._create_v11_snapshot_schema(conn)
+            self._create_v12_learning_lane_schema(conn)
             self._validate_structural_contract(
                 conn,
                 integrity_check=marker_value != CONTROL_STORE_SCHEMA_VERSION,
@@ -1562,11 +1579,44 @@ class RcaControlStore:
                 "UPDATE control_meta SET value = ? "
                 "WHERE key = 'schema_version' AND value = ?",
                 (
-                    CONTROL_STORE_SCHEMA_VERSION,
+                    CONTROL_STORE_SCHEMA_PREDECESSOR_VERSION,
                     "pnc_rca_control_store_v10",
                 ),
             )
             if conn.execute("SELECT changes()").fetchone()[0] != 1:
+                raise RuntimeError("incompatible_control_store_schema:version_marker")
+            conn.commit()
+            return True
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _migrate_v11_to_v12(self) -> bool:
+        """Install the immutable W6 stock cohort and learning admission schema."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            marker = conn.execute(
+                "SELECT value FROM control_meta WHERE key = 'schema_version'"
+            ).fetchone()
+            marker_value = str(marker["value"]) if marker is not None else ""
+            if marker_value == CONTROL_STORE_SCHEMA_VERSION:
+                self._validate_structural_contract(conn, integrity_check=False)
+                conn.commit()
+                return False
+            if marker_value != "pnc_rca_control_store_v11":
+                raise RuntimeError("incompatible_control_store_schema:version_marker")
+            self._create_v12_learning_lane_schema(conn)
+            self._validate_structural_contract(conn, integrity_check=True)
+            updated = conn.execute(
+                "UPDATE control_meta SET value = ? "
+                "WHERE key = 'schema_version' AND value = ?",
+                (CONTROL_STORE_SCHEMA_VERSION, "pnc_rca_control_store_v11"),
+            )
+            if updated.rowcount != 1:
                 raise RuntimeError("incompatible_control_store_schema:version_marker")
             conn.commit()
             return True
@@ -2500,6 +2550,213 @@ class RcaControlStore:
         for statement in statements:
             conn.execute(statement)
 
+    @staticmethod
+    def _create_v12_learning_lane_schema(conn: sqlite3.Connection) -> None:
+        """Create the sealed stock cohort and append-only learning admissions."""
+        script = f"""
+            CREATE TABLE IF NOT EXISTS rca_learning_lane_cohorts (
+                cohort_id TEXT PRIMARY KEY,
+                schema_version TEXT NOT NULL CHECK(
+                    schema_version = '{LEARNING_LANE_COHORT_SCHEMA_VERSION}'
+                ),
+                stock_cutoff TEXT NOT NULL CHECK(
+                    stock_cutoff = '{STOCK_CUTOFF}'
+                ),
+                stock_count INTEGER NOT NULL CHECK(stock_count >= 0),
+                stock_ids_sha256 TEXT NOT NULL CHECK(
+                    length(stock_ids_sha256) = 64
+                    AND stock_ids_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+                sealed_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS rca_learning_lane_stock_items (
+                cohort_id TEXT NOT NULL,
+                work_item_id TEXT NOT NULL,
+                PRIMARY KEY(cohort_id, work_item_id),
+                FOREIGN KEY(cohort_id)
+                    REFERENCES rca_learning_lane_cohorts(cohort_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS rca_learning_lane_admissions (
+                business_key TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK(generation >= 1),
+                work_item_id TEXT NOT NULL,
+                schema_version TEXT NOT NULL CHECK(
+                    schema_version = '{LEARNING_LANE_ADMISSION_SCHEMA_VERSION}'
+                ),
+                lane TEXT NOT NULL CHECK(lane = 'learning'),
+                reason TEXT NOT NULL CHECK(reason IN ('stock', 'legacy')),
+                external_write_allowed INTEGER NOT NULL CHECK(
+                    external_write_allowed = 0
+                ),
+                cohort_id TEXT NOT NULL,
+                stock_cutoff TEXT NOT NULL CHECK(
+                    stock_cutoff = '{STOCK_CUTOFF}'
+                ),
+                stock_ids_sha256 TEXT NOT NULL CHECK(
+                    length(stock_ids_sha256) = 64
+                    AND stock_ids_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+                admitted_at TEXT NOT NULL,
+                PRIMARY KEY(business_key, generation),
+                FOREIGN KEY(business_key, generation)
+                    REFERENCES business_triggers(business_key, generation),
+                FOREIGN KEY(cohort_id, work_item_id)
+                    REFERENCES rca_learning_lane_stock_items(cohort_id, work_item_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_learning_lane_admission_item
+                ON rca_learning_lane_admissions(work_item_id, admitted_at);
+
+            CREATE TRIGGER IF NOT EXISTS trg_learning_lane_stock_item_no_append
+            BEFORE INSERT ON rca_learning_lane_stock_items
+            WHEN (
+                SELECT COUNT(*) FROM rca_learning_lane_stock_items
+                 WHERE cohort_id = NEW.cohort_id
+            ) >= (
+                SELECT stock_count FROM rca_learning_lane_cohorts
+                 WHERE cohort_id = NEW.cohort_id
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'learning_lane_cohort_immutable');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_learning_lane_cohort_no_update
+            BEFORE UPDATE ON rca_learning_lane_cohorts
+            BEGIN
+                SELECT RAISE(ABORT, 'learning_lane_cohort_immutable');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_learning_lane_cohort_no_delete
+            BEFORE DELETE ON rca_learning_lane_cohorts
+            BEGIN
+                SELECT RAISE(ABORT, 'learning_lane_cohort_immutable');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_learning_lane_cohort_no_replace
+            BEFORE INSERT ON rca_learning_lane_cohorts
+            WHEN EXISTS (SELECT 1 FROM rca_learning_lane_cohorts)
+            BEGIN
+                SELECT RAISE(ABORT, 'learning_lane_cohort_replace_forbidden');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_learning_lane_stock_item_no_update
+            BEFORE UPDATE ON rca_learning_lane_stock_items
+            BEGIN
+                SELECT RAISE(ABORT, 'learning_lane_cohort_immutable');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_learning_lane_stock_item_no_delete
+            BEFORE DELETE ON rca_learning_lane_stock_items
+            BEGIN
+                SELECT RAISE(ABORT, 'learning_lane_cohort_immutable');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_learning_lane_admission_no_update
+            BEFORE UPDATE ON rca_learning_lane_admissions
+            BEGIN
+                SELECT RAISE(ABORT, 'learning_lane_admission_immutable');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_learning_lane_admission_no_delete
+            BEFORE DELETE ON rca_learning_lane_admissions
+            BEGIN
+                SELECT RAISE(ABORT, 'learning_lane_admission_immutable');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS trg_learning_lane_admission_cohort_binding
+            BEFORE INSERT ON rca_learning_lane_admissions
+            WHEN NOT EXISTS (
+                SELECT 1
+                  FROM rca_learning_lane_cohorts AS cohort
+                  JOIN rca_learning_lane_stock_items AS item
+                    ON item.cohort_id = cohort.cohort_id
+                   AND item.work_item_id = NEW.work_item_id
+                 WHERE cohort.cohort_id = NEW.cohort_id
+                   AND cohort.stock_cutoff = NEW.stock_cutoff
+                   AND cohort.stock_ids_sha256 = NEW.stock_ids_sha256
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'learning_lane_cohort_binding_mismatch');
+            END;
+            """
+        pending = ""
+        for line in script.splitlines(keepends=True):
+            pending += line
+            if sqlite3.complete_statement(pending):
+                conn.execute(pending)
+                pending = ""
+        if pending.strip():
+            conn.execute(pending)
+
+    @staticmethod
+    def _validate_v12_learning_lane_schema(conn: sqlite3.Connection) -> None:
+        required_columns = {
+            "rca_learning_lane_cohorts": {
+                "cohort_id", "schema_version", "stock_cutoff", "stock_count",
+                "stock_ids_sha256", "sealed_at",
+            },
+            "rca_learning_lane_stock_items": {"cohort_id", "work_item_id"},
+            "rca_learning_lane_admissions": {
+                "business_key", "generation", "work_item_id", "schema_version",
+                "lane", "reason", "external_write_allowed", "cohort_id",
+                "stock_cutoff", "stock_ids_sha256", "admitted_at",
+            },
+        }
+        for table, expected in required_columns.items():
+            observed = {
+                str(row["name"])
+                for row in conn.execute(f"PRAGMA table_info({table})")
+            }
+            if observed != expected:
+                raise RuntimeError(f"incompatible_control_store_schema:{table}_columns")
+        present_triggers = {
+            str(row["name"])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+            )
+        }
+        required_triggers = {
+            "trg_learning_lane_cohort_no_update",
+            "trg_learning_lane_cohort_no_delete",
+            "trg_learning_lane_cohort_no_replace",
+            "trg_learning_lane_stock_item_no_append",
+            "trg_learning_lane_stock_item_no_update",
+            "trg_learning_lane_stock_item_no_delete",
+            "trg_learning_lane_admission_no_update",
+            "trg_learning_lane_admission_no_delete",
+            "trg_learning_lane_admission_cohort_binding",
+        }
+        if not required_triggers.issubset(present_triggers):
+            raise RuntimeError("incompatible_control_store_schema:learning_lane_triggers")
+        cohorts = conn.execute(
+            "SELECT * FROM rca_learning_lane_cohorts ORDER BY cohort_id"
+        ).fetchall()
+        if len(cohorts) > 1:
+            raise RuntimeError("incompatible_control_store_schema:learning_lane_cohort_count")
+        for cohort in cohorts:
+            if str(cohort["stock_cutoff"]) != STOCK_CUTOFF:
+                raise RuntimeError(
+                    "incompatible_control_store_schema:learning_lane_cutoff"
+                )
+            item_ids = [
+                str(row["work_item_id"])
+                for row in conn.execute(
+                    "SELECT work_item_id FROM rca_learning_lane_stock_items "
+                    "WHERE cohort_id = ? ORDER BY work_item_id",
+                    (cohort["cohort_id"],),
+                ).fetchall()
+            ]
+            if (
+                len(item_ids) != int(cohort["stock_count"])
+                or RcaControlStore._learning_stock_digest(item_ids)
+                != str(cohort["stock_ids_sha256"])
+            ):
+                raise RuntimeError(
+                    "incompatible_control_store_schema:learning_lane_cohort_binding"
+                )
+
     def _preflight_schema_version(self) -> str | None:
         """Reject a future schema using a read-only connection before any pragma/DDL."""
         if not self.db_path.is_file() or self.db_path.stat().st_size == 0:
@@ -2537,6 +2794,7 @@ class RcaControlStore:
             conn.execute("PRAGMA recursive_triggers=ON")
             conn.execute("BEGIN")
             self._validate_structural_contract(conn, integrity_check=False)
+            self._validate_v12_learning_lane_schema(conn)
             conn.commit()
         except Exception:
             if conn.in_transaction:
@@ -5304,6 +5562,261 @@ class RcaControlStore:
             (table,),
         ).fetchone() is not None
 
+    @staticmethod
+    def _learning_cutoff_datetime() -> datetime:
+        value = datetime.fromisoformat(STOCK_CUTOFF)
+        return value.astimezone(timezone.utc)
+
+    @staticmethod
+    def _learning_stock_ids_tx(conn: sqlite3.Connection) -> list[str]:
+        """Derive the stock set from already-settled user-visible results."""
+        if not (
+            RcaControlStore._table_exists(conn, "rca_delivery_jobs")
+            and RcaControlStore._table_exists(conn, "rca_delivery_effects")
+        ):
+            return []
+        required = {
+            "rca_delivery_jobs": {"delivery_id", "target_key", "work_item_id"},
+            "rca_delivery_effects": {
+                "delivery_id", "effect_kind", "target_key", "status",
+                "payload_json", "created_at",
+            },
+        }
+        for table, columns in required.items():
+            observed = {
+                str(row["name"])
+                for row in conn.execute(f"PRAGMA table_info({table})")
+            }
+            if not columns.issubset(observed):
+                return []
+        cutoff = RcaControlStore._learning_cutoff_datetime()
+        rows = conn.execute(
+            """
+            SELECT j.work_item_id, j.target_key AS job_target_key,
+                   e.target_key, e.status, e.payload_json, e.created_at
+              FROM rca_delivery_effects AS e
+              JOIN rca_delivery_jobs AS j ON j.delivery_id = e.delivery_id
+             WHERE e.effect_kind = 'feishu_issue_comment'
+               AND e.status = 'succeeded'
+            """
+        ).fetchall()
+        ids: set[str] = set()
+        for row in rows:
+            if str(row["target_key"] or "") != str(row["job_target_key"] or ""):
+                continue
+            target = str(row["target_key"] or "")
+            try:
+                payload = json.loads(str(row["payload_json"] or ""))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            if not isinstance(payload, Mapping):
+                payload = {}
+            if str(payload.get("schema_version") or "") in {
+                "pnc_rca_conclusion_adjudication_effect_v1",
+                "pnc_rca_conclusion_adjudication_effect_v2",
+            } or target.startswith("g1q3-rca-adjudication-target-v1-"):
+                continue
+            try:
+                created = datetime.fromisoformat(
+                    str(row["created_at"]).replace("Z", "+00:00")
+                )
+                if created.tzinfo is None or created.utcoffset() is None:
+                    continue
+                created = created.astimezone(timezone.utc)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if created <= cutoff:
+                item_id = str(row["work_item_id"] or "").strip()
+                if item_id:
+                    ids.add(item_id)
+        return sorted(ids)
+
+    @staticmethod
+    def _learning_stock_digest(work_item_ids: Iterable[str]) -> str:
+        normalized = sorted({str(item).strip() for item in work_item_ids if str(item).strip()})
+        return hashlib.sha256("\n".join(normalized).encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _ensure_learning_lane_cohort_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        sealed_at: str,
+    ) -> sqlite3.Row:
+        existing = conn.execute(
+            "SELECT * FROM rca_learning_lane_cohorts LIMIT 1"
+        ).fetchone()
+        if existing is not None:
+            if str(existing["stock_cutoff"]) != STOCK_CUTOFF:
+                raise RecordConflictError("learning_lane_cohort_cutoff_mismatch")
+            item_ids = [
+                str(row["work_item_id"])
+                for row in conn.execute(
+                    "SELECT work_item_id FROM rca_learning_lane_stock_items "
+                    "WHERE cohort_id = ? ORDER BY work_item_id",
+                    (existing["cohort_id"],),
+                ).fetchall()
+            ]
+            item_count = len(item_ids)
+            digest = cls._learning_stock_digest(item_ids)
+            if digest != str(existing["stock_ids_sha256"]):
+                raise RecordConflictError("learning_lane_cohort_digest_mismatch")
+            if item_count != int(existing["stock_count"]):
+                raise RecordConflictError("learning_lane_cohort_count_mismatch")
+            return existing
+        work_item_ids = cls._learning_stock_ids_tx(conn)
+        digest = cls._learning_stock_digest(work_item_ids)
+        material = _canonical_json(
+            {
+                "schema_version": LEARNING_LANE_COHORT_SCHEMA_VERSION,
+                "stock_cutoff": STOCK_CUTOFF,
+                "stock_count": len(work_item_ids),
+                "stock_ids_sha256": digest,
+            }
+        )
+        cohort_id = "g1q3-rca-stock-cohort-v1-" + hashlib.sha256(
+            material.encode("utf-8")
+        ).hexdigest()
+        conn.execute(
+            """
+            INSERT INTO rca_learning_lane_cohorts(
+                cohort_id, schema_version, stock_cutoff, stock_count,
+                stock_ids_sha256, sealed_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                cohort_id,
+                LEARNING_LANE_COHORT_SCHEMA_VERSION,
+                STOCK_CUTOFF,
+                len(work_item_ids),
+                digest,
+                sealed_at,
+            ),
+        )
+        conn.executemany(
+            "INSERT INTO rca_learning_lane_stock_items(cohort_id, work_item_id) VALUES (?, ?)",
+            [(cohort_id, item) for item in work_item_ids],
+        )
+        row = conn.execute(
+            "SELECT * FROM rca_learning_lane_cohorts WHERE cohort_id = ?",
+            (cohort_id,),
+        ).fetchone()
+        if row is None:
+            raise RecordConflictError("learning_lane_cohort_missing_after_seal")
+        return row
+
+    @classmethod
+    def _ensure_learning_lane_admission_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        admission: RcaAdmission,
+        current: str,
+    ) -> bool:
+        """Bind a post-cutoff stock generation to the sealed learning lane."""
+        observed_at = datetime.fromisoformat(
+            str(current).replace("Z", "+00:00")
+        ).astimezone(timezone.utc)
+        if observed_at <= cls._learning_cutoff_datetime():
+            return False
+        cohort = cls._ensure_learning_lane_cohort_tx(conn, sealed_at=current)
+        member = conn.execute(
+            """
+            SELECT 1 FROM rca_learning_lane_stock_items
+             WHERE cohort_id = ? AND work_item_id = ?
+            """,
+            (cohort["cohort_id"], admission.source_refs.work_item_id),
+        ).fetchone()
+        if member is None:
+            return False
+        existing = conn.execute(
+            """
+            SELECT * FROM rca_learning_lane_admissions
+             WHERE business_key = ? AND generation = ?
+            """,
+            (admission.business_key, admission.generation),
+        ).fetchone()
+        values = {
+            "business_key": admission.business_key,
+            "generation": admission.generation,
+            "work_item_id": admission.source_refs.work_item_id,
+            "schema_version": LEARNING_LANE_ADMISSION_SCHEMA_VERSION,
+            "lane": "learning",
+            "reason": "stock",
+            "external_write_allowed": 0,
+            "cohort_id": str(cohort["cohort_id"]),
+            "stock_cutoff": str(cohort["stock_cutoff"]),
+            "stock_ids_sha256": str(cohort["stock_ids_sha256"]),
+            "admitted_at": current,
+        }
+        if existing is not None:
+            if any(existing[name] != value for name, value in values.items() if name != "admitted_at"):
+                raise RecordConflictError("learning_lane_admission_binding_mismatch")
+            return True
+        conn.execute(
+            """
+            INSERT INTO rca_learning_lane_admissions(
+                business_key, generation, work_item_id, schema_version, lane,
+                reason, external_write_allowed, cohort_id, stock_cutoff,
+                stock_ids_sha256, admitted_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            tuple(values[name] for name in (
+                "business_key", "generation", "work_item_id", "schema_version",
+                "lane", "reason", "external_write_allowed", "cohort_id",
+                "stock_cutoff", "stock_ids_sha256", "admitted_at",
+            )),
+        )
+        return True
+
+    def seal_learning_lane_cohort(
+        self, *, now: datetime | None = None
+    ) -> dict[str, Any]:
+        """Seal and return the stock cohort; repeated calls are read-only."""
+        current = _iso(now)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = self._ensure_learning_lane_cohort_tx(conn, sealed_at=current)
+            conn.commit()
+            return {
+                "cohort_id": str(row["cohort_id"]),
+                "schema_version": str(row["schema_version"]),
+                "stock_cutoff": str(row["stock_cutoff"]),
+                "stock_count": int(row["stock_count"]),
+                "stock_ids_sha256": str(row["stock_ids_sha256"]),
+                "sealed_at": str(row["sealed_at"]),
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def learning_lane_cohort(self) -> dict[str, Any] | None:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM rca_learning_lane_cohorts LIMIT 1"
+            ).fetchone()
+            return dict(row) if row is not None else None
+        finally:
+            conn.close()
+
+    def learning_lane_admission(
+        self, business_key: str, generation: int
+    ) -> dict[str, Any] | None:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM rca_learning_lane_admissions "
+                "WHERE business_key = ? AND generation = ?",
+                (business_key, generation),
+            ).fetchone()
+            return dict(row) if row is not None else None
+        finally:
+            conn.close()
+
     @classmethod
     def _migrate_source_neutral_parents(cls, conn: sqlite3.Connection) -> None:
         """Atomically remove Kafka-only parent constraints while preserving rows."""
@@ -5773,6 +6286,12 @@ class RcaControlStore:
         admission: RcaAdmission,
         current: str,
     ) -> str:
+        if conn.execute(
+            "SELECT 1 FROM rca_learning_lane_admissions "
+            "WHERE business_key = ? AND generation = ?",
+            (admission.business_key, admission.generation),
+        ).fetchone() is not None:
+            return ""
         refs = admission.source_refs
         target_key = (
             f"feishu_project:{refs.project_key}:{refs.work_item_type_key}:"
@@ -6013,6 +6532,12 @@ class RcaControlStore:
         request: ManualRcaTriggerRequest,
         current: str,
     ) -> tuple[str, bool]:
+        if conn.execute(
+            "SELECT 1 FROM rca_learning_lane_admissions "
+            "WHERE business_key = ? AND generation = ?",
+            (admission.business_key, admission.generation),
+        ).fetchone() is not None:
+            return "", False
         root_message_id = request.thread_id.split("topic:", 1)[1]
         target_key = f"feishu_thread:{request.chat_id}:{root_message_id}"
         target = {
@@ -6064,6 +6589,8 @@ class RcaControlStore:
         subscription_key: str,
         current: str,
     ) -> None:
+        if not str(subscription_key or "").strip():
+            return
         conn.execute(
             """
             INSERT OR IGNORE INTO rca_trigger_delivery_bindings(
@@ -6245,6 +6772,9 @@ class RcaControlStore:
                 trigger_kind=trigger_kind,
                 generation=generation,
                 **admission_kwargs,
+            )
+            cls._ensure_learning_lane_admission_tx(
+                conn, admission=admission, current=current
             )
             issue_subscription_key = cls._insert_issue_subscription_tx(
                 conn, admission=admission, current=current
@@ -7062,6 +7592,8 @@ class RcaControlStore:
             error_prefix="incompatible_control_store_schema",
         )
         RcaControlStore._validate_v11_snapshot_schema(conn)
+        if RcaControlStore._table_exists(conn, "rca_learning_lane_admissions"):
+            RcaControlStore._validate_v12_learning_lane_schema(conn)
 
         def foreign_key_groups(table: str) -> dict[tuple[int, str], set[tuple[str, str]]]:
             groups: dict[tuple[int, str], set[tuple[str, str]]] = {}
@@ -8677,12 +9209,25 @@ class RcaControlStore:
                     }
                     if source_kind == "feishu_group_manual":
                         target_set["chat_id"] = str(source_metadata["chat_id"])
+                    learning_lane = conn.execute(
+                        "SELECT 1 FROM rca_learning_lane_admissions "
+                        "WHERE business_key = ? AND generation = ?",
+                        (
+                            legacy_admission.business_key,
+                            legacy_admission.generation,
+                        ),
+                    ).fetchone() is not None
                     snapshot = issue_snapshot_write_fence(
                         snapshot,
                         activation_epoch_id=str(activation_decision.epoch_id),
                         activation_ledger_id=int(activation_decision.ledger_id),
                         admission_key=admission_key,
                         target_set=target_set,
+                        allowed_write_kinds=(
+                            LEARNING_LANE_ALLOWED_WRITE_KINDS
+                            if learning_lane
+                            else None
+                        ),
                         now=datetime.now(timezone.utc),
                     )
                 except Exception as exc:
@@ -9867,26 +10412,51 @@ class RcaControlStore:
                         "UPDATE rca_trigger_sources SET outcome = ? WHERE source_id = ?",
                         (replay_outcome, source_id),
                     )
-                required_subscriptions = conn.execute(
-                    """
-                    SELECT subscription_key, effect_kind
-                      FROM rca_delivery_subscriptions
-                     WHERE business_key = ? AND generation = ?
-                       AND effect_kind IN (
-                           'feishu_issue_comment', 'feishu_thread_reply'
-                       )
-                    """,
-                    (binding["business_key"], int(binding["generation"])),
-                ).fetchall()
+                replay_generation = int(binding["generation"])
+                replay_admission_for_lane = build_rca_admission(
+                    project_key=str(binding["project_key"]),
+                    project_simple_name=project_simple_name,
+                    work_item_type_key=str(binding["work_item_type_key"]),
+                    work_item_id=str(binding["work_item_id"]),
+                    rule_version=str(binding["creation_rule_version"]),
+                    trigger_kind=(
+                        "manual_retrigger"
+                        if replay_generation > 1
+                        else (
+                            "issue_created"
+                            if str(binding["source_event_id"] or "").strip()
+                            else "manual_issue_request"
+                        )
+                    ),
+                    generation=replay_generation,
+                )
+                learning_lane = self._ensure_learning_lane_admission_tx(
+                    conn, admission=replay_admission_for_lane, current=current
+                )
+                required_subscriptions = (
+                    []
+                    if learning_lane
+                    else conn.execute(
+                        """
+                        SELECT subscription_key, effect_kind
+                          FROM rca_delivery_subscriptions
+                         WHERE business_key = ? AND generation = ?
+                           AND effect_kind IN (
+                               'feishu_issue_comment', 'feishu_thread_reply'
+                           )
+                        """,
+                        (binding["business_key"], int(binding["generation"])),
+                    ).fetchall()
+                )
                 subscriptions_by_kind = {
                     str(row["effect_kind"]): str(row["subscription_key"])
                     for row in required_subscriptions
                 }
-                expected_kinds = {"feishu_issue_comment"}
+                expected_kinds = set() if learning_lane else {"feishu_issue_comment"}
                 subscription_key = subscriptions_by_kind.get(
                     "feishu_issue_comment", ""
                 )
-                if not issue_only_operator:
+                if not learning_lane and not issue_only_operator:
                     root = manual.thread_id.split("topic:", 1)[1]
                     target_key = f"feishu_thread:{manual.chat_id}:{root}"
                     subscription_key = _stable_key(
@@ -9899,11 +10469,11 @@ class RcaControlStore:
                         },
                     )
                     expected_kinds.add("feishu_thread_reply")
-                if not subscription_key or (
+                if not learning_lane and (not subscription_key or (
                     not issue_only_operator
                     and subscriptions_by_kind.get("feishu_thread_reply")
                     != subscription_key
-                ):
+                )):
                     raise ManualRcaAdmissionError(
                         "manual_source_subscription_missing"
                     )
@@ -10355,6 +10925,9 @@ class RcaControlStore:
                     current,
                 ),
             )
+            learning_lane = self._ensure_learning_lane_admission_tx(
+                conn, admission=admission, current=current
+            )
             if w3_authority is not None:
                 self.persist_w3_admission_shadow_tx(
                     conn,
@@ -10387,7 +10960,7 @@ class RcaControlStore:
                 current=current,
             )
             late_catchup = False
-            if not issue_only_operator:
+            if not learning_lane and not issue_only_operator:
                 self._bind_source_subscription_tx(
                     conn,
                     source_id=source_id,
@@ -11055,6 +11628,9 @@ class RcaControlStore:
                             (bound_source_id,),
                         )
                     if admission is not None:
+                        learning_lane = self._ensure_learning_lane_admission_tx(
+                            conn, admission=admission, current=now
+                        )
                         issue_subscription_key = self._insert_issue_subscription_tx(
                             conn, admission=admission, current=now
                         )
@@ -12781,6 +13357,9 @@ class RcaControlStore:
             "rca_admission_snapshots",
             "rca_source_authority_receipts",
             "rca_snapshot_source_envelopes",
+            "rca_learning_lane_cohorts",
+            "rca_learning_lane_stock_items",
+            "rca_learning_lane_admissions",
         }
         if table not in allowed:
             raise ValueError(f"unsupported table: {table}")

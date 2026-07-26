@@ -1149,6 +1149,18 @@ def record_conclusion_adjudication_tx(
     current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
     lineage_json = _canonical_json(lineage)
     lineage_sha256 = hashlib.sha256(lineage_json.encode("utf-8")).hexdigest()
+    # Keep the correction slot reservation in the same caller transaction as
+    # the adjudication row and effect insert.
+    from gateway.pnc_rca_delivery_store import RcaDeliveryStore
+
+    RcaDeliveryStore.enforce_issue_comment_budget_tx(
+        conn,
+        delivery_id=str(row["delivery_id"]),
+        business_key=str(row["business_key"]),
+        generation=int(row["generation"]),
+        target_key=str(payload["target_key"]),
+        payload=payload,
+    )
     conn.execute(
         """
         INSERT INTO rca_delivery_effects(

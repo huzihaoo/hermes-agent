@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
+import re
 import sqlite3
 import stat
 from typing import Any, Literal, Mapping, Sequence
@@ -96,6 +97,13 @@ PERMANENT_FAILURE_CIRCUIT_THRESHOLD = 2
 _PERMANENT_FAILURE_STREAK_META_KEY = "permanent_failure_streak"
 _PERMANENT_FAILURE_LAST_META_KEY = "permanent_failure_last"
 _NON_PIPELINE_QUARANTINE_CODES = frozenset({"feishu_work_item_not_found"})
+LEARNING_LANE_EXTERNAL_EFFECT_ERROR = "learning_lane_external_effect_forbidden"
+_LEARNING_ADJUDICATION_SCHEMAS = frozenset({
+    "pnc_rca_conclusion_adjudication_effect_v1",
+    "pnc_rca_conclusion_adjudication_effect_v2",
+})
+_ADJUDICATION_TARGET_PREFIX = "g1q3-rca-adjudication-target-v1-"
+_OPEN_ID_RE = re.compile(r"^ou_[0-9a-f]{32}$")
 SUPPORTED_DELIVERY_STORE_SCHEMA_VERSIONS = frozenset({
     "pnc_rca_delivery_store_v1",
     "pnc_rca_delivery_store_v2",
@@ -735,6 +743,30 @@ class RcaDeliveryStore:
         if boundary.tzinfo is None or boundary.utcoffset() is None:
             return False
         return observed.astimezone(timezone.utc) < boundary.astimezone(timezone.utc)
+
+    def validate_learning_lane_external_operation(
+        self, *, business_key: str, generation: int, operation: str
+    ) -> None:
+        """Reject every provider-side Feishu operation for a learning admission."""
+        conn = self._connect()
+        try:
+            row = self._learning_lane_row_tx(
+                conn, business_key=business_key, generation=generation
+            )
+        finally:
+            conn.close()
+        if (
+            row is not None
+            and str(row["lane"] or "") == "learning"
+            and int(
+                row["external_write_allowed"]
+                if row["external_write_allowed"] is not None
+                else 1
+            )
+            == 0
+            and str(operation or "").strip().startswith("feishu_")
+        ):
+            raise RuntimeError(LEARNING_LANE_EXTERNAL_EFFECT_ERROR)
 
     @staticmethod
     def _validate_activation_required(activation_required: bool) -> None:
@@ -1751,6 +1783,10 @@ class RcaDeliveryStore:
         )
         validate_conclusion_adjudication_schema(conn)
         RcaDeliveryStore._validate_failure_route_schema(conn)
+        # W6 enforcement is additive and safe to install on the v9 store.
+        # The Python transaction guards remain authoritative when the control
+        # tables are not present in an isolated delivery fixture.
+        RcaDeliveryStore._install_w6_effect_guards(conn)
         quick_check = conn.execute("PRAGMA quick_check").fetchone()
         if quick_check is None or str(quick_check[0]).lower() != "ok":
             raise RuntimeError("incompatible_delivery_store_schema:quick_check")
@@ -1769,6 +1805,37 @@ class RcaDeliveryStore:
             conn.execute("PRAGMA foreign_keys=ON")
             if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise RuntimeError("incompatible_delivery_store_schema:foreign_keys")
+
+    @staticmethod
+    def _install_w6_effect_guards(conn: sqlite3.Connection) -> None:
+        """Install a DB-level backstop when the shared control tables are present."""
+        if not RcaDeliveryStore._table_exists(
+            conn, "rca_learning_lane_admissions"
+        ):
+            return
+        conn.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_learning_lane_effect_insert_forbidden
+            BEFORE INSERT ON rca_delivery_effects
+            WHEN NEW.effect_kind LIKE 'feishu_%'
+             AND EXISTS (
+                 SELECT 1 FROM rca_learning_lane_admissions AS admission
+                  WHERE admission.business_key = (
+                      SELECT business_key FROM rca_delivery_jobs
+                       WHERE delivery_id = NEW.delivery_id
+                  )
+                    AND admission.generation = (
+                      SELECT generation FROM rca_delivery_jobs
+                       WHERE delivery_id = NEW.delivery_id
+                    )
+                    AND admission.lane = 'learning'
+                    AND admission.external_write_allowed = 0
+             )
+            BEGIN
+                SELECT RAISE(ABORT, 'learning_lane_external_effect_forbidden');
+            END
+            """
+        )
 
     def journal_settings(self) -> dict[str, Any]:
         conn = self._connect()
@@ -2865,6 +2932,168 @@ class RcaDeliveryStore:
         return row is not None
 
     @classmethod
+    def _learning_lane_row_tx(
+        cls, conn: sqlite3.Connection, *, business_key: str, generation: int
+    ) -> sqlite3.Row | None:
+        if not cls._table_exists(conn, "rca_learning_lane_admissions"):
+            return None
+        return conn.execute(
+            "SELECT * FROM rca_learning_lane_admissions "
+            "WHERE business_key = ? AND generation = ?",
+            (business_key, generation),
+        ).fetchone()
+
+    @classmethod
+    def is_learning_lane_tx(
+        cls, conn: sqlite3.Connection, *, business_key: str, generation: int
+    ) -> bool:
+        row = cls._learning_lane_row_tx(
+            conn, business_key=business_key, generation=generation
+        )
+        return (
+            row is not None
+            and str(row["lane"] or "") == "learning"
+            and int(
+                row["external_write_allowed"]
+                if row["external_write_allowed"] is not None
+                else 1
+            )
+            == 0
+        )
+
+    @staticmethod
+    def _is_adjudication_comment_payload(
+        payload: Mapping[str, Any], target_key: str
+    ) -> bool:
+        return (
+            str(payload.get("schema_version") or "") in _LEARNING_ADJUDICATION_SCHEMAS
+            or str(target_key or "").startswith(_ADJUDICATION_TARGET_PREFIX)
+        )
+
+    @classmethod
+    def enforce_issue_comment_budget_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        delivery_id: str,
+        business_key: str,
+        generation: int,
+        target_key: str,
+        payload: Mapping[str, Any],
+    ) -> None:
+        """Reserve one outward issue-comment slot inside the caller transaction."""
+        if cls.is_learning_lane_tx(
+            conn, business_key=business_key, generation=generation
+        ):
+            raise DeliveryContractError(LEARNING_LANE_EXTERNAL_EFFECT_ERROR)
+        job = conn.execute(
+            "SELECT work_item_id, target_key FROM rca_delivery_jobs WHERE delivery_id = ?",
+            (delivery_id,),
+        ).fetchone()
+        if job is None:
+            raise DeliveryRecordConflictError("delivery_comment_budget_job_missing")
+        job_target = str(job["target_key"] or "")
+        is_adjudication = cls._is_adjudication_comment_payload(payload, target_key)
+        if not is_adjudication and str(target_key) != job_target:
+            raise DeliveryContractError("delivery_comment_budget_unclassified")
+        if is_adjudication:
+            existing = conn.execute(
+                """
+                SELECT COUNT(*)
+                  FROM rca_delivery_effects AS e
+                  JOIN rca_delivery_jobs AS j ON j.delivery_id = e.delivery_id
+                 WHERE j.work_item_id = ?
+                   AND e.effect_kind = 'feishu_issue_comment'
+                   AND (
+                        json_extract(e.payload_json, '$.schema_version') IN (?, ?)
+                        OR substr(e.target_key, 1, ?) = ?
+                   )
+                """,
+                (
+                    str(job["work_item_id"]),
+                    *_LEARNING_ADJUDICATION_SCHEMAS,
+                    len(_ADJUDICATION_TARGET_PREFIX),
+                    _ADJUDICATION_TARGET_PREFIX,
+                ),
+            ).fetchone()[0]
+            if int(existing) >= 1:
+                raise DeliveryContractError(
+                    "conclusion_adjudication_comment_budget_exhausted"
+                )
+            return
+
+        source_tables_ready = all(
+            cls._table_exists(conn, table)
+            for table in ("rca_trigger_sources", "rca_trigger_bindings", "business_triggers")
+        )
+        explicit_generations: set[int] = set()
+        if source_tables_ready:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT b.generation, s.requester_id, s.chat_id,
+                                s.thread_id, s.message_id, s.source_kind, s.mode
+                  FROM rca_trigger_bindings AS b
+                  JOIN rca_trigger_sources AS s ON s.source_id = b.source_id
+                  JOIN business_triggers AS t
+                    ON t.business_key = b.business_key AND t.generation = b.generation
+                 WHERE t.work_item_id = ?
+                """,
+                (str(job["work_item_id"]),),
+            ).fetchall()
+            for row in rows:
+                if (
+                    str(row["source_kind"] or "") == "feishu_group_manual"
+                    and str(row["mode"] or "") == "rerun"
+                    and _OPEN_ID_RE.fullmatch(str(row["requester_id"] or ""))
+                    and str(row["chat_id"] or "").strip()
+                    and str(row["thread_id"] or "").strip()
+                    and str(row["message_id"] or "").strip()
+                ):
+                    explicit_generations.add(int(row["generation"]))
+        w6_cohort_sealed = (
+            cls._table_exists(conn, "rca_learning_lane_cohorts")
+            and conn.execute(
+                "SELECT 1 FROM rca_learning_lane_cohorts "
+                "WHERE stock_count > 0 LIMIT 1"
+            ).fetchone()
+            is not None
+        )
+        if generation > 1 and generation not in explicit_generations:
+            if w6_cohort_sealed:
+                raise DeliveryContractError(
+                    "delivery_comment_budget_generation_not_user_rerun"
+                )
+        primary_count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                  FROM rca_delivery_effects AS e
+                  JOIN rca_delivery_jobs AS j ON j.delivery_id = e.delivery_id
+                 WHERE j.work_item_id = ?
+                   AND e.effect_kind = 'feishu_issue_comment'
+                   AND e.target_key = j.target_key
+                   AND NOT (
+                        json_extract(e.payload_json, '$.schema_version') IN (?, ?)
+                        OR substr(e.target_key, 1, ?) = ?
+                   )
+                """,
+                (
+                    str(job["work_item_id"]),
+                    *_LEARNING_ADJUDICATION_SCHEMAS,
+                    len(_ADJUDICATION_TARGET_PREFIX),
+                    _ADJUDICATION_TARGET_PREFIX,
+                ),
+            ).fetchone()[0]
+        )
+        allowed_primary = 1 + len(explicit_generations)
+        if generation > 1 and not w6_cohort_sealed and generation not in explicit_generations:
+            # Pre-W6 fixtures have no durable cohort authority; preserve their
+            # legacy generation behavior until the sealed contract is present.
+            allowed_primary += 1
+        if primary_count >= allowed_primary:
+            raise DeliveryContractError("delivery_comment_budget_exhausted")
+
+    @classmethod
     def _quarantine_subscription_in_transaction(
         cls,
         conn: sqlite3.Connection,
@@ -2900,6 +3129,12 @@ class RcaDeliveryStore:
         effect_kind = str(subscription["effect_kind"])
         target_key = str(subscription["target_key"])
         delivery_id = str(job["delivery_id"])
+        if cls.is_learning_lane_tx(
+            conn,
+            business_key=str(job["business_key"]),
+            generation=int(job["generation"]),
+        ):
+            raise DeliveryContractError(LEARNING_LANE_EXTERNAL_EFFECT_ERROR)
         if int(subscription["required"]) != 1:
             raise DeliveryContractError("delivery_subscription_required_invalid")
         try:
@@ -3249,6 +3484,14 @@ class RcaDeliveryStore:
                         current,
                     ),
                 )
+                self.enforce_issue_comment_budget_tx(
+                    conn,
+                    delivery_id=delivery.delivery_id,
+                    business_key=delivery.business_key,
+                    generation=delivery.generation,
+                    target_key=delivery.target_key,
+                    payload=delivery.effect_payload,
+                )
                 conn.execute(
                     """
                     INSERT INTO rca_delivery_effects(
@@ -3408,6 +3651,14 @@ class RcaDeliveryStore:
                     current,
                     current,
                 ),
+            )
+            cls.enforce_issue_comment_budget_tx(
+                conn,
+                delivery_id=delivery.delivery_id,
+                business_key=delivery.business_key,
+                generation=delivery.generation,
+                target_key=delivery.target_key,
+                payload=delivery.effect_payload,
             )
             conn.execute(
                 """
