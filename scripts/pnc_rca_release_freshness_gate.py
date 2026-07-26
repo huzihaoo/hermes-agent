@@ -486,6 +486,9 @@ def audit_release_golden_registry(
         errors.append(_error("pnc_release_golden_registry_invalid"))
     if observed.get("low_tier_golden_ready") is not True:
         errors.append(_error("pnc_release_low_tier_golden_not_ready"))
+    evaluator_entries = observed.get("evaluators")
+    if not isinstance(evaluator_entries, Mapping) or not evaluator_entries:
+        errors.append(_error("pnc_release_golden_evaluator_set_empty"))
     manifest_path = hermes_home / "runtime" / "LIVE_MANIFEST.json"
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))

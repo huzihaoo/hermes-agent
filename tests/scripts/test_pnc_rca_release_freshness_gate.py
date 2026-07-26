@@ -206,7 +206,12 @@ def test_release_golden_registry_must_be_green_and_pipeline_bound(tmp_path: Path
         "low_tier_golden_ready": True,
         "pipeline_commit": commit,
         "pipeline_tree": tree,
-        "evaluators": {},
+        "evaluators": {
+            "acc_decel_heavy": {
+                "status": "passed",
+                "evaluator_id": "acc_decel_heavy",
+            }
+        },
     }
 
     evidence, errors = gate.audit_release_golden_registry(
@@ -215,6 +220,15 @@ def test_release_golden_registry_must_be_green_and_pipeline_bound(tmp_path: Path
     )
     assert errors == []
     assert evidence["active_pipeline_commit"] == commit
+
+    empty = {**base, "evaluators": {}}
+    _evidence, errors = gate.audit_release_golden_registry(
+        hermes_home=hermes_home,
+        registry=empty,
+    )
+    assert {item["code"] for item in errors} == {
+        "pnc_release_golden_evaluator_set_empty"
+    }
 
     failing = {**base, "low_tier_golden_ready": False}
     _evidence, errors = gate.audit_release_golden_registry(
