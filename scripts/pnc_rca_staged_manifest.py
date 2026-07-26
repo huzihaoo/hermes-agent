@@ -309,12 +309,10 @@ def compile_staged_manifest(
 def _atomic_write(
     path: Path,
     payload: bytes,
-    *,
-    expected_identity: _FileIdentity | None,
 ) -> None:
     selected = _absolute(path)
     parent = _validate_owner_directory(selected.parent, create=True)
-    if _optional_output_identity(selected) != expected_identity:
+    if _optional_output_identity(selected) is not None:
         raise StagedManifestError("pnc_release_staged_manifest_output_changed")
 
     descriptor, temporary_name = tempfile.mkstemp(
@@ -343,10 +341,12 @@ def _atomic_write(
             or confirmed_temporary_identity != temporary_identity
         ):
             raise StagedManifestError("pnc_release_staged_manifest_temporary_invalid")
-        if _optional_output_identity(selected) != expected_identity:
+        if _optional_output_identity(selected) is not None:
             raise StagedManifestError("pnc_release_staged_manifest_output_changed")
+        published = False
         try:
-            os.replace(temporary, selected)
+            os.link(temporary, selected, follow_symlinks=False)
+            published = True
             directory_descriptor = os.open(
                 parent,
                 os.O_RDONLY
@@ -357,7 +357,21 @@ def _atomic_write(
                 os.fsync(directory_descriptor)
             finally:
                 os.close(directory_descriptor)
+        except FileExistsError as exc:
+            raise StagedManifestError(
+                "pnc_release_staged_manifest_output_changed"
+            ) from exc
         except OSError as exc:
+            if published:
+                try:
+                    selected_identity = selected.lstat()
+                    if (
+                        selected_identity.st_dev == temporary_identity.device
+                        and selected_identity.st_ino == temporary_identity.inode
+                    ):
+                        selected.unlink()
+                except OSError:
+                    pass
             raise StagedManifestError(
                 "pnc_release_staged_manifest_atomic_write_failed"
             ) from exc
@@ -379,12 +393,14 @@ def bind_staged_manifest(
     pipeline_source_root: Path,
     pipeline_commit: str,
     pipeline_tree: str,
-    staged_root: Path | None = None,
+    staged_root: Path,
 ) -> dict[str, Any]:
     """Compile and atomically write a staged manifest without applying it."""
 
     source_path = _absolute(input_manifest)
     output_path = _absolute(output_manifest)
+    if staged_root is None:
+        raise StagedManifestError("pnc_release_staged_manifest_root_required")
     try:
         resolved_pipeline_source_root = _absolute(pipeline_source_root).resolve(
             strict=True
@@ -436,15 +452,12 @@ def bind_staged_manifest(
             raise StagedManifestError("pnc_release_staged_manifest_output_changed")
         if output_raw == payload:
             written = False
-        elif output_raw != raw:
+        else:
             raise StagedManifestError(
                 "pnc_release_staged_manifest_output_stale_replacement"
             )
-        else:
-            _atomic_write(output_path, payload, expected_identity=output_identity)
-            written = True
     else:
-        _atomic_write(output_path, payload, expected_identity=None)
+        _atomic_write(output_path, payload)
         written = True
 
     return {
@@ -480,7 +493,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pipeline-source-root", type=Path, required=True)
     parser.add_argument("--pipeline-commit", required=True)
     parser.add_argument("--pipeline-tree", required=True)
-    parser.add_argument("--staged-root", type=Path)
+    parser.add_argument("--staged-root", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
         result = bind_staged_manifest(

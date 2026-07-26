@@ -342,6 +342,28 @@ def test_stale_output_is_never_overwritten(tmp_path: Path):
     assert output_path.read_bytes() == stale
 
 
+def test_uncompiled_input_copy_is_never_replaced(tmp_path: Path):
+    source_root, _source, commit, tree = _pipeline_repo(tmp_path)
+    staged_root = tmp_path / "stage"
+    staged_root.mkdir()
+    input_path, output_path, _manifest_value = _bind(
+        staged_root, source_root, commit, tree
+    )
+    input_bytes = input_path.read_bytes()
+    output_path.write_bytes(input_bytes)
+
+    with pytest.raises(binder.StagedManifestError, match="stale_replacement"):
+        binder.bind_staged_manifest(
+            input_path,
+            output_path,
+            pipeline_source_root=source_root,
+            pipeline_commit=commit,
+            pipeline_tree=tree,
+            staged_root=staged_root,
+        )
+    assert output_path.read_bytes() == input_bytes
+
+
 def test_atomic_write_failure_leaves_no_output_or_temporary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -352,10 +374,12 @@ def test_atomic_write_failure_leaves_no_output_or_temporary(
         staged_root, source_root, commit, tree
     )
 
-    def fail_replace(_source: object, _target: object) -> None:
-        raise OSError("injected replace failure")
+    def fail_link(
+        _source: object, _target: object, *, follow_symlinks: bool = True
+    ) -> None:
+        raise OSError("injected link failure")
 
-    monkeypatch.setattr(binder.os, "replace", fail_replace)
+    monkeypatch.setattr(binder.os, "link", fail_link)
     with pytest.raises(binder.StagedManifestError, match="atomic_write_failed"):
         binder.bind_staged_manifest(
             input_path,
@@ -367,6 +391,26 @@ def test_atomic_write_failure_leaves_no_output_or_temporary(
         )
     assert not output_path.exists()
     assert not list(staged_root.glob(f".{output_path.name}.tmp.*"))
+
+
+def test_staged_root_is_required(tmp_path: Path):
+    source_root, _source, commit, tree = _pipeline_repo(tmp_path)
+    staged_root = tmp_path / "stage"
+    staged_root.mkdir()
+    input_path, output_path, _manifest_value = _bind(
+        staged_root, source_root, commit, tree
+    )
+
+    with pytest.raises(binder.StagedManifestError, match="root_required"):
+        binder.bind_staged_manifest(
+            input_path,
+            output_path,
+            pipeline_source_root=source_root,
+            pipeline_commit=commit,
+            pipeline_tree=tree,
+            staged_root=None,  # type: ignore[arg-type]
+        )
+    assert not output_path.exists()
 
 
 def test_live_manifest_output_is_explicitly_forbidden(
@@ -391,6 +435,7 @@ def test_live_manifest_output_is_explicitly_forbidden(
             pipeline_source_root=source_root,
             pipeline_commit=commit,
             pipeline_tree=tree,
+            staged_root=staged_root,
         )
     assert not live_manifest.exists()
 
