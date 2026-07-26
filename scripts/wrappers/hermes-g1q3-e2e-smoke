@@ -1,4 +1,0 @@
-#!/bin/zsh
-set -euo pipefail
-exec /usr/bin/python3 "${HOME}/.hermes/runtime/governance-tools/pnc_live_exec.py" \
-  local.pnc.g1q3-e2e-smoke "$@"

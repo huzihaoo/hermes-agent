@@ -25,6 +25,17 @@ def _git(root: Path, *args: str) -> str:
     ).strip()
 
 
+def test_runtime_script_targets_have_source_files():
+    missing = [
+        (label, relative_path)
+        for label, (target_kind, relative_path) in live_exec.SERVICE_TARGETS.items()
+        if target_kind == "runtime_script"
+        and not (REPO_ROOT / relative_path).is_file()
+    ]
+
+    assert missing == []
+
+
 def _create_runtime(home: Path, name: str) -> tuple[Path, Path, str, str]:
     root = home / "runtime" / "releases" / name
     script = root / "scripts" / "pnc_vm_task_sync.py"

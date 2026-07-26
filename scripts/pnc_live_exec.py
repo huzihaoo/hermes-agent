@@ -94,14 +94,6 @@ SERVICE_TARGETS = {
         "governance_tool",
         "hermes_worktree_hygiene.py",
     ),
-    "local.pnc.g1q3-e2e-smoke": (
-        "runtime_script",
-        "scripts/g1q3_rca_e2e_smoke.py",
-    ),
-    "local.pnc.live-promote": (
-        "runtime_script",
-        "scripts/hermes_live_promote.py",
-    ),
     "local.pnc.hermes-cli": (
         "runtime_script",
         "hermes_cli/main.py",

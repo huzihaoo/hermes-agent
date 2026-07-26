@@ -92,9 +92,7 @@ def test_source_registry_has_no_pinned_plist_or_wrapper():
     assert "VIRTUAL_ENV" not in gateway["EnvironmentVariables"]
 
     wrapper_names = {
-        "hermes-g1q3-e2e-smoke",
         "hermes-governance-check",
-        "hermes-live",
         "hermes-live-drift-guard",
         "hermes-provider-failure-audit",
         "hermes-release-fingerprint-check",
@@ -116,6 +114,10 @@ def test_source_registry_has_no_pinned_plist_or_wrapper():
         "runtime_script",
         "scripts/pnc_rca_release_freshness_gate.py",
     )
+    assert "local.pnc.g1q3-e2e-smoke" not in gate.SERVICE_TARGETS
+    assert "local.pnc.live-promote" not in gate.SERVICE_TARGETS
+    assert not (REPO_ROOT / "scripts/wrappers/hermes-g1q3-e2e-smoke").exists()
+    assert not (REPO_ROOT / "scripts/wrappers/hermes-live").exists()
 
 
 def test_loaded_gate_rejects_a_stale_launchd_snapshot(tmp_path: Path):
