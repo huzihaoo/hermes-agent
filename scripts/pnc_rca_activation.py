@@ -47,16 +47,14 @@ _ISSUE_URL_RE = re.compile(
     r"[A-Za-z0-9._-]+/issue/detail/[0-9]+/*$"
 )
 _SAFE_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{2,127}$")
-_MANUAL_IDENTITY_FIELDS = frozenset(
-    {
-        "chat_id",
-        "requester_id",
-        "message_id",
-        "thread_id",
-        "issue_url",
-        "mode",
-    }
-)
+_MANUAL_IDENTITY_FIELDS = frozenset({
+    "chat_id",
+    "requester_id",
+    "message_id",
+    "thread_id",
+    "issue_url",
+    "mode",
+})
 
 
 class ActivationCliError(RuntimeError):
@@ -375,14 +373,12 @@ def _read_preproduction_capsule(
             capsule_path,
             control_db_path=control_db_path,
             current_activation=current_activation,
-            allowed_current_states=frozenset(
-                {str(current_activation.get("state") or "")}
-            ),
+            allowed_current_states=frozenset({
+                str(current_activation.get("state") or "")
+            }),
         )
     except Exception as exc:
-        raise ActivationCliError(
-            "activation_preproduction_capsule_rejected"
-        ) from exc
+        raise ActivationCliError("activation_preproduction_capsule_rejected") from exc
 
 
 def _canonical_preproduction_transition(
@@ -430,14 +426,11 @@ def _canonical_preproduction_transition(
             "canary_slot_plan",
         }
     ):
-        normalized[field] = _normalized_sha256(
-            str(value.get(field) or ""), field
-        )
+        normalized[field] = _normalized_sha256(str(value.get(field) or ""), field)
     if (
         normalized["expected_state"] != "safe_off"
         or normalized["target_state"] != "preauthorized"
-        or normalized["canary_slot_plan_sha256"]
-        != _sha256_json(canary_slot_plan)
+        or normalized["canary_slot_plan_sha256"] != _sha256_json(canary_slot_plan)
     ):
         raise ActivationCliError("activation_preproduction_capsule_rejected")
     return normalized
@@ -473,15 +466,16 @@ def _confirmation_capsule_scope(
     )
     receipt_meta = capsule.get("release_gate_receipt")
     transition = capsule.get("transition_input")
-    if not isinstance(receipt_meta, Mapping) or not isinstance(
-        transition, Mapping
-    ):
+    if not isinstance(receipt_meta, Mapping) or not isinstance(transition, Mapping):
         raise ActivationCliError("activation_confirmation_capsule_scope_invalid")
     receipt_path_value = receipt_meta.get("path")
     if not isinstance(receipt_path_value, str) or not receipt_path_value.strip():
         raise ActivationCliError("activation_confirmation_capsule_scope_invalid")
     receipt_path = Path(receipt_path_value)
-    if not receipt_path.is_absolute() or str(receipt_path.absolute()) != receipt_path_value:
+    if (
+        not receipt_path.is_absolute()
+        or str(receipt_path.absolute()) != receipt_path_value
+    ):
         raise ActivationCliError("activation_confirmation_capsule_scope_invalid")
     epoch_id = _normalized_epoch_id(str(transition.get("epoch_id") or ""))
     config_sha256 = _normalized_sha256(
@@ -573,9 +567,7 @@ def _canonical_confirmation_transition(
             current_activation=current_activation,
         )
     except Exception as exc:
-        raise ActivationCliError(
-            "activation_confirmation_capsule_rejected"
-        ) from exc
+        raise ActivationCliError("activation_confirmation_capsule_rejected") from exc
     if not isinstance(transition, Mapping):
         raise ActivationCliError("activation_confirmation_capsule_rejected")
     return _normalize_confirmation_transition(transition)
@@ -586,10 +578,9 @@ def _normalize_event_uid(value: str) -> tuple[str, dict[str, Any]]:
     match = _EVENT_UID_RE.fullmatch(event_uid)
     if match is None:
         raise ActivationCliError("activation_event_uid_invalid")
-    if (
-        str(int(match.group("partition"))) != match.group("partition")
-        or str(int(match.group("offset"))) != match.group("offset")
-    ):
+    if str(int(match.group("partition"))) != match.group("partition") or str(
+        int(match.group("offset"))
+    ) != match.group("offset"):
         raise ActivationCliError("activation_event_uid_invalid")
     normalized = {
         "event_uid": event_uid,
@@ -709,12 +700,10 @@ def _normalize_canary_slot_plan(value: Any) -> dict[str, dict[str, Any]]:
     if (
         len({slot["source_identity_sha256"] for slot in normalized.values()})
         != len(ACTIVATION_SLOT_KINDS)
-        or len(
-            {
-                str(slot["expected_admission"]["submission_key"])
-                for slot in normalized.values()
-            }
-        )
+        or len({
+            str(slot["expected_admission"]["submission_key"])
+            for slot in normalized.values()
+        })
         != len(ACTIVATION_SLOT_KINDS)
         or len(_canonical_json(normalized).encode("utf-8")) > MAX_JSON_INPUT_BYTES
     ):
@@ -739,7 +728,9 @@ def _open_store(db_path: Path) -> RcaControlStore:
             row = conn.execute(
                 "SELECT value FROM control_meta WHERE key = 'schema_version'"
             ).fetchone()
-            journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+            journal_mode = str(
+                conn.execute("PRAGMA journal_mode").fetchone()[0]
+            ).lower()
         finally:
             conn.close()
     except sqlite3.Error as exc:
@@ -851,9 +842,7 @@ def _create(store: RcaControlStore, args: argparse.Namespace) -> dict[str, Any]:
             "preauthorization_capsule_sha256"
         ],
         "config_sha256": activation_input["config_sha256"],
-        "db_logical_identity_sha256": activation_input[
-            "db_logical_identity_sha256"
-        ],
+        "db_logical_identity_sha256": activation_input["db_logical_identity_sha256"],
         "partition_start_fence_sha256": activation_input[
             "partition_start_fence_sha256"
         ],
@@ -938,9 +927,7 @@ def _transition_preauthorized(
             "expected_preauthorization_capsule_sha256"
         ],
         "config_sha256": transition["expected_config_sha256"],
-        "db_logical_identity_sha256": transition[
-            "expected_db_logical_identity_sha256"
-        ],
+        "db_logical_identity_sha256": transition["expected_db_logical_identity_sha256"],
         "partition_start_fence_sha256": transition[
             "expected_partition_start_fence_sha256"
         ],
@@ -952,9 +939,7 @@ def _transition_preauthorized(
         "preproduction_gate_receipt_sha256": transition[
             "preproduction_gate_receipt_sha256"
         ],
-        "preproduction_capsule_sha256": transition[
-            "preproduction_capsule_sha256"
-        ],
+        "preproduction_capsule_sha256": transition["preproduction_capsule_sha256"],
     }
     identical = bool(
         current["state"] == "preauthorized"
@@ -981,9 +966,7 @@ def _transition_preauthorized(
         preproduction_gate_receipt_sha256=str(
             transition["preproduction_gate_receipt_sha256"]
         ),
-        preproduction_capsule_sha256=str(
-            transition["preproduction_capsule_sha256"]
-        ),
+        preproduction_capsule_sha256=str(transition["preproduction_capsule_sha256"]),
         expected_preauthorization_fingerprint=str(
             transition["expected_preauthorization_fingerprint"]
         ),
@@ -1016,9 +999,7 @@ def _transition_preauthorized(
 def _authorize(store: RcaControlStore, args: argparse.Namespace) -> dict[str, Any]:
     epoch_id = _normalized_epoch_id(args.epoch_id)
     operator, reason = _normalized_audit(args.operator, args.reason)
-    current = _current_epoch(
-        store, epoch_id, frozenset({"preauthorized"})
-    )
+    current = _current_epoch(store, epoch_id, frozenset({"preauthorized"}))
     transition = _canonical_preproduction_transition(
         args.preproduction_capsule,
         control_db_path=args.control_db,
@@ -1103,9 +1084,7 @@ def _require_preproduction_binding(
         "preproduction_gate_receipt_sha256": transition.get(
             "preproduction_gate_receipt_sha256"
         ),
-        "preproduction_capsule_sha256": transition.get(
-            "preproduction_capsule_sha256"
-        ),
+        "preproduction_capsule_sha256": transition.get("preproduction_capsule_sha256"),
     }
     if any(current.get(field) != value for field, value in expected.items()):
         raise ActivationCliError("activation_preproduction_epoch_binding_changed")
@@ -1132,9 +1111,7 @@ def _transition_bounded(
     expected_authorizations = {
         slot_kind: {
             "source_kind": planned[slot_kind]["source_kind"],
-            "source_identity_sha256": planned[slot_kind][
-                "source_identity_sha256"
-            ],
+            "source_identity_sha256": planned[slot_kind]["source_identity_sha256"],
         }
         for slot_kind in sorted(ACTIVATION_SLOT_KINDS)
     }
@@ -1249,11 +1226,11 @@ def _bootstrap_authority(
     state: Mapping[str, Any],
     operator: str,
     now: datetime,
-) -> tuple[dict[str, Any], dict[str, Any], bytes, capacity_runtime.CapacityRuntimePaths]:
+) -> tuple[
+    dict[str, Any], dict[str, Any], bytes, capacity_runtime.CapacityRuntimePaths
+]:
     release_id = str(getattr(args, "release_id", "") or "").strip()
-    bootstrap_epoch_id = str(
-        getattr(args, "bootstrap_epoch_id", "") or ""
-    ).strip()
+    bootstrap_epoch_id = str(getattr(args, "bootstrap_epoch_id", "") or "").strip()
     if not release_id:
         raise ActivationCliError("activation_release_id_required")
     if not bootstrap_epoch_id:
@@ -1267,9 +1244,7 @@ def _bootstrap_authority(
     active_binding_path = _absolute_path_argument(
         getattr(args, "active_release_binding", None), "active_release_binding"
     )
-    live_env_path = _absolute_path_argument(
-        getattr(args, "live_env", None), "live_env"
-    )
+    live_env_path = _absolute_path_argument(getattr(args, "live_env", None), "live_env")
     expected_active_binding = (
         Path(args.control_db).expanduser().absolute().parent
         / prod_bootstrap.ACTIVE_RELEASE_BINDING_NAME
@@ -1288,9 +1263,7 @@ def _bootstrap_authority(
             expected_epoch_id=binding["bootstrap_epoch_id"],
             expected_release_bom_sha256=binding["release_bom_sha256"],
             expected_release_approval_id=binding["release_id"],
-            expected_approval_evidence_sha256=binding[
-                "approval_evidence_sha256"
-            ],
+            expected_approval_evidence_sha256=binding["approval_evidence_sha256"],
         )
     except prod_bootstrap.RcaBootstrapAuthorizationError as exc:
         raise ActivationCliError(exc.code) from exc
@@ -1320,9 +1293,7 @@ def _producer_receipt_id(
         "bootstrap_epoch_id": binding["bootstrap_epoch_id"],
         "release_bom_sha256": binding["release_bom_sha256"],
         "active_release_binding_sha256": binding["binding_receipt_sha256"],
-        "authorization_receipt_sha256": authorization[
-            "authorization_receipt_sha256"
-        ],
+        "authorization_receipt_sha256": authorization["authorization_receipt_sha256"],
         "authorization_fingerprint": authorization["receipt_fingerprint"],
     }
     return f"producer-{_sha256_json(identity)[:32]}"
@@ -1436,7 +1407,10 @@ def _validate_capacity_runtime_locked(
         if state["state"] == capacity_transition.BOOTSTRAP_PRODUCTION
         else {capacity_transition.STEADY_ACTIVE}
     )
-    if decision.get("ready") is not True or decision.get("effective_state") not in expected:
+    if (
+        decision.get("ready") is not True
+        or decision.get("effective_state") not in expected
+    ):
         reason = str(decision.get("reason_code") or "")
         if _SAFE_ERROR_CODE_RE.fullmatch(reason):
             raise ActivationCliError(reason)
@@ -1459,15 +1433,14 @@ def _require_bounded_preproduction_scope(
     expected_authorizations = {
         slot_kind: {
             "source_kind": planned[slot_kind]["source_kind"],
-            "source_identity_sha256": planned[slot_kind][
-                "source_identity_sha256"
-            ],
+            "source_identity_sha256": planned[slot_kind]["source_identity_sha256"],
         }
         for slot_kind in sorted(ACTIVATION_SLOT_KINDS)
     }
-    if store.activation_slot_authorizations(
-        epoch_id=str(current["epoch_id"])
-    ) != expected_authorizations:
+    if (
+        store.activation_slot_authorizations(epoch_id=str(current["epoch_id"]))
+        != expected_authorizations
+    ):
         raise ActivationCliError("activation_canary_plan_authorizations_mismatch")
     return transition
 
@@ -1496,9 +1469,7 @@ def _publish_bootstrap_producer_locked(
                 release_id=str(binding["release_id"]),
                 bootstrap_epoch_id=str(binding["bootstrap_epoch_id"]),
                 release_bom_sha256=str(binding["release_bom_sha256"]),
-                active_release_binding_sha256=str(
-                    binding["binding_receipt_sha256"]
-                ),
+                active_release_binding_sha256=str(binding["binding_receipt_sha256"]),
                 activated_at=now,
                 hmac_key=hmac_key,
                 receipt_id=_producer_receipt_id(
@@ -1620,9 +1591,7 @@ def _transition_steady(
 ) -> dict[str, Any]:
     epoch_id = _normalized_epoch_id(args.epoch_id)
     operator, reason = _normalized_audit(args.operator, args.reason)
-    current = _current_epoch(
-        store, epoch_id, frozenset({"confirmed", "steady_active"})
-    )
+    current = _current_epoch(store, epoch_id, frozenset({"confirmed", "steady_active"}))
     state = _capacity_state(store)
     if state["state"] not in {
         capacity_transition.BOOTSTRAP_PRODUCTION,
@@ -1817,9 +1786,7 @@ def _confirm(store: RcaControlStore, args: argparse.Namespace) -> dict[str, Any]
         expected_partition_start_fence_sha256=str(
             transition["partition_start_fence_sha256"]
         ),
-        expected_release_binding_sha256=str(
-            transition["release_binding_sha256"]
-        ),
+        expected_release_binding_sha256=str(transition["release_binding_sha256"]),
         operator=operator,
         reason=reason,
     )
@@ -1887,15 +1854,13 @@ def _defer_event(store: RcaControlStore, args: argparse.Namespace) -> dict[str, 
     current = _current_epoch(
         store,
         epoch_id,
-        frozenset(
-            {
-                "safe_off",
-                "preauthorized",
-                "bounded_active",
-                "confirmed",
-                "aborted",
-            }
-        ),
+        frozenset({
+            "safe_off",
+            "preauthorized",
+            "bounded_active",
+            "confirmed",
+            "aborted",
+        }),
     )
     summary = {
         **_audit_hashes(operator, reason),
@@ -1924,9 +1889,7 @@ def _defer_event(store: RcaControlStore, args: argparse.Namespace) -> dict[str, 
             "outbox_id": deferred["outbox_id"],
             "prior_status": deferred["prior_status"],
             "status": deferred["status"],
-            "submission_key_sha256": _sha256_text(
-                str(deferred["submission_key"])
-            ),
+            "submission_key_sha256": _sha256_text(str(deferred["submission_key"])),
             **_audit_hashes(operator, reason),
         },
     )
@@ -1938,16 +1901,14 @@ def _abort(store: RcaControlStore, args: argparse.Namespace) -> dict[str, Any]:
         args,
         command="abort",
         target_state="aborted",
-        allowed_states=frozenset(
-            {
-                "safe_off",
-                "preauthorized",
-                "bounded_active",
-                "confirmed",
-                "steady_active",
-                "aborted",
-            }
-        ),
+        allowed_states=frozenset({
+            "safe_off",
+            "preauthorized",
+            "bounded_active",
+            "confirmed",
+            "steady_active",
+            "aborted",
+        }),
     )
 
 
@@ -2015,9 +1976,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     prepare_bootstrap = commands.add_parser("prepare-bootstrap-production")
     _add_mutation_arguments(prepare_bootstrap)
-    prepare_bootstrap.add_argument(
-        "--preproduction-capsule", type=Path, required=True
-    )
+    prepare_bootstrap.add_argument("--preproduction-capsule", type=Path, required=True)
     prepare_bootstrap.add_argument("--active-release-binding", type=Path, required=True)
     prepare_bootstrap.add_argument("--live-env", type=Path, required=True)
     prepare_bootstrap.add_argument("--release-id", required=True)
@@ -2088,14 +2047,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     except SystemExit:
         raise
     except Exception as exc:
-        _emit(
-            {
-                "code": _safe_exception_code(exc),
-                "command": command,
-                "ok": False,
-                "schema_version": ACTIVATION_CLI_SCHEMA_VERSION,
-            }
-        )
+        _emit({
+            "code": _safe_exception_code(exc),
+            "command": command,
+            "ok": False,
+            "schema_version": ACTIVATION_CLI_SCHEMA_VERSION,
+        })
         return 2
     _emit(payload)
     return 0
