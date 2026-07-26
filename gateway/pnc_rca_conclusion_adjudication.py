@@ -858,9 +858,10 @@ def _candidate_row(
                j.created_at AS job_created_at
           FROM rca_delivery_jobs AS j
           JOIN rca_delivery_effects AS e
-            ON e.delivery_id = j.delivery_id
+           ON e.delivery_id = j.delivery_id
            AND e.effect_kind = 'feishu_issue_comment'
            AND e.target_key = j.target_key
+           AND e.required = 1
          WHERE j.work_item_id = ?
            AND j.outcome = 'success'
            AND e.status = 'succeeded'
@@ -939,9 +940,10 @@ def list_conclusion_review_queue_tx(
                j.created_at AS job_created_at
           FROM rca_delivery_jobs AS j
           JOIN rca_delivery_effects AS e
-            ON e.delivery_id = j.delivery_id
+           ON e.delivery_id = j.delivery_id
            AND e.effect_kind = 'feishu_issue_comment'
            AND e.target_key = j.target_key
+           AND e.required = 1
      LEFT JOIN rca_conclusion_adjudications AS a
             ON a.business_key = j.business_key
          WHERE j.outcome = 'success'

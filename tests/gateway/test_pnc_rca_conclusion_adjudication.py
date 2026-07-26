@@ -644,6 +644,24 @@ def test_review_queue_and_recognition_reject_non_medium_effect(tmp_path):
     assert store.list_rows("rca_conclusion_adjudications") == []
 
 
+def test_review_and_adjudication_ignore_optional_issue_effect(tmp_path):
+    store = _seed_published_conclusion(tmp_path)
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_delivery_effects SET required = 0 "
+            "WHERE effect_key = ?",
+            (ORIGINAL_EFFECT_KEY,),
+        )
+
+    assert store.list_conclusion_review_queue() == ()
+    with pytest.raises(
+        ConclusionAdjudicationError,
+        match="conclusion_adjudication_published_conclusion_missing",
+    ):
+        _record_retraction(store)
+    assert store.list_rows("rca_conclusion_adjudications") == []
+
+
 def test_recognition_cannot_replace_or_inject_a_different_conclusion(tmp_path):
     store = _seed_published_conclusion(tmp_path)
 
