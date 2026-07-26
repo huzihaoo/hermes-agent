@@ -197,6 +197,61 @@ def test_source_binding_rejects_target_and_envelope_hash_mutations():
     assert exc.value.code == "external_write_fence_identity_mismatch"
 
 
+def test_source_binding_rejects_self_consistent_epoch_ledger_mismatch():
+    snapshot, envelope, fence = _bound_snapshot_and_envelope()
+    forged = dict(fence)
+    forged["activation_epoch_id"] = "epoch-forged"
+    forged["activation_ledger_id"] = 99
+    forged_payload = {
+        key: forged[key] for key in forged if key not in {"fence_id", "state"}
+    }
+    forged["fence_id"] = (
+        "pnc-rca-wf1-" + canonical_write_fence_sha256(forged_payload)
+    )
+    snapshot_identity = {
+        key: value
+        for key, value in snapshot.items()
+        if key not in {"snapshot_id", "snapshot_sha256", "write_fence"}
+    }
+    snapshot_identity["write_fence"] = forged
+    snapshot_sha256 = canonical_write_fence_sha256(snapshot_identity)
+    forged_snapshot = {
+        **snapshot_identity,
+        "snapshot_id": f"pnc-rca-snapshot-v1-{snapshot_sha256}",
+        "snapshot_sha256": snapshot_sha256,
+    }
+    envelope_identity = {
+        key: envelope[key]
+        for key in (
+            "schema_version",
+            "source_authority_sha256",
+            "snapshot_id",
+            "snapshot_sha256",
+            "submission_key",
+            "source_id",
+            "source_kind",
+            "ingress_decision",
+            "source_metadata",
+            "anchor",
+        )
+    }
+    envelope_identity["snapshot_id"] = forged_snapshot["snapshot_id"]
+    envelope_identity["snapshot_sha256"] = forged_snapshot["snapshot_sha256"]
+    envelope_sha256 = canonical_write_fence_sha256(envelope_identity)
+    forged_envelope = {
+        **envelope_identity,
+        "source_envelope_id": f"pnc-rca-source-envelope-v1-{envelope_sha256}",
+        "source_envelope_sha256": envelope_sha256,
+    }
+    with pytest.raises(ExternalWriteFenceError) as exc:
+        validate_write_fence_source_binding(
+            forged,
+            snapshot=forged_snapshot,
+            source_envelope=forged_envelope,
+        )
+    assert exc.value.code == "external_write_fence_identity_mismatch"
+
+
 def test_w13_shaped_claim_cannot_change_authoritative_issue_target():
     from scripts.pnc_rca_delivery_dispatcher import DeliveryDispatcher
 

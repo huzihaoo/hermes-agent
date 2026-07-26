@@ -518,10 +518,29 @@ def validate_write_fence(
     if snapshot is not None:
         resolved = _snapshot_value(snapshot, "resolved_admission", {})
         execution = _snapshot_value(snapshot, "execution_admission", {})
+        if not isinstance(execution, Mapping):
+            raise ExternalWriteFenceError("external_write_fence_schema_invalid")
         if value["business_key"] != resolved.get("business_key") or value["submission_key"] != resolved.get("submission_key") or value["generation"] != resolved.get("generation"):
             raise ExternalWriteFenceError("external_write_fence_identity_mismatch")
         if execution.get("decision") != "admit" or execution.get("legacy_unconfigured") is True:
             raise ExternalWriteFenceError("external_write_fence_operation_denied")
+        execution_epoch = execution.get("activation_epoch_id")
+        execution_ledger = execution.get("activation_ledger_id")
+        if (
+            not isinstance(execution_epoch, str)
+            or not execution_epoch.strip()
+            or isinstance(execution_ledger, bool)
+            or not isinstance(execution_ledger, int)
+            or execution_ledger < 1
+        ):
+            raise ExternalWriteFenceError("external_write_fence_schema_invalid")
+        if (
+            value["activation_epoch_id"] != execution_epoch
+            or value["activation_ledger_id"] != execution_ledger
+        ):
+            raise ExternalWriteFenceError(
+                "external_write_fence_identity_mismatch"
+            )
     target_hash = value["target_set_sha256"]
     _sha("target_set_sha256", target_hash)
     if expected_target_set_sha256 is not None and target_hash != _sha("expected_target_set_sha256", expected_target_set_sha256):
