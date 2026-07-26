@@ -128,6 +128,15 @@ def test_scorecard_validator_accepts_complete_not_ga_contract() -> None:
     scorecard.validate_scorecard(_valid_scorecard())
 
 
+def test_scorecard_validator_accepts_quiet_day_with_seven_day_lineage() -> None:
+    quiet_day = _valid_scorecard()
+    quiet_day["historical"]["release_lineage"]["today"].update(
+        {"host": [], "pipeline": [], "host_count": 0, "pipeline_count": 0}
+    )
+
+    scorecard.validate_scorecard(quiet_day)
+
+
 def test_negative_injection_exits_nonzero(tmp_path: Path) -> None:
     injected = _valid_scorecard()
     injected["live"]["fingerprints"]["host"]["commit"] = ""

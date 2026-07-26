@@ -1172,7 +1172,7 @@ def _release_lineage(
     }
     for label, view in (("today", today), ("seven_day", seven_day)):
         for kind in ("host", "pipeline"):
-            if not view[kind]:
+            if label == "seven_day" and not view[kind]:
                 raise ScorecardError(
                     "required_real_data_empty",
                     f"{label} {kind} release lineage is empty",
@@ -1580,9 +1580,19 @@ def validate_scorecard(scorecard: Mapping[str, Any]) -> None:
     for window in ("today", "seven_day"):
         view = _required_mapping(lineage.get(window), f"release_lineage.{window}")
         for kind in ("host", "pipeline"):
-            entries = _required_sequence(
-                view.get(kind), f"release_lineage.{window}.{kind}"
-            )
+            entries = view.get(kind)
+            if not isinstance(entries, list) or (
+                window == "seven_day" and not entries
+            ):
+                raise ScorecardError(
+                    "required_field_empty",
+                    f"release_lineage.{window}.{kind} must be "
+                    + (
+                        "a non-empty array"
+                        if window == "seven_day"
+                        else "an array"
+                    ),
+                )
             for index, entry in enumerate(entries):
                 if not isinstance(entry, Mapping):
                     raise ScorecardError(
@@ -1599,7 +1609,7 @@ def validate_scorecard(scorecard: Mapping[str, Any]) -> None:
                     entry.get("previous_commit"),
                     f"{window}.{kind}[{index}].previous_commit",
                 )
-            if window == "today":
+            if entries:
                 latest_lineage[kind] = str(entries[-1]["commit"])
     for kind in ("host", "pipeline"):
         if latest_lineage.get(kind) != fingerprints[kind]["commit"]:
