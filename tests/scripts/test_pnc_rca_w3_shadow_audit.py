@@ -223,7 +223,13 @@ def _create_schema(conn: sqlite3.Connection) -> None:
     )
 
 
-def _insert_pair(conn: sqlite3.Connection, index: int, *, joined: bool = True) -> None:
+def _insert_pair(
+    conn: sqlite3.Connection,
+    index: int,
+    *,
+    joined: bool = True,
+    joined_source_kind: str = "feishu_group_manual",
+) -> None:
     request, request_sha256 = _request(index)
     snapshot, _snapshot_sha256 = _snapshot(index, request, request_sha256)
     creator = _envelope(
@@ -278,7 +284,7 @@ def _insert_pair(conn: sqlite3.Connection, index: int, *, joined: bool = True) -
             _envelope(
                 snapshot,
                 source_id=f"manual-{index}",
-                source_kind="feishu_group_manual",
+                source_kind=joined_source_kind,
                 binding_action="join",
             )
         )
@@ -310,12 +316,23 @@ def _insert_pair(conn: sqlite3.Connection, index: int, *, joined: bool = True) -
         )
 
 
-def _database(tmp_path: Path, *, pairs: int = 1, joined: bool = True) -> Path:
+def _database(
+    tmp_path: Path,
+    *,
+    pairs: int = 1,
+    joined: bool = True,
+    joined_source_kind: str = "feishu_group_manual",
+) -> Path:
     path = tmp_path / "control.sqlite3"
     with sqlite3.connect(path) as conn:
         _create_schema(conn)
         for index in range(pairs):
-            _insert_pair(conn, index, joined=joined)
+            _insert_pair(
+                conn,
+                index,
+                joined=joined,
+                joined_source_kind=joined_source_kind,
+            )
     return path
 
 
@@ -385,6 +402,60 @@ def test_strict_acceptance_fails_when_real_pair_count_is_below_ten(
     assert strict["audit_clean"] is True
     assert strict["scope"]["valid_real_pair_count"] == 9
     assert strict["gate_errors"] == ["too_few_real_pairs"]
+
+
+def test_strict_acceptance_rejects_a_weakened_minimum(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = _database(tmp_path, pairs=10)
+
+    exit_code = audit.main([
+        "--control-db",
+        str(path),
+        "--strict-acceptance",
+        "--min-real-pairs",
+        "9",
+    ])
+
+    report = json.loads(capsys.readouterr().out)
+    assert exit_code == 2
+    assert report["ok"] is False
+    assert report["external_writes"] is False
+    assert report["error"] == (
+        "ShadowAuditError:min_real_pairs_below_strict_floor"
+    )
+
+
+@pytest.mark.parametrize(
+    ("joined", "joined_source_kind", "expected_comparisons"),
+    [
+        (False, "feishu_group_manual", 0),
+        (True, "kafka_workflow_event", 10),
+    ],
+)
+def test_strict_acceptance_requires_a_dual_distinct_source_comparison(
+    tmp_path: Path,
+    joined: bool,
+    joined_source_kind: str,
+    expected_comparisons: int,
+) -> None:
+    path = _database(
+        tmp_path,
+        pairs=10,
+        joined=joined,
+        joined_source_kind=joined_source_kind,
+    )
+
+    result = audit.audit_w3_shadow(path, strict_acceptance=True)
+
+    assert result["ok"] is False
+    assert result["audit_clean"] is True
+    assert result["strict_acceptance_ready"] is False
+    assert result["scope"]["valid_real_pair_count"] == 0
+    assert result["scope"]["source_comparison_count"] == expected_comparisons
+    assert result["gate_errors"] == ["too_few_real_pairs"]
+    assert not any(pair["real_pair_qualified"] for pair in result["pairs"])
 
 
 def test_immutable_uri_audit_preserves_database_identity_and_writes_nothing(

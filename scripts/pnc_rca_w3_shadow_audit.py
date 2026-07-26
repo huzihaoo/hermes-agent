@@ -703,8 +703,8 @@ def audit_w3_shadow(
 
     if not isinstance(strict_acceptance, bool):
         raise ShadowAuditError("strict_acceptance_boolean_required")
-    if min_real_pairs < 1:
-        raise ShadowAuditError("min_real_pairs_positive_required")
+    if min_real_pairs < MIN_STRICT_REAL_PAIRS:
+        raise ShadowAuditError("min_real_pairs_below_strict_floor")
     path = Path(control_db).expanduser()
     before, before_sha256 = _assert_checkpoint(path)
 
@@ -845,6 +845,13 @@ def audit_w3_shadow(
                 or creator["source_id"] != row["creator_source_id"]
             ):
                 raise ShadowAuditError("creator_source_envelope_binding_mismatch")
+            joined_envelopes = [
+                envelope for envelope in envelopes if envelope is not creator
+            ]
+            source_kinds = {
+                str(envelope["source_kind"]) for envelope in envelopes
+            }
+            real_pair_qualified = bool(joined_envelopes) and len(source_kinds) >= 2
             baseline = {
                 "execution_core": execution_core,
                 "source_metadata": _source_projection(creator),
@@ -852,14 +859,12 @@ def audit_w3_shadow(
             }
             pair_allowed_paths: set[str] = set()
             pair_forbidden_paths: set[str] = set()
-            for envelope in envelopes:
+            for envelope in joined_envelopes:
                 candidate = {
                     "execution_core": execution_core,
                     "source_metadata": _source_projection(envelope),
                     "anchor": envelope["anchor"],
                 }
-                if envelope is creator:
-                    continue
                 source_comparison_count += 1
                 for diff in _diff_paths(baseline, candidate):
                     pointer = _pointer(diff)
@@ -875,7 +880,7 @@ def audit_w3_shadow(
                     "forbidden_projection_diff",
                     path_value=pointer,
                 )
-            if len(violations) == pair_errors_before:
+            if len(violations) == pair_errors_before and real_pair_qualified:
                 valid_pair_count += 1
             pair_summaries.append({
                 "pair_identity_sha256": pair_identity,
@@ -884,9 +889,8 @@ def audit_w3_shadow(
                 "snapshot_sha256": str(row["snapshot_sha256"]),
                 "execution_core_sha256": _canonical_json_sha256(execution_core),
                 "source_envelope_count": len(envelopes),
-                "source_kinds": sorted({
-                    str(envelope["source_kind"]) for envelope in envelopes
-                }),
+                "source_kinds": sorted(source_kinds),
+                "real_pair_qualified": real_pair_qualified,
                 "allowed_diff_paths": sorted(pair_allowed_paths),
                 "forbidden_diff_paths": sorted(pair_forbidden_paths),
             })
