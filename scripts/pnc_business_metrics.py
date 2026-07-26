@@ -1344,10 +1344,28 @@ def load_sqlite_observations(
                         else "owner_rejected"
                     )
             if denominator_kind == "business" and not attribution_outcome:
-                raise MetricsValidationError(
-                    "metrics_owner_adjudication_missing",
-                    f"eligible business row lacks W13 adjudication for {key[0]}/{key[1]}",
-                )
+                # W13 is a post-publication review surface for medium-tier
+                # candidate conclusions only.  High-tier supported results
+                # and low-tier honest non-attribution are judged by their
+                # bound W1 oracle/golden facts; requiring an owner row here
+                # would make a valid high/low delivery impossible to report.
+                # Keep the high result out of the owner-acceptance metric and
+                # make low non-attribution an explicit excluded outcome.
+                confidence_tier = str(effect["confidence_tier"])
+                if confidence_tier == "medium":
+                    raise MetricsValidationError(
+                        "metrics_owner_adjudication_missing",
+                        f"eligible medium business row lacks W13 adjudication for {key[0]}/{key[1]}",
+                    )
+                if confidence_tier == "high":
+                    attribution_outcome = "supported_attribution"
+                elif confidence_tier == "low":
+                    attribution_outcome = "not_attributable"
+                else:
+                    raise MetricsValidationError(
+                        "metrics_attribution_outcome_missing",
+                        f"business row has no attribution outcome for tier {confidence_tier}: {key[0]}/{key[1]}",
+                    )
             if denominator_kind == "system" and not attribution_outcome:
                 attribution_outcome = "not_attributable"
 

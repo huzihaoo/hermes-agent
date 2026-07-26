@@ -444,6 +444,95 @@ def _clean_records() -> list[dict]:
     ]
 
 
+def _rewrite_golden_record(path: Path, business_key: str, **updates: object) -> None:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    for record in payload["records"]:
+        if record["business_key"] == business_key:
+            record.update(updates)
+            break
+    else:
+        raise AssertionError(f"golden record not found: {business_key}")
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _remove_adjudication(db_path: Path, business_key: str) -> None:
+    """Remove one temporary-fixture adjudication while retaining immutability."""
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("DROP TRIGGER trg_rca_conclusion_adjudication_no_delete")
+    row = conn.execute(
+        "SELECT adjudication_id, correction_effect_key "
+        "FROM rca_conclusion_adjudications WHERE business_key = ?",
+        (business_key,),
+    ).fetchone()
+    assert row is not None
+    adjudication_id, correction_effect_key = row
+    conn.execute(
+        "DELETE FROM rca_conclusion_adjudication_repairs WHERE adjudication_id = ?",
+        (adjudication_id,),
+    )
+    conn.execute(
+        "DELETE FROM rca_conclusion_adjudications WHERE adjudication_id = ?",
+        (adjudication_id,),
+    )
+    conn.execute(
+        "DELETE FROM rca_delivery_effects WHERE effect_key = ?",
+        (correction_effect_key,),
+    )
+    conn.execute(
+        "CREATE TRIGGER trg_rca_conclusion_adjudication_no_delete "
+        "BEFORE DELETE ON rca_conclusion_adjudications "
+        "BEGIN SELECT RAISE(ABORT, 'immutable'); END"
+    )
+    conn.commit()
+    conn.close()
+
+
+def _replace_effect_oracle(
+    db_path: Path,
+    effect_key: str,
+    *,
+    terminal_class: str,
+    confidence_tier: str,
+) -> None:
+    conn = sqlite3.connect(db_path)
+    payload = json.loads(
+        conn.execute(
+            "SELECT payload_json FROM rca_delivery_effects WHERE effect_key = ?",
+            (effect_key,),
+        ).fetchone()[0]
+    )
+    oracle = {
+        "schema_version": "pnc_rca_structural_tier_oracle_v2",
+        "terminal_class": terminal_class,
+        "confidence_tier": confidence_tier,
+        "publication_allowed": True,
+        "classification_conflict": False,
+        "violations": [],
+        "facts": {"golden_coverage_complete": confidence_tier != "low"},
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            oracle,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    payload.update({
+        "terminal_class": terminal_class,
+        "confidence_tier": confidence_tier,
+        "quality_oracle": oracle,
+        "quality_oracle_sha256": digest,
+    })
+    conn.execute(
+        "UPDATE rca_delivery_effects SET payload_json = ? WHERE effect_key = ?",
+        (json.dumps(payload, ensure_ascii=False, sort_keys=True), effect_key),
+    )
+    conn.commit()
+    conn.close()
+
+
 def _group(report: dict, *, entry: str, tier: str) -> dict:
     return next(
         group
@@ -560,8 +649,51 @@ def test_unsupported_and_event_not_found_are_auxiliary_not_attribution_success()
     )
     assert report["auxiliary"]["attribution_exclusions"] == {
         "event_not_found": 1,
+        "not_attributable": 0,
         "unsupported": 1,
     }
+
+
+def test_high_and_low_tiers_never_enter_owner_attribution_denominator() -> None:
+    records = [
+        _record(
+            pair_id="high-no-owner",
+            entry=entry,
+            scope="business",
+            tier="high",
+            attribution="supported_attribution",
+            owner_decision="",
+        )
+        for entry in ("kafka", "feishu")
+    ] + [
+        _record(
+            pair_id="low-honest",
+            entry=entry,
+            scope="business",
+            tier="low",
+            attribution="not_attributable",
+            owner_decision="",
+        )
+        for entry in ("kafka", "feishu")
+    ]
+
+    report = quality_metrics.build_daily_report(records, observed_at=OBSERVED_AT)
+
+    assert report["ok"] is True
+    high = _group(report, entry="kafka", tier="high")
+    low = _group(report, entry="kafka", tier="low")
+    for group in (high, low):
+        assert group["metrics"]["useful_attribution"]["by_denominator"]["business"] == {
+            "numerator": 0,
+            "denominator": 0,
+            "rate_pct": None,
+        }
+        assert group["signals"]["rca_adoption_rate"]["by_denominator"]["business"] == {
+            "numerator": 0,
+            "denominator": 0,
+            "rate_pct": None,
+        }
+    assert report["auxiliary"]["attribution_exclusions"]["not_attributable"] == 2
 
 
 def test_auxiliary_counts_cannot_inflate_any_metric_denominator() -> None:
@@ -802,9 +934,123 @@ def test_sqlite_observation_producer_joins_identity_w13_oracle_and_golden(
     }
     assert report["auxiliary"]["attribution_exclusions"] == {
         "event_not_found": 2,
+        "not_attributable": 2,
         "unsupported": 2,
     }
     assert report["ok"] is True
+
+
+def test_sqlite_loader_accepts_high_and_low_without_w13_adjudication(
+    sqlite_observation_fixture: tuple[Path, Path],
+) -> None:
+    db_path, golden_path = sqlite_observation_fixture
+
+    # Recognized is changed from medium to high, then its owner correction is
+    # removed.  High confidence is golden/oracle governed, not W13 governed.
+    _remove_adjudication(db_path, "business-recognized")
+    _replace_effect_oracle(
+        db_path,
+        "effect-recognized",
+        terminal_class="supported_attribution",
+        confidence_tier="high",
+    )
+    _rewrite_golden_record(
+        golden_path,
+        "business-recognized",
+        expected_terminal_class="supported_attribution",
+    )
+
+    # Event-not-found is changed to a successful low honest non-attribution;
+    # it has no owner review and must remain an explicit excluded outcome.
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "UPDATE rca_delivery_jobs SET outcome='success', outcome_key='completed', "
+        "terminal_state='', terminal_error_code='' "
+        "WHERE delivery_id='delivery-event-not-found'"
+    )
+    conn.commit()
+    conn.close()
+    _replace_effect_oracle(
+        db_path,
+        "effect-event-not-found",
+        terminal_class="honest_non_attribution",
+        confidence_tier="low",
+    )
+
+    rows = business_metrics.load_sqlite_observations(
+        db_path,
+        release_id=SQLITE_RELEASE,
+        pipeline_commit=SQLITE_PIPELINE_COMMIT,
+        window_start=SQLITE_WINDOW_START,
+        window_end=SQLITE_WINDOW_END,
+        golden_input=golden_path,
+    )
+    report = quality_metrics.build_daily_report(rows, observed_at=SQLITE_WINDOW_END)
+
+    assert report["ok"] is True
+    high_rows = [row for row in rows if row["pair_id"] == "delivery-recognized"]
+    low_rows = [row for row in rows if row["pair_id"] == "delivery-event-not-found"]
+    assert {row["confidence_tier"] for row in high_rows} == {"high"}
+    assert {row["owner_decision"] for row in high_rows} == {""}
+    assert {row["attribution_outcome"] for row in high_rows} == {
+        "supported_attribution"
+    }
+    assert {row["confidence_tier"] for row in low_rows} == {"low"}
+    assert {row["owner_decision"] for row in low_rows} == {""}
+    assert {row["attribution_outcome"] for row in low_rows} == {"not_attributable"}
+
+
+def test_sqlite_loader_requires_w13_for_medium_only(
+    sqlite_observation_fixture: tuple[Path, Path],
+) -> None:
+    db_path, golden_path = sqlite_observation_fixture
+    _remove_adjudication(db_path, "business-recognized")
+
+    with pytest.raises(business_metrics.MetricsValidationError) as error:
+        business_metrics.load_sqlite_observations(
+            db_path,
+            release_id=SQLITE_RELEASE,
+            pipeline_commit=SQLITE_PIPELINE_COMMIT,
+            window_start=SQLITE_WINDOW_START,
+            window_end=SQLITE_WINDOW_END,
+            golden_input=golden_path,
+        )
+
+    assert error.value.code == "metrics_owner_adjudication_missing"
+
+
+@pytest.mark.parametrize(
+    ("business_key", "updates"),
+    [
+        (
+            "business-recognized",
+            {"evaluated": True, "false_high_confidence": None},
+        ),
+        (
+            "business-event-not-found",
+            {"evaluated": False, "false_high_confidence": False},
+        ),
+    ],
+)
+def test_high_low_golden_fields_remain_fail_closed(
+    sqlite_observation_fixture: tuple[Path, Path],
+    business_key: str,
+    updates: dict[str, object],
+) -> None:
+    db_path, golden_path = sqlite_observation_fixture
+    _rewrite_golden_record(golden_path, business_key, **updates)
+
+    with pytest.raises(business_metrics.MetricsValidationError) as error:
+        business_metrics.load_sqlite_observations(
+            db_path,
+            release_id=SQLITE_RELEASE,
+            pipeline_commit=SQLITE_PIPELINE_COMMIT,
+            window_start=SQLITE_WINDOW_START,
+            window_end=SQLITE_WINDOW_END,
+            golden_input=golden_path,
+        )
+
+    assert error.value.code == "metrics_golden_binding_invalid"
 
 
 def test_sqlite_cli_feeds_existing_daily_report(

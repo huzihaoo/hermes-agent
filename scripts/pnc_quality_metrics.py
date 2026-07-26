@@ -55,7 +55,11 @@ _SUCCESS_READBACK = frozenset({
     "readback_verified",
     "ack",
 })
-_ATTRIBUTION_EXCLUSIONS = frozenset({"unsupported", "event_not_found"})
+_ATTRIBUTION_EXCLUSIONS = frozenset({
+    "unsupported",
+    "event_not_found",
+    "not_attributable",
+})
 
 # These are the three ``todo`` rows in the resident pnc_quality_metrics.py
 # inventory.  They now have explicit fields and denominator semantics.  The
@@ -189,9 +193,7 @@ def _normalization(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]
                 "confidence_tier",
                 "denominator_kind",
             )
-            missing = [
-                field for field in required_dimensions if field not in row
-            ]
+            missing = [field for field in required_dimensions if field not in row]
             if missing:
                 raise MetricsValidationError(
                     "metrics_normalized_dimensions_missing",
@@ -425,7 +427,7 @@ def _compute_group_metrics(
             if outcome in _ATTRIBUTION_EXCLUSIONS:
                 group["auxiliary"]["attribution_exclusions"][outcome] += 1
                 attribution["excluded_outcomes"][kind][outcome] += 1
-            elif kind == "business":
+            elif kind == "business" and row.get("confidence_tier") == "medium":
                 if not outcome:
                     _issue(
                         issues,
@@ -448,6 +450,17 @@ def _compute_group_metrics(
                         eligible=True,
                         success=owner_decision == "allow",
                     )
+            elif kind == "business":
+                # High-tier results are accepted by the W1 oracle and
+                # low-tier results are honest non-attribution.  Neither is a
+                # W13 owner-acceptance observation; keeping them outside the
+                # useful-attribution denominator prevents missing adjudication
+                # from becoming either a failure or a success.
+                excluded_tier = str(row.get("confidence_tier") or "unknown")
+                tier_counts = group["auxiliary"].setdefault(
+                    "attribution_tier_excluded", {}
+                )
+                tier_counts[excluded_tier] = tier_counts.get(excluded_tier, 0) + 1
             elif outcome:
                 # System observations are intentionally visible as excluded,
                 # never folded into the business attribution denominator.
@@ -511,7 +524,7 @@ def _compute_group_metrics(
             missing_code="metrics_triage_signal_missing",
         )
         group["signals"]["rca_adoption_rate"] = _signal_ratio(
-            signal_rows,
+            [row for row in signal_rows if str(row.get("confidence_tier")) == "medium"],
             eligible=lambda row: (
                 row.get("attribution_outcome") not in _ATTRIBUTION_EXCLUSIONS
                 and bool(row.get("attribution_outcome"))
