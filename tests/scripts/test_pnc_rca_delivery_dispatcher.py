@@ -883,7 +883,7 @@ def test_meegle_normalized_marker_reconciles_without_duplicate_comment(tmp_path)
     assert remote.update_field_calls == 0
 
 
-def test_marker_only_remote_comment_is_quarantined_without_html_network_dependency(
+def test_marker_only_remote_comment_is_quarantined_before_primary_report_probe(
     tmp_path,
 ):
     store = _seed(tmp_path)
@@ -1809,7 +1809,7 @@ def test_thread_circuit_opens_without_blocking_issue_comment(tmp_path):
     assert store.delivery_dispatcher_circuit("feishu_issue_comment").is_open is False
 
 
-def test_delivery_does_not_fetch_supporting_html_before_foxglove_comment(tmp_path):
+def test_delivery_verifies_primary_html_before_external_comment(tmp_path):
     _seed(tmp_path, bundle_payload=_web_bundle_payload())
     calls = []
 
@@ -1821,14 +1821,16 @@ def test_delivery_does_not_fetch_supporting_html_before_foxglove_comment(tmp_pat
     add_comment = remote.add_comment
 
     def guarded_add(project_key, work_item_id, content):
-        assert calls == []
+        assert len(calls) == 1
+        assert calls[0][0].endswith("/index.html")
         return add_comment(project_key, work_item_id, content)
 
     remote.add_comment = guarded_add
     dispatcher, remote, _clock = _dispatcher(tmp_path, remote=remote, verifier=verifier)
 
     assert dispatcher.dispatch_one().status == "succeeded"
-    assert calls == []
+    assert len(calls) == 1
+    assert calls[0][0].endswith("/index.html")
     assert remote.add_calls == 1
 
 
@@ -1848,6 +1850,44 @@ def test_dispatcher_rejects_report_url_for_another_submission_before_http(tmp_pa
         dispatcher_module._validate_effect(tampered)
 
     assert exc.value.code == "delivery_effect_report_url_invalid"
+
+
+@pytest.mark.parametrize("bad_shape", ["empty", "viz_mcap"])
+def test_publication_report_url_counterexamples_fail_closed_before_http(
+    tmp_path, bad_shape
+):
+    store = _seed(tmp_path)
+    claim = store.claim_due_effect(lease_owner="worker-1", now=NOW)
+    assert claim is not None
+    bad_url = (
+        "" if bad_shape == "empty" else canonical_viz_mcap_path(claim.submission_key)
+    )
+    tampered = replace(
+        claim,
+        report_url=bad_url,
+        payload={**claim.payload, "report_url": bad_url},
+        manifest={**claim.manifest, "report_url": bad_url},
+    )
+
+    with pytest.raises(DeliveryContractError) as exc:
+        dispatcher_module._validate_effect(tampered)
+
+    assert exc.value.code == "delivery_effect_report_url_invalid"
+
+
+def test_validated_effect_binds_primary_report_to_http_readback_probe(tmp_path):
+    store = _seed(tmp_path)
+    claim = store.claim_due_effect(lease_owner="worker-1", now=NOW)
+    assert claim is not None
+
+    validated = dispatcher_module._validate_effect(claim)
+
+    index = next(
+        item for item in claim.manifest["artifacts"] if item["role"] == "index_html"
+    )
+    assert validated.artifacts == (
+        ("index_html", claim.report_url, index["size"], index["sha256"]),
+    )
 
 
 def test_dispatcher_rejects_non_html_report_link_kind_before_write(tmp_path):
@@ -1986,7 +2026,7 @@ def test_dispatcher_rejects_noncanonical_report_cifs_path_before_http(tmp_path):
     assert exc.value.code == "delivery_report_cifs_identity_mismatch"
 
 
-def test_foxglove_delivery_skips_html_artifact_network_loop(
+def test_foxglove_delivery_verifies_only_primary_html_artifact(
     tmp_path,
 ):
     store = _seed(tmp_path, bundle_payload=_web_bundle_payload())
@@ -2014,8 +2054,8 @@ def test_foxglove_delivery_skips_html_artifact_network_loop(
     outcome = dispatcher.dispatch_one()
 
     assert outcome.status == "succeeded"
-    assert contender_claims == []
-    assert clock.current == NOW
+    assert contender_claims == [None]
+    assert clock.current == NOW + timedelta(seconds=80)
     assert dispatcher.stats.lease_lost == 0
     assert remote.add_calls == 1
 
@@ -2178,7 +2218,7 @@ def test_effect_lease_keeper_normal_path_joins_thread(tmp_path):
     "changed_asset",
     ["assets/app.css", "assets/app.js", "assets/media/video.mp4"],
 )
-def test_changed_remote_html_assets_do_not_block_formal_foxglove_delivery(
+def test_changed_remote_html_assets_do_not_block_primary_report_delivery(
     tmp_path, changed_asset
 ):
     _seed(tmp_path, bundle_payload=_web_bundle_payload())
@@ -2200,42 +2240,31 @@ def test_changed_remote_html_assets_do_not_block_formal_foxglove_delivery(
     outcome = dispatcher.dispatch_one()
 
     assert outcome.status == "succeeded"
-    assert calls == []
+    assert calls == ["index.html"]
     assert remote.add_calls == 1
 
 
-def test_unused_html_verifier_cannot_expire_or_fence_foxglove_claim(tmp_path):
+def test_primary_report_verifier_is_inside_fenced_write_boundary(tmp_path):
     store = _seed(tmp_path)
     remote = Remote()
-    clock = Clock()
-    second_outcomes = []
+    calls = []
 
     def verifier(url, size, sha256):
-        clock.current += timedelta(seconds=91)
-        second, _remote, _clock = _dispatcher(
-            tmp_path,
-            remote=remote,
-            clock=clock,
-            verifier=_verified_report,
-            lease_owner="worker-2",
-        )
-        second_outcomes.append(second.dispatch_one())
+        calls.append((url, size, sha256))
         return _verified_report(url, size, sha256)
 
-    first, _remote, _clock = _dispatcher(
+    dispatcher, _remote, _clock = _dispatcher(
         tmp_path,
         remote=remote,
-        clock=clock,
         verifier=verifier,
         lease_owner="worker-1",
     )
 
-    first_outcome = first.dispatch_one()
+    outcome = dispatcher.dispatch_one()
 
-    assert first_outcome.status == "succeeded"
-    assert first.stats.lease_lost == 0
-    assert first.stats.retried == first.stats.quarantined == 0
-    assert second_outcomes == []
+    assert outcome.status == "succeeded"
+    assert len(calls) == 1
+    assert calls[0][0].endswith("/index.html")
     assert remote.add_calls == 1
     assert store.list_rows("rca_delivery_effects")[0]["status"] == "succeeded"
     assert store.delivery_dispatcher_circuit().is_open is False
@@ -2488,7 +2517,7 @@ def test_stored_artifact_inventory_corruption_quarantines_before_boundaries(
     assert remote.list_calls == remote.add_calls == 0
 
 
-def test_html_http_network_failure_does_not_block_foxglove_comment(tmp_path):
+def test_primary_report_network_failure_blocks_external_comment(tmp_path):
     store = _seed(tmp_path)
     dispatcher, remote, _clock = _dispatcher(
         tmp_path,
@@ -2498,12 +2527,13 @@ def test_html_http_network_failure_does_not_block_foxglove_comment(tmp_path):
         },
     )
     outcome = dispatcher.dispatch_one()
-    assert outcome.status == "succeeded"
-    assert remote.add_calls == 1
-    assert store.list_rows("rca_delivery_jobs")[0]["status"] == "delivered"
+    assert outcome.status == "retry_wait"
+    assert outcome.error_code == "report_http_unavailable"
+    assert remote.add_calls == 0
+    assert store.list_rows("rca_delivery_jobs")[0]["status"] == "ready"
 
 
-def test_html_http_hash_mismatch_does_not_block_foxglove_comment(tmp_path):
+def test_primary_report_readback_hash_mismatch_quarantines_before_comment(tmp_path):
     store = _seed(tmp_path)
     dispatcher, remote, _clock = _dispatcher(
         tmp_path,
@@ -2514,9 +2544,10 @@ def test_html_http_hash_mismatch_does_not_block_foxglove_comment(tmp_path):
         },
     )
     outcome = dispatcher.dispatch_one()
-    assert outcome.status == "succeeded"
-    assert remote.add_calls == 1
-    assert store.list_rows("rca_delivery_jobs")[0]["status"] == "delivered"
+    assert outcome.status == "quarantined"
+    assert outcome.error_code == "report_http_hash_mismatch"
+    assert remote.add_calls == 0
+    assert store.list_rows("rca_delivery_jobs")[0]["status"] == "quarantined"
 
 
 def test_partial_status_is_reserved_for_future_optional_effects(tmp_path):

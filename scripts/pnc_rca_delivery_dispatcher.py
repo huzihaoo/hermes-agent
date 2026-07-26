@@ -44,6 +44,7 @@ from gateway.pnc_rca_delivery_contract import (
     RCA_REPORT_FIELD_KEY,
     RCA_RESULT_FIELD_KEY,
     build_issue_comment_content,
+    build_report_artifact_url,
     build_thread_reply_content,
     build_terminal_delivery,
     build_terminal_thread_reply_effect,
@@ -1944,11 +1945,26 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         != artifacts_by_role["report_data"].sha256
     ):
         raise DeliveryContractError("html_validation_report_data_hash_mismatch")
+    # W4-C4: prove the user-facing sealed report before any external effect.
+    # Auxiliary assets remain covered by the immutable manifest; the primary
+    # index is the publication hard gate (HEAD + GET + exact size/hash).
+    primary_report = artifacts_by_role["index_html"]
+    artifact_requests = (
+        (
+            primary_report.role,
+            build_report_artifact_url(
+                claim.report_url,
+                primary_report.relative_path,
+            ),
+            primary_report.size,
+            primary_report.sha256,
+        ),
+    )
     return ValidatedEffect(
         effect_kind=claim.effect_kind,
         marker=marker,
         content=content,
-        artifacts=(),
+        artifacts=artifact_requests,
         field_updates=(
             (
                 RCA_RESULT_FIELD_KEY,
@@ -3028,14 +3044,6 @@ class DeliveryDispatcher:
                 error_code="delivery_effect_superseded_by_newer_settled_fields",
             )
 
-        verification_failure = self._verify_report_artifacts(
-            claim,
-            validated,
-            uncertain=prior_write_uncertain,
-        )
-        if verification_failure is not None:
-            return verification_failure
-
         self._heartbeat(claim)
         try:
             before_raw = self._list_remote_effect(claim, validated)
@@ -3288,6 +3296,17 @@ class DeliveryDispatcher:
                         exact_delay_seconds=UNCERTAIN_RECONCILIATION_POLL_SECONDS,
                     )
                 recovery_write_count = recovery_authorization
+        # W4-C4 applies at the last point before any external write.  A claim
+        # already reconciled above has no write boundary and needs no network
+        # probe; all field/comment writes (including bounded recovery writes)
+        # must prove the sealed primary report first.
+        verification_failure = self._verify_report_artifacts(
+            claim,
+            validated,
+            uncertain=prior_write_uncertain,
+        )
+        if verification_failure is not None:
+            return verification_failure
         if (
             not prior_write_uncertain
             and not (
