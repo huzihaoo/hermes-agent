@@ -19,6 +19,55 @@ from scripts.pnc_live_exec import PNC_PYTHON_LAUNCHD_LABELS
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+_VALID_EVALUATOR_SOURCE = """\
+G1Q3_EVALUATOR_SCOPE = 'g1q3_rca_evaluator_scope_v4'
+G1Q3_EVALUATOR_INVENTORY = (
+    'lane_geometry_quality',
+    'acc_decel_heavy',
+)
+"""
+
+
+def _git(repo: Path, *args: str) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return completed.stdout.strip()
+
+
+def _commit(repo: Path, message: str) -> tuple[str, str]:
+    _git(repo, "add", "-A")
+    _git(
+        repo,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "commit",
+        "-q",
+        "-m",
+        message,
+    )
+    return _git(repo, "rev-parse", "HEAD"), _git(repo, "rev-parse", "HEAD^{tree}")
+
+
+def _pipeline_repo(
+    tmp_path: Path,
+    *,
+    source_text: str = _VALID_EVALUATOR_SOURCE,
+) -> tuple[Path, Path, str, str]:
+    source_root = tmp_path / "pipeline"
+    source_root.mkdir()
+    _git(source_root, "init", "-q")
+    _git(source_root, "config", "user.name", "PNC test")
+    _git(source_root, "config", "user.email", "pnc-test@example.invalid")
+    source = source_root / gate.ACTIVE_EVALUATOR_INVENTORY_SOURCE_PATH
+    source.parent.mkdir(parents=True)
+    source.write_text(source_text, encoding="utf-8")
+    commit, tree = _commit(source_root, "add evaluator inventory")
+    return source_root, source, commit, tree
 
 
 def _active_evaluator_inventory_binding(
@@ -68,25 +117,15 @@ def _write_pipeline_manifest(
 def test_materialize_active_evaluator_inventory_uses_ast_and_exact_keys(
     tmp_path: Path,
 ):
-    source_root = tmp_path / "pipeline"
-    source = source_root / gate.ACTIVE_EVALUATOR_INVENTORY_SOURCE_PATH
-    source.parent.mkdir(parents=True)
-    source.write_text(
-        """
-G1Q3_EVALUATOR_SCOPE = 'g1q3_rca_evaluator_scope_v4'
-G1Q3_EVALUATOR_INVENTORY = (
-    'lane_geometry_quality',
-    'acc_decel_heavy',
-)
-""",
-        encoding="utf-8",
-    )
+    source_root, source, commit, tree = _pipeline_repo(tmp_path)
     binding = gate.materialize_active_evaluator_inventory_binding(
         pipeline_source_root=source_root,
-        pipeline_commit="a" * 40,
-        pipeline_tree="b" * 40,
+        pipeline_commit=commit,
+        pipeline_tree=tree,
     )
 
+    assert binding["pipeline_commit"] == commit
+    assert binding["pipeline_tree"] == tree
     assert binding["evaluator_ids"] == ["acc_decel_heavy", "lane_geometry_quality"]
     assert (
         binding["source_blob_sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
@@ -101,11 +140,106 @@ G1Q3_EVALUATOR_INVENTORY = (
         "G1Q3_EVALUATOR_INVENTORY=('duplicate', 'duplicate')\n",
         encoding="utf-8",
     )
+    invalid_commit, invalid_tree = _commit(source_root, "add invalid inventory")
     with pytest.raises(ValueError, match="source_invalid"):
+        gate.materialize_active_evaluator_inventory_binding(
+            pipeline_source_root=source_root,
+            pipeline_commit=invalid_commit,
+            pipeline_tree=invalid_tree,
+        )
+
+
+def test_materialize_evaluator_inventory_rejects_non_git_source(tmp_path: Path):
+    source_root = tmp_path / "pipeline"
+    source = source_root / gate.ACTIVE_EVALUATOR_INVENTORY_SOURCE_PATH
+    source.parent.mkdir(parents=True)
+    source.write_text(_VALID_EVALUATOR_SOURCE, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="pipeline_repository_invalid"):
         gate.materialize_active_evaluator_inventory_binding(
             pipeline_source_root=source_root,
             pipeline_commit="a" * 40,
             pipeline_tree="b" * 40,
+        )
+
+
+def test_materialize_evaluator_inventory_rejects_wrong_commit_and_tree(
+    tmp_path: Path,
+):
+    source_root, _source, first_commit, first_tree = _pipeline_repo(tmp_path)
+    (source_root / "README.md").write_text("second commit\n", encoding="utf-8")
+    current_commit, current_tree = _commit(source_root, "advance pipeline")
+
+    with pytest.raises(ValueError, match="pipeline_commit_mismatch"):
+        gate.materialize_active_evaluator_inventory_binding(
+            pipeline_source_root=source_root,
+            pipeline_commit=first_commit,
+            pipeline_tree=first_tree,
+        )
+    with pytest.raises(ValueError, match="pipeline_tree_mismatch"):
+        gate.materialize_active_evaluator_inventory_binding(
+            pipeline_source_root=source_root,
+            pipeline_commit=current_commit,
+            pipeline_tree=first_tree,
+        )
+    assert current_tree != first_tree
+
+
+def test_materialize_evaluator_inventory_rejects_dirty_source(tmp_path: Path):
+    source_root, source, commit, tree = _pipeline_repo(tmp_path)
+    source.write_text(_VALID_EVALUATOR_SOURCE + "# dirty\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="source_dirty"):
+        gate.materialize_active_evaluator_inventory_binding(
+            pipeline_source_root=source_root,
+            pipeline_commit=commit,
+            pipeline_tree=tree,
+        )
+
+    _git(source_root, "add", gate.ACTIVE_EVALUATOR_INVENTORY_SOURCE_PATH)
+    with pytest.raises(ValueError, match="source_dirty"):
+        gate.materialize_active_evaluator_inventory_binding(
+            pipeline_source_root=source_root,
+            pipeline_commit=commit,
+            pipeline_tree=tree,
+        )
+
+
+def test_materialize_evaluator_inventory_rejects_untracked_source(tmp_path: Path):
+    source_root = tmp_path / "pipeline"
+    source_root.mkdir()
+    _git(source_root, "init", "-q")
+    _git(source_root, "config", "user.name", "PNC test")
+    _git(source_root, "config", "user.email", "pnc-test@example.invalid")
+    (source_root / "README.md").write_text("tracked\n", encoding="utf-8")
+    commit, tree = _commit(source_root, "add tracked file")
+    source = source_root / gate.ACTIVE_EVALUATOR_INVENTORY_SOURCE_PATH
+    source.parent.mkdir(parents=True)
+    source.write_text(_VALID_EVALUATOR_SOURCE, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="source_untracked"):
+        gate.materialize_active_evaluator_inventory_binding(
+            pipeline_source_root=source_root,
+            pipeline_commit=commit,
+            pipeline_tree=tree,
+        )
+
+
+def test_materialize_evaluator_inventory_verifies_commit_blob(tmp_path: Path):
+    source_root, source, commit, tree = _pipeline_repo(tmp_path)
+    _git(
+        source_root,
+        "update-index",
+        "--assume-unchanged",
+        gate.ACTIVE_EVALUATOR_INVENTORY_SOURCE_PATH,
+    )
+    source.write_text(_VALID_EVALUATOR_SOURCE + "# hidden change\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="source_blob_mismatch"):
+        gate.materialize_active_evaluator_inventory_binding(
+            pipeline_source_root=source_root,
+            pipeline_commit=commit,
+            pipeline_tree=tree,
         )
 
 

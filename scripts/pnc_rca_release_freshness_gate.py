@@ -113,6 +113,30 @@ def _evaluator_inventory_sha256(
     return hashlib.sha256(raw).hexdigest()
 
 
+def _read_git_object(
+    source_root: Path,
+    *args: str,
+    error_code: str,
+) -> bytes:
+    env = os.environ.copy()
+    env.update({"GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"})
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(source_root), *args],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=10,
+            env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(error_code) from exc
+    if completed.returncode != 0:
+        raise ValueError(error_code)
+    return completed.stdout
+
+
 def materialize_active_evaluator_inventory_binding(
     *,
     pipeline_source_root: Path,
@@ -127,6 +151,57 @@ def materialize_active_evaluator_inventory_binding(
         raise ValueError("pnc_release_evaluator_inventory_pipeline_binding_invalid")
 
     source_root = Path(pipeline_source_root).expanduser().absolute().resolve()
+    repository_error = "pnc_release_evaluator_inventory_pipeline_repository_invalid"
+    top_level_raw = _read_git_object(
+        source_root,
+        "rev-parse",
+        "--show-toplevel",
+        error_code=repository_error,
+    )
+    inside_worktree = _read_git_object(
+        source_root,
+        "rev-parse",
+        "--is-inside-work-tree",
+        error_code=repository_error,
+    )
+    try:
+        top_level = Path(os.fsdecode(top_level_raw.rstrip(b"\r\n"))).resolve(
+            strict=True
+        )
+    except (OSError, ValueError) as exc:
+        raise ValueError(repository_error) from exc
+    if top_level != source_root or inside_worktree.strip() != b"true":
+        raise ValueError(repository_error)
+
+    resolved_commit = _read_git_object(
+        source_root,
+        "rev-parse",
+        "--verify",
+        f"{commit}^{{commit}}",
+        error_code="pnc_release_evaluator_inventory_pipeline_commit_invalid",
+    ).strip()
+    if resolved_commit != commit.encode("ascii"):
+        raise ValueError("pnc_release_evaluator_inventory_pipeline_commit_invalid")
+    head_commit = _read_git_object(
+        source_root,
+        "rev-parse",
+        "--verify",
+        "HEAD^{commit}",
+        error_code=repository_error,
+    ).strip()
+    if head_commit != resolved_commit:
+        raise ValueError("pnc_release_evaluator_inventory_pipeline_commit_mismatch")
+
+    resolved_tree = _read_git_object(
+        source_root,
+        "rev-parse",
+        "--verify",
+        f"{commit}^{{tree}}",
+        error_code="pnc_release_evaluator_inventory_pipeline_tree_invalid",
+    ).strip()
+    if resolved_tree != tree.encode("ascii"):
+        raise ValueError("pnc_release_evaluator_inventory_pipeline_tree_mismatch")
+
     source_path = source_root / ACTIVE_EVALUATOR_INVENTORY_SOURCE_PATH
     try:
         resolved_source_path = source_path.resolve(strict=True)
@@ -143,6 +218,52 @@ def materialize_active_evaluator_inventory_binding(
         if isinstance(exc, ValueError):
             raise
         raise ValueError("pnc_release_evaluator_inventory_source_unreadable") from exc
+
+    source_path_raw = ACTIVE_EVALUATOR_INVENTORY_SOURCE_PATH.encode("utf-8")
+    tracked_paths = _read_git_object(
+        source_root,
+        "ls-files",
+        "--error-unmatch",
+        "-z",
+        "--",
+        ACTIVE_EVALUATOR_INVENTORY_SOURCE_PATH,
+        error_code="pnc_release_evaluator_inventory_source_untracked",
+    )
+    if tracked_paths != source_path_raw + b"\0":
+        raise ValueError("pnc_release_evaluator_inventory_source_untracked")
+    source_status = _read_git_object(
+        source_root,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--no-renames",
+        "-z",
+        "--",
+        ACTIVE_EVALUATOR_INVENTORY_SOURCE_PATH,
+        error_code="pnc_release_evaluator_inventory_source_provenance_invalid",
+    )
+    if source_status:
+        raise ValueError("pnc_release_evaluator_inventory_source_dirty")
+
+    commit_source = f"{commit}:{ACTIVE_EVALUATOR_INVENTORY_SOURCE_PATH}"
+    source_object_type = _read_git_object(
+        source_root,
+        "cat-file",
+        "-t",
+        commit_source,
+        error_code="pnc_release_evaluator_inventory_source_blob_invalid",
+    ).strip()
+    if source_object_type != b"blob":
+        raise ValueError("pnc_release_evaluator_inventory_source_blob_invalid")
+    committed_source_bytes = _read_git_object(
+        source_root,
+        "cat-file",
+        "blob",
+        commit_source,
+        error_code="pnc_release_evaluator_inventory_source_blob_invalid",
+    )
+    if source_bytes != committed_source_bytes:
+        raise ValueError("pnc_release_evaluator_inventory_source_blob_mismatch")
 
     try:
         module = ast.parse(source_bytes.decode("utf-8"), filename=str(source_path))
