@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import sqlite3
@@ -17,6 +18,8 @@ NEW_ITEM = "7000000002"
 STOCK_BUSINESS = "business-stock"
 NEW_BUSINESS = "business-new"
 OPEN_ID = "ou_0123456789abcdef0123456789abcdef"
+COHORT_ID = "cohort-1"
+STOCK_DIGEST = hashlib.sha256(STOCK_ITEM.encode("utf-8")).hexdigest()
 
 
 def _schema(conn: sqlite3.Connection) -> None:
@@ -68,6 +71,19 @@ def _schema(conn: sqlite3.Connection) -> None:
             generation INTEGER NOT NULL,
             effect_kind TEXT NOT NULL
         );
+        CREATE TABLE rca_learning_lane_cohorts (
+            cohort_id TEXT PRIMARY KEY,
+            schema_version TEXT NOT NULL,
+            stock_cutoff TEXT NOT NULL,
+            stock_count INTEGER NOT NULL,
+            stock_ids_sha256 TEXT NOT NULL,
+            sealed_at TEXT NOT NULL
+        );
+        CREATE TABLE rca_learning_lane_stock_items (
+            cohort_id TEXT NOT NULL,
+            work_item_id TEXT NOT NULL,
+            PRIMARY KEY (cohort_id, work_item_id)
+        );
         CREATE TABLE rca_learning_lane_admissions (
             business_key TEXT NOT NULL,
             generation INTEGER NOT NULL,
@@ -76,6 +92,9 @@ def _schema(conn: sqlite3.Connection) -> None:
             lane TEXT NOT NULL,
             reason TEXT NOT NULL,
             external_write_allowed INTEGER NOT NULL,
+            cohort_id TEXT NOT NULL,
+            stock_cutoff TEXT NOT NULL,
+            stock_ids_sha256 TEXT NOT NULL,
             admitted_at TEXT NOT NULL,
             PRIMARY KEY (business_key, generation)
         );
@@ -93,6 +112,47 @@ def _schema(conn: sqlite3.Connection) -> None:
             correction_effect_key TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
+        CREATE TRIGGER trg_learning_lane_cohort_no_update
+        BEFORE UPDATE ON rca_learning_lane_cohorts
+        BEGIN SELECT RAISE(ABORT, 'learning_lane_cohort_immutable'); END;
+        CREATE TRIGGER trg_learning_lane_cohort_no_delete
+        BEFORE DELETE ON rca_learning_lane_cohorts
+        BEGIN SELECT RAISE(ABORT, 'learning_lane_cohort_immutable'); END;
+        CREATE TRIGGER trg_learning_lane_cohort_no_replace
+        BEFORE INSERT ON rca_learning_lane_cohorts
+        WHEN EXISTS (SELECT 1 FROM rca_learning_lane_cohorts)
+        BEGIN SELECT RAISE(ABORT, 'learning_lane_cohort_replace_forbidden'); END;
+        CREATE TRIGGER trg_learning_lane_stock_item_no_append
+        BEFORE INSERT ON rca_learning_lane_stock_items
+        WHEN (SELECT COUNT(*) FROM rca_learning_lane_stock_items
+              WHERE cohort_id = NEW.cohort_id) >=
+             (SELECT stock_count FROM rca_learning_lane_cohorts
+              WHERE cohort_id = NEW.cohort_id)
+        BEGIN SELECT RAISE(ABORT, 'learning_lane_cohort_immutable'); END;
+        CREATE TRIGGER trg_learning_lane_stock_item_no_update
+        BEFORE UPDATE ON rca_learning_lane_stock_items
+        BEGIN SELECT RAISE(ABORT, 'learning_lane_cohort_immutable'); END;
+        CREATE TRIGGER trg_learning_lane_stock_item_no_delete
+        BEFORE DELETE ON rca_learning_lane_stock_items
+        BEGIN SELECT RAISE(ABORT, 'learning_lane_cohort_immutable'); END;
+        CREATE TRIGGER trg_learning_lane_admission_no_update
+        BEFORE UPDATE ON rca_learning_lane_admissions
+        BEGIN SELECT RAISE(ABORT, 'learning_lane_admission_immutable'); END;
+        CREATE TRIGGER trg_learning_lane_admission_no_delete
+        BEFORE DELETE ON rca_learning_lane_admissions
+        BEGIN SELECT RAISE(ABORT, 'learning_lane_admission_immutable'); END;
+        CREATE TRIGGER trg_learning_lane_admission_cohort_binding
+        BEFORE INSERT ON rca_learning_lane_admissions
+        WHEN NOT EXISTS (
+            SELECT 1 FROM rca_learning_lane_cohorts AS cohort
+            JOIN rca_learning_lane_stock_items AS item
+              ON item.cohort_id = cohort.cohort_id
+             AND item.work_item_id = NEW.work_item_id
+            WHERE cohort.cohort_id = NEW.cohort_id
+              AND cohort.stock_cutoff = NEW.stock_cutoff
+              AND cohort.stock_ids_sha256 = NEW.stock_ids_sha256
+        )
+        BEGIN SELECT RAISE(ABORT, 'learning_lane_cohort_binding_mismatch'); END;
         """
     )
 
@@ -141,6 +201,10 @@ def _effect(
     created_at: str,
     conclusion: str = "",
     adjudication: bool = False,
+    status: str = "succeeded",
+    write_phase: str = "settled",
+    write_started_at: str | None = None,
+    remote_receipt_json: str = "{}",
 ) -> None:
     job_target = f"issue:{work_item_id}"
     conn.execute(
@@ -166,14 +230,17 @@ def _effect(
         INSERT INTO rca_delivery_effects(
             effect_key, delivery_id, effect_kind, target_key, payload_json,
             status, write_phase, write_started_at, remote_receipt_json, created_at
-        ) VALUES (?, ?, 'feishu_issue_comment', ?, ?, 'succeeded', 'settled', ?, '{}', ?)
+        ) VALUES (?, ?, 'feishu_issue_comment', ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             effect_key,
             delivery_id,
             target,
             json.dumps(payload, separators=(",", ":"), sort_keys=True),
-            created_at,
+            status,
+            write_phase,
+            write_started_at if write_started_at is not None else created_at,
+            remote_receipt_json,
             created_at,
         ),
     )
@@ -183,6 +250,21 @@ def _database(tmp_path: Path) -> Path:
     path = tmp_path / "control.sqlite3"
     with sqlite3.connect(path) as conn:
         _schema(conn)
+        conn.execute(
+            "INSERT INTO rca_learning_lane_cohorts VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                COHORT_ID,
+                audit.LEARNING_COHORT_SCHEMA_VERSION,
+                CUTOFF,
+                1,
+                STOCK_DIGEST,
+                "2026-07-25T10:16:00+00:00",
+            ),
+        )
+        conn.execute(
+            "INSERT INTO rca_learning_lane_stock_items VALUES (?, ?)",
+            (COHORT_ID, STOCK_ITEM),
+        )
         _trigger(
             conn,
             source_id="stock-initial",
@@ -211,7 +293,7 @@ def _database(tmp_path: Path) -> Path:
             rerun=True,
         )
         conn.execute(
-            "INSERT INTO rca_learning_lane_admissions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO rca_learning_lane_admissions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 STOCK_BUSINESS,
                 2,
@@ -220,6 +302,9 @@ def _database(tmp_path: Path) -> Path:
                 "learning",
                 "stock",
                 0,
+                COHORT_ID,
+                CUTOFF,
+                STOCK_DIGEST,
                 "2026-07-25T11:00:01+00:00",
             ),
         )
@@ -286,6 +371,7 @@ def _audit(path: Path) -> dict:
         path,
         stock_cutoff=CUTOFF,
         expected_stock_count=1,
+        expected_stock_ids_sha256=STOCK_DIGEST,
     )
 
 
@@ -400,6 +486,135 @@ def test_missing_learning_ledger_fails_closed(tmp_path: Path) -> None:
     assert result["invariants"]["learning_lane_schema_ready"] is False
 
 
+def test_stock_digest_is_checked_even_when_count_matches(tmp_path: Path) -> None:
+    path = _database(tmp_path)
+
+    result = audit.audit_w6_guard(
+        path,
+        stock_cutoff=CUTOFF,
+        expected_stock_count=1,
+        expected_stock_ids_sha256="0" * 64,
+    )
+
+    assert result["scope"]["observed_stock_count"] == 1
+    assert result["invariants"]["stock_count_matches_expected"] is True
+    assert result["invariants"]["stock_digest_matches_expected"] is False
+    assert result["invariants"]["stock_cohort_binding_exact"] is True
+    assert result["ok"] is False
+
+
+def test_stock_digest_expectation_is_required_for_green_audit(tmp_path: Path) -> None:
+    path = _database(tmp_path)
+
+    result = audit.audit_w6_guard(
+        path,
+        stock_cutoff=CUTOFF,
+        expected_stock_count=1,
+    )
+
+    assert result["invariants"]["stock_digest_expectation_supplied"] is False
+    assert result["invariants"]["stock_digest_matches_expected"] is False
+    assert result["ok"] is False
+
+
+def test_stock_cohort_id_swap_is_detected_without_count_change(tmp_path: Path) -> None:
+    path = _database(tmp_path)
+    with sqlite3.connect(path) as conn:
+        conn.execute("DROP TRIGGER trg_learning_lane_stock_item_no_update")
+        conn.execute(
+            "UPDATE rca_learning_lane_stock_items SET work_item_id = ?",
+            ("7000000999",),
+        )
+        conn.execute(
+            """
+            CREATE TRIGGER trg_learning_lane_stock_item_no_update
+            BEFORE UPDATE ON rca_learning_lane_stock_items
+            BEGIN SELECT RAISE(ABORT, 'learning_lane_cohort_immutable'); END;
+            """
+        )
+
+    result = _audit(path)
+
+    assert result["scope"]["observed_stock_count"] == 1
+    assert result["invariants"]["stock_count_matches_expected"] is True
+    assert result["invariants"]["stock_cohort_binding_exact"] is False
+    assert "cohort_stock_digest_invalid" in result["violations"]["stock_cohort_binding"]
+    assert result["ok"] is False
+
+
+def test_orphan_stock_item_is_not_hidden_by_cohort_filter(tmp_path: Path) -> None:
+    path = _database(tmp_path)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "INSERT INTO rca_learning_lane_stock_items VALUES (?, ?)",
+            ("orphan-cohort", "7000000998"),
+        )
+
+    result = _audit(path)
+
+    assert result["invariants"]["stock_cohort_binding_exact"] is False
+    assert "cohort_orphan_stock_item" in result["violations"]["stock_cohort_binding"]
+    assert result["ok"] is False
+
+
+def test_missing_immutable_cohort_trigger_fails_closed(tmp_path: Path) -> None:
+    path = _database(tmp_path)
+    with sqlite3.connect(path) as conn:
+        conn.execute("DROP TRIGGER trg_learning_lane_cohort_no_delete")
+
+    result = _audit(path)
+
+    assert result["invariants"]["stock_cohort_immutable_triggers"] is False
+    assert (
+        "missing:trg_learning_lane_cohort_no_delete"
+        in result["violations"]["stock_cohort_triggers"]
+    )
+    assert result["ok"] is False
+
+
+def test_outward_retry_transition_is_included_in_full_digest(tmp_path: Path) -> None:
+    path = _database(tmp_path)
+    baseline = _audit(path)
+    with sqlite3.connect(path) as conn:
+        _trigger(
+            conn,
+            source_id="new-rerun-3",
+            business_key=NEW_BUSINESS,
+            generation=3,
+            work_item_id=NEW_ITEM,
+            created_at="2026-07-25T11:40:00+00:00",
+            rerun=True,
+        )
+        _effect(
+            conn,
+            effect_key="new-effect-c",
+            delivery_id="new-delivery-3",
+            business_key=NEW_BUSINESS,
+            generation=3,
+            work_item_id=NEW_ITEM,
+            created_at="2026-07-25T11:41:00+00:00",
+            conclusion="conclusion C",
+            status="retry_wait",
+            write_phase="started",
+            write_started_at="2026-07-25T11:40:30+00:00",
+            remote_receipt_json='{"remote_id":"remote-c"}',
+        )
+
+    result = _audit(path)
+
+    assert baseline["counts"]["conclusion_transitions"] == 1
+    assert result["counts"]["conclusion_transitions"] == 2
+    assert result["transition_pairs"]["count"] == 2
+    assert (
+        result["scope"]["transition_pairs_sha256"]
+        != baseline["scope"]["transition_pairs_sha256"]
+    )
+    assert any(
+        row["to_effect_key"] == "new-effect-c"
+        for row in result["violations"]["missing_transition_adjudications"]
+    )
+
+
 def test_nonempty_wal_is_rejected_before_audit(tmp_path: Path) -> None:
     path = _database(tmp_path)
     Path(f"{path}-wal").write_bytes(b"not-checkpointed")
@@ -422,6 +637,8 @@ def test_cli_negative_injection_exits_nonzero(tmp_path: Path) -> None:
             CUTOFF,
             "--expected-stock-count",
             "1",
+            "--expected-stock-ids-sha256",
+            STOCK_DIGEST,
         ],
         check=False,
         capture_output=True,

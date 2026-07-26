@@ -15,7 +15,8 @@ import stat
 from typing import Any, Iterable, Mapping, Sequence
 
 
-AUDIT_SCHEMA_VERSION = "g1q3_rca_w6_guard_audit_v1"
+AUDIT_SCHEMA_VERSION = "g1q3_rca_w6_guard_audit_v2"
+LEARNING_COHORT_SCHEMA_VERSION = "g1q3_rca_learning_lane_cohort_v1"
 LEARNING_ADMISSION_SCHEMA_VERSION = "g1q3_rca_learning_lane_admission_v1"
 LEGACY_BATCH_ID = "rca-legacy-report-48-20260725"
 LEGACY_BATCH_REQUESTER_ID = "codex-production-coverage"
@@ -101,6 +102,62 @@ _ADJUDICATION_SCHEMA = frozenset({
     "correction_effect_key",
     "created_at",
 })
+_COHORT_SCHEMA = frozenset({
+    "cohort_id",
+    "schema_version",
+    "stock_cutoff",
+    "stock_count",
+    "stock_ids_sha256",
+    "sealed_at",
+})
+_STOCK_ITEM_SCHEMA = frozenset({"cohort_id", "work_item_id"})
+_LEARNING_ADMISSION_BINDING_SCHEMA = frozenset({
+    "cohort_id",
+    "stock_cutoff",
+    "stock_ids_sha256",
+})
+
+# These triggers make the sealed cohort and its admission bindings append-only.
+# Check both presence and the operation/table encoded in the SQL so a renamed or
+# inert trigger cannot make an audit appear green.
+_IMMUTABLE_COHORT_TRIGGERS: Mapping[str, tuple[str, ...]] = {
+    "trg_learning_lane_cohort_no_update": (
+        "before update on rca_learning_lane_cohorts",
+        "raise(abort",
+    ),
+    "trg_learning_lane_cohort_no_delete": (
+        "before delete on rca_learning_lane_cohorts",
+        "raise(abort",
+    ),
+    "trg_learning_lane_cohort_no_replace": (
+        "before insert on rca_learning_lane_cohorts",
+        "raise(abort",
+    ),
+    "trg_learning_lane_stock_item_no_append": (
+        "before insert on rca_learning_lane_stock_items",
+        "raise(abort",
+    ),
+    "trg_learning_lane_stock_item_no_update": (
+        "before update on rca_learning_lane_stock_items",
+        "raise(abort",
+    ),
+    "trg_learning_lane_stock_item_no_delete": (
+        "before delete on rca_learning_lane_stock_items",
+        "raise(abort",
+    ),
+    "trg_learning_lane_admission_no_update": (
+        "before update on rca_learning_lane_admissions",
+        "raise(abort",
+    ),
+    "trg_learning_lane_admission_no_delete": (
+        "before delete on rca_learning_lane_admissions",
+        "raise(abort",
+    ),
+    "trg_learning_lane_admission_cohort_binding": (
+        "before insert on rca_learning_lane_admissions",
+        "raise(abort",
+    ),
+}
 
 
 def _sha256(path: Path) -> str:
@@ -167,6 +224,72 @@ def _table_names(conn: sqlite3.Connection) -> set[str]:
 
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _stock_digest(work_item_ids: Iterable[str]) -> str:
+    """Return the canonical digest used by the control-store cohort seal."""
+
+    normalized = sorted({
+        str(item).strip() for item in work_item_ids if str(item).strip()
+    })
+    return hashlib.sha256("\n".join(normalized).encode("utf-8")).hexdigest()
+
+
+def _trigger_sql(conn: sqlite3.Connection, trigger_name: str) -> str:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+        (trigger_name,),
+    ).fetchone()
+    return str(row[0] or "").lower() if row else ""
+
+
+def _transition_digest(transitions: Iterable[Mapping[str, Any]]) -> str:
+    """Hash every transition pair, not only the bounded evidence sample."""
+
+    canonical: list[dict[str, Any]] = []
+    for row in transitions:
+        canonical.append({
+            "work_item_id": str(row["work_item_id"]),
+            "business_key": str(row["business_key"]),
+            "from_effect_key": str(row["from_effect_key"]),
+            "from_generation": int(row["from_generation"]),
+            "from_created_at": _canonical_time(row["from_created_at"]),
+            "from_result_identity_sha256": hashlib.sha256(
+                str(row["from_result_identity"]).encode("utf-8")
+            ).hexdigest(),
+            "from_status": str(row.get("from_status") or ""),
+            "from_write_phase": str(row.get("from_write_phase") or ""),
+            "from_write_started_at": str(row.get("from_write_started_at") or ""),
+            "from_remote_receipt_sha256": hashlib.sha256(
+                str(row.get("from_remote_receipt_json") or "").encode("utf-8")
+            ).hexdigest(),
+            "to_effect_key": str(row["to_effect_key"]),
+            "to_generation": int(row["to_generation"]),
+            "to_created_at": _canonical_time(row["to_created_at"]),
+            "to_result_identity_sha256": hashlib.sha256(
+                str(row["to_result_identity"]).encode("utf-8")
+            ).hexdigest(),
+            "to_status": str(row.get("to_status") or ""),
+            "to_write_phase": str(row.get("to_write_phase") or ""),
+            "to_write_started_at": str(row.get("to_write_started_at") or ""),
+            "to_remote_receipt_sha256": hashlib.sha256(
+                str(row.get("to_remote_receipt_json") or "").encode("utf-8")
+            ).hexdigest(),
+        })
+    canonical.sort(
+        key=lambda row: (
+            row["work_item_id"],
+            row["business_key"],
+            row["from_generation"],
+            row["to_generation"],
+            row["from_effect_key"],
+            row["to_effect_key"],
+        )
+    )
+    encoded = json.dumps(
+        canonical, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _require_base_schema(conn: sqlite3.Connection, tables: set[str]) -> None:
@@ -273,6 +396,7 @@ def audit_w6_guard(
     *,
     stock_cutoff: str,
     expected_stock_count: int,
+    expected_stock_ids_sha256: str | None = None,
     sample_size: int = 5,
 ) -> dict[str, Any]:
     """Audit one checkpointed control database without mutating it."""
@@ -282,6 +406,10 @@ def audit_w6_guard(
         raise ValueError("control DB path must be absolute")
     if expected_stock_count <= 0:
         raise ValueError("expected stock count must be positive")
+    if expected_stock_ids_sha256 is not None:
+        expected_stock_ids_sha256 = str(expected_stock_ids_sha256).strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_stock_ids_sha256):
+            raise ValueError("expected stock IDs digest must be a lowercase SHA-256")
     if sample_size < 1 or sample_size > 20:
         raise ValueError("sample size must be between 1 and 20")
     cutoff = _parse_time(stock_cutoff, field="stock_cutoff")
@@ -355,6 +483,119 @@ def audit_w6_guard(
             except ValueError as exc:
                 data_errors.append(f"{exc}:{key[0]}:{key[1]}")
 
+        cohort_schema_errors: list[str] = []
+        cohort_binding_errors: list[str] = []
+        cohort_trigger_errors: list[str] = []
+        cohort_rows: list[dict[str, Any]] = []
+        cohort_stock_ids: set[str] = set()
+        cohort_id = ""
+        cohort_digest = ""
+        cohort_stock_count: int | None = None
+        cohort_cutoff: datetime | None = None
+        cohort_schema_ready = True
+        cohort_tables = {
+            "rca_learning_lane_cohorts": _COHORT_SCHEMA,
+            "rca_learning_lane_stock_items": _STOCK_ITEM_SCHEMA,
+        }
+        for table, required_columns in cohort_tables.items():
+            if table not in tables:
+                cohort_schema_errors.append(f"table_missing:{table}")
+                continue
+            missing = sorted(required_columns - _columns(conn, table))
+            if missing:
+                cohort_schema_errors.append(
+                    f"columns_missing:{table}:{','.join(missing)}"
+                )
+        if "rca_learning_lane_admissions" not in tables:
+            cohort_schema_errors.append("table_missing:rca_learning_lane_admissions")
+        else:
+            missing = sorted(
+                (_LEARNING_SCHEMA | _LEARNING_ADMISSION_BINDING_SCHEMA)
+                - _columns(conn, "rca_learning_lane_admissions")
+            )
+            if missing:
+                cohort_schema_errors.append(
+                    "columns_missing:rca_learning_lane_admissions:" + ",".join(missing)
+                )
+        cohort_schema_ready = not cohort_schema_errors
+        if cohort_schema_ready:
+            trigger_names = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+                ).fetchall()
+            }
+            for name, markers in _IMMUTABLE_COHORT_TRIGGERS.items():
+                if name not in trigger_names:
+                    cohort_trigger_errors.append(f"missing:{name}")
+                    continue
+                sql = _trigger_sql(conn, name)
+                if any(marker not in sql for marker in markers):
+                    cohort_trigger_errors.append(f"invalid:{name}")
+            cohort_rows = _rows(
+                conn,
+                """
+                SELECT cohort_id, schema_version, stock_cutoff, stock_count,
+                       stock_ids_sha256, sealed_at
+                  FROM rca_learning_lane_cohorts
+                 ORDER BY cohort_id
+                """,
+            )
+            if len(cohort_rows) != 1:
+                cohort_binding_errors.append(f"cohort_count_invalid:{len(cohort_rows)}")
+            else:
+                cohort = cohort_rows[0]
+                cohort_id = str(cohort["cohort_id"] or "")
+                cohort_digest = str(cohort["stock_ids_sha256"] or "").lower()
+                try:
+                    cohort_stock_count = int(cohort["stock_count"])
+                except (TypeError, ValueError):
+                    cohort_binding_errors.append("cohort_stock_count_invalid")
+                try:
+                    cohort_cutoff = _parse_time(
+                        cohort["stock_cutoff"], field="cohort_stock_cutoff"
+                    )
+                    sealed_at = _parse_time(
+                        cohort["sealed_at"], field="cohort_sealed_at"
+                    )
+                    if sealed_at <= cohort_cutoff:
+                        cohort_binding_errors.append("cohort_sealed_before_cutoff")
+                except ValueError as exc:
+                    cohort_binding_errors.append(str(exc))
+                if cohort["schema_version"] != LEARNING_COHORT_SCHEMA_VERSION:
+                    cohort_binding_errors.append("cohort_schema_version_invalid")
+                if cohort_cutoff is not None and cohort_cutoff != cutoff:
+                    cohort_binding_errors.append("cohort_cutoff_mismatch")
+                all_item_rows = [
+                    dict(row)
+                    for row in conn.execute(
+                        """
+                        SELECT cohort_id, work_item_id
+                          FROM rca_learning_lane_stock_items
+                         ORDER BY cohort_id, work_item_id
+                        """
+                    ).fetchall()
+                ]
+                item_rows = [
+                    row for row in all_item_rows if str(row["cohort_id"]) == cohort_id
+                ]
+                if len(item_rows) != len(all_item_rows):
+                    cohort_binding_errors.append("cohort_orphan_stock_item")
+                raw_cohort_stock_ids = [
+                    str(row["work_item_id"] or "") for row in item_rows
+                ]
+                cohort_stock_ids = {
+                    item.strip() for item in raw_cohort_stock_ids if item.strip()
+                }
+                if any(not item.strip() for item in raw_cohort_stock_ids):
+                    cohort_binding_errors.append("cohort_empty_stock_id")
+                if len(cohort_stock_ids) != len(item_rows):
+                    cohort_binding_errors.append("cohort_duplicate_stock_id")
+                if cohort_stock_count != len(item_rows):
+                    cohort_binding_errors.append("cohort_stock_count_mismatch")
+                if cohort_digest != _stock_digest(cohort_stock_ids):
+                    cohort_binding_errors.append("cohort_stock_digest_invalid")
+
         explicit_rerun_keys = {
             key
             for key, bound_sources in bindings.items()
@@ -427,7 +668,23 @@ def audit_w6_guard(
             and effect["created_at_dt"] is not None
             and effect["created_at_dt"] <= cutoff
         }
+        stock_ids_sha256 = _stock_digest(stock_ids)
         stock_count_matches = len(stock_ids) == expected_stock_count
+        stock_digest_matches_expected = (
+            expected_stock_ids_sha256 is not None
+            and stock_ids_sha256 == expected_stock_ids_sha256
+        )
+        stock_cohort_exact = (
+            cohort_schema_ready
+            and not cohort_binding_errors
+            and stock_ids == cohort_stock_ids
+            and stock_ids_sha256 == cohort_digest
+        )
+        cohort_stock_count_matches_expected = cohort_stock_count == expected_stock_count
+        cohort_digest_matches_expected = (
+            expected_stock_ids_sha256 is not None
+            and cohort_digest == expected_stock_ids_sha256
+        )
         post_cutoff_stock_effects = [
             effect
             for effect in feishu_effects
@@ -442,7 +699,8 @@ def audit_w6_guard(
             learning_schema_errors.append("learning_admission_table_missing")
         else:
             missing = sorted(
-                _LEARNING_SCHEMA - _columns(conn, "rca_learning_lane_admissions")
+                (_LEARNING_SCHEMA | _LEARNING_ADMISSION_BINDING_SCHEMA)
+                - _columns(conn, "rca_learning_lane_admissions")
             )
             if missing:
                 learning_schema_errors.append(
@@ -453,7 +711,8 @@ def audit_w6_guard(
                     conn,
                     """
                     SELECT business_key, generation, work_item_id, schema_version,
-                           lane, reason, external_write_allowed, admitted_at
+                           lane, reason, external_write_allowed, cohort_id,
+                           stock_cutoff, stock_ids_sha256, admitted_at
                       FROM rca_learning_lane_admissions
                      ORDER BY business_key, generation
                     """,
@@ -472,8 +731,14 @@ def audit_w6_guard(
                 and trigger is not None
                 and str(row["work_item_id"]) == str(trigger["work_item_id"])
                 and str(row["work_item_id"]) in stock_ids
+                and str(row["cohort_id"] or "") == cohort_id
+                and str(row["stock_ids_sha256"] or "").lower() == cohort_digest
             )
             try:
+                valid = valid and (
+                    _parse_time(row["stock_cutoff"], field="learning_stock_cutoff")
+                    == cutoff
+                )
                 admitted_at = _parse_time(
                     row["admitted_at"], field="learning_admitted_at"
                 )
@@ -629,7 +894,7 @@ def audit_w6_guard(
                 (
                     row
                     for row in rows
-                    if row["status"] == "succeeded"
+                    if _potentially_outward(row)
                     and row.get("created_at_dt") is not None
                     and row.get("result_identity")
                 ),
@@ -653,13 +918,24 @@ def audit_w6_guard(
                     "from_generation": int(previous["generation"]),
                     "from_created_at": previous["created_at_dt"],
                     "from_result_identity": str(previous["result_identity"]),
+                    "from_status": str(previous["status"] or ""),
+                    "from_write_phase": str(previous["write_phase"] or ""),
+                    "from_write_started_at": str(previous["write_started_at"] or ""),
+                    "from_remote_receipt_json": str(
+                        previous["remote_receipt_json"] or ""
+                    ),
                     "to_effect_key": str(current["effect_key"]),
                     "to_generation": int(current["generation"]),
                     "to_created_at": current["created_at_dt"],
                     "to_result_identity": str(current["result_identity"]),
                     "to_replacement_value": str(current["replacement_value"]),
+                    "to_status": str(current["status"] or ""),
+                    "to_write_phase": str(current["write_phase"] or ""),
+                    "to_write_started_at": str(current["write_started_at"] or ""),
+                    "to_remote_receipt_json": str(current["remote_receipt_json"] or ""),
                 })
                 previous = current
+        transition_pairs_sha256 = _transition_digest(transition_rows)
 
         adjudication_schema_errors: list[str] = []
         adjudications: list[dict[str, Any]] = []
@@ -757,6 +1033,15 @@ def audit_w6_guard(
     invariants = {
         "audited_rows_valid": not data_errors,
         "stock_count_matches_expected": stock_count_matches,
+        "stock_digest_expectation_supplied": expected_stock_ids_sha256 is not None,
+        "stock_digest_matches_expected": stock_digest_matches_expected,
+        "stock_cohort_count_matches_expected": cohort_stock_count_matches_expected,
+        "stock_cohort_digest_matches_expected": cohort_digest_matches_expected,
+        "stock_cohort_schema_ready": cohort_schema_ready,
+        "stock_cohort_binding_exact": stock_cohort_exact,
+        "stock_cohort_immutable_triggers": (
+            cohort_schema_ready and not cohort_trigger_errors
+        ),
         "learning_lane_schema_ready": learning_schema_ready,
         "learning_lane_observed": bool(valid_learning_keys),
         "learning_rows_valid": not learning_row_violations,
@@ -785,9 +1070,12 @@ def audit_w6_guard(
             "stock_cutoff": _canonical_time(cutoff),
             "expected_stock_count": expected_stock_count,
             "observed_stock_count": len(stock_ids),
-            "stock_ids_sha256": hashlib.sha256(
-                "\n".join(sorted(stock_ids)).encode("utf-8")
-            ).hexdigest(),
+            "expected_stock_ids_sha256": expected_stock_ids_sha256,
+            "stock_ids_sha256": stock_ids_sha256,
+            "cohort_id": cohort_id or None,
+            "cohort_stock_count": cohort_stock_count,
+            "cohort_stock_ids_sha256": cohort_digest or None,
+            "transition_pairs_sha256": transition_pairs_sha256,
         },
         "legacy_batch": {
             "batch_id": LEGACY_BATCH_ID,
@@ -820,11 +1108,14 @@ def audit_w6_guard(
             "missing_transition_adjudications": len(missing_adjudications),
         },
         "schema_errors": {
+            "stock_cohort": cohort_schema_errors,
             "learning_lane": learning_schema_errors,
             "adjudication": adjudication_schema_errors,
         },
         "violations": {
             "data_errors": data_errors[:_MAX_EVIDENCE_ROWS],
+            "stock_cohort_binding": cohort_binding_errors[:_MAX_EVIDENCE_ROWS],
+            "stock_cohort_triggers": cohort_trigger_errors[:_MAX_EVIDENCE_ROWS],
             "learning_rows": learning_row_violations[:_MAX_EVIDENCE_ROWS],
             "stock_triggers_without_learning": [
                 {"business_key": key[0], "generation": key[1]}
@@ -852,6 +1143,10 @@ def audit_w6_guard(
                 :_MAX_EVIDENCE_ROWS
             ],
         },
+        "transition_pairs": {
+            "count": len(transition_rows),
+            "sha256": transition_pairs_sha256,
+        },
         "latest_stock_comment_samples": samples,
         "invariants": invariants,
         "ok": all(invariants.values()),
@@ -865,6 +1160,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--control-db", type=Path, required=True)
     parser.add_argument("--stock-cutoff", required=True)
     parser.add_argument("--expected-stock-count", type=int, required=True)
+    parser.add_argument(
+        "--expected-stock-ids-sha256",
+        "--expected-stock-digest",
+        dest="expected_stock_ids_sha256",
+    )
     parser.add_argument("--sample-size", type=int, default=5)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
@@ -873,6 +1173,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.control_db,
             stock_cutoff=args.stock_cutoff,
             expected_stock_count=args.expected_stock_count,
+            expected_stock_ids_sha256=args.expected_stock_ids_sha256,
             sample_size=args.sample_size,
         )
     except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
