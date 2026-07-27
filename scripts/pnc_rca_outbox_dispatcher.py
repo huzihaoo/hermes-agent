@@ -440,6 +440,7 @@ class PermanentDispatchError(RuntimeError):
 @dataclass(frozen=True)
 class DispatcherConfig:
     dispatch_enabled: bool
+    activation_required: bool
     control_db_path: Path
     delivery_db_path: Path
     health_path: Path
@@ -630,6 +631,11 @@ class DispatcherConfig:
         )
         config = cls(
             dispatch_enabled=dispatch_enabled,
+            activation_required=_strict_boolean(
+                source,
+                f"{ENV_PREFIX}ACTIVATION_REQUIRED",
+                False,
+            ),
             control_db_path=control_db_path,
             delivery_db_path=delivery_db_path,
             health_path=Path(
@@ -726,6 +732,7 @@ class DispatcherConfig:
     def public_dict(self) -> dict[str, Any]:
         return {
             "dispatch_enabled": self.dispatch_enabled,
+            "activation_required": self.activation_required,
             "control_db_path": str(self.control_db_path),
             "delivery_db_path": str(self.delivery_db_path),
             "health_path": str(self.health_path),
@@ -2294,7 +2301,7 @@ class OutboxDispatcher:
             lease_owner=self.lease_owner,
             lease_seconds=self.config.lease_seconds,
             max_age_seconds=self.config.max_age_seconds,
-            activation_required=False,
+            activation_required=self.config.activation_required,
             now=current,
         )
         if claim is None:
@@ -2695,7 +2702,7 @@ class OutboxDispatcher:
             lease_token=claim.lease_token,
             lease_owner=claim.lease_owner,
             lease_seconds=self.config.lease_seconds,
-            activation_required=False,
+            activation_required=self.config.activation_required,
             now=self.now(),
         )
 
@@ -3534,7 +3541,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.dry_run:
             rows = store.preview_dispatchable(
                 limit=config.batch_size,
-                activation_required=False,
+                activation_required=config.activation_required,
             )
             print(
                 json.dumps(

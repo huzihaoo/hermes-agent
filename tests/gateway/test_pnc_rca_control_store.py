@@ -682,6 +682,17 @@ def test_preproduction_capsule_transition_is_atomic_idempotent_and_exact(tmp_pat
         == PREPRODUCTION_RECEIPT_SHA256
     )
     assert first["preproduction_capsule_sha256"] == PREPRODUCTION_CAPSULE_SHA256
+    empty_hold = store.activation_historical_outbox_hold_evidence(
+        epoch_id=first["epoch_id"]
+    )
+    assert empty_hold["sealed_count"] == empty_hold["current_count"] == 0
+    assert empty_hold["sealed_sha256"] == empty_hold["current_sha256"]
+    assert empty_hold["matches"] is True
+    restarted = RcaControlStore(store.db_path, require_current=True)
+    assert (
+        restarted.activation_historical_outbox_hold_evidence(epoch_id=first["epoch_id"])
+        == empty_hold
+    )
     with pytest.raises(
         ActivationEpochError, match="activation_preproduction_binding_conflict"
     ):
@@ -697,8 +708,15 @@ def test_preproduction_capsule_transition_is_atomic_idempotent_and_exact(tmp_pat
         )
 
 
-def test_activation_state_machine_requires_exact_receipts_and_is_audited(tmp_path):
+def test_activation_state_machine_requires_exact_receipts_and_is_audited(
+    tmp_path, monkeypatch
+):
     store = RcaControlStore(tmp_path / "control.sqlite3")
+    store.ingest_record(
+        _record(offset=10, value=_value(work_item_id=7041712800)),
+        policy=_policy(),
+        submit_enabled=True,
+    )
     _create_activation_epoch(store)
 
     with pytest.raises(
@@ -753,7 +771,9 @@ def test_activation_state_machine_requires_exact_receipts_and_is_audited(tmp_pat
         activation_required=True,
     )
     assert {kafka.submission_key, success.submission_key, terminal.submission_key} == {
-        row["submission_key"] for row in store.list_rows("rca_outbox")
+        row["submission_key"]
+        for row in store.list_rows("rca_outbox")
+        if row["activation_epoch_id"] == "rca-release-20260712"
     }
 
     for index in range(3):
@@ -800,8 +820,30 @@ def test_activation_state_machine_requires_exact_receipts_and_is_audited(tmp_pat
 
     bounded = store.activation_epoch()
     assert bounded is not None
+    release_bindings = []
+    canonical_sha256 = control_store_module._canonical_sha256
+
+    def capture_release_binding(value):
+        if isinstance(value, dict) and "historical_hold_sha256" in value:
+            release_bindings.append(value)
+        return canonical_sha256(value)
+
+    monkeypatch.setattr(
+        control_store_module, "_canonical_sha256", capture_release_binding
+    )
     confirmation_preconditions = _confirmation_preconditions(
         store, {TOPIC: {"2": 21}}
+    )
+    historical_hold = store.activation_historical_outbox_hold_evidence(
+        epoch_id="rca-release-20260712"
+    )
+    assert release_bindings[-1]["historical_hold_count"] == 1
+    assert (
+        release_bindings[-1]["historical_hold_sha256"]
+        == historical_hold["sealed_sha256"]
+    )
+    assert release_bindings[-1]["historical_hold_row_schema_version"] == (
+        "pnc_rca_activation_historical_outbox_row_v1"
     )
     with pytest.raises(
         ActivationEpochError,
@@ -1519,10 +1561,15 @@ def test_safe_off_epoch_claims_no_work_and_does_not_age_history(
         _record(offset=10), policy=_policy(), submit_enabled=True
     )
     _create_activation_epoch(store, preauthorize=False)
-    with pytest.raises(
-        ActivationEpochError, match="activation_preproduction_effects_not_held"
-    ):
-        _create_activation_epoch(store)
+    _create_activation_epoch(store)
+
+    evidence = store.activation_historical_outbox_hold_evidence(
+        epoch_id="rca-release-20260712"
+    )
+    assert evidence["sealed_count"] == evidence["current_count"] == 1
+    assert evidence["sealed_sha256"] == evidence["current_sha256"]
+    assert evidence["matches"] is True
+    assert store.dispatch_backlog_count() == 0
 
     claim = store.claim_outbox(
         lease_owner="activation-dispatcher",
@@ -1537,6 +1584,626 @@ def test_safe_off_epoch_claims_no_work_and_does_not_age_history(
         if row["submission_key"] == legacy.submission_key
     )
     assert legacy_outbox["status"] == "pending"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        (
+            "UPDATE rca_outbox SET status = 'claimed'",
+            "activation_historical_hold_outbox_claimed",
+        ),
+        (
+            "UPDATE rca_outbox SET status = 'shadow'",
+            "activation_historical_hold_outbox_shadow",
+        ),
+        (
+            "UPDATE rca_outbox SET lease_token = 'stale-lease'",
+            "activation_historical_hold_outbox_leased",
+        ),
+        (
+            "UPDATE rca_outbox SET source_topic = NULL, "
+            "source_partition = NULL, source_offset = NULL",
+            "activation_historical_hold_outbox_manual",
+        ),
+        (
+            "UPDATE rca_outbox SET source_topic = 'unfenced-topic'",
+            "activation_historical_hold_outbox_unfenced",
+        ),
+        (
+            "UPDATE rca_outbox SET source_offset = 20",
+            "activation_historical_hold_outbox_at_or_after_start_fence",
+        ),
+        (
+            "UPDATE rca_outbox SET activation_epoch_id = 'other-epoch'",
+            "activation_historical_hold_outbox_activation_bound",
+        ),
+    ],
+)
+def test_historical_hold_preauthorization_rejects_inexact_active_rows(
+    tmp_path,
+    mutation,
+    error,
+):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    store.ingest_record(_record(offset=10), policy=_policy(), submit_enabled=True)
+    _create_activation_epoch(store, preauthorize=False)
+    conn = store._connect()
+    try:
+        conn.execute(mutation)
+    finally:
+        conn.close()
+
+    with pytest.raises(ActivationEpochError, match=error):
+        _create_activation_epoch(store)
+
+    assert store.list_rows("rca_activation_historical_outbox_holds") == []
+
+
+def test_historical_hold_requires_drained_inbox_and_empty_current_ledger(tmp_path):
+    pending_store = RcaControlStore(tmp_path / "pending.sqlite3")
+    pending_store.ingest_record(
+        _record(offset=10), policy=_policy(), submit_enabled=True
+    )
+    _create_activation_epoch(pending_store, preauthorize=False)
+    conn = pending_store._connect()
+    try:
+        conn.execute("UPDATE kafka_inbox SET decision = 'pending'")
+    finally:
+        conn.close()
+    with pytest.raises(
+        ActivationEpochError,
+        match="activation_historical_hold_pending_inbox",
+    ):
+        _create_activation_epoch(pending_store)
+
+    ledger_store = RcaControlStore(tmp_path / "ledger.sqlite3")
+    _create_activation_epoch(ledger_store, preauthorize=False)
+    held = _adjudicate_activation(
+        ledger_store,
+        entrypoint="kafka_ingest",
+        source_kind="kafka",
+        source_identity={"event_uid": f"{TOPIC}:2:20"},
+        business_key="held-business",
+        submission_key="held-submission",
+        generation=1,
+        new_execution=True,
+        activation_required=True,
+    )
+    assert held.decision == "shadow"
+    with pytest.raises(
+        ActivationEpochError,
+        match="activation_historical_hold_current_ledger",
+    ):
+        _create_activation_epoch(ledger_store)
+
+
+def test_historical_hold_is_immutable_and_idempotent_revalidation_detects_addition(
+    tmp_path,
+):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    store.ingest_record(
+        _record(offset=10, value=_value(work_item_id=7041712800)),
+        policy=_policy(),
+        submit_enabled=True,
+    )
+    first = _create_activation_epoch(store)
+    original = store.list_rows("rca_outbox")[0]
+
+    evidence = store.activation_historical_outbox_hold_evidence(
+        epoch_id=first["epoch_id"]
+    )
+    assert evidence["sealed_count"] == evidence["current_count"] == 1
+    assert evidence["matches"] is True
+    assert "7041712800" not in json.dumps(evidence, sort_keys=True)
+
+    conn = store._connect()
+    try:
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="activation_historical_outbox_update_forbidden",
+        ):
+            conn.execute(
+                "UPDATE rca_outbox SET updated_at = updated_at WHERE outbox_id = ?",
+                (original["outbox_id"],),
+            )
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="activation_historical_outbox_delete_forbidden",
+        ):
+            conn.execute(
+                "DELETE FROM rca_outbox WHERE outbox_id = ?",
+                (original["outbox_id"],),
+            )
+
+        clone = dict(original)
+        clone.pop("outbox_id")
+        clone["submission_key"] = f"{original['submission_key']}-added"
+        columns = tuple(clone)
+        conn.execute(
+            f"INSERT INTO rca_outbox({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' for _ in columns)})",
+            tuple(clone[column] for column in columns),
+        )
+    finally:
+        conn.close()
+
+    drift = store.activation_historical_outbox_hold_evidence(epoch_id=first["epoch_id"])
+    assert drift["sealed_count"] == 1
+    assert drift["current_count"] == 2
+    assert drift["matches"] is False
+    with pytest.raises(
+        ActivationEpochError,
+        match="activation_historical_hold_cohort_changed",
+    ):
+        _create_activation_epoch(store)
+
+
+def test_historical_hold_rejects_forged_current_epoch_binding_before_bounded(
+    tmp_path,
+):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    store.ingest_record(
+        _record(offset=10, value=_value(work_item_id=7041712800)),
+        policy=_policy(),
+        submit_enabled=True,
+    )
+    epoch = _create_activation_epoch(store)
+    original = store.list_rows("rca_outbox")[0]
+    conn = store._connect()
+    try:
+        clone = dict(original)
+        clone.pop("outbox_id")
+        clone["submission_key"] = f"{original['submission_key']}-forged-current"
+        clone["activation_epoch_id"] = epoch["epoch_id"]
+        clone["activation_ledger_id"] = 999_999
+        columns = tuple(clone)
+        conn.execute(
+            f"INSERT INTO rca_outbox({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' for _ in columns)})",
+            tuple(clone[column] for column in columns),
+        )
+    finally:
+        conn.close()
+
+    with pytest.raises(
+        ActivationEpochError,
+        match="activation_historical_hold_current_epoch_binding_invalid",
+    ):
+        store.activation_historical_outbox_hold_evidence(epoch_id=epoch["epoch_id"])
+    _authorize_activation_slots(store)
+    with pytest.raises(
+        ActivationEpochError,
+        match="activation_historical_hold_current_epoch_binding_invalid",
+    ):
+        store.transition_activation_epoch(
+            epoch_id=epoch["epoch_id"],
+            expected_state="preauthorized",
+            target_state="bounded_active",
+            operator="release-test",
+            reason="forged current binding must not cross the bounded gate",
+        )
+
+
+def test_historical_hold_schema_rejects_same_name_noop_trigger(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    store = RcaControlStore(path)
+    conn = store._connect()
+    try:
+        conn.execute("DROP TRIGGER trg_activation_historical_outbox_no_update")
+        conn.execute(
+            "CREATE TRIGGER trg_activation_historical_outbox_no_update "
+            "BEFORE UPDATE ON rca_outbox BEGIN SELECT 1; END"
+        )
+    finally:
+        conn.close()
+
+    with pytest.raises(
+        RuntimeError,
+        match="incompatible_control_store_schema:historical_outbox_hold_trigger_sql",
+    ):
+        RcaControlStore(path, require_current=True)
+
+
+@pytest.mark.parametrize(
+    ("insert_sql", "error"),
+    [
+        (
+            "INSERT INTO rca_activation_historical_outbox_hold_items("
+            "epoch_id, outbox_id, row_sha256, immutable_row_sha256"
+            ") SELECT 'missing-epoch', outbox_id, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', "
+            "'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' "
+            "FROM rca_outbox LIMIT 1",
+            "historical_outbox_hold_item_orphan",
+        ),
+        (
+            "INSERT INTO rca_activation_historical_outbox_disposition_items("
+            "disposition_id, outbox_id, row_sha256, immutable_row_sha256"
+            ") SELECT 'missing-disposition', outbox_id, "
+            "'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', "
+            "'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' "
+            "FROM rca_outbox LIMIT 1",
+            "historical_outbox_disposition_item_orphan",
+        ),
+    ],
+)
+def test_historical_hold_schema_rejects_orphan_items(
+    tmp_path,
+    insert_sql,
+    error,
+):
+    path = tmp_path / "control.sqlite3"
+    store = RcaControlStore(path)
+    store.ingest_record(_record(offset=10), policy=_policy(), submit_enabled=True)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute(insert_sql)
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(
+        RuntimeError,
+        match=f"incompatible_control_store_schema:{error}",
+    ):
+        RcaControlStore(path, require_current=True)
+
+
+def test_historical_hold_row_hash_ignores_future_additive_columns(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    store = RcaControlStore(path)
+    store.ingest_record(
+        _record(offset=10), policy=_policy(), submit_enabled=True
+    )
+    epoch = _create_activation_epoch(store)
+    before = store.activation_historical_outbox_hold_evidence(
+        epoch_id=epoch["epoch_id"]
+    )
+    conn = store._connect()
+    try:
+        conn.execute("ALTER TABLE rca_outbox ADD COLUMN future_additive_field TEXT")
+    finally:
+        conn.close()
+
+    restarted = RcaControlStore(path, require_current=True)
+    after = restarted.activation_historical_outbox_hold_evidence(
+        epoch_id=epoch["epoch_id"]
+    )
+    assert after == before
+
+
+def test_historical_hold_steady_allowlist_never_selects_sealed_rows(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    legacy = store.ingest_record(
+        _record(offset=10), policy=_policy(), submit_enabled=True
+    )
+    epoch = _create_activation_epoch(store)
+    conn = store._connect()
+    try:
+        conn.execute(
+            "UPDATE rca_activation_epochs SET state = 'steady_active' "
+            "WHERE epoch_id = ?",
+            (epoch["epoch_id"],),
+        )
+    finally:
+        conn.close()
+
+    assert store.preview_dispatchable(
+        activation_required=True,
+        historical_submission_allowlist=[legacy.submission_key],
+    ) == []
+    assert store.claim_outbox(
+        lease_owner="held-allowlist-test",
+        activation_required=True,
+        historical_submission_allowlist=[legacy.submission_key],
+    ) is None
+
+
+def test_historical_hold_owner_disposition_is_exact_immutable_and_non_replayable(
+    tmp_path,
+):
+    path = tmp_path / "control.sqlite3"
+    store = RcaControlStore(path)
+    legacy = store.ingest_record(
+        _record(offset=10), policy=_policy(), submit_enabled=True
+    )
+    epoch = _create_activation_epoch(store)
+    evidence = store.activation_historical_outbox_hold_evidence(
+        epoch_id=epoch["epoch_id"]
+    )
+    kwargs = {
+        "epoch_id": epoch["epoch_id"],
+        "expected_cohort_count": evidence["sealed_count"],
+        "expected_cohort_sha256": evidence["sealed_sha256"],
+        "owner_authorized": True,
+        "operator": "owner-ou-test",
+        "reason": "owner-approved exact historical isolation",
+        "now": datetime(2026, 7, 27, 5, 0, tzinfo=timezone.utc),
+    }
+    with pytest.raises(
+        ActivationEpochError,
+        match="activation_historical_disposition_epoch_not_aborted",
+    ):
+        store.dispose_activation_historical_outbox_hold(**kwargs)
+    store.transition_activation_epoch(
+        epoch_id=epoch["epoch_id"],
+        expected_state="preauthorized",
+        target_state="aborted",
+        operator="release-test",
+        reason="abort before governed historical disposition",
+    )
+    with pytest.raises(
+        ActivationEpochError,
+        match="activation_historical_disposition_owner_authorization_required",
+    ):
+        store.dispose_activation_historical_outbox_hold(
+            **{**kwargs, "owner_authorized": False}
+        )
+    with pytest.raises(
+        ActivationEpochError,
+        match="activation_historical_disposition_cohort_binding_changed",
+    ):
+        store.dispose_activation_historical_outbox_hold(
+            **{**kwargs, "expected_cohort_count": evidence["sealed_count"] + 1}
+        )
+    with pytest.raises(
+        ActivationEpochError,
+        match="activation_historical_disposition_cohort_binding_changed",
+    ):
+        store.dispose_activation_historical_outbox_hold(
+            **{**kwargs, "expected_cohort_sha256": "f" * 64}
+        )
+
+    disposed = store.dispose_activation_historical_outbox_hold(**kwargs)
+    assert disposed == store.dispose_activation_historical_outbox_hold(**kwargs)
+    assert disposed["cohort_count"] == 1
+    assert disposed["cohort_sha256"] == evidence["sealed_sha256"]
+    assert disposed["epoch_state"] == "aborted"
+    assert disposed["owner_authorized"] is True
+    [outbox] = store.list_rows("rca_outbox")
+    assert outbox["submission_key"] == legacy.submission_key
+    assert outbox["status"] == "quarantined"
+    assert outbox["last_error_code"] == "activation_historical_hold_owner_disposed"
+    [trigger] = store.list_rows("business_triggers")
+    assert trigger["state"] == "quarantined"
+    [audit] = store.list_rows("rca_activation_historical_outbox_dispositions")
+    [audit_item] = store.list_rows(
+        "rca_activation_historical_outbox_disposition_items"
+    )
+    [hold_item] = store.list_rows("rca_activation_historical_outbox_hold_items")
+    assert audit["disposition_id"] == audit_item["disposition_id"]
+    assert audit_item["outbox_id"] == hold_item["outbox_id"]
+    assert audit_item["row_sha256"] == hold_item["row_sha256"]
+
+    conn = store._connect()
+    try:
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="activation_historical_disposed_outbox_update_forbidden",
+        ):
+            conn.execute(
+                "UPDATE rca_outbox SET status = 'pending' WHERE outbox_id = ?",
+                (outbox["outbox_id"],),
+            )
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="activation_historical_outbox_delete_forbidden",
+        ):
+            conn.execute(
+                "DELETE FROM rca_outbox WHERE outbox_id = ?",
+                (outbox["outbox_id"],),
+            )
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="activation_historical_disposition_update_forbidden",
+        ):
+            conn.execute(
+                "UPDATE rca_activation_historical_outbox_dispositions "
+                "SET reason = reason"
+            )
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="activation_historical_disposition_item_update_forbidden",
+        ):
+            conn.execute(
+                "UPDATE rca_activation_historical_outbox_disposition_items "
+                "SET row_sha256 = row_sha256"
+            )
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="activation_historical_disposition_item_delete_forbidden",
+        ):
+            conn.execute(
+                "DELETE FROM rca_activation_historical_outbox_disposition_items"
+            )
+    finally:
+        conn.close()
+    with pytest.raises(
+        ActivationEpochError,
+        match="activation_historical_disposition_binding_conflict",
+    ):
+        store.dispose_activation_historical_outbox_hold(
+            **{**kwargs, "reason": "conflicting owner disposition retry"}
+        )
+    restarted = RcaControlStore(path, require_current=True)
+    assert restarted.list_rows("rca_outbox")[0]["status"] == "quarantined"
+    assert restarted.claim_outbox(
+        lease_owner="disposed-must-never-replay", activation_required=True
+    ) is None
+
+
+def test_empty_historical_hold_can_be_owner_disposed_after_abort(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    epoch = _create_activation_epoch(store)
+    evidence = store.activation_historical_outbox_hold_evidence(
+        epoch_id=epoch["epoch_id"]
+    )
+    store.transition_activation_epoch(
+        epoch_id=epoch["epoch_id"],
+        expected_state="preauthorized",
+        target_state="aborted",
+        operator="release-test",
+        reason="abort empty historical cohort",
+    )
+    disposed = store.dispose_activation_historical_outbox_hold(
+        epoch_id=epoch["epoch_id"],
+        expected_cohort_count=0,
+        expected_cohort_sha256=evidence["sealed_sha256"],
+        owner_authorized=True,
+        operator="owner-ou-test",
+        reason="close empty historical cohort",
+    )
+    assert disposed["cohort_count"] == 0
+    assert store.list_rows(
+        "rca_activation_historical_outbox_disposition_items"
+    ) == []
+
+
+def test_owner_disposition_covers_identical_holds_from_superseded_aborted_epochs(
+    tmp_path,
+):
+    path = tmp_path / "control.sqlite3"
+    store = RcaControlStore(path)
+    store.ingest_record(_record(offset=10), policy=_policy(), submit_enabled=True)
+    first = _create_activation_epoch(store)
+    store.transition_activation_epoch(
+        epoch_id=first["epoch_id"],
+        expected_state="preauthorized",
+        target_state="aborted",
+        operator="release-test",
+        reason="abort first exact hold",
+    )
+    second = _create_activation_epoch(
+        store,
+        epoch_id="rca-release-20260712-retry",
+    )
+    second_evidence = store.activation_historical_outbox_hold_evidence(
+        epoch_id=second["epoch_id"]
+    )
+    store.transition_activation_epoch(
+        epoch_id=second["epoch_id"],
+        expected_state="preauthorized",
+        target_state="aborted",
+        operator="release-test",
+        reason="abort second exact hold",
+    )
+
+    disposed = store.dispose_activation_historical_outbox_hold(
+        epoch_id=second["epoch_id"],
+        expected_cohort_count=second_evidence["sealed_count"],
+        expected_cohort_sha256=second_evidence["sealed_sha256"],
+        owner_authorized=True,
+        operator="owner-ou-test",
+        reason="isolate identical historical cohort after both epochs aborted",
+    )
+
+    assert disposed["cohort_count"] == 1
+    dispositions = store.list_rows(
+        "rca_activation_historical_outbox_dispositions"
+    )
+    assert {row["epoch_id"] for row in dispositions} == {
+        first["epoch_id"],
+        second["epoch_id"],
+    }
+    assert {row["epoch_state"] for row in dispositions} == {"aborted"}
+    disposition_items = store.list_rows(
+        "rca_activation_historical_outbox_disposition_items"
+    )
+    assert len(disposition_items) == 2
+    assert len({row["outbox_id"] for row in disposition_items}) == 1
+    assert len({row["row_sha256"] for row in disposition_items}) == 1
+    assert len({row["immutable_row_sha256"] for row in disposition_items}) == 1
+    restarted = RcaControlStore(path, require_current=True)
+    assert restarted.list_rows("rca_outbox")[0]["status"] == "quarantined"
+
+    conn = restarted._connect()
+    try:
+        restarted._drop_v13_historical_outbox_hold_triggers(conn)
+        first_disposition_id = next(
+            row["disposition_id"]
+            for row in dispositions
+            if row["epoch_id"] == first["epoch_id"]
+        )
+        conn.execute(
+            "DELETE FROM rca_activation_historical_outbox_disposition_items "
+            "WHERE disposition_id = ?",
+            (first_disposition_id,),
+        )
+        conn.execute(
+            "DELETE FROM rca_activation_historical_outbox_dispositions "
+            "WHERE disposition_id = ?",
+            (first_disposition_id,),
+        )
+        restarted._create_v13_historical_outbox_hold_schema(conn)
+    finally:
+        conn.close()
+    with pytest.raises(
+        RuntimeError,
+        match="incompatible_control_store_schema:historical_outbox_hold_row_binding",
+    ):
+        RcaControlStore(path, require_current=True)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        (
+            "UPDATE rca_outbox SET payload_json = 'offline-corruption'",
+            "historical_outbox_disposition_row_binding",
+        ),
+        (
+            "UPDATE rca_outbox SET next_attempt_at = '2026-07-28T00:00:00+00:00'",
+            "historical_outbox_disposition_row_binding",
+        ),
+        (
+            "UPDATE rca_activation_epochs SET state = 'steady_active' "
+            "WHERE epoch_id = 'rca-release-20260712'",
+            "historical_outbox_disposition_epoch_state",
+        ),
+    ],
+)
+def test_disposed_historical_hold_restart_rejects_audit_drift(
+    tmp_path,
+    mutation,
+    error,
+):
+    path = tmp_path / "control.sqlite3"
+    store = RcaControlStore(path)
+    store.ingest_record(_record(offset=10), policy=_policy(), submit_enabled=True)
+    epoch = _create_activation_epoch(store)
+    evidence = store.activation_historical_outbox_hold_evidence(
+        epoch_id=epoch["epoch_id"]
+    )
+    store.transition_activation_epoch(
+        epoch_id=epoch["epoch_id"],
+        expected_state="preauthorized",
+        target_state="aborted",
+        operator="release-test",
+        reason="abort before audit-drift test",
+    )
+    store.dispose_activation_historical_outbox_hold(
+        epoch_id=epoch["epoch_id"],
+        expected_cohort_count=evidence["sealed_count"],
+        expected_cohort_sha256=evidence["sealed_sha256"],
+        owner_authorized=True,
+        operator="owner-ou-test",
+        reason="seal exact disposition before audit-drift test",
+    )
+    conn = store._connect()
+    try:
+        store._drop_v13_historical_outbox_hold_triggers(conn)
+        conn.execute(mutation)
+        store._create_v13_historical_outbox_hold_schema(conn)
+    finally:
+        conn.close()
+
+    with pytest.raises(
+        RuntimeError,
+        match=f"incompatible_control_store_schema:{error}",
+    ):
+        RcaControlStore(path, require_current=True)
 
 
 def test_held_epoch_claim_has_no_historical_age_quarantine_side_effect(tmp_path):
@@ -5702,12 +6369,48 @@ V11_SNAPSHOT_TABLES = {
     "rca_source_authority_receipts",
     "rca_snapshot_source_envelopes",
 }
+V12_LEARNING_TABLES = {
+    "rca_learning_lane_admissions",
+    "rca_learning_lane_stock_items",
+    "rca_learning_lane_cohorts",
+}
+V13_HISTORICAL_HOLD_TABLES = {
+    "rca_activation_historical_outbox_disposition_items",
+    "rca_activation_historical_outbox_dispositions",
+    "rca_activation_historical_outbox_hold_items",
+    "rca_activation_historical_outbox_holds",
+}
+
+
+def _drop_schema_objects(conn, *, tables):
+    tables = tuple(tables)
+    drop_learning = bool(set(tables) & V12_LEARNING_TABLES)
+    drop_historical = bool(set(tables) & V13_HISTORICAL_HOLD_TABLES)
+    conn.execute("PRAGMA foreign_keys=OFF")
+    for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+    ).fetchall():
+        name = str(row["name"])
+        if (
+            drop_learning and name.startswith("trg_learning_lane_")
+        ) or (
+            drop_historical and name.startswith("trg_activation_historical_")
+        ):
+            conn.execute(f"DROP TRIGGER {name}")
+    for table in tables:
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
 
 
 def _downgrade_current_store_to_v10(store):
     conn = store._connect()
     try:
-        conn.execute("PRAGMA foreign_keys=OFF")
+        _drop_schema_objects(
+            conn,
+            tables=(
+                *V13_HISTORICAL_HOLD_TABLES,
+                *V12_LEARNING_TABLES,
+            ),
+        )
         for table in (
             "rca_snapshot_source_envelopes",
             "rca_admission_snapshots",
@@ -5721,6 +6424,225 @@ def _downgrade_current_store_to_v10(store):
         )
     finally:
         conn.close()
+
+
+def _downgrade_current_store_to_v12(store):
+    conn = store._connect()
+    try:
+        _drop_schema_objects(conn, tables=V13_HISTORICAL_HOLD_TABLES)
+        conn.execute(
+            "UPDATE control_meta SET value='pnc_rca_control_store_v12' "
+            "WHERE key='schema_version'"
+        )
+    finally:
+        conn.close()
+
+
+def _downgrade_current_store_to_v11(store):
+    conn = store._connect()
+    try:
+        _drop_schema_objects(
+            conn,
+            tables=(
+                *V13_HISTORICAL_HOLD_TABLES,
+                *V12_LEARNING_TABLES,
+            ),
+        )
+        conn.execute(
+            "UPDATE control_meta SET value='pnc_rca_control_store_v11' "
+            "WHERE key='schema_version'"
+        )
+    finally:
+        conn.close()
+
+
+def test_v11_store_migrates_through_v12_to_v13(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    _downgrade_current_store_to_v11(RcaControlStore(path))
+
+    upgraded = RcaControlStore(path)
+
+    assert upgraded.health()["schema_version"] == CONTROL_STORE_SCHEMA_VERSION
+    assert upgraded.initialization_observation() == {
+        "mode": "migration",
+        "backfill_runs": 0,
+    }
+    assert all(
+        upgraded.list_rows(table) == []
+        for table in (*V12_LEARNING_TABLES, *V13_HISTORICAL_HOLD_TABLES)
+    )
+
+
+def test_v12_store_migrates_to_v13_historical_hold_schema(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    original = RcaControlStore(path)
+    accepted = original.ingest_record(
+        _record(offset=10), policy=_policy(), submit_enabled=True
+    )
+    _downgrade_current_store_to_v12(original)
+
+    upgraded = RcaControlStore(path)
+
+    assert upgraded.health()["schema_version"] == CONTROL_STORE_SCHEMA_VERSION
+    assert upgraded.initialization_observation() == {
+        "mode": "migration",
+        "backfill_runs": 0,
+    }
+    assert upgraded.list_rows("rca_outbox")[0]["submission_key"] == (
+        accepted.submission_key
+    )
+    assert all(
+        upgraded.list_rows(table) == [] for table in V13_HISTORICAL_HOLD_TABLES
+    )
+
+
+def test_v12_prototype_sealed_hold_migrates_without_rehashing_rows(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    store = RcaControlStore(path)
+    store.ingest_record(_record(offset=10), policy=_policy(), submit_enabled=True)
+    epoch = _create_activation_epoch(store)
+    before = store.activation_historical_outbox_hold_evidence(
+        epoch_id=epoch["epoch_id"]
+    )
+    conn = store._connect()
+    try:
+        store._drop_v13_historical_outbox_hold_triggers(conn)
+        conn.execute(
+            "DROP TABLE rca_activation_historical_outbox_disposition_items"
+        )
+        conn.execute("DROP TABLE rca_activation_historical_outbox_dispositions")
+        conn.execute(
+            "UPDATE control_meta SET value='pnc_rca_control_store_v12' "
+            "WHERE key='schema_version'"
+        )
+    finally:
+        conn.close()
+
+    upgraded = RcaControlStore(path)
+    after = upgraded.activation_historical_outbox_hold_evidence(
+        epoch_id=epoch["epoch_id"]
+    )
+    assert upgraded.health()["schema_version"] == CONTROL_STORE_SCHEMA_VERSION
+    assert after["sealed_sha256"] == before["sealed_sha256"]
+    assert after["matches"] is True
+
+
+def test_v12_to_v13_migration_rolls_back_ddl_and_marker_on_validation_failure(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "control.sqlite3"
+    _downgrade_current_store_to_v12(RcaControlStore(path))
+
+    def reject_migrated_schema(_conn, *, integrity_check):
+        assert integrity_check is True
+        raise RuntimeError("injected_v13_schema_validation_failure")
+
+    monkeypatch.setattr(
+        RcaControlStore,
+        "_validate_structural_contract",
+        staticmethod(reject_migrated_schema),
+    )
+    with pytest.raises(
+        RuntimeError, match="injected_v13_schema_validation_failure"
+    ):
+        RcaControlStore(path)
+
+    conn = sqlite3.connect(path)
+    try:
+        marker = conn.execute(
+            "SELECT value FROM control_meta WHERE key='schema_version'"
+        ).fetchone()[0]
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+    assert marker == "pnc_rca_control_store_v12"
+    assert tables.isdisjoint(V13_HISTORICAL_HOLD_TABLES)
+
+
+def test_v12_to_v13_migration_rejects_incomplete_v12_learning_schema(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    store = RcaControlStore(path)
+    conn = store._connect()
+    try:
+        _drop_schema_objects(
+            conn,
+            tables=(*V13_HISTORICAL_HOLD_TABLES, *V12_LEARNING_TABLES),
+        )
+        conn.execute(
+            "UPDATE control_meta SET value='pnc_rca_control_store_v12' "
+            "WHERE key='schema_version'"
+        )
+    finally:
+        conn.close()
+
+    with pytest.raises(
+        RuntimeError,
+        match="incompatible_control_store_schema:rca_learning_lane_cohorts_columns",
+    ):
+        RcaControlStore(path)
+
+    conn = sqlite3.connect(path)
+    try:
+        marker = conn.execute(
+            "SELECT value FROM control_meta WHERE key='schema_version'"
+        ).fetchone()[0]
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+    assert marker == "pnc_rca_control_store_v12"
+    assert tables.isdisjoint(V13_HISTORICAL_HOLD_TABLES)
+
+
+@pytest.mark.parametrize(
+    ("tables", "error"),
+    [
+        (
+            V13_HISTORICAL_HOLD_TABLES,
+            "historical_outbox_hold_table_sql",
+        ),
+        (
+            V12_LEARNING_TABLES,
+            "rca_learning_lane_cohorts_columns",
+        ),
+    ],
+)
+def test_v13_marker_requires_complete_predecessor_and_current_schema(
+    tmp_path,
+    tables,
+    error,
+):
+    path = tmp_path / "control.sqlite3"
+    store = RcaControlStore(path)
+    conn = store._connect()
+    try:
+        _drop_schema_objects(conn, tables=tables)
+        with pytest.raises(
+            RuntimeError,
+            match=f"incompatible_control_store_schema:{error}",
+        ):
+            RcaControlStore._validate_structural_contract(
+                conn,
+                integrity_check=False,
+            )
+    finally:
+        conn.close()
+
+    with pytest.raises(
+        RuntimeError,
+        match=f"incompatible_control_store_schema:{error}",
+    ):
+        RcaControlStore(path, require_current=True)
 
 
 def test_v10_store_migrates_to_empty_inert_v11_snapshot_schema(tmp_path):

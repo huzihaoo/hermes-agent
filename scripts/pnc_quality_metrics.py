@@ -714,7 +714,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     mode.add_argument("--input", help="offline JSON/JSONL observations")
     mode.add_argument(
         "--control-db",
-        help="checkpointed control v11/v12 + delivery v9 SQLite snapshot",
+        help="checkpointed control v11/v12/v13 + delivery v9 SQLite snapshot",
     )
     parser.add_argument("--release-id")
     parser.add_argument("--pipeline-commit")

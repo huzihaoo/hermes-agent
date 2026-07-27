@@ -405,6 +405,7 @@ def expected_remote_css_runtime_dependency() -> dict[str, str]:
 @dataclass(frozen=True)
 class CollectorConfig:
     enabled: bool
+    activation_required: bool
     control_db_path: Path
     health_path: Path
     poll_interval_seconds: int
@@ -525,6 +526,11 @@ class CollectorConfig:
         )
         return cls(
             enabled=enabled,
+            activation_required=_strict_boolean(
+                source,
+                f"{ENV_PREFIX}ACTIVATION_REQUIRED",
+                False,
+            ),
             control_db_path=control_db_path,
             health_path=Path(
                 source.get(
@@ -589,6 +595,7 @@ class CollectorConfig:
     def public_dict(self) -> dict[str, Any]:
         return {
             "enabled": self.enabled,
+            "activation_required": self.activation_required,
             "control_db_path": str(self.control_db_path),
             "health_path": str(self.health_path),
             "poll_interval_seconds": self.poll_interval_seconds,
@@ -2158,7 +2165,7 @@ class DeliveryCollector:
         inserted = self.store.backfill_completed_submissions(
             limit=self.config.backfill_batch_size,
             now=self.now(),
-            activation_required=False,
+            activation_required=self.config.activation_required,
         )
         self.stats.watches_created += inserted
         return inserted
@@ -2461,7 +2468,7 @@ class DeliveryCollector:
                 terminal_fallback=terminal_fallback,
                 runtime_identity=self.runtime_identity,
                 now=self.now(),
-                activation_required=False,
+                activation_required=self.config.activation_required,
             )
         except StaleDeliveryWatchLeaseError:
             self.stats.stale_lease += 1
@@ -2617,7 +2624,7 @@ class DeliveryCollector:
             lease_owner=self.lease_owner,
             lease_seconds=self.config.lease_seconds,
             now=self.now(),
-            activation_required=False,
+            activation_required=self.config.activation_required,
         )
         if claim is None:
             self.stats.idle += 1
@@ -2955,7 +2962,7 @@ class DeliveryCollector:
                 status=status,
                 runtime_identity=self.runtime_identity,
                 now=self.now(),
-                activation_required=False,
+                activation_required=self.config.activation_required,
             )
         except StaleDeliveryWatchLeaseError:
             self.stats.stale_lease += 1
@@ -3193,7 +3200,7 @@ class DeliveryCollector:
     def dry_run_once(self) -> dict[str, Any]:
         rows = self.store.preview_unwatched_completed(
             limit=self.config.backfill_batch_size,
-            activation_required=False,
+            activation_required=self.config.activation_required,
         )
         previews: list[dict[str, Any]] = []
         for row in rows[: self.config.batch_size]:
@@ -3405,7 +3412,7 @@ class HealthReporter:
         if refresh_dependencies:
             self._refresh_dependencies()
         store_health = self.store.health(
-            activation_required=False,
+            activation_required=self.config.activation_required,
             quarantine_baseline_path=self.config.quarantine_baseline_path,
             expected_quarantine_baseline_sha256=(
                 self.config.quarantine_baseline_sha256

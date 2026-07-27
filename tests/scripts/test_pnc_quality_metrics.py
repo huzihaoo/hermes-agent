@@ -1087,14 +1087,19 @@ def test_sqlite_cli_feeds_existing_daily_report(
     assert report["source"]["wal_created"] is False
 
 
-def test_sqlite_observation_accepts_integrated_control_v12(
+@pytest.mark.parametrize(
+    "control_schema_version",
+    ["pnc_rca_control_store_v12", "pnc_rca_control_store_v13"],
+)
+def test_sqlite_observation_accepts_integrated_control_schema(
     sqlite_observation_fixture: tuple[Path, Path],
+    control_schema_version: str,
 ) -> None:
     db_path, golden_path = sqlite_observation_fixture
     conn = sqlite3.connect(db_path)
     conn.execute(
-        "UPDATE control_meta SET value = 'pnc_rca_control_store_v12' "
-        "WHERE key = 'schema_version'"
+        "UPDATE control_meta SET value = ? WHERE key = 'schema_version'",
+        (control_schema_version,),
     )
     conn.commit()
     conn.close()

@@ -365,6 +365,22 @@ def test_clean_strict_ten_pair_audit_allows_only_source_and_anchor_diffs(
     )
 
 
+def test_current_v13_control_schema_is_accepted(tmp_path: Path) -> None:
+    path = _database(tmp_path, pairs=10)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "UPDATE control_meta SET value = 'pnc_rca_control_store_v13' "
+            "WHERE key = 'schema_version'"
+        )
+
+    result = audit.audit_w3_shadow(path, strict_acceptance=True)
+
+    assert result["ok"] is True
+    assert result["control_db"]["control_schema_version"] == (
+        "pnc_rca_control_store_v13"
+    )
+
+
 def test_forbidden_execution_core_mismatch_fails_closed(tmp_path: Path) -> None:
     path = _database(tmp_path)
     with sqlite3.connect(path) as conn:

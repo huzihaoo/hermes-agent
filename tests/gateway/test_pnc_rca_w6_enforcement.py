@@ -10,6 +10,7 @@ import pytest
 
 from gateway.pnc_rca_admission import build_rca_admission
 from gateway.pnc_rca_control_store import (
+    CONTROL_STORE_SCHEMA_VERSION,
     MANUAL_TRIGGER_SCHEMA_VERSION,
     ManualRcaTriggerRequest,
     RcaControlStore,
@@ -395,7 +396,7 @@ def test_v11_marker_migrates_the_v12_learning_schema(tmp_path):
         conn.close()
 
     migrated = RcaControlStore(db_path)
-    assert migrated.health()["schema_version"] == "pnc_rca_control_store_v12"
+    assert migrated.health()["schema_version"] == CONTROL_STORE_SCHEMA_VERSION
     assert migrated.initialization_observation()["mode"] == "migration"
     assert migrated.list_rows("rca_learning_lane_cohorts") == []
     assert migrated.list_rows("rca_learning_lane_admissions") == []

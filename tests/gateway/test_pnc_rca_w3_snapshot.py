@@ -3683,6 +3683,9 @@ def test_dispatcher_missing_w3_snapshot_stops_before_external_boundaries(tmp_pat
     instance.store = store
     instance.config = SimpleNamespace(
         dispatch_enabled=True,
+        # This fixture isolates the downstream W3 fail-closed boundary; the
+        # activation-required path is covered by the dispatcher activation tests.
+        activation_required=False,
         lease_seconds=180,
         max_age_seconds=86_400,
         w3_snapshot_read_mode="snapshot_required",

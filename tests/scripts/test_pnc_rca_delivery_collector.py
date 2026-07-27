@@ -17,7 +17,12 @@ from gateway.pnc_rca_delivery_contract import (
 from gateway.pnc_rca_delivery_store import RcaDeliveryStore
 from scripts import pnc_rca_delivery_collector as collector
 from scripts.pnc_foxglove_delivery import canonical_viz_mcap_path
-from tests.gateway.test_pnc_rca_delivery_store import NOW, _control, _delivery
+from tests.gateway.test_pnc_rca_delivery_store import (
+    NOW,
+    _bind_activation_execution,
+    _control,
+    _delivery,
+)
 from tests.gateway.test_pnc_rca_w3_snapshot import _runtime_authority
 
 
@@ -32,7 +37,6 @@ def _config_env(tmp_path) -> dict[str, str]:
         "HERMES_RCA_DELIVERY_COLLECTOR_ARTIFACT_READ_TIMEOUT_SECONDS": "30",
         "HERMES_RCA_DELIVERY_COLLECTOR_LEASE_SECONDS": "60",
         "HERMES_RCA_DELIVERY_COLLECTOR_CAPACITY_SAMPLE_ENABLED": "true",
-        "HERMES_RCA_DELIVERY_COLLECTOR_ACTIVATION_REQUIRED": "true",
     }
 
 
@@ -68,15 +72,159 @@ def test_viz_surface_errors_retry_internally_instead_of_becoming_user_results():
     assert "if viz_publication:" in script
 
 
-def test_config_exposes_capacity_sampling_without_restoring_activation_gate(tmp_path):
-    config = collector.CollectorConfig.from_env(
-        _config_env(tmp_path), hermes_home=tmp_path
-    )
+def test_config_exposes_capacity_sampling_and_activation_required(tmp_path):
+    env = _config_env(tmp_path)
+    env["HERMES_RCA_DELIVERY_COLLECTOR_ACTIVATION_REQUIRED"] = "true"
+    config = collector.CollectorConfig.from_env(env, hermes_home=tmp_path)
 
     public = config.public_dict()
-    assert "activation_required" not in public
+    assert config.activation_required is True
+    assert public["activation_required"] is True
     assert public["capacity_sample_enabled"] is True
     assert public["capacity_sample_batch_size"] == 20
+
+
+def test_activation_required_defaults_false(tmp_path):
+    config = collector.CollectorConfig.from_env(
+        _config_env(tmp_path),
+        hermes_home=tmp_path,
+    )
+
+    assert config.activation_required is False
+    assert config.public_dict()["activation_required"] is False
+
+
+@pytest.mark.parametrize("value", ["1", "0", "yes", "on", "off", ""])
+def test_activation_required_rejects_boolean_aliases(tmp_path, value):
+    env = _config_env(tmp_path)
+    env["HERMES_RCA_DELIVERY_COLLECTOR_ACTIVATION_REQUIRED"] = value
+
+    with pytest.raises(ValueError, match="exactly true or false"):
+        collector.CollectorConfig.from_env(env, hermes_home=tmp_path)
+
+
+def test_activation_gate_does_not_backfill_claim_or_preview_legacy_null_row(
+    tmp_path,
+):
+    control, legacy = _control(tmp_path)
+    env = _config_env(tmp_path)
+    env["HERMES_RCA_DELIVERY_COLLECTOR_CAPACITY_SAMPLE_ENABLED"] = "false"
+    env["HERMES_RCA_DELIVERY_COLLECTOR_ACTIVATION_REQUIRED"] = "true"
+    instance = collector.DeliveryCollector(
+        store=RcaDeliveryStore(control.db_path),
+        config=collector.CollectorConfig.from_env(env, hermes_home=tmp_path),
+        status_reader=lambda _task_id: pytest.fail("legacy row reached VM reader"),
+        now=lambda: NOW,
+        lease_owner="activation-required-test",
+    )
+
+    assert instance.backfill() == 0
+    assert instance.collect_one().status == "idle"
+    preview = instance.dry_run_once()
+
+    assert preview["candidate_count"] == 0
+    assert instance.store.list_rows("rca_execution_watch") == []
+    [row] = control.list_rows("rca_outbox")
+    assert row["submission_key"] == legacy.submission_key
+    assert row["activation_epoch_id"] is None
+    assert row["activation_ledger_id"] is None
+    assert row["status"] == "completed"
+
+
+def test_activation_required_reaches_watch_claim_and_successful_create(
+    tmp_path,
+    monkeypatch,
+):
+    control, result = _control(tmp_path)
+    _bind_activation_execution(control, result, state="steady_active")
+    real_store = RcaDeliveryStore(control.db_path)
+    assert (
+        real_store.backfill_completed_submissions(
+            now=NOW,
+            activation_required=True,
+        )
+        == 1
+    )
+    claim = real_store.claim_due_watch(
+        lease_owner="activation-create-test",
+        lease_seconds=60,
+        now=NOW,
+        activation_required=True,
+    )
+    assert claim is not None
+    calls = []
+    original_create = real_store.create_delivery
+    store = SimpleNamespace(
+        claim_due_watch=lambda **kwargs: calls.append(("claim", kwargs)) or claim,
+        create_delivery=(
+            lambda **kwargs: (
+                calls.append(("create", kwargs)) or original_create(**kwargs)
+            )
+        ),
+    )
+    env = _config_env(tmp_path)
+    env["HERMES_RCA_DELIVERY_COLLECTOR_CAPACITY_SAMPLE_ENABLED"] = "false"
+    env["HERMES_RCA_DELIVERY_COLLECTOR_ACTIVATION_REQUIRED"] = "true"
+    instance = collector.DeliveryCollector(
+        store=store,
+        config=collector.CollectorConfig.from_env(env, hermes_home=tmp_path),
+        status_reader=lambda task_id: {
+            "success": True,
+            "task_id": task_id,
+            "state": "completed",
+        },
+        artifact_bundle_reader=lambda _claim: {},
+        now=lambda: NOW,
+        lease_owner="activation-create-test",
+    )
+    monkeypatch.setattr(
+        collector,
+        "verify_delivery_bundle",
+        lambda **_kwargs: _delivery(claim),
+    )
+
+    outcome = instance.collect_one()
+
+    assert outcome.status == "delivery_created"
+    assert calls[0][0] == "claim"
+    assert calls[0][1]["activation_required"] is True
+    assert calls[1][0] == "create"
+    assert calls[1][1]["activation_required"] is True
+
+
+def test_activation_required_reaches_terminal_create(tmp_path):
+    env = _config_env(tmp_path)
+    env["HERMES_RCA_DELIVERY_COLLECTOR_CAPACITY_SAMPLE_ENABLED"] = "false"
+    env["HERMES_RCA_DELIVERY_COLLECTOR_ACTIVATION_REQUIRED"] = "true"
+    calls = []
+    instance = object.__new__(collector.DeliveryCollector)
+    instance.config = collector.CollectorConfig.from_env(env, hermes_home=tmp_path)
+    instance.store = SimpleNamespace(
+        create_terminal_delivery=lambda **kwargs: (
+            calls.append(kwargs)
+            or SimpleNamespace(
+                created=True,
+                delivery_id="delivery-id",
+                effect_key="effect-key",
+            )
+        )
+    )
+    instance.stats = collector.CollectorStats()
+    instance.runtime_identity = None
+    instance.now = lambda: NOW
+    claim = SimpleNamespace(submission_key="submission-key", state="pending")
+
+    outcome = instance._durable_terminal_outcome(
+        claim,
+        status={"success": False},
+        outcome="terminal_failed",
+        terminal_state="failed",
+        error_code="rca_work_deadline_exceeded",
+        error_detail="deadline",
+    )
+
+    assert outcome.status == "terminal_failed"
+    assert calls[0]["activation_required"] is True
 
 
 def test_collect_batch_collects_delivery_then_capacity_samples():
@@ -111,12 +259,15 @@ def test_collector_stats_expose_capacity_counters_without_activation_counter():
 
 
 def test_capacity_observation_error_does_not_mark_delivery_unhealthy(tmp_path):
-    config = collector.CollectorConfig.from_env(
-        _config_env(tmp_path), hermes_home=tmp_path
-    )
+    env = _config_env(tmp_path)
+    env["HERMES_RCA_DELIVERY_COLLECTOR_ACTIVATION_REQUIRED"] = "true"
+    config = collector.CollectorConfig.from_env(env, hermes_home=tmp_path)
+    health_calls = []
     reporter = object.__new__(collector.HealthReporter)
     reporter.config = config
-    reporter.store = SimpleNamespace(health=lambda **_kwargs: {"ok": True})
+    reporter.store = SimpleNamespace(
+        health=lambda **kwargs: health_calls.append(kwargs) or {"ok": True}
+    )
     reporter.started_at = collector._utc_iso()
     reporter.runtime_identity = SimpleNamespace(to_dict=lambda: {})
     reporter._remote_css_parser_receipt = {"status": "ok"}
@@ -131,6 +282,7 @@ def test_capacity_observation_error_does_not_mark_delivery_unhealthy(tmp_path):
     reporter.write(state="idle", stats=stats, refresh_dependencies=False)
 
     payload = json.loads(config.health_path.read_text(encoding="utf-8"))
+    assert health_calls[0]["activation_required"] is True
     assert payload["healthy"] is True
     assert payload["capacity_samples"]["observation_healthy"] is False
     assert payload["capacity_samples"]["blocks_delivery_health"] is False

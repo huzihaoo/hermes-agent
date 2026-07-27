@@ -36,8 +36,8 @@ from gateway.pnc_rca_runtime_transition import (
 from gateway.pnc_rca_requester_identity import validate_rca_requester
 
 
-CONTROL_STORE_SCHEMA_VERSION = "pnc_rca_control_store_v12"
-CONTROL_STORE_SCHEMA_PREDECESSOR_VERSION = "pnc_rca_control_store_v11"
+CONTROL_STORE_SCHEMA_VERSION = "pnc_rca_control_store_v13"
+CONTROL_STORE_SCHEMA_PREDECESSOR_VERSION = "pnc_rca_control_store_v12"
 SUPPORTED_CONTROL_STORE_SCHEMA_VERSIONS = frozenset(
     {
         "pnc_rca_control_store_v3",
@@ -49,6 +49,7 @@ SUPPORTED_CONTROL_STORE_SCHEMA_VERSIONS = frozenset(
         "pnc_rca_control_store_v9",
         "pnc_rca_control_store_v10",
         "pnc_rca_control_store_v11",
+        "pnc_rca_control_store_v12",
         CONTROL_STORE_SCHEMA_VERSION,
     }
 )
@@ -102,6 +103,65 @@ OUTBOX_PAYLOAD_SCHEMA_VERSION = "pnc_rca_submission_outbox_v2"
 DELIVERY_TARGET_SCHEMA_VERSION = "pnc_rca_delivery_target_v1"
 LEARNING_LANE_ADMISSION_SCHEMA_VERSION = "g1q3_rca_learning_lane_admission_v1"
 LEARNING_LANE_COHORT_SCHEMA_VERSION = "g1q3_rca_learning_lane_cohort_v1"
+ACTIVATION_HISTORICAL_OUTBOX_HOLD_SCHEMA_VERSION = (
+    "pnc_rca_activation_historical_outbox_hold_v1"
+)
+ACTIVATION_HISTORICAL_OUTBOX_ROW_SCHEMA_VERSION = (
+    "pnc_rca_activation_historical_outbox_row_v1"
+)
+ACTIVATION_HISTORICAL_OUTBOX_DISPOSITION_SCHEMA_VERSION = (
+    "pnc_rca_activation_historical_outbox_disposition_v1"
+)
+ACTIVATION_HISTORICAL_OUTBOX_DISPOSITION_ERROR_CODE = (
+    "activation_historical_hold_owner_disposed"
+)
+ACTIVATION_HISTORICAL_OUTBOX_ROW_FIELDS = (
+    "outbox_id",
+    "action",
+    "business_key",
+    "submission_key",
+    "creation_rule_version",
+    "generation",
+    "activation_epoch_id",
+    "activation_ledger_id",
+    "origin_source_id",
+    "source_event_id",
+    "source_topic",
+    "source_partition",
+    "source_offset",
+    "payload_json",
+    "status",
+    "attempt",
+    "next_attempt_at",
+    "fence",
+    "lease_token",
+    "lease_owner",
+    "lease_expires_at",
+    "claimed_at",
+    "completed_at",
+    "quarantined_at",
+    "last_error_code",
+    "last_error_detail",
+    "result_json",
+    "retry_window_started_at",
+    "created_at",
+    "updated_at",
+)
+ACTIVATION_HISTORICAL_OUTBOX_DISPOSITION_MUTABLE_FIELDS = frozenset(
+    {
+        "status",
+        "next_attempt_at",
+        "quarantined_at",
+        "last_error_code",
+        "last_error_detail",
+        "updated_at",
+    }
+)
+ACTIVATION_HISTORICAL_OUTBOX_IMMUTABLE_ROW_FIELDS = tuple(
+    field
+    for field in ACTIVATION_HISTORICAL_OUTBOX_ROW_FIELDS
+    if field not in ACTIVATION_HISTORICAL_OUTBOX_DISPOSITION_MUTABLE_FIELDS
+)
 # The W6 stock boundary is a release contract, not an operator-controlled flag.
 STOCK_CUTOFF = "2026-07-25T10:15:43.473251+00:00"
 LEARNING_LANE_ALLOWED_WRITE_KINDS = ("internal_alert", "vm_submit")
@@ -850,12 +910,19 @@ class RcaControlStore:
         if marker_value == "pnc_rca_control_store_v10":
             migrated = self._migrate_v10_to_v11()
             migrated = self._migrate_v11_to_v12() or migrated
+            migrated = self._migrate_v12_to_v13() or migrated
             self._initialization_mode = "migration" if migrated else "steady"
             return
 
         if marker_value == "pnc_rca_control_store_v11":
+            migrated = self._migrate_v11_to_v12()
+            migrated = self._migrate_v12_to_v13() or migrated
+            self._initialization_mode = "migration" if migrated else "steady"
+            return
+
+        if marker_value == "pnc_rca_control_store_v12":
             self._initialization_mode = (
-                "migration" if self._migrate_v11_to_v12() else "steady"
+                "migration" if self._migrate_v12_to_v13() else "steady"
             )
             return
 
@@ -1459,6 +1526,7 @@ class RcaControlStore:
             # The source backfill below may classify post-cutoff stock rows;
             # install its durable target schema before invoking that path.
             self._create_v12_learning_lane_schema(conn)
+            self._create_v13_historical_outbox_hold_schema(conn)
             if self._learning_delivery_schema_present(conn):
                 self._ensure_learning_lane_cohort_tx(
                     conn, sealed_at=_now_iso()
@@ -1583,7 +1651,7 @@ class RcaControlStore:
                 "UPDATE control_meta SET value = ? "
                 "WHERE key = 'schema_version' AND value = ?",
                 (
-                    CONTROL_STORE_SCHEMA_PREDECESSOR_VERSION,
+                    "pnc_rca_control_store_v11",
                     "pnc_rca_control_store_v10",
                 ),
             )
@@ -1607,7 +1675,10 @@ class RcaControlStore:
                 "SELECT value FROM control_meta WHERE key = 'schema_version'"
             ).fetchone()
             marker_value = str(marker["value"]) if marker is not None else ""
-            if marker_value == CONTROL_STORE_SCHEMA_VERSION:
+            if marker_value in {
+                "pnc_rca_control_store_v12",
+                CONTROL_STORE_SCHEMA_VERSION,
+            }:
                 self._validate_structural_contract(conn, integrity_check=False)
                 conn.commit()
                 return False
@@ -1622,7 +1693,42 @@ class RcaControlStore:
             updated = conn.execute(
                 "UPDATE control_meta SET value = ? "
                 "WHERE key = 'schema_version' AND value = ?",
-                (CONTROL_STORE_SCHEMA_VERSION, "pnc_rca_control_store_v11"),
+                ("pnc_rca_control_store_v12", "pnc_rca_control_store_v11"),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError("incompatible_control_store_schema:version_marker")
+            conn.commit()
+            return True
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _migrate_v12_to_v13(self) -> bool:
+        """Install the immutable historical-outbox hold and disposition schema."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            marker = conn.execute(
+                "SELECT value FROM control_meta WHERE key = 'schema_version'"
+            ).fetchone()
+            marker_value = str(marker["value"]) if marker is not None else ""
+            if marker_value == CONTROL_STORE_SCHEMA_VERSION:
+                self._validate_structural_contract(conn, integrity_check=False)
+                conn.commit()
+                return False
+            if marker_value != "pnc_rca_control_store_v12":
+                raise RuntimeError("incompatible_control_store_schema:version_marker")
+            self._validate_v12_learning_lane_schema(conn)
+            self._drop_v13_historical_outbox_hold_triggers(conn)
+            self._create_v13_historical_outbox_hold_schema(conn)
+            self._validate_structural_contract(conn, integrity_check=True)
+            updated = conn.execute(
+                "UPDATE control_meta SET value = ? "
+                "WHERE key = 'schema_version' AND value = ?",
+                (CONTROL_STORE_SCHEMA_VERSION, "pnc_rca_control_store_v12"),
             )
             if updated.rowcount != 1:
                 raise RuntimeError("incompatible_control_store_schema:version_marker")
@@ -2765,6 +2871,615 @@ class RcaControlStore:
                     "incompatible_control_store_schema:learning_lane_cohort_binding"
                 )
 
+    @staticmethod
+    def _v13_historical_outbox_hold_trigger_names() -> tuple[str, ...]:
+        return (
+            "trg_activation_historical_hold_no_update",
+            "trg_activation_historical_hold_no_delete",
+            "trg_activation_historical_hold_no_replace",
+            "trg_activation_historical_hold_item_no_append",
+            "trg_activation_historical_hold_item_no_update",
+            "trg_activation_historical_hold_item_no_delete",
+            "trg_activation_historical_disposition_no_update",
+            "trg_activation_historical_disposition_no_delete",
+            "trg_activation_historical_disposition_no_replace",
+            "trg_activation_historical_disposition_item_no_append",
+            "trg_activation_historical_disposition_item_no_update",
+            "trg_activation_historical_disposition_item_no_delete",
+            "trg_activation_historical_outbox_no_update",
+            "trg_activation_historical_outbox_disposition_guard",
+            "trg_activation_historical_outbox_no_delete",
+        )
+
+    @staticmethod
+    def _v13_historical_outbox_hold_schema_statements() -> tuple[str, ...]:
+        immutable_guard = " OR ".join(
+            f"NEW.{field} IS NOT OLD.{field}"
+            for field in ACTIVATION_HISTORICAL_OUTBOX_IMMUTABLE_ROW_FIELDS
+        )
+        return (
+            f"""
+            CREATE TABLE IF NOT EXISTS rca_activation_historical_outbox_holds (
+                epoch_id TEXT PRIMARY KEY,
+                schema_version TEXT NOT NULL CHECK(
+                    schema_version =
+                        '{ACTIVATION_HISTORICAL_OUTBOX_HOLD_SCHEMA_VERSION}'
+                ),
+                partition_start_fence_sha256 TEXT NOT NULL CHECK(
+                    length(partition_start_fence_sha256) = 64
+                    AND partition_start_fence_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+                cohort_count INTEGER NOT NULL CHECK(cohort_count >= 0),
+                cohort_sha256 TEXT NOT NULL CHECK(
+                    length(cohort_sha256) = 64
+                    AND cohort_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+                sealed_at TEXT NOT NULL CHECK(length(trim(sealed_at)) > 0),
+                FOREIGN KEY(epoch_id) REFERENCES rca_activation_epochs(epoch_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS
+                rca_activation_historical_outbox_hold_items (
+                    epoch_id TEXT NOT NULL,
+                    outbox_id INTEGER NOT NULL,
+                    row_sha256 TEXT NOT NULL CHECK(
+                        length(row_sha256) = 64
+                        AND row_sha256 NOT GLOB '*[^0-9a-f]*'
+                    ),
+                    immutable_row_sha256 TEXT NOT NULL CHECK(
+                        length(immutable_row_sha256) = 64
+                        AND immutable_row_sha256 NOT GLOB '*[^0-9a-f]*'
+                    ),
+                    PRIMARY KEY(epoch_id, outbox_id),
+                    FOREIGN KEY(epoch_id)
+                        REFERENCES rca_activation_historical_outbox_holds(epoch_id),
+                    FOREIGN KEY(outbox_id) REFERENCES rca_outbox(outbox_id)
+                )
+            """,
+            f"""
+            CREATE TABLE IF NOT EXISTS
+                rca_activation_historical_outbox_dispositions (
+                    disposition_id TEXT PRIMARY KEY CHECK(
+                        disposition_id = 'rca-hold-disposition-v1-' || disposition_sha256
+                    ),
+                    epoch_id TEXT NOT NULL UNIQUE,
+                    epoch_state TEXT NOT NULL CHECK(epoch_state = 'aborted'),
+                    schema_version TEXT NOT NULL CHECK(
+                        schema_version =
+                            '{ACTIVATION_HISTORICAL_OUTBOX_DISPOSITION_SCHEMA_VERSION}'
+                    ),
+                    hold_schema_version TEXT NOT NULL CHECK(
+                        hold_schema_version =
+                            '{ACTIVATION_HISTORICAL_OUTBOX_HOLD_SCHEMA_VERSION}'
+                    ),
+                    row_schema_version TEXT NOT NULL CHECK(
+                        row_schema_version =
+                            '{ACTIVATION_HISTORICAL_OUTBOX_ROW_SCHEMA_VERSION}'
+                    ),
+                    cohort_count INTEGER NOT NULL CHECK(cohort_count >= 0),
+                    cohort_sha256 TEXT NOT NULL CHECK(
+                        length(cohort_sha256) = 64
+                        AND cohort_sha256 NOT GLOB '*[^0-9a-f]*'
+                    ),
+                    owner_authorized INTEGER NOT NULL CHECK(owner_authorized = 1),
+                    operator TEXT NOT NULL CHECK(length(trim(operator)) > 0),
+                    reason TEXT NOT NULL CHECK(length(trim(reason)) > 0),
+                    disposed_at TEXT NOT NULL CHECK(length(trim(disposed_at)) > 0),
+                    disposition_sha256 TEXT NOT NULL UNIQUE CHECK(
+                        length(disposition_sha256) = 64
+                        AND disposition_sha256 NOT GLOB '*[^0-9a-f]*'
+                    ),
+                    FOREIGN KEY(epoch_id)
+                        REFERENCES rca_activation_historical_outbox_holds(epoch_id)
+                )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS
+                rca_activation_historical_outbox_disposition_items (
+                    disposition_id TEXT NOT NULL,
+                    outbox_id INTEGER NOT NULL,
+                    row_sha256 TEXT NOT NULL CHECK(
+                        length(row_sha256) = 64
+                        AND row_sha256 NOT GLOB '*[^0-9a-f]*'
+                    ),
+                    immutable_row_sha256 TEXT NOT NULL CHECK(
+                        length(immutable_row_sha256) = 64
+                        AND immutable_row_sha256 NOT GLOB '*[^0-9a-f]*'
+                    ),
+                    PRIMARY KEY(disposition_id, outbox_id),
+                    FOREIGN KEY(disposition_id) REFERENCES
+                        rca_activation_historical_outbox_dispositions(disposition_id),
+                    FOREIGN KEY(outbox_id) REFERENCES rca_outbox(outbox_id)
+                )
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_activation_historical_hold_no_update
+            BEFORE UPDATE ON rca_activation_historical_outbox_holds
+            BEGIN
+                SELECT RAISE(
+                    ABORT, 'activation_historical_hold_seal_update_forbidden'
+                );
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_activation_historical_hold_no_delete
+            BEFORE DELETE ON rca_activation_historical_outbox_holds
+            BEGIN
+                SELECT RAISE(
+                    ABORT, 'activation_historical_hold_seal_delete_forbidden'
+                );
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_activation_historical_hold_no_replace
+            BEFORE INSERT ON rca_activation_historical_outbox_holds
+            WHEN EXISTS (
+                SELECT 1 FROM rca_activation_historical_outbox_holds
+                 WHERE epoch_id = NEW.epoch_id
+            )
+            BEGIN
+                SELECT RAISE(
+                    ABORT, 'activation_historical_hold_seal_replace_forbidden'
+                );
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS
+                trg_activation_historical_hold_item_no_append
+            BEFORE INSERT ON rca_activation_historical_outbox_hold_items
+            WHEN (
+                SELECT COUNT(*)
+                  FROM rca_activation_historical_outbox_hold_items
+                 WHERE epoch_id = NEW.epoch_id
+            ) >= (
+                SELECT cohort_count
+                  FROM rca_activation_historical_outbox_holds
+                 WHERE epoch_id = NEW.epoch_id
+            )
+            BEGIN
+                SELECT RAISE(
+                    ABORT, 'activation_historical_hold_item_append_forbidden'
+                );
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS
+                trg_activation_historical_hold_item_no_update
+            BEFORE UPDATE ON rca_activation_historical_outbox_hold_items
+            BEGIN
+                SELECT RAISE(
+                    ABORT, 'activation_historical_hold_item_update_forbidden'
+                );
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS
+                trg_activation_historical_hold_item_no_delete
+            BEFORE DELETE ON rca_activation_historical_outbox_hold_items
+            BEGIN
+                SELECT RAISE(
+                    ABORT, 'activation_historical_hold_item_delete_forbidden'
+                );
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS
+                trg_activation_historical_disposition_no_update
+            BEFORE UPDATE ON rca_activation_historical_outbox_dispositions
+            BEGIN
+                SELECT RAISE(
+                    ABORT, 'activation_historical_disposition_update_forbidden'
+                );
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS
+                trg_activation_historical_disposition_no_delete
+            BEFORE DELETE ON rca_activation_historical_outbox_dispositions
+            BEGIN
+                SELECT RAISE(
+                    ABORT, 'activation_historical_disposition_delete_forbidden'
+                );
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS
+                trg_activation_historical_disposition_no_replace
+            BEFORE INSERT ON rca_activation_historical_outbox_dispositions
+            WHEN EXISTS (
+                SELECT 1 FROM rca_activation_historical_outbox_dispositions
+                 WHERE disposition_id = NEW.disposition_id
+                    OR epoch_id = NEW.epoch_id
+                    OR disposition_sha256 = NEW.disposition_sha256
+            )
+            BEGIN
+                SELECT RAISE(
+                    ABORT, 'activation_historical_disposition_replace_forbidden'
+                );
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS
+                trg_activation_historical_disposition_item_no_append
+            BEFORE INSERT ON rca_activation_historical_outbox_disposition_items
+            WHEN (
+                SELECT COUNT(*)
+                  FROM rca_activation_historical_outbox_disposition_items
+                 WHERE disposition_id = NEW.disposition_id
+            ) >= (
+                SELECT cohort_count
+                  FROM rca_activation_historical_outbox_dispositions
+                 WHERE disposition_id = NEW.disposition_id
+            )
+            BEGIN
+                SELECT RAISE(
+                    ABORT, 'activation_historical_disposition_item_append_forbidden'
+                );
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS
+                trg_activation_historical_disposition_item_no_update
+            BEFORE UPDATE ON rca_activation_historical_outbox_disposition_items
+            BEGIN
+                SELECT RAISE(
+                    ABORT, 'activation_historical_disposition_item_update_forbidden'
+                );
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS
+                trg_activation_historical_disposition_item_no_delete
+            BEFORE DELETE ON rca_activation_historical_outbox_disposition_items
+            BEGIN
+                SELECT RAISE(
+                    ABORT, 'activation_historical_disposition_item_delete_forbidden'
+                );
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_activation_historical_outbox_no_update
+            BEFORE UPDATE ON rca_outbox
+            WHEN EXISTS (
+                SELECT 1
+                  FROM rca_activation_historical_outbox_hold_items AS held
+                 WHERE held.outbox_id = OLD.outbox_id
+                   AND NOT EXISTS (
+                       SELECT 1
+                         FROM rca_activation_historical_outbox_disposition_items AS disposed
+                        WHERE disposed.outbox_id = held.outbox_id
+                   )
+            )
+            BEGIN
+                SELECT RAISE(
+                    ABORT, 'activation_historical_outbox_update_forbidden'
+                );
+            END
+            """,
+            f"""
+            CREATE TRIGGER IF NOT EXISTS
+                trg_activation_historical_outbox_disposition_guard
+            BEFORE UPDATE ON rca_outbox
+            WHEN EXISTS (
+                SELECT 1
+                  FROM rca_activation_historical_outbox_disposition_items AS disposed
+                 WHERE disposed.outbox_id = OLD.outbox_id
+            ) AND NOT (
+                OLD.status = 'pending'
+                AND NEW.status = 'quarantined'
+                AND NEW.next_attempt_at IS NULL
+                AND NEW.lease_token IS NULL
+                AND NEW.lease_owner IS NULL
+                AND NEW.lease_expires_at IS NULL
+                AND NEW.claimed_at IS NULL
+                AND NEW.completed_at IS NULL
+                AND NEW.result_json IS NULL
+                AND NEW.quarantined_at IS NOT NULL
+                AND NEW.updated_at = NEW.quarantined_at
+                AND NEW.last_error_code =
+                    '{ACTIVATION_HISTORICAL_OUTBOX_DISPOSITION_ERROR_CODE}'
+                AND NEW.last_error_detail = 'owner_audited_disposition'
+                AND NOT ({immutable_guard})
+                AND EXISTS (
+                    SELECT 1
+                      FROM rca_activation_historical_outbox_disposition_items AS disposed
+                      JOIN rca_activation_historical_outbox_dispositions AS disposition
+                        ON disposition.disposition_id = disposed.disposition_id
+                      JOIN rca_activation_historical_outbox_hold_items AS held
+                        ON held.epoch_id = disposition.epoch_id
+                       AND held.outbox_id = disposed.outbox_id
+                       AND held.row_sha256 = disposed.row_sha256
+                       AND held.immutable_row_sha256 =
+                           disposed.immutable_row_sha256
+                     WHERE disposed.outbox_id = OLD.outbox_id
+                       AND disposition.disposed_at = NEW.quarantined_at
+                )
+            )
+            BEGIN
+                SELECT RAISE(
+                    ABORT, 'activation_historical_disposed_outbox_update_forbidden'
+                );
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_activation_historical_outbox_no_delete
+            BEFORE DELETE ON rca_outbox
+            WHEN EXISTS (
+                SELECT 1
+                  FROM rca_activation_historical_outbox_hold_items AS held
+                 WHERE held.outbox_id = OLD.outbox_id
+            )
+            BEGIN
+                SELECT RAISE(
+                    ABORT, 'activation_historical_outbox_delete_forbidden'
+                );
+            END
+            """,
+        )
+
+    @classmethod
+    def _drop_v13_historical_outbox_hold_triggers(
+        cls,
+        conn: sqlite3.Connection,
+    ) -> None:
+        for name in cls._v13_historical_outbox_hold_trigger_names():
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+
+    @classmethod
+    def _create_v13_historical_outbox_hold_schema(
+        cls,
+        conn: sqlite3.Connection,
+    ) -> None:
+        """Create immutable per-epoch seals and owner-audited disposition records."""
+        for statement in cls._v13_historical_outbox_hold_schema_statements():
+            conn.execute(statement)
+
+    @classmethod
+    def _validate_v13_historical_outbox_hold_schema(
+        cls,
+        conn: sqlite3.Connection,
+    ) -> None:
+        normalize_sql = lambda value: " ".join(str(value).split()).rstrip(";")
+        statements = cls._v13_historical_outbox_hold_schema_statements()
+        expected_tables: dict[str, str] = {}
+        expected_triggers: dict[str, str] = {}
+        for statement in statements:
+            normalized = normalize_sql(statement)
+            if normalized.startswith("CREATE TABLE IF NOT EXISTS "):
+                name = normalized[len("CREATE TABLE IF NOT EXISTS ") :].split(" ", 1)[0]
+                expected_tables[name] = normalized.replace(
+                    "CREATE TABLE IF NOT EXISTS ", "CREATE TABLE ", 1
+                )
+            elif normalized.startswith("CREATE TRIGGER IF NOT EXISTS "):
+                name = normalized[len("CREATE TRIGGER IF NOT EXISTS ") :].split(" ", 1)[0]
+                expected_triggers[name] = normalized.replace(
+                    "CREATE TRIGGER IF NOT EXISTS ", "CREATE TRIGGER ", 1
+                )
+        observed_tables = {
+            str(row["name"]): normalize_sql(row["sql"] or "")
+            for row in conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+            if str(row["name"]) in expected_tables
+        }
+        historical_table_names = {
+            str(row["name"])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name LIKE 'rca_activation_historical_outbox_%'"
+            ).fetchall()
+        }
+        if (
+            observed_tables != expected_tables
+            or historical_table_names != set(expected_tables)
+        ):
+            raise RuntimeError(
+                "incompatible_control_store_schema:historical_outbox_hold_table_sql"
+            )
+        observed_triggers = {
+            str(row["name"]): normalize_sql(row["sql"] or "")
+            for row in conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'trigger'"
+            ).fetchall()
+            if str(row["name"]) in expected_triggers
+        }
+        historical_trigger_names = {
+            str(row["name"])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                "AND name LIKE 'trg_activation_historical_%'"
+            ).fetchall()
+        }
+        if (
+            observed_triggers != expected_triggers
+            or historical_trigger_names != set(expected_triggers)
+        ):
+            raise RuntimeError(
+                "incompatible_control_store_schema:historical_outbox_hold_trigger_sql"
+            )
+
+        orphan = conn.execute(
+            """
+            SELECT 1
+              FROM rca_activation_historical_outbox_dispositions AS disposition
+         LEFT JOIN rca_activation_historical_outbox_holds AS held
+                ON held.epoch_id = disposition.epoch_id
+             WHERE held.epoch_id IS NULL
+             LIMIT 1
+            """
+        ).fetchone()
+        if orphan is not None:
+            raise RuntimeError(
+                "incompatible_control_store_schema:historical_outbox_disposition_orphan"
+            )
+        orphan_hold_item = conn.execute(
+            """
+            SELECT 1
+              FROM rca_activation_historical_outbox_hold_items AS item
+         LEFT JOIN rca_activation_historical_outbox_holds AS held
+                ON held.epoch_id = item.epoch_id
+         LEFT JOIN rca_outbox AS outbox
+                ON outbox.outbox_id = item.outbox_id
+             WHERE held.epoch_id IS NULL OR outbox.outbox_id IS NULL
+             LIMIT 1
+            """
+        ).fetchone()
+        if orphan_hold_item is not None:
+            raise RuntimeError(
+                "incompatible_control_store_schema:historical_outbox_hold_item_orphan"
+            )
+        orphan_disposition_item = conn.execute(
+            """
+            SELECT 1
+              FROM rca_activation_historical_outbox_disposition_items AS item
+         LEFT JOIN rca_activation_historical_outbox_dispositions AS disposition
+                ON disposition.disposition_id = item.disposition_id
+         LEFT JOIN rca_outbox AS outbox
+                ON outbox.outbox_id = item.outbox_id
+             WHERE disposition.disposition_id IS NULL
+                OR outbox.outbox_id IS NULL
+             LIMIT 1
+            """
+        ).fetchone()
+        if orphan_disposition_item is not None:
+            raise RuntimeError(
+                "incompatible_control_store_schema:"
+                "historical_outbox_disposition_item_orphan"
+            )
+        for hold in conn.execute(
+            "SELECT * FROM rca_activation_historical_outbox_holds ORDER BY epoch_id"
+        ).fetchall():
+            epoch = conn.execute(
+                "SELECT state, partition_start_fence_sha256 "
+                "FROM rca_activation_epochs WHERE epoch_id = ?",
+                (hold["epoch_id"],),
+            ).fetchone()
+            if (
+                epoch is None
+                or str(hold["schema_version"])
+                != ACTIVATION_HISTORICAL_OUTBOX_HOLD_SCHEMA_VERSION
+                or str(hold["partition_start_fence_sha256"])
+                != str(epoch["partition_start_fence_sha256"])
+            ):
+                raise RuntimeError(
+                    "incompatible_control_store_schema:historical_outbox_hold_binding"
+                )
+            items = [
+                {
+                    "outbox_id": int(row["outbox_id"]),
+                    "row_sha256": str(row["row_sha256"]),
+                    "immutable_row_sha256": str(row["immutable_row_sha256"]),
+                }
+                for row in conn.execute(
+                    "SELECT outbox_id, row_sha256, immutable_row_sha256 "
+                    "FROM rca_activation_historical_outbox_hold_items "
+                    "WHERE epoch_id = ? ORDER BY outbox_id",
+                    (hold["epoch_id"],),
+                ).fetchall()
+            ]
+            if len(items) != int(hold["cohort_count"]) or _canonical_sha256(
+                items
+            ) != str(hold["cohort_sha256"]):
+                raise RuntimeError(
+                    "incompatible_control_store_schema:historical_outbox_hold_seal"
+                )
+            disposition = conn.execute(
+                "SELECT * FROM rca_activation_historical_outbox_dispositions "
+                "WHERE epoch_id = ?",
+                (hold["epoch_id"],),
+            ).fetchone()
+            if disposition is None:
+                for item in items:
+                    outbox = conn.execute(
+                        "SELECT * FROM rca_outbox WHERE outbox_id = ?",
+                        (item["outbox_id"],),
+                    ).fetchone()
+                    if (
+                        outbox is None
+                        or cls._historical_outbox_row_sha256(outbox)
+                        != item["row_sha256"]
+                        or cls._historical_outbox_immutable_row_sha256(outbox)
+                        != item["immutable_row_sha256"]
+                    ):
+                        raise RuntimeError(
+                            "incompatible_control_store_schema:"
+                            "historical_outbox_hold_row_binding"
+                        )
+                continue
+            if str(epoch["state"]) != "aborted":
+                raise RuntimeError(
+                    "incompatible_control_store_schema:"
+                    "historical_outbox_disposition_epoch_state"
+                )
+            disposed_items = [
+                {
+                    "outbox_id": int(row["outbox_id"]),
+                    "row_sha256": str(row["row_sha256"]),
+                    "immutable_row_sha256": str(row["immutable_row_sha256"]),
+                }
+                for row in conn.execute(
+                    "SELECT outbox_id, row_sha256, immutable_row_sha256 "
+                    "FROM rca_activation_historical_outbox_disposition_items "
+                    "WHERE disposition_id = ? ORDER BY outbox_id",
+                    (disposition["disposition_id"],),
+                ).fetchall()
+            ]
+            binding = cls._historical_outbox_disposition_binding(
+                epoch_id=str(disposition["epoch_id"]),
+                cohort_count=int(disposition["cohort_count"]),
+                cohort_sha256=str(disposition["cohort_sha256"]),
+                operator=str(disposition["operator"]),
+                reason=str(disposition["reason"]),
+                disposed_at=str(disposition["disposed_at"]),
+            )
+            disposition_sha256 = _canonical_sha256(binding)
+            if (
+                str(disposition["schema_version"])
+                != ACTIVATION_HISTORICAL_OUTBOX_DISPOSITION_SCHEMA_VERSION
+                or str(disposition["epoch_id"]) != str(hold["epoch_id"])
+                or str(disposition["epoch_state"]) != "aborted"
+                or str(disposition["hold_schema_version"])
+                != ACTIVATION_HISTORICAL_OUTBOX_HOLD_SCHEMA_VERSION
+                or str(disposition["row_schema_version"])
+                != ACTIVATION_HISTORICAL_OUTBOX_ROW_SCHEMA_VERSION
+                or int(disposition["cohort_count"]) != int(hold["cohort_count"])
+                or str(disposition["cohort_sha256"]) != str(hold["cohort_sha256"])
+                or int(disposition["owner_authorized"]) != 1
+                or disposed_items != items
+                or str(disposition["disposition_sha256"]) != disposition_sha256
+                or str(disposition["disposition_id"])
+                != f"rca-hold-disposition-v1-{disposition_sha256}"
+            ):
+                raise RuntimeError(
+                    "incompatible_control_store_schema:"
+                    "historical_outbox_disposition_binding"
+                )
+            for item in disposed_items:
+                outbox = conn.execute(
+                    "SELECT * FROM rca_outbox WHERE outbox_id = ?",
+                    (item["outbox_id"],),
+                ).fetchone()
+                if (
+                    outbox is None
+                    or cls._historical_outbox_immutable_row_sha256(outbox)
+                    != item["immutable_row_sha256"]
+                    or str(outbox["status"]) != "quarantined"
+                    or outbox["next_attempt_at"] is not None
+                    or str(outbox["quarantined_at"] or "")
+                    != str(disposition["disposed_at"])
+                    or str(outbox["last_error_code"] or "")
+                    != ACTIVATION_HISTORICAL_OUTBOX_DISPOSITION_ERROR_CODE
+                    or str(outbox["last_error_detail"] or "")
+                    != "owner_audited_disposition"
+                    or str(outbox["updated_at"] or "")
+                    != str(disposition["disposed_at"])
+                ):
+                    raise RuntimeError(
+                        "incompatible_control_store_schema:"
+                        "historical_outbox_disposition_row_binding"
+                    )
+
     def _preflight_schema_version(self) -> str | None:
         """Reject a future schema using a read-only connection before any pragma/DDL."""
         if not self.db_path.is_file() or self.db_path.stat().st_size == 0:
@@ -2803,6 +3518,7 @@ class RcaControlStore:
             conn.execute("BEGIN")
             self._validate_structural_contract(conn, integrity_check=False)
             self._validate_v12_learning_lane_schema(conn)
+            self._validate_v13_historical_outbox_hold_schema(conn)
             conn.commit()
         except Exception:
             if conn.in_transaction:
@@ -3118,6 +3834,343 @@ class RcaControlStore:
                 raise ActivationEpochError("activation_manual_mode_invalid")
         canonical = _canonical_json(normalized)
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest(), normalized
+
+    @staticmethod
+    def _historical_outbox_row_sha256(row: sqlite3.Row) -> str:
+        """Hash the stable v1 outbox projection, ignoring later additive columns."""
+        try:
+            projection = {
+                field: row[field] for field in ACTIVATION_HISTORICAL_OUTBOX_ROW_FIELDS
+            }
+        except (IndexError, KeyError) as exc:
+            raise RuntimeError(
+                "incompatible_control_store_schema:historical_outbox_row_projection"
+            ) from exc
+        return _canonical_sha256(projection)
+
+    @staticmethod
+    def _historical_outbox_immutable_row_sha256(row: sqlite3.Row) -> str:
+        """Hash the v1 identity that must survive owner-audited disposition."""
+        try:
+            projection = {
+                field: row[field]
+                for field in ACTIVATION_HISTORICAL_OUTBOX_IMMUTABLE_ROW_FIELDS
+            }
+        except (IndexError, KeyError) as exc:
+            raise RuntimeError(
+                "incompatible_control_store_schema:"
+                "historical_outbox_immutable_row_projection"
+            ) from exc
+        return _canonical_sha256(projection)
+
+    @staticmethod
+    def _historical_outbox_disposition_binding(
+        *,
+        epoch_id: str,
+        cohort_count: int,
+        cohort_sha256: str,
+        operator: str,
+        reason: str,
+        disposed_at: str,
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": ACTIVATION_HISTORICAL_OUTBOX_DISPOSITION_SCHEMA_VERSION,
+            "hold_schema_version": ACTIVATION_HISTORICAL_OUTBOX_HOLD_SCHEMA_VERSION,
+            "row_schema_version": ACTIVATION_HISTORICAL_OUTBOX_ROW_SCHEMA_VERSION,
+            "epoch_id": epoch_id,
+            "epoch_state": "aborted",
+            "cohort_count": cohort_count,
+            "cohort_sha256": cohort_sha256,
+            "owner_authorized": True,
+            "operator": operator,
+            "reason": reason,
+            "disposed_at": disposed_at,
+        }
+
+    @classmethod
+    def _historical_outbox_hold_snapshot_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        epoch: sqlite3.Row,
+        allow_current_epoch: bool,
+    ) -> list[dict[str, Any]]:
+        epoch_id = str(epoch["epoch_id"])
+        start_fence = json.loads(str(epoch["partition_start_fence_json"]))
+        items: list[dict[str, Any]] = []
+        for row in conn.execute(
+            "SELECT * FROM rca_outbox "
+            "WHERE status IN ('pending', 'claimed', 'shadow') ORDER BY outbox_id"
+        ).fetchall():
+            bound_epoch = row["activation_epoch_id"]
+            bound_ledger = row["activation_ledger_id"]
+            if bound_epoch is not None or bound_ledger is not None:
+                if allow_current_epoch and str(bound_epoch or "") == epoch_id:
+                    if bound_ledger is None:
+                        raise ActivationEpochError(
+                            "activation_historical_hold_current_epoch_binding_invalid"
+                        )
+                    binding = conn.execute(
+                        """
+                        SELECT ledger.decision, ledger.bound_at,
+                               trigger.state AS trigger_state
+                          FROM rca_activation_admission_ledger AS ledger
+                          JOIN business_triggers AS trigger
+                            ON trigger.activation_epoch_id = ledger.epoch_id
+                           AND trigger.activation_ledger_id = ledger.ledger_id
+                           AND trigger.business_key = ledger.business_key
+                           AND trigger.submission_key = ledger.submission_key
+                           AND trigger.generation = ledger.generation
+                         WHERE ledger.epoch_id = ? AND ledger.ledger_id = ?
+                           AND ledger.business_key = ?
+                           AND ledger.submission_key = ?
+                           AND ledger.generation = ?
+                        """,
+                        (
+                            epoch_id,
+                            bound_ledger,
+                            row["business_key"],
+                            row["submission_key"],
+                            row["generation"],
+                        ),
+                    ).fetchone()
+                    status = str(row["status"] or "")
+                    expected = {
+                        "pending": ("admit", "pending"),
+                        "claimed": ("admit", "dispatching"),
+                        "shadow": ("shadow", "shadow"),
+                    }.get(status)
+                    if (
+                        binding is None
+                        or expected is None
+                        or not str(binding["bound_at"] or "")
+                        or str(binding["decision"] or "") != expected[0]
+                        or str(binding["trigger_state"] or "") != expected[1]
+                    ):
+                        raise ActivationEpochError(
+                            "activation_historical_hold_current_epoch_binding_invalid"
+                        )
+                    continue
+                raise ActivationEpochError(
+                    "activation_historical_hold_outbox_activation_bound"
+                )
+            status = str(row["status"] or "")
+            if status == "claimed":
+                raise ActivationEpochError("activation_historical_hold_outbox_claimed")
+            if status == "shadow":
+                raise ActivationEpochError("activation_historical_hold_outbox_shadow")
+            if status != "pending":
+                raise ActivationEpochError(
+                    "activation_historical_hold_outbox_status_invalid"
+                )
+            if any(
+                row[field] is not None
+                for field in (
+                    "lease_token",
+                    "lease_owner",
+                    "lease_expires_at",
+                    "claimed_at",
+                )
+            ):
+                raise ActivationEpochError("activation_historical_hold_outbox_leased")
+            topic = str(row["source_topic"] or "")
+            if not topic:
+                raise ActivationEpochError("activation_historical_hold_outbox_manual")
+            raw_partition = row["source_partition"]
+            raw_offset = row["source_offset"]
+            if raw_partition is None or raw_offset is None:
+                raise ActivationEpochError("activation_historical_hold_outbox_unfenced")
+            try:
+                partition_value = int(raw_partition)
+                offset = int(raw_offset)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ActivationEpochError(
+                    "activation_historical_hold_outbox_unfenced"
+                ) from exc
+            partition = str(partition_value)
+            if (
+                partition_value < 0
+                or offset < 0
+                or topic not in start_fence
+                or partition not in start_fence[topic]
+            ):
+                raise ActivationEpochError("activation_historical_hold_outbox_unfenced")
+            if offset >= int(start_fence[topic][partition]):
+                raise ActivationEpochError(
+                    "activation_historical_hold_outbox_at_or_after_start_fence"
+                )
+            items.append({
+                "outbox_id": int(row["outbox_id"]),
+                "row_sha256": cls._historical_outbox_row_sha256(row),
+                "immutable_row_sha256": (
+                    cls._historical_outbox_immutable_row_sha256(row)
+                ),
+            })
+        return items
+
+    @classmethod
+    def _historical_outbox_hold_evidence_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        epoch: sqlite3.Row,
+        allow_current_epoch: bool,
+    ) -> dict[str, Any]:
+        epoch_id = str(epoch["epoch_id"])
+        hold = conn.execute(
+            "SELECT * FROM rca_activation_historical_outbox_holds WHERE epoch_id = ?",
+            (epoch_id,),
+        ).fetchone()
+        if hold is None:
+            raise ActivationEpochError("activation_historical_hold_not_sealed")
+        if str(
+            hold["schema_version"]
+        ) != ACTIVATION_HISTORICAL_OUTBOX_HOLD_SCHEMA_VERSION or str(
+            hold["partition_start_fence_sha256"]
+        ) != str(epoch["partition_start_fence_sha256"]):
+            raise ActivationEpochError("activation_historical_hold_seal_invalid")
+        sealed_items = [
+            {
+                "outbox_id": int(row["outbox_id"]),
+                "row_sha256": str(row["row_sha256"]),
+                "immutable_row_sha256": str(row["immutable_row_sha256"]),
+            }
+            for row in conn.execute(
+                "SELECT outbox_id, row_sha256, immutable_row_sha256 "
+                "FROM rca_activation_historical_outbox_hold_items "
+                "WHERE epoch_id = ? ORDER BY outbox_id",
+                (epoch_id,),
+            ).fetchall()
+        ]
+        sealed_count = int(hold["cohort_count"])
+        sealed_sha256 = str(hold["cohort_sha256"])
+        if (
+            len(sealed_items) != sealed_count
+            or _canonical_sha256(sealed_items) != sealed_sha256
+        ):
+            raise ActivationEpochError("activation_historical_hold_seal_invalid")
+        disposition = conn.execute(
+            "SELECT disposition_id, disposition_sha256, disposed_at "
+            "FROM rca_activation_historical_outbox_dispositions WHERE epoch_id = ?",
+            (epoch_id,),
+        ).fetchone()
+        current_items = cls._historical_outbox_hold_snapshot_tx(
+            conn,
+            epoch=epoch,
+            allow_current_epoch=allow_current_epoch,
+        )
+        current_count = len(current_items)
+        current_sha256 = _canonical_sha256(current_items)
+        return {
+            "schema_version": ACTIVATION_HISTORICAL_OUTBOX_HOLD_SCHEMA_VERSION,
+            "row_schema_version": ACTIVATION_HISTORICAL_OUTBOX_ROW_SCHEMA_VERSION,
+            "epoch_id": epoch_id,
+            "partition_start_fence_sha256": str(hold["partition_start_fence_sha256"]),
+            "sealed_at": str(hold["sealed_at"]),
+            "sealed_count": sealed_count,
+            "sealed_sha256": sealed_sha256,
+            "disposed": disposition is not None,
+            "disposition_id": (
+                str(disposition["disposition_id"]) if disposition is not None else ""
+            ),
+            "disposition_sha256": (
+                str(disposition["disposition_sha256"])
+                if disposition is not None
+                else ""
+            ),
+            "disposed_at": (
+                str(disposition["disposed_at"]) if disposition is not None else ""
+            ),
+            "current_count": current_count,
+            "current_sha256": current_sha256,
+            "matches": (
+                sealed_count == current_count
+                and sealed_sha256 == current_sha256
+                and sealed_items == current_items
+            ),
+        }
+
+    @classmethod
+    def _require_historical_outbox_hold_match_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        epoch: sqlite3.Row,
+        allow_current_epoch: bool = True,
+    ) -> dict[str, Any]:
+        evidence = cls._historical_outbox_hold_evidence_tx(
+            conn,
+            epoch=epoch,
+            allow_current_epoch=allow_current_epoch,
+        )
+        if evidence["disposed"]:
+            raise ActivationEpochError("activation_historical_hold_disposed")
+        if not evidence["matches"]:
+            raise ActivationEpochError("activation_historical_hold_cohort_changed")
+        return evidence
+
+    @classmethod
+    def _seal_historical_outbox_hold_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        epoch: sqlite3.Row,
+        sealed_at: str,
+    ) -> dict[str, Any]:
+        epoch_id = str(epoch["epoch_id"])
+        existing = conn.execute(
+            "SELECT 1 FROM rca_activation_historical_outbox_holds WHERE epoch_id = ?",
+            (epoch_id,),
+        ).fetchone()
+        if existing is not None:
+            return cls._require_historical_outbox_hold_match_tx(
+                conn,
+                epoch=epoch,
+                allow_current_epoch=False,
+            )
+        items = cls._historical_outbox_hold_snapshot_tx(
+            conn,
+            epoch=epoch,
+            allow_current_epoch=False,
+        )
+        cohort_sha256 = _canonical_sha256(items)
+        conn.execute(
+            """
+            INSERT INTO rca_activation_historical_outbox_holds(
+                epoch_id, schema_version, partition_start_fence_sha256,
+                cohort_count, cohort_sha256, sealed_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                epoch_id,
+                ACTIVATION_HISTORICAL_OUTBOX_HOLD_SCHEMA_VERSION,
+                epoch["partition_start_fence_sha256"],
+                len(items),
+                cohort_sha256,
+                sealed_at,
+            ),
+        )
+        conn.executemany(
+            """
+            INSERT INTO rca_activation_historical_outbox_hold_items(
+                epoch_id, outbox_id, row_sha256, immutable_row_sha256
+            ) VALUES (?, ?, ?, ?)
+            """,
+            [
+                (
+                    epoch_id,
+                    item["outbox_id"],
+                    item["row_sha256"],
+                    item["immutable_row_sha256"],
+                )
+                for item in items
+            ],
+        )
+        return cls._require_historical_outbox_hold_match_tx(
+            conn,
+            epoch=epoch,
+            allow_current_epoch=False,
+        )
 
     @staticmethod
     def _current_activation_epoch_tx(conn: sqlite3.Connection) -> sqlite3.Row | None:
@@ -3497,6 +4550,10 @@ class RcaControlStore:
                     raise ActivationEpochError(
                         "activation_preproduction_binding_conflict"
                     )
+                self._require_historical_outbox_hold_match_tx(
+                    conn,
+                    epoch=epoch,
+                )
                 conn.commit()
                 return self._public_activation_epoch(epoch)
             if prior != "safe_off":
@@ -3508,12 +4565,6 @@ class RcaControlStore:
                     "SELECT COUNT(*) FROM kafka_inbox WHERE decision = 'pending'"
                 ).fetchone()[0]
             )
-            active_outbox = int(
-                conn.execute(
-                    "SELECT COUNT(*) FROM rca_outbox "
-                    "WHERE status IN ('pending', 'claimed', 'shadow')"
-                ).fetchone()[0]
-            )
             current_ledger = int(
                 conn.execute(
                     "SELECT COUNT(*) FROM rca_activation_admission_ledger "
@@ -3521,10 +4572,15 @@ class RcaControlStore:
                     (identity,),
                 ).fetchone()[0]
             )
-            if pending_inbox or active_outbox or current_ledger:
-                raise ActivationEpochError(
-                    "activation_preproduction_effects_not_held"
-                )
+            if pending_inbox:
+                raise ActivationEpochError("activation_historical_hold_pending_inbox")
+            if current_ledger:
+                raise ActivationEpochError("activation_historical_hold_current_ledger")
+            self._seal_historical_outbox_hold_tx(
+                conn,
+                epoch=epoch,
+                sealed_at=current,
+            )
             updated = conn.execute(
                 """
                 UPDATE rca_activation_epochs
@@ -3574,6 +4630,371 @@ class RcaControlStore:
         try:
             row = self._current_activation_epoch_tx(conn)
             return self._public_activation_epoch(row) if row is not None else None
+        finally:
+            conn.close()
+
+    def activation_historical_outbox_hold_evidence(
+        self,
+        *,
+        epoch_id: str,
+    ) -> dict[str, Any]:
+        """Return privacy-light sealed/current cohort evidence without writing."""
+        identity = self._normalize_activation_epoch_id(epoch_id)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            epoch = self._current_activation_epoch_tx(conn)
+            if epoch is None or str(epoch["epoch_id"]) != identity:
+                raise ActivationEpochError("activation_epoch_not_current")
+            evidence = self._historical_outbox_hold_evidence_tx(
+                conn,
+                epoch=epoch,
+                allow_current_epoch=True,
+            )
+            conn.rollback()
+            return evidence
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _public_historical_outbox_disposition(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema_version": str(row["schema_version"]),
+            "disposition_id": str(row["disposition_id"]),
+            "disposition_sha256": str(row["disposition_sha256"]),
+            "epoch_id": str(row["epoch_id"]),
+            "epoch_state": str(row["epoch_state"]),
+            "hold_schema_version": str(row["hold_schema_version"]),
+            "row_schema_version": str(row["row_schema_version"]),
+            "cohort_count": int(row["cohort_count"]),
+            "cohort_sha256": str(row["cohort_sha256"]),
+            "owner_authorized": bool(row["owner_authorized"]),
+            "operator": str(row["operator"]),
+            "reason": str(row["reason"]),
+            "disposed_at": str(row["disposed_at"]),
+            "outbox_status": "quarantined",
+        }
+
+    def dispose_activation_historical_outbox_hold(
+        self,
+        *,
+        epoch_id: str,
+        expected_cohort_count: int,
+        expected_cohort_sha256: str,
+        owner_authorized: bool,
+        operator: str,
+        reason: str,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Quarantine one exact aborted cohort under an immutable owner audit."""
+        identity = self._normalize_activation_epoch_id(epoch_id)
+        if (
+            isinstance(expected_cohort_count, bool)
+            or not isinstance(expected_cohort_count, int)
+            or expected_cohort_count < 0
+        ):
+            raise ActivationEpochError(
+                "activation_historical_disposition_cohort_count_invalid"
+            )
+        expected_sha256 = self._normalize_activation_sha256(
+            expected_cohort_sha256,
+            "historical_disposition_cohort_sha256",
+        )
+        if owner_authorized is not True:
+            raise ActivationEpochError(
+                "activation_historical_disposition_owner_authorization_required"
+            )
+        actor, justification = self._normalize_activation_audit_text(operator, reason)
+        disposed_at = _iso(now)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            epoch = self._current_activation_epoch_tx(conn)
+            if epoch is None or str(epoch["epoch_id"]) != identity:
+                raise ActivationEpochError("activation_epoch_not_current")
+            if str(epoch["state"]) != "aborted":
+                raise ActivationEpochError(
+                    "activation_historical_disposition_epoch_not_aborted"
+                )
+            hold = conn.execute(
+                "SELECT * FROM rca_activation_historical_outbox_holds "
+                "WHERE epoch_id = ?",
+                (identity,),
+            ).fetchone()
+            if hold is None:
+                raise ActivationEpochError("activation_historical_hold_not_sealed")
+            if (
+                int(hold["cohort_count"]) != expected_cohort_count
+                or str(hold["cohort_sha256"]) != expected_sha256
+            ):
+                raise ActivationEpochError(
+                    "activation_historical_disposition_cohort_binding_changed"
+                )
+            existing = conn.execute(
+                "SELECT * FROM rca_activation_historical_outbox_dispositions "
+                "WHERE epoch_id = ?",
+                (identity,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    int(existing["cohort_count"]) != expected_cohort_count
+                    or str(existing["cohort_sha256"]) != expected_sha256
+                    or str(existing["operator"]) != actor
+                    or str(existing["reason"]) != justification
+                    or int(existing["owner_authorized"]) != 1
+                ):
+                    raise ActivationEpochError(
+                        "activation_historical_disposition_binding_conflict"
+                    )
+                self._validate_v13_historical_outbox_hold_schema(conn)
+                result = self._public_historical_outbox_disposition(existing)
+                conn.commit()
+                return result
+            evidence = self._require_historical_outbox_hold_match_tx(
+                conn,
+                epoch=epoch,
+                allow_current_epoch=True,
+            )
+            if (
+                int(evidence["sealed_count"]) != expected_cohort_count
+                or str(evidence["sealed_sha256"]) != expected_sha256
+            ):
+                raise ActivationEpochError(
+                    "activation_historical_disposition_cohort_binding_changed"
+                )
+            items = [
+                {
+                    "outbox_id": int(row["outbox_id"]),
+                    "row_sha256": str(row["row_sha256"]),
+                    "immutable_row_sha256": str(row["immutable_row_sha256"]),
+                }
+                for row in conn.execute(
+                    "SELECT outbox_id, row_sha256, immutable_row_sha256 "
+                    "FROM rca_activation_historical_outbox_hold_items "
+                    "WHERE epoch_id = ? ORDER BY outbox_id",
+                    (identity,),
+                ).fetchall()
+            ]
+            covered_holds = [
+                {
+                    "epoch_id": identity,
+                    "state": str(epoch["state"]),
+                    "cohort_count": int(hold["cohort_count"]),
+                    "cohort_sha256": str(hold["cohort_sha256"]),
+                }
+            ]
+            if items:
+                outbox_ids = [item["outbox_id"] for item in items]
+                placeholders = ",".join("?" for _ in outbox_ids)
+                covered_holds = [
+                    dict(row)
+                    for row in conn.execute(
+                        f"""
+                        SELECT DISTINCT referenced_epoch.epoch_id,
+                                        referenced_epoch.state,
+                                        referenced_hold.cohort_count,
+                                        referenced_hold.cohort_sha256
+                          FROM rca_activation_historical_outbox_hold_items AS held
+                          JOIN rca_activation_historical_outbox_holds
+                               AS referenced_hold
+                            ON referenced_hold.epoch_id = held.epoch_id
+                          JOIN rca_activation_epochs AS referenced_epoch
+                            ON referenced_epoch.epoch_id = held.epoch_id
+                         WHERE held.outbox_id IN ({placeholders})
+                         ORDER BY referenced_epoch.epoch_id
+                        """,
+                        tuple(outbox_ids),
+                    ).fetchall()
+                ]
+                for covered_hold in covered_holds:
+                    if str(covered_hold["state"]) != "aborted":
+                        raise ActivationEpochError(
+                            "activation_historical_disposition_active_epoch_reference"
+                        )
+                    referenced_items = [
+                        {
+                            "outbox_id": int(row["outbox_id"]),
+                            "row_sha256": str(row["row_sha256"]),
+                            "immutable_row_sha256": str(
+                                row["immutable_row_sha256"]
+                            ),
+                        }
+                        for row in conn.execute(
+                            "SELECT outbox_id, row_sha256, immutable_row_sha256 "
+                            "FROM rca_activation_historical_outbox_hold_items "
+                            "WHERE epoch_id = ? ORDER BY outbox_id",
+                            (covered_hold["epoch_id"],),
+                        ).fetchall()
+                    ]
+                    if (
+                        referenced_items != items
+                        or int(covered_hold["cohort_count"])
+                        != expected_cohort_count
+                        or str(covered_hold["cohort_sha256"]) != expected_sha256
+                    ):
+                        raise ActivationEpochError(
+                            "activation_historical_disposition_overlapping_cohort_changed"
+                        )
+            if identity not in {
+                str(covered_hold["epoch_id"]) for covered_hold in covered_holds
+            }:
+                raise ActivationEpochError(
+                    "activation_historical_disposition_current_hold_missing"
+                )
+            for covered_hold in covered_holds:
+                overlapping = conn.execute(
+                    "SELECT 1 FROM rca_activation_historical_outbox_dispositions "
+                    "WHERE epoch_id = ?",
+                    (covered_hold["epoch_id"],),
+                ).fetchone()
+                if overlapping is not None:
+                    raise ActivationEpochError(
+                        "activation_historical_disposition_overlapping_epoch_disposed"
+                    )
+            for item in items:
+                parent = conn.execute(
+                    """
+                    SELECT trigger.state
+                      FROM rca_outbox AS outbox
+                      JOIN business_triggers AS trigger
+                        ON trigger.business_key = outbox.business_key
+                       AND trigger.generation = outbox.generation
+                       AND trigger.submission_key = outbox.submission_key
+                     WHERE outbox.outbox_id = ?
+                    """,
+                    (item["outbox_id"],),
+                ).fetchone()
+                if parent is None or str(parent["state"]) != "pending":
+                    raise ActivationEpochError(
+                        "activation_historical_disposition_parent_state_invalid"
+                    )
+            disposition_id = ""
+            for covered_hold in covered_holds:
+                covered_epoch_id = str(covered_hold["epoch_id"])
+                binding = self._historical_outbox_disposition_binding(
+                    epoch_id=covered_epoch_id,
+                    cohort_count=expected_cohort_count,
+                    cohort_sha256=expected_sha256,
+                    operator=actor,
+                    reason=justification,
+                    disposed_at=disposed_at,
+                )
+                disposition_sha256 = _canonical_sha256(binding)
+                covered_disposition_id = (
+                    f"rca-hold-disposition-v1-{disposition_sha256}"
+                )
+                conn.execute(
+                    """
+                    INSERT INTO rca_activation_historical_outbox_dispositions(
+                        disposition_id, epoch_id, epoch_state, schema_version,
+                        hold_schema_version, row_schema_version,
+                        cohort_count, cohort_sha256, owner_authorized,
+                        operator, reason, disposed_at, disposition_sha256
+                    ) VALUES (?, ?, 'aborted', ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                    """,
+                    (
+                        covered_disposition_id,
+                        covered_epoch_id,
+                        ACTIVATION_HISTORICAL_OUTBOX_DISPOSITION_SCHEMA_VERSION,
+                        ACTIVATION_HISTORICAL_OUTBOX_HOLD_SCHEMA_VERSION,
+                        ACTIVATION_HISTORICAL_OUTBOX_ROW_SCHEMA_VERSION,
+                        expected_cohort_count,
+                        expected_sha256,
+                        actor,
+                        justification,
+                        disposed_at,
+                        disposition_sha256,
+                    ),
+                )
+                conn.executemany(
+                    """
+                    INSERT INTO rca_activation_historical_outbox_disposition_items(
+                        disposition_id, outbox_id, row_sha256,
+                        immutable_row_sha256
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            covered_disposition_id,
+                            item["outbox_id"],
+                            item["row_sha256"],
+                            item["immutable_row_sha256"],
+                        )
+                        for item in items
+                    ],
+                )
+                if covered_epoch_id == identity:
+                    disposition_id = covered_disposition_id
+            if not disposition_id:
+                raise ActivationEpochError(
+                    "activation_historical_disposition_current_audit_missing"
+                )
+            for item in items:
+                updated = conn.execute(
+                    """
+                    UPDATE rca_outbox
+                       SET status = 'quarantined', next_attempt_at = NULL,
+                           quarantined_at = ?,
+                           last_error_code = ?,
+                           last_error_detail = 'owner_audited_disposition',
+                           updated_at = ?
+                     WHERE outbox_id = ? AND status = 'pending'
+                       AND activation_epoch_id IS NULL
+                       AND activation_ledger_id IS NULL
+                       AND lease_token IS NULL AND lease_owner IS NULL
+                       AND lease_expires_at IS NULL AND claimed_at IS NULL
+                       AND completed_at IS NULL AND result_json IS NULL
+                    """,
+                    (
+                        disposed_at,
+                        ACTIVATION_HISTORICAL_OUTBOX_DISPOSITION_ERROR_CODE,
+                        disposed_at,
+                        item["outbox_id"],
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise ActivationEpochError(
+                        "activation_historical_disposition_outbox_state_changed"
+                    )
+                parent_updated = conn.execute(
+                    """
+                    UPDATE business_triggers
+                       SET state = 'quarantined'
+                     WHERE business_key = (
+                               SELECT business_key FROM rca_outbox WHERE outbox_id = ?
+                           )
+                       AND generation = (
+                               SELECT generation FROM rca_outbox WHERE outbox_id = ?
+                           )
+                       AND state = 'pending'
+                    """,
+                    (item["outbox_id"], item["outbox_id"]),
+                )
+                if parent_updated.rowcount != 1:
+                    raise ActivationEpochError(
+                        "activation_historical_disposition_parent_state_changed"
+                    )
+            self._validate_v13_historical_outbox_hold_schema(conn)
+            disposition = conn.execute(
+                "SELECT * FROM rca_activation_historical_outbox_dispositions "
+                "WHERE disposition_id = ?",
+                (disposition_id,),
+            ).fetchone()
+            if disposition is None:
+                raise ActivationEpochError(
+                    "activation_historical_disposition_commit_lost"
+                )
+            result = self._public_historical_outbox_disposition(disposition)
+            conn.commit()
+            return result
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
         finally:
             conn.close()
 
@@ -4169,14 +5590,19 @@ class RcaControlStore:
             )
         return total
 
-    @staticmethod
+    @classmethod
     def _validate_consumed_activation_executions_tx(
+        cls,
         conn: sqlite3.Connection,
         *,
         epoch: sqlite3.Row,
         end_fence_json: str,
     ) -> str:
         epoch_id = str(epoch["epoch_id"])
+        historical_hold = cls._require_historical_outbox_hold_match_tx(
+            conn,
+            epoch=epoch,
+        )
         rows = conn.execute(
             """
             SELECT s.slot_kind, s.authorized_identity_sha256,
@@ -4305,6 +5731,12 @@ class RcaControlStore:
                 """
                 SELECT COUNT(*) FROM rca_outbox AS o
                  WHERE o.status IN ('pending', 'claimed')
+                   AND NOT EXISTS (
+                       SELECT 1
+                         FROM rca_activation_historical_outbox_hold_items AS held
+                        WHERE held.epoch_id = ?
+                          AND held.outbox_id = o.outbox_id
+                   )
                    AND (
                        o.activation_epoch_id IS NULL
                        OR o.activation_epoch_id != ?
@@ -4318,7 +5750,7 @@ class RcaControlStore:
                        )
                    )
                 """,
-                (epoch_id,),
+                (epoch_id, epoch_id),
             ).fetchone()[0]
         )
         historical_held = int(
@@ -4380,32 +5812,22 @@ class RcaControlStore:
         release_binding = {
             "epoch_id": epoch_id,
             "state": "bounded_active",
-            "preauthorization_fingerprint": str(
-                epoch["preauthorization_fingerprint"]
-            ),
+            "preauthorization_fingerprint": str(epoch["preauthorization_fingerprint"]),
             "preauthorization_gate_receipt_sha256": str(
                 epoch["preauthorization_gate_receipt_sha256"]
             ),
             "preauthorization_capsule_sha256": str(
                 epoch["preauthorization_capsule_sha256"]
             ),
-            "preproduction_fingerprint": str(
-                epoch["preproduction_fingerprint"]
-            ),
+            "preproduction_fingerprint": str(epoch["preproduction_fingerprint"]),
             "preproduction_gate_receipt_sha256": str(
                 epoch["preproduction_gate_receipt_sha256"]
             ),
-            "preproduction_capsule_sha256": str(
-                epoch["preproduction_capsule_sha256"]
-            ),
+            "preproduction_capsule_sha256": str(epoch["preproduction_capsule_sha256"]),
             "config_sha256": str(epoch["config_sha256"]),
-            "db_logical_identity_sha256": str(
-                epoch["db_logical_identity_sha256"]
-            ),
+            "db_logical_identity_sha256": str(epoch["db_logical_identity_sha256"]),
             "bounded_activated_at": str(epoch["bounded_activated_at"]),
-            "partition_start_fence_sha256": str(
-                epoch["partition_start_fence_sha256"]
-            ),
+            "partition_start_fence_sha256": str(epoch["partition_start_fence_sha256"]),
             "partition_start_fence": start_fence,
             "kafka_coordinate": {
                 "topic": topic,
@@ -4416,6 +5838,11 @@ class RcaControlStore:
             "unexpected_admissions": 0,
             "historical_blocked": 0,
             "historical_held": 0,
+            "historical_hold_count": historical_hold["sealed_count"],
+            "historical_hold_sha256": historical_hold["sealed_sha256"],
+            "historical_hold_row_schema_version": historical_hold[
+                "row_schema_version"
+            ],
             "pending_inbox": 0,
             "unbound_ledger": 0,
             "inflight_writes": 0,
@@ -4612,6 +6039,11 @@ class RcaControlStore:
             if expected and prior != expected:
                 raise ActivationEpochError("activation_epoch_state_changed")
             if prior == target:
+                if target in {"bounded_active", "steady_active"}:
+                    self._require_historical_outbox_hold_match_tx(
+                        conn,
+                        epoch=epoch,
+                    )
                 if target == "confirmed":
                     if end_fence_json is None:
                         raise ActivationEpochError(
@@ -4630,6 +6062,20 @@ class RcaControlStore:
                     ):
                         raise ActivationEpochError(
                             "activation_confirmation_binding_conflict"
+                        )
+                    release_binding_sha256 = (
+                        self._validate_consumed_activation_executions_tx(
+                            conn,
+                            epoch=epoch,
+                            end_fence_json=end_fence_json,
+                        )
+                    )
+                    if (
+                        release_binding_sha256
+                        != expected_confirmation_bindings["release_binding_sha256"]
+                    ):
+                        raise ActivationEpochError(
+                            "activation_confirmation_release_binding_changed"
                         )
                 conn.commit()
                 return self._public_activation_epoch(epoch)
@@ -4656,6 +6102,10 @@ class RcaControlStore:
             fields = ["state = ?", "updated_at = ?"]
             parameters: list[Any] = [target, current]
             if target == "bounded_active":
+                self._require_historical_outbox_hold_match_tx(
+                    conn,
+                    epoch=epoch,
+                )
                 if any(
                     not str(epoch[field] or "")
                     for field in (
@@ -4737,6 +6187,10 @@ class RcaControlStore:
                     ]
                 )
             elif target == "steady_active":
+                self._require_historical_outbox_hold_match_tx(
+                    conn,
+                    epoch=epoch,
+                )
                 if (
                     not str(epoch["production_fingerprint"] or "")
                     or not str(epoch["production_gate_receipt_sha256"] or "")
@@ -7624,8 +9078,34 @@ class RcaControlStore:
             error_prefix="incompatible_control_store_schema",
         )
         RcaControlStore._validate_v11_snapshot_schema(conn)
-        if RcaControlStore._table_exists(conn, "rca_learning_lane_admissions"):
+        marker = conn.execute(
+            "SELECT value FROM control_meta WHERE key = 'schema_version'"
+        ).fetchone()
+        marker_value = str(marker["value"]) if marker is not None else ""
+        v12_tables_present = any(
+            RcaControlStore._table_exists(conn, table)
+            for table in (
+                "rca_learning_lane_cohorts",
+                "rca_learning_lane_stock_items",
+                "rca_learning_lane_admissions",
+            )
+        )
+        if marker_value in {
+            "pnc_rca_control_store_v12",
+            CONTROL_STORE_SCHEMA_VERSION,
+        } or v12_tables_present:
             RcaControlStore._validate_v12_learning_lane_schema(conn)
+        v13_tables_present = any(
+            RcaControlStore._table_exists(conn, table)
+            for table in (
+                "rca_activation_historical_outbox_holds",
+                "rca_activation_historical_outbox_hold_items",
+                "rca_activation_historical_outbox_dispositions",
+                "rca_activation_historical_outbox_disposition_items",
+            )
+        )
+        if marker_value == CONTROL_STORE_SCHEMA_VERSION or v13_tables_present:
+            RcaControlStore._validate_v13_historical_outbox_hold_schema(conn)
 
         def foreign_key_groups(table: str) -> dict[tuple[int, str], set[tuple[str, str]]]:
             groups: dict[tuple[int, str], set[tuple[str, str]]] = {}
@@ -12598,7 +14078,11 @@ class RcaControlStore:
                 f"(({ledger_match}) OR ("
                 f"{alias}.activation_epoch_id IS NULL "
                 f"AND {alias}.activation_ledger_id IS NULL "
-                f"AND {alias}.submission_key IN ({placeholders})))"
+                f"AND {alias}.submission_key IN ({placeholders}) "
+                "AND NOT EXISTS ("
+                "SELECT 1 "
+                "FROM rca_activation_historical_outbox_hold_items AS held "
+                f"WHERE held.outbox_id = {alias}.outbox_id)))"
             )
             parameters.extend(allowlist)
         return f"({ledger_match})", tuple(parameters)
@@ -13396,6 +14880,10 @@ class RcaControlStore:
             "rca_learning_lane_cohorts",
             "rca_learning_lane_stock_items",
             "rca_learning_lane_admissions",
+            "rca_activation_historical_outbox_holds",
+            "rca_activation_historical_outbox_hold_items",
+            "rca_activation_historical_outbox_dispositions",
+            "rca_activation_historical_outbox_disposition_items",
         }
         if table not in allowed:
             raise ValueError(f"unsupported table: {table}")
@@ -13415,6 +14903,11 @@ class RcaControlStore:
                     """
                     SELECT COUNT(*) FROM rca_outbox
                      WHERE status IN ('pending', 'claimed')
+                       AND NOT EXISTS (
+                           SELECT 1
+                             FROM rca_activation_historical_outbox_hold_items AS held
+                            WHERE held.outbox_id = rca_outbox.outbox_id
+                       )
                     """
                 ).fetchone()[0]
             )
@@ -13663,9 +15156,23 @@ class RcaControlStore:
             }
             activation_current = None
             bounded_canaries_completed_count = 0
+            historical_hold_count = 0
             if current_epoch is not None:
                 epoch_id = str(current_epoch["epoch_id"])
                 activation_current = self._public_activation_epoch(current_epoch)
+                historical_hold = conn.execute(
+                    "SELECT cohort_count "
+                    "FROM rca_activation_historical_outbox_holds "
+                    "WHERE epoch_id = ? AND NOT EXISTS ("
+                    "SELECT 1 FROM rca_activation_historical_outbox_dispositions "
+                    "WHERE epoch_id = ?)",
+                    (epoch_id, epoch_id),
+                ).fetchone()
+                historical_hold_count = (
+                    int(historical_hold["cohort_count"])
+                    if historical_hold is not None
+                    else 0
+                )
                 for slot_row in conn.execute(
                     """
                     SELECT slot_kind, authorized_identity_sha256,
@@ -13763,6 +15270,12 @@ class RcaControlStore:
                         """
                         SELECT COUNT(*) FROM rca_outbox AS o
                          WHERE o.status IN ('pending', 'claimed')
+                           AND NOT EXISTS (
+                               SELECT 1
+                                 FROM rca_activation_historical_outbox_hold_items AS held
+                                WHERE held.epoch_id = ?
+                                  AND held.outbox_id = o.outbox_id
+                           )
                            AND (
                                o.activation_epoch_id IS NULL
                                OR o.activation_epoch_id != ?
@@ -13776,12 +15289,13 @@ class RcaControlStore:
                                )
                            )
                         """,
-                        (epoch_id,),
+                        (epoch_id, epoch_id),
                     ).fetchone()[0]
                 )
-                activation_backlog["historical_held"] = int(
-                    conn.execute(
-                        """
+                activation_backlog["historical_held"] = (
+                    int(
+                        conn.execute(
+                            """
                         SELECT COUNT(*) FROM rca_outbox AS o
                          WHERE o.status = 'shadow'
                            AND (
@@ -13789,8 +15303,10 @@ class RcaControlStore:
                                OR o.activation_epoch_id != ?
                            )
                         """,
-                        (epoch_id,),
-                    ).fetchone()[0]
+                            (epoch_id,),
+                        ).fetchone()[0]
+                    )
+                    + historical_hold_count
                 )
             else:
                 activation_backlog["historical_blocked"] = int(

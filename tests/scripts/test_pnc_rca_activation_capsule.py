@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from gateway.pnc_rca_control_store import (
+    CONTROL_STORE_SCHEMA_VERSION,
     KafkaRecord,
     MANUAL_TRIGGER_SCHEMA_VERSION,
     ManualRcaTriggerRequest,
@@ -121,7 +122,7 @@ def _database_identity(
                 "path": str(control_path.absolute()),
                 "device": control_stat.st_dev,
                 "inode": control_stat.st_ino,
-                "schema_version": "pnc_rca_control_store_v12",
+                "schema_version": CONTROL_STORE_SCHEMA_VERSION,
                 "db_instance_id": None,
                 "genesis_intent_sha256": None,
             },

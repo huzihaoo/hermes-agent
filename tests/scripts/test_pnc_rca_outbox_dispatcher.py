@@ -7,8 +7,10 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.pnc_rca_prod_bootstrap import RcaBootstrapAuthorizationError
+from gateway.pnc_rca_control_store import RcaControlStore
 from gateway.pnc_rca_runtime_identity import RCA_RUNTIME_RELATIVE_FILES
 from scripts import pnc_rca_outbox_dispatcher as dispatcher
+from tests.gateway.test_pnc_rca_control_store import _policy, _record
 
 
 RELEASE_ID = "rca-v0182-test-release"
@@ -61,6 +63,8 @@ def test_config_requires_and_projects_production_capacity_binding(tmp_path):
     )
 
     public = config.public_dict()
+    assert config.activation_required is False
+    assert public["activation_required"] is False
     assert public["capacity_mode"] == "bootstrap"
     assert public["release_id"] == RELEASE_ID
     assert public["bootstrap_epoch_id"] == EPOCH_ID
@@ -68,6 +72,106 @@ def test_config_requires_and_projects_production_capacity_binding(tmp_path):
         tmp_path / "active-release-binding.json"
     )
     assert config.live_env_path == tmp_path / ".env"
+
+
+def test_config_exposes_strict_activation_required(tmp_path):
+    env = _config_env(tmp_path)
+    env["HERMES_RCA_OUTBOX_ACTIVATION_REQUIRED"] = "true"
+
+    config = dispatcher.DispatcherConfig.from_env(env, hermes_home=tmp_path)
+
+    assert config.activation_required is True
+    assert config.public_dict()["activation_required"] is True
+
+
+@pytest.mark.parametrize("value", ["1", "0", "yes", "on", "off", ""])
+def test_activation_required_rejects_boolean_aliases(tmp_path, value):
+    env = _config_env(tmp_path)
+    env["HERMES_RCA_OUTBOX_ACTIVATION_REQUIRED"] = value
+
+    with pytest.raises(ValueError, match="exactly true or false"):
+        dispatcher.DispatcherConfig.from_env(env, hermes_home=tmp_path)
+
+
+def test_dispatcher_activation_gate_does_not_claim_legacy_null_row(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    legacy = store.ingest_record(
+        _record(),
+        policy=_policy(),
+        submit_enabled=True,
+    )
+    env = _config_env(tmp_path, enabled=True)
+    env["HERMES_RCA_OUTBOX_ACTIVATION_REQUIRED"] = "true"
+    config = dispatcher.DispatcherConfig.from_env(env, hermes_home=tmp_path)
+    instance = dispatcher.OutboxDispatcher(
+        store=store,
+        config=config,
+        enrich=lambda _claim: None,
+        storage_admission=lambda _request: {},
+        submit=lambda _admission, _request: {},
+        derived_capacity_reservation=lambda _request: None,
+        lease_owner="activation-required-test",
+    )
+    instance._delivery_backpressure_outcome = lambda: None
+
+    outcome = instance.dispatch_one()
+
+    assert outcome.status == "idle"
+    [row] = store.list_rows("rca_outbox")
+    assert row["submission_key"] == legacy.submission_key
+    assert row["activation_epoch_id"] is None
+    assert row["activation_ledger_id"] is None
+    assert row["status"] == "pending"
+    assert row["lease_token"] is None
+
+
+def test_dispatcher_renew_passes_activation_required(tmp_path):
+    env = _config_env(tmp_path)
+    env["HERMES_RCA_OUTBOX_ACTIVATION_REQUIRED"] = "true"
+    calls = []
+    instance = object.__new__(dispatcher.OutboxDispatcher)
+    instance.config = dispatcher.DispatcherConfig.from_env(
+        env,
+        hermes_home=tmp_path,
+    )
+    instance.store = SimpleNamespace(
+        extend_outbox_lease=lambda **kwargs: calls.append(kwargs)
+    )
+    instance.now = lambda: datetime.now(timezone.utc)
+    claim = SimpleNamespace(
+        outbox_id=17,
+        lease_token="lease-token",
+        lease_owner="lease-owner",
+    )
+
+    instance._renew(claim)
+
+    assert calls[0]["activation_required"] is True
+
+
+def test_dispatcher_dry_run_does_not_preview_legacy_null_row(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    store.ingest_record(_record(), policy=_policy(), submit_enabled=True)
+    env = _config_env(tmp_path)
+    env["HERMES_RCA_OUTBOX_ACTIVATION_REQUIRED"] = "true"
+    config = dispatcher.DispatcherConfig.from_env(env, hermes_home=tmp_path)
+    monkeypatch.setattr(dispatcher, "load_dispatcher_environment", lambda _path: None)
+    monkeypatch.setattr(
+        dispatcher.DispatcherConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+
+    assert dispatcher.main(["--dry-run"]) == 0
+
+    assert '"due_count_in_sample": 0' in capsys.readouterr().out
+    [row] = store.list_rows("rca_outbox")
+    assert row["status"] == "pending"
+    assert row["lease_token"] is None
 
 
 def test_config_fails_closed_without_production_capacity_mode(tmp_path):
