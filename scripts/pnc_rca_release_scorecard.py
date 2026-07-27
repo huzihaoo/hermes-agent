@@ -34,7 +34,8 @@ if str(REPO_ROOT) not in sys.path:
 from gateway.pnc_rca_requester_identity import classify_rca_requester
 
 
-SCHEMA_VERSION = "pnc_rca_release_scorecard_v1"
+SCHEMA_VERSION = "pnc_rca_release_scorecard_v2"
+LEGACY_SCHEMA_VERSION = "pnc_rca_release_scorecard_v1"
 RELEASE_STATUS = "NOT_GA"
 LOCAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
 MAX_JSON_BYTES = 96 * 1024 * 1024
@@ -609,6 +610,7 @@ def _latest_canary_row(
         predicate = """
             s.source_kind = 'kafka_workflow_event'
             AND s.mode = 'issue_created'
+            AND s.requester_id LIKE 'ou_%'
             AND s.kafka_event_uid IS NOT NULL AND s.kafka_event_uid != ''
         """
     elif kind == "feishu_topic":
@@ -645,14 +647,58 @@ def _latest_canary_row(
     ).fetchone()
 
 
-def _formal_report_url(value: Any) -> bool:
-    text = str(value or "")
-    return (
-        text.startswith("https://")
-        and ".minieye.tech/" in text
-        and text.endswith("/index.html")
-        and ".viz.mcap" not in text
+def _publication_report_url_checks(
+    value: Any,
+    *,
+    issue_effect: Mapping[str, Any] | None,
+) -> tuple[dict[str, bool], dict[str, str]]:
+    text = str(value or "").strip()
+    nonempty = bool(text)
+    not_viz_mcap = ".viz.mcap" not in text.lower()
+    receipt = (
+        issue_effect.get("remote_receipt", {})
+        if isinstance(issue_effect, Mapping)
+        else {}
     )
+    if not isinstance(receipt, Mapping):
+        receipt = {}
+    receipt_source = str(receipt.get("source") or "")
+    confirmed_report_url = str(receipt.get("confirmed_report_url") or "")
+    reachable = bool(
+        issue_effect
+        and issue_effect.get("status") == "succeeded"
+        and receipt_source in {"read_after_write", "read_after_recovery_write"}
+        and confirmed_report_url == text
+    )
+    checks = {
+        "report_url_nonempty": nonempty,
+        "report_url_reachable": reachable,
+        "report_url_not_viz_mcap": not_viz_mcap,
+    }
+    evidence = {
+        "effect_kind": str((issue_effect or {}).get("effect_kind") or ""),
+        "effect_status": str((issue_effect or {}).get("status") or ""),
+        "receipt_source": receipt_source,
+        "confirmed_report_url": confirmed_report_url,
+        "proof_basis": (
+            "dispatcher_prewrite_no_redirect_head_get_exact_size_sha256"
+            if reachable
+            else "dispatcher_prewrite_reachability_not_proven"
+        ),
+    }
+    return checks, evidence
+
+
+def _formal_report_url(
+    value: Any,
+    *,
+    issue_effect: Mapping[str, Any] | None = None,
+) -> bool:
+    checks, _evidence = _publication_report_url_checks(
+        value,
+        issue_effect=issue_effect,
+    )
+    return all(checks.values())
 
 
 def _mention_present(payload: Mapping[str, Any], requester_id: str) -> bool:
@@ -667,7 +713,7 @@ def _mention_present(payload: Mapping[str, Any], requester_id: str) -> bool:
 
 def _evaluate_canary(
     connection: sqlite3.Connection,
-    row: sqlite3.Row,
+    row: Mapping[str, Any] | sqlite3.Row,
     *,
     kind: str,
 ) -> dict[str, Any]:
@@ -679,6 +725,12 @@ def _evaluate_canary(
     issue = by_kind.get("feishu_issue_comment")
     thread = by_kind.get("feishu_thread_reply")
     report_url = str(value.get("report_url") or "")
+    report_url_checks, report_url_reachability_evidence = (
+        _publication_report_url_checks(
+            report_url,
+            issue_effect=issue,
+        )
+    )
     checks: dict[str, bool] = {
         "trigger_bound": bool(
             value.get("business_key") and value.get("submission_key")
@@ -688,11 +740,12 @@ def _evaluate_canary(
         "required_effects_succeeded": bool(required)
         and all(effect["status"] == "succeeded" for effect in required),
         "issue_comment_succeeded": bool(issue and issue["status"] == "succeeded"),
-        "formal_report_url": _formal_report_url(report_url),
+        "formal_report_url": all(report_url_checks.values()),
+        **report_url_checks,
         "readback_present": bool(
             issue
             and issue["remote_receipt"].get("source")
-            in {"read_before_write", "read_after_write"}
+            in {"read_before_write", "read_after_write", "read_after_recovery_write"}
         ),
     }
     if kind == "feishu_topic":
@@ -720,6 +773,7 @@ def _evaluate_canary(
         "generation": int(value.get("generation") or 0),
         "delivery_id": delivery_id,
         "report_url": report_url,
+        "report_url_reachability_evidence": report_url_reachability_evidence,
         "checks": checks,
     }
 
@@ -741,7 +795,11 @@ def _canary_state(
             "active_release_window_start": _timestamp(active_since),
             "latest_observation": latest_evidence,
         }
-    current_evidence = _evaluate_canary(connection, current, kind=kind)
+    current_evidence = _evaluate_canary(
+        connection,
+        current,
+        kind=kind,
+    )
     return {
         **current_evidence,
         "active_release_window_start": _timestamp(active_since),
@@ -826,10 +884,14 @@ def _database_evidence(
             ),
             "canaries": {
                 "natural_kafka": _canary_state(
-                    connection, kind="natural_kafka", active_since=active_since
+                    connection,
+                    kind="natural_kafka",
+                    active_since=active_since,
                 ),
                 "feishu_topic": _canary_state(
-                    connection, kind="feishu_topic", active_since=active_since
+                    connection,
+                    kind="feishu_topic",
+                    active_since=active_since,
                 ),
             },
         }
@@ -1490,7 +1552,8 @@ def build_scorecard(
 
 
 def validate_scorecard(scorecard: Mapping[str, Any]) -> None:
-    if scorecard.get("schema_version") != SCHEMA_VERSION:
+    schema_version = scorecard.get("schema_version")
+    if schema_version not in {SCHEMA_VERSION, LEGACY_SCHEMA_VERSION}:
         raise ScorecardError(
             "scorecard_schema_invalid", "scorecard schema version mismatch"
         )
@@ -1547,7 +1610,43 @@ def validate_scorecard(scorecard: Mapping[str, Any]) -> None:
     canaries = _required_mapping(live.get("canaries"), "live.canaries")
     for kind in ("natural_kafka", "feishu_topic"):
         canary = _required_mapping(canaries.get(kind), f"live.canaries.{kind}")
-        _required_text(canary.get("state"), f"live.canaries.{kind}.state")
+        canary_state = _required_text(
+            canary.get("state"), f"live.canaries.{kind}.state"
+        )
+        if canary_state not in {"pass", "fail", "not_observed_for_active_release"}:
+            raise ScorecardError(
+                "canary_state_invalid", f"live.canaries.{kind}.state is invalid"
+            )
+        if schema_version == SCHEMA_VERSION and canary_state in {"pass", "fail"}:
+            checks = _required_mapping(
+                canary.get("checks"), f"live.canaries.{kind}.checks"
+            )
+            publication_checks = {
+                name: checks.get(name)
+                for name in (
+                    "report_url_nonempty",
+                    "report_url_reachable",
+                    "report_url_not_viz_mcap",
+                )
+            }
+            if any(
+                not isinstance(value, bool) for value in publication_checks.values()
+            ):
+                raise ScorecardError(
+                    "canary_publication_check_invalid",
+                    f"live.canaries.{kind} publication checks are incomplete",
+                )
+            if checks.get("formal_report_url") != all(publication_checks.values()):
+                raise ScorecardError(
+                    "canary_publication_check_invalid",
+                    f"live.canaries.{kind} publication checks disagree",
+                )
+            expected_state = "pass" if all(checks.values()) else "fail"
+            if canary_state != expected_state:
+                raise ScorecardError(
+                    "canary_state_invalid",
+                    f"live.canaries.{kind}.state disagrees with checks",
+                )
     identities = _required_mapping(
         live.get("requester_identity_denominators"),
         "live.requester_identity_denominators",
@@ -1581,17 +1680,11 @@ def validate_scorecard(scorecard: Mapping[str, Any]) -> None:
         view = _required_mapping(lineage.get(window), f"release_lineage.{window}")
         for kind in ("host", "pipeline"):
             entries = view.get(kind)
-            if not isinstance(entries, list) or (
-                window == "seven_day" and not entries
-            ):
+            if not isinstance(entries, list) or (window == "seven_day" and not entries):
                 raise ScorecardError(
                     "required_field_empty",
                     f"release_lineage.{window}.{kind} must be "
-                    + (
-                        "a non-empty array"
-                        if window == "seven_day"
-                        else "an array"
-                    ),
+                    + ("a non-empty array" if window == "seven_day" else "an array"),
                 )
             for index, entry in enumerate(entries):
                 if not isinstance(entry, Mapping):
@@ -1639,6 +1732,14 @@ def validate_scorecard(scorecard: Mapping[str, Any]) -> None:
     if (
         attestation.get("production_mutation_performed") is not False
         or attestation.get("external_effects_triggered") is not False
+        or (
+            schema_version == SCHEMA_VERSION
+            and attestation.get("network_requests_performed") is not False
+        )
+        or (
+            schema_version == LEGACY_SCHEMA_VERSION
+            and attestation.get("network_requests_performed", False) is not False
+        )
     ):
         raise ScorecardError(
             "read_only_attestation_invalid", "scorecard is not read-only"
@@ -1769,7 +1870,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             validate_scorecard(value)
             print(
                 json.dumps(
-                    {"ok": True, "schema_version": SCHEMA_VERSION}, sort_keys=True
+                    {"ok": True, "schema_version": value["schema_version"]},
+                    sort_keys=True,
                 )
             )
             return 0

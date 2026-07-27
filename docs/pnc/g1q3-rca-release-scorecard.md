@@ -15,7 +15,11 @@ python3 scripts/pnc_rca_release_scorecard.py --validate scorecard.json
 The command reads the canonical live manifest, active release binding,
 resident health/state files, deployed business profile registry, and the RCA
 control database. SQLite is opened with URI `mode=ro`, `PRAGMA query_only=ON`,
-and a read transaction. The command does not restart services, mutate a plist,
+and a read transaction. Publication URL evidence is exactly non-empty,
+reachable, and not a `.viz.mcap` URL; an internal HTTP URL such as
+`http://192.168.26.174:18081/...` is eligible. Reachability is bound to the
+successful dispatcher receipt produced after its no-redirect HEAD+GET and
+exact size/hash check. The command does not restart services, mutate a plist,
 write a database, create a trigger, publish an effect, or call a network API.
 
 ## Source boundaries
