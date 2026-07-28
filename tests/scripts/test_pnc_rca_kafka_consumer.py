@@ -20,6 +20,7 @@ from gateway.pnc_rca_control_store import (
     RcaControlStore,
 )
 from gateway.pnc_rca_kafka_contract import WorkflowEventPolicy, WorkflowTransition
+from gateway.pnc_rca_write_fence import ExternalWriteFenceError
 from scripts import pnc_rca_kafka_consumer as consumer_module
 
 
@@ -922,10 +923,80 @@ def test_create_consumer_rejects_preauthorized_epoch_before_kafka_client(
         lambda name: fake_kafka if name == "kafka" else None,
     )
 
-    with pytest.raises(RuntimeError, match="rca_activation_ingress_not_open"):
+    with pytest.raises(ExternalWriteFenceError) as exc:
         consumer_module.create_consumer(config, store=store)
 
+    assert exc.value.code == "resident_activation_epoch_state_invalid"
     assert client_created is False
+
+
+def test_create_consumer_without_epoch_rejects_unsafe_false_flag_before_client(
+    monkeypatch,
+    tmp_path,
+):
+    config = _config(
+        tmp_path,
+        HERMES_RCA_KAFKA_SUBMIT_ENABLED="true",
+        HERMES_RCA_KAFKA_ACTIVATION_REQUIRED="false",
+    )
+    store = RcaControlStore(config.control_db_path)
+    client_created = False
+
+    class UnexpectedKafkaConsumer:
+        def __init__(self, **_kwargs):
+            nonlocal client_created
+            client_created = True
+
+    fake_kafka = SimpleNamespace(
+        KafkaConsumer=UnexpectedKafkaConsumer,
+        AsyncConsumerRebalanceListener=object,
+    )
+    monkeypatch.setattr(
+        consumer_module.importlib,
+        "import_module",
+        lambda name: fake_kafka if name == "kafka" else None,
+    )
+
+    with pytest.raises(ExternalWriteFenceError) as exc:
+        consumer_module.create_consumer(config, store=store)
+
+    assert exc.value.code == "resident_activation_epoch_missing"
+    assert client_created is False
+    assert store.list_rows("kafka_inbox") == []
+    assert store.list_rows("rca_outbox") == []
+
+
+def test_resident_main_without_epoch_exits_nonzero_with_zero_writes(
+    monkeypatch,
+    tmp_path,
+):
+    config = _config(
+        tmp_path,
+        HERMES_RCA_KAFKA_SUBMIT_ENABLED="true",
+        HERMES_RCA_KAFKA_ACTIVATION_REQUIRED="false",
+    )
+    store = RcaControlStore(config.control_db_path)
+    consumer_created = False
+
+    def unexpected_consumer(*_args, **_kwargs):
+        nonlocal consumer_created
+        consumer_created = True
+        raise AssertionError("consumer must not be created without an epoch")
+
+    monkeypatch.setattr(
+        consumer_module, "load_consumer_environment", lambda _path=None: tmp_path
+    )
+    monkeypatch.setattr(
+        consumer_module.ConsumerConfig,
+        "from_env",
+        lambda *_args, **_kwargs: config,
+    )
+    monkeypatch.setattr(consumer_module, "create_consumer", unexpected_consumer)
+
+    assert consumer_module.main([]) == 2
+    assert consumer_created is False
+    assert store.list_rows("kafka_inbox") == []
+    assert store.list_rows("rca_outbox") == []
 
 
 @pytest.mark.parametrize(

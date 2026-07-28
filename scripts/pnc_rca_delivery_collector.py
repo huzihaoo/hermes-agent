@@ -89,6 +89,7 @@ from gateway.pnc_rca_snapshot import (
 from gateway.pnc_rca_write_fence import (
     ExternalWriteFenceError,
     canonical_write_fence_sha256,
+    require_resident_activation_epoch,
     validate_write_fence,
     validate_write_fence_source_binding,
     write_fence_binding,
@@ -3712,6 +3713,19 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 2
+    if config.enabled and not args.dry_run:
+        try:
+            require_resident_activation_epoch(
+                RcaControlStore(config.control_db_path, require_current=True)
+            )
+        except ExternalWriteFenceError as exc:
+            print(
+                json.dumps(
+                    {"ok": False, "error": exc.code, "detail": exc.detail},
+                    ensure_ascii=False,
+                )
+            )
+            return 2
     collector = DeliveryCollector(store=store, config=config)
     if args.dry_run:
         print(json.dumps(collector.dry_run_once(), ensure_ascii=False))

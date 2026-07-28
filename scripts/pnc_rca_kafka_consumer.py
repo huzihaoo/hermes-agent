@@ -46,6 +46,10 @@ from gateway.pnc_rca_runtime_identity import (
     canonical_json_sha256,
     runtime_identity_is_valid,
 )
+from gateway.pnc_rca_write_fence import (
+    RESIDENT_INGRESS_OPEN_STATES,
+    require_resident_activation_epoch,
+)
 from hermes_constants import get_hermes_home
 
 
@@ -903,12 +907,12 @@ def _require_activation_ingress_open(
     store: RcaControlStore,
     config: ConsumerConfig,
 ) -> None:
-    if not config.activation_required:
+    if not config.submit_enabled:
         return
-    epoch = store.activation_epoch()
-    state = str((epoch or {}).get("state") or "unconfigured")
-    if state not in {"bounded_active", "confirmed", "steady_active"}:
-        raise RuntimeError(f"rca_activation_ingress_not_open:{state}")
+    require_resident_activation_epoch(
+        store,
+        allowed_states=RESIDENT_INGRESS_OPEN_STATES,
+    )
 
 
 def _default_commit_payload(message: Any) -> dict[Any, Any]:
@@ -2890,9 +2894,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if status.get("ok") is True else 2
 
         store = RcaControlStore(config.control_db_path, require_current=True)
+        _require_activation_ingress_open(store, config)
         health = HealthReporter(config, store)
         stats = PollStats()
-        _require_activation_ingress_open(store, config)
         recover_pending(
             store,
             stats,

@@ -174,6 +174,38 @@ def test_dispatcher_dry_run_does_not_preview_legacy_null_row(
     assert row["lease_token"] is None
 
 
+def test_enabled_resident_without_epoch_exits_before_dispatcher_creation(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    config = dispatcher.DispatcherConfig.from_env(
+        _config_env(tmp_path, enabled=True),
+        hermes_home=tmp_path,
+    )
+    store = RcaControlStore(config.control_db_path)
+    constructed = False
+
+    def unexpected_dispatcher(*_args, **_kwargs):
+        nonlocal constructed
+        constructed = True
+        raise AssertionError("dispatcher must not start without an active epoch")
+
+    monkeypatch.setattr(dispatcher, "load_dispatcher_environment", lambda _path: None)
+    monkeypatch.setattr(
+        dispatcher.DispatcherConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(dispatcher, "OutboxDispatcher", unexpected_dispatcher)
+
+    assert dispatcher.main(["--once"]) == 2
+    assert constructed is False
+    assert store.list_rows("kafka_inbox") == []
+    assert store.list_rows("rca_outbox") == []
+    assert "resident_activation_epoch_missing" in capsys.readouterr().err
+
+
 def test_config_fails_closed_without_production_capacity_mode(tmp_path):
     env = _config_env(tmp_path)
     env.pop("HERMES_RCA_PROD_CAPACITY_MODE")

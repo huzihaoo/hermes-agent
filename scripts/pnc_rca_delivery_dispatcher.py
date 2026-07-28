@@ -69,6 +69,7 @@ from gateway.pnc_rca_delivery_quarantine_baseline import (
     quarantine_baseline_settings,
     read_quarantine_baseline_status,
 )
+from gateway.pnc_rca_control_store import RcaControlStore
 from gateway.pnc_rca_delivery_store import (
     DeliveryEffectClaim,
     RcaDeliveryStore,
@@ -76,6 +77,8 @@ from gateway.pnc_rca_delivery_store import (
 )
 from gateway.pnc_rca_write_fence import (
     ExternalWriteFenceError,
+    RESIDENT_EXTERNAL_WRITE_STATES,
+    require_resident_activation_epoch,
     validate_write_fence,
 )
 from gateway.pnc_rca_conclusion_adjudication import (
@@ -2532,6 +2535,7 @@ class DeliveryDispatcher:
             if self.store.is_historical_external_write_effect(
                 claim.effect_created_at
             ):
+                self._validate_historical_external_write_epoch(claim)
                 return
             raise ExternalWriteFenceError("external_write_fence_missing")
         fence = binding.get("write_fence")
@@ -2540,6 +2544,7 @@ class DeliveryDispatcher:
             if self.store.is_historical_external_write_effect(
                 claim.effect_created_at
             ):
+                self._validate_historical_external_write_epoch(claim)
                 return
             raise ExternalWriteFenceError("external_write_fence_missing")
         try:
@@ -2582,6 +2587,21 @@ class DeliveryDispatcher:
             expected_target_set_sha256=expected_target_set_sha256,
             now=self.now(),
         )
+
+    def _validate_historical_external_write_epoch(
+        self, claim: DeliveryEffectClaim
+    ) -> None:
+        try:
+            require_resident_activation_epoch(
+                self.store,
+                allowed_states=RESIDENT_EXTERNAL_WRITE_STATES,
+            )
+        except ExternalWriteFenceError as exc:
+            if exc.code == "resident_activation_epoch_state_invalid":
+                raise StaleDeliveryEffectLeaseError(
+                    f"delivery activation changed for {claim.effect_key}"
+                ) from exc
+            raise
 
     @staticmethod
     def _adjudication_error_outcome(
@@ -3990,6 +4010,20 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 0
+
+    if config.enabled:
+        try:
+            require_resident_activation_epoch(
+                RcaControlStore(config.control_db_path, require_current=True)
+            )
+        except ExternalWriteFenceError as exc:
+            print(
+                json.dumps(
+                    {"ok": False, "error": exc.code, "detail": exc.detail},
+                    ensure_ascii=False,
+                )
+            )
+            return 2
 
     adapter = MeegleIssueCommentAdapter()
     thread_adapter = FeishuThreadReplyAdapter()

@@ -751,6 +751,23 @@ class RcaDeliveryStore:
             return False
         return observed.astimezone(timezone.utc) < boundary.astimezone(timezone.utc)
 
+    def activation_epoch(self) -> dict[str, Any] | None:
+        """Return the current epoch identity for resident safe-off checks."""
+
+        conn = self._connect()
+        try:
+            if not self._table_exists(conn, "rca_activation_epochs"):
+                return None
+            row = conn.execute(
+                "SELECT epoch_id, state FROM rca_activation_epochs "
+                "WHERE is_current = 1"
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return None
+        return {"epoch_id": str(row["epoch_id"]), "state": str(row["state"])}
+
     def validate_learning_lane_external_operation(
         self, *, business_key: str, generation: int, operation: str
     ) -> None:

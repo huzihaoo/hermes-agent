@@ -14,6 +14,7 @@ from gateway.pnc_rca_delivery_contract import (
     TERMINAL_FALLBACK_CONTRACT_SCHEMA_VERSION,
     TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
 )
+from gateway.pnc_rca_control_store import RcaControlStore
 from gateway.pnc_rca_delivery_store import RcaDeliveryStore
 from scripts import pnc_rca_delivery_collector as collector
 from scripts.pnc_foxglove_delivery import canonical_viz_mcap_path
@@ -92,6 +93,38 @@ def test_activation_required_defaults_false(tmp_path):
 
     assert config.activation_required is False
     assert config.public_dict()["activation_required"] is False
+
+
+def test_enabled_resident_without_epoch_exits_before_collector_creation(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    config = collector.CollectorConfig.from_env(
+        _config_env(tmp_path),
+        hermes_home=tmp_path,
+    )
+    control = RcaControlStore(config.control_db_path)
+    delivery = RcaDeliveryStore(config.control_db_path)
+    constructed = False
+
+    def unexpected_collector(*_args, **_kwargs):
+        nonlocal constructed
+        constructed = True
+        raise AssertionError("collector must not start without an active epoch")
+
+    monkeypatch.setattr(collector, "load_collector_environment", lambda: None)
+    monkeypatch.setattr(
+        collector.CollectorConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(collector, "DeliveryCollector", unexpected_collector)
+
+    assert collector.main(["--once"]) == 2
+    assert constructed is False
+    assert delivery.list_rows("rca_delivery_effects") == []
+    assert "resident_activation_epoch_missing" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("value", ["1", "0", "yes", "on", "off", ""])

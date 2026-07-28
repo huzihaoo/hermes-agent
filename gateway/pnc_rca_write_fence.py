@@ -31,6 +31,13 @@ WRITE_FENCE_ALLOWED_KINDS = frozenset(
         "internal_alert",
     }
 )
+RESIDENT_ACTIVATION_EPOCH_STATES = frozenset(
+    {"bounded_active", "steady_active"}
+)
+RESIDENT_INGRESS_OPEN_STATES = frozenset(
+    {"confirmed", "bounded_active", "steady_active"}
+)
+RESIDENT_EXTERNAL_WRITE_STATES = RESIDENT_ACTIVATION_EPOCH_STATES
 WRITE_FENCE_FIELDS = frozenset(
     {
         "schema_version",
@@ -60,6 +67,35 @@ class ExternalWriteFenceError(ValueError):
         self.code = str(code or "external_write_fence_invalid")[:120]
         self.detail = str(detail or self.code)[:1000]
         super().__init__(self.detail)
+
+
+def require_resident_activation_epoch(
+    store: Any,
+    *,
+    allowed_states: Any = RESIDENT_ACTIVATION_EPOCH_STATES,
+) -> dict[str, Any]:
+    """Require a current activation epoch without consulting environment flags."""
+
+    try:
+        epoch = store.activation_epoch()
+    except Exception as exc:
+        raise ExternalWriteFenceError(
+            "resident_activation_epoch_unavailable", type(exc).__name__
+        ) from exc
+    if not isinstance(epoch, Mapping):
+        raise ExternalWriteFenceError("resident_activation_epoch_missing")
+    epoch_id = str(epoch.get("epoch_id") or "").strip()
+    state = str(epoch.get("state") or "").strip()
+    states = frozenset(str(item or "").strip() for item in allowed_states)
+    if not states or any(not item for item in states):
+        raise ExternalWriteFenceError("resident_activation_epoch_policy_invalid")
+    if not epoch_id:
+        raise ExternalWriteFenceError("resident_activation_epoch_missing")
+    if state not in states:
+        raise ExternalWriteFenceError(
+            "resident_activation_epoch_state_invalid", state or "unconfigured"
+        )
+    return dict(epoch)
 
 
 def _canonical(value: Any) -> bytes:
@@ -644,6 +680,9 @@ def issue_snapshot_write_fence(
 
 __all__ = [
     "ExternalWriteFenceError",
+    "RESIDENT_ACTIVATION_EPOCH_STATES",
+    "RESIDENT_EXTERNAL_WRITE_STATES",
+    "RESIDENT_INGRESS_OPEN_STATES",
     "WRITE_FENCE_ALLOWED_KINDS",
     "WRITE_FENCE_FIELDS",
     "WRITE_FENCE_ID_PREFIX",
@@ -653,6 +692,7 @@ __all__ = [
     "canonical_utc",
     "canonical_write_fence_sha256",
     "issue_snapshot_write_fence",
+    "require_resident_activation_epoch",
     "snapshot_core_payload",
     "snapshot_core_sha256",
     "target_set_sha256",

@@ -101,6 +101,7 @@ from gateway.pnc_rca_snapshot import (
 )
 from gateway.pnc_rca_write_fence import (
     ExternalWriteFenceError,
+    require_resident_activation_epoch,
     validate_write_fence,
     validate_write_fence_source_binding,
     write_fence_binding,
@@ -3559,6 +3560,9 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             return 0
+
+        if config.dispatch_enabled:
+            require_resident_activation_epoch(store)
 
         dispatcher = OutboxDispatcher(
             store=store,

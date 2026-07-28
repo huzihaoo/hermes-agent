@@ -25,6 +25,7 @@ from gateway.pnc_rca_delivery_contract import (
     build_report_url,
     build_terminal_delivery,
 )
+from gateway.pnc_rca_control_store import RcaControlStore
 from gateway.pnc_rca_delivery_store import (
     RcaDeliveryStore,
     StaleDeliveryEffectLeaseError,
@@ -96,6 +97,39 @@ def test_delivery_dispatcher_main_disables_dotenv_interpolation(monkeypatch):
 
     assert dispatcher_module.main(["--check-config"]) == 2
     assert calls[0][1] == {"override": False, "interpolate": False}
+
+
+def test_enabled_resident_without_epoch_exits_before_provider_creation(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    config = _config(tmp_path, enabled=True)
+    control = RcaControlStore(config.control_db_path)
+    delivery = RcaDeliveryStore(config.control_db_path)
+    provider_created = False
+
+    def unexpected_provider(*_args, **_kwargs):
+        nonlocal provider_created
+        provider_created = True
+        raise AssertionError("provider must not start without an active epoch")
+
+    monkeypatch.setattr(
+        dispatcher_module, "load_delivery_dispatcher_environment", lambda: None
+    )
+    monkeypatch.setattr(
+        dispatcher_module.DispatcherConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(
+        dispatcher_module, "MeegleIssueCommentAdapter", unexpected_provider
+    )
+
+    assert dispatcher_module.main(["--once"]) == 2
+    assert provider_created is False
+    assert delivery.list_rows("rca_delivery_effects") == []
+    assert "resident_activation_epoch_missing" in capsys.readouterr().out
 
 
 def test_delivery_dispatcher_environment_loader_preserves_literal_expansion_syntax(
@@ -197,7 +231,8 @@ def _collector(
 
 
 def _seed(tmp_path, *, bundle_payload=None):
-    _control(tmp_path)
+    control, result = _control(tmp_path)
+    _bind_activation_execution(control, result, state="steady_active")
     collector = _collector(
         tmp_path,
         bundle_reader=(
@@ -209,7 +244,8 @@ def _seed(tmp_path, *, bundle_payload=None):
 
 
 def _seed_with_thread_subscription(tmp_path, *, bundle_payload=None):
-    control, _result = _control(tmp_path)
+    control, result = _control(tmp_path)
+    _bind_activation_execution(control, result, state="steady_active")
     trigger = control.list_rows("business_triggers")[0]
     store = RcaDeliveryStore(tmp_path / "control.sqlite3")
     _insert_subscription(
@@ -234,7 +270,8 @@ def _seed_with_thread_subscription(tmp_path, *, bundle_payload=None):
 
 
 def _seed_terminal(tmp_path, *, with_thread: bool = False):
-    control, _result = _control(tmp_path)
+    control, result = _control(tmp_path)
+    _bind_activation_execution(control, result, state="steady_active")
     admitted_at = (NOW - timedelta(seconds=1800)).isoformat()
     with sqlite3.connect(control.db_path) as conn:
         conn.execute(
@@ -683,7 +720,7 @@ def test_success_requires_read_before_http_add_and_read_after_remote_id(tmp_path
 
     outcome = dispatcher.dispatch_one()
 
-    assert outcome.status == "succeeded"
+    assert outcome.status == "succeeded", outcome
     assert outcome.remote_id == "comment-1"
     assert remote.list_calls == 2
     assert remote.add_calls == 1
@@ -1487,7 +1524,7 @@ def test_terminal_v2_epoch_switch_blocks_field_write_and_comment(tmp_path):
 
     outcome = dispatcher.dispatch_one()
 
-    assert outcome.status == "lease_lost"
+    assert outcome.status == "lease_lost", outcome
     assert remote.update_field_calls == 0
     assert remote.add_calls == 0
 

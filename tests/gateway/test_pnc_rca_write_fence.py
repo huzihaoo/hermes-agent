@@ -6,8 +6,10 @@ import pytest
 
 from gateway.pnc_rca_write_fence import (
     ExternalWriteFenceError,
+    RESIDENT_INGRESS_OPEN_STATES,
     build_issued_write_fence,
     canonical_write_fence_sha256,
+    require_resident_activation_epoch,
     snapshot_core_sha256,
     validate_write_fence,
     validate_write_fence_source_binding,
@@ -161,6 +163,31 @@ def test_legacy_boolean_does_not_grant_without_fence():
     with pytest.raises(ExternalWriteFenceError) as exc:
         validate_write_fence({}, operation="feishu_issue_comment", target="issue", now=NOW)
     assert exc.value.code == "external_write_fence_missing"
+
+
+def test_resident_epoch_guard_ignores_environment_style_booleans():
+    class Store:
+        def __init__(self, epoch):
+            self.epoch = epoch
+
+        def activation_epoch(self):
+            return self.epoch
+
+    with pytest.raises(ExternalWriteFenceError) as exc:
+        require_resident_activation_epoch(Store(None))
+    assert exc.value.code == "resident_activation_epoch_missing"
+
+    with pytest.raises(ExternalWriteFenceError) as exc:
+        require_resident_activation_epoch(
+            Store({"epoch_id": "epoch-safe", "state": "safe_off"})
+        )
+    assert exc.value.code == "resident_activation_epoch_state_invalid"
+
+    ingress = require_resident_activation_epoch(
+        Store({"epoch_id": "epoch-confirmed", "state": "confirmed"}),
+        allowed_states=RESIDENT_INGRESS_OPEN_STATES,
+    )
+    assert ingress["state"] == "confirmed"
 
 
 def test_source_binding_rejects_target_and_envelope_hash_mutations():
@@ -498,7 +525,7 @@ def test_delivery_cutoff_is_durable_and_grandfathers_only_old_rows(tmp_path):
     assert marker[0] == "2026-07-25T00:00:00+00:00"
 
 
-def test_dispatcher_grandfather_is_immutable_but_new_missing_fence_blocks():
+def test_dispatcher_missing_fence_blocks_historical_and_new_effects():
     pytest.importorskip("psutil")
     from scripts.pnc_rca_delivery_dispatcher import DeliveryDispatcher
 
@@ -516,28 +543,26 @@ def test_dispatcher_grandfather_is_immutable_but_new_missing_fence_blocks():
         def is_historical_external_write_effect(self, _created_at):
             return self.historical
 
+        def activation_epoch(self):
+            return None
+
     claim = SimpleNamespace(
         contract={},
         effect_created_at="2026-07-25T00:00:01+00:00",
         business_key="business-1",
         generation=1,
     )
-    historical_dispatcher = DeliveryDispatcher.__new__(DeliveryDispatcher)
-    historical_dispatcher.store = Store(True)
-    historical_dispatcher.now = lambda: NOW
-    historical_dispatcher._validate_external_write(
-        claim,
-        operation="feishu_issue_comment",
-        target="issue",
-    )
-
-    new_dispatcher = DeliveryDispatcher.__new__(DeliveryDispatcher)
-    new_dispatcher.store = Store(False)
-    new_dispatcher.now = lambda: NOW
-    with pytest.raises(ExternalWriteFenceError) as exc:
-        new_dispatcher._validate_external_write(
-            claim,
-            operation="feishu_issue_comment",
-            target="issue",
-        )
-    assert exc.value.code == "external_write_fence_missing"
+    for historical, expected_code in (
+        (True, "resident_activation_epoch_missing"),
+        (False, "external_write_fence_missing"),
+    ):
+        dispatcher = DeliveryDispatcher.__new__(DeliveryDispatcher)
+        dispatcher.store = Store(historical)
+        dispatcher.now = lambda: NOW
+        with pytest.raises(ExternalWriteFenceError) as exc:
+            dispatcher._validate_external_write(
+                claim,
+                operation="feishu_issue_comment",
+                target="issue",
+            )
+        assert exc.value.code == expected_code
