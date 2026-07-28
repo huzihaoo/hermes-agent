@@ -28,6 +28,14 @@ from gateway.pnc_rca_kafka_contract import (
     build_event_admission,
     classify_workflow_event,
 )
+from gateway.pnc_rca_gray_samples import (
+    GRAY_SAMPLE_DAILY_LIMIT,
+    GRAY_SAMPLE_REQUESTER_ID,
+    build_gray_sample_message_id,
+    build_gray_sample_reason,
+    gray_sample_issue_url,
+    normalize_gray_sample_automation_authority,
+)
 from gateway.pnc_rca_runtime_transition import (
     ensure_host_runtime_transition_schema,
     insert_host_runtime_transition,
@@ -3832,6 +3840,16 @@ class RcaControlStore:
             normalized["issue_url"] = normalized["issue_url"].rstrip("/")
             if normalized["mode"] not in {"run_or_join", "rerun", "debug"}:
                 raise ActivationEpochError("activation_manual_mode_invalid")
+            automation_authority = value.get("automation_authority")
+            if automation_authority is not None:
+                try:
+                    normalized["automation_authority"] = (
+                        normalize_gray_sample_automation_authority(
+                            automation_authority
+                        )
+                    )
+                except ValueError as exc:
+                    raise ActivationEpochError(str(exc)) from exc
         canonical = _canonical_json(normalized)
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest(), normalized
 
@@ -11736,6 +11754,7 @@ class RcaControlStore:
         outbox_high_watermark: int = DEFAULT_OUTBOX_HIGH_WATERMARK,
         activation_required: bool = False,
         activation_slot_kind: str = "",
+        automation_authority: Mapping[str, Any] | None = None,
         snapshot_authority: Any = None,
         snapshot_ticket_authority: Mapping[str, Any] | None = None,
         snapshot_manual_ingress_authority: Mapping[str, Any] | None = None,
@@ -11749,6 +11768,38 @@ class RcaControlStore:
         activation_slot = str(activation_slot_kind or "").strip()
         if activation_slot and activation_slot not in ACTIVATION_SLOT_KINDS:
             raise ManualRcaAdmissionError("manual_activation_slot_invalid")
+        gray_sample_authority: dict[str, str] | None = None
+        if automation_authority is not None:
+            try:
+                gray_sample_authority = normalize_gray_sample_automation_authority(
+                    automation_authority
+                )
+            except ValueError as exc:
+                raise ManualRcaAdmissionError(str(exc)) from exc
+            if (
+                manual.platform != "operator"
+                or manual.mode != "rerun"
+                or manual.requester_id != GRAY_SAMPLE_REQUESTER_ID
+                or activation_required is not True
+                or activation_slot
+                or operator_authorized is not True
+                or snapshot_authority is not None
+                or snapshot_ticket_authority is not None
+                or snapshot_manual_ingress_authority is not None
+            ):
+                raise ManualRcaAdmissionError(
+                    "gray_sample_automation_contract_invalid"
+                )
+            sample_id = gray_sample_authority["sample_id"]
+            if (
+                manual.issue_url != gray_sample_issue_url(sample_id)
+                or manual.reason != build_gray_sample_reason(gray_sample_authority)
+                or manual.message_id
+                != build_gray_sample_message_id(gray_sample_authority)
+            ):
+                raise ManualRcaAdmissionError(
+                    "gray_sample_automation_binding_mismatch"
+                )
         allowed = {str(item or "").strip() for item in allowed_chat_ids}
         if not submit_enabled:
             raise ManualRcaAdmissionError("manual_intake_disabled")
@@ -11821,7 +11872,10 @@ class RcaControlStore:
                 w3_manual_authority = dict(snapshot_manual_ingress_authority)
         except (TypeError, ValueError, KeyError) as exc:
             raise ManualRcaAdmissionError(str(exc)) from exc
-        payload_sha = _canonical_sha256(manual.to_dict())
+        source_payload = manual.to_dict()
+        if gray_sample_authority is not None:
+            source_payload["automation_authority"] = gray_sample_authority
+        payload_sha = _canonical_sha256(source_payload)
         source_dedupe_key = f"{manual.platform}:{manual.message_id}"
         source_id = _stable_key(
             "g1q3-rca-source-v1",
@@ -11838,6 +11892,10 @@ class RcaControlStore:
         if issue_only_operator:
             activation_source_identity.update(
                 {"chat_id": "operator", "thread_id": "operator:issue-only"}
+            )
+        if gray_sample_authority is not None:
+            activation_source_identity["automation_authority"] = (
+                gray_sample_authority
             )
         current = _iso(now)
         conn = self._connect()
@@ -12085,7 +12143,32 @@ class RcaControlStore:
                     reason=replay_reason,
                 )
 
-            if operator_requested and not issue_only_operator:
+            if gray_sample_authority is not None:
+                day_start = _utc_datetime(now).replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                )
+                day_end = day_start + timedelta(days=1)
+                started_today = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) FROM rca_trigger_sources
+                         WHERE source_kind = 'feishu_group_manual'
+                           AND platform = 'operator'
+                           AND requester_id = ? AND mode = 'rerun'
+                           AND created_at >= ? AND created_at < ?
+                        """,
+                        (
+                            GRAY_SAMPLE_REQUESTER_ID,
+                            _iso(day_start),
+                            _iso(day_end),
+                        ),
+                    ).fetchone()[0]
+                )
+                if started_today >= GRAY_SAMPLE_DAILY_LIMIT:
+                    raise ManualRcaAdmissionError(
+                        "gray_sample_daily_rate_limited"
+                    )
+            elif operator_requested and not issue_only_operator:
                 window_start = _iso(
                     _utc_datetime(now) - timedelta(seconds=rate_window_seconds)
                 )
@@ -12143,6 +12226,12 @@ class RcaControlStore:
                 work_item_type_key=work_item_type_key,
                 work_item_id=work_item_id,
             )
+            if gray_sample_authority is not None and (
+                latest is None or not self._execution_terminal_tx(conn, latest)
+            ):
+                raise ManualRcaAdmissionError(
+                    "gray_sample_terminal_generation_required"
+                )
             if business_key_count > 1:
                 self._audit_issue_scope_conflict_tx(
                     conn,
@@ -12243,7 +12332,10 @@ class RcaControlStore:
             elif manual.mode in {"rerun", "debug"} and self._execution_terminal_tx(
                 conn, latest
             ):
-                if manual.platform != "feishu" or manual.mode != "rerun":
+                if (
+                    manual.platform != "feishu"
+                    or manual.mode != "rerun"
+                ) and gray_sample_authority is None:
                     raise ManualRcaAdmissionError(
                         "manual_generation_requires_explicit_user_rerun"
                     )
