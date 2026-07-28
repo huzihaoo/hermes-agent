@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -18,6 +19,10 @@ def _write(path: Path, value: object) -> None:
         path.write_text(value, encoding="utf-8")
     else:
         path.write_text(json.dumps(value), encoding="utf-8")
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _matrix(task_root: Path) -> Path:
@@ -99,6 +104,17 @@ def gate_inputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Pa
         lambda *_args, **_kwargs: {
             "status": "GREEN",
             "active_evaluator_count": 67,
+            "errors": [],
+        },
+    )
+    monkeypatch.setattr(
+        suite,
+        "_w17_l_b_db_contract_check",
+        lambda *_args, **_kwargs: {
+            "status": "GREEN",
+            "a17_l_b_status": "PARTIAL_285_OF_336",
+            "active_evaluator_covered_count": 67,
+            "accuracy_evidence": False,
             "errors": [],
         },
     )
@@ -307,3 +323,153 @@ def test_candidate_reference_token_must_match_matrix_binding(tmp_path: Path) -> 
 
     assert receipts == []
     assert errors == ["matrix_candidate_reference_mismatch"]
+
+
+def _w17_l_b_inputs(tmp_path: Path) -> tuple[dict, Path]:
+    task_root = tmp_path / "task"
+    task_root.mkdir()
+    database = task_root / "source.sqlite3"
+    database.write_bytes(b"bounded historical delivery database\n")
+    pipeline_commit = "a" * 40
+    pipeline_tree = "b" * 40
+    inventory_sha = "c" * 64
+    manifest = {
+        "schema_version": "g1q3_w17_lb_db_contract_manifest_v1",
+        "status": "PARTIAL",
+        "candidate_binding": {
+            "pipeline_commit": pipeline_commit,
+            "pipeline_tree": pipeline_tree,
+            "inventory_ledger_sha256": inventory_sha,
+        },
+        "source": {
+            "db_path": str(database),
+            "db_sha256": _sha256(database),
+            "db_bytes": database.stat().st_size,
+            "db_integrity": "ok",
+            "db_open_mode": "read_only_immutable",
+        },
+        "accounting": {
+            "active_evaluator_count": 67,
+            "active_evaluator_covered_count": 67,
+            "active_evaluator_missing_count": 0,
+            "canonical_target_snapshot_count": 336,
+            "contract_count": 286,
+            "contract_failure_count": 0,
+            "contract_missing_count": 1,
+            "exact_match_count": 285,
+        },
+        "claims": {
+            "l_b_active_key_coverage": True,
+            "canonical_336_complete": False,
+            "accuracy_evidence": False,
+            "generalization_evidence": False,
+            "high_confidence_dimension_evidence": False,
+            "report_data_used_as_evaluator_input": False,
+        },
+        "policy": {
+            "identity_persisted_in_public_manifest": False,
+            "raw_report_payload_persisted": False,
+            "report_file_locator_persisted": False,
+        },
+        "production_actions": [],
+    }
+    manifest_path = task_root / "manifest.json"
+    _write(manifest_path, manifest)
+    receipt = {
+        "schema_version": "g1q3_w17_lb_db_contract_scan_receipt_v1",
+        "status": "PARTIAL",
+        "artifacts": {
+            "manifest": {
+                "path": str(manifest_path),
+                "sha256": _sha256(manifest_path),
+            }
+        },
+        "source_checks": {
+            "db_sha256": _sha256(database),
+            "inventory_ledger_sha256": inventory_sha,
+            "report_contract_count": 286,
+            "exact_match_count": 285,
+            "contract_missing_count": 1,
+            "contract_failure_count": 0,
+        },
+        "release_claim": {
+            "a17_l_b": "PARTIAL_285_OF_336",
+            "active_key_coverage": "GREEN_67_OF_67",
+            "accuracy_evidence": False,
+            "generalization_evidence": False,
+            "high_confidence_dimension_evidence": False,
+        },
+        "verification": {
+            "database_open_mode": "read_only_immutable",
+            "mcap_read": False,
+            "platform_or_kafka_required": False,
+            "raw_report_payload_persisted": False,
+            "negative_fingerprint_injection": {
+                "exit_code": 2,
+                "output_artifact_count": 0,
+            },
+        },
+        "production_actions": [],
+    }
+    receipt_path = task_root / "receipt.json"
+    _write(receipt_path, receipt)
+    receipt_path.chmod(0o600)
+    matrix = {
+        "authority": {
+            "w17_l_b_db_contract": {
+                "manifest": {
+                    "path": manifest_path.relative_to(task_root).as_posix(),
+                    "sha256": _sha256(manifest_path),
+                },
+                "receipt": {
+                    "path": receipt_path.relative_to(task_root).as_posix(),
+                    "sha256": _sha256(receipt_path),
+                },
+            }
+        },
+        "candidate": {
+            "pipeline_w17_offline_evaluation": {
+                "commit": pipeline_commit,
+                "tree": pipeline_tree,
+            }
+        },
+    }
+    return matrix, task_root
+
+
+def test_w17_l_b_db_contract_accepts_hash_bound_partial_67_key_coverage(
+    tmp_path: Path,
+) -> None:
+    matrix, task_root = _w17_l_b_inputs(tmp_path)
+
+    result = suite._w17_l_b_db_contract_check(matrix, task_root=task_root)
+
+    assert result["status"] == "GREEN"
+    assert result["a17_l_b_status"] == "PARTIAL_285_OF_336"
+    assert result["active_evaluator_covered_count"] == 67
+    assert result["exact_match_count"] == 285
+    assert result["accuracy_evidence"] is False
+
+
+def test_w17_l_b_db_contract_rejects_accuracy_overclaim(tmp_path: Path) -> None:
+    matrix, task_root = _w17_l_b_inputs(tmp_path)
+    manifest_path = task_root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["claims"]["accuracy_evidence"] = True
+    _write(manifest_path, manifest)
+    receipt_path = task_root / "receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["artifacts"]["manifest"]["sha256"] = _sha256(manifest_path)
+    _write(receipt_path, receipt)
+    receipt_path.chmod(0o600)
+    matrix["authority"]["w17_l_b_db_contract"]["manifest"]["sha256"] = _sha256(
+        manifest_path
+    )
+    matrix["authority"]["w17_l_b_db_contract"]["receipt"]["sha256"] = _sha256(
+        receipt_path
+    )
+
+    result = suite._w17_l_b_db_contract_check(matrix, task_root=task_root)
+
+    assert result["status"] == "RED"
+    assert "w17_l_b_claim_boundary_invalid" in result["errors"]

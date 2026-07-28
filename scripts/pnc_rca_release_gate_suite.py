@@ -588,6 +588,201 @@ def _w17_resource_paths(pipeline_source: Path) -> dict[str, Path]:
     }
 
 
+def _w17_l_b_db_contract_check(
+    matrix: Mapping[str, Any], *, task_root: Path
+) -> dict[str, Any]:
+    errors: list[str] = []
+    sources: dict[str, Any] = {}
+    authority = matrix.get("authority")
+    authority = authority if isinstance(authority, Mapping) else {}
+    binding = authority.get("w17_l_b_db_contract")
+    binding = binding if isinstance(binding, Mapping) else {}
+    receipt_ref = binding.get("receipt")
+    receipt_ref = receipt_ref if isinstance(receipt_ref, Mapping) else {}
+    manifest_ref = binding.get("manifest")
+    manifest_ref = manifest_ref if isinstance(manifest_ref, Mapping) else {}
+
+    documents: dict[str, dict[str, Any]] = {}
+    paths: dict[str, Path] = {}
+    for name, reference in (("receipt", receipt_ref), ("manifest", manifest_ref)):
+        try:
+            path = _trusted_child(
+                task_root,
+                str(reference.get("path") or ""),
+                label=f"W17 L-B {name}",
+            )
+            document, source = _json_object(path, label=f"W17 L-B {name}")
+            if source["sha256"] != reference.get("sha256"):
+                errors.append(f"w17_l_b_{name}_sha256_mismatch")
+            documents[name] = document
+            sources[name] = source
+            paths[name] = path
+        except ReleaseGateError as exc:
+            errors.append(exc.code)
+    if errors or set(documents) != {"receipt", "manifest"}:
+        return {"status": "RED", "errors": sorted(set(errors)), "sources": sources}
+
+    receipt = documents["receipt"]
+    manifest = documents["manifest"]
+    if stat.S_IMODE(paths["receipt"].lstat().st_mode) != 0o600:
+        errors.append("w17_l_b_receipt_exact_0600_required")
+    if receipt.get("schema_version") != "g1q3_w17_lb_db_contract_scan_receipt_v1":
+        errors.append("w17_l_b_receipt_schema_invalid")
+    if manifest.get("schema_version") != "g1q3_w17_lb_db_contract_manifest_v1":
+        errors.append("w17_l_b_manifest_schema_invalid")
+    if receipt.get("status") != "PARTIAL" or manifest.get("status") != "PARTIAL":
+        errors.append("w17_l_b_partial_status_invalid")
+
+    receipt_artifacts = receipt.get("artifacts")
+    receipt_artifacts = (
+        receipt_artifacts if isinstance(receipt_artifacts, Mapping) else {}
+    )
+    receipt_manifest = receipt_artifacts.get("manifest")
+    receipt_manifest = (
+        receipt_manifest if isinstance(receipt_manifest, Mapping) else {}
+    )
+    if (
+        receipt_manifest.get("path") != str(paths["manifest"])
+        or receipt_manifest.get("sha256") != sources["manifest"]["sha256"]
+    ):
+        errors.append("w17_l_b_receipt_manifest_binding_invalid")
+
+    candidate = matrix.get("candidate")
+    candidate = candidate if isinstance(candidate, Mapping) else {}
+    expected_pipeline = candidate.get("pipeline_w17_offline_evaluation")
+    expected_pipeline = (
+        expected_pipeline if isinstance(expected_pipeline, Mapping) else {}
+    )
+    candidate_binding = manifest.get("candidate_binding")
+    candidate_binding = (
+        candidate_binding if isinstance(candidate_binding, Mapping) else {}
+    )
+    if (
+        candidate_binding.get("pipeline_commit") != expected_pipeline.get("commit")
+        or candidate_binding.get("pipeline_tree") != expected_pipeline.get("tree")
+    ):
+        errors.append("w17_l_b_pipeline_binding_mismatch")
+
+    source = manifest.get("source")
+    source = source if isinstance(source, Mapping) else {}
+    db_path_value = source.get("db_path")
+    try:
+        task_root_resolved = task_root.resolve(strict=True)
+        db_path = Path(str(db_path_value or "")).resolve(strict=True)
+        db_relative = db_path.relative_to(task_root_resolved)
+        db_path = _trusted_child(
+            task_root_resolved, db_relative.as_posix(), label="W17 L-B database"
+        )
+        db_raw, db_stat = _stable_bytes(db_path, label="W17 L-B database")
+        db_sha256 = _sha256(db_raw)
+        sources["database"] = {
+            "path": str(db_path),
+            "sha256": db_sha256,
+            "bytes": db_stat.st_size,
+            "mtime_ns": db_stat.st_mtime_ns,
+        }
+        if (
+            db_sha256 != source.get("db_sha256")
+            or db_stat.st_size != source.get("db_bytes")
+            or source.get("db_integrity") != "ok"
+            or source.get("db_open_mode") != "read_only_immutable"
+        ):
+            errors.append("w17_l_b_database_binding_invalid")
+    except (OSError, ValueError, ReleaseGateError):
+        errors.append("w17_l_b_database_binding_invalid")
+
+    accounting = manifest.get("accounting")
+    accounting = accounting if isinstance(accounting, Mapping) else {}
+    source_checks = receipt.get("source_checks")
+    source_checks = source_checks if isinstance(source_checks, Mapping) else {}
+    active_count = accounting.get("active_evaluator_count")
+    covered_count = accounting.get("active_evaluator_covered_count")
+    missing_count = accounting.get("active_evaluator_missing_count")
+    exact_count = accounting.get("exact_match_count")
+    contract_count = accounting.get("contract_count")
+    contract_missing = accounting.get("contract_missing_count")
+    if (active_count, covered_count, missing_count) != (67, 67, 0):
+        errors.append("w17_l_b_active_key_coverage_incomplete")
+    if (
+        not isinstance(exact_count, int)
+        or not isinstance(contract_count, int)
+        or not isinstance(contract_missing, int)
+        or exact_count <= 0
+        or exact_count + contract_missing != contract_count
+        or accounting.get("canonical_target_snapshot_count") != 336
+        or accounting.get("contract_failure_count") != 0
+        or source_checks.get("exact_match_count") != exact_count
+        or source_checks.get("report_contract_count") != contract_count
+        or source_checks.get("contract_missing_count") != contract_missing
+        or source_checks.get("contract_failure_count") != 0
+    ):
+        errors.append("w17_l_b_contract_accounting_invalid")
+    if (
+        source_checks.get("db_sha256") != source.get("db_sha256")
+        or source_checks.get("inventory_ledger_sha256")
+        != candidate_binding.get("inventory_ledger_sha256")
+    ):
+        errors.append("w17_l_b_source_binding_invalid")
+
+    claims = manifest.get("claims")
+    claims = claims if isinstance(claims, Mapping) else {}
+    policy = manifest.get("policy")
+    policy = policy if isinstance(policy, Mapping) else {}
+    release_claim = receipt.get("release_claim")
+    release_claim = release_claim if isinstance(release_claim, Mapping) else {}
+    if (
+        claims.get("l_b_active_key_coverage") is not True
+        or claims.get("canonical_336_complete") is not False
+        or claims.get("accuracy_evidence") is not False
+        or claims.get("generalization_evidence") is not False
+        or claims.get("high_confidence_dimension_evidence") is not False
+        or claims.get("report_data_used_as_evaluator_input") is not False
+        or release_claim.get("active_key_coverage") != "GREEN_67_OF_67"
+        or release_claim.get("accuracy_evidence") is not False
+        or release_claim.get("generalization_evidence") is not False
+        or release_claim.get("high_confidence_dimension_evidence") is not False
+        or not str(release_claim.get("a17_l_b") or "").startswith("PARTIAL_")
+    ):
+        errors.append("w17_l_b_claim_boundary_invalid")
+    if (
+        policy.get("identity_persisted_in_public_manifest") is not False
+        or policy.get("raw_report_payload_persisted") is not False
+        or policy.get("report_file_locator_persisted") is not False
+        or receipt.get("production_actions") != []
+        or manifest.get("production_actions") != []
+    ):
+        errors.append("w17_l_b_privacy_or_effect_boundary_invalid")
+
+    verification = receipt.get("verification")
+    verification = verification if isinstance(verification, Mapping) else {}
+    negative = verification.get("negative_fingerprint_injection")
+    negative = negative if isinstance(negative, Mapping) else {}
+    if (
+        verification.get("database_open_mode") != "read_only_immutable"
+        or verification.get("mcap_read") is not False
+        or verification.get("platform_or_kafka_required") is not False
+        or verification.get("raw_report_payload_persisted") is not False
+        or negative.get("exit_code") != 2
+        or negative.get("output_artifact_count") != 0
+    ):
+        errors.append("w17_l_b_verification_boundary_invalid")
+    return {
+        "status": "GREEN" if not errors else "RED",
+        "a17_l_b_status": release_claim.get("a17_l_b"),
+        "active_evaluator_count": active_count,
+        "active_evaluator_covered_count": covered_count,
+        "canonical_target_snapshot_count": accounting.get(
+            "canonical_target_snapshot_count"
+        ),
+        "exact_match_count": exact_count,
+        "contract_missing_count": contract_missing,
+        "accuracy_evidence": False,
+        "high_confidence_dimension_evidence": False,
+        "sources": sources,
+        "errors": sorted(set(errors)),
+    }
+
+
 def _w17_checks(
     *,
     pipeline_source: Path,
@@ -667,14 +862,14 @@ def _w17_checks(
 
     regression_rows = regression.get("active_evaluator_coverage_rows")
     regression_rows = regression_rows if isinstance(regression_rows, list) else []
-    regression_keys = {
+    schema_smoke_keys = {
         str(item.get("evaluator_key") or "")
         for item in regression_rows
         if isinstance(item, Mapping)
-        and item.get("local_subset_status") == "covered"
+        and item.get("local_schema_smoke_status") == "present"
     }
-    if regression_keys != active_keys:
-        errors.append("w17_report_regression_coverage_incomplete")
+    if schema_smoke_keys != active_keys:
+        errors.append("w17_report_schema_smoke_incomplete")
 
     builder = _run_command(
         (str(python), str(paths["builder"]), "--check"),
@@ -698,6 +893,7 @@ def _w17_checks(
         "api/g1q3_rca/tests/test_rca_golden.py::test_golden_root_check_parses_committed_set",
         "api/g1q3_rca/tests/test_rca_golden.py::test_criterion_refuted_negative_catches_status_flip_without_conclusion_change",
         "api/g1q3_rca/tests/test_rca_golden.py::test_criterion_refuted_negative_fails_if_status_is_not_refuted",
+        "api/g1q3_rca/tests/test_rca_golden.py::test_digest_change_does_not_hide_evaluator_verdict_regression",
     )
     golden_tests = _run_command(
         (str(python), "-m", "pytest", "-q", *golden_nodeids),
@@ -754,12 +950,13 @@ def _w17_checks(
     )
     return {
         "status": "GREEN" if not errors else "RED",
-        "scope": "W17.1-W17.4_mandatory_automated_subset",
+        "scope": "W17_pre_ga_guard_and_offline_structure",
         "active_evaluator_count": len(active_keys),
         "inventory_key_count": len(rows),
         "synthetic_boundary_evaluator_count": len(boundary_keys),
         "synthetic_boundary_nodeid_count": len(nodeids),
-        "report_regression_evaluator_count": len(regression_keys),
+        "local_schema_smoke_evaluator_count": len(schema_smoke_keys),
+        "pipeline_resource_l_b_evaluator_count": 0,
         "canonical_336_source_available": regression_accounting.get(
             "canonical_corpus_source_available"
         ),
@@ -771,8 +968,8 @@ def _w17_checks(
         },
         "sources": sources,
         "nonblocking_followup": [
-            "canonical_336_source_unavailable_is_not_accuracy_evidence",
-            "W17.5_real_mcap_dimensions_and_41_issue_mapping_continue_separately",
+            "local_schema_smoke_is_not_l_b_coverage",
+            "41_issue_mapping_rows_complete_but_end_to_end_formalized_count_zero",
             "four_fully_validated_evaluators_are_not_claimed_by_this_subset",
         ],
         "errors": sorted(set(errors)),
@@ -902,7 +1099,7 @@ def build_release_gate(
             criterion = {
                 "criterion_id": criterion_id,
                 "mode": "automated",
-                "scope": "W17.1-W17.4_mandatory_automated_subset",
+                "scope": "W17_decision49_guard_with_partial_A17_accounting",
                 "status": "GREEN",
                 "matrix_ga_status": row.get("ga_status"),
                 "matrix_offline_status": row.get("offline_status"),
@@ -1008,6 +1205,8 @@ def build_release_gate(
         timeout_seconds=timeout_seconds,
     )
     _merge_check(by_id["A17"], "w17_automated_subset", w17)
+    l_b = _w17_l_b_db_contract_check(matrix, task_root=task_root)
+    _merge_check(by_id["A17"], "w17_l_b_db_contract", l_b)
     _merge_check(by_id["A17"], "high_confidence_ticket_registry", freshness)
 
     if inject_auto_red:
