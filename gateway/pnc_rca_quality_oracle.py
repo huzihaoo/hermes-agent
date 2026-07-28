@@ -1,9 +1,9 @@
 """Fail-closed structural quality tiers for production RCA publication.
 
-The oracle deliberately ignores model confidence and capability inventories.
-Only evaluator keys present in the producer's ``actual_evaluators`` emission,
-structured evidence, and a closed causal narrative can raise an attribution
-above honest non-attribution.
+The oracle deliberately ignores model confidence. Only evaluator keys present
+in the producer's ``actual_evaluators`` emission, a hash-bound active inventory,
+verified validation artifacts, structured evidence, and a closed causal
+narrative can raise an attribution above honest non-attribution.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import json
 import math
 from pathlib import Path
 import re
+import stat
 from typing import Any, Mapping, Sequence
 
 
@@ -35,6 +36,11 @@ MEDIUM_TIER_DISCLAIMER = "候选结论，待人工确认，不可作为定责依
 BANNED_PUBLIC_PHRASES = ("请核对问题数据地址",)
 GOLDEN_REGISTRY_SCHEMA_VERSION = "pnc_rca_release_golden_registry_v1"
 EVALUATOR_VALIDATION_SCHEMA_VERSION = "g1q3_rca_evaluator_validation_dimensions_v1"
+ACTIVE_EVALUATOR_INVENTORY_SCHEMA_VERSION = (
+    "g1q3_rca_active_evaluator_inventory_v1"
+)
+OWNER_CONFIRMED_SOURCE_SCHEMA_VERSION = "g1q3_rca_owner_confirmed_source_v1"
+VALIDATION_ARTIFACT_SCHEMA_VERSION = "g1q3_rca_validation_dimension_artifact_v1"
 REQUIRED_EVALUATOR_VALIDATION_DIMENSIONS = (
     "real_positive",
     "real_negative",
@@ -57,6 +63,12 @@ _GOLDEN_HASH_FIELDS = (
     "test_receipt_sha256",
 )
 _GOLDEN_SOURCE_KIND_FIELD = "source_kind"
+_MAX_VALIDATION_ARTIFACT_BYTES = 4 * 1024 * 1024
+_REAL_CASE_SOURCE_KINDS = frozenset({
+    "owner_confirmed_real_issue",
+    "real_issue",
+    "real_mcap_case",
+})
 _OWNER_GOLDEN_SOURCE_KINDS = frozenset({
     "owner_confirmed",
     "owner_confirmed_case",
@@ -261,6 +273,361 @@ def _golden_source_validation(item: Mapping[str, Any]) -> tuple[bool, str]:
     return True, ""
 
 
+def _read_bound_json_artifact(
+    *,
+    registry_path: Path,
+    artifact_path: Any,
+    artifact_sha256: Any,
+    label: str,
+) -> tuple[dict[str, Any], dict[str, Any], tuple[str, ...]]:
+    """Read one hash-bound regular JSON artifact below the registry directory."""
+
+    locator = _string(artifact_path)
+    expected_sha256 = _string(artifact_sha256)
+    errors: list[str] = []
+    relative = Path(locator) if locator else Path()
+    if (
+        not locator
+        or relative.is_absolute()
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        return {}, {}, (f"{label}_artifact_path_invalid",)
+    if _SHA256_RE.fullmatch(expected_sha256) is None:
+        return {}, {}, (f"{label}_artifact_sha256_invalid",)
+
+    root = registry_path.parent
+    candidate = root.joinpath(*relative.parts)
+    current = root
+    try:
+        for part in relative.parts:
+            current = current / part
+            mode = current.lstat().st_mode
+            if stat.S_ISLNK(mode):
+                errors.append(f"{label}_artifact_symlink_forbidden")
+                break
+        if not errors and not stat.S_ISREG(candidate.lstat().st_mode):
+            errors.append(f"{label}_artifact_not_regular_file")
+    except OSError:
+        errors.append(f"{label}_artifact_unreadable")
+    if errors:
+        return {}, {"path": locator, "sha256": expected_sha256}, tuple(errors)
+
+    try:
+        root_resolved = root.resolve(strict=True)
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(root_resolved)
+        payload = candidate.read_bytes()
+    except (OSError, ValueError):
+        return (
+            {},
+            {"path": locator, "sha256": expected_sha256},
+            (f"{label}_artifact_path_escape_or_unreadable",),
+        )
+    if not payload or len(payload) > _MAX_VALIDATION_ARTIFACT_BYTES:
+        errors.append(f"{label}_artifact_size_invalid")
+    observed_sha256 = hashlib.sha256(payload).hexdigest()
+    if observed_sha256 != expected_sha256:
+        errors.append(f"{label}_artifact_hash_mismatch")
+    try:
+        document = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        document = {}
+        errors.append(f"{label}_artifact_json_invalid")
+    if not isinstance(document, Mapping):
+        document = {}
+        errors.append(f"{label}_artifact_not_object")
+    source = {
+        "path": locator,
+        "sha256": observed_sha256,
+        "size_bytes": len(payload),
+    }
+    return dict(document), source, tuple(sorted(set(errors)))
+
+
+def _validate_active_inventory_artifact(
+    *,
+    registry_path: Path,
+    binding: Any,
+    pipeline_commit: str,
+    pipeline_tree: str,
+    required: bool,
+    externally_required_ids: Sequence[str] | None,
+) -> dict[str, Any]:
+    raw = binding if isinstance(binding, Mapping) else {}
+    errors: list[str] = []
+    if not raw:
+        if required:
+            errors.append("active_inventory_artifact_missing")
+        return {
+            "valid": not required,
+            "present": False,
+            "required": required,
+            "evaluator_ids": (),
+            "source": {},
+            "errors": tuple(errors),
+        }
+    if set(raw) != {"artifact_path", "artifact_sha256"}:
+        errors.append("active_inventory_binding_fields_invalid")
+    document, source, read_errors = _read_bound_json_artifact(
+        registry_path=registry_path,
+        artifact_path=raw.get("artifact_path"),
+        artifact_sha256=raw.get("artifact_sha256"),
+        label="active_inventory",
+    )
+    errors.extend(read_errors)
+    if set(document) != {
+        "schema_version",
+        "pipeline_commit",
+        "pipeline_tree",
+        "active_evaluator_ids",
+    }:
+        errors.append("active_inventory_schema_fields_invalid")
+    if document.get("schema_version") != ACTIVE_EVALUATOR_INVENTORY_SCHEMA_VERSION:
+        errors.append("active_inventory_schema_mismatch")
+    if _string(document.get("pipeline_commit")) != pipeline_commit:
+        errors.append("active_inventory_pipeline_commit_mismatch")
+    if _string(document.get("pipeline_tree")) != pipeline_tree:
+        errors.append("active_inventory_pipeline_tree_mismatch")
+    raw_ids = document.get("active_evaluator_ids")
+    ids, ids_valid, id_errors = _normalize_required_evaluator_ids(
+        raw_ids,
+        present=True,
+    )
+    errors.extend(f"active_inventory_{error}" for error in id_errors)
+    if not ids_valid:
+        errors.append("active_inventory_evaluator_ids_invalid")
+    if any(_FLAT_EVALUATOR_KEY_RE.fullmatch(value) is None for value in ids):
+        errors.append("active_inventory_evaluator_key_invalid")
+    if externally_required_ids is not None:
+        external_ids, external_valid, external_errors = (
+            _normalize_required_evaluator_ids(
+                externally_required_ids,
+                present=True,
+            )
+        )
+        errors.extend(f"active_inventory_external_{error}" for error in external_errors)
+        if external_valid and tuple(ids) != tuple(external_ids):
+            errors.append("active_inventory_external_binding_mismatch")
+    return {
+        "valid": not errors,
+        "present": True,
+        "required": required,
+        "evaluator_ids": tuple(ids),
+        "source": source,
+        "errors": tuple(sorted(set(errors))),
+    }
+
+
+def _validate_owner_source_artifact(
+    document: Mapping[str, Any],
+    *,
+    evaluator_id: str,
+    evaluator_key: str,
+    domain: str,
+    source_kind: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    errors: list[str] = []
+    if set(document) != {
+        "schema_version",
+        "evaluator_id",
+        "evaluator_key",
+        "domain",
+        "source_kind",
+        "case_ids",
+        "owner_confirmation",
+    }:
+        errors.append("owner_source_schema_fields_invalid")
+    if document.get("schema_version") != OWNER_CONFIRMED_SOURCE_SCHEMA_VERSION:
+        errors.append("owner_source_schema_mismatch")
+    if _string(document.get("evaluator_id")) != evaluator_id:
+        errors.append("owner_source_evaluator_id_mismatch")
+    if _string(document.get("evaluator_key")) != evaluator_key:
+        errors.append("owner_source_evaluator_key_mismatch")
+    if _string(document.get("domain")) != domain:
+        errors.append("owner_source_domain_mismatch")
+    if _normalize_golden_source_kind(document.get("source_kind")) != source_kind:
+        errors.append("owner_source_kind_mismatch")
+    case_ids_raw = document.get("case_ids")
+    case_ids = tuple(
+        _string(value)
+        for value in case_ids_raw
+        if _string(value)
+    ) if isinstance(case_ids_raw, list) else ()
+    if (
+        not case_ids
+        or len(case_ids) != len(case_ids_raw or ())
+        or len(case_ids) != len(set(case_ids))
+        or not isinstance(case_ids_raw, list)
+    ):
+        errors.append("owner_source_case_ids_invalid")
+    confirmation = _mapping(document.get("owner_confirmation"))
+    if set(confirmation) != {"status", "receipt_sha256"}:
+        errors.append("owner_source_confirmation_fields_invalid")
+    if confirmation.get("status") != "confirmed":
+        errors.append("owner_source_confirmation_missing")
+    if _SHA256_RE.fullmatch(_string(confirmation.get("receipt_sha256"))) is None:
+        errors.append("owner_source_confirmation_receipt_invalid")
+    return tuple(case_ids), tuple(sorted(set(errors)))
+
+
+def _validate_dimension_artifact(
+    document: Mapping[str, Any],
+    *,
+    evaluator_id: str,
+    evaluator_key: str,
+    domain: str,
+    dimension: str,
+    declared_case_count: Any,
+    owner_case_ids: Sequence[str],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    errors: list[str] = []
+    if set(document) != {
+        "schema_version",
+        "evaluator_id",
+        "evaluator_key",
+        "domain",
+        "dimension",
+        "cases",
+    }:
+        errors.append(f"validation_artifact_schema_fields_invalid:{dimension}")
+    if document.get("schema_version") != VALIDATION_ARTIFACT_SCHEMA_VERSION:
+        errors.append(f"validation_artifact_schema_mismatch:{dimension}")
+    if _string(document.get("evaluator_id")) != evaluator_id:
+        errors.append(f"validation_artifact_evaluator_id_mismatch:{dimension}")
+    if _string(document.get("evaluator_key")) != evaluator_key:
+        errors.append(f"validation_artifact_evaluator_key_mismatch:{dimension}")
+    if _string(document.get("domain")) != domain:
+        errors.append(f"validation_artifact_domain_mismatch:{dimension}")
+    if _string(document.get("dimension")) != dimension:
+        errors.append(f"validation_artifact_dimension_mismatch:{dimension}")
+    cases_raw = document.get("cases")
+    cases = cases_raw if isinstance(cases_raw, list) else []
+    if (
+        type(declared_case_count) is not int
+        or declared_case_count < 1
+        or declared_case_count != len(cases)
+    ):
+        errors.append(f"validation_artifact_case_count_mismatch:{dimension}")
+    case_ids: list[str] = []
+    outcomes: set[str] = set()
+    expected_status = {
+        "real_positive": "PASS",
+        "real_negative": "FAIL",
+    }.get(dimension)
+    for case in cases:
+        if not isinstance(case, Mapping):
+            errors.append(f"validation_artifact_case_not_object:{dimension}")
+            continue
+        if set(case) != {
+            "case_id",
+            "source_kind",
+            "expected_evaluator_status",
+            "evaluator_observed_status",
+            "result",
+            "case_config_sha256",
+            "evidence_sha256",
+        }:
+            errors.append(f"validation_artifact_case_schema_invalid:{dimension}")
+        case_id = _string(case.get("case_id"))
+        source_kind = _string(case.get("source_kind"))
+        expected = _string(case.get("expected_evaluator_status"))
+        observed = _string(case.get("evaluator_observed_status"))
+        result = _string(case.get("result"))
+        if not case_id:
+            errors.append(f"validation_artifact_case_id_missing:{dimension}")
+        else:
+            case_ids.append(case_id)
+        if expected not in {"PASS", "FAIL"} or observed != expected:
+            errors.append(f"validation_artifact_evaluator_outcome_invalid:{dimension}")
+        else:
+            outcomes.add(observed)
+        if result != "PASS":
+            errors.append(f"validation_artifact_case_result_not_pass:{dimension}")
+        for field in ("case_config_sha256", "evidence_sha256"):
+            if _SHA256_RE.fullmatch(_string(case.get(field))) is None:
+                errors.append(f"validation_artifact_{field}_invalid:{dimension}")
+        if dimension in {"real_positive", "real_negative"}:
+            if source_kind not in _REAL_CASE_SOURCE_KINDS:
+                errors.append(f"validation_artifact_real_source_kind_invalid:{dimension}")
+            if case_id and case_id not in owner_case_ids:
+                errors.append(f"validation_artifact_case_not_owner_confirmed:{dimension}")
+            if expected != expected_status:
+                errors.append(f"validation_artifact_real_outcome_semantics_invalid:{dimension}")
+        elif dimension == "synthetic_boundary" and source_kind != "synthetic_boundary":
+            errors.append("validation_artifact_synthetic_source_kind_invalid:synthetic_boundary")
+    if len(case_ids) != len(set(case_ids)):
+        errors.append(f"validation_artifact_duplicate_case_id:{dimension}")
+    if dimension == "synthetic_boundary" and outcomes != {"PASS", "FAIL"}:
+        errors.append("validation_artifact_boundary_outcomes_incomplete:synthetic_boundary")
+    return tuple(case_ids), tuple(sorted(set(errors)))
+
+
+def _validate_entry_artifacts(
+    item: Mapping[str, Any],
+    *,
+    registry_path: Path,
+    validation: Mapping[str, Any],
+) -> dict[str, Any]:
+    evaluator_id = _string(item.get("evaluator_id"))
+    evaluator_key = _string(validation.get("evaluator_key"))
+    domain = _string(validation.get("domain"))
+    source_kind = _normalize_golden_source_kind(item.get(_GOLDEN_SOURCE_KIND_FIELD))
+    errors: list[str] = []
+    sources: dict[str, Any] = {}
+    source_document, source_info, source_read_errors = _read_bound_json_artifact(
+        registry_path=registry_path,
+        artifact_path=item.get("evaluator_source_artifact_path"),
+        artifact_sha256=item.get("evaluator_source_sha256"),
+        label="owner_source",
+    )
+    errors.extend(source_read_errors)
+    owner_case_ids, source_errors = _validate_owner_source_artifact(
+        source_document,
+        evaluator_id=evaluator_id,
+        evaluator_key=evaluator_key,
+        domain=domain,
+        source_kind=source_kind,
+    )
+    errors.extend(source_errors)
+    sources["owner_source"] = source_info
+
+    case_ids_by_dimension: dict[str, tuple[str, ...]] = {}
+    dimensions = validation.get("dimensions")
+    dimensions = dimensions if isinstance(dimensions, Mapping) else {}
+    for dimension in REQUIRED_EVALUATOR_VALIDATION_DIMENSIONS:
+        raw = dimensions.get(dimension)
+        if not isinstance(raw, Mapping) or raw.get("status") != "passed":
+            continue
+        document, info, read_errors = _read_bound_json_artifact(
+            registry_path=registry_path,
+            artifact_path=raw.get("artifact_path"),
+            artifact_sha256=raw.get("artifact_sha256"),
+            label=f"{dimension}",
+        )
+        errors.extend(read_errors)
+        case_ids, dimension_errors = _validate_dimension_artifact(
+            document,
+            evaluator_id=evaluator_id,
+            evaluator_key=evaluator_key,
+            domain=domain,
+            dimension=dimension,
+            declared_case_count=raw.get("case_count"),
+            owner_case_ids=owner_case_ids,
+        )
+        errors.extend(dimension_errors)
+        case_ids_by_dimension[dimension] = case_ids
+        sources[dimension] = info
+    positive_ids = set(case_ids_by_dimension.get("real_positive", ()))
+    negative_ids = set(case_ids_by_dimension.get("real_negative", ()))
+    if positive_ids & negative_ids:
+        errors.append("real_positive_negative_case_overlap")
+    return {
+        "valid": not errors,
+        "sources": sources,
+        "errors": tuple(sorted(set(errors))),
+    }
+
+
 def _normalize_validation_required_dimensions(
     value: Any,
 ) -> tuple[tuple[str, ...], bool, tuple[str, ...]]:
@@ -334,6 +701,8 @@ def _validation_dimension_status(
         if not isinstance(raw, Mapping):
             errors.append(f"validation_dimension_not_object:{dimension}")
             continue
+        if set(raw) != {"status", "case_count", "artifact_sha256", "artifact_path"}:
+            errors.append(f"validation_dimension_schema_fields_invalid:{dimension}")
         status = _string(raw.get("status"))
         case_count = raw.get("case_count")
         artifact_sha256 = _string(raw.get("artifact_sha256"))
@@ -357,6 +726,7 @@ def _validation_dimension_status(
             "status": status,
             "case_count": case_count,
             "artifact_sha256": artifact_sha256,
+            "artifact_path": _string(raw.get("artifact_path")),
         }
 
     calculated_missing = tuple(
@@ -553,9 +923,16 @@ def _empty_golden_registry_status(*, present: bool, valid: bool = False) -> dict
         "incomplete_evaluator_ids": (),
         "missing_dimensions_by_evaluator": {},
         "invalid_validation_evaluator_ids": (),
+        "invalid_validation_artifact_evaluator_ids": (),
+        "validation_artifact_errors_by_evaluator": {},
+        "inactive_validation_evaluator_ids": (),
         "required_evaluator_ids": (),
         "required_evaluator_ids_present": False,
         "inventory_binding_valid": False,
+        "active_inventory_binding_valid": False,
+        "active_inventory_evaluator_ids": (),
+        "active_inventory_source": {},
+        "active_inventory_errors": (),
         "missing_required_evaluator_ids": (),
         "unexpected_evaluator_ids": (),
         "inventory_binding_errors": (),
@@ -714,6 +1091,18 @@ def release_golden_registry_status(
     )
     entry_shape_valid = isinstance(entries, list)
     valid = bool(base_valid)
+    entry_list = entries if isinstance(entries, list) else []
+    active_inventory = _validate_active_inventory_artifact(
+        registry_path=path,
+        binding=payload.get("active_inventory_artifact"),
+        pipeline_commit=commit,
+        pipeline_tree=tree,
+        required=bool(entry_list),
+        externally_required_ids=required_evaluator_ids,
+    )
+    if not active_inventory["valid"]:
+        valid = False
+    active_evaluator_ids = set(active_inventory["evaluator_ids"])
     covered: set[str] = set()
     normalized: dict[str, dict[str, Any]] = {}
     invalid_ids: list[str] = []
@@ -722,11 +1111,14 @@ def release_golden_registry_status(
     source_invalid_ids: list[str] = []
     machine_observation_ids: list[str] = []
     invalid_validation_ids: list[str] = []
+    invalid_validation_artifact_ids: list[str] = []
+    validation_artifact_errors_by_evaluator: dict[str, tuple[str, ...]] = {}
+    inactive_validation_ids: list[str] = []
     incomplete_ids: list[str] = []
     missing_dimensions_by_evaluator: dict[str, tuple[str, ...]] = {}
     fully_validated: dict[str, dict[str, Any]] = {}
     seen_ids: set[str] = set()
-    for item in entries if isinstance(entries, list) else ():
+    for item in entry_list:
         if not isinstance(item, Mapping):
             valid = False
             continue
@@ -767,6 +1159,22 @@ def release_golden_registry_status(
             invalid_validation_ids.append(evaluator_id)
             valid = False
             continue
+        if active_inventory["valid"] and evaluator_id not in active_evaluator_ids:
+            inactive_validation_ids.append(evaluator_id)
+            valid = False
+            continue
+        artifact_validation = _validate_entry_artifacts(
+            item,
+            registry_path=path,
+            validation=validation,
+        )
+        if not artifact_validation["valid"]:
+            invalid_validation_artifact_ids.append(evaluator_id)
+            validation_artifact_errors_by_evaluator[evaluator_id] = (
+                artifact_validation["errors"]
+            )
+            valid = False
+            continue
         normalized_item = dict(item)
         normalized_item["evaluator_key"] = validation["evaluator_key"]
         normalized_item["domain"] = validation["domain"]
@@ -776,6 +1184,7 @@ def release_golden_registry_status(
         normalized_item["dimensions"] = validation["dimensions"]
         normalized_item["fully_validated"] = validation["fully_validated"]
         normalized_item["missing_dimensions"] = list(validation["missing_dimensions"])
+        normalized_item["verified_artifacts"] = artifact_validation["sources"]
         normalized[evaluator_id] = normalized_item
         covered.add(evaluator_id)
         if validation["fully_validated"]:
@@ -827,6 +1236,9 @@ def release_golden_registry_status(
         or binding_errors
         or required_dimension_errors
         or invalid_validation_ids
+        or invalid_validation_artifact_ids
+        or inactive_validation_ids
+        or not active_inventory["valid"]
     ):
         valid = False
     low_tier_ready = bool(
@@ -853,6 +1265,16 @@ def release_golden_registry_status(
             for key, value in sorted(missing_dimensions_by_evaluator.items())
         },
         "invalid_validation_evaluator_ids": tuple(sorted(set(invalid_validation_ids))),
+        "invalid_validation_artifact_evaluator_ids": tuple(
+            sorted(set(invalid_validation_artifact_ids))
+        ),
+        "validation_artifact_errors_by_evaluator": {
+            key: tuple(value)
+            for key, value in sorted(validation_artifact_errors_by_evaluator.items())
+        },
+        "inactive_validation_evaluator_ids": tuple(
+            sorted(set(inactive_validation_ids))
+        ),
         "required_evaluator_ids": effective_binding["required_evaluator_ids"],
         "required_evaluator_ids_present": bool(
             payload_required_present or required_evaluator_ids is not None
@@ -867,6 +1289,12 @@ def release_golden_registry_status(
         ],
         "unexpected_evaluator_ids": effective_binding["unexpected_evaluator_ids"],
         "inventory_binding_errors": tuple(sorted(binding_errors)),
+        "active_inventory_binding_valid": bool(
+            active_inventory["present"] and active_inventory["valid"]
+        ),
+        "active_inventory_evaluator_ids": tuple(active_inventory["evaluator_ids"]),
+        "active_inventory_source": active_inventory["source"],
+        "active_inventory_errors": tuple(active_inventory["errors"]),
         "invalid_evaluator_ids": tuple(sorted(set(invalid_ids))),
         "duplicate_evaluator_ids": tuple(sorted(set(duplicate_ids))),
         "non_distinct_evaluator_ids": tuple(sorted(set(non_distinct_ids))),
@@ -899,7 +1327,13 @@ def _golden_coverage(
     )
     required = set(evaluator_keys)
     valid = registry.get("valid") is True
-    complete = bool(required) and valid and required.issubset(covered)
+    active_inventory_bound = registry.get("active_inventory_binding_valid") is True
+    complete = (
+        bool(required)
+        and valid
+        and active_inventory_bound
+        and required.issubset(covered)
+    )
     required_dimensions = tuple(
         registry.get("required_dimensions") or REQUIRED_EVALUATOR_VALIDATION_DIMENSIONS
     )

@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pnc_rca_release_golden_registry_v1.schema.json",
+  "title": "PNC RCA release golden registry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "validation_schema_version",
+    "required_dimensions",
+    "pipeline_commit",
+    "pipeline_tree",
+    "low_tier_suite",
+    "golden_scope_evaluator_ids",
+    "evaluators"
+  ],
+  "properties": {
+    "schema_version": {"const": "pnc_rca_release_golden_registry_v1"},
+    "validation_schema_version": {"const": "g1q3_rca_evaluator_validation_dimensions_v1"},
+    "required_dimensions": {
+      "type": "array",
+      "prefixItems": [
+        {"const": "real_positive"},
+        {"const": "real_negative"},
+        {"const": "synthetic_boundary"}
+      ],
+      "items": false,
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "pipeline_commit": {"type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"},
+    "pipeline_tree": {"type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"},
+    "low_tier_suite": {
+      "type": "object",
+      "required": [
+        "status",
+        "positive_case_count",
+        "negative_case_count",
+        "receipt_sha256",
+        "vm_path",
+        "user_visible_path"
+      ]
+    },
+    "golden_scope_evaluator_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$"}
+    },
+    "required_evaluator_ids": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$"}
+    },
+    "active_inventory_artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_path", "artifact_sha256"],
+      "properties": {
+        "artifact_path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*(?:^|/)\\.(?:/|$)).+$"
+        },
+        "artifact_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "evaluators": {
+      "type": "array",
+      "items": {"$ref": "pnc_rca_evaluator_validation_dimensions_v1.schema.json"}
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"evaluators": {"minItems": 1}},
+        "required": ["evaluators"]
+      },
+      "then": {"required": ["active_inventory_artifact"]}
+    }
+  ]
+}

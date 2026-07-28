@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pnc_rca_validation_dimension_artifact_v1.schema.json",
+  "title": "G1Q3 RCA evaluator validation dimension artifact",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "evaluator_id",
+    "evaluator_key",
+    "domain",
+    "dimension",
+    "cases"
+  ],
+  "properties": {
+    "schema_version": {"const": "g1q3_rca_validation_dimension_artifact_v1"},
+    "evaluator_id": {"type": "string", "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$"},
+    "evaluator_key": {"type": "string", "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$"},
+    "domain": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]{1,63}$"},
+    "dimension": {"enum": ["real_positive", "real_negative", "synthetic_boundary"]},
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "case_id",
+          "source_kind",
+          "expected_evaluator_status",
+          "evaluator_observed_status",
+          "result",
+          "case_config_sha256",
+          "evidence_sha256"
+        ],
+        "properties": {
+          "case_id": {"type": "string", "minLength": 1},
+          "source_kind": {"type": "string", "minLength": 1},
+          "expected_evaluator_status": {"enum": ["PASS", "FAIL"]},
+          "evaluator_observed_status": {"enum": ["PASS", "FAIL"]},
+          "result": {"const": "PASS"},
+          "case_config_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "evidence_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    }
+  }
+}

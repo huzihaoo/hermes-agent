@@ -361,6 +361,7 @@ def test_supported_tier_requires_golden_and_does_not_request_human_review(
             "present": True,
             "valid": True,
             "low_tier_golden_ready": True,
+            "active_inventory_binding_valid": True,
             "evaluators": {
                 "aeb_trigger": {
                     "evaluator_id": "aeb_trigger",
@@ -370,6 +371,12 @@ def test_supported_tier_requires_golden_and_does_not_request_human_review(
                     "positive_golden_sha256": "a" * 64,
                     "negative_golden_sha256": "b" * 64,
                     "test_receipt_sha256": "d" * 64,
+                }
+            },
+            "fully_validated_evaluators": {
+                "aeb_trigger": {
+                    "evaluator_id": "aeb_trigger",
+                    "fully_validated": True,
                 }
             },
         },

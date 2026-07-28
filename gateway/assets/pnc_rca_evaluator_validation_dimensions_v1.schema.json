@@ -11,7 +11,14 @@
     "required_dimensions",
     "dimensions",
     "fully_validated",
-    "missing_dimensions"
+    "missing_dimensions",
+    "status",
+    "source_kind",
+    "evaluator_source_artifact_path",
+    "evaluator_source_sha256",
+    "positive_golden_sha256",
+    "negative_golden_sha256",
+    "test_receipt_sha256"
   ],
   "properties": {
     "evaluator_id": {
@@ -26,6 +33,22 @@
       "type": "string",
       "pattern": "^[A-Z][A-Z0-9_]{1,63}$"
     },
+    "status": {"enum": ["passed", "pending", "failing"]},
+    "source_kind": {
+      "enum": [
+        "owner_confirmed",
+        "owner_confirmed_case",
+        "owner_confirmed_fixture",
+        "owner_confirmed_production_case",
+        "owner_grounded",
+        "owner_approved_fixture"
+      ]
+    },
+    "evaluator_source_artifact_path": {"$ref": "#/$defs/artifactPath"},
+    "evaluator_source_sha256": {"$ref": "#/$defs/sha256"},
+    "positive_golden_sha256": {"$ref": "#/$defs/sha256"},
+    "negative_golden_sha256": {"$ref": "#/$defs/sha256"},
+    "test_receipt_sha256": {"$ref": "#/$defs/sha256"},
     "required_dimensions": {
       "type": "array",
       "prefixItems": [
@@ -59,15 +82,22 @@
     "dimension": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["status", "case_count", "artifact_sha256"],
+      "required": ["status", "case_count", "artifact_sha256", "artifact_path"],
       "properties": {
         "status": {"enum": ["passed", "pending", "failing"]},
         "case_count": {"type": "integer", "minimum": 0},
-        "artifact_sha256": {
-          "type": "string",
-          "pattern": "^[0-9a-f]{64}$"
-        }
+        "artifact_sha256": {"$ref": "#/$defs/sha256"},
+        "artifact_path": {"$ref": "#/$defs/artifactPath"}
       }
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "artifactPath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*(?:^|/)\\.(?:/|$)).+$"
     }
   }
 }

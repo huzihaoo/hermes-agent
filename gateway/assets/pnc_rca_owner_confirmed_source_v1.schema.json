@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pnc_rca_owner_confirmed_source_v1.schema.json",
+  "title": "G1Q3 RCA owner-confirmed evaluator source artifact",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "evaluator_id",
+    "evaluator_key",
+    "domain",
+    "source_kind",
+    "case_ids",
+    "owner_confirmation"
+  ],
+  "properties": {
+    "schema_version": {"const": "g1q3_rca_owner_confirmed_source_v1"},
+    "evaluator_id": {"type": "string", "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$"},
+    "evaluator_key": {"type": "string", "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$"},
+    "domain": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]{1,63}$"},
+    "source_kind": {"type": "string", "minLength": 1},
+    "case_ids": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "owner_confirmation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "receipt_sha256"],
+      "properties": {
+        "status": {"const": "confirmed"},
+        "receipt_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    }
+  }
+}
