@@ -1,5 +1,11 @@
 {
   "schema_version": "pnc_rca_release_golden_registry_v1",
+  "validation_schema_version": "g1q3_rca_evaluator_validation_dimensions_v1",
+  "required_dimensions": [
+    "real_positive",
+    "real_negative",
+    "synthetic_boundary"
+  ],
   "pipeline_commit": "1158a49140bd4459d5fbff4ca91cdea9875cd8b1",
   "pipeline_tree": "0cc6f8db18b9af8e60657cb662726113c4231fd7",
   "low_tier_suite": {

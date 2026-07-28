@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pnc_rca_evaluator_validation_dimensions_v1.schema.json",
+  "title": "G1Q3 RCA evaluator validation dimensions",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "evaluator_id",
+    "evaluator_key",
+    "domain",
+    "required_dimensions",
+    "dimensions",
+    "fully_validated",
+    "missing_dimensions"
+  ],
+  "properties": {
+    "evaluator_id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$"
+    },
+    "evaluator_key": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$"
+    },
+    "domain": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9_]{1,63}$"
+    },
+    "required_dimensions": {
+      "type": "array",
+      "prefixItems": [
+        {"const": "real_positive"},
+        {"const": "real_negative"},
+        {"const": "synthetic_boundary"}
+      ],
+      "items": false,
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "dimensions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "real_positive": {"$ref": "#/$defs/dimension"},
+        "real_negative": {"$ref": "#/$defs/dimension"},
+        "synthetic_boundary": {"$ref": "#/$defs/dimension"}
+      }
+    },
+    "fully_validated": {"type": "boolean"},
+    "missing_dimensions": {
+      "type": "array",
+      "items": {
+        "enum": ["real_positive", "real_negative", "synthetic_boundary"]
+      },
+      "uniqueItems": true
+    }
+  },
+  "$defs": {
+    "dimension": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "case_count", "artifact_sha256"],
+      "properties": {
+        "status": {"enum": ["passed", "pending", "failing"]},
+        "case_count": {"type": "integer", "minimum": 0},
+        "artifact_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    }
+  }
+}

@@ -274,21 +274,111 @@ def _negative_contract(*, banned: bool = False) -> dict[str, Any]:
     }
 
 
+def _dimension_gate_contract() -> dict[str, Any]:
+    """A structurally complete claim used only by the validation-gate injection."""
+    return {
+        "consumer_capability": {
+            "actual_evaluators": [
+                {"evaluator_id": "lane_geometry_quality", "status": "supported"}
+            ],
+            "evidence": {
+                "issue_frame_id": 12,
+                "focus_window": {"start_ts": 0.0, "end_ts": 1.0},
+                "field_lineage": {
+                    "schema_version": "g1q3_field_lineage_v2",
+                    "fidelity_ok": True,
+                    "status": "pass",
+                },
+                "viz_lineage": {
+                    "schema_version": "g1q3_viz_lineage_v1",
+                    "ok": True,
+                    "status": "pass",
+                },
+            },
+        },
+        "report": {"candidate_owner_domain": "PERCEPTION_LANE"},
+        "public_result": {
+            "summary": {"short_conclusion": "车道线异常导致车道保持不稳。"},
+            "candidate": "PERCEPTION_LANE",
+            "responsibility": {"status": "supported"},
+            "evidence_summary": {"refs": [{"evidence_ref": "frame:12/lane"}]},
+            "causal_chain": {
+                "narrative": [
+                    {"role": "现象", "text": "车道保持不稳。"},
+                    {"role": "证据", "text": "车道线异常。"},
+                    {"role": "因果判断", "text": "车道线异常导致车道保持不稳。"},
+                ]
+            },
+            "user_action": {},
+        },
+    }
+
+
+def _incomplete_dimension_registry() -> dict[str, Any]:
+    """Build a valid partial registry: synthetic boundaries are intentionally absent."""
+    hashes = {"source": "c" * 64, "positive": "a" * 64, "negative": "b" * 64, "receipt": "d" * 64}
+    return {
+        "present": True,
+        "valid": True,
+        "low_tier_golden_ready": True,
+        "required_dimensions": ("real_positive", "real_negative", "synthetic_boundary"),
+        "fully_validated_evaluators": {},
+        "evaluators": {
+            "lane_geometry_quality": {
+                "evaluator_id": "lane_geometry_quality",
+                "evaluator_key": "lane_geometry_quality",
+                "domain": "PERCEPTION_LANE",
+                "required_dimensions": [
+                    "real_positive",
+                    "real_negative",
+                    "synthetic_boundary",
+                ],
+                "status": "pending",
+                "fully_validated": False,
+                "missing_dimensions": ("synthetic_boundary",),
+                "dimensions": {
+                    "real_positive": {"status": "passed", "case_count": 1, "artifact_sha256": hashes["positive"]},
+                    "real_negative": {"status": "passed", "case_count": 1, "artifact_sha256": hashes["negative"]},
+                },
+                "source_kind": "owner_confirmed_case",
+                "evaluator_source_sha256": hashes["source"],
+                "positive_golden_sha256": hashes["positive"],
+                "negative_golden_sha256": hashes["negative"],
+                "test_receipt_sha256": hashes["receipt"],
+            }
+        },
+        "missing_dimensions_by_evaluator": {
+            "lane_geometry_quality": ("synthetic_boundary",)
+        },
+    }
+
+
 def _run_negative(scenario: str, receipt_path: Path | None) -> int:
-    contract = _negative_contract(banned=scenario == "banned_phrase")
-    result = evaluate_structural_tier(
-        contract,
-        claimed_terminal_class=SUPPORTED_ATTRIBUTION,
-        publication_text=(
-            "归因结论：自动RCA未归因。\n责任模块：暂无法判断。\n"
-            "因果关系：现有证据不足。\n关键证据：现有证据不足。"
-        ),
-    )
-    expected_violation = (
-        "banned_public_phrase:请核对问题数据地址"
-        if scenario == "banned_phrase"
-        else "supported_attribution_evaluator_count_zero"
-    )
+    registry_status = None
+    if scenario == "missing_validation_dimension":
+        contract = _dimension_gate_contract()
+        registry_status = _incomplete_dimension_registry()
+        result = evaluate_structural_tier(
+            contract,
+            claimed_terminal_class=SUPPORTED_ATTRIBUTION,
+            golden_registry_status=registry_status,
+        )
+        expected_violation = "supported_attribution_golden_coverage_missing"
+    else:
+        contract = _negative_contract(banned=scenario == "banned_phrase")
+        result = evaluate_structural_tier(
+            contract,
+            claimed_terminal_class=SUPPORTED_ATTRIBUTION,
+            publication_text=(
+                "归因结论：自动RCA未归因。\n责任模块：暂无法判断。\n"
+                "因果关系：现有证据不足。\n关键证据：现有证据不足。"
+            ),
+        )
+        expected_violation = (
+            "banned_public_phrase:请核对问题数据地址"
+            if scenario == "banned_phrase"
+            else "supported_attribution_evaluator_count_zero"
+        )
     blocked = (
         result.classification_conflict
         and not result.publication_allowed
@@ -301,6 +391,7 @@ def _run_negative(scenario: str, receipt_path: Path | None) -> int:
         "expected_violation": expected_violation,
         "exit_code": 2 if blocked else 0,
         "oracle": result.as_dict(),
+        "validation_registry": registry_status,
     }
     encoded = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     if receipt_path is not None:
@@ -540,7 +631,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--inject-negative",
-        choices=("supported_without_evaluator", "banned_phrase"),
+        choices=("supported_without_evaluator", "banned_phrase", "missing_validation_dimension"),
     )
     parser.add_argument("--failure-receipt", type=Path)
     parser.add_argument("--scope-ledger", type=Path)

@@ -476,6 +476,12 @@ def test_release_golden_registry_must_be_green_and_pipeline_bound(tmp_path: Path
                 "source_kind": "owner_confirmed_case",
             }
         },
+        "fully_validated_evaluators": {
+            "acc_decel_heavy": {
+                "evaluator_id": "acc_decel_heavy",
+                "fully_validated": True,
+            }
+        },
     }
 
     evidence, errors = gate.audit_release_golden_registry(
@@ -486,7 +492,7 @@ def test_release_golden_registry_must_be_green_and_pipeline_bound(tmp_path: Path
     assert errors == []
     assert evidence["active_pipeline_commit"] == commit
 
-    empty = {**base, "evaluators": {}}
+    empty = {**base, "evaluators": {}, "fully_validated_evaluators": {}}
     evidence, errors = gate.audit_release_golden_registry(
         hermes_home=hermes_home,
         registry=empty,
@@ -544,6 +550,12 @@ def test_release_golden_registry_binds_explicit_active_inventory(tmp_path: Path)
                 "status": "passed",
                 "evaluator_id": "lane_geometry_quality",
                 "source_kind": "owner_confirmed_case",
+            }
+        },
+        "fully_validated_evaluators": {
+            "lane_geometry_quality": {
+                "evaluator_id": "lane_geometry_quality",
+                "fully_validated": True,
             }
         },
     }
@@ -613,6 +625,12 @@ def test_release_golden_registry_requires_exact_declared_high_scope(tmp_path: Pa
                 "source_kind": "owner_confirmed_case",
             }
         },
+        "fully_validated_evaluators": {
+            "lane_geometry_quality": {
+                "evaluator_id": "lane_geometry_quality",
+                "fully_validated": True,
+            }
+        },
     }
 
     evidence, errors = gate.audit_release_golden_registry(
@@ -654,6 +672,7 @@ def test_release_golden_registry_rejects_machine_observation_as_golden(
                 "source_kind": "machine_observation",
             }
         },
+        "fully_validated_evaluators": {},
     }
 
     evidence, errors = gate.audit_release_golden_registry(

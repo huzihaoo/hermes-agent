@@ -19,30 +19,45 @@ from gateway.pnc_rca_quality_oracle import (
 
 
 _MISSING = object()
+_REQUIRED_DIMENSIONS = ["real_positive", "real_negative", "synthetic_boundary"]
 
 
 def _release_registry(evaluator_id: str = "lane_geometry_quality") -> dict:
+    entry = {
+        "evaluator_id": evaluator_id,
+        "evaluator_key": evaluator_id,
+        "domain": "PERCEPTION_LANE",
+        "required_dimensions": list(_REQUIRED_DIMENSIONS),
+        "status": "passed",
+        "source_kind": "owner_confirmed_case",
+        "evaluator_source_sha256": "c" * 64,
+        "positive_golden_sha256": "a" * 64,
+        "negative_golden_sha256": "b" * 64,
+        "test_receipt_sha256": "d" * 64,
+        "dimensions": {
+            "real_positive": {"status": "passed", "case_count": 1, "artifact_sha256": "a" * 64},
+            "real_negative": {"status": "passed", "case_count": 1, "artifact_sha256": "b" * 64},
+            "synthetic_boundary": {"status": "passed", "case_count": 1, "artifact_sha256": "d" * 64},
+        },
+        "fully_validated": True,
+        "missing_dimensions": [],
+    }
     return {
         "present": True,
         "valid": True,
         "low_tier_golden_ready": True,
-        "evaluators": {
-            evaluator_id: {
-                "evaluator_id": evaluator_id,
-                "status": "passed",
-                "source_kind": "owner_confirmed_case",
-                "evaluator_source_sha256": "c" * 64,
-                "positive_golden_sha256": "a" * 64,
-                "negative_golden_sha256": "b" * 64,
-                "test_receipt_sha256": "d" * 64,
-            }
-        },
+        "required_dimensions": tuple(_REQUIRED_DIMENSIONS),
+        "evaluators": {evaluator_id: entry},
+        "fully_validated_evaluators": {evaluator_id: entry},
+        "missing_dimensions_by_evaluator": {},
     }
 
 
 def _registry_payload(*entries: dict, required=_MISSING):
     payload = {
         "schema_version": "pnc_rca_release_golden_registry_v1",
+        "validation_schema_version": "g1q3_rca_evaluator_validation_dimensions_v1",
+        "required_dimensions": list(_REQUIRED_DIMENSIONS),
         "pipeline_commit": "a" * 40,
         "pipeline_tree": "b" * 40,
         "low_tier_suite": {
@@ -69,12 +84,22 @@ def _golden_entry(evaluator_id: str, *, hash_char: str = "a") -> dict:
     ]
     return {
         "evaluator_id": evaluator_id,
+        "evaluator_key": evaluator_id,
+        "domain": "PERCEPTION_LANE",
+        "required_dimensions": list(_REQUIRED_DIMENSIONS),
         "status": "passed",
         "source_kind": "owner_confirmed_case",
         "evaluator_source_sha256": hashes[0] * 64,
         "positive_golden_sha256": hashes[1] * 64,
         "negative_golden_sha256": hashes[2] * 64,
         "test_receipt_sha256": hashes[3] * 64,
+        "dimensions": {
+            "real_positive": {"status": "passed", "case_count": 1, "artifact_sha256": hashes[1] * 64},
+            "real_negative": {"status": "passed", "case_count": 1, "artifact_sha256": hashes[2] * 64},
+            "synthetic_boundary": {"status": "passed", "case_count": 1, "artifact_sha256": hashes[3] * 64},
+        },
+        "fully_validated": True,
+        "missing_dimensions": [],
     }
 
 
@@ -86,6 +111,8 @@ def test_release_registry_accepts_current_git_object_ids_and_tracks_red_suite(
         json.dumps(
             {
                 "schema_version": "pnc_rca_release_golden_registry_v1",
+                "validation_schema_version": "g1q3_rca_evaluator_validation_dimensions_v1",
+                "required_dimensions": list(_REQUIRED_DIMENSIONS),
                 "pipeline_commit": "a" * 40,
                 "pipeline_tree": "b" * 40,
                 "low_tier_suite": {
@@ -117,6 +144,8 @@ def test_release_registry_rejects_malformed_git_object_id(tmp_path):
         json.dumps(
             {
                 "schema_version": "pnc_rca_release_golden_registry_v1",
+                "validation_schema_version": "g1q3_rca_evaluator_validation_dimensions_v1",
+                "required_dimensions": list(_REQUIRED_DIMENSIONS),
                 "pipeline_commit": "a" * 39,
                 "pipeline_tree": "b" * 40,
                 "low_tier_suite": {
@@ -147,6 +176,22 @@ def test_low_tier_only_registry_does_not_claim_full_inventory_coverage(tmp_path)
     assert status["evaluators"] == {}
     assert status["required_evaluator_ids_present"] is False
     assert status["inventory_binding_valid"] is False
+
+
+def test_registry_requires_exact_ordered_three_dimension_schema(tmp_path):
+    payload = _registry_payload()
+    payload["required_dimensions"] = [
+        "real_negative",
+        "real_positive",
+        "synthetic_boundary",
+    ]
+    path = tmp_path / "registry.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    status = oracle_module.release_golden_registry_status(path)
+
+    assert status["valid"] is False
+    assert "required_dimensions_order_invalid" in status["golden_scope_errors"]
 
 
 def test_explicit_inventory_rejects_missing_active_evaluator(tmp_path):
@@ -253,6 +298,66 @@ def test_registry_requires_owner_grounded_source_for_high_scope(tmp_path):
     assert status["valid"] is False
     assert status["evaluators"] == {}
     assert status["invalid_golden_source_ids"] == ("lane_geometry_quality",)
+
+
+def test_registry_accounts_missing_validation_dimension_without_unlocking_scope(tmp_path):
+    entry = _golden_entry("lane_geometry_quality")
+    entry["status"] = "pending"
+    entry["dimensions"].pop("synthetic_boundary")
+    entry["fully_validated"] = False
+    entry["missing_dimensions"] = ["synthetic_boundary"]
+    path = tmp_path / "registry.json"
+    path.write_text(json.dumps(_registry_payload(entry)), encoding="utf-8")
+
+    status = oracle_module.release_golden_registry_status(path)
+
+    assert status["valid"] is True
+    assert status["evaluators"]["lane_geometry_quality"]["fully_validated"] is False
+    assert status["fully_validated_evaluator_ids"] == ()
+    assert status["incomplete_evaluator_ids"] == ("lane_geometry_quality",)
+    assert status["missing_dimensions_by_evaluator"]["lane_geometry_quality"] == (
+        "synthetic_boundary",
+    )
+    assert status["golden_scope_evaluator_ids"] == ()
+
+
+def test_validation_dimension_accounting_lie_invalidates_registry(tmp_path):
+    entry = _golden_entry("lane_geometry_quality")
+    entry["dimensions"].pop("synthetic_boundary")
+    # Claiming complete while the required dimension is absent is not a
+    # downgrade; it is an invalid registry and must fail closed.
+    entry["fully_validated"] = True
+    entry["missing_dimensions"] = []
+    path = tmp_path / "registry.json"
+    path.write_text(json.dumps(_registry_payload(entry)), encoding="utf-8")
+
+    status = oracle_module.release_golden_registry_status(path)
+
+    assert status["valid"] is False
+    assert status["invalid_validation_evaluator_ids"] == ("lane_geometry_quality",)
+
+
+def test_incomplete_three_dimension_entry_keeps_candidate_at_medium_tier(tmp_path):
+    entry = _golden_entry("lane_geometry_quality")
+    entry["status"] = "pending"
+    entry["dimensions"].pop("real_negative")
+    entry["fully_validated"] = False
+    entry["missing_dimensions"] = ["real_negative"]
+    path = tmp_path / "registry.json"
+    path.write_text(json.dumps(_registry_payload(entry)), encoding="utf-8")
+    registry = oracle_module.release_golden_registry_status(path)
+
+    result = evaluate_structural_tier(
+        _contract(),
+        golden_registry_status=registry,
+    )
+
+    assert result.terminal_class == CANDIDATE_HYPOTHESIS
+    assert result.confidence_tier == "medium"
+    assert result.facts.evaluator_validation_complete is False
+    assert result.facts.evaluator_validation_missing_dimensions == (
+        "lane_geometry_quality:real_negative",
+    )
 
 
 def _contract(

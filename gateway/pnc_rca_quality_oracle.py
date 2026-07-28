@@ -34,6 +34,12 @@ TERMINAL_CLASSES = frozenset({
 MEDIUM_TIER_DISCLAIMER = "候选结论，待人工确认，不可作为定责依据"
 BANNED_PUBLIC_PHRASES = ("请核对问题数据地址",)
 GOLDEN_REGISTRY_SCHEMA_VERSION = "pnc_rca_release_golden_registry_v1"
+EVALUATOR_VALIDATION_SCHEMA_VERSION = "g1q3_rca_evaluator_validation_dimensions_v1"
+REQUIRED_EVALUATOR_VALIDATION_DIMENSIONS = (
+    "real_positive",
+    "real_negative",
+    "synthetic_boundary",
+)
 GOLDEN_REGISTRY_PATH = (
     Path(__file__).resolve().parent
     / "assets"
@@ -42,6 +48,8 @@ GOLDEN_REGISTRY_PATH = (
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _GIT_OID_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _EVALUATOR_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$")
+_FLAT_EVALUATOR_KEY_RE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
+_EVALUATOR_DOMAIN_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,63}$")
 _GOLDEN_HASH_FIELDS = (
     "evaluator_source_sha256",
     "positive_golden_sha256",
@@ -161,6 +169,9 @@ class StructuralTierFacts:
     golden_registry_valid: bool
     low_tier_golden_ready: bool
     golden_coverage_complete: bool
+    evaluator_validation_required_dimensions: tuple[str, ...]
+    evaluator_validation_missing_dimensions: tuple[str, ...]
+    evaluator_validation_complete: bool
     evidence_ref_count: int
     issue_frame_present: bool
     focus_window_present: bool
@@ -248,6 +259,162 @@ def _golden_source_validation(item: Mapping[str, Any]) -> tuple[bool, str]:
     if kind not in _OWNER_GOLDEN_SOURCE_KINDS:
         return False, "golden_source_kind_unqualified"
     return True, ""
+
+
+def _normalize_validation_required_dimensions(
+    value: Any,
+) -> tuple[tuple[str, ...], bool, tuple[str, ...]]:
+    if not isinstance(value, (list, tuple)):
+        return (), False, ("required_dimensions_not_list",)
+    normalized: list[str] = []
+    errors: list[str] = []
+    seen: set[str] = set()
+    allowed = set(REQUIRED_EVALUATOR_VALIDATION_DIMENSIONS)
+    for item in value:
+        dimension = _string(item)
+        if dimension not in allowed:
+            errors.append("required_dimension_invalid")
+            continue
+        if dimension in seen:
+            errors.append("required_dimensions_duplicate")
+            continue
+        seen.add(dimension)
+        normalized.append(dimension)
+    if set(normalized) != allowed:
+        errors.append("required_dimensions_exact_set_mismatch")
+    elif tuple(normalized) != REQUIRED_EVALUATOR_VALIDATION_DIMENSIONS:
+        errors.append("required_dimensions_order_invalid")
+    return (
+        tuple(dimension for dimension in REQUIRED_EVALUATOR_VALIDATION_DIMENSIONS if dimension in seen),
+        not errors,
+        tuple(sorted(set(errors))),
+    )
+
+
+def _validation_dimension_status(
+    item: Mapping[str, Any],
+    required_dimensions: Sequence[str],
+) -> dict[str, Any]:
+    evaluator_id = _string(item.get("evaluator_id"))
+    evaluator_key = _string(item.get("evaluator_key"))
+    domain = _string(item.get("domain"))
+    errors: list[str] = []
+    entry_required, entry_required_valid, entry_required_errors = (
+        _normalize_validation_required_dimensions(item.get("required_dimensions"))
+    )
+    errors.extend(entry_required_errors)
+    if entry_required_valid and tuple(entry_required) != tuple(required_dimensions):
+        errors.append("entry_required_dimensions_mismatch")
+    if _FLAT_EVALUATOR_KEY_RE.fullmatch(evaluator_key) is None:
+        errors.append("evaluator_key_not_flat_snake_case")
+    if evaluator_key != evaluator_id:
+        errors.append("evaluator_id_key_mapping_mismatch")
+    if _EVALUATOR_DOMAIN_RE.fullmatch(domain) is None:
+        errors.append("evaluator_domain_invalid")
+
+    dimensions_raw = item.get("dimensions")
+    dimensions = dimensions_raw if isinstance(dimensions_raw, Mapping) else {}
+    if not isinstance(dimensions_raw, Mapping):
+        errors.append("dimensions_not_object")
+    unexpected = set(str(value) for value in dimensions) - set(required_dimensions)
+    if unexpected:
+        errors.append("validation_dimension_unexpected")
+
+    passed: set[str] = set()
+    normalized_dimensions: dict[str, dict[str, Any]] = {}
+    hash_field_by_dimension = {
+        "real_positive": "positive_golden_sha256",
+        "real_negative": "negative_golden_sha256",
+        "synthetic_boundary": "test_receipt_sha256",
+    }
+    for dimension in required_dimensions:
+        raw = dimensions.get(dimension)
+        if raw is None:
+            continue
+        if not isinstance(raw, Mapping):
+            errors.append(f"validation_dimension_not_object:{dimension}")
+            continue
+        status = _string(raw.get("status"))
+        case_count = raw.get("case_count")
+        artifact_sha256 = _string(raw.get("artifact_sha256"))
+        if status not in {"passed", "pending", "failing"}:
+            errors.append(f"validation_dimension_status_invalid:{dimension}")
+        if type(case_count) is not int or int(case_count) < 0:
+            errors.append(f"validation_dimension_case_count_invalid:{dimension}")
+        if artifact_sha256 and _SHA256_RE.fullmatch(artifact_sha256) is None:
+            errors.append(f"validation_dimension_artifact_sha256_invalid:{dimension}")
+        if status == "passed":
+            if type(case_count) is not int or int(case_count) < 1:
+                errors.append(f"validation_dimension_passed_without_case:{dimension}")
+            if _SHA256_RE.fullmatch(artifact_sha256) is None:
+                errors.append(f"validation_dimension_passed_without_artifact:{dimension}")
+            expected_hash = _string(item.get(hash_field_by_dimension[dimension]))
+            if artifact_sha256 != expected_hash:
+                errors.append(f"validation_dimension_hash_binding_mismatch:{dimension}")
+            if not any(error.endswith(f":{dimension}") for error in errors):
+                passed.add(dimension)
+        normalized_dimensions[dimension] = {
+            "status": status,
+            "case_count": case_count,
+            "artifact_sha256": artifact_sha256,
+        }
+
+    calculated_missing = tuple(
+        dimension for dimension in required_dimensions if dimension not in passed
+    )
+    declared_missing_raw = item.get("missing_dimensions")
+    declared_missing, declared_valid, declared_errors = (
+        _normalize_declared_missing_dimensions(
+            declared_missing_raw,
+            required_dimensions=required_dimensions,
+        )
+    )
+    errors.extend(declared_errors)
+    if declared_valid and declared_missing != calculated_missing:
+        errors.append("missing_dimensions_accounting_mismatch")
+    calculated_fully_validated = not calculated_missing and not errors
+    if type(item.get("fully_validated")) is not bool:
+        errors.append("fully_validated_not_bool")
+    elif item.get("fully_validated") is not calculated_fully_validated:
+        errors.append("fully_validated_accounting_mismatch")
+    status = _string(item.get("status"))
+    if calculated_fully_validated and status != "passed":
+        errors.append("fully_validated_status_not_passed")
+    if calculated_missing and status not in {"pending", "failing"}:
+        errors.append("incomplete_validation_status_invalid")
+    return {
+        "valid": not errors,
+        "evaluator_key": evaluator_key,
+        "domain": domain,
+        "required_dimensions": tuple(entry_required),
+        "dimensions": normalized_dimensions,
+        "fully_validated": bool(not calculated_missing and not errors),
+        "missing_dimensions": calculated_missing,
+        "errors": tuple(sorted(set(errors))),
+    }
+
+
+def _normalize_declared_missing_dimensions(
+    value: Any,
+    *,
+    required_dimensions: Sequence[str],
+) -> tuple[tuple[str, ...], bool, tuple[str, ...]]:
+    if not isinstance(value, (list, tuple)):
+        return (), False, ("missing_dimensions_not_list",)
+    allowed = set(required_dimensions)
+    seen: set[str] = set()
+    errors: list[str] = []
+    for item in value:
+        dimension = _string(item)
+        if dimension not in allowed:
+            errors.append("missing_dimension_invalid")
+            continue
+        if dimension in seen:
+            errors.append("missing_dimensions_duplicate")
+            continue
+        seen.add(dimension)
+    normalized = tuple(dimension for dimension in required_dimensions if dimension in seen)
+    return normalized, not errors, tuple(sorted(set(errors)))
 
 
 def _append_values(target: list[Any], value: Any) -> None:
@@ -378,7 +545,14 @@ def _empty_golden_registry_status(*, present: bool, valid: bool = False) -> dict
         "pipeline_commit": "",
         "pipeline_tree": "",
         "low_tier_golden_ready": False,
+        "validation_schema_version": "",
+        "required_dimensions": REQUIRED_EVALUATOR_VALIDATION_DIMENSIONS,
         "evaluators": {},
+        "fully_validated_evaluators": {},
+        "fully_validated_evaluator_ids": (),
+        "incomplete_evaluator_ids": (),
+        "missing_dimensions_by_evaluator": {},
+        "invalid_validation_evaluator_ids": (),
         "required_evaluator_ids": (),
         "required_evaluator_ids_present": False,
         "inventory_binding_valid": False,
@@ -517,8 +691,14 @@ def release_golden_registry_status(
     entries = payload.get("evaluators")
     commit = _string(payload.get("pipeline_commit"))
     tree = _string(payload.get("pipeline_tree"))
+    validation_schema_version = _string(payload.get("validation_schema_version"))
+    required_dimensions, required_dimensions_valid, required_dimension_errors = (
+        _normalize_validation_required_dimensions(payload.get("required_dimensions"))
+    )
     base_valid = (
         payload.get("schema_version") == GOLDEN_REGISTRY_SCHEMA_VERSION
+        and validation_schema_version == EVALUATOR_VALIDATION_SCHEMA_VERSION
+        and required_dimensions_valid
         and _GIT_OID_RE.fullmatch(commit) is not None
         and _GIT_OID_RE.fullmatch(tree) is not None
         and isinstance(low, Mapping)
@@ -541,6 +721,11 @@ def release_golden_registry_status(
     non_distinct_ids: list[str] = []
     source_invalid_ids: list[str] = []
     machine_observation_ids: list[str] = []
+    invalid_validation_ids: list[str] = []
+    incomplete_ids: list[str] = []
+    missing_dimensions_by_evaluator: dict[str, tuple[str, ...]] = {}
+    fully_validated: dict[str, dict[str, Any]] = {}
+    seen_ids: set[str] = set()
     for item in entries if isinstance(entries, list) else ():
         if not isinstance(item, Mapping):
             valid = False
@@ -551,8 +736,9 @@ def release_golden_registry_status(
         )
         if _EVALUATOR_ID_RE.fullmatch(evaluator_id) is None:
             invalid_ids.append(evaluator_id)
-        elif evaluator_id in covered:
+        elif evaluator_id in seen_ids:
             duplicate_ids.append(evaluator_id)
+        seen_ids.add(evaluator_id)
         hashes = (source, positive, negative, receipt)
         hashes_valid = all(_SHA256_RE.fullmatch(value) is not None for value in hashes)
         hashes_distinct = hashes_valid and len(set(hashes)) == len(hashes)
@@ -566,7 +752,7 @@ def release_golden_registry_status(
         if (
             _EVALUATOR_ID_RE.fullmatch(evaluator_id) is None
             or evaluator_id in covered
-            or item.get("status") != "passed"
+            or item.get("status") not in {"passed", "pending", "failing"}
             or _SHA256_RE.fullmatch(source) is None
             or _SHA256_RE.fullmatch(positive) is None
             or _SHA256_RE.fullmatch(negative) is None
@@ -576,13 +762,34 @@ def release_golden_registry_status(
         ):
             valid = False
             continue
+        validation = _validation_dimension_status(item, required_dimensions)
+        if not validation["valid"]:
+            invalid_validation_ids.append(evaluator_id)
+            valid = False
+            continue
+        normalized_item = dict(item)
+        normalized_item["evaluator_key"] = validation["evaluator_key"]
+        normalized_item["domain"] = validation["domain"]
+        normalized_item["required_dimensions"] = list(
+            validation["required_dimensions"]
+        )
+        normalized_item["dimensions"] = validation["dimensions"]
+        normalized_item["fully_validated"] = validation["fully_validated"]
+        normalized_item["missing_dimensions"] = list(validation["missing_dimensions"])
+        normalized[evaluator_id] = normalized_item
         covered.add(evaluator_id)
-        normalized[evaluator_id] = dict(item)
+        if validation["fully_validated"]:
+            fully_validated[evaluator_id] = normalized_item
+        else:
+            incomplete_ids.append(evaluator_id)
+            missing_dimensions_by_evaluator[evaluator_id] = validation[
+                "missing_dimensions"
+            ]
     scope_present = "golden_scope_evaluator_ids" in payload
     scope_raw = payload.get("golden_scope_evaluator_ids")
     if scope_present:
         golden_scope, scope_valid, scope_errors = _normalize_golden_scope_ids(scope_raw)
-        if set(golden_scope) != covered:
+        if set(golden_scope) != set(fully_validated):
             scope_errors = tuple(sorted({*scope_errors, "golden_scope_evaluator_set_mismatch"}))
             scope_valid = False
         if not scope_valid:
@@ -591,18 +798,18 @@ def release_golden_registry_status(
         # The entry list is itself an explicit scope for v1 registries that do
         # not carry the optional declaration. No active-inventory coverage is
         # inferred from this fallback.
-        golden_scope = tuple(sorted(covered))
+        golden_scope = tuple(sorted(fully_validated))
         scope_errors = ()
     payload_required_present = "required_evaluator_ids" in payload
     payload_required = payload.get("required_evaluator_ids")
     payload_binding = validate_golden_registry_inventory(
         payload_required,
-        tuple(sorted(covered)),
+        tuple(sorted(fully_validated)),
         present=payload_required_present,
     )
     external_binding = validate_golden_registry_inventory(
         required_evaluator_ids,
-        tuple(sorted(covered)),
+        tuple(sorted(fully_validated)),
         present=required_evaluator_ids is not None,
     )
     binding_errors = set(payload_binding["errors"])
@@ -614,7 +821,13 @@ def release_golden_registry_status(
         ):
             binding_errors.add("required_evaluator_ids_binding_mismatch")
     effective_binding = external_binding if required_evaluator_ids is not None else payload_binding
-    if not entry_shape_valid or not valid or binding_errors:
+    if (
+        not entry_shape_valid
+        or not valid
+        or binding_errors
+        or required_dimension_errors
+        or invalid_validation_ids
+    ):
         valid = False
     low_tier_ready = bool(
         base_valid
@@ -628,8 +841,18 @@ def release_golden_registry_status(
         "valid": bool(valid),
         "pipeline_commit": commit,
         "pipeline_tree": tree,
+        "validation_schema_version": validation_schema_version,
+        "required_dimensions": required_dimensions,
         "low_tier_golden_ready": low_tier_ready,
         "evaluators": normalized,
+        "fully_validated_evaluators": fully_validated,
+        "fully_validated_evaluator_ids": tuple(sorted(fully_validated)),
+        "incomplete_evaluator_ids": tuple(sorted(incomplete_ids)),
+        "missing_dimensions_by_evaluator": {
+            key: tuple(value)
+            for key, value in sorted(missing_dimensions_by_evaluator.items())
+        },
+        "invalid_validation_evaluator_ids": tuple(sorted(set(invalid_validation_ids))),
         "required_evaluator_ids": effective_binding["required_evaluator_ids"],
         "required_evaluator_ids_present": bool(
             payload_required_present or required_evaluator_ids is not None
@@ -653,25 +876,53 @@ def release_golden_registry_status(
         ),
         "golden_scope_evaluator_ids": golden_scope,
         "golden_scope_explicit": scope_present,
-        "golden_scope_errors": tuple(scope_errors),
+        "golden_scope_errors": tuple(
+            sorted(set(scope_errors) | set(required_dimension_errors))
+        ),
     }
 
 
 def _golden_coverage(
     evaluator_keys: Sequence[str],
-) -> tuple[tuple[str, ...], bool, bool, bool, bool]:
-    registry = release_golden_registry_status()
-    evaluator_registry = registry.get("evaluators")
-    covered = set(evaluator_registry) if isinstance(evaluator_registry, Mapping) else set()
+    registry_status: Mapping[str, Any] | None = None,
+) -> tuple[tuple[str, ...], bool, bool, bool, bool, tuple[str, ...]]:
+    registry = (
+        dict(registry_status)
+        if isinstance(registry_status, Mapping)
+        else release_golden_registry_status()
+    )
+    fully_registry = registry.get("fully_validated_evaluators")
+    covered = (
+        set(fully_registry)
+        if isinstance(fully_registry, Mapping)
+        else set()
+    )
     required = set(evaluator_keys)
     valid = registry.get("valid") is True
     complete = bool(required) and valid and required.issubset(covered)
+    required_dimensions = tuple(
+        registry.get("required_dimensions") or REQUIRED_EVALUATOR_VALIDATION_DIMENSIONS
+    )
+    missing_by_key = registry.get("missing_dimensions_by_evaluator")
+    missing: list[str] = []
+    for key in sorted(required - covered):
+        declared = (
+            missing_by_key.get(key)
+            if isinstance(missing_by_key, Mapping)
+            else None
+        )
+        dimensions = tuple(
+            str(value) for value in declared
+            if str(value) in required_dimensions
+        ) if isinstance(declared, (list, tuple)) else required_dimensions
+        missing.extend(f"{key}:{dimension}" for dimension in dimensions)
     return (
         tuple(sorted(covered)),
         registry.get("present") is True,
         valid,
         registry.get("low_tier_golden_ready") is True,
         complete,
+        tuple(sorted(missing)),
     )
 
 
@@ -870,6 +1121,7 @@ def evaluate_structural_tier(
     execution_outcome: Any = "",
     terminal_error_code: Any = "",
     consumer_delivery_status: Any = "",
+    golden_registry_status: Mapping[str, Any] | None = None,
 ) -> TierOracleResult:
     """Recompute one of five terminal classes from production structure."""
 
@@ -902,7 +1154,8 @@ def evaluate_structural_tier(
         golden_valid,
         low_golden_ready,
         golden_complete,
-    ) = _golden_coverage(evaluator_keys)
+        golden_missing_dimensions,
+    ) = _golden_coverage(evaluator_keys, golden_registry_status)
     refs = _evidence_refs(material)
     evidence = _structural_evidence(material, refs)
     roles, causal_closed = _causal_roles(material)
@@ -1022,6 +1275,9 @@ def evaluate_structural_tier(
         golden_registry_valid=golden_valid,
         low_tier_golden_ready=low_golden_ready,
         golden_coverage_complete=golden_complete,
+        evaluator_validation_required_dimensions=REQUIRED_EVALUATOR_VALIDATION_DIMENSIONS,
+        evaluator_validation_missing_dimensions=golden_missing_dimensions,
+        evaluator_validation_complete=not golden_missing_dimensions,
         evidence_ref_count=len(refs),
         issue_frame_present=evidence["issue_frame_present"],
         focus_window_present=evidence["focus_window_present"],

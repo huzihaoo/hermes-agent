@@ -141,7 +141,11 @@ def _scope(path: Path):
 
 
 def test_negative_injections_exit_nonzero_and_write_receipts(tmp_path):
-    for scenario in ("supported_without_evaluator", "banned_phrase"):
+    for scenario in (
+        "supported_without_evaluator",
+        "banned_phrase",
+        "missing_validation_dimension",
+    ):
         receipt = tmp_path / f"{scenario}.json"
         completed = subprocess.run(
             [
@@ -162,6 +166,11 @@ def test_negative_injections_exit_nonzero_and_write_receipts(tmp_path):
         assert payload["blocked"] is True
         assert payload["exit_code"] == 2
         assert payload["expected_violation"] in payload["oracle"]["violations"]
+        if scenario == "missing_validation_dimension":
+            assert payload["oracle"]["confidence_tier"] == "medium"
+            assert payload["oracle"]["facts"][
+                "evaluator_validation_missing_dimensions"
+            ] == ["lane_geometry_quality:synthetic_boundary"]
 
 
 def test_recompute_uses_read_only_db_and_requires_nonempty_rows(tmp_path):

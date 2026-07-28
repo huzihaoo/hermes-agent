@@ -971,7 +971,13 @@ def audit_release_golden_registry(
     if observed.get("low_tier_golden_ready") is not True:
         errors.append(_error("pnc_release_low_tier_golden_not_ready"))
     evaluator_entries = observed.get("evaluators")
+    fully_validated_entries = observed.get("fully_validated_evaluators")
     covered_ids = tuple(
+        sorted(str(value) for value in fully_validated_entries)
+        if isinstance(fully_validated_entries, Mapping)
+        else ()
+    )
+    ledger_ids = tuple(
         sorted(str(value) for value in evaluator_entries)
         if isinstance(evaluator_entries, Mapping)
         else ()
@@ -1002,7 +1008,7 @@ def audit_release_golden_registry(
         )
     active_ids = tuple(active_binding["required_evaluator_ids"])
     active_set = set(active_ids)
-    unexpected_ids = tuple(sorted(set(covered_ids) - active_set))
+    unexpected_ids = tuple(sorted(set(ledger_ids) - active_set))
     if unexpected_ids:
         errors.append(
             _error(
@@ -1108,6 +1114,25 @@ def audit_release_golden_registry(
                 evaluator_ids=list(invalid_source_ids),
             )
         )
+    invalid_validation_ids = observed.get("invalid_validation_evaluator_ids")
+    if isinstance(invalid_validation_ids, (list, tuple)) and invalid_validation_ids:
+        errors.append(
+            _error(
+                "pnc_release_golden_validation_dimensions_invalid",
+                evaluator_ids=list(invalid_validation_ids),
+            )
+        )
+    missing_dimensions = observed.get("missing_dimensions_by_evaluator")
+    if isinstance(missing_dimensions, Mapping) and missing_dimensions:
+        # Incomplete entries are valid ledger rows, but can never be part of
+        # the high-confidence scope. Keep the missing-dimension accounting in
+        # the release receipt so a partial registry cannot look fully green.
+        evidence_missing_dimensions = {
+            str(key): list(value) if isinstance(value, (list, tuple)) else []
+            for key, value in missing_dimensions.items()
+        }
+    else:
+        evidence_missing_dimensions = {}
     observed_machine_ids = observed.get("machine_observation_evaluator_ids")
     if (
         isinstance(observed_machine_ids, (list, tuple))
@@ -1164,6 +1189,8 @@ def audit_release_golden_registry(
         "golden_scope_explicit": scope_present,
         "golden_scope_exact": bool(scope_valid and set(scope_ids) == set(covered_ids)),
         "uncovered_evaluator_ids": list(sorted(active_set - set(scope_ids))),
+        "fully_validated_evaluator_ids": list(covered_ids),
+        "missing_dimensions_by_evaluator": evidence_missing_dimensions,
         "high_confidence_ready": bool(
             scope_ids
             and scope_valid
