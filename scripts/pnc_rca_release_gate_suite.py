@@ -1054,6 +1054,23 @@ def _human_criterion(
     }
 
 
+def _live_followup(
+    matrix: Mapping[str, Any], *, criterion_id: str
+) -> dict[str, Any]:
+    """Project post-activation evidence without making it a preflight gate."""
+
+    row = _matrix_row(matrix, criterion_id)
+    live_status = str(row.get("live_status") or "").strip().upper()
+    return {
+        "criterion_id": criterion_id,
+        "mode": "requires_live",
+        "scope": "post_activation_live_evidence",
+        "status": "GREEN" if live_status == "GREEN" else "REQUIRES_LIVE",
+        "matrix_live_status": row.get("live_status"),
+        "blocking": False,
+    }
+
+
 def _merge_check(criterion: dict[str, Any], name: str, check: Mapping[str, Any]) -> None:
     criterion.setdefault("checks", {})[name] = dict(check)
     if check.get("status") != "GREEN":
@@ -1230,10 +1247,19 @@ def build_release_gate(
         for item in criteria
         if item["mode"] == "requires_human"
     ]
+    live_followups = [
+        _live_followup(matrix, criterion_id=criterion_id)
+        for criterion_id in AUTOMATED_CRITERIA
+    ]
+    requires_live = [
+        item["criterion_id"]
+        for item in live_followups
+        if item["status"] == "REQUIRES_LIVE"
+    ]
     preflight_status = (
         "BLOCKED_AUTOMATED_GATE_RED"
         if automated_red
-        else "AUTOMATED_GATE_GREEN_REQUIRES_HUMAN_CAPTURE"
+        else "AUTOMATED_GATE_GREEN_NONBLOCKING_FOLLOWUPS_PENDING"
     )
     report = {
         "schema_version": SCHEMA_VERSION,
@@ -1242,11 +1268,14 @@ def build_release_gate(
         "matrix": matrix_source,
         "candidate_binding": binding,
         "criteria": criteria,
+        "live_followups": live_followups,
         "summary": {
             "automated_total": len(AUTOMATED_CRITERIA),
             "automated_green": automated_green,
             "automated_red": automated_red,
             "requires_human": requires_human,
+            "requires_live": requires_live,
+            "blocking_modes": ["automated"],
             "all_automated_green": not automated_red,
             "all_criteria_green": False,
         },
@@ -1300,17 +1329,48 @@ def validate_release_gate(report: Mapping[str, Any]) -> None:
             "RED",
         }:
             raise ReleaseGateError("release_gate_automated_status_invalid")
+    live_followups = report.get("live_followups")
+    if not isinstance(live_followups, list) or tuple(
+        str(item.get("criterion_id") or "")
+        for item in live_followups
+        if isinstance(item, Mapping)
+    ) != AUTOMATED_CRITERIA:
+        raise ReleaseGateError("release_gate_live_followups_invalid")
+    for item in live_followups:
+        if (
+            not isinstance(item, Mapping)
+            or item.get("mode") != "requires_live"
+            or item.get("status") not in {"GREEN", "REQUIRES_LIVE"}
+            or item.get("blocking") is not False
+        ):
+            raise ReleaseGateError("release_gate_live_followup_invalid")
     summary = report.get("summary")
     summary = summary if isinstance(summary, Mapping) else {}
     preflight = report.get("activation_preflight")
     preflight = preflight if isinstance(preflight, Mapping) else {}
     has_red = bool(summary.get("automated_red"))
+    expected_requires_live = [
+        item["criterion_id"]
+        for item in live_followups
+        if item["status"] == "REQUIRES_LIVE"
+    ]
+    if summary.get("requires_live") != expected_requires_live or summary.get(
+        "blocking_modes"
+    ) != ["automated"]:
+        raise ReleaseGateError("release_gate_mode_summary_invalid")
     if has_red and (
         preflight.get("status") != "BLOCKED_AUTOMATED_GATE_RED"
         or preflight.get("exit_code") == 0
         or preflight.get("external_cutover_may_proceed_to_human_capture") is not False
     ):
         raise ReleaseGateError("release_gate_red_not_blocking")
+    if not has_red and (
+        preflight.get("status")
+        != "AUTOMATED_GATE_GREEN_NONBLOCKING_FOLLOWUPS_PENDING"
+        or preflight.get("exit_code") != 0
+        or preflight.get("external_cutover_may_proceed_to_human_capture") is not True
+    ):
+        raise ReleaseGateError("release_gate_nonblocking_followup_interlock")
     attestation = report.get("read_only_attestation")
     attestation = attestation if isinstance(attestation, Mapping) else {}
     if any(

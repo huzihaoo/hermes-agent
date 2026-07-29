@@ -156,8 +156,36 @@ def test_suite_emits_exact_automated_and_human_criteria(gate_inputs) -> None:
     assert statuses["A13"]["mode"] == "requires_human"
     assert report["summary"]["automated_total"] == 13
     assert report["summary"]["automated_red"] == []
+    assert report["summary"]["requires_live"] == list(suite.AUTOMATED_CRITERIA)
+    assert report["summary"]["blocking_modes"] == ["automated"]
+    assert {item["mode"] for item in report["live_followups"]} == {
+        "requires_live"
+    }
+    assert {item["status"] for item in report["live_followups"]} == {
+        "REQUIRES_LIVE"
+    }
     assert report["activation_preflight"]["exit_code"] == 0
     assert report["activation_preflight"]["activation_dispatch_performed"] is False
+
+
+def test_human_and_live_pending_do_not_block_automated_green_activation(
+    gate_inputs,
+) -> None:
+    report = _build(gate_inputs)
+
+    assert report["summary"]["all_automated_green"] is True
+    assert report["summary"]["requires_human"] == ["A7", "A13"]
+    assert report["summary"]["requires_live"]
+    assert report["activation_preflight"]["exit_code"] == 0
+    assert report["activation_preflight"]["status"] == (
+        "AUTOMATED_GATE_GREEN_NONBLOCKING_FOLLOWUPS_PENDING"
+    )
+    assert (
+        report["activation_preflight"][
+            "external_cutover_may_proceed_to_human_capture"
+        ]
+        is True
+    )
 
 
 def test_a_minus_one_uses_static_cutover_gate_not_not_applicable_offline_status(

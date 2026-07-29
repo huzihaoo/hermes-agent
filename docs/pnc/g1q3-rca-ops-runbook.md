@@ -145,7 +145,75 @@ PYTHONDONTWRITEBYTECODE=1 "$RCA_PYTHON" -m pytest -q -o addopts='' \
 
 不要默认运行整个 Hermes 测试集。VM 改动只运行对应 pipeline/service 测试和同一真实任务产物的阶段级验证，不新建无业务价值的 generation。
 
-## 7. 故障定位
+## 7. 紧急止血（生产操作）
+
+唯一对外写者是 delivery dispatcher。需要止血时必须按顺序卸载三个 launchd 服务：
+
+```bash
+launchctl bootout gui/$(id -u)/local.pnc.rca-delivery-dispatcher
+launchctl bootout gui/$(id -u)/local.pnc.completion-notice-relay
+launchctl bootout gui/$(id -u)/local.pnc.feishu-delivery-repair
+```
+
+使用 `bootout`，不要只 `kill`：这些 plist 具有 `KeepAlive`/`RunAtLoad`，单纯杀进程可能在 `ThrottleInterval` 后被重新拉起。`ExitTimeOut=30` 意味着已 claim 且仍在 lease 内的 effect 最多还可能完成；止血不是瞬时零风险。
+
+止血后的只读确认：
+
+```bash
+for label in \
+  local.pnc.rca-delivery-dispatcher \
+  local.pnc.completion-notice-relay \
+  local.pnc.feishu-delivery-repair; do
+  launchctl print gui/$(id -u)/"$label" >/dev/null 2>&1 && echo "still-loaded:$label" || echo "unloaded:$label"
+done
+```
+
+submission 熔断只阻止新任务进入，不能撤回已经存在的外发 effect；外发闸是 `HERMES_RCA_DELIVERY_DISPATCHER_ENABLED=false`，修改后需要重启/重新加载对应服务才生效。`HERMES_RCA_OUTBOX_ALLOW_FEISHU_WRITEBACK=false` 不是评论闸门，outbox 对 `true` 会 fail closed。
+
+submission 熔断复位必须先做 plan，再由明确操作者以新 receipt 路径 apply；不能直接调用 store 方法或复用旧 receipt：
+
+```bash
+python3 scripts/pnc_rca_outbox_dispatcher.py \
+  --clear-circuit \
+  --operator '<operator-id>' \
+  --reason '<bounded reason>' \
+  --receipt '/absolute/path/rca-circuit-reset.json'
+
+python3 scripts/pnc_rca_outbox_dispatcher.py \
+  --clear-circuit \
+  --operator '<operator-id>' \
+  --reason '<bounded reason>' \
+  --apply \
+  --receipt '/absolute/path/rca-circuit-reset.json'
+```
+
+第一条只读并输出前态/计划后态；第二条在 SQLite 同一事务中写入 `control_meta` 审计记录并关闭 circuit，随后以 0444 receipt 和 `.sha256` sidecar 物化。receipt 或 sidecar 物化失败时，数据库状态可能已经关闭，命令会返回 `recovery_required`、`reset_id` 和 `meta_key`；先从该审计记录恢复 receipt，不得再次盲目 reset。
+
+```bash
+python3 scripts/pnc_rca_outbox_dispatcher.py \
+  --materialize-reset '<reset-id>' \
+  --receipt '/absolute/path/recovered-rca-circuit-reset.json'
+```
+
+`control_meta` 是事务内 create-once 的应用层审计记录，并非 SQL trigger 强制不可变；恢复命令会重新校验 schema、DB identity、canonical JSON 和 fingerprint。`effect_delta.external_writes=0` 仅声明这个 reset 命令本身没有外部写路径，不能替代 B15 的 delivery DB 前后计数证据。
+
+B15 最终只读 preflight 必须把 resident/config、历史 outbox hold、Kafka freeze、120 秒 resource snapshot、record-only 完整配置、delivery disabled 和 effect baseline 收敛到一张 receipt；任何一项缺失都返回 `RED`，不启动或重载服务：
+
+```bash
+python3 scripts/pnc_rca_b15_preflight.py \
+  --env-file "$HOME/.hermes/.env" \
+  --runtime-dir "$HOME/.hermes/runtime/pnc_agent/feishu_issue_kafka_rca" \
+  --launch-agents-dir "$HOME/Library/LaunchAgents" \
+  --control-db "$HOME/.hermes/runtime/pnc_agent/feishu_issue_kafka_rca/control.sqlite3" \
+  --resource-snapshot '/absolute/path/resource-snapshot.json' \
+  --receipt '/absolute/path/b15-preflight.json'
+```
+
+该脚本只读打开 SQLite（`query_only`），receipt 另写入 0444 文件和 hash sidecar；`RED` receipt 也必须保留，不能把空输入、非法嵌套 snapshot 或缺失 snapshot 当成绿灯。CLI 只使用执行时的 live UTC clock，不提供 `--now` 或其他 freshness 覆盖参数。resident gate 会校验四类 health 的 exact schema、关键布尔/config、各自权威 freshness 字段、完整 runtime identity 及 plist/release 绑定；历史 outbox gate 会用 v13 canonical table/trigger validator 重算 sealed/current 非空 cohort，并要求 Kafka freeze epoch 与当前 activation epoch 一致。`HERMES_RCA_OUTBOX_ALLOW_FEISHU_WRITEBACK=false` 也必须显式存在，缺失不能继承默认值。`external_effect_baseline` 是后续零增量比较的起点，不等同于已经完成零增量验收。
+
+恢复前先取 service PID、配置指纹、数据库 effect 增量和 receipt；不得用 `kill -9`、跳过 `bootout`，或在未记录 receipt 时直接重新加载 plist。上线前演练应在隔离/无写环境完成，并记录最多 30 秒的残余 lease 窗口。
+
+## 8. 故障定位
 
 | 信号 | 处理 |
 |---|---|
@@ -158,7 +226,7 @@ PYTHONDONTWRITEBYTECODE=1 "$RCA_PYTHON" -m pytest -q -o addopts='' \
 | 报告存在但字段为空 | 修 delivery adapter 和字段元数据映射；不要用评论冒充交付 |
 | 远端写入结果不确定 | 保持 circuit open，按 marker/UUID/字段读回裁决，不直接重试 |
 
-## 8. 清理与保留
+## 9. 清理与保留
 
 迁移 worktree、candidate runtime、precutover 快照、stage plan/lock、发布评测器和退役 gate 应删除。只保留：
 
