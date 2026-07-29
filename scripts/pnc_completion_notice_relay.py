@@ -45,7 +45,12 @@ from scripts.pnc_foxglove_delivery import (  # noqa: E402
     validate_foxglove_url,
 )
 from scripts.vm_task_state_bridge import _atomic_write_json  # noqa: E402
-from gateway.feishu_task_card import render_task_card, stable_render_hash  # noqa: E402
+from gateway.feishu_task_card import (  # noqa: E402
+    contains_internal_rca_html_reference,
+    has_rca_delivery_provenance,
+    render_task_card,
+    stable_render_hash,
+)
 from gateway.feishu_task_confirm import (  # noqa: E402
     RCA_CANDIDATE_REVIEW_PRESET,
     RCA_CANDIDATE_REVIEW_SCHEMA_VERSION,
@@ -4233,7 +4238,9 @@ def _sync_task_card_unlocked(
         return {"skipped": True, "reason": "card_message_expired", "disposition": "suppressed_terminal", "semantic_key": semantic_key, "error": error, "target": target, "message_id": card_message_id}
     body["task_card"] = task_card
     _atomic_write_json(path, body)
-    fallback_text = str(notice.get("text") or "").strip()[:500]
+    fallback_text = _rca_public_text_without_internal_html(
+        str(notice.get("text") or "").strip()[:500], task_card
+    )
     if not fallback_text:
         fallback_text = _build_task_card_fallback_text(task_id, task_card, notice, error)
     return {"success": False, "error": error, "target": target, "fallback_text": fallback_text}
@@ -4291,11 +4298,69 @@ def _is_expired_card_update_error(error: str) -> bool:
     return "230031" in text or "message has expired" in text or "can only be updated within fourteen days" in text
 
 
+def _task_card_has_rca_delivery(task_card: Mapping[str, Any] | None) -> bool:
+    return has_rca_delivery_provenance(task_card)
+
+
+def _rca_internal_html_reference(
+    value: str,
+    *,
+    protected_foxglove_url: str,
+) -> bool:
+    return contains_internal_rca_html_reference(
+        value,
+        protected_foxglove_url=protected_foxglove_url,
+    )
+
+
+def _rca_public_text_without_internal_html(
+    value: Any,
+    task_card: Mapping[str, Any] | None,
+) -> str:
+    text = str(value or "").strip()
+    if not text or not _task_card_has_rca_delivery(task_card):
+        return text
+    card = task_card if isinstance(task_card, Mapping) else {}
+    delivery = card.get("delivery") if isinstance(card.get("delivery"), Mapping) else {}
+    protected_foxglove_url = _validated_foxglove_link(
+        delivery.get("foxglove_url"), delivery.get("viz_mcap_vm")
+    )
+    safe_lines = []
+    for line in text.splitlines():
+        lowered = line.lower()
+        if _rca_internal_html_reference(
+            line,
+            protected_foxglove_url=protected_foxglove_url,
+        ):
+            replacement = (
+                "报告链接：内部 HTML 审计产物已隐藏；公开交付仅使用已验证的 Foxglove 链接。"
+                if "报告链接" in line
+                else "html_url：内部 HTML 审计产物已隐藏；公开交付仅使用已验证的 Foxglove 链接。"
+                if "html_url" in lowered
+                else "artifact: 内部 HTML 审计产物已隐藏；公开交付仅使用已验证的 Foxglove 链接。"
+                if "artifact" in lowered
+                else ""
+            )
+            if replacement:
+                safe_lines.append(replacement)
+            continue
+        safe_lines.append(line)
+    return "\n".join(safe_lines).strip()
+
+
 def _build_task_card_fallback_text(task_id: str, task_card: dict[str, Any] | None, notice: dict[str, Any] | None, error: str) -> str:
     card = task_card if isinstance(task_card, dict) else {}
     delivery = card.get("delivery") if isinstance(card.get("delivery"), dict) else {}
     status_line = str(card.get("status_line") or card.get("user_state") or "进度更新").strip()
-    artifact_path = str(delivery.get("artifact_path") or "").strip()
+    raw_artifact_path = str(delivery.get("artifact_path") or "").strip()
+    artifact_path = raw_artifact_path
+    if _task_card_has_rca_delivery(card):
+        foxglove_url = _validated_foxglove_link(
+            delivery.get("foxglove_url"), delivery.get("viz_mcap_vm")
+        )
+        artifact_path = foxglove_url or _rca_public_text_without_internal_html(
+            raw_artifact_path, card
+        )
     conclusion = str(delivery.get("conclusion") or "").strip()
     lines = [
         CARD_FALLBACK_PREFIX,
@@ -4307,9 +4372,11 @@ def _build_task_card_fallback_text(task_id: str, task_card: dict[str, Any] | Non
         lines.append(f"conclusion: {conclusion}")
     if artifact_path:
         lines.append(f"artifact: {artifact_path}")
+    elif raw_artifact_path and _task_card_has_rca_delivery(card):
+        lines.append("artifact: 内部 HTML 审计产物已隐藏；公开交付仅使用已验证的 Foxglove 链接。")
     if error:
         lines.append(f"card_error: {error[:300]}")
-    return "\n".join(lines)
+    return _rca_public_text_without_internal_html("\n".join(lines), card)
 
 def _feishu_target(notice: dict[str, Any]) -> str:
     chat_id = str(notice.get("chat_id") or "").strip()
@@ -5176,6 +5243,7 @@ def relay_pending_notices(*, task_ids: Iterable[str] | None = None, send: bool =
         text = str(notice.get("text") or "") if isinstance(notice, dict) else ""
         if text.strip() and _completion_delivery_required(body, notice):
             text = _text_with_completion_must_carry(text, body, notice)
+        text = _rca_public_text_without_internal_html(text, _task_card)
         if not send:
             row["preview"] = text[:500]
             return row, errs

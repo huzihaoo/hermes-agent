@@ -362,17 +362,52 @@ def _record(
     triage_expected_kind: str = "lane",
     gate_decision: str = "allow",
     gate_review_decision: str = "allow",
+    adoption: str = "unreviewed",
+    adoption_operation_time: int = 1785250000000,
+    adoption_operator: str = "ou_adoption_reviewer",
+    generation: int = 1,
+    work_item_id: str | None = None,
     coverage_count: int = 100,
     report_count: int = 200,
     field_write_count: int = 300,
 ) -> dict:
     source_kind = "kafka_workflow_event" if entry == "kafka" else "feishu_group_manual"
+    issue_id = work_item_id or f"issue-{pair_id}"
+    adoption_signal: dict[str, object] = {
+        "source": "official_meegle_api",
+        "scope": {"project_key": "t03o4q", "work_item_id": issue_id},
+        "field_key": "field_b23cb8",
+        "generation": generation,
+        "start_ms": adoption_operation_time - 1000,
+        "end_ms": adoption_operation_time + 1000,
+        "window_semantics": "closed_conclusion_to_observed_at",
+        "status": adoption,
+    }
+    if adoption in {"adopted", "rejected"}:
+        adoption_signal.update({
+            "explicit": True,
+            "operation": {
+                "field_key": "field_b23cb8",
+                "operation_time": adoption_operation_time,
+                "operator": adoption_operator,
+                "operator_type": "user",
+                "new": "rya79_oos" if adoption == "adopted" else "0ivvg65i7",
+            },
+        })
+    elif adoption == "read_error":
+        adoption_signal["error_code"] = "meegle_read_failed"
     return {
         "record_id": f"{pair_id}-{entry}",
         "pair_id": pair_id,
         "release_id": "release-20260726",
         "business_line": "g1q3_rca",
         "source_kind": source_kind,
+        "delivery_provenance": {
+            "business_key": pair_id,
+            "generation": generation,
+            "project_key": "t03o4q",
+            "work_item_id": issue_id,
+        },
         "confidence_tier": tier,
         "denominator_kind": scope,
         "e2e": {"status": e2e},
@@ -390,6 +425,7 @@ def _record(
             "regression": regression,
         },
         "signals": {
+            "adoption": adoption_signal,
             "triage": {
                 "kind": triage_kind,
                 "expected_kind": triage_expected_kind,
@@ -413,6 +449,7 @@ def _clean_records() -> list[dict]:
             scope="business",
             tier="medium",
             attribution="candidate",
+            adoption="adopted",
         ),
         _record(
             pair_id="business-pair",
@@ -422,6 +459,7 @@ def _clean_records() -> list[dict]:
             owner_decision="rejected",
             attribution="owner_rejected",
             triage_expected_kind="aeb",
+            adoption="adopted",
         ),
         _record(
             pair_id="system-pair",
@@ -689,8 +727,8 @@ def test_high_and_low_tiers_never_enter_owner_attribution_denominator() -> None:
             "rate_pct": None,
         }
         assert group["signals"]["rca_adoption_rate"]["by_denominator"]["business"] == {
-            "numerator": 0,
-            "denominator": 0,
+            "numerator": None,
+            "denominator": None,
             "rate_pct": None,
         }
     assert report["auxiliary"]["attribution_exclusions"]["not_attributable"] == 2
@@ -728,7 +766,9 @@ def test_auxiliary_counts_cannot_inflate_any_metric_denominator() -> None:
 
 def test_three_former_todo_signals_have_clean_fields_and_rates() -> None:
     report = quality_metrics.build_daily_report(
-        _clean_records(), observed_at=OBSERVED_AT
+        _clean_records(),
+        observed_at=OBSERVED_AT,
+        adoption_semantics_confirmed=True,
     )
 
     inventory = {item["name"]: item for item in report["signal_inventory"]}
@@ -764,6 +804,252 @@ def test_three_former_todo_signals_have_clean_fields_and_rates() -> None:
     assert system["metrics"]["false_high_confidence_no_regression"]["failure_counts"][
         "system"
     ] == {"false_high_confidence": 1, "regression": 0}
+
+
+def test_adoption_without_explicit_operation_is_insufficient_and_has_no_rate() -> None:
+    records = [
+        _record(
+            pair_id="default-only",
+            entry=entry,
+            scope="business",
+            tier="medium",
+            attribution="candidate",
+        )
+        for entry in ("kafka", "feishu")
+    ]
+
+    report = quality_metrics.build_daily_report(records, observed_at=OBSERVED_AT)
+
+    assert report["adoption_signal"]["status"] == "insufficient_adoption_signal"
+    assert report["adoption_signal"]["explicit_response_count"] == 0
+    assert report["adoption_signal"]["numerator"] is None
+    assert report["adoption_signal"]["denominator"] is None
+    assert report["adoption_signal"]["rate_pct"] is None
+    assert "- rate_pct:" not in quality_metrics.render_markdown(report)
+
+
+def test_adoption_rate_waits_for_semantics_confirmation_and_deduplicates_pair() -> None:
+    records = [
+        _record(
+            pair_id="one-generation",
+            entry=entry,
+            scope="business",
+            tier="medium",
+            attribution="candidate",
+            adoption="adopted",
+        )
+        for entry in ("kafka", "feishu")
+    ]
+
+    unconfirmed = quality_metrics.build_daily_report(
+        records,
+        observed_at=OBSERVED_AT,
+    )
+    assert unconfirmed["adoption_signal"]["status"] == "adoption_semantics_unconfirmed"
+    assert unconfirmed["adoption_signal"]["explicit_response_count"] == 1
+    assert unconfirmed["adoption_signal"]["rate_pct"] is None
+
+    confirmed = quality_metrics.build_daily_report(
+        records,
+        observed_at=OBSERVED_AT,
+        adoption_semantics_confirmed=True,
+    )
+    assert confirmed["adoption_signal"]["status"] == "available"
+    assert confirmed["adoption_signal"]["states"]["adopted"] == 1
+    assert confirmed["adoption_signal"]["numerator"] == 1
+    assert confirmed["adoption_signal"]["denominator"] == 1
+    assert confirmed["adoption_signal"]["rate_pct"] == 100.0
+
+
+def test_flattened_adoption_cannot_bypass_official_generation_binding() -> None:
+    normalized = business_metrics.normalize_record(
+        _record(
+            pair_id="forged-flattened",
+            entry="kafka",
+            scope="business",
+            tier="medium",
+            attribution="candidate",
+            adoption="adopted",
+        )
+    )
+    for field in (
+        "adoption_source",
+        "adoption_work_item_id",
+        "adoption_generation",
+        "adoption_window_start_ms",
+        "adoption_window_end_ms",
+        "adoption_window_semantics",
+    ):
+        normalized.pop(field)
+
+    with pytest.raises(business_metrics.MetricsValidationError) as raised:
+        quality_metrics.build_daily_report(
+            [normalized],
+            observed_at=OBSERVED_AT,
+            adoption_semantics_confirmed=True,
+        )
+
+    assert raised.value.code == "metrics_adoption_binding_invalid"
+
+
+def test_valid_flattened_adoption_is_revalidated_before_aggregation() -> None:
+    normalized = business_metrics.normalize_records([
+        _record(
+            pair_id="valid-flattened",
+            entry=entry,
+            scope="business",
+            tier="medium",
+            attribution="candidate",
+            adoption="adopted",
+        )
+        for entry in ("kafka", "feishu")
+    ])
+
+    report = quality_metrics.build_daily_report(
+        normalized,
+        observed_at=OBSERVED_AT,
+        adoption_semantics_confirmed=True,
+    )
+
+    assert report["adoption_signal"]["status"] == "available"
+    assert report["adoption_signal"]["rate_pct"] == 100.0
+
+
+def test_adoption_rate_uses_only_explicit_adopted_and_rejected_generations() -> None:
+    records = []
+    for pair_id, status in (("adopted-pair", "adopted"), ("rejected-pair", "rejected")):
+        records.extend(
+            _record(
+                pair_id=pair_id,
+                entry=entry,
+                scope="business",
+                tier="medium",
+                attribution="candidate",
+                adoption=status,
+            )
+            for entry in ("kafka", "feishu")
+        )
+
+    report = quality_metrics.build_daily_report(
+        records,
+        observed_at=OBSERVED_AT,
+        adoption_semantics_confirmed=True,
+    )
+
+    assert report["adoption_signal"]["states"] == {
+        "adopted": 1,
+        "rejected": 1,
+        "unreviewed": 0,
+        "read_error": 0,
+    }
+    assert report["adoption_signal"]["numerator"] == 1
+    assert report["adoption_signal"]["denominator"] == 2
+    assert report["adoption_signal"]["rate_pct"] == 50.0
+
+
+def test_adoption_read_error_suppresses_rate_even_with_valid_operation() -> None:
+    records = [
+        _record(
+            pair_id="valid-pair",
+            entry="kafka",
+            scope="business",
+            tier="medium",
+            attribution="candidate",
+            adoption="adopted",
+        ),
+        _record(
+            pair_id="read-error-pair",
+            entry="feishu",
+            scope="business",
+            tier="medium",
+            attribution="candidate",
+            adoption="read_error",
+        ),
+    ]
+
+    report = quality_metrics.build_daily_report(
+        records,
+        observed_at=OBSERVED_AT,
+        strict=False,
+        adoption_semantics_confirmed=True,
+    )
+
+    assert report["adoption_signal"]["status"] == "read_error"
+    assert report["adoption_signal"]["numerator"] is None
+    assert report["adoption_signal"]["denominator"] is None
+    assert report["adoption_signal"]["rate_pct"] is None
+
+
+def test_adoption_claim_without_exact_user_operation_proof_is_rejected() -> None:
+    record = _record(
+        pair_id="invalid-proof",
+        entry="kafka",
+        scope="business",
+        tier="medium",
+        attribution="candidate",
+        adoption="adopted",
+    )
+    record["signals"]["adoption"]["operation"]["operator_type"] = "system"
+
+    with pytest.raises(business_metrics.MetricsValidationError) as error:
+        quality_metrics.build_daily_report([record], observed_at=OBSERVED_AT)
+
+    assert error.value.code == "metrics_adoption_proof_invalid"
+
+
+def test_adoption_ignores_unknown_non_conclusion_outcome() -> None:
+    records = [
+        _record(
+            pair_id="unknown-outcome",
+            entry=entry,
+            scope="business",
+            tier="medium",
+            attribution="arbitrary_nonempty_value",
+            adoption="adopted",
+        )
+        for entry in ("kafka", "feishu")
+    ]
+
+    report = quality_metrics.build_daily_report(
+        records,
+        observed_at=OBSERVED_AT,
+        adoption_semantics_confirmed=True,
+    )
+
+    assert report["adoption_signal"]["status"] == "insufficient_adoption_signal"
+    assert report["adoption_signal"]["explicit_response_count"] == 0
+
+
+def test_one_operation_proof_cannot_be_reused_across_generations() -> None:
+    records = [
+        _record(
+            pair_id=f"generation-{generation}",
+            entry=entry,
+            scope="business",
+            tier="medium",
+            attribution="candidate",
+            adoption="adopted",
+            generation=generation,
+            work_item_id="7048004715",
+        )
+        for generation in (1, 2)
+        for entry in ("kafka", "feishu")
+    ]
+
+    report = quality_metrics.build_daily_report(
+        records,
+        observed_at=OBSERVED_AT,
+        strict=False,
+        adoption_semantics_confirmed=True,
+    )
+
+    assert report["adoption_signal"]["status"] == "read_error"
+    assert report["adoption_signal"]["states"]["read_error"] == 2
+    assert report["adoption_signal"]["rate_pct"] is None
+    assert any(
+        item["code"] == "metrics_adoption_proof_reused"
+        for item in report["errors"]
+    )
 
 
 def test_markdown_keeps_auxiliary_in_a_separate_section() -> None:

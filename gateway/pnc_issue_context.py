@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 import logging
 from typing import Any, Callable, Literal
@@ -80,12 +81,23 @@ PNC_ALL_BUSINESS_TEST_GROUP_ID = "oc_16614f4ba25b8c88b69c0b8e9ebc2fb5"
 MEEGLE_CLI_TIMEOUT_SECONDS = 12
 G1Q3_ISSUE_ENRICHMENT_TIMEOUT_SECONDS = 75
 G1Q3_ISSUE_MCP_CALL_TIMEOUT_SECONDS = 15
+# ``field_b23cb8`` is an upstream select field.  It is deliberately kept
+# here, next to the read-only runner contract, so callers cannot accidentally
+# treat the field as a writable RCA output or infer a value from ``get``.
+G1Q3_ADOPTION_FIELD_KEY = "field_b23cb8"
+G1Q3_ADOPTION_VALUE_KEYS = {
+    "rya79_oos": "adopted",
+    "0ivvg65i7": "rejected",
+}
+G1Q3_ADOPTION_MAX_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
+G1Q3_ADOPTION_MAX_OPERATION_PAGES = 20
 _MEEGLE_READ_ONLY_COMMANDS = frozenset(
     {
         ("auth", "status"),
         ("comment", "list"),
         ("workitem", "get"),
         ("workitem", "meta-fields"),
+        ("workitem", "list-op-records"),
     }
 )
 _MEEGLE_WRITE_COMMANDS = {
@@ -436,6 +448,272 @@ def _unwrap_data_payload(payload: Any) -> Any:
             continue
         return current
     return current
+
+
+class G1Q3AdoptionReadError(ValueError):
+    """A malformed adoption operation response that must fail closed."""
+
+    def __init__(self, code: str, detail: str = ""):
+        self.code = str(code or "g1q3_adoption_read_error")
+        self.detail = str(detail or self.code)
+        super().__init__(f"{self.code}: {self.detail}")
+
+
+def validate_g1q3_adoption_window(start_ms: Any, end_ms: Any) -> tuple[int, int]:
+    """Validate one bounded ``list-op-records`` time window.
+
+    The Meegle endpoint silently truncates broad windows.  Rejecting them here
+    keeps a caller from accidentally treating a partial history as complete.
+    """
+
+    if (
+        isinstance(start_ms, bool)
+        or isinstance(end_ms, bool)
+        or not isinstance(start_ms, int)
+        or not isinstance(end_ms, int)
+    ):
+        raise G1Q3AdoptionReadError(
+            "g1q3_adoption_window_invalid",
+            "start_ms and end_ms must be integer milliseconds",
+        )
+    if start_ms < 0 or end_ms < 0 or end_ms < start_ms:
+        raise G1Q3AdoptionReadError(
+            "g1q3_adoption_window_invalid",
+            "adoption operation window bounds are invalid",
+        )
+    if end_ms - start_ms > G1Q3_ADOPTION_MAX_WINDOW_MS:
+        raise G1Q3AdoptionReadError(
+            "g1q3_adoption_window_too_wide",
+            "an adoption operation window may not exceed seven days",
+        )
+    return start_ms, end_ms
+
+
+def _adoption_option_keys(value: Any) -> list[str]:
+    """Extract option keys without accepting labels as stable identities."""
+
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, Mapping):
+        for key in (
+            "key_label_value",
+            "key_label",
+            "option",
+            "value",
+            "key",
+            "id",
+        ):
+            nested = value.get(key)
+            if nested is value:
+                continue
+            found = _adoption_option_keys(nested)
+            if found:
+                return found
+        return []
+    if isinstance(value, list):
+        result: list[str] = []
+        for item in value:
+            result.extend(_adoption_option_keys(item))
+        return result
+    return []
+
+
+def _adoption_content_targets_field(content: Mapping[str, Any]) -> bool:
+    """Return true only for an explicit object/field target.
+
+    Meegle has emitted both ``object.object_value=field_key`` and
+    ``object.object_value=field`` + ``object_property=field_key`` shapes over
+    time.  Both retain an explicit object discriminator; a bare property is
+    intentionally rejected to avoid counting unrelated field changes.
+    """
+
+    obj = content.get("object")
+    if not isinstance(obj, Mapping):
+        return False
+    object_value = str(
+        obj.get("object_value") or obj.get("objectValue") or ""
+    ).strip()
+    object_type = str(
+        obj.get("object_type") or obj.get("objectType") or obj.get("type") or ""
+    ).strip()
+    property_key = str(
+        content.get("object_property")
+        or content.get("objectProperty")
+        or content.get("field_key")
+        or content.get("fieldKey")
+        or ""
+    ).strip()
+    if object_value == G1Q3_ADOPTION_FIELD_KEY:
+        return object_type in {"field", "work_item_field"}
+    return (
+        object_value in {"field", "work_item_field"}
+        and property_key == G1Q3_ADOPTION_FIELD_KEY
+    )
+
+
+def _normalize_adoption_operation(
+    record: Mapping[str, Any], content: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    """Normalize target changes from one operation record.
+
+    Records for other fields are ignored.  Once a record explicitly targets
+    ``field_b23cb8``, malformed provenance is an error rather than an
+    unreviewed value; this is the fail-closed boundary for metrics.
+    """
+
+    if not _adoption_content_targets_field(content):
+        return []
+    timestamp = record.get("operation_time")
+    if (
+        isinstance(timestamp, bool)
+        or not isinstance(timestamp, int)
+        or timestamp < 0
+    ):
+        raise G1Q3AdoptionReadError(
+            "g1q3_adoption_operation_time_invalid",
+            "target operation is missing integer operation_time",
+        )
+    operator_type = str(record.get("operator_type") or "").strip()
+    operator = record.get("operator")
+    if isinstance(operator, Mapping):
+        if not operator_type:
+            operator_type = str(
+                operator.get("operator_type") or operator.get("type") or ""
+            ).strip()
+        operator = (
+            operator.get("id")
+            or operator.get("operator_id")
+            or operator.get("user_id")
+            or operator.get("name")
+        )
+    operator_text = str(operator or "").strip()
+    if operator_type != "user":
+        # Upstream cleanup/defaulting can be performed by a plugin or system
+        # actor.  Those records are non-authoritative, but they are not a read
+        # failure and must never enter the human-response denominator.
+        return []
+    if not operator_text:
+        raise G1Q3AdoptionReadError(
+            "g1q3_adoption_operator_invalid",
+            "target user operation must identify its operator",
+        )
+    old_keys = _adoption_option_keys(content.get("old"))
+    new_keys = _adoption_option_keys(content.get("new"))
+    if len(old_keys) > 1 or len(new_keys) > 1:
+        raise G1Q3AdoptionReadError(
+            "g1q3_adoption_option_cardinality_invalid",
+            "adoption select operations must contain at most one old/new option",
+        )
+    if not new_keys:
+        return [{
+            "field_key": G1Q3_ADOPTION_FIELD_KEY,
+            "operation_time": timestamp,
+            "operator": operator_text,
+            "operator_type": operator_type,
+            "old": old_keys[-1] if old_keys else "",
+            "new": "",
+            "status": "unreviewed",
+        }]
+    old_key = old_keys[-1] if old_keys else ""
+    normalized: list[dict[str, Any]] = []
+    for new_key in new_keys:
+        status = G1Q3_ADOPTION_VALUE_KEYS.get(new_key)
+        if status is None:
+            raise G1Q3AdoptionReadError(
+                "g1q3_adoption_option_invalid",
+                "target operation contains an unknown adoption option key",
+            )
+        normalized.append(
+            {
+                "field_key": G1Q3_ADOPTION_FIELD_KEY,
+                "operation_time": timestamp,
+                "operator": operator_text,
+                "operator_type": operator_type,
+                "old": old_key,
+                "new": new_key,
+                "status": status,
+            }
+        )
+    return normalized
+
+
+def normalize_g1q3_adoption_operation_page(payload: Any) -> tuple[list[dict[str, Any]], str]:
+    """Parse one ``workitem list-op-records`` page.
+
+    The second return value is the next ``start_from`` token.  Pagination
+    policy (window and maximum page count) belongs to the caller; this helper
+    only enforces response shape and target provenance.
+    """
+
+    body = _unwrap_data_payload(payload)
+    if not isinstance(body, Mapping):
+        raise G1Q3AdoptionReadError(
+            "g1q3_adoption_response_invalid",
+            "operation page must be an object",
+        )
+    rows: Any = body.get("op_records")
+    if rows is None:
+        for key in ("records", "items", "list"):
+            if key in body:
+                rows = body.get(key)
+                break
+    if not isinstance(rows, list):
+        raise G1Q3AdoptionReadError(
+            "g1q3_adoption_response_invalid",
+            "operation page is missing an array of records",
+        )
+    normalized: list[dict[str, Any]] = []
+    for record in rows:
+        if not isinstance(record, Mapping):
+            raise G1Q3AdoptionReadError(
+                "g1q3_adoption_response_invalid",
+                "operation records must contain objects",
+            )
+        contents = record.get("record_contents")
+        if contents is None:
+            contents = record.get("recordContents")
+        if contents is None:
+            # An operation with no field changes is valid history, just not an
+            # adoption signal.  Do not turn it into a read error.
+            continue
+        if not isinstance(contents, list):
+            raise G1Q3AdoptionReadError(
+                "g1q3_adoption_response_invalid",
+                "record_contents must be an array",
+            )
+        for content in contents:
+            if not isinstance(content, Mapping):
+                raise G1Q3AdoptionReadError(
+                    "g1q3_adoption_response_invalid",
+                    "record_contents must contain objects",
+                )
+            normalized.extend(_normalize_adoption_operation(record, content))
+
+    has_more = body.get("has_more")
+    if has_more is None and "hasMore" in body:
+        has_more = body.get("hasMore")
+    if not isinstance(has_more, bool):
+        raise G1Q3AdoptionReadError(
+            "g1q3_adoption_pagination_invalid",
+            "has_more must be present and boolean",
+        )
+    token_value = body.get("start_from")
+    if token_value is None:
+        token_value = body.get("next_start_from")
+    if token_value is None:
+        token_value = body.get("nextStartFrom")
+    token = str(token_value or "").strip()
+    if has_more is True and not token:
+        raise G1Q3AdoptionReadError(
+            "g1q3_adoption_pagination_invalid",
+            "has_more response is missing start_from",
+        )
+    if has_more is False and token:
+        raise G1Q3AdoptionReadError(
+            "g1q3_adoption_pagination_invalid",
+            "completed response unexpectedly carries start_from",
+        )
+    return normalized, token
 
 
 def _first_list_payload(payload: Any, keys: tuple[str, ...]) -> list[dict[str, Any]]:

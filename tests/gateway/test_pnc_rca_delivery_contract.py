@@ -17,7 +17,7 @@ from gateway.pnc_rca_delivery_contract import (
     DeliveryContractError,
     MAX_DELIVERY_ARTIFACT_BYTES,
     MAX_DELIVERY_ARTIFACTS,
-    RERUN_PROMPT_LINE,
+    ADOPTION_PROMPT_LINE,
     build_public_rca_result,
     build_report_cifs_path,
     build_report_artifact_url,
@@ -25,9 +25,11 @@ from gateway.pnc_rca_delivery_contract import (
     build_report_vm_path,
     build_terminal_delivery,
     build_thread_reply_effect,
+    canonical_issue_url,
     compute_artifact_set_id,
     MAX_FEISHU_COMMENT_BYTES,
     render_public_rca_result,
+    rerun_prompt_line,
     verify_delivery_bundle,
 )
 from scripts.pnc_foxglove_delivery import (
@@ -227,6 +229,7 @@ def _bundle(
             "viz_mcap_vm": viz_path,
             "viz_publication": viz_publication,
         },
+        "consumer_capability": _consumer_capability(),
     }
     observed = [
         {
@@ -357,7 +360,10 @@ def test_delivery_projects_consumer_capability_into_field_and_comment():
     assert "signals/fields/evaluators" not in verified.effect_payload["comment_content"]
     assert "Foxglove 证据：" in verified.effect_payload["comment_content"]
     assert verified.effect_payload["comment_content"].splitlines()[-1] == (
-        RERUN_PROMPT_LINE
+        ADOPTION_PROMPT_LINE
+    )
+    assert rerun_prompt_line(canonical_issue_url("g1q3", "7041712812")) in (
+        verified.effect_payload["comment_content"].splitlines()
     )
     assert (
         verified.effect_payload["field_updates"][0]["field_value"]
@@ -592,6 +598,79 @@ def test_public_projection_humanizes_legacy_success_wrapped_terminal_result():
     assert "已生成诊断报告" not in rendered
 
 
+def test_honest_abstention_projects_existing_window_signals_and_foxglove_handoff():
+    admission, contract, manifest, observed, dependencies = _bundle()
+    contract["consumer_capability"] = _consumer_capability()
+    contract["consumer_capability"]["evidence"]["focus_window"].update(
+        {"start_frame": None, "end_frame": None}
+    )
+
+    verified = verify_delivery_bundle(
+        admission=admission,
+        delivery_contract=contract,
+        delivery_manifest=manifest,
+        observed_files=observed,
+        html_dependencies=dependencies,
+    )
+
+    conclusion = verified.effect_payload["conclusion"]
+    comment = verified.effect_payload["comment_content"]
+    assert verified.effect_payload["terminal_class"] == "honest_non_attribution"
+    assert "自动分析未形成可派单结论" in conclusion
+    assert "相对问题时刻 0.000s-1.000s" in conclusion
+    assert "`AEBReq`" in conclusion
+    assert "`OOI_ID`" in conclusion
+    assert verified.foxglove_url in comment
+    assert "自行查看该区间" in comment
+    assert "自动跳转或预置 layout" in comment
+    assert ADOPTION_PROMPT_LINE not in comment
+
+
+def test_honest_abstention_requires_existing_window_and_signal_capability():
+    admission, contract, manifest, observed, dependencies = _bundle()
+    contract.pop("consumer_capability")
+
+    with pytest.raises(DeliveryContractError) as raised:
+        verify_delivery_bundle(
+            admission=admission,
+            delivery_contract=contract,
+            delivery_manifest=manifest,
+            observed_files=observed,
+            html_dependencies=dependencies,
+        )
+
+    assert raised.value.code == "consumer_capability_required_for_abstain"
+
+
+@pytest.mark.parametrize(
+    "internal_pointer",
+    [
+        "http://internal/G1Q3_RCA/demo/index%2Ehtml",
+        "http://internal/G1Q3_RCA/demo/index&amp;#46;html",
+        "http://192.168.26.174:18081?case=demo",
+    ],
+)
+def test_public_delivery_rejects_internal_html_hidden_in_conclusion(
+    internal_pointer,
+):
+    admission, contract, manifest, observed, dependencies = _bundle()
+    _add_structural_candidate(
+        contract,
+        conclusion=f"证据见 {internal_pointer}",
+    )
+
+    with pytest.raises(DeliveryContractError) as raised:
+        verify_delivery_bundle(
+            admission=admission,
+            delivery_contract=contract,
+            delivery_manifest=manifest,
+            observed_files=observed,
+            html_dependencies=dependencies,
+        )
+
+    assert raised.value.code == "delivery_public_html_reference_forbidden"
+
+
 def test_public_projection_keeps_out_of_scope_separate_from_abstention():
     rendered = render_public_rca_result(
         {
@@ -799,7 +878,7 @@ def test_out_of_scope_terminal_uses_distinct_public_copy_and_rerun_prompt():
     assert any(line.startswith("数据来源：") for line in diagnostic_lines)
     assert any(line.startswith("检查结果：") for line in diagnostic_lines)
     assert terminal.effect_payload["comment_content"].splitlines()[-1] == (
-        RERUN_PROMPT_LINE
+        rerun_prompt_line(canonical_issue_url("t03o4q", "7041712812"))
     )
     assert "G1Q3 RCA 机器人终态" not in terminal.effect_payload["comment_content"]
 
@@ -901,6 +980,7 @@ def test_public_comment_rejects_noncanonical_foxglove_url(invalid_url):
             report_url=invalid_url,
             foxglove_url=invalid_url,
             report_cifs_path="",
+            issue_url=canonical_issue_url("t03o4q", "7041712812"),
         )
 
     assert exc.value.code == "foxglove_url_invalid"
@@ -1592,7 +1672,7 @@ def test_terminal_v2_writes_only_honest_result_without_fake_report_url():
     }
     assert "field_8c912e" not in json.dumps(delivery.effect_payload, ensure_ascii=False)
     assert delivery.effect_payload["comment_content"].splitlines()[-1] == (
-        RERUN_PROMPT_LINE
+        rerun_prompt_line(canonical_issue_url("t03o4q", "7051585084"))
     )
     assert "本终态不改写" not in delivery.effect_payload["comment_content"]
     assert "不代表第 1 代结论" not in delivery.effect_payload["comment_content"]

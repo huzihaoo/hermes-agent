@@ -18,9 +18,10 @@ from gateway.pnc_rca_delivery_contract import (
     DELIVERY_EFFECT_KIND,
     MAX_FEISHU_COMMENT_BYTES,
     RCA_RESULT_FIELD_KEY,
-    RERUN_PROMPT_LINE,
+    canonical_issue_url,
     compute_delivery_effect_key,
     delivery_effect_marker,
+    rerun_prompt_line,
 )
 from gateway.pnc_rca_quality_oracle import (
     CANDIDATE_HYPOTHESIS,
@@ -677,6 +678,7 @@ def _adjudication_content(
     *,
     marker: str,
     action: str,
+    project_key: str,
     work_item_id: str,
     original_effect_key: str,
     reason: str,
@@ -684,6 +686,7 @@ def _adjudication_content(
 ) -> tuple[str, str]:
     # Free-form owner input is internal audit evidence, never publication text.
     del original_effect_key, reason
+    prompt = rerun_prompt_line(canonical_issue_url(project_key, work_item_id))
     if action == "retract":
         field_value = "原自动 RCA 结论已撤回并标记作废；不可作为定责依据。"
         lines = [
@@ -692,7 +695,7 @@ def _adjudication_content(
             f"问题：{work_item_id}",
             "原结论不可作为定责依据；后续以重新复核后的结论为准。",
             "更正依据已保留在内部不可变审计记录中。",
-            RERUN_PROMPT_LINE,
+            prompt,
         ]
     elif action == "recognize":
         field_value = replacement_conclusion
@@ -702,7 +705,7 @@ def _adjudication_content(
             f"问题：{work_item_id}",
             "已确认结论以本问题单上一条自动 RCA 候选评论为准。",
             "确认依据已保留在内部不可变审计记录中。",
-            RERUN_PROMPT_LINE,
+            prompt,
         ]
     else:
         raise ConclusionAdjudicationError(
@@ -777,6 +780,7 @@ def _build_effect(
     comment_content, field_value = _adjudication_content(
         marker=marker,
         action=action,
+        project_key=str(row["project_key"]),
         work_item_id=str(row["work_item_id"]),
         original_effect_key=str(row["effect_key"]),
         reason=reason,
@@ -1390,6 +1394,7 @@ def validate_adjudication_effect_claim(
     content, field_value = _adjudication_content(
         marker=marker,
         action=action,
+        project_key=str(payload.get("project_key") or ""),
         work_item_id=claim.work_item_id,
         original_effect_key=str(payload.get("original_effect_key") or ""),
         reason=reason,

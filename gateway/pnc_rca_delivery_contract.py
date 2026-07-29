@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from gateway.pnc_rca_admission import RcaAdmission, validate_rca_admission
 from gateway.feishu_mention import build_at_mention
+from gateway.feishu_task_card import contains_internal_rca_html_reference
 from gateway.pnc_rca_quality_oracle import (
     CANDIDATE_HYPOTHESIS,
     HONEST_NON_ATTRIBUTION,
@@ -128,9 +129,17 @@ CONSUMER_CAPABILITY_SCHEMA_VERSION = "rca_consumer_capability_publication_v1"
 RCA_RESULT_FIELD_KEY = "field_9193cb"
 RCA_REPORT_FIELD_KEY = "field_8c912e"
 DELIVERY_REPORT_LINK_KIND = "foxglove_viz"
-RERUN_PROMPT_LINE = (
-    "如需重新分析，请到 PNC-Agent 群 @小助手 并发送：重新分析 <单号>"
+RERUN_PROMPT_PREFIX = (
+    "如需重新分析，请到 PNC-Agent 群 @小助手 并发送：重新分析"
 )
+ADOPTION_PROMPT_LINE = (
+    "责任模块研发请在「是否采纳」字段选择“采纳”或“不采纳”；"
+    "如选择“不采纳”，请填写不采纳原因。提单测试同学无需额外操作。"
+)
+_PROJECT_URL_SLUGS = {
+    "t03o4q": "t03o4q",
+    "68ef617fb371dc80a10641f7": "t03o4q",
+}
 _HTML_REPORT_STATUSES = frozenset({
     "html_delivery_ready",
     "report_generated_need_review",
@@ -147,6 +156,39 @@ class DeliveryContractError(ValueError):
         self.code = str(code or "delivery_contract_invalid")[:120]
         self.detail = str(detail or self.code)[:1000]
         super().__init__(self.detail)
+
+
+def canonical_issue_url(project_key: Any, work_item_id: Any) -> str:
+    project = str(project_key or "").strip()
+    issue = str(work_item_id or "").strip()
+    slug = _PROJECT_URL_SLUGS.get(project, project)
+    if (
+        not _PROJECT_SIMPLE_NAME_RE.fullmatch(slug)
+        or not issue.isdigit()
+        or len(issue) > 32
+    ):
+        raise DeliveryContractError("delivery_issue_url_invalid")
+    return f"https://project.feishu.cn/{slug}/issue/detail/{issue}"
+
+
+def rerun_prompt_line(issue_url: Any) -> str:
+    text = str(issue_url or "").strip()
+    parsed = urlparse(text)
+    parts = tuple(part for part in parsed.path.split("/") if part)
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != "project.feishu.cn"
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+        or len(parts) != 4
+        or parts[1:3] != ("issue", "detail")
+        or not _PROJECT_SIMPLE_NAME_RE.fullmatch(parts[0])
+        or not parts[3].isdigit()
+        or len(parts[3]) > 32
+    ):
+        raise DeliveryContractError("delivery_issue_url_invalid")
+    return f"{RERUN_PROMPT_PREFIX} {text}"
 
 
 _UPSTREAM_DISPATCH_SCHEMA_VERSION = "g1q3_upstream_dispatch_v2"
@@ -336,6 +378,75 @@ def _dispatch_window_line(dispatch: Mapping[str, Any]) -> str:
         f"{float(envelope['t_end']):.3f}s"
         f"（参与判据 {int(envelope['participating_key_count'])} 个）"
     )
+
+
+def _abstain_analysis_handoff_lines(
+    contract: Mapping[str, Any],
+) -> list[str]:
+    capability = contract.get("consumer_capability")
+    if capability is None and isinstance(contract.get("summary"), Mapping):
+        capability = contract["summary"].get("consumer_capability")
+    if not capability:
+        return []
+    if not isinstance(capability, Mapping):
+        raise DeliveryContractError("consumer_capability_invalid")
+    evidence = capability.get("evidence")
+    focus = evidence.get("focus_window") if isinstance(evidence, Mapping) else None
+    if (
+        not isinstance(focus, Mapping)
+        or not {"start_ts", "end_ts"}.issubset(focus)
+        or not set(focus).issubset(
+            {"start_ts", "end_ts", "start_frame", "end_frame"}
+        )
+    ):
+        raise DeliveryContractError("consumer_capability_focus_window_invalid")
+    start = focus.get("start_ts")
+    end = focus.get("end_ts")
+    if (
+        isinstance(start, bool)
+        or isinstance(end, bool)
+        or not isinstance(start, (int, float))
+        or not isinstance(end, (int, float))
+        or not math.isfinite(float(start))
+        or not math.isfinite(float(end))
+        or float(start) > float(end)
+    ):
+        raise DeliveryContractError("consumer_capability_focus_window_invalid")
+    for frame_key in ("start_frame", "end_frame"):
+        frame = focus.get(frame_key)
+        if frame is not None and (
+            isinstance(frame, bool) or not isinstance(frame, int) or frame < 0
+        ):
+            raise DeliveryContractError("consumer_capability_focus_window_invalid")
+    raw_names = [
+        *(capability.get("actual_signals") or []),
+        *(capability.get("actual_fields") or []),
+    ]
+    if any(
+        not isinstance(name, str)
+        or not name.strip()
+        or len(name.encode("utf-8")) > 128
+        or "\n" in name
+        or "\r" in name
+        or "`" in name
+        for name in raw_names
+    ):
+        raise DeliveryContractError("consumer_capability_signal_name_invalid")
+    names = list(dict.fromkeys(name.strip() for name in raw_names))
+    if not names:
+        raise DeliveryContractError("consumer_capability_signal_inventory_empty")
+    displayed = names[:10]
+    suffix = f" 等共 {len(names)} 个" if len(names) > len(displayed) else ""
+    return [
+        (
+            "建议研发重点复核相对问题时刻 "
+            f"{float(start):.3f}s-{float(end):.3f}s。"
+        ),
+        "已读取的关键信号包括 "
+        + "、".join(f"`{name}`" for name in displayed)
+        + suffix
+        + "。",
+    ]
 
 
 @dataclass(frozen=True)
@@ -799,6 +910,18 @@ def _validated_public_foxglove_url(value: Any) -> str:
     return text
 
 
+def _reject_public_internal_html(
+    value: Any,
+    *,
+    protected_foxglove_url: str = "",
+) -> None:
+    if contains_internal_rca_html_reference(
+        value,
+        protected_foxglove_url=protected_foxglove_url,
+    ):
+        raise DeliveryContractError("delivery_public_html_reference_forbidden")
+
+
 def build_issue_comment_content(
     *,
     marker: str,
@@ -808,6 +931,7 @@ def build_issue_comment_content(
     report_url: str,
     foxglove_url: str,
     report_cifs_path: str,
+    issue_url: str,
     terminal_class: str = "",
 ) -> str:
     public_url = _validated_public_foxglove_url(foxglove_url)
@@ -819,10 +943,22 @@ def build_issue_comment_content(
         raise DeliveryContractError("delivery_dispatch_first_line_invalid")
     lines.extend([
         f"Foxglove 证据：{public_url}",
-        marker,
-        RERUN_PROMPT_LINE,
     ])
+    if (
+        terminal_class == HONEST_NON_ATTRIBUTION
+        and "建议研发重点复核相对问题时刻" in conclusion
+    ):
+        lines.append(
+            "请在上述 Foxglove 证据中自行查看该区间；本轮不承诺自动跳转或预置 layout。"
+        )
+    lines.extend([marker, rerun_prompt_line(issue_url)])
+    if terminal_class in {SUPPORTED_ATTRIBUTION, CANDIDATE_HYPOTHESIS}:
+        lines.append(ADOPTION_PROMPT_LINE)
     content = "\n".join(lines)
+    _reject_public_internal_html(
+        content,
+        protected_foxglove_url=public_url,
+    )
     if len(content.encode("utf-8")) > MAX_FEISHU_COMMENT_BYTES:
         raise DeliveryContractError("delivery_comment_too_large")
     return content
@@ -851,10 +987,22 @@ def build_thread_reply_content(
         f"Foxglove 证据：{public_url}",
         f"问题单：{issue_url}",
         f"发起人：{build_at_mention(requester_id)}",
-        marker,
-        RERUN_PROMPT_LINE,
     ])
+    if (
+        terminal_class == HONEST_NON_ATTRIBUTION
+        and "建议研发重点复核相对问题时刻" in conclusion
+    ):
+        lines.append(
+            "请在上述 Foxglove 证据中自行查看该区间；本轮不承诺自动跳转或预置 layout。"
+        )
+    lines.extend([marker, rerun_prompt_line(issue_url)])
+    if terminal_class in {SUPPORTED_ATTRIBUTION, CANDIDATE_HYPOTHESIS}:
+        lines.append(ADOPTION_PROMPT_LINE)
     content = "\n".join(lines)
+    _reject_public_internal_html(
+        content,
+        protected_foxglove_url=public_url,
+    )
     if len(content.encode("utf-8")) > MAX_FEISHU_COMMENT_BYTES:
         raise DeliveryContractError("delivery_thread_reply_too_large")
     return content
@@ -929,6 +1077,7 @@ def _terminal_content(
     error_code: str,
     submission_key: str,
     generation: int,
+    issue_url: str,
     thread: bool,
     diagnostic_result: str = "",
     requester_id: str = "",
@@ -945,8 +1094,9 @@ def _terminal_content(
     )
     if thread:
         lines.append(f"发起人：{build_at_mention(requester_id)}")
-    lines.extend([marker, RERUN_PROMPT_LINE])
+    lines.extend([marker, rerun_prompt_line(issue_url)])
     content = "\n".join(lines)
+    _reject_public_internal_html(content)
     if len(content.encode("utf-8")) > MAX_FEISHU_COMMENT_BYTES:
         raise DeliveryContractError("terminal_delivery_content_too_large")
     return content
@@ -1036,13 +1186,14 @@ def _validate_terminal_fallback_publication(
 
 
 def _terminal_fallback_content(
-    *, marker: str, conclusion: str, requester_id: str = ""
+    *, marker: str, conclusion: str, issue_url: str, requester_id: str = ""
 ) -> str:
     lines = [*conclusion.splitlines()]
     if requester_id:
         lines.append(f"发起人：{build_at_mention(requester_id)}")
-    lines.extend([marker, RERUN_PROMPT_LINE])
+    lines.extend([marker, rerun_prompt_line(issue_url)])
     content = "\n".join(lines)
+    _reject_public_internal_html(content)
     if len(content.encode("utf-8")) > MAX_FEISHU_COMMENT_BYTES:
         raise DeliveryContractError("terminal_delivery_content_too_large")
     return content
@@ -1094,6 +1245,9 @@ def build_terminal_delivery(
     target_key = (
         f"feishu_project:{values['project_key']}:{values['work_item_type_key']}:"
         f"{values['work_item_id']}"
+    )
+    issue_url = canonical_issue_url(
+        values["project_key"], values["work_item_id"]
     )
     outcome_key = _stable_key(
         "g1q3-rca-terminal-v1",
@@ -1256,6 +1410,7 @@ def build_terminal_delivery(
         comment_content = _terminal_fallback_content(
             marker=marker,
             conclusion=fallback_conclusion,
+            issue_url=issue_url,
         )
         _validate_terminal_fallback_publication(
             fallback_contract["public_contract"],
@@ -1286,6 +1441,7 @@ def build_terminal_delivery(
             error_code=normalized_error,
             submission_key=values["submission_key"],
             generation=generation,
+            issue_url=issue_url,
             thread=False,
             diagnostic_result=diagnostic_result,
         )
@@ -1375,6 +1531,9 @@ def build_terminal_thread_reply_effect(
         message_content = _terminal_fallback_content(
             marker=marker,
             conclusion=str(semantic.get("conclusion") or ""),
+            issue_url=canonical_issue_url(
+                semantic.get("project_key"), semantic.get("work_item_id")
+            ),
             requester_id=str(semantic.get("requester_id") or ""),
         )
     else:
@@ -1385,6 +1544,9 @@ def build_terminal_thread_reply_effect(
             error_code=str(semantic.get("error_code") or ""),
             submission_key=str(semantic.get("submission_key") or ""),
             generation=generation,
+            issue_url=canonical_issue_url(
+                semantic.get("project_key"), semantic.get("work_item_id")
+            ),
             thread=True,
             diagnostic_result=str(semantic.get("diagnostic_result") or ""),
             requester_id=str(semantic.get("requester_id") or ""),
@@ -2303,6 +2465,17 @@ def render_public_rca_result(
             else MEDIUM_TIER_DISCLAIMER
         ),
     ]
+    if (
+        terminal_class == HONEST_NON_ATTRIBUTION
+        and dispatch["reason"] in {"abstain_no_hit", "abstain_cross_domain"}
+    ):
+        handoff = _abstain_analysis_handoff_lines(contract)
+        if not handoff:
+            raise DeliveryContractError(
+                "consumer_capability_required_for_abstain"
+            )
+        lines.extend(["自动分析未形成可派单结论。", *handoff])
+        return "\n".join(_truncate_utf8(line, 1800) for line in lines)
     if dispatch["reason"] == "out_of_scope":
         pass
     elif dispatch["reason"] == "abstain_no_hit":
@@ -3229,10 +3402,7 @@ def verify_delivery_bundle(
         raise DeliveryContractError("delivery_project_simple_name_missing")
     if not _PROJECT_SIMPLE_NAME_RE.fullmatch(project_simple_name):
         raise DeliveryContractError("delivery_project_simple_name_invalid")
-    issue_url = (
-        f"https://project.feishu.cn/{project_simple_name}"
-        f"/issue/detail/{refs.work_item_id}"
-    )
+    issue_url = canonical_issue_url(project_simple_name, refs.work_item_id)
     delivery_id = _stable_key(
         "g1q3-rca-delivery-v1",
         {
@@ -3347,6 +3517,7 @@ def verify_delivery_bundle(
         report_url=rendered_foxglove_url,
         foxglove_url=rendered_foxglove_url,
         report_cifs_path=report_cifs_path,
+        issue_url=issue_url,
         terminal_class=publication_tier.terminal_class,
     )
     final_publication_tier = evaluate_structural_tier(

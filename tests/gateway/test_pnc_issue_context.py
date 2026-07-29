@@ -32,6 +32,14 @@ def _completed_meegle(command, **_kwargs):
             "7008267126",
         ],
         ["workitem", "meta-fields", "--project-key", "t03o4q"],
+        [
+            "workitem",
+            "list-op-records",
+            "--project-key",
+            "t03o4q",
+            "--work-item-id",
+            "7008267126",
+        ],
     ],
 )
 def test_default_meegle_runner_allows_only_known_read_commands_without_claim(
@@ -53,6 +61,115 @@ def test_default_meegle_runner_allows_only_known_read_commands_without_claim(
 
     assert pnc_issue_context.default_meegle_runner(args) == (0, "{}", "")
     assert calls[0][0] == ["/bin/meegle", *args]
+
+
+def test_adoption_operation_page_accepts_only_explicit_user_change():
+    rows, token = pnc_issue_context.normalize_g1q3_adoption_operation_page({
+        "has_more": True,
+        "start_from": "next-page",
+        "op_records": [
+            {
+                "operation_time": 1785021395703,
+                "operator": "7545326123157061660",
+                "operator_type": "user",
+                "record_contents": [
+                    {
+                        "object": {
+                            "object_type": "field",
+                            "object_value": "field_b23cb8",
+                        },
+                        "old": [],
+                        "new": ["rya79_oos"],
+                    }
+                ],
+            }
+        ],
+    })
+
+    assert token == "next-page"
+    assert rows == [
+        {
+            "field_key": "field_b23cb8",
+            "operation_time": 1785021395703,
+            "operator": "7545326123157061660",
+            "operator_type": "user",
+            "old": "",
+            "new": "rya79_oos",
+            "status": "adopted",
+        }
+    ]
+
+
+def test_adoption_operation_page_ignores_non_user_target_change():
+    rows, token = pnc_issue_context.normalize_g1q3_adoption_operation_page({
+        "has_more": False,
+        "op_records": [
+            {
+                "operation_time": 1785021395703,
+                "operator": "calculated_field",
+                "operator_type": "calc_field",
+                "record_contents": [
+                    {
+                        "object": {
+                            "object_type": "field",
+                            "object_value": "field_b23cb8",
+                        },
+                        "new": ["rya79_oos"],
+                    }
+                ],
+            }
+        ],
+    })
+
+    assert rows == []
+    assert token == ""
+
+
+def test_adoption_operation_window_rejects_more_than_seven_days():
+    with pytest.raises(
+        pnc_issue_context.G1Q3AdoptionReadError,
+        match="g1q3_adoption_window_too_wide",
+    ):
+        pnc_issue_context.validate_g1q3_adoption_window(
+            0,
+            pnc_issue_context.G1Q3_ADOPTION_MAX_WINDOW_MS + 1,
+        )
+
+
+def test_adoption_operation_page_requires_explicit_pagination_state():
+    with pytest.raises(
+        pnc_issue_context.G1Q3AdoptionReadError,
+        match="g1q3_adoption_pagination_invalid",
+    ):
+        pnc_issue_context.normalize_g1q3_adoption_operation_page({
+            "op_records": [],
+        })
+
+
+def test_adoption_operation_page_rejects_unknown_select_option():
+    with pytest.raises(
+        pnc_issue_context.G1Q3AdoptionReadError,
+        match="g1q3_adoption_option_invalid",
+    ):
+        pnc_issue_context.normalize_g1q3_adoption_operation_page({
+            "has_more": False,
+            "op_records": [
+                {
+                    "operation_time": 1785021395703,
+                    "operator": "7545326123157061660",
+                    "operator_type": "user",
+                    "record_contents": [
+                        {
+                            "object": {
+                                "object_type": "field",
+                                "object_value": "field_b23cb8",
+                            },
+                            "new": ["unknown-option"],
+                        }
+                    ],
+                }
+            ],
+        })
 
 
 def test_default_meegle_runner_write_without_bound_claim_stops_before_subprocess(

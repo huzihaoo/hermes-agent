@@ -3718,6 +3718,338 @@ def test_meegle_adapter_rejects_omitted_fields_without_exact_metadata():
     assert result["error_code"] == "feishu_field_metadata_invalid"
 
 
+def test_adoption_default_value_without_operation_is_unreviewed():
+    calls = []
+
+    def runner(args):
+        calls.append(args)
+        if args[:2] == ["workitem", "get"]:
+            return (
+                0,
+                json.dumps({
+                    "work_item_fields": [
+                        {
+                            "key": "field_b23cb8",
+                            "value": {"label": "采纳", "value": "rya79_oos"},
+                        }
+                    ]
+                }, ensure_ascii=False),
+                "",
+            )
+        if args[:2] == ["workitem", "list-op-records"]:
+            return 0, json.dumps({"has_more": False, "op_records": []}), ""
+        raise AssertionError(args)
+
+    result = MeegleIssueCommentAdapter(runner).read_adoption(
+        "t03o4q",
+        "7048004715",
+        start_ms=1784736000000,
+        end_ms=1785340799000,
+    )
+
+    assert result["success"] is True
+    assert result["status"] == "unreviewed"
+    assert result["reason"] == "current_value_has_no_user_operation_record"
+    assert result["ignored_default_value"] == "rya79_oos"
+    assert [call[:2] for call in calls] == [
+        ["workitem", "get"],
+        ["workitem", "list-op-records"],
+    ]
+
+
+def test_adoption_read_windows_long_span_and_follows_start_from():
+    calls = []
+    max_window = dispatcher_module.MAX_MEEGLE_OPERATION_WINDOW_MS
+
+    def runner(args):
+        calls.append(args)
+        if args[:2] == ["workitem", "get"]:
+            return (
+                0,
+                json.dumps({
+                    "work_item_fields": [
+                        {
+                            "key": "field_b23cb8",
+                            "value": {"label": "不采纳", "value": "0ivvg65i7"},
+                        }
+                    ]
+                }, ensure_ascii=False),
+                "",
+            )
+        if args[:2] != ["workitem", "list-op-records"]:
+            raise AssertionError(args)
+        start = int(args[args.index("--start") + 1])
+        if start == 0 and "--start-from" not in args:
+            return (
+                0,
+                json.dumps({
+                    "has_more": True,
+                    "start_from": "page-2",
+                    "op_records": [],
+                }),
+                "",
+            )
+        if start == 0:
+            assert args[args.index("--start-from") + 1] == "page-2"
+            return (
+                0,
+                json.dumps({
+                    "has_more": False,
+                    "op_records": [
+                        {
+                            "operation_time": 1000,
+                            "operator": "user-1",
+                            "operator_type": "user",
+                            "record_contents": [
+                                {
+                                    "object": {
+                                        "object_type": "field",
+                                        "object_value": "field_b23cb8",
+                                    },
+                                    "old": ["rya79_oos"],
+                                    "new": ["0ivvg65i7"],
+                                }
+                            ],
+                        }
+                    ],
+                }),
+                "",
+            )
+        assert start == max_window + 1
+        return 0, json.dumps({"has_more": False, "op_records": []}), ""
+
+    result = MeegleIssueCommentAdapter(runner).read_adoption(
+        "t03o4q",
+        "7048004715",
+        start_ms=0,
+        end_ms=max_window + 10,
+    )
+
+    assert result["success"] is True
+    assert result["status"] == "rejected"
+    assert result["explicit"] is True
+    assert result["operation"]["new"] == "0ivvg65i7"
+    assert result["windows_read"] == 2
+    operation_calls = [call for call in calls if call[:2] == ["workitem", "list-op-records"]]
+    assert len(operation_calls) == 3
+    for call in operation_calls:
+        start = int(call[call.index("--start") + 1])
+        end = int(call[call.index("--end") + 1])
+        assert end - start <= max_window
+
+
+def test_adoption_read_rejects_repeated_start_from():
+    def runner(args):
+        if args[:2] == ["workitem", "get"]:
+            return (
+                0,
+                json.dumps({
+                    "work_item_fields": [
+                        {"key": "field_b23cb8", "value": "rya79_oos"}
+                    ]
+                }),
+                "",
+            )
+        if args[:2] == ["workitem", "list-op-records"]:
+            return (
+                0,
+                json.dumps({
+                    "has_more": True,
+                    "start_from": "same-token",
+                    "op_records": [],
+                }),
+                "",
+            )
+        raise AssertionError(args)
+
+    result = MeegleIssueCommentAdapter(runner).read_adoption(
+        "t03o4q",
+        "7048004715",
+        start_ms=0,
+        end_ms=1000,
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == "g1q3_adoption_pagination_cycle"
+
+
+def test_closed_generation_uses_half_open_window_without_current_value_match():
+    calls = []
+
+    def runner(args):
+        calls.append(args)
+        if args[:2] == ["workitem", "get"]:
+            return (
+                0,
+                json.dumps({
+                    "work_item_fields": [
+                        {"key": "field_b23cb8", "value": "0ivvg65i7"}
+                    ]
+                }),
+                "",
+            )
+        if args[:2] == ["workitem", "list-op-records"]:
+            return (
+                0,
+                json.dumps({
+                    "has_more": False,
+                    "op_records": [
+                        {
+                            "operation_time": 1500,
+                            "operator": "user-1",
+                            "operator_type": "user",
+                            "record_contents": [
+                                {
+                                    "object": {
+                                        "object_type": "field",
+                                        "object_value": "field_b23cb8",
+                                    },
+                                    "old": [],
+                                    "new": ["rya79_oos"],
+                                }
+                            ],
+                        }
+                    ],
+                }),
+                "",
+            )
+        raise AssertionError(args)
+
+    result = MeegleIssueCommentAdapter(runner).read_generation_adoption(
+        "t03o4q",
+        "7048004715",
+        generation=2,
+        conclusion_time_ms=1000,
+        next_conclusion_time_ms=2000,
+    )
+
+    assert result["success"] is True
+    assert result["status"] == "adopted"
+    assert result["generation"] == 2
+    assert result["end_ms"] == 1999
+    operation_call = next(
+        call for call in calls if call[:2] == ["workitem", "list-op-records"]
+    )
+    assert operation_call[operation_call.index("--end") + 1] == "1999"
+
+
+def test_current_generation_requires_field_to_match_latest_operation():
+    def runner(args):
+        if args[:2] == ["workitem", "get"]:
+            return (
+                0,
+                json.dumps({
+                    "work_item_fields": [
+                        {"key": "field_b23cb8", "value": "0ivvg65i7"}
+                    ]
+                }),
+                "",
+            )
+        if args[:2] == ["workitem", "list-op-records"]:
+            return (
+                0,
+                json.dumps({
+                    "has_more": False,
+                    "op_records": [
+                        {
+                            "operation_time": 1500,
+                            "operator": "user-1",
+                            "operator_type": "user",
+                            "record_contents": [
+                                {
+                                    "object": {
+                                        "object_type": "field",
+                                        "object_value": "field_b23cb8",
+                                    },
+                                    "new": ["rya79_oos"],
+                                }
+                            ],
+                        }
+                    ],
+                }),
+                "",
+            )
+        raise AssertionError(args)
+
+    result = MeegleIssueCommentAdapter(runner).read_generation_adoption(
+        "t03o4q",
+        "7048004715",
+        generation=3,
+        conclusion_time_ms=1000,
+        observed_at_ms=2000,
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == "g1q3_adoption_current_operation_mismatch"
+
+
+def test_adoption_read_rejects_operation_outside_requested_window():
+    def runner(args):
+        if args[:2] == ["workitem", "get"]:
+            return (
+                0,
+                json.dumps({
+                    "work_item_fields": [
+                        {"key": "field_b23cb8", "value": "rya79_oos"}
+                    ]
+                }),
+                "",
+            )
+        if args[:2] == ["workitem", "list-op-records"]:
+            return (
+                0,
+                json.dumps({
+                    "has_more": False,
+                    "op_records": [
+                        {
+                            "operation_time": 999,
+                            "operator": "user-1",
+                            "operator_type": "user",
+                            "record_contents": [
+                                {
+                                    "object": {
+                                        "object_type": "field",
+                                        "object_value": "field_b23cb8",
+                                    },
+                                    "new": ["rya79_oos"],
+                                }
+                            ],
+                        }
+                    ],
+                }),
+                "",
+            )
+        raise AssertionError(args)
+
+    result = MeegleIssueCommentAdapter(runner).read_adoption(
+        "t03o4q",
+        "7048004715",
+        start_ms=1000,
+        end_ms=2000,
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == "g1q3_adoption_operation_out_of_window"
+
+
+@pytest.mark.parametrize("next_time,observed_time", [(2000, None), (None, 2000)])
+def test_generation_adoption_rejects_invalid_conclusion_time(
+    next_time,
+    observed_time,
+):
+    result = MeegleIssueCommentAdapter(lambda _args: pytest.fail("must not read")).read_generation_adoption(
+        "t03o4q",
+        "7048004715",
+        generation=1,
+        conclusion_time_ms="1000",
+        next_conclusion_time_ms=next_time,
+        observed_at_ms=observed_time,
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == "g1q3_adoption_conclusion_time_invalid"
+
+
 def test_default_report_verifier_performs_bounded_head_then_get(monkeypatch):
     monkeypatch.setenv(
         "PNC_FOXGLOVE_RENDER_HOST",

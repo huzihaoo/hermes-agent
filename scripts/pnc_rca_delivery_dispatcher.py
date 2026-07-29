@@ -104,6 +104,15 @@ from gateway.pnc_rca_runtime_identity import (
     build_runtime_identity,
     runtime_identity_is_valid,
 )
+from gateway.pnc_issue_context import (
+    G1Q3_ADOPTION_FIELD_KEY,
+    G1Q3_ADOPTION_MAX_OPERATION_PAGES,
+    G1Q3_ADOPTION_MAX_WINDOW_MS,
+    G1Q3_ADOPTION_VALUE_KEYS,
+    G1Q3AdoptionReadError,
+    normalize_g1q3_adoption_operation_page,
+    validate_g1q3_adoption_window,
+)
 from hermes_constants import get_hermes_home
 from scripts.pnc_foxglove_delivery import (
     G1Q3_RCA_FORMAL_VIZ_ROOT,
@@ -120,6 +129,9 @@ MAX_EFFECT_AGE_SECONDS = 86_400
 MEEGLE_COMMENT_PAGE_TIMEOUT_SECONDS = 12
 MAX_MEEGLE_COMMENT_PAGES = 5
 MAX_MEEGLE_COMMENTS = 500
+MAX_MEEGLE_OPERATION_PAGES = G1Q3_ADOPTION_MAX_OPERATION_PAGES
+MAX_MEEGLE_OPERATION_WINDOW_MS = G1Q3_ADOPTION_MAX_WINDOW_MS
+MAX_MEEGLE_OPERATION_WINDOWS = 64
 MAX_EXTERNAL_BOUNDARY_TIMEOUT_SECONDS = MEEGLE_COMMENT_PAGE_TIMEOUT_SECONDS * (
     MAX_MEEGLE_COMMENT_PAGES + 1
 )
@@ -1274,7 +1286,18 @@ class MeegleIssueCommentAdapter:
     _RCA_FIELD_METADATA = {
         RCA_RESULT_FIELD_KEY: ("归因结果", "text"),
         RCA_REPORT_FIELD_KEY: ("归因报告", "link"),
+        G1Q3_ADOPTION_FIELD_KEY: ("是否采纳", "select"),
     }
+    _READ_FIELD_KEY_SETS = frozenset({
+        (RCA_RESULT_FIELD_KEY,),
+        (RCA_RESULT_FIELD_KEY, RCA_REPORT_FIELD_KEY),
+        (G1Q3_ADOPTION_FIELD_KEY,),
+        (
+            RCA_RESULT_FIELD_KEY,
+            RCA_REPORT_FIELD_KEY,
+            G1Q3_ADOPTION_FIELD_KEY,
+        ),
+    })
 
     def __init__(
         self, runner: Callable[[list[str]], tuple[int, str, str]] | None = None
@@ -1373,10 +1396,7 @@ class MeegleIssueCommentAdapter:
         work_item_id: str,
         field_keys: tuple[str, ...],
     ) -> Mapping[str, Any]:
-        if field_keys not in {
-            (RCA_RESULT_FIELD_KEY,),
-            (RCA_RESULT_FIELD_KEY, RCA_REPORT_FIELD_KEY),
-        }:
+        if field_keys not in self._READ_FIELD_KEY_SETS:
             return {
                 "success": False,
                 "permanent": True,
@@ -1500,6 +1520,331 @@ class MeegleIssueCommentAdapter:
                 }
             normalized.update({key: "" for key in missing_keys})
         return {"success": True, "fields": normalized}
+
+    def _list_adoption_operation_window(
+        self,
+        project_key: str,
+        work_item_id: str,
+        *,
+        start_ms: int,
+        end_ms: int,
+    ) -> Mapping[str, Any]:
+        try:
+            start_ms, end_ms = validate_g1q3_adoption_window(start_ms, end_ms)
+        except G1Q3AdoptionReadError as exc:
+            return {
+                "success": False,
+                "permanent": True,
+                "error_code": exc.code,
+                "error": exc.detail,
+            }
+        operations: list[dict[str, Any]] = []
+        seen_tokens: set[str] = set()
+        start_from = ""
+        for page_num in range(1, MAX_MEEGLE_OPERATION_PAGES + 1):
+            args = [
+                "workitem",
+                "list-op-records",
+                "--project-key",
+                str(project_key),
+                "--work-item-id",
+                str(work_item_id),
+                "--op-record-module",
+                "field_mod",
+                "--operation-type",
+                "modify",
+                "--start",
+                str(start_ms),
+                "--end",
+                str(end_ms),
+            ]
+            if start_from:
+                args.extend(["--start-from", start_from])
+            args.extend(["--format", "json"])
+            rc, out, err = self.runner(args)
+            if rc != 0:
+                return _error_payload(rc, out, err)
+            try:
+                page, next_token = normalize_g1q3_adoption_operation_page(
+                    _json_stdout(out)
+                )
+            except G1Q3AdoptionReadError as exc:
+                return {
+                    "success": False,
+                    "permanent": True,
+                    "error_code": exc.code,
+                    "error": exc.detail,
+                }
+            if any(
+                int(operation["operation_time"]) < start_ms
+                or int(operation["operation_time"]) > end_ms
+                for operation in page
+            ):
+                return {
+                    "success": False,
+                    "permanent": True,
+                    "error_code": "g1q3_adoption_operation_out_of_window",
+                    "error": "list-op-records returned an operation outside its query window",
+                }
+            operations.extend(page)
+            if not next_token:
+                return {
+                    "success": True,
+                    "operations": operations,
+                    "pages_read": page_num,
+                    "start_ms": start_ms,
+                    "end_ms": end_ms,
+                }
+            if next_token in seen_tokens:
+                return {
+                    "success": False,
+                    "permanent": True,
+                    "error_code": "g1q3_adoption_pagination_cycle",
+                    "error": "list-op-records repeated start_from",
+                }
+            seen_tokens.add(next_token)
+            start_from = next_token
+        return {
+            "success": False,
+            "permanent": True,
+            "error_code": "g1q3_adoption_operation_page_limit",
+            "error": "adoption operation history exceeds 20 pages in one window",
+        }
+
+    def read_adoption(
+        self,
+        project_key: str,
+        work_item_id: str,
+        *,
+        start_ms: int,
+        end_ms: int,
+        require_current_match: bool = True,
+    ) -> Mapping[str, Any]:
+        """Read one generation's explicit adoption state without writing it."""
+
+        if (
+            isinstance(start_ms, bool)
+            or isinstance(end_ms, bool)
+            or not isinstance(start_ms, int)
+            or not isinstance(end_ms, int)
+            or start_ms < 0
+            or end_ms < start_ms
+        ):
+            return {
+                "success": False,
+                "permanent": True,
+                "error_code": "g1q3_adoption_window_invalid",
+            }
+        fields = self.get_fields(
+            project_key,
+            work_item_id,
+            (G1Q3_ADOPTION_FIELD_KEY,),
+        )
+        if fields.get("success") is not True:
+            return fields
+        current_value = str(
+            (fields.get("fields") or {}).get(G1Q3_ADOPTION_FIELD_KEY) or ""
+        ).strip()
+        if (
+            require_current_match
+            and current_value
+            and current_value not in G1Q3_ADOPTION_VALUE_KEYS
+        ):
+            return {
+                "success": False,
+                "permanent": True,
+                "error_code": "g1q3_adoption_value_invalid",
+            }
+
+        operations: list[dict[str, Any]] = []
+        windows_read = 0
+        cursor = start_ms
+        while cursor <= end_ms:
+            windows_read += 1
+            if windows_read > MAX_MEEGLE_OPERATION_WINDOWS:
+                return {
+                    "success": False,
+                    "permanent": True,
+                    "error_code": "g1q3_adoption_window_limit",
+                    "error": "adoption history exceeds 64 bounded windows",
+                }
+            window_end = min(end_ms, cursor + MAX_MEEGLE_OPERATION_WINDOW_MS)
+            window = self._list_adoption_operation_window(
+                project_key,
+                work_item_id,
+                start_ms=cursor,
+                end_ms=window_end,
+            )
+            if window.get("success") is not True:
+                return window
+            operations.extend(dict(item) for item in window["operations"])
+            cursor = window_end + 1
+
+        identities: set[tuple[Any, ...]] = set()
+        timestamps: set[int] = set()
+        for operation in operations:
+            identity = (
+                operation.get("operation_time"),
+                operation.get("operator"),
+                operation.get("old"),
+                operation.get("new"),
+            )
+            if identity in identities:
+                return {
+                    "success": False,
+                    "permanent": True,
+                    "error_code": "g1q3_adoption_operation_duplicate",
+                }
+            identities.add(identity)
+            timestamp = int(operation["operation_time"])
+            if timestamp in timestamps:
+                return {
+                    "success": False,
+                    "permanent": True,
+                    "error_code": "g1q3_adoption_operation_order_ambiguous",
+                }
+            timestamps.add(timestamp)
+        operations.sort(
+            key=lambda item: (
+                int(item["operation_time"]),
+                str(item["operator"]),
+                str(item["new"]),
+            )
+        )
+
+        result: dict[str, Any] = {
+            "success": True,
+            "source": "official_meegle_api",
+            "scope": {
+                "project_key": str(project_key),
+                "work_item_id": str(work_item_id),
+            },
+            "field_key": G1Q3_ADOPTION_FIELD_KEY,
+            "current_value": current_value,
+            "operations": operations,
+            "windows_read": windows_read,
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+        }
+        if not operations:
+            result.update({
+                "status": "unreviewed",
+                "reason": (
+                    "generation_has_no_user_operation_record"
+                    if not require_current_match
+                    else "current_field_empty"
+                    if not current_value
+                    else "current_value_has_no_user_operation_record"
+                ),
+            })
+            if require_current_match and current_value:
+                result["ignored_default_value"] = current_value
+            return result
+        latest = operations[-1]
+        if require_current_match and latest["new"] != current_value:
+            return {
+                **result,
+                "success": False,
+                "permanent": True,
+                "error_code": "g1q3_adoption_current_operation_mismatch",
+            }
+        if latest["status"] == "unreviewed":
+            result.update({
+                "status": "unreviewed",
+                "reason": "latest_user_operation_cleared_field",
+                "operation": latest,
+                "explicit": False,
+            })
+            return result
+        result.update({
+            "status": latest["status"],
+            "operation": latest,
+            "explicit": True,
+        })
+        return result
+
+    def read_generation_adoption(
+        self,
+        project_key: str,
+        work_item_id: str,
+        *,
+        generation: int,
+        conclusion_time_ms: int,
+        next_conclusion_time_ms: int | None = None,
+        observed_at_ms: int | None = None,
+    ) -> Mapping[str, Any]:
+        """Bind the latest explicit response to one conclusion generation.
+
+        Closed generations use ``[conclusion, next_conclusion)``.  The current
+        generation uses ``[conclusion, observed_at]`` and additionally checks
+        that the field's current value matches the latest operation.
+        """
+
+        if (
+            isinstance(conclusion_time_ms, bool)
+            or not isinstance(conclusion_time_ms, int)
+            or conclusion_time_ms < 0
+        ):
+            return {
+                "success": False,
+                "permanent": True,
+                "error_code": "g1q3_adoption_conclusion_time_invalid",
+            }
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+        ):
+            return {
+                "success": False,
+                "permanent": True,
+                "error_code": "g1q3_adoption_generation_invalid",
+            }
+        if next_conclusion_time_ms is not None:
+            if (
+                isinstance(next_conclusion_time_ms, bool)
+                or not isinstance(next_conclusion_time_ms, int)
+                or next_conclusion_time_ms <= conclusion_time_ms
+            ):
+                return {
+                    "success": False,
+                    "permanent": True,
+                    "error_code": "g1q3_adoption_generation_window_invalid",
+                }
+            end_ms = next_conclusion_time_ms - 1
+            require_current_match = False
+        else:
+            if (
+                isinstance(observed_at_ms, bool)
+                or not isinstance(observed_at_ms, int)
+                or observed_at_ms < conclusion_time_ms
+            ):
+                return {
+                    "success": False,
+                    "permanent": True,
+                    "error_code": "g1q3_adoption_observation_time_invalid",
+                }
+            end_ms = observed_at_ms
+            require_current_match = True
+
+        result = dict(self.read_adoption(
+            project_key,
+            work_item_id,
+            start_ms=conclusion_time_ms,
+            end_ms=end_ms,
+            require_current_match=require_current_match,
+        ))
+        result.update({
+            "generation": generation,
+            "conclusion_time_ms": conclusion_time_ms,
+            "next_conclusion_time_ms": next_conclusion_time_ms,
+            "window_semantics": (
+                "half_open_conclusion_to_next_conclusion"
+                if next_conclusion_time_ms is not None
+                else "closed_conclusion_to_observed_at"
+            ),
+        })
+        return result
 
     def get_fields_and_comments(
         self,
@@ -2228,6 +2573,7 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
             report_url=claim.report_url,
             foxglove_url=str(payload.get("foxglove_url") or ""),
             report_cifs_path=expected_report_cifs_path,
+            issue_url=expected_issue_url,
             terminal_class=str(payload.get("terminal_class") or ""),
         )
     else:

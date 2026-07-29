@@ -5,12 +5,15 @@ Pure rendering only: no network, no filesystem, no state mutation.
 from __future__ import annotations
 
 import hashlib
+from html import unescape as html_unescape
 import json
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Mapping
+from urllib.parse import unquote
 
 from scripts.pnc_status_projection import no_deliverable_forbidden_hits, sanitize_milestones
+from scripts.pnc_foxglove_delivery import validate_foxglove_url
 
 TASK_STATUS_TEMPLATES = {
     "host-created": "我这边先把任务建好了，还在确认有没有真正送到 VM。",
@@ -65,6 +68,10 @@ HTML_SOURCE_FRAGMENTS = (
     ".header h1",
     "justify-content:",
     "background:",
+)
+
+INTERNAL_HTML_HIDDEN_TEXT = (
+    "内部 HTML 审计产物已隐藏；公开交付仅使用已验证的 Foxglove 链接。"
 )
 
 STATUS_DISPLAY = {
@@ -142,14 +149,133 @@ def _same_artifact_location(left: str, right: str) -> bool:
 def _display_artifact_label(label: Any, artifact_path: str) -> str:
     text = _safe_card_text(label, "报告目录")
     path = str(artifact_path or "").strip()
-    if "HTML" in text.upper() or path.lower().endswith((".html", ".htm")):
+    if "HTML" in text.upper() or _looks_like_html_artifact(path):
         return "报告目录"
     return text
 
 
+def has_rca_delivery_provenance(task_card: Mapping[str, Any] | None) -> bool:
+    card = task_card if isinstance(task_card, Mapping) else {}
+    delivery = card.get("delivery") if isinstance(card.get("delivery"), Mapping) else {}
+    contract = (
+        card.get("delivery_contract")
+        if isinstance(card.get("delivery_contract"), Mapping)
+        else delivery.get("delivery_contract")
+        if isinstance(delivery.get("delivery_contract"), Mapping)
+        else {}
+    )
+    identity_text = "\n".join(
+        str(value or "")
+        for value in (
+            card.get("task_id"),
+            card.get("business_line"),
+            delivery.get("business_line"),
+            delivery.get("artifact_path"),
+            delivery.get("artifact_root"),
+            delivery.get("artifact_vm"),
+            delivery.get("artifact_cifs"),
+            delivery.get("viz_mcap_vm"),
+            delivery.get("conclusion"),
+            card.get("status_line"),
+        )
+    ).lower()
+    return bool(
+        delivery.get("rca_status")
+        or delivery.get("foxglove_url")
+        or contract.get("schema_version") == "g1q3_delivery_contract_v1"
+        or str(card.get("business_line") or "").strip().lower()
+        in {"g1q3_rca", "g1q3-rca"}
+        or str(delivery.get("business_line") or "").strip().lower()
+        in {"g1q3_rca", "g1q3-rca"}
+        or "g1q3_rca" in identity_text
+        or "g1q3-rca" in identity_text
+        or "rca 报告已生成" in identity_text
+    )
+
+
+def contains_internal_rca_html_reference(
+    value: Any,
+    *,
+    protected_foxglove_url: str = "",
+) -> bool:
+    candidate = str(value or "")
+    if protected_foxglove_url:
+        candidate = candidate.replace(
+            protected_foxglove_url, "__VALIDATED_FOXGLOVE_URL__"
+        )
+    converged = False
+    for _ in range(64):
+        decoded = html_unescape(unquote(candidate))
+        if decoded == candidate:
+            converged = True
+            break
+        candidate = decoded
+    if not converged:
+        return True
+    lowered = candidate.lower()
+    return bool(re.search(r"\.(?:xhtml|html?)", lowered) or ":18081" in lowered)
+
+
+def _sanitize_rca_visible_text(value: str, *, protected_foxglove_url: str) -> str:
+    text = str(value or "")
+    if not contains_internal_rca_html_reference(
+        text,
+        protected_foxglove_url=protected_foxglove_url,
+    ):
+        return text
+    safe_lines: list[str] = []
+    for line in text.splitlines():
+        chunks = re.split(r"(\s+)", line)
+        sanitized = "".join(
+            INTERNAL_HTML_HIDDEN_TEXT
+            if contains_internal_rca_html_reference(
+                chunk,
+                protected_foxglove_url=protected_foxglove_url,
+            )
+            else chunk
+            for chunk in chunks
+        )
+        if contains_internal_rca_html_reference(
+            sanitized,
+            protected_foxglove_url=protected_foxglove_url,
+        ):
+            sanitized = INTERNAL_HTML_HIDDEN_TEXT
+        safe_lines.append(sanitized)
+    return "\n".join(safe_lines)
+
+
+def _sanitize_rca_visible_card(
+    value: Any,
+    *,
+    protected_foxglove_url: str,
+) -> Any:
+    if isinstance(value, list):
+        return [
+            _sanitize_rca_visible_card(
+                item,
+                protected_foxglove_url=protected_foxglove_url,
+            )
+            for item in value
+        ]
+    if not isinstance(value, dict):
+        return value
+    result: dict[str, Any] = {}
+    for key, item in value.items():
+        if key in {"content", "href", "url"} and isinstance(item, str):
+            result[key] = _sanitize_rca_visible_text(
+                item,
+                protected_foxglove_url=protected_foxglove_url,
+            )
+        else:
+            result[key] = _sanitize_rca_visible_card(
+                item,
+                protected_foxglove_url=protected_foxglove_url,
+            )
+    return result
+
+
 def _looks_like_html_artifact(value: Any) -> bool:
-    text = str(value or "").strip().split("?", 1)[0].split("#", 1)[0].lower()
-    return text.endswith((".html", ".htm")) or "/index.html" in text
+    return contains_internal_rca_html_reference(value)
 
 
 def _internal_html_only_text(value: Any) -> str:
@@ -389,16 +515,16 @@ def render_task_card(task_card: dict[str, Any]) -> dict[str, Any]:
     attribution_causal_text = _clean_candidate_cause(delivery.get("attribution_causal_text"))
     responsibility_candidate = _safe_card_text(delivery.get("responsibility_candidate"))
     artifact_path = _safe_card_text(delivery.get("artifact_path"))
-    foxglove_url = _safe_card_text(delivery.get("foxglove_url"))
+    raw_foxglove_url = _safe_card_text(delivery.get("foxglove_url"))
+    viz_mcap_vm = _safe_card_text(delivery.get("viz_mcap_vm"))
+    foxglove_url = (
+        raw_foxglove_url
+        if validate_foxglove_url(raw_foxglove_url, viz_mcap_vm)
+        else ""
+    )
     if foxglove_url.startswith(("http://", "https://")):
         artifact_path = foxglove_url
-    is_rca_delivery = bool(
-        _text(delivery.get("report_status"))
-        or delivery.get("rca_status")
-        or foxglove_url
-        or _looks_like_html_artifact(artifact_path)
-        or "RCA 报告已生成" in conclusion
-    )
+    is_rca_delivery = has_rca_delivery_provenance(task_card)
     # A stale/internal index.html must never become a public card link. Keep
     # directory metadata available for internal pickup, but remove the HTML
     # pointer itself when no published Foxglove URL exists.
@@ -552,5 +678,10 @@ def render_task_card(task_card: dict[str, Any]) -> dict[str, Any]:
         },
         "elements": elements,
     }
+    if is_rca_delivery:
+        card = _sanitize_rca_visible_card(
+            card,
+            protected_foxglove_url=foxglove_url,
+        )
     assert_no_forbidden_fragments(card, has_deliverable_report=has_deliverable_report)
     return card

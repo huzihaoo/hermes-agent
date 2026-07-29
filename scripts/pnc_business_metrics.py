@@ -70,6 +70,17 @@ SUPPORTED_DELIVERY_STORE_SCHEMA_VERSIONS = frozenset({
     "pnc_rca_delivery_store_v9",
 })
 ADJUDICATION_SCHEMA_VERSION = "pnc_rca_conclusion_adjudication_v1"
+G1Q3_ADOPTION_FIELD_KEY = "field_b23cb8"
+G1Q3_ADOPTION_OPTION_STATUSES = {
+    "rya79_oos": "adopted",
+    "0ivvg65i7": "rejected",
+}
+G1Q3_ADOPTION_STATUSES = frozenset({
+    "adopted",
+    "rejected",
+    "unreviewed",
+    "read_error",
+})
 GOLDEN_INPUT_SCHEMA_VERSION = "pnc_rca_w12_golden_observations_v1"
 ORACLE_SCHEMA_VERSION = "pnc_rca_structural_tier_oracle_v2"
 MAX_SQLITE_JOBS = 100_000
@@ -418,6 +429,160 @@ def normalize_decision(value: Any) -> str:
     }.get(raw, raw)
 
 
+def normalize_adoption_signal(
+    value: Mapping[str, Any],
+    *,
+    index: int,
+    expected_work_item_id: str,
+    expected_generation: int | None,
+) -> dict[str, Any]:
+    empty_binding = {
+        "adoption_source": "",
+        "adoption_work_item_id": "",
+        "adoption_generation": None,
+        "adoption_window_start_ms": None,
+        "adoption_window_end_ms": None,
+        "adoption_window_semantics": "",
+    }
+    if not value:
+        return {
+            "adoption_status": "unreviewed",
+            "adoption_explicit": False,
+            "adoption_field_key": G1Q3_ADOPTION_FIELD_KEY,
+            "adoption_option_key": "",
+            "adoption_operation_time_ms": None,
+            "adoption_operator": "",
+            "adoption_operator_type": "",
+            "adoption_error_code": "",
+            **empty_binding,
+        }
+    scope = _mapping(value.get("scope"))
+    source = _optional_text(value.get("source"))
+    field_key = _optional_text(value.get("field_key"))
+    work_item_id = _optional_text(
+        value.get("work_item_id") or scope.get("work_item_id")
+    )
+    generation = _optional_nonnegative_int(
+        value.get("generation"),
+        "signals.adoption.generation",
+        index=index,
+    )
+    start_ms = _optional_nonnegative_int(
+        _pick(value, "start_ms", "conclusion_time_ms"),
+        "signals.adoption.start_ms",
+        index=index,
+    )
+    end_ms = _optional_nonnegative_int(
+        value.get("end_ms"),
+        "signals.adoption.end_ms",
+        index=index,
+    )
+    window_semantics = _optional_text(value.get("window_semantics"))
+    if (
+        source != "official_meegle_api"
+        or field_key != G1Q3_ADOPTION_FIELD_KEY
+        or not work_item_id
+        or generation is None
+        or generation < 1
+        or not expected_work_item_id
+        or expected_generation is None
+        or work_item_id != expected_work_item_id
+        or generation != expected_generation
+        or start_ms is None
+        or end_ms is None
+        or end_ms < start_ms
+        or window_semantics
+        not in {
+            "half_open_conclusion_to_next_conclusion",
+            "closed_conclusion_to_observed_at",
+        }
+    ):
+        raise MetricsValidationError(
+            "metrics_adoption_binding_invalid",
+            "adoption signal must bind the official issue, generation, and conclusion window",
+            index=index,
+        )
+    binding = {
+        "adoption_source": source,
+        "adoption_work_item_id": work_item_id,
+        "adoption_generation": generation,
+        "adoption_window_start_ms": start_ms,
+        "adoption_window_end_ms": end_ms,
+        "adoption_window_semantics": window_semantics,
+    }
+    status = normalize_status(value.get("status"))
+    if status not in G1Q3_ADOPTION_STATUSES:
+        raise MetricsValidationError(
+            "metrics_adoption_status_invalid",
+            f"unsupported adoption status {status!r}",
+            index=index,
+        )
+    if status == "read_error":
+        error_code = _required_text(
+            value.get("error_code"), "signals.adoption.error_code", index=index
+        )
+        return {
+            "adoption_status": status,
+            "adoption_explicit": False,
+            "adoption_field_key": G1Q3_ADOPTION_FIELD_KEY,
+            "adoption_option_key": "",
+            "adoption_operation_time_ms": None,
+            "adoption_operator": "",
+            "adoption_operator_type": "",
+            "adoption_error_code": error_code,
+            **binding,
+        }
+    if status == "unreviewed":
+        return {
+            "adoption_status": status,
+            "adoption_explicit": False,
+            "adoption_field_key": G1Q3_ADOPTION_FIELD_KEY,
+            "adoption_option_key": "",
+            "adoption_operation_time_ms": None,
+            "adoption_operator": "",
+            "adoption_operator_type": "",
+            "adoption_error_code": "",
+            **binding,
+        }
+
+    operation = _mapping(value.get("operation")) or value
+    operation_field_key = _optional_text(operation.get("field_key"))
+    option_key = _optional_text(operation.get("new"))
+    operator = _optional_text(operation.get("operator"))
+    operator_type = _optional_text(operation.get("operator_type"))
+    operation_time = _optional_nonnegative_int(
+        operation.get("operation_time"),
+        "signals.adoption.operation_time",
+        index=index,
+    )
+    if (
+        value.get("explicit") is not True
+        or operation_field_key != G1Q3_ADOPTION_FIELD_KEY
+        or G1Q3_ADOPTION_OPTION_STATUSES.get(option_key) != status
+        or operator_type != "user"
+        or not operator
+        or operation_time is None
+        or operation_time < start_ms
+        or operation_time > end_ms
+    ):
+        raise MetricsValidationError(
+            "metrics_adoption_proof_invalid",
+            "adopted/rejected requires an exact user list-op-record proof",
+            index=index,
+        )
+    return {
+        "adoption_status": status,
+        "adoption_explicit": True,
+        "adoption_field_key": operation_field_key,
+        "adoption_option_key": option_key,
+        "adoption_operation_time_ms": operation_time,
+        "adoption_operator": operator,
+        "adoption_operator_type": operator_type,
+        "adoption_error_code": "",
+        **binding,
+    }
+
+
 def _sources(raw: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
     return (
         raw,
@@ -456,6 +621,24 @@ def normalize_record(raw: Mapping[str, Any], *, index: int = 0) -> dict[str, Any
         record_id_value or f"offline-{index}", "record_id", index=index
     )
     pair_id = _required_text(pair_id_value or record_id, "pair_id", index=index)
+    delivery_provenance = _mapping(_pick(raw, "delivery_provenance"))
+    business_key = _optional_text(
+        _pick(raw, "business_key") or _pick(delivery_provenance, "business_key")
+    )
+    work_item_id = _optional_text(
+        _pick(raw, "work_item_id") or _pick(delivery_provenance, "work_item_id")
+    )
+    generation = _optional_nonnegative_int(
+        _pick(raw, "generation", "delivery_provenance.generation"),
+        "generation",
+        index=index,
+    )
+    if generation == 0:
+        raise MetricsValidationError(
+            "metrics_generation_invalid",
+            "generation must be a positive integer",
+            index=index,
+        )
 
     release_value = _pick_sources(
         sources,
@@ -525,6 +708,9 @@ def normalize_record(raw: Mapping[str, Any], *, index: int = 0) -> dict[str, Any
     triage = _mapping(_pick(signals, "triage")) or _mapping(_pick(raw, "triage"))
     rca_signal = _mapping(_pick(signals, "rca", "attribution")) or attribution
     gate = _mapping(_pick(signals, "gate")) or _mapping(_pick(raw, "gate"))
+    adoption = _mapping(_pick(signals, "adoption")) or _mapping(
+        _pick(raw, "adoption")
+    )
 
     delivery_status = normalize_status(
         _pick(technical, "delivery_status", "delivery", "delivery_outcome")
@@ -564,6 +750,12 @@ def normalize_record(raw: Mapping[str, Any], *, index: int = 0) -> dict[str, Any
             "owner_decision",
             "expected_decision",
         )
+    )
+    adoption_signal = normalize_adoption_signal(
+        adoption,
+        index=index,
+        expected_work_item_id=work_item_id,
+        expected_generation=generation,
     )
 
     golden_evaluated = _optional_bool(
@@ -606,6 +798,9 @@ def normalize_record(raw: Mapping[str, Any], *, index: int = 0) -> dict[str, Any
         "schema_version": SCHEMA_VERSION,
         "record_id": record_id,
         "pair_id": pair_id,
+        "business_key": business_key,
+        "work_item_id": work_item_id,
+        "generation": generation,
         "release": release,
         "business": business,
         "entry": entry,
@@ -621,6 +816,7 @@ def normalize_record(raw: Mapping[str, Any], *, index: int = 0) -> dict[str, Any
         "triage_correct": triage_correct,
         "gate_decision": gate_decision,
         "gate_review_decision": gate_review_decision,
+        **adoption_signal,
         "golden_evaluated": golden_evaluated,
         "false_high_confidence": false_high_confidence,
         "golden_regression": golden_regression,
@@ -1841,6 +2037,9 @@ def load_sqlite_observations(
                     "schema_version": SCHEMA_VERSION,
                     "record_id": f"w12:{source_identity}",
                     "pair_id": str(job["delivery_id"]),
+                    "business_key": str(job["business_key"]),
+                    "generation": int(job["generation"]),
+                    "work_item_id": str(job["work_item_id"]),
                     "release": release,
                     "release_id": release,
                     "pipeline_commit": pipeline,
@@ -1896,6 +2095,8 @@ def load_sqlite_observations(
                     "delivery_provenance": {
                         "business_key": str(job["business_key"]),
                         "generation": int(job["generation"]),
+                        "project_key": str(job["project_key"]),
+                        "work_item_id": str(job["work_item_id"]),
                         "submission_key": str(job["submission_key"]),
                         "delivery_id": str(job["delivery_id"]),
                         "effect_keys": list(effect["effect_keys"]),

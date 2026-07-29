@@ -11,6 +11,7 @@ import pytest
 from gateway.record_only import runtime
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from scripts import pnc_completion_notice_relay
+from scripts.pnc_foxglove_delivery import canonical_viz_mcap_path, foxglove_url
 
 
 def _write_sidecar(tmp_path, task_id="task-1", *, send_status="pending"):
@@ -1316,6 +1317,162 @@ def test_m2_3_card_failure_without_completion_text_degrades_to_topic_text(tmp_pa
     assert "[PNC task card fallback]" in text_calls[0]["message"]
     assert "task_id: task-1" in text_calls[0]["message"]
     assert "VM 已接手" in text_calls[0]["message"]
+
+
+def test_rca_card_failure_fallback_never_exposes_internal_html(tmp_path):
+    token = set_hermes_home_override(tmp_path)
+    try:
+        sidecar = _write_sidecar(tmp_path)
+        body = json.loads(sidecar.read_text(encoding="utf-8"))
+        body["completion_notice"]["text"] = ""
+        body["task_card"] = {
+            "schema_version": 1,
+            "chat_id": pnc_completion_notice_relay.DEFAULT_CHAT_IDS[1],
+            "thread_id": "topic:om_1",
+            "user_state": "completed",
+            "status_line": "RCA 报告已生成",
+            "milestones": [],
+            "pending_confirms": [],
+            "delivery": {
+                "report_status": "report_ready",
+                "conclusion": "自动分析已完成",
+                "artifact_path": (
+                    "http://192.168.26.174:18081/G1Q3_RCA/cases/demo/index.html"
+                ),
+            },
+        }
+        sidecar.write_text(json.dumps(body), encoding="utf-8")
+        text_calls = []
+
+        result = pnc_completion_notice_relay.relay_pending_notices(
+            task_ids=["task-1"],
+            send=True,
+            send_func=lambda args: text_calls.append(args)
+            or json.dumps({"success": True, "message_id": "om_fallback"}),
+            send_card_func=lambda target, rendered, message_id: {
+                "success": False,
+                "error": "patch failed",
+            },
+            max_card_fallbacks_per_loop=1,
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert result["ok"] is True
+    message = text_calls[0]["message"]
+    assert "18081" not in message
+    assert "index.html" not in message
+    assert "内部 HTML 审计产物已隐藏" in message
+
+
+def test_rca_completion_text_is_sanitized_after_card_failure(tmp_path):
+    token = set_hermes_home_override(tmp_path)
+    try:
+        sidecar = _write_sidecar(tmp_path)
+        body = json.loads(sidecar.read_text(encoding="utf-8"))
+        body["completion_notice"]["text"] = (
+            "artifact: http://192.168.26.174:18081/G1Q3_RCA/cases/demo/index.html\n"
+            "结论：自动分析已完成"
+        )
+        body["task_card"] = {
+            "schema_version": 1,
+            "chat_id": pnc_completion_notice_relay.DEFAULT_CHAT_IDS[1],
+            "thread_id": "topic:om_1",
+            "user_state": "completed",
+            "milestones": [],
+            "pending_confirms": [],
+            "delivery": {
+                "report_status": "report_ready",
+                "rca_status": "report_ready",
+            },
+        }
+        sidecar.write_text(json.dumps(body), encoding="utf-8")
+        text_calls = []
+
+        result = pnc_completion_notice_relay.relay_pending_notices(
+            task_ids=["task-1"],
+            send=True,
+            send_func=lambda args: text_calls.append(args)
+            or json.dumps({"success": True, "message_id": "om_text"}),
+            send_card_func=lambda target, rendered, message_id: {
+                "success": False,
+                "error": "patch failed",
+            },
+            max_card_fallbacks_per_loop=1,
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert result["ok"] is True
+    message = text_calls[0]["message"]
+    assert "结论：自动分析已完成" in message
+    assert "内部 HTML 审计产物已隐藏" in message
+    assert "18081" not in message
+    assert "index.html" not in message
+
+
+@pytest.mark.parametrize(
+    "internal_pointer",
+    [
+        "http://internal/G1Q3_RCA/demo/index%2Ehtml",
+        "http://internal/G1Q3_RCA/demo/report.xhtml",
+        "https://internal/report?file=index%252Ehtml",
+        "<http://internal/G1Q3_RCA/demo/index.html>",
+        "http://internal/G1Q3_RCA/demo/index.html]",
+        "http://192.168.26.174:18081?case=demo",
+        "http://192.168.26.174:18081#demo",
+        "(http://192.168.26.174:18081)",
+        "https://internal/report?file=index%2525252Ehtml",
+        "https://internal/report?file=index&#46;html",
+        "https://internal/report?file=index&amp;#46;html",
+    ],
+)
+def test_rca_fallback_sanitizer_decodes_internal_html_references(
+    internal_pointer,
+):
+    card = {"delivery": {"rca_status": "report_ready"}}
+
+    rendered = pnc_completion_notice_relay._rca_public_text_without_internal_html(
+        f"artifact: {internal_pointer}\n结论：保留",
+        card,
+    )
+
+    assert internal_pointer not in rendered
+    assert "内部 HTML 审计产物已隐藏" in rendered
+    assert "结论：保留" in rendered
+
+
+def test_rca_fallback_sanitizer_preserves_exact_validated_foxglove_with_dot_name():
+    submission_key = "case.html"
+    viz_mcap_vm = canonical_viz_mcap_path(submission_key)
+    exact_foxglove = foxglove_url(viz_mcap_vm)
+    card = {
+        "delivery": {
+            "rca_status": "report_ready",
+            "foxglove_url": exact_foxglove,
+            "viz_mcap_vm": viz_mcap_vm,
+        }
+    }
+
+    rendered = pnc_completion_notice_relay._rca_public_text_without_internal_html(
+        f"artifact: {exact_foxglove}",
+        card,
+    )
+
+    assert rendered == f"artifact: {exact_foxglove}"
+
+
+def test_non_rca_report_status_does_not_enable_rca_html_sanitizer():
+    text = "public: https://docs.example/release/report.html\n完成"
+    card = {"delivery": {"report_status": "published"}}
+
+    assert (
+        pnc_completion_notice_relay._rca_public_text_without_internal_html(
+            text,
+            card,
+        )
+        == text
+    )
 
 
 def test_m2_3_card_failure_fallback_send_error_is_visible(tmp_path):

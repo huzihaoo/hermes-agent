@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 from datetime import datetime, timezone
+import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -30,16 +31,21 @@ from scripts.pnc_business_metrics import (
     CONFIDENCE_TIERS,
     DENOMINATOR_KINDS,
     ENTRYPOINTS,
+    G1Q3_ADOPTION_FIELD_KEY,
+    G1Q3_ADOPTION_OPTION_STATUSES,
     MetricsValidationError,
     SUPPORTED_CONTROL_STORE_SCHEMA_VERSIONS,
     SUPPORTED_DELIVERY_STORE_SCHEMA_VERSIONS,
     load_records,
     load_sqlite_observations,
+    normalize_adoption_signal,
     normalize_record,
 )
 
 
 SCHEMA_VERSION = "pnc_quality_metrics_w12_v1"
+ADOPTION_BATCH_SCHEMA_VERSION = "pnc_rca_adoption_signal_batch_v1"
+MAX_ADOPTION_INPUT_BYTES = 2 * 1024 * 1024
 METRIC_NAMES = (
     "dual_entry_e2e_success",
     "technical_delivery_readback",
@@ -59,6 +65,12 @@ _ATTRIBUTION_EXCLUSIONS = frozenset({
     "unsupported",
     "event_not_found",
     "not_attributable",
+})
+_ADOPTION_CONCLUSION_OUTCOMES = frozenset({
+    "candidate",
+    "owner_accepted",
+    "owner_rejected",
+    "supported_attribution",
 })
 
 # These are the three ``todo`` rows in the resident pnc_quality_metrics.py
@@ -81,11 +93,12 @@ SIGNAL_INVENTORY = (
         "label": "RCA 采纳率",
         "status": "have",
         "clean_fields": (
-            "attribution.outcome",
-            "attribution.owner_decision",
+            "signals.adoption.status",
+            "signals.adoption.explicit",
+            "signals.adoption.operation",
         ),
         "denominator_kind": "business",
-        "numerator": "owner_decision == accepted",
+        "numerator": "explicit user op-record status == adopted",
     },
     {
         "name": "gate_consistency_rate",
@@ -164,6 +177,207 @@ def _issue(
     issues.append({"code": code, "detail": detail, "record_id": row.get("record_id")})
 
 
+def load_adoption_batch(path: str | Path) -> tuple[dict[str, Any], str]:
+    source = Path(path).expanduser()
+    try:
+        raw = source.read_bytes()
+    except OSError as exc:
+        raise MetricsValidationError(
+            "metrics_adoption_input_unavailable", str(source)
+        ) from exc
+    if len(raw) > MAX_ADOPTION_INPUT_BYTES:
+        raise MetricsValidationError("metrics_adoption_input_too_large", str(source))
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise MetricsValidationError(
+            "metrics_adoption_input_invalid", "adoption input must be UTF-8 JSON"
+        ) from exc
+    if not isinstance(payload, Mapping):
+        raise MetricsValidationError(
+            "metrics_adoption_input_invalid", "adoption input must be an object"
+        )
+    return dict(payload), hashlib.sha256(raw).hexdigest()
+
+
+def merge_adoption_batch(
+    rows: Sequence[Mapping[str, Any]],
+    batch: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    if (
+        batch.get("schema_version") != ADOPTION_BATCH_SCHEMA_VERSION
+        or batch.get("source") != "official_meegle_api"
+        or batch.get("read_only") is not True
+        or batch.get("write_commands_performed") != 0
+    ):
+        raise MetricsValidationError(
+            "metrics_adoption_batch_invalid",
+            "adoption batch must bind the official read-only collector contract",
+        )
+    records = batch.get("records")
+    if not isinstance(records, list):
+        raise MetricsValidationError(
+            "metrics_adoption_batch_invalid", "adoption batch records must be an array"
+        )
+    signals: dict[tuple[str, int, str], Mapping[str, Any]] = {}
+    for index, record in enumerate(records):
+        if not isinstance(record, Mapping) or not isinstance(
+            record.get("signal"), Mapping
+        ):
+            raise MetricsValidationError(
+                "metrics_adoption_batch_record_invalid",
+                "adoption batch records must contain a signal object",
+                index=index,
+            )
+        business_key = str(record.get("business_key") or "").strip()
+        work_item_id = str(record.get("work_item_id") or "").strip()
+        generation = record.get("generation")
+        if (
+            not business_key
+            or not work_item_id
+            or isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+        ):
+            raise MetricsValidationError(
+                "metrics_adoption_batch_identity_invalid",
+                "adoption batch identity is missing or invalid",
+                index=index,
+            )
+        key = (business_key, generation, work_item_id)
+        if key in signals:
+            raise MetricsValidationError(
+                "metrics_adoption_batch_identity_duplicate",
+                "adoption batch repeats a conclusion generation",
+                index=index,
+            )
+        signals[key] = record["signal"]
+
+    merged = []
+    consumed: set[tuple[str, int, str]] = set()
+    for index, row in enumerate(rows):
+        provenance = row.get("delivery_provenance")
+        if provenance is not None and not isinstance(provenance, Mapping):
+            raise MetricsValidationError(
+                "metrics_adoption_observation_identity_invalid",
+                "delivery_provenance must be an object when present",
+                index=index,
+            )
+        provenance = provenance or {}
+        business_key = str(
+            row.get("business_key")
+            or provenance.get("business_key")
+            or ""
+        ).strip()
+        work_item_id = str(
+            row.get("work_item_id")
+            or provenance.get("work_item_id")
+            or ""
+        ).strip()
+        generation = row.get("generation")
+        if generation is None:
+            generation = provenance.get("generation")
+        key = (business_key, generation, work_item_id)
+        signal = signals.get(key)
+        item = dict(row)
+        if signal is not None:
+            if any(
+                item.get(field)
+                for field in ("adoption_source", "adoption_option_key")
+            ):
+                raise MetricsValidationError(
+                    "metrics_adoption_signal_duplicate",
+                    "observation already contains an adoption signal",
+                    index=index,
+                )
+            item.update(normalize_adoption_signal(
+                signal,
+                index=index,
+                expected_work_item_id=work_item_id,
+                expected_generation=generation,
+            ))
+            consumed.add(key)
+        merged.append(item)
+    unused = sorted(set(signals) - consumed)
+    if unused:
+        raise MetricsValidationError(
+            "metrics_adoption_batch_unbound",
+            f"adoption batch contains unbound generations: {unused[:20]}",
+        )
+    return merged
+
+
+_NORMALIZED_ADOPTION_FIELDS = (
+    "adoption_status",
+    "adoption_explicit",
+    "adoption_field_key",
+    "adoption_option_key",
+    "adoption_operation_time_ms",
+    "adoption_operator",
+    "adoption_operator_type",
+    "adoption_error_code",
+    "adoption_source",
+    "adoption_work_item_id",
+    "adoption_generation",
+    "adoption_window_start_ms",
+    "adoption_window_end_ms",
+    "adoption_window_semantics",
+)
+
+
+def _validated_normalized_adoption(
+    row: Mapping[str, Any],
+    *,
+    index: int,
+) -> dict[str, Any]:
+    status = str(row.get("adoption_status") or "").strip()
+    has_binding_or_proof = any(
+        row.get(field) not in (None, "", False)
+        for field in _NORMALIZED_ADOPTION_FIELDS
+        if field not in {"adoption_status", "adoption_field_key"}
+    )
+    empty = (
+        status in {"", "unreviewed"}
+        and not has_binding_or_proof
+        and row.get("adoption_field_key") in (None, "", G1Q3_ADOPTION_FIELD_KEY)
+    )
+    signal: dict[str, Any] = {}
+    if not empty:
+        signal = {
+            "source": row.get("adoption_source"),
+            "field_key": row.get("adoption_field_key"),
+            "work_item_id": row.get("adoption_work_item_id"),
+            "generation": row.get("adoption_generation"),
+            "start_ms": row.get("adoption_window_start_ms"),
+            "end_ms": row.get("adoption_window_end_ms"),
+            "window_semantics": row.get("adoption_window_semantics"),
+            "status": row.get("adoption_status"),
+            "explicit": row.get("adoption_explicit"),
+            "error_code": row.get("adoption_error_code"),
+            "operation": {
+                "field_key": row.get("adoption_field_key"),
+                "new": row.get("adoption_option_key"),
+                "operation_time": row.get("adoption_operation_time_ms"),
+                "operator": row.get("adoption_operator"),
+                "operator_type": row.get("adoption_operator_type"),
+            },
+        }
+    validated = normalize_adoption_signal(
+        signal,
+        index=index,
+        expected_work_item_id=str(row.get("work_item_id") or "").strip(),
+        expected_generation=row.get("generation"),
+    )
+    for field in _NORMALIZED_ADOPTION_FIELDS:
+        if field in row and row.get(field) != validated[field]:
+            raise MetricsValidationError(
+                "metrics_adoption_flattened_mismatch",
+                f"normalized adoption field {field} does not match validated proof",
+                index=index,
+            )
+    return validated
+
+
 def _normalization(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     if not isinstance(records, Sequence) or isinstance(
         records, (str, bytes, bytearray)
@@ -226,6 +440,7 @@ def _normalization(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]
                     f"unsupported normalized scope {item['denominator_kind']!r}",
                     index=index,
                 )
+            item.update(_validated_normalized_adoption(item, index=index))
             normalized.append(item)
         else:
             # Keep the index in normalization errors for negative-injection
@@ -323,6 +538,185 @@ def _signal_ratio(
     return metric
 
 
+def _adoption_state(
+    row: Mapping[str, Any], issues: list[dict[str, Any]]
+) -> str:
+    status = str(row.get("adoption_status") or "unreviewed")
+    if status == "unreviewed":
+        return status
+    if status == "read_error":
+        _issue(
+            issues,
+            "metrics_adoption_read_error",
+            str(row.get("adoption_error_code") or "adoption read failed"),
+            row,
+        )
+        return status
+    option_key = str(row.get("adoption_option_key") or "")
+    operation_time = row.get("adoption_operation_time_ms")
+    if (
+        status not in {"adopted", "rejected"}
+        or row.get("adoption_explicit") is not True
+        or row.get("adoption_field_key") != G1Q3_ADOPTION_FIELD_KEY
+        or G1Q3_ADOPTION_OPTION_STATUSES.get(option_key) != status
+        or row.get("adoption_operator_type") != "user"
+        or not str(row.get("adoption_operator") or "").strip()
+        or isinstance(operation_time, bool)
+        or not isinstance(operation_time, int)
+        or operation_time < 0
+    ):
+        _issue(
+            issues,
+            "metrics_adoption_proof_invalid",
+            "adopted/rejected requires an exact user list-op-record proof",
+            row,
+        )
+        return "read_error"
+    return status
+
+
+def _adoption_metric(
+    rows: Sequence[Mapping[str, Any]],
+    issues: list[dict[str, Any]],
+    *,
+    semantics_confirmed: bool,
+) -> dict[str, Any]:
+    observations: dict[tuple[str, str, str], Mapping[str, Any] | None] = {}
+    conflicts: set[tuple[str, str, str]] = set()
+    proof_fields = (
+        "adoption_status",
+        "adoption_explicit",
+        "adoption_field_key",
+        "adoption_option_key",
+        "adoption_operation_time_ms",
+        "adoption_operator",
+        "adoption_operator_type",
+        "adoption_error_code",
+        "adoption_source",
+        "adoption_work_item_id",
+        "adoption_generation",
+        "adoption_window_start_ms",
+        "adoption_window_end_ms",
+        "adoption_window_semantics",
+    )
+    for row in rows:
+        if row.get("denominator_kind") != "business":
+            continue
+        if str(row.get("confidence_tier") or "") not in {"high", "medium"}:
+            continue
+        outcome = str(row.get("attribution_outcome") or "")
+        if outcome not in _ADOPTION_CONCLUSION_OUTCOMES:
+            continue
+        work_item_id = str(row.get("work_item_id") or "").strip()
+        generation = row.get("generation")
+        key = (
+            str(row.get("release") or ""),
+            work_item_id or f"unbound:{row.get('pair_id')}",
+            str(generation if isinstance(generation, int) else "unbound"),
+        )
+        previous = observations.get(key)
+        if previous is None and key not in observations:
+            observations[key] = row
+            continue
+        if previous is not None and all(
+            previous.get(field) == row.get(field) for field in proof_fields
+        ):
+            continue
+        if key not in conflicts:
+            _issue(
+                issues,
+                "metrics_adoption_pair_conflict",
+                "one conclusion generation has conflicting adoption observations",
+                row,
+            )
+        conflicts.add(key)
+        observations[key] = None
+
+    proof_owners: dict[tuple[Any, ...], tuple[str, str, str]] = {}
+    for key, row in tuple(observations.items()):
+        if row is None or key in conflicts:
+            continue
+        if row.get("adoption_status") not in {"adopted", "rejected"}:
+            continue
+        proof = tuple(row.get(field) for field in (
+            "adoption_field_key",
+            "adoption_option_key",
+            "adoption_operation_time_ms",
+            "adoption_operator",
+            "adoption_operator_type",
+        ))
+        owner = proof_owners.get(proof)
+        if owner is None:
+            proof_owners[proof] = key
+            continue
+        if owner == key:
+            continue
+        if owner not in conflicts:
+            owner_row = observations.get(owner)
+            _issue(
+                issues,
+                "metrics_adoption_proof_reused",
+                "one user operation proof cannot bind multiple conclusion generations",
+                owner_row or row,
+            )
+        conflicts.add(owner)
+        conflicts.add(key)
+
+    states = {
+        "adopted": 0,
+        "rejected": 0,
+        "unreviewed": 0,
+        "read_error": 0,
+    }
+    for key, row in observations.items():
+        if key in conflicts or row is None:
+            states["read_error"] += 1
+        else:
+            states[_adoption_state(row, issues)] += 1
+
+    denominator = states["adopted"] + states["rejected"]
+    status = (
+        "read_error"
+        if states["read_error"]
+        else "adoption_semantics_unconfirmed"
+        if denominator and not semantics_confirmed
+        else "available"
+        if denominator
+        else "insufficient_adoption_signal"
+    )
+    business_bucket: dict[str, int | float | None]
+    if status == "available":
+        business_bucket = {
+            "numerator": states["adopted"],
+            "denominator": denominator,
+            "rate_pct": _rate(states["adopted"], denominator),
+        }
+    else:
+        business_bucket = {
+            "numerator": None,
+            "denominator": None,
+            "rate_pct": None,
+        }
+    return {
+        "status": status,
+        "field_key": G1Q3_ADOPTION_FIELD_KEY,
+        "definition": "adopted / (adopted + rejected)",
+        "semantic_status": "confirmed" if semantics_confirmed else "unconfirmed",
+        "default_values_counted": False,
+        "explicit_response_count": denominator,
+        "states": states,
+        "denominator_kind": "business",
+        "by_denominator": {
+            "business": business_bucket,
+            "system": {
+                "numerator": None,
+                "denominator": None,
+                "rate_pct": None,
+            },
+        },
+    }
+
+
 def _group_skeleton(
     rows: Sequence[Mapping[str, Any]],
 ) -> dict[tuple[str, str, str, str], dict[str, Any]]:
@@ -372,6 +766,8 @@ def _compute_group_metrics(
     groups: dict[tuple[str, str, str, str], dict[str, Any]],
     pair_results: Mapping[tuple[str, str, str, str], Mapping[str, Any]],
     issues: list[dict[str, Any]],
+    *,
+    adoption_semantics_confirmed: bool,
 ) -> None:
     for key, group in groups.items():
         rows = group["_rows"]
@@ -523,18 +919,10 @@ def _compute_group_metrics(
             issues=issues,
             missing_code="metrics_triage_signal_missing",
         )
-        group["signals"]["rca_adoption_rate"] = _signal_ratio(
-            [row for row in signal_rows if str(row.get("confidence_tier")) == "medium"],
-            eligible=lambda row: (
-                row.get("attribution_outcome") not in _ATTRIBUTION_EXCLUSIONS
-                and bool(row.get("attribution_outcome"))
-                and bool(row.get("owner_decision"))
-            ),
-            success=lambda row: row.get("owner_decision") == "allow",
-            skip=lambda row: row.get("attribution_outcome") in _ATTRIBUTION_EXCLUSIONS,
-            expected_scope="business",
-            issues=issues,
-            missing_code="metrics_rca_signal_missing",
+        group["signals"]["rca_adoption_rate"] = _adoption_metric(
+            signal_rows,
+            issues,
+            semantics_confirmed=adoption_semantics_confirmed,
         )
         group["signals"]["gate_consistency_rate"] = _signal_ratio(
             rows,
@@ -556,6 +944,7 @@ def build_daily_report(
     *,
     observed_at: str | None = None,
     strict: bool = True,
+    adoption_semantics_confirmed: bool = False,
 ) -> dict[str, Any]:
     """Aggregate records into a fail-closed W12 report.
 
@@ -595,7 +984,17 @@ def build_daily_report(
         )
     groups = _group_skeleton(rows)
     pair_results = _pair_results(rows, issues)
-    _compute_group_metrics(groups, pair_results, issues)
+    if not isinstance(adoption_semantics_confirmed, bool):
+        raise MetricsValidationError(
+            "metrics_adoption_semantics_flag_invalid",
+            "adoption_semantics_confirmed must be boolean",
+        )
+    _compute_group_metrics(
+        groups,
+        pair_results,
+        issues,
+        adoption_semantics_confirmed=adoption_semantics_confirmed,
+    )
 
     rendered_groups: list[dict[str, Any]] = []
     total_auxiliary = {
@@ -619,6 +1018,18 @@ def build_daily_report(
             total_auxiliary["attribution_exclusions"][name] += int(
                 group["auxiliary"]["attribution_exclusions"].get(name) or 0
             )
+
+    adoption_signal = _adoption_metric(
+        rows,
+        issues,
+        semantics_confirmed=adoption_semantics_confirmed,
+    )
+    business_adoption = adoption_signal["by_denominator"]["business"]
+    adoption_signal.update({
+        "numerator": business_adoption["numerator"],
+        "denominator": business_adoption["denominator"],
+        "rate_pct": business_adoption["rate_pct"],
+    })
 
     report = {
         "schema_version": SCHEMA_VERSION,
@@ -644,6 +1055,7 @@ def build_daily_report(
         },
         "confidence_tiers": list(CONFIDENCE_TIERS),
         "signal_inventory": [dict(item) for item in SIGNAL_INVENTORY],
+        "adoption_signal": adoption_signal,
         "groups": rendered_groups,
         "auxiliary": total_auxiliary,
         "errors": issues,
@@ -689,6 +1101,17 @@ def render_markdown(report: Mapping[str, Any]) -> str:
                 f"| {dims.get('release')} | {dims.get('business')} | {dims.get('entry')} | "
                 f"{dims.get('confidence_tier')} | {metric_name} | {cells[0]} | {cells[1]} |"
             )
+    adoption = report.get("adoption_signal") or {}
+    lines.extend([
+        "",
+        "## RCA Adoption Signal",
+        "",
+        f"- status: {adoption.get('status', 'insufficient_adoption_signal')}",
+        f"- field_key: {adoption.get('field_key', G1Q3_ADOPTION_FIELD_KEY)}",
+        "- default values without a user op-record are excluded",
+    ])
+    if adoption.get("status") == "available":
+        lines.append(f"- rate_pct: {adoption.get('rate_pct')}")
     auxiliary = report.get("auxiliary") or {}
     lines.extend([
         "",
@@ -721,6 +1144,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--window-start")
     parser.add_argument("--window-end")
     parser.add_argument("--golden-input")
+    parser.add_argument(
+        "--adoption-input",
+        help="read-only pnc_rca_adoption_signal_batch_v1 JSON",
+    )
     parser.add_argument("--observed-at", default=None)
     parser.add_argument("--markdown", action="store_true")
     parser.add_argument(
@@ -776,6 +1203,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             rows = load_records(args.input)
             observed_at = args.observed_at
+        adoption_input_sha256 = ""
+        if args.adoption_input:
+            adoption_batch, adoption_input_sha256 = load_adoption_batch(
+                args.adoption_input
+            )
+            rows = merge_adoption_batch(rows, adoption_batch)
         report = build_daily_report(
             rows, observed_at=observed_at, strict=not args.non_strict
         )
@@ -797,6 +1230,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "external_effects_triggered": False,
                 "wal_created": False,
             }
+        if args.adoption_input:
+            report["source"]["adoption_input"] = str(
+                Path(args.adoption_input).expanduser().absolute()
+            )
+            report["source"]["adoption_input_sha256"] = adoption_input_sha256
+            report["source"]["adoption_source"] = "official_meegle_api"
+            report["source"]["adoption_read_only"] = True
     except MetricsValidationError as exc:
         print(
             json.dumps(exc.as_dict(), ensure_ascii=False, sort_keys=True),

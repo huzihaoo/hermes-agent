@@ -2,7 +2,13 @@ import pytest
 
 import json
 
-from gateway.feishu_task_card import assert_no_forbidden_fragments, render_task_card, render_status_line
+from gateway.feishu_task_card import (
+    INTERNAL_HTML_HIDDEN_TEXT,
+    assert_no_forbidden_fragments,
+    render_status_line,
+    render_task_card,
+)
+from scripts.pnc_foxglove_delivery import canonical_viz_mcap_path, foxglove_url
 
 
 def _dump(card):
@@ -296,12 +302,8 @@ def test_html_paths_in_display_metadata_are_hidden_without_foxglove():
 
 
 def test_g1q3_card_prefers_foxglove_and_hides_independent_html_link():
-    foxglove_url = (
-        "https://192.168.21.217/?ds=foxglove-http&ds.mcapPath="
-        "/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases/"
-        "6986500860_fcw_FCW-%E5%90%88%E8%82%A5-%E9%9B%A8%E5%A4%A9/"
-        "6986500860_fcw_FCW-%E5%90%88%E8%82%A5-%E9%9B%A8%E5%A4%A9.viz.mcap"
-    )
+    viz_mcap_vm = canonical_viz_mcap_path("6986500860_fcw")
+    public_foxglove_url = foxglove_url(viz_mcap_vm)
     card = render_task_card({
         "user_state": "done",
         "delivery": {
@@ -309,17 +311,104 @@ def test_g1q3_card_prefers_foxglove_and_hides_independent_html_link():
             "report_status": "html_delivery_ready",
             "artifact_label": "打开 HTML 报告",
             "artifact_path": "http://192.168.26.174:18081/G1Q3_RCA/cases/6986500860_fcw/index.html",
-            "foxglove_url": foxglove_url,
+            "foxglove_url": public_foxglove_url,
+            "viz_mcap_vm": viz_mcap_vm,
             "attribution_causal_text": "目标测速异常 -> ACC 纵向请求波动 -> 减速过重",
         },
     })
 
     text = _dump(card)
-    assert f"[打开 foxglove 可视化]({foxglove_url})" in text
+    assert f"[打开 foxglove 可视化]({public_foxglove_url})" in text
     assert "[打开 HTML 报告]" not in text
     assert "http://192.168.26.174:18081/G1Q3_RCA/cases/6986500860_fcw/index.html" not in text
     assert "归因因果：目标测速异常 -> ACC 纵向请求波动 -> 减速过重" in text
     assert "@" not in text
+
+
+@pytest.mark.parametrize(
+    "internal_pointer",
+    [
+        "http://internal/G1Q3_RCA/demo/index%2Ehtml",
+        "http://internal/G1Q3_RCA/demo/index%252Ehtml",
+        "http://internal/G1Q3_RCA/demo/report.xhtml",
+        "http://192.168.26.174:18081?case=demo",
+        "https://internal/report?file=index&#46;html",
+    ],
+)
+def test_g1q3_card_hides_encoded_internal_html_references(internal_pointer):
+    card = render_task_card({
+        "task_id": "g1q3-rca-encoded-html",
+        "user_state": "done",
+        "delivery": {
+            "rca_status": "report_ready",
+            "artifact_path": internal_pointer,
+        },
+    })
+
+    assert internal_pointer not in _dump(card)
+
+
+def test_non_rca_report_status_keeps_public_html_artifact():
+    public_report = "https://docs.example/release/report.html"
+    card = render_task_card({
+        "task_id": "ordinary-task",
+        "user_state": "done",
+        "delivery": {
+            "report_status": "published",
+            "artifact_path": public_report,
+        },
+    })
+
+    assert public_report in _dump(card)
+
+
+def test_g1q3_card_preserves_exact_validated_foxglove_with_dot_name():
+    viz_mcap_vm = canonical_viz_mcap_path("case.html")
+    public_foxglove_url = foxglove_url(viz_mcap_vm)
+    card = render_task_card({
+        "task_id": "g1q3-rca-case-html",
+        "user_state": "done",
+        "delivery": {
+            "rca_status": "report_ready",
+            "artifact_path": "http://192.168.26.174:18081/index.html",
+            "foxglove_url": public_foxglove_url,
+            "viz_mcap_vm": viz_mcap_vm,
+        },
+    })
+
+    assert public_foxglove_url in _dump(card)
+
+
+def test_g1q3_card_sanitizes_internal_html_from_all_visible_text_only():
+    card = render_task_card({
+        "task_id": "case.html",
+        "business_line": "g1q3-rca",
+        "user_state": "awaiting_user",
+        "status_line": "状态 http://internal/status/index%2Ehtml",
+        "pending_confirms": [
+            {
+                "id": "review",
+                "question": "复核 http://internal/question/report.xhtml",
+                "options": ["确认"],
+                "resolved": None,
+            }
+        ],
+        "delivery": {
+            "rca_status": "report_ready",
+            "conclusion": "结论见 http://internal/conclusion/index%252Ehtml",
+            "boundaries": ["http://192.168.26.174:18081?case=boundary"],
+        },
+        "diagnostics": {
+            "blocker": "http://internal/diagnostic/index&amp;#46;html",
+        },
+    })
+
+    dumped = _dump(card)
+    assert "internal/" not in dumped
+    assert ":18081" not in dumped
+    assert INTERNAL_HTML_HIDDEN_TEXT in dumped
+    action = next(item for item in card["elements"] if item.get("tag") == "action")
+    assert action["actions"][0]["value"]["task_id"] == "case.html"
 
 
 

@@ -130,6 +130,11 @@ FEISHU_WEBSOCKET_AVAILABLE = websockets is not None
 FEISHU_WEBHOOK_AVAILABLE = aiohttp is not None
 
 from gateway.config import Platform, PlatformConfig
+from gateway.pnc_group_binding import (
+    G1Q3_RCA_GROUP_ID,
+    G1Q3_RCA_MANUAL_GROUP_IDS,
+    PNC_ALL_BUSINESS_TEST_GROUP_ID,
+)
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -160,8 +165,6 @@ from utils import atomic_json_write, env_float, env_int
 logger = logging.getLogger(__name__)
 
 
-PNC_ALL_BUSINESS_TEST_GROUP_ID = "oc_16614f4ba25b8c88b69c0b8e9ebc2fb5"
-G1Q3_RCA_GROUP_ID = "oc_6cfc782212009ff4cd815349909dd423"
 _FEISHU_QUEUE_EVENT_CONTEXT_SCHEMA = "feishu_queue_message_event_v1"
 _G1Q3_RCA_MANUAL_QUEUE_ROUTE = "g1q3_rca_manual_v1"
 _G1Q3_RCA_MANUAL_ADMISSION_RESULT_SCHEMA = "pnc_rca_manual_admission_result_v1"
@@ -290,7 +293,7 @@ def _requires_durable_g1q3_gateway_decision(event: MessageEvent) -> bool:
         return False
     chat_id = str(getattr(source, "chat_id", "") or "").strip()
     if (
-        chat_id not in {G1Q3_RCA_GROUP_ID, PNC_ALL_BUSINESS_TEST_GROUP_ID}
+        chat_id not in G1Q3_RCA_MANUAL_GROUP_IDS
         or str(getattr(source, "chat_type", "") or "").strip().lower() != "group"
         or bool(getattr(source, "is_bot", False))
     ):
@@ -5479,7 +5482,7 @@ class FeishuAdapter(BasePlatformAdapter):
         action = str(action_value.get("hermes_action") or "").strip()
         task_id = str(action_value.get("task_id") or "").strip()
         protected = chat_id == G1Q3_RCA_GROUP_ID or (
-            chat_id == PNC_ALL_BUSINESS_TEST_GROUP_ID and action == "rca_clarify"
+            chat_id in G1Q3_RCA_MANUAL_GROUP_IDS and action == "rca_clarify"
         )
         claim = None
         if task_id:
@@ -6881,7 +6884,7 @@ class FeishuAdapter(BasePlatformAdapter):
         raw_chat_id = str(getattr(message, "chat_id", "") or "").strip()
         requires_complete_reply_context = bool(
             reply_to_message_id
-            and raw_chat_id in {G1Q3_RCA_GROUP_ID, PNC_ALL_BUSINESS_TEST_GROUP_ID}
+            and raw_chat_id in G1Q3_RCA_MANUAL_GROUP_IDS
             and str(chat_type or "").strip().lower() not in {"p2p", "dm"}
             and not is_bot
             and self_mention_command_directed

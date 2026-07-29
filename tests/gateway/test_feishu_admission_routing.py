@@ -32,6 +32,7 @@ from gateway.pnc_rca_provider_fence import (
     build_historical_epoch_provider_claim,
     build_manual_provider_write_claim,
 )
+from gateway.pnc_group_binding import G1Q3_RCA_MANUAL_GROUP_IDS
 from gateway.session import SessionSource
 
 
@@ -59,6 +60,48 @@ def _adapter_without_init(*, lane: str = "heavy") -> FeishuAdapter:
 
     adapter.send = fake_send
     return adapter
+
+
+@pytest.mark.parametrize("chat_id", sorted(G1Q3_RCA_MANUAL_GROUP_IDS))
+def test_all_canonical_manual_groups_require_durable_g1q3_decision(chat_id):
+    event = MessageEvent(
+        source=SessionSource(
+            platform="feishu",
+            user_id="ou_owner",
+            chat_id=chat_id,
+            chat_type="group",
+            is_bot=False,
+        ),
+        text="重新分析 https://project.feishu.cn/g1q3/issue/detail/7041712812",
+        message_type=MessageType.TEXT,
+        message_id="om_durable",
+        metadata={
+            "feishu": {
+                "self_mentioned": True,
+                "self_mention_command_directed": True,
+                "is_bot_sender": False,
+                "sender_type": "user",
+            }
+        },
+    )
+
+    assert feishu_adapter_module._requires_durable_g1q3_gateway_decision(event)
+
+
+def test_integration_tools_rca_clarify_card_is_guarded_without_claim():
+    integration_tools_group = next(
+        chat_id
+        for chat_id in G1Q3_RCA_MANUAL_GROUP_IDS
+        if chat_id not in {G1Q3_RCA_GROUP_ID, PNC_ALL_BUSINESS_TEST_GROUP_ID}
+    )
+    event = SimpleNamespace(
+        context=SimpleNamespace(open_chat_id=integration_tools_group)
+    )
+
+    assert FeishuAdapter._suppress_unfenced_rca_card_action(
+        event=event,
+        action_value={"hermes_action": "rca_clarify"},
+    )
 
 
 def _manual_admission_result() -> dict[str, object]:
