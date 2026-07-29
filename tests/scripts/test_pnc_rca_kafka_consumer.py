@@ -40,6 +40,10 @@ def _env(tmp_path):
         "HERMES_RCA_KAFKA_WORK_ITEM_TYPE_KEYS": "problem-type",
         "HERMES_RCA_KAFKA_STATUS_CHANGE_TYPES": "Reached",
         "HERMES_RCA_KAFKA_CREATION_RULE_VERSION": "issue-created-v1",
+        "HERMES_RCA_KAFKA_SNAPSHOT_PATTERNS": "",
+        "HERMES_RCA_KAFKA_SNAPSHOT_SUB_STAGES": "",
+        "HERMES_RCA_KAFKA_SUBMIT_ENABLED": "false",
+        "HERMES_RCA_KAFKA_ACTIVATION_REQUIRED": "false",
         "HERMES_RCA_KAFKA_STATE_TRANSITIONS_JSON": json.dumps([
             {
                 "state_key": "new-problem-state",

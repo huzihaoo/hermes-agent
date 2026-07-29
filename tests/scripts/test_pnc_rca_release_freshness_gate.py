@@ -14,7 +14,10 @@ import pytest
 
 from scripts import pnc_rca_release_freshness_gate as gate
 from gateway.pnc_rca_control_store import CONTROL_STORE_SCHEMA_VERSION, RcaControlStore
-from gateway.pnc_rca_delivery_store import RcaDeliveryStore
+from gateway.pnc_rca_delivery_store import (
+    DELIVERY_STORE_SCHEMA_VERSION,
+    RcaDeliveryStore,
+)
 from scripts.pnc_live_exec import PNC_PYTHON_LAUNCHD_LABELS
 
 
@@ -949,7 +952,7 @@ def test_release_preflight_accepts_complete_v9_delivery_store_without_writes(
     assert errors == []
     assert evidence["schema_valid"] is True
     assert evidence["observed_control_schema_version"] == CONTROL_STORE_SCHEMA_VERSION
-    assert evidence["observed_schema_version"] == "pnc_rca_delivery_store_v9"
+    assert evidence["observed_schema_version"] == DELIVERY_STORE_SCHEMA_VERSION
     assert evidence["quick_check"] == "ok"
     assert evidence["integrity_check"] == "ok"
     assert evidence["foreign_key_violation_count"] == 0
@@ -1002,7 +1005,7 @@ def test_release_preflight_rejects_missing_immutable_trigger_without_writes(
     )
 
     assert evidence["schema_valid"] is False
-    assert evidence["observed_schema_version"] == "pnc_rca_delivery_store_v9"
+    assert evidence["observed_schema_version"] == DELIVERY_STORE_SCHEMA_VERSION
     assert errors == [
         {
             "code": "pnc_release_delivery_store_schema_not_current",
@@ -1018,9 +1021,9 @@ def test_release_preflight_rejects_wrong_cross_store_migration_order_without_wri
     tmp_path: Path,
 ):
     db_path = tmp_path / "control.sqlite3"
-    # This reproduces the old offline rehearsal: delivery v9 is installed
-    # before the control schema reaches current, so the W6 cross-table triggers
-    # do not exist.
+    # This reproduces the old offline rehearsal: the delivery schema is
+    # installed before the control schema reaches current, so the combined
+    # subscription observability contract is incomplete.
     RcaDeliveryStore(db_path)
     RcaControlStore(db_path)
     before_sha256 = _delivery_store_sha256(db_path)
@@ -1031,14 +1034,13 @@ def test_release_preflight_rejects_wrong_cross_store_migration_order_without_wri
     )
 
     assert evidence["observed_control_schema_version"] == CONTROL_STORE_SCHEMA_VERSION
-    assert evidence["observed_schema_version"] == "pnc_rca_delivery_store_v9"
+    assert evidence["observed_schema_version"] == DELIVERY_STORE_SCHEMA_VERSION
     assert evidence["schema_valid"] is False
     assert errors == [
         {
             "code": "pnc_release_delivery_store_schema_not_current",
             "reason": (
-                "incompatible_delivery_store_schema:w6_trigger:"
-                "trg_learning_lane_effect_insert_forbidden"
+                "incompatible_delivery_store_schema:subscription_observability"
             ),
         }
     ]

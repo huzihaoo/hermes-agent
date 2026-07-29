@@ -543,6 +543,7 @@ def _matching_status(
             "resource_class": "rca_prod",
             "queue_if_blocked": False,
             "resource_gate_bypass": False,
+            "rca_prod_capacity_mode": "steady",
             "reservation_id": reservation["reservation_id"],
             "reservation_fence": str(reservation["fence"]),
             "reservation_contract_sha256": reservation["contract_sha256"],

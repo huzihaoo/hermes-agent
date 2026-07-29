@@ -15,7 +15,10 @@ from gateway.pnc_rca_control_store import (
     ManualRcaTriggerRequest,
     RcaControlStore,
 )
-from gateway.pnc_rca_delivery_store import RcaDeliveryStore
+from gateway.pnc_rca_delivery_store import (
+    DELIVERY_STORE_SCHEMA_VERSION,
+    RcaDeliveryStore,
+)
 from gateway.pnc_rca_kafka_contract import WorkflowEventPolicy, WorkflowTransition
 from scripts import pnc_rca_activation as activation
 from scripts import pnc_rca_activation_capsule as capsules
@@ -130,7 +133,7 @@ def _database_identity(
                 "path": str(delivery_path.absolute()),
                 "device": delivery_stat.st_dev,
                 "inode": delivery_stat.st_ino,
-                "schema_version": "pnc_rca_delivery_store_v9",
+                "schema_version": DELIVERY_STORE_SCHEMA_VERSION,
                 "db_instance_id": None,
                 "genesis_intent_sha256": None,
             },

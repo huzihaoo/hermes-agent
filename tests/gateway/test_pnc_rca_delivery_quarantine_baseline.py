@@ -442,7 +442,10 @@ def test_combined_v2_offline_receipt_requires_quick_checked_copy_and_rollback(
     )
 
     assert binding["source_schema_version"] == source_version
-    assert binding["target_schema_version"] == "pnc_rca_delivery_store_v9"
+    assert (
+        binding["target_schema_version"]
+        == delivery_store_module.DELIVERY_STORE_SCHEMA_VERSION
+    )
     assert binding["source_quick_check"] == "ok"
     assert binding["target_quick_check"] == "ok"
     assert binding["rollback_path"] == str(migration["source_backup"])
@@ -458,7 +461,7 @@ def test_combined_v2_offline_receipt_requires_quick_checked_copy_and_rollback(
         "selector": {"key": "schema_version"},
         "column": "value",
         "source_value": source_version,
-        "target_value": "pnc_rca_delivery_store_v9",
+        "target_value": delivery_store_module.DELIVERY_STORE_SCHEMA_VERSION,
     }
     expected_variant = (
         "active_prod_v7_no_adjudication_v1"
@@ -699,8 +702,9 @@ def test_combined_v2_live_pre_and_post_gates_bind_exact_source_clone_and_rollbac
         expected_source_schema_sha256=migration["source_schema_sha256"],
     )
 
-    assert post["live_validation"]["schema_version"] == (
-        "pnc_rca_delivery_store_v9"
+    assert (
+        post["live_validation"]["schema_version"]
+        == delivery_store_module.DELIVERY_STORE_SCHEMA_VERSION
     )
     assert post["live_validation"]["quick_check"] == "ok"
     assert post["live_validation"]["sidecars"] == []
@@ -1303,12 +1307,14 @@ def test_baseline_can_be_reissued_after_monotonic_quarantine_audit_events(tmp_pa
     with sqlite3.connect(bundle["store"].db_path) as conn:
         conn.execute(
             "UPDATE rca_delivery_subscriptions SET status = 'quarantined', "
-            "updated_at = ? WHERE effect_kind = 'feishu_issue_comment'",
+            "reason = 'test_quarantine_for_reissue', updated_at = ? "
+            "WHERE effect_kind = 'feishu_issue_comment'",
             ((NOW + timedelta(seconds=6)).isoformat(),),
         )
         conn.execute(
             "UPDATE rca_delivery_subscriptions SET status = 'materialized', "
-            "updated_at = ? WHERE effect_kind = 'feishu_issue_comment'",
+            "reason = 'test_materialized_after_quarantine', updated_at = ? "
+            "WHERE effect_kind = 'feishu_issue_comment'",
             ((NOW + timedelta(seconds=7)).isoformat(),),
         )
 
@@ -1756,7 +1762,8 @@ def test_baseline_or_snapshot_drift_fails_closed(tmp_path, case):
     elif case == "new_quarantine":
         with sqlite3.connect(bundle["store"].db_path) as conn:
             conn.execute(
-                "UPDATE rca_delivery_subscriptions SET status = 'quarantined' "
+                "UPDATE rca_delivery_subscriptions SET status = 'quarantined', "
+                "reason = 'test_new_quarantine' "
                 "WHERE effect_kind = 'feishu_issue_comment'"
             )
     elif case == "row_mutation":
@@ -1802,11 +1809,13 @@ def test_monotonic_quarantine_events_prevent_old_baseline_revival(tmp_path, muta
     with sqlite3.connect(bundle["store"].db_path) as conn:
         if mutation == "status_roundtrip":
             conn.execute(
-                "UPDATE rca_delivery_subscriptions SET status = 'quarantined' "
+                "UPDATE rca_delivery_subscriptions SET status = 'quarantined', "
+                "reason = 'test_roundtrip_quarantine' "
                 "WHERE effect_kind = 'feishu_issue_comment'"
             )
             conn.execute(
-                "UPDATE rca_delivery_subscriptions SET status = 'materialized' "
+                "UPDATE rca_delivery_subscriptions SET status = 'materialized', "
+                "reason = 'test_roundtrip_materialized' "
                 "WHERE effect_kind = 'feishu_issue_comment'"
             )
         else:

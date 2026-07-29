@@ -397,117 +397,51 @@ def test_relay_boundary_uses_live_bound_thread_and_rejects_forged_target(
     assert cards == ["feishu:oc_1:abc"]
 
 
-def test_attachment_boundary_rejects_mutated_source_anchor(monkeypatch):
+def test_retired_attachment_bridge_remains_record_only(monkeypatch):
+    from gateway.record_only import runtime as record_runtime
     from scripts import pnc_vm_task_sync as vm_sync
 
-    submission_key = "g1q3-rca-s1-submission-1"
-    fence_now = datetime.now(timezone.utc) - timedelta(minutes=1)
-    snapshot, envelope, fence = _bound_snapshot_and_envelope(
-        fence_now=fence_now,
-        submission_key=submission_key,
+    recorded = []
+
+    class Recorder:
+        def record(self, **kwargs):
+            recorded.append(kwargs)
+
+    monkeypatch.setattr(
+        record_runtime,
+        "get_record_only_transport",
+        lambda _component: Recorder(),
     )
-    snapshot["canonical_request"]["ticket"]["work_item_id"] = "123"
-    # Rebuild the final snapshot/fence identity after adding the immutable item id.
-    fence = build_issued_write_fence(
-        snapshot={key: value for key, value in snapshot.items() if key not in {"snapshot_id", "snapshot_sha256", "write_fence"}},
-        activation_epoch_id="epoch-1",
-        activation_ledger_id=7,
-        admission_key="admission-1",
-        target_set={
-            "issue_target": "https://project.feishu.cn/g1q3/issue/detail/123",
-            "thread_target": "topic:abc",
-            "chat_id": "oc_1",
-        },
-        now=fence_now,
-        expires_at=fence_now + timedelta(hours=2),
+    monkeypatch.setattr(
+        vm_sync,
+        "_report_internal_http_link",
+        lambda _path: "http://127.0.0.1/report/index.html",
     )
-    snapshot_identity = {
-        key: value
-        for key, value in snapshot.items()
-        if key not in {"snapshot_id", "snapshot_sha256", "write_fence"}
-    }
-    snapshot_identity["write_fence"] = fence
-    snapshot_sha256 = canonical_write_fence_sha256(snapshot_identity)
-    snapshot = {
-        **snapshot_identity,
-        "snapshot_id": f"pnc-rca-snapshot-v1-{snapshot_sha256}",
-        "snapshot_sha256": snapshot_sha256,
-    }
-    envelope["snapshot_id"] = snapshot["snapshot_id"]
-    envelope["snapshot_sha256"] = snapshot_sha256
-    envelope_identity = {
-        key: envelope[key]
-        for key in (
-            "schema_version",
-            "source_authority_sha256",
-            "snapshot_id",
-            "snapshot_sha256",
-            "submission_key",
-            "source_id",
-            "source_kind",
-            "ingress_decision",
-            "source_metadata",
-            "anchor",
-        )
-    }
-    envelope_sha256 = canonical_write_fence_sha256(envelope_identity)
-    envelope["source_envelope_sha256"] = envelope_sha256
-    envelope["source_envelope_id"] = f"pnc-rca-source-envelope-v1-{envelope_sha256}"
-
-    class Row(dict):
-        pass
-
-    class Cursor:
-        def __init__(self, row):
-            self.row = row
-
-        def fetchone(self):
-            return self.row
-
-    class Connection:
-        row_factory = None
-
-        def execute(self, sql, _params=()):
-            if "admission_snapshot_json" in sql:
-                return Cursor(Row(
-                    {
-                        "admission_snapshot_json": json.dumps(snapshot),
-                        "source_envelope_json": json.dumps(envelope),
-                    }
-                ))
-            return Cursor(Row(
-                {
-                    "epoch_id": "epoch-1",
-                    "state": "bounded_active",
-                    "is_current": 1,
-                    "ledger_id": 7,
-                    "business_key": "business-1",
-                    "submission_key": submission_key,
-                    "generation": 1,
-                    "decision": "admit",
-                    "bound_at": fence_now.isoformat(),
-                }
-            ))
-
-        def close(self):
-            return None
-
-    monkeypatch.setenv("HERMES_RCA_CONTROL_DB_PATH", "/tmp/w5-fence-test.sqlite3")
-    monkeypatch.setattr(vm_sync.sqlite3, "connect", lambda *_args, **_kwargs: Connection())
-    vm_sync._validate_report_attachment_fence(
-        vm_task_id="g1q3-rca-s1-submission-1",
-        work_item_id="123",
-    )
-    envelope["anchor"] = {
-        "issue_target": "https://project.feishu.cn/g1q3/issue/detail/999",
-        "thread_target": "topic:abc",
-    }
-    with pytest.raises(ExternalWriteFenceError) as exc:
-        vm_sync._validate_report_attachment_fence(
-            vm_task_id="g1q3-rca-s1-submission-1",
+    assert (
+        vm_sync._feishu_report_attachment_link(
             work_item_id="123",
+            vm_task_id="g1q3-rca-s1-submission-1",
+            index_html="/mnt/tmp/report/index.html",
         )
-    assert exc.value.code == "external_write_fence_identity_mismatch"
+        == ""
+    )
+    assert recorded == [
+        {
+            "operation": "file_send",
+            "platform": "feishu_project",
+            "destination_kind": "work_item",
+            "destination_id": "123",
+            "payload_type": "file",
+            "payload": {
+                "index_html": "/mnt/tmp/report/index.html",
+                "source_url": "http://127.0.0.1/report/index.html",
+            },
+            "task_id": "g1q3-rca-s1-submission-1",
+            "caller_dedupe_key": (
+                "g1q3-report-attachment:123:/mnt/tmp/report/index.html"
+            ),
+        }
+    ]
 
 
 def test_delivery_cutoff_is_durable_and_grandfathers_only_old_rows(tmp_path):
@@ -549,6 +483,7 @@ def test_dispatcher_missing_fence_blocks_historical_and_new_effects():
     claim = SimpleNamespace(
         contract={},
         effect_created_at="2026-07-25T00:00:01+00:00",
+        effect_kind="feishu_issue_comment",
         business_key="business-1",
         generation=1,
     )
