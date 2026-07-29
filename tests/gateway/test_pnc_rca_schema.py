@@ -302,6 +302,40 @@ def test_validate_issue_context_fields_distinguishes_missing_and_invalid_pdcl():
     assert is_valid_pdcl_download_cmd("mdi download clip -u abc -s ./") is True
 
 
+def test_fallback_raw_text_cannot_be_used_as_a_remote_reference():
+    context, blocker = validate_issue_context_fields(
+        RcaIssueContext(
+            work_item_id="7015689036",
+            source_quality="fallback_raw_text",
+            pdcl_download_cmd="mdi download event -u default-fallback -s ./",
+        )
+    )
+
+    assert context.is_pdcl_format is False
+    assert blocker["kind"] == "issue_field_untrusted_remote_data_reference"
+    assert blocker["sub_kind"] == "fallback_raw_text"
+
+
+def test_fallback_raw_text_build_request_is_blocked_even_when_text_parses():
+    context = RcaIssueContext(
+        work_item_id="7015689036",
+        source_quality="fallback_raw_text",
+        pdcl_download_cmd="mdi download event -u default-fallback -s ./",
+        blockers=[{"kind": "issue_field_untrusted_remote_data_reference"}],
+    )
+
+    request = build_execution_request(
+        request_kind="issue_intake",
+        task_id="g1q3_rca_issue_intake_fallback",
+        issue_context=context,
+    )
+
+    assert request.data["data_access"]["status"] == "blocked"
+    assert request.data["data_access"]["blocker"]["kind"] == (
+        "issue_field_untrusted_remote_data_reference"
+    )
+
+
 def test_business_profile_is_parsed_bound_and_fail_closed_before_data_resolution():
     profile = {
         "status": "matched",

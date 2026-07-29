@@ -63,6 +63,18 @@
     "valid": false
   },
   {
+    "cmd": "mdi download event -u default-event -s ./",
+    "valid": false
+  },
+  {
+    "cmd": "mdi download event -u fallback_raw_text -s ./",
+    "valid": false
+  },
+  {
+    "cmd": "mdi download event -u 00000000-0000-0000-0000-000000000000 -s ./",
+    "valid": false
+  },
+  {
     "cmd": "rm -rf / # mdi",
     "valid": false
   }

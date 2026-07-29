@@ -59,7 +59,7 @@ def test_clip_and_refresh_addresses_map_to_supported_reader_classes():
 @pytest.mark.parametrize(
     ("source", "code"),
     [
-        ("", "remote_data_reference_missing"),
+        ("", "issue_field_missing_remote_data_reference"),
         ("mdi refresh -t ticket-only -s ./", "remote_data_reference_resolution_required"),
         ("mdi download raw -r /safe/ref -s ./", "remote_data_reference_kind_unsupported"),
         ("cyber_recorder play -f demo.record", "remote_data_reference_invalid"),
@@ -172,3 +172,21 @@ def test_strict_validator_rejects_contract_drift(mutation, code):
         validate_remote_data_access(contract)
 
     assert caught.value.code == code
+
+
+@pytest.mark.parametrize("locator", ["default", "fallback-event", "0-0-0-0"])
+def test_placeholder_locator_cannot_enter_remote_data_access(locator):
+    with pytest.raises(RemoteDataAccessError) as caught:
+        build_remote_data_access(f"mdi download event -u {locator} -s ./")
+
+    assert caught.value.code == "remote_data_reference_invalid"
+
+
+def test_handcrafted_placeholder_reference_fails_contract_revalidation():
+    contract = build_remote_data_access("mdi download event -u event-123 -s ./")
+    contract["references"][0]["event_uuid"] = "fallback:event"
+
+    with pytest.raises(RemoteDataAccessError) as caught:
+        validate_remote_data_access(contract)
+
+    assert caught.value.code == "remote_data_reference_invalid"

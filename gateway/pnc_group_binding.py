@@ -19,6 +19,14 @@ from typing import Literal, Sequence
 
 G1Q3_RCA_GROUP_ID = "oc_6cfc782212009ff4cd815349909dd423"
 PNC_ALL_BUSINESS_TEST_GROUP_ID = "oc_16614f4ba25b8c88b69c0b8e9ebc2fb5"
+INTEGRATION_TOOLS_INTAKE_GROUP_ID = "oc_35039b74ffb63ab8100343dc32218c57"
+G1Q3_RCA_MANUAL_GROUP_IDS = frozenset(
+    {
+        G1Q3_RCA_GROUP_ID,
+        PNC_ALL_BUSINESS_TEST_GROUP_ID,
+        INTEGRATION_TOOLS_INTAKE_GROUP_ID,
+    }
+)
 G1Q3_RCA_GROUP_BINDING_ID = "gb_g1q3_rca_feishu_group"
 GROUP_BINDING_RECEIPT_FILENAME_RE = re.compile(
     r"\A\d{4}-\d{2}-\d{2}-[0-9a-f]{64}\.jsonl\Z"
@@ -412,7 +420,7 @@ def _looks_like_feishu_issue_card(text: str) -> bool:
 
 def is_g1q3_rca_bound_chat(chat_id: object) -> bool:
     """Return True for chats where G1Q3-RCA control-plane commands are valid."""
-    return _normalize(chat_id) in {G1Q3_RCA_GROUP_ID, PNC_ALL_BUSINESS_TEST_GROUP_ID}
+    return _normalize(chat_id) in G1Q3_RCA_MANUAL_GROUP_IDS
 
 
 def _is_all_business_test_group(chat_id: object) -> bool:
@@ -704,7 +712,7 @@ def evaluate_pnc_group_request(
 ) -> PncGroupBindingDecision:
     """Evaluate a request against G1Q3 RCA Feishu business surfaces.
 
-    An explicit Feishu Project issue URL is read-only by default. In the two
+    An explicit Feishu Project issue URL is read-only by default. In the three
     fixed RCA groups only, a command-prefix action can enter the durable manual
     control plane; authorization and real-mention checks happen at the gateway
     boundary. Number-only and case-only handling remains scoped below.
@@ -712,10 +720,7 @@ def evaluate_pnc_group_request(
     if not _is_feishu(platform):
         return PncGroupBindingDecision(decision="allow")
     normalized_chat_id = _normalize(chat_id)
-    bound_chat = normalized_chat_id in {
-        G1Q3_RCA_GROUP_ID,
-        PNC_ALL_BUSINESS_TEST_GROUP_ID,
-    }
+    bound_chat = normalized_chat_id in G1Q3_RCA_MANUAL_GROUP_IDS
     current_identities = _extract_feishu_issue_identities(
         text or "",
         supplemental_urls=issue_link_urls,

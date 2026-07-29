@@ -1,9 +1,16 @@
 import pytest
 
-from gateway.pnc_group_binding import evaluate_pnc_group_request
+from gateway.pnc_group_binding import (
+    G1Q3_RCA_GROUP_ID,
+    G1Q3_RCA_MANUAL_GROUP_IDS,
+    INTEGRATION_TOOLS_INTAKE_GROUP_ID,
+    PNC_ALL_BUSINESS_TEST_GROUP_ID,
+    evaluate_pnc_group_request,
+    is_g1q3_rca_bound_chat,
+)
 
 
-G1Q3_GROUP_ID = "oc_6cfc782212009ff4cd815349909dd423"
+G1Q3_GROUP_ID = G1Q3_RCA_GROUP_ID
 
 
 def decide(text: str, *, chat_id: str = G1Q3_GROUP_ID, **kwargs):
@@ -74,6 +81,40 @@ def test_explicit_rerun_debug_and_emergency_actions_have_bounded_modes():
         decision = decide(text)
         assert decision.route_surface == "rca_manual_intake"
         assert decision.handoff_contract["mode"] == mode
+
+
+@pytest.mark.parametrize(
+    "chat_id",
+    sorted(G1Q3_RCA_MANUAL_GROUP_IDS),
+)
+def test_full_url_rerun_is_available_only_in_each_canonical_group(chat_id):
+    url = "https://project.feishu.cn/g1q3/issue/detail/7013527412"
+
+    decision = decide(f"重新分析 {url}", chat_id=chat_id)
+
+    assert decision.decision == "accepted"
+    assert decision.route_surface == "rca_manual_intake"
+    assert decision.handoff_contract["mode"] == "rerun"
+    assert decision.handoff_contract["issue_url"] == url
+
+
+def test_bare_issue_number_does_not_enter_rerun_admission():
+    decision = decide("重新分析 7013527412")
+
+    assert decision.route_surface != "rca_manual_intake"
+    assert not decision.handoff_contract or decision.handoff_contract.get("mode") != "rerun"
+
+
+def test_canonical_group_inventory_includes_config_only_intake_group():
+    assert G1Q3_RCA_MANUAL_GROUP_IDS == frozenset(
+        {
+            G1Q3_RCA_GROUP_ID,
+            PNC_ALL_BUSINESS_TEST_GROUP_ID,
+            INTEGRATION_TOOLS_INTAKE_GROUP_ID,
+        }
+    )
+    assert all(is_g1q3_rca_bound_chat(chat_id) for chat_id in G1Q3_RCA_MANUAL_GROUP_IDS)
+    assert is_g1q3_rca_bound_chat("oc_outside") is False
 
 
 @pytest.mark.parametrize(
@@ -344,9 +385,10 @@ def test_bare_issue_url_and_status_question_remain_read_only():
         assert decision.handoff_contract["read_only"] is True
 
 
-def test_manual_action_outside_fixed_groups_remains_read_only():
+@pytest.mark.parametrize("action", ("分析这个问题", "重新分析"))
+def test_manual_action_outside_fixed_groups_remains_read_only(action):
     url = "https://project.feishu.cn/g1q3/issue/detail/7013527412"
-    decision = decide(f"分析这个问题 {url}", chat_id="oc_other")
+    decision = decide(f"{action} {url}", chat_id="oc_other")
     assert decision.route_surface == "rca_kafka_issue_status"
     assert decision.handoff_contract["read_only"] is True
 

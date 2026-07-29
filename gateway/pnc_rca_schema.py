@@ -104,6 +104,14 @@ def validate_issue_context_fields(issue_context: RcaIssueContext) -> tuple[RcaIs
                 "retryable": False,
                 "business_profile": profile,
             }
+    if issue_context.source_quality == "fallback_raw_text":
+        return dataclasses_replace(issue_context, is_pdcl_format=False), {
+            "kind": "issue_field_untrusted_remote_data_reference",
+            "sub_kind": "fallback_raw_text",
+            "field": "问题数据地址_PDCL",
+            "message": "问题数据地址_PDCL 来自回退文本，未证明为具名字段取值",
+            "retryable": True,
+        }
     source_value = _sanitize_string(issue_context.pdcl_download_cmd)
     if not source_value:
         return dataclasses_replace(issue_context, is_pdcl_format=False), {
@@ -406,7 +414,15 @@ def build_execution_request(
     """Build the fixed VM execution request contract from host intake context."""
     if allow_download:
         raise ValueError("MDI download is forbidden by the RCA remote-read contract")
+    source_error = None
+    if issue_context.source_quality in {"fallback_raw_text", "unavailable"}:
+        source_error = RemoteDataAccessError(
+            "issue_field_untrusted_remote_data_reference",
+            f"source quality {issue_context.source_quality} cannot supply a remote reference",
+        )
     try:
+        if source_error is not None:
+            raise source_error
         data_access = build_remote_data_access(issue_context.pdcl_download_cmd)
     except RemoteDataAccessError as exc:
         if not issue_context.blockers:

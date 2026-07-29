@@ -5,10 +5,12 @@ import json
 from pathlib import Path
 import tempfile
 import threading
+from unittest.mock import AsyncMock
 
 import pytest
 
 from gateway import run as gateway_run
+import gateway.platforms.feishu as feishu_adapter_module
 from gateway.admission.controller import AdmissionController
 from gateway.admission.worker import QueueWorker
 from gateway.config import Platform
@@ -34,17 +36,26 @@ from hermes_constants import reset_hermes_home_override, set_hermes_home_overrid
 G1Q3_GROUP_ID = "oc_6cfc782212009ff4cd815349909dd423"
 
 
-def test_rca_manual_chat_allowlist_accepts_explicit_non_g1q3_groups(monkeypatch):
-    groups = {
-        "oc_mdrive4_authorized_group_001",
-        "oc_cross_business_authorized_group_002",
-    }
+def test_rca_manual_chat_allowlist_accepts_canonical_three_group_subset(monkeypatch):
+    groups = gateway_run.G1Q3_RCA_MANUAL_GROUP_IDS
     monkeypatch.setenv("HERMES_RCA_MANUAL_CHAT_IDS", ",".join(sorted(groups)))
 
     allowed, valid, _digest = gateway_run._g1q3_manual_chat_allowlist()
 
     assert valid is True
     assert allowed == frozenset(groups)
+
+
+def test_rca_manual_chat_allowlist_rejects_mixed_outside_group(monkeypatch):
+    monkeypatch.setenv(
+        "HERMES_RCA_MANUAL_CHAT_IDS",
+        f"{G1Q3_GROUP_ID},oc_outside_authorized_group_001",
+    )
+
+    allowed, valid, _digest = gateway_run._g1q3_manual_chat_allowlist()
+
+    assert valid is False
+    assert allowed == frozenset()
 
 
 def _gateway_runtime_identity() -> dict:
@@ -60,6 +71,20 @@ def _gateway_runtime_identity() -> dict:
         "runtime_files_sha256": "b" * 64,
         "public_config_sha256": "c" * 64,
         "loaded_runtime_sha256": "d" * 64,
+    }
+
+
+def _manual_admission_result() -> dict[str, object]:
+    return {
+        "schema_version": "pnc_rca_manual_admission_result_v1",
+        "outcome": "created",
+        "business_key": "g1q3-rca-business-1",
+        "submission_key": "g1q3-rca-s1-" + "a" * 64,
+        "generation": 1,
+        "source_id": "g1q3-rca-source-1",
+        "subscription_key": "g1q3-rca-subscription-1",
+        "state": "pending",
+        "reason": "manual_explicit_issue_action",
     }
 
 
@@ -299,6 +324,45 @@ async def test_g1q3_policy_evaluator_exception_sets_retryable_transport_marker(
 
 
 @pytest.mark.asyncio
+async def test_durable_manual_route_defers_inline_clarify_card_provider_write(
+    monkeypatch,
+    tmp_path,
+):
+    runner = make_runner(receipt_dir=tmp_path / "receipts")
+    event = make_feishu_event("@PNC-Agent 分析这个问题")
+    event.metadata["pnc_rca_provider_writes_deferred"] = True
+    decision = PncGroupBindingDecision(
+        decision="clarify",
+        group_binding_id=G1Q3_RCA_GROUP_BINDING_ID,
+        business_line_ref="rca",
+        project_space_ref="g1q3_rca",
+        template_id="rca_issue_intake",
+        route_surface="rca_manual_intake",
+        risk_gate="manual_intake_control_store",
+        reason="issue_identity_missing",
+        user_message="请补充 G1Q3 问题单链接后再试。",
+        clarify_options=(("add_issue", "补充问题单"),),
+    )
+    monkeypatch.setenv("HERMES_RCA_MANUAL_INTAKE_ENABLED", "true")
+    monkeypatch.setenv("HERMES_RCA_MANUAL_CHAT_IDS", G1Q3_GROUP_ID)
+    monkeypatch.setattr(
+        gateway_run.GatewayRunner,
+        "_is_user_authorized",
+        lambda self, source: True,
+    )
+    monkeypatch.setattr(
+        "gateway.pnc_group_binding.evaluate_pnc_group_request",
+        lambda **_kwargs: decision,
+    )
+    runner._send_pnc_clarify_card = AsyncMock(return_value=True)
+
+    response = await gateway_run.GatewayRunner._handle_message(runner, event)
+
+    assert response == "请补充 G1Q3 问题单链接后再试。"
+    runner._send_pnc_clarify_card.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_explicit_issue_action_uses_manual_control_store_and_acks_current_topic(
     monkeypatch,
 ):
@@ -314,12 +378,7 @@ async def test_explicit_issue_action_uses_manual_control_store_and_acks_current_
     monkeypatch.setattr(
         gateway_run,
         "_admit_g1q3_manual_trigger",
-        lambda **kwargs: calls.append(kwargs)
-        or {
-            "outcome": "created",
-            "submission_key": "g1q3-rca-s1-" + "a" * 64,
-            "generation": 1,
-        },
+        lambda **kwargs: calls.append(kwargs) or _manual_admission_result(),
     )
 
     response = await gateway_run.GatewayRunner._handle_message(runner, event)
@@ -402,11 +461,20 @@ async def test_admission_enabled_feishu_queue_reaches_manual_control_store_from_
     monkeypatch.setattr(
         gateway_run,
         "_admit_g1q3_manual_trigger",
-        lambda **kwargs: calls.append(kwargs)
-        or {
-            "outcome": "created",
-            "submission_key": "g1q3-rca-s1-" + "a" * 64,
-            "generation": 1,
+        lambda **kwargs: calls.append(kwargs) or _manual_admission_result(),
+    )
+    monkeypatch.setattr(
+        feishu_adapter_module,
+        "_require_current_rca_manual_activation_epoch",
+        lambda: {"epoch_id": "epoch-gray-1", "state": "steady_active"},
+    )
+    monkeypatch.setattr(
+        feishu_adapter_module,
+        "_require_current_rca_manual_admission",
+        lambda _admission, _identity: {
+            "epoch_id": "epoch-gray-1",
+            "state": "steady_active",
+            "ledger_id": 1,
         },
     )
 
@@ -448,6 +516,9 @@ async def test_admission_enabled_feishu_queue_reaches_manual_control_store_from_
     await worker._process_item(item)
 
     assert len(calls) == 1
+    assert item.result["external_write_authorized"] is False
+    assert item.result["external_write_suppressed"] is True
+    assert item.result["feishu_write_performed"] is False
     observed_call = dict(calls[0])
     observed_authorization = observed_call.pop("manual_authorization")
     observed_runtime_identity = observed_call.pop("gateway_runtime_identity")
@@ -476,11 +547,7 @@ async def test_admission_enabled_feishu_queue_reaches_manual_control_store_from_
     assert item.result["durable_admission"] is True
     assert item.result["durable_feishu_completion"] is True
     assert adapter._message_processing_completed(event.message_id) is True
-    assert sent[-1]["reply_to"] == "om_parent"
-    assert sent[-1]["metadata"] == {
-        "thread_id": "topic:om_test_message",
-        "reply_to_message_id": "om_parent",
-    }
+    assert sent == []
 
 
 @pytest.mark.asyncio
@@ -799,13 +866,23 @@ async def test_rerun_denied_for_regular_user_is_audited_without_admission(
 
 
 @pytest.mark.asyncio
-async def test_rerun_operator_reaches_control_store_with_operator_proof(monkeypatch):
+@pytest.mark.parametrize("chat_id", sorted(gateway_run.G1Q3_RCA_MANUAL_GROUP_IDS))
+async def test_full_url_rerun_reaches_control_store_from_each_canonical_group(
+    monkeypatch,
+    chat_id,
+):
     runner = make_runner()
     issue_url = "https://project.feishu.cn/g1q3/issue/detail/7013527412"
-    event = make_feishu_event(f"@PNC-Agent 重跑这个问题 {issue_url}")
+    event = make_feishu_event(
+        f"@PNC-Agent 重跑这个问题 {issue_url}",
+        chat_id=chat_id,
+    )
     calls = []
     monkeypatch.setenv("HERMES_RCA_MANUAL_INTAKE_ENABLED", "true")
-    monkeypatch.setenv("HERMES_RCA_MANUAL_CHAT_IDS", G1Q3_GROUP_ID)
+    monkeypatch.setenv(
+        "HERMES_RCA_MANUAL_CHAT_IDS",
+        ",".join(sorted(gateway_run.G1Q3_RCA_MANUAL_GROUP_IDS)),
+    )
     monkeypatch.setenv("HERMES_RCA_MANUAL_OPERATOR_ENABLED", "true")
     monkeypatch.setenv("HERMES_RCA_MANUAL_OPERATOR_USER_IDS", "ou_test_user")
     monkeypatch.setattr(
@@ -827,6 +904,39 @@ async def test_rerun_operator_reaches_control_store_with_operator_proof(monkeypa
     assert "RCA 已受理" in response
     assert calls[0]["mode"] == "rerun"
     assert calls[0]["operator_authorized"] is True
+    assert calls[0]["issue_url"] == issue_url
+    assert calls[0]["chat_id"] == chat_id
+
+
+def test_issue_status_rerun_guidance_uses_current_canonical_url():
+    issue_url = "https://project.feishu.cn/g1q3/issue/detail/7013527412"
+
+    response = gateway_run._format_g1q3_kafka_issue_status(
+        "7013527412",
+        None,
+        issue_url=issue_url,
+    )
+
+    assert f"重新分析 {issue_url}" in response
+
+
+def test_direct_manual_admission_rejects_outside_group_before_store_access():
+    from gateway.pnc_rca_control_store import ManualRcaAdmissionError
+
+    with pytest.raises(ManualRcaAdmissionError, match="manual_chat_allowlist_invalid"):
+        gateway_run._admit_g1q3_manual_trigger(
+            issue_url="https://project.feishu.cn/g1q3/issue/detail/7013527412",
+            mode="rerun",
+            chat_id="oc_outside_authorized_group_001",
+            thread_id="topic:om_test",
+            message_id="om_test",
+            requester_id="ou_test_user",
+            submit_enabled=True,
+            operator_authorized=True,
+            operator_rate_limit=3,
+            operator_rate_window_seconds=600,
+            allowed_chat_ids=("oc_outside_authorized_group_001",),
+        )
 
 
 @pytest.mark.parametrize("configured", ["", "oc_unknown"])
@@ -911,6 +1021,7 @@ def test_manual_gateway_passes_exact_kafka_policy_and_high_watermark(
             ]
         ),
         "HERMES_RCA_KAFKA_OUTBOX_HIGH_WATERMARK": "7",
+        "HERMES_RCA_ACTIVATION_REQUIRED": "false",
     }
     for name, value in policy_env.items():
         monkeypatch.setenv(name, value)
@@ -992,6 +1103,7 @@ def test_manual_gateway_w3_uses_official_preread_before_admission(
 
     control_path = tmp_path / "control.sqlite3"
     monkeypatch.setenv("HERMES_RCA_KAFKA_CONTROL_DB_PATH", str(control_path))
+    monkeypatch.setenv("HERMES_RCA_ACTIVATION_REQUIRED", "false")
     RcaControlStore(control_path)
     config = _w3_manual_admission_runtime_config()
     preread_calls = []

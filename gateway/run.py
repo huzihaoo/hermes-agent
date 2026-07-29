@@ -1828,6 +1828,14 @@ def _integration_tools_intake_chat_ids(config: dict | None = None) -> set[str]:
 
 G1Q3_RCA_GROUP_ID = "oc_6cfc782212009ff4cd815349909dd423"
 PNC_ALL_BUSINESS_TEST_GROUP_ID = "oc_16614f4ba25b8c88b69c0b8e9ebc2fb5"
+INTEGRATION_TOOLS_INTAKE_GROUP_ID = "oc_35039b74ffb63ab8100343dc32218c57"
+G1Q3_RCA_MANUAL_GROUP_IDS = frozenset(
+    {
+        G1Q3_RCA_GROUP_ID,
+        PNC_ALL_BUSINESS_TEST_GROUP_ID,
+        INTEGRATION_TOOLS_INTAKE_GROUP_ID,
+    }
+)
 
 
 def _looks_like_g1q3_rca_request_for_business_routing(text: str) -> bool:
@@ -2140,9 +2148,13 @@ def _g1q3_manual_chat_allowlist() -> tuple[frozenset[str], bool, str]:
             sorted(requested), ensure_ascii=True, separators=(",", ":")
         ).encode("utf-8")
     ).hexdigest()
-    valid = bool(requested) and len(requested) <= 64 and all(
-        re.fullmatch(r"oc_[A-Za-z0-9_-]{8,255}", item)
-        for item in requested
+    valid = (
+        bool(requested)
+        and requested.issubset(G1Q3_RCA_MANUAL_GROUP_IDS)
+        and all(
+            re.fullmatch(r"oc_[A-Za-z0-9_-]{8,255}", item)
+            for item in requested
+        )
     )
     return (requested if valid else frozenset(), valid, digest)
 
@@ -2425,9 +2437,13 @@ def _admit_g1q3_manual_trigger(
     allowed_chats = frozenset(
         str(item or "").strip() for item in allowed_chat_ids if str(item or "").strip()
     )
-    if not allowed_chats or len(allowed_chats) > 64 or not all(
-        re.fullmatch(r"oc_[A-Za-z0-9_-]{8,255}", item)
-        for item in allowed_chats
+    if (
+        not allowed_chats
+        or not allowed_chats.issubset(G1Q3_RCA_MANUAL_GROUP_IDS)
+        or not all(
+            re.fullmatch(r"oc_[A-Za-z0-9_-]{8,255}", item)
+            for item in allowed_chats
+        )
     ):
         raise ManualRcaAdmissionError("manual_chat_allowlist_invalid")
     try:
@@ -2681,15 +2697,33 @@ def _find_g1q3_rca_task_by_issue_identity(
             conn.close()
 
 
-def _format_g1q3_kafka_issue_status(work_item_id: str, task: dict | None) -> str:
+def _format_g1q3_kafka_issue_status(
+    work_item_id: str,
+    task: dict | None,
+    *,
+    issue_url: str = "",
+) -> str:
     """Render an L1-only durable RCA status response for a Feishu issue URL."""
     issue_id = str(work_item_id or "").strip()
+    normalized_issue_url = str(issue_url or "").strip().rstrip("/")
+    if re.fullmatch(
+        rf"https://project\.feishu\.cn/[A-Za-z0-9_-]+/issue/detail/{re.escape(issue_id)}",
+        normalized_issue_url,
+        re.IGNORECASE,
+    ) is None:
+        normalized_issue_url = ""
+    rerun_guidance = (
+        "如需重新分析，请在固定群真实 @小助手并发送："
+        f"重新分析 {normalized_issue_url}。"
+        if normalized_issue_url
+        else "固定群手工入口需真实 @、明确动作和完整问题链接。"
+    )
     boundary = "本次仅做只读状态查询，不会手工创建、重跑任务或进入通用 Agent。"
     if not isinstance(task, dict) or not str(task.get("task_id") or "").strip():
         return (
             f"飞书问题 {issue_id} 当前尚未查询到对应 RCA 任务。\n"
-            "Kafka 自动入口请等待 creation event 被消费；固定群手工入口需真实 @、"
-            "明确动作和完整问题链接。\n"
+            "Kafka 自动入口请等待 creation event 被消费。\n"
+            f"{rerun_guidance}\n"
             f"{boundary}"
         )
     task_id = str(task.get("task_id") or "").strip()
@@ -2709,6 +2743,7 @@ def _format_g1q3_kafka_issue_status(work_item_id: str, task: dict | None) -> str
     ]
     if milestone:
         lines.append(f"最新进展：{milestone[:220]}")
+    lines.append(rerun_guidance)
     lines.append(boundary)
     return "\n".join(lines)
 
@@ -11434,7 +11469,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "没有创建分析任务。"
                         )
                 if _pnc_decision.decision == "clarify":
-                    if await self._send_pnc_clarify_card(source, event, _pnc_decision):
+                    _provider_writes_deferred = bool(
+                        isinstance(event.metadata, dict)
+                        and event.metadata.get(
+                            "pnc_rca_provider_writes_deferred"
+                        )
+                        is True
+                    )
+                    if (
+                        not _provider_writes_deferred
+                        and await self._send_pnc_clarify_card(
+                            source, event, _pnc_decision
+                        )
+                    ):
                         return None  # button card sent; its body carries the guidance
                     return _pnc_decision.user_message or "请补充 G1Q3 case 后再发一次。"
                 if _pnc_decision.decision == "reject":
@@ -11480,7 +11527,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 else None
                             )
                             return _format_g1q3_kafka_issue_status(
-                                _manual_issue_id, _manual_existing
+                                _manual_issue_id,
+                                _manual_existing,
+                                issue_url=str(_handoff.get("issue_url") or ""),
                             )
                         if (
                             not _manual_authorization.get(
@@ -11629,7 +11678,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 ),
                             }
                         return (
-                            _format_g1q3_kafka_issue_status(_issue_id, _kafka_task)
+                            _format_g1q3_kafka_issue_status(
+                                _issue_id,
+                                _kafka_task,
+                                issue_url=str(_handoff.get("issue_url") or ""),
+                            )
                             if _issue_id
                             else _format_g1q3_kafka_case_status(
                                 _case_id,

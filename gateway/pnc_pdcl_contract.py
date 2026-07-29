@@ -9,6 +9,11 @@ ALLOWED_RESOURCES = {"raw", "clip", "event", "eventset", "group", "refresh", "re
 FORBIDDEN_VERBS = {"upload", "login", "logout", "upgrade", "utils"}
 ID_VALUE_RE = re.compile(r"^[A-Za-z0-9_,:-]+$")
 RAW_VALUE_RE = re.compile(r"^[A-Za-z0-9_,:/.-]+$")
+PLACEHOLDER_ID_RE = re.compile(
+    r"^(?:default|fallback|placeholder|unknown|unset|missing|none|null|todo|tbd)"
+    r"(?:[-_:].*)?$",
+    re.IGNORECASE,
+)
 DANGEROUS_CHARS = set(";|&$><`(){}")
 ADDRESS_FLAGS = {
     "-u": ("clip_ukeys", ID_VALUE_RE),
@@ -24,6 +29,17 @@ SAVE_FLAGS = {"-s", "--save-path"}
 REBUILD_KEYS = ("ticket_ids", "event_ids", "clip_ukeys", "raw_refs")
 
 
+def is_placeholder_reference_value(value: str) -> bool:
+    """Return whether a locator is a default/fallback sentinel, not an ID."""
+    text = str(value or "").strip()
+    compact = re.sub(r"[-_:]", "", text)
+    return bool(
+        not text
+        or PLACEHOLDER_ID_RE.fullmatch(text)
+        or (compact and set(compact) == {"0"})
+    )
+
+
 def _split_values(value: str, pattern: re.Pattern[str]) -> list[str] | None:
     text = str(value or "").strip()
     if not text or any(ch.isspace() for ch in text) or any(ch in DANGEROUS_CHARS for ch in text):
@@ -31,6 +47,8 @@ def _split_values(value: str, pattern: re.Pattern[str]) -> list[str] | None:
     if not pattern.fullmatch(text):
         return None
     parts = [part for part in text.split(",") if part]
+    if pattern is ID_VALUE_RE and any(is_placeholder_reference_value(part) for part in parts):
+        return None
     return parts or None
 
 

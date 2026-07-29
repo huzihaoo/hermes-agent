@@ -64,6 +64,22 @@ def _make_event(chat_id: str, thread_id: str, message_id: str = "1") -> MessageE
     )
 
 
+def _make_pnc_manual_event(message_id: str = "om_manual") -> MessageEvent:
+    return MessageEvent(
+        text=(
+            "分析 https://project.feishu.cn/t03o4q/issue/detail/7008267126"
+        ),
+        source=SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="oc_6cfc782212009ff4cd815349909dd423",
+            chat_type="group",
+            thread_id=f"topic:{message_id}",
+        ),
+        message_id=message_id,
+        metadata={"pnc_rca_provider_writes_deferred": True},
+    )
+
+
 class TestBasePlatformTopicSessions:
     @pytest.mark.asyncio
     async def test_handle_message_does_not_interrupt_different_topic(self, monkeypatch):
@@ -194,6 +210,62 @@ class TestBasePlatformTopicSessions:
         assert adapter.processing_hooks == [
             ("start", "1"),
             ("complete", "1", ProcessingOutcome.FAILURE),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_pnc_manual_response_is_receipt_only_at_base_send_boundary(self):
+        adapter = DummyTelegramAdapter()
+        adapter.platform = Platform.FEISHU
+
+        async def handler(event):
+            event.metadata["pnc_group_binding"] = {
+                "decision": "accepted",
+                "route_surface": "rca_manual_intake",
+            }
+            return "RCA 已受理。"
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        adapter.set_message_handler(handler)
+        adapter._keep_typing = hold_typing
+        event = _make_pnc_manual_event()
+
+        await adapter._process_message_background(
+            event,
+            build_session_key(event.source),
+        )
+
+        assert adapter.sent == []
+        assert adapter.processing_hooks == [
+            ("start", "om_manual"),
+            ("complete", "om_manual", ProcessingOutcome.SUCCESS),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_pnc_manual_exception_does_not_send_generic_error(self):
+        adapter = DummyTelegramAdapter()
+        adapter.platform = Platform.FEISHU
+
+        async def handler(_event):
+            raise RuntimeError("manual admission failed")
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        adapter.set_message_handler(handler)
+        adapter._keep_typing = hold_typing
+        event = _make_pnc_manual_event("om_manual_error")
+
+        await adapter._process_message_background(
+            event,
+            build_session_key(event.source),
+        )
+
+        assert adapter.sent == []
+        assert adapter.processing_hooks == [
+            ("start", "om_manual_error"),
+            ("complete", "om_manual_error", ProcessingOutcome.FAILURE),
         ]
 
     @pytest.mark.asyncio

@@ -23,6 +23,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from gateway.platforms.feishu import FeishuAdapter  # noqa: E402
+from gateway.pnc_group_binding import (  # noqa: E402
+    G1Q3_RCA_GROUP_ID,
+    G1Q3_RCA_MANUAL_GROUP_IDS,
+    INTEGRATION_TOOLS_INTAKE_GROUP_ID,
+    PNC_ALL_BUSINESS_TEST_GROUP_ID,
+)
 from hermes_constants import get_config_path  # noqa: E402
 
 DEFAULT_CONFIG = get_config_path()
@@ -35,22 +41,31 @@ class BusinessGroup:
     chat_id: str
     require_mention: bool | None = None
     require_api_poll: bool = False
+    config_only_intake: bool = False
 
 
 BUSINESS_GROUPS: tuple[BusinessGroup, ...] = (
     BusinessGroup(
         slug="pnc",
         label="PNC",
-        chat_id="oc_16614f4ba25b8c88b69c0b8e9ebc2fb5",
+        chat_id=PNC_ALL_BUSINESS_TEST_GROUP_ID,
         require_mention=None,
         require_api_poll=False,
     ),
     BusinessGroup(
         slug="g1q3-rca",
         label="G1Q3 RCA",
-        chat_id="oc_6cfc782212009ff4cd815349909dd423",
+        chat_id=G1Q3_RCA_GROUP_ID,
         require_mention=True,
         require_api_poll=True,
+    ),
+    BusinessGroup(
+        slug="integration-tools-intake",
+        label="Integration tools intake",
+        chat_id=INTEGRATION_TOOLS_INTAKE_GROUP_ID,
+        require_mention=None,
+        require_api_poll=True,
+        config_only_intake=True,
     ),
 )
 
@@ -82,6 +97,19 @@ def _feishu_extra(config: dict[str, Any]) -> dict[str, Any]:
         return {}
     extra = feishu.get("extra") or {}
     return extra if isinstance(extra, dict) else {}
+
+
+def _integration_tools_intake_chat_ids(config: dict[str, Any]) -> set[str]:
+    business_lines = config.get("business_lines") or {}
+    if not isinstance(business_lines, dict):
+        return set()
+    integration_tools = business_lines.get("integration_tools") or {}
+    if not isinstance(integration_tools, dict):
+        return set()
+    values: list[str] = []
+    for key in ("intake_chat_ids", "intake_chat_id", "intake_group_ids", "intake_group_id"):
+        values.extend(_as_list(integration_tools.get(key)))
+    return set(values)
 
 
 
@@ -127,6 +155,8 @@ def repair_config(config_path: Path = DEFAULT_CONFIG, *, backup: bool = True) ->
         changed.append("platforms.feishu.extra.group_rules")
 
     for group in BUSINESS_GROUPS:
+        if group.config_only_intake:
+            continue
         desired: dict[str, Any] = {"policy": "open"}
         if group.require_mention is not None:
             desired["require_mention"] = group.require_mention
@@ -194,7 +224,10 @@ def run_guard(config_path: Path = DEFAULT_CONFIG) -> dict[str, Any]:
     group_rules = extra.get("group_rules") if isinstance(extra.get("group_rules"), dict) else {}
     allowed_chats = set(_as_list(extra.get("group_allowed_chats")))
     api_poll_chats = set(_as_list(extra.get("api_poll_chat_ids")))
+    integration_tools_intake_chats = _integration_tools_intake_chat_ids(config)
     default_policy = str(extra.get("default_group_policy") or "").strip().lower()
+    canonical_groups = set(G1Q3_RCA_MANUAL_GROUP_IDS)
+    audited_groups = {group.chat_id for group in BUSINESS_GROUPS}
 
     effective_settings = FeishuAdapter._load_settings(extra)
     effective_rules = effective_settings.group_rules
@@ -203,6 +236,31 @@ def run_guard(config_path: Path = DEFAULT_CONFIG) -> dict[str, Any]:
     checks["business_groups"] = []
     checks["group_allowed_chats"] = sorted(allowed_chats)
     checks["api_poll_chat_ids"] = sorted(api_poll_chats)
+    checks["integration_tools_intake_chat_ids"] = sorted(
+        integration_tools_intake_chats
+    )
+    checks["canonical_group_ids"] = sorted(canonical_groups)
+
+    if audited_groups != canonical_groups:
+        errors.append("canonical PNC group audit inventory is incomplete")
+    unexpected_allowed = sorted(allowed_chats - canonical_groups)
+    if unexpected_allowed:
+        errors.append(
+            "non-canonical groups present in group_allowed_chats: "
+            + ",".join(unexpected_allowed)
+        )
+    unexpected_open_rules = sorted(
+        chat_id
+        for chat_id, rule in group_rules.items()
+        if chat_id not in canonical_groups
+        and isinstance(rule, dict)
+        and str(rule.get("policy") or "").strip().lower() == "open"
+    )
+    if unexpected_open_rules:
+        errors.append(
+            "non-canonical groups have explicit open policy: "
+            + ",".join(unexpected_open_rules)
+        )
 
     for group in BUSINESS_GROUPS:
         explicit = group_rules.get(group.chat_id)
@@ -221,6 +279,10 @@ def run_guard(config_path: Path = DEFAULT_CONFIG) -> dict[str, Any]:
             "in_api_poll_chat_ids": group.chat_id in api_poll_chats,
             "explicit_require_mention": explicit_require_mention,
             "effective_require_mention": effective_require_mention,
+            "config_only_intake": group.config_only_intake,
+            "in_integration_tools_intake": (
+                group.chat_id in integration_tools_intake_chats
+            ),
         }
         checks["business_groups"].append(row)
 
@@ -231,6 +293,14 @@ def run_guard(config_path: Path = DEFAULT_CONFIG) -> dict[str, Any]:
             )
         if group.chat_id not in allowed_chats:
             errors.append(f"{group.label} missing from group_allowed_chats: {group.chat_id}")
+        if (
+            group.config_only_intake
+            and group.chat_id not in integration_tools_intake_chats
+        ):
+            errors.append(
+                f"{group.label} missing from integration-tools intake config: "
+                f"{group.chat_id}"
+            )
         if group.require_api_poll and group.chat_id not in api_poll_chats:
             warnings.append(f"{group.label} missing from api_poll_chat_ids fallback: {group.chat_id}")
         if group.require_mention is not None:

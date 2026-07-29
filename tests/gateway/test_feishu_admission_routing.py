@@ -11,6 +11,8 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+import gateway.platforms.feishu as feishu_adapter_module
+import gateway.pnc_rca_provider_fence as provider_fence_module
 from gateway.admission.controller import AdmissionController
 from gateway.admission.types import QueueItem
 from gateway.admission.worker import QueueWorker
@@ -20,8 +22,15 @@ from gateway.platforms.feishu import (
     G1Q3_RCA_GROUP_ID,
     PNC_ALL_BUSINESS_TEST_GROUP_ID,
     FeishuAdapter,
+    _RcaManualExternalWriteFenceRejected,
     _build_feishu_queue_event_context,
+    _enforce_rca_manual_external_write_fence,
     _looks_like_g1q3_rca_request_for_admission,
+)
+from gateway.pnc_rca_provider_fence import (
+    RcaProviderWriteClaim,
+    build_historical_epoch_provider_claim,
+    build_manual_provider_write_claim,
 )
 from gateway.session import SessionSource
 
@@ -50,6 +59,475 @@ def _adapter_without_init(*, lane: str = "heavy") -> FeishuAdapter:
 
     adapter.send = fake_send
     return adapter
+
+
+def _manual_admission_result() -> dict[str, object]:
+    return {
+        "schema_version": "pnc_rca_manual_admission_result_v1",
+        "outcome": "created",
+        "business_key": "g1q3-rca-business-1",
+        "submission_key": "g1q3-rca-s1-" + "a" * 64,
+        "generation": 1,
+        "source_id": "g1q3-rca-source-1",
+        "subscription_key": "g1q3-rca-subscription-1",
+        "state": "pending",
+        "reason": "manual_explicit_issue_action",
+    }
+
+
+def _manual_route_metadata(*, authorized: bool) -> dict[str, object]:
+    return {
+        "pnc_group_binding": {
+            "decision": "accepted",
+            "route_surface": "rca_manual_intake",
+        },
+        "pnc_manual_authorization": {"authorized": authorized},
+    }
+
+
+def _manual_source_identity() -> dict[str, str]:
+    return {
+        "chat_id": G1Q3_RCA_GROUP_ID,
+        "thread_id": "topic:om_safe_off",
+        "message_id": "om_safe_off",
+        "requester_id": "ou_user",
+    }
+
+
+def test_manual_external_write_fence_rejects_safe_off_reply_without_admission():
+    metadata = _manual_route_metadata(authorized=False)
+
+    with pytest.raises(
+        _RcaManualExternalWriteFenceRejected,
+        match="activation_admission_missing",
+    ):
+        _enforce_rca_manual_external_write_fence(
+            metadata,
+            "G1Q3 RCA 人工入口当前处于安全关闭状态，本次未创建任务。",
+            source_identity=_manual_source_identity(),
+        )
+
+
+def test_manual_external_write_fence_requires_live_activation_epoch(monkeypatch):
+    metadata = _manual_route_metadata(authorized=True)
+    metadata["pnc_manual_rca_admission"] = _manual_admission_result()
+    monkeypatch.setattr(
+        provider_fence_module,
+        "revalidate_provider_write_claim",
+        Mock(side_effect=RuntimeError("resident_activation_epoch_missing")),
+    )
+
+    with pytest.raises(
+        _RcaManualExternalWriteFenceRejected,
+        match="activation_binding_invalid",
+    ):
+        _enforce_rca_manual_external_write_fence(
+            metadata,
+            "RCA 已受理。",
+            source_identity=_manual_source_identity(),
+        )
+
+
+def test_manual_external_write_fence_accepts_canonical_admission_in_active_epoch(
+    monkeypatch,
+):
+    metadata = _manual_route_metadata(authorized=True)
+    metadata["pnc_manual_rca_admission"] = _manual_admission_result()
+    monkeypatch.setattr(
+        provider_fence_module,
+        "revalidate_provider_write_claim",
+        lambda *_args, **_kwargs: {
+            "epoch_id": "epoch-gray-1",
+            "state": "steady_active",
+            "ledger_id": 1,
+        },
+    )
+
+    claim = _enforce_rca_manual_external_write_fence(
+        metadata,
+        "RCA 已受理。",
+        source_identity=_manual_source_identity(),
+    )
+
+    assert type(claim) is RcaProviderWriteClaim
+
+
+def test_provider_rejects_forged_claim_before_opening_control_store(monkeypatch):
+    monkeypatch.setattr(
+        provider_fence_module,
+        "_canonical_store",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("forged claim opened canonical control store")
+        ),
+    )
+
+    with pytest.raises(
+        provider_fence_module.ExternalWriteFenceError,
+        match="external_write_provider_claim_invalid",
+    ):
+        provider_fence_module.revalidate_provider_write_claim(
+            lambda: {"epoch_id": "forged"},
+            operation="feishu_thread_reply",
+            chat_id=G1Q3_RCA_GROUP_ID,
+            thread_id="topic:om_expected",
+        )
+
+
+def test_historical_provider_claim_rechecks_exact_target_and_epoch(monkeypatch):
+    class Store:
+        epoch_id = "epoch-gray-1"
+
+        def activation_epoch(self):
+            return {"epoch_id": self.epoch_id, "state": "bounded_active"}
+
+    store = Store()
+    monkeypatch.setattr(provider_fence_module, "_canonical_store", lambda: store)
+    monkeypatch.setattr(
+        provider_fence_module,
+        "_historical_effect_binding",
+        lambda _store, _authority: {
+            "effect_kind": "feishu_thread_reply",
+            "issue_url": "https://project.feishu.cn/t03o4q/issue/detail/7001",
+            "work_item_id": "7001",
+            "submission_key": "historical-rca-1",
+            "payload": {
+                "chat_id": G1Q3_RCA_GROUP_ID,
+                "thread_id": "topic:om_expected",
+            },
+        },
+    )
+    claim = build_historical_epoch_provider_claim(
+        epoch_id="epoch-gray-1",
+        effect_key="effect-historical-1",
+        delivery_id="delivery-historical-1",
+        lease_token="lease-historical-1",
+        lease_fence=1,
+        operations=("feishu_thread_reply",),
+        issue_target="https://project.feishu.cn/t03o4q/issue/detail/7001",
+        chat_id=G1Q3_RCA_GROUP_ID,
+        thread_id="topic:om_expected",
+        submission_key="historical-rca-1",
+    )
+
+    live = provider_fence_module.revalidate_provider_write_claim(
+        claim,
+        operation="feishu_thread_reply",
+        chat_id=G1Q3_RCA_GROUP_ID,
+        thread_id="topic:om_expected",
+    )
+    assert live["epoch_id"] == "epoch-gray-1"
+
+    with pytest.raises(
+        provider_fence_module.ExternalWriteFenceError,
+        match="external_write_fence_target_mismatch",
+    ):
+        provider_fence_module.revalidate_provider_write_claim(
+            claim,
+            operation="feishu_thread_reply",
+            chat_id=G1Q3_RCA_GROUP_ID,
+            thread_id="topic:om_wrong",
+        )
+
+    store.epoch_id = "epoch-gray-2"
+    with pytest.raises(
+        provider_fence_module.ExternalWriteFenceError,
+        match="external_write_fence_epoch_not_current",
+    ):
+        provider_fence_module.revalidate_provider_write_claim(
+            claim,
+            operation="feishu_thread_reply",
+            chat_id=G1Q3_RCA_GROUP_ID,
+            thread_id="topic:om_expected",
+        )
+
+
+@pytest.mark.asyncio
+async def test_durable_manual_no_epoch_stops_before_handler_or_any_feishu_write(
+    monkeypatch,
+):
+    event = MessageEvent(
+        source=SessionSource(
+            platform=Platform.FEISHU,
+            user_id="ou_user",
+            chat_id=G1Q3_RCA_GROUP_ID,
+            chat_type="group",
+            thread_id="topic:om_safe_off",
+        ),
+        text="分析 https://project.feishu.cn/t03o4q/issue/detail/7006868401",
+        message_type=MessageType.TEXT,
+        message_id="om_safe_off",
+        metadata={},
+    )
+    adapter = object.__new__(FeishuAdapter)
+    adapter.platform = Platform.FEISHU
+    adapter._chat_locks = OrderedDict()
+    adapter._reactions_enabled = lambda: True
+    adapter._add_ack_reaction = AsyncMock()
+    adapter._run_processing_hook = AsyncMock()
+    adapter._send_with_retry = AsyncMock()
+    adapter._message_handler = AsyncMock()
+    monkeypatch.setattr(
+        feishu_adapter_module,
+        "_require_current_rca_manual_activation_epoch",
+        Mock(side_effect=RuntimeError("resident_activation_epoch_missing")),
+    )
+
+    result = await adapter._process_durable_g1q3_queue_event(event)
+
+    assert result == {
+        "durable_admission": False,
+        "terminal_rejection": True,
+        "external_write_authorized": False,
+        "external_write_suppressed": True,
+        "feishu_write_performed": False,
+    }
+    adapter._message_handler.assert_not_awaited()
+    adapter._add_ack_reaction.assert_not_awaited()
+    adapter._run_processing_hook.assert_not_awaited()
+    adapter._send_with_retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_durable_manual_terminal_reply_is_suppressed_without_admission(
+    monkeypatch,
+):
+    event = MessageEvent(
+        source=SessionSource(
+            platform=Platform.FEISHU,
+            user_id="ou_user",
+            chat_id=G1Q3_RCA_GROUP_ID,
+            chat_type="group",
+            thread_id="topic:om_safe_off",
+        ),
+        text="分析 https://project.feishu.cn/t03o4q/issue/detail/7006868401",
+        message_type=MessageType.TEXT,
+        message_id="om_safe_off",
+        metadata={},
+    )
+    adapter = object.__new__(FeishuAdapter)
+    adapter.platform = Platform.FEISHU
+    adapter._chat_locks = OrderedDict()
+    adapter._send_with_retry = AsyncMock()
+
+    async def safe_off_handler(reconstructed):
+        reconstructed.metadata.update(_manual_route_metadata(authorized=False))
+        return "G1Q3 RCA 人工入口当前处于安全关闭状态，本次未创建任务。"
+
+    adapter._message_handler = safe_off_handler
+    monkeypatch.setattr(
+        feishu_adapter_module,
+        "_require_current_rca_manual_activation_epoch",
+        lambda: {"epoch_id": "epoch-gray-1", "state": "steady_active"},
+    )
+
+    result = await adapter._process_durable_g1q3_queue_event(event)
+
+    assert result["terminal_rejection"] is True
+    assert result["external_write_suppressed"] is True
+    assert result["feishu_write_performed"] is False
+    adapter._send_with_retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_feishu_provider_retry_rechecks_epoch_and_stops_after_revocation(
+    monkeypatch,
+):
+    adapter = object.__new__(FeishuAdapter)
+    live = True
+    guard_calls = 0
+
+    def provider_revalidate(_claim, **_kwargs):
+        nonlocal guard_calls
+        guard_calls += 1
+        if not live:
+            raise _RcaManualExternalWriteFenceRejected(
+                "rca_manual_external_write_activation_binding_invalid"
+            )
+        return {
+            "epoch_id": "epoch-gray-1",
+            "state": "steady_active",
+            "ledger_id": 1,
+            "chat_id": G1Q3_RCA_GROUP_ID,
+            "thread_id": "topic:om_safe_off",
+        }
+
+    async def first_provider_attempt(**_kwargs):
+        nonlocal live
+        live = False
+        raise RuntimeError("injected transient provider failure")
+
+    adapter._send_raw_message = AsyncMock(side_effect=first_provider_attempt)
+    monkeypatch.setattr(feishu_adapter_module.asyncio, "sleep", AsyncMock())
+    monkeypatch.setattr(
+        provider_fence_module,
+        "revalidate_provider_write_claim",
+        provider_revalidate,
+    )
+    provider_claim = build_manual_provider_write_claim(
+        _manual_admission_result(), _manual_source_identity()
+    )
+
+    with pytest.raises(
+        _RcaManualExternalWriteFenceRejected,
+        match="activation_binding_invalid",
+    ):
+        await adapter._feishu_send_with_retry(
+            chat_id=G1Q3_RCA_GROUP_ID,
+            msg_type="text",
+            payload='{"text":"RCA 已受理。"}',
+            reply_to="om_safe_off",
+            metadata={
+                "thread_id": "topic:om_safe_off",
+                "_pnc_rca_external_write_guard": provider_claim,
+            },
+        )
+
+    assert guard_calls == 2
+    adapter._send_raw_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_feishu_provider_rejects_forgeable_callable_before_raw_write():
+    adapter = object.__new__(FeishuAdapter)
+    adapter._send_raw_message = AsyncMock()
+
+    with pytest.raises(
+        _RcaManualExternalWriteFenceRejected,
+        match="provider_claim_invalid",
+    ):
+        await adapter._feishu_send_with_retry(
+            chat_id=G1Q3_RCA_GROUP_ID,
+            msg_type="text",
+            payload='{"text":"forged"}',
+            reply_to="om_safe_off",
+            metadata={
+                "thread_id": "topic:om_safe_off",
+                "_pnc_rca_external_write_guard": lambda: {
+                    "epoch_id": "forged",
+                    "state": "steady_active",
+                    "ledger_id": 1,
+                    "chat_id": G1Q3_RCA_GROUP_ID,
+                    "thread_id": "topic:om_safe_off",
+                },
+            },
+        )
+
+    adapter._send_raw_message.assert_not_awaited()
+
+
+def test_feishu_provider_rejects_the_former_callable_builder():
+    with pytest.raises(
+        _RcaManualExternalWriteFenceRejected,
+        match="callable_guard_forbidden",
+    ):
+        feishu_adapter_module._build_rca_external_write_guard(
+            lambda: {"epoch_id": "forged", "state": "steady_active"}
+        )
+
+
+@pytest.mark.asyncio
+async def test_feishu_provider_rejects_wrong_reply_anchor_before_sdk_call(
+    monkeypatch,
+):
+    adapter = object.__new__(FeishuAdapter)
+    adapter._client = SimpleNamespace()
+    adapter._run_blocking = AsyncMock()
+    adapter._record_only_outbound_result = lambda **_kwargs: None
+
+    def provider_revalidate(_claim, **kwargs):
+        if kwargs.get("reply_to_message_id") != "om_expected":
+            raise RuntimeError("external_write_fence_target_mismatch")
+        return {"epoch_id": "epoch-gray-1", "state": "steady_active"}
+
+    monkeypatch.setattr(
+        provider_fence_module,
+        "revalidate_provider_write_claim",
+        provider_revalidate,
+    )
+    provider_claim = build_manual_provider_write_claim(
+        _manual_admission_result(),
+        {**_manual_source_identity(), "message_id": "om_expected", "thread_id": "topic:om_expected"},
+    )
+
+    with pytest.raises(
+        _RcaManualExternalWriteFenceRejected,
+        match="external_write_fence_target_mismatch",
+    ):
+        await adapter._send_raw_message(
+            chat_id=G1Q3_RCA_GROUP_ID,
+            msg_type="text",
+            payload='{"text":"must not send"}',
+            reply_to="om_wrong",
+            metadata={
+                "thread_id": "topic:om_expected",
+                "_pnc_rca_external_write_guard": provider_claim,
+            },
+        )
+
+    adapter._run_blocking.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_feishu_rca_edit_and_media_sinks_require_guard_before_provider(
+    tmp_path,
+):
+    adapter = object.__new__(FeishuAdapter)
+    adapter._client = SimpleNamespace()
+    adapter._run_blocking = AsyncMock()
+    adapter._record_only_outbound_result = lambda **_kwargs: None
+    adapter.format_message = lambda value: value
+    image_path = tmp_path / "evidence.png"
+    image_path.write_bytes(b"not-uploaded")
+    file_path = tmp_path / "evidence.txt"
+    file_path.write_text("not uploaded", encoding="utf-8")
+
+    with pytest.raises(
+        _RcaManualExternalWriteFenceRejected,
+        match="guard_missing",
+    ):
+        await adapter.edit_message(
+            G1Q3_RCA_GROUP_ID,
+            "om_existing",
+            "must not edit",
+        )
+    with pytest.raises(
+        _RcaManualExternalWriteFenceRejected,
+        match="guard_missing",
+    ):
+        await adapter.send_image_file(
+            G1Q3_RCA_GROUP_ID,
+            str(image_path),
+        )
+    with pytest.raises(
+        _RcaManualExternalWriteFenceRejected,
+        match="guard_missing",
+    ):
+        await adapter.send_document(
+            G1Q3_RCA_GROUP_ID,
+            str(file_path),
+        )
+
+    adapter._run_blocking.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_feishu_rca_scope_guards_all_business_test_group_sink():
+    adapter = object.__new__(FeishuAdapter)
+    adapter._client = SimpleNamespace()
+    adapter._record_only_outbound_result = lambda **_kwargs: None
+    adapter.format_message = lambda value: value
+    scope_token = feishu_adapter_module._G1Q3_RCA_EXTERNAL_WRITE_SCOPE.set(True)
+    try:
+        with pytest.raises(
+            _RcaManualExternalWriteFenceRejected,
+            match="guard_missing",
+        ):
+            await adapter.send(
+                PNC_ALL_BUSINESS_TEST_GROUP_ID,
+                "must not send",
+            )
+    finally:
+        feishu_adapter_module._G1Q3_RCA_EXTERNAL_WRITE_SCOPE.reset(scope_token)
 
 
 @pytest.mark.asyncio
@@ -152,6 +630,7 @@ async def test_fixed_group_directed_mention_persists_trusted_reply_and_card_cont
     assert context["feishu"]["self_mentioned"] is True
     assert context["feishu"]["self_mention_command_directed"] is True
     assert call["require_durable_persistence"] is True
+    assert adapter.sent == []
 
 
 @pytest.mark.parametrize(
@@ -286,6 +765,7 @@ async def test_feishu_process_queue_item_reconstructs_group_topic_event(monkeypa
 @pytest.mark.asyncio
 async def test_durable_rca_worker_failure_releases_inbox_and_retry_completes(
     tmp_path,
+    monkeypatch,
 ):
     issue_url = "https://project.feishu.cn/g1q3/issue/detail/7013527412"
     event = MessageEvent(
@@ -361,10 +841,7 @@ async def test_durable_rca_worker_failure_releases_inbox_and_retry_completes(
             "route_surface": "rca_manual_intake",
         }
         reconstructed.metadata["pnc_manual_authorization"] = {"authorized": True}
-        reconstructed.metadata["pnc_manual_rca_admission"] = {
-            "outcome": "created",
-            "submission_key": "g1q3-rca-s1-" + "a" * 64,
-        }
+        reconstructed.metadata["pnc_manual_rca_admission"] = _manual_admission_result()
         return "durably admitted"
 
     async def send(**kwargs):
@@ -373,6 +850,20 @@ async def test_durable_rca_worker_failure_releases_inbox_and_retry_completes(
 
     adapter._message_handler = handle
     adapter.send = send
+    monkeypatch.setattr(
+        feishu_adapter_module,
+        "_require_current_rca_manual_activation_epoch",
+        lambda: {"epoch_id": "epoch-gray-1", "state": "steady_active"},
+    )
+    monkeypatch.setattr(
+        provider_fence_module,
+        "revalidate_provider_write_claim",
+        lambda *_args, **_kwargs: {
+            "epoch_id": "epoch-gray-1",
+            "state": "steady_active",
+            "ledger_id": 1,
+        },
+    )
     assert adapter._begin_message_processing("om_retry") is True
 
     worker = QueueWorker(controller, adapter._process_queue_item)
@@ -406,17 +897,19 @@ async def test_durable_rca_worker_failure_releases_inbox_and_retry_completes(
 
     assert item.status == "completed"
     assert item.result["durable_feishu_completion"] is True
+    assert item.result["external_write_authorized"] is False
+    assert item.result["external_write_suppressed"] is True
+    assert item.result["feishu_write_performed"] is False
     assert adapter._message_processing_completed("om_retry") is True
     assert calls == 2
-    assert sent[0]["reply_to"] == "om_parent"
-    assert sent[0]["metadata"] == {
-        "thread_id": "topic:om_root",
-        "reply_to_message_id": "om_parent",
-    }
+    assert sent == []
 
 
 @pytest.mark.asyncio
-async def test_durable_rca_policy_error_is_retried_and_never_completed(tmp_path):
+async def test_durable_rca_policy_error_is_retried_and_never_completed(
+    tmp_path,
+    monkeypatch,
+):
     event = MessageEvent(
         source=SessionSource(
             platform=Platform.FEISHU,
@@ -482,6 +975,11 @@ async def test_durable_rca_policy_error_is_retried_and_never_completed(tmp_path)
         return "fail-closed response"
 
     adapter._message_handler = policy_error_handler
+    monkeypatch.setattr(
+        feishu_adapter_module,
+        "_require_current_rca_manual_activation_epoch",
+        lambda: {"epoch_id": "epoch-gray-1", "state": "steady_active"},
+    )
     assert adapter._begin_message_processing(event.message_id) is True
     worker = QueueWorker(controller, adapter._process_queue_item)
     assert controller.dequeue_next(item.lane, domain=item.domain) is item

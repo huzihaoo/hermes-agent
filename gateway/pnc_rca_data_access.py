@@ -7,7 +7,7 @@ import json
 import re
 from typing import Any, Mapping
 
-from gateway.pnc_pdcl_contract import parse_pdcl_command
+from gateway.pnc_pdcl_contract import is_placeholder_reference_value, parse_pdcl_command
 
 
 RCA_REMOTE_DATA_ACCESS_SCHEMA_VERSION = "g1q3_rca_remote_data_access_v1"
@@ -99,8 +99,8 @@ def build_remote_data_access(source_value: str) -> dict[str, Any]:
     normalized = str(source_value or "").strip()
     if not normalized:
         raise RemoteDataAccessError(
-            "remote_data_reference_missing",
-            "the issue data field is empty",
+            "issue_field_missing_remote_data_reference",
+            "the issue field 问题数据地址_PDCL is empty",
         )
     if len(normalized.encode("utf-8")) > MAX_REMOTE_SOURCE_LENGTH:
         raise RemoteDataAccessError(
@@ -260,6 +260,7 @@ def validate_remote_data_access(value: Any) -> dict[str, Any]:
             or len(locator) > MAX_REMOTE_REFERENCE_LENGTH
             or raw_locator != locator
             or "\x00" in locator
+            or is_placeholder_reference_value(locator)
             or item.get("reader_class") != reader_class
         ):
             raise RemoteDataAccessError(
