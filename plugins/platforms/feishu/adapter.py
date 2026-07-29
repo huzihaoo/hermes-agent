@@ -62,11 +62,12 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Literal, Optional, Sequence
+from typing import Any, Callable, Dict, List, Literal, Mapping, Optional, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -163,6 +164,27 @@ PNC_ALL_BUSINESS_TEST_GROUP_ID = "oc_16614f4ba25b8c88b69c0b8e9ebc2fb5"
 G1Q3_RCA_GROUP_ID = "oc_6cfc782212009ff4cd815349909dd423"
 _FEISHU_QUEUE_EVENT_CONTEXT_SCHEMA = "feishu_queue_message_event_v1"
 _G1Q3_RCA_MANUAL_QUEUE_ROUTE = "g1q3_rca_manual_v1"
+_G1Q3_RCA_MANUAL_ADMISSION_RESULT_SCHEMA = "pnc_rca_manual_admission_result_v1"
+_G1Q3_RCA_MANUAL_ADMISSION_RESULT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "outcome",
+        "business_key",
+        "submission_key",
+        "generation",
+        "source_id",
+        "subscription_key",
+        "state",
+        "reason",
+    }
+)
+_G1Q3_RCA_PROVIDER_WRITES_DEFERRED_KEY = "pnc_rca_provider_writes_deferred"
+_G1Q3_RCA_EXTERNAL_WRITE_GUARD_KEY = "_pnc_rca_external_write_guard"
+_G1Q3_RCA_EXTERNAL_WRITE_OPERATION_KEY = "_pnc_rca_external_write_operation"
+_G1Q3_RCA_EXTERNAL_WRITE_SCOPE: ContextVar[bool] = ContextVar(
+    "g1q3_rca_external_write_scope",
+    default=False,
+)
 _MAX_FEISHU_QUEUE_REPLY_TEXT_CHARS = 32 * 1024
 _MAX_FEISHU_QUEUE_LINK_COUNT = 32
 _MAX_FEISHU_QUEUE_LINK_CHARS = 4096
@@ -285,6 +307,189 @@ def _requires_durable_g1q3_gateway_decision(event: MessageEvent) -> bool:
     ):
         return False
     return True
+
+
+class _RcaManualExternalWriteFenceRejected(RuntimeError):
+    """A manual RCA response lacks a live activation-bound admission."""
+
+
+def _build_rca_external_write_guard(
+    _revalidate: Callable[[], Mapping[str, Any]],
+) -> None:
+    """Permanently reject the former forgeable callback authority."""
+
+    raise _RcaManualExternalWriteFenceRejected(
+        "rca_external_write_callable_guard_forbidden"
+    )
+
+
+def _is_activation_bound_manual_admission(value: Any) -> bool:
+    if (
+        not isinstance(value, dict)
+        or set(value) != _G1Q3_RCA_MANUAL_ADMISSION_RESULT_FIELDS
+    ):
+        return False
+    generation = value.get("generation")
+    required_text = (
+        "outcome",
+        "business_key",
+        "submission_key",
+        "source_id",
+        "subscription_key",
+        "state",
+    )
+    return bool(
+        value.get("schema_version") == _G1Q3_RCA_MANUAL_ADMISSION_RESULT_SCHEMA
+        and isinstance(generation, int)
+        and not isinstance(generation, bool)
+        and generation >= 1
+        and all(str(value.get(field) or "").strip() for field in required_text)
+    )
+
+
+def _require_current_rca_manual_activation_epoch() -> dict[str, Any]:
+    """Read the live control store before allowing the manual handler to run."""
+    from gateway.pnc_rca_control_store import RcaControlStore
+    from gateway.pnc_rca_write_fence import require_resident_activation_epoch
+    from gateway.run import _g1q3_rca_control_db_path
+
+    store = RcaControlStore(
+        _g1q3_rca_control_db_path(),
+        require_current=True,
+    )
+    return require_resident_activation_epoch(store)
+
+
+def _require_current_rca_manual_admission(
+    admission: Mapping[str, Any],
+    source_identity: Mapping[str, str],
+) -> dict[str, Any]:
+    """Re-read the exact source, subscription, epoch, and ledger binding."""
+    from gateway.pnc_rca_control_store import RcaControlStore
+    from gateway.run import _g1q3_rca_control_db_path
+
+    store = RcaControlStore(
+        _g1q3_rca_control_db_path(),
+        require_current=True,
+    )
+    return store.validate_manual_external_write_admission(
+        admission,
+        expected_chat_id=source_identity["chat_id"],
+        expected_thread_id=source_identity["thread_id"],
+        expected_message_id=source_identity["message_id"],
+        expected_requester_id=source_identity["requester_id"],
+    )
+
+
+def _manual_event_source_identity(event: MessageEvent) -> dict[str, str]:
+    source = event.source
+    identity = {
+        "chat_id": str(source.chat_id or "").strip(),
+        "thread_id": str(source.thread_id or "").strip(),
+        "message_id": str(event.message_id or "").strip(),
+        "requester_id": str(source.user_id or "").strip(),
+    }
+    if not all(identity.values()):
+        raise _RcaManualExternalWriteFenceRejected(
+            "rca_manual_external_write_source_identity_missing"
+        )
+    return identity
+
+
+def _enforce_rca_manual_external_write_fence(
+    metadata: Any,
+    response_text: Any,
+    *,
+    source_identity: Mapping[str, str],
+) -> Any:
+    """Build a provider guard only from a live canonical manual admission."""
+    normalized = metadata if isinstance(metadata, dict) else {}
+    if not str(response_text or "").strip():
+        return None
+    admission = normalized.get("pnc_manual_rca_admission")
+    if not _is_activation_bound_manual_admission(admission):
+        raise _RcaManualExternalWriteFenceRejected(
+            "rca_manual_external_write_activation_admission_missing"
+        )
+    from gateway.pnc_rca_provider_fence import (
+        build_manual_provider_write_claim,
+        revalidate_provider_write_claim,
+    )
+
+    claim = build_manual_provider_write_claim(admission, source_identity)
+    try:
+        revalidate_provider_write_claim(
+            claim,
+            operation="feishu_manual_reply",
+            chat_id=str(source_identity.get("chat_id") or ""),
+            thread_id=str(source_identity.get("thread_id") or ""),
+            reply_to_message_id=str(source_identity.get("message_id") or ""),
+        )
+    except Exception as exc:
+        raise _RcaManualExternalWriteFenceRejected(
+            "rca_manual_external_write_activation_binding_invalid"
+        ) from exc
+    return claim
+
+
+def _run_rca_external_write_guard(
+    metadata: Any,
+    *,
+    operation: str,
+    expected_chat_id: str | None = None,
+    expected_thread_id: str | None = None,
+    expected_reply_to: str | None = None,
+) -> dict[str, Any] | None:
+    """Revalidate immutable RCA identifiers immediately before a write."""
+    from gateway.pnc_rca_provider_fence import (
+        RcaProviderWriteClaim,
+        revalidate_provider_write_claim,
+    )
+
+    normalized = metadata if isinstance(metadata, Mapping) else {}
+    claim = normalized.get(_G1Q3_RCA_EXTERNAL_WRITE_GUARD_KEY)
+    if claim is None:
+        return None
+    if type(claim) is not RcaProviderWriteClaim:
+        raise _RcaManualExternalWriteFenceRejected(
+            "rca_external_write_provider_claim_invalid"
+        )
+    try:
+        binding = revalidate_provider_write_claim(
+            claim,
+            operation=operation,
+            chat_id=str(expected_chat_id or ""),
+            thread_id=str(expected_thread_id or ""),
+            reply_to_message_id=str(expected_reply_to or ""),
+        )
+    except Exception as exc:
+        raise _RcaManualExternalWriteFenceRejected(
+            str(getattr(exc, "code", "") or exc or "rca_external_write_provider_claim_rejected")
+        ) from exc
+    return dict(binding)
+
+
+def _without_rca_external_write_guard(metadata: Any) -> dict[str, Any] | None:
+    normalized = dict(metadata) if isinstance(metadata, Mapping) else {}
+    normalized.pop(_G1Q3_RCA_EXTERNAL_WRITE_GUARD_KEY, None)
+    normalized.pop(_G1Q3_RCA_EXTERNAL_WRITE_OPERATION_KEY, None)
+    return normalized or None
+
+
+def _rca_external_write_operation(metadata: Any, default: str) -> str:
+    normalized = metadata if isinstance(metadata, Mapping) else {}
+    return str(
+        normalized.get(_G1Q3_RCA_EXTERNAL_WRITE_OPERATION_KEY) or default
+    ).strip()
+
+
+def _rca_external_write_guard_required(chat_id: Any, metadata: Any = None) -> bool:
+    normalized = metadata if isinstance(metadata, Mapping) else {}
+    return bool(
+        str(chat_id or "").strip() == G1Q3_RCA_GROUP_ID
+        or _G1Q3_RCA_EXTERNAL_WRITE_SCOPE.get()
+        or normalized.get(_G1Q3_RCA_EXTERNAL_WRITE_GUARD_KEY) is not None
+    )
 
 
 def _build_feishu_queue_event_context(
@@ -4052,6 +4257,7 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send a Feishu message."""
+        provider_metadata = _without_rca_external_write_guard(metadata)
         formatted = self.format_message(content)
         thread_id = str((metadata or {}).get("thread_id") or "") or None
         recorded = self._record_only_outbound_result(
@@ -4059,13 +4265,26 @@ class FeishuAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             payload_type="text",
             payload=formatted,
-            metadata=metadata,
+            metadata=provider_metadata,
             thread_id=thread_id,
             message_id=reply_to,
             reply_mode="message" if reply_to else ("thread" if thread_id else "none"),
         )
         if recorded is not None:
             return recorded
+        provider_binding = _run_rca_external_write_guard(
+            metadata,
+            operation=_rca_external_write_operation(
+                metadata, "feishu_manual_reply"
+            ),
+            expected_chat_id=chat_id,
+            expected_thread_id=thread_id or "",
+            expected_reply_to=reply_to or "",
+        )
+        if _rca_external_write_guard_required(chat_id, metadata) and provider_binding is None:
+            raise _RcaManualExternalWriteFenceRejected(
+                "rca_external_write_guard_missing"
+            )
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
@@ -4141,6 +4360,7 @@ class FeishuAdapter(BasePlatformAdapter):
         content: str,
         *,
         finalize: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Edit a previously sent Feishu text/post message."""
         content = self.format_message(content)
@@ -4149,11 +4369,25 @@ class FeishuAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             payload_type="text",
             payload=content,
+            metadata=_without_rca_external_write_guard(metadata),
             message_id=message_id,
             update_mode="patch",
         )
         if recorded is not None:
             return recorded
+        provider_binding = _run_rca_external_write_guard(
+            metadata,
+            operation=_rca_external_write_operation(
+                metadata, "feishu_message_update"
+            ),
+            expected_chat_id=chat_id,
+            expected_thread_id=str((metadata or {}).get("thread_id") or ""),
+            expected_reply_to=message_id,
+        )
+        if _rca_external_write_guard_required(chat_id, metadata) and provider_binding is None:
+            raise _RcaManualExternalWriteFenceRejected(
+                "rca_external_write_guard_missing"
+            )
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
@@ -4161,6 +4395,15 @@ class FeishuAdapter(BasePlatformAdapter):
             msg_type, payload = self._build_outbound_payload(content)
             body = self._build_update_message_body(msg_type=msg_type, content=payload)
             request = self._build_update_message_request(message_id=message_id, request_body=body)
+            _run_rca_external_write_guard(
+                metadata,
+                operation=_rca_external_write_operation(
+                    metadata, "feishu_message_update"
+                ),
+                expected_chat_id=chat_id,
+                expected_thread_id=str((metadata or {}).get("thread_id") or ""),
+                expected_reply_to=message_id,
+            )
             response = await self._run_blocking(self._client.im.v1.message.update, request)
             result = self._finalize_send_result(response, "update failed")
             if not result.success and msg_type == "post" and _POST_CONTENT_INVALID_RE.search(result.error or ""):
@@ -4170,6 +4413,17 @@ class FeishuAdapter(BasePlatformAdapter):
                     content=json.dumps({"text": _strip_markdown_to_plain_text(content)}, ensure_ascii=False),
                 )
                 fallback_request = self._build_update_message_request(message_id=message_id, request_body=fallback_body)
+                _run_rca_external_write_guard(
+                    metadata,
+                    operation=_rca_external_write_operation(
+                        metadata, "feishu_message_update"
+                    ),
+                    expected_chat_id=chat_id,
+                    expected_thread_id=str(
+                        (metadata or {}).get("thread_id") or ""
+                    ),
+                    expected_reply_to=message_id,
+                )
                 fallback_response = await self._run_blocking(self._client.im.v1.message.update, fallback_request)
                 result = self._finalize_send_result(fallback_response, "update failed")
             if result.success:
@@ -4567,6 +4821,11 @@ class FeishuAdapter(BasePlatformAdapter):
             if not recorded.success:
                 logger.warning("[Feishu] %s", recorded.error)
             return
+        if chat_id == G1Q3_RCA_GROUP_ID:
+            logger.warning(
+                "[Feishu] Suppressed unfenced approval-card update in RCA chat"
+            )
+            return
         if not self._client:
             return
         try:
@@ -4670,6 +4929,18 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         if recorded is not None:
             return recorded
+        provider_binding = _run_rca_external_write_guard(
+            metadata,
+            operation=_rca_external_write_operation(
+                metadata, "feishu_attachment_upload"
+            ),
+            expected_chat_id=chat_id,
+            expected_thread_id=thread_id or "",
+        )
+        if _rca_external_write_guard_required(chat_id, metadata) and provider_binding is None:
+            raise _RcaManualExternalWriteFenceRejected(
+                "rca_external_write_guard_missing"
+            )
         if not self._client:
             return SendResult(success=False, error="Not connected")
         if not os.path.exists(image_path):
@@ -4687,6 +4958,14 @@ class FeishuAdapter(BasePlatformAdapter):
                 image=image_file,
             )
             request = self._build_image_upload_request(body)
+            _run_rca_external_write_guard(
+                metadata,
+                operation=_rca_external_write_operation(
+                    metadata, "feishu_attachment_upload"
+                ),
+                expected_chat_id=chat_id,
+                expected_thread_id=thread_id or "",
+            )
             upload_response = await self._run_blocking(self._client.im.v1.image.create, request)
             image_key = self._extract_response_field(upload_response, "image_key")
             if not image_key:
@@ -5154,6 +5433,12 @@ class FeishuAdapter(BasePlatformAdapter):
             if isinstance(action_value, dict) else None
         )
 
+        if self._suppress_unfenced_rca_card_action(
+            event=event,
+            action_value=action_value if isinstance(action_value, dict) else {},
+        ):
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+
         if hermes_action and str(hermes_action).startswith("repo_acl_"):
             return self._handle_repo_acl_card_action(event=event, action_value=action_value)
 
@@ -5182,6 +5467,61 @@ class FeishuAdapter(BasePlatformAdapter):
         if P2CardActionTriggerResponse is None:
             return None
         return P2CardActionTriggerResponse()
+
+    @staticmethod
+    def _suppress_unfenced_rca_card_action(
+        *, event: Any, action_value: Mapping[str, Any]
+    ) -> bool:
+        """Fail closed before any RCA callback mutates state or an inline card."""
+
+        context = getattr(event, "context", None)
+        chat_id = str(getattr(context, "open_chat_id", "") or "").strip()
+        action = str(action_value.get("hermes_action") or "").strip()
+        task_id = str(action_value.get("task_id") or "").strip()
+        protected = chat_id == G1Q3_RCA_GROUP_ID or (
+            chat_id == PNC_ALL_BUSINESS_TEST_GROUP_ID and action == "rca_clarify"
+        )
+        claim = None
+        if task_id:
+            try:
+                from gateway.pnc_rca_provider_fence import (
+                    write_fence_claim_for_submission,
+                )
+
+                claim = write_fence_claim_for_submission(task_id)
+            except Exception:
+                if protected:
+                    logger.warning(
+                        "[Feishu] Suppressed RCA card callback without a live "
+                        "submission fence",
+                        exc_info=True,
+                    )
+                    return True
+            protected = protected or claim is not None
+        if not protected:
+            return False
+        if claim is None:
+            logger.warning(
+                "[Feishu] Suppressed RCA card callback without canonical task binding"
+            )
+            return True
+        try:
+            from gateway.pnc_rca_provider_fence import (
+                revalidate_provider_write_claim,
+            )
+
+            revalidate_provider_write_claim(
+                claim,
+                operation="feishu_card_patch",
+                chat_id=chat_id,
+            )
+        except Exception:
+            logger.warning(
+                "[Feishu] Suppressed RCA card callback without a live activation epoch",
+                exc_info=True,
+            )
+            return True
+        return False
 
     @staticmethod
     def _loop_accepts_callbacks(loop: Any) -> bool:
@@ -5309,6 +5649,8 @@ class FeishuAdapter(BasePlatformAdapter):
         if P2CardActionTriggerResponse is None:
             return None
         response = P2CardActionTriggerResponse()
+        if result.get("card_response_mode") == "durable_patch_only":
+            return response
         if CallBackCard is not None:
             card = CallBackCard()
             card.type = "raw"
@@ -5391,9 +5733,11 @@ class FeishuAdapter(BasePlatformAdapter):
         guidance. No task is created here — the user supplies a G1Q3 case on their
         next message, which then routes normally through pnc_group_binding.
         """
-        choice = str(action_value.get("choice") or "")
-        guidance = self._RCA_CLARIFY_GUIDANCE.get(choice, "请补充 G1Q3 case 编号后再发一次。")
-        return self._rca_clarify_response(guidance)
+        logger.info(
+            "[Feishu] Suppressed legacy RCA clarify-card mutation; "
+            "the canonical manual route owns all RCA responses"
+        )
+        return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
 
     def _rca_clarify_response(self, guidance: str) -> Any:
         if P2CardActionTriggerResponse is None:
@@ -6268,7 +6612,11 @@ class FeishuAdapter(BasePlatformAdapter):
         chat_lock = self._get_chat_lock(chat_id)
         async with chat_lock:
             message_id = getattr(event, "message_id", None)
-            if message_id and self._reactions_enabled():
+            if (
+                chat_id != G1Q3_RCA_GROUP_ID
+                and message_id
+                and self._reactions_enabled()
+            ):
                 await self._add_ack_reaction(message_id)
             if await self._maybe_resolve_task_confirm_text(event):
                 return
@@ -6398,6 +6746,8 @@ class FeishuAdapter(BasePlatformAdapter):
         return self._pending_processing_reactions.pop(message_id, None)
 
     async def on_processing_start(self, event: MessageEvent) -> None:
+        if str(getattr(event.source, "chat_id", "") or "") == G1Q3_RCA_GROUP_ID:
+            return
         if not self._reactions_enabled():
             return
         message_id = event.message_id
@@ -6410,6 +6760,8 @@ class FeishuAdapter(BasePlatformAdapter):
     async def on_processing_complete(
         self, event: MessageEvent, outcome: ProcessingOutcome
     ) -> None:
+        if str(getattr(event.source, "chat_id", "") or "") == G1Q3_RCA_GROUP_ID:
+            return
         if not self._reactions_enabled():
             return
         message_id = event.message_id
@@ -6682,9 +7034,26 @@ class FeishuAdapter(BasePlatformAdapter):
         chat_id = str(event.source.chat_id or "")
         chat_lock = self._get_chat_lock(chat_id)
         async with chat_lock:
-            if event.message_id and self._reactions_enabled():
-                await self._add_ack_reaction(event.message_id)
-            await self._run_processing_hook("on_processing_start", event)
+            try:
+                _require_current_rca_manual_activation_epoch()
+            except Exception as exc:
+                logger.warning(
+                    "[admission] Suppressed RCA manual processing without a live "
+                    "activation epoch: %s",
+                    type(exc).__name__,
+                )
+                return {
+                    "durable_admission": False,
+                    "terminal_rejection": True,
+                    "external_write_authorized": False,
+                    "external_write_suppressed": True,
+                    "feishu_write_performed": False,
+                }
+            metadata = event.metadata if isinstance(event.metadata, dict) else {}
+            if metadata is not event.metadata:
+                event.metadata = metadata
+            metadata[_G1Q3_RCA_PROVIDER_WRITES_DEFERRED_KEY] = True
+            scope_token = _G1Q3_RCA_EXTERNAL_WRITE_SCOPE.set(True)
             try:
                 response = await self._message_handler(event)
                 metadata = event.metadata if isinstance(event.metadata, dict) else {}
@@ -6712,46 +7081,22 @@ class FeishuAdapter(BasePlatformAdapter):
                 if manual_route and not isinstance(manual_admission, dict) and not terminal_rejection:
                     raise RuntimeError("RCA manual admission did not reach a durable decision")
 
-                response_text, ephemeral_ttl = self._unwrap_ephemeral(response)
+                response_text, _ephemeral_ttl = self._unwrap_ephemeral(response)
+                external_write_authorized = False
+                external_write_suppressed = bool(response_text) or manual_route
+                feishu_write_performed = False
                 if response_text:
-                    try:
-                        send_result = await self._send_with_retry(
-                            chat_id=chat_id,
-                            content=str(response_text),
-                            reply_to=_reply_anchor_for_event(event),
-                            metadata=_thread_metadata_for_source(
-                                event.source,
-                                _reply_anchor_for_event(event),
-                            ),
-                        )
-                        if (
-                            ephemeral_ttl > 0
-                            and send_result.success
-                            and send_result.message_id
-                        ):
-                            self._schedule_ephemeral_delete(
-                                chat_id=chat_id,
-                                message_id=send_result.message_id,
-                                ttl_seconds=ephemeral_ttl,
-                            )
-                    except Exception:
-                        # The control-store decision is already durable. Response
-                        # delivery failure must not create another RCA generation.
-                        logger.warning(
-                            "[admission] Failed to send durable RCA decision response",
-                            exc_info=True,
-                        )
-            except BaseException:
-                await self._run_processing_hook(
-                    "on_processing_complete", event, ProcessingOutcome.FAILURE
-                )
-                raise
-            await self._run_processing_hook(
-                "on_processing_complete", event, ProcessingOutcome.SUCCESS
-            )
+                    logger.info(
+                        "[admission] RCA manual response retained in receipt only"
+                    )
+            finally:
+                _G1Q3_RCA_EXTERNAL_WRITE_SCOPE.reset(scope_token)
             return {
                 "durable_admission": isinstance(manual_admission, dict),
                 "terminal_rejection": terminal_rejection,
+                "external_write_authorized": external_write_authorized,
+                "external_write_suppressed": external_write_suppressed,
+                "feishu_write_performed": feishu_write_performed,
             }
 
     async def _process_queue_item(self, item) -> dict:
@@ -6828,6 +7173,11 @@ class FeishuAdapter(BasePlatformAdapter):
             # Map SessionSource chat_type ("dm"/"group") to admission chat_type
             admission_chat_type = "group" if chat_type == "group" else None
             requires_durable_decision = _requires_durable_g1q3_gateway_decision(event)
+            if requires_durable_decision:
+                metadata = event.metadata if isinstance(event.metadata, dict) else {}
+                if metadata is not event.metadata:
+                    event.metadata = metadata
+                metadata[_G1Q3_RCA_PROVIDER_WRITES_DEFERRED_KEY] = True
             try:
                 business_line = "integration_tools" if _is_integration_tools_message_context(chat_id, message_text) else "generic"
                 intent = (
@@ -6910,7 +7260,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 # the original topic immediately.  G1Q3 completion/card behavior is
                 # untouched; this fills the earlier admission/direct-QA gap.
                 ack_text = build_intake_ack(policy_ctx)
-                if ack_text:
+                if ack_text and not requires_durable_decision:
                     try:
                         await self.send(
                             chat_id,
@@ -9179,6 +9529,18 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         if recorded is not None:
             return recorded
+        provider_binding = _run_rca_external_write_guard(
+            metadata,
+            operation=_rca_external_write_operation(
+                metadata, "feishu_attachment_upload"
+            ),
+            expected_chat_id=chat_id,
+            expected_thread_id=thread_id or "",
+        )
+        if _rca_external_write_guard_required(chat_id, metadata) and provider_binding is None:
+            raise _RcaManualExternalWriteFenceRejected(
+                "rca_external_write_guard_missing"
+            )
         if not self._client:
             return SendResult(success=False, error="Not connected")
         if not os.path.exists(file_path):
@@ -9197,6 +9559,14 @@ class FeishuAdapter(BasePlatformAdapter):
                     file=file_obj,
                 )
                 request = self._build_file_upload_request(body)
+                _run_rca_external_write_guard(
+                    metadata,
+                    operation=_rca_external_write_operation(
+                        metadata, "feishu_attachment_upload"
+                    ),
+                    expected_chat_id=chat_id,
+                    expected_thread_id=thread_id or "",
+                )
                 upload_response = await self._run_blocking(self._client.im.v1.file.create, request)
             file_key = self._extract_response_field(upload_response, "file_key")
             if not file_key:
@@ -9258,7 +9628,7 @@ class FeishuAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             payload_type="interactive_card" if is_card else "text",
             payload=payload,
-            metadata=metadata,
+            metadata=_without_rca_external_write_guard(metadata),
             thread_id=thread_id,
             message_id=effective_reply_to if effective_reply_to and effective_reply_to != thread_id else None,
             reply_mode=("thread" if reply_in_thread or thread_id else "message") if (effective_reply_to or thread_id) else "none",
@@ -9266,6 +9636,19 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         if recorded is not None:
             return recorded
+        provider_binding = _run_rca_external_write_guard(
+            metadata,
+            operation=_rca_external_write_operation(
+                metadata, "feishu_manual_reply"
+            ),
+            expected_chat_id=chat_id,
+            expected_thread_id=thread_id or "",
+            expected_reply_to=effective_reply_to or "",
+        )
+        if _rca_external_write_guard_required(chat_id, metadata) and provider_binding is None:
+            raise _RcaManualExternalWriteFenceRejected(
+                "rca_external_write_guard_missing"
+            )
         if effective_reply_to:
             body = self._build_reply_message_body(
                 content=payload,
@@ -9474,18 +9857,52 @@ class FeishuAdapter(BasePlatformAdapter):
     ) -> Any:
         last_error: Optional[Exception] = None
         send_metadata = dict(metadata or {})
+        write_guard = send_metadata.pop(
+            _G1Q3_RCA_EXTERNAL_WRITE_GUARD_KEY,
+            None,
+        )
+        write_operation = _rca_external_write_operation(
+            send_metadata, "feishu_manual_reply"
+        )
+        guard_metadata = (
+            {
+                _G1Q3_RCA_EXTERNAL_WRITE_GUARD_KEY: write_guard,
+                _G1Q3_RCA_EXTERNAL_WRITE_OPERATION_KEY: write_operation,
+            }
+            if write_guard is not None
+            else None
+        )
+
+        def raw_send_metadata(value: Mapping[str, Any]) -> dict[str, Any]:
+            bound = dict(value)
+            if write_guard is not None:
+                bound[_G1Q3_RCA_EXTERNAL_WRITE_GUARD_KEY] = write_guard
+                bound[_G1Q3_RCA_EXTERNAL_WRITE_OPERATION_KEY] = write_operation
+            return bound
+
         send_metadata.setdefault("idempotency_uuid", str(uuid.uuid4()))
         metadata_thread_id = str(send_metadata.get("thread_id") or "").strip()
         metadata_reply_to = str(send_metadata.get("reply_to_message_id") or "").strip() or None
         active_reply_to = reply_to or metadata_reply_to or self._topic_anchor_from_thread_id(metadata_thread_id)
         for attempt in range(_FEISHU_SEND_ATTEMPTS):
+            provider_binding = _run_rca_external_write_guard(
+                guard_metadata,
+                operation=write_operation,
+                expected_chat_id=chat_id,
+                expected_thread_id=metadata_thread_id,
+                expected_reply_to=active_reply_to or "",
+            )
+            if _rca_external_write_guard_required(chat_id, guard_metadata) and provider_binding is None:
+                raise _RcaManualExternalWriteFenceRejected(
+                    "rca_external_write_guard_missing"
+                )
             try:
                 response = await self._send_raw_message(
                     chat_id=chat_id,
                     msg_type=msg_type,
                     payload=payload,
                     reply_to=active_reply_to,
-                    metadata=send_metadata,
+                    metadata=raw_send_metadata(send_metadata),
                 )
                 # If replying to a message failed because it was withdrawn or not found,
                 # fall back to posting a new message directly to the chat only for plain
@@ -9512,12 +9929,21 @@ class FeishuAdapter(BasePlatformAdapter):
                             chat_id,
                         )
                         active_reply_to = None
+                        _run_rca_external_write_guard(
+                            guard_metadata,
+                            operation=write_operation,
+                            expected_chat_id=chat_id,
+                            expected_thread_id=metadata_thread_id,
+                            expected_reply_to="",
+                        )
                         response = await self._send_raw_message(
                             chat_id=chat_id,
                             msg_type=msg_type,
                             payload=payload,
                             reply_to=None,
-                            metadata=self._reply_fallback_metadata(send_metadata),
+                            metadata=raw_send_metadata(
+                                self._reply_fallback_metadata(send_metadata)
+                            ),
                         )
                 return response
             except Exception as exc:

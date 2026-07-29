@@ -18,13 +18,9 @@ import pwd
 import re
 import stat
 import secrets
-import sqlite3
 import subprocess
 import sys
-import tempfile
 import time
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,12 +32,6 @@ if str(REPO_ROOT) not in sys.path:
 
 from gateway.tasks.store import TaskStore  # noqa: E402
 from gateway.tasks.types import Task, TaskStatus  # noqa: E402
-from gateway.pnc_rca_write_fence import (  # noqa: E402
-    ExternalWriteFenceError,
-    snapshot_core_sha256,
-    validate_write_fence,
-    validate_write_fence_source_binding,
-)
 from hermes_cli.config import get_hermes_home  # noqa: E402
 from scripts.vm_task_state_bridge import _atomic_write_json, _load_existing, sidecar_path  # noqa: E402
 from gateway.feishu_task_card import render_status_line, stable_render_hash, render_task_card  # noqa: E402
@@ -63,8 +53,6 @@ PNC_CHAT_ID = "oc_16614f4ba25b8c88b69c0b8e9ebc2fb5"
 G1Q3_RCA_CHAT_ID = "oc_6cfc782212009ff4cd815349909dd423"
 DEFAULT_CHAT_IDS = (PNC_CHAT_ID, G1Q3_RCA_CHAT_ID)
 REPORT_FS_PREFIX = "/mnt/minieye/pdcl/department/perception_test_team/"
-REPORT_ATTACHMENT_CODEC_VERSION = "bom-utf8-v1"
-UTF8_BOM = b"\xef\xbb\xbf"
 REPORT_INTERNAL_HTTP_BASE = "http://192.168.26.174:18081"
 PNC_FEISHU_BUSINESS_TZ = timezone(timedelta(hours=8))
 _L4_EVENT_EPOCH_MAX = 4_102_444_800.0  # 2100-01-01T00:00:00Z
@@ -1199,127 +1187,12 @@ def _report_publication_url(index_html: str) -> str:
     return canonical_report_url_from_vm_path(index_html, origin)
 
 
-def _report_attachment_ledger_path() -> Path:
-    return get_hermes_home() / "pnc_agent" / "quota" / "g1q3_report_attachments.json"
-
-
-def _load_report_attachment_ledger() -> dict[str, Any]:
-    path = _report_attachment_ledger_path()
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        return payload if isinstance(payload, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def _save_report_attachment_ledger(payload: dict[str, Any]) -> None:
-    path = _report_attachment_ledger_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(path)
-
-
-def _validate_report_attachment_fence(*, vm_task_id: str, work_item_id: str) -> None:
-    """Require the live W5 fence before the legacy attachment provider call."""
-    # Date-prefixed task ids are pre-W3 historical records.  New admitted RCA
-    # submissions use the immutable g1q3-rca-s1-* key and require the fence.
-    if not str(vm_task_id or "").lower().startswith("g1q3-rca-s1-"):
-        return
-    configured = os.getenv("HERMES_RCA_CONTROL_DB_PATH", "").strip()
-    db_path = Path(configured).expanduser() if configured else (
-        get_hermes_home()
-        / "runtime/pnc_agent/feishu_issue_kafka_rca/control.sqlite3"
-    )
-    try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            """
-            SELECT snapshot.admission_snapshot_json,
-                   envelope.source_envelope_json
-              FROM rca_admission_snapshots AS snapshot
-              JOIN rca_snapshot_source_envelopes AS envelope
-                ON envelope.snapshot_sha256 = snapshot.snapshot_sha256
-               AND envelope.source_envelope_sha256 =
-                   snapshot.creator_source_envelope_sha256
-               AND envelope.source_id = snapshot.creator_source_id
-             WHERE snapshot.submission_key = ?
-            """,
-            (str(vm_task_id).strip(),),
-        ).fetchone()
-        if row is None:
-            raise ExternalWriteFenceError("external_write_fence_missing")
-        snapshot = json.loads(str(row["admission_snapshot_json"]))
-        fence = snapshot.get("write_fence") if isinstance(snapshot, dict) else None
-        if not isinstance(fence, dict) or fence.get("state") != "issued":
-            raise ExternalWriteFenceError("external_write_fence_missing")
-        source_targets = validate_write_fence_source_binding(
-            fence,
-            snapshot=snapshot,
-            source_envelope=json.loads(str(row["source_envelope_json"])),
-        )
-        ticket = (
-            ((snapshot.get("canonical_request") or {}).get("ticket"))
-            if isinstance(snapshot, dict)
-            else {}
-        )
-        issue_target = str((ticket or {}).get("issue_url") or "").strip()
-        if (
-            not issue_target
-            or issue_target != source_targets["issue_target"]
-            or str((ticket or {}).get("work_item_id") or "").strip()
-            != str(work_item_id or "").strip()
-        ):
-            raise ExternalWriteFenceError("external_write_fence_target_mismatch")
-        epoch_row = conn.execute(
-            """
-            SELECT epoch.epoch_id, epoch.state, epoch.is_current,
-                   ledger.ledger_id, ledger.business_key, ledger.submission_key,
-                   ledger.generation, ledger.decision, ledger.bound_at
-              FROM rca_activation_epochs AS epoch
-              JOIN rca_activation_admission_ledger AS ledger
-                ON ledger.epoch_id = epoch.epoch_id
-               AND ledger.ledger_id = ?
-             WHERE epoch.epoch_id = ? AND ledger.admission_key = ?
-            """,
-            (fence.get("activation_ledger_id"), fence.get("activation_epoch_id"), fence.get("admission_key")),
-        ).fetchone()
-    except ExternalWriteFenceError:
-        raise
-    except (OSError, sqlite3.Error, TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise ExternalWriteFenceError("external_write_fence_missing", type(exc).__name__) from exc
-    finally:
-        try:
-            conn.close()
-        except UnboundLocalError:
-            pass
-    if epoch_row is None or int(epoch_row["is_current"]) != 1 or str(epoch_row["state"]) not in {"bounded_active", "steady_active"}:
-        raise ExternalWriteFenceError("external_write_fence_epoch_not_current")
-    if str(epoch_row["decision"]) != "admit" or not epoch_row["bound_at"]:
-        raise ExternalWriteFenceError("external_write_fence_operation_denied")
-    validate_write_fence(
-        fence,
-        snapshot_core_sha256_value=snapshot_core_sha256(snapshot),
-        operation="feishu_attachment_upload",
-        target=issue_target,
-        expected_epoch_id=str(epoch_row["epoch_id"]),
-        expected_ledger_id=int(epoch_row["ledger_id"]),
-        expected_business_key=str(fence.get("business_key") or ""),
-        expected_submission_key=str(vm_task_id),
-        expected_generation=int(fence.get("generation") or 0),
-        expected_issue_target=issue_target,
-        expected_target_set_sha256=source_targets["target_set_sha256"],
-    )
-
-
 def _feishu_report_attachment_link(*, work_item_id: str, vm_task_id: str, index_html: str) -> str:
-    """Upload report HTML as a Feishu Project attachment and return file_url.
+    """Keep the retired Feishu HTML attachment bridge fail-closed.
 
-    Production delivery cannot expose ``file://`` or VM/private-IP HTTP links:
-    Feishu clients do not open ``file://`` and VM 192.168.x.x reachability is
-    not guaranteed for every user.  The project attachment URL is the stable,
-    clickable, permission-scoped user-facing link.
+    The canonical delivery dispatcher exclusively owns production Feishu
+    writes. Historical call sites remain record-only even if their old opt-in
+    environment variable is present.
     """
     work_item_id = str(work_item_id or "").strip()
     index_html = str(index_html or "").strip()
@@ -1345,69 +1218,10 @@ def _feishu_report_attachment_link(*, work_item_id: str, vm_task_id: str, index_
         )
         return ""
 
-    key = f"{work_item_id}|{index_html}"
-    ledger = _load_report_attachment_ledger()
-    entry = (ledger.get("reports") or {}).get(key)
-    if (
-        isinstance(entry, dict)
-        and str(entry.get("file_url") or "").startswith("https://project.feishu.cn/")
-        and str(entry.get("delivery_codec_version") or "") == REPORT_ATTACHMENT_CODEC_VERSION
-    ):
-        return str(entry.get("file_url"))
-
-    source_url = _report_internal_http_link(index_html)
-    if not source_url:
-        return ""
-
-    try:
-        _validate_report_attachment_fence(
-            vm_task_id=vm_task_id,
-            work_item_id=work_item_id,
-        )
-    except ExternalWriteFenceError:
-        return ""
-
-    try:
-        from gateway.pnc_issue_context import default_meegle_runner
-
-        safe_issue = "".join(ch for ch in work_item_id if ch.isalnum() or ch in {"-", "_"}) or "g1q3"
-        filename = f"{safe_issue}_RCA_report.html"
-        with tempfile.TemporaryDirectory(prefix="g1q3_report_attach_") as tmpdir:
-            local_path = Path(tmpdir) / filename
-            with urllib.request.urlopen(source_url, timeout=20) as response:
-                data = response.read()
-            if not data.startswith(UTF8_BOM):
-                data = UTF8_BOM + data
-            local_path.write_bytes(data)
-            rc, out, err = default_meegle_runner([
-                "attachment", "+upload", str(local_path),
-                "--project-key", "t03o4q",
-                "--work-item-id", work_item_id,
-                "--resource-type", "13",
-                "--filename", filename,
-                "--content-type", "text/html; charset=utf-8",
-                "--format", "json",
-            ])
-        if rc != 0:
-            return ""
-        payload = json.loads(out or "{}")
-        file_url = str(payload.get("file_url") or "").strip()
-        file_token = str(payload.get("file_token") or "").strip()
-        if not file_url.startswith("https://project.feishu.cn/"):
-            return ""
-        ledger.setdefault("reports", {})[key] = {
-            "work_item_id": work_item_id,
-            "vm_task_id": vm_task_id,
-            "index_html": index_html,
-            "file_url": file_url,
-            "file_token": file_token,
-            "delivery_codec_version": REPORT_ATTACHMENT_CODEC_VERSION,
-            "uploaded_at": _now_iso(),
-        }
-        _save_report_attachment_ledger(ledger)
-        return file_url
-    except (OSError, TimeoutError, urllib.error.URLError, json.JSONDecodeError):
-        return ""
+    # W-1 gives canonical delivery_dispatcher exclusive ownership of every
+    # production Feishu write. This legacy bridge remains record-only so an env
+    # toggle or historical task id can never revive its attachment uploader.
+    return ""
 
 
 
@@ -1985,7 +1799,7 @@ def _maybe_report_comment_for_task(task: Task, task_card: dict[str, Any], payloa
     delivery = task_card.get("delivery") if isinstance(task_card.get("delivery"), dict) else {}
     rca_status = delivery.get("rca_status") if isinstance(delivery.get("rca_status"), dict) else {}
     work_item_id = str(rca_status.get("work_item_id") or "").strip()
-    if not work_item_id or not rca_status.get("html_link"):
+    if not work_item_id or not rca_status.get("foxglove_url"):
         return None
     updated_at = str(payload.get("updated_at") or state_obj.get("updated_at") or "").strip()
     try:

@@ -349,6 +349,14 @@ def test_fixture_mode_executes_projection_notice_comment_and_sidecar_without_col
             "artifacts": {
                 "index_html_vm": "/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases/7017699515/index.html",
                 "case_dir_cifs": "//hfs.minieye.tech/department-perception_test_team/G1Q3_RCA/cases/7017699515/",
+                "viz_mcap_vm": (
+                    "/mnt/minieye/pdcl/department/perception_test_team/"
+                    "G1Q3_RCA/cases/g1q3-rca-s1-"
+                    + "a" * 64
+                    + "/g1q3-rca-s1-"
+                    + "a" * 64
+                    + ".viz.mcap"
+                ),
             },
         },
     }
@@ -411,7 +419,7 @@ def test_fixture_mode_executes_projection_notice_comment_and_sidecar_without_col
     assert sidecar["completion_notice"]["state"] == "completed"
     assert sidecar["report_comment"]["action"] == "recorded_intents"
     assert sidecar["report_comment"]["posted"] is False
-    assert sidecar["vm_delivery_proposal"]["delivery"]["report_status"] == "html_delivery_ready"
+    assert sidecar["vm_delivery_proposal"]["delivery"]["report_status"] == "report_ready"
     assert sidecar["vm_delivery_proposal"]["evidence_source"] == "fixture"
     assert sidecar["vm_delivery_proposal"]["delivery_contract"]["schema_version"] == "g1q3_delivery_contract_v1"
     assert [row["operation"] for row in rows] == ["project_comment_list", "project_comment_add"]
@@ -1186,7 +1194,7 @@ def test_vm_sync_html_artifact_uses_explicit_canonical_https(monkeypatch):
 
 def test_g1q3_contract_foxglove_url_is_byte_identical_across_host_writers(monkeypatch):
     monkeypatch.delenv("PNC_FOXGLOVE_RENDER_HOST", raising=False)
-    case_key = "6986500860_fcw_FCW-合肥-G1Q3_6028车-自车右转_直行后-FCW疑似误触发"
+    case_key = "g1q3-rca-s1-" + "a" * 64
     case_dir = f"/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases/{case_key}"
     contract = {
         "schema_version": "g1q3_delivery_contract_v1",
@@ -1211,10 +1219,7 @@ def test_g1q3_contract_foxglove_url_is_byte_identical_across_host_writers(monkey
     expected = (
         "https://192.168.21.217/?ds=foxglove-http&ds.mcapPath="
         "/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases/"
-        "6986500860_fcw_FCW-%E5%90%88%E8%82%A5-G1Q3_6028%E8%BD%A6-%E8%87%AA%E8%BD%A6%E5%8F%B3%E8%BD%AC_"
-        "%E7%9B%B4%E8%A1%8C%E5%90%8E-FCW%E7%96%91%E4%BC%BC%E8%AF%AF%E8%A7%A6%E5%8F%91/"
-        "6986500860_fcw_FCW-%E5%90%88%E8%82%A5-G1Q3_6028%E8%BD%A6-%E8%87%AA%E8%BD%A6%E5%8F%B3%E8%BD%AC_"
-        "%E7%9B%B4%E8%A1%8C%E5%90%8E-FCW%E7%96%91%E4%BC%BC%E8%AF%AF%E8%A7%A6%E5%8F%91.viz.mcap"
+        f"{case_key}/{case_key}.viz.mcap"
     )
     assert sync_delivery["foxglove_url"] == expected
     assert sync_delivery["artifact_path"] == expected
@@ -1264,14 +1269,14 @@ def test_g1q3_viz_only_contract_is_done_without_claiming_html_ready():
     assert card["delivery"]["foxglove_url"].endswith("/viz_only/viz_only.viz.mcap")
 
 
-def test_foxglove_render_host_is_configurable(monkeypatch):
+def test_foxglove_delivery_origin_is_fixed(monkeypatch):
     monkeypatch.setenv("PNC_FOXGLOVE_RENDER_HOST", "viewer.internal:8443")
 
     url = pnc_foxglove_delivery.foxglove_url(
         "/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases/case_a/case_a.viz.mcap"
     )
 
-    assert url.startswith("https://viewer.internal:8443/?ds=foxglove-http&ds.mcapPath=")
+    assert url.startswith("https://192.168.21.217/?ds=foxglove-http&ds.mcapPath=")
 
 
 def test_g1q3_task_card_delivery_contract_missing_input_is_not_done():
@@ -1387,7 +1392,6 @@ def test_record_only_report_attachment_records_before_download_or_meegle_upload(
     def bomb(*_args, **_kwargs):
         raise AssertionError("real attachment download/upload was touched")
 
-    monkeypatch.setattr(pnc_vm_task_sync.urllib.request, "urlopen", bomb)
     monkeypatch.setattr("gateway.pnc_issue_context.default_meegle_runner", bomb)
     try:
         link = pnc_vm_task_sync._feishu_report_attachment_link(
@@ -1417,17 +1421,9 @@ def test_record_only_report_attachment_records_before_download_or_meegle_upload(
     assert not (tmp_path / "pnc_agent" / "quota" / "g1q3_report_attachments.json").exists()
 
 
-def test_feishu_report_attachment_upload_adds_utf8_bom_charset_and_codec_version(tmp_path, monkeypatch):
+def test_live_legacy_report_attachment_writer_is_superseded(tmp_path, monkeypatch):
     token = set_hermes_home_override(tmp_path)
     uploads = []
-
-    class FakeResponse:
-        def __enter__(self):
-            return self
-        def __exit__(self, exc_type, exc, tb):
-            return False
-        def read(self):
-            return '<!doctype html><title>ACC-前车切入刹车过重</title>'.encode('utf-8')
 
     def fake_upload(args):
         path = Path(args[2])
@@ -1438,40 +1434,25 @@ def test_feishu_report_attachment_upload_adds_utf8_bom_charset_and_codec_version
         return 0, json.dumps({'file_url': 'https://project.feishu.cn/new-bom-link', 'file_token': 'tok-new'}), ''
 
     try:
-        monkeypatch.setattr(pnc_vm_task_sync.urllib.request, 'urlopen', lambda *a, **k: FakeResponse())
         monkeypatch.setattr('gateway.pnc_issue_context.default_meegle_runner', fake_upload)
         link = pnc_vm_task_sync._feishu_report_attachment_link(
             work_item_id='7029768863',
             vm_task_id='vm-1',
             index_html='/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases/7029768863_acc/index.html',
         )
-        ledger = json.loads((tmp_path / 'pnc_agent' / 'quota' / 'g1q3_report_attachments.json').read_text(encoding='utf-8'))
     finally:
         reset_hermes_home_override(token)
 
-    assert link == 'https://project.feishu.cn/new-bom-link'
-    assert len(uploads) == 1
-    assert uploads[0]['bytes'].startswith(pnc_vm_task_sync.UTF8_BOM)
-    assert uploads[0]['bytes'].count(pnc_vm_task_sync.UTF8_BOM) == 1
-    content_type_index = uploads[0]['args'].index('--content-type') + 1
-    assert uploads[0]['args'][content_type_index] == 'text/html; charset=utf-8'
-    entry = next(iter(ledger['reports'].values()))
-    assert entry['delivery_codec_version'] == pnc_vm_task_sync.REPORT_ATTACHMENT_CODEC_VERSION
+    assert link == ''
+    assert uploads == []
+    assert not (tmp_path / 'pnc_agent' / 'quota' / 'g1q3_report_attachments.json').exists()
 
 
-def test_feishu_report_attachment_cache_requires_codec_version_and_bom_is_idempotent(tmp_path, monkeypatch):
+def test_live_legacy_report_attachment_cache_cannot_revive_writer(tmp_path, monkeypatch):
     token = set_hermes_home_override(tmp_path)
     uploads = []
     index_html = '/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases/7029768863_acc/index.html'
     key = f'7029768863|{index_html}'
-
-    class FakeResponse:
-        def __enter__(self):
-            return self
-        def __exit__(self, exc_type, exc, tb):
-            return False
-        def read(self):
-            return pnc_vm_task_sync.UTF8_BOM + '<!doctype html><title>ACC-前车切入刹车过重</title>'.encode('utf-8')
 
     def fake_upload(args):
         path = Path(args[2])
@@ -1491,7 +1472,6 @@ def test_feishu_report_attachment_cache_requires_codec_version_and_bom_is_idempo
                 }
             }
         }), encoding='utf-8')
-        monkeypatch.setattr(pnc_vm_task_sync.urllib.request, 'urlopen', lambda *a, **k: FakeResponse())
         monkeypatch.setattr('gateway.pnc_issue_context.default_meegle_runner', fake_upload)
 
         first = pnc_vm_task_sync._feishu_report_attachment_link(work_item_id='7029768863', vm_task_id='vm-2', index_html=index_html)
@@ -1500,12 +1480,10 @@ def test_feishu_report_attachment_cache_requires_codec_version_and_bom_is_idempo
     finally:
         reset_hermes_home_override(token)
 
-    assert first == 'https://project.feishu.cn/new-bom-link-1'
-    assert second == first
-    assert len(uploads) == 1
-    assert uploads[0].startswith(pnc_vm_task_sync.UTF8_BOM)
-    assert uploads[0].count(pnc_vm_task_sync.UTF8_BOM) == 1
-    assert ledger['reports'][key]['delivery_codec_version'] == pnc_vm_task_sync.REPORT_ATTACHMENT_CODEC_VERSION
+    assert first == ''
+    assert second == ''
+    assert uploads == []
+    assert ledger['reports'][key].get('delivery_codec_version') is None
 
 
 def _g1q3_laundered_contract(work_item_id="7029488224"):

@@ -4,6 +4,170 @@ from pathlib import Path
 import pytest
 
 from gateway import pnc_issue_context
+from gateway import pnc_rca_provider_fence
+
+
+def _completed_meegle(command, **_kwargs):
+    return pnc_issue_context.subprocess.CompletedProcess(command, 0, "{}", "")
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["auth", "status", "--format", "json"],
+        [
+            "comment",
+            "list",
+            "--project-key",
+            "t03o4q",
+            "--work-item-id",
+            "7008267126",
+        ],
+        [
+            "workitem",
+            "get",
+            "--project-key",
+            "t03o4q",
+            "--work-item-id",
+            "7008267126",
+        ],
+        ["workitem", "meta-fields", "--project-key", "t03o4q"],
+    ],
+)
+def test_default_meegle_runner_allows_only_known_read_commands_without_claim(
+    monkeypatch, args
+):
+    calls = []
+    monkeypatch.setattr(pnc_issue_context.shutil, "which", lambda _name: "/bin/meegle")
+    monkeypatch.setattr(
+        pnc_issue_context,
+        "require_provider_write_claim",
+        lambda **_kwargs: pytest.fail("read command consulted write authority"),
+    )
+    monkeypatch.setattr(
+        pnc_issue_context.subprocess,
+        "run",
+        lambda command, **kwargs: calls.append((command, kwargs))
+        or _completed_meegle(command, **kwargs),
+    )
+
+    assert pnc_issue_context.default_meegle_runner(args) == (0, "{}", "")
+    assert calls[0][0] == ["/bin/meegle", *args]
+
+
+def test_default_meegle_runner_write_without_bound_claim_stops_before_subprocess(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        pnc_issue_context.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("unfenced Meegle write reached subprocess"),
+    )
+
+    with pytest.raises(
+        pnc_issue_context.ExternalWriteFenceError,
+        match="external_write_provider_claim_missing",
+    ):
+        pnc_issue_context.default_meegle_runner(
+            [
+                "comment",
+                "add",
+                "--project-key",
+                "t03o4q",
+                "--work-item-id",
+                "7008267126",
+                "--content",
+                "blocked",
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    ("args", "operation"),
+    [
+        (
+            [
+                "comment",
+                "add",
+                "--project-key",
+                "t03o4q",
+                "--work-item-id",
+                "7008267126",
+                "--content",
+                "authorized",
+            ],
+            "feishu_issue_comment",
+        ),
+        (
+            [
+                "workitem",
+                "update",
+                "--project-key",
+                "t03o4q",
+                "--work-item-id",
+                "7008267126",
+                "--params",
+                "{}",
+            ],
+            "feishu_issue_field_update",
+        ),
+    ],
+)
+def test_default_meegle_runner_revalidates_bound_claim_at_physical_write(
+    monkeypatch, args, operation
+):
+    validations = []
+    subprocess_calls = []
+    monkeypatch.setattr(pnc_issue_context.shutil, "which", lambda _name: "/bin/meegle")
+    monkeypatch.setattr(
+        pnc_rca_provider_fence,
+        "revalidate_provider_write_claim",
+        lambda claim, **kwargs: validations.append((claim, kwargs)) or {"ok": True},
+    )
+    monkeypatch.setattr(
+        pnc_issue_context.subprocess,
+        "run",
+        lambda command, **kwargs: subprocess_calls.append(command)
+        or _completed_meegle(command, **kwargs),
+    )
+    claim = pnc_rca_provider_fence.build_write_fence_provider_claim(
+        {"state": "issued"}
+    )
+
+    with pnc_rca_provider_fence.bound_provider_write_claim(claim):
+        result = pnc_issue_context.default_meegle_runner(args)
+
+    assert result == (0, "{}", "")
+    assert validations == [
+        (
+            claim,
+            {
+                "operation": operation,
+                "chat_id": "",
+                "thread_id": "",
+                "reply_to_message_id": "",
+                "issue_project_key": "t03o4q",
+                "issue_work_item_id": "7008267126",
+            },
+        )
+    ]
+    assert subprocess_calls == [["/bin/meegle", *args]]
+
+
+def test_default_meegle_runner_rejects_unknown_command_before_subprocess(monkeypatch):
+    monkeypatch.setattr(
+        pnc_issue_context.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("unknown command reached subprocess"),
+    )
+
+    with pytest.raises(
+        pnc_issue_context.ExternalWriteFenceError,
+        match="Meegle command is not allowlisted",
+    ):
+        pnc_issue_context.default_meegle_runner(
+            ["comment", "delete", "--work-item-id", "7008267126"]
+        )
 
 
 def test_sanitize_issue_evidence_text_removes_transient_feishu_file_urls_only():

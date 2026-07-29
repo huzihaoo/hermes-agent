@@ -6,13 +6,16 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
+import hashlib
 import json
 import logging
 import os
 from pathlib import Path
 import re
 import signal
+import secrets
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -34,6 +37,7 @@ from gateway.pnc_rca_admission import (
 )
 from gateway.pnc_rca_control_store import (
     OutboxClaim,
+    OUTBOX_CIRCUIT_RESET_SCHEMA_VERSION,
     RcaControlStore,
     RecordConflictError,
     StaleOutboxLeaseError,
@@ -431,11 +435,236 @@ class DispatchCircuitError(RuntimeError):
         self.detail = str(detail or code)
 
 
+class CircuitResetReceiptMaterializationError(RuntimeError):
+    def __init__(self, *, reset_id: str, receipt_path: Path, cause: Exception):
+        self.reset_id = str(reset_id)
+        self.receipt_path = receipt_path
+        self.meta_key = f"rca_dispatcher_circuit_reset:{self.reset_id}"
+        self.cause = cause
+        super().__init__(
+            "dispatcher_circuit_reset_recovery_required:"
+            f"reset_id={self.reset_id}:receipt={receipt_path}:cause={cause}"
+        )
+
+
 class PermanentDispatchError(RuntimeError):
     def __init__(self, code: str, detail: str = ""):
         super().__init__(detail or code)
         self.code = str(code or "dispatch_permanent_error")
         self.detail = str(detail or code)
+
+
+OUTBOX_CIRCUIT_RESET_RECEIPT_SCHEMA_VERSION = (
+    OUTBOX_CIRCUIT_RESET_SCHEMA_VERSION
+)
+_CIRCUIT_RESET_MAX_OPERATOR_BYTES = 200
+_CIRCUIT_RESET_MAX_REASON_BYTES = 1000
+
+
+def _canonical_receipt_json(value: Mapping[str, Any]) -> str:
+    return json.dumps(
+        dict(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _circuit_state_dict(circuit: Any) -> dict[str, Any]:
+    return {
+        "state": str(circuit.state),
+        "reason_code": str(circuit.reason_code or ""),
+        "reason_detail": str(circuit.reason_detail or ""),
+        "opened_at": circuit.opened_at,
+        "updated_at": circuit.updated_at,
+    }
+
+
+def _validate_reset_audit_text(operator: Any, reason: Any) -> tuple[str, str]:
+    actor = str(operator or "").strip()
+    justification = str(reason or "").strip()
+    if (
+        not actor
+        or actor != str(operator)
+        or len(actor.encode("utf-8")) > _CIRCUIT_RESET_MAX_OPERATOR_BYTES
+        or any(char in actor for char in "\n\r\x00")
+    ):
+        raise ValueError("dispatcher_circuit_reset_operator_invalid")
+    if (
+        not justification
+        or justification != str(reason)
+        or len(justification.encode("utf-8")) > _CIRCUIT_RESET_MAX_REASON_BYTES
+        or any(char in justification for char in "\n\r\x00")
+    ):
+        raise ValueError("dispatcher_circuit_reset_reason_invalid")
+    return actor, justification
+
+
+def _absolute_new_receipt_path(value: Any) -> Path:
+    if value is None or str(value).strip() == "":
+        raise ValueError("dispatcher_circuit_reset_receipt_required")
+    candidate = Path(str(value)).expanduser()
+    if not candidate.is_absolute() or str(candidate) != str(candidate.absolute()):
+        raise ValueError("dispatcher_circuit_reset_receipt_path_invalid")
+    target = candidate.absolute()
+    sidecar = Path(f"{target}.sha256")
+    if os.path.lexists(target) or os.path.lexists(sidecar):
+        raise ValueError("dispatcher_circuit_reset_receipt_already_exists")
+    parent_path = target.parent
+    try:
+        parent = parent_path.lstat()
+    except OSError as exc:
+        raise ValueError("dispatcher_circuit_reset_receipt_parent_invalid") from exc
+    if (
+        stat.S_ISLNK(parent.st_mode)
+        or not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != os.getuid()
+        or stat.S_IMODE(parent.st_mode) & 0o022
+        or Path(os.path.realpath(parent_path)) != parent_path
+    ):
+        raise ValueError("dispatcher_circuit_reset_receipt_parent_invalid")
+    return target
+
+
+def _control_db_identity(path: Path) -> dict[str, Any]:
+    candidate = path.expanduser().absolute()
+    try:
+        observed = candidate.lstat()
+    except OSError as exc:
+        raise ValueError("dispatcher_circuit_reset_control_db_invalid") from exc
+    if (
+        stat.S_ISLNK(observed.st_mode)
+        or not stat.S_ISREG(observed.st_mode)
+        or observed.st_nlink != 1
+        or observed.st_uid != os.getuid()
+    ):
+        raise ValueError("dispatcher_circuit_reset_control_db_invalid")
+    return {
+        "path": str(candidate),
+        "device": int(observed.st_dev),
+        "inode": int(observed.st_ino),
+        "size": int(observed.st_size),
+        "mtime_ns": int(observed.st_mtime_ns),
+    }
+
+
+def _write_all(descriptor: int, raw: bytes) -> None:
+    view = memoryview(raw)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("short receipt write")
+        view = view[written:]
+
+
+def _create_immutable_file(path: Path, raw: bytes) -> None:
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    )
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o400,
+        )
+        _write_all(descriptor, raw)
+        os.fsync(descriptor)
+        os.fchmod(descriptor, 0o444)
+        os.close(descriptor)
+        descriptor = -1
+        try:
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError as exc:
+            raise ValueError("dispatcher_circuit_reset_receipt_already_exists") from exc
+        temporary.unlink()
+        directory = os.open(
+            path.parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except ValueError:
+        raise
+    except OSError as exc:
+        raise ValueError("dispatcher_circuit_reset_receipt_write_failed") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _write_immutable_receipt(path: Path, value: Mapping[str, Any]) -> str:
+    """Create a receipt and hash sidecar without replacing an existing file."""
+    raw = _canonical_receipt_json(value).encode("utf-8")
+    _create_immutable_file(path, raw)
+    digest = hashlib.sha256(raw).hexdigest()
+    sidecar = Path(f"{path}.sha256")
+    _create_immutable_file(sidecar, f"{digest}  {path.name}\n".encode("ascii"))
+    return digest
+
+
+def _build_circuit_reset_receipt(
+    *,
+    config: "DispatcherConfig",
+    operator: str,
+    reason: str,
+    before: Any,
+    recorded_at: str,
+    receipt_path: Path | None,
+) -> dict[str, Any]:
+    before_state = _circuit_state_dict(before)
+    after_state = {
+        "state": "closed",
+        "reason_code": "",
+        "reason_detail": "",
+        "opened_at": None,
+        "updated_at": recorded_at,
+    }
+    db_identity = _control_db_identity(config.control_db_path)
+    seed = {
+        "recorded_at": recorded_at,
+        "operator": operator,
+        "reason": reason,
+        "before": before_state,
+        "control_db_identity": db_identity,
+    }
+    reset_id = hashlib.sha256(_canonical_receipt_json(seed).encode("utf-8")).hexdigest()
+    receipt: dict[str, Any] = {
+        "schema_version": OUTBOX_CIRCUIT_RESET_RECEIPT_SCHEMA_VERSION,
+        "command": "clear-circuit",
+        "reset_id": reset_id,
+        "recorded_at": recorded_at,
+        "operator": operator,
+        "reason": reason,
+        "control_db_identity": db_identity,
+        "config_binding_sha256": canonical_json_sha256(config.public_dict()),
+        "before": before_state,
+        "after": after_state,
+        "pre_state": before_state,
+        "post_state": after_state,
+        "effect_delta": {
+            "external_writes": 0,
+            "scope": "submission_circuit_reset_command",
+        },
+    }
+    if receipt_path is not None:
+        receipt["receipt_path"] = str(receipt_path)
+    receipt["receipt_fingerprint"] = canonical_json_sha256(receipt)
+    return receipt
 
 
 @dataclass(frozen=True)
@@ -630,6 +859,15 @@ class DispatcherConfig:
         w3_snapshot_read_mode, w3_snapshot_authority = (
             w3_snapshot_read_config_from_env(source)
         )
+        requested_feishu_writeback = _boolean(
+            source, f"{ENV_PREFIX}ALLOW_FEISHU_WRITEBACK", False
+        )
+        if requested_feishu_writeback:
+            raise ValueError(
+                f"{ENV_PREFIX}ALLOW_FEISHU_WRITEBACK is declarative-only and "
+                "cannot enable Feishu writes; the host delivery dispatcher "
+                "owns the external-write fence"
+            )
         config = cls(
             dispatch_enabled=dispatch_enabled,
             activation_required=_strict_boolean(
@@ -668,9 +906,9 @@ class DispatcherConfig:
             ),
             batch_size=_integer(source, f"{ENV_PREFIX}BATCH_SIZE", 10),
             data_access_mode=data_access_mode,
-            allow_feishu_writeback=_boolean(
-                source, f"{ENV_PREFIX}ALLOW_FEISHU_WRITEBACK", False
-            ),
+            # Keep the legacy payload key for ABI compatibility, but never
+            # allow the outbox dispatcher to turn it into an external write.
+            allow_feishu_writeback=False,
             group_response_cap=group_response_cap,
             translate_baseline=str(
                 source.get(f"{ENV_PREFIX}TRANSLATE_BASELINE", "production")
@@ -3514,7 +3752,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--clear-circuit",
         action="store_true",
-        help="explicitly close the persisted circuit and exit",
+        help="plan or apply an audited reset of the persisted submission circuit",
+    )
+    parser.add_argument("--operator", help="bounded operator identity for circuit reset")
+    parser.add_argument("--reason", help="bounded reason for circuit reset")
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="perform a mutation; without this flag --clear-circuit is plan-only",
+    )
+    parser.add_argument(
+        "--receipt",
+        type=Path,
+        help="absolute, non-existing path for the immutable circuit reset receipt",
+    )
+    parser.add_argument(
+        "--materialize-reset",
+        metavar="RESET_ID",
+        help="materialize an existing durable reset audit without changing the DB",
     )
     return parser
 
@@ -3522,6 +3777,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     try:
+        if args.clear_circuit and args.materialize_reset:
+            raise ValueError("dispatcher_circuit_reset_modes_conflict")
+        if args.materialize_reset:
+            if args.operator is not None or args.reason is not None or args.apply:
+                raise ValueError("dispatcher_circuit_reset_recovery_flags_conflict")
+            if any((args.check_config, args.dry_run, args.health, args.once)):
+                raise ValueError("dispatcher_circuit_reset_flags_conflict")
+            if args.receipt is None:
+                raise ValueError("dispatcher_circuit_reset_receipt_required")
+        if args.clear_circuit:
+            if args.operator is None or args.reason is None:
+                raise ValueError("dispatcher_circuit_reset_operator_and_reason_required")
+            if any((args.check_config, args.dry_run, args.health, args.once)):
+                raise ValueError("dispatcher_circuit_reset_flags_conflict")
+        elif not args.materialize_reset and (
+            any(
+                value is not None
+                for value in (args.operator, args.reason, args.receipt)
+            )
+            or args.apply
+        ):
+            raise ValueError("dispatcher_circuit_reset_arguments_require_clear_circuit")
+        if args.clear_circuit and args.apply and args.receipt is None:
+            raise ValueError("dispatcher_circuit_reset_receipt_required")
         load_dispatcher_environment(args.env_file)
         config = DispatcherConfig.from_env()
         if args.check_config:
@@ -3535,9 +3814,96 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if result.get("ok") is True else 2
 
         store = RcaControlStore(config.control_db_path, require_current=True)
+        if args.materialize_reset:
+            receipt_path = _absolute_new_receipt_path(args.receipt)
+            audit = store.dispatcher_circuit_reset_audit(args.materialize_reset)
+            if audit is None:
+                raise RuntimeError("dispatcher_circuit_reset_audit_missing")
+            try:
+                receipt_sha256 = _write_immutable_receipt(receipt_path, audit)
+            except Exception as exc:
+                raise ValueError(
+                    "dispatcher_circuit_reset_recovery_materialization_failed"
+                ) from exc
+            print(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "recovered": True,
+                        "reset_id": args.materialize_reset,
+                        "receipt": str(receipt_path),
+                        "receipt_sha256": receipt_sha256,
+                        "receipt_fingerprint": audit["receipt_fingerprint"],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
         if args.clear_circuit:
-            circuit = store.close_dispatcher_circuit()
-            print(json.dumps({"ok": True, "circuit": asdict(circuit)}, indent=2))
+            operator, reason = _validate_reset_audit_text(args.operator, args.reason)
+            receipt_path = (
+                _absolute_new_receipt_path(args.receipt)
+                if args.apply
+                else (
+                    Path(str(args.receipt)).expanduser().absolute()
+                    if args.receipt is not None
+                    else None
+                )
+            )
+            before = store.dispatcher_circuit()
+            if before.reason_code == "circuit_state_missing":
+                raise RuntimeError("dispatcher_circuit_reset_state_missing")
+            if not before.is_open:
+                raise RuntimeError("dispatcher_circuit_reset_requires_open_circuit")
+            recorded_at = datetime.now(timezone.utc).isoformat()
+            planned = _build_circuit_reset_receipt(
+                config=config,
+                operator=operator,
+                reason=reason,
+                before=before,
+                recorded_at=recorded_at,
+                receipt_path=receipt_path,
+            )
+            if not args.apply:
+                planned["applied"] = False
+                planned["mode"] = "plan"
+                print(json.dumps(planned, ensure_ascii=False, indent=2, sort_keys=True))
+                return 0
+            reset_at = datetime.fromisoformat(recorded_at)
+            _before, after = store.close_dispatcher_circuit_with_audit(
+                audit=planned,
+                now=reset_at,
+            )
+            if _circuit_state_dict(after) != planned["after"]:
+                raise RuntimeError("dispatcher_circuit_reset_post_state_mismatch")
+            try:
+                receipt_sha256 = _write_immutable_receipt(receipt_path, planned)
+            except Exception as exc:
+                raise CircuitResetReceiptMaterializationError(
+                    reset_id=str(planned["reset_id"]),
+                    receipt_path=receipt_path,
+                    cause=exc,
+                ) from exc
+            print(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "applied": True,
+                        "command": "clear-circuit",
+                        "reset_id": planned["reset_id"],
+                        "receipt": str(receipt_path),
+                        "receipt_sha256": receipt_sha256,
+                        "receipt_fingerprint": planned["receipt_fingerprint"],
+                        "pre_state": planned["pre_state"],
+                        "post_state": planned["post_state"],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
             return 0
         if args.dry_run:
             rows = store.preview_dispatchable(
@@ -3629,6 +3995,23 @@ def main(argv: list[str] | None = None) -> int:
             stop_requested=lambda: stopping,
         )
         return 0
+    except CircuitResetReceiptMaterializationError as exc:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": type(exc).__name__,
+                    "message": str(exc),
+                    "recovery_required": True,
+                    "reset_id": exc.reset_id,
+                    "meta_key": exc.meta_key,
+                    "receipt": str(exc.receipt_path),
+                },
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        return 2
     except Exception as exc:
         print(
             json.dumps(

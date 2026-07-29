@@ -24,6 +24,8 @@ from gateway.pnc_rca_frame_reference import (
     parse_frame_reference,
 )
 from gateway.pnc_rca_business_profiles import resolve_business_profile
+from gateway.pnc_rca_provider_fence import require_provider_write_claim
+from gateway.pnc_rca_write_fence import ExternalWriteFenceError
 
 GatewayToolCaller = Callable[[str, dict[str, Any]], Any]
 IssueReadStatus = Literal["not_requested", "read_failed", "read_empty", "fields_extracted"]
@@ -78,10 +80,71 @@ PNC_ALL_BUSINESS_TEST_GROUP_ID = "oc_16614f4ba25b8c88b69c0b8e9ebc2fb5"
 MEEGLE_CLI_TIMEOUT_SECONDS = 12
 G1Q3_ISSUE_ENRICHMENT_TIMEOUT_SECONDS = 75
 G1Q3_ISSUE_MCP_CALL_TIMEOUT_SECONDS = 15
+_MEEGLE_READ_ONLY_COMMANDS = frozenset(
+    {
+        ("auth", "status"),
+        ("comment", "list"),
+        ("workitem", "get"),
+        ("workitem", "meta-fields"),
+    }
+)
+_MEEGLE_WRITE_COMMANDS = {
+    ("comment", "add"): "feishu_issue_comment",
+    ("workitem", "update"): "feishu_issue_field_update",
+}
 
 
 class IssueEnrichmentDeadlineExceeded(TimeoutError):
     """The bounded host issue preread exhausted its total business budget."""
+
+
+def _single_meegle_option(args: list[str], name: str) -> str:
+    values: list[str] = []
+    for index, value in enumerate(args):
+        if value == name:
+            if index + 1 >= len(args) or str(args[index + 1]).startswith("--"):
+                raise ExternalWriteFenceError(
+                    "external_write_fence_target_mismatch",
+                    f"Meegle write command has no value for {name}",
+                )
+            values.append(str(args[index + 1]).strip())
+        elif str(value).startswith(f"{name}="):
+            values.append(str(value).split("=", 1)[1].strip())
+    if len(values) != 1 or not values[0]:
+        raise ExternalWriteFenceError(
+            "external_write_fence_target_mismatch",
+            f"Meegle write command requires exactly one {name}",
+        )
+    return values[0]
+
+
+def _meegle_write_scope(args: list[str]) -> tuple[str, str, str] | None:
+    if not isinstance(args, list) or len(args) < 2 or not all(
+        isinstance(item, str) and item for item in args
+    ):
+        raise ExternalWriteFenceError(
+            "external_write_fence_operation_denied",
+            "Meegle command shape is not allowlisted",
+        )
+    command = (args[0], args[1])
+    if command in _MEEGLE_READ_ONLY_COMMANDS:
+        return None
+    operation = _MEEGLE_WRITE_COMMANDS.get(command)
+    if operation is None:
+        raise ExternalWriteFenceError(
+            "external_write_fence_operation_denied",
+            f"Meegle command is not allowlisted: {' '.join(command)}",
+        )
+    project_key = _single_meegle_option(args, "--project-key")
+    work_item_id = _single_meegle_option(args, "--work-item-id")
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", project_key) or not re.fullmatch(
+        r"[0-9]{1,32}", work_item_id
+    ):
+        raise ExternalWriteFenceError(
+            "external_write_fence_target_mismatch",
+            "Meegle write target is not canonical",
+        )
+    return operation, project_key, work_item_id
 
 
 def _positive_timeout_seconds(value: Any, *, name: str) -> float:
@@ -323,6 +386,14 @@ def default_meegle_runner(
     not passed explicitly; the CLI uses its own keychain/config or sanctioned
     MEEGLE_* environment variables when present.
     """
+    write_scope = _meegle_write_scope(args)
+    if write_scope is not None:
+        operation, project_key, work_item_id = write_scope
+        require_provider_write_claim(
+            operation=operation,
+            issue_project_key=project_key,
+            issue_work_item_id=work_item_id,
+        )
     exe = shutil.which("meegle")
     if not exe:
         return 127, "", "meegle CLI not found"

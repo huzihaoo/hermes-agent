@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.pnc_rca_delivery_contract import (
+    DELIVERY_EFFECT_KIND,
     DELIVERY_EFFECT_SCHEMA_VERSION_V1,
     TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1,
     TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
@@ -26,6 +27,7 @@ from gateway.pnc_rca_delivery_contract import (
     build_terminal_delivery,
 )
 from gateway.pnc_rca_control_store import RcaControlStore
+from gateway.pnc_rca_provider_fence import build_write_fence_provider_claim
 from gateway.pnc_rca_delivery_store import (
     RcaDeliveryStore,
     StaleDeliveryEffectLeaseError,
@@ -62,9 +64,42 @@ from tests.gateway.test_pnc_rca_delivery_contract import (
 )
 
 
+_TEST_PROVIDER_WRITE_CLAIM = build_write_fence_provider_claim({"state": "issued"})
+
+
+def _test_provider_revalidate(
+    _claim,
+    *,
+    operation: str,
+    chat_id: str = "",
+    thread_id: str = "",
+    reply_to_message_id: str = "",
+    issue_project_key: str = "",
+    issue_work_item_id: str = "",
+):
+    binding = {
+        "epoch_id": "epoch-test-active",
+        "state": "bounded_active",
+        "ledger_id": 1,
+    }
+    if operation == "feishu_thread_reply":
+        binding.update(
+            {
+                "chat_id": "oc_group123",
+                "thread_id": thread_id,
+            }
+        )
+    return binding
+
+
 @pytest.fixture(autouse=True)
 def _seal_dependencies_available_in_the_test_interpreter(monkeypatch):
     monkeypatch.setenv("PNC_FOXGLOVE_RENDER_HOST", "https://viewer.internal")
+    monkeypatch.setattr(
+        dispatcher_module,
+        "revalidate_provider_write_claim",
+        _test_provider_revalidate,
+    )
     original = dispatcher_module.build_runtime_identity
 
     def build_test_identity(**kwargs):
@@ -146,6 +181,37 @@ def test_delivery_dispatcher_environment_loader_preserves_literal_expansion_synt
         assert os.environ[key] == "${AMBIENT_PATH}"
     finally:
         os.environ.pop(key, None)
+
+
+def test_clear_circuit_cli_closes_selected_circuit_without_claiming_effects(
+    tmp_path, monkeypatch, capsys
+):
+    config = _config(tmp_path, enabled=False)
+    store = RcaDeliveryStore(config.control_db_path)
+    store.open_delivery_dispatcher_circuit(
+        effect_kind=DELIVERY_EFFECT_KIND,
+        reason_code="operator_test_open",
+        now=NOW,
+    )
+    before_effects = store.list_rows("rca_delivery_effects")
+    monkeypatch.setattr(
+        dispatcher_module, "load_delivery_dispatcher_environment", lambda: None
+    )
+    monkeypatch.setattr(
+        dispatcher_module.DispatcherConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+
+    assert dispatcher_module.main(
+        ["--clear-circuit", "--effect-kind", DELIVERY_EFFECT_KIND]
+    ) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["circuit"]["state"] == "closed"
+    assert store.delivery_dispatcher_circuit(DELIVERY_EFFECT_KIND).state == "closed"
+    assert store.list_rows("rca_delivery_effects") == before_effects == []
 
 
 def _config(tmp_path, *, enabled: bool = True):
@@ -445,7 +511,9 @@ class Clock:
 
 
 def _verified_report(url, size, sha256):
-    assert url.startswith("https://viewer.internal/G1Q3_RCA/cases/")
+    assert url.startswith(
+        "https://192.168.21.217/?ds=foxglove-http&ds.mcapPath="
+    )
     return {
         "success": True,
         "status_code": 200,
@@ -498,6 +566,7 @@ def test_default_config_is_disabled_and_comment_write_is_closed(tmp_path):
     assert config.public_dict()["external_writes"] is False
     assert config.public_dict()["allowed_effect_kind"] == "feishu_issue_comment"
     assert config.public_dict()["allowed_effect_kinds"] == [
+        "feishu_card_patch",
         "feishu_issue_comment",
         "feishu_thread_reply",
     ]
@@ -628,24 +697,72 @@ def test_feishu_thread_writer_preserves_topic_and_stable_uuid():
         return SimpleNamespace(success=True, message_id="om_reply456", error=None)
 
     fake_adapter = SimpleNamespace(send=send)
-    result = FeishuThreadReplyAdapter(fake_adapter).add_reply(
-        "oc_group123",
-        "topic:om_root123",
-        "marker\nreport",
-        "00000000-0000-0000-0000-000000000001",
-    )
+    with dispatcher_module._bound_provider_write_guard(
+        _TEST_PROVIDER_WRITE_CLAIM
+    ):
+        result = FeishuThreadReplyAdapter(fake_adapter).add_reply(
+            "oc_group123",
+            "topic:om_root123",
+            "marker\nreport",
+            "00000000-0000-0000-0000-000000000001",
+        )
 
     assert result == {"success": True, "remote_id": "om_reply456"}
-    assert calls == [
-        (
-            "oc_group123",
-            "marker\nreport",
-            {
-                "thread_id": "topic:om_root123",
-                "idempotency_uuid": "00000000-0000-0000-0000-000000000001",
-            },
+    assert len(calls) == 1
+    chat_id, content, metadata = calls[0]
+    assert chat_id == "oc_group123"
+    assert content == "marker\nreport"
+    assert {
+        key: value
+        for key, value in metadata.items()
+        if key != "_pnc_rca_external_write_guard"
+    } == {
+        "thread_id": "topic:om_root123",
+        "idempotency_uuid": "00000000-0000-0000-0000-000000000001",
+        "_pnc_rca_external_write_operation": "feishu_thread_reply",
+    }
+    assert metadata["_pnc_rca_external_write_guard"] is _TEST_PROVIDER_WRITE_CLAIM
+
+
+def test_feishu_thread_writer_rejects_wrong_anchor_before_provider_call(
+    monkeypatch,
+):
+    calls = []
+
+    async def send(*args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(success=True, message_id="om_unexpected", error=None)
+
+    def exact_revalidate(_claim, *, operation, thread_id="", **_kwargs):
+        assert operation == "feishu_thread_reply"
+        if thread_id != "topic:om_expected":
+            raise dispatcher_module.ExternalWriteFenceError(
+                "external_write_fence_target_mismatch"
+            )
+        return _test_provider_revalidate(
+            _claim, operation=operation, thread_id=thread_id
         )
-    ]
+
+    monkeypatch.setattr(
+        dispatcher_module,
+        "revalidate_provider_write_claim",
+        exact_revalidate,
+    )
+    with dispatcher_module._bound_provider_write_guard(
+        _TEST_PROVIDER_WRITE_CLAIM
+    ):
+        with pytest.raises(
+            dispatcher_module.ExternalWriteFenceError,
+            match="external_write_fence_target_mismatch",
+        ):
+            FeishuThreadReplyAdapter(SimpleNamespace(send=send)).add_reply(
+                "oc_group123",
+                "topic:om_wrong",
+                "must not send",
+                "00000000-0000-0000-0000-000000000001",
+            )
+
+    assert calls == []
 
 
 def test_feishu_thread_reader_has_a_hard_deadline(monkeypatch):
@@ -689,12 +806,15 @@ def test_feishu_thread_write_timeout_is_outcome_uncertain(monkeypatch):
         0.01,
     )
 
-    result = FeishuThreadReplyAdapter(SimpleNamespace(send=slow_send)).add_reply(
-        "oc_group123",
-        "topic:om_root123",
-        "marker\nreport",
-        "00000000-0000-0000-0000-000000000001",
-    )
+    with dispatcher_module._bound_provider_write_guard(
+        _TEST_PROVIDER_WRITE_CLAIM
+    ):
+        result = FeishuThreadReplyAdapter(SimpleNamespace(send=slow_send)).add_reply(
+            "oc_group123",
+            "topic:om_root123",
+            "marker\nreport",
+            "00000000-0000-0000-0000-000000000001",
+        )
 
     assert result["success"] is False
     assert result["outcome_uncertain"] is True
@@ -745,7 +865,7 @@ def test_success_requires_read_before_http_add_and_read_after_remote_id(tmp_path
     assert receipt["remote_id"] == "comment-1"
     assert receipt["confirmed_field_keys"] == ["field_9193cb", "field_8c912e"]
     payload = json.loads(effect["payload_json"])
-    assert payload["report_link_kind"] == "html_report"
+    assert payload["report_link_kind"] == "foxglove_viz"
     assert payload["project_key"] == "t03o4q"
     assert payload["project_simple_name"] == "g1q3"
     assert payload["issue_url"] == (
@@ -754,8 +874,7 @@ def test_success_requires_read_before_http_add_and_read_after_remote_id(tmp_path
     assert job["issue_url"] == payload["issue_url"]
     assert remote.fields["field_8c912e"] == payload["report_url"]
     assert payload["report_url"] in remote.comments[0]["content"]
-    assert payload["foxglove_url"] != payload["report_url"]
-    assert payload["foxglove_url"] not in remote.comments[0]["content"]
+    assert payload["foxglove_url"] == payload["report_url"]
     assert receipt["confirmed_report_url"] == payload["report_url"]
     assert (
         receipt["confirmed_content_sha256"]
@@ -828,23 +947,21 @@ def test_quality_regression_guard_only_blocks_causal_to_noncausal(
     )
 
 
-def test_html_only_causal_result_is_delivered_without_foxglove_surface(tmp_path):
-    store = _seed(tmp_path, bundle_payload=_html_only_bundle_payload())
-    dispatcher, remote, _clock = _dispatcher(tmp_path)
+def test_html_only_causal_result_is_held_before_delivery_creation(tmp_path):
+    control, result = _control(tmp_path)
+    _bind_activation_execution(control, result, state="steady_active")
+    collector = _collector(
+        tmp_path,
+        bundle_reader=lambda _claim: _html_only_bundle_payload(),
+    )
 
-    outcome = dispatcher.dispatch_one()
+    outcomes = collector.collect_batch()
 
-    assert outcome.status == "succeeded"
-    effect = store.list_rows("rca_delivery_effects")[0]
-    payload = json.loads(effect["payload_json"])
-    assert payload["report_status"] == "html_delivery_ready"
-    assert payload["viz_mcap_vm"] == ""
-    assert payload["foxglove_url"] == ""
-    assert payload["report_cifs_path"].endswith("/index.html")
-    assert payload["report_url"] in remote.comments[0]["content"]
+    assert outcomes[0].status == "failure_hold"
+    assert collector.store.list_rows("rca_delivery_effects") == []
 
 
-def test_postwrite_marker_without_canonical_body_never_acks(tmp_path):
+def test_postwrite_body_without_marker_never_acks_and_enters_uncertain(tmp_path):
     _seed(tmp_path)
 
     class TruncatingRemote(Remote):
@@ -858,11 +975,15 @@ def test_postwrite_marker_without_canonical_body_never_acks(tmp_path):
 
     outcome = dispatcher.dispatch_one()
 
-    assert outcome.status == "quarantined"
-    assert outcome.error_code == "delivery_remote_content_mismatch"
+    assert outcome.status == "uncertain"
+    assert outcome.error_code == "feishu_postwrite_confirmation_mismatch"
     assert remote.add_calls == 1
     assert remote.update_field_calls == 1
-    assert remote.comments[0]["content"].startswith("[RCA_DELIVERY:")
+    assert remote.comments[0]["content"] in {
+        "本单未能定向",
+        "建议责任方：视觉感知",
+        "建议责任方：纵向控制",
+    }
 
 
 def test_existing_marker_repairs_drifted_fields_without_duplicate_comment(tmp_path):
@@ -1162,9 +1283,9 @@ def test_terminal_manual_delivery_skips_report_http_and_sends_both_effects(tmp_p
     assert verifier_calls == []
     assert remote.add_calls == 1
     assert remote.update_field_calls == 1
-    assert (
-        "归因结论：本次自动处理未形成可确认的归因结论" in remote.fields["field_9193cb"]
-    )
+    assert "检查路径：" in remote.fields["field_9193cb"]
+    assert "数据来源：" in remote.fields["field_9193cb"]
+    assert "检查结果：" in remote.fields["field_9193cb"]
     assert "第 1 代" not in remote.fields["field_9193cb"]
     assert "其他代次" not in remote.fields["field_9193cb"]
     assert remote.fields["field_8c912e"] == existing_report
@@ -1846,7 +1967,7 @@ def test_thread_circuit_opens_without_blocking_issue_comment(tmp_path):
     assert store.delivery_dispatcher_circuit("feishu_issue_comment").is_open is False
 
 
-def test_delivery_verifies_primary_html_before_external_comment(tmp_path):
+def test_delivery_verifies_viz_publication_before_external_comment(tmp_path):
     _seed(tmp_path, bundle_payload=_web_bundle_payload())
     calls = []
 
@@ -1859,7 +1980,7 @@ def test_delivery_verifies_primary_html_before_external_comment(tmp_path):
 
     def guarded_add(project_key, work_item_id, content):
         assert len(calls) == 1
-        assert calls[0][0].endswith("/index.html")
+        assert "?ds=foxglove-http&ds.mcapPath=" in calls[0][0]
         return add_comment(project_key, work_item_id, content)
 
     remote.add_comment = guarded_add
@@ -1867,7 +1988,7 @@ def test_delivery_verifies_primary_html_before_external_comment(tmp_path):
 
     assert dispatcher.dispatch_one().status == "succeeded"
     assert len(calls) == 1
-    assert calls[0][0].endswith("/index.html")
+    assert "?ds=foxglove-http&ds.mcapPath=" in calls[0][0]
     assert remote.add_calls == 1
 
 
@@ -1912,28 +2033,31 @@ def test_publication_report_url_counterexamples_fail_closed_before_http(
     assert exc.value.code == "delivery_effect_report_url_invalid"
 
 
-def test_validated_effect_binds_primary_report_to_http_readback_probe(tmp_path):
+def test_validated_effect_binds_viz_publication_to_write_boundary_probe(tmp_path):
     store = _seed(tmp_path)
     claim = store.claim_due_effect(lease_owner="worker-1", now=NOW)
     assert claim is not None
 
     validated = dispatcher_module._validate_effect(claim)
 
-    index = next(
-        item for item in claim.manifest["artifacts"] if item["role"] == "index_html"
-    )
+    publication = claim.contract["artifacts"]["viz_publication"]
     assert validated.artifacts == (
-        ("index_html", claim.report_url, index["size"], index["sha256"]),
+        (
+            "viz_mcap",
+            claim.report_url,
+            publication["size"],
+            publication["sha256"],
+        ),
     )
 
 
-def test_dispatcher_rejects_non_html_report_link_kind_before_write(tmp_path):
+def test_dispatcher_rejects_html_report_link_kind_before_write(tmp_path):
     store = _seed(tmp_path)
     claim = store.claim_due_effect(lease_owner="worker-1", now=NOW)
     assert claim is not None
     tampered = replace(
         claim,
-        payload={**claim.payload, "report_link_kind": "foxglove_viz"},
+        payload={**claim.payload, "report_link_kind": "html_report"},
     )
 
     with pytest.raises(DeliveryContractError) as exc:
@@ -1942,12 +2066,12 @@ def test_dispatcher_rejects_non_html_report_link_kind_before_write(tmp_path):
     assert exc.value.code == "delivery_effect_report_link_kind_invalid"
 
 
-def test_dispatcher_rejects_foxglove_report_field_before_write(tmp_path):
+def test_dispatcher_rejects_internal_html_report_field_before_write(tmp_path):
     store = _seed(tmp_path)
     claim = store.claim_due_effect(lease_owner="worker-1", now=NOW)
     assert claim is not None
     field_updates = [dict(item) for item in claim.payload["field_updates"]]
-    field_updates[1]["field_value"] = claim.payload["foxglove_url"]
+    field_updates[1]["field_value"] = claim.manifest["report_url"]
     tampered = replace(
         claim,
         payload={**claim.payload, "field_updates": field_updates},
@@ -2262,14 +2386,7 @@ def test_changed_remote_html_assets_do_not_block_primary_report_delivery(
     calls = []
 
     def verifier(url, size, sha256):
-        relative = _asset_relative(url)
-        calls.append(relative)
-        if relative == changed_asset:
-            return {
-                "success": False,
-                "permanent": True,
-                "error_code": "report_http_hash_mismatch",
-            }
+        calls.append(url)
         return _verified_report(url, size, sha256)
 
     dispatcher, remote, _clock = _dispatcher(tmp_path, verifier=verifier)
@@ -2277,11 +2394,13 @@ def test_changed_remote_html_assets_do_not_block_primary_report_delivery(
     outcome = dispatcher.dispatch_one()
 
     assert outcome.status == "succeeded"
-    assert calls == ["index.html"]
+    assert len(calls) == 1
+    assert "?ds=foxglove-http&ds.mcapPath=" in calls[0]
+    assert changed_asset not in calls[0]
     assert remote.add_calls == 1
 
 
-def test_primary_report_verifier_is_inside_fenced_write_boundary(tmp_path):
+def test_viz_publication_verifier_is_inside_fenced_write_boundary(tmp_path):
     store = _seed(tmp_path)
     remote = Remote()
     calls = []
@@ -2301,7 +2420,7 @@ def test_primary_report_verifier_is_inside_fenced_write_boundary(tmp_path):
 
     assert outcome.status == "succeeded"
     assert len(calls) == 1
-    assert calls[0][0].endswith("/index.html")
+    assert "?ds=foxglove-http&ds.mcapPath=" in calls[0][0]
     assert remote.add_calls == 1
     assert store.list_rows("rca_delivery_effects")[0]["status"] == "succeeded"
     assert store.delivery_dispatcher_circuit().is_open is False
@@ -2554,14 +2673,10 @@ def test_stored_artifact_inventory_corruption_quarantines_before_boundaries(
     assert remote.list_calls == remote.add_calls == 0
 
 
-def test_primary_report_network_failure_blocks_external_comment(tmp_path, monkeypatch):
-    monkeypatch.setenv(
-        "PNC_FOXGLOVE_RENDER_HOST",
-        "http://192.168.26.174:18081",
-    )
+def test_viz_publication_probe_failure_blocks_external_comment(tmp_path):
     store = _seed(tmp_path)
     assert store.list_rows("rca_delivery_jobs")[0]["report_url"].startswith(
-        "http://192.168.26.174:18081/"
+        "https://192.168.21.217/?ds=foxglove-http&ds.mcapPath="
     )
     dispatcher, remote, _clock = _dispatcher(
         tmp_path,
@@ -2901,7 +3016,10 @@ def test_meegle_adapter_exposes_only_fixed_list_and_add_commands():
         adapter.list_comments("t03o4q", "7041712812")["comments"][0]["remote_id"]
         == "c-1"
     )
-    assert adapter.add_comment("t03o4q", "7041712812", "content")["remote_id"] == "c-2"
+    with dispatcher_module._bound_provider_write_guard(
+        _TEST_PROVIDER_WRITE_CLAIM
+    ):
+        assert adapter.add_comment("t03o4q", "7041712812", "content")["remote_id"] == "c-2"
     assert [call[:2] for call in calls] == [
         ["comment", "list"],
         ["comment", "add"],
@@ -2910,6 +3028,69 @@ def test_meegle_adapter_exposes_only_fixed_list_and_add_commands():
     assert calls[0][calls[0].index("--page-num") + 1] == "1"
     assert "--content" not in calls[0]
     assert "--content" in calls[1]
+
+
+def test_meegle_provider_guard_missing_or_revoked_blocks_before_runner(
+    monkeypatch,
+):
+    calls = []
+    adapter = MeegleIssueCommentAdapter(
+        lambda args: calls.append(args)
+        or (0, json.dumps({"comment_id": "unexpected"}), "")
+    )
+
+    with pytest.raises(
+        dispatcher_module.ExternalWriteFenceError,
+        match="external_write_provider_claim_missing",
+    ):
+        adapter.add_comment("t03o4q", "7041712812", "must not send")
+
+    def revoked_revalidate(*_args, **_kwargs):
+        raise dispatcher_module.ExternalWriteFenceError(
+            "external_write_fence_epoch_not_current"
+        )
+
+    monkeypatch.setattr(
+        dispatcher_module,
+        "revalidate_provider_write_claim",
+        revoked_revalidate,
+    )
+    with dispatcher_module._bound_provider_write_guard(
+        _TEST_PROVIDER_WRITE_CLAIM
+    ):
+        with pytest.raises(
+            dispatcher_module.ExternalWriteFenceError,
+            match="external_write_fence_epoch_not_current",
+        ):
+            adapter.update_fields(
+                "t03o4q",
+                "7041712812",
+                (("field_9193cb", "must not write"),),
+            )
+
+    assert calls == []
+
+
+def test_meegle_provider_rejects_forged_callable_context_before_runner():
+    calls = []
+    adapter = MeegleIssueCommentAdapter(
+        lambda args: calls.append(args)
+        or (0, json.dumps({"comment_id": "unexpected"}), "")
+    )
+
+    with pytest.raises(
+        dispatcher_module.ExternalWriteFenceError,
+        match="external_write_provider_claim_invalid",
+    ):
+        with dispatcher_module._bound_provider_write_guard(
+            lambda *_args, **_kwargs: {
+                "epoch_id": "forged",
+                "state": "steady_active",
+            }
+        ):
+            adapter.add_comment("t03o4q", "7041712812", "must not send")
+
+    assert calls == []
 
 
 def test_meegle_adapter_reads_every_page_until_explicit_completion():
@@ -3122,7 +3303,10 @@ def test_meegle_adapter_treats_weak_success_as_uncertain():
     adapter = MeegleIssueCommentAdapter(
         lambda _args: (0, json.dumps({"success": True}), "")
     )
-    result = adapter.add_comment("t03o4q", "7041712812", "content")
+    with dispatcher_module._bound_provider_write_guard(
+        _TEST_PROVIDER_WRITE_CLAIM
+    ):
+        result = adapter.add_comment("t03o4q", "7041712812", "content")
     assert result["success"] is False
     assert result["outcome_uncertain"] is True
     assert result["error_code"] == "feishu_add_remote_id_missing"
@@ -3160,14 +3344,17 @@ def test_meegle_adapter_reads_and_updates_only_attribution_fields():
         "7041712812",
         ("field_9193cb", "field_8c912e"),
     )
-    update = adapter.update_fields(
-        "t03o4q",
-        "7041712812",
-        (
-            ("field_9193cb", "candidate conclusion"),
-            ("field_8c912e", "http://report.example/index.html"),
-        ),
-    )
+    with dispatcher_module._bound_provider_write_guard(
+        _TEST_PROVIDER_WRITE_CLAIM
+    ):
+        update = adapter.update_fields(
+            "t03o4q",
+            "7041712812",
+            (
+                ("field_9193cb", "candidate conclusion"),
+                ("field_8c912e", "http://report.example/index.html"),
+            ),
+        )
 
     assert fields == {
         "success": True,
@@ -3357,11 +3544,14 @@ def test_meegle_adapter_allows_terminal_result_only_but_never_report_only():
         "success": True,
         "fields": {"field_9193cb": ""},
     }
-    assert adapter.update_fields(
-        "t03o4q",
-        "7041712812",
-        (("field_9193cb", "自动归因未完成（非归因结论）"),),
-    ) == {"success": True}
+    with dispatcher_module._bound_provider_write_guard(
+        _TEST_PROVIDER_WRITE_CLAIM
+    ):
+        assert adapter.update_fields(
+            "t03o4q",
+            "7041712812",
+            (("field_9193cb", "自动归因未完成（非归因结论）"),),
+        ) == {"success": True}
     assert (
         adapter.update_fields(
             "t03o4q",
@@ -3582,6 +3772,98 @@ def test_default_report_verifier_performs_bounded_head_then_get(monkeypatch):
         ("GET", url),
     ]
     assert all(0 < timeout <= 7 for _method, _url, timeout in calls)
+
+
+def test_default_report_verifier_restats_viz_then_probes_renderer_only(monkeypatch):
+    submission_key = "g1q3-rca-s1-" + "a" * 64
+    path = canonical_viz_mcap_path(submission_key)
+    url = foxglove_url(path)
+    expected_size = 17
+    expected_sha256 = "b" * 64
+    calls = []
+    monkeypatch.setattr(
+        dispatcher_module,
+        "_verify_local_viz_mcap",
+        lambda observed_path, size, sha256: {
+            "success": True,
+            "content_length": size,
+            "sha256": sha256,
+            "observed_path": observed_path,
+        },
+    )
+
+    class Response:
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def getcode(self):
+            return 200
+
+    class Opener:
+        def open(self, request, timeout):
+            calls.append((request.get_method(), request.full_url, timeout))
+            return Response()
+
+    result = default_report_verifier(
+        url,
+        expected_size,
+        expected_sha256,
+        timeout_seconds=7,
+        opener=Opener(),
+    )
+
+    assert result == {
+        "success": True,
+        "status_code": 200,
+        "content_length": expected_size,
+        "sha256": expected_sha256,
+        "viz_mcap_path": path,
+        "renderer_probe": "spa_endpoint_only",
+    }
+    assert [(method, called_url) for method, called_url, _timeout in calls] == [
+        ("HEAD", "https://192.168.21.217/")
+    ]
+    assert 0 < calls[0][2] <= 7
+
+
+def test_default_report_verifier_missing_viz_never_probes_renderer(monkeypatch):
+    path = canonical_viz_mcap_path("g1q3-rca-s1-" + "a" * 64)
+    url = foxglove_url(path)
+    monkeypatch.setattr(
+        dispatcher_module,
+        "_verify_local_viz_mcap",
+        lambda *_args: {"success": False, "error_code": "viz_mcap_missing"},
+    )
+
+    class ForbiddenOpener:
+        def open(self, *_args, **_kwargs):
+            raise AssertionError("missing viz must stop before renderer probe")
+
+    result = default_report_verifier(
+        url,
+        17,
+        "b" * 64,
+        opener=ForbiddenOpener(),
+    )
+
+    assert result == {"success": False, "error_code": "viz_mcap_missing"}
+
+
+def test_default_report_verifier_rejects_noncanonical_viz_url_before_io():
+    invalid = (
+        "https://192.168.21.217/?ds=foxglove-http&"
+        "ds.mcapPath=/mnt/tmp/not-publishable.viz.mcap"
+    )
+
+    result = default_report_verifier(invalid, 17, "b" * 64)
+
+    assert result["success"] is False
+    assert result["permanent"] is True
 
 
 def test_default_report_verifier_fails_closed_when_internal_service_is_unreachable(

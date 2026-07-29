@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timezone
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +10,7 @@ import pytest
 from gateway.pnc_rca_prod_bootstrap import RcaBootstrapAuthorizationError
 from gateway.pnc_rca_control_store import RcaControlStore
 from gateway.pnc_rca_runtime_identity import RCA_RUNTIME_RELATIVE_FILES
+from gateway.pnc_rca_runtime_identity import canonical_json_sha256
 from scripts import pnc_rca_outbox_dispatcher as dispatcher
 from tests.gateway.test_pnc_rca_control_store import _policy, _record
 
@@ -82,6 +84,21 @@ def test_config_exposes_strict_activation_required(tmp_path):
 
     assert config.activation_required is True
     assert config.public_dict()["activation_required"] is True
+
+
+def test_config_rejects_declarative_feishu_writeback_enablement(tmp_path):
+    env = _config_env(tmp_path)
+    env["HERMES_RCA_OUTBOX_ALLOW_FEISHU_WRITEBACK"] = "true"
+
+    with pytest.raises(ValueError, match="declarative-only"):
+        dispatcher.DispatcherConfig.from_env(env, hermes_home=tmp_path)
+
+
+def test_config_keeps_legacy_feishu_writeback_projection_false(tmp_path):
+    config = dispatcher.DispatcherConfig.from_env(_config_env(tmp_path), hermes_home=tmp_path)
+
+    assert config.allow_feishu_writeback is False
+    assert config.public_dict()["allow_feishu_writeback"] is False
 
 
 @pytest.mark.parametrize("value", ["1", "0", "yes", "on", "off", ""])
@@ -204,6 +221,246 @@ def test_enabled_resident_without_epoch_exits_before_dispatcher_creation(
     assert store.list_rows("kafka_inbox") == []
     assert store.list_rows("rca_outbox") == []
     assert "resident_activation_epoch_missing" in capsys.readouterr().err
+
+
+def _patch_reset_cli(monkeypatch, config):
+    monkeypatch.setattr(dispatcher, "load_dispatcher_environment", lambda _path: None)
+    monkeypatch.setattr(
+        dispatcher.DispatcherConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+
+
+def test_clear_circuit_plan_does_not_mutate_or_create_receipt(
+    tmp_path, monkeypatch, capsys
+):
+    config = dispatcher.DispatcherConfig.from_env(
+        _config_env(tmp_path), hermes_home=tmp_path
+    )
+    store = RcaControlStore(config.control_db_path)
+    store.open_dispatcher_circuit(
+        reason_code="snapshot_stale", reason_detail="offline test"
+    )
+    receipt = tmp_path / "reset.json"
+    _patch_reset_cli(monkeypatch, config)
+
+    assert dispatcher.main(
+        [
+            "--clear-circuit",
+            "--operator",
+            "owner@example.com",
+            "--reason",
+            "verify snapshot before rearm",
+            "--receipt",
+            str(receipt),
+        ]
+    ) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["mode"] == "plan"
+    assert result["applied"] is False
+    assert result["pre_state"]["state"] == "open"
+    assert store.dispatcher_circuit().state == "open"
+    assert not receipt.exists()
+
+
+def test_clear_circuit_apply_writes_receipt_and_db_audit(
+    tmp_path, monkeypatch, capsys
+):
+    config = dispatcher.DispatcherConfig.from_env(
+        _config_env(tmp_path), hermes_home=tmp_path
+    )
+    store = RcaControlStore(config.control_db_path)
+    store.open_dispatcher_circuit(
+        reason_code="snapshot_stale", reason_detail="offline test"
+    )
+    receipt = tmp_path / "reset.json"
+    _patch_reset_cli(monkeypatch, config)
+
+    assert dispatcher.main(
+        [
+            "--clear-circuit",
+            "--operator",
+            "owner@example.com",
+            "--reason",
+            "verify snapshot before rearm",
+            "--apply",
+            "--receipt",
+            str(receipt),
+        ]
+    ) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    body = json.loads(receipt.read_text(encoding="utf-8"))
+    assert result["applied"] is True
+    assert result["receipt"] == str(receipt.absolute())
+    assert result["receipt_sha256"]
+    assert body["operator"] == "owner@example.com"
+    assert body["reason"] == "verify snapshot before rearm"
+    assert body["pre_state"]["state"] == "open"
+    assert body["post_state"]["state"] == "closed"
+    assert body["effect_delta"]["external_writes"] == 0
+    assert body["receipt_fingerprint"] == canonical_json_sha256(
+        {key: value for key, value in body.items() if key != "receipt_fingerprint"}
+    )
+    assert receipt.stat().st_mode & 0o777 == 0o444
+    sidecar = receipt.with_name(receipt.name + ".sha256")
+    assert sidecar.read_text(encoding="ascii").startswith(result["receipt_sha256"])
+    assert store.dispatcher_circuit().state == "closed"
+    assert store.dispatcher_circuit_reset_audit(body["reset_id"]) == body
+
+
+def test_clear_circuit_duplicate_receipt_is_rejected_before_mutation(
+    tmp_path, monkeypatch, capsys
+):
+    config = dispatcher.DispatcherConfig.from_env(
+        _config_env(tmp_path), hermes_home=tmp_path
+    )
+    store = RcaControlStore(config.control_db_path)
+    store.open_dispatcher_circuit(reason_code="snapshot_stale")
+    receipt = tmp_path / "reset.json"
+    _patch_reset_cli(monkeypatch, config)
+    args = [
+        "--clear-circuit",
+        "--operator",
+        "owner",
+        "--reason",
+        "first reset",
+        "--apply",
+        "--receipt",
+        str(receipt),
+    ]
+    assert dispatcher.main(args) == 0
+    capsys.readouterr()
+
+    # Re-open the circuit to prove the duplicate path is checked before the
+    # second mutation attempt.
+    store.open_dispatcher_circuit(reason_code="reopened-for-negative-test")
+    assert dispatcher.main(args) == 2
+    assert "already_exists" in capsys.readouterr().err
+    assert store.dispatcher_circuit().state == "open"
+
+
+def test_clear_circuit_closed_state_fails_closed_without_plan_success(
+    tmp_path, monkeypatch, capsys
+):
+    config = dispatcher.DispatcherConfig.from_env(
+        _config_env(tmp_path), hermes_home=tmp_path
+    )
+    store = RcaControlStore(config.control_db_path)
+    _patch_reset_cli(monkeypatch, config)
+
+    assert dispatcher.main(
+        [
+            "--clear-circuit",
+            "--operator",
+            "owner",
+            "--reason",
+            "do not reset a closed circuit",
+        ]
+    ) == 2
+    assert "requires_open_circuit" in capsys.readouterr().err
+    assert store.dispatcher_circuit().state == "closed"
+
+
+def test_clear_circuit_receipt_materialization_failure_reports_recovery(
+    tmp_path, monkeypatch, capsys
+):
+    config = dispatcher.DispatcherConfig.from_env(
+        _config_env(tmp_path), hermes_home=tmp_path
+    )
+    store = RcaControlStore(config.control_db_path)
+    store.open_dispatcher_circuit(reason_code="snapshot_stale")
+    receipt = tmp_path / "reset.json"
+    _patch_reset_cli(monkeypatch, config)
+    writer = dispatcher._write_immutable_receipt
+
+    def fail_materialization(*_args, **_kwargs):
+        raise OSError("simulated receipt filesystem failure")
+
+    monkeypatch.setattr(dispatcher, "_write_immutable_receipt", fail_materialization)
+    assert dispatcher.main(
+        [
+            "--clear-circuit",
+            "--operator",
+            "owner",
+            "--reason",
+            "persist database audit before filesystem copy",
+            "--apply",
+            "--receipt",
+            str(receipt),
+        ]
+    ) == 2
+    error = json.loads(capsys.readouterr().err)
+    assert error["recovery_required"] is True
+    assert error["meta_key"].startswith("rca_dispatcher_circuit_reset:")
+    assert store.dispatcher_circuit().state == "closed"
+    assert store.dispatcher_circuit_reset_audit(error["reset_id"]) is not None
+    monkeypatch.setattr(dispatcher, "_write_immutable_receipt", writer)
+    recovered = tmp_path / "recovered-reset.json"
+    assert dispatcher.main(
+        [
+            "--materialize-reset",
+            error["reset_id"],
+            "--receipt",
+            str(recovered),
+        ]
+    ) == 0
+    recovery_result = json.loads(capsys.readouterr().out)
+    assert recovery_result["recovered"] is True
+    assert json.loads(recovered.read_text(encoding="utf-8"))["reset_id"] == error[
+        "reset_id"
+    ]
+
+
+def test_clear_circuit_rejects_relative_receipt_before_mutation(
+    tmp_path, monkeypatch, capsys
+):
+    config = dispatcher.DispatcherConfig.from_env(
+        _config_env(tmp_path), hermes_home=tmp_path
+    )
+    store = RcaControlStore(config.control_db_path)
+    store.open_dispatcher_circuit(reason_code="snapshot_stale")
+    _patch_reset_cli(monkeypatch, config)
+
+    assert dispatcher.main(
+        [
+            "--clear-circuit",
+            "--operator",
+            "owner",
+            "--reason",
+            "absolute path required",
+            "--apply",
+            "--receipt",
+            "relative-reset.json",
+        ]
+    ) == 2
+    assert "path_invalid" in capsys.readouterr().err
+    assert store.dispatcher_circuit().state == "open"
+
+
+@pytest.mark.parametrize(
+    "extra,expected",
+    [
+        (["--reason", "reason"], "operator_and_reason_required"),
+        (["--operator", "operator"], "operator_and_reason_required"),
+        (["--operator", "operator", "--reason", "reason", "--apply"], "receipt_required"),
+    ],
+)
+def test_clear_circuit_apply_requires_bounded_audit_inputs(
+    tmp_path, monkeypatch, capsys, extra, expected
+):
+    config = dispatcher.DispatcherConfig.from_env(
+        _config_env(tmp_path), hermes_home=tmp_path
+    )
+    store = RcaControlStore(config.control_db_path)
+    store.open_dispatcher_circuit(reason_code="snapshot_stale")
+    _patch_reset_cli(monkeypatch, config)
+
+    assert dispatcher.main(["--clear-circuit", *extra]) == 2
+    assert expected in capsys.readouterr().err
+    assert store.dispatcher_circuit().state == "open"
 
 
 def test_config_fails_closed_without_production_capacity_mode(tmp_path):

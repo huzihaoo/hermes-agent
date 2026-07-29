@@ -16,7 +16,7 @@ import stat
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from gateway.pnc_rca_conclusion_adjudication import (
     ADJUDICATION_ARTIFACT_RECEIPT_SCHEMA_VERSION,
@@ -276,8 +276,6 @@ def _handle_w13_adjudication(
     owner_id: str,
     owner_name: str,
 ) -> OwnerReviewResult:
-    from gateway.pnc_rca_delivery_store import RcaDeliveryStore
-
     if requested_action == "更正" and not reason:
         return OwnerReviewResult(
             handled=True,
@@ -286,69 +284,24 @@ def _handle_w13_adjudication(
     if not issue_ids:
         return OwnerReviewResult(handled=True, response=_usage_message())
     adjudication_action = "recognize" if requested_action == "追认" else "retract"
-    artifact_action = "追认" if requested_action == "追认" else "撤回"
     audit_reason = reason or "owner_confirmed_medium_confidence_candidate"
-    control_db_path = (
-        hermes_home
-        / "runtime"
-        / "pnc_agent"
-        / "feishu_issue_kafka_rca"
-        / "control.sqlite3"
-    )
-    now = datetime.now(timezone.utc)
     try:
-        store = RcaDeliveryStore(control_db_path, require_current=True)
-        results = store.record_conclusion_adjudications(
-            work_item_ids=issue_ids,
+        result = resolve_candidate_conclusion_review(
+            event=event,
+            hermes_home=hermes_home,
+            issue_ids=issue_ids,
             action=adjudication_action,
             reason=audit_reason,
-            actor_id=owner_id,
-            actor_name=owner_name,
-            source=_source_record(event),
-            require_medium_candidate=True,
-            now=now,
+            owner_id=owner_id,
+            owner_name=owner_name,
         )
     except Exception as exc:
         return OwnerReviewResult(
             handled=True,
             response=f"RCA {requested_action}未执行：{exc}",
         )
-
-    review_dir = hermes_home / "pnc_agent" / "reviews" / "g1q3_rca"
-    artifact_failures: list[str] = []
-    for result in results:
-        try:
-            persisted = _persist_owner_review_artifacts(
-                event=event,
-                hermes_home=hermes_home,
-                review_dir=review_dir,
-                issue_id=result.work_item_id,
-                action=artifact_action,
-                reason=audit_reason,
-                owner_id=owner_id,
-                owner_name=owner_name,
-                override=True,
-                adjudication_result=result,
-                now=now,
-            )
-            store.mark_conclusion_adjudication_artifact_repair(
-                adjudication_id=result.adjudication_id,
-                succeeded=True,
-                receipt_binding=persisted["receipt_binding"],
-                now=now,
-            )
-        except Exception as exc:
-            artifact_failures.append(result.work_item_id)
-            try:
-                store.mark_conclusion_adjudication_artifact_repair(
-                    adjudication_id=result.adjudication_id,
-                    succeeded=False,
-                    error_code=type(exc).__name__,
-                    error_detail=str(exc),
-                    now=now,
-                )
-            except Exception:
-                pass
+    artifact_failures = result["artifact_failures"]
+    results = result["results"]
     if artifact_failures:
         return OwnerReviewResult(
             handled=True,
@@ -361,6 +314,193 @@ def _handle_w13_adjudication(
         handled=True,
         response=f"RCA {requested_action}已完成 {len(results)} 单。",
     )
+
+
+def resolve_candidate_conclusion_review(
+    *,
+    event: Any,
+    hermes_home: str | Path,
+    issue_ids: tuple[str, ...],
+    action: str,
+    reason: str,
+    owner_id: str,
+    owner_name: str = "",
+    candidate_bindings: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Create the existing immutable medium-candidate adjudication.
+
+    Both owner text commands and task-confirm buttons/text call this function.
+    It is the single semantic resolver: the delivery store rechecks that every
+    requested issue is the latest settled medium candidate and reserves the
+    already-defined correction comment slot atomically.
+    """
+    from gateway.pnc_rca_delivery_store import RcaDeliveryStore
+
+    normalized_action = str(action or "").strip()
+    if normalized_action not in {"recognize", "retract"}:
+        raise ValueError("rca candidate review action is invalid")
+    normalized_issue_ids = tuple(str(item or "").strip() for item in issue_ids)
+    if (
+        not normalized_issue_ids
+        or len(normalized_issue_ids) > _MAX_BATCH_SIZE
+        or len(set(normalized_issue_ids)) != len(normalized_issue_ids)
+        or any(not item.isdigit() for item in normalized_issue_ids)
+    ):
+        raise ValueError("rca candidate review issue ids are invalid")
+    owners = _owner_allowlist()
+    normalized_owner_id = str(owner_id or "").strip()
+    normalized_owner_name = str(owner_name or "").strip()
+    if not owners.user_ids or not _is_allowed_owner(
+        owner_id=normalized_owner_id,
+        owner_name=normalized_owner_name,
+        owners=owners,
+    ):
+        raise PermissionError("rca candidate review owner is not authorized")
+    if not _is_g1q3_bound_group_source(getattr(event, "source", None)):
+        raise PermissionError("rca candidate review source is not bound")
+
+    home = Path(hermes_home)
+    control_db_path = (
+        home
+        / "runtime"
+        / "pnc_agent"
+        / "feishu_issue_kafka_rca"
+        / "control.sqlite3"
+    )
+    now = datetime.now(timezone.utc)
+    store = RcaDeliveryStore(control_db_path, require_current=True)
+    normalized_reason = str(reason or "").strip()
+    normalized_source = _source_record(event)
+    if candidate_bindings is None:
+        adjudications = store.record_conclusion_adjudications(
+            work_item_ids=normalized_issue_ids,
+            action=normalized_action,
+            reason=normalized_reason,
+            actor_id=normalized_owner_id,
+            actor_name=normalized_owner_name,
+            source=normalized_source,
+            require_medium_candidate=True,
+            now=now,
+        )
+    else:
+        binding_keys = {str(key or "").strip() for key in candidate_bindings}
+        if binding_keys != set(normalized_issue_ids):
+            raise ValueError("rca candidate review bindings are incomplete")
+        from gateway.pnc_rca_conclusion_adjudication import (
+            record_conclusion_adjudication_tx,
+        )
+
+        # The public batch method intentionally selects by issue.  A card also
+        # carries an immutable publication identity, so use the same store
+        # primitive inside one transaction and compare every binding before
+        # commit.  A stale/tampered card therefore cannot adjudicate a newer
+        # generation and then fail only after the mutation.
+        conn = store._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            bound_results = []
+            for issue_id in normalized_issue_ids:
+                binding = candidate_bindings[issue_id]
+                expected_business_key = str(
+                    binding.get("business_key") or ""
+                ).strip()
+                expected_effect_key = str(
+                    binding.get("original_effect_key") or ""
+                ).strip()
+                try:
+                    expected_generation = int(binding.get("generation") or 0)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "rca candidate review generation binding is invalid"
+                    ) from exc
+                if (
+                    not expected_business_key
+                    or not expected_effect_key
+                    or expected_generation < 1
+                ):
+                    raise ValueError("rca candidate review binding is invalid")
+                adjudication = record_conclusion_adjudication_tx(
+                    conn,
+                    work_item_id=issue_id,
+                    action=normalized_action,
+                    reason=normalized_reason,
+                    actor_id=normalized_owner_id,
+                    actor_name=normalized_owner_name,
+                    source=normalized_source,
+                    original_effect_key=expected_effect_key,
+                    require_medium_candidate=True,
+                    now=now,
+                )
+                if (
+                    adjudication.business_key != expected_business_key
+                    or adjudication.generation != expected_generation
+                    or adjudication.work_item_id != issue_id
+                    or adjudication.original_effect_key != expected_effect_key
+                ):
+                    raise ValueError("rca candidate review binding changed")
+                bound_results.append(adjudication)
+            conn.commit()
+            adjudications = tuple(bound_results)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    review_dir = home / "pnc_agent" / "reviews" / "g1q3_rca"
+    artifact_failures: list[str] = []
+    rows: list[dict[str, Any]] = []
+    artifact_action = "追认" if normalized_action == "recognize" else "撤回"
+    for adjudication in adjudications:
+        rows.append(
+            {
+                "adjudication_id": adjudication.adjudication_id,
+                "action": adjudication.action,
+                "conclusion_state": adjudication.conclusion_state,
+                "business_key": adjudication.business_key,
+                "generation": adjudication.generation,
+                "work_item_id": adjudication.work_item_id,
+                "original_effect_key": adjudication.original_effect_key,
+                "correction_effect_key": adjudication.correction_effect_key,
+                "created": adjudication.created,
+            }
+        )
+        try:
+            persisted = _persist_owner_review_artifacts(
+                event=event,
+                hermes_home=home,
+                review_dir=review_dir,
+                issue_id=adjudication.work_item_id,
+                action=artifact_action,
+                reason=normalized_reason,
+                owner_id=normalized_owner_id,
+                owner_name=normalized_owner_name,
+                override=True,
+                adjudication_result=adjudication,
+                now=now,
+            )
+            store.mark_conclusion_adjudication_artifact_repair(
+                adjudication_id=adjudication.adjudication_id,
+                succeeded=True,
+                receipt_binding=persisted["receipt_binding"],
+                now=now,
+            )
+        except Exception as exc:
+            artifact_failures.append(adjudication.work_item_id)
+            try:
+                store.mark_conclusion_adjudication_artifact_repair(
+                    adjudication_id=adjudication.adjudication_id,
+                    succeeded=False,
+                    error_code=type(exc).__name__,
+                    error_detail=str(exc),
+                    now=now,
+                )
+            except Exception:
+                pass
+    return {
+        "results": rows,
+        "artifact_failures": artifact_failures,
+    }
 
 
 def _is_g1q3_bound_group_source(source: Any) -> bool:

@@ -78,12 +78,12 @@ def test_g1q3_delivery_section_renders_business_fields():
     })
     text = _dump(card)
     assert "归因状态：已有候选归因，待人工确认" in text
-    assert "报告状态：HTML 报告已生成" in text
+    assert "报告状态：内部审计产物已生成" in text
     assert "候选原因：触发请求出现但 TTC/gate 风险上下文不足" in text
     assert "责任候选：刘培瑞" in text
-    assert "HTML 报告路径" in text
+    assert "内部审计产物已生成" in text
     assert "打开 HTML 报告" not in text
-    assert "index.html" in text
+    assert "index.html" not in text
     assert "**诊断**" in text
     assert "命中既有报告，已复用" in text
 
@@ -203,7 +203,7 @@ def test_g1q3_delivery_section_uses_user_readable_status_and_clean_paths():
     })
     text = _dump(card)
     assert "归因状态：已有候选归因，待人工确认" in text
-    assert "报告状态：HTML 报告已生成" in text
+    assert "报告状态：内部审计产物已生成" in text
     assert "候选原因：实际减速度相对 OOI 加速度偏重，建议由控制继续核查" in text
     assert "候选原因：候选因果判断" not in text
     assert "。；" not in text
@@ -247,7 +247,7 @@ def test_legacy_mdi_command_is_neutralized_in_non_input_card_fields():
     assert "opaque" not in text
 
 
-def test_http_artifact_keeps_open_html_report_label():
+def test_http_html_artifact_is_not_user_visible_without_foxglove():
     card = render_task_card({
         "user_state": "done",
         "delivery": {
@@ -257,11 +257,12 @@ def test_http_artifact_keeps_open_html_report_label():
         },
     })
     text = _dump(card)
-    assert "[打开 HTML 报告](https://example.invalid/report/index.html)" in text
-    assert "HTML 报告路径" not in text
+    assert "https://example.invalid/report/index.html" not in text
+    assert "打开 HTML 报告" not in text
+    assert "当前尚无可交付 Foxglove 可视化" in text
 
 
-def test_http_report_url_is_clickable_open_label_and_cifs_stays_pickup():
+def test_internal_http_report_is_hidden_while_cifs_directory_stays_pickup():
     card = render_task_card({
         "user_state": "done",
         "delivery": {
@@ -274,9 +275,24 @@ def test_http_report_url_is_clickable_open_label_and_cifs_stays_pickup():
         },
     })
     text = _dump(card)
-    assert "[打开 HTML 报告](http://192.168.26.174:18081/G1Q3_RCA/cases/7026726390_acc/index.html)" in text
+    assert "http://192.168.26.174:18081/G1Q3_RCA/cases/7026726390_acc/index.html" not in text
     assert "📦 取件(CIFS)：//hfs.minieye.tech/department-perception_test_team/G1Q3_RCA/cases/7026726390_acc" in text
-    assert "HTML 报告路径：http" not in text
+    assert "打开 HTML 报告" not in text
+
+
+def test_html_paths_in_display_metadata_are_hidden_without_foxglove():
+    card = render_task_card({
+        "user_state": "done",
+        "delivery": {
+            "report_status": "html_delivery_ready",
+            "artifact_root": "/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases/demo/index.html",
+            "artifact_vm": "/mnt/minieye/pdcl/department/perception_test_team/G1Q3_RCA/cases/demo/index.html",
+            "artifact_cifs": "//hfs.minieye.tech/department-perception_test_team/G1Q3_RCA/cases/demo/index.html",
+        },
+    })
+
+    text = _dump(card)
+    assert "index.html" not in text
 
 
 def test_g1q3_card_prefers_foxglove_and_hides_independent_html_link():

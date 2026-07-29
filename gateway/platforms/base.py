@@ -110,6 +110,27 @@ def _reply_anchor_for_event(event) -> str | None:
     return getattr(event, "message_id", None)
 
 
+def _pnc_manual_response_must_be_silent(event) -> bool:
+    """Keep RCA manual-admission outcomes on the durable receipt surface."""
+
+    source = getattr(event, "source", None)
+    if _platform_name(getattr(source, "platform", None)) != "feishu":
+        return False
+    metadata = getattr(event, "metadata", None)
+    if not isinstance(metadata, dict):
+        return False
+    if metadata.get("pnc_rca_provider_writes_deferred") is True:
+        return True
+    binding = metadata.get("pnc_group_binding")
+    if isinstance(binding, dict) and binding.get("route_surface") == "rca_manual_intake":
+        return True
+    policy_error = metadata.get("pnc_group_binding_error")
+    return bool(
+        isinstance(policy_error, dict)
+        and policy_error.get("schema_version") == "pnc_group_binding_error_v1"
+    )
+
+
 def should_send_media_as_audio(platform, ext: str, is_voice: bool = False) -> bool:
     """Return True when a media file should use the platform's audio sender.
 
@@ -4540,6 +4561,8 @@ class BasePlatformAdapter(ABC):
 
         try:
             response = await self._message_handler(event)
+            if _pnc_manual_response_must_be_silent(event):
+                response = None
             _text, _eph_ttl = self._unwrap_ephemeral(response)
             # Send the response BEFORE cancelling the old task so the send
             # cannot be affected by task-cancellation side effects (race
@@ -4659,6 +4682,8 @@ class BasePlatformAdapter(ABC):
                 try:
                     _thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
                     response = await self._message_handler(event)
+                    if _pnc_manual_response_must_be_silent(event):
+                        response = None
                     _text, _eph_ttl = self._unwrap_ephemeral(response)
                     if _text:
                         _r = await self._send_with_retry(
@@ -4712,6 +4737,8 @@ class BasePlatformAdapter(ABC):
                             event.source, _reply_anchor_for_event(event)
                         )
                         response = await self._message_handler(event)
+                        if _pnc_manual_response_must_be_silent(event):
+                            response = None
                         _text, _eph_ttl = self._unwrap_ephemeral(response)
                         if _text:
                             _r = await self._send_with_retry(
@@ -4860,6 +4887,8 @@ class BasePlatformAdapter(ABC):
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
+            if _pnc_manual_response_must_be_silent(event):
+                response = None
             is_ephemeral_response = isinstance(response, EphemeralReply)
 
             # Slash-command handlers may return an EphemeralReply sentinel to
@@ -5214,24 +5243,31 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
-            try:
-                error_type = type(e).__name__
-                error_detail = str(e)[:300] if str(e) else "no details available"
-                _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
-                await self.send(
-                    chat_id=event.source.chat_id,
-                    content=(
-                        f"Sorry, I encountered an error ({error_type}).\n"
-                        f"{error_detail}\n"
-                        "Try again or use /reset to start a fresh session."
-                    ),
-                    metadata=_thread_metadata,
+            if _pnc_manual_response_must_be_silent(event):
+                logger.warning(
+                    "[%s] Suppressed RCA manual-admission error response for %s",
+                    self.name,
+                    event.source.chat_id,
                 )
-            except Exception as notify_err:
-                logger.error(
-                    "[%s] Failed to send error notification to user: %s",
-                    self.name, notify_err, exc_info=True,
-                )  # Last resort — don't let error reporting crash the handler
+            else:
+                try:
+                    error_type = type(e).__name__
+                    error_detail = str(e)[:300] if str(e) else "no details available"
+                    _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+                    await self.send(
+                        chat_id=event.source.chat_id,
+                        content=(
+                            f"Sorry, I encountered an error ({error_type}).\n"
+                            f"{error_detail}\n"
+                            "Try again or use /reset to start a fresh session."
+                        ),
+                        metadata=_thread_metadata,
+                    )
+                except Exception as notify_err:
+                    logger.error(
+                        "[%s] Failed to send error notification to user: %s",
+                        self.name, notify_err, exc_info=True,
+                    )  # Last resort — don't let error reporting crash the handler
         finally:
             # Stop typing before any deferred callback work.  Post-delivery
             # callbacks may perform platform I/O; a stuck callback must not

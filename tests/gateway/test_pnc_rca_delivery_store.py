@@ -313,7 +313,7 @@ def _delivery(claim):
         "foxglove_url": rendered_foxglove_url,
         "report_status": "html_delivery_ready",
         "requires_human_review": True,
-        "conclusion": "候选原因",
+        "conclusion": "本单未能定向\n仅供参考，待确认\n未发现已知异常模式",
     }
     semantic_sha = compute_delivery_effect_payload_sha256(
         semantic, DELIVERY_EFFECT_KIND
@@ -341,7 +341,7 @@ def _delivery(claim):
         report_url=report_url,
         viz_mcap_vm=viz_mcap_vm,
         foxglove_url=rendered_foxglove_url,
-        conclusion="候选原因",
+        conclusion="本单未能定向\n仅供参考，待确认\n未发现已知异常模式",
         marker=marker,
         manifest={"schema_version": "delivery_manifest_v2"},
         contract={"schema_version": "g1q3_delivery_contract_v1"},
@@ -1547,7 +1547,8 @@ def test_suppressed_required_subscription_terminates_job_as_partial(tmp_path):
     _insert_subscription(store, claim, effect_kind="feishu_thread_reply")
     with sqlite3.connect(store.db_path) as conn:
         conn.execute(
-            "UPDATE rca_delivery_subscriptions SET status = 'suppressed' "
+            "UPDATE rca_delivery_subscriptions "
+            "SET status = 'suppressed', reason = 'owner_delivery_suppressed' "
             "WHERE effect_kind = 'feishu_thread_reply'"
         )
 
@@ -1569,6 +1570,19 @@ def test_suppressed_required_subscription_terminates_job_as_partial(tmp_path):
 
     assert mutation.job_status == "partial"
     assert store.list_rows("rca_delivery_jobs")[0]["status"] == "partial"
+    [subscription] = [
+        row
+        for row in store.list_rows("rca_delivery_subscriptions")
+        if row["effect_kind"] == "feishu_thread_reply"
+    ]
+    assert subscription["reason"] == "owner_delivery_suppressed"
+    events = [
+        row
+        for row in store.list_rows("rca_delivery_subscription_events")
+        if row["subscription_key"] == subscription["subscription_key"]
+    ]
+    assert [row["new_status"] for row in events] == ["pending", "suppressed"]
+    assert events[-1]["reason"] == "owner_delivery_suppressed"
 
 
 def test_reconcile_delivery_job_status_repairs_stale_ready_status(tmp_path):

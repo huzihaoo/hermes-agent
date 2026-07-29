@@ -67,8 +67,31 @@ MANUAL_OUTBOX_SHARE_NUMERATOR = 4
 MANUAL_OUTBOX_SHARE_DENOMINATOR = 5
 OUTBOX_MAX_CONSECUTIVE_KAFKA_CLAIMS = 3
 OUTBOX_KAFKA_CLAIM_STREAK_META_KEY = "outbox_kafka_claim_streak"
+OUTBOX_CIRCUIT_RESET_META_PREFIX = "rca_dispatcher_circuit_reset:"
+OUTBOX_CIRCUIT_RESET_SCHEMA_VERSION = "pnc_rca_outbox_circuit_reset_v1"
+OUTBOX_CIRCUIT_RESET_MAX_AUDIT_BYTES = 256 * 1024
+OUTBOX_CIRCUIT_RESET_REQUIRED_FIELDS = frozenset(
+    {
+        "schema_version",
+        "command",
+        "reset_id",
+        "recorded_at",
+        "operator",
+        "reason",
+        "control_db_identity",
+        "config_binding_sha256",
+        "before",
+        "after",
+        "pre_state",
+        "post_state",
+        "effect_delta",
+        "receipt_fingerprint",
+    }
+)
 DEFAULT_MANUAL_OPERATOR_RATE_LIMIT = 3
 DEFAULT_MANUAL_OPERATOR_RATE_WINDOW_SECONDS = 600
+GROUP_USER_RERUN_SCHEMA_VERSION = "pnc_rca_group_user_rerun_v1"
+GROUP_USER_RERUN_DEDUPE_SECONDS = 600
 REPLAY_RAW_RETENTION = timedelta(days=7)
 PROCESSED_RAW_RETENTION = timedelta(days=30)
 REPLAY_RAW_PRUNE_BATCH = 1000
@@ -107,6 +130,19 @@ INPUT_WAIT_REARM_ERROR_CODES = frozenset(
 )
 MANUAL_TRIGGER_SCHEMA_VERSION = "pnc_rca_manual_trigger_v1"
 MANUAL_ADMISSION_RESULT_SCHEMA_VERSION = "pnc_rca_manual_admission_result_v1"
+MANUAL_ADMISSION_RESULT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "outcome",
+        "business_key",
+        "submission_key",
+        "generation",
+        "source_id",
+        "subscription_key",
+        "state",
+        "reason",
+    }
+)
 OUTBOX_PAYLOAD_SCHEMA_VERSION = "pnc_rca_submission_outbox_v2"
 DELIVERY_TARGET_SCHEMA_VERSION = "pnc_rca_delivery_target_v1"
 LEARNING_LANE_ADMISSION_SCHEMA_VERSION = "g1q3_rca_learning_lane_admission_v1"
@@ -229,6 +265,149 @@ def _canonical_json(value: Any) -> str:
 
 def _canonical_sha256(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _dispatcher_circuit_reset_fingerprint(value: Mapping[str, Any]) -> str:
+    payload = dict(value)
+    payload.pop("receipt_fingerprint", None)
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _reject_dispatcher_reset_json_constant(_value: str) -> None:
+    raise ValueError("dispatcher_circuit_reset_non_finite_json")
+
+
+def _validate_dispatcher_circuit_reset_audit(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError("dispatcher_circuit_reset_audit_invalid")
+    normalized = dict(value)
+    if not OUTBOX_CIRCUIT_RESET_REQUIRED_FIELDS.issubset(normalized):
+        raise ValueError("dispatcher_circuit_reset_audit_fields_invalid")
+    if (
+        normalized.get("schema_version") != OUTBOX_CIRCUIT_RESET_SCHEMA_VERSION
+        or normalized.get("command") != "clear-circuit"
+    ):
+        raise ValueError("dispatcher_circuit_reset_audit_schema_invalid")
+    reset_id = normalized.get("reset_id")
+    recorded_at = normalized.get("recorded_at")
+    operator = normalized.get("operator")
+    reason = normalized.get("reason")
+    if (
+        not isinstance(reset_id, str)
+        or not reset_id
+        or len(reset_id) > 200
+        or any(char in reset_id for char in "\n\r\x00")
+        or not isinstance(recorded_at, str)
+        or not recorded_at
+        or not isinstance(operator, str)
+        or not operator
+        or operator != operator.strip()
+        or len(operator.encode("utf-8")) > 200
+        or any(char in operator for char in "\n\r\x00")
+        or not isinstance(reason, str)
+        or not reason
+        or reason != reason.strip()
+        or len(reason.encode("utf-8")) > 1000
+        or any(char in reason for char in "\n\r\x00")
+    ):
+        raise ValueError("dispatcher_circuit_reset_audit_text_invalid")
+    try:
+        recorded_datetime = datetime.fromisoformat(recorded_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("dispatcher_circuit_reset_audit_timestamp_invalid") from exc
+    if (
+        recorded_datetime.tzinfo is None
+        or recorded_datetime.utcoffset() != timedelta(0)
+    ):
+        raise ValueError("dispatcher_circuit_reset_audit_timestamp_invalid")
+    identity = normalized.get("control_db_identity")
+    if not isinstance(identity, Mapping):
+        raise ValueError("dispatcher_circuit_reset_audit_db_identity_invalid")
+    identity_path = identity.get("path")
+    if (
+        not isinstance(identity_path, str)
+        or not Path(identity_path).is_absolute()
+        or isinstance(identity.get("device"), bool)
+        or not isinstance(identity.get("device"), int)
+        or isinstance(identity.get("inode"), bool)
+        or not isinstance(identity.get("inode"), int)
+    ):
+        raise ValueError("dispatcher_circuit_reset_audit_db_identity_invalid")
+    config_sha = normalized.get("config_binding_sha256")
+    if (
+        not isinstance(config_sha, str)
+        or _ACTIVATION_SHA256_RE.fullmatch(config_sha) is None
+        or config_sha == "0" * 64
+    ):
+        raise ValueError("dispatcher_circuit_reset_audit_config_invalid")
+    before = normalized.get("before")
+    after = normalized.get("after")
+    pre_state = normalized.get("pre_state")
+    post_state = normalized.get("post_state")
+    if (
+        not isinstance(before, Mapping)
+        or not isinstance(after, Mapping)
+        or dict(before) != dict(pre_state)
+        or dict(after) != dict(post_state)
+    ):
+        raise ValueError("dispatcher_circuit_reset_audit_state_invalid")
+    state_fields = frozenset(
+        {"state", "reason_code", "reason_detail", "opened_at", "updated_at"}
+    )
+    for state in (before, after, pre_state, post_state):
+        if set(state) != state_fields:
+            raise ValueError("dispatcher_circuit_reset_audit_state_invalid")
+        if (
+            not isinstance(state.get("state"), str)
+            or not isinstance(state.get("reason_code"), str)
+            or not isinstance(state.get("reason_detail"), str)
+            or state.get("opened_at") is not None
+            and not isinstance(state.get("opened_at"), str)
+            or state.get("updated_at") is not None
+            and not isinstance(state.get("updated_at"), str)
+        ):
+            raise ValueError("dispatcher_circuit_reset_audit_state_invalid")
+    if (
+        after.get("state") != "closed"
+        or after.get("reason_code") != ""
+        or after.get("reason_detail") != ""
+        or after.get("opened_at") is not None
+        or after.get("updated_at") != recorded_at
+    ):
+        raise ValueError("dispatcher_circuit_reset_audit_state_invalid")
+    effect_delta = normalized.get("effect_delta")
+    if (
+        not isinstance(effect_delta, Mapping)
+        or isinstance(effect_delta.get("external_writes"), bool)
+        or effect_delta.get("external_writes") != 0
+        or not str(effect_delta.get("scope") or "").strip()
+    ):
+        raise ValueError("dispatcher_circuit_reset_audit_effect_invalid")
+    fingerprint = normalized.get("receipt_fingerprint")
+    if (
+        not isinstance(fingerprint, str)
+        or _ACTIVATION_SHA256_RE.fullmatch(fingerprint) is None
+        or fingerprint == "0" * 64
+        or fingerprint != _dispatcher_circuit_reset_fingerprint(normalized)
+    ):
+        raise ValueError("dispatcher_circuit_reset_fingerprint_invalid")
+    try:
+        serialized = _canonical_json(normalized)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("dispatcher_circuit_reset_audit_json_invalid") from exc
+    if len(serialized.encode("utf-8")) > OUTBOX_CIRCUIT_RESET_MAX_AUDIT_BYTES:
+        raise ValueError("dispatcher_circuit_reset_audit_too_large")
+    return normalized
 
 
 def build_w3_ticket_authority_receipt(
@@ -1443,6 +1622,7 @@ class RcaControlStore:
                     status TEXT NOT NULL CHECK(
                         status IN ('pending', 'materialized', 'suppressed', 'quarantined')
                     ),
+                    reason TEXT NOT NULL DEFAULT 'awaiting_delivery_materialization',
                     delivery_id TEXT,
                     effect_key TEXT,
                     catchup_requested_at TEXT,
@@ -5016,6 +5196,188 @@ class RcaControlStore:
         finally:
             conn.close()
 
+    def validate_manual_external_write_admission(
+        self,
+        result: Mapping[str, Any],
+        *,
+        expected_chat_id: str,
+        expected_thread_id: str,
+        expected_message_id: str,
+        expected_requester_id: str,
+    ) -> dict[str, Any]:
+        """Validate one manual acknowledgement against its live admission ledger."""
+        value = dict(result) if isinstance(result, Mapping) else {}
+        generation = value.get("generation")
+        required_text = (
+            "outcome",
+            "business_key",
+            "submission_key",
+            "source_id",
+            "subscription_key",
+            "state",
+        )
+        if (
+            set(value) != MANUAL_ADMISSION_RESULT_FIELDS
+            or value.get("schema_version")
+            != MANUAL_ADMISSION_RESULT_SCHEMA_VERSION
+            or isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+            or any(
+                not isinstance(value.get(field), str)
+                or not str(value[field]).strip()
+                for field in required_text
+            )
+            or not isinstance(value.get("reason"), str)
+        ):
+            raise RecordConflictError(
+                "manual_external_write_admission_schema_invalid"
+            )
+        expected_source = {
+            "chat_id": str(expected_chat_id or "").strip(),
+            "thread_id": str(expected_thread_id or "").strip(),
+            "message_id": str(expected_message_id or "").strip(),
+            "requester_id": str(expected_requester_id or "").strip(),
+        }
+        if not all(expected_source.values()):
+            raise RecordConflictError(
+                "manual_external_write_source_identity_invalid"
+            )
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            source = conn.execute(
+                """
+                SELECT source.source_kind, source.platform, source.chat_id,
+                       source.thread_id, source.message_id, source.requester_id,
+                       source.mode, source.outcome,
+                       binding.business_key, binding.generation,
+                       trigger.submission_key, trigger.normalized_json,
+                       subscription.subscription_key,
+                       delivery_binding.source_id AS delivery_source_id
+                  FROM rca_trigger_sources AS source
+                  JOIN rca_trigger_bindings AS binding
+                    ON binding.source_id = source.source_id
+                  JOIN business_triggers AS trigger
+                    ON trigger.business_key = binding.business_key
+                   AND trigger.generation = binding.generation
+                  JOIN rca_delivery_subscriptions AS subscription
+                    ON subscription.subscription_key = ?
+                   AND subscription.business_key = binding.business_key
+                   AND subscription.generation = binding.generation
+                  JOIN rca_trigger_delivery_bindings AS delivery_binding
+                    ON delivery_binding.source_id = source.source_id
+                   AND delivery_binding.subscription_key =
+                       subscription.subscription_key
+                 WHERE source.source_id = ?
+                   AND binding.business_key = ?
+                   AND binding.generation = ?
+                   AND trigger.submission_key = ?
+                """,
+                (
+                    value["subscription_key"],
+                    value["source_id"],
+                    value["business_key"],
+                    generation,
+                    value["submission_key"],
+                ),
+            ).fetchone()
+            if source is None:
+                raise RecordConflictError(
+                    "manual_external_write_admission_binding_missing"
+                )
+            observed_source = {
+                "chat_id": str(source["chat_id"]),
+                "thread_id": str(source["thread_id"]),
+                "message_id": str(source["message_id"]),
+                "requester_id": str(source["requester_id"]),
+            }
+            if (
+                str(source["source_kind"]) != "feishu_group_manual"
+                or str(source["platform"]) != "feishu"
+                or observed_source != expected_source
+                or str(source["outcome"]) != str(value["outcome"])
+                or str(source["delivery_source_id"]) != str(value["source_id"])
+            ):
+                raise RecordConflictError(
+                    "manual_external_write_source_identity_mismatch"
+                )
+            try:
+                context = json.loads(str(source["normalized_json"]))
+                issue_url = str(context["issue_url"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RecordConflictError(
+                    "manual_external_write_trigger_context_invalid"
+                ) from exc
+            source_identity = {
+                **observed_source,
+                "issue_url": issue_url,
+                "mode": str(source["mode"]),
+            }
+            source_identity_sha256 = _canonical_sha256(source_identity)
+            ledger = conn.execute(
+                """
+                SELECT epoch.epoch_id, epoch.state, epoch.is_current,
+                       ledger.ledger_id, ledger.decision, ledger.bound_at,
+                       ledger.business_key, ledger.submission_key,
+                       ledger.generation
+                  FROM rca_activation_epochs AS epoch
+                  JOIN rca_activation_admission_ledger AS ledger
+                    ON ledger.epoch_id = epoch.epoch_id
+                 WHERE epoch.is_current = 1
+                   AND ledger.entrypoint = 'manual_admit'
+                   AND ledger.source_kind = 'manual'
+                   AND ledger.source_identity_sha256 = ?
+                   AND ledger.business_key = ?
+                   AND ledger.submission_key = ?
+                   AND ledger.generation = ?
+                   AND ledger.decision IN ('admit', 'join')
+                 ORDER BY ledger.ledger_id DESC
+                 LIMIT 1
+                """,
+                (
+                    source_identity_sha256,
+                    value["business_key"],
+                    value["submission_key"],
+                    generation,
+                ),
+            ).fetchone()
+            if ledger is None or int(ledger["is_current"]) != 1:
+                raise RecordConflictError(
+                    "manual_external_write_activation_ledger_missing"
+                )
+            if str(ledger["state"]) not in {
+                "bounded_active",
+                "steady_active",
+            }:
+                raise RecordConflictError(
+                    "manual_external_write_activation_epoch_not_current"
+                )
+            if (
+                str(ledger["decision"]) == "admit"
+                and not str(ledger["bound_at"] or "").strip()
+            ):
+                raise RecordConflictError(
+                    "manual_external_write_activation_ledger_unbound"
+                )
+            return {
+                "epoch_id": str(ledger["epoch_id"]),
+                "state": str(ledger["state"]),
+                "ledger_id": int(ledger["ledger_id"]),
+                "decision": str(ledger["decision"]),
+                "business_key": str(ledger["business_key"]),
+                "submission_key": str(ledger["submission_key"]),
+                "generation": int(ledger["generation"]),
+                "source_id": str(value["source_id"]),
+                "subscription_key": str(value["subscription_key"]),
+                **observed_source,
+            }
+        finally:
+            if conn.in_transaction:
+                conn.rollback()
+            conn.close()
+
     def validate_external_write_fence_binding(
         self,
         fence: Mapping[str, Any],
@@ -7822,9 +8184,10 @@ class RcaControlStore:
             """
             INSERT OR IGNORE INTO rca_delivery_subscriptions(
                 subscription_key, business_key, generation, source_id,
-                effect_kind, target_key, target_json, required, status,
+                effect_kind, target_key, target_json, required, status, reason,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, NULL, 'feishu_issue_comment', ?, ?, 1, 'pending', ?, ?)
+            ) VALUES (?, ?, ?, NULL, 'feishu_issue_comment', ?, ?, 1, 'pending',
+                      'awaiting_delivery_materialization', ?, ?)
             """,
             (
                 subscription_key,
@@ -8068,9 +8431,10 @@ class RcaControlStore:
             """
             INSERT OR IGNORE INTO rca_delivery_subscriptions(
                 subscription_key, business_key, generation, source_id,
-                effect_kind, target_key, target_json, required, status,
+                effect_kind, target_key, target_json, required, status, reason,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 'feishu_thread_reply', ?, ?, 1, 'pending', ?, ?)
+            ) VALUES (?, ?, ?, ?, 'feishu_thread_reply', ?, ?, 1, 'pending',
+                      'awaiting_delivery_materialization', ?, ?)
             """,
             (
                 subscription_key,
@@ -8137,7 +8501,8 @@ class RcaControlStore:
         updated = conn.execute(
             """
             UPDATE rca_delivery_subscriptions
-               SET delivery_id = ?, catchup_requested_at = ?, updated_at = ?
+               SET delivery_id = ?, catchup_requested_at = ?,
+                   reason = 'late_catchup_requested', updated_at = ?
              WHERE subscription_key = ? AND status = 'pending'
             """,
             (delivery["delivery_id"], current, current, subscription_key),
@@ -11755,6 +12120,7 @@ class RcaControlStore:
         activation_required: bool = False,
         activation_slot_kind: str = "",
         automation_authority: Mapping[str, Any] | None = None,
+        user_rerun_authority: Mapping[str, Any] | None = None,
         snapshot_authority: Any = None,
         snapshot_ticket_authority: Mapping[str, Any] | None = None,
         snapshot_manual_ingress_authority: Mapping[str, Any] | None = None,
@@ -11769,6 +12135,36 @@ class RcaControlStore:
         if activation_slot and activation_slot not in ACTIVATION_SLOT_KINDS:
             raise ManualRcaAdmissionError("manual_activation_slot_invalid")
         gray_sample_authority: dict[str, str] | None = None
+        normalized_user_rerun: dict[str, str] | None = None
+        if user_rerun_authority is not None:
+            if not isinstance(user_rerun_authority, Mapping) or set(
+                user_rerun_authority
+            ) != {"schema_version", "command_text", "work_item_id"}:
+                raise ManualRcaAdmissionError("group_user_rerun_authority_invalid")
+            normalized_user_rerun = {
+                "schema_version": str(
+                    user_rerun_authority.get("schema_version") or ""
+                ).strip(),
+                "command_text": str(
+                    user_rerun_authority.get("command_text") or ""
+                ),
+                "work_item_id": str(
+                    user_rerun_authority.get("work_item_id") or ""
+                ).strip(),
+            }
+            if (
+                normalized_user_rerun["schema_version"]
+                != GROUP_USER_RERUN_SCHEMA_VERSION
+                or not re.fullmatch(
+                    r"[0-9]{1,32}", normalized_user_rerun["work_item_id"]
+                )
+                or normalized_user_rerun["command_text"]
+                != f"重新分析 {normalized_user_rerun['work_item_id']}"
+                or manual.platform != "feishu"
+                or manual.mode != "rerun"
+                or not manual.requester_id.startswith("ou_")
+            ):
+                raise ManualRcaAdmissionError("group_user_rerun_authority_invalid")
         if automation_authority is not None:
             try:
                 gray_sample_authority = normalize_gray_sample_automation_authority(
@@ -11806,7 +12202,11 @@ class RcaControlStore:
         if not issue_only_operator and manual.chat_id not in allowed:
             raise ManualRcaAdmissionError("manual_intake_chat_not_allowed")
         operator_requested = manual.mode in {"rerun", "debug"}
-        if (operator_requested or issue_only_operator) and not operator_authorized:
+        if (
+            (operator_requested or issue_only_operator)
+            and normalized_user_rerun is None
+            and not operator_authorized
+        ):
             raise ManualRcaAdmissionError("manual_operator_not_authorized")
         try:
             high_watermark = int(outbox_high_watermark)
@@ -11875,6 +12275,8 @@ class RcaControlStore:
         source_payload = manual.to_dict()
         if gray_sample_authority is not None:
             source_payload["automation_authority"] = gray_sample_authority
+        if normalized_user_rerun is not None:
+            source_payload["user_rerun_authority"] = normalized_user_rerun
         payload_sha = _canonical_sha256(source_payload)
         source_dedupe_key = f"{manual.platform}:{manual.message_id}"
         source_id = _stable_key(
@@ -12000,8 +12402,14 @@ class RcaControlStore:
                     ),
                     generation=replay_generation,
                 )
-                learning_lane = self._ensure_learning_lane_admission_tx(
-                    conn, admission=replay_admission_for_lane, current=current
+                learning_lane = (
+                    False
+                    if normalized_user_rerun is not None
+                    else self._ensure_learning_lane_admission_tx(
+                        conn,
+                        admission=replay_admission_for_lane,
+                        current=current,
+                    )
                 )
                 required_subscriptions = (
                     []
@@ -12143,6 +12551,59 @@ class RcaControlStore:
                     reason=replay_reason,
                 )
 
+            if normalized_user_rerun is not None:
+                if normalized_user_rerun["work_item_id"] != work_item_id:
+                    raise ManualRcaAdmissionError(
+                        "group_user_rerun_authority_mismatch"
+                    )
+                dedupe_window_start = _iso(
+                    _utc_datetime(now)
+                    - timedelta(seconds=GROUP_USER_RERUN_DEDUPE_SECONDS)
+                )
+                recent = conn.execute(
+                    """
+                    SELECT s.source_id, b.business_key, b.generation,
+                           t.submission_key, t.state,
+                           COALESCE(sub.subscription_key, '') AS subscription_key
+                      FROM rca_trigger_sources AS s
+                      JOIN rca_trigger_bindings AS b
+                        ON b.source_id = s.source_id AND b.role = 'origin'
+                      JOIN business_triggers AS t
+                        ON t.business_key = b.business_key
+                       AND t.generation = b.generation
+                      LEFT JOIN rca_delivery_subscriptions AS sub
+                        ON sub.business_key = b.business_key
+                       AND sub.generation = b.generation
+                       AND sub.effect_kind = 'feishu_issue_comment'
+                     WHERE s.source_kind = 'feishu_group_manual'
+                       AND s.platform = 'feishu'
+                       AND s.mode = 'rerun'
+                       AND s.requester_id = ?
+                       AND t.work_item_id = ?
+                       AND s.created_at >= ?
+                     ORDER BY s.created_at DESC, s.source_id DESC
+                     LIMIT 1
+                    """,
+                    (
+                        manual.requester_id,
+                        work_item_id,
+                        dedupe_window_start,
+                    ),
+                ).fetchone()
+                if recent is not None:
+                    conn.commit()
+                    return ManualRcaAdmissionResult(
+                        schema_version=MANUAL_ADMISSION_RESULT_SCHEMA_VERSION,
+                        outcome="deduped",
+                        business_key=str(recent["business_key"]),
+                        submission_key=str(recent["submission_key"]),
+                        generation=int(recent["generation"]),
+                        source_id=str(recent["source_id"]),
+                        subscription_key=str(recent["subscription_key"]),
+                        state=str(recent["state"]),
+                        reason="user_rerun_duplicate_window",
+                    )
+
             if gray_sample_authority is not None:
                 day_start = _utc_datetime(now).replace(
                     hour=0, minute=0, second=0, microsecond=0
@@ -12168,7 +12629,11 @@ class RcaControlStore:
                     raise ManualRcaAdmissionError(
                         "gray_sample_daily_rate_limited"
                     )
-            elif operator_requested and not issue_only_operator:
+            elif (
+                operator_requested
+                and not issue_only_operator
+                and normalized_user_rerun is None
+            ):
                 window_start = _iso(
                     _utc_datetime(now) - timedelta(seconds=rate_window_seconds)
                 )
@@ -12232,6 +12697,15 @@ class RcaControlStore:
                 raise ManualRcaAdmissionError(
                     "gray_sample_terminal_generation_required"
                 )
+            if normalized_user_rerun is not None:
+                if latest is None:
+                    raise ManualRcaAdmissionError(
+                        "group_user_rerun_existing_generation_required"
+                    )
+                if not self._execution_terminal_tx(conn, latest):
+                    raise ManualRcaAdmissionError(
+                        "group_user_rerun_terminal_generation_required"
+                    )
             if business_key_count > 1:
                 self._audit_issue_scope_conflict_tx(
                     conn,
@@ -12533,8 +13007,12 @@ class RcaControlStore:
                     current,
                 ),
             )
-            learning_lane = self._ensure_learning_lane_admission_tx(
-                conn, admission=admission, current=current
+            learning_lane = (
+                False
+                if normalized_user_rerun is not None
+                else self._ensure_learning_lane_admission_tx(
+                    conn, admission=admission, current=current
+                )
             )
             if w3_authority is not None:
                 self.persist_w3_admission_shadow_tx(
@@ -14043,7 +14521,8 @@ class RcaControlStore:
                 conn.execute(
                     """
                     UPDATE rca_delivery_subscriptions
-                       SET status = 'quarantined', updated_at = ?
+                       SET status = 'quarantined',
+                           reason = 'activation_epoch_deferred', updated_at = ?
                      WHERE business_key = ? AND generation = ? AND status = 'pending'
                     """,
                     (current, row["business_key"], row["generation"]),
@@ -14888,6 +15367,194 @@ class RcaControlStore:
         finally:
             conn.close()
         return self.dispatcher_circuit()
+
+    def close_dispatcher_circuit_with_audit(
+        self,
+        *,
+        audit: Mapping[str, Any],
+        now: datetime | None = None,
+    ) -> tuple[DispatcherCircuit, DispatcherCircuit]:
+        """Close the submission circuit and persist its operator receipt atomically.
+
+        The receipt is stored in ``control_meta`` under a create-once key in the
+        same transaction as the circuit transition.  The CLI may materialize
+        that value to a filesystem receipt afterwards; the database entry is
+        the authoritative recovery record if that materialization is interrupted.
+        """
+        payload = _validate_dispatcher_circuit_reset_audit(audit)
+        reset_id = str(payload.get("reset_id") or "").strip()
+        if not reset_id or any(char in reset_id for char in "\n\r\x00"):
+            raise ValueError("dispatcher_circuit_reset_id_invalid")
+        if len(reset_id) > 200:
+            raise ValueError("dispatcher_circuit_reset_id_invalid")
+        try:
+            db_identity = self.db_path.expanduser().absolute().lstat()
+        except OSError as exc:
+            raise RuntimeError("dispatcher_circuit_reset_control_db_missing") from exc
+        recorded_identity = payload["control_db_identity"]
+        if (
+            recorded_identity.get("path")
+            != str(self.db_path.expanduser().absolute())
+            or int(recorded_identity.get("device")) != int(db_identity.st_dev)
+            or int(recorded_identity.get("inode")) != int(db_identity.st_ino)
+        ):
+            raise RuntimeError("dispatcher_circuit_reset_control_db_mismatch")
+        before_value = payload.get("before")
+        after_value = payload.get("after")
+        if not isinstance(before_value, Mapping) or not isinstance(
+            after_value, Mapping
+        ):
+            raise ValueError("dispatcher_circuit_reset_state_invalid")
+        current = _iso(now)
+        expected_before = DispatcherCircuit(
+            state=str(before_value.get("state") or ""),
+            reason_code=str(before_value.get("reason_code") or ""),
+            reason_detail=str(before_value.get("reason_detail") or ""),
+            opened_at=(
+                str(before_value["opened_at"])
+                if before_value.get("opened_at") is not None
+                else None
+            ),
+            updated_at=(
+                str(before_value["updated_at"])
+                if before_value.get("updated_at") is not None
+                else None
+            ),
+        )
+        expected_after = DispatcherCircuit(
+            state=str(after_value.get("state") or ""),
+            reason_code=str(after_value.get("reason_code") or ""),
+            reason_detail=str(after_value.get("reason_detail") or ""),
+            opened_at=(
+                str(after_value["opened_at"])
+                if after_value.get("opened_at") is not None
+                else None
+            ),
+            updated_at=(
+                str(after_value["updated_at"])
+                if after_value.get("updated_at") is not None
+                else None
+            ),
+        )
+        if expected_before.state != "open":
+            raise RuntimeError("dispatcher_circuit_reset_requires_open_circuit")
+        if expected_after != DispatcherCircuit(
+            state="closed", updated_at=current
+        ):
+            raise ValueError("dispatcher_circuit_reset_post_state_invalid")
+        payload = dict(payload)
+        payload["before"] = {
+            "state": expected_before.state,
+            "reason_code": expected_before.reason_code,
+            "reason_detail": expected_before.reason_detail,
+            "opened_at": expected_before.opened_at,
+            "updated_at": expected_before.updated_at,
+        }
+        payload["after"] = {
+            "state": expected_after.state,
+            "reason_code": expected_after.reason_code,
+            "reason_detail": expected_after.reason_detail,
+            "opened_at": expected_after.opened_at,
+            "updated_at": expected_after.updated_at,
+        }
+        serialized = _canonical_json(payload)
+        meta_key = f"{OUTBOX_CIRCUIT_RESET_META_PREFIX}{reset_id}"
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT state, reason_code, reason_detail, opened_at, updated_at
+                  FROM rca_dispatcher_circuit
+                 WHERE circuit_name = 'submission'
+                """
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("dispatcher_circuit_reset_state_missing")
+            observed_before = DispatcherCircuit(**dict(row))
+            if observed_before != expected_before:
+                raise RuntimeError("dispatcher_circuit_reset_state_changed")
+            conn.execute(
+                "INSERT INTO control_meta(key, value) VALUES(?, ?)",
+                (meta_key, serialized),
+            )
+            updated = conn.execute(
+                """
+                UPDATE rca_dispatcher_circuit
+                   SET state = 'closed', reason_code = '', reason_detail = '',
+                       opened_at = NULL, updated_at = ?
+                 WHERE circuit_name = 'submission'
+                   AND state = 'open'
+                   AND updated_at = ?
+                """,
+                (current, expected_before.updated_at),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError("dispatcher_circuit_reset_state_changed")
+            row = conn.execute(
+                """
+                SELECT state, reason_code, reason_detail, opened_at, updated_at
+                  FROM rca_dispatcher_circuit
+                 WHERE circuit_name = 'submission'
+                """
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("dispatcher_circuit_reset_post_state_missing")
+            observed_after = DispatcherCircuit(**dict(row))
+            if observed_after != expected_after:
+                raise RuntimeError("dispatcher_circuit_reset_post_state_changed")
+            conn.commit()
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return observed_before, observed_after
+
+    def dispatcher_circuit_reset_audit(
+        self, reset_id: str
+    ) -> dict[str, Any] | None:
+        """Read an operator circuit-reset receipt from the durable metadata log."""
+        normalized = str(reset_id or "").strip()
+        if not normalized:
+            raise ValueError("dispatcher_circuit_reset_id_invalid")
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT value FROM control_meta WHERE key = ?",
+                (f"{OUTBOX_CIRCUIT_RESET_META_PREFIX}{normalized}",),
+            ).fetchone()
+            if row is None:
+                return None
+            raw = str(row["value"])
+            value = json.loads(
+                raw,
+                parse_constant=_reject_dispatcher_reset_json_constant,
+            )
+            value = _validate_dispatcher_circuit_reset_audit(value)
+            if (
+                value.get("reset_id") != normalized
+                or _canonical_json(value) != raw
+            ):
+                raise RuntimeError("dispatcher_circuit_reset_audit_tampered")
+            try:
+                observed_db = self.db_path.expanduser().absolute().lstat()
+            except OSError as exc:
+                raise RuntimeError("dispatcher_circuit_reset_control_db_missing") from exc
+            identity = value["control_db_identity"]
+            if (
+                identity.get("path")
+                != str(self.db_path.expanduser().absolute())
+                or int(identity.get("device")) != int(observed_db.st_dev)
+                or int(identity.get("inode")) != int(observed_db.st_ino)
+            ):
+                raise RuntimeError("dispatcher_circuit_reset_control_db_mismatch")
+            return value
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise RuntimeError("dispatcher_circuit_reset_audit_invalid") from exc
+        finally:
+            conn.close()
 
     def get_inbox(self, event_uid: str) -> dict[str, Any] | None:
         conn = self._connect()

@@ -1,15 +1,25 @@
-"""#17 transport: pnc clarify card construction + button-action handler.
+"""#17 transport: pnc clarify card construction and safe callback retirement.
 
-GatewayRunner._send_pnc_clarify_card builds the 3-button card; FeishuAdapter.
-_handle_rca_clarify_card_action maps each choice to concrete guidance. Bare
+GatewayRunner._send_pnc_clarify_card builds the legacy 3-button card. The
+callback no longer mutates that card because canonical RCA replies must cross
+the activation-bound send fence. Bare
 instances (__new__) avoid full gateway/SDK init. Feishu end-to-end render + the
 real card callback still needs a test-group human click (noted in HANDOFF).
 """
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import Mock
 
+import pytest
+
+import gateway.platforms.feishu as feishu_module
 from gateway.run import GatewayRunner, Platform
-from gateway.platforms.feishu import FeishuAdapter
+from gateway.platforms.feishu import (
+    G1Q3_RCA_GROUP_ID,
+    PNC_ALL_BUSINESS_TEST_GROUP_ID,
+    FeishuAdapter,
+)
+from gateway.pnc_rca_provider_fence import build_write_fence_provider_claim
 from gateway.pnc_group_binding import PncGroupBindingDecision, _RCA_CLARIFY_OPTIONS
 
 
@@ -68,20 +78,101 @@ def test_send_clarify_card_no_options_returns_false():
     assert asyncio.run(runner._send_pnc_clarify_card(source, event, decision)) is False
 
 
-def test_handler_maps_each_choice_to_guidance():
+def test_handler_suppresses_all_legacy_choice_mutations():
     a = _adapter()
     cases = {
         "rca_case_status_check": "case 状态",
         "rca_issue_intake": "问题",
         "rca_case_evidence_summary": "证据",
     }
-    for choice, kw in cases.items():
+    for choice in cases:
         resp = a._handle_rca_clarify_card_action(event=None, action_value={"choice": choice})
-        content = resp.card.data["elements"][0]["content"]
-        assert kw in content
+        assert getattr(resp, "card", None) is None
 
 
-def test_handler_unknown_choice_falls_back():
+def test_handler_unknown_choice_is_also_suppressed():
     a = _adapter()
     resp = a._handle_rca_clarify_card_action(event=None, action_value={"choice": "bogus"})
-    assert "G1Q3 case" in resp.card.data["elements"][0]["content"]
+    assert getattr(resp, "card", None) is None
+
+
+class _CallbackResponse:
+    def __init__(self):
+        self.card = None
+
+
+@pytest.mark.parametrize(
+    "action_value",
+    [
+        {"hermes_action": "repo_acl_approve"},
+        {"hermes_action": "task_confirm"},
+        {"hermes_action": "intake_clarify"},
+        {"hermes_action": "rca_clarify"},
+        {"hermes_action": "clarify"},
+        {"hermes_action": "approve_once"},
+        {"hermes_update_prompt_action": "y"},
+        {},
+    ],
+)
+def test_all_rca_chat_callback_families_stop_before_handler_without_epoch(
+    monkeypatch, action_value
+):
+    monkeypatch.setattr(feishu_module, "P2CardActionTriggerResponse", _CallbackResponse)
+    adapter = _adapter()
+    adapter._loop = SimpleNamespace(is_closed=lambda: False)
+    bomb = Mock(side_effect=AssertionError("callback handler must not run"))
+    for name in (
+        "_handle_repo_acl_card_action",
+        "_handle_task_confirm_card_action",
+        "_handle_intake_clarify_card_action",
+        "_handle_rca_clarify_card_action",
+        "_handle_clarify_card_action",
+        "_handle_approval_card_action",
+        "_handle_update_prompt_card_action",
+        "_submit_on_loop",
+    ):
+        setattr(adapter, name, bomb)
+    data = SimpleNamespace(
+        event=SimpleNamespace(
+            context=SimpleNamespace(open_chat_id=G1Q3_RCA_GROUP_ID),
+            action=SimpleNamespace(value=action_value),
+        )
+    )
+
+    response = adapter._on_card_action_trigger(data)
+
+    assert response.card is None
+    bomb.assert_not_called()
+
+
+def test_all_business_rca_task_callback_revalidates_and_blocks_revoked_epoch(
+    monkeypatch,
+):
+    monkeypatch.setattr(feishu_module, "P2CardActionTriggerResponse", _CallbackResponse)
+    claim = build_write_fence_provider_claim({"state": "issued"})
+    monkeypatch.setattr(
+        "gateway.pnc_rca_provider_fence.write_fence_claim_for_submission",
+        lambda _task_id: claim,
+    )
+    monkeypatch.setattr(
+        "gateway.pnc_rca_provider_fence.revalidate_provider_write_claim",
+        Mock(side_effect=RuntimeError("external_write_fence_epoch_not_current")),
+    )
+    adapter = _adapter()
+    adapter._loop = SimpleNamespace(is_closed=lambda: False)
+    adapter._handle_task_confirm_card_action = Mock(
+        side_effect=AssertionError("callback handler must not run")
+    )
+    data = SimpleNamespace(
+        event=SimpleNamespace(
+            context=SimpleNamespace(open_chat_id=PNC_ALL_BUSINESS_TEST_GROUP_ID),
+            action=SimpleNamespace(
+                value={"hermes_action": "task_confirm", "task_id": "rca-task"}
+            ),
+        )
+    )
+
+    response = adapter._on_card_action_trigger(data)
+
+    assert response.card is None
+    adapter._handle_task_confirm_card_action.assert_not_called()

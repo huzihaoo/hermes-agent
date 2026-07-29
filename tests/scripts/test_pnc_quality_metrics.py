@@ -1160,3 +1160,236 @@ def test_sqlite_cli_missing_or_malformed_schema_exits_two(
         "metrics_control_db_schema_mismatch",
     }
     assert not Path(f"{db_path}-wal").exists()
+
+
+def _dispatch_receipt(
+    issue_id: str,
+    terminal_class: str,
+    **fields: object,
+) -> dict[str, object]:
+    return {
+        "issue_id": issue_id,
+        "terminal_class": terminal_class,
+        **fields,
+    }
+
+
+def test_upstream_dispatch_reducer_uses_correct_denominator_and_breakdowns() -> None:
+    records = [
+        _dispatch_receipt(
+            f"dispatch-{index}",
+            "valid_dispatch",
+            system_bucket=(
+                "vision_perception"
+                if index % 2 == 0
+                else "acc_longitudinal_control"
+            ),
+            confidence_tier=("high" if index < 2 else "medium"),
+            reviewed=index < 10,
+            **(
+                {"is_correct": True}
+                if index < 8
+                else {
+                    "is_correct": False,
+                    "corrected_bucket": "ooi_spp",
+                }
+                if index < 10
+                else {}
+            ),
+        )
+        for index in range(12)
+    ]
+    records.extend([
+        _dispatch_receipt("no-hit", "abstain_no_hit"),
+        _dispatch_receipt(
+            "input-incomplete",
+            "abstain_no_hit",
+            abstain_reason="input_incomplete",
+        ),
+        _dispatch_receipt(
+            "capability-degraded",
+            "abstain_no_hit",
+            abstain_reason="capability_degraded",
+        ),
+        _dispatch_receipt("cross-domain", "abstain_cross_domain"),
+        _dispatch_receipt(
+            "timeout",
+            "technical_failure",
+            timeout_fallback_applied=True,
+        ),
+        _dispatch_receipt("outside", "out_of_scope"),
+        _dispatch_receipt("still-failed", "technical_failure"),
+    ])
+
+    report = business_metrics.reduce_upstream_dispatch_metrics(records)
+
+    assert report["terminal_total"] == 19
+    assert report["terminal_counts"] == {
+        "valid_dispatch": 12,
+        "abstain_no_hit": 4,
+        "abstain_cross_domain": 1,
+        "out_of_scope": 1,
+        "technical_failure": 1,
+    }
+    assert sum(report["terminal_counts"].values()) == report["terminal_total"]
+    assert report["denominator_base"] == 17
+    assert report["technical_failure_breakdown"] == {
+        "unreduced": 1,
+        "timeout_fallback_reduced_to_abstain": 1,
+    }
+    assert report["metrics"] == {
+        "dispatch_accuracy": {
+            "numerator": 8,
+            "denominator": 10,
+            "rate_pct": 80.0,
+        },
+        "dispatch_coverage": {
+            "numerator": 12,
+            "denominator": 17,
+            "rate_pct": 70.6,
+        },
+        "abstain_rate": {
+            "numerator": 5,
+            "denominator": 17,
+            "rate_pct": 29.4,
+        },
+        "review_coverage": {
+            "numerator": 10,
+            "denominator": 12,
+            "rate_pct": 83.3,
+        },
+    }
+    assert {
+        reason: values["count"]
+        for reason, values in report["abstain_breakdown"].items()
+    } == {
+        "no_hit": 1,
+        "cross_domain": 1,
+        "input_incomplete": 1,
+        "capability_degraded": 1,
+        "timeout_fallback": 1,
+    }
+    assert report["by_confidence_tier"]["high"] == {
+        "valid_dispatch_count": 2,
+        "reviewed_count": 2,
+        "reviewed_correct_count": 2,
+        "dispatch_accuracy": {
+            "numerator": 2,
+            "denominator": 2,
+            "rate_pct": 100.0,
+        },
+        "review_coverage": {
+            "numerator": 2,
+            "denominator": 2,
+            "rate_pct": 100.0,
+        },
+    }
+    assert report["by_confidence_tier"]["medium"]["dispatch_accuracy"] == {
+        "numerator": 6,
+        "denominator": 8,
+        "rate_pct": 75.0,
+    }
+    assert report["readout"]["status"] == "valid"
+    assert report["readout"]["ga_first_reading_gate_satisfied"] is True
+    assert report["readout"]["accuracy_threshold_applied"] is False
+
+
+def test_upstream_dispatch_one_percent_review_does_not_false_gate_at_100_pct() -> None:
+    records = [
+        _dispatch_receipt(
+            f"dispatch-{index}",
+            "valid_dispatch",
+            system_bucket="vision_perception",
+            confidence_tier="medium",
+            **({"reviewed": True, "is_correct": True} if index == 0 else {}),
+        )
+        for index in range(100)
+    ]
+
+    report = business_metrics.reduce_upstream_dispatch_metrics(records)
+
+    assert report["metrics"]["dispatch_accuracy"] == {
+        "numerator": 1,
+        "denominator": 1,
+        "rate_pct": 100.0,
+    }
+    assert report["metrics"]["review_coverage"] == {
+        "numerator": 1,
+        "denominator": 100,
+        "rate_pct": 1.0,
+    }
+    assert report["readout"]["status"] == "insufficient_review_coverage"
+    assert report["readout"]["ga_first_reading_gate_satisfied"] is False
+
+
+def test_upstream_dispatch_review_minimum_count_is_independent_of_percentage() -> None:
+    records = [
+        _dispatch_receipt(
+            f"dispatch-{index}",
+            "valid_dispatch",
+            system_bucket="acc_longitudinal_control",
+            confidence_tier="medium",
+            **(
+                {
+                    "reviewed": True,
+                    "is_correct": index != 8,
+                    **(
+                        {"corrected_bucket": "ooi_spp"}
+                        if index == 8
+                        else {}
+                    ),
+                }
+                if index < 9
+                else {}
+            ),
+        )
+        for index in range(10)
+    ]
+
+    report = business_metrics.reduce_upstream_dispatch_metrics(records)
+
+    assert report["metrics"]["review_coverage"]["rate_pct"] == 90.0
+    assert report["readout"]["reviewed_count"] == 9
+    assert report["readout"]["status"] == "insufficient_review_coverage"
+    assert report["readout"]["ga_first_reading_gate_satisfied"] is False
+
+
+def test_upstream_dispatch_rejects_reviewed_abstention() -> None:
+    with pytest.raises(business_metrics.MetricsValidationError) as error:
+        business_metrics.reduce_upstream_dispatch_metrics([
+            _dispatch_receipt(
+                "invalid-review",
+                "abstain_no_hit",
+                reviewed=True,
+                is_correct=True,
+            )
+        ])
+
+    assert error.value.code == "metrics_upstream_dispatch_review_mismatch"
+
+
+def test_upstream_dispatch_wrong_review_requires_different_corrected_bucket() -> None:
+    with pytest.raises(business_metrics.MetricsValidationError) as missing:
+        business_metrics.reduce_upstream_dispatch_metrics([
+            _dispatch_receipt(
+                "wrong-without-correction",
+                "valid_dispatch",
+                system_bucket="vision_perception",
+                reviewed=True,
+                is_correct=False,
+            )
+        ])
+    assert missing.value.code == "metrics_upstream_dispatch_value_invalid"
+
+    with pytest.raises(business_metrics.MetricsValidationError) as same:
+        business_metrics.reduce_upstream_dispatch_metrics([
+            _dispatch_receipt(
+                "wrong-with-same-bucket",
+                "valid_dispatch",
+                system_bucket="vision_perception",
+                reviewed=True,
+                is_correct=False,
+                corrected_bucket="vision_perception",
+            )
+        ])
+    assert same.value.code == "metrics_upstream_dispatch_review_mismatch"

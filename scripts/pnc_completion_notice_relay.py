@@ -33,7 +33,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from hermes_cli.config import get_hermes_home, reload_env  # noqa: E402
-from scripts.pnc_vm_task_sync import DEFAULT_CHAT_IDS  # noqa: E402
+from scripts.pnc_vm_task_sync import (  # noqa: E402
+    DEFAULT_CHAT_IDS,
+    G1Q3_RCA_CHAT_ID,
+)
 from scripts.pnc_foxglove_delivery import (  # noqa: E402
     canonical_publication_origin,
     canonical_report_url_from_vm_path,
@@ -43,12 +46,27 @@ from scripts.pnc_foxglove_delivery import (  # noqa: E402
 )
 from scripts.vm_task_state_bridge import _atomic_write_json  # noqa: E402
 from gateway.feishu_task_card import render_task_card, stable_render_hash  # noqa: E402
+from gateway.feishu_task_confirm import (  # noqa: E402
+    RCA_CANDIDATE_REVIEW_PRESET,
+    RCA_CANDIDATE_REVIEW_SCHEMA_VERSION,
+    add_rca_candidate_conclusion_confirm,
+)
+from gateway.pnc_rca_delivery_contract import (  # noqa: E402
+    DELIVERY_TARGET_SCHEMA_VERSION,
+    build_card_patch_effect,
+    card_patch_payload_has_exact_submission_marker,
+)
 from gateway.pnc_rca_artifacts import local_candidates_for_vm_path  # noqa: E402
 from gateway.pnc_rca_write_fence import (  # noqa: E402
     ExternalWriteFenceError,
     snapshot_core_sha256,
     validate_write_fence,
     validate_write_fence_source_binding,
+)
+from gateway.pnc_rca_provider_fence import (  # noqa: E402
+    RcaProviderWriteClaim,
+    build_write_fence_provider_claim,
+    revalidate_provider_write_claim,
 )
 from gateway.feishu_mention import (  # noqa: E402
     build_at_mention,
@@ -284,7 +302,84 @@ class FeishuHotSender:
         markers = ("access_token", "tenant_access_token", "auth", "unauthorized", "expired", "999916", "99991663")
         return any(marker in text for marker in markers)
 
-    async def _send_once(self, target: str, message: str) -> dict[str, Any]:
+    @staticmethod
+    def _card_failure_result(result: Mapping[str, Any]) -> dict[str, Any]:
+        value = dict(result)
+        error = str(
+            value.get("error") or value.get("raw") or "task card patch failed"
+        )
+        lowered = error.lower()
+        if _is_expired_card_update_error(error):
+            return {
+                **value,
+                "success": False,
+                "outcome_uncertain": False,
+                "permanent": True,
+                "error_code": "feishu_card_patch_message_expired",
+                "error": error,
+            }
+        if any(
+            marker in lowered for marker in ("permission", "forbidden", "230006")
+        ):
+            return {
+                **value,
+                "success": False,
+                "outcome_uncertain": False,
+                "error_code": "feishu_permission_denied",
+                "error": error,
+            }
+        if FeishuHotSender._looks_auth_error(value):
+            return {
+                **value,
+                "success": False,
+                "outcome_uncertain": False,
+                "error_code": "feishu_auth_failed",
+                "error": error,
+            }
+        if any(
+            marker in lowered
+            for marker in (
+                "dependencies not installed",
+                "is not configured",
+                "modulenotfounderror",
+                "importerror",
+            )
+        ):
+            return {
+                **value,
+                "success": False,
+                "outcome_uncertain": False,
+                "error_code": "feishu_card_dependency_unavailable",
+                "error": error,
+            }
+        if "unsupported target" in lowered or "could not resolve" in lowered:
+            return {
+                **value,
+                "success": False,
+                "outcome_uncertain": False,
+                "permanent": True,
+                "error_code": "external_write_fence_target_mismatch",
+                "error": error,
+            }
+        return {
+            **value,
+            "success": False,
+            "outcome_uncertain": True,
+            "error_code": str(
+                value.get("error_code") or "feishu_card_patch_failed"
+            ),
+            "error": error,
+        }
+
+    async def _send_once(
+        self,
+        target: str,
+        message: str,
+        *,
+        provider_claim: RcaProviderWriteClaim | None = None,
+    ) -> dict[str, Any]:
+        if provider_claim is not None and type(provider_claim) is not RcaProviderWriteClaim:
+            raise ExternalWriteFenceError("external_write_provider_claim_invalid")
         adapter = self._ensure_adapter()
         parts = target.split(":", 1)
         if len(parts) != 2 or parts[0].strip().lower() != "feishu":
@@ -295,7 +390,16 @@ class FeishuHotSender:
         normalized_thread_id = str(thread_id or "").strip()
         if normalized_thread_id and normalized_thread_id.startswith("om_"):
             normalized_thread_id = f"topic:{normalized_thread_id}"
-        metadata = {"thread_id": normalized_thread_id} if normalized_thread_id else None
+        metadata = {"thread_id": normalized_thread_id} if normalized_thread_id else {}
+        if provider_claim is not None:
+            if type(provider_claim) is not RcaProviderWriteClaim:
+                raise ExternalWriteFenceError(
+                    "external_write_provider_claim_invalid"
+                )
+            metadata["_pnc_rca_external_write_guard"] = provider_claim
+            metadata["_pnc_rca_external_write_operation"] = (
+                "feishu_thread_reply" if normalized_thread_id else "internal_alert"
+            )
         result = await adapter.send(chat_id, message, metadata=metadata)
         if not result.success:
             return {"error": result.error or "Feishu send failed"}
@@ -309,30 +413,140 @@ class FeishuHotSender:
         payload["delivery_target"] = f"feishu:{chat_id}:{normalized_thread_id}" if normalized_thread_id else f"feishu:{chat_id}"
         return payload
 
+    @staticmethod
+    async def _verify_card_patch_target(
+        adapter: Any,
+        *,
+        message_id: str,
+        chat_id: str,
+        thread_id: str,
+        submission_key: str,
+    ) -> None:
+        """Officially read the card before patching an exact RCA task message."""
 
-    async def _send_card_once(self, target: str, card_payload: dict[str, Any], *, message_id: str | None = None) -> dict[str, Any]:
+        if not message_id or not chat_id or not submission_key:
+            raise ExternalWriteFenceError("external_write_fence_target_mismatch")
+        request = adapter._build_get_message_request(message_id)
+        response = await asyncio.to_thread(adapter._client.im.v1.message.get, request)
+        if not adapter._response_succeeded(response):
+            raise ExternalWriteFenceError("external_write_fence_target_mismatch")
+        items = getattr(getattr(response, "data", None), "items", None)
+        if not isinstance(items, list) or len(items) != 1:
+            raise ExternalWriteFenceError("external_write_fence_target_mismatch")
+        item = items[0]
+        observed_message_id = str(getattr(item, "message_id", "") or "").strip()
+        observed_chat_id = str(getattr(item, "chat_id", "") or "").strip()
+        if observed_message_id != message_id or observed_chat_id != chat_id:
+            raise ExternalWriteFenceError("external_write_fence_target_mismatch")
+        expected_thread = str(thread_id or "").strip().removeprefix("topic:")
+        if expected_thread:
+            observed_threads = {
+                str(getattr(item, field, "") or "").strip().removeprefix("topic:")
+                for field in ("thread_id", "root_id", "parent_id")
+            }
+            observed_threads.discard("")
+            if expected_thread not in observed_threads:
+                raise ExternalWriteFenceError(
+                    "external_write_fence_target_mismatch"
+                )
+        body = getattr(item, "body", None)
+        content = str(getattr(body, "content", "") or "")
+        try:
+            observed_card = json.loads(content)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ExternalWriteFenceError(
+                "external_write_fence_target_mismatch"
+            ) from exc
+        if not card_patch_payload_has_exact_submission_marker(
+            observed_card,
+            submission_key=submission_key,
+        ):
+            raise ExternalWriteFenceError("external_write_fence_target_mismatch")
+
+    @staticmethod
+    async def _patch_verified_task_card(
+        adapter: Any,
+        request: Any,
+        *,
+        provider_claim: RcaProviderWriteClaim,
+        chat_id: str,
+        thread_id: str,
+    ) -> Any:
+        """Revalidate after target readback, immediately before physical PATCH."""
+
+        revalidate_provider_write_claim(
+            provider_claim,
+            operation="feishu_card_patch",
+            chat_id=chat_id,
+            thread_id=(
+                f"topic:{thread_id}"
+                if thread_id and not str(thread_id).startswith("topic:")
+                else str(thread_id or "")
+            ),
+        )
+        return await asyncio.to_thread(
+            adapter._client.im.v1.message.patch,
+            request,
+        )
+
+    async def _send_card_once(
+        self,
+        target: str,
+        card_payload: dict[str, Any],
+        *,
+        message_id: str | None = None,
+        provider_claim: RcaProviderWriteClaim | None = None,
+    ) -> dict[str, Any]:
         adapter = self._ensure_adapter()
         payload = json.dumps(card_payload, ensure_ascii=False)
-        if message_id:
-            from lark_oapi.api.im.v1.model import PatchMessageRequest, PatchMessageRequestBody
-
-            body = PatchMessageRequestBody.builder().content(payload).build()
-            request = PatchMessageRequest.builder().message_id(message_id).request_body(body).build()
-            response = await asyncio.to_thread(adapter._client.im.v1.message.patch, request)
-            result = adapter._finalize_send_result(response, "task card patch failed")
-            if not result.success:
-                return {"error": result.error or "task card patch failed"}
-            return {"success": True, "message_id": message_id, "updated": True}
         parts = target.split(":", 1)
         if len(parts) != 2 or parts[0].strip().lower() != "feishu":
             return {"error": f"Unsupported target for FeishuHotSender: {target}"}
         chat_id, thread_id, is_explicit = _parse_target_ref("feishu", parts[1].strip())
         if not chat_id or not is_explicit:
             return {"error": f"Could not resolve '{parts[1].strip()}' on feishu hot sender"}
+        if provider_claim is not None and type(provider_claim) is not RcaProviderWriteClaim:
+            raise ExternalWriteFenceError("external_write_provider_claim_invalid")
+        if chat_id == G1Q3_RCA_CHAT_ID and provider_claim is None:
+            raise ExternalWriteFenceError("external_write_provider_claim_missing")
+        if message_id:
+            from lark_oapi.api.im.v1.model import PatchMessageRequest, PatchMessageRequestBody
+
+            body = PatchMessageRequestBody.builder().content(payload).build()
+            request = PatchMessageRequest.builder().message_id(message_id).request_body(body).build()
+            if provider_claim is None:
+                raise ExternalWriteFenceError("external_write_provider_claim_missing")
+            live = revalidate_provider_write_claim(
+                provider_claim,
+                operation="feishu_card_patch",
+                chat_id=chat_id,
+                thread_id=(f"topic:{thread_id}" if thread_id and not str(thread_id).startswith("topic:") else str(thread_id or "")),
+            )
+            await self._verify_card_patch_target(
+                adapter,
+                message_id=message_id,
+                chat_id=chat_id,
+                thread_id=str(thread_id or ""),
+                submission_key=str(live.get("submission_key") or ""),
+            )
+            response = await self._patch_verified_task_card(
+                adapter,
+                request,
+                provider_claim=provider_claim,
+                chat_id=chat_id,
+                thread_id=str(thread_id or ""),
+            )
+            result = adapter._finalize_send_result(response, "task card patch failed")
+            if not result.success:
+                return {"error": result.error or "task card patch failed"}
+            return {"success": True, "message_id": message_id, "updated": True}
         normalized_thread_id = str(thread_id or "").strip()
         if normalized_thread_id and normalized_thread_id.startswith("om_"):
             normalized_thread_id = f"topic:{normalized_thread_id}"
-        metadata = {"thread_id": normalized_thread_id} if normalized_thread_id else None
+        metadata = {"thread_id": normalized_thread_id} if normalized_thread_id else {}
+        if provider_claim is not None:
+            metadata["_pnc_rca_external_write_guard"] = provider_claim
+            metadata["_pnc_rca_external_write_operation"] = "feishu_card_create"
         response = await adapter._feishu_send_with_retry(
             chat_id=chat_id,
             msg_type="interactive",
@@ -354,32 +568,81 @@ class FeishuHotSender:
             "updated": False,
         }
 
-    def send_task_card(self, target: str, card_payload: dict[str, Any], message_id: str | None = None) -> dict[str, Any]:
+    def send_task_card(
+        self,
+        target: str,
+        card_payload: dict[str, Any],
+        message_id: str | None = None,
+        *,
+        provider_claim: RcaProviderWriteClaim | None = None,
+    ) -> dict[str, Any]:
+        if provider_claim is not None and type(provider_claim) is not RcaProviderWriteClaim:
+            raise ExternalWriteFenceError("external_write_provider_claim_invalid")
         if self._record_sender is not None:
             return self._record_sender.send_task_card(target, card_payload, message_id=message_id)
         try:
-            result = asyncio.run(self._send_card_once(target, card_payload, message_id=message_id))
-            if self._looks_auth_error(result):
+            result = asyncio.run(
+                self._send_card_once(
+                    target,
+                    card_payload,
+                    message_id=message_id,
+                    provider_claim=provider_claim,
+                )
+            )
+            if self._looks_auth_error(result) and not _is_expired_card_update_error(
+                str(result.get("error") or "")
+            ):
                 self._ensure_adapter(rebuild=True)
-                result = asyncio.run(self._send_card_once(target, card_payload, message_id=message_id))
+                result = asyncio.run(
+                    self._send_card_once(
+                        target,
+                        card_payload,
+                        message_id=message_id,
+                        provider_claim=provider_claim,
+                    )
+                )
+        except ExternalWriteFenceError:
+            raise
         except Exception as exc:
             result = {"error": f"Feishu hot card send failed: {type(exc).__name__}: {exc}"}
-        return result
+        if result.get("success") is True:
+            return result
+        return self._card_failure_result(result)
 
     def send(self, args: dict[str, Any]) -> str:
         if self._record_sender is not None:
             return self._record_sender.send(args)
+        raw_claim = args.get("_pnc_rca_external_write_guard")
+        if raw_claim is not None and type(raw_claim) is not RcaProviderWriteClaim:
+            raise ExternalWriteFenceError("external_write_provider_claim_invalid")
         if args.get("action", "send") != "send":
+            if raw_claim is not None:
+                raise ExternalWriteFenceError("external_write_provider_claim_invalid")
             return send_message_tool(args)
         target = str(args.get("target") or "")
         message = str(args.get("message") or "")
+        provider_claim = raw_claim
         if not target.startswith("feishu:"):
+            if provider_claim is not None:
+                raise ExternalWriteFenceError("external_write_provider_claim_invalid")
             return send_message_tool(args)
         try:
-            result = asyncio.run(self._send_once(target, message))
+            result = asyncio.run(
+                self._send_once(
+                    target,
+                    message,
+                    provider_claim=provider_claim,
+                )
+            )
             if self._looks_auth_error(result):
                 self._ensure_adapter(rebuild=True)
-                result = asyncio.run(self._send_once(target, message))
+                result = asyncio.run(
+                    self._send_once(
+                        target,
+                        message,
+                        provider_claim=provider_claim,
+                    )
+                )
         except Exception as exc:
             result = {"error": f"Feishu hot send failed: {type(exc).__name__}: {exc}"}
         return json.dumps(result, ensure_ascii=False)
@@ -569,6 +832,12 @@ def iter_pending_notices(*, task_ids: Iterable[str] | None = None, retry_failed_
             # card. Otherwise the next scan sees a different render and emits
             # a second PATCH for the same terminal transition.
             _atomic_write_json(path, body)
+            body, _review_confirm_result = ensure_rca_candidate_review_confirm(
+                task_id=task_id,
+                path=path,
+                body=body,
+            )
+            task_card = body.get("task_card") if isinstance(body.get("task_card"), dict) else task_card
         card_relayable = _task_card_needs_sync(task_card) if task_card else False
         notify_pending = (_originator_notify_pending(task_id, body) or _mechanical_download_notify_pending(task_id, body) or _g1q3_anomaly_notify_pending(task_id, body) or _infra_recovery_notify_pending(task_id, body)) if task_card else False
         if not notice:
@@ -3473,6 +3742,10 @@ _CARD_PERSISTENT_FIELDS = frozenset(
         "close_loop_guard_applied_at",
         "close_loop_guard_reason",
         "need_input_first_timeout_at",
+        # These fields are written by the task-confirm lock.  A concurrent
+        # relay render must not resurrect buttons or erase adjudication state.
+        "pending_confirms",
+        "rca_conclusion_review",
     }
 )
 _CARD_LOCK_TIMEOUT_SECONDS = 10.0
@@ -3579,6 +3852,282 @@ class _TaskCardSidecarLock:
                 self.acquired = False
 
 
+_DURABLE_CARD_PATCH_PENDING_STATES = frozenset(
+    {"pending", "claimed", "retry_wait", "uncertain"}
+)
+
+
+def _resolved_rca_review(task_card: Mapping[str, Any]) -> dict[str, Any] | None:
+    raw = task_card.get("rca_conclusion_review")
+    if not isinstance(raw, Mapping):
+        return None
+    value = dict(raw)
+    if (
+        value.get("schema_version") != RCA_CANDIDATE_REVIEW_SCHEMA_VERSION
+        or value.get("kind") != RCA_CANDIDATE_REVIEW_PRESET
+    ):
+        raise ValueError("rca_card_patch_semantic_resolution_invalid")
+    action = str(value.get("action") or "").strip()
+    conclusion_state = str(value.get("conclusion_state") or "").strip()
+    generation = value.get("generation")
+    required = (
+        "adjudication_id",
+        "business_key",
+        "work_item_id",
+        "original_effect_key",
+        "correction_effect_key",
+    )
+    if (
+        {"recognize": "recognized", "retract": "invalidated"}.get(action)
+        != conclusion_state
+        or isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation < 1
+        or any(not str(value.get(key) or "").strip() for key in required)
+    ):
+        raise ValueError("rca_card_patch_semantic_resolution_invalid")
+    return value
+
+
+def _materialize_rca_review_card_patch(
+    *,
+    task_id: str,
+    path: Path,
+    body: dict[str, Any],
+    task_card: dict[str, Any],
+    rendered: dict[str, Any],
+    render_hash: str,
+    semantic_key: str,
+    target: str,
+    card_message_id: str | None,
+    send: bool,
+    store_factory: Callable[..., Any] | None,
+    write_fence_binding_loader: Callable[[str], Mapping[str, Any]] | None,
+) -> tuple[bool, dict[str, Any] | None]:
+    """Materialize the semantic correction into one durable card-patch effect.
+
+    The boolean says whether generic card sync must stop.  Once a prior durable
+    patch is settled, a later unrelated card render may continue through the
+    normal relay path without replaying the semantic correction.
+    """
+
+    try:
+        review = _resolved_rca_review(task_card)
+    except ValueError as exc:
+        return True, {
+            "skipped": True,
+            "reason": str(exc),
+            "external_write_attempted": False,
+        }
+    if review is None or not card_message_id:
+        return False, None
+    if str(task_card.get("task_id") or "").strip() != str(task_id or "").strip():
+        return True, {
+            "skipped": True,
+            "reason": "rca_card_patch_submission_identity_invalid",
+            "external_write_attempted": False,
+        }
+    parts = target.split(":")
+    if (
+        len(parts) not in {2, 3}
+        or parts[0] != "feishu"
+        or not parts[1]
+        or (len(parts) == 3 and not parts[2])
+    ):
+        return True, {
+            "skipped": True,
+            "reason": "rca_card_patch_target_invalid",
+            "external_write_attempted": False,
+        }
+    chat_id = parts[1]
+    thread_id = f"topic:{parts[2]}" if len(parts) == 3 else ""
+    target_key = f"feishu_card:{chat_id}:{card_message_id}"
+    if not send:
+        return True, {
+            "dry_run": True,
+            "durable_card_patch": True,
+            "external_write_attempted": False,
+            "render_hash": render_hash,
+            "target": target,
+            "target_key": target_key,
+            "message_id": card_message_id,
+        }
+    try:
+        if write_fence_binding_loader is None:
+            task_binding = _load_task_write_fence(task_id)
+            live_target = _relay_live_fence_binding(task_binding["write_fence"])
+        else:
+            live_target = dict(write_fence_binding_loader(task_id))
+        if (
+            str(live_target.get("chat_id") or "").strip() != chat_id
+            or str(live_target.get("thread_target") or "").strip() != thread_id
+        ):
+            raise ExternalWriteFenceError(
+                "external_write_fence_target_mismatch"
+            )
+    except Exception as exc:
+        code = exc.code if isinstance(exc, ExternalWriteFenceError) else str(exc)
+        return True, {
+            "skipped": True,
+            "reason": "durable_card_patch_target_binding_blocked",
+            "error_code": str(code or type(exc).__name__)[:120],
+            "external_write_attempted": False,
+            "target": target,
+            "message_id": card_message_id,
+        }
+    if store_factory is None:
+        from gateway.pnc_rca_delivery_store import RcaDeliveryStore
+
+        store_factory = RcaDeliveryStore
+    try:
+        store = store_factory(_relay_control_db_path(), require_current=True)
+        binding = store.card_patch_materialization_binding(
+            adjudication_id=str(review.get("adjudication_id") or ""),
+            action=str(review.get("action") or ""),
+            conclusion_state=str(review.get("conclusion_state") or ""),
+            business_key=str(review.get("business_key") or ""),
+            submission_key=task_id,
+            generation=int(review.get("generation") or 0),
+            work_item_id=str(review.get("work_item_id") or ""),
+            original_effect_key=str(review.get("original_effect_key") or ""),
+            correction_effect_key=str(review.get("correction_effect_key") or ""),
+            require_current_activation=False,
+        )
+        state = store.card_patch_effect_state(
+            delivery_id=binding["delivery_id"],
+            target_key=target_key,
+            adjudication_id=binding["adjudication_id"],
+        )
+        if state is None:
+            binding = store.card_patch_materialization_binding(
+                adjudication_id=binding["adjudication_id"],
+                action=binding["action"],
+                conclusion_state=binding["conclusion_state"],
+                business_key=binding["business_key"],
+                submission_key=binding["submission_key"],
+                generation=binding["generation"],
+                work_item_id=binding["work_item_id"],
+                original_effect_key=binding["original_effect_key"],
+                correction_effect_key=binding["correction_effect_key"],
+                require_current_activation=True,
+            )
+            _effect_key, _payload_sha, payload = build_card_patch_effect(
+                delivery_id=binding["delivery_id"],
+                project_key=binding["project_key"],
+                work_item_type_key=binding["work_item_type_key"],
+                work_item_id=binding["work_item_id"],
+                business_key=binding["business_key"],
+                submission_key=binding["submission_key"],
+                generation=binding["generation"],
+                adjudication_id=binding["adjudication_id"],
+                action=binding["action"],
+                conclusion_state=binding["conclusion_state"],
+                original_effect_key=binding["original_effect_key"],
+                correction_effect_key=binding["correction_effect_key"],
+                target_key=target_key,
+                target={
+                    "schema_version": DELIVERY_TARGET_SCHEMA_VERSION,
+                    "platform": "feishu",
+                    "chat_id": chat_id,
+                    "thread_id": thread_id,
+                    "message_id": card_message_id,
+                    "submission_key": binding["submission_key"],
+                    "output_cap": "L1",
+                },
+                card_payload=rendered,
+            )
+            store.enqueue_card_patch_effect(payload=payload)
+            state = store.card_patch_effect_state(
+                delivery_id=binding["delivery_id"],
+                target_key=target_key,
+                adjudication_id=binding["adjudication_id"],
+            )
+    except Exception as exc:
+        code = str(exc) or type(exc).__name__
+        return True, {
+            "skipped": True,
+            "reason": (
+                "awaiting_correction_effect"
+                if code == "delivery_card_patch_correction_not_settled"
+                else "durable_card_patch_materialization_blocked"
+            ),
+            "error_code": code[:120],
+            "external_write_attempted": False,
+            "target": target,
+            "message_id": card_message_id,
+        }
+    if not isinstance(state, Mapping):
+        return True, {
+            "skipped": True,
+            "reason": "durable_card_patch_state_missing",
+            "external_write_attempted": False,
+            "target": target,
+            "message_id": card_message_id,
+        }
+    effect_status = str(state.get("status") or "")
+    effect_payload = (
+        state.get("payload") if isinstance(state.get("payload"), Mapping) else {}
+    )
+    durable_result = {
+        "durable_card_patch": True,
+        "effect_key": str(state.get("effect_key") or ""),
+        "effect_status": effect_status,
+        "external_write_attempted": False,
+        "target": target,
+        "message_id": card_message_id,
+        "render_hash": str(effect_payload.get("render_hash") or ""),
+    }
+    if effect_status in _DURABLE_CARD_PATCH_PENDING_STATES:
+        return True, {
+            **durable_result,
+            "skipped": True,
+            "reason": "durable_card_patch_pending",
+        }
+    if effect_status == "suppressed" and state.get("write_phase") == "settled":
+        observed_at = str(state.get("completed_at") or "").strip() or _now_iso()
+        task_card["last_sent_hash"] = render_hash
+        task_card["last_render_hash"] = render_hash
+        task_card["last_card_semantic_key"] = semantic_key
+        task_card["last_update_observed_at"] = observed_at
+        task_card["card_message_expired_at"] = (
+            task_card.get("card_message_expired_at") or observed_at
+        )
+        task_card.pop("last_error", None)
+        body["task_card"] = task_card
+        _atomic_write_json(path, body)
+        return True, {
+            **durable_result,
+            "skipped": True,
+            "reason": "card_message_expired",
+            "disposition": "suppressed_terminal",
+        }
+    if effect_status != "succeeded" or state.get("write_phase") != "settled":
+        return True, {
+            **durable_result,
+            "skipped": True,
+            "reason": "durable_card_patch_terminal_failure",
+        }
+
+    effect_render_hash = str(effect_payload.get("render_hash") or "")
+    completed_at = str(state.get("completed_at") or "").strip() or _now_iso()
+    task_card["last_sent_hash"] = effect_render_hash
+    task_card["last_render_hash"] = effect_render_hash
+    task_card["last_update_ts"] = completed_at
+    task_card["last_update_observed_at"] = completed_at
+    task_card.pop("last_error", None)
+    if effect_render_hash == render_hash:
+        task_card["last_card_semantic_key"] = semantic_key
+    body["task_card"] = task_card
+    _atomic_write_json(path, body)
+    settled_result = {
+        **durable_result,
+        "success": True,
+        "updated": True,
+        "disposition": "durable_effect_settled",
+    }
+    return effect_render_hash == render_hash, settled_result
+
+
 def _sync_task_card_unlocked(
     *,
     task_id: str,
@@ -3586,6 +4135,10 @@ def _sync_task_card_unlocked(
     body: dict[str, Any],
     send: bool,
     send_card_func: Callable[..., dict[str, Any]] | None = None,
+    card_patch_store_factory: Callable[..., Any] | None = None,
+    card_patch_write_fence_loader: (
+        Callable[[str], Mapping[str, Any]] | None
+    ) = None,
     throttle_seconds: float = DEFAULT_CARD_UPDATE_THROTTLE_SECONDS,
 ) -> dict[str, Any] | None:
     task_card = body.get("task_card") if isinstance(body.get("task_card"), dict) else None
@@ -3607,6 +4160,22 @@ def _sync_task_card_unlocked(
         notice=notice,
         render_hash=render_hash,
     )
+    durable_handled, durable_result = _materialize_rca_review_card_patch(
+        task_id=task_id,
+        path=path,
+        body=body,
+        task_card=task_card,
+        rendered=rendered,
+        render_hash=render_hash,
+        semantic_key=semantic_key,
+        target=target,
+        card_message_id=card_message_id,
+        send=send,
+        store_factory=card_patch_store_factory,
+        write_fence_binding_loader=card_patch_write_fence_loader,
+    )
+    if durable_handled:
+        return durable_result
     if card_message_id and last_sent_hash == render_hash and (not last_semantic_key or last_semantic_key == semantic_key):
         return {
             "skipped": True,
@@ -3641,6 +4210,8 @@ def _sync_task_card_unlocked(
         result["target"] = target
         result["semantic_key"] = semantic_key
         result["disposition"] = "recorded"
+        if durable_result is not None:
+            result["durable_card_patch"] = durable_result
         return result
     error = str((result or {}).get("error") if isinstance(result, dict) else result)
     now_iso = _now_iso()
@@ -3675,6 +4246,10 @@ def sync_task_card(
     body: dict[str, Any],
     send: bool,
     send_card_func: Callable[..., dict[str, Any]] | None = None,
+    card_patch_store_factory: Callable[..., Any] | None = None,
+    card_patch_write_fence_loader: (
+        Callable[[str], Mapping[str, Any]] | None
+    ) = None,
     throttle_seconds: float = DEFAULT_CARD_UPDATE_THROTTLE_SECONDS,
 ) -> dict[str, Any] | None:
     desired_card = body.get("task_card") if isinstance(body.get("task_card"), dict) else None
@@ -3702,6 +4277,8 @@ def sync_task_card(
             body=working_body,
             send=send,
             send_card_func=send_card_func,
+            card_patch_store_factory=card_patch_store_factory,
+            card_patch_write_fence_loader=card_patch_write_fence_loader,
             throttle_seconds=throttle_seconds,
         )
         body.clear()
@@ -3913,7 +4490,11 @@ def _merge_task_card_persistent_fields(current: dict[str, Any], previous: dict[s
     if not isinstance(current, dict) or not isinstance(previous, dict):
         return current
     for key in _CARD_PERSISTENT_FIELDS:
-        if key in previous and key not in current:
+        # task-confirm owns these two values under its own flock.  Always take
+        # the on-disk value so a stale relay body cannot resurrect a resolved
+        # action or erase the immutable adjudication projection.
+        task_confirm_owned = key in {"pending_confirms", "rca_conclusion_review"}
+        if key in previous and (task_confirm_owned or key not in current):
             current[key] = previous[key]
     return current
 
@@ -4085,6 +4666,76 @@ def _relay_control_db_path() -> Path:
     )
 
 
+def ensure_rca_candidate_review_confirm(
+    *,
+    task_id: str,
+    path: Path,
+    body: dict[str, Any],
+    store_factory: Callable[..., Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Attach one review card only after the delivery DB proves candidacy.
+
+    Card fields are intentionally ignored for qualification.  The read-only
+    queue recomputes the structural medium tier from the settled publication,
+    and the immutable write fence binds this sidecar to the same business key
+    and generation before the generic ``add_pending_confirm`` producer runs.
+    """
+    if not isinstance(body, dict) or "g1q3-rca" not in str(task_id or ""):
+        return body, {"added": False, "skipped": "not_g1q3_rca"}
+    task_card = body.get("task_card") if isinstance(body.get("task_card"), dict) else None
+    if not isinstance(task_card, dict):
+        return body, {"added": False, "skipped": "task_card_missing"}
+    meta = _load_shared_state_meta(task_id)
+    work_item_id = _work_item_id_for_sidecar(task_id, body, meta)
+    if not work_item_id:
+        return body, {"added": False, "skipped": "work_item_id_missing"}
+    try:
+        binding = _load_task_write_fence(task_id)
+        fence = binding.get("write_fence") if isinstance(binding.get("write_fence"), dict) else {}
+        business_key = str(fence.get("business_key") or "").strip()
+        generation = int(fence.get("generation") or 0)
+        if (
+            str(fence.get("submission_key") or "").strip() != str(task_id).strip()
+            or not business_key
+            or generation < 1
+        ):
+            raise ExternalWriteFenceError("external_write_fence_identity_mismatch")
+        if store_factory is None:
+            from gateway.pnc_rca_delivery_store import RcaDeliveryStore
+
+            store_factory = RcaDeliveryStore
+        store = store_factory(_relay_control_db_path(), require_current=True)
+        candidates = store.list_conclusion_review_queue(limit=100)
+        candidate = next(
+            (
+                item
+                for item in candidates
+                if str(getattr(item, "work_item_id", "") or "").strip() == work_item_id
+                and str(getattr(item, "business_key", "") or "").strip() == business_key
+                and int(getattr(item, "generation", 0) or 0) == generation
+            ),
+            None,
+        )
+        if candidate is None:
+            return body, {"added": False, "skipped": "no_db_proven_medium_candidate"}
+        result = add_rca_candidate_conclusion_confirm(
+            task_id=task_id,
+            candidate=candidate,
+        )
+        if not result.get("ok"):
+            return body, dict(result)
+        refreshed = _load_json(path)
+        if not refreshed:
+            raise RuntimeError("rca review confirm sidecar reload failed")
+        return refreshed, dict(result)
+    except Exception as exc:
+        return body, {
+            "added": False,
+            "skipped": "db_candidate_proof_unavailable",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
 def _load_task_write_fence(task_id: str) -> dict[str, Any]:
     """Read the immutable W3 snapshot; sidecar metadata is never authoritative."""
     key = str(task_id or "").strip()
@@ -4147,6 +4798,30 @@ def _load_task_write_fence(task_id: str) -> dict[str, Any]:
     }
 
 
+def _is_g1q3_rca_origin_task(task_id: str, body: Mapping[str, Any]) -> bool:
+    """Classify relay provenance from canonical admission or live shared state."""
+
+    try:
+        _load_task_write_fence(task_id)
+        return True
+    except ExternalWriteFenceError:
+        pass
+    meta = _load_shared_state_meta(task_id)
+    if str(meta.get("business_line") or "").strip() in {
+        "g1q3_rca",
+        "g1q3-rca",
+    }:
+        return True
+    task_card = body.get("task_card") if isinstance(body, Mapping) else None
+    delivery = (
+        task_card.get("delivery")
+        if isinstance(task_card, Mapping)
+        and isinstance(task_card.get("delivery"), Mapping)
+        else {}
+    )
+    return str(delivery.get("schema_version") or "").startswith("g1q3_")
+
+
 def _relay_live_fence_binding(fence: Mapping[str, Any]) -> dict[str, Any]:
     path = _relay_control_db_path()
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
@@ -4205,6 +4880,7 @@ def _relay_live_fence_binding(fence: Mapping[str, Any]) -> dict[str, Any]:
         ) from exc
     return {
         "epoch_id": str(row["epoch_id"]),
+        "state": str(row["state"]),
         "ledger_id": int(row["ledger_id"]),
         "business_key": str(row["business_key"]),
         "submission_key": str(row["submission_key"]),
@@ -4222,9 +4898,18 @@ def _fenced_task_senders(
     binding = _load_task_write_fence(task_id)
     snapshot = binding["snapshot"]
     fence = binding["write_fence"]
+    provider_claim = build_write_fence_provider_claim(fence)
     core_sha = binding["snapshot_core_sha256"]
     resolved = snapshot.get("resolved_admission") or {}
-    def _check(operation: str, target: str) -> None:
+    hot_sender: FeishuHotSender | None = None
+
+    def _provider_sender() -> FeishuHotSender:
+        nonlocal hot_sender
+        if hot_sender is None:
+            hot_sender = FeishuHotSender()
+        return hot_sender
+
+    def _check(operation: str, target: str) -> dict[str, Any]:
         live = _relay_live_fence_binding(fence)
         chat_id = str(live.get("chat_id") or "").strip()
         thread_target = str(live.get("thread_target") or "").strip()
@@ -4273,6 +4958,7 @@ def _fenced_task_senders(
             expected_target_set_sha256=str(live["target_set_sha256"]),
             now=datetime.now(timezone.utc),
         )
+        return live
 
     def _send(args: dict[str, Any]) -> str:
         target = str(args.get("target") or "")
@@ -4280,14 +4966,23 @@ def _fenced_task_senders(
         if target.count(":") >= 2:
             operation = "feishu_thread_reply"
         _check(operation, target)
-        return (send_func or send_message_tool)(args)
+        bound_args = dict(args)
+        bound_args["_pnc_rca_external_write_guard"] = provider_claim
+        sender = send_func
+        if sender is None or sender is send_message_tool:
+            sender = _provider_sender().send
+        return sender(bound_args)
 
     def _card(target: str, card_payload: dict[str, Any], message_id: str | None = None) -> dict[str, Any]:
         operation = "feishu_card_patch" if message_id else "feishu_card_create"
         _check(operation, target)
-        if send_card_func is None:
-            return {"success": False, "error_code": "external_write_fence_operation_denied", "error": "card sender unavailable"}
-        return send_card_func(target, card_payload, message_id=message_id)
+        sender = send_card_func or _provider_sender().send_task_card
+        return sender(
+            target,
+            card_payload,
+            message_id=message_id,
+            provider_claim=provider_claim,
+        )
 
     return _send, _card
 
@@ -4375,9 +5070,7 @@ def relay_pending_notices(*, task_ids: Iterable[str] | None = None, send: bool =
                 body=body,
                 notice=notice,
             )
-        # Legacy date-prefixed task ids predate W3 and remain grandfathered.
-        # Only canonical W3 submission keys consume the RCA admission fence.
-        if send and task_id.lower().startswith("g1q3-rca-s1-"):
+        if send and _is_g1q3_rca_origin_task(task_id, body):
             try:
                 task_send_func, task_card_func = _fenced_task_senders(
                     task_id,

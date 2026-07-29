@@ -225,46 +225,10 @@ def maybe_comment_field_gap(
             result["action"] = "planned"
             result["reason"] = f"{ENABLE_ENV} not enabled; plan only"
             return result
-
-        if meegle_runner is None:
-            from gateway.pnc_issue_context import default_meegle_runner
-            meegle_runner = default_meegle_runner
-
-        current = _now(now)
-        ledger_dir = Path(ledger_dir)
-        ledger = _load_ledger(ledger_dir)
-        if _recently_commented(ledger, str(work_item_id), blocker_kind, current):
-            result["action"] = "skipped_recent"
-            return result
-        if _today_count(ledger, current) >= _daily_cap():
-            result["action"] = "skipped_cap"
-            return result
-        has_existing = _existing_comment_has_signature(
-            project_key=str(project_key), work_item_id=str(work_item_id),
-            signature=plan["signature"], runner=meegle_runner,
+        result["action"] = "skipped_superseded"
+        result["reason"] = (
+            "input self-proof is internal-only; user field-gap comments are disabled"
         )
-        if has_existing is None:
-            # Fail closed: cannot verify dedup, do not write.
-            result["action"] = "comment_failed"
-            result["reason"] = "comment list unreadable; refusing to post without dedup check"
-            return result
-        if has_existing:
-            result["action"] = "skipped_existing"
-            _record_post(ledger_dir, ledger, str(work_item_id), blocker_kind, current)
-            return result
-
-        rc, out, err = meegle_runner([
-            "comment", "add",
-            "--project-key", str(project_key),
-            "--work-item-id", str(work_item_id),
-            "--content", plan["content"],
-        ])
-        if rc != 0:
-            result["action"] = "comment_failed"
-            result["reason"] = str(err or out or "meegle comment add failed")[:200]
-            return result
-        _record_post(ledger_dir, ledger, str(work_item_id), blocker_kind, current)
-        result["action"] = "posted"
         return result
     except Exception as exc:
         return {"action": "comment_failed", "blocker_kind": blocker_kind, "reason": f"{type(exc).__name__}: {exc}"[:200]}

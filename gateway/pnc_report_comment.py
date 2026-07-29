@@ -230,40 +230,10 @@ def maybe_comment_report_ready(
         if recorded is not None:
             result.update(recorded)
             return result
-        if meegle_runner is None:
-            from gateway.pnc_issue_context import default_meegle_runner
-            meegle_runner = default_meegle_runner
-
-        current = _now(now)
-        ledger_dir = Path(ledger_dir)
-        ledger = _load_ledger(ledger_dir)
-        if _recently_commented(ledger, str(work_item_id), current):
-            result["action"] = "skipped_recent"
-            return result
-        if _today_count(ledger, current) >= daily_cap():
-            result["action"] = "skipped_cap"
-            return result
-        existing = _existing_comment_has_signature(project_key=str(project_key), work_item_id=str(work_item_id), signature=plan["signature"], runner=meegle_runner)
-        if existing is None:
-            result["action"] = "comment_failed"
-            result["reason"] = "comment list unreadable; refusing to post without dedup check"
-            return result
-        if existing:
-            result["action"] = "skipped_existing"
-            _record_post(ledger_dir, ledger, str(work_item_id), str(task_id), current)
-            return result
-        rc, out, err = meegle_runner([
-            "comment", "add",
-            "--project-key", str(project_key),
-            "--work-item-id", str(work_item_id),
-            "--content", plan["content"],
-        ])
-        if rc != 0:
-            result["action"] = "comment_failed"
-            result["reason"] = str(err or out or "meegle comment add failed")[:200]
-            return result
-        _record_post(ledger_dir, ledger, str(work_item_id), str(task_id), current)
-        result["action"] = "posted"
+        result["action"] = "skipped_superseded"
+        result["reason"] = (
+            "canonical RCA delivery dispatcher exclusively owns Feishu comments"
+        )
         return result
     except Exception as exc:
         return {"action": "comment_failed", "work_item_id": str(work_item_id), "task_id": str(task_id), "reason": f"{type(exc).__name__}: {exc}"[:200]}

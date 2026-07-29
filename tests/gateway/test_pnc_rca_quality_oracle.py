@@ -797,6 +797,16 @@ def _contract(
     if candidate:
         conclusion += " 当前为候选方向，需人工复核。"
     return {
+        "upstream_dispatch": {
+            "hit_evaluator_keys": ["lane_geometry_quality"],
+            "hit_window_envelope": None,
+            "hit_windows": [],
+            "owner_bucket": "lane_perception",
+            "owner_bucket_label": "车道线感知",
+            "reason": "single_owner_bucket_hit",
+            "schema_version": "g1q3_upstream_dispatch_v2",
+            "terminal_classification": "valid_dispatch",
+        },
         "consumer_capability": {
             "actual_evaluators": [
                 {

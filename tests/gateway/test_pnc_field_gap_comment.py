@@ -63,7 +63,7 @@ def test_disabled_by_default_returns_plan_only(tmp_path, monkeypatch):
     assert runner.calls == []
 
 
-def test_enabled_posts_comment_and_records_ledger(tmp_path, monkeypatch):
+def test_enabled_writer_is_superseded_and_never_calls_provider(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_G1Q3_FIELD_GAP_COMMENT", "1")
     runner = _runner()
 
@@ -73,13 +73,9 @@ def test_enabled_posts_comment_and_records_ledger(tmp_path, monkeypatch):
         ledger_dir=tmp_path, meegle_runner=runner, now=NOW,
     )
 
-    assert result["action"] == "posted"
-    add_call = [c for c in runner.calls if c[:2] == ["comment", "add"]][0]
-    assert add_call[add_call.index("--work-item-id") + 1] == "7015828844"
-    assert "问题发生frameid" in add_call[add_call.index("--content") + 1]
-    ledger = json.loads((tmp_path / "g1q3_field_gap_comments.json").read_text())
-    assert "7015828844:missing_frame_id" in ledger["issues"]
-    assert ledger["daily"]["2026-06-12"] == 1
+    assert result["action"] == "skipped_superseded"
+    assert runner.calls == []
+    assert not (tmp_path / "g1q3_field_gap_comments.json").exists()
 
 
 def test_repeat_within_window_is_skipped(tmp_path, monkeypatch):
@@ -95,9 +91,9 @@ def test_repeat_within_window_is_skipped(tmp_path, monkeypatch):
         ledger_dir=tmp_path, meegle_runner=runner, now=NOW,
     )
 
-    assert first["action"] == "posted"
-    assert second["action"] == "skipped_recent"
-    assert len([c for c in runner.calls if c[:2] == ["comment", "add"]]) == 1
+    assert first["action"] == "skipped_superseded"
+    assert second["action"] == "skipped_superseded"
+    assert runner.calls == []
 
 
 def test_existing_comment_signature_prevents_posting(tmp_path, monkeypatch):
@@ -109,8 +105,8 @@ def test_existing_comment_signature_prevents_posting(tmp_path, monkeypatch):
         ledger_dir=tmp_path, meegle_runner=runner, now=NOW,
     )
 
-    assert result["action"] == "skipped_existing"
-    assert [c for c in runner.calls if c[:2] == ["comment", "add"]] == []
+    assert result["action"] == "skipped_superseded"
+    assert runner.calls == []
 
 
 def test_daily_cap_blocks_further_posts(tmp_path, monkeypatch):
@@ -127,8 +123,8 @@ def test_daily_cap_blocks_further_posts(tmp_path, monkeypatch):
         ledger_dir=tmp_path, meegle_runner=runner, now=NOW,
     )
 
-    assert first["action"] == "posted"
-    assert second["action"] == "skipped_cap"
+    assert first["action"] == "skipped_superseded"
+    assert second["action"] == "skipped_superseded"
 
 
 def test_unreadable_comment_list_fails_closed(tmp_path, monkeypatch):
@@ -144,8 +140,7 @@ def test_unreadable_comment_list_fails_closed(tmp_path, monkeypatch):
         ledger_dir=tmp_path, meegle_runner=broken, now=NOW,
     )
 
-    assert result["action"] == "comment_failed"
-    assert "dedup" in result["reason"]
+    assert result["action"] == "skipped_superseded"
 
 
 def test_post_failure_is_reported_not_raised(tmp_path, monkeypatch):
@@ -157,8 +152,8 @@ def test_post_failure_is_reported_not_raised(tmp_path, monkeypatch):
         ledger_dir=tmp_path, meegle_runner=runner, now=NOW,
     )
 
-    assert result["action"] == "comment_failed"
-    assert "boom" in result["reason"]
+    assert result["action"] == "skipped_superseded"
+    assert runner.calls == []
 
 
 def test_legacy_invalid_pdcl_subkinds_project_remote_reference_copy_and_can_real_at():

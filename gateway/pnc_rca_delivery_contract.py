@@ -6,12 +6,13 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 import hashlib
 import json
+import math
 import posixpath
 import re
 import uuid
 from pathlib import PurePosixPath
 from typing import Any, Mapping, Sequence
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from gateway.pnc_rca_admission import RcaAdmission, validate_rca_admission
 from gateway.feishu_mention import build_at_mention
@@ -54,7 +55,17 @@ _TERMINAL_FALLBACK_UNBACKED_EVIDENCE_RE = re.compile(
 DELIVERY_KEY_VERSION = "v1"
 DELIVERY_EFFECT_KIND = "feishu_issue_comment"
 DELIVERY_THREAD_EFFECT_KIND = "feishu_thread_reply"
-DELIVERY_EFFECT_KINDS = frozenset({DELIVERY_EFFECT_KIND, DELIVERY_THREAD_EFFECT_KIND})
+DELIVERY_CARD_PATCH_EFFECT_KIND = "feishu_card_patch"
+DELIVERY_CARD_PATCH_EFFECT_SCHEMA_VERSION = "pnc_rca_card_patch_effect_v1"
+DELIVERY_EFFECT_KINDS = frozenset({
+    DELIVERY_EFFECT_KIND,
+    DELIVERY_THREAD_EFFECT_KIND,
+    DELIVERY_CARD_PATCH_EFFECT_KIND,
+})
+TERMINAL_DELIVERY_EFFECT_KINDS = frozenset({
+    DELIVERY_EFFECT_KIND,
+    DELIVERY_THREAD_EFFECT_KIND,
+})
 DELIVERY_TARGET_SCHEMA_VERSION = "pnc_rca_delivery_target_v1"
 TERMINAL_DELIVERY_OUTCOMES = frozenset({"terminal_failed", "quarantined"})
 _VM_TMP_PREFIX = "/mnt/tmp/"
@@ -111,11 +122,15 @@ MAX_DELIVERY_ARTIFACT_BYTES = 256 * 1024 * 1024
 MAX_DELIVERY_ARTIFACT_TOTAL_BYTES = 512 * 1024 * 1024
 MAX_DELIVERY_INDEX_HTML_BYTES = 32 * 1024 * 1024
 MAX_FEISHU_COMMENT_BYTES = 8 * 1024
+MAX_FEISHU_CARD_BYTES = 64 * 1024
 MAX_CONCLUSION_BYTES = 2 * 1024
 CONSUMER_CAPABILITY_SCHEMA_VERSION = "rca_consumer_capability_publication_v1"
 RCA_RESULT_FIELD_KEY = "field_9193cb"
 RCA_REPORT_FIELD_KEY = "field_8c912e"
-DELIVERY_REPORT_LINK_KIND = "html_report"
+DELIVERY_REPORT_LINK_KIND = "foxglove_viz"
+RERUN_PROMPT_LINE = (
+    "如需重新分析，请到 PNC-Agent 群 @小助手 并发送：重新分析 <单号>"
+)
 _HTML_REPORT_STATUSES = frozenset({
     "html_delivery_ready",
     "report_generated_need_review",
@@ -132,6 +147,195 @@ class DeliveryContractError(ValueError):
         self.code = str(code or "delivery_contract_invalid")[:120]
         self.detail = str(detail or self.code)[:1000]
         super().__init__(self.detail)
+
+
+_UPSTREAM_DISPATCH_SCHEMA_VERSION = "g1q3_upstream_dispatch_v2"
+_UPSTREAM_OWNER_BUCKET_LABELS = {
+    "acc_longitudinal_control": "纵向控制",
+    "aeb": "AEB",
+    "fctb_fcw": "AEB_FCW",
+    "hmi_sr": "HMI_SR",
+    "lane_perception": "车道线感知",
+    "lcc_lateral_control": "横向控制",
+    "ooi_spp": "目标选择 / SPP",
+    "tsr": "TSR",
+    "vision_perception": "视觉感知",
+}
+_UPSTREAM_DISPATCH_REASONS = frozenset(
+    {
+        "single_owner_bucket_hit",
+        "abstain_no_hit",
+        "abstain_cross_domain",
+        "out_of_scope",
+    }
+)
+
+
+def _legacy_abstain_no_hit() -> dict[str, Any]:
+    return {
+        "hit_evaluator_keys": [],
+        "hit_window_envelope": None,
+        "hit_windows": [],
+        "owner_bucket": None,
+        "owner_bucket_label": None,
+        "reason": "abstain_no_hit",
+        "schema_version": _UPSTREAM_DISPATCH_SCHEMA_VERSION,
+        "terminal_classification": "abstain",
+    }
+
+
+def _validated_upstream_dispatch(contract: Mapping[str, Any]) -> dict[str, Any]:
+    raw = contract.get("upstream_dispatch")
+    if raw is None:
+        # Old sealed contracts cannot be reinterpreted as a direction. Treat
+        # their missing W1b output as an honest no-hit abstention.
+        return _legacy_abstain_no_hit()
+    if not isinstance(raw, Mapping) or set(raw) != {
+        "hit_evaluator_keys",
+        "hit_window_envelope",
+        "hit_windows",
+        "owner_bucket",
+        "owner_bucket_label",
+        "reason",
+        "schema_version",
+        "terminal_classification",
+    }:
+        raise DeliveryContractError("upstream_dispatch_contract_invalid")
+    owner_bucket = raw.get("owner_bucket")
+    owner_bucket_label = raw.get("owner_bucket_label")
+    reason = raw.get("reason")
+    terminal = raw.get("terminal_classification")
+    keys = raw.get("hit_evaluator_keys")
+    envelope = raw.get("hit_window_envelope")
+    windows = raw.get("hit_windows")
+    if (
+        raw.get("schema_version") != _UPSTREAM_DISPATCH_SCHEMA_VERSION
+        or reason not in _UPSTREAM_DISPATCH_REASONS
+        or not isinstance(keys, list)
+        or len(keys) > MAX_DELIVERY_ARTIFACTS
+        or any(not isinstance(key, str) or not _SAFE_KEY_RE.fullmatch(key) for key in keys)
+        or keys != sorted(set(keys))
+        or not isinstance(windows, list)
+        or len(windows) > MAX_DELIVERY_ARTIFACTS
+    ):
+        raise DeliveryContractError("upstream_dispatch_contract_invalid")
+    if reason == "single_owner_bucket_hit":
+        if (
+            terminal != "valid_dispatch"
+            or owner_bucket not in _UPSTREAM_OWNER_BUCKET_LABELS
+            or owner_bucket_label
+            != _UPSTREAM_OWNER_BUCKET_LABELS.get(owner_bucket)
+            or not keys
+        ):
+            raise DeliveryContractError("upstream_dispatch_contract_invalid")
+    elif reason == "out_of_scope":
+        if (
+            terminal != "out_of_scope"
+            or owner_bucket is not None
+            or owner_bucket_label is not None
+            or keys
+            or windows
+            or envelope is not None
+        ):
+            raise DeliveryContractError("upstream_dispatch_contract_invalid")
+    elif (
+        terminal != "abstain"
+        or owner_bucket is not None
+        or owner_bucket_label is not None
+        or (reason == "abstain_no_hit" and (keys or windows or envelope is not None))
+        or (reason == "abstain_cross_domain" and not keys)
+    ):
+        raise DeliveryContractError("upstream_dispatch_contract_invalid")
+    normalized_windows = []
+    for window in windows:
+        if not isinstance(window, Mapping) or set(window) != {
+            "key",
+            "t_end",
+            "t_start",
+        }:
+            raise DeliveryContractError("upstream_dispatch_window_invalid")
+        evaluator_key = window.get("key")
+        start = window.get("t_start")
+        end = window.get("t_end")
+        if (
+            evaluator_key not in keys
+            or isinstance(start, bool)
+            or isinstance(end, bool)
+            or not isinstance(start, (int, float))
+            or not isinstance(end, (int, float))
+            or not math.isfinite(float(start))
+            or not math.isfinite(float(end))
+            or float(start) > float(end)
+        ):
+            raise DeliveryContractError("upstream_dispatch_window_invalid")
+        normalized_windows.append(
+            {
+                "key": str(evaluator_key),
+                "t_end": float(end),
+                "t_start": float(start),
+            }
+        )
+    if normalized_windows != sorted(
+        normalized_windows,
+        key=lambda item: (
+            item["t_start"],
+            item["t_end"],
+            item["key"],
+        ),
+    ):
+        raise DeliveryContractError("upstream_dispatch_window_invalid")
+    if normalized_windows:
+        if not isinstance(envelope, Mapping) or set(envelope) != {
+            "participating_key_count",
+            "t_end",
+            "t_start",
+        }:
+            raise DeliveryContractError("upstream_dispatch_window_envelope_invalid")
+        expected_envelope = {
+            "participating_key_count": len(
+                {item["key"] for item in normalized_windows}
+            ),
+            "t_end": max(item["t_end"] for item in normalized_windows),
+            "t_start": min(item["t_start"] for item in normalized_windows),
+        }
+        if dict(envelope) != expected_envelope:
+            raise DeliveryContractError("upstream_dispatch_window_envelope_invalid")
+        normalized_envelope = expected_envelope
+    elif envelope is not None:
+        raise DeliveryContractError("upstream_dispatch_window_envelope_invalid")
+    else:
+        normalized_envelope = None
+    return {
+        "hit_evaluator_keys": list(keys),
+        "hit_window_envelope": normalized_envelope,
+        "hit_windows": normalized_windows,
+        "owner_bucket": owner_bucket,
+        "owner_bucket_label": owner_bucket_label,
+        "reason": reason,
+        "schema_version": _UPSTREAM_DISPATCH_SCHEMA_VERSION,
+        "terminal_classification": terminal,
+    }
+
+
+def _dispatch_first_line(dispatch: Mapping[str, Any]) -> str:
+    if dispatch.get("terminal_classification") == "out_of_scope":
+        return "本单不在自动分析范围"
+    owner_bucket_label = dispatch.get("owner_bucket_label")
+    if isinstance(owner_bucket_label, str) and owner_bucket_label:
+        return f"建议责任方：{owner_bucket_label}"
+    return "本单未能定向"
+
+
+def _dispatch_window_line(dispatch: Mapping[str, Any]) -> str:
+    envelope = dispatch.get("hit_window_envelope")
+    if not isinstance(envelope, Mapping):
+        return ""
+    return (
+        "异常时间窗：相对事件起点 "
+        f"{float(envelope['t_start']):.3f}s 至 "
+        f"{float(envelope['t_end']):.3f}s"
+        f"（参与判据 {int(envelope['participating_key_count'])} 个）"
+    )
 
 
 @dataclass(frozen=True)
@@ -289,6 +493,36 @@ _THREAD_EFFECT_SEMANTIC_FIELDS = (
     "reply_in_thread",
     "output_cap",
 )
+_CARD_PATCH_EFFECT_SEMANTIC_FIELDS = (
+    "schema_version",
+    "delivery_id",
+    "effect_kind",
+    "target_key",
+    "project_key",
+    "work_item_type_key",
+    "work_item_id",
+    "business_key",
+    "submission_key",
+    "generation",
+    "platform",
+    "chat_id",
+    "thread_id",
+    "message_id",
+    "output_cap",
+    "adjudication_id",
+    "action",
+    "conclusion_state",
+    "original_effect_key",
+    "correction_effect_key",
+    "render_hash",
+    "card_payload",
+)
+_CARD_PATCH_EFFECT_FINAL_FIELDS = frozenset({
+    *_CARD_PATCH_EFFECT_SEMANTIC_FIELDS,
+    "effect_key",
+    "semantic_payload_sha256",
+    "idempotency_uuid",
+})
 _TERMINAL_V1_BASE_EFFECT_SEMANTIC_FIELDS = (
     "schema_version",
     "delivery_id",
@@ -321,6 +555,7 @@ _TERMINAL_FALLBACK_BASE_EFFECT_SEMANTIC_FIELDS = (
 )
 
 _TERMINAL_DIAGNOSTIC_RESULTS = {
+    "out_of_scope": "本单不在自动分析范围。",
     "business_route_unresolved": (
         "自动归因未完成（非归因结论）：官方所属项目字段缺失，无法唯一选择业务归因能力；未按标题、负责人或群聊猜测。"
     ),
@@ -355,6 +590,68 @@ _TERMINAL_DIAGNOSTIC_RESULTS = {
         "自动归因未完成（非归因结论）：自动分析任务异常终止，请由系统维护者排查并显式重试。"
     ),
 }
+_TERMINAL_SELF_PROOF = {
+    "out_of_scope": (
+        "适用性检查 -> 业务范围判定",
+        "问题单官方字段与已注册业务能力",
+        "当前问题不在已验证的自动分析范围，未运行信号归因判据。",
+    ),
+    "business_route_unresolved": (
+        "官方所属项目字段 -> 业务 profile 解析",
+        "飞书问题单官方字段",
+        "未解析出唯一业务，未按标题、负责人或群聊猜测。",
+    ),
+    "business_route_unsupported": (
+        "官方所属项目字段 -> 已注册业务能力清单",
+        "飞书问题单官方字段与运行时能力注册表",
+        "业务已识别但未接入自动 RCA，未借用其他项目评测器。",
+    ),
+    "business_route_conflict": (
+        "官方所属项目字段 -> 业务 profile 一致性检查",
+        "飞书问题单官方字段",
+        "多个业务身份相互冲突，未选择任一项目评测器。",
+    ),
+    "business_adapter_not_ready": (
+        "官方所属项目字段 -> 业务 profile -> 输入 adapter",
+        "飞书问题单官方字段与对应业务适配状态",
+        "业务已识别，但输入适配尚未就绪；不能跨项目借用其他归因能力。",
+    ),
+    "input_remote_data_required": (
+        "问题数据地址_PDCL -> RemoteEventReader / RemoteClipReader 引用解析",
+        "飞书问题单数据地址字段",
+        "未获得可读取的 event 或 clip 引用，未进入信号解析。",
+    ),
+    "input_remote_data_invalid": (
+        "问题数据地址_PDCL -> RemoteEventReader / RemoteClipReader 引用解析",
+        "飞书问题单数据地址字段",
+        "字段存在但无法形成规范 event 或 clip 引用，未进入信号解析。",
+    ),
+    "input_frame_required": (
+        "问题发生 frame_id / 时间 -> 帧定位解析",
+        "飞书问题单 frame 字段",
+        "未获得可用帧号或时间锚点，未运行窗口判据。",
+    ),
+    "input_required": (
+        "问题单必需字段 -> 数据引用与帧定位联合检查",
+        "飞书问题单官方字段",
+        "至少一项必要输入缺失或无效，未运行信号归因判据。",
+    ),
+    "issue_source_unavailable": (
+        "Meegle workitem get / comment list -> MCP 只读降级",
+        "飞书问题单字段与评论",
+        "只读来源未返回可靠输入，未把读取失败解释为业务缺陷。",
+    ),
+    "submission_failed": (
+        "业务准入 -> 受限任务提交 -> 提交回执",
+        "准入快照与任务提交回执",
+        "任务在分析执行前终止，未产生信号或判据证据。",
+    ),
+    "analysis_failed": (
+        "输入解析 -> 信号扫描 -> 因果评测 -> 任务终态回执",
+        "任务状态与已封存执行回执",
+        "执行未形成可复核的判据命中和异常时间窗。",
+    ),
+}
 _BUSINESS_ROUTE_DIAGNOSTIC_CODES = frozenset({
     "business_route_unresolved",
     "business_route_unsupported",
@@ -362,6 +659,8 @@ _BUSINESS_ROUTE_DIAGNOSTIC_CODES = frozenset({
     "business_adapter_not_ready",
 })
 _TERMINAL_INPUT_DIAGNOSTIC_CODES = {
+    "out_of_scope": "out_of_scope",
+    "not_admissible": "out_of_scope",
     "business_profile_unresolved": "business_route_unresolved",
     "business_profile_unsupported": "business_route_unsupported",
     "business_profile_conflict": "business_route_conflict",
@@ -428,7 +727,11 @@ def delivery_effect_semantic_payload(
     if effect_kind not in DELIVERY_EFFECT_KINDS:
         raise DeliveryContractError("delivery_effect_kind_unsupported")
     schema_version = payload.get("schema_version")
-    if schema_version == DELIVERY_EFFECT_SCHEMA_VERSION_V1:
+    if effect_kind == DELIVERY_CARD_PATCH_EFFECT_KIND:
+        if schema_version != DELIVERY_CARD_PATCH_EFFECT_SCHEMA_VERSION:
+            raise DeliveryContractError("delivery_effect_schema_unsupported")
+        fields = list(_CARD_PATCH_EFFECT_SEMANTIC_FIELDS)
+    elif schema_version == DELIVERY_EFFECT_SCHEMA_VERSION_V1:
         fields = list(_V1_BASE_EFFECT_SEMANTIC_FIELDS)
     elif schema_version == DELIVERY_EFFECT_SCHEMA_VERSION_V2:
         fields = list(_V2_BASE_EFFECT_SEMANTIC_FIELDS)
@@ -478,6 +781,24 @@ def delivery_effect_idempotency_uuid(effect_key: str) -> str:
     return str(uuid.UUID(digest[:32]))
 
 
+def _validated_public_foxglove_url(value: Any) -> str:
+    text = str(value or "").strip()
+    try:
+        parsed = urlparse(text)
+        query = parse_qs(parsed.query, keep_blank_values=True)
+    except ValueError as exc:
+        raise DeliveryContractError("foxglove_url_invalid") from exc
+    paths = query.get("ds.mcapPath", [])
+    if (
+        query.get("ds") != ["foxglove-http"]
+        or set(query) != {"ds", "ds.mcapPath"}
+        or len(paths) != 1
+        or not validate_foxglove_url(text, paths[0])
+    ):
+        raise DeliveryContractError("foxglove_url_invalid")
+    return text
+
+
 def build_issue_comment_content(
     *,
     marker: str,
@@ -489,22 +810,17 @@ def build_issue_comment_content(
     report_cifs_path: str,
     terminal_class: str = "",
 ) -> str:
-    tier = terminal_class or public_tier_from_rendered_text(conclusion)
-    heading = {
-        SUPPORTED_ATTRIBUTION: "【RCA 结果】自动定责结论。",
-        CANDIDATE_HYPOTHESIS: "【RCA 结果】候选结论。",
-        HONEST_NON_ATTRIBUTION: "【RCA 结果】本次未形成可确认归因。",
-    }.get(tier, "【RCA 结果】本次未形成可确认归因。")
-    lines = [
-        marker,
-        heading,
-        f"问题：{work_item_id}",
-    ]
-    if conclusion:
-        lines.append(conclusion)
+    public_url = _validated_public_foxglove_url(foxglove_url)
+    lines = conclusion.splitlines() if conclusion else []
+    if not lines or not (
+        lines[0].startswith("建议责任方：")
+        or lines[0] in {"本单未能定向", "本单不在自动分析范围"}
+    ):
+        raise DeliveryContractError("delivery_dispatch_first_line_invalid")
     lines.extend([
-        f"详细证据报告：{report_url}",
-        "报告页包含证据和完整分析过程。",
+        f"Foxglove 证据：{public_url}",
+        marker,
+        RERUN_PROMPT_LINE,
     ])
     content = "\n".join(lines)
     if len(content.encode("utf-8")) > MAX_FEISHU_COMMENT_BYTES:
@@ -524,24 +840,19 @@ def build_thread_reply_content(
     requester_id: str,
     terminal_class: str = "",
 ) -> str:
-    tier = terminal_class or public_tier_from_rendered_text(conclusion)
-    heading = {
-        SUPPORTED_ATTRIBUTION: "【RCA 结果】自动定责结论。",
-        CANDIDATE_HYPOTHESIS: "【RCA 结果】候选结论。",
-        HONEST_NON_ATTRIBUTION: "【RCA 结果】本次未形成可确认归因。",
-    }.get(tier, "【RCA 结果】本次未形成可确认归因。")
-    lines = [
-        marker,
-        heading,
-        f"问题：{work_item_id}",
-    ]
-    if conclusion:
-        lines.append(conclusion)
+    public_url = _validated_public_foxglove_url(foxglove_url)
+    lines = conclusion.splitlines() if conclusion else []
+    if not lines or not (
+        lines[0].startswith("建议责任方：")
+        or lines[0] in {"本单未能定向", "本单不在自动分析范围"}
+    ):
+        raise DeliveryContractError("delivery_dispatch_first_line_invalid")
     lines.extend([
-        f"详细证据报告：{report_url}",
+        f"Foxglove 证据：{public_url}",
         f"问题单：{issue_url}",
-        "报告页包含证据和完整分析过程。",
         f"发起人：{build_at_mention(requester_id)}",
+        marker,
+        RERUN_PROMPT_LINE,
     ])
     content = "\n".join(lines)
     if len(content.encode("utf-8")) > MAX_FEISHU_COMMENT_BYTES:
@@ -552,7 +863,7 @@ def build_thread_reply_content(
 def terminal_delivery_effect_semantic_payload(
     payload: Mapping[str, Any], effect_kind: str
 ) -> dict[str, Any]:
-    if effect_kind not in DELIVERY_EFFECT_KINDS:
+    if effect_kind not in TERMINAL_DELIVERY_EFFECT_KINDS:
         raise DeliveryContractError("delivery_effect_kind_unsupported")
     fields = list(_terminal_semantic_fields(payload.get("schema_version")))
     if effect_kind == DELIVERY_THREAD_EFFECT_KIND:
@@ -574,7 +885,7 @@ def compute_terminal_delivery_effect_key(
     target_key: str,
     semantic_payload_sha256: str,
 ) -> str:
-    if effect_kind not in DELIVERY_EFFECT_KINDS:
+    if effect_kind not in TERMINAL_DELIVERY_EFFECT_KINDS:
         raise DeliveryContractError("delivery_effect_kind_unsupported")
     return _stable_key(
         "g1q3-rca-terminal-effect-v1",
@@ -622,23 +933,19 @@ def _terminal_content(
     diagnostic_result: str = "",
     requester_id: str = "",
 ) -> str:
-    if diagnostic_result and "\n" in diagnostic_result:
-        lines = [
-            marker,
-            "【RCA 结果】低置信终态：本次未形成可确认归因。",
-        ] + diagnostic_result.splitlines()
-    else:
-        lines = [
-            marker,
-            "【RCA 结果】低置信终态：本次未形成可确认归因。",
-            "责任候选：暂无法判断。",
-            "因果链：暂无足够证据建立可确认的因果链。",
-            f"当前卡点：{diagnostic_result or '自动分析未生成可交付证据。'}",
-            "关键证据：本次未生成可供审批的归因证据。",
-            "处理状态：系统已记录内部处理路径，不要求问题发起人执行维护操作。",
+    lines = (
+        diagnostic_result.splitlines()
+        if diagnostic_result
+        else [
+            "本单未能定向",
+            MEDIUM_TIER_DISCLAIMER,
+            "未发现已知异常模式",
+            "本次没有判据命中，无法提供异常时间窗。",
         ]
+    )
     if thread:
         lines.append(f"发起人：{build_at_mention(requester_id)}")
+    lines.extend([marker, RERUN_PROMPT_LINE])
     content = "\n".join(lines)
     if len(content.encode("utf-8")) > MAX_FEISHU_COMMENT_BYTES:
         raise DeliveryContractError("terminal_delivery_content_too_large")
@@ -712,10 +1019,11 @@ def _terminal_fallback_public_contract() -> dict[str, Any]:
 
 def _terminal_fallback_public_result() -> str:
     return "\n".join((
-        "归因结论：本次自动处理未形成可确认的归因结论。",
-        "责任模块：暂无法判断。",
-        "因果关系：本次处理记录不足以支持责任因果判断。",
-        "处理记录：自动处理已结束，内部状态已记录。",
+        "本单未能定向",
+        MEDIUM_TIER_DISCLAIMER,
+        "检查路径：任务终态 -> 失败路由回执 -> 已封存证据清单。",
+        "数据来源：任务状态与失败路由回执。",
+        "检查结果：未获得可复核的信号或判据证据，无法提供异常时间窗。",
     ))
 
 
@@ -730,13 +1038,10 @@ def _validate_terminal_fallback_publication(
 def _terminal_fallback_content(
     *, marker: str, conclusion: str, requester_id: str = ""
 ) -> str:
-    lines = [
-        marker,
-        "【RCA 结果】本次未形成可确认归因。",
-        *conclusion.splitlines(),
-    ]
+    lines = [*conclusion.splitlines()]
     if requester_id:
         lines.append(f"发起人：{build_at_mention(requester_id)}")
+    lines.extend([marker, RERUN_PROMPT_LINE])
     content = "\n".join(lines)
     if len(content.encode("utf-8")) > MAX_FEISHU_COMMENT_BYTES:
         raise DeliveryContractError("terminal_delivery_content_too_large")
@@ -1157,11 +1462,269 @@ def validate_delivery_subscription_target(
             "output_cap": "L1",
         }
         expected_key = f"feishu_thread:{chat_id}:{anchor}"
+    elif effect_kind == DELIVERY_CARD_PATCH_EFFECT_KIND:
+        expected_keys = {
+            "schema_version",
+            "platform",
+            "chat_id",
+            "thread_id",
+            "message_id",
+            "submission_key",
+            "output_cap",
+        }
+        if set(value) != expected_keys:
+            raise DeliveryContractError("delivery_subscription_target_invalid")
+        chat_id = str(value.get("chat_id") or "").strip()
+        thread_id = str(value.get("thread_id") or "").strip()
+        message_id = str(value.get("message_id") or "").strip()
+        submission_key = str(value.get("submission_key") or "").strip()
+        thread_anchor = thread_id.removeprefix("topic:")
+        if (
+            _FEISHU_ID_RE.fullmatch(chat_id) is None
+            or _FEISHU_ID_RE.fullmatch(message_id) is None
+            or not chat_id.startswith("oc_")
+            or not message_id.startswith("om_")
+            or _SAFE_KEY_RE.fullmatch(submission_key) is None
+            or (
+                thread_id
+                and (
+                    not thread_id.startswith("topic:om_")
+                    or _FEISHU_ID_RE.fullmatch(thread_anchor) is None
+                )
+            )
+        ):
+            raise DeliveryContractError("delivery_subscription_target_invalid")
+        expected = {
+            "schema_version": DELIVERY_TARGET_SCHEMA_VERSION,
+            "platform": "feishu",
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "message_id": message_id,
+            "submission_key": submission_key,
+            "output_cap": "L1",
+        }
+        expected_key = f"feishu_card:{chat_id}:{message_id}"
     else:
         raise DeliveryContractError("delivery_effect_kind_unsupported")
     if value != expected or target_key != expected_key:
         raise DeliveryContractError("delivery_subscription_target_invalid")
     return expected
+
+
+def card_patch_payload_has_exact_submission_marker(
+    value: Any,
+    *,
+    submission_key: str,
+) -> bool:
+    """Bind a rendered task card to one exact, parseable tracking marker."""
+
+    key = str(submission_key or "").strip()
+    if _SAFE_KEY_RE.fullmatch(key) is None or not isinstance(value, Mapping):
+        return False
+    elements = value.get("elements")
+    if not isinstance(elements, list):
+        return False
+    expected = f"追踪号：`{key}`"
+    return any(
+        isinstance(element, Mapping)
+        and element.get("tag") == "markdown"
+        and str(element.get("content") or "").strip() == expected
+        for element in elements
+    )
+
+
+def _validated_card_payload(value: Any, *, submission_key: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise DeliveryContractError("delivery_card_patch_payload_invalid")
+    card_payload = dict(value)
+    if (
+        not isinstance(card_payload.get("header"), Mapping)
+        or not isinstance(card_payload.get("elements"), list)
+        or not card_payload["elements"]
+    ):
+        raise DeliveryContractError("delivery_card_patch_payload_invalid")
+    try:
+        encoded = _canonical_json(card_payload).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise DeliveryContractError("delivery_card_patch_payload_invalid") from exc
+    if len(encoded) > MAX_FEISHU_CARD_BYTES or not (
+        card_patch_payload_has_exact_submission_marker(
+            card_payload,
+            submission_key=submission_key,
+        )
+    ):
+        raise DeliveryContractError("delivery_card_patch_payload_invalid")
+    return card_payload
+
+
+def card_patch_render_hash(card_payload: Mapping[str, Any]) -> str:
+    try:
+        encoded = _canonical_json(dict(card_payload)).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise DeliveryContractError("delivery_card_patch_payload_invalid") from exc
+    if len(encoded) > MAX_FEISHU_CARD_BYTES:
+        raise DeliveryContractError("delivery_card_patch_payload_invalid")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def validate_card_patch_effect_payload(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(payload, Mapping):
+        raise DeliveryContractError("delivery_card_patch_effect_shape_invalid")
+    value = dict(payload or {})
+    if set(value) != _CARD_PATCH_EFFECT_FINAL_FIELDS:
+        raise DeliveryContractError("delivery_card_patch_effect_shape_invalid")
+    if (
+        value.get("schema_version") != DELIVERY_CARD_PATCH_EFFECT_SCHEMA_VERSION
+        or value.get("effect_kind") != DELIVERY_CARD_PATCH_EFFECT_KIND
+    ):
+        raise DeliveryContractError("delivery_card_patch_effect_schema_invalid")
+    generation = value.get("generation")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+        raise DeliveryContractError("delivery_card_patch_effect_identity_invalid")
+    for key in (
+        "delivery_id",
+        "project_key",
+        "work_item_type_key",
+        "business_key",
+        "submission_key",
+        "adjudication_id",
+        "original_effect_key",
+        "correction_effect_key",
+    ):
+        if _SAFE_KEY_RE.fullmatch(str(value.get(key) or "")) is None:
+            raise DeliveryContractError("delivery_card_patch_effect_identity_invalid")
+    work_item_id = str(value.get("work_item_id") or "").strip()
+    if not work_item_id.isdigit():
+        raise DeliveryContractError("delivery_card_patch_effect_identity_invalid")
+    action = str(value.get("action") or "")
+    conclusion_state = str(value.get("conclusion_state") or "")
+    if {"recognize": "recognized", "retract": "invalidated"}.get(action) != conclusion_state:
+        raise DeliveryContractError("delivery_card_patch_effect_state_invalid")
+    validate_delivery_subscription_target(
+        effect_kind=DELIVERY_CARD_PATCH_EFFECT_KIND,
+        target_key=str(value.get("target_key") or ""),
+        target={
+            "schema_version": DELIVERY_TARGET_SCHEMA_VERSION,
+            **{
+                key: value.get(key)
+                for key in (
+                    "platform",
+                    "chat_id",
+                    "thread_id",
+                    "message_id",
+                    "submission_key",
+                    "output_cap",
+                )
+            },
+        },
+        project_key=str(value.get("project_key") or ""),
+        work_item_type_key=str(value.get("work_item_type_key") or ""),
+        work_item_id=work_item_id,
+    )
+    card_payload = _validated_card_payload(
+        value.get("card_payload"),
+        submission_key=str(value.get("submission_key") or ""),
+    )
+    expected_render_hash = card_patch_render_hash(card_payload)
+    if value.get("render_hash") != expected_render_hash:
+        raise DeliveryContractError("delivery_card_patch_render_hash_invalid")
+    semantic_sha = compute_delivery_effect_payload_sha256(
+        value, DELIVERY_CARD_PATCH_EFFECT_KIND
+    )
+    expected_effect_key = compute_delivery_effect_key(
+        delivery_id=str(value.get("delivery_id") or ""),
+        effect_kind=DELIVERY_CARD_PATCH_EFFECT_KIND,
+        target_key=str(value.get("target_key") or ""),
+        semantic_payload_sha256=semantic_sha,
+    )
+    if (
+        value.get("semantic_payload_sha256") != semantic_sha
+        or value.get("effect_key") != expected_effect_key
+        or value.get("idempotency_uuid")
+        != delivery_effect_idempotency_uuid(expected_effect_key)
+    ):
+        raise DeliveryContractError("delivery_card_patch_effect_hash_invalid")
+    return {
+        **value,
+        "card_payload": card_payload,
+    }
+
+
+def build_card_patch_effect(
+    *,
+    delivery_id: str,
+    project_key: str,
+    work_item_type_key: str,
+    work_item_id: str,
+    business_key: str,
+    submission_key: str,
+    generation: int,
+    adjudication_id: str,
+    action: str,
+    conclusion_state: str,
+    original_effect_key: str,
+    correction_effect_key: str,
+    target_key: str,
+    target: Mapping[str, Any],
+    card_payload: Mapping[str, Any],
+) -> tuple[str, str, dict[str, Any]]:
+    validated_target = validate_delivery_subscription_target(
+        effect_kind=DELIVERY_CARD_PATCH_EFFECT_KIND,
+        target_key=target_key,
+        target=target,
+        project_key=project_key,
+        work_item_type_key=work_item_type_key,
+        work_item_id=work_item_id,
+    )
+    normalized_submission_key = str(submission_key or "").strip()
+    if validated_target["submission_key"] != normalized_submission_key:
+        raise DeliveryContractError("delivery_card_patch_effect_identity_invalid")
+    validated_card = _validated_card_payload(
+        card_payload,
+        submission_key=normalized_submission_key,
+    )
+    semantic = {
+        "schema_version": DELIVERY_CARD_PATCH_EFFECT_SCHEMA_VERSION,
+        "delivery_id": str(delivery_id or "").strip(),
+        "effect_kind": DELIVERY_CARD_PATCH_EFFECT_KIND,
+        "target_key": str(target_key or "").strip(),
+        "project_key": str(project_key or "").strip(),
+        "work_item_type_key": str(work_item_type_key or "").strip(),
+        "work_item_id": str(work_item_id or "").strip(),
+        "business_key": str(business_key or "").strip(),
+        "submission_key": normalized_submission_key,
+        "generation": generation,
+        "platform": validated_target["platform"],
+        "chat_id": validated_target["chat_id"],
+        "thread_id": validated_target["thread_id"],
+        "message_id": validated_target["message_id"],
+        "output_cap": validated_target["output_cap"],
+        "adjudication_id": str(adjudication_id or "").strip(),
+        "action": str(action or "").strip(),
+        "conclusion_state": str(conclusion_state or "").strip(),
+        "original_effect_key": str(original_effect_key or "").strip(),
+        "correction_effect_key": str(correction_effect_key or "").strip(),
+        "render_hash": card_patch_render_hash(validated_card),
+        "card_payload": validated_card,
+    }
+    semantic_sha = compute_delivery_effect_payload_sha256(
+        semantic, DELIVERY_CARD_PATCH_EFFECT_KIND
+    )
+    effect_key = compute_delivery_effect_key(
+        delivery_id=semantic["delivery_id"],
+        effect_kind=DELIVERY_CARD_PATCH_EFFECT_KIND,
+        target_key=semantic["target_key"],
+        semantic_payload_sha256=semantic_sha,
+    )
+    payload = {
+        **semantic,
+        "effect_key": effect_key,
+        "semantic_payload_sha256": semantic_sha,
+        "idempotency_uuid": delivery_effect_idempotency_uuid(effect_key),
+    }
+    return effect_key, semantic_sha, validate_card_patch_effect_payload(payload)
 
 
 def build_thread_reply_effect(
@@ -1731,40 +2294,57 @@ def render_public_rca_result(
     contract: Mapping[str, Any], *, terminal_class: str = ""
 ) -> str:
     result = build_public_rca_result(contract)
-    if terminal_class == HONEST_NON_ATTRIBUTION:
-        return "\n".join((
-            "归因结论：系统已完成现有可用证据的自动分析，但未形成可确认的归因结论。",
-            "责任模块：暂无法判断。",
-            "因果关系：现有证据不足以闭合责任因果链。",
-            "关键证据：已取得的证据仅能支持记录分析边界，不能支持责任判断。",
-        ))
+    dispatch = _validated_upstream_dispatch(contract)
     lines = [
-        f"归因结论：{result['conclusion']}",
-        f"责任模块：{result['responsibility']}",
-        f"因果关系：{result['causal_chain']}",
-        f"关键证据：{result['evidence']}",
+        _dispatch_first_line(dispatch),
+        (
+            "可直接参考"
+            if terminal_class == SUPPORTED_ATTRIBUTION
+            else MEDIUM_TIER_DISCLAIMER
+        ),
     ]
-    if terminal_class == CANDIDATE_HYPOTHESIS:
-        lines.insert(0, f"置信说明：{MEDIUM_TIER_DISCLAIMER}")
+    if dispatch["reason"] == "out_of_scope":
+        pass
+    elif dispatch["reason"] == "abstain_no_hit":
+        lines.extend(
+            [
+                "未发现已知异常模式",
+                "本次没有判据命中，无法提供异常时间窗。",
+            ]
+        )
+    elif dispatch["reason"] == "abstain_cross_domain":
+        lines.append("多个环节均有异常信号")
+        lines.append(
+            _dispatch_window_line(dispatch)
+            or "命中判据未提供可复算时间窗，本次不展示可疑段。"
+        )
+    else:
+        lines.extend(
+            [
+                f"依据：{result['evidence']}",
+                f"归因判断：{result['conclusion']}",
+            ]
+        )
+        window_line = _dispatch_window_line(dispatch)
+        if window_line:
+            lines.append(window_line)
     return "\n".join(_truncate_utf8(line, 1800) for line in lines)
 
 
 def _render_terminal_user_result(code: str, detail: str = "") -> str:
-    conclusion, impact, action = _public_terminal_blocker(code)
-    detail_text = _public_text(detail, limit=500)
-    if detail_text and code == "business_adapter_not_ready":
-        # Keep the route decision useful without leaking resolver/evaluator
-        # implementation names into the issue field.
-        route = detail_text.split("（", 1)[0].rstrip("。； ")
-        if route:
-            conclusion = f"未形成归因：{route}。"
-    return "\n".join((
-        "置信档：低置信（未归因）。",
-        f"归因结论：{conclusion}",
-        "责任模块：暂无法判断。",
-        "因果关系：暂无足够证据建立可确认的因果链。",
-        f"关键证据：{impact}",
-    ))
+    heading = "本单不在自动分析范围" if code == "out_of_scope" else "本单未能定向"
+    path, source, result = _TERMINAL_SELF_PROOF.get(
+        code,
+        _TERMINAL_SELF_PROOF["analysis_failed"],
+    )
+    lines = [
+        heading,
+        MEDIUM_TIER_DISCLAIMER,
+        f"检查路径：{path}。",
+        f"数据来源：{source}。",
+        f"检查结果：{result}",
+    ]
+    return "\n".join(lines)
 
 
 def _positive_int(value: Any, field: str) -> int:
@@ -1977,7 +2557,7 @@ def verify_persisted_artifact_inventory(
         raise DeliveryContractError("delivery_manifest_schema_unsupported")
     if manifest.get("sealed") is not True:
         raise DeliveryContractError("delivery_manifest_not_sealed")
-    if manifest.get("deliverable_kind") != "html":
+    if manifest.get("deliverable_kind") != "foxglove_viz":
         raise DeliveryContractError("delivery_kind_unsupported")
     if manifest.get("dependencies_complete") is not True:
         raise DeliveryContractError("delivery_dependencies_incomplete")
@@ -2478,9 +3058,10 @@ def verify_delivery_bundle(
         raise DeliveryContractError("delivery_manifest_schema_unsupported")
     if manifest.get("sealed") is not True:
         raise DeliveryContractError("delivery_manifest_not_sealed")
-    if manifest.get("deliverable_kind") != "html":
+    if manifest.get("deliverable_kind") != "foxglove_viz":
         raise DeliveryContractError(
-            "delivery_kind_unsupported", "only sealed HTML delivery is supported"
+            "delivery_kind_unsupported",
+            "only sealed Foxglove delivery is supported; HTML remains internal",
         )
     if manifest.get("dependencies_complete") is not True:
         raise DeliveryContractError(
@@ -2499,15 +3080,10 @@ def verify_delivery_bundle(
     explicit_kind = str(
         report.get("deliverable_kind") or contract.get("deliverable_kind") or ""
     ).strip()
-    if explicit_kind not in {"html", "foxglove_viz"}:
+    if explicit_kind != "foxglove_viz":
         raise DeliveryContractError("delivery_kind_unsupported")
     report_status = str(report.get("status") or "").strip()
-    allowed_report_statuses = (
-        _VIZ_REPORT_STATUSES
-        if explicit_kind == "foxglove_viz"
-        else _HTML_REPORT_STATUSES
-    )
-    if report_status not in allowed_report_statuses:
+    if report_status not in _VIZ_REPORT_STATUSES:
         raise DeliveryContractError(
             "delivery_report_status_invalid",
             f"unsupported report status: {report_status}",
@@ -2544,18 +3120,11 @@ def verify_delivery_bundle(
         raise DeliveryContractError("artifact_set_reference_mismatch")
 
     observations = _observations_by_path(observed_files)
-    if explicit_kind == "foxglove_viz":
-        viz_mcap_vm, rendered_foxglove_url = _verify_viz_publication(
-            contract_artifacts=contract_artifacts,
-            observations=observations,
-            submission_key=validated_admission.submission_key,
-        )
-    else:
-        if contract_artifacts.get("viz_publication") or contract_artifacts.get(
-            "viz_mcap_vm"
-        ):
-            raise DeliveryContractError("html_delivery_must_not_claim_viz")
-        viz_mcap_vm, rendered_foxglove_url = "", ""
+    viz_mcap_vm, rendered_foxglove_url = _verify_viz_publication(
+        contract_artifacts=contract_artifacts,
+        observations=observations,
+        submission_key=validated_admission.submission_key,
+    )
     roles: dict[str, VerifiedArtifact] = {}
     verified: list[VerifiedArtifact] = []
     seen_paths: set[str] = set()
@@ -2645,10 +3214,8 @@ def verify_delivery_bundle(
         submission_key=validated_admission.submission_key,
         artifact_set_id=expected_artifact_set_id,
     )
-    report_cifs_path = (
-        canonical_viz_mcap_cifs_path(validated_admission.submission_key)
-        if explicit_kind == "foxglove_viz"
-        else str(manifest.get("report_cifs_path") or "").strip()
+    report_cifs_path = canonical_viz_mcap_cifs_path(
+        validated_admission.submission_key
     )
     if not report_cifs_path:
         raise DeliveryContractError("delivery_report_cifs_path_invalid")
@@ -2702,7 +3269,9 @@ def verify_delivery_bundle(
             "delivery_conclusion_missing",
             "a non-empty RCA conclusion is required for the result field",
         )
-    structural_tier = evaluate_structural_tier(contract)
+    oracle_contract = dict(contract)
+    oracle_contract["upstream_dispatch"] = _validated_upstream_dispatch(contract)
+    structural_tier = evaluate_structural_tier(oracle_contract)
     conclusion_text = render_public_rca_result(
         contract, terminal_class=structural_tier.terminal_class
     )
@@ -2713,7 +3282,7 @@ def verify_delivery_bundle(
             "a non-empty RCA conclusion is required for the result field",
         )
     publication_tier = evaluate_structural_tier(
-        contract,
+        oracle_contract,
         publication_text=conclusion,
     )
     try:
@@ -2735,7 +3304,7 @@ def verify_delivery_bundle(
         "work_item_id": refs.work_item_id,
         "issue_url": issue_url,
         "artifact_set_id": expected_artifact_set_id,
-        "report_url": html_report_url,
+        "report_url": rendered_foxglove_url,
         "report_cifs_path": report_cifs_path,
         "viz_mcap_vm": viz_mcap_vm,
         "foxglove_url": rendered_foxglove_url,
@@ -2756,7 +3325,7 @@ def verify_delivery_bundle(
             },
             {
                 "field_key": RCA_REPORT_FIELD_KEY,
-                "field_value": html_report_url,
+                "field_value": rendered_foxglove_url,
             },
         ],
     }
@@ -2775,13 +3344,13 @@ def verify_delivery_bundle(
         work_item_id=refs.work_item_id,
         report_status=report_status,
         conclusion=conclusion,
-        report_url=html_report_url,
+        report_url=rendered_foxglove_url,
         foxglove_url=rendered_foxglove_url,
         report_cifs_path=report_cifs_path,
         terminal_class=publication_tier.terminal_class,
     )
     final_publication_tier = evaluate_structural_tier(
-        contract,
+        oracle_contract,
         publication_text=f"{conclusion}\n{comment_content}",
     )
     try:
@@ -2817,7 +3386,7 @@ def verify_delivery_bundle(
         work_item_id=refs.work_item_id,
         target_key=target_key,
         issue_url=issue_url,
-        report_url=html_report_url,
+        report_url=rendered_foxglove_url,
         viz_mcap_vm=viz_mcap_vm,
         foxglove_url=rendered_foxglove_url,
         conclusion=conclusion,

@@ -69,7 +69,7 @@ def test_disabled_is_plan_only(tmp_path, monkeypatch):
     assert runner.calls == []
 
 
-def test_enabled_posts_and_dedups(tmp_path, monkeypatch):
+def test_enabled_live_writer_is_superseded_without_provider_calls(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_OUTBOUND_MODE", raising=False)
     runtime._reset_for_tests()
     monkeypatch.setenv("HERMES_G1Q3_REPORT_COMMENT", "1")
@@ -80,11 +80,9 @@ def test_enabled_posts_and_dedups(tmp_path, monkeypatch):
     second = maybe_comment_report_ready(
         project_key="t03o4q", work_item_id="701", task_id="t2", rca_status={"html_link":"https://project.feishu.cn/goapi/v5/platform/file/stream/download/token-x"}, ledger_dir=tmp_path, meegle_runner=runner, now=NOW,
     )
-    assert first["action"] == "posted"
-    assert second["action"] == "skipped_recent"
-    adds = [c for c in runner.calls if c[:2] == ["comment", "add"]]
-    assert len(adds) == 1
-    assert adds[0][adds[0].index("--work-item-id") + 1] == "701"
+    assert first["action"] == "skipped_superseded"
+    assert second["action"] == "skipped_superseded"
+    assert runner.calls == []
 
 
 def test_partial_record_only_config_fails_before_meegle_runner_or_comment_ledger(tmp_path, monkeypatch):
@@ -120,8 +118,8 @@ def test_existing_signature_prevents_post(tmp_path, monkeypatch):
     res = maybe_comment_report_ready(
         project_key="t03o4q", work_item_id="701", task_id="t1", rca_status={}, ledger_dir=tmp_path, meegle_runner=runner, now=NOW,
     )
-    assert res["action"] == "skipped_existing"
-    assert [c for c in runner.calls if c[:2] == ["comment", "add"]] == []
+    assert res["action"] == "skipped_superseded"
+    assert runner.calls == []
 
 
 def test_cap_and_comment_list_fail_closed(tmp_path, monkeypatch):
@@ -130,7 +128,7 @@ def test_cap_and_comment_list_fail_closed(tmp_path, monkeypatch):
     res = maybe_comment_report_ready(
         project_key="t03o4q", work_item_id="701", task_id="t1", rca_status={}, ledger_dir=tmp_path, meegle_runner=_runner(), now=NOW,
     )
-    assert res["action"] == "skipped_cap"
+    assert res["action"] == "skipped_superseded"
 
     monkeypatch.setenv("HERMES_G1Q3_REPORT_COMMENT_DAILY_CAP", "50")
     def broken(args):
@@ -140,8 +138,7 @@ def test_cap_and_comment_list_fail_closed(tmp_path, monkeypatch):
     res2 = maybe_comment_report_ready(
         project_key="t03o4q", work_item_id="702", task_id="t1", rca_status={}, ledger_dir=tmp_path, meegle_runner=broken, now=NOW,
     )
-    assert res2["action"] == "comment_failed"
-    assert "dedup" in res2["reason"]
+    assert res2["action"] == "skipped_superseded"
 
 
 def test_not_before_gate(monkeypatch):
@@ -197,7 +194,6 @@ def test_record_only_records_list_and_conditional_add_without_runner_or_ledger(t
     assert rows[1]["metadata"]["conditional_on"] == "comment_signature_absent"
     assert rows[1]["links"] == [
         "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/g1q3-task/",
-        "https://project.feishu.cn/report/index.html",
     ]
     serialized = json.dumps(rows, ensure_ascii=False)
     assert "7017699515" not in serialized

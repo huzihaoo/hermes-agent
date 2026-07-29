@@ -24,12 +24,42 @@ from typing import Any
 
 
 SCHEMA_VERSION = "pnc_business_metrics_w12_v1"
+UPSTREAM_DISPATCH_SCHEMA_VERSION = "pnc_upstream_dispatch_metrics_w12_v2"
 DENOMINATOR_KINDS = frozenset({"business", "system"})
 CONFIDENCE_TIERS = ("high", "medium", "low", "none")
 ENTRYPOINTS = ("kafka", "feishu")
+UPSTREAM_DISPATCH_TERMINAL_CLASSES = (
+    "valid_dispatch",
+    "abstain_no_hit",
+    "abstain_cross_domain",
+    "out_of_scope",
+    "technical_failure",
+)
+UPSTREAM_DISPATCH_ABSTAIN_REASONS = (
+    "no_hit",
+    "cross_domain",
+    "input_incomplete",
+    "capability_degraded",
+    "timeout_fallback",
+)
+UPSTREAM_DISPATCH_OWNER_BUCKETS = frozenset(
+    {
+        "acc_longitudinal_control",
+        "aeb",
+        "fctb_fcw",
+        "hmi_sr",
+        "lane_perception",
+        "lcc_lateral_control",
+        "ooi_spp",
+        "tsr",
+        "vision_perception",
+    }
+)
+UPSTREAM_DISPATCH_REVIEW_COVERAGE_MIN_PCT = 30
+UPSTREAM_DISPATCH_REVIEWED_COUNT_MIN = 10
 MAX_INPUT_BYTES = 96 * 1024 * 1024
 CONTROL_STORE_SCHEMA_VERSION = "pnc_rca_control_store_v11"
-DELIVERY_STORE_SCHEMA_VERSION = "pnc_rca_delivery_store_v9"
+DELIVERY_STORE_SCHEMA_VERSION = "pnc_rca_delivery_store_v10"
 SUPPORTED_CONTROL_STORE_SCHEMA_VERSIONS = frozenset({
     CONTROL_STORE_SCHEMA_VERSION,
     "pnc_rca_control_store_v12",
@@ -37,6 +67,7 @@ SUPPORTED_CONTROL_STORE_SCHEMA_VERSIONS = frozenset({
 })
 SUPPORTED_DELIVERY_STORE_SCHEMA_VERSIONS = frozenset({
     DELIVERY_STORE_SCHEMA_VERSION,
+    "pnc_rca_delivery_store_v9",
 })
 ADJUDICATION_SCHEMA_VERSION = "pnc_rca_conclusion_adjudication_v1"
 GOLDEN_INPUT_SCHEMA_VERSION = "pnc_rca_w12_golden_observations_v1"
@@ -610,6 +641,387 @@ def normalize_records(records: Sequence[Mapping[str, Any]]) -> list[dict[str, An
             "metrics_records_invalid", "records must be an array"
         )
     return [normalize_record(item, index=index) for index, item in enumerate(records)]
+
+
+def _dispatch_rate(numerator: int, denominator: int) -> dict[str, int | float | None]:
+    return {
+        "numerator": numerator,
+        "denominator": denominator,
+        "rate_pct": (
+            round(100.0 * numerator / denominator, 1) if denominator > 0 else None
+        ),
+    }
+
+
+def _dispatch_choice(
+    value: Any,
+    *,
+    field: str,
+    allowed: Sequence[str] | frozenset[str],
+    index: int,
+) -> str:
+    normalized = normalize_status(value)
+    if normalized not in allowed:
+        raise MetricsValidationError(
+            "metrics_upstream_dispatch_value_invalid",
+            f"{field} must be one of {sorted(allowed)}, got {normalized!r}",
+            index=index,
+        )
+    return normalized
+
+
+def _dispatch_cohort(counts: Mapping[str, int]) -> dict[str, Any]:
+    valid_dispatches = int(counts.get("valid_dispatch", 0))
+    reviewed = int(counts.get("reviewed", 0))
+    correct = int(counts.get("reviewed_correct", 0))
+    return {
+        "valid_dispatch_count": valid_dispatches,
+        "reviewed_count": reviewed,
+        "reviewed_correct_count": correct,
+        "dispatch_accuracy": _dispatch_rate(correct, reviewed),
+        "review_coverage": _dispatch_rate(reviewed, valid_dispatches),
+    }
+
+
+def reduce_upstream_dispatch_metrics(
+    records: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Reduce terminal issue receipts into the W12 upstream-dispatch readout.
+
+    Each issue must have exactly one terminal class.  A technical failure whose
+    30-minute fallback has completed is normalized to ``abstain_no_hit`` with
+    ``abstain_reason=timeout_fallback``; only unreduced technical failures stay
+    outside ``denominator_base``.  Review validity is a sampling-quality gate,
+    not an accuracy threshold.
+    """
+
+    if not isinstance(records, Sequence) or isinstance(
+        records, (str, bytes, bytearray)
+    ):
+        raise MetricsValidationError(
+            "metrics_upstream_dispatch_records_invalid",
+            "records must be an array",
+        )
+
+    terminal_counts = {
+        terminal_class: 0 for terminal_class in UPSTREAM_DISPATCH_TERMINAL_CLASSES
+    }
+    abstain_counts = {
+        reason: 0 for reason in UPSTREAM_DISPATCH_ABSTAIN_REASONS
+    }
+    cohort_counts: dict[str, dict[str, int]] = {
+        tier: {"valid_dispatch": 0, "reviewed": 0, "reviewed_correct": 0}
+        for tier in ("high", "medium", "unspecified")
+    }
+    issue_ids: set[str] = set()
+    reviewed_count = 0
+    reviewed_correct_count = 0
+    timeout_fallback_count = 0
+    dispatch_bucket_counts = {
+        bucket: 0 for bucket in sorted(UPSTREAM_DISPATCH_OWNER_BUCKETS)
+    }
+
+    for index, raw in enumerate(records):
+        if not isinstance(raw, Mapping):
+            raise MetricsValidationError(
+                "metrics_upstream_dispatch_record_invalid",
+                "record must be an object",
+                index=index,
+            )
+        issue_id = _required_text(
+            _pick(raw, "issue_id", "work_item_id", "record_id"),
+            "issue_id",
+            index=index,
+        )
+        if issue_id in issue_ids:
+            raise MetricsValidationError(
+                "metrics_upstream_dispatch_duplicate_issue",
+                f"issue_id is repeated: {issue_id}",
+                index=index,
+            )
+        issue_ids.add(issue_id)
+
+        source_terminal_class = _dispatch_choice(
+            raw.get("terminal_class"),
+            field="terminal_class",
+            allowed=UPSTREAM_DISPATCH_TERMINAL_CLASSES,
+            index=index,
+        )
+        timeout_fallback_applied = _optional_bool(
+            _pick(
+                raw,
+                "timeout_fallback_applied",
+                "technical_failure.timeout_fallback_applied",
+            ),
+            "timeout_fallback_applied",
+            index=index,
+        )
+        abstain_reason_raw = _pick(raw, "abstain_reason")
+
+        terminal_class = source_terminal_class
+        if source_terminal_class == "technical_failure" and timeout_fallback_applied:
+            if abstain_reason_raw is not None:
+                reduced_reason = _dispatch_choice(
+                    abstain_reason_raw,
+                    field="abstain_reason",
+                    allowed=UPSTREAM_DISPATCH_ABSTAIN_REASONS,
+                    index=index,
+                )
+                if reduced_reason != "timeout_fallback":
+                    raise MetricsValidationError(
+                        "metrics_upstream_dispatch_timeout_fallback_mismatch",
+                        "a reduced technical failure must use timeout_fallback",
+                        index=index,
+                    )
+            terminal_class = "abstain_no_hit"
+            abstain_reason = "timeout_fallback"
+            timeout_fallback_count += 1
+        elif source_terminal_class == "abstain_no_hit":
+            abstain_reason = (
+                _dispatch_choice(
+                    abstain_reason_raw,
+                    field="abstain_reason",
+                    allowed=UPSTREAM_DISPATCH_ABSTAIN_REASONS,
+                    index=index,
+                )
+                if abstain_reason_raw is not None
+                else "no_hit"
+            )
+            if abstain_reason not in {
+                "no_hit",
+                "input_incomplete",
+                "capability_degraded",
+                "timeout_fallback",
+            }:
+                raise MetricsValidationError(
+                    "metrics_upstream_dispatch_abstain_reason_mismatch",
+                    f"{abstain_reason} cannot use abstain_no_hit",
+                    index=index,
+                )
+            if abstain_reason == "timeout_fallback":
+                timeout_fallback_count += 1
+        elif source_terminal_class == "abstain_cross_domain":
+            abstain_reason = (
+                _dispatch_choice(
+                    abstain_reason_raw,
+                    field="abstain_reason",
+                    allowed=UPSTREAM_DISPATCH_ABSTAIN_REASONS,
+                    index=index,
+                )
+                if abstain_reason_raw is not None
+                else "cross_domain"
+            )
+            if abstain_reason != "cross_domain":
+                raise MetricsValidationError(
+                    "metrics_upstream_dispatch_abstain_reason_mismatch",
+                    f"{abstain_reason} cannot use abstain_cross_domain",
+                    index=index,
+                )
+        else:
+            abstain_reason = ""
+            if abstain_reason_raw is not None:
+                raise MetricsValidationError(
+                    "metrics_upstream_dispatch_abstain_reason_mismatch",
+                    f"{source_terminal_class} cannot have abstain_reason",
+                    index=index,
+                )
+
+        if (
+            timeout_fallback_applied
+            and source_terminal_class != "technical_failure"
+            and abstain_reason != "timeout_fallback"
+        ):
+            raise MetricsValidationError(
+                "metrics_upstream_dispatch_timeout_fallback_mismatch",
+                "timeout fallback must reduce to abstain_reason=timeout_fallback",
+                index=index,
+            )
+
+        review = _mapping(raw.get("review"))
+        reviewed_value = (
+            raw.get("reviewed") if "reviewed" in raw else review.get("reviewed")
+        )
+        correct_value = (
+            raw.get("is_correct")
+            if "is_correct" in raw
+            else review.get("is_correct")
+        )
+        reviewed = _optional_bool(reviewed_value, "reviewed", index=index)
+        is_correct = _optional_bool(correct_value, "is_correct", index=index)
+        if reviewed is None:
+            reviewed = is_correct is not None
+        if reviewed and is_correct is None:
+            raise MetricsValidationError(
+                "metrics_upstream_dispatch_review_incomplete",
+                "a reviewed dispatch requires is_correct",
+                index=index,
+            )
+        if not reviewed and is_correct is not None:
+            raise MetricsValidationError(
+                "metrics_upstream_dispatch_review_mismatch",
+                "an unreviewed dispatch cannot have is_correct",
+                index=index,
+            )
+        system_bucket_raw = _pick(raw, "system_bucket")
+        corrected_bucket_raw = _pick(raw, "corrected_bucket")
+
+        terminal_counts[terminal_class] += 1
+        if terminal_class in {"abstain_no_hit", "abstain_cross_domain"}:
+            if system_bucket_raw is not None or corrected_bucket_raw is not None:
+                raise MetricsValidationError(
+                    "metrics_upstream_dispatch_bucket_mismatch",
+                    "an abstention cannot have owner buckets",
+                    index=index,
+                )
+            if reviewed:
+                raise MetricsValidationError(
+                    "metrics_upstream_dispatch_review_mismatch",
+                    "an abstention cannot enter the review sample",
+                    index=index,
+                )
+            abstain_counts[abstain_reason] += 1
+            continue
+
+        if terminal_class != "valid_dispatch":
+            if system_bucket_raw is not None or corrected_bucket_raw is not None:
+                raise MetricsValidationError(
+                    "metrics_upstream_dispatch_bucket_mismatch",
+                    f"{terminal_class} cannot have owner buckets",
+                    index=index,
+                )
+            if reviewed:
+                raise MetricsValidationError(
+                    "metrics_upstream_dispatch_review_mismatch",
+                    f"{terminal_class} cannot enter the review sample",
+                    index=index,
+                )
+            continue
+
+        system_bucket = _dispatch_choice(
+            system_bucket_raw,
+            field="system_bucket",
+            allowed=UPSTREAM_DISPATCH_OWNER_BUCKETS,
+            index=index,
+        )
+        dispatch_bucket_counts[system_bucket] += 1
+        if not reviewed and corrected_bucket_raw is not None:
+            raise MetricsValidationError(
+                "metrics_upstream_dispatch_review_mismatch",
+                "an unreviewed dispatch cannot have corrected_bucket",
+                index=index,
+            )
+        if reviewed and is_correct:
+            if corrected_bucket_raw is not None:
+                raise MetricsValidationError(
+                    "metrics_upstream_dispatch_review_mismatch",
+                    "a correct dispatch cannot have corrected_bucket",
+                    index=index,
+                )
+        elif reviewed:
+            corrected_bucket = _dispatch_choice(
+                corrected_bucket_raw,
+                field="corrected_bucket",
+                allowed=UPSTREAM_DISPATCH_OWNER_BUCKETS,
+                index=index,
+            )
+            if corrected_bucket == system_bucket:
+                raise MetricsValidationError(
+                    "metrics_upstream_dispatch_review_mismatch",
+                    "an incorrect dispatch must select a different bucket",
+                    index=index,
+                )
+        tier_raw = raw.get("confidence_tier")
+        if tier_raw is None or tier_raw == "":
+            tier = "unspecified"
+        else:
+            tier = normalize_confidence_tier(tier_raw, index=index)
+            if tier not in {"high", "medium"}:
+                raise MetricsValidationError(
+                    "metrics_upstream_dispatch_tier_invalid",
+                    "a valid dispatch tier must be high or medium",
+                    index=index,
+                )
+        cohort_counts[tier]["valid_dispatch"] += 1
+        if reviewed:
+            reviewed_count += 1
+            cohort_counts[tier]["reviewed"] += 1
+            if is_correct:
+                reviewed_correct_count += 1
+                cohort_counts[tier]["reviewed_correct"] += 1
+
+    terminal_total = len(records)
+    unreduced_technical_failures = terminal_counts["technical_failure"]
+    denominator_base = (
+        terminal_total
+        - terminal_counts["out_of_scope"]
+        - unreduced_technical_failures
+    )
+    valid_dispatch_count = terminal_counts["valid_dispatch"]
+    abstain_count = (
+        terminal_counts["abstain_no_hit"]
+        + terminal_counts["abstain_cross_domain"]
+    )
+    review_coverage_is_sufficient = (
+        reviewed_count >= UPSTREAM_DISPATCH_REVIEWED_COUNT_MIN
+        and valid_dispatch_count > 0
+        and reviewed_count * 100
+        >= valid_dispatch_count * UPSTREAM_DISPATCH_REVIEW_COVERAGE_MIN_PCT
+    )
+
+    return {
+        "ok": True,
+        "schema_version": UPSTREAM_DISPATCH_SCHEMA_VERSION,
+        "terminal_total": terminal_total,
+        "terminal_counts": terminal_counts,
+        "denominator_base": denominator_base,
+        "technical_failure_breakdown": {
+            "unreduced": unreduced_technical_failures,
+            "timeout_fallback_reduced_to_abstain": timeout_fallback_count,
+        },
+        "metrics": {
+            "dispatch_accuracy": _dispatch_rate(
+                reviewed_correct_count, reviewed_count
+            ),
+            "dispatch_coverage": _dispatch_rate(
+                valid_dispatch_count, denominator_base
+            ),
+            "abstain_rate": _dispatch_rate(abstain_count, denominator_base),
+            "review_coverage": _dispatch_rate(
+                reviewed_count, valid_dispatch_count
+            ),
+        },
+        "abstain_breakdown": {
+            reason: {
+                "count": count,
+                "denominator": denominator_base,
+                "rate_pct": (
+                    round(100.0 * count / denominator_base, 1)
+                    if denominator_base > 0
+                    else None
+                ),
+            }
+            for reason, count in abstain_counts.items()
+        },
+        "dispatch_bucket_counts": dispatch_bucket_counts,
+        "by_confidence_tier": {
+            tier: _dispatch_cohort(counts)
+            for tier, counts in cohort_counts.items()
+        },
+        "readout": {
+            "status": (
+                "valid"
+                if review_coverage_is_sufficient
+                else "insufficient_review_coverage"
+            ),
+            "ga_first_reading_gate_satisfied": review_coverage_is_sufficient,
+            "reviewed_count": reviewed_count,
+            "review_coverage_min_pct": (
+                UPSTREAM_DISPATCH_REVIEW_COVERAGE_MIN_PCT
+            ),
+            "reviewed_count_min": UPSTREAM_DISPATCH_REVIEWED_COUNT_MIN,
+            "accuracy_threshold_applied": False,
+        },
+    }
 
 
 def load_records(path: str | Path) -> list[dict[str, Any]]:

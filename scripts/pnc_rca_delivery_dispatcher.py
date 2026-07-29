@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deliver durable RCA effects as exactly one Feishu Project issue comment."""
+"""Deliver durable RCA effects to exact Feishu issue, thread, or card targets."""
 
 from __future__ import annotations
 
@@ -15,11 +15,13 @@ import re
 import signal
 import socket
 import sqlite3
+import stat
 import sys
 import threading
 import time
 from typing import Any, Callable, Mapping
 from urllib import error as urllib_error
+from urllib.parse import parse_qs, urlsplit
 from urllib import request as urllib_request
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -29,6 +31,7 @@ if str(REPO_ROOT) not in sys.path:
 from dotenv import load_dotenv
 
 from gateway.pnc_rca_delivery_contract import (
+    DELIVERY_CARD_PATCH_EFFECT_KIND,
     DELIVERY_EFFECT_KIND,
     DELIVERY_EFFECT_KINDS,
     DELIVERY_EFFECT_SCHEMA_VERSION,
@@ -44,7 +47,6 @@ from gateway.pnc_rca_delivery_contract import (
     RCA_REPORT_FIELD_KEY,
     RCA_RESULT_FIELD_KEY,
     build_issue_comment_content,
-    build_report_artifact_url,
     build_thread_reply_content,
     build_terminal_delivery,
     build_terminal_thread_reply_effect,
@@ -52,6 +54,7 @@ from gateway.pnc_rca_delivery_contract import (
     compute_delivery_effect_payload_sha256,
     delivery_effect_idempotency_uuid,
     delivery_effect_marker,
+    validate_card_patch_effect_payload,
     validate_report_asset_url,
     validate_report_url,
     validate_delivery_subscription_target,
@@ -70,8 +73,17 @@ from gateway.pnc_rca_delivery_quarantine_baseline import (
     read_quarantine_baseline_status,
 )
 from gateway.pnc_rca_control_store import RcaControlStore
+from gateway.pnc_rca_provider_fence import (
+    RcaProviderWriteClaim,
+    bound_provider_write_claim,
+    build_historical_epoch_provider_claim,
+    build_write_fence_provider_claim,
+    current_provider_write_claim,
+    revalidate_provider_write_claim,
+)
 from gateway.pnc_rca_delivery_store import (
     DeliveryEffectClaim,
+    DeliveryRecordConflictError,
     RcaDeliveryStore,
     StaleDeliveryEffectLeaseError,
 )
@@ -94,6 +106,7 @@ from gateway.pnc_rca_runtime_identity import (
 )
 from hermes_constants import get_hermes_home
 from scripts.pnc_foxglove_delivery import (
+    G1Q3_RCA_FORMAL_VIZ_ROOT,
     canonical_viz_mcap_cifs_path,
     canonical_viz_mcap_path,
     validate_foxglove_url,
@@ -125,13 +138,9 @@ _FEISHU_ISSUE_URL_RE = re.compile(
 _PROJECT_SIMPLE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _VIZ_REPORT_STATUSES = frozenset({"report_ready"})
-_HTML_REPORT_STATUSES = frozenset({
-    "html_delivery_ready",
-    "report_generated_need_review",
-    "report_ready",
-})
 _CIRCUIT_CODES = frozenset({
     "feishu_auth_failed",
+    "feishu_card_dependency_unavailable",
     "feishu_permission_denied",
     "meegle_dependency_unavailable",
     "feishu_thread_dependency_unavailable",
@@ -141,13 +150,94 @@ _CIRCUIT_CODES = frozenset({
 })
 
 
+def _card_patch_exception_result(exc: Exception) -> dict[str, Any]:
+    detail = f"{type(exc).__name__}: {exc}"
+    lowered = detail.lower()
+    if any(
+        marker in lowered
+        for marker in (
+            "dependencies not installed",
+            "is not configured",
+            "modulenotfounderror",
+            "importerror",
+        )
+    ):
+        return {
+            "success": False,
+            "outcome_uncertain": False,
+            "error_code": "feishu_card_dependency_unavailable",
+            "error": detail,
+        }
+    if any(
+        marker in lowered for marker in ("permission", "forbidden", "230006")
+    ):
+        return {
+            "success": False,
+            "outcome_uncertain": False,
+            "error_code": "feishu_permission_denied",
+            "error": detail,
+        }
+    if any(
+        marker in lowered
+        for marker in (
+            "access_token",
+            "tenant_access_token",
+            "unauthorized",
+            "999916",
+            "99991663",
+        )
+    ):
+        return {
+            "success": False,
+            "outcome_uncertain": False,
+            "error_code": "feishu_auth_failed",
+            "error": detail,
+        }
+    return {
+        "success": False,
+        "outcome_uncertain": True,
+        "error_code": "feishu_card_patch_outcome_unknown",
+        "error": detail,
+    }
+
+
 ListComments = Callable[[str, str], Mapping[str, Any]]
 AddComment = Callable[[str, str, str], Mapping[str, Any]]
 GetFields = Callable[[str, str, tuple[str, ...]], Mapping[str, Any]]
 UpdateFields = Callable[[str, str, tuple[tuple[str, str], ...]], Mapping[str, Any]]
 ListThreadReplies = Callable[[str, str], Mapping[str, Any]]
 AddThreadReply = Callable[[str, str, str, str], Mapping[str, Any]]
+PatchTaskCard = Callable[..., Mapping[str, Any]]
 ReportVerifier = Callable[[str, int, str], Mapping[str, Any]]
+ProviderWriteClaim = RcaProviderWriteClaim
+_bound_provider_write_guard = bound_provider_write_claim
+
+
+def _require_provider_write_guard(
+    operation: str,
+    target: str,
+    *,
+    chat_id: str = "",
+) -> dict[str, Any]:
+    claim = current_provider_write_claim()
+    project_key = ""
+    work_item_id = ""
+    thread_id = ""
+    if operation in {"feishu_issue_comment", "feishu_issue_field_update"}:
+        parts = str(target or "").split(":")
+        if len(parts) != 3 or parts[0] != "feishu_project":
+            raise ExternalWriteFenceError("external_write_fence_target_mismatch")
+        project_key, work_item_id = parts[1:]
+    elif operation == "feishu_thread_reply":
+        thread_id = str(target or "").strip()
+    return revalidate_provider_write_claim(
+        claim,
+        operation=operation,
+        chat_id=str(chat_id or "").strip(),
+        thread_id=thread_id,
+        issue_project_key=project_key,
+        issue_work_item_id=work_item_id,
+    )
 
 
 def _utc_now() -> datetime:
@@ -569,6 +659,10 @@ class ValidatedEffect:
     chat_id: str = ""
     thread_id: str = ""
     idempotency_uuid: str = ""
+    message_id: str = ""
+    submission_key: str = ""
+    render_hash: str = ""
+    card_payload: Mapping[str, Any] | None = None
 
 
 class _NoRedirect(urllib_request.HTTPRedirectHandler):
@@ -627,6 +721,179 @@ def _retry_after(headers: Any) -> int | None:
         return None
 
 
+def _foxglove_publication_path(value: Any) -> str:
+    text = str(value or "").strip()
+    try:
+        parsed = urlsplit(text)
+        query = parse_qs(parsed.query, keep_blank_values=True)
+    except ValueError:
+        return ""
+    paths = query.get("ds.mcapPath", [])
+    if len(paths) != 1 or not validate_foxglove_url(text, paths[0]):
+        return ""
+    return paths[0]
+
+
+def _verify_local_viz_mcap(
+    path: str,
+    expected_size: int,
+    expected_sha256: str,
+) -> dict[str, Any]:
+    """Re-stat and hash the canonical publication immediately before writing."""
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    try:
+        root = Path(G1Q3_RCA_FORMAL_VIZ_ROOT)
+        current = Path(path).parent
+        if current != root and root not in current.parents:
+            return {
+                "success": False,
+                "permanent": True,
+                "error_code": "viz_mcap_path_invalid",
+            }
+        while True:
+            parent_info = os.lstat(current)
+            if stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(
+                parent_info.st_mode
+            ):
+                return {
+                    "success": False,
+                    "permanent": True,
+                    "error_code": "viz_mcap_parent_invalid",
+                }
+            if current == root:
+                break
+            current = current.parent
+        descriptor = os.open(path, flags)
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink < 1:
+            return {
+                "success": False,
+                "permanent": True,
+                "error_code": "viz_mcap_not_regular",
+            }
+        if info.st_size != expected_size:
+            return {
+                "success": False,
+                "permanent": True,
+                "error_code": "viz_mcap_size_mismatch",
+                "content_length": info.st_size,
+            }
+        digest = hashlib.sha256()
+        received = 0
+        while True:
+            chunk = os.read(descriptor, HTTP_VERIFY_READ_CHUNK_BYTES)
+            if not chunk:
+                break
+            received += len(chunk)
+            if received > expected_size:
+                return {
+                    "success": False,
+                    "permanent": True,
+                    "error_code": "viz_mcap_size_mismatch",
+                    "content_length": received,
+                }
+            digest.update(chunk)
+        actual_sha256 = digest.hexdigest()
+        if received != expected_size:
+            return {
+                "success": False,
+                "permanent": True,
+                "error_code": "viz_mcap_size_mismatch",
+                "content_length": received,
+            }
+        if actual_sha256 != expected_sha256:
+            return {
+                "success": False,
+                "permanent": True,
+                "error_code": "viz_mcap_hash_mismatch",
+                "sha256": actual_sha256,
+            }
+        return {
+            "success": True,
+            "content_length": received,
+            "sha256": actual_sha256,
+        }
+    except FileNotFoundError:
+        return {"success": False, "error_code": "viz_mcap_missing"}
+    except OSError as exc:
+        return {
+            "success": False,
+            "error_code": "viz_mcap_stat_unavailable",
+            "error": type(exc).__name__,
+        }
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _verify_foxglove_publication(
+    report_url: str,
+    expected_size: int,
+    expected_sha256: str,
+    *,
+    timeout_seconds: int,
+    monotonic: Callable[[], float],
+    opener: Any | None,
+) -> Mapping[str, Any]:
+    path = _foxglove_publication_path(report_url)
+    if not path:
+        return {
+            "success": False,
+            "permanent": True,
+            "error_code": "foxglove_url_invalid",
+        }
+    local = _verify_local_viz_mcap(path, expected_size, expected_sha256)
+    if local.get("success") is not True:
+        return local
+    parsed = urlsplit(report_url)
+    renderer_url = f"{parsed.scheme}://{parsed.netloc}/"
+    deadline = float(monotonic()) + timeout_seconds
+    http_opener = (
+        opener if opener is not None else urllib_request.build_opener(_NoRedirect())
+    )
+    try:
+        request = urllib_request.Request(renderer_url, method="HEAD")
+        with http_opener.open(
+            request,
+            timeout=_remaining_deadline_seconds(deadline, monotonic),
+        ) as response:
+            status = int(response.getcode())
+        if status != 200:
+            return {
+                "success": False,
+                "error_code": "foxglove_renderer_not_ready",
+                "status_code": status,
+            }
+        return {
+            "success": True,
+            "status_code": status,
+            "content_length": local["content_length"],
+            "sha256": local["sha256"],
+            "viz_mcap_path": path,
+            "renderer_probe": "spa_endpoint_only",
+        }
+    except (_ReportDeadlineExceeded, TimeoutError):
+        return {
+            "success": False,
+            "error_code": "foxglove_renderer_timeout",
+        }
+    except urllib_error.HTTPError as exc:
+        return {
+            "success": False,
+            "error_code": "foxglove_renderer_not_ready",
+            "status_code": int(exc.code),
+            "error": str(exc)[:500],
+        }
+    except (urllib_error.URLError, OSError) as exc:
+        return {
+            "success": False,
+            "error_code": "foxglove_renderer_unavailable",
+            "error": type(exc).__name__,
+        }
+
+
 def default_report_verifier(
     report_url: str,
     expected_size: int,
@@ -636,16 +903,7 @@ def default_report_verifier(
     monotonic: Callable[[], float] = time.monotonic,
     opener: Any | None = None,
 ) -> Mapping[str, Any]:
-    """No-redirect HEAD+GET verification under one wall-clock deadline."""
-    try:
-        validate_report_asset_url(report_url)
-    except DeliveryContractError as exc:
-        return {
-            "success": False,
-            "permanent": True,
-            "error_code": exc.code,
-            "error": exc.detail,
-        }
+    """Verify a Foxglove publication, retaining sealed-HTML rollback support."""
     if (
         isinstance(expected_size, bool)
         or not isinstance(expected_size, int)
@@ -660,6 +918,24 @@ def default_report_verifier(
             "success": False,
             "permanent": True,
             "error_code": "report_http_expectation_invalid",
+        }
+    if _foxglove_publication_path(report_url):
+        return _verify_foxglove_publication(
+            report_url,
+            expected_size,
+            expected_sha256,
+            timeout_seconds=timeout_seconds,
+            monotonic=monotonic,
+            opener=opener,
+        )
+    try:
+        validate_report_asset_url(report_url)
+    except DeliveryContractError as exc:
+        return {
+            "success": False,
+            "permanent": True,
+            "error_code": exc.code,
+            "error": exc.detail,
         }
     deadline = float(monotonic()) + timeout_seconds
     http_opener = (
@@ -1278,6 +1554,10 @@ class MeegleIssueCommentAdapter:
         fields = [
             {"field_key": key, "field_value": value} for key, value in field_updates
         ]
+        _require_provider_write_guard(
+            "feishu_issue_field_update",
+            f"feishu_project:{project_key}:{work_item_id}",
+        )
         rc, out, err = self.runner([
             "workitem",
             "update",
@@ -1304,6 +1584,10 @@ class MeegleIssueCommentAdapter:
     def add_comment(
         self, project_key: str, work_item_id: str, content: str
     ) -> Mapping[str, Any]:
+        _require_provider_write_guard(
+            "feishu_issue_comment",
+            f"feishu_project:{project_key}:{work_item_id}",
+        )
         rc, out, err = self.runner([
             "comment",
             "add",
@@ -1582,6 +1866,13 @@ class FeishuThreadReplyAdapter:
         content: str,
         idempotency_uuid: str,
     ) -> Mapping[str, Any]:
+        _require_provider_write_guard(
+            "feishu_thread_reply",
+            thread_id,
+            chat_id=chat_id,
+        )
+        provider_claim = current_provider_write_claim()
+
         try:
             result = await asyncio.wait_for(
                 self._adapter.send(
@@ -1590,6 +1881,10 @@ class FeishuThreadReplyAdapter:
                     metadata={
                         "thread_id": thread_id,
                         "idempotency_uuid": idempotency_uuid,
+                        "_pnc_rca_external_write_guard": provider_claim,
+                        "_pnc_rca_external_write_operation": (
+                            "feishu_thread_reply"
+                        ),
                     },
                 ),
                 timeout=MEEGLE_COMMENT_PAGE_TIMEOUT_SECONDS,
@@ -1638,12 +1933,57 @@ class FeishuThreadReplyAdapter:
         )
 
 
+def _validate_card_patch_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
+    if claim.outcome != "success":
+        raise DeliveryContractError("delivery_card_patch_outcome_invalid")
+    payload = validate_card_patch_effect_payload(claim.payload)
+    expected = {
+        "effect_key": claim.effect_key,
+        "delivery_id": claim.delivery_id,
+        "effect_kind": claim.effect_kind,
+        "target_key": claim.target_key,
+        "project_key": claim.project_key,
+        "work_item_type_key": claim.work_item_type_key,
+        "work_item_id": claim.work_item_id,
+        "business_key": claim.business_key,
+        "submission_key": claim.submission_key,
+        "generation": claim.generation,
+        "semantic_payload_sha256": claim.payload_sha256,
+    }
+    if any(payload.get(key) != value for key, value in expected.items()):
+        raise DeliveryContractError("delivery_card_patch_effect_identity_invalid")
+    card_payload = payload.get("card_payload")
+    if not isinstance(card_payload, Mapping):
+        raise DeliveryContractError("delivery_card_patch_payload_invalid")
+    content = json.dumps(
+        card_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return ValidatedEffect(
+        effect_kind=DELIVERY_CARD_PATCH_EFFECT_KIND,
+        marker="",
+        content=content,
+        artifacts=(),
+        chat_id=str(payload.get("chat_id") or ""),
+        thread_id=str(payload.get("thread_id") or ""),
+        idempotency_uuid=str(payload.get("idempotency_uuid") or ""),
+        message_id=str(payload.get("message_id") or ""),
+        submission_key=str(payload.get("submission_key") or ""),
+        render_hash=str(payload.get("render_hash") or ""),
+        card_payload=dict(card_payload),
+    )
+
+
 def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
     if claim.effect_kind not in DELIVERY_EFFECT_KINDS or claim.required is not True:
         raise DeliveryContractError(
             "delivery_effect_kind_unsupported",
             "dispatcher only accepts required RCA delivery effects",
         )
+    if claim.effect_kind == DELIVERY_CARD_PATCH_EFFECT_KIND:
+        return _validate_card_patch_effect(claim)
     if claim.outcome != "success":
         return _validate_terminal_effect(claim)
     payload = claim.payload
@@ -1801,36 +2141,37 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         raise DeliveryContractError("delivery_manifest_store_identity_mismatch")
     expected_viz_path = canonical_viz_mcap_path(manifest_submission_key)
     try:
-        manifest_report_url = validate_report_url(
+        validate_report_url(
             claim.manifest.get("report_url"),
             submission_key=manifest_submission_key,
             artifact_set_id=claim.artifact_set_id,
         )
     except DeliveryContractError as exc:
         raise DeliveryContractError("delivery_effect_report_url_invalid") from exc
-    if claim.report_url != manifest_report_url:
-        raise DeliveryContractError("delivery_effect_report_url_invalid")
-    has_viz_surface = bool(payload.get("viz_mcap_vm") or payload.get("foxglove_url"))
-    expected_report_cifs_path = (
-        canonical_viz_mcap_cifs_path(manifest_submission_key)
-        if has_viz_surface
-        else str(claim.manifest.get("report_cifs_path") or "").strip()
+    has_viz_surface = bool(payload.get("viz_mcap_vm")) and bool(
+        payload.get("foxglove_url")
+    )
+    if not has_viz_surface:
+        raise DeliveryContractError("delivery_effect_foxglove_identity_mismatch")
+    expected_report_cifs_path = canonical_viz_mcap_cifs_path(
+        manifest_submission_key
     )
     if payload.get("report_cifs_path") != expected_report_cifs_path:
         raise DeliveryContractError("delivery_report_cifs_identity_mismatch")
-    if has_viz_surface:
-        if payload.get("viz_mcap_vm") != expected_viz_path or not validate_foxglove_url(
+    if (
+        payload.get("viz_mcap_vm") != expected_viz_path
+        or payload.get("foxglove_url") != claim.report_url
+        or not validate_foxglove_url(
             payload.get("foxglove_url"), payload.get("viz_mcap_vm")
-        ):
-            raise DeliveryContractError("delivery_effect_foxglove_identity_mismatch")
-    elif payload.get("viz_mcap_vm") or payload.get("foxglove_url"):
+        )
+    ):
         raise DeliveryContractError("delivery_effect_foxglove_identity_mismatch")
     if payload.get("report_link_kind") != DELIVERY_REPORT_LINK_KIND:
         raise DeliveryContractError("delivery_effect_report_link_kind_invalid")
     expected_human_review = payload.get("terminal_class") == CANDIDATE_HYPOTHESIS
     if payload.get("requires_human_review") is not expected_human_review or payload.get(
         "report_status"
-    ) not in (_VIZ_REPORT_STATUSES if has_viz_surface else _HTML_REPORT_STATUSES):
+    ) not in _VIZ_REPORT_STATUSES:
         raise DeliveryContractError("delivery_effect_review_boundary_invalid")
     expected_report_link = claim.report_url
     expected_field_updates = [
@@ -1872,7 +2213,6 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
     if (
         payload.get("marker") != marker
         or not content
-        or content.splitlines()[0] != marker
         or content.splitlines().count(marker) != 1
     ):
         raise DeliveryContractError("delivery_effect_marker_invalid")
@@ -1948,19 +2288,51 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         != artifacts_by_role["report_data"].sha256
     ):
         raise DeliveryContractError("html_validation_report_data_hash_mismatch")
-    # W4-C4: prove the user-facing sealed report before any external effect.
-    # Auxiliary assets remain covered by the immutable manifest; the primary
-    # index is the publication hard gate (HEAD + GET + exact size/hash).
-    primary_report = artifacts_by_role["index_html"]
+    contract_artifacts = claim.contract.get("artifacts")
+    publication = (
+        contract_artifacts.get("viz_publication")
+        if isinstance(contract_artifacts, Mapping)
+        else None
+    )
+    publication_fields = {
+        "schema_version",
+        "status",
+        "submission_key",
+        "path",
+        "size",
+        "sha256",
+        "manifest_path",
+        "manifest_size",
+        "manifest_sha256",
+        "source_path",
+        "source_sha256",
+        "published_at",
+    }
+    if not isinstance(publication, Mapping) or set(publication) != publication_fields:
+        raise DeliveryContractError("viz_publication_shape_invalid")
+    publication_size = publication.get("size")
+    publication_sha256 = str(publication.get("sha256") or "")
+    if (
+        publication.get("schema_version") != "g1q3_rca_viz_publication_v1"
+        or publication.get("status") != "published"
+        or publication.get("submission_key") != manifest_submission_key
+        or publication.get("path") != expected_viz_path
+        or isinstance(publication_size, bool)
+        or not isinstance(publication_size, int)
+        or publication_size <= 0
+        or publication_size > MAX_DELIVERY_ARTIFACT_BYTES
+        or _SHA256_RE.fullmatch(publication_sha256) is None
+        or publication.get("source_sha256") != publication_sha256
+    ):
+        raise DeliveryContractError("viz_publication_identity_mismatch")
+    # The public gate re-stats and hashes viz.mcap, then probes only the SPA
+    # endpoint. A 200 response does not claim that CVEStudio parsed this file.
     artifact_requests = (
         (
-            primary_report.role,
-            build_report_artifact_url(
-                claim.report_url,
-                primary_report.relative_path,
-            ),
-            primary_report.size,
-            primary_report.sha256,
+            "viz_mcap",
+            claim.report_url,
+            publication_size,
+            publication_sha256,
         ),
     )
     return ValidatedEffect(
@@ -2295,13 +2667,15 @@ def _canonical_remote_content(content: str, marker: str) -> str | None:
     remote_marker = (
         marker[1:-1] if marker.startswith("[") and marker.endswith("]") else marker
     )
-    first_line = lines[0]
-    if (
-        first_line == marker
-        or first_line == remote_marker
-        or first_line.replace(" ", "") == remote_marker
-    ):
-        lines[0] = marker
+    marker_indexes = [
+        index
+        for index, line in enumerate(lines)
+        if line == marker
+        or line == remote_marker
+        or line.replace(" ", "") == remote_marker
+    ]
+    if len(marker_indexes) == 1:
+        lines[marker_indexes[0]] = marker
         normalized: list[str] = []
         for line in lines:
             normalized.append(
@@ -2356,6 +2730,7 @@ class DeliveryDispatcher:
         update_fields: UpdateFields | None = None,
         list_thread_replies: ListThreadReplies | None = None,
         add_thread_reply: AddThreadReply | None = None,
+        patch_task_card: PatchTaskCard | None = None,
         now: Callable[[], datetime] = _utc_now,
         lease_owner: str | None = None,
         _effect_lease_renew_interval_seconds: float | None = None,
@@ -2368,6 +2743,7 @@ class DeliveryDispatcher:
         self.update_fields = update_fields
         self.list_thread_replies = list_thread_replies
         self.add_thread_reply = add_thread_reply
+        self.patch_task_card = patch_task_card
         self.report_verifier = report_verifier
         self.now = now
         self.lease_owner = lease_owner or (
@@ -2514,7 +2890,7 @@ class DeliveryDispatcher:
         *,
         operation: str,
         target: str,
-    ) -> None:
+    ) -> dict[str, Any]:
         """Revalidate the immutable W5 fence immediately before a provider call."""
         try:
             self.store.validate_learning_lane_external_operation(
@@ -2532,20 +2908,22 @@ class DeliveryDispatcher:
         contract = claim.contract if isinstance(claim.contract, Mapping) else {}
         binding = contract.get("w3_execution_snapshot")
         if not isinstance(binding, Mapping):
+            if claim.effect_kind == DELIVERY_CARD_PATCH_EFFECT_KIND:
+                raise ExternalWriteFenceError("external_write_fence_missing")
             if self.store.is_historical_external_write_effect(
                 claim.effect_created_at
             ):
-                self._validate_historical_external_write_epoch(claim)
-                return
+                return self._validate_historical_external_write_epoch(claim)
             raise ExternalWriteFenceError("external_write_fence_missing")
         fence = binding.get("write_fence")
         core_sha = binding.get("snapshot_core_sha256")
         if not isinstance(fence, Mapping) or not core_sha:
+            if claim.effect_kind == DELIVERY_CARD_PATCH_EFFECT_KIND:
+                raise ExternalWriteFenceError("external_write_fence_missing")
             if self.store.is_historical_external_write_effect(
                 claim.effect_created_at
             ):
-                self._validate_historical_external_write_epoch(claim)
-                return
+                return self._validate_historical_external_write_epoch(claim)
             raise ExternalWriteFenceError("external_write_fence_missing")
         try:
             live = self.store.validate_external_write_fence_binding(fence)
@@ -2572,6 +2950,13 @@ class DeliveryDispatcher:
             raise ExternalWriteFenceError(
                 "external_write_fence_target_mismatch"
             )
+        if claim.effect_kind == DELIVERY_CARD_PATCH_EFFECT_KIND and (
+            str(claim.payload.get("chat_id") or "").strip()
+            != str(live.get("chat_id") or "").strip()
+            or str(claim.payload.get("thread_id") or "").strip()
+            != str(live.get("thread_target") or "").strip()
+        ):
+            raise ExternalWriteFenceError("external_write_fence_target_mismatch")
         validate_write_fence(
             fence,
             snapshot_core_sha256_value=str(core_sha),
@@ -2587,12 +2972,13 @@ class DeliveryDispatcher:
             expected_target_set_sha256=expected_target_set_sha256,
             now=self.now(),
         )
+        return dict(live)
 
     def _validate_historical_external_write_epoch(
         self, claim: DeliveryEffectClaim
-    ) -> None:
+    ) -> dict[str, Any]:
         try:
-            require_resident_activation_epoch(
+            epoch = require_resident_activation_epoch(
                 self.store,
                 allowed_states=RESIDENT_EXTERNAL_WRITE_STATES,
             )
@@ -2602,6 +2988,39 @@ class DeliveryDispatcher:
                     f"delivery activation changed for {claim.effect_key}"
                 ) from exc
             raise
+        return dict(epoch)
+
+    def _provider_write_guard(
+        self,
+        claim: DeliveryEffectClaim,
+    ) -> ProviderWriteClaim:
+        contract = claim.contract if isinstance(claim.contract, Mapping) else {}
+        snapshot = contract.get("w3_execution_snapshot")
+        fence = snapshot.get("write_fence") if isinstance(snapshot, Mapping) else None
+        if isinstance(fence, Mapping):
+            return build_write_fence_provider_claim(fence)
+        if claim.effect_kind == DELIVERY_CARD_PATCH_EFFECT_KIND:
+            raise ExternalWriteFenceError("external_write_fence_missing")
+        epoch = self._validate_historical_external_write_epoch(claim)
+        if claim.effect_kind == DELIVERY_THREAD_EFFECT_KIND:
+            operations = ("feishu_thread_reply",)
+        else:
+            operations = (
+                "feishu_issue_comment",
+                "feishu_issue_field_update",
+            )
+        return build_historical_epoch_provider_claim(
+            epoch_id=str(epoch.get("epoch_id") or ""),
+            effect_key=claim.effect_key,
+            delivery_id=claim.delivery_id,
+            lease_token=claim.lease_token,
+            lease_fence=claim.fence,
+            operations=operations,
+            issue_target=claim.issue_url,
+            chat_id=str(claim.payload.get("chat_id") or ""),
+            thread_id=str(claim.payload.get("thread_id") or ""),
+            submission_key=claim.submission_key,
+        )
 
     @staticmethod
     def _adjudication_error_outcome(
@@ -2807,6 +3226,8 @@ class DeliveryDispatcher:
     ) -> Mapping[str, Any]:
         if validated.effect_kind == DELIVERY_EFFECT_KIND:
             return self.list_comments(claim.project_key, claim.work_item_id)
+        if validated.effect_kind != DELIVERY_THREAD_EFFECT_KIND:
+            raise DeliveryContractError("delivery_effect_kind_unsupported")
         if self.list_thread_replies is None:
             return {
                 "success": False,
@@ -2857,6 +3278,8 @@ class DeliveryDispatcher:
             return self.add_comment(
                 claim.project_key, claim.work_item_id, validated.content
             )
+        if validated.effect_kind != DELIVERY_THREAD_EFFECT_KIND:
+            raise DeliveryContractError("delivery_effect_kind_unsupported")
         if self.add_thread_reply is None:
             return {
                 "success": False,
@@ -3010,6 +3433,213 @@ class DeliveryDispatcher:
             error_code=error_code,
         )
 
+    def _dispatch_card_patch(
+        self,
+        claim: DeliveryEffectClaim,
+        validated: ValidatedEffect,
+    ) -> DispatchOutcome:
+        if self.patch_task_card is None:
+            return self._open_circuit(
+                claim,
+                error_code="feishu_card_dependency_unavailable",
+                detail="task card patch transport is not configured",
+                uncertain=False,
+            )
+        if claim.write_phase == "write_started":
+            return self._quarantine(
+                claim,
+                error_code="feishu_card_patch_outcome_unknown",
+                detail=(
+                    "a prior card PATCH crossed the outward boundary without an "
+                    "exact readback; refusing a duplicate write"
+                ),
+            )
+        try:
+            self.store.validate_card_patch_effect_binding(
+                claim=claim,
+                now=self.now(),
+            )
+        except DeliveryRecordConflictError as exc:
+            return self._quarantine(
+                claim,
+                error_code=str(exc)[:120],
+                detail="card patch is not bound to its immutable adjudication",
+            )
+        try:
+            self._validate_external_write(
+                claim,
+                operation="feishu_card_patch",
+                target=claim.issue_url,
+            )
+        except ExternalWriteFenceError as exc:
+            return self._quarantine(claim, error_code=exc.code, detail=exc.detail)
+        self._heartbeat(claim)
+
+        if claim.write_phase == "prewrite":
+            try:
+                superseded = self.store.mark_effect_write_started(
+                    claim=claim,
+                    now=self.now(),
+                    activation_required=self.config.activation_required,
+                )
+            except DeliveryRecordConflictError as exc:
+                return self._quarantine(
+                    claim,
+                    error_code="delivery_card_patch_write_phase_invalid",
+                    detail=str(exc),
+                )
+            if superseded is not None:
+                self.stats.reconciled += 1
+                return DispatchOutcome(
+                    status="superseded",
+                    effect_key=claim.effect_key,
+                    delivery_id=claim.delivery_id,
+                    attempt=claim.attempt,
+                    error_code="delivery_effect_superseded_by_newer_settled_fields",
+                )
+        elif claim.write_phase != "write_started":
+            return self._quarantine(
+                claim,
+                error_code="delivery_card_patch_write_phase_invalid",
+                detail="card patch claim has an invalid write phase",
+            )
+
+        self._heartbeat(claim)
+        thread_anchor = validated.thread_id.removeprefix("topic:")
+        target = f"feishu:{validated.chat_id}"
+        if thread_anchor:
+            target = f"{target}:{thread_anchor}"
+        try:
+            provider_claim = self._provider_write_guard(claim)
+            with _bound_provider_write_guard(provider_claim):
+                patch_raw = self.patch_task_card(
+                    target,
+                    dict(validated.card_payload or {}),
+                    message_id=validated.message_id,
+                    provider_claim=provider_claim,
+                )
+        except ExternalWriteFenceError as exc:
+            return self._quarantine(claim, error_code=exc.code, detail=exc.detail)
+        except Exception as exc:
+            self._heartbeat(claim)
+            return self._boundary_failure(
+                claim,
+                _card_patch_exception_result(exc),
+                uncertain_default=True,
+            )
+        self._heartbeat(claim)
+        if not isinstance(patch_raw, Mapping):
+            return self._open_circuit(
+                claim,
+                error_code="delivery_boundary_contract_invalid",
+                detail="patch_task_card must return an object",
+                uncertain=True,
+            )
+        patch_result = dict(patch_raw)
+        if patch_result.get("success") is not True:
+            if patch_result.get("success") is not False:
+                patch_result = {
+                    "success": False,
+                    "outcome_uncertain": True,
+                    "error_code": "delivery_boundary_contract_invalid",
+                    "error": "patch_task_card omitted a boolean success field",
+                }
+            if (
+                patch_result.get("error_code")
+                == "feishu_card_patch_message_expired"
+                and patch_result.get("permanent") is True
+                and patch_result.get("outcome_uncertain") is False
+            ):
+                self._settle_claim(
+                    claim,
+                    lambda: self.store.suppress_expired_card_patch(
+                        claim=claim,
+                        error_detail=str(
+                            patch_result.get("error")
+                            or "Feishu card message expired"
+                        ),
+                        receipt={
+                            "source": "card_message_expired",
+                            "message_id": validated.message_id,
+                            "render_hash": validated.render_hash,
+                            "adjudication_id": str(
+                                claim.payload.get("adjudication_id") or ""
+                            ),
+                            "conclusion_state": str(
+                                claim.payload.get("conclusion_state") or ""
+                            ),
+                            "correction_effect_key": str(
+                                claim.payload.get("correction_effect_key") or ""
+                            ),
+                            "error_code": "feishu_card_patch_message_expired",
+                        },
+                        now=self.now(),
+                    ),
+                )
+                self.stats.reconciled += 1
+                return DispatchOutcome(
+                    status="suppressed",
+                    effect_key=claim.effect_key,
+                    delivery_id=claim.delivery_id,
+                    attempt=claim.attempt,
+                    error_code="feishu_card_patch_message_expired",
+                )
+            return self._boundary_failure(
+                claim,
+                patch_result,
+                uncertain_default=True,
+            )
+        remote_id = str(patch_result.get("message_id") or "").strip()
+        if remote_id != validated.message_id:
+            return self._open_circuit(
+                claim,
+                error_code="delivery_boundary_contract_invalid",
+                detail="card patch response did not confirm the exact message id",
+                uncertain=True,
+            )
+        try:
+            self._settle_claim(
+                claim,
+                lambda: self.store.complete_effect(
+                    claim=claim,
+                    outcome="ack",
+                    remote_id=remote_id,
+                    receipt={
+                        "remote_id": remote_id,
+                        "source": "relay_card_patch",
+                        "render_hash": validated.render_hash,
+                        "adjudication_id": str(
+                            claim.payload.get("adjudication_id") or ""
+                        ),
+                        "conclusion_state": str(
+                            claim.payload.get("conclusion_state") or ""
+                        ),
+                        "correction_effect_key": str(
+                            claim.payload.get("correction_effect_key") or ""
+                        ),
+                    },
+                    runtime_identity=self.runtime_identity,
+                    now=self.now(),
+                ),
+            )
+        except DeliveryRecordConflictError as exc:
+            return DispatchOutcome(
+                status="activation_stale",
+                effect_key=claim.effect_key,
+                delivery_id=claim.delivery_id,
+                attempt=claim.attempt,
+                error_code=str(exc)[:120],
+                remote_id=remote_id,
+            )
+        self.stats.delivered += 1
+        return DispatchOutcome(
+            status="succeeded",
+            effect_key=claim.effect_key,
+            delivery_id=claim.delivery_id,
+            attempt=claim.attempt,
+            remote_id=remote_id,
+        )
+
     def _dispatch_claim(self, claim: DeliveryEffectClaim) -> DispatchOutcome:
         prior_write_uncertain = claim.previous_status == "uncertain"
         adjudication_effect = identifies_adjudication_effect(
@@ -3019,6 +3649,8 @@ class DeliveryDispatcher:
             validated = _validate_effect(claim)
         except DeliveryContractError as exc:
             return self._quarantine(claim, error_code=exc.code, detail=exc.detail)
+        if claim.effect_kind == DELIVERY_CARD_PATCH_EFFECT_KIND:
+            return self._dispatch_card_patch(claim, validated)
         if adjudication_effect:
             binding_failure = self._adjudication_binding_gate(
                 claim,
@@ -3382,7 +4014,16 @@ class DeliveryDispatcher:
             except ExternalWriteFenceError as exc:
                 return self._quarantine(claim, error_code=exc.code, detail=exc.detail)
             try:
-                update_raw = self._write_field_updates(claim, validated)
+                with _bound_provider_write_guard(
+                    self._provider_write_guard(claim)
+                ):
+                    update_raw = self._write_field_updates(claim, validated)
+            except ExternalWriteFenceError as exc:
+                return self._quarantine(
+                    claim,
+                    error_code=exc.code,
+                    detail=exc.detail,
+                )
             except Exception as exc:
                 if adjudication_effect:
                     binding_failure = self._adjudication_binding_gate(
@@ -3504,7 +4145,8 @@ class DeliveryDispatcher:
                     else claim.issue_url
                 ),
             )
-            add_raw = self._add_remote_effect(claim, validated)
+            with _bound_provider_write_guard(self._provider_write_guard(claim)):
+                add_raw = self._add_remote_effect(claim, validated)
         except ExternalWriteFenceError as exc:
             return self._quarantine(claim, error_code=exc.code, detail=exc.detail)
         except Exception as exc:
@@ -4027,6 +4669,42 @@ def main(argv: list[str] | None = None) -> int:
 
     adapter = MeegleIssueCommentAdapter()
     thread_adapter = FeishuThreadReplyAdapter()
+    card_sender: Any | None = None
+
+    def patch_task_card(
+        target: str,
+        card_payload: Mapping[str, Any],
+        message_id: str | None = None,
+        *,
+        provider_claim: ProviderWriteClaim | None = None,
+    ) -> Mapping[str, Any]:
+        nonlocal card_sender
+        if card_sender is None:
+            from scripts.pnc_completion_notice_relay import FeishuHotSender
+
+            card_sender = FeishuHotSender()
+        raw = card_sender.send_task_card(
+            target,
+            dict(card_payload),
+            message_id=message_id,
+            provider_claim=provider_claim,
+        )
+        if not isinstance(raw, Mapping):
+            return {
+                "success": False,
+                "outcome_uncertain": True,
+                "error_code": "delivery_boundary_contract_invalid",
+                "error": "relay task card patch returned a non-object",
+            }
+        value = dict(raw)
+        if value.get("success") is True:
+            return value
+        value["success"] = False
+        value.setdefault("outcome_uncertain", True)
+        value.setdefault("error_code", "feishu_card_patch_failed")
+        value.setdefault("error", "task card patch failed")
+        return value
+
     dispatcher = DeliveryDispatcher(
         store=store,
         config=config,
@@ -4036,6 +4714,7 @@ def main(argv: list[str] | None = None) -> int:
         update_fields=adapter.update_fields,
         list_thread_replies=thread_adapter.list_replies,
         add_thread_reply=thread_adapter.add_reply,
+        patch_task_card=patch_task_card,
         report_verifier=lambda url, size, sha256: default_report_verifier(
             url,
             size,

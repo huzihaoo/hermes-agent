@@ -44,6 +44,7 @@ CONFIRM_OPTION_PRESETS = {
     "plan_ab": ["方案A", "方案B"],
     "continue_stop": ["继续", "中止"],
     "boundary": ["接受边界", "要求补全"],
+    "rca_candidate_conclusion_review": ["追认", "更正"],
 }
 
 FORBIDDEN_FRAGMENTS = (
@@ -70,7 +71,8 @@ STATUS_DISPLAY = {
     "hypothesis_ready": "已有候选归因，待人工确认",
     "needs_review": "待人工复核",
     "need_review": "待人工复核",
-    "html_delivery_ready": "HTML 报告已生成",
+    # HTML is an internal audit artifact, never the public delivery surface.
+    "html_delivery_ready": "内部审计产物已生成",
     "report_ready": "报告已生成",
     "need_download": "待补充数据/证据",
     "out_of_scope": "不予受理/转人工",
@@ -83,6 +85,8 @@ STATUS_DISPLAY = {
     "in_progress": "执行中",
     "reused_existing_report": "命中既有报告，已复用",
     "existing_report_draft_not_deliverable": "命中报告草稿，但暂不可交付",
+    "recognized": "候选结论已追认",
+    "invalidated": "原候选结论已作废",
 }
 
 
@@ -113,10 +117,10 @@ def _display_label(value: Any) -> str:
     if not text:
         return ""
     replacements = {
-        "报告状态确认：html_delivery_ready": "报告状态确认：HTML 报告已生成",
+        "报告状态确认：html_delivery_ready": "报告状态确认：内部审计产物已生成",
         "归因状态确认：hypothesis_ready": "归因状态确认：已有候选归因，待人工确认",
         "report_ready": "报告已生成",
-        "html_delivery_ready": "HTML 报告已生成",
+        "html_delivery_ready": "内部审计产物已生成",
         "hypothesis_ready": "已有候选归因，待人工确认",
         "ready_to_download": "数据准入通过，等待处理",
         "out_of_scope": "不予受理/转人工",
@@ -136,11 +140,24 @@ def _same_artifact_location(left: str, right: str) -> bool:
 
 
 def _display_artifact_label(label: Any, artifact_path: str) -> str:
-    text = _safe_card_text(label, "打开 HTML 报告")
+    text = _safe_card_text(label, "报告目录")
     path = str(artifact_path or "").strip()
-    if text == "打开 HTML 报告" and path and not path.startswith(("http://", "https://", "file://")):
-        return "HTML 报告路径" if path.lower().endswith(".html") else "报告目录"
+    if "HTML" in text.upper() or path.lower().endswith((".html", ".htm")):
+        return "报告目录"
     return text
+
+
+def _looks_like_html_artifact(value: Any) -> bool:
+    text = str(value or "").strip().split("?", 1)[0].split("#", 1)[0].lower()
+    return text.endswith((".html", ".htm")) or "/index.html" in text
+
+
+def _internal_html_only_text(value: Any) -> str:
+    text = _safe_card_text(value)
+    return text.replace(
+        "RCA 报告已生成",
+        "内部审计产物已生成，当前尚无可交付 Foxglove 可视化",
+    )
 
 
 def _text(value: Any, default: str = "") -> str:
@@ -286,6 +303,30 @@ def _confirm_actions(confirms: list[dict[str, Any]], *, task_id: str = "") -> li
     return actions
 
 
+def _rca_conclusion_review_state(
+    task_card: dict[str, Any], pending_confirms: list[dict[str, Any]]
+) -> dict[str, Any]:
+    current = task_card.get("rca_conclusion_review")
+    if isinstance(current, dict) and current.get("kind") == "rca_candidate_conclusion_review":
+        return current
+    for item in reversed(pending_confirms):
+        if not isinstance(item, dict):
+            continue
+        semantic = item.get("semantic") if isinstance(item.get("semantic"), dict) else {}
+        resolved = item.get("resolved") if isinstance(item.get("resolved"), dict) else {}
+        semantic_result = (
+            resolved.get("semantic_result")
+            if isinstance(resolved.get("semantic_result"), dict)
+            else {}
+        )
+        if (
+            semantic.get("kind") == "rca_candidate_conclusion_review"
+            and semantic_result.get("kind") == "rca_candidate_conclusion_review"
+        ):
+            return semantic_result
+    return {}
+
+
 def render_task_card(task_card: dict[str, Any]) -> dict[str, Any]:
     """Render a task_card sidecar object into Feishu interactive-card JSON."""
     if not isinstance(task_card, dict):
@@ -323,7 +364,25 @@ def render_task_card(task_card: dict[str, Any]) -> dict[str, Any]:
         if actions:
             elements.append({"tag": "action", "actions": actions[:6]})
 
+    review_state = _rca_conclusion_review_state(task_card, pending_confirms)
+    conclusion_state = _text(review_state.get("conclusion_state"))
+    if conclusion_state in {"recognized", "invalidated"}:
+        state_text = _display_status(conclusion_state)
+        work_item_id = _text(review_state.get("work_item_id"))
+        generation = _text(review_state.get("generation"))
+        identity = f"issue {work_item_id}" if work_item_id else "当前 issue"
+        if generation:
+            identity += f" / generation {generation}"
+        lines = [f"- {identity}：{state_text}"]
+        if conclusion_state == "invalidated":
+            lines.append("- 原评论不可改写；更正沿用既有单一更正槽追加。")
+        elif review_state.get("artifact_repair_pending"):
+            lines.append("- 裁决已生效；审计材料等待自动修复。")
+        elements.append(_markdown("**结论复核**\n" + "\n".join(lines)))
+
     conclusion = _safe_card_text(delivery.get("conclusion"))
+    if conclusion_state == "invalidated":
+        conclusion = "原候选结论已作废；更正已进入既有单一更正槽。"
     attribution_status = _display_status(delivery.get("attribution_status"))
     report_status = _display_status(delivery.get("report_status"))
     candidate_cause = _clean_candidate_cause(delivery.get("candidate_cause"))
@@ -333,14 +392,31 @@ def render_task_card(task_card: dict[str, Any]) -> dict[str, Any]:
     foxglove_url = _safe_card_text(delivery.get("foxglove_url"))
     if foxglove_url.startswith(("http://", "https://")):
         artifact_path = foxglove_url
+    is_rca_delivery = bool(
+        _text(delivery.get("report_status"))
+        or delivery.get("rca_status")
+        or foxglove_url
+        or _looks_like_html_artifact(artifact_path)
+        or "RCA 报告已生成" in conclusion
+    )
+    # A stale/internal index.html must never become a public card link. Keep
+    # directory metadata available for internal pickup, but remove the HTML
+    # pointer itself when no published Foxglove URL exists.
+    if is_rca_delivery and not foxglove_url and _looks_like_html_artifact(artifact_path):
+        artifact_path = ""
+    if is_rca_delivery and not foxglove_url:
+        status_line = _internal_html_only_text(status_line)
+        conclusion = _internal_html_only_text(conclusion)
+        elements[0] = _markdown(f"**状态**  {status_line}")
     diagnostics_for_report = task_card.get("diagnostics") if isinstance(task_card.get("diagnostics"), dict) else {}
     has_deliverable_report = (
-        bool(presentation.get("has_deliverable_report"))
-        or _text(delivery.get("report_status")) in {"html_delivery_ready", "report_ready", "report_generated_need_review"}
-        or _text(diagnostics_for_report.get("report_status")) in {"html_delivery_ready", "report_ready", "report_generated_need_review"}
-        or (artifact_path.startswith(("http://", "https://", "file://")) and artifact_path.lower().endswith(".html"))
-        or foxglove_url.startswith(("http://", "https://"))
-        or (not presentation and _text(task_card.get("user_state")) in {"done", "completed"} and _text(delivery.get("cifs_status")).lower() in {"success", "ok", "succeeded", "done", "ready"})
+        bool(foxglove_url.startswith(("http://", "https://")))
+        if is_rca_delivery
+        else (
+            bool(presentation.get("has_deliverable_report"))
+            or (artifact_path.startswith(("http://", "https://", "file://")) and not _looks_like_html_artifact(artifact_path))
+            or (not presentation and _text(task_card.get("user_state")) in {"done", "completed"} and _text(delivery.get("cifs_status")).lower() in {"success", "ok", "succeeded", "done", "ready"})
+        )
     )
     artifact_label = "打开 foxglove 可视化" if artifact_path == foxglove_url and foxglove_url else _display_artifact_label(delivery.get("artifact_label"), artifact_path)
     artifact_root = _safe_card_text(delivery.get("artifact_root"))
@@ -348,6 +424,13 @@ def render_task_card(task_card: dict[str, Any]) -> dict[str, Any]:
     input_resolved = _safe_input_text(delivery.get("input_resolved"))
     artifact_vm = _safe_card_text(delivery.get("artifact_vm"))
     artifact_cifs = _safe_card_text(delivery.get("artifact_cifs"))
+    if is_rca_delivery and not foxglove_url:
+        if _looks_like_html_artifact(artifact_root):
+            artifact_root = ""
+        if _looks_like_html_artifact(artifact_vm):
+            artifact_vm = ""
+        if _looks_like_html_artifact(artifact_cifs):
+            artifact_cifs = ""
     cifs_status = _safe_card_text(delivery.get("cifs_status"))
     verification = _safe_card_text(delivery.get("verification"))
     translate_baseline = _safe_card_text(delivery.get("translate_baseline"))
@@ -459,7 +542,14 @@ def render_task_card(task_card: dict[str, Any]) -> dict[str, Any]:
 
     card = {
         "config": {"wide_screen_mode": True},
-        "header": {"title": {"tag": "plain_text", "content": "长程编码任务"}, "template": "blue"},
+        "header": {
+            "title": {"tag": "plain_text", "content": "长程编码任务"},
+            "template": (
+                "red"
+                if conclusion_state == "invalidated"
+                else "green" if conclusion_state == "recognized" else "blue"
+            ),
+        },
         "elements": elements,
     }
     assert_no_forbidden_fragments(card, has_deliverable_report=has_deliverable_report)

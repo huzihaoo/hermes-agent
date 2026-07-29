@@ -75,14 +75,26 @@ def _insert_issue_effect(
     created_at: str,
     status: str = "succeeded",
     payload: dict[str, object] | None = None,
+    comment_slot: dict[str, object] | None = None,
 ) -> None:
+    slot = comment_slot or {
+        "comment_slot_budget_exempt": 0,
+        "comment_slot_generation": None,
+        "comment_slot_key": "",
+        "comment_slot_kind": "",
+        "comment_slot_revision": None,
+        "comment_slot_schema_version": "",
+    }
     conn.execute(
         """
         INSERT INTO rca_delivery_effects(
             effect_key, delivery_id, effect_kind, required, target_key,
             payload_json, payload_sha256, status, created_at, updated_at,
-            completed_at
-        ) VALUES (?, ?, 'feishu_issue_comment', 1, ?, ?, ?, ?, ?, ?, ?)
+            completed_at, comment_slot_schema_version, comment_slot_key,
+            comment_slot_kind, comment_slot_generation,
+            comment_slot_revision, comment_slot_budget_exempt
+        ) VALUES (?, ?, 'feishu_issue_comment', 1, ?, ?, ?, ?, ?, ?, ?,
+                  ?, ?, ?, ?, ?, ?)
         """,
         (
             effect_key,
@@ -97,6 +109,12 @@ def _insert_issue_effect(
             created_at,
             created_at,
             created_at if status == "succeeded" else None,
+            slot["comment_slot_schema_version"],
+            slot["comment_slot_key"],
+            slot["comment_slot_kind"],
+            slot["comment_slot_generation"],
+            slot["comment_slot_revision"],
+            slot["comment_slot_budget_exempt"],
         ),
     )
 
@@ -604,8 +622,8 @@ def test_issue_comment_budget_allows_initial_adjudication_and_explicit_rerun_onl
         generation: int,
         payload: dict[str, object] | None = None,
         target_key: str = target,
-    ) -> None:
-        delivery.enforce_issue_comment_budget_tx(
+    ) -> dict[str, object]:
+        return delivery.enforce_issue_comment_budget_tx(
             conn,
             delivery_id=delivery_id,
             business_key=business_key,
@@ -617,7 +635,7 @@ def test_issue_comment_budget_allows_initial_adjudication_and_explicit_rerun_onl
     conn = delivery._connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        enforce(
+        slot = enforce(
             conn,
             delivery_id="normal-delivery-1",
             business_key="normal-business-1",
@@ -629,6 +647,7 @@ def test_issue_comment_budget_allows_initial_adjudication_and_explicit_rerun_onl
             delivery_id="normal-delivery-1",
             target_key=target,
             created_at=current,
+            comment_slot=slot,
         )
         conn.commit()
     finally:
@@ -696,7 +715,7 @@ def test_issue_comment_budget_allows_initial_adjudication_and_explicit_rerun_onl
     conn = delivery._connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        enforce(
+        slot = enforce(
             conn,
             delivery_id="normal-delivery-2",
             business_key="normal-business-2",
@@ -708,6 +727,7 @@ def test_issue_comment_budget_allows_initial_adjudication_and_explicit_rerun_onl
             delivery_id="normal-delivery-2",
             target_key=target,
             created_at=current,
+            comment_slot=slot,
         )
         conn.commit()
     finally:
@@ -734,7 +754,7 @@ def test_issue_comment_budget_allows_initial_adjudication_and_explicit_rerun_onl
     conn = delivery._connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        enforce(
+        slot = enforce(
             conn,
             delivery_id="normal-delivery-1",
             business_key="normal-business-1",
@@ -749,6 +769,7 @@ def test_issue_comment_budget_allows_initial_adjudication_and_explicit_rerun_onl
             target_key=adjudication_target,
             created_at=current,
             payload=adjudication_payload,
+            comment_slot=slot,
         )
         conn.commit()
     finally:

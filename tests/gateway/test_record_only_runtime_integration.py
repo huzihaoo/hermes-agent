@@ -39,6 +39,32 @@ def test_live_mode_is_lazy_and_does_not_load_census(monkeypatch: pytest.MonkeyPa
     assert "gateway.record_only.census_binding" not in sys.modules
 
 
+@pytest.mark.parametrize(
+    "misspelled_mode",
+    ["record_only", "recordonly", "record-onyl", "record only"],
+)
+def test_misspelled_outbound_mode_fails_closed_before_transport_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    misspelled_mode: str,
+) -> None:
+    record_root = tmp_path / "records"
+    monkeypatch.setenv("HERMES_OUTBOUND_MODE", misspelled_mode)
+    monkeypatch.setenv("HERMES_OUTBOUND_RECORD_ROOT", str(record_root))
+    sys.modules.pop("gateway.record_only.transport", None)
+    sys.modules.pop("gateway.record_only.census_binding", None)
+
+    with pytest.raises(
+        runtime.RecordOnlyConfigurationError,
+        match="unsupported HERMES_OUTBOUND_MODE",
+    ):
+        runtime.get_record_only_transport("test.misspelled-mode")
+
+    assert not record_root.exists()
+    assert "gateway.record_only.transport" not in sys.modules
+    assert "gateway.record_only.census_binding" not in sys.modules
+
+
 def test_record_only_mode_fails_closed_without_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root = tmp_path / "records"
     root.mkdir(mode=0o700)

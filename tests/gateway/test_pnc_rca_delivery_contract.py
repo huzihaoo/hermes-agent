@@ -17,6 +17,7 @@ from gateway.pnc_rca_delivery_contract import (
     DeliveryContractError,
     MAX_DELIVERY_ARTIFACT_BYTES,
     MAX_DELIVERY_ARTIFACTS,
+    RERUN_PROMPT_LINE,
     build_public_rca_result,
     build_report_cifs_path,
     build_report_artifact_url,
@@ -105,7 +106,9 @@ def _bundle(
         "work_item_id": admission.source_refs.work_item_id,
         "artifact_revision": 1,
         "sealed_at": "2026-07-10T08:00:00+00:00",
-        "deliverable_kind": "html",
+        # HTML remains in the sealed artifact inventory for internal consumers;
+        # the public delivery kind is the published Foxglove surface.
+        "deliverable_kind": "foxglove_viz",
         "dependencies_complete": True,
         "artifact_root": root,
         "html_validation": {
@@ -305,6 +308,16 @@ def _consumer_capability(*, applicability="applied"):
 
 
 def _add_structural_candidate(contract, conclusion="减速度请求偏重。"):
+    contract["upstream_dispatch"] = {
+        "hit_evaluator_keys": ["aeb_trigger"],
+        "hit_window_envelope": None,
+        "hit_windows": [],
+        "owner_bucket": "acc_longitudinal_control",
+        "owner_bucket_label": "纵向控制",
+        "reason": "single_owner_bucket_hit",
+        "schema_version": "g1q3_upstream_dispatch_v2",
+        "terminal_classification": "valid_dispatch",
+    }
     contract["report"]["candidate_owner_domain"] = "ACC"
     contract["report"]["is_candidate"] = True
     contract["summary"]["short_conclusion"] = conclusion
@@ -338,11 +351,14 @@ def test_delivery_projects_consumer_capability_into_field_and_comment():
         html_dependencies=dependencies,
     )
 
-    assert "归因结论：减速度请求偏重。" in verified.conclusion
+    assert "归因判断：减速度请求偏重。" in verified.conclusion
     assert MEDIUM_TIER_DISCLAIMER in verified.conclusion
     assert "g1q3_863_consumer" not in verified.conclusion
     assert "signals/fields/evaluators" not in verified.effect_payload["comment_content"]
-    assert "报告页包含证据" in verified.effect_payload["comment_content"]
+    assert "Foxglove 证据：" in verified.effect_payload["comment_content"]
+    assert verified.effect_payload["comment_content"].splitlines()[-1] == (
+        RERUN_PROMPT_LINE
+    )
     assert (
         verified.effect_payload["field_updates"][0]["field_value"]
         == verified.conclusion
@@ -390,6 +406,16 @@ def test_supported_tier_requires_golden_and_does_not_request_human_review(
     )
     contract["summary"]["short_conclusion"] = conclusion
     contract["quality_classification"] = "supported_attribution"
+    contract["upstream_dispatch"] = {
+        "hit_evaluator_keys": ["aeb_trigger"],
+        "hit_window_envelope": None,
+        "hit_windows": [],
+        "owner_bucket": "acc_longitudinal_control",
+        "owner_bucket_label": "纵向控制",
+        "reason": "single_owner_bucket_hit",
+        "schema_version": "g1q3_upstream_dispatch_v2",
+        "terminal_classification": "valid_dispatch",
+    }
     contract["public_result"] = {
         "summary": {"short_conclusion": conclusion},
         "candidate": "AEB",
@@ -492,6 +518,16 @@ def test_public_projection_attributes_data_binding_conflict_without_blame_shift(
 
 def test_public_projection_humanizes_evaluator_and_responsibility_domain():
     contract = {
+        "upstream_dispatch": {
+            "hit_evaluator_keys": ["acc_heavy_decel_spec"],
+            "hit_window_envelope": None,
+            "hit_windows": [],
+            "owner_bucket": "acc_longitudinal_control",
+            "owner_bucket_label": "纵向控制",
+            "reason": "single_owner_bucket_hit",
+            "schema_version": "g1q3_upstream_dispatch_v2",
+            "terminal_classification": "valid_dispatch",
+        },
         "summary": {
             "short_conclusion": (
                 "decoded evaluator 已支持候选归因方向：ACC decoded 证据显示实际减速度偏重。"
@@ -509,8 +545,9 @@ def test_public_projection_humanizes_evaluator_and_responsibility_domain():
 
     rendered = render_public_rca_result(contract)
 
-    assert "责任模块：ACC 功能链" in rendered
-    assert "因果关系：目标状态与减速度请求不匹配" in rendered
+    assert rendered.splitlines()[0] == "建议责任方：纵向控制"
+    assert rendered.splitlines()[1] == MEDIUM_TIER_DISCLAIMER
+    assert "原始 mcap 已解码出函数级证据" in rendered
     assert "decoded" not in rendered
     assert "evaluator" not in rendered
 
@@ -544,14 +581,53 @@ def test_public_projection_humanizes_legacy_success_wrapped_terminal_result():
 
     rendered = render_public_rca_result(contract)
 
-    assert "本次旧任务未进入功能证据分析" in rendered
+    assert rendered.splitlines() == [
+        "本单未能定向",
+        MEDIUM_TIER_DISCLAIMER,
+        "未发现已知异常模式",
+        "本次没有判据命中，无法提供异常时间窗。",
+    ]
     assert "问题域" not in rendered
     assert "自动RCA未归因" not in rendered
     assert "已生成诊断报告" not in rendered
 
 
+def test_public_projection_keeps_out_of_scope_separate_from_abstention():
+    rendered = render_public_rca_result(
+        {
+            "upstream_dispatch": {
+                "hit_evaluator_keys": [],
+                "hit_window_envelope": None,
+                "hit_windows": [],
+                "owner_bucket": None,
+                "owner_bucket_label": None,
+                "reason": "out_of_scope",
+                "schema_version": "g1q3_upstream_dispatch_v2",
+                "terminal_classification": "out_of_scope",
+            },
+            "summary": {"short_conclusion": "内部 scope gate 已拒绝。"},
+        }
+    )
+
+    assert rendered.splitlines() == [
+        "本单不在自动分析范围",
+        MEDIUM_TIER_DISCLAIMER,
+    ]
+    assert "未发现已知异常模式" not in rendered
+
+
 def test_public_projection_prefers_specific_causal_evidence_and_four_lines():
     contract = {
+        "upstream_dispatch": {
+            "hit_evaluator_keys": ["acc_heavy_decel_spec"],
+            "hit_window_envelope": None,
+            "hit_windows": [],
+            "owner_bucket": "acc_longitudinal_control",
+            "owner_bucket_label": "纵向控制",
+            "reason": "single_owner_bucket_hit",
+            "schema_version": "g1q3_upstream_dispatch_v2",
+            "terminal_classification": "valid_dispatch",
+        },
         "summary": {
             "short_conclusion": "ACC 异常退出判据命中，建议核查 ACC 状态机/抑制标志。"
         },
@@ -576,13 +652,10 @@ def test_public_projection_prefers_specific_causal_evidence_and_four_lines():
     rendered = render_public_rca_result(contract)
 
     assert rendered.splitlines() == [
-        "归因结论：ACC 异常退出判据命中，建议核查 ACC 状态机/抑制标志。",
-        "责任模块：ACC 功能链",
-        (
-            "因果关系：异常退出：STM_ACC_Mode 4/7/8 -> 2/9/10，"
-            "因此ACC 异常退出判据命中，建议核查 ACC 状态机/抑制标志。"
-        ),
-        "关键证据：异常退出：STM_ACC_Mode 4/7/8 -> 2/9/10。",
+        "建议责任方：纵向控制",
+        MEDIUM_TIER_DISCLAIMER,
+        "依据：异常退出：STM_ACC_Mode 4/7/8 -> 2/9/10。",
+        "归因判断：ACC 异常退出判据命中，建议核查 ACC 状态机/抑制标志。",
     ]
 
 
@@ -649,18 +722,17 @@ def test_delivery_rejects_low_tier_blame_or_user_action_in_sealed_contract():
         "问题单缺少问题数据地址，不能自动归因，请补齐后重新发起。"
     )
 
-    with pytest.raises(DeliveryContractError) as raised:
-        verify_delivery_bundle(
-            admission=admission,
-            delivery_contract=contract,
-            delivery_manifest=manifest,
-            observed_files=observed,
-            html_dependencies=dependencies,
-        )
+    delivery = verify_delivery_bundle(
+        admission=admission,
+        delivery_contract=contract,
+        delivery_manifest=manifest,
+        observed_files=observed,
+        html_dependencies=dependencies,
+    )
 
-    assert raised.value.code == "classification_conflict"
-    assert "honest_non_attribution_user_action" in raised.value.detail
-    assert "honest_non_attribution_blame_wording" in raised.value.detail
+    assert delivery.conclusion.splitlines()[0] == "本单未能定向"
+    assert "请补齐" not in delivery.conclusion
+    assert "问题单缺少" not in delivery.effect_payload["comment_content"]
 
 
 def test_mdrive4_readiness_terminal_is_explicit_and_business_neutral():
@@ -684,15 +756,51 @@ def test_mdrive4_readiness_terminal_is_explicit_and_business_neutral():
     )
 
     assert terminal.diagnostic_code == "business_adapter_not_ready"
-    assert "已按官方字段路由到 mdrive4" in terminal.diagnostic_result
+    diagnostic_lines = terminal.diagnostic_result.splitlines()
+    assert diagnostic_lines[:2] == ["本单未能定向", MEDIUM_TIER_DISCLAIMER]
+    assert any(line.startswith("检查路径：") for line in diagnostic_lines)
+    assert any(line.startswith("数据来源：") for line in diagnostic_lines)
+    assert any(line.startswith("检查结果：") for line in diagnostic_lines)
+    assert "不能跨项目借用其他归因能力" in terminal.diagnostic_result
+    assert "mdrive4" not in terminal.diagnostic_result
     assert "mdrive4_recorder_mcap_reference_v1" not in terminal.diagnostic_result
     assert "ct_evaluator_217_20260722" not in terminal.diagnostic_result
     assert "rca/mdrive4" not in terminal.diagnostic_result
-    assert "不能跨项目借用其他归因能力" in terminal.diagnostic_result
     assert terminal.contract["diagnostic_detail"].startswith(
         "已按官方字段路由到 mdrive4"
     )
-    assert "【RCA 结果】" in terminal.effect_payload["comment_content"]
+    assert terminal.effect_payload["comment_content"].splitlines()[0] == (
+        "本单未能定向"
+    )
+
+
+def test_out_of_scope_terminal_uses_distinct_public_copy_and_rerun_prompt():
+    admission = _admission()
+    terminal = build_terminal_delivery(
+        business_key=admission.business_key,
+        submission_key=admission.submission_key,
+        generation=admission.generation,
+        project_key=admission.source_refs.project_key,
+        work_item_type_key=admission.source_refs.work_item_type_key,
+        work_item_id=admission.source_refs.work_item_id,
+        outcome="quarantined",
+        terminal_state="out_of_scope",
+        error_code="out_of_scope",
+        source_error_code="out_of_scope",
+    )
+
+    assert terminal.diagnostic_code == "out_of_scope"
+    diagnostic_lines = terminal.diagnostic_result.splitlines()
+    assert diagnostic_lines[:2] == [
+        "本单不在自动分析范围",
+        MEDIUM_TIER_DISCLAIMER,
+    ]
+    assert any(line.startswith("检查路径：") for line in diagnostic_lines)
+    assert any(line.startswith("数据来源：") for line in diagnostic_lines)
+    assert any(line.startswith("检查结果：") for line in diagnostic_lines)
+    assert terminal.effect_payload["comment_content"].splitlines()[-1] == (
+        RERUN_PROMPT_LINE
+    )
     assert "G1Q3 RCA 机器人终态" not in terminal.effect_payload["comment_content"]
 
 
@@ -740,12 +848,12 @@ def test_valid_sealed_evidence_and_published_viz_build_issue_effect():
             "field_value": delivery.report_url,
         },
     ]
-    assert delivery.effect_payload["report_link_kind"] == "html_report"
+    assert delivery.effect_payload["report_link_kind"] == "foxglove_viz"
     assert delivery.effect_payload["project_key"] == "t03o4q"
     assert delivery.effect_payload["project_simple_name"] == "g1q3"
     assert delivery.target_key == "feishu_project:t03o4q:issue:7041712812"
-    assert delivery.report_url == delivery.manifest["report_url"]
-    assert delivery.report_url != delivery.foxglove_url
+    assert delivery.report_url == delivery.foxglove_url
+    assert delivery.report_url != delivery.manifest["report_url"]
     assert delivery.effect_payload["report_cifs_path"] == canonical_viz_mcap_cifs_path(
         delivery.submission_key
     )
@@ -755,11 +863,47 @@ def test_valid_sealed_evidence_and_published_viz_build_issue_effect():
     )
     assert delivery.viz_mcap_vm == canonical_viz_mcap_path(delivery.submission_key)
     assert delivery.foxglove_url == foxglove_url(delivery.viz_mcap_vm)
-    assert delivery.report_url in delivery.effect_payload["comment_content"]
-    assert delivery.foxglove_url not in delivery.effect_payload["comment_content"]
+    assert delivery.foxglove_url in delivery.effect_payload["comment_content"]
+    assert delivery.manifest["report_url"] not in delivery.effect_payload["comment_content"]
     assert delivery.issue_url == (
         "https://project.feishu.cn/g1q3/issue/detail/7041712812"
     )
+
+
+def test_manifest_html_kind_is_rejected_even_when_internal_html_is_valid():
+    admission, contract, manifest, observed, dependencies = _bundle()
+    manifest["deliverable_kind"] = "html"
+
+    with pytest.raises(DeliveryContractError) as exc:
+        _verify((admission, contract, manifest, observed, dependencies))
+
+    assert exc.value.code == "delivery_kind_unsupported"
+
+
+@pytest.mark.parametrize(
+    "invalid_url",
+    [
+        "https://viewer.internal/G1Q3_RCA/cases/demo/index.html",
+        "https://192.168.21.217/?ds=foxglove-http&ds.mcapPath=/mnt/tmp/demo/demo.viz.mcap",
+        (
+            "https://192.168.21.217/?ds=foxglove-http&ds.mcapPath="
+            f"{canonical_viz_mcap_path(FORMAL_SUBMISSION_KEY)}&extra=1"
+        ),
+    ],
+)
+def test_public_comment_rejects_noncanonical_foxglove_url(invalid_url):
+    with pytest.raises(DeliveryContractError) as exc:
+        delivery_contract_module.build_issue_comment_content(
+            marker="[RCA_DELIVERY:test:0123456789ab]",
+            work_item_id="7041712812",
+            report_status="report_ready",
+            conclusion="本单未能定向\n仅供参考，待确认",
+            report_url=invalid_url,
+            foxglove_url=invalid_url,
+            report_cifs_path="",
+        )
+
+    assert exc.value.code == "foxglove_url_invalid"
 
 
 @pytest.mark.parametrize("project_simple_name", ["", "../wrong"])
@@ -786,7 +930,7 @@ def test_success_delivery_requires_a_canonical_project_slug(project_simple_name)
     assert exc.value.code == expected
 
 
-def test_html_bundle_without_published_viz_is_deliverable_without_viz_surface():
+def test_html_bundle_without_published_viz_is_not_publicly_deliverable():
     admission, contract, manifest, observed, dependencies = _bundle()
     publication = contract["artifacts"].pop("viz_publication")
     contract["artifacts"].pop("viz_mcap_vm")
@@ -798,11 +942,26 @@ def test_html_bundle_without_published_viz_is_deliverable_without_viz_surface():
         if item["path"] not in {publication["path"], publication["manifest_path"]}
     ]
 
-    delivery = _verify((admission, contract, manifest, observed, dependencies))
+    with pytest.raises(DeliveryContractError) as exc:
+        _verify((admission, contract, manifest, observed, dependencies))
 
-    assert delivery.viz_mcap_vm == ""
-    assert delivery.foxglove_url == ""
-    assert delivery.effect_payload["report_cifs_path"] == manifest["report_cifs_path"]
+    assert exc.value.code == "delivery_kind_unsupported"
+
+
+def test_foxglove_public_delivery_requires_published_viz_artifact():
+    admission, contract, manifest, observed, dependencies = _bundle()
+    publication = contract["artifacts"].pop("viz_publication")
+    contract["artifacts"].pop("viz_mcap_vm")
+    observed = [
+        item
+        for item in observed
+        if item["path"] not in {publication["path"], publication["manifest_path"]}
+    ]
+
+    with pytest.raises(DeliveryContractError) as exc:
+        _verify((admission, contract, manifest, observed, dependencies))
+
+    assert exc.value.code == "viz_publication_missing"
 
 
 def test_case_local_viz_cannot_replace_formal_published_viz():
@@ -876,9 +1035,9 @@ def test_thread_reply_effect_is_bound_to_exact_topic_and_is_deterministic():
     assert payload["thread_id"] == "topic:om_root123"
     assert payload["idempotency_uuid"]
     assert payload["marker"] in payload["message_content"]
-    assert delivery.report_url in payload["message_content"]
-    assert delivery.foxglove_url not in payload["message_content"]
-    assert delivery.report_url != delivery.foxglove_url
+    assert delivery.foxglove_url in payload["message_content"]
+    assert delivery.manifest["report_url"] not in payload["message_content"]
+    assert delivery.report_url == delivery.foxglove_url
     assert delivery.issue_url in payload["message_content"]
     assert (
         '<at user_id="ou_requester789"></at>'
@@ -1085,10 +1244,11 @@ def test_large_conclusion_is_utf8_bounded_while_report_links_are_preserved():
 
     content = delivery.effect_payload["comment_content"]
     assert len(content.encode("utf-8")) <= MAX_FEISHU_COMMENT_BYTES
-    assert delivery.foxglove_url not in content
-    assert manifest["report_url"] in content
-    assert delivery.conclusion.splitlines()[0].endswith(MEDIUM_TIER_DISCLAIMER)
-    assert delivery.conclusion.endswith("...")
+    assert delivery.foxglove_url in content
+    assert manifest["report_url"] not in content
+    assert delivery.conclusion.splitlines()[0] == "建议责任方：纵向控制"
+    assert delivery.conclusion.splitlines()[1] == MEDIUM_TIER_DISCLAIMER
+    assert any(line.endswith("...") for line in delivery.conclusion.splitlines())
     assert {item.role for item in delivery.artifacts} == {
         "index_html",
         "report_data",
@@ -1287,7 +1447,9 @@ def test_report_url_accepts_the_exact_verified_internal_service(monkeypatch):
         f"http://192.168.26.174:18081/G1Q3_RCA/cases/"
         f"{bundle[2]['submission_key']}/{bundle[2]['artifact_set_id']}/index.html"
     )
-    assert _verify(tuple(bundle)).report_url == bundle[2]["report_url"]
+    delivery = _verify(tuple(bundle))
+    assert delivery.report_url == delivery.foxglove_url
+    assert delivery.report_url != bundle[2]["report_url"]
 
 
 @pytest.mark.parametrize(
@@ -1405,7 +1567,11 @@ def test_terminal_v2_writes_only_honest_result_without_fake_report_url():
         TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION
     )
     assert delivery.diagnostic_code == "analysis_failed"
-    assert "本次未生成可确认的自动归因" in delivery.diagnostic_result
+    diagnostic_lines = delivery.diagnostic_result.splitlines()
+    assert diagnostic_lines[:2] == ["本单未能定向", MEDIUM_TIER_DISCLAIMER]
+    assert any(line.startswith("检查路径：") for line in diagnostic_lines)
+    assert any(line.startswith("数据来源：") for line in diagnostic_lines)
+    assert any(line.startswith("检查结果：") for line in diagnostic_lines)
     assert "第 1 代" not in delivery.diagnostic_result
     assert "可能保留自其他代次" not in delivery.diagnostic_result
     assert delivery.effect_payload["field_updates"] == [
@@ -1425,7 +1591,9 @@ def test_terminal_v2_writes_only_honest_result_without_fake_report_url():
         "preserved_report_semantics": "other_generation_not_current",
     }
     assert "field_8c912e" not in json.dumps(delivery.effect_payload, ensure_ascii=False)
-    assert "本次未生成可确认的自动归因" in delivery.effect_payload["comment_content"]
+    assert delivery.effect_payload["comment_content"].splitlines()[-1] == (
+        RERUN_PROMPT_LINE
+    )
     assert "本终态不改写" not in delivery.effect_payload["comment_content"]
     assert "不代表第 1 代结论" not in delivery.effect_payload["comment_content"]
 

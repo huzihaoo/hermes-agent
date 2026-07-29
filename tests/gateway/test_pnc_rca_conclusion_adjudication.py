@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -463,6 +464,26 @@ def test_retract_is_atomic_idempotent_budgeted_and_has_impact_lineage(tmp_path):
     ):
         _record_retraction(store, reason="第二条更正不得进入队列")
     assert len(store.list_rows("rca_delivery_effects")) == 2
+
+
+def test_concurrent_retraction_reserves_exactly_one_correction_slot(tmp_path):
+    store = _seed_published_conclusion(tmp_path)
+
+    def record_once(_index: int):
+        return _record_retraction(RcaDeliveryStore(store.db_path))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(record_once, range(2)))
+
+    assert sorted(result.created for result in results) == [False, True]
+    assert len({result.correction_effect_key for result in results}) == 1
+    effects = store.list_rows("rca_delivery_effects")
+    correction = [
+        row for row in effects if row["effect_key"] != ORIGINAL_EFFECT_KEY
+    ]
+    assert len(correction) == 1
+    assert correction[0]["comment_slot_kind"] == "correction"
+    assert correction[0]["comment_slot_generation"] == 7
 
 
 def test_invalid_retraction_fails_before_queue_mutation(tmp_path):
@@ -1249,7 +1270,7 @@ def test_v7_migrates_to_combined_w2_w16_v9_schema(tmp_path):
     } <= repair_columns
 
 
-def test_w2_v8_migrates_explicitly_to_combined_v9_schema(tmp_path):
+def test_w2_v8_migrates_explicitly_to_combined_v10_schema(tmp_path):
     path = tmp_path / "w2-v8-control.sqlite3"
     RcaDeliveryStore(path)
     with sqlite3.connect(path) as conn:
@@ -1283,7 +1304,7 @@ def test_w2_v8_migrates_explicitly_to_combined_v9_schema(tmp_path):
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'rca_conclusion_adjudication_repairs'"
         ).fetchone()
-    assert marker == "pnc_rca_delivery_store_v9"
+    assert marker == "pnc_rca_delivery_store_v10"
     assert failure_routes is not None
     assert repairs is not None
 

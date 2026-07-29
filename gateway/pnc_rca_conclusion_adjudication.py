@@ -18,6 +18,7 @@ from gateway.pnc_rca_delivery_contract import (
     DELIVERY_EFFECT_KIND,
     MAX_FEISHU_COMMENT_BYTES,
     RCA_RESULT_FIELD_KEY,
+    RERUN_PROMPT_LINE,
     compute_delivery_effect_key,
     delivery_effect_marker,
 )
@@ -691,6 +692,7 @@ def _adjudication_content(
             f"问题：{work_item_id}",
             "原结论不可作为定责依据；后续以重新复核后的结论为准。",
             "更正依据已保留在内部不可变审计记录中。",
+            RERUN_PROMPT_LINE,
         ]
     elif action == "recognize":
         field_value = replacement_conclusion
@@ -700,6 +702,7 @@ def _adjudication_content(
             f"问题：{work_item_id}",
             "已确认结论以本问题单上一条自动 RCA 候选评论为准。",
             "确认依据已保留在内部不可变审计记录中。",
+            RERUN_PROMPT_LINE,
         ]
     else:
         raise ConclusionAdjudicationError(
@@ -1155,7 +1158,7 @@ def record_conclusion_adjudication_tx(
     # the adjudication row and effect insert.
     from gateway.pnc_rca_delivery_store import RcaDeliveryStore
 
-    RcaDeliveryStore.enforce_issue_comment_budget_tx(
+    comment_slot = RcaDeliveryStore.enforce_issue_comment_budget_tx(
         conn,
         delivery_id=str(row["delivery_id"]),
         business_key=str(row["business_key"]),
@@ -1167,9 +1170,12 @@ def record_conclusion_adjudication_tx(
         """
         INSERT INTO rca_delivery_effects(
             effect_key, delivery_id, effect_kind, required, target_key,
-            payload_json, payload_sha256, outcome, status, created_at, updated_at
+            payload_json, payload_sha256, outcome,
+            comment_slot_schema_version, comment_slot_key, comment_slot_kind,
+            comment_slot_generation, comment_slot_revision,
+            comment_slot_budget_exempt, status, created_at, updated_at
         ) VALUES (?, ?, 'feishu_issue_comment', 1, ?, ?, ?, 'success',
-                  'pending', ?, ?)
+                  ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
         """,
         (
             effect_key,
@@ -1177,6 +1183,12 @@ def record_conclusion_adjudication_tx(
             payload["target_key"],
             _canonical_json(payload),
             payload_sha256,
+            comment_slot["comment_slot_schema_version"],
+            comment_slot["comment_slot_key"],
+            comment_slot["comment_slot_kind"],
+            comment_slot["comment_slot_generation"],
+            comment_slot["comment_slot_revision"],
+            comment_slot["comment_slot_budget_exempt"],
             current,
             current,
         ),

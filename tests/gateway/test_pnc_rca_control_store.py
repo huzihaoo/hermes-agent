@@ -197,6 +197,14 @@ def _manual_request(
     )
 
 
+def _group_user_rerun_authority(work_item_id: str = "7041712812"):
+    return {
+        "schema_version": "pnc_rca_group_user_rerun_v1",
+        "command_text": f"重新分析 {work_item_id}",
+        "work_item_id": work_item_id,
+    }
+
+
 def _operator_request(
     message_id: str,
     *,
@@ -304,6 +312,145 @@ def test_operator_rerun_requires_authorization_and_can_create_issue_only(tmp_pat
     assert [row["effect_kind"] for row in subscriptions] == [
         "feishu_issue_comment"
     ]
+
+
+def test_group_user_rerun_creates_next_generation_and_dedupes_for_ten_minutes(
+    tmp_path,
+):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    _register_policy_without_classifying(store)
+    started = datetime(2026, 7, 28, 10, 0, tzinfo=timezone.utc)
+    first = store.admit_manual_trigger(
+        _manual_request("om_user_rerun_seed"),
+        allowed_chat_ids={"oc_allowed"},
+        submit_enabled=True,
+        now=started - timedelta(seconds=1),
+    )
+    _terminalize_permanent(store, first.submission_key)
+
+    rerun = store.admit_manual_trigger(
+        _manual_request(
+            "om_user_rerun_1",
+            mode="rerun",
+            thread_id="topic:om_user_rerun_1",
+            requester_id="ou_" + "1" * 32,
+        ),
+        allowed_chat_ids={"oc_allowed"},
+        submit_enabled=True,
+        user_rerun_authority=_group_user_rerun_authority(),
+        now=started,
+    )
+    counts_after_first = {
+        table: len(store.list_rows(table))
+        for table in (
+            "business_triggers",
+            "rca_outbox",
+            "rca_trigger_sources",
+            "rca_delivery_subscriptions",
+        )
+    }
+    duplicate = store.admit_manual_trigger(
+        _manual_request(
+            "om_user_rerun_duplicate",
+            mode="rerun",
+            thread_id="topic:om_user_rerun_duplicate",
+            requester_id="ou_" + "1" * 32,
+        ),
+        allowed_chat_ids={"oc_allowed"},
+        submit_enabled=True,
+        user_rerun_authority=_group_user_rerun_authority(),
+        now=started + timedelta(seconds=599),
+    )
+
+    assert rerun.outcome == "created"
+    assert rerun.generation == 2
+    assert duplicate.outcome == "deduped"
+    assert duplicate.generation == rerun.generation
+    assert duplicate.source_id == rerun.source_id
+    assert {
+        table: len(store.list_rows(table))
+        for table in counts_after_first
+    } == counts_after_first
+    assert not [
+        row
+        for row in store.list_rows("rca_learning_lane_admissions")
+        if row["business_key"] == rerun.business_key
+        and row["generation"] == rerun.generation
+    ]
+
+    _terminalize_permanent(store, rerun.submission_key)
+    after_window = store.admit_manual_trigger(
+        _manual_request(
+            "om_user_rerun_after_window",
+            mode="rerun",
+            thread_id="topic:om_user_rerun_after_window",
+            requester_id="ou_" + "1" * 32,
+        ),
+        allowed_chat_ids={"oc_allowed"},
+        submit_enabled=True,
+        user_rerun_authority=_group_user_rerun_authority(),
+        now=started + timedelta(seconds=601),
+    )
+
+    assert after_window.outcome == "created"
+    assert after_window.generation == 3
+
+
+@pytest.mark.parametrize(
+    "authority",
+    [
+        _group_user_rerun_authority("7041712813"),
+        {
+            **_group_user_rerun_authority(),
+            "command_text": "重新分析  7041712812",
+        },
+        {
+            **_group_user_rerun_authority(),
+            "schema_version": "pnc_rca_group_user_rerun_v0",
+        },
+    ],
+)
+def test_group_user_rerun_invalid_authority_is_non_mutating(tmp_path, authority):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    before = len(store.list_rows("rca_trigger_sources"))
+
+    with pytest.raises(
+        ManualRcaAdmissionError,
+        match="group_user_rerun_authority_(invalid|mismatch)",
+    ):
+        store.admit_manual_trigger(
+            _manual_request(
+                "om_invalid_user_rerun",
+                mode="rerun",
+                requester_id="ou_" + "1" * 32,
+            ),
+            allowed_chat_ids={"oc_allowed"},
+            submit_enabled=True,
+            user_rerun_authority=authority,
+        )
+
+    assert len(store.list_rows("rca_trigger_sources")) == before
+
+
+def test_group_user_rerun_requires_human_feishu_identity(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+
+    with pytest.raises(
+        ManualRcaAdmissionError,
+        match="manual_feishu_requester_identity_invalid",
+    ):
+        store.admit_manual_trigger(
+            _manual_request(
+                "om_machine_user_rerun",
+                mode="rerun",
+                requester_id="automation:gray-sample",
+            ),
+            allowed_chat_ids={"oc_allowed"},
+            submit_enabled=True,
+            user_rerun_authority=_group_user_rerun_authority(),
+        )
+
+    assert store.list_rows("rca_trigger_sources") == []
 
 
 def _create_activation_epoch(
@@ -1508,6 +1655,60 @@ def test_bounded_manual_slots_auto_resolve_two_canaries_without_restart(tmp_path
         and row["activation_ledger_id"] is not None
         for row in outboxes
     )
+
+
+def test_manual_external_write_authority_is_exact_and_revocation_sensitive(
+    tmp_path,
+):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    issue_url = "https://project.feishu.cn/g1q3/issue/detail/7041712814"
+    _begin_bounded_activation(store)
+    admitted = store.admit_manual_trigger(
+        _manual_request("om_manual_success", issue_url=issue_url),
+        allowed_chat_ids={"oc_allowed"},
+        submit_enabled=True,
+        active_policy=_policy(),
+        activation_required=True,
+    )
+
+    authority = store.validate_manual_external_write_admission(
+        admitted.to_dict(),
+        expected_chat_id="oc_allowed",
+        expected_thread_id="topic:om_root",
+        expected_message_id="om_manual_success",
+        expected_requester_id="ou_operator",
+    )
+
+    assert authority["epoch_id"] == "rca-release-20260712"
+    assert authority["state"] == "bounded_active"
+    assert authority["decision"] == "admit"
+    assert authority["business_key"] == admitted.business_key
+    assert authority["submission_key"] == admitted.submission_key
+    assert authority["generation"] == admitted.generation
+    with pytest.raises(RecordConflictError, match="source_identity_mismatch"):
+        store.validate_manual_external_write_admission(
+            admitted.to_dict(),
+            expected_chat_id="oc_other",
+            expected_thread_id="topic:om_root",
+            expected_message_id="om_manual_success",
+            expected_requester_id="ou_operator",
+        )
+
+    store.transition_activation_epoch(
+        epoch_id="rca-release-20260712",
+        expected_state="bounded_active",
+        target_state="aborted",
+        operator="release-test",
+        reason="inject provider-bound revocation",
+    )
+    with pytest.raises(RecordConflictError, match="activation_epoch_not_current"):
+        store.validate_manual_external_write_admission(
+            admitted.to_dict(),
+            expected_chat_id="oc_allowed",
+            expected_thread_id="topic:om_root",
+            expected_message_id="om_manual_success",
+            expected_requester_id="ou_operator",
+        )
 
 
 def test_bounded_manual_auto_slot_rejects_ambiguous_exact_identity(tmp_path):
@@ -4493,6 +4694,183 @@ def test_retry_outbox_and_open_circuit_rolls_back_together(
     assert row["status"] == "claimed"
     assert row["lease_token"] == claim.lease_token
     assert store.dispatcher_circuit().is_open is False
+
+
+def _circuit_dict(circuit):
+    return {
+        "state": circuit.state,
+        "reason_code": circuit.reason_code,
+        "reason_detail": circuit.reason_detail,
+        "opened_at": circuit.opened_at,
+        "updated_at": circuit.updated_at,
+    }
+
+
+def _audited_reset(*, db_path, reset_id, before, after, operator, reason, recorded_at):
+    info = db_path.stat()
+    audit = {
+        "schema_version": "pnc_rca_outbox_circuit_reset_v1",
+        "command": "clear-circuit",
+        "reset_id": reset_id,
+        "recorded_at": recorded_at,
+        "operator": operator,
+        "reason": reason,
+        "control_db_identity": {
+            "path": str(db_path.absolute()),
+            "device": int(info.st_dev),
+            "inode": int(info.st_ino),
+            "size": int(info.st_size),
+            "mtime_ns": int(info.st_mtime_ns),
+        },
+        "config_binding_sha256": "1" * 64,
+        "before": _circuit_dict(before),
+        "after": after,
+        "pre_state": _circuit_dict(before),
+        "post_state": after,
+        "effect_delta": {
+            "external_writes": 0,
+            "scope": "submission_circuit_reset_command",
+        },
+    }
+    audit["receipt_fingerprint"] = canonical_json_sha256(audit)
+    return audit
+
+
+def test_close_dispatcher_circuit_with_audit_commits_receipt_atomically(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    opened_at = datetime(2026, 7, 29, 3, 0, tzinfo=timezone.utc)
+    reset_at = datetime(2026, 7, 29, 3, 1, tzinfo=timezone.utc)
+    store.open_dispatcher_circuit(
+        reason_code="snapshot_stale",
+        reason_detail="snapshot exceeded ttl",
+        now=opened_at,
+    )
+    before = store.dispatcher_circuit()
+    after = {
+        "state": "closed",
+        "reason_code": "",
+        "reason_detail": "",
+        "opened_at": None,
+        "updated_at": reset_at.isoformat(),
+    }
+    audit = _audited_reset(
+        db_path=tmp_path / "control.sqlite3",
+        reset_id="reset-test-1",
+        before=before,
+        after=after,
+        operator="owner@example.com",
+        reason="verified snapshot freshness offline",
+        recorded_at=reset_at.isoformat(),
+    )
+
+    observed_before, observed_after = store.close_dispatcher_circuit_with_audit(
+        audit=audit, now=reset_at
+    )
+
+    assert observed_before == before
+    assert _circuit_dict(observed_after) == after
+    assert store.dispatcher_circuit_reset_audit("reset-test-1") == audit
+
+
+def test_close_dispatcher_circuit_with_audit_rejects_duplicate_without_mutation(
+    tmp_path,
+):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    opened_at = datetime(2026, 7, 29, 3, 0, tzinfo=timezone.utc)
+    reset_at = datetime(2026, 7, 29, 3, 1, tzinfo=timezone.utc)
+    store.open_dispatcher_circuit(reason_code="stale", now=opened_at)
+    before = store.dispatcher_circuit()
+    audit = _audited_reset(
+        db_path=tmp_path / "control.sqlite3",
+        reset_id="reset-test-duplicate",
+        before=before,
+        after={
+            "state": "closed",
+            "reason_code": "",
+            "reason_detail": "",
+            "opened_at": None,
+            "updated_at": reset_at.isoformat(),
+        },
+        operator="operator",
+        reason="reason",
+        recorded_at=reset_at.isoformat(),
+    )
+    store.close_dispatcher_circuit_with_audit(audit=audit, now=reset_at)
+    with pytest.raises(RuntimeError, match="requires_open_circuit|state_changed"):
+        store.close_dispatcher_circuit_with_audit(audit=audit, now=reset_at)
+    assert store.dispatcher_circuit().state == "closed"
+
+
+def test_close_dispatcher_circuit_with_audit_rejects_extra_state_field(
+    tmp_path,
+):
+    db_path = tmp_path / "control.sqlite3"
+    store = RcaControlStore(db_path)
+    reset_at = datetime(2026, 7, 29, 3, 1, tzinfo=timezone.utc)
+    store.open_dispatcher_circuit(reason_code="stale")
+    before = store.dispatcher_circuit()
+    after = {
+        "state": "closed",
+        "reason_code": "",
+        "reason_detail": "",
+        "opened_at": None,
+        "updated_at": reset_at.isoformat(),
+    }
+    audit = _audited_reset(
+        db_path=db_path,
+        reset_id="reset-extra-field",
+        before=before,
+        after=after,
+        operator="operator",
+        reason="reason",
+        recorded_at=reset_at.isoformat(),
+    )
+    audit["before"]["unexpected"] = True
+    audit["pre_state"]["unexpected"] = True
+    audit["receipt_fingerprint"] = canonical_json_sha256(
+        {key: value for key, value in audit.items() if key != "receipt_fingerprint"}
+    )
+
+    with pytest.raises(ValueError, match="audit_state_invalid"):
+        store.close_dispatcher_circuit_with_audit(audit=audit, now=reset_at)
+    assert store.dispatcher_circuit().state == "open"
+
+
+def test_dispatcher_circuit_reset_audit_detects_direct_sql_tampering(tmp_path):
+    db_path = tmp_path / "control.sqlite3"
+    store = RcaControlStore(db_path)
+    reset_at = datetime(2026, 7, 29, 3, 1, tzinfo=timezone.utc)
+    store.open_dispatcher_circuit(reason_code="stale")
+    before = store.dispatcher_circuit()
+    audit = _audited_reset(
+        db_path=db_path,
+        reset_id="reset-tamper-test",
+        before=before,
+        after={
+            "state": "closed",
+            "reason_code": "",
+            "reason_detail": "",
+            "opened_at": None,
+            "updated_at": reset_at.isoformat(),
+        },
+        operator="operator",
+        reason="reason",
+        recorded_at=reset_at.isoformat(),
+    )
+    store.close_dispatcher_circuit_with_audit(audit=audit, now=reset_at)
+    tampered = dict(audit)
+    tampered["reason"] = "changed after commit"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE control_meta SET value = ? WHERE key = ?",
+            (
+                json.dumps(tampered, sort_keys=True, separators=(",", ":")),
+                "rca_dispatcher_circuit_reset:reset-tamper-test",
+            ),
+        )
+
+    with pytest.raises(RuntimeError, match="audit_invalid"):
+        store.dispatcher_circuit_reset_audit("reset-tamper-test")
 
 
 def test_crash_after_raw_commit_is_recovered_from_pending_on_restart(tmp_path):

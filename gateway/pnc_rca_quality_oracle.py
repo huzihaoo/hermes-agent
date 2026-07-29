@@ -32,7 +32,7 @@ TERMINAL_CLASSES = frozenset({
     CONSUMER_DELIVERY_FAILURE,
 })
 
-MEDIUM_TIER_DISCLAIMER = "候选结论，待人工确认，不可作为定责依据"
+MEDIUM_TIER_DISCLAIMER = "仅供参考，待确认"
 BANNED_PUBLIC_PHRASES = ("请核对问题数据地址",)
 GOLDEN_REGISTRY_SCHEMA_VERSION = "pnc_rca_release_golden_registry_v1"
 EVALUATOR_VALIDATION_SCHEMA_VERSION = "g1q3_rca_evaluator_validation_dimensions_v1"
@@ -56,6 +56,32 @@ _GIT_OID_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _EVALUATOR_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$")
 _FLAT_EVALUATOR_KEY_RE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
 _EVALUATOR_DOMAIN_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,63}$")
+_UPSTREAM_DISPATCH_SCHEMA_VERSION = "g1q3_upstream_dispatch_v2"
+_UPSTREAM_DISPATCH_FIELDS = frozenset({
+    "hit_evaluator_keys",
+    "hit_window_envelope",
+    "hit_windows",
+    "owner_bucket",
+    "owner_bucket_label",
+    "reason",
+    "schema_version",
+    "terminal_classification",
+})
+_UPSTREAM_OWNER_BUCKET_LABELS = {
+    "acc_longitudinal_control": "纵向控制",
+    "aeb": "AEB",
+    "fctb_fcw": "AEB_FCW",
+    "hmi_sr": "HMI_SR",
+    "lane_perception": "车道线感知",
+    "lcc_lateral_control": "横向控制",
+    "ooi_spp": "目标选择 / SPP",
+    "tsr": "TSR",
+    "vision_perception": "视觉感知",
+}
+_UPSTREAM_DISPATCH_ABSTAIN_REASONS = frozenset({
+    "abstain_no_hit",
+    "abstain_cross_domain",
+})
 _GOLDEN_HASH_FIELDS = (
     "evaluator_source_sha256",
     "positive_golden_sha256",
@@ -1545,6 +1571,65 @@ def _contract_approval_ready(contract: Mapping[str, Any]) -> bool:
     return False
 
 
+def _upstream_dispatch_state(contract: Mapping[str, Any]) -> str:
+    """Return the sealed W1b publication state without inferring a direction.
+
+    A missing W1b result is a legacy report and therefore cannot produce a
+    direction.  Malformed W1b material is kept separate so the oracle can fail
+    closed instead of silently treating it as an ordinary abstention.
+    """
+
+    raw = contract.get("upstream_dispatch")
+    if raw is None:
+        return "legacy"
+    if not isinstance(raw, Mapping) or set(raw) != _UPSTREAM_DISPATCH_FIELDS:
+        return "invalid"
+    if raw.get("schema_version") != _UPSTREAM_DISPATCH_SCHEMA_VERSION:
+        return "invalid"
+    terminal = _text(raw.get("terminal_classification"))
+    reason = _text(raw.get("reason"))
+    owner_bucket = raw.get("owner_bucket")
+    owner_bucket_label = raw.get("owner_bucket_label")
+    keys = raw.get("hit_evaluator_keys")
+    windows = raw.get("hit_windows")
+    if (
+        not isinstance(keys, list)
+        or not isinstance(windows, list)
+        or any(not _FLAT_EVALUATOR_KEY_RE.fullmatch(_text(key)) for key in keys)
+        or keys != sorted(set(keys))
+    ):
+        return "invalid"
+    if terminal == "out_of_scope":
+        if (
+            reason != "out_of_scope"
+            or owner_bucket is not None
+            or owner_bucket_label is not None
+            or keys
+            or windows
+        ):
+            return "invalid"
+        return "out_of_scope"
+    if terminal == "valid_dispatch":
+        if (
+            reason != "single_owner_bucket_hit"
+            or owner_bucket not in _UPSTREAM_OWNER_BUCKET_LABELS
+            or owner_bucket_label
+            != _UPSTREAM_OWNER_BUCKET_LABELS.get(owner_bucket)
+            or not keys
+        ):
+            return "invalid"
+        return "valid_dispatch"
+    if terminal != "abstain" or reason not in _UPSTREAM_DISPATCH_ABSTAIN_REASONS:
+        return "invalid"
+    if owner_bucket is not None or owner_bucket_label is not None:
+        return "invalid"
+    if reason == "abstain_no_hit" and keys:
+        return "invalid"
+    if reason == "abstain_cross_domain" and not keys:
+        return "invalid"
+    return "abstain"
+
+
 def evaluate_structural_tier(
     contract: Mapping[str, Any] | None,
     *,
@@ -1560,10 +1645,24 @@ def evaluate_structural_tier(
     """Recompute one of five terminal classes from production structure."""
 
     material = contract if isinstance(contract, Mapping) else {}
+    upstream_dispatch_state = _upstream_dispatch_state(material)
     public_parts = _public_parts(material)
     combined_public = "\n".join(public_parts)
     rendered = _text(publication_text)
-    classification_text = f"{combined_public}\n{rendered}"
+    dispatch_abstains = upstream_dispatch_state in {"abstain", "out_of_scope"}
+    classification_text = (
+        rendered
+        if dispatch_abstains and rendered
+        else (
+            (
+                "本单不在自动分析范围\n仅供参考，待确认"
+                if upstream_dispatch_state == "out_of_scope"
+                else "本单未能定向\n仅供参考，待确认\n未发现已知异常模式"
+            )
+            if dispatch_abstains
+            else f"{combined_public}\n{rendered}"
+        )
+    )
     conclusion = _conclusion(material)
     lowered_public = classification_text.lower()
     explicit_non_attribution = any(
@@ -1594,6 +1693,18 @@ def evaluate_structural_tier(
     evidence = _structural_evidence(material, refs)
     roles, causal_closed = _causal_roles(material)
     responsibility = _responsibility(material)
+    if dispatch_abstains:
+        # W1b is the sole source of the outward direction.  Internal report
+        # candidates remain available in the sealed report but cannot leak
+        # through the low-tier publication checks.
+        conclusion = (
+            "本单不在自动分析范围"
+            if upstream_dispatch_state == "out_of_scope"
+            else "本单未能定向"
+        )
+        explicit_non_attribution = True
+        candidate_wording = False
+        responsibility = ""
 
     normalized_consumer_status = _text(consumer_delivery_status).lower()
     normalized_outcome = _text(execution_outcome).lower()
@@ -1638,6 +1749,8 @@ def evaluate_structural_tier(
     violations: list[str] = []
     if inventory_present and not inventory_valid:
         violations.append("actual_evaluator_inventory_invalid")
+    if upstream_dispatch_state == "invalid":
+        violations.append("upstream_dispatch_contract_invalid")
     for phrase in BANNED_PUBLIC_PHRASES:
         if phrase in combined_public or phrase in _text(publication_text):
             violations.append(f"banned_public_phrase:{phrase}")
@@ -1682,7 +1795,7 @@ def evaluate_structural_tier(
     if terminal_class == HONEST_NON_ATTRIBUTION:
         if responsibility:
             violations.append("honest_non_attribution_responsibility_present")
-        if any(marker in classification_text for marker in _CANDIDATE_MARKERS):
+        if candidate_wording:
             violations.append("honest_non_attribution_candidate_wording")
         if _LOW_TIER_USER_ACTION_RE.search(classification_text):
             violations.append("honest_non_attribution_user_action")
@@ -1753,8 +1866,13 @@ def public_tier_from_rendered_text(value: Any) -> str:
     """Recover the tier from an oracle-rendered field for deterministic replay."""
 
     text = _text(value)
+    if (
+        "本单未能定向" in text
+        or "本单不在自动分析范围" in text
+        or "责任模块：暂无法判断" in text
+        or "未形成可确认的归因结论" in text
+    ):
+        return HONEST_NON_ATTRIBUTION
     if MEDIUM_TIER_DISCLAIMER in text:
         return CANDIDATE_HYPOTHESIS
-    if "责任模块：暂无法判断" in text or "未形成可确认的归因结论" in text:
-        return HONEST_NON_ATTRIBUTION
     return SUPPORTED_ATTRIBUTION

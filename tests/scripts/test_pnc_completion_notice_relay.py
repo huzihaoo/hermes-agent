@@ -1,8 +1,10 @@
+import asyncio
 import json
 import os
 import plistlib
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -45,6 +47,29 @@ def _set_record_only_env(tmp_path: Path, monkeypatch):
     return records
 
 
+def _install_unit_test_active_relay_fence(monkeypatch):
+    """Keep relay state-machine tests behind an explicit active fence stub."""
+
+    def bind(_task_id, send_func, send_card_func):
+        def send(args):
+            if send_func is None:
+                raise AssertionError("unit test did not provide a text sender")
+            return send_func(dict(args))
+
+        def send_card(target, payload, message_id=None):
+            if send_card_func is None:
+                raise AssertionError("unit test did not provide a card sender")
+            return send_card_func(target, payload, message_id)
+
+        return send, send_card
+
+    monkeypatch.setattr(
+        pnc_completion_notice_relay,
+        "_fenced_task_senders",
+        bind,
+    )
+
+
 def test_relay_dry_run_builds_feishu_topic_target(tmp_path):
     token = set_hermes_home_override(tmp_path)
     try:
@@ -77,6 +102,257 @@ def test_live_mode_keeps_relay_reload_env_behavior(monkeypatch):
     pnc_completion_notice_relay._reload_env_for_current_mode()
 
     assert calls == [True]
+
+
+def test_misspelled_outbound_mode_refuses_relay_daemon_before_env_reload(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_OUTBOUND_MODE", "record-onyl")
+    reload_calls = []
+    monkeypatch.setattr(
+        pnc_completion_notice_relay,
+        "reload_env",
+        lambda: reload_calls.append(True),
+    )
+
+    with pytest.raises(
+        runtime.RecordOnlyConfigurationError,
+        match="unsupported HERMES_OUTBOUND_MODE",
+    ):
+        pnc_completion_notice_relay._reload_env_for_current_mode()
+
+    assert reload_calls == []
+
+
+def test_hot_sender_auth_retry_revalidates_epoch_before_second_provider_call(
+    monkeypatch,
+):
+    sender = object.__new__(pnc_completion_notice_relay.FeishuHotSender)
+    sender._record_sender = None
+    live = True
+    guard_calls = 0
+    provider_calls = 0
+    rebuilds = []
+
+    def provider_revalidate(_claim, **_kwargs):
+        nonlocal guard_calls
+        guard_calls += 1
+        if not live:
+            raise pnc_completion_notice_relay.ExternalWriteFenceError(
+                "external_write_fence_epoch_not_current"
+            )
+        return {
+            "epoch_id": "epoch-gray-1",
+            "state": "bounded_active",
+            "ledger_id": 1,
+            "chat_id": pnc_completion_notice_relay.G1Q3_RCA_CHAT_ID,
+            "thread_id": "topic:om_root",
+        }
+
+    class FakeAdapter:
+        async def send(self, _chat_id, _message, *, metadata=None):
+            nonlocal live, provider_calls
+            pnc_completion_notice_relay.revalidate_provider_write_claim(
+                metadata["_pnc_rca_external_write_guard"],
+                operation=metadata["_pnc_rca_external_write_operation"],
+                chat_id=_chat_id,
+                thread_id=metadata.get("thread_id", ""),
+            )
+            provider_calls += 1
+            live = False
+            return SimpleNamespace(
+                success=False,
+                error="tenant access_token expired",
+                message_id=None,
+            )
+
+    fake_adapter = FakeAdapter()
+
+    def ensure_adapter(*, rebuild=False):
+        rebuilds.append(rebuild)
+        return fake_adapter
+
+    monkeypatch.setattr(sender, "_ensure_adapter", ensure_adapter)
+    monkeypatch.setattr(
+        pnc_completion_notice_relay,
+        "revalidate_provider_write_claim",
+        provider_revalidate,
+    )
+    provider_claim = pnc_completion_notice_relay.build_write_fence_provider_claim(
+        {"state": "issued"}
+    )
+
+    result = json.loads(
+        sender.send(
+            {
+                "target": (
+                    "feishu:"
+                    f"{pnc_completion_notice_relay.G1Q3_RCA_CHAT_ID}:om_root"
+                ),
+                "message": "must stop before retry",
+                    "_pnc_rca_external_write_guard": provider_claim,
+            }
+        )
+    )
+
+    assert guard_calls == 2
+    assert provider_calls == 1
+    assert True in rebuilds
+    assert "external_write_fence_epoch_not_current" in result["error"]
+
+
+def test_hot_sender_rejects_forged_callable_claim_before_adapter(monkeypatch):
+    sender = object.__new__(pnc_completion_notice_relay.FeishuHotSender)
+    sender._record_sender = None
+    monkeypatch.setattr(
+        sender,
+        "_ensure_adapter",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("forged claim reached Feishu adapter")
+        ),
+    )
+
+    with pytest.raises(
+        pnc_completion_notice_relay.ExternalWriteFenceError,
+        match="external_write_provider_claim_invalid",
+    ):
+        sender.send(
+            {
+                "target": (
+                    "feishu:"
+                    f"{pnc_completion_notice_relay.G1Q3_RCA_CHAT_ID}:om_root"
+                ),
+                "message": "must stay blocked",
+                "_pnc_rca_external_write_guard": lambda: {"state": "forged"},
+            }
+        )
+
+
+def test_card_patch_readback_rejects_wrong_message_binding():
+    get_calls = []
+    item = SimpleNamespace(
+        message_id="om_wrong",
+        chat_id=pnc_completion_notice_relay.G1Q3_RCA_CHAT_ID,
+        thread_id="om_root",
+        root_id="om_root",
+        parent_id="",
+        body=SimpleNamespace(content='{"task_id":"task-rca-1"}'),
+    )
+    response = SimpleNamespace(data=SimpleNamespace(items=[item]))
+    adapter = SimpleNamespace(
+        _build_get_message_request=lambda message_id: message_id,
+        _response_succeeded=lambda _response: True,
+        _client=SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=SimpleNamespace(
+                        get=lambda request: get_calls.append(request) or response
+                    )
+                )
+            )
+        ),
+    )
+
+    with pytest.raises(
+        pnc_completion_notice_relay.ExternalWriteFenceError,
+        match="external_write_fence_target_mismatch",
+    ):
+        asyncio.run(
+            pnc_completion_notice_relay.FeishuHotSender._verify_card_patch_target(
+                adapter,
+                message_id="om_expected",
+                chat_id=pnc_completion_notice_relay.G1Q3_RCA_CHAT_ID,
+                thread_id="topic:om_root",
+                submission_key="task-rca-1",
+            )
+        )
+
+    assert get_calls == ["om_expected"]
+
+
+def test_fenced_one_shot_relay_never_uses_send_message_tool(monkeypatch):
+    task_id = "task-rca-1"
+    chat_id = pnc_completion_notice_relay.G1Q3_RCA_CHAT_ID
+    thread_id = "topic:om_root"
+    live = {
+        "epoch_id": "epoch-gray-1",
+        "state": "bounded_active",
+        "ledger_id": 1,
+        "business_key": "business-1",
+        "submission_key": task_id,
+        "generation": 1,
+        "chat_id": chat_id,
+        "thread_target": thread_id,
+        "issue_target": "https://project.feishu.cn/example/issue/detail/7001",
+        "target_set_sha256": "1" * 64,
+    }
+    fence = {"state": "issued"}
+    monkeypatch.setattr(
+        pnc_completion_notice_relay,
+        "_load_task_write_fence",
+        lambda _task_id: {
+            "snapshot": {
+                "resolved_admission": {
+                    "business_key": "business-1",
+                    "submission_key": task_id,
+                    "generation": 1,
+                }
+            },
+            "snapshot_core_sha256": "2" * 64,
+            "write_fence": fence,
+        },
+    )
+    monkeypatch.setattr(
+        pnc_completion_notice_relay,
+        "_relay_live_fence_binding",
+        lambda _fence: dict(live),
+    )
+    monkeypatch.setattr(
+        pnc_completion_notice_relay,
+        "validate_write_fence",
+        lambda *_args, **_kwargs: fence,
+    )
+    monkeypatch.setattr(
+        pnc_completion_notice_relay,
+        "send_message_tool",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("RCA one-shot relay reached send_message_tool")
+        ),
+    )
+    calls = []
+
+    class FakeHotSender:
+        def send(self, args):
+            calls.append(dict(args))
+            return json.dumps({"success": True, "message_id": "om_sent"})
+
+        def send_task_card(self, *_args, **_kwargs):
+            raise AssertionError("unexpected card send")
+
+    monkeypatch.setattr(
+        pnc_completion_notice_relay, "FeishuHotSender", FakeHotSender
+    )
+
+    send_text, _send_card = pnc_completion_notice_relay._fenced_task_senders(
+        task_id,
+        None,
+        None,
+    )
+    result = json.loads(
+        send_text(
+            {
+                "action": "send",
+                "target": f"feishu:{chat_id}:om_root",
+                "message": "bounded notice",
+            }
+        )
+    )
+
+    assert result["success"] is True
+    assert len(calls) == 1
+    assert type(calls[0]["_pnc_rca_external_write_guard"]) is (
+        pnc_completion_notice_relay.RcaProviderWriteClaim
+    )
 
 
 def test_l4_sealed_clock_and_business_timestamp_format_are_idempotent(monkeypatch):
@@ -2408,6 +2684,7 @@ def test_merge_task_card_preserves_download_notify_markers():
 
 
 def test_g1q3_mechanical_download_failure_notifies_once(tmp_path, monkeypatch):
+    _install_unit_test_active_relay_fence(monkeypatch)
     token = set_hermes_home_override(tmp_path)
     task_id = "20260623-220131-g1q3-rca-issue-intake-7025452822-52822_ffdab7"
     try:
@@ -2508,7 +2785,11 @@ def test_g1q3_mechanical_download_failure_notifies_dry_run_candidate_without_car
     assert row["originator_notify"]["open_id"] == "ou_originator"
     assert "download_notify" not in row
 
-def test_g1q3_card_success_suppresses_duplicate_full_completion_text(tmp_path):
+def test_g1q3_card_success_suppresses_duplicate_full_completion_text(
+    tmp_path,
+    monkeypatch,
+):
+    _install_unit_test_active_relay_fence(monkeypatch)
     os.environ["HERMES_G1Q3_ANOMALY_AUTO_NOTIFY"] = "1"
     token = set_hermes_home_override(tmp_path)
     task_id = "20260617-164205-g1q3-rca-issue-intake-7015689036"
@@ -2597,6 +2878,7 @@ def test_v8_relay_consumes_vm_bridge_progress_into_milestones_and_heartbeat(tmp_
 
 
 def test_v11_originator_notify_generalized_to_named_long_business_line(tmp_path, monkeypatch):
+    _install_unit_test_active_relay_fence(monkeypatch)
     token = set_hermes_home_override(tmp_path)
     try:
         _write_roles(tmp_path, {"ou_liuxu": "刘旭"})
@@ -2852,7 +3134,11 @@ def test_g1q3_enrichment_runs_in_watch_channel_without_explicit_filter(tmp_path)
 # Regression: G1Q3-RCA honest broadcast redesign (2026-06-22)
 # ---------------------------------------------------------------------------
 
-def test_g1q3_false_green_existing_index_is_downgraded_and_pings_anomaly(tmp_path):
+def test_g1q3_false_green_existing_index_is_downgraded_and_pings_anomaly(
+    tmp_path,
+    monkeypatch,
+):
+    _install_unit_test_active_relay_fence(monkeypatch)
     os.environ["HERMES_G1Q3_ANOMALY_AUTO_NOTIFY"] = "1"
     task_id = "20260622-201049-g1q3-rca-status-check-g1q3-rca"
     token = set_hermes_home_override(tmp_path)
@@ -3122,7 +3408,8 @@ def test_backfill_g1q3_anomaly_enriches_historical_sidecar_before_stamping(tmp_p
     assert updated["task_card"]["last_anomaly_notify_key"].endswith("|g1q3_anomaly")
     assert updated["task_card"]["last_anomaly_notify_backfilled_at"]
 
-def test_g1q3_anomaly_auto_notify_disabled_by_default(tmp_path):
+def test_g1q3_anomaly_auto_notify_disabled_by_default(tmp_path, monkeypatch):
+    _install_unit_test_active_relay_fence(monkeypatch)
     task_id = "20260622-201049-g1q3-rca-status-check-g1q3-rca"
     token = set_hermes_home_override(tmp_path)
     try:
@@ -3163,7 +3450,11 @@ def test_g1q3_anomaly_auto_notify_disabled_by_default(tmp_path):
     assert text_calls == []
     assert result["rows"][0]["anomaly_notify"] == {"skipped": True, "reason": "auto_notify_disabled", "kind": "g1q3_anomaly"}
 
-def test_g1q3_anomaly_notify_key_survives_later_delivery_mark_write(tmp_path):
+def test_g1q3_anomaly_notify_key_survives_later_delivery_mark_write(
+    tmp_path,
+    monkeypatch,
+):
+    _install_unit_test_active_relay_fence(monkeypatch)
     os.environ["HERMES_G1Q3_ANOMALY_AUTO_NOTIFY"] = "1"
     task_id = "20260622-110137-g1q3-rca-issue-intake-7023754183"
     token = set_hermes_home_override(tmp_path)
@@ -3239,7 +3530,11 @@ def test_g1q3_anomaly_notify_key_survives_later_delivery_mark_write(tmp_path):
     assert len(text_calls) == 1
 
 
-def test_g1q3_mechanical_download_failure_ledger_blocks_repeat_when_card_marker_missing(tmp_path):
+def test_g1q3_mechanical_download_failure_ledger_blocks_repeat_when_card_marker_missing(
+    tmp_path,
+    monkeypatch,
+):
+    _install_unit_test_active_relay_fence(monkeypatch)
     token = set_hermes_home_override(tmp_path)
     task_id = "20260623-220131-g1q3-rca-issue-intake-7025452822-52822_ffdab7"
     try:
