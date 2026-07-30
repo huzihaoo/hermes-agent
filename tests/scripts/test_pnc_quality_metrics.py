@@ -764,7 +764,7 @@ def test_auxiliary_counts_cannot_inflate_any_metric_denominator() -> None:
             )
 
 
-def test_three_former_todo_signals_have_clean_fields_and_rates() -> None:
+def test_adoption_field_stays_todo_even_with_explicit_records() -> None:
     report = quality_metrics.build_daily_report(
         _clean_records(),
         observed_at=OBSERVED_AT,
@@ -777,8 +777,10 @@ def test_three_former_todo_signals_have_clean_fields_and_rates() -> None:
         "rca_adoption_rate",
         "gate_consistency_rate",
     }
-    assert all(item["status"] == "have" for item in inventory.values())
-    assert all(item["clean_fields"] for item in inventory.values())
+    assert inventory["rca_adoption_rate"]["status"] == "todo"
+    assert inventory["rca_adoption_rate"]["clean_fields"] == ()
+    assert inventory["triage_accuracy_kind_distribution"]["status"] == "have"
+    assert inventory["gate_consistency_rate"]["status"] == "have"
 
     business = _group(report, entry="kafka", tier="medium")
     assert (
@@ -787,12 +789,8 @@ def test_three_former_todo_signals_have_clean_fields_and_rates() -> None:
         ]["rate_pct"]
         == 100.0
     )
-    assert (
-        business["signals"]["rca_adoption_rate"]["by_denominator"]["business"][
-            "rate_pct"
-        ]
-        == 100.0
-    )
+    assert business["signals"]["rca_adoption_rate"]["status"] == "insufficient_adoption_signal"
+    assert business["signals"]["rca_adoption_rate"]["by_denominator"]["business"]["rate_pct"] is None
 
     system = _group(report, entry="feishu", tier="high")
     assert (
@@ -821,14 +819,14 @@ def test_adoption_without_explicit_operation_is_insufficient_and_has_no_rate() -
     report = quality_metrics.build_daily_report(records, observed_at=OBSERVED_AT)
 
     assert report["adoption_signal"]["status"] == "insufficient_adoption_signal"
-    assert report["adoption_signal"]["explicit_response_count"] == 0
+    assert report["adoption_signal"]["explicit_response_count"] is None
     assert report["adoption_signal"]["numerator"] is None
     assert report["adoption_signal"]["denominator"] is None
     assert report["adoption_signal"]["rate_pct"] is None
     assert "- rate_pct:" not in quality_metrics.render_markdown(report)
 
 
-def test_adoption_rate_waits_for_semantics_confirmation_and_deduplicates_pair() -> None:
+def test_adoption_rate_is_unavailable_even_when_semantics_flag_is_true() -> None:
     records = [
         _record(
             pair_id="one-generation",
@@ -845,8 +843,8 @@ def test_adoption_rate_waits_for_semantics_confirmation_and_deduplicates_pair() 
         records,
         observed_at=OBSERVED_AT,
     )
-    assert unconfirmed["adoption_signal"]["status"] == "adoption_semantics_unconfirmed"
-    assert unconfirmed["adoption_signal"]["explicit_response_count"] == 1
+    assert unconfirmed["adoption_signal"]["status"] == "insufficient_adoption_signal"
+    assert unconfirmed["adoption_signal"]["explicit_response_count"] is None
     assert unconfirmed["adoption_signal"]["rate_pct"] is None
 
     confirmed = quality_metrics.build_daily_report(
@@ -854,11 +852,10 @@ def test_adoption_rate_waits_for_semantics_confirmation_and_deduplicates_pair() 
         observed_at=OBSERVED_AT,
         adoption_semantics_confirmed=True,
     )
-    assert confirmed["adoption_signal"]["status"] == "available"
-    assert confirmed["adoption_signal"]["states"]["adopted"] == 1
-    assert confirmed["adoption_signal"]["numerator"] == 1
-    assert confirmed["adoption_signal"]["denominator"] == 1
-    assert confirmed["adoption_signal"]["rate_pct"] == 100.0
+    assert confirmed["adoption_signal"]["status"] == "insufficient_adoption_signal"
+    assert confirmed["adoption_signal"]["numerator"] is None
+    assert confirmed["adoption_signal"]["denominator"] is None
+    assert confirmed["adoption_signal"]["rate_pct"] is None
 
 
 def test_flattened_adoption_cannot_bypass_official_generation_binding() -> None:
@@ -911,11 +908,11 @@ def test_valid_flattened_adoption_is_revalidated_before_aggregation() -> None:
         adoption_semantics_confirmed=True,
     )
 
-    assert report["adoption_signal"]["status"] == "available"
-    assert report["adoption_signal"]["rate_pct"] == 100.0
+    assert report["adoption_signal"]["status"] == "insufficient_adoption_signal"
+    assert report["adoption_signal"]["rate_pct"] is None
 
 
-def test_adoption_rate_uses_only_explicit_adopted_and_rejected_generations() -> None:
+def test_explicit_valid_and_invalid_ticket_values_cannot_create_rate() -> None:
     records = []
     for pair_id, status in (("adopted-pair", "adopted"), ("rejected-pair", "rejected")):
         records.extend(
@@ -936,15 +933,10 @@ def test_adoption_rate_uses_only_explicit_adopted_and_rejected_generations() -> 
         adoption_semantics_confirmed=True,
     )
 
-    assert report["adoption_signal"]["states"] == {
-        "adopted": 1,
-        "rejected": 1,
-        "unreviewed": 0,
-        "read_error": 0,
-    }
-    assert report["adoption_signal"]["numerator"] == 1
-    assert report["adoption_signal"]["denominator"] == 2
-    assert report["adoption_signal"]["rate_pct"] == 50.0
+    assert report["adoption_signal"]["status"] == "insufficient_adoption_signal"
+    assert report["adoption_signal"]["numerator"] is None
+    assert report["adoption_signal"]["denominator"] is None
+    assert report["adoption_signal"]["rate_pct"] is None
 
 
 def test_adoption_read_error_suppresses_rate_even_with_valid_operation() -> None:
@@ -974,7 +966,7 @@ def test_adoption_read_error_suppresses_rate_even_with_valid_operation() -> None
         adoption_semantics_confirmed=True,
     )
 
-    assert report["adoption_signal"]["status"] == "read_error"
+    assert report["adoption_signal"]["status"] == "insufficient_adoption_signal"
     assert report["adoption_signal"]["numerator"] is None
     assert report["adoption_signal"]["denominator"] is None
     assert report["adoption_signal"]["rate_pct"] is None
@@ -1017,10 +1009,10 @@ def test_adoption_ignores_unknown_non_conclusion_outcome() -> None:
     )
 
     assert report["adoption_signal"]["status"] == "insufficient_adoption_signal"
-    assert report["adoption_signal"]["explicit_response_count"] == 0
+    assert report["adoption_signal"]["explicit_response_count"] is None
 
 
-def test_one_operation_proof_cannot_be_reused_across_generations() -> None:
+def test_ticket_validity_operations_do_not_enter_quality_validation() -> None:
     records = [
         _record(
             pair_id=f"generation-{generation}",
@@ -1043,11 +1035,10 @@ def test_one_operation_proof_cannot_be_reused_across_generations() -> None:
         adoption_semantics_confirmed=True,
     )
 
-    assert report["adoption_signal"]["status"] == "read_error"
-    assert report["adoption_signal"]["states"]["read_error"] == 2
+    assert report["adoption_signal"]["status"] == "insufficient_adoption_signal"
     assert report["adoption_signal"]["rate_pct"] is None
-    assert any(
-        item["code"] == "metrics_adoption_proof_reused"
+    assert not any(
+        item["code"].startswith("metrics_adoption_")
         for item in report["errors"]
     )
 

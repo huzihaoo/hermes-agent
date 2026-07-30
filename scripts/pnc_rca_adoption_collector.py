@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Collect generation-bound G1Q3 adoption signals through read-only Meegle APIs."""
+"""Collect human ticket-validity inputs through read-only Meegle APIs.
+
+The historic file name is retained for compatibility.  ``field_b23cb8`` is
+not an RCA adoption or quality signal: it only records whether a human treated
+the ticket itself as valid, for fail-closed intake filtering.
+"""
 
 from __future__ import annotations
 
@@ -20,7 +25,8 @@ from scripts.pnc_rca_delivery_dispatcher import MeegleIssueCommentAdapter
 
 
 MANIFEST_SCHEMA_VERSION = "pnc_rca_adoption_read_manifest_v1"
-BATCH_SCHEMA_VERSION = "pnc_rca_adoption_signal_batch_v1"
+BATCH_SCHEMA_VERSION = "pnc_rca_ticket_validity_batch_v1"
+TICKET_VALIDITY_PURPOSE = "human_ticket_validity_only_not_rca_quality_metric"
 MAX_MANIFEST_BYTES = 2 * 1024 * 1024
 MAX_RECORDS = 1000
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_.:@/-]{1,256}")
@@ -201,17 +207,31 @@ def collect_adoption_signals(
                     result.get("error_code") or "g1q3_adoption_read_failed"
                 ),
             }
+        raw_status = str(result.get("status") or "").strip()
+        validity_state = {
+            "adopted": "human_valid",
+            "rejected": "human_invalid",
+            "read_error": "read_error",
+        }.get(raw_status, "unknown")
         output_records.append({
             "business_key": row["business_key"],
             "work_item_id": row["work_item_id"],
             "generation": row["generation"],
-            "signal": result,
+            "ticket_validity": {
+                "field_key": G1Q3_ADOPTION_FIELD_KEY,
+                "state": validity_state,
+                "source": str(result.get("source") or "official_meegle_api"),
+                "explicit_human_operation": result.get("explicit") is True,
+                "error_code": str(result.get("error_code") or ""),
+            },
         })
     return {
         "schema_version": BATCH_SCHEMA_VERSION,
         "ok": error_count == 0,
         "observed_at_ms": observed_at_ms,
         "source": "official_meegle_api",
+        "purpose": TICKET_VALIDITY_PURPOSE,
+        "quality_metric_eligible": False,
         "read_only": True,
         "write_commands_performed": 0,
         "error_count": error_count,

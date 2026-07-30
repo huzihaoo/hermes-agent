@@ -121,9 +121,11 @@ def test_collector_to_metrics_pipeline_preserves_generation_and_deduplicates_ent
     assert batch["read_only"] is True
     assert batch["write_commands_performed"] == 0
     assert len(adapter.calls) == 1
-    assert report["adoption_signal"]["states"]["adopted"] == 1
-    assert report["adoption_signal"]["denominator"] == 1
-    assert report["adoption_signal"]["rate_pct"] == 100.0
+    assert batch["purpose"] == collector.TICKET_VALIDITY_PURPOSE
+    assert batch["quality_metric_eligible"] is False
+    assert batch["records"][0]["ticket_validity"]["state"] == "human_valid"
+    assert report["adoption_signal"]["status"] == "insufficient_adoption_signal"
+    assert report["adoption_signal"]["rate_pct"] is None
 
 
 def test_collector_read_failure_is_structured_and_cannot_emit_a_rate():
@@ -146,7 +148,8 @@ def test_collector_read_failure_is_structured_and_cannot_emit_a_rate():
 
     assert batch["ok"] is False
     assert batch["error_count"] == 1
-    assert report["adoption_signal"]["status"] == "read_error"
+    assert batch["records"][0]["ticket_validity"]["state"] == "read_error"
+    assert report["adoption_signal"]["status"] == "insufficient_adoption_signal"
     assert report["adoption_signal"]["rate_pct"] is None
 
 
@@ -162,12 +165,11 @@ def test_manifest_rejects_duplicate_generation_identity():
         raise AssertionError("duplicate generation must fail closed")
 
 
-def test_metrics_merge_rejects_non_object_delivery_provenance():
+def test_metrics_merge_does_not_use_ticket_validity_to_bind_quality_rows():
     batch = collector.collect_adoption_signals(_manifest(), adapter=_Adapter())
     row = _observation("kafka")
     row["delivery_provenance"] = "not-an-object"
 
-    with pytest.raises(pnc_business_metrics.MetricsValidationError) as error:
-        pnc_quality_metrics.merge_adoption_batch([row], batch)
+    merged = pnc_quality_metrics.merge_adoption_batch([row], batch)
 
-    assert error.value.code == "metrics_adoption_observation_identity_invalid"
+    assert merged == [row]
