@@ -336,22 +336,20 @@ def _seed_with_thread_subscription(tmp_path, *, bundle_payload=None):
 
 
 def _seed_terminal(tmp_path, *, with_thread: bool = False):
+    """Seed a pre-B6 terminal effect for dispatcher recovery coverage.
+
+    New terminal failures must be completed by DeliveryCollector through its
+    silent internal path.  These dispatcher tests instead exercise historical
+    rows that were already materialized before that policy existed, without
+    asserting that the current collector may create them.
+    """
     control, result = _control(tmp_path)
     _bind_activation_execution(control, result, state="steady_active")
-    admitted_at = (NOW - timedelta(seconds=1800)).isoformat()
-    with sqlite3.connect(control.db_path) as conn:
-        conn.execute(
-            "UPDATE business_triggers SET created_at = ?",
-            (admitted_at,),
-        )
-        conn.execute(
-            "UPDATE rca_outbox SET created_at = ?, retry_window_started_at = ?",
-            (admitted_at, admitted_at),
-        )
+    store = RcaDeliveryStore(tmp_path / "control.sqlite3")
     if with_thread:
         trigger = control.list_rows("business_triggers")[0]
         _insert_subscription(
-            RcaDeliveryStore(tmp_path / "control.sqlite3"),
+            store,
             SimpleNamespace(
                 business_key=trigger["business_key"],
                 generation=trigger["generation"],
@@ -361,17 +359,24 @@ def _seed_terminal(tmp_path, *, with_thread: bool = False):
             ),
             effect_kind="feishu_thread_reply",
         )
-    collector = _collector(
-        tmp_path,
-        status_reader=lambda task_id: {
-            "success": True,
-            "task_id": task_id,
-            "state": "failed",
-            "error": "sensitive backend detail",
-        },
+    assert store.backfill_completed_submissions(now=NOW) == 1
+    claim = store.claim_due_watch(
+        lease_owner="legacy-terminal-fixture",
+        now=NOW,
     )
-    assert collector.collect_batch()[0].status == "terminal_failed"
-    return collector.store
+    assert claim is not None
+    seeded = store.create_terminal_delivery(
+        claim=claim,
+        status={"success": False, "state": "failed", "legacy_fixture": True},
+        outcome="terminal_failed",
+        terminal_state="failed",
+        error_code="vm_terminal_failed_unclassified",
+        error_detail="historical fixture only",
+        now=NOW,
+        activation_required=True,
+    )
+    assert seeded.created is True
+    return store
 
 
 def _web_bundle_payload():
@@ -1355,16 +1360,50 @@ def test_bounded_terminal_v3_replays_oracle_low_at_dispatch_boundary(tmp_path):
         now=NOW,
     )
     assert claim is not None
-    assert claim.payload["schema_version"] == (
+    bounded = build_terminal_delivery(
+        business_key=claim.business_key,
+        submission_key=claim.submission_key,
+        generation=claim.generation,
+        project_key=claim.project_key,
+        work_item_type_key=claim.work_item_type_key,
+        work_item_id=claim.work_item_id,
+        outcome=claim.outcome,
+        terminal_state=claim.terminal_state,
+        error_code=claim.terminal_error_code,
+        terminal_fallback={
+            "schema_version": "pnc_rca_bounded_terminal_fallback_v1",
+            "work_started_at": NOW.isoformat(),
+            "deadline_at": (NOW + timedelta(seconds=1800)).isoformat(),
+            "elapsed_seconds": 1800,
+            "confidence_tier": "low",
+            "terminal_class": "honest_non_attribution",
+            "route_key": "rca-failure-route-" + "a" * 64,
+            "route_kind": "internal_alert",
+            "route_owner": "rca-engineering",
+        },
+        schema_version=TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
+    )
+    bounded_claim = replace(
+        claim,
+        effect_key=bounded.effect_key,
+        delivery_id=bounded.delivery_id,
+        target_key=bounded.target_key,
+        payload=bounded.effect_payload,
+        payload_sha256=bounded.semantic_payload_sha256,
+        artifact_set_id=bounded.outcome_key,
+        outcome_key=bounded.outcome_key,
+        contract=bounded.contract,
+    )
+    assert bounded_claim.payload["schema_version"] == (
         TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION
     )
 
-    validated = dispatcher_module._validate_effect(claim)
+    validated = dispatcher_module._validate_effect(bounded_claim)
 
-    assert validated.field_updates == (("field_9193cb", claim.payload["conclusion"]),)
-    assert claim.payload["terminal_class"] == "honest_non_attribution"
-    assert claim.payload["confidence_tier"] == "low"
-    assert claim.payload["quality_oracle"]["schema_version"] == (
+    assert validated.field_updates == (("field_9193cb", bounded_claim.payload["conclusion"]),)
+    assert bounded_claim.payload["terminal_class"] == "honest_non_attribution"
+    assert bounded_claim.payload["confidence_tier"] == "low"
+    assert bounded_claim.payload["quality_oracle"]["schema_version"] == (
         "pnc_rca_structural_tier_oracle_v2"
     )
 

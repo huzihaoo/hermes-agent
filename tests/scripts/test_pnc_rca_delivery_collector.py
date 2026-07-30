@@ -23,6 +23,7 @@ from tests.gateway.test_pnc_rca_delivery_store import (
     _bind_activation_execution,
     _control,
     _delivery,
+    _insert_subscription,
 )
 from tests.gateway.test_pnc_rca_w3_snapshot import _runtime_authority
 
@@ -480,6 +481,15 @@ def test_all_failure_lanes_are_silent_until_admission_deadline_then_oracle_low(
         blocker=blocker,
         clock=clock,
     )
+    [watch] = instance.store.list_rows("rca_execution_watch")
+    _insert_subscription(
+        instance.store,
+        SimpleNamespace(
+            business_key=watch["business_key"],
+            generation=watch["generation"],
+        ),
+        effect_kind="feishu_thread_reply",
+    )
 
     held = instance.collect_one()
 
@@ -506,10 +516,13 @@ def test_all_failure_lanes_are_silent_until_admission_deadline_then_oracle_low(
     assert route["status"] in {"remediation_held", "backlog_pending", "alert_pending"}
     assert instance.store.list_rows("rca_delivery_jobs") == []
     assert instance.store.list_rows("rca_delivery_effects") == []
-    assert all(
-        row["delivery_id"] is None
-        for row in instance.store.list_rows("rca_delivery_subscriptions")
+    subscriptions = instance.store.list_rows("rca_delivery_subscriptions")
+    assert any(
+        row["effect_kind"] == "feishu_thread_reply" for row in subscriptions
     )
+    assert all(row["status"] == "pending" for row in subscriptions)
+    assert all(row["delivery_id"] is None for row in subscriptions)
+    assert all(row["effect_key"] is None for row in subscriptions)
     watch = instance.store.list_rows("rca_execution_watch")[0]
     assert watch["state"] == "terminal_failed"
     taxonomy = json.loads(watch["last_status_json"])["failure_taxonomy"]
