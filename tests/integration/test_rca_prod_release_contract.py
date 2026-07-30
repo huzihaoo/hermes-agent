@@ -16,6 +16,10 @@ import pytest
 from gateway.pnc_rca_admission import build_rca_admission
 from gateway.pnc_rca_workspace_runtime import validate_staged_workspace_runtime
 from gateway import pnc_rca_prod_admission
+from gateway.pnc_rca_vm_release_binding import (
+    RCA_PROD_VM_FIXED_CLI_RELATIVE_PATH,
+    RCA_PROD_VM_RELEASE_ROOT,
+)
 from tools import vm_task_tool
 
 
@@ -215,9 +219,7 @@ def test_pinned_release_goal_bytes_survive_creator_and_vm_admission(
         "codex_backend_enabled": False,
         "coding_agent_fallback_enabled": False,
         "fixed_cli_entrypoint": (
-            "/home/mini/.hermes/rca-prod-runtime/releases/"
-            "rca-platform-20260724/"
-            "api/g1q3_rca/scripts/run_rca_service_request.py"
+            f"{RCA_PROD_VM_RELEASE_ROOT}/{RCA_PROD_VM_FIXED_CLI_RELATIVE_PATH}"
         ),
         **workspace.task_meta(),
         **prod_admission.meta,

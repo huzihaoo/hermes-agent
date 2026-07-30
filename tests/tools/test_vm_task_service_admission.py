@@ -24,6 +24,7 @@ from gateway.pnc_rca_workspace_runtime import (
     WorkspaceRuntimeError,
     WorkspaceRuntimeIdentity,
 )
+from gateway.pnc_rca_vm_release_binding import RCA_PROD_VM_RELEASE_ROOT
 from tools import permission_policy, vm_task_tool
 from tools.registry import registry
 
@@ -560,9 +561,8 @@ def _matching_status(
             "codex_backend_enabled": False,
             "coding_agent_fallback_enabled": False,
             "fixed_cli_entrypoint": (
-                "/home/mini/.hermes/rca-prod-runtime/releases/"
-                "rca-platform-20260724/"
-                "api/g1q3_rca/scripts/run_rca_service_request.py"
+                f"{RCA_PROD_VM_RELEASE_ROOT}/api/g1q3_rca/scripts/"
+                "run_rca_service_request.py"
             ),
             **(bootstrap_meta or {}),
         },
@@ -1216,8 +1216,7 @@ def test_service_wrapper_allows_only_validated_rca_intake_with_fixed_envelope(mo
     task_id = admission.submission_key
     assert goal.splitlines()[-2:] == [
         (
-                "- cd /home/mini/.hermes/rca-prod-runtime/releases/"
-                "rca-platform-20260724"
+                f"- cd {RCA_PROD_VM_RELEASE_ROOT}"
         ),
         (
             "- ./api/g1q3_rca/scripts/run_rca_service_request.py "
@@ -2256,8 +2255,7 @@ def test_fixed_cli_goal_keeps_caller_text_inside_json_and_commands_are_immutable
     task_id = admission.submission_key
     assert executable_lines == [
         (
-                "- cd /home/mini/.hermes/rca-prod-runtime/releases/"
-                "rca-platform-20260724"
+                f"- cd {RCA_PROD_VM_RELEASE_ROOT}"
         ),
         (
             "- ./api/g1q3_rca/scripts/run_rca_service_request.py "

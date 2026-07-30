@@ -18,6 +18,10 @@ from gateway.pnc_rca_data_access import (
     RemoteDataAccessError,
     validate_remote_data_access,
 )
+from gateway.pnc_rca_vm_release_binding import (
+    RCA_PROD_VM_DERIVED_RESERVATION_MODULE,
+    RCA_PROD_VM_RELEASE_ROOT,
+)
 
 
 DERIVED_RESERVATION_REQUEST_SCHEMA_VERSION = (
@@ -31,10 +35,8 @@ DERIVED_PRECREATE_ABORT_SCHEMA_VERSION = (
     "g1q3_rca_derived_capacity_precreate_release_v1"
 )
 DEFAULT_SSH_MINI_AGENT = str(Path.home() / ".local" / "bin" / "ssh-mini-agent")
-REMOTE_VM_REPO_ROOT = "/home/mini/data3/yj-evaluation-server"
-REMOTE_DERIVED_RESERVATION_MODULE = (
-    f"{REMOTE_VM_REPO_ROOT}/api/g1q3_rca/derived_capacity_reservation.py"
-)
+REMOTE_VM_REPO_ROOT = RCA_PROD_VM_RELEASE_ROOT
+REMOTE_DERIVED_RESERVATION_MODULE = RCA_PROD_VM_DERIVED_RESERVATION_MODULE
 
 CAPACITY_SCOPE = "derived_artifact_and_cache"
 DEFAULT_EXPECTED_ARTIFACT_CACHE_BYTES = 1_000_000_000

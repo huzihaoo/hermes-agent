@@ -34,6 +34,10 @@ from gateway.pnc_rca_workspace_runtime import (
     WorkspaceRuntimeIdentity,
     validate_workspace_runtime,
 )
+from gateway.pnc_rca_vm_release_binding import (
+    RCA_PROD_VM_FIXED_CLI_RELATIVE_PATH,
+    RCA_PROD_VM_RELEASE_ROOT,
+)
 from hermes_constants import get_hermes_home
 from tools.registry import registry
 
@@ -178,11 +182,8 @@ _RCA_SHARED_STATE_GOAL_PREFIX = (
     "Execute the governed RCA issue intake represented by the validated "
     "contracts below."
 )
-_RCA_VM_REPO_ROOT = (
-    "/home/mini/.hermes/rca-prod-runtime/releases/"
-    "rca-platform-20260724"
-)
-_RCA_FIXED_CLI_RELATIVE_PATH = "./api/g1q3_rca/scripts/run_rca_service_request.py"
+_RCA_VM_REPO_ROOT = RCA_PROD_VM_RELEASE_ROOT
+_RCA_FIXED_CLI_RELATIVE_PATH = f"./{RCA_PROD_VM_FIXED_CLI_RELATIVE_PATH}"
 _RCA_VM_TASK_ROOT = "/home/mini/.hermes/shared-state/tasks"
 _RCA_STORAGE_ADMISSION_SCHEMA_VERSION = "pnc_rca_derived_capacity_admission_v2"
 _RCA_FORBIDDEN_LEGACY_DOWNLOAD_FIELDS = frozenset({
