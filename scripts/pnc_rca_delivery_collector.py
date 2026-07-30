@@ -2458,6 +2458,39 @@ class DeliveryCollector:
             else "quarantined"
         )
         safe_error_code = _public_terminal_error_code(error_code)
+        if safe_outcome == "terminal_failed":
+            # A technical terminal failure is durable internal state, never a
+            # user-visible delivery.  In particular, do not materialize an
+            # issue comment, field update, thread reply, or repair effect.
+            internal_status = dict(status)
+            internal_status["external_writes"] = False
+            internal_status["terminal_delivery_policy"] = (
+                "silent_internal_alert_only"
+            )
+            try:
+                self.store.terminal_failure(
+                    submission_key=claim.submission_key,
+                    lease_token=claim.lease_token,
+                    status=internal_status,
+                    error_code=safe_error_code,
+                    error_detail=error_detail,
+                    now=self.now(),
+                )
+            except StaleDeliveryWatchLeaseError:
+                self.stats.stale_lease += 1
+                return CollectOutcome(
+                    status="lease_lost",
+                    submission_key=claim.submission_key,
+                    error_code="stale_delivery_watch_lease",
+                )
+            self.stats.terminal_failed += 1
+            self.stats.internal_alert += 1
+            return CollectOutcome(
+                status="terminal_failed",
+                submission_key=claim.submission_key,
+                error_code=safe_error_code,
+                created=False,
+            )
         try:
             result = self.store.create_terminal_delivery(
                 claim=claim,
@@ -2486,10 +2519,7 @@ class DeliveryCollector:
                 error_code="delivery_record_conflict",
                 error_detail=f"delivery_record_conflict: {exc}",
             )
-        if safe_outcome == "terminal_failed":
-            self.stats.terminal_failed += 1
-        else:
-            self.stats.quarantined += 1
+        self.stats.quarantined += 1
         if result.created:
             self.stats.delivery_created += 1
         else:

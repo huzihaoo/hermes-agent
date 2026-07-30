@@ -225,7 +225,7 @@ def test_activation_required_reaches_watch_claim_and_successful_create(
     assert calls[1][1]["activation_required"] is True
 
 
-def test_activation_required_reaches_terminal_create(tmp_path):
+def test_terminal_failure_is_silent_and_does_not_create_delivery(tmp_path):
     env = _config_env(tmp_path)
     env["HERMES_RCA_DELIVERY_COLLECTOR_CAPACITY_SAMPLE_ENABLED"] = "false"
     env["HERMES_RCA_DELIVERY_COLLECTOR_ACTIVATION_REQUIRED"] = "true"
@@ -233,19 +233,18 @@ def test_activation_required_reaches_terminal_create(tmp_path):
     instance = object.__new__(collector.DeliveryCollector)
     instance.config = collector.CollectorConfig.from_env(env, hermes_home=tmp_path)
     instance.store = SimpleNamespace(
-        create_terminal_delivery=lambda **kwargs: (
+        terminal_failure=lambda **kwargs: (
             calls.append(kwargs)
-            or SimpleNamespace(
-                created=True,
-                delivery_id="delivery-id",
-                effect_key="effect-key",
-            )
         )
     )
     instance.stats = collector.CollectorStats()
     instance.runtime_identity = None
     instance.now = lambda: NOW
-    claim = SimpleNamespace(submission_key="submission-key", state="pending")
+    claim = SimpleNamespace(
+        submission_key="submission-key",
+        state="pending",
+        lease_token="lease-token",
+    )
 
     outcome = instance._durable_terminal_outcome(
         claim,
@@ -257,7 +256,13 @@ def test_activation_required_reaches_terminal_create(tmp_path):
     )
 
     assert outcome.status == "terminal_failed"
-    assert calls[0]["activation_required"] is True
+    assert outcome.delivery_id == ""
+    assert outcome.effect_key == ""
+    assert calls[0]["status"]["external_writes"] is False
+    assert calls[0]["status"]["terminal_delivery_policy"] == (
+        "silent_internal_alert_only"
+    )
+    assert "activation_required" not in calls[0]
 
 
 def test_collect_batch_collects_delivery_then_capacity_samples():
@@ -497,44 +502,23 @@ def test_all_failure_lanes_are_silent_until_admission_deadline_then_oracle_low(
     fallback = instance.collect_one()
 
     assert fallback.status == "terminal_failed"
-    [job] = instance.store.list_rows("rca_delivery_jobs")
-    assert job["generation"] == 1
-    assert job["terminal_error_code"] == error_code
     [route] = instance.store.list_rows("rca_failure_routes")
-    assert route["status"] == "terminal_fallback"
-    assert route["completed_at"]
-    [effect] = instance.store.list_rows("rca_delivery_effects")
-    payload = json.loads(effect["payload_json"])
-    contract = json.loads(job["contract_json"])
-    assert payload["schema_version"] == TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION
-    assert payload["terminal_class"] == "honest_non_attribution"
-    assert payload["confidence_tier"] == "low"
-    assert payload["terminal_fallback"]["work_started_at"] == NOW.isoformat()
-    assert (
-        payload["terminal_fallback"]["deadline_at"]
-        == (NOW + timedelta(seconds=1800)).isoformat()
+    assert route["status"] in {"remediation_held", "backlog_pending", "alert_pending"}
+    assert instance.store.list_rows("rca_delivery_jobs") == []
+    assert instance.store.list_rows("rca_delivery_effects") == []
+    assert all(
+        row["delivery_id"] is None
+        for row in instance.store.list_rows("rca_delivery_subscriptions")
     )
-    assert payload["quality_oracle"]["schema_version"] == (
-        "pnc_rca_structural_tier_oracle_v2"
-    )
-    oracle_sha = hashlib.sha256(
-        json.dumps(
-            payload["quality_oracle"],
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
-    assert payload["quality_oracle_sha256"] == oracle_sha
-    assert contract["schema_version"] == TERMINAL_FALLBACK_CONTRACT_SCHEMA_VERSION
-    assert "diagnostic_code" not in contract
-    assert error_code not in payload["comment_content"]
-    assert "请补齐" not in payload["comment_content"]
-    assert "请修正" not in payload["comment_content"]
     watch = instance.store.list_rows("rca_execution_watch")[0]
+    assert watch["state"] == "terminal_failed"
     taxonomy = json.loads(watch["last_status_json"])["failure_taxonomy"]
     assert taxonomy["terminal_fallback"]["confidence_tier"] == "low"
     assert taxonomy["terminal_fallback"]["elapsed_seconds"] == 1800
+    assert json.loads(watch["last_status_json"])["external_writes"] is False
+    assert json.loads(watch["last_status_json"])["terminal_delivery_policy"] == (
+        "silent_internal_alert_only"
+    )
 
 
 def test_infra_remediation_runner_executes_once_for_same_task(tmp_path):
@@ -609,8 +593,7 @@ def test_infra_remediation_crossing_deadline_falls_back_without_extra_hold(tmp_p
     assert fallback.error_code == "translate_workdir_permission"
     [route] = instance.store.list_rows("rca_failure_routes")
     assert route["remediation_attempt_count"] == 1
-    assert route["status"] == "terminal_fallback"
-    assert route["next_retry_at"] is None
+    assert route["status"] == "remediation_held"
     assert instance.stats.failure_holds == 0
 
 
@@ -630,10 +613,8 @@ def test_unknown_code_is_held_fail_closed_then_persisted_as_taxonomy_gap(tmp_pat
     clock[0] = NOW + timedelta(seconds=1800)
     fallback = instance.collect_one()
     assert fallback.status == "terminal_failed"
-    assert (
-        instance.store.list_rows("rca_delivery_jobs")[0]["terminal_error_code"]
-        == "taxonomy_gap:new_vm_failure"
-    )
+    assert instance.store.list_rows("rca_delivery_jobs") == []
+    assert instance.store.list_rows("rca_delivery_effects") == []
 
 
 def test_forever_running_falls_back_at_admission_deadline(tmp_path):
@@ -688,9 +669,9 @@ def test_status_missing_and_reader_error_use_same_admission_deadline(
 
     assert fallback.status == "terminal_failed"
     assert fallback.error_code == expected_code
-    assert instance.store.list_rows("rca_failure_routes")[0]["status"] == (
-        "terminal_fallback"
-    )
+    assert instance.store.list_rows("rca_failure_routes")[0]["status"] in {
+        "remediation_held", "backlog_pending", "alert_pending"
+    }
 
 
 def test_invalid_submission_admission_is_silent_until_work_deadline(tmp_path):
@@ -772,7 +753,9 @@ def test_admission_parsing_crossing_deadline_skips_status_read(tmp_path, monkeyp
     assert fallback.status == "terminal_failed"
     assert fallback.error_code == "rca_work_deadline_exceeded"
     assert status_calls == []
-    assert instance.store.list_rows("rca_delivery_jobs")[0]["outcome"] == (
+    assert instance.store.list_rows("rca_delivery_jobs") == []
+    assert instance.store.list_rows("rca_delivery_effects") == []
+    assert instance.store.list_rows("rca_execution_watch")[0]["state"] == (
         "terminal_failed"
     )
 
@@ -798,7 +781,9 @@ def test_status_read_crossing_deadline_skips_artifact_read(tmp_path):
     assert fallback.status == "terminal_failed"
     assert fallback.error_code == "rca_work_deadline_exceeded"
     assert artifact_calls == []
-    assert instance.store.list_rows("rca_delivery_effects")[0]["outcome"] == (
+    assert instance.store.list_rows("rca_delivery_jobs") == []
+    assert instance.store.list_rows("rca_delivery_effects") == []
+    assert instance.store.list_rows("rca_execution_watch")[0]["state"] == (
         "terminal_failed"
     )
 
@@ -834,12 +819,11 @@ def test_late_valid_completed_bundle_becomes_low_fallback_not_delivery(
 
     assert fallback.status == "terminal_failed"
     assert fallback.error_code == "rca_work_deadline_exceeded"
-    [job] = instance.store.list_rows("rca_delivery_jobs")
-    assert job["outcome"] == "terminal_failed"
-    [effect] = instance.store.list_rows("rca_delivery_effects")
-    payload = json.loads(effect["payload_json"])
-    assert payload["terminal_class"] == "honest_non_attribution"
-    assert payload["confidence_tier"] == "low"
+    assert instance.store.list_rows("rca_delivery_jobs") == []
+    assert instance.store.list_rows("rca_delivery_effects") == []
+    assert instance.store.list_rows("rca_execution_watch")[0]["state"] == (
+        "terminal_failed"
+    )
 
 
 def test_failure_receipt_reader_script_is_exact_and_read_only():
