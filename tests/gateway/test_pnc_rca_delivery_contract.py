@@ -475,6 +475,7 @@ def test_gate_a_l0_projection_does_not_claim_evaluator_observation():
     assert "建议责任方：" not in verified.conclusion
     assert "已读取评测器观测事实" not in verified.conclusion
     assert "未找到对应事件" in verified.conclusion
+    assert MEDIUM_TIER_DISCLAIMER not in verified.conclusion
 
 
 def test_gate_a_projection_rejects_forged_candidate_fields():
