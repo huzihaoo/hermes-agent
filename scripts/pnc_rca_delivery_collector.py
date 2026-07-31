@@ -58,6 +58,12 @@ from gateway.pnc_rca_delivery_contract import (
     canonical_artifact_root,
     verify_delivery_bundle,
 )
+from gateway.pnc_rca_abstention_projection import (
+    RcaEvidenceProjectionError,
+    build_gate_a_identifier_binding,
+    build_gate_a_public_result,
+    project_gate_a_report,
+)
 from gateway.pnc_rca_delivery_quarantine_baseline import (
     disabled_quarantine_baseline_status,
     quarantine_baseline_settings,
@@ -1038,53 +1044,55 @@ def _remote_bundle_script(submission_key: str) -> str:
                 raise RuntimeError(missing_code.replace('_missing', '') + '_json_invalid')
             return value
 
+        def read_bound_regular(fd, path, before, max_bytes, changed_code):
+            raw = bytearray()
+            try:
+                while len(raw) <= max_bytes:
+                    chunk = os.read(fd, min(1024 * 1024, max_bytes + 1 - len(raw)))
+                    if not chunk:
+                        break
+                    raw.extend(chunk)
+                if len(raw) > max_bytes:
+                    raise RuntimeError(changed_code.replace('_changed_during_read', '') + '_size_invalid')
+                after = os.fstat(fd)
+                try:
+                    current = os.lstat(path)
+                except FileNotFoundError:
+                    raise RuntimeError(changed_code)
+                if (
+                    not stat.S_ISREG(current.st_mode)
+                    or before.st_dev != after.st_dev
+                    or before.st_ino != after.st_ino
+                    or before.st_size != after.st_size
+                    or before.st_mtime_ns != after.st_mtime_ns
+                    or before.st_ctime_ns != after.st_ctime_ns
+                    or current.st_dev != after.st_dev
+                    or current.st_ino != after.st_ino
+                    or current.st_size != after.st_size
+                    or current.st_mtime_ns != after.st_mtime_ns
+                    or current.st_ctime_ns != after.st_ctime_ns
+                    or len(raw) != after.st_size
+                ):
+                    raise RuntimeError(changed_code)
+                return bytes(raw)
+            except OSError:
+                raise RuntimeError(changed_code)
+            finally:
+                os.close(fd)
+
         def public_report_projection(report_data):
-            # Extract only decision-bearing RCA fields for Feishu projection.
-            summary = report_data.get('summary') if isinstance(report_data.get('summary'), dict) else {{}}
-            receipt = report_data.get('rca_receipt') if isinstance(report_data.get('rca_receipt'), dict) else {{}}
-            responsibility = report_data.get('responsibility') if isinstance(report_data.get('responsibility'), dict) else {{}}
-            if not responsibility and isinstance(receipt.get('responsibility'), dict):
-                responsibility = receipt.get('responsibility')
-            attribution = receipt.get('attribution_expression') if isinstance(receipt.get('attribution_expression'), dict) else {{}}
-            slots = attribution.get('slots') if isinstance(attribution.get('slots'), dict) else {{}}
-            candidate = (
-                responsibility.get('candidate')
-                or responsibility.get('owner')
-                or report_data.get('candidate_responsibility')
-                or report_data.get('responsibility_candidate')
-                or slots.get('responsibility_candidate')
-            )
-            causal = report_data.get('causal_chain') if isinstance(report_data.get('causal_chain'), dict) else {{}}
-            if not causal and isinstance(receipt.get('causal_chain'), dict):
-                causal = receipt.get('causal_chain')
-            narrative = causal.get('narrative') if isinstance(causal.get('narrative'), list) else []
-            narrative = [
-                {{'role': str(item.get('role') or ''), 'text': str(item.get('text') or '')[:1400]}}
-                for item in narrative[:8] if isinstance(item, dict) and (item.get('role') or item.get('text'))
-            ]
-            hypotheses = causal.get('hypotheses') if isinstance(causal.get('hypotheses'), list) else []
-            hypotheses = [
-                {{k: item.get(k) for k in ('narrative', 'text', 'summary') if item.get(k)}}
-                for item in hypotheses[:8] if isinstance(item, dict)
-            ]
-            evidence = report_data.get('evidence_summary') if isinstance(report_data.get('evidence_summary'), dict) else {{}}
-            refs = evidence.get('refs') if isinstance(evidence.get('refs'), list) else []
-            compact_refs = []
-            for item in refs[:8]:
-                if isinstance(item, dict):
-                    compact_refs.append({{k: item.get(k) for k in ('evidence_ref', 'summary', 'field', 'check', 'fit_source') if item.get(k)}})
-                elif item:
-                    compact_refs.append(str(item)[:400])
-            terminal = report_data.get('terminal_diagnostic') if isinstance(report_data.get('terminal_diagnostic'), dict) else {{}}
+            # This VM-side result is a safe placeholder only. The host binds
+            # gate_a_source and recomputes the canonical projection before
+            # contract verification; no VM-side candidate text is trusted.
+            message = '当前无法证明远程读取完整；本次未取得可用于归因的分析数据。'
             return {{
-                'summary': {{k: summary.get(k) for k in ('short_conclusion', 'l0', 'status', 'rca_pattern', 'rca_domain', 'high_confidence_boundary') if summary.get(k)}},
-                'responsibility': {{k: responsibility.get(k) for k in ('candidate', 'owner', 'status', 'boundary', 'missing_evidence') if responsibility.get(k)}},
-                'causal_chain': {{'narrative': narrative, 'hypotheses': hypotheses}},
-                'evidence_summary': {{'refs': compact_refs, 'missing_evidence': [str(x)[:400] for x in (evidence.get('missing_evidence') or [])[:20]]}},
-                'evidence_boundary': [str(x)[:500] for x in (report_data.get('evidence_boundary') or [])[:8]],
-                'user_action': report_data.get('user_action') if isinstance(report_data.get('user_action'), dict) else {{}},
-                'terminal_diagnostic': {{k: terminal.get(k) for k in ('blocker_kind', 'attribution_status', 'stage') if terminal.get(k)}},
-                'candidate': str(candidate or '')[:500],
+                'summary': {{'short_conclusion': message}},
+                'responsibility': {{'status': 'not_attributed', 'candidate': '暂无法判断'}},
+                'causal_chain': {{'narrative': []}},
+                'evidence_summary': {{'refs': [], 'missing_evidence': [message]}},
+                'evidence_boundary': [message],
+                'evaluator_observations': [],
+                'gate_a_level': 'L0_abstain',
             }}
 
         def read_text_artifact(path, expected):
@@ -1433,12 +1441,7 @@ def _remote_bundle_script(submission_key: str) -> str:
             root_norm = posixpath.normpath(ROOT)
             contract = read_json(ROOT + 'delivery_contract.json', 'delivery_contract_missing')
             manifest = read_json(ROOT + 'delivery_manifest.json', 'delivery_manifest_missing')
-            report_data = read_json(ROOT + 'report_data.json', 'report_data_missing')
-            reject_banned_public_phrase(
-                json.dumps(report_data, ensure_ascii=False, sort_keys=True)
-            )
             contract = dict(contract)
-            contract['public_result'] = public_report_projection(report_data)
             contract_artifacts = contract.get('artifacts')
             if not isinstance(contract_artifacts, dict):
                 raise RuntimeError('viz_publication_missing')
@@ -1517,6 +1520,8 @@ def _remote_bundle_script(submission_key: str) -> str:
             artifact_meta = {{}}
             total = 0
             html_path = ''
+            report_data = None
+            report_data_path = ''
             for row in rows:
                 if not isinstance(row, dict):
                     raise RuntimeError('delivery_manifest_artifacts_invalid')
@@ -1548,34 +1553,77 @@ def _remote_bundle_script(submission_key: str) -> str:
                 )
                 if posixpath.commonpath((root_norm, path)) != root_norm or path == root_norm:
                     raise RuntimeError('artifact_path_outside_root')
-                fd, info = open_regular(path, 'artifact_missing', MAX_FILE_BYTES)
+                if path in artifact_meta:
+                    raise RuntimeError('delivery_manifest_duplicate_artifact')
+                is_report_data = role == 'report_data'
+                if is_report_data:
+                    if report_data_path:
+                        raise RuntimeError('delivery_manifest_duplicate_artifact')
+                    if not raw_path.lower().endswith('.json'):
+                        raise RuntimeError('required_report_data_artifact_invalid')
+                    report_data_path = path
+                fd, info = open_regular(
+                    path,
+                    'report_data_missing' if is_report_data else 'artifact_missing',
+                    MAX_JSON_BYTES if is_report_data else MAX_FILE_BYTES,
+                )
                 is_symlink = False
                 is_file = True
                 total += info.st_size
                 if total > MAX_TOTAL_BYTES:
                     os.close(fd)
                     raise RuntimeError('artifact_bundle_too_large')
-                digest = hashlib.sha256()
-                with os.fdopen(fd, 'rb') as handle:
-                    for chunk in iter(lambda: handle.read(1024 * 1024), b''):
-                        digest.update(chunk)
+                if is_report_data:
+                    report_raw = read_bound_regular(
+                        fd,
+                        path,
+                        info,
+                        MAX_JSON_BYTES,
+                        'report_data_changed_during_read',
+                    )
+                    digest_hex = hashlib.sha256(report_raw).hexdigest()
+                    expected_size = row.get('size')
+                    if (
+                        isinstance(expected_size, bool)
+                        or not isinstance(expected_size, int)
+                        or expected_size != info.st_size
+                    ):
+                        raise RuntimeError('report_data_size_mismatch')
+                    if digest_hex != str(row.get('sha256') or '').strip().lower():
+                        raise RuntimeError('report_data_hash_mismatch')
+                    try:
+                        report_data = json.loads(report_raw.decode('utf-8'))
+                    except Exception:
+                        raise RuntimeError('report_data_json_invalid')
+                    if not isinstance(report_data, dict):
+                        raise RuntimeError('report_data_json_invalid')
+                    reject_banned_public_phrase(
+                        json.dumps(report_data, ensure_ascii=False, sort_keys=True)
+                    )
+                else:
+                    digest = hashlib.sha256()
+                    with os.fdopen(fd, 'rb') as handle:
+                        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                            digest.update(chunk)
+                    digest_hex = digest.hexdigest()
                 observed.append({{
                     'path': path,
                     'size': info.st_size,
-                    'sha256': digest.hexdigest(),
+                    'sha256': digest_hex,
                     'is_file': is_file,
                     'is_symlink': is_symlink,
                     'parents_symlink_free': symlink_free(path),
                 }})
-                if path in artifact_meta:
-                    raise RuntimeError('delivery_manifest_duplicate_artifact')
                 artifact_meta[path] = {{
                     'media_type': media_type,
                     'size': info.st_size,
-                    'sha256': digest.hexdigest(),
+                    'sha256': digest_hex,
                 }}
                 if role == 'index_html':
                     html_path = path
+            if not report_data_path or report_data is None:
+                raise RuntimeError('required_report_data_artifact_missing')
+            contract['public_result'] = public_report_projection(report_data)
             if not html_path:
                 raise RuntimeError('required_html_artifact_missing')
             dependencies = []
@@ -1626,6 +1674,24 @@ def _remote_bundle_script(submission_key: str) -> str:
                 'delivery_manifest': manifest,
                 'observed_files': observed,
                 'html_dependencies': dependencies,
+                'gate_a_source': {{
+                    'input_materialized': report_data.get('input_materialized'),
+                    # The sealed report artifact was read through the
+                    # manifest-bound, regular-file path above.  Older report
+                    # schemas omit input_materialized; this attestation keeps
+                    # that legacy shape fail-closed without guessing from
+                    # evaluator presence alone.
+                    'materialization_attested': True,
+                    'failure_class': report_data.get('failure_class') or (
+                        report_data.get('terminal_diagnostic', {{}}).get('blocker_kind')
+                        if isinstance(report_data.get('terminal_diagnostic'), dict)
+                        else None
+                    ),
+                    'frame_lookup': report_data.get('frame_lookup'),
+                    'marker_time': report_data.get('marker_time'),
+                    'event_uuid': report_data.get('event_uuid'),
+                    'rca_evaluators': report_data.get('rca_evaluators'),
+                }},
             }})
         except RuntimeError as exc:
             code = str(exc)
@@ -1682,6 +1748,72 @@ def default_artifact_bundle_reader(
             code, str(payload.get("error") or code), permanent=permanent
         )
     return payload
+
+
+def _apply_gate_a_bundle_projection(bundle: Mapping[str, Any]) -> dict[str, Any]:
+    """Bind the host-side fail-closed projection before contract verification."""
+    if not isinstance(bundle, Mapping):
+        raise DeliveryContractError("gate_a_bundle_invalid")
+    source = bundle.get("gate_a_source")
+    if source is None and "delivery_contract" not in bundle:
+        # A caller that replaces verification entirely (for example an
+        # isolated store test) has no sealed report to project here.
+        return dict(bundle)
+    if source is None:
+        # A missing envelope means the worker/reader contract is broken.  Do
+        # not turn that schema/version failure into a successful L0 result.
+        raise DeliveryContractError("gate_a_source_missing")
+    contract = bundle.get("delivery_contract")
+    if not isinstance(contract, Mapping):
+        raise DeliveryContractError("delivery_contract_missing")
+    try:
+        identifier_binding = (
+            build_gate_a_identifier_binding(contract.get("consumer_capability"))
+            if source.get("rca_evaluators")
+            else None
+        )
+        projection = project_gate_a_report(
+            source,
+            identifier_binding=identifier_binding,
+        )
+        public_result = build_gate_a_public_result(projection)
+    except RcaEvidenceProjectionError as exc:
+        raise DeliveryContractError(
+            "gate_a_projection_invalid", f"gate_a_projection_invalid: {exc}"
+        ) from exc
+    contract = dict(contract)
+    contract["gate_a_projection"] = projection
+    contract["public_result"] = public_result
+    contract["summary"] = dict(public_result["summary"])
+    report = contract.get("report")
+    if isinstance(report, Mapping):
+        report = dict(report)
+        for field in (
+            "candidate_owner_domain",
+            "candidate_owner",
+            "candidate_responsibility",
+            "responsibility_candidate",
+            "is_candidate",
+        ):
+            report.pop(field, None)
+        contract["report"] = report
+    for field in (
+        "quality_classification",
+        "terminal_class",
+        "confidence_tier",
+        "approval_ready",
+        "human_decision",
+    ):
+        contract.pop(field, None)
+    artifacts = contract.get("artifacts")
+    if isinstance(artifacts, Mapping):
+        artifacts = dict(artifacts)
+        artifacts.pop("attribution_causal_text", None)
+        contract["artifacts"] = artifacts
+    contract["evidence_boundary"] = list(
+        public_result.get("evidence_boundary") or []
+    )
+    return {**dict(bundle), "delivery_contract": contract}
 
 
 def _w3_execution_binding(
@@ -2853,6 +2985,7 @@ class DeliveryCollector:
             bundle = self.artifact_bundle_reader(claim)
             if not isinstance(bundle, Mapping):
                 raise ArtifactBundleReadError("artifact_reader_response_invalid")
+            bundle = _apply_gate_a_bundle_projection(bundle)
             w3_binding = None
             if snapshot_bundle is not None:
                 _validate_w3_delivery_bundle(bundle, snapshot_bundle)

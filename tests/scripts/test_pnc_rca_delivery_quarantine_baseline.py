@@ -92,6 +92,13 @@ def _dispatcher_config(bundle, tmp_path, *, sha256, enabled=False):
             "HERMES_RCA_DELIVERY_DISPATCHER_HEALTH_PATH": str(
                 tmp_path / "dispatcher-health.json"
             ),
+            "HERMES_RCA_DELIVERY_DISPATCHER_OBSERVABILITY_PATH": str(
+                tmp_path / "dispatcher-observations.jsonl"
+            ),
+            "HERMES_RCA_DELIVERY_DISPATCHER_INVENTORY_PIN": "a" * 64,
+            "HERMES_RCA_DELIVERY_DISPATCHER_OBSERVATION_RELEASE_ID": (
+                "quarantine-baseline-test"
+            ),
             BASELINE_PATH_ENV: str(bundle["baseline_path"]),
             BASELINE_SHA256_ENV: sha256,
             PROD_RELEASE_ID_ENV: bundle["core"]["release_id"],

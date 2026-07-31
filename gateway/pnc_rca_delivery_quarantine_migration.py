@@ -19,15 +19,15 @@ from gateway.pnc_rca_conclusion_adjudication import (
 SCHEMA_VERSION = "pnc_rca_delivery_quarantine_offline_migration_v1"
 SOURCE_SCHEMA_VERSION = "pnc_rca_delivery_store_v6"
 TARGET_SCHEMA_VERSION = "pnc_rca_delivery_store_v8"
-COMBINED_SCHEMA_VERSION = "pnc_rca_delivery_store_offline_migration_v2"
+COMBINED_SCHEMA_VERSION = "pnc_rca_delivery_store_offline_migration_v3"
 COMBINED_SOURCE_SCHEMA_VERSIONS = frozenset(
     {
         "pnc_rca_delivery_store_v7",
         "pnc_rca_delivery_store_v8",
-        "pnc_rca_delivery_store_v9",
+        "pnc_rca_delivery_store_v10",
     }
 )
-COMBINED_TARGET_SCHEMA_VERSION = "pnc_rca_delivery_store_v10"
+COMBINED_TARGET_SCHEMA_VERSION = "pnc_rca_delivery_store_v11"
 MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
 _HEX64 = frozenset("0123456789abcdef")
 _FIELDS = frozenset({
@@ -103,6 +103,7 @@ _COMBINED_W5_CUTOFF_META_KEY = "w5_external_write_fence_cutoff"
 _COMBINED_W5_CUTOFF_META_VALUE = "2026-07-25T00:00:00+00:00"
 _COMBINED_ACTIVE_PROD_V7_VARIANT = "active_prod_v7_no_adjudication_v1"
 _COMBINED_W2_V8_VARIANT = "w2_v8_failure_routes_adjudication_v1"
+_COMBINED_V10_PRE_OBSERVABILITY_VARIANT = "v10_without_observation_outbox_v1"
 _COMBINED_ALLOWED_ADDED_TABLES = {
     _COMBINED_ACTIVE_PROD_V7_VARIANT: frozenset(
         {
@@ -110,10 +111,17 @@ _COMBINED_ALLOWED_ADDED_TABLES = {
             "rca_conclusion_adjudications",
             "rca_failure_routes",
             "rca_delivery_subscription_events",
+            "rca_delivery_observation_outbox",
         }
     ),
     _COMBINED_W2_V8_VARIANT: frozenset(
-        {"rca_conclusion_adjudication_repairs"}
+        {
+            "rca_conclusion_adjudication_repairs",
+            "rca_delivery_observation_outbox",
+        }
+    ),
+    _COMBINED_V10_PRE_OBSERVABILITY_VARIANT: frozenset(
+        {"rca_delivery_observation_outbox"}
     ),
 }
 _COMBINED_EFFECT_COLUMN_DEFINITIONS = {
@@ -167,7 +175,17 @@ _COMBINED_COMMENT_SLOT_INDEX_CONTRACT = (
     "rca_delivery_effects",
     "b0ef33faf578767c840105b949de578cd568cd794aa4354c4324d8039b94304c",
 )
-_COMBINED_CANONICAL_V9_OBJECTS = {
+_COMBINED_CANONICAL_TARGET_OBJECTS = {
+    "rca_delivery_observation_outbox": (
+        "table",
+        "rca_delivery_observation_outbox",
+        "56ac3767f64f26666da68a7eff78e04e81dc94ad49c73ffde2ce7408cf4a7e0e",
+    ),
+    "idx_delivery_observation_outbox_status": (
+        "index",
+        "rca_delivery_observation_outbox",
+        "d5be40072c9c9edba2fa7b0602daa22d7545c5e68d1e2e49745149a283c50637",
+    ),
     "idx_failure_routes_status": (
         "index",
         "rca_failure_routes",
@@ -600,6 +618,23 @@ def _combined_source_schema_variant(
     adjudication_table = "rca_conclusion_adjudications"
     repair_table = "rca_conclusion_adjudication_repairs"
     failure_table = "rca_failure_routes"
+    observation_outbox = "rca_delivery_observation_outbox"
+    if source_version == "pnc_rca_delivery_store_v10":
+        if observation_outbox in tables:
+            raise QuarantineMigrationError(
+                "delivery_store_combined_migration_"
+                "v10_observation_outbox_operator_rebuild_required"
+            )
+        _assert_combined_schema_object_contract(
+            conn,
+            owned_tables=frozenset(
+                {adjudication_table, repair_table, failure_table}
+            ),
+            error_code=(
+                "delivery_store_combined_migration_source_schema_contract_invalid"
+            ),
+        )
+        return _COMBINED_V10_PRE_OBSERVABILITY_VARIANT
     if source_version == "pnc_rca_delivery_store_v7":
         if (
             {adjudication_table, repair_table, failure_table} & tables
@@ -814,6 +849,8 @@ def _expected_combined_added_table_rows(
     target_columns: list[str],
     source_variant: str,
 ) -> list[dict[str, Any]]:
+    if table == "rca_delivery_observation_outbox":
+        return []
     if table == "rca_delivery_subscription_events":
         source_rows = _project_table_rows(
             source,
@@ -912,7 +949,7 @@ def _assert_combined_schema_object_contract(
     objects = _normalized_schema_objects(conn)
     expected = {
         name: contract
-        for name, contract in _COMBINED_CANONICAL_V9_OBJECTS.items()
+        for name, contract in _COMBINED_CANONICAL_TARGET_OBJECTS.items()
         if contract[1] in owned_tables
     }
     observed = {
@@ -949,6 +986,7 @@ def _validate_combined_target_schema_contract(conn: sqlite3.Connection) -> None:
                 "rca_conclusion_adjudications",
                 "rca_conclusion_adjudication_repairs",
                 "rca_failure_routes",
+                "rca_delivery_observation_outbox",
             }
         ),
         error_code=(
@@ -958,7 +996,7 @@ def _validate_combined_target_schema_contract(conn: sqlite3.Connection) -> None:
 
 
 def validate_combined_target_schema(conn: sqlite3.Connection) -> dict[str, Any]:
-    """Validate the complete combined-v9 target without mutating it."""
+    """Validate the complete current target without mutating it."""
 
     schema_version = _schema_version(conn)
     if schema_version != COMBINED_TARGET_SCHEMA_VERSION:
@@ -969,12 +1007,12 @@ def validate_combined_target_schema(conn: sqlite3.Connection) -> dict[str, Any]:
     health = _combined_database_health(conn)
     return {
         "schema_version": schema_version,
-        "canonical_object_count": len(_COMBINED_CANONICAL_V9_OBJECTS),
+        "canonical_object_count": len(_COMBINED_CANONICAL_TARGET_OBJECTS),
         **health,
     }
 
 
-def _expected_effects_v9_schema_sql(source_sql: str) -> str:
+def _expected_effects_target_schema_sql(source_sql: str) -> str:
     scratch = sqlite3.connect(":memory:")
     try:
         scratch.execute(source_sql)
@@ -1000,7 +1038,7 @@ def _expected_effects_v9_schema_sql(source_sql: str) -> str:
     return "".join(str(row[0] if row else "").split()).lower()
 
 
-def _expected_subscriptions_v9_schema_sql(source_sql: str) -> str:
+def _expected_subscriptions_target_schema_sql(source_sql: str) -> str:
     scratch = sqlite3.connect(":memory:")
     try:
         scratch.execute(source_sql)
@@ -1043,12 +1081,14 @@ def _combined_source_schema_preservation(
         target_object = target_objects[name]
         expected_sql = source_object["normalized_sql"]
         if name == "rca_delivery_effects" and source_object["type"] == "table":
-            expected_sql = _expected_effects_v9_schema_sql(source_object["sql"])
+            expected_sql = _expected_effects_target_schema_sql(source_object["sql"])
         if (
             name == "rca_delivery_subscriptions"
             and source_object["type"] == "table"
         ):
-            expected_sql = _expected_subscriptions_v9_schema_sql(source_object["sql"])
+            expected_sql = _expected_subscriptions_target_schema_sql(
+                source_object["sql"]
+            )
         if (
             target_object["type"] != source_object["type"]
             or target_object["table"] != source_object["table"]
@@ -1077,7 +1117,7 @@ def _combined_source_schema_preservation(
     }
     expected_added_objects = {
         name: contract
-        for name, contract in _COMBINED_CANONICAL_V9_OBJECTS.items()
+        for name, contract in _COMBINED_CANONICAL_TARGET_OBJECTS.items()
         if contract[1] in allowed_added_tables
     }
     for name, contract in _COMBINED_CANONICAL_SUBSCRIPTION_OBJECTS.items():
@@ -1129,7 +1169,7 @@ def _combined_cross_projection_preservation(
     source_projection: Mapping[str, Any],
     target_projection: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Prove the v9 clone preserves every source-owned row semantically."""
+    """Prove the current clone preserves every source-owned row semantically."""
 
     source_tables = source_projection["tables"]
     target_tables = target_projection["tables"]
@@ -1172,10 +1212,75 @@ def _combined_cross_projection_preservation(
         else set()
     )
     for table in sorted(source_names):
-        # SQLite's AUTOINCREMENT bookkeeping is derived metadata. Adding the
-        # subscription event table legitimately adds one sqlite_sequence row;
-        # it is not a source-owned business row to preserve byte-for-byte.
         if table == "sqlite_sequence":
+            source_table = source_tables[table]
+            target_table = target_tables[table]
+            source_columns = list(source_table["columns"])
+            target_columns = list(target_table["columns"])
+            if source_columns != ["name", "seq"] or target_columns != source_columns:
+                raise QuarantineMigrationError(
+                    "delivery_store_combined_migration_cross_projection_mismatch"
+                )
+            source_rows = _project_table_rows(
+                source,
+                table=table,
+                columns=source_columns,
+                order=source_columns,
+            )
+            expected_target_rows = [dict(row) for row in source_rows]
+            allowed_added_rows: list[dict[str, Any]] = []
+            subscription_events = "rca_delivery_subscription_events"
+            if (
+                subscription_events in allowed_added_tables
+                and not any(row["name"] == subscription_events for row in source_rows)
+            ):
+                maximum_event_id = clone.execute(
+                    "SELECT MAX(event_id) FROM rca_delivery_subscription_events"
+                ).fetchone()[0]
+                if maximum_event_id is not None:
+                    allowed_added_rows.append(
+                        {"name": subscription_events, "seq": int(maximum_event_id)}
+                    )
+                    expected_target_rows.extend(allowed_added_rows)
+            expected_target_rows.sort(
+                key=lambda row: (str(row["name"]), int(row["seq"]))
+            )
+            observed_target_rows = _project_table_rows(
+                clone,
+                table=table,
+                columns=target_columns,
+                order=target_columns,
+            )
+            if observed_target_rows != expected_target_rows:
+                raise QuarantineMigrationError(
+                    "delivery_store_combined_migration_cross_projection_mismatch"
+                )
+            source_rows_sha256 = hashlib.sha256(_canonical(source_rows)).hexdigest()
+            expected_target_rows_sha256 = hashlib.sha256(
+                _canonical(expected_target_rows)
+            ).hexdigest()
+            observed_target_rows_sha256 = hashlib.sha256(
+                _canonical(observed_target_rows)
+            ).hexdigest()
+            if (
+                len(source_rows) != source_table["row_count"]
+                or source_rows_sha256 != source_table["rows_sha256"]
+                or len(observed_target_rows) != target_table["row_count"]
+                or observed_target_rows_sha256 != target_table["rows_sha256"]
+            ):
+                raise QuarantineMigrationError(
+                    "delivery_store_combined_migration_cross_projection_mismatch"
+                )
+            table_evidence[table] = {
+                "source_columns": source_columns,
+                "added_target_columns": [],
+                "source_row_count": len(source_rows),
+                "target_preserved_row_count": len(source_rows),
+                "allowed_added_target_rows": allowed_added_rows,
+                "source_rows_sha256": source_rows_sha256,
+                "expected_target_rows_sha256": expected_target_rows_sha256,
+                "observed_target_rows_sha256": observed_target_rows_sha256,
+            }
             continue
         source_table = source_tables[table]
         target_table = target_tables[table]
@@ -1644,7 +1749,7 @@ def build_combined_offline_migration_receipt(
     migration_runtime_sha256: str,
     expected_source_schema_sha256: str,
 ) -> dict[str, Any]:
-    """Build a v7/W2-v8 to combined-v9 receipt from offline copies only."""
+    """Build a supported predecessor-to-v11 receipt from offline copies only."""
 
     source_path = Path(source_backup_path).expanduser().absolute()
     clone_path = Path(migrated_clone_path).expanduser().absolute()
@@ -1856,6 +1961,7 @@ def validate_combined_migration_receipt(
     expected_source_variant = {
         "pnc_rca_delivery_store_v7": _COMBINED_ACTIVE_PROD_V7_VARIANT,
         "pnc_rca_delivery_store_v8": _COMBINED_W2_V8_VARIANT,
+        "pnc_rca_delivery_store_v10": _COMBINED_V10_PRE_OBSERVABILITY_VARIANT,
     }.get(source_version)
     if (
         set(value) != _COMBINED_FIELDS
@@ -2071,7 +2177,7 @@ def assert_combined_live_post_migration_matches(
     expected_migration_runtime_sha256: str,
     expected_source_schema_sha256: str,
 ) -> dict[str, Any]:
-    """Require the stopped live database to exactly match the v2 v9 clone."""
+    """Require the stopped live database to exactly match the v3 v11 clone."""
 
     binding = validate_combined_migration_receipt(
         receipt_path=receipt_path,

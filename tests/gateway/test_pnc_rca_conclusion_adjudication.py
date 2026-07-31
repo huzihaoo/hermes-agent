@@ -339,6 +339,13 @@ def _dispatcher(
         reconciliation_visibility_grace_seconds=30,
         reconciliation_min_missing_reads=2,
         recovery_write_interval_seconds=30,
+        observability_enabled=True,
+        observability_path=store.db_path.with_name(
+            "conclusion-adjudication-observations.jsonl"
+        ),
+        inventory_pin="c" * 64,
+        observation_release_id="conclusion-adjudication-test",
+        quarantine_release_id="",
     )
     return DeliveryDispatcher(
         store=store,
@@ -1304,7 +1311,7 @@ def test_w2_v8_migrates_explicitly_to_combined_v10_schema(tmp_path):
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'rca_conclusion_adjudication_repairs'"
         ).fetchone()
-    assert marker == "pnc_rca_delivery_store_v10"
+    assert marker == "pnc_rca_delivery_store_v11"
     assert failure_routes is not None
     assert repairs is not None
 

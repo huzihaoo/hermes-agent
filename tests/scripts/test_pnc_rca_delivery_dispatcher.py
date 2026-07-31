@@ -17,6 +17,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from gateway.pnc_rca_abstention_projection import (
+    build_gate_a_identifier_binding,
+    build_gate_a_public_result,
+    project_gate_a_report as _project_gate_a_report,
+)
 from gateway.pnc_rca_delivery_contract import (
     DELIVERY_EFFECT_KIND,
     DELIVERY_EFFECT_SCHEMA_VERSION_V1,
@@ -29,8 +34,14 @@ from gateway.pnc_rca_delivery_contract import (
 from gateway.pnc_rca_control_store import RcaControlStore
 from gateway.pnc_rca_provider_fence import build_write_fence_provider_claim
 from gateway.pnc_rca_delivery_store import (
+    DeliveryObservationIntent,
     RcaDeliveryStore,
     StaleDeliveryEffectLeaseError,
+)
+from gateway.pnc_rca_delivery_observability import (
+    OBSERVATION_SCHEMA_VERSION,
+    DeliveryObservationError,
+    append_delivery_observation,
 )
 from gateway.pnc_rca_runtime_identity import GATEWAY_LOADED_DEPENDENCIES
 from scripts import pnc_rca_delivery_dispatcher as dispatcher_module
@@ -67,6 +78,40 @@ from tests.gateway.test_pnc_rca_delivery_contract import (
 _TEST_PROVIDER_WRITE_CLAIM = build_write_fence_provider_claim({"state": "issued"})
 
 
+def project_gate_a_report(source):
+    evaluators = source.get("rca_evaluators") or []
+    signals = {
+        reference["signal"]
+        for evaluator in evaluators
+        for reference in evaluator.get("evidence_refs") or []
+        if reference.get("signal") is not None
+    }
+    fields = {
+        field
+        for evaluator in evaluators
+        for reference in evaluator.get("evidence_refs") or []
+        for field in (
+            [reference["field"]] if reference.get("field") is not None else []
+        ) + list(reference.get("fields") or [])
+    }
+    binding = (
+        build_gate_a_identifier_binding({
+            "actual_evaluators": [
+                {
+                    "evaluator_id": evaluator.get("key"),
+                    "status": evaluator.get("status"),
+                }
+                for evaluator in evaluators
+            ],
+            "actual_signals": sorted(signals),
+            "actual_fields": sorted(fields),
+        })
+        if evaluators
+        else None
+    )
+    return _project_gate_a_report(source, identifier_binding=binding)
+
+
 def _test_provider_revalidate(
     _claim,
     *,
@@ -83,12 +128,10 @@ def _test_provider_revalidate(
         "ledger_id": 1,
     }
     if operation == "feishu_thread_reply":
-        binding.update(
-            {
-                "chat_id": "oc_group123",
-                "thread_id": thread_id,
-            }
-        )
+        binding.update({
+            "chat_id": "oc_group123",
+            "thread_id": thread_id,
+        })
     return binding
 
 
@@ -203,9 +246,14 @@ def test_clear_circuit_cli_closes_selected_circuit_without_claiming_effects(
         classmethod(lambda _cls: config),
     )
 
-    assert dispatcher_module.main(
-        ["--clear-circuit", "--effect-kind", DELIVERY_EFFECT_KIND]
-    ) == 0
+    assert (
+        dispatcher_module.main([
+            "--clear-circuit",
+            "--effect-kind",
+            DELIVERY_EFFECT_KIND,
+        ])
+        == 0
+    )
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is True
@@ -303,6 +351,11 @@ def _collector(
 
 def _seed(tmp_path, *, bundle_payload=None):
     control, result = _control(tmp_path)
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute(
+            "UPDATE business_triggers SET created_at = ? WHERE submission_key = ?",
+            (NOW.isoformat(), result.submission_key),
+        )
     _bind_activation_execution(control, result, state="steady_active")
     collector = _collector(
         tmp_path,
@@ -316,6 +369,11 @@ def _seed(tmp_path, *, bundle_payload=None):
 
 def _seed_with_thread_subscription(tmp_path, *, bundle_payload=None):
     control, result = _control(tmp_path)
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute(
+            "UPDATE business_triggers SET created_at = ? WHERE submission_key = ?",
+            (NOW.isoformat(), result.submission_key),
+        )
     _bind_activation_execution(control, result, state="steady_active")
     trigger = control.list_rows("business_triggers")[0]
     store = RcaDeliveryStore(tmp_path / "control.sqlite3")
@@ -349,6 +407,11 @@ def _seed_terminal(tmp_path, *, with_thread: bool = False):
     asserting that the current collector may create them.
     """
     control, result = _control(tmp_path)
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute(
+            "UPDATE business_triggers SET created_at = ? WHERE submission_key = ?",
+            (NOW.isoformat(), result.submission_key),
+        )
     _bind_activation_execution(control, result, state="steady_active")
     store = RcaDeliveryStore(tmp_path / "control.sqlite3")
     if with_thread:
@@ -393,6 +456,27 @@ def _web_bundle_payload():
         "delivery_manifest": manifest,
         "observed_files": observed,
         "html_dependencies": dependencies,
+        # Dispatcher fixtures now model the sealed Gate A envelope that the
+        # collector requires before creating a delivery effect.
+        "gate_a_source": {
+            "input_materialized": True,
+            "materialization_attested": True,
+            "rca_evaluators": [
+                {
+                    "key": "aeb_trigger",
+                    "domain": "ACC",
+                    "pattern": "fixture",
+                    "status": "supported",
+                    "evidence_refs": [
+                        {
+                            "signal": "AEBReq",
+                            "evidence": "窗口内观测到测试事实。",
+                            "window": [-1.0, 1.0],
+                        }
+                    ],
+                }
+            ],
+        },
     }
 
 
@@ -412,6 +496,25 @@ def _html_only_bundle_payload():
         "delivery_manifest": manifest,
         "observed_files": observed,
         "html_dependencies": dependencies,
+        "gate_a_source": {
+            "input_materialized": True,
+            "materialization_attested": True,
+            "rca_evaluators": [
+                {
+                    "key": "aeb_trigger",
+                    "domain": "ACC",
+                    "pattern": "fixture",
+                    "status": "supported",
+                    "evidence_refs": [
+                        {
+                            "signal": "AEBReq",
+                            "evidence": "窗口内观测到测试事实。",
+                            "window": [-1.0, 1.0],
+                        }
+                    ],
+                }
+            ],
+        },
     }
 
 
@@ -521,9 +624,7 @@ class Clock:
 
 
 def _verified_report(url, size, sha256):
-    assert url.startswith(
-        "https://192.168.21.217/?ds=foxglove-http&ds.mcapPath="
-    )
+    assert url.startswith("https://192.168.21.217/?ds=foxglove-http&ds.mcapPath=")
     return {
         "success": True,
         "status_code": 200,
@@ -568,6 +669,538 @@ def _dispatcher(
         remote,
         clock,
     )
+
+
+def test_enabled_config_requires_bound_observability_identity(tmp_path):
+    values = {
+        "HERMES_RCA_DELIVERY_DISPATCHER_ENABLED": "true",
+        "HERMES_RCA_DELIVERY_DISPATCHER_OBSERVABILITY_ENABLED": "true",
+        "HERMES_RCA_DELIVERY_DISPATCHER_INVENTORY_PIN": "a" * 63,
+        "HERMES_RCA_DELIVERY_DISPATCHER_OBSERVATION_RELEASE_ID": "release-test",
+    }
+    with pytest.raises(ValueError, match="INVENTORY_PIN"):
+        DispatcherConfig.from_env(values, hermes_home=tmp_path)
+
+    values["HERMES_RCA_DELIVERY_DISPATCHER_INVENTORY_PIN"] = "a" * 64
+    values.pop("HERMES_RCA_DELIVERY_DISPATCHER_OBSERVATION_RELEASE_ID")
+    with pytest.raises(ValueError, match="OBSERVATION_RELEASE_ID"):
+        DispatcherConfig.from_env(values, hermes_home=tmp_path)
+
+
+def _observation_intent(index: int) -> DeliveryObservationIntent:
+    fields = {
+        "schema_version": OBSERVATION_SCHEMA_VERSION,
+        "work_item_id": f"work-{index}",
+        "case_key": f"case-{index}",
+        "delivered_at": "2026-07-31T08:00:00+00:00",
+        "level": "L0_abstain",
+        "has_attribution": False,
+        "viz_published": False,
+        "viz_bytes": 0,
+        "evidence_channel_msg_count": None,
+        "evidence_channel_msg_count_not_measured_reason": "not_measured",
+        "evidence_refs_nonempty": None,
+        "evidence_refs_nonempty_not_measured_reason": "not_measured",
+        "evaluator_hit_count": 0,
+        "pipeline_elapsed_seconds": 1.0,
+        "outcome_content_sha256": f"{index:064x}",
+        "remote_receipt_id": f"receipt-{index}",
+        "release_id": "release-test-observability",
+        "inventory_pin": "1" * 64,
+    }
+    fields["observation_id"] = dispatcher_module.delivery_observation_id(fields)
+    payload = dispatcher_module.build_delivery_observation(fields)
+    payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return DeliveryObservationIntent(
+        observation_id=payload["observation_id"],
+        effect_key=f"effect-{index}",
+        payload=payload,
+        payload_sha256=hashlib.sha256(payload_json.encode("utf-8")).hexdigest(),
+        created_at=f"2026-07-31T08:00:{index % 60:02d}+00:00",
+    )
+
+
+def test_observation_flush_drains_more_than_one_thousand_pending_intents(
+    tmp_path, monkeypatch
+):
+    dispatcher, _remote, _clock = _dispatcher(tmp_path)
+    pending = {
+        intent.observation_id: intent
+        for intent in map(_observation_intent, range(1001))
+    }
+    appended: dict[str, DeliveryObservationIntent] = {}
+    batch_sizes: list[int] = []
+
+    def list_all(**_kwargs):
+        return list(pending.values()) + [
+            replace(intent, status="appended") for intent in appended.values()
+        ]
+
+    def list_pending(*, limit):
+        batch = list(pending.values())[:limit]
+        batch_sizes.append(len(batch))
+        return batch
+
+    def mark_appended(*, observation_id, payload_sha256, now):
+        del now
+        intent = pending.pop(observation_id)
+        assert intent.payload_sha256 == payload_sha256
+        appended[observation_id] = intent
+        return True
+
+    monkeypatch.setattr(dispatcher.store, "list_delivery_observations", list_all)
+    monkeypatch.setattr(
+        dispatcher.store, "list_pending_delivery_observations", list_pending
+    )
+    monkeypatch.setattr(
+        dispatcher.store, "mark_delivery_observation_appended", mark_appended
+    )
+    observed_hashes: dict[str, str] = {}
+
+    def append_verified(_path, fields):
+        observation = dict(fields)
+        observed_hashes[observation["observation_id"]] = (
+            dispatcher_module.delivery_observation_payload_sha256(observation)
+        )
+        return SimpleNamespace(
+            observation=observation,
+            receipt=SimpleNamespace(
+                payload_sha256_by_id=dict(observed_hashes),
+            ),
+        )
+
+    monkeypatch.setattr(
+        dispatcher_module,
+        "append_delivery_observation_verified",
+        append_verified,
+    )
+    monkeypatch.setattr(
+        dispatcher_module,
+        "read_delivery_observation_receipt",
+        lambda _path: SimpleNamespace(
+            payload_sha256_by_id=dict(observed_hashes),
+        ),
+    )
+
+    dispatcher._flush_pending_delivery_observations()
+
+    assert not pending
+    assert len(appended) == 1001
+    assert batch_sizes == [1000, 1, 0]
+    assert dispatcher.stats.observability_written == 1001
+
+
+def test_idle_observation_flush_fully_rereads_and_revalidates_changed_identity(
+    tmp_path, monkeypatch
+):
+    dispatcher, _remote, _clock = _dispatcher(tmp_path)
+    original_read = dispatcher_module.read_delivery_observation_receipt
+    read_calls = 0
+
+    def count_reads(path):
+        nonlocal read_calls
+        read_calls += 1
+        return original_read(path)
+
+    monkeypatch.setattr(
+        dispatcher_module, "read_delivery_observation_receipt", count_reads
+    )
+
+    assert dispatcher.dispatch_one().status == "idle"
+    assert dispatcher.dispatch_one().status == "idle"
+    assert read_calls == 4
+
+    intent = _observation_intent(1)
+    append_delivery_observation(
+        dispatcher.config.observability_path, intent.payload
+    )
+    with pytest.raises(DeliveryObservationError) as raised:
+        dispatcher.dispatch_one()
+
+    assert raised.value.code == "observation_receipt_untracked_id"
+    assert read_calls == 5
+
+
+def test_appended_observation_hash_is_reconciled_before_claim(tmp_path, monkeypatch):
+    dispatcher, remote, _clock = _dispatcher(tmp_path)
+    intent = _observation_intent(1)
+    receipt_path = Path(dispatcher.config.observability_path)
+    append_delivery_observation(receipt_path, intent.payload)
+    altered = replace(intent, payload_sha256="c" * 64, status="appended")
+
+    monkeypatch.setattr(
+        dispatcher.store,
+        "list_delivery_observations",
+        lambda **_kwargs: [altered],
+    )
+    monkeypatch.setattr(
+        dispatcher.store,
+        "list_pending_delivery_observations",
+        lambda **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        dispatcher.store,
+        "claim_due_effect",
+        lambda **_kwargs: pytest.fail("claim must not run before reconciliation"),
+    )
+    with pytest.raises(DeliveryObservationError) as raised:
+        dispatcher.dispatch_one()
+
+    assert raised.value.code == "observation_receipt_payload_hash_mismatch"
+    assert remote.add_calls == 0
+
+
+def test_missing_appended_observation_blocks_before_claim(tmp_path, monkeypatch):
+    dispatcher, remote, _clock = _dispatcher(tmp_path)
+    intent = replace(_observation_intent(2), status="appended")
+    Path(dispatcher.config.observability_path).write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        dispatcher.store,
+        "list_delivery_observations",
+        lambda **_kwargs: [intent],
+    )
+    monkeypatch.setattr(
+        dispatcher.store,
+        "list_pending_delivery_observations",
+        lambda **_kwargs: [],
+    )
+
+    monkeypatch.setattr(
+        dispatcher.store,
+        "claim_due_effect",
+        lambda **_kwargs: pytest.fail("claim must not run before reconciliation"),
+    )
+    with pytest.raises(DeliveryObservationError) as raised:
+        dispatcher.dispatch_one()
+
+    assert raised.value.code == "observation_appended_receipt_missing"
+    assert remote.add_calls == 0
+
+
+def test_observation_outbox_recovers_after_append_failure_without_duplicate_write(
+    tmp_path, monkeypatch
+):
+    store = _seed(tmp_path)
+    dispatcher, remote, _clock = _dispatcher(tmp_path)
+    original_append = dispatcher_module.append_delivery_observation_verified
+    calls = 0
+
+    def fail_once(path, fields):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("simulated observation append crash")
+        return original_append(path, fields)
+
+    monkeypatch.setattr(
+        dispatcher_module, "append_delivery_observation_verified", fail_once
+    )
+    with pytest.raises(OSError, match="simulated observation append crash"):
+        dispatcher.dispatch_one()
+    assert remote.add_calls == 1
+    assert store.pending_delivery_observation_count() == 1
+
+    monkeypatch.setattr(
+        dispatcher_module, "append_delivery_observation_verified", original_append
+    )
+    outcome = dispatcher.dispatch_one()
+    assert outcome.status == "idle"
+    assert remote.add_calls == 1
+    assert store.pending_delivery_observation_count() == 0
+    assert (
+        len(
+            Path(dispatcher.config.observability_path)
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
+        == 1
+    )
+
+
+def test_observation_path_replacement_after_append_never_marks_outbox_appended(
+    tmp_path,
+    monkeypatch,
+):
+    store = _seed(tmp_path)
+    dispatcher, remote, _clock = _dispatcher(tmp_path)
+    original_append = dispatcher_module.append_delivery_observation_verified
+    rotated_path = tmp_path / "replaced-observations.jsonl"
+
+    def append_then_replace(path, fields):
+        result = original_append(path, fields)
+        destination = Path(path)
+        destination.replace(rotated_path)
+        destination.write_bytes(b"")
+        destination.chmod(0o600)
+        return result
+
+    monkeypatch.setattr(
+        dispatcher_module,
+        "append_delivery_observation_verified",
+        append_then_replace,
+    )
+
+    with pytest.raises(DeliveryObservationError) as raised:
+        dispatcher.dispatch_one()
+
+    assert raised.value.code == "observation_appended_receipt_missing"
+    assert remote.add_calls == 1
+    assert store.pending_delivery_observation_count() == 1
+    [intent] = store.list_delivery_observations()
+    assert intent.status == "pending"
+    assert Path(dispatcher.config.observability_path).read_bytes() == b""
+    assert len(rotated_path.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_observation_torn_tail_recovers_only_from_pending_canonical_frame(
+    tmp_path,
+    monkeypatch,
+):
+    store = _seed(tmp_path)
+    dispatcher, remote, _clock = _dispatcher(tmp_path)
+    original_append = dispatcher_module.append_delivery_observation_verified
+
+    monkeypatch.setattr(
+        dispatcher_module,
+        "append_delivery_observation_verified",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("simulated short observation append")
+        ),
+    )
+    with pytest.raises(OSError, match="simulated short observation append"):
+        dispatcher.dispatch_one()
+    assert remote.add_calls == 1
+    [intent] = store.list_pending_delivery_observations()
+    canonical = json.dumps(
+        intent.payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    receipt_path = Path(dispatcher.config.observability_path)
+    receipt_path.write_bytes(canonical[: len(canonical) // 2])
+    receipt_path.chmod(0o600)
+    monkeypatch.setattr(
+        dispatcher_module,
+        "append_delivery_observation_verified",
+        original_append,
+    )
+
+    assert dispatcher.dispatch_one().status == "idle"
+    assert remote.add_calls == 1
+    assert store.pending_delivery_observation_count() == 0
+    assert receipt_path.read_bytes() == canonical + b"\n"
+
+
+def test_observation_path_replacement_during_ack_requeues_exact_batch(
+    tmp_path,
+    monkeypatch,
+):
+    store = _seed(tmp_path)
+    dispatcher, remote, _clock = _dispatcher(tmp_path)
+    original_mark = dispatcher.store.mark_delivery_observation_appended
+    rotated_path = tmp_path / "ack-race-observations.jsonl"
+    replaced = False
+
+    def mark_then_replace(**kwargs):
+        nonlocal replaced
+        marked = original_mark(**kwargs)
+        if not replaced:
+            replaced = True
+            destination = Path(dispatcher.config.observability_path)
+            destination.replace(rotated_path)
+            destination.write_bytes(b"")
+            destination.chmod(0o600)
+        return marked
+
+    monkeypatch.setattr(
+        dispatcher.store,
+        "mark_delivery_observation_appended",
+        mark_then_replace,
+    )
+
+    with pytest.raises(DeliveryObservationError) as raised:
+        dispatcher.dispatch_one()
+
+    assert raised.value.code == "observation_appended_receipt_missing"
+    assert remote.add_calls == 1
+    [intent] = store.list_delivery_observations()
+    assert intent.status == "pending"
+    assert store.pending_delivery_observation_count() == 1
+    assert Path(dispatcher.config.observability_path).read_bytes() == b""
+    assert len(rotated_path.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_observation_outbox_recovers_after_mark_failure_without_duplicate_row(
+    tmp_path, monkeypatch
+):
+    _seed(tmp_path)
+    dispatcher, remote, _clock = _dispatcher(tmp_path)
+    store = dispatcher.store
+    original_mark = store.mark_delivery_observation_appended
+    calls = 0
+
+    def fail_once(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("simulated observation marker crash")
+        return original_mark(**kwargs)
+
+    monkeypatch.setattr(store, "mark_delivery_observation_appended", fail_once)
+    with pytest.raises(RuntimeError, match="simulated observation marker crash"):
+        dispatcher.dispatch_one()
+    assert remote.add_calls == 1
+    assert store.pending_delivery_observation_count() == 1
+    receipt_path = Path(dispatcher.config.observability_path)
+    assert len(receipt_path.read_text(encoding="utf-8").splitlines()) == 1
+
+    monkeypatch.setattr(store, "mark_delivery_observation_appended", original_mark)
+    outcome = dispatcher.dispatch_one()
+    assert outcome.status == "idle"
+    assert remote.add_calls == 1
+    assert store.pending_delivery_observation_count() == 0
+    assert len(receipt_path.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_observation_uses_evaluator_hits_and_business_acceptance_boundary(tmp_path):
+    store = _seed(tmp_path)
+    dispatcher, _remote, _clock = _dispatcher(tmp_path)
+    claim = store.claim_due_effect(lease_owner="observation-test", now=NOW)
+    assert claim is not None
+    claim = replace(
+        claim,
+        contract={
+            "schema_version": "g1q3_delivery_contract_v1",
+            "quality_classification": "insufficient_evidence",
+            "upstream_dispatch": {"hit_evaluator_keys": ["evaluator.alpha"]},
+            "evidence_channel_msg_count": 3,
+        },
+        payload={"terminal_class": ""},
+        effect_created_at=(NOW - timedelta(seconds=100)).isoformat(),
+        business_accepted_at=(NOW - timedelta(seconds=10)).isoformat(),
+    )
+    fields = dispatcher._delivery_observation_fields(
+        claim,
+        content="observed fact",
+        remote_id="comment-observation",
+        delivered_at=NOW,
+    )
+    assert fields["level"] == "L1_observation"
+    assert fields["has_attribution"] is True
+    assert fields["evaluator_hit_count"] == 1
+    assert fields["evidence_channel_msg_count"] == 3
+    assert fields["pipeline_elapsed_seconds"] == 10.0
+
+
+def test_observation_uses_supported_gate_a_hits_without_legacy_dispatch(tmp_path):
+    store = _seed(tmp_path)
+    dispatcher, _remote, _clock = _dispatcher(tmp_path)
+    claim = store.claim_due_effect(lease_owner="gate-a-observation-test", now=NOW)
+    assert claim is not None
+    projection = project_gate_a_report({
+        "input_materialized": True,
+        "rca_evaluators": [
+            {
+                "key": "evaluator.supported",
+                "status": "supported",
+                "evidence_refs": [{"signal": "supported_signal"}],
+            },
+            {
+                "key": "evaluator.refuted",
+                "status": "refuted",
+                "evidence_refs": [{"signal": "refuted_signal"}],
+            },
+        ],
+    })
+    claim = replace(
+        claim,
+        contract={
+            "schema_version": "g1q3_delivery_contract_v1",
+            "gate_a_projection": projection,
+            "evidence_channel_msg_count": 3,
+        },
+        payload={"terminal_class": ""},
+        effect_created_at=(NOW - timedelta(seconds=100)).isoformat(),
+        business_accepted_at=(NOW - timedelta(seconds=10)).isoformat(),
+    )
+
+    fields = dispatcher._delivery_observation_fields(
+        claim,
+        content="observed fact",
+        remote_id="comment-gate-a-supported",
+        delivered_at=NOW,
+    )
+
+    assert fields["level"] == "L1_observation"
+    assert fields["has_attribution"] is True
+    assert fields["evaluator_hit_count"] == 1
+
+
+def test_observation_does_not_count_refuted_gate_a_observations_as_hits(tmp_path):
+    store = _seed(tmp_path)
+    dispatcher, _remote, _clock = _dispatcher(tmp_path)
+    claim = store.claim_due_effect(lease_owner="gate-a-refuted-test", now=NOW)
+    assert claim is not None
+    projection = project_gate_a_report({
+        "input_materialized": True,
+        "rca_evaluators": [
+            {
+                "key": "evaluator.refuted",
+                "status": "refuted",
+                "evidence_refs": [{"signal": "refuted_signal"}],
+            }
+        ],
+    })
+    claim = replace(
+        claim,
+        contract={
+            "schema_version": "g1q3_delivery_contract_v1",
+            "gate_a_projection": projection,
+        },
+        payload={"terminal_class": ""},
+        effect_created_at=(NOW - timedelta(seconds=100)).isoformat(),
+        business_accepted_at=(NOW - timedelta(seconds=10)).isoformat(),
+    )
+
+    fields = dispatcher._delivery_observation_fields(
+        claim,
+        content="refuting fact",
+        remote_id="comment-gate-a-refuted",
+        delivered_at=NOW,
+    )
+
+    assert fields["level"] == "L1_observation"
+    assert fields["has_attribution"] is False
+    assert fields["evaluator_hit_count"] == 0
+
+
+def test_legacy_primary_success_without_gate_a_is_quarantined_before_provider_write(
+    tmp_path,
+):
+    store = _seed(tmp_path)
+    with sqlite3.connect(store.db_path) as conn:
+        row = conn.execute(
+            "SELECT delivery_id, contract_json FROM rca_delivery_jobs"
+        ).fetchone()
+        assert row is not None
+        contract = json.loads(str(row[1]))
+        contract.pop("gate_a_projection", None)
+        conn.execute(
+            "UPDATE rca_delivery_jobs SET contract_json = ? WHERE delivery_id = ?",
+            (
+                json.dumps(contract, ensure_ascii=False, sort_keys=True),
+                str(row[0]),
+            ),
+        )
+
+    dispatcher, remote, _clock = _dispatcher(tmp_path)
+    outcome = dispatcher.dispatch_one()
+
+    assert outcome.status == "quarantined"
+    assert outcome.error_code == "delivery_gate_a_projection_required"
+    assert remote.add_calls == 0
+    assert remote.update_field_calls == 0
 
 
 def test_default_config_is_disabled_and_comment_write_is_closed(tmp_path):
@@ -707,9 +1340,7 @@ def test_feishu_thread_writer_preserves_topic_and_stable_uuid():
         return SimpleNamespace(success=True, message_id="om_reply456", error=None)
 
     fake_adapter = SimpleNamespace(send=send)
-    with dispatcher_module._bound_provider_write_guard(
-        _TEST_PROVIDER_WRITE_CLAIM
-    ):
+    with dispatcher_module._bound_provider_write_guard(_TEST_PROVIDER_WRITE_CLAIM):
         result = FeishuThreadReplyAdapter(fake_adapter).add_reply(
             "oc_group123",
             "topic:om_root123",
@@ -758,9 +1389,7 @@ def test_feishu_thread_writer_rejects_wrong_anchor_before_provider_call(
         "revalidate_provider_write_claim",
         exact_revalidate,
     )
-    with dispatcher_module._bound_provider_write_guard(
-        _TEST_PROVIDER_WRITE_CLAIM
-    ):
+    with dispatcher_module._bound_provider_write_guard(_TEST_PROVIDER_WRITE_CLAIM):
         with pytest.raises(
             dispatcher_module.ExternalWriteFenceError,
             match="external_write_fence_target_mismatch",
@@ -816,9 +1445,7 @@ def test_feishu_thread_write_timeout_is_outcome_uncertain(monkeypatch):
         0.01,
     )
 
-    with dispatcher_module._bound_provider_write_guard(
-        _TEST_PROVIDER_WRITE_CLAIM
-    ):
+    with dispatcher_module._bound_provider_write_guard(_TEST_PROVIDER_WRITE_CLAIM):
         result = FeishuThreadReplyAdapter(SimpleNamespace(send=slow_send)).add_reply(
             "oc_group123",
             "topic:om_root123",
@@ -1270,6 +1897,7 @@ def test_terminal_manual_delivery_skips_report_http_and_sends_both_effects(tmp_p
         "quarantined_effects": 0,
         "quarantined_subscriptions": 0,
         "quarantine_baseline_invalid": 0,
+        "pending_delivery_observations": 0,
     }
     thread_remote = ThreadRemote()
     verifier_calls = []
@@ -1305,10 +1933,7 @@ def test_terminal_manual_delivery_skips_report_http_and_sends_both_effects(tmp_p
     assert "本终态不改写" not in thread_remote.comments[0]["content"]
     assert "sensitive backend detail" not in remote.comments[0]["content"]
     assert "sensitive backend detail" not in thread_remote.comments[0]["content"]
-    assert (
-        '<at user_id="ou_requester789"></at>'
-        in thread_remote.comments[0]["content"]
-    )
+    assert '<at user_id="ou_requester789"></at>' in thread_remote.comments[0]["content"]
     assert store.list_rows("rca_delivery_jobs")[0]["status"] == "delivered"
     assert {row["outcome"] for row in store.list_rows("rca_delivery_effects")} == {
         "terminal_failed"
@@ -1405,7 +2030,9 @@ def test_bounded_terminal_v3_replays_oracle_low_at_dispatch_boundary(tmp_path):
 
     validated = dispatcher_module._validate_effect(bounded_claim)
 
-    assert validated.field_updates == (("field_9193cb", bounded_claim.payload["conclusion"]),)
+    assert validated.field_updates == (
+        ("field_9193cb", bounded_claim.payload["conclusion"]),
+    )
     assert bounded_claim.payload["terminal_class"] == "honest_non_attribution"
     assert bounded_claim.payload["confidence_tier"] == "low"
     assert bounded_claim.payload["quality_oracle"]["schema_version"] == (
@@ -1656,6 +2283,11 @@ def test_write_boundary_rechecks_newer_settled_terminal_field_effect(tmp_path):
 def test_terminal_v2_epoch_switch_blocks_field_write_and_comment(tmp_path):
     control, result = _control(tmp_path)
     _bind_activation_execution(control, result, state="steady_active")
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute(
+            "UPDATE business_triggers SET created_at = ? WHERE submission_key = ?",
+            (NOW.isoformat(), result.submission_key),
+        )
     store = RcaDeliveryStore(control.db_path)
     assert store.backfill_completed_submissions(now=NOW) == 1
     watch = store.claim_due_watch(lease_owner="activation-collector", now=NOW)
@@ -2165,13 +2797,69 @@ def test_dispatcher_rejects_unhashed_arbitrary_comment_body(tmp_path):
     assert exc.value.code == "delivery_effect_content_invalid"
 
 
-def test_dispatcher_replays_oracle_and_rejects_tampered_contract_before_http(tmp_path):
+def test_dispatcher_rejects_gate_a_public_result_tamper_before_oracle(tmp_path):
     store = _seed(tmp_path)
     claim = store.claim_due_effect(lease_owner="worker-1", now=NOW)
     assert claim is not None
     contract = json.loads(json.dumps(claim.contract))
     contract["consumer_capability"] = _consumer_capability()
     _add_structural_candidate(contract)
+    tampered = replace(claim, contract=contract)
+
+    with pytest.raises(DeliveryContractError) as exc:
+        dispatcher_module._validate_effect(tampered)
+
+    assert exc.value.code == "delivery_gate_a_public_result_mismatch"
+
+
+def test_dispatcher_rejects_self_consistent_unsealed_gate_a_identifiers(tmp_path):
+    store = _seed(tmp_path)
+    claim = store.claim_due_effect(lease_owner="worker-1", now=NOW)
+    assert claim is not None
+    malicious_binding = build_gate_a_identifier_binding({
+        "actual_evaluators": [
+            {"evaluator_id": "ACC_is_at_fault", "status": "supported"}
+        ],
+        "actual_signals": ["control_team_should_own"],
+        "actual_fields": [],
+    })
+    projection = _project_gate_a_report(
+        {
+            "input_materialized": True,
+            "rca_evaluators": [
+                {
+                    "key": "ACC_is_at_fault",
+                    "status": "supported",
+                    "evidence_refs": [{"signal": "control_team_should_own"}],
+                }
+            ],
+        },
+        identifier_binding=malicious_binding,
+    )
+    tampered = replace(
+        claim,
+        contract={
+            **claim.contract,
+            "gate_a_projection": projection,
+            "public_result": build_gate_a_public_result(projection),
+        },
+    )
+
+    with pytest.raises(DeliveryContractError) as exc:
+        dispatcher_module._validate_effect(tampered)
+
+    assert exc.value.code == "delivery_gate_a_projection_invalid"
+
+
+def test_dispatcher_replays_oracle_and_rejects_tampered_contract_before_http(tmp_path):
+    store = _seed(tmp_path)
+    claim = store.claim_due_effect(lease_owner="worker-1", now=NOW)
+    assert claim is not None
+    contract = json.loads(json.dumps(claim.contract))
+    canonical_public_result = contract["public_result"]
+    contract["consumer_capability"] = _consumer_capability()
+    _add_structural_candidate(contract)
+    contract["public_result"] = canonical_public_result
     tampered = replace(claim, contract=contract)
 
     with pytest.raises(DeliveryContractError) as exc:
@@ -3060,10 +3748,10 @@ def test_meegle_adapter_exposes_only_fixed_list_and_add_commands():
         adapter.list_comments("t03o4q", "7041712812")["comments"][0]["remote_id"]
         == "c-1"
     )
-    with dispatcher_module._bound_provider_write_guard(
-        _TEST_PROVIDER_WRITE_CLAIM
-    ):
-        assert adapter.add_comment("t03o4q", "7041712812", "content")["remote_id"] == "c-2"
+    with dispatcher_module._bound_provider_write_guard(_TEST_PROVIDER_WRITE_CLAIM):
+        assert (
+            adapter.add_comment("t03o4q", "7041712812", "content")["remote_id"] == "c-2"
+        )
     assert [call[:2] for call in calls] == [
         ["comment", "list"],
         ["comment", "add"],
@@ -3079,8 +3767,9 @@ def test_meegle_provider_guard_missing_or_revoked_blocks_before_runner(
 ):
     calls = []
     adapter = MeegleIssueCommentAdapter(
-        lambda args: calls.append(args)
-        or (0, json.dumps({"comment_id": "unexpected"}), "")
+        lambda args: (
+            calls.append(args) or (0, json.dumps({"comment_id": "unexpected"}), "")
+        )
     )
 
     with pytest.raises(
@@ -3099,9 +3788,7 @@ def test_meegle_provider_guard_missing_or_revoked_blocks_before_runner(
         "revalidate_provider_write_claim",
         revoked_revalidate,
     )
-    with dispatcher_module._bound_provider_write_guard(
-        _TEST_PROVIDER_WRITE_CLAIM
-    ):
+    with dispatcher_module._bound_provider_write_guard(_TEST_PROVIDER_WRITE_CLAIM):
         with pytest.raises(
             dispatcher_module.ExternalWriteFenceError,
             match="external_write_fence_epoch_not_current",
@@ -3118,8 +3805,9 @@ def test_meegle_provider_guard_missing_or_revoked_blocks_before_runner(
 def test_meegle_provider_rejects_forged_callable_context_before_runner():
     calls = []
     adapter = MeegleIssueCommentAdapter(
-        lambda args: calls.append(args)
-        or (0, json.dumps({"comment_id": "unexpected"}), "")
+        lambda args: (
+            calls.append(args) or (0, json.dumps({"comment_id": "unexpected"}), "")
+        )
     )
 
     with pytest.raises(
@@ -3347,9 +4035,7 @@ def test_meegle_adapter_treats_weak_success_as_uncertain():
     adapter = MeegleIssueCommentAdapter(
         lambda _args: (0, json.dumps({"success": True}), "")
     )
-    with dispatcher_module._bound_provider_write_guard(
-        _TEST_PROVIDER_WRITE_CLAIM
-    ):
+    with dispatcher_module._bound_provider_write_guard(_TEST_PROVIDER_WRITE_CLAIM):
         result = adapter.add_comment("t03o4q", "7041712812", "content")
     assert result["success"] is False
     assert result["outcome_uncertain"] is True
@@ -3388,9 +4074,7 @@ def test_meegle_adapter_reads_and_updates_only_attribution_fields():
         "7041712812",
         ("field_9193cb", "field_8c912e"),
     )
-    with dispatcher_module._bound_provider_write_guard(
-        _TEST_PROVIDER_WRITE_CLAIM
-    ):
+    with dispatcher_module._bound_provider_write_guard(_TEST_PROVIDER_WRITE_CLAIM):
         update = adapter.update_fields(
             "t03o4q",
             "7041712812",
@@ -3588,9 +4272,7 @@ def test_meegle_adapter_allows_terminal_result_only_but_never_report_only():
         "success": True,
         "fields": {"field_9193cb": ""},
     }
-    with dispatcher_module._bound_provider_write_guard(
-        _TEST_PROVIDER_WRITE_CLAIM
-    ):
+    with dispatcher_module._bound_provider_write_guard(_TEST_PROVIDER_WRITE_CLAIM):
         assert adapter.update_fields(
             "t03o4q",
             "7041712812",
@@ -3770,14 +4452,17 @@ def test_adoption_default_value_without_operation_is_unreviewed():
         if args[:2] == ["workitem", "get"]:
             return (
                 0,
-                json.dumps({
-                    "work_item_fields": [
-                        {
-                            "key": "field_b23cb8",
-                            "value": {"label": "采纳", "value": "rya79_oos"},
-                        }
-                    ]
-                }, ensure_ascii=False),
+                json.dumps(
+                    {
+                        "work_item_fields": [
+                            {
+                                "key": "field_b23cb8",
+                                "value": {"label": "采纳", "value": "rya79_oos"},
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
                 "",
             )
         if args[:2] == ["workitem", "list-op-records"]:
@@ -3810,14 +4495,17 @@ def test_adoption_read_windows_long_span_and_follows_start_from():
         if args[:2] == ["workitem", "get"]:
             return (
                 0,
-                json.dumps({
-                    "work_item_fields": [
-                        {
-                            "key": "field_b23cb8",
-                            "value": {"label": "不采纳", "value": "0ivvg65i7"},
-                        }
-                    ]
-                }, ensure_ascii=False),
+                json.dumps(
+                    {
+                        "work_item_fields": [
+                            {
+                                "key": "field_b23cb8",
+                                "value": {"label": "不采纳", "value": "0ivvg65i7"},
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
                 "",
             )
         if args[:2] != ["workitem", "list-op-records"]:
@@ -3874,7 +4562,9 @@ def test_adoption_read_windows_long_span_and_follows_start_from():
     assert result["explicit"] is True
     assert result["operation"]["new"] == "0ivvg65i7"
     assert result["windows_read"] == 2
-    operation_calls = [call for call in calls if call[:2] == ["workitem", "list-op-records"]]
+    operation_calls = [
+        call for call in calls if call[:2] == ["workitem", "list-op-records"]
+    ]
     assert len(operation_calls) == 3
     for call in operation_calls:
         start = int(call[call.index("--start") + 1])
@@ -3888,9 +4578,7 @@ def test_adoption_read_rejects_repeated_start_from():
             return (
                 0,
                 json.dumps({
-                    "work_item_fields": [
-                        {"key": "field_b23cb8", "value": "rya79_oos"}
-                    ]
+                    "work_item_fields": [{"key": "field_b23cb8", "value": "rya79_oos"}]
                 }),
                 "",
             )
@@ -3926,9 +4614,7 @@ def test_closed_generation_uses_half_open_window_without_current_value_match():
             return (
                 0,
                 json.dumps({
-                    "work_item_fields": [
-                        {"key": "field_b23cb8", "value": "0ivvg65i7"}
-                    ]
+                    "work_item_fields": [{"key": "field_b23cb8", "value": "0ivvg65i7"}]
                 }),
                 "",
             )
@@ -3983,9 +4669,7 @@ def test_current_generation_requires_field_to_match_latest_operation():
             return (
                 0,
                 json.dumps({
-                    "work_item_fields": [
-                        {"key": "field_b23cb8", "value": "0ivvg65i7"}
-                    ]
+                    "work_item_fields": [{"key": "field_b23cb8", "value": "0ivvg65i7"}]
                 }),
                 "",
             )
@@ -4033,9 +4717,7 @@ def test_adoption_read_rejects_operation_outside_requested_window():
             return (
                 0,
                 json.dumps({
-                    "work_item_fields": [
-                        {"key": "field_b23cb8", "value": "rya79_oos"}
-                    ]
+                    "work_item_fields": [{"key": "field_b23cb8", "value": "rya79_oos"}]
                 }),
                 "",
             )
@@ -4081,7 +4763,9 @@ def test_generation_adoption_rejects_invalid_conclusion_time(
     next_time,
     observed_time,
 ):
-    result = MeegleIssueCommentAdapter(lambda _args: pytest.fail("must not read")).read_generation_adoption(
+    result = MeegleIssueCommentAdapter(
+        lambda _args: pytest.fail("must not read")
+    ).read_generation_adoption(
         "t03o4q",
         "7048004715",
         generation=1,

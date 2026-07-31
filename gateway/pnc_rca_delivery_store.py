@@ -36,6 +36,7 @@ from gateway.pnc_rca_delivery_quarantine_baseline import (
     BASELINE_NAME as DELIVERY_QUARANTINE_BASELINE_NAME,
     quarantine_baseline_status_tx,
 )
+from gateway.pnc_rca_delivery_observability import validate_delivery_observation
 from gateway.pnc_rca_conclusion_adjudication import (
     ADJUDICATION_EFFECT_SCHEMA_VERSION,
     ConclusionAdjudicationError,
@@ -64,13 +65,26 @@ from gateway.pnc_rca_failure_route_schema import (
 )
 
 
-DELIVERY_STORE_SCHEMA_VERSION = "pnc_rca_delivery_store_v10"
+DELIVERY_STORE_SCHEMA_VERSION = "pnc_rca_delivery_store_v11"
 W5_EXTERNAL_WRITE_FENCE_CUTOFF_META_KEY = "w5_external_write_fence_cutoff"
 # Persisted once at delivery-store initialization; never controlled by env.
 W5_EXTERNAL_WRITE_FENCE_CUTOFF = "2026-07-25T00:00:00+00:00"
 DELIVERY_STORE_SCHEMA_PREDECESSOR_VERSION = "pnc_rca_delivery_store_v7"
 DELIVERY_STORE_W2_SCHEMA_VERSION = "pnc_rca_delivery_store_v8"
 DELIVERY_STORE_W6_PREDECESSOR_VERSION = "pnc_rca_delivery_store_v9"
+DELIVERY_STORE_OBSERVABILITY_PREDECESSOR_VERSION = "pnc_rca_delivery_store_v10"
+_DELIVERY_OBSERVATION_OUTBOX_SCHEMA_OBJECTS = {
+    "rca_delivery_observation_outbox": (
+        "table",
+        "rca_delivery_observation_outbox",
+        "56ac3767f64f26666da68a7eff78e04e81dc94ad49c73ffde2ce7408cf4a7e0e",
+    ),
+    "idx_delivery_observation_outbox_status": (
+        "index",
+        "rca_delivery_observation_outbox",
+        "d5be40072c9c9edba2fa7b0602daa22d7545c5e68d1e2e49745149a283c50637",
+    ),
+}
 DELIVERY_BACKPRESSURE_SNAPSHOT_SCHEMA_VERSION = (
     "pnc_rca_delivery_backpressure_snapshot_v2"
 )
@@ -140,6 +154,7 @@ SUPPORTED_DELIVERY_STORE_SCHEMA_VERSIONS = frozenset({
     DELIVERY_STORE_SCHEMA_PREDECESSOR_VERSION,
     DELIVERY_STORE_W2_SCHEMA_VERSION,
     DELIVERY_STORE_W6_PREDECESSOR_VERSION,
+    DELIVERY_STORE_OBSERVABILITY_PREDECESSOR_VERSION,
     DELIVERY_STORE_SCHEMA_VERSION,
 })
 WATCH_ACTIVE_STATES = frozenset({"pending", "running"})
@@ -322,6 +337,7 @@ class DeliveryEffectClaim:
     lease_owner: str
     lease_expires_at: str
     effect_created_at: str
+    business_accepted_at: str
     artifact_set_id: str
     project_key: str
     work_item_type_key: str
@@ -345,6 +361,16 @@ class DeliveryEffectClaim:
     generation: int = 0
     adjudication_comment_attempt_count: int = 0
     adjudication_comment_attempted_at: str | None = None
+
+
+@dataclass(frozen=True)
+class DeliveryObservationIntent:
+    observation_id: str
+    effect_key: str
+    payload: dict[str, Any]
+    payload_sha256: str
+    created_at: str
+    status: str = "pending"
 
 
 @dataclass(frozen=True)
@@ -1062,6 +1088,42 @@ class RcaDeliveryStore:
             )
 
     @staticmethod
+    def _validate_delivery_observation_outbox_schema(
+        conn: sqlite3.Connection,
+    ) -> None:
+        rows = conn.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master "
+            "WHERE tbl_name = 'rca_delivery_observation_outbox' "
+            "AND name NOT LIKE 'sqlite_%' ORDER BY type, name"
+        ).fetchall()
+        observed = {
+            str(row["name"]): {
+                "type": str(row["type"]),
+                "table": str(row["tbl_name"]),
+                "sql_sha256": hashlib.sha256(
+                    "".join(str(row["sql"] or "").split()).lower().encode()
+                ).hexdigest(),
+            }
+            for row in rows
+        }
+        if set(observed) != set(_DELIVERY_OBSERVATION_OUTBOX_SCHEMA_OBJECTS):
+            raise RuntimeError(
+                "incompatible_delivery_store_schema:delivery_observation_outbox"
+            )
+        for name, (expected_type, expected_table, expected_sha256) in (
+            _DELIVERY_OBSERVATION_OUTBOX_SCHEMA_OBJECTS.items()
+        ):
+            item = observed[name]
+            if (
+                item["type"] != expected_type
+                or item["table"] != expected_table
+                or item["sql_sha256"] != expected_sha256
+            ):
+                raise RuntimeError(
+                    "incompatible_delivery_store_schema:delivery_observation_outbox"
+                )
+
+    @staticmethod
     def _validate_v9_predecessor_variant(
         conn: sqlite3.Connection,
         *,
@@ -1157,6 +1219,7 @@ class RcaDeliveryStore:
                 self._validate_failure_route_schema(conn)
                 self._validate_comment_slot_schema(conn)
                 self._validate_subscription_observability_schema(conn)
+                self._validate_delivery_observation_outbox_schema(conn)
                 self._validate_w6_effect_guards(conn)
             finally:
                 conn.close()
@@ -2173,11 +2236,41 @@ class RcaDeliveryStore:
                 ON rca_failure_routes(submission_key, created_at);
             """,
         )
+        _execute_schema_script_in_transaction(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS rca_delivery_observation_outbox (
+                observation_id TEXT PRIMARY KEY CHECK (
+                    length(observation_id) = 64
+                    AND observation_id NOT GLOB '*[^0-9a-f]*'
+                ),
+                effect_key TEXT NOT NULL UNIQUE,
+                payload_json TEXT NOT NULL,
+                payload_sha256 TEXT NOT NULL CHECK (
+                    length(payload_sha256) = 64
+                    AND payload_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+                status TEXT NOT NULL CHECK (status IN ('pending', 'appended')),
+                created_at TEXT NOT NULL,
+                appended_at TEXT,
+                CHECK (
+                    (status = 'pending' AND appended_at IS NULL)
+                    OR (status = 'appended' AND appended_at IS NOT NULL)
+                ),
+                FOREIGN KEY(effect_key)
+                    REFERENCES rca_delivery_effects(effect_key)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_delivery_observation_outbox_status
+                ON rca_delivery_observation_outbox(status, created_at);
+            """,
+        )
         validate_conclusion_adjudication_schema(conn)
         RcaDeliveryStore._validate_failure_route_schema(conn)
         RcaDeliveryStore._validate_comment_slot_schema(conn)
         RcaDeliveryStore._validate_subscription_observability_schema(conn)
-        # W6 enforcement is additive and safe to install on the v9 store.
+        RcaDeliveryStore._validate_delivery_observation_outbox_schema(conn)
+        # The enforcement objects are additive on every supported predecessor.
         # The Python transaction guards remain authoritative when the control
         # tables are not present in an isolated delivery fixture.
         RcaDeliveryStore._install_w6_effect_guards(conn)
@@ -2189,6 +2282,7 @@ class RcaDeliveryStore:
             DELIVERY_STORE_SCHEMA_PREDECESSOR_VERSION,
             DELIVERY_STORE_W2_SCHEMA_VERSION,
             DELIVERY_STORE_W6_PREDECESSOR_VERSION,
+            DELIVERY_STORE_OBSERVABILITY_PREDECESSOR_VERSION,
         }:
             conn.execute(
                 "UPDATE rca_delivery_meta SET value = ? WHERE key = 'schema_version'",
@@ -6293,6 +6387,25 @@ class RcaDeliveryStore:
             )
             if activation_enforced:
                 self._require_activation_schema(conn)
+            acceptance_ready = {
+                "business_key",
+                "generation",
+                "created_at",
+            }.issubset(self._table_columns_tx(conn, "business_triggers"))
+            acceptance_join = (
+                """
+             LEFT JOIN business_triggers AS accepted_trigger
+                    ON accepted_trigger.business_key = j.business_key
+                   AND accepted_trigger.generation = j.generation
+                """
+                if acceptance_ready
+                else ""
+            )
+            acceptance_select = (
+                "accepted_trigger.created_at AS business_accepted_at"
+                if acceptance_ready
+                else "e.created_at AS business_accepted_at"
+            )
             activation_joins = (
                 """
              LEFT JOIN rca_execution_watch AS w
@@ -6394,12 +6507,14 @@ class RcaDeliveryStore:
                        j.generation AS job_generation,
                        j.terminal_state AS job_terminal_state,
                        j.terminal_error_code AS job_terminal_error_code,
-                       j.manifest_json, j.contract_json, j.artifacts_json
+                       j.manifest_json, j.contract_json, j.artifacts_json,
+                       {acceptance_select}
                   FROM rca_delivery_effects AS e
                   JOIN rca_delivery_jobs AS j ON j.delivery_id = e.delivery_id
                   JOIN rca_delivery_dispatcher_circuit AS circuit
                     ON circuit.circuit_name = e.effect_kind
                    AND circuit.state = 'closed'
+                  {acceptance_join}
                   {activation_joins}
                  WHERE (
                         (
@@ -6421,6 +6536,16 @@ class RcaDeliveryStore:
             if row is None:
                 conn.commit()
                 return None
+            business_accepted_at = str(row["business_accepted_at"] or "").strip()
+            if acceptance_ready:
+                try:
+                    business_accepted_at = _parse_iso(
+                        business_accepted_at
+                    ).isoformat()
+                except (TypeError, ValueError) as exc:
+                    raise DeliveryRecordConflictError(
+                        "delivery_business_acceptance_timestamp_invalid"
+                    ) from exc
             previous_status = str(row["status"])
             previous_write_phase = str(row["write_phase"] or "")
             if previous_write_phase not in {"prewrite", "write_started"}:
@@ -6542,6 +6667,7 @@ class RcaDeliveryStore:
                 lease_owner=owner,
                 lease_expires_at=expires,
                 effect_created_at=str(row["created_at"]),
+                business_accepted_at=business_accepted_at,
                 artifact_set_id=str(row["artifact_set_id"]),
                 project_key=str(row["project_key"]),
                 work_item_type_key=str(row["work_item_type_key"]),
@@ -6589,6 +6715,7 @@ class RcaDeliveryStore:
         outcome: str,
         remote_id: str,
         receipt: dict[str, Any],
+        observation: Mapping[str, Any] | None = None,
         runtime_identity: Mapping[str, Any] | None = None,
         now: datetime | None = None,
     ) -> DeliveryEffectMutation:
@@ -6617,6 +6744,11 @@ class RcaDeliveryStore:
                     raise DeliveryRecordConflictError(
                         "delivery_card_patch_effect_receipt_invalid"
                     )
+            normalized_observation = self._bound_delivery_observation_intent(
+                claim=claim,
+                remote_id=remote_id,
+                observation=observation,
+            )
             self._append_attempt_event(
                 conn,
                 effect_key=claim.effect_key,
@@ -6677,10 +6809,372 @@ class RcaDeliveryStore:
                     runtime_identity=runtime_identity,
                     transitioned_at=current,
                 )
+            observation_id, payload_json, payload_sha256 = normalized_observation
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO rca_delivery_observation_outbox(
+                        observation_id, effect_key, payload_json,
+                        payload_sha256, status, created_at, appended_at
+                    ) VALUES(?, ?, ?, ?, 'pending', ?, NULL)
+                    """,
+                    (
+                        observation_id,
+                        claim.effect_key,
+                        payload_json,
+                        payload_sha256,
+                        current,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DeliveryRecordConflictError(
+                    "delivery_observation_intent_conflict"
+                ) from exc
             conn.commit()
             return DeliveryEffectMutation(
                 claim.effect_key, claim.delivery_id, "succeeded", job_status
             )
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _effect_observation_content_sha256(claim: DeliveryEffectClaim) -> str:
+        if claim.effect_kind == DELIVERY_CARD_PATCH_EFFECT_KIND:
+            validated = validate_card_patch_effect_payload(claim.payload)
+            content = _canonical_json(validated["card_payload"])
+        elif claim.effect_kind == DELIVERY_EFFECT_KIND:
+            content = str(claim.payload.get("comment_content") or "")
+        elif claim.effect_kind == DELIVERY_THREAD_EFFECT_KIND:
+            content = str(claim.payload.get("message_content") or "")
+        else:
+            raise DeliveryRecordConflictError(
+                "delivery_observation_effect_kind_invalid"
+            )
+        if not content:
+            raise DeliveryRecordConflictError(
+                "delivery_observation_effect_content_missing"
+            )
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _bound_delivery_observation_intent(
+        cls,
+        *,
+        claim: DeliveryEffectClaim,
+        remote_id: str,
+        observation: Mapping[str, Any] | None,
+    ) -> tuple[str, str, str]:
+        if observation is None:
+            raise DeliveryRecordConflictError("delivery_observation_required")
+        payload = validate_delivery_observation(observation)
+        expected = {
+            "remote_receipt_id": str(remote_id),
+            "work_item_id": claim.work_item_id,
+            "case_key": claim.submission_key or claim.business_key,
+            "outcome_content_sha256": cls._effect_observation_content_sha256(
+                claim
+            ),
+        }
+        for field, expected_value in expected.items():
+            if payload.get(field) != expected_value:
+                raise DeliveryRecordConflictError(
+                    f"delivery_observation_{field}_mismatch"
+                )
+        payload_json = _canonical_json(payload)
+        return (
+            payload["observation_id"],
+            payload_json,
+            hashlib.sha256(payload_json.encode("utf-8")).hexdigest(),
+        )
+
+    def record_postwrite_delivery_observation(
+        self,
+        *,
+        claim: DeliveryEffectClaim,
+        remote_id: str,
+        observation: Mapping[str, Any],
+        now: datetime | None = None,
+    ) -> bool:
+        """Persist the exact observation after a provider success lost settlement.
+
+        This path never repeats or settles the external effect. It is limited to
+        card PATCH writes, whose provider has no exact readback reconciliation.
+        """
+        if claim.effect_kind != DELIVERY_CARD_PATCH_EFFECT_KIND:
+            raise DeliveryRecordConflictError(
+                "delivery_postwrite_observation_effect_kind_invalid"
+            )
+        validated = validate_card_patch_effect_payload(claim.payload)
+        if str(remote_id or "") != validated["message_id"]:
+            raise DeliveryRecordConflictError(
+                "delivery_card_patch_effect_receipt_invalid"
+            )
+        observation_id, payload_json, payload_sha256 = (
+            self._bound_delivery_observation_intent(
+                claim=claim,
+                remote_id=remote_id,
+                observation=observation,
+            )
+        )
+        current = _iso(now)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT e.delivery_id, e.effect_kind, e.target_key,
+                       e.payload_json, e.payload_sha256, e.write_phase,
+                       j.business_key, j.submission_key, j.work_item_id
+                  FROM rca_delivery_effects AS e
+                  JOIN rca_delivery_jobs AS j
+                    ON j.delivery_id = e.delivery_id
+                 WHERE e.effect_key = ?
+                """,
+                (claim.effect_key,),
+            ).fetchone()
+            if row is None:
+                raise DeliveryRecordConflictError(
+                    "delivery_postwrite_observation_effect_missing"
+                )
+            expected_identity = {
+                "delivery_id": claim.delivery_id,
+                "effect_kind": claim.effect_kind,
+                "target_key": claim.target_key,
+                "payload_json": _canonical_json(claim.payload),
+                "payload_sha256": claim.payload_sha256,
+                "business_key": claim.business_key,
+                "submission_key": claim.submission_key,
+                "work_item_id": claim.work_item_id,
+            }
+            if any(
+                str(row[field]) != str(expected)
+                for field, expected in expected_identity.items()
+            ) or str(row["write_phase"]) not in {"write_started", "settled"}:
+                raise DeliveryRecordConflictError(
+                    "delivery_postwrite_observation_effect_identity_invalid"
+                )
+            existing = conn.execute(
+                """
+                SELECT observation_id, payload_json, payload_sha256
+                  FROM rca_delivery_observation_outbox
+                 WHERE effect_key = ?
+                """,
+                (claim.effect_key,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    str(existing["observation_id"]) != observation_id
+                    or str(existing["payload_json"]) != payload_json
+                    or str(existing["payload_sha256"]) != payload_sha256
+                ):
+                    raise DeliveryRecordConflictError(
+                        "delivery_observation_intent_conflict"
+                    )
+                conn.commit()
+                return False
+            conn.execute(
+                """
+                INSERT INTO rca_delivery_observation_outbox(
+                    observation_id, effect_key, payload_json,
+                    payload_sha256, status, created_at, appended_at
+                ) VALUES(?, ?, ?, ?, 'pending', ?, NULL)
+                """,
+                (
+                    observation_id,
+                    claim.effect_key,
+                    payload_json,
+                    payload_sha256,
+                    current,
+                ),
+            )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def list_delivery_observations(
+        self,
+        *,
+        status: str | None = None,
+        limit: int | None = None,
+    ) -> list[DeliveryObservationIntent]:
+        if status not in {None, "pending", "appended"}:
+            raise ValueError("delivery observation status is invalid")
+        if limit is not None and (
+            isinstance(limit, bool) or not isinstance(limit, int) or limit < 1
+        ):
+            raise ValueError("delivery observation limit must be positive")
+        conn = self._connect()
+        try:
+            where = "" if status is None else " WHERE status = ?"
+            bounded = "" if limit is None else " LIMIT ?"
+            parameters: tuple[Any, ...] = (() if status is None else (status,))
+            if limit is not None:
+                parameters += (limit,)
+            rows = conn.execute(
+                "SELECT observation_id, effect_key, payload_json, payload_sha256, "
+                "created_at, status FROM rca_delivery_observation_outbox"
+                f"{where} ORDER BY created_at, observation_id{bounded}",
+                parameters,
+            ).fetchall()
+            intents: list[DeliveryObservationIntent] = []
+            for row in rows:
+                payload_json = str(row["payload_json"])
+                payload_sha256 = hashlib.sha256(
+                    payload_json.encode("utf-8")
+                ).hexdigest()
+                if payload_sha256 != str(row["payload_sha256"]):
+                    raise RuntimeError("delivery_observation_intent_hash_mismatch")
+                try:
+                    payload = json.loads(payload_json)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        "delivery_observation_intent_payload_invalid"
+                    ) from exc
+                if (
+                    not isinstance(payload, dict)
+                    or payload.get("observation_id") != row["observation_id"]
+                ):
+                    raise RuntimeError(
+                        "delivery_observation_intent_identity_mismatch"
+                    )
+                intents.append(
+                    DeliveryObservationIntent(
+                        observation_id=str(row["observation_id"]),
+                        effect_key=str(row["effect_key"]),
+                        payload=payload,
+                        payload_sha256=payload_sha256,
+                        created_at=str(row["created_at"]),
+                        status=str(row["status"]),
+                    )
+                )
+            return intents
+        finally:
+            conn.close()
+
+    def list_pending_delivery_observations(
+        self,
+        *,
+        limit: int = 100,
+    ) -> list[DeliveryObservationIntent]:
+        return self.list_delivery_observations(status="pending", limit=limit)
+
+    def list_appended_delivery_observations(self) -> list[DeliveryObservationIntent]:
+        return self.list_delivery_observations(status="appended")
+
+    def pending_delivery_observation_count(self) -> int:
+        conn = self._connect()
+        try:
+            return int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM rca_delivery_observation_outbox "
+                    "WHERE status = 'pending'"
+                ).fetchone()[0]
+            )
+        finally:
+            conn.close()
+
+    def mark_delivery_observation_appended(
+        self,
+        *,
+        observation_id: str,
+        payload_sha256: str,
+        now: datetime | None = None,
+    ) -> bool:
+        if re.fullmatch(r"[0-9a-f]{64}", str(observation_id or "")) is None:
+            raise ValueError("delivery observation id is invalid")
+        if re.fullmatch(r"[0-9a-f]{64}", str(payload_sha256 or "")) is None:
+            raise ValueError("delivery observation payload hash is invalid")
+        current = _iso(now)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT status, payload_sha256 FROM "
+                "rca_delivery_observation_outbox WHERE observation_id = ?",
+                (observation_id,),
+            ).fetchone()
+            if row is None or str(row["payload_sha256"]) != payload_sha256:
+                raise DeliveryRecordConflictError(
+                    "delivery_observation_intent_receipt_mismatch"
+                )
+            if str(row["status"]) == "appended":
+                conn.commit()
+                return False
+            updated = conn.execute(
+                """
+                UPDATE rca_delivery_observation_outbox
+                   SET status = 'appended', appended_at = ?
+                 WHERE observation_id = ? AND status = 'pending'
+                   AND payload_sha256 = ?
+                """,
+                (current, observation_id, payload_sha256),
+            )
+            if updated.rowcount != 1:
+                raise DeliveryRecordConflictError(
+                    "delivery_observation_intent_receipt_conflict"
+                )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def requeue_delivery_observations(
+        self,
+        *,
+        observations: Sequence[tuple[str, str]],
+    ) -> int:
+        """Undo only exact acknowledgements whose live receipt proof was lost."""
+        normalized = tuple((str(item[0]), str(item[1])) for item in observations)
+        if not normalized or len(set(normalized)) != len(normalized):
+            raise ValueError("delivery observation requeue set is invalid")
+        for observation_id, payload_sha256 in normalized:
+            if re.fullmatch(r"[0-9a-f]{64}", observation_id) is None:
+                raise ValueError("delivery observation id is invalid")
+            if re.fullmatch(r"[0-9a-f]{64}", payload_sha256) is None:
+                raise ValueError("delivery observation payload hash is invalid")
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for observation_id, payload_sha256 in normalized:
+                row = conn.execute(
+                    "SELECT status, payload_sha256 FROM "
+                    "rca_delivery_observation_outbox WHERE observation_id = ?",
+                    (observation_id,),
+                ).fetchone()
+                if (
+                    row is None
+                    or str(row["status"]) != "appended"
+                    or str(row["payload_sha256"]) != payload_sha256
+                ):
+                    raise DeliveryRecordConflictError(
+                        "delivery_observation_requeue_identity_mismatch"
+                    )
+                updated = conn.execute(
+                    """
+                    UPDATE rca_delivery_observation_outbox
+                       SET status = 'pending', appended_at = NULL
+                     WHERE observation_id = ? AND status = 'appended'
+                       AND payload_sha256 = ?
+                    """,
+                    (observation_id, payload_sha256),
+                )
+                if updated.rowcount != 1:
+                    raise DeliveryRecordConflictError(
+                        "delivery_observation_requeue_conflict"
+                    )
+            conn.commit()
+            return len(normalized)
         except Exception:
             conn.rollback()
             raise
@@ -7603,6 +8097,7 @@ class RcaDeliveryStore:
             "rca_conclusion_adjudications",
             "rca_delivery_subscriptions",
             "rca_delivery_subscription_events",
+            "rca_delivery_observation_outbox",
             "rca_failure_routes",
         }
         if table not in allowed:
@@ -8038,6 +8533,13 @@ class RcaDeliveryStore:
                     "SELECT outcome, COUNT(*) AS count FROM rca_delivery_attempts GROUP BY outcome"
                 ).fetchall()
             }
+            observation_outbox = {
+                str(row["status"]): int(row["count"])
+                for row in conn.execute(
+                    "SELECT status, COUNT(*) AS count "
+                    "FROM rca_delivery_observation_outbox GROUP BY status"
+                ).fetchall()
+            }
             circuit_rows = conn.execute(
                 """
                 SELECT circuit_name, state, reason_code, reason_detail,
@@ -8172,6 +8674,9 @@ class RcaDeliveryStore:
                 "pending_required_subscriptions": pending_required_subscriptions,
                 "unresolved_required_effects": unresolved_required_effects,
                 "outcome_slo_breached": int(not outcome_slo["healthy"]),
+                "pending_delivery_observations": int(
+                    observation_outbox.get("pending", 0)
+                ),
             }
             # Keep ordinary backlog and historical outcome counts visible without
             # turning them into admission gates.  The release-scoped quarantine
@@ -8189,6 +8694,9 @@ class RcaDeliveryStore:
                 ],
                 "quarantine_baseline_invalid": business_blockers[
                     "quarantine_baseline_invalid"
+                ],
+                "pending_delivery_observations": business_blockers[
+                    "pending_delivery_observations"
                 ],
             }
             required_circuits = set(REQUIRED_DELIVERY_EFFECT_KINDS)
@@ -8216,6 +8724,7 @@ class RcaDeliveryStore:
                 "delivery_outcome_slo": outcome_slo,
                 "delivery_effects": effects,
                 "delivery_attempts": attempts,
+                "delivery_observation_outbox": observation_outbox,
                 "delivery_subscriptions": subscriptions,
                 "delivery_subscription_reasons": subscription_reasons,
                 "delivery_subscription_events": subscription_events,

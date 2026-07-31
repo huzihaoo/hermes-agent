@@ -30,6 +30,12 @@ if str(REPO_ROOT) not in sys.path:
 
 from dotenv import load_dotenv
 
+from gateway.pnc_rca_abstention_projection import (
+    RcaEvidenceProjectionError,
+    build_gate_a_identifier_binding,
+    build_gate_a_public_result,
+    validate_gate_a_projection,
+)
 from gateway.pnc_rca_delivery_contract import (
     DELIVERY_CARD_PATCH_EFFECT_KIND,
     DELIVERY_EFFECT_KIND,
@@ -89,8 +95,14 @@ from gateway.pnc_rca_delivery_store import (
 )
 from gateway.pnc_rca_delivery_observability import (
     DeliveryObservationError,
-    append_delivery_observation,
+    append_delivery_observation_verified,
+    build_delivery_observation,
     default_observation_path,
+    delivery_observation_file_lock,
+    delivery_observation_id,
+    delivery_observation_payload_sha256,
+    ensure_delivery_observation_path,
+    read_delivery_observation_receipt,
 )
 from gateway.pnc_rca_write_fence import (
     ExternalWriteFenceError,
@@ -185,9 +197,7 @@ def _card_patch_exception_result(exc: Exception) -> dict[str, Any]:
             "error_code": "feishu_card_dependency_unavailable",
             "error": detail,
         }
-    if any(
-        marker in lowered for marker in ("permission", "forbidden", "230006")
-    ):
+    if any(marker in lowered for marker in ("permission", "forbidden", "230006")):
         return {
             "success": False,
             "outcome_uncertain": False,
@@ -508,6 +518,21 @@ class DispatcherConfig:
                 f"{ENV_PREFIX}LEASE_SECONDS must exceed the maximum single "
                 f"boundary timeout plus margin ({minimum_lease}s)"
             )
+        if self.enabled:
+            if not self.observability_enabled:
+                raise ValueError(
+                    f"{ENV_PREFIX}OBSERVABILITY_ENABLED must be true when enabled"
+                )
+            if not self.observability_path.is_absolute():
+                raise ValueError(f"{ENV_PREFIX}OBSERVABILITY_PATH must be absolute")
+            if _SHA256_RE.fullmatch(self.inventory_pin) is None:
+                raise ValueError(
+                    f"{ENV_PREFIX}INVENTORY_PIN must be a lowercase SHA-256"
+                )
+            if not self.observation_release_id:
+                raise ValueError(
+                    f"{ENV_PREFIX}OBSERVATION_RELEASE_ID is required when enabled"
+                )
 
     @classmethod
     def from_env(
@@ -602,11 +627,7 @@ class DispatcherConfig:
             observability_path=Path(
                 source.get(
                     f"{ENV_PREFIX}OBSERVABILITY_PATH",
-                    home
-                    / "runtime"
-                    / "pnc_agent"
-                    / "feishu_issue_kafka_rca"
-                    / "delivery_observations.jsonl",
+                    default_observation_path(home),
                 )
             ).expanduser(),
             inventory_pin=str(
@@ -682,6 +703,7 @@ class DispatchStats:
     observability_written: int = 0
     observability_errors: int = 0
     observability_last_error: str = ""
+    observability_current_error: str = ""
     idle: int = 0
 
 
@@ -1862,13 +1884,15 @@ class MeegleIssueCommentAdapter:
             end_ms = observed_at_ms
             require_current_match = True
 
-        result = dict(self.read_adoption(
-            project_key,
-            work_item_id,
-            start_ms=conclusion_time_ms,
-            end_ms=end_ms,
-            require_current_match=require_current_match,
-        ))
+        result = dict(
+            self.read_adoption(
+                project_key,
+                work_item_id,
+                start_ms=conclusion_time_ms,
+                end_ms=end_ms,
+                require_current_match=require_current_match,
+            )
+        )
         result.update({
             "generation": generation,
             "conclusion_time_ms": conclusion_time_ms,
@@ -2262,9 +2286,7 @@ class FeishuThreadReplyAdapter:
                         "thread_id": thread_id,
                         "idempotency_uuid": idempotency_uuid,
                         "_pnc_rca_external_write_guard": provider_claim,
-                        "_pnc_rca_external_write_operation": (
-                            "feishu_thread_reply"
-                        ),
+                        "_pnc_rca_external_write_operation": ("feishu_thread_reply"),
                     },
                 ),
                 timeout=MEEGLE_COMMENT_PAGE_TIMEOUT_SECONDS,
@@ -2379,6 +2401,23 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
             artifacts=(),
             field_updates=field_updates,
         )
+    raw_gate_a_projection = claim.contract.get("gate_a_projection")
+    if raw_gate_a_projection is None:
+        raise DeliveryContractError("delivery_gate_a_projection_required")
+    try:
+        gate_a_projection = validate_gate_a_projection(raw_gate_a_projection)
+        if gate_a_projection["level"] == "L1_observation":
+            gate_a_projection = validate_gate_a_projection(
+                raw_gate_a_projection,
+                identifier_binding=build_gate_a_identifier_binding(
+                    claim.contract.get("consumer_capability")
+                ),
+            )
+        expected_public_result = build_gate_a_public_result(gate_a_projection)
+    except RcaEvidenceProjectionError as exc:
+        raise DeliveryContractError("delivery_gate_a_projection_invalid") from exc
+    if claim.contract.get("public_result") != expected_public_result:
+        raise DeliveryContractError("delivery_gate_a_public_result_mismatch")
     schema_version = str(payload.get("schema_version") or "")
     if schema_version != DELIVERY_EFFECT_SCHEMA_VERSION:
         raise DeliveryContractError("delivery_effect_schema_unsupported")
@@ -2533,9 +2572,7 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
     )
     if not has_viz_surface:
         raise DeliveryContractError("delivery_effect_foxglove_identity_mismatch")
-    expected_report_cifs_path = canonical_viz_mcap_cifs_path(
-        manifest_submission_key
-    )
+    expected_report_cifs_path = canonical_viz_mcap_cifs_path(manifest_submission_key)
     if payload.get("report_cifs_path") != expected_report_cifs_path:
         raise DeliveryContractError("delivery_report_cifs_identity_mismatch")
     if (
@@ -2549,9 +2586,10 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
     if payload.get("report_link_kind") != DELIVERY_REPORT_LINK_KIND:
         raise DeliveryContractError("delivery_effect_report_link_kind_invalid")
     expected_human_review = payload.get("terminal_class") == CANDIDATE_HYPOTHESIS
-    if payload.get("requires_human_review") is not expected_human_review or payload.get(
-        "report_status"
-    ) not in _VIZ_REPORT_STATUSES:
+    if (
+        payload.get("requires_human_review") is not expected_human_review
+        or payload.get("report_status") not in _VIZ_REPORT_STATUSES
+    ):
         raise DeliveryContractError("delivery_effect_review_boundary_invalid")
     expected_report_link = claim.report_url
     expected_field_updates = [
@@ -3255,39 +3293,79 @@ class DeliveryDispatcher:
         payload = claim.payload if isinstance(claim.payload, Mapping) else {}
         terminal_class = str(payload.get("terminal_class") or "")
         quality = str(contract.get("quality_classification") or "")
-        if terminal_class == HONEST_NON_ATTRIBUTION:
+        raw_gate_a_projection = contract.get("gate_a_projection")
+        gate_a_projection: dict[str, Any] | None = None
+        if raw_gate_a_projection is not None:
+            try:
+                gate_a_projection = validate_gate_a_projection(raw_gate_a_projection)
+            except RcaEvidenceProjectionError as exc:
+                raise DeliveryObservationError(
+                    "observation_gate_a_projection_invalid", exc.code
+                ) from exc
+        if gate_a_projection is not None:
+            level = str(gate_a_projection["level"])
+        elif terminal_class == HONEST_NON_ATTRIBUTION:
             level = "L0_abstain"
         elif quality == "supported_attribution":
             level = "L2_attribution"
         else:
             level = "L1_observation"
-        upstream = contract.get("upstream_dispatch")
-        hit_keys = (
-            upstream.get("hit_evaluator_keys")
-            if isinstance(upstream, Mapping)
-            else None
+        if gate_a_projection is not None:
+            evaluator_projection = gate_a_projection.get("evaluator_projection")
+            evaluators = (
+                evaluator_projection.get("evaluators")
+                if isinstance(evaluator_projection, Mapping)
+                else []
+            )
+            hit_keys = {
+                str(evaluator.get("key") or "").strip()
+                for evaluator in evaluators
+                if isinstance(evaluator, Mapping)
+                and evaluator.get("status") == "supported"
+                and evaluator.get("evidence_refs")
+                and str(evaluator.get("key") or "").strip()
+            }
+            evaluator_hit_count = len(hit_keys)
+        else:
+            upstream = contract.get("upstream_dispatch")
+            hit_keys = (
+                upstream.get("hit_evaluator_keys")
+                if isinstance(upstream, Mapping)
+                else None
+            )
+            evaluator_hit_count = (
+                len({
+                    str(value).strip() for value in hit_keys if str(value or "").strip()
+                })
+                if isinstance(hit_keys, (list, tuple))
+                else 0
+            )
+        has_attribution = evaluator_hit_count > 0
+        publication = self._contract_value(contract, ("artifacts", "viz_publication"))
+        viz_published = (
+            isinstance(publication, Mapping)
+            and publication.get("status") == "published"
         )
-        has_attribution = bool(
-            isinstance(hit_keys, (list, tuple))
-            and any(str(value or "").strip() for value in hit_keys)
-            and quality == "supported_attribution"
-        )
-        publication = self._contract_value(
-            contract, ("artifacts", "viz_publication")
-        )
-        viz_published = isinstance(publication, Mapping) and publication.get(
-            "status"
-        ) == "published"
         viz_bytes = (
-            publication.get("size", 0)
-            if isinstance(publication, Mapping)
-            else 0
+            publication.get("size", 0) if isinstance(publication, Mapping) else 0
         )
         evidence_count = self._contract_value(
             contract,
             ("evidence_channel_msg_count",),
             ("evidence", "evidence_channel_msg_count"),
             ("consumer_capability", "evidence_channel_msg_count"),
+            (
+                "consumer_capability",
+                "evidence",
+                "viz_lineage",
+                "evidence_channel_msg_count",
+            ),
+            (
+                "consumer_capability",
+                "evidence",
+                "viz_lineage",
+                "evaluator_topic_message_count",
+            ),
         )
         evidence_count_reason = (
             "sealed_contract_does_not_expose_evidence_channel_msg_count"
@@ -3306,96 +3384,306 @@ class DeliveryDispatcher:
             if isinstance(public_result, Mapping)
             else None
         )
-        refs = evidence_summary.get("refs") if isinstance(evidence_summary, Mapping) else None
-        refs_nonempty = bool(refs) if isinstance(refs, (list, tuple, str, Mapping)) else None
+        refs = (
+            evidence_summary.get("refs")
+            if isinstance(evidence_summary, Mapping)
+            else None
+        )
+        refs_nonempty = (
+            bool(refs) if isinstance(refs, (list, tuple, str, Mapping)) else None
+        )
         refs_reason = (
             "sealed_contract_does_not_expose_evidence_refs"
             if refs_nonempty is None
             else None
         )
         try:
-            # The effect row's created_at is the durable acceptance boundary
-            # available to the dispatcher; upstream task timing is not present
-            # in this v7 claim schema and must not be fabricated.
+            # business_triggers.created_at is the durable pipeline acceptance
+            # boundary.  The store falls back to effect creation only for
+            # isolated fixtures that do not contain the control schema.
             started_at = datetime.fromisoformat(
-                str(claim.effect_created_at or "").replace("Z", "+00:00")
+                str(
+                    claim.business_accepted_at or claim.effect_created_at or ""
+                ).replace("Z", "+00:00")
             )
             if started_at.tzinfo is None or started_at.utcoffset() is None:
                 raise ValueError("work_started_at must be timezone-aware")
-            elapsed = (delivered_at.astimezone(timezone.utc) - started_at.astimezone(timezone.utc)).total_seconds()
+            elapsed = (
+                delivered_at.astimezone(timezone.utc)
+                - started_at.astimezone(timezone.utc)
+            ).total_seconds()
         except (TypeError, ValueError) as exc:
             raise DeliveryObservationError(
                 "observation_pipeline_start_invalid", str(exc)
             ) from exc
         if elapsed < 0:
             raise DeliveryObservationError("observation_pipeline_elapsed_negative")
-        inventory_pin = self._contract_value(
-            contract,
-            ("inventory_pin",),
-            ("evaluator_inventory", "inventory_sha256"),
-            ("consumer_capability", "inventory_sha256"),
-            ("consumer_capability", "evaluator_inventory", "inventory_sha256"),
-        ) or claim.manifest.get("inventory_pin") or claim.manifest.get("inventory_sha256")
-        inventory_pin = str(inventory_pin or getattr(self.config, "inventory_pin", "") or "").strip()
+        contract_inventory_pin = (
+            self._contract_value(
+                contract,
+                ("inventory_pin",),
+                ("evaluator_inventory", "inventory_sha256"),
+                ("consumer_capability", "inventory_sha256"),
+                ("consumer_capability", "evaluator_inventory", "inventory_sha256"),
+            )
+            or claim.manifest.get("inventory_pin")
+            or claim.manifest.get("inventory_sha256")
+        )
+        inventory_pin = str(getattr(self.config, "inventory_pin", "") or "").strip()
+        if (
+            contract_inventory_pin
+            and str(contract_inventory_pin).strip() != inventory_pin
+        ):
+            raise DeliveryObservationError("observation_inventory_pin_mismatch")
+        configured_release_id = str(
+            getattr(self.config, "observation_release_id", "")
+            or getattr(self.config, "quarantine_release_id", "")
+            or ""
+        ).strip()
+        contract_release_id = str(contract.get("release_id") or "").strip()
+        if contract_release_id and contract_release_id != configured_release_id:
+            raise DeliveryObservationError("observation_release_id_mismatch")
         fields: dict[str, Any] = {
             "work_item_id": claim.work_item_id,
             "case_key": claim.submission_key or claim.business_key,
             "delivered_at": _utc_iso(delivered_at),
             "level": level,
             "has_attribution": has_attribution,
+            "evaluator_hit_count": evaluator_hit_count,
             "viz_published": viz_published,
             "viz_bytes": viz_bytes,
             "evidence_channel_msg_count": evidence_count,
             "evidence_refs_nonempty": refs_nonempty,
             "pipeline_elapsed_seconds": elapsed,
-            "outcome_content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            "outcome_content_sha256": hashlib.sha256(
+                content.encode("utf-8")
+            ).hexdigest(),
             "remote_receipt_id": remote_id,
-            "release_id": str(
-                getattr(self.config, "observation_release_id", "")
-                or getattr(self.config, "quarantine_release_id", "")
-                or contract.get("release_id")
-                or ""
-            ).strip(),
+            "release_id": configured_release_id,
             "inventory_pin": inventory_pin,
         }
         if evidence_count_reason:
-            fields["evidence_channel_msg_count_not_measured_reason"] = evidence_count_reason
+            fields["evidence_channel_msg_count_not_measured_reason"] = (
+                evidence_count_reason
+            )
         if refs_reason:
             fields["evidence_refs_nonempty_not_measured_reason"] = refs_reason
+        fields["observation_id"] = delivery_observation_id(fields)
         return fields
 
-    def _record_delivery_observation(
+    def _prepare_delivery_observation(
         self,
         claim: DeliveryEffectClaim,
         *,
         content: str,
         remote_id: str,
         delivered_at: datetime,
-    ) -> None:
+    ) -> dict[str, Any]:
         if not getattr(self.config, "observability_enabled", False):
-            return
+            error = DeliveryObservationError("observability_disabled")
+            self._record_observability_error(error)
+            raise error
         try:
-            append_delivery_observation(
-                getattr(self.config, "observability_path", default_observation_path()),
+            return build_delivery_observation(
                 self._delivery_observation_fields(
                     claim,
                     content=content,
                     remote_id=remote_id,
                     delivered_at=delivered_at,
-                ),
+                )
             )
-        except DeliveryObservationError as exc:
-            # The provider write is already confirmed; telemetry cannot roll it
-            # back.  Count the loss explicitly so the release gate can fail.
-            self.stats.observability_errors += 1
-            self.stats.observability_last_error = (
-                f"{exc.code}:{exc.detail}" if exc.detail else exc.code
+        except (
+            DeliveryObservationError,
+            OSError,
+            TypeError,
+            ValueError,
+            RuntimeError,
+        ) as exc:
+            self._record_observability_error(exc)
+            raise
+
+    @staticmethod
+    def _observability_error_code(exc: BaseException) -> str:
+        if isinstance(exc, DeliveryObservationError):
+            return f"{exc.code}:{exc.detail}" if exc.detail else exc.code
+        return type(exc).__name__
+
+    def _record_observability_error(self, exc: BaseException) -> None:
+        code = self._observability_error_code(exc)
+        self.stats.observability_errors += 1
+        self.stats.observability_last_error = code
+        self.stats.observability_current_error = code
+
+    def _flush_pending_delivery_observations(self) -> None:
+        """Recover committed intents before admitting another provider write."""
+        if not getattr(self.config, "observability_enabled", False):
+            return
+        path = getattr(self.config, "observability_path", default_observation_path())
+        try:
+            with delivery_observation_file_lock(path):
+                ensure_delivery_observation_path(path)
+                all_intents = self.store.list_delivery_observations()
+                pending_intents = [
+                    intent for intent in all_intents if intent.status == "pending"
+                ]
+                try:
+                    snapshot = read_delivery_observation_receipt(path)
+                except DeliveryObservationError as original_error:
+                    if original_error.code != "observation_receipt_line_invalid":
+                        raise
+                    snapshot = None
+                    for intent in pending_intents:
+                        try:
+                            append_result = append_delivery_observation_verified(
+                                path, intent.payload
+                            )
+                        except DeliveryObservationError as candidate_error:
+                            if candidate_error.code == "observation_receipt_duplicate_id":
+                                try:
+                                    snapshot = read_delivery_observation_receipt(path)
+                                except DeliveryObservationError as reread_error:
+                                    if reread_error.code == "observation_receipt_line_invalid":
+                                        continue
+                                    raise
+                                break
+                            if candidate_error.code == "observation_receipt_line_invalid":
+                                continue
+                            raise
+                        snapshot = append_result.receipt
+                        self.stats.observability_written += 1
+                        break
+                    if snapshot is None:
+                        raise original_error
+                observed_hashes = dict(snapshot.payload_sha256_by_id)
+
+                self._reconcile_delivery_observation_receipt(
+                    observed_hashes,
+                    all_intents,
+                    require_all=False,
+                )
+
+                acknowledged: list[tuple[str, str]] = []
+                while True:
+                    intents = self.store.list_pending_delivery_observations(limit=1000)
+                    if not intents:
+                        break
+                    for intent in intents:
+                        observed_sha256 = observed_hashes.get(intent.observation_id)
+                        if observed_sha256 is None:
+                            append_result = append_delivery_observation_verified(
+                                path, intent.payload
+                            )
+                            appended_sha256 = delivery_observation_payload_sha256(
+                                append_result.observation
+                            )
+                            if appended_sha256 != intent.payload_sha256:
+                                raise DeliveryObservationError(
+                                    "observation_outbox_payload_hash_mismatch",
+                                    intent.observation_id,
+                                )
+                            observed_hashes = dict(
+                                append_result.receipt.payload_sha256_by_id
+                            )
+                            self.stats.observability_written += 1
+                        elif observed_sha256 != intent.payload_sha256:
+                            raise DeliveryObservationError(
+                                "observation_receipt_payload_hash_mismatch",
+                                intent.observation_id,
+                            )
+                    # The append helper binds its own FD, but callers can still
+                    # replace the pathname after it returns. Reopen and verify
+                    # the live path before any durable outbox acknowledgement.
+                    premark_snapshot = read_delivery_observation_receipt(path)
+                    observed_hashes = dict(
+                        premark_snapshot.payload_sha256_by_id
+                    )
+                    self._reconcile_delivery_observation_receipt(
+                        observed_hashes,
+                        self.store.list_delivery_observations(),
+                        require_all=False,
+                    )
+                    for intent in intents:
+                        if (
+                            observed_hashes.get(intent.observation_id)
+                            != intent.payload_sha256
+                        ):
+                            raise DeliveryObservationError(
+                                "observation_appended_receipt_missing",
+                                intent.observation_id,
+                            )
+                        marked = self.store.mark_delivery_observation_appended(
+                            observation_id=intent.observation_id,
+                            payload_sha256=intent.payload_sha256,
+                            now=self.now(),
+                        )
+                        if marked:
+                            acknowledged.append(
+                                (intent.observation_id, intent.payload_sha256)
+                            )
+
+                try:
+                    final_snapshot = read_delivery_observation_receipt(path)
+                    observed_hashes = dict(final_snapshot.payload_sha256_by_id)
+                    all_intents = self.store.list_delivery_observations()
+                    self._reconcile_delivery_observation_receipt(
+                        observed_hashes,
+                        all_intents,
+                        require_all=True,
+                    )
+                except Exception:
+                    if acknowledged:
+                        self.store.requeue_delivery_observations(
+                            observations=acknowledged,
+                        )
+                    raise
+                self.stats.observability_current_error = ""
+        except (
+            DeliveryObservationError,
+            OSError,
+            TypeError,
+            ValueError,
+            RuntimeError,
+        ) as exc:
+            self._record_observability_error(exc)
+            raise
+
+    @staticmethod
+    def _reconcile_delivery_observation_receipt(
+        observed_hashes: Mapping[str, str],
+        intents: list[Any],
+        *,
+        require_all: bool,
+    ) -> None:
+        outbox_hashes: dict[str, str] = {}
+        appended_ids: set[str] = set()
+        for intent in intents:
+            if intent.observation_id in outbox_hashes:
+                raise DeliveryObservationError(
+                    "observation_outbox_duplicate_id", intent.observation_id
+                )
+            outbox_hashes[intent.observation_id] = intent.payload_sha256
+            if intent.status == "appended":
+                appended_ids.add(intent.observation_id)
+            elif intent.status != "pending":
+                raise DeliveryObservationError(
+                    "observation_outbox_status_invalid", str(intent.status)
+                )
+        for observation_id, observed_sha256 in observed_hashes.items():
+            expected_sha256 = outbox_hashes.get(observation_id)
+            if expected_sha256 is None:
+                raise DeliveryObservationError(
+                    "observation_receipt_untracked_id", observation_id
+                )
+            if observed_sha256 != expected_sha256:
+                raise DeliveryObservationError(
+                    "observation_receipt_payload_hash_mismatch", observation_id
+                )
+        required_ids = set(outbox_hashes) if require_all else appended_ids
+        missing = required_ids.difference(observed_hashes)
+        if missing:
+            raise DeliveryObservationError(
+                "observation_appended_receipt_missing", min(missing)
             )
-        except (OSError, TypeError, ValueError) as exc:
-            self.stats.observability_errors += 1
-            self.stats.observability_last_error = type(exc).__name__
-        else:
-            self.stats.observability_written += 1
 
     def _lease_lost(self, claim: DeliveryEffectClaim) -> DispatchOutcome:
         self.stats.lease_lost += 1
@@ -3405,6 +3693,20 @@ class DeliveryDispatcher:
             delivery_id=claim.delivery_id,
             attempt=claim.attempt,
             error_code="stale_delivery_effect_lease",
+        )
+
+    def _preflight_delivery_observation(
+        self,
+        claim: DeliveryEffectClaim,
+        *,
+        content: str,
+    ) -> None:
+        """Validate all observation fields before crossing a provider write boundary."""
+        self._prepare_delivery_observation(
+            claim,
+            content=content,
+            remote_id=f"preflight:{claim.request_id}",
+            delivered_at=self.now(),
         )
 
     def _adjudication_binding_gate(
@@ -3458,9 +3760,7 @@ class DeliveryDispatcher:
         if not isinstance(binding, Mapping):
             if claim.effect_kind == DELIVERY_CARD_PATCH_EFFECT_KIND:
                 raise ExternalWriteFenceError("external_write_fence_missing")
-            if self.store.is_historical_external_write_effect(
-                claim.effect_created_at
-            ):
+            if self.store.is_historical_external_write_effect(claim.effect_created_at):
                 return self._validate_historical_external_write_epoch(claim)
             raise ExternalWriteFenceError("external_write_fence_missing")
         fence = binding.get("write_fence")
@@ -3468,9 +3768,7 @@ class DeliveryDispatcher:
         if not isinstance(fence, Mapping) or not core_sha:
             if claim.effect_kind == DELIVERY_CARD_PATCH_EFFECT_KIND:
                 raise ExternalWriteFenceError("external_write_fence_missing")
-            if self.store.is_historical_external_write_effect(
-                claim.effect_created_at
-            ):
+            if self.store.is_historical_external_write_effect(claim.effect_created_at):
                 return self._validate_historical_external_write_epoch(claim)
             raise ExternalWriteFenceError("external_write_fence_missing")
         try:
@@ -3491,13 +3789,9 @@ class DeliveryDispatcher:
             else None
         )
         expected_issue = str(live.get("issue_target") or "").strip()
-        expected_target_set_sha256 = str(
-            live.get("target_set_sha256") or ""
-        ).strip()
+        expected_target_set_sha256 = str(live.get("target_set_sha256") or "").strip()
         if not expected_issue or not expected_target_set_sha256:
-            raise ExternalWriteFenceError(
-                "external_write_fence_target_mismatch"
-            )
+            raise ExternalWriteFenceError("external_write_fence_target_mismatch")
         if claim.effect_kind == DELIVERY_CARD_PATCH_EFFECT_KIND and (
             str(claim.payload.get("chat_id") or "").strip()
             != str(live.get("chat_id") or "").strip()
@@ -3723,6 +4017,7 @@ class DeliveryDispatcher:
         self.stats.loops += 1
         if not self.config.enabled:
             return DispatchOutcome(status="disabled")
+        self._flush_pending_delivery_observations()
         claim = self.store.claim_due_effect(
             lease_owner=self.lease_owner,
             lease_seconds=self.config.lease_seconds,
@@ -3904,6 +4199,13 @@ class DeliveryDispatcher:
         source: str,
     ) -> DispatchOutcome:
         remote_id = str(match["remote_id"])
+        delivered_at = self.now()
+        observation = self._prepare_delivery_observation(
+            claim,
+            content=validated.content,
+            remote_id=remote_id,
+            delivered_at=delivered_at,
+        )
         self._settle_claim(
             claim,
             lambda: self.store.complete_effect(
@@ -3922,16 +4224,12 @@ class DeliveryDispatcher:
                         key for key, _value in validated.field_updates
                     ],
                 },
+                observation=observation,
                 runtime_identity=self.runtime_identity,
-                now=self.now(),
+                now=delivered_at,
             ),
         )
-        self._record_delivery_observation(
-            claim,
-            content=validated.content,
-            remote_id=remote_id,
-            delivered_at=self.now(),
-        )
+        self._flush_pending_delivery_observations()
         self.stats.reconciled += 1
         return DispatchOutcome(
             status="reconciled",
@@ -4099,8 +4397,7 @@ class DeliveryDispatcher:
                     "error": "patch_task_card omitted a boolean success field",
                 }
             if (
-                patch_result.get("error_code")
-                == "feishu_card_patch_message_expired"
+                patch_result.get("error_code") == "feishu_card_patch_message_expired"
                 and patch_result.get("permanent") is True
                 and patch_result.get("outcome_uncertain") is False
             ):
@@ -4109,8 +4406,7 @@ class DeliveryDispatcher:
                     lambda: self.store.suppress_expired_card_patch(
                         claim=claim,
                         error_detail=str(
-                            patch_result.get("error")
-                            or "Feishu card message expired"
+                            patch_result.get("error") or "Feishu card message expired"
                         ),
                         receipt={
                             "source": "card_message_expired",
@@ -4151,6 +4447,13 @@ class DeliveryDispatcher:
                 detail="card patch response did not confirm the exact message id",
                 uncertain=True,
             )
+        delivered_at = self.now()
+        observation = self._prepare_delivery_observation(
+            claim,
+            content=_canonical_json(validated.card_payload or claim.payload),
+            remote_id=remote_id,
+            delivered_at=delivered_at,
+        )
         try:
             self._settle_claim(
                 claim,
@@ -4172,11 +4475,22 @@ class DeliveryDispatcher:
                             claim.payload.get("correction_effect_key") or ""
                         ),
                     },
+                    observation=observation,
                     runtime_identity=self.runtime_identity,
-                    now=self.now(),
+                    now=delivered_at,
                 ),
             )
         except DeliveryRecordConflictError as exc:
+            # The provider already acknowledged this irreversible PATCH. Even
+            # if the fenced settlement lost a race, preserve the exact
+            # observation intent without repeating or settling the write.
+            self.store.record_postwrite_delivery_observation(
+                claim=claim,
+                remote_id=remote_id,
+                observation=observation,
+                now=delivered_at,
+            )
+            self._flush_pending_delivery_observations()
             return DispatchOutcome(
                 status="activation_stale",
                 effect_key=claim.effect_key,
@@ -4185,12 +4499,7 @@ class DeliveryDispatcher:
                 error_code=str(exc)[:120],
                 remote_id=remote_id,
             )
-        self._record_delivery_observation(
-            claim,
-            content=_canonical_json(validated.card_payload or claim.payload),
-            remote_id=remote_id,
-            delivered_at=self.now(),
-        )
+        self._flush_pending_delivery_observations()
         self.stats.delivered += 1
         return DispatchOutcome(
             status="succeeded",
@@ -4209,6 +4518,15 @@ class DeliveryDispatcher:
             validated = _validate_effect(claim)
         except DeliveryContractError as exc:
             return self._quarantine(claim, error_code=exc.code, detail=exc.detail)
+        preflight_content = (
+            _canonical_json(validated.card_payload or claim.payload)
+            if claim.effect_kind == DELIVERY_CARD_PATCH_EFFECT_KIND
+            else validated.content
+        )
+        self._preflight_delivery_observation(
+            claim,
+            content=preflight_content,
+        )
         if claim.effect_kind == DELIVERY_CARD_PATCH_EFFECT_KIND:
             return self._dispatch_card_patch(claim, validated)
         if adjudication_effect:
@@ -4370,8 +4688,10 @@ class DeliveryDispatcher:
                 uncertain=True,
                 exact_delay_seconds=UNCERTAIN_RECONCILIATION_POLL_SECONDS,
             )
-        if adjudication_effect and not fields_match and (
-            claim.write_phase == "write_started" or existing_marker is not None
+        if (
+            adjudication_effect
+            and not fields_match
+            and (claim.write_phase == "write_started" or existing_marker is not None)
         ):
             return self._retry(
                 claim,
@@ -4519,12 +4839,8 @@ class DeliveryDispatcher:
         )
         if verification_failure is not None:
             return verification_failure
-        if (
-            not prior_write_uncertain
-            and not (
-                adjudication_effect
-                and claim.adjudication_comment_attempt_count > 0
-            )
+        if not prior_write_uncertain and not (
+            adjudication_effect and claim.adjudication_comment_attempt_count > 0
         ):
             try:
                 self._validate_external_write(
@@ -4574,9 +4890,7 @@ class DeliveryDispatcher:
             except ExternalWriteFenceError as exc:
                 return self._quarantine(claim, error_code=exc.code, detail=exc.detail)
             try:
-                with _bound_provider_write_guard(
-                    self._provider_write_guard(claim)
-                ):
+                with _bound_provider_write_guard(self._provider_write_guard(claim)):
                     update_raw = self._write_field_updates(claim, validated)
             except ExternalWriteFenceError as exc:
                 return self._quarantine(
@@ -4877,6 +5191,13 @@ class DeliveryDispatcher:
                 detail=detail,
                 uncertain=True,
             )
+        delivered_at = self.now()
+        observation = self._prepare_delivery_observation(
+            claim,
+            content=validated.content,
+            remote_id=remote_id,
+            delivered_at=delivered_at,
+        )
         self._settle_claim(
             claim,
             lambda: self.store.complete_effect(
@@ -4898,16 +5219,12 @@ class DeliveryDispatcher:
                     "confirmed_report_url": claim.report_url,
                     "confirmed_field_keys": list(expected_field_keys),
                 },
+                observation=observation,
                 runtime_identity=self.runtime_identity,
-                now=self.now(),
+                now=delivered_at,
             ),
         )
-        self._record_delivery_observation(
-            claim,
-            content=validated.content,
-            remote_id=remote_id,
-            delivered_at=self.now(),
-        )
+        self._flush_pending_delivery_observations()
         self.stats.delivered += 1
         return DispatchOutcome(
             status="succeeded",
@@ -4976,7 +5293,7 @@ class HealthReporter:
                 and (not self.config.enabled or store_health.get("ok") is True)
                 and not (
                     self.config.observability_enabled
-                    and stats.observability_errors > 0
+                    and bool(stats.observability_current_error)
                 )
             ),
             "state": state,

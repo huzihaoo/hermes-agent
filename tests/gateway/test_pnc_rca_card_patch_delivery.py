@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
-from datetime import timedelta
+from datetime import datetime, timedelta
 import json
 import sqlite3
 from types import SimpleNamespace
@@ -102,6 +102,19 @@ def _card_patch(
         card_payload=card_payload,
     )
     return store, adjudication, payload
+
+
+def _card_dispatcher_config(tmp_path):
+    return SimpleNamespace(
+        enabled=True,
+        lease_seconds=90,
+        activation_required=True,
+        observability_enabled=True,
+        observability_path=tmp_path / "card-delivery-observations.jsonl",
+        inventory_pin="c" * 64,
+        observation_release_id="card-release-test",
+        quarantine_release_id="",
+    )
 
 
 def test_card_patch_contract_is_exact_deterministic_and_tamper_evident(tmp_path):
@@ -414,11 +427,7 @@ def test_card_patch_dependency_exception_opens_card_circuit(tmp_path, monkeypatc
 
     dispatcher = DeliveryDispatcher(
         store=store,
-        config=SimpleNamespace(
-            enabled=True,
-            lease_seconds=90,
-            activation_required=True,
-        ),
+        config=_card_dispatcher_config(tmp_path),
         list_comments=lambda *_args: pytest.fail("card patch must not list comments"),
         add_comment=lambda *_args: pytest.fail("card patch must not add comments"),
         report_verifier=lambda *_args: pytest.fail("card patch has no report read"),
@@ -668,6 +677,9 @@ def test_relay_materializes_and_dispatches_exact_card_patch_offline(
         if row["effect_kind"] == DELIVERY_CARD_PATCH_EFFECT_KIND
     ]
     queued_payload = json.loads(queued_effect["payload_json"])
+    dispatch_now = datetime.fromisoformat(queued_effect["created_at"]) + timedelta(
+        seconds=1
+    )
     assert queued_payload["adjudication_id"] == adjudication.adjudication_id
     assert queued_payload["message_id"] == "om_card123"
     assert queued_payload["render_hash"] == stable_render_hash(
@@ -698,16 +710,12 @@ def test_relay_materializes_and_dispatches_exact_card_patch_offline(
 
     dispatcher = DeliveryDispatcher(
         store=store,
-        config=SimpleNamespace(
-            enabled=True,
-            lease_seconds=90,
-            activation_required=True,
-        ),
+        config=_card_dispatcher_config(tmp_path),
         list_comments=lambda *_args: pytest.fail("card patch must not list comments"),
         add_comment=lambda *_args: pytest.fail("card patch must not add comments"),
         report_verifier=lambda *_args: pytest.fail("card patch has no report read"),
         patch_task_card=patch_task_card,
-        now=lambda: NOW,
+        now=lambda: dispatch_now,
         lease_owner="card-patch-dispatcher-test",
     )
     monkeypatch.setattr(
@@ -793,11 +801,7 @@ def test_revoked_ambiguous_card_patch_is_reclaimed_only_for_quarantine(
 
     dispatcher = DeliveryDispatcher(
         store=store,
-        config=SimpleNamespace(
-            enabled=True,
-            lease_seconds=90,
-            activation_required=True,
-        ),
+        config=_card_dispatcher_config(tmp_path),
         list_comments=lambda *_args: pytest.fail("card patch must not list comments"),
         add_comment=lambda *_args: pytest.fail("card patch must not add comments"),
         report_verifier=lambda *_args: pytest.fail("card patch has no report read"),
@@ -884,6 +888,61 @@ def test_revoked_ambiguous_card_patch_is_reclaimed_only_for_quarantine(
     assert observed["external_write_attempted"] is False
 
 
+def test_card_patch_success_records_observation_when_settlement_conflicts(
+    tmp_path,
+    monkeypatch,
+):
+    store, _adjudication, payload = _card_patch(
+        tmp_path,
+        settle_correction=True,
+    )
+    store.enqueue_card_patch_effect(payload=payload, now=NOW)
+    provider_claim = build_write_fence_provider_claim({"state": "issued"})
+    patch_calls = 0
+
+    def successful_patch(_target, _card, message_id=None, **_kwargs):
+        nonlocal patch_calls
+        patch_calls += 1
+        return {"success": True, "message_id": message_id, "updated": True}
+
+    dispatcher = DeliveryDispatcher(
+        store=store,
+        config=_card_dispatcher_config(tmp_path),
+        list_comments=lambda *_args: pytest.fail("card patch must not list comments"),
+        add_comment=lambda *_args: pytest.fail("card patch must not add comments"),
+        report_verifier=lambda *_args: pytest.fail("card patch has no report read"),
+        patch_task_card=successful_patch,
+        now=lambda: NOW,
+        lease_owner="card-patch-settlement-conflict-test",
+    )
+    monkeypatch.setattr(
+        dispatcher,
+        "_validate_external_write",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        dispatcher,
+        "_provider_write_guard",
+        lambda _claim: provider_claim,
+    )
+
+    def settlement_conflict(**_kwargs):
+        raise DeliveryRecordConflictError("simulated_card_settlement_conflict")
+
+    monkeypatch.setattr(store, "complete_effect", settlement_conflict)
+
+    outcome = dispatcher.dispatch_one()
+
+    assert outcome.status == "activation_stale"
+    assert outcome.error_code == "simulated_card_settlement_conflict"
+    assert patch_calls == 1
+    [intent] = store.list_delivery_observations()
+    assert intent.effect_key == payload["effect_key"]
+    assert intent.status == "appended"
+    receipt = tmp_path / "card-delivery-observations.jsonl"
+    assert len(receipt.read_text(encoding="utf-8").splitlines()) == 1
+
+
 def test_expired_card_patch_is_durably_suppressed_without_direct_retry(
     tmp_path,
     monkeypatch,
@@ -913,11 +972,7 @@ def test_expired_card_patch_is_durably_suppressed_without_direct_retry(
 
     dispatcher = DeliveryDispatcher(
         store=store,
-        config=SimpleNamespace(
-            enabled=True,
-            lease_seconds=90,
-            activation_required=True,
-        ),
+        config=_card_dispatcher_config(tmp_path),
         list_comments=lambda *_args: pytest.fail("card patch must not list comments"),
         add_comment=lambda *_args: pytest.fail("card patch must not add comments"),
         report_verifier=lambda *_args: pytest.fail("card patch has no report read"),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 import json
 from types import SimpleNamespace
 
@@ -13,7 +14,6 @@ from gateway.pnc_rca_provider_fence import build_write_fence_provider_claim
 from scripts import pnc_completion_notice_relay as relay
 from scripts.pnc_rca_delivery_dispatcher import DeliveryDispatcher
 from tests.gateway.test_pnc_rca_card_patch_delivery import _card_patch
-from tests.gateway.test_pnc_rca_conclusion_adjudication import NOW
 
 
 def test_semantic_review_materializes_and_settles_one_durable_card_patch(
@@ -80,6 +80,7 @@ def test_semantic_review_materializes_and_settles_one_durable_card_patch(
     ]
     assert effect["status"] == "pending"
     assert direct_card_calls == []
+    dispatch_now = datetime.fromisoformat(effect["created_at"]) + timedelta(seconds=1)
 
     provider_claim = build_write_fence_provider_claim({"state": "issued"})
 
@@ -101,12 +102,17 @@ def test_semantic_review_materializes_and_settles_one_durable_card_patch(
             enabled=True,
             lease_seconds=90,
             activation_required=True,
+            observability_enabled=True,
+            observability_path=tmp_path / "card-relay-observations.jsonl",
+            inventory_pin="c" * 64,
+            observation_release_id="card-relay-release-test",
+            quarantine_release_id="",
         ),
         list_comments=lambda *_args: pytest.fail("card patch must not list comments"),
         add_comment=lambda *_args: pytest.fail("card patch must not add comments"),
         report_verifier=lambda *_args: pytest.fail("card patch has no report read"),
         patch_task_card=patch_task_card,
-        now=lambda: NOW,
+        now=lambda: dispatch_now,
         lease_owner="card-patch-relay-test",
     )
     monkeypatch.setattr(

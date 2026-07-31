@@ -25,9 +25,9 @@
     <key>HERMES_RCA_DELIVERY_DISPATCHER_OBSERVABILITY_ENABLED</key>
     <string>true</string>
     <key>HERMES_RCA_DELIVERY_DISPATCHER_OBSERVABILITY_PATH</key>
-    <string>/Users/songying/.hermes/runtime/pnc_agent/feishu_issue_kafka_rca/delivery_observations.jsonl</string>
+    <string>/Users/songying/.hermes/runtime/pnc_agent/feishu_issue_kafka_rca/delivery_observations.rca-goal-v6-gate-a-20260731-r11.jsonl</string>
     <key>HERMES_RCA_DELIVERY_DISPATCHER_OBSERVATION_RELEASE_ID</key>
-    <string>rca-goal-v6-gate-a-20260731-r10</string>
+    <string>rca-goal-v6-gate-a-20260731-r11</string>
     <key>PATH</key>
     <string>/Users/songying/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>PNC_FOXGLOVE_RENDER_HOST</key>

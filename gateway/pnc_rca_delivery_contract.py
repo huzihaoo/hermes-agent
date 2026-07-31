@@ -15,6 +15,12 @@ from typing import Any, Mapping, Sequence
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from gateway.pnc_rca_admission import RcaAdmission, validate_rca_admission
+from gateway.pnc_rca_abstention_projection import (
+    RcaEvidenceProjectionError,
+    build_gate_a_identifier_binding,
+    build_gate_a_public_result,
+    validate_gate_a_projection,
+)
 from gateway.feishu_mention import build_at_mention
 from gateway.feishu_task_card import contains_internal_rca_html_reference
 from gateway.pnc_rca_quality_oracle import (
@@ -226,6 +232,64 @@ def _legacy_abstain_no_hit() -> dict[str, Any]:
     }
 
 
+def _gate_a_projection(contract: Mapping[str, Any]) -> dict[str, Any] | None:
+    raw = contract.get("gate_a_projection")
+    if raw is None:
+        return None
+    try:
+        projection = validate_gate_a_projection(raw)
+        if projection["level"] == "L1_observation":
+            projection = validate_gate_a_projection(
+                raw,
+                identifier_binding=build_gate_a_identifier_binding(
+                    contract.get("consumer_capability")
+                ),
+            )
+        return projection
+    except RcaEvidenceProjectionError as exc:
+        raise DeliveryContractError(
+            "gate_a_projection_invalid", f"gate_a_projection_invalid: {exc}"
+        ) from exc
+
+
+def _sanitize_gate_a_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
+    """Replace all decision-bearing fields with the L0/L1 projection."""
+    projection = _gate_a_projection(contract)
+    if projection is None:
+        return dict(contract)
+    public = build_gate_a_public_result(projection)
+    sanitized = dict(contract)
+    sanitized["public_result"] = public
+    sanitized["summary"] = dict(public["summary"])
+    report = dict(contract.get("report")) if isinstance(
+        contract.get("report"), Mapping
+    ) else {}
+    for field in (
+        "candidate_owner_domain",
+        "candidate_owner",
+        "candidate_responsibility",
+        "responsibility_candidate",
+        "is_candidate",
+    ):
+        report.pop(field, None)
+    sanitized["report"] = report
+    for field in (
+        "quality_classification",
+        "terminal_class",
+        "confidence_tier",
+        "approval_ready",
+        "human_decision",
+    ):
+        sanitized.pop(field, None)
+    artifacts = contract.get("artifacts")
+    if isinstance(artifacts, Mapping):
+        artifacts = dict(artifacts)
+        artifacts.pop("attribution_causal_text", None)
+        sanitized["artifacts"] = artifacts
+    sanitized["evidence_boundary"] = list(public.get("evidence_boundary") or [])
+    return sanitized
+
+
 def _validated_upstream_dispatch(contract: Mapping[str, Any]) -> dict[str, Any]:
     raw = contract.get("upstream_dispatch")
     if raw is None:
@@ -359,7 +423,11 @@ def _validated_upstream_dispatch(contract: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _dispatch_first_line(dispatch: Mapping[str, Any]) -> str:
+def _dispatch_first_line(
+    dispatch: Mapping[str, Any], *, gate_a_projection: bool = False
+) -> str:
+    if gate_a_projection:
+        return "本单未能定向"
     if dispatch.get("terminal_classification") == "out_of_scope":
         return "本单不在自动分析范围"
     owner_bucket_label = dispatch.get("owner_bucket_label")
@@ -2210,6 +2278,9 @@ def build_public_rca_result(contract: Mapping[str, Any]) -> dict[str, Any]:
     evaluator, generation, or terminal implementation details.
     """
     contract = contract if isinstance(contract, Mapping) else {}
+    gate_a_projection = _gate_a_projection(contract)
+    if gate_a_projection is not None:
+        contract = _sanitize_gate_a_contract(contract)
     public = contract.get("public_result")
     public = public if isinstance(public, Mapping) else {}
     summary = (
@@ -2415,6 +2486,21 @@ def build_public_rca_result(contract: Mapping[str, Any]) -> dict[str, Any]:
                 "生产数据读取 → 问题现象不明确 → 无法选择归因机制 → 转人工补充。"
             )
             default_action = "请补充发生了什么、预期行为及实际异常后重新发起 RCA。"
+        elif gate_a_projection is not None:
+            if gate_a_projection["level"] == "L1_observation":
+                conclusion = "本次仅发布已观测事实，未输出责任归因。"
+                impact = boundary or "域 golden 未绑定，当前不输出责任归因。"
+                causal_boundary = (
+                    "已读取评测器观测事实 → 域 golden 未绑定 → 不输出责任归因。"
+                )
+                default_action = "域 golden 完成 Gate B 准入后再评估责任归因。"
+                specific = evidence_text or short
+            else:
+                conclusion = short or "本次未取得可用于归因的分析数据。"
+                impact = boundary or conclusion
+                causal_boundary = "分析输入未物化 → 不生成证据判断 → 不输出责任归因。"
+                default_action = "系统保留弃权结果；待输入可用后再执行分析。"
+                specific = short or evidence_text
         elif not terminal_code and any(
             marker in short
             for marker in ("自动RCA未归因", "当前问题域不在已验证", "已生成诊断报告")
@@ -2457,14 +2543,25 @@ def render_public_rca_result(
 ) -> str:
     result = build_public_rca_result(contract)
     dispatch = _validated_upstream_dispatch(contract)
+    gate_a_projection = _gate_a_projection(contract) is not None
     lines = [
-        _dispatch_first_line(dispatch),
+        _dispatch_first_line(dispatch, gate_a_projection=gate_a_projection),
         (
             "可直接参考"
             if terminal_class == SUPPORTED_ATTRIBUTION
             else MEDIUM_TIER_DISCLAIMER
         ),
     ]
+    if gate_a_projection:
+        # Gate A is an observation surface even when the legacy dispatch
+        # envelope says abstain_no_hit.  Do not route it through the legacy
+        # "未发现已知异常模式" branch, which would discard materialized
+        # signal/window facts before they reach the user.
+        result = build_public_rca_result(contract)
+        if result.get("evidence"):
+            lines.append("观测事实：" + str(result["evidence"]))
+        lines.append(str(result["conclusion"]))
+        return "\n".join(_truncate_utf8(line, 1800) for line in lines)
     if (
         terminal_class == HONEST_NON_ATTRIBUTION
         and dispatch["reason"] in {"abstain_no_hit", "abstain_cross_domain"}
@@ -3215,6 +3312,8 @@ def verify_delivery_bundle(
     """
     validated_admission = validate_rca_admission(admission)
     contract = dict(delivery_contract or {})
+    if contract.get("gate_a_projection") is not None:
+        contract = _sanitize_gate_a_contract(contract)
     manifest = dict(delivery_manifest or {})
     if w3_execution_binding is not None:
         if not isinstance(w3_execution_binding, Mapping):

@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import replace
-import json
 import hashlib
+import json
 from datetime import timedelta
 from pathlib import PurePosixPath
 import sqlite3
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
 
 from gateway.pnc_rca_delivery_contract import (
+    DeliveryContractError,
     TERMINAL_FALLBACK_CONTRACT_SCHEMA_VERSION,
     TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
 )
@@ -42,6 +45,79 @@ def _config_env(tmp_path) -> dict[str, str]:
     }
 
 
+def _json_bytes(value) -> bytes:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8")
+
+
+def _gate_a_capability(*, status="supported"):
+    return {
+        "actual_evaluators": [
+            {"evaluator_id": "aeb_trigger", "status": status}
+        ],
+        "actual_signals": ["AEBReq"],
+        "actual_fields": [],
+    }
+
+
+def _manifest_row(path, role, raw, media_type):
+    return {
+        "role": role,
+        "path": path,
+        "size": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "media_type": media_type,
+        "required": True,
+    }
+
+
+def _run_remote_bundle_reader(
+    tmp_path,
+    monkeypatch,
+    *,
+    report_path="sealed-safe.json",
+    report_value=None,
+    extra_rows=(),
+    script_transform=lambda script: script,
+):
+    submission_key = "g1q3-rca-s1-" + "e" * 64
+    root = tmp_path / "bundle"
+    root.mkdir()
+    html_raw = b"<!doctype html><html><body>sealed report</body></html>"
+    report_value = report_value or {
+        "input_materialized": False,
+        "failure_class": "remote_event_not_found",
+        "event_uuid": "sealed-safe",
+    }
+    report_raw = _json_bytes(report_value)
+    (root / "index.html").write_bytes(html_raw)
+    (root / report_path).write_bytes(report_raw)
+    rows = [
+        _manifest_row("index.html", "index_html", html_raw, "text/html"),
+        _manifest_row(report_path, "report_data", report_raw, "application/json"),
+        *extra_rows,
+    ]
+    (root / "delivery_contract.json").write_bytes(_json_bytes({"artifacts": {}}))
+    (root / "delivery_manifest.json").write_bytes(_json_bytes({"artifacts": rows}))
+    monkeypatch.setattr(
+        collector, "canonical_artifact_root", lambda _key: str(root) + "/"
+    )
+    monkeypatch.setattr(
+        collector,
+        "canonical_viz_mcap_path",
+        lambda key: str(tmp_path / "viz" / f"{key}.viz.mcap"),
+    )
+    script = script_transform(collector._remote_bundle_script(submission_key))
+    process = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert process.returncode == 0, process.stderr
+    return json.loads(process.stdout)
+
+
 def test_remote_bundle_reader_uses_formal_viz_publication_root():
     submission_key = "g1q3-rca-s1-" + "a" * 64
     formal_root = str(PurePosixPath(canonical_viz_mcap_path(submission_key)).parent)
@@ -60,6 +136,242 @@ def test_remote_bundle_reader_scans_sealed_public_artifacts_for_banned_phrases()
     assert "reject_banned_public_phrase(text)" in script
     assert "except RuntimeError:\n            report_data = {}" not in script
     assert "report_data_missing" in collector._EVENTUAL_ARTIFACT_CODES
+
+
+def test_remote_bundle_reader_uses_manifest_report_instead_of_fixed_filename(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "bundle"
+
+    def add_unsafe_fixed_file(script):
+        (root / "report_data.json").write_bytes(
+            _json_bytes({"conclusion": "ACC 是责任方", "event_uuid": "unsafe"})
+        )
+        return script
+
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        script_transform=add_unsafe_fixed_file,
+    )
+
+    assert payload["ok"] is True
+    assert payload["gate_a_source"]["event_uuid"] == "sealed-safe"
+    assert "read_json(ROOT + 'report_data.json'" not in collector._remote_bundle_script(
+        "g1q3-rca-s1-" + "f" * 64
+    )
+
+
+def test_remote_bundle_reader_rejects_missing_report_role(tmp_path, monkeypatch):
+    def remove_report_row(script):
+        manifest_path = tmp_path / "bundle" / "delivery_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["artifacts"] = [manifest["artifacts"][0]]
+        manifest_path.write_bytes(_json_bytes(manifest))
+        return script
+
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        script_transform=remove_report_row,
+    )
+
+    assert payload["error_code"] == "required_report_data_artifact_missing"
+
+
+def test_remote_bundle_reader_rejects_duplicate_report_role(tmp_path, monkeypatch):
+    duplicate_raw = _json_bytes({"input_materialized": False})
+
+    def add_duplicate_file(script):
+        (tmp_path / "bundle" / "other.json").write_bytes(duplicate_raw)
+        return script
+
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        extra_rows=(
+            _manifest_row(
+                "other.json", "report_data", duplicate_raw, "application/json"
+            ),
+        ),
+        script_transform=add_duplicate_file,
+    )
+
+    assert payload["error_code"] == "delivery_manifest_duplicate_artifact"
+
+
+def test_remote_bundle_reader_rejects_non_json_report_path(tmp_path, monkeypatch):
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        report_path="sealed-safe.txt",
+    )
+
+    assert payload["error_code"] == "required_report_data_artifact_invalid"
+
+
+def test_remote_bundle_reader_rejects_report_identity_change(tmp_path, monkeypatch):
+    def replace_report_during_read(script):
+        report_path = tmp_path / "bundle" / "sealed-safe.json"
+        replacement = type(report_path)(str(report_path) + ".replacement")
+        replacement.write_bytes(report_path.read_bytes())
+        injected = (
+            "os.replace(path + '.replacement', path)\n        after = os.fstat(fd)"
+        )
+        prefix, separator, suffix = script.rpartition("after = os.fstat(fd)")
+        assert separator
+        return prefix + injected + suffix
+
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        script_transform=replace_report_during_read,
+    )
+
+    assert payload["error_code"] == "report_data_changed_during_read"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error_code"),
+    [
+        ("size", 1, "report_data_size_mismatch"),
+        ("sha256", "0" * 64, "report_data_hash_mismatch"),
+    ],
+)
+def test_remote_bundle_reader_binds_report_size_and_hash(
+    tmp_path, monkeypatch, field, value, error_code
+):
+    def corrupt_manifest_binding(script):
+        manifest_path = tmp_path / "bundle" / "delivery_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["artifacts"][1][field] = value
+        manifest_path.write_bytes(_json_bytes(manifest))
+        return script
+
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        script_transform=corrupt_manifest_binding,
+    )
+
+    assert payload["error_code"] == error_code
+
+
+def test_remote_bundle_reader_rejects_malformed_json_report(tmp_path, monkeypatch):
+    def replace_with_invalid_json(script):
+        root = tmp_path / "bundle"
+        raw = b"not-json"
+        (root / "sealed-safe.json").write_bytes(raw)
+        manifest_path = root / "delivery_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["artifacts"][1].update({
+            "size": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        })
+        manifest_path.write_bytes(_json_bytes(manifest))
+        return script
+
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        script_transform=replace_with_invalid_json,
+    )
+
+    assert payload["error_code"] == "report_data_json_invalid"
+
+
+def test_remote_bundle_reader_applies_json_size_limit_to_report(tmp_path, monkeypatch):
+    def lower_report_limit(script):
+        return script.replace(
+            "MAX_JSON_BYTES if is_report_data else MAX_FILE_BYTES",
+            "64 if is_report_data else MAX_FILE_BYTES",
+        )
+
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        script_transform=lower_report_limit,
+    )
+
+    assert payload["error_code"] == "report_data_missing_size_invalid"
+
+
+def test_remote_bundle_reader_binds_gate_a_source_and_safe_projection():
+    script = collector._remote_bundle_script("g1q3-rca-s1-" + "d" * 64)
+
+    assert "'gate_a_source'" in script
+    assert "'gate_a_level': 'L0_abstain'" in script
+    assert "recomputes the canonical projection" in script
+    assert "responsibility_candidate" not in script.split("def public_report_projection", 1)[1].split("def read_text_artifact", 1)[0]
+
+
+def test_host_gate_a_projection_replaces_candidate_bearing_contract():
+    bundle = collector._apply_gate_a_bundle_projection({
+        "delivery_contract": {
+            "consumer_capability": _gate_a_capability(),
+            "summary": {"short_conclusion": "candidate ACC"},
+            "report": {"candidate_owner_domain": "ACC", "is_candidate": True},
+        },
+        "gate_a_source": {
+            "input_materialized": True,
+            "rca_evaluators": [
+                {
+                    "key": "aeb_trigger",
+                    "status": "supported",
+                    "evidence_refs": [
+                        {
+                            "signal": "AEBReq",
+                            "evidence": "窗口内观测到 AEB 请求。",
+                        }
+                    ],
+                },
+            ],
+        },
+    })
+
+    public = bundle["delivery_contract"]["public_result"]
+    assert public["gate_a_level"] == "L1_observation"
+    assert public["responsibility"]["candidate"] == "暂无法判断"
+    assert "candidate_owner_domain" not in bundle["delivery_contract"]["report"]
+
+
+def test_host_gate_a_projection_rejects_malformed_evaluator_source():
+    with pytest.raises(DeliveryContractError, match="gate_a_projection_invalid"):
+        collector._apply_gate_a_bundle_projection({
+            "delivery_contract": {
+                "consumer_capability": _gate_a_capability(),
+            },
+            "gate_a_source": {
+                "input_materialized": True,
+                "rca_evaluators": [{"status": "not-a-valid-status"}],
+            },
+        })
+
+
+def test_host_gate_a_projection_rejects_missing_source_envelope():
+    with pytest.raises(DeliveryContractError, match="gate_a_source_missing"):
+        collector._apply_gate_a_bundle_projection({
+            "delivery_contract": {"summary": {"short_conclusion": "stale"}},
+        })
+
+
+def test_host_gate_a_projection_rejects_all_need_fields_source():
+    with pytest.raises(DeliveryContractError, match="gate_a_projection_invalid"):
+        collector._apply_gate_a_bundle_projection({
+            "delivery_contract": {
+                "consumer_capability": _gate_a_capability(status="need_fields"),
+            },
+            "gate_a_source": {
+                "input_materialized": True,
+                "rca_evaluators": [
+                    {
+                        "key": "aeb_trigger",
+                        "status": "need_fields",
+                        "missing_fields": ["AEBReq"],
+                    }
+                ],
+            },
+        })
 
 
 def test_viz_surface_errors_retry_internally_instead_of_becoming_user_results():

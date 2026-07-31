@@ -24,11 +24,17 @@ from gateway.pnc_rca_delivery_contract import (
     compute_delivery_effect_payload_sha256,
     delivery_effect_marker,
 )
+from gateway.pnc_rca_delivery_observability import (
+    OBSERVATION_SCHEMA_VERSION,
+    DeliveryObservationError,
+    delivery_observation_id,
+)
 from gateway.pnc_rca_delivery_store import (
     DELIVERY_STORE_SCHEMA_VERSION,
     OUTBOX_QUARANTINED_PUBLIC_ERROR_CODE,
     OUTBOX_QUARANTINED_TERMINAL_STATE,
     PERMANENT_FAILURE_CIRCUIT_THRESHOLD,
+    DeliveryRecordConflictError,
     RcaDeliveryStore,
     StaleDeliveryEffectLeaseError,
     StaleDeliveryWatchLeaseError,
@@ -82,6 +88,48 @@ def _record(*, offset: int = 10, issue_id: int = 7041712812):
             "work_item_type_key": "issue",
         }).encode(),
     )
+
+
+def _delivery_observation(claim=None, **overrides):
+    content = ""
+    if claim is not None:
+        content = str(
+            claim.payload.get("comment_content")
+            or claim.payload.get("message_content")
+            or ""
+        )
+    value = {
+        "schema_version": OBSERVATION_SCHEMA_VERSION,
+        "work_item_id": claim.work_item_id if claim is not None else "7041712812",
+        "case_key": (
+            claim.submission_key or claim.business_key
+            if claim is not None
+            else "g1q3-rca-s1-" + "a" * 64
+        ),
+        "delivered_at": NOW.isoformat(),
+        "level": "L1_observation",
+        "has_attribution": False,
+        "viz_published": False,
+        "viz_bytes": 0,
+        "evidence_channel_msg_count": None,
+        "evidence_channel_msg_count_not_measured_reason": "fixture_not_measured",
+        "evidence_refs_nonempty": None,
+        "evidence_refs_nonempty_not_measured_reason": "fixture_not_measured",
+        "evaluator_hit_count": 0,
+        "pipeline_elapsed_seconds": 1.0,
+        "outcome_content_sha256": (
+            hashlib.sha256(content.encode("utf-8")).hexdigest()
+            if claim is not None
+            else "b" * 64
+        ),
+        "remote_receipt_id": "comment-observed",
+        "release_id": "release-test",
+        "inventory_pin": "c" * 64,
+    }
+    value.update(overrides)
+    if "observation_id" not in overrides:
+        value["observation_id"] = delivery_observation_id(value)
+    return value
 
 
 def _control(
@@ -799,6 +847,9 @@ def test_successful_required_delivery_breaks_permanent_failure_streak(tmp_path):
         outcome="ack",
         remote_id="comment-1",
         receipt={"remote_id": "comment-1"},
+        observation=_delivery_observation(
+            effect, remote_receipt_id="comment-1"
+        ),
         now=NOW,
     )
     assert store.permanent_failure_circuit_state()["consecutive_failures"] == 0
@@ -815,6 +866,272 @@ def test_successful_required_delivery_breaks_permanent_failure_streak(tmp_path):
     )
     assert store.delivery_dispatcher_circuit().is_open is False
     assert store.permanent_failure_circuit_state()["consecutive_failures"] == 1
+
+
+def test_successful_effect_commits_observation_intent_atomically(tmp_path):
+    store, effect = _claimed_effect(tmp_path)
+    observation = _delivery_observation(effect)
+
+    store.complete_effect(
+        claim=effect,
+        outcome="ack",
+        remote_id="comment-observed",
+        receipt={"remote_id": "comment-observed"},
+        observation=observation,
+        now=NOW,
+    )
+
+    [row] = store.list_rows("rca_delivery_observation_outbox")
+    assert row["effect_key"] == effect.effect_key
+    assert row["status"] == "pending"
+    [intent] = store.list_pending_delivery_observations()
+    assert intent.payload == observation
+    assert store.pending_delivery_observation_count() == 1
+    assert store.mark_delivery_observation_appended(
+        observation_id=intent.observation_id,
+        payload_sha256=intent.payload_sha256,
+        now=NOW + timedelta(seconds=1),
+    ) is True
+    assert store.pending_delivery_observation_count() == 0
+    assert store.list_rows("rca_delivery_observation_outbox")[0]["status"] == "appended"
+    assert store.requeue_delivery_observations(
+        observations=[(intent.observation_id, intent.payload_sha256)]
+    ) == 1
+    [requeued] = store.list_delivery_observations()
+    assert requeued.status == "pending"
+    assert store.pending_delivery_observation_count() == 1
+
+
+def test_observation_requeue_is_exact_and_atomic(tmp_path):
+    store, effect = _claimed_effect(tmp_path)
+    observation = _delivery_observation(effect)
+    store.complete_effect(
+        claim=effect,
+        outcome="ack",
+        remote_id="comment-observed",
+        receipt={"remote_id": "comment-observed"},
+        observation=observation,
+        now=NOW,
+    )
+    [intent] = store.list_pending_delivery_observations()
+    store.mark_delivery_observation_appended(
+        observation_id=intent.observation_id,
+        payload_sha256=intent.payload_sha256,
+        now=NOW + timedelta(seconds=1),
+    )
+
+    with pytest.raises(
+        DeliveryRecordConflictError,
+        match="delivery_observation_requeue_identity_mismatch",
+    ):
+        store.requeue_delivery_observations(
+            observations=[
+                (intent.observation_id, "f" * 64),
+                ("e" * 64, "e" * 64),
+            ]
+        )
+
+    [unchanged] = store.list_delivery_observations()
+    assert unchanged.status == "appended"
+
+
+def test_successful_effect_requires_observation_intent(tmp_path):
+    store, effect = _claimed_effect(tmp_path)
+
+    with pytest.raises(
+        DeliveryRecordConflictError, match="delivery_observation_required"
+    ):
+        store.complete_effect(
+            claim=effect,
+            outcome="ack",
+            remote_id="comment-required",
+            receipt={"remote_id": "comment-required"},
+            now=NOW,
+        )
+
+    assert store.list_rows("rca_delivery_effects")[0]["status"] == "claimed"
+    assert store.list_rows("rca_delivery_observation_outbox") == []
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_code"),
+    [
+        (
+            {"remote_receipt_id": "comment-other"},
+            "delivery_observation_remote_receipt_id_mismatch",
+        ),
+        (
+            {"work_item_id": "7041712999"},
+            "delivery_observation_work_item_id_mismatch",
+        ),
+        (
+            {"case_key": "g1q3-rca-s1-" + "f" * 64},
+            "delivery_observation_case_key_mismatch",
+        ),
+        (
+            {"outcome_content_sha256": "f" * 64},
+            "delivery_observation_outcome_content_sha256_mismatch",
+        ),
+    ],
+)
+def test_successful_effect_rejects_self_consistent_observation_for_other_effect(
+    tmp_path,
+    overrides,
+    expected_code,
+):
+    store, effect = _claimed_effect(tmp_path)
+    observation = _delivery_observation(
+        effect,
+        **{"remote_receipt_id": "comment-bound", **overrides},
+    )
+
+    with pytest.raises(DeliveryRecordConflictError, match=expected_code):
+        store.complete_effect(
+            claim=effect,
+            outcome="ack",
+            remote_id="comment-bound",
+            receipt={"remote_id": "comment-bound"},
+            observation=observation,
+            now=NOW,
+        )
+
+    assert store.list_rows("rca_delivery_effects")[0]["status"] == "claimed"
+    assert store.list_rows("rca_delivery_observation_outbox") == []
+
+
+def test_observation_intent_conflict_rolls_back_successful_settlement(tmp_path):
+    store, effect = _claimed_effect(tmp_path)
+    existing = _delivery_observation(
+        effect, remote_receipt_id="existing-comment"
+    )
+    payload_json = json.dumps(existing, sort_keys=True, separators=(",", ":"))
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "INSERT INTO rca_delivery_observation_outbox("
+            "observation_id, effect_key, payload_json, payload_sha256, status, "
+            "created_at, appended_at) VALUES(?, ?, ?, ?, 'pending', ?, NULL)",
+            (
+                existing["observation_id"],
+                effect.effect_key,
+                payload_json,
+                hashlib.sha256(payload_json.encode()).hexdigest(),
+                NOW.isoformat(),
+            ),
+        )
+
+    with pytest.raises(
+        DeliveryRecordConflictError,
+        match="delivery_observation_intent_conflict",
+    ):
+        store.complete_effect(
+            claim=effect,
+            outcome="ack",
+            remote_id="comment-conflict",
+            receipt={"remote_id": "comment-conflict"},
+            observation=_delivery_observation(
+                effect, remote_receipt_id="comment-conflict"
+            ),
+            now=NOW,
+        )
+
+    [effect_row] = store.list_rows("rca_delivery_effects")
+    assert effect_row["status"] == "claimed"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_code"),
+    [
+        ("missing_level", "observation_required_field_missing"),
+        ("identity_mismatch", "observation_identity_mismatch"),
+    ],
+)
+def test_malformed_observation_rolls_back_successful_settlement(
+    tmp_path,
+    mutation,
+    expected_code,
+):
+    store, effect = _claimed_effect(tmp_path)
+    observation = _delivery_observation(
+        effect, remote_receipt_id="comment-malformed"
+    )
+    if mutation == "missing_level":
+        observation.pop("level")
+    else:
+        observation["remote_receipt_id"] = "identity-was-not-recomputed"
+    before_attempts = store.list_rows("rca_delivery_attempts")
+
+    with pytest.raises(DeliveryObservationError) as raised:
+        store.complete_effect(
+            claim=effect,
+            outcome="ack",
+            remote_id="comment-malformed",
+            receipt={"remote_id": "comment-malformed"},
+            observation=observation,
+            now=NOW,
+        )
+
+    assert raised.value.code == expected_code
+    [effect_row] = store.list_rows("rca_delivery_effects")
+    assert effect_row["status"] == "claimed"
+    assert store.list_rows("rca_delivery_attempts") == before_attempts
+    assert store.list_rows("rca_delivery_observation_outbox") == []
+
+
+def test_effect_claim_uses_business_trigger_acceptance_timestamp(tmp_path):
+    store, effect = _claimed_effect(tmp_path)
+    with sqlite3.connect(store.db_path) as conn:
+        accepted_at = conn.execute(
+            "SELECT created_at FROM business_triggers "
+            "WHERE business_key = ? AND generation = ?",
+            (effect.business_key, effect.generation),
+        ).fetchone()[0]
+
+    assert effect.business_accepted_at == accepted_at
+
+
+@pytest.mark.parametrize("corruption", ["missing", "empty", "naive"])
+def test_effect_claim_fails_closed_on_invalid_business_acceptance_timestamp(
+    tmp_path,
+    corruption,
+):
+    control, _result = _control(tmp_path)
+    store = RcaDeliveryStore(control.db_path)
+    store.backfill_completed_submissions(now=NOW)
+    watch = store.claim_due_watch(lease_owner="collector", now=NOW)
+    assert watch is not None
+    store.create_delivery(
+        claim=watch,
+        delivery=_delivery(watch),
+        status={"success": True, "state": "completed"},
+        now=NOW,
+    )
+    with sqlite3.connect(store.db_path) as conn:
+        if corruption == "missing":
+            conn.execute(
+                "DELETE FROM business_triggers WHERE business_key = ? AND generation = ?",
+                (watch.business_key, watch.generation),
+            )
+        else:
+            conn.execute(
+                "UPDATE business_triggers SET created_at = ? "
+                "WHERE business_key = ? AND generation = ?",
+                (
+                    "" if corruption == "empty" else "2026-07-31T10:00:00",
+                    watch.business_key,
+                    watch.generation,
+                ),
+            )
+    before_effects = store.list_rows("rca_delivery_effects")
+    before_attempts = store.list_rows("rca_delivery_attempts")
+
+    with pytest.raises(
+        DeliveryRecordConflictError,
+        match="delivery_business_acceptance_timestamp_invalid",
+    ):
+        store.claim_due_effect(lease_owner="dispatcher", now=NOW)
+
+    assert store.list_rows("rca_delivery_effects") == before_effects
+    assert store.list_rows("rca_delivery_attempts") == before_attempts
 
 
 def test_permanent_failure_and_circuit_open_roll_back_atomically(
@@ -961,6 +1278,39 @@ def test_require_current_delivery_store_never_migrates_predecessor(tmp_path):
     assert marker == "pnc_rca_delivery_store_v5"
 
 
+def test_require_current_delivery_store_rejects_v10_without_outbox_unchanged(
+    tmp_path,
+):
+    path = tmp_path / "control.sqlite3"
+    RcaDeliveryStore(path)
+    with sqlite3.connect(path) as conn:
+        conn.executescript(
+            """
+            DROP INDEX idx_delivery_observation_outbox_status;
+            DROP TABLE rca_delivery_observation_outbox;
+            UPDATE rca_delivery_meta
+               SET value = 'pnc_rca_delivery_store_v10'
+             WHERE key = 'schema_version';
+            """
+        )
+        before = conn.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+
+    with pytest.raises(RuntimeError, match="rca_delivery_store_schema_not_current"):
+        RcaDeliveryStore(path, require_current=True)
+
+    with sqlite3.connect(path) as conn:
+        after = conn.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+        marker = conn.execute(
+            "SELECT value FROM rca_delivery_meta WHERE key = 'schema_version'"
+        ).fetchone()[0]
+    assert after == before
+    assert marker == "pnc_rca_delivery_store_v10"
+
+
 def test_delivery_store_migrates_real_v7_shape_before_comment_slot_index(tmp_path):
     path = tmp_path / "control.sqlite3"
     RcaDeliveryStore(path)
@@ -1019,6 +1369,53 @@ def test_require_current_delivery_store_opens_current_regular_file(tmp_path):
     reopened = RcaDeliveryStore(path, require_current=True)
 
     assert reopened.db_path == path
+
+
+@pytest.mark.parametrize("mutation", ["drop_index", "weaken_check"])
+def test_require_current_rejects_noncanonical_observation_outbox_schema(
+    tmp_path,
+    mutation,
+):
+    path = tmp_path / "control.sqlite3"
+    RcaDeliveryStore(path)
+    with sqlite3.connect(path) as conn:
+        before_columns = [
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(rca_delivery_observation_outbox)"
+            )
+        ]
+        if mutation == "drop_index":
+            conn.execute("DROP INDEX idx_delivery_observation_outbox_status")
+        else:
+            conn.execute("PRAGMA writable_schema=ON")
+            conn.execute(
+                "UPDATE sqlite_master SET sql = REPLACE(sql, ?, ?) "
+                "WHERE type = 'table' "
+                "AND name = 'rca_delivery_observation_outbox'",
+                (
+                    "status IN ('pending', 'appended')",
+                    "status IN ('pending', 'appended', 'forged')",
+                ),
+            )
+            schema_version = conn.execute("PRAGMA schema_version").fetchone()[0]
+            conn.execute(f"PRAGMA schema_version = {schema_version + 1}")
+            conn.execute("PRAGMA writable_schema=OFF")
+
+    with sqlite3.connect(path) as conn:
+        after_columns = [
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(rca_delivery_observation_outbox)"
+            )
+        ]
+    assert after_columns == before_columns
+
+    with pytest.raises(
+        RuntimeError,
+        match="incompatible_delivery_store_schema:delivery_observation_outbox",
+    ):
+        RcaDeliveryStore(path, require_current=True)
 
 
 def test_require_current_rejects_v8_marker_without_failure_route_sink(tmp_path):
@@ -1359,6 +1756,7 @@ def test_delivery_health_observes_stalled_watch_without_blocking_readiness(tmp_p
         "quarantined_effects": 0,
         "quarantined_subscriptions": 0,
         "quarantine_baseline_invalid": 0,
+        "pending_delivery_observations": 0,
     }
     assert watch["state"] == "pending"
 
@@ -1573,6 +1971,9 @@ def test_late_topic_subscription_reopens_delivered_job_for_catchup(tmp_path):
         outcome="ack",
         remote_id="comment-1",
         receipt={"remote_id": "comment-1"},
+        observation=_delivery_observation(
+            issue_claim, remote_receipt_id="comment-1"
+        ),
         now=NOW,
     )
     assert store.list_rows("rca_delivery_jobs")[0]["status"] == "delivered"
@@ -1616,6 +2017,9 @@ def test_suppressed_required_subscription_terminates_job_as_partial(tmp_path):
         outcome="ack",
         remote_id="comment-1",
         receipt={"remote_id": "comment-1"},
+        observation=_delivery_observation(
+            issue_claim, remote_receipt_id="comment-1"
+        ),
         now=NOW,
     )
 
@@ -1643,6 +2047,9 @@ def test_reconcile_delivery_job_status_repairs_stale_ready_status(tmp_path):
         outcome="ack",
         remote_id="comment-1",
         receipt={"remote_id": "comment-1"},
+        observation=_delivery_observation(
+            effect, remote_receipt_id="comment-1"
+        ),
         now=NOW,
     )
     [job] = store.list_rows("rca_delivery_jobs")
@@ -2249,6 +2656,9 @@ def test_epoch_switch_rejects_recovery_write_but_allows_settlement_state(
         outcome="reconciled",
         remote_id="remote-existing-effect",
         receipt={"source": "read_after_epoch_switch"},
+        observation=_delivery_observation(
+            effect, remote_receipt_id="remote-existing-effect"
+        ),
         now=NOW + timedelta(seconds=122),
     )
     assert settled.effect_status == "succeeded"
@@ -2384,6 +2794,9 @@ def test_capacity_sample_candidates_are_bounded_read_only_snapshots(tmp_path):
         outcome="ack",
         remote_id="comment-1",
         receipt={"remote_id": "comment-1", "request_id": effect.request_id},
+        observation=_delivery_observation(
+            effect, remote_receipt_id="comment-1"
+        ),
         now=NOW + timedelta(seconds=2),
     )
 

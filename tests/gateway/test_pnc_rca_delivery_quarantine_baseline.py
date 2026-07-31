@@ -37,6 +37,7 @@ from tests.gateway.test_pnc_rca_delivery_store import (
     NOW,
     _control,
     _delivery,
+    _delivery_observation,
     _insert_subscription,
 )
 
@@ -120,6 +121,15 @@ def _seed_quarantine(root: Path) -> tuple[RcaDeliveryStore, str]:
         outcome="ack",
         remote_id="comment-baseline",
         receipt={"remote_id": "comment-baseline"},
+        observation=_delivery_observation(
+            effect, remote_receipt_id="comment-baseline"
+        ),
+        now=NOW,
+    )
+    [observation_intent] = store.list_pending_delivery_observations()
+    store.mark_delivery_observation_appended(
+        observation_id=observation_intent.observation_id,
+        payload_sha256=observation_intent.payload_sha256,
         now=NOW,
     )
     with sqlite3.connect(store.db_path) as conn:
@@ -237,15 +247,19 @@ def _prepare_combined_schema_migration(
     RcaControlStore(live_path)
     RcaDeliveryStore(live_path)
     with sqlite3.connect(live_path) as conn:
-        conn.executescript(
-            """
-            DROP TABLE rca_conclusion_adjudication_repairs;
-            ALTER TABLE rca_delivery_effects
-                DROP COLUMN adjudication_comment_attempted_at;
-            ALTER TABLE rca_delivery_effects
-                DROP COLUMN adjudication_comment_attempt_count;
-            """
-        )
+        if source_version in {
+            "pnc_rca_delivery_store_v7",
+            "pnc_rca_delivery_store_v8",
+        }:
+            conn.executescript(
+                """
+                DROP TABLE rca_conclusion_adjudication_repairs;
+                ALTER TABLE rca_delivery_effects
+                    DROP COLUMN adjudication_comment_attempted_at;
+                ALTER TABLE rca_delivery_effects
+                    DROP COLUMN adjudication_comment_attempt_count;
+                """
+            )
         if source_version == "pnc_rca_delivery_store_v7":
             conn.executescript(
                 """
@@ -259,6 +273,8 @@ def _prepare_combined_schema_migration(
                 DROP INDEX IF EXISTS idx_rca_delivery_subscription_events;
                 DROP TABLE IF EXISTS rca_delivery_subscription_events;
                 DROP INDEX idx_delivery_effects_comment_slot;
+                DROP INDEX IF EXISTS idx_delivery_observation_outbox_status;
+                DROP TABLE IF EXISTS rca_delivery_observation_outbox;
                 DROP TABLE rca_conclusion_adjudications;
                 DROP TABLE rca_failure_routes;
                 DELETE FROM rca_delivery_dispatcher_circuit
@@ -278,10 +294,21 @@ def _prepare_combined_schema_migration(
                     DROP COLUMN comment_slot_schema_version;
                 """
             )
+        conn.executescript(
+            """
+            DROP INDEX IF EXISTS idx_delivery_observation_outbox_status;
+            DROP TABLE IF EXISTS rca_delivery_observation_outbox;
+            """
+        )
         conn.execute(
             "UPDATE rca_delivery_meta SET value = ? WHERE key = 'schema_version'",
             (source_version,),
         )
+        if source_version == "pnc_rca_delivery_store_v10":
+            conn.execute(
+                "INSERT INTO rca_delivery_meta(key, value) VALUES(?, ?)",
+                ("v10_migration_preservation_sentinel", "preserve-exactly"),
+            )
         if source_version == "pnc_rca_delivery_store_v7":
             legacy_at = "2026-07-25T10:00:00+00:00"
             conn.execute(
@@ -416,7 +443,7 @@ def _prepare_combined_schema_migration(
     with sqlite3.connect(source_backup) as conn:
         conn.row_factory = sqlite3.Row
         source_schema_sha256 = logical_database_projection(conn)["schema_sha256"]
-    clone_path = root / "control.v9.offline-clone.sqlite3"
+    clone_path = root / "control.v11.offline-clone.sqlite3"
     shutil.copyfile(source_backup, clone_path)
     clone_path.chmod(0o600)
     RcaDeliveryStore(clone_path)
@@ -474,6 +501,8 @@ def _prepare_combined_quarantine_migration(
             DELETE FROM rca_delivery_dispatcher_circuit
              WHERE circuit_name = 'feishu_card_patch';
             DROP INDEX IF EXISTS idx_delivery_effects_comment_slot;
+            DROP INDEX IF EXISTS idx_delivery_observation_outbox_status;
+            DROP TABLE IF EXISTS rca_delivery_observation_outbox;
             ALTER TABLE rca_delivery_subscriptions DROP COLUMN reason;
             ALTER TABLE rca_delivery_effects
                 DROP COLUMN comment_slot_budget_exempt;
@@ -528,7 +557,11 @@ def _prepare_combined_quarantine_migration(
 
 @pytest.mark.parametrize(
     "source_version",
-    ["pnc_rca_delivery_store_v7", "pnc_rca_delivery_store_v8"],
+    [
+        "pnc_rca_delivery_store_v7",
+        "pnc_rca_delivery_store_v8",
+        "pnc_rca_delivery_store_v10",
+    ],
 )
 def test_combined_v2_offline_receipt_requires_quick_checked_copy_and_rollback(
     tmp_path, source_version
@@ -545,6 +578,9 @@ def test_combined_v2_offline_receipt_requires_quick_checked_copy_and_rollback(
     )
 
     assert binding["source_schema_version"] == source_version
+    assert migration["receipt"]["schema_version"] == (
+        "pnc_rca_delivery_store_offline_migration_v3"
+    )
     assert (
         binding["target_schema_version"]
         == delivery_store_module.DELIVERY_STORE_SCHEMA_VERSION
@@ -555,6 +591,10 @@ def test_combined_v2_offline_receipt_requires_quick_checked_copy_and_rollback(
     assert binding["rollback_sha256"] == hashlib.sha256(
         migration["source_backup"].read_bytes()
     ).hexdigest()
+    assert binding["source_schema_sha256"] == migration["source_schema_sha256"]
+    assert migration["receipt"]["source_schema_contract"]["schema_sha256"] == (
+        migration["source_schema_sha256"]
+    )
     assert binding["no_live_database_writes"] is True
     preservation = migration["receipt"]["cross_projection_preservation"]
     assert preservation["policy"] == "all_source_owned_rows_exact_v1"
@@ -566,26 +606,30 @@ def test_combined_v2_offline_receipt_requires_quick_checked_copy_and_rollback(
         "source_value": source_version,
         "target_value": delivery_store_module.DELIVERY_STORE_SCHEMA_VERSION,
     }
-    expected_variant = (
-        "active_prod_v7_no_adjudication_v1"
-        if source_version == "pnc_rca_delivery_store_v7"
-        else "w2_v8_failure_routes_adjudication_v1"
-    )
+    expected_variant = {
+        "pnc_rca_delivery_store_v7": "active_prod_v7_no_adjudication_v1",
+        "pnc_rca_delivery_store_v8": "w2_v8_failure_routes_adjudication_v1",
+        "pnc_rca_delivery_store_v10": "v10_without_observation_outbox_v1",
+    }[source_version]
     assert migration["receipt"]["source_schema_variant"] == expected_variant
     if source_version == "pnc_rca_delivery_store_v8":
         assert preservation["deterministic_transforms"][1]["rule"] == (
             "backfill_pending_repairs_from_adjudication_created_at_v1"
         )
-    expected_effect_columns = [
-        {
-            "name": "adjudication_comment_attempt_count",
-            "existing_row_value": 0,
-        },
-        {
-            "name": "adjudication_comment_attempted_at",
-            "existing_row_value": None,
-        },
-    ]
+    expected_effect_columns = (
+        []
+        if source_version == "pnc_rca_delivery_store_v10"
+        else [
+            {
+                "name": "adjudication_comment_attempt_count",
+                "existing_row_value": 0,
+            },
+            {
+                "name": "adjudication_comment_attempted_at",
+                "existing_row_value": None,
+            },
+        ]
+    )
     if source_version == "pnc_rca_delivery_store_v7":
         expected_effect_columns.extend(
             [
@@ -633,9 +677,42 @@ def test_combined_v2_offline_receipt_requires_quick_checked_copy_and_rollback(
                 "WHERE circuit_name = 'feishu_card_patch'"
             ).fetchone()
         assert card_patch == ("closed", latest_source_circuit_at)
+        assert preservation["source_owned_tables"]["sqlite_sequence"][
+            "allowed_added_target_rows"
+        ] == [
+            {
+                "name": "rca_delivery_subscription_events",
+                "seq": 4,
+            }
+        ]
+    else:
+        assert preservation["source_owned_tables"]["sqlite_sequence"][
+            "allowed_added_target_rows"
+        ] == []
     assert preservation["source_owned_tables"]["rca_delivery_effects"][
         "added_target_columns"
     ] == expected_effect_columns
+    if source_version == "pnc_rca_delivery_store_v10":
+        assert set(preservation["added_target_tables"]) == {
+            "rca_delivery_observation_outbox"
+        }
+        assert preservation["added_target_tables"][
+            "rca_delivery_observation_outbox"
+        ]["observed_row_count"] == 0
+        with sqlite3.connect(migration["clone_path"]) as clone_conn:
+            marker = clone_conn.execute(
+                "SELECT value FROM rca_delivery_meta WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            sentinel = clone_conn.execute(
+                "SELECT value FROM rca_delivery_meta "
+                "WHERE key = 'v10_migration_preservation_sentinel'"
+            ).fetchone()[0]
+            outbox_count = clone_conn.execute(
+                "SELECT COUNT(*) FROM rca_delivery_observation_outbox"
+            ).fetchone()[0]
+        assert marker == "pnc_rca_delivery_store_v11"
+        assert sentinel == "preserve-exactly"
+        assert outbox_count == 0
 
 
 def test_combined_v2_receipt_binds_w5_cutoff_backfill_for_legacy_v7_source(
@@ -681,6 +758,85 @@ def test_combined_v2_receipt_binds_w5_cutoff_backfill_for_legacy_v7_source(
         "source_value": None,
         "target_value": "2026-07-25T00:00:00+00:00",
     }
+
+
+def test_combined_v3_rejects_old_staged_v10_clone_and_unsupported_sources(
+    tmp_path,
+):
+    migration = _prepare_combined_schema_migration(
+        tmp_path / "valid", "pnc_rca_delivery_store_v10"
+    )
+    old_staged_clone = tmp_path / "old-staged-v10-clone.sqlite3"
+    shutil.copyfile(migration["clone_path"], old_staged_clone)
+    old_staged_clone.chmod(0o600)
+    with sqlite3.connect(old_staged_clone) as conn:
+        conn.execute(
+            "UPDATE rca_delivery_meta SET value = 'pnc_rca_delivery_store_v10' "
+            "WHERE key = 'schema_version'"
+        )
+        conn.commit()
+        conn.execute("PRAGMA journal_mode=DELETE")
+
+    with pytest.raises(
+        QuarantineMigrationError,
+        match="delivery_store_combined_migration_target_schema_invalid",
+    ):
+        build_combined_offline_migration_receipt(
+            source_backup_path=migration["source_backup"],
+            migrated_clone_path=old_staged_clone,
+            target_live_db_path=migration["live_path"],
+            migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+            expected_source_schema_sha256=migration["source_schema_sha256"],
+        )
+
+    old_same_version_source = tmp_path / "v10-with-outbox-source.sqlite3"
+    shutil.copyfile(old_staged_clone, old_same_version_source)
+    old_same_version_source.chmod(0o600)
+    with sqlite3.connect(old_same_version_source) as conn:
+        conn.row_factory = sqlite3.Row
+        source_schema_sha256 = logical_database_projection(conn)["schema_sha256"]
+
+    with pytest.raises(
+        QuarantineMigrationError,
+        match=(
+            "delivery_store_combined_migration_"
+            "v10_observation_outbox_operator_rebuild_required"
+        ),
+    ):
+        build_combined_offline_migration_receipt(
+            source_backup_path=old_same_version_source,
+            migrated_clone_path=migration["clone_path"],
+            target_live_db_path=migration["live_path"],
+            migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+            expected_source_schema_sha256=source_schema_sha256,
+        )
+
+    unsupported_v9_source = tmp_path / "unsupported-v9-source.sqlite3"
+    shutil.copyfile(old_staged_clone, unsupported_v9_source)
+    unsupported_v9_source.chmod(0o600)
+    with sqlite3.connect(unsupported_v9_source) as conn:
+        conn.execute(
+            "UPDATE rca_delivery_meta SET value = 'pnc_rca_delivery_store_v9' "
+            "WHERE key = 'schema_version'"
+        )
+        conn.commit()
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.row_factory = sqlite3.Row
+        unsupported_schema_sha256 = logical_database_projection(conn)[
+            "schema_sha256"
+        ]
+
+    with pytest.raises(
+        QuarantineMigrationError,
+        match="delivery_store_combined_migration_source_schema_invalid",
+    ):
+        build_combined_offline_migration_receipt(
+            source_backup_path=unsupported_v9_source,
+            migrated_clone_path=migration["clone_path"],
+            target_live_db_path=migration["live_path"],
+            migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+            expected_source_schema_sha256=unsupported_schema_sha256,
+        )
 
 
 def test_combined_v2_v7_subscription_reason_and_event_backfill_are_status_derived(
@@ -845,7 +1001,11 @@ def test_combined_v2_validator_rejects_forged_unrelated_clone_binding(tmp_path):
 
 @pytest.mark.parametrize(
     "source_version",
-    ["pnc_rca_delivery_store_v7", "pnc_rca_delivery_store_v8"],
+    [
+        "pnc_rca_delivery_store_v7",
+        "pnc_rca_delivery_store_v8",
+        "pnc_rca_delivery_store_v10",
+    ],
 )
 def test_combined_v2_live_pre_and_post_gates_bind_exact_source_clone_and_rollback(
     tmp_path,
@@ -1020,6 +1180,87 @@ def test_combined_v2_cross_schema_rejects_source_owned_schema_drift(
         )
 
 
+def test_combined_v2_cross_projection_rejects_existing_sequence_drift(tmp_path):
+    migration = _prepare_combined_schema_migration(
+        tmp_path, "pnc_rca_delivery_store_v7"
+    )
+    with sqlite3.connect(migration["source_backup"]) as source_conn:
+        source_sequence = source_conn.execute(
+            "SELECT name, seq FROM sqlite_sequence "
+            "WHERE name != 'rca_delivery_subscription_events' "
+            "ORDER BY name LIMIT 1"
+        ).fetchone()
+    assert source_sequence is not None
+    with sqlite3.connect(migration["clone_path"]) as clone_conn:
+        clone_conn.execute(
+            "UPDATE sqlite_sequence SET seq = seq + 1000000 WHERE name = ?",
+            (source_sequence[0],),
+        )
+        clone_conn.execute("PRAGMA journal_mode=DELETE")
+    migration["clone_path"].chmod(0o600)
+
+    with pytest.raises(
+        QuarantineMigrationError,
+        match="delivery_store_combined_migration_cross_projection_mismatch",
+    ):
+        build_combined_offline_migration_receipt(
+            source_backup_path=migration["source_backup"],
+            migrated_clone_path=migration["clone_path"],
+            target_live_db_path=migration["live_path"],
+            migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+            expected_source_schema_sha256=migration["source_schema_sha256"],
+        )
+
+
+def test_combined_v2_cross_projection_rejects_unallowlisted_sequence_row(tmp_path):
+    migration = _prepare_combined_schema_migration(
+        tmp_path, "pnc_rca_delivery_store_v7"
+    )
+    with sqlite3.connect(migration["clone_path"]) as clone_conn:
+        clone_conn.execute(
+            "INSERT INTO sqlite_sequence(name, seq) VALUES('forged_sequence', 1)"
+        )
+        clone_conn.execute("PRAGMA journal_mode=DELETE")
+    migration["clone_path"].chmod(0o600)
+
+    with pytest.raises(
+        QuarantineMigrationError,
+        match="delivery_store_combined_migration_cross_projection_mismatch",
+    ):
+        build_combined_offline_migration_receipt(
+            source_backup_path=migration["source_backup"],
+            migrated_clone_path=migration["clone_path"],
+            target_live_db_path=migration["live_path"],
+            migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+            expected_source_schema_sha256=migration["source_schema_sha256"],
+        )
+
+
+def test_combined_v2_cross_projection_rejects_added_sequence_drift(tmp_path):
+    migration = _prepare_combined_schema_migration(
+        tmp_path, "pnc_rca_delivery_store_v7"
+    )
+    with sqlite3.connect(migration["clone_path"]) as clone_conn:
+        clone_conn.execute(
+            "UPDATE sqlite_sequence SET seq = seq + 1 "
+            "WHERE name = 'rca_delivery_subscription_events'"
+        )
+        clone_conn.execute("PRAGMA journal_mode=DELETE")
+    migration["clone_path"].chmod(0o600)
+
+    with pytest.raises(
+        QuarantineMigrationError,
+        match="delivery_store_combined_migration_cross_projection_mismatch",
+    ):
+        build_combined_offline_migration_receipt(
+            source_backup_path=migration["source_backup"],
+            migrated_clone_path=migration["clone_path"],
+            target_live_db_path=migration["live_path"],
+            migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+            expected_source_schema_sha256=migration["source_schema_sha256"],
+        )
+
+
 @pytest.mark.parametrize("mutation", ["extra_trigger", "weaken_new_table_check"])
 def test_combined_v2_rejects_noncanonical_added_v9_objects(tmp_path, mutation):
     migration = _prepare_combined_schema_migration(
@@ -1057,6 +1298,62 @@ def test_combined_v2_rejects_noncanonical_added_v9_objects(tmp_path, mutation):
             assert after != before
         conn.execute("PRAGMA journal_mode=DELETE")
     migration["clone_path"].chmod(0o600)
+
+    with pytest.raises(
+        QuarantineMigrationError,
+        match="delivery_store_combined_migration_target_schema_contract_invalid",
+    ):
+        build_combined_offline_migration_receipt(
+            source_backup_path=migration["source_backup"],
+            migrated_clone_path=migration["clone_path"],
+            target_live_db_path=migration["live_path"],
+            migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+            expected_source_schema_sha256=migration["source_schema_sha256"],
+        )
+
+
+@pytest.mark.parametrize("mutation", ["drop_index", "weaken_check"])
+def test_combined_v2_rejects_noncanonical_observation_outbox_schema(
+    tmp_path,
+    mutation,
+):
+    migration = _prepare_combined_schema_migration(
+        tmp_path, "pnc_rca_delivery_store_v7"
+    )
+    with sqlite3.connect(migration["clone_path"]) as conn:
+        before_columns = [
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(rca_delivery_observation_outbox)"
+            )
+        ]
+        if mutation == "drop_index":
+            conn.execute("DROP INDEX idx_delivery_observation_outbox_status")
+        else:
+            conn.execute("PRAGMA writable_schema=ON")
+            conn.execute(
+                "UPDATE sqlite_master SET sql = REPLACE(sql, ?, ?) "
+                "WHERE type = 'table' "
+                "AND name = 'rca_delivery_observation_outbox'",
+                (
+                    "status IN ('pending', 'appended')",
+                    "status IN ('pending', 'appended', 'forged')",
+                ),
+            )
+            schema_version = conn.execute("PRAGMA schema_version").fetchone()[0]
+            conn.execute(f"PRAGMA schema_version = {schema_version + 1}")
+            conn.execute("PRAGMA writable_schema=OFF")
+        conn.execute("PRAGMA journal_mode=DELETE")
+    migration["clone_path"].chmod(0o600)
+
+    with sqlite3.connect(migration["clone_path"]) as conn:
+        after_columns = [
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(rca_delivery_observation_outbox)"
+            )
+        ]
+    assert after_columns == before_columns
 
     with pytest.raises(
         QuarantineMigrationError,
@@ -1416,9 +1713,10 @@ def test_exact_approved_baseline_acknowledges_lifetime_without_db_writes(tmp_pat
         "uncertain_effects": 0,
         "quarantined_jobs": 1,
         "quarantined_effects": 1,
-        "quarantined_subscriptions": 1,
-        "quarantine_baseline_invalid": 1,
-    }
+            "quarantined_subscriptions": 1,
+            "quarantine_baseline_invalid": 1,
+            "pending_delivery_observations": 0,
+        }
     before_backpressure = store.backpressure_snapshot(
         now=NOW + timedelta(seconds=5)
     ).public_dict()

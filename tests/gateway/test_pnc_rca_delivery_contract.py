@@ -8,6 +8,10 @@ import pytest
 from gateway import pnc_rca_delivery_contract as delivery_contract_module
 from gateway import pnc_rca_quality_oracle as quality_oracle_module
 from gateway.pnc_rca_admission import build_rca_admission
+from gateway.pnc_rca_abstention_projection import (
+    build_gate_a_identifier_binding,
+    project_gate_a_report,
+)
 from gateway.pnc_rca_delivery_contract import (
     DELIVERY_THREAD_EFFECT_KIND,
     TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
@@ -371,6 +375,120 @@ def test_delivery_projects_consumer_capability_into_field_and_comment():
     )
     assert verified.effect_payload["terminal_class"] == "candidate_hypothesis"
     assert verified.effect_payload["requires_human_review"] is True
+
+
+def test_gate_a_observation_projection_suppresses_candidate_without_golden():
+    admission, contract, manifest, observed, dependencies = _bundle()
+    contract["consumer_capability"] = _consumer_capability()
+    _add_structural_candidate(contract)
+    contract["gate_a_projection"] = project_gate_a_report({
+        "input_materialized": True,
+        "rca_evaluators": [
+            {
+                "key": "aeb_trigger",
+                "domain": "AEB",
+                "pattern": "trigger",
+                "status": "supported",
+                "evidence_refs": [
+                    {
+                        "signal": "AEBReq",
+                        "window": [0.0, 1.0],
+                        "evidence": "窗口内观测到 AEB 请求。",
+                    }
+                ],
+            }
+        ],
+    }, identifier_binding=build_gate_a_identifier_binding(
+        contract["consumer_capability"]
+    ))
+
+    verified = verify_delivery_bundle(
+        admission=admission,
+        delivery_contract=contract,
+        delivery_manifest=manifest,
+        observed_files=observed,
+        html_dependencies=dependencies,
+    )
+
+    assert verified.effect_payload["terminal_class"] == "honest_non_attribution"
+    assert "建议责任方：" not in verified.conclusion
+    assert "候选" not in verified.conclusion
+    assert "已观测到评测项 aeb_trigger 的支持证据" in verified.conclusion
+    assert "信号 AEBReq" in verified.conclusion
+    assert "窗口 0~1s" in verified.conclusion
+    assert "窗口内观测到 AEB 请求" not in verified.conclusion
+    assert verified.effect_payload["requires_human_review"] is False
+
+
+def test_gate_a_render_keeps_observation_when_legacy_dispatch_has_no_hit():
+    _admission_obj, contract, _manifest, _observed, _dependencies = _bundle()
+    contract["consumer_capability"]["actual_evaluators"][0]["status"] = "refuted"
+    contract["gate_a_projection"] = project_gate_a_report({
+        "input_materialized": True,
+        "rca_evaluators": [
+            {
+                "key": "aeb_trigger",
+                "domain": "AEB",
+                "status": "refuted",
+                "evidence_refs": [
+                    {
+                        "signal": "AEBReq",
+                        "window": [-1.0, 1.0],
+                        "evidence": "窗口内未观测到 AEB 请求。",
+                    }
+                ],
+            }
+        ],
+    }, identifier_binding=build_gate_a_identifier_binding(
+        contract["consumer_capability"]
+    ))
+
+    rendered = render_public_rca_result(contract)
+
+    assert "信号 AEBReq" in rendered
+    assert "窗口 -1~1s" in rendered
+    assert "窗口内未观测到 AEB 请求" not in rendered
+    assert "现有证据不支持评测项 aeb_trigger" in rendered
+    assert "未发现已知异常模式" not in rendered
+
+
+def test_gate_a_l0_projection_does_not_claim_evaluator_observation():
+    admission, contract, manifest, observed, dependencies = _bundle()
+    contract["consumer_capability"] = _consumer_capability()
+    _add_structural_candidate(contract)
+    contract["gate_a_projection"] = project_gate_a_report({
+        "input_materialized": False,
+        "failure_class": "remote_event_not_found",
+    })
+
+    verified = verify_delivery_bundle(
+        admission=admission,
+        delivery_contract=contract,
+        delivery_manifest=manifest,
+        observed_files=observed,
+        html_dependencies=dependencies,
+    )
+
+    assert verified.effect_payload["terminal_class"] == "honest_non_attribution"
+    assert "建议责任方：" not in verified.conclusion
+    assert "已读取评测器观测事实" not in verified.conclusion
+    assert "未找到对应事件" in verified.conclusion
+
+
+def test_gate_a_projection_rejects_forged_candidate_fields():
+    projection = project_gate_a_report({
+        "input_materialized": True,
+        "rca_evaluators": [
+            {
+                "key": "aeb_trigger",
+                "status": "supported",
+                "evidence_refs": [{"signal": "AEBReq"}],
+            }
+        ],
+    }, identifier_binding=build_gate_a_identifier_binding(_consumer_capability()))
+    projection["evaluator_projection"]["evaluators"][0]["candidate"] = "ACC"
+    with pytest.raises(DeliveryContractError, match="gate_a_projection_invalid"):
+        render_public_rca_result({"gate_a_projection": projection})
 
 
 def test_supported_tier_requires_golden_and_does_not_request_human_review(
