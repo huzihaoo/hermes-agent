@@ -20,6 +20,14 @@
     <string>/Users/songying/.hermes</string>
     <key>HERMES_RCA_DELIVERY_QUARANTINE_BASELINE_SHA256</key>
     <string>04db01355ab86ed1b739c00cc3f530ddef832f42df8b12772fb9e67e2ecf1ac2</string>
+    <key>HERMES_RCA_DELIVERY_DISPATCHER_INVENTORY_PIN</key>
+    <string>9fea0306752d005f58937e08202c9ce094e52056794549201259f214fe885880</string>
+    <key>HERMES_RCA_DELIVERY_DISPATCHER_OBSERVABILITY_ENABLED</key>
+    <string>true</string>
+    <key>HERMES_RCA_DELIVERY_DISPATCHER_OBSERVABILITY_PATH</key>
+    <string>/Users/songying/.hermes/runtime/pnc_agent/feishu_issue_kafka_rca/delivery_observations.jsonl</string>
+    <key>HERMES_RCA_DELIVERY_DISPATCHER_OBSERVATION_RELEASE_ID</key>
+    <string>rca-goal-v6-gate-a-20260731-r10</string>
     <key>PATH</key>
     <string>/Users/songying/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>PNC_FOXGLOVE_RENDER_HOST</key>

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
+import plistlib
 
 import pytest
 
@@ -83,3 +85,21 @@ def test_symlink_destination_is_rejected(tmp_path):
         append_delivery_observation(link, _row())
     assert raised.value.code == "observation_path_not_regular"
 
+
+def test_dispatcher_launch_agent_binds_release_and_inventory():
+    repo_root = Path(__file__).resolve().parents[2]
+    with (repo_root / "local.pnc.rca-delivery-dispatcher.plist").open("rb") as handle:
+        launch_agent = plistlib.load(handle)
+
+    env = launch_agent["EnvironmentVariables"]
+    assert env["HERMES_RCA_DELIVERY_DISPATCHER_OBSERVABILITY_ENABLED"] == "true"
+    assert env["HERMES_RCA_DELIVERY_DISPATCHER_OBSERVATION_RELEASE_ID"] == (
+        "rca-goal-v6-gate-a-20260731-r10"
+    )
+    assert env["HERMES_RCA_DELIVERY_DISPATCHER_INVENTORY_PIN"] == (
+        "9fea0306752d005f58937e08202c9ce094e52056794549201259f214fe885880"
+    )
+    assert env["HERMES_RCA_DELIVERY_DISPATCHER_OBSERVABILITY_PATH"] == (
+        "/Users/songying/.hermes/runtime/pnc_agent/feishu_issue_kafka_rca/"
+        "delivery_observations.jsonl"
+    )
