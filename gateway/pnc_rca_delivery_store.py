@@ -1344,9 +1344,6 @@ class RcaDeliveryStore:
                     ON rca_delivery_jobs(updated_at DESC, status);
                 CREATE INDEX IF NOT EXISTS idx_delivery_effects_due
                     ON rca_delivery_effects(status, next_attempt_at, lease_expires_at);
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_effects_comment_slot
-                    ON rca_delivery_effects(comment_slot_key)
-                 WHERE comment_slot_key != '';
                 """
             )
             ensure_host_runtime_transition_schema(conn)
@@ -1558,6 +1555,27 @@ class RcaDeliveryStore:
             conn,
             schema_version=initial_schema_version,
         )
+        if RcaDeliveryStore._table_exists(
+            conn, "rca_delivery_dispatcher_circuit"
+        ):
+            card_patch_row = conn.execute(
+                "SELECT 1 FROM rca_delivery_dispatcher_circuit "
+                "WHERE circuit_name = 'feishu_card_patch'"
+            ).fetchone()
+            if card_patch_row is None:
+                deterministic_updated_at = conn.execute(
+                    "SELECT COALESCE(MAX(updated_at), ?) "
+                    "FROM rca_delivery_dispatcher_circuit",
+                    (W5_EXTERNAL_WRITE_FENCE_CUTOFF,),
+                ).fetchone()[0]
+                conn.execute(
+                    """
+                    INSERT INTO rca_delivery_dispatcher_circuit(
+                        circuit_name, state, updated_at
+                    ) VALUES('feishu_card_patch', 'closed', ?)
+                    """,
+                    (deterministic_updated_at,),
+                )
         if RcaDeliveryStore._table_exists(conn, "rca_delivery_subscriptions"):
             subscription_columns = {
                 str(row["name"])
@@ -1565,13 +1583,13 @@ class RcaDeliveryStore:
                     "PRAGMA table_info(rca_delivery_subscriptions)"
                 )
             }
-            if "reason" not in subscription_columns:
+            reason_added = "reason" not in subscription_columns
+            if reason_added:
                 conn.execute(
                     "ALTER TABLE rca_delivery_subscriptions ADD COLUMN reason "
                     "TEXT NOT NULL DEFAULT 'awaiting_delivery_materialization'"
                 )
-            conn.execute(
-                """
+            reason_update = """
                 UPDATE rca_delivery_subscriptions
                    SET reason = CASE status
                        WHEN 'pending' THEN 'awaiting_delivery_materialization'
@@ -1580,9 +1598,11 @@ class RcaDeliveryStore:
                        WHEN 'quarantined' THEN 'legacy_quarantine_reason_unknown'
                        ELSE 'legacy_subscription_state_unknown'
                    END
-                 WHERE TRIM(reason) = ''
-                """
-            )
+            """
+            if reason_added:
+                conn.execute(reason_update)
+            else:
+                conn.execute(reason_update + " WHERE TRIM(reason) = ''")
             _execute_schema_script_in_transaction(
                 conn,
                 """
@@ -1658,6 +1678,7 @@ class RcaDeliveryStore:
                        FROM rca_delivery_subscription_events AS event
                       WHERE event.subscription_key = subscription.subscription_key
                  )
+                 ORDER BY subscription.subscription_key
                 """
             )
         watch_columns = {

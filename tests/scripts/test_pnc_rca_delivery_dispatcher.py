@@ -230,6 +230,11 @@ def _config(tmp_path, *, enabled: bool = True):
             "HERMES_RCA_DELIVERY_DISPATCHER_BATCH_SIZE": "5",
             "HERMES_RCA_DELIVERY_DISPATCHER_HEALTH_MAX_AGE_SECONDS": "60",
             "HERMES_RCA_DELIVERY_DISPATCHER_REPORT_HTTP_TIMEOUT_SECONDS": "10",
+            "HERMES_RCA_DELIVERY_DISPATCHER_OBSERVABILITY_PATH": str(
+                tmp_path / "delivery-observations.jsonl"
+            ),
+            "HERMES_RCA_DELIVERY_DISPATCHER_INVENTORY_PIN": "b" * 64,
+            "HERMES_RCA_DELIVERY_DISPATCHER_OBSERVATION_RELEASE_ID": "release-test-observability",
         },
         hermes_home=tmp_path,
     )

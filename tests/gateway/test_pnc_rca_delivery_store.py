@@ -961,6 +961,57 @@ def test_require_current_delivery_store_never_migrates_predecessor(tmp_path):
     assert marker == "pnc_rca_delivery_store_v5"
 
 
+def test_delivery_store_migrates_real_v7_shape_before_comment_slot_index(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    RcaDeliveryStore(path)
+    with sqlite3.connect(path) as conn:
+        conn.executescript(
+            """
+            DROP INDEX idx_delivery_effects_comment_slot;
+            DROP TABLE rca_conclusion_adjudication_repairs;
+            DROP TABLE rca_conclusion_adjudications;
+            DROP TABLE rca_failure_routes;
+            ALTER TABLE rca_delivery_effects
+                DROP COLUMN adjudication_comment_attempted_at;
+            ALTER TABLE rca_delivery_effects
+                DROP COLUMN adjudication_comment_attempt_count;
+            ALTER TABLE rca_delivery_effects
+                DROP COLUMN comment_slot_budget_exempt;
+            ALTER TABLE rca_delivery_effects
+                DROP COLUMN comment_slot_revision;
+            ALTER TABLE rca_delivery_effects
+                DROP COLUMN comment_slot_generation;
+            ALTER TABLE rca_delivery_effects
+                DROP COLUMN comment_slot_kind;
+            ALTER TABLE rca_delivery_effects
+                DROP COLUMN comment_slot_key;
+            ALTER TABLE rca_delivery_effects
+                DROP COLUMN comment_slot_schema_version;
+            UPDATE rca_delivery_meta
+               SET value='pnc_rca_delivery_store_v7'
+             WHERE key='schema_version';
+            """
+        )
+
+    RcaDeliveryStore(path)
+
+    with sqlite3.connect(path) as conn:
+        marker = conn.execute(
+            "SELECT value FROM rca_delivery_meta WHERE key='schema_version'"
+        ).fetchone()[0]
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(rca_delivery_effects)")
+        }
+        index = conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='index' AND name='idx_delivery_effects_comment_slot'"
+        ).fetchone()
+    assert marker == DELIVERY_STORE_SCHEMA_VERSION
+    assert "comment_slot_key" in columns
+    assert index is not None
+    assert "comment_slot_key" in index[0]
+
+
 def test_require_current_delivery_store_opens_current_regular_file(tmp_path):
     path = tmp_path / "control.sqlite3"
     RcaDeliveryStore(path)

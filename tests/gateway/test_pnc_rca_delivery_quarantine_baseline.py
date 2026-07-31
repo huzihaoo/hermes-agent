@@ -32,6 +32,7 @@ from gateway.pnc_rca_delivery_quarantine_migration import (
     validate_combined_migration_receipt,
 )
 from gateway.pnc_rca_delivery_store import RcaDeliveryStore
+from gateway.pnc_rca_control_store import RcaControlStore
 from tests.gateway.test_pnc_rca_delivery_store import (
     NOW,
     _control,
@@ -233,6 +234,7 @@ def _prepare_combined_schema_migration(
 ) -> dict:
     root.mkdir(parents=True, exist_ok=True)
     live_path = root / "live-control.sqlite3"
+    RcaControlStore(live_path)
     RcaDeliveryStore(live_path)
     with sqlite3.connect(live_path) as conn:
         conn.executescript(
@@ -245,20 +247,96 @@ def _prepare_combined_schema_migration(
             """
         )
         if source_version == "pnc_rca_delivery_store_v7":
-            conn.execute("DROP TABLE rca_conclusion_adjudications")
-            conn.execute("DROP TABLE rca_failure_routes")
+            conn.executescript(
+                """
+                DROP TRIGGER IF EXISTS trg_rca_delivery_subscription_reason_required;
+                DROP TRIGGER IF EXISTS trg_rca_delivery_subscription_event_insert;
+                DROP TRIGGER IF EXISTS trg_rca_delivery_subscription_event_update;
+                DROP TRIGGER IF EXISTS trg_learning_lane_effect_insert_forbidden;
+                DROP TRIGGER IF EXISTS trg_learning_lane_stock_effect_insert_forbidden;
+                DROP TRIGGER IF EXISTS trg_learning_lane_stock_subscription_insert_forbidden;
+                DROP TRIGGER IF EXISTS trg_learning_lane_stock_subscription_update_forbidden;
+                DROP INDEX IF EXISTS idx_rca_delivery_subscription_events;
+                DROP TABLE IF EXISTS rca_delivery_subscription_events;
+                DROP INDEX idx_delivery_effects_comment_slot;
+                DROP TABLE rca_conclusion_adjudications;
+                DROP TABLE rca_failure_routes;
+                DELETE FROM rca_delivery_dispatcher_circuit
+                 WHERE circuit_name = 'feishu_card_patch';
+                ALTER TABLE rca_delivery_subscriptions DROP COLUMN reason;
+                ALTER TABLE rca_delivery_effects
+                    DROP COLUMN comment_slot_budget_exempt;
+                ALTER TABLE rca_delivery_effects
+                    DROP COLUMN comment_slot_revision;
+                ALTER TABLE rca_delivery_effects
+                    DROP COLUMN comment_slot_generation;
+                ALTER TABLE rca_delivery_effects
+                    DROP COLUMN comment_slot_kind;
+                ALTER TABLE rca_delivery_effects
+                    DROP COLUMN comment_slot_key;
+                ALTER TABLE rca_delivery_effects
+                    DROP COLUMN comment_slot_schema_version;
+                """
+            )
         conn.execute(
             "UPDATE rca_delivery_meta SET value = ? WHERE key = 'schema_version'",
             (source_version,),
         )
+        if source_version == "pnc_rca_delivery_store_v7":
+            legacy_at = "2026-07-25T10:00:00+00:00"
+            conn.execute(
+                """
+                INSERT INTO business_triggers(
+                    business_key, generation, submission_key,
+                    creation_rule_version, work_item_id, project_key,
+                    work_item_type_key, normalized_json, state, created_at
+                ) VALUES ('legacy-migration-business', 1,
+                          'legacy-migration-submission', 'v1', 'legacy-item',
+                          'project', 'issue', '{}', 'completed', ?)
+                """,
+                (legacy_at,),
+            )
+            conn.executemany(
+                """
+                INSERT INTO rca_delivery_subscriptions(
+                    subscription_key, business_key, generation, effect_kind,
+                    target_key, target_json, required, status,
+                    created_at, updated_at
+                ) VALUES (?, 'legacy-migration-business', 1,
+                          'feishu_issue_comment', ?, '{}', 1, ?, ?, ?)
+                """,
+                [
+                    ("legacy-pending", "target-pending", "pending", legacy_at, legacy_at),
+                    ("legacy-materialized", "target-materialized", "materialized", legacy_at, legacy_at),
+                    ("legacy-suppressed", "target-suppressed", "suppressed", legacy_at, legacy_at),
+                    ("legacy-quarantined", "target-quarantined", "quarantined", legacy_at, legacy_at),
+                ],
+            )
         if seed_w2_adjudication:
             assert source_version == "pnc_rca_delivery_store_v8"
             created_at = "2026-07-25T11:30:00+00:00"
             conn.execute(
-                "CREATE TABLE IF NOT EXISTS rca_outbox("
-                "outbox_id INTEGER PRIMARY KEY)"
+                """
+                INSERT INTO business_triggers(
+                    business_key, generation, submission_key,
+                    creation_rule_version, work_item_id, project_key,
+                    work_item_type_key, normalized_json, state, created_at
+                ) VALUES ('w2-business', 1, 'w2-submission', 'v1', '123',
+                          'project', 'issue', '{}', 'completed', ?)
+                """,
+                (created_at,),
             )
-            conn.execute("INSERT INTO rca_outbox(outbox_id) VALUES(1)")
+            conn.execute(
+                """
+                INSERT INTO rca_outbox(
+                    outbox_id, action, business_key, submission_key,
+                    creation_rule_version, generation, payload_json, status,
+                    created_at, updated_at
+                ) VALUES (1, 'submit', 'w2-business', 'w2-submission',
+                          'v1', 1, '{}', 'succeeded', ?, ?)
+                """,
+                (created_at, created_at),
+            )
             conn.execute(
                 """
                 INSERT INTO rca_execution_watch(
@@ -381,9 +459,34 @@ def _prepare_combined_quarantine_migration(
     with sqlite3.connect(source_backup) as conn:
         conn.executescript(
             """
+            DROP TRIGGER IF EXISTS trg_rca_delivery_subscription_reason_required;
+            DROP TRIGGER IF EXISTS trg_rca_delivery_subscription_event_insert;
+            DROP TRIGGER IF EXISTS trg_rca_delivery_subscription_event_update;
+            DROP TRIGGER IF EXISTS trg_learning_lane_effect_insert_forbidden;
+            DROP TRIGGER IF EXISTS trg_learning_lane_stock_effect_insert_forbidden;
+            DROP TRIGGER IF EXISTS trg_learning_lane_stock_subscription_insert_forbidden;
+            DROP TRIGGER IF EXISTS trg_learning_lane_stock_subscription_update_forbidden;
+            DROP INDEX IF EXISTS idx_rca_delivery_subscription_events;
+            DROP TABLE IF EXISTS rca_delivery_subscription_events;
             DROP TABLE rca_conclusion_adjudication_repairs;
             DROP TABLE rca_conclusion_adjudications;
             DROP TABLE rca_failure_routes;
+            DELETE FROM rca_delivery_dispatcher_circuit
+             WHERE circuit_name = 'feishu_card_patch';
+            DROP INDEX IF EXISTS idx_delivery_effects_comment_slot;
+            ALTER TABLE rca_delivery_subscriptions DROP COLUMN reason;
+            ALTER TABLE rca_delivery_effects
+                DROP COLUMN comment_slot_budget_exempt;
+            ALTER TABLE rca_delivery_effects
+                DROP COLUMN comment_slot_revision;
+            ALTER TABLE rca_delivery_effects
+                DROP COLUMN comment_slot_generation;
+            ALTER TABLE rca_delivery_effects
+                DROP COLUMN comment_slot_kind;
+            ALTER TABLE rca_delivery_effects
+                DROP COLUMN comment_slot_key;
+            ALTER TABLE rca_delivery_effects
+                DROP COLUMN comment_slot_schema_version;
             ALTER TABLE rca_delivery_effects
                 DROP COLUMN adjudication_comment_attempted_at;
             ALTER TABLE rca_delivery_effects
@@ -473,9 +576,7 @@ def test_combined_v2_offline_receipt_requires_quick_checked_copy_and_rollback(
         assert preservation["deterministic_transforms"][1]["rule"] == (
             "backfill_pending_repairs_from_adjudication_created_at_v1"
         )
-    assert preservation["source_owned_tables"]["rca_delivery_effects"][
-        "added_target_columns"
-    ] == [
+    expected_effect_columns = [
         {
             "name": "adjudication_comment_attempt_count",
             "existing_row_value": 0,
@@ -485,6 +586,56 @@ def test_combined_v2_offline_receipt_requires_quick_checked_copy_and_rollback(
             "existing_row_value": None,
         },
     ]
+    if source_version == "pnc_rca_delivery_store_v7":
+        expected_effect_columns.extend(
+            [
+                {
+                    "name": "comment_slot_schema_version",
+                    "existing_row_value": "",
+                },
+                {"name": "comment_slot_key", "existing_row_value": ""},
+                {"name": "comment_slot_kind", "existing_row_value": ""},
+                {
+                    "name": "comment_slot_generation",
+                    "existing_row_value": None,
+                },
+                {
+                    "name": "comment_slot_revision",
+                    "existing_row_value": None,
+                },
+                {
+                    "name": "comment_slot_budget_exempt",
+                    "existing_row_value": 0,
+                },
+            ]
+        )
+        assert "idx_delivery_effects_comment_slot" in preservation[
+            "source_owned_schema"
+        ]["added_target_objects"]
+        assert "rca_delivery_subscription_events" in preservation[
+            "source_owned_schema"
+        ]["added_target_objects"]
+        assert preservation["source_owned_tables"]["rca_delivery_subscriptions"][
+            "added_target_columns"
+        ] == [{"name": "reason", "existing_row_value": "status_derived_v1"}]
+        assert any(
+            item["rule"]
+            == "backfill_card_patch_circuit_from_latest_source_timestamp_v1"
+            for item in preservation["deterministic_transforms"]
+        )
+        with sqlite3.connect(migration["source_backup"]) as source_conn:
+            latest_source_circuit_at = source_conn.execute(
+                "SELECT MAX(updated_at) FROM rca_delivery_dispatcher_circuit"
+            ).fetchone()[0]
+        with sqlite3.connect(migration["clone_path"]) as clone_conn:
+            card_patch = clone_conn.execute(
+                "SELECT state, updated_at FROM rca_delivery_dispatcher_circuit "
+                "WHERE circuit_name = 'feishu_card_patch'"
+            ).fetchone()
+        assert card_patch == ("closed", latest_source_circuit_at)
+    assert preservation["source_owned_tables"]["rca_delivery_effects"][
+        "added_target_columns"
+    ] == expected_effect_columns
 
 
 def test_combined_v2_receipt_binds_w5_cutoff_backfill_for_legacy_v7_source(
@@ -530,6 +681,35 @@ def test_combined_v2_receipt_binds_w5_cutoff_backfill_for_legacy_v7_source(
         "source_value": None,
         "target_value": "2026-07-25T00:00:00+00:00",
     }
+
+
+def test_combined_v2_v7_subscription_reason_and_event_backfill_are_status_derived(
+    tmp_path,
+):
+    migration = _prepare_combined_schema_migration(
+        tmp_path / "seed", "pnc_rca_delivery_store_v7"
+    )
+    with sqlite3.connect(migration["clone_path"]) as conn:
+        rows = conn.execute(
+            "SELECT subscription_key, status, reason "
+            "FROM rca_delivery_subscriptions ORDER BY subscription_key"
+        ).fetchall()
+        assert rows == [
+            ("legacy-materialized", "materialized", "delivery_effect_materialized"),
+            ("legacy-pending", "pending", "awaiting_delivery_materialization"),
+            ("legacy-quarantined", "quarantined", "legacy_quarantine_reason_unknown"),
+            ("legacy-suppressed", "suppressed", "legacy_suppression_reason_unknown"),
+        ]
+        events = conn.execute(
+            "SELECT event_id, subscription_key, old_status, new_status, reason "
+            "FROM rca_delivery_subscription_events ORDER BY event_id"
+        ).fetchall()
+        assert events == [
+            (1, "legacy-materialized", "", "materialized", "delivery_effect_materialized"),
+            (2, "legacy-pending", "", "pending", "awaiting_delivery_materialization"),
+            (3, "legacy-quarantined", "", "quarantined", "legacy_quarantine_reason_unknown"),
+            (4, "legacy-suppressed", "", "suppressed", "legacy_suppression_reason_unknown"),
+        ]
 
 
 def test_combined_v2_receipt_builds_quarantine_core_from_offline_v9_clone(

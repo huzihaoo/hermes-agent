@@ -97,7 +97,7 @@ _COMBINED_SEMANTICS_FIELDS = frozenset(
 )
 _COMBINED_PRESERVATION_POLICY = "all_source_owned_rows_exact_v1"
 _COMBINED_ADDED_SCHEMA_POLICY = (
-    "allowlisted_deterministic_tables_and_constant_default_columns_v1"
+    "allowlisted_deterministic_tables_rows_and_columns_v2"
 )
 _COMBINED_W5_CUTOFF_META_KEY = "w5_external_write_fence_cutoff"
 _COMBINED_W5_CUTOFF_META_VALUE = "2026-07-25T00:00:00+00:00"
@@ -109,18 +109,64 @@ _COMBINED_ALLOWED_ADDED_TABLES = {
             "rca_conclusion_adjudication_repairs",
             "rca_conclusion_adjudications",
             "rca_failure_routes",
+            "rca_delivery_subscription_events",
         }
     ),
     _COMBINED_W2_V8_VARIANT: frozenset(
         {"rca_conclusion_adjudication_repairs"}
     ),
 }
+_COMBINED_EFFECT_COLUMN_DEFINITIONS = {
+    "adjudication_comment_attempt_count": (
+        "INTEGER NOT NULL DEFAULT 0 CHECK "
+        "(adjudication_comment_attempt_count IN (0, 1))"
+    ),
+    "adjudication_comment_attempted_at": "TEXT",
+    "comment_slot_schema_version": (
+        "TEXT NOT NULL DEFAULT '' CHECK "
+        "(comment_slot_schema_version IN ('', 'pnc_rca_comment_slot_v1'))"
+    ),
+    "comment_slot_key": "TEXT NOT NULL DEFAULT ''",
+    "comment_slot_kind": (
+        "TEXT NOT NULL DEFAULT '' CHECK "
+        "(comment_slot_kind IN ('', 'conclusion', 'correction'))"
+    ),
+    "comment_slot_generation": (
+        "INTEGER CHECK (comment_slot_generation IS NULL "
+        "OR comment_slot_generation >= 1)"
+    ),
+    "comment_slot_revision": (
+        "INTEGER CHECK (comment_slot_revision IS NULL "
+        "OR comment_slot_revision >= 1)"
+    ),
+    "comment_slot_budget_exempt": (
+        "INTEGER NOT NULL DEFAULT 0 CHECK "
+        "(comment_slot_budget_exempt IN (0, 1))"
+    ),
+}
 _COMBINED_ALLOWED_ADDED_COLUMN_DEFAULTS = {
     "rca_delivery_effects": {
         "adjudication_comment_attempt_count": 0,
         "adjudication_comment_attempted_at": None,
-    }
+        "comment_slot_schema_version": "",
+        "comment_slot_key": "",
+        "comment_slot_kind": "",
+        "comment_slot_generation": None,
+        "comment_slot_revision": None,
+        "comment_slot_budget_exempt": 0,
+    },
+    "rca_delivery_subscriptions": {
+        "reason": "status_derived_v1",
+    },
 }
+_COMBINED_SUBSCRIPTION_REASON_DEFINITION = (
+    "TEXT NOT NULL DEFAULT 'awaiting_delivery_materialization'"
+)
+_COMBINED_COMMENT_SLOT_INDEX_CONTRACT = (
+    "index",
+    "rca_delivery_effects",
+    "b0ef33faf578767c840105b949de578cd568cd794aa4354c4324d8039b94304c",
+)
 _COMBINED_CANONICAL_V9_OBJECTS = {
     "idx_failure_routes_status": (
         "index",
@@ -166,6 +212,53 @@ _COMBINED_CANONICAL_V9_OBJECTS = {
         "trigger",
         "rca_conclusion_adjudications",
         "3cec6349b8b4fd3efc57bb6f612b6894d69fc8a983be4c83d131b01950ae043e",
+    ),
+}
+_COMBINED_CANONICAL_SUBSCRIPTION_OBJECTS = {
+    "rca_delivery_subscription_events": (
+        "table",
+        "rca_delivery_subscription_events",
+        "ba97ba9e31ac0f3fc527a8724252d9bce60ffcbd536497f2034af9192ef6434e",
+    ),
+    "idx_rca_delivery_subscription_events": (
+        "index",
+        "rca_delivery_subscription_events",
+        "50a27d6124fb53e1d31ac667f178204664792b8fb6d3094a5276d00053e20280",
+    ),
+    "trg_learning_lane_effect_insert_forbidden": (
+        "trigger",
+        "rca_delivery_effects",
+        "cb044942a3f4fb78b0788abb6269c85e6f56e9de34eac43625af096fbecd95e7",
+    ),
+    "trg_learning_lane_stock_effect_insert_forbidden": (
+        "trigger",
+        "rca_delivery_effects",
+        "1a67cb8559a037166b61f40c21977933d734e9147dbd38bb18b71700b07fe73a",
+    ),
+    "trg_learning_lane_stock_subscription_insert_forbidden": (
+        "trigger",
+        "rca_delivery_subscriptions",
+        "5d0ceb8a3c68e4a33c83c0dc5d3a6172ca60835a471fef28560fe60151ac75a4",
+    ),
+    "trg_learning_lane_stock_subscription_update_forbidden": (
+        "trigger",
+        "rca_delivery_subscriptions",
+        "8ba715f5649a2e60acffa5f72e15dfa39ea78225084d1fbe25900ec4bcbe865c",
+    ),
+    "trg_rca_delivery_subscription_event_insert": (
+        "trigger",
+        "rca_delivery_subscriptions",
+        "473d2575f0f63735a3940e26c14776c15e9a6a21653e3cf3aff1609361fe3d75",
+    ),
+    "trg_rca_delivery_subscription_event_update": (
+        "trigger",
+        "rca_delivery_subscriptions",
+        "e767d65b4f39c4c836d5bce8ae8c3a9c3899eeb136eb89c3aa025e7aa6c379e4",
+    ),
+    "trg_rca_delivery_subscription_reason_required": (
+        "trigger",
+        "rca_delivery_subscriptions",
+        "472983f5f226ee30bdef182919a38b4e7737c3fe787fa14e7e27637f03b93d08",
     ),
 }
 _COMBINED_W2_SOURCE_TABLES = frozenset(
@@ -496,6 +589,10 @@ def _combined_source_schema_variant(
         str(row[1])
         for row in conn.execute("PRAGMA table_info(rca_delivery_effects)")
     }
+    subscription_columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(rca_delivery_subscriptions)")
+    }
     attempt_columns = {
         "adjudication_comment_attempt_count",
         "adjudication_comment_attempted_at",
@@ -507,6 +604,8 @@ def _combined_source_schema_variant(
         if (
             {adjudication_table, repair_table, failure_table} & tables
             or attempt_columns & effect_columns
+            or "reason" in subscription_columns
+            or "rca_delivery_subscription_events" in tables
         ):
             raise QuarantineMigrationError(
                 "delivery_store_combined_migration_"
@@ -593,6 +692,7 @@ def _combined_deterministic_transforms(
     *,
     source_variant: str,
     source_meta_keys: set[str] | None = None,
+    source_circuit_names: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     transforms = [
         {
@@ -613,6 +713,19 @@ def _combined_deterministic_transforms(
                 "column": "value",
                 "source_value": None,
                 "target_value": _COMBINED_W5_CUTOFF_META_VALUE,
+            }
+        )
+    if (
+        source_circuit_names is not None
+        and "feishu_card_patch" not in source_circuit_names
+    ):
+        transforms.append(
+            {
+                "rule": "backfill_card_patch_circuit_from_latest_source_timestamp_v1",
+                "table": "rca_delivery_dispatcher_circuit",
+                "selector": {"circuit_name": "feishu_card_patch"},
+                "state": "closed",
+                "updated_at_rule": "max_source_circuit_updated_at_or_w5_cutoff",
             }
         )
     if source_variant == _COMBINED_W2_V8_VARIANT:
@@ -637,6 +750,28 @@ def _expected_combined_target_rows(
     source_version: str,
 ) -> list[dict[str, Any]]:
     expected = [dict(row) for row in source_rows]
+    if table == "rca_delivery_dispatcher_circuit":
+        if not any(
+            row.get("circuit_name") == "feishu_card_patch" for row in expected
+        ):
+            updated_at = max(
+                (str(row.get("updated_at") or "") for row in expected),
+                default=_COMBINED_W5_CUTOFF_META_VALUE,
+            )
+            if not updated_at:
+                updated_at = _COMBINED_W5_CUTOFF_META_VALUE
+            expected.append(
+                {
+                    "circuit_name": "feishu_card_patch",
+                    "state": "closed",
+                    "reason_code": "",
+                    "reason_detail": "",
+                    "opened_at": None,
+                    "updated_at": updated_at,
+                }
+            )
+            expected.sort(key=lambda row: str(row.get("circuit_name") or ""))
+        return expected
     if table != "rca_delivery_meta":
         return expected
     markers = [
@@ -679,6 +814,37 @@ def _expected_combined_added_table_rows(
     target_columns: list[str],
     source_variant: str,
 ) -> list[dict[str, Any]]:
+    if table == "rca_delivery_subscription_events":
+        source_rows = _project_table_rows(
+            source,
+            table="rca_delivery_subscriptions",
+            columns=["subscription_key", "status", "updated_at"],
+            order=["subscription_key"],
+        )
+        reason_by_status = {
+            "pending": "awaiting_delivery_materialization",
+            "materialized": "delivery_effect_materialized",
+            "suppressed": "legacy_suppression_reason_unknown",
+            "quarantined": "legacy_quarantine_reason_unknown",
+        }
+        expected = []
+        for event_id, source_row in enumerate(source_rows, start=1):
+            values = {
+                "event_id": event_id,
+                "subscription_key": source_row["subscription_key"],
+                "old_status": "",
+                "new_status": source_row["status"],
+                "reason": reason_by_status.get(
+                    source_row["status"], "legacy_subscription_state_unknown"
+                ),
+                "observed_at": source_row["updated_at"],
+            }
+            if set(values) != set(target_columns):
+                raise QuarantineMigrationError(
+                    "delivery_store_combined_migration_cross_projection_mismatch"
+                )
+            expected.append({column: values[column] for column in target_columns})
+        return expected
     if (
         source_variant != _COMBINED_W2_V8_VARIANT
         or table != "rca_conclusion_adjudication_repairs"
@@ -812,18 +978,44 @@ def _expected_effects_v9_schema_sql(source_sql: str) -> str:
     scratch = sqlite3.connect(":memory:")
     try:
         scratch.execute(source_sql)
-        scratch.execute(
-            "ALTER TABLE rca_delivery_effects "
-            "ADD COLUMN adjudication_comment_attempt_count INTEGER NOT NULL "
-            "DEFAULT 0 CHECK (adjudication_comment_attempt_count IN (0, 1))"
-        )
-        scratch.execute(
-            "ALTER TABLE rca_delivery_effects "
-            "ADD COLUMN adjudication_comment_attempted_at TEXT"
-        )
+        source_columns = {
+            str(row[1])
+            for row in scratch.execute("PRAGMA table_info(rca_delivery_effects)")
+        }
+        for name, definition in _COMBINED_EFFECT_COLUMN_DEFINITIONS.items():
+            if name not in source_columns:
+                scratch.execute(
+                    f"ALTER TABLE rca_delivery_effects ADD COLUMN {name} {definition}"
+                )
         row = scratch.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' "
             "AND name = 'rca_delivery_effects'"
+        ).fetchone()
+    except sqlite3.Error as exc:
+        raise QuarantineMigrationError(
+            "delivery_store_combined_migration_cross_schema_mismatch"
+        ) from exc
+    finally:
+        scratch.close()
+    return "".join(str(row[0] if row else "").split()).lower()
+
+
+def _expected_subscriptions_v9_schema_sql(source_sql: str) -> str:
+    scratch = sqlite3.connect(":memory:")
+    try:
+        scratch.execute(source_sql)
+        source_columns = {
+            str(row[1])
+            for row in scratch.execute("PRAGMA table_info(rca_delivery_subscriptions)")
+        }
+        if "reason" not in source_columns:
+            scratch.execute(
+                "ALTER TABLE rca_delivery_subscriptions ADD COLUMN reason "
+                + _COMBINED_SUBSCRIPTION_REASON_DEFINITION
+            )
+        row = scratch.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'rca_delivery_subscriptions'"
         ).fetchone()
     except sqlite3.Error as exc:
         raise QuarantineMigrationError(
@@ -852,6 +1044,11 @@ def _combined_source_schema_preservation(
         expected_sql = source_object["normalized_sql"]
         if name == "rca_delivery_effects" and source_object["type"] == "table":
             expected_sql = _expected_effects_v9_schema_sql(source_object["sql"])
+        if (
+            name == "rca_delivery_subscriptions"
+            and source_object["type"] == "table"
+        ):
+            expected_sql = _expected_subscriptions_v9_schema_sql(source_object["sql"])
         if (
             target_object["type"] != source_object["type"]
             or target_object["table"] != source_object["table"]
@@ -883,6 +1080,13 @@ def _combined_source_schema_preservation(
         for name, contract in _COMBINED_CANONICAL_V9_OBJECTS.items()
         if contract[1] in allowed_added_tables
     }
+    for name, contract in _COMBINED_CANONICAL_SUBSCRIPTION_OBJECTS.items():
+        if name not in source_objects:
+            expected_added_objects[name] = contract
+    if "idx_delivery_effects_comment_slot" not in source_objects:
+        expected_added_objects["idx_delivery_effects_comment_slot"] = (
+            _COMBINED_COMMENT_SLOT_INDEX_CONTRACT
+        )
     if set(added_objects) != set(expected_added_objects):
         raise QuarantineMigrationError(
             "delivery_store_combined_migration_cross_schema_mismatch"
@@ -938,7 +1142,7 @@ def _combined_cross_projection_preservation(
         or target_names - source_names != allowed_added_tables
     ):
         raise QuarantineMigrationError(
-            "delivery_store_combined_migration_cross_projection_mismatch"
+            "delivery_store_combined_migration_cross_schema_mismatch"
         )
 
     schema_preservation = _combined_source_schema_preservation(
@@ -957,16 +1161,37 @@ def _combined_cross_projection_preservation(
         if "rca_delivery_meta" in source_names
         else set()
     )
+    source_circuit_names = (
+        {
+            str(row["circuit_name"])
+            for row in source.execute(
+                "SELECT circuit_name FROM rca_delivery_dispatcher_circuit"
+            ).fetchall()
+        }
+        if "rca_delivery_dispatcher_circuit" in source_names
+        else set()
+    )
     for table in sorted(source_names):
+        # SQLite's AUTOINCREMENT bookkeeping is derived metadata. Adding the
+        # subscription event table legitimately adds one sqlite_sequence row;
+        # it is not a source-owned business row to preserve byte-for-byte.
+        if table == "sqlite_sequence":
+            continue
         source_table = source_tables[table]
         target_table = target_tables[table]
         source_columns = list(source_table["columns"])
         target_columns = list(target_table["columns"])
         added_columns = target_columns[len(source_columns) :]
         allowed_defaults = _COMBINED_ALLOWED_ADDED_COLUMN_DEFAULTS.get(table, {})
+        expected_added_columns = [
+            name for name in allowed_defaults if name not in source_columns
+        ]
+        expected_added_defaults = {
+            name: allowed_defaults[name] for name in expected_added_columns
+        }
         if (
             target_columns[: len(source_columns)] != source_columns
-            or added_columns != list(allowed_defaults)
+            or added_columns != expected_added_columns
         ):
             raise QuarantineMigrationError(
                 "delivery_store_combined_migration_cross_projection_mismatch"
@@ -993,6 +1218,22 @@ def _combined_cross_projection_preservation(
             raise QuarantineMigrationError(
                 "delivery_store_combined_migration_cross_projection_mismatch"
             )
+        expected_added_rows: list[dict[str, Any]] | None = None
+        if table == "rca_delivery_subscriptions" and "reason" in added_columns:
+            reason_by_status = {
+                "pending": "awaiting_delivery_materialization",
+                "materialized": "delivery_effect_materialized",
+                "suppressed": "legacy_suppression_reason_unknown",
+                "quarantined": "legacy_quarantine_reason_unknown",
+            }
+            expected_added_rows = [
+                {
+                    "reason": reason_by_status.get(
+                        row["status"], "legacy_subscription_state_unknown"
+                    )
+                }
+                for row in source_rows
+            ]
         if added_columns:
             added_values = _project_table_rows(
                 clone,
@@ -1000,10 +1241,11 @@ def _combined_cross_projection_preservation(
                 columns=added_columns,
                 order=order,
             )
-            if any(
-                row != allowed_defaults
-                for row in added_values
-            ):
+            if expected_added_rows is None:
+                expected_added_rows = [
+                    expected_added_defaults for _ in added_values
+                ]
+            if added_values != expected_added_rows:
                 raise QuarantineMigrationError(
                     "delivery_store_combined_migration_cross_projection_mismatch"
                 )
@@ -1028,7 +1270,12 @@ def _combined_cross_projection_preservation(
             "added_target_columns": [
                 {
                     "name": name,
-                    "existing_row_value": allowed_defaults[name],
+                    "existing_row_value": (
+                        "status_derived_v1"
+                        if table == "rca_delivery_subscriptions"
+                        and name == "reason"
+                        else allowed_defaults[name]
+                    ),
                 }
                 for name in added_columns
             ],
@@ -1079,6 +1326,7 @@ def _combined_cross_projection_preservation(
             source_version,
             source_variant=source_variant,
             source_meta_keys=source_meta_keys,
+            source_circuit_names=source_circuit_names,
         ),
         "source_owned_schema": schema_preservation,
         "source_owned_tables": table_evidence,

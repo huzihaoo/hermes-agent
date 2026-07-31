@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -86,6 +86,11 @@ from gateway.pnc_rca_delivery_store import (
     DeliveryRecordConflictError,
     RcaDeliveryStore,
     StaleDeliveryEffectLeaseError,
+)
+from gateway.pnc_rca_delivery_observability import (
+    DeliveryObservationError,
+    append_delivery_observation,
+    default_observation_path,
 )
 from gateway.pnc_rca_write_fence import (
     ExternalWriteFenceError,
@@ -485,6 +490,10 @@ class DispatcherConfig:
     quarantine_bootstrap_epoch_id: str
     quarantine_active_release_binding_path: Path
     quarantine_live_env_path: Path
+    observability_enabled: bool = True
+    observability_path: Path = field(default_factory=default_observation_path)
+    inventory_pin: str = ""
+    observation_release_id: str = ""
 
     def __post_init__(self) -> None:
         minimum_lease = (
@@ -587,6 +596,25 @@ class DispatcherConfig:
                 quarantine.active_release_binding_path
             ),
             quarantine_live_env_path=quarantine.live_env_path,
+            observability_enabled=_boolean(
+                source, f"{ENV_PREFIX}OBSERVABILITY_ENABLED", True
+            ),
+            observability_path=Path(
+                source.get(
+                    f"{ENV_PREFIX}OBSERVABILITY_PATH",
+                    home
+                    / "runtime"
+                    / "pnc_agent"
+                    / "feishu_issue_kafka_rca"
+                    / "delivery_observations.jsonl",
+                )
+            ).expanduser(),
+            inventory_pin=str(
+                source.get(f"{ENV_PREFIX}INVENTORY_PIN", "") or ""
+            ).strip(),
+            observation_release_id=str(
+                source.get(f"{ENV_PREFIX}OBSERVATION_RELEASE_ID", "") or ""
+            ).strip(),
         )
 
     def public_dict(self) -> dict[str, Any]:
@@ -615,6 +643,10 @@ class DispatcherConfig:
                 self.quarantine_active_release_binding_path
             ),
             "quarantine_live_env_path": str(self.quarantine_live_env_path),
+            "observability_enabled": self.observability_enabled,
+            "observability_path": str(self.observability_path),
+            "inventory_pin_configured": bool(self.inventory_pin),
+            "observation_release_id_configured": bool(self.observation_release_id),
             "max_recovery_writes": MAX_RECOVERY_WRITES,
             "lease_boundary_margin_seconds": LEASE_BOUNDARY_MARGIN_SECONDS,
             "effect_lease_keeper_enabled": True,
@@ -647,6 +679,9 @@ class DispatchStats:
     effect_lease_keeper_renewals: int = 0
     effect_lease_keeper_failures: int = 0
     effect_lease_keeper_active: int = 0
+    observability_written: int = 0
+    observability_errors: int = 0
+    observability_last_error: str = ""
     idle: int = 0
 
 
@@ -3195,6 +3230,173 @@ class DeliveryDispatcher:
             return keeper.settle(mutation)
         return keeper.settle_without_renewal(mutation)
 
+    @staticmethod
+    def _contract_value(contract: Mapping[str, Any], *paths: tuple[str, ...]) -> Any:
+        for path in paths:
+            current: Any = contract
+            for key in path:
+                if not isinstance(current, Mapping) or key not in current:
+                    current = None
+                    break
+                current = current[key]
+            if current is not None:
+                return current
+        return None
+
+    def _delivery_observation_fields(
+        self,
+        claim: DeliveryEffectClaim,
+        *,
+        content: str,
+        remote_id: str,
+        delivered_at: datetime,
+    ) -> dict[str, Any]:
+        contract = claim.contract if isinstance(claim.contract, Mapping) else {}
+        payload = claim.payload if isinstance(claim.payload, Mapping) else {}
+        terminal_class = str(payload.get("terminal_class") or "")
+        quality = str(contract.get("quality_classification") or "")
+        if terminal_class == HONEST_NON_ATTRIBUTION:
+            level = "L0_abstain"
+        elif quality == "supported_attribution":
+            level = "L2_attribution"
+        else:
+            level = "L1_observation"
+        upstream = contract.get("upstream_dispatch")
+        hit_keys = (
+            upstream.get("hit_evaluator_keys")
+            if isinstance(upstream, Mapping)
+            else None
+        )
+        has_attribution = bool(
+            isinstance(hit_keys, (list, tuple))
+            and any(str(value or "").strip() for value in hit_keys)
+            and quality == "supported_attribution"
+        )
+        publication = self._contract_value(
+            contract, ("artifacts", "viz_publication")
+        )
+        viz_published = isinstance(publication, Mapping) and publication.get(
+            "status"
+        ) == "published"
+        viz_bytes = (
+            publication.get("size", 0)
+            if isinstance(publication, Mapping)
+            else 0
+        )
+        evidence_count = self._contract_value(
+            contract,
+            ("evidence_channel_msg_count",),
+            ("evidence", "evidence_channel_msg_count"),
+            ("consumer_capability", "evidence_channel_msg_count"),
+        )
+        evidence_count_reason = (
+            "sealed_contract_does_not_expose_evidence_channel_msg_count"
+            if not isinstance(evidence_count, int) or isinstance(evidence_count, bool)
+            else None
+        )
+        if evidence_count_reason:
+            evidence_count = None
+        public_result = self._contract_value(
+            contract,
+            ("public_result",),
+            ("public_contract", "public_result"),
+        )
+        evidence_summary = (
+            public_result.get("evidence_summary")
+            if isinstance(public_result, Mapping)
+            else None
+        )
+        refs = evidence_summary.get("refs") if isinstance(evidence_summary, Mapping) else None
+        refs_nonempty = bool(refs) if isinstance(refs, (list, tuple, str, Mapping)) else None
+        refs_reason = (
+            "sealed_contract_does_not_expose_evidence_refs"
+            if refs_nonempty is None
+            else None
+        )
+        try:
+            # The effect row's created_at is the durable acceptance boundary
+            # available to the dispatcher; upstream task timing is not present
+            # in this v7 claim schema and must not be fabricated.
+            started_at = datetime.fromisoformat(
+                str(claim.effect_created_at or "").replace("Z", "+00:00")
+            )
+            if started_at.tzinfo is None or started_at.utcoffset() is None:
+                raise ValueError("work_started_at must be timezone-aware")
+            elapsed = (delivered_at.astimezone(timezone.utc) - started_at.astimezone(timezone.utc)).total_seconds()
+        except (TypeError, ValueError) as exc:
+            raise DeliveryObservationError(
+                "observation_pipeline_start_invalid", str(exc)
+            ) from exc
+        if elapsed < 0:
+            raise DeliveryObservationError("observation_pipeline_elapsed_negative")
+        inventory_pin = self._contract_value(
+            contract,
+            ("inventory_pin",),
+            ("evaluator_inventory", "inventory_sha256"),
+            ("consumer_capability", "inventory_sha256"),
+            ("consumer_capability", "evaluator_inventory", "inventory_sha256"),
+        ) or claim.manifest.get("inventory_pin") or claim.manifest.get("inventory_sha256")
+        inventory_pin = str(inventory_pin or getattr(self.config, "inventory_pin", "") or "").strip()
+        fields: dict[str, Any] = {
+            "work_item_id": claim.work_item_id,
+            "case_key": claim.submission_key or claim.business_key,
+            "delivered_at": _utc_iso(delivered_at),
+            "level": level,
+            "has_attribution": has_attribution,
+            "viz_published": viz_published,
+            "viz_bytes": viz_bytes,
+            "evidence_channel_msg_count": evidence_count,
+            "evidence_refs_nonempty": refs_nonempty,
+            "pipeline_elapsed_seconds": elapsed,
+            "outcome_content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            "remote_receipt_id": remote_id,
+            "release_id": str(
+                getattr(self.config, "observation_release_id", "")
+                or getattr(self.config, "quarantine_release_id", "")
+                or contract.get("release_id")
+                or ""
+            ).strip(),
+            "inventory_pin": inventory_pin,
+        }
+        if evidence_count_reason:
+            fields["evidence_channel_msg_count_not_measured_reason"] = evidence_count_reason
+        if refs_reason:
+            fields["evidence_refs_nonempty_not_measured_reason"] = refs_reason
+        return fields
+
+    def _record_delivery_observation(
+        self,
+        claim: DeliveryEffectClaim,
+        *,
+        content: str,
+        remote_id: str,
+        delivered_at: datetime,
+    ) -> None:
+        if not getattr(self.config, "observability_enabled", False):
+            return
+        try:
+            append_delivery_observation(
+                getattr(self.config, "observability_path", default_observation_path()),
+                self._delivery_observation_fields(
+                    claim,
+                    content=content,
+                    remote_id=remote_id,
+                    delivered_at=delivered_at,
+                ),
+            )
+        except DeliveryObservationError as exc:
+            # The provider write is already confirmed; telemetry cannot roll it
+            # back.  Count the loss explicitly so the release gate can fail.
+            self.stats.observability_errors += 1
+            self.stats.observability_last_error = (
+                f"{exc.code}:{exc.detail}" if exc.detail else exc.code
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            self.stats.observability_errors += 1
+            self.stats.observability_last_error = type(exc).__name__
+        else:
+            self.stats.observability_written += 1
+
     def _lease_lost(self, claim: DeliveryEffectClaim) -> DispatchOutcome:
         self.stats.lease_lost += 1
         return DispatchOutcome(
@@ -3724,6 +3926,12 @@ class DeliveryDispatcher:
                 now=self.now(),
             ),
         )
+        self._record_delivery_observation(
+            claim,
+            content=validated.content,
+            remote_id=remote_id,
+            delivered_at=self.now(),
+        )
         self.stats.reconciled += 1
         return DispatchOutcome(
             status="reconciled",
@@ -3977,6 +4185,12 @@ class DeliveryDispatcher:
                 error_code=str(exc)[:120],
                 remote_id=remote_id,
             )
+        self._record_delivery_observation(
+            claim,
+            content=_canonical_json(validated.card_payload or claim.payload),
+            remote_id=remote_id,
+            delivered_at=self.now(),
+        )
         self.stats.delivered += 1
         return DispatchOutcome(
             status="succeeded",
@@ -4688,6 +4902,12 @@ class DeliveryDispatcher:
                 now=self.now(),
             ),
         )
+        self._record_delivery_observation(
+            claim,
+            content=validated.content,
+            remote_id=remote_id,
+            delivered_at=self.now(),
+        )
         self.stats.delivered += 1
         return DispatchOutcome(
             status="succeeded",
@@ -4754,6 +4974,10 @@ class HealthReporter:
                 }
                 and not any(value.is_open for value in circuits.values())
                 and (not self.config.enabled or store_health.get("ok") is True)
+                and not (
+                    self.config.observability_enabled
+                    and stats.observability_errors > 0
+                )
             ),
             "state": state,
             "started_at": self.started_at,
