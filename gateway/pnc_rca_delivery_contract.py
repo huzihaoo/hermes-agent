@@ -2544,14 +2544,7 @@ def render_public_rca_result(
     result = build_public_rca_result(contract)
     dispatch = _validated_upstream_dispatch(contract)
     gate_a_projection = _gate_a_projection(contract) is not None
-    lines = [
-        _dispatch_first_line(dispatch, gate_a_projection=gate_a_projection),
-        (
-            "可直接参考"
-            if terminal_class == SUPPORTED_ATTRIBUTION
-            else MEDIUM_TIER_DISCLAIMER
-        ),
-    ]
+    lines = [_dispatch_first_line(dispatch, gate_a_projection=gate_a_projection)]
     if gate_a_projection:
         # Gate A is an observation surface even when the legacy dispatch
         # envelope says abstain_no_hit.  Do not route it through the legacy
@@ -2562,6 +2555,11 @@ def render_public_rca_result(
             lines.append("观测事实：" + str(result["evidence"]))
         lines.append(str(result["conclusion"]))
         return "\n".join(_truncate_utf8(line, 1800) for line in lines)
+    lines.append(
+        "可直接参考"
+        if terminal_class == SUPPORTED_ATTRIBUTION
+        else MEDIUM_TIER_DISCLAIMER
+    )
     if (
         terminal_class == HONEST_NON_ATTRIBUTION
         and dispatch["reason"] in {"abstain_no_hit", "abstain_cross_domain"}

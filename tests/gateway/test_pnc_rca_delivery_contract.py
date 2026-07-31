@@ -413,6 +413,7 @@ def test_gate_a_observation_projection_suppresses_candidate_without_golden():
     assert verified.effect_payload["terminal_class"] == "honest_non_attribution"
     assert "建议责任方：" not in verified.conclusion
     assert "候选" not in verified.conclusion
+    assert MEDIUM_TIER_DISCLAIMER not in verified.conclusion
     assert "已观测到评测项 aeb_trigger 的支持证据" in verified.conclusion
     assert "信号 AEBReq" in verified.conclusion
     assert "窗口 0~1s" in verified.conclusion
@@ -450,6 +451,7 @@ def test_gate_a_render_keeps_observation_when_legacy_dispatch_has_no_hit():
     assert "窗口内未观测到 AEB 请求" not in rendered
     assert "现有证据不支持评测项 aeb_trigger" in rendered
     assert "未发现已知异常模式" not in rendered
+    assert MEDIUM_TIER_DISCLAIMER not in rendered
 
 
 def test_gate_a_l0_projection_does_not_claim_evaluator_observation():
