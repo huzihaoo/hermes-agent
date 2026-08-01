@@ -475,6 +475,11 @@ def test_gate_a_l0_projection_does_not_claim_evaluator_observation():
     assert "建议责任方：" not in verified.conclusion
     assert "已读取评测器观测事实" not in verified.conclusion
     assert "未找到对应事件" in verified.conclusion
+    assert verified.conclusion.splitlines() == [
+        "本单未能定向",
+        "观测事实：当前数据源未找到对应事件；本次未取得可用于归因的分析数据。",
+        "本次仅发布弃权事实，未输出责任归因。",
+    ]
     assert MEDIUM_TIER_DISCLAIMER not in verified.conclusion
 
 

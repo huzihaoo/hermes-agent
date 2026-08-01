@@ -2553,7 +2553,13 @@ def render_public_rca_result(
         result = build_public_rca_result(contract)
         if result.get("evidence"):
             lines.append("观测事实：" + str(result["evidence"]))
-        lines.append(str(result["conclusion"]))
+        projection = _gate_a_projection(contract)
+        if isinstance(projection, Mapping) and projection.get("level") == "L0_abstain":
+            # L0's fixed abstention message is both the observed boundary and
+            # the short conclusion; add a distinct close instead of repeating it.
+            lines.append("本次仅发布弃权事实，未输出责任归因。")
+        else:
+            lines.append(str(result["conclusion"]))
         return "\n".join(_truncate_utf8(line, 1800) for line in lines)
     lines.append(
         "可直接参考"
