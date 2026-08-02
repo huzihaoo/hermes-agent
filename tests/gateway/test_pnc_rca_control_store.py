@@ -1787,6 +1787,41 @@ def test_safe_off_epoch_claims_no_work_and_does_not_age_history(
     assert legacy_outbox["status"] == "pending"
 
 
+def test_historical_hold_accepts_retry_audit_without_active_lease(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    legacy = store.ingest_record(
+        _record(offset=10), policy=_policy(), submit_enabled=True
+    )
+    claimed = store.claim_outbox(
+        lease_owner="historical-retry-test",
+        activation_required=False,
+    )
+    assert claimed is not None
+    assert claimed.submission_key == legacy.submission_key
+
+    retried = store.retry_outbox(
+        outbox_id=claimed.outbox_id,
+        lease_token=claimed.lease_token,
+        error_code="production_admission_held",
+        delay_seconds=60,
+    )
+    assert retried.status == "pending"
+    [pending] = store.list_rows("rca_outbox")
+    assert pending["claimed_at"] is not None
+    assert pending["lease_token"] is None
+    assert pending["lease_owner"] is None
+    assert pending["lease_expires_at"] is None
+
+    _create_activation_epoch(store, preauthorize=False)
+    _create_activation_epoch(store)
+    evidence = store.activation_historical_outbox_hold_evidence(
+        epoch_id="rca-release-20260712"
+    )
+
+    assert evidence["sealed_count"] == evidence["current_count"] == 1
+    assert evidence["matches"] is True
+
+
 @pytest.mark.parametrize(
     ("mutation", "error"),
     [

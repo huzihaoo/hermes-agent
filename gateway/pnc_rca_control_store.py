@@ -4161,14 +4161,12 @@ class RcaControlStore:
                 raise ActivationEpochError(
                     "activation_historical_hold_outbox_status_invalid"
                 )
+            # A retry clears the active lease but intentionally preserves
+            # claimed_at as immutable audit history. Only live lease fields
+            # make a pending historical row unsafe to seal.
             if any(
                 row[field] is not None
-                for field in (
-                    "lease_token",
-                    "lease_owner",
-                    "lease_expires_at",
-                    "claimed_at",
-                )
+                for field in ("lease_token", "lease_owner", "lease_expires_at")
             ):
                 raise ActivationEpochError("activation_historical_hold_outbox_leased")
             topic = str(row["source_topic"] or "")
