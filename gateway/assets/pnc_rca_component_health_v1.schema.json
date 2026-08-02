@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pnc_rca_component_health_v1.schema.json",
+  "title": "PNC RCA component health envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "component",
+    "authority_sha256",
+    "observed_at",
+    "freshness_ttl_seconds",
+    "pid",
+    "started_at",
+    "executable",
+    "executable_sha256",
+    "process_health",
+    "dependency_health",
+    "readiness",
+    "side_effect_mode"
+  ],
+  "properties": {
+    "schema_version": {"const": "pnc_rca_component_health_v1"},
+    "component": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$"},
+    "authority_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "observed_at": {"type": "string", "format": "date-time"},
+    "freshness_ttl_seconds": {"type": "integer", "minimum": 1, "maximum": 3600},
+    "pid": {"type": ["integer", "null"], "minimum": 1},
+    "started_at": {"type": ["string", "null"], "format": "date-time"},
+    "executable": {"type": ["string", "null"], "pattern": "^/"},
+    "executable_sha256": {
+      "oneOf": [
+        {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        {"type": "null"}
+      ]
+    },
+    "process_health": {"$ref": "#/$defs/dimension"},
+    "dependency_health": {"$ref": "#/$defs/dimension"},
+    "readiness": {"$ref": "#/$defs/dimension"},
+    "side_effect_mode": {"enum": ["disabled", "shadow", "canary", "enabled"]}
+  },
+  "$defs": {
+    "dimension": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "evidence_sha256", "reason"],
+      "properties": {
+        "status": {"enum": ["pass", "fail", "not_measured", "not_applicable"]},
+        "evidence_sha256": {
+          "oneOf": [
+            {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            {"type": "null"}
+          ]
+        },
+        "reason": {"type": "string"}
+      }
+    }
+  }
+}
