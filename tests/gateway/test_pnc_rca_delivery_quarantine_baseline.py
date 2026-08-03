@@ -14,6 +14,7 @@ from gateway import pnc_rca_delivery_store as delivery_store_module
 from gateway.pnc_rca_delivery_quarantine_baseline import (
     APPROVAL_SCHEMA_VERSION,
     DeliveryQuarantineBaselineError,
+    _db_identity_matches_baseline,
     build_quarantine_core,
     build_quarantine_core_from_offline_clone,
     canonical_quarantine_baseline_bytes,
@@ -55,6 +56,38 @@ def _json_bytes(value) -> bytes:
         )
         + "\n"
     ).encode()
+
+
+def test_baseline_identity_allows_only_safe_off_epoch_binding() -> None:
+    def identity(activation_sha256: str) -> dict[str, str]:
+        body = {
+            "path": "/clone/control.sqlite3",
+            "control_schema_version": "pnc_rca_control_store_v13",
+            "delivery_schema_version": "pnc_rca_delivery_store_v11",
+            "activation_db_logical_identity_sha256": activation_sha256,
+        }
+        return {
+            **body,
+            "logical_identity_sha256": hashlib.sha256(
+                _json_bytes(body).removesuffix(b"\n")
+            ).hexdigest(),
+        }
+
+    baseline = identity("")
+    current = identity("a" * 64)
+
+    assert _db_identity_matches_baseline(baseline, baseline) is True
+    assert _db_identity_matches_baseline(baseline, current) is True
+    assert _db_identity_matches_baseline(current, baseline) is False
+    assert _db_identity_matches_baseline(current, identity("b" * 64)) is False
+    assert _db_identity_matches_baseline(
+        baseline,
+        {**current, "logical_identity_sha256": baseline["logical_identity_sha256"]},
+    ) is False
+    assert _db_identity_matches_baseline(
+        baseline,
+        {**current, "path": "/other/control.sqlite3"},
+    ) is False
 
 
 def _write(path: Path, value, *, mode: int = 0o600) -> str:

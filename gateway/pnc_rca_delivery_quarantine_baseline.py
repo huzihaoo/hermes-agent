@@ -437,6 +437,62 @@ def _db_identity(conn: sqlite3.Connection, db_path: str | Path) -> dict[str, Any
     }
 
 
+def _db_identity_matches_baseline(
+    baseline_identity: Mapping[str, Any],
+    current_identity: Mapping[str, Any],
+) -> bool:
+    """Compare immutable store identity while allowing safe-off epoch binding.
+
+    A quarantine baseline is issued before ``activation.create``.  That
+    mutation adds the current epoch's logical identity hash, so the baseline
+    necessarily has an empty activation binding while the live snapshot has a
+    valid one.  The data/schema/path portions remain exact; the reverse
+    transition or a different non-empty epoch hash is rejected.
+    """
+    if (
+        set(baseline_identity) != _DB_IDENTITY_FIELDS
+        or set(current_identity) != _DB_IDENTITY_FIELDS
+    ):
+        return False
+    immutable_fields = _DB_IDENTITY_FIELDS - {
+        "activation_db_logical_identity_sha256",
+        "logical_identity_sha256",
+    }
+    for field in immutable_fields:
+        if baseline_identity.get(field) != current_identity.get(field):
+            return False
+
+    def verified_activation(identity: Mapping[str, Any]) -> str | None:
+        activation = identity.get("activation_db_logical_identity_sha256")
+        if not isinstance(activation, str):
+            return None
+        if activation and _HEX64_RE.fullmatch(activation) is None:
+            return None
+        body = {
+            "path": identity.get("path"),
+            "control_schema_version": identity.get("control_schema_version"),
+            "delivery_schema_version": identity.get("delivery_schema_version"),
+            "activation_db_logical_identity_sha256": activation,
+        }
+        logical_identity = identity.get("logical_identity_sha256")
+        expected = hashlib.sha256(_canonical_bytes(body)).hexdigest()
+        if (
+            not isinstance(logical_identity, str)
+            or _HEX64_RE.fullmatch(logical_identity) is None
+            or logical_identity != expected
+        ):
+            return None
+        return activation
+
+    baseline_activation = verified_activation(baseline_identity)
+    current_activation = verified_activation(current_identity)
+    if baseline_activation is None or current_activation is None:
+        return False
+    if baseline_activation == current_activation:
+        return True
+    return baseline_activation == "" and bool(current_activation)
+
+
 def _row_set_digest(
     conn: sqlite3.Connection, *, table: str, primary_key: str
 ) -> tuple[int, str]:
@@ -1230,10 +1286,8 @@ def _validate_core(
     )
     current_db_identity = _db_identity(conn, target_db_path)
     db_identity = value.get("control_db")
-    if (
-        not isinstance(db_identity, Mapping)
-        or set(db_identity) != _DB_IDENTITY_FIELDS
-        or dict(db_identity) != current_db_identity
+    if not isinstance(db_identity, Mapping) or not _db_identity_matches_baseline(
+        db_identity, current_db_identity
     ):
         raise DeliveryQuarantineBaselineError(
             "delivery_quarantine_baseline_db_identity_mismatch"
