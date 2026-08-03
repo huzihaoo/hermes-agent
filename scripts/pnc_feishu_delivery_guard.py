@@ -184,6 +184,32 @@ def repair_config(config_path: Path = DEFAULT_CONFIG, *, backup: bool = True) ->
         extra["api_poll_chat_ids"] = repaired_api_poll
         changed.append("platforms.feishu.extra.api_poll_chat_ids")
 
+    business_lines = config.setdefault("business_lines", {})
+    if not isinstance(business_lines, dict):
+        business_lines = {}
+        config["business_lines"] = business_lines
+        changed.append("business_lines")
+    integration_tools = business_lines.setdefault("integration_tools", {})
+    if not isinstance(integration_tools, dict):
+        integration_tools = {}
+        business_lines["integration_tools"] = integration_tools
+        changed.append("business_lines.integration_tools")
+    intake_values: list[str] = []
+    for key in (
+        "intake_chat_ids",
+        "intake_chat_id",
+        "intake_group_ids",
+        "intake_group_id",
+    ):
+        intake_values.extend(_as_list(integration_tools.get(key)))
+    desired_intake = [
+        group.chat_id for group in BUSINESS_GROUPS if group.config_only_intake
+    ]
+    repaired_intake = _dedupe_preserve_order(intake_values, desired_intake)
+    if _as_list(integration_tools.get("intake_chat_ids")) != repaired_intake:
+        integration_tools["intake_chat_ids"] = repaired_intake
+        changed.append("business_lines.integration_tools.intake_chat_ids")
+
     backup_path = None
     if changed:
         if backup and config_path.exists():

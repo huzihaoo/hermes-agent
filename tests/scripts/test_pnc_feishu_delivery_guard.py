@@ -151,3 +151,58 @@ def test_guard_fails_when_config_only_intake_membership_is_missing(tmp_path):
         "missing from integration-tools intake config" in item
         for item in result["errors"]
     )
+
+
+def test_repair_materializes_complete_contract_and_is_idempotent(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {"provider": "test-provider"},
+                "business_lines": {
+                    "integration_tools": {"intake_group_id": PNC}
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    first = guard.repair_config(path, backup=False)
+    first_raw = path.read_bytes()
+    repaired = yaml.safe_load(first_raw)
+
+    assert first["ok"] is True
+    assert first["repaired"] is True
+    assert first["backup_path"] is None
+    assert repaired["model"] == {"provider": "test-provider"}
+    assert repaired["business_lines"]["integration_tools"]["intake_group_id"] == PNC
+    assert repaired["business_lines"]["integration_tools"]["intake_chat_ids"] == [
+        INTEGRATION_TOOLS,
+        PNC,
+    ]
+    assert repaired["platforms"]["feishu"]["extra"]["group_allowed_chats"] == [
+        PNC,
+        G1Q3,
+        INTEGRATION_TOOLS,
+    ]
+
+    second = guard.repair_config(path, backup=False)
+
+    assert second["ok"] is True
+    assert second["repaired"] is False
+    assert second["changed_keys"] == []
+    assert path.read_bytes() == first_raw
+
+
+def test_repair_adds_config_only_intake_to_minimal_config(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text("{}\n", encoding="utf-8")
+
+    result = guard.repair_config(path, backup=False)
+    repaired = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+    assert result["ok"] is True
+    assert repaired["business_lines"]["integration_tools"]["intake_chat_ids"] == [
+        INTEGRATION_TOOLS
+    ]
