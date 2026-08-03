@@ -63,6 +63,9 @@ def test_snapshot_receipt_binds_current_combined_schema_without_source_write(
     assert after_identity == before_identity
     assert produced["receipt"].stat().st_mode & 0o777 == 0o600
     assert produced["snapshot"].stat().st_mode & 0o777 == 0o600
+    assert produced["value"]["snapshot_database"]["journal_mode"] == "delete"
+    assert not Path(f"{produced['snapshot']}-wal").exists()
+    assert not Path(f"{produced['snapshot']}-shm").exists()
     assert produced["value"]["assertions"] == {
         "foreign_keys_ok": True,
         "quick_check_ok": True,
@@ -77,6 +80,8 @@ def test_snapshot_receipt_binds_current_combined_schema_without_source_write(
     assert verified["receipt_raw_sha256"] == produced["result"][
         "receipt_raw_sha256"
     ]
+    assert not Path(f"{produced['snapshot']}-wal").exists()
+    assert not Path(f"{produced['snapshot']}-shm").exists()
 
 
 def test_schema_fingerprint_is_deterministic_and_ignores_row_content(

@@ -227,6 +227,9 @@ def _database_observation(path: Path) -> dict[str, Any]:
             ),
             "page_size": int(connection.execute("PRAGMA page_size").fetchone()[0]),
             "page_count": int(connection.execute("PRAGMA page_count").fetchone()[0]),
+            "journal_mode": str(
+                connection.execute("PRAGMA journal_mode").fetchone()[0]
+            ).lower(),
             "quick_check": str(quick[0]) if quick else "missing",
             "foreign_key_violation_count": len(violations),
             "foreign_key_violations_truncated": len(violations) > 100,
@@ -341,6 +344,16 @@ def create_snapshot_receipt(
             source_connection.execute("PRAGMA query_only=ON")
             source_connection.backup(destination_connection, pages=1024, sleep=0.01)
             destination_connection.commit()
+            # The source is WAL-backed. Seal the task-owned snapshot as a
+            # standalone file so later read-only verification cannot create
+            # mutable -wal/-shm sidecars beside immutable evidence.
+            journal_mode = destination_connection.execute(
+                "PRAGMA journal_mode=DELETE"
+            ).fetchone()
+            if journal_mode is None or str(journal_mode[0]).lower() != "delete":
+                raise SchemaFingerprintError(
+                    "rca_schema_fingerprint_snapshot_journal_mode_invalid"
+                )
         finally:
             destination_connection.close()
             source_connection.close()
@@ -377,6 +390,7 @@ def create_snapshot_receipt(
                 "raw_sha256": file_sha256(snapshot),
                 "page_size": snapshot_observation["page_size"],
                 "page_count": snapshot_observation["page_count"],
+                "journal_mode": snapshot_observation["journal_mode"],
                 "quick_check": snapshot_observation["quick_check"],
                 "foreign_key_violation_count": snapshot_observation[
                     "foreign_key_violation_count"
@@ -701,6 +715,7 @@ def verify_snapshot_receipt(receipt_path: Path) -> dict[str, Any]:
             "raw_sha256",
             "page_size",
             "page_count",
+            "journal_mode",
             "quick_check",
             "foreign_key_violation_count",
             "schema_version_counter",
@@ -729,6 +744,8 @@ def verify_snapshot_receipt(receipt_path: Path) -> dict[str, Any]:
         or live["schema_material"] != material
         or live["page_size"] != snapshot.get("page_size")
         or live["page_count"] != snapshot.get("page_count")
+        or live["journal_mode"] != snapshot.get("journal_mode")
+        or live["journal_mode"] != "delete"
         or live["quick_check"] != snapshot.get("quick_check")
         or live["foreign_key_violation_count"]
         != snapshot.get("foreign_key_violation_count")
