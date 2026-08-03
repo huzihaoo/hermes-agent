@@ -277,6 +277,8 @@ def _active_release_binding_body(
     return {
         "schema_version": bootstrap.ACTIVE_RELEASE_BINDING_SCHEMA_VERSION,
         "release_id": "release-approval-20260713",
+        "authority_sha256": "34" * 32,
+        "authority_epoch_id": "rca-authority-test-epoch",
         "complete": True,
         "live_write_performed": False,
         "bindings": {
@@ -329,6 +331,8 @@ def test_active_release_binding_pins_live_env_release_and_authorization(tmp_path
 
     assert result["binding_receipt_sha256"] == hashlib.sha256(raw).hexdigest()
     assert result["authorization_receipt_sha256"] == "ef" * 32
+    assert result["authority_sha256"] == "34" * 32
+    assert result["authority_epoch_id"] == "rca-authority-test-epoch"
     assert result["candidate_env_sha256"] == hashlib.sha256(
         live_env.read_bytes()
     ).hexdigest()

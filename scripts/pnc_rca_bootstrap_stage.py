@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from gateway import pnc_rca_prod_bootstrap as bootstrap
+from gateway import pnc_rca_release_authority as release_authority
 
 
 SCHEMA_VERSION = "pnc_rca_bootstrap_stage_receipt_v1"
@@ -264,6 +265,7 @@ def _prepare_stage(
     paths: StagePaths,
     host_source: Path,
     host_seal_path: Path,
+    authority_path: Path,
     owner_authorization_path: Path,
     resource_snapshot_path: Path,
     release_id: str,
@@ -282,6 +284,27 @@ def _prepare_stage(
         raise BootstrapStageError("rca_bootstrap_stage_deadline_invalid")
     live_env_raw = _read_regular(paths.live_env, "rca_bootstrap_stage_live_env_invalid", required_mode=0o600)
     host_seal_raw, host_seal = _read_json(host_seal_path, "rca_bootstrap_stage_host_seal_invalid")
+    authority_raw, authority = _read_json(
+        authority_path,
+        "rca_bootstrap_stage_release_authority_invalid",
+        required_mode=0o600,
+    )
+    try:
+        release_authority.validate_release_authority(authority)
+    except release_authority.ReleaseAuthorityError as exc:
+        raise BootstrapStageError(
+            "rca_bootstrap_stage_release_authority_invalid"
+        ) from exc
+    host_face = authority.get("faces", {}).get("host_runtime", {})
+    authority_sha256 = release_authority.canonical_json_sha256(authority)
+    authority_epoch_id = str(authority.get("authority_epoch_id") or "")
+    if (
+        authority.get("status") != "approved_for_activation"
+        or authority.get("release_id") != release_id
+        or host_face.get("commit") != _git_value(host_source, "HEAD")
+        or host_face.get("tree") != _git_value(host_source, "HEAD^{tree}")
+    ):
+        raise BootstrapStageError("rca_bootstrap_stage_release_authority_invalid")
     approval_raw, approval = _read_json(owner_authorization_path, "rca_bootstrap_stage_owner_authorization_invalid")
     snapshot_raw, snapshot = _read_json(resource_snapshot_path, "rca_bootstrap_stage_resource_snapshot_invalid")
     _validate_host_seal(host_seal, host_source=host_source, release_id=release_id)
@@ -317,6 +340,8 @@ def _prepare_stage(
     binding = {
         "schema_version": bootstrap.ACTIVE_RELEASE_BINDING_SCHEMA_VERSION,
         "release_id": release_id,
+        "authority_sha256": authority_sha256,
+        "authority_epoch_id": authority_epoch_id,
         "complete": True,
         "live_write_performed": False,
         "bindings": {
@@ -353,6 +378,9 @@ def _prepare_stage(
         "release_bom_sha256": release_bom_sha256,
         "approval_sha256": approval_sha256,
         "host_seal_sha256": _sha256(host_seal_raw),
+        "authority_sha256": authority_sha256,
+        "authority_epoch_id": authority_epoch_id,
+        "authority_raw_sha256": _sha256(authority_raw),
         "resource_snapshot_sha256": _sha256(snapshot_raw),
         "authorization": validated_auth,
     }
@@ -392,6 +420,7 @@ def stage_bootstrap(
     paths: StagePaths,
     host_source: Path,
     host_seal_path: Path,
+    authority_path: Path,
     owner_authorization_path: Path,
     resource_snapshot_path: Path,
     release_id: str,
@@ -411,6 +440,9 @@ def stage_bootstrap(
         paths=paths,
         host_source=_absolute(host_source, "rca_bootstrap_stage_host_source_invalid"),
         host_seal_path=_absolute(host_seal_path, "rca_bootstrap_stage_host_seal_invalid"),
+        authority_path=_absolute(
+            authority_path, "rca_bootstrap_stage_release_authority_invalid"
+        ),
         owner_authorization_path=_absolute(owner_authorization_path, "rca_bootstrap_stage_owner_authorization_invalid"),
         resource_snapshot_path=_absolute(resource_snapshot_path, "rca_bootstrap_stage_resource_snapshot_invalid"),
         release_id=release_id,
@@ -429,6 +461,9 @@ def stage_bootstrap(
         "release_bom_sha256": prepared["release_bom_sha256"],
         "owner_authorization_sha256": prepared["approval_sha256"],
         "host_seal_sha256": prepared["host_seal_sha256"],
+        "authority_sha256": prepared["authority_sha256"],
+        "authority_epoch_id": prepared["authority_epoch_id"],
+        "authority_raw_sha256": prepared["authority_raw_sha256"],
         "resource_snapshot_sha256": prepared["resource_snapshot_sha256"],
         "authorization": {
             "receipt_fingerprint": prepared["authorization"]["receipt_fingerprint"],
@@ -479,6 +514,8 @@ def stage_bootstrap(
             live_env_path=paths.live_env,
             expected_release_id=release_id,
             expected_epoch_id=bootstrap_epoch_id,
+            expected_authority_sha256=prepared["authority_sha256"],
+            expected_authority_epoch_id=prepared["authority_epoch_id"],
         )
         authorization = bootstrap.load_bootstrap_authorization(
             now=current,
@@ -508,6 +545,7 @@ def _arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host-source", type=Path, required=True)
     parser.add_argument("--host-seal", type=Path, required=True)
+    parser.add_argument("--authority", type=Path, required=True)
     parser.add_argument("--owner-authorization", type=Path, required=True)
     parser.add_argument("--resource-snapshot", type=Path, required=True)
     parser.add_argument("--release-id", required=True)
@@ -537,6 +575,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             host_source=args.host_source,
             host_seal_path=args.host_seal,
+            authority_path=args.authority,
             owner_authorization_path=args.owner_authorization,
             resource_snapshot_path=args.resource_snapshot,
             release_id=args.release_id,

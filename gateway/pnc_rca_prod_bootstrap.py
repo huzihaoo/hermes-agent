@@ -28,14 +28,26 @@ DELIVERY_PER_TASK_BYTES = 128 * 1024**3
 DELIVERY_REQUIRED_AVAILABLE_BYTES = 640 * 1024**3
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 EPOCH_ID_RE = re.compile(r"^rca-bootstrap-[A-Za-z0-9._-]{1,96}$")
+AUTHORITY_EPOCH_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 BOOTSTRAP_AUTHORIZATION_PATH = (
     Path.home() / ".ssh-mini" / "rca-bootstrap-capacity-authorization.json"
 )
 MAX_AUTHORIZATION_FILE_BYTES = 64 * 1024
 ACTIVE_RELEASE_BINDING_NAME = "active-release-binding.json"
-ACTIVE_RELEASE_BINDING_SCHEMA_VERSION = "pnc_rca_production_env_stage_receipt_v1"
+ACTIVE_RELEASE_BINDING_SCHEMA_VERSION = "pnc_rca_production_env_stage_receipt_v2"
 MAX_ACTIVE_RELEASE_BINDING_BYTES = 256 * 1024
 MAX_LIVE_ENV_BYTES = 1024 * 1024
+ACTIVE_RELEASE_BINDING_FIELDS = {
+    "schema_version",
+    "release_id",
+    "authority_sha256",
+    "authority_epoch_id",
+    "complete",
+    "live_write_performed",
+    "bindings",
+    "policy",
+    "side_effect_contract",
+}
 
 AUTHORIZATION_FIELDS = {
     "schema_version",
@@ -493,6 +505,8 @@ def load_active_release_binding(
     live_env_path: Path,
     expected_release_id: str,
     expected_epoch_id: str,
+    expected_authority_sha256: str | None = None,
+    expected_authority_epoch_id: str | None = None,
     verify_live_env: bool = True,
 ) -> dict[str, Any]:
     """Validate the post-BOM receipt installed beside the active RCA store."""
@@ -508,6 +522,8 @@ def load_active_release_binding(
         maximum=MAX_ACTIVE_RELEASE_BINDING_BYTES,
     )
     body = _strict_bound_json(raw, artifact="rca_active_release_binding")
+    if set(body) != ACTIVE_RELEASE_BINDING_FIELDS:
+        raise RcaBootstrapAuthorizationError("rca_active_release_binding_invalid")
     bindings = body.get("bindings")
     policy = body.get("policy")
     side_effect = body.get("side_effect_contract")
@@ -521,9 +537,27 @@ def load_active_release_binding(
         if isinstance(bindings, Mapping)
         else None
     )
+    authority_sha256 = _hex(
+        body.get("authority_sha256"),
+        "rca_active_release_binding_authority_invalid",
+    )
+    authority_epoch_id = str(body.get("authority_epoch_id") or "").strip()
     if (
         body.get("schema_version") != ACTIVE_RELEASE_BINDING_SCHEMA_VERSION
         or body.get("release_id") != expected_release_id
+        or AUTHORITY_EPOCH_ID_RE.fullmatch(authority_epoch_id) is None
+        or (
+            expected_authority_sha256 is not None
+            and authority_sha256
+            != _hex(
+                expected_authority_sha256,
+                "rca_active_release_binding_authority_invalid",
+            )
+        )
+        or (
+            expected_authority_epoch_id is not None
+            and authority_epoch_id != expected_authority_epoch_id
+        )
         or body.get("complete") is not True
         or body.get("live_write_performed") is not False
         or not isinstance(side_effect, Mapping)
@@ -599,6 +633,8 @@ def load_active_release_binding(
         "binding_ready": True,
         "binding_receipt_sha256": raw_sha256,
         "release_id": expected_release_id,
+        "authority_sha256": authority_sha256,
+        "authority_epoch_id": authority_epoch_id,
         "bootstrap_epoch_id": expected_epoch_id,
         "release_bom_sha256": release_bom_sha256,
         "approval_evidence_sha256": approval_evidence_sha256,

@@ -18,8 +18,6 @@
     <string>/Users/songying</string>
     <key>HERMES_HOME</key>
     <string>/Users/songying/.hermes</string>
-    <key>HERMES_RCA_DELIVERY_QUARANTINE_BASELINE_SHA256</key>
-    <string>04db01355ab86ed1b739c00cc3f530ddef832f42df8b12772fb9e67e2ecf1ac2</string>
     <key>PATH</key>
     <string>/Users/songying/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>PNC_FOXGLOVE_RENDER_HOST</key>

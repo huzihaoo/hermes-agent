@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from gateway import pnc_rca_prod_bootstrap as bootstrap
+from gateway import pnc_rca_release_authority as release_authority
 from scripts import pnc_rca_bootstrap_stage as stage
 
 
@@ -52,7 +53,9 @@ def _paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> stage.StagePaths:
     )
 
 
-def _inputs(tmp_path: Path, host_source: Path, *, resource_ok: bool = True) -> tuple[Path, Path, Path]:
+def _inputs(
+    tmp_path: Path, host_source: Path, *, resource_ok: bool = True
+) -> tuple[Path, Path, Path, Path]:
     seal = tmp_path / "host-seal.json"
     _write_json(
         seal,
@@ -65,6 +68,64 @@ def _inputs(tmp_path: Path, host_source: Path, *, resource_ok: bool = True) -> t
                 "worktree": str(host_source),
                 "commit": _git(host_source, "HEAD"),
                 "tree": _git(host_source, "HEAD^{tree}"),
+            },
+        },
+    )
+    authority = tmp_path / "authority.json"
+    measured_sha = "3" * 64
+    host_face = {
+        "commit": _git(host_source, "HEAD"),
+        "tree": _git(host_source, "HEAD^{tree}"),
+        "root": "/srv/rca/host",
+    }
+    _write_json(
+        authority,
+        {
+            "schema_version": release_authority.AUTHORITY_SCHEMA_VERSION,
+            "release_id": RELEASE_ID,
+            "authority_epoch_id": "rca-authority-bootstrap-stage-test",
+            "created_at": NOW.isoformat(),
+            "status": "approved_for_activation",
+            "supersedes_authority_sha256": None,
+            "faces": {
+                "host_runtime": host_face,
+                "vm_worker_state": {**host_face, "root": "/srv/rca/worker"},
+                "g1q3_rca_pipeline": {**host_face, "root": "/srv/rca/pipeline"},
+                "mcap_data_translate": {
+                    **host_face,
+                    "root": "/srv/rca/mcap",
+                    "contract_sha256": measured_sha,
+                },
+            },
+            "control_store": {
+                "schema_version": "pnc_rca_control_store_v13",
+                "database_instance_id": "device1-inode1",
+                "schema_fingerprint_sha256": measured_sha,
+                "backup_receipt_sha256": measured_sha,
+                "not_measured_reason": "",
+            },
+            "quarantine_baseline": {
+                "state": "ready",
+                "required": True,
+                "schema_version": "pnc_rca_delivery_quarantine_baseline_v1",
+                "baseline_sha256": measured_sha,
+                "not_measured_reason": "",
+            },
+            "side_effect_policy": {
+                "mode": "disabled",
+                "single_active_writer": True,
+                "allow_historical_requeue": False,
+                "allowed_effect_kinds": ["feishu_issue_comment"],
+            },
+            "report_publication": {
+                "canonical_base_url": "http://192.168.26.174:18081",
+                "root": "/mnt/tmp",
+                "manifest_schema_version": "pnc_rca_report_manifest_v1",
+            },
+            "feishu_capability": {
+                "required_surfaces": ["issue_comment"],
+                "capability_profile_sha256": measured_sha,
+                "not_measured_reason": "",
             },
         },
     )
@@ -90,17 +151,18 @@ def _inputs(tmp_path: Path, host_source: Path, *, resource_ok: bool = True) -> t
             },
         },
     )
-    return seal, approval, snapshot
+    return seal, authority, approval, snapshot
 
 
 def _stage_args(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     paths = _paths(tmp_path, monkeypatch)
     host_source = Path(__file__).resolve().parents[2]
-    seal, approval, snapshot = _inputs(tmp_path, host_source)
+    seal, authority, approval, snapshot = _inputs(tmp_path, host_source)
     return {
         "paths": paths,
         "host_source": host_source,
         "host_seal_path": seal,
+        "authority_path": authority,
         "owner_authorization_path": approval,
         "resource_snapshot_path": snapshot,
         "release_id": RELEASE_ID,
@@ -134,6 +196,8 @@ def test_stage_apply_installs_a_release_bound_bootstrap_authority(tmp_path, monk
         live_env_path=args["paths"].live_env,
         expected_release_id=RELEASE_ID,
         expected_epoch_id=EPOCH_ID,
+        expected_authority_sha256=result["authority_sha256"],
+        expected_authority_epoch_id=result["authority_epoch_id"],
     )
     authority = bootstrap.load_bootstrap_authorization(
         now=NOW,
@@ -143,6 +207,8 @@ def test_stage_apply_installs_a_release_bound_bootstrap_authority(tmp_path, monk
         expected_approval_evidence_sha256=result["owner_authorization_sha256"],
     )
     assert binding["authorization_receipt_sha256"] == authority["authorization_receipt_sha256"]
+    assert binding["authority_sha256"] == result["authority_sha256"]
+    assert binding["authority_epoch_id"] == result["authority_epoch_id"]
     assert result["readback"]["active_release_binding_sha256"] == hashlib.sha256(
         args["paths"].active_binding.read_bytes()
     ).hexdigest()
@@ -150,7 +216,9 @@ def test_stage_apply_installs_a_release_bound_bootstrap_authority(tmp_path, monk
 
 def test_stage_rejects_unready_resource_without_writes(tmp_path, monkeypatch):
     args = _stage_args(tmp_path, monkeypatch)
-    _seal, _approval, snapshot = _inputs(tmp_path, args["host_source"], resource_ok=False)
+    _seal, _authority, _approval, snapshot = _inputs(
+        tmp_path, args["host_source"], resource_ok=False
+    )
     args["resource_snapshot_path"] = snapshot
     before = args["paths"].live_env.read_bytes()
 

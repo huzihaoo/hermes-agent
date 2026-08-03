@@ -1733,8 +1733,10 @@ def _build_bundle(root: Path) -> dict:
     _write(
         active_release_binding_path,
         {
-            "schema_version": "pnc_rca_production_env_stage_receipt_v1",
+            "schema_version": "pnc_rca_production_env_stage_receipt_v2",
             "release_id": core["release_id"],
+            "authority_sha256": "9" * 64,
+            "authority_epoch_id": "rca-authority-baseline-test",
             "complete": True,
             "live_write_performed": False,
             "bindings": {
