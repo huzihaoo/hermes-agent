@@ -17,6 +17,8 @@ import tempfile
 from typing import Any, Mapping, Sequence
 import uuid
 
+import yaml
+
 from gateway import pnc_rca_prod_bootstrap as bootstrap
 from gateway import pnc_rca_release_authority as authority
 
@@ -48,6 +50,7 @@ TARGET_MODE = {
     "authority": 0o400,
     "pointer": 0o600,
     "manifest": 0o600,
+    "config": 0o600,
     "binding": 0o600,
     "env": 0o600,
     "bootstrap_authorization": 0o600,
@@ -420,6 +423,7 @@ def _candidate_paths(candidate_root: Path) -> dict[str, Path]:
         "authority": candidate_root / "authority.json",
         "pointer": candidate_root / "ACTIVE_RCA_RELEASE.json",
         "manifest": candidate_root / "LIVE_MANIFEST.json",
+        "config": candidate_root / "config.yaml",
         "binding": candidate_root / "active-release-binding.json",
         "env": candidate_root / "candidate.env",
         "bootstrap_authorization": candidate_root / "bootstrap-authorization.json",
@@ -487,6 +491,28 @@ def build_plan(
         paths["manifest"], code="pnc_release_transaction_manifest_invalid", required_mode=0o600
     )
     manifest = _json(manifest_raw, code="pnc_release_transaction_manifest_invalid")
+    config_raw, config_observation = _read_file(
+        paths["config"], code="pnc_release_transaction_config_invalid", required_mode=0o600
+    )
+    try:
+        config_value = yaml.safe_load(config_raw.decode("utf-8"))
+        config_semantic = _sha(
+            json.dumps(
+                config_value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+    except (UnicodeDecodeError, yaml.YAMLError, TypeError, ValueError) as exc:
+        raise ReleaseTransactionError("pnc_release_transaction_config_invalid") from exc
+    config_target = hermes_home / "config.yaml"
+    if (
+        manifest.get("config_path") != str(config_target)
+        or manifest.get("config_sha256") != config_observation["sha256"]
+        or manifest.get("config_semantic_sha256") != config_semantic
+    ):
+        raise ReleaseTransactionError("pnc_release_transaction_config_invalid")
     env_raw, env_observation = _read_file(
         paths["env"], code="pnc_release_transaction_env_invalid", required_mode=0o600
     )
@@ -576,6 +602,13 @@ def build_plan(
             hermes_home / "runtime" / "LIVE_MANIFEST.json",
             TARGET_MODE["manifest"],
             "manifest",
+        ),
+        (
+            "config",
+            paths["config"],
+            config_target,
+            TARGET_MODE["config"],
+            "config",
         ),
         ("binding", paths["binding"], binding_target, TARGET_MODE["binding"], "binding"),
         ("env", paths["env"], env_target, TARGET_MODE["env"], "env"),

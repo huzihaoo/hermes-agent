@@ -9,6 +9,7 @@ import plistlib
 import subprocess
 
 import pytest
+import yaml
 
 from gateway import pnc_rca_prod_bootstrap as bootstrap
 from gateway import pnc_rca_release_authority as authority
@@ -151,11 +152,36 @@ def _fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
     ).encode()
     env_sha = hashlib.sha256(env).hexdigest()
     _write(candidate_root / "candidate.env", env)
+    config = {
+        "model": {"provider": "test-provider"},
+        "platforms": {
+            "feishu": {
+                "extra": {
+                    "default_group_policy": "disabled",
+                    "group_allowed_chats": ["oc_test"],
+                }
+            }
+        },
+    }
+    config_raw = yaml.safe_dump(config, sort_keys=False).encode("utf-8")
+    config_sha = hashlib.sha256(config_raw).hexdigest()
+    config_semantic_sha = hashlib.sha256(
+        json.dumps(
+            config,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    _write(candidate_root / "config.yaml", config_raw)
     manifest_faces = value["faces"]
     manifest = {
         "schema_version": 1,
         "runtime_root": str(host_root),
         "env_sha256": env_sha,
+        "config_path": str(hermes_home / "config.yaml"),
+        "config_sha256": config_sha,
+        "config_semantic_sha256": config_semantic_sha,
         "rca_release_authority": {
             "release_id": RELEASE_ID,
             "authority_sha256": authority_sha,
@@ -249,6 +275,7 @@ def _fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
 def _seed_old_targets(args: dict) -> None:
     targets = {
         args["hermes_home"] / "runtime/LIVE_MANIFEST.json": b"old-manifest\n",
+        args["hermes_home"] / "config.yaml": b"old-config\n",
         args["state_root"] / "active-release-binding.json": b"old-binding\n",
         args["hermes_home"] / ".env": b"old-env\n",
         bootstrap.BOOTSTRAP_AUTHORIZATION_PATH: b"old-auth\n",
@@ -285,6 +312,9 @@ def test_release_transaction_plan_apply_and_explicit_rollback(tmp_path, monkeypa
     ).read_bytes()
     assert (args["hermes_home"] / ".env").read_bytes() == (
         args["candidate_root"] / "candidate.env"
+    ).read_bytes()
+    assert (args["hermes_home"] / "config.yaml").read_bytes() == (
+        args["candidate_root"] / "config.yaml"
     ).read_bytes()
     assert (args["state_root"] / "ACTIVE_RCA_RELEASE.json").exists()
     assert (args["evidence"] / "r11-test-transaction/receipt.json").exists()
@@ -343,5 +373,19 @@ def test_release_transaction_rejects_release_pinned_or_non_source_plist(
     _write(dispatcher, mutated)
     with pytest.raises(
         transaction.ReleaseTransactionError, match="plist_source_mismatch"
+    ):
+        _build(args, monkeypatch)
+
+
+def test_release_transaction_rejects_config_not_bound_by_manifest(
+    tmp_path, monkeypatch
+):
+    args = _fixture(tmp_path, monkeypatch)
+    config_path = args["candidate_root"] / "config.yaml"
+    config_path.write_text("model:\n  provider: changed\n", encoding="utf-8")
+    config_path.chmod(0o600)
+
+    with pytest.raises(
+        transaction.ReleaseTransactionError, match="transaction_config_invalid"
     ):
         _build(args, monkeypatch)
