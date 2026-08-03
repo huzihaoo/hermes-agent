@@ -28,7 +28,10 @@ SOURCE_NAMES = (
     "hermes-worktree-hygiene",
     "hermes.current",
 )
-RETIRED_NAMES = ("hermes-g1q3-e2e-smoke",)
+RETIRED_NAMES = (
+    "hermes-g1q3-e2e-smoke",
+    "hermes-live",
+)
 PLAN_SCHEMA_VERSION = "pnc_wrapper_transaction_plan_v1"
 RECEIPT_SCHEMA_VERSION = "pnc_wrapper_transaction_receipt_v1"
 ROLLBACK_RECEIPT_SCHEMA_VERSION = "pnc_wrapper_rollback_receipt_v1"

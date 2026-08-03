@@ -6,15 +6,15 @@
     "real_negative",
     "synthetic_boundary"
   ],
-  "pipeline_commit": "1158a49140bd4459d5fbff4ca91cdea9875cd8b1",
-  "pipeline_tree": "0cc6f8db18b9af8e60657cb662726113c4231fd7",
+  "pipeline_commit": "cb86051ac7b4cb89f4f494709bd3ff54de9a930f",
+  "pipeline_tree": "0fbec98d02173800c75897dcdc239a3ba5662b41",
   "low_tier_suite": {
     "status": "passed",
     "positive_case_count": 1,
     "negative_case_count": 4,
-    "receipt_sha256": "612cd2d8b69a946b29398fb5f76b317ce9f34d37da65e6ab1c6bbbac385d14f9",
-    "vm_path": "/mnt/tmp/20260725-rca-ga-phasea-pipeline/final-golden-run-v2/stdout.log",
-    "user_visible_path": "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/20260725-rca-ga-phasea-pipeline/"
+    "receipt_sha256": "85a23c8c6edea78a81bf24cc6d1ffdea2109af0fbe2c32f22b35b952f27eb455",
+    "vm_path": "/mnt/tmp/rca-r11-r4-pipeline-final-validation-20260803/pytest.stdout",
+    "user_visible_path": "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/rca-r11-r4-pipeline-final-validation-20260803/"
   },
   "golden_scope_evaluator_ids": [],
   "evaluators": []

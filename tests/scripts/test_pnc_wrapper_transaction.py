@@ -65,6 +65,13 @@ def _plan(case: dict[str, Any], transaction_id: str) -> tuple[dict, Path]:
     )
 
 
+def test_retired_inventory_matches_release_freshness_contract() -> None:
+    assert wrappers.RETIRED_NAMES == (
+        "hermes-g1q3-e2e-smoke",
+        "hermes-live",
+    )
+
+
 def test_plan_is_owner_only_and_non_mutating(wrapper_case: dict[str, Any]) -> None:
     plan, path = _plan(wrapper_case, "plan-only")
 
