@@ -22,8 +22,8 @@
     "local.pnc.release-fingerprint-check": {
       "target_kind": "governance_tool",
       "relative_path": "hermes_release_fingerprint_check.py",
-      "sha256": "45730a9f5ea00508bd6302c315a9374eb4211b1323ab4dd398a6f5115407f0de",
-      "size": 52259
+      "sha256": "6ad1df2aeb40e9f8580480568bd7fd1ced280d47abcdc4194305aec3d7032a8b",
+      "size": 53038
     },
     "local.pnc.safe-worktree-remove": {
       "target_kind": "governance_tool",
