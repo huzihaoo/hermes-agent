@@ -9,7 +9,8 @@
     <string>/usr/bin/python3</string>
     <string>/Users/songying/.hermes/runtime/governance-tools/pnc_live_exec.py</string>
     <string>local.pnc.completion-notice-relay</string>
-    <string>--send</string>
+    <string>--task-id</string>
+    <string>rca-r11-safe-off-no-task</string>
     <string>--watch</string>
     <string>--limit</string>
     <string>50</string>

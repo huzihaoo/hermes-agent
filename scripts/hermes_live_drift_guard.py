@@ -132,16 +132,37 @@ def _validate_pnc_launchd_timer(label: str, expected_script_name: str) -> dict[s
     if expected_script_name == "pnc_vm_task_sync.py" and "--include-terminal" not in raw:
         errors.append(f"{label} must include --include-terminal so completed VM tasks keep syncing")
     if expected_script_name == "pnc_completion_notice_relay.py":
-        if "--send" not in raw:
-            errors.append(f"{label} must include --send so pending completion notices are relayed")
+        persisted_arguments = arguments if isinstance(arguments, list) else []
+        safe_off_task_id = "rca-r11-safe-off-no-task"
+        safe_off_persisted = any(
+            persisted_arguments[index : index + 2] == ["--task-id", safe_off_task_id]
+            for index in range(max(0, len(persisted_arguments) - 1))
+        )
+        safe_off_loaded = "--task-id" in raw and safe_off_task_id in raw
+        persisted_send = "--send" in persisted_arguments
+        loaded_send = "--send" in raw
+        safe_off = safe_off_persisted and safe_off_loaded
+        send_enabled = persisted_send and loaded_send
+        if not send_enabled and not safe_off:
+            errors.append(
+                f"{label} persisted and loaded definitions must agree on --send or release safe-off mode"
+            )
+        if (safe_off_persisted or safe_off_loaded) and (
+            persisted_send or loaded_send
+        ):
+            errors.append(f"{label} release safe-off mode must not include --send")
         if "--retry-failed-after" not in raw:
             errors.append(f"{label} must include --retry-failed-after for bounded transient failure retries")
         if "--max-attempts" not in raw:
             errors.append(f"{label} must include --max-attempts to avoid infinite retry loops")
         if "--watch" not in raw:
             errors.append(f"{label} must include --watch so completion notices use the resident hot relay")
-        raw_lower = raw.lower()
-        if "properties = keepalive" not in raw_lower and "keepalive => true" not in raw_lower and "keepalive = 1" not in raw_lower:
+        keep_alive = body.get("KeepAlive") if isinstance(body, dict) else None
+        keep_alive_enabled = keep_alive is True or (
+            isinstance(keep_alive, dict)
+            and keep_alive.get("SuccessfulExit") is False
+        )
+        if not keep_alive_enabled:
             errors.append(f"{label} must use KeepAlive=true so the resident relay is restarted")
         if "com.apple.launchd.WatchPaths" in raw:
             errors.append(f"{label} must not use WatchPaths in resident --watch mode")

@@ -580,14 +580,38 @@ def test_retry_failed_notice_can_succeed_and_clears_error(tmp_path, monkeypatch)
     assert "send_error" not in updated
 
 
-def test_completion_notice_relay_launchd_guard_requires_keepalive_watch(monkeypatch):
+def test_completion_notice_relay_launchd_guard_requires_keepalive_watch(
+    tmp_path, monkeypatch
+):
     from scripts import hermes_live_drift_guard
 
+    plist = tmp_path / "Library" / "LaunchAgents" / "local.pnc.completion-notice-relay.plist"
+    plist.parent.mkdir(parents=True)
+    plist.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": "local.pnc.completion-notice-relay",
+                "ProgramArguments": [
+                    "/usr/bin/python3",
+                    str(tmp_path / ".hermes/runtime/governance-tools/pnc_live_exec.py"),
+                    "local.pnc.completion-notice-relay",
+                    "--send",
+                    "--retry-failed-after",
+                    "600",
+                    "--max-attempts",
+                    "3",
+                ],
+                "WorkingDirectory": str(tmp_path / ".hermes/runtime"),
+                "EnvironmentVariables": {"HERMES_HOME": str(tmp_path / ".hermes")},
+            }
+        )
+    )
+    monkeypatch.setattr(hermes_live_drift_guard.Path, "home", staticmethod(lambda: tmp_path))
     raw_without_watch = """
-    program = /Users/songying/.hermes/runtime/governance-tools/pnc_live_exec.py
-    /usr/bin/python3 /Users/songying/.hermes/runtime/governance-tools/pnc_live_exec.py local.pnc.completion-notice-relay
+    program = /usr/bin/python3
+    /usr/bin/python3 PLACEHOLDER/.hermes/runtime/governance-tools/pnc_live_exec.py local.pnc.completion-notice-relay
     --send --retry-failed-after 600 --max-attempts 3
-    """
+    """.replace("PLACEHOLDER", str(tmp_path))
     monkeypatch.setattr(
         hermes_live_drift_guard,
         "read_launchd_runtime",
@@ -623,6 +647,7 @@ def test_completion_notice_relay_launchd_guard_accepts_keepalive_watch(tmp_path,
                 ],
                 "WorkingDirectory": str(tmp_path / ".hermes/runtime"),
                 "EnvironmentVariables": {"HERMES_HOME": str(tmp_path / ".hermes")},
+                "KeepAlive": True,
             }
         )
     )
@@ -643,6 +668,66 @@ def test_completion_notice_relay_launchd_guard_accepts_keepalive_watch(tmp_path,
 
     assert result["ok"] is True
     assert result["errors"] == []
+
+
+def test_completion_notice_relay_launchd_guard_accepts_release_safe_off_watch(
+    tmp_path, monkeypatch
+):
+    from scripts import hermes_live_drift_guard
+
+    plist = tmp_path / "Library" / "LaunchAgents" / "local.pnc.completion-notice-relay.plist"
+    plist.parent.mkdir(parents=True)
+    plist.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": "local.pnc.completion-notice-relay",
+                "ProgramArguments": [
+                    "/usr/bin/python3",
+                    str(tmp_path / ".hermes/runtime/governance-tools/pnc_live_exec.py"),
+                    "local.pnc.completion-notice-relay",
+                    "--task-id",
+                    "rca-r11-safe-off-no-task",
+                    "--watch",
+                    "--retry-failed-after",
+                    "600",
+                    "--max-attempts",
+                    "3",
+                ],
+                "WorkingDirectory": str(tmp_path / ".hermes/runtime"),
+                "EnvironmentVariables": {"HERMES_HOME": str(tmp_path / ".hermes")},
+                "KeepAlive": {"SuccessfulExit": False},
+            }
+        )
+    )
+    monkeypatch.setattr(hermes_live_drift_guard.Path, "home", staticmethod(lambda: tmp_path))
+    raw_with_safe_off = f"""
+    program = /usr/bin/python3
+    /usr/bin/python3 {tmp_path}/.hermes/runtime/governance-tools/pnc_live_exec.py local.pnc.completion-notice-relay
+    --task-id rca-r11-safe-off-no-task --watch --retry-failed-after 600 --max-attempts 3
+    KeepAlive => true
+    """
+    monkeypatch.setattr(
+        hermes_live_drift_guard,
+        "read_launchd_runtime",
+        lambda label: {"found": "true", "raw": raw_with_safe_off},
+    )
+
+    result = hermes_live_drift_guard.validate_pnc_completion_notice_relay_launchd()
+
+    assert result["ok"] is True
+    assert result["errors"] == []
+
+
+def test_repository_completion_notice_relay_defaults_to_release_safe_off():
+    repository_root = Path(__file__).resolve().parents[2]
+    body = plistlib.loads(
+        (repository_root / "local.pnc.completion-notice-relay.plist").read_bytes()
+    )
+    arguments = body["ProgramArguments"]
+
+    assert "--send" not in arguments
+    task_id_index = arguments.index("--task-id")
+    assert arguments[task_id_index + 1] == "rca-r11-safe-off-no-task"
 
 
 def test_failed_notice_alerts_home_channel_once_at_max_attempts(tmp_path, monkeypatch):
