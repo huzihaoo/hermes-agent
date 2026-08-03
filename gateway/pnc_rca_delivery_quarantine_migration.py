@@ -110,7 +110,6 @@ _COMBINED_ALLOWED_ADDED_TABLES = {
             "rca_conclusion_adjudication_repairs",
             "rca_conclusion_adjudications",
             "rca_failure_routes",
-            "rca_delivery_subscription_events",
             "rca_delivery_observation_outbox",
         }
     ),
@@ -232,52 +231,102 @@ _COMBINED_CANONICAL_TARGET_OBJECTS = {
         "3cec6349b8b4fd3efc57bb6f612b6894d69fc8a983be4c83d131b01950ae043e",
     ),
 }
-_COMBINED_CANONICAL_SUBSCRIPTION_OBJECTS = {
-    "rca_delivery_subscription_events": (
-        "table",
-        "rca_delivery_subscription_events",
-        "ba97ba9e31ac0f3fc527a8724252d9bce60ffcbd536497f2034af9192ef6434e",
-    ),
-    "idx_rca_delivery_subscription_events": (
-        "index",
-        "rca_delivery_subscription_events",
-        "50a27d6124fb53e1d31ac667f178204664792b8fb6d3094a5276d00053e20280",
-    ),
-    "trg_learning_lane_effect_insert_forbidden": (
-        "trigger",
-        "rca_delivery_effects",
-        "cb044942a3f4fb78b0788abb6269c85e6f56e9de34eac43625af096fbecd95e7",
-    ),
-    "trg_learning_lane_stock_effect_insert_forbidden": (
-        "trigger",
-        "rca_delivery_effects",
-        "1a67cb8559a037166b61f40c21977933d734e9147dbd38bb18b71700b07fe73a",
-    ),
-    "trg_learning_lane_stock_subscription_insert_forbidden": (
-        "trigger",
-        "rca_delivery_subscriptions",
-        "5d0ceb8a3c68e4a33c83c0dc5d3a6172ca60835a471fef28560fe60151ac75a4",
-    ),
-    "trg_learning_lane_stock_subscription_update_forbidden": (
-        "trigger",
-        "rca_delivery_subscriptions",
-        "8ba715f5649a2e60acffa5f72e15dfa39ea78225084d1fbe25900ec4bcbe865c",
-    ),
-    "trg_rca_delivery_subscription_event_insert": (
-        "trigger",
-        "rca_delivery_subscriptions",
-        "473d2575f0f63735a3940e26c14776c15e9a6a21653e3cf3aff1609361fe3d75",
-    ),
-    "trg_rca_delivery_subscription_event_update": (
-        "trigger",
-        "rca_delivery_subscriptions",
-        "e767d65b4f39c4c836d5bce8ae8c3a9c3899eeb136eb89c3aa025e7aa6c379e4",
-    ),
-    "trg_rca_delivery_subscription_reason_required": (
-        "trigger",
-        "rca_delivery_subscriptions",
-        "472983f5f226ee30bdef182919a38b4e7737c3fe787fa14e7e27637f03b93d08",
-    ),
+_COMBINED_CONDITIONAL_OBJECTS = {
+    "rca_delivery_subscription_events": {
+        "contract": (
+            "table",
+            "rca_delivery_subscription_events",
+            "ba97ba9e31ac0f3fc527a8724252d9bce60ffcbd536497f2034af9192ef6434e",
+        ),
+        "requires_tables": frozenset({"rca_delivery_subscriptions"}),
+    },
+    "idx_rca_delivery_subscription_events": {
+        "contract": (
+            "index",
+            "rca_delivery_subscription_events",
+            "50a27d6124fb53e1d31ac667f178204664792b8fb6d3094a5276d00053e20280",
+        ),
+        "requires_tables": frozenset({"rca_delivery_subscriptions"}),
+    },
+    "trg_rca_delivery_subscription_event_insert": {
+        "contract": (
+            "trigger",
+            "rca_delivery_subscriptions",
+            "473d2575f0f63735a3940e26c14776c15e9a6a21653e3cf3aff1609361fe3d75",
+        ),
+        "requires_tables": frozenset({"rca_delivery_subscriptions"}),
+    },
+    "trg_rca_delivery_subscription_event_update": {
+        "contract": (
+            "trigger",
+            "rca_delivery_subscriptions",
+            "e767d65b4f39c4c836d5bce8ae8c3a9c3899eeb136eb89c3aa025e7aa6c379e4",
+        ),
+        "requires_tables": frozenset({"rca_delivery_subscriptions"}),
+    },
+    "trg_rca_delivery_subscription_reason_required": {
+        "contract": (
+            "trigger",
+            "rca_delivery_subscriptions",
+            "472983f5f226ee30bdef182919a38b4e7737c3fe787fa14e7e27637f03b93d08",
+        ),
+        "requires_tables": frozenset({"rca_delivery_subscriptions"}),
+    },
+    "trg_learning_lane_effect_insert_forbidden": {
+        "contract": (
+            "trigger",
+            "rca_delivery_effects",
+            "cb044942a3f4fb78b0788abb6269c85e6f56e9de34eac43625af096fbecd95e7",
+        ),
+        "requires_tables": frozenset({"rca_learning_lane_admissions"}),
+    },
+    "trg_learning_lane_stock_effect_insert_forbidden": {
+        "contract": (
+            "trigger",
+            "rca_delivery_effects",
+            "1a67cb8559a037166b61f40c21977933d734e9147dbd38bb18b71700b07fe73a",
+        ),
+        "requires_tables": frozenset(
+            {
+                "business_triggers",
+                "rca_learning_lane_admissions",
+                "rca_learning_lane_cohorts",
+                "rca_learning_lane_stock_items",
+            }
+        ),
+    },
+    "trg_learning_lane_stock_subscription_insert_forbidden": {
+        "contract": (
+            "trigger",
+            "rca_delivery_subscriptions",
+            "5d0ceb8a3c68e4a33c83c0dc5d3a6172ca60835a471fef28560fe60151ac75a4",
+        ),
+        "requires_tables": frozenset(
+            {
+                "business_triggers",
+                "rca_delivery_subscriptions",
+                "rca_learning_lane_admissions",
+                "rca_learning_lane_cohorts",
+                "rca_learning_lane_stock_items",
+            }
+        ),
+    },
+    "trg_learning_lane_stock_subscription_update_forbidden": {
+        "contract": (
+            "trigger",
+            "rca_delivery_subscriptions",
+            "8ba715f5649a2e60acffa5f72e15dfa39ea78225084d1fbe25900ec4bcbe865c",
+        ),
+        "requires_tables": frozenset(
+            {
+                "business_triggers",
+                "rca_delivery_subscriptions",
+                "rca_learning_lane_admissions",
+                "rca_learning_lane_cohorts",
+                "rca_learning_lane_stock_items",
+            }
+        ),
+    },
 }
 _COMBINED_W2_SOURCE_TABLES = frozenset(
     {"rca_conclusion_adjudications", "rca_failure_routes"}
@@ -722,6 +771,23 @@ def _combined_source_schema_contract(
     }
 
 
+def _combined_allowed_added_tables(
+    *,
+    source_variant: str,
+    source_tables: set[str],
+) -> frozenset[str] | None:
+    configured = _COMBINED_ALLOWED_ADDED_TABLES.get(source_variant)
+    if configured is None:
+        return None
+    selected = set(configured)
+    if (
+        source_variant == _COMBINED_ACTIVE_PROD_V7_VARIANT
+        and "rca_delivery_subscriptions" in source_tables
+    ):
+        selected.add("rca_delivery_subscription_events")
+    return frozenset(selected)
+
+
 def _combined_deterministic_transforms(
     source_version: str,
     *,
@@ -940,6 +1006,37 @@ def _normalized_schema_objects(
     }
 
 
+def _combined_conditional_schema_contract(
+    source_objects: Mapping[str, Mapping[str, str]],
+) -> tuple[dict[str, tuple[str, str, str]], dict[str, Any]]:
+    """Select exact target objects from their source-schema prerequisites."""
+
+    source_tables = frozenset(
+        name
+        for name, item in source_objects.items()
+        if item.get("type") == "table"
+    )
+    expected: dict[str, tuple[str, str, str]] = {}
+    conditions: dict[str, dict[str, Any]] = {}
+    for name, specification in sorted(_COMBINED_CONDITIONAL_OBJECTS.items()):
+        required_tables = frozenset(specification["requires_tables"])
+        active = required_tables.issubset(source_tables)
+        conditions[name] = {
+            "active": active,
+            "requires_tables": sorted(required_tables),
+        }
+        if active and name not in source_objects:
+            expected[name] = tuple(specification["contract"])
+    shape = {
+        "schema_version": "pnc_rca_combined_conditional_schema_shape_v1",
+        "source_tables_sha256": hashlib.sha256(
+            _canonical(sorted(source_tables))
+        ).hexdigest(),
+        "conditions": conditions,
+    }
+    return expected, shape
+
+
 def _assert_combined_schema_object_contract(
     conn: sqlite3.Connection,
     *,
@@ -1120,9 +1217,10 @@ def _combined_source_schema_preservation(
         for name, contract in _COMBINED_CANONICAL_TARGET_OBJECTS.items()
         if contract[1] in allowed_added_tables
     }
-    for name, contract in _COMBINED_CANONICAL_SUBSCRIPTION_OBJECTS.items():
-        if name not in source_objects:
-            expected_added_objects[name] = contract
+    conditional_objects, conditional_shape = (
+        _combined_conditional_schema_contract(source_objects)
+    )
+    expected_added_objects.update(conditional_objects)
     if "idx_delivery_effects_comment_slot" not in source_objects:
         expected_added_objects["idx_delivery_effects_comment_slot"] = (
             _COMBINED_COMMENT_SLOT_INDEX_CONTRACT
@@ -1146,6 +1244,7 @@ def _combined_source_schema_preservation(
             )
     return {
         "policy": "all_source_owned_sqlite_master_objects_exact_v1",
+        "conditional_schema_shape": conditional_shape,
         "source_owned_objects": evidence,
         "added_target_objects": {
             name: {
@@ -1175,7 +1274,10 @@ def _combined_cross_projection_preservation(
     target_tables = target_projection["tables"]
     source_names = set(source_tables)
     target_names = set(target_tables)
-    allowed_added_tables = _COMBINED_ALLOWED_ADDED_TABLES.get(source_variant)
+    allowed_added_tables = _combined_allowed_added_tables(
+        source_variant=source_variant,
+        source_tables=source_names,
+    )
     if (
         allowed_added_tables is None
         or not source_names.issubset(target_names)

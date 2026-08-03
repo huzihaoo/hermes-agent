@@ -241,10 +241,12 @@ def _prepare_combined_schema_migration(
     source_version: str,
     *,
     seed_w2_adjudication: bool = False,
+    shared_control_plane: bool = True,
 ) -> dict:
     root.mkdir(parents=True, exist_ok=True)
     live_path = root / "live-control.sqlite3"
-    RcaControlStore(live_path)
+    if shared_control_plane:
+        RcaControlStore(live_path)
     RcaDeliveryStore(live_path)
     with sqlite3.connect(live_path) as conn:
         if source_version in {
@@ -279,7 +281,6 @@ def _prepare_combined_schema_migration(
                 DROP TABLE rca_failure_routes;
                 DELETE FROM rca_delivery_dispatcher_circuit
                  WHERE circuit_name = 'feishu_card_patch';
-                ALTER TABLE rca_delivery_subscriptions DROP COLUMN reason;
                 ALTER TABLE rca_delivery_effects
                     DROP COLUMN comment_slot_budget_exempt;
                 ALTER TABLE rca_delivery_effects
@@ -294,6 +295,16 @@ def _prepare_combined_schema_migration(
                     DROP COLUMN comment_slot_schema_version;
                 """
             )
+            subscription_columns = {
+                str(row[1])
+                for row in conn.execute(
+                    "PRAGMA table_info(rca_delivery_subscriptions)"
+                )
+            }
+            if "reason" in subscription_columns:
+                conn.execute(
+                    "ALTER TABLE rca_delivery_subscriptions DROP COLUMN reason"
+                )
         conn.executescript(
             """
             DROP INDEX IF EXISTS idx_delivery_observation_outbox_status;
@@ -309,7 +320,7 @@ def _prepare_combined_schema_migration(
                 "INSERT INTO rca_delivery_meta(key, value) VALUES(?, ?)",
                 ("v10_migration_preservation_sentinel", "preserve-exactly"),
             )
-        if source_version == "pnc_rca_delivery_store_v7":
+        if source_version == "pnc_rca_delivery_store_v7" and shared_control_plane:
             legacy_at = "2026-07-25T10:00:00+00:00"
             conn.execute(
                 """
@@ -341,6 +352,7 @@ def _prepare_combined_schema_migration(
             )
         if seed_w2_adjudication:
             assert source_version == "pnc_rca_delivery_store_v8"
+            assert shared_control_plane
             created_at = "2026-07-25T11:30:00+00:00"
             conn.execute(
                 """
@@ -470,6 +482,7 @@ def _prepare_combined_schema_migration(
         "receipt_path": receipt_path,
         "receipt_sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
         "source_schema_sha256": source_schema_sha256,
+        "shared_control_plane": shared_control_plane,
     }
 
 
@@ -598,6 +611,16 @@ def test_combined_v2_offline_receipt_requires_quick_checked_copy_and_rollback(
     assert binding["no_live_database_writes"] is True
     preservation = migration["receipt"]["cross_projection_preservation"]
     assert preservation["policy"] == "all_source_owned_rows_exact_v1"
+    conditional_shape = preservation["source_owned_schema"][
+        "conditional_schema_shape"
+    ]
+    assert conditional_shape["schema_version"] == (
+        "pnc_rca_combined_conditional_schema_shape_v1"
+    )
+    assert all(
+        condition["active"] is True
+        for condition in conditional_shape["conditions"].values()
+    )
     assert preservation["deterministic_transforms"][0] == {
         "rule": "replace_exact_schema_version_marker_v1",
         "table": "rca_delivery_meta",
@@ -713,6 +736,74 @@ def test_combined_v2_offline_receipt_requires_quick_checked_copy_and_rollback(
         assert marker == "pnc_rca_delivery_store_v11"
         assert sentinel == "preserve-exactly"
         assert outbox_count == 0
+
+
+def test_combined_v7_standalone_delivery_selects_only_applicable_schema(
+    tmp_path,
+):
+    migration = _prepare_combined_schema_migration(
+        tmp_path,
+        "pnc_rca_delivery_store_v7",
+        shared_control_plane=False,
+    )
+
+    binding = validate_combined_migration_receipt(
+        receipt_path=migration["receipt_path"],
+        expected_sha256=migration["receipt_sha256"],
+        target_live_db_path=migration["live_path"],
+        migrated_db_path=migration["clone_path"],
+        expected_migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+        expected_source_schema_sha256=migration["source_schema_sha256"],
+    )
+
+    assert binding["target_quick_check"] == "ok"
+    schema = migration["receipt"]["cross_projection_preservation"][
+        "source_owned_schema"
+    ]
+    conditions = schema["conditional_schema_shape"]["conditions"]
+    for name in (
+        "rca_delivery_subscription_events",
+        "idx_rca_delivery_subscription_events",
+        "trg_rca_delivery_subscription_event_insert",
+        "trg_rca_delivery_subscription_event_update",
+        "trg_rca_delivery_subscription_reason_required",
+        "trg_learning_lane_effect_insert_forbidden",
+        "trg_learning_lane_stock_effect_insert_forbidden",
+        "trg_learning_lane_stock_subscription_insert_forbidden",
+        "trg_learning_lane_stock_subscription_update_forbidden",
+    ):
+        assert conditions[name]["active"] is False
+        assert name not in schema["added_target_objects"]
+
+
+def test_combined_v7_standalone_rejects_inapplicable_guard_object(tmp_path):
+    migration = _prepare_combined_schema_migration(
+        tmp_path,
+        "pnc_rca_delivery_store_v7",
+        shared_control_plane=False,
+    )
+    with sqlite3.connect(migration["clone_path"]) as conn:
+        conn.executescript(
+            """
+            CREATE TRIGGER trg_learning_lane_effect_insert_forbidden
+            BEFORE INSERT ON rca_delivery_effects
+            BEGIN
+                SELECT RAISE(ABORT, 'forged_inapplicable_guard');
+            END;
+            """
+        )
+
+    with pytest.raises(
+        QuarantineMigrationError,
+        match="delivery_store_combined_migration_cross_schema_mismatch",
+    ):
+        build_combined_offline_migration_receipt(
+            source_backup_path=migration["source_backup"],
+            migrated_clone_path=migration["clone_path"],
+            target_live_db_path=migration["live_path"],
+            migration_runtime_sha256=MIGRATION_RUNTIME_SHA256,
+            expected_source_schema_sha256=migration["source_schema_sha256"],
+        )
 
 
 def test_combined_v2_receipt_binds_w5_cutoff_backfill_for_legacy_v7_source(
