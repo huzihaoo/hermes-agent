@@ -442,7 +442,7 @@ def _validate_baseline(
         ),
         live_env_path=str(collector.get("quarantine_live_env_path") or ""),
     )
-    if status.get("ready") is not True or status.get("state") != "ready":
+    if status.get("ready") is not True or status.get("state") != "acknowledged":
         raise ActivationGateError(
             str(status.get("error_code") or "rca_activation_gate_quarantine_baseline_not_ready")
         )

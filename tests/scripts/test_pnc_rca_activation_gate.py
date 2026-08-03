@@ -354,7 +354,7 @@ def producer_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, 
         "read_quarantine_baseline_status",
         lambda *_args, **_kwargs: {
             "ready": True,
-            "state": "ready",
+            "state": "acknowledged",
             "error_code": "",
         },
     )
