@@ -443,7 +443,13 @@ def _validate_report(
         raise CapsuleError("activation_capsule_gate_fingerprint_invalid")
     checks = _check_map(report)
     activation = checks.get("activation_epoch")
-    if activation is None or activation["detail"].get("state") != expected_state:
+    allowed_states = {expected_state}
+    if expected_state == "absent":
+        allowed_states.add("supersedable_aborted")
+    if (
+        activation is None
+        or activation["detail"].get("state") not in allowed_states
+    ):
         raise CapsuleError("activation_capsule_gate_activation_state_invalid")
     return fingerprint, checks
 

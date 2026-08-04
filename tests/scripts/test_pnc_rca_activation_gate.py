@@ -462,6 +462,13 @@ def test_preauthorization_accepts_only_supersedable_aborted_history(
         "epoch_count": 1,
         "current_epoch_count": 1,
     }
+    result = _produce(producer_case, mode="preauthorization", broker_end=10)
+    capsule = capsules.build_preauthorization_capsule(
+        Path(result["report_path"]),
+        control_db_path=producer_case["db"],
+        now=producer_case["now"],
+    )
+    assert capsule.is_file()
     with pytest.raises(
         gate.ActivationGateError,
         match="rca_activation_gate_epoch_not_absent",
