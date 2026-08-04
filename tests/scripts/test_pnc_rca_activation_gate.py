@@ -407,6 +407,92 @@ def _produce(
     )
 
 
+def _insert_current_epoch(db_path: Path, *, state: str, epoch_id: str) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO rca_activation_epochs(
+                epoch_id, state, is_current,
+                preauthorization_fingerprint,
+                preauthorization_gate_receipt_sha256,
+                preauthorization_capsule_sha256,
+                config_sha256, db_logical_identity_json,
+                db_logical_identity_sha256, partition_start_fence_json,
+                partition_start_fence_sha256, created_at, updated_at,
+                aborted_at
+            ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                epoch_id,
+                state,
+                "1" * 64,
+                "2" * 64,
+                "3" * 64,
+                "4" * 64,
+                "{}",
+                "5" * 64,
+                json.dumps({TOPIC: {"0": 10}}, sort_keys=True),
+                "6" * 64,
+                now,
+                now,
+                now if state == "aborted" else None,
+            ),
+        )
+
+
+def test_preauthorization_accepts_only_supersedable_aborted_history(
+    producer_case: dict[str, Any],
+) -> None:
+    old_epoch = "rca-activation-old-aborted"
+    _insert_current_epoch(
+        producer_case["db"], state="aborted", epoch_id=old_epoch
+    )
+
+    observed = gate._activation_observation(
+        producer_case["db"],
+        mode="preauthorization",
+        epoch_id=EPOCH_ID,
+        activation_input=None,
+    )
+
+    assert observed == {
+        "state": "supersedable_aborted",
+        "epoch_id": old_epoch,
+        "epoch_count": 1,
+        "current_epoch_count": 1,
+    }
+    with pytest.raises(
+        gate.ActivationGateError,
+        match="rca_activation_gate_epoch_not_absent",
+    ):
+        gate._activation_observation(
+            producer_case["db"],
+            mode="preauthorization",
+            epoch_id=old_epoch,
+            activation_input=None,
+        )
+
+
+def test_preauthorization_rejects_live_nonaborted_epoch(
+    producer_case: dict[str, Any],
+) -> None:
+    _insert_current_epoch(
+        producer_case["db"], state="safe_off", epoch_id="rca-activation-live"
+    )
+
+    with pytest.raises(
+        gate.ActivationGateError,
+        match="rca_activation_gate_epoch_not_absent",
+    ):
+        gate._activation_observation(
+            producer_case["db"],
+            mode="preauthorization",
+            epoch_id=EPOCH_ID,
+            activation_input=None,
+        )
+
+
 def test_preauthorization_producer_builds_capsule_consumed_by_activation(
     producer_case: dict[str, Any], capsys: pytest.CaptureFixture[str]
 ) -> None:

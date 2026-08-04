@@ -729,9 +729,22 @@ def _activation_observation(
             connection.close()
     current = [row for row in rows if int(row["is_current"]) == 1]
     if mode == "preauthorization":
-        if rows or current:
+        if not rows and not current:
+            return {"state": "absent", "epoch_count": 0, "current_epoch_count": 0}
+        supersedable = (
+            len(current) == 1
+            and str(current[0]["state"]) == "aborted"
+            and str(current[0]["epoch_id"]) != epoch_id
+            and all(str(row["state"]) == "aborted" for row in rows)
+        )
+        if not supersedable:
             raise ActivationGateError("rca_activation_gate_epoch_not_absent")
-        return {"state": "absent", "epoch_count": 0, "current_epoch_count": 0}
+        return {
+            "state": "supersedable_aborted",
+            "epoch_id": str(current[0]["epoch_id"]),
+            "epoch_count": len(rows),
+            "current_epoch_count": 1,
+        }
     if len(current) != 1 or activation_input is None:
         raise ActivationGateError("rca_activation_gate_epoch_not_safe_off")
     row = current[0]
