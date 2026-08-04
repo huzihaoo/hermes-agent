@@ -160,7 +160,6 @@ def _preauthorization_input(control_path: Path, delivery_path: Path) -> dict[str
         "migration_receipt_raw_sha256": "b" * 64,
         "materialization_receipt_raw_sha256": hashlib.sha256(b"").hexdigest(),
         "broker_t0_observation_sha256": "d" * 64,
-        "canary_plan_raw_sha256": "e" * 64,
     }
 
 

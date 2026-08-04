@@ -398,7 +398,7 @@ def _produce(
         schema_receipt_path=case["schema"],
         migration_receipt_path=case["migration"],
         baseline_path=case["baseline"],
-        canary_plan_path=case["canary"],
+        canary_plan_path=(case["canary"] if mode == "preproduction" else None),
         live_manifest_path=case["manifest"],
         broker_receipt_path=case["tmp"] / f"{mode}-broker.json",
         receipt_path=case["tmp"] / f"{mode}-gate.json",
@@ -426,6 +426,14 @@ def test_preauthorization_producer_builds_capsule_consumed_by_activation(
     assert report["checks"][-1]["detail"]["activation_input"][
         "partition_start_fence"
     ] == {TOPIC: {"0": 10}}
+    assert "canary_plan_raw_sha256" not in report["checks"][-1]["detail"][
+        "activation_input"
+    ]
+    contract = next(
+        item for item in report["checks"] if item["name"] == "contract_drift"
+    )["detail"]
+    assert "canary_plan_raw_sha256" not in contract
+    assert "canary_plan" not in report["evidence_sha256"]
     assert result["source_mutation_performed"] is False
     assert result["external_effects_triggered"] is False
 
@@ -449,6 +457,61 @@ def test_preauthorization_producer_builds_capsule_consumed_by_activation(
     assert activation.main(args) == 0
     assert json.loads(capsys.readouterr().out)["ok"] is True
     assert RcaControlStore(producer_case["db"]).activation_epoch()["state"] == "safe_off"
+
+
+def test_canary_plan_is_bound_only_after_t0(
+    producer_case: dict[str, Any],
+) -> None:
+    with pytest.raises(
+        gate.ActivationGateError,
+        match="rca_activation_gate_preauthorization_canary_plan_forbidden",
+    ):
+        gate.produce_release_gate(
+            mode="preauthorization",
+            epoch_id=EPOCH_ID,
+            env_path=producer_case["env"],
+            live_env_path=producer_case["live_env"],
+            authority_path=producer_case["authority_path"],
+            schema_receipt_path=producer_case["schema"],
+            migration_receipt_path=producer_case["migration"],
+            baseline_path=producer_case["baseline"],
+            canary_plan_path=producer_case["canary"],
+            live_manifest_path=producer_case["manifest"],
+            broker_receipt_path=producer_case["tmp"] / "forbidden-broker.json",
+            receipt_path=producer_case["tmp"] / "forbidden-gate.json",
+            evidence_dir=producer_case["tmp"],
+            now=producer_case["now"],
+            broker_collector=lambda *_args, **_kwargs: _broker(
+                producer_case["now"], end=10
+            ),
+            gateway_collector=lambda **_kwargs: producer_case["gateway"],
+        )
+
+    with pytest.raises(
+        gate.ActivationGateError,
+        match="rca_activation_gate_canary_plan_required",
+    ):
+        gate.produce_release_gate(
+            mode="preproduction",
+            epoch_id=EPOCH_ID,
+            env_path=producer_case["env"],
+            live_env_path=producer_case["live_env"],
+            authority_path=producer_case["authority_path"],
+            schema_receipt_path=producer_case["schema"],
+            migration_receipt_path=producer_case["migration"],
+            baseline_path=producer_case["baseline"],
+            canary_plan_path=None,
+            live_manifest_path=producer_case["manifest"],
+            broker_receipt_path=producer_case["tmp"] / "missing-broker.json",
+            receipt_path=producer_case["tmp"] / "missing-gate.json",
+            evidence_dir=producer_case["tmp"],
+            now=producer_case["now"],
+            preauthorization_capsule_path=producer_case["tmp"] / "missing.json",
+            broker_collector=lambda *_args, **_kwargs: _broker(
+                producer_case["now"], end=10
+            ),
+            gateway_collector=lambda **_kwargs: producer_case["gateway"],
+        )
 
 
 def test_preproduction_producer_preserves_preauthorization_input_and_transitions(

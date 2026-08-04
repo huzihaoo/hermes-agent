@@ -82,7 +82,6 @@ _PREAUTHORIZATION_INPUT_FIELDS = {
     "migration_receipt_raw_sha256",
     "materialization_receipt_raw_sha256",
     "broker_t0_observation_sha256",
-    "canary_plan_raw_sha256",
 }
 
 
@@ -823,7 +822,7 @@ def produce_release_gate(
     schema_receipt_path: Path,
     migration_receipt_path: Path,
     baseline_path: Path,
-    canary_plan_path: Path,
+    canary_plan_path: Path | None,
     live_manifest_path: Path,
     broker_receipt_path: Path,
     receipt_path: Path,
@@ -884,7 +883,17 @@ def produce_release_gate(
         control_db_path=control_db_path,
         config=config,
     )
-    canary_raw, canary_plan = _validate_canary_plan(canary_plan_path)
+    canary_raw = b""
+    canary_plan: dict[str, Any] | None = None
+    if mode == "preauthorization":
+        if canary_plan_path is not None:
+            raise ActivationGateError(
+                "rca_activation_gate_preauthorization_canary_plan_forbidden"
+            )
+    else:
+        if canary_plan_path is None:
+            raise ActivationGateError("rca_activation_gate_canary_plan_required")
+        canary_raw, canary_plan = _validate_canary_plan(canary_plan_path)
     live_manifest_raw, live_manifest = _read_owner_json(
         live_manifest_path, "rca_activation_gate_live_manifest"
     )
@@ -950,7 +959,6 @@ def produce_release_gate(
             "migration_receipt_raw_sha256": migration_sha,
             "materialization_receipt_raw_sha256": hashlib.sha256(b"").hexdigest(),
             "broker_t0_observation_sha256": broker_raw_sha,
-            "canary_plan_raw_sha256": hashlib.sha256(canary_raw).hexdigest(),
         }
     else:
         if preauthorization_capsule_path is None:
@@ -983,8 +991,6 @@ def produce_release_gate(
             activation_input["config_sha256"] != config_sha
             or activation_input["migration_receipt_raw_sha256"]
             != hashlib.sha256(migration_raw).hexdigest()
-            or activation_input["canary_plan_raw_sha256"]
-            != hashlib.sha256(canary_raw).hexdigest()
         ):
             raise ActivationGateError(
                 "rca_activation_gate_preauthorization_input_drift"
@@ -1012,7 +1018,7 @@ def produce_release_gate(
             max_age_seconds=max_age,
         )
 
-    contract = {
+    contract: dict[str, Any] = {
         "schema_version": CONTRACT_SCHEMA_VERSION,
         "release_id": authority["release_id"],
         "authority_epoch_id": authority["authority_epoch_id"],
@@ -1025,13 +1031,14 @@ def produce_release_gate(
         "schema_receipt_raw_sha256": hashlib.sha256(schema_raw).hexdigest(),
         "migration_receipt_raw_sha256": hashlib.sha256(migration_raw).hexdigest(),
         "quarantine_baseline_raw_sha256": hashlib.sha256(baseline_raw).hexdigest(),
-        "canary_plan_raw_sha256": hashlib.sha256(canary_raw).hexdigest(),
         "gateway_runtime_identity_sha256": gateway["runtime_identity_sha256"],
         "broker_observation_raw_sha256": broker_raw_sha,
         "vm_observation_raw_sha256": (
             hashlib.sha256(vm_raw).hexdigest() if vm_raw else None
         ),
     }
+    if mode == "preproduction":
+        contract["canary_plan_raw_sha256"] = hashlib.sha256(canary_raw).hexdigest()
     material: dict[str, Any] = {
         "schema_version": (
             capsules.PREAUTHORIZATION_MATERIAL_SCHEMA_VERSION
@@ -1043,6 +1050,8 @@ def produce_release_gate(
         "gateway_binding": gateway,
     }
     if mode == "preproduction":
+        if canary_plan is None:
+            raise ActivationGateError("rca_activation_gate_canary_plan_required")
         material.update({
             "preauthorization_capsule": preauthorization_capsule,
             "canary_slot_plan": canary_plan,
@@ -1100,10 +1109,11 @@ def produce_release_gate(
         "schema_receipt": hashlib.sha256(schema_raw).hexdigest(),
         "migration_receipt": hashlib.sha256(migration_raw).hexdigest(),
         "quarantine_baseline": hashlib.sha256(baseline_raw).hexdigest(),
-        "canary_plan": hashlib.sha256(canary_raw).hexdigest(),
         "live_manifest": hashlib.sha256(live_manifest_raw).hexdigest(),
         "broker_observation": broker_raw_sha,
     }
+    if mode == "preproduction":
+        evidence_sha256["canary_plan"] = hashlib.sha256(canary_raw).hexdigest()
     if vm_raw:
         evidence_sha256["vm_observation"] = hashlib.sha256(vm_raw).hexdigest()
     report = {
@@ -1239,7 +1249,7 @@ def _arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--schema-receipt", type=Path, required=True)
     parser.add_argument("--migration-receipt", type=Path, required=True)
     parser.add_argument("--quarantine-baseline", type=Path, required=True)
-    parser.add_argument("--canary-plan", type=Path, required=True)
+    parser.add_argument("--canary-plan", type=Path)
     parser.add_argument("--live-manifest", type=Path, required=True)
     parser.add_argument("--broker-receipt", type=Path, required=True)
     parser.add_argument("--receipt", type=Path, required=True)

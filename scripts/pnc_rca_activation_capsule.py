@@ -40,7 +40,7 @@ from gateway.pnc_rca_runtime_identity import (
 
 RELEASE_GATE_SCHEMA_VERSION = "pnc_rca_release_gate_v1"
 PREAUTHORIZATION_CAPSULE_SCHEMA_VERSION = (
-    "pnc_rca_activation_preauthorization_capsule_v1"
+    "pnc_rca_activation_preauthorization_capsule_v2"
 )
 PREPRODUCTION_CAPSULE_SCHEMA_VERSION = "pnc_rca_activation_preproduction_capsule_v1"
 CONFIRMATION_CAPSULE_SCHEMA_VERSION = "pnc_rca_activation_confirmation_capsule_v2"
@@ -49,7 +49,7 @@ CONFIRMATION_PAIR_COMMIT_SCHEMA_VERSION = (
     "pnc_rca_activation_confirmation_pair_commit_v1"
 )
 PREAUTHORIZATION_MATERIAL_SCHEMA_VERSION = (
-    "pnc_rca_activation_preauthorization_material_v1"
+    "pnc_rca_activation_preauthorization_material_v2"
 )
 PREPRODUCTION_MATERIAL_SCHEMA_VERSION = "pnc_rca_activation_preproduction_material_v1"
 CAPSULE_CLI_SCHEMA_VERSION = "pnc_rca_activation_capsule_cli_v1"
@@ -157,7 +157,6 @@ _PREAUTHORIZATION_INPUT_FIELDS = {
     "migration_receipt_raw_sha256",
     "materialization_receipt_raw_sha256",
     "broker_t0_observation_sha256",
-    "canary_plan_raw_sha256",
 }
 
 
@@ -760,7 +759,6 @@ def _normalize_preauthorization_input(
         "migration_receipt_raw_sha256",
         "materialization_receipt_raw_sha256",
         "broker_t0_observation_sha256",
-        "canary_plan_raw_sha256",
     ):
         normalized[field] = _digest(
             value.get(field), "activation_capsule_preauthorization_input_invalid"

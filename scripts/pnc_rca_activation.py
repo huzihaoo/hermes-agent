@@ -296,7 +296,6 @@ def _canonical_preauthorization_input(
         "migration_receipt_raw_sha256",
         "materialization_receipt_raw_sha256",
         "broker_t0_observation_sha256",
-        "canary_plan_raw_sha256",
     }
     if not isinstance(value, Mapping) or set(value) != expected_fields:
         raise ActivationCliError("activation_preauthorization_capsule_rejected")
@@ -347,10 +346,6 @@ def _canonical_preauthorization_input(
         "broker_t0_observation_sha256": _normalized_sha256(
             str(value.get("broker_t0_observation_sha256") or ""),
             "broker_t0_observation_sha256",
-        ),
-        "canary_plan_raw_sha256": _normalized_sha256(
-            str(value.get("canary_plan_raw_sha256") or ""),
-            "canary_plan_raw_sha256",
         ),
     }
     if (

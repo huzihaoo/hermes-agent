@@ -34,7 +34,6 @@ RELEASE_BINDING_SHA256 = "7" * 64
 PREAUTHORIZATION_FINGERPRINT = "1" * 64
 PREAUTHORIZATION_RECEIPT_SHA256 = "a" * 64
 PREAUTHORIZATION_CAPSULE_SHA256 = "b" * 64
-CANARY_PLAN_RAW_SHA256 = "4" * 64
 PREPRODUCTION_FINGERPRINT = "c" * 64
 PREPRODUCTION_RECEIPT_SHA256 = "d" * 64
 PREPRODUCTION_CAPSULE_SHA256 = "e" * 64
@@ -109,7 +108,6 @@ def _preauthorization_input(epoch_id: str = EPOCH_ID) -> dict[str, Any]:
         "migration_receipt_raw_sha256": "8" * 64,
         "materialization_receipt_raw_sha256": "9" * 64,
         "broker_t0_observation_sha256": "0" * 64,
-        "canary_plan_raw_sha256": CANARY_PLAN_RAW_SHA256,
     }
 
 
