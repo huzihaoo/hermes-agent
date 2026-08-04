@@ -14030,6 +14030,60 @@ class RcaControlStore:
         finally:
             conn.close()
 
+    def activation_partition_start_fence(
+        self,
+        *,
+        topic: str,
+        partitions: Iterable[int],
+    ) -> dict[int, int]:
+        """Read the current activation epoch's immutable Kafka start fence.
+
+        A bounded activation may intentionally begin after the durable local
+        progress checkpoint because the pre-release cohort is sealed and held.
+        Consumers need the exact epoch fence to distinguish that deliberate
+        skip from an unexplained broker/DB split-brain.
+        """
+        normalized = sorted({int(partition) for partition in partitions})
+        if any(partition < 0 for partition in normalized):
+            raise ValueError("partitions must be non-negative")
+        if not normalized:
+            return {}
+        conn = self._connect()
+        try:
+            row = self._current_activation_epoch_tx(conn)
+            if row is None or str(row["state"]) not in {
+                "bounded_active",
+                "confirmed",
+                "steady_active",
+            }:
+                return {}
+            try:
+                start_fence = json.loads(str(row["partition_start_fence_json"]))
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ActivationEpochError(
+                    "activation_partition_start_fence_invalid"
+                ) from exc
+            topic_fence = start_fence.get(str(topic))
+            if not isinstance(topic_fence, dict):
+                raise ActivationEpochError(
+                    "activation_partition_start_fence_missing"
+                )
+            result: dict[int, int] = {}
+            for partition in normalized:
+                raw_offset = topic_fence.get(str(partition))
+                if (
+                    isinstance(raw_offset, bool)
+                    or not isinstance(raw_offset, int)
+                    or raw_offset < 0
+                ):
+                    raise ActivationEpochError(
+                        "activation_partition_start_fence_invalid"
+                    )
+                result[partition] = raw_offset
+            return result
+        finally:
+            conn.close()
+
     def record_host_runtime_transition(
         self,
         *,

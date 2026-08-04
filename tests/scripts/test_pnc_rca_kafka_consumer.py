@@ -820,6 +820,80 @@ def test_partition_assignment_blocks_broker_offset_ahead_of_local_durability(
     assert seeks == []
 
 
+def test_partition_assignment_accepts_current_activation_start_fence_skip(
+    tmp_path,
+):
+    config = _config(
+        tmp_path,
+        HERMES_RCA_KAFKA_START_OFFSETS_JSON='{"0": 676}',
+    )
+    topic_partition = namedtuple("TopicPartition", "topic partition")
+    partition = topic_partition(TOPIC, 0)
+
+    class ActivationFenceConsumer:
+        def __init__(self):
+            self._coordinator = self
+            self.seeks = []
+
+        async def fetch_committed_offsets_async(self, _partitions, **_kwargs):
+            return {partition: SimpleNamespace(offset=1578)}
+
+        def seek(self, topic_partition, offset):
+            self.seeks.append((topic_partition, offset))
+
+    store = SimpleNamespace(
+        partition_progress=lambda **_kwargs: {0: 975},
+        activation_partition_start_fence=lambda **_kwargs: {0: 1578},
+    )
+    consumer = ActivationFenceConsumer()
+    listener = consumer_module.ExplicitInitialOffsetListener(
+        consumer, config, store
+    )
+
+    asyncio.run(listener.on_partitions_assigned([partition]))
+
+    assert consumer.seeks == []
+    assert listener.diagnostics()["assigned_partitions"] == [0]
+    assert listener.diagnostics()["callback_errors"] == 0
+
+
+def test_partition_assignment_uses_current_activation_start_fence_when_group_missing(
+    tmp_path,
+):
+    config = _config(
+        tmp_path,
+        HERMES_RCA_KAFKA_START_OFFSETS_JSON='{"0": 676}',
+    )
+    topic_partition = namedtuple("TopicPartition", "topic partition")
+    partition = topic_partition(TOPIC, 0)
+
+    class ActivationFenceConsumer:
+        def __init__(self):
+            self._coordinator = self
+            self.seeks = []
+
+        async def fetch_committed_offsets_async(self, _partitions, **_kwargs):
+            return {partition: SimpleNamespace(offset=-1)}
+
+        def seek(self, topic_partition, offset):
+            self.seeks.append((topic_partition, offset))
+
+    store = SimpleNamespace(
+        partition_progress=lambda **_kwargs: {0: 975},
+        activation_partition_start_fence=lambda **_kwargs: {0: 1578},
+    )
+    consumer = ActivationFenceConsumer()
+    listener = consumer_module.ExplicitInitialOffsetListener(
+        consumer, config, store
+    )
+
+    asyncio.run(listener.on_partitions_assigned([partition]))
+
+    assert consumer.seeks == [(partition, 1578)]
+    assert listener.diagnostics()["assigned_partitions"] == [0]
+    assert listener.diagnostics()["callback_errors"] == 0
+
+
 def test_create_consumer_registers_a_supported_rebalance_listener(monkeypatch, tmp_path):
     config = _config(tmp_path)
     RcaControlStore(config.control_db_path)

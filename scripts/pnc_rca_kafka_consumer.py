@@ -817,6 +817,29 @@ class ExplicitInitialOffsetListener:
             ),
         )
 
+        activation_start_fence_reader = getattr(
+            self.store, "activation_partition_start_fence", None
+        )
+        if callable(activation_start_fence_reader):
+            try:
+                activation_start_fence = activation_start_fence_reader(
+                    topic=self.config.topic,
+                    partitions=(
+                        int(topic_partition.partition)
+                        for topic_partition in assigned_partitions
+                    ),
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "activation_start_fence_unavailable"
+                ) from exc
+            if not isinstance(activation_start_fence, Mapping):
+                raise RuntimeError("activation_start_fence_invalid")
+        else:
+            # Isolated test doubles and pre-activation stores retain the
+            # explicit-T0 path; the live v13 store exposes the epoch fence.
+            activation_start_fence = {}
+
         missing: list[int] = []
         incoherent: list[int] = []
         to_seek: list[tuple[Any, int]] = []
@@ -831,15 +854,49 @@ class ExplicitInitialOffsetListener:
                 and committed_offset >= 0
             ):
                 local_next = local_progress.get(int(topic_partition.partition))
-                t0 = self.config.initial_offset_for(topic_partition.partition)
+                activation_t0 = activation_start_fence.get(
+                    int(topic_partition.partition)
+                )
+                if (
+                    activation_t0 is not None
+                    and (
+                        isinstance(activation_t0, bool)
+                        or not isinstance(activation_t0, int)
+                        or activation_t0 < 0
+                    )
+                ):
+                    raise RuntimeError("activation_start_fence_invalid")
+                t0 = (
+                    int(activation_t0)
+                    if activation_t0 is not None
+                    else self.config.initial_offset_for(topic_partition.partition)
+                )
+                intentional_activation_skip = (
+                    activation_t0 is not None
+                    and committed_offset == int(activation_t0)
+                    and local_next is not None
+                    and committed_offset > local_next
+                )
                 if (
                     local_next is None
-                    or committed_offset > local_next
+                    or (
+                        committed_offset > local_next
+                        and not intentional_activation_skip
+                    )
                     or (t0 is not None and committed_offset < t0)
                 ):
                     incoherent.append(int(topic_partition.partition))
                 continue
-            offset = self.config.initial_offset_for(topic_partition.partition)
+            offset = activation_start_fence.get(
+                int(topic_partition.partition),
+                self.config.initial_offset_for(topic_partition.partition),
+            )
+            if (
+                isinstance(offset, bool)
+                or (offset is not None and not isinstance(offset, int))
+                or (isinstance(offset, int) and offset < 0)
+            ):
+                raise RuntimeError("activation_start_fence_invalid")
             if offset is None:
                 missing.append(int(topic_partition.partition))
             else:
