@@ -176,12 +176,6 @@ def _manual_identity(message: str, issue_id: int, *, mode: str) -> dict[str, str
 
 def _canary_plan() -> dict[str, dict[str, Any]]:
     identities: dict[str, dict[str, Any]] = {
-        "kafka_success": {
-            "event_uid": f"{TOPIC}:0:10",
-            "offset": 10,
-            "partition": 0,
-            "topic": TOPIC,
-        },
         "manual_success": _manual_identity(
             "om_capsule_success", 7041712814, mode="run_or_join"
         ),
@@ -590,8 +584,6 @@ def _prepare_bounded_canaries(
     plan = _canary_plan()
     for slot, item in plan.items():
         identity = dict(item["source_identity"])
-        if item["source_kind"] == "kafka":
-            identity = {"event_uid": identity["event_uid"]}
         store.authorize_activation_slot(
             epoch_id=EPOCH_ID,
             slot_kind=slot,
@@ -607,13 +599,6 @@ def _prepare_bounded_canaries(
         operator=OPERATOR,
         reason=REASON,
     )
-    kafka = store.ingest_record(
-        _record(),
-        policy=_policy(),
-        submit_enabled=True,
-        activation_required=True,
-        activation_slot_kind="kafka_success",
-    )
     manual_results = []
     for slot in ("manual_success", "manual_terminal_failure"):
         manual_results.append(
@@ -626,9 +611,8 @@ def _prepare_bounded_canaries(
                 activation_required=True,
             )
         )
-    assert kafka.submission_key
     assert all(result.submission_key for result in manual_results)
-    for index in range(3):
+    for index in range(2):
         claim = store.claim_outbox(
             lease_owner=f"capsule-canary-{index}", activation_required=True
         )

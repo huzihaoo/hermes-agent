@@ -58,12 +58,6 @@ def _database(path: Path) -> Path:
 
 def _canary_plan() -> dict[str, dict[str, Any]]:
     identities = {
-        "kafka_success": {
-            "event_uid": f"{TOPIC}:0:10",
-            "topic": TOPIC,
-            "partition": 0,
-            "offset": 10,
-        },
         "manual_success": {
             "chat_id": "oc_gate_test",
             "requester_id": "ou_gate_owner",

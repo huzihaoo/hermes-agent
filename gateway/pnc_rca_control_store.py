@@ -224,6 +224,15 @@ ACTIVATION_SLOT_KINDS = (
     "manual_success",
     "manual_terminal_failure",
 )
+# Kafka is a passive production ingress. Its broker/ACL/offset connectivity is
+# sealed by the preauthorization gate; bounded activation actively exercises
+# the two exact manual paths without fabricating an upstream Kafka event.
+ACTIVATION_RELEASE_SLOT_KINDS = (
+    "manual_success",
+    "manual_terminal_failure",
+)
+ACTIVATION_KAFKA_PROOF_MODE = "passive_connectivity"
+_ACTIVATION_RELEASE_SLOT_SQL = "'manual_success', 'manual_terminal_failure'"
 ACTIVATION_ENTRYPOINTS = frozenset(
     {"kafka_ingest", "manual_admit", "shadow_promotion"}
 )
@@ -5790,17 +5799,19 @@ class RcaControlStore:
             if epoch is None or str(epoch["epoch_id"]) != identity:
                 raise ActivationEpochError("activation_epoch_not_current")
             rows = conn.execute(
-                """
+                f"""
                 SELECT slot_kind, authorized_source_kind,
                        authorized_identity_sha256
                   FROM rca_activation_budget_slots
-                 WHERE epoch_id = ? ORDER BY slot_kind
+                 WHERE epoch_id = ?
+                   AND slot_kind IN ({_ACTIVATION_RELEASE_SLOT_SQL})
+                 ORDER BY slot_kind
                 """,
                 (identity,),
             ).fetchall()
-            if len(rows) != len(ACTIVATION_SLOT_KINDS) or {
+            if len(rows) != len(ACTIVATION_RELEASE_SLOT_KINDS) or {
                 str(row["slot_kind"]) for row in rows
-            } != set(ACTIVATION_SLOT_KINDS):
+            } != set(ACTIVATION_RELEASE_SLOT_KINDS):
                 raise ActivationEpochError("activation_slot_set_invalid")
             return {
                 str(row["slot_kind"]): {
@@ -5982,7 +5993,7 @@ class RcaControlStore:
             epoch=epoch,
         )
         rows = conn.execute(
-            """
+            f"""
             SELECT s.slot_kind, s.authorized_identity_sha256,
                    s.consumed_ledger_id, s.consumed_at,
                    al.ledger_id, al.epoch_id AS ledger_epoch_id,
@@ -5993,9 +6004,8 @@ class RcaControlStore:
                    t.activation_ledger_id AS trigger_ledger_id,
                    o.activation_epoch_id AS outbox_epoch_id,
                    o.activation_ledger_id AS outbox_ledger_id,
-                   o.status AS outbox_status, o.source_topic,
-                   o.source_partition, o.source_offset
-              FROM rca_activation_budget_slots AS s
+                   o.status AS outbox_status
+             FROM rca_activation_budget_slots AS s
          LEFT JOIN rca_activation_admission_ledger AS al
                 ON al.ledger_id = s.consumed_ledger_id
                AND al.epoch_id = s.epoch_id
@@ -6008,11 +6018,12 @@ class RcaControlStore:
                AND o.submission_key = al.submission_key
                AND o.generation = al.generation
              WHERE s.epoch_id = ?
+               AND s.slot_kind IN ({_ACTIVATION_RELEASE_SLOT_SQL})
              ORDER BY s.slot_kind
             """,
             (epoch_id,),
         ).fetchall()
-        if len(rows) != len(ACTIVATION_SLOT_KINDS):
+        if len(rows) != len(ACTIVATION_RELEASE_SLOT_KINDS):
             raise ActivationEpochError("activation_bounded_execution_unbound")
         for row in rows:
             ledger_id = int(row["ledger_id"] or 0)
@@ -6033,24 +6044,7 @@ class RcaControlStore:
                 or str(row["outbox_status"] or "") != "completed"
             ):
                 raise ActivationEpochError("activation_bounded_execution_unbound")
-        kafka = next(
-            row for row in rows if str(row["slot_kind"]) == "kafka_success"
-        )
         start_fence = json.loads(str(epoch["partition_start_fence_json"]))
-        end_fence = json.loads(end_fence_json)
-        topic = str(kafka["source_topic"] or "")
-        partition = str(kafka["source_partition"])
-        raw_offset = kafka["source_offset"]
-        offset = int(raw_offset) if raw_offset is not None else -1
-        if (
-            topic not in start_fence
-            or partition not in start_fence[topic]
-            or topic not in end_fence
-            or partition not in end_fence[topic]
-            or offset < int(start_fence[topic][partition])
-            or offset >= int(end_fence[topic][partition])
-        ):
-            raise ActivationEpochError("activation_kafka_canary_outside_end_fence")
         unexpected_admissions = int(
             conn.execute(
                 """
@@ -6165,7 +6159,7 @@ class RcaControlStore:
             ).fetchone()[0]
         )
         if (
-            admitted_ledgers != len(ACTIVATION_SLOT_KINDS)
+            admitted_ledgers != len(ACTIVATION_RELEASE_SLOT_KINDS)
             or unexpected_admissions
         ):
             raise ActivationEpochError("activation_unexpected_admission")
@@ -6207,10 +6201,17 @@ class RcaControlStore:
             "bounded_activated_at": str(epoch["bounded_activated_at"]),
             "partition_start_fence_sha256": str(epoch["partition_start_fence_sha256"]),
             "partition_start_fence": start_fence,
-            "kafka_coordinate": {
-                "topic": topic,
-                "partition": int(partition),
-                "offset": offset,
+            "kafka_proof": {
+                "mode": ACTIVATION_KAFKA_PROOF_MODE,
+                "preauthorization_gate_receipt_sha256": str(
+                    epoch["preauthorization_gate_receipt_sha256"]
+                ),
+                "partition_start_fence_sha256": str(
+                    epoch["partition_start_fence_sha256"]
+                ),
+                "partition_end_fence_sha256": hashlib.sha256(
+                    end_fence_json.encode("utf-8")
+                ).hexdigest(),
             },
             "slot_bindings": bindings,
             "unexpected_admissions": 0,
@@ -6497,30 +6498,52 @@ class RcaControlStore:
                     )
                 authorized = int(
                     conn.execute(
-                        """
+                        f"""
                         SELECT COUNT(*) FROM rca_activation_budget_slots
                          WHERE epoch_id = ?
+                           AND slot_kind IN ({_ACTIVATION_RELEASE_SLOT_SQL})
                            AND authorized_source_kind IS NOT NULL
                            AND authorized_identity_sha256 IS NOT NULL
                         """,
                         (identity,),
                     ).fetchone()[0]
                 )
-                if authorized != len(ACTIVATION_SLOT_KINDS):
+                optional_mutated = int(
+                    conn.execute(
+                        f"""
+                        SELECT COUNT(*) FROM rca_activation_budget_slots
+                         WHERE epoch_id = ?
+                           AND slot_kind NOT IN ({_ACTIVATION_RELEASE_SLOT_SQL})
+                           AND (
+                               authorized_source_kind IS NOT NULL
+                            OR authorized_identity_sha256 IS NOT NULL
+                            OR consumed_ledger_id IS NOT NULL
+                           )
+                        """,
+                        (identity,),
+                    ).fetchone()[0]
+                )
+                if optional_mutated:
+                    raise ActivationEpochError(
+                        "activation_nonrelease_slot_mutated"
+                    )
+                if authorized != len(ACTIVATION_RELEASE_SLOT_KINDS):
                     raise ActivationEpochError("activation_slots_not_preauthorized")
                 fields.append("bounded_activated_at = ?")
                 parameters.append(current)
             elif target == "confirmed":
                 consumed = int(
                     conn.execute(
-                        """
+                        f"""
                         SELECT COUNT(*) FROM rca_activation_budget_slots
-                         WHERE epoch_id = ? AND consumed_ledger_id IS NOT NULL
+                         WHERE epoch_id = ?
+                           AND slot_kind IN ({_ACTIVATION_RELEASE_SLOT_SQL})
+                           AND consumed_ledger_id IS NOT NULL
                         """,
                         (identity,),
                     ).fetchone()[0]
                 )
-                if consumed != len(ACTIVATION_SLOT_KINDS):
+                if consumed != len(ACTIVATION_RELEASE_SLOT_KINDS):
                     raise ActivationEpochError("activation_bounded_budget_incomplete")
                 if end_fence_json is None:
                     raise ActivationEpochError("activation_partition_end_fence_required")
@@ -15696,16 +15719,18 @@ class RcaControlStore:
             if state == "bounded_active":
                 consumed_slot_count = int(
                     conn.execute(
-                        """
+                        f"""
                         SELECT COUNT(*) FROM rca_activation_budget_slots
-                         WHERE epoch_id = ? AND consumed_ledger_id IS NOT NULL
+                         WHERE epoch_id = ?
+                           AND slot_kind IN ({_ACTIVATION_RELEASE_SLOT_SQL})
+                           AND consumed_ledger_id IS NOT NULL
                         """,
                         (epoch_id,),
                     ).fetchone()[0]
                 )
                 completed_bound_slot_count = int(
                     conn.execute(
-                        """
+                        f"""
                         SELECT COUNT(*)
                           FROM rca_activation_budget_slots AS s
                           JOIN rca_activation_admission_ledger AS al
@@ -15730,6 +15755,7 @@ class RcaControlStore:
                            AND o.generation = al.generation
                            AND o.status = 'completed'
                          WHERE s.epoch_id = ?
+                           AND s.slot_kind IN ({_ACTIVATION_RELEASE_SLOT_SQL})
                         """,
                         (epoch_id,),
                     ).fetchone()[0]
@@ -15770,9 +15796,11 @@ class RcaControlStore:
                     ).fetchone()[0]
                 )
                 inflight_writes = self._activation_inflight_writes_tx(conn)
-                if consumed_slot_count != len(ACTIVATION_SLOT_KINDS):
+                if consumed_slot_count != len(ACTIVATION_RELEASE_SLOT_KINDS):
                     reason = "activation_slots_incomplete"
-                elif completed_bound_slot_count != len(ACTIVATION_SLOT_KINDS):
+                elif completed_bound_slot_count != len(
+                    ACTIVATION_RELEASE_SLOT_KINDS
+                ):
                     reason = "activation_canary_executions_incomplete"
                 elif pending_inbox:
                     reason = "activation_pending_inbox_not_drained"
@@ -15788,7 +15816,7 @@ class RcaControlStore:
                 "state": state,
                 "ready": reason == "ready",
                 "reason": reason,
-                "required_slot_count": len(ACTIVATION_SLOT_KINDS),
+                "required_slot_count": len(ACTIVATION_RELEASE_SLOT_KINDS),
                 "consumed_slot_count": consumed_slot_count,
                 "completed_bound_slot_count": completed_bound_slot_count,
                 "pending_inbox": pending_inbox,
@@ -15957,7 +15985,7 @@ class RcaControlStore:
                     )
                 bounded_canaries_completed_count = int(
                     conn.execute(
-                        """
+                        f"""
                         SELECT COUNT(*)
                           FROM rca_activation_budget_slots AS s
                           JOIN rca_activation_admission_ledger AS al
@@ -15982,6 +16010,7 @@ class RcaControlStore:
                            AND o.generation = al.generation
                            AND o.status = 'completed'
                          WHERE s.epoch_id = ?
+                           AND s.slot_kind IN ({_ACTIVATION_RELEASE_SLOT_SQL})
                         """,
                         (epoch_id,),
                     ).fetchone()[0]
@@ -16157,7 +16186,9 @@ class RcaControlStore:
                     unbound_ledger_count("1", ())
                 )
             consumed_slot_count = sum(
-                1 for slot in activation_slots.values() if slot["consumed"]
+                1
+                for slot_kind, slot in activation_slots.items()
+                if slot_kind in ACTIVATION_RELEASE_SLOT_KINDS and slot["consumed"]
             )
             inflight_writes = self._activation_inflight_writes_tx(conn)
             freeze_state = (
@@ -16170,9 +16201,11 @@ class RcaControlStore:
                 freeze_reason = "activation_epoch_unconfigured"
             elif freeze_state != "bounded_active":
                 freeze_reason = "activation_epoch_not_bounded"
-            elif consumed_slot_count != len(ACTIVATION_SLOT_KINDS):
+            elif consumed_slot_count != len(ACTIVATION_RELEASE_SLOT_KINDS):
                 freeze_reason = "activation_slots_incomplete"
-            elif bounded_canaries_completed_count != len(ACTIVATION_SLOT_KINDS):
+            elif bounded_canaries_completed_count != len(
+                ACTIVATION_RELEASE_SLOT_KINDS
+            ):
                 freeze_reason = "activation_canary_executions_incomplete"
             elif activation_backlog["pending_inbox"]:
                 freeze_reason = "activation_pending_inbox_not_drained"
@@ -16189,7 +16222,7 @@ class RcaControlStore:
                 "state": freeze_state,
                 "ready": freeze_reason == "ready",
                 "reason": freeze_reason,
-                "required_slot_count": len(ACTIVATION_SLOT_KINDS),
+                "required_slot_count": len(ACTIVATION_RELEASE_SLOT_KINDS),
                 "consumed_slot_count": consumed_slot_count,
                 "completed_bound_slot_count": bounded_canaries_completed_count,
                 "pending_inbox": activation_backlog["pending_inbox"],
@@ -16260,7 +16293,7 @@ class RcaControlStore:
                     "configured": current_epoch is not None,
                     "bounded_canaries_completed": (
                         bounded_canaries_completed_count
-                        == len(ACTIVATION_SLOT_KINDS)
+                        == len(ACTIVATION_RELEASE_SLOT_KINDS)
                     ),
                     "bounded_canaries_completed_count": (
                         bounded_canaries_completed_count

@@ -238,7 +238,8 @@ def _prepare_activation_epoch(
             ),
         ),
     }
-    for slot_kind, (source_kind, source_identity) in identities.items():
+    for slot_kind in ("manual_success", "manual_terminal_failure"):
+        source_kind, source_identity = identities[slot_kind]
         store.authorize_activation_slot(
             epoch_id=epoch_id,
             slot_kind=slot_kind,
@@ -253,7 +254,7 @@ def _prepare_activation_epoch(
             expected_state="preauthorized",
             target_state="bounded_active",
             operator="consumer-test",
-            reason="open exact bounded Kafka canary",
+            reason="open exact bounded manual canaries",
         )
     return epoch_id, identities
 
@@ -283,13 +284,6 @@ def _prepare_ready_bounded_activation(
             ),
         ),
     )
-    store.ingest_record(
-        KafkaRecord(topic=TOPIC, partition=0, offset=kafka_offset, value=_value()),
-        policy=policy,
-        submit_enabled=True,
-        activation_required=True,
-        activation_slot_kind="kafka_success",
-    )
     for slot_kind in ("manual_success", "manual_terminal_failure"):
         identity = identities[slot_kind][1]
         store.admit_manual_trigger(
@@ -310,7 +304,7 @@ def _prepare_ready_bounded_activation(
             active_policy=policy,
             activation_required=True,
         )
-    for index in range(3):
+    for index in range(2):
         claim = store.claim_outbox(
             lease_owner=f"consumer-activation-{index}",
             activation_required=True,
@@ -1161,7 +1155,7 @@ def test_activation_preauthorized_ingest_is_deferred_without_commit(tmp_path):
     assert store.list_rows("rca_outbox") == []
 
 
-def test_activation_bounded_exact_authorized_ingest_is_pending_and_commits(
+def test_activation_bounded_passive_kafka_ingest_is_shadow_and_commits(
     tmp_path,
 ):
     config = _config(
@@ -1182,9 +1176,7 @@ def test_activation_bounded_exact_authorized_ingest_is_pending_and_commits(
         commit_payload=lambda item: {("tp", item.partition): item.offset + 1},
     )
 
-    [outbox] = [
-        row for row in store.list_rows("rca_outbox") if row["status"] == "pending"
-    ]
+    [outbox] = store.list_rows("rca_outbox")
     slot = next(
         row
         for row in store.list_rows("rca_activation_budget_slots")
@@ -1192,12 +1184,12 @@ def test_activation_bounded_exact_authorized_ingest_is_pending_and_commits(
     )
     assert stats.records_committed == 1
     assert consumer.commits == [{"offsets": {("tp", 0): 21}}]
-    assert outbox["status"] == "pending"
+    assert outbox["status"] == "shadow"
     assert outbox["activation_ledger_id"] is not None
-    assert slot["consumed_ledger_id"] == outbox["activation_ledger_id"]
+    assert slot["consumed_ledger_id"] is None
 
 
-def test_resident_exact_recovery_ingests_authorized_offset_without_commit_or_progress_regression(
+def test_resident_exact_recovery_kafka_canary_is_rejected_without_progress_regression(
     tmp_path,
 ):
     request_path = tmp_path / "exact-recovery-request.json"
@@ -1251,55 +1243,28 @@ def test_resident_exact_recovery_ingests_authorized_offset_without_commit_or_pro
     ).runtime_identity.to_dict()
     ordinary_consumer = FakeConsumer([{}])
 
-    stats = consumer_module.run_poll_loop(
-        ordinary_consumer,
-        store,
-        config,
-        max_polls=1,
-        recover_on_start=False,
-        exact_recovery_reader=lambda _config, _request: (message, observation),
-        exact_recovery_runtime_identity=resident_identity,
-    )
+    with pytest.raises(consumer_module.ConsumerLoopError, match="exact_recovery"):
+        consumer_module.run_poll_loop(
+            ordinary_consumer,
+            store,
+            config,
+            max_polls=1,
+            recover_on_start=False,
+            exact_recovery_reader=lambda _config, _request: (message, observation),
+            exact_recovery_runtime_identity=resident_identity,
+        )
 
-    assert stats.exact_recovery_attempts == 1
-    assert stats.exact_recovery_succeeded == 1
     assert ordinary_consumer.commits == []
     assert store.partition_progress(topic=TOPIC, partitions=[0]) == {0: 51}
-    inbox = store.get_inbox(request["event_uid"])
-    assert inbox["decision"] == "accepted"
-    assert inbox["business_key"] == expected.business_key
-    target_outbox = next(
-        row
-        for row in store.list_rows("rca_outbox")
-        if row["source_event_id"] == request["event_uid"]
-    )
-    assert target_outbox["status"] == "pending"
+    assert store.get_inbox(request["event_uid"]) is None
     kafka_slot = next(
         row
         for row in store.list_rows("rca_activation_budget_slots")
         if row["slot_kind"] == "kafka_success"
     )
-    assert kafka_slot["consumed_ledger_id"] == target_outbox["activation_ledger_id"]
-    [transition] = [
-        row
-        for row in store.list_rows("rca_host_runtime_transitions")
-        if row["entity_key"] == request["event_uid"]
-    ]
-    assert transition["service_label"] == consumer_module.SERVICE_LABEL
+    assert kafka_slot["consumed_ledger_id"] is None
     receipt_path = consumer_module._exact_recovery_receipt_path(request_path)
-    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    assert receipt["request_sha256"] == request["request_sha256"]
-    assert receipt["kafka_offset_committed"] is False
-    assert receipt["raw_payload_persisted"] is True
-
-    receipt["kafka_offset_committed"] = True
-    receipt_path.write_bytes(consumer_module._canonical_bytes(receipt) + b"\n")
-    with pytest.raises(consumer_module.ExactRecoveryError, match="receipt_invalid"):
-        consumer_module.recover_exact_kafka_request(
-            store=store,
-            config=config,
-            runtime_identity=resident_identity,
-        )
+    assert receipt_path.exists() is False
 
 
 def test_resident_exact_recovery_failure_stops_before_ordinary_poll(tmp_path):
@@ -1688,7 +1653,7 @@ def test_activation_ready_freezes_all_partitions_and_publishes_exact_receipt(
         "partition_positions",
         "restart_required",
     }
-    assert receipt["schema_version"] == "pnc_rca_activation_ingress_freeze_v1"
+    assert receipt["schema_version"] == "pnc_rca_activation_ingress_freeze_v2"
     assert receipt["epoch_id"] == epoch_id
     assert receipt["state"] == "partitions_paused"
     assert receipt["partition_positions"] == {TOPIC: {"0": 21}}
@@ -1721,9 +1686,9 @@ def test_activation_freeze_rewinds_nonempty_batch_observed_after_poll(
         "state": "bounded_active",
         "ready": False,
         "reason": "activation_slots_incomplete",
-        "required_slot_count": 3,
-        "consumed_slot_count": 2,
-        "completed_bound_slot_count": 2,
+        "required_slot_count": 2,
+        "consumed_slot_count": 1,
+        "completed_bound_slot_count": 1,
         "pending_inbox": 0,
         "unbound_ledger": 0,
         "inflight_writes": 0,
@@ -1731,9 +1696,9 @@ def test_activation_freeze_rewinds_nonempty_batch_observed_after_poll(
     ready = {
         **not_ready,
         "ready": True,
-        "reason": "activation_bounded_complete",
-        "consumed_slot_count": 3,
-        "completed_bound_slot_count": 3,
+        "reason": "ready",
+        "consumed_slot_count": 2,
+        "completed_bound_slot_count": 2,
     }
     readiness = iter((not_ready, ready))
     monkeypatch.setattr(
@@ -1876,9 +1841,8 @@ def test_activation_freeze_rejects_unproven_uncommitted_partition_position(
     assert health["activation_freeze"] is None
 
 
-def test_bounded_batch_rechecks_readiness_after_first_canary_and_rewinds_tail(
+def test_bounded_ready_freezes_before_passive_kafka_batch(
     tmp_path,
-    monkeypatch,
 ):
     config = _config(
         tmp_path,
@@ -1913,7 +1877,7 @@ def test_bounded_batch_rechecks_readiness_after_first_canary_and_rewinds_tail(
         )
     for index in range(2):
         claim = store.claim_outbox(
-            lease_owner=f"consumer-two-of-three-{index}",
+            lease_owner=f"consumer-two-canaries-{index}",
             activation_required=True,
         )
         assert claim is not None
@@ -1925,26 +1889,7 @@ def test_bounded_batch_rechecks_readiness_after_first_canary_and_rewinds_tail(
     initial = store.health()["activation"]["ingress_freeze_readiness"]
     assert initial["consumed_slot_count"] == 2
     assert initial["completed_bound_slot_count"] == 2
-    assert initial["ready"] is False
-
-    original_ingest = store.ingest_record
-
-    def ingest_and_complete_kafka_canary(record, **kwargs):
-        result = original_ingest(record, **kwargs)
-        if record.offset == 20:
-            claim = store.claim_outbox(
-                lease_owner="consumer-third-canary",
-                activation_required=True,
-            )
-            assert claim is not None
-            store.complete_outbox(
-                outbox_id=claim.outbox_id,
-                lease_token=claim.lease_token,
-                result={"outcome": "kafka_canary_completed"},
-            )
-        return result
-
-    monkeypatch.setattr(store, "ingest_record", ingest_and_complete_kafka_canary)
+    assert initial["ready"] is True
     topic_partition = FreezeTopicPartition(TOPIC, 0)
     messages = [
         _message(offset=20),
@@ -1977,15 +1922,15 @@ def test_bounded_batch_rechecks_readiness_after_first_canary_and_rewinds_tail(
     )
 
     health = json.loads(config.health_path.read_text(encoding="utf-8"))
-    assert stats.records_seen == 1
-    assert stats.records_committed == 1
+    assert stats.records_seen == 0
+    assert stats.records_committed == 0
     assert stats.activation_freezes == 1
-    assert consumer.commits == [{"offsets": {topic_partition: 21}}]
-    assert consumer.seek_calls == [(topic_partition, 21)]
+    assert consumer.commits == []
+    assert consumer.seek_calls == [(topic_partition, 20)]
     assert health["activation_freeze"]["partition_positions"] == {
-        TOPIC: {"0": 21}
+        TOPIC: {"0": 20}
     }
-    assert store.get_inbox(f"{TOPIC}:0:20")["decision"] == "accepted"
+    assert store.get_inbox(f"{TOPIC}:0:20") is None
     assert store.get_inbox(f"{TOPIC}:0:21") is None
     assert store.get_inbox(f"{TOPIC}:0:22") is None
 
@@ -2236,7 +2181,7 @@ def test_activation_freeze_releases_on_epoch_identity_change(tmp_path):
             "state": "preauthorized",
             "ready": False,
             "reason": "activation_slots_incomplete",
-            "required_slot_count": 3,
+            "required_slot_count": 2,
             "consumed_slot_count": 0,
             "completed_bound_slot_count": 0,
             "pending_inbox": 0,

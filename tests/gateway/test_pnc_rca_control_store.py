@@ -9,7 +9,7 @@ import pytest
 from gateway import pnc_rca_control_store as control_store_module
 from gateway.pnc_rca_admission import build_rca_admission
 from gateway.pnc_rca_control_store import (
-    ACTIVATION_SLOT_KINDS,
+    ACTIVATION_RELEASE_SLOT_KINDS,
     ActivationEpochError,
     ActivationIngressDeferredError,
     CapacityTransitionStateError,
@@ -552,7 +552,8 @@ def _authorize_activation_slots(
             ),
         ),
     }
-    for slot_kind, (source_kind, source_identity) in identities.items():
+    for slot_kind in ACTIVATION_RELEASE_SLOT_KINDS:
+        source_kind, source_identity = identities[slot_kind]
         store.authorize_activation_slot(
             epoch_id=epoch_id,
             slot_kind=slot_kind,
@@ -585,7 +586,7 @@ def _begin_bounded_activation(
         expected_state="preauthorized",
         target_state="bounded_active",
         operator="release-test",
-        reason="begin exact three-canary bounded activation",
+        reason="begin exact two-canary bounded activation",
     )
     return identities
 
@@ -882,14 +883,7 @@ def test_activation_state_machine_requires_exact_receipts_and_is_audited(
         expected_state="preauthorized",
         target_state="bounded_active",
         operator="release-test",
-        reason="open bounded three-slot activation",
-    )
-    kafka = store.ingest_record(
-        _record(offset=20),
-        policy=_policy(),
-        submit_enabled=True,
-        activation_required=True,
-        activation_slot_kind="kafka_success",
+        reason="open bounded two-slot activation",
     )
     manual_success = identities["manual_success"][1]
     success = store.admit_manual_trigger(
@@ -917,13 +911,13 @@ def test_activation_state_machine_requires_exact_receipts_and_is_audited(
         active_policy=_policy(),
         activation_required=True,
     )
-    assert {kafka.submission_key, success.submission_key, terminal.submission_key} == {
+    assert {success.submission_key, terminal.submission_key} == {
         row["submission_key"]
         for row in store.list_rows("rca_outbox")
         if row["activation_epoch_id"] == "rca-release-20260712"
     }
 
-    for index in range(3):
+    for index in range(2):
         claim = store.claim_outbox(
             lease_owner=f"activation-canary-{index}",
             activation_required=True,
@@ -945,9 +939,9 @@ def test_activation_state_machine_requires_exact_receipts_and_is_audited(
         "state": "bounded_active",
         "ready": True,
         "reason": "ready",
-        "required_slot_count": 3,
-        "consumed_slot_count": 3,
-        "completed_bound_slot_count": 3,
+        "required_slot_count": 2,
+        "consumed_slot_count": 2,
+        "completed_bound_slot_count": 2,
         "pending_inbox": 0,
         "unbound_ledger": 0,
         "inflight_writes": 0,
@@ -1067,7 +1061,6 @@ def test_activation_confirmation_rejects_consumed_but_unbound_slots(tmp_path):
     store = RcaControlStore(tmp_path / "control.sqlite3")
     identities = _begin_bounded_activation(store)
     requests = (
-        ("kafka_success", "kafka_ingest", "kafka"),
         ("manual_success", "manual_admit", "manual"),
         ("manual_terminal_failure", "manual_admit", "manual"),
     )
@@ -1113,14 +1106,14 @@ def test_bounded_slot_consume_is_atomic_idempotent_and_survives_restart(tmp_path
     def compete(index: int):
         return _adjudicate_activation(
             store,
-            entrypoint="kafka_ingest",
-            source_kind="kafka",
-            source_identity=identities["kafka_success"][1],
+            entrypoint="manual_admit",
+            source_kind="manual",
+            source_identity=identities["manual_success"][1],
             business_key=f"business-{index}",
             submission_key=f"submission-{index}",
             generation=1,
             new_execution=True,
-            requested_slot_kind="kafka_success",
+            requested_slot_kind="manual_success",
         )
 
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -1131,7 +1124,7 @@ def test_bounded_slot_consume_is_atomic_idempotent_and_survives_restart(tmp_path
         for index, result in enumerate(results)
         if result.decision == "admit"
     )
-    [loser] = [result for result in results if result.decision == "shadow"]
+    [loser] = [result for result in results if result.decision == "reject"]
     assert winner.consumed_slot is True
     assert loser.reason == "activation_bounded_slot_consumed"
     restarted = RcaControlStore(path)
@@ -1142,7 +1135,7 @@ def test_bounded_slot_consume_is_atomic_idempotent_and_survives_restart(tmp_path
     [slot] = [
         row
         for row in restarted.list_rows("rca_activation_budget_slots")
-        if row["slot_kind"] == "kafka_success"
+        if row["slot_kind"] == "manual_success"
     ]
     assert slot["consumed_ledger_id"] == winner.ledger_id
     assert len(
@@ -1216,7 +1209,7 @@ def test_preauthorized_enabled_kafka_is_deferred_and_manual_is_rejected(
     ] == []
 
 
-def test_shadow_promotion_consumes_exact_slot_atomically_and_replay_is_inert(
+def test_bounded_passive_kafka_shadow_cannot_consume_release_slot(
     tmp_path,
 ):
     store = RcaControlStore(tmp_path / "control.sqlite3")
@@ -1256,38 +1249,33 @@ def test_shadow_promotion_consumes_exact_slot_atomically_and_replay_is_inert(
             activation_slot_kind="manual_success",
         )
 
-    promoted = store.promote_shadow_event(
-        accepted.event_uid,
-        operator="release-test",
-        reason="promote the exact bounded Kafka canary",
-        activation_required=True,
-        activation_slot_kind="kafka_success",
-    )
-    replay = store.promote_shadow_event(
-        accepted.event_uid,
-        operator="release-test",
-        reason="idempotent operator retry",
-        activation_required=True,
-        activation_slot_kind="kafka_success",
-    )
+    with pytest.raises(
+        ShadowPromotionError,
+        match="activation_bounded_identity_not_authorized",
+    ):
+        store.promote_shadow_event(
+            accepted.event_uid,
+            operator="release-test",
+            reason="passive Kafka cannot consume a bounded release slot",
+            activation_required=True,
+            activation_slot_kind="kafka_success",
+        )
 
-    assert promoted.promoted is True
-    assert replay.promoted is False
     [outbox] = store.list_rows("rca_outbox")
     [trigger] = store.list_rows("business_triggers")
-    assert outbox["status"] == trigger["state"] == "pending"
+    assert outbox["status"] == trigger["state"] == "shadow"
     kafka_slot = next(
         row
         for row in store.list_rows("rca_activation_budget_slots")
         if row["slot_kind"] == "kafka_success"
     )
-    assert kafka_slot["consumed_ledger_id"] == outbox["activation_ledger_id"]
+    assert kafka_slot["consumed_ledger_id"] is None
     ledger = next(
         row
         for row in store.list_rows("rca_activation_admission_ledger")
         if row["ledger_id"] == outbox["activation_ledger_id"]
     )
-    assert ledger["decision"] == "admit"
+    assert ledger["decision"] == "reject"
 
 
 def test_confirmed_reconciles_only_exact_fenced_shadow_before_steady(tmp_path):
@@ -1301,20 +1289,12 @@ def test_confirmed_reconciles_only_exact_fenced_shadow_before_steady(tmp_path):
         operator="release-test",
         reason="open exact canaries while holding ordinary Kafka work",
     )
-    canary = store.ingest_record(
+    catchup = store.ingest_record(
         _record(offset=20),
         policy=_policy(),
         submit_enabled=True,
         activation_required=True,
-        activation_slot_kind="kafka_success",
     )
-    catchup = store.ingest_record(
-        _record(offset=21, value=_value(work_item_id=7041712816)),
-        policy=_policy(),
-        submit_enabled=True,
-        activation_required=True,
-    )
-    assert canary.reason == "creation_policy_matched"
     for slot_kind in ("manual_success", "manual_terminal_failure"):
         identity = identities[slot_kind][1]
         store.admit_manual_trigger(
@@ -1330,7 +1310,7 @@ def test_confirmed_reconciles_only_exact_fenced_shadow_before_steady(tmp_path):
             active_policy=_policy(),
             activation_required=True,
         )
-    for index in range(3):
+    for index in range(2):
         claim = store.claim_outbox(
             lease_owner=f"confirmed-canary-{index}",
             activation_required=True,
@@ -1342,13 +1322,13 @@ def test_confirmed_reconciles_only_exact_fenced_shadow_before_steady(tmp_path):
             result={"outcome": "confirmed_canary_recorded"},
         )
     late = store.ingest_record(
-        _record(offset=22, value=_value(work_item_id=7041712817)),
+        _record(offset=21, value=_value(work_item_id=7041712817)),
         policy=_policy(),
         submit_enabled=True,
         activation_required=True,
     )
-    confirmation_preconditions = _confirmation_preconditions(
-        store, {TOPIC: {"2": 23}}
+    stale_confirmation_preconditions = _confirmation_preconditions(
+        store, {TOPIC: {"2": 21}}
     )
     with pytest.raises(
         ActivationEpochError, match="activation_shadow_outside_end_fence"
@@ -1357,18 +1337,21 @@ def test_confirmed_reconciles_only_exact_fenced_shadow_before_steady(tmp_path):
             epoch_id="rca-release-20260712",
             expected_state="bounded_active",
             target_state="confirmed",
-            partition_end_fence={TOPIC: {"2": 22}},
+            partition_end_fence={TOPIC: {"2": 21}},
             production_fingerprint="3" * 64,
             production_gate_receipt_sha256="4" * 64,
-            **confirmation_preconditions,
+            **stale_confirmation_preconditions,
             operator="release-test",
             reason="stale end fence must reject a raced bounded shadow",
         )
+    confirmation_preconditions = _confirmation_preconditions(
+        store, {TOPIC: {"2": 22}}
+    )
     store.transition_activation_epoch(
         epoch_id="rca-release-20260712",
         expected_state="bounded_active",
         target_state="confirmed",
-        partition_end_fence={TOPIC: {"2": 23}},
+        partition_end_fence={TOPIC: {"2": 22}},
         production_fingerprint="3" * 64,
         production_gate_receipt_sha256="4" * 64,
         **confirmation_preconditions,
@@ -1486,8 +1469,9 @@ def test_activation_health_is_payload_free_and_counts_held_lineage(tmp_path):
     assert activation["current_epoch"]["epoch_id"] == "rca-release-20260712"
     assert activation["current_epoch"]["state"] == "bounded_active"
     assert activation["slots"] == {
-        slot_kind: {"authorized": True, "consumed": False}
-        for slot_kind in ACTIVATION_SLOT_KINDS
+        "kafka_success": {"authorized": False, "consumed": False},
+        "manual_success": {"authorized": True, "consumed": False},
+        "manual_terminal_failure": {"authorized": True, "consumed": False},
     }
     assert activation["ledger"] == {
         "admit": 0,
@@ -1532,14 +1516,14 @@ def test_activation_unbound_health_counts_only_current_creating_ledgers(tmp_path
 
     admitted = _adjudicate_activation(
         store,
-        entrypoint="kafka_ingest",
-        source_kind="kafka",
-        source_identity=identities["kafka_success"][1],
+        entrypoint="manual_admit",
+        source_kind="manual",
+        source_identity=identities["manual_success"][1],
         business_key="unbound-business",
         submission_key="unbound-submission",
         generation=1,
         new_execution=True,
-        requested_slot_kind="kafka_success",
+        requested_slot_kind="manual_success",
     )
     assert admitted.decision == "admit"
     backlog = store.health()["activation"]["backlog"]
@@ -1564,14 +1548,6 @@ def test_bounded_manual_slots_auto_resolve_two_canaries_without_restart(tmp_path
     success_url = "https://project.feishu.cn/g1q3/issue/detail/7041712814"
     terminal_url = "https://project.feishu.cn/g1q3/issue/detail/7041712815"
     _create_activation_epoch(store)
-    store.authorize_activation_slot(
-        epoch_id="rca-release-20260712",
-        slot_kind="kafka_success",
-        source_kind="kafka",
-        source_identity={"event_uid": f"{TOPIC}:2:20"},
-        operator="release-test",
-        reason="authorize Kafka canary",
-    )
     store.authorize_activation_slot(
         epoch_id="rca-release-20260712",
         slot_kind="manual_success",
@@ -3973,7 +3949,7 @@ def test_terminal_replacement_transaction_rolls_back_and_retries_cleanly(
     assert len(store.list_rows("rca_outbox")) == 2
 
 
-def test_terminal_replacement_consumes_and_binds_exact_activation_slot(tmp_path):
+def test_terminal_replacement_kafka_is_held_during_bounded_activation(tmp_path):
     store = RcaControlStore(tmp_path / "control.sqlite3")
     first = store.ingest_record(
         _record(10), policy=_policy(), submit_enabled=True
@@ -3989,33 +3965,16 @@ def test_terminal_replacement_consumes_and_binds_exact_activation_slot(tmp_path)
         activation_slot_kind="kafka_success",
     )
 
-    assert replacement.generation == 2
-    assert replacement.rearm_reason == INPUT_WAIT_TERMINAL_NEW_GENERATION_REASON
-    outboxes = store.list_rows("rca_outbox")
-    old_outbox, new_outbox = outboxes
-    assert old_outbox["activation_epoch_id"] is None
-    assert old_outbox["activation_ledger_id"] is None
-    assert new_outbox["activation_epoch_id"] == "rca-release-20260712"
-    assert new_outbox["activation_ledger_id"] is not None
-    new_trigger = store.list_rows("business_triggers")[1]
-    assert new_trigger["activation_epoch_id"] == new_outbox["activation_epoch_id"]
-    assert new_trigger["activation_ledger_id"] == new_outbox["activation_ledger_id"]
-    [ledger] = [
-        row
-        for row in store.list_rows("rca_activation_admission_ledger")
-        if row["ledger_id"] == new_outbox["activation_ledger_id"]
-    ]
-    assert ledger["source_kind"] == "kafka"
-    assert ledger["business_key"] == replacement.business_key
-    assert ledger["submission_key"] == replacement.submission_key
-    assert ledger["generation"] == 2
-    assert ledger["decision"] == "admit"
+    assert replacement.generation == 0
+    assert replacement.outbox_created is False
+    assert replacement.reason == "activation_existing_generation_not_eligible"
+    assert len(store.list_rows("rca_outbox")) == 1
     kafka_slot = next(
         row
         for row in store.list_rows("rca_activation_budget_slots")
         if row["slot_kind"] == "kafka_success"
     )
-    assert kafka_slot["consumed_ledger_id"] == ledger["ledger_id"]
+    assert kafka_slot["consumed_ledger_id"] is None
 
 
 def test_failed_next_generation_advances_again_without_rearming_old_baseline(
@@ -4602,13 +4561,18 @@ def test_activation_transition_fences_claimed_worker_and_renewal_rechecks_state(
     tmp_path,
 ):
     store = RcaControlStore(tmp_path / "control.sqlite3")
-    _begin_bounded_activation(store)
-    store.ingest_record(
-        _record(offset=20),
-        policy=_policy(),
+    identities = _begin_bounded_activation(store)
+    manual = identities["manual_success"][1]
+    store.admit_manual_trigger(
+        _manual_request(
+            manual["message_id"],
+            issue_url=manual["issue_url"],
+            thread_id=manual["thread_id"],
+        ),
+        allowed_chat_ids={"oc_allowed"},
         submit_enabled=True,
+        active_policy=_policy(),
         activation_required=True,
-        activation_slot_kind="kafka_success",
     )
     current = datetime.now(timezone.utc) + timedelta(seconds=1)
     claim = store.claim_outbox(

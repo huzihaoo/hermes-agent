@@ -25,6 +25,7 @@ if str(REPO_ROOT) not in sys.path:
 from dotenv import load_dotenv
 
 from gateway.pnc_rca_control_store import (
+    ACTIVATION_RELEASE_SLOT_KINDS,
     ActivationIngressDeferredError,
     KafkaRecord,
     RcaControlStore,
@@ -55,11 +56,11 @@ from hermes_constants import get_hermes_home
 
 ENV_PREFIX = "HERMES_RCA_KAFKA_"
 CONSUMER_HEALTH_SCHEMA_VERSION = "pnc_rca_kafka_consumer_health_v2"
-ACTIVATION_FREEZE_SCHEMA_VERSION = "pnc_rca_activation_ingress_freeze_v1"
+ACTIVATION_FREEZE_SCHEMA_VERSION = "pnc_rca_activation_ingress_freeze_v2"
 ACTIVATION_FREEZE_RELEASE_SCHEMA_VERSION = (
-    "pnc_rca_activation_ingress_freeze_release_v1"
+    "pnc_rca_activation_ingress_freeze_release_v2"
 )
-ACTIVATION_FREEZE_REQUIRED_SLOT_COUNT = 3
+ACTIVATION_FREEZE_REQUIRED_SLOT_COUNT = len(ACTIVATION_RELEASE_SLOT_KINDS)
 SERVICE_LABEL = "local.pnc.rca-kafka-consumer"
 MAX_CONFIG_JSON_NESTING = 32
 FIXED_SERVICE_ID = "root_cause_analysis_agent"

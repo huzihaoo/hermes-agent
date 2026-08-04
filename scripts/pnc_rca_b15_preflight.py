@@ -673,7 +673,7 @@ def _kafka_fence_gate(
     runtime_identity = runtime_identity if isinstance(runtime_identity, Mapping) else {}
     identity_sha = canonical_json_sha256(dict(runtime_identity))
     ready = bool(
-        freeze.get("schema_version") == "pnc_rca_activation_ingress_freeze_v1"
+        freeze.get("schema_version") == "pnc_rca_activation_ingress_freeze_v2"
         and bool(str(freeze.get("epoch_id") or ""))
         and freeze.get("state") == "partitions_paused"
         and HEX64_RE.fullmatch(str(freeze.get("freeze_token") or ""))

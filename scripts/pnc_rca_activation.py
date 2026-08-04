@@ -21,6 +21,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from gateway.pnc_rca_control_store import (
+    ACTIVATION_KAFKA_PROOF_MODE,
+    ACTIVATION_RELEASE_SLOT_KINDS,
     ACTIVATION_SLOT_KINDS,
     CONTROL_STORE_SCHEMA_VERSION,
     ActivationEpochError,
@@ -397,6 +399,8 @@ def _canonical_preproduction_transition(
         "expected_config_sha256",
         "expected_db_logical_identity_sha256",
         "expected_partition_start_fence_sha256",
+        "kafka_proof_mode",
+        "required_slot_kinds",
         "canary_slot_plan",
         "canary_slot_plan_sha256",
         "preproduction_fingerprint",
@@ -409,6 +413,8 @@ def _canonical_preproduction_transition(
         "epoch_id": _normalized_epoch_id(str(value.get("epoch_id") or "")),
         "expected_state": value.get("expected_state"),
         "target_state": value.get("target_state"),
+        "kafka_proof_mode": value.get("kafka_proof_mode"),
+        "required_slot_kinds": value.get("required_slot_kinds"),
     }
     canary_slot_plan = _normalize_canary_slot_plan(value.get("canary_slot_plan"))
     normalized["canary_slot_plan"] = canary_slot_plan
@@ -418,6 +424,8 @@ def _canonical_preproduction_transition(
             "epoch_id",
             "expected_state",
             "target_state",
+            "kafka_proof_mode",
+            "required_slot_kinds",
             "canary_slot_plan",
         }
     ):
@@ -425,6 +433,9 @@ def _canonical_preproduction_transition(
     if (
         normalized["expected_state"] != "safe_off"
         or normalized["target_state"] != "preauthorized"
+        or normalized["kafka_proof_mode"] != ACTIVATION_KAFKA_PROOF_MODE
+        or normalized["required_slot_kinds"]
+        != list(ACTIVATION_RELEASE_SLOT_KINDS)
         or normalized["canary_slot_plan_sha256"] != _sha256_json(canary_slot_plan)
     ):
         raise ActivationCliError("activation_preproduction_capsule_rejected")
@@ -609,7 +620,9 @@ def _normalize_manual_identity(value: Mapping[str, Any]) -> dict[str, str]:
 
 
 def _normalize_canary_slot_plan(value: Any) -> dict[str, dict[str, Any]]:
-    if not isinstance(value, Mapping) or set(value) != set(ACTIVATION_SLOT_KINDS):
+    if not isinstance(value, Mapping) or set(value) != set(
+        ACTIVATION_RELEASE_SLOT_KINDS
+    ):
         raise ActivationCliError("activation_canary_slot_plan_invalid")
     expected_source = {
         "kafka_success": ("kafka", "kafka_ingest", "success"),
@@ -621,7 +634,7 @@ def _normalize_canary_slot_plan(value: Any) -> dict[str, dict[str, Any]]:
         ),
     }
     normalized: dict[str, dict[str, Any]] = {}
-    for slot_kind in sorted(ACTIVATION_SLOT_KINDS):
+    for slot_kind in sorted(ACTIVATION_RELEASE_SLOT_KINDS):
         raw_slot = value.get(slot_kind)
         if not isinstance(raw_slot, Mapping) or set(raw_slot) != {
             "source_kind",
@@ -694,12 +707,12 @@ def _normalize_canary_slot_plan(value: Any) -> dict[str, dict[str, Any]]:
         }
     if (
         len({slot["source_identity_sha256"] for slot in normalized.values()})
-        != len(ACTIVATION_SLOT_KINDS)
+        != len(ACTIVATION_RELEASE_SLOT_KINDS)
         or len({
             str(slot["expected_admission"]["submission_key"])
             for slot in normalized.values()
         })
-        != len(ACTIVATION_SLOT_KINDS)
+        != len(ACTIVATION_RELEASE_SLOT_KINDS)
         or len(_canonical_json(normalized).encode("utf-8")) > MAX_JSON_INPUT_BYTES
     ):
         raise ActivationCliError("activation_canary_slot_plan_invalid")
@@ -1002,7 +1015,7 @@ def _authorize(store: RcaControlStore, args: argparse.Namespace) -> dict[str, An
     )
     _require_preproduction_binding(current, transition)
     slot = str(args.slot_kind or "").strip()
-    if slot not in ACTIVATION_SLOT_KINDS:
+    if slot not in ACTIVATION_RELEASE_SLOT_KINDS:
         raise ActivationCliError("activation_slot_kind_invalid")
     if slot == "kafka_success":
         if not args.event_uid or args.manual_identity_json is not None:
@@ -1108,7 +1121,7 @@ def _transition_bounded(
             "source_kind": planned[slot_kind]["source_kind"],
             "source_identity_sha256": planned[slot_kind]["source_identity_sha256"],
         }
-        for slot_kind in sorted(ACTIVATION_SLOT_KINDS)
+        for slot_kind in sorted(ACTIVATION_RELEASE_SLOT_KINDS)
     }
     if store.activation_slot_authorizations(epoch_id=epoch_id) != (
         expected_authorizations
@@ -1430,7 +1443,7 @@ def _require_bounded_preproduction_scope(
             "source_kind": planned[slot_kind]["source_kind"],
             "source_identity_sha256": planned[slot_kind]["source_identity_sha256"],
         }
-        for slot_kind in sorted(ACTIVATION_SLOT_KINDS)
+        for slot_kind in sorted(ACTIVATION_RELEASE_SLOT_KINDS)
     }
     if (
         store.activation_slot_authorizations(epoch_id=str(current["epoch_id"]))
@@ -1946,7 +1959,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     authorize = commands.add_parser("authorize")
     _add_mutation_arguments(authorize)
-    authorize.add_argument("--slot-kind", choices=ACTIVATION_SLOT_KINDS, required=True)
+    authorize.add_argument(
+        "--slot-kind", choices=ACTIVATION_RELEASE_SLOT_KINDS, required=True
+    )
     authorize.add_argument("--preproduction-capsule", type=Path, required=True)
     identity = authorize.add_mutually_exclusive_group(required=True)
     identity.add_argument("--event-uid")

@@ -113,12 +113,6 @@ def _preauthorization_input(epoch_id: str = EPOCH_ID) -> dict[str, Any]:
 
 def _canary_slot_plan() -> dict[str, dict[str, Any]]:
     identities: dict[str, dict[str, Any]] = {
-        "kafka_success": {
-            "event_uid": f"{TOPIC}:0:12",
-            "offset": 12,
-            "partition": 0,
-            "topic": TOPIC,
-        },
         "manual_success": {
             "chat_id": "oc_activation_test",
             "requester_id": "ou_activation_test",
@@ -183,6 +177,10 @@ def _preproduction_input(epoch_id: str = EPOCH_ID) -> dict[str, Any]:
         "expected_partition_start_fence_sha256": preauthorization[
             "partition_start_fence_sha256"
         ],
+        "kafka_proof_mode": activation_module.ACTIVATION_KAFKA_PROOF_MODE,
+        "required_slot_kinds": list(
+            activation_module.ACTIVATION_RELEASE_SLOT_KINDS
+        ),
         "canary_slot_plan": canary_slot_plan,
         "canary_slot_plan_sha256": activation_module._sha256_json(
             canary_slot_plan
@@ -662,14 +660,6 @@ def _create_epoch(store: RcaControlStore) -> None:
 
 
 def _authorize_all_slots(store: RcaControlStore) -> None:
-    store.authorize_activation_slot(
-        epoch_id=EPOCH_ID,
-        slot_kind="kafka_success",
-        source_kind="kafka",
-        source_identity={"event_uid": f"{TOPIC}:0:12"},
-        operator=OPERATOR,
-        reason=REASON,
-    )
     for slot, message_id, issue_id in (
         ("manual_success", "om-success", 7041712813),
         ("manual_terminal_failure", "om-failure", 7041712814),
@@ -875,27 +865,35 @@ def test_create_can_supersede_one_exact_aborted_epoch(tmp_path, capsys):
     assert current["state"] == "safe_off"
 
 
-def test_authorize_plan_apply_and_idempotent_retry_use_one_exact_event(
+def test_authorize_plan_apply_and_idempotent_retry_use_one_exact_manual_message(
     tmp_path, capsys
 ):
     db_path = tmp_path / "control.sqlite3"
     store = RcaControlStore(db_path)
     _create_epoch(store)
-    event_uid = f"{TOPIC}:0:12"
+    identity_value = {
+        "chat_id": "oc_activation_test",
+        "requester_id": "ou_activation_test",
+        "message_id": "om-success",
+        "thread_id": "topic:om-success",
+        "issue_url": "https://project.feishu.cn/g1q3/issue/detail/7041712813",
+        "mode": "run_or_join",
+    }
+    identity = _write_json(tmp_path, "manual-success.json", identity_value)
     args = [
         *_mutation_args(db_path, "authorize"),
         "--slot-kind",
-        "kafka_success",
+        "manual_success",
         "--preproduction-capsule",
         str(_authorization_capsule(tmp_path)),
-        "--event-uid",
-        event_uid,
+        "--manual-identity-json",
+        str(identity),
     ]
 
     plan_code, plan = _invoke(capsys, args)
     assert plan_code == 0
     assert plan["mode"] == "plan"
-    assert store.health()["activation"]["slots"]["kafka_success"]["authorized"] is False
+    assert store.health()["activation"]["slots"]["manual_success"]["authorized"] is False
 
     apply_args = [*args, "--apply"]
     first_code, first = _invoke(capsys, apply_args)
@@ -904,17 +902,10 @@ def test_authorize_plan_apply_and_idempotent_retry_use_one_exact_event(
     assert first_code == second_code == 0
     assert first["result"] == second["result"]
     assert first["result"]["source_identity_sha256"] == hashlib.sha256(
-        activation_module._canonical_json(
-            {
-                "event_uid": event_uid,
-                "offset": 12,
-                "partition": 0,
-                "topic": TOPIC,
-            }
-        ).encode()
+        activation_module._canonical_json(identity_value).encode()
     ).hexdigest()
-    assert event_uid not in json.dumps(first, sort_keys=True)
-    assert store.health()["activation"]["slots"]["kafka_success"]["authorized"] is True
+    assert identity_value["message_id"] not in json.dumps(first, sort_keys=True)
+    assert store.health()["activation"]["slots"]["manual_success"]["authorized"] is True
 
 
 def test_authorize_rejects_valid_identity_outside_frozen_canary_plan(
@@ -929,18 +920,25 @@ def test_authorize_rejects_valid_identity_outside_frozen_canary_plan(
         [
             *_mutation_args(db_path, "authorize"),
             "--slot-kind",
-            "kafka_success",
+            "manual_success",
             "--preproduction-capsule",
             str(_authorization_capsule(tmp_path)),
-            "--event-uid",
-            f"{TOPIC}:0:13",
+            "--manual-identity-json",
+            str(
+                _manual_identity(
+                    tmp_path,
+                    "manual-outside-plan.json",
+                    message_id="om-outside-plan",
+                    issue_id=7041712813,
+                )
+            ),
         ],
     )
 
     assert code == 2
     assert payload["code"] == "activation_canary_plan_identity_mismatch"
     assert store.activation_slot_authorizations(epoch_id=EPOCH_ID)[
-        "kafka_success"
+        "manual_success"
     ]["source_identity_sha256"] is None
 
 
@@ -978,7 +976,9 @@ def test_authorize_rejects_manual_identity_extra_fields_without_echoing_payload(
     assert store.health()["activation"]["slots"]["manual_success"]["authorized"] is False
 
 
-def test_event_uid_rejects_wildcard_and_never_echoes_argument(tmp_path, capsys):
+def test_kafka_release_slot_is_not_authorizable_and_never_echoes_argument(
+    tmp_path, capsys
+):
     db_path = tmp_path / "control.sqlite3"
     store = RcaControlStore(db_path)
     _create_epoch(store)
@@ -998,7 +998,7 @@ def test_event_uid_rejects_wildcard_and_never_echoes_argument(tmp_path, capsys):
     )
 
     assert code == 2
-    assert payload["code"] == "activation_event_uid_invalid"
+    assert payload["code"] == "activation_cli_arguments_invalid"
     assert invalid not in json.dumps(payload, sort_keys=True)
 
 
@@ -1036,13 +1036,12 @@ def test_transition_bounded_rejects_authorizations_outside_frozen_plan(
     _authorize_all_slots(store)
     drifted = _preproduction_input()
     identity = {
-        "event_uid": f"{TOPIC}:0:13",
-        "offset": 13,
-        "partition": 0,
-        "topic": TOPIC,
+        **drifted["canary_slot_plan"]["manual_success"]["source_identity"],
+        "message_id": "om-drifted",
+        "thread_id": "topic:om-drifted",
     }
-    drifted["canary_slot_plan"]["kafka_success"]["source_identity"] = identity
-    drifted["canary_slot_plan"]["kafka_success"][
+    drifted["canary_slot_plan"]["manual_success"]["source_identity"] = identity
+    drifted["canary_slot_plan"]["manual_success"][
         "source_identity_sha256"
     ] = activation_module._sha256_json(identity)
     drifted["canary_slot_plan_sha256"] = activation_module._sha256_json(

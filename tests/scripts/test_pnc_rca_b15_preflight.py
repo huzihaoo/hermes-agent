@@ -160,7 +160,7 @@ def _build_fixture(
             },
             "store": {"ok": True},
             "activation_freeze": {
-                "schema_version": "pnc_rca_activation_ingress_freeze_v1",
+                "schema_version": "pnc_rca_activation_ingress_freeze_v2",
                 "epoch_id": "epoch-fixture",
                 "state": "partitions_paused",
                 "freeze_token": "c" * 64,

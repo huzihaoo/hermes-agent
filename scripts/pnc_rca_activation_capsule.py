@@ -24,7 +24,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from gateway.pnc_rca_control_store import (
-    ACTIVATION_SLOT_KINDS,
+    ACTIVATION_KAFKA_PROOF_MODE,
+    ACTIVATION_RELEASE_SLOT_KINDS,
     CONTROL_STORE_SCHEMA_VERSION,
     RcaControlStore,
 )
@@ -42,7 +43,7 @@ RELEASE_GATE_SCHEMA_VERSION = "pnc_rca_release_gate_v1"
 PREAUTHORIZATION_CAPSULE_SCHEMA_VERSION = (
     "pnc_rca_activation_preauthorization_capsule_v2"
 )
-PREPRODUCTION_CAPSULE_SCHEMA_VERSION = "pnc_rca_activation_preproduction_capsule_v1"
+PREPRODUCTION_CAPSULE_SCHEMA_VERSION = "pnc_rca_activation_preproduction_capsule_v2"
 CONFIRMATION_CAPSULE_SCHEMA_VERSION = "pnc_rca_activation_confirmation_capsule_v2"
 STAGE_PAIR_COMMIT_SCHEMA_VERSION = "pnc_rca_activation_stage_pair_commit_v1"
 CONFIRMATION_PAIR_COMMIT_SCHEMA_VERSION = (
@@ -51,7 +52,7 @@ CONFIRMATION_PAIR_COMMIT_SCHEMA_VERSION = (
 PREAUTHORIZATION_MATERIAL_SCHEMA_VERSION = (
     "pnc_rca_activation_preauthorization_material_v2"
 )
-PREPRODUCTION_MATERIAL_SCHEMA_VERSION = "pnc_rca_activation_preproduction_material_v1"
+PREPRODUCTION_MATERIAL_SCHEMA_VERSION = "pnc_rca_activation_preproduction_material_v2"
 CAPSULE_CLI_SCHEMA_VERSION = "pnc_rca_activation_capsule_cli_v1"
 MAX_CAPSULE_BYTES = 256 * 1024
 MAX_RECEIPT_BYTES = 4 * 1024 * 1024
@@ -61,7 +62,7 @@ LIVE_HEALTH_MAX_AGE_SECONDS = 60
 GATEWAY_SERVICE_LABEL = "ai.hermes.gateway"
 CONSUMER_SERVICE_LABEL = "local.pnc.rca-kafka-consumer"
 CONSUMER_HEALTH_SCHEMA_VERSION = "pnc_rca_kafka_consumer_health_v2"
-ACTIVATION_FREEZE_SCHEMA_VERSION = "pnc_rca_activation_ingress_freeze_v1"
+ACTIVATION_FREEZE_SCHEMA_VERSION = "pnc_rca_activation_ingress_freeze_v2"
 _RESIDENT_LABELS = {
     "kafka_consumer_health": "local.pnc.rca-kafka-consumer",
     "outbox_dispatcher_health": "local.pnc.rca-outbox-dispatcher",
@@ -1202,12 +1203,14 @@ def _recheck_live_consumer_freeze(
 
 
 def _normalize_canary_slot_plan(value: Any) -> dict[str, dict[str, Any]]:
-    if not isinstance(value, Mapping) or set(value) != set(ACTIVATION_SLOT_KINDS):
+    if not isinstance(value, Mapping) or set(value) != set(
+        ACTIVATION_RELEASE_SLOT_KINDS
+    ):
         raise CapsuleError("activation_capsule_canary_plan_invalid")
     normalized: dict[str, dict[str, Any]] = {}
     identity_hashes: set[str] = set()
     submissions: set[str] = set()
-    for slot_kind in ACTIVATION_SLOT_KINDS:
+    for slot_kind in ACTIVATION_RELEASE_SLOT_KINDS:
         raw = value.get(slot_kind)
         if not isinstance(raw, Mapping) or set(raw) != {
             "source_kind",
@@ -1315,8 +1318,10 @@ def _normalize_canary_slot_plan(value: Any) -> dict[str, dict[str, Any]]:
             },
             "expected_outcome": expected_outcome,
         }
-    if len(identity_hashes) != len(ACTIVATION_SLOT_KINDS) or len(submissions) != len(
-        ACTIVATION_SLOT_KINDS
+    if len(identity_hashes) != len(ACTIVATION_RELEASE_SLOT_KINDS) or len(
+        submissions
+    ) != len(
+        ACTIVATION_RELEASE_SLOT_KINDS
     ):
         raise CapsuleError("activation_capsule_canary_plan_invalid")
     return normalized
@@ -1829,6 +1834,8 @@ def _preproduction_transition(
         "expected_config_sha256": prior["config_sha256"],
         "expected_db_logical_identity_sha256": prior["db_logical_identity_sha256"],
         "expected_partition_start_fence_sha256": prior["partition_start_fence_sha256"],
+        "kafka_proof_mode": ACTIVATION_KAFKA_PROOF_MODE,
+        "required_slot_kinds": list(ACTIVATION_RELEASE_SLOT_KINDS),
         "canary_slot_plan": dict(canary_plan),
         "canary_slot_plan_sha256": _sha256_json(canary_plan),
     }
