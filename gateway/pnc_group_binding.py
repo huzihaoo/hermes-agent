@@ -31,6 +31,7 @@ G1Q3_RCA_GROUP_BINDING_ID = "gb_g1q3_rca_feishu_group"
 GROUP_BINDING_RECEIPT_FILENAME_RE = re.compile(
     r"\A\d{4}-\d{2}-\d{2}-[0-9a-f]{64}\.jsonl\Z"
 )
+_MAX_GROUP_BINDING_RECEIPT_BYTES = 256 * 1024
 
 _GIT_INTENT = re.compile(
     r"(git\s+(clone|pull|push|fetch|checkout|commit|merge|rebase|reset|branch|stash)|"
@@ -466,17 +467,26 @@ def _specific_rejection_reason(text: str) -> tuple[str, str] | None:
     return None
 
 
-def pnc_group_binding_receipt_filename(
+def _canonical_json_sha256(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _pnc_group_binding_receipt_identity(
     *,
-    receipt_date: date,
     platform: object,
     chat_id: object,
     user_id: object,
     message_id: object,
-) -> str:
-    """Return the canonical immutable receipt filename for one source event."""
-    if isinstance(receipt_date, datetime) or not isinstance(receipt_date, date):
-        raise ValueError("receipt_date must be a date")
+    manual_authorization: dict | None = None,
+    gateway_runtime_identity: dict | None = None,
+) -> dict[str, str]:
     identity = {
         "chat_id": _normalize(chat_id),
         "message_id": _normalize(message_id),
@@ -484,15 +494,165 @@ def pnc_group_binding_receipt_filename(
         "requester_id": _normalize(user_id),
         "schema_version": "pnc_group_binding_receipt_identity_v1",
     }
-    digest = hashlib.sha256(
-        json.dumps(
-            identity,
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
+    manual_context_supplied = manual_authorization is not None
+    runtime_context_supplied = gateway_runtime_identity is not None
+    if manual_context_supplied != runtime_context_supplied:
+        raise ValueError(
+            "manual receipt identity requires authorization and runtime together"
+        )
+    if manual_context_supplied:
+        if not isinstance(manual_authorization, dict) or not isinstance(
+            gateway_runtime_identity, dict
+        ):
+            raise ValueError("manual receipt identity contexts must be dictionaries")
+        identity.update(
+            {
+                "schema_version": "pnc_group_binding_receipt_identity_v2",
+                "manual_authorization_sha256": _canonical_json_sha256(
+                    manual_authorization
+                ),
+                "gateway_runtime_identity_sha256": _canonical_json_sha256(
+                    gateway_runtime_identity
+                ),
+            }
+        )
+    return identity
+
+
+def pnc_group_binding_receipt_filename(
+    *,
+    receipt_date: date,
+    platform: object,
+    chat_id: object,
+    user_id: object,
+    message_id: object,
+    manual_authorization: dict | None = None,
+    gateway_runtime_identity: dict | None = None,
+) -> str:
+    """Return the immutable receipt filename for one source-event attempt."""
+    if isinstance(receipt_date, datetime) or not isinstance(receipt_date, date):
+        raise ValueError("receipt_date must be a date")
+    identity = _pnc_group_binding_receipt_identity(
+        platform=platform,
+        chat_id=chat_id,
+        user_id=user_id,
+        message_id=message_id,
+        manual_authorization=manual_authorization,
+        gateway_runtime_identity=gateway_runtime_identity,
+    )
+    digest = _canonical_json_sha256(identity)
     return f"{receipt_date.isoformat()}-{digest}.jsonl"
+
+
+def _read_group_binding_receipt_record(
+    *,
+    directory_descriptor: int,
+    filename: str,
+) -> dict | None:
+    """Read one immutable receipt through a verified owner-controlled dir fd."""
+    descriptor = -1
+    try:
+        try:
+            descriptor = os.open(
+                filename,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory_descriptor,
+            )
+        except FileNotFoundError:
+            return
+        file_info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(file_info.st_mode)
+            or file_info.st_uid != os.getuid()
+            or file_info.st_nlink != 1
+            or stat.S_IMODE(file_info.st_mode) != 0o600
+            or file_info.st_size < 1
+            or file_info.st_size > _MAX_GROUP_BINDING_RECEIPT_BYTES
+        ):
+            raise OSError("legacy group binding receipt is not owner-controlled")
+        payload = bytearray()
+        while len(payload) < file_info.st_size:
+            chunk = os.read(descriptor, file_info.st_size - len(payload))
+            if not chunk:
+                raise OSError("legacy group binding receipt was truncated")
+            payload.extend(chunk)
+        if os.read(descriptor, 1):
+            raise OSError("legacy group binding receipt grew while reading")
+        final_info = os.fstat(descriptor)
+        final_path_info = os.stat(
+            filename,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            final_info.st_dev != file_info.st_dev
+            or final_info.st_ino != file_info.st_ino
+            or final_info.st_size != file_info.st_size
+            or final_path_info.st_dev != file_info.st_dev
+            or final_path_info.st_ino != file_info.st_ino
+            or final_path_info.st_size != file_info.st_size
+        ):
+            raise OSError("legacy group binding receipt changed while reading")
+        lines = bytes(payload).splitlines()
+        if len(lines) != 1:
+            raise OSError("legacy group binding receipt has invalid record count")
+        try:
+            record = json.loads(lines[0])
+        except (TypeError, ValueError) as exc:
+            raise OSError("group binding receipt is invalid JSON") from exc
+        if not isinstance(record, dict):
+            raise OSError("group binding receipt record must be an object")
+        return record
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _manual_receipt_matches_attempt(
+    *,
+    record: dict,
+    receipt_identity: dict[str, str],
+    decision: PncGroupBindingDecision,
+    platform: object,
+    chat_id: object,
+    user_id: object,
+    message_id: object,
+    manual_authorization: dict,
+    gateway_runtime_identity: dict,
+) -> bool:
+    """Return whether an immutable v1/v2 record proves this exact attempt."""
+    expected_source_fields = {
+        "platform": str(getattr(platform, "value", platform) or ""),
+        "group_id": _normalize(chat_id),
+        "requester": _normalize(user_id),
+        "message_id": _normalize(message_id),
+    }
+    if any(record.get(key) != value for key, value in expected_source_fields.items()):
+        raise OSError("group binding receipt source identity mismatch")
+    existing_identity = record.get("receipt_identity")
+    if existing_identity is not None:
+        if (
+            existing_identity != receipt_identity
+            or record.get("receipt_identity_sha256")
+            != _canonical_json_sha256(receipt_identity)
+        ):
+            raise OSError("group binding receipt identity mismatch")
+    existing_authorization = record.get("manual_authorization")
+    existing_runtime = record.get("gateway_runtime_identity")
+    if not isinstance(existing_authorization, dict) or not isinstance(
+        existing_runtime, dict
+    ):
+        raise OSError("manual group binding receipt lacks attempt identity")
+    return bool(
+        _canonical_json_sha256(record.get("decision_snapshot"))
+        == _canonical_json_sha256(asdict(decision))
+        and _canonical_json_sha256(existing_authorization)
+        == _canonical_json_sha256(manual_authorization)
+        and _canonical_json_sha256(existing_runtime)
+        == _canonical_json_sha256(gateway_runtime_identity)
+    )
 
 
 def pnc_group_binding_receipt_path(
@@ -503,6 +663,8 @@ def pnc_group_binding_receipt_path(
     chat_id: object,
     user_id: object,
     message_id: object,
+    manual_authorization: dict | None = None,
+    gateway_runtime_identity: dict | None = None,
 ) -> Path:
     """Return the canonical per-event path without touching the filesystem."""
     return Path(receipt_dir).expanduser() / pnc_group_binding_receipt_filename(
@@ -511,6 +673,8 @@ def pnc_group_binding_receipt_path(
         chat_id=chat_id,
         user_id=user_id,
         message_id=message_id,
+        manual_authorization=manual_authorization,
+        gateway_runtime_identity=gateway_runtime_identity,
     )
 
 
@@ -524,8 +688,16 @@ def write_pnc_group_binding_receipt(
     message_id: object,
     manual_authorization: dict | None = None,
     gateway_runtime_identity: dict | None = None,
+    allow_existing_matching_attempt: bool = False,
 ) -> Path:
     """Create one immutable privacy-light JSONL receipt for a source event."""
+    if not isinstance(allow_existing_matching_attempt, bool):
+        raise ValueError("allow_existing_matching_attempt must be a boolean")
+    if allow_existing_matching_attempt and (
+        not isinstance(manual_authorization, dict)
+        or not isinstance(gateway_runtime_identity, dict)
+    ):
+        raise ValueError("matching receipt reuse requires manual attempt identity")
     out_dir = Path(receipt_dir).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     resolved_dir = out_dir.resolve(strict=True)
@@ -538,16 +710,40 @@ def write_pnc_group_binding_receipt(
     ):
         raise OSError("group binding receipt directory is not owner-controlled")
     now = datetime.now(timezone.utc)
+    receipt_identity = _pnc_group_binding_receipt_identity(
+        platform=platform,
+        chat_id=chat_id,
+        user_id=user_id,
+        message_id=message_id,
+        manual_authorization=manual_authorization,
+        gateway_runtime_identity=gateway_runtime_identity,
+    )
     filename = pnc_group_binding_receipt_filename(
         receipt_date=now.date(),
         platform=platform,
         chat_id=chat_id,
         user_id=user_id,
         message_id=message_id,
+        manual_authorization=manual_authorization,
+        gateway_runtime_identity=gateway_runtime_identity,
+    )
+    legacy_filename = (
+        pnc_group_binding_receipt_filename(
+            receipt_date=now.date(),
+            platform=platform,
+            chat_id=chat_id,
+            user_id=user_id,
+            message_id=message_id,
+        )
+        if isinstance(manual_authorization, dict)
+        and isinstance(gateway_runtime_identity, dict)
+        else None
     )
     path = resolved_dir / filename
     record = {
         "event_type": "group_binding_decision",
+        "receipt_identity": receipt_identity,
+        "receipt_identity_sha256": _canonical_json_sha256(receipt_identity),
         "timestamp": now.isoformat(),
         "platform": str(getattr(platform, "value", platform) or ""),
         "group_binding_id": decision.group_binding_id,
@@ -599,16 +795,60 @@ def write_pnc_group_binding_receipt(
         opened_directory = os.fstat(directory_descriptor)
         if stat.S_IMODE(opened_directory.st_mode) != 0o700:
             raise OSError("group binding receipt directory is not private")
-        descriptor = os.open(
-            filename,
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-            dir_fd=directory_descriptor,
-        )
+        if legacy_filename is not None:
+            legacy_record = _read_group_binding_receipt_record(
+                directory_descriptor=directory_descriptor,
+                filename=legacy_filename,
+            )
+            if legacy_record is not None and _manual_receipt_matches_attempt(
+                record=legacy_record,
+                receipt_identity=receipt_identity,
+                decision=decision,
+                platform=platform,
+                chat_id=chat_id,
+                user_id=user_id,
+                message_id=message_id,
+                manual_authorization=manual_authorization,
+                gateway_runtime_identity=gateway_runtime_identity,
+            ):
+                if allow_existing_matching_attempt:
+                    return resolved_dir / legacy_filename
+                raise FileExistsError(
+                    "manual receipt already exists for this attempt"
+                )
+        try:
+            descriptor = os.open(
+                filename,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=directory_descriptor,
+            )
+        except FileExistsError:
+            if not allow_existing_matching_attempt:
+                raise
+            existing_record = _read_group_binding_receipt_record(
+                directory_descriptor=directory_descriptor,
+                filename=filename,
+            )
+            if existing_record is None or not _manual_receipt_matches_attempt(
+                record=existing_record,
+                receipt_identity=receipt_identity,
+                decision=decision,
+                platform=platform,
+                chat_id=chat_id,
+                user_id=user_id,
+                message_id=message_id,
+                manual_authorization=manual_authorization,
+                gateway_runtime_identity=gateway_runtime_identity,
+            ):
+                raise OSError(
+                    "existing group binding receipt does not match this attempt"
+                )
+            return path
         file_info = os.fstat(descriptor)
         if (
             not stat.S_ISREG(file_info.st_mode)

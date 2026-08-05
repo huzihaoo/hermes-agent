@@ -188,6 +188,10 @@ _G1Q3_RCA_EXTERNAL_WRITE_SCOPE: ContextVar[bool] = ContextVar(
     "g1q3_rca_external_write_scope",
     default=False,
 )
+_G1Q3_RCA_DURABLE_GATEWAY_SCOPE: ContextVar[bool] = ContextVar(
+    "g1q3_rca_durable_gateway_scope",
+    default=False,
+)
 _MAX_FEISHU_QUEUE_REPLY_TEXT_CHARS = 32 * 1024
 _MAX_FEISHU_QUEUE_LINK_COUNT = 32
 _MAX_FEISHU_QUEUE_LINK_CHARS = 4096
@@ -310,6 +314,11 @@ def _requires_durable_g1q3_gateway_decision(event: MessageEvent) -> bool:
     ):
         return False
     return True
+
+
+def g1q3_rca_durable_gateway_retry_active() -> bool:
+    """Return true only while the durable Feishu queue owns Gateway dispatch."""
+    return bool(_G1Q3_RCA_DURABLE_GATEWAY_SCOPE.get())
 
 
 class _RcaManualExternalWriteFenceRejected(RuntimeError):
@@ -7068,6 +7077,7 @@ class FeishuAdapter(BasePlatformAdapter):
             if metadata is not event.metadata:
                 event.metadata = metadata
             metadata[_G1Q3_RCA_PROVIDER_WRITES_DEFERRED_KEY] = True
+            durable_scope_token = _G1Q3_RCA_DURABLE_GATEWAY_SCOPE.set(True)
             scope_token = _G1Q3_RCA_EXTERNAL_WRITE_SCOPE.set(True)
             try:
                 response = await self._message_handler(event)
@@ -7106,6 +7116,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     )
             finally:
                 _G1Q3_RCA_EXTERNAL_WRITE_SCOPE.reset(scope_token)
+                _G1Q3_RCA_DURABLE_GATEWAY_SCOPE.reset(durable_scope_token)
             return {
                 "durable_admission": isinstance(manual_admission, dict),
                 "terminal_rejection": terminal_rejection,
@@ -7178,8 +7189,15 @@ class FeishuAdapter(BasePlatformAdapter):
 
     async def _dispatch_inbound_event(self, event: MessageEvent) -> bool:
         """Apply Feishu-specific burst protection before entering the base adapter."""
+        requires_durable_decision = _requires_durable_g1q3_gateway_decision(event)
+        admission_enabled = bool(getattr(self, "_admission_enabled", False))
+        admission_controller = getattr(self, "_admission_controller", None)
+        if requires_durable_decision and (
+            not admission_enabled or admission_controller is None
+        ):
+            raise RuntimeError("durable RCA admission controller is unavailable")
         # --- Admission gate (optional) ---
-        if self._admission_enabled and self._admission_controller:
+        if admission_enabled and admission_controller:
             user_id = event.source.user_id or ""
             message_text = _admission_text_with_issue_links(event)
             chat_id = event.source.chat_id or ""
@@ -7187,7 +7205,6 @@ class FeishuAdapter(BasePlatformAdapter):
             chat_type = getattr(event.source, "chat_type", "dm") or "dm"
             # Map SessionSource chat_type ("dm"/"group") to admission chat_type
             admission_chat_type = "group" if chat_type == "group" else None
-            requires_durable_decision = _requires_durable_g1q3_gateway_decision(event)
             if requires_durable_decision:
                 metadata = event.metadata if isinstance(event.metadata, dict) else {}
                 if metadata is not event.metadata:

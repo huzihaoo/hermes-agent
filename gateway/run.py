@@ -11323,6 +11323,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     evaluate_pnc_group_request,
                     write_pnc_group_binding_receipt,
                 )
+                from gateway.platforms.feishu import (
+                    g1q3_rca_durable_gateway_retry_active,
+                )
                 _pnc_request_text = _g1q3_request_text_with_metadata(event)
                 _pnc_event_text = str(getattr(event, "text", "") or "")
                 _pnc_metadata = getattr(event, "metadata", None)
@@ -11463,6 +11466,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         message_id=event.message_id,
                         manual_authorization=_manual_authorization,
                         gateway_runtime_identity=_manual_gateway_runtime_identity,
+                        allow_existing_matching_attempt=(
+                            g1q3_rca_durable_gateway_retry_active()
+                        ),
                     )
                 except Exception as _receipt_exc:
                     logger.warning("PNC group binding receipt write failed: %s", _receipt_exc)

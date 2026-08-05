@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 from datetime import datetime
+from collections import OrderedDict
+from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
@@ -1059,6 +1061,9 @@ def test_manual_gateway_passes_exact_kafka_policy_and_high_watermark(
         "hermes_cli/__init__.py",
         "gateway/__init__.py",
         "gateway/platforms/__init__.py",
+        "plugins/__init__.py",
+        "plugins/platforms/feishu/__init__.py",
+        "plugins/platforms/feishu/adapter.py",
         "gateway/record_only/runtime.py",
         "gateway/record_only/transport.py",
     }.issubset(GATEWAY_RCA_RUNTIME_RELATIVE_FILES)
@@ -1301,6 +1306,152 @@ def test_group_binding_receipt_is_immutable_per_source_event(tmp_path):
     assert path.read_bytes() == original
 
 
+def test_manual_group_binding_receipt_is_immutable_per_attempt_snapshot(tmp_path):
+    decision = PncGroupBindingDecision(
+        decision="accepted",
+        group_binding_id=G1Q3_RCA_GROUP_BINDING_ID,
+        business_line_ref="rca",
+        project_space_ref="g1q3_rca",
+        template_id="rca_issue_intake",
+        route_surface="rca_manual_intake",
+        risk_gate="manual_intake_control_store",
+    )
+    authorization = _manual_authorization()
+    runtime_identity = _gateway_runtime_identity()
+    arguments = {
+        "receipt_dir": tmp_path / "receipts",
+        "decision": decision,
+        "platform": "feishu",
+        "chat_id": G1Q3_GROUP_ID,
+        "user_id": "ou_test_user",
+        "message_id": "om_attempt_scoped_event",
+        "manual_authorization": authorization,
+        "gateway_runtime_identity": runtime_identity,
+    }
+
+    first = write_pnc_group_binding_receipt(**arguments)
+    original = first.read_bytes()
+    [record] = [json.loads(line) for line in original.splitlines()]
+    receipt_date = datetime.fromisoformat(record["timestamp"]).date()
+
+    assert first.name == pnc_group_binding_receipt_filename(
+        receipt_date=receipt_date,
+        platform="feishu",
+        chat_id=G1Q3_GROUP_ID,
+        user_id="ou_test_user",
+        message_id="om_attempt_scoped_event",
+        manual_authorization=authorization,
+        gateway_runtime_identity=runtime_identity,
+    )
+    with pytest.raises(FileExistsError):
+        write_pnc_group_binding_receipt(**arguments)
+    reused = write_pnc_group_binding_receipt(
+        **arguments,
+        allow_existing_matching_attempt=True,
+    )
+    mismatched_decision = replace(decision, reason="changed_after_receipt")
+    with pytest.raises(OSError, match="does not match this attempt"):
+        write_pnc_group_binding_receipt(
+            **{**arguments, "decision": mismatched_decision},
+            allow_existing_matching_attempt=True,
+        )
+
+    changed_authorization = {**authorization, "authorized": False}
+    second = write_pnc_group_binding_receipt(
+        **{**arguments, "manual_authorization": changed_authorization}
+    )
+    changed_runtime = {**runtime_identity, "pid": runtime_identity["pid"] + 1}
+    third = write_pnc_group_binding_receipt(
+        **{**arguments, "gateway_runtime_identity": changed_runtime}
+    )
+
+    assert len({first.name, second.name, third.name}) == 3
+    assert reused == first
+    assert first.read_bytes() == original
+
+
+def test_manual_group_binding_receipt_identity_rejects_partial_context():
+    arguments = {
+        "receipt_date": datetime.now().date(),
+        "platform": "feishu",
+        "chat_id": G1Q3_GROUP_ID,
+        "user_id": "ou_test_user",
+        "message_id": "om_partial_attempt_context",
+    }
+
+    with pytest.raises(ValueError, match="authorization and runtime together"):
+        pnc_group_binding_receipt_filename(
+            **arguments,
+            manual_authorization=_manual_authorization(),
+        )
+    with pytest.raises(ValueError, match="authorization and runtime together"):
+        pnc_group_binding_receipt_filename(
+            **arguments,
+            gateway_runtime_identity=_gateway_runtime_identity(),
+        )
+
+
+def test_manual_group_binding_receipt_honors_matching_legacy_attempt(tmp_path):
+    decision = PncGroupBindingDecision(
+        decision="accepted",
+        group_binding_id=G1Q3_RCA_GROUP_BINDING_ID,
+        business_line_ref="rca",
+        project_space_ref="g1q3_rca",
+        template_id="rca_issue_intake",
+        route_surface="rca_manual_intake",
+        risk_gate="manual_intake_control_store",
+    )
+    authorization = _manual_authorization()
+    runtime_identity = _gateway_runtime_identity()
+    base_arguments = {
+        "receipt_dir": tmp_path / "receipts",
+        "decision": decision,
+        "platform": "feishu",
+        "chat_id": G1Q3_GROUP_ID,
+        "user_id": "ou_test_user",
+        "message_id": "om_legacy_attempt",
+    }
+    legacy = write_pnc_group_binding_receipt(**base_arguments)
+    [legacy_record] = [
+        json.loads(line) for line in legacy.read_text().splitlines()
+    ]
+    legacy_record["manual_authorization"] = authorization
+    legacy_record["gateway_runtime_identity"] = runtime_identity
+    legacy_record.pop("receipt_identity", None)
+    legacy_record.pop("receipt_identity_sha256", None)
+    legacy.write_text(
+        json.dumps(legacy_record, ensure_ascii=False, sort_keys=True) + "\n"
+    )
+    legacy.chmod(0o600)
+    legacy_bytes = legacy.read_bytes()
+    attempt_arguments = {
+        **base_arguments,
+        "manual_authorization": authorization,
+        "gateway_runtime_identity": runtime_identity,
+    }
+
+    with pytest.raises(FileExistsError, match="already exists for this attempt"):
+        write_pnc_group_binding_receipt(**attempt_arguments)
+    reused_legacy = write_pnc_group_binding_receipt(
+        **attempt_arguments,
+        allow_existing_matching_attempt=True,
+    )
+
+    changed_authorization = {
+        **authorization,
+        "manual_intake_enabled": False,
+        "authorized": False,
+    }
+    changed_attempt = write_pnc_group_binding_receipt(
+        **{**attempt_arguments, "manual_authorization": changed_authorization}
+    )
+
+    assert changed_attempt != legacy
+    assert reused_legacy == legacy
+    assert changed_attempt.exists()
+    assert legacy.read_bytes() == legacy_bytes
+
+
 @pytest.mark.asyncio
 async def test_duplicate_manual_source_event_fails_closed_before_second_admission(
     monkeypatch, tmp_path
@@ -1335,6 +1486,103 @@ async def test_duplicate_manual_source_event_fails_closed_before_second_admissio
     assert "授权回执写入失败" in replay
     assert "安全中止" in replay
     assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_manual_source_event_retries_after_safe_off_snapshot_changes(
+    monkeypatch, tmp_path
+):
+    runner = make_runner(receipt_dir=tmp_path / "receipts")
+    issue_url = "https://project.feishu.cn/g1q3/issue/detail/7013527412"
+    calls = []
+    monkeypatch.setenv("HERMES_RCA_MANUAL_CHAT_IDS", G1Q3_GROUP_ID)
+    monkeypatch.setattr(
+        gateway_run.GatewayRunner, "_is_user_authorized", lambda self, source: True
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_admit_g1q3_manual_trigger",
+        lambda **kwargs: calls.append(kwargs)
+        or {
+            "outcome": "created",
+            "submission_key": "g1q3-rca-s1-" + "a" * 64,
+            "generation": 1,
+        },
+    )
+
+    monkeypatch.setenv("HERMES_RCA_MANUAL_INTAKE_ENABLED", "false")
+    safe_off = await gateway_run.GatewayRunner._handle_message(
+        runner, make_feishu_event(f"@PNC-Agent 分析这个问题 {issue_url}")
+    )
+
+    monkeypatch.setenv("HERMES_RCA_MANUAL_INTAKE_ENABLED", "true")
+    runner._rca_gateway_runtime_identity = {
+        **_gateway_runtime_identity(),
+        "pid": _gateway_runtime_identity()["pid"] + 1,
+    }
+    admitted = await gateway_run.GatewayRunner._handle_message(
+        runner, make_feishu_event(f"@PNC-Agent 分析这个问题 {issue_url}")
+    )
+    duplicate = await gateway_run.GatewayRunner._handle_message(
+        runner, make_feishu_event(f"@PNC-Agent 分析这个问题 {issue_url}")
+    )
+
+    assert "安全关闭状态" in safe_off
+    assert "RCA 已受理" in admitted
+    assert "授权回执写入失败" in duplicate
+    assert len(calls) == 1
+    assert len(list((tmp_path / "receipts").glob("*.jsonl"))) == 2
+
+
+@pytest.mark.asyncio
+async def test_durable_manual_retry_reuses_exact_receipt_then_reaches_admission(
+    monkeypatch, tmp_path
+):
+    runner = make_runner(receipt_dir=tmp_path / "receipts")
+    adapter = object.__new__(FeishuAdapter)
+    adapter._chat_locks = OrderedDict()
+    issue_url = "https://project.feishu.cn/g1q3/issue/detail/7013527412"
+    event = make_feishu_event(f"@PNC-Agent 分析这个问题 {issue_url}")
+    calls = []
+    monkeypatch.setenv("HERMES_RCA_MANUAL_INTAKE_ENABLED", "true")
+    monkeypatch.setenv("HERMES_RCA_MANUAL_CHAT_IDS", G1Q3_GROUP_ID)
+    monkeypatch.setattr(
+        gateway_run.GatewayRunner, "_is_user_authorized", lambda self, source: True
+    )
+
+    def admit(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise RuntimeError("manual_outbox_high_watermark_reached")
+        return {
+            "outcome": "created",
+            "submission_key": "g1q3-rca-s1-" + "a" * 64,
+            "generation": 1,
+        }
+
+    async def handle(reconstructed):
+        return await gateway_run.GatewayRunner._handle_message(runner, reconstructed)
+
+    adapter._message_handler = handle
+    monkeypatch.setattr(gateway_run, "_admit_g1q3_manual_trigger", admit)
+    monkeypatch.setattr(
+        feishu_adapter_module,
+        "_require_current_rca_manual_activation_epoch",
+        lambda: {"epoch_id": "epoch-bounded-1", "state": "bounded_active"},
+    )
+
+    with pytest.raises(
+        RuntimeError, match="did not reach a durable decision"
+    ):
+        await adapter._process_durable_g1q3_queue_event(event)
+    assert feishu_adapter_module.g1q3_rca_durable_gateway_retry_active() is False
+
+    result = await adapter._process_durable_g1q3_queue_event(event)
+
+    assert result["durable_admission"] is True
+    assert len(calls) == 2
+    assert len(list((tmp_path / "receipts").glob("*.jsonl"))) == 1
+    assert feishu_adapter_module.g1q3_rca_durable_gateway_retry_active() is False
 
 
 @pytest.mark.asyncio

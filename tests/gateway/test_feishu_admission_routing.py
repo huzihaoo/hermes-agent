@@ -676,6 +676,44 @@ async def test_fixed_group_directed_mention_persists_trusted_reply_and_card_cont
     assert adapter.sent == []
 
 
+@pytest.mark.asyncio
+async def test_durable_g1q3_dispatch_fails_closed_without_admission_controller():
+    adapter = object.__new__(FeishuAdapter)
+    adapter._admission_enabled = False
+    adapter._admission_controller = None
+    adapter._enqueue_text_event = AsyncMock()
+    issue_url = "https://project.feishu.cn/g1q3/issue/detail/7013527412"
+    event = MessageEvent(
+        source=SessionSource(
+            platform=Platform.FEISHU,
+            user_id="ou_user",
+            chat_id=G1Q3_RCA_GROUP_ID,
+            chat_type="group",
+            thread_id="topic:om_root",
+            is_bot=False,
+        ),
+        text=f"分析这个问题 {issue_url}",
+        message_type=MessageType.TEXT,
+        message_id="om_durable_without_admission",
+        metadata={
+            "feishu": {
+                "self_mentioned": True,
+                "self_mention_command_directed": True,
+                "sender_type": "user",
+                "is_bot_sender": False,
+                "link_urls": [issue_url],
+            }
+        },
+    )
+
+    with pytest.raises(
+        RuntimeError, match="durable RCA admission controller is unavailable"
+    ):
+        await adapter._dispatch_inbound_event(event)
+
+    adapter._enqueue_text_event.assert_not_awaited()
+
+
 @pytest.mark.parametrize(
     "oversized_field",
     ["reply", "links", "link_url"],
