@@ -187,6 +187,191 @@ EXACT_OUTBOX_HOLD_REQUIRED_FIELDS = frozenset(
         "receipt_fingerprint",
     }
 )
+EXACT_OUTBOX_HOLD_CONTROL_IDENTITY_FIELDS = frozenset(
+    {
+        "schema_version",
+        "path",
+        "present",
+        "device",
+        "inode",
+        "size",
+        "mtime_ns",
+        "sha256",
+        "wal",
+        "shm",
+        "logical_db_identity",
+        "coordination_observation",
+    }
+)
+EXACT_OUTBOX_HOLD_SOURCE_FILE_FIELDS = frozenset(
+    {"present", "device", "inode", "size", "mtime_ns", "sha256"}
+)
+EXACT_OUTBOX_HOLD_LOGICAL_DB_FIELDS = frozenset({"database", "wal"})
+EXACT_OUTBOX_HOLD_COORDINATION_FIELDS = frozenset({"shm"})
+EXACT_OUTBOX_HOLD_W3_READ_DISABLED_FIELDS = frozenset({"enabled", "mode"})
+EXACT_OUTBOX_HOLD_W3_READ_ENABLED_FIELDS = frozenset(
+    {"enabled", "mode", "schema_version", "authority_sha256", "policy_sha256s"}
+)
+EXACT_OUTBOX_HOLD_W3_POLICY_FIELDS = frozenset(
+    {
+        "creation_policy",
+        "business_profile",
+        "execution_policy",
+        "publication_policy",
+        "correction_lineage_policy",
+    }
+)
+EXACT_OUTBOX_HOLD_ACTIVE_BINDING_FIELDS = frozenset(
+    {
+        "path",
+        "sha256",
+        "release_id",
+        "authority_sha256",
+        "authority_epoch_id",
+        "bootstrap_epoch_id",
+        "release_bom_sha256",
+        "candidate_env_sha256",
+        "authorization_fingerprint",
+        "authorization_receipt_sha256",
+        "approval_evidence_sha256",
+        "runtime_manifest_sha256",
+        "runtime_release_target",
+        "runtime_git_head",
+        "runtime_git_tree",
+        "raw_sha256",
+        "live_env_path",
+        "live_env_sha256",
+    }
+)
+EXACT_OUTBOX_HOLD_TOOL_FIELDS = frozenset(
+    {
+        "entrypoint_path",
+        "entrypoint_sha256",
+        "control_store_path",
+        "control_store_sha256",
+        "bootstrap_path",
+        "bootstrap_sha256",
+        "git_head",
+        "git_tree",
+        "git_status_returncode",
+        "git_clean",
+        "runtime_provenance",
+    }
+)
+EXACT_OUTBOX_HOLD_RUNTIME_FIELDS = frozenset(
+    {
+        "schema_version",
+        "manifest",
+        "manifest_runtime_root",
+        "manifest_runtime_release_target",
+        "manifest_gateway_release_target",
+        "manifest_commit",
+        "manifest_tree",
+        "runtime_git_head",
+        "runtime_git_tree",
+        "release_bom_sha256",
+        "plists",
+        "stable_target_registry",
+    }
+)
+EXACT_OUTBOX_HOLD_RUNTIME_FILE_FIELDS = frozenset(
+    {"present", "path", "sha256", "mode", "uid", "nlink"}
+)
+EXACT_OUTBOX_HOLD_RUNTIME_PLIST_FIELDS = frozenset(
+    {"present", "label", "path", "sha256", "mode", "uid", "nlink"}
+)
+EXACT_OUTBOX_HOLD_RESIDENT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "observed_at",
+        "forbidden_labels",
+        "observations",
+        "loaded_labels",
+        "loaded_count",
+        "all_unloaded",
+        "source_kind",
+        "domain",
+        "active_release_binding_path",
+        "source_sha256",
+    }
+)
+EXACT_OUTBOX_HOLD_RESIDENT_OBSERVATION_FIELDS = frozenset(
+    {"label", "loaded", "returncode", "unloaded_proven", "output_sha256"}
+)
+EXACT_OUTBOX_HOLD_ACTIVATION_FIELDS = frozenset(
+    {
+        "configured",
+        "epoch_id",
+        "state",
+        "is_current",
+        "config_sha256",
+        "db_logical_identity_sha256",
+        "db_logical_identity",
+        "preproduction_fingerprint",
+        "preproduction_gate_receipt_sha256",
+        "production_fingerprint",
+        "production_gate_receipt_sha256",
+        "sha256",
+    }
+)
+EXACT_OUTBOX_HOLD_ACTIVATION_DB_FIELDS = frozenset(
+    {"device", "inode", "logical_store_id"}
+)
+EXACT_OUTBOX_HOLD_ROW_FIELDS = frozenset(
+    {
+        "schema_version",
+        "outbox_id",
+        "submission_key",
+        "business_key",
+        "generation",
+        "status",
+        "attempt",
+        "fence",
+        "next_attempt_at",
+        "retry_window_started_at",
+        "lease_token",
+        "lease_owner",
+        "lease_expires_at",
+        "claimed_at",
+        "completed_at",
+        "quarantined_at",
+        "result_json",
+        "updated_at",
+        "activation_epoch_id",
+        "activation_ledger_id",
+        "row_sha256",
+    }
+)
+EXACT_OUTBOX_HOLD_QUEUE_FIELDS = frozenset(
+    {"outbox_ids", "entries", "sha256"}
+)
+EXACT_OUTBOX_HOLD_QUEUE_ENTRY_FIELDS = frozenset({"outbox_id", "row_sha256"})
+EXACT_OUTBOX_HOLD_RETRY_FIELDS = frozenset(
+    {
+        "target_outbox_id",
+        "anchor",
+        "expires_at",
+        "min_remaining_seconds",
+        "safety_headroom_seconds",
+        "record_max_age_seconds",
+        "plan_remaining_seconds",
+        "apply_observed_at",
+        "apply_remaining_seconds",
+    }
+)
+EXACT_OUTBOX_HOLD_EFFECT_FIELDS = frozenset(
+    {
+        "external_writes",
+        "external_effects_triggered",
+        "target_rows_updated",
+        "control_meta_inserted",
+        "business_trigger_rows_updated",
+        "mutation",
+    }
+)
+EXACT_OUTBOX_HOLD_EFFECT_MUTATION_FIELDS = frozenset(
+    {"next_attempt_at", "updated_at"}
+)
 DEFAULT_MANUAL_OPERATOR_RATE_LIMIT = 3
 DEFAULT_MANUAL_OPERATOR_RATE_WINDOW_SECONDS = 600
 GROUP_USER_RERUN_SCHEMA_VERSION = "pnc_rca_group_user_rerun_v1"
@@ -595,6 +780,438 @@ def _exact_outbox_hold_plan_id(value: Mapping[str, Any]) -> str:
     )
 
 
+def _exact_hold_require_mapping(
+    value: Any,
+    expected_fields: frozenset[str],
+    error_code: str,
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != expected_fields:
+        raise ValueError(error_code)
+    return value
+
+
+def _exact_hold_require_type(
+    value: Any,
+    expected_type: type[Any],
+    error_code: str,
+    *,
+    nullable: bool = False,
+) -> None:
+    if nullable and value is None:
+        return
+    if type(value) is not expected_type:
+        raise ValueError(error_code)
+
+
+def _exact_hold_require_sha(value: Any, error_code: str) -> None:
+    if (
+        not isinstance(value, str)
+        or _ACTIVATION_SHA256_RE.fullmatch(value) is None
+        or value == "0" * 64
+    ):
+        raise ValueError(error_code)
+
+
+def _validate_exact_outbox_hold_nested(value: Mapping[str, Any]) -> None:
+    """Reject structural drift before any live binding or database work."""
+    error = "exact_outbox_hold_nested_schema_invalid"
+
+    def require_string(item: Any, code: str = error) -> None:
+        _exact_hold_require_type(item, str, code)
+
+    def require_int(item: Any, code: str = error) -> None:
+        _exact_hold_require_type(item, int, code)
+
+    def require_bool(item: Any, code: str = error) -> None:
+        _exact_hold_require_type(item, bool, code)
+
+    def require_nullable_string(item: Any, code: str = error) -> None:
+        _exact_hold_require_type(item, str, code, nullable=True)
+
+    def require_nullable_int(item: Any, code: str = error) -> None:
+        _exact_hold_require_type(item, int, code, nullable=True)
+
+    def require_path(item: Any, code: str = error) -> None:
+        require_string(item, code)
+        if not Path(item).is_absolute():
+            raise ValueError(code)
+
+    def require_source_file(item: Any, *, allow_label: bool = False) -> None:
+        fields = (
+            EXACT_OUTBOX_HOLD_RUNTIME_PLIST_FIELDS
+            if allow_label
+            else EXACT_OUTBOX_HOLD_RUNTIME_FILE_FIELDS
+        )
+        source = _exact_hold_require_mapping(item, fields, error)
+        require_bool(source["present"])
+        require_path(source["path"])
+        _exact_hold_require_sha(source["sha256"], error)
+        for field in ("mode", "uid", "nlink"):
+            require_int(source[field])
+        if source["nlink"] != 1:
+            raise ValueError(error)
+        if allow_label:
+            require_string(source["label"])
+
+    identity = _exact_hold_require_mapping(
+        value["control_db_identity"],
+        EXACT_OUTBOX_HOLD_CONTROL_IDENTITY_FIELDS,
+        "exact_outbox_hold_control_db_identity_invalid",
+    )
+    require_string(identity["schema_version"])
+    require_path(identity["path"])
+    require_bool(identity["present"])
+    for field in ("device", "inode", "size", "mtime_ns"):
+        require_int(identity[field])
+    _exact_hold_require_sha(identity["sha256"], error)
+
+    def require_sidecar(item: Any) -> None:
+        sidecar = _exact_hold_require_mapping(
+            item,
+            (
+                frozenset({"present"})
+                if isinstance(item, Mapping) and item.get("present") is False
+                else EXACT_OUTBOX_HOLD_SOURCE_FILE_FIELDS
+            ),
+            "exact_outbox_hold_control_db_identity_invalid",
+        )
+        require_bool(sidecar["present"])
+        if sidecar["present"]:
+            for field in ("device", "inode", "size", "mtime_ns"):
+                require_int(sidecar[field])
+            _exact_hold_require_sha(sidecar["sha256"], error)
+
+    require_sidecar(identity["wal"])
+    require_sidecar(identity["shm"])
+    logical_identity = _exact_hold_require_mapping(
+        identity["logical_db_identity"],
+        EXACT_OUTBOX_HOLD_LOGICAL_DB_FIELDS,
+        "exact_outbox_hold_control_db_identity_invalid",
+    )
+    require_sidecar(logical_identity["database"])
+    require_sidecar(logical_identity["wal"])
+    coordination = _exact_hold_require_mapping(
+        identity["coordination_observation"],
+        EXACT_OUTBOX_HOLD_COORDINATION_FIELDS,
+        "exact_outbox_hold_control_db_identity_invalid",
+    )
+    require_sidecar(coordination["shm"])
+
+    config = _exact_hold_require_mapping(
+        value["config_binding"],
+        EXACT_OUTBOX_CONFIG_KEYS,
+        "exact_outbox_hold_config_binding_invalid",
+    )
+    for field in (
+        "dispatch_enabled",
+        "activation_required",
+        "allow_download",
+        "allow_feishu_writeback",
+        "storage_admission_enabled",
+        "storage_reservation_enabled",
+        "derived_capacity_reservation_enabled",
+        "delivery_backpressure_enabled",
+        "derived_capacity_atomic_reservation",
+    ):
+        require_bool(config[field])
+    for field in (
+        "lease_seconds",
+        "max_age_seconds",
+        "input_wait_max_age_seconds",
+        "poll_interval_seconds",
+        "circuit_poll_interval_seconds",
+        "batch_size",
+        "delivery_high_watermark",
+        "delivery_resume_watermark",
+        "storage_concurrency_reserve_cases",
+        "storage_cases_per_day",
+        "storage_expected_artifact_cache_bytes",
+        "storage_reserve_percent",
+        "storage_timeout_seconds",
+        "derived_capacity_reservation_timeout_seconds",
+    ):
+        require_int(config[field])
+    for field in (
+        "control_db_path",
+        "delivery_db_path",
+        "health_path",
+        "service_id",
+        "service_capability",
+        "service_operation",
+        "data_access_mode",
+        "group_response_cap",
+        "translate_baseline",
+        "translate_contract_path",
+        "storage_capacity_scope",
+        "capacity_mode",
+        "release_id",
+        "bootstrap_epoch_id",
+        "active_release_binding_path",
+        "live_env_path",
+    ):
+        require_string(config[field])
+    w3_read = config["w3_snapshot_read"]
+    if not isinstance(w3_read, Mapping):
+        raise ValueError("exact_outbox_hold_config_binding_invalid")
+    require_bool(w3_read.get("enabled"))
+    require_string(w3_read.get("mode"))
+    w3_fields = (
+        EXACT_OUTBOX_HOLD_W3_READ_ENABLED_FIELDS
+        if w3_read["enabled"]
+        else EXACT_OUTBOX_HOLD_W3_READ_DISABLED_FIELDS
+    )
+    w3_read = _exact_hold_require_mapping(
+        w3_read, w3_fields, "exact_outbox_hold_config_binding_invalid"
+    )
+    if w3_read["enabled"]:
+        require_string(w3_read["schema_version"])
+        _exact_hold_require_sha(w3_read["authority_sha256"], error)
+        policy_sha256s = _exact_hold_require_mapping(
+            w3_read["policy_sha256s"],
+            EXACT_OUTBOX_HOLD_W3_POLICY_FIELDS,
+            "exact_outbox_hold_config_binding_invalid",
+        )
+        for item in policy_sha256s.values():
+            _exact_hold_require_sha(item, error)
+
+    active_binding = _exact_hold_require_mapping(
+        value["active_release_binding"],
+        EXACT_OUTBOX_HOLD_ACTIVE_BINDING_FIELDS,
+        "exact_outbox_hold_active_binding_invalid",
+    )
+    for field in (
+        "path",
+        "release_id",
+        "authority_epoch_id",
+        "bootstrap_epoch_id",
+        "runtime_release_target",
+        "live_env_path",
+    ):
+        require_string(active_binding[field])
+    require_path(active_binding["path"])
+    require_path(active_binding["live_env_path"])
+    for field in (
+        "sha256",
+        "authority_sha256",
+        "release_bom_sha256",
+        "candidate_env_sha256",
+        "authorization_fingerprint",
+        "authorization_receipt_sha256",
+        "approval_evidence_sha256",
+        "runtime_manifest_sha256",
+        "raw_sha256",
+        "live_env_sha256",
+    ):
+        _exact_hold_require_sha(active_binding[field], error)
+    for field in ("runtime_git_head", "runtime_git_tree"):
+        if not isinstance(active_binding[field], str) or re.fullmatch(
+            r"[0-9a-f]{40}", active_binding[field]
+        ) is None:
+            raise ValueError("exact_outbox_hold_active_binding_invalid")
+
+    tool = _exact_hold_require_mapping(
+        value["tool_provenance"],
+        EXACT_OUTBOX_HOLD_TOOL_FIELDS,
+        "exact_outbox_hold_tool_provenance_invalid",
+    )
+    for field in ("entrypoint_path", "control_store_path", "bootstrap_path"):
+        require_path(tool[field])
+    for field in (
+        "entrypoint_sha256",
+        "control_store_sha256",
+        "bootstrap_sha256",
+    ):
+        _exact_hold_require_sha(tool[field], error)
+    for field in ("git_head", "git_tree"):
+        if not isinstance(tool[field], str) or re.fullmatch(
+            r"[0-9a-f]{40}", tool[field]
+        ) is None:
+            raise ValueError("exact_outbox_hold_tool_provenance_invalid")
+    require_int(tool["git_status_returncode"])
+    require_bool(tool["git_clean"])
+    runtime = _exact_hold_require_mapping(
+        tool["runtime_provenance"],
+        EXACT_OUTBOX_HOLD_RUNTIME_FIELDS,
+        "exact_outbox_hold_runtime_provenance_invalid",
+    )
+    for field in (
+        "schema_version",
+        "manifest_runtime_root",
+        "manifest_runtime_release_target",
+        "manifest_gateway_release_target",
+        "manifest_commit",
+        "manifest_tree",
+        "runtime_git_head",
+        "runtime_git_tree",
+    ):
+        require_string(runtime[field])
+    require_path(runtime["manifest_runtime_root"])
+    for field in ("manifest_commit", "manifest_tree", "runtime_git_head", "runtime_git_tree"):
+        if re.fullmatch(r"[0-9a-f]{40}", runtime[field]) is None:
+            raise ValueError("exact_outbox_hold_runtime_provenance_invalid")
+    _exact_hold_require_sha(runtime["release_bom_sha256"], error)
+    require_source_file(runtime["manifest"])
+    require_source_file(runtime["stable_target_registry"])
+    plists = runtime["plists"]
+    if type(plists) is not list or len(plists) != len(EXACT_OUTBOX_RUNTIME_PLIST_LABELS):
+        raise ValueError("exact_outbox_hold_runtime_provenance_invalid")
+    for label, plist in zip(EXACT_OUTBOX_RUNTIME_PLIST_LABELS, plists, strict=True):
+        require_source_file(plist, allow_label=True)
+        if plist["label"] != label:
+            raise ValueError("exact_outbox_hold_runtime_provenance_invalid")
+
+    resident = _exact_hold_require_mapping(
+        value["resident_census"],
+        EXACT_OUTBOX_HOLD_RESIDENT_FIELDS,
+        "exact_outbox_hold_resident_census_invalid",
+    )
+    for field in ("schema_version", "observed_at", "source_kind", "domain"):
+        require_string(resident[field])
+    require_path(resident["active_release_binding_path"])
+    require_bool(resident["all_unloaded"])
+    require_int(resident["loaded_count"])
+    if type(resident["forbidden_labels"]) is not list or type(
+        resident["observations"]
+    ) is not list or type(resident["loaded_labels"]) is not list:
+        raise ValueError("exact_outbox_hold_resident_census_invalid")
+    for label in resident["forbidden_labels"]:
+        require_string(label)
+    for label in resident["loaded_labels"]:
+        require_string(label)
+    observations = resident["observations"]
+    if len(observations) != len(resident["forbidden_labels"]):
+        raise ValueError("exact_outbox_hold_resident_census_invalid")
+    for observation in observations:
+        item = _exact_hold_require_mapping(
+            observation,
+            EXACT_OUTBOX_HOLD_RESIDENT_OBSERVATION_FIELDS,
+            "exact_outbox_hold_resident_census_invalid",
+        )
+        require_string(item["label"])
+        require_bool(item["loaded"])
+        require_int(item["returncode"])
+        require_bool(item["unloaded_proven"])
+        _exact_hold_require_sha(item["output_sha256"], error)
+    _exact_hold_require_sha(resident["source_sha256"], error)
+
+    activation = _exact_hold_require_mapping(
+        value["active_activation"],
+        EXACT_OUTBOX_HOLD_ACTIVATION_FIELDS,
+        "exact_outbox_hold_activation_invalid",
+    )
+    require_bool(activation["configured"])
+    for field in ("epoch_id", "state"):
+        require_string(activation[field])
+    require_int(activation["is_current"])
+    for field in (
+        "config_sha256",
+        "db_logical_identity_sha256",
+        "preproduction_fingerprint",
+        "preproduction_gate_receipt_sha256",
+        "production_fingerprint",
+        "production_gate_receipt_sha256",
+    ):
+        require_string(activation[field])
+    db_identity = _exact_hold_require_mapping(
+        activation["db_logical_identity"],
+        EXACT_OUTBOX_HOLD_ACTIVATION_DB_FIELDS,
+        "exact_outbox_hold_activation_invalid",
+    )
+    require_int(db_identity["device"])
+    require_int(db_identity["inode"])
+    require_string(db_identity["logical_store_id"])
+    _exact_hold_require_sha(activation["sha256"], error)
+
+    def require_row(item: Any) -> None:
+        row = _exact_hold_require_mapping(
+            item, EXACT_OUTBOX_HOLD_ROW_FIELDS, "exact_outbox_hold_row_binding_invalid"
+        )
+        require_string(row["schema_version"])
+        require_int(row["outbox_id"])
+        for field in ("submission_key", "business_key", "status", "updated_at"):
+            require_string(row[field])
+        for field in ("generation", "attempt", "fence"):
+            require_int(row[field])
+        for field in (
+            "next_attempt_at",
+            "retry_window_started_at",
+            "lease_token",
+            "lease_owner",
+            "lease_expires_at",
+            "claimed_at",
+            "completed_at",
+            "quarantined_at",
+            "result_json",
+            "activation_epoch_id",
+        ):
+            require_nullable_string(row[field])
+        require_nullable_int(row["activation_ledger_id"])
+        _exact_hold_require_sha(row["row_sha256"], error)
+
+    for field in ("target_before", "target_after", "predecessor"):
+        require_row(value[field])
+    for field in ("eligible_queue_before", "eligible_queue_after"):
+        queue = _exact_hold_require_mapping(
+            value[field], EXACT_OUTBOX_HOLD_QUEUE_FIELDS, "exact_outbox_hold_queue_binding_invalid"
+        )
+        if type(queue["outbox_ids"]) is not list or type(queue["entries"]) is not list:
+            raise ValueError("exact_outbox_hold_queue_binding_invalid")
+        _exact_hold_require_sha(queue["sha256"], error)
+        for outbox_id in queue["outbox_ids"]:
+            require_int(outbox_id)
+        for entry in queue["entries"]:
+            queue_entry = _exact_hold_require_mapping(
+                entry,
+                EXACT_OUTBOX_HOLD_QUEUE_ENTRY_FIELDS,
+                "exact_outbox_hold_queue_binding_invalid",
+            )
+            require_int(queue_entry["outbox_id"])
+            _exact_hold_require_sha(queue_entry["row_sha256"], error)
+
+    retry = _exact_hold_require_mapping(
+        value["retry_horizon"],
+        EXACT_OUTBOX_HOLD_RETRY_FIELDS,
+        "exact_outbox_hold_retry_horizon_invalid",
+    )
+    require_int(retry["target_outbox_id"])
+    for field in ("anchor", "expires_at"):
+        require_string(retry[field])
+    for field in (
+        "min_remaining_seconds",
+        "safety_headroom_seconds",
+        "record_max_age_seconds",
+        "plan_remaining_seconds",
+    ):
+        require_int(retry[field])
+    require_nullable_string(retry["apply_observed_at"])
+    require_nullable_int(retry["apply_remaining_seconds"])
+    if (retry["apply_observed_at"] is None) != (
+        retry["apply_remaining_seconds"] is None
+    ):
+        raise ValueError("exact_outbox_hold_retry_horizon_invalid")
+
+    effect = _exact_hold_require_mapping(
+        value["effect_delta"],
+        EXACT_OUTBOX_HOLD_EFFECT_FIELDS,
+        "exact_outbox_hold_effect_delta_invalid",
+    )
+    require_int(effect["external_writes"])
+    require_bool(effect["external_effects_triggered"])
+    for field in (
+        "target_rows_updated",
+        "control_meta_inserted",
+        "business_trigger_rows_updated",
+    ):
+        require_int(effect[field])
+    mutation = _exact_hold_require_mapping(
+        effect["mutation"],
+        EXACT_OUTBOX_HOLD_EFFECT_MUTATION_FIELDS,
+        "exact_outbox_hold_effect_delta_invalid",
+    )
+    require_string(mutation["next_attempt_at"])
+    require_string(mutation["updated_at"])
+
+
 def _validate_exact_outbox_hold_audit(
     value: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -649,6 +1266,7 @@ def _validate_exact_outbox_hold_audit(
         or max_age_seconds < 1
     ):
         raise ValueError("exact_outbox_hold_retry_horizon_invalid")
+    _validate_exact_outbox_hold_nested(normalized)
     identity = normalized.get("control_db_identity")
     if (
         not isinstance(identity, Mapping)
@@ -16739,26 +17357,31 @@ class RcaControlStore:
                 raise RuntimeError("exact_outbox_hold_resident_census_changed")
 
     def _validate_exact_hold_external_bindings(
-        self, payload: Mapping[str, Any]
+        self,
+        payload: Mapping[str, Any],
+        *,
+        include_control_db_identity: bool = True,
     ) -> None:
         self._exact_destination_parent_live(payload)
         self._exact_resident_census_live(payload)
         config_binding = payload["config_binding"]
         if config_binding.get("control_db_path") != str(self.db_path.expanduser().absolute()):
             raise RuntimeError("exact_outbox_hold_config_changed")
-        canonical_binding_path = (
-            self.db_path.expanduser().absolute().parent / "active-release-binding.json"
-        )
         live_path = Path(str(payload["active_release_binding"]["live_env_path"])).expanduser().absolute()
-        home_candidates = [self.db_path.expanduser().absolute().parent / ".env"]
-        if len(self.db_path.expanduser().absolute().parents) >= 3:
-            home_candidates.append(
-                self.db_path.expanduser().absolute().parents[2] / ".env"
-            )
+        hermes_home = live_path.parent
+        canonical_db_path = (
+            hermes_home
+            / "runtime"
+            / "pnc_agent"
+            / "feishu_issue_kafka_rca"
+            / "control.sqlite3"
+        )
+        canonical_binding_path = self.db_path.expanduser().absolute().parent / "active-release-binding.json"
         if (
-            Path(str(payload["active_release_binding"]["path"])).expanduser().absolute()
+            self.db_path.expanduser().absolute() != canonical_db_path
+            or Path(str(payload["active_release_binding"]["path"])).expanduser().absolute()
             != canonical_binding_path
-            or live_path not in home_candidates
+            or live_path != hermes_home / ".env"
         ):
             raise RuntimeError("exact_outbox_hold_config_changed")
         if (
@@ -16770,19 +17393,25 @@ class RcaControlStore:
         ):
             raise RuntimeError("exact_outbox_hold_config_changed")
         try:
-            from scripts.pnc_rca_outbox_dispatcher import DispatcherConfig
+            from scripts.pnc_rca_outbox_dispatcher import (
+                DispatcherConfig,
+                _exact_outbox_canonical_env_config,
+            )
 
-            live_config_binding = DispatcherConfig.from_env().public_dict()
+            canonical_config = _exact_outbox_canonical_env_config(
+                payload["active_release_binding"]["live_env_path"]
+            )
+            process_config = DispatcherConfig.from_env()
+            canonical_config_binding = canonical_config.public_dict()
+            live_config_binding = process_config.public_dict()
         except Exception as exc:
             raise RuntimeError("exact_outbox_hold_config_unavailable") from exc
-        if live_config_binding != dict(config_binding):
+        if (
+            canonical_config_binding != dict(config_binding)
+            or live_config_binding != dict(config_binding)
+        ):
             raise RuntimeError("exact_outbox_hold_config_changed")
-        try:
-            expected_max_age = int(
-                os.environ.get("HERMES_RCA_OUTBOX_MAX_AGE_SECONDS", "86400")
-            )
-        except ValueError as exc:
-            raise RuntimeError("exact_outbox_hold_config_changed") from exc
+        expected_max_age = canonical_config.max_age_seconds
         if (
             config_binding.get("max_age_seconds") != expected_max_age
             or payload.get("max_age_seconds") != expected_max_age
@@ -16795,25 +17424,28 @@ class RcaControlStore:
             or config_binding.get("data_access_mode") != "remote_read"
         ):
             raise RuntimeError("exact_outbox_hold_config_changed")
-        snapshot_store = RcaControlStore(
-            self.db_path,
-            require_current=True,
-            read_only=True,
-        )
-        current_identity = snapshot_store.control_db_source_snapshot_identity()
-        if self._exact_logical_source_identity(current_identity) != self._exact_logical_source_identity(
-            payload["control_db_identity"]
-        ):
-            raise RuntimeError("exact_outbox_hold_control_db_provenance_changed")
+        if include_control_db_identity:
+            snapshot_store = RcaControlStore(
+                self.db_path,
+                require_current=True,
+                read_only=True,
+            )
+            current_identity = snapshot_store.control_db_source_snapshot_identity()
+            if self._exact_logical_source_identity(current_identity) != self._exact_logical_source_identity(
+                payload["control_db_identity"]
+            ):
+                raise RuntimeError("exact_outbox_hold_control_db_provenance_changed")
         binding = payload["active_release_binding"]
         active_digest, raw_binding, _active_identity = self._exact_bound_file_bytes(
             binding["path"]
         )
         if active_digest != binding["raw_sha256"]:
             raise RuntimeError("exact_outbox_hold_active_binding_changed")
-        if self._exact_bound_file_sha256(binding["live_env_path"]) != binding[
-            "live_env_sha256"
-        ]:
+        live_env_digest = self._exact_bound_file_sha256(binding["live_env_path"])
+        if (
+            live_env_digest != binding["live_env_sha256"]
+            or live_env_digest != binding["candidate_env_sha256"]
+        ):
             raise RuntimeError("exact_outbox_hold_live_env_changed")
         try:
             parsed_binding = json.loads(
@@ -16924,8 +17556,11 @@ class RcaControlStore:
                 raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
             runtime_raw[str(Path(file_binding["path"]).expanduser().absolute())] = raw
         manifest_path = Path(runtime["manifest"]["path"]).expanduser().absolute()
+        hermes_home = Path(
+            payload["active_release_binding"]["live_env_path"]
+        ).expanduser().absolute().parent
         if (
-            manifest_path != Path.home() / ".hermes" / "runtime" / "LIVE_MANIFEST.json"
+            manifest_path != hermes_home / "runtime" / "LIVE_MANIFEST.json"
             or Path(os.path.realpath(manifest_path)) != manifest_path
         ):
             raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
@@ -16956,6 +17591,8 @@ class RcaControlStore:
         if (
             runtime_root != Path(runtime["manifest_runtime_root"])
             or Path(os.path.realpath(runtime_root)) != runtime_root
+            or runtime_root.parent
+            != hermes_home / "runtime" / "releases"
         ):
             raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
         expected_plist_prefix = Path.home() / "Library" / "LaunchAgents"
@@ -16980,11 +17617,15 @@ class RcaControlStore:
             ):
                 raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
             try:
-                plist = plistlib.loads(runtime_raw[str(plist_path)])
-            except (OSError, ValueError, plistlib.InvalidFileException) as exc:
+                from scripts.pnc_rca_release_transaction import _validate_plist
+
+                _validate_plist(
+                    runtime_raw[str(plist_path)],
+                    label=label,
+                    hermes_home=hermes_home,
+                )
+            except Exception as exc:
                 raise RuntimeError("exact_outbox_hold_runtime_provenance_changed") from exc
-            if not isinstance(plist, Mapping) or plist.get("Label") != label:
-                raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
         registry_path = Path(runtime["stable_target_registry"]["path"]).expanduser().absolute()
         if (
             registry_path
@@ -16992,6 +17633,12 @@ class RcaControlStore:
             or Path(os.path.realpath(registry_path)) != registry_path
         ):
             raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
+        try:
+            from scripts.pnc_live_exec import _stable_target_registry
+
+            _stable_target_registry(runtime_root)
+        except Exception as exc:
+            raise RuntimeError("exact_outbox_hold_runtime_provenance_changed") from exc
         git_head = subprocess.run(
             ["git", "-C", str(runtime_root), "rev-parse", "HEAD"],
             capture_output=True,
@@ -17129,6 +17776,79 @@ class RcaControlStore:
         return value
 
     @classmethod
+    def _exact_outbox_hold_role_binding_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        row: Mapping[str, Any],
+        epoch_id: str,
+        expected_slot_kind: str,
+    ) -> None:
+        """Bind each hold row to its exact consumed manual activation slot."""
+        binding = conn.execute(
+            """
+            SELECT s.slot_kind, s.authorized_source_kind,
+                   s.authorized_identity_sha256, s.consumed_ledger_id,
+                   s.consumed_at, al.ledger_id, al.epoch_id AS ledger_epoch_id,
+                   al.entrypoint, al.source_kind, al.source_identity_sha256,
+                   al.slot_kind AS ledger_slot_kind, al.decision, al.bound_at,
+                   al.business_key, al.submission_key, al.generation,
+                   t.activation_epoch_id AS trigger_epoch_id,
+                   t.activation_ledger_id AS trigger_ledger_id
+              FROM rca_activation_budget_slots AS s
+              JOIN rca_activation_admission_ledger AS al
+                ON al.epoch_id = s.epoch_id
+               AND al.ledger_id = s.consumed_ledger_id
+              JOIN business_triggers AS t
+                ON t.activation_epoch_id = al.epoch_id
+               AND t.activation_ledger_id = al.ledger_id
+               AND t.business_key = al.business_key
+               AND t.submission_key = al.submission_key
+               AND t.generation = al.generation
+             WHERE s.epoch_id = ?
+               AND s.slot_kind = ?
+               AND s.consumed_ledger_id = ?
+               AND t.business_key = ?
+               AND t.submission_key = ?
+               AND t.generation = ?
+            """,
+            (
+                str(epoch_id),
+                str(expected_slot_kind),
+                row["activation_ledger_id"],
+                row["business_key"],
+                row["submission_key"],
+                row["generation"],
+            ),
+        ).fetchone()
+        if (
+            binding is None
+            or str(binding["slot_kind"] or "") != expected_slot_kind
+            or str(binding["authorized_source_kind"] or "") != "manual"
+            or not str(binding["authorized_identity_sha256"] or "")
+            or binding["consumed_ledger_id"] is None
+            or not str(binding["consumed_at"] or "")
+            or int(binding["ledger_id"] or 0)
+            != int(binding["consumed_ledger_id"] or 0)
+            or str(binding["ledger_epoch_id"] or "") != str(epoch_id)
+            or str(binding["entrypoint"] or "") != "manual_admit"
+            or str(binding["source_kind"] or "") != "manual"
+            or str(binding["source_identity_sha256"] or "")
+            != str(binding["authorized_identity_sha256"] or "")
+            or str(binding["ledger_slot_kind"] or "") != expected_slot_kind
+            or str(binding["decision"] or "") != "admit"
+            or not str(binding["bound_at"] or "")
+            or str(binding["business_key"] or "") != str(row["business_key"])
+            or str(binding["submission_key"] or "")
+            != str(row["submission_key"])
+            or int(binding["generation"] or 0) != int(row["generation"])
+            or str(binding["trigger_epoch_id"] or "") != str(epoch_id)
+            or int(binding["trigger_ledger_id"] or 0)
+            != int(binding["ledger_id"] or 0)
+        ):
+            raise RuntimeError("exact_outbox_hold_activation_role_binding_invalid")
+
+    @classmethod
     def _exact_outbox_hold_snapshot_tx(
         cls,
         conn: sqlite3.Connection,
@@ -17211,6 +17931,19 @@ class RcaControlStore:
             or active_activation.get("state") != "bounded_active"
         ):
             raise RuntimeError("exact_outbox_hold_bounded_activation_required")
+        epoch_id = str(active_activation.get("epoch_id") or "")
+        cls._exact_outbox_hold_role_binding_tx(
+            conn,
+            row=predecessor,
+            epoch_id=epoch_id,
+            expected_slot_kind="manual_success",
+        )
+        cls._exact_outbox_hold_role_binding_tx(
+            conn,
+            row=target,
+            epoch_id=epoch_id,
+            expected_slot_kind="manual_terminal_failure",
+        )
         for role, binding in (
             ("target", target_binding),
             ("predecessor", predecessor_binding),
@@ -17500,6 +18233,10 @@ class RcaControlStore:
                 or conn.total_changes - changes_before != 2
             ):
                 raise RuntimeError("exact_outbox_hold_effect_delta_changed")
+            self._validate_exact_hold_external_bindings(
+                effective_payload,
+                include_control_db_identity=False,
+            )
             conn.commit()
             return dict(effective_payload)
         except Exception:

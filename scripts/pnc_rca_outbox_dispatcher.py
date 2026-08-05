@@ -26,7 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 from gateway.pnc_rca_admission import (
     RCA_KAFKA_TRIGGER_KINDS,
@@ -933,12 +933,17 @@ def _exact_runtime_file_binding(path: Path, *, label: str | None = None) -> dict
     }
 
 
-def _exact_outbox_runtime_provenance() -> dict[str, Any]:
+def _exact_outbox_runtime_provenance(
+    hermes_home: str | Path | None = None,
+) -> dict[str, Any]:
     """Bind the active runtime manifest and canonical resident source files."""
+    runtime_home = Path(hermes_home or get_hermes_home()).expanduser().absolute()
     manifest_path = Path(
-        os.environ.get(
+        str(runtime_home / "runtime" / "LIVE_MANIFEST.json")
+        if hermes_home is not None
+        else os.environ.get(
             "HERMES_RCA_OUTBOX_RUNTIME_MANIFEST_PATH",
-            str(Path.home() / ".hermes" / "runtime" / "LIVE_MANIFEST.json"),
+            str(runtime_home / "runtime" / "LIVE_MANIFEST.json"),
         )
     )
     manifest_digest, manifest_raw, manifest_stat = _bound_exact_hold_source_bytes(
@@ -1026,7 +1031,9 @@ def _exact_outbox_runtime_provenance() -> dict[str, Any]:
     }
 
 
-def _exact_outbox_hold_tool_provenance() -> dict[str, Any]:
+def _exact_outbox_hold_tool_provenance(
+    hermes_home: str | Path | None = None,
+) -> dict[str, Any]:
     entrypoint = Path(__file__).resolve(strict=True)
     control_path = (REPO_ROOT / "gateway" / "pnc_rca_control_store.py").resolve(
         strict=True
@@ -1077,7 +1084,7 @@ def _exact_outbox_hold_tool_provenance() -> dict[str, Any]:
         "git_tree": git_tree,
         "git_status_returncode": int(git_status.returncode),
         "git_clean": git_status.returncode == 0 and not git_status.stdout.strip(),
-        "runtime_provenance": _exact_outbox_runtime_provenance(),
+        "runtime_provenance": _exact_outbox_runtime_provenance(hermes_home),
     }
 
 
@@ -1149,7 +1156,7 @@ def _exact_outbox_hold_active_release_binding(
         expected_release_id=config.release_id,
         expected_epoch_id=config.bootstrap_epoch_id,
     )
-    runtime = _exact_outbox_runtime_provenance()
+    runtime = _exact_outbox_runtime_provenance(config.live_env_path.parent)
     release_bom_sha256 = str(binding.get("release_bom_sha256") or "")
     if release_bom_sha256 != runtime.get("release_bom_sha256"):
         raise RuntimeError("exact_outbox_hold_runtime_release_bom_changed")
@@ -4381,13 +4388,22 @@ def read_health_status(
 
 
 def load_dispatcher_environment(env_file: str | Path | None = None) -> Path:
-    path = Path(
-        env_file
-        or os.environ.get(f"{ENV_PREFIX}ENV_FILE")
-        or get_hermes_home() / ".env"
-    ).expanduser()
+    requested = env_file or os.environ.get(f"{ENV_PREFIX}ENV_FILE")
+    path = Path(requested or get_hermes_home() / ".env").expanduser().absolute()
     load_dotenv(path, override=False, interpolate=False)
     return path
+
+
+def _exact_outbox_canonical_env_config(env_file: str | Path) -> DispatcherConfig:
+    """Build config solely from the canonical dotenv source, without interpolation."""
+    path = Path(env_file).expanduser().absolute()
+    parsed = dotenv_values(path, interpolate=False)
+    if not isinstance(parsed, Mapping) or any(
+        not isinstance(key, str) or value is None or not isinstance(value, str)
+        for key, value in parsed.items()
+    ):
+        raise ValueError("exact_outbox_hold_canonical_env_invalid")
+    return DispatcherConfig.from_env(dict(parsed), hermes_home=path.parent)
 
 
 def run_dispatch_loop(
@@ -4522,7 +4538,9 @@ def _run_exact_outbox_hold_command(
     observed_at = _utc_now()
     active_binding = _exact_outbox_hold_active_release_binding(config)
     config_binding_sha256 = _exact_outbox_hold_config_binding(config)
-    tool_provenance = _exact_outbox_hold_tool_provenance()
+    tool_provenance = _exact_outbox_hold_tool_provenance(
+        config.live_env_path.parent
+    )
     tool_provenance_sha256 = _exact_hold_json_sha256(tool_provenance)
     resident_census = _exact_outbox_resident_census(config)
     if not store.read_only:
@@ -4630,7 +4648,10 @@ def _run_exact_outbox_hold_command(
         != config_binding_sha256
     ):
         raise RuntimeError("exact_outbox_hold_config_changed")
-    if _exact_outbox_hold_tool_provenance() != tool_provenance:
+    if (
+        _exact_outbox_hold_tool_provenance(config.live_env_path.parent)
+        != tool_provenance
+    ):
         raise RuntimeError("exact_outbox_hold_tool_provenance_changed")
     apply_resident_census = _exact_outbox_resident_census(config)
     resident_policy_keys = (
@@ -4841,8 +4862,41 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("dispatcher_circuit_reset_arguments_require_clear_circuit")
         if args.clear_circuit and args.apply and args.receipt is None:
             raise ValueError("dispatcher_circuit_reset_receipt_required")
-        load_dispatcher_environment(args.env_file)
+        canonical_env_path = (
+            Path(get_hermes_home()).expanduser() / ".env"
+        ).absolute()
+        operator_mode_requested = bool(
+            args.clear_circuit
+            or args.materialize_reset
+            or args.hold_exact_outbox_id is not None
+            or args.materialize_exact_outbox_hold
+        )
+        requested_env_path = args.env_file or os.environ.get(f"{ENV_PREFIX}ENV_FILE")
+        if operator_mode_requested and requested_env_path:
+            try:
+                requested_resolved = Path(requested_env_path).expanduser().resolve(
+                    strict=True
+                )
+                canonical_resolved = canonical_env_path.resolve(strict=True)
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                raise ValueError("exact_outbox_hold_canonical_env_path_required") from exc
+            if requested_resolved != canonical_resolved:
+                raise ValueError("exact_outbox_hold_canonical_env_path_required")
+        loaded_env_path = load_dispatcher_environment(args.env_file)
         config = DispatcherConfig.from_env()
+        if operator_mode_requested:
+            try:
+                loaded_resolved = Path(loaded_env_path).expanduser().resolve(strict=True)
+                canonical_resolved = canonical_env_path.resolve(strict=True)
+                config_resolved = (
+                    Path(config.live_env_path).expanduser().resolve(strict=True)
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                raise ValueError("exact_outbox_hold_canonical_env_path_required") from exc
+            if not (
+                loaded_resolved == canonical_resolved == config_resolved
+            ):
+                raise ValueError("exact_outbox_hold_canonical_env_path_required")
         if args.check_config:
             print(json.dumps({"ok": True, "config": config.public_dict()}, indent=2))
             return 0

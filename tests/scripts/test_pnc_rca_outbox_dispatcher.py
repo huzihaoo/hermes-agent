@@ -5,6 +5,7 @@ import copy
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import plistlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,6 +23,7 @@ from gateway.pnc_rca_control_store import (
 from gateway.pnc_rca_runtime_identity import RCA_RUNTIME_RELATIVE_FILES
 from gateway.pnc_rca_runtime_identity import canonical_json_sha256
 from scripts import pnc_rca_outbox_dispatcher as dispatcher
+from scripts import pnc_live_exec as live_exec_module
 from tests.gateway.test_pnc_rca_control_store import (
     _begin_bounded_activation,
     _manual_request,
@@ -32,6 +34,7 @@ from tests.gateway.test_pnc_rca_control_store import (
 
 RELEASE_ID = "rca-v0182-test-release"
 EPOCH_ID = "rca-bootstrap-v0182-test-epoch"
+REAL_HOME = Path.home()
 
 
 def test_storage_admission_uses_isolated_production_runtime():
@@ -41,7 +44,18 @@ def test_storage_admission_uses_isolated_production_runtime():
     )
 
 
-def _config_env(tmp_path, *, enabled: bool = False) -> dict[str, str]:
+def _config_env(
+    tmp_path, *, enabled: bool = False, canonical_layout: bool = False
+) -> dict[str, str]:
+    control_db_path = (
+        tmp_path
+        / "runtime"
+        / "pnc_agent"
+        / "feishu_issue_kafka_rca"
+        / "control.sqlite3"
+        if canonical_layout
+        else tmp_path / "control.sqlite3"
+    )
     return {
         "HERMES_RCA_OUTBOX_DISPATCH_ENABLED": str(enabled).lower(),
         "HERMES_RCA_OUTBOX_STORAGE_ADMISSION_ENABLED": str(enabled).lower(),
@@ -49,7 +63,7 @@ def _config_env(tmp_path, *, enabled: bool = False) -> dict[str, str]:
             enabled
         ).lower(),
         "HERMES_RCA_OUTBOX_DELIVERY_BACKPRESSURE_ENABLED": str(enabled).lower(),
-        "HERMES_RCA_OUTBOX_CONTROL_DB_PATH": str(tmp_path / "control.sqlite3"),
+        "HERMES_RCA_OUTBOX_CONTROL_DB_PATH": str(control_db_path),
         "HERMES_RCA_OUTBOX_HEALTH_PATH": str(tmp_path / "health.json"),
         "HERMES_RCA_PROD_CAPACITY_MODE": "bootstrap",
         "HERMES_RCA_PROD_RELEASE_ID": RELEASE_ID,
@@ -239,16 +253,31 @@ def test_enabled_resident_without_epoch_exits_before_dispatcher_creation(
 
 
 def _patch_reset_cli(monkeypatch, config):
-    monkeypatch.setattr(dispatcher, "load_dispatcher_environment", lambda _path: None)
+    config.live_env_path.parent.mkdir(parents=True, exist_ok=True)
+    config.live_env_path.write_text("HERMES_TEST=true\n", encoding="utf-8")
+    monkeypatch.setattr(
+        dispatcher, "get_hermes_home", lambda: config.live_env_path.parent
+    )
+    monkeypatch.setattr(
+        dispatcher,
+        "load_dispatcher_environment",
+        lambda _path: config.live_env_path,
+    )
     monkeypatch.setattr(
         dispatcher.DispatcherConfig,
         "from_env",
-        classmethod(lambda _cls: config),
+        classmethod(lambda _cls, *_args, **_kwargs: config),
     )
 
 
 def _exact_hold_fixture(tmp_path):
-    store = RcaControlStore(tmp_path / "control.sqlite3")
+    store = RcaControlStore(
+        tmp_path
+        / "runtime"
+        / "pnc_agent"
+        / "feishu_issue_kafka_rca"
+        / "control.sqlite3"
+    )
     _begin_bounded_activation(store, epoch_id="rca-exact-hold-test")
     conn = store._connect()
     try:
@@ -286,9 +315,116 @@ def _exact_hold_fixture(tmp_path):
     return store
 
 
-def _patch_exact_hold_cli(monkeypatch, config):
-    _patch_reset_cli(monkeypatch, config)
-    runtime = dispatcher._exact_outbox_runtime_provenance()
+def _prepare_exact_hold_runtime(monkeypatch, config):
+    hermes_home = config.live_env_path.parent
+    user_home = hermes_home / "test-user-home"
+    monkeypatch.setattr(
+        Path,
+        "home",
+        classmethod(lambda _cls: user_home),
+    )
+    runtime_root = hermes_home / "runtime" / "releases" / "hermes-test-runtime"
+    governance = hermes_home / "runtime" / "governance-tools"
+    registry_path = runtime_root / "gateway" / "assets" / "pnc_stable_target_registry_v1.json"
+    runtime_root.mkdir(parents=True)
+    governance.mkdir(parents=True)
+    (governance / "pnc_live_exec.py").write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    registry_path.parent.mkdir(parents=True)
+    registry_payload = {
+        "schema_version": "pnc_stable_target_registry_v1",
+        "targets": {
+            label: {
+                "target_kind": target_kind,
+                "relative_path": relative_path,
+                "sha256": "0" * 64,
+                "size": 1,
+            }
+            for label, (target_kind, relative_path) in live_exec_module.SERVICE_TARGETS.items()
+            if target_kind in {"governance_tool", "runtime_file"}
+        },
+    }
+    registry_path.write_text(
+        json.dumps(registry_payload, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    git_commands = [
+        ["git", "-C", str(runtime_root), "init", "-q"],
+        ["git", "-C", str(runtime_root), "config", "user.email", "test@example.com"],
+        ["git", "-C", str(runtime_root), "config", "user.name", "Exact Hold Test"],
+        ["git", "-C", str(runtime_root), "add", "."],
+        ["git", "-C", str(runtime_root), "commit", "-q", "-m", "runtime fixture"],
+    ]
+    for command in git_commands:
+        dispatcher.subprocess.run(command, check=True, capture_output=True, text=True)
+    head = dispatcher.subprocess.run(
+        ["git", "-C", str(runtime_root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    tree = dispatcher.subprocess.run(
+        ["git", "-C", str(runtime_root), "rev-parse", "HEAD^{tree}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    manifest_path = hermes_home / "runtime" / "LIVE_MANIFEST.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "runtime_root": str(runtime_root),
+                "runtime_release_target": "hermes-test-runtime",
+                "gateway_release_target": "hermes-test-runtime",
+                "gateway_release_binding": {
+                    "commit": head,
+                    "tree": tree,
+                    "capacity_admission": {"release_bom_sha256": "a" * 64},
+                },
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    manifest_path.chmod(0o600)
+    plist_dir = user_home / "Library" / "LaunchAgents"
+    plist_dir.mkdir(parents=True)
+    for label in control_store_module.EXACT_OUTBOX_RUNTIME_PLIST_LABELS:
+        plist_path = plist_dir / f"{label}.plist"
+        plist_path.write_bytes(
+            plistlib.dumps(
+                {
+                    "Label": label,
+                    "ProgramArguments": [
+                        "/usr/bin/python3",
+                        str(governance / "pnc_live_exec.py"),
+                        label,
+                    ],
+                    "EnvironmentVariables": {},
+                }
+            )
+        )
+        plist_path.chmod(0o600)
+
+
+def _patch_exact_hold_cli(monkeypatch, config, env):
+    monkeypatch.setattr(
+        dispatcher, "get_hermes_home", lambda: config.live_env_path.parent
+    )
+    monkeypatch.setattr(
+        dispatcher,
+        "load_dispatcher_environment",
+        lambda _path: config.live_env_path,
+    )
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    _prepare_exact_hold_runtime(monkeypatch, config)
+    config.live_env_path.write_text(
+        "".join(f"{key}={value}\n" for key, value in sorted(env.items())),
+        encoding="utf-8",
+    )
+    config.live_env_path.chmod(0o600)
+    runtime = dispatcher._exact_outbox_runtime_provenance(config.live_env_path.parent)
     active_payload = {
         "release_id": RELEASE_ID,
         "authority_sha256": "b" * 64,
@@ -300,14 +436,12 @@ def _patch_exact_hold_cli(monkeypatch, config):
         json.dumps(active_payload, sort_keys=True) + "\n", encoding="utf-8"
     )
     config.active_release_binding_path.chmod(0o600)
-    config.live_env_path.write_text("HERMES_TEST=true\n", encoding="utf-8")
-    config.live_env_path.chmod(0o600)
     active_raw_sha = dispatcher._bound_exact_hold_source_sha256(
         config.active_release_binding_path
     )
     live_env_sha = dispatcher._bound_exact_hold_source_sha256(config.live_env_path)
     tool_root = (
-        Path.home()
+        REAL_HOME
         / ".hermes"
         / "runtime"
         / "releases"
@@ -354,7 +488,7 @@ def _patch_exact_hold_cli(monkeypatch, config):
             "authority_epoch_id": "authority-test",
             "bootstrap_epoch_id": EPOCH_ID,
             "release_bom_sha256": runtime["release_bom_sha256"],
-            "candidate_env_sha256": "c" * 64,
+            "candidate_env_sha256": live_env_sha,
             "authorization_fingerprint": "d" * 64,
             "authorization_receipt_sha256": "e" * 64,
             "approval_evidence_sha256": "f" * 64,
@@ -377,7 +511,7 @@ def _patch_exact_hold_cli(monkeypatch, config):
             "authority_epoch_id": "authority-test",
             "bootstrap_epoch_id": EPOCH_ID,
             "release_bom_sha256": runtime["release_bom_sha256"],
-            "candidate_env_sha256": "c" * 64,
+            "candidate_env_sha256": live_env_sha,
             "authorization_fingerprint": "d" * 64,
             "authorization_receipt_sha256": "e" * 64,
             "approval_evidence_sha256": "f" * 64,
@@ -386,7 +520,7 @@ def _patch_exact_hold_cli(monkeypatch, config):
     monkeypatch.setattr(
         dispatcher,
         "_exact_outbox_hold_tool_provenance",
-        lambda: dict(tool_provenance),
+        lambda *_args, **_kwargs: dict(tool_provenance),
     )
     monkeypatch.setattr(
         dispatcher,
@@ -397,10 +531,10 @@ def _patch_exact_hold_cli(monkeypatch, config):
 
 def _exact_hold_plan(tmp_path, monkeypatch, capsys):
     store = _exact_hold_fixture(tmp_path)
-    env = _config_env(tmp_path)
+    env = _config_env(tmp_path, canonical_layout=True)
     env["HERMES_RCA_OUTBOX_ACTIVATION_REQUIRED"] = "true"
     config = dispatcher.DispatcherConfig.from_env(env, hermes_home=tmp_path)
-    _patch_exact_hold_cli(monkeypatch, config)
+    _patch_exact_hold_cli(monkeypatch, config, env)
     receipt_dir = tmp_path / "receipt-dir"
     receipt_dir.mkdir()
     receipt = receipt_dir / "hold.json"
@@ -456,10 +590,10 @@ def test_exact_outbox_hold_plan_is_read_only_and_privacy_light(
     tmp_path, monkeypatch, capsys
 ):
     store = _exact_hold_fixture(tmp_path)
-    env = _config_env(tmp_path)
+    env = _config_env(tmp_path, canonical_layout=True)
     env["HERMES_RCA_OUTBOX_ACTIVATION_REQUIRED"] = "true"
     config = dispatcher.DispatcherConfig.from_env(env, hermes_home=tmp_path)
-    _patch_exact_hold_cli(monkeypatch, config)
+    _patch_exact_hold_cli(monkeypatch, config, env)
     receipt = tmp_path / "hold.json"
     paths = [
         config.control_db_path,
@@ -522,10 +656,10 @@ def test_exact_outbox_hold_plan_without_source_sidecars_is_still_read_only(
             sidecar.unlink()
         except FileNotFoundError:
             pass
-    env = _config_env(tmp_path)
+    env = _config_env(tmp_path, canonical_layout=True)
     env["HERMES_RCA_OUTBOX_ACTIVATION_REQUIRED"] = "true"
     config = dispatcher.DispatcherConfig.from_env(env, hermes_home=tmp_path)
-    _patch_exact_hold_cli(monkeypatch, config)
+    _patch_exact_hold_cli(monkeypatch, config, env)
     receipt = tmp_path / "hold-no-sidecar.json"
     before = sorted(path.name for path in tmp_path.iterdir())
     assert dispatcher.main(
@@ -956,6 +1090,234 @@ def test_exact_outbox_hold_public_api_rejects_self_signed_retry_horizon_without_
     )
 
 
+@pytest.mark.parametrize(
+    "nested_extra,expected_error",
+    (
+        ("effect_delta", "exact_outbox_hold_effect_delta_invalid"),
+        ("activation_db_identity", "exact_outbox_hold_activation_invalid"),
+        ("runtime_provenance", "exact_outbox_hold_runtime_provenance_invalid"),
+        ("resident_census", "exact_outbox_hold_resident_census_invalid"),
+        ("queue", "exact_outbox_hold_queue_binding_invalid"),
+        ("control_db_identity", "exact_outbox_hold_control_db_identity_invalid"),
+    ),
+)
+def test_exact_outbox_hold_public_api_rejects_nested_extra_without_mutation(
+    tmp_path, monkeypatch, capsys, nested_extra, expected_error
+):
+    store, _config, _receipt, _args, output = _exact_hold_plan(
+        tmp_path, monkeypatch, capsys
+    )
+    audit = copy.deepcopy(output["plan"])
+    if nested_extra == "effect_delta":
+        audit["effect_delta"]["unexpected_extra"] = True
+    elif nested_extra == "activation_db_identity":
+        db_identity = audit["active_activation"]["db_logical_identity"]
+        db_identity["unexpected_extra"] = True
+        audit["active_activation"]["sha256"] = (
+            control_store_module._exact_canonical_sha256(
+                {
+                    key: item
+                    for key, item in audit["active_activation"].items()
+                    if key != "sha256"
+                }
+            )
+        )
+    elif nested_extra == "runtime_provenance":
+        audit["tool_provenance"]["runtime_provenance"]["unexpected_extra"] = True
+    elif nested_extra == "resident_census":
+        audit["resident_census"]["unexpected_extra"] = True
+        audit["resident_census"]["source_sha256"] = dispatcher._exact_hold_json_sha256(
+            {
+                key: item
+                for key, item in audit["resident_census"].items()
+                if key != "source_sha256"
+            }
+        )
+    elif nested_extra == "queue":
+        audit["eligible_queue_before"]["unexpected_extra"] = True
+    elif nested_extra == "control_db_identity":
+        audit["control_db_identity"]["logical_db_identity"]["unexpected_extra"] = True
+    else:
+        raise AssertionError(nested_extra)
+    _resign_exact_hold(audit)
+
+    before = _rows_and_meta(store)
+    with pytest.raises(ValueError, match=expected_error):
+        store.hold_exact_outbox_with_audit(audit=audit)
+    assert _rows_and_meta(store) == before
+
+
+def test_exact_outbox_hold_rejects_reversed_activation_roles_without_mutation(
+    tmp_path, monkeypatch, capsys
+):
+    store, _config, _receipt, _args, _output = _exact_hold_plan(
+        tmp_path, monkeypatch, capsys
+    )
+    before = _rows_and_meta(store)
+    with pytest.raises(
+        RuntimeError,
+        match="exact_outbox_hold_activation_role_binding_invalid",
+    ):
+        store.exact_outbox_hold_snapshot(
+            target_outbox_id=684,
+            predecessor_outbox_id=685,
+            activation_required=True,
+        )
+    assert _rows_and_meta(store) == before
+
+
+def test_exact_outbox_hold_rejects_alternate_env_file_without_mutation(
+    tmp_path, monkeypatch, capsys
+):
+    real_loader = dispatcher.load_dispatcher_environment
+    store, _config, _receipt, args, output = _exact_hold_plan(
+        tmp_path, monkeypatch, capsys
+    )
+    monkeypatch.setattr(dispatcher, "load_dispatcher_environment", real_loader)
+    alternate = tmp_path / "alternate.env"
+    alternate.write_text(
+        "HERMES_RCA_OUTBOX_MAX_AGE_SECONDS=604800\n", encoding="utf-8"
+    )
+    apply_args = ["--env-file", str(alternate), *args, "--apply"]
+    for key, value in output["expected_apply"].items():
+        apply_args.extend(["--" + key.replace("_", "-"), value])
+    before = _rows_and_meta(store)
+    assert dispatcher.main(apply_args) == 2
+    assert "exact_outbox_hold_canonical_env_path_required" in capsys.readouterr().err
+    assert _rows_and_meta(store) == before
+
+
+def test_exact_outbox_hold_binds_nondefault_hermes_home_and_canonical_env(
+    tmp_path, monkeypatch, capsys
+):
+    store, config, _receipt, _args, output = _exact_hold_plan(
+        tmp_path, monkeypatch, capsys
+    )
+    assert config.live_env_path.parent == tmp_path
+    assert config.control_db_path == (
+        tmp_path / "runtime" / "pnc_agent" / "feishu_issue_kafka_rca" / "control.sqlite3"
+    )
+    assert output["plan"]["tool_provenance"]["runtime_provenance"]["manifest"][
+        "path"
+    ] == str(tmp_path / "runtime" / "LIVE_MANIFEST.json")
+    assert store.list_rows("rca_outbox")
+
+
+def test_exact_outbox_hold_rejects_process_env_override_without_mutation(
+    tmp_path, monkeypatch, capsys
+):
+    store, _config, _receipt, _args, output = _exact_hold_plan(
+        tmp_path, monkeypatch, capsys
+    )
+    monkeypatch.setenv("HERMES_RCA_OUTBOX_MAX_AGE_SECONDS", "604800")
+    before = _rows_and_meta(store)
+    with pytest.raises(RuntimeError, match="exact_outbox_hold_config_changed"):
+        store.hold_exact_outbox_with_audit(audit=output["plan"])
+    assert _rows_and_meta(store) == before
+
+
+def test_exact_outbox_hold_rejects_boolean_row_counter_without_mutation(
+    tmp_path, monkeypatch, capsys
+):
+    store, _config, _receipt, _args, output = _exact_hold_plan(
+        tmp_path, monkeypatch, capsys
+    )
+    audit = copy.deepcopy(output["plan"])
+    audit["target_before"]["attempt"] = False
+    audit["target_after"]["attempt"] = False
+    _resign_exact_hold(audit)
+    before = _rows_and_meta(store)
+    with pytest.raises(ValueError, match="exact_outbox_hold_nested_schema_invalid"):
+        store.hold_exact_outbox_with_audit(audit=audit)
+    assert _rows_and_meta(store) == before
+
+
+def test_exact_outbox_hold_rechecks_external_bindings_before_commit(
+    tmp_path, monkeypatch, capsys
+):
+    store, config, _receipt, _args, output = _exact_hold_plan(
+        tmp_path, monkeypatch, capsys
+    )
+    binding_path = config.active_release_binding_path
+    original_binding = binding_path.read_bytes()
+    real_validate = store._validate_exact_hold_external_bindings
+    calls = 0
+
+    def hooked_validate(payload, *, include_control_db_identity=True):
+        nonlocal calls
+        calls += 1
+        result = real_validate(
+            payload,
+            include_control_db_identity=include_control_db_identity,
+        )
+        if calls == 2:
+            binding_path.write_bytes(original_binding + b"\n")
+        return result
+
+    monkeypatch.setattr(store, "_validate_exact_hold_external_bindings", hooked_validate)
+    before = _rows_and_meta(store)
+    with pytest.raises(
+        RuntimeError,
+        match="exact_outbox_hold_(?:active_binding|live_env)_changed",
+    ):
+        store.hold_exact_outbox_with_audit(audit=output["plan"])
+    assert calls == 3
+    assert _rows_and_meta(store) == before
+
+
+@pytest.mark.parametrize("plist_break", ("launcher", "virtual_env"))
+def test_exact_outbox_hold_rejects_wrong_runtime_plist_without_mutation(
+    tmp_path, monkeypatch, capsys, plist_break
+):
+    store, _config, _receipt, _args, output = _exact_hold_plan(
+        tmp_path, monkeypatch, capsys
+    )
+    audit = copy.deepcopy(output["plan"])
+    label = "local.pnc.rca-delivery-dispatcher"
+    plist_path = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+    plist = plistlib.loads(plist_path.read_bytes())
+    if plist_break == "launcher":
+        plist["ProgramArguments"][1] = "/tmp/alternate-pnc-live-exec.py"
+    else:
+        plist["EnvironmentVariables"]["VIRTUAL_ENV"] = str(
+            tmp_path / "runtime" / "venvs" / "alternate"
+        )
+    plist_path.write_bytes(plistlib.dumps(plist))
+    plist_binding = next(
+        item
+        for item in audit["tool_provenance"]["runtime_provenance"]["plists"]
+        if item["label"] == label
+    )
+    plist_binding["sha256"] = dispatcher._bound_exact_hold_source_sha256(plist_path)
+    _resign_exact_hold(audit)
+    before = _rows_and_meta(store)
+    with pytest.raises(RuntimeError, match="exact_outbox_hold_runtime_provenance_changed"):
+        store.hold_exact_outbox_with_audit(audit=audit)
+    assert _rows_and_meta(store) == before
+
+
+def test_exact_outbox_hold_rejects_malformed_stable_registry_without_mutation(
+    tmp_path, monkeypatch, capsys
+):
+    store, _config, _receipt, _args, output = _exact_hold_plan(
+        tmp_path, monkeypatch, capsys
+    )
+    audit = copy.deepcopy(output["plan"])
+    registry_binding = audit["tool_provenance"]["runtime_provenance"][
+        "stable_target_registry"
+    ]
+    registry_path = Path(registry_binding["path"])
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    registry["targets"]["unexpected-extra"] = {}
+    registry_path.write_text(json.dumps(registry, sort_keys=True) + "\n", encoding="utf-8")
+    registry_binding["sha256"] = dispatcher._bound_exact_hold_source_sha256(registry_path)
+    _resign_exact_hold(audit)
+    before = _rows_and_meta(store)
+    with pytest.raises(RuntimeError, match="exact_outbox_hold_runtime_provenance_changed"):
+        store.hold_exact_outbox_with_audit(audit=audit)
+    assert _rows_and_meta(store) == before
+
+
 def test_exact_outbox_hold_recovery_survives_removed_or_swapped_receipt_parent(
     tmp_path, monkeypatch, capsys
 ):
@@ -1220,7 +1582,7 @@ def test_clear_circuit_apply_requires_bounded_audit_inputs(
 
 
 def test_config_fails_closed_without_production_capacity_mode(tmp_path):
-    env = _config_env(tmp_path)
+    env = _config_env(tmp_path, canonical_layout=True)
     env.pop("HERMES_RCA_PROD_CAPACITY_MODE")
 
     with pytest.raises(ValueError, match="must be exactly steady or bootstrap"):
