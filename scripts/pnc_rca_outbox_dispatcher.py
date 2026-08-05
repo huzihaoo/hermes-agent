@@ -973,6 +973,19 @@ def _exact_outbox_runtime_provenance(
         or runtime_root != runtime_root.resolve(strict=True)
     ):
         raise ValueError("exact_outbox_hold_runtime_manifest_invalid")
+    try:
+        runtime_root_stat = runtime_root.lstat()
+    except OSError as exc:
+        raise ValueError("exact_outbox_hold_runtime_manifest_invalid") from exc
+    if (
+        stat.S_ISLNK(runtime_root_stat.st_mode)
+        or not stat.S_ISDIR(runtime_root_stat.st_mode)
+        or runtime_root_stat.st_uid != os.getuid()
+        or stat.S_IMODE(runtime_root_stat.st_mode) & 0o022
+        or Path(os.path.realpath(runtime_root)) != runtime_root
+        or runtime_root.parent != runtime_home / "runtime" / "releases"
+    ):
+        raise ValueError("exact_outbox_hold_runtime_manifest_invalid")
     registry = runtime_root / "gateway" / "assets" / "pnc_stable_target_registry_v1.json"
     runtime_git_head_result = subprocess.run(
         ["git", "-C", str(runtime_root), "rev-parse", "HEAD"],
@@ -997,6 +1010,31 @@ def _exact_outbox_runtime_provenance(
         or not re.fullmatch(r"[0-9a-f]{40}", runtime_git_tree)
     ):
         raise ValueError("exact_outbox_hold_runtime_git_invalid")
+    try:
+        from scripts.pnc_live_exec import SERVICE_TARGETS, _stable_target_registry
+
+        registered_targets = _stable_target_registry(runtime_root)
+        for label, (target_kind, relative_target) in SERVICE_TARGETS.items():
+            if target_kind not in {"governance_tool", "runtime_file"}:
+                continue
+            target_base = (
+                runtime_home / "runtime" / "governance-tools"
+                if target_kind == "governance_tool"
+                else runtime_home / "runtime"
+            )
+            target_path = (target_base / relative_target).absolute()
+            expected = registered_targets[label]
+            digest, raw, _identity = _bound_exact_hold_source_bytes(target_path)
+            if (
+                Path(os.path.realpath(target_path)) != target_path
+                or len(raw) != expected["size"]
+                or digest != expected["sha256"]
+            ):
+                raise ValueError("exact_outbox_hold_runtime_target_changed")
+    except Exception as exc:
+        if isinstance(exc, ValueError) and str(exc) == "exact_outbox_hold_runtime_target_changed":
+            raise
+        raise ValueError("exact_outbox_hold_runtime_target_changed") from exc
     plist_dir = Path.home() / "Library" / "LaunchAgents"
     plists: list[dict[str, Any]] = []
     for label in EXACT_OUTBOX_RUNTIME_PLIST_LABELS:
@@ -4897,6 +4935,10 @@ def main(argv: list[str] | None = None) -> int:
                 loaded_resolved == canonical_resolved == config_resolved
             ):
                 raise ValueError("exact_outbox_hold_canonical_env_path_required")
+        if args.hold_exact_outbox_id is not None or args.materialize_exact_outbox_hold:
+            canonical_config = _exact_outbox_canonical_env_config(canonical_env_path)
+            if canonical_config.public_dict() != config.public_dict():
+                raise ValueError("exact_outbox_hold_config_changed")
         if args.check_config:
             print(json.dumps({"ok": True, "config": config.public_dict()}, indent=2))
             return 0

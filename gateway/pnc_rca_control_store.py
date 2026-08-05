@@ -101,6 +101,7 @@ EXACT_OUTBOX_HOLD_MAX_AUDIT_BYTES = 512 * 1024
 # delay.  Keep a fixed margin for the canary, collector, and manual review.
 EXACT_OUTBOX_HOLD_MIN_REMAINING_SECONDS = 6 * 60 * 60
 EXACT_OUTBOX_HOLD_RECORD_MAX_AGE_SECONDS = 60
+EXACT_OUTBOX_HOLD_MAX_FUTURE_SKEW_SECONDS = 5
 EXACT_OUTBOX_RUNTIME_PLIST_LABELS = (
     "local.pnc.rca-kafka-consumer",
     "local.pnc.rca-outbox-dispatcher",
@@ -340,6 +341,7 @@ EXACT_OUTBOX_HOLD_ROW_FIELDS = frozenset(
         "activation_epoch_id",
         "activation_ledger_id",
         "row_sha256",
+        "created_at",
     }
 )
 EXACT_OUTBOX_HOLD_QUEUE_FIELDS = frozenset(
@@ -1128,7 +1130,13 @@ def _validate_exact_outbox_hold_nested(value: Mapping[str, Any]) -> None:
         )
         require_string(row["schema_version"])
         require_int(row["outbox_id"])
-        for field in ("submission_key", "business_key", "status", "updated_at"):
+        for field in (
+            "submission_key",
+            "business_key",
+            "status",
+            "created_at",
+            "updated_at",
+        ):
             require_string(row[field])
         for field in ("generation", "attempt", "fence"):
             require_int(row[field])
@@ -1531,6 +1539,38 @@ def _validate_exact_outbox_hold_audit(
         )
     ):
         raise ValueError("exact_outbox_hold_resident_census_invalid")
+    try:
+        resident_observed_at = datetime.fromisoformat(
+            str(resident_census["observed_at"]).replace("Z", "+00:00")
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("exact_outbox_hold_resident_census_invalid") from exc
+    if (
+        resident_observed_at.tzinfo is None
+        or resident_observed_at.utcoffset() != timedelta(0)
+        or _utc_datetime(resident_observed_at) < recorded
+        or _utc_datetime(resident_observed_at)
+        > datetime.now(timezone.utc)
+        + timedelta(seconds=EXACT_OUTBOX_HOLD_MAX_FUTURE_SKEW_SECONDS)
+    ):
+        raise ValueError("exact_outbox_hold_resident_census_invalid")
+    live_env_path = Path(active_binding["live_env_path"]).expanduser().absolute()
+    canonical_binding_path = (
+        live_env_path.parent
+        / "runtime"
+        / "pnc_agent"
+        / "feishu_issue_kafka_rca"
+        / "active-release-binding.json"
+    )
+    if (
+        resident_census["active_release_binding_path"]
+        != active_binding["path"]
+        or Path(resident_census["active_release_binding_path"])
+        .expanduser()
+        .absolute()
+        != canonical_binding_path
+    ):
+        raise ValueError("exact_outbox_hold_resident_census_invalid")
     active_activation = normalized.get("active_activation")
     if (
         not isinstance(active_activation, Mapping)
@@ -1558,6 +1598,14 @@ def _validate_exact_outbox_hold_audit(
         != active_activation.get("db_logical_identity_sha256")
         or active_activation.get("production_fingerprint") != ""
         or active_activation.get("production_gate_receipt_sha256") != ""
+    ):
+        raise ValueError("exact_outbox_hold_activation_invalid")
+    if active_activation["sha256"] != _exact_canonical_sha256(
+        {
+            key: item
+            for key, item in active_activation.items()
+            if key != "sha256"
+        }
     ):
         raise ValueError("exact_outbox_hold_activation_invalid")
     destination = normalized.get("destination_binding")
@@ -1618,6 +1666,25 @@ def _validate_exact_outbox_hold_audit(
         != active_activation.get("epoch_id")
     ):
         raise ValueError("exact_outbox_hold_row_state_invalid")
+    for row in (before, after, normalized["predecessor"]):
+        for field in ("created_at", "retry_window_started_at"):
+            raw_timestamp = row.get(field)
+            if raw_timestamp is None:
+                if field == "created_at":
+                    raise ValueError("exact_outbox_hold_row_state_invalid")
+                continue
+            try:
+                parsed_timestamp = datetime.fromisoformat(
+                    str(raw_timestamp).replace("Z", "+00:00")
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError("exact_outbox_hold_row_state_invalid") from exc
+            if (
+                parsed_timestamp.tzinfo is None
+                or parsed_timestamp.utcoffset() != timedelta(0)
+                or _utc_datetime(parsed_timestamp) > recorded
+            ):
+                raise ValueError("exact_outbox_hold_row_state_invalid")
     mutable_after_fields = {"next_attempt_at", "updated_at", "row_sha256"}
     if any(
         before.get(field) != after.get(field)
@@ -1729,6 +1796,8 @@ def _validate_exact_outbox_hold_audit(
         or _utc_datetime(expires) <= recorded
         or int((_utc_datetime(expires) - _utc_datetime(recorded)).total_seconds())
         < EXACT_OUTBOX_HOLD_MIN_REMAINING_SECONDS
+        or retry_horizon["plan_remaining_seconds"]
+        != int((_utc_datetime(expires) - _utc_datetime(recorded)).total_seconds())
     ):
         raise ValueError("exact_outbox_hold_retry_horizon_invalid")
     apply_observed_at = retry_horizon.get("apply_observed_at")
@@ -1756,6 +1825,14 @@ def _validate_exact_outbox_hold_audit(
         or effect_delta.get("target_rows_updated") != 1
         or effect_delta.get("control_meta_inserted") != 1
         or effect_delta.get("business_trigger_rows_updated") != 0
+    ):
+        raise ValueError("exact_outbox_hold_effect_delta_invalid")
+    mutation = effect_delta["mutation"]
+    if (
+        mutation["next_attempt_at"] != EXACT_OUTBOX_HOLD_UNTIL
+        or mutation["next_attempt_at"] != after["next_attempt_at"]
+        or mutation["updated_at"] != recorded_at
+        or mutation["updated_at"] != after["updated_at"]
     ):
         raise ValueError("exact_outbox_hold_effect_delta_invalid")
     fingerprint = normalized.get("receipt_fingerprint")
@@ -17216,6 +17293,7 @@ class RcaControlStore:
             "completed_at": row["completed_at"],
             "quarantined_at": row["quarantined_at"],
             "result_json": row["result_json"],
+            "created_at": str(row["created_at"] or ""),
             "updated_at": str(row["updated_at"] or ""),
             "activation_epoch_id": row["activation_epoch_id"],
             "activation_ledger_id": row["activation_ledger_id"],
@@ -17320,6 +17398,50 @@ class RcaControlStore:
         census = payload["resident_census"]
         uid = str(os.getuid())
         expected_labels = list(EXACT_OUTBOX_RUNTIME_PLIST_LABELS)
+        try:
+            observed_at = datetime.fromisoformat(
+                str(census["observed_at"]).replace("Z", "+00:00")
+            )
+            recorded_at = datetime.fromisoformat(
+                str(payload["recorded_at"]).replace("Z", "+00:00")
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("exact_outbox_hold_resident_census_invalid") from exc
+        if (
+            observed_at.tzinfo is None
+            or observed_at.utcoffset() != timedelta(0)
+            or recorded_at.tzinfo is None
+            or recorded_at.utcoffset() != timedelta(0)
+        ):
+            raise RuntimeError("exact_outbox_hold_resident_census_invalid")
+        current = datetime.now(timezone.utc)
+        age = (current - observed_at.astimezone(timezone.utc)).total_seconds()
+        if (
+            observed_at.astimezone(timezone.utc)
+            < recorded_at.astimezone(timezone.utc)
+            or age > EXACT_OUTBOX_HOLD_RECORD_MAX_AGE_SECONDS
+            or age < -EXACT_OUTBOX_HOLD_MAX_FUTURE_SKEW_SECONDS
+        ):
+            raise RuntimeError("exact_outbox_hold_resident_census_invalid")
+        live_env_path = Path(
+            str(payload["active_release_binding"]["live_env_path"])
+        ).expanduser().absolute()
+        canonical_binding_path = (
+            live_env_path.parent
+            / "runtime"
+            / "pnc_agent"
+            / "feishu_issue_kafka_rca"
+            / "active-release-binding.json"
+        )
+        census_binding_path = Path(
+            str(census["active_release_binding_path"])
+        ).expanduser().absolute()
+        if (
+            census_binding_path != canonical_binding_path
+            or str(census_binding_path)
+            != str(payload["active_release_binding"]["path"])
+        ):
+            raise RuntimeError("exact_outbox_hold_resident_census_invalid")
         if census.get("forbidden_labels") != expected_labels:
             raise RuntimeError("exact_outbox_hold_resident_census_invalid")
         observations = census.get("observations")
@@ -17595,6 +17717,17 @@ class RcaControlStore:
             != hermes_home / "runtime" / "releases"
         ):
             raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
+        try:
+            runtime_root_stat = runtime_root.lstat()
+        except OSError as exc:
+            raise RuntimeError("exact_outbox_hold_runtime_provenance_changed") from exc
+        if (
+            stat.S_ISLNK(runtime_root_stat.st_mode)
+            or not stat.S_ISDIR(runtime_root_stat.st_mode)
+            or runtime_root_stat.st_uid != os.getuid()
+            or stat.S_IMODE(runtime_root_stat.st_mode) & 0o022
+        ):
+            raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
         expected_plist_prefix = Path.home() / "Library" / "LaunchAgents"
         expected_plist_paths = [
             expected_plist_prefix / f"{label}.plist"
@@ -17634,10 +17767,29 @@ class RcaControlStore:
         ):
             raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
         try:
-            from scripts.pnc_live_exec import _stable_target_registry
+            from scripts.pnc_live_exec import SERVICE_TARGETS, _stable_target_registry
 
-            _stable_target_registry(runtime_root)
+            registered_targets = _stable_target_registry(runtime_root)
+            for label, (target_kind, relative_target) in SERVICE_TARGETS.items():
+                if target_kind not in {"governance_tool", "runtime_file"}:
+                    continue
+                target_base = (
+                    hermes_home / "runtime" / "governance-tools"
+                    if target_kind == "governance_tool"
+                    else hermes_home / "runtime"
+                )
+                target_path = (target_base / relative_target).absolute()
+                expected = registered_targets[label]
+                digest, raw, _identity = self._exact_bound_file_bytes(target_path)
+                if (
+                    Path(os.path.realpath(target_path)) != target_path
+                    or len(raw) != expected["size"]
+                    or digest != expected["sha256"]
+                ):
+                    raise RuntimeError("exact_outbox_hold_runtime_target_changed")
         except Exception as exc:
+            if isinstance(exc, RuntimeError) and str(exc) == "exact_outbox_hold_runtime_target_changed":
+                raise
             raise RuntimeError("exact_outbox_hold_runtime_provenance_changed") from exc
         git_head = subprocess.run(
             ["git", "-C", str(runtime_root), "rev-parse", "HEAD"],
@@ -17891,6 +18043,27 @@ class RcaControlStore:
             raise RuntimeError("exact_outbox_hold_target_missing")
         if predecessor is None:
             raise RuntimeError("exact_outbox_hold_predecessor_missing")
+        for row in (target, predecessor):
+            for field in ("created_at", "retry_window_started_at"):
+                raw_timestamp = row[field]
+                if raw_timestamp is None:
+                    if field == "created_at":
+                        raise RuntimeError("exact_outbox_hold_retry_window_invalid")
+                    continue
+                try:
+                    parsed_timestamp = datetime.fromisoformat(
+                        str(raw_timestamp).replace("Z", "+00:00")
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        "exact_outbox_hold_retry_window_invalid"
+                    ) from exc
+                if (
+                    parsed_timestamp.tzinfo is None
+                    or parsed_timestamp.utcoffset() != timedelta(0)
+                    or _utc_datetime(parsed_timestamp) > current
+                ):
+                    raise RuntimeError("exact_outbox_hold_retry_window_invalid")
         rows = conn.execute(
             f"""
             SELECT o.*
@@ -18123,13 +18296,12 @@ class RcaControlStore:
                 raise RuntimeError("exact_outbox_hold_retry_horizon_changed")
             remaining_inside = int(actual_remaining)
             if (
-                target["row_sha256"] != payload["target_before"]["row_sha256"]
-                or predecessor["row_sha256"]
-                != payload["predecessor"]["row_sha256"]
+                dict(target) != dict(payload["target_before"])
+                or dict(predecessor) != dict(payload["predecessor"])
                 or snapshot["eligible_queue"]["sha256"]
                 != payload["eligible_queue_before"]["sha256"]
-                or snapshot["active_activation"]["sha256"]
-                != payload["active_activation"]["sha256"]
+                or dict(snapshot["active_activation"])
+                != dict(payload["active_activation"])
                 or snapshot["active_activation"].get("configured") is not True
                 or snapshot["active_activation"].get("state") != "bounded_active"
                 or target["status"] != "pending"
@@ -18210,10 +18382,15 @@ class RcaControlStore:
             if held is None:
                 raise RuntimeError("exact_outbox_hold_post_row_missing")
             held_binding = self._exact_outbox_row_binding(held)
+            public_held_binding = {
+                key: item
+                for key, item in held_binding.items()
+                if not key.startswith("_")
+            }
             if (
-                held_binding["row_sha256"] != payload["target_after"]["row_sha256"]
-                or held_binding["next_attempt_at"] != EXACT_OUTBOX_HOLD_UNTIL
-                or held_binding["updated_at"] != current
+                public_held_binding != dict(payload["target_after"])
+                or public_held_binding["next_attempt_at"] != EXACT_OUTBOX_HOLD_UNTIL
+                or public_held_binding["updated_at"] != current
             ):
                 raise RuntimeError("exact_outbox_hold_post_row_changed")
             after_snapshot = self._exact_outbox_hold_snapshot_tx(
