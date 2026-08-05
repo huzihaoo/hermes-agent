@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import hashlib
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -12,7 +14,12 @@ from gateway.pnc_rca_control_store import RcaControlStore
 from gateway.pnc_rca_runtime_identity import RCA_RUNTIME_RELATIVE_FILES
 from gateway.pnc_rca_runtime_identity import canonical_json_sha256
 from scripts import pnc_rca_outbox_dispatcher as dispatcher
-from tests.gateway.test_pnc_rca_control_store import _policy, _record
+from tests.gateway.test_pnc_rca_control_store import (
+    _begin_bounded_activation,
+    _manual_request,
+    _policy,
+    _record,
+)
 
 
 RELEASE_ID = "rca-v0182-test-release"
@@ -230,6 +237,300 @@ def _patch_reset_cli(monkeypatch, config):
         "from_env",
         classmethod(lambda _cls: config),
     )
+
+
+def _exact_hold_fixture(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    _begin_bounded_activation(store, epoch_id="rca-exact-hold-test")
+    conn = store._connect()
+    try:
+        conn.execute("INSERT INTO sqlite_sequence(name, seq) VALUES('rca_outbox', 683)")
+    finally:
+        conn.close()
+    success = store.admit_manual_trigger(
+        _manual_request(
+            "om_manual_success",
+            issue_url="https://project.feishu.cn/g1q3/issue/detail/7041712814",
+        ),
+        allowed_chat_ids={"oc_allowed"},
+        submit_enabled=True,
+        active_policy=_policy(),
+        activation_required=True,
+    )
+    terminal = store.admit_manual_trigger(
+        _manual_request(
+            "om_manual_terminal",
+            mode="debug",
+            issue_url="https://project.feishu.cn/g1q3/issue/detail/7041712815",
+        ),
+        allowed_chat_ids={"oc_allowed"},
+        submit_enabled=True,
+        operator_authorized=True,
+        active_policy=_policy(),
+        activation_required=True,
+    )
+    rows = store.list_rows("rca_outbox")
+    assert [row["outbox_id"] for row in rows] == [684, 685]
+    assert [row["submission_key"] for row in rows] == [
+        success.submission_key,
+        terminal.submission_key,
+    ]
+    return store
+
+
+def _patch_exact_hold_cli(monkeypatch, config):
+    _patch_reset_cli(monkeypatch, config)
+    monkeypatch.setattr(
+        dispatcher,
+        "_exact_outbox_hold_active_release_binding",
+        lambda _config: {
+            "path": str(config.active_release_binding_path),
+            "sha256": "a" * 64,
+            "release_id": RELEASE_ID,
+            "authority_sha256": "b" * 64,
+            "authority_epoch_id": "authority-test",
+            "bootstrap_epoch_id": EPOCH_ID,
+        },
+    )
+    monkeypatch.setattr(
+        dispatcher,
+        "_exact_outbox_hold_tool_provenance",
+        lambda: {
+            "entrypoint_path": "/candidate/scripts/pnc_rca_outbox_dispatcher.py",
+            "entrypoint_sha256": "c" * 64,
+            "control_store_path": "/candidate/gateway/pnc_rca_control_store.py",
+            "control_store_sha256": "d" * 64,
+            "bootstrap_path": "/candidate/gateway/pnc_rca_prod_bootstrap.py",
+            "bootstrap_sha256": "e" * 64,
+        },
+    )
+
+
+def _exact_hold_plan(tmp_path, monkeypatch, capsys):
+    store = _exact_hold_fixture(tmp_path)
+    env = _config_env(tmp_path)
+    env["HERMES_RCA_OUTBOX_ACTIVATION_REQUIRED"] = "true"
+    config = dispatcher.DispatcherConfig.from_env(env, hermes_home=tmp_path)
+    _patch_exact_hold_cli(monkeypatch, config)
+    receipt = tmp_path / "hold.json"
+    args = [
+        "--hold-exact-outbox-id",
+        "685",
+        "--predecessor-outbox-id",
+        "684",
+        "--operator",
+        "owner@example.com",
+        "--reason",
+        "run success canary before terminal canary",
+        "--receipt",
+        str(receipt),
+    ]
+    assert dispatcher.main(args) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["mode"] == "plan"
+    return store, config, receipt, args, output
+
+
+def test_exact_outbox_hold_plan_is_read_only_and_privacy_light(
+    tmp_path, monkeypatch, capsys
+):
+    store = _exact_hold_fixture(tmp_path)
+    env = _config_env(tmp_path)
+    env["HERMES_RCA_OUTBOX_ACTIVATION_REQUIRED"] = "true"
+    config = dispatcher.DispatcherConfig.from_env(env, hermes_home=tmp_path)
+    _patch_exact_hold_cli(monkeypatch, config)
+    receipt = tmp_path / "hold.json"
+    paths = [
+        config.control_db_path,
+        config.control_db_path.with_name(config.control_db_path.name + "-wal"),
+        config.control_db_path.with_name(config.control_db_path.name + "-shm"),
+    ]
+
+    def snapshot_files():
+        return {
+            str(path): (
+                path.stat().st_mode,
+                path.stat().st_size,
+                path.stat().st_mtime_ns,
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+            )
+            for path in paths
+            if path.exists()
+        }
+
+    before_files = snapshot_files()
+    before_rows = store.list_rows("rca_outbox")
+    assert dispatcher.main(
+        [
+            "--hold-exact-outbox-id",
+            "685",
+            "--predecessor-outbox-id",
+            "684",
+            "--operator",
+            "owner@example.com",
+            "--reason",
+            "read-only exact hold plan",
+            "--receipt",
+            str(receipt),
+        ]
+    ) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    serialized = json.dumps(output, sort_keys=True)
+    assert output["plan"]["eligible_queue_before"]["outbox_ids"] == [684, 685]
+    assert output["plan"]["active_activation"]["state"] == "bounded_active"
+    assert "_row_projection" not in serialized
+    assert "payload_json" not in serialized
+    assert not receipt.exists()
+    assert store.list_rows("rca_outbox") == before_rows
+    assert snapshot_files() == before_files
+
+
+def test_exact_outbox_hold_plan_without_source_sidecars_is_still_read_only(
+    tmp_path, monkeypatch, capsys
+):
+    store = _exact_hold_fixture(tmp_path)
+    conn = store._connect()
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(str(store.db_path) + suffix)
+        try:
+            sidecar.unlink()
+        except FileNotFoundError:
+            pass
+    env = _config_env(tmp_path)
+    env["HERMES_RCA_OUTBOX_ACTIVATION_REQUIRED"] = "true"
+    config = dispatcher.DispatcherConfig.from_env(env, hermes_home=tmp_path)
+    _patch_exact_hold_cli(monkeypatch, config)
+    receipt = tmp_path / "hold-no-sidecar.json"
+    before = sorted(path.name for path in tmp_path.iterdir())
+    assert dispatcher.main(
+        [
+            "--hold-exact-outbox-id",
+            "685",
+            "--predecessor-outbox-id",
+            "684",
+            "--operator",
+            "owner",
+            "--reason",
+            "plan with no source sidecars",
+            "--receipt",
+            str(receipt),
+        ]
+    ) == 0
+    capsys.readouterr()
+    assert sorted(path.name for path in tmp_path.iterdir()) == before
+    assert not receipt.exists()
+
+
+def test_exact_outbox_hold_apply_mutates_only_schedule_and_audit(
+    tmp_path, monkeypatch, capsys
+):
+    store, _config, receipt, args, output = _exact_hold_plan(
+        tmp_path, monkeypatch, capsys
+    )
+    expected = output["expected_apply"]
+    before = {row["outbox_id"]: row for row in store.list_rows("rca_outbox")}
+    apply_args = [*args, "--apply"]
+    for key, value in expected.items():
+        apply_args.extend(["--" + key.replace("_", "-"), value])
+
+    assert dispatcher.main(apply_args) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    after = {row["outbox_id"]: row for row in store.list_rows("rca_outbox")}
+    assert result["applied"] is True
+    assert after[684] == before[684]
+    changed = {
+        key
+        for key in before[685]
+        if before[685][key] != after[685][key]
+    }
+    assert changed == {"next_attempt_at", "updated_at"}
+    assert after[685]["next_attempt_at"] == dispatcher.EXACT_OUTBOX_HOLD_UNTIL
+    assert after[685]["attempt"] == after[685]["fence"] == 0
+    assert after[685]["retry_window_started_at"] == before[685][
+        "retry_window_started_at"
+    ]
+    audit = store.exact_outbox_hold_audit(result["hold_id"])
+    assert audit is not None
+    assert audit["effect_delta"]["business_trigger_rows_updated"] == 0
+    assert receipt.stat().st_mode & 0o777 == 0o444
+    claim = store.claim_outbox(
+        lease_owner="exact-hold-test",
+        activation_required=True,
+    )
+    assert claim is not None
+    assert claim.outbox_id == 684
+
+
+def test_exact_outbox_hold_does_not_bypass_retry_horizon(
+    tmp_path, monkeypatch, capsys
+):
+    store, _config, _receipt, args, output = _exact_hold_plan(
+        tmp_path, monkeypatch, capsys
+    )
+    apply_args = [*args, "--apply"]
+    for key, value in output["expected_apply"].items():
+        apply_args.extend(["--" + key.replace("_", "-"), value])
+    assert dispatcher.main(apply_args) == 0
+    capsys.readouterr()
+    [target] = [
+        row for row in store.list_rows("rca_outbox") if row["outbox_id"] == 685
+    ]
+    anchor = datetime.fromisoformat(
+        target["retry_window_started_at"] or target["created_at"]
+    )
+
+    store.claim_outbox(
+        lease_owner="expiry-sweep",
+        max_age_seconds=86_400,
+        activation_required=True,
+        now=anchor + timedelta(seconds=86_401),
+    )
+
+    [expired] = [
+        row for row in store.list_rows("rca_outbox") if row["outbox_id"] == 685
+    ]
+    assert expired["status"] == "quarantined"
+    assert expired["last_error_code"] == "dispatch_age_exceeded"
+
+
+def test_exact_outbox_hold_recovery_is_read_only(
+    tmp_path, monkeypatch, capsys
+):
+    store, _config, _receipt, args, output = _exact_hold_plan(
+        tmp_path, monkeypatch, capsys
+    )
+    apply_args = [*args, "--apply"]
+    for key, value in output["expected_apply"].items():
+        apply_args.extend(["--" + key.replace("_", "-"), value])
+    assert dispatcher.main(apply_args) == 0
+    applied = json.loads(capsys.readouterr().out)
+    before = store.list_rows("rca_outbox")
+    recovered = tmp_path / "hold-recovered.json"
+
+    assert dispatcher.main(
+        [
+            "--materialize-exact-outbox-hold",
+            applied["hold_id"],
+            "--phase",
+            "hold",
+            "--receipt",
+            str(recovered),
+        ]
+    ) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    envelope = json.loads(recovered.read_text(encoding="utf-8"))
+    assert result["recovered"] is True
+    assert envelope["source_hold_id"] == applied["hold_id"]
+    assert envelope["audit"]["hold_id"] == applied["hold_id"]
+    assert envelope["materialized_destination"]["path"] == str(recovered)
+    assert store.list_rows("rca_outbox") == before
 
 
 def test_clear_circuit_plan_does_not_mutate_or_create_receipt(

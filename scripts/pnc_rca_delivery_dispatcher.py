@@ -496,7 +496,13 @@ def _circuit_reset_destination_binding(path: Path) -> dict[str, Any]:
 
 
 def _bound_source_sha256(path: Path) -> str:
-    resolved = path.expanduser().resolve(strict=True)
+    lexical = path.expanduser().absolute()
+    lexical_stat = lexical.lstat()
+    if stat.S_ISLNK(lexical_stat.st_mode):
+        raise ValueError("delivery_circuit_reset_tool_provenance_invalid")
+    resolved = lexical.resolve(strict=True)
+    if resolved != lexical:
+        raise ValueError("delivery_circuit_reset_tool_provenance_invalid")
     descriptor = os.open(
         resolved,
         os.O_RDONLY
@@ -509,6 +515,9 @@ def _bound_source_sha256(path: Path) -> str:
             not stat.S_ISREG(before.st_mode)
             or before.st_nlink != 1
             or before.st_uid != os.getuid()
+            or stat.S_IMODE(before.st_mode) & 0o022
+            or before.st_dev != lexical_stat.st_dev
+            or before.st_ino != lexical_stat.st_ino
         ):
             raise ValueError("delivery_circuit_reset_tool_provenance_invalid")
         digest = hashlib.sha256()

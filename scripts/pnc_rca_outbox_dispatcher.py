@@ -36,6 +36,10 @@ from gateway.pnc_rca_admission import (
     validate_rca_trigger_context,
 )
 from gateway.pnc_rca_control_store import (
+    ACTIVATION_HISTORICAL_OUTBOX_ROW_FIELDS,
+    EXACT_OUTBOX_HOLD_META_PREFIX,
+    EXACT_OUTBOX_HOLD_SCHEMA_VERSION,
+    EXACT_OUTBOX_HOLD_UNTIL,
     OutboxClaim,
     OUTBOX_CIRCUIT_RESET_SCHEMA_VERSION,
     RcaControlStore,
@@ -447,6 +451,18 @@ class CircuitResetReceiptMaterializationError(RuntimeError):
         )
 
 
+class ExactOutboxHoldReceiptMaterializationError(RuntimeError):
+    def __init__(self, *, hold_id: str, receipt_path: Path, cause: Exception):
+        self.hold_id = str(hold_id)
+        self.receipt_path = receipt_path
+        self.meta_key = f"{EXACT_OUTBOX_HOLD_META_PREFIX}{self.hold_id}"
+        self.cause = cause
+        super().__init__(
+            "exact_outbox_hold_recovery_required:"
+            f"hold_id={self.hold_id}:receipt={receipt_path}:cause={cause}"
+        )
+
+
 class PermanentDispatchError(RuntimeError):
     def __init__(self, code: str, detail: str = ""):
         super().__init__(detail or code)
@@ -459,6 +475,10 @@ OUTBOX_CIRCUIT_RESET_RECEIPT_SCHEMA_VERSION = (
 )
 _CIRCUIT_RESET_MAX_OPERATOR_BYTES = 200
 _CIRCUIT_RESET_MAX_REASON_BYTES = 1000
+EXACT_OUTBOX_HOLD_RECOVERY_SCHEMA_VERSION = (
+    "pnc_rca_exact_outbox_hold_recovery_v1"
+)
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _canonical_receipt_json(value: Mapping[str, Any]) -> str:
@@ -764,6 +784,269 @@ def _build_circuit_reset_receipt(
         receipt["receipt_path"] = str(receipt_path)
     receipt["receipt_fingerprint"] = canonical_json_sha256(receipt)
     return receipt
+
+
+def _exact_hold_destination_binding(path: Path) -> dict[str, Any]:
+    absolute = str(path.expanduser().absolute())
+    parent = _receipt_parent_identity(path)
+    return {
+        "path_sha256": hashlib.sha256(absolute.encode("utf-8")).hexdigest(),
+        "parent_device": int(parent["device"]),
+        "parent_inode": int(parent["inode"]),
+    }
+
+
+def _bound_exact_hold_source_sha256(path: Path) -> str:
+    lexical = path.expanduser().absolute()
+    lexical_stat = lexical.lstat()
+    if stat.S_ISLNK(lexical_stat.st_mode):
+        raise ValueError("exact_outbox_hold_tool_provenance_invalid")
+    resolved = lexical.resolve(strict=True)
+    if resolved != lexical:
+        raise ValueError("exact_outbox_hold_tool_provenance_invalid")
+    descriptor = os.open(
+        resolved,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != os.getuid()
+            or stat.S_IMODE(before.st_mode) & 0o022
+            or before.st_dev != lexical_stat.st_dev
+            or before.st_ino != lexical_stat.st_ino
+        ):
+            raise ValueError("exact_outbox_hold_tool_provenance_invalid")
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise ValueError("exact_outbox_hold_tool_provenance_changed")
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)
+
+
+def _exact_outbox_hold_tool_provenance() -> dict[str, Any]:
+    entrypoint = Path(__file__).resolve(strict=True)
+    control_path = (REPO_ROOT / "gateway" / "pnc_rca_control_store.py").resolve(
+        strict=True
+    )
+    bootstrap_path = (REPO_ROOT / "gateway" / "pnc_rca_prod_bootstrap.py").resolve(
+        strict=True
+    )
+    return {
+        "entrypoint_path": str(entrypoint),
+        "entrypoint_sha256": _bound_exact_hold_source_sha256(entrypoint),
+        "control_store_path": str(control_path),
+        "control_store_sha256": _bound_exact_hold_source_sha256(control_path),
+        "bootstrap_path": str(bootstrap_path),
+        "bootstrap_sha256": _bound_exact_hold_source_sha256(bootstrap_path),
+    }
+
+
+def _exact_outbox_hold_active_release_binding(
+    config: "DispatcherConfig",
+) -> dict[str, Any]:
+    binding = load_active_release_binding(
+        path=config.active_release_binding_path,
+        live_env_path=config.live_env_path,
+        expected_release_id=config.release_id,
+        expected_epoch_id=config.bootstrap_epoch_id,
+    )
+    return {
+        "path": str(config.active_release_binding_path.expanduser().absolute()),
+        "sha256": str(binding["binding_receipt_sha256"]),
+        "release_id": str(binding["release_id"]),
+        "authority_sha256": str(binding["authority_sha256"]),
+        "authority_epoch_id": str(binding["authority_epoch_id"]),
+        "bootstrap_epoch_id": str(binding["bootstrap_epoch_id"]),
+    }
+
+
+def _exact_outbox_hold_config_binding(config: "DispatcherConfig") -> str:
+    return canonical_json_sha256(config.public_dict())
+
+
+def _public_exact_hold_row(value: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: item for key, item in value.items() if not key.startswith("_")}
+
+
+def _exact_hold_row_sha256(projection: Mapping[str, Any]) -> str:
+    return canonical_json_sha256(
+        {field: projection[field] for field in ACTIVATION_HISTORICAL_OUTBOX_ROW_FIELDS}
+    )
+
+
+def _build_exact_outbox_hold_receipt(
+    *,
+    config: "DispatcherConfig",
+    snapshot: Mapping[str, Any],
+    operator: str,
+    reason: str,
+    recorded_at: str,
+    receipt_path: Path,
+    control_db_identity: Mapping[str, Any],
+    active_release_binding: Mapping[str, Any],
+    tool_provenance: Mapping[str, Any],
+) -> dict[str, Any]:
+    target_raw = snapshot["target"]
+    predecessor_raw = snapshot["predecessor"]
+    if not isinstance(target_raw, Mapping) or not isinstance(
+        predecessor_raw, Mapping
+    ):
+        raise ValueError("exact_outbox_hold_snapshot_invalid")
+    target_before = _public_exact_hold_row(target_raw)
+    predecessor = _public_exact_hold_row(predecessor_raw)
+    projection = dict(target_raw["_row_projection"])
+    projection["next_attempt_at"] = EXACT_OUTBOX_HOLD_UNTIL
+    projection["updated_at"] = recorded_at
+    target_after = {
+        **target_before,
+        "next_attempt_at": EXACT_OUTBOX_HOLD_UNTIL,
+        "updated_at": recorded_at,
+        "row_sha256": _exact_hold_row_sha256(projection),
+    }
+    queue_before = dict(snapshot["eligible_queue"])
+    queue_after_entries = [
+        {
+            "outbox_id": predecessor["outbox_id"],
+            "row_sha256": predecessor["row_sha256"],
+        }
+    ]
+    queue_after = {
+        "outbox_ids": [predecessor["outbox_id"]],
+        "entries": queue_after_entries,
+        "sha256": RcaControlStore._exact_outbox_queue_sha256(queue_after_entries),
+    }
+    destination_binding = _exact_hold_destination_binding(receipt_path)
+    config_binding_sha256 = _exact_outbox_hold_config_binding(config)
+    tool_provenance_sha256 = canonical_json_sha256(dict(tool_provenance))
+    retry_horizon = {
+        key: item
+        for key, item in dict(snapshot["retry_horizon"]).items()
+        if key not in {"remaining_seconds", "cutoff_at"}
+    }
+    plan_logical_db_identity = dict(control_db_identity["logical_db_identity"])
+    plan_wal = dict(plan_logical_db_identity.get("wal") or {})
+    if plan_wal.get("present") is True and int(plan_wal.get("size", 0)) == 0:
+        plan_wal = {"present": False}
+    plan_logical_db_identity["wal"] = plan_wal
+    plan_control_db_identity = {
+        "path": control_db_identity["path"],
+        "logical_db_identity": plan_logical_db_identity,
+    }
+    plan_id = canonical_json_sha256(
+        {
+            "command": "hold-exact-outbox",
+            "operator": operator,
+            "reason": reason,
+            "target_outbox_id": int(snapshot["target_outbox_id"]),
+            "predecessor_outbox_id": int(snapshot["predecessor_outbox_id"]),
+            "activation_required": bool(snapshot["activation_required"]),
+            "max_age_seconds": int(snapshot["max_age_seconds"]),
+            "active_activation": dict(snapshot["active_activation"]),
+            "active_release_binding": dict(active_release_binding),
+            "control_db_identity": plan_control_db_identity,
+            "config_binding_sha256": config_binding_sha256,
+            "tool_provenance_sha256": tool_provenance_sha256,
+            "target_row_sha256": target_before["row_sha256"],
+            "predecessor_row_sha256": predecessor["row_sha256"],
+            "eligible_queue_sha256": queue_before["sha256"],
+            "retry_horizon": retry_horizon,
+            "destination_binding": destination_binding,
+        }
+    )
+    hold_id = canonical_json_sha256(
+        {
+            "plan_id": plan_id,
+            "recorded_at": recorded_at,
+            "target_after_sha256": target_after["row_sha256"],
+        }
+    )
+    receipt: dict[str, Any] = {
+        "schema_version": EXACT_OUTBOX_HOLD_SCHEMA_VERSION,
+        "command": "hold-exact-outbox",
+        "phase": "hold",
+        "hold_id": hold_id,
+        "plan_id": plan_id,
+        "recorded_at": recorded_at,
+        "operator": operator,
+        "reason": reason,
+        "target_outbox_id": int(snapshot["target_outbox_id"]),
+        "predecessor_outbox_id": int(snapshot["predecessor_outbox_id"]),
+        "control_db_identity": dict(control_db_identity),
+        "activation_required": bool(snapshot["activation_required"]),
+        "max_age_seconds": int(snapshot["max_age_seconds"]),
+        "active_activation": dict(snapshot["active_activation"]),
+        "active_release_binding": dict(active_release_binding),
+        "config_binding_sha256": config_binding_sha256,
+        "tool_provenance": dict(tool_provenance),
+        "tool_provenance_sha256": tool_provenance_sha256,
+        "destination_binding": destination_binding,
+        "target_before": target_before,
+        "target_after": target_after,
+        "predecessor": predecessor,
+        "eligible_queue_before": queue_before,
+        "eligible_queue_after": queue_after,
+        "retry_horizon": retry_horizon,
+        "effect_delta": {
+            "external_writes": 0,
+            "external_effects_triggered": False,
+            "target_rows_updated": 1,
+            "control_meta_inserted": 1,
+            "business_trigger_rows_updated": 0,
+            "mutation": {
+                "next_attempt_at": EXACT_OUTBOX_HOLD_UNTIL,
+                "updated_at": recorded_at,
+            },
+        },
+    }
+    receipt["receipt_fingerprint"] = canonical_json_sha256(receipt)
+    return receipt
+
+
+def _build_exact_outbox_hold_recovery_envelope(
+    audit: Mapping[str, Any], receipt_path: Path
+) -> dict[str, Any]:
+    destination = _exact_hold_destination_binding(receipt_path)
+    envelope: dict[str, Any] = {
+        "schema_version": EXACT_OUTBOX_HOLD_RECOVERY_SCHEMA_VERSION,
+        "command": "materialize-exact-outbox-hold",
+        "phase": "hold",
+        "recovered": True,
+        "source_hold_id": audit["hold_id"],
+        "source_plan_id": audit["plan_id"],
+        "source_receipt_fingerprint": audit["receipt_fingerprint"],
+        "planned_destination_binding": audit["destination_binding"],
+        "materialized_destination": {
+            "path": str(receipt_path),
+            "binding": destination,
+        },
+        "materialized_at": _utc_iso(),
+        "external_effects_triggered": False,
+        "audit": dict(audit),
+    }
+    envelope["receipt_fingerprint"] = canonical_json_sha256(envelope)
+    return envelope
 
 
 @dataclass(frozen=True)
@@ -3836,6 +4119,215 @@ def run_dispatch_loop(
         heartbeat_thread.join(timeout=float(heartbeat_interval_seconds) + 1.0)
 
 
+def _validate_expected_sha256(value: Any, error: str) -> str:
+    normalized = str(value or "").strip()
+    if _SHA256_RE.fullmatch(normalized) is None or normalized == "0" * 64:
+        raise ValueError(error)
+    return normalized
+
+
+def _run_exact_outbox_hold_command(
+    *, args: argparse.Namespace, config: DispatcherConfig, store: RcaControlStore
+) -> int:
+    if args.materialize_exact_outbox_hold:
+        receipt_path = _absolute_new_receipt_path(args.receipt)
+        audit = store.exact_outbox_hold_audit(args.materialize_exact_outbox_hold)
+        if audit is None:
+            raise RuntimeError("exact_outbox_hold_audit_missing")
+        envelope = _build_exact_outbox_hold_recovery_envelope(audit, receipt_path)
+        try:
+            receipt_sha256 = _write_immutable_receipt(
+                receipt_path,
+                envelope,
+                expected_parent_identity={
+                    "device": envelope["materialized_destination"]["binding"][
+                        "parent_device"
+                    ],
+                    "inode": envelope["materialized_destination"]["binding"][
+                        "parent_inode"
+                    ],
+                },
+            )
+        except Exception as exc:
+            raise ValueError("exact_outbox_hold_recovery_materialization_failed") from exc
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "recovered": True,
+                    "phase": "hold",
+                    "hold_id": audit["hold_id"],
+                    "plan_id": audit["plan_id"],
+                    "receipt": str(receipt_path),
+                    "receipt_sha256": receipt_sha256,
+                    "receipt_fingerprint": envelope["receipt_fingerprint"],
+                    "source_receipt_fingerprint": audit["receipt_fingerprint"],
+                    "external_effects_triggered": False,
+                },
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    operator, reason = _validate_reset_audit_text(args.operator, args.reason)
+    receipt_path = _absolute_new_receipt_path(args.receipt)
+    observed_at = _utc_now()
+    active_binding = _exact_outbox_hold_active_release_binding(config)
+    config_binding_sha256 = _exact_outbox_hold_config_binding(config)
+    tool_provenance = _exact_outbox_hold_tool_provenance()
+    tool_provenance_sha256 = canonical_json_sha256(tool_provenance)
+    if not store.read_only:
+        raise RuntimeError("exact_outbox_hold_planning_store_not_read_only")
+    planning_store = store
+    control_db_identity = planning_store.control_db_source_snapshot_identity()
+    snapshot = planning_store._exact_outbox_hold_private_snapshot(
+        target_outbox_id=int(args.hold_exact_outbox_id),
+        predecessor_outbox_id=int(args.predecessor_outbox_id),
+        activation_required=config.activation_required,
+        max_age_seconds=config.max_age_seconds,
+        now=observed_at,
+    )
+    planned = _build_exact_outbox_hold_receipt(
+        config=config,
+        snapshot=snapshot,
+        operator=operator,
+        reason=reason,
+        recorded_at=observed_at.isoformat(),
+        receipt_path=receipt_path,
+        control_db_identity=control_db_identity,
+        active_release_binding=active_binding,
+        tool_provenance=tool_provenance,
+    )
+    if args.apply:
+        expected = {
+            "plan_id": _validate_expected_sha256(
+                args.expected_plan_id, "exact_outbox_hold_expected_plan_invalid"
+            ),
+            "target_row_sha256": _validate_expected_sha256(
+                args.expected_target_row_sha256,
+                "exact_outbox_hold_expected_target_row_invalid",
+            ),
+            "eligible_queue_sha256": _validate_expected_sha256(
+                args.expected_eligible_queue_sha256,
+                "exact_outbox_hold_expected_queue_invalid",
+            ),
+            "active_release_binding_sha256": _validate_expected_sha256(
+                args.expected_active_release_binding_sha256,
+                "exact_outbox_hold_expected_active_binding_invalid",
+            ),
+            "config_binding_sha256": _validate_expected_sha256(
+                args.expected_config_binding_sha256,
+                "exact_outbox_hold_expected_config_invalid",
+            ),
+            "tool_provenance_sha256": _validate_expected_sha256(
+                args.expected_tool_provenance_sha256,
+                "exact_outbox_hold_expected_tool_provenance_invalid",
+            ),
+        }
+        observed = {
+            "plan_id": planned["plan_id"],
+            "target_row_sha256": planned["target_before"]["row_sha256"],
+            "eligible_queue_sha256": planned["eligible_queue_before"]["sha256"],
+            "active_release_binding_sha256": planned["active_release_binding"][
+                "sha256"
+            ],
+            "config_binding_sha256": planned["config_binding_sha256"],
+            "tool_provenance_sha256": planned["tool_provenance_sha256"],
+        }
+        changed = [key for key, value in expected.items() if observed[key] != value]
+        if changed:
+            raise RuntimeError(f"exact_outbox_hold_plan_changed:{','.join(changed)}")
+    else:
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "mode": "plan",
+                    "applied": False,
+                    "external_effects_triggered": False,
+                    "receipt_path": str(receipt_path),
+                    "expected_apply": {
+                        "expected_plan_id": planned["plan_id"],
+                        "expected_target_row_sha256": planned["target_before"][
+                            "row_sha256"
+                        ],
+                        "expected_eligible_queue_sha256": planned[
+                            "eligible_queue_before"
+                        ]["sha256"],
+                        "expected_active_release_binding_sha256": planned[
+                            "active_release_binding"
+                        ]["sha256"],
+                        "expected_config_binding_sha256": planned[
+                            "config_binding_sha256"
+                        ],
+                        "expected_tool_provenance_sha256": planned[
+                            "tool_provenance_sha256"
+                        ],
+                    },
+                    "plan": planned,
+                },
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if _exact_outbox_hold_active_release_binding(config) != active_binding:
+        raise RuntimeError("exact_outbox_hold_active_binding_changed")
+    if (
+        _exact_outbox_hold_config_binding(DispatcherConfig.from_env())
+        != config_binding_sha256
+    ):
+        raise RuntimeError("exact_outbox_hold_config_changed")
+    if _exact_outbox_hold_tool_provenance() != tool_provenance:
+        raise RuntimeError("exact_outbox_hold_tool_provenance_changed")
+    mutation_store = RcaControlStore(
+        config.control_db_path,
+        require_current=True,
+    )
+    applied = mutation_store.hold_exact_outbox_with_audit(
+        audit=planned, now=observed_at
+    )
+    try:
+        receipt_sha256 = _write_immutable_receipt(
+            receipt_path,
+            applied,
+            expected_parent_identity={
+                "device": planned["destination_binding"]["parent_device"],
+                "inode": planned["destination_binding"]["parent_inode"],
+            },
+        )
+    except Exception as exc:
+        raise ExactOutboxHoldReceiptMaterializationError(
+            hold_id=planned["hold_id"], receipt_path=receipt_path, cause=exc
+        ) from exc
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "applied": True,
+                "command": "hold-exact-outbox",
+                "phase": "hold",
+                "hold_id": planned["hold_id"],
+                "plan_id": planned["plan_id"],
+                "target_outbox_id": planned["target_outbox_id"],
+                "predecessor_outbox_id": planned["predecessor_outbox_id"],
+                "receipt": str(receipt_path),
+                "receipt_sha256": receipt_sha256,
+                "receipt_fingerprint": planned["receipt_fingerprint"],
+                "effect_delta": planned["effect_delta"],
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env-file", help="dotenv path; defaults to HERMES_HOME/.env")
@@ -3870,16 +4362,63 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar="RESET_ID",
         help="materialize an existing durable reset audit without changing the DB",
     )
+    parser.add_argument(
+        "--hold-exact-outbox-id",
+        type=int,
+        help="plan or apply a one-row outbox hold under the current bounded epoch",
+    )
+    parser.add_argument(
+        "--predecessor-outbox-id",
+        type=int,
+        help="exact predecessor that must remain dispatchable while the target is held",
+    )
+    parser.add_argument(
+        "--materialize-exact-outbox-hold",
+        metavar="HOLD_ID",
+        help="materialize a durable exact-outbox hold audit without changing the DB",
+    )
+    parser.add_argument(
+        "--phase",
+        choices=("hold", "release"),
+        help="audit phase for exact-outbox receipt recovery",
+    )
+    parser.add_argument("--expected-plan-id")
+    parser.add_argument("--expected-target-row-sha256")
+    parser.add_argument("--expected-eligible-queue-sha256")
+    parser.add_argument("--expected-active-release-binding-sha256")
+    parser.add_argument("--expected-config-binding-sha256")
+    parser.add_argument("--expected-tool-provenance-sha256")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     try:
-        if args.clear_circuit and args.materialize_reset:
-            raise ValueError("dispatcher_circuit_reset_modes_conflict")
+        exact_expected = (
+            args.expected_plan_id,
+            args.expected_target_row_sha256,
+            args.expected_eligible_queue_sha256,
+            args.expected_active_release_binding_sha256,
+            args.expected_config_binding_sha256,
+            args.expected_tool_provenance_sha256,
+        )
+        modes = (
+            bool(args.clear_circuit),
+            bool(args.materialize_reset),
+            args.hold_exact_outbox_id is not None,
+            bool(args.materialize_exact_outbox_hold),
+        )
+        if sum(modes) > 1:
+            raise ValueError("outbox_operator_modes_conflict")
         if args.materialize_reset:
-            if args.operator is not None or args.reason is not None or args.apply:
+            if (
+                args.operator is not None
+                or args.reason is not None
+                or args.apply
+                or any(value is not None for value in exact_expected)
+                or args.predecessor_outbox_id is not None
+                or args.phase is not None
+            ):
                 raise ValueError("dispatcher_circuit_reset_recovery_flags_conflict")
             if any((args.check_config, args.dry_run, args.health, args.once)):
                 raise ValueError("dispatcher_circuit_reset_flags_conflict")
@@ -3890,12 +4429,55 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("dispatcher_circuit_reset_operator_and_reason_required")
             if any((args.check_config, args.dry_run, args.health, args.once)):
                 raise ValueError("dispatcher_circuit_reset_flags_conflict")
+            if any(value is not None for value in exact_expected):
+                raise ValueError("exact_outbox_hold_arguments_require_hold_mode")
+            if args.predecessor_outbox_id is not None or args.phase is not None:
+                raise ValueError("exact_outbox_hold_arguments_require_hold_mode")
+        elif args.hold_exact_outbox_id is not None:
+            if (
+                args.hold_exact_outbox_id < 1
+                or args.predecessor_outbox_id is None
+                or args.predecessor_outbox_id < 1
+                or args.hold_exact_outbox_id == args.predecessor_outbox_id
+            ):
+                raise ValueError("exact_outbox_hold_identity_invalid")
+            if args.operator is None or args.reason is None:
+                raise ValueError("exact_outbox_hold_operator_and_reason_required")
+            if args.receipt is None:
+                raise ValueError("exact_outbox_hold_receipt_required")
+            if args.phase is not None:
+                raise ValueError("exact_outbox_hold_phase_recovery_only")
+            if any((args.check_config, args.dry_run, args.health, args.once)):
+                raise ValueError("exact_outbox_hold_flags_conflict")
+            if args.apply and any(value is None for value in exact_expected):
+                raise ValueError("exact_outbox_hold_expected_bindings_required")
+            if not args.apply and any(value is not None for value in exact_expected):
+                raise ValueError("exact_outbox_hold_expected_bindings_apply_only")
+        elif args.materialize_exact_outbox_hold:
+            if (
+                args.operator is not None
+                or args.reason is not None
+                or args.apply
+                or any(value is not None for value in exact_expected)
+                or args.predecessor_outbox_id is not None
+                or args.hold_exact_outbox_id is not None
+            ):
+                raise ValueError("exact_outbox_hold_recovery_flags_conflict")
+            if args.phase not in {None, "hold"}:
+                raise ValueError("exact_outbox_hold_recovery_phase_invalid")
+            if args.receipt is None:
+                raise ValueError("exact_outbox_hold_receipt_required")
+            if any((args.check_config, args.dry_run, args.health, args.once)):
+                raise ValueError("exact_outbox_hold_flags_conflict")
         elif not args.materialize_reset and (
             any(
                 value is not None
                 for value in (args.operator, args.reason, args.receipt)
             )
             or args.apply
+            or args.predecessor_outbox_id is not None
+            or args.phase is not None
+            or any(value is not None for value in exact_expected)
         ):
             raise ValueError("dispatcher_circuit_reset_arguments_require_clear_circuit")
         if args.clear_circuit and args.apply and args.receipt is None:
@@ -3912,7 +4494,26 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
             return 0 if result.get("ok") is True else 2
 
-        store = RcaControlStore(config.control_db_path, require_current=True)
+        exact_hold_mode = bool(
+            args.hold_exact_outbox_id is not None
+            or args.materialize_exact_outbox_hold
+        )
+        read_only_operator = bool(
+            args.materialize_reset
+            or args.materialize_exact_outbox_hold
+            or args.hold_exact_outbox_id is not None
+        )
+        store = RcaControlStore(
+            config.control_db_path,
+            require_current=True,
+            read_only=read_only_operator,
+        )
+        if exact_hold_mode:
+            return _run_exact_outbox_hold_command(
+                args=args,
+                config=config,
+                store=store,
+            )
         if args.materialize_reset:
             receipt_path = _absolute_new_receipt_path(args.receipt)
             audit = store.dispatcher_circuit_reset_audit(args.materialize_reset)
@@ -4094,6 +4695,25 @@ def main(argv: list[str] | None = None) -> int:
             stop_requested=lambda: stopping,
         )
         return 0
+    except ExactOutboxHoldReceiptMaterializationError as exc:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": type(exc).__name__,
+                    "message": str(exc),
+                    "recovery_required": True,
+                    "phase": "hold",
+                    "hold_id": exc.hold_id,
+                    "meta_key": exc.meta_key,
+                    "receipt": str(exc.receipt_path),
+                    "external_effects_triggered": False,
+                },
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        return 2
     except CircuitResetReceiptMaterializationError as exc:
         print(
             json.dumps(

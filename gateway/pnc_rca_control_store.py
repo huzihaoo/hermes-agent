@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import sqlite3
 import stat
+import tempfile
 from typing import Any, Callable, Iterable, Literal, Mapping
 import uuid
 
@@ -84,6 +85,43 @@ OUTBOX_CIRCUIT_RESET_REQUIRED_FIELDS = frozenset(
         "after",
         "pre_state",
         "post_state",
+        "effect_delta",
+        "receipt_fingerprint",
+    }
+)
+EXACT_OUTBOX_HOLD_META_PREFIX = "rca_exact_outbox_hold:"
+EXACT_OUTBOX_HOLD_SCHEMA_VERSION = "pnc_rca_exact_outbox_hold_v1"
+EXACT_OUTBOX_HOLD_ROW_SCHEMA_VERSION = "pnc_rca_exact_outbox_hold_row_v1"
+EXACT_OUTBOX_HOLD_SNAPSHOT_SCHEMA_VERSION = "pnc_rca_exact_outbox_hold_snapshot_v1"
+EXACT_OUTBOX_HOLD_UNTIL = "9999-12-31T23:59:59.999999+00:00"
+EXACT_OUTBOX_HOLD_MAX_AUDIT_BYTES = 512 * 1024
+EXACT_OUTBOX_HOLD_REQUIRED_FIELDS = frozenset(
+    {
+        "schema_version",
+        "command",
+        "phase",
+        "hold_id",
+        "plan_id",
+        "recorded_at",
+        "operator",
+        "reason",
+        "target_outbox_id",
+        "predecessor_outbox_id",
+        "control_db_identity",
+        "activation_required",
+        "max_age_seconds",
+        "active_activation",
+        "active_release_binding",
+        "config_binding_sha256",
+        "tool_provenance",
+        "tool_provenance_sha256",
+        "destination_binding",
+        "target_before",
+        "target_after",
+        "predecessor",
+        "eligible_queue_before",
+        "eligible_queue_after",
+        "retry_horizon",
         "effect_delta",
         "receipt_fingerprint",
     }
@@ -416,6 +454,338 @@ def _validate_dispatcher_circuit_reset_audit(
         raise ValueError("dispatcher_circuit_reset_audit_json_invalid") from exc
     if len(serialized.encode("utf-8")) > OUTBOX_CIRCUIT_RESET_MAX_AUDIT_BYTES:
         raise ValueError("dispatcher_circuit_reset_audit_too_large")
+    return normalized
+
+
+def _exact_outbox_hold_fingerprint(value: Mapping[str, Any]) -> str:
+    payload = dict(value)
+    payload.pop("receipt_fingerprint", None)
+    return _canonical_sha256(payload)
+
+
+def _exact_outbox_hold_plan_id(value: Mapping[str, Any]) -> str:
+    control_identity = dict(value["control_db_identity"])
+    logical_identity = dict(control_identity.get("logical_db_identity") or {})
+    wal = dict(logical_identity.get("wal") or {})
+    if wal.get("present") is True and int(wal.get("size", 0)) == 0:
+        wal = {"present": False}
+    logical_identity["wal"] = wal
+    control_identity = {
+        "path": control_identity.get("path"),
+        "logical_db_identity": logical_identity,
+    }
+    return _canonical_sha256(
+        {
+            "command": "hold-exact-outbox",
+            "operator": value["operator"],
+            "reason": value["reason"],
+            "target_outbox_id": value["target_outbox_id"],
+            "predecessor_outbox_id": value["predecessor_outbox_id"],
+            "activation_required": value["activation_required"],
+            "max_age_seconds": value["max_age_seconds"],
+            "active_activation": value["active_activation"],
+            "active_release_binding": value["active_release_binding"],
+            # WAL is durable logical state. SHM contains volatile lock bytes,
+            # so bind only its presence while preserving its full hash in the
+            # audit evidence outside the deterministic plan id.
+            "control_db_identity": control_identity,
+            "config_binding_sha256": value["config_binding_sha256"],
+            "tool_provenance_sha256": value["tool_provenance_sha256"],
+            "target_row_sha256": value["target_before"]["row_sha256"],
+            "predecessor_row_sha256": value["predecessor"]["row_sha256"],
+            "eligible_queue_sha256": value["eligible_queue_before"]["sha256"],
+            "retry_horizon": value["retry_horizon"],
+            "destination_binding": value["destination_binding"],
+        }
+    )
+
+
+def _validate_exact_outbox_hold_audit(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError("exact_outbox_hold_audit_invalid")
+    normalized = dict(value)
+    if not EXACT_OUTBOX_HOLD_REQUIRED_FIELDS.issubset(normalized):
+        raise ValueError("exact_outbox_hold_audit_fields_invalid")
+    if (
+        normalized.get("schema_version") != EXACT_OUTBOX_HOLD_SCHEMA_VERSION
+        or normalized.get("command") != "hold-exact-outbox"
+        or normalized.get("phase") != "hold"
+    ):
+        raise ValueError("exact_outbox_hold_audit_schema_invalid")
+    for field in ("hold_id", "plan_id"):
+        if (
+            not isinstance(normalized.get(field), str)
+            or _ACTIVATION_SHA256_RE.fullmatch(normalized[field]) is None
+            or normalized[field] == "0" * 64
+        ):
+            raise ValueError(f"exact_outbox_hold_{field}_invalid")
+    for field in ("operator", "reason"):
+        limit = 200 if field == "operator" else 1000
+        item = normalized.get(field)
+        if (
+            not isinstance(item, str)
+            or not item
+            or item != item.strip()
+            or len(item.encode("utf-8")) > limit
+            or any(char in item for char in "\n\r\x00")
+        ):
+            raise ValueError("exact_outbox_hold_audit_text_invalid")
+    recorded_at = normalized.get("recorded_at")
+    try:
+        recorded = datetime.fromisoformat(str(recorded_at).replace("Z", "+00:00"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("exact_outbox_hold_timestamp_invalid") from exc
+    if recorded.tzinfo is None or recorded.utcoffset() != timedelta(0):
+        raise ValueError("exact_outbox_hold_timestamp_invalid")
+    for field in ("target_outbox_id", "predecessor_outbox_id"):
+        item = normalized.get(field)
+        if isinstance(item, bool) or not isinstance(item, int) or item < 1:
+            raise ValueError("exact_outbox_hold_identity_invalid")
+    if normalized["target_outbox_id"] == normalized["predecessor_outbox_id"]:
+        raise ValueError("exact_outbox_hold_identity_invalid")
+    if normalized.get("activation_required") is not True:
+        raise ValueError("exact_outbox_hold_activation_required_invalid")
+    max_age_seconds = normalized.get("max_age_seconds")
+    if (
+        isinstance(max_age_seconds, bool)
+        or not isinstance(max_age_seconds, int)
+        or max_age_seconds < 1
+    ):
+        raise ValueError("exact_outbox_hold_retry_horizon_invalid")
+    identity = normalized.get("control_db_identity")
+    if (
+        not isinstance(identity, Mapping)
+        or identity.get("schema_version")
+        != "pnc_rca_control_store_source_snapshot_v1"
+        or not isinstance(identity.get("path"), str)
+        or not Path(identity["path"]).is_absolute()
+        or identity.get("present") is not True
+        or isinstance(identity.get("device"), bool)
+        or not isinstance(identity.get("device"), int)
+        or isinstance(identity.get("size"), bool)
+        or not isinstance(identity.get("size"), int)
+        or isinstance(identity.get("mtime_ns"), bool)
+        or not isinstance(identity.get("mtime_ns"), int)
+        or isinstance(identity.get("inode"), bool)
+        or not isinstance(identity.get("inode"), int)
+        or _ACTIVATION_SHA256_RE.fullmatch(str(identity.get("sha256") or ""))
+        is None
+    ):
+        raise ValueError("exact_outbox_hold_control_db_identity_invalid")
+    for sidecar in ("wal", "shm"):
+        item = identity.get(sidecar)
+        if not isinstance(item, Mapping) or not isinstance(
+            item.get("present"), bool
+        ):
+            raise ValueError("exact_outbox_hold_control_db_identity_invalid")
+        expected_keys = (
+            {"present"}
+            if item.get("present") is False
+            else {"present", "device", "inode", "size", "mtime_ns", "sha256"}
+        )
+        if set(item) != expected_keys:
+            raise ValueError("exact_outbox_hold_control_db_identity_invalid")
+        if item["present"] and (
+            _ACTIVATION_SHA256_RE.fullmatch(str(item.get("sha256") or "")) is None
+            or any(
+                isinstance(item.get(field), bool)
+                or not isinstance(item.get(field), int)
+                for field in ("device", "inode", "size", "mtime_ns")
+            )
+        ):
+            raise ValueError("exact_outbox_hold_control_db_identity_invalid")
+    logical_identity = identity.get("logical_db_identity")
+    coordination = identity.get("coordination_observation")
+    if (
+        not isinstance(logical_identity, Mapping)
+        or logical_identity.get("database") != {
+            key: identity[key]
+            for key in ("present", "device", "inode", "size", "mtime_ns", "sha256")
+            if key in identity
+        }
+        or logical_identity.get("wal") != identity.get("wal")
+        or not isinstance(coordination, Mapping)
+        or coordination.get("shm") != identity.get("shm")
+    ):
+        raise ValueError("exact_outbox_hold_control_db_identity_invalid")
+    for field in ("config_binding_sha256", "tool_provenance_sha256"):
+        item = normalized.get(field)
+        if (
+            not isinstance(item, str)
+            or _ACTIVATION_SHA256_RE.fullmatch(item) is None
+            or item == "0" * 64
+        ):
+            raise ValueError("exact_outbox_hold_provenance_invalid")
+    active_binding = normalized.get("active_release_binding")
+    if (
+        not isinstance(active_binding, Mapping)
+        or _ACTIVATION_SHA256_RE.fullmatch(
+            str(active_binding.get("sha256") or "")
+        )
+        is None
+    ):
+        raise ValueError("exact_outbox_hold_active_binding_invalid")
+    tool_provenance = normalized.get("tool_provenance")
+    if (
+        not isinstance(tool_provenance, Mapping)
+        or _canonical_sha256(tool_provenance)
+        != normalized["tool_provenance_sha256"]
+    ):
+        raise ValueError("exact_outbox_hold_tool_provenance_invalid")
+    active_activation = normalized.get("active_activation")
+    if (
+        not isinstance(active_activation, Mapping)
+        or active_activation.get("configured") is not True
+        or active_activation.get("state") != "bounded_active"
+        or _ACTIVATION_SHA256_RE.fullmatch(
+            str(active_activation.get("sha256") or "")
+        )
+        is None
+    ):
+        raise ValueError("exact_outbox_hold_activation_invalid")
+    for field, expected_id in (
+        ("target_before", normalized["target_outbox_id"]),
+        ("target_after", normalized["target_outbox_id"]),
+        ("predecessor", normalized["predecessor_outbox_id"]),
+    ):
+        item = normalized.get(field)
+        if (
+            not isinstance(item, Mapping)
+            or item.get("schema_version") != EXACT_OUTBOX_HOLD_ROW_SCHEMA_VERSION
+            or item.get("outbox_id") != expected_id
+            or _ACTIVATION_SHA256_RE.fullmatch(
+                str(item.get("row_sha256") or "")
+            )
+            is None
+        ):
+            raise ValueError("exact_outbox_hold_row_binding_invalid")
+    before = normalized["target_before"]
+    after = normalized["target_after"]
+    if (
+        before.get("status") != "pending"
+        or after.get("status") != "pending"
+        or before.get("attempt") != 0
+        or after.get("attempt") != 0
+        or before.get("fence") != 0
+        or after.get("fence") != 0
+        or before.get("next_attempt_at") is not None
+        or after.get("next_attempt_at") != EXACT_OUTBOX_HOLD_UNTIL
+        or after.get("updated_at") != recorded_at
+        or normalized["predecessor"].get("status") != "pending"
+        or normalized["predecessor"].get("attempt") != 0
+        or normalized["predecessor"].get("fence") != 0
+        or normalized["predecessor"].get("next_attempt_at") is not None
+    ):
+        raise ValueError("exact_outbox_hold_row_state_invalid")
+    mutable_after_fields = {"next_attempt_at", "updated_at", "row_sha256"}
+    if any(
+        before.get(field) != after.get(field)
+        for field in set(before) | set(after)
+        if field not in mutable_after_fields
+    ):
+        raise ValueError("exact_outbox_hold_row_state_invalid")
+    for field, expected_ids in (
+        (
+            "eligible_queue_before",
+            sorted(
+                [
+                    normalized["predecessor_outbox_id"],
+                    normalized["target_outbox_id"],
+                ]
+            ),
+        ),
+        ("eligible_queue_after", [normalized["predecessor_outbox_id"]]),
+    ):
+        item = normalized.get(field)
+        entries = item.get("entries") if isinstance(item, Mapping) else None
+        if (
+            not isinstance(item, Mapping)
+            or item.get("outbox_ids") != expected_ids
+            or not isinstance(entries, list)
+            or [entry.get("outbox_id") for entry in entries] != expected_ids
+            or any(
+                not isinstance(entry, Mapping)
+                or set(entry) != {"outbox_id", "row_sha256"}
+                or _ACTIVATION_SHA256_RE.fullmatch(
+                    str(entry.get("row_sha256") or "")
+                )
+                is None
+                for entry in entries
+            )
+            or _ACTIVATION_SHA256_RE.fullmatch(
+                str(item.get("sha256") or "")
+            )
+            is None
+            or item.get("sha256")
+            != _canonical_sha256(
+                [
+                    {
+                        "outbox_id": int(entry["outbox_id"]),
+                        "row_sha256": str(entry["row_sha256"]),
+                    }
+                    for entry in entries
+                ]
+            )
+        ):
+            raise ValueError("exact_outbox_hold_queue_binding_invalid")
+    before_entries = normalized["eligible_queue_before"]["entries"]
+    after_entries = normalized["eligible_queue_after"]["entries"]
+    expected_before_sha = {
+        normalized["predecessor_outbox_id"]: normalized["predecessor"]["row_sha256"],
+        normalized["target_outbox_id"]: normalized["target_before"]["row_sha256"],
+    }
+    if (
+        any(
+            entry["row_sha256"] != expected_before_sha[entry["outbox_id"]]
+            for entry in before_entries
+        )
+        or after_entries[0]["row_sha256"]
+        != normalized["predecessor"]["row_sha256"]
+    ):
+        raise ValueError("exact_outbox_hold_queue_row_binding_invalid")
+    retry_horizon = normalized.get("retry_horizon")
+    if (
+        not isinstance(retry_horizon, Mapping)
+        or not isinstance(retry_horizon.get("anchor"), str)
+        or not isinstance(retry_horizon.get("expires_at"), str)
+        or retry_horizon.get("target_outbox_id")
+        != normalized["target_outbox_id"]
+    ):
+        raise ValueError("exact_outbox_hold_retry_horizon_invalid")
+    effect_delta = normalized.get("effect_delta")
+    if (
+        not isinstance(effect_delta, Mapping)
+        or effect_delta.get("external_writes") != 0
+        or effect_delta.get("target_rows_updated") != 1
+        or effect_delta.get("control_meta_inserted") != 1
+        or effect_delta.get("business_trigger_rows_updated") != 0
+    ):
+        raise ValueError("exact_outbox_hold_effect_delta_invalid")
+    fingerprint = normalized.get("receipt_fingerprint")
+    expected_plan_id = _exact_outbox_hold_plan_id(normalized)
+    expected_hold_id = _canonical_sha256(
+        {
+            "plan_id": expected_plan_id,
+            "recorded_at": recorded_at,
+            "target_after_sha256": after["row_sha256"],
+        }
+    )
+    if (
+        normalized["plan_id"] != expected_plan_id
+        or normalized["hold_id"] != expected_hold_id
+        or not isinstance(fingerprint, str)
+        or _ACTIVATION_SHA256_RE.fullmatch(fingerprint) is None
+        or fingerprint != _exact_outbox_hold_fingerprint(normalized)
+    ):
+        raise ValueError("exact_outbox_hold_fingerprint_invalid")
+    try:
+        serialized = _canonical_json(normalized)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("exact_outbox_hold_audit_json_invalid") from exc
+    if len(serialized.encode("utf-8")) > EXACT_OUTBOX_HOLD_MAX_AUDIT_BYTES:
+        raise ValueError("exact_outbox_hold_audit_too_large")
     return normalized
 
 
@@ -1027,17 +1397,28 @@ class RcaControlStore:
         *,
         busy_timeout_ms: int = 5000,
         require_current: bool = False,
+        read_only: bool = False,
     ):
         self.db_path = Path(db_path).expanduser()
         if not isinstance(require_current, bool):
             raise TypeError("require_current must be true or false")
+        if not isinstance(read_only, bool):
+            raise TypeError("read_only must be true or false")
+        if read_only and not require_current:
+            raise ValueError("read_only control store requires current schema")
         self.require_current = require_current
+        self.read_only = read_only
+        self._read_only_snapshot_dir: tempfile.TemporaryDirectory[str] | None = None
+        self._read_only_db_path: Path | None = None
+        self._read_only_source_identity: dict[str, Any] | None = None
         if require_current:
             self._validate_no_installation_marker()
             self._validate_existing_path()
         else:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.busy_timeout_ms = max(1, int(busy_timeout_ms))
+        if self.read_only:
+            self._create_read_only_snapshot()
         self._initialization_mode = "unknown"
         self._initialization_backfill_runs = 0
         self._initialize()
@@ -1072,14 +1453,182 @@ class RcaControlStore:
                 f"rca_control_store_installation_marker_present:{marker_kind}"
             )
 
+    @staticmethod
+    def _snapshot_file(
+        source: Path,
+        *,
+        destination: Path | None,
+        required: bool,
+    ) -> dict[str, Any]:
+        try:
+            lexical = source.lstat()
+        except FileNotFoundError:
+            if required:
+                raise RuntimeError("rca_control_store_snapshot_source_missing")
+            return {"present": False}
+        except OSError as exc:
+            raise RuntimeError("rca_control_store_snapshot_source_unreadable") from exc
+        if (
+            stat.S_ISLNK(lexical.st_mode)
+            or not stat.S_ISREG(lexical.st_mode)
+            or lexical.st_nlink != 1
+            or lexical.st_uid != os.getuid()
+            or stat.S_IMODE(lexical.st_mode) & 0o022
+        ):
+            raise RuntimeError("rca_control_store_snapshot_source_invalid")
+        descriptor = os.open(
+            source,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        output = -1
+        try:
+            before = os.fstat(descriptor)
+            identity = (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+            )
+            if identity != (
+                lexical.st_dev,
+                lexical.st_ino,
+                lexical.st_size,
+                lexical.st_mtime_ns,
+            ):
+                raise RuntimeError("rca_control_store_snapshot_source_changed")
+            if destination is not None:
+                output = os.open(
+                    destination,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                )
+            digest = hashlib.sha256()
+            copied = 0
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                copied += len(chunk)
+                if output >= 0:
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(output, view)
+                        if written <= 0:
+                            raise OSError("short snapshot write")
+                        view = view[written:]
+            if copied != before.st_size:
+                raise RuntimeError("rca_control_store_snapshot_source_changed")
+            after = os.fstat(descriptor)
+            if identity != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+            ):
+                raise RuntimeError("rca_control_store_snapshot_source_changed")
+            if output >= 0:
+                os.fsync(output)
+                os.fchmod(output, 0o600)
+            return {
+                "present": True,
+                "device": int(before.st_dev),
+                "inode": int(before.st_ino),
+                "size": int(before.st_size),
+                "mtime_ns": int(before.st_mtime_ns),
+                "sha256": digest.hexdigest(),
+            }
+        except RuntimeError:
+            raise
+        except OSError as exc:
+            raise RuntimeError("rca_control_store_snapshot_copy_failed") from exc
+        finally:
+            if output >= 0:
+                os.close(output)
+            os.close(descriptor)
+
+    def _create_read_only_snapshot(self) -> None:
+        temporary = tempfile.TemporaryDirectory(prefix="pnc-rca-control-ro-")
+        root = Path(temporary.name)
+        os.chmod(root, 0o700)
+        snapshot_db = root / "control.sqlite3"
+        sources = {
+            "database": (self.db_path, snapshot_db, True),
+            "wal": (Path(f"{self.db_path}-wal"), Path(f"{snapshot_db}-wal"), False),
+            "shm": (Path(f"{self.db_path}-shm"), None, False),
+        }
+        try:
+            first = {
+                name: self._snapshot_file(
+                    source, destination=destination, required=required
+                )
+                for name, (source, destination, required) in sources.items()
+            }
+            second = {
+                name: self._snapshot_file(source, destination=None, required=required)
+                for name, (source, _destination, required) in sources.items()
+            }
+            if first != second:
+                raise RuntimeError("rca_control_store_snapshot_source_changed")
+            database = first["database"]
+            self._read_only_snapshot_dir = temporary
+            self._read_only_db_path = snapshot_db
+            self._read_only_source_identity = {
+                "schema_version": "pnc_rca_control_store_source_snapshot_v1",
+                "path": str(self.db_path.expanduser().absolute()),
+                "present": True,
+                "device": database["device"],
+                "inode": database["inode"],
+                "size": database["size"],
+                "mtime_ns": database["mtime_ns"],
+                "sha256": database["sha256"],
+                "wal": first["wal"],
+                "shm": first["shm"],
+                "logical_db_identity": {
+                    "database": database,
+                    "wal": first["wal"],
+                },
+                "coordination_observation": {"shm": first["shm"]},
+            }
+        except Exception:
+            temporary.cleanup()
+            raise
+
+    def control_db_source_snapshot_identity(self) -> dict[str, Any]:
+        if not self.read_only or self._read_only_source_identity is None:
+            raise RuntimeError("rca_control_store_source_snapshot_unavailable")
+        return json.loads(_canonical_json(self._read_only_source_identity))
+
+    @property
+    def _sqlite_path(self) -> Path:
+        if self.read_only:
+            if self._read_only_db_path is None:
+                raise RuntimeError("rca_control_store_read_only_snapshot_missing")
+            return self._read_only_db_path
+        return self.db_path
+
     def _connect(self) -> sqlite3.Connection:
         if self.require_current:
             self._validate_no_installation_marker()
-        conn = sqlite3.connect(
-            self.db_path,
-            timeout=self.busy_timeout_ms / 1000,
-            isolation_level=None,
-        )
+        if self.read_only:
+            conn = sqlite3.connect(
+                f"{self._sqlite_path.resolve().as_uri()}?mode=ro",
+                uri=True,
+                timeout=self.busy_timeout_ms / 1000,
+                isolation_level=None,
+            )
+        else:
+            conn = sqlite3.connect(
+                self.db_path,
+                timeout=self.busy_timeout_ms / 1000,
+                isolation_level=None,
+            )
         conn.row_factory = sqlite3.Row
         conn.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
         conn.execute("PRAGMA foreign_keys=ON")
@@ -1088,8 +1637,11 @@ class RcaControlStore:
         if recursive_triggers is None or int(recursive_triggers[0]) != 1:
             conn.close()
             raise RuntimeError("rca_control_store_recursive_triggers_disabled")
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=FULL")
+        if self.read_only:
+            conn.execute("PRAGMA query_only=ON")
+        else:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=FULL")
         return conn
 
     def _initialize(self) -> None:
@@ -3679,9 +4231,10 @@ class RcaControlStore:
 
     def _preflight_schema_version(self) -> str | None:
         """Reject a future schema using a read-only connection before any pragma/DDL."""
-        if not self.db_path.is_file() or self.db_path.stat().st_size == 0:
+        sqlite_path = self._sqlite_path
+        if not sqlite_path.is_file() or sqlite_path.stat().st_size == 0:
             return None
-        uri = f"{self.db_path.resolve().as_uri()}?mode=ro"
+        uri = f"{sqlite_path.resolve().as_uri()}?mode=ro"
         try:
             conn = sqlite3.connect(uri, uri=True)
             conn.row_factory = sqlite3.Row
@@ -3707,7 +4260,7 @@ class RcaControlStore:
 
     def _validate_current_schema_read_only(self) -> None:
         """Validate fixed-size schema metadata without taking a SQLite write lock."""
-        uri = f"{self.db_path.resolve().as_uri()}?mode=ro"
+        uri = f"{self._sqlite_path.resolve().as_uri()}?mode=ro"
         conn = sqlite3.connect(uri, uri=True)
         conn.row_factory = sqlite3.Row
         try:
@@ -15635,6 +16188,481 @@ class RcaControlStore:
             return [dict(row) for row in rows]
         finally:
             conn.close()
+
+    @staticmethod
+    def _exact_outbox_row_binding(row: sqlite3.Row) -> dict[str, Any]:
+        """Return the small stable row binding used by the operator CAS."""
+        projection = {
+            field: row[field] for field in ACTIVATION_HISTORICAL_OUTBOX_ROW_FIELDS
+        }
+        return {
+            "schema_version": EXACT_OUTBOX_HOLD_ROW_SCHEMA_VERSION,
+            "outbox_id": int(row["outbox_id"]),
+            "submission_key": str(row["submission_key"] or ""),
+            "business_key": str(row["business_key"] or ""),
+            "generation": int(row["generation"]),
+            "status": str(row["status"] or ""),
+            "attempt": int(row["attempt"]),
+            "fence": int(row["fence"]),
+            "next_attempt_at": (
+                str(row["next_attempt_at"])
+                if row["next_attempt_at"] is not None
+                else None
+            ),
+            "retry_window_started_at": (
+                str(row["retry_window_started_at"])
+                if row["retry_window_started_at"] is not None
+                else None
+            ),
+            "lease_token": row["lease_token"],
+            "lease_owner": row["lease_owner"],
+            "lease_expires_at": row["lease_expires_at"],
+            "claimed_at": row["claimed_at"],
+            "completed_at": row["completed_at"],
+            "quarantined_at": row["quarantined_at"],
+            "result_json": row["result_json"],
+            "updated_at": str(row["updated_at"] or ""),
+            "activation_epoch_id": row["activation_epoch_id"],
+            "activation_ledger_id": row["activation_ledger_id"],
+            "row_sha256": _canonical_sha256(projection),
+            "_row_projection": projection,
+        }
+
+    @staticmethod
+    def _exact_outbox_queue_sha256(entries: Iterable[Mapping[str, Any]]) -> str:
+        return _canonical_sha256(
+            [
+                {
+                    "outbox_id": int(item["outbox_id"]),
+                    "row_sha256": str(item["row_sha256"]),
+                }
+                for item in entries
+            ]
+        )
+
+    @classmethod
+    def _exact_outbox_activation_binding_tx(
+        cls, conn: sqlite3.Connection
+    ) -> dict[str, Any]:
+        epoch = cls._current_activation_epoch_tx(conn)
+        if epoch is None:
+            value: dict[str, Any] = {"configured": False, "epoch_id": ""}
+        else:
+            value = {
+                "configured": True,
+                "epoch_id": str(epoch["epoch_id"]),
+                "state": str(epoch["state"]),
+                "is_current": int(epoch["is_current"]),
+                "config_sha256": str(epoch["config_sha256"]),
+                "production_fingerprint": str(epoch["production_fingerprint"] or ""),
+                "production_gate_receipt_sha256": str(
+                    epoch["production_gate_receipt_sha256"] or ""
+                ),
+            }
+        value["sha256"] = _canonical_sha256(
+            {key: item for key, item in value.items() if key != "sha256"}
+        )
+        return value
+
+    @classmethod
+    def _exact_outbox_hold_snapshot_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        target_outbox_id: int,
+        predecessor_outbox_id: int,
+        activation_required: bool,
+        max_age_seconds: int,
+        now: datetime,
+        require_exact_queue: bool = True,
+        include_private_projection: bool = False,
+    ) -> dict[str, Any]:
+        if isinstance(target_outbox_id, bool) or int(target_outbox_id) < 1:
+            raise ValueError("exact_outbox_hold_target_id_invalid")
+        if isinstance(predecessor_outbox_id, bool) or int(predecessor_outbox_id) < 1:
+            raise ValueError("exact_outbox_hold_predecessor_id_invalid")
+        if int(target_outbox_id) == int(predecessor_outbox_id):
+            raise ValueError("exact_outbox_hold_identity_invalid")
+        if not isinstance(max_age_seconds, int) or isinstance(max_age_seconds, bool):
+            raise ValueError("exact_outbox_hold_max_age_invalid")
+        if max_age_seconds < 1:
+            raise ValueError("exact_outbox_hold_max_age_invalid")
+        current = _utc_datetime(now)
+        current_iso = _iso(current)
+        cutoff_iso = _iso(current - timedelta(seconds=max_age_seconds))
+        predicate, parameters = cls._activation_claim_predicate_tx(
+            conn,
+            activation_required=activation_required,
+            historical_submission_allowlist=(),
+        )
+        target = conn.execute(
+            "SELECT * FROM rca_outbox WHERE outbox_id = ?",
+            (int(target_outbox_id),),
+        ).fetchone()
+        predecessor = conn.execute(
+            "SELECT * FROM rca_outbox WHERE outbox_id = ?",
+            (int(predecessor_outbox_id),),
+        ).fetchone()
+        if target is None:
+            raise RuntimeError("exact_outbox_hold_target_missing")
+        if predecessor is None:
+            raise RuntimeError("exact_outbox_hold_predecessor_missing")
+        rows = conn.execute(
+            f"""
+            SELECT o.*
+              FROM rca_outbox AS o
+             WHERE ({predicate})
+               AND COALESCE(o.retry_window_started_at, o.created_at) > ?
+               AND (
+                    (o.status = 'pending'
+                     AND (o.next_attempt_at IS NULL OR o.next_attempt_at <= ?))
+                    OR (o.status = 'claimed'
+                        AND o.lease_expires_at IS NOT NULL
+                        AND o.lease_expires_at <= ?)
+               )
+             ORDER BY o.outbox_id
+            """,
+            (*parameters, cutoff_iso, current_iso, current_iso),
+        ).fetchall()
+        bindings = [cls._exact_outbox_row_binding(row) for row in rows]
+        queue_entries = [
+            {"outbox_id": item["outbox_id"], "row_sha256": item["row_sha256"]}
+            for item in bindings
+        ]
+        queue_ids = [int(item["outbox_id"]) for item in queue_entries]
+        expected_ids = sorted(
+            [int(predecessor_outbox_id), int(target_outbox_id)]
+        )
+        if require_exact_queue and queue_ids != expected_ids:
+            raise RuntimeError(
+                "exact_outbox_hold_eligible_queue_changed:"
+                f"observed={queue_ids}:expected={expected_ids}"
+            )
+        target_binding = cls._exact_outbox_row_binding(target)
+        predecessor_binding = cls._exact_outbox_row_binding(predecessor)
+        active_activation = cls._exact_outbox_activation_binding_tx(conn)
+        if (
+            activation_required is not True
+            or active_activation.get("configured") is not True
+            or active_activation.get("state") != "bounded_active"
+        ):
+            raise RuntimeError("exact_outbox_hold_bounded_activation_required")
+        for role, binding in (
+            ("target", target_binding),
+            ("predecessor", predecessor_binding),
+        ):
+            if (
+                binding["status"] != "pending"
+                or binding["attempt"] != 0
+                or binding["fence"] != 0
+                or (
+                    binding["next_attempt_at"] is not None
+                    and (require_exact_queue or role == "predecessor")
+                )
+                or any(
+                    binding[field] is not None
+                    for field in (
+                        "lease_token",
+                        "lease_owner",
+                        "lease_expires_at",
+                        "claimed_at",
+                        "completed_at",
+                        "quarantined_at",
+                        "result_json",
+                    )
+                )
+            ):
+                raise RuntimeError(f"exact_outbox_hold_{role}_baseline_invalid")
+        target_anchor = target["retry_window_started_at"] or target["created_at"]
+        try:
+            target_anchor_dt = _utc_datetime(
+                datetime.fromisoformat(str(target_anchor).replace("Z", "+00:00"))
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("exact_outbox_hold_retry_window_invalid") from exc
+        expires_at = target_anchor_dt + timedelta(seconds=max_age_seconds)
+        remaining = (expires_at - current).total_seconds()
+        if remaining <= 0:
+            raise RuntimeError("exact_outbox_hold_retry_horizon_expired")
+        snapshot = {
+            "schema_version": EXACT_OUTBOX_HOLD_SNAPSHOT_SCHEMA_VERSION,
+            "observed_at": current_iso,
+            "target_outbox_id": int(target_outbox_id),
+            "predecessor_outbox_id": int(predecessor_outbox_id),
+            "activation_required": activation_required,
+            "max_age_seconds": max_age_seconds,
+            "active_activation": active_activation,
+            "target": target_binding,
+            "predecessor": predecessor_binding,
+            "eligible_queue": {
+                "outbox_ids": queue_ids,
+                "entries": queue_entries,
+                "sha256": cls._exact_outbox_queue_sha256(queue_entries),
+            },
+            "retry_horizon": {
+                "target_outbox_id": int(target_outbox_id),
+                "anchor": str(target_anchor),
+                "expires_at": _iso(expires_at),
+                "cutoff_at": cutoff_iso,
+                "remaining_seconds": remaining,
+            },
+        }
+        if not include_private_projection:
+            snapshot["target"].pop("_row_projection", None)
+            snapshot["predecessor"].pop("_row_projection", None)
+        return snapshot
+
+    def exact_outbox_hold_snapshot(
+        self,
+        *,
+        target_outbox_id: int,
+        predecessor_outbox_id: int,
+        activation_required: bool = True,
+        max_age_seconds: int = 86_400,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Read the exact bounded queue without taking a write lock."""
+        conn = self._connect()
+        try:
+            return self._exact_outbox_hold_snapshot_tx(
+                conn,
+                target_outbox_id=target_outbox_id,
+                predecessor_outbox_id=predecessor_outbox_id,
+                activation_required=activation_required,
+                max_age_seconds=max_age_seconds,
+                now=_utc_datetime(now),
+            )
+        finally:
+            conn.close()
+
+    def _exact_outbox_hold_private_snapshot(
+        self,
+        *,
+        target_outbox_id: int,
+        predecessor_outbox_id: int,
+        activation_required: bool,
+        max_age_seconds: int,
+        now: datetime,
+    ) -> dict[str, Any]:
+        conn = self._connect()
+        try:
+            return self._exact_outbox_hold_snapshot_tx(
+                conn,
+                target_outbox_id=target_outbox_id,
+                predecessor_outbox_id=predecessor_outbox_id,
+                activation_required=activation_required,
+                max_age_seconds=max_age_seconds,
+                now=now,
+                include_private_projection=True,
+            )
+        finally:
+            conn.close()
+
+    def hold_exact_outbox_with_audit(
+        self,
+        *,
+        audit: Mapping[str, Any],
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """CAS-hold exactly one pending outbox row and durably audit it."""
+        if self.read_only:
+            raise RuntimeError("exact_outbox_hold_mutation_requires_read_write_store")
+        payload = _validate_exact_outbox_hold_audit(audit)
+        current = _iso(now)
+        if payload["recorded_at"] != current:
+            raise RuntimeError("exact_outbox_hold_recorded_at_changed")
+        try:
+            db_identity = self.db_path.expanduser().absolute().lstat()
+        except OSError as exc:
+            raise RuntimeError("exact_outbox_hold_control_db_missing") from exc
+        recorded_identity = payload["control_db_identity"]
+        if (
+            recorded_identity.get("path") != str(self.db_path.expanduser().absolute())
+            or int(recorded_identity.get("device")) != int(db_identity.st_dev)
+            or int(recorded_identity.get("inode")) != int(db_identity.st_ino)
+        ):
+            raise RuntimeError("exact_outbox_hold_control_db_changed")
+        meta_key = f"{EXACT_OUTBOX_HOLD_META_PREFIX}{payload['hold_id']}"
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            changes_before = conn.total_changes
+            existing = conn.execute(
+                "SELECT value FROM control_meta WHERE key = ?", (meta_key,)
+            ).fetchone()
+            if existing is not None:
+                if str(existing["value"]) == _canonical_json(payload):
+                    raise RuntimeError("exact_outbox_hold_already_applied")
+                raise RuntimeError("exact_outbox_hold_audit_key_conflict")
+            snapshot = self._exact_outbox_hold_snapshot_tx(
+                conn,
+                target_outbox_id=int(payload["target_outbox_id"]),
+                predecessor_outbox_id=int(payload["predecessor_outbox_id"]),
+                activation_required=bool(payload["activation_required"]),
+                max_age_seconds=int(payload["max_age_seconds"]),
+                now=datetime.fromisoformat(current),
+            )
+            target = snapshot["target"]
+            predecessor = snapshot["predecessor"]
+            if (
+                target["row_sha256"] != payload["target_before"]["row_sha256"]
+                or predecessor["row_sha256"]
+                != payload["predecessor"]["row_sha256"]
+                or snapshot["eligible_queue"]["sha256"]
+                != payload["eligible_queue_before"]["sha256"]
+                or snapshot["active_activation"]["sha256"]
+                != payload["active_activation"]["sha256"]
+                or snapshot["active_activation"].get("configured") is not True
+                or snapshot["active_activation"].get("state") != "bounded_active"
+                or target["status"] != "pending"
+                or target["attempt"] != 0
+                or target["fence"] != 0
+                or target["next_attempt_at"] is not None
+                or any(
+                    target[field] is not None
+                    for field in (
+                        "lease_token",
+                        "lease_owner",
+                        "lease_expires_at",
+                        "claimed_at",
+                        "completed_at",
+                        "quarantined_at",
+                        "result_json",
+                    )
+                )
+            ):
+                raise RuntimeError("exact_outbox_hold_target_changed")
+            if (
+                predecessor["status"] != "pending"
+                or predecessor["attempt"] != 0
+                or predecessor["fence"] != 0
+                or predecessor["next_attempt_at"] is not None
+                or any(
+                    predecessor[field] is not None
+                    for field in (
+                        "lease_token",
+                        "lease_owner",
+                        "lease_expires_at",
+                        "claimed_at",
+                        "completed_at",
+                        "quarantined_at",
+                        "result_json",
+                    )
+                )
+            ):
+                raise RuntimeError("exact_outbox_hold_predecessor_not_pending")
+            conn.execute(
+                "INSERT INTO control_meta(key, value) VALUES(?, ?)",
+                (meta_key, _canonical_json(payload)),
+            )
+            updated = conn.execute(
+                """
+                UPDATE rca_outbox
+                   SET next_attempt_at = ?, updated_at = ?
+                 WHERE outbox_id = ? AND status = 'pending'
+                   AND attempt = 0 AND fence = ?
+                   AND submission_key = ? AND business_key = ? AND generation = ?
+                   AND next_attempt_at IS ? AND updated_at = ?
+                   AND lease_token IS NULL AND lease_owner IS NULL
+                   AND lease_expires_at IS NULL AND claimed_at IS NULL
+                   AND completed_at IS NULL AND quarantined_at IS NULL
+                   AND result_json IS NULL
+                """,
+                (
+                    EXACT_OUTBOX_HOLD_UNTIL,
+                    current,
+                    int(payload["target_outbox_id"]),
+                    int(target["fence"]),
+                    target["submission_key"],
+                    target["business_key"],
+                    int(target["generation"]),
+                    target["next_attempt_at"],
+                    target["updated_at"],
+                ),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError("exact_outbox_hold_target_cas_lost")
+            held = conn.execute(
+                "SELECT * FROM rca_outbox WHERE outbox_id = ?",
+                (int(payload["target_outbox_id"]),),
+            ).fetchone()
+            if held is None:
+                raise RuntimeError("exact_outbox_hold_post_row_missing")
+            held_binding = self._exact_outbox_row_binding(held)
+            if (
+                held_binding["row_sha256"] != payload["target_after"]["row_sha256"]
+                or held_binding["next_attempt_at"] != EXACT_OUTBOX_HOLD_UNTIL
+                or held_binding["updated_at"] != current
+            ):
+                raise RuntimeError("exact_outbox_hold_post_row_changed")
+            after_snapshot = self._exact_outbox_hold_snapshot_tx(
+                conn,
+                target_outbox_id=int(payload["target_outbox_id"]),
+                predecessor_outbox_id=int(payload["predecessor_outbox_id"]),
+                activation_required=bool(payload["activation_required"]),
+                max_age_seconds=int(payload["max_age_seconds"]),
+                now=datetime.fromisoformat(current),
+                require_exact_queue=False,
+            )
+            if (
+                after_snapshot["eligible_queue"]["outbox_ids"]
+                != [int(payload["predecessor_outbox_id"])]
+                or after_snapshot["eligible_queue"]["sha256"]
+                != payload["eligible_queue_after"]["sha256"]
+                or conn.total_changes - changes_before != 2
+            ):
+                raise RuntimeError("exact_outbox_hold_effect_delta_changed")
+            conn.commit()
+            return dict(payload)
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def exact_outbox_hold_audit(self, hold_id: str) -> dict[str, Any] | None:
+        normalized = str(hold_id or "").strip()
+        if not normalized:
+            raise ValueError("exact_outbox_hold_id_invalid")
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT value FROM control_meta WHERE key = ?",
+                (f"{EXACT_OUTBOX_HOLD_META_PREFIX}{normalized}",),
+            ).fetchone()
+            if row is None:
+                return None
+            raw = str(row["value"])
+            try:
+                value = json.loads(raw, parse_constant=lambda _v: (_ for _ in ()).throw(ValueError()))
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError("exact_outbox_hold_audit_invalid") from exc
+            value = _validate_exact_outbox_hold_audit(value)
+            if (
+                value["hold_id"] != normalized
+                or _canonical_json(value) != raw
+            ):
+                raise RuntimeError("exact_outbox_hold_audit_tampered")
+            identity = value["control_db_identity"]
+            observed = self.db_path.expanduser().absolute().lstat()
+            if (
+                identity.get("path") != str(self.db_path.expanduser().absolute())
+                or int(identity.get("device")) != int(observed.st_dev)
+                or int(identity.get("inode")) != int(observed.st_ino)
+            ):
+                raise RuntimeError("exact_outbox_hold_control_db_changed")
+            return value
+        finally:
+            conn.close()
+
+    # Explicit aliases keep the operator vocabulary discoverable for callers
+    # that separate planning from application at the API boundary.
+    def plan_exact_outbox_hold(self, **kwargs: Any) -> dict[str, Any]:
+        return self.exact_outbox_hold_snapshot(**kwargs)
+
+    def apply_exact_outbox_hold(self, **kwargs: Any) -> dict[str, Any]:
+        return self.hold_exact_outbox_with_audit(**kwargs)
 
     def dispatcher_circuit(self) -> DispatcherCircuit:
         conn = self._connect()

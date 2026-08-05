@@ -268,6 +268,15 @@ def _patch_circuit_reset_cli(monkeypatch, config, tmp_path):
     return binding
 
 
+def test_bound_source_rejects_group_or_world_writable_file(tmp_path):
+    source = tmp_path / "tool.py"
+    source.write_text("print('bound')\n", encoding="utf-8")
+    source.chmod(0o664)
+
+    with pytest.raises(ValueError, match="tool_provenance_invalid"):
+        dispatcher_module._bound_source_sha256(source)
+
+
 def test_clear_circuit_cli_plans_then_applies_without_claiming_effects(
     tmp_path, monkeypatch, capsys
 ):
