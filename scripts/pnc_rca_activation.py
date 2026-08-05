@@ -630,7 +630,7 @@ def _normalize_canary_slot_plan(value: Any) -> dict[str, dict[str, Any]]:
         "manual_terminal_failure": (
             "manual",
             "manual_admit",
-            "terminal_failed",
+            frozenset({"terminal_failed", "quarantined"}),
         ),
     }
     normalized: dict[str, dict[str, Any]] = {}
@@ -646,7 +646,7 @@ def _normalize_canary_slot_plan(value: Any) -> dict[str, dict[str, Any]]:
             "expected_outcome",
         }:
             raise ActivationCliError("activation_canary_slot_plan_invalid")
-        source_kind, entrypoint, outcome = expected_source[slot_kind]
+        source_kind, entrypoint, expected_outcome = expected_source[slot_kind]
         raw_identity = raw_slot.get("source_identity")
         if not isinstance(raw_identity, Mapping):
             raise ActivationCliError("activation_canary_slot_plan_invalid")
@@ -690,7 +690,12 @@ def _normalize_canary_slot_plan(value: Any) -> dict[str, dict[str, Any]]:
             or generation < 1
             or raw_slot.get("source_kind") != source_kind
             or raw_slot.get("entrypoint") != entrypoint
-            or raw_slot.get("expected_outcome") != outcome
+            or raw_slot.get("expected_outcome")
+            not in (
+                expected_outcome
+                if isinstance(expected_outcome, frozenset)
+                else {expected_outcome}
+            )
             or isinstance(raw_slot.get("max_admissions"), bool)
             or raw_slot.get("max_admissions") != 1
             or source_sha256 != _sha256_json(source_identity)
@@ -703,7 +708,7 @@ def _normalize_canary_slot_plan(value: Any) -> dict[str, dict[str, Any]]:
             "source_identity_sha256": source_sha256,
             "max_admissions": 1,
             "expected_admission": dict(admission),
-            "expected_outcome": outcome,
+            "expected_outcome": str(raw_slot.get("expected_outcome")),
         }
     if (
         len({slot["source_identity_sha256"] for slot in normalized.values()})

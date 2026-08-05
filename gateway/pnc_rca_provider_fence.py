@@ -393,10 +393,6 @@ def revalidate_provider_write_claim(
     store = _canonical_store()
 
     if kind == _MANUAL_KIND:
-        if op != "feishu_manual_reply" or not observed_reply:
-            raise ExternalWriteFenceError(
-                "external_write_fence_operation_denied"
-            )
         source = authority["source_identity"]
         if not isinstance(source, Mapping):
             raise ExternalWriteFenceError(
@@ -409,14 +405,46 @@ def revalidate_provider_write_claim(
             expected_message_id=str(source.get("message_id") or ""),
             expected_requester_id=str(source.get("requester_id") or ""),
         )
-        if (
-            observed_chat != str(live.get("chat_id") or "").strip()
-            or observed_thread != str(live.get("thread_id") or "").strip()
-            or observed_reply != str(live.get("message_id") or "").strip()
-        ):
-            raise ExternalWriteFenceError(
-                "external_write_fence_target_mismatch"
+        expected_chat = str(live.get("chat_id") or "").strip()
+        expected_thread = str(live.get("thread_id") or "").strip()
+        if op == "feishu_manual_reply":
+            if not observed_reply:
+                raise ExternalWriteFenceError(
+                    "external_write_fence_operation_denied"
+                )
+            if (
+                observed_chat != expected_chat
+                or observed_thread != expected_thread
+                or observed_reply != str(live.get("message_id") or "").strip()
+            ):
+                raise ExternalWriteFenceError(
+                    "external_write_fence_target_mismatch"
+                )
+        elif op == "feishu_thread_reply":
+            if (
+                not expected_chat
+                or not expected_thread
+                or observed_chat != expected_chat
+                or observed_thread != expected_thread
+            ):
+                raise ExternalWriteFenceError(
+                    "external_write_fence_target_mismatch"
+                )
+        elif op in _ISSUE_OPERATIONS:
+            expected_project, expected_work_item = _issue_identity(
+                str(live.get("issue_url") or source.get("issue_url") or "")
             )
+            if (
+                not expected_project
+                or not expected_work_item
+                or observed_work_item != expected_work_item
+                or (observed_project and observed_project != expected_project)
+            ):
+                raise ExternalWriteFenceError(
+                    "external_write_fence_target_mismatch"
+                )
+        else:
+            raise ExternalWriteFenceError("external_write_fence_operation_denied")
         return {"authority_kind": kind, **dict(live)}
 
     if kind == _HISTORICAL_EPOCH_KIND:

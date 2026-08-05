@@ -78,10 +78,11 @@ from gateway.pnc_rca_delivery_quarantine_baseline import (
     quarantine_baseline_settings,
     read_quarantine_baseline_status,
 )
-from gateway.pnc_rca_control_store import RcaControlStore
+from gateway.pnc_rca_control_store import RecordConflictError, RcaControlStore
 from gateway.pnc_rca_provider_fence import (
     RcaProviderWriteClaim,
     bound_provider_write_claim,
+    build_manual_provider_write_claim,
     build_historical_epoch_provider_claim,
     build_write_fence_provider_claim,
     current_provider_write_claim,
@@ -3758,6 +3759,31 @@ class DeliveryDispatcher:
         contract = claim.contract if isinstance(claim.contract, Mapping) else {}
         binding = contract.get("w3_execution_snapshot")
         if not isinstance(binding, Mapping):
+            if claim.effect_kind in {
+                DELIVERY_EFFECT_KIND,
+                DELIVERY_THREAD_EFFECT_KIND,
+            }:
+                try:
+                    manual_claim = self._manual_provider_write_claim(claim)
+                    if manual_claim is None:
+                        raise RecordConflictError(
+                            "manual_external_write_source_not_manual"
+                        )
+                    operation_kwargs = self._provider_operation_kwargs(
+                        claim, operation
+                    )
+                    return dict(
+                        revalidate_provider_write_claim(
+                            manual_claim,
+                            operation=operation,
+                            **operation_kwargs,
+                        )
+                    )
+                except (RecordConflictError, ExternalWriteFenceError) as exc:
+                    if isinstance(exc, ExternalWriteFenceError):
+                        raise
+                    if str(exc) != "manual_external_write_source_not_manual":
+                        raise ExternalWriteFenceError(str(exc)) from exc
             if claim.effect_kind == DELIVERY_CARD_PATCH_EFFECT_KIND:
                 raise ExternalWriteFenceError("external_write_fence_missing")
             if self.store.is_historical_external_write_effect(claim.effect_created_at):
@@ -3816,6 +3842,44 @@ class DeliveryDispatcher:
         )
         return dict(live)
 
+    @staticmethod
+    def _provider_operation_kwargs(
+        claim: DeliveryEffectClaim, operation: str
+    ) -> dict[str, str]:
+        if operation == "feishu_thread_reply":
+            return {
+                "chat_id": str(claim.payload.get("chat_id") or "").strip(),
+                "thread_id": str(claim.payload.get("thread_id") or "").strip(),
+            }
+        match = _FEISHU_ISSUE_URL_RE.fullmatch(str(claim.issue_url or "").strip())
+        if match is None:
+            raise ExternalWriteFenceError("external_write_fence_target_mismatch")
+        return {
+            "issue_project_key": match.group(1),
+            "issue_work_item_id": match.group(2),
+        }
+
+    def _manual_provider_write_claim(
+        self, claim: DeliveryEffectClaim
+    ) -> ProviderWriteClaim | None:
+        control_store = RcaControlStore(
+            self.config.control_db_path,
+            require_current=True,
+        )
+        binding = control_store.manual_external_write_admission_for_effect(
+            business_key=claim.business_key,
+            submission_key=claim.submission_key,
+            generation=claim.generation,
+            delivery_id=claim.delivery_id,
+            effect_kind=claim.effect_kind,
+            target_key=claim.target_key,
+        )
+        if binding is None:
+            return None
+        return build_manual_provider_write_claim(
+            binding["admission"], binding["source_identity"]
+        )
+
     def _validate_historical_external_write_epoch(
         self, claim: DeliveryEffectClaim
     ) -> dict[str, Any]:
@@ -3841,6 +3905,10 @@ class DeliveryDispatcher:
         fence = snapshot.get("write_fence") if isinstance(snapshot, Mapping) else None
         if isinstance(fence, Mapping):
             return build_write_fence_provider_claim(fence)
+        if claim.effect_kind in {DELIVERY_EFFECT_KIND, DELIVERY_THREAD_EFFECT_KIND}:
+            manual_claim = self._manual_provider_write_claim(claim)
+            if manual_claim is not None:
+                return manual_claim
         if claim.effect_kind == DELIVERY_CARD_PATCH_EFFECT_KIND:
             raise ExternalWriteFenceError("external_write_fence_missing")
         epoch = self._validate_historical_external_write_epoch(claim)

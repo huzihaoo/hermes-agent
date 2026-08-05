@@ -225,6 +225,8 @@ def _validate_safe_config(
     config: Mapping[str, Any],
     env: Mapping[str, str],
     authority: Mapping[str, Any],
+    *,
+    mode: str = "preauthorization",
 ) -> dict[str, Any]:
     consumer = config.get("consumer")
     outbox = config.get("outbox_dispatcher")
@@ -246,8 +248,11 @@ def _validate_safe_config(
         str(collector.get("control_db_path") or ""),
         str(delivery.get("control_db_path") or ""),
     }
+    outbound_mode = str(env.get("HERMES_OUTBOUND_MODE") or "").strip()
+    production_mode = mode in {"production_bootstrap", "production"}
+    live_profile = outbound_mode == "live"
     safe = (
-        env.get("HERMES_OUTBOUND_MODE") == "record-only"
+        outbound_mode in {"record-only", "live"}
         and consumer.get("submit_enabled") is True
         and consumer.get("activation_required") is True
         and consumer.get("external_dispatch_wired") is False
@@ -262,25 +267,31 @@ def _validate_safe_config(
         and collector.get("activation_required") is True
         and collector.get("quarantine_release_id") == release_id
         and collector.get("quarantine_baseline_sha256") == expected_baseline
-        and delivery.get("enabled") is False
-        and delivery.get("external_writes") is False
+        and delivery.get("enabled") is live_profile
+        and delivery.get("external_writes") is live_profile
         and delivery.get("activation_required") is True
         and delivery.get("quarantine_release_id") == release_id
         and delivery.get("quarantine_baseline_sha256") == expected_baseline
         and len(control_paths) == 1
         and next(iter(control_paths)).startswith("/")
     )
+    if production_mode:
+        safe = safe and live_profile
+    else:
+        # The first two gates are deliberately inert.  A live profile is
+        # only admissible after the bounded-active production transition.
+        safe = safe and outbound_mode == "record-only" and not live_profile
     if not safe:
         raise ActivationGateError("rca_activation_gate_unsafe_config")
     return {
-        "outbound_mode": "record-only",
+        "outbound_mode": outbound_mode,
         "activation_required": True,
         "submit_enabled": True,
         "outbox_dispatch_enabled": True,
         "feishu_writeback_enabled": False,
         "delivery_collector_enabled": True,
-        "delivery_dispatcher_enabled": False,
-        "external_writes": False,
+        "delivery_dispatcher_enabled": live_profile,
+        "external_writes": live_profile,
         "control_db_path": next(iter(control_paths)),
         "capacity_mode": "bootstrap",
     }
@@ -748,18 +759,27 @@ def _activation_observation(
     if len(current) != 1 or activation_input is None:
         raise ActivationGateError("rca_activation_gate_epoch_not_safe_off")
     row = current[0]
+    expected_state = (
+        "bounded_active"
+        if mode in {"production_bootstrap", "production"}
+        else "safe_off"
+    )
     if (
         row["epoch_id"] != epoch_id
-        or row["state"] != "safe_off"
+        or row["state"] != expected_state
         or row["config_sha256"] != activation_input["config_sha256"]
         or row["db_logical_identity_sha256"]
         != activation_input["db_logical_identity_sha256"]
         or row["partition_start_fence_sha256"]
         != activation_input["partition_start_fence_sha256"]
     ):
-        raise ActivationGateError("rca_activation_gate_epoch_not_safe_off")
+        raise ActivationGateError(
+            "rca_activation_gate_epoch_not_bounded_active"
+            if expected_state == "bounded_active"
+            else "rca_activation_gate_epoch_not_safe_off"
+        )
     return {
-        "state": "safe_off",
+        "state": expected_state,
         "epoch_id": row["epoch_id"],
         "epoch_count": len(rows),
         "current_epoch_count": 1,
@@ -781,6 +801,203 @@ def _partition_fence(broker: Mapping[str, Any]) -> dict[str, dict[str, int]]:
             if isinstance(value, Mapping)
         }
     }
+
+
+def _read_production_health(
+    path: Path,
+    *,
+    schema_version: str,
+    timestamp_field: str,
+    now: datetime,
+) -> tuple[bytes, dict[str, Any]]:
+    raw, body = _read_owner_json(path, "rca_activation_gate_resident_health")
+    if body.get("schema_version") != schema_version:
+        raise ActivationGateError("rca_activation_gate_resident_health_invalid")
+    if body.get("healthy") is not True:
+        raise ActivationGateError("rca_activation_gate_resident_unhealthy")
+    if timestamp_field not in body:
+        raise ActivationGateError("rca_activation_gate_resident_health_time_invalid")
+    _fresh(
+        body.get(timestamp_field),
+        now=now,
+        max_age_seconds=capsules.LIVE_HEALTH_MAX_AGE_SECONDS,
+        code="rca_activation_gate_resident_health_stale",
+    )
+    identity = body.get("runtime_identity")
+    config = body.get("config")
+    if not isinstance(identity, Mapping) or not isinstance(config, Mapping):
+        raise ActivationGateError("rca_activation_gate_resident_runtime_invalid")
+    return raw, body
+
+
+def _production_freeze_binding(
+    *,
+    consumer_health: Mapping[str, Any],
+    consumer_health_path: Path,
+    epoch_id: str,
+    partition_end_fence: Mapping[str, Any],
+    now: datetime,
+) -> dict[str, Any]:
+    freeze = consumer_health.get("activation_freeze")
+    identity = consumer_health.get("runtime_identity")
+    if not isinstance(freeze, Mapping) or not isinstance(identity, Mapping):
+        raise ActivationGateError("rca_activation_gate_consumer_freeze_invalid")
+    if (
+        freeze.get("schema_version") != capsules.ACTIVATION_FREEZE_SCHEMA_VERSION
+        or freeze.get("epoch_id") != epoch_id
+        or freeze.get("state") != "partitions_paused"
+        or freeze.get("restart_required") is not False
+        or not isinstance(freeze.get("freeze_token"), str)
+        or not str(freeze.get("freeze_token") or "").strip()
+    ):
+        raise ActivationGateError("rca_activation_gate_consumer_freeze_invalid")
+    try:
+        positions = capsules._normalize_fence(
+            freeze.get("partition_positions"),
+            "rca_activation_gate_consumer_freeze_invalid",
+        )
+    except capsules.CapsuleError as exc:
+        raise ActivationGateError(exc.code) from exc
+    if positions != partition_end_fence:
+        raise ActivationGateError("rca_activation_gate_consumer_freeze_position_changed")
+    _fresh(
+        freeze.get("observed_at"),
+        now=now,
+        max_age_seconds=capsules.LIVE_HEALTH_MAX_AGE_SECONDS,
+        code="rca_activation_gate_consumer_freeze_stale",
+    )
+    stable = dict(freeze)
+    stable.pop("observed_at", None)
+    return {
+        "schema_version": "pnc_rca_activation_ingress_freeze_binding_v1",
+        "epoch_id": epoch_id,
+        "health_path": str(consumer_health_path),
+        "paused_at": str(freeze["paused_at"]),
+        "freeze_receipt_sha256": capsules._sha256_json(stable),
+        "freeze_token_sha256": hashlib.sha256(
+            str(freeze["freeze_token"]).encode("utf-8")
+        ).hexdigest(),
+        "consumer_runtime_identity_sha256": capsules._sha256_json(identity),
+        "partition_positions_sha256": capsules._sha256_json(partition_end_fence),
+        "restart_required": False,
+    }
+
+
+def _production_runtime_continuity(
+    *,
+    config: Mapping[str, Any],
+    gateway: Mapping[str, Any],
+    consumer_health: Mapping[str, Any],
+    now: datetime,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, bytes]]:
+    service_configs = {
+        "local.pnc.rca-kafka-consumer": config["consumer"],
+        "local.pnc.rca-outbox-dispatcher": config["outbox_dispatcher"],
+        "local.pnc.rca-delivery-collector": config["delivery_collector"],
+        "local.pnc.rca-delivery-dispatcher": config["delivery_dispatcher"],
+    }
+    health_specs = {
+        "kafka_consumer_health": (
+            "local.pnc.rca-kafka-consumer",
+            capsules.CONSUMER_HEALTH_SCHEMA_VERSION,
+            "heartbeat_at",
+            consumer_health,
+            b"",
+        ),
+        "outbox_dispatcher_health": (
+            "local.pnc.rca-outbox-dispatcher",
+            "pnc_rca_outbox_dispatcher_health_v2",
+            "heartbeat_at",
+            None,
+            b"",
+        ),
+        "delivery_collector_health": (
+            "local.pnc.rca-delivery-collector",
+            "pnc_rca_delivery_collector_health_v2",
+            "updated_at",
+            None,
+            b"",
+        ),
+        "delivery_dispatcher_health": (
+            "local.pnc.rca-delivery-dispatcher",
+            "pnc_rca_delivery_dispatcher_health_v2",
+            "updated_at",
+            None,
+            b"",
+        ),
+    }
+    residents: dict[str, Any] = {}
+    health_raw: dict[str, bytes] = {}
+    for artifact, (label, schema, timestamp, supplied, _unused) in health_specs.items():
+        service_config = service_configs[label]
+        health_path = Path(str(service_config["health_path"])).expanduser().absolute()
+        if supplied is None:
+            raw, health = _read_production_health(
+                health_path,
+                schema_version=schema,
+                timestamp_field=timestamp,
+                now=now,
+            )
+        else:
+            raw = b""
+            health = supplied
+            if health.get("healthy") is not True:
+                raise ActivationGateError("rca_activation_gate_resident_unhealthy")
+        if health.get("config") != service_config:
+            raise ActivationGateError("rca_activation_gate_resident_health_config_changed")
+        identity = health.get("runtime_identity")
+        if not isinstance(identity, Mapping):
+            raise ActivationGateError("rca_activation_gate_resident_runtime_invalid")
+        if not runtime_identity_is_valid(
+            identity,
+            service_label=label,
+            public_config=service_config,
+        ):
+            raise ActivationGateError("rca_activation_gate_resident_runtime_invalid")
+        resident = {
+            "pid": identity.get("pid"),
+            "process_create_time": identity.get("process_create_time"),
+            "executable": str(identity.get("executable") or ""),
+            "cwd": str(identity.get("cwd") or ""),
+            "runtime_identity_sha256": capsules._sha256_json(identity),
+            "loaded_runtime_sha256": str(identity.get("loaded_runtime_sha256") or ""),
+        }
+        residents[artifact] = resident
+        health_raw[artifact] = raw
+
+    gateway_identity = gateway.get("runtime_identity")
+    if not isinstance(gateway_identity, Mapping):
+        raise ActivationGateError("rca_activation_gate_gateway_runtime_invalid")
+    plist = Path.home() / "Library" / "LaunchAgents" / "ai.hermes.gateway.plist"
+    try:
+        launchctl_sha = file_sha256(plist)
+    except OSError as exc:
+        raise ActivationGateError("rca_activation_gate_gateway_config_unavailable") from exc
+    gateway_verification = {
+        "runtime_identity_sha256": str(gateway["runtime_identity_sha256"]),
+        "loaded_runtime_sha256": str(gateway_identity["loaded_runtime_sha256"]),
+        "launchctl_config_sha256": launchctl_sha,
+        "pid": gateway["pid"],
+        "process_create_time": gateway["process_create_time"],
+    }
+    continuity = {
+        "gateway": dict(gateway),
+        "gateway_verification": gateway_verification,
+        "residents": residents,
+        "residents_sha256": capsules._sha256_json(residents),
+    }
+    try:
+        capsules._recheck_live_gateway_binding(gateway)
+        capsules._recheck_live_resident_projection(
+            continuity,
+            consumer_health=consumer_health,
+            consumer_health_path=str(service_configs["local.pnc.rca-kafka-consumer"]["health_path"]),
+            service_configs=service_configs,
+            now=now,
+        )
+    except capsules.CapsuleError as exc:
+        raise ActivationGateError(exc.code) from exc
+    return continuity, service_configs, health_raw
 
 
 def _database_identity(
@@ -841,12 +1058,18 @@ def produce_release_gate(
     receipt_path: Path,
     evidence_dir: Path,
     preauthorization_capsule_path: Path | None = None,
+    preproduction_capsule_path: Path | None = None,
     vm_observation_path: Path | None = None,
     now: datetime | None = None,
     broker_collector: Callable[..., Mapping[str, Any]] = collect_broker_t0,
     gateway_collector: Callable[..., Mapping[str, Any]] = collect_gateway_binding,
 ) -> dict[str, Any]:
-    if mode not in {"preauthorization", "preproduction"}:
+    if mode not in {
+        "preauthorization",
+        "preproduction",
+        "production_bootstrap",
+        "production",
+    }:
         raise ActivationGateError("rca_activation_gate_mode_invalid")
     if _EPOCH_RE.fullmatch(epoch_id) is None:
         raise ActivationGateError("rca_activation_gate_epoch_id_invalid")
@@ -873,7 +1096,7 @@ def produce_release_gate(
     if env["HERMES_HOME"] != live_env["HERMES_HOME"]:
         raise ActivationGateError("rca_activation_gate_hermes_home_mismatch")
     config = _public_config(env, authority)
-    safe_config = _validate_safe_config(config, env, authority)
+    safe_config = _validate_safe_config(config, env, authority, mode=mode)
     config_sha = capsules._sha256_json(config)
     control_db_path = Path(safe_config["control_db_path"]).expanduser().absolute()
     schema_raw, schema_receipt, schema_verified = _validate_schema_receipt(
@@ -903,7 +1126,7 @@ def produce_release_gate(
             raise ActivationGateError(
                 "rca_activation_gate_preauthorization_canary_plan_forbidden"
             )
-    else:
+    elif mode == "preproduction":
         if canary_plan_path is None:
             raise ActivationGateError("rca_activation_gate_canary_plan_required")
         canary_raw, canary_plan = _validate_canary_plan(canary_plan_path)
@@ -951,6 +1174,7 @@ def produce_release_gate(
         raise ActivationGateError(exc.code) from exc
 
     preauthorization_capsule: str | None = None
+    preproduction_capsule: str | None = None
     if mode == "preauthorization":
         fence = _partition_fence(broker)
         migration_sha = hashlib.sha256(migration_raw).hexdigest()
@@ -973,7 +1197,7 @@ def produce_release_gate(
             "materialization_receipt_raw_sha256": hashlib.sha256(b"").hexdigest(),
             "broker_t0_observation_sha256": broker_raw_sha,
         }
-    else:
+    elif mode == "preproduction":
         if preauthorization_capsule_path is None:
             raise ActivationGateError(
                 "rca_activation_gate_preauthorization_capsule_required"
@@ -1008,6 +1232,58 @@ def produce_release_gate(
             raise ActivationGateError(
                 "rca_activation_gate_preauthorization_input_drift"
             )
+    else:
+        if preproduction_capsule_path is None:
+            raise ActivationGateError(
+                "rca_activation_gate_preproduction_capsule_required"
+            )
+        try:
+            current_epoch = RcaControlStore(
+                control_db_path, require_current=True
+            ).activation_epoch()
+            if current_epoch is None:
+                raise capsules.CapsuleError(
+                    "activation_capsule_live_release_binding_invalid"
+                )
+            preproduction = capsules.read_preproduction_capsule(
+                preproduction_capsule_path,
+                control_db_path=control_db_path,
+                current_activation=current_epoch,
+                allowed_current_states=frozenset({"bounded_active"}),
+            )
+            prior_path = Path(
+                json.loads(
+                    Path(preproduction_capsule_path).read_text(encoding="utf-8")
+                )["preauthorization_capsule"]["path"]
+            )
+            prior_bundle = capsules._read_preauthorization_bundle(
+                prior_path, control_db_path=control_db_path
+            )
+        except (OSError, KeyError, TypeError, json.JSONDecodeError, capsules.CapsuleError) as exc:
+            code = exc.code if isinstance(exc, capsules.CapsuleError) else "rca_activation_gate_preproduction_capsule_invalid"
+            raise ActivationGateError(code) from exc
+        activation_input = {
+            key: prior_bundle["normalized"][key]
+            for key in _PREAUTHORIZATION_INPUT_FIELDS
+        }
+        preproduction_capsule = str(Path(preproduction_capsule_path).absolute())
+        current_fence = _partition_fence(broker)
+        start_fence = activation_input["partition_start_fence"]
+        if set(current_fence) != set(start_fence) or any(
+            set(current_fence[topic]) != set(start_fence[topic])
+            or any(
+                current_fence[topic][partition] < start_fence[topic][partition]
+                for partition in start_fence[topic]
+            )
+            for topic in start_fence
+        ):
+            raise ActivationGateError("rca_activation_gate_broker_fence_regressed")
+        if (
+            activation_input["config_sha256"] != config_sha
+            or activation_input["migration_receipt_raw_sha256"]
+            != hashlib.sha256(migration_raw).hexdigest()
+        ):
+            raise ActivationGateError("rca_activation_gate_preproduction_input_drift")
 
     activation = _activation_observation(
         control_db_path,
@@ -1031,6 +1307,123 @@ def produce_release_gate(
             max_age_seconds=max_age,
         )
 
+    production_detail: dict[str, Any] = {}
+    production_evidence: dict[str, bytes] = {}
+    if mode in {"production_bootstrap", "production"}:
+        if canary_plan_path is not None:
+            raise ActivationGateError(
+                "rca_activation_gate_production_canary_plan_forbidden"
+            )
+        consumer_config = config.get("consumer")
+        if not isinstance(consumer_config, Mapping):
+            raise ActivationGateError("rca_activation_gate_config_invalid")
+        consumer_health_path = _absolute(
+            Path(str(consumer_config.get("health_path") or "")),
+            "rca_activation_gate_consumer_health_path_invalid",
+        )
+        consumer_raw, consumer_health = _read_production_health(
+            consumer_health_path,
+            schema_version=capsules.CONSUMER_HEALTH_SCHEMA_VERSION,
+            timestamp_field="heartbeat_at",
+            now=current,
+        )
+        if consumer_health.get("config") != consumer_config:
+            raise ActivationGateError(
+                "rca_activation_gate_resident_health_config_changed"
+            )
+        broker_fence = _partition_fence(broker)
+        freeze_value = consumer_health.get("activation_freeze")
+        if not isinstance(freeze_value, Mapping):
+            raise ActivationGateError("rca_activation_gate_consumer_freeze_invalid")
+        try:
+            end_fence = capsules._normalize_fence(
+                freeze_value.get("partition_positions"),
+                "rca_activation_gate_consumer_freeze_invalid",
+            )
+        except capsules.CapsuleError as exc:
+            raise ActivationGateError(exc.code) from exc
+        if set(broker_fence) != set(end_fence) or any(
+            set(broker_fence[topic]) != set(end_fence[topic])
+            or any(
+                broker_fence[topic][partition] < end_fence[topic][partition]
+                for partition in end_fence[topic]
+            )
+            for topic in end_fence
+        ):
+            raise ActivationGateError("rca_activation_gate_broker_fence_regressed")
+        freeze = _production_freeze_binding(
+            consumer_health=consumer_health,
+            consumer_health_path=consumer_health_path,
+            epoch_id=epoch_id,
+            partition_end_fence=end_fence,
+            now=current,
+        )
+        try:
+            capsules._recheck_live_consumer_freeze(
+                freeze,
+                epoch_id=epoch_id,
+                partition_end_fence=end_fence,
+                now=current,
+            )
+        except capsules.CapsuleError as exc:
+            raise ActivationGateError(exc.code) from exc
+        try:
+            store = RcaControlStore(control_db_path, require_current=True)
+            release_binding = store.activation_release_binding_sha256(
+                epoch_id=epoch_id,
+                partition_end_fence=end_fence,
+            )
+        except Exception as exc:
+            raise ActivationGateError(
+                "rca_activation_gate_release_binding_invalid"
+            ) from exc
+        try:
+            continuity, service_configs, resident_raw = _production_runtime_continuity(
+                config=config,
+                gateway=gateway,
+                consumer_health=consumer_health,
+                now=current,
+            )
+        except ActivationGateError:
+            raise
+        production_detail = {
+            "freeze": freeze,
+            "continuity": continuity,
+            "service_configs": service_configs,
+            "release_binding_sha256": release_binding,
+            "confirm_input": {
+                "epoch_id": epoch_id,
+                "expected_state": "bounded_active",
+                "target_state": "confirmed",
+                "config_sha256": activation_input["config_sha256"],
+                "db_logical_identity_sha256": activation_input[
+                    "db_logical_identity_sha256"
+                ],
+                "partition_start_fence_sha256": activation_input[
+                    "partition_start_fence_sha256"
+                ],
+                "release_binding_sha256": release_binding,
+                "partition_end_fence": end_fence,
+                "partition_end_fence_sha256": capsules._sha256_json(end_fence),
+                "production_fingerprint_source": "release_gate_report.fingerprint",
+                "production_gate_receipt_sha256_source": (
+                    "sha256(exact_written_release_gate_receipt)"
+                ),
+                "restart_between_gate_and_confirm": False,
+            },
+        }
+        production_detail["confirm_input_sha256"] = capsules._sha256_json(
+            production_detail["confirm_input"]
+        )
+        production_evidence = {
+            "consumer_health": consumer_raw,
+            **{
+                f"{name}_health": raw
+                for name, raw in resident_raw.items()
+                if raw
+            },
+        }
+
     contract: dict[str, Any] = {
         "schema_version": CONTRACT_SCHEMA_VERSION,
         "release_id": authority["release_id"],
@@ -1052,6 +1445,14 @@ def produce_release_gate(
     }
     if mode == "preproduction":
         contract["canary_plan_raw_sha256"] = hashlib.sha256(canary_raw).hexdigest()
+    if mode in {"production_bootstrap", "production"}:
+        if not preproduction_capsule:
+            raise ActivationGateError(
+                "rca_activation_gate_preproduction_capsule_required"
+            )
+        contract["preproduction_capsule_raw_sha256"] = hashlib.sha256(
+            Path(preproduction_capsule).read_bytes()
+        ).hexdigest()
     material: dict[str, Any] = {
         "schema_version": (
             capsules.PREAUTHORIZATION_MATERIAL_SCHEMA_VERSION
@@ -1113,8 +1514,27 @@ def produce_release_gate(
         }),
         _check("vm_release", vm_detail),
         _check("activation_epoch", activation),
-        _check("activation_capsule_material", material),
     ]
+    if mode in {"preauthorization", "preproduction"}:
+        checks.append(_check("activation_capsule_material", material))
+    else:
+        checks.extend([
+            _check("activation_writer_barrier", {
+                "state": "bounded_active",
+                "production_confirmation_required": True,
+                "transition_performed": False,
+                "release_binding_sha256": production_detail[
+                    "release_binding_sha256"
+                ],
+                "confirm_input": production_detail["confirm_input"],
+                "confirm_input_sha256": production_detail["confirm_input_sha256"],
+                "ingress_freeze_binding": production_detail["freeze"],
+            }),
+            _check("activation_runtime_continuity", production_detail["continuity"]),
+            _check("runtime_dependencies", {
+                "service_configs": production_detail["service_configs"],
+            }),
+        ])
     evidence_sha256 = {
         "authority": hashlib.sha256(authority_raw).hexdigest(),
         "candidate_env": hashlib.sha256(env_raw).hexdigest(),
@@ -1127,8 +1547,14 @@ def produce_release_gate(
     }
     if mode == "preproduction":
         evidence_sha256["canary_plan"] = hashlib.sha256(canary_raw).hexdigest()
+    if preproduction_capsule:
+        evidence_sha256["preproduction_capsule"] = hashlib.sha256(
+            Path(preproduction_capsule).read_bytes()
+        ).hexdigest()
     if vm_raw:
         evidence_sha256["vm_observation"] = hashlib.sha256(vm_raw).hexdigest()
+    for name, raw in production_evidence.items():
+        evidence_sha256[name] = hashlib.sha256(raw).hexdigest()
     report = {
         "schema_version": capsules.RELEASE_GATE_SCHEMA_VERSION,
         "evaluated_at": current.isoformat(),
@@ -1254,7 +1680,16 @@ class _SafeParser(argparse.ArgumentParser):
 
 def _arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = _SafeParser(description=__doc__)
-    parser.add_argument("--mode", choices=("preauthorization", "preproduction"), required=True)
+    parser.add_argument(
+        "--mode",
+        choices=(
+            "preauthorization",
+            "preproduction",
+            "production_bootstrap",
+            "production",
+        ),
+        required=True,
+    )
     parser.add_argument("--epoch-id", required=True)
     parser.add_argument("--env-file", type=Path, required=True)
     parser.add_argument("--live-env-file", type=Path, required=True)
@@ -1268,6 +1703,7 @@ def _arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--receipt", type=Path, required=True)
     parser.add_argument("--evidence-dir", type=Path, required=True)
     parser.add_argument("--preauthorization-capsule", type=Path)
+    parser.add_argument("--preproduction-capsule", type=Path)
     parser.add_argument("--vm-observation", type=Path)
     return parser.parse_args(argv)
 
@@ -1292,6 +1728,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             receipt_path=args.receipt,
             evidence_dir=args.evidence_dir,
             preauthorization_capsule_path=args.preauthorization_capsule,
+            preproduction_capsule_path=args.preproduction_capsule,
             vm_observation_path=args.vm_observation,
         )
         print(json.dumps(result, ensure_ascii=True, sort_keys=True))

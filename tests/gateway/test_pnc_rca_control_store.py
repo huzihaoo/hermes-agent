@@ -917,18 +917,18 @@ def test_activation_state_machine_requires_exact_receipts_and_is_audited(
         if row["activation_epoch_id"] == "rca-release-20260712"
     }
 
-    for index in range(2):
-        claim = store.claim_outbox(
-            lease_owner=f"activation-canary-{index}",
-            activation_required=True,
-        )
-        assert claim is not None
-        completed = store.complete_outbox(
-            outbox_id=claim.outbox_id,
-            lease_token=claim.lease_token,
-            result={"outcome": "canary_evidence_recorded"},
-        )
-        assert completed.status == "completed"
+    claim = store.claim_outbox(
+        lease_owner="activation-success-canary",
+        activation_required=True,
+    )
+    assert claim is not None and claim.submission_key == success.submission_key
+    completed = store.complete_outbox(
+        outbox_id=claim.outbox_id,
+        lease_token=claim.lease_token,
+        result={"outcome": "canary_evidence_recorded"},
+    )
+    assert completed.status == "completed"
+    _terminalize_permanent(store, terminal.submission_key)
     assert store.claim_outbox(
         lease_owner="activation-canary-empty", activation_required=True
     ) is None
@@ -1310,17 +1310,28 @@ def test_confirmed_reconciles_only_exact_fenced_shadow_before_steady(tmp_path):
             active_policy=_policy(),
             activation_required=True,
         )
-    for index in range(2):
-        claim = store.claim_outbox(
-            lease_owner=f"confirmed-canary-{index}",
-            activation_required=True,
-        )
-        assert claim is not None
-        store.complete_outbox(
-            outbox_id=claim.outbox_id,
-            lease_token=claim.lease_token,
-            result={"outcome": "confirmed_canary_recorded"},
-        )
+    claim = store.claim_outbox(
+        lease_owner="confirmed-success-canary",
+        activation_required=True,
+    )
+    assert claim is not None
+    success_submission_key = next(
+        row["submission_key"]
+        for row in store.list_rows("rca_activation_admission_ledger")
+        if row["slot_kind"] == "manual_success"
+    )
+    terminal_submission_key = next(
+        row["submission_key"]
+        for row in store.list_rows("rca_activation_admission_ledger")
+        if row["slot_kind"] == "manual_terminal_failure"
+    )
+    assert claim.submission_key == success_submission_key
+    store.complete_outbox(
+        outbox_id=claim.outbox_id,
+        lease_token=claim.lease_token,
+        result={"outcome": "confirmed_canary_recorded"},
+    )
+    _terminalize_permanent(store, terminal_submission_key)
     late = store.ingest_record(
         _record(offset=21, value=_value(work_item_id=7041712817)),
         policy=_policy(),
@@ -2581,10 +2592,15 @@ def _quarantine_for_input_wait(
 def _settle_delivery(store: RcaControlStore, submission_key: str) -> None:
     delivery = RcaDeliveryStore(store.db_path)
     delivery.materialize_pending_subscriptions()
+    settled_at = datetime.now(timezone.utc).isoformat()
     conn = delivery._connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        conn.execute("UPDATE rca_delivery_effects SET status='succeeded'")
+        conn.execute(
+            "UPDATE rca_delivery_effects SET status='succeeded', "
+            "completed_at=COALESCE(completed_at, ?), updated_at=?",
+            (settled_at, settled_at),
+        )
         job = conn.execute(
             "SELECT delivery_id FROM rca_delivery_jobs WHERE submission_key=?",
             (submission_key,),
@@ -2624,7 +2640,7 @@ def _terminalize_permanent(store: RcaControlStore, submission_key: str) -> None:
     finally:
         conn.close()
     delivery = RcaDeliveryStore(store.db_path)
-    assert delivery.backfill_completed_submissions() == 1
+    assert delivery.backfill_completed_submissions() >= 1
     _settle_delivery(store, submission_key)
 
 

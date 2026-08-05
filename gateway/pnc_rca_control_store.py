@@ -5378,11 +5378,137 @@ class RcaControlStore:
                 "generation": int(ledger["generation"]),
                 "source_id": str(value["source_id"]),
                 "subscription_key": str(value["subscription_key"]),
+                "issue_url": issue_url,
                 **observed_source,
             }
         finally:
             if conn.in_transaction:
                 conn.rollback()
+
+    def manual_external_write_admission_for_effect(
+        self,
+        *,
+        business_key: str,
+        submission_key: str,
+        generation: int,
+        delivery_id: str,
+        effect_kind: str,
+        target_key: str,
+    ) -> dict[str, Any] | None:
+        """Build the exact manual admission envelope for one materialized effect.
+
+        Manual executions intentionally do not carry a W3 snapshot.  The
+        source row, trigger binding, and delivery subscription are still an
+        immutable, activation-bound authority chain; expose only that chain to
+        the provider-fence builder so the physical sender can reopen it.
+        """
+        if (
+            not all(
+                isinstance(value, str) and value.strip()
+                for value in (business_key, submission_key, delivery_id, effect_kind, target_key)
+            )
+            or isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+        ):
+            raise RecordConflictError("manual_external_write_effect_binding_invalid")
+        conn = self._connect()
+        try:
+            source_row = conn.execute(
+                """
+                SELECT source.source_kind, source.platform
+                  FROM business_triggers AS trigger
+                  JOIN rca_trigger_sources AS source
+                    ON source.source_id = trigger.origin_source_id
+                 WHERE trigger.business_key = ?
+                   AND trigger.submission_key = ?
+                   AND trigger.generation = ?
+                """,
+                (business_key, submission_key, generation),
+            ).fetchone()
+            if source_row is None or (
+                str(source_row["source_kind"] or "") != "feishu_group_manual"
+                or str(source_row["platform"] or "") != "feishu"
+            ):
+                return None
+            row = conn.execute(
+                """
+                SELECT source.source_id, source.source_kind, source.platform,
+                       source.chat_id, source.thread_id, source.message_id,
+                       source.requester_id, source.mode, source.outcome,
+                       trigger.state, trigger.normalized_json,
+                       subscription.subscription_key,
+                       subscription.effect_kind, subscription.target_key,
+                       subscription.delivery_id
+                  FROM business_triggers AS trigger
+                  JOIN rca_trigger_sources AS source
+                    ON source.source_id = trigger.origin_source_id
+                  JOIN rca_delivery_subscriptions AS subscription
+                    ON subscription.business_key = trigger.business_key
+                   AND subscription.generation = trigger.generation
+                 WHERE trigger.business_key = ?
+                   AND trigger.submission_key = ?
+                   AND trigger.generation = ?
+                   AND subscription.delivery_id = ?
+                   AND subscription.effect_kind = ?
+                   AND subscription.target_key = ?
+                   AND source.source_kind = 'feishu_group_manual'
+                   AND source.platform = 'feishu'
+                 ORDER BY subscription.subscription_key
+                """,
+                (
+                    business_key,
+                    submission_key,
+                    generation,
+                    delivery_id,
+                    effect_kind,
+                    target_key,
+                ),
+            ).fetchone()
+            if row is None:
+                raise RecordConflictError(
+                    "manual_external_write_effect_binding_missing"
+                )
+            try:
+                context = json.loads(str(row["normalized_json"] or ""))
+                issue_url = str(context["issue_url"] or "").strip().rstrip("/")
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RecordConflictError(
+                    "manual_external_write_trigger_context_invalid"
+                ) from exc
+            source_identity = {
+                "chat_id": str(row["chat_id"] or ""),
+                "thread_id": str(row["thread_id"] or ""),
+                "message_id": str(row["message_id"] or ""),
+                "requester_id": str(row["requester_id"] or ""),
+                "issue_url": issue_url,
+                "mode": str(row["mode"] or ""),
+            }
+            admission = {
+                "schema_version": MANUAL_ADMISSION_RESULT_SCHEMA_VERSION,
+                "outcome": str(row["outcome"] or ""),
+                "business_key": business_key,
+                "submission_key": submission_key,
+                "generation": generation,
+                "source_id": str(row["source_id"] or ""),
+                "subscription_key": str(row["subscription_key"] or ""),
+                "state": str(row["state"] or ""),
+                "reason": "dispatcher_manual_effect_binding",
+            }
+            if (
+                str(row["effect_kind"] or "") != effect_kind
+                or str(row["delivery_id"] or "") != delivery_id
+                or not all(str(value).strip() for value in source_identity.values())
+                or not all(str(value).strip() for value in admission.values() if not isinstance(value, int))
+            ):
+                raise RecordConflictError(
+                    "manual_external_write_effect_binding_invalid"
+                )
+            return {
+                "admission": admission,
+                "source_identity": source_identity,
+            }
+        finally:
             conn.close()
 
     def validate_external_write_fence_binding(
@@ -5979,6 +6105,151 @@ class RcaControlStore:
             )
         return total
 
+    @staticmethod
+    def _activation_terminal_execution_complete_tx(
+        conn: sqlite3.Connection,
+        *,
+        business_key: str,
+        submission_key: str,
+        generation: int,
+    ) -> bool:
+        """Require the terminal canary's durable delivery, not just its quarantine.
+
+        A terminal canary is allowed to end at the submission boundary.  Its
+        outbox row is then quarantined, while the execution watch and terminal
+        delivery still have to settle through both required Feishu effects.
+        Keeping this predicate in the control store makes ingress readiness and
+        the release-binding validator use the same fail-closed contract.
+        """
+        required_tables = {
+            "rca_execution_watch",
+            "rca_delivery_jobs",
+            "rca_delivery_effects",
+        }
+        present = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        if not required_tables.issubset(present):
+            return False
+        watch = conn.execute(
+            """
+            SELECT w.state, w.task_id, w.terminal_at, w.delivery_id,
+                   w.last_error_code, j.status AS job_status,
+                   j.delivery_id AS job_delivery_id, j.outcome AS job_outcome,
+                   j.terminal_state,
+                   j.terminal_error_code
+              FROM rca_execution_watch AS w
+              LEFT JOIN rca_delivery_jobs AS j
+                ON j.delivery_id = w.delivery_id
+             WHERE w.submission_key = ?
+               AND w.business_key = ?
+               AND w.generation = ?
+            """,
+            (submission_key, business_key, generation),
+        ).fetchone()
+        if watch is None or (
+            str(watch["state"] or "") != "delivery_created"
+            or watch["task_id"] is not None
+            or not str(watch["terminal_at"] or "")
+            or not str(watch["last_error_code"] or "")
+            or not str(watch["delivery_id"] or "")
+            or str(watch["job_status"] or "") != "delivered"
+            or str(watch["job_outcome"] or "") not in {"terminal_failed", "quarantined"}
+            or not str(watch["terminal_state"] or "")
+            or not str(watch["terminal_error_code"] or "")
+            or str(watch["delivery_id"] or "")
+            != str(watch["job_delivery_id"] or "")
+        ):
+            return False
+        effects = conn.execute(
+            """
+            SELECT s.effect_kind, s.required, s.status AS subscription_status,
+                   s.delivery_id AS subscription_delivery_id,
+                   s.effect_key AS subscription_effect_key,
+                   e.status AS effect_status, e.outcome AS effect_outcome,
+                   e.completed_at
+              FROM rca_delivery_subscriptions AS s
+              LEFT JOIN rca_delivery_effects AS e
+                ON e.effect_key = s.effect_key
+             WHERE s.business_key = ?
+               AND s.generation = ?
+               AND s.required = 1
+            ORDER BY s.effect_kind
+            """,
+            (business_key, generation),
+        ).fetchall()
+        if len(effects) != 2 or {
+            str(row["effect_kind"] or "") for row in effects
+        } != {"feishu_issue_comment", "feishu_thread_reply"}:
+            return False
+        delivery_id = str(watch["delivery_id"])
+        return all(
+            int(row["required"] or 0) == 1
+            and str(row["subscription_status"] or "") == "materialized"
+            and str(row["subscription_delivery_id"] or "") == delivery_id
+            and str(row["subscription_effect_key"] or "")
+            and str(row["effect_status"] or "") == "succeeded"
+            and str(row["effect_outcome"] or "") == str(watch["job_outcome"])
+            and bool(str(row["completed_at"] or ""))
+            for row in effects
+        )
+
+    @classmethod
+    def _activation_completed_bound_slot_count_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        epoch_id: str,
+    ) -> int:
+        bound_slots = conn.execute(
+            f"""
+            SELECT s.slot_kind, al.business_key, al.submission_key,
+                   al.generation, o.status AS outbox_status
+              FROM rca_activation_budget_slots AS s
+              JOIN rca_activation_admission_ledger AS al
+                ON al.epoch_id = s.epoch_id
+               AND al.ledger_id = s.consumed_ledger_id
+               AND al.slot_kind = s.slot_kind
+               AND al.source_identity_sha256 = s.authorized_identity_sha256
+               AND al.decision = 'admit'
+               AND al.bound_at IS NOT NULL
+              JOIN business_triggers AS t
+                ON t.activation_epoch_id = al.epoch_id
+               AND t.activation_ledger_id = al.ledger_id
+               AND t.business_key = al.business_key
+               AND t.submission_key = al.submission_key
+               AND t.generation = al.generation
+              JOIN rca_outbox AS o
+                ON o.activation_epoch_id = al.epoch_id
+               AND o.activation_ledger_id = al.ledger_id
+               AND o.business_key = al.business_key
+               AND o.submission_key = al.submission_key
+               AND o.generation = al.generation
+             WHERE s.epoch_id = ?
+               AND s.slot_kind IN ({_ACTIVATION_RELEASE_SLOT_SQL})
+            """,
+            (epoch_id,),
+        ).fetchall()
+        completed = 0
+        for slot in bound_slots:
+            slot_kind = str(slot["slot_kind"] or "")
+            is_complete = (
+                cls._activation_terminal_execution_complete_tx(
+                    conn,
+                    business_key=str(slot["business_key"] or ""),
+                    submission_key=str(slot["submission_key"] or ""),
+                    generation=int(slot["generation"] or 0),
+                )
+                if slot_kind == "manual_terminal_failure"
+                else str(slot["outbox_status"] or "") == "completed"
+            )
+            if is_complete:
+                completed += 1
+        return completed
+
     @classmethod
     def _validate_consumed_activation_executions_tx(
         cls,
@@ -6041,7 +6312,19 @@ class RcaControlStore:
                 or int(row["trigger_ledger_id"] or 0) != ledger_id
                 or str(row["outbox_epoch_id"] or "") != epoch_id
                 or int(row["outbox_ledger_id"] or 0) != ledger_id
-                or str(row["outbox_status"] or "") != "completed"
+                or (
+                    str(row["slot_kind"] or "") == "manual_terminal_failure"
+                    and not cls._activation_terminal_execution_complete_tx(
+                        conn,
+                        business_key=str(row["business_key"] or ""),
+                        submission_key=str(row["submission_key"] or ""),
+                        generation=int(row["generation"] or 0),
+                    )
+                )
+                or (
+                    str(row["slot_kind"] or "") != "manual_terminal_failure"
+                    and str(row["outbox_status"] or "") != "completed"
+                )
             ):
                 raise ActivationEpochError("activation_bounded_execution_unbound")
         start_fence = json.loads(str(epoch["partition_start_fence_json"]))
@@ -15782,37 +16065,11 @@ class RcaControlStore:
                         (epoch_id,),
                     ).fetchone()[0]
                 )
-                completed_bound_slot_count = int(
-                    conn.execute(
-                        f"""
-                        SELECT COUNT(*)
-                          FROM rca_activation_budget_slots AS s
-                          JOIN rca_activation_admission_ledger AS al
-                            ON al.epoch_id = s.epoch_id
-                           AND al.ledger_id = s.consumed_ledger_id
-                           AND al.slot_kind = s.slot_kind
-                           AND al.source_identity_sha256 =
-                               s.authorized_identity_sha256
-                           AND al.decision = 'admit'
-                           AND al.bound_at IS NOT NULL
-                          JOIN business_triggers AS t
-                            ON t.activation_epoch_id = al.epoch_id
-                           AND t.activation_ledger_id = al.ledger_id
-                           AND t.business_key = al.business_key
-                           AND t.submission_key = al.submission_key
-                           AND t.generation = al.generation
-                          JOIN rca_outbox AS o
-                            ON o.activation_epoch_id = al.epoch_id
-                           AND o.activation_ledger_id = al.ledger_id
-                           AND o.business_key = al.business_key
-                           AND o.submission_key = al.submission_key
-                           AND o.generation = al.generation
-                           AND o.status = 'completed'
-                         WHERE s.epoch_id = ?
-                           AND s.slot_kind IN ({_ACTIVATION_RELEASE_SLOT_SQL})
-                        """,
-                        (epoch_id,),
-                    ).fetchone()[0]
+                completed_bound_slot_count = (
+                    self._activation_completed_bound_slot_count_tx(
+                        conn,
+                        epoch_id=epoch_id,
+                    )
                 )
                 pending_inbox = int(
                     conn.execute(
@@ -16037,37 +16294,11 @@ class RcaControlStore:
                     activation_ledger[str(ledger_row["decision"])] = int(
                         ledger_row["count"]
                     )
-                bounded_canaries_completed_count = int(
-                    conn.execute(
-                        f"""
-                        SELECT COUNT(*)
-                          FROM rca_activation_budget_slots AS s
-                          JOIN rca_activation_admission_ledger AS al
-                            ON al.epoch_id = s.epoch_id
-                           AND al.ledger_id = s.consumed_ledger_id
-                           AND al.slot_kind = s.slot_kind
-                           AND al.source_identity_sha256 =
-                               s.authorized_identity_sha256
-                           AND al.decision = 'admit'
-                           AND al.bound_at IS NOT NULL
-                          JOIN business_triggers AS t
-                            ON t.activation_epoch_id = al.epoch_id
-                           AND t.activation_ledger_id = al.ledger_id
-                           AND t.business_key = al.business_key
-                           AND t.submission_key = al.submission_key
-                           AND t.generation = al.generation
-                          JOIN rca_outbox AS o
-                            ON o.activation_epoch_id = al.epoch_id
-                           AND o.activation_ledger_id = al.ledger_id
-                           AND o.business_key = al.business_key
-                           AND o.submission_key = al.submission_key
-                           AND o.generation = al.generation
-                           AND o.status = 'completed'
-                         WHERE s.epoch_id = ?
-                           AND s.slot_kind IN ({_ACTIVATION_RELEASE_SLOT_SQL})
-                        """,
-                        (epoch_id,),
-                    ).fetchone()[0]
+                bounded_canaries_completed_count = (
+                    self._activation_completed_bound_slot_count_tx(
+                        conn,
+                        epoch_id=epoch_id,
+                    )
                 )
                 activation_backlog["current_admitted"] = int(
                     conn.execute(

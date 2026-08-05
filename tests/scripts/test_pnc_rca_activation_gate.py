@@ -759,6 +759,41 @@ def test_unsafe_external_write_config_is_rejected(producer_case: dict[str, Any])
         )
 
 
+def test_safe_config_profile_is_bound_to_gate_mode(producer_case: dict[str, Any]) -> None:
+    baseline_sha = producer_case["authority"]["quarantine_baseline"]["baseline_sha256"]
+    config = _config(producer_case["db"], producer_case["authority"], baseline_sha)
+    authority = producer_case["authority"]
+
+    inert = gate._validate_safe_config(
+        config,
+        {"HERMES_OUTBOUND_MODE": "record-only"},
+        authority,
+        mode="preproduction",
+    )
+    assert inert["delivery_dispatcher_enabled"] is False
+    assert inert["external_writes"] is False
+
+    live_config = json.loads(json.dumps(config))
+    live_config["delivery_dispatcher"]["enabled"] = True
+    live_config["delivery_dispatcher"]["external_writes"] = True
+    live = gate._validate_safe_config(
+        live_config,
+        {"HERMES_OUTBOUND_MODE": "live"},
+        authority,
+        mode="production_bootstrap",
+    )
+    assert live["delivery_dispatcher_enabled"] is True
+    assert live["external_writes"] is True
+
+    with pytest.raises(gate.ActivationGateError, match="rca_activation_gate_unsafe_config"):
+        gate._validate_safe_config(
+            live_config,
+            {"HERMES_OUTBOUND_MODE": "live"},
+            authority,
+            mode="preproduction",
+        )
+
+
 def test_unapproved_authority_is_rejected(producer_case: dict[str, Any]) -> None:
     authority = dict(producer_case["authority"])
     authority["status"] = "candidate_only"

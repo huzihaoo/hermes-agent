@@ -1302,10 +1302,10 @@ def _normalize_canary_slot_plan(value: Any) -> dict[str, dict[str, Any]]:
             or not isinstance(generation, int)
             or generation < 1
             or expected_outcome
-            != (
-                "terminal_failed"
+            not in (
+                {"terminal_failed", "quarantined"}
                 if slot_kind == "manual_terminal_failure"
-                else "success"
+                else {"success"}
             )
         ):
             raise CapsuleError("activation_capsule_canary_plan_invalid")

@@ -612,19 +612,68 @@ def _prepare_bounded_canaries(
             )
         )
     assert all(result.submission_key for result in manual_results)
-    for index in range(2):
-        claim = store.claim_outbox(
-            lease_owner=f"capsule-canary-{index}", activation_required=True
-        )
-        assert claim is not None
-        store.complete_outbox(
-            outbox_id=claim.outbox_id,
-            lease_token=claim.lease_token,
-            result={"outcome": "canary_evidence_recorded"},
-        )
+    success_claim = store.claim_outbox(
+        lease_owner="capsule-success-canary", activation_required=True
+    )
+    assert success_claim is not None
+    assert success_claim.submission_key == manual_results[0].submission_key
+    store.complete_outbox(
+        outbox_id=success_claim.outbox_id,
+        lease_token=success_claim.lease_token,
+        result={"outcome": "canary_evidence_recorded"},
+    )
+    _terminalize_permanent(store, manual_results[1].submission_key)
     current = store.activation_epoch()
     assert current is not None and current["state"] == "bounded_active"
     return current
+
+
+def _settle_delivery(store: RcaControlStore, submission_key: str) -> None:
+    delivery = RcaDeliveryStore(store.db_path)
+    delivery.materialize_pending_subscriptions()
+    settled_at = datetime.now(timezone.utc).isoformat()
+    conn = delivery._connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "UPDATE rca_delivery_effects SET status='succeeded', "
+            "completed_at=COALESCE(completed_at, ?), updated_at=?",
+            (settled_at, settled_at),
+        )
+        job = conn.execute(
+            "SELECT delivery_id FROM rca_delivery_jobs WHERE submission_key=?",
+            (submission_key,),
+        ).fetchone()
+        assert job is not None
+        delivery._aggregate_job_status(
+            conn, str(job["delivery_id"]), settled_at
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _terminalize_permanent(store: RcaControlStore, submission_key: str) -> None:
+    current = datetime.now(timezone.utc).isoformat()
+    conn = store._connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "UPDATE rca_outbox SET status='quarantined', quarantined_at=?, "
+            "last_error_code='permanent_failure' WHERE submission_key=?",
+            (current, submission_key),
+        )
+        conn.execute(
+            "UPDATE business_triggers SET state='quarantined' "
+            "WHERE submission_key=?",
+            (submission_key,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    delivery = RcaDeliveryStore(store.db_path)
+    assert delivery.backfill_completed_submissions() >= 1
+    _settle_delivery(store, submission_key)
 
 
 def _confirmation_receipt(
