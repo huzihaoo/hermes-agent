@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import copy
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -9,8 +10,15 @@ from types import SimpleNamespace
 
 import pytest
 
+import gateway.pnc_rca_control_store as control_store_module
+import gateway.pnc_rca_prod_bootstrap as bootstrap_module
 from gateway.pnc_rca_prod_bootstrap import RcaBootstrapAuthorizationError
 from gateway.pnc_rca_control_store import RcaControlStore
+from gateway.pnc_rca_control_store import (
+    EXACT_OUTBOX_HOLD_MIN_REMAINING_SECONDS,
+    _exact_outbox_hold_fingerprint,
+    _exact_outbox_hold_plan_id,
+)
 from gateway.pnc_rca_runtime_identity import RCA_RUNTIME_RELATIVE_FILES
 from gateway.pnc_rca_runtime_identity import canonical_json_sha256
 from scripts import pnc_rca_outbox_dispatcher as dispatcher
@@ -280,29 +288,110 @@ def _exact_hold_fixture(tmp_path):
 
 def _patch_exact_hold_cli(monkeypatch, config):
     _patch_reset_cli(monkeypatch, config)
+    runtime = dispatcher._exact_outbox_runtime_provenance()
+    active_payload = {
+        "release_id": RELEASE_ID,
+        "authority_sha256": "b" * 64,
+        "authority_epoch_id": "authority-test",
+        "bootstrap_epoch_id": EPOCH_ID,
+        "release_bom_sha256": runtime["release_bom_sha256"],
+    }
+    config.active_release_binding_path.write_text(
+        json.dumps(active_payload, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    config.active_release_binding_path.chmod(0o600)
+    config.live_env_path.write_text("HERMES_TEST=true\n", encoding="utf-8")
+    config.live_env_path.chmod(0o600)
+    active_raw_sha = dispatcher._bound_exact_hold_source_sha256(
+        config.active_release_binding_path
+    )
+    live_env_sha = dispatcher._bound_exact_hold_source_sha256(config.live_env_path)
+    tool_root = (
+        Path.home()
+        / ".hermes"
+        / "runtime"
+        / "releases"
+        / "hermes-v0.18.2-r15j-host-e75dbebae-git"
+    )
+    entrypoint = tool_root / "scripts" / "pnc_rca_outbox_dispatcher.py"
+    control_path = tool_root / "gateway" / "pnc_rca_control_store.py"
+    bootstrap_path = tool_root / "gateway" / "pnc_rca_prod_bootstrap.py"
+    monkeypatch.setattr(control_store_module, "__file__", str(control_path))
+    head = dispatcher.subprocess.run(
+        ["git", "-C", str(tool_root), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    tree = dispatcher.subprocess.run(
+        ["git", "-C", str(tool_root), "rev-parse", "HEAD^{tree}"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    tool_provenance = {
+        "entrypoint_path": str(entrypoint),
+        "entrypoint_sha256": dispatcher._bound_exact_hold_source_sha256(entrypoint),
+        "control_store_path": str(control_path),
+        "control_store_sha256": dispatcher._bound_exact_hold_source_sha256(control_path),
+        "bootstrap_path": str(bootstrap_path),
+        "bootstrap_sha256": dispatcher._bound_exact_hold_source_sha256(bootstrap_path),
+        "git_head": head,
+        "git_tree": tree,
+        "git_status_returncode": 0,
+        "git_clean": True,
+        "runtime_provenance": runtime,
+    }
+    census = dispatcher._exact_outbox_resident_census(config)
     monkeypatch.setattr(
         dispatcher,
         "_exact_outbox_hold_active_release_binding",
         lambda _config: {
             "path": str(config.active_release_binding_path),
-            "sha256": "a" * 64,
+            "sha256": active_raw_sha,
             "release_id": RELEASE_ID,
             "authority_sha256": "b" * 64,
             "authority_epoch_id": "authority-test",
             "bootstrap_epoch_id": EPOCH_ID,
+            "release_bom_sha256": runtime["release_bom_sha256"],
+            "candidate_env_sha256": "c" * 64,
+            "authorization_fingerprint": "d" * 64,
+            "authorization_receipt_sha256": "e" * 64,
+            "approval_evidence_sha256": "f" * 64,
+            "runtime_manifest_sha256": runtime["manifest"]["sha256"],
+            "runtime_release_target": runtime["manifest_runtime_release_target"],
+            "runtime_git_head": runtime["runtime_git_head"],
+            "runtime_git_tree": runtime["runtime_git_tree"],
+            "raw_sha256": active_raw_sha,
+            "live_env_path": str(config.live_env_path),
+            "live_env_sha256": live_env_sha,
+        },
+    )
+    monkeypatch.setattr(
+        bootstrap_module,
+        "load_active_release_binding",
+        lambda **_kwargs: {
+            "binding_receipt_sha256": active_raw_sha,
+            "release_id": RELEASE_ID,
+            "authority_sha256": "b" * 64,
+            "authority_epoch_id": "authority-test",
+            "bootstrap_epoch_id": EPOCH_ID,
+            "release_bom_sha256": runtime["release_bom_sha256"],
+            "candidate_env_sha256": "c" * 64,
+            "authorization_fingerprint": "d" * 64,
+            "authorization_receipt_sha256": "e" * 64,
+            "approval_evidence_sha256": "f" * 64,
         },
     )
     monkeypatch.setattr(
         dispatcher,
         "_exact_outbox_hold_tool_provenance",
-        lambda: {
-            "entrypoint_path": "/candidate/scripts/pnc_rca_outbox_dispatcher.py",
-            "entrypoint_sha256": "c" * 64,
-            "control_store_path": "/candidate/gateway/pnc_rca_control_store.py",
-            "control_store_sha256": "d" * 64,
-            "bootstrap_path": "/candidate/gateway/pnc_rca_prod_bootstrap.py",
-            "bootstrap_sha256": "e" * 64,
-        },
+        lambda: dict(tool_provenance),
+    )
+    monkeypatch.setattr(
+        dispatcher,
+        "_exact_outbox_resident_census",
+        lambda _config: dict(census),
     )
 
 
@@ -312,7 +401,9 @@ def _exact_hold_plan(tmp_path, monkeypatch, capsys):
     env["HERMES_RCA_OUTBOX_ACTIVATION_REQUIRED"] = "true"
     config = dispatcher.DispatcherConfig.from_env(env, hermes_home=tmp_path)
     _patch_exact_hold_cli(monkeypatch, config)
-    receipt = tmp_path / "hold.json"
+    receipt_dir = tmp_path / "receipt-dir"
+    receipt_dir.mkdir()
+    receipt = receipt_dir / "hold.json"
     args = [
         "--hold-exact-outbox-id",
         "685",
@@ -329,6 +420,36 @@ def _exact_hold_plan(tmp_path, monkeypatch, capsys):
     output = json.loads(capsys.readouterr().out)
     assert output["mode"] == "plan"
     return store, config, receipt, args, output
+
+
+def _resign_exact_hold(audit):
+    audit["config_binding_sha256"] = dispatcher._exact_hold_json_sha256(
+        audit["config_binding"]
+    )
+    audit["tool_provenance_sha256"] = dispatcher._exact_hold_json_sha256(
+        audit["tool_provenance"]
+    )
+    audit["plan_id"] = _exact_outbox_hold_plan_id(audit)
+    audit["hold_id"] = control_store_module._exact_canonical_sha256(
+        {
+            "plan_id": audit["plan_id"],
+            "recorded_at": audit["recorded_at"],
+            "target_after_sha256": audit["target_after"]["row_sha256"],
+        }
+    )
+    audit["receipt_fingerprint"] = _exact_outbox_hold_fingerprint(audit)
+    return audit
+
+
+def _rows_and_meta(store):
+    conn = store._connect()
+    try:
+        return (
+            store.list_rows("rca_outbox"),
+            [dict(row) for row in conn.execute("SELECT key, value FROM control_meta")],
+        )
+    finally:
+        conn.close()
 
 
 def test_exact_outbox_hold_plan_is_read_only_and_privacy_light(
@@ -531,6 +652,238 @@ def test_exact_outbox_hold_recovery_is_read_only(
     assert envelope["audit"]["hold_id"] == applied["hold_id"]
     assert envelope["materialized_destination"]["path"] == str(recovered)
     assert store.list_rows("rca_outbox") == before
+
+
+def test_exact_outbox_hold_public_api_rejects_resigned_config_forge_without_mutation(
+    tmp_path, monkeypatch, capsys
+):
+    store, _config, _receipt, _args, output = _exact_hold_plan(
+        tmp_path, monkeypatch, capsys
+    )
+    audit = copy.deepcopy(output["plan"])
+    audit["max_age_seconds"] = 999_999
+    audit["config_binding"]["max_age_seconds"] = 999_999
+    # Keep the horizon internally coherent so rejection comes from the live
+    # configuration boundary rather than a malformed receipt.
+    anchor = datetime.fromisoformat(audit["retry_horizon"]["anchor"])
+    expires = anchor + timedelta(seconds=999_999)
+    audit["retry_horizon"]["expires_at"] = expires.isoformat()
+    audit["retry_horizon"]["plan_remaining_seconds"] = int(
+        (expires - datetime.fromisoformat(audit["recorded_at"])).total_seconds()
+    )
+    _resign_exact_hold(audit)
+    before = _rows_and_meta(store)
+    with pytest.raises(RuntimeError, match="exact_outbox_hold_config_changed"):
+        store.hold_exact_outbox_with_audit(audit=audit)
+    assert _rows_and_meta(store) == before
+
+
+def test_exact_outbox_hold_public_api_rejects_alternate_tool_clone_without_mutation(
+    tmp_path, monkeypatch, capsys
+):
+    store, _config, _receipt, _args, output = _exact_hold_plan(
+        tmp_path, monkeypatch, capsys
+    )
+    audit = copy.deepcopy(output["plan"])
+    alternate = tmp_path / "alternate-tool"
+    (alternate / "scripts").mkdir(parents=True)
+    (alternate / "gateway").mkdir()
+    bindings = {
+        "entrypoint": alternate / "scripts" / "pnc_rca_outbox_dispatcher.py",
+        "control_store": alternate / "gateway" / "pnc_rca_control_store.py",
+        "bootstrap": alternate / "gateway" / "pnc_rca_prod_bootstrap.py",
+    }
+    for index, path in enumerate(bindings.values()):
+        path.write_text(f"# alternate {index}\n", encoding="utf-8")
+        path.chmod(0o600)
+    for name, path in bindings.items():
+        audit["tool_provenance"][f"{name}_path"] = str(path)
+        audit["tool_provenance"][f"{name}_sha256"] = hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+    _resign_exact_hold(audit)
+    before = _rows_and_meta(store)
+    with pytest.raises(RuntimeError, match="exact_outbox_hold_tool_provenance_invalid"):
+        store.hold_exact_outbox_with_audit(audit=audit)
+    assert _rows_and_meta(store) == before
+
+
+def test_exact_outbox_hold_public_api_rejects_resigned_release_forge_without_mutation(
+    tmp_path, monkeypatch, capsys
+):
+    store, _config, _receipt, _args, output = _exact_hold_plan(
+        tmp_path, monkeypatch, capsys
+    )
+    audit = copy.deepcopy(output["plan"])
+    audit["active_release_binding"]["release_id"] = "rca-v0182-forged-release"
+    _resign_exact_hold(audit)
+    before = _rows_and_meta(store)
+    with pytest.raises(
+        RuntimeError,
+        match="exact_outbox_hold_(?:config|active_binding)_changed",
+    ):
+        store.hold_exact_outbox_with_audit(audit=audit)
+    assert _rows_and_meta(store) == before
+
+
+def test_exact_outbox_hold_public_api_rejects_activation_db_binding_corruption(
+    tmp_path, monkeypatch, capsys
+):
+    store, _config, _receipt, _args, output = _exact_hold_plan(
+        tmp_path, monkeypatch, capsys
+    )
+    conn = store._connect()
+    try:
+        conn.execute(
+            "UPDATE rca_activation_epochs SET db_logical_identity_sha256 = ? "
+            "WHERE is_current = 1",
+            ("1" * 64,),
+        )
+    finally:
+        conn.close()
+    before = _rows_and_meta(store)
+    with pytest.raises(
+        RuntimeError,
+        match="exact_outbox_hold_(?:control_db_provenance_changed|activation_db_binding_invalid)",
+    ):
+        store.hold_exact_outbox_with_audit(audit=output["plan"])
+    assert _rows_and_meta(store) == before
+
+
+def test_exact_outbox_hold_public_api_recensuses_loaded_writer_without_mutation(
+    tmp_path, monkeypatch, capsys
+):
+    store, _config, _receipt, _args, output = _exact_hold_plan(
+        tmp_path, monkeypatch, capsys
+    )
+    real_run = control_store_module.subprocess.run
+
+    def loaded_after_plan(command, *args, **kwargs):
+        if (
+            command[:2] == ["launchctl", "print"]
+            and command[2].endswith("/local.pnc.rca-outbox-dispatcher")
+        ):
+            return control_store_module.subprocess.CompletedProcess(
+                command, 0, stdout="loaded\n", stderr=""
+            )
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(control_store_module.subprocess, "run", loaded_after_plan)
+    before = _rows_and_meta(store)
+    with pytest.raises(RuntimeError, match="exact_outbox_hold_forbidden_resident_loaded"):
+        store.hold_exact_outbox_with_audit(audit=output["plan"])
+    assert _rows_and_meta(store) == before
+
+
+def test_exact_outbox_hold_public_api_rejects_destination_parent_forge_without_mutation(
+    tmp_path, monkeypatch, capsys
+):
+    store, _config, _receipt, _args, output = _exact_hold_plan(
+        tmp_path, monkeypatch, capsys
+    )
+    audit = copy.deepcopy(output["plan"])
+    audit["destination_binding"]["parent_inode"] += 1
+    _resign_exact_hold(audit)
+    before = _rows_and_meta(store)
+    with pytest.raises(RuntimeError, match="exact_outbox_hold_destination_parent_changed"):
+        store.hold_exact_outbox_with_audit(audit=audit)
+    assert _rows_and_meta(store) == before
+
+
+def test_exact_outbox_hold_public_api_rejects_nan_without_mutation(
+    tmp_path, monkeypatch, capsys
+):
+    store, _config, _receipt, _args, output = _exact_hold_plan(
+        tmp_path, monkeypatch, capsys
+    )
+    audit = copy.deepcopy(output["plan"])
+    audit["tool_provenance"]["forged_nan"] = float("nan")
+    before = _rows_and_meta(store)
+    with pytest.raises(ValueError, match="JSON compliant|exact_outbox_hold"):
+        store.hold_exact_outbox_with_audit(audit=audit)
+    assert _rows_and_meta(store) == before
+
+
+def test_exact_outbox_hold_public_api_rejects_stale_recorded_at_without_mutation(
+    tmp_path, monkeypatch, capsys
+):
+    store, _config, _receipt, _args, output = _exact_hold_plan(
+        tmp_path, monkeypatch, capsys
+    )
+    audit = copy.deepcopy(output["plan"])
+    stale = datetime.now(timezone.utc) - timedelta(
+        seconds=dispatcher.EXACT_OUTBOX_HOLD_RECORD_MAX_AGE_SECONDS + 1
+    )
+    audit["recorded_at"] = stale.isoformat()
+    with pytest.raises(RuntimeError, match="exact_outbox_hold_recorded_at_stale"):
+        RcaControlStore._exact_hold_freshness(audit, datetime.now(timezone.utc))
+    before = _rows_and_meta(store)
+    with pytest.raises((ValueError, RuntimeError), match="exact_outbox_hold"):
+        store.hold_exact_outbox_with_audit(audit=audit)
+    assert _rows_and_meta(store) == before
+
+
+def test_exact_outbox_hold_public_api_rejects_expiry_margin_without_mutation(
+    tmp_path, monkeypatch, capsys
+):
+    store, _config, _receipt, _args, output = _exact_hold_plan(
+        tmp_path, monkeypatch, capsys
+    )
+    audit = copy.deepcopy(output["plan"])
+    expires = datetime.fromisoformat(audit["retry_horizon"]["expires_at"])
+    fake_now = expires - timedelta(
+        seconds=EXACT_OUTBOX_HOLD_MIN_REMAINING_SECONDS - 0.001
+    )
+    audit["recorded_at"] = (fake_now - timedelta(microseconds=100)).isoformat()
+    fresh_audit = copy.deepcopy(audit)
+    fresh_audit["recorded_at"] = (fake_now - timedelta(seconds=1)).isoformat()
+    with pytest.raises(RuntimeError, match="exact_outbox_hold_retry_horizon_headroom_insufficient"):
+        RcaControlStore._exact_hold_freshness(
+            fresh_audit,
+            fake_now,
+        )
+    real_utc = control_store_module._utc_datetime
+    monkeypatch.setattr(
+        control_store_module,
+        "_utc_datetime",
+        lambda value=None: fake_now if value is None else real_utc(value),
+    )
+    before = _rows_and_meta(store)
+    with pytest.raises((ValueError, RuntimeError), match="exact_outbox_hold"):
+        store.hold_exact_outbox_with_audit(audit=audit)
+    assert _rows_and_meta(store) == before
+
+
+def test_exact_outbox_hold_recovery_survives_removed_or_swapped_receipt_parent(
+    tmp_path, monkeypatch, capsys
+):
+    store, _config, receipt, args, output = _exact_hold_plan(
+        tmp_path, monkeypatch, capsys
+    )
+    apply_args = [*args, "--apply"]
+    for key, value in output["expected_apply"].items():
+        apply_args.extend(["--" + key.replace("_", "-"), value])
+    assert dispatcher.main(apply_args) == 0
+    applied = json.loads(capsys.readouterr().out)
+    original_parent = receipt.parent
+    moved_parent = tmp_path / "receipt-dir-moved"
+    original_parent.rename(moved_parent)
+    original_parent.mkdir()
+    assert store.exact_outbox_hold_audit(applied["hold_id"]) is not None
+    recovered = original_parent / "recovered.json"
+    assert dispatcher.main(
+        [
+            "--materialize-exact-outbox-hold",
+            applied["hold_id"],
+            "--phase",
+            "hold",
+            "--receipt",
+            str(recovered),
+        ]
+    ) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["recovered"] is True
+    assert recovered.exists()
 
 
 def test_clear_circuit_plan_does_not_mutate_or_create_receipt(

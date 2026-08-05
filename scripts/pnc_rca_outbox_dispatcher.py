@@ -38,6 +38,9 @@ from gateway.pnc_rca_admission import (
 from gateway.pnc_rca_control_store import (
     ACTIVATION_HISTORICAL_OUTBOX_ROW_FIELDS,
     EXACT_OUTBOX_HOLD_META_PREFIX,
+    EXACT_OUTBOX_HOLD_MIN_REMAINING_SECONDS,
+    EXACT_OUTBOX_HOLD_RECORD_MAX_AGE_SECONDS,
+    EXACT_OUTBOX_RUNTIME_PLIST_LABELS,
     EXACT_OUTBOX_HOLD_SCHEMA_VERSION,
     EXACT_OUTBOX_HOLD_UNTIL,
     OutboxClaim,
@@ -478,6 +481,17 @@ _CIRCUIT_RESET_MAX_REASON_BYTES = 1000
 EXACT_OUTBOX_HOLD_RECOVERY_SCHEMA_VERSION = (
     "pnc_rca_exact_outbox_hold_recovery_v1"
 )
+EXACT_OUTBOX_RESIDENT_CENSUS_SCHEMA_VERSION = (
+    "pnc_rca_exact_outbox_resident_census_v1"
+)
+EXACT_OUTBOX_FORBIDDEN_RESIDENT_LABELS = (
+    "local.pnc.rca-kafka-consumer",
+    "local.pnc.rca-outbox-dispatcher",
+    "local.pnc.rca-delivery-collector",
+    "local.pnc.rca-delivery-dispatcher",
+    "local.pnc.completion-notice-relay",
+    "local.pnc.feishu-delivery-repair",
+)
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -796,6 +810,17 @@ def _exact_hold_destination_binding(path: Path) -> dict[str, Any]:
     }
 
 
+def _exact_hold_json_sha256(value: Any) -> str:
+    raw = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
 def _bound_exact_hold_source_sha256(path: Path) -> str:
     lexical = path.expanduser().absolute()
     lexical_stat = lexical.lstat()
@@ -845,6 +870,162 @@ def _bound_exact_hold_source_sha256(path: Path) -> str:
         os.close(descriptor)
 
 
+def _bound_exact_hold_source_bytes(path: Path) -> tuple[str, bytes, os.stat_result]:
+    """Read and hash one stable, non-symlink file through the same fd."""
+    lexical = path.expanduser().absolute()
+    lexical_stat = lexical.lstat()
+    if stat.S_ISLNK(lexical_stat.st_mode):
+        raise ValueError("exact_outbox_hold_tool_provenance_invalid")
+    descriptor = os.open(
+        lexical,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != os.getuid()
+            or stat.S_IMODE(before.st_mode) & 0o022
+            or before.st_dev != lexical_stat.st_dev
+            or before.st_ino != lexical_stat.st_ino
+        ):
+            raise ValueError("exact_outbox_hold_tool_provenance_invalid")
+        chunks: list[bytes] = []
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise ValueError("exact_outbox_hold_tool_provenance_changed")
+        return digest.hexdigest(), b"".join(chunks), before
+    finally:
+        os.close(descriptor)
+
+
+def _exact_runtime_file_binding(path: Path, *, label: str | None = None) -> dict[str, Any]:
+    lexical = path.expanduser().absolute()
+    digest, _raw, observed = _bound_exact_hold_source_bytes(lexical)
+    return {
+        "present": True,
+        **({"label": label} if label is not None else {}),
+        "path": str(lexical),
+        "sha256": digest,
+        "mode": int(stat.S_IMODE(observed.st_mode)),
+        "uid": int(observed.st_uid),
+        "nlink": int(observed.st_nlink),
+    }
+
+
+def _exact_outbox_runtime_provenance() -> dict[str, Any]:
+    """Bind the active runtime manifest and canonical resident source files."""
+    manifest_path = Path(
+        os.environ.get(
+            "HERMES_RCA_OUTBOX_RUNTIME_MANIFEST_PATH",
+            str(Path.home() / ".hermes" / "runtime" / "LIVE_MANIFEST.json"),
+        )
+    )
+    manifest_digest, manifest_raw, manifest_stat = _bound_exact_hold_source_bytes(
+        manifest_path
+    )
+    manifest_binding = {
+        "present": True,
+        "path": str(manifest_path.expanduser().absolute()),
+        "sha256": manifest_digest,
+        "mode": int(stat.S_IMODE(manifest_stat.st_mode)),
+        "uid": int(manifest_stat.st_uid),
+        "nlink": int(manifest_stat.st_nlink),
+    }
+    try:
+        manifest = json.loads(
+            manifest_raw.decode("utf-8"),
+            parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
+        )
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("exact_outbox_hold_runtime_manifest_invalid") from exc
+    if not isinstance(manifest, Mapping):
+        raise ValueError("exact_outbox_hold_runtime_manifest_invalid")
+    runtime_root = Path(str(manifest.get("runtime_root") or "")).expanduser()
+    if (
+        not runtime_root.is_absolute()
+        or runtime_root != runtime_root.absolute()
+        or runtime_root != runtime_root.resolve(strict=True)
+    ):
+        raise ValueError("exact_outbox_hold_runtime_manifest_invalid")
+    registry = runtime_root / "gateway" / "assets" / "pnc_stable_target_registry_v1.json"
+    runtime_git_head_result = subprocess.run(
+        ["git", "-C", str(runtime_root), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=5,
+    )
+    runtime_git_tree_result = subprocess.run(
+        ["git", "-C", str(runtime_root), "rev-parse", "HEAD^{tree}"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=5,
+    )
+    runtime_git_head = runtime_git_head_result.stdout.strip()
+    runtime_git_tree = runtime_git_tree_result.stdout.strip()
+    if (
+        runtime_git_head_result.returncode != 0
+        or runtime_git_tree_result.returncode != 0
+        or not re.fullmatch(r"[0-9a-f]{40}", runtime_git_head)
+        or not re.fullmatch(r"[0-9a-f]{40}", runtime_git_tree)
+    ):
+        raise ValueError("exact_outbox_hold_runtime_git_invalid")
+    plist_dir = Path.home() / "Library" / "LaunchAgents"
+    plists: list[dict[str, Any]] = []
+    for label in EXACT_OUTBOX_RUNTIME_PLIST_LABELS:
+        path = plist_dir / f"{label}.plist"
+        plists.append(_exact_runtime_file_binding(path, label=label))
+    return {
+        "schema_version": "pnc_rca_exact_outbox_runtime_provenance_v1",
+        "manifest": manifest_binding,
+        "manifest_runtime_root": str(runtime_root.absolute()),
+        "manifest_runtime_release_target": str(
+            manifest.get("runtime_release_target") or ""
+        ),
+        "manifest_gateway_release_target": str(
+            manifest.get("gateway_release_target") or ""
+        ),
+        "manifest_commit": str(
+            (manifest.get("gateway_release_binding") or {}).get("commit") or ""
+        ),
+        "manifest_tree": str(
+            (manifest.get("gateway_release_binding") or {}).get("tree") or ""
+        ),
+        "runtime_git_head": runtime_git_head,
+        "runtime_git_tree": runtime_git_tree,
+        "release_bom_sha256": str(
+            (manifest.get("gateway_release_binding") or {}).get(
+                "capacity_admission", {}
+            ).get("release_bom_sha256")
+            or ""
+        ),
+        "plists": plists,
+        "stable_target_registry": _exact_runtime_file_binding(registry),
+    }
+
+
 def _exact_outbox_hold_tool_provenance() -> dict[str, Any]:
     entrypoint = Path(__file__).resolve(strict=True)
     control_path = (REPO_ROOT / "gateway" / "pnc_rca_control_store.py").resolve(
@@ -853,6 +1034,38 @@ def _exact_outbox_hold_tool_provenance() -> dict[str, Any]:
     bootstrap_path = (REPO_ROOT / "gateway" / "pnc_rca_prod_bootstrap.py").resolve(
         strict=True
     )
+    git_head_result = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=5,
+    )
+    git_tree_result = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD^{tree}"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=5,
+    )
+    git_status = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "status", "--porcelain", "--untracked-files=all"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=5,
+    )
+    git_head = git_head_result.stdout.strip()
+    git_tree = git_tree_result.stdout.strip()
+    if (
+        git_head_result.returncode != 0
+        or git_tree_result.returncode != 0
+        or re.fullmatch(r"[0-9a-f]{40}", git_head) is None
+        or re.fullmatch(r"[0-9a-f]{40}", git_tree) is None
+        or git_status.returncode != 0
+        or bool(git_status.stdout.strip())
+    ):
+        raise ValueError("exact_outbox_hold_git_provenance_invalid")
     return {
         "entrypoint_path": str(entrypoint),
         "entrypoint_sha256": _bound_exact_hold_source_sha256(entrypoint),
@@ -860,7 +1073,71 @@ def _exact_outbox_hold_tool_provenance() -> dict[str, Any]:
         "control_store_sha256": _bound_exact_hold_source_sha256(control_path),
         "bootstrap_path": str(bootstrap_path),
         "bootstrap_sha256": _bound_exact_hold_source_sha256(bootstrap_path),
+        "git_head": git_head,
+        "git_tree": git_tree,
+        "git_status_returncode": int(git_status.returncode),
+        "git_clean": git_status.returncode == 0 and not git_status.stdout.strip(),
+        "runtime_provenance": _exact_outbox_runtime_provenance(),
     }
+
+
+def _exact_outbox_resident_census(config: "DispatcherConfig") -> dict[str, Any]:
+    """Read-only launchd census; never unloads or signals a resident."""
+    observations: list[dict[str, Any]] = []
+    uid = str(os.getuid())
+    for label in EXACT_OUTBOX_FORBIDDEN_RESIDENT_LABELS:
+        try:
+            result = subprocess.run(
+                ["launchctl", "print", f"gui/{uid}/{label}"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=3,
+            )
+            combined = (result.stdout or "") + (result.stderr or "")
+            raw = combined.encode("utf-8")
+            loaded = result.returncode == 0
+            unloaded_proven = bool(
+                result.returncode == 113
+                and re.fullmatch(
+                    rf"Bad request\.\nCould not find service \"{re.escape(label)}\" in domain for user gui: {re.escape(uid)}\n?",
+                    combined,
+                )
+            )
+            if not loaded and not unloaded_proven:
+                raise RuntimeError("exact_outbox_hold_resident_census_unavailable")
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError("exact_outbox_hold_resident_census_unavailable") from exc
+        observations.append(
+            {
+                "label": label,
+                "loaded": loaded,
+                "returncode": int(result.returncode),
+                "unloaded_proven": unloaded_proven,
+                "output_sha256": hashlib.sha256(raw).hexdigest(),
+            }
+        )
+    loaded = [item["label"] for item in observations if item["loaded"]]
+    census: dict[str, Any] = {
+        "schema_version": EXACT_OUTBOX_RESIDENT_CENSUS_SCHEMA_VERSION,
+        "observed_at": _utc_now().isoformat(),
+        "forbidden_labels": list(EXACT_OUTBOX_FORBIDDEN_RESIDENT_LABELS),
+        "observations": observations,
+        "loaded_labels": loaded,
+        "loaded_count": len(loaded),
+        "all_unloaded": not loaded,
+        "source_kind": "launchctl_read_only_print",
+        "domain": f"gui/{uid}",
+        "active_release_binding_path": str(config.active_release_binding_path),
+    }
+    census["source_sha256"] = _exact_hold_json_sha256(
+        {key: value for key, value in census.items() if key != "source_sha256"}
+    )
+    if not census["all_unloaded"]:
+        raise RuntimeError(
+            "exact_outbox_hold_forbidden_resident_loaded:" + ",".join(loaded)
+        )
+    return census
 
 
 def _exact_outbox_hold_active_release_binding(
@@ -872,6 +1149,15 @@ def _exact_outbox_hold_active_release_binding(
         expected_release_id=config.release_id,
         expected_epoch_id=config.bootstrap_epoch_id,
     )
+    runtime = _exact_outbox_runtime_provenance()
+    release_bom_sha256 = str(binding.get("release_bom_sha256") or "")
+    if release_bom_sha256 != runtime.get("release_bom_sha256"):
+        raise RuntimeError("exact_outbox_hold_runtime_release_bom_changed")
+    if (
+        runtime.get("runtime_git_head") != runtime.get("manifest_commit")
+        or runtime.get("runtime_git_tree") != runtime.get("manifest_tree")
+    ):
+        raise RuntimeError("exact_outbox_hold_runtime_git_changed")
     return {
         "path": str(config.active_release_binding_path.expanduser().absolute()),
         "sha256": str(binding["binding_receipt_sha256"]),
@@ -879,11 +1165,27 @@ def _exact_outbox_hold_active_release_binding(
         "authority_sha256": str(binding["authority_sha256"]),
         "authority_epoch_id": str(binding["authority_epoch_id"]),
         "bootstrap_epoch_id": str(binding["bootstrap_epoch_id"]),
+        "release_bom_sha256": release_bom_sha256,
+        "candidate_env_sha256": str(binding["candidate_env_sha256"]),
+        "authorization_fingerprint": str(binding["authorization_fingerprint"]),
+        "authorization_receipt_sha256": str(
+            binding["authorization_receipt_sha256"]
+        ),
+        "approval_evidence_sha256": str(binding["approval_evidence_sha256"]),
+        "runtime_manifest_sha256": runtime["manifest"]["sha256"],
+        "runtime_release_target": runtime["manifest_runtime_release_target"],
+        "runtime_git_head": runtime["runtime_git_head"],
+        "runtime_git_tree": runtime["runtime_git_tree"],
+        "raw_sha256": _bound_exact_hold_source_sha256(
+            config.active_release_binding_path
+        ),
+        "live_env_path": str(config.live_env_path.expanduser().absolute()),
+        "live_env_sha256": _bound_exact_hold_source_sha256(config.live_env_path),
     }
 
 
 def _exact_outbox_hold_config_binding(config: "DispatcherConfig") -> str:
-    return canonical_json_sha256(config.public_dict())
+    return _exact_hold_json_sha256(config.public_dict())
 
 
 def _public_exact_hold_row(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -891,7 +1193,7 @@ def _public_exact_hold_row(value: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _exact_hold_row_sha256(projection: Mapping[str, Any]) -> str:
-    return canonical_json_sha256(
+    return _exact_hold_json_sha256(
         {field: projection[field] for field in ACTIVATION_HISTORICAL_OUTBOX_ROW_FIELDS}
     )
 
@@ -907,6 +1209,7 @@ def _build_exact_outbox_hold_receipt(
     control_db_identity: Mapping[str, Any],
     active_release_binding: Mapping[str, Any],
     tool_provenance: Mapping[str, Any],
+    resident_census: Mapping[str, Any],
 ) -> dict[str, Any]:
     target_raw = snapshot["target"]
     predecessor_raw = snapshot["predecessor"]
@@ -939,11 +1242,32 @@ def _build_exact_outbox_hold_receipt(
     }
     destination_binding = _exact_hold_destination_binding(receipt_path)
     config_binding_sha256 = _exact_outbox_hold_config_binding(config)
-    tool_provenance_sha256 = canonical_json_sha256(dict(tool_provenance))
+    tool_provenance_sha256 = _exact_hold_json_sha256(dict(tool_provenance))
+    raw_retry_horizon = dict(snapshot["retry_horizon"])
+    try:
+        expires_at = datetime.fromisoformat(
+            str(raw_retry_horizon["expires_at"]).replace("Z", "+00:00")
+        )
+        recorded_datetime = datetime.fromisoformat(
+            str(recorded_at).replace("Z", "+00:00")
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("exact_outbox_hold_retry_horizon_invalid") from exc
+    plan_remaining_seconds = int(
+        (expires_at.astimezone(timezone.utc) - recorded_datetime.astimezone(timezone.utc)).total_seconds()
+    )
+    if plan_remaining_seconds < EXACT_OUTBOX_HOLD_MIN_REMAINING_SECONDS:
+        raise ValueError("exact_outbox_hold_retry_horizon_headroom_insufficient")
     retry_horizon = {
-        key: item
-        for key, item in dict(snapshot["retry_horizon"]).items()
-        if key not in {"remaining_seconds", "cutoff_at"}
+        "target_outbox_id": int(raw_retry_horizon["target_outbox_id"]),
+        "anchor": str(raw_retry_horizon["anchor"]),
+        "expires_at": str(raw_retry_horizon["expires_at"]),
+        "min_remaining_seconds": EXACT_OUTBOX_HOLD_MIN_REMAINING_SECONDS,
+        "safety_headroom_seconds": EXACT_OUTBOX_HOLD_MIN_REMAINING_SECONDS,
+        "record_max_age_seconds": EXACT_OUTBOX_HOLD_RECORD_MAX_AGE_SECONDS,
+        "plan_remaining_seconds": plan_remaining_seconds,
+        "apply_observed_at": None,
+        "apply_remaining_seconds": None,
     }
     plan_logical_db_identity = dict(control_db_identity["logical_db_identity"])
     plan_wal = dict(plan_logical_db_identity.get("wal") or {})
@@ -954,7 +1278,8 @@ def _build_exact_outbox_hold_receipt(
         "path": control_db_identity["path"],
         "logical_db_identity": plan_logical_db_identity,
     }
-    plan_id = canonical_json_sha256(
+    config_binding = config.public_dict()
+    plan_id = _exact_hold_json_sha256(
         {
             "command": "hold-exact-outbox",
             "operator": operator,
@@ -971,11 +1296,29 @@ def _build_exact_outbox_hold_receipt(
             "target_row_sha256": target_before["row_sha256"],
             "predecessor_row_sha256": predecessor["row_sha256"],
             "eligible_queue_sha256": queue_before["sha256"],
-            "retry_horizon": retry_horizon,
+            "retry_horizon": {
+                key: retry_horizon[key]
+                for key in (
+                    "target_outbox_id",
+                    "anchor",
+                    "expires_at",
+                    "min_remaining_seconds",
+                    "safety_headroom_seconds",
+                    "record_max_age_seconds",
+                )
+            },
+            "destination_path": str(receipt_path.expanduser().absolute()),
             "destination_binding": destination_binding,
+            "resident_census_policy": {
+                "schema_version": resident_census["schema_version"],
+                "source_kind": resident_census["source_kind"],
+                "domain": resident_census["domain"],
+                "forbidden_labels": resident_census["forbidden_labels"],
+                "all_unloaded": resident_census["all_unloaded"],
+            },
         }
     )
-    hold_id = canonical_json_sha256(
+    hold_id = _exact_hold_json_sha256(
         {
             "plan_id": plan_id,
             "recorded_at": recorded_at,
@@ -998,9 +1341,12 @@ def _build_exact_outbox_hold_receipt(
         "max_age_seconds": int(snapshot["max_age_seconds"]),
         "active_activation": dict(snapshot["active_activation"]),
         "active_release_binding": dict(active_release_binding),
+        "config_binding": config_binding,
         "config_binding_sha256": config_binding_sha256,
         "tool_provenance": dict(tool_provenance),
         "tool_provenance_sha256": tool_provenance_sha256,
+        "resident_census": dict(resident_census),
+        "destination_path": str(receipt_path.expanduser().absolute()),
         "destination_binding": destination_binding,
         "target_before": target_before,
         "target_after": target_after,
@@ -1020,7 +1366,7 @@ def _build_exact_outbox_hold_receipt(
             },
         },
     }
-    receipt["receipt_fingerprint"] = canonical_json_sha256(receipt)
+    receipt["receipt_fingerprint"] = _exact_hold_json_sha256(receipt)
     return receipt
 
 
@@ -4177,7 +4523,8 @@ def _run_exact_outbox_hold_command(
     active_binding = _exact_outbox_hold_active_release_binding(config)
     config_binding_sha256 = _exact_outbox_hold_config_binding(config)
     tool_provenance = _exact_outbox_hold_tool_provenance()
-    tool_provenance_sha256 = canonical_json_sha256(tool_provenance)
+    tool_provenance_sha256 = _exact_hold_json_sha256(tool_provenance)
+    resident_census = _exact_outbox_resident_census(config)
     if not store.read_only:
         raise RuntimeError("exact_outbox_hold_planning_store_not_read_only")
     planning_store = store
@@ -4199,6 +4546,7 @@ def _run_exact_outbox_hold_command(
         control_db_identity=control_db_identity,
         active_release_binding=active_binding,
         tool_provenance=tool_provenance,
+        resident_census=resident_census,
     )
     if args.apply:
         expected = {
@@ -4284,13 +4632,24 @@ def _run_exact_outbox_hold_command(
         raise RuntimeError("exact_outbox_hold_config_changed")
     if _exact_outbox_hold_tool_provenance() != tool_provenance:
         raise RuntimeError("exact_outbox_hold_tool_provenance_changed")
+    apply_resident_census = _exact_outbox_resident_census(config)
+    resident_policy_keys = (
+        "schema_version",
+        "source_kind",
+        "domain",
+        "forbidden_labels",
+        "all_unloaded",
+    )
+    if any(
+        apply_resident_census.get(key) != planned["resident_census"].get(key)
+        for key in resident_policy_keys
+    ):
+        raise RuntimeError("exact_outbox_hold_resident_census_changed")
     mutation_store = RcaControlStore(
         config.control_db_path,
         require_current=True,
     )
-    applied = mutation_store.hold_exact_outbox_with_audit(
-        audit=planned, now=observed_at
-    )
+    applied = mutation_store.hold_exact_outbox_with_audit(audit=planned, now=observed_at)
     try:
         receipt_sha256 = _write_immutable_receipt(
             receipt_path,
@@ -4317,8 +4676,8 @@ def _run_exact_outbox_hold_command(
                 "predecessor_outbox_id": planned["predecessor_outbox_id"],
                 "receipt": str(receipt_path),
                 "receipt_sha256": receipt_sha256,
-                "receipt_fingerprint": planned["receipt_fingerprint"],
-                "effect_delta": planned["effect_delta"],
+                "receipt_fingerprint": applied["receipt_fingerprint"],
+                "effect_delta": applied["effect_delta"],
             },
             ensure_ascii=False,
             indent=2,

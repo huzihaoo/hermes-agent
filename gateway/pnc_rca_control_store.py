@@ -8,10 +8,12 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
+import plistlib
 from pathlib import Path
 import re
 import sqlite3
 import stat
+import subprocess
 import tempfile
 from typing import Any, Callable, Iterable, Literal, Mapping
 import uuid
@@ -95,6 +97,62 @@ EXACT_OUTBOX_HOLD_ROW_SCHEMA_VERSION = "pnc_rca_exact_outbox_hold_row_v1"
 EXACT_OUTBOX_HOLD_SNAPSHOT_SCHEMA_VERSION = "pnc_rca_exact_outbox_hold_snapshot_v1"
 EXACT_OUTBOX_HOLD_UNTIL = "9999-12-31T23:59:59.999999+00:00"
 EXACT_OUTBOX_HOLD_MAX_AUDIT_BYTES = 512 * 1024
+# A hold is an operational gate for a predecessor canary, not a generic retry
+# delay.  Keep a fixed margin for the canary, collector, and manual review.
+EXACT_OUTBOX_HOLD_MIN_REMAINING_SECONDS = 6 * 60 * 60
+EXACT_OUTBOX_HOLD_RECORD_MAX_AGE_SECONDS = 60
+EXACT_OUTBOX_RUNTIME_PLIST_LABELS = (
+    "local.pnc.rca-kafka-consumer",
+    "local.pnc.rca-outbox-dispatcher",
+    "local.pnc.rca-delivery-collector",
+    "local.pnc.rca-delivery-dispatcher",
+    "local.pnc.completion-notice-relay",
+    "local.pnc.feishu-delivery-repair",
+)
+EXACT_OUTBOX_CONFIG_KEYS = frozenset(
+    {
+        "dispatch_enabled",
+        "activation_required",
+        "control_db_path",
+        "delivery_db_path",
+        "health_path",
+        "service_id",
+        "service_capability",
+        "service_operation",
+        "lease_seconds",
+        "max_age_seconds",
+        "input_wait_max_age_seconds",
+        "poll_interval_seconds",
+        "circuit_poll_interval_seconds",
+        "batch_size",
+        "data_access_mode",
+        "allow_download",
+        "allow_feishu_writeback",
+        "group_response_cap",
+        "translate_baseline",
+        "translate_contract_path",
+        "storage_admission_enabled",
+        "storage_reservation_enabled",
+        "derived_capacity_reservation_enabled",
+        "delivery_backpressure_enabled",
+        "delivery_high_watermark",
+        "delivery_resume_watermark",
+        "storage_concurrency_reserve_cases",
+        "storage_cases_per_day",
+        "storage_capacity_scope",
+        "derived_capacity_atomic_reservation",
+        "storage_expected_artifact_cache_bytes",
+        "storage_reserve_percent",
+        "storage_timeout_seconds",
+        "derived_capacity_reservation_timeout_seconds",
+        "capacity_mode",
+        "release_id",
+        "bootstrap_epoch_id",
+        "active_release_binding_path",
+        "live_env_path",
+        "w3_snapshot_read",
+    }
+)
 EXACT_OUTBOX_HOLD_REQUIRED_FIELDS = frozenset(
     {
         "schema_version",
@@ -112,9 +170,12 @@ EXACT_OUTBOX_HOLD_REQUIRED_FIELDS = frozenset(
         "max_age_seconds",
         "active_activation",
         "active_release_binding",
+        "config_binding",
         "config_binding_sha256",
         "tool_provenance",
         "tool_provenance_sha256",
+        "resident_census",
+        "destination_path",
         "destination_binding",
         "target_before",
         "target_after",
@@ -314,6 +375,20 @@ def _canonical_sha256(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def _exact_canonical_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    )
+
+
+def _exact_canonical_sha256(value: Any) -> str:
+    return hashlib.sha256(_exact_canonical_json(value).encode("utf-8")).hexdigest()
+
+
 def _dispatcher_circuit_reset_fingerprint(value: Mapping[str, Any]) -> str:
     payload = dict(value)
     payload.pop("receipt_fingerprint", None)
@@ -460,7 +535,7 @@ def _validate_dispatcher_circuit_reset_audit(
 def _exact_outbox_hold_fingerprint(value: Mapping[str, Any]) -> str:
     payload = dict(value)
     payload.pop("receipt_fingerprint", None)
-    return _canonical_sha256(payload)
+    return _exact_canonical_sha256(payload)
 
 
 def _exact_outbox_hold_plan_id(value: Mapping[str, Any]) -> str:
@@ -474,7 +549,7 @@ def _exact_outbox_hold_plan_id(value: Mapping[str, Any]) -> str:
         "path": control_identity.get("path"),
         "logical_db_identity": logical_identity,
     }
-    return _canonical_sha256(
+    return _exact_canonical_sha256(
         {
             "command": "hold-exact-outbox",
             "operator": value["operator"],
@@ -494,8 +569,28 @@ def _exact_outbox_hold_plan_id(value: Mapping[str, Any]) -> str:
             "target_row_sha256": value["target_before"]["row_sha256"],
             "predecessor_row_sha256": value["predecessor"]["row_sha256"],
             "eligible_queue_sha256": value["eligible_queue_before"]["sha256"],
-            "retry_horizon": value["retry_horizon"],
+            # Remaining seconds and observation timestamps are evidence, not
+            # plan identity.  Bind only the fixed policy and expiry anchor.
+            "retry_horizon": {
+                key: value["retry_horizon"][key]
+                for key in (
+                    "target_outbox_id",
+                    "anchor",
+                    "expires_at",
+                    "min_remaining_seconds",
+                    "safety_headroom_seconds",
+                    "record_max_age_seconds",
+                )
+            },
+            "destination_path": value["destination_path"],
             "destination_binding": value["destination_binding"],
+            "resident_census_policy": {
+                "schema_version": value["resident_census"]["schema_version"],
+                "source_kind": value["resident_census"]["source_kind"],
+                "domain": value["resident_census"]["domain"],
+                "forbidden_labels": value["resident_census"]["forbidden_labels"],
+                "all_unloaded": value["resident_census"]["all_unloaded"],
+            },
         }
     )
 
@@ -506,7 +601,7 @@ def _validate_exact_outbox_hold_audit(
     if not isinstance(value, Mapping):
         raise ValueError("exact_outbox_hold_audit_invalid")
     normalized = dict(value)
-    if not EXACT_OUTBOX_HOLD_REQUIRED_FIELDS.issubset(normalized):
+    if set(normalized) != EXACT_OUTBOX_HOLD_REQUIRED_FIELDS:
         raise ValueError("exact_outbox_hold_audit_fields_invalid")
     if (
         normalized.get("schema_version") != EXACT_OUTBOX_HOLD_SCHEMA_VERSION
@@ -618,33 +713,255 @@ def _validate_exact_outbox_hold_audit(
             or item == "0" * 64
         ):
             raise ValueError("exact_outbox_hold_provenance_invalid")
+    config_binding = normalized.get("config_binding")
+    if (
+        not isinstance(config_binding, Mapping)
+        or set(config_binding) != EXACT_OUTBOX_CONFIG_KEYS
+        or _exact_canonical_sha256(config_binding)
+        != normalized["config_binding_sha256"]
+    ):
+        raise ValueError("exact_outbox_hold_config_binding_invalid")
     active_binding = normalized.get("active_release_binding")
     if (
         not isinstance(active_binding, Mapping)
+        or not isinstance(active_binding.get("path"), str)
+        or not Path(active_binding["path"]).is_absolute()
+        or not isinstance(active_binding.get("live_env_path"), str)
+        or not Path(active_binding["live_env_path"]).is_absolute()
+        or _ACTIVATION_SHA256_RE.fullmatch(str(active_binding.get("raw_sha256") or ""))
+        is None
+        or _ACTIVATION_SHA256_RE.fullmatch(
+            str(active_binding.get("live_env_sha256") or "")
+        )
+        is None
         or _ACTIVATION_SHA256_RE.fullmatch(
             str(active_binding.get("sha256") or "")
         )
         is None
+        or active_binding.get("sha256") != active_binding.get("raw_sha256")
+        or _ACTIVATION_SHA256_RE.fullmatch(
+            str(active_binding.get("release_bom_sha256") or "")
+        )
+        is None
+        or _ACTIVATION_SHA256_RE.fullmatch(
+            str(active_binding.get("runtime_manifest_sha256") or "")
+        )
+        is None
+        or any(
+            _ACTIVATION_SHA256_RE.fullmatch(str(active_binding.get(field) or ""))
+            is None
+            for field in (
+                "candidate_env_sha256",
+                "authorization_fingerprint",
+                "authorization_receipt_sha256",
+                "approval_evidence_sha256",
+            )
+        )
+        or not re.fullmatch(
+            r"[0-9a-f]{40}", str(active_binding.get("runtime_git_head") or "")
+        )
+        or not re.fullmatch(
+            r"[0-9a-f]{40}", str(active_binding.get("runtime_git_tree") or "")
+        )
     ):
         raise ValueError("exact_outbox_hold_active_binding_invalid")
     tool_provenance = normalized.get("tool_provenance")
     if (
         not isinstance(tool_provenance, Mapping)
-        or _canonical_sha256(tool_provenance)
+        or _exact_canonical_sha256(tool_provenance)
         != normalized["tool_provenance_sha256"]
     ):
         raise ValueError("exact_outbox_hold_tool_provenance_invalid")
+    if (
+        not isinstance(tool_provenance.get("git_clean"), bool)
+        or tool_provenance.get("git_clean") is not True
+        or not re.fullmatch(r"[0-9a-f]{40}", str(tool_provenance.get("git_head") or ""))
+        or not re.fullmatch(r"[0-9a-f]{40}", str(tool_provenance.get("git_tree") or ""))
+    ):
+        raise ValueError("exact_outbox_hold_tool_provenance_invalid")
+    runtime_provenance = tool_provenance.get("runtime_provenance")
+    runtime_plists = (
+        runtime_provenance.get("plists")
+        if isinstance(runtime_provenance, Mapping)
+        else None
+    )
+
+    def _valid_runtime_plists(value: Any) -> bool:
+        if not isinstance(value, list) or len(value) != len(EXACT_OUTBOX_RUNTIME_PLIST_LABELS):
+            return False
+        prefix = Path.home() / "Library" / "LaunchAgents"
+        for label, item in zip(EXACT_OUTBOX_RUNTIME_PLIST_LABELS, value, strict=True):
+            if not isinstance(item, Mapping) or item.get("label") != label:
+                return False
+            expected_path = prefix / f"{label}.plist"
+            if item.get("path") != str(expected_path):
+                return False
+            if (
+                item.get("present") is not True
+                or _ACTIVATION_SHA256_RE.fullmatch(str(item.get("sha256") or "")) is None
+                or isinstance(item.get("mode"), bool)
+                or not isinstance(item.get("mode"), int)
+                or isinstance(item.get("uid"), bool)
+                or not isinstance(item.get("uid"), int)
+                or item.get("nlink") != 1
+            ):
+                return False
+        return True
+
+    if (
+        not isinstance(runtime_provenance, Mapping)
+        or runtime_provenance.get("schema_version")
+        != "pnc_rca_exact_outbox_runtime_provenance_v1"
+        or not isinstance(runtime_provenance.get("manifest"), Mapping)
+        or runtime_provenance["manifest"].get("present") is not True
+        or not isinstance(runtime_provenance["manifest"].get("path"), str)
+        or not Path(runtime_provenance["manifest"]["path"]).is_absolute()
+        or _ACTIVATION_SHA256_RE.fullmatch(
+            str(runtime_provenance["manifest"].get("sha256") or "")
+        )
+        is None
+        or isinstance(runtime_provenance["manifest"].get("mode"), bool)
+        or not isinstance(runtime_provenance["manifest"].get("mode"), int)
+        or isinstance(runtime_provenance["manifest"].get("uid"), bool)
+        or not isinstance(runtime_provenance["manifest"].get("uid"), int)
+        or runtime_provenance["manifest"].get("nlink") != 1
+        or not isinstance(runtime_provenance.get("manifest_runtime_root"), str)
+        or not Path(runtime_provenance["manifest_runtime_root"]).is_absolute()
+        or not isinstance(runtime_provenance.get("manifest_runtime_release_target"), str)
+        or not runtime_provenance["manifest_runtime_release_target"]
+        or runtime_provenance.get("manifest_runtime_release_target")
+        != runtime_provenance.get("manifest_gateway_release_target")
+        or not re.fullmatch(
+            r"[0-9a-f]{40}", str(runtime_provenance.get("runtime_git_head") or "")
+        )
+        or not re.fullmatch(
+            r"[0-9a-f]{40}", str(runtime_provenance.get("runtime_git_tree") or "")
+        )
+        or runtime_provenance.get("runtime_git_head")
+        != runtime_provenance.get("manifest_commit")
+        or runtime_provenance.get("runtime_git_tree")
+        != runtime_provenance.get("manifest_tree")
+        or _ACTIVATION_SHA256_RE.fullmatch(
+            str(runtime_provenance.get("release_bom_sha256") or "")
+        )
+        is None
+        or not _valid_runtime_plists(runtime_plists)
+        or not isinstance(runtime_provenance.get("stable_target_registry"), Mapping)
+        or runtime_provenance["stable_target_registry"].get("present") is not True
+        or not isinstance(runtime_provenance["stable_target_registry"].get("path"), str)
+        or not Path(runtime_provenance["stable_target_registry"]["path"]).is_absolute()
+        or _ACTIVATION_SHA256_RE.fullmatch(
+            str(runtime_provenance["stable_target_registry"].get("sha256") or "")
+        )
+        is None
+        or runtime_provenance["stable_target_registry"].get("nlink") != 1
+    ):
+        raise ValueError("exact_outbox_hold_runtime_provenance_invalid")
+    if (
+        active_binding.get("release_bom_sha256")
+        != runtime_provenance.get("release_bom_sha256")
+        or active_binding.get("runtime_manifest_sha256")
+        != runtime_provenance["manifest"].get("sha256")
+        or active_binding.get("runtime_git_head")
+        != runtime_provenance.get("runtime_git_head")
+        or active_binding.get("runtime_git_tree")
+        != runtime_provenance.get("runtime_git_tree")
+        or active_binding.get("runtime_release_target")
+        != runtime_provenance.get("manifest_runtime_release_target")
+    ):
+        raise ValueError("exact_outbox_hold_active_binding_invalid")
+    resident_census = normalized.get("resident_census")
+    if (
+        not isinstance(resident_census, Mapping)
+        or resident_census.get("schema_version")
+        != "pnc_rca_exact_outbox_resident_census_v1"
+        or resident_census.get("all_unloaded") is not True
+        or resident_census.get("loaded_count") != 0
+        or resident_census.get("source_kind") != "launchctl_read_only_print"
+        or resident_census.get("domain") != f"gui/{os.getuid()}"
+        or not isinstance(resident_census.get("forbidden_labels"), list)
+        or not isinstance(resident_census.get("observations"), list)
+        or resident_census.get("forbidden_labels")
+        != [
+            "local.pnc.rca-kafka-consumer",
+            "local.pnc.rca-outbox-dispatcher",
+            "local.pnc.rca-delivery-collector",
+            "local.pnc.rca-delivery-dispatcher",
+            "local.pnc.completion-notice-relay",
+            "local.pnc.feishu-delivery-repair",
+        ]
+        or len(resident_census.get("observations"))
+        != len(resident_census.get("forbidden_labels"))
+        or any(
+            not isinstance(item, Mapping)
+            or item.get("label") != resident_census["forbidden_labels"][index]
+            or item.get("loaded") is not False
+            or item.get("returncode") != 113
+            or item.get("unloaded_proven") is not True
+            for index, item in enumerate(resident_census.get("observations", []))
+        )
+        or resident_census.get("loaded_labels") != []
+        or not isinstance(resident_census.get("source_sha256"), str)
+        or _ACTIVATION_SHA256_RE.fullmatch(resident_census["source_sha256"]) is None
+        or resident_census.get("source_sha256")
+        != _exact_canonical_sha256(
+            {
+                key: item
+                for key, item in resident_census.items()
+                if key != "source_sha256"
+            }
+        )
+    ):
+        raise ValueError("exact_outbox_hold_resident_census_invalid")
     active_activation = normalized.get("active_activation")
     if (
         not isinstance(active_activation, Mapping)
         or active_activation.get("configured") is not True
         or active_activation.get("state") != "bounded_active"
+        or active_activation.get("is_current") != 1
         or _ACTIVATION_SHA256_RE.fullmatch(
             str(active_activation.get("sha256") or "")
         )
         is None
+        or any(
+            _ACTIVATION_SHA256_RE.fullmatch(str(active_activation.get(field) or ""))
+            is None
+            for field in (
+                "config_sha256",
+                "db_logical_identity_sha256",
+                "preproduction_fingerprint",
+                "preproduction_gate_receipt_sha256",
+            )
+        )
+        or not isinstance(active_activation.get("db_logical_identity"), Mapping)
+        or active_activation["db_logical_identity"].get("logical_store_id")
+        != "rca-control-primary"
+        or _exact_canonical_sha256(active_activation["db_logical_identity"])
+        != active_activation.get("db_logical_identity_sha256")
+        or active_activation.get("production_fingerprint") != ""
+        or active_activation.get("production_gate_receipt_sha256") != ""
     ):
         raise ValueError("exact_outbox_hold_activation_invalid")
+    destination = normalized.get("destination_binding")
+    destination_path = normalized.get("destination_path")
+    if (
+        not isinstance(destination_path, str)
+        or not Path(destination_path).is_absolute()
+        or destination_path != str(Path(destination_path).absolute())
+        or hashlib.sha256(destination_path.encode("utf-8")).hexdigest()
+        != str(destination.get("path_sha256") if isinstance(destination, Mapping) else "")
+        or not isinstance(destination, Mapping)
+        or set(destination) != {"path_sha256", "parent_device", "parent_inode"}
+        or _ACTIVATION_SHA256_RE.fullmatch(str(destination.get("path_sha256") or ""))
+        is None
+        or isinstance(destination.get("parent_device"), bool)
+        or not isinstance(destination.get("parent_device"), int)
+        or isinstance(destination.get("parent_inode"), bool)
+        or not isinstance(destination.get("parent_inode"), int)
+        or destination.get("parent_device") < 1
+        or destination.get("parent_inode") < 1
+    ):
+        raise ValueError("exact_outbox_hold_destination_invalid")
     for field, expected_id in (
         ("target_before", normalized["target_outbox_id"]),
         ("target_after", normalized["target_outbox_id"]),
@@ -677,6 +994,10 @@ def _validate_exact_outbox_hold_audit(
         or normalized["predecessor"].get("attempt") != 0
         or normalized["predecessor"].get("fence") != 0
         or normalized["predecessor"].get("next_attempt_at") is not None
+        or before.get("activation_epoch_id") != active_activation.get("epoch_id")
+        or after.get("activation_epoch_id") != active_activation.get("epoch_id")
+        or normalized["predecessor"].get("activation_epoch_id")
+        != active_activation.get("epoch_id")
     ):
         raise ValueError("exact_outbox_hold_row_state_invalid")
     mutable_after_fields = {"next_attempt_at", "updated_at", "row_sha256"}
@@ -719,7 +1040,7 @@ def _validate_exact_outbox_hold_audit(
             )
             is None
             or item.get("sha256")
-            != _canonical_sha256(
+            != _exact_canonical_sha256(
                 [
                     {
                         "outbox_id": int(entry["outbox_id"]),
@@ -752,12 +1073,68 @@ def _validate_exact_outbox_hold_audit(
         or not isinstance(retry_horizon.get("expires_at"), str)
         or retry_horizon.get("target_outbox_id")
         != normalized["target_outbox_id"]
+        or retry_horizon.get("min_remaining_seconds")
+        != EXACT_OUTBOX_HOLD_MIN_REMAINING_SECONDS
+        or retry_horizon.get("safety_headroom_seconds")
+        != EXACT_OUTBOX_HOLD_MIN_REMAINING_SECONDS
+        or retry_horizon.get("record_max_age_seconds")
+        != EXACT_OUTBOX_HOLD_RECORD_MAX_AGE_SECONDS
+        or isinstance(retry_horizon.get("plan_remaining_seconds"), bool)
+        or not isinstance(retry_horizon.get("plan_remaining_seconds"), int)
+        or retry_horizon.get("plan_remaining_seconds")
+        < EXACT_OUTBOX_HOLD_MIN_REMAINING_SECONDS
+        or (
+            retry_horizon.get("apply_remaining_seconds") is not None
+            and (
+                isinstance(retry_horizon.get("apply_remaining_seconds"), bool)
+                or not isinstance(retry_horizon.get("apply_remaining_seconds"), int)
+                or retry_horizon.get("apply_remaining_seconds")
+                < EXACT_OUTBOX_HOLD_MIN_REMAINING_SECONDS
+            )
+        )
     ):
         raise ValueError("exact_outbox_hold_retry_horizon_invalid")
+    try:
+        anchor = datetime.fromisoformat(
+            str(retry_horizon["anchor"]).replace("Z", "+00:00")
+        )
+        expires = datetime.fromisoformat(
+            str(retry_horizon["expires_at"]).replace("Z", "+00:00")
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("exact_outbox_hold_retry_horizon_invalid") from exc
+    if (
+        anchor.tzinfo is None
+        or expires.tzinfo is None
+        or _utc_datetime(expires)
+        != _utc_datetime(anchor) + timedelta(seconds=max_age_seconds)
+        or _utc_datetime(expires) <= recorded
+        or int((_utc_datetime(expires) - _utc_datetime(recorded)).total_seconds())
+        < EXACT_OUTBOX_HOLD_MIN_REMAINING_SECONDS
+    ):
+        raise ValueError("exact_outbox_hold_retry_horizon_invalid")
+    apply_observed_at = retry_horizon.get("apply_observed_at")
+    if apply_observed_at is not None:
+        try:
+            apply_observed = datetime.fromisoformat(
+                str(apply_observed_at).replace("Z", "+00:00")
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("exact_outbox_hold_retry_horizon_invalid") from exc
+        if (
+            apply_observed.tzinfo is None
+            or _utc_datetime(apply_observed) < _utc_datetime(recorded)
+            or int(
+                (_utc_datetime(expires) - _utc_datetime(apply_observed)).total_seconds()
+            )
+            != retry_horizon.get("apply_remaining_seconds")
+        ):
+            raise ValueError("exact_outbox_hold_retry_horizon_invalid")
     effect_delta = normalized.get("effect_delta")
     if (
         not isinstance(effect_delta, Mapping)
         or effect_delta.get("external_writes") != 0
+        or effect_delta.get("external_effects_triggered") is not False
         or effect_delta.get("target_rows_updated") != 1
         or effect_delta.get("control_meta_inserted") != 1
         or effect_delta.get("business_trigger_rows_updated") != 0
@@ -765,7 +1142,7 @@ def _validate_exact_outbox_hold_audit(
         raise ValueError("exact_outbox_hold_effect_delta_invalid")
     fingerprint = normalized.get("receipt_fingerprint")
     expected_plan_id = _exact_outbox_hold_plan_id(normalized)
-    expected_hold_id = _canonical_sha256(
+    expected_hold_id = _exact_canonical_sha256(
         {
             "plan_id": expected_plan_id,
             "recorded_at": recorded_at,
@@ -781,7 +1158,7 @@ def _validate_exact_outbox_hold_audit(
     ):
         raise ValueError("exact_outbox_hold_fingerprint_invalid")
     try:
-        serialized = _canonical_json(normalized)
+        serialized = _exact_canonical_json(normalized)
     except (TypeError, ValueError) as exc:
         raise ValueError("exact_outbox_hold_audit_json_invalid") from exc
     if len(serialized.encode("utf-8")) > EXACT_OUTBOX_HOLD_MAX_AUDIT_BYTES:
@@ -16224,13 +16601,468 @@ class RcaControlStore:
             "updated_at": str(row["updated_at"] or ""),
             "activation_epoch_id": row["activation_epoch_id"],
             "activation_ledger_id": row["activation_ledger_id"],
-            "row_sha256": _canonical_sha256(projection),
+            "row_sha256": _exact_canonical_sha256(projection),
             "_row_projection": projection,
         }
 
     @staticmethod
+    def _exact_bound_file_bytes(
+        path: str | Path,
+    ) -> tuple[str, bytes, os.stat_result]:
+        lexical = Path(path).expanduser().absolute()
+        try:
+            lexical_stat = lexical.lstat()
+        except OSError as exc:
+            raise RuntimeError("exact_outbox_hold_bound_file_missing") from exc
+        if (
+            stat.S_ISLNK(lexical_stat.st_mode)
+            or not stat.S_ISREG(lexical_stat.st_mode)
+            or lexical_stat.st_nlink != 1
+            or lexical_stat.st_uid != os.getuid()
+            or stat.S_IMODE(lexical_stat.st_mode) & 0o022
+        ):
+            raise RuntimeError("exact_outbox_hold_bound_file_invalid")
+        descriptor = os.open(
+            lexical,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            before = os.fstat(descriptor)
+            if (before.st_dev, before.st_ino) != (
+                lexical_stat.st_dev,
+                lexical_stat.st_ino,
+            ):
+                raise RuntimeError("exact_outbox_hold_bound_file_changed")
+            digest = hashlib.sha256()
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                digest.update(chunk)
+            after = os.fstat(descriptor)
+            if (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+            ) != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+            ):
+                raise RuntimeError("exact_outbox_hold_bound_file_changed")
+            return digest.hexdigest(), b"".join(chunks), before
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _exact_bound_file_sha256(path: str | Path) -> str:
+        digest, _raw, _identity = RcaControlStore._exact_bound_file_bytes(path)
+        return digest
+
+    @staticmethod
+    def _exact_logical_source_identity(identity: Mapping[str, Any]) -> dict[str, Any]:
+        logical = dict(identity.get("logical_db_identity") or {})
+        wal = dict(logical.get("wal") or {})
+        if wal.get("present") is True and int(wal.get("size", 0)) == 0:
+            wal = {"present": False}
+        logical["wal"] = wal
+        return {
+            "path": identity.get("path"),
+            "logical_db_identity": logical,
+        }
+
+    @staticmethod
+    def _exact_destination_parent_live(payload: Mapping[str, Any]) -> None:
+        path = Path(str(payload["destination_path"])).expanduser().absolute()
+        parent = path.parent
+        try:
+            observed = parent.lstat()
+        except OSError as exc:
+            raise RuntimeError("exact_outbox_hold_destination_parent_invalid") from exc
+        binding = payload["destination_binding"]
+        if (
+            stat.S_ISLNK(observed.st_mode)
+            or not stat.S_ISDIR(observed.st_mode)
+            or observed.st_uid != os.getuid()
+            or stat.S_IMODE(observed.st_mode) & 0o022
+            or observed.st_dev != int(binding["parent_device"])
+            or observed.st_ino != int(binding["parent_inode"])
+            or Path(os.path.realpath(parent)) != parent
+        ):
+            raise RuntimeError("exact_outbox_hold_destination_parent_changed")
+
+    @staticmethod
+    def _exact_resident_census_live(payload: Mapping[str, Any]) -> None:
+        census = payload["resident_census"]
+        uid = str(os.getuid())
+        expected_labels = list(EXACT_OUTBOX_RUNTIME_PLIST_LABELS)
+        if census.get("forbidden_labels") != expected_labels:
+            raise RuntimeError("exact_outbox_hold_resident_census_invalid")
+        observations = census.get("observations")
+        if not isinstance(observations, list) or len(observations) != len(expected_labels):
+            raise RuntimeError("exact_outbox_hold_resident_census_invalid")
+        for expected_label, expected in zip(expected_labels, observations, strict=True):
+            try:
+                result = subprocess.run(
+                    ["launchctl", "print", f"gui/{uid}/{expected_label}"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=3,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise RuntimeError("exact_outbox_hold_resident_census_unavailable") from exc
+            combined = (result.stdout or "") + (result.stderr or "")
+            unloaded_proven = bool(
+                result.returncode == 113
+                and re.fullmatch(
+                    rf"Bad request\.\nCould not find service \"{re.escape(expected_label)}\" in domain for user gui: {re.escape(uid)}\n?",
+                    combined,
+                )
+            )
+            if result.returncode == 0 or not unloaded_proven:
+                raise RuntimeError("exact_outbox_hold_forbidden_resident_loaded")
+            observed_sha = hashlib.sha256(combined.encode("utf-8")).hexdigest()
+            if (
+                not isinstance(expected, Mapping)
+                or expected.get("label") != expected_label
+                or expected.get("returncode") != result.returncode
+                or expected.get("unloaded_proven") is not True
+                or expected.get("output_sha256") != observed_sha
+            ):
+                raise RuntimeError("exact_outbox_hold_resident_census_changed")
+
+    def _validate_exact_hold_external_bindings(
+        self, payload: Mapping[str, Any]
+    ) -> None:
+        self._exact_destination_parent_live(payload)
+        self._exact_resident_census_live(payload)
+        config_binding = payload["config_binding"]
+        if config_binding.get("control_db_path") != str(self.db_path.expanduser().absolute()):
+            raise RuntimeError("exact_outbox_hold_config_changed")
+        canonical_binding_path = (
+            self.db_path.expanduser().absolute().parent / "active-release-binding.json"
+        )
+        live_path = Path(str(payload["active_release_binding"]["live_env_path"])).expanduser().absolute()
+        home_candidates = [self.db_path.expanduser().absolute().parent / ".env"]
+        if len(self.db_path.expanduser().absolute().parents) >= 3:
+            home_candidates.append(
+                self.db_path.expanduser().absolute().parents[2] / ".env"
+            )
+        if (
+            Path(str(payload["active_release_binding"]["path"])).expanduser().absolute()
+            != canonical_binding_path
+            or live_path not in home_candidates
+        ):
+            raise RuntimeError("exact_outbox_hold_config_changed")
+        if (
+            config_binding.get("active_release_binding_path")
+            != payload["active_release_binding"]["path"]
+            or config_binding.get("live_env_path")
+            != payload["active_release_binding"]["live_env_path"]
+            or config_binding.get("activation_required") is not True
+        ):
+            raise RuntimeError("exact_outbox_hold_config_changed")
+        try:
+            from scripts.pnc_rca_outbox_dispatcher import DispatcherConfig
+
+            live_config_binding = DispatcherConfig.from_env().public_dict()
+        except Exception as exc:
+            raise RuntimeError("exact_outbox_hold_config_unavailable") from exc
+        if live_config_binding != dict(config_binding):
+            raise RuntimeError("exact_outbox_hold_config_changed")
+        try:
+            expected_max_age = int(
+                os.environ.get("HERMES_RCA_OUTBOX_MAX_AGE_SECONDS", "86400")
+            )
+        except ValueError as exc:
+            raise RuntimeError("exact_outbox_hold_config_changed") from exc
+        if (
+            config_binding.get("max_age_seconds") != expected_max_age
+            or payload.get("max_age_seconds") != expected_max_age
+            or config_binding.get("release_id")
+            != payload["active_release_binding"].get("release_id")
+            or config_binding.get("bootstrap_epoch_id")
+            != payload["active_release_binding"].get("bootstrap_epoch_id")
+            or config_binding.get("allow_download") is not False
+            or config_binding.get("allow_feishu_writeback") is not False
+            or config_binding.get("data_access_mode") != "remote_read"
+        ):
+            raise RuntimeError("exact_outbox_hold_config_changed")
+        snapshot_store = RcaControlStore(
+            self.db_path,
+            require_current=True,
+            read_only=True,
+        )
+        current_identity = snapshot_store.control_db_source_snapshot_identity()
+        if self._exact_logical_source_identity(current_identity) != self._exact_logical_source_identity(
+            payload["control_db_identity"]
+        ):
+            raise RuntimeError("exact_outbox_hold_control_db_provenance_changed")
+        binding = payload["active_release_binding"]
+        active_digest, raw_binding, _active_identity = self._exact_bound_file_bytes(
+            binding["path"]
+        )
+        if active_digest != binding["raw_sha256"]:
+            raise RuntimeError("exact_outbox_hold_active_binding_changed")
+        if self._exact_bound_file_sha256(binding["live_env_path"]) != binding[
+            "live_env_sha256"
+        ]:
+            raise RuntimeError("exact_outbox_hold_live_env_changed")
+        try:
+            parsed_binding = json.loads(
+                raw_binding.decode("utf-8"),
+                parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError("exact_outbox_hold_active_binding_changed") from exc
+        if not isinstance(parsed_binding, Mapping):
+            raise RuntimeError("exact_outbox_hold_active_binding_changed")
+        try:
+            from gateway.pnc_rca_prod_bootstrap import load_active_release_binding
+
+            live_binding = load_active_release_binding(
+                path=Path(binding["path"]),
+                live_env_path=Path(binding["live_env_path"]),
+                expected_release_id=str(config_binding["release_id"]),
+                expected_epoch_id=str(config_binding["bootstrap_epoch_id"]),
+            )
+        except Exception as exc:
+            raise RuntimeError("exact_outbox_hold_active_binding_changed") from exc
+        live_binding_projection = {
+            "sha256": str(live_binding["binding_receipt_sha256"]),
+            "release_id": str(live_binding["release_id"]),
+            "authority_sha256": str(live_binding["authority_sha256"]),
+            "authority_epoch_id": str(live_binding["authority_epoch_id"]),
+            "bootstrap_epoch_id": str(live_binding["bootstrap_epoch_id"]),
+            "release_bom_sha256": str(live_binding["release_bom_sha256"]),
+            "candidate_env_sha256": str(live_binding["candidate_env_sha256"]),
+            "authorization_fingerprint": str(
+                live_binding["authorization_fingerprint"]
+            ),
+            "authorization_receipt_sha256": str(
+                live_binding["authorization_receipt_sha256"]
+            ),
+            "approval_evidence_sha256": str(
+                live_binding["approval_evidence_sha256"]
+            ),
+        }
+        if (
+            any(binding.get(key) != value for key, value in live_binding_projection.items())
+            or self._exact_bound_file_sha256(binding["path"]) != active_digest
+        ):
+            raise RuntimeError("exact_outbox_hold_active_binding_changed")
+        provenance = payload["tool_provenance"]
+        for key, value in provenance.items():
+            if not key.endswith("_path"):
+                continue
+            digest_key = key.removesuffix("_path") + "_sha256"
+            if digest_key not in provenance:
+                raise RuntimeError("exact_outbox_hold_tool_provenance_invalid")
+            if self._exact_bound_file_sha256(value) != provenance[digest_key]:
+                raise RuntimeError("exact_outbox_hold_tool_provenance_changed")
+        entrypoint = Path(provenance["entrypoint_path"]).expanduser().absolute()
+        control_source = Path(provenance["control_store_path"]).expanduser().absolute()
+        bootstrap_source = Path(provenance["bootstrap_path"]).expanduser().absolute()
+        module_source = Path(__file__).expanduser().absolute()
+        module_root = module_source.parent.parent
+        if (
+            Path(os.path.realpath(module_source)) != module_source
+            or Path(os.path.realpath(entrypoint)) != entrypoint
+            or Path(os.path.realpath(control_source)) != control_source
+            or Path(os.path.realpath(bootstrap_source)) != bootstrap_source
+            or entrypoint != module_root / "scripts" / "pnc_rca_outbox_dispatcher.py"
+            or control_source != module_source
+            or bootstrap_source != module_root / "gateway" / "pnc_rca_prod_bootstrap.py"
+        ):
+            raise RuntimeError("exact_outbox_hold_tool_provenance_invalid")
+        tool_root = module_root
+        tool_head = subprocess.run(
+            ["git", "-C", str(tool_root), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        tool_tree = subprocess.run(
+            ["git", "-C", str(tool_root), "rev-parse", "HEAD^{tree}"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        tool_status = subprocess.run(
+            ["git", "-C", str(tool_root), "status", "--porcelain", "--untracked-files=all"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        if (
+            tool_head.returncode != 0
+            or tool_tree.returncode != 0
+            or tool_status.returncode != 0
+            or tool_head.stdout.strip() != provenance["git_head"]
+            or tool_tree.stdout.strip() != provenance["git_tree"]
+            or tool_status.stdout.strip()
+            or provenance.get("git_status_returncode") != 0
+            or provenance.get("git_clean") is not True
+        ):
+            raise RuntimeError("exact_outbox_hold_tool_provenance_changed")
+        runtime = provenance["runtime_provenance"]
+        runtime_files = [runtime["manifest"], *runtime["plists"], runtime["stable_target_registry"]]
+        runtime_raw: dict[str, bytes] = {}
+        for file_binding in runtime_files:
+            digest, raw, _identity = self._exact_bound_file_bytes(file_binding["path"])
+            if digest != file_binding["sha256"]:
+                raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
+            runtime_raw[str(Path(file_binding["path"]).expanduser().absolute())] = raw
+        manifest_path = Path(runtime["manifest"]["path"]).expanduser().absolute()
+        if (
+            manifest_path != Path.home() / ".hermes" / "runtime" / "LIVE_MANIFEST.json"
+            or Path(os.path.realpath(manifest_path)) != manifest_path
+        ):
+            raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
+        try:
+            manifest = json.loads(
+                runtime_raw[str(manifest_path)].decode("utf-8"),
+                parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError("exact_outbox_hold_runtime_provenance_changed") from exc
+        release_binding = manifest.get("gateway_release_binding") if isinstance(manifest, Mapping) else None
+        capacity = release_binding.get("capacity_admission") if isinstance(release_binding, Mapping) else None
+        if (
+            not isinstance(manifest, Mapping)
+            or manifest.get("runtime_root") != runtime["manifest_runtime_root"]
+            or manifest.get("runtime_release_target") != runtime["manifest_runtime_release_target"]
+            or manifest.get("gateway_release_target") != runtime["manifest_gateway_release_target"]
+            or not isinstance(release_binding, Mapping)
+            or release_binding.get("commit") != runtime["manifest_commit"]
+            or release_binding.get("tree") != runtime["manifest_tree"]
+            or not isinstance(capacity, Mapping)
+            or capacity.get("release_bom_sha256") != runtime["release_bom_sha256"]
+            or payload["active_release_binding"].get("release_bom_sha256")
+            != runtime["release_bom_sha256"]
+        ):
+            raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
+        runtime_root = Path(runtime["manifest_runtime_root"]).expanduser().absolute()
+        if (
+            runtime_root != Path(runtime["manifest_runtime_root"])
+            or Path(os.path.realpath(runtime_root)) != runtime_root
+        ):
+            raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
+        expected_plist_prefix = Path.home() / "Library" / "LaunchAgents"
+        expected_plist_paths = [
+            expected_plist_prefix / f"{label}.plist"
+            for label in EXACT_OUTBOX_RUNTIME_PLIST_LABELS
+        ]
+        actual_plist_paths = [
+            Path(item["path"]).expanduser().absolute() for item in runtime["plists"]
+        ]
+        if actual_plist_paths != expected_plist_paths:
+            raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
+        for label, item in zip(EXACT_OUTBOX_RUNTIME_PLIST_LABELS, runtime["plists"], strict=True):
+            plist_path = Path(item["path"])
+            observed = plist_path.lstat()
+            if Path(os.path.realpath(plist_path)) != plist_path:
+                raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
+            if (
+                observed.st_uid != int(item["uid"])
+                or observed.st_nlink != int(item["nlink"])
+                or stat.S_IMODE(observed.st_mode) != int(item["mode"])
+            ):
+                raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
+            try:
+                plist = plistlib.loads(runtime_raw[str(plist_path)])
+            except (OSError, ValueError, plistlib.InvalidFileException) as exc:
+                raise RuntimeError("exact_outbox_hold_runtime_provenance_changed") from exc
+            if not isinstance(plist, Mapping) or plist.get("Label") != label:
+                raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
+        registry_path = Path(runtime["stable_target_registry"]["path"]).expanduser().absolute()
+        if (
+            registry_path
+            != runtime_root / "gateway" / "assets" / "pnc_stable_target_registry_v1.json"
+            or Path(os.path.realpath(registry_path)) != registry_path
+        ):
+            raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
+        git_head = subprocess.run(
+            ["git", "-C", str(runtime_root), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        git_tree = subprocess.run(
+            ["git", "-C", str(runtime_root), "rev-parse", "HEAD^{tree}"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        git_status = subprocess.run(
+            ["git", "-C", str(runtime_root), "status", "--porcelain", "--untracked-files=all"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        if (
+            git_head.returncode != 0
+            or git_tree.returncode != 0
+            or git_status.returncode != 0
+            or git_head.stdout.strip() != runtime["runtime_git_head"]
+            or git_tree.stdout.strip() != runtime["runtime_git_tree"]
+            or git_status.stdout.strip()
+        ):
+            raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
+
+    @staticmethod
+    def _exact_hold_freshness(
+        payload: Mapping[str, Any], fresh_now: datetime
+    ) -> tuple[datetime, datetime, int]:
+        try:
+            recorded = datetime.fromisoformat(
+                str(payload["recorded_at"]).replace("Z", "+00:00")
+            )
+            horizon = payload["retry_horizon"]
+            expires = datetime.fromisoformat(
+                str(horizon["expires_at"]).replace("Z", "+00:00")
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("exact_outbox_hold_retry_horizon_invalid") from exc
+        if recorded.tzinfo is None or expires.tzinfo is None:
+            raise RuntimeError("exact_outbox_hold_retry_horizon_invalid")
+        fresh = _utc_datetime(fresh_now)
+        age = (fresh - _utc_datetime(recorded)).total_seconds()
+        if age < -5 or age > EXACT_OUTBOX_HOLD_RECORD_MAX_AGE_SECONDS:
+            raise RuntimeError("exact_outbox_hold_recorded_at_stale")
+        remaining = (_utc_datetime(expires) - fresh).total_seconds()
+        if remaining < EXACT_OUTBOX_HOLD_MIN_REMAINING_SECONDS:
+            raise RuntimeError("exact_outbox_hold_retry_horizon_headroom_insufficient")
+        return recorded, expires, int(remaining)
+
+    @staticmethod
+    def _exact_hold_with_apply_observation(
+        payload: Mapping[str, Any], fresh_now: datetime, remaining: int
+    ) -> dict[str, Any]:
+        effective = dict(payload)
+        horizon = dict(payload["retry_horizon"])
+        horizon["apply_observed_at"] = _iso(fresh_now)
+        horizon["apply_remaining_seconds"] = int(remaining)
+        effective["retry_horizon"] = horizon
+        effective["receipt_fingerprint"] = _exact_outbox_hold_fingerprint(effective)
+        return _validate_exact_outbox_hold_audit(effective)
+
+    @staticmethod
     def _exact_outbox_queue_sha256(entries: Iterable[Mapping[str, Any]]) -> str:
-        return _canonical_sha256(
+        return _exact_canonical_sha256(
             [
                 {
                     "outbox_id": int(item["outbox_id"]),
@@ -16244,22 +17076,54 @@ class RcaControlStore:
     def _exact_outbox_activation_binding_tx(
         cls, conn: sqlite3.Connection
     ) -> dict[str, Any]:
-        epoch = cls._current_activation_epoch_tx(conn)
+        current_rows = conn.execute(
+            "SELECT * FROM rca_activation_epochs WHERE is_current = 1"
+        ).fetchall()
+        if len(current_rows) > 1:
+            raise RuntimeError("exact_outbox_hold_activation_not_unique")
+        epoch = current_rows[0] if current_rows else None
         if epoch is None:
             value: dict[str, Any] = {"configured": False, "epoch_id": ""}
         else:
+            db_identity_json = str(epoch["db_logical_identity_json"])
+            try:
+                db_identity = json.loads(
+                    db_identity_json,
+                    parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
+                )
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    "exact_outbox_hold_activation_db_binding_invalid"
+                ) from exc
+            if (
+                not isinstance(db_identity, Mapping)
+                or _exact_canonical_json(db_identity) != db_identity_json
+                or hashlib.sha256(db_identity_json.encode("utf-8")).hexdigest()
+                != str(epoch["db_logical_identity_sha256"])
+            ):
+                raise RuntimeError("exact_outbox_hold_activation_db_binding_invalid")
             value = {
                 "configured": True,
                 "epoch_id": str(epoch["epoch_id"]),
                 "state": str(epoch["state"]),
                 "is_current": int(epoch["is_current"]),
                 "config_sha256": str(epoch["config_sha256"]),
+                "db_logical_identity_sha256": str(
+                    epoch["db_logical_identity_sha256"]
+                ),
+                "db_logical_identity": dict(db_identity),
+                "preproduction_fingerprint": str(
+                    epoch["preproduction_fingerprint"] or ""
+                ),
+                "preproduction_gate_receipt_sha256": str(
+                    epoch["preproduction_gate_receipt_sha256"] or ""
+                ),
                 "production_fingerprint": str(epoch["production_fingerprint"] or ""),
                 "production_gate_receipt_sha256": str(
                     epoch["production_gate_receipt_sha256"] or ""
                 ),
             }
-        value["sha256"] = _canonical_sha256(
+        value["sha256"] = _exact_canonical_sha256(
             {key: item for key, item in value.items() if key != "sha256"}
         )
         return value
@@ -16468,9 +17332,11 @@ class RcaControlStore:
         if self.read_only:
             raise RuntimeError("exact_outbox_hold_mutation_requires_read_write_store")
         payload = _validate_exact_outbox_hold_audit(audit)
-        current = _iso(now)
-        if payload["recorded_at"] != current:
-            raise RuntimeError("exact_outbox_hold_recorded_at_changed")
+        # The caller's timestamp is only an audit anchor.  Fresh wall-clock
+        # reads govern admission and are repeated after taking the write lock.
+        fresh_before = _utc_datetime()
+        self._exact_hold_freshness(payload, fresh_before)
+        current = str(payload["recorded_at"])
         try:
             db_identity = self.db_path.expanduser().absolute().lstat()
         except OSError as exc:
@@ -16482,16 +17348,20 @@ class RcaControlStore:
             or int(recorded_identity.get("inode")) != int(db_identity.st_ino)
         ):
             raise RuntimeError("exact_outbox_hold_control_db_changed")
+        self._validate_exact_hold_external_bindings(payload)
         meta_key = f"{EXACT_OUTBOX_HOLD_META_PREFIX}{payload['hold_id']}"
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            fresh_inside = _utc_datetime()
+            remaining_inside = self._exact_hold_freshness(payload, fresh_inside)[2]
+            self._validate_exact_hold_external_bindings(payload)
             changes_before = conn.total_changes
             existing = conn.execute(
                 "SELECT value FROM control_meta WHERE key = ?", (meta_key,)
             ).fetchone()
             if existing is not None:
-                if str(existing["value"]) == _canonical_json(payload):
+                if str(existing["value"]) == _exact_canonical_json(payload):
                     raise RuntimeError("exact_outbox_hold_already_applied")
                 raise RuntimeError("exact_outbox_hold_audit_key_conflict")
             snapshot = self._exact_outbox_hold_snapshot_tx(
@@ -16500,7 +17370,7 @@ class RcaControlStore:
                 predecessor_outbox_id=int(payload["predecessor_outbox_id"]),
                 activation_required=bool(payload["activation_required"]),
                 max_age_seconds=int(payload["max_age_seconds"]),
-                now=datetime.fromisoformat(current),
+                now=fresh_inside,
             )
             target = snapshot["target"]
             predecessor = snapshot["predecessor"]
@@ -16551,9 +17421,12 @@ class RcaControlStore:
                 )
             ):
                 raise RuntimeError("exact_outbox_hold_predecessor_not_pending")
+            effective_payload = self._exact_hold_with_apply_observation(
+                payload, fresh_inside, remaining_inside
+            )
             conn.execute(
                 "INSERT INTO control_meta(key, value) VALUES(?, ?)",
-                (meta_key, _canonical_json(payload)),
+                (meta_key, _exact_canonical_json(effective_payload)),
             )
             updated = conn.execute(
                 """
@@ -16601,7 +17474,7 @@ class RcaControlStore:
                 predecessor_outbox_id=int(payload["predecessor_outbox_id"]),
                 activation_required=bool(payload["activation_required"]),
                 max_age_seconds=int(payload["max_age_seconds"]),
-                now=datetime.fromisoformat(current),
+                now=fresh_inside,
                 require_exact_queue=False,
             )
             if (
@@ -16613,7 +17486,7 @@ class RcaControlStore:
             ):
                 raise RuntimeError("exact_outbox_hold_effect_delta_changed")
             conn.commit()
-            return dict(payload)
+            return dict(effective_payload)
         except Exception:
             if conn.in_transaction:
                 conn.rollback()
@@ -16641,7 +17514,7 @@ class RcaControlStore:
             value = _validate_exact_outbox_hold_audit(value)
             if (
                 value["hold_id"] != normalized
-                or _canonical_json(value) != raw
+                or _exact_canonical_json(value) != raw
             ):
                 raise RuntimeError("exact_outbox_hold_audit_tampered")
             identity = value["control_db_identity"]
@@ -16655,14 +17528,6 @@ class RcaControlStore:
             return value
         finally:
             conn.close()
-
-    # Explicit aliases keep the operator vocabulary discoverable for callers
-    # that separate planning from application at the API boundary.
-    def plan_exact_outbox_hold(self, **kwargs: Any) -> dict[str, Any]:
-        return self.exact_outbox_hold_snapshot(**kwargs)
-
-    def apply_exact_outbox_hold(self, **kwargs: Any) -> dict[str, Any]:
-        return self.hold_exact_outbox_with_audit(**kwargs)
 
     def dispatcher_circuit(self) -> DispatcherCircuit:
         conn = self._connect()
