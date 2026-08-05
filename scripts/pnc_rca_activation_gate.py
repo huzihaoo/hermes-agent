@@ -348,18 +348,20 @@ def _validate_schema_receipt(
     authority: Mapping[str, Any],
     now: datetime,
     max_age_seconds: int,
+    enforce_freshness: bool = True,
 ) -> tuple[bytes, dict[str, Any], dict[str, Any]]:
     try:
         verified = verify_snapshot_receipt(path)
     except SchemaFingerprintError as exc:
         raise ActivationGateError(exc.code, exc.detail) from exc
     raw, body = _read_owner_json(path, "rca_activation_gate_schema_receipt")
-    _fresh(
-        body.get("observation_completed_at"),
-        now=now,
-        max_age_seconds=max_age_seconds,
-        code="rca_activation_gate_schema_receipt_stale",
-    )
+    if enforce_freshness:
+        _fresh(
+            body.get("observation_completed_at"),
+            now=now,
+            max_age_seconds=max_age_seconds,
+            code="rca_activation_gate_schema_receipt_stale",
+        )
     source = body.get("source_database")
     identity = body.get("database_identity")
     if not isinstance(source, Mapping) or not isinstance(identity, Mapping):
@@ -380,6 +382,31 @@ def _validate_schema_receipt(
     ):
         raise ActivationGateError("rca_activation_gate_schema_authority_mismatch")
     return raw, body, verified
+
+
+def _validate_prior_activation_input(
+    *,
+    mode: str,
+    activation_input: Mapping[str, Any],
+    config_sha256: str,
+    migration_raw: bytes,
+) -> None:
+    """Validate immutable prior-stage bindings without conflating live config."""
+    migration_sha256 = hashlib.sha256(migration_raw).hexdigest()
+    if mode == "preproduction":
+        if (
+            activation_input.get("config_sha256") != config_sha256
+            or activation_input.get("migration_receipt_raw_sha256") != migration_sha256
+        ):
+            raise ActivationGateError("rca_activation_gate_preproduction_input_drift")
+        return
+    if mode in {"production_bootstrap", "production"}:
+        # The live profile intentionally changes from record-only to live.  Its
+        # resident-level continuity is checked separately below.
+        if activation_input.get("migration_receipt_raw_sha256") != migration_sha256:
+            raise ActivationGateError("rca_activation_gate_production_input_drift")
+        return
+    raise ActivationGateError("rca_activation_gate_mode_invalid")
 
 
 def _validate_migration_receipt(
@@ -1105,6 +1132,7 @@ def produce_release_gate(
         authority=authority,
         now=current,
         max_age_seconds=max_age,
+        enforce_freshness=(mode == "preauthorization"),
     )
     migration_raw, migration_receipt, migration_binding = (
         _validate_migration_receipt(
@@ -1224,14 +1252,12 @@ def produce_release_gate(
             for topic in start_fence
         ):
             raise ActivationGateError("rca_activation_gate_broker_fence_regressed")
-        if (
-            activation_input["config_sha256"] != config_sha
-            or activation_input["migration_receipt_raw_sha256"]
-            != hashlib.sha256(migration_raw).hexdigest()
-        ):
-            raise ActivationGateError(
-                "rca_activation_gate_preauthorization_input_drift"
-            )
+        _validate_prior_activation_input(
+            mode=mode,
+            activation_input=activation_input,
+            config_sha256=config_sha,
+            migration_raw=migration_raw,
+        )
     else:
         if preproduction_capsule_path is None:
             raise ActivationGateError(
@@ -1278,12 +1304,12 @@ def produce_release_gate(
             for topic in start_fence
         ):
             raise ActivationGateError("rca_activation_gate_broker_fence_regressed")
-        if (
-            activation_input["config_sha256"] != config_sha
-            or activation_input["migration_receipt_raw_sha256"]
-            != hashlib.sha256(migration_raw).hexdigest()
-        ):
-            raise ActivationGateError("rca_activation_gate_preproduction_input_drift")
+        _validate_prior_activation_input(
+            mode=mode,
+            activation_input=activation_input,
+            config_sha256=config_sha,
+            migration_raw=migration_raw,
+        )
 
     activation = _activation_observation(
         control_db_path,

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -791,6 +791,107 @@ def test_safe_config_profile_is_bound_to_gate_mode(producer_case: dict[str, Any]
             {"HERMES_OUTBOUND_MODE": "live"},
             authority,
             mode="preproduction",
+        )
+
+
+def test_schema_receipt_freshness_is_only_required_for_preauthorization(
+    producer_case: dict[str, Any],
+) -> None:
+    stale_now = producer_case["now"] + timedelta(
+        seconds=gate.DEFAULT_EVIDENCE_MAX_AGE_SECONDS + 1
+    )
+    common = {
+        "control_db_path": producer_case["db"],
+        "authority": producer_case["authority"],
+        "now": stale_now,
+        "max_age_seconds": gate.DEFAULT_EVIDENCE_MAX_AGE_SECONDS,
+    }
+    with pytest.raises(
+        gate.ActivationGateError,
+        match="rca_activation_gate_schema_receipt_stale",
+    ):
+        gate._validate_schema_receipt(
+            producer_case["schema"], enforce_freshness=True, **common
+        )
+
+    raw, receipt, _verified = gate._validate_schema_receipt(
+        producer_case["schema"], enforce_freshness=False, **common
+    )
+    assert receipt["schema_fingerprint_sha256"] == producer_case["authority"][
+        "control_store"
+    ]["schema_fingerprint_sha256"]
+    assert hashlib.sha256(raw).hexdigest() == producer_case["authority"][
+        "control_store"
+    ]["backup_receipt_sha256"]
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["backup_receipt_sha256", "database_instance_id", "schema_fingerprint_sha256"],
+)
+def test_late_schema_receipt_still_requires_exact_authority_binding(
+    producer_case: dict[str, Any], field: str
+) -> None:
+    authority = json.loads(json.dumps(producer_case["authority"]))
+    authority["control_store"][field] = "0" * 64
+    with pytest.raises(
+        gate.ActivationGateError,
+        match="rca_activation_gate_schema_authority_mismatch",
+    ):
+        gate._validate_schema_receipt(
+            producer_case["schema"],
+            control_db_path=producer_case["db"],
+            authority=authority,
+            now=producer_case["now"]
+            + timedelta(seconds=gate.DEFAULT_EVIDENCE_MAX_AGE_SECONDS + 1),
+            max_age_seconds=gate.DEFAULT_EVIDENCE_MAX_AGE_SECONDS,
+            enforce_freshness=False,
+        )
+
+
+def test_production_input_allows_live_config_rotation_but_requires_migration_binding(
+    producer_case: dict[str, Any],
+) -> None:
+    migration_raw = b"migration-receipt"
+    activation_input = {
+        "config_sha256": "1" * 64,
+        "migration_receipt_raw_sha256": hashlib.sha256(migration_raw).hexdigest(),
+    }
+    gate._validate_prior_activation_input(
+        mode="production_bootstrap",
+        activation_input=activation_input,
+        config_sha256="2" * 64,
+        migration_raw=migration_raw,
+    )
+    with pytest.raises(
+        gate.ActivationGateError,
+        match="rca_activation_gate_production_input_drift",
+    ):
+        gate._validate_prior_activation_input(
+            mode="production",
+            activation_input=activation_input,
+            config_sha256="2" * 64,
+            migration_raw=b"different-migration-receipt",
+        )
+
+
+def test_preproduction_input_still_requires_config_and_migration_continuity(
+    producer_case: dict[str, Any],
+) -> None:
+    migration_raw = b"migration-receipt"
+    activation_input = {
+        "config_sha256": "1" * 64,
+        "migration_receipt_raw_sha256": hashlib.sha256(migration_raw).hexdigest(),
+    }
+    with pytest.raises(
+        gate.ActivationGateError,
+        match="rca_activation_gate_preproduction_input_drift",
+    ):
+        gate._validate_prior_activation_input(
+            mode="preproduction",
+            activation_input=activation_input,
+            config_sha256="2" * 64,
+            migration_raw=migration_raw,
         )
 
 
