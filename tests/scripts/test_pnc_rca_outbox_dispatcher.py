@@ -1265,6 +1265,53 @@ def test_exact_outbox_hold_rechecks_external_bindings_before_commit(
     assert _rows_and_meta(store) == before
 
 
+def test_exact_outbox_hold_rechecks_freshness_after_slow_final_binding_check(
+    tmp_path, monkeypatch, capsys
+):
+    store, _config, _receipt, _args, output = _exact_hold_plan(
+        tmp_path, monkeypatch, capsys
+    )
+    audit = output["plan"]
+    recorded_at = datetime.fromisoformat(audit["recorded_at"])
+    clock = {"now": recorded_at + timedelta(seconds=1)}
+    real_utc_datetime = control_store_module._utc_datetime
+
+    def controlled_utc_datetime(value=None):
+        return clock["now"] if value is None else real_utc_datetime(value)
+
+    real_validate = store._validate_exact_hold_external_bindings
+    calls = 0
+
+    def slow_final_validate(payload, *, include_control_db_identity=True):
+        nonlocal calls
+        calls += 1
+        result = real_validate(
+            payload,
+            include_control_db_identity=include_control_db_identity,
+        )
+        if calls == 3:
+            clock["now"] = recorded_at + timedelta(
+                seconds=dispatcher.EXACT_OUTBOX_HOLD_RECORD_MAX_AGE_SECONDS + 1
+            )
+        return result
+
+    monkeypatch.setattr(
+        control_store_module,
+        "_utc_datetime",
+        controlled_utc_datetime,
+    )
+    monkeypatch.setattr(
+        store,
+        "_validate_exact_hold_external_bindings",
+        slow_final_validate,
+    )
+    before = _rows_and_meta(store)
+    with pytest.raises(RuntimeError, match="exact_outbox_hold_recorded_at_stale"):
+        store.hold_exact_outbox_with_audit(audit=audit)
+    assert calls == 3
+    assert _rows_and_meta(store) == before
+
+
 @pytest.mark.parametrize("plist_break", ("launcher", "virtual_env"))
 def test_exact_outbox_hold_rejects_wrong_runtime_plist_without_mutation(
     tmp_path, monkeypatch, capsys, plist_break

@@ -18237,6 +18237,7 @@ class RcaControlStore:
                 effective_payload,
                 include_control_db_identity=False,
             )
+            self._exact_hold_freshness(payload, _utc_datetime())
             conn.commit()
             return dict(effective_payload)
         except Exception:
