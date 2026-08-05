@@ -431,7 +431,7 @@ def test_clear_circuit_rejects_config_drift_before_mutation(
         str(receipt),
     ]) == 0
     plan = json.loads(capsys.readouterr().out)["plan"]
-    changed_config = replace(config, batch_size=config.batch_size + 1)
+    changed_config = replace(config, inventory_pin="c" * 64)
     monkeypatch.setattr(
         dispatcher_module.DispatcherConfig,
         "from_env",
@@ -519,6 +519,143 @@ def test_clear_circuit_rejects_exact_before_state_drift(
     assert not receipt.exists()
 
 
+def test_clear_circuit_rejects_destination_drift_from_reviewed_plan(
+    tmp_path, monkeypatch, capsys
+):
+    config = _config(tmp_path, enabled=False)
+    RcaControlStore(config.control_db_path)
+    store = RcaDeliveryStore(config.control_db_path)
+    store.open_delivery_dispatcher_circuit(
+        effect_kind=DELIVERY_EFFECT_KIND,
+        reason_code="operator_test_open",
+        now=NOW,
+    )
+    binding = _patch_circuit_reset_cli(monkeypatch, config, tmp_path)
+    planned_receipt = tmp_path / "planned-destination.json"
+    alternate_receipt = tmp_path / "alternate-destination.json"
+    assert dispatcher_module.main([
+        "--clear-circuit",
+        "--effect-kind",
+        DELIVERY_EFFECT_KIND,
+        "--operator",
+        "owner",
+        "--reason",
+        "destination binding",
+        "--receipt",
+        str(planned_receipt),
+    ]) == 0
+    plan = json.loads(capsys.readouterr().out)["plan"]
+    assert dispatcher_module.main([
+        "--clear-circuit",
+        "--effect-kind",
+        DELIVERY_EFFECT_KIND,
+        "--operator",
+        "owner",
+        "--reason",
+        "destination binding",
+        "--apply",
+        "--expected-active-release-binding-sha256",
+        binding["sha256"],
+        "--expected-config-binding-sha256",
+        plan["config_binding_sha256"],
+        "--expected-plan-id",
+        plan["plan_id"],
+        "--expected-before-state-sha256",
+        plan["before_state_sha256"],
+        "--receipt",
+        str(alternate_receipt),
+    ]) == 2
+    assert "plan_changed" in capsys.readouterr().out
+    assert store.delivery_dispatcher_circuit(DELIVERY_EFFECT_KIND).state == "open"
+    assert not planned_receipt.exists()
+    assert not alternate_receipt.exists()
+
+
+def test_clear_circuit_parent_swap_is_rejected_before_receipt_write(
+    tmp_path, monkeypatch, capsys
+):
+    config = _config(tmp_path, enabled=False)
+    RcaControlStore(config.control_db_path)
+    store = RcaDeliveryStore(config.control_db_path)
+    store.open_delivery_dispatcher_circuit(
+        effect_kind=DELIVERY_EFFECT_KIND,
+        reason_code="operator_test_open",
+        now=NOW,
+    )
+    binding = _patch_circuit_reset_cli(monkeypatch, config, tmp_path)
+    destination_dir = tmp_path / "receipts"
+    destination_dir.mkdir()
+    receipt = destination_dir / "swap-reset.json"
+    assert dispatcher_module.main([
+        "--clear-circuit",
+        "--effect-kind",
+        DELIVERY_EFFECT_KIND,
+        "--operator",
+        "owner",
+        "--reason",
+        "parent swap",
+        "--receipt",
+        str(receipt),
+    ]) == 0
+    plan = json.loads(capsys.readouterr().out)["plan"]
+    original_writer = dispatcher_module._write_immutable_circuit_reset_receipt
+
+    def swap_then_write(path, value, **kwargs):
+        old_dir = tmp_path / "receipts-old"
+        destination_dir.rename(old_dir)
+        destination_dir.mkdir()
+        return original_writer(path, value, **kwargs)
+
+    monkeypatch.setattr(
+        dispatcher_module,
+        "_write_immutable_circuit_reset_receipt",
+        swap_then_write,
+    )
+    assert dispatcher_module.main([
+        "--clear-circuit",
+        "--effect-kind",
+        DELIVERY_EFFECT_KIND,
+        "--operator",
+        "owner",
+        "--reason",
+        "parent swap",
+        "--apply",
+        "--expected-active-release-binding-sha256",
+        binding["sha256"],
+        "--expected-config-binding-sha256",
+        plan["config_binding_sha256"],
+        "--expected-plan-id",
+        plan["plan_id"],
+        "--expected-before-state-sha256",
+        plan["before_state_sha256"],
+        "--receipt",
+        str(receipt),
+    ]) == 2
+    error = json.loads(capsys.readouterr().out)
+    assert error["recovery_required"] is True
+    assert store.delivery_dispatcher_circuit(DELIVERY_EFFECT_KIND).state == "closed"
+    assert not receipt.exists()
+    monkeypatch.setattr(
+        dispatcher_module,
+        "_write_immutable_circuit_reset_receipt",
+        original_writer,
+    )
+    recovered_dir = tmp_path / "recovered"
+    recovered_dir.mkdir()
+    recovered = recovered_dir / "swap-recovered.json"
+    assert dispatcher_module.main([
+        "--materialize-reset",
+        error["reset_id"],
+        "--effect-kind",
+        DELIVERY_EFFECT_KIND,
+        "--receipt",
+        str(recovered),
+    ]) == 0
+    envelope = json.loads(recovered.read_text(encoding="utf-8"))
+    assert envelope["source_reset_id"] == error["reset_id"]
+    assert envelope["materialized_destination"]["path"] == str(recovered)
+
+
 def test_clear_circuit_receipt_materialization_failure_is_recoverable(
     tmp_path, monkeypatch, capsys
 ):
@@ -594,9 +731,13 @@ def test_clear_circuit_receipt_materialization_failure_is_recoverable(
     ]) == 0
     result = json.loads(capsys.readouterr().out)
     assert result["recovered"] is True
-    assert json.loads(recovered.read_text(encoding="utf-8"))["reset_id"] == error[
-        "reset_id"
-    ]
+    envelope = json.loads(recovered.read_text(encoding="utf-8"))
+    assert envelope["source_reset_id"] == error["reset_id"]
+    assert envelope["audit"]["reset_id"] == error["reset_id"]
+    assert envelope["materialized_destination"]["path"] == str(recovered)
+    assert envelope["planned_destination_binding"] == (
+        envelope["audit"]["destination_binding"]
+    )
 
 
 def test_clear_circuit_requires_governed_inputs_and_leaves_open_state(

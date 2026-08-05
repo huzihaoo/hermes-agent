@@ -148,6 +148,7 @@ from scripts.pnc_foxglove_delivery import (
 from scripts.pnc_rca_outbox_dispatcher import (
     _absolute_new_receipt_path as _absolute_new_circuit_reset_receipt_path,
     _control_db_identity,
+    _receipt_parent_identity,
     _validate_reset_audit_text as _validate_circuit_reset_text,
     _write_immutable_receipt as _write_immutable_circuit_reset_receipt,
 )
@@ -191,6 +192,9 @@ _CIRCUIT_CODES = frozenset({
     "delivery_boundary_contract_invalid",
     "report_http_auth_or_permission",
 })
+DELIVERY_CIRCUIT_RESET_RECOVERY_SCHEMA_VERSION = (
+    "pnc_rca_delivery_circuit_reset_recovery_v1"
+)
 class DeliveryCircuitResetReceiptMaterializationError(RuntimeError):
     def __init__(self, *, reset_id: str, receipt_path: Path, cause: Exception):
         self.reset_id = str(reset_id)
@@ -474,6 +478,23 @@ def _circuit_reset_sha256(value: Any) -> str:
     ).hexdigest()
 
 
+def _circuit_reset_config_binding(config: "DispatcherConfig") -> str:
+    payload = config.public_dict()
+    payload["inventory_pin"] = config.inventory_pin
+    payload["observation_release_id"] = config.observation_release_id
+    return _circuit_reset_sha256(payload)
+
+
+def _circuit_reset_destination_binding(path: Path) -> dict[str, Any]:
+    absolute = str(path.expanduser().absolute())
+    parent = _receipt_parent_identity(path)
+    return {
+        "path_sha256": hashlib.sha256(absolute.encode("utf-8")).hexdigest(),
+        "parent_device": int(parent["device"]),
+        "parent_inode": int(parent["inode"]),
+    }
+
+
 def _bound_source_sha256(path: Path) -> str:
     resolved = path.expanduser().resolve(strict=True)
     descriptor = os.open(
@@ -576,6 +597,9 @@ def _build_delivery_circuit_reset_receipt(
     before_state = json.loads(_circuit_reset_canonical_json(before))
     before_failure = before_state["permanent_failure"]
     last_failure_present = bool(before_failure["last_failure_present"])
+    if receipt_path is None:
+        raise ValueError("delivery_circuit_reset_receipt_required")
+    destination_binding = _circuit_reset_destination_binding(receipt_path)
     after_circuit = {
         "state": "closed",
         "reason_code": "",
@@ -590,7 +614,7 @@ def _build_delivery_circuit_reset_receipt(
         "last_failure_present": False,
     }
     db_identity = _control_db_identity(config.control_db_path)
-    config_binding_sha256 = _circuit_reset_sha256(config.public_dict())
+    config_binding_sha256 = _circuit_reset_config_binding(config)
     plan_id = _circuit_reset_sha256(
         {
             "operator": operator,
@@ -601,6 +625,7 @@ def _build_delivery_circuit_reset_receipt(
             "config_binding_sha256": config_binding_sha256,
             "active_release_binding_sha256": active_release_binding["sha256"],
             "tool_provenance": dict(tool_provenance),
+            "destination_binding": destination_binding,
         }
     )
     reset_seed = {
@@ -628,6 +653,7 @@ def _build_delivery_circuit_reset_receipt(
         "effect_kind": effect_kind,
         "control_db_identity": db_identity,
         "config_binding_sha256": config_binding_sha256,
+        "destination_binding": destination_binding,
         "active_release_binding": dict(active_release_binding),
         "tool_provenance": dict(tool_provenance),
         "before": before_state["circuit"],
@@ -650,10 +676,32 @@ def _build_delivery_circuit_reset_receipt(
             },
         },
     }
-    if receipt_path is not None:
-        receipt["receipt_path"] = str(receipt_path)
     receipt["receipt_fingerprint"] = _dispatcher_circuit_reset_fingerprint(receipt)
     return receipt
+
+
+def _build_delivery_circuit_reset_recovery_envelope(
+    audit: Mapping[str, Any],
+    receipt_path: Path,
+) -> dict[str, Any]:
+    destination = _circuit_reset_destination_binding(receipt_path)
+    envelope: dict[str, Any] = {
+        "schema_version": DELIVERY_CIRCUIT_RESET_RECOVERY_SCHEMA_VERSION,
+        "command": "materialize-delivery-circuit-reset",
+        "recovered": True,
+        "source_reset_id": audit["reset_id"],
+        "source_receipt_fingerprint": audit["receipt_fingerprint"],
+        "planned_destination_binding": audit["destination_binding"],
+        "materialized_destination": {
+            "path": str(receipt_path),
+            "binding": destination,
+        },
+        "materialized_at": _utc_now().isoformat(),
+        "external_effects_triggered": False,
+        "audit": dict(audit),
+    }
+    envelope["receipt_fingerprint"] = _circuit_reset_sha256(envelope)
+    return envelope
 
 
 def _stable_key(prefix: str, material: Mapping[str, Any]) -> str:
@@ -5773,8 +5821,6 @@ def _validate_circuit_reset_arguments(args: argparse.Namespace) -> None:
     expected_config = args.expected_config_binding_sha256
     expected_plan = args.expected_plan_id
     expected_before = args.expected_before_state_sha256
-    expected_plan = args.expected_plan_id
-    expected_before = args.expected_before_state_sha256
     if args.clear_circuit and args.materialize_reset:
         raise ValueError("delivery_circuit_reset_modes_conflict")
     if args.materialize_reset:
@@ -5798,7 +5844,7 @@ def _validate_circuit_reset_arguments(args: argparse.Namespace) -> None:
             raise ValueError("delivery_circuit_reset_operator_and_reason_required")
         if any((args.check_config, args.dry_run, args.health, args.once)):
             raise ValueError("delivery_circuit_reset_flags_conflict")
-        if args.apply and args.receipt is None:
+        if args.receipt is None:
             raise ValueError("delivery_circuit_reset_receipt_required")
         if args.apply and expected_binding is None:
             raise ValueError(
@@ -5856,10 +5902,22 @@ def _run_circuit_reset_command(
         )
         if audit is None:
             raise RuntimeError("delivery_circuit_reset_audit_missing")
+        envelope = _build_delivery_circuit_reset_recovery_envelope(
+            audit,
+            receipt_path,
+        )
         try:
             receipt_sha256 = _write_immutable_circuit_reset_receipt(
                 receipt_path,
-                audit,
+                envelope,
+                expected_parent_identity={
+                    "device": envelope["materialized_destination"]["binding"][
+                        "parent_device"
+                    ],
+                    "inode": envelope["materialized_destination"]["binding"][
+                        "parent_inode"
+                    ],
+                },
             )
         except Exception as exc:
             raise ValueError(
@@ -5874,7 +5932,9 @@ def _run_circuit_reset_command(
                     "effect_kind": args.effect_kind,
                     "receipt": str(receipt_path),
                     "receipt_sha256": receipt_sha256,
-                    "receipt_fingerprint": audit["receipt_fingerprint"],
+                    "receipt_fingerprint": envelope["receipt_fingerprint"],
+                    "source_receipt_fingerprint": audit["receipt_fingerprint"],
+                    "planned_destination_binding": audit["destination_binding"],
                     "external_effects_triggered": False,
                 },
                 ensure_ascii=False,
@@ -5897,7 +5957,7 @@ def _run_circuit_reset_command(
     expected_before = args.expected_before_state_sha256
     if expected_binding is not None and active_binding["sha256"] != expected_binding:
         raise RuntimeError("delivery_circuit_reset_active_binding_changed")
-    config_binding_sha256 = _circuit_reset_sha256(config.public_dict())
+    config_binding_sha256 = _circuit_reset_config_binding(config)
     if expected_config is not None and config_binding_sha256 != expected_config:
         raise RuntimeError("delivery_circuit_reset_config_changed")
     tool_provenance = _circuit_reset_tool_provenance()
@@ -5931,6 +5991,7 @@ def _run_circuit_reset_command(
                     "mode": "plan",
                     "applied": False,
                     "external_effects_triggered": False,
+                    "receipt_path": str(receipt_path),
                     "plan": planned,
                 },
                 ensure_ascii=False,
@@ -5942,6 +6003,8 @@ def _run_circuit_reset_command(
 
     if _active_release_binding_snapshot(config) != active_binding:
         raise RuntimeError("delivery_circuit_reset_active_binding_changed")
+    if _circuit_reset_config_binding(DispatcherConfig.from_env()) != config_binding_sha256:
+        raise RuntimeError("delivery_circuit_reset_config_changed")
     if _circuit_reset_tool_provenance() != tool_provenance:
         raise RuntimeError("delivery_circuit_reset_tool_provenance_changed")
     reset_at = datetime.fromisoformat(recorded_at)
@@ -5959,6 +6022,10 @@ def _run_circuit_reset_command(
         receipt_sha256 = _write_immutable_circuit_reset_receipt(
             receipt_path,
             planned,
+            expected_parent_identity={
+                "device": planned["destination_binding"]["parent_device"],
+                "inode": planned["destination_binding"]["parent_inode"],
+            },
         )
     except Exception as exc:
         raise DeliveryCircuitResetReceiptMaterializationError(

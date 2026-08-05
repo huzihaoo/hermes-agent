@@ -124,6 +124,7 @@ DELIVERY_CIRCUIT_RESET_REQUIRED_FIELDS = frozenset(
     {
         "plan_id",
         "before_state_sha256",
+        "destination_binding",
         "circuit_scope",
         "effect_kind",
         "active_release_binding",
@@ -535,6 +536,22 @@ def _validate_delivery_circuit_reset_audit(
         != hashlib.sha256(_canonical_json(normalized["before"]).encode()).hexdigest()
     ):
         raise ValueError("delivery_circuit_reset_plan_binding_invalid")
+    destination = normalized.get("destination_binding")
+    if (
+        not isinstance(destination, Mapping)
+        or set(destination) != {"path_sha256", "parent_device", "parent_inode"}
+        or re.fullmatch(
+            r"[0-9a-f]{64}", str(destination.get("path_sha256") or "")
+        )
+        is None
+        or isinstance(destination.get("parent_device"), bool)
+        or not isinstance(destination.get("parent_device"), int)
+        or destination.get("parent_device") < 0
+        or isinstance(destination.get("parent_inode"), bool)
+        or not isinstance(destination.get("parent_inode"), int)
+        or destination.get("parent_inode") < 0
+    ):
+        raise ValueError("delivery_circuit_reset_destination_binding_invalid")
     if (
         normalized.get("circuit_scope") != "delivery"
         or normalized.get("effect_kind") not in DELIVERY_EFFECT_KINDS

@@ -508,23 +508,90 @@ def _absolute_new_receipt_path(value: Any) -> Path:
     if not candidate.is_absolute() or str(candidate) != str(candidate.absolute()):
         raise ValueError("dispatcher_circuit_reset_receipt_path_invalid")
     target = candidate.absolute()
-    sidecar = Path(f"{target}.sha256")
-    if os.path.lexists(target) or os.path.lexists(sidecar):
-        raise ValueError("dispatcher_circuit_reset_receipt_already_exists")
+    if target.name in {"", ".", ".."}:
+        raise ValueError("dispatcher_circuit_reset_receipt_path_invalid")
     parent_path = target.parent
+    parent_fd = -1
     try:
-        parent = parent_path.lstat()
+        parent_fd, _identity = _open_receipt_parent(parent_path)
+        for name in (target.name, f"{target.name}.sha256"):
+            try:
+                os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            raise ValueError("dispatcher_circuit_reset_receipt_already_exists")
     except OSError as exc:
         raise ValueError("dispatcher_circuit_reset_receipt_parent_invalid") from exc
+    finally:
+        if parent_fd >= 0:
+            os.close(parent_fd)
+    return target
+
+
+def _receipt_parent_identity(path: Path) -> dict[str, int]:
+    parent_path = path.expanduser().absolute().parent
+    fd = -1
+    try:
+        fd, identity = _open_receipt_parent(parent_path)
+        return identity
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _open_receipt_parent(path: Path) -> tuple[int, dict[str, int]]:
+    parent_path = path.expanduser().absolute()
+    if Path(os.path.realpath(parent_path)) != parent_path:
+        raise OSError("receipt parent is not canonical")
+    fd = os.open(
+        parent_path,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        observed = os.fstat(fd)
+        if (
+            not stat.S_ISDIR(observed.st_mode)
+            or observed.st_nlink < 1
+            or observed.st_uid != os.getuid()
+            or stat.S_IMODE(observed.st_mode) & 0o022
+        ):
+            raise OSError("receipt parent permissions invalid")
+        lexical = parent_path.lstat()
+        if (
+            stat.S_ISLNK(lexical.st_mode)
+            or lexical.st_dev != observed.st_dev
+            or lexical.st_ino != observed.st_ino
+            or Path(os.path.realpath(parent_path)) != parent_path
+        ):
+            raise OSError("receipt parent identity changed")
+        return fd, {
+            "device": int(observed.st_dev),
+            "inode": int(observed.st_ino),
+        }
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _receipt_parent_stable(parent_path: Path, parent_fd: int, identity: Mapping[str, int]) -> None:
+    observed = os.fstat(parent_fd)
+    lexical = parent_path.lstat()
     if (
-        stat.S_ISLNK(parent.st_mode)
-        or not stat.S_ISDIR(parent.st_mode)
-        or parent.st_uid != os.getuid()
-        or stat.S_IMODE(parent.st_mode) & 0o022
+        not stat.S_ISDIR(observed.st_mode)
+        or observed.st_nlink < 1
+        or observed.st_uid != os.getuid()
+        or stat.S_IMODE(observed.st_mode) & 0o022
+        or observed.st_dev != int(identity["device"])
+        or observed.st_ino != int(identity["inode"])
+        or lexical.st_dev != observed.st_dev
+        or lexical.st_ino != observed.st_ino
+        or stat.S_ISLNK(lexical.st_mode)
         or Path(os.path.realpath(parent_path)) != parent_path
     ):
-        raise ValueError("dispatcher_circuit_reset_receipt_parent_invalid")
-    return target
+        raise OSError("receipt parent identity changed")
 
 
 def _control_db_identity(path: Path) -> dict[str, Any]:
@@ -558,12 +625,17 @@ def _write_all(descriptor: int, raw: bytes) -> None:
         view = view[written:]
 
 
-def _create_immutable_file(path: Path, raw: bytes) -> None:
-    temporary = path.with_name(
-        f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
-    )
+def _create_immutable_file(
+    parent_path: Path,
+    parent_fd: int,
+    name: str,
+    raw: bytes,
+    identity: Mapping[str, int],
+) -> None:
+    temporary = f".{name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
     descriptor = -1
     try:
+        _receipt_parent_stable(parent_path, parent_fd, identity)
         descriptor = os.open(
             temporary,
             os.O_WRONLY
@@ -572,6 +644,7 @@ def _create_immutable_file(path: Path, raw: bytes) -> None:
             | getattr(os, "O_CLOEXEC", 0)
             | getattr(os, "O_NOFOLLOW", 0),
             0o400,
+            dir_fd=parent_fd,
         )
         _write_all(descriptor, raw)
         os.fsync(descriptor)
@@ -579,21 +652,18 @@ def _create_immutable_file(path: Path, raw: bytes) -> None:
         os.close(descriptor)
         descriptor = -1
         try:
-            os.link(temporary, path, follow_symlinks=False)
+            os.link(
+                temporary,
+                name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
         except FileExistsError as exc:
             raise ValueError("dispatcher_circuit_reset_receipt_already_exists") from exc
-        temporary.unlink()
-        directory = os.open(
-            path.parent,
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-        )
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        os.unlink(temporary, dir_fd=parent_fd)
+        _receipt_parent_stable(parent_path, parent_fd, identity)
+        os.fsync(parent_fd)
     except ValueError:
         raise
     except OSError as exc:
@@ -602,19 +672,48 @@ def _create_immutable_file(path: Path, raw: bytes) -> None:
         if descriptor >= 0:
             os.close(descriptor)
         try:
-            temporary.unlink()
+            try:
+                os.unlink(temporary, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
         except FileNotFoundError:
             pass
 
 
-def _write_immutable_receipt(path: Path, value: Mapping[str, Any]) -> str:
+def _write_immutable_receipt(
+    path: Path,
+    value: Mapping[str, Any],
+    *,
+    expected_parent_identity: Mapping[str, int] | None = None,
+) -> str:
     """Create a receipt and hash sidecar without replacing an existing file."""
     raw = _canonical_receipt_json(value).encode("utf-8")
-    _create_immutable_file(path, raw)
-    digest = hashlib.sha256(raw).hexdigest()
-    sidecar = Path(f"{path}.sha256")
-    _create_immutable_file(sidecar, f"{digest}  {path.name}\n".encode("ascii"))
-    return digest
+    parent_path = path.expanduser().absolute().parent
+    parent_fd, identity = _open_receipt_parent(parent_path)
+    try:
+        if expected_parent_identity is not None and dict(identity) != {
+            "device": int(expected_parent_identity["device"]),
+            "inode": int(expected_parent_identity["inode"]),
+        }:
+            raise ValueError("dispatcher_circuit_reset_receipt_parent_changed")
+        for name in (path.name, f"{path.name}.sha256"):
+            try:
+                os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            raise ValueError("dispatcher_circuit_reset_receipt_already_exists")
+        _create_immutable_file(parent_path, parent_fd, path.name, raw, identity)
+        digest = hashlib.sha256(raw).hexdigest()
+        _create_immutable_file(
+            parent_path,
+            parent_fd,
+            f"{path.name}.sha256",
+            f"{digest}  {path.name}\n".encode("ascii"),
+            identity,
+        )
+        return digest
+    finally:
+        os.close(parent_fd)
 
 
 def _build_circuit_reset_receipt(
