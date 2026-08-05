@@ -8759,7 +8759,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         drained = await self._drain_startup_restore_queue()
         self._startup_restore_in_progress = False
         if drained:
-            logger.info("Drained %d inbound message(s) queued during startup restore", drained)
+            logger.info(
+                "Dispatched %d inbound message(s) queued during startup restore",
+                drained,
+            )
 
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.

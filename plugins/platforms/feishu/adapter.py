@@ -769,6 +769,8 @@ _DEFAULT_API_POLL_PAGE_SIZE = 10
 _MAX_API_POLL_PAGE_SIZE = 50
 _DEFAULT_API_POLL_STARTUP_LOOKBACK_SECONDS = 0
 _MAX_API_POLL_STARTUP_LOOKBACK_SECONDS = 10 * 60
+_DEFAULT_API_POLL_INITIAL_DELAY_SECONDS = 0
+_MAX_API_POLL_INITIAL_DELAY_SECONDS = 60
 _MAX_API_POLL_STARTUP_PAGES = 20
 _API_POLL_REQUEST_TIMEOUT_SECONDS = 20
 _API_POLL_CANCEL_WAIT_SECONDS = _API_POLL_REQUEST_TIMEOUT_SECONDS + 5
@@ -2274,6 +2276,13 @@ class FeishuAdapter(BasePlatformAdapter):
             minimum=0,
             maximum=_MAX_API_POLL_STARTUP_LOOKBACK_SECONDS,
         )
+        self._api_poll_initial_delay_seconds = _bounded_int_setting(
+            config.extra.get("api_poll_initial_delay_seconds"),
+            env_name="HERMES_FEISHU_API_POLL_INITIAL_DELAY_SECONDS",
+            default=_DEFAULT_API_POLL_INITIAL_DELAY_SECONDS,
+            minimum=0,
+            maximum=_MAX_API_POLL_INITIAL_DELAY_SECONDS,
+        )
         self._api_poll_task: Optional[asyncio.Task] = None
         self._api_poll_seen_message_ids: set[str] = set()
         self._api_poll_seen_message_order: List[str] = []
@@ -2800,11 +2809,12 @@ class FeishuAdapter(BasePlatformAdapter):
             return
         self._api_poll_task = loop.create_task(self._poll_api_chats_loop())
         logger.info(
-            "[Feishu] API polling fallback enabled for %d chat(s), interval=%.1fs, page_size=%d, startup_lookback=%ds",
+            "[Feishu] API polling fallback enabled for %d chat(s), interval=%.1fs, page_size=%d, startup_lookback=%ds, initial_delay=%ds",
             len(self._api_poll_chat_ids),
             self._api_poll_interval_seconds,
             self._api_poll_page_size,
             self._api_poll_startup_lookback_seconds,
+            self._api_poll_initial_delay_seconds,
         )
 
     async def _establish_api_poll_startup_baselines(self) -> None:
@@ -2852,6 +2862,8 @@ class FeishuAdapter(BasePlatformAdapter):
             }
 
     async def _poll_api_chats_loop(self) -> None:
+        if self._api_poll_initial_delay_seconds > 0:
+            await asyncio.sleep(self._api_poll_initial_delay_seconds)
         while True:
             for chat_id in list(self._api_poll_chat_ids):
                 try:

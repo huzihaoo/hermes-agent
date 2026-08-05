@@ -3472,6 +3472,28 @@ class TestFeishuApiPollStartupLookback(unittest.TestCase):
 
         adapter._handle_message_event_data.assert_not_awaited()
         self.assertEqual(adapter._api_poll_startup_lookback_seconds, 0)
+        self.assertEqual(adapter._api_poll_initial_delay_seconds, 0)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_configured_initial_delay_defers_first_api_poll(self):
+        adapter = self._make_adapter(
+            {
+                "api_poll_chat_ids": ["oc_test"],
+                "api_poll_initial_delay_seconds": 10,
+            }
+        )
+        adapter._poll_api_chat_once = AsyncMock()
+
+        async def _run():
+            task = asyncio.create_task(adapter._poll_api_chats_loop())
+            await asyncio.sleep(0)
+            adapter._poll_api_chat_once.assert_not_awaited()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(_run())
+        self.assertEqual(adapter._api_poll_initial_delay_seconds, 10)
 
     @patch.dict(
         os.environ,
@@ -3736,24 +3758,28 @@ class TestFeishuApiPollStartupLookback(unittest.TestCase):
             {
                 "HERMES_FEISHU_API_POLL_PAGE_SIZE": "50",
                 "HERMES_FEISHU_API_POLL_STARTUP_LOOKBACK_SECONDS": "600",
+                "HERMES_FEISHU_API_POLL_INITIAL_DELAY_SECONDS": "60",
             },
             clear=True,
         ):
             adapter = self._make_adapter()
             self.assertEqual(adapter._api_poll_page_size, 50)
             self.assertEqual(adapter._api_poll_startup_lookback_seconds, 600)
+            self.assertEqual(adapter._api_poll_initial_delay_seconds, 60)
 
         with patch.dict(
             os.environ,
             {
                 "HERMES_FEISHU_API_POLL_PAGE_SIZE": "51",
                 "HERMES_FEISHU_API_POLL_STARTUP_LOOKBACK_SECONDS": "invalid",
+                "HERMES_FEISHU_API_POLL_INITIAL_DELAY_SECONDS": "61",
             },
             clear=True,
         ):
             adapter = self._make_adapter()
             self.assertEqual(adapter._api_poll_page_size, 10)
             self.assertEqual(adapter._api_poll_startup_lookback_seconds, 0)
+            self.assertEqual(adapter._api_poll_initial_delay_seconds, 0)
 
 
 class TestDedupTTL(unittest.TestCase):
@@ -3819,7 +3845,8 @@ class TestDedupTTL(unittest.TestCase):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
-        adapter = FeishuAdapter(PlatformConfig())
+        with patch.object(FeishuAdapter, "_load_seen_message_ids"):
+            adapter = FeishuAdapter(PlatformConfig())
         ts = time.time()
         adapter._seen_message_ids = {"om_ts1": ts}
         adapter._seen_message_order = ["om_ts1"]
