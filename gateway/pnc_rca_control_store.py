@@ -17354,7 +17354,7 @@ class RcaControlStore:
         try:
             conn.execute("BEGIN IMMEDIATE")
             fresh_inside = _utc_datetime()
-            remaining_inside = self._exact_hold_freshness(payload, fresh_inside)[2]
+            self._exact_hold_freshness(payload, fresh_inside)
             self._validate_exact_hold_external_bindings(payload)
             changes_before = conn.total_changes
             existing = conn.execute(
@@ -17374,6 +17374,21 @@ class RcaControlStore:
             )
             target = snapshot["target"]
             predecessor = snapshot["predecessor"]
+            payload_horizon = payload["retry_horizon"]
+            snapshot_horizon = snapshot["retry_horizon"]
+            actual_remaining = snapshot_horizon["remaining_seconds"]
+            if (
+                payload_horizon["target_outbox_id"]
+                != snapshot_horizon["target_outbox_id"]
+                or payload_horizon["anchor"] != snapshot_horizon["anchor"]
+                or payload_horizon["expires_at"]
+                != snapshot_horizon["expires_at"]
+                or isinstance(actual_remaining, bool)
+                or not isinstance(actual_remaining, (int, float))
+                or actual_remaining < EXACT_OUTBOX_HOLD_MIN_REMAINING_SECONDS
+            ):
+                raise RuntimeError("exact_outbox_hold_retry_horizon_changed")
+            remaining_inside = int(actual_remaining)
             if (
                 target["row_sha256"] != payload["target_before"]["row_sha256"]
                 or predecessor["row_sha256"]

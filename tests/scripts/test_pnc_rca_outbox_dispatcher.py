@@ -854,6 +854,108 @@ def test_exact_outbox_hold_public_api_rejects_expiry_margin_without_mutation(
     assert _rows_and_meta(store) == before
 
 
+def test_exact_outbox_hold_public_api_rejects_self_signed_retry_horizon_without_mutation(
+    tmp_path, monkeypatch, capsys
+):
+    store, _config, _receipt, _args, output = _exact_hold_plan(
+        tmp_path, monkeypatch, capsys
+    )
+    audit = copy.deepcopy(output["plan"])
+    observed_at = datetime.now(timezone.utc)
+    actual_anchor = observed_at - timedelta(
+        seconds=audit["max_age_seconds"] - 120
+    )
+    conn = store._connect()
+    try:
+        conn.execute(
+            "UPDATE rca_outbox SET retry_window_started_at = ? WHERE outbox_id = 685",
+            (actual_anchor.isoformat(),),
+        )
+    finally:
+        conn.close()
+    snapshot = store._exact_outbox_hold_private_snapshot(
+        target_outbox_id=685,
+        predecessor_outbox_id=684,
+        activation_required=True,
+        max_age_seconds=audit["max_age_seconds"],
+        now=observed_at,
+    )
+    assert 0 < snapshot["retry_horizon"]["remaining_seconds"] < (
+        EXACT_OUTBOX_HOLD_MIN_REMAINING_SECONDS
+    )
+
+    recorded_at = observed_at.isoformat()
+    target_before = dispatcher._public_exact_hold_row(snapshot["target"])
+    target_projection = dict(snapshot["target"]["_row_projection"])
+    target_projection["next_attempt_at"] = dispatcher.EXACT_OUTBOX_HOLD_UNTIL
+    target_projection["updated_at"] = recorded_at
+    target_after = dict(target_before)
+    target_after.update(
+        {
+            "next_attempt_at": dispatcher.EXACT_OUTBOX_HOLD_UNTIL,
+            "updated_at": recorded_at,
+            "row_sha256": control_store_module._exact_canonical_sha256(
+                target_projection
+            ),
+        }
+    )
+    predecessor = dispatcher._public_exact_hold_row(snapshot["predecessor"])
+    queue_after_entries = [
+        {
+            "outbox_id": predecessor["outbox_id"],
+            "row_sha256": predecessor["row_sha256"],
+        }
+    ]
+    audit.update(
+        {
+            "recorded_at": recorded_at,
+            "active_activation": dict(snapshot["active_activation"]),
+            "target_before": target_before,
+            "target_after": target_after,
+            "predecessor": predecessor,
+            "eligible_queue_before": dict(snapshot["eligible_queue"]),
+            "eligible_queue_after": {
+                "outbox_ids": [684],
+                "entries": queue_after_entries,
+                "sha256": RcaControlStore._exact_outbox_queue_sha256(
+                    queue_after_entries
+                ),
+            },
+        }
+    )
+    audit["effect_delta"]["mutation"]["updated_at"] = recorded_at
+    forged_anchor = observed_at
+    forged_expires = forged_anchor + timedelta(seconds=audit["max_age_seconds"])
+    audit["retry_horizon"].update(
+        {
+            "anchor": forged_anchor.isoformat(),
+            "expires_at": forged_expires.isoformat(),
+            "plan_remaining_seconds": audit["max_age_seconds"],
+            "apply_observed_at": None,
+            "apply_remaining_seconds": None,
+        }
+    )
+    read_only_store = RcaControlStore(
+        store.db_path, require_current=True, read_only=True
+    )
+    audit["control_db_identity"] = (
+        read_only_store.control_db_source_snapshot_identity()
+    )
+    _resign_exact_hold(audit)
+
+    before = _rows_and_meta(store)
+    with pytest.raises(
+        RuntimeError, match="exact_outbox_hold_retry_horizon_changed"
+    ):
+        store.hold_exact_outbox_with_audit(audit=audit)
+    after = _rows_and_meta(store)
+    assert after == before
+    assert not any(
+        item["key"].startswith(control_store_module.EXACT_OUTBOX_HOLD_META_PREFIX)
+        for item in after[1]
+    )
+
+
 def test_exact_outbox_hold_recovery_survives_removed_or_swapped_receipt_parent(
     tmp_path, monkeypatch, capsys
 ):
