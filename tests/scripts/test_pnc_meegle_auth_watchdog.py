@@ -200,7 +200,16 @@ def test_consecutive_expired_alerts_once_assists_and_rate_limits(tmp_path):
     assert r3["alert_sent"] is False
     assert r4["alert_sent"] is True
     assert len(sent) == 2
-    assert runner_calls == [["auth", "login", "--device-code", "--phase", "init", "--once"]] * 2
+    assert runner_calls == [[
+        "auth",
+        "login",
+        "--device-code",
+        "--host",
+        "project.feishu.cn",
+        "--phase",
+        "init",
+        "--once",
+    ]] * 2
     first_msg = sent[0]["message"]
     assert '<at user_id="ou_owner">' in first_msg
     assert "胡子豪" in first_msg
@@ -354,6 +363,24 @@ def test_alert_message_redacts_device_code_but_keeps_human_material(tmp_path):
     assert "device_code" not in message
 
 
+def test_proactive_init_failure_keeps_manual_command_separate_from_error(tmp_path):
+    message = wd.build_alert_message(
+        state="healthy",
+        status=auth(107),
+        config=cfg(tmp_path),
+        assist={
+            "ok": False,
+            "error": "ExternalWriteFenceError: command denied",
+        },
+        proactive=True,
+    )
+
+    lines = message.splitlines()
+    assert "meegle auth login --device-code --host project.feishu.cn" in lines
+    assert "error=ExternalWriteFenceError: command denied" in lines
+    assert "project.feishu.cn。error=" not in message
+
+
 def test_quiet_hours_suppresses_confirmed_meegle_alert(tmp_path):
     sent = []
     wd.run_once(cfg(tmp_path, quiet_start="22:00", quiet_end="08:00"), deps([auth(None, authenticated=False)], sent=sent, now=23 * 3600)[0])
@@ -387,7 +414,16 @@ def test_long_auto_roll_without_device_code_init_triggers_proactive_reinit(tmp_p
     assert result["state"] == "healthy"
     assert result["proactive_reinit"] is True
     assert result["alert_sent"] is True
-    assert runner_calls == [["auth", "login", "--device-code", "--phase", "init", "--once"]]
+    assert runner_calls == [[
+        "auth",
+        "login",
+        "--device-code",
+        "--host",
+        "project.feishu.cn",
+        "--phase",
+        "init",
+        "--once",
+    ]]
     assert '<at user_id="ou_owner">' in sent[0]["message"]
     assert "需扫码续期" in sent[0]["message"]
     assert "SECRET" not in sent[0]["message"]

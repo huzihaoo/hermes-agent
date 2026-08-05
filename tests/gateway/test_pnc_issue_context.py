@@ -63,6 +63,80 @@ def test_default_meegle_runner_allows_only_known_read_commands_without_claim(
     assert calls[0][0] == ["/bin/meegle", *args]
 
 
+def test_default_meegle_runner_allows_exact_device_code_init_without_claim(monkeypatch):
+    args = [
+        "auth",
+        "login",
+        "--device-code",
+        "--host",
+        "project.feishu.cn",
+        "--phase",
+        "init",
+        "--once",
+    ]
+    calls = []
+    monkeypatch.setattr(pnc_issue_context.shutil, "which", lambda _name: "/bin/meegle")
+    monkeypatch.setattr(
+        pnc_issue_context,
+        "require_provider_write_claim",
+        lambda **_kwargs: pytest.fail("device-code init consulted issue write authority"),
+    )
+    monkeypatch.setattr(
+        pnc_issue_context.subprocess,
+        "run",
+        lambda command, **kwargs: calls.append((command, kwargs))
+        or _completed_meegle(command, **kwargs),
+    )
+
+    assert pnc_issue_context.default_meegle_runner(args) == (0, "{}", "")
+    assert calls[0][0] == ["/bin/meegle", *args]
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["auth", "login", "--device-code", "--phase", "init"],
+        ["auth", "login", "--device-code", "--phase", "complete", "--once"],
+        ["auth", "login", "--device-code"],
+        [
+            "auth",
+            "login",
+            "--device-code",
+            "--host",
+            "project.feishu.cn",
+            "--phase",
+            "init",
+            "--once",
+            "--format",
+            "json",
+        ],
+        [
+            "auth",
+            "login",
+            "--device-code",
+            "--host",
+            "evil.example",
+            "--phase",
+            "init",
+            "--once",
+        ],
+        ["auth", "logout"],
+    ],
+)
+def test_default_meegle_runner_rejects_noncanonical_auth_controls(monkeypatch, args):
+    monkeypatch.setattr(
+        pnc_issue_context.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("noncanonical auth command reached subprocess"),
+    )
+
+    with pytest.raises(
+        pnc_issue_context.ExternalWriteFenceError,
+        match="Meegle command is not allowlisted",
+    ):
+        pnc_issue_context.default_meegle_runner(args)
+
+
 def test_adoption_operation_page_accepts_only_explicit_user_change():
     rows, token = pnc_issue_context.normalize_g1q3_adoption_operation_page({
         "has_more": True,

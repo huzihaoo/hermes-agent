@@ -51,6 +51,7 @@ DEFAULT_REALERT_SECONDS = 2 * 60 * 60
 DEFAULT_CONFIRM_CHECKS = 2
 DEFAULT_PROACTIVE_REINIT_HOURS = 24
 DEFAULT_PROACTIVE_AUTO_ROLL_COUNT = 3
+DEFAULT_MEEGLE_HOST = "project.feishu.cn"
 DEFAULT_OWNER_NAME = "胡子豪"
 DEFAULT_OWNER_OPEN_ID = "ou_d1d3cfeba1be0a22faa36aaf4fb3907d"
 STATE_FILE_NAME = "meegle_auth_watchdog_state.json"
@@ -86,7 +87,7 @@ class WatchdogConfig:
     owner_name: str = DEFAULT_OWNER_NAME
     alert_target: str = ""
     state_path: Path | None = None
-    host_default: str = "project.feishu.cn"
+    host_default: str = DEFAULT_MEEGLE_HOST
     quiet_start: str = "22:00"
     quiet_end: str = "08:00"
     proactive_reinit_hours: int = DEFAULT_PROACTIVE_REINIT_HOURS
@@ -268,9 +269,24 @@ def _parse_device_code_payload(out: str, err: str) -> dict[str, str]:
     return redact(result)
 
 
-def try_device_code_init(runner: Callable[[list[str]], tuple[int, str, str]]) -> dict[str, Any]:
+def try_device_code_init(
+    runner: Callable[[list[str]], tuple[int, str, str]],
+    *,
+    host: str = DEFAULT_MEEGLE_HOST,
+) -> dict[str, Any]:
     try:
-        rc, out, err = runner(["auth", "login", "--device-code", "--phase", "init", "--once"])
+        rc, out, err = runner(
+            [
+                "auth",
+                "login",
+                "--device-code",
+                "--host",
+                host,
+                "--phase",
+                "init",
+                "--once",
+            ]
+        )
         payload = _parse_device_code_payload(out, err)
         payload["ok"] = bool(rc == 0 and (payload.get("verification_url") or payload.get("user_code")))
         if rc != 0:
@@ -304,7 +320,13 @@ def build_alert_message(*, state: str, status: dict[str, Any], config: WatchdogC
                 if code:
                     lines.append(f"user_code={code}")
             elif assist.get("error"):
-                lines.append(f"Device Code 初始化失败，请手动执行：meegle auth login --device-code --host project.feishu.cn。error={redact(assist.get('error'))}")
+                lines.extend(
+                    [
+                        "Device Code 初始化失败，请手动执行：",
+                        "meegle auth login --device-code --host project.feishu.cn",
+                        f"error={redact(assist.get('error'))}",
+                    ]
+                )
         return "\n".join(str(redact(line)) for line in lines if line)
 
     title = {
@@ -556,7 +578,7 @@ def run_once(config: WatchdogConfig, deps: WatchdogDeps | None = None) -> dict[s
     quiet_suppressed = False
     recovery = should_recovery_alert(state, previous)
     if proactive_reinit:
-        assist = try_device_code_init(deps.runner)
+        assist = try_device_code_init(deps.runner, host=config.host_default)
         if assist.get("ok"):
             previous[PROACTIVE_REINIT_AT_KEY] = now
             previous.pop(LEGACY_DEVICE_CODE_INIT_AT_KEY, None)
@@ -583,7 +605,7 @@ def run_once(config: WatchdogConfig, deps: WatchdogDeps | None = None) -> dict[s
             if config.try_assist and state == "expired":
                 # Only true confirmed expiry alerts get zero-friction Device Code assist;
                 # rate-limited/quiet-suppressed checks must not mint extra codes.
-                assist = try_device_code_init(deps.runner)
+                assist = try_device_code_init(deps.runner, host=config.host_default)
             message = build_alert_message(state=state, status=status, config=config, assist=assist)
             alert_result = send_alert(message, config, deps)
             alert_sent = bool(alert_result.get("success") or alert_result.get("dry_run"))

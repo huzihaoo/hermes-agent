@@ -100,6 +100,16 @@ _MEEGLE_READ_ONLY_COMMANDS = frozenset(
         ("workitem", "list-op-records"),
     }
 )
+_MEEGLE_DEVICE_CODE_INIT_COMMAND = (
+    "auth",
+    "login",
+    "--device-code",
+    "--host",
+    "project.feishu.cn",
+    "--phase",
+    "init",
+    "--once",
+)
 _MEEGLE_WRITE_COMMANDS = {
     ("comment", "add"): "feishu_issue_comment",
     ("workitem", "update"): "feishu_issue_field_update",
@@ -138,6 +148,8 @@ def _meegle_write_scope(args: list[str]) -> tuple[str, str, str] | None:
             "external_write_fence_operation_denied",
             "Meegle command shape is not allowlisted",
         )
+    if tuple(args) == _MEEGLE_DEVICE_CODE_INIT_COMMAND:
+        return None
     command = (args[0], args[1])
     if command in _MEEGLE_READ_ONLY_COMMANDS:
         return None
