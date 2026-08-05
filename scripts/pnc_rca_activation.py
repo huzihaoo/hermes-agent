@@ -38,6 +38,9 @@ from scripts import pnc_rca_activation_capsule as activation_capsule
 
 ACTIVATION_CLI_SCHEMA_VERSION = "pnc_rca_activation_cli_v1"
 MAX_JSON_INPUT_BYTES = 64 * 1024
+CAPACITY_ORIGIN_COMPAT_SCHEMA_VERSION = "rca_capacity_origin_compat_receipt_v2"
+CAPACITY_ORIGIN_COMPAT_NAME = "capacity-origin-compatibility.json"
+CAPACITY_ORIGIN_COMPAT_MAX_AGE_SECONDS = 3600
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _EPOCH_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _EVENT_UID_RE = re.compile(
@@ -56,6 +59,21 @@ _MANUAL_IDENTITY_FIELDS = frozenset({
     "thread_id",
     "issue_url",
     "mode",
+})
+_CAPACITY_ORIGIN_COMPAT_FIELDS = frozenset({
+    "schema_version",
+    "created_at",
+    "current_release_id",
+    "current_bootstrap_epoch_id",
+    "capacity_origin_release_id",
+    "capacity_origin_bootstrap_epoch_id",
+    "active_release_binding_sha256",
+    "release_bom_sha256",
+    "producer_path",
+    "producer_sha256",
+    "producer_receipt_fingerprint",
+    "database_rows_modified",
+    "external_effects_triggered",
 })
 
 
@@ -1233,6 +1251,97 @@ def _producer_receipt_present(path: Path) -> bool:
         raise ActivationCliError("activation_producer_receipt_stat_failed") from exc
 
 
+def _capacity_producer_identity(
+    binding: Mapping[str, Any],
+) -> tuple[str, str]:
+    origin = binding.get("_capacity_origin")
+    if isinstance(origin, Mapping) and set(origin) == {
+        "release_id",
+        "bootstrap_epoch_id",
+    }:
+        return str(origin["release_id"]), str(origin["bootstrap_epoch_id"])
+    return str(binding["release_id"]), str(binding["bootstrap_epoch_id"])
+
+
+def _load_capacity_origin_compatibility(
+    *,
+    state: Mapping[str, Any],
+    binding: Mapping[str, Any],
+    authorization: Mapping[str, Any],
+    paths: capacity_runtime.CapacityRuntimePaths,
+    hmac_key: bytes,
+    now: datetime,
+) -> dict[str, str]:
+    path = paths.state_root / CAPACITY_ORIGIN_COMPAT_NAME
+    try:
+        value, _raw = _read_json_document(
+            path,
+            "capacity_origin_compat",
+            owner_only=True,
+        )
+    except ActivationCliError as exc:
+        if exc.code == "activation_capacity_origin_compat_file_unavailable":
+            raise ActivationCliError("activation_capacity_origin_binding_invalid") from exc
+        raise
+    if (
+        set(value) != _CAPACITY_ORIGIN_COMPAT_FIELDS
+        or value.get("schema_version") != CAPACITY_ORIGIN_COMPAT_SCHEMA_VERSION
+        or value.get("database_rows_modified") is not False
+        or value.get("external_effects_triggered") is not False
+        or value.get("producer_path") != str(paths.producer_activation)
+    ):
+        raise ActivationCliError("activation_capacity_origin_compat_invalid")
+    try:
+        created_at = datetime.fromisoformat(
+            str(value.get("created_at") or "").replace("Z", "+00:00")
+        ).astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ActivationCliError("activation_capacity_origin_compat_invalid") from exc
+    age = (now.astimezone(timezone.utc) - created_at).total_seconds()
+    if age < -5 or age > CAPACITY_ORIGIN_COMPAT_MAX_AGE_SECONDS:
+        raise ActivationCliError("activation_capacity_origin_compat_stale")
+    origin = {
+        "release_id": str(state.get("release_id") or ""),
+        "bootstrap_epoch_id": str(state.get("bootstrap_epoch_id") or ""),
+    }
+    expected = {
+        "current_release_id": str(binding["release_id"]),
+        "current_bootstrap_epoch_id": str(binding["bootstrap_epoch_id"]),
+        "capacity_origin_release_id": origin["release_id"],
+        "capacity_origin_bootstrap_epoch_id": origin["bootstrap_epoch_id"],
+        "active_release_binding_sha256": str(binding["binding_receipt_sha256"]),
+        "release_bom_sha256": str(binding["release_bom_sha256"]),
+    }
+    if any(value.get(field) != expected_value for field, expected_value in expected.items()):
+        raise ActivationCliError("activation_capacity_origin_compat_invalid")
+    bound = dict(binding)
+    bound["_capacity_origin"] = origin
+    try:
+        producer, producer_sha256 = (
+            capacity_evidence.read_and_validate_producer_activation(
+                paths.producer_activation,
+                hmac_key=hmac_key,
+                expected_release_id=origin["release_id"],
+                expected_bootstrap_epoch_id=origin["bootstrap_epoch_id"],
+                expected_release_bom_sha256=str(binding["release_bom_sha256"]),
+                expected_active_release_binding_sha256=str(
+                    binding["binding_receipt_sha256"]
+                ),
+            )
+        )
+    except capacity_evidence.CapacitySampleEvidenceError as exc:
+        raise ActivationCliError(exc.code) from exc
+    if (
+        value.get("producer_sha256") != producer_sha256
+        or value.get("producer_receipt_fingerprint")
+        != producer.get("receipt_fingerprint")
+        or producer.get("receipt_id")
+        != _producer_receipt_id(binding=bound, authorization=authorization)
+    ):
+        raise ActivationCliError("activation_capacity_origin_compat_invalid")
+    return origin
+
+
 def _bootstrap_authority(
     args: argparse.Namespace,
     *,
@@ -1248,11 +1357,7 @@ def _bootstrap_authority(
         raise ActivationCliError("activation_release_id_required")
     if not bootstrap_epoch_id:
         raise ActivationCliError("activation_bootstrap_epoch_id_required")
-    if (
-        state.get("release_id") != release_id
-        or state.get("bootstrap_epoch_id") != bootstrap_epoch_id
-        or state.get("generation") != 1
-    ):
+    if state.get("generation") != 1:
         raise ActivationCliError("activation_capacity_origin_binding_invalid")
     active_binding_path = _absolute_path_argument(
         getattr(args, "active_release_binding", None), "active_release_binding"
@@ -1295,15 +1400,30 @@ def _bootstrap_authority(
     except capacity_runtime.CapacityRuntimeError as exc:
         raise ActivationCliError(exc.code) from exc
     paths = capacity_runtime.CapacityRuntimePaths.from_control_db(args.control_db)
+    if (
+        state.get("release_id") != release_id
+        or state.get("bootstrap_epoch_id") != bootstrap_epoch_id
+    ):
+        origin = _load_capacity_origin_compatibility(
+            state=state,
+            binding=binding,
+            authorization=authorization,
+            paths=paths,
+            hmac_key=hmac_key,
+            now=now,
+        )
+        binding = dict(binding)
+        binding["_capacity_origin"] = origin
     return binding, authorization, hmac_key, paths
 
 
 def _producer_receipt_id(
     *, binding: Mapping[str, Any], authorization: Mapping[str, Any]
 ) -> str:
+    release_id, bootstrap_epoch_id = _capacity_producer_identity(binding)
     identity = {
-        "release_id": binding["release_id"],
-        "bootstrap_epoch_id": binding["bootstrap_epoch_id"],
+        "release_id": release_id,
+        "bootstrap_epoch_id": bootstrap_epoch_id,
         "release_bom_sha256": binding["release_bom_sha256"],
         "active_release_binding_sha256": binding["binding_receipt_sha256"],
         "authorization_receipt_sha256": authorization["authorization_receipt_sha256"],
@@ -1348,12 +1468,13 @@ def _read_bound_producer_receipt(
     hmac_key: bytes,
     now: datetime,
 ) -> tuple[dict[str, Any], str]:
+    release_id, bootstrap_epoch_id = _capacity_producer_identity(binding)
     try:
         receipt, raw_sha256 = capacity_evidence.read_and_validate_producer_activation(
             paths.producer_activation,
             hmac_key=hmac_key,
-            expected_release_id=str(binding["release_id"]),
-            expected_bootstrap_epoch_id=str(binding["bootstrap_epoch_id"]),
+            expected_release_id=release_id,
+            expected_bootstrap_epoch_id=bootstrap_epoch_id,
             expected_release_bom_sha256=str(binding["release_bom_sha256"]),
             expected_active_release_binding_sha256=str(
                 binding["binding_receipt_sha256"]
@@ -1478,9 +1599,10 @@ def _publish_bootstrap_producer_locked(
             deadline=str(authorization["deadline"]),
         )
         try:
+            release_id, bootstrap_epoch_id = _capacity_producer_identity(binding)
             receipt = capacity_evidence.issue_producer_activation_receipt(
-                release_id=str(binding["release_id"]),
-                bootstrap_epoch_id=str(binding["bootstrap_epoch_id"]),
+                release_id=release_id,
+                bootstrap_epoch_id=bootstrap_epoch_id,
                 release_bom_sha256=str(binding["release_bom_sha256"]),
                 active_release_binding_sha256=str(binding["binding_receipt_sha256"]),
                 activated_at=now,

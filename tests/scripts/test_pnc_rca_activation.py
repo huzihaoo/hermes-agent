@@ -1892,6 +1892,103 @@ def test_bootstrap_steady_rejects_authority_and_origin_mismatch(
     assert fake.transition_calls == []
 
 
+def test_bootstrap_prepare_accepts_exact_signed_immutable_capacity_origin(
+    tmp_path, capsys, monkeypatch
+):
+    db_path = tmp_path / "control.sqlite3"
+    origin_release_id = "origin-release-20260717"
+    origin_bootstrap_epoch_id = "origin-bootstrap-20260717"
+    current_release_id = "current-release-20260805"
+    current_bootstrap_epoch_id = "current-bootstrap-20260805"
+    fake = _bounded_fake_store()
+    fake.capacity = _bootstrap_capacity_state(
+        release_id=origin_release_id,
+        bootstrap_epoch_id=origin_bootstrap_epoch_id,
+    )
+    monkeypatch.setattr(activation_module, "_open_store", lambda _path: fake)
+    binding, authorization = _bootstrap_authority_values()
+    binding.update(
+        {
+            "release_id": current_release_id,
+            "bootstrap_epoch_id": current_bootstrap_epoch_id,
+        }
+    )
+    authorization.update(
+        {
+            "bootstrap_epoch_id": current_bootstrap_epoch_id,
+            "release_approval_id": current_release_id,
+        }
+    )
+    monkeypatch.setattr(
+        activation_module.prod_bootstrap,
+        "load_active_release_binding",
+        lambda **_kwargs: dict(binding),
+    )
+    monkeypatch.setattr(
+        activation_module.prod_bootstrap,
+        "load_bootstrap_authorization",
+        lambda **_kwargs: dict(authorization),
+    )
+    monkeypatch.setattr(activation_module, "_utc_now", lambda: NOW)
+    monkeypatch.setenv(capacity_runtime.HMAC_ENV, "hex:" + HMAC_KEY.hex())
+
+    paths = capacity_runtime.CapacityRuntimePaths.from_control_db(db_path)
+    bound_binding = dict(binding)
+    bound_binding["_capacity_origin"] = {
+        "release_id": origin_release_id,
+        "bootstrap_epoch_id": origin_bootstrap_epoch_id,
+    }
+    producer = capacity_evidence.issue_producer_activation_receipt(
+        release_id=origin_release_id,
+        bootstrap_epoch_id=origin_bootstrap_epoch_id,
+        release_bom_sha256=RELEASE_BOM_SHA256,
+        active_release_binding_sha256=ACTIVE_RELEASE_BINDING_SHA256,
+        activated_at=NOW,
+        hmac_key=HMAC_KEY,
+        receipt_id=activation_module._producer_receipt_id(
+            binding=bound_binding,
+            authorization=authorization,
+        ),
+    )
+    producer_sha256 = capacity_evidence.write_owner_only_create_once(
+        paths.producer_activation,
+        producer,
+    )
+    compatibility = {
+        "schema_version": activation_module.CAPACITY_ORIGIN_COMPAT_SCHEMA_VERSION,
+        "created_at": NOW.isoformat().replace("+00:00", "Z"),
+        "current_release_id": current_release_id,
+        "current_bootstrap_epoch_id": current_bootstrap_epoch_id,
+        "capacity_origin_release_id": origin_release_id,
+        "capacity_origin_bootstrap_epoch_id": origin_bootstrap_epoch_id,
+        "active_release_binding_sha256": ACTIVE_RELEASE_BINDING_SHA256,
+        "release_bom_sha256": RELEASE_BOM_SHA256,
+        "producer_path": str(paths.producer_activation),
+        "producer_sha256": producer_sha256,
+        "producer_receipt_fingerprint": producer["receipt_fingerprint"],
+        "database_rows_modified": False,
+        "external_effects_triggered": False,
+    }
+    _write_secure_json(
+        paths.state_root / activation_module.CAPACITY_ORIGIN_COMPAT_NAME,
+        compatibility,
+    )
+    args = _prepare_bootstrap_args(
+        db_path,
+        tmp_path / ".env",
+        _authorization_capsule(tmp_path),
+    )
+    args[args.index("--release-id") + 1] = current_release_id
+    args[args.index("--bootstrap-epoch-id") + 1] = current_bootstrap_epoch_id
+
+    code, payload = _invoke(capsys, args)
+
+    assert code == 0, payload
+    assert payload["result"]["producer_receipt_present"] is True
+    assert payload["result"]["would_publish_producer_receipt"] is False
+    assert fake.transition_calls == []
+
+
 def test_bootstrap_steady_cannot_bypass_governed_arguments(
     tmp_path, capsys, monkeypatch
 ):
