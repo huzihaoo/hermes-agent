@@ -955,10 +955,20 @@ def _effect_settlement_projection(
         """
         SELECT effect.effect_key, effect.effect_kind, effect.required,
                effect.target_key, effect.write_phase, job.delivery_id,
-               job.business_key, job.generation, job.work_item_id
+               job.business_key, job.generation, job.project_key,
+               job.work_item_type_key, job.work_item_id,
+               subscription.effect_kind AS subscription_effect_kind,
+               subscription.required AS subscription_required,
+               subscription.status AS subscription_status,
+               subscription.target_json AS subscription_target_json,
+               source.source_kind, source.mode
           FROM rca_delivery_effects AS effect
           JOIN rca_delivery_jobs AS job
             ON job.delivery_id = effect.delivery_id
+          LEFT JOIN rca_delivery_subscriptions AS subscription
+            ON subscription.effect_key = effect.effect_key
+          LEFT JOIN rca_trigger_sources AS source
+            ON source.source_id = subscription.source_id
          WHERE effect.status = 'quarantined'
          ORDER BY effect.effect_key
         """
@@ -973,11 +983,41 @@ def _effect_settlement_projection(
     superseded = 0
     for row in rows:
         effect_key = str(row["effect_key"])
-        if (
-            int(row["required"]) != 1
-            or str(row["effect_kind"]) != "feishu_issue_comment"
-            or str(row["write_phase"]) != "settled"
-        ):
+        effect_kind = str(row["effect_kind"])
+        if int(row["required"]) != 1 or str(row["write_phase"]) != "settled":
+            raise DeliveryQuarantineBaselineError(
+                "delivery_quarantine_settlement_receipt_scope_invalid"
+            )
+        if effect_kind == DELIVERY_THREAD_EFFECT_KIND:
+            try:
+                target = _strict_json(
+                    str(row["subscription_target_json"] or "").encode("utf-8"),
+                    artifact="delivery_quarantine_subscription_target",
+                )
+                validate_delivery_subscription_target(
+                    effect_kind=effect_kind,
+                    target_key=str(row["target_key"]),
+                    target=target,
+                    project_key=str(row["project_key"] or ""),
+                    work_item_type_key=str(row["work_item_type_key"] or ""),
+                    work_item_id=str(row["work_item_id"] or ""),
+                )
+            except (DeliveryContractError, DeliveryQuarantineBaselineError) as exc:
+                raise DeliveryQuarantineBaselineError(
+                    "delivery_quarantine_settlement_receipt_scope_invalid"
+                ) from exc
+            if (
+                str(row["subscription_effect_kind"] or "") != effect_kind
+                or int(row["subscription_required"] or 0) != 1
+                or str(row["subscription_status"] or "")
+                not in {"materialized", "quarantined"}
+                or str(row["source_kind"] or "") != "feishu_group_manual"
+                or str(row["mode"] or "") not in {"rerun", "run_or_join"}
+            ):
+                raise DeliveryQuarantineBaselineError(
+                    "delivery_quarantine_settlement_receipt_scope_invalid"
+                )
+        elif effect_kind != "feishu_issue_comment":
             raise DeliveryQuarantineBaselineError(
                 "delivery_quarantine_settlement_receipt_scope_invalid"
             )
@@ -986,7 +1026,7 @@ def _effect_settlement_projection(
             "business_key": str(row["business_key"]),
             "work_item_id": str(row["work_item_id"]),
             "generation": int(row["generation"]),
-            "effect_kind": str(row["effect_kind"]),
+            "effect_kind": effect_kind,
             "target_key": str(row["target_key"]),
         }
         if effect_key in receipt_effect_keys:

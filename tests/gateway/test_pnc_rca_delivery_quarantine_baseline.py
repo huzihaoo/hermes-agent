@@ -175,6 +175,67 @@ def _seed_quarantine(root: Path) -> tuple[RcaDeliveryStore, str]:
     return store, effect.effect_key
 
 
+def _seed_manual_dual_effect_quarantine(
+    root: Path, *, source_kind: str = "feishu_group_manual"
+) -> tuple[RcaDeliveryStore, list[str]]:
+    root.mkdir(parents=True, exist_ok=True)
+    _control(root)
+    store = RcaDeliveryStore(root / "control.sqlite3")
+    assert store.backfill_completed_submissions(now=NOW) == 1
+    claim = store.claim_due_watch(lease_owner="collector", now=NOW)
+    assert claim is not None
+    _insert_subscription(
+        store,
+        claim,
+        effect_kind="feishu_thread_reply",
+        invalid_thread=False,
+    )
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO rca_trigger_sources(
+                source_id, source_kind, source_dedupe_key, payload_sha256,
+                platform, chat_id, thread_id, message_id, requester_id,
+                mode, outcome, created_at
+            ) VALUES (
+                'source-manual-dual-baseline', ?,
+                'dedupe-manual-dual-baseline', ?, 'feishu', 'oc_group123',
+                'topic:om_root123', 'om_trigger456', 'ou_requester789',
+                'run_or_join', 'joined', ?
+            )
+            """,
+            (source_kind, "a" * 64, NOW.isoformat()),
+        )
+        conn.execute(
+            "UPDATE rca_delivery_subscriptions "
+            "SET source_id = 'source-manual-dual-baseline' "
+            "WHERE effect_kind = 'feishu_thread_reply'"
+        )
+    store.create_delivery(
+        claim=claim,
+        delivery=_delivery(claim),
+        status={"success": True, "state": "completed"},
+        now=NOW,
+    )
+    quarantined_at = (NOW + timedelta(seconds=1)).isoformat()
+    with sqlite3.connect(store.db_path) as conn:
+        effect_keys = [
+            str(row[0])
+            for row in conn.execute(
+                "SELECT effect_key FROM rca_delivery_effects ORDER BY effect_key"
+            )
+        ]
+        assert len(effect_keys) == 2
+        conn.execute(
+            "UPDATE rca_delivery_effects SET status='quarantined', "
+            "outcome='quarantined', write_phase='settled', "
+            "last_error_code='external_write_fence_missing', "
+            "quarantined_at=?, updated_at=?",
+            (quarantined_at, quarantined_at),
+        )
+    return store, effect_keys
+
+
 def _settlement_receipt(effect_key: str, root: Path) -> Path:
     path = root / "functional-settlement.json"
     backup = root / "control.pre-settlement.sqlite3"
@@ -2492,6 +2553,59 @@ def test_settlement_receipts_must_cover_or_explicitly_supersede_every_effect(
             analyzed_by="forensic-operator",
             reason="exact historical terminal rows and settlement evidence",
         )
+
+
+@pytest.mark.parametrize(
+    ("source_kind", "expected_error"),
+    [
+        ("feishu_group_manual", None),
+        (
+            "kafka_workflow_event",
+            "delivery_quarantine_settlement_receipt_scope_invalid",
+        ),
+    ],
+)
+def test_settlement_accepts_only_exact_manual_thread_effects(
+    tmp_path, source_kind, expected_error
+):
+    store, effect_keys = _seed_manual_dual_effect_quarantine(
+        tmp_path, source_kind=source_kind
+    )
+    receipt = _settlement_receipt(effect_keys[0], tmp_path)
+    body = json.loads(receipt.read_text())
+    body["cumulative_settled"] = [
+        {
+            "effect_key": effect_key,
+            "status": "quarantined",
+            "write_phase": "settled",
+        }
+        for effect_key in effect_keys
+    ]
+    _write(receipt, body)
+    migration = _prepare_offline_migration(store, tmp_path / "migration")
+    _migrate_live(migration)
+    kwargs = {
+        **_migration_kwargs(migration),
+        "release_id": "release-baseline-thread-001",
+        "snapshot_at": NOW + timedelta(seconds=2),
+        "settlement_receipt_paths": [receipt],
+        "analyzed_by": "forensic-operator",
+        "reason": "exact aborted manual canary effects remain terminal with no rearm",
+    }
+
+    if expected_error is not None:
+        with pytest.raises(DeliveryQuarantineBaselineError, match=expected_error):
+            build_quarantine_core(store.db_path, **kwargs)
+        return
+
+    core = build_quarantine_core(store.db_path, **kwargs)
+    settlement = core["effect_settlement"]
+    assert settlement["quarantined_effect_count"] == 2
+    assert settlement["receipt_settled_count"] == 2
+    assert {entry["effect_kind"] for entry in settlement["entries"]} == {
+        "feishu_issue_comment",
+        "feishu_thread_reply",
+    }
 
 
 @pytest.mark.parametrize("failure", ["missing", "sha"])
