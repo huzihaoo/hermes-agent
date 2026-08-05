@@ -226,17 +226,27 @@ def test_delivery_dispatcher_environment_loader_preserves_literal_expansion_synt
         os.environ.pop(key, None)
 
 
-def test_clear_circuit_cli_closes_selected_circuit_without_claiming_effects(
-    tmp_path, monkeypatch, capsys
-):
-    config = _config(tmp_path, enabled=False)
-    store = RcaDeliveryStore(config.control_db_path)
-    store.open_delivery_dispatcher_circuit(
-        effect_kind=DELIVERY_EFFECT_KIND,
-        reason_code="operator_test_open",
-        now=NOW,
-    )
-    before_effects = store.list_rows("rca_delivery_effects")
+def _patch_circuit_reset_cli(monkeypatch, config, tmp_path):
+    binding = {
+        "path": str((tmp_path / "active-release-binding.json").absolute()),
+        "sha256": "1" * 64,
+        "release_id": "rca-test-release",
+        "authority_sha256": "2" * 64,
+        "authority_epoch_id": "rca-authority-test",
+        "bootstrap_epoch_id": "rca-bootstrap-test",
+    }
+    provenance = {
+        "entrypoint_path": str((tmp_path / "dispatcher.py").absolute()),
+        "entrypoint_sha256": "3" * 64,
+        "delivery_store_path": str((tmp_path / "delivery-store.py").absolute()),
+        "delivery_store_sha256": "4" * 64,
+        "receipt_helper_path": str((tmp_path / "receipt-helper.py").absolute()),
+        "receipt_helper_sha256": "5" * 64,
+        "control_store_path": str((tmp_path / "control-store.py").absolute()),
+        "control_store_sha256": "6" * 64,
+        "bootstrap_path": str((tmp_path / "bootstrap.py").absolute()),
+        "bootstrap_sha256": "7" * 64,
+    }
     monkeypatch.setattr(
         dispatcher_module, "load_delivery_dispatcher_environment", lambda: None
     )
@@ -245,21 +255,440 @@ def test_clear_circuit_cli_closes_selected_circuit_without_claiming_effects(
         "from_env",
         classmethod(lambda _cls: config),
     )
+    monkeypatch.setattr(
+        dispatcher_module,
+        "_active_release_binding_snapshot",
+        lambda _config: dict(binding),
+    )
+    monkeypatch.setattr(
+        dispatcher_module,
+        "_circuit_reset_tool_provenance",
+        lambda: dict(provenance),
+    )
+    return binding
+
+
+def test_clear_circuit_cli_plans_then_applies_without_claiming_effects(
+    tmp_path, monkeypatch, capsys
+):
+    config = _config(tmp_path, enabled=False)
+    RcaControlStore(config.control_db_path)
+    store = RcaDeliveryStore(config.control_db_path)
+    store.open_delivery_dispatcher_circuit(
+        effect_kind=DELIVERY_EFFECT_KIND,
+        reason_code="operator_test_open",
+        now=NOW,
+    )
+    before_effects = store.list_rows("rca_delivery_effects")
+    binding = _patch_circuit_reset_cli(monkeypatch, config, tmp_path)
+    receipt = tmp_path / "delivery-circuit-reset.json"
 
     assert (
         dispatcher_module.main([
             "--clear-circuit",
             "--effect-kind",
             DELIVERY_EFFECT_KIND,
+            "--operator",
+            "owner@example.com",
+            "--reason",
+            "validated provider recovery",
+            "--receipt",
+            str(receipt),
         ])
         == 0
     )
-
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["ok"] is True
-    assert payload["circuit"]["state"] == "closed"
-    assert store.delivery_dispatcher_circuit(DELIVERY_EFFECT_KIND).state == "closed"
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["mode"] == "plan"
+    assert plan["applied"] is False
+    assert plan["plan"]["active_release_binding"]["sha256"] == binding["sha256"]
+    assert plan["plan"]["effect_delta"]["external_writes"] == 0
+    config_sha = plan["plan"]["config_binding_sha256"]
+    plan_id = plan["plan"]["plan_id"]
+    before_sha = plan["plan"]["before_state_sha256"]
+    assert store.delivery_dispatcher_circuit(DELIVERY_EFFECT_KIND).state == "open"
+    assert not receipt.exists()
     assert store.list_rows("rca_delivery_effects") == before_effects == []
+
+    assert (
+        dispatcher_module.main([
+            "--clear-circuit",
+            "--effect-kind",
+            DELIVERY_EFFECT_KIND,
+            "--operator",
+            "owner@example.com",
+            "--reason",
+            "validated provider recovery",
+            "--apply",
+            "--expected-active-release-binding-sha256",
+            binding["sha256"],
+            "--expected-config-binding-sha256",
+            config_sha,
+            "--expected-plan-id",
+            plan_id,
+            "--expected-before-state-sha256",
+            before_sha,
+            "--receipt",
+            str(receipt),
+        ])
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    body = json.loads(receipt.read_text(encoding="utf-8"))
+    assert payload["ok"] is True
+    assert payload["applied"] is True
+    assert payload["effect_delta"]["external_effects_triggered"] is False
+    assert body["active_release_binding"] == binding
+    assert body["effect_delta"]["delivery_effect_rows"] == 0
+    assert body["effect_delta"]["database_rows"]["total"] == 3
+    assert receipt.stat().st_mode & 0o777 == 0o444
+    assert Path(f"{receipt}.sha256").is_file()
+    assert store.delivery_dispatcher_circuit(DELIVERY_EFFECT_KIND).state == "closed"
+    assert store.delivery_dispatcher_circuit_reset_audit(
+        body["reset_id"], effect_kind=DELIVERY_EFFECT_KIND
+    ) == body
+    assert store.list_rows("rca_delivery_effects") == before_effects == []
+
+
+def test_clear_circuit_rejects_binding_drift_before_mutation(
+    tmp_path, monkeypatch, capsys
+):
+    config = _config(tmp_path, enabled=False)
+    RcaControlStore(config.control_db_path)
+    store = RcaDeliveryStore(config.control_db_path)
+    store.open_delivery_dispatcher_circuit(
+        effect_kind=DELIVERY_EFFECT_KIND,
+        reason_code="operator_test_open",
+        now=NOW,
+    )
+    binding = _patch_circuit_reset_cli(monkeypatch, config, tmp_path)
+    receipt = tmp_path / "drift-reset.json"
+    assert dispatcher_module.main([
+        "--clear-circuit",
+        "--effect-kind",
+        DELIVERY_EFFECT_KIND,
+        "--operator",
+        "owner",
+        "--reason",
+        "plan binding",
+        "--receipt",
+        str(receipt),
+    ]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    changed = dict(binding)
+    changed["sha256"] = "6" * 64
+    monkeypatch.setattr(
+        dispatcher_module,
+        "_active_release_binding_snapshot",
+        lambda _config: changed,
+    )
+    assert dispatcher_module.main([
+        "--clear-circuit",
+        "--effect-kind",
+        DELIVERY_EFFECT_KIND,
+        "--operator",
+        "owner",
+        "--reason",
+        "plan binding",
+        "--apply",
+        "--expected-active-release-binding-sha256",
+        binding["sha256"],
+        "--expected-config-binding-sha256",
+        plan["plan"]["config_binding_sha256"],
+        "--expected-plan-id",
+        plan["plan"]["plan_id"],
+        "--expected-before-state-sha256",
+        plan["plan"]["before_state_sha256"],
+        "--receipt",
+        str(receipt),
+    ]) == 2
+    assert "active_binding_changed" in capsys.readouterr().out
+    assert store.delivery_dispatcher_circuit(DELIVERY_EFFECT_KIND).state == "open"
+    assert not receipt.exists()
+
+
+def test_clear_circuit_rejects_config_drift_before_mutation(
+    tmp_path, monkeypatch, capsys
+):
+    config = _config(tmp_path, enabled=False)
+    RcaControlStore(config.control_db_path)
+    store = RcaDeliveryStore(config.control_db_path)
+    store.open_delivery_dispatcher_circuit(
+        effect_kind=DELIVERY_EFFECT_KIND,
+        reason_code="operator_test_open",
+        now=NOW,
+    )
+    binding = _patch_circuit_reset_cli(monkeypatch, config, tmp_path)
+    receipt = tmp_path / "config-drift-reset.json"
+    assert dispatcher_module.main([
+        "--clear-circuit",
+        "--effect-kind",
+        DELIVERY_EFFECT_KIND,
+        "--operator",
+        "owner",
+        "--reason",
+        "plan config",
+        "--receipt",
+        str(receipt),
+    ]) == 0
+    plan = json.loads(capsys.readouterr().out)["plan"]
+    changed_config = replace(config, batch_size=config.batch_size + 1)
+    monkeypatch.setattr(
+        dispatcher_module.DispatcherConfig,
+        "from_env",
+        classmethod(lambda _cls: changed_config),
+    )
+    assert dispatcher_module.main([
+        "--clear-circuit",
+        "--effect-kind",
+        DELIVERY_EFFECT_KIND,
+        "--operator",
+        "owner",
+        "--reason",
+        "plan config",
+        "--apply",
+        "--expected-active-release-binding-sha256",
+        binding["sha256"],
+        "--expected-config-binding-sha256",
+        plan["config_binding_sha256"],
+        "--expected-plan-id",
+        plan["plan_id"],
+        "--expected-before-state-sha256",
+        plan["before_state_sha256"],
+        "--receipt",
+        str(receipt),
+    ]) == 2
+    assert "config_changed" in capsys.readouterr().out
+    assert store.delivery_dispatcher_circuit(DELIVERY_EFFECT_KIND).state == "open"
+    assert not receipt.exists()
+
+
+def test_clear_circuit_rejects_exact_before_state_drift(
+    tmp_path, monkeypatch, capsys
+):
+    config = _config(tmp_path, enabled=False)
+    RcaControlStore(config.control_db_path)
+    store = RcaDeliveryStore(config.control_db_path)
+    store.open_delivery_dispatcher_circuit(
+        effect_kind=DELIVERY_EFFECT_KIND,
+        reason_code="first-open",
+        now=NOW,
+    )
+    binding = _patch_circuit_reset_cli(monkeypatch, config, tmp_path)
+    receipt = tmp_path / "before-drift-reset.json"
+    assert dispatcher_module.main([
+        "--clear-circuit",
+        "--effect-kind",
+        DELIVERY_EFFECT_KIND,
+        "--operator",
+        "owner",
+        "--reason",
+        "exact before",
+        "--receipt",
+        str(receipt),
+    ]) == 0
+    plan = json.loads(capsys.readouterr().out)["plan"]
+    store.open_delivery_dispatcher_circuit(
+        effect_kind=DELIVERY_EFFECT_KIND,
+        reason_code="second-open",
+        now=NOW + timedelta(seconds=1),
+    )
+    assert dispatcher_module.main([
+        "--clear-circuit",
+        "--effect-kind",
+        DELIVERY_EFFECT_KIND,
+        "--operator",
+        "owner",
+        "--reason",
+        "exact before",
+        "--apply",
+        "--expected-active-release-binding-sha256",
+        binding["sha256"],
+        "--expected-config-binding-sha256",
+        plan["config_binding_sha256"],
+        "--expected-plan-id",
+        plan["plan_id"],
+        "--expected-before-state-sha256",
+        plan["before_state_sha256"],
+        "--receipt",
+        str(receipt),
+    ]) == 2
+    assert "before_state_changed" in capsys.readouterr().out
+    assert store.delivery_dispatcher_circuit(DELIVERY_EFFECT_KIND).reason_code == (
+        "second-open"
+    )
+    assert not receipt.exists()
+
+
+def test_clear_circuit_receipt_materialization_failure_is_recoverable(
+    tmp_path, monkeypatch, capsys
+):
+    config = _config(tmp_path, enabled=False)
+    RcaControlStore(config.control_db_path)
+    store = RcaDeliveryStore(config.control_db_path)
+    store.open_delivery_dispatcher_circuit(
+        effect_kind=DELIVERY_EFFECT_KIND,
+        reason_code="operator_test_open",
+        now=NOW,
+    )
+    binding = _patch_circuit_reset_cli(monkeypatch, config, tmp_path)
+    receipt = tmp_path / "materialization-fails.json"
+    assert dispatcher_module.main([
+        "--clear-circuit",
+        "--effect-kind",
+        DELIVERY_EFFECT_KIND,
+        "--operator",
+        "owner",
+        "--reason",
+        "recover durable audit",
+        "--receipt",
+        str(receipt),
+    ]) == 0
+    plan = json.loads(capsys.readouterr().out)["plan"]
+    original_writer = dispatcher_module._write_immutable_circuit_reset_receipt
+    monkeypatch.setattr(
+        dispatcher_module,
+        "_write_immutable_circuit_reset_receipt",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("simulated receipt failure")
+        ),
+    )
+    assert dispatcher_module.main([
+        "--clear-circuit",
+        "--effect-kind",
+        DELIVERY_EFFECT_KIND,
+        "--operator",
+        "owner",
+        "--reason",
+        "recover durable audit",
+        "--apply",
+        "--expected-active-release-binding-sha256",
+        binding["sha256"],
+        "--expected-config-binding-sha256",
+        plan["config_binding_sha256"],
+        "--expected-plan-id",
+        plan["plan_id"],
+        "--expected-before-state-sha256",
+        plan["before_state_sha256"],
+        "--receipt",
+        str(receipt),
+    ]) == 2
+    error = json.loads(capsys.readouterr().out)
+    assert error["recovery_required"] is True
+    assert store.delivery_dispatcher_circuit(DELIVERY_EFFECT_KIND).state == "closed"
+    assert store.delivery_dispatcher_circuit_reset_audit(
+        error["reset_id"], effect_kind=DELIVERY_EFFECT_KIND
+    ) is not None
+    monkeypatch.setattr(
+        dispatcher_module,
+        "_write_immutable_circuit_reset_receipt",
+        original_writer,
+    )
+    recovered = tmp_path / "recovered-delivery-reset.json"
+    assert dispatcher_module.main([
+        "--materialize-reset",
+        error["reset_id"],
+        "--effect-kind",
+        DELIVERY_EFFECT_KIND,
+        "--receipt",
+        str(recovered),
+    ]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["recovered"] is True
+    assert json.loads(recovered.read_text(encoding="utf-8"))["reset_id"] == error[
+        "reset_id"
+    ]
+
+
+def test_clear_circuit_requires_governed_inputs_and_leaves_open_state(
+    tmp_path, monkeypatch, capsys
+):
+    config = _config(tmp_path, enabled=False)
+    RcaControlStore(config.control_db_path)
+    store = RcaDeliveryStore(config.control_db_path)
+    store.open_delivery_dispatcher_circuit(
+        effect_kind=DELIVERY_EFFECT_KIND,
+        reason_code="operator_test_open",
+        now=NOW,
+    )
+    _patch_circuit_reset_cli(monkeypatch, config, tmp_path)
+    assert dispatcher_module.main([
+        "--clear-circuit",
+        "--effect-kind",
+        DELIVERY_EFFECT_KIND,
+    ]) == 2
+    assert "operator_and_reason_required" in capsys.readouterr().out
+    assert store.delivery_dispatcher_circuit(DELIVERY_EFFECT_KIND).state == "open"
+
+
+def test_reset_plan_and_missing_recovery_are_read_only_without_card_row(
+    tmp_path, monkeypatch, capsys
+):
+    config = _config(tmp_path, enabled=False)
+    RcaControlStore(config.control_db_path)
+    store = RcaDeliveryStore(config.control_db_path)
+    store.open_delivery_dispatcher_circuit(
+        effect_kind=DELIVERY_EFFECT_KIND,
+        reason_code="operator_test_open",
+        now=NOW,
+    )
+    with sqlite3.connect(config.control_db_path) as conn:
+        conn.execute(
+            "DELETE FROM rca_delivery_dispatcher_circuit "
+            "WHERE circuit_name = ?",
+            ("feishu_card_patch",),
+        )
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    def db_snapshot():
+        return {
+            str(path): path.read_bytes() if path.exists() else None
+            for path in (
+                config.control_db_path,
+                Path(f"{config.control_db_path}-wal"),
+                Path(f"{config.control_db_path}-shm"),
+            )
+        }
+
+    before = db_snapshot()
+    _patch_circuit_reset_cli(monkeypatch, config, tmp_path)
+    receipt = tmp_path / "read-only-plan.json"
+    assert dispatcher_module.main([
+        "--clear-circuit",
+        "--effect-kind",
+        DELIVERY_EFFECT_KIND,
+        "--operator",
+        "owner",
+        "--reason",
+        "read only plan",
+        "--receipt",
+        str(receipt),
+    ]) == 0
+    assert json.loads(capsys.readouterr().out)["mode"] == "plan"
+    assert db_snapshot() == before
+    with sqlite3.connect(config.control_db_path) as conn:
+        assert conn.execute(
+            "SELECT 1 FROM rca_delivery_dispatcher_circuit "
+            "WHERE circuit_name = 'feishu_card_patch'"
+        ).fetchone() is None
+
+    missing_receipt = tmp_path / "missing-recovery.json"
+    assert dispatcher_module.main([
+        "--materialize-reset",
+        "a" * 64,
+        "--effect-kind",
+        DELIVERY_EFFECT_KIND,
+        "--receipt",
+        str(missing_receipt),
+    ]) == 2
+    assert "audit_missing" in capsys.readouterr().out
+    assert db_snapshot() == before
+    with sqlite3.connect(config.control_db_path) as conn:
+        assert conn.execute(
+            "SELECT 1 FROM rca_delivery_dispatcher_circuit "
+            "WHERE circuit_name = 'feishu_card_patch'"
+        ).fetchone() is None
+
 
 
 def _config(tmp_path, *, enabled: bool = True):

@@ -78,7 +78,11 @@ from gateway.pnc_rca_delivery_quarantine_baseline import (
     quarantine_baseline_settings,
     read_quarantine_baseline_status,
 )
-from gateway.pnc_rca_control_store import RecordConflictError, RcaControlStore
+from gateway.pnc_rca_control_store import (
+    RecordConflictError,
+    RcaControlStore,
+    _dispatcher_circuit_reset_fingerprint,
+)
 from gateway.pnc_rca_provider_fence import (
     RcaProviderWriteClaim,
     bound_provider_write_claim,
@@ -89,11 +93,14 @@ from gateway.pnc_rca_provider_fence import (
     revalidate_provider_write_claim,
 )
 from gateway.pnc_rca_delivery_store import (
+    DELIVERY_CIRCUIT_RESET_META_PREFIX,
+    DELIVERY_CIRCUIT_RESET_SCHEMA_VERSION,
     DeliveryEffectClaim,
     DeliveryRecordConflictError,
     RcaDeliveryStore,
     StaleDeliveryEffectLeaseError,
 )
+from gateway.pnc_rca_prod_bootstrap import load_active_release_binding
 from gateway.pnc_rca_delivery_observability import (
     DeliveryObservationError,
     append_delivery_observation_verified,
@@ -138,6 +145,12 @@ from scripts.pnc_foxglove_delivery import (
     canonical_viz_mcap_path,
     validate_foxglove_url,
 )
+from scripts.pnc_rca_outbox_dispatcher import (
+    _absolute_new_receipt_path as _absolute_new_circuit_reset_receipt_path,
+    _control_db_identity,
+    _validate_reset_audit_text as _validate_circuit_reset_text,
+    _write_immutable_receipt as _write_immutable_circuit_reset_receipt,
+)
 
 
 ENV_PREFIX = "HERMES_RCA_DELIVERY_DISPATCHER_"
@@ -178,6 +191,16 @@ _CIRCUIT_CODES = frozenset({
     "delivery_boundary_contract_invalid",
     "report_http_auth_or_permission",
 })
+class DeliveryCircuitResetReceiptMaterializationError(RuntimeError):
+    def __init__(self, *, reset_id: str, receipt_path: Path, cause: Exception):
+        self.reset_id = str(reset_id)
+        self.receipt_path = receipt_path
+        self.meta_key = f"{DELIVERY_CIRCUIT_RESET_META_PREFIX}{self.reset_id}"
+        self.cause = cause
+        super().__init__(
+            "delivery_circuit_reset_recovery_required:"
+            f"reset_id={self.reset_id}:receipt={receipt_path}:cause={cause}"
+        )
 
 
 def _card_patch_exception_result(exc: Exception) -> dict[str, Any]:
@@ -433,6 +456,204 @@ class _EffectLeaseKeeper:
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _circuit_reset_canonical_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _circuit_reset_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        _circuit_reset_canonical_json(value).encode("utf-8")
+    ).hexdigest()
+
+
+def _bound_source_sha256(path: Path) -> str:
+    resolved = path.expanduser().resolve(strict=True)
+    descriptor = os.open(
+        resolved,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != os.getuid()
+        ):
+            raise ValueError("delivery_circuit_reset_tool_provenance_invalid")
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise ValueError("delivery_circuit_reset_tool_provenance_changed")
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)
+
+
+def _circuit_reset_tool_provenance() -> dict[str, Any]:
+    entrypoint = Path(__file__).resolve(strict=True)
+    store_path = (REPO_ROOT / "gateway" / "pnc_rca_delivery_store.py").resolve(
+        strict=True
+    )
+    helper_path = (REPO_ROOT / "scripts" / "pnc_rca_outbox_dispatcher.py").resolve(
+        strict=True
+    )
+    control_path = (REPO_ROOT / "gateway" / "pnc_rca_control_store.py").resolve(
+        strict=True
+    )
+    bootstrap_path = (REPO_ROOT / "gateway" / "pnc_rca_prod_bootstrap.py").resolve(
+        strict=True
+    )
+    return {
+        "entrypoint_path": str(entrypoint),
+        "entrypoint_sha256": _bound_source_sha256(entrypoint),
+        "delivery_store_path": str(store_path),
+        "delivery_store_sha256": _bound_source_sha256(store_path),
+        "receipt_helper_path": str(helper_path),
+        "receipt_helper_sha256": _bound_source_sha256(helper_path),
+        "control_store_path": str(control_path),
+        "control_store_sha256": _bound_source_sha256(control_path),
+        "bootstrap_path": str(bootstrap_path),
+        "bootstrap_sha256": _bound_source_sha256(bootstrap_path),
+    }
+
+
+def _active_release_binding_snapshot(config: "DispatcherConfig") -> dict[str, Any]:
+    if not config.quarantine_release_id or not config.quarantine_bootstrap_epoch_id:
+        raise ValueError("delivery_circuit_reset_active_binding_config_missing")
+    binding = load_active_release_binding(
+        path=config.quarantine_active_release_binding_path,
+        live_env_path=config.quarantine_live_env_path,
+        expected_release_id=config.quarantine_release_id,
+        expected_epoch_id=config.quarantine_bootstrap_epoch_id,
+    )
+    return {
+        "path": str(config.quarantine_active_release_binding_path.absolute()),
+        "sha256": binding["binding_receipt_sha256"],
+        "release_id": binding["release_id"],
+        "authority_sha256": binding["authority_sha256"],
+        "authority_epoch_id": binding["authority_epoch_id"],
+        "bootstrap_epoch_id": binding["bootstrap_epoch_id"],
+    }
+
+
+def _build_delivery_circuit_reset_receipt(
+    *,
+    config: "DispatcherConfig",
+    effect_kind: str,
+    operator: str,
+    reason: str,
+    before: Mapping[str, Any],
+    recorded_at: str,
+    receipt_path: Path | None,
+    active_release_binding: Mapping[str, Any],
+    tool_provenance: Mapping[str, Any],
+) -> dict[str, Any]:
+    before_state = json.loads(_circuit_reset_canonical_json(before))
+    before_failure = before_state["permanent_failure"]
+    last_failure_present = bool(before_failure["last_failure_present"])
+    after_circuit = {
+        "state": "closed",
+        "reason_code": "",
+        "reason_detail": "",
+        "opened_at": None,
+        "updated_at": recorded_at,
+    }
+    after_failure = {
+        "threshold": before_failure["threshold"],
+        "consecutive_failures": 0,
+        "last_failure": {},
+        "last_failure_present": False,
+    }
+    db_identity = _control_db_identity(config.control_db_path)
+    config_binding_sha256 = _circuit_reset_sha256(config.public_dict())
+    plan_id = _circuit_reset_sha256(
+        {
+            "operator": operator,
+            "reason": reason,
+            "effect_kind": effect_kind,
+            "before": before_state,
+            "control_db_identity": db_identity,
+            "config_binding_sha256": config_binding_sha256,
+            "active_release_binding_sha256": active_release_binding["sha256"],
+            "tool_provenance": dict(tool_provenance),
+        }
+    )
+    reset_seed = {
+        "recorded_at": recorded_at,
+        "operator": operator,
+        "reason": reason,
+        "effect_kind": effect_kind,
+        "before": before_state,
+        "control_db_identity": db_identity,
+        "active_release_binding_sha256": active_release_binding["sha256"],
+        "tool_provenance": dict(tool_provenance),
+        "plan_id": plan_id,
+    }
+    reset_id = _circuit_reset_sha256(reset_seed)
+    receipt: dict[str, Any] = {
+        "schema_version": DELIVERY_CIRCUIT_RESET_SCHEMA_VERSION,
+        "command": "clear-circuit",
+        "reset_id": reset_id,
+        "plan_id": plan_id,
+        "before_state_sha256": _circuit_reset_sha256(before_state["circuit"]),
+        "recorded_at": recorded_at,
+        "operator": operator,
+        "reason": reason,
+        "circuit_scope": "delivery",
+        "effect_kind": effect_kind,
+        "control_db_identity": db_identity,
+        "config_binding_sha256": config_binding_sha256,
+        "active_release_binding": dict(active_release_binding),
+        "tool_provenance": dict(tool_provenance),
+        "before": before_state["circuit"],
+        "after": after_circuit,
+        "pre_state": before_state["circuit"],
+        "post_state": after_circuit,
+        "permanent_failure_before": before_failure,
+        "permanent_failure_after": after_failure,
+        "effect_delta": {
+            "external_writes": 0,
+            "external_effects_triggered": False,
+            "delivery_effect_rows": 0,
+            "scope": "delivery_dispatcher_circuit_reset_command",
+            "database_rows": {
+                "circuit_updated": 1,
+                "control_meta_inserted": 1,
+                "permanent_failure_streak_upserted": 1,
+                "permanent_failure_last_deleted": int(last_failure_present),
+                "total": 3 + int(last_failure_present),
+            },
+        },
+    }
+    if receipt_path is not None:
+        receipt["receipt_path"] = str(receipt_path)
+    receipt["receipt_fingerprint"] = _dispatcher_circuit_reset_fingerprint(receipt)
+    return receipt
 
 
 def _stable_key(prefix: str, material: Mapping[str, Any]) -> str:
@@ -5500,13 +5721,272 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--health", action="store_true")
     parser.add_argument("--health-max-age-seconds", type=int)
-    parser.add_argument("--clear-circuit", action="store_true")
+    parser.add_argument(
+        "--clear-circuit",
+        action="store_true",
+        help="plan or apply an audited reset of one delivery circuit",
+    )
+    parser.add_argument("--operator", help="bounded operator identity")
+    parser.add_argument("--reason", help="bounded reset reason")
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="apply a reset; without this flag --clear-circuit is read-only",
+    )
+    parser.add_argument(
+        "--receipt",
+        type=Path,
+        help="absolute, non-existing path for the immutable reset receipt",
+    )
+    parser.add_argument(
+        "--materialize-reset",
+        metavar="RESET_ID",
+        help="recover a receipt from the durable audit without changing the DB",
+    )
+    parser.add_argument(
+        "--expected-active-release-binding-sha256",
+        help="binding SHA from the immediately preceding reset plan",
+    )
+    parser.add_argument(
+        "--expected-config-binding-sha256",
+        help="config SHA from the immediately preceding reset plan",
+    )
+    parser.add_argument(
+        "--expected-plan-id",
+        help="plan id from the immediately preceding reset plan",
+    )
+    parser.add_argument(
+        "--expected-before-state-sha256",
+        help="exact before-state SHA from the immediately preceding reset plan",
+    )
     parser.add_argument(
         "--effect-kind",
         choices=sorted(DELIVERY_EFFECT_KINDS),
         default=DELIVERY_EFFECT_KIND,
     )
     return parser
+
+
+def _validate_circuit_reset_arguments(args: argparse.Namespace) -> None:
+    reset_only_flags = (args.operator, args.reason, args.receipt)
+    expected_binding = args.expected_active_release_binding_sha256
+    expected_config = args.expected_config_binding_sha256
+    expected_plan = args.expected_plan_id
+    expected_before = args.expected_before_state_sha256
+    expected_plan = args.expected_plan_id
+    expected_before = args.expected_before_state_sha256
+    if args.clear_circuit and args.materialize_reset:
+        raise ValueError("delivery_circuit_reset_modes_conflict")
+    if args.materialize_reset:
+        if (
+            args.operator is not None
+            or args.reason is not None
+            or args.apply
+            or expected_binding is not None
+            or expected_config is not None
+            or expected_plan is not None
+            or expected_before is not None
+        ):
+            raise ValueError("delivery_circuit_reset_recovery_flags_conflict")
+        if any((args.check_config, args.dry_run, args.health, args.once)):
+            raise ValueError("delivery_circuit_reset_flags_conflict")
+        if args.receipt is None:
+            raise ValueError("delivery_circuit_reset_receipt_required")
+        return
+    if args.clear_circuit:
+        if args.operator is None or args.reason is None:
+            raise ValueError("delivery_circuit_reset_operator_and_reason_required")
+        if any((args.check_config, args.dry_run, args.health, args.once)):
+            raise ValueError("delivery_circuit_reset_flags_conflict")
+        if args.apply and args.receipt is None:
+            raise ValueError("delivery_circuit_reset_receipt_required")
+        if args.apply and expected_binding is None:
+            raise ValueError(
+                "delivery_circuit_reset_expected_active_binding_required"
+            )
+        if args.apply and expected_config is None:
+            raise ValueError("delivery_circuit_reset_expected_config_required")
+        if args.apply and expected_plan is None:
+            raise ValueError("delivery_circuit_reset_expected_plan_required")
+        if args.apply and expected_before is None:
+            raise ValueError("delivery_circuit_reset_expected_before_required")
+        if expected_binding is not None and (
+            _SHA256_RE.fullmatch(str(expected_binding)) is None
+            or str(expected_binding) == "0" * 64
+        ):
+            raise ValueError("delivery_circuit_reset_expected_active_binding_invalid")
+        if expected_config is not None and (
+            _SHA256_RE.fullmatch(str(expected_config)) is None
+            or str(expected_config) == "0" * 64
+        ):
+            raise ValueError("delivery_circuit_reset_expected_config_invalid")
+        if expected_plan is not None and (
+            _SHA256_RE.fullmatch(str(expected_plan)) is None
+            or str(expected_plan) == "0" * 64
+        ):
+            raise ValueError("delivery_circuit_reset_expected_plan_invalid")
+        if expected_before is not None and (
+            _SHA256_RE.fullmatch(str(expected_before)) is None
+            or str(expected_before) == "0" * 64
+        ):
+            raise ValueError("delivery_circuit_reset_expected_before_invalid")
+        return
+    if (
+        any(reset_only_flags)
+        or args.apply
+        or expected_binding is not None
+        or expected_config is not None
+        or expected_plan is not None
+        or expected_before is not None
+    ):
+        raise ValueError("delivery_circuit_reset_arguments_require_clear_circuit")
+
+
+def _run_circuit_reset_command(
+    *,
+    args: argparse.Namespace,
+    config: DispatcherConfig,
+    store: RcaDeliveryStore,
+) -> int:
+    if args.materialize_reset:
+        receipt_path = _absolute_new_circuit_reset_receipt_path(args.receipt)
+        audit = store.delivery_dispatcher_circuit_reset_audit(
+            args.materialize_reset,
+            effect_kind=args.effect_kind,
+        )
+        if audit is None:
+            raise RuntimeError("delivery_circuit_reset_audit_missing")
+        try:
+            receipt_sha256 = _write_immutable_circuit_reset_receipt(
+                receipt_path,
+                audit,
+            )
+        except Exception as exc:
+            raise ValueError(
+                "delivery_circuit_reset_recovery_materialization_failed"
+            ) from exc
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "recovered": True,
+                    "reset_id": args.materialize_reset,
+                    "effect_kind": args.effect_kind,
+                    "receipt": str(receipt_path),
+                    "receipt_sha256": receipt_sha256,
+                    "receipt_fingerprint": audit["receipt_fingerprint"],
+                    "external_effects_triggered": False,
+                },
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    operator, reason = _validate_circuit_reset_text(args.operator, args.reason)
+    receipt_path = (
+        _absolute_new_circuit_reset_receipt_path(args.receipt)
+        if args.receipt is not None
+        else None
+    )
+    active_binding = _active_release_binding_snapshot(config)
+    expected_binding = args.expected_active_release_binding_sha256
+    expected_config = args.expected_config_binding_sha256
+    expected_plan = args.expected_plan_id
+    expected_before = args.expected_before_state_sha256
+    if expected_binding is not None and active_binding["sha256"] != expected_binding:
+        raise RuntimeError("delivery_circuit_reset_active_binding_changed")
+    config_binding_sha256 = _circuit_reset_sha256(config.public_dict())
+    if expected_config is not None and config_binding_sha256 != expected_config:
+        raise RuntimeError("delivery_circuit_reset_config_changed")
+    tool_provenance = _circuit_reset_tool_provenance()
+    before = store.delivery_dispatcher_circuit_reset_state(args.effect_kind)
+    if before is None:
+        raise RuntimeError("delivery_circuit_reset_state_missing")
+    if before["circuit"]["state"] != "open":
+        raise RuntimeError("delivery_circuit_reset_requires_open_circuit")
+    before_state_sha256 = _circuit_reset_sha256(before["circuit"])
+    if expected_before is not None and before_state_sha256 != expected_before:
+        raise RuntimeError("delivery_circuit_reset_before_state_changed")
+    recorded_at = _utc_now().isoformat()
+    planned = _build_delivery_circuit_reset_receipt(
+        config=config,
+        effect_kind=args.effect_kind,
+        operator=operator,
+        reason=reason,
+        before=before,
+        recorded_at=recorded_at,
+        receipt_path=receipt_path,
+        active_release_binding=active_binding,
+        tool_provenance=tool_provenance,
+    )
+    if expected_plan is not None and planned["plan_id"] != expected_plan:
+        raise RuntimeError("delivery_circuit_reset_plan_changed")
+    if not args.apply:
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "mode": "plan",
+                    "applied": False,
+                    "external_effects_triggered": False,
+                    "plan": planned,
+                },
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if _active_release_binding_snapshot(config) != active_binding:
+        raise RuntimeError("delivery_circuit_reset_active_binding_changed")
+    if _circuit_reset_tool_provenance() != tool_provenance:
+        raise RuntimeError("delivery_circuit_reset_tool_provenance_changed")
+    reset_at = datetime.fromisoformat(recorded_at)
+    _before, after = store.close_delivery_dispatcher_circuit_with_audit(
+        effect_kind=args.effect_kind,
+        audit=planned,
+        now=reset_at,
+    )
+    if (
+        after["circuit"] != planned["after"]
+        or after["permanent_failure"] != planned["permanent_failure_after"]
+    ):
+        raise RuntimeError("delivery_circuit_reset_post_state_mismatch")
+    try:
+        receipt_sha256 = _write_immutable_circuit_reset_receipt(
+            receipt_path,
+            planned,
+        )
+    except Exception as exc:
+        raise DeliveryCircuitResetReceiptMaterializationError(
+            reset_id=planned["reset_id"],
+            receipt_path=receipt_path,
+            cause=exc,
+        ) from exc
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "applied": True,
+                "command": "clear-delivery-circuit",
+                "effect_kind": args.effect_kind,
+                "reset_id": planned["reset_id"],
+                "receipt": str(receipt_path),
+                "receipt_sha256": receipt_sha256,
+                "receipt_fingerprint": planned["receipt_fingerprint"],
+                "pre_state": planned["pre_state"],
+                "post_state": planned["post_state"],
+                "effect_delta": planned["effect_delta"],
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
 
 
 def load_delivery_dispatcher_environment(
@@ -5525,6 +6005,7 @@ def main(argv: list[str] | None = None) -> int:
     load_delivery_dispatcher_environment()
     args = _parser().parse_args(argv)
     try:
+        _validate_circuit_reset_arguments(args)
         config = DispatcherConfig.from_env()
     except ValueError as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
@@ -5569,7 +6050,13 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(payload, ensure_ascii=False))
         return 0 if healthy else 2
     try:
-        store = RcaDeliveryStore(config.control_db_path, require_current=True)
+        reset_mode = bool(args.clear_circuit or args.materialize_reset)
+        store = RcaDeliveryStore(
+            config.control_db_path,
+            require_current=True,
+            read_only=reset_mode and not args.apply,
+            ensure_current_rows=not reset_mode,
+        )
     except (OSError, RuntimeError, sqlite3.Error) as exc:
         print(
             json.dumps(
@@ -5578,10 +6065,43 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 2
-    if args.clear_circuit:
-        circuit = store.close_delivery_dispatcher_circuit(effect_kind=args.effect_kind)
-        print(json.dumps({"ok": True, "circuit": asdict(circuit)}, ensure_ascii=False))
-        return 0
+    if args.clear_circuit or args.materialize_reset:
+        try:
+            return _run_circuit_reset_command(
+                args=args,
+                config=config,
+                store=store,
+            )
+        except DeliveryCircuitResetReceiptMaterializationError as exc:
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": type(exc).__name__,
+                        "message": str(exc),
+                        "recovery_required": True,
+                        "reset_id": exc.reset_id,
+                        "meta_key": exc.meta_key,
+                        "receipt": str(exc.receipt_path),
+                        "external_effects_triggered": False,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 2
+        except Exception as exc:
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": type(exc).__name__,
+                        "message": str(exc),
+                        "external_effects_triggered": False,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 2
     if args.dry_run:
         rows = store.preview_dispatchable_effects(
             limit=config.batch_size,

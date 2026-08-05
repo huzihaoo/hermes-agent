@@ -37,6 +37,10 @@ from gateway.pnc_rca_delivery_quarantine_baseline import (
     quarantine_baseline_status_tx,
 )
 from gateway.pnc_rca_delivery_observability import validate_delivery_observation
+from gateway.pnc_rca_control_store import (
+    OUTBOX_CIRCUIT_RESET_SCHEMA_VERSION,
+    _validate_dispatcher_circuit_reset_audit,
+)
 from gateway.pnc_rca_conclusion_adjudication import (
     ADJUDICATION_EFFECT_SCHEMA_VERSION,
     ConclusionAdjudicationError,
@@ -114,6 +118,20 @@ DELIVERY_WATCH_SLA_SECONDS = 86_400
 PERMANENT_FAILURE_CIRCUIT_THRESHOLD = 2
 _PERMANENT_FAILURE_STREAK_META_KEY = "permanent_failure_streak"
 _PERMANENT_FAILURE_LAST_META_KEY = "permanent_failure_last"
+DELIVERY_CIRCUIT_RESET_META_PREFIX = "rca_delivery_dispatcher_circuit_reset:"
+DELIVERY_CIRCUIT_RESET_SCHEMA_VERSION = OUTBOX_CIRCUIT_RESET_SCHEMA_VERSION
+DELIVERY_CIRCUIT_RESET_REQUIRED_FIELDS = frozenset(
+    {
+        "plan_id",
+        "before_state_sha256",
+        "circuit_scope",
+        "effect_kind",
+        "active_release_binding",
+        "tool_provenance",
+        "permanent_failure_before",
+        "permanent_failure_after",
+    }
+)
 _NON_PIPELINE_QUARANTINE_CODES = frozenset({"feishu_work_item_not_found"})
 LEARNING_LANE_EXTERNAL_EFFECT_ERROR = "learning_lane_external_effect_forbidden"
 LEARNING_LANE_ADMISSION_MISSING_ERROR = "learning_lane_admission_missing"
@@ -497,6 +515,98 @@ def _canonical_json(value: Any) -> str:
     )
 
 
+def _reject_delivery_circuit_reset_json_constant(_value: str) -> None:
+    raise ValueError("delivery_circuit_reset_non_finite_json")
+
+
+def _validate_delivery_circuit_reset_audit(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    normalized = _validate_dispatcher_circuit_reset_audit(value)
+    if not DELIVERY_CIRCUIT_RESET_REQUIRED_FIELDS.issubset(normalized):
+        raise ValueError("delivery_circuit_reset_audit_fields_invalid")
+    if (
+        re.fullmatch(r"[0-9a-f]{64}", str(normalized.get("plan_id") or "")) is None
+        or re.fullmatch(
+            r"[0-9a-f]{64}", str(normalized.get("before_state_sha256") or "")
+        )
+        is None
+        or normalized.get("before_state_sha256")
+        != hashlib.sha256(_canonical_json(normalized["before"]).encode()).hexdigest()
+    ):
+        raise ValueError("delivery_circuit_reset_plan_binding_invalid")
+    if (
+        normalized.get("circuit_scope") != "delivery"
+        or normalized.get("effect_kind") not in DELIVERY_EFFECT_KINDS
+    ):
+        raise ValueError("delivery_circuit_reset_audit_schema_invalid")
+    release = normalized.get("active_release_binding")
+    if (
+        not isinstance(release, Mapping)
+        or not isinstance(release.get("path"), str)
+        or not Path(release["path"]).is_absolute()
+        or re.fullmatch(r"[0-9a-f]{64}", str(release.get("sha256") or "")) is None
+        or re.fullmatch(
+            r"[0-9a-f]{64}", str(release.get("authority_sha256") or "")
+        )
+        is None
+        or not str(release.get("release_id") or "").strip()
+        or not str(release.get("authority_epoch_id") or "").strip()
+        or not str(release.get("bootstrap_epoch_id") or "").strip()
+    ):
+        raise ValueError("delivery_circuit_reset_active_binding_invalid")
+    provenance = normalized.get("tool_provenance")
+    if not isinstance(provenance, Mapping) or any(
+        not isinstance(provenance.get(path_name), str)
+        or not Path(provenance[path_name]).is_absolute()
+        or re.fullmatch(r"[0-9a-f]{64}", str(provenance.get(sha_name) or ""))
+        is None
+        for path_name, sha_name in (
+            ("entrypoint_path", "entrypoint_sha256"),
+            ("delivery_store_path", "delivery_store_sha256"),
+            ("receipt_helper_path", "receipt_helper_sha256"),
+            ("control_store_path", "control_store_sha256"),
+            ("bootstrap_path", "bootstrap_sha256"),
+        )
+    ):
+        raise ValueError("delivery_circuit_reset_tool_provenance_invalid")
+    before_failure = normalized.get("permanent_failure_before")
+    after_failure = normalized.get("permanent_failure_after")
+    if (
+        not isinstance(before_failure, Mapping)
+        or before_failure.get("threshold") != PERMANENT_FAILURE_CIRCUIT_THRESHOLD
+        or isinstance(before_failure.get("consecutive_failures"), bool)
+        or not isinstance(before_failure.get("consecutive_failures"), int)
+        or type(before_failure.get("last_failure_present")) is not bool
+        or not isinstance(before_failure.get("last_failure"), Mapping)
+        or after_failure
+        != {
+            "threshold": PERMANENT_FAILURE_CIRCUIT_THRESHOLD,
+            "consecutive_failures": 0,
+            "last_failure": {},
+            "last_failure_present": False,
+        }
+    ):
+        raise ValueError("delivery_circuit_reset_failure_state_invalid")
+    effect_delta = normalized.get("effect_delta")
+    expected_total = 3 + int(before_failure["last_failure_present"])
+    if (
+        not isinstance(effect_delta, Mapping)
+        or effect_delta.get("external_effects_triggered") is not False
+        or effect_delta.get("delivery_effect_rows") != 0
+        or effect_delta.get("database_rows")
+        != {
+            "circuit_updated": 1,
+            "control_meta_inserted": 1,
+            "permanent_failure_streak_upserted": 1,
+            "permanent_failure_last_deleted": expected_total - 3,
+            "total": expected_total,
+        }
+    ):
+        raise ValueError("delivery_circuit_reset_effect_delta_invalid")
+    return normalized
+
+
 def _execute_schema_script_in_transaction(
     conn: sqlite3.Connection,
     script: str,
@@ -682,11 +792,21 @@ class RcaDeliveryStore:
         *,
         busy_timeout_ms: int = 5000,
         require_current: bool = False,
+        read_only: bool = False,
+        ensure_current_rows: bool = True,
     ):
         self.db_path = Path(db_path).expanduser()
         if not isinstance(require_current, bool):
             raise TypeError("require_current must be true or false")
+        if not isinstance(read_only, bool):
+            raise TypeError("read_only must be true or false")
+        if not isinstance(ensure_current_rows, bool):
+            raise TypeError("ensure_current_rows must be true or false")
+        if read_only and not require_current:
+            raise ValueError("read_only delivery store requires current schema")
         self.require_current = require_current
+        self.read_only = read_only
+        self.ensure_current_rows = ensure_current_rows
         if require_current:
             self._validate_runtime_fences()
             self._validate_existing_path()
@@ -728,16 +848,27 @@ class RcaDeliveryStore:
     def _connect(self) -> sqlite3.Connection:
         if self.require_current:
             self._validate_runtime_fences()
-        conn = sqlite3.connect(
-            self.db_path,
-            timeout=self.busy_timeout_ms / 1000,
-            isolation_level=None,
-        )
+        if self.read_only:
+            conn = sqlite3.connect(
+                f"{self.db_path.resolve().as_uri()}?mode=ro",
+                uri=True,
+                timeout=self.busy_timeout_ms / 1000,
+                isolation_level=None,
+            )
+        else:
+            conn = sqlite3.connect(
+                self.db_path,
+                timeout=self.busy_timeout_ms / 1000,
+                isolation_level=None,
+            )
         conn.row_factory = sqlite3.Row
         conn.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
         conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=FULL")
+        if self.read_only:
+            conn.execute("PRAGMA query_only=ON")
+        else:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=FULL")
         if self.require_current:
             try:
                 self._validate_runtime_fences()
@@ -1223,7 +1354,8 @@ class RcaDeliveryStore:
                 self._validate_w6_effect_guards(conn)
             finally:
                 conn.close()
-            self._ensure_card_patch_circuit_row()
+            if self.ensure_current_rows and not self.read_only:
+                self._ensure_card_patch_circuit_row()
             return
         conn = self._connect()
         try:
@@ -7489,6 +7621,77 @@ class RcaDeliveryStore:
             claim.effect_key, claim.delivery_id, "quarantined", job_status
         )
 
+    @staticmethod
+    def _delivery_circuit_reset_state_in_transaction(
+        conn: sqlite3.Connection,
+        *,
+        effect_kind: str,
+    ) -> dict[str, Any] | None:
+        row = conn.execute(
+            """
+            SELECT state, reason_code, reason_detail, opened_at, updated_at
+              FROM rca_delivery_dispatcher_circuit
+             WHERE circuit_name = ?
+            """,
+            (effect_kind,),
+        ).fetchone()
+        if row is None:
+            return None
+        streak_key = (
+            _PERMANENT_FAILURE_STREAK_META_KEY
+            if effect_kind == DELIVERY_EFFECT_KIND
+            else f"{_PERMANENT_FAILURE_STREAK_META_KEY}:{effect_kind}"
+        )
+        last_key = (
+            _PERMANENT_FAILURE_LAST_META_KEY
+            if effect_kind == DELIVERY_EFFECT_KIND
+            else f"{_PERMANENT_FAILURE_LAST_META_KEY}:{effect_kind}"
+        )
+        streak_row = conn.execute(
+            "SELECT value FROM rca_delivery_meta WHERE key = ?",
+            (streak_key,),
+        ).fetchone()
+        last_row = conn.execute(
+            "SELECT value FROM rca_delivery_meta WHERE key = ?",
+            (last_key,),
+        ).fetchone()
+        if streak_row is None:
+            streak = 0
+        else:
+            try:
+                streak = int(str(streak_row["value"]))
+            except (TypeError, ValueError):
+                streak = PERMANENT_FAILURE_CIRCUIT_THRESHOLD
+            if streak < 0:
+                streak = PERMANENT_FAILURE_CIRCUIT_THRESHOLD
+        return {
+            "circuit": dict(row),
+            "permanent_failure": {
+                "threshold": PERMANENT_FAILURE_CIRCUIT_THRESHOLD,
+                "consecutive_failures": streak,
+                "last_failure": (
+                    _json_object(last_row["value"]) if last_row is not None else {}
+                ),
+                "last_failure_present": last_row is not None,
+            },
+        }
+
+    def delivery_dispatcher_circuit_reset_state(
+        self,
+        effect_kind: str = DELIVERY_EFFECT_KIND,
+    ) -> dict[str, Any] | None:
+        """Return the exact circuit and streak state used by a reset plan."""
+        if effect_kind not in DELIVERY_EFFECT_KINDS:
+            raise ValueError("unsupported delivery circuit")
+        conn = self._connect()
+        try:
+            return self._delivery_circuit_reset_state_in_transaction(
+                conn,
+                effect_kind=effect_kind,
+            )
+        finally:
+            conn.close()
+
     def delivery_dispatcher_circuit(
         self, effect_kind: str = DELIVERY_EFFECT_KIND
     ) -> DeliveryDispatcherCircuit:
@@ -7755,6 +7958,165 @@ class RcaDeliveryStore:
         finally:
             conn.close()
         return self.delivery_dispatcher_circuit(effect_kind)
+
+    def close_delivery_dispatcher_circuit_with_audit(
+        self,
+        *,
+        effect_kind: str,
+        audit: Mapping[str, Any],
+        now: datetime | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Atomically persist an operator audit and close one exact circuit."""
+        if effect_kind not in DELIVERY_EFFECT_KINDS:
+            raise ValueError("unsupported delivery circuit")
+        payload = _validate_delivery_circuit_reset_audit(audit)
+        if payload["effect_kind"] != effect_kind:
+            raise ValueError("delivery_circuit_reset_effect_kind_mismatch")
+        current = _iso(now)
+        if payload["recorded_at"] != current:
+            raise ValueError("delivery_circuit_reset_timestamp_mismatch")
+        try:
+            observed_db = self.db_path.expanduser().absolute().lstat()
+        except OSError as exc:
+            raise RuntimeError("delivery_circuit_reset_control_db_missing") from exc
+        identity = payload["control_db_identity"]
+        observed_identity = {
+            "path": str(self.db_path.expanduser().absolute()),
+            "device": int(observed_db.st_dev),
+            "inode": int(observed_db.st_ino),
+            "size": int(observed_db.st_size),
+            "mtime_ns": int(observed_db.st_mtime_ns),
+        }
+        if identity != observed_identity:
+            raise RuntimeError("delivery_circuit_reset_control_db_changed")
+        expected_before = {
+            "circuit": dict(payload["before"]),
+            "permanent_failure": dict(payload["permanent_failure_before"]),
+        }
+        expected_after = {
+            "circuit": dict(payload["after"]),
+            "permanent_failure": dict(payload["permanent_failure_after"]),
+        }
+        expected_rows = dict(payload["effect_delta"]["database_rows"])
+        serialized = _canonical_json(payload)
+        meta_key = f"{DELIVERY_CIRCUIT_RESET_META_PREFIX}{payload['reset_id']}"
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'control_meta'"
+            ).fetchone() is None:
+                raise RuntimeError("delivery_circuit_reset_audit_store_missing")
+            observed_before = self._delivery_circuit_reset_state_in_transaction(
+                conn,
+                effect_kind=effect_kind,
+            )
+            if observed_before is None:
+                raise RuntimeError("delivery_circuit_reset_state_missing")
+            if observed_before != expected_before:
+                raise RuntimeError("delivery_circuit_reset_state_changed")
+            if observed_before["circuit"]["state"] != "open":
+                raise RuntimeError("delivery_circuit_reset_requires_open_circuit")
+            changes_before = conn.total_changes
+            try:
+                conn.execute(
+                    "INSERT INTO control_meta(key, value) VALUES(?, ?)",
+                    (meta_key, serialized),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise RuntimeError(
+                    "delivery_circuit_reset_audit_already_exists"
+                ) from exc
+            updated = conn.execute(
+                """
+                UPDATE rca_delivery_dispatcher_circuit
+                   SET state = 'closed', reason_code = '', reason_detail = '',
+                       opened_at = NULL, updated_at = ?
+                 WHERE circuit_name = ? AND state = 'open' AND updated_at = ?
+                """,
+                (
+                    current,
+                    effect_kind,
+                    observed_before["circuit"]["updated_at"],
+                ),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError("delivery_circuit_reset_state_changed")
+            self._reset_permanent_failure_streak_in_transaction(
+                conn,
+                circuit_name=effect_kind,
+                require_closed_circuit=True,
+            )
+            observed_after = self._delivery_circuit_reset_state_in_transaction(
+                conn,
+                effect_kind=effect_kind,
+            )
+            if observed_after != expected_after:
+                raise RuntimeError("delivery_circuit_reset_post_state_changed")
+            actual_rows = conn.total_changes - changes_before
+            if actual_rows != expected_rows["total"]:
+                raise RuntimeError("delivery_circuit_reset_row_delta_changed")
+            conn.commit()
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return observed_before, observed_after
+
+    def delivery_dispatcher_circuit_reset_audit(
+        self,
+        reset_id: str,
+        *,
+        effect_kind: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Read and verify a durable delivery-circuit reset audit."""
+        normalized = str(reset_id or "").strip()
+        if re.fullmatch(r"[0-9a-f]{64}", normalized) is None:
+            raise ValueError("delivery_circuit_reset_id_invalid")
+        if effect_kind is not None and effect_kind not in DELIVERY_EFFECT_KINDS:
+            raise ValueError("unsupported delivery circuit")
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT value FROM control_meta WHERE key = ?",
+                (f"{DELIVERY_CIRCUIT_RESET_META_PREFIX}{normalized}",),
+            ).fetchone()
+            if row is None:
+                return None
+            raw = str(row["value"])
+            value = json.loads(
+                raw,
+                parse_constant=_reject_delivery_circuit_reset_json_constant,
+            )
+            value = _validate_delivery_circuit_reset_audit(value)
+            if (
+                value["reset_id"] != normalized
+                or _canonical_json(value) != raw
+            ):
+                raise RuntimeError("delivery_circuit_reset_audit_tampered")
+            if effect_kind is not None and value["effect_kind"] != effect_kind:
+                raise RuntimeError("delivery_circuit_reset_effect_kind_mismatch")
+            try:
+                observed_db = self.db_path.expanduser().absolute().lstat()
+            except OSError as exc:
+                raise RuntimeError(
+                    "delivery_circuit_reset_control_db_missing"
+                ) from exc
+            identity = value["control_db_identity"]
+            if (
+                identity["path"] != str(self.db_path.expanduser().absolute())
+                or int(identity["device"]) != int(observed_db.st_dev)
+                or int(identity["inode"]) != int(observed_db.st_ino)
+            ):
+                raise RuntimeError("delivery_circuit_reset_control_db_mismatch")
+            return value
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise RuntimeError("delivery_circuit_reset_audit_invalid") from exc
+        finally:
+            conn.close()
 
     @staticmethod
     def _delivery_outcome_slo_in_transaction(
