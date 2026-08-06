@@ -854,6 +854,8 @@ def _validate_exact_outbox_hold_nested(value: Mapping[str, Any]) -> None:
         )
         source = _exact_hold_require_mapping(item, fields, error)
         require_bool(source["present"])
+        if source["present"] is not True:
+            raise ValueError(error)
         require_path(source["path"])
         _exact_hold_require_sha(source["sha256"], error)
         for field in ("size", "mode", "uid", "nlink"):
@@ -17714,6 +17716,11 @@ class RcaControlStore:
         runtime_raw: dict[str, bytes] = {}
         try:
             for file_binding in runtime_files:
+                if (
+                    not isinstance(file_binding, Mapping)
+                    or file_binding.get("present") is not True
+                ):
+                    raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
                 digest, raw, identity = self._exact_bound_file_bytes(
                     file_binding["path"]
                 )

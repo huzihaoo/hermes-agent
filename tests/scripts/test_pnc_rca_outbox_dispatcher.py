@@ -1671,6 +1671,23 @@ def test_exact_outbox_hold_rejects_invalid_manifest_runtime_semantics_without_mu
     assert _rows_and_meta(store) == before
 
 
+def test_exact_outbox_hold_rejects_nonpresent_runtime_script_without_mutation(
+    tmp_path, monkeypatch, capsys
+):
+    store, _config, _receipt, _args, output = _exact_hold_plan(
+        tmp_path, monkeypatch, capsys
+    )
+    audit = copy.deepcopy(output["plan"])
+    audit["tool_provenance"]["runtime_provenance"]["runtime_scripts"][0][
+        "present"
+    ] = False
+    _resign_exact_hold(audit)
+    before = _rows_and_meta(store)
+    with pytest.raises(ValueError, match="exact_outbox_hold_nested_schema_invalid"):
+        store.hold_exact_outbox_with_audit(audit=audit)
+    assert _rows_and_meta(store) == before
+
+
 def test_exact_outbox_hold_rejects_installed_launcher_drift_without_mutation(
     tmp_path, monkeypatch, capsys
 ):
