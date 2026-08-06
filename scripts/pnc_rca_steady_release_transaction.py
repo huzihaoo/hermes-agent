@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Govern a steady-active RCA successor projection without restarting services."""
+"""Install the record-only half of one RCA successor release transaction."""
 
 from __future__ import annotations
 
@@ -462,7 +462,7 @@ def _relay_expected(source: Mapping[str, Any]) -> dict[str, Any]:
         del arguments[index : index + 2]
     if "--task-id" in arguments:
         _fail("pnc_steady_release_transaction_relay_task_id_invalid")
-    expected["EnvironmentVariables"]["HERMES_OUTBOUND_MODE"] = "live"
+    expected["EnvironmentVariables"]["HERMES_OUTBOUND_MODE"] = "record-only"
     return expected
 
 
@@ -479,8 +479,8 @@ def _dispatcher_expected(
     expected_environment = expected["EnvironmentVariables"]
     expected_environment.update(
         {
-            "HERMES_OUTBOUND_MODE": "live",
-            "HERMES_RCA_DELIVERY_DISPATCHER_ENABLED": "true",
+            "HERMES_OUTBOUND_MODE": "record-only",
+            "HERMES_RCA_DELIVERY_DISPATCHER_ENABLED": "false",
             "HERMES_RCA_DELIVERY_DISPATCHER_INVENTORY_PIN": inventory_pin,
             "HERMES_RCA_DELIVERY_DISPATCHER_OBSERVABILITY_ENABLED": "true",
             "HERMES_RCA_DELIVERY_DISPATCHER_OBSERVATION_RELEASE_ID": release_id,
@@ -709,9 +709,9 @@ def _validate_candidate(
     if (
         env.get("HERMES_RCA_PROD_RELEASE_ID") != release_id
         or env.get("HERMES_RCA_PROD_CAPACITY_MODE") != "bootstrap"
-        or env.get("HERMES_OUTBOUND_MODE") != "live"
+        or env.get("HERMES_OUTBOUND_MODE") != "record-only"
         or env.get("HERMES_RCA_OUTBOX_ALLOW_FEISHU_WRITEBACK") != "false"
-        or env.get("HERMES_RCA_DELIVERY_DISPATCHER_ENABLED") != "true"
+        or env.get("HERMES_RCA_DELIVERY_DISPATCHER_ENABLED") != "false"
         or manifest.get("env_sha256") != env_observation["sha256"]
     ):
         _fail("pnc_steady_release_transaction_env_invalid")
@@ -1151,6 +1151,7 @@ def _read_plan(path: Path) -> tuple[bytes, dict[str, Any]]:
 
 def _acquire_lock(state_root: Path, transaction_id: str) -> tuple[Path, int]:
     lock = state_root / LOCK_NAME
+    descriptor = -1
     try:
         descriptor = os.open(
             lock,
@@ -1163,12 +1164,21 @@ def _acquire_lock(state_root: Path, transaction_id: str) -> tuple[Path, int]:
     except FileExistsError as exc:
         _fail("pnc_steady_release_transaction_lock_held", exc)
     except OSError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+            lock.unlink(missing_ok=True)
         _fail("pnc_steady_release_transaction_lock_invalid", exc)
 
 
 def _release_lock(lock: Path, descriptor: int) -> None:
-    os.close(descriptor)
-    lock.unlink(missing_ok=True)
+    try:
+        opened = os.fstat(descriptor)
+        current = lock.lstat()
+        if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+            _fail("pnc_steady_release_transaction_lock_changed")
+        lock.unlink()
+    finally:
+        os.close(descriptor)
 
 
 def _effects() -> dict[str, bool]:
@@ -1181,17 +1191,261 @@ def _effects() -> dict[str, bool]:
     }
 
 
+def _sync_directory(path: Path) -> None:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _replace_from_staged(
+    entry: Mapping[str, Any],
+    *,
+    transaction_id: str,
+    replace_func,
+    after_observations: dict[str, Mapping[str, Any]],
+) -> None:
+    raw, staged_observation = base._read_file(
+        Path(entry["staged_path"]),
+        code="pnc_steady_release_transaction_staged_invalid",
+    )
+    if (
+        staged_observation["sha256"] != entry["source"]["sha256"]
+        or staged_observation["mode"] != entry["target_mode"]
+    ):
+        _fail("pnc_steady_release_transaction_staged_changed")
+    target = Path(entry["target_path"])
+    temporary = target.parent / (
+        f".{target.name}.steady-{transaction_id}.tmp"
+    )
+    base._write_new(temporary, raw, mode=int(entry["target_mode"], 8))
+    try:
+        replace_func(temporary, target)
+        observed = _owned_after_observation(entry)
+        if observed is None:
+            _fail("pnc_steady_release_transaction_verify_failed")
+        after_observations[str(entry["name"])] = observed
+        _sync_directory(target.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _owned_after_observation(
+    entry: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    try:
+        observed = base._observe(Path(entry["target_path"]), required=True)
+    except base.ReleaseTransactionError:
+        return None
+    if (
+        observed["sha256"] != entry["source"]["sha256"]
+        or observed["mode"] != entry["target_mode"]
+    ):
+        return None
+    return observed
+
+
+def _restore_attempted_no_clobber(
+    plan: Mapping[str, Any],
+    *,
+    attempted_names: Sequence[str],
+    after_observations: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    entries = {str(entry["name"]): entry for entry in plan["entries"]}
+    restored: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    for name in reversed(tuple(attempted_names)):
+        entry = entries[name]
+        target = Path(entry["target_path"])
+        before = entry["before"]
+        try:
+            current = base._observe(target, required=False)
+        except base.ReleaseTransactionError as exc:
+            blocked.append(
+                {"name": name, "reason": "target_unobservable", "error": exc.code}
+            )
+            continue
+        expected_after = after_observations.get(name)
+        if expected_after is None:
+            if base._same_observation(current, before):
+                restored.append(
+                    {"name": name, "action": "not_written", "observed": current}
+                )
+            else:
+                blocked.append(
+                    {
+                        "name": name,
+                        "reason": "after_observation_missing",
+                        "observed": current,
+                    }
+                )
+            continue
+        if not base._same_observation(current, expected_after):
+            blocked.append(
+                {"name": name, "reason": "target_changed", "observed": current}
+            )
+            continue
+        if before["exists"]:
+            try:
+                rollback_raw, rollback_observation = base._read_file(
+                    Path(entry["rollback_path"]),
+                    code="pnc_steady_release_transaction_rollback_invalid",
+                )
+            except base.ReleaseTransactionError as exc:
+                blocked.append(
+                    {
+                        "name": name,
+                        "reason": "rollback_blob_unavailable",
+                        "error": exc.code,
+                    }
+                )
+                continue
+            if (
+                rollback_observation["sha256"] != before["sha256"]
+                or rollback_observation["mode"] != before["mode"]
+            ):
+                blocked.append(
+                    {
+                        "name": name,
+                        "reason": "rollback_blob_changed",
+                        "observed": rollback_observation,
+                    }
+                )
+                continue
+            try:
+                before_restore = base._observe(target, required=True)
+            except base.ReleaseTransactionError as exc:
+                blocked.append(
+                    {
+                        "name": name,
+                        "reason": "target_unobservable_before_restore",
+                        "error": exc.code,
+                    }
+                )
+                continue
+            if not base._same_observation(before_restore, expected_after):
+                blocked.append(
+                    {"name": name, "reason": "target_changed_before_restore"}
+                )
+                continue
+            restore_error: Exception | None = None
+            try:
+                base._replace(target, rollback_raw, mode=int(before["mode"], 8))
+            except Exception as exc:  # replacement may have completed before fsync failed
+                restore_error = exc
+            try:
+                observed = base._observe(target, required=True)
+            except base.ReleaseTransactionError as exc:
+                blocked.append(
+                    {"name": name, "reason": "restore_unobservable", "error": exc.code}
+                )
+                continue
+            if (
+                observed["sha256"] != before["sha256"]
+                or observed["mode"] != before["mode"]
+            ):
+                blocked.append(
+                    {
+                        "name": name,
+                        "reason": "restore_failed",
+                        "error": getattr(
+                            restore_error,
+                            "code",
+                            type(restore_error).__name__ if restore_error else "",
+                        ),
+                        "observed": observed,
+                    }
+                )
+                continue
+            restored.append(
+                {
+                    "name": name,
+                    "action": (
+                        "restored_after_error" if restore_error else "restored"
+                    ),
+                    "observed": observed,
+                }
+            )
+            continue
+        try:
+            before_remove = base._observe(target, required=True)
+        except base.ReleaseTransactionError as exc:
+            blocked.append(
+                {
+                    "name": name,
+                    "reason": "target_unobservable_before_restore",
+                    "error": exc.code,
+                }
+            )
+            continue
+        if not base._same_observation(before_remove, expected_after):
+            blocked.append(
+                {"name": name, "reason": "target_changed_before_restore"}
+            )
+            continue
+        remove_error: Exception | None = None
+        try:
+            target.unlink()
+            _sync_directory(target.parent)
+        except Exception as exc:
+            remove_error = exc
+        try:
+            observed = base._observe(target, required=False)
+        except base.ReleaseTransactionError as exc:
+            blocked.append(
+                {
+                    "name": name,
+                    "reason": "remove_unobservable",
+                    "error": exc.code,
+                }
+            )
+            continue
+        if observed["exists"]:
+            blocked.append(
+                {
+                    "name": name,
+                    "reason": "remove_failed",
+                    "error": getattr(
+                        remove_error,
+                        "code",
+                        type(remove_error).__name__ if remove_error else "",
+                    ),
+                    "observed": observed,
+                }
+            )
+            continue
+        restored.append(
+            {
+                "name": name,
+                "action": "removed_after_error" if remove_error else "removed",
+                "observed": observed,
+            }
+        )
+    return {"restored": restored, "blocked": blocked}
+
+
 def apply_plan(
     plan: Mapping[str, Any], *, plan_path: Path, replace_func=os.replace
 ) -> dict[str, Any]:
     _validate_plan(plan)
     if plan_path != Path(plan["transaction_dir"]) / "plan.json":
         _fail("pnc_steady_release_transaction_plan_invalid")
+    plan_raw, on_disk_plan = _read_plan(plan_path)
+    if dict(plan) != on_disk_plan:
+        _fail("pnc_steady_release_transaction_plan_changed")
+    plan = on_disk_plan
     state_root = base._directory(Path(plan["state_root"]))
     lock, lock_fd = _acquire_lock(state_root, str(plan["transaction_id"]))
-    mutation_started = False
-    rollback_performed = False
+    attempted_names: list[str] = []
+    after_by_name: dict[str, Mapping[str, Any]] = {}
     try:
+        locked_plan_raw, locked_plan = _read_plan(plan_path)
+        if locked_plan_raw != plan_raw or locked_plan != plan:
+            _fail("pnc_steady_release_transaction_plan_changed")
         provenance = base._source_provenance(Path(plan["source_root"]))
         if provenance != {
             "commit": plan["source_commit"],
@@ -1220,7 +1474,6 @@ def apply_plan(
             plan["activation_binding"]
         ):
             _fail("pnc_steady_release_transaction_activation_changed")
-        base._backup(plan)
         for entry in plan["entries"]:
             current = base._observe(Path(entry["target_path"]), required=False)
             if not base._same_observation(current, entry["before"]):
@@ -1231,7 +1484,13 @@ def apply_plan(
             )
             if staged_observation["sha256"] != entry["source"]["sha256"]:
                 _fail("pnc_steady_release_transaction_staged_changed")
-        mutation_started = True
+        base._backup(plan)
+        for entry in plan["entries"]:
+            if not base._same_observation(
+                base._observe(Path(entry["target_path"]), required=False),
+                entry["before"],
+            ):
+                _fail("pnc_steady_release_transaction_target_changed")
         ordered = sorted(
             plan["entries"], key=lambda item: 1 if item["kind"] == "manifest" else 0
         )
@@ -1241,24 +1500,19 @@ def apply_plan(
                 entry["before"],
             ):
                 _fail("pnc_steady_release_transaction_target_changed")
-            raw, _observation = base._read_file(
-                Path(entry["staged_path"]),
-                code="pnc_steady_release_transaction_staged_invalid",
+            name = str(entry["name"])
+            attempted_names.append(name)
+            _replace_from_staged(
+                entry,
+                transaction_id=str(plan["transaction_id"]),
+                replace_func=replace_func,
+                after_observations=after_by_name,
             )
-            temporary = Path(entry["target_path"]).parent / (
-                f".{Path(entry['target_path']).name}.steady-{plan['transaction_id']}.tmp"
-            )
-            base._write_new(temporary, raw, mode=int(entry["target_mode"], 8))
-            try:
-                replace_func(temporary, Path(entry["target_path"]))
-            finally:
-                temporary.unlink(missing_ok=True)
         after = []
         for entry in plan["entries"]:
             observed = base._observe(Path(entry["target_path"]), required=True)
-            if (
-                observed["sha256"] != entry["source"]["sha256"]
-                or observed["mode"] != entry["target_mode"]
+            if not base._same_observation(
+                observed, after_by_name[str(entry["name"])]
             ):
                 _fail("pnc_steady_release_transaction_verify_failed")
             after.append({"name": entry["name"], "observed": observed})
@@ -1266,11 +1520,6 @@ def apply_plan(
             plan["activation_binding"]
         ):
             _fail("pnc_steady_release_transaction_activation_changed")
-        plan_raw, _plan_observation = base._read_file(
-            plan_path,
-            code="pnc_steady_release_transaction_plan_invalid",
-            required_mode=0o600,
-        )
         receipt = {
             "schema_version": RECEIPT_SCHEMA_VERSION,
             "transaction_id": plan["transaction_id"],
@@ -1298,34 +1547,41 @@ def apply_plan(
             receipt_path.read_bytes()
         ).hexdigest()
         return receipt
-    except Exception:
-        if mutation_started:
-            try:
-                base._restore(plan)
-                rollback_performed = True
-            except Exception:
-                raise
+    except BaseException as original:
+        if attempted_names:
+            rollback_result = _restore_attempted_no_clobber(
+                plan,
+                attempted_names=attempted_names,
+                after_observations=after_by_name,
+            )
+            automatic = {
+                "schema_version": ROLLBACK_SCHEMA_VERSION,
+                "transaction_id": plan["transaction_id"],
+                "rolled_back_at": datetime.now(timezone.utc).isoformat(),
+                "restored_to_pre_transaction": not rollback_result["blocked"],
+                "filesystem_restored_to_pre_transaction": not rollback_result[
+                    "blocked"
+                ],
+                "restored_entries": rollback_result["restored"],
+                "blocked_entries": rollback_result["blocked"],
+                "original_error": getattr(
+                    original, "code", "pnc_steady_release_transaction_apply_failed"
+                ),
+                "production_effects": _effects(),
+            }
+            base._write_new(
+                Path(plan["transaction_dir"]) / "automatic-rollback.json",
+                base._pretty(automatic),
+                mode=0o600,
+            )
+            if rollback_result["blocked"]:
+                _fail(
+                    "pnc_steady_release_transaction_automatic_rollback_incomplete",
+                    original,
+                )
         raise
     finally:
         _release_lock(lock, lock_fd)
-        if rollback_performed:
-            rollback_path = Path(plan["transaction_dir"]) / "automatic-rollback.json"
-            try:
-                base._write_new(
-                    rollback_path,
-                    base._pretty(
-                        {
-                            "schema_version": ROLLBACK_SCHEMA_VERSION,
-                            "transaction_id": plan["transaction_id"],
-                            "rolled_back_at": datetime.now(timezone.utc).isoformat(),
-                            "restored_to_pre_transaction": True,
-                            "production_effects": _effects(),
-                        }
-                    ),
-                    mode=0o600,
-                )
-            except base.ReleaseTransactionError:
-                pass
 
 
 def rollback_transaction(receipt_path: Path, *, output_path: Path) -> dict[str, Any]:
@@ -1337,39 +1593,83 @@ def rollback_transaction(receipt_path: Path, *, output_path: Path) -> dict[str, 
     receipt = base._json(
         receipt_raw, code="pnc_steady_release_transaction_receipt_invalid"
     )
-    if receipt.get("schema_version") != RECEIPT_SCHEMA_VERSION:
+    if (
+        receipt_raw != base._pretty(receipt)
+        or receipt.get("schema_version") != RECEIPT_SCHEMA_VERSION
+        or receipt.get("mutation_performed") is not True
+        or receipt.get("rollback_performed") is not False
+        or receipt.get("verification") != "pass"
+        or receipt.get("production_effects") != _effects()
+        or not output_path.is_absolute()
+    ):
         _fail("pnc_steady_release_transaction_receipt_invalid")
     plan_raw, plan = _read_plan(Path(str(receipt.get("plan_path") or "")))
-    if hashlib.sha256(plan_raw).hexdigest() != receipt.get("plan_raw_sha256"):
+    if (
+        hashlib.sha256(plan_raw).hexdigest() != receipt.get("plan_raw_sha256")
+        or receipt.get("transaction_id") != plan["transaction_id"]
+        or receipt.get("release_id") != plan["release_id"]
+        or receipt.get("authority_sha256") != plan["authority_sha256"]
+        or receipt.get("authority_epoch_id") != plan["authority_epoch_id"]
+        or receipt.get("activation_binding") != plan["activation_binding"]
+        or receipt_path != Path(plan["transaction_dir"]) / "receipt.json"
+    ):
         _fail("pnc_steady_release_transaction_receipt_binding_invalid")
+    receipt_entries = receipt.get("entries")
+    if not isinstance(receipt_entries, list) or len(receipt_entries) != len(
+        plan["entries"]
+    ):
+        _fail("pnc_steady_release_transaction_receipt_binding_invalid")
+    after_by_name: dict[str, Mapping[str, Any]] = {}
+    for item, entry in zip(receipt_entries, plan["entries"], strict=True):
+        if (
+            not isinstance(item, Mapping)
+            or set(item) != {"name", "observed"}
+            or item.get("name") != entry["name"]
+            or not _valid_observation(item.get("observed"))
+            or item["observed"].get("exists") is not True
+            or item["observed"].get("sha256") != entry["source"]["sha256"]
+            or item["observed"].get("mode") != entry["target_mode"]
+        ):
+            _fail("pnc_steady_release_transaction_receipt_binding_invalid")
+        after_by_name[str(entry["name"])] = item["observed"]
     state_root = base._directory(Path(plan["state_root"]))
     lock, lock_fd = _acquire_lock(state_root, str(plan["transaction_id"]))
     try:
-        receipt_entries = receipt.get("entries")
-        if not isinstance(receipt_entries, list) or len(receipt_entries) != len(
-            plan["entries"]
+        locked_receipt_raw, _locked_receipt_observation = base._read_file(
+            receipt_path,
+            code="pnc_steady_release_transaction_receipt_invalid",
+            required_mode=0o600,
+        )
+        locked_receipt = base._json(
+            locked_receipt_raw,
+            code="pnc_steady_release_transaction_receipt_invalid",
+        )
+        locked_plan_raw, locked_plan = _read_plan(Path(receipt["plan_path"]))
+        if (
+            locked_receipt_raw != receipt_raw
+            or locked_receipt != receipt
+            or locked_plan_raw != plan_raw
+            or locked_plan != plan
         ):
             _fail("pnc_steady_release_transaction_receipt_binding_invalid")
-        for item, entry in zip(receipt_entries, plan["entries"], strict=True):
-            if (
-                not isinstance(item, Mapping)
-                or item.get("name") != entry["name"]
-                or not _valid_observation(item.get("observed"))
-                or not base._same_observation(
-                    base._observe(Path(entry["target_path"]), required=True),
-                    item["observed"],
-                )
-            ):
-                _fail("pnc_steady_release_transaction_rollback_target_changed")
-        base._restore(plan)
+        result_detail = _restore_attempted_no_clobber(
+            plan,
+            attempted_names=[str(entry["name"]) for entry in plan["entries"]],
+            after_observations=after_by_name,
+        )
         result = {
             "schema_version": ROLLBACK_SCHEMA_VERSION,
             "transaction_id": plan["transaction_id"],
             "rolled_back_at": datetime.now(timezone.utc).isoformat(),
-            "restored_to_pre_transaction": True,
+            "restored_to_pre_transaction": not result_detail["blocked"],
+            "filesystem_restored_to_pre_transaction": not result_detail["blocked"],
+            "restored_entries": result_detail["restored"],
+            "blocked_entries": result_detail["blocked"],
             "production_effects": _effects(),
         }
         base._write_new(output_path, base._pretty(result), mode=0o600)
+        if result_detail["blocked"]:
+            _fail("pnc_steady_release_transaction_manual_rollback_incomplete")
         return result
     finally:
         _release_lock(lock, lock_fd)

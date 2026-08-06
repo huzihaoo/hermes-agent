@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import plistlib
 import sqlite3
@@ -175,9 +176,9 @@ def _prepare_candidate(args: dict, monkeypatch: pytest.MonkeyPatch) -> None:
     env = env_path.read_text(encoding="utf-8")
     env = env.replace(
         "HERMES_RCA_DELIVERY_DISPATCHER_ENABLED=false",
-        "HERMES_RCA_DELIVERY_DISPATCHER_ENABLED=true",
+        "HERMES_RCA_DELIVERY_DISPATCHER_ENABLED=false",
     )
-    env += "HERMES_OUTBOUND_MODE=live\n"
+    env += "HERMES_OUTBOUND_MODE=record-only\n"
     env += f"HERMES_RCA_DELIVERY_QUARANTINE_BASELINE_PATH={baseline_path}\n"
     env_path.write_text(env, encoding="utf-8")
     env_path.chmod(0o600)
@@ -195,15 +196,15 @@ def _prepare_candidate(args: dict, monkeypatch: pytest.MonkeyPatch) -> None:
 
     relay_path = args["candidate_root"] / "local.pnc.completion-notice-relay.plist"
     relay = plistlib.loads(relay_path.read_bytes())
-    relay["EnvironmentVariables"]["HERMES_OUTBOUND_MODE"] = "live"
+    relay["EnvironmentVariables"]["HERMES_OUTBOUND_MODE"] = "record-only"
     relay_path.write_bytes(plistlib.dumps(relay))
     relay_path.chmod(0o600)
     dispatcher_path = args["candidate_root"] / "local.pnc.rca-delivery-dispatcher.plist"
     dispatcher = plistlib.loads(dispatcher_path.read_bytes())
     dispatcher["EnvironmentVariables"].update(
         {
-            "HERMES_OUTBOUND_MODE": "live",
-            "HERMES_RCA_DELIVERY_DISPATCHER_ENABLED": "true",
+            "HERMES_OUTBOUND_MODE": "record-only",
+            "HERMES_RCA_DELIVERY_DISPATCHER_ENABLED": "false",
             "HERMES_RCA_DELIVERY_DISPATCHER_INVENTORY_PIN": INVENTORY_PIN,
             "HERMES_RCA_DELIVERY_DISPATCHER_OBSERVABILITY_ENABLED": "true",
             "HERMES_RCA_DELIVERY_DISPATCHER_OBSERVATION_RELEASE_ID": RELEASE_ID,
@@ -352,3 +353,136 @@ def test_empty_activation_baseline_is_compatible_with_current_binding():
         transaction.quarantine_baseline._canonical_bytes(current)
     ).hexdigest()
     assert quarantine_baseline._db_identity_matches_baseline(baseline, current)
+
+
+def test_apply_tracks_replace_when_post_replace_fsync_fails(tmp_path, monkeypatch):
+    args = _fixture(tmp_path, monkeypatch)
+    _prepare_candidate(args, monkeypatch)
+    _seed_old_targets(args)
+    plan, plan_path = _build(args)
+    original_sync = transaction._sync_directory
+    calls = 0
+
+    def fail_first_sync(path):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("injected post-replace fsync failure")
+        original_sync(path)
+
+    monkeypatch.setattr(transaction, "_sync_directory", fail_first_sync)
+    with pytest.raises(OSError, match="post-replace fsync failure"):
+        transaction.apply_plan(plan, plan_path=plan_path)
+    authority_path = args["state_root"] / f"{RELEASE_ID}.authority.json"
+    assert not authority_path.exists()
+    automatic = json.loads(
+        (args["evidence"] / "steady-test-transaction/automatic-rollback.json").read_text()
+    )
+    assert automatic["restored_to_pre_transaction"] is True
+    assert automatic["blocked_entries"] == []
+    assert automatic["restored_entries"][0]["name"] == "authority"
+
+
+def test_automatic_rollback_preserves_concurrent_target_and_records_partial(
+    tmp_path, monkeypatch
+):
+    args = _fixture(tmp_path, monkeypatch)
+    _prepare_candidate(args, monkeypatch)
+    _seed_old_targets(args)
+    plan, plan_path = _build(args)
+    replacements = 0
+    concurrent = b"concurrent-owner\n"
+
+    def replace_then_conflict(source, target):
+        nonlocal replacements
+        replacements += 1
+        os.replace(source, target)
+        if replacements == 2:
+            Path(target).write_bytes(concurrent)
+            Path(target).chmod(0o600)
+            raise OSError("injected concurrent replacement")
+
+    with pytest.raises(
+        transaction.SteadyReleaseTransactionError,
+        match="automatic_rollback_incomplete",
+    ):
+        transaction.apply_plan(
+            plan,
+            plan_path=plan_path,
+            replace_func=replace_then_conflict,
+        )
+    authority_path = args["state_root"] / f"{RELEASE_ID}.authority.json"
+    pointer_path = args["state_root"] / "ACTIVE_RCA_RELEASE.json"
+    assert not authority_path.exists()
+    assert pointer_path.read_bytes() == concurrent
+    automatic = json.loads(
+        (args["evidence"] / "steady-test-transaction/automatic-rollback.json").read_text()
+    )
+    assert automatic["restored_to_pre_transaction"] is False
+    assert [item["name"] for item in automatic["blocked_entries"]] == ["pointer"]
+    assert automatic["blocked_entries"][0]["reason"] == "after_observation_missing"
+
+
+def test_manual_rollback_preserves_concurrent_target_and_records_partial(
+    tmp_path, monkeypatch
+):
+    args = _fixture(tmp_path, monkeypatch)
+    _prepare_candidate(args, monkeypatch)
+    _seed_old_targets(args)
+    plan, plan_path = _build(args)
+    receipt = transaction.apply_plan(plan, plan_path=plan_path)
+    env_path = args["hermes_home"] / ".env"
+    concurrent = b"concurrent-env-owner\n"
+    env_path.write_bytes(concurrent)
+    env_path.chmod(0o600)
+    output_path = args["evidence"] / "partial-manual-rollback.json"
+    with pytest.raises(
+        transaction.SteadyReleaseTransactionError,
+        match="manual_rollback_incomplete",
+    ):
+        transaction.rollback_transaction(
+            Path(receipt["receipt_path"]), output_path=output_path
+        )
+    assert env_path.read_bytes() == concurrent
+    assert not (args["state_root"] / f"{RELEASE_ID}.authority.json").exists()
+    rollback = json.loads(output_path.read_text())
+    assert rollback["restored_to_pre_transaction"] is False
+    assert [item["name"] for item in rollback["blocked_entries"]] == ["env"]
+    assert rollback["blocked_entries"][0]["reason"] == "target_changed"
+
+
+def test_manual_rollback_rechecks_after_immediately_before_restore(
+    tmp_path, monkeypatch
+):
+    args = _fixture(tmp_path, monkeypatch)
+    _prepare_candidate(args, monkeypatch)
+    _seed_old_targets(args)
+    plan, plan_path = _build(args)
+    receipt = transaction.apply_plan(plan, plan_path=plan_path)
+    env_path = args["hermes_home"] / ".env"
+    concurrent = b"concurrent-between-cas-and-restore\n"
+    original_observe = transaction.base._observe
+    env_observations = 0
+
+    def drift_on_second_env_observation(path, *, required):
+        nonlocal env_observations
+        if Path(path) == env_path:
+            env_observations += 1
+            if env_observations == 2:
+                env_path.write_bytes(concurrent)
+                env_path.chmod(0o600)
+        return original_observe(path, required=required)
+
+    monkeypatch.setattr(transaction.base, "_observe", drift_on_second_env_observation)
+    output_path = args["evidence"] / "between-cas-manual-rollback.json"
+    with pytest.raises(
+        transaction.SteadyReleaseTransactionError,
+        match="manual_rollback_incomplete",
+    ):
+        transaction.rollback_transaction(
+            Path(receipt["receipt_path"]), output_path=output_path
+        )
+    assert env_path.read_bytes() == concurrent
+    rollback = json.loads(output_path.read_text())
+    assert [item["name"] for item in rollback["blocked_entries"]] == ["env"]
+    assert rollback["blocked_entries"][0]["reason"] == "target_changed_before_restore"
