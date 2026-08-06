@@ -1539,6 +1539,136 @@ def test_quarantined_kafka_outbox_backfills_public_issue_terminal_atomically(
     assert after.unresolved_work == 1
 
 
+def test_current_epoch_pre_w3_quarantine_backfill_is_silent_and_idempotent(
+    tmp_path,
+):
+    control, result = _control(tmp_path, completed=False)
+    _quarantine_submission(control)
+    _bind_activation_execution(control, result, state="steady_active")
+    store = RcaDeliveryStore(control.db_path)
+
+    subscriptions_before = store.list_rows("rca_delivery_subscriptions")
+    before = store.backpressure_snapshot(now=NOW + timedelta(seconds=2))
+    assert before.untracked_completed_submissions == 1
+    assert store.backfill_completed_submissions(now=NOW + timedelta(seconds=2)) == 1
+    assert store.backfill_completed_submissions(now=NOW + timedelta(seconds=3)) == 0
+
+    [watch] = store.list_rows("rca_execution_watch")
+    assert watch["state"] == "quarantined"
+    assert watch["task_id"] is None
+    assert watch["delivery_id"] is None
+    status = json.loads(watch["last_status_json"])
+    assert status["external_writes"] is False
+    assert status["terminal_delivery_policy"] == "silent_internal_alert_only"
+    assert status["error_code"] == "w3_execution_snapshot_missing"
+    assert store.list_rows("rca_delivery_jobs") == []
+    assert store.list_rows("rca_delivery_effects") == []
+    assert store.list_rows("rca_delivery_subscriptions") == subscriptions_before
+    assert all(row["status"] == "pending" for row in subscriptions_before)
+    after = store.backpressure_snapshot(now=NOW + timedelta(seconds=3))
+    assert after.untracked_completed_submissions == 0
+    assert after.unresolved_effects == 0
+    assert after.unresolved_work == 0
+    assert all(
+        item["state"] == "closed"
+        for item in store.health(now=NOW + timedelta(seconds=3))[
+            "delivery_dispatcher_circuits"
+        ].values()
+    )
+
+
+def _current_epoch_valid_w3_quarantined_control(tmp_path):
+    from tests.gateway.test_pnc_rca_control_store import _create_activation_epoch
+    from tests.gateway.test_pnc_rca_w3_snapshot import _admit_manual_w3
+
+    control = RcaControlStore(tmp_path / "control.sqlite3")
+    epoch = _create_activation_epoch(control)
+    current = datetime.now(timezone.utc)
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_activation_epochs SET state = 'steady_active', "
+            "updated_at = ? WHERE epoch_id = ? AND is_current = 1",
+            (current.isoformat(), epoch["epoch_id"]),
+        )
+    admitted = _admit_manual_w3(control)
+    [snapshot_row] = control.list_rows("rca_admission_snapshots")
+    snapshot = json.loads(snapshot_row["admission_snapshot_json"])
+    assert snapshot["write_fence"]["state"] == "issued"
+    claim = control.claim_outbox(
+        lease_owner="valid-w3-quarantine-test",
+        now=current + timedelta(seconds=1),
+    )
+    assert claim is not None
+    assert claim.submission_key == admitted.submission_key
+    control.quarantine_outbox(
+        outbox_id=claim.outbox_id,
+        lease_token=claim.lease_token,
+        error_code="internal_submit_failure",
+        error_detail="private submit failure",
+        now=current + timedelta(seconds=2),
+    )
+    return control, current, snapshot
+
+
+def test_current_epoch_valid_w3_quarantine_keeps_fenced_terminal_effect(tmp_path):
+    control, current, snapshot = _current_epoch_valid_w3_quarantined_control(
+        tmp_path
+    )
+    expected_issue_url = snapshot["canonical_request"]["ticket"]["issue_url"]
+    store = RcaDeliveryStore(control.db_path)
+
+    assert store.backfill_completed_submissions(
+        now=current + timedelta(seconds=3)
+    ) == 1
+
+    [watch] = store.list_rows("rca_execution_watch")
+    [job] = store.list_rows("rca_delivery_jobs")
+    effects = store.list_rows("rca_delivery_effects")
+    binding = json.loads(job["contract_json"])["w3_execution_snapshot"]
+    assert watch["state"] == "delivery_created"
+    assert job["issue_url"] == expected_issue_url
+    assert binding["write_fence"]["state"] == "issued"
+    assert len(binding["snapshot_core_sha256"]) == 64
+    assert any(row["effect_kind"] == "feishu_issue_comment" for row in effects)
+    assert all(row["status"] == "pending" for row in effects)
+    effect = store.claim_due_effect(
+        lease_owner="valid-w3-effect-target-test",
+        now=current + timedelta(seconds=4),
+        activation_required=True,
+    )
+    assert effect is not None
+    assert effect.issue_url == expected_issue_url
+
+
+def test_current_epoch_w3_validator_runtime_error_rolls_back_backfill(
+    tmp_path, monkeypatch
+):
+    control, current, _snapshot = _current_epoch_valid_w3_quarantined_control(
+        tmp_path
+    )
+    store = RcaDeliveryStore(control.db_path)
+    subscriptions_before = store.list_rows("rca_delivery_subscriptions")
+
+    def validator_crash(*_args, **_kwargs):
+        raise RuntimeError("injected_w3_validator_runtime_error")
+
+    monkeypatch.setattr(
+        "gateway.pnc_rca_delivery_store.validate_write_fence_source_binding",
+        validator_crash,
+    )
+    with pytest.raises(RuntimeError, match="injected_w3_validator_runtime_error"):
+        store.backfill_completed_submissions(now=current + timedelta(seconds=3))
+
+    assert store.list_rows("rca_execution_watch") == []
+    assert store.list_rows("rca_delivery_jobs") == []
+    assert store.list_rows("rca_delivery_effects") == []
+    assert store.list_rows("rca_delivery_subscriptions") == subscriptions_before
+    backpressure = store.backpressure_snapshot(now=current + timedelta(seconds=3))
+    assert backpressure.untracked_completed_submissions == 1
+    assert backpressure.unresolved_effects == 0
+    assert backpressure.unresolved_work == 1
+
+
 def test_manual_quarantined_backfill_rolls_back_then_materializes_issue_and_topic(
     tmp_path, monkeypatch
 ):

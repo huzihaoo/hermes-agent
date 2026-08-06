@@ -67,6 +67,12 @@ from gateway.pnc_rca_failure_route_schema import (
     FAILURE_ROUTE_TABLE_INFO_CONTRACT as _FAILURE_ROUTE_TABLE_INFO_CONTRACT,
     failure_route_schema_errors,
 )
+from gateway.pnc_rca_write_fence import (
+    ExternalWriteFenceError,
+    snapshot_core_sha256 as _snapshot_core_sha256,
+    validate_write_fence,
+    validate_write_fence_source_binding,
+)
 
 
 DELIVERY_STORE_SCHEMA_VERSION = "pnc_rca_delivery_store_v11"
@@ -108,6 +114,9 @@ DELIVERY_OUTCOME_CONSECUTIVE_WINDOW_SECONDS = 3600
 DELIVERY_OUTCOME_CONSECUTIVE_FAILURE_THRESHOLD = 3
 OUTBOX_QUARANTINED_TERMINAL_STATE = "submission_quarantined"
 OUTBOX_QUARANTINED_PUBLIC_ERROR_CODE = "outbox_submission_quarantined"
+OUTBOX_PRE_W3_QUARANTINE_POLICY = "silent_internal_alert_only"
+OUTBOX_PRE_W3_QUARANTINE_MISSING_CODE = "w3_execution_snapshot_missing"
+OUTBOX_PRE_W3_QUARANTINE_INVALID_CODE = "w3_execution_snapshot_invalid"
 OUTBOX_PUBLIC_PROFILE_ERROR_CODES = frozenset({
     "business_profile_unresolved",
     "business_profile_unsupported",
@@ -3368,13 +3377,213 @@ class RcaDeliveryStore:
         finally:
             conn.close()
 
+    @classmethod
+    def _issued_w3_binding_for_quarantined_outbox_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        row: sqlite3.Row,
+        current: str,
+    ) -> tuple[dict[str, Any] | None, str, str]:
+        """Return a live-bound W3 fence, or a fail-closed disposition code.
+
+        A quarantined outbox can predate W3 and therefore have no immutable
+        source snapshot at all.  Once an activation epoch is enforced, that
+        history must never be upgraded into a public effect.  The check stays
+        inside the caller's write transaction and only accepts the immutable
+        snapshot/envelope pair whose issued fence is bound to this exact
+        outbox identity and current epoch ledger.
+        """
+        required_tables = {
+            "rca_admission_snapshots",
+            "rca_snapshot_source_envelopes",
+        }
+        present_tables = {
+            str(item["name"])
+            for item in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        if not required_tables.issubset(present_tables):
+            return None, OUTBOX_PRE_W3_QUARANTINE_MISSING_CODE, ""
+        snapshot_row = conn.execute(
+            """
+            SELECT snapshot.*, envelope.source_envelope_json
+              FROM rca_admission_snapshots AS snapshot
+              JOIN rca_snapshot_source_envelopes AS envelope
+                ON envelope.source_envelope_sha256 =
+                   snapshot.creator_source_envelope_sha256
+               AND envelope.source_authority_sha256 =
+                   snapshot.creator_authority_sha256
+               AND envelope.source_id = snapshot.creator_source_id
+             WHERE snapshot.submission_key = ?
+             LIMIT 1
+            """,
+            (str(row["submission_key"]),),
+        ).fetchone()
+        if snapshot_row is None:
+            return None, OUTBOX_PRE_W3_QUARANTINE_MISSING_CODE, ""
+        try:
+            snapshot = json.loads(str(snapshot_row["admission_snapshot_json"] or ""))
+            envelope = json.loads(str(snapshot_row["source_envelope_json"] or ""))
+            if not isinstance(snapshot, Mapping) or not isinstance(envelope, Mapping):
+                raise ValueError("w3_snapshot_mapping_invalid")
+            resolved = snapshot.get("resolved_admission")
+            if not isinstance(resolved, Mapping):
+                raise TypeError("w3_snapshot_resolved_admission_invalid")
+            if (
+                snapshot.get("snapshot_sha256") != snapshot_row["snapshot_sha256"]
+                or snapshot.get("snapshot_id") != snapshot_row["snapshot_id"]
+                or snapshot.get("request_sha256") != snapshot_row["request_sha256"]
+                or resolved.get("business_key") != row["business_key"]
+                or resolved.get("submission_key") != row["submission_key"]
+                or resolved.get("generation") != row["generation"]
+                or snapshot_row["business_key"] != row["business_key"]
+                or snapshot_row["submission_key"] != row["submission_key"]
+                or int(snapshot_row["generation"]) != int(row["generation"])
+                or snapshot_row["activation_epoch_id"]
+                != row["activation_epoch_id"]
+                or snapshot_row["activation_ledger_id"]
+                != row["activation_ledger_id"]
+                or snapshot_row["execution_decision"] != "admit"
+                or int(snapshot_row["legacy_unconfigured"]) != 0
+            ):
+                raise ValueError("w3_snapshot_identity_mismatch")
+            execution = snapshot.get("execution_admission")
+            fence = snapshot.get("write_fence")
+            request = snapshot.get("canonical_request")
+            ticket = request.get("ticket") if isinstance(request, Mapping) else None
+            if (
+                not isinstance(execution, Mapping)
+                or not isinstance(fence, Mapping)
+                or not isinstance(ticket, Mapping)
+            ):
+                raise ValueError("w3_snapshot_fence_missing")
+            if (
+                execution.get("decision") != "admit"
+                or execution.get("legacy_unconfigured") is True
+                or execution.get("activation_epoch_id")
+                != row["activation_epoch_id"]
+                or execution.get("activation_ledger_id")
+                != row["activation_ledger_id"]
+                or fence.get("state") != "issued"
+                or ticket.get("project_key") != row["project_key"]
+                or ticket.get("work_item_type_key") != row["work_item_type_key"]
+                or ticket.get("work_item_id") != row["work_item_id"]
+            ):
+                raise ValueError("w3_snapshot_fence_unissued")
+            targets = validate_write_fence_source_binding(
+                fence,
+                snapshot=snapshot,
+                source_envelope=envelope,
+            )
+            if not isinstance(targets, Mapping):
+                raise TypeError("w3_snapshot_targets_invalid")
+            issue_target = str(targets.get("issue_target") or "").strip()
+            target_set_sha256 = str(
+                targets.get("target_set_sha256") or ""
+            ).strip()
+            if not issue_target or not target_set_sha256:
+                raise ValueError("w3_snapshot_target_mismatch")
+            validate_write_fence(
+                fence,
+                snapshot=snapshot,
+                operation="feishu_issue_comment",
+                target=issue_target,
+                expected_epoch_id=str(row["activation_epoch_id"]),
+                expected_ledger_id=int(row["activation_ledger_id"]),
+                expected_business_key=str(row["business_key"]),
+                expected_submission_key=str(row["submission_key"]),
+                expected_generation=int(row["generation"]),
+                expected_issue_target=issue_target,
+                expected_target_set_sha256=target_set_sha256,
+                now=_parse_iso(current),
+            )
+            return {
+                "write_fence": dict(fence),
+                "snapshot_core_sha256": _snapshot_core_sha256(snapshot),
+            }, "", issue_target
+        except ExternalWriteFenceError:
+            return None, OUTBOX_PRE_W3_QUARANTINE_INVALID_CODE, ""
+        except (TypeError, ValueError, OverflowError):
+            return None, OUTBOX_PRE_W3_QUARANTINE_INVALID_CODE, ""
+
+    @staticmethod
+    def _materialize_silent_quarantined_outbox_in_transaction(
+        conn: sqlite3.Connection,
+        *,
+        row: sqlite3.Row,
+        current: str,
+        disposition_code: str,
+    ) -> None:
+        """Close pre-W3 quarantine history without creating an outward effect."""
+        status = {
+            "success": False,
+            "state": "quarantined",
+            "error_code": disposition_code,
+            "external_writes": False,
+            "terminal_delivery_policy": OUTBOX_PRE_W3_QUARANTINE_POLICY,
+        }
+        inserted = conn.execute(
+            """
+            INSERT INTO rca_execution_watch(
+                submission_key, submission_outbox_id, business_key,
+                generation, project_key, work_item_type_key, work_item_id,
+                task_id, state, next_poll_at, last_observed_at, terminal_at,
+                last_status_json, last_error_code, last_error_detail,
+                delivery_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'quarantined', ?, ?, ?,
+                      ?, ?, ?, NULL, ?, ?)
+            """,
+            (
+                row["submission_key"],
+                row["outbox_id"],
+                row["business_key"],
+                row["generation"],
+                row["project_key"],
+                row["work_item_type_key"],
+                row["work_item_id"],
+                current,
+                current,
+                str(row["quarantined_at"] or current),
+                _canonical_json(status),
+                disposition_code,
+                "pre-W3 quarantined outbox retained as an internal terminal disposition",
+                str(row["outbox_created_at"] or current),
+                current,
+            ),
+        )
+        if inserted.rowcount != 1:
+            raise DeliveryRecordConflictError(
+                "pre-W3 quarantined outbox watch was not created exactly once"
+            )
+
     def _materialize_quarantined_outbox_in_transaction(
         self,
         conn: sqlite3.Connection,
         *,
         row: sqlite3.Row,
         current: str,
+        activation_enforced: bool = False,
     ) -> None:
+        w3_binding: dict[str, Any] | None = None
+        w3_issue_target = ""
+        if activation_enforced:
+            w3_binding, disposition_code, w3_issue_target = (
+                self._issued_w3_binding_for_quarantined_outbox_tx(
+                    conn,
+                    row=row,
+                    current=current,
+                )
+            )
+            if w3_binding is None:
+                self._materialize_silent_quarantined_outbox_in_transaction(
+                    conn,
+                    row=row,
+                    current=current,
+                    disposition_code=disposition_code,
+                )
+                return
         source_error_code = str(row["last_error_code"] or "").strip()
         public_error_code = (
             source_error_code
@@ -3398,6 +3607,8 @@ class RcaDeliveryStore:
                 else ""
             ),
         )
+        if w3_binding is not None:
+            delivery.contract["w3_execution_snapshot"] = w3_binding
         terminal_at = str(row["quarantined_at"] or current)
         status = {
             "success": False,
@@ -3445,6 +3656,7 @@ class RcaDeliveryStore:
             materialize_subscriptions=(
                 self._materialize_delivery_subscriptions_in_transaction
             ),
+            issue_url=w3_issue_target,
         )
 
     def backfill_completed_submissions(
@@ -3476,6 +3688,7 @@ class RcaDeliveryStore:
             rows = conn.execute(
                 f"""
                 SELECT o.outbox_id, o.submission_key, o.business_key, o.generation,
+                       o.activation_epoch_id, o.activation_ledger_id,
                        o.status AS outbox_status, o.created_at AS outbox_created_at,
                        o.quarantined_at, o.last_error_code, o.last_error_detail,
                        t.project_key, t.work_item_type_key, t.work_item_id
@@ -3504,6 +3717,7 @@ class RcaDeliveryStore:
                         conn,
                         row=row,
                         current=current,
+                        activation_enforced=activation_enforced,
                     )
                     inserted += 1
                 else:
@@ -5166,7 +5380,9 @@ class RcaDeliveryStore:
         current: str,
         materialize_subscriptions: Any = None,
         activation_required: bool = False,
+        issue_url: str = "",
     ) -> bool:
+        terminal_issue_url = str(issue_url or "").strip()
         existing = conn.execute(
             """
             SELECT delivery_id, outcome_key, outcome, terminal_state,
@@ -5182,7 +5398,7 @@ class RcaDeliveryStore:
                 delivery.outcome,
                 delivery.terminal_state,
                 delivery.error_code,
-                "",
+                terminal_issue_url,
                 "",
                 _canonical_json(delivery.contract),
             )
@@ -5226,7 +5442,7 @@ class RcaDeliveryStore:
                     outcome, outcome_key, terminal_state,
                     terminal_error_code, status, manifest_json,
                     contract_json, artifacts_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, ?,
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?,
                           'ready', '{}', ?, '[]', ?, ?)
                 """,
                 (
@@ -5239,6 +5455,7 @@ class RcaDeliveryStore:
                     delivery.work_item_type_key,
                     delivery.work_item_id,
                     delivery.target_key,
+                    terminal_issue_url,
                     delivery.outcome,
                     delivery.outcome_key,
                     delivery.terminal_state,
