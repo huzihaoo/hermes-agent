@@ -20,6 +20,7 @@ from gateway.pnc_rca_control_store import (
     RcaControlStore,
 )
 from gateway.pnc_rca_kafka_contract import WorkflowEventPolicy, WorkflowTransition
+from gateway.pnc_rca_delivery_store import RcaDeliveryStore
 from gateway.pnc_rca_write_fence import ExternalWriteFenceError
 from scripts import pnc_rca_kafka_consumer as consumer_module
 
@@ -310,11 +311,38 @@ def _prepare_ready_bounded_activation(
             activation_required=True,
         )
         assert claim is not None
-        store.complete_outbox(
-            outbox_id=claim.outbox_id,
-            lease_token=claim.lease_token,
-            result={"outcome": "consumer_activation_canary_recorded"},
+        if index == 0:
+            store.complete_outbox(
+                outbox_id=claim.outbox_id,
+                lease_token=claim.lease_token,
+                result={"outcome": "consumer_activation_canary_recorded"},
+            )
+        else:
+            store.quarantine_outbox(
+                outbox_id=claim.outbox_id,
+                lease_token=claim.lease_token,
+                error_code="consumer_activation_terminal_canary",
+            )
+    delivery = RcaDeliveryStore(store.db_path)
+    assert delivery.backfill_completed_submissions(activation_required=True) == 2
+    settled_at = datetime.now(timezone.utc).isoformat()
+    conn = delivery._connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        jobs = conn.execute(
+            "SELECT delivery_id FROM rca_delivery_jobs"
+        ).fetchall()
+        assert len(jobs) == 1
+        delivery_id = str(jobs[0]["delivery_id"])
+        conn.execute(
+            "UPDATE rca_delivery_effects SET status = 'succeeded', "
+            "completed_at = ?, updated_at = ? WHERE delivery_id = ?",
+            (settled_at, settled_at, delivery_id),
         )
+        delivery._aggregate_job_status(conn, delivery_id, settled_at)
+        conn.commit()
+    finally:
+        conn.close()
     readiness = store.health()["activation"]["ingress_freeze_readiness"]
     assert readiness["ready"] is True
     return epoch_id

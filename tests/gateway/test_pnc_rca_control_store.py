@@ -1875,6 +1875,68 @@ def test_activation_health_is_payload_free_and_counts_held_lineage(tmp_path):
     assert "om_manual_success" not in health_json
 
 
+def test_activation_terminal_canary_accepts_settled_silent_internal_route(tmp_path):
+    store, _terminal, _status = _silent_terminal_activation(tmp_path)
+
+    assert store.activation_ingress_freeze_readiness() == {
+        "epoch_id": "rca-release-20260712",
+        "state": "bounded_active",
+        "ready": True,
+        "reason": "ready",
+        "required_slot_count": 2,
+        "consumed_slot_count": 2,
+        "completed_bound_slot_count": 2,
+        "pending_inbox": 0,
+        "unbound_ledger": 0,
+        "inflight_writes": 0,
+    }
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ("external_write", "outlet_effect", "route_identity"),
+)
+def test_activation_terminal_canary_rejects_forged_silent_settlement(
+    tmp_path, corruption
+):
+    store, terminal, status = _silent_terminal_activation(tmp_path)
+    conn = store._connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if corruption == "external_write":
+            status["external_writes"] = True
+            conn.execute(
+                "UPDATE rca_execution_watch SET last_status_json = ? "
+                "WHERE submission_key = ?",
+                (json.dumps(status, sort_keys=True, separators=(",", ":")),
+                 terminal.submission_key),
+            )
+        elif corruption == "outlet_effect":
+            status["failure_taxonomy"]["durable_route"]["internal_outlet"][
+                "external_effects"
+            ] = 1
+            conn.execute(
+                "UPDATE rca_execution_watch SET last_status_json = ? "
+                "WHERE submission_key = ?",
+                (json.dumps(status, sort_keys=True, separators=(",", ":")),
+                 terminal.submission_key),
+            )
+        else:
+            route_key = status["failure_taxonomy"]["durable_route"]["route_key"]
+            conn.execute(
+                "UPDATE rca_failure_routes SET task_id = ? WHERE route_key = ?",
+                ("different-task", route_key),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    readiness = store.activation_ingress_freeze_readiness()
+    assert readiness["ready"] is False
+    assert readiness["reason"] == "activation_canary_executions_incomplete"
+    assert readiness["completed_bound_slot_count"] == 1
+
+
 def test_activation_unbound_health_counts_only_current_creating_ledgers(tmp_path):
     store = RcaControlStore(tmp_path / "control.sqlite3")
     identities = _begin_bounded_activation(store)
@@ -3145,6 +3207,144 @@ def _terminalize_permanent(store: RcaControlStore, submission_key: str) -> None:
     finally:
         conn.close()
     _settle_delivery(store, submission_key)
+
+
+def _silent_terminal_activation(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    identities = _begin_bounded_activation(store)
+    success_identity = identities["manual_success"][1]
+    terminal_identity = identities["manual_terminal_failure"][1]
+    success = store.admit_manual_trigger(
+        _manual_request(
+            success_identity["message_id"],
+            issue_url=success_identity["issue_url"],
+            thread_id=success_identity["thread_id"],
+        ),
+        allowed_chat_ids={"oc_allowed"},
+        submit_enabled=True,
+        active_policy=_policy(),
+        activation_required=True,
+    )
+    terminal = store.admit_manual_trigger(
+        _manual_request(
+            terminal_identity["message_id"],
+            mode=terminal_identity["mode"],
+            issue_url=terminal_identity["issue_url"],
+            thread_id=terminal_identity["thread_id"],
+        ),
+        allowed_chat_ids={"oc_allowed"},
+        submit_enabled=True,
+        operator_authorized=True,
+        active_policy=_policy(),
+        activation_required=True,
+    )
+    current = datetime.now(timezone.utc)
+    for index, expected in enumerate((success, terminal), start=1):
+        claim = store.claim_outbox(
+            lease_owner=f"activation-silent-terminal-{index}",
+            activation_required=True,
+            now=current + timedelta(seconds=index),
+        )
+        assert claim is not None and claim.submission_key == expected.submission_key
+        store.complete_outbox(
+            outbox_id=claim.outbox_id,
+            lease_token=claim.lease_token,
+            result={
+                "success": True,
+                "submission_key": claim.submission_key,
+                "task_id": claim.submission_key,
+            },
+            now=current + timedelta(seconds=index, milliseconds=100),
+        )
+
+    delivery = RcaDeliveryStore(store.db_path)
+    assert delivery.backfill_completed_submissions(
+        now=current + timedelta(seconds=3), activation_required=True
+    ) == 2
+    conn = store._connect()
+    try:
+        conn.execute(
+            "UPDATE rca_execution_watch SET next_poll_at = ? "
+            "WHERE submission_key = ?",
+            ((current + timedelta(days=1)).isoformat(), success.submission_key),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    watch_claim = delivery.claim_due_watch(
+        lease_owner="activation-silent-terminal-collector",
+        now=current + timedelta(seconds=4),
+        activation_required=True,
+    )
+    assert watch_claim is not None
+    assert watch_claim.submission_key == terminal.submission_key
+    error_code = "rca_work_deadline_exceeded"
+    route = delivery.upsert_failure_route(
+        claim=watch_claim,
+        terminal_error_code=error_code,
+        lane="hard_defect",
+        route_kind="internal_alert",
+        owner="rca-engineering",
+        work_started_at=watch_claim.work_started_at,
+        deadline_at=(current + timedelta(minutes=30)).isoformat(),
+        audit={
+            "schema_version": "pnc_rca_failure_route_audit_v1",
+            "taxonomy_audit": {},
+            "contract_errors": [],
+            "source": "before_admission",
+            "receipt": {},
+        },
+        route_payload={
+            "schema_version": "pnc_rca_failure_route_payload_v1",
+            "decision": {},
+            "remediation": {},
+            "blocker": {"kind": error_code},
+        },
+        now=current + timedelta(seconds=4),
+    )
+    fallback = {
+        "schema_version": "pnc_rca_bounded_terminal_fallback_v1",
+        "route_key": route.route_key,
+        "route_kind": "internal_alert",
+        "route_owner": "rca-engineering",
+        "terminal_class": "honest_non_attribution",
+        "confidence_tier": "low",
+        "work_started_at": watch_claim.work_started_at,
+        "deadline_at": (current + timedelta(minutes=30)).isoformat(),
+        "elapsed_seconds": 1800,
+    }
+    status = {
+        "external_writes": False,
+        "failure_taxonomy": {
+            "known": True,
+            "retryable": False,
+            "lane": "hard_defect",
+            "internal_route": "internal_alert",
+            "terminal_error_code": error_code,
+            "terminal_fallback": fallback,
+            "durable_route": {
+                "route_key": route.route_key,
+                "status": route.status,
+                "owner": route.owner,
+                "internal_outlet": {
+                    "route_key": route.route_key,
+                    "status": "settled",
+                    "attempt": 1,
+                    "external_effects": 0,
+                },
+            },
+        },
+        "terminal_delivery_policy": "silent_internal_alert_only",
+    }
+    delivery.terminal_failure(
+        submission_key=watch_claim.submission_key,
+        lease_token=watch_claim.lease_token,
+        status=status,
+        error_code=error_code,
+        error_detail="RCA work did not produce a deliverable result within 30 minutes",
+        now=current + timedelta(seconds=5),
+    )
+    return store, terminal, status
 
 
 def _terminalize_input_wait(

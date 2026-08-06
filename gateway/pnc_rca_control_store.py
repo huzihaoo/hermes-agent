@@ -567,6 +567,13 @@ ACTIVATION_RELEASE_SLOT_KINDS = (
 )
 ACTIVATION_KAFKA_PROOF_MODE = "passive_connectivity"
 _ACTIVATION_RELEASE_SLOT_SQL = "'manual_success', 'manual_terminal_failure'"
+_ACTIVATION_SILENT_TERMINAL_POLICY = "silent_internal_alert_only"
+_ACTIVATION_SILENT_TERMINAL_ROUTE_LANES = frozenset(
+    {
+        ("internal_alert", "hard_defect"),
+        ("internal_backlog", "needs_human_input"),
+    }
+)
 ACTIVATION_ENTRYPOINTS = frozenset(
     {"kafka_ingest", "manual_admit", "shadow_promotion"}
 )
@@ -7962,18 +7969,13 @@ class RcaControlStore:
         submission_key: str,
         generation: int,
     ) -> bool:
-        """Require the terminal canary's durable delivery, not just its quarantine.
-
-        A terminal canary is allowed to end at the submission boundary.  Its
-        outbox row is then quarantined, while the execution watch and terminal
-        delivery still have to settle through both required Feishu effects.
-        Keeping this predicate in the control store makes ingress readiness and
-        the release-binding validator use the same fail-closed contract.
-        """
+        """Require one durable terminal settlement, public or intentionally silent."""
         required_tables = {
             "rca_execution_watch",
             "rca_delivery_jobs",
             "rca_delivery_effects",
+            "rca_delivery_subscriptions",
+            "rca_failure_routes",
         }
         present = {
             str(row[0])
@@ -7986,7 +7988,8 @@ class RcaControlStore:
         watch = conn.execute(
             """
             SELECT w.state, w.task_id, w.terminal_at, w.delivery_id,
-                   w.last_error_code, j.status AS job_status,
+                   w.last_error_code, w.last_status_json,
+                   j.status AS job_status,
                    j.delivery_id AS job_delivery_id, j.outcome AS job_outcome,
                    j.terminal_state,
                    j.terminal_error_code
@@ -7999,20 +8002,30 @@ class RcaControlStore:
             """,
             (submission_key, business_key, generation),
         ).fetchone()
-        if watch is None or (
+        if watch is None:
+            return False
+        public_delivery_complete = not (
             str(watch["state"] or "") != "delivery_created"
             or watch["task_id"] is not None
             or not str(watch["terminal_at"] or "")
             or not str(watch["last_error_code"] or "")
             or not str(watch["delivery_id"] or "")
             or str(watch["job_status"] or "") != "delivered"
-            or str(watch["job_outcome"] or "") not in {"terminal_failed", "quarantined"}
+            or str(watch["job_outcome"] or "")
+            not in {"terminal_failed", "quarantined"}
             or not str(watch["terminal_state"] or "")
             or not str(watch["terminal_error_code"] or "")
             or str(watch["delivery_id"] or "")
             != str(watch["job_delivery_id"] or "")
-        ):
-            return False
+        )
+        if not public_delivery_complete:
+            return RcaControlStore._activation_silent_terminal_complete_tx(
+                conn,
+                business_key=business_key,
+                submission_key=submission_key,
+                generation=generation,
+                watch=watch,
+            )
         effects = conn.execute(
             """
             SELECT s.effect_kind, s.required, s.status AS subscription_status,
@@ -8044,6 +8057,146 @@ class RcaControlStore:
             and str(row["effect_outcome"] or "") == str(watch["job_outcome"])
             and bool(str(row["completed_at"] or ""))
             for row in effects
+        )
+
+    @staticmethod
+    def _activation_silent_terminal_complete_tx(
+        conn: sqlite3.Connection,
+        *,
+        business_key: str,
+        submission_key: str,
+        generation: int,
+        watch: sqlite3.Row,
+    ) -> bool:
+        """Accept only the collector's zero-write terminal route contract."""
+        task_id = str(watch["task_id"] or "")
+        error_code = str(watch["last_error_code"] or "")
+        status_raw = str(watch["last_status_json"] or "")
+        if (
+            str(watch["state"] or "") != "terminal_failed"
+            or not task_id
+            or not str(watch["terminal_at"] or "")
+            or not error_code
+            or str(watch["delivery_id"] or "")
+            or str(watch["job_delivery_id"] or "")
+            or str(watch["job_status"] or "")
+            or str(watch["job_outcome"] or "")
+            or str(watch["terminal_state"] or "")
+            or str(watch["terminal_error_code"] or "")
+        ):
+            return False
+        try:
+            status = json.loads(status_raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        if (
+            not isinstance(status, dict)
+            or _canonical_json(status) != status_raw
+            or status.get("external_writes") is not False
+            or status.get("terminal_delivery_policy")
+            != _ACTIVATION_SILENT_TERMINAL_POLICY
+        ):
+            return False
+        taxonomy = status.get("failure_taxonomy")
+        if not isinstance(taxonomy, dict):
+            return False
+        route_kind = str(taxonomy.get("internal_route") or "")
+        lane = str(taxonomy.get("lane") or "")
+        durable_route = taxonomy.get("durable_route")
+        fallback = taxonomy.get("terminal_fallback")
+        if (
+            taxonomy.get("known") is not True
+            or taxonomy.get("retryable") is not False
+            or str(taxonomy.get("terminal_error_code") or "") != error_code
+            or (route_kind, lane)
+            not in _ACTIVATION_SILENT_TERMINAL_ROUTE_LANES
+            or not isinstance(durable_route, dict)
+            or not isinstance(fallback, dict)
+        ):
+            return False
+        route_key = str(durable_route.get("route_key") or "")
+        outlet = durable_route.get("internal_outlet")
+        if (
+            not route_key
+            or str(fallback.get("route_key") or "") != route_key
+            or str(fallback.get("route_kind") or "") != route_kind
+            or str(fallback.get("route_owner") or "")
+            != str(durable_route.get("owner") or "")
+            or not isinstance(outlet, dict)
+            or str(outlet.get("route_key") or "") != route_key
+            or outlet.get("status") != "settled"
+            or outlet.get("external_effects") != 0
+            or isinstance(outlet.get("attempt"), bool)
+            or not isinstance(outlet.get("attempt"), int)
+            or int(outlet["attempt"]) < 1
+        ):
+            return False
+        route = conn.execute(
+            """
+            SELECT route_key, submission_key, business_key, generation,
+                   task_id, terminal_error_code, lane, route_kind, owner,
+                   status, audit_json, route_payload_json
+              FROM rca_failure_routes
+             WHERE route_key = ?
+            """,
+            (route_key,),
+        ).fetchone()
+        if route is None or (
+            str(route["submission_key"] or "") != submission_key
+            or str(route["business_key"] or "") != business_key
+            or int(route["generation"] or 0) != generation
+            or str(route["task_id"] or "") != task_id
+            or str(route["terminal_error_code"] or "") != error_code
+            or str(route["lane"] or "") != lane
+            or str(route["route_kind"] or "") != route_kind
+            or str(route["owner"] or "")
+            != str(durable_route.get("owner") or "")
+            or str(route["status"] or "")
+            != str(durable_route.get("status") or "")
+        ):
+            return False
+        try:
+            audit = json.loads(str(route["audit_json"] or ""))
+            payload = json.loads(str(route["route_payload_json"] or ""))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        if (
+            not isinstance(audit, dict)
+            or audit.get("schema_version") != "pnc_rca_failure_route_audit_v1"
+            or not isinstance(payload, dict)
+            or payload.get("schema_version")
+            != "pnc_rca_failure_route_payload_v1"
+        ):
+            return False
+        subscriptions = conn.execute(
+            """
+            SELECT effect_kind, required, status, delivery_id, effect_key,
+                   materialized_at
+              FROM rca_delivery_subscriptions
+             WHERE business_key = ? AND generation = ? AND required = 1
+            ORDER BY effect_kind
+            """,
+            (business_key, generation),
+        ).fetchall()
+        if len(subscriptions) != 2 or {
+            str(row["effect_kind"] or "") for row in subscriptions
+        } != {"feishu_issue_comment", "feishu_thread_reply"}:
+            return False
+        if any(
+            int(row["required"] or 0) != 1
+            or str(row["status"] or "") != "pending"
+            or row["delivery_id"] is not None
+            or row["effect_key"] is not None
+            or row["materialized_at"] is not None
+            for row in subscriptions
+        ):
+            return False
+        return (
+            conn.execute(
+                "SELECT 1 FROM rca_delivery_jobs WHERE submission_key = ? LIMIT 1",
+                (submission_key,),
+            ).fetchone()
+            is None
         )
 
     @classmethod
