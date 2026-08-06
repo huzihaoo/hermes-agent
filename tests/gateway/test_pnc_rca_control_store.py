@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
@@ -28,6 +29,8 @@ from gateway.pnc_rca_control_store import (
     RecordProcessingBlockedError,
     ShadowPromotionError,
     StaleOutboxLeaseError,
+    build_silent_terminal_rerun_authority,
+    build_batch_terminal_rerun_authority,
 )
 from gateway.pnc_rca_kafka_contract import WorkflowEventPolicy, WorkflowTransition
 from gateway.pnc_rca_delivery_store import RcaDeliveryStore
@@ -223,6 +226,369 @@ def _operator_request(
         message_id=message_id,
         requester_id=requester_id,
     )
+
+
+def _silent_deadline_terminal_store(tmp_path):
+    from tests.scripts.test_pnc_rca_delivery_collector import (
+        NOW as delivery_now,
+        _real_terminal_collector,
+    )
+    from tests.gateway.test_pnc_rca_delivery_store import _bind_activation_execution
+    from types import SimpleNamespace
+
+    clock = [delivery_now]
+    collector = _real_terminal_collector(
+        tmp_path,
+        clock=clock,
+        status_reader=lambda task_id: {
+            "success": True,
+            "task_id": task_id,
+            "state": "running",
+        },
+    )
+    control = RcaControlStore(collector.store.db_path)
+    [trigger] = control.list_rows("business_triggers")
+    _bind_activation_execution(
+        control,
+        SimpleNamespace(
+            business_key=trigger["business_key"],
+            generation=trigger["generation"],
+            submission_key=trigger["submission_key"],
+        ),
+    )
+    collector.config = replace(collector.config, activation_required=True)
+    assert collector.collect_one().status == "running"
+    clock[0] = delivery_now + timedelta(seconds=1800)
+    terminal = collector.collect_one()
+    assert terminal.status == "terminal_failed"
+    assert terminal.error_code == "rca_work_deadline_exceeded"
+    return RcaControlStore(collector.store.db_path), clock[0]
+
+
+def _silent_batch_request(batch_id: str = "batch-684") -> ManualRcaTriggerRequest:
+    request = _operator_request(
+        f"{batch_id}-7041712812-try-1",
+        requester_id="automation:rca-batch-rerun",
+    )
+    return ManualRcaTriggerRequest(
+        **{**request.to_dict(), "reason": f"production_gray_batch:{batch_id}"}
+    )
+
+
+def _silent_batch_authority(
+    store: RcaControlStore,
+    request: ManualRcaTriggerRequest,
+    *,
+    batch_id: str = "batch-684",
+) -> dict:
+    [prior] = store.list_rows("business_triggers")
+    return build_silent_terminal_rerun_authority(
+        batch_id=batch_id,
+        queue_sha256="1" * 64,
+        issue_id=str(prior["work_item_id"]),
+        prior_submission_key=str(prior["submission_key"]),
+        prior_generation=int(prior["generation"]),
+        owner_receipt_path=str(store.db_path.parent / "owner-receipt.json"),
+        owner_receipt_sha256="2" * 64,
+        requester_id=request.requester_id,
+        reason=request.reason,
+    )
+
+
+def test_operator_silent_terminal_rerun_creates_new_generation_without_old_mutation(
+    tmp_path,
+):
+    store, terminal_at = _silent_deadline_terminal_store(tmp_path)
+    request = _silent_batch_request()
+    authority = _silent_batch_authority(store, request)
+    delivery = RcaDeliveryStore(store.db_path)
+    old_watch = dict(delivery.list_rows("rca_execution_watch")[0])
+    old_route = dict(delivery.list_rows("rca_failure_routes")[0])
+
+    rerun = store.admit_manual_trigger(
+        request,
+        allowed_chat_ids=set(),
+        submit_enabled=True,
+        operator_authorized=True,
+        silent_terminal_rerun_authority=authority,
+        outbox_high_watermark=10_000,
+        activation_required=True,
+        now=terminal_at + timedelta(seconds=1),
+    )
+
+    assert rerun.outcome == "created"
+    assert rerun.generation == 2
+    assert delivery.list_rows("rca_execution_watch") == [old_watch]
+    assert delivery.list_rows("rca_failure_routes") == [old_route]
+    generations = sorted(
+        store.list_rows("business_triggers"), key=lambda item: item["generation"]
+    )
+    assert [(item["generation"], item["submission_key"]) for item in generations] == [
+        (1, old_watch["submission_key"]),
+        (2, rerun.submission_key),
+    ]
+    [new_outbox] = [
+        item for item in store.list_rows("rca_outbox") if item["generation"] == 2
+    ]
+    assert new_outbox["status"] == "pending"
+    subscriptions = [
+        item
+        for item in store.list_rows("rca_delivery_subscriptions")
+        if item["generation"] == 2
+    ]
+    assert [item["effect_kind"] for item in subscriptions] == [
+        "feishu_issue_comment"
+    ]
+    [audit] = [
+        item
+        for item in store.list_rows("rca_shadow_promotion_audit")
+        if item["outcome"] == "silent_terminal_new_generation_created"
+    ]
+    assert json.loads(audit["detail"]) == authority
+    assert audit["from_status"] == "terminal_failed:g1"
+    assert audit["to_status"] == "pending:g2"
+
+
+def test_operator_silent_terminal_rerun_rejects_tampered_authority_without_mutation(
+    tmp_path,
+):
+    store, terminal_at = _silent_deadline_terminal_store(tmp_path)
+    request = _silent_batch_request()
+    authority = {
+        **_silent_batch_authority(store, request),
+        "selection_sha256": "f" * 64,
+    }
+    before = {
+        table: store.list_rows(table)
+        for table in (
+            "business_triggers",
+            "rca_outbox",
+            "rca_trigger_sources",
+            "rca_shadow_promotion_audit",
+        )
+    }
+
+    with pytest.raises(
+        ManualRcaAdmissionError, match="silent_terminal_rerun_authority_invalid"
+    ):
+        store.admit_manual_trigger(
+            request,
+            allowed_chat_ids=set(),
+            submit_enabled=True,
+            operator_authorized=True,
+            silent_terminal_rerun_authority=authority,
+            activation_required=True,
+            now=terminal_at + timedelta(seconds=1),
+        )
+
+    assert {table: store.list_rows(table) for table in before} == before
+
+
+@pytest.mark.parametrize("invalid_state", ["retry_wait", "quarantined"])
+def test_operator_silent_terminal_rerun_requires_settled_internal_outlet(
+    tmp_path, invalid_state
+):
+    store, terminal_at = _silent_deadline_terminal_store(tmp_path)
+    request = _silent_batch_request()
+    authority = _silent_batch_authority(store, request)
+    with sqlite3.connect(store.db_path) as conn:
+        [status_raw] = conn.execute(
+            "SELECT last_status_json FROM rca_execution_watch"
+        ).fetchone()
+        status = json.loads(status_raw)
+        status["failure_taxonomy"]["durable_route"]["internal_outlet"][
+            "status"
+        ] = invalid_state
+        conn.execute(
+            "UPDATE rca_execution_watch SET last_status_json = ?",
+            (json.dumps(status, sort_keys=True, separators=(",", ":")),),
+        )
+
+    with pytest.raises(
+        ManualRcaAdmissionError,
+        match="silent_terminal_rerun_terminal_generation_required",
+    ):
+        store.admit_manual_trigger(
+            request,
+            allowed_chat_ids=set(),
+            submit_enabled=True,
+            operator_authorized=True,
+            silent_terminal_rerun_authority=authority,
+            activation_required=True,
+            now=terminal_at + timedelta(seconds=1),
+        )
+    assert len(store.list_rows("business_triggers")) == 1
+    assert len(store.list_rows("rca_outbox")) == 1
+
+
+def test_operator_silent_terminal_rerun_rejects_materialized_old_effect(tmp_path):
+    store, terminal_at = _silent_deadline_terminal_store(tmp_path)
+    request = _silent_batch_request()
+    authority = _silent_batch_authority(store, request)
+    [watch] = RcaDeliveryStore(store.db_path).list_rows("rca_execution_watch")
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO rca_delivery_jobs(
+                delivery_id, submission_key, business_key, generation,
+                artifact_set_id, project_key, work_item_type_key, work_item_id,
+                target_key, issue_url, report_url, status, manifest_json,
+                contract_json, artifacts_json, created_at, updated_at
+            ) VALUES (
+                'stale-delivery', ?, ?, ?, 'stale-artifact', ?, ?, ?,
+                'stale-target', ?, '', 'ready', '{}', '{}', '[]', ?, ?
+            )
+            """,
+            (
+                watch["submission_key"],
+                watch["business_key"],
+                watch["generation"],
+                watch["project_key"],
+                watch["work_item_type_key"],
+                watch["work_item_id"],
+                request.issue_url,
+                terminal_at.isoformat(),
+                terminal_at.isoformat(),
+            ),
+        )
+
+    with pytest.raises(
+        ManualRcaAdmissionError,
+        match="silent_terminal_rerun_terminal_generation_required",
+    ):
+        store.admit_manual_trigger(
+            request,
+            allowed_chat_ids=set(),
+            submit_enabled=True,
+            operator_authorized=True,
+            silent_terminal_rerun_authority=authority,
+            activation_required=True,
+            now=terminal_at + timedelta(seconds=1),
+        )
+    assert len(store.list_rows("business_triggers")) == 1
+
+
+def test_feishu_user_rerun_does_not_inherit_silent_terminal_exception(tmp_path):
+    store, terminal_at = _silent_deadline_terminal_store(tmp_path)
+    request = _manual_request(
+        "om_user_silent_terminal",
+        mode="rerun",
+        requester_id="ou_" + "1" * 32,
+    )
+
+    with pytest.raises(
+        ManualRcaAdmissionError,
+        match="group_user_rerun_terminal_generation_required",
+    ):
+        store.admit_manual_trigger(
+            request,
+            allowed_chat_ids={"oc_allowed"},
+            submit_enabled=True,
+            user_rerun_authority=_group_user_rerun_authority(),
+            activation_required=True,
+            now=terminal_at + timedelta(seconds=1),
+        )
+    assert len(store.list_rows("business_triggers")) == 1
+
+
+def test_batch_terminal_authority_creates_correction_generation_only_for_failed_delivery(
+    tmp_path,
+):
+    from types import SimpleNamespace
+
+    from tests.gateway.test_pnc_rca_delivery_store import _bind_activation_execution
+
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    first = store.ingest_record(
+        _record(),
+        policy=_policy(),
+        submit_enabled=True,
+    )
+    _terminalize_permanent(store, first.submission_key)
+    _bind_activation_execution(
+        store,
+        SimpleNamespace(
+            business_key=first.business_key,
+            generation=first.generation,
+            submission_key=first.submission_key,
+        ),
+        start_offset=11,
+    )
+    with sqlite3.connect(store.db_path) as conn:
+        delivery_id = conn.execute(
+            "SELECT delivery_id FROM rca_execution_watch WHERE submission_key=?",
+            (first.submission_key,),
+        ).fetchone()[0]
+    batch_id = "batch-delivery"
+    request = replace(
+        _operator_request("batch-delivery-try-1"),
+        reason=f"production_gray_batch:{batch_id}",
+    )
+    authority = build_batch_terminal_rerun_authority(
+        batch_id=batch_id,
+        queue_sha256="1" * 64,
+        issue_id="7041712812",
+        prior_submission_key=first.submission_key,
+        prior_generation=1,
+        prior_delivery_id=str(delivery_id),
+        owner_receipt_path=str(tmp_path / "owner.json"),
+        owner_receipt_sha256="2" * 64,
+        requester_id=request.requester_id,
+        reason=request.reason,
+    )
+    rerun = store.admit_manual_trigger(
+        request,
+        allowed_chat_ids=set(),
+        submit_enabled=True,
+        operator_authorized=True,
+        batch_terminal_rerun_authority=authority,
+        activation_required=True,
+    )
+    assert rerun.outcome == "created"
+    assert rerun.generation == 2
+    assert len(store.list_rows("business_triggers")) == 2
+    [audit] = [
+        row
+        for row in store.list_rows("rca_shadow_promotion_audit")
+        if row["outcome"] == "batch_terminal_rerun_new_generation_created"
+    ]
+    assert json.loads(audit["detail"]) == authority
+
+    # A successful/approved delivery is not a correction candidate.
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_delivery_jobs SET outcome='success', terminal_error_code='' "
+            "WHERE delivery_id=?",
+            (str(delivery_id),),
+        )
+    bad_request = replace(
+        _operator_request("batch-delivery-success-try-1"),
+        reason=f"production_gray_batch:{batch_id}",
+    )
+    bad_authority = build_batch_terminal_rerun_authority(
+        batch_id=batch_id,
+        queue_sha256="1" * 64,
+        issue_id="7041712812",
+        prior_submission_key=first.submission_key,
+        prior_generation=1,
+        prior_delivery_id=str(delivery_id),
+        owner_receipt_path=str(tmp_path / "owner.json"),
+        owner_receipt_sha256="2" * 64,
+        requester_id=bad_request.requester_id,
+        reason=bad_request.reason,
+    )
+    with pytest.raises(
+        ManualRcaAdmissionError,
+        match="batch_terminal_rerun_terminal_generation_required",
+    ):
+        store.admit_manual_trigger(
+            bad_request,
+            allowed_chat_ids=set(),
+            submit_enabled=True,
+            operator_authorized=True,
+            batch_terminal_rerun_authority=bad_authority,
+            activation_required=True,
+        )
 
 
 def _manual_activation_identity(

@@ -4,17 +4,19 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
 from typing import Any, Mapping, Sequence
+from urllib.parse import quote
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -24,10 +26,52 @@ from gateway.pnc_rca_control_store import (  # noqa: E402
     MANUAL_TRIGGER_SCHEMA_VERSION,
     ManualRcaTriggerRequest,
     RcaControlStore,
+    build_batch_terminal_rerun_authority,
+    build_silent_terminal_rerun_authority,
 )
 
 
-SCHEMA_VERSION = "pnc_rca_batch_rerun_state_v1"
+SCHEMA_VERSION = "pnc_rca_batch_rerun_state_v3"
+OWNER_RECEIPT_SCHEMA_VERSION = "pnc_rca_batch_owner_receipt_v1"
+OWNER_RECEIPT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "approved",
+        "batch_id",
+        "queue_sha256",
+        "selected_issue_ids",
+        "production_effects",
+        "no_other_task_boundary",
+        "approved_by",
+        "approved_at",
+        "requester_id",
+        "reason",
+        "activation_required",
+    }
+)
+OWNER_RECEIPT_EFFECT_SCOPE = {
+    "rca_issue_rerun": True,
+    "feishu_issue_comment": True,
+    "feishu_issue_field_update": True,
+    "vm_submit": True,
+    "resident_restart": False,
+    "kafka_consume": False,
+    "other_task": False,
+}
+OWNER_RECEIPT_NO_OTHER_TASK_BOUNDARY = {
+    "mode": "exclusive",
+    "scope": "g1q3_rca_selected_issue_ids_only",
+    "production_release_task_untouched": True,
+    "other_codex_tasks_untouched": True,
+}
+QUEUE_SCHEMA_VERSION = "g1q3_rca_bootstrap_rerun_queue_v1"
+QUEUE_AUTHORITY_FLAGS = {
+    "project_g1q3_only": True,
+    "issue_only": True,
+    "owner_or_proposer_scope": True,
+    "no_other_task": True,
+    "activation_required": True,
+}
 MAX_INPUT_BYTES = 2 * 1024 * 1024
 ISSUE_ID_RE = re.compile(r"^[0-9]{6,24}$")
 BATCH_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$")
@@ -70,6 +114,182 @@ def _read_json(path: Path) -> tuple[Any, str]:
     return value, _sha256_bytes(raw)
 
 
+def _validate_owner_receipt(
+    value: Any,
+    *,
+    expected_batch_id: str | None = None,
+    expected_queue_sha256: str | None = None,
+    expected_issue_ids: Sequence[str] | None = None,
+    expected_requester_id: str | None = None,
+) -> dict[str, Any]:
+    """Validate the semantic owner approval contract before any admission.
+
+    The raw receipt is separately required to be canonical and its exact byte
+    hash is bound into batch state and every silent-terminal authority.  This
+    function intentionally rejects a merely owner-readable ``{approved:true}``
+    marker: approval must describe the exact queue and the exclusive effects
+    boundary of this batch.
+    """
+    if not isinstance(value, Mapping) or set(value) != OWNER_RECEIPT_FIELDS:
+        raise BatchRerunError("batch_owner_receipt_schema_invalid")
+    if value.get("schema_version") != OWNER_RECEIPT_SCHEMA_VERSION:
+        raise BatchRerunError("batch_owner_receipt_schema_invalid")
+    if value.get("approved") is not True:
+        raise BatchRerunError("batch_owner_receipt_not_approved")
+    batch_id = str(value.get("batch_id") or "").strip()
+    queue_sha256 = str(value.get("queue_sha256") or "").strip().lower()
+    if BATCH_ID_RE.fullmatch(batch_id) is None or not re.fullmatch(
+        r"[0-9a-f]{64}", queue_sha256
+    ) or queue_sha256 == "0" * 64:
+        raise BatchRerunError("batch_owner_receipt_binding_invalid")
+    selected = value.get("selected_issue_ids")
+    if not isinstance(selected, list) or not selected:
+        raise BatchRerunError("batch_owner_receipt_selection_invalid")
+    if any(
+        not isinstance(issue_id, str) or ISSUE_ID_RE.fullmatch(issue_id) is None
+        for issue_id in selected
+    ) or selected != sorted(set(selected)):
+        raise BatchRerunError("batch_owner_receipt_selection_invalid")
+    if expected_batch_id is not None and batch_id != expected_batch_id:
+        raise BatchRerunError("batch_owner_receipt_binding_mismatch")
+    if expected_queue_sha256 is not None and queue_sha256 != expected_queue_sha256:
+        raise BatchRerunError("batch_owner_receipt_binding_mismatch")
+    if expected_issue_ids is not None and selected != sorted(set(expected_issue_ids)):
+        raise BatchRerunError("batch_owner_receipt_selection_mismatch")
+
+    effects = value.get("production_effects")
+    if effects != OWNER_RECEIPT_EFFECT_SCOPE:
+        raise BatchRerunError("batch_owner_receipt_effect_scope_invalid")
+    boundary = value.get("no_other_task_boundary")
+    if boundary != OWNER_RECEIPT_NO_OTHER_TASK_BOUNDARY:
+        raise BatchRerunError("batch_owner_receipt_task_boundary_invalid")
+    if value.get("activation_required") is not True:
+        raise BatchRerunError("batch_owner_receipt_activation_required")
+
+    approved_by = value.get("approved_by")
+    if (
+        not isinstance(approved_by, str)
+        or not approved_by.strip()
+        or len(approved_by) > 128
+        or approved_by != approved_by.strip()
+        or approved_by.startswith("automation:")
+        or any(ord(char) < 0x20 for char in approved_by)
+    ):
+        raise BatchRerunError("batch_owner_receipt_approver_invalid")
+    approved_at = value.get("approved_at")
+    if not isinstance(approved_at, str) or not approved_at or approved_at != approved_at.strip():
+        raise BatchRerunError("batch_owner_receipt_timestamp_invalid")
+    try:
+        observed_at = datetime.fromisoformat(approved_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise BatchRerunError("batch_owner_receipt_timestamp_invalid") from exc
+    if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+        raise BatchRerunError("batch_owner_receipt_timestamp_invalid")
+    now = datetime.now(timezone.utc)
+    if observed_at.astimezone(timezone.utc) > now + timedelta(minutes=5):
+        raise BatchRerunError("batch_owner_receipt_timestamp_invalid")
+
+    requester_id = value.get("requester_id")
+    if (
+        not isinstance(requester_id, str)
+        or not requester_id.startswith("automation:")
+        or len(requester_id) > 128
+        or requester_id != requester_id.strip()
+    ):
+        raise BatchRerunError("batch_owner_receipt_requester_invalid")
+    if expected_requester_id is not None and requester_id != expected_requester_id:
+        raise BatchRerunError("batch_owner_receipt_requester_mismatch")
+    reason = value.get("reason")
+    if reason != f"production_gray_batch:{batch_id}":
+        raise BatchRerunError("batch_owner_receipt_reason_invalid")
+    return dict(value)
+
+
+def _owner_receipt_binding(
+    path: Path,
+    *,
+    expected_batch_id: str | None = None,
+    expected_queue_sha256: str | None = None,
+    expected_issue_ids: Sequence[str] | None = None,
+    expected_requester_id: str | None = None,
+) -> tuple[str, str]:
+    """Validate and hash an owner-only canonical receipt without exposing it."""
+    selected = path.expanduser()
+    if not selected.is_absolute():
+        raise BatchRerunError("batch_owner_receipt_path_invalid")
+    try:
+        observed = selected.lstat()
+    except OSError as exc:
+        raise BatchRerunError("batch_owner_receipt_unavailable") from exc
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or stat.S_ISLNK(observed.st_mode)
+        or observed.st_nlink != 1
+        or observed.st_uid != os.getuid()
+        or stat.S_IMODE(observed.st_mode) & 0o077
+    ):
+        raise BatchRerunError("batch_owner_receipt_identity_invalid")
+    if observed.st_size < 1 or observed.st_size > MAX_INPUT_BYTES:
+        raise BatchRerunError("batch_owner_receipt_size_invalid")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(
+        os, "O_NOFOLLOW", 0
+    )
+    try:
+        descriptor = os.open(selected, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                opened.st_dev != observed.st_dev
+                or opened.st_ino != observed.st_ino
+                or opened.st_size != observed.st_size
+                or not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or opened.st_uid != os.getuid()
+            ):
+                raise BatchRerunError("batch_owner_receipt_identity_changed")
+            digest = hashlib.sha256()
+            chunks: list[bytes] = []
+            remaining = observed.st_size
+            while remaining:
+                chunk = os.read(descriptor, min(64 * 1024, remaining))
+                if not chunk:
+                    raise BatchRerunError("batch_owner_receipt_size_changed")
+                digest.update(chunk)
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            if os.read(descriptor, 1):
+                raise BatchRerunError("batch_owner_receipt_size_changed")
+            final = os.fstat(descriptor)
+            if (
+                final.st_dev != observed.st_dev
+                or final.st_ino != observed.st_ino
+                or final.st_size != observed.st_size
+            ):
+                raise BatchRerunError("batch_owner_receipt_identity_changed")
+        finally:
+            os.close(descriptor)
+    except BatchRerunError:
+        raise
+    except OSError as exc:
+        raise BatchRerunError("batch_owner_receipt_read_failed") from exc
+    raw = b"".join(chunks)
+    try:
+        decoded = raw.decode("utf-8")
+        value = json.loads(decoded)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BatchRerunError("batch_owner_receipt_json_invalid") from exc
+    if raw != (_canonical_json(value) + "\n").encode("utf-8"):
+        raise BatchRerunError("batch_owner_receipt_noncanonical")
+    _validate_owner_receipt(
+        value,
+        expected_batch_id=expected_batch_id,
+        expected_queue_sha256=expected_queue_sha256,
+        expected_issue_ids=expected_issue_ids,
+        expected_requester_id=expected_requester_id,
+    )
+    return str(selected), digest.hexdigest()
+
+
 def _write_state(path: Path, value: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     raw = (_canonical_json(value) + "\n").encode("utf-8")
@@ -102,9 +322,22 @@ def _runtime_commit() -> str:
         raise BatchRerunError("batch_runtime_commit_unavailable") from exc
 
 
-def _load_queue(path: Path) -> tuple[list[dict[str, Any]], str]:
+def _load_queue(
+    path: Path, *, expected_batch_id: str | None = None
+) -> tuple[list[dict[str, Any]], str]:
     value, raw_sha = _read_json(path)
-    if not isinstance(value, Mapping) or not isinstance(value.get("items"), list):
+    if (
+        not isinstance(value, Mapping)
+        or value.get("schema_version") != QUEUE_SCHEMA_VERSION
+        or not isinstance(value.get("items"), list)
+        or BATCH_ID_RE.fullmatch(str(value.get("batch_id") or "")) is None
+        or value.get("project_key") not in {"g1q3", "t03o4q"}
+        or value.get("authority_flags") != QUEUE_AUTHORITY_FLAGS
+        or (
+            expected_batch_id is not None
+            and value.get("batch_id") != expected_batch_id
+        )
+    ):
         raise BatchRerunError("batch_queue_schema_invalid")
     items: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -114,18 +347,35 @@ def _load_queue(path: Path) -> tuple[list[dict[str, Any]], str]:
         issue_id = str(raw.get("issue_id") or "").strip()
         if ISSUE_ID_RE.fullmatch(issue_id) is None or issue_id in seen:
             raise BatchRerunError("batch_queue_issue_invalid")
+        title = str(raw.get("title") or "").strip()
+        classification = str(raw.get("quality_classification") or "").strip()
+        submission_key = str(raw.get("current_submission_key") or "").strip()
+        priority = raw.get("priority")
+        if (
+            not title
+            or not classification
+            or not submission_key
+            or isinstance(priority, bool)
+            or not isinstance(priority, int)
+            or priority < 0
+            or re.fullmatch(r"g1q3-rca-s1-[0-9a-f]{64}", submission_key)
+            is None
+            or (
+                raw.get("project_key") is not None
+                and raw.get("project_key") != value.get("project_key")
+            )
+        ):
+            raise BatchRerunError("batch_queue_item_invalid")
         seen.add(issue_id)
         items.append({
             "issue_id": issue_id,
-            "title": str(raw.get("title") or "").strip(),
-            "quality_classification": str(
-                raw.get("quality_classification") or ""
-            ).strip(),
-            "queue_submission_key": str(
-                raw.get("current_submission_key") or ""
-            ).strip(),
-            "priority": int(raw.get("priority") or 0),
+            "title": title,
+            "quality_classification": classification,
+            "queue_submission_key": submission_key,
+            "priority": priority,
         })
+    if not items:
+        raise BatchRerunError("batch_queue_empty")
     return sorted(items, key=lambda row: (row["priority"], row["issue_id"])), raw_sha
 
 
@@ -135,6 +385,9 @@ def _load_or_create_state(
     batch_id: str,
     queue_sha256: str,
     runtime_commit: str,
+    owner_receipt_path: str,
+    owner_receipt_sha256: str,
+    selected_issue_ids: Sequence[str],
 ) -> dict[str, Any]:
     if path.exists():
         value, _raw_sha = _read_json(path)
@@ -145,6 +398,10 @@ def _load_or_create_state(
             state.get("schema_version") != SCHEMA_VERSION
             or state.get("batch_id") != batch_id
             or state.get("queue_sha256") != queue_sha256
+            or state.get("owner_receipt_path") != owner_receipt_path
+            or state.get("owner_receipt_sha256") != owner_receipt_sha256
+            or state.get("selected_issue_ids") != list(selected_issue_ids)
+            or state.get("activation_required") is not True
         ):
             raise BatchRerunError("batch_state_binding_mismatch")
         if not isinstance(state.get("items"), Mapping):
@@ -156,6 +413,10 @@ def _load_or_create_state(
         "schema_version": SCHEMA_VERSION,
         "batch_id": batch_id,
         "queue_sha256": queue_sha256,
+        "owner_receipt_path": owner_receipt_path,
+        "owner_receipt_sha256": owner_receipt_sha256,
+        "selected_issue_ids": list(selected_issue_ids),
+        "activation_required": True,
         "runtime_commit": runtime_commit,
         "created_at": current,
         "updated_at": current,
@@ -222,9 +483,15 @@ def _causal_delivery_quality(contract_raw: Any) -> dict[str, str] | None:
 def _issue_snapshot(
     db_path: Path, issue_id: str, *, submission_key: str = ""
 ) -> dict[str, Any] | None:
-    conn = sqlite3.connect(db_path, timeout=10)
+    # The batch runner only observes the control DB.  Open it in SQLite
+    # read-only/query-only mode so a SELECT cannot create WAL/sidecar state or
+    # accidentally acquire a writable handle while the resident producer runs.
+    selected = db_path.expanduser().absolute()
+    uri = f"file:{quote(str(selected), safe='/')}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=10)
     conn.row_factory = sqlite3.Row
     try:
+        conn.execute("PRAGMA query_only = ON")
         submission_filter = ""
         params: tuple[str, ...] = (issue_id,)
         if submission_key:
@@ -237,6 +504,9 @@ def _issue_snapshot(
                    o.last_error_code AS outbox_error_code,
                    o.last_error_detail AS outbox_error_detail,
                    o.completed_at AS outbox_completed_at,
+                   w.state AS watch_state,
+                   w.delivery_id AS watch_delivery_id,
+                   w.last_error_code AS watch_error_code,
                    j.delivery_id, j.status AS job_status,
                    j.outcome AS job_outcome, j.outcome_key,
                    j.terminal_state, j.terminal_error_code,
@@ -380,6 +650,88 @@ def _request(
     )
 
 
+def _silent_terminal_authority(
+    *,
+    snapshot: Mapping[str, Any],
+    batch_id: str,
+    queue_sha256: str,
+    issue_id: str,
+    owner_receipt_path: str,
+    owner_receipt_sha256: str,
+    requester_id: str,
+    reason: str,
+) -> dict[str, Any] | None:
+    """Bind only an exact no-delivery deadline terminal to batch authority."""
+    if (
+        snapshot.get("watch_state") != "terminal_failed"
+        or snapshot.get("watch_delivery_id") is not None
+        or snapshot.get("watch_error_code") != "rca_work_deadline_exceeded"
+    ):
+        return None
+    return build_silent_terminal_rerun_authority(
+        batch_id=batch_id,
+        queue_sha256=queue_sha256,
+        issue_id=issue_id,
+        prior_submission_key=str(snapshot.get("submission_key") or ""),
+        prior_generation=int(snapshot.get("generation") or 0),
+        owner_receipt_path=owner_receipt_path,
+        owner_receipt_sha256=owner_receipt_sha256,
+        requester_id=requester_id,
+        reason=reason,
+    )
+
+
+def _batch_terminal_authority(
+    *,
+    snapshot: Mapping[str, Any],
+    batch_id: str,
+    queue_sha256: str,
+    issue_id: str,
+    owner_receipt_path: str,
+    owner_receipt_sha256: str,
+    requester_id: str,
+    reason: str,
+) -> dict[str, Any] | None:
+    """Bind an ordinary settled delivery terminal to the owner-approved batch."""
+    if (
+        snapshot.get("watch_state") != "delivery_created"
+        or not str(snapshot.get("watch_delivery_id") or "").strip()
+        or str(snapshot.get("job_status") or "")
+        not in TERMINAL_JOB_STATUSES
+        or not snapshot.get("delivery_id")
+        or snapshot.get("job_outcome") == "success"
+        or _approval(snapshot) is not None
+        or (
+            not str(snapshot.get("terminal_error_code") or "").strip()
+            and str(snapshot.get("job_outcome") or "") != "terminal_failed"
+        )
+    ):
+        return None
+    required_effects = [
+        effect
+        for effect in snapshot.get("effects", [])
+        if isinstance(effect, Mapping) and int(effect.get("required") or 0) == 1
+    ]
+    if not required_effects or any(
+        str(effect.get("status") or "")
+        not in {"succeeded", "suppressed", "quarantined"}
+        for effect in required_effects
+    ):
+        return None
+    return build_batch_terminal_rerun_authority(
+        batch_id=batch_id,
+        queue_sha256=queue_sha256,
+        issue_id=issue_id,
+        prior_submission_key=str(snapshot.get("submission_key") or ""),
+        prior_generation=int(snapshot.get("generation") or 0),
+        prior_delivery_id=str(snapshot.get("watch_delivery_id") or snapshot.get("delivery_id") or ""),
+        owner_receipt_path=owner_receipt_path,
+        owner_receipt_sha256=owner_receipt_sha256,
+        requester_id=requester_id,
+        reason=reason,
+    )
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     batch_id = str(args.batch_id or "").strip()
     if BATCH_ID_RE.fullmatch(batch_id) is None:
@@ -387,13 +739,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     runtime_commit = _runtime_commit()
     if runtime_commit != str(args.expected_runtime_commit or "").strip():
         raise BatchRerunError("batch_runtime_commit_mismatch")
-    queue, queue_sha = _load_queue(Path(args.queue))
+    queue, queue_sha = _load_queue(Path(args.queue), expected_batch_id=batch_id)
+    selected_issue_ids = [str(item["issue_id"]) for item in queue]
+    owner_receipt_path, owner_receipt_sha256 = _owner_receipt_binding(
+        Path(args.owner_receipt),
+        expected_batch_id=batch_id,
+        expected_queue_sha256=queue_sha,
+        expected_issue_ids=selected_issue_ids,
+        expected_requester_id=args.requester_id,
+    )
     state_path = Path(args.state)
     state = _load_or_create_state(
         state_path,
         batch_id=batch_id,
         queue_sha256=queue_sha,
         runtime_commit=runtime_commit,
+        owner_receipt_path=owner_receipt_path,
+        owner_receipt_sha256=owner_receipt_sha256,
+        selected_issue_ids=selected_issue_ids,
     )
     store = RcaControlStore(Path(args.control_db))
     completed = 0
@@ -422,18 +785,57 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise BatchRerunError("batch_failed_item_requires_retry_flag")
         request_index = int(item.get("request_index") or 0)
         if item.get("status") not in {"submitted", "running"}:
+            if (
+                latest is None
+                or not queue_submission
+                or str(latest["submission_key"] or "") != queue_submission
+            ):
+                raise BatchRerunError("batch_issue_generation_drift")
             request_index += 1
-            admitted = store.admit_manual_trigger(
-                _request(
+            request = _request(
+                batch_id=batch_id,
+                issue_id=issue_id,
+                request_index=request_index,
+                requester_id=args.requester_id,
+            )
+            silent_authority = _silent_terminal_authority(
+                snapshot=latest,
+                batch_id=batch_id,
+                queue_sha256=queue_sha,
+                issue_id=issue_id,
+                owner_receipt_path=owner_receipt_path,
+                owner_receipt_sha256=owner_receipt_sha256,
+                requester_id=args.requester_id,
+                reason=request.reason,
+            )
+            batch_authority = None
+            if silent_authority is None:
+                batch_authority = _batch_terminal_authority(
+                    snapshot=latest,
                     batch_id=batch_id,
+                    queue_sha256=queue_sha,
                     issue_id=issue_id,
-                    request_index=request_index,
+                    owner_receipt_path=owner_receipt_path,
+                    owner_receipt_sha256=owner_receipt_sha256,
                     requester_id=args.requester_id,
-                ),
+                    reason=request.reason,
+                )
+            admission_kwargs: dict[str, Any] = {}
+            if silent_authority is not None:
+                admission_kwargs["silent_terminal_rerun_authority"] = (
+                    silent_authority
+                )
+            elif batch_authority is not None:
+                admission_kwargs["batch_terminal_rerun_authority"] = (
+                    batch_authority
+                )
+            admitted = store.admit_manual_trigger(
+                request,
                 allowed_chat_ids=set(),
                 submit_enabled=True,
                 operator_authorized=True,
-                activation_required=False,
+                activation_required=True,
+                **admission_kwargs,
             )
             item.update({
                 **queue_item,
@@ -512,6 +914,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--state", required=True)
     parser.add_argument("--batch-id", required=True)
     parser.add_argument("--expected-runtime-commit", required=True)
+    parser.add_argument("--owner-receipt", required=True)
     parser.add_argument("--requester-id", default="automation:rca-batch-rerun")
     parser.add_argument("--poll-seconds", type=int, default=5)
     parser.add_argument("--item-timeout-seconds", type=int, default=7200)

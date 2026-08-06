@@ -386,6 +386,46 @@ DEFAULT_MANUAL_OPERATOR_RATE_LIMIT = 3
 DEFAULT_MANUAL_OPERATOR_RATE_WINDOW_SECONDS = 600
 GROUP_USER_RERUN_SCHEMA_VERSION = "pnc_rca_group_user_rerun_v1"
 GROUP_USER_RERUN_DEDUPE_SECONDS = 600
+SILENT_TERMINAL_RERUN_AUTHORITY_SCHEMA_VERSION = (
+    "pnc_rca_silent_terminal_rerun_authority_v1"
+)
+SILENT_TERMINAL_RERUN_AUTHORITY_FIELDS = frozenset(
+    {
+        "schema_version",
+        "batch_id",
+        "queue_sha256",
+        "issue_id",
+        "prior_submission_key",
+        "prior_generation",
+        "owner_receipt_path",
+        "owner_receipt_sha256",
+        "activation_required",
+        "requester_id",
+        "reason",
+        "selection_sha256",
+    }
+)
+BATCH_TERMINAL_RERUN_AUTHORITY_SCHEMA_VERSION = (
+    "pnc_rca_batch_terminal_rerun_authority_v1"
+)
+BATCH_TERMINAL_RERUN_AUTHORITY_FIELDS = frozenset(
+    {
+        "schema_version",
+        "batch_id",
+        "queue_sha256",
+        "issue_id",
+        "prior_submission_key",
+        "prior_generation",
+        "prior_delivery_id",
+        "owner_receipt_path",
+        "owner_receipt_sha256",
+        "activation_required",
+        "terminal_mode",
+        "requester_id",
+        "reason",
+        "selection_sha256",
+    }
+)
 REPLAY_RAW_RETENTION = timedelta(days=7)
 PROCESSED_RAW_RETENTION = timedelta(days=30)
 REPLAY_RAW_PRUNE_BATCH = 1000
@@ -568,6 +608,129 @@ def _canonical_json(value: Any) -> str:
 
 def _canonical_sha256(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def build_silent_terminal_rerun_authority(
+    *,
+    batch_id: str,
+    queue_sha256: str,
+    issue_id: str,
+    prior_submission_key: str,
+    prior_generation: int,
+    owner_receipt_path: str,
+    owner_receipt_sha256: str,
+    requester_id: str,
+    reason: str,
+    activation_required: bool = True,
+) -> dict[str, Any]:
+    """Build the exact owner-approved batch authority for one silent terminal."""
+    material: dict[str, Any] = {
+        "batch_id": str(batch_id or "").strip(),
+        "queue_sha256": str(queue_sha256 or "").strip().lower(),
+        "issue_id": str(issue_id or "").strip(),
+        "prior_submission_key": str(prior_submission_key or "").strip(),
+        "prior_generation": prior_generation,
+        "owner_receipt_path": str(owner_receipt_path or "").strip(),
+        "owner_receipt_sha256": str(owner_receipt_sha256 or "").strip().lower(),
+        "activation_required": activation_required,
+        "requester_id": str(requester_id or "").strip(),
+        "reason": str(reason or "").strip(),
+    }
+    if (
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{2,63}", material["batch_id"])
+        is None
+        or _ACTIVATION_SHA256_RE.fullmatch(material["queue_sha256"]) is None
+        or material["queue_sha256"] == "0" * 64
+        or re.fullmatch(r"[0-9]{1,32}", material["issue_id"]) is None
+        or re.fullmatch(
+            r"g1q3-rca-s1-[0-9a-f]{64}", material["prior_submission_key"]
+        )
+        is None
+        or isinstance(prior_generation, bool)
+        or not isinstance(prior_generation, int)
+        or prior_generation < 1
+        or not Path(material["owner_receipt_path"]).is_absolute()
+        or len(material["owner_receipt_path"].encode("utf-8")) > 4096
+        or any(
+            marker in material["owner_receipt_path"] for marker in ("\x00", "\n", "\r")
+        )
+        or _ACTIVATION_SHA256_RE.fullmatch(material["owner_receipt_sha256"])
+        is None
+        or material["owner_receipt_sha256"] == "0" * 64
+        or material["activation_required"] is not True
+        or not material["requester_id"].startswith("automation:")
+        or material["reason"] != f"production_gray_batch:{material['batch_id']}"
+    ):
+        raise ValueError("silent_terminal_rerun_authority_invalid")
+    return {
+        "schema_version": SILENT_TERMINAL_RERUN_AUTHORITY_SCHEMA_VERSION,
+        **material,
+        "selection_sha256": _canonical_sha256(material),
+    }
+
+
+def build_batch_terminal_rerun_authority(
+    *,
+    batch_id: str,
+    queue_sha256: str,
+    issue_id: str,
+    prior_submission_key: str,
+    prior_generation: int,
+    prior_delivery_id: str,
+    owner_receipt_path: str,
+    owner_receipt_sha256: str,
+    requester_id: str,
+    reason: str,
+    activation_required: bool = True,
+) -> dict[str, Any]:
+    """Build owner-approved authority for a settled delivered-generation correction."""
+    material: dict[str, Any] = {
+        "batch_id": str(batch_id or "").strip(),
+        "queue_sha256": str(queue_sha256 or "").strip().lower(),
+        "issue_id": str(issue_id or "").strip(),
+        "prior_submission_key": str(prior_submission_key or "").strip(),
+        "prior_generation": prior_generation,
+        "prior_delivery_id": str(prior_delivery_id or "").strip(),
+        "owner_receipt_path": str(owner_receipt_path or "").strip(),
+        "owner_receipt_sha256": str(owner_receipt_sha256 or "").strip().lower(),
+        "activation_required": activation_required,
+        "terminal_mode": "settled_delivery_correction",
+        "requester_id": str(requester_id or "").strip(),
+        "reason": str(reason or "").strip(),
+    }
+    if (
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{2,63}", material["batch_id"])
+        is None
+        or _ACTIVATION_SHA256_RE.fullmatch(material["queue_sha256"]) is None
+        or material["queue_sha256"] == "0" * 64
+        or re.fullmatch(r"[0-9]{1,32}", material["issue_id"]) is None
+        or re.fullmatch(
+            r"g1q3-rca-s1-[0-9a-f]{64}", material["prior_submission_key"]
+        ) is None
+        or isinstance(material["prior_generation"], bool)
+        or not isinstance(material["prior_generation"], int)
+        or material["prior_generation"] < 1
+        or re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}", material["prior_delivery_id"]
+        ) is None
+        or not Path(material["owner_receipt_path"]).is_absolute()
+        or len(material["owner_receipt_path"].encode("utf-8")) > 4096
+        or any(
+            marker in material["owner_receipt_path"] for marker in ("\x00", "\n", "\r")
+        )
+        or _ACTIVATION_SHA256_RE.fullmatch(material["owner_receipt_sha256"])
+        is None
+        or material["owner_receipt_sha256"] == "0" * 64
+        or material["activation_required"] is not True
+        or not material["requester_id"].startswith("automation:")
+        or material["reason"] != f"production_gray_batch:{material['batch_id']}"
+    ):
+        raise ValueError("batch_terminal_rerun_authority_invalid")
+    return {
+        "schema_version": BATCH_TERMINAL_RERUN_AUTHORITY_SCHEMA_VERSION,
+        **material,
+        "selection_sha256": _canonical_sha256(material),
+    }
 
 
 def _exact_canonical_json(value: Any) -> str:
@@ -14111,8 +14274,19 @@ class RcaControlStore:
 
     @classmethod
     def _execution_terminal_tx(
-        cls, conn: sqlite3.Connection, row: sqlite3.Row
+        cls,
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        allow_silent_terminal: bool = False,
     ) -> bool:
+        """Return whether a generation is durably terminal for a new rerun.
+
+        The ordinary terminal contract requires a settled delivery.  A
+        technical deadline terminal is a separate, opt-in contract: it can
+        authorize only an explicitly authenticated Feishu rerun after its
+        internal failure route has settled and no delivery effect exists.
+        """
         if cls._table_exists(conn, "rca_execution_watch"):
             watch = conn.execute(
                 "SELECT state FROM rca_execution_watch WHERE submission_key = ?",
@@ -14120,6 +14294,8 @@ class RcaControlStore:
             ).fetchone()
             if watch is not None:
                 watch_state = str(watch["state"] or "")
+                if watch_state == "terminal_failed" and allow_silent_terminal:
+                    return cls._silent_terminal_rerun_eligible_tx(conn, row)
                 if watch_state != "delivery_created":
                     return False
                 required_tables = {
@@ -14184,6 +14360,244 @@ class RcaControlStore:
                         return False
                 return True
         return False
+
+    @classmethod
+    def _silent_terminal_rerun_eligible_tx(
+        cls,
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> bool:
+        """Validate one internal-only deadline terminal before a new generation.
+
+        This predicate deliberately validates the complete durable chain.  It
+        does not repair or mutate the old watch, route, subscriptions, job, or
+        effects; a caller may only create a separate generation after every
+        check succeeds.
+        """
+        required_tables = {
+            "rca_execution_watch",
+            "rca_failure_routes",
+            "rca_delivery_subscriptions",
+            "rca_delivery_jobs",
+            "rca_delivery_effects",
+        }
+        if not all(cls._table_exists(conn, table) for table in required_tables):
+            return False
+        submission_key = str(row["submission_key"] or "").strip()
+        business_key = str(row["business_key"] or "").strip()
+        try:
+            generation = int(row["generation"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if not submission_key or not business_key or generation < 1:
+            return False
+
+        terminal = conn.execute(
+            """
+            SELECT w.state, w.business_key AS watch_business_key,
+                   w.generation AS watch_generation, w.terminal_at,
+                   w.last_status_json, w.last_error_code, w.last_error_detail,
+                   w.delivery_id, w.lease_token, w.lease_owner,
+                   w.lease_expires_at, o.status AS outbox_status,
+                   o.completed_at AS outbox_completed_at,
+                   o.quarantined_at AS outbox_quarantined_at,
+                   o.result_json AS outbox_result_json,
+                   o.last_error_code AS outbox_error_code,
+                   o.lease_token AS outbox_lease_token,
+                   o.lease_owner AS outbox_lease_owner,
+                   o.lease_expires_at AS outbox_lease_expires_at
+              FROM rca_execution_watch AS w
+              JOIN rca_outbox AS o
+                ON o.outbox_id = w.submission_outbox_id
+               AND o.business_key = w.business_key
+               AND o.generation = w.generation
+             WHERE w.submission_key = ?
+               AND w.business_key = ?
+               AND w.generation = ?
+             LIMIT 1
+            """,
+            (submission_key, business_key, generation),
+        ).fetchone()
+        if terminal is None:
+            return False
+        try:
+            terminal_generation = int(terminal["watch_generation"] or 0)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if (
+            str(terminal["state"] or "") != "terminal_failed"
+            or str(terminal["watch_business_key"] or "") != business_key
+            or terminal_generation != generation
+            or terminal["delivery_id"] is not None
+            or not str(terminal["terminal_at"] or "").strip()
+            or str(terminal["last_error_code"] or "")
+            != "rca_work_deadline_exceeded"
+            or not str(terminal["last_error_detail"] or "").strip()
+            or any(
+                terminal[name] is not None
+                for name in (
+                    "lease_token",
+                    "lease_owner",
+                    "lease_expires_at",
+                    "outbox_lease_token",
+                    "outbox_lease_owner",
+                    "outbox_lease_expires_at",
+                )
+            )
+        ):
+            return False
+        outbox_status = str(terminal["outbox_status"] or "")
+        if outbox_status not in {"completed", "quarantined"}:
+            return False
+        if outbox_status == "completed":
+            if (
+                not str(terminal["outbox_completed_at"] or "").strip()
+                or terminal["outbox_result_json"] is None
+                or str(terminal["outbox_error_code"] or "")
+            ):
+                return False
+        elif (
+            not str(terminal["outbox_quarantined_at"] or "").strip()
+            or terminal["outbox_completed_at"] is not None
+            or str(terminal["outbox_error_code"] or "")
+            != "rca_work_deadline_exceeded"
+        ):
+            return False
+
+        try:
+            status = json.loads(str(terminal["last_status_json"] or ""))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        if not isinstance(status, Mapping):
+            return False
+        if (
+            status.get("external_writes") is not False
+            or status.get("terminal_delivery_policy")
+            != "silent_internal_alert_only"
+        ):
+            return False
+        taxonomy = status.get("failure_taxonomy")
+        if not isinstance(taxonomy, Mapping):
+            return False
+        if (
+            taxonomy.get("raw_code") != "rca_work_deadline_exceeded"
+            or taxonomy.get("terminal_error_code") != "rca_work_deadline_exceeded"
+            or taxonomy.get("internal_route") != "internal_alert"
+            or taxonomy.get("lane") != "hard_defect"
+            or taxonomy.get("known") is not True
+            or taxonomy.get("retryable") is not False
+        ):
+            return False
+        fallback = taxonomy.get("terminal_fallback")
+        durable_route = taxonomy.get("durable_route")
+        if not isinstance(fallback, Mapping) or not isinstance(
+            durable_route, Mapping
+        ):
+            return False
+        try:
+            elapsed_seconds = int(fallback["elapsed_seconds"])
+            fallback_seconds = int(taxonomy["terminal_fallback_seconds"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        route_key = str(fallback.get("route_key") or "").strip()
+        if (
+            fallback.get("schema_version")
+            != "pnc_rca_bounded_terminal_fallback_v1"
+            or fallback.get("confidence_tier") != "low"
+            or fallback.get("terminal_class") != "honest_non_attribution"
+            or fallback.get("route_kind") != "internal_alert"
+            or fallback.get("route_owner") != "rca-engineering"
+            or elapsed_seconds < fallback_seconds
+            or fallback_seconds < 1
+            or not route_key
+            or str(durable_route.get("route_key") or "") != route_key
+        ):
+            return False
+        internal_outlet = durable_route.get("internal_outlet")
+        if not isinstance(internal_outlet, Mapping) or (
+            internal_outlet.get("status") not in {"settled", "resolved"}
+            or internal_outlet.get("external_effects") != 0
+        ):
+            return False
+
+        route_rows = conn.execute(
+            """
+            SELECT route_key, submission_key, business_key, generation,
+                   terminal_error_code, lane, route_kind, owner, status,
+                   audit_json, route_payload_json
+              FROM rca_failure_routes
+             WHERE route_key = ? AND submission_key = ?
+               AND business_key = ? AND generation = ?
+             LIMIT 1
+            """,
+            (route_key, submission_key, business_key, generation),
+        ).fetchall()
+        if len(route_rows) != 1:
+            return False
+        route = route_rows[0]
+        if str(route["status"] or "") not in {
+            "alert_pending",
+            "terminal_fallback",
+            "resolved",
+        }:
+            return False
+        if (
+            str(route["terminal_error_code"] or "")
+            != "rca_work_deadline_exceeded"
+            or str(route["lane"] or "") != "hard_defect"
+            or str(route["route_kind"] or "") != "internal_alert"
+            or str(route["owner"] or "") != "rca-engineering"
+        ):
+            return False
+        try:
+            route_audit = json.loads(str(route["audit_json"] or ""))
+            route_payload = json.loads(str(route["route_payload_json"] or ""))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        if not isinstance(route_audit, Mapping) or not isinstance(
+            route_payload, Mapping
+        ):
+            return False
+        decision = route_payload.get("decision")
+        if not isinstance(decision, Mapping) or (
+            route_payload.get("schema_version")
+            != "pnc_rca_failure_route_payload_v1"
+            or decision.get("terminal_error_code")
+            != "rca_work_deadline_exceeded"
+            or decision.get("internal_route") != "internal_alert"
+            or decision.get("lane") != "hard_defect"
+        ):
+            return False
+
+        # A silent terminal must not have an older public job/effect that could
+        # race the new generation.  Subscriptions may remain pending (or be
+        # explicitly suppressed/quarantined), but never materialized here.
+        if conn.execute(
+            """
+            SELECT 1 FROM rca_delivery_jobs
+             WHERE business_key = ? AND generation = ?
+             LIMIT 1
+            """,
+            (business_key, generation),
+        ).fetchone() is not None:
+            return False
+        subscriptions = conn.execute(
+            """
+            SELECT required, status, delivery_id, effect_key
+              FROM rca_delivery_subscriptions
+             WHERE business_key = ? AND generation = ?
+            """,
+            (business_key, generation),
+        ).fetchall()
+        required = [item for item in subscriptions if int(item["required"] or 0) == 1]
+        if not required or any(
+            str(item["status"] or "") == "materialized"
+            or item["delivery_id"] is not None
+            or item["effect_key"] is not None
+            for item in subscriptions
+        ):
+            return False
+        return True
 
     @classmethod
     def _terminal_duplicate_retrigger_eligible_tx(
@@ -14265,6 +14679,8 @@ class RcaControlStore:
         activation_slot_kind: str = "",
         automation_authority: Mapping[str, Any] | None = None,
         user_rerun_authority: Mapping[str, Any] | None = None,
+        batch_terminal_rerun_authority: Mapping[str, Any] | None = None,
+        silent_terminal_rerun_authority: Mapping[str, Any] | None = None,
         snapshot_authority: Any = None,
         snapshot_ticket_authority: Mapping[str, Any] | None = None,
         snapshot_manual_ingress_authority: Mapping[str, Any] | None = None,
@@ -14280,6 +14696,8 @@ class RcaControlStore:
             raise ManualRcaAdmissionError("manual_activation_slot_invalid")
         gray_sample_authority: dict[str, str] | None = None
         normalized_user_rerun: dict[str, str] | None = None
+        normalized_batch_rerun: dict[str, Any] | None = None
+        normalized_silent_rerun: dict[str, Any] | None = None
         if user_rerun_authority is not None:
             if not isinstance(user_rerun_authority, Mapping) or set(
                 user_rerun_authority
@@ -14309,6 +14727,126 @@ class RcaControlStore:
                 or not manual.requester_id.startswith("ou_")
             ):
                 raise ManualRcaAdmissionError("group_user_rerun_authority_invalid")
+        if silent_terminal_rerun_authority is not None:
+            if (
+                not isinstance(silent_terminal_rerun_authority, Mapping)
+                or set(silent_terminal_rerun_authority)
+                != SILENT_TERMINAL_RERUN_AUTHORITY_FIELDS
+            ):
+                raise ManualRcaAdmissionError(
+                    "silent_terminal_rerun_authority_invalid"
+                )
+            try:
+                expected_silent_rerun = build_silent_terminal_rerun_authority(
+                    batch_id=silent_terminal_rerun_authority.get("batch_id"),
+                    queue_sha256=silent_terminal_rerun_authority.get("queue_sha256"),
+                    issue_id=silent_terminal_rerun_authority.get("issue_id"),
+                    prior_submission_key=silent_terminal_rerun_authority.get(
+                        "prior_submission_key"
+                    ),
+                    prior_generation=silent_terminal_rerun_authority.get(
+                        "prior_generation"
+                    ),
+                    owner_receipt_sha256=silent_terminal_rerun_authority.get(
+                        "owner_receipt_sha256"
+                    ),
+                    owner_receipt_path=silent_terminal_rerun_authority.get(
+                        "owner_receipt_path"
+                    ),
+                    activation_required=silent_terminal_rerun_authority.get(
+                        "activation_required"
+                    ),
+                    requester_id=silent_terminal_rerun_authority.get("requester_id"),
+                    reason=silent_terminal_rerun_authority.get("reason"),
+                )
+            except (TypeError, ValueError) as exc:
+                raise ManualRcaAdmissionError(
+                    "silent_terminal_rerun_authority_invalid"
+                ) from exc
+            if dict(silent_terminal_rerun_authority) != expected_silent_rerun:
+                raise ManualRcaAdmissionError(
+                    "silent_terminal_rerun_authority_invalid"
+                )
+            if (
+                manual.platform != "operator"
+                or manual.mode != "rerun"
+                or operator_authorized is not True
+                or user_rerun_authority is not None
+                or automation_authority is not None
+                or activation_slot
+                or snapshot_authority is not None
+                or snapshot_ticket_authority is not None
+                or snapshot_manual_ingress_authority is not None
+                or expected_silent_rerun["activation_required"] is not True
+                or expected_silent_rerun["requester_id"] != manual.requester_id
+                or expected_silent_rerun["reason"] != manual.reason
+            ):
+                raise ManualRcaAdmissionError(
+                    "silent_terminal_rerun_authority_invalid"
+                )
+            normalized_silent_rerun = expected_silent_rerun
+        if batch_terminal_rerun_authority is not None:
+            if (
+                not isinstance(batch_terminal_rerun_authority, Mapping)
+                or set(batch_terminal_rerun_authority)
+                != BATCH_TERMINAL_RERUN_AUTHORITY_FIELDS
+            ):
+                raise ManualRcaAdmissionError(
+                    "batch_terminal_rerun_authority_invalid"
+                )
+            try:
+                expected_batch_rerun = build_batch_terminal_rerun_authority(
+                    batch_id=batch_terminal_rerun_authority.get("batch_id"),
+                    queue_sha256=batch_terminal_rerun_authority.get("queue_sha256"),
+                    issue_id=batch_terminal_rerun_authority.get("issue_id"),
+                    prior_submission_key=batch_terminal_rerun_authority.get(
+                        "prior_submission_key"
+                    ),
+                    prior_generation=batch_terminal_rerun_authority.get(
+                        "prior_generation"
+                    ),
+                    prior_delivery_id=batch_terminal_rerun_authority.get(
+                        "prior_delivery_id"
+                    ),
+                    owner_receipt_sha256=batch_terminal_rerun_authority.get(
+                        "owner_receipt_sha256"
+                    ),
+                    owner_receipt_path=batch_terminal_rerun_authority.get(
+                        "owner_receipt_path"
+                    ),
+                    activation_required=batch_terminal_rerun_authority.get(
+                        "activation_required"
+                    ),
+                    requester_id=batch_terminal_rerun_authority.get("requester_id"),
+                    reason=batch_terminal_rerun_authority.get("reason"),
+                )
+            except (TypeError, ValueError) as exc:
+                raise ManualRcaAdmissionError(
+                    "batch_terminal_rerun_authority_invalid"
+                ) from exc
+            if dict(batch_terminal_rerun_authority) != expected_batch_rerun:
+                raise ManualRcaAdmissionError(
+                    "batch_terminal_rerun_authority_invalid"
+                )
+            if (
+                manual.platform != "operator"
+                or manual.mode != "rerun"
+                or operator_authorized is not True
+                or user_rerun_authority is not None
+                or automation_authority is not None
+                or activation_slot
+                or snapshot_authority is not None
+                or snapshot_ticket_authority is not None
+                or snapshot_manual_ingress_authority is not None
+                or silent_terminal_rerun_authority is not None
+                or activation_required is not True
+                or expected_batch_rerun["requester_id"] != manual.requester_id
+                or expected_batch_rerun["reason"] != manual.reason
+            ):
+                raise ManualRcaAdmissionError(
+                    "batch_terminal_rerun_authority_invalid"
+                )
+            normalized_batch_rerun = expected_batch_rerun
         if automation_authority is not None:
             try:
                 gray_sample_authority = normalize_gray_sample_automation_authority(
@@ -14421,6 +14959,12 @@ class RcaControlStore:
             source_payload["automation_authority"] = gray_sample_authority
         if normalized_user_rerun is not None:
             source_payload["user_rerun_authority"] = normalized_user_rerun
+        if normalized_batch_rerun is not None:
+            source_payload["batch_terminal_rerun_authority"] = normalized_batch_rerun
+        if normalized_silent_rerun is not None:
+            source_payload["silent_terminal_rerun_authority"] = (
+                normalized_silent_rerun
+            )
         payload_sha = _canonical_sha256(source_payload)
         source_dedupe_key = f"{manual.platform}:{manual.message_id}"
         source_id = _stable_key(
@@ -14850,6 +15394,103 @@ class RcaControlStore:
                     raise ManualRcaAdmissionError(
                         "group_user_rerun_terminal_generation_required"
                     )
+            if normalized_silent_rerun is not None:
+                if latest is None or not self._silent_terminal_rerun_eligible_tx(
+                    conn, latest
+                ):
+                    raise ManualRcaAdmissionError(
+                        "silent_terminal_rerun_terminal_generation_required"
+                    )
+                expected_silent_rerun = build_silent_terminal_rerun_authority(
+                    batch_id=normalized_silent_rerun["batch_id"],
+                    queue_sha256=normalized_silent_rerun["queue_sha256"],
+                    issue_id=work_item_id,
+                    prior_submission_key=str(latest["submission_key"]),
+                    prior_generation=int(latest["generation"]),
+                    owner_receipt_sha256=normalized_silent_rerun[
+                        "owner_receipt_sha256"
+                    ],
+                    owner_receipt_path=normalized_silent_rerun[
+                        "owner_receipt_path"
+                    ],
+                    activation_required=normalized_silent_rerun[
+                        "activation_required"
+                    ],
+                    requester_id=manual.requester_id,
+                    reason=manual.reason,
+                )
+                if normalized_silent_rerun != expected_silent_rerun:
+                    raise ManualRcaAdmissionError(
+                        "silent_terminal_rerun_authority_mismatch"
+                    )
+            if normalized_batch_rerun is not None:
+                if latest is None or not self._execution_terminal_tx(conn, latest):
+                    raise ManualRcaAdmissionError(
+                        "batch_terminal_rerun_terminal_generation_required"
+                    )
+                latest_watch = conn.execute(
+                    """
+                    SELECT state, delivery_id
+                      FROM rca_execution_watch
+                     WHERE submission_key = ?
+                    """,
+                    (str(latest["submission_key"]),),
+                ).fetchone()
+                if (
+                    latest_watch is None
+                    or str(latest_watch["state"] or "") != "delivery_created"
+                    or not str(latest_watch["delivery_id"] or "").strip()
+                    or str(latest_watch["delivery_id"])
+                    != normalized_batch_rerun["prior_delivery_id"]
+                    or normalized_batch_rerun["prior_submission_key"]
+                    != str(latest["submission_key"])
+                    or int(normalized_batch_rerun["prior_generation"])
+                    != int(latest["generation"])
+                    or normalized_batch_rerun["issue_id"] != work_item_id
+                ):
+                    raise ManualRcaAdmissionError(
+                        "batch_terminal_rerun_authority_mismatch"
+                    )
+                batch_job = conn.execute(
+                    """
+                    SELECT delivery_id, status, outcome, terminal_error_code
+                      FROM rca_delivery_jobs
+                     WHERE business_key = ? AND generation = ?
+                     LIMIT 1
+                    """,
+                    (str(latest["business_key"]), int(latest["generation"])),
+                ).fetchone()
+                if (
+                    batch_job is None
+                    or str(batch_job["delivery_id"] or "")
+                    != normalized_batch_rerun["prior_delivery_id"]
+                    or str(batch_job["status"] or "")
+                    not in {"delivered", "partial", "quarantined"}
+                    or str(batch_job["outcome"] or "") == "success"
+                    or (
+                        not str(batch_job["terminal_error_code"] or "").strip()
+                        and str(batch_job["outcome"] or "") != "terminal_failed"
+                    )
+                ):
+                    raise ManualRcaAdmissionError(
+                        "batch_terminal_rerun_terminal_generation_required"
+                    )
+                batch_effects = conn.execute(
+                    """
+                    SELECT status
+                      FROM rca_delivery_effects
+                     WHERE delivery_id = ? AND required = 1
+                    """,
+                    (normalized_batch_rerun["prior_delivery_id"],),
+                ).fetchall()
+                if not batch_effects or any(
+                    str(effect["status"] or "")
+                    not in {"succeeded", "suppressed", "quarantined"}
+                    for effect in batch_effects
+                ):
+                    raise ManualRcaAdmissionError(
+                        "batch_terminal_rerun_terminal_generation_required"
+                    )
             if business_key_count > 1:
                 self._audit_issue_scope_conflict_tx(
                     conn,
@@ -14948,12 +15589,14 @@ class RcaControlStore:
                 rearm_reason = INPUT_WAIT_QUARANTINE_REARMED_REASON
                 needs_input_rearm = True
             elif manual.mode in {"rerun", "debug"} and self._execution_terminal_tx(
-                conn, latest
+                conn,
+                latest,
+                allow_silent_terminal=normalized_silent_rerun is not None,
             ):
                 if (
                     manual.platform != "feishu"
                     or manual.mode != "rerun"
-                ) and gray_sample_authority is None:
+                ) and gray_sample_authority is None and normalized_silent_rerun is None and normalized_batch_rerun is None:
                     raise ManualRcaAdmissionError(
                         "manual_generation_requires_explicit_user_rerun"
                     )
@@ -15124,6 +15767,46 @@ class RcaControlStore:
             ).fetchone()
             if bound_outbox is None:
                 raise ManualRcaAdmissionError("manual_issue_scope_outbox_missing")
+            if normalized_silent_rerun is not None:
+                prior_generation = int(
+                    normalized_silent_rerun["prior_generation"]
+                )
+                if not created or admission.generation != prior_generation + 1:
+                    raise RuntimeError(
+                        "silent_terminal_rerun_generation_not_created"
+                    )
+                self._insert_promotion_audit(
+                    conn,
+                    event_uid=source_id,
+                    outbox_id=int(bound_outbox["outbox_id"]),
+                    submission_key=admission.submission_key,
+                    operator=f"manual:{manual.requester_id}",
+                    reason="silent_terminal_explicit_batch_rerun",
+                    outcome="silent_terminal_new_generation_created",
+                    from_status=f"terminal_failed:g{prior_generation}",
+                    to_status=f"pending:g{admission.generation}",
+                    detail=_canonical_json(normalized_silent_rerun),
+                    created_at=current,
+                )
+            if normalized_batch_rerun is not None:
+                prior_generation = int(normalized_batch_rerun["prior_generation"])
+                if not created or admission.generation != prior_generation + 1:
+                    raise RuntimeError(
+                        "batch_terminal_rerun_generation_not_created"
+                    )
+                self._insert_promotion_audit(
+                    conn,
+                    event_uid=source_id,
+                    outbox_id=int(bound_outbox["outbox_id"]),
+                    submission_key=admission.submission_key,
+                    operator=f"manual:{manual.requester_id}",
+                    reason="settled_delivery_correction_batch_rerun",
+                    outcome="batch_terminal_rerun_new_generation_created",
+                    from_status=f"delivery_created:g{prior_generation}",
+                    to_status=f"pending:g{admission.generation}",
+                    detail=_canonical_json(normalized_batch_rerun),
+                    created_at=current,
+                )
             self._audit_manual_policy_observation_tx(
                 conn,
                 source_id=source_id,
