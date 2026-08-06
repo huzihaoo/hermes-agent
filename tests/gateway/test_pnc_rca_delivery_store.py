@@ -1707,6 +1707,265 @@ def test_current_epoch_profile_terminal_without_w3_keeps_public_issue_target(
     contract = json.loads(job["contract_json"])
     assert contract["diagnostic_code"] == "business_route_unsupported"
     assert "w3_execution_snapshot" not in contract
+    effect = store.claim_due_effect(
+        lease_owner="profile-terminal-fence-test",
+        now=NOW + timedelta(seconds=3),
+        activation_required=True,
+    )
+    assert effect is not None
+    binding = store.validate_profile_terminal_external_write_binding(
+        effect_key=effect.effect_key,
+        delivery_id=effect.delivery_id,
+        lease_token=effect.lease_token,
+        lease_fence=effect.fence,
+        operation="feishu_issue_comment",
+        issue_url=effect.issue_url,
+        target_key=effect.target_key,
+        business_key=effect.business_key,
+        submission_key=effect.submission_key,
+        generation=effect.generation,
+        require_write_started=False,
+        now=NOW + timedelta(seconds=3),
+    )
+    assert binding["source_error_code"] == "business_profile_unsupported"
+    with pytest.raises(
+        RuntimeError,
+        match="external_write_fence_operation_denied",
+    ):
+        store.validate_profile_terminal_external_write_binding(
+            effect_key=effect.effect_key,
+            delivery_id=effect.delivery_id,
+            lease_token=effect.lease_token,
+            lease_fence=effect.fence,
+            operation="feishu_issue_field_update",
+            issue_url=effect.issue_url,
+            target_key=effect.target_key,
+            business_key=effect.business_key,
+            submission_key=effect.submission_key,
+            generation=effect.generation,
+            require_write_started=False,
+            now=NOW + timedelta(seconds=3),
+        )
+    store.mark_effect_write_started(
+        claim=effect,
+        now=NOW + timedelta(seconds=4),
+        activation_required=True,
+    )
+    started = store.validate_profile_terminal_external_write_binding(
+        effect_key=effect.effect_key,
+        delivery_id=effect.delivery_id,
+        lease_token=effect.lease_token,
+        lease_fence=effect.fence,
+        operation="feishu_issue_comment",
+        issue_url=effect.issue_url,
+        target_key=effect.target_key,
+        business_key=effect.business_key,
+        submission_key=effect.submission_key,
+        generation=effect.generation,
+        require_write_started=True,
+        now=NOW + timedelta(seconds=4),
+    )
+    assert started["write_phase"] == "write_started"
+
+
+def test_profile_terminal_provider_claim_rechecks_lease_target_and_epoch(tmp_path, monkeypatch):
+    from gateway import pnc_rca_provider_fence as provider_fence
+    from gateway.pnc_rca_provider_fence import (
+        build_profile_terminal_provider_claim,
+    )
+    from gateway.pnc_rca_write_fence import ExternalWriteFenceError
+    from tests.gateway.test_pnc_rca_control_store import (
+        _create_activation_epoch,
+        _profile_snapshot_policy,
+        _profile_snapshot_record,
+    )
+
+    provider_now = datetime.now(timezone.utc)
+    control = RcaControlStore(tmp_path / "control.sqlite3")
+    epoch = _create_activation_epoch(control, start_offset=20)
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_activation_epochs SET state='steady_active' "
+            "WHERE epoch_id=? AND is_current=1",
+            (epoch["epoch_id"],),
+        )
+    result = control.ingest_record(
+        _profile_snapshot_record(20, "6841983153"),
+        policy=_profile_snapshot_policy(),
+        submit_enabled=True,
+        activation_required=True,
+        activation_slot_kind="kafka_success",
+    )
+    assert result.decision == "accepted"
+    outbox = control.claim_outbox(
+        lease_owner="profile-terminal-provider-test",
+        now=provider_now,
+    )
+    assert outbox is not None
+    control.quarantine_outbox(
+        outbox_id=outbox.outbox_id,
+        lease_token=outbox.lease_token,
+        error_code="business_profile_unsupported",
+        error_detail="profile provider claim fixture",
+        now=provider_now + timedelta(seconds=1),
+    )
+    store = RcaDeliveryStore(control.db_path)
+    assert store.backfill_completed_submissions(
+        now=provider_now + timedelta(seconds=2),
+        activation_required=True,
+    ) == 1
+    effect = store.claim_due_effect(
+        lease_owner="profile-terminal-provider-test",
+        now=provider_now + timedelta(seconds=3),
+        activation_required=True,
+    )
+    assert effect is not None
+    store.mark_effect_write_started(
+        claim=effect,
+        now=provider_now + timedelta(seconds=4),
+        activation_required=True,
+    )
+    binding = store.validate_profile_terminal_external_write_binding(
+        effect_key=effect.effect_key,
+        delivery_id=effect.delivery_id,
+        lease_token=effect.lease_token,
+        lease_fence=effect.fence,
+        operation="feishu_issue_comment",
+        issue_url=effect.issue_url,
+        target_key=effect.target_key,
+        business_key=effect.business_key,
+        submission_key=effect.submission_key,
+        generation=effect.generation,
+        require_write_started=True,
+        now=provider_now + timedelta(seconds=4),
+    )
+    claim = build_profile_terminal_provider_claim(
+        epoch_id=binding["epoch_id"],
+        activation_ledger_id=binding["activation_ledger_id"],
+        effect_key=binding["effect_key"],
+        delivery_id=binding["delivery_id"],
+        lease_token=binding["lease_token"],
+        lease_fence=binding["lease_fence"],
+        issue_target=binding["issue_url"],
+        target_key=binding["target_key"],
+        business_key=binding["business_key"],
+        submission_key=binding["submission_key"],
+        generation=binding["generation"],
+        source_error_code=binding["source_error_code"],
+    )
+    monkeypatch.setattr(provider_fence, "_canonical_store", lambda: control)
+    live = provider_fence.revalidate_provider_write_claim(
+        claim,
+        operation="feishu_issue_comment",
+        issue_project_key="t03o4q",
+        issue_work_item_id="7041712812",
+    )
+    assert live["authority_kind"] == "profile_terminal"
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_trigger_sources SET source_kind='feishu_group_manual' "
+            "WHERE source_id = (SELECT origin_source_id FROM business_triggers "
+            "WHERE submission_key = ?)",
+            (effect.submission_key,),
+        )
+    with pytest.raises(
+        ExternalWriteFenceError,
+        match="external_write_fence_identity_mismatch",
+    ):
+        provider_fence.revalidate_provider_write_claim(
+            claim,
+            operation="feishu_issue_comment",
+            issue_project_key="t03o4q",
+            issue_work_item_id="7041712812",
+        )
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_trigger_sources SET source_kind='kafka_workflow_event' "
+            "WHERE source_id = (SELECT origin_source_id FROM business_triggers "
+            "WHERE submission_key = ?)",
+            (effect.submission_key,),
+        )
+        normalized_raw = conn.execute(
+            "SELECT normalized_json FROM business_triggers WHERE submission_key = ?",
+            (effect.submission_key,),
+        ).fetchone()[0]
+        normalized = json.loads(normalized_raw)
+        normalized["business_profile_resolution"]["project_option_ids"] = [
+            "tampered-option"
+        ]
+        conn.execute(
+            "UPDATE business_triggers SET normalized_json = ? "
+            "WHERE submission_key = ?",
+            (json.dumps(normalized, ensure_ascii=False, sort_keys=True), effect.submission_key),
+        )
+    with pytest.raises(
+        ExternalWriteFenceError,
+        match="external_write_fence_identity_mismatch",
+    ):
+        provider_fence.revalidate_provider_write_claim(
+            claim,
+            operation="feishu_issue_comment",
+            issue_project_key="t03o4q",
+            issue_work_item_id="7041712812",
+        )
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute(
+            "UPDATE business_triggers SET normalized_json = ? "
+            "WHERE submission_key = ?",
+            (normalized_raw, effect.submission_key),
+        )
+    with pytest.raises(
+        ExternalWriteFenceError,
+        match="external_write_fence_operation_denied",
+    ):
+        provider_fence.revalidate_provider_write_claim(
+            claim,
+            operation="feishu_issue_field_update",
+            issue_project_key="t03o4q",
+            issue_work_item_id="7041712812",
+        )
+    assert claim.payload()["authority"]["operation"] == "feishu_issue_comment"
+    assert "thread_id" not in claim.payload()["authority"]
+    wrong_target = build_profile_terminal_provider_claim(
+        epoch_id=binding["epoch_id"],
+        activation_ledger_id=binding["activation_ledger_id"],
+        effect_key=binding["effect_key"],
+        delivery_id=binding["delivery_id"],
+        lease_token=binding["lease_token"],
+        lease_fence=binding["lease_fence"],
+        issue_target="https://project.feishu.cn/t03o4q/issue/detail/9999999999",
+        target_key=binding["target_key"],
+        business_key=binding["business_key"],
+        submission_key=binding["submission_key"],
+        generation=binding["generation"],
+        source_error_code=binding["source_error_code"],
+    )
+    with pytest.raises(
+        ExternalWriteFenceError,
+        match="external_write_fence_target_mismatch",
+    ):
+        provider_fence.revalidate_provider_write_claim(
+            wrong_target,
+            operation="feishu_issue_comment",
+            issue_project_key="t03o4q",
+            issue_work_item_id="7041712812",
+        )
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_activation_epochs SET state='aborted' "
+            "WHERE epoch_id=? AND is_current=1",
+            (epoch["epoch_id"],),
+        )
+    with pytest.raises(
+        ExternalWriteFenceError,
+        match="external_write_fence_epoch_not_current",
+    ):
+        provider_fence.revalidate_provider_write_claim(
+            claim,
+            operation="feishu_issue_comment",
+            issue_project_key="t03o4q",
+            issue_work_item_id="7041712812",
+        )
 
 
 def test_current_epoch_adapter_pending_terminal_without_w3_is_public(tmp_path):
@@ -1757,6 +2016,90 @@ def test_current_epoch_adapter_pending_terminal_without_w3_is_public(tmp_path):
     contract = json.loads(job["contract_json"])
     assert contract["diagnostic_code"] == "business_adapter_not_ready"
     assert "w3_execution_snapshot" not in contract
+
+
+@pytest.mark.parametrize(
+    "tamper_kind",
+    ("creation_rule_version", "resolution_project_key"),
+)
+def test_forged_profile_terminal_observation_is_silent_and_settled(
+    tmp_path,
+    tamper_kind,
+):
+    from tests.gateway.test_pnc_rca_control_store import (
+        _create_activation_epoch,
+        _profile_snapshot_policy,
+        _profile_snapshot_record,
+    )
+
+    control = RcaControlStore(tmp_path / "control.sqlite3")
+    epoch = _create_activation_epoch(control, start_offset=22)
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_activation_epochs SET state='steady_active' "
+            "WHERE epoch_id=? AND is_current=1",
+            (epoch["epoch_id"],),
+        )
+    result = control.ingest_record(
+        _profile_snapshot_record(22, "6841983153"),
+        policy=_profile_snapshot_policy(),
+        submit_enabled=True,
+        activation_required=True,
+        activation_slot_kind="kafka_success",
+    )
+    assert result.decision == "accepted"
+    claim = control.claim_outbox(
+        lease_owner="profile-terminal-forged-observation-test",
+        now=NOW,
+    )
+    assert claim is not None
+    control.quarantine_outbox(
+        outbox_id=claim.outbox_id,
+        lease_token=claim.lease_token,
+        error_code="business_profile_unsupported",
+        error_detail="forged profile observation must remain internal",
+        now=NOW + timedelta(seconds=1),
+    )
+    with sqlite3.connect(control.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT source_event_id, normalized_json FROM business_triggers "
+            "WHERE submission_key = ?",
+            (result.submission_key,),
+        ).fetchone()
+        normalized = json.loads(row["normalized_json"])
+        if tamper_kind == "creation_rule_version":
+            normalized["creation_rule_version"] = "forged-rule-v1"
+        else:
+            normalized["business_profile_resolution"]["project_key"] = (
+                "forged-project"
+            )
+        forged = json.dumps(
+            normalized,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        conn.execute(
+            "UPDATE business_triggers SET normalized_json = ? "
+            "WHERE submission_key = ?",
+            (forged, result.submission_key),
+        )
+        conn.execute(
+            "UPDATE kafka_inbox SET normalized_json = ? WHERE event_uid = ?",
+            (forged, row["source_event_id"]),
+        )
+
+    store = RcaDeliveryStore(control.db_path)
+    assert store.backfill_completed_submissions(
+        now=NOW + timedelta(seconds=2),
+        activation_required=True,
+    ) == 1
+    [watch] = store.list_rows("rca_execution_watch")
+    assert watch["state"] == "quarantined"
+    assert watch["last_error_code"] == "profile_terminal_binding_invalid"
+    assert store.list_rows("rca_delivery_jobs") == []
+    assert store.list_rows("rca_delivery_effects") == []
 
 
 def test_invalid_profile_terminal_binding_is_silent_and_settled(tmp_path):

@@ -1331,6 +1331,55 @@ def _seed_terminal(tmp_path, *, with_thread: bool = False):
     return store
 
 
+def _seed_profile_terminal(tmp_path):
+    """Materialize one current Kafka profile terminal without a W3 snapshot."""
+    from tests.gateway.test_pnc_rca_control_store import (
+        _create_activation_epoch,
+        _profile_snapshot_policy,
+        _profile_snapshot_record,
+    )
+
+    control = RcaControlStore(tmp_path / "control.sqlite3")
+    epoch = _create_activation_epoch(control, start_offset=20)
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_activation_epochs SET state='steady_active' "
+            "WHERE epoch_id=? AND is_current=1",
+            (epoch["epoch_id"],),
+        )
+    result = control.ingest_record(
+        _profile_snapshot_record(20, "6841983153"),
+        policy=_profile_snapshot_policy(),
+        submit_enabled=True,
+        activation_required=True,
+        activation_slot_kind="kafka_success",
+    )
+    assert result.decision == "accepted"
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute(
+            "UPDATE business_triggers SET created_at = ? WHERE submission_key = ?",
+            (NOW.isoformat(), result.submission_key),
+        )
+    outbox = control.claim_outbox(
+        lease_owner="profile-terminal-dispatcher-fixture",
+        now=NOW,
+    )
+    assert outbox is not None
+    control.quarantine_outbox(
+        outbox_id=outbox.outbox_id,
+        lease_token=outbox.lease_token,
+        error_code="business_profile_unsupported",
+        error_detail="official project option is not registered",
+        now=NOW + timedelta(seconds=1),
+    )
+    store = RcaDeliveryStore(control.db_path)
+    assert store.backfill_completed_submissions(
+        now=NOW + timedelta(seconds=2),
+        activation_required=True,
+    ) == 1
+    return store
+
+
 def _web_bundle_payload():
     _admission, contract, manifest, observed, dependencies = _bundle(
         include_web_assets=True
@@ -2955,6 +3004,7 @@ def test_profile_readiness_terminal_validates_with_explicit_detail(tmp_path):
         effect_key=readiness.effect_key,
         delivery_id=readiness.delivery_id,
         target_key=readiness.target_key,
+        issue_url="https://project.feishu.cn/t03o4q/issue/detail/7041712812",
         payload=readiness.effect_payload,
         payload_sha256=readiness.semantic_payload_sha256,
         artifact_set_id=readiness.outcome_key,
@@ -2967,7 +3017,40 @@ def test_profile_readiness_terminal_validates_with_explicit_detail(tmp_path):
 
     assert "ct_evaluator_217_20260722" not in validated.content
     assert "不能跨项目借用其他归因能力" in validated.content
-    assert validated.field_updates[0][1] == readiness.diagnostic_result
+    assert validated.field_updates == ()
+
+
+def test_current_profile_terminal_without_w3_dispatches_comment_only_with_scoped_claim(
+    tmp_path,
+    monkeypatch,
+):
+    store = _seed_profile_terminal(tmp_path)
+    captured_claims = []
+    original_builder = dispatcher_module.build_profile_terminal_provider_claim
+
+    def capture_claim(**kwargs):
+        claim = original_builder(**kwargs)
+        captured_claims.append(claim)
+        return claim
+
+    monkeypatch.setattr(
+        dispatcher_module,
+        "build_profile_terminal_provider_claim",
+        capture_claim,
+    )
+    dispatcher, remote, _clock = _dispatcher(tmp_path)
+
+    outcome = dispatcher.dispatch_one()
+
+    assert outcome.status == "succeeded"
+    assert remote.add_calls == 1
+    assert remote.update_field_calls == 0
+    assert len(captured_claims) == 1
+    claim_payload = captured_claims[0].payload()
+    assert claim_payload["authority_kind"] == "profile_terminal"
+    assert claim_payload["authority"]["operation"] == "feishu_issue_comment"
+    assert store.list_rows("rca_delivery_effects")[0]["status"] == "succeeded"
+    assert store.list_rows("rca_delivery_jobs")[0]["status"] == "delivered"
 
 
 def test_pre_submit_quarantine_keeps_specific_safe_diagnostic_only(tmp_path):

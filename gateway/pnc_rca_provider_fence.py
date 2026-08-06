@@ -26,6 +26,7 @@ PROVIDER_WRITE_CLAIM_SCHEMA_VERSION = "pnc_rca_provider_write_claim_v1"
 _MANUAL_KIND = "manual_admission"
 _WRITE_FENCE_KIND = "write_fence"
 _HISTORICAL_EPOCH_KIND = "historical_epoch"
+_PROFILE_TERMINAL_KIND = "profile_terminal"
 _CLAIM_FIELDS = frozenset({"schema_version", "authority_kind", "authority"})
 _MANUAL_FIELDS = frozenset({"admission", "source_identity"})
 _WRITE_FENCE_FIELDS = frozenset({"write_fence"})
@@ -41,6 +42,23 @@ _HISTORICAL_EPOCH_FIELDS = frozenset(
         "chat_id",
         "thread_id",
         "submission_key",
+    }
+)
+_PROFILE_TERMINAL_FIELDS = frozenset(
+    {
+        "epoch_id",
+        "activation_ledger_id",
+        "effect_key",
+        "delivery_id",
+        "lease_token",
+        "lease_fence",
+        "operation",
+        "issue_target",
+        "target_key",
+        "business_key",
+        "submission_key",
+        "generation",
+        "source_error_code",
     }
 )
 _HISTORICAL_ALLOWED_OPERATIONS = frozenset(
@@ -110,6 +128,11 @@ class RcaProviderWriteClaim:
                 )
         elif kind == _HISTORICAL_EPOCH_KIND:
             if set(authority) != _HISTORICAL_EPOCH_FIELDS:
+                raise ExternalWriteFenceError(
+                    "external_write_provider_claim_schema_invalid"
+                )
+        elif kind == _PROFILE_TERMINAL_KIND:
+            if set(authority) != _PROFILE_TERMINAL_FIELDS:
                 raise ExternalWriteFenceError(
                     "external_write_provider_claim_schema_invalid"
                 )
@@ -257,6 +280,42 @@ def build_historical_epoch_provider_claim(
     )
 
 
+def build_profile_terminal_provider_claim(
+    *,
+    epoch_id: str,
+    activation_ledger_id: int,
+    effect_key: str,
+    delivery_id: str,
+    lease_token: str,
+    lease_fence: int,
+    issue_target: str,
+    target_key: str,
+    business_key: str,
+    submission_key: str,
+    generation: int,
+    source_error_code: str,
+) -> RcaProviderWriteClaim:
+    """Bind one current Kafka profile terminal to one issue-comment lease."""
+    return _claim(
+        _PROFILE_TERMINAL_KIND,
+        {
+            "epoch_id": str(epoch_id or "").strip(),
+            "activation_ledger_id": activation_ledger_id,
+            "effect_key": str(effect_key or "").strip(),
+            "delivery_id": str(delivery_id or "").strip(),
+            "lease_token": str(lease_token or "").strip(),
+            "lease_fence": lease_fence,
+            "operation": "feishu_issue_comment",
+            "issue_target": str(issue_target or "").strip(),
+            "target_key": str(target_key or "").strip(),
+            "business_key": str(business_key or "").strip(),
+            "submission_key": str(submission_key or "").strip(),
+            "generation": generation,
+            "source_error_code": str(source_error_code or "").strip(),
+        },
+    )
+
+
 def _canonical_store():
     from gateway.pnc_rca_control_store import RcaControlStore
     from gateway.run import _g1q3_rca_control_db_path
@@ -365,6 +424,70 @@ def _historical_effect_binding(
     return {**dict(row), "payload": dict(payload)}
 
 
+def _profile_terminal_effect_binding(
+    store: Any,
+    authority: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Reopen current delivery/source lineage for a profile-terminal claim."""
+    from gateway.pnc_rca_delivery_store import RcaDeliveryStore
+
+    try:
+        delivery_store = RcaDeliveryStore(
+            store.db_path,
+            require_current=True,
+            read_only=True,
+            ensure_current_rows=False,
+        )
+        live = delivery_store.validate_profile_terminal_external_write_binding(
+            effect_key=authority.get("effect_key"),
+            delivery_id=authority.get("delivery_id"),
+            lease_token=authority.get("lease_token"),
+            lease_fence=authority.get("lease_fence"),
+            operation=authority.get("operation"),
+            issue_url=authority.get("issue_target"),
+            target_key=authority.get("target_key"),
+            business_key=authority.get("business_key"),
+            submission_key=authority.get("submission_key"),
+            generation=authority.get("generation"),
+            require_write_started=True,
+        )
+    except RuntimeError as exc:
+        code = str(exc)
+        if code not in {
+            "external_write_fence_schema_invalid",
+            "external_write_fence_epoch_not_current",
+            "external_write_fence_operation_denied",
+            "external_write_fence_identity_mismatch",
+            "external_write_fence_target_mismatch",
+        }:
+            code = "external_write_fence_epoch_not_current"
+        raise ExternalWriteFenceError(code, str(exc)) from exc
+    expected_identity = {
+        "epoch_id": live["epoch_id"],
+        "activation_ledger_id": live["activation_ledger_id"],
+        "effect_key": live["effect_key"],
+        "delivery_id": live["delivery_id"],
+        "lease_token": live["lease_token"],
+        "lease_fence": live["lease_fence"],
+        "operation": live["operation"],
+        "issue_target": live["issue_url"],
+        "target_key": live["target_key"],
+        "business_key": live["business_key"],
+        "submission_key": live["submission_key"],
+        "generation": live["generation"],
+        "source_error_code": live["source_error_code"],
+    }
+    if dict(authority) != expected_identity:
+        if authority.get("epoch_id") != live["epoch_id"]:
+            raise ExternalWriteFenceError("external_write_fence_epoch_not_current")
+        if authority.get("operation") != "feishu_issue_comment":
+            raise ExternalWriteFenceError("external_write_fence_operation_denied")
+        if authority.get("issue_target") != live["issue_url"]:
+            raise ExternalWriteFenceError("external_write_fence_target_mismatch")
+        raise ExternalWriteFenceError("external_write_fence_identity_mismatch")
+    return live
+
+
 def revalidate_provider_write_claim(
     claim: RcaProviderWriteClaim,
     *,
@@ -445,6 +568,20 @@ def revalidate_provider_write_claim(
                 )
         else:
             raise ExternalWriteFenceError("external_write_fence_operation_denied")
+        return {"authority_kind": kind, **dict(live)}
+
+    if kind == _PROFILE_TERMINAL_KIND:
+        if op != "feishu_issue_comment" or authority.get("operation") != op:
+            raise ExternalWriteFenceError("external_write_fence_operation_denied")
+        live = _profile_terminal_effect_binding(store, authority)
+        expected_project, expected_work_item = _issue_identity(live["issue_url"])
+        if (
+            not expected_project
+            or not expected_work_item
+            or observed_work_item != expected_work_item
+            or (observed_project and observed_project != expected_project)
+        ):
+            raise ExternalWriteFenceError("external_write_fence_target_mismatch")
         return {"authority_kind": kind, **dict(live)}
 
     if kind == _HISTORICAL_EPOCH_KIND:
@@ -595,6 +732,7 @@ __all__ = [
     "bound_provider_write_claim",
     "build_manual_provider_write_claim",
     "build_historical_epoch_provider_claim",
+    "build_profile_terminal_provider_claim",
     "build_write_fence_provider_claim",
     "current_provider_write_claim",
     "require_provider_write_claim",

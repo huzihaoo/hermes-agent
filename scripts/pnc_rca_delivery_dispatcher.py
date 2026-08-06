@@ -88,6 +88,7 @@ from gateway.pnc_rca_provider_fence import (
     bound_provider_write_claim,
     build_manual_provider_write_claim,
     build_historical_epoch_provider_claim,
+    build_profile_terminal_provider_claim,
     build_write_fence_provider_claim,
     current_provider_write_claim,
     revalidate_provider_write_claim,
@@ -95,6 +96,7 @@ from gateway.pnc_rca_provider_fence import (
 from gateway.pnc_rca_delivery_store import (
     DELIVERY_CIRCUIT_RESET_META_PREFIX,
     DELIVERY_CIRCUIT_RESET_SCHEMA_VERSION,
+    OUTBOX_PROFILE_TERMINAL_WRITE_ERROR_CODES,
     PRE_W3_EFFECT_DISPOSITION_COMMAND,
     PRE_W3_EFFECT_DISPOSITION_META_PREFIX,
     PRE_W3_EFFECT_DISPOSITION_SCHEMA_VERSION,
@@ -3445,10 +3447,16 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
 def _validate_terminal_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
     if claim.outcome not in TERMINAL_DELIVERY_OUTCOMES:
         raise DeliveryContractError("terminal_delivery_outcome_invalid")
+    profile_terminal_public_target = (
+        claim.effect_kind == DELIVERY_EFFECT_KIND
+        and claim.terminal_error_code
+        in OUTBOX_PROFILE_TERMINAL_WRITE_ERROR_CODES
+        and "w3_execution_snapshot" not in claim.contract
+    )
     if (
         claim.artifact_set_id != claim.outcome_key
         or not re.fullmatch(r"g1q3-rca-terminal-v1-[0-9a-f]{64}", claim.outcome_key)
-        or claim.issue_url
+        or (claim.issue_url and not profile_terminal_public_target)
         or claim.report_url
         or claim.manifest != {}
         or claim.artifacts != []
@@ -3487,6 +3495,16 @@ def _validate_terminal_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         ),
         schema_version=schema_version,
     )
+    if profile_terminal_public_target:
+        expected_issue_url = (
+            f"https://project.feishu.cn/{claim.project_key}/issue/detail/"
+            f"{claim.work_item_id}"
+        )
+        if (
+            not claim.issue_url
+            or claim.issue_url.rstrip("/") != expected_issue_url.rstrip("/")
+        ):
+            raise DeliveryContractError("delivery_issue_url_identity_mismatch")
     if claim.contract != primary.contract:
         raise DeliveryContractError("terminal_delivery_diagnostic_contract_invalid")
     if claim.effect_kind == DELIVERY_EFFECT_KIND:
@@ -3574,10 +3592,20 @@ def _validate_terminal_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         if payload.get("idempotency_uuid") != expected_uuid:
             raise DeliveryContractError("delivery_effect_idempotency_invalid")
     field_updates: tuple[tuple[str, str], ...] = ()
-    if claim.effect_kind == DELIVERY_EFFECT_KIND and schema_version in {
+    profile_terminal_comment_only = (
+        claim.effect_kind == DELIVERY_EFFECT_KIND
+        and claim.terminal_error_code
+        in OUTBOX_PROFILE_TERMINAL_WRITE_ERROR_CODES
+        and "w3_execution_snapshot" not in claim.contract
+    )
+    if (
+        claim.effect_kind == DELIVERY_EFFECT_KIND
+        and not profile_terminal_comment_only
+        and schema_version in {
         TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
         TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
-    }:
+        }
+    ):
         field_updates = (
             (
                 RCA_RESULT_FIELD_KEY,
@@ -4451,6 +4479,13 @@ class DeliveryDispatcher:
                         raise
                     if str(exc) != "manual_external_write_source_not_manual":
                         raise ExternalWriteFenceError(str(exc)) from exc
+            profile_terminal = self._profile_terminal_external_write_binding(
+                claim,
+                operation=operation,
+                require_write_started=False,
+            )
+            if profile_terminal is not None:
+                return profile_terminal
             if claim.effect_kind == DELIVERY_CARD_PATCH_EFFECT_KIND:
                 raise ExternalWriteFenceError("external_write_fence_missing")
             if self.store.is_historical_external_write_effect(claim.effect_created_at):
@@ -4529,6 +4564,8 @@ class DeliveryDispatcher:
     def _manual_provider_write_claim(
         self, claim: DeliveryEffectClaim
     ) -> ProviderWriteClaim | None:
+        if not hasattr(self, "config"):
+            return None
         control_store = RcaControlStore(
             self.config.control_db_path,
             require_current=True,
@@ -4546,6 +4583,48 @@ class DeliveryDispatcher:
         return build_manual_provider_write_claim(
             binding["admission"], binding["source_identity"]
         )
+
+    def _profile_terminal_external_write_binding(
+        self,
+        claim: DeliveryEffectClaim,
+        *,
+        operation: str,
+        require_write_started: bool,
+    ) -> dict[str, Any] | None:
+        terminal_error_code = str(
+            getattr(claim, "terminal_error_code", "") or ""
+        ).strip()
+        if (
+            claim.effect_kind != DELIVERY_EFFECT_KIND
+            or terminal_error_code not in OUTBOX_PROFILE_TERMINAL_WRITE_ERROR_CODES
+        ):
+            return None
+        try:
+            return self.store.validate_profile_terminal_external_write_binding(
+                effect_key=claim.effect_key,
+                delivery_id=claim.delivery_id,
+                lease_token=claim.lease_token,
+                lease_fence=claim.fence,
+                operation=operation,
+                issue_url=claim.issue_url,
+                target_key=claim.target_key,
+                business_key=claim.business_key,
+                submission_key=claim.submission_key,
+                generation=claim.generation,
+                require_write_started=require_write_started,
+                now=self.now(),
+            )
+        except RuntimeError as exc:
+            code = str(exc)
+            if code not in {
+                "external_write_fence_schema_invalid",
+                "external_write_fence_epoch_not_current",
+                "external_write_fence_operation_denied",
+                "external_write_fence_identity_mismatch",
+                "external_write_fence_target_mismatch",
+            }:
+                code = "external_write_fence_identity_mismatch"
+            raise ExternalWriteFenceError(code, str(exc)) from exc
 
     def _validate_historical_external_write_epoch(
         self, claim: DeliveryEffectClaim
@@ -4576,6 +4655,26 @@ class DeliveryDispatcher:
             manual_claim = self._manual_provider_write_claim(claim)
             if manual_claim is not None:
                 return manual_claim
+        profile_terminal = self._profile_terminal_external_write_binding(
+            claim,
+            operation="feishu_issue_comment",
+            require_write_started=True,
+        )
+        if profile_terminal is not None:
+            return build_profile_terminal_provider_claim(
+                epoch_id=profile_terminal["epoch_id"],
+                activation_ledger_id=profile_terminal["activation_ledger_id"],
+                effect_key=profile_terminal["effect_key"],
+                delivery_id=profile_terminal["delivery_id"],
+                lease_token=profile_terminal["lease_token"],
+                lease_fence=profile_terminal["lease_fence"],
+                issue_target=profile_terminal["issue_url"],
+                target_key=profile_terminal["target_key"],
+                business_key=profile_terminal["business_key"],
+                submission_key=profile_terminal["submission_key"],
+                generation=profile_terminal["generation"],
+                source_error_code=profile_terminal["source_error_code"],
+            )
         if claim.effect_kind == DELIVERY_CARD_PATCH_EFFECT_KIND:
             raise ExternalWriteFenceError("external_write_fence_missing")
         epoch = self._validate_historical_external_write_epoch(claim)

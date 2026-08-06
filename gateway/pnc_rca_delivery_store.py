@@ -39,6 +39,7 @@ from gateway.pnc_rca_delivery_quarantine_baseline import (
 from gateway.pnc_rca_delivery_observability import validate_delivery_observation
 from gateway.pnc_rca_control_store import (
     OUTBOX_CIRCUIT_RESET_SCHEMA_VERSION,
+    RcaControlStore,
     _validate_dispatcher_circuit_reset_audit,
 )
 from gateway.pnc_rca_conclusion_adjudication import (
@@ -121,11 +122,14 @@ OUTBOX_MANUAL_ACTIVATION_BINDING_INVALID_CODE = "manual_activation_binding_inval
 OUTBOX_PROFILE_TERMINAL_BINDING_INVALID_CODE = (
     "profile_terminal_binding_invalid"
 )
-OUTBOX_PUBLIC_PROFILE_ERROR_CODES = frozenset({
-    "business_profile_unresolved",
+OUTBOX_PROFILE_TERMINAL_WRITE_ERROR_CODES = frozenset({
     "business_profile_unsupported",
     "business_profile_conflict",
     "business_profile_adapter_not_ready",
+})
+OUTBOX_PUBLIC_PROFILE_ERROR_CODES = frozenset({
+    "business_profile_unresolved",
+    *OUTBOX_PROFILE_TERMINAL_WRITE_ERROR_CODES,
 })
 DELIVERY_WATCH_SLA_SECONDS = 86_400
 PERMANENT_FAILURE_CIRCUIT_THRESHOLD = 2
@@ -1482,6 +1486,223 @@ class RcaDeliveryStore:
             "generation": int(row["generation"]),
             **targets,
         }
+
+    def validate_profile_terminal_external_write_binding(
+        self,
+        *,
+        effect_key: str,
+        delivery_id: str,
+        lease_token: str,
+        lease_fence: int,
+        operation: str,
+        issue_url: str,
+        target_key: str,
+        business_key: str,
+        submission_key: str,
+        generation: int,
+        require_write_started: bool,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Reopen the exact Kafka profile-terminal lease for one issue comment."""
+        text_values = (
+            effect_key,
+            delivery_id,
+            lease_token,
+            issue_url,
+            target_key,
+            business_key,
+            submission_key,
+        )
+        if (
+            not all(isinstance(value, str) and value.strip() for value in text_values)
+            or isinstance(lease_fence, bool)
+            or not isinstance(lease_fence, int)
+            or lease_fence < 1
+            or isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+            or not isinstance(require_write_started, bool)
+        ):
+            raise RuntimeError("external_write_fence_schema_invalid")
+        if operation != "feishu_issue_comment":
+            raise RuntimeError("external_write_fence_operation_denied")
+        current = _utc_datetime(now)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            row = conn.execute(
+                """
+                SELECT outbox.*,
+                       effect.effect_key AS delivery_effect_key,
+                       effect.delivery_id AS effect_delivery_id,
+                       effect.effect_kind AS delivery_effect_kind,
+                       effect.required AS delivery_effect_required,
+                       effect.target_key AS delivery_effect_target_key,
+                       effect.outcome AS delivery_effect_outcome,
+                       effect.status AS delivery_effect_status,
+                       effect.write_phase AS delivery_effect_write_phase,
+                       effect.lease_token AS delivery_effect_lease_token,
+                       effect.lease_expires_at AS delivery_effect_lease_expires_at,
+                       effect.fence AS delivery_effect_fence,
+                       job.issue_url AS delivery_issue_url,
+                       job.outcome AS delivery_job_outcome,
+                       job.terminal_state AS delivery_job_terminal_state,
+                       job.terminal_error_code AS delivery_job_terminal_error_code,
+                       job.business_key AS delivery_job_business_key,
+                       job.submission_key AS delivery_job_submission_key,
+                       job.generation AS delivery_job_generation,
+                       job.contract_json AS delivery_job_contract_json,
+                       watch.state AS delivery_watch_state,
+                       trigger.project_key AS project_key,
+                       trigger.work_item_type_key AS work_item_type_key,
+                       trigger.work_item_id AS work_item_id,
+                       trigger.normalized_json AS trigger_normalized_json,
+                       source.source_id AS kafka_origin_source_id,
+                       source.source_dedupe_key AS kafka_source_dedupe_key,
+                       source.kafka_event_uid AS kafka_event_uid,
+                       source.mode AS kafka_source_mode,
+                       source.payload_sha256 AS kafka_source_payload_sha256,
+                       outbox.origin_source_id AS outbox_origin_source_id,
+                       outbox.source_event_id AS outbox_source_event_id,
+                       outbox.source_topic AS outbox_source_topic,
+                       outbox.source_partition AS outbox_source_partition,
+                       outbox.source_offset AS outbox_source_offset,
+                       outbox.payload_json AS outbox_payload_json,
+                       inbox.normalized_json AS inbox_normalized_json,
+                       inbox.raw_sha256 AS inbox_raw_sha256
+                  FROM rca_delivery_effects AS effect
+                  JOIN rca_delivery_jobs AS job
+                    ON job.delivery_id = effect.delivery_id
+                  JOIN rca_execution_watch AS watch
+                    ON watch.delivery_id = job.delivery_id
+                   AND watch.submission_key = job.submission_key
+                  JOIN rca_outbox AS outbox
+                    ON outbox.outbox_id = watch.submission_outbox_id
+                   AND outbox.business_key = job.business_key
+                   AND outbox.submission_key = job.submission_key
+                   AND outbox.generation = job.generation
+                  JOIN business_triggers AS trigger
+                    ON trigger.business_key = outbox.business_key
+                   AND trigger.generation = outbox.generation
+                  JOIN rca_trigger_sources AS source
+                    ON source.source_id = trigger.origin_source_id
+                  JOIN kafka_inbox AS inbox
+                    ON inbox.event_uid = outbox.source_event_id
+                 WHERE effect.effect_key = ?
+                   AND effect.delivery_id = ?
+                   AND effect.lease_token = ?
+                   AND effect.fence = ?
+                   AND effect.status = 'claimed'
+                """,
+                (effect_key, delivery_id, lease_token, lease_fence),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("external_write_fence_operation_denied")
+            try:
+                lease_expires_at = _parse_iso(
+                    str(row["delivery_effect_lease_expires_at"] or "")
+                )
+                contract = _json_object(row["delivery_job_contract_json"])
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError("external_write_fence_schema_invalid") from exc
+            write_phase = str(row["delivery_effect_write_phase"] or "")
+            if (
+                lease_expires_at <= current
+                or write_phase not in {"prewrite", "write_started"}
+                or (require_write_started and write_phase != "write_started")
+            ):
+                raise RuntimeError("external_write_fence_operation_denied")
+            epoch = conn.execute(
+                "SELECT state, is_current FROM rca_activation_epochs "
+                "WHERE epoch_id = ?",
+                (str(row["activation_epoch_id"] or ""),),
+            ).fetchone()
+            if (
+                epoch is None
+                or int(epoch["is_current"] or 0) != 1
+                or str(epoch["state"] or "") not in ACTIVATION_DELIVERY_STATES
+            ):
+                raise RuntimeError("external_write_fence_epoch_not_current")
+            is_profile_terminal, observed_issue_url, source_error_code = (
+                self._stored_profile_terminal_issue_target_for_quarantined_outbox_tx(
+                    conn,
+                    row=row,
+                )
+            )
+            if not RcaControlStore._kafka_generation_contract_valid(row):
+                raise RuntimeError("external_write_fence_identity_mismatch")
+            if not RcaControlStore._business_profile_observation_sha256(
+                row["trigger_normalized_json"]
+            ):
+                raise RuntimeError("external_write_fence_identity_mismatch")
+            if (
+                str(row["trigger_normalized_json"] or "")
+                != str(row["inbox_normalized_json"] or "")
+                or str(row["kafka_source_payload_sha256"] or "")
+                != str(row["inbox_raw_sha256"] or "")
+            ):
+                raise RuntimeError("external_write_fence_identity_mismatch")
+            activation_ledger_id = row["activation_ledger_id"]
+            if (
+                not is_profile_terminal
+                or not observed_issue_url
+                or source_error_code not in OUTBOX_PROFILE_TERMINAL_WRITE_ERROR_CODES
+                or isinstance(activation_ledger_id, bool)
+                or not isinstance(activation_ledger_id, int)
+                or activation_ledger_id < 1
+                or str(row["delivery_effect_key"] or "") != effect_key
+                or str(row["effect_delivery_id"] or "") != delivery_id
+                or str(row["delivery_effect_kind"] or "")
+                != "feishu_issue_comment"
+                or int(row["delivery_effect_required"] or 0) != 1
+                or str(row["delivery_effect_target_key"] or "") != target_key
+                or str(row["delivery_effect_outcome"] or "") != "quarantined"
+                or str(row["delivery_effect_status"] or "") != "claimed"
+                or str(row["delivery_effect_lease_token"] or "") != lease_token
+                or int(row["delivery_effect_fence"] or 0) != lease_fence
+                or str(row["delivery_job_outcome"] or "") != "quarantined"
+                or str(row["delivery_job_terminal_state"] or "")
+                != OUTBOX_QUARANTINED_TERMINAL_STATE
+                or str(row["delivery_job_terminal_error_code"] or "")
+                != source_error_code
+                or str(row["delivery_job_business_key"] or "") != business_key
+                or str(row["delivery_job_submission_key"] or "")
+                != submission_key
+                or int(row["delivery_job_generation"] or 0) != generation
+                or str(row["delivery_watch_state"] or "") != "delivery_created"
+                or str(row["status"] or "") != "quarantined"
+                or str(row["business_key"] or "") != business_key
+                or str(row["submission_key"] or "") != submission_key
+                or int(row["generation"] or 0) != generation
+                or "w3_execution_snapshot" in contract
+            ):
+                raise RuntimeError("external_write_fence_identity_mismatch")
+            if (
+                str(row["delivery_issue_url"] or "").rstrip("/")
+                != issue_url.rstrip("/")
+                or observed_issue_url.rstrip("/") != issue_url.rstrip("/")
+            ):
+                raise RuntimeError("external_write_fence_target_mismatch")
+            return {
+                "epoch_id": str(row["activation_epoch_id"]),
+                "activation_ledger_id": activation_ledger_id,
+                "effect_key": effect_key,
+                "delivery_id": delivery_id,
+                "lease_token": lease_token,
+                "lease_fence": lease_fence,
+                "operation": "feishu_issue_comment",
+                "issue_url": observed_issue_url,
+                "target_key": target_key,
+                "business_key": business_key,
+                "submission_key": submission_key,
+                "generation": generation,
+                "source_error_code": source_error_code,
+                "write_phase": write_phase,
+            }
+        finally:
+            if conn.in_transaction:
+                conn.rollback()
+            conn.close()
 
     def is_historical_external_write_effect(self, created_at: str) -> bool:
         """Grandfather only effects predating the durable W5 rollout marker."""
@@ -4131,16 +4352,14 @@ class RcaDeliveryStore:
         exception bound to the exact current activation admission.
         """
         source_error = str(row["last_error_code"] or "").strip()
-        if source_error not in {
-            "business_profile_unsupported",
-            "business_profile_conflict",
-            "business_profile_adapter_not_ready",
-        }:
+        if source_error not in OUTBOX_PROFILE_TERMINAL_WRITE_ERROR_CODES:
             return False, "", ""
         source = conn.execute(
             """
             SELECT source.source_id, source.source_kind, source.kafka_event_uid,
-                   source.mode, trigger.normalized_json,
+                   source.mode, source.payload_sha256,
+                   trigger.normalized_json, inbox.normalized_json AS inbox_normalized_json,
+                   inbox.raw_sha256 AS inbox_raw_sha256,
                    trigger.activation_epoch_id AS trigger_epoch_id,
                    trigger.activation_ledger_id AS trigger_ledger_id,
                    binding.business_key AS binding_business_key,
@@ -4157,6 +4376,8 @@ class RcaDeliveryStore:
                AND trigger.generation = outbox.generation
               JOIN rca_trigger_sources AS source
                 ON source.source_id = trigger.origin_source_id
+              JOIN kafka_inbox AS inbox
+                ON inbox.event_uid = outbox.source_event_id
               JOIN rca_trigger_bindings AS binding
                 ON binding.source_id = source.source_id
                AND binding.business_key = trigger.business_key
@@ -4218,9 +4439,19 @@ class RcaDeliveryStore:
             if (
                 normalized.get("schema_version")
                 != "pnc_rca_workflow_event_v1"
+                or str(normalized.get("creation_rule_version") or "")
+                != str(row["creation_rule_version"] or "")
                 or normalized.get("business_profile_observed") is not True
                 or resolution.get("routing_field_key") != "field_052f23"
                 or resolution.get("registry_version") != "rca_business_profiles_v1"
+                or str(resolution.get("project_key") or "")
+                != str(normalized.get("project_key") or "")
+                or str(resolution.get("work_item_type_key") or "")
+                != str(normalized.get("work_item_type_key") or "")
+                or str(resolution.get("project_key") or "")
+                != str(row["project_key"] or "")
+                or str(resolution.get("work_item_type_key") or "")
+                != str(row["work_item_type_key"] or "")
                 or str(normalized.get("project_key") or "")
                 != str(row["project_key"] or "")
                 or str(normalized.get("work_item_type_key") or "")
@@ -4230,10 +4461,21 @@ class RcaDeliveryStore:
                 or issue_url.rstrip("/") != expected_issue_url.rstrip("/")
                 or str(source["source_kind"] or "")
                 != "kafka_workflow_event"
+                or str(source["payload_sha256"] or "")
+                != str(source["inbox_raw_sha256"] or "")
+                or str(source["normalized_json"] or "")
+                != str(source["inbox_normalized_json"] or "")
                 or str(source["source_id"] or "")
                 != str(row["origin_source_id"] or "")
-                or str(source["kafka_event_uid"] or "")
-                != str(row["source_event_id"] or "")
+                or (
+                    int(row["generation"]) == 1
+                    and str(source["kafka_event_uid"] or "")
+                    != str(row["source_event_id"] or "")
+                )
+                or (
+                    int(row["generation"]) >= 2
+                    and str(source["kafka_event_uid"] or "")
+                )
                 or str(source["mode"] or "")
                 != ("issue_created" if int(row["generation"]) == 1 else "kafka_retrigger")
                 or str(source["trigger_epoch_id"] or "")
@@ -4497,7 +4739,8 @@ class RcaDeliveryStore:
                        o.origin_source_id, o.source_event_id,
                        o.status AS outbox_status, o.created_at AS outbox_created_at,
                        o.quarantined_at, o.last_error_code, o.last_error_detail,
-                       t.project_key, t.work_item_type_key, t.work_item_id
+                       t.creation_rule_version, t.project_key,
+                       t.work_item_type_key, t.work_item_id
                   FROM rca_outbox AS o
                   JOIN business_triggers AS t
                     ON t.business_key = o.business_key
