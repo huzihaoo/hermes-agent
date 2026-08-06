@@ -34,10 +34,15 @@ from gateway.pnc_rca_delivery_store import (
     OUTBOX_QUARANTINED_PUBLIC_ERROR_CODE,
     OUTBOX_QUARANTINED_TERMINAL_STATE,
     PERMANENT_FAILURE_CIRCUIT_THRESHOLD,
+    PRE_W3_EFFECT_DISPOSITION_COMMAND,
+    PRE_W3_EFFECT_DISPOSITION_SCHEMA_VERSION,
     DeliveryRecordConflictError,
     RcaDeliveryStore,
     StaleDeliveryEffectLeaseError,
     StaleDeliveryWatchLeaseError,
+    _pre_w3_disposition_sha256,
+    _pre_w3_effect_disposition_after,
+    _pre_w3_effect_disposition_fingerprint,
 )
 from gateway.pnc_rca_kafka_contract import WorkflowEventPolicy, WorkflowTransition
 from scripts.pnc_foxglove_delivery import canonical_viz_mcap_path, foxglove_url
@@ -1667,6 +1672,268 @@ def test_current_epoch_w3_validator_runtime_error_rolls_back_backfill(
     assert backpressure.untracked_completed_submissions == 1
     assert backpressure.unresolved_effects == 0
     assert backpressure.unresolved_work == 1
+
+
+def _legacy_pre_w3_pending_effects(tmp_path, *, count=2):
+    results = []
+    control = None
+    for index in range(count):
+        control, result = _control(
+            tmp_path,
+            completed=False,
+            offset=40 + index,
+            issue_id=7041712900 + index,
+        )
+        _quarantine_submission(control)
+        results.append(result)
+    assert control is not None
+    store = RcaDeliveryStore(control.db_path)
+    assert store.backfill_completed_submissions(now=NOW + timedelta(seconds=2)) == count
+    for result in results:
+        _bind_activation_execution(control, result, state="steady_active")
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_activation_epochs SET production_fingerprint = ?, "
+            "production_gate_receipt_sha256 = ? WHERE is_current = 1",
+            ("2" * 64, "3" * 64),
+        )
+    store.open_delivery_dispatcher_circuit(
+        reason_code="delivery_permanent_failure_streak_exceeded",
+        reason_detail="pre-W3 fixture circuit",
+        now=NOW + timedelta(seconds=3),
+    )
+    keys = sorted(
+        row["effect_key"] for row in store.list_rows("rca_delivery_effects")
+    )
+    assert len(keys) == count
+    return control, store, keys
+
+
+def _pre_w3_disposition_audit(store, snapshot, tmp_path, *, now):
+    observed = store.db_path.absolute().lstat()
+    receipt_path = (tmp_path / "pre-w3-disposition.json").absolute()
+    parent = receipt_path.parent.lstat()
+    tool_provenance = {
+        "entrypoint_path": str((tmp_path / "dispatcher.py").absolute()),
+        "entrypoint_sha256": "a" * 64,
+        "delivery_store_path": str((tmp_path / "delivery-store.py").absolute()),
+        "delivery_store_sha256": "b" * 64,
+        "receipt_helper_path": str((tmp_path / "receipt-helper.py").absolute()),
+        "receipt_helper_sha256": "c" * 64,
+        "control_store_path": str((tmp_path / "control-store.py").absolute()),
+        "control_store_sha256": "d" * 64,
+        "bootstrap_path": str((tmp_path / "bootstrap.py").absolute()),
+        "bootstrap_sha256": "e" * 64,
+    }
+    plan_id = _pre_w3_disposition_sha256({
+        "before": snapshot["snapshot_sha256"],
+        "destination": str(receipt_path),
+    })
+    disposition_id = _pre_w3_disposition_sha256({
+        "plan_id": plan_id,
+        "recorded_at": now.isoformat(),
+    })
+    after = _pre_w3_effect_disposition_after(
+        snapshot,
+        disposition_id=disposition_id,
+        recorded_at=now.isoformat(),
+    )
+    count = len(snapshot["effect_keys"])
+    audit = {
+        "schema_version": PRE_W3_EFFECT_DISPOSITION_SCHEMA_VERSION,
+        "command": PRE_W3_EFFECT_DISPOSITION_COMMAND,
+        "disposition_id": disposition_id,
+        "plan_id": plan_id,
+        "recorded_at": now.isoformat(),
+        "operator": "test-operator",
+        "reason": "dispose exact pre-W3 effects without provider calls",
+        "effect_kind": DELIVERY_EFFECT_KIND,
+        "effect_keys": snapshot["effect_keys"],
+        "effect_set_sha256": snapshot["effect_set_sha256"],
+        "before_snapshot_sha256": snapshot["snapshot_sha256"],
+        "control_db_identity": {
+            "path": str(store.db_path.absolute()),
+            "device": int(observed.st_dev),
+            "inode": int(observed.st_ino),
+            "size": int(observed.st_size),
+            "mtime_ns": int(observed.st_mtime_ns),
+        },
+        "destination_binding": {
+            "path_sha256": hashlib.sha256(
+                str(receipt_path).encode("utf-8")
+            ).hexdigest(),
+            "parent_device": int(parent.st_dev),
+            "parent_inode": int(parent.st_ino),
+        },
+        "backup_binding": {
+            "path": str((tmp_path / "control.before.sqlite3").absolute()),
+            "sha256": "4" * 64,
+            "size_bytes": 4096,
+        },
+        "active_release_binding": {
+            "path": str((tmp_path / "active-release-binding.json").absolute()),
+            "sha256": "5" * 64,
+            "release_id": "rca-test-release",
+            "bootstrap_epoch_id": "rca-bootstrap-test",
+            "candidate_env_sha256": "6" * 64,
+            "live_env_sha256": "7" * 64,
+            "live_env_matches_candidate": False,
+        },
+        "config_binding_sha256": "8" * 64,
+        "tool_provenance": tool_provenance,
+        "tool_provenance_sha256": _pre_w3_disposition_sha256(tool_provenance),
+        "before": snapshot,
+        "after": after,
+        "effect_delta": {
+            "external_effects_triggered": False,
+            "provider_calls": 0,
+            "control_meta_inserted": 1,
+            "attempt_audits_inserted": count,
+            "effects_updated": count,
+            "jobs_updated": count,
+            "quarantine_audits_inserted": 2 * count,
+            "total_database_rows": 1 + (5 * count),
+        },
+        "external_writes_performed": False,
+        "provider_calls_performed": 0,
+    }
+    audit["receipt_fingerprint"] = _pre_w3_effect_disposition_fingerprint(audit)
+    return audit
+
+
+def test_exact_pre_w3_disposition_is_audited_atomic_and_idempotent(tmp_path):
+    _control_store, store, keys = _legacy_pre_w3_pending_effects(tmp_path)
+    circuit_before = store.delivery_dispatcher_circuit_reset_state()
+    snapshot = store.pre_w3_effect_disposition_snapshot(effect_keys=reversed(keys))
+    audit = _pre_w3_disposition_audit(
+        store,
+        snapshot,
+        tmp_path,
+        now=NOW + timedelta(seconds=4),
+    )
+
+    applied_audit, applied = store.quarantine_pre_w3_effects_with_audit(
+        audit=audit,
+        now=NOW + timedelta(seconds=4),
+    )
+
+    assert applied is True
+    assert applied_audit == audit
+    effects = store.list_rows("rca_delivery_effects")
+    assert [row["effect_key"] for row in effects] != []
+    assert {row["status"] for row in effects} == {"quarantined"}
+    assert {row["write_phase"] for row in effects} == {"settled"}
+    assert {row["attempt"] for row in effects} == {0}
+    assert {row["fence"] for row in effects} == {0}
+    assert all(row["remote_receipt_json"] is None for row in effects)
+    assert {row["status"] for row in store.list_rows("rca_delivery_jobs")} == {
+        "quarantined"
+    }
+    attempts = store.list_rows("rca_delivery_attempts")
+    assert len(attempts) == len(keys)
+    assert {row["outcome"] for row in attempts} == {"quarantined"}
+    assert all(row["request_id"].startswith("pre-w3-disposition:") for row in attempts)
+    assert not any(row["outcome"] == "started" for row in attempts)
+    assert store.delivery_dispatcher_circuit_reset_state() == circuit_before
+    assert store.pre_w3_effect_disposition_audit(audit["disposition_id"]) == audit
+    with sqlite3.connect(store.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        quarantine_audit = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM rca_delivery_quarantine_mutation_audit "
+                "ORDER BY audit_id"
+            ).fetchall()
+        ]
+    assert len(quarantine_audit) == 2 * len(keys)
+    assert {row["entity_kind"] for row in quarantine_audit} == {"effect", "job"}
+
+    before_counts = {"rca_delivery_attempts": len(attempts)}
+    before_counts["rca_delivery_quarantine_mutation_audit"] = len(quarantine_audit)
+    repeated, repeated_applied = store.quarantine_pre_w3_effects_with_audit(
+        audit=audit,
+        now=NOW + timedelta(seconds=4),
+    )
+    assert repeated == audit
+    assert repeated_applied is False
+    with sqlite3.connect(store.db_path) as conn:
+        audit_count = conn.execute(
+            "SELECT COUNT(*) FROM rca_delivery_quarantine_mutation_audit"
+        ).fetchone()[0]
+    assert before_counts == {
+        "rca_delivery_attempts": len(store.list_rows("rca_delivery_attempts")),
+        "rca_delivery_quarantine_mutation_audit": audit_count,
+    }
+
+
+def test_exact_pre_w3_disposition_rolls_back_every_row_on_mid_batch_failure(
+    tmp_path, monkeypatch
+):
+    _control_store, store, keys = _legacy_pre_w3_pending_effects(tmp_path)
+    snapshot = store.pre_w3_effect_disposition_snapshot(effect_keys=keys)
+    audit = _pre_w3_disposition_audit(
+        store,
+        snapshot,
+        tmp_path,
+        now=NOW + timedelta(seconds=4),
+    )
+    original = store._aggregate_job_status
+    calls = 0
+
+    def fail_second(conn, delivery_id, current):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("injected_pre_w3_batch_failure")
+        return original(conn, delivery_id, current)
+
+    monkeypatch.setattr(store, "_aggregate_job_status", fail_second)
+    with pytest.raises(RuntimeError, match="injected_pre_w3_batch_failure"):
+        store.quarantine_pre_w3_effects_with_audit(
+            audit=audit,
+            now=NOW + timedelta(seconds=4),
+        )
+
+    assert {row["status"] for row in store.list_rows("rca_delivery_effects")} == {
+        "pending"
+    }
+    assert {row["status"] for row in store.list_rows("rca_delivery_jobs")} == {
+        "ready"
+    }
+    assert store.list_rows("rca_delivery_attempts") == []
+    with sqlite3.connect(store.db_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM rca_delivery_quarantine_mutation_audit"
+        ).fetchone()[0] == 0
+    assert store.pre_w3_effect_disposition_audit(audit["disposition_id"]) is None
+
+
+def test_exact_pre_w3_disposition_rejects_row_drift_before_mutation(tmp_path):
+    _control_store, store, keys = _legacy_pre_w3_pending_effects(tmp_path, count=1)
+    snapshot = store.pre_w3_effect_disposition_snapshot(effect_keys=keys)
+    audit = _pre_w3_disposition_audit(
+        store,
+        snapshot,
+        tmp_path,
+        now=NOW + timedelta(seconds=4),
+    )
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_delivery_effects SET last_error_detail = 'drifted' "
+            "WHERE effect_key = ?",
+            (keys[0],),
+        )
+
+    with pytest.raises(
+        DeliveryRecordConflictError,
+        match="effect_not_eligible|before_changed",
+    ):
+        store.quarantine_pre_w3_effects_with_audit(
+            audit=audit,
+            now=NOW + timedelta(seconds=4),
+        )
+    assert store.list_rows("rca_delivery_attempts") == []
+    assert store.pre_w3_effect_disposition_audit(audit["disposition_id"]) is None
 
 
 def test_manual_quarantined_backfill_rolls_back_then_materializes_issue_and_topic(

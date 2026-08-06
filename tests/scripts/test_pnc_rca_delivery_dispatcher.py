@@ -66,6 +66,7 @@ from tests.gateway.test_pnc_rca_delivery_store import (
     _bind_activation_execution,
     _control,
     _insert_subscription,
+    _legacy_pre_w3_pending_effects,
     _switch_activation_epoch,
 )
 from tests.gateway.test_pnc_rca_delivery_contract import (
@@ -266,6 +267,165 @@ def _patch_circuit_reset_cli(monkeypatch, config, tmp_path):
         lambda: dict(provenance),
     )
     return binding
+
+
+def _patch_pre_w3_disposition_cli(monkeypatch, config, tmp_path):
+    _patch_circuit_reset_cli(monkeypatch, config, tmp_path)
+    binding = {
+        "path": str((tmp_path / "active-release-binding.json").absolute()),
+        "sha256": "1" * 64,
+        "release_id": "rca-test-release",
+        "authority_sha256": "2" * 64,
+        "authority_epoch_id": "rca-authority-test",
+        "bootstrap_epoch_id": "rca-bootstrap-test",
+        "release_bom_sha256": "3" * 64,
+        "candidate_env_sha256": "4" * 64,
+        "live_env_path": str((tmp_path / ".env").absolute()),
+        "live_env_sha256": "5" * 64,
+        "live_env_matches_candidate": False,
+        "mismatch_policy": "observed_only_no_external_write",
+    }
+    monkeypatch.setattr(
+        dispatcher_module,
+        "_pre_w3_effect_disposition_active_release_binding",
+        lambda _config: dict(binding),
+    )
+    return binding
+
+
+def _sqlite_backup(source_path, backup_path):
+    source = sqlite3.connect(source_path)
+    destination = sqlite3.connect(backup_path)
+    try:
+        source.backup(destination)
+        destination.commit()
+    finally:
+        destination.close()
+        source.close()
+    backup_path.chmod(0o600)
+    return hashlib.sha256(backup_path.read_bytes()).hexdigest()
+
+
+def _pre_w3_cli_args(keys, *, receipt, backup, backup_sha256):
+    args = []
+    for key in keys:
+        args.extend(("--dispose-pre-w3-effect", key))
+    args.extend((
+        "--operator",
+        "test-operator",
+        "--reason",
+        "exact pre-W3 disposition without provider calls",
+        "--receipt",
+        str(receipt),
+        "--backup",
+        str(backup),
+        "--backup-sha256",
+        backup_sha256,
+    ))
+    return args
+
+
+def test_pre_w3_disposition_cli_plan_apply_and_recovery_never_builds_provider(
+    tmp_path, monkeypatch, capsys
+):
+    _control_store, store, keys = _legacy_pre_w3_pending_effects(tmp_path)
+    config = _config(tmp_path, enabled=False)
+    _patch_pre_w3_disposition_cli(monkeypatch, config, tmp_path)
+    provider_created = False
+
+    def unexpected_provider(*_args, **_kwargs):
+        nonlocal provider_created
+        provider_created = True
+        raise AssertionError("provider must not be built for disposition")
+
+    monkeypatch.setattr(
+        dispatcher_module,
+        "MeegleIssueCommentAdapter",
+        unexpected_provider,
+    )
+    backup = (tmp_path / "control.before.sqlite3").absolute()
+    backup_sha256 = _sqlite_backup(config.control_db_path, backup)
+    receipt = (tmp_path / "pre-w3-disposition.json").absolute()
+    base_args = _pre_w3_cli_args(
+        reversed(keys),
+        receipt=receipt,
+        backup=backup,
+        backup_sha256=backup_sha256,
+    )
+    before = store.list_rows("rca_delivery_effects")
+
+    assert dispatcher_module.main(base_args) == 0
+    plan_output = json.loads(capsys.readouterr().out)
+    assert plan_output["mode"] == "plan"
+    assert plan_output["external_effects_triggered"] is False
+    assert plan_output["provider_calls_performed"] == 0
+    assert store.list_rows("rca_delivery_effects") == before
+    assert not receipt.exists()
+
+    expected = plan_output["expected_apply"]
+    apply_args = [*base_args, "--apply"]
+    for name, value in expected.items():
+        apply_args.extend((f"--{name.replace('_', '-')}", value))
+    assert dispatcher_module.main(apply_args) == 0
+    applied = json.loads(capsys.readouterr().out)
+    assert applied["applied"] is True
+    assert applied["provider_calls_performed"] == 0
+    assert provider_created is False
+    assert receipt.stat().st_mode & 0o777 == 0o444
+    assert Path(f"{receipt}.sha256").is_file()
+    body = json.loads(receipt.read_text(encoding="utf-8"))
+    assert body["disposition_id"] == applied["disposition_id"]
+    assert body["active_release_binding"]["live_env_matches_candidate"] is False
+    effects = store.list_rows("rca_delivery_effects")
+    assert {row["status"] for row in effects} == {"quarantined"}
+    assert {row["attempt"] for row in effects} == {0}
+    assert all(row["remote_receipt_json"] is None for row in effects)
+
+    recovered = (tmp_path / "pre-w3-disposition.recovered.json").absolute()
+    assert dispatcher_module.main([
+        "--materialize-pre-w3-disposition",
+        applied["disposition_id"],
+        "--receipt",
+        str(recovered),
+    ]) == 0
+    recovery = json.loads(capsys.readouterr().out)
+    assert recovery["recovered"] is True
+    assert recovery["provider_calls_performed"] == 0
+    envelope = json.loads(recovered.read_text(encoding="utf-8"))
+    assert envelope["source_disposition_id"] == applied["disposition_id"]
+    assert envelope["audit"] == body
+    assert provider_created is False
+
+
+def test_pre_w3_disposition_cli_rejects_active_binding_drift_before_mutation(
+    tmp_path, monkeypatch, capsys
+):
+    _control_store, store, keys = _legacy_pre_w3_pending_effects(tmp_path, count=1)
+    config = _config(tmp_path, enabled=False)
+    binding = _patch_pre_w3_disposition_cli(monkeypatch, config, tmp_path)
+    backup = (tmp_path / "control.before.sqlite3").absolute()
+    backup_sha256 = _sqlite_backup(config.control_db_path, backup)
+    receipt = (tmp_path / "pre-w3-drift.json").absolute()
+    base_args = _pre_w3_cli_args(
+        keys,
+        receipt=receipt,
+        backup=backup,
+        backup_sha256=backup_sha256,
+    )
+    assert dispatcher_module.main(base_args) == 0
+    planned = json.loads(capsys.readouterr().out)
+    binding["sha256"] = "9" * 64
+    apply_args = [*base_args, "--apply"]
+    for name, value in planned["expected_apply"].items():
+        apply_args.extend((f"--{name.replace('_', '-')}", value))
+
+    assert dispatcher_module.main(apply_args) == 2
+    error = json.loads(capsys.readouterr().out)
+    assert "plan_changed" in error["message"]
+    [effect] = store.list_rows("rca_delivery_effects")
+    assert effect["status"] == "pending"
+    assert store.list_rows("rca_delivery_attempts") == []
+    assert not receipt.exists()
 
 
 def test_bound_source_rejects_group_or_world_writable_file(tmp_path):
