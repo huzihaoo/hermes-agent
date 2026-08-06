@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+import os
 from pathlib import Path
 import plistlib
 
@@ -90,6 +91,28 @@ def test_live_projection_uses_validated_dispatcher_environment(tmp_path):
             dispatcher_environment={**_env_for_dispatcher(enabled=True), "HERMES_RCA_DELIVERY_DISPATCHER_OBSERVABILITY_ENABLED": "false"},
         )
     assert error.value.code == "pnc_rca_live_profile_switch_dispatcher_environment_invalid"
+
+
+def test_baseline_status_digest_ignores_only_validation_binding_identity():
+    first = {
+        "ready": True,
+        "state": "acknowledged",
+        "baseline_identity": {
+            "active_release_binding_sha256": "a" * 64,
+            "candidate_env_sha256": "b" * 64,
+            "db_logical_identity_sha256": "c" * 64,
+        },
+        "lifetime": {"jobs": 1},
+    }
+    second = deepcopy(first)
+    second["baseline_identity"]["active_release_binding_sha256"] = "d" * 64
+    assert switch._canonical(switch._stable_baseline_status(first)) == switch._canonical(
+        switch._stable_baseline_status(second)
+    )
+    second["baseline_identity"]["candidate_env_sha256"] = "e" * 64
+    assert switch._canonical(switch._stable_baseline_status(first)) != switch._canonical(
+        switch._stable_baseline_status(second)
+    )
 
 
 def _make_plan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[dict, Path, dict[str, Path]]:
@@ -250,25 +273,47 @@ def test_apply_and_rollback_happy_path(tmp_path, monkeypatch):
     assert all(target.read_bytes() == f"old-{name}\n".encode() for name, target in targets.items())
 
 
+def test_post_replace_fsync_failure_is_restored(tmp_path, monkeypatch):
+    plan, plan_path, targets = _make_plan(tmp_path, monkeypatch)
+    monkeypatch.setattr(switch, "_locked_validation", lambda *_args, **_kwargs: None)
+    original_sync = switch._sync_directory
+    failed = False
+
+    def fail_once(path):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise RuntimeError("injected post-replace fsync failure")
+        original_sync(path)
+
+    monkeypatch.setattr(switch, "_sync_directory", fail_once)
+    with pytest.raises(RuntimeError, match="injected post-replace fsync failure"):
+        switch._apply(plan, plan_path=plan_path)
+    assert targets["env"].read_bytes() == b"old-env\n"
+    automatic = json.loads(
+        (Path(plan["transaction_dir"]) / "automatic-rollback.json").read_text()
+    )
+    assert automatic["filesystem_restored_to_pre_transaction"] is True
+    assert automatic["blocked_entries"] == []
+
+
 def test_post_replace_failure_fails_closed_without_after_identity(tmp_path, monkeypatch):
     plan, plan_path, targets = _make_plan(tmp_path, monkeypatch)
     monkeypatch.setattr(switch, "_locked_validation", lambda *_args, **_kwargs: None)
-    original_replace = switch.base._replace
     failed = False
 
-    def fail_after_replace(path, raw, *, mode):
+    def fail_after_replace(source, target):
         nonlocal failed
-        original_replace(path, raw, mode=mode)
-        if path == targets["env"] and not failed:
+        os.replace(source, target)
+        if target == targets["env"] and not failed:
             failed = True
-            raise RuntimeError("injected post-replace fsync failure")
+            raise RuntimeError("injected replace failure")
 
-    monkeypatch.setattr(switch.base, "_replace", fail_after_replace)
     with pytest.raises(
         switch.LiveProfileSwitchError,
         match="pnc_rca_live_profile_switch_automatic_rollback_incomplete",
     ):
-        switch._apply(plan, plan_path=plan_path)
+        switch._apply(plan, plan_path=plan_path, replace_func=fail_after_replace)
     assert targets["env"].read_bytes() == b"new-env\n"
     automatic = json.loads(
         (Path(plan["transaction_dir"]) / "automatic-rollback.json").read_text()
@@ -280,27 +325,32 @@ def test_post_replace_failure_fails_closed_without_after_identity(tmp_path, monk
 def test_concurrent_target_change_is_not_clobbered(tmp_path, monkeypatch):
     plan, plan_path, targets = _make_plan(tmp_path, monkeypatch)
     monkeypatch.setattr(switch, "_locked_validation", lambda *_args, **_kwargs: None)
-    original_replace = switch.base._replace
+    original_replace = os.replace
     forward = True
     rollback_clobber_attempted = False
 
-    def inject_competing_write(path, raw, *, mode):
+    def inject_competing_write(source, target):
         nonlocal forward, rollback_clobber_attempted
-        if path == targets["env"] and raw == b"old-env\n":
-            rollback_clobber_attempted = True
-        if forward and path == targets["env"]:
-            original_replace(path, raw, mode=mode)
-            path.write_bytes(b"foreign-writer\n")
-            path.chmod(mode)
+        source_path = Path(source)
+        target_path = Path(target)
+        if target_path == targets["env"] and not forward:
+            try:
+                if source_path.read_bytes() == b"old-env\n":
+                    rollback_clobber_attempted = True
+            except OSError:
+                pass
+        if forward and target_path == targets["env"]:
+            original_replace(source, target)
+            target_path.write_bytes(b"foreign-writer\n")
+            target_path.chmod(switch.TARGET_MODES["env"])
             return
-        if forward and path == targets["binding"]:
+        if forward and target_path == targets["binding"]:
             forward = False
             raise RuntimeError("injected competing transaction")
-        return original_replace(path, raw, mode=mode)
+        return original_replace(source, target)
 
-    monkeypatch.setattr(switch.base, "_replace", inject_competing_write)
     with pytest.raises(switch.LiveProfileSwitchError) as error:
-        switch._apply(plan, plan_path=plan_path)
+        switch._apply(plan, plan_path=plan_path, replace_func=inject_competing_write)
     assert error.value.code == "pnc_rca_live_profile_switch_automatic_rollback_incomplete"
     assert targets["env"].read_bytes() == b"foreign-writer\n"
     assert rollback_clobber_attempted is False
@@ -311,28 +361,57 @@ def test_concurrent_target_change_is_not_clobbered(tmp_path, monkeypatch):
 def test_same_bytes_replaced_by_competitor_is_not_clobbered(tmp_path, monkeypatch):
     plan, plan_path, targets = _make_plan(tmp_path, monkeypatch)
     monkeypatch.setattr(switch, "_locked_validation", lambda *_args, **_kwargs: None)
-    original_replace = switch.base._replace
+    original_replace = os.replace
     injected = False
 
-    def inject_same_bytes(path, raw, *, mode):
+    def inject_same_bytes(source, target):
         nonlocal injected
-        result = original_replace(path, raw, mode=mode)
-        if path == targets["binding"] and not injected:
+        result = original_replace(source, target)
+        if Path(target) == targets["binding"] and not injected:
             injected = True
             # Replace the env with identical bytes but a new inode after the
             # transaction has already recorded its after observation.
-            replacement = path.parent / ".foreign-same-bytes"
+            replacement = Path(target).parent / ".foreign-same-bytes"
             replacement.write_bytes(targets["env"].read_bytes())
             replacement.chmod(switch.TARGET_MODES["env"])
             replacement.replace(targets["env"])
             raise RuntimeError("injected same-bytes competitor")
         return result
 
-    monkeypatch.setattr(switch.base, "_replace", inject_same_bytes)
     with pytest.raises(switch.LiveProfileSwitchError) as error:
-        switch._apply(plan, plan_path=plan_path)
+        switch._apply(plan, plan_path=plan_path, replace_func=inject_same_bytes)
     assert error.value.code == "pnc_rca_live_profile_switch_automatic_rollback_incomplete"
     assert targets["env"].read_bytes() == b"new-env\n"
+
+
+def test_rollback_rechecks_target_before_replace(tmp_path, monkeypatch):
+    plan, _plan_path, targets = _make_plan(tmp_path, monkeypatch)
+    switch.base._backup(plan)
+    target = targets["env"]
+    _write(target, b"new-env\n", switch.TARGET_MODES["env"])
+    expected_after = switch.base._observe(target, required=True)
+    original_observe = switch.base._observe
+    injected = False
+
+    def observe_with_competitor(path, *, required):
+        nonlocal injected
+        observed = original_observe(path, required=required)
+        if Path(path) == target and not injected:
+            injected = True
+            foreign = target.parent / ".foreign-rollback-writer"
+            _write(foreign, b"foreign-rollback-writer\n", switch.TARGET_MODES["env"])
+            os.replace(foreign, target)
+        return observed
+
+    monkeypatch.setattr(switch.base, "_observe", observe_with_competitor)
+    result = switch._restore_written_no_clobber(
+        plan,
+        written_names=["env"],
+        after_observations={"env": expected_after},
+    )
+    assert result["restored"] == []
+    assert result["blocked"][0]["reason"] == "target_changed_before_restore"
+    assert target.read_bytes() == b"foreign-rollback-writer\n"
 
 
 def test_manual_rollback_refuses_activation_state_change(tmp_path, monkeypatch):

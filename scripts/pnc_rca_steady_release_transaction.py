@@ -601,6 +601,10 @@ def _validate_quarantine_baseline(
         or identity.get("approval_evidence_sha256")
         != capacity.get("approval_evidence_sha256")
         or identity.get("candidate_env_sha256") != hashlib.sha256(env_raw).hexdigest()
+        or HEX64_RE.fullmatch(
+            str(identity.get("db_logical_identity_sha256") or "")
+        )
+        is None
     ):
         _fail("pnc_steady_release_transaction_baseline_invalid")
     return {
@@ -608,7 +612,33 @@ def _validate_quarantine_baseline(
         "observation": observation,
         "baseline_id": str(identity["baseline_id"]),
         "baseline_fingerprint": str(identity["baseline_fingerprint"]),
+        "status_sha256": hashlib.sha256(
+            _canonical_sha256_input(_stable_baseline_status(status))
+        ).hexdigest(),
+        "db_logical_identity_sha256": str(
+            identity["db_logical_identity_sha256"]
+        ),
     }
+
+
+def _canonical_sha256_input(value: Mapping[str, Any]) -> bytes:
+    return json.dumps(
+        dict(value),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _stable_baseline_status(status: Mapping[str, Any]) -> dict[str, Any]:
+    stable = copy.deepcopy(dict(status))
+    identity = stable.get("baseline_identity")
+    if isinstance(identity, Mapping):
+        identity = dict(identity)
+        identity.pop("active_release_binding_sha256", None)
+        stable["baseline_identity"] = identity
+    return stable
 
 
 def _candidate_paths(candidate_root: Path) -> dict[str, Path]:
@@ -1038,10 +1068,22 @@ def _validate_plan(plan: Mapping[str, Any]) -> None:
         or not _valid_observation(profile["observation"])
         or not isinstance(baseline, Mapping)
         or set(baseline)
-        != {"path", "observation", "baseline_id", "baseline_fingerprint"}
+        != {
+            "path",
+            "observation",
+            "baseline_id",
+            "baseline_fingerprint",
+            "status_sha256",
+            "db_logical_identity_sha256",
+        }
         or not Path(str(baseline["path"])).is_absolute()
         or not _valid_observation(baseline["observation"])
         or HEX64_RE.fullmatch(str(baseline["baseline_fingerprint"] or "")) is None
+        or HEX64_RE.fullmatch(str(baseline["status_sha256"] or "")) is None
+        or HEX64_RE.fullmatch(
+            str(baseline["db_logical_identity_sha256"] or "")
+        )
+        is None
     ):
         _fail("pnc_steady_release_transaction_plan_invalid")
     anchors = plan.get("read_only_plist_anchors")
@@ -1249,6 +1291,20 @@ def _owned_after_observation(
     return observed
 
 
+def _revalidate_candidate_baseline(plan: Mapping[str, Any]) -> None:
+    """Re-read the candidate projection and DB-backed baseline under the lock."""
+    validated = _validate_candidate(
+        candidate_root=Path(plan["candidate_root"]),
+        source_root=Path(plan["source_root"]),
+        home=Path(plan["home"]),
+        hermes_home=Path(plan["hermes_home"]),
+        control_db=Path(plan["control_db"]),
+        activation_binding=plan["activation_binding"],
+    )
+    if validated["baseline"] != plan["quarantine_baseline"]:
+        _fail("pnc_steady_release_transaction_baseline_status_changed")
+
+
 def _restore_attempted_no_clobber(
     plan: Mapping[str, Any],
     *,
@@ -1258,7 +1314,14 @@ def _restore_attempted_no_clobber(
     entries = {str(entry["name"]): entry for entry in plan["entries"]}
     restored: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
-    for name in reversed(tuple(attempted_names)):
+    # Keep the manifest as the final visibility switch during rollback.  The
+    # supporting files must be coherent before the old manifest is published.
+    restore_order = [
+        name for name in reversed(tuple(attempted_names)) if name != "manifest"
+    ]
+    if "manifest" in attempted_names:
+        restore_order.append("manifest")
+    for name in restore_order:
         entry = entries[name]
         target = Path(entry["target_path"])
         before = entry["before"]
@@ -1328,6 +1391,25 @@ def _restore_attempted_no_clobber(
                 )
                 continue
             if not base._same_observation(before_restore, expected_after):
+                blocked.append(
+                    {"name": name, "reason": "target_changed_before_restore"}
+                )
+                continue
+            # Re-check immediately after preparing the rollback blob.  This
+            # narrows the external-writer window and fails closed if the
+            # target changed while the blob was being read/prepared.
+            try:
+                before_replace = base._observe(target, required=True)
+            except base.ReleaseTransactionError as exc:
+                blocked.append(
+                    {
+                        "name": name,
+                        "reason": "target_unobservable_before_restore",
+                        "error": exc.code,
+                    }
+                )
+                continue
+            if not base._same_observation(before_replace, expected_after):
                 blocked.append(
                     {"name": name, "reason": "target_changed_before_restore"}
                 )
@@ -1474,6 +1556,7 @@ def apply_plan(
             plan["activation_binding"]
         ):
             _fail("pnc_steady_release_transaction_activation_changed")
+        _revalidate_candidate_baseline(plan)
         for entry in plan["entries"]:
             current = base._observe(Path(entry["target_path"]), required=False)
             if not base._same_observation(current, entry["before"]):
@@ -1520,6 +1603,7 @@ def apply_plan(
             plan["activation_binding"]
         ):
             _fail("pnc_steady_release_transaction_activation_changed")
+        _revalidate_candidate_baseline(plan)
         receipt = {
             "schema_version": RECEIPT_SCHEMA_VERSION,
             "transaction_id": plan["transaction_id"],
@@ -1562,6 +1646,8 @@ def apply_plan(
                 "filesystem_restored_to_pre_transaction": not rollback_result[
                     "blocked"
                 ],
+                "runtime_state": "unchanged_by_transaction",
+                "overall_release_state_restored": False,
                 "restored_entries": rollback_result["restored"],
                 "blocked_entries": rollback_result["blocked"],
                 "original_error": getattr(
@@ -1652,6 +1738,12 @@ def rollback_transaction(receipt_path: Path, *, output_path: Path) -> dict[str, 
             or locked_plan != plan
         ):
             _fail("pnc_steady_release_transaction_receipt_binding_invalid")
+        # A filesystem rollback is only safe while the exact aborted
+        # predecessor remains current.  Never restore over a newer epoch.
+        if _read_activation_binding(Path(plan["control_db"])) != dict(
+            plan["activation_binding"]
+        ):
+            _fail("pnc_steady_release_transaction_activation_changed")
         result_detail = _restore_attempted_no_clobber(
             plan,
             attempted_names=[str(entry["name"]) for entry in plan["entries"]],
@@ -1663,6 +1755,8 @@ def rollback_transaction(receipt_path: Path, *, output_path: Path) -> dict[str, 
             "rolled_back_at": datetime.now(timezone.utc).isoformat(),
             "restored_to_pre_transaction": not result_detail["blocked"],
             "filesystem_restored_to_pre_transaction": not result_detail["blocked"],
+            "runtime_state": "unchanged_by_transaction",
+            "overall_release_state_restored": False,
             "restored_entries": result_detail["restored"],
             "blocked_entries": result_detail["blocked"],
             "production_effects": _effects(),

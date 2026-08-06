@@ -263,6 +263,17 @@ def _effects() -> dict[str, bool]:
     }
 
 
+def _stable_baseline_status(status: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove only the validation-temp binding identity from the status digest."""
+    stable = deepcopy(dict(status))
+    identity = stable.get("baseline_identity")
+    if isinstance(identity, Mapping):
+        identity = dict(identity)
+        identity.pop("active_release_binding_sha256", None)
+        stable["baseline_identity"] = identity
+    return stable
+
+
 def _project_env(raw: bytes) -> bytes:
     replacements = {
         "HERMES_OUTBOUND_MODE": "live",
@@ -640,6 +651,7 @@ def _validate_release_state(
         (live_manifest, live_env_obs, live_binding_obs),
     ):
         gateway_release = manifest.get("gateway_release_binding")
+        manifest_authority = manifest.get("rca_release_authority")
         gateway_capacity = (
             gateway_release.get("capacity_admission")
             if isinstance(gateway_release, Mapping)
@@ -647,18 +659,20 @@ def _validate_release_state(
         )
         capacity = initial_binding["policy"]["capacity_admission"]
         if (
-            manifest.get("config_path") != str(config_target)
+            not isinstance(gateway_release, Mapping)
+            or not isinstance(gateway_capacity, Mapping)
+            or not isinstance(manifest_authority, Mapping)
+            or manifest.get("config_path") != str(config_target)
             or manifest.get("config_sha256") != _sha(config_raw)
             or manifest.get("config_semantic_sha256") != config_semantic_sha
             or manifest.get("env_sha256") != env_obs["sha256"]
             or manifest.get("runtime_root")
             != authority_value["faces"]["host_runtime"]["root"]
-            or manifest.get("rca_release_authority", {}).get("release_id") != release_id
+            or manifest_authority.get("release_id") != release_id
             or manifest.get("gateway_release_binding", {}).get(
                 "rca_platform_active_binding_sha256"
             )
             != binding_obs["sha256"]
-            or not isinstance(gateway_capacity, Mapping)
             or gateway_capacity.get("release_id") != release_id
             or gateway_capacity.get("bootstrap_epoch_id") != capacity["bootstrap_epoch_id"]
             or gateway_capacity.get("bootstrap_authorization_sha256")
@@ -765,7 +779,7 @@ def _validate_release_state(
         "observation": baseline_obs,
         "baseline_id": str(baseline.get("baseline_id") or ""),
         "baseline_fingerprint": str(baseline["baseline_fingerprint"]),
-        "status_sha256": _sha(_canonical(status)),
+        "status_sha256": _sha(_canonical(_stable_baseline_status(status))),
         "db_logical_identity_sha256": str(
             baseline_identity["db_logical_identity_sha256"]
         ),
@@ -1336,15 +1350,66 @@ def _restore_written_no_clobber(
                 {"name": name, "reason": "rollback_blob_changed", "observed": rollback_observation}
             )
             continue
+        temporary = target.parent / f".{target.name}.mode-rollback.tmp"
+        restore_error: BaseException | None = None
         try:
-            base._replace(target, rollback_raw, mode=int(before["mode"], 8))
+            base._write_new(temporary, rollback_raw, mode=int(before["mode"], 8))
+            # Re-read immediately before replacement so a writer that arrived
+            # while the rollback blob was being prepared is detected fail-closed.
+            try:
+                before_restore = base._observe(target, required=True)
+            except base.ReleaseTransactionError as exc:
+                blocked.append(
+                    {
+                        "name": name,
+                        "reason": "target_unobservable_before_restore",
+                        "error": exc.code,
+                    }
+                )
+                continue
+            if not base._same_observation(before_restore, expected_after):
+                blocked.append(
+                    {
+                        "name": name,
+                        "reason": "target_changed_before_restore",
+                        "observed": before_restore,
+                    }
+                )
+                continue
+            os.replace(temporary, target)
             restored_observation = base._observe(target, required=True)
-        except base.ReleaseTransactionError as exc:
+            if (
+                restored_observation["sha256"] != before["sha256"]
+                or restored_observation["mode"] != before["mode"]
+            ):
+                blocked.append(
+                    {
+                        "name": name,
+                        "reason": "restore_verification_failed",
+                        "observed": restored_observation,
+                    }
+                )
+                continue
+            try:
+                _sync_directory(target.parent)
+            except BaseException as exc:
+                restore_error = exc
+        except BaseException as exc:
+            restore_error = exc
+            try:
+                restored_observation = base._observe(target, required=True)
+            except base.ReleaseTransactionError:
+                blocked.append({"name": name, "reason": "restore_failed"})
+                continue
+        finally:
+            temporary.unlink(missing_ok=True)
+        if restore_error is not None:
             blocked.append(
                 {
                     "name": name,
-                    "reason": "restore_failed",
-                    "error": exc.code,
+                    "reason": "restore_fsync_unproven",
+                    "error": getattr(restore_error, "code", type(restore_error).__name__),
+                    "observed": restored_observation,
                 }
             )
             continue
@@ -1360,7 +1425,53 @@ def _restore_written_no_clobber(
     return {"restored": restored, "blocked": blocked}
 
 
-def _apply(plan: Mapping[str, Any], *, plan_path: Path) -> dict[str, Any]:
+def _sync_directory(path: Path) -> None:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _replace_from_staged(
+    entry: Mapping[str, Any],
+    *,
+    transaction_id: str,
+    replace_func,
+    after_observations: dict[str, Mapping[str, Any]],
+) -> None:
+    raw, staged_observation = base._read_file(
+        Path(entry["staged_path"]),
+        code="pnc_rca_live_profile_switch_staged_invalid",
+    )
+    if (
+        staged_observation["sha256"] != entry["source"]["sha256"]
+        or staged_observation["mode"] != entry["target_mode"]
+    ):
+        _fail("pnc_rca_live_profile_switch_staged_changed")
+    target = Path(entry["target_path"])
+    temporary = target.parent / f".{target.name}.mode-switch-{transaction_id}.tmp"
+    base._write_new(temporary, raw, mode=int(entry["target_mode"], 8))
+    try:
+        replace_func(temporary, target)
+        observed = base._observe(target, required=True)
+        if (
+            observed["sha256"] != entry["source"]["sha256"]
+            or observed["mode"] != entry["target_mode"]
+        ):
+            _fail("pnc_rca_live_profile_switch_verify_failed")
+        after_observations[str(entry["name"])] = observed
+        _sync_directory(target.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _apply(
+    plan: Mapping[str, Any], *, plan_path: Path, replace_func=os.replace
+) -> dict[str, Any]:
     _validate_plan(plan)
     plan_raw, on_disk_plan = _read_plan(plan_path)
     if dict(plan) != on_disk_plan:
@@ -1399,25 +1510,13 @@ def _apply(plan: Mapping[str, Any], *, plan_path: Path) -> dict[str, Any]:
                 base._observe(Path(entry["target_path"]), required=True), entry["before"]
             ):
                 _fail("pnc_rca_live_profile_switch_target_changed")
-            raw, staged_observation = base._read_file(
-                Path(entry["staged_path"]),
-                code="pnc_rca_live_profile_switch_staged_invalid",
-            )
-            if (
-                staged_observation["sha256"] != entry["source"]["sha256"]
-                or staged_observation["mode"] != entry["target_mode"]
-            ):
-                _fail("pnc_rca_live_profile_switch_staged_changed")
-            target = Path(entry["target_path"])
             attempted_names.append(str(entry["name"]))
-            base._replace(target, raw, mode=int(entry["target_mode"], 8))
-            after = base._observe(target, required=True)
-            if (
-                after["sha256"] != entry["source"]["sha256"]
-                or after["mode"] != entry["target_mode"]
-            ):
-                _fail("pnc_rca_live_profile_switch_verify_failed")
-            after_by_name[str(entry["name"])] = after
+            _replace_from_staged(
+                entry,
+                transaction_id=str(plan["transaction_id"]),
+                replace_func=replace_func,
+                after_observations=after_by_name,
+            )
         _locked_validation(plan, installed_mode="live")
         after_entries = [
             {"name": entry["name"], "observed": dict(after_by_name[entry["name"]])}

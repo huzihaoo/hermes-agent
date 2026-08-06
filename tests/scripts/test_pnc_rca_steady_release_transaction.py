@@ -260,6 +260,8 @@ def _prepare_candidate(args: dict, monkeypatch: pytest.MonkeyPatch) -> None:
             "observation": transaction.base._observe(path, required=True),
             "baseline_id": "test-baseline",
             "baseline_fingerprint": "b" * 64,
+            "status_sha256": "c" * 64,
+            "db_logical_identity_sha256": "d" * 64,
         }
 
     monkeypatch.setattr(transaction, "_validate_quarantine_baseline", fake_baseline)
@@ -333,6 +335,29 @@ def test_steady_transaction_rechecks_read_only_anchor_and_auto_rolls_back(
     ):
         transaction.apply_plan(plan, plan_path=plan_path)
     assert not (args["state_root"] / f"{RELEASE_ID}.authority.json").exists()
+
+
+def test_steady_apply_rejects_db_backed_baseline_drift(tmp_path, monkeypatch):
+    args = _fixture(tmp_path, monkeypatch)
+    _prepare_candidate(args, monkeypatch)
+    _seed_old_targets(args)
+    plan, plan_path = _build(args)
+
+    def drifted_baseline(**_kwargs):
+        value = dict(plan["quarantine_baseline"])
+        value["status_sha256"] = "e" * 64
+        return value
+
+    monkeypatch.setattr(transaction, "_validate_quarantine_baseline", drifted_baseline)
+    with pytest.raises(
+        transaction.SteadyReleaseTransactionError,
+        match="baseline_status_changed",
+    ):
+        transaction.apply_plan(plan, plan_path=plan_path)
+    assert not (args["state_root"] / f"{RELEASE_ID}.authority.json").exists()
+    assert (args["hermes_home"] / ".env").read_text() != (
+        args["candidate_root"] / "candidate.env"
+    ).read_text()
 
 
 def test_empty_activation_baseline_is_compatible_with_current_binding():
@@ -449,6 +474,31 @@ def test_manual_rollback_preserves_concurrent_target_and_records_partial(
     assert rollback["restored_to_pre_transaction"] is False
     assert [item["name"] for item in rollback["blocked_entries"]] == ["env"]
     assert rollback["blocked_entries"][0]["reason"] == "target_changed"
+
+
+def test_manual_rollback_refuses_replaced_activation_epoch(tmp_path, monkeypatch):
+    args = _fixture(tmp_path, monkeypatch)
+    _prepare_candidate(args, monkeypatch)
+    _seed_old_targets(args)
+    plan, plan_path = _build(args)
+    receipt = transaction.apply_plan(plan, plan_path=plan_path)
+    env_path = args["hermes_home"] / ".env"
+    installed = env_path.read_bytes()
+    connection = sqlite3.connect(args["control_db"])
+    connection.execute(
+        "UPDATE rca_activation_epochs SET state='steady_active' WHERE is_current=1"
+    )
+    connection.commit()
+    connection.close()
+    with pytest.raises(
+        transaction.SteadyReleaseTransactionError,
+        match="activation_not_aborted",
+    ):
+        transaction.rollback_transaction(
+            Path(receipt["receipt_path"]),
+            output_path=args["evidence"] / "replaced-epoch-rollback.json",
+        )
+    assert env_path.read_bytes() == installed
 
 
 def test_manual_rollback_rechecks_after_immediately_before_restore(
