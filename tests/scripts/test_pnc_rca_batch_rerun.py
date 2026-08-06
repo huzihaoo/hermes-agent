@@ -348,6 +348,11 @@ def test_batch_state_v3_binds_owner_receipt_path_hash_selection_and_gate(tmp_pat
             state_path,
             **{**values, "owner_receipt_sha256": "4" * 64},
         )
+    with pytest.raises(BatchRerunError, match="batch_state_binding_mismatch"):
+        _load_or_create_state(
+            state_path,
+            **{**values, "runtime_commit": "5" * 40},
+        )
 
 
 def test_queue_schema_binds_batch_project_authority_and_item_identity(tmp_path):

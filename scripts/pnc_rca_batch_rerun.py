@@ -402,6 +402,7 @@ def _load_or_create_state(
             or state.get("owner_receipt_sha256") != owner_receipt_sha256
             or state.get("selected_issue_ids") != list(selected_issue_ids)
             or state.get("activation_required") is not True
+            or state.get("runtime_commit") != runtime_commit
         ):
             raise BatchRerunError("batch_state_binding_mismatch")
         if not isinstance(state.get("items"), Mapping):
