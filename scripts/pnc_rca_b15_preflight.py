@@ -39,7 +39,7 @@ from gateway.pnc_rca_control_store import (
 from gateway.pnc_rca_runtime_identity import runtime_identity_is_valid
 
 
-CONTROL_STORE_SCHEMA_VERSION = "pnc_rca_control_store_v13"
+CONTROL_STORE_SCHEMA_VERSION = "pnc_rca_control_store_v14"
 
 
 def canonical_json_sha256(value: Any) -> str:

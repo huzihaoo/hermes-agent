@@ -21,6 +21,7 @@ SUPPORTED_CONTROL_SCHEMAS = frozenset({
     "pnc_rca_control_store_v11",
     "pnc_rca_control_store_v12",
     "pnc_rca_control_store_v13",
+    "pnc_rca_control_store_v14",
 })
 REQUEST_SCHEMA_VERSION = "pnc_rca_canonical_request_v1"
 SNAPSHOT_SCHEMA_VERSION = "pnc_rca_admission_snapshot_v1"

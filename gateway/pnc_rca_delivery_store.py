@@ -76,7 +76,7 @@ from gateway.pnc_rca_write_fence import (
 )
 
 
-DELIVERY_STORE_SCHEMA_VERSION = "pnc_rca_delivery_store_v11"
+DELIVERY_STORE_SCHEMA_VERSION = "pnc_rca_delivery_store_v12"
 W5_EXTERNAL_WRITE_FENCE_CUTOFF_META_KEY = "w5_external_write_fence_cutoff"
 # Persisted once at delivery-store initialization; never controlled by env.
 W5_EXTERNAL_WRITE_FENCE_CUTOFF = "2026-07-25T00:00:00+00:00"
@@ -84,6 +84,7 @@ DELIVERY_STORE_SCHEMA_PREDECESSOR_VERSION = "pnc_rca_delivery_store_v7"
 DELIVERY_STORE_W2_SCHEMA_VERSION = "pnc_rca_delivery_store_v8"
 DELIVERY_STORE_W6_PREDECESSOR_VERSION = "pnc_rca_delivery_store_v9"
 DELIVERY_STORE_OBSERVABILITY_PREDECESSOR_VERSION = "pnc_rca_delivery_store_v10"
+DELIVERY_STORE_TERMINAL_RERUN_PREDECESSOR_VERSION = "pnc_rca_delivery_store_v11"
 _DELIVERY_OBSERVATION_OUTBOX_SCHEMA_OBJECTS = {
     "rca_delivery_observation_outbox": (
         "table",
@@ -180,7 +181,7 @@ _LEARNING_ADJUDICATION_SCHEMAS = frozenset({
 _ADJUDICATION_TARGET_PREFIX = "g1q3-rca-adjudication-target-v1-"
 _OPEN_ID_RE = re.compile(r"^ou_[0-9a-f]{32}$")
 _FEISHU_ISSUE_URL_RE = re.compile(
-    r"^https://project\.feishu\.cn/[A-Za-z0-9._-]+/issue/detail/[0-9]+/*$"
+    r"^https://project\.feishu\.cn/([A-Za-z0-9._-]+)/issue/detail/([0-9]+)/*$"
 )
 COMMENT_SLOT_SCHEMA_VERSION = "pnc_rca_comment_slot_v1"
 COMMENT_SLOT_KINDS = frozenset({"conclusion", "correction"})
@@ -208,6 +209,7 @@ SUPPORTED_DELIVERY_STORE_SCHEMA_VERSIONS = frozenset({
     DELIVERY_STORE_W2_SCHEMA_VERSION,
     DELIVERY_STORE_W6_PREDECESSOR_VERSION,
     DELIVERY_STORE_OBSERVABILITY_PREDECESSOR_VERSION,
+    DELIVERY_STORE_TERMINAL_RERUN_PREDECESSOR_VERSION,
     DELIVERY_STORE_SCHEMA_VERSION,
 })
 WATCH_ACTIVE_STATES = frozenset({"pending", "running"})
@@ -1712,6 +1714,167 @@ class RcaDeliveryStore:
                 conn.rollback()
             conn.close()
 
+    def validate_terminal_rerun_external_write_binding(
+        self,
+        *,
+        effect_key: str,
+        delivery_id: str,
+        lease_token: str,
+        lease_fence: int,
+        operation: str,
+        issue_url: str,
+        target_key: str,
+        business_key: str,
+        submission_key: str,
+        generation: int,
+        require_write_started: bool,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Reopen one exact authority-bound terminal correction comment."""
+        text_values = (
+            effect_key,
+            delivery_id,
+            lease_token,
+            issue_url,
+            target_key,
+            business_key,
+            submission_key,
+        )
+        if (
+            not all(isinstance(value, str) and value.strip() for value in text_values)
+            or isinstance(lease_fence, bool)
+            or not isinstance(lease_fence, int)
+            or lease_fence < 1
+            or isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 2
+            or not isinstance(require_write_started, bool)
+        ):
+            raise RuntimeError("external_write_fence_schema_invalid")
+        if operation != DELIVERY_EFFECT_KIND:
+            raise RuntimeError("external_write_fence_operation_denied")
+        current = _utc_datetime(now)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            row = conn.execute(
+                """
+                SELECT effect.effect_kind, effect.required, effect.target_key,
+                       effect.payload_json, effect.payload_sha256,
+                       effect.status, effect.write_phase, effect.lease_token,
+                       effect.lease_expires_at, effect.fence,
+                       job.issue_url, job.target_key AS job_target_key,
+                       job.project_key, job.work_item_type_key, job.work_item_id,
+                       job.business_key, job.submission_key, job.generation,
+                       watch.state AS watch_state
+                  FROM rca_delivery_effects AS effect
+                  JOIN rca_delivery_jobs AS job
+                    ON job.delivery_id = effect.delivery_id
+                  JOIN rca_execution_watch AS watch
+                    ON watch.delivery_id = job.delivery_id
+                   AND watch.submission_key = job.submission_key
+                 WHERE effect.effect_key = ?
+                   AND effect.delivery_id = ?
+                   AND effect.lease_token = ?
+                   AND effect.fence = ?
+                   AND effect.status = 'claimed'
+                """,
+                (effect_key, delivery_id, lease_token, lease_fence),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("external_write_fence_operation_denied")
+            authority = self._terminal_rerun_authority_tx(
+                conn,
+                business_key=business_key,
+                generation=generation,
+                work_item_id=str(row["work_item_id"]),
+            )
+            if authority is None:
+                raise RuntimeError("external_write_fence_identity_mismatch")
+            try:
+                expires_at = _parse_iso(str(row["lease_expires_at"] or ""))
+                payload = _json_object(row["payload_json"])
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError("external_write_fence_schema_invalid") from exc
+            write_phase = str(row["write_phase"] or "")
+            if (
+                expires_at <= current
+                or write_phase not in {"prewrite", "write_started"}
+                or (require_write_started and write_phase != "write_started")
+            ):
+                raise RuntimeError("external_write_fence_operation_denied")
+            expected_target = (
+                f"feishu_project:{row['project_key']}:"
+                f"{row['work_item_type_key']}:{row['work_item_id']}"
+            )
+            issue_match = _FEISHU_ISSUE_URL_RE.fullmatch(issue_url.rstrip("/"))
+            if (
+                issue_match is None
+                or issue_match.group(1) != str(authority["project_simple_name"])
+                or issue_match.group(2) != str(row["work_item_id"])
+                or str(row["issue_url"] or "").rstrip("/") != issue_url.rstrip("/")
+                or str(row["target_key"] or "") != target_key
+                or str(row["job_target_key"] or "") != expected_target
+                or target_key != expected_target
+            ):
+                raise RuntimeError("external_write_fence_target_mismatch")
+            if (
+                str(row["effect_kind"] or "") != DELIVERY_EFFECT_KIND
+                or int(row["required"] or 0) != 1
+                or str(row["status"] or "") != "claimed"
+                or str(row["lease_token"] or "") != lease_token
+                or int(row["fence"] or 0) != lease_fence
+                or str(row["business_key"] or "") != business_key
+                or str(row["submission_key"] or "") != submission_key
+                or int(row["generation"] or 0) != generation
+                or str(row["watch_state"] or "") != "delivery_created"
+                or str(authority["submission_key"]) != submission_key
+                or str(authority["project_key"]) != str(row["project_key"])
+                or str(authority["work_item_type_key"]) !=
+                    str(row["work_item_type_key"])
+                or str(payload.get("schema_version") or "")
+                    not in _TERMINAL_EFFECT_SCHEMA_VERSIONS
+                or str(payload.get("delivery_id") or "") != delivery_id
+                or str(payload.get("effect_kind") or "") != DELIVERY_EFFECT_KIND
+                or str(payload.get("target_key") or "") != target_key
+                or str(payload.get("project_key") or "") != str(row["project_key"])
+                or str(payload.get("work_item_type_key") or "") !=
+                    str(row["work_item_type_key"])
+                or str(payload.get("work_item_id") or "") !=
+                    str(row["work_item_id"])
+                or str(payload.get("submission_key") or "") != submission_key
+                or int(payload.get("generation") or 0) != generation
+                or hashlib.sha256(
+                    _canonical_json(payload).encode("utf-8")
+                ).hexdigest() != str(row["payload_sha256"] or "")
+            ):
+                raise RuntimeError("external_write_fence_identity_mismatch")
+            return {
+                "authority_sha256": str(authority["authority_sha256"]),
+                "outbox_id": int(authority["outbox_id"]),
+                "epoch_id": str(authority["activation_epoch_id"]),
+                "activation_ledger_id": int(authority["activation_ledger_id"]),
+                "effect_key": effect_key,
+                "delivery_id": delivery_id,
+                "lease_token": lease_token,
+                "lease_fence": lease_fence,
+                "operation": DELIVERY_EFFECT_KIND,
+                "issue_url": issue_url.rstrip("/"),
+                "target_key": target_key,
+                "business_key": business_key,
+                "submission_key": submission_key,
+                "generation": generation,
+                "project_key": str(row["project_key"]),
+                "project_simple_name": str(authority["project_simple_name"]),
+                "work_item_type_key": str(row["work_item_type_key"]),
+                "work_item_id": str(row["work_item_id"]),
+                "write_phase": write_phase,
+            }
+        finally:
+            if conn.in_transaction:
+                conn.rollback()
+            conn.close()
+
     def is_historical_external_write_effect(self, created_at: str) -> bool:
         """Grandfather only effects predating the durable W5 rollout marker."""
         conn = self._connect()
@@ -1771,6 +1934,11 @@ class RcaDeliveryStore:
         finally:
             conn.close()
         if state == "admitted" or state == "unknown":
+            raise RuntimeError(LEARNING_LANE_EXTERNAL_EFFECT_ERROR)
+        if (
+            state == "terminal_rerun_authorized"
+            and str(operation) != DELIVERY_EFFECT_KIND
+        ):
             raise RuntimeError(LEARNING_LANE_EXTERNAL_EFFECT_ERROR)
         if state == "admission_missing":
             raise RuntimeError(LEARNING_LANE_ADMISSION_MISSING_ERROR)
@@ -3167,7 +3335,10 @@ class RcaDeliveryStore:
         # The enforcement objects are additive on every supported predecessor.
         # The Python transaction guards remain authoritative when the control
         # tables are not present in an isolated delivery fixture.
+        if initial_schema_version != DELIVERY_STORE_SCHEMA_VERSION:
+            RcaDeliveryStore._drop_w6_stock_effect_guards(conn)
         RcaDeliveryStore._install_w6_effect_guards(conn)
+        RcaDeliveryStore._validate_w6_effect_guards(conn)
         quick_check = conn.execute("PRAGMA quick_check").fetchone()
         if quick_check is None or str(quick_check[0]).lower() != "ok":
             raise RuntimeError("incompatible_delivery_store_schema:quick_check")
@@ -3177,6 +3348,7 @@ class RcaDeliveryStore:
             DELIVERY_STORE_W2_SCHEMA_VERSION,
             DELIVERY_STORE_W6_PREDECESSOR_VERSION,
             DELIVERY_STORE_OBSERVABILITY_PREDECESSOR_VERSION,
+            DELIVERY_STORE_TERMINAL_RERUN_PREDECESSOR_VERSION,
         }:
             conn.execute(
                 "UPDATE rca_delivery_meta SET value = ? WHERE key = 'schema_version'",
@@ -3190,13 +3362,22 @@ class RcaDeliveryStore:
                 raise RuntimeError("incompatible_delivery_store_schema:foreign_keys")
 
     @staticmethod
-    def _install_w6_effect_guards(conn: sqlite3.Connection) -> None:
-        """Install DB-level W6 backstops when the shared control schema exists."""
+    def _drop_w6_stock_effect_guards(conn: sqlite3.Connection) -> None:
+        for name in (
+            "trg_learning_lane_stock_effect_insert_forbidden",
+            "trg_learning_lane_stock_subscription_insert_forbidden",
+            "trg_learning_lane_stock_subscription_update_forbidden",
+        ):
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+
+    @staticmethod
+    def _w6_effect_guard_statements(conn: sqlite3.Connection) -> tuple[str, ...]:
+        statements: list[str] = []
         admissions_ready = RcaDeliveryStore._table_exists(
             conn, "rca_learning_lane_admissions"
         )
         if admissions_ready:
-            conn.execute(
+            statements.append(
                 """
                 CREATE TRIGGER IF NOT EXISTS trg_learning_lane_effect_insert_forbidden
                 BEFORE INSERT ON rca_delivery_effects
@@ -3228,85 +3409,220 @@ class RcaDeliveryStore:
                 "rca_learning_lane_stock_items",
             )
         )
-        # This trigger deliberately checks stock membership rather than only the
-        # admission table.  A missing admission is itself a fail-closed state.
-        if cohort_ready and admissions_ready:
-            conn.execute(
-                """
-                CREATE TRIGGER IF NOT EXISTS
-                    trg_learning_lane_stock_effect_insert_forbidden
-                BEFORE INSERT ON rca_delivery_effects
-                WHEN NEW.effect_kind LIKE 'feishu_%'
-                 AND EXISTS (
-                     SELECT 1
-                       FROM rca_delivery_jobs AS job
-                       JOIN business_triggers AS bt
-                         ON bt.business_key = job.business_key
-                        AND bt.generation = job.generation
-                       JOIN rca_learning_lane_cohorts AS cohort
-                       JOIN rca_learning_lane_stock_items AS item
-                         ON item.cohort_id = cohort.cohort_id
-                        AND item.work_item_id = job.work_item_id
-                      WHERE job.delivery_id = NEW.delivery_id
-                        AND (
-                            julianday(bt.created_at) IS NULL
-                            OR julianday(cohort.stock_cutoff) IS NULL
-                            OR julianday(bt.created_at) >
-                               julianday(cohort.stock_cutoff)
-                        )
-                        AND NOT EXISTS (
-                            SELECT 1
-                              FROM rca_learning_lane_admissions AS admission
-                             WHERE admission.business_key = job.business_key
-                               AND admission.generation = job.generation
-                               AND admission.lane = 'learning'
-                               AND admission.external_write_allowed = 0
-                        )
-                 )
-                BEGIN
-                    SELECT RAISE(ABORT, 'learning_lane_admission_missing');
-                END
-                """
+        if not (cohort_ready and admissions_ready):
+            return tuple(statements)
+        if not RcaDeliveryStore._table_exists(
+            conn, "rca_terminal_rerun_delivery_authorities"
+        ):
+            raise RuntimeError(
+                "incompatible_delivery_store_schema:"
+                "terminal_rerun_authority_table_missing"
             )
-            if RcaDeliveryStore._table_exists(
-                conn, "rca_delivery_subscriptions"
-            ):
-                conn.execute(
+        from gateway.pnc_rca_control_store import (
+            CONTROL_STORE_SCHEMA_VERSION,
+            RcaControlStore,
+        )
+
+        control_marker = conn.execute(
+            "SELECT value FROM control_meta WHERE key = 'schema_version'"
+        ).fetchone()
+        if (
+            control_marker is None
+            or str(control_marker["value"]) != CONTROL_STORE_SCHEMA_VERSION
+        ):
+            raise RuntimeError(
+                "incompatible_delivery_store_schema:"
+                "terminal_rerun_authority_control_schema"
+            )
+        RcaControlStore._validate_v14_terminal_rerun_delivery_authority_schema(
+            conn
+        )
+        statements.append(
+            """
+            CREATE TRIGGER IF NOT EXISTS
+                trg_learning_lane_stock_effect_insert_forbidden
+            BEFORE INSERT ON rca_delivery_effects
+            WHEN NEW.effect_kind LIKE 'feishu_%'
+             AND EXISTS (
+                 SELECT 1
+                   FROM rca_delivery_jobs AS job
+                   JOIN business_triggers AS bt
+                     ON bt.business_key = job.business_key
+                    AND bt.generation = job.generation
+                   JOIN rca_learning_lane_cohorts AS cohort
+                   JOIN rca_learning_lane_stock_items AS item
+                     ON item.cohort_id = cohort.cohort_id
+                    AND item.work_item_id = job.work_item_id
+                  WHERE job.delivery_id = NEW.delivery_id
+                    AND (
+                        julianday(bt.created_at) IS NULL
+                        OR julianday(cohort.stock_cutoff) IS NULL
+                        OR julianday(bt.created_at) > julianday(cohort.stock_cutoff)
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                          FROM rca_learning_lane_admissions AS admission
+                         WHERE admission.business_key = job.business_key
+                           AND admission.generation = job.generation
+                           AND admission.lane = 'learning'
+                           AND admission.external_write_allowed = 0
+                    )
+                    AND NOT (
+                        NEW.effect_kind = 'feishu_issue_comment'
+                        AND NEW.target_key = job.target_key
+                        AND job.target_key =
+                            'feishu_project:' || bt.project_key || ':' ||
+                            bt.work_item_type_key || ':' || bt.work_item_id
+                        AND json_extract(NEW.payload_json, '$.schema_version') IN (
+                            'pnc_rca_terminal_delivery_effect_v1',
+                            'pnc_rca_terminal_delivery_effect_v2',
+                            'pnc_rca_terminal_delivery_effect_v3'
+                        )
+                        AND json_extract(NEW.payload_json, '$.delivery_id') =
+                            NEW.delivery_id
+                        AND json_extract(NEW.payload_json, '$.effect_kind') =
+                            NEW.effect_kind
+                        AND json_extract(NEW.payload_json, '$.target_key') =
+                            NEW.target_key
+                        AND json_extract(NEW.payload_json, '$.project_key') =
+                            bt.project_key
+                        AND json_extract(
+                            NEW.payload_json, '$.work_item_type_key'
+                        ) = bt.work_item_type_key
+                        AND json_extract(NEW.payload_json, '$.work_item_id') =
+                            bt.work_item_id
+                        AND json_extract(NEW.payload_json, '$.submission_key') =
+                            job.submission_key
+                        AND json_extract(NEW.payload_json, '$.generation') =
+                            job.generation
+                        AND EXISTS (
+                            SELECT 1
+                              FROM rca_terminal_rerun_delivery_authorities AS authority
+                              JOIN rca_execution_watch AS authority_watch
+                                ON authority_watch.submission_key =
+                                   job.submission_key
+                               AND authority_watch.delivery_id = job.delivery_id
+                              JOIN rca_outbox AS authority_outbox
+                                ON authority_outbox.outbox_id =
+                                   authority_watch.submission_outbox_id
+                               AND authority_outbox.business_key =
+                                   job.business_key
+                               AND authority_outbox.generation = job.generation
+                               AND authority_outbox.submission_key =
+                                   job.submission_key
+                             WHERE authority.business_key = job.business_key
+                               AND authority.generation = job.generation
+                               AND authority.submission_key = job.submission_key
+                               AND authority.outbox_id =
+                                   authority_outbox.outbox_id
+                               AND authority.activation_epoch_id =
+                                   authority_outbox.activation_epoch_id
+                               AND authority.activation_ledger_id =
+                                   authority_outbox.activation_ledger_id
+                               AND authority.project_key = bt.project_key
+                               AND authority.work_item_type_key =
+                                   bt.work_item_type_key
+                               AND authority.project_simple_name = json_extract(
+                                   bt.normalized_json, '$.project_simple_name'
+                               )
+                               AND authority.issue_id = job.work_item_id
+                               AND authority.effect_kind = NEW.effect_kind
+                               AND authority.activation_required = 1
+                        )
+                    )
+             )
+            BEGIN
+                SELECT RAISE(ABORT, 'learning_lane_admission_missing');
+            END
+            """
+        )
+        if RcaDeliveryStore._table_exists(conn, "rca_delivery_subscriptions"):
+            statements.extend(
+                (
                     """
                     CREATE TRIGGER IF NOT EXISTS
                         trg_learning_lane_stock_subscription_insert_forbidden
-                        BEFORE INSERT ON rca_delivery_subscriptions
-                        WHEN NEW.effect_kind LIKE 'feishu_%'
-                         AND EXISTS (
-                             SELECT 1
-                               FROM business_triggers AS bt
-                               JOIN rca_learning_lane_cohorts AS cohort
-                               JOIN rca_learning_lane_stock_items AS item
-                                 ON item.cohort_id = cohort.cohort_id
-                                AND item.work_item_id = bt.work_item_id
-                              WHERE bt.business_key = NEW.business_key
-                                AND bt.generation = NEW.generation
-                                AND (
-                                    julianday(bt.created_at) IS NULL
-                                    OR julianday(cohort.stock_cutoff) IS NULL
-                                    OR julianday(bt.created_at) >
-                                       julianday(cohort.stock_cutoff)
-                                )
-                                AND NOT EXISTS (
+                    BEFORE INSERT ON rca_delivery_subscriptions
+                    WHEN NEW.effect_kind LIKE 'feishu_%'
+                     AND EXISTS (
+                         SELECT 1
+                           FROM business_triggers AS bt
+                           JOIN rca_learning_lane_cohorts AS cohort
+                           JOIN rca_learning_lane_stock_items AS item
+                             ON item.cohort_id = cohort.cohort_id
+                            AND item.work_item_id = bt.work_item_id
+                          WHERE bt.business_key = NEW.business_key
+                            AND bt.generation = NEW.generation
+                            AND (
+                                julianday(bt.created_at) IS NULL
+                                OR julianday(cohort.stock_cutoff) IS NULL
+                                OR julianday(bt.created_at) >
+                                   julianday(cohort.stock_cutoff)
+                            )
+                            AND NOT EXISTS (
+                                SELECT 1
+                                  FROM rca_learning_lane_admissions AS admission
+                                 WHERE admission.business_key = NEW.business_key
+                                   AND admission.generation = NEW.generation
+                                   AND admission.lane = 'learning'
+                                   AND admission.external_write_allowed = 0
+                            )
+                            AND NOT (
+                                NEW.effect_kind = 'feishu_issue_comment'
+                                AND NEW.target_key =
+                                    'feishu_project:' || bt.project_key || ':' ||
+                                    bt.work_item_type_key || ':' || bt.work_item_id
+                                AND json_extract(
+                                    NEW.target_json, '$.platform'
+                                ) = 'feishu_project'
+                                AND json_extract(
+                                    NEW.target_json, '$.project_key'
+                                ) = bt.project_key
+                                AND json_extract(
+                                    NEW.target_json, '$.work_item_type_key'
+                                ) = bt.work_item_type_key
+                                AND json_extract(
+                                    NEW.target_json, '$.work_item_id'
+                                ) = bt.work_item_id
+                                AND EXISTS (
                                     SELECT 1
-                                      FROM rca_learning_lane_admissions AS admission
-                                     WHERE admission.business_key = NEW.business_key
-                                       AND admission.generation = NEW.generation
-                                       AND admission.lane = 'learning'
-                                       AND admission.external_write_allowed = 0
+                                      FROM rca_terminal_rerun_delivery_authorities
+                                           AS authority
+                                      JOIN rca_outbox AS authority_outbox
+                                        ON authority_outbox.outbox_id =
+                                           authority.outbox_id
+                                       AND authority_outbox.business_key =
+                                           authority.business_key
+                                       AND authority_outbox.generation =
+                                           authority.generation
+                                       AND authority_outbox.submission_key =
+                                           authority.submission_key
+                                       AND authority_outbox.activation_epoch_id =
+                                           authority.activation_epoch_id
+                                       AND authority_outbox.activation_ledger_id =
+                                           authority.activation_ledger_id
+                                     WHERE authority.business_key = NEW.business_key
+                                       AND authority.generation = NEW.generation
+                                       AND authority.submission_key =
+                                           bt.submission_key
+                                       AND authority.project_key = bt.project_key
+                                       AND authority.work_item_type_key =
+                                           bt.work_item_type_key
+                                       AND authority.project_simple_name =
+                                           json_extract(
+                                               bt.normalized_json,
+                                               '$.project_simple_name'
+                                           )
+                                       AND authority.issue_id = bt.work_item_id
+                                       AND authority.effect_kind = NEW.effect_kind
+                                       AND authority.activation_required = 1
                                 )
-                         )
-                        BEGIN
-                            SELECT RAISE(ABORT, 'learning_lane_admission_missing');
-                        END
-                        """
-                )
-                conn.execute(
+                            )
+                     )
+                    BEGIN
+                        SELECT RAISE(ABORT, 'learning_lane_admission_missing');
+                    END
+                    """,
                     """
                     CREATE TRIGGER IF NOT EXISTS
                         trg_learning_lane_stock_subscription_update_forbidden
@@ -3336,12 +3652,71 @@ class RcaDeliveryStore:
                                    AND admission.lane = 'learning'
                                    AND admission.external_write_allowed = 0
                             )
+                            AND NOT (
+                                NEW.effect_kind = 'feishu_issue_comment'
+                                AND NEW.target_key =
+                                    'feishu_project:' || bt.project_key || ':' ||
+                                    bt.work_item_type_key || ':' || bt.work_item_id
+                                AND json_extract(
+                                    NEW.target_json, '$.platform'
+                                ) = 'feishu_project'
+                                AND json_extract(
+                                    NEW.target_json, '$.project_key'
+                                ) = bt.project_key
+                                AND json_extract(
+                                    NEW.target_json, '$.work_item_type_key'
+                                ) = bt.work_item_type_key
+                                AND json_extract(
+                                    NEW.target_json, '$.work_item_id'
+                                ) = bt.work_item_id
+                                AND EXISTS (
+                                    SELECT 1
+                                      FROM rca_terminal_rerun_delivery_authorities
+                                           AS authority
+                                      JOIN rca_outbox AS authority_outbox
+                                        ON authority_outbox.outbox_id =
+                                           authority.outbox_id
+                                       AND authority_outbox.business_key =
+                                           authority.business_key
+                                       AND authority_outbox.generation =
+                                           authority.generation
+                                       AND authority_outbox.submission_key =
+                                           authority.submission_key
+                                       AND authority_outbox.activation_epoch_id =
+                                           authority.activation_epoch_id
+                                       AND authority_outbox.activation_ledger_id =
+                                           authority.activation_ledger_id
+                                     WHERE authority.business_key = NEW.business_key
+                                       AND authority.generation = NEW.generation
+                                       AND authority.submission_key =
+                                           bt.submission_key
+                                       AND authority.project_key = bt.project_key
+                                       AND authority.work_item_type_key =
+                                           bt.work_item_type_key
+                                       AND authority.project_simple_name =
+                                           json_extract(
+                                               bt.normalized_json,
+                                               '$.project_simple_name'
+                                           )
+                                       AND authority.issue_id = bt.work_item_id
+                                       AND authority.effect_kind = NEW.effect_kind
+                                       AND authority.activation_required = 1
+                                )
+                            )
                      )
                     BEGIN
                         SELECT RAISE(ABORT, 'learning_lane_admission_missing');
                     END
-                    """
+                    """,
                 )
+            )
+        return tuple(statements)
+
+    @staticmethod
+    def _install_w6_effect_guards(conn: sqlite3.Connection) -> None:
+        """Install exact DB-level W6 backstops for the shared control schema."""
+        for statement in RcaDeliveryStore._w6_effect_guard_statements(conn):
+            conn.execute(statement)
 
     @staticmethod
     def _validate_comment_slot_schema(conn: sqlite3.Connection) -> None:
@@ -3406,7 +3781,7 @@ class RcaDeliveryStore:
 
     @staticmethod
     def _validate_w6_effect_guards(conn: sqlite3.Connection) -> None:
-        """Fail closed when a current control DB has a partial W6 backstop."""
+        """Require the exact W6 trigger bodies, including correction authority."""
         w6_authority_tables = {
             "rca_learning_lane_cohorts",
             "rca_learning_lane_stock_items",
@@ -3426,45 +3801,38 @@ class RcaDeliveryStore:
             raise RuntimeError(
                 "incompatible_delivery_store_schema:w6_authority_tables"
             )
-        trigger_rows = {
-            str(row["name"]): " ".join(
-                str(row["sql"] or "").lower().split()
+        normalize_sql = lambda value: " ".join(str(value).lower().split()).rstrip(
+            ";"
+        )
+        expected: dict[str, str] = {}
+        for statement in RcaDeliveryStore._w6_effect_guard_statements(conn):
+            normalized = normalize_sql(statement)
+            prefix = "create trigger if not exists "
+            if not normalized.startswith(prefix):
+                raise RuntimeError(
+                    "incompatible_delivery_store_schema:w6_trigger_definition"
+                )
+            name = normalized[len(prefix) :].split(" ", 1)[0]
+            expected[name] = normalized.replace(
+                prefix, "create trigger ", 1
             )
+        observed = {
+            str(row["name"]): normalize_sql(row["sql"] or "")
             for row in conn.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type = 'trigger'"
             ).fetchall()
+            if str(row["name"]) in expected
         }
-        required = {
-            "trg_learning_lane_effect_insert_forbidden": (
-                "before insert on rca_delivery_effects",
-                "learning_lane_external_effect_forbidden",
-            ),
-            "trg_learning_lane_stock_effect_insert_forbidden": (
-                "before insert on rca_delivery_effects",
-                "learning_lane_admission_missing",
-            ),
-        }
-        if RcaDeliveryStore._table_exists(
-            conn, "rca_delivery_subscriptions"
-        ):
-            required[
-                "trg_learning_lane_stock_subscription_insert_forbidden"
-            ] = (
-                "before insert on rca_delivery_subscriptions",
-                "learning_lane_admission_missing",
+        if observed != expected:
+            mismatched = sorted(
+                name
+                for name in set(expected) | set(observed)
+                if expected.get(name) != observed.get(name)
             )
-            required[
-                "trg_learning_lane_stock_subscription_update_forbidden"
-            ] = (
-                "before update of business_key, generation, effect_kind",
-                "learning_lane_admission_missing",
+            detail = mismatched[0] if mismatched else "unknown"
+            raise RuntimeError(
+                f"incompatible_delivery_store_schema:w6_trigger:{detail}"
             )
-        for name, markers in required.items():
-            sql = trigger_rows.get(name)
-            if sql is None or any(marker not in sql for marker in markers):
-                raise RuntimeError(
-                    f"incompatible_delivery_store_schema:w6_trigger:{name}"
-                )
 
     def journal_settings(self) -> dict[str, Any]:
         conn = self._connect()
@@ -3883,6 +4251,7 @@ class RcaDeliveryStore:
                 business_key=str(validated["business_key"]),
                 generation=int(validated["generation"]),
                 work_item_id=str(validated["work_item_id"]),
+                effect_kind=DELIVERY_CARD_PATCH_EFFECT_KIND,
             )
             existing = conn.execute(
                 """
@@ -5515,6 +5884,158 @@ class RcaDeliveryStore:
         }
 
     @classmethod
+    def _terminal_rerun_authority_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        business_key: str,
+        generation: int,
+        work_item_id: str | None = None,
+    ) -> sqlite3.Row | None:
+        required_tables = (
+            "rca_terminal_rerun_delivery_authorities",
+            "business_triggers",
+            "rca_outbox",
+            "rca_trigger_bindings",
+            "rca_trigger_sources",
+            "rca_activation_admission_ledger",
+            "rca_activation_epochs",
+        )
+        if not all(cls._table_exists(conn, table) for table in required_tables):
+            return None
+        row = conn.execute(
+            """
+            SELECT authority.*,
+                   trigger.work_item_id AS bound_work_item_id,
+                   trigger.activation_epoch_id AS bound_epoch_id,
+                   trigger.activation_ledger_id AS bound_ledger_id
+              FROM rca_terminal_rerun_delivery_authorities AS authority
+              JOIN business_triggers AS trigger
+                ON trigger.business_key = authority.business_key
+               AND trigger.generation = authority.generation
+               AND trigger.submission_key = authority.submission_key
+               AND trigger.project_key = authority.project_key
+               AND trigger.work_item_type_key = authority.work_item_type_key
+               AND trigger.work_item_id = authority.issue_id
+               AND json_extract(
+                   trigger.normalized_json, '$.project_simple_name'
+               ) = authority.project_simple_name
+               AND trigger.activation_epoch_id = authority.activation_epoch_id
+               AND trigger.activation_ledger_id = authority.activation_ledger_id
+              JOIN rca_trigger_bindings AS binding
+                ON binding.source_id = authority.source_id
+               AND binding.business_key = authority.business_key
+               AND binding.generation = authority.generation
+               AND binding.role = 'origin'
+              JOIN rca_trigger_sources AS source
+                ON source.source_id = binding.source_id
+               AND source.payload_sha256 = authority.source_payload_sha256
+               AND source.source_kind = 'feishu_group_manual'
+               AND source.platform = 'operator'
+               AND source.chat_id = ''
+               AND source.thread_id = ''
+               AND source.mode = 'rerun'
+               AND source.outcome = 'created'
+               AND source.requester_id = authority.requester_id
+              JOIN rca_outbox AS outbox
+                ON outbox.outbox_id = authority.outbox_id
+               AND outbox.business_key = authority.business_key
+               AND outbox.generation = authority.generation
+               AND outbox.submission_key = authority.submission_key
+               AND outbox.origin_source_id = authority.source_id
+               AND outbox.action = 'submit_rca_issue_intake'
+               AND outbox.activation_epoch_id = authority.activation_epoch_id
+               AND outbox.activation_ledger_id = authority.activation_ledger_id
+              JOIN rca_activation_admission_ledger AS ledger
+                ON ledger.ledger_id = authority.activation_ledger_id
+               AND ledger.epoch_id = authority.activation_epoch_id
+               AND ledger.entrypoint = 'manual_admit'
+               AND ledger.source_kind = 'manual'
+               AND ledger.decision = 'admit'
+               AND ledger.business_key = authority.business_key
+               AND ledger.submission_key = authority.submission_key
+               AND ledger.generation = authority.generation
+               AND ledger.bound_at IS NOT NULL
+              JOIN rca_activation_epochs AS epoch
+                ON epoch.epoch_id = ledger.epoch_id
+               AND epoch.is_current = 1
+               AND epoch.state IN ('bounded_active', 'steady_active')
+             WHERE authority.business_key = ?
+               AND authority.generation = ?
+               AND authority.effect_kind = 'feishu_issue_comment'
+               AND authority.activation_required = 1
+             LIMIT 1
+            """,
+            (str(business_key), int(generation)),
+        ).fetchone()
+        if row is None or (
+            work_item_id is not None
+            and str(row["issue_id"]) != str(work_item_id)
+        ):
+            return None
+        try:
+            from gateway.pnc_rca_control_store import (
+                TERMINAL_RERUN_DELIVERY_AUTHORITY_SCHEMA_VERSION,
+                build_batch_terminal_rerun_authority,
+                build_silent_terminal_rerun_authority,
+            )
+
+            authority = json.loads(str(row["authority_json"]))
+            if not isinstance(authority, dict):
+                return None
+            if str(row["authority_kind"]) == "silent_terminal":
+                expected = build_silent_terminal_rerun_authority(
+                    batch_id=authority.get("batch_id"),
+                    queue_sha256=authority.get("queue_sha256"),
+                    issue_id=authority.get("issue_id"),
+                    prior_submission_key=authority.get("prior_submission_key"),
+                    prior_generation=authority.get("prior_generation"),
+                    owner_receipt_path=authority.get("owner_receipt_path"),
+                    owner_receipt_sha256=authority.get("owner_receipt_sha256"),
+                    requester_id=authority.get("requester_id"),
+                    reason=authority.get("reason"),
+                    activation_required=authority.get("activation_required"),
+                )
+                expected_prior_delivery_id = ""
+            elif str(row["authority_kind"]) == "batch_terminal":
+                expected = build_batch_terminal_rerun_authority(
+                    batch_id=authority.get("batch_id"),
+                    queue_sha256=authority.get("queue_sha256"),
+                    issue_id=authority.get("issue_id"),
+                    prior_submission_key=authority.get("prior_submission_key"),
+                    prior_generation=authority.get("prior_generation"),
+                    prior_delivery_id=authority.get("prior_delivery_id"),
+                    owner_receipt_path=authority.get("owner_receipt_path"),
+                    owner_receipt_sha256=authority.get("owner_receipt_sha256"),
+                    requester_id=authority.get("requester_id"),
+                    reason=authority.get("reason"),
+                    activation_required=authority.get("activation_required"),
+                )
+                expected_prior_delivery_id = str(expected["prior_delivery_id"])
+            else:
+                return None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        expected_projection = {
+            "authority_sha256": str(expected["selection_sha256"]),
+            "schema_version": TERMINAL_RERUN_DELIVERY_AUTHORITY_SCHEMA_VERSION,
+            "issue_id": str(expected["issue_id"]),
+            "batch_id": str(expected["batch_id"]),
+            "prior_submission_key": str(expected["prior_submission_key"]),
+            "prior_generation": int(expected["prior_generation"]),
+            "prior_delivery_id": expected_prior_delivery_id,
+            "queue_sha256": str(expected["queue_sha256"]),
+            "owner_receipt_path": str(expected["owner_receipt_path"]),
+            "owner_receipt_sha256": str(expected["owner_receipt_sha256"]),
+            "requester_id": str(expected["requester_id"]),
+            "reason": str(expected["reason"]),
+            "authority_json": _canonical_json(expected),
+        }
+        if any(row[name] != value for name, value in expected_projection.items()):
+            return None
+        return row
+
+    @classmethod
     def _explicit_user_rerun_keys_tx(
         cls,
         conn: sqlite3.Connection,
@@ -5607,7 +6128,13 @@ class RcaDeliveryStore:
         business_key: str,
         generation: int,
         work_item_id: str | None = None,
-    ) -> Literal["admitted", "admission_missing", "not_learning", "unknown"]:
+    ) -> Literal[
+        "admitted",
+        "terminal_rerun_authorized",
+        "admission_missing",
+        "not_learning",
+        "unknown",
+    ]:
         """Resolve the W6 lane from immutable admission and stock authority.
 
         A stock member is learning even when its admission row is missing.  The
@@ -5742,7 +6269,16 @@ class RcaDeliveryStore:
             "WHERE cohort_id = ? AND work_item_id = ?",
             (str(cohort["cohort_id"]), item_id),
         ).fetchone()
-        return "admission_missing" if member is not None else "not_learning"
+        if member is None:
+            return "not_learning"
+        if cls._terminal_rerun_authority_tx(
+            conn,
+            business_key=str(business_key),
+            generation=int(generation),
+            work_item_id=item_id,
+        ) is not None:
+            return "terminal_rerun_authorized"
+        return "admission_missing"
 
     @classmethod
     def _require_learning_lane_guard_tx(
@@ -5752,7 +6288,10 @@ class RcaDeliveryStore:
         business_key: str,
         generation: int,
         work_item_id: str | None = None,
-    ) -> None:
+        effect_kind: str,
+    ) -> Literal[
+        "terminal_rerun_authorized", "not_learning"
+    ]:
         state = cls._learning_lane_guard_state_tx(
             conn,
             business_key=business_key,
@@ -5761,10 +6300,15 @@ class RcaDeliveryStore:
         )
         if state == "admitted":
             raise DeliveryContractError(LEARNING_LANE_EXTERNAL_EFFECT_ERROR)
+        if state == "terminal_rerun_authorized":
+            if str(effect_kind) != DELIVERY_EFFECT_KIND:
+                raise DeliveryContractError(LEARNING_LANE_EXTERNAL_EFFECT_ERROR)
+            return state
         if state == "admission_missing":
             raise DeliveryContractError(LEARNING_LANE_ADMISSION_MISSING_ERROR)
         if state == "unknown":
             raise DeliveryContractError(LEARNING_LANE_EXTERNAL_EFFECT_ERROR)
+        return "not_learning"
 
     @staticmethod
     def _is_adjudication_comment_payload(
@@ -5871,14 +6415,17 @@ class RcaDeliveryStore:
             raise DeliveryRecordConflictError(
                 "delivery_comment_budget_job_identity_mismatch"
             )
-        cls._require_learning_lane_guard_tx(
+        guard_state = cls._require_learning_lane_guard_tx(
             conn,
             business_key=str(business_key),
             generation=int(generation),
             work_item_id=str(job["work_item_id"]),
+            effect_kind=DELIVERY_EFFECT_KIND,
         )
         job_target = str(job["target_key"] or "")
         is_adjudication = cls._is_adjudication_comment_payload(payload, target_key)
+        if is_adjudication and guard_state == "terminal_rerun_authorized":
+            raise DeliveryContractError(LEARNING_LANE_EXTERNAL_EFFECT_ERROR)
         if not is_adjudication and str(target_key) != job_target:
             raise DeliveryContractError("delivery_comment_budget_unclassified")
         if not is_adjudication and generation > 1:
@@ -5898,7 +6445,10 @@ class RcaDeliveryStore:
                     generation=int(generation),
                 )
             )
-            if not legacy_terminal_exception:
+            terminal_rerun_exception = (
+                is_terminal and guard_state == "terminal_rerun_authorized"
+            )
+            if not legacy_terminal_exception and not terminal_rerun_exception:
                 explicit_keys = cls._explicit_user_rerun_keys_tx(
                     conn,
                     business_key=str(job["business_key"]),
@@ -5992,6 +6542,7 @@ class RcaDeliveryStore:
             business_key=str(job["business_key"]),
             generation=int(job["generation"]),
             work_item_id=str(job["work_item_id"]),
+            effect_kind=effect_kind,
         )
         if int(subscription["required"]) != 1:
             raise DeliveryContractError("delivery_subscription_required_invalid")

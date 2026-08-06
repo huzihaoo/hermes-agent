@@ -27,6 +27,7 @@ _MANUAL_KIND = "manual_admission"
 _WRITE_FENCE_KIND = "write_fence"
 _HISTORICAL_EPOCH_KIND = "historical_epoch"
 _PROFILE_TERMINAL_KIND = "profile_terminal"
+_TERMINAL_RERUN_KIND = "terminal_rerun"
 _CLAIM_FIELDS = frozenset({"schema_version", "authority_kind", "authority"})
 _MANUAL_FIELDS = frozenset({"admission", "source_identity"})
 _WRITE_FENCE_FIELDS = frozenset({"write_fence"})
@@ -61,6 +62,28 @@ _PROFILE_TERMINAL_FIELDS = frozenset(
         "submission_key",
         "generation",
         "source_error_code",
+    }
+)
+_TERMINAL_RERUN_FIELDS = frozenset(
+    {
+        "authority_sha256",
+        "outbox_id",
+        "epoch_id",
+        "activation_ledger_id",
+        "effect_key",
+        "delivery_id",
+        "lease_token",
+        "lease_fence",
+        "operation",
+        "issue_target",
+        "target_key",
+        "business_key",
+        "submission_key",
+        "generation",
+        "project_key",
+        "project_simple_name",
+        "work_item_type_key",
+        "work_item_id",
     }
 )
 _HISTORICAL_ALLOWED_OPERATIONS = frozenset(
@@ -135,6 +158,11 @@ class RcaProviderWriteClaim:
                 )
         elif kind == _PROFILE_TERMINAL_KIND:
             if set(authority) != _PROFILE_TERMINAL_FIELDS:
+                raise ExternalWriteFenceError(
+                    "external_write_provider_claim_schema_invalid"
+                )
+        elif kind == _TERMINAL_RERUN_KIND:
+            if set(authority) != _TERMINAL_RERUN_FIELDS:
                 raise ExternalWriteFenceError(
                     "external_write_provider_claim_schema_invalid"
                 )
@@ -322,6 +350,52 @@ def build_profile_terminal_provider_claim(
     )
 
 
+def build_terminal_rerun_provider_claim(
+    *,
+    authority_sha256: str,
+    outbox_id: int,
+    epoch_id: str,
+    activation_ledger_id: int,
+    effect_key: str,
+    delivery_id: str,
+    lease_token: str,
+    lease_fence: int,
+    issue_target: str,
+    target_key: str,
+    business_key: str,
+    submission_key: str,
+    generation: int,
+    project_key: str,
+    project_simple_name: str,
+    work_item_type_key: str,
+    work_item_id: str,
+) -> RcaProviderWriteClaim:
+    """Bind one immutable terminal-rerun authority to one comment lease."""
+    return _claim(
+        _TERMINAL_RERUN_KIND,
+        {
+            "authority_sha256": str(authority_sha256 or "").strip(),
+            "outbox_id": outbox_id,
+            "epoch_id": str(epoch_id or "").strip(),
+            "activation_ledger_id": activation_ledger_id,
+            "effect_key": str(effect_key or "").strip(),
+            "delivery_id": str(delivery_id or "").strip(),
+            "lease_token": str(lease_token or "").strip(),
+            "lease_fence": lease_fence,
+            "operation": "feishu_issue_comment",
+            "issue_target": str(issue_target or "").strip(),
+            "target_key": str(target_key or "").strip(),
+            "business_key": str(business_key or "").strip(),
+            "submission_key": str(submission_key or "").strip(),
+            "generation": generation,
+            "project_key": str(project_key or "").strip(),
+            "project_simple_name": str(project_simple_name or "").strip(),
+            "work_item_type_key": str(work_item_type_key or "").strip(),
+            "work_item_id": str(work_item_id or "").strip(),
+        },
+    )
+
+
 def _canonical_store():
     from gateway.pnc_rca_control_store import RcaControlStore
     from gateway.run import _g1q3_rca_control_db_path
@@ -496,6 +570,75 @@ def _profile_terminal_effect_binding(
     return live
 
 
+def _terminal_rerun_effect_binding(
+    store: Any,
+    authority: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Reopen the current authority, delivery lease, and terminal payload."""
+    from gateway.pnc_rca_delivery_store import RcaDeliveryStore
+
+    try:
+        delivery_store = RcaDeliveryStore(
+            store.db_path,
+            require_current=True,
+            read_only=True,
+            ensure_current_rows=False,
+        )
+        live = delivery_store.validate_terminal_rerun_external_write_binding(
+            effect_key=authority.get("effect_key"),
+            delivery_id=authority.get("delivery_id"),
+            lease_token=authority.get("lease_token"),
+            lease_fence=authority.get("lease_fence"),
+            operation=authority.get("operation"),
+            issue_url=authority.get("issue_target"),
+            target_key=authority.get("target_key"),
+            business_key=authority.get("business_key"),
+            submission_key=authority.get("submission_key"),
+            generation=authority.get("generation"),
+            require_write_started=True,
+        )
+    except RuntimeError as exc:
+        code = str(exc)
+        if code not in {
+            "external_write_fence_schema_invalid",
+            "external_write_fence_epoch_not_current",
+            "external_write_fence_operation_denied",
+            "external_write_fence_identity_mismatch",
+            "external_write_fence_target_mismatch",
+        }:
+            code = "external_write_fence_identity_mismatch"
+        raise ExternalWriteFenceError(code, str(exc)) from exc
+    expected = {
+        "authority_sha256": live["authority_sha256"],
+        "outbox_id": live["outbox_id"],
+        "epoch_id": live["epoch_id"],
+        "activation_ledger_id": live["activation_ledger_id"],
+        "effect_key": live["effect_key"],
+        "delivery_id": live["delivery_id"],
+        "lease_token": live["lease_token"],
+        "lease_fence": live["lease_fence"],
+        "operation": live["operation"],
+        "issue_target": live["issue_url"],
+        "target_key": live["target_key"],
+        "business_key": live["business_key"],
+        "submission_key": live["submission_key"],
+        "generation": live["generation"],
+        "project_key": live["project_key"],
+        "project_simple_name": live["project_simple_name"],
+        "work_item_type_key": live["work_item_type_key"],
+        "work_item_id": live["work_item_id"],
+    }
+    if dict(authority) != expected:
+        if authority.get("epoch_id") != live["epoch_id"]:
+            raise ExternalWriteFenceError("external_write_fence_epoch_not_current")
+        if authority.get("operation") != "feishu_issue_comment":
+            raise ExternalWriteFenceError("external_write_fence_operation_denied")
+        if authority.get("issue_target") != live["issue_url"]:
+            raise ExternalWriteFenceError("external_write_fence_target_mismatch")
+        raise ExternalWriteFenceError("external_write_fence_identity_mismatch")
+    return live
+
+
 def revalidate_provider_write_claim(
     claim: RcaProviderWriteClaim,
     *,
@@ -592,6 +735,23 @@ def revalidate_provider_write_claim(
             or not expected_project_key
             or observed_work_item != expected_work_item
             or observed_project != expected_project_key
+        ):
+            raise ExternalWriteFenceError("external_write_fence_target_mismatch")
+        return {"authority_kind": kind, **dict(live)}
+
+    if kind == _TERMINAL_RERUN_KIND:
+        if op != "feishu_issue_comment" or authority.get("operation") != op:
+            raise ExternalWriteFenceError("external_write_fence_operation_denied")
+        live = _terminal_rerun_effect_binding(store, authority)
+        if (
+            observed_project != str(live["project_key"])
+            or observed_work_item != str(live["work_item_id"])
+        ):
+            raise ExternalWriteFenceError("external_write_fence_target_mismatch")
+        expected_url_project, expected_url_item = _issue_identity(live["issue_url"])
+        if (
+            expected_url_project != str(live["project_simple_name"])
+            or expected_url_item != str(live["work_item_id"])
         ):
             raise ExternalWriteFenceError("external_write_fence_target_mismatch")
         return {"authority_kind": kind, **dict(live)}
@@ -745,6 +905,7 @@ __all__ = [
     "build_manual_provider_write_claim",
     "build_historical_epoch_provider_claim",
     "build_profile_terminal_provider_claim",
+    "build_terminal_rerun_provider_claim",
     "build_write_fence_provider_claim",
     "current_provider_write_claim",
     "require_provider_write_claim",

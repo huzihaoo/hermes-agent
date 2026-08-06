@@ -30,7 +30,7 @@ from gateway.pnc_rca_delivery_contract import RCA_RESULT_FIELD_KEY
 
 
 AUDIT_SCHEMA_VERSION = "pnc_rca_conclusion_adjudication_audit_v2"
-EXPECTED_DELIVERY_STORE_SCHEMA_VERSION = "pnc_rca_delivery_store_v11"
+EXPECTED_DELIVERY_STORE_SCHEMA_VERSION = "pnc_rca_delivery_store_v12"
 MIN_GA_RECOGNITION_BATCH_SIZE = 5
 _SETTLED_READBACK_SOURCES = frozenset({
     "read_before_write",

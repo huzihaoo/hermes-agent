@@ -17,6 +17,7 @@ from gateway.pnc_rca_control_store import (
 )
 from gateway.pnc_rca_delivery_contract import DeliveryContractError
 from gateway.pnc_rca_delivery_store import (
+    DELIVERY_STORE_SCHEMA_VERSION,
     LEARNING_LANE_ADMISSION_MISSING_ERROR,
     LEARNING_LANE_EXTERNAL_EFFECT_ERROR,
     RcaDeliveryStore,
@@ -418,6 +419,97 @@ def test_v11_marker_migrates_the_v12_learning_schema(tmp_path):
     assert migrated.initialization_observation()["mode"] == "migration"
     assert migrated.list_rows("rca_learning_lane_cohorts") == []
     assert migrated.list_rows("rca_learning_lane_admissions") == []
+
+
+def _install_weakened_stock_effect_trigger(conn: sqlite3.Connection) -> None:
+    conn.execute("DROP TRIGGER trg_learning_lane_stock_effect_insert_forbidden")
+    conn.execute(
+        """
+        CREATE TRIGGER trg_learning_lane_stock_effect_insert_forbidden
+        BEFORE INSERT ON rca_delivery_effects
+        WHEN 0
+        BEGIN
+            SELECT RAISE(ABORT, 'learning_lane_admission_missing');
+        END
+        """
+    )
+
+
+def test_delivery_v11_to_v12_replaces_stock_guards_atomically(tmp_path):
+    db_path = tmp_path / "delivery-migration.sqlite3"
+    RcaControlStore(db_path)
+    RcaDeliveryStore(db_path)
+    with sqlite3.connect(db_path) as conn:
+        _install_weakened_stock_effect_trigger(conn)
+        conn.execute(
+            "UPDATE rca_delivery_meta SET value='pnc_rca_delivery_store_v11' "
+            "WHERE key='schema_version'"
+        )
+
+    with pytest.raises(RuntimeError, match="rca_delivery_store_schema_not_current"):
+        RcaDeliveryStore(db_path, require_current=True)
+    migrated = RcaDeliveryStore(db_path)
+
+    assert migrated.health()["schema_version"] == DELIVERY_STORE_SCHEMA_VERSION
+    RcaDeliveryStore(db_path, require_current=True)
+    with sqlite3.connect(db_path) as conn:
+        sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' "
+            "AND name='trg_learning_lane_stock_effect_insert_forbidden'"
+        ).fetchone()[0]
+    assert "terminal_rerun_delivery_authorities" in sql
+    assert "WHEN 0" not in sql
+
+
+def test_delivery_v11_to_v12_guard_replacement_rolls_back(tmp_path, monkeypatch):
+    db_path = tmp_path / "delivery-migration-rollback.sqlite3"
+    RcaControlStore(db_path)
+    RcaDeliveryStore(db_path)
+    with sqlite3.connect(db_path) as conn:
+        _install_weakened_stock_effect_trigger(conn)
+        conn.execute(
+            "UPDATE rca_delivery_meta SET value='pnc_rca_delivery_store_v11' "
+            "WHERE key='schema_version'"
+        )
+    install = RcaDeliveryStore._install_w6_effect_guards
+
+    def fail_after_install(conn):
+        install(conn)
+        raise RuntimeError("injected_delivery_v12_guard_failure")
+
+    monkeypatch.setattr(
+        RcaDeliveryStore,
+        "_install_w6_effect_guards",
+        staticmethod(fail_after_install),
+    )
+    with pytest.raises(RuntimeError, match="injected_delivery_v12_guard_failure"):
+        RcaDeliveryStore(db_path)
+
+    with sqlite3.connect(db_path) as conn:
+        marker = conn.execute(
+            "SELECT value FROM rca_delivery_meta WHERE key='schema_version'"
+        ).fetchone()[0]
+        sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' "
+            "AND name='trg_learning_lane_stock_effect_insert_forbidden'"
+        ).fetchone()[0]
+    assert marker == "pnc_rca_delivery_store_v11"
+    assert "WHEN 0" in sql
+
+
+def test_current_delivery_v12_rejects_redefined_stock_guard(tmp_path):
+    db_path = tmp_path / "delivery-current-tamper.sqlite3"
+    RcaControlStore(db_path)
+    RcaDeliveryStore(db_path)
+    with sqlite3.connect(db_path) as conn:
+        _install_weakened_stock_effect_trigger(conn)
+
+    with pytest.raises(
+        RuntimeError,
+        match="incompatible_delivery_store_schema:w6_trigger:"
+        "trg_learning_lane_stock_effect_insert_forbidden",
+    ):
+        RcaDeliveryStore(db_path, require_current=True)
 
 
 def test_learning_cohort_and_admission_are_immutable(tmp_path):

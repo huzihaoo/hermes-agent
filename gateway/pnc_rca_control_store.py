@@ -47,8 +47,8 @@ from gateway.pnc_rca_runtime_transition import (
 from gateway.pnc_rca_requester_identity import validate_rca_requester
 
 
-CONTROL_STORE_SCHEMA_VERSION = "pnc_rca_control_store_v13"
-CONTROL_STORE_SCHEMA_PREDECESSOR_VERSION = "pnc_rca_control_store_v12"
+CONTROL_STORE_SCHEMA_VERSION = "pnc_rca_control_store_v14"
+CONTROL_STORE_SCHEMA_PREDECESSOR_VERSION = "pnc_rca_control_store_v13"
 SUPPORTED_CONTROL_STORE_SCHEMA_VERSIONS = frozenset(
     {
         "pnc_rca_control_store_v3",
@@ -61,6 +61,7 @@ SUPPORTED_CONTROL_STORE_SCHEMA_VERSIONS = frozenset(
         "pnc_rca_control_store_v10",
         "pnc_rca_control_store_v11",
         "pnc_rca_control_store_v12",
+        "pnc_rca_control_store_v13",
         CONTROL_STORE_SCHEMA_VERSION,
     }
 )
@@ -481,6 +482,12 @@ OUTBOX_PAYLOAD_SCHEMA_VERSION = "pnc_rca_submission_outbox_v2"
 DELIVERY_TARGET_SCHEMA_VERSION = "pnc_rca_delivery_target_v1"
 LEARNING_LANE_ADMISSION_SCHEMA_VERSION = "g1q3_rca_learning_lane_admission_v1"
 LEARNING_LANE_COHORT_SCHEMA_VERSION = "g1q3_rca_learning_lane_cohort_v1"
+TERMINAL_RERUN_DELIVERY_AUTHORITY_SCHEMA_VERSION = (
+    "pnc_rca_terminal_rerun_delivery_authority_v1"
+)
+TERMINAL_RERUN_DELIVERY_AUTHORITY_KINDS = frozenset(
+    {"silent_terminal", "batch_terminal"}
+)
 ACTIVATION_HISTORICAL_OUTBOX_HOLD_SCHEMA_VERSION = (
     "pnc_rca_activation_historical_outbox_hold_v1"
 )
@@ -2931,18 +2938,26 @@ class RcaControlStore:
             migrated = self._migrate_v10_to_v11()
             migrated = self._migrate_v11_to_v12() or migrated
             migrated = self._migrate_v12_to_v13() or migrated
+            migrated = self._migrate_v13_to_v14() or migrated
             self._initialization_mode = "migration" if migrated else "steady"
             return
 
         if marker_value == "pnc_rca_control_store_v11":
             migrated = self._migrate_v11_to_v12()
             migrated = self._migrate_v12_to_v13() or migrated
+            migrated = self._migrate_v13_to_v14() or migrated
             self._initialization_mode = "migration" if migrated else "steady"
             return
 
         if marker_value == "pnc_rca_control_store_v12":
+            migrated = self._migrate_v12_to_v13()
+            migrated = self._migrate_v13_to_v14() or migrated
+            self._initialization_mode = "migration" if migrated else "steady"
+            return
+
+        if marker_value == "pnc_rca_control_store_v13":
             self._initialization_mode = (
-                "migration" if self._migrate_v12_to_v13() else "steady"
+                "migration" if self._migrate_v13_to_v14() else "steady"
             )
             return
 
@@ -3548,6 +3563,7 @@ class RcaControlStore:
             # install its durable target schema before invoking that path.
             self._create_v12_learning_lane_schema(conn)
             self._create_v13_historical_outbox_hold_schema(conn)
+            self._create_v14_terminal_rerun_delivery_authority_schema(conn)
             if self._learning_delivery_schema_present(conn):
                 self._ensure_learning_lane_cohort_tx(
                     conn, sealed_at=_now_iso()
@@ -3626,6 +3642,8 @@ class RcaControlStore:
             )
             self._create_v11_snapshot_schema(conn)
             self._create_v12_learning_lane_schema(conn)
+            self._create_v13_historical_outbox_hold_schema(conn)
+            self._create_v14_terminal_rerun_delivery_authority_schema(conn)
             self._validate_structural_contract(
                 conn,
                 integrity_check=marker_value != CONTROL_STORE_SCHEMA_VERSION,
@@ -3698,6 +3716,7 @@ class RcaControlStore:
             marker_value = str(marker["value"]) if marker is not None else ""
             if marker_value in {
                 "pnc_rca_control_store_v12",
+                "pnc_rca_control_store_v13",
                 CONTROL_STORE_SCHEMA_VERSION,
             }:
                 self._validate_structural_contract(conn, integrity_check=False)
@@ -3736,7 +3755,10 @@ class RcaControlStore:
                 "SELECT value FROM control_meta WHERE key = 'schema_version'"
             ).fetchone()
             marker_value = str(marker["value"]) if marker is not None else ""
-            if marker_value == CONTROL_STORE_SCHEMA_VERSION:
+            if marker_value in {
+                "pnc_rca_control_store_v13",
+                CONTROL_STORE_SCHEMA_VERSION,
+            }:
                 self._validate_structural_contract(conn, integrity_check=False)
                 conn.commit()
                 return False
@@ -3749,7 +3771,41 @@ class RcaControlStore:
             updated = conn.execute(
                 "UPDATE control_meta SET value = ? "
                 "WHERE key = 'schema_version' AND value = ?",
-                (CONTROL_STORE_SCHEMA_VERSION, "pnc_rca_control_store_v12"),
+                ("pnc_rca_control_store_v13", "pnc_rca_control_store_v12"),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError("incompatible_control_store_schema:version_marker")
+            conn.commit()
+            return True
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _migrate_v13_to_v14(self) -> bool:
+        """Install immutable terminal-rerun delivery authority atomically."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            marker = conn.execute(
+                "SELECT value FROM control_meta WHERE key = 'schema_version'"
+            ).fetchone()
+            marker_value = str(marker["value"]) if marker is not None else ""
+            if marker_value == CONTROL_STORE_SCHEMA_VERSION:
+                self._validate_structural_contract(conn, integrity_check=False)
+                conn.commit()
+                return False
+            if marker_value != "pnc_rca_control_store_v13":
+                raise RuntimeError("incompatible_control_store_schema:version_marker")
+            self._validate_v13_historical_outbox_hold_schema(conn)
+            self._create_v14_terminal_rerun_delivery_authority_schema(conn)
+            self._validate_structural_contract(conn, integrity_check=True)
+            updated = conn.execute(
+                "UPDATE control_meta SET value = ? "
+                "WHERE key = 'schema_version' AND value = ?",
+                (CONTROL_STORE_SCHEMA_VERSION, "pnc_rca_control_store_v13"),
             )
             if updated.rowcount != 1:
                 raise RuntimeError("incompatible_control_store_schema:version_marker")
@@ -5501,6 +5557,553 @@ class RcaControlStore:
                         "historical_outbox_disposition_row_binding"
                     )
 
+    @staticmethod
+    def _v14_terminal_rerun_delivery_authority_trigger_names() -> tuple[str, ...]:
+        return (
+            "trg_terminal_rerun_delivery_authority_no_update",
+            "trg_terminal_rerun_delivery_authority_no_delete",
+            "trg_terminal_rerun_delivery_authority_no_replace",
+            "trg_terminal_rerun_delivery_authority_projection_guard",
+            "trg_terminal_rerun_delivery_authority_binding_guard",
+        )
+
+    @staticmethod
+    def _v14_terminal_rerun_delivery_authority_schema_statements() -> tuple[str, ...]:
+        return (
+            f"""
+            CREATE TABLE IF NOT EXISTS rca_terminal_rerun_delivery_authorities (
+                authority_sha256 TEXT PRIMARY KEY CHECK(
+                    length(authority_sha256) = 64
+                    AND authority_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+                schema_version TEXT NOT NULL CHECK(
+                    schema_version =
+                        '{TERMINAL_RERUN_DELIVERY_AUTHORITY_SCHEMA_VERSION}'
+                ),
+                authority_kind TEXT NOT NULL CHECK(
+                    authority_kind IN ('silent_terminal', 'batch_terminal')
+                ),
+                source_id TEXT NOT NULL UNIQUE,
+                outbox_id INTEGER NOT NULL UNIQUE,
+                source_payload_sha256 TEXT NOT NULL CHECK(
+                    length(source_payload_sha256) = 64
+                    AND source_payload_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+                business_key TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK(generation >= 2),
+                submission_key TEXT NOT NULL UNIQUE,
+                activation_epoch_id TEXT NOT NULL,
+                activation_ledger_id INTEGER NOT NULL UNIQUE,
+                effect_kind TEXT NOT NULL CHECK(
+                    effect_kind = 'feishu_issue_comment'
+                ),
+                project_key TEXT NOT NULL CHECK(length(trim(project_key)) > 0),
+                project_simple_name TEXT NOT NULL CHECK(
+                    length(trim(project_simple_name)) > 0
+                ),
+                work_item_type_key TEXT NOT NULL CHECK(
+                    length(trim(work_item_type_key)) > 0
+                ),
+                issue_id TEXT NOT NULL CHECK(
+                    length(issue_id) BETWEEN 1 AND 32
+                    AND issue_id NOT GLOB '*[^0-9]*'
+                ),
+                batch_id TEXT NOT NULL CHECK(length(trim(batch_id)) > 0),
+                prior_submission_key TEXT NOT NULL,
+                prior_generation INTEGER NOT NULL CHECK(prior_generation >= 1),
+                prior_delivery_id TEXT NOT NULL,
+                queue_sha256 TEXT NOT NULL CHECK(
+                    length(queue_sha256) = 64
+                    AND queue_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+                owner_receipt_path TEXT NOT NULL CHECK(
+                    length(trim(owner_receipt_path)) > 0
+                ),
+                owner_receipt_sha256 TEXT NOT NULL CHECK(
+                    length(owner_receipt_sha256) = 64
+                    AND owner_receipt_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+                requester_id TEXT NOT NULL CHECK(
+                    requester_id LIKE 'automation:%'
+                ),
+                reason TEXT NOT NULL CHECK(
+                    reason = 'production_gray_batch:' || batch_id
+                ),
+                activation_required INTEGER NOT NULL CHECK(
+                    activation_required = 1
+                ),
+                authority_json TEXT NOT NULL CHECK(json_valid(authority_json)),
+                created_at TEXT NOT NULL CHECK(length(trim(created_at)) > 0),
+                UNIQUE(business_key, generation),
+                CHECK(generation = prior_generation + 1),
+                CHECK(
+                    (authority_kind = 'silent_terminal' AND prior_delivery_id = '')
+                    OR
+                    (authority_kind = 'batch_terminal'
+                     AND length(trim(prior_delivery_id)) > 0)
+                ),
+                FOREIGN KEY(source_id) REFERENCES rca_trigger_sources(source_id),
+                FOREIGN KEY(outbox_id) REFERENCES rca_outbox(outbox_id),
+                FOREIGN KEY(business_key, generation)
+                    REFERENCES business_triggers(business_key, generation),
+                FOREIGN KEY(submission_key)
+                    REFERENCES business_triggers(submission_key),
+                FOREIGN KEY(activation_epoch_id)
+                    REFERENCES rca_activation_epochs(epoch_id),
+                FOREIGN KEY(activation_ledger_id)
+                    REFERENCES rca_activation_admission_ledger(ledger_id),
+                FOREIGN KEY(business_key, prior_generation)
+                    REFERENCES business_triggers(business_key, generation),
+                FOREIGN KEY(prior_submission_key)
+                    REFERENCES business_triggers(submission_key)
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_terminal_rerun_delivery_authority_issue
+                ON rca_terminal_rerun_delivery_authorities(
+                    issue_id, generation, authority_sha256
+                )
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS
+                trg_terminal_rerun_delivery_authority_no_update
+            BEFORE UPDATE ON rca_terminal_rerun_delivery_authorities
+            BEGIN
+                SELECT RAISE(
+                    ABORT, 'terminal_rerun_delivery_authority_update_forbidden'
+                );
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS
+                trg_terminal_rerun_delivery_authority_no_delete
+            BEFORE DELETE ON rca_terminal_rerun_delivery_authorities
+            BEGIN
+                SELECT RAISE(
+                    ABORT, 'terminal_rerun_delivery_authority_delete_forbidden'
+                );
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS
+                trg_terminal_rerun_delivery_authority_no_replace
+            BEFORE INSERT ON rca_terminal_rerun_delivery_authorities
+            WHEN EXISTS (
+                SELECT 1 FROM rca_terminal_rerun_delivery_authorities
+                 WHERE authority_sha256 = NEW.authority_sha256
+                    OR source_id = NEW.source_id
+                    OR submission_key = NEW.submission_key
+                    OR (
+                        business_key = NEW.business_key
+                        AND generation = NEW.generation
+                    )
+            )
+            BEGIN
+                SELECT RAISE(
+                    ABORT, 'terminal_rerun_delivery_authority_replace_forbidden'
+                );
+            END
+            """,
+            f"""
+            CREATE TRIGGER IF NOT EXISTS
+                trg_terminal_rerun_delivery_authority_projection_guard
+            BEFORE INSERT ON rca_terminal_rerun_delivery_authorities
+            WHEN NOT COALESCE((
+                json_extract(NEW.authority_json, '$.selection_sha256') =
+                    NEW.authority_sha256
+                AND json_extract(NEW.authority_json, '$.batch_id') = NEW.batch_id
+                AND json_extract(NEW.authority_json, '$.queue_sha256') =
+                    NEW.queue_sha256
+                AND json_extract(NEW.authority_json, '$.issue_id') = NEW.issue_id
+                AND json_extract(
+                    NEW.authority_json, '$.prior_submission_key'
+                ) = NEW.prior_submission_key
+                AND json_extract(NEW.authority_json, '$.prior_generation') =
+                    NEW.prior_generation
+                AND json_extract(NEW.authority_json, '$.owner_receipt_path') =
+                    NEW.owner_receipt_path
+                AND json_extract(NEW.authority_json, '$.owner_receipt_sha256') =
+                    NEW.owner_receipt_sha256
+                AND json_extract(NEW.authority_json, '$.activation_required') =
+                    NEW.activation_required
+                AND json_extract(NEW.authority_json, '$.requester_id') =
+                    NEW.requester_id
+                AND json_extract(NEW.authority_json, '$.reason') = NEW.reason
+                AND (
+                    (
+                        NEW.authority_kind = 'silent_terminal'
+                        AND json_extract(
+                            NEW.authority_json, '$.schema_version'
+                        ) = '{SILENT_TERMINAL_RERUN_AUTHORITY_SCHEMA_VERSION}'
+                        AND NEW.prior_delivery_id = ''
+                        AND json_type(
+                            NEW.authority_json, '$.prior_delivery_id'
+                        ) IS NULL
+                        AND json_type(
+                            NEW.authority_json, '$.terminal_mode'
+                        ) IS NULL
+                        AND (
+                            SELECT COUNT(*) FROM json_each(NEW.authority_json)
+                        ) = 12
+                    )
+                    OR
+                    (
+                        NEW.authority_kind = 'batch_terminal'
+                        AND json_extract(
+                            NEW.authority_json, '$.schema_version'
+                        ) = '{BATCH_TERMINAL_RERUN_AUTHORITY_SCHEMA_VERSION}'
+                        AND json_extract(
+                            NEW.authority_json, '$.prior_delivery_id'
+                        ) = NEW.prior_delivery_id
+                        AND json_extract(
+                            NEW.authority_json, '$.terminal_mode'
+                        ) = 'settled_delivery_correction'
+                        AND (
+                            SELECT COUNT(*) FROM json_each(NEW.authority_json)
+                        ) = 14
+                    )
+                )
+            ), 0)
+            BEGIN
+                SELECT RAISE(
+                    ABORT, 'terminal_rerun_delivery_authority_projection_mismatch'
+                );
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS
+                trg_terminal_rerun_delivery_authority_binding_guard
+            BEFORE INSERT ON rca_terminal_rerun_delivery_authorities
+            WHEN NOT EXISTS (
+                SELECT 1
+                  FROM rca_trigger_sources AS source
+                  JOIN rca_trigger_bindings AS binding
+                    ON binding.source_id = source.source_id
+                  JOIN business_triggers AS trigger
+                    ON trigger.business_key = binding.business_key
+                   AND trigger.generation = binding.generation
+                  JOIN rca_outbox AS outbox
+                    ON outbox.business_key = trigger.business_key
+                   AND outbox.generation = trigger.generation
+                   AND outbox.submission_key = trigger.submission_key
+                  JOIN business_triggers AS prior
+                    ON prior.business_key = trigger.business_key
+                   AND prior.generation = NEW.prior_generation
+                  JOIN rca_activation_admission_ledger AS ledger
+                    ON ledger.ledger_id = NEW.activation_ledger_id
+                   AND ledger.epoch_id = NEW.activation_epoch_id
+                  JOIN rca_activation_epochs AS epoch
+                    ON epoch.epoch_id = ledger.epoch_id
+                 WHERE source.source_id = NEW.source_id
+                   AND source.source_kind = 'feishu_group_manual'
+                   AND source.payload_sha256 = NEW.source_payload_sha256
+                   AND source.platform = 'operator'
+                   AND source.chat_id = ''
+                   AND source.thread_id = ''
+                   AND source.requester_id = NEW.requester_id
+                   AND source.mode = 'rerun'
+                   AND source.outcome = 'created'
+                   AND binding.business_key = NEW.business_key
+                   AND binding.generation = NEW.generation
+                   AND binding.role = 'origin'
+                   AND trigger.submission_key = NEW.submission_key
+                   AND trigger.origin_source_id = NEW.source_id
+                   AND trigger.project_key = NEW.project_key
+                   AND trigger.work_item_type_key = NEW.work_item_type_key
+                   AND trigger.work_item_id = NEW.issue_id
+                   AND json_extract(
+                       trigger.normalized_json, '$.project_simple_name'
+                   ) = NEW.project_simple_name
+                   AND json_extract(trigger.normalized_json, '$.issue_url') =
+                       'https://project.feishu.cn/' || NEW.project_simple_name ||
+                       '/issue/detail/' || NEW.issue_id
+                   AND trigger.activation_epoch_id = NEW.activation_epoch_id
+                   AND trigger.activation_ledger_id = NEW.activation_ledger_id
+                   AND trigger.activation_epoch_id = outbox.activation_epoch_id
+                   AND trigger.activation_ledger_id = outbox.activation_ledger_id
+                   AND outbox.origin_source_id = NEW.source_id
+                   AND outbox.outbox_id = NEW.outbox_id
+                   AND outbox.action = 'submit_rca_issue_intake'
+                   AND prior.submission_key = NEW.prior_submission_key
+                   AND prior.work_item_id = NEW.issue_id
+                   AND ledger.entrypoint = 'manual_admit'
+                   AND ledger.source_kind = 'manual'
+                   AND ledger.decision = 'admit'
+                   AND ledger.business_key = NEW.business_key
+                   AND ledger.submission_key = NEW.submission_key
+                   AND ledger.generation = NEW.generation
+                   AND ledger.bound_at IS NOT NULL
+                   AND epoch.is_current = 1
+                   AND epoch.state IN ('bounded_active', 'steady_active')
+            )
+            BEGIN
+                SELECT RAISE(
+                    ABORT, 'terminal_rerun_delivery_authority_binding_mismatch'
+                );
+            END
+            """,
+        )
+
+    @classmethod
+    def _create_v14_terminal_rerun_delivery_authority_schema(
+        cls,
+        conn: sqlite3.Connection,
+    ) -> None:
+        for statement in cls._v14_terminal_rerun_delivery_authority_schema_statements():
+            conn.execute(statement)
+
+    @classmethod
+    def _validate_v14_terminal_rerun_delivery_authority_schema(
+        cls,
+        conn: sqlite3.Connection,
+    ) -> None:
+        normalize_sql = lambda value: " ".join(str(value).split()).rstrip(";")
+        expected_tables: dict[str, str] = {}
+        expected_indexes: dict[str, str] = {}
+        expected_triggers: dict[str, str] = {}
+        for statement in cls._v14_terminal_rerun_delivery_authority_schema_statements():
+            normalized = normalize_sql(statement)
+            for prefix, destination in (
+                ("CREATE TABLE IF NOT EXISTS ", expected_tables),
+                ("CREATE INDEX IF NOT EXISTS ", expected_indexes),
+                ("CREATE TRIGGER IF NOT EXISTS ", expected_triggers),
+            ):
+                if normalized.startswith(prefix):
+                    name = normalized[len(prefix) :].split(" ", 1)[0]
+                    destination[name] = normalized.replace(
+                        prefix, prefix.replace(" IF NOT EXISTS", ""), 1
+                    )
+                    break
+
+        def observed(kind: str, expected: Mapping[str, str]) -> dict[str, str]:
+            return {
+                str(row["name"]): normalize_sql(row["sql"] or "")
+                for row in conn.execute(
+                    "SELECT name, sql FROM sqlite_master WHERE type = ?",
+                    (kind,),
+                ).fetchall()
+                if str(row["name"]) in expected
+            }
+
+        if observed("table", expected_tables) != expected_tables:
+            raise RuntimeError(
+                "incompatible_control_store_schema:terminal_rerun_authority_table_sql"
+            )
+        if observed("index", expected_indexes) != expected_indexes:
+            raise RuntimeError(
+                "incompatible_control_store_schema:terminal_rerun_authority_index_sql"
+            )
+        if observed("trigger", expected_triggers) != expected_triggers:
+            raise RuntimeError(
+                "incompatible_control_store_schema:terminal_rerun_authority_trigger_sql"
+            )
+        authority_tables = {
+            str(row["name"])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name LIKE 'rca_terminal_rerun_delivery_authorit%'"
+            ).fetchall()
+        }
+        authority_triggers = {
+            str(row["name"])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                "AND name LIKE 'trg_terminal_rerun_delivery_authority_%'"
+            ).fetchall()
+        }
+        if authority_tables != set(expected_tables):
+            raise RuntimeError(
+                "incompatible_control_store_schema:terminal_rerun_authority_tables"
+            )
+        if authority_triggers != set(expected_triggers):
+            raise RuntimeError(
+                "incompatible_control_store_schema:terminal_rerun_authority_triggers"
+            )
+        for row in conn.execute(
+            "SELECT * FROM rca_terminal_rerun_delivery_authorities "
+            "ORDER BY authority_sha256"
+        ).fetchall():
+            try:
+                authority = json.loads(str(row["authority_json"]))
+                if str(row["authority_kind"]) == "silent_terminal":
+                    expected = build_silent_terminal_rerun_authority(
+                        batch_id=authority.get("batch_id"),
+                        queue_sha256=authority.get("queue_sha256"),
+                        issue_id=authority.get("issue_id"),
+                        prior_submission_key=authority.get("prior_submission_key"),
+                        prior_generation=authority.get("prior_generation"),
+                        owner_receipt_path=authority.get("owner_receipt_path"),
+                        owner_receipt_sha256=authority.get("owner_receipt_sha256"),
+                        requester_id=authority.get("requester_id"),
+                        reason=authority.get("reason"),
+                        activation_required=authority.get("activation_required"),
+                    )
+                    prior_delivery_id = ""
+                elif str(row["authority_kind"]) == "batch_terminal":
+                    expected = build_batch_terminal_rerun_authority(
+                        batch_id=authority.get("batch_id"),
+                        queue_sha256=authority.get("queue_sha256"),
+                        issue_id=authority.get("issue_id"),
+                        prior_submission_key=authority.get("prior_submission_key"),
+                        prior_generation=authority.get("prior_generation"),
+                        prior_delivery_id=authority.get("prior_delivery_id"),
+                        owner_receipt_path=authority.get("owner_receipt_path"),
+                        owner_receipt_sha256=authority.get("owner_receipt_sha256"),
+                        requester_id=authority.get("requester_id"),
+                        reason=authority.get("reason"),
+                        activation_required=authority.get("activation_required"),
+                    )
+                    prior_delivery_id = str(expected["prior_delivery_id"])
+                else:
+                    raise ValueError("authority_kind_invalid")
+            except (AttributeError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    "incompatible_control_store_schema:terminal_rerun_authority_json"
+                ) from exc
+            activation = conn.execute(
+                """
+                SELECT outbox.outbox_id, trigger.activation_epoch_id,
+                       trigger.activation_ledger_id,
+                       trigger.project_key, trigger.work_item_type_key,
+                       json_extract(
+                           trigger.normalized_json, '$.project_simple_name'
+                       ) AS project_simple_name
+                  FROM business_triggers AS trigger
+                  JOIN rca_outbox AS outbox
+                    ON outbox.business_key = trigger.business_key
+                   AND outbox.generation = trigger.generation
+                   AND outbox.submission_key = trigger.submission_key
+                   AND outbox.activation_epoch_id = trigger.activation_epoch_id
+                   AND outbox.activation_ledger_id = trigger.activation_ledger_id
+                 WHERE trigger.business_key = ?
+                   AND trigger.generation = ?
+                   AND trigger.submission_key = ?
+                """,
+                (
+                    row["business_key"],
+                    row["generation"],
+                    row["submission_key"],
+                ),
+            ).fetchone()
+            if (
+                activation is None
+                or not str(activation["activation_epoch_id"] or "").strip()
+                or activation["activation_ledger_id"] is None
+            ):
+                raise RuntimeError(
+                    "incompatible_control_store_schema:"
+                    "terminal_rerun_authority_activation"
+                )
+            projected = {
+                "authority_sha256": str(expected["selection_sha256"]),
+                "schema_version": TERMINAL_RERUN_DELIVERY_AUTHORITY_SCHEMA_VERSION,
+                "source_payload_sha256": str(row["source_payload_sha256"]),
+                "outbox_id": int(activation["outbox_id"]),
+                "business_key": str(row["business_key"]),
+                "generation": int(row["generation"]),
+                "submission_key": str(row["submission_key"]),
+                "activation_epoch_id": str(activation["activation_epoch_id"]),
+                "activation_ledger_id": int(activation["activation_ledger_id"]),
+                "effect_kind": "feishu_issue_comment",
+                "project_key": str(activation["project_key"]),
+                "project_simple_name": str(activation["project_simple_name"]),
+                "work_item_type_key": str(activation["work_item_type_key"]),
+                "issue_id": str(expected["issue_id"]),
+                "batch_id": str(expected["batch_id"]),
+                "prior_submission_key": str(expected["prior_submission_key"]),
+                "prior_generation": int(expected["prior_generation"]),
+                "prior_delivery_id": prior_delivery_id,
+                "queue_sha256": str(expected["queue_sha256"]),
+                "owner_receipt_path": str(expected["owner_receipt_path"]),
+                "owner_receipt_sha256": str(expected["owner_receipt_sha256"]),
+                "requester_id": str(expected["requester_id"]),
+                "reason": str(expected["reason"]),
+                "activation_required": 1,
+                "authority_json": _canonical_json(expected),
+            }
+            if any(row[name] != value for name, value in projected.items()):
+                raise RuntimeError(
+                    "incompatible_control_store_schema:terminal_rerun_authority_projection"
+                )
+            binding = conn.execute(
+                """
+                SELECT 1
+                  FROM rca_trigger_sources AS source
+                  JOIN rca_trigger_bindings AS bound
+                    ON bound.source_id = source.source_id
+                  JOIN business_triggers AS trigger
+                    ON trigger.business_key = bound.business_key
+                   AND trigger.generation = bound.generation
+                  JOIN rca_outbox AS outbox
+                    ON outbox.business_key = trigger.business_key
+                   AND outbox.generation = trigger.generation
+                  JOIN business_triggers AS prior
+                    ON prior.business_key = trigger.business_key
+                   AND prior.generation = ?
+                  JOIN rca_activation_admission_ledger AS ledger
+                    ON ledger.ledger_id = trigger.activation_ledger_id
+                   AND ledger.epoch_id = trigger.activation_epoch_id
+                  JOIN rca_activation_epochs AS epoch
+                    ON epoch.epoch_id = ledger.epoch_id
+                 WHERE source.source_id = ?
+                   AND source.payload_sha256 = ?
+                   AND source.source_kind = 'feishu_group_manual'
+                   AND source.platform = 'operator'
+                   AND source.chat_id = ''
+                   AND source.thread_id = ''
+                   AND source.mode = 'rerun'
+                   AND source.outcome = 'created'
+                   AND bound.role = 'origin'
+                   AND trigger.business_key = ?
+                   AND trigger.generation = ?
+                   AND trigger.submission_key = ?
+                   AND trigger.origin_source_id = source.source_id
+                   AND trigger.project_key = ?
+                   AND trigger.work_item_type_key = ?
+                   AND trigger.work_item_id = ?
+                   AND json_extract(
+                       trigger.normalized_json, '$.project_simple_name'
+                   ) = ?
+                   AND trigger.activation_epoch_id = ?
+                   AND trigger.activation_ledger_id = ?
+                   AND outbox.submission_key = trigger.submission_key
+                   AND outbox.outbox_id = ?
+                   AND outbox.origin_source_id = source.source_id
+                   AND outbox.action = 'submit_rca_issue_intake'
+                   AND outbox.activation_epoch_id = trigger.activation_epoch_id
+                   AND outbox.activation_ledger_id = trigger.activation_ledger_id
+                   AND prior.submission_key = ?
+                   AND prior.work_item_id = trigger.work_item_id
+                   AND ledger.entrypoint = 'manual_admit'
+                   AND ledger.source_kind = 'manual'
+                   AND ledger.decision = 'admit'
+                   AND ledger.business_key = trigger.business_key
+                   AND ledger.submission_key = trigger.submission_key
+                   AND ledger.generation = trigger.generation
+                   AND ledger.bound_at IS NOT NULL
+                """,
+                (
+                    row["prior_generation"],
+                    row["source_id"],
+                    row["source_payload_sha256"],
+                    row["business_key"],
+                    row["generation"],
+                    row["submission_key"],
+                    row["project_key"],
+                    row["work_item_type_key"],
+                    row["issue_id"],
+                    row["project_simple_name"],
+                    row["activation_epoch_id"],
+                    row["activation_ledger_id"],
+                    row["outbox_id"],
+                    row["prior_submission_key"],
+                ),
+            ).fetchone()
+            if binding is None:
+                raise RuntimeError(
+                    "incompatible_control_store_schema:terminal_rerun_authority_binding"
+                )
+
     def _preflight_schema_version(self) -> str | None:
         """Reject a future schema using a read-only connection before any pragma/DDL."""
         sqlite_path = self._sqlite_path
@@ -5541,6 +6144,7 @@ class RcaControlStore:
             self._validate_structural_contract(conn, integrity_check=False)
             self._validate_v12_learning_lane_schema(conn)
             self._validate_v13_historical_outbox_hold_schema(conn)
+            self._validate_v14_terminal_rerun_delivery_authority_schema(conn)
             conn.commit()
         except Exception:
             if conn.in_transaction:
@@ -10095,6 +10699,204 @@ class RcaControlStore:
         )
         return True
 
+    @staticmethod
+    def _terminal_rerun_delivery_authority_values(
+        *,
+        authority_kind: str,
+        authority: Mapping[str, Any],
+        source_id: str,
+        outbox_id: int,
+        source_payload_sha256: str,
+        admission: RcaAdmission,
+        activation_epoch_id: str,
+        activation_ledger_id: int,
+        current: str,
+    ) -> dict[str, Any]:
+        if authority_kind not in TERMINAL_RERUN_DELIVERY_AUTHORITY_KINDS:
+            raise RecordConflictError("terminal_rerun_authority_kind_invalid")
+        normalized = dict(authority)
+        expected = (
+            build_silent_terminal_rerun_authority(
+                batch_id=normalized.get("batch_id"),
+                queue_sha256=normalized.get("queue_sha256"),
+                issue_id=normalized.get("issue_id"),
+                prior_submission_key=normalized.get("prior_submission_key"),
+                prior_generation=normalized.get("prior_generation"),
+                owner_receipt_path=normalized.get("owner_receipt_path"),
+                owner_receipt_sha256=normalized.get("owner_receipt_sha256"),
+                requester_id=normalized.get("requester_id"),
+                reason=normalized.get("reason"),
+                activation_required=normalized.get("activation_required"),
+            )
+            if authority_kind == "silent_terminal"
+            else build_batch_terminal_rerun_authority(
+                batch_id=normalized.get("batch_id"),
+                queue_sha256=normalized.get("queue_sha256"),
+                issue_id=normalized.get("issue_id"),
+                prior_submission_key=normalized.get("prior_submission_key"),
+                prior_generation=normalized.get("prior_generation"),
+                prior_delivery_id=normalized.get("prior_delivery_id"),
+                owner_receipt_path=normalized.get("owner_receipt_path"),
+                owner_receipt_sha256=normalized.get("owner_receipt_sha256"),
+                requester_id=normalized.get("requester_id"),
+                reason=normalized.get("reason"),
+                activation_required=normalized.get("activation_required"),
+            )
+        )
+        if normalized != expected:
+            raise RecordConflictError("terminal_rerun_authority_invalid")
+        if (
+            str(expected["issue_id"]) != admission.source_refs.work_item_id
+            or int(admission.generation) != int(expected["prior_generation"]) + 1
+        ):
+            raise RecordConflictError("terminal_rerun_authority_admission_mismatch")
+        return {
+            "authority_sha256": str(expected["selection_sha256"]),
+            "schema_version": TERMINAL_RERUN_DELIVERY_AUTHORITY_SCHEMA_VERSION,
+            "authority_kind": authority_kind,
+            "source_id": str(source_id),
+            "outbox_id": int(outbox_id),
+            "source_payload_sha256": str(source_payload_sha256),
+            "business_key": admission.business_key,
+            "generation": admission.generation,
+            "submission_key": admission.submission_key,
+            "activation_epoch_id": str(activation_epoch_id),
+            "activation_ledger_id": int(activation_ledger_id),
+            "effect_kind": "feishu_issue_comment",
+            "project_key": admission.source_refs.project_key,
+            "project_simple_name": admission.source_refs.project_simple_name,
+            "work_item_type_key": admission.source_refs.work_item_type_key,
+            "issue_id": str(expected["issue_id"]),
+            "batch_id": str(expected["batch_id"]),
+            "prior_submission_key": str(expected["prior_submission_key"]),
+            "prior_generation": int(expected["prior_generation"]),
+            "prior_delivery_id": str(expected.get("prior_delivery_id") or ""),
+            "queue_sha256": str(expected["queue_sha256"]),
+            "owner_receipt_path": str(expected["owner_receipt_path"]),
+            "owner_receipt_sha256": str(expected["owner_receipt_sha256"]),
+            "requester_id": str(expected["requester_id"]),
+            "reason": str(expected["reason"]),
+            "activation_required": 1,
+            "authority_json": _canonical_json(expected),
+            "created_at": str(current),
+        }
+
+    @classmethod
+    def _persist_terminal_rerun_delivery_authority_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        authority_kind: str,
+        authority: Mapping[str, Any],
+        source_id: str,
+        source_payload_sha256: str,
+        admission: RcaAdmission,
+        current: str,
+    ) -> None:
+        if not conn.in_transaction:
+            raise RecordConflictError("terminal_rerun_authority_transaction_required")
+        execution = conn.execute(
+            """
+            SELECT outbox.outbox_id, trigger.activation_epoch_id,
+                   trigger.activation_ledger_id
+              FROM business_triggers AS trigger
+              JOIN rca_outbox AS outbox
+                ON outbox.business_key = trigger.business_key
+               AND outbox.generation = trigger.generation
+               AND outbox.submission_key = trigger.submission_key
+               AND outbox.activation_epoch_id = trigger.activation_epoch_id
+               AND outbox.activation_ledger_id = trigger.activation_ledger_id
+             WHERE trigger.business_key = ?
+               AND trigger.generation = ?
+               AND trigger.submission_key = ?
+            """,
+            (
+                admission.business_key,
+                admission.generation,
+                admission.submission_key,
+            ),
+        ).fetchone()
+        if (
+            execution is None
+            or not str(execution["activation_epoch_id"] or "").strip()
+            or execution["activation_ledger_id"] is None
+        ):
+            raise RecordConflictError("terminal_rerun_authority_activation_missing")
+        values = cls._terminal_rerun_delivery_authority_values(
+            authority_kind=authority_kind,
+            authority=authority,
+            source_id=source_id,
+            outbox_id=int(execution["outbox_id"]),
+            source_payload_sha256=source_payload_sha256,
+            admission=admission,
+            activation_epoch_id=str(execution["activation_epoch_id"]),
+            activation_ledger_id=int(execution["activation_ledger_id"]),
+            current=current,
+        )
+        columns = tuple(values)
+        conn.execute(
+            "INSERT INTO rca_terminal_rerun_delivery_authorities("
+            + ", ".join(columns)
+            + ") VALUES ("
+            + ", ".join("?" for _ in columns)
+            + ")",
+            tuple(values[column] for column in columns),
+        )
+
+    @classmethod
+    def _require_terminal_rerun_delivery_authority_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        authority_kind: str,
+        authority: Mapping[str, Any],
+        source_id: str,
+        source_payload_sha256: str,
+        admission: RcaAdmission,
+    ) -> None:
+        execution = conn.execute(
+            "SELECT outbox.outbox_id, trigger.activation_epoch_id, "
+            "trigger.activation_ledger_id FROM business_triggers AS trigger "
+            "JOIN rca_outbox AS outbox ON outbox.business_key=trigger.business_key "
+            "AND outbox.generation=trigger.generation "
+            "AND outbox.submission_key=trigger.submission_key "
+            "WHERE trigger.business_key = ? AND trigger.generation = ? "
+            "AND trigger.submission_key = ?",
+            (
+                admission.business_key,
+                admission.generation,
+                admission.submission_key,
+            ),
+        ).fetchone()
+        if (
+            execution is None
+            or not str(execution["activation_epoch_id"] or "").strip()
+            or execution["activation_ledger_id"] is None
+        ):
+            raise RecordConflictError("terminal_rerun_authority_activation_missing")
+        expected = cls._terminal_rerun_delivery_authority_values(
+            authority_kind=authority_kind,
+            authority=authority,
+            source_id=source_id,
+            outbox_id=int(execution["outbox_id"]),
+            source_payload_sha256=source_payload_sha256,
+            admission=admission,
+            activation_epoch_id=str(execution["activation_epoch_id"]),
+            activation_ledger_id=int(execution["activation_ledger_id"]),
+            current="",
+        )
+        row = conn.execute(
+            "SELECT * FROM rca_terminal_rerun_delivery_authorities "
+            "WHERE source_id = ?",
+            (source_id,),
+        ).fetchone()
+        if row is None or any(
+            row[name] != value
+            for name, value in expected.items()
+            if name != "created_at"
+        ):
+            raise RecordConflictError("terminal_rerun_authority_replay_mismatch")
+
     def seal_learning_lane_cohort(
         self, *, now: datetime | None = None
     ) -> dict[str, Any]:
@@ -11935,6 +12737,7 @@ class RcaControlStore:
         )
         if marker_value in {
             "pnc_rca_control_store_v12",
+            "pnc_rca_control_store_v13",
             CONTROL_STORE_SCHEMA_VERSION,
         } or v12_tables_present:
             RcaControlStore._validate_v12_learning_lane_schema(conn)
@@ -11947,8 +12750,18 @@ class RcaControlStore:
                 "rca_activation_historical_outbox_disposition_items",
             )
         )
-        if marker_value == CONTROL_STORE_SCHEMA_VERSION or v13_tables_present:
+        if marker_value in {
+            "pnc_rca_control_store_v13",
+            CONTROL_STORE_SCHEMA_VERSION,
+        } or v13_tables_present:
             RcaControlStore._validate_v13_historical_outbox_hold_schema(conn)
+        v14_table_present = RcaControlStore._table_exists(
+            conn, "rca_terminal_rerun_delivery_authorities"
+        )
+        if marker_value == CONTROL_STORE_SCHEMA_VERSION or v14_table_present:
+            RcaControlStore._validate_v14_terminal_rerun_delivery_authority_schema(
+                conn
+            )
 
         def foreign_key_groups(table: str) -> dict[tuple[int, str], set[tuple[str, str]]]:
             groups: dict[tuple[int, str], set[tuple[str, str]]] = {}
@@ -15244,6 +16057,24 @@ class RcaControlStore:
                     ),
                     generation=replay_generation,
                 )
+                if normalized_silent_rerun is not None:
+                    self._require_terminal_rerun_delivery_authority_tx(
+                        conn,
+                        authority_kind="silent_terminal",
+                        authority=normalized_silent_rerun,
+                        source_id=source_id,
+                        source_payload_sha256=payload_sha,
+                        admission=replay_admission_for_lane,
+                    )
+                if normalized_batch_rerun is not None:
+                    self._require_terminal_rerun_delivery_authority_tx(
+                        conn,
+                        authority_kind="batch_terminal",
+                        authority=normalized_batch_rerun,
+                        source_id=source_id,
+                        source_payload_sha256=payload_sha,
+                        admission=replay_admission_for_lane,
+                    )
                 learning_lane = (
                     False
                     if any(
@@ -15995,6 +16826,26 @@ class RcaControlStore:
                     current,
                 ),
             )
+            if normalized_silent_rerun is not None:
+                self._persist_terminal_rerun_delivery_authority_tx(
+                    conn,
+                    authority_kind="silent_terminal",
+                    authority=normalized_silent_rerun,
+                    source_id=source_id,
+                    source_payload_sha256=payload_sha,
+                    admission=admission,
+                    current=current,
+                )
+            if normalized_batch_rerun is not None:
+                self._persist_terminal_rerun_delivery_authority_tx(
+                    conn,
+                    authority_kind="batch_terminal",
+                    authority=normalized_batch_rerun,
+                    source_id=source_id,
+                    source_payload_sha256=payload_sha,
+                    admission=admission,
+                    current=current,
+                )
             learning_lane = (
                 False
                 if any(
@@ -19962,6 +20813,7 @@ class RcaControlStore:
             "rca_activation_historical_outbox_hold_items",
             "rca_activation_historical_outbox_dispositions",
             "rca_activation_historical_outbox_disposition_items",
+            "rca_terminal_rerun_delivery_authorities",
         }
         if table not in allowed:
             raise ValueError(f"unsupported table: {table}")

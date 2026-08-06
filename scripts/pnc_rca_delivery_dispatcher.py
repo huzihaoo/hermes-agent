@@ -90,6 +90,7 @@ from gateway.pnc_rca_provider_fence import (
     build_manual_provider_write_claim,
     build_historical_epoch_provider_claim,
     build_profile_terminal_provider_claim,
+    build_terminal_rerun_provider_claim,
     build_write_fence_provider_claim,
     current_provider_write_claim,
     revalidate_provider_write_claim,
@@ -4455,6 +4456,13 @@ class DeliveryDispatcher:
         contract = claim.contract if isinstance(claim.contract, Mapping) else {}
         binding = contract.get("w3_execution_snapshot")
         if not isinstance(binding, Mapping):
+            terminal_rerun = self._terminal_rerun_external_write_binding(
+                claim,
+                operation=operation,
+                require_write_started=False,
+            )
+            if terminal_rerun is not None:
+                return terminal_rerun
             if claim.effect_kind in {
                 DELIVERY_EFFECT_KIND,
                 DELIVERY_THREAD_EFFECT_KIND,
@@ -4627,6 +4635,56 @@ class DeliveryDispatcher:
                 code = "external_write_fence_identity_mismatch"
             raise ExternalWriteFenceError(code, str(exc)) from exc
 
+    def _terminal_rerun_external_write_binding(
+        self,
+        claim: DeliveryEffectClaim,
+        *,
+        operation: str,
+        require_write_started: bool,
+    ) -> dict[str, Any] | None:
+        if claim.effect_kind != DELIVERY_EFFECT_KIND or claim.generation < 2:
+            return None
+        try:
+            return self.store.validate_terminal_rerun_external_write_binding(
+                effect_key=claim.effect_key,
+                delivery_id=claim.delivery_id,
+                lease_token=claim.lease_token,
+                lease_fence=claim.fence,
+                operation=operation,
+                issue_url=claim.issue_url,
+                target_key=claim.target_key,
+                business_key=claim.business_key,
+                submission_key=claim.submission_key,
+                generation=claim.generation,
+                require_write_started=require_write_started,
+                now=self.now(),
+            )
+        except RuntimeError as exc:
+            code = str(exc)
+            if code == "external_write_fence_identity_mismatch":
+                conn = self.store._connect()
+                try:
+                    authority_present = self.store._table_exists(
+                        conn, "rca_terminal_rerun_delivery_authorities"
+                    ) and conn.execute(
+                        "SELECT 1 FROM rca_terminal_rerun_delivery_authorities "
+                        "WHERE business_key = ? AND generation = ?",
+                        (claim.business_key, claim.generation),
+                    ).fetchone() is not None
+                finally:
+                    conn.close()
+                if not authority_present:
+                    return None
+            if code not in {
+                "external_write_fence_schema_invalid",
+                "external_write_fence_epoch_not_current",
+                "external_write_fence_operation_denied",
+                "external_write_fence_identity_mismatch",
+                "external_write_fence_target_mismatch",
+            }:
+                code = "external_write_fence_identity_mismatch"
+            raise ExternalWriteFenceError(code, str(exc)) from exc
+
     def _validate_historical_external_write_epoch(
         self, claim: DeliveryEffectClaim
     ) -> dict[str, Any]:
@@ -4652,6 +4710,31 @@ class DeliveryDispatcher:
         fence = snapshot.get("write_fence") if isinstance(snapshot, Mapping) else None
         if isinstance(fence, Mapping):
             return build_write_fence_provider_claim(fence)
+        terminal_rerun = self._terminal_rerun_external_write_binding(
+            claim,
+            operation="feishu_issue_comment",
+            require_write_started=True,
+        )
+        if terminal_rerun is not None:
+            return build_terminal_rerun_provider_claim(
+                authority_sha256=terminal_rerun["authority_sha256"],
+                outbox_id=terminal_rerun["outbox_id"],
+                epoch_id=terminal_rerun["epoch_id"],
+                activation_ledger_id=terminal_rerun["activation_ledger_id"],
+                effect_key=terminal_rerun["effect_key"],
+                delivery_id=terminal_rerun["delivery_id"],
+                lease_token=terminal_rerun["lease_token"],
+                lease_fence=terminal_rerun["lease_fence"],
+                issue_target=terminal_rerun["issue_url"],
+                target_key=terminal_rerun["target_key"],
+                business_key=terminal_rerun["business_key"],
+                submission_key=terminal_rerun["submission_key"],
+                generation=terminal_rerun["generation"],
+                project_key=terminal_rerun["project_key"],
+                project_simple_name=terminal_rerun["project_simple_name"],
+                work_item_type_key=terminal_rerun["work_item_type_key"],
+                work_item_id=terminal_rerun["work_item_id"],
+            )
         if claim.effect_kind in {DELIVERY_EFFECT_KIND, DELIVERY_THREAD_EFFECT_KIND}:
             manual_claim = self._manual_provider_write_claim(claim)
             if manual_claim is not None:

@@ -27,7 +27,7 @@ COMBINED_SOURCE_SCHEMA_VERSIONS = frozenset(
         "pnc_rca_delivery_store_v10",
     }
 )
-COMBINED_TARGET_SCHEMA_VERSION = "pnc_rca_delivery_store_v11"
+COMBINED_TARGET_SCHEMA_VERSION = "pnc_rca_delivery_store_v12"
 MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
 _HEX64 = frozenset("0123456789abcdef")
 _FIELDS = frozenset({

@@ -59,14 +59,16 @@ UPSTREAM_DISPATCH_REVIEW_COVERAGE_MIN_PCT = 30
 UPSTREAM_DISPATCH_REVIEWED_COUNT_MIN = 10
 MAX_INPUT_BYTES = 96 * 1024 * 1024
 CONTROL_STORE_SCHEMA_VERSION = "pnc_rca_control_store_v11"
-DELIVERY_STORE_SCHEMA_VERSION = "pnc_rca_delivery_store_v11"
+DELIVERY_STORE_SCHEMA_VERSION = "pnc_rca_delivery_store_v12"
 SUPPORTED_CONTROL_STORE_SCHEMA_VERSIONS = frozenset({
     CONTROL_STORE_SCHEMA_VERSION,
     "pnc_rca_control_store_v12",
     "pnc_rca_control_store_v13",
+    "pnc_rca_control_store_v14",
 })
 SUPPORTED_DELIVERY_STORE_SCHEMA_VERSIONS = frozenset({
     DELIVERY_STORE_SCHEMA_VERSION,
+    "pnc_rca_delivery_store_v11",
     "pnc_rca_delivery_store_v9",
 })
 ADJUDICATION_SCHEMA_VERSION = "pnc_rca_conclusion_adjudication_v1"

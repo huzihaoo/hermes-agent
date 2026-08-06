@@ -531,11 +531,73 @@ def test_batch_terminal_authority_creates_correction_generation_only_for_failed_
     from tests.gateway.test_pnc_rca_delivery_store import _bind_activation_execution
 
     store = RcaControlStore(tmp_path / "control.sqlite3")
+    stock_issue_id = "7055722720"
+    original_utc_datetime = control_store_module._utc_datetime
+    pre_cutoff = datetime(2026, 7, 24, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        control_store_module,
+        "_utc_datetime",
+        lambda value=None: (
+            pre_cutoff if value is None else original_utc_datetime(value)
+        ),
+    )
     first = store.ingest_record(
-        _record(),
+        _record(value=_value(work_item_id=int(stock_issue_id))),
         policy=_policy(),
         submit_enabled=True,
     )
+    monkeypatch.setattr(
+        control_store_module, "_utc_datetime", original_utc_datetime
+    )
+    RcaDeliveryStore(store.db_path)
+    stock_target = f"feishu_project:project-key:problem-type:{stock_issue_id}"
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute(
+            """
+            INSERT INTO rca_delivery_jobs(
+                delivery_id, submission_key, business_key, generation,
+                artifact_set_id, project_key, work_item_type_key, work_item_id,
+                target_key, issue_url, report_url, status, manifest_json,
+                contract_json, artifacts_json, created_at, updated_at
+            ) VALUES('stock-seed-delivery', 'stock-seed-submission',
+                     'stock-seed-business', 1, 'stock-seed-artifact',
+                     'project-key', 'problem-type', ?, ?, ?, '', 'delivered',
+                     '{}', '{}', '[]', ?, ?)
+            """,
+            (
+                stock_issue_id,
+                stock_target,
+                f"https://project.feishu.cn/g1q3/issue/detail/{stock_issue_id}",
+                "2026-07-24T00:00:00+00:00",
+                "2026-07-24T00:00:00+00:00",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO rca_delivery_effects(
+                effect_key, delivery_id, effect_kind, required, target_key,
+                payload_json, payload_sha256, status, created_at, updated_at,
+                completed_at
+            ) VALUES('stock-seed-effect', 'stock-seed-delivery',
+                     'feishu_issue_comment', 1, ?,
+                     '{"schema_version":"pnc_rca_delivery_effect_v1"}', ?,
+                     'succeeded', ?, ?, ?)
+            """,
+            (
+                stock_target,
+                "a" * 64,
+                "2026-07-24T00:00:00+00:00",
+                "2026-07-24T00:00:00+00:00",
+                "2026-07-24T00:00:00+00:00",
+            ),
+        )
+    stock_now = datetime(2026, 7, 26, tzinfo=timezone.utc)
+    cohort = store.seal_learning_lane_cohort(now=stock_now)
+    assert cohort["stock_count"] == 1
+    assert store.list_rows("rca_learning_lane_stock_items")[0][
+        "work_item_id"
+    ] == stock_issue_id
     _terminalize_permanent(store, first.submission_key)
     _bind_activation_execution(
         store,
@@ -553,13 +615,18 @@ def test_batch_terminal_authority_creates_correction_generation_only_for_failed_
         ).fetchone()[0]
     batch_id = "batch-delivery"
     request = replace(
-        _operator_request("batch-delivery-try-1"),
+        _operator_request(
+            "batch-delivery-try-1",
+            issue_url=(
+                f"https://project.feishu.cn/g1q3/issue/detail/{stock_issue_id}"
+            ),
+        ),
         reason=f"production_gray_batch:{batch_id}",
     )
     authority = build_batch_terminal_rerun_authority(
         batch_id=batch_id,
         queue_sha256="1" * 64,
-        issue_id="7041712812",
+        issue_id=stock_issue_id,
         prior_submission_key=first.submission_key,
         prior_generation=1,
         prior_delivery_id=str(delivery_id),
@@ -598,6 +665,267 @@ def test_batch_terminal_authority_creates_correction_generation_only_for_failed_
         for row in store.list_rows("rca_learning_lane_admissions")
         if row["generation"] == 2
     ] == []
+    [persisted_authority] = store.list_rows(
+        "rca_terminal_rerun_delivery_authorities"
+    )
+    assert persisted_authority["authority_sha256"] == authority["selection_sha256"]
+    assert persisted_authority["authority_kind"] == "batch_terminal"
+    assert persisted_authority["submission_key"] == rerun.submission_key
+    assert persisted_authority["outbox_id"] > 0
+    assert persisted_authority["activation_epoch_id"]
+    assert persisted_authority["activation_ledger_id"] > 0
+    authority_conn = store._connect()
+    try:
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="terminal_rerun_delivery_authority_update_forbidden",
+        ):
+            authority_conn.execute(
+                "UPDATE rca_terminal_rerun_delivery_authorities "
+                "SET created_at=created_at"
+            )
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="terminal_rerun_delivery_authority_delete_forbidden",
+        ):
+            authority_conn.execute(
+                "DELETE FROM rca_terminal_rerun_delivery_authorities"
+            )
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="terminal_rerun_delivery_authority_replace_forbidden",
+        ):
+            authority_conn.execute(
+                "INSERT OR REPLACE INTO rca_terminal_rerun_delivery_authorities "
+                "SELECT * FROM rca_terminal_rerun_delivery_authorities"
+            )
+    finally:
+        authority_conn.close()
+    generation = next(
+        row
+        for row in store.list_rows("business_triggers")
+        if row["generation"] == 2
+    )
+    correction_target = (
+        f"feishu_project:{generation['project_key']}:"
+        f"{generation['work_item_type_key']}:{generation['work_item_id']}"
+    )
+    correction_delivery_id = "terminal-rerun-delivery"
+    terminal_payload = {
+        "schema_version": "pnc_rca_terminal_delivery_effect_v3",
+        "delivery_id": correction_delivery_id,
+        "effect_kind": "feishu_issue_comment",
+        "target_key": correction_target,
+        "project_key": generation["project_key"],
+        "work_item_type_key": generation["work_item_type_key"],
+        "work_item_id": generation["work_item_id"],
+        "outcome": "terminal_failed",
+        "terminal_state": "terminal_failed",
+        "error_code": "analysis_failed",
+        "submission_key": rerun.submission_key,
+        "generation": 2,
+    }
+    delivery = RcaDeliveryStore(store.db_path)
+    conn = delivery._connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            INSERT INTO rca_execution_watch(
+                submission_key, submission_outbox_id, business_key, generation,
+                project_key, work_item_type_key, work_item_id, state,
+                next_poll_at, delivery_id, created_at, updated_at
+            ) VALUES(?, ?, ?, 2, ?, ?, ?, 'delivery_created', ?, ?, ?, ?)
+            """,
+            (
+                rerun.submission_key,
+                persisted_authority["outbox_id"],
+                rerun.business_key,
+                generation["project_key"],
+                generation["work_item_type_key"],
+                generation["work_item_id"],
+                stock_now.isoformat(),
+                correction_delivery_id,
+                stock_now.isoformat(),
+                stock_now.isoformat(),
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO rca_delivery_jobs(
+                delivery_id, submission_key, business_key, generation,
+                artifact_set_id, project_key, work_item_type_key, work_item_id,
+                target_key, issue_url, report_url, status, manifest_json,
+                contract_json, artifacts_json, created_at, updated_at
+            ) VALUES (?, ?, ?, 2, 'terminal-rerun-artifact', ?, ?, ?, ?, ?, '',
+                      'ready', '{}', '{}', '[]', ?, ?)
+            """,
+            (
+                correction_delivery_id,
+                rerun.submission_key,
+                rerun.business_key,
+                generation["project_key"],
+                generation["work_item_type_key"],
+                generation["work_item_id"],
+                correction_target,
+                request.issue_url,
+                stock_now.isoformat(),
+                stock_now.isoformat(),
+            ),
+        )
+        forged_payload = {**terminal_payload, "target_key": "forged-target"}
+        with pytest.raises(sqlite3.IntegrityError, match="learning_lane_admission_missing"):
+            conn.execute(
+                """
+                INSERT INTO rca_delivery_effects(
+                    effect_key, delivery_id, effect_kind, required, target_key,
+                    payload_json, payload_sha256, status, created_at, updated_at
+                ) VALUES('forged-terminal-rerun-effect', ?,
+                         'feishu_issue_comment', 1, 'forged-target', ?, ?,
+                         'pending', ?, ?)
+                """,
+                (
+                    correction_delivery_id,
+                    json.dumps(forged_payload, sort_keys=True, separators=(",", ":")),
+                    canonical_json_sha256(forged_payload),
+                    stock_now.isoformat(),
+                    stock_now.isoformat(),
+                ),
+            )
+        slot = delivery.enforce_issue_comment_budget_tx(
+            conn,
+            delivery_id=correction_delivery_id,
+            business_key=rerun.business_key,
+            generation=2,
+            target_key=correction_target,
+            payload=terminal_payload,
+        )
+        conn.execute(
+            """
+            INSERT INTO rca_delivery_effects(
+                effect_key, delivery_id, effect_kind, required, target_key,
+                payload_json, payload_sha256, status,
+                comment_slot_schema_version, comment_slot_key,
+                comment_slot_kind, comment_slot_generation,
+                comment_slot_revision, comment_slot_budget_exempt,
+                created_at, updated_at
+            ) VALUES('terminal-rerun-effect', ?, 'feishu_issue_comment', 1,
+                     ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                correction_delivery_id,
+                correction_target,
+                json.dumps(terminal_payload, sort_keys=True, separators=(",", ":")),
+                canonical_json_sha256(terminal_payload),
+                slot["comment_slot_schema_version"],
+                slot["comment_slot_key"],
+                slot["comment_slot_kind"],
+                slot["comment_slot_generation"],
+                slot["comment_slot_revision"],
+                slot["comment_slot_budget_exempt"],
+                stock_now.isoformat(),
+                stock_now.isoformat(),
+            ),
+        )
+        with pytest.raises(
+            sqlite3.IntegrityError, match="learning_lane_admission_missing"
+        ):
+            conn.execute(
+                """
+                INSERT INTO rca_delivery_subscriptions(
+                    subscription_key, business_key, generation, source_id,
+                    effect_kind, target_key, target_json, required, status,
+                    reason, created_at, updated_at
+                ) VALUES('terminal-rerun-thread', ?, 2, NULL,
+                         'feishu_thread_reply', 'feishu_thread:forged', '{}', 1,
+                         'pending', 'awaiting_delivery_materialization', ?, ?)
+                """,
+                (
+                    rerun.business_key,
+                    stock_now.isoformat(),
+                    stock_now.isoformat(),
+                ),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    delivery.validate_learning_lane_external_operation(
+        business_key=rerun.business_key,
+        generation=2,
+        operation="feishu_issue_comment",
+    )
+    with pytest.raises(RuntimeError, match="learning_lane_external_effect_forbidden"):
+        delivery.validate_learning_lane_external_operation(
+            business_key=rerun.business_key,
+            generation=2,
+            operation="feishu_issue_field_update",
+        )
+    claimed = delivery.claim_due_effect(
+        lease_owner="terminal-rerun-provider-test",
+        lease_seconds=300,
+        max_age_seconds=10**8,
+        activation_required=True,
+    )
+    assert claimed is not None
+    assert claimed.effect_key == "terminal-rerun-effect"
+    assert delivery.mark_effect_write_started(
+        claim=claimed,
+        activation_required=True,
+    ) is None
+    live_provider_binding = delivery.validate_terminal_rerun_external_write_binding(
+        effect_key=claimed.effect_key,
+        delivery_id=claimed.delivery_id,
+        lease_token=claimed.lease_token,
+        lease_fence=claimed.fence,
+        operation="feishu_issue_comment",
+        issue_url=claimed.issue_url,
+        target_key=claimed.target_key,
+        business_key=claimed.business_key,
+        submission_key=claimed.submission_key,
+        generation=claimed.generation,
+        require_write_started=True,
+    )
+    from gateway import pnc_rca_provider_fence as provider_fence
+
+    provider_claim = provider_fence.build_terminal_rerun_provider_claim(
+        authority_sha256=live_provider_binding["authority_sha256"],
+        outbox_id=live_provider_binding["outbox_id"],
+        epoch_id=live_provider_binding["epoch_id"],
+        activation_ledger_id=live_provider_binding["activation_ledger_id"],
+        effect_key=live_provider_binding["effect_key"],
+        delivery_id=live_provider_binding["delivery_id"],
+        lease_token=live_provider_binding["lease_token"],
+        lease_fence=live_provider_binding["lease_fence"],
+        issue_target=live_provider_binding["issue_url"],
+        target_key=live_provider_binding["target_key"],
+        business_key=live_provider_binding["business_key"],
+        submission_key=live_provider_binding["submission_key"],
+        generation=live_provider_binding["generation"],
+        project_key=live_provider_binding["project_key"],
+        project_simple_name=live_provider_binding["project_simple_name"],
+        work_item_type_key=live_provider_binding["work_item_type_key"],
+        work_item_id=live_provider_binding["work_item_id"],
+    )
+    monkeypatch.setattr(provider_fence, "_canonical_store", lambda: store)
+    assert provider_fence.revalidate_provider_write_claim(
+        provider_claim,
+        operation="feishu_issue_comment",
+        issue_project_key=generation["project_key"],
+        issue_work_item_id=stock_issue_id,
+    )["authority_kind"] == "terminal_rerun"
+    with pytest.raises(
+        provider_fence.ExternalWriteFenceError,
+        match="external_write_fence_target_mismatch",
+    ):
+        provider_fence.revalidate_provider_write_claim(
+            provider_claim,
+            operation="feishu_issue_comment",
+            issue_project_key="g1q3",
+            issue_work_item_id=stock_issue_id,
+        )
     assert [
         row
         for row in store.list_rows("rca_trigger_delivery_bindings")
@@ -618,13 +946,18 @@ def test_batch_terminal_authority_creates_correction_generation_only_for_failed_
             (str(delivery_id),),
         )
     bad_request = replace(
-        _operator_request("batch-delivery-success-try-1"),
+        _operator_request(
+            "batch-delivery-success-try-1",
+            issue_url=(
+                f"https://project.feishu.cn/g1q3/issue/detail/{stock_issue_id}"
+            ),
+        ),
         reason=f"production_gray_batch:{batch_id}",
     )
     bad_authority = build_batch_terminal_rerun_authority(
         batch_id=batch_id,
         queue_sha256="1" * 64,
-        issue_id="7041712812",
+        issue_id=stock_issue_id,
         prior_submission_key=first.submission_key,
         prior_generation=1,
         prior_delivery_id=str(delivery_id),
@@ -644,6 +977,51 @@ def test_batch_terminal_authority_creates_correction_generation_only_for_failed_
             operator_authorized=True,
             batch_terminal_rerun_authority=bad_authority,
             activation_required=True,
+        )
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_trigger_sources SET outcome='joined' WHERE source_id=?",
+            (rerun.source_id,),
+        )
+    with pytest.raises(RuntimeError, match="learning_lane_admission_missing"):
+        delivery.validate_learning_lane_external_operation(
+            business_key=rerun.business_key,
+            generation=2,
+            operation="feishu_issue_comment",
+        )
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_trigger_sources SET outcome='created' WHERE source_id=?",
+            (rerun.source_id,),
+        )
+        conn.execute(
+            "UPDATE rca_outbox SET action='tampered_action' WHERE outbox_id=?",
+            (persisted_authority["outbox_id"],),
+        )
+    with pytest.raises(RuntimeError, match="learning_lane_admission_missing"):
+        delivery.validate_learning_lane_external_operation(
+            business_key=rerun.business_key,
+            generation=2,
+            operation="feishu_issue_comment",
+        )
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_outbox SET action='submit_rca_issue_intake' "
+            "WHERE outbox_id=?",
+            (persisted_authority["outbox_id"],),
+        )
+    active_epoch = store.activation_epoch()
+    assert active_epoch is not None
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_activation_epochs SET is_current=0 WHERE epoch_id=?",
+            (active_epoch["epoch_id"],),
+        )
+    with pytest.raises(RuntimeError, match="learning_lane_admission_missing"):
+        delivery.validate_learning_lane_external_operation(
+            business_key=rerun.business_key,
+            generation=2,
+            operation="feishu_issue_comment",
         )
 
 
@@ -3880,6 +4258,7 @@ def test_v5_kafka_bound_parent_rows_are_atomically_migrated_and_backfilled(tmp_p
             DROP TABLE rca_admission_snapshots;
             DROP TABLE rca_source_authority_receipts;
             DROP TABLE rca_canonical_requests;
+            DROP TABLE rca_terminal_rerun_delivery_authorities;
             DROP TABLE rca_trigger_delivery_bindings;
             DROP TABLE rca_delivery_subscriptions;
             DROP TABLE rca_trigger_bindings;
@@ -7532,6 +7911,7 @@ V13_HISTORICAL_HOLD_TABLES = {
     "rca_activation_historical_outbox_hold_items",
     "rca_activation_historical_outbox_holds",
 }
+V14_TERMINAL_RERUN_TABLES = {"rca_terminal_rerun_delivery_authorities"}
 
 
 def _drop_schema_objects(conn, *, tables):
@@ -7561,6 +7941,7 @@ def _downgrade_current_store_to_v10(store):
             tables=(
                 *V13_HISTORICAL_HOLD_TABLES,
                 *V12_LEARNING_TABLES,
+                *V14_TERMINAL_RERUN_TABLES,
             ),
         )
         for table in (
@@ -7581,7 +7962,10 @@ def _downgrade_current_store_to_v10(store):
 def _downgrade_current_store_to_v12(store):
     conn = store._connect()
     try:
-        _drop_schema_objects(conn, tables=V13_HISTORICAL_HOLD_TABLES)
+        _drop_schema_objects(
+            conn,
+            tables=(*V13_HISTORICAL_HOLD_TABLES, *V14_TERMINAL_RERUN_TABLES),
+        )
         conn.execute(
             "UPDATE control_meta SET value='pnc_rca_control_store_v12' "
             "WHERE key='schema_version'"
@@ -7598,10 +7982,23 @@ def _downgrade_current_store_to_v11(store):
             tables=(
                 *V13_HISTORICAL_HOLD_TABLES,
                 *V12_LEARNING_TABLES,
+                *V14_TERMINAL_RERUN_TABLES,
             ),
         )
         conn.execute(
             "UPDATE control_meta SET value='pnc_rca_control_store_v11' "
+            "WHERE key='schema_version'"
+        )
+    finally:
+        conn.close()
+
+
+def _downgrade_current_store_to_v13(store):
+    conn = store._connect()
+    try:
+        _drop_schema_objects(conn, tables=V14_TERMINAL_RERUN_TABLES)
+        conn.execute(
+            "UPDATE control_meta SET value='pnc_rca_control_store_v13' "
             "WHERE key='schema_version'"
         )
     finally:
@@ -7646,6 +8043,79 @@ def test_v12_store_migrates_to_v13_historical_hold_schema(tmp_path):
     assert all(
         upgraded.list_rows(table) == [] for table in V13_HISTORICAL_HOLD_TABLES
     )
+
+
+def test_v13_store_migrates_to_v14_terminal_rerun_authority_schema(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    _downgrade_current_store_to_v13(RcaControlStore(path))
+
+    with pytest.raises(RuntimeError, match="rca_control_store_schema_not_current"):
+        RcaControlStore(path, require_current=True)
+    upgraded = RcaControlStore(path)
+
+    assert upgraded.health()["schema_version"] == CONTROL_STORE_SCHEMA_VERSION
+    assert upgraded.initialization_observation()["mode"] == "migration"
+    assert upgraded.list_rows("rca_terminal_rerun_delivery_authorities") == []
+
+
+def test_v13_to_v14_migration_rolls_back_ddl_and_marker(tmp_path, monkeypatch):
+    path = tmp_path / "control.sqlite3"
+    _downgrade_current_store_to_v13(RcaControlStore(path))
+    create_schema = RcaControlStore._create_v14_terminal_rerun_delivery_authority_schema
+
+    def fail_after_ddl(cls, conn):
+        create_schema(conn)
+        raise RuntimeError("injected_v14_schema_validation_failure")
+
+    monkeypatch.setattr(
+        RcaControlStore,
+        "_create_v14_terminal_rerun_delivery_authority_schema",
+        classmethod(fail_after_ddl),
+    )
+    with pytest.raises(RuntimeError, match="injected_v14_schema_validation_failure"):
+        RcaControlStore(path)
+
+    with sqlite3.connect(path) as conn:
+        marker = conn.execute(
+            "SELECT value FROM control_meta WHERE key='schema_version'"
+        ).fetchone()[0]
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='rca_terminal_rerun_delivery_authorities'"
+        ).fetchone()
+    assert marker == "pnc_rca_control_store_v13"
+    assert table is None
+
+
+def test_current_v14_redefined_terminal_authority_trigger_is_rejected(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    store = RcaControlStore(path)
+    conn = store._connect()
+    try:
+        conn.execute(
+            "DROP TRIGGER trg_terminal_rerun_delivery_authority_binding_guard"
+        )
+        conn.execute(
+            """
+            CREATE TRIGGER trg_terminal_rerun_delivery_authority_binding_guard
+            BEFORE INSERT ON rca_terminal_rerun_delivery_authorities
+            WHEN 0
+            BEGIN
+                SELECT RAISE(
+                    ABORT, 'terminal_rerun_delivery_authority_binding_mismatch'
+                );
+            END
+            """
+        )
+    finally:
+        conn.close()
+
+    with pytest.raises(
+        RuntimeError,
+        match="incompatible_control_store_schema:"
+        "terminal_rerun_authority_trigger_sql",
+    ):
+        RcaControlStore(path, require_current=True)
 
 
 def test_v12_prototype_sealed_hold_migrates_without_rehashing_rows(tmp_path):
