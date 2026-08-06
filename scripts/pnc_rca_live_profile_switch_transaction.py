@@ -274,6 +274,35 @@ def _stable_baseline_status(status: Mapping[str, Any]) -> dict[str, Any]:
     return stable
 
 
+def _manifest_components(
+    manifest: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]]:
+    """Return manifest bindings only after validating their object shapes."""
+    if not isinstance(manifest, Mapping):
+        _fail("pnc_rca_live_profile_switch_manifest_invalid")
+    gateway_release = manifest.get("gateway_release_binding")
+    manifest_authority = manifest.get("rca_release_authority")
+    if not isinstance(gateway_release, Mapping) or not isinstance(
+        manifest_authority, Mapping
+    ):
+        _fail("pnc_rca_live_profile_switch_manifest_invalid")
+    gateway_capacity = gateway_release.get("capacity_admission")
+    if not isinstance(gateway_capacity, Mapping):
+        _fail("pnc_rca_live_profile_switch_manifest_invalid")
+    return gateway_release, manifest_authority, gateway_capacity
+
+
+def _host_runtime_face(authority_value: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Require the authority host face before reading its projected fields."""
+    if not isinstance(authority_value, Mapping):
+        _fail("pnc_rca_live_profile_switch_authority_invalid")
+    faces = authority_value.get("faces")
+    host_face = faces.get("host_runtime") if isinstance(faces, Mapping) else None
+    if not isinstance(host_face, Mapping):
+        _fail("pnc_rca_live_profile_switch_authority_invalid")
+    return host_face
+
+
 def _project_env(raw: bytes) -> bytes:
     replacements = {
         "HERMES_OUTBOUND_MODE": "live",
@@ -328,9 +357,12 @@ def _project_plist(
     launcher = str(hermes_home / "runtime" / "governance-tools" / "pnc_live_exec.py")
     if not isinstance(args, list) or args[:3] != ["/usr/bin/python3", launcher, label]:
         _fail("pnc_rca_live_profile_switch_plist_runtime_pinned")
+    try:
+        serialized = json.dumps(value, ensure_ascii=True, sort_keys=True)
+    except (TypeError, ValueError, RecursionError) as exc:
+        _fail("pnc_rca_live_profile_switch_plist_invalid", exc)
     if any(
-        marker in json.dumps(value, ensure_ascii=True, sort_keys=True)
-        for marker in ("/runtime/releases/", "/runtime/venvs/")
+        marker in serialized for marker in ("/runtime/releases/", "/runtime/venvs/")
     ):
         _fail("pnc_rca_live_profile_switch_plist_runtime_pinned")
     environment = value.get("EnvironmentVariables")
@@ -480,7 +512,8 @@ def _validate_release_state(
     authority_sha = authority.canonical_json_sha256(authority_value)
     authority_epoch_id = str(authority_value.get("authority_epoch_id") or "")
     provenance = base._source_provenance(source_root)
-    host_face = authority_value.get("faces", {}).get("host_runtime", {})
+    host_face = _host_runtime_face(authority_value)
+    host_runtime_root = str(host_face.get("root") or "")
     anchors = profile.get("read_only_plist_anchors")
     if (
         set(profile) != PROFILE_FIELDS
@@ -616,7 +649,13 @@ def _validate_release_state(
                 separators=(",", ":"),
             ).encode("utf-8")
         )
-    except (UnicodeDecodeError, TypeError, ValueError, yaml.YAMLError) as exc:
+    except (
+        UnicodeDecodeError,
+        TypeError,
+        ValueError,
+        RecursionError,
+        yaml.YAMLError,
+    ) as exc:
         _fail("pnc_rca_live_profile_switch_config_invalid", exc)
     try:
         expected_live_manifest = deepcopy(initial_manifest)
@@ -650,28 +689,18 @@ def _validate_release_state(
         (initial_manifest, initial_env_obs, initial_binding_obs),
         (live_manifest, live_env_obs, live_binding_obs),
     ):
-        gateway_release = manifest.get("gateway_release_binding")
-        manifest_authority = manifest.get("rca_release_authority")
-        gateway_capacity = (
-            gateway_release.get("capacity_admission")
-            if isinstance(gateway_release, Mapping)
-            else None
+        gateway_release, manifest_authority, gateway_capacity = _manifest_components(
+            manifest
         )
         capacity = initial_binding["policy"]["capacity_admission"]
         if (
-            not isinstance(gateway_release, Mapping)
-            or not isinstance(gateway_capacity, Mapping)
-            or not isinstance(manifest_authority, Mapping)
-            or manifest.get("config_path") != str(config_target)
+            manifest.get("config_path") != str(config_target)
             or manifest.get("config_sha256") != _sha(config_raw)
             or manifest.get("config_semantic_sha256") != config_semantic_sha
             or manifest.get("env_sha256") != env_obs["sha256"]
-            or manifest.get("runtime_root")
-            != authority_value["faces"]["host_runtime"]["root"]
+            or manifest.get("runtime_root") != host_runtime_root
             or manifest_authority.get("release_id") != release_id
-            or manifest.get("gateway_release_binding", {}).get(
-                "rca_platform_active_binding_sha256"
-            )
+            or gateway_release.get("rca_platform_active_binding_sha256")
             != binding_obs["sha256"]
             or gateway_capacity.get("release_id") != release_id
             or gateway_capacity.get("bootstrap_epoch_id") != capacity["bootstrap_epoch_id"]

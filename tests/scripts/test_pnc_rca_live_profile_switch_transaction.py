@@ -93,6 +93,27 @@ def test_live_projection_uses_validated_dispatcher_environment(tmp_path):
     assert error.value.code == "pnc_rca_live_profile_switch_dispatcher_environment_invalid"
 
 
+def test_plist_non_json_value_fails_closed(tmp_path):
+    hermes_home = tmp_path / ".hermes"
+    source = plistlib.loads(
+        _plist_source(tmp_path, hermes_home)
+        .joinpath("local.pnc.completion-notice-relay.plist")
+        .read_bytes()
+    )
+    source["OpaqueData"] = b"\x00\x01"
+    with pytest.raises(switch.LiveProfileSwitchError) as error:
+        switch._project_plist(
+            plistlib.dumps(source),
+            label="local.pnc.completion-notice-relay",
+            outbound="live",
+            enabled=True,
+            hermes_home=hermes_home,
+            release_id=RELEASE_ID,
+            dispatcher_environment={},
+        )
+    assert error.value.code == "pnc_rca_live_profile_switch_plist_invalid"
+
+
 def test_baseline_status_digest_ignores_only_validation_binding_identity():
     first = {
         "ready": True,
@@ -113,6 +134,56 @@ def test_baseline_status_digest_ignores_only_validation_binding_identity():
     assert switch._canonical(switch._stable_baseline_status(first)) != switch._canonical(
         switch._stable_baseline_status(second)
     )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("__manifest__", None),
+        ("gateway_release_binding", []),
+        ("rca_release_authority", "invalid"),
+    ],
+)
+def test_manifest_nested_bindings_fail_closed(field, value):
+    manifest = {
+        "gateway_release_binding": {
+            "capacity_admission": {"release_id": RELEASE_ID}
+        },
+        "rca_release_authority": {"release_id": RELEASE_ID},
+    }
+    if field == "__manifest__":
+        manifest = value
+    else:
+        manifest[field] = value
+    with pytest.raises(switch.LiveProfileSwitchError) as error:
+        switch._manifest_components(manifest)
+    assert error.value.code == "pnc_rca_live_profile_switch_manifest_invalid"
+
+
+def test_manifest_capacity_binding_requires_mapping():
+    manifest = {
+        "gateway_release_binding": {"capacity_admission": "invalid"},
+        "rca_release_authority": {"release_id": RELEASE_ID},
+    }
+    with pytest.raises(switch.LiveProfileSwitchError) as error:
+        switch._manifest_components(manifest)
+    assert error.value.code == "pnc_rca_live_profile_switch_manifest_invalid"
+
+
+@pytest.mark.parametrize(
+    "faces",
+    [None, [], {"host_runtime": "invalid"}],
+)
+def test_authority_host_face_requires_mapping(faces):
+    with pytest.raises(switch.LiveProfileSwitchError) as error:
+        switch._host_runtime_face({"faces": faces})
+    assert error.value.code == "pnc_rca_live_profile_switch_authority_invalid"
+
+
+def test_authority_value_requires_mapping():
+    with pytest.raises(switch.LiveProfileSwitchError) as error:
+        switch._host_runtime_face(None)
+    assert error.value.code == "pnc_rca_live_profile_switch_authority_invalid"
 
 
 def _make_plan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[dict, Path, dict[str, Path]]:

@@ -609,7 +609,7 @@ def _validate_quarantine_baseline(
         _fail("pnc_steady_release_transaction_baseline_invalid")
     return {
         "path": str(baseline_path),
-        "observation": observation,
+        "observation": {"exists": True, **observation},
         "baseline_id": str(identity["baseline_id"]),
         "baseline_fingerprint": str(identity["baseline_fingerprint"]),
         "status_sha256": hashlib.sha256(
