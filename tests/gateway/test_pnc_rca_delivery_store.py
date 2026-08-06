@@ -51,6 +51,29 @@ from scripts.pnc_foxglove_delivery import canonical_viz_mcap_path, foxglove_url
 
 NOW = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
 TOPIC = "feishu-project-workflow-event"
+REAL_G1Q3_PROJECT_KEY = "68ef617fb371dc80a10641f7"
+REAL_G1Q3_PROJECT_SIMPLE_NAME = "t03o4q"
+
+
+def _real_g1q3_profile_snapshot(offset: int, option_id: str):
+    from tests.gateway.test_pnc_rca_control_store import (
+        _profile_snapshot_policy,
+        _profile_snapshot_record,
+    )
+
+    policy = replace(
+        _profile_snapshot_policy(),
+        project_keys=frozenset({REAL_G1Q3_PROJECT_KEY}),
+        project_simple_names=frozenset({REAL_G1Q3_PROJECT_SIMPLE_NAME}),
+    )
+    record = _profile_snapshot_record(offset, option_id)
+    payload = json.loads(record.value)
+    payload["project_key"] = REAL_G1Q3_PROJECT_KEY
+    payload["project_simple_name"] = REAL_G1Q3_PROJECT_SIMPLE_NAME
+    return policy, replace(
+        record,
+        value=json.dumps(payload, sort_keys=True).encode(),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -1655,11 +1678,7 @@ def test_current_epoch_valid_w3_quarantine_keeps_fenced_terminal_effect(tmp_path
 def test_current_epoch_profile_terminal_without_w3_keeps_public_issue_target(
     tmp_path,
 ):
-    from tests.gateway.test_pnc_rca_control_store import (
-        _create_activation_epoch,
-        _profile_snapshot_policy,
-        _profile_snapshot_record,
-    )
+    from tests.gateway.test_pnc_rca_control_store import _create_activation_epoch
 
     control = RcaControlStore(tmp_path / "control.sqlite3")
     epoch = _create_activation_epoch(control, start_offset=20)
@@ -1669,9 +1688,10 @@ def test_current_epoch_profile_terminal_without_w3_keeps_public_issue_target(
             "WHERE epoch_id=? AND is_current=1",
             (epoch["epoch_id"],),
         )
+    policy, record = _real_g1q3_profile_snapshot(20, "6841983153")
     result = control.ingest_record(
-        _profile_snapshot_record(20, "6841983153"),
-        policy=_profile_snapshot_policy(),
+        record,
+        policy=policy,
         submit_enabled=True,
         activation_required=True,
         activation_slot_kind="kafka_success",
@@ -1703,6 +1723,10 @@ def test_current_epoch_profile_terminal_without_w3_keeps_public_issue_target(
     [job] = store.list_rows("rca_delivery_jobs")
     assert watch["state"] == "delivery_created"
     assert job["issue_url"].endswith("/t03o4q/issue/detail/7041712812")
+    assert job["project_key"] == REAL_G1Q3_PROJECT_KEY
+    assert job["target_key"] == (
+        f"feishu_project:{REAL_G1Q3_PROJECT_KEY}:issue:7041712812"
+    )
     assert job["terminal_error_code"] == "business_profile_unsupported"
     contract = json.loads(job["contract_json"])
     assert contract["diagnostic_code"] == "business_route_unsupported"
@@ -1728,6 +1752,8 @@ def test_current_epoch_profile_terminal_without_w3_keeps_public_issue_target(
         now=NOW + timedelta(seconds=3),
     )
     assert binding["source_error_code"] == "business_profile_unsupported"
+    assert binding["project_key"] == REAL_G1Q3_PROJECT_KEY
+    assert binding["project_simple_name"] == REAL_G1Q3_PROJECT_SIMPLE_NAME
     with pytest.raises(
         RuntimeError,
         match="external_write_fence_operation_denied",
@@ -1774,11 +1800,7 @@ def test_profile_terminal_provider_claim_rechecks_lease_target_and_epoch(tmp_pat
         build_profile_terminal_provider_claim,
     )
     from gateway.pnc_rca_write_fence import ExternalWriteFenceError
-    from tests.gateway.test_pnc_rca_control_store import (
-        _create_activation_epoch,
-        _profile_snapshot_policy,
-        _profile_snapshot_record,
-    )
+    from tests.gateway.test_pnc_rca_control_store import _create_activation_epoch
 
     provider_now = datetime.now(timezone.utc)
     control = RcaControlStore(tmp_path / "control.sqlite3")
@@ -1789,9 +1811,10 @@ def test_profile_terminal_provider_claim_rechecks_lease_target_and_epoch(tmp_pat
             "WHERE epoch_id=? AND is_current=1",
             (epoch["epoch_id"],),
         )
+    policy, record = _real_g1q3_profile_snapshot(20, "6841983153")
     result = control.ingest_record(
-        _profile_snapshot_record(20, "6841983153"),
-        policy=_profile_snapshot_policy(),
+        record,
+        policy=policy,
         submit_enabled=True,
         activation_required=True,
         activation_slot_kind="kafka_success",
@@ -1847,6 +1870,8 @@ def test_profile_terminal_provider_claim_rechecks_lease_target_and_epoch(tmp_pat
         lease_token=binding["lease_token"],
         lease_fence=binding["lease_fence"],
         issue_target=binding["issue_url"],
+        project_key=binding["project_key"],
+        project_simple_name=binding["project_simple_name"],
         target_key=binding["target_key"],
         business_key=binding["business_key"],
         submission_key=binding["submission_key"],
@@ -1857,10 +1882,12 @@ def test_profile_terminal_provider_claim_rechecks_lease_target_and_epoch(tmp_pat
     live = provider_fence.revalidate_provider_write_claim(
         claim,
         operation="feishu_issue_comment",
-        issue_project_key="t03o4q",
+        issue_project_key=REAL_G1Q3_PROJECT_KEY,
         issue_work_item_id="7041712812",
     )
     assert live["authority_kind"] == "profile_terminal"
+    assert live["project_key"] == REAL_G1Q3_PROJECT_KEY
+    assert live["project_simple_name"] == REAL_G1Q3_PROJECT_SIMPLE_NAME
     with sqlite3.connect(control.db_path) as conn:
         conn.execute(
             "UPDATE rca_trigger_sources SET source_kind='feishu_group_manual' "
@@ -1875,7 +1902,7 @@ def test_profile_terminal_provider_claim_rechecks_lease_target_and_epoch(tmp_pat
         provider_fence.revalidate_provider_write_claim(
             claim,
             operation="feishu_issue_comment",
-            issue_project_key="t03o4q",
+            issue_project_key=REAL_G1Q3_PROJECT_KEY,
             issue_work_item_id="7041712812",
         )
     with sqlite3.connect(control.db_path) as conn:
@@ -1905,7 +1932,7 @@ def test_profile_terminal_provider_claim_rechecks_lease_target_and_epoch(tmp_pat
         provider_fence.revalidate_provider_write_claim(
             claim,
             operation="feishu_issue_comment",
-            issue_project_key="t03o4q",
+            issue_project_key=REAL_G1Q3_PROJECT_KEY,
             issue_work_item_id="7041712812",
         )
     with sqlite3.connect(control.db_path) as conn:
@@ -1921,11 +1948,50 @@ def test_profile_terminal_provider_claim_rechecks_lease_target_and_epoch(tmp_pat
         provider_fence.revalidate_provider_write_claim(
             claim,
             operation="feishu_issue_field_update",
-            issue_project_key="t03o4q",
+            issue_project_key=REAL_G1Q3_PROJECT_KEY,
             issue_work_item_id="7041712812",
         )
-    assert claim.payload()["authority"]["operation"] == "feishu_issue_comment"
-    assert "thread_id" not in claim.payload()["authority"]
+    authority = claim.payload()["authority"]
+    assert authority["operation"] == "feishu_issue_comment"
+    assert authority["project_key"] == REAL_G1Q3_PROJECT_KEY
+    assert authority["project_simple_name"] == REAL_G1Q3_PROJECT_SIMPLE_NAME
+    assert "thread_id" not in authority
+    with pytest.raises(
+        ExternalWriteFenceError,
+        match="external_write_fence_target_mismatch",
+    ):
+        provider_fence.revalidate_provider_write_claim(
+            claim,
+            operation="feishu_issue_comment",
+            issue_project_key=REAL_G1Q3_PROJECT_SIMPLE_NAME,
+            issue_work_item_id="7041712812",
+        )
+    wrong_simple_name = build_profile_terminal_provider_claim(
+        epoch_id=binding["epoch_id"],
+        activation_ledger_id=binding["activation_ledger_id"],
+        effect_key=binding["effect_key"],
+        delivery_id=binding["delivery_id"],
+        lease_token=binding["lease_token"],
+        lease_fence=binding["lease_fence"],
+        issue_target=binding["issue_url"],
+        project_key=binding["project_key"],
+        project_simple_name="wrong-slug",
+        target_key=binding["target_key"],
+        business_key=binding["business_key"],
+        submission_key=binding["submission_key"],
+        generation=binding["generation"],
+        source_error_code=binding["source_error_code"],
+    )
+    with pytest.raises(
+        ExternalWriteFenceError,
+        match="external_write_fence_identity_mismatch",
+    ):
+        provider_fence.revalidate_provider_write_claim(
+            wrong_simple_name,
+            operation="feishu_issue_comment",
+            issue_project_key=REAL_G1Q3_PROJECT_KEY,
+            issue_work_item_id="7041712812",
+        )
     wrong_target = build_profile_terminal_provider_claim(
         epoch_id=binding["epoch_id"],
         activation_ledger_id=binding["activation_ledger_id"],
@@ -1934,6 +2000,8 @@ def test_profile_terminal_provider_claim_rechecks_lease_target_and_epoch(tmp_pat
         lease_token=binding["lease_token"],
         lease_fence=binding["lease_fence"],
         issue_target="https://project.feishu.cn/t03o4q/issue/detail/9999999999",
+        project_key=binding["project_key"],
+        project_simple_name=binding["project_simple_name"],
         target_key=binding["target_key"],
         business_key=binding["business_key"],
         submission_key=binding["submission_key"],
@@ -1947,7 +2015,7 @@ def test_profile_terminal_provider_claim_rechecks_lease_target_and_epoch(tmp_pat
         provider_fence.revalidate_provider_write_claim(
             wrong_target,
             operation="feishu_issue_comment",
-            issue_project_key="t03o4q",
+            issue_project_key=REAL_G1Q3_PROJECT_KEY,
             issue_work_item_id="7041712812",
         )
     with sqlite3.connect(control.db_path) as conn:
@@ -1963,7 +2031,7 @@ def test_profile_terminal_provider_claim_rechecks_lease_target_and_epoch(tmp_pat
         provider_fence.revalidate_provider_write_claim(
             claim,
             operation="feishu_issue_comment",
-            issue_project_key="t03o4q",
+            issue_project_key=REAL_G1Q3_PROJECT_KEY,
             issue_work_item_id="7041712812",
         )
 

@@ -77,6 +77,8 @@ from tests.gateway.test_pnc_rca_delivery_contract import (
 
 
 _TEST_PROVIDER_WRITE_CLAIM = build_write_fence_provider_claim({"state": "issued"})
+REAL_G1Q3_PROJECT_KEY = "68ef617fb371dc80a10641f7"
+REAL_G1Q3_PROJECT_SIMPLE_NAME = "t03o4q"
 
 
 def project_gate_a_report(source):
@@ -1331,7 +1333,7 @@ def _seed_terminal(tmp_path, *, with_thread: bool = False):
     return store
 
 
-def _seed_profile_terminal(tmp_path):
+def _seed_profile_terminal(tmp_path, *, split_project_identity: bool = False):
     """Materialize one current Kafka profile terminal without a W3 snapshot."""
     from tests.gateway.test_pnc_rca_control_store import (
         _create_activation_epoch,
@@ -1347,9 +1349,24 @@ def _seed_profile_terminal(tmp_path):
             "WHERE epoch_id=? AND is_current=1",
             (epoch["epoch_id"],),
         )
+    policy = _profile_snapshot_policy()
+    record = _profile_snapshot_record(20, "6841983153")
+    if split_project_identity:
+        policy = replace(
+            policy,
+            project_keys=frozenset({REAL_G1Q3_PROJECT_KEY}),
+            project_simple_names=frozenset({REAL_G1Q3_PROJECT_SIMPLE_NAME}),
+        )
+        payload = json.loads(record.value)
+        payload["project_key"] = REAL_G1Q3_PROJECT_KEY
+        payload["project_simple_name"] = REAL_G1Q3_PROJECT_SIMPLE_NAME
+        record = replace(
+            record,
+            value=json.dumps(payload, sort_keys=True).encode(),
+        )
     result = control.ingest_record(
-        _profile_snapshot_record(20, "6841983153"),
-        policy=_profile_snapshot_policy(),
+        record,
+        policy=policy,
         submit_enabled=True,
         activation_required=True,
         activation_slot_kind="kafka_success",
@@ -1458,7 +1475,14 @@ def _asset_relative(url):
 
 
 class Remote:
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        project_key: str = "t03o4q",
+        work_item_id: str = "7041712812",
+    ):
+        self.project_key = project_key
+        self.work_item_id = work_item_id
         self.comments: list[dict[str, str]] = []
         self.list_calls = 0
         self.add_calls = 0
@@ -1473,8 +1497,8 @@ class Remote:
         self.weak_success = False
 
     def list_comments(self, project_key, work_item_id):
-        assert project_key == "t03o4q"
-        assert work_item_id == "7041712812"
+        assert project_key == self.project_key
+        assert work_item_id == self.work_item_id
         self.list_calls += 1
         self.history.append("list_comments")
         if self.list_failure is not None:
@@ -1482,8 +1506,8 @@ class Remote:
         return {"success": True, "comments": list(self.comments)}
 
     def add_comment(self, project_key, work_item_id, content):
-        assert project_key == "t03o4q"
-        assert work_item_id == "7041712812"
+        assert project_key == self.project_key
+        assert work_item_id == self.work_item_id
         self.add_calls += 1
         self.history.append("add_comment")
         if self.add_failure is not None:
@@ -1495,8 +1519,8 @@ class Remote:
         return {"success": True, "remote_id": remote_id}
 
     def get_fields(self, project_key, work_item_id, field_keys):
-        assert project_key == "t03o4q"
-        assert work_item_id == "7041712812"
+        assert project_key == self.project_key
+        assert work_item_id == self.work_item_id
         self.get_field_calls += 1
         self.history.append("get_fields")
         if self.get_field_failure is not None:
@@ -1509,8 +1533,8 @@ class Remote:
         }
 
     def update_fields(self, project_key, work_item_id, field_updates):
-        assert project_key == "t03o4q"
-        assert work_item_id == "7041712812"
+        assert project_key == self.project_key
+        assert work_item_id == self.work_item_id
         self.update_field_calls += 1
         self.history.append("update_fields")
         if self.update_field_failure is not None:
@@ -3024,7 +3048,7 @@ def test_current_profile_terminal_without_w3_dispatches_comment_only_with_scoped
     tmp_path,
     monkeypatch,
 ):
-    store = _seed_profile_terminal(tmp_path)
+    store = _seed_profile_terminal(tmp_path, split_project_identity=True)
     captured_claims = []
     original_builder = dispatcher_module.build_profile_terminal_provider_claim
 
@@ -3038,7 +3062,8 @@ def test_current_profile_terminal_without_w3_dispatches_comment_only_with_scoped
         "build_profile_terminal_provider_claim",
         capture_claim,
     )
-    dispatcher, remote, _clock = _dispatcher(tmp_path)
+    remote = Remote(project_key=REAL_G1Q3_PROJECT_KEY)
+    dispatcher, remote, _clock = _dispatcher(tmp_path, remote=remote)
 
     outcome = dispatcher.dispatch_one()
 
@@ -3049,8 +3074,22 @@ def test_current_profile_terminal_without_w3_dispatches_comment_only_with_scoped
     claim_payload = captured_claims[0].payload()
     assert claim_payload["authority_kind"] == "profile_terminal"
     assert claim_payload["authority"]["operation"] == "feishu_issue_comment"
-    assert store.list_rows("rca_delivery_effects")[0]["status"] == "succeeded"
-    assert store.list_rows("rca_delivery_jobs")[0]["status"] == "delivered"
+    assert claim_payload["authority"]["project_key"] == REAL_G1Q3_PROJECT_KEY
+    assert (
+        claim_payload["authority"]["project_simple_name"]
+        == REAL_G1Q3_PROJECT_SIMPLE_NAME
+    )
+    [effect] = store.list_rows("rca_delivery_effects")
+    [job] = store.list_rows("rca_delivery_jobs")
+    assert effect["status"] == "succeeded"
+    assert effect["target_key"].startswith(
+        f"feishu_project:{REAL_G1Q3_PROJECT_KEY}:"
+    )
+    assert job["status"] == "delivered"
+    assert job["project_key"] == REAL_G1Q3_PROJECT_KEY
+    assert job["issue_url"].startswith(
+        f"https://project.feishu.cn/{REAL_G1Q3_PROJECT_SIMPLE_NAME}/"
+    )
 
 
 def test_pre_submit_quarantine_keeps_specific_safe_diagnostic_only(tmp_path):

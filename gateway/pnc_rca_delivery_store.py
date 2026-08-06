@@ -1623,7 +1623,12 @@ class RcaDeliveryStore:
                 or str(epoch["state"] or "") not in ACTIVATION_DELIVERY_STATES
             ):
                 raise RuntimeError("external_write_fence_epoch_not_current")
-            is_profile_terminal, observed_issue_url, source_error_code = (
+            (
+                is_profile_terminal,
+                observed_issue_url,
+                observed_project_simple_name,
+                source_error_code,
+            ) = (
                 self._stored_profile_terminal_issue_target_for_quarantined_outbox_tx(
                     conn,
                     row=row,
@@ -1646,6 +1651,7 @@ class RcaDeliveryStore:
             if (
                 not is_profile_terminal
                 or not observed_issue_url
+                or not observed_project_simple_name
                 or source_error_code not in OUTBOX_PROFILE_TERMINAL_WRITE_ERROR_CODES
                 or isinstance(activation_ledger_id, bool)
                 or not isinstance(activation_ledger_id, int)
@@ -1692,6 +1698,8 @@ class RcaDeliveryStore:
                 "lease_fence": lease_fence,
                 "operation": "feishu_issue_comment",
                 "issue_url": observed_issue_url,
+                "project_key": str(row["project_key"]),
+                "project_simple_name": observed_project_simple_name,
                 "target_key": target_key,
                 "business_key": business_key,
                 "submission_key": submission_key,
@@ -4343,7 +4351,7 @@ class RcaDeliveryStore:
         conn: sqlite3.Connection,
         *,
         row: sqlite3.Row,
-    ) -> tuple[bool, str, str]:
+    ) -> tuple[bool, str, str, str]:
         """Validate a Kafka profile terminal without a W3 execution snapshot.
 
         Snapshot-only profile observations are sufficient for a neutral
@@ -4353,7 +4361,7 @@ class RcaDeliveryStore:
         """
         source_error = str(row["last_error_code"] or "").strip()
         if source_error not in OUTBOX_PROFILE_TERMINAL_WRITE_ERROR_CODES:
-            return False, "", ""
+            return False, "", "", ""
         source = conn.execute(
             """
             SELECT source.source_id, source.source_kind, source.kafka_event_uid,
@@ -4396,7 +4404,7 @@ class RcaDeliveryStore:
             (int(row["outbox_id"]),),
         ).fetchone()
         if source is None:
-            return True, "", OUTBOX_PROFILE_TERMINAL_BINDING_INVALID_CODE
+            return True, "", "", OUTBOX_PROFILE_TERMINAL_BINDING_INVALID_CODE
         try:
             normalized = json.loads(str(source["normalized_json"] or ""))
             resolution = normalized["business_profile_resolution"]
@@ -4501,9 +4509,9 @@ class RcaDeliveryStore:
                 != int(row["generation"])
             ):
                 raise ValueError("profile_terminal_binding_mismatch")
-            return True, issue_url, source_error
+            return True, issue_url, project_simple_name, source_error
         except (KeyError, TypeError, ValueError, OverflowError, json.JSONDecodeError):
-            return True, "", OUTBOX_PROFILE_TERMINAL_BINDING_INVALID_CODE
+            return True, "", "", OUTBOX_PROFILE_TERMINAL_BINDING_INVALID_CODE
 
     @staticmethod
     def _materialize_silent_quarantined_outbox_in_transaction(
@@ -4597,11 +4605,14 @@ class RcaDeliveryStore:
                         row=row,
                     )
                 )
-                is_profile_terminal, profile_issue_target, profile_code = (
-                    self._stored_profile_terminal_issue_target_for_quarantined_outbox_tx(
-                        conn,
-                        row=row,
-                    )
+                (
+                    is_profile_terminal,
+                    profile_issue_target,
+                    _profile_project_simple_name,
+                    profile_code,
+                ) = self._stored_profile_terminal_issue_target_for_quarantined_outbox_tx(
+                    conn,
+                    row=row,
                 )
                 if is_manual:
                     if not manual_issue_target:

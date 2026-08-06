@@ -56,6 +56,7 @@ from gateway.pnc_rca_delivery_contract import (
     build_thread_reply_content,
     build_terminal_delivery,
     build_terminal_thread_reply_effect,
+    canonical_issue_url,
     compute_delivery_effect_key,
     compute_delivery_effect_payload_sha256,
     delivery_effect_idempotency_uuid,
@@ -3496,9 +3497,9 @@ def _validate_terminal_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         schema_version=schema_version,
     )
     if profile_terminal_public_target:
-        expected_issue_url = (
-            f"https://project.feishu.cn/{claim.project_key}/issue/detail/"
-            f"{claim.work_item_id}"
+        expected_issue_url = canonical_issue_url(
+            claim.project_key,
+            claim.work_item_id,
         )
         if (
             not claim.issue_url
@@ -4669,6 +4670,8 @@ class DeliveryDispatcher:
                 lease_token=profile_terminal["lease_token"],
                 lease_fence=profile_terminal["lease_fence"],
                 issue_target=profile_terminal["issue_url"],
+                project_key=profile_terminal["project_key"],
+                project_simple_name=profile_terminal["project_simple_name"],
                 target_key=profile_terminal["target_key"],
                 business_key=profile_terminal["business_key"],
                 submission_key=profile_terminal["submission_key"],

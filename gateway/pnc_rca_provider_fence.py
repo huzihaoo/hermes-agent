@@ -54,6 +54,8 @@ _PROFILE_TERMINAL_FIELDS = frozenset(
         "lease_fence",
         "operation",
         "issue_target",
+        "project_key",
+        "project_simple_name",
         "target_key",
         "business_key",
         "submission_key",
@@ -289,6 +291,8 @@ def build_profile_terminal_provider_claim(
     lease_token: str,
     lease_fence: int,
     issue_target: str,
+    project_key: str,
+    project_simple_name: str,
     target_key: str,
     business_key: str,
     submission_key: str,
@@ -307,6 +311,8 @@ def build_profile_terminal_provider_claim(
             "lease_fence": lease_fence,
             "operation": "feishu_issue_comment",
             "issue_target": str(issue_target or "").strip(),
+            "project_key": str(project_key or "").strip(),
+            "project_simple_name": str(project_simple_name or "").strip(),
             "target_key": str(target_key or "").strip(),
             "business_key": str(business_key or "").strip(),
             "submission_key": str(submission_key or "").strip(),
@@ -471,6 +477,8 @@ def _profile_terminal_effect_binding(
         "lease_fence": live["lease_fence"],
         "operation": live["operation"],
         "issue_target": live["issue_url"],
+        "project_key": live["project_key"],
+        "project_simple_name": live["project_simple_name"],
         "target_key": live["target_key"],
         "business_key": live["business_key"],
         "submission_key": live["submission_key"],
@@ -574,12 +582,16 @@ def revalidate_provider_write_claim(
         if op != "feishu_issue_comment" or authority.get("operation") != op:
             raise ExternalWriteFenceError("external_write_fence_operation_denied")
         live = _profile_terminal_effect_binding(store, authority)
-        expected_project, expected_work_item = _issue_identity(live["issue_url"])
+        expected_simple_name, expected_work_item = _issue_identity(live["issue_url"])
+        expected_project_key = str(live.get("project_key") or "").strip()
+        project_simple_name = str(live.get("project_simple_name") or "").strip()
         if (
-            not expected_project
+            not expected_simple_name
             or not expected_work_item
+            or expected_simple_name != project_simple_name
+            or not expected_project_key
             or observed_work_item != expected_work_item
-            or (observed_project and observed_project != expected_project)
+            or observed_project != expected_project_key
         ):
             raise ExternalWriteFenceError("external_write_fence_target_mismatch")
         return {"authority_kind": kind, **dict(live)}
