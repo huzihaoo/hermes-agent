@@ -153,7 +153,9 @@ from scripts.pnc_foxglove_delivery import (
 )
 from scripts.pnc_rca_outbox_dispatcher import (
     _absolute_new_receipt_path as _absolute_new_circuit_reset_receipt_path,
+    _create_immutable_file,
     _control_db_identity,
+    _open_receipt_parent,
     _receipt_parent_identity,
     _validate_reset_audit_text as _validate_circuit_reset_text,
     _write_immutable_receipt as _write_immutable_circuit_reset_receipt,
@@ -775,12 +777,50 @@ def _pre_w3_effect_disposition_active_release_binding(
 def _pre_w3_effect_disposition_backup_binding(
     path: Path,
     expected_sha256: str,
+    *,
+    source_path: Path,
+    expected_snapshot: Mapping[str, Any],
+    verify_source_logical_digest: bool = True,
 ) -> dict[str, Any]:
     selected = path.expanduser().absolute()
+    source = source_path.expanduser().absolute()
     expected = str(expected_sha256 or "").strip().lower()
-    if not path.is_absolute() or _SHA256_RE.fullmatch(expected) is None:
+    if (
+        not path.is_absolute()
+        or not source_path.is_absolute()
+        or _SHA256_RE.fullmatch(expected) is None
+    ):
         raise ValueError("pre_w3_effect_disposition_backup_invalid")
+    try:
+        source_stat = source.lstat()
+    except OSError as exc:
+        raise ValueError("pre_w3_effect_disposition_backup_invalid") from exc
+    if (
+        stat.S_ISLNK(source_stat.st_mode)
+        or not stat.S_ISREG(source_stat.st_mode)
+        or source == selected
+    ):
+        raise ValueError("pre_w3_effect_disposition_backup_invalid")
+    source_sha256 = _bound_source_sha256(source)
     observed_sha256 = _bound_source_sha256(selected)
+    backup_db: sqlite3.Connection | None = None
+    try:
+        backup_db = sqlite3.connect(
+            f"file:{selected}?mode=ro&immutable=1",
+            uri=True,
+            timeout=5,
+        )
+        backup_db.execute("PRAGMA query_only=ON")
+        journal_mode = str(backup_db.execute("PRAGMA journal_mode").fetchone()[0])
+        quick_check = str(backup_db.execute("PRAGMA quick_check").fetchone()[0])
+        foreign_key_violations = backup_db.execute(
+            "PRAGMA foreign_key_check"
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise ValueError("pre_w3_effect_disposition_backup_invalid") from exc
+    finally:
+        if backup_db is not None:
+            backup_db.close()
     descriptor = -1
     try:
         before = selected.lstat()
@@ -796,20 +836,66 @@ def _pre_w3_effect_disposition_backup_binding(
         if (
             observed_sha256 != expected
             or magic != b"SQLite format 3\x00"
+            or journal_mode != "delete"
+            or quick_check != "ok"
+            or foreign_key_violations
             or opened.st_size < 512
             or opened.st_size % 512 != 0
+            or (opened.st_dev, opened.st_ino)
+            == (source_stat.st_dev, source_stat.st_ino)
             or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
             != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
             or (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
             != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
         ):
             raise ValueError("pre_w3_effect_disposition_backup_invalid")
+        backup_store = RcaDeliveryStore(
+            selected,
+            require_current=True,
+            read_only=True,
+            ensure_current_rows=False,
+        )
+        backup_snapshot = backup_store.pre_w3_effect_disposition_snapshot(
+            effect_keys=expected_snapshot["effect_keys"],
+        )
+        expected_logical_digest = expected_snapshot["control_db_logical_digest"]
+        backup_logical_digest = backup_store.control_db_logical_digest()
+        source_logical_digest = expected_logical_digest
+        if verify_source_logical_digest:
+            source_store = RcaDeliveryStore(
+                source,
+                require_current=True,
+                read_only=True,
+                ensure_current_rows=False,
+            )
+            source_logical_digest = source_store.control_db_logical_digest()
+        if (
+            backup_snapshot != expected_snapshot
+            or backup_logical_digest != expected_logical_digest
+            or source_logical_digest != expected_logical_digest
+        ):
+            raise ValueError("pre_w3_effect_disposition_backup_snapshot_mismatch")
         return {
             "path": str(selected),
             "sha256": observed_sha256,
             "size_bytes": int(opened.st_size),
+            "device": int(opened.st_dev),
+            "inode": int(opened.st_ino),
+            "mtime_ns": int(opened.st_mtime_ns),
+            "source_path": str(source),
+            "source_sha256": source_sha256,
+            "source_device": int(source_stat.st_dev),
+            "source_inode": int(source_stat.st_ino),
+            "source_size_bytes": int(source_stat.st_size),
+            "source_mtime_ns": int(source_stat.st_mtime_ns),
+            "journal_mode": journal_mode,
+            "quick_check": quick_check,
+            "foreign_key_check": "ok",
+            "snapshot_sha256": str(backup_snapshot["snapshot_sha256"]),
+            "effect_set_sha256": str(backup_snapshot["effect_set_sha256"]),
+            "logical_digest_sha256": str(backup_logical_digest["sha256"]),
         }
-    except OSError as exc:
+    except (OSError, RuntimeError, sqlite3.Error) as exc:
         raise ValueError("pre_w3_effect_disposition_backup_invalid") from exc
     finally:
         if descriptor >= 0:
@@ -836,6 +922,25 @@ def _build_pre_w3_effect_disposition_receipt(
         key: control_db_identity[key]
         for key in ("path", "device", "inode")
     }
+    stable_backup_binding = {
+        key: backup_binding[key]
+        for key in (
+            "path",
+            "sha256",
+            "size_bytes",
+            "device",
+            "inode",
+            "journal_mode",
+            "quick_check",
+            "foreign_key_check",
+            "snapshot_sha256",
+            "effect_set_sha256",
+            "logical_digest_sha256",
+            "source_path",
+            "source_device",
+            "source_inode",
+        )
+    }
     plan_id = _pre_w3_disposition_sha256({
         "command": PRE_W3_EFFECT_DISPOSITION_COMMAND,
         "operator": operator,
@@ -847,15 +952,12 @@ def _build_pre_w3_effect_disposition_receipt(
         "circuit": snapshot["circuit"],
         "control_db_identity": stable_db_identity,
         "destination_binding": destination_binding,
-        "backup_binding": dict(backup_binding),
+        "backup_binding": stable_backup_binding,
         "active_release_binding": dict(active_release_binding),
         "config_binding_sha256": config_binding_sha256,
         "tool_provenance_sha256": tool_provenance_sha256,
     })
-    disposition_id = _pre_w3_disposition_sha256({
-        "plan_id": plan_id,
-        "recorded_at": recorded_at,
-    })
+    disposition_id = _pre_w3_disposition_sha256({"plan_id": plan_id})
     after = _pre_w3_effect_disposition_after(
         snapshot,
         disposition_id=disposition_id,
@@ -925,6 +1027,79 @@ def _build_pre_w3_effect_disposition_recovery_envelope(
     }
     envelope["receipt_fingerprint"] = _pre_w3_disposition_sha256(envelope)
     return envelope
+
+
+def _existing_pre_w3_disposition_receipt_sha256(
+    path: Path,
+    audit: Mapping[str, Any],
+) -> str | None:
+    selected = path.expanduser()
+    if not selected.is_absolute() or str(selected) != str(selected.absolute()):
+        raise ValueError("pre_w3_effect_disposition_receipt_path_invalid")
+    selected = selected.absolute()
+    if _circuit_reset_destination_binding(selected) != audit["destination_binding"]:
+        raise ValueError("pre_w3_effect_disposition_receipt_destination_changed")
+    sidecar = Path(f"{selected}.sha256")
+    try:
+        observed = selected.lstat()
+    except FileNotFoundError:
+        if sidecar.exists():
+            raise ValueError("pre_w3_effect_disposition_receipt_incomplete")
+        return None
+    if (
+        stat.S_ISLNK(observed.st_mode)
+        or not stat.S_ISREG(observed.st_mode)
+        or observed.st_nlink != 1
+        or observed.st_uid != os.getuid()
+        or stat.S_IMODE(observed.st_mode) != 0o444
+    ):
+        raise ValueError("pre_w3_effect_disposition_receipt_invalid")
+    expected_raw = _circuit_reset_canonical_json(audit).encode("utf-8")
+    raw = selected.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    if raw != expected_raw or _bound_source_sha256(selected) != digest:
+        raise ValueError("pre_w3_effect_disposition_receipt_invalid")
+    try:
+        sidecar_stat = sidecar.lstat()
+    except FileNotFoundError:
+        # A DB commit can succeed immediately before the sidecar write.  The
+        # audit and immutable main receipt are already exact at this point, so
+        # repair only the missing sidecar and never rewrite either artifact.
+        parent_path = selected.parent
+        parent_fd, parent_identity = _open_receipt_parent(parent_path)
+        try:
+            expected_parent = {
+                "device": int(audit["destination_binding"]["parent_device"]),
+                "inode": int(audit["destination_binding"]["parent_inode"]),
+            }
+            if parent_identity != expected_parent:
+                raise ValueError("pre_w3_effect_disposition_receipt_parent_changed")
+            try:
+                _create_immutable_file(
+                    parent_path,
+                    parent_fd,
+                    sidecar.name,
+                    f"{digest}  {selected.name}\n".encode("ascii"),
+                    parent_identity,
+                )
+            except ValueError as exc:
+                # Another retry may have won the no-clobber race.  The final
+                # exact sidecar validation below remains authoritative.
+                if "already_exists" not in str(exc):
+                    raise
+        finally:
+            os.close(parent_fd)
+        sidecar_stat = sidecar.lstat()
+    if (
+        stat.S_ISLNK(sidecar_stat.st_mode)
+        or not stat.S_ISREG(sidecar_stat.st_mode)
+        or sidecar_stat.st_nlink != 1
+        or sidecar_stat.st_uid != os.getuid()
+        or stat.S_IMODE(sidecar_stat.st_mode) != 0o444
+        or sidecar.read_text(encoding="ascii") != f"{digest}  {selected.name}\n"
+    ):
+        raise ValueError("pre_w3_effect_disposition_receipt_invalid")
+    return digest
 
 
 def _stable_key(prefix: str, material: Mapping[str, Any]) -> str:
@@ -6045,6 +6220,8 @@ def _parser() -> argparse.ArgumentParser:
         help="exact before-state SHA from the immediately preceding reset plan",
     )
     parser.add_argument("--expected-effect-set-sha256")
+    parser.add_argument("--expected-database-logical-sha256")
+    parser.add_argument("--expected-disposition-id")
     parser.add_argument("--expected-activation-sha256")
     parser.add_argument("--expected-live-env-sha256")
     parser.add_argument("--expected-tool-provenance-sha256")
@@ -6064,6 +6241,8 @@ def _validate_circuit_reset_arguments(args: argparse.Namespace) -> None:
     expected_before = args.expected_before_state_sha256
     disposition_expected = (
         args.expected_effect_set_sha256,
+        args.expected_database_logical_sha256,
+        args.expected_disposition_id,
         args.expected_activation_sha256,
         args.expected_live_env_sha256,
         args.expected_tool_provenance_sha256,
@@ -6417,11 +6596,135 @@ def _run_pre_w3_effect_disposition_command(
         return 0
 
     operator, reason = _validate_circuit_reset_text(args.operator, args.reason)
+    if args.apply:
+        existing = store.pre_w3_effect_disposition_audit(
+            args.expected_disposition_id
+        )
+        if existing is not None:
+            expected_existing = {
+                "disposition_id": args.expected_disposition_id,
+                "plan_id": args.expected_plan_id,
+                "before_snapshot_sha256": args.expected_before_state_sha256,
+                "effect_set_sha256": args.expected_effect_set_sha256,
+                "database_logical_sha256": (
+                    args.expected_database_logical_sha256
+                ),
+                "activation_sha256": args.expected_activation_sha256,
+                "active_release_binding_sha256": (
+                    args.expected_active_release_binding_sha256
+                ),
+                "config_binding_sha256": args.expected_config_binding_sha256,
+                "live_env_sha256": args.expected_live_env_sha256,
+                "tool_provenance_sha256": args.expected_tool_provenance_sha256,
+            }
+            observed_existing = {
+                "disposition_id": existing["disposition_id"],
+                "plan_id": existing["plan_id"],
+                "before_snapshot_sha256": existing["before_snapshot_sha256"],
+                "effect_set_sha256": existing["effect_set_sha256"],
+                "database_logical_sha256": existing["before"][
+                    "control_db_logical_digest"
+                ]["sha256"],
+                "activation_sha256": existing["before"]["current_activation"][
+                    "sha256"
+                ],
+                "active_release_binding_sha256": existing[
+                    "active_release_binding"
+                ]["sha256"],
+                "config_binding_sha256": existing["config_binding_sha256"],
+                "live_env_sha256": existing["active_release_binding"][
+                    "live_env_sha256"
+                ],
+                "tool_provenance_sha256": existing["tool_provenance_sha256"],
+            }
+            changed = [
+                key
+                for key, value in expected_existing.items()
+                if observed_existing[key] != value
+            ]
+            requested_keys = sorted(
+                str(value or "").strip() for value in args.pre_w3_effect_keys
+            )
+            if (
+                changed
+                or requested_keys != existing["effect_keys"]
+                or operator != existing["operator"]
+                or reason != existing["reason"]
+                or not store.pre_w3_effect_disposition_is_applied(existing)
+            ):
+                raise RuntimeError(
+                    "pre_w3_effect_disposition_idempotent_retry_mismatch"
+                )
+            current_backup = _pre_w3_effect_disposition_backup_binding(
+                args.backup,
+                args.backup_sha256,
+                source_path=config.control_db_path,
+                expected_snapshot=existing["before"],
+                verify_source_logical_digest=False,
+            )
+            stable_backup_fields = {
+                "path",
+                "sha256",
+                "size_bytes",
+                "device",
+                "inode",
+                "mtime_ns",
+                "journal_mode",
+                "quick_check",
+                "foreign_key_check",
+                "snapshot_sha256",
+                "effect_set_sha256",
+                "logical_digest_sha256",
+            }
+            if any(
+                current_backup[field] != existing["backup_binding"][field]
+                for field in stable_backup_fields
+            ):
+                raise RuntimeError(
+                    "pre_w3_effect_disposition_backup_changed"
+                )
+            requested_receipt = Path(args.receipt).expanduser()
+            if (
+                not requested_receipt.is_absolute()
+                or str(requested_receipt) != str(requested_receipt.absolute())
+            ):
+                raise ValueError(
+                    "pre_w3_effect_disposition_receipt_path_invalid"
+                )
+            receipt_path = requested_receipt.absolute()
+            receipt_sha256 = _existing_pre_w3_disposition_receipt_sha256(
+                receipt_path,
+                existing,
+            )
+            if receipt_sha256 is None:
+                receipt_path = _absolute_new_circuit_reset_receipt_path(args.receipt)
+                receipt_sha256 = _write_immutable_circuit_reset_receipt(
+                    receipt_path,
+                    existing,
+                    expected_parent_identity={
+                        "device": existing["destination_binding"]["parent_device"],
+                        "inode": existing["destination_binding"]["parent_inode"],
+                    },
+                )
+            print(json.dumps({
+                "ok": True,
+                "applied": False,
+                "idempotent": True,
+                "command": PRE_W3_EFFECT_DISPOSITION_COMMAND,
+                "disposition_id": existing["disposition_id"],
+                "effect_keys": existing["effect_keys"],
+                "receipt": str(receipt_path),
+                "receipt_sha256": receipt_sha256,
+                "receipt_fingerprint": existing["receipt_fingerprint"],
+                "effect_delta": {
+                    **existing["effect_delta"],
+                    "database_rows_repeated": 0,
+                },
+                "external_effects_triggered": False,
+                "provider_calls_performed": 0,
+            }, ensure_ascii=False, indent=2, sort_keys=True))
+            return 0
     receipt_path = _absolute_new_circuit_reset_receipt_path(args.receipt)
-    backup_binding = _pre_w3_effect_disposition_backup_binding(
-        args.backup,
-        args.backup_sha256,
-    )
     active_binding = _pre_w3_effect_disposition_active_release_binding(config)
     config_binding_sha256 = _circuit_reset_config_binding(config)
     tool_provenance = _circuit_reset_tool_provenance()
@@ -6429,6 +6732,12 @@ def _run_pre_w3_effect_disposition_command(
     recorded_at = _utc_now()
     snapshot = store.pre_w3_effect_disposition_snapshot(
         effect_keys=args.pre_w3_effect_keys,
+    )
+    backup_binding = _pre_w3_effect_disposition_backup_binding(
+        args.backup,
+        args.backup_sha256,
+        source_path=config.control_db_path,
+        expected_snapshot=snapshot,
     )
     planned = _build_pre_w3_effect_disposition_receipt(
         config=config,
@@ -6442,9 +6751,13 @@ def _run_pre_w3_effect_disposition_command(
         tool_provenance=tool_provenance,
     )
     observed = {
+        "disposition_id": planned["disposition_id"],
         "plan_id": planned["plan_id"],
         "before_snapshot_sha256": planned["before_snapshot_sha256"],
         "effect_set_sha256": planned["effect_set_sha256"],
+        "database_logical_sha256": planned["before"][
+            "control_db_logical_digest"
+        ]["sha256"],
         "activation_sha256": planned["before"]["current_activation"]["sha256"],
         "active_release_binding_sha256": planned["active_release_binding"]["sha256"],
         "config_binding_sha256": planned["config_binding_sha256"],
@@ -6460,11 +6773,15 @@ def _run_pre_w3_effect_disposition_command(
             "provider_calls_performed": 0,
             "receipt_path": str(receipt_path),
             "expected_apply": {
+                "expected_disposition_id": observed["disposition_id"],
                 "expected_plan_id": observed["plan_id"],
                 "expected_before_state_sha256": observed[
                     "before_snapshot_sha256"
                 ],
                 "expected_effect_set_sha256": observed["effect_set_sha256"],
+                "expected_database_logical_sha256": observed[
+                    "database_logical_sha256"
+                ],
                 "expected_activation_sha256": observed["activation_sha256"],
                 "expected_active_release_binding_sha256": observed[
                     "active_release_binding_sha256"
@@ -6482,9 +6799,11 @@ def _run_pre_w3_effect_disposition_command(
         return 0
 
     expected = {
+        "disposition_id": args.expected_disposition_id,
         "plan_id": args.expected_plan_id,
         "before_snapshot_sha256": args.expected_before_state_sha256,
         "effect_set_sha256": args.expected_effect_set_sha256,
+        "database_logical_sha256": args.expected_database_logical_sha256,
         "activation_sha256": args.expected_activation_sha256,
         "active_release_binding_sha256": (
             args.expected_active_release_binding_sha256
@@ -6506,6 +6825,8 @@ def _run_pre_w3_effect_disposition_command(
         or _pre_w3_effect_disposition_backup_binding(
             args.backup,
             args.backup_sha256,
+            source_path=config.control_db_path,
+            expected_snapshot=planned["before"],
         )
         != backup_binding
     ):

@@ -1729,10 +1729,7 @@ def _pre_w3_disposition_audit(store, snapshot, tmp_path, *, now):
         "before": snapshot["snapshot_sha256"],
         "destination": str(receipt_path),
     })
-    disposition_id = _pre_w3_disposition_sha256({
-        "plan_id": plan_id,
-        "recorded_at": now.isoformat(),
-    })
+    disposition_id = _pre_w3_disposition_sha256({"plan_id": plan_id})
     after = _pre_w3_effect_disposition_after(
         snapshot,
         disposition_id=disposition_id,
@@ -1769,6 +1766,23 @@ def _pre_w3_disposition_audit(store, snapshot, tmp_path, *, now):
             "path": str((tmp_path / "control.before.sqlite3").absolute()),
             "sha256": "4" * 64,
             "size_bytes": 4096,
+            "device": 10,
+            "inode": 11,
+            "mtime_ns": 12,
+            "source_path": str(store.db_path.absolute()),
+            "source_sha256": "4" * 64,
+            "source_device": int(observed.st_dev),
+            "source_inode": int(observed.st_ino),
+            "source_size_bytes": int(observed.st_size),
+            "source_mtime_ns": int(observed.st_mtime_ns),
+            "journal_mode": "delete",
+            "quick_check": "ok",
+            "foreign_key_check": "ok",
+            "snapshot_sha256": snapshot["snapshot_sha256"],
+            "effect_set_sha256": snapshot["effect_set_sha256"],
+            "logical_digest_sha256": snapshot["control_db_logical_digest"][
+                "sha256"
+            ],
         },
         "active_release_binding": {
             "path": str((tmp_path / "active-release-binding.json").absolute()),
@@ -1926,7 +1940,7 @@ def test_exact_pre_w3_disposition_rejects_row_drift_before_mutation(tmp_path):
 
     with pytest.raises(
         DeliveryRecordConflictError,
-        match="effect_not_eligible|before_changed",
+        match="effect_not_eligible|before_changed|logical_state_changed",
     ):
         store.quarantine_pre_w3_effects_with_audit(
             audit=audit,

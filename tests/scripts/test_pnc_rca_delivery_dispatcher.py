@@ -298,6 +298,7 @@ def _sqlite_backup(source_path, backup_path):
     destination = sqlite3.connect(backup_path)
     try:
         source.backup(destination)
+        destination.execute("PRAGMA journal_mode=DELETE")
         destination.commit()
     finally:
         destination.close()
@@ -381,6 +382,33 @@ def test_pre_w3_disposition_cli_plan_apply_and_recovery_never_builds_provider(
     assert {row["attempt"] for row in effects} == {0}
     assert all(row["remote_receipt_json"] is None for row in effects)
 
+    before_retry = {
+        table: store.list_rows(table)
+        for table in (
+            "rca_delivery_effects",
+            "rca_delivery_jobs",
+            "rca_delivery_attempts",
+        )
+    }
+    # A crash after the immutable main receipt but before its sidecar must be
+    # recoverable without another database mutation.
+    Path(f"{receipt}.sha256").unlink()
+    assert dispatcher_module.main(apply_args) == 0
+    repaired = json.loads(capsys.readouterr().out)
+    assert repaired["applied"] is False
+    assert repaired["idempotent"] is True
+    assert Path(f"{receipt}.sha256").read_text(encoding="ascii") == (
+        f"{repaired['receipt_sha256']}  {receipt.name}\n"
+    )
+    assert dispatcher_module.main(apply_args) == 0
+    retried = json.loads(capsys.readouterr().out)
+    assert retried["applied"] is False
+    assert retried["idempotent"] is True
+    assert retried["disposition_id"] == applied["disposition_id"]
+    assert before_retry == {
+        table: store.list_rows(table) for table in before_retry
+    }
+
     recovered = (tmp_path / "pre-w3-disposition.recovered.json").absolute()
     assert dispatcher_module.main([
         "--materialize-pre-w3-disposition",
@@ -424,6 +452,123 @@ def test_pre_w3_disposition_cli_rejects_active_binding_drift_before_mutation(
     assert "plan_changed" in error["message"]
     [effect] = store.list_rows("rca_delivery_effects")
     assert effect["status"] == "pending"
+    assert store.list_rows("rca_delivery_attempts") == []
+    assert not receipt.exists()
+
+
+def test_pre_w3_disposition_cli_rejects_live_db_as_backup(
+    tmp_path, monkeypatch, capsys
+):
+    _control_store, store, keys = _legacy_pre_w3_pending_effects(tmp_path, count=1)
+    config = _config(tmp_path, enabled=False)
+    _patch_pre_w3_disposition_cli(monkeypatch, config, tmp_path)
+    live_sha256 = hashlib.sha256(config.control_db_path.read_bytes()).hexdigest()
+    receipt = (tmp_path / "pre-w3-live-db-backup.json").absolute()
+    args = _pre_w3_cli_args(
+        keys,
+        receipt=receipt,
+        backup=config.control_db_path.absolute(),
+        backup_sha256=live_sha256,
+    )
+
+    assert dispatcher_module.main(args) == 2
+    error = json.loads(capsys.readouterr().out)
+    assert "backup_invalid" in error["message"]
+    [effect] = store.list_rows("rca_delivery_effects")
+    assert effect["status"] == "pending"
+    assert store.list_rows("rca_delivery_attempts") == []
+    assert not receipt.exists()
+
+
+def test_pre_w3_disposition_cli_rejects_unrelated_sqlite_backup(
+    tmp_path, monkeypatch, capsys
+):
+    _control_store, store, keys = _legacy_pre_w3_pending_effects(tmp_path, count=1)
+    config = _config(tmp_path, enabled=False)
+    _patch_pre_w3_disposition_cli(monkeypatch, config, tmp_path)
+    unrelated_root = tmp_path / "unrelated"
+    _other_control, other_store, _other_keys = _legacy_pre_w3_pending_effects(
+        unrelated_root,
+        count=1,
+    )
+    with sqlite3.connect(other_store.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_activation_epochs SET production_fingerprint = ? "
+            "WHERE is_current = 1",
+            ("9" * 64,),
+        )
+    backup = (tmp_path / "unrelated.before.sqlite3").absolute()
+    backup_sha256 = _sqlite_backup(other_store.db_path, backup)
+    receipt = (tmp_path / "pre-w3-unrelated-backup.json").absolute()
+    args = _pre_w3_cli_args(
+        keys,
+        receipt=receipt,
+        backup=backup,
+        backup_sha256=backup_sha256,
+    )
+
+    assert dispatcher_module.main(args) == 2
+    error = json.loads(capsys.readouterr().out)
+    assert "backup" in error["message"]
+    [effect] = store.list_rows("rca_delivery_effects")
+    assert effect["status"] == "pending"
+    assert store.list_rows("rca_delivery_attempts") == []
+    assert not receipt.exists()
+
+
+@pytest.mark.parametrize("mutation_sql", [
+    "INSERT INTO control_meta(key, value) VALUES('unrelated-backup-row', 'x')",
+    "INSERT INTO rca_delivery_meta(key, value) VALUES('unrelated-backup-row', 'x')",
+])
+def test_pre_w3_disposition_cli_rejects_backup_with_unrelated_row(
+    tmp_path, monkeypatch, capsys, mutation_sql
+):
+    _control_store, store, keys = _legacy_pre_w3_pending_effects(tmp_path, count=1)
+    config = _config(tmp_path, enabled=False)
+    _patch_pre_w3_disposition_cli(monkeypatch, config, tmp_path)
+    backup = (tmp_path / "control.before.extra-row.sqlite3").absolute()
+    _sqlite_backup(config.control_db_path, backup)
+    with sqlite3.connect(backup) as conn:
+        conn.execute(mutation_sql)
+    backup_sha256 = hashlib.sha256(backup.read_bytes()).hexdigest()
+    receipt = (tmp_path / "pre-w3-extra-row.json").absolute()
+    args = _pre_w3_cli_args(
+        keys,
+        receipt=receipt,
+        backup=backup,
+        backup_sha256=backup_sha256,
+    )
+
+    assert dispatcher_module.main(args) == 2
+    error = json.loads(capsys.readouterr().out)
+    assert "backup" in error["message"]
+    assert store.list_rows("rca_delivery_attempts") == []
+    assert not receipt.exists()
+
+
+def test_pre_w3_disposition_cli_rejects_live_unrelated_row_drift(
+    tmp_path, monkeypatch, capsys
+):
+    _control_store, store, keys = _legacy_pre_w3_pending_effects(tmp_path, count=1)
+    config = _config(tmp_path, enabled=False)
+    _patch_pre_w3_disposition_cli(monkeypatch, config, tmp_path)
+    backup = (tmp_path / "control.before.sqlite3").absolute()
+    backup_sha256 = _sqlite_backup(config.control_db_path, backup)
+    with sqlite3.connect(config.control_db_path) as conn:
+        conn.execute(
+            "INSERT INTO control_meta(key, value) VALUES('live-unrelated-row', 'x')"
+        )
+    receipt = (tmp_path / "pre-w3-live-extra-row.json").absolute()
+    args = _pre_w3_cli_args(
+        keys,
+        receipt=receipt,
+        backup=backup,
+        backup_sha256=backup_sha256,
+    )
+
+    assert dispatcher_module.main(args) == 2
+    error = json.loads(capsys.readouterr().out)
+    assert "backup" in error["message"] or "snapshot" in error["message"]
     assert store.list_rows("rca_delivery_attempts") == []
     assert not receipt.exists()
 

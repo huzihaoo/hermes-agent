@@ -149,6 +149,9 @@ PRE_W3_EFFECT_DISPOSITION_SCHEMA_VERSION = (
 PRE_W3_EFFECT_DISPOSITION_SNAPSHOT_SCHEMA_VERSION = (
     "pnc_rca_pre_w3_effect_disposition_snapshot_v1"
 )
+PRE_W3_CONTROL_DB_LOGICAL_DIGEST_SCHEMA_VERSION = (
+    "pnc_rca_control_db_logical_digest_v1"
+)
 PRE_W3_EFFECT_DISPOSITION_COMMAND = "quarantine-exact-pre-w3-effects"
 PRE_W3_EFFECT_DISPOSITION_ERROR_CODE = "external_write_fence_missing"
 PRE_W3_EFFECT_DISPOSITION_MAX_EFFECTS = 32
@@ -536,6 +539,135 @@ def _canonical_json(value: Any) -> str:
     )
 
 
+def _sqlite_identifier(identifier: str) -> str:
+    """Quote a SQLite identifier without allowing query text injection."""
+    return '"' + str(identifier).replace('"', '""') + '"'
+
+
+def _sqlite_value_material(value: Any) -> dict[str, Any]:
+    """Encode SQLite values with type information for a stable logical digest."""
+    if value is None:
+        return {"type": "null"}
+    if isinstance(value, bool):
+        return {"type": "integer", "value": int(value)}
+    if isinstance(value, int):
+        return {"type": "integer", "value": value}
+    if isinstance(value, float):
+        # ``float.hex`` preserves the exact IEEE value and is JSON-safe even for
+        # the non-finite values a custom SQLite adapter might return.
+        return {"type": "real", "value": value.hex()}
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return {"type": "blob", "value": bytes(value).hex()}
+    if isinstance(value, str):
+        return {"type": "text", "value": value}
+    raise TypeError(f"unsupported SQLite value type: {type(value).__name__}")
+
+
+def _sqlite_logical_digest_tx(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Digest all SQLite logical schema and row content under the caller's snapshot.
+
+    The caller must already hold a read or write transaction.  Rows are encoded
+    with SQLite type tags and sorted by their canonical bytes, so a page-layout
+    or index rebuild cannot change the result while any user-table mutation can.
+    """
+    digest = hashlib.sha256()
+    object_rows = conn.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master "
+        "ORDER BY type COLLATE BINARY, name COLLATE BINARY, "
+        "tbl_name COLLATE BINARY"
+    ).fetchall()
+    objects: list[dict[str, Any]] = []
+    table_names: list[str] = []
+    for row in object_rows:
+        item = {
+            "type": str(row[0]),
+            "name": str(row[1]),
+            "table": str(row[2]),
+            "sql": None if row[3] is None else str(row[3]),
+        }
+        objects.append(item)
+        # sqlite_stat* is planner-maintenance state rather than application
+        # content; sqlite_sequence is retained because it is part of rowid
+        # allocation semantics.
+        if item["type"] == "table" and not item["name"].startswith("sqlite_stat"):
+            table_names.append(item["name"])
+
+    def feed(value: Any) -> None:
+        raw = _canonical_json(value).encode("utf-8")
+        digest.update(len(raw).to_bytes(8, "big"))
+        digest.update(raw)
+
+    feed({
+        "schema_version": PRE_W3_CONTROL_DB_LOGICAL_DIGEST_SCHEMA_VERSION,
+        "application_id": int(conn.execute("PRAGMA application_id").fetchone()[0]),
+        "user_version": int(conn.execute("PRAGMA user_version").fetchone()[0]),
+        "encoding": str(conn.execute("PRAGMA encoding").fetchone()[0]),
+        "objects": objects,
+    })
+    row_count = 0
+    for table_name in table_names:
+        quoted_table = _sqlite_identifier(table_name)
+        column_rows = conn.execute(
+            f"PRAGMA table_xinfo({quoted_table})"
+        ).fetchall()
+        columns = [
+            {
+                "cid": int(row[0]),
+                "name": str(row[1]),
+                "type": str(row[2] or ""),
+                "notnull": int(row[3]),
+                "default": None if row[4] is None else str(row[4]),
+                "pk": int(row[5]),
+                "hidden": int(row[6]),
+            }
+            for row in column_rows
+        ]
+        visible = [row for row in columns if row["hidden"] == 0]
+        select_columns = ", ".join(
+            _sqlite_identifier(row["name"]) for row in visible
+        )
+        # Include rowid when available.  WITHOUT ROWID tables are represented by
+        # their complete typed row values and schema/PK metadata.
+        has_rowid = False
+        try:
+            conn.execute(f"SELECT rowid FROM {quoted_table} LIMIT 0")
+            has_rowid = True
+        except sqlite3.Error:
+            pass
+        projection_parts = (["rowid"] if has_rowid else []) + [
+            _sqlite_identifier(row["name"]) for row in visible
+        ]
+        projection = ", ".join(projection_parts) or "1"
+        try:
+            rows = conn.execute(f"SELECT {projection} FROM {quoted_table}").fetchall()
+        except sqlite3.Error:
+            # A malformed/unsupported table must fail closed rather than silently
+            # producing a partial digest.
+            raise
+        encoded_rows: list[bytes] = []
+        for row in rows:
+            values = [_sqlite_value_material(value) for value in tuple(row)]
+            encoded_rows.append(_canonical_json(values).encode("utf-8"))
+        encoded_rows.sort()
+        feed({
+            "table": table_name,
+            "columns": columns,
+            "has_rowid": has_rowid,
+            "row_count": len(encoded_rows),
+        })
+        for encoded in encoded_rows:
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+        row_count += len(encoded_rows)
+    return {
+        "schema_version": PRE_W3_CONTROL_DB_LOGICAL_DIGEST_SCHEMA_VERSION,
+        "sha256": digest.hexdigest(),
+        "object_count": len(objects),
+        "table_count": len(table_names),
+        "row_count": row_count,
+    }
+
+
 def _reject_delivery_circuit_reset_json_constant(_value: str) -> None:
     raise ValueError("delivery_circuit_reset_non_finite_json")
 
@@ -785,6 +917,8 @@ def _validate_pre_w3_effect_disposition_audit(
     if (
         normalized["schema_version"] != PRE_W3_EFFECT_DISPOSITION_SCHEMA_VERSION
         or normalized["command"] != PRE_W3_EFFECT_DISPOSITION_COMMAND
+        or normalized["disposition_id"]
+        != _pre_w3_disposition_sha256({"plan_id": normalized["plan_id"]})
         or normalized["effect_kind"] != DELIVERY_EFFECT_KIND
         or not str(normalized["operator"] or "").strip()
         or not str(normalized["reason"] or "").strip()
@@ -810,6 +944,23 @@ def _validate_pre_w3_effect_disposition_audit(
         or len(before["effects"]) != len(keys)
     ):
         raise ValueError("pre_w3_effect_disposition_before_invalid")
+    logical_digest = before.get("control_db_logical_digest")
+    if (
+        not isinstance(logical_digest, Mapping)
+        or set(logical_digest)
+        != {"schema_version", "sha256", "object_count", "table_count", "row_count"}
+        or logical_digest.get("schema_version")
+        != PRE_W3_CONTROL_DB_LOGICAL_DIGEST_SCHEMA_VERSION
+        or re.fullmatch(r"[0-9a-f]{64}", str(logical_digest.get("sha256") or ""))
+        is None
+        or any(
+            isinstance(logical_digest.get(field), bool)
+            or not isinstance(logical_digest.get(field), int)
+            or logical_digest.get(field) < 0
+            for field in ("object_count", "table_count", "row_count")
+        )
+    ):
+        raise ValueError("pre_w3_effect_disposition_logical_digest_invalid")
     if [row.get("effect_key") for row in before["effects"]] != list(keys):
         raise ValueError("pre_w3_effect_disposition_before_invalid")
     activation = before.get("current_activation")
@@ -871,12 +1022,70 @@ def _validate_pre_w3_effect_disposition_audit(
             for field in ("parent_device", "parent_inode")
         )
         or not isinstance(backup, Mapping)
-        or set(backup) != {"path", "sha256", "size_bytes"}
+        or set(backup)
+        != {
+            "path",
+            "sha256",
+            "size_bytes",
+            "device",
+            "inode",
+            "mtime_ns",
+            "source_path",
+            "source_sha256",
+            "source_device",
+            "source_inode",
+            "source_size_bytes",
+            "source_mtime_ns",
+            "journal_mode",
+            "quick_check",
+            "foreign_key_check",
+            "snapshot_sha256",
+            "effect_set_sha256",
+            "logical_digest_sha256",
+        }
         or not Path(str(backup.get("path") or "")).is_absolute()
         or re.fullmatch(r"[0-9a-f]{64}", str(backup.get("sha256") or "")) is None
+        or not Path(str(backup.get("source_path") or "")).is_absolute()
+        or re.fullmatch(
+            r"[0-9a-f]{64}", str(backup.get("source_sha256") or "")
+        )
+        is None
+        or backup.get("source_path") != identity.get("path")
+        or backup.get("source_device") != identity.get("device")
+        or backup.get("source_inode") != identity.get("inode")
+        or backup.get("source_size_bytes") != identity.get("size")
+        or backup.get("source_mtime_ns") != identity.get("mtime_ns")
+        or backup.get("journal_mode") != "delete"
+        or backup.get("quick_check") != "ok"
+        or backup.get("foreign_key_check") != "ok"
+        or backup.get("snapshot_sha256") != normalized["before_snapshot_sha256"]
+        or backup.get("effect_set_sha256") != normalized["effect_set_sha256"]
+        or backup.get("logical_digest_sha256")
+        != logical_digest["sha256"]
+        or (
+            backup.get("device"),
+            backup.get("inode"),
+        ) == (
+            backup.get("source_device"),
+            backup.get("source_inode"),
+        )
         or isinstance(backup.get("size_bytes"), bool)
         or not isinstance(backup.get("size_bytes"), int)
         or backup.get("size_bytes") < 512
+        or any(
+            isinstance(backup.get(field), bool)
+            or not isinstance(backup.get(field), int)
+            or backup.get(field) < 0
+            for field in (
+                "device",
+                "inode",
+                "mtime_ns",
+                "source_device",
+                "source_inode",
+                "source_size_bytes",
+                "source_mtime_ns",
+            )
+        )
         or not isinstance(release, Mapping)
         or not Path(str(release.get("path") or "")).is_absolute()
         or re.fullmatch(r"[0-9a-f]{64}", str(release.get("sha256") or "")) is None
@@ -8502,6 +8711,7 @@ class RcaDeliveryStore:
             {"effect_key": row["effect_key"], "row_sha256": row["row_sha256"]}
             for row in effects
         ]
+        logical_digest = _sqlite_logical_digest_tx(conn)
         body = {
             "schema_version": PRE_W3_EFFECT_DISPOSITION_SNAPSHOT_SCHEMA_VERSION,
             "effect_kind": DELIVERY_EFFECT_KIND,
@@ -8509,6 +8719,7 @@ class RcaDeliveryStore:
             "effect_set_sha256": _pre_w3_disposition_sha256(set_binding),
             "current_activation": activation,
             "circuit": circuit,
+            "control_db_logical_digest": logical_digest,
             "effects": effects,
         }
         return {**body, "snapshot_sha256": _pre_w3_disposition_sha256(body)}
@@ -8521,11 +8732,25 @@ class RcaDeliveryStore:
         """Read the exact no-write disposition cohort without taking a lease."""
         conn = self._connect()
         try:
+            conn.execute("BEGIN")
             return self._pre_w3_effect_disposition_snapshot_tx(
                 conn,
                 effect_keys=effect_keys,
             )
         finally:
+            if conn.in_transaction:
+                conn.rollback()
+            conn.close()
+
+    def control_db_logical_digest(self) -> dict[str, Any]:
+        """Return a full logical digest from one consistent read transaction."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            return _sqlite_logical_digest_tx(conn)
+        finally:
+            if conn.in_transaction:
+                conn.rollback()
             conn.close()
 
     @staticmethod
@@ -8651,6 +8876,13 @@ class RcaDeliveryStore:
                 )
             if identity != observed_identity:
                 raise RuntimeError("pre_w3_effect_disposition_control_db_changed")
+            if (
+                _sqlite_logical_digest_tx(conn)
+                != payload["before"]["control_db_logical_digest"]
+            ):
+                raise DeliveryRecordConflictError(
+                    "pre_w3_effect_disposition_control_db_logical_state_changed"
+                )
             observed_before = self._pre_w3_effect_disposition_snapshot_tx(
                 conn,
                 effect_keys=payload["effect_keys"],
@@ -8791,6 +9023,18 @@ class RcaDeliveryStore:
             return value
         except (json.JSONDecodeError, ValueError) as exc:
             raise RuntimeError("pre_w3_effect_disposition_audit_invalid") from exc
+        finally:
+            conn.close()
+
+    def pre_w3_effect_disposition_is_applied(
+        self,
+        audit: Mapping[str, Any],
+    ) -> bool:
+        """Verify that an existing durable disposition still has its exact after-state."""
+        payload = _validate_pre_w3_effect_disposition_audit(audit)
+        conn = self._connect()
+        try:
+            return self._pre_w3_after_state_matches_tx(conn, payload=payload)
         finally:
             conn.close()
 
