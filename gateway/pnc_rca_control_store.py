@@ -14930,6 +14930,7 @@ class RcaControlStore:
                 or snapshot_authority is not None
                 or snapshot_ticket_authority is not None
                 or snapshot_manual_ingress_authority is not None
+                or activation_required is not True
                 or expected_silent_rerun["activation_required"] is not True
                 or expected_silent_rerun["requester_id"] != manual.requester_id
                 or expected_silent_rerun["reason"] != manual.reason

@@ -384,6 +384,38 @@ def test_operator_silent_terminal_rerun_rejects_tampered_authority_without_mutat
     assert {table: store.list_rows(table) for table in before} == before
 
 
+def test_operator_silent_terminal_rerun_requires_callsite_activation_gate(
+    tmp_path,
+):
+    store, terminal_at = _silent_deadline_terminal_store(tmp_path)
+    request = _silent_batch_request()
+    authority = _silent_batch_authority(store, request)
+    before = {
+        table: store.list_rows(table)
+        for table in (
+            "business_triggers",
+            "rca_outbox",
+            "rca_trigger_sources",
+            "rca_shadow_promotion_audit",
+        )
+    }
+
+    with pytest.raises(
+        ManualRcaAdmissionError, match="silent_terminal_rerun_authority_invalid"
+    ):
+        store.admit_manual_trigger(
+            request,
+            allowed_chat_ids=set(),
+            submit_enabled=True,
+            operator_authorized=True,
+            silent_terminal_rerun_authority=authority,
+            activation_required=False,
+            now=terminal_at + timedelta(seconds=1),
+        )
+
+    assert {table: store.list_rows(table) for table in before} == before
+
+
 @pytest.mark.parametrize("invalid_state", ["retry_wait", "quarantined"])
 def test_operator_silent_terminal_rerun_requires_settled_internal_outlet(
     tmp_path, invalid_state

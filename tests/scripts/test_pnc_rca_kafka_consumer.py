@@ -1952,42 +1952,7 @@ def test_bounded_ready_freezes_before_passive_kafka_batch(
         HERMES_RCA_KAFKA_ACTIVATION_REQUIRED="true",
     )
     store = RcaControlStore(config.control_db_path)
-    _epoch_id, identities = _prepare_activation_epoch(
-        store,
-        kafka_offset=20,
-        bounded=True,
-    )
-    for slot_kind in ("manual_success", "manual_terminal_failure"):
-        identity = identities[slot_kind][1]
-        store.admit_manual_trigger(
-            ManualRcaTriggerRequest(
-                schema_version=MANUAL_TRIGGER_SCHEMA_VERSION,
-                issue_url=identity["issue_url"],
-                mode=identity["mode"],
-                reason="prepare two completed bounded canaries",
-                platform="feishu",
-                chat_id=identity["chat_id"],
-                thread_id=identity["thread_id"],
-                message_id=identity["message_id"],
-                requester_id=identity["requester_id"],
-            ),
-            allowed_chat_ids={"oc_activation_test"},
-            submit_enabled=True,
-            operator_authorized=slot_kind == "manual_terminal_failure",
-            active_policy=config.policy,
-            activation_required=True,
-        )
-    for index in range(2):
-        claim = store.claim_outbox(
-            lease_owner=f"consumer-two-canaries-{index}",
-            activation_required=True,
-        )
-        assert claim is not None
-        store.complete_outbox(
-            outbox_id=claim.outbox_id,
-            lease_token=claim.lease_token,
-            result={"outcome": "manual_canary_completed"},
-        )
+    _prepare_ready_bounded_activation(store, kafka_offset=20)
     initial = store.health()["activation"]["ingress_freeze_readiness"]
     assert initial["consumed_slot_count"] == 2
     assert initial["completed_bound_slot_count"] == 2
