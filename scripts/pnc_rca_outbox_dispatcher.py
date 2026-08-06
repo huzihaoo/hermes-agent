@@ -41,6 +41,7 @@ from gateway.pnc_rca_control_store import (
     EXACT_OUTBOX_HOLD_MIN_REMAINING_SECONDS,
     EXACT_OUTBOX_HOLD_RECORD_MAX_AGE_SECONDS,
     EXACT_OUTBOX_RUNTIME_PLIST_LABELS,
+    EXACT_OUTBOX_RUNTIME_PROVENANCE_SCHEMA_VERSION,
     EXACT_OUTBOX_HOLD_SCHEMA_VERSION,
     EXACT_OUTBOX_HOLD_UNTIL,
     OutboxClaim,
@@ -927,6 +928,7 @@ def _exact_runtime_file_binding(path: Path, *, label: str | None = None) -> dict
         **({"label": label} if label is not None else {}),
         "path": str(lexical),
         "sha256": digest,
+        "size": int(observed.st_size),
         "mode": int(stat.S_IMODE(observed.st_mode)),
         "uid": int(observed.st_uid),
         "nlink": int(observed.st_nlink),
@@ -953,6 +955,7 @@ def _exact_outbox_runtime_provenance(
         "present": True,
         "path": str(manifest_path.expanduser().absolute()),
         "sha256": manifest_digest,
+        "size": int(manifest_stat.st_size),
         "mode": int(stat.S_IMODE(manifest_stat.st_mode)),
         "uid": int(manifest_stat.st_uid),
         "nlink": int(manifest_stat.st_nlink),
@@ -986,32 +989,66 @@ def _exact_outbox_runtime_provenance(
         or runtime_root.parent != runtime_home / "runtime" / "releases"
     ):
         raise ValueError("exact_outbox_hold_runtime_manifest_invalid")
-    registry = runtime_root / "gateway" / "assets" / "pnc_stable_target_registry_v1.json"
-    runtime_git_head_result = subprocess.run(
-        ["git", "-C", str(runtime_root), "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=5,
-    )
-    runtime_git_tree_result = subprocess.run(
-        ["git", "-C", str(runtime_root), "rev-parse", "HEAD^{tree}"],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=5,
-    )
-    runtime_git_head = runtime_git_head_result.stdout.strip()
-    runtime_git_tree = runtime_git_tree_result.stdout.strip()
-    if (
-        runtime_git_head_result.returncode != 0
-        or runtime_git_tree_result.returncode != 0
-        or not re.fullmatch(r"[0-9a-f]{40}", runtime_git_head)
-        or not re.fullmatch(r"[0-9a-f]{40}", runtime_git_tree)
-    ):
-        raise ValueError("exact_outbox_hold_runtime_git_invalid")
     try:
-        from scripts.pnc_live_exec import SERVICE_TARGETS, _stable_target_registry
+        from scripts.pnc_live_exec import (
+            SERVICE_TARGETS,
+            _stable_target_registry,
+            resolve_active_runtime,
+        )
+
+        resolved = resolve_active_runtime(
+            manifest_path=manifest_path,
+            hermes_home=runtime_home,
+            service_label="local.pnc.rca-outbox-dispatcher",
+        )
+        if (
+            resolved["manifest_sha256"] != manifest_digest
+            or Path(resolved["runtime_root"]) != runtime_root
+        ):
+            raise ValueError("exact_outbox_hold_runtime_manifest_changed")
+        runtime_git_head = str(resolved["runtime_commit"])
+        runtime_git_tree = str(resolved["runtime_tree"])
+        runtime_venv = Path(resolved["runtime_venv"])
+        runtime_python = Path(resolved["runtime_python"])
+
+        runtime_scripts: list[dict[str, Any]] = []
+        for label in EXACT_OUTBOX_RUNTIME_PLIST_LABELS:
+            target_kind, relative_target = SERVICE_TARGETS[label]
+            if target_kind != "runtime_script":
+                raise ValueError("exact_outbox_hold_runtime_target_changed")
+            target_path = (runtime_root / relative_target).absolute()
+            if Path(os.path.realpath(target_path)) != target_path:
+                raise ValueError("exact_outbox_hold_runtime_target_changed")
+            runtime_scripts.append(
+                _exact_runtime_file_binding(target_path, label=label)
+            )
+
+        launcher_source_path = runtime_root / "scripts" / "pnc_live_exec.py"
+        installed_launcher_path = (
+            runtime_home / "runtime" / "governance-tools" / "pnc_live_exec.py"
+        )
+        launcher_source_digest, launcher_source_raw, launcher_source_stat = (
+            _bound_exact_hold_source_bytes(launcher_source_path)
+        )
+        launcher_installed_digest, launcher_installed_raw, launcher_installed_stat = (
+            _bound_exact_hold_source_bytes(installed_launcher_path)
+        )
+        if (
+            Path(os.path.realpath(launcher_source_path)) != launcher_source_path
+            or Path(os.path.realpath(installed_launcher_path))
+            != installed_launcher_path
+            or launcher_source_raw != launcher_installed_raw
+            or launcher_source_digest != launcher_installed_digest
+            or launcher_source_stat.st_size != launcher_installed_stat.st_size
+        ):
+            raise ValueError("exact_outbox_hold_runtime_launcher_changed")
+
+        registry = (
+            runtime_root
+            / "gateway"
+            / "assets"
+            / "pnc_stable_target_registry_v1.json"
+        )
 
         registered_targets = _stable_target_registry(runtime_root)
         for label, (target_kind, relative_target) in SERVICE_TARGETS.items():
@@ -1032,18 +1069,53 @@ def _exact_outbox_runtime_provenance(
             ):
                 raise ValueError("exact_outbox_hold_runtime_target_changed")
     except Exception as exc:
-        if isinstance(exc, ValueError) and str(exc) == "exact_outbox_hold_runtime_target_changed":
+        if isinstance(exc, ValueError) and str(exc).startswith(
+            "exact_outbox_hold_runtime_"
+        ):
             raise
         raise ValueError("exact_outbox_hold_runtime_target_changed") from exc
     plist_dir = Path.home() / "Library" / "LaunchAgents"
     plists: list[dict[str, Any]] = []
+    from scripts.pnc_rca_release_transaction import _validate_plist
+
     for label in EXACT_OUTBOX_RUNTIME_PLIST_LABELS:
-        path = plist_dir / f"{label}.plist"
-        plists.append(_exact_runtime_file_binding(path, label=label))
+        installed_path = plist_dir / f"{label}.plist"
+        source_path = runtime_root / f"{label}.plist"
+        installed_digest, installed_raw, installed_stat = (
+            _bound_exact_hold_source_bytes(installed_path)
+        )
+        source_digest, source_raw, _source_stat = _bound_exact_hold_source_bytes(
+            source_path
+        )
+        if (
+            Path(os.path.realpath(installed_path)) != installed_path
+            or Path(os.path.realpath(source_path)) != source_path
+            or installed_raw != source_raw
+            or installed_digest != source_digest
+        ):
+            raise ValueError("exact_outbox_hold_runtime_plist_changed")
+        try:
+            _validate_plist(installed_raw, label=label, hermes_home=runtime_home)
+        except Exception as exc:
+            raise ValueError("exact_outbox_hold_runtime_plist_changed") from exc
+        plists.append(
+            {
+                "present": True,
+                "label": label,
+                "path": str(installed_path),
+                "sha256": installed_digest,
+                "size": int(installed_stat.st_size),
+                "mode": int(stat.S_IMODE(installed_stat.st_mode)),
+                "uid": int(installed_stat.st_uid),
+                "nlink": int(installed_stat.st_nlink),
+            }
+        )
     return {
-        "schema_version": "pnc_rca_exact_outbox_runtime_provenance_v1",
+        "schema_version": EXACT_OUTBOX_RUNTIME_PROVENANCE_SCHEMA_VERSION,
         "manifest": manifest_binding,
         "manifest_runtime_root": str(runtime_root.absolute()),
+        "runtime_venv": str(runtime_venv),
+        "runtime_python": str(runtime_python),
         "manifest_runtime_release_target": str(
             manifest.get("runtime_release_target") or ""
         ),
@@ -1066,6 +1138,25 @@ def _exact_outbox_runtime_provenance(
         ),
         "plists": plists,
         "stable_target_registry": _exact_runtime_file_binding(registry),
+        "launcher_source": {
+            "present": True,
+            "path": str(launcher_source_path),
+            "sha256": launcher_source_digest,
+            "size": int(launcher_source_stat.st_size),
+            "mode": int(stat.S_IMODE(launcher_source_stat.st_mode)),
+            "uid": int(launcher_source_stat.st_uid),
+            "nlink": int(launcher_source_stat.st_nlink),
+        },
+        "installed_launcher": {
+            "present": True,
+            "path": str(installed_launcher_path),
+            "sha256": launcher_installed_digest,
+            "size": int(launcher_installed_stat.st_size),
+            "mode": int(stat.S_IMODE(launcher_installed_stat.st_mode)),
+            "uid": int(launcher_installed_stat.st_uid),
+            "nlink": int(launcher_installed_stat.st_nlink),
+        },
+        "runtime_scripts": runtime_scripts,
     }
 
 
@@ -4937,7 +5028,10 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("exact_outbox_hold_canonical_env_path_required")
         if args.hold_exact_outbox_id is not None or args.materialize_exact_outbox_hold:
             canonical_config = _exact_outbox_canonical_env_config(canonical_env_path)
-            if canonical_config.public_dict() != config.public_dict():
+            if (
+                canonical_config.public_dict() != config.public_dict()
+                or config.delivery_db_path != config.control_db_path
+            ):
                 raise ValueError("exact_outbox_hold_config_changed")
         if args.check_config:
             print(json.dumps({"ok": True, "config": config.public_dict()}, indent=2))

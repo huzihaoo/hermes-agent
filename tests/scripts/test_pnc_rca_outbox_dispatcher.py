@@ -7,6 +7,7 @@ import hashlib
 import json
 import plistlib
 from pathlib import Path
+import stat
 from types import SimpleNamespace
 
 import pytest
@@ -324,11 +325,60 @@ def _prepare_exact_hold_runtime(monkeypatch, config):
         classmethod(lambda _cls: user_home),
     )
     runtime_root = hermes_home / "runtime" / "releases" / "hermes-test-runtime"
+    runtime_venv = hermes_home / "runtime" / "venvs" / "hermes-test-venv"
+    runtime_python = runtime_venv / "bin" / "python"
     governance = hermes_home / "runtime" / "governance-tools"
     registry_path = runtime_root / "gateway" / "assets" / "pnc_stable_target_registry_v1.json"
     runtime_root.mkdir(parents=True)
+    runtime_python.parent.mkdir(parents=True)
+    runtime_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    runtime_python.chmod(0o700)
     governance.mkdir(parents=True)
-    (governance / "pnc_live_exec.py").write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    launcher_source = runtime_root / "scripts" / "pnc_live_exec.py"
+    launcher_source.parent.mkdir(parents=True)
+    launcher_source.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    (governance / "pnc_live_exec.py").write_bytes(launcher_source.read_bytes())
+
+    completion_args = [
+        "--task-id",
+        "rca-r11-safe-off-no-task",
+        "--watch",
+        "--limit",
+        "50",
+        "--retry-failed-after",
+        "600",
+        "--max-attempts",
+        "3",
+        "--watch-canary-loops",
+        "3",
+        "--max-card-fallbacks-per-loop",
+        "0",
+        "--json",
+    ]
+    extra_args = {
+        "local.pnc.completion-notice-relay": completion_args,
+        "local.pnc.feishu-delivery-repair": ["--repair", "--json", "--no-backup"],
+    }
+    for label in control_store_module.EXACT_OUTBOX_RUNTIME_PLIST_LABELS:
+        target_kind, relative_path = live_exec_module.SERVICE_TARGETS[label]
+        assert target_kind == "runtime_script"
+        target_path = runtime_root / relative_path
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text(f"# exact hold runtime target: {label}\n", encoding="utf-8")
+        plist_raw = plistlib.dumps(
+            {
+                "Label": label,
+                "ProgramArguments": [
+                    "/usr/bin/python3",
+                    str(governance / "pnc_live_exec.py"),
+                    label,
+                    *extra_args.get(label, []),
+                ],
+                "EnvironmentVariables": {},
+            }
+        )
+        (runtime_root / f"{label}.plist").write_bytes(plist_raw)
+
     registry_path.parent.mkdir(parents=True)
     registry_targets = {}
     for label, (target_kind, relative_path) in live_exec_module.SERVICE_TARGETS.items():
@@ -379,6 +429,16 @@ def _prepare_exact_hold_runtime(monkeypatch, config):
         json.dumps(
             {
                 "runtime_root": str(runtime_root),
+                "runtime_venv": str(runtime_venv),
+                "runtime_python": str(runtime_python),
+                "promotion_source_head": head,
+                "face_git_bindings": {
+                    "runtime_engine": {
+                        "commit": head,
+                        "tree": tree,
+                        "repo": str(runtime_root),
+                    }
+                },
                 "runtime_release_target": "hermes-test-runtime",
                 "gateway_release_target": "hermes-test-runtime",
                 "gateway_release_binding": {
@@ -397,19 +457,7 @@ def _prepare_exact_hold_runtime(monkeypatch, config):
     plist_dir.mkdir(parents=True)
     for label in control_store_module.EXACT_OUTBOX_RUNTIME_PLIST_LABELS:
         plist_path = plist_dir / f"{label}.plist"
-        plist_path.write_bytes(
-            plistlib.dumps(
-                {
-                    "Label": label,
-                    "ProgramArguments": [
-                        "/usr/bin/python3",
-                        str(governance / "pnc_live_exec.py"),
-                        label,
-                    ],
-                    "EnvironmentVariables": {},
-                }
-            )
-        )
+        plist_path.write_bytes((runtime_root / f"{label}.plist").read_bytes())
         plist_path.chmod(0o600)
 
 
@@ -584,6 +632,20 @@ def _resign_exact_hold(audit):
     )
     audit["receipt_fingerprint"] = _exact_outbox_hold_fingerprint(audit)
     return audit
+
+
+def _refresh_runtime_file_binding(binding):
+    path = Path(binding["path"])
+    observed = path.lstat()
+    binding.update(
+        {
+            "sha256": dispatcher._bound_exact_hold_source_sha256(path),
+            "size": observed.st_size,
+            "mode": stat.S_IMODE(observed.st_mode),
+            "uid": observed.st_uid,
+            "nlink": observed.st_nlink,
+        }
+    )
 
 
 def _rows_and_meta(store):
@@ -1562,6 +1624,144 @@ def test_exact_outbox_hold_rejects_malformed_stable_registry_without_mutation(
     with pytest.raises(RuntimeError, match="exact_outbox_hold_runtime_provenance_changed"):
         store.hold_exact_outbox_with_audit(audit=audit)
     assert _rows_and_meta(store) == before
+
+
+@pytest.mark.parametrize(
+    "runtime_break", ("runtime_python", "runtime_face", "missing_script")
+)
+def test_exact_outbox_hold_rejects_invalid_manifest_runtime_semantics_without_mutation(
+    tmp_path, monkeypatch, capsys, runtime_break
+):
+    store, _config, _receipt, _args, output = _exact_hold_plan(
+        tmp_path, monkeypatch, capsys
+    )
+    audit = copy.deepcopy(output["plan"])
+    runtime = audit["tool_provenance"]["runtime_provenance"]
+    if runtime_break == "missing_script":
+        script_binding = next(
+            item
+            for item in runtime["runtime_scripts"]
+            if item["label"] == "local.pnc.rca-outbox-dispatcher"
+        )
+        Path(script_binding["path"]).unlink()
+    else:
+        manifest_path = Path(runtime["manifest"]["path"])
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if runtime_break == "runtime_python":
+            forged = str(
+                tmp_path / "runtime" / "venvs" / "hermes-test-venv" / "bin" / "alternate"
+            )
+            manifest["runtime_python"] = forged
+            runtime["runtime_python"] = forged
+        else:
+            manifest["face_git_bindings"]["runtime_engine"]["repo"] = str(
+                tmp_path / "runtime" / "releases" / "forged"
+            )
+        manifest_path.write_text(
+            json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        _refresh_runtime_file_binding(runtime["manifest"])
+        audit["active_release_binding"]["runtime_manifest_sha256"] = runtime[
+            "manifest"
+        ]["sha256"]
+        _resign_exact_hold(audit)
+    before = _rows_and_meta(store)
+    with pytest.raises(RuntimeError, match="exact_outbox_hold_runtime_provenance_changed"):
+        store.hold_exact_outbox_with_audit(audit=audit)
+    assert _rows_and_meta(store) == before
+
+
+def test_exact_outbox_hold_rejects_installed_launcher_drift_without_mutation(
+    tmp_path, monkeypatch, capsys
+):
+    store, _config, _receipt, _args, output = _exact_hold_plan(
+        tmp_path, monkeypatch, capsys
+    )
+    audit = copy.deepcopy(output["plan"])
+    runtime = audit["tool_provenance"]["runtime_provenance"]
+    installed = runtime["installed_launcher"]
+    installed_path = Path(installed["path"])
+    installed_path.write_bytes(installed_path.read_bytes() + b"# drift\n")
+    _refresh_runtime_file_binding(installed)
+    _resign_exact_hold(audit)
+    before = _rows_and_meta(store)
+    with pytest.raises(
+        ValueError, match="exact_outbox_hold_runtime_provenance_invalid"
+    ):
+        store.hold_exact_outbox_with_audit(audit=audit)
+    assert _rows_and_meta(store) == before
+
+
+def test_exact_outbox_hold_rejects_installed_plist_extra_argument_without_mutation(
+    tmp_path, monkeypatch, capsys
+):
+    store, _config, _receipt, _args, output = _exact_hold_plan(
+        tmp_path, monkeypatch, capsys
+    )
+    audit = copy.deepcopy(output["plan"])
+    runtime = audit["tool_provenance"]["runtime_provenance"]
+    plist_binding = next(
+        item
+        for item in runtime["plists"]
+        if item["label"] == "local.pnc.rca-outbox-dispatcher"
+    )
+    plist_path = Path(plist_binding["path"])
+    plist = plistlib.loads(plist_path.read_bytes())
+    plist["ProgramArguments"].append("--once")
+    plist_path.write_bytes(plistlib.dumps(plist))
+    _refresh_runtime_file_binding(plist_binding)
+    _resign_exact_hold(audit)
+    before = _rows_and_meta(store)
+    with pytest.raises(RuntimeError, match="exact_outbox_hold_runtime_provenance_changed"):
+        store.hold_exact_outbox_with_audit(audit=audit)
+    assert _rows_and_meta(store) == before
+
+
+@pytest.mark.parametrize("binding_name", ("manifest", "stable_target_registry"))
+def test_exact_outbox_hold_rejects_runtime_file_stat_forge_without_mutation(
+    tmp_path, monkeypatch, capsys, binding_name
+):
+    store, _config, _receipt, _args, output = _exact_hold_plan(
+        tmp_path, monkeypatch, capsys
+    )
+    audit = copy.deepcopy(output["plan"])
+    binding = audit["tool_provenance"]["runtime_provenance"][binding_name]
+    binding["mode"] ^= 0o100
+    _resign_exact_hold(audit)
+    before = _rows_and_meta(store)
+    with pytest.raises(RuntimeError, match="exact_outbox_hold_runtime_provenance_changed"):
+        store.hold_exact_outbox_with_audit(audit=audit)
+    assert _rows_and_meta(store) == before
+
+
+def test_exact_outbox_hold_plan_rejects_delivery_database_divergence_without_mutation(
+    tmp_path, monkeypatch, capsys
+):
+    store = _exact_hold_fixture(tmp_path)
+    env = _config_env(tmp_path, canonical_layout=True)
+    env["HERMES_RCA_OUTBOX_ACTIVATION_REQUIRED"] = "true"
+    env["HERMES_RCA_OUTBOX_DELIVERY_DB_PATH"] = str(tmp_path / "other.sqlite3")
+    config = dispatcher.DispatcherConfig.from_env(env, hermes_home=tmp_path)
+    _patch_exact_hold_cli(monkeypatch, config, env)
+    receipt = tmp_path / "delivery-db-divergence.json"
+    before = _rows_and_meta(store)
+    assert dispatcher.main(
+        [
+            "--hold-exact-outbox-id",
+            "685",
+            "--predecessor-outbox-id",
+            "684",
+            "--operator",
+            "owner@example.com",
+            "--reason",
+            "reject delivery database divergence",
+            "--receipt",
+            str(receipt),
+        ]
+    ) == 2
+    assert "exact_outbox_hold_config_changed" in capsys.readouterr().err
+    assert _rows_and_meta(store) == before
+    assert not receipt.exists()
 
 
 @pytest.mark.parametrize("mode", ("plan", "apply"))

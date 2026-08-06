@@ -102,6 +102,9 @@ EXACT_OUTBOX_HOLD_MAX_AUDIT_BYTES = 512 * 1024
 EXACT_OUTBOX_HOLD_MIN_REMAINING_SECONDS = 6 * 60 * 60
 EXACT_OUTBOX_HOLD_RECORD_MAX_AGE_SECONDS = 60
 EXACT_OUTBOX_HOLD_MAX_FUTURE_SKEW_SECONDS = 5
+EXACT_OUTBOX_RUNTIME_PROVENANCE_SCHEMA_VERSION = (
+    "pnc_rca_exact_outbox_runtime_provenance_v2"
+)
 EXACT_OUTBOX_RUNTIME_PLIST_LABELS = (
     "local.pnc.rca-kafka-consumer",
     "local.pnc.rca-outbox-dispatcher",
@@ -264,6 +267,8 @@ EXACT_OUTBOX_HOLD_RUNTIME_FIELDS = frozenset(
         "schema_version",
         "manifest",
         "manifest_runtime_root",
+        "runtime_venv",
+        "runtime_python",
         "manifest_runtime_release_target",
         "manifest_gateway_release_target",
         "manifest_commit",
@@ -273,13 +278,16 @@ EXACT_OUTBOX_HOLD_RUNTIME_FIELDS = frozenset(
         "release_bom_sha256",
         "plists",
         "stable_target_registry",
+        "launcher_source",
+        "installed_launcher",
+        "runtime_scripts",
     }
 )
 EXACT_OUTBOX_HOLD_RUNTIME_FILE_FIELDS = frozenset(
-    {"present", "path", "sha256", "mode", "uid", "nlink"}
+    {"present", "path", "sha256", "size", "mode", "uid", "nlink"}
 )
 EXACT_OUTBOX_HOLD_RUNTIME_PLIST_FIELDS = frozenset(
-    {"present", "label", "path", "sha256", "mode", "uid", "nlink"}
+    {"present", "label", "path", "sha256", "size", "mode", "uid", "nlink"}
 )
 EXACT_OUTBOX_HOLD_RESIDENT_FIELDS = frozenset(
     {
@@ -848,9 +856,9 @@ def _validate_exact_outbox_hold_nested(value: Mapping[str, Any]) -> None:
         require_bool(source["present"])
         require_path(source["path"])
         _exact_hold_require_sha(source["sha256"], error)
-        for field in ("mode", "uid", "nlink"):
+        for field in ("size", "mode", "uid", "nlink"):
             require_int(source[field])
-        if source["nlink"] != 1:
+        if source["size"] < 1 or source["nlink"] != 1:
             raise ValueError(error)
         if allow_label:
             require_string(source["label"])
@@ -1039,6 +1047,8 @@ def _validate_exact_outbox_hold_nested(value: Mapping[str, Any]) -> None:
     for field in (
         "schema_version",
         "manifest_runtime_root",
+        "runtime_venv",
+        "runtime_python",
         "manifest_runtime_release_target",
         "manifest_gateway_release_target",
         "manifest_commit",
@@ -1047,19 +1057,33 @@ def _validate_exact_outbox_hold_nested(value: Mapping[str, Any]) -> None:
         "runtime_git_tree",
     ):
         require_string(runtime[field])
-    require_path(runtime["manifest_runtime_root"])
+    for field in ("manifest_runtime_root", "runtime_venv", "runtime_python"):
+        require_path(runtime[field])
     for field in ("manifest_commit", "manifest_tree", "runtime_git_head", "runtime_git_tree"):
         if re.fullmatch(r"[0-9a-f]{40}", runtime[field]) is None:
             raise ValueError("exact_outbox_hold_runtime_provenance_invalid")
     _exact_hold_require_sha(runtime["release_bom_sha256"], error)
     require_source_file(runtime["manifest"])
     require_source_file(runtime["stable_target_registry"])
+    require_source_file(runtime["launcher_source"])
+    require_source_file(runtime["installed_launcher"])
     plists = runtime["plists"]
     if type(plists) is not list or len(plists) != len(EXACT_OUTBOX_RUNTIME_PLIST_LABELS):
         raise ValueError("exact_outbox_hold_runtime_provenance_invalid")
     for label, plist in zip(EXACT_OUTBOX_RUNTIME_PLIST_LABELS, plists, strict=True):
         require_source_file(plist, allow_label=True)
         if plist["label"] != label:
+            raise ValueError("exact_outbox_hold_runtime_provenance_invalid")
+    runtime_scripts = runtime["runtime_scripts"]
+    if type(runtime_scripts) is not list or len(runtime_scripts) != len(
+        EXACT_OUTBOX_RUNTIME_PLIST_LABELS
+    ):
+        raise ValueError("exact_outbox_hold_runtime_provenance_invalid")
+    for label, script in zip(
+        EXACT_OUTBOX_RUNTIME_PLIST_LABELS, runtime_scripts, strict=True
+    ):
+        require_source_file(script, allow_label=True)
+        if script["label"] != label:
             raise ValueError("exact_outbox_hold_runtime_provenance_invalid")
 
     resident = _exact_hold_require_mapping(
@@ -1437,7 +1461,7 @@ def _validate_exact_outbox_hold_audit(
     if (
         not isinstance(runtime_provenance, Mapping)
         or runtime_provenance.get("schema_version")
-        != "pnc_rca_exact_outbox_runtime_provenance_v1"
+        != EXACT_OUTBOX_RUNTIME_PROVENANCE_SCHEMA_VERSION
         or not isinstance(runtime_provenance.get("manifest"), Mapping)
         or runtime_provenance["manifest"].get("present") is not True
         or not isinstance(runtime_provenance["manifest"].get("path"), str)
@@ -1481,6 +1505,10 @@ def _validate_exact_outbox_hold_audit(
         )
         is None
         or runtime_provenance["stable_target_registry"].get("nlink") != 1
+        or runtime_provenance["launcher_source"].get("sha256")
+        != runtime_provenance["installed_launcher"].get("sha256")
+        or runtime_provenance["launcher_source"].get("size")
+        != runtime_provenance["installed_launcher"].get("size")
     ):
         raise ValueError("exact_outbox_hold_runtime_provenance_invalid")
     if (
@@ -17487,7 +17515,12 @@ class RcaControlStore:
         self._exact_destination_parent_live(payload)
         self._exact_resident_census_live(payload)
         config_binding = payload["config_binding"]
-        if config_binding.get("control_db_path") != str(self.db_path.expanduser().absolute()):
+        if (
+            config_binding.get("control_db_path")
+            != str(self.db_path.expanduser().absolute())
+            or config_binding.get("delivery_db_path")
+            != config_binding.get("control_db_path")
+        ):
             raise RuntimeError("exact_outbox_hold_config_changed")
         live_path = Path(str(payload["active_release_binding"]["live_env_path"])).expanduser().absolute()
         hermes_home = live_path.parent
@@ -17670,13 +17703,37 @@ class RcaControlStore:
         ):
             raise RuntimeError("exact_outbox_hold_tool_provenance_changed")
         runtime = provenance["runtime_provenance"]
-        runtime_files = [runtime["manifest"], *runtime["plists"], runtime["stable_target_registry"]]
+        runtime_files = [
+            runtime["manifest"],
+            *runtime["plists"],
+            runtime["stable_target_registry"],
+            runtime["launcher_source"],
+            runtime["installed_launcher"],
+            *runtime["runtime_scripts"],
+        ]
         runtime_raw: dict[str, bytes] = {}
-        for file_binding in runtime_files:
-            digest, raw, _identity = self._exact_bound_file_bytes(file_binding["path"])
-            if digest != file_binding["sha256"]:
-                raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
-            runtime_raw[str(Path(file_binding["path"]).expanduser().absolute())] = raw
+        try:
+            for file_binding in runtime_files:
+                digest, raw, identity = self._exact_bound_file_bytes(
+                    file_binding["path"]
+                )
+                if (
+                    digest != file_binding["sha256"]
+                    or identity.st_size != int(file_binding["size"])
+                    or stat.S_IMODE(identity.st_mode) != int(file_binding["mode"])
+                    or identity.st_uid != int(file_binding["uid"])
+                    or identity.st_nlink != int(file_binding["nlink"])
+                ):
+                    raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
+                runtime_raw[
+                    str(Path(file_binding["path"]).expanduser().absolute())
+                ] = raw
+        except Exception as exc:
+            if isinstance(exc, RuntimeError) and str(exc) == (
+                "exact_outbox_hold_runtime_provenance_changed"
+            ):
+                raise
+            raise RuntimeError("exact_outbox_hold_runtime_provenance_changed") from exc
         manifest_path = Path(runtime["manifest"]["path"]).expanduser().absolute()
         hermes_home = Path(
             payload["active_release_binding"]["live_env_path"]
@@ -17698,6 +17755,8 @@ class RcaControlStore:
         if (
             not isinstance(manifest, Mapping)
             or manifest.get("runtime_root") != runtime["manifest_runtime_root"]
+            or manifest.get("runtime_venv") != runtime["runtime_venv"]
+            or manifest.get("runtime_python") != runtime["runtime_python"]
             or manifest.get("runtime_release_target") != runtime["manifest_runtime_release_target"]
             or manifest.get("gateway_release_target") != runtime["manifest_gateway_release_target"]
             or not isinstance(release_binding, Mapping)
@@ -17728,6 +17787,65 @@ class RcaControlStore:
             or stat.S_IMODE(runtime_root_stat.st_mode) & 0o022
         ):
             raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
+        try:
+            from scripts.pnc_live_exec import (
+                SERVICE_TARGETS,
+                _stable_target_registry,
+                resolve_active_runtime,
+            )
+
+            resolved = resolve_active_runtime(
+                manifest_path=manifest_path,
+                hermes_home=hermes_home,
+                service_label="local.pnc.rca-outbox-dispatcher",
+            )
+        except Exception as exc:
+            raise RuntimeError("exact_outbox_hold_runtime_provenance_changed") from exc
+        if (
+            resolved.get("manifest_sha256") != runtime["manifest"]["sha256"]
+            or resolved.get("runtime_root") != str(runtime_root)
+            or resolved.get("runtime_venv") != runtime["runtime_venv"]
+            or resolved.get("runtime_python") != runtime["runtime_python"]
+            or resolved.get("runtime_commit") != runtime["runtime_git_head"]
+            or resolved.get("runtime_tree") != runtime["runtime_git_tree"]
+        ):
+            raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
+
+        expected_script_paths: list[Path] = []
+        for label in EXACT_OUTBOX_RUNTIME_PLIST_LABELS:
+            target_kind, relative_target = SERVICE_TARGETS[label]
+            if target_kind != "runtime_script":
+                raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
+            expected_script_paths.append((runtime_root / relative_target).absolute())
+        actual_script_paths = [
+            Path(item["path"]).expanduser().absolute()
+            for item in runtime["runtime_scripts"]
+        ]
+        if actual_script_paths != expected_script_paths or any(
+            Path(os.path.realpath(path)) != path for path in actual_script_paths
+        ):
+            raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
+
+        launcher_source_path = runtime_root / "scripts" / "pnc_live_exec.py"
+        installed_launcher_path = (
+            hermes_home / "runtime" / "governance-tools" / "pnc_live_exec.py"
+        )
+        if (
+            Path(runtime["launcher_source"]["path"]) != launcher_source_path
+            or Path(runtime["installed_launcher"]["path"])
+            != installed_launcher_path
+            or Path(os.path.realpath(launcher_source_path))
+            != launcher_source_path
+            or Path(os.path.realpath(installed_launcher_path))
+            != installed_launcher_path
+            or runtime_raw[str(launcher_source_path)]
+            != runtime_raw[str(installed_launcher_path)]
+            or runtime["launcher_source"]["sha256"]
+            != runtime["installed_launcher"]["sha256"]
+            or runtime["launcher_source"]["size"]
+            != runtime["installed_launcher"]["size"]
+        ):
+            raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
         expected_plist_prefix = Path.home() / "Library" / "LaunchAgents"
         expected_plist_paths = [
             expected_plist_prefix / f"{label}.plist"
@@ -17740,8 +17858,17 @@ class RcaControlStore:
             raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
         for label, item in zip(EXACT_OUTBOX_RUNTIME_PLIST_LABELS, runtime["plists"], strict=True):
             plist_path = Path(item["path"])
+            source_plist_path = runtime_root / f"{label}.plist"
             observed = plist_path.lstat()
-            if Path(os.path.realpath(plist_path)) != plist_path:
+            _source_digest, source_raw, _source_identity = (
+                self._exact_bound_file_bytes(source_plist_path)
+            )
+            if (
+                Path(os.path.realpath(plist_path)) != plist_path
+                or Path(os.path.realpath(source_plist_path))
+                != source_plist_path
+                or runtime_raw[str(plist_path)] != source_raw
+            ):
                 raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
             if (
                 observed.st_uid != int(item["uid"])
@@ -17767,8 +17894,6 @@ class RcaControlStore:
         ):
             raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
         try:
-            from scripts.pnc_live_exec import SERVICE_TARGETS, _stable_target_registry
-
             registered_targets = _stable_target_registry(runtime_root)
             for label, (target_kind, relative_target) in SERVICE_TARGETS.items():
                 if target_kind not in {"governance_tool", "runtime_file"}:
@@ -17791,36 +17916,6 @@ class RcaControlStore:
             if isinstance(exc, RuntimeError) and str(exc) == "exact_outbox_hold_runtime_target_changed":
                 raise
             raise RuntimeError("exact_outbox_hold_runtime_provenance_changed") from exc
-        git_head = subprocess.run(
-            ["git", "-C", str(runtime_root), "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=5,
-        )
-        git_tree = subprocess.run(
-            ["git", "-C", str(runtime_root), "rev-parse", "HEAD^{tree}"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=5,
-        )
-        git_status = subprocess.run(
-            ["git", "-C", str(runtime_root), "status", "--porcelain", "--untracked-files=all"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=5,
-        )
-        if (
-            git_head.returncode != 0
-            or git_tree.returncode != 0
-            or git_status.returncode != 0
-            or git_head.stdout.strip() != runtime["runtime_git_head"]
-            or git_tree.stdout.strip() != runtime["runtime_git_tree"]
-            or git_status.stdout.strip()
-        ):
-            raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
 
     @staticmethod
     def _exact_hold_freshness(
