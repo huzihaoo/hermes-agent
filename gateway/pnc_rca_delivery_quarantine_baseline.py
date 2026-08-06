@@ -49,6 +49,7 @@ MAX_SETTLEMENT_RECEIPTS = 32
 
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$")
+_ACTIVATION_EPOCH_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _QUARANTINE_TABLES = (
     ("jobs", "rca_delivery_jobs", "delivery_id"),
     ("effects", "rca_delivery_effects", "effect_key"),
@@ -435,6 +436,83 @@ def _db_identity(conn: sqlite3.Connection, db_path: str | Path) -> dict[str, Any
         **body,
         "logical_identity_sha256": hashlib.sha256(_canonical_bytes(body)).hexdigest(),
     }
+
+
+def _require_current_aborted_predecessor(
+    conn: sqlite3.Connection,
+    *,
+    expected_epoch_id: str,
+    expected_state: str,
+) -> None:
+    """Require one exact current predecessor before issuing a successor core."""
+
+    if _ACTIVATION_EPOCH_ID_RE.fullmatch(expected_epoch_id) is None:
+        raise DeliveryQuarantineBaselineError(
+            "delivery_quarantine_successor_predecessor_epoch_invalid"
+        )
+    if expected_state != "aborted":
+        raise DeliveryQuarantineBaselineError(
+            "delivery_quarantine_successor_predecessor_state_invalid"
+        )
+    if not _table_exists(conn, "rca_activation_epochs"):
+        raise DeliveryQuarantineBaselineError(
+            "delivery_quarantine_successor_predecessor_epoch_unavailable"
+        )
+    columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(rca_activation_epochs)")
+    }
+    required = {
+        "epoch_id",
+        "state",
+        "is_current",
+        "db_logical_identity_json",
+        "db_logical_identity_sha256",
+    }
+    if not required.issubset(columns):
+        raise DeliveryQuarantineBaselineError(
+            "delivery_quarantine_successor_predecessor_epoch_unavailable"
+        )
+    rows = conn.execute(
+        "SELECT epoch_id, state, is_current, db_logical_identity_json, "
+        "db_logical_identity_sha256 FROM rca_activation_epochs "
+        "WHERE is_current = 1"
+    ).fetchall()
+    if (
+        len(rows) != 1
+        or str(rows[0]["epoch_id"] or "") != expected_epoch_id
+        or str(rows[0]["state"] or "") != expected_state
+        or int(rows[0]["is_current"] or 0) != 1
+        or _HEX64_RE.fullmatch(
+            str(rows[0]["db_logical_identity_sha256"] or "").lower()
+        ) is None
+        or not str(rows[0]["db_logical_identity_json"] or "").strip()
+    ):
+        raise DeliveryQuarantineBaselineError(
+            "delivery_quarantine_successor_predecessor_not_current_aborted"
+        )
+
+
+def _project_preactivation_db_identity(
+    identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project only the activation binding away for a pre-activation core."""
+
+    if set(identity) != _DB_IDENTITY_FIELDS:
+        raise DeliveryQuarantineBaselineError(
+            "delivery_quarantine_successor_db_identity_invalid"
+        )
+    projected = dict(identity)
+    projected["activation_db_logical_identity_sha256"] = ""
+    body = {
+        key: projected[key]
+        for key in _DB_IDENTITY_FIELDS
+        if key != "logical_identity_sha256"
+    }
+    projected["logical_identity_sha256"] = hashlib.sha256(
+        _canonical_bytes(body)
+    ).hexdigest()
+    return projected
 
 
 def _db_identity_matches_baseline(
@@ -1861,6 +1939,9 @@ def _build_quarantine_core(
     analyzed_by: str,
     reason: str,
     busy_timeout_ms: int = 5000,
+    expected_predecessor_epoch_id: str | None = None,
+    expected_predecessor_state: str | None = None,
+    project_empty_activation_binding: bool = False,
 ) -> dict[str, Any]:
     """Build, but never write, the deterministic unapproved release/BOM input."""
 
@@ -1888,6 +1969,19 @@ def _build_quarantine_core(
     )
     try:
         conn.execute("BEGIN")
+        if project_empty_activation_binding:
+            if (
+                expected_predecessor_epoch_id is None
+                or expected_predecessor_state is None
+            ):
+                raise DeliveryQuarantineBaselineError(
+                    "delivery_quarantine_successor_predecessor_required"
+                )
+            _require_current_aborted_predecessor(
+                conn,
+                expected_epoch_id=expected_predecessor_epoch_id,
+                expected_state=expected_predecessor_state,
+            )
         snapshot = quarantine_snapshot(conn)
         event_projection = _quarantine_event_projection(conn)
         descriptors, _receipt_set_sha256, receipt_claims = _settlement_receipts(
@@ -1901,11 +1995,14 @@ def _build_quarantine_core(
             raise DeliveryQuarantineBaselineError(
                 "delivery_quarantine_baseline_manual_thread_adjudication_invalid"
             )
+        control_db = _db_identity(conn, target_path)
+        if project_empty_activation_binding:
+            control_db = _project_preactivation_db_identity(control_db)
         body = {
             "schema_version": CORE_SCHEMA_VERSION,
             "release_id": normalized_release_id,
             "snapshot_at": observed_at,
-            "control_db": _db_identity(conn, target_path),
+            "control_db": control_db,
             "migration_binding": migration_binding,
             "quarantine_snapshot": snapshot,
             "quarantine_event_projection": event_projection,
@@ -1974,6 +2071,58 @@ def build_quarantine_core(
         analyzed_by=analyzed_by,
         reason=reason,
         busy_timeout_ms=busy_timeout_ms,
+    )
+
+
+def build_successor_preactivation_quarantine_core(
+    db_path: str | Path,
+    *,
+    expected_predecessor_epoch_id: str,
+    expected_predecessor_state: str,
+    migration_receipt_path: str | Path,
+    expected_migration_receipt_sha256: str,
+    migration_runtime_sha256: str,
+    release_id: str,
+    snapshot_at: datetime,
+    settlement_receipt_paths: list[str | Path],
+    analyzed_by: str,
+    reason: str,
+    busy_timeout_ms: int = 5000,
+) -> dict[str, Any]:
+    """Build a successor pre-activation core from one exact live snapshot.
+
+    The predecessor must be the current, explicitly aborted activation epoch.
+    All quarantine, event, migration, and settlement evidence is read from the
+    same read-only transaction; only the activation DB binding is projected to
+    the safe-off form expected before the successor epoch is created.
+    """
+
+    predecessor_id = str(expected_predecessor_epoch_id or "").strip()
+    predecessor_state = str(expected_predecessor_state or "").strip()
+    if _ACTIVATION_EPOCH_ID_RE.fullmatch(predecessor_id) is None:
+        raise DeliveryQuarantineBaselineError(
+            "delivery_quarantine_successor_predecessor_epoch_invalid"
+        )
+    if predecessor_state != "aborted":
+        raise DeliveryQuarantineBaselineError(
+            "delivery_quarantine_successor_predecessor_state_invalid"
+        )
+    live_path = Path(db_path).expanduser().absolute()
+    return _build_quarantine_core(
+        live_path,
+        target_live_db_path=live_path,
+        migration_receipt_path=migration_receipt_path,
+        expected_migration_receipt_sha256=expected_migration_receipt_sha256,
+        migration_runtime_sha256=migration_runtime_sha256,
+        release_id=release_id,
+        snapshot_at=snapshot_at,
+        settlement_receipt_paths=settlement_receipt_paths,
+        analyzed_by=analyzed_by,
+        reason=reason,
+        busy_timeout_ms=busy_timeout_ms,
+        expected_predecessor_epoch_id=predecessor_id,
+        expected_predecessor_state=predecessor_state,
+        project_empty_activation_binding=True,
     )
 
 

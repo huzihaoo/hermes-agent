@@ -17,6 +17,7 @@ from gateway.pnc_rca_delivery_quarantine_baseline import (
     _db_identity_matches_baseline,
     build_quarantine_core,
     build_quarantine_core_from_offline_clone,
+    build_successor_preactivation_quarantine_core,
     canonical_quarantine_baseline_bytes,
     issue_quarantine_baseline,
 )
@@ -1763,6 +1764,205 @@ def _offline_case(root: Path) -> tuple[RcaDeliveryStore, Path, dict, dict]:
         "reason": "exact historical terminal rows and settlement evidence",
     }
     return store, settlement, migration, kwargs
+
+
+def _abort_predecessor(store: RcaDeliveryStore, *, epoch_id: str):
+    control = RcaControlStore(store.db_path)
+    created = control.create_activation_epoch(
+        epoch_id=epoch_id,
+        preauthorization_fingerprint="1" * 64,
+        preauthorization_gate_receipt_sha256="2" * 64,
+        preauthorization_capsule_sha256="3" * 64,
+        config_sha256="4" * 64,
+        db_logical_identity={
+            "device": 7,
+            "inode": 11,
+            "logical_store_id": "successor-predecessor",
+        },
+        partition_start_fence={"successor-test-topic": {"0": 0}},
+        operator="successor-test",
+        reason="create exact predecessor fixture",
+    )
+    return control, control.transition_activation_epoch(
+        epoch_id=created["epoch_id"],
+        expected_state="safe_off",
+        target_state="aborted",
+        operator="successor-test",
+        reason="abort exact predecessor fixture",
+    )
+
+
+def test_successor_preactivation_core_projects_only_activation_binding_read_only(
+    tmp_path,
+):
+    store, _settlement, migration, kwargs = _offline_case(tmp_path)
+    _migrate_live(migration)
+    control, predecessor = _abort_predecessor(
+        store, epoch_id="rca-predecessor-successor-core"
+    )
+    before = store.db_path.read_bytes()
+
+    predecessor_core = build_quarantine_core(store.db_path, **kwargs)
+    successor_core = build_successor_preactivation_quarantine_core(
+        store.db_path,
+        expected_predecessor_epoch_id=predecessor["epoch_id"],
+        expected_predecessor_state="aborted",
+        **kwargs,
+    )
+
+    assert store.db_path.read_bytes() == before
+    assert successor_core["control_db"][
+        "activation_db_logical_identity_sha256"
+    ] == ""
+    assert successor_core["control_db"]["path"] == predecessor_core["control_db"][
+        "path"
+    ]
+    assert successor_core["control_db"]["control_schema_version"] == (
+        predecessor_core["control_db"]["control_schema_version"]
+    )
+    assert successor_core["control_db"]["delivery_schema_version"] == (
+        predecessor_core["control_db"]["delivery_schema_version"]
+    )
+    projected_body = {
+        key: value
+        for key, value in successor_core["control_db"].items()
+        if key != "logical_identity_sha256"
+    }
+    assert successor_core["control_db"]["logical_identity_sha256"] == hashlib.sha256(
+        _json_bytes(projected_body).removesuffix(b"\n")
+    ).hexdigest()
+    for field in (
+        "schema_version",
+        "release_id",
+        "snapshot_at",
+        "migration_binding",
+        "quarantine_snapshot",
+        "quarantine_event_projection",
+        "settlement_receipts",
+        "effect_settlement",
+        "invalid_manual_thread_adjudication",
+        "issuance_policy",
+    ):
+        assert successor_core[field] == predecessor_core[field]
+    assert successor_core["core_sha256"] != predecessor_core["core_sha256"]
+
+    with pytest.raises(
+        DeliveryQuarantineBaselineError,
+        match="delivery_quarantine_successor_predecessor_state_invalid",
+    ):
+        build_successor_preactivation_quarantine_core(
+            store.db_path,
+            expected_predecessor_epoch_id=predecessor["epoch_id"],
+            expected_predecessor_state="steady_active",
+            **kwargs,
+        )
+    with pytest.raises(
+        DeliveryQuarantineBaselineError,
+        match="delivery_quarantine_successor_predecessor_not_current_aborted",
+    ):
+        build_successor_preactivation_quarantine_core(
+            store.db_path,
+            expected_predecessor_epoch_id="rca-other-predecessor",
+            expected_predecessor_state="aborted",
+            **kwargs,
+        )
+    assert control.activation_epoch()["epoch_id"] == predecessor["epoch_id"]
+
+
+def test_successor_preactivation_baseline_validates_before_and_after_successor_create(
+    tmp_path,
+):
+    store, _settlement, migration, kwargs = _offline_case(tmp_path)
+    _migrate_live(migration)
+    control, predecessor = _abort_predecessor(
+        store, epoch_id="rca-predecessor-baseline-compat"
+    )
+    core = build_successor_preactivation_quarantine_core(
+        store.db_path,
+        expected_predecessor_epoch_id=predecessor["epoch_id"],
+        expected_predecessor_state="aborted",
+        **kwargs,
+    )
+    release_bom_sha256 = "f" * 64
+    manifest_path = tmp_path / "successor-release-manifest.json"
+    manifest_sha256 = _write(
+        manifest_path,
+        {
+            "schema_version": "pnc_rca_release_prepare_manifest_v1",
+            "release_id": core["release_id"],
+            "release_bom_sha256": release_bom_sha256,
+            "quarantine_core_sha256": core["core_sha256"],
+            "created_at": (NOW + timedelta(seconds=3)).isoformat(),
+            "complete": True,
+            "side_effect_contract": {
+                "live_files_written": False,
+                "launchctl_invoked": False,
+            },
+        },
+    )
+    approval_path = tmp_path / "successor-approval.json"
+    approval_sha256 = _write(
+        approval_path,
+        {
+            "schema_version": APPROVAL_SCHEMA_VERSION,
+            "release_id": core["release_id"],
+            "quarantine_core_sha256": core["core_sha256"],
+            "release_bom_sha256": release_bom_sha256,
+            "decision": "authorize_rca_delivery_quarantine_baseline",
+            "identity": {"uid": os.geteuid(), "username": "owner-user"},
+            "created_at": (NOW + timedelta(seconds=4)).isoformat(),
+        },
+    )
+
+    before = issue_quarantine_baseline(
+        store.db_path,
+        quarantine_core=core,
+        release_manifest_path=manifest_path,
+        expected_release_manifest_sha256=manifest_sha256,
+        expected_release_bom_sha256=release_bom_sha256,
+        approval_evidence_path=approval_path,
+        expected_approval_evidence_sha256=approval_sha256,
+        baseline_id="successor-baseline-before",
+        issued_at=NOW + timedelta(seconds=5),
+    )
+
+    successor = control.create_activation_epoch(
+        epoch_id="rca-successor-baseline-compat",
+        preauthorization_fingerprint="5" * 64,
+        preauthorization_gate_receipt_sha256="6" * 64,
+        preauthorization_capsule_sha256="7" * 64,
+        config_sha256="8" * 64,
+        db_logical_identity={
+            "device": 7,
+            "inode": 11,
+            "logical_store_id": "successor-baseline",
+        },
+        partition_start_fence={"successor-test-topic": {"0": 1}},
+        operator="successor-test",
+        reason="create successor after predecessor abort",
+    )
+    assert successor["state"] == "safe_off"
+
+    after = issue_quarantine_baseline(
+        store.db_path,
+        quarantine_core=core,
+        release_manifest_path=manifest_path,
+        expected_release_manifest_sha256=manifest_sha256,
+        expected_release_bom_sha256=release_bom_sha256,
+        approval_evidence_path=approval_path,
+        expected_approval_evidence_sha256=approval_sha256,
+        baseline_id="successor-baseline-after",
+        issued_at=NOW + timedelta(seconds=6),
+    )
+
+    assert before["quarantine_core"]["control_db"][
+        "activation_db_logical_identity_sha256"
+    ] == ""
+    assert after["quarantine_core"]["control_db"][
+        "activation_db_logical_identity_sha256"
+    ] == ""
+    assert before["quarantine_core_sha256"] == core["core_sha256"]
+    assert after["quarantine_core_sha256"] == core["core_sha256"]
 
 
 def _build_bundle(root: Path) -> dict:
