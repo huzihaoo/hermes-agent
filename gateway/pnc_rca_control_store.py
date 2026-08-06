@@ -8829,9 +8829,17 @@ class RcaControlStore:
             return False
         watch = conn.execute(
             """
-            SELECT state, delivery_id, last_status_json
-              FROM rca_execution_watch
-             WHERE business_key = ? AND submission_key = ? AND generation = ?
+            SELECT w.state, w.task_id, w.terminal_at, w.delivery_id,
+                   w.last_error_code, w.last_status_json,
+                   j.status AS job_status,
+                   j.delivery_id AS job_delivery_id,
+                   j.outcome AS job_outcome,
+                   j.terminal_state,
+                   j.terminal_error_code
+              FROM rca_execution_watch AS w
+              LEFT JOIN rca_delivery_jobs AS j
+                ON j.delivery_id = w.delivery_id
+             WHERE w.business_key = ? AND w.submission_key = ? AND w.generation = ?
              LIMIT 1
             """,
             (business_key, submission_key, generation),
@@ -8840,6 +8848,21 @@ class RcaControlStore:
             return False
         watch_state = str(watch["state"] or "")
         delivery_id = str(watch["delivery_id"] or "").strip()
+
+        # A collector deadline is a durable, zero-write terminal route.  It
+        # has no delivery job by design, but it still drains the activation
+        # lineage once the internal failure route is settled.
+        if watch_state == "terminal_failed":
+            if "rca_failure_routes" not in present:
+                return False
+            return cls._activation_silent_terminal_complete_tx(
+                conn,
+                business_key=business_key,
+                submission_key=submission_key,
+                generation=generation,
+                watch=watch,
+            )
+
         effects = conn.execute(
             """
             SELECT s.effect_kind, s.status AS subscription_status,

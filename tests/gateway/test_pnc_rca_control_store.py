@@ -2326,6 +2326,31 @@ def test_activation_terminal_canary_accepts_settled_silent_internal_route(tmp_pa
     }
 
 
+def test_activation_delivery_completion_accepts_settled_silent_terminal_route(
+    tmp_path,
+):
+    store, terminal, _status = _silent_terminal_activation(tmp_path)
+    row = next(
+        item
+        for item in store.list_rows("rca_outbox")
+        if item["submission_key"] == terminal.submission_key
+    )
+    conn = store._connect()
+    try:
+        assert RcaControlStore._activation_delivery_execution_complete_tx(
+            conn,
+            business_key=row["business_key"],
+            submission_key=row["submission_key"],
+            generation=int(row["generation"]),
+        )
+        assert RcaControlStore._activation_bound_delivery_backlog_tx(
+            conn,
+            epoch_id=store.activation_epoch()["epoch_id"],
+        ) == 1
+    finally:
+        conn.close()
+
+
 @pytest.mark.parametrize(
     "corruption",
     ("external_write", "outlet_effect", "route_identity"),
@@ -2362,6 +2387,26 @@ def test_activation_terminal_canary_rejects_forged_silent_settlement(
                 ("different-task", route_key),
             )
         conn.commit()
+    finally:
+        conn.close()
+
+    row = next(
+        item
+        for item in store.list_rows("rca_outbox")
+        if item["submission_key"] == terminal.submission_key
+    )
+    conn = store._connect()
+    try:
+        assert not RcaControlStore._activation_delivery_execution_complete_tx(
+            conn,
+            business_key=row["business_key"],
+            submission_key=row["submission_key"],
+            generation=int(row["generation"]),
+        )
+        assert RcaControlStore._activation_bound_delivery_backlog_tx(
+            conn,
+            epoch_id=store.activation_epoch()["epoch_id"],
+        ) == 2
     finally:
         conn.close()
 
