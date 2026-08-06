@@ -69,6 +69,57 @@ def test_missing_or_conflicting_project_field_fails_closed():
     assert conflict.profile is None
 
 
+def test_duplicate_project_fields_are_merged_without_first_value_bias():
+    result = resolve_business_profile(
+        project_key="t03o4q",
+        work_item_type_key="issue",
+        work_item_brief={
+            "work_item_fields": [
+                {"key": "field_052f23", "value": [{"id": 6670325063}]},
+                {"key": "field_052f23", "value": [{"id": 6670325063}]},
+            ]
+        },
+    )
+
+    assert result.status == "matched"
+    assert result.project_option_ids == ("6670325063",)
+
+
+def test_duplicate_project_fields_with_different_values_are_conflict():
+    result = resolve_business_profile(
+        project_key="t03o4q",
+        work_item_type_key="issue",
+        work_item_brief={
+            "work_item_fields": [
+                {"key": "field_052f23", "value": [{"id": 6670325063}]},
+                {"key": "field_052f23", "value": [{"id": 6841983153}]},
+            ]
+        },
+    )
+
+    assert result.status == "conflict"
+    assert result.project_option_ids == ("6670325063", "6841983153")
+
+
+def test_empty_work_item_fields_falls_back_to_canonical_fields():
+    result = resolve_business_profile(
+        project_key="t03o4q",
+        work_item_type_key="issue",
+        work_item_brief={
+            "work_item_fields": [],
+            "fields": [
+                {
+                    "field_key": "field_052f23",
+                    "field_value": ["6670325063"],
+                }
+            ],
+        },
+    )
+
+    assert result.status == "matched"
+    assert result.profile.profile_id == "g1q3"
+
+
 def test_title_and_owner_cannot_route_without_project_option_id():
     result = resolve_business_profile(
         project_key="t03o4q",

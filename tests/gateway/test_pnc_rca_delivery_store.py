@@ -12,6 +12,7 @@ import pytest
 
 from gateway.pnc_rca_control_store import (
     MANUAL_TRIGGER_SCHEMA_VERSION,
+    ActivationEpochError,
     KafkaRecord,
     ManualRcaTriggerRequest,
     RcaControlStore,
@@ -175,6 +176,7 @@ def _bind_activation_execution(
     epoch_id="delivery-epoch-1",
     state="steady_active",
     slot_kind="kafka_success",
+    start_offset=0,
 ):
     created = control.create_activation_epoch(
         epoch_id=epoch_id,
@@ -183,7 +185,7 @@ def _bind_activation_execution(
         preauthorization_capsule_sha256="d" * 64,
         config_sha256="b" * 64,
         db_logical_identity={"database": "delivery-test"},
-        partition_start_fence={TOPIC: {"2": 0}},
+        partition_start_fence={TOPIC: {"2": start_offset}},
         operator="delivery-test",
         reason="delivery_activation_test",
         now=NOW,
@@ -1568,8 +1570,13 @@ def test_current_epoch_pre_w3_quarantine_backfill_is_silent_and_idempotent(
     assert status["error_code"] == "w3_execution_snapshot_missing"
     assert store.list_rows("rca_delivery_jobs") == []
     assert store.list_rows("rca_delivery_effects") == []
-    assert store.list_rows("rca_delivery_subscriptions") == subscriptions_before
-    assert all(row["status"] == "pending" for row in subscriptions_before)
+    subscriptions_after = store.list_rows("rca_delivery_subscriptions")
+    assert len(subscriptions_after) == len(subscriptions_before)
+    assert all(row["status"] == "quarantined" for row in subscriptions_after)
+    assert all(
+        row["effect_key"] is None and row["delivery_id"] is None
+        for row in subscriptions_after
+    )
     after = store.backpressure_snapshot(now=NOW + timedelta(seconds=3))
     assert after.untracked_completed_submissions == 0
     assert after.unresolved_effects == 0
@@ -1643,6 +1650,248 @@ def test_current_epoch_valid_w3_quarantine_keeps_fenced_terminal_effect(tmp_path
     )
     assert effect is not None
     assert effect.issue_url == expected_issue_url
+
+
+def test_current_epoch_profile_terminal_without_w3_keeps_public_issue_target(
+    tmp_path,
+):
+    from tests.gateway.test_pnc_rca_control_store import (
+        _create_activation_epoch,
+        _profile_snapshot_policy,
+        _profile_snapshot_record,
+    )
+
+    control = RcaControlStore(tmp_path / "control.sqlite3")
+    epoch = _create_activation_epoch(control, start_offset=20)
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_activation_epochs SET state='steady_active' "
+            "WHERE epoch_id=? AND is_current=1",
+            (epoch["epoch_id"],),
+        )
+    result = control.ingest_record(
+        _profile_snapshot_record(20, "6841983153"),
+        policy=_profile_snapshot_policy(),
+        submit_enabled=True,
+        activation_required=True,
+        activation_slot_kind="kafka_success",
+    )
+    assert result.decision == "accepted"
+    assert control.list_rows("rca_admission_snapshots") == []
+    claim = control.claim_outbox(
+        lease_owner="profile-terminal-quarantine-test",
+        now=NOW,
+    )
+    assert claim is not None
+    control.quarantine_outbox(
+        outbox_id=claim.outbox_id,
+        lease_token=claim.lease_token,
+        error_code="business_profile_unsupported",
+        error_detail="official project option is not registered",
+        now=NOW + timedelta(seconds=1),
+    )
+
+    store = RcaDeliveryStore(control.db_path)
+    assert (
+        store.backfill_completed_submissions(
+            now=NOW + timedelta(seconds=2),
+            activation_required=True,
+        )
+        == 1
+    )
+    [watch] = store.list_rows("rca_execution_watch")
+    [job] = store.list_rows("rca_delivery_jobs")
+    assert watch["state"] == "delivery_created"
+    assert job["issue_url"].endswith("/t03o4q/issue/detail/7041712812")
+    assert job["terminal_error_code"] == "business_profile_unsupported"
+    contract = json.loads(job["contract_json"])
+    assert contract["diagnostic_code"] == "business_route_unsupported"
+    assert "w3_execution_snapshot" not in contract
+
+
+def test_current_epoch_adapter_pending_terminal_without_w3_is_public(tmp_path):
+    from tests.gateway.test_pnc_rca_control_store import (
+        _create_activation_epoch,
+        _profile_snapshot_policy,
+        _profile_snapshot_record,
+    )
+
+    control = RcaControlStore(tmp_path / "control.sqlite3")
+    epoch = _create_activation_epoch(control, start_offset=21)
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_activation_epochs SET state='steady_active' "
+            "WHERE epoch_id=? AND is_current=1",
+            (epoch["epoch_id"],),
+        )
+    result = control.ingest_record(
+        _profile_snapshot_record(21, "7019637554"),
+        policy=_profile_snapshot_policy(),
+        submit_enabled=True,
+        activation_required=True,
+        activation_slot_kind="kafka_success",
+    )
+    assert result.decision == "accepted"
+    claim = control.claim_outbox(
+        lease_owner="profile-adapter-terminal-quarantine-test",
+        now=NOW,
+    )
+    assert claim is not None
+    control.quarantine_outbox(
+        outbox_id=claim.outbox_id,
+        lease_token=claim.lease_token,
+        error_code="business_profile_adapter_not_ready",
+        error_detail="matched profile input adapter is not ready",
+        now=NOW + timedelta(seconds=1),
+    )
+
+    store = RcaDeliveryStore(control.db_path)
+    assert store.backfill_completed_submissions(
+        now=NOW + timedelta(seconds=2),
+        activation_required=True,
+    ) == 1
+    [watch] = store.list_rows("rca_execution_watch")
+    [job] = store.list_rows("rca_delivery_jobs")
+    assert watch["state"] == "delivery_created"
+    assert job["terminal_error_code"] == "business_profile_adapter_not_ready"
+    contract = json.loads(job["contract_json"])
+    assert contract["diagnostic_code"] == "business_adapter_not_ready"
+    assert "w3_execution_snapshot" not in contract
+
+
+def test_invalid_profile_terminal_binding_is_silent_and_settled(tmp_path):
+    from tests.gateway.test_pnc_rca_control_store import (
+        _create_activation_epoch,
+        _profile_snapshot_policy,
+        _profile_snapshot_record,
+    )
+
+    control = RcaControlStore(tmp_path / "control.sqlite3")
+    epoch = _create_activation_epoch(control, start_offset=22)
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_activation_epochs SET state='steady_active' "
+            "WHERE epoch_id=? AND is_current=1",
+            (epoch["epoch_id"],),
+        )
+    result = control.ingest_record(
+        _profile_snapshot_record(22, "6841983153"),
+        policy=_profile_snapshot_policy(),
+        submit_enabled=True,
+        activation_required=True,
+        activation_slot_kind="kafka_success",
+    )
+    assert result.decision == "accepted"
+    claim = control.claim_outbox(
+        lease_owner="profile-terminal-invalid-binding-test",
+        now=NOW,
+    )
+    assert claim is not None
+    control.quarantine_outbox(
+        outbox_id=claim.outbox_id,
+        lease_token=claim.lease_token,
+        error_code="business_profile_adapter_not_ready",
+        error_detail="injected mismatched terminal code",
+        now=NOW + timedelta(seconds=1),
+    )
+
+    store = RcaDeliveryStore(control.db_path)
+    assert store.backfill_completed_submissions(
+        now=NOW + timedelta(seconds=2),
+        activation_required=True,
+    ) == 1
+    [watch] = store.list_rows("rca_execution_watch")
+    assert watch["state"] == "quarantined"
+    assert watch["last_error_code"] == "profile_terminal_binding_invalid"
+    assert store.list_rows("rca_delivery_jobs") == []
+    assert store.list_rows("rca_delivery_effects") == []
+    assert {
+        row["status"] for row in store.list_rows("rca_delivery_subscriptions")
+    } == {"quarantined"}
+
+    control.transition_activation_epoch(
+        epoch_id=epoch["epoch_id"],
+        expected_state="steady_active",
+        target_state="aborted",
+        operator="delivery-test",
+        reason="prove silent invalid terminal is fully settled before replacement",
+    )
+    replacement = _create_activation_epoch(
+        control,
+        epoch_id="rca-release-after-silent-terminal",
+        start_offset=23,
+        preauthorize=False,
+    )
+    assert replacement["state"] == "safe_off"
+
+
+def test_silent_terminal_without_required_subscriptions_blocks_replacement(
+    tmp_path,
+):
+    from tests.gateway.test_pnc_rca_control_store import (
+        _create_activation_epoch,
+        _profile_snapshot_policy,
+        _profile_snapshot_record,
+    )
+
+    control = RcaControlStore(tmp_path / "control.sqlite3")
+    epoch = _create_activation_epoch(control, start_offset=23)
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_activation_epochs SET state='steady_active' "
+            "WHERE epoch_id=? AND is_current=1",
+            (epoch["epoch_id"],),
+        )
+    result = control.ingest_record(
+        _profile_snapshot_record(23, "6841983153"),
+        policy=_profile_snapshot_policy(),
+        submit_enabled=True,
+        activation_required=True,
+        activation_slot_kind="kafka_success",
+    )
+    assert result.decision == "accepted"
+    claim = control.claim_outbox(
+        lease_owner="profile-terminal-missing-subscription-test",
+        now=NOW,
+    )
+    assert claim is not None
+    control.quarantine_outbox(
+        outbox_id=claim.outbox_id,
+        lease_token=claim.lease_token,
+        error_code="business_profile_adapter_not_ready",
+        error_detail="injected mismatched terminal code",
+        now=NOW + timedelta(seconds=1),
+    )
+    store = RcaDeliveryStore(control.db_path)
+    assert store.backfill_completed_submissions(
+        now=NOW + timedelta(seconds=2),
+        activation_required=True,
+    ) == 1
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute(
+            "DELETE FROM rca_delivery_subscriptions "
+            "WHERE business_key=? AND generation=?",
+            (result.business_key, result.generation),
+        )
+
+    control.transition_activation_epoch(
+        epoch_id=epoch["epoch_id"],
+        expected_state="steady_active",
+        target_state="aborted",
+        operator="delivery-test",
+        reason="prove missing subscription cannot be mistaken for settlement",
+        now=NOW + timedelta(seconds=3),
+    )
+    with pytest.raises(
+        ActivationEpochError,
+        match="activation_bound_delivery_backlog_not_drained",
+    ):
+        _create_activation_epoch(
+            control,
+            epoch_id="rca-release-after-missing-subscriptions",
+            start_offset=24,
+            preauthorize=False,
+        )
 
 
 def test_current_epoch_w3_validator_runtime_error_rolls_back_backfill(
@@ -2981,6 +3230,61 @@ def test_bounded_activation_allows_exact_execution_and_reuses_one_budget_slot(
         ).fetchone()[0]
     assert consumed == ledger_id
     assert ledger_count == 1
+
+
+def test_fully_settled_issue_only_delivery_allows_activation_replacement(tmp_path):
+    control, result = _control(tmp_path)
+    _bind_activation_execution(control, result, state="steady_active")
+    store = RcaDeliveryStore(control.db_path)
+    assert store.backfill_completed_submissions(now=NOW) == 1
+    watch = store.claim_due_watch(lease_owner="issue-only-collector", now=NOW)
+    assert watch is not None
+    store.create_delivery(
+        claim=watch,
+        delivery=_delivery(watch),
+        status={"success": True, "state": "completed"},
+        now=NOW,
+    )
+    effect = store.claim_due_effect(
+        lease_owner="issue-only-dispatcher",
+        now=NOW + timedelta(seconds=1),
+    )
+    assert effect is not None
+    assert effect.effect_kind == "feishu_issue_comment"
+    store.complete_effect(
+        claim=effect,
+        outcome="ack",
+        remote_id="comment-issue-only",
+        receipt={"remote_id": "comment-issue-only"},
+        observation=_delivery_observation(
+            effect,
+            remote_receipt_id="comment-issue-only",
+        ),
+        now=NOW + timedelta(seconds=2),
+    )
+    assert store.list_rows("rca_delivery_jobs")[0]["status"] == "delivered"
+
+    control.transition_activation_epoch(
+        epoch_id="delivery-epoch-1",
+        expected_state="steady_active",
+        target_state="aborted",
+        operator="delivery-test",
+        reason="replace only after the issue-only effect is settled",
+        now=NOW + timedelta(seconds=3),
+    )
+    replacement = control.create_activation_epoch(
+        epoch_id="delivery-epoch-issue-only-successor",
+        preauthorization_fingerprint="7" * 64,
+        preauthorization_gate_receipt_sha256="8" * 64,
+        preauthorization_capsule_sha256="9" * 64,
+        config_sha256="a" * 64,
+        db_logical_identity={"database": "delivery-test"},
+        partition_start_fence={TOPIC: {"2": 11}},
+        operator="delivery-test",
+        reason="issue-only delivery settlement permits replacement",
+        now=NOW + timedelta(seconds=4),
+    )
+    assert replacement["state"] == "safe_off"
 
 
 def _claimed_activation_effect(tmp_path):

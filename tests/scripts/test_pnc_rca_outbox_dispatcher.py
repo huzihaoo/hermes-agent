@@ -29,6 +29,8 @@ from tests.gateway.test_pnc_rca_control_store import (
     _begin_bounded_activation,
     _manual_request,
     _policy,
+    _profile_snapshot_policy,
+    _profile_snapshot_record,
     _record,
 )
 
@@ -43,6 +45,74 @@ def test_storage_admission_uses_isolated_production_runtime():
         "/home/mini/.hermes/rca-prod-runtime/releases/"
         "rca-platform-20260724/api/g1q3_rca/storage_admission.py"
     )
+
+
+def test_stored_unsupported_profile_is_terminal_before_preread(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    result = store.ingest_record(
+        _profile_snapshot_record(301, "6841983153"),
+        policy=_profile_snapshot_policy(),
+        submit_enabled=True,
+    )
+    assert result.decision == "accepted"
+    claim = store.claim_outbox(lease_owner="profile-terminal-test")
+    assert claim is not None
+    admission, event = dispatcher._validated_claim_contract(claim)
+
+    error = dispatcher._stored_profile_terminal_error(
+        claim=claim,
+        admission=admission,
+        event=event,
+    )
+
+    assert error is not None
+    assert error[0] == "business_profile_unsupported"
+    assert "no G1Q3 evaluator" in error[1]
+
+
+def test_stored_unresolved_profile_keeps_preread_path(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    result = store.ingest_record(
+        _profile_snapshot_record(302, ""),
+        policy=_profile_snapshot_policy(),
+        submit_enabled=True,
+    )
+    assert result.decision == "accepted"
+    claim = store.claim_outbox(lease_owner="profile-unresolved-test")
+    assert claim is not None
+    admission, event = dispatcher._validated_claim_contract(claim)
+
+    assert (
+        dispatcher._stored_profile_terminal_error(
+            claim=claim,
+            admission=admission,
+            event=event,
+        )
+        is None
+    )
+
+
+def test_stored_adapter_pending_profile_is_terminal_before_preread(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    result = store.ingest_record(
+        _profile_snapshot_record(303, "7019637554"),
+        policy=_profile_snapshot_policy(),
+        submit_enabled=True,
+    )
+    assert result.decision == "accepted"
+    claim = store.claim_outbox(lease_owner="profile-adapter-terminal-test")
+    assert claim is not None
+    admission, event = dispatcher._validated_claim_contract(claim)
+
+    error = dispatcher._stored_profile_terminal_error(
+        claim=claim,
+        admission=admission,
+        event=event,
+    )
+
+    assert error is not None
+    assert error[0] == "business_profile_adapter_not_ready"
+    assert "input adapter is not ready" in error[1]
 
 
 def _config_env(

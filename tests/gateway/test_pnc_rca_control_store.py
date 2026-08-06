@@ -2551,6 +2551,126 @@ def test_kafka_ingress_lineage_reuses_original_epoch_and_rejects_intent_change(
     assert store.health()["activation"]["backlog"]["deferred_quarantined"] == 1
     assert store.list_rows("rca_shadow_promotion_audit")[-1]["outcome"] == "deferred"
 
+
+def test_activation_replacement_requires_bound_pending_outbox_to_be_deferred(
+    tmp_path,
+):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    _create_activation_epoch(
+        store,
+        epoch_id="rca-release-original-pending",
+        start_offset=22,
+    )
+    conn = store._connect()
+    try:
+        conn.execute(
+            "UPDATE rca_activation_epochs SET state = 'steady_active' "
+            "WHERE epoch_id = 'rca-release-original-pending'"
+        )
+    finally:
+        conn.close()
+    pending = store.ingest_record(
+        _record(offset=22),
+        policy=_policy(),
+        submit_enabled=True,
+        activation_required=True,
+    )
+    assert pending.decision == "accepted"
+    [outbox] = store.list_rows("rca_outbox")
+    assert outbox["status"] == "pending"
+    assert outbox["activation_epoch_id"] == "rca-release-original-pending"
+
+    store.transition_activation_epoch(
+        epoch_id="rca-release-original-pending",
+        expected_state="steady_active",
+        target_state="aborted",
+        operator="release-test",
+        reason="abort before reviewed replacement",
+    )
+    with pytest.raises(
+        ActivationEpochError,
+        match="activation_bound_outbox_backlog_not_drained",
+    ):
+        _create_activation_epoch(
+            store,
+            epoch_id="rca-release-replacement-pending",
+            start_offset=23,
+            preauthorize=False,
+        )
+    assert store.activation_epoch()["epoch_id"] == "rca-release-original-pending"
+
+    deferred = store.defer_activation_event(
+        _record(offset=22).event_uid,
+        expected_activation_epoch_id="rca-release-original-pending",
+        operator="release-test",
+        reason="reviewed retry after replacement",
+    )
+    assert deferred.prior_status == "pending"
+    assert deferred.status == "quarantined"
+    replacement = _create_activation_epoch(
+        store,
+        epoch_id="rca-release-replacement-pending",
+        start_offset=23,
+        preauthorize=False,
+    )
+    assert replacement["state"] == "safe_off"
+    assert replacement["epoch_id"] == "rca-release-replacement-pending"
+
+
+def test_activation_replacement_requires_bound_quarantine_delivery_to_settle(
+    tmp_path,
+):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    _create_activation_epoch(
+        store,
+        epoch_id="rca-release-original-quarantined",
+        start_offset=22,
+    )
+    conn = store._connect()
+    try:
+        conn.execute(
+            "UPDATE rca_activation_epochs SET state = 'steady_active' "
+            "WHERE epoch_id = 'rca-release-original-quarantined'"
+        )
+    finally:
+        conn.close()
+    pending = store.ingest_record(
+        _record(offset=22),
+        policy=_policy(),
+        submit_enabled=True,
+        activation_required=True,
+    )
+    assert pending.decision == "accepted"
+    claim = store.claim_outbox(lease_owner="quarantine-drain-test")
+    assert claim is not None
+    store.quarantine_outbox(
+        outbox_id=claim.outbox_id,
+        lease_token=claim.lease_token,
+        error_code="business_profile_unsupported",
+        error_detail="profile terminal must be materialized before cutover",
+    )
+    store.transition_activation_epoch(
+        epoch_id="rca-release-original-quarantined",
+        expected_state="steady_active",
+        target_state="aborted",
+        operator="release-test",
+        reason="abort before delivery settlement",
+    )
+    with pytest.raises(
+        ActivationEpochError,
+        match="activation_bound_delivery_backlog_not_drained",
+    ):
+        _create_activation_epoch(
+            store,
+            epoch_id="rca-release-replacement-quarantined",
+            start_offset=23,
+            preauthorize=False,
+        )
+    assert store.activation_epoch()["epoch_id"] == (
+        "rca-release-original-quarantined"
+    )
+
+
 def _register_policy_without_classifying(store: RcaControlStore) -> None:
     store.persist_raw(_record(), policy=_policy(), submit_enabled=True)
 
@@ -2641,6 +2761,23 @@ def _terminalize_permanent(store: RcaControlStore, submission_key: str) -> None:
         conn.close()
     delivery = RcaDeliveryStore(store.db_path)
     assert delivery.backfill_completed_submissions() >= 1
+    conn = delivery._connect()
+    try:
+        watch = conn.execute(
+            "SELECT state, delivery_id FROM rca_execution_watch "
+            "WHERE submission_key=?",
+            (submission_key,),
+        ).fetchone()
+        assert watch is not None
+        if watch["delivery_id"] is None:
+            assert watch["state"] == "quarantined"
+            assert conn.execute(
+                "SELECT 1 FROM rca_delivery_jobs WHERE submission_key=?",
+                (submission_key,),
+            ).fetchone() is None
+            return
+    finally:
+        conn.close()
     _settle_delivery(store, submission_key)
 
 

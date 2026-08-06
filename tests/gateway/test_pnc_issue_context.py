@@ -446,6 +446,65 @@ def test_compact_rca_context_publishes_isolated_business_profile_contract():
     assert profile["evaluator_scope"] == "ct_evaluator_217_20260722"
 
 
+def test_generic_meegle_payload_preserves_work_item_type_for_profile_routing():
+    normalized = pnc_issue_context._normalize_meegle_workitem_payload(
+        {
+            "id": "7044346306",
+            "name": "generic Feishu response",
+            "status": "OPEN",
+            "work_item_type": {"key": "issue"},
+            "fields": [
+                {
+                    "field_key": "field_052f23",
+                    "field_value": [6670325063],
+                }
+            ],
+        },
+        work_item_id="7044346306",
+    )
+
+    assert normalized["work_item_attribute"]["work_item_type"] == {
+        "key": "issue"
+    }
+    context = pnc_issue_context.compact_rca_issue_context(
+        project_key="t03o4q",
+        work_item_brief=normalized,
+        comments=[],
+    )
+    profile_line = next(
+        line
+        for line in context.splitlines()
+        if line.startswith("- business_profile_contract: ")
+    )
+    profile = json.loads(profile_line.split(": ", 1)[1])
+    assert profile["status"] == "matched"
+    assert profile["profile_id"] == "g1q3"
+
+
+def test_compact_rca_context_accepts_string_work_item_type_key():
+    context = pnc_issue_context.compact_rca_issue_context(
+        project_key="t03o4q",
+        work_item_brief={
+            "work_item_attribute": {
+                "work_item_id": "7044346306",
+                "work_item_type": "issue",
+            },
+            "work_item_fields": [
+                {"key": "field_052f23", "value": [{"id": 6670325063}]}
+            ],
+        },
+        comments=[],
+    )
+    profile_line = next(
+        line
+        for line in context.splitlines()
+        if line.startswith("- business_profile_contract: ")
+    )
+    profile = json.loads(profile_line.split(": ", 1)[1])
+    assert profile["status"] == "matched"
+    assert profile["profile_id"] == "g1q3"
+
+
 def test_compact_rca_context_does_not_guess_missing_work_item_type():
     context = pnc_issue_context.compact_rca_issue_context(
         project_key="t03o4q",

@@ -132,21 +132,20 @@ def _stable_option_ids(value: Any) -> tuple[str, ...]:
 
 
 def project_option_ids(work_item_brief: Mapping[str, Any]) -> tuple[str, ...]:
-    fields = work_item_brief.get("work_item_fields")
-    key_name = "key"
-    value_name = "value"
-    if not isinstance(fields, list):
-        fields = work_item_brief.get("fields")
-        key_name = "field_key"
-        value_name = "field_value"
-    if not isinstance(fields, list):
-        return ()
-    for field in fields:
-        if not isinstance(field, Mapping):
+    sources = (
+        (work_item_brief.get("work_item_fields"), "key", "value"),
+        (work_item_brief.get("fields"), "field_key", "field_value"),
+    )
+    found: set[str] = set()
+    for fields, key_name, value_name in sources:
+        if not isinstance(fields, list):
             continue
-        if str(field.get(key_name) or "").strip() == PROJECT_FIELD_KEY:
-            return _stable_option_ids(field.get(value_name))
-    return ()
+        for field in fields:
+            if not isinstance(field, Mapping):
+                continue
+            if str(field.get(key_name) or "").strip() == PROJECT_FIELD_KEY:
+                found.update(_stable_option_ids(field.get(value_name)))
+    return tuple(sorted(found))
 
 
 def resolve_business_profile(

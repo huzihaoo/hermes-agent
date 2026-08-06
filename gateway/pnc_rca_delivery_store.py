@@ -117,6 +117,10 @@ OUTBOX_QUARANTINED_PUBLIC_ERROR_CODE = "outbox_submission_quarantined"
 OUTBOX_PRE_W3_QUARANTINE_POLICY = "silent_internal_alert_only"
 OUTBOX_PRE_W3_QUARANTINE_MISSING_CODE = "w3_execution_snapshot_missing"
 OUTBOX_PRE_W3_QUARANTINE_INVALID_CODE = "w3_execution_snapshot_invalid"
+OUTBOX_MANUAL_ACTIVATION_BINDING_INVALID_CODE = "manual_activation_binding_invalid"
+OUTBOX_PROFILE_TERMINAL_BINDING_INVALID_CODE = (
+    "profile_terminal_binding_invalid"
+)
 OUTBOX_PUBLIC_PROFILE_ERROR_CODES = frozenset({
     "business_profile_unresolved",
     "business_profile_unsupported",
@@ -171,6 +175,9 @@ _LEARNING_ADJUDICATION_SCHEMAS = frozenset({
 })
 _ADJUDICATION_TARGET_PREFIX = "g1q3-rca-adjudication-target-v1-"
 _OPEN_ID_RE = re.compile(r"^ou_[0-9a-f]{32}$")
+_FEISHU_ISSUE_URL_RE = re.compile(
+    r"^https://project\.feishu\.cn/[A-Za-z0-9._-]+/issue/detail/[0-9]+/*$"
+)
 COMMENT_SLOT_SCHEMA_VERSION = "pnc_rca_comment_slot_v1"
 COMMENT_SLOT_KINDS = frozenset({"conclusion", "correction"})
 ACCIDENT_SAMPLE_BUDGET_EXEMPT_ISSUE_IDS = frozenset(
@@ -4008,6 +4015,254 @@ class RcaDeliveryStore:
         except (TypeError, ValueError, OverflowError):
             return None, OUTBOX_PRE_W3_QUARANTINE_INVALID_CODE, ""
 
+    @classmethod
+    def _manual_activation_issue_target_for_quarantined_outbox_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        row: sqlite3.Row,
+    ) -> tuple[bool, str]:
+        """Recognize manual admission authority without requiring a W3 snapshot.
+
+        Manual Feishu executions intentionally use their immutable source and
+        admission-ledger chain as the write authority. Kafka executions have no
+        equivalent exception and must continue through the issued W3 fence path.
+        """
+        source = conn.execute(
+            """
+            SELECT source.source_kind, source.platform,
+                   source.chat_id, source.thread_id, source.message_id,
+                   source.requester_id, source.mode,
+                   trigger.origin_source_id, trigger.normalized_json,
+                   trigger.activation_epoch_id AS trigger_epoch_id,
+                   trigger.activation_ledger_id AS trigger_ledger_id,
+                   binding.business_key AS binding_business_key,
+                   binding.generation AS binding_generation,
+                   epoch.epoch_id, epoch.state AS epoch_state, epoch.is_current,
+                   ledger.entrypoint, ledger.source_kind AS ledger_source_kind,
+                   ledger.source_identity_sha256, ledger.decision,
+                   ledger.bound_at, ledger.business_key AS ledger_business_key,
+                   ledger.submission_key AS ledger_submission_key,
+                   ledger.generation AS ledger_generation
+              FROM rca_outbox AS outbox
+              JOIN business_triggers AS trigger
+                ON trigger.business_key = outbox.business_key
+               AND trigger.submission_key = outbox.submission_key
+               AND trigger.generation = outbox.generation
+              JOIN rca_trigger_sources AS source
+                ON source.source_id = trigger.origin_source_id
+              JOIN rca_trigger_bindings AS binding
+                ON binding.source_id = source.source_id
+               AND binding.business_key = trigger.business_key
+               AND binding.generation = trigger.generation
+              JOIN rca_activation_epochs AS epoch
+                ON epoch.is_current = 1
+               AND epoch.epoch_id = outbox.activation_epoch_id
+              JOIN rca_activation_admission_ledger AS ledger
+                ON ledger.epoch_id = epoch.epoch_id
+               AND ledger.ledger_id = outbox.activation_ledger_id
+               AND ledger.business_key = outbox.business_key
+               AND ledger.submission_key = outbox.submission_key
+               AND ledger.generation = outbox.generation
+             WHERE outbox.outbox_id = ?
+            """,
+            (int(row["outbox_id"]),),
+        ).fetchone()
+        if source is None:
+            return False, ""
+        if (
+            str(source["source_kind"] or "") != "feishu_group_manual"
+            or str(source["platform"] or "") != "feishu"
+        ):
+            return False, ""
+        try:
+            normalized = json.loads(str(source["normalized_json"] or ""))
+            if not isinstance(normalized, Mapping):
+                raise ValueError("manual_trigger_context_invalid")
+            issue_url = str(normalized.get("issue_url") or "").strip()
+            if not issue_url:
+                raise ValueError("manual_trigger_issue_url_missing")
+            source_identity = {
+                "chat_id": str(source["chat_id"] or "").strip(),
+                "thread_id": str(source["thread_id"] or "").strip(),
+                "message_id": str(source["message_id"] or "").strip(),
+                "requester_id": str(source["requester_id"] or "").strip(),
+                "issue_url": issue_url,
+                "mode": str(source["mode"] or "").strip(),
+            }
+            if not all(source_identity.values()):
+                raise ValueError("manual_source_identity_invalid")
+            if (
+                str(source["trigger_epoch_id"] or "") != str(row["activation_epoch_id"] or "")
+                or int(source["trigger_ledger_id"] or 0)
+                != int(row["activation_ledger_id"] or 0)
+                or str(source["epoch_state"] or "")
+                not in ACTIVATION_DELIVERY_STATES
+                or int(source["is_current"] or 0) != 1
+                or str(source["entrypoint"] or "") != "manual_admit"
+                or str(source["ledger_source_kind"] or "") != "manual"
+                or str(source["decision"] or "") not in {"admit", "join"}
+                or not str(source["bound_at"] or "").strip()
+                or str(source["binding_business_key"] or "") != str(row["business_key"])
+                or int(source["binding_generation"] or 0) != int(row["generation"])
+                or str(source["ledger_business_key"] or "") != str(row["business_key"])
+                or str(source["ledger_submission_key"] or "") != str(row["submission_key"])
+                or int(source["ledger_generation"] or 0) != int(row["generation"])
+                or hashlib.sha256(_canonical_json(source_identity).encode("utf-8")).hexdigest()
+                != str(source["source_identity_sha256"] or "")
+            ):
+                raise ValueError("manual_activation_binding_mismatch")
+            return True, issue_url
+        except (TypeError, ValueError, OverflowError, json.JSONDecodeError):
+            return True, ""
+
+    @classmethod
+    def _stored_profile_terminal_issue_target_for_quarantined_outbox_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        row: sqlite3.Row,
+    ) -> tuple[bool, str, str]:
+        """Validate a Kafka profile terminal without a W3 execution snapshot.
+
+        Snapshot-only profile observations are sufficient for a neutral
+        out-of-scope terminal.  They are never sufficient for VM submission
+        or a successful external write.  The source/ledger joins keep this
+        exception bound to the exact current activation admission.
+        """
+        source_error = str(row["last_error_code"] or "").strip()
+        if source_error not in {
+            "business_profile_unsupported",
+            "business_profile_conflict",
+            "business_profile_adapter_not_ready",
+        }:
+            return False, "", ""
+        source = conn.execute(
+            """
+            SELECT source.source_id, source.source_kind, source.kafka_event_uid,
+                   source.mode, trigger.normalized_json,
+                   trigger.activation_epoch_id AS trigger_epoch_id,
+                   trigger.activation_ledger_id AS trigger_ledger_id,
+                   binding.business_key AS binding_business_key,
+                   binding.generation AS binding_generation,
+                   epoch.epoch_id, epoch.state AS epoch_state, epoch.is_current,
+                   ledger.entrypoint, ledger.source_kind AS ledger_source_kind,
+                   ledger.decision, ledger.bound_at,
+                   ledger.business_key AS ledger_business_key,
+                   ledger.submission_key AS ledger_submission_key,
+                   ledger.generation AS ledger_generation
+              FROM rca_outbox AS outbox
+              JOIN business_triggers AS trigger
+                ON trigger.business_key = outbox.business_key
+               AND trigger.generation = outbox.generation
+              JOIN rca_trigger_sources AS source
+                ON source.source_id = trigger.origin_source_id
+              JOIN rca_trigger_bindings AS binding
+                ON binding.source_id = source.source_id
+               AND binding.business_key = trigger.business_key
+               AND binding.generation = trigger.generation
+              JOIN rca_activation_epochs AS epoch
+                ON epoch.is_current = 1
+               AND epoch.epoch_id = outbox.activation_epoch_id
+              JOIN rca_activation_admission_ledger AS ledger
+                ON ledger.epoch_id = epoch.epoch_id
+               AND ledger.ledger_id = outbox.activation_ledger_id
+               AND ledger.business_key = outbox.business_key
+               AND ledger.submission_key = outbox.submission_key
+               AND ledger.generation = outbox.generation
+             WHERE outbox.outbox_id = ?
+            """,
+            (int(row["outbox_id"]),),
+        ).fetchone()
+        if source is None:
+            return True, "", OUTBOX_PROFILE_TERMINAL_BINDING_INVALID_CODE
+        try:
+            normalized = json.loads(str(source["normalized_json"] or ""))
+            resolution = normalized["business_profile_resolution"]
+            if not isinstance(normalized, Mapping) or not isinstance(
+                resolution, Mapping
+            ):
+                raise ValueError("profile_terminal_observation_invalid")
+            status = str(resolution.get("status") or "").strip()
+            if source_error == "business_profile_adapter_not_ready":
+                if (
+                    status != "matched"
+                    or str(resolution.get("execution_readiness") or "").strip()
+                    != "input_adapter_pending"
+                    or not str(resolution.get("profile_id") or "").strip()
+                ):
+                    raise ValueError("profile_terminal_adapter_contract_invalid")
+            elif f"business_profile_{status}" != source_error:
+                raise ValueError("profile_terminal_error_code_mismatch")
+            issue_url = str(normalized.get("issue_url") or "").strip()
+            project_simple_name = str(
+                normalized.get("project_simple_name") or ""
+            ).strip()
+            work_item_id = str(normalized.get("work_item_id") or "").strip()
+            expected_issue_url = (
+                f"https://project.feishu.cn/{project_simple_name}/issue/detail/"
+                f"{work_item_id}"
+            )
+            option_ids = resolution.get("project_option_ids")
+            if (
+                not isinstance(option_ids, list)
+                or not option_ids
+                or any(
+                    not isinstance(option_id, str) or not option_id.strip()
+                    for option_id in option_ids
+                )
+                or len(set(option_ids)) != len(option_ids)
+                or option_ids != sorted(option_ids)
+            ):
+                raise ValueError("profile_terminal_project_options_missing")
+            if (
+                normalized.get("schema_version")
+                != "pnc_rca_workflow_event_v1"
+                or normalized.get("business_profile_observed") is not True
+                or resolution.get("routing_field_key") != "field_052f23"
+                or resolution.get("registry_version") != "rca_business_profiles_v1"
+                or str(normalized.get("project_key") or "")
+                != str(row["project_key"] or "")
+                or str(normalized.get("work_item_type_key") or "")
+                != str(row["work_item_type_key"] or "")
+                or work_item_id != str(row["work_item_id"] or "")
+                or not _FEISHU_ISSUE_URL_RE.fullmatch(issue_url)
+                or issue_url.rstrip("/") != expected_issue_url.rstrip("/")
+                or str(source["source_kind"] or "")
+                != "kafka_workflow_event"
+                or str(source["source_id"] or "")
+                != str(row["origin_source_id"] or "")
+                or str(source["kafka_event_uid"] or "")
+                != str(row["source_event_id"] or "")
+                or str(source["mode"] or "")
+                != ("issue_created" if int(row["generation"]) == 1 else "kafka_retrigger")
+                or str(source["trigger_epoch_id"] or "")
+                != str(row["activation_epoch_id"] or "")
+                or int(source["trigger_ledger_id"] or 0)
+                != int(row["activation_ledger_id"] or 0)
+                or str(source["epoch_state"] or "")
+                not in ACTIVATION_DELIVERY_STATES
+                or int(source["is_current"] or 0) != 1
+                or str(source["entrypoint"] or "") != "kafka_ingest"
+                or str(source["ledger_source_kind"] or "") != "kafka"
+                or str(source["decision"] or "") not in {"admit", "join"}
+                or not str(source["bound_at"] or "").strip()
+                or str(source["binding_business_key"] or "")
+                != str(row["business_key"] or "")
+                or int(source["binding_generation"] or 0)
+                != int(row["generation"])
+                or str(source["ledger_business_key"] or "")
+                != str(row["business_key"] or "")
+                or str(source["ledger_submission_key"] or "")
+                != str(row["submission_key"] or "")
+                or int(source["ledger_generation"] or 0)
+                != int(row["generation"])
+            ):
+                raise ValueError("profile_terminal_binding_mismatch")
+            return True, issue_url, source_error
+        except (KeyError, TypeError, ValueError, OverflowError, json.JSONDecodeError):
+            return True, "", OUTBOX_PROFILE_TERMINAL_BINDING_INVALID_CODE
+
     @staticmethod
     def _materialize_silent_quarantined_outbox_in_transaction(
         conn: sqlite3.Connection,
@@ -4057,6 +4312,21 @@ class RcaDeliveryStore:
             raise DeliveryRecordConflictError(
                 "pre-W3 quarantined outbox watch was not created exactly once"
             )
+        conn.execute(
+            """
+            UPDATE rca_delivery_subscriptions
+               SET status = 'quarantined', delivery_id = NULL, effect_key = NULL,
+                   reason = ?, updated_at = ?
+             WHERE business_key = ? AND generation = ?
+               AND required = 1 AND status = 'pending'
+            """,
+            (
+                disposition_code,
+                current,
+                row["business_key"],
+                row["generation"],
+            ),
+        )
 
     def _materialize_quarantined_outbox_in_transaction(
         self,
@@ -4069,21 +4339,56 @@ class RcaDeliveryStore:
         w3_binding: dict[str, Any] | None = None
         w3_issue_target = ""
         if activation_enforced:
-            w3_binding, disposition_code, w3_issue_target = (
+            w3_binding, w3_disposition_code, w3_issue_target = (
                 self._issued_w3_binding_for_quarantined_outbox_tx(
                     conn,
                     row=row,
                     current=current,
                 )
             )
-            if w3_binding is None:
-                self._materialize_silent_quarantined_outbox_in_transaction(
-                    conn,
-                    row=row,
-                    current=current,
-                    disposition_code=disposition_code,
+            if w3_binding is not None:
+                pass
+            else:
+                is_manual, manual_issue_target = (
+                    self._manual_activation_issue_target_for_quarantined_outbox_tx(
+                        conn,
+                        row=row,
+                    )
                 )
-                return
+                is_profile_terminal, profile_issue_target, profile_code = (
+                    self._stored_profile_terminal_issue_target_for_quarantined_outbox_tx(
+                        conn,
+                        row=row,
+                    )
+                )
+                if is_manual:
+                    if not manual_issue_target:
+                        self._materialize_silent_quarantined_outbox_in_transaction(
+                            conn,
+                            row=row,
+                            current=current,
+                            disposition_code=OUTBOX_MANUAL_ACTIVATION_BINDING_INVALID_CODE,
+                        )
+                        return
+                    w3_issue_target = manual_issue_target
+                elif is_profile_terminal:
+                    if not profile_issue_target:
+                        self._materialize_silent_quarantined_outbox_in_transaction(
+                            conn,
+                            row=row,
+                            current=current,
+                            disposition_code=profile_code,
+                        )
+                        return
+                    w3_issue_target = profile_issue_target
+                else:
+                    self._materialize_silent_quarantined_outbox_in_transaction(
+                        conn,
+                        row=row,
+                        current=current,
+                        disposition_code=w3_disposition_code,
+                    )
+                    return
         source_error_code = str(row["last_error_code"] or "").strip()
         public_error_code = (
             source_error_code
@@ -4189,6 +4494,7 @@ class RcaDeliveryStore:
                 f"""
                 SELECT o.outbox_id, o.submission_key, o.business_key, o.generation,
                        o.activation_epoch_id, o.activation_ledger_id,
+                       o.origin_source_id, o.source_event_id,
                        o.status AS outbox_status, o.created_at AS outbox_created_at,
                        o.quarantined_at, o.last_error_code, o.last_error_detail,
                        t.project_key, t.work_item_type_key, t.work_item_id

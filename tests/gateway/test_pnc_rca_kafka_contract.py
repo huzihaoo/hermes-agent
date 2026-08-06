@@ -180,6 +180,25 @@ def test_exact_policy_match_normalizes_observed_workflow_shape():
     assert result.normalized.matched_nodes[0].state_key == "new-problem-state"
 
 
+def test_workflow_envelope_with_snapshot_fields_is_rejected_as_ambiguous():
+    result = classify_workflow_event(
+        topic=TOPIC,
+        value=_payload(
+            fields=[
+                {
+                    "field_key": "field_052f23",
+                    "field_value": ["6841983153"],
+                }
+            ]
+        ),
+        policy=_policy(),
+    )
+
+    assert result.decision == "invalid"
+    assert result.reason == "ambiguous_creation_snapshot"
+    assert result.normalized is None
+
+
 def test_node_name_is_optional_diagnostic_not_creation_identity():
     renamed = _payload(
         nodes=[

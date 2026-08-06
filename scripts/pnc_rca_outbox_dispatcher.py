@@ -2864,6 +2864,87 @@ def _validated_claim_contract(
     return admission, event
 
 
+def _stored_profile_terminal_error(
+    *,
+    claim: OutboxClaim,
+    admission: RcaAdmission,
+    event: Mapping[str, Any],
+) -> tuple[str, str] | None:
+    """Use an immutable Kafka profile observation before network preread.
+
+    Snapshot events already carry the official routing field. If that field is
+    explicitly unsupported/conflicting, or resolves to a profile whose input
+    adapter is not ready, retrying Feishu preread cannot change executability
+    and only burns the outbox retry window. Keep unresolved observations on the
+    normal preread path so missing-card-field diagnostics remain user-visible.
+    """
+    normalized = claim.payload.get("normalized_event")
+    if not isinstance(normalized, Mapping):
+        return None
+    if normalized.get("schema_version") != NORMALIZED_EVENT_SCHEMA_VERSION:
+        return None
+    identity_fields = (
+        "project_key",
+        "project_simple_name",
+        "work_item_type_key",
+        "work_item_id",
+        "creation_rule_version",
+    )
+    refs = admission.source_refs
+    expected_identity = {
+        "project_key": refs.project_key,
+        "project_simple_name": refs.project_simple_name,
+        "work_item_type_key": refs.work_item_type_key,
+        "work_item_id": refs.work_item_id,
+        "creation_rule_version": refs.rule_version,
+    }
+    if any(
+        str(normalized.get(field) or "").strip()
+        != str(event.get(field) or expected_identity[field]).strip()
+        or str(normalized.get(field) or "").strip()
+        != str(expected_identity[field]).strip()
+        for field in identity_fields
+    ):
+        raise DispatchCircuitError(
+            "dispatcher_outbox_identity_mismatch",
+            "normalized profile observation disagrees with trigger context",
+        )
+    if normalized.get("business_profile_observed") is not True:
+        return None
+    resolution = normalized.get("business_profile_resolution")
+    if not isinstance(resolution, Mapping):
+        raise DispatchCircuitError(
+            "dispatcher_outbox_contract_invalid",
+            "observed business profile resolution is not an object",
+        )
+    status = str(resolution.get("status") or "").strip()
+    if status in {"unsupported", "conflict"}:
+        code = f"business_profile_{status}"
+        detail = (
+            "official Feishu project-field observation resolved to an "
+            f"{status} business profile; no G1Q3 evaluator was selected"
+        )
+        return code, detail
+    if status != "matched":
+        return None
+    readiness = str(resolution.get("execution_readiness") or "").strip()
+    if readiness == "ready":
+        return None
+    if (
+        readiness != "input_adapter_pending"
+        or not str(resolution.get("profile_id") or "").strip()
+    ):
+        raise DispatchCircuitError(
+            "dispatcher_outbox_contract_invalid",
+            "matched business profile has an invalid execution readiness contract",
+        )
+    return (
+        "business_profile_adapter_not_ready",
+        "official Feishu project-field observation matched a business profile "
+        "whose input adapter is not ready; no evaluator was invoked",
+    )
+
+
 def _contains_mapping_key(value: Any, forbidden_key: str) -> bool:
     if isinstance(value, Mapping):
         return any(
@@ -3412,6 +3493,21 @@ class OutboxDispatcher:
             return DispatchOutcome(status="idle")
         self.stats.claimed += 1
         try:
+            # Validate the source-neutral outbox contract before any optional
+            # W3 snapshot read.  This also lets an immutable unsupported
+            # profile observation take its terminal diagnostic path when the
+            # snapshot itself is intentionally absent.
+            admission, event = _validated_claim_contract(
+                claim,
+                snapshot_bundle=None,
+            )
+            stored_profile_error = _stored_profile_terminal_error(
+                claim=claim,
+                admission=admission,
+                event=event,
+            )
+            if stored_profile_error is not None:
+                raise PermanentDispatchError(*stored_profile_error)
             snapshot_bundle: AdmissionSnapshotExecutionBundle | None = None
             if self.config.w3_snapshot_read_mode == "snapshot_required":
                 try:
@@ -3437,10 +3533,11 @@ class OutboxDispatcher:
                         "dispatcher_snapshot_contract_invalid",
                         "control store returned no immutable execution snapshot",
                     )
-            admission, event = _validated_claim_contract(
-                claim,
-                snapshot_bundle=snapshot_bundle,
-            )
+            if snapshot_bundle is not None:
+                admission, event = _validated_claim_contract(
+                    claim,
+                    snapshot_bundle=snapshot_bundle,
+                )
             self._renew(claim)
             issue_context = self.enrich(event)
             if not isinstance(issue_context, RcaIssueContext):

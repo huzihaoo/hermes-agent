@@ -6260,6 +6260,37 @@ class RcaControlStore:
                 raise ActivationEpochError(
                     "activation_shadow_backlog_not_disposed"
                 )
+            predecessor_epoch_id = (
+                str(existing["epoch_id"]) if existing is not None else ""
+            )
+            bound_outbox_backlog = 0
+            if predecessor_epoch_id:
+                bound_outbox_backlog = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM rca_outbox "
+                        "WHERE status IN ('pending', 'claimed', 'shadow') "
+                        "AND (activation_epoch_id = ? OR activation_ledger_id IN ("
+                        "SELECT ledger_id FROM rca_activation_admission_ledger "
+                        "WHERE epoch_id = ?))",
+                        (predecessor_epoch_id, predecessor_epoch_id),
+                    ).fetchone()[0]
+                )
+            if bound_outbox_backlog:
+                raise ActivationEpochError(
+                    "activation_bound_outbox_backlog_not_drained"
+                )
+            bound_delivery_backlog = (
+                self._activation_bound_delivery_backlog_tx(
+                    conn,
+                    epoch_id=predecessor_epoch_id,
+                )
+                if predecessor_epoch_id
+                else 0
+            )
+            if bound_delivery_backlog:
+                raise ActivationEpochError(
+                    "activation_bound_delivery_backlog_not_drained"
+                )
             if existing is not None:
                 if str(existing["state"]) != "aborted":
                     raise ActivationEpochError("activation_current_epoch_exists")
@@ -7850,6 +7881,160 @@ class RcaControlStore:
             and str(row["effect_outcome"] or "") == str(watch["job_outcome"])
             and bool(str(row["completed_at"] or ""))
             for row in effects
+        )
+
+    @classmethod
+    def _activation_delivery_execution_complete_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        business_key: str,
+        submission_key: str,
+        generation: int,
+    ) -> bool:
+        """Return whether one bound outbox row has fully settled delivery."""
+        required_tables = {
+            "rca_execution_watch",
+            "rca_delivery_jobs",
+            "rca_delivery_effects",
+            "rca_delivery_subscriptions",
+        }
+        present = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        if not required_tables.issubset(present):
+            return False
+        watch = conn.execute(
+            """
+            SELECT state, delivery_id, last_status_json
+              FROM rca_execution_watch
+             WHERE business_key = ? AND submission_key = ? AND generation = ?
+             LIMIT 1
+            """,
+            (business_key, submission_key, generation),
+        ).fetchone()
+        if watch is None:
+            return False
+        watch_state = str(watch["state"] or "")
+        delivery_id = str(watch["delivery_id"] or "").strip()
+        effects = conn.execute(
+            """
+            SELECT s.effect_kind, s.status AS subscription_status,
+                   s.delivery_id AS subscription_delivery_id,
+                   s.effect_key, e.status AS effect_status
+              FROM rca_delivery_subscriptions AS s
+              LEFT JOIN rca_delivery_effects AS e
+                ON e.effect_key = s.effect_key
+             WHERE s.business_key = ? AND s.generation = ? AND s.required = 1
+             ORDER BY s.effect_kind
+            """,
+            (business_key, generation),
+        ).fetchall()
+        effect_kinds = [str(row["effect_kind"] or "") for row in effects]
+        valid_subscription_shape = (
+            bool(effects)
+            and "feishu_issue_comment" in effect_kinds
+            and len(set(effect_kinds)) == len(effect_kinds)
+            and set(effect_kinds).issubset(
+                {"feishu_issue_comment", "feishu_thread_reply"}
+            )
+        )
+
+        if watch_state == "quarantined":
+            try:
+                status = json.loads(str(watch["last_status_json"] or ""))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return False
+            if (
+                delivery_id
+                or not isinstance(status, Mapping)
+                or status.get("success") is not False
+                or status.get("state") != "quarantined"
+                or status.get("external_writes") is not False
+                or status.get("terminal_delivery_policy")
+                != "silent_internal_alert_only"
+                or not valid_subscription_shape
+                or any(
+                    str(row["subscription_status"] or "")
+                    not in {"suppressed", "quarantined"}
+                    or str(row["subscription_delivery_id"] or "")
+                    or str(row["effect_key"] or "")
+                    or str(row["effect_status"] or "")
+                    for row in effects
+                )
+            ):
+                return False
+            historical_job = conn.execute(
+                "SELECT 1 FROM rca_delivery_jobs "
+                "WHERE business_key = ? AND submission_key = ? AND generation = ? "
+                "LIMIT 1",
+                (business_key, submission_key, generation),
+            ).fetchone()
+            return historical_job is None
+
+        if watch_state != "delivery_created" or not delivery_id:
+            return False
+        job = conn.execute(
+            "SELECT status FROM rca_delivery_jobs WHERE delivery_id = ?",
+            (delivery_id,),
+        ).fetchone()
+        if job is None or str(job["status"] or "") not in {
+            "delivered",
+            "partial",
+            "quarantined",
+        }:
+            return False
+        if not valid_subscription_shape:
+            return False
+        settled = {"succeeded", "suppressed", "quarantined"}
+        return all(
+            str(row["subscription_status"] or "") in {
+                "materialized",
+                "suppressed",
+                "quarantined",
+            }
+            and (
+                str(row["subscription_status"] or "")
+                in {"suppressed", "quarantined"}
+                or (
+                    str(row["subscription_delivery_id"] or "") == delivery_id
+                    and str(row["effect_key"] or "")
+                    and str(row["effect_status"] or "") in settled
+                )
+            )
+            for row in effects
+        )
+
+    @classmethod
+    def _activation_bound_delivery_backlog_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        epoch_id: str,
+    ) -> int:
+        rows = conn.execute(
+            """
+            SELECT business_key, submission_key, generation
+             FROM rca_outbox
+             WHERE status IN ('completed', 'quarantined')
+               AND (activation_epoch_id = ? OR activation_ledger_id IN (
+                    SELECT ledger_id FROM rca_activation_admission_ledger
+                     WHERE epoch_id = ?))
+               AND last_error_code != 'activation_epoch_deferred'
+            """,
+            (epoch_id, epoch_id),
+        ).fetchall()
+        return sum(
+            not cls._activation_delivery_execution_complete_tx(
+                conn,
+                business_key=str(row["business_key"] or ""),
+                submission_key=str(row["submission_key"] or ""),
+                generation=int(row["generation"] or 0),
+            )
+            for row in rows
         )
 
     @classmethod

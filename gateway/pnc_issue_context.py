@@ -803,10 +803,27 @@ def _normalize_meegle_workitem_payload(payload: Any, *, work_item_id: str) -> di
         status_obj = {"name": status.get("name") or status.get("label") or status.get("state_key_name") or status.get("end_state_key_name") or status.get("key") or ""}
     else:
         status_obj = {}
+    raw_work_item_type = (
+        item.get("work_item_type")
+        or item.get("work_item_type_key")
+        or info.get("work_item_type")
+        or info.get("work_item_type_key")
+    )
+    if isinstance(raw_work_item_type, Mapping):
+        work_item_type_key = str(
+            raw_work_item_type.get("key")
+            or raw_work_item_type.get("work_item_type_key")
+            or ""
+        ).strip()
+    else:
+        work_item_type_key = str(raw_work_item_type or "").strip()
     attrs = {
         "work_item_id": str(item.get("work_item_id") or item.get("id") or info.get("work_item_id") or info.get("id") or work_item_id),
         "work_item_name": str(item.get("work_item_name") or item.get("name") or item.get("title") or info.get("work_item_name") or info.get("name") or ""),
         "work_item_status": status_obj,
+        "work_item_type": (
+            {"key": work_item_type_key} if work_item_type_key else {}
+        ),
     }
     fields = _normalize_meegle_fields(item.get("fields") or item.get("work_item_fields") or item.get("field_values") or {})
     return {"work_item_attribute": attrs, "work_item_fields": fields}
@@ -1051,11 +1068,14 @@ def compact_rca_issue_context(
     description = sanitize_issue_evidence_text(by_name.get("描述"))[:1200]
 
     work_item_type = attrs.get("work_item_type")
-    work_item_type_key = (
-        str(work_item_type.get("key") or "").strip()
-        if isinstance(work_item_type, dict)
-        else ""
-    )
+    if isinstance(work_item_type, dict):
+        work_item_type_key = str(
+            work_item_type.get("key") or work_item_type.get("work_item_type_key") or ""
+        ).strip()
+    else:
+        work_item_type_key = str(
+            work_item_type or attrs.get("work_item_type_key") or ""
+        ).strip()
     profile_resolution = resolve_business_profile(
         project_key=project_key,
         work_item_type_key=work_item_type_key,

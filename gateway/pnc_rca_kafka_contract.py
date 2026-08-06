@@ -464,6 +464,11 @@ def classify_workflow_event(
             return ClassificationResult("filtered", "snapshot_pattern_not_allowed")
         if sub_stage not in policy.snapshot_sub_stages:
             return ClassificationResult("filtered", "snapshot_sub_stage_not_allowed")
+        profile_resolution = resolve_business_profile(
+            project_key=project_key,
+            work_item_type_key=work_item_type_key,
+            work_item_brief=payload,
+        )
         normalized = NormalizedWorkflowEvent(
             schema_version=NORMALIZED_EVENT_SCHEMA_VERSION,
             creation_rule_version=policy.policy_version,
@@ -481,15 +486,17 @@ def classify_workflow_event(
             nodes=(),
             matched_nodes=(),
             business_profile_observed=True,
-            business_profile_resolution=resolve_business_profile(
-                project_key=project_key,
-                work_item_type_key=work_item_type_key,
-                work_item_brief=payload,
-            ).to_dict(),
+            business_profile_resolution=profile_resolution.to_dict(),
         )
         return ClassificationResult(
             "accepted", "creation_snapshot_policy_matched", normalized
         )
+
+    # A workflow transition must not silently discard snapshot fields.  A
+    # hybrid envelope has two competing creation contracts and is rejected
+    # before profile routing or admission identity is built.
+    if _SNAPSHOT_MARKERS & payload.keys():
+        return ClassificationResult("invalid", "ambiguous_creation_snapshot")
 
     try:
         status_change_type = _required_text(
