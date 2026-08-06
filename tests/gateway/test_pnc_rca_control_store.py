@@ -524,7 +524,7 @@ def test_feishu_user_rerun_does_not_inherit_silent_terminal_exception(tmp_path):
 
 
 def test_batch_terminal_authority_creates_correction_generation_only_for_failed_delivery(
-    tmp_path,
+    tmp_path, monkeypatch
 ):
     from types import SimpleNamespace
 
@@ -568,6 +568,15 @@ def test_batch_terminal_authority_creates_correction_generation_only_for_failed_
         requester_id=request.requester_id,
         reason=request.reason,
     )
+
+    def unexpected_learning_lane_admission(cls, conn, *, admission, current):
+        raise AssertionError("terminal correction must stay on the delivery lane")
+
+    monkeypatch.setattr(
+        RcaControlStore,
+        "_ensure_learning_lane_admission_tx",
+        classmethod(unexpected_learning_lane_admission),
+    )
     rerun = store.admit_manual_trigger(
         request,
         allowed_chat_ids=set(),
@@ -579,6 +588,21 @@ def test_batch_terminal_authority_creates_correction_generation_only_for_failed_
     assert rerun.outcome == "created"
     assert rerun.generation == 2
     assert len(store.list_rows("business_triggers")) == 2
+    assert [
+        row["effect_kind"]
+        for row in store.list_rows("rca_delivery_subscriptions")
+        if row["generation"] == 2
+    ] == ["feishu_issue_comment"]
+    assert [
+        row
+        for row in store.list_rows("rca_learning_lane_admissions")
+        if row["generation"] == 2
+    ] == []
+    assert [
+        row
+        for row in store.list_rows("rca_trigger_delivery_bindings")
+        if row["source_id"] == rerun.source_id
+    ]
     [audit] = [
         row
         for row in store.list_rows("rca_shadow_promotion_audit")

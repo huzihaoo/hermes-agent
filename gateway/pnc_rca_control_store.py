@@ -15246,7 +15246,14 @@ class RcaControlStore:
                 )
                 learning_lane = (
                     False
-                    if normalized_user_rerun is not None
+                    if any(
+                        authority is not None
+                        for authority in (
+                            normalized_user_rerun,
+                            normalized_silent_rerun,
+                            normalized_batch_rerun,
+                        )
+                    )
                     else self._ensure_learning_lane_admission_tx(
                         conn,
                         admission=replay_admission_for_lane,
@@ -15990,7 +15997,14 @@ class RcaControlStore:
             )
             learning_lane = (
                 False
-                if normalized_user_rerun is not None
+                if any(
+                    authority is not None
+                    for authority in (
+                        normalized_user_rerun,
+                        normalized_silent_rerun,
+                        normalized_batch_rerun,
+                    )
+                )
                 else self._ensure_learning_lane_admission_tx(
                     conn, admission=admission, current=current
                 )
