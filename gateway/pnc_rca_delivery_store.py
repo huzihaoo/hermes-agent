@@ -22,6 +22,8 @@ from gateway.pnc_rca_delivery_contract import (
     RCA_RESULT_FIELD_KEY,
     TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
     TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
+    TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY,
+    TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY,
     TERMINAL_DELIVERY_OUTCOMES,
     DeliveryContractError,
     VerifiedDelivery,
@@ -173,6 +175,8 @@ _TERMINAL_EFFECT_SCHEMA_VERSIONS = frozenset({
     "pnc_rca_terminal_delivery_effect_v1",
     "pnc_rca_terminal_delivery_effect_v2",
     "pnc_rca_terminal_delivery_effect_v3",
+    "pnc_rca_terminal_delivery_effect_v4",
+    "pnc_rca_terminal_delivery_effect_v5",
 })
 _LEARNING_ADJUDICATION_SCHEMAS = frozenset({
     "pnc_rca_conclusion_adjudication_effect_v1",
@@ -3476,7 +3480,9 @@ class RcaDeliveryStore:
                         AND json_extract(NEW.payload_json, '$.schema_version') IN (
                             'pnc_rca_terminal_delivery_effect_v1',
                             'pnc_rca_terminal_delivery_effect_v2',
-                            'pnc_rca_terminal_delivery_effect_v3'
+                            'pnc_rca_terminal_delivery_effect_v3',
+                            'pnc_rca_terminal_delivery_effect_v4',
+                            'pnc_rca_terminal_delivery_effect_v5'
                         )
                         AND json_extract(NEW.payload_json, '$.delivery_id') =
                             NEW.delivery_id
@@ -5033,6 +5039,7 @@ class RcaDeliveryStore:
                 if source_error_code in OUTBOX_PUBLIC_PROFILE_ERROR_CODES
                 else ""
             ),
+            schema_version=TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY,
         )
         if w3_binding is not None:
             delivery.contract["w3_execution_snapshot"] = w3_binding
@@ -7154,9 +7161,9 @@ class RcaDeliveryStore:
             error_code=error_code,
             terminal_fallback=terminal_fallback,
             schema_version=(
-                TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION
+                TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY
                 if terminal_fallback is not None
-                else TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION
+                else TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY
             ),
         )
         # Preserve the immutable W3/W5 lineage on terminal effects as well as

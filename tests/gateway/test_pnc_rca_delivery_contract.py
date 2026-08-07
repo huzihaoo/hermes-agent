@@ -16,8 +16,10 @@ from gateway.pnc_rca_delivery_contract import (
     DELIVERY_THREAD_EFFECT_KIND,
     TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
     TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1,
+    TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY,
     TERMINAL_FALLBACK_CONTRACT_SCHEMA_VERSION,
     TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
+    TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY,
     DeliveryContractError,
     MAX_DELIVERY_ARTIFACT_BYTES,
     MAX_DELIVERY_ARTIFACTS,
@@ -35,6 +37,14 @@ from gateway.pnc_rca_delivery_contract import (
     render_public_rca_result,
     rerun_prompt_line,
     verify_delivery_bundle,
+)
+from gateway.pnc_rca_issue_focus import (
+    ANALYSIS_CAPABILITY_UNSUPPORTED,
+    ANALYSIS_COMPLETE,
+    ANALYSIS_INSUFFICIENT_STATEMENT,
+    ISSUE_FOCUS_EVIDENCE_SCHEMA_VERSION,
+    issue_title_sha256,
+    resolve_issue_intent,
 )
 from scripts.pnc_foxglove_delivery import (
     canonical_viz_mcap_cifs_path,
@@ -371,8 +381,19 @@ def test_delivery_projects_consumer_capability_into_field_and_comment():
     )
     assert (
         verified.effect_payload["field_updates"][0]["field_value"]
-        == verified.conclusion
+        == verified.effect_payload["result_field_value"]
     )
+    assert verified.effect_payload["schema_version"] == (
+        delivery_contract_module.DELIVERY_EFFECT_SCHEMA_VERSION
+    )
+    assert verified.effect_payload["result_field_value"].splitlines() == [
+        (
+            "归因结论：减速度请求偏重；减速度请求与目标状态不匹配；"
+            f"{MEDIUM_TIER_DISCLAIMER}。"
+        ),
+        "责任模块：ACC 功能链",
+    ]
+    assert verified.effect_payload["result_field_value"] != verified.conclusion
     assert verified.effect_payload["terminal_class"] == "candidate_hypothesis"
     assert verified.effect_payload["requires_human_review"] is True
 
@@ -864,6 +885,66 @@ def test_public_projection_prefers_specific_causal_evidence_and_four_lines():
     ]
 
 
+def test_result_field_projection_is_two_lines_and_deduplicates_causal_evidence():
+    contract = {
+        "summary": {"short_conclusion": "自车加速源于纵向请求持续抬升。"},
+        "report": {"candidate_owner_domain": "CONTROL_LONGITUDINAL"},
+        "public_result": {
+            "summary": {"short_conclusion": "自车加速源于纵向请求持续抬升。"},
+            "responsibility": {"candidate": "CONTROL_LONGITUDINAL"},
+            "causal_chain": {
+                "narrative": [
+                    {
+                        "role": "因果判断",
+                        "text": (
+                            "纵向请求持续抬升，因此自车加速源于纵向请求持续抬升。"
+                        ),
+                    },
+                    {"role": "证据", "text": "纵向请求持续抬升。"},
+                ]
+            },
+            "evidence_summary": {
+                "refs": [{"summary": "纵向请求持续抬升。"}]
+            },
+        },
+    }
+
+    rendered = delivery_contract_module.render_public_rca_result_field(
+        contract,
+        terminal_class="candidate_hypothesis",
+    )
+
+    assert rendered.splitlines() == [
+        (
+            "归因结论：纵向请求持续抬升，因此自车加速源于纵向请求持续抬升；"
+            f"{MEDIUM_TIER_DISCLAIMER}。"
+        ),
+        "责任模块：纵向控制",
+    ]
+    assert rendered.count("纵向请求持续抬升，因此") == 1
+
+
+def test_result_field_projection_abstention_is_exactly_two_lines():
+    contract = {
+        "summary": {
+            "short_conclusion": (
+                "生产数据已读取，但问题单未提供可核验的现象描述，不能自动归因。"
+            )
+        }
+    }
+
+    rendered = delivery_contract_module.render_public_rca_result_field(
+        contract,
+        terminal_class="honest_non_attribution",
+    )
+
+    assert len(rendered.splitlines()) == 2
+    assert rendered.splitlines()[0].startswith("归因结论：")
+    assert rendered.splitlines()[1] == "责任模块：暂无法判断"
+    assert "因果关系：" not in rendered
+    assert "关键证据：" not in rendered
+
+
 def test_delivery_rejects_false_applied_consumer_capability():
     admission, contract, manifest, observed, dependencies = _bundle()
     capability = _consumer_capability()
@@ -1034,6 +1115,246 @@ def _verify(bundle):
     )
 
 
+def _focus_refs():
+    return ["report_data.json#/issue_focus"]
+
+
+def _focus_payload(title: str, *, status: str = ANALYSIS_COMPLETE):
+    intent = resolve_issue_intent(title)
+    if status == ANALYSIS_COMPLETE:
+        capabilities = [
+            {
+                "key": key,
+                "status": "available",
+                "provider": "g1q3_rca_worker",
+                "version": "focus-test-v1",
+                "evidence_refs": _focus_refs(),
+            }
+            for key in intent.required_capabilities
+        ]
+        segments = [
+            {
+                "role": key,
+                "start_ts": 1.0,
+                "end_ts": 2.0,
+                "evidence_refs": _focus_refs(),
+            }
+            for key in intent.required_segments
+        ]
+        entities = [
+            {
+                "role": key,
+                "target_id": str(index + 1),
+                "object_class": "vru" if key == "vru_target" else "vehicle",
+                "speed_summary": "1.0s-2.0s: 8.0 -> 2.0 m/s",
+                "distance_summary": "1.0s-2.0s: 18.0 -> 5.0 m",
+                "evidence_refs": _focus_refs(),
+            }
+            for index, key in enumerate(intent.required_entities)
+        ]
+        measurements = [
+            {
+                "key": key,
+                "unit": "m/s",
+                "summary": "已复算。",
+                "evidence_refs": _focus_refs(),
+            }
+            for key in intent.required_measurements
+        ]
+        checks = [
+            {
+                "key": key,
+                "status": "supported",
+                "summary": "已闭环。",
+                "evidence_refs": _focus_refs(),
+            }
+            for key in intent.required_checks
+        ]
+        calculations = [
+            {
+                "key": key,
+                "formula": "a_lat = v^2 * kappa",
+                "unit": "m/s^2",
+                "summary": "已复算。",
+                "evidence_refs": _focus_refs(),
+            }
+            for key in intent.required_calculations
+        ]
+        missing = []
+        unsupported = []
+        stop_reason = ""
+    elif status == ANALYSIS_CAPABILITY_UNSUPPORTED:
+        capabilities = segments = entities = measurements = checks = calculations = []
+        unsupported = [intent.required_capabilities[0]]
+        missing = [f"capability:{unsupported[0]}"]
+        stop_reason = "该焦点能力未接入。"
+    else:
+        capabilities = segments = entities = measurements = checks = calculations = []
+        missing = ["statement:problem_statement"]
+        unsupported = []
+        stop_reason = "问题陈述不足。"
+    return {
+        "schema_version": ISSUE_FOCUS_EVIDENCE_SCHEMA_VERSION,
+        "issue_intent": intent.to_dict(),
+        "title_sha256": issue_title_sha256(title),
+        "analysis_status": status,
+        "capabilities": capabilities,
+        "segments": segments,
+        "entities": entities,
+        "measurements": measurements,
+        "checks": checks,
+        "calculations": calculations,
+        "missing_requirements": missing,
+        "unsupported_capabilities": unsupported,
+        "stop_reason": stop_reason,
+    }
+
+
+def test_focus_bound_v2_delivery_carries_title_and_validation_into_effect():
+    title = "ACC-前车切入，跟停前前车，自车加速后刹停"
+    admission, contract, manifest, observed, dependencies = _bundle()
+    contract["schema_version"] = delivery_contract_module.DELIVERY_CONTRACT_SCHEMA_VERSION
+    contract["issue_focus"] = _focus_payload(title)
+    _add_structural_candidate(contract)
+
+    delivery = verify_delivery_bundle(
+        admission=admission,
+        delivery_contract=contract,
+        delivery_manifest=manifest,
+        observed_files=observed,
+        html_dependencies=dependencies,
+        issue_title=title,
+        report_issue_focus=contract["issue_focus"],
+    )
+
+    assert delivery.effect_payload["issue_title"] == title
+    assert delivery.effect_payload["issue_focus_validation"]["analysis_status"] == (
+        ANALYSIS_COMPLETE
+    )
+    assert delivery.effect_payload["issue_focus_sha256"]
+
+
+def test_focus_bound_v2_missing_focus_is_rejected_before_publication():
+    title = "ACC-前车切入，跟停前前车，自车加速后刹停"
+    admission, contract, manifest, observed, dependencies = _bundle()
+    contract["schema_version"] = delivery_contract_module.DELIVERY_CONTRACT_SCHEMA_VERSION
+
+    with pytest.raises(DeliveryContractError) as raised:
+        verify_delivery_bundle(
+            admission=admission,
+            delivery_contract=contract,
+            delivery_manifest=manifest,
+            observed_files=observed,
+            html_dependencies=dependencies,
+            issue_title=title,
+        )
+
+    assert raised.value.code == "issue_focus_evidence_missing"
+
+
+def test_bound_v1_without_focus_cannot_publish_generic_candidate():
+    title = "ACC-前车切入，跟停前前车，自车加速后刹停"
+    admission, contract, manifest, observed, dependencies = _bundle()
+    _add_structural_candidate(contract)
+
+    with pytest.raises(DeliveryContractError) as raised:
+        verify_delivery_bundle(
+            admission=admission,
+            delivery_contract=contract,
+            delivery_manifest=manifest,
+            observed_files=observed,
+            html_dependencies=dependencies,
+            issue_title=title,
+        )
+
+    assert raised.value.code == "issue_focus_evidence_missing"
+
+
+def test_focus_bound_v2_requires_manifest_read_report_binding():
+    title = "ACC-前方仪表无目标，制动"
+    admission, contract, manifest, observed, dependencies = _bundle()
+    contract["schema_version"] = delivery_contract_module.DELIVERY_CONTRACT_SCHEMA_VERSION
+    contract["issue_focus"] = _focus_payload(title)
+
+    with pytest.raises(DeliveryContractError) as missing:
+        verify_delivery_bundle(
+            admission=admission,
+            delivery_contract=contract,
+            delivery_manifest=manifest,
+            observed_files=observed,
+            html_dependencies=dependencies,
+            issue_title=title,
+        )
+    assert missing.value.code == "issue_focus_report_binding_missing"
+
+    report_focus = json.loads(json.dumps(contract["issue_focus"], ensure_ascii=False))
+    report_focus["stop_reason"] = "tampered"
+    with pytest.raises(DeliveryContractError) as mismatch:
+        verify_delivery_bundle(
+            admission=admission,
+            delivery_contract=contract,
+            delivery_manifest=manifest,
+            observed_files=observed,
+            html_dependencies=dependencies,
+            issue_title=title,
+            report_issue_focus=report_focus,
+        )
+    assert mismatch.value.code == "issue_focus_report_binding_mismatch"
+
+
+def test_focus_capability_stop_cannot_be_promoted_by_generic_candidate():
+    title = "AEB-AEB触发仪表无双闪"
+    admission, contract, manifest, observed, dependencies = _bundle()
+    contract["schema_version"] = delivery_contract_module.DELIVERY_CONTRACT_SCHEMA_VERSION
+    contract["issue_focus"] = _focus_payload(
+        title,
+        status=ANALYSIS_CAPABILITY_UNSUPPORTED,
+    )
+    _add_structural_candidate(contract)
+
+    delivery = verify_delivery_bundle(
+        admission=admission,
+        delivery_contract=contract,
+        delivery_manifest=manifest,
+        observed_files=observed,
+        html_dependencies=dependencies,
+        issue_title=title,
+        report_issue_focus=contract["issue_focus"],
+    )
+
+    assert delivery.effect_payload["terminal_class"] == "honest_non_attribution"
+    assert delivery.conclusion.splitlines() == [
+        "本单未能定向",
+        "问题焦点所需能力未接入，未输出责任归因。",
+    ]
+    assert delivery.effect_payload["result_field_value"].splitlines()[1] == (
+        "责任模块：暂无法判断"
+    )
+
+
+def test_focus_insufficient_statement_is_explicit_stop():
+    title = "HMI-S弯"
+    admission, contract, manifest, observed, dependencies = _bundle()
+    contract["schema_version"] = delivery_contract_module.DELIVERY_CONTRACT_SCHEMA_VERSION
+    contract["issue_focus"] = _focus_payload(
+        title,
+        status=ANALYSIS_INSUFFICIENT_STATEMENT,
+    )
+    _add_structural_candidate(contract)
+
+    delivery = verify_delivery_bundle(
+        admission=admission,
+        delivery_contract=contract,
+        delivery_manifest=manifest,
+        observed_files=observed,
+        html_dependencies=dependencies,
+        issue_title=title,
+        report_issue_focus=contract["issue_focus"],
+    )
+
+    assert delivery.conclusion == "本单未能定向\n问题陈述不足，未输出责任归因。"
+
+
 def test_valid_sealed_evidence_and_published_viz_build_issue_effect():
     delivery = _verify(_bundle())
 
@@ -1043,10 +1364,13 @@ def test_valid_sealed_evidence_and_published_viz_build_issue_effect():
     assert delivery.effect_payload["marker"] == delivery.marker
     assert delivery.marker in delivery.effect_payload["comment_content"]
     assert delivery.effect_key in delivery.marker
+    result_field_value = delivery.effect_payload["result_field_value"]
+    assert result_field_value.splitlines()[0].startswith("归因结论：")
+    assert result_field_value.splitlines()[1] == "责任模块：暂无法判断"
     assert delivery.effect_payload["field_updates"] == [
         {
             "field_key": "field_9193cb",
-            "field_value": delivery.conclusion,
+            "field_value": result_field_value,
         },
         {
             "field_key": "field_8c912e",
@@ -1249,6 +1573,48 @@ def test_thread_reply_effect_is_bound_to_exact_topic_and_is_deterministic():
         '<at user_id="ou_requester789"></at>'
         in payload["message_content"]
     )
+
+
+def test_focus_bound_thread_reply_preserves_issue_focus_binding():
+    title = "ACC-前车切入，跟停前前车，自车加速后刹停"
+    admission, contract, manifest, observed, dependencies = _bundle()
+    contract["schema_version"] = delivery_contract_module.DELIVERY_CONTRACT_SCHEMA_VERSION
+    contract["issue_focus"] = _focus_payload(title)
+    _add_structural_candidate(contract)
+    delivery = verify_delivery_bundle(
+        admission=admission,
+        delivery_contract=contract,
+        delivery_manifest=manifest,
+        observed_files=observed,
+        html_dependencies=dependencies,
+        issue_title=title,
+        report_issue_focus=contract["issue_focus"],
+    )
+    target = {
+        "schema_version": "pnc_rca_delivery_target_v1",
+        "platform": "feishu",
+        "chat_id": "oc_123456",
+        "thread_id": "topic:om_root123",
+        "reply_anchor_message_id": "om_root123",
+        "source_message_id": "om_trigger456",
+        "requester_id": "ou_requester789",
+        "reply_in_thread": True,
+        "output_cap": "L1",
+    }
+
+    _effect_key, _semantic_sha, payload = build_thread_reply_effect(
+        issue_effect_payload=delivery.effect_payload,
+        target_key="feishu_thread:oc_123456:om_root123",
+        target=target,
+    )
+
+    assert payload["issue_title"] == title
+    assert payload["issue_focus_sha256"] == delivery.effect_payload[
+        "issue_focus_sha256"
+    ]
+    assert payload["issue_focus_validation"] == delivery.effect_payload[
+        "issue_focus_validation"
+    ]
 
 
 def test_thread_reply_effect_refuses_target_or_topic_fallback_drift():
@@ -1455,6 +1821,14 @@ def test_large_conclusion_is_utf8_bounded_while_report_links_are_preserved():
     assert delivery.conclusion.splitlines()[0] == "建议责任方：纵向控制"
     assert delivery.conclusion.splitlines()[1] == MEDIUM_TIER_DISCLAIMER
     assert any(line.endswith("...") for line in delivery.conclusion.splitlines())
+    result_field_value = delivery.effect_payload["result_field_value"]
+    assert len(result_field_value.encode("utf-8")) <= (
+        delivery_contract_module.MAX_CONCLUSION_BYTES
+    )
+    assert len(result_field_value.splitlines()) == 2
+    assert result_field_value.splitlines()[0].startswith("归因结论：")
+    assert result_field_value.splitlines()[1] == "责任模块：ACC 功能链"
+    assert MEDIUM_TIER_DISCLAIMER in result_field_value.splitlines()[0]
     assert {item.role for item in delivery.artifacts} == {
         "index_html",
         "report_data",
@@ -1820,6 +2194,42 @@ def test_terminal_v2_result_and_preserve_policy_are_bound_to_generation():
     ]
     assert second.contract["generation"] == 2
     assert second.contract["report_field_write_policy"] == "preserve_existing"
+
+
+def test_comment_only_terminal_v4_preserves_historical_v2_field_semantics():
+    historical = _terminal_delivery()
+    current = _terminal_delivery(
+        schema_version=TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY
+    )
+
+    assert historical.effect_payload["schema_version"] == (
+        TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION
+    )
+    assert historical.effect_payload["field_updates"]
+    assert current.effect_payload["schema_version"] == (
+        TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY
+    )
+    assert current.effect_payload["field_updates"] == []
+    assert current.effect_payload["comment_content"]
+
+
+def test_comment_only_terminal_v5_preserves_historical_v3_field_semantics():
+    historical = _terminal_delivery(
+        error_code="service_pipeline_runner_failed",
+        terminal_fallback=_terminal_fallback(),
+        schema_version=TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
+    )
+    current = _terminal_delivery(
+        error_code="service_pipeline_runner_failed",
+        terminal_fallback=_terminal_fallback(),
+        schema_version=TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY,
+    )
+
+    assert historical.effect_payload["field_updates"]
+    assert current.effect_payload["field_updates"] == []
+    assert current.effect_payload["schema_version"] == (
+        TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY
+    )
 
 
 def _terminal_fallback(*, elapsed_seconds=1800):

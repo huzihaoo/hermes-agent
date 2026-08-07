@@ -182,7 +182,8 @@ def has_rca_delivery_provenance(task_card: Mapping[str, Any] | None) -> bool:
     return bool(
         delivery.get("rca_status")
         or delivery.get("foxglove_url")
-        or contract.get("schema_version") == "g1q3_delivery_contract_v1"
+        or contract.get("schema_version")
+        in {"g1q3_delivery_contract_v1", "g1q3_delivery_contract_v2"}
         or str(card.get("business_line") or "").strip().lower()
         in {"g1q3_rca", "g1q3-rca"}
         or str(delivery.get("business_line") or "").strip().lower()

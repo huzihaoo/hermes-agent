@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -34,7 +34,7 @@ from gateway.pnc_rca_gray_samples import (  # noqa: E402
     C_TOPIC_TEXT,
     GRAY_SAMPLE_AUTOMATION_AUTHORITY_SCHEMA_VERSION,
     GRAY_SAMPLE_CONTRACTS,
-    GRAY_SAMPLE_DAILY_LIMIT,
+    GRAY_SAMPLE_DAILY_STARTED_ATTEMPT_QUOTA,
     GRAY_SAMPLE_REQUESTER_ID,
     build_gray_sample_message_id,
     build_gray_sample_reason,
@@ -48,7 +48,7 @@ from gateway.pnc_rca_gray_samples import (  # noqa: E402
 
 
 RECEIPT_SCHEMA_VERSION = "pnc_rca_gray_sample_admission_receipt_v1"
-STATUS_SCHEMA_VERSION = "pnc_rca_gray_sample_status_v1"
+STATUS_SCHEMA_VERSION = "pnc_rca_gray_sample_status_v2"
 MAX_FIXTURE_BYTES = 256 * 1024
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _OPEN_ID_RE = re.compile(r"^ou_[A-Za-z0-9_-]{3,200}$")
@@ -249,7 +249,7 @@ def _runtime_identity() -> tuple[str, str]:
 
 def _selected_samples(values: Sequence[str]) -> list[str]:
     selected = [str(value or "").strip().upper() for value in values]
-    if not selected or len(selected) > GRAY_SAMPLE_DAILY_LIMIT:
+    if not selected:
         raise GraySampleInitiatorError("gray_sample_selection_count_invalid")
     if len(set(selected)) != len(selected) or any(
         sample_id not in GRAY_SAMPLE_CONTRACTS for sample_id in selected
@@ -309,40 +309,6 @@ def _business_counts(db_path: Path) -> dict[str, int]:
                 conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             )
         return counts
-    finally:
-        conn.close()
-
-
-def _daily_started_count(db_path: Path, *, now: datetime) -> int:
-    day_start = _now(now).replace(hour=0, minute=0, second=0, microsecond=0)
-    day_end = day_start + timedelta(days=1)
-    conn = sqlite3.connect(db_path, timeout=10)
-    try:
-        return int(
-            conn.execute(
-                """
-                SELECT COUNT(*) FROM rca_trigger_sources
-                 WHERE source_kind='feishu_group_manual' AND platform='operator'
-                   AND requester_id=? AND mode='rerun'
-                   AND created_at >= ? AND created_at < ?
-                """,
-                (GRAY_SAMPLE_REQUESTER_ID, day_start.isoformat(), day_end.isoformat()),
-            ).fetchone()[0]
-        )
-    finally:
-        conn.close()
-
-
-def _source_exists(db_path: Path, *, message_id: str) -> bool:
-    conn = sqlite3.connect(db_path, timeout=10)
-    try:
-        return (
-            conn.execute(
-                "SELECT 1 FROM rca_trigger_sources WHERE source_dedupe_key=?",
-                (f"operator:{message_id}",),
-            ).fetchone()
-            is not None
-        )
     finally:
         conn.close()
 
@@ -555,7 +521,7 @@ def _write_status(
         },
         "lane": "production",
         "activation_required": True,
-        "daily_started_attempt_quota": GRAY_SAMPLE_DAILY_LIMIT,
+        "daily_started_attempt_quota": GRAY_SAMPLE_DAILY_STARTED_ATTEMPT_QUOTA,
         "summary": {"admitted": admitted, "total": len(items)},
         "items": items,
     }
@@ -614,19 +580,6 @@ def run(args: argparse.Namespace, *, now: datetime | None = None) -> dict[str, A
         )
         for sample_id in selected
     }
-    new_count = sum(
-        not _source_exists(
-            control_db,
-            message_id=build_gray_sample_message_id(authorities[sample_id]),
-        )
-        for sample_id in selected
-    )
-    if (
-        _daily_started_count(control_db, now=current) + new_count
-        > GRAY_SAMPLE_DAILY_LIMIT
-    ):
-        raise GraySampleInitiatorError("gray_sample_daily_rate_limited")
-
     results: list[dict[str, Any]] = []
     for sample_id in selected:
         receipt_path = receipt_dir / f"{sample_id}.json"

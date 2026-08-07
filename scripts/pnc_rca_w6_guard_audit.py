@@ -31,6 +31,8 @@ TERMINAL_EFFECT_SCHEMA_VERSIONS = frozenset({
     "pnc_rca_terminal_delivery_effect_v1",
     "pnc_rca_terminal_delivery_effect_v2",
     "pnc_rca_terminal_delivery_effect_v3",
+    "pnc_rca_terminal_delivery_effect_v4",
+    "pnc_rca_terminal_delivery_effect_v5",
 })
 _OPEN_ID_RE = re.compile(r"^ou_[0-9a-f]{32}$")
 _MAX_EVIDENCE_ROWS = 20

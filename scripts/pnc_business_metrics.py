@@ -90,9 +90,12 @@ _DELIVERY_EFFECT_SCHEMA_VERSIONS = frozenset({
     "pnc_rca_delivery_effect_v1",
     "pnc_rca_delivery_effect_v2",
     "pnc_rca_delivery_effect_v3",
+    "pnc_rca_delivery_effect_v4",
     "pnc_rca_terminal_delivery_effect_v1",
     "pnc_rca_terminal_delivery_effect_v2",
     "pnc_rca_terminal_delivery_effect_v3",
+    "pnc_rca_terminal_delivery_effect_v4",
+    "pnc_rca_terminal_delivery_effect_v5",
 })
 _ADJUDICATION_EFFECT_SCHEMA_VERSIONS = frozenset({
     "pnc_rca_conclusion_adjudication_effect_v1",

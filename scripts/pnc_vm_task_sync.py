@@ -405,7 +405,10 @@ def _pipeline_result_for_delivery_contract(contract: dict[str, Any], payload_or_
     return _read_vm_json_file(task_root_vm + "/pipeline_result.json") if task_root_vm else {}
 
 def _contract_is_report_ready(contract: dict[str, Any], *, work_item_id: str) -> bool:
-    if str(contract.get("schema_version") or "") != "g1q3_delivery_contract_v1":
+    if str(contract.get("schema_version") or "") not in {
+        "g1q3_delivery_contract_v1",
+        "g1q3_delivery_contract_v2",
+    }:
         return False
     if work_item_id and str(contract.get("work_item_id") or "").strip() != work_item_id:
         return False
@@ -1227,14 +1230,17 @@ def _feishu_report_attachment_link(*, work_item_id: str, vm_task_id: str, index_
 
 
 def _delivery_from_contract(task: Task, payload_or_contract: dict[str, Any]) -> dict[str, Any]:
-    """Map VM-produced g1q3_delivery_contract_v1 into task_card.delivery.
+    """Map a VM-produced G1Q3 delivery contract into task_card.delivery.
 
     This is the preferred producer/consumer path for G1Q3 RCA delivery.  It
     keeps vm-task-sync aligned with the relay and prevents the 120s sync writer
     from reasserting stale generic completed/need_download states.
     """
     contract = payload_or_contract.get("delivery_contract") if isinstance(payload_or_contract.get("delivery_contract"), dict) else payload_or_contract
-    if not isinstance(contract, dict) or str(contract.get("schema_version") or "").strip() != "g1q3_delivery_contract_v1":
+    if not isinstance(contract, dict) or str(contract.get("schema_version") or "").strip() not in {
+        "g1q3_delivery_contract_v1",
+        "g1q3_delivery_contract_v2",
+    }:
         return {}
     report = contract.get("report") if isinstance(contract.get("report"), dict) else {}
     artifacts = contract.get("artifacts") if isinstance(contract.get("artifacts"), dict) else {}

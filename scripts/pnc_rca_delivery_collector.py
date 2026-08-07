@@ -1674,6 +1674,7 @@ def _remote_bundle_script(submission_key: str) -> str:
                 'delivery_manifest': manifest,
                 'observed_files': observed,
                 'html_dependencies': dependencies,
+                'report_issue_focus': report_data.get('issue_focus'),
                 'gate_a_source': {{
                     'input_materialized': report_data.get('input_materialized'),
                     # The sealed report artifact was read through the
@@ -2000,6 +2001,28 @@ def _submission_admission(
     ):
         raise DeliveryContractError("submission_receipt_identity_mismatch")
     return admission
+
+
+def _submission_issue_title(
+    claim: ExecutionWatchClaim,
+    snapshot_bundle: AdmissionSnapshotExecutionBundle | None = None,
+) -> str:
+    """Return the immutable ticket title from the already-bound submission."""
+
+    try:
+        if snapshot_bundle is not None:
+            _admission, context = snapshot_execution_inputs(
+                validate_snapshot_execution_bundle(snapshot_bundle)
+            )
+        else:
+            payload = claim.submission_payload
+            context = validate_rca_trigger_context(payload.get("trigger_context") or {})
+    except Exception as exc:
+        raise DeliveryContractError("submission_issue_title_invalid") from exc
+    title = str(context.title or "").strip()
+    if not title:
+        raise DeliveryContractError("submission_issue_title_missing")
+    return title
 
 
 def _validate_w3_task_status(
@@ -2796,6 +2819,7 @@ class DeliveryCollector:
         status: dict[str, Any] = {}
         snapshot_bundle: AdmissionSnapshotExecutionBundle | None = None
         admission = None
+        issue_title = ""
         if self.config.w3_snapshot_read_mode == "snapshot_required":
             try:
                 snapshot_bundle = self._control_store().read_w3_execution_snapshot(
@@ -2809,6 +2833,7 @@ class DeliveryCollector:
                 ):
                     raise RecordConflictError("w3_execution_snapshot_missing")
                 admission = _submission_admission(claim, snapshot_bundle)
+                issue_title = _submission_issue_title(claim, snapshot_bundle)
             except Exception as exc:
                 code = (
                     exc.code
@@ -2839,6 +2864,7 @@ class DeliveryCollector:
         if admission is None:
             try:
                 admission = _submission_admission(claim)
+                issue_title = _submission_issue_title(claim)
             except Exception as exc:
                 deadline_outcome = self._deadline_outcome(
                     claim,
@@ -3043,6 +3069,8 @@ class DeliveryCollector:
                 observed_files=bundle.get("observed_files") or [],
                 html_dependencies=bundle.get("html_dependencies") or [],
                 w3_execution_binding=w3_binding,
+                issue_title=issue_title,
+                report_issue_focus=bundle.get("report_issue_focus"),
             )
         except ArtifactBundleReadError as exc:
             deadline_outcome = self._deadline_outcome(

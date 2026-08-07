@@ -1167,7 +1167,10 @@ def _latest_governance_report_contract(task_id: str, body: dict[str, Any], meta:
         if not artifact_root.startswith("/mnt/tmp/"):
             continue
         contract = _read_vm_json_file(artifact_root + "delivery_contract.json")
-        if not contract or str(contract.get("schema_version") or "") != "g1q3_delivery_contract_v1":
+        if not contract or str(contract.get("schema_version") or "") not in {
+            "g1q3_delivery_contract_v1",
+            "g1q3_delivery_contract_v2",
+        }:
             continue
         report = contract.get("report") if isinstance(contract.get("report"), dict) else {}
         if str(contract.get("work_item_id") or "").strip() != work_item_id:
@@ -1244,7 +1247,7 @@ def _shared_result_report_ready(task_id: str) -> dict[str, Any]:
 
 
 def _load_g1q3_delivery_contract(task_id: str, body: dict[str, Any] | None = None, artifact_root: str = "") -> dict[str, Any]:
-    """Load explicit G1Q3 delivery_contract v1 from body/card/artifact root."""
+    """Load an explicit G1Q3 delivery contract from body/card/artifact root."""
     candidates: list[Any] = []
     if isinstance(body, dict):
         candidates.append(body.get("delivery_contract"))
@@ -1255,16 +1258,22 @@ def _load_g1q3_delivery_contract(task_id: str, body: dict[str, Any] | None = Non
         delivery = task_card.get("delivery") if isinstance(task_card.get("delivery"), dict) else {}
         candidates.append(delivery.get("delivery_contract"))
     for item in candidates:
-        if isinstance(item, dict) and str(item.get("schema_version") or "").strip() == "g1q3_delivery_contract_v1":
+        if isinstance(item, dict) and str(item.get("schema_version") or "").strip() in {
+            "g1q3_delivery_contract_v1",
+            "g1q3_delivery_contract_v2",
+        }:
             return item
     data = _load_artifact_json(artifact_root, "delivery_contract.json", "g1q3_delivery_contract.json") if artifact_root else {}
-    if isinstance(data, dict) and str(data.get("schema_version") or "").strip() == "g1q3_delivery_contract_v1":
+    if isinstance(data, dict) and str(data.get("schema_version") or "").strip() in {
+        "g1q3_delivery_contract_v1",
+        "g1q3_delivery_contract_v2",
+    }:
         return data
     return {}
 
 
 def _g1q3_contract_report_ready_truth(contract: dict[str, Any]) -> dict[str, Any]:
-    """Map explicit delivery_contract v1 to relay report-ready truth."""
+    """Map an explicit delivery contract to relay report-ready truth."""
     if not isinstance(contract, dict):
         return {}
     report = contract.get("report") if isinstance(contract.get("report"), dict) else {}

@@ -871,7 +871,13 @@ def test_release_preflight_rejects_only_unresolved_incompatible_effects(
             {"schema_version": "pnc_rca_delivery_effect_v2"},
         ),
         (
-            "current-v3",
+            "legacy-v3",
+            "success",
+            "pending",
+            {"schema_version": gate.DELIVERY_EFFECT_SCHEMA_VERSION_V3},
+        ),
+        (
+            "current-v4",
             "success",
             "claimed",
             {"schema_version": gate.DELIVERY_EFFECT_SCHEMA_VERSION},
@@ -910,7 +916,7 @@ def test_release_preflight_rejects_only_unresolved_incompatible_effects(
         control_db_path=db_path,
     )
 
-    assert evidence["unresolved_effect_count"] == 5
+    assert evidence["unresolved_effect_count"] == 6
     assert evidence["incompatible_effect_count"] == 1
     assert evidence["incompatible_effect_keys"] == ["legacy-v2"]
     assert {item["code"] for item in errors} == {
@@ -927,7 +933,7 @@ def test_release_preflight_rejects_only_unresolved_incompatible_effects(
         hermes_home=tmp_path,
         control_db_path=db_path,
     )
-    assert evidence["unresolved_effect_count"] == 4
+    assert evidence["unresolved_effect_count"] == 5
     assert evidence["incompatible_effect_count"] == 0
     assert errors == []
 

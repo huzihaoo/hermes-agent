@@ -33,6 +33,17 @@ from gateway.pnc_rca_quality_oracle import (
     public_tier_from_rendered_text,
     require_publishable,
 )
+from gateway.pnc_rca_issue_focus import (
+    ANALYSIS_CAPABILITY_UNSUPPORTED,
+    ANALYSIS_COMPLETE,
+    ANALYSIS_EVIDENCE_CONFLICT,
+    ANALYSIS_EVIDENCE_INCOMPLETE,
+    ANALYSIS_INSUFFICIENT_STATEMENT,
+    IssueFocusContractError,
+    IssueFocusValidation,
+    normalized_issue_title,
+    validate_issue_focus_evidence,
+)
 from scripts.pnc_foxglove_delivery import (
     canonical_publication_origin,
     canonical_viz_mcap_cifs_path,
@@ -42,14 +53,33 @@ from scripts.pnc_foxglove_delivery import (
 )
 
 
-DELIVERY_CONTRACT_SCHEMA_VERSION = "g1q3_delivery_contract_v1"
+DELIVERY_CONTRACT_SCHEMA_VERSION_V1 = "g1q3_delivery_contract_v1"
+# v2 binds a sealed delivery to the immutable issue title and its focus-evidence
+# contract.  v1 remains readable for historical artifacts and legacy adapters.
+DELIVERY_CONTRACT_SCHEMA_VERSION = "g1q3_delivery_contract_v2"
+DELIVERY_CONTRACT_SCHEMA_VERSIONS = frozenset({
+    DELIVERY_CONTRACT_SCHEMA_VERSION_V1,
+    DELIVERY_CONTRACT_SCHEMA_VERSION,
+})
 DELIVERY_MANIFEST_SCHEMA_VERSION = "delivery_manifest_v2"
 DELIVERY_EFFECT_SCHEMA_VERSION_V1 = "pnc_rca_delivery_effect_v1"
 DELIVERY_EFFECT_SCHEMA_VERSION_V2 = "pnc_rca_delivery_effect_v2"
-DELIVERY_EFFECT_SCHEMA_VERSION = "pnc_rca_delivery_effect_v3"
+DELIVERY_EFFECT_SCHEMA_VERSION_V3 = "pnc_rca_delivery_effect_v3"
+# v4 separates the Feishu field projection from the issue-comment body.  The
+# old v3 payload remains a first-class read/dispatch format so an already
+# sealed effect is never reinterpreted under the new projection contract.
+DELIVERY_EFFECT_SCHEMA_VERSION = "pnc_rca_delivery_effect_v4"
 TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1 = "pnc_rca_terminal_delivery_effect_v1"
 TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION = "pnc_rca_terminal_delivery_effect_v2"
 TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION = "pnc_rca_terminal_delivery_effect_v3"
+# New terminal effects are comment-only.  The historical v2/v3 schemas remain
+# readable with their original field-update semantics.
+TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY = (
+    "pnc_rca_terminal_delivery_effect_v4"
+)
+TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY = (
+    "pnc_rca_terminal_delivery_effect_v5"
+)
 TERMINAL_DIAGNOSTIC_CONTRACT_SCHEMA_VERSION = "pnc_rca_terminal_diagnostic_v1"
 TERMINAL_FALLBACK_CONTRACT_SCHEMA_VERSION = "pnc_rca_bounded_terminal_fallback_v1"
 TERMINAL_FALLBACK_PUBLIC_CONTRACT_SCHEMA_VERSION = (
@@ -626,6 +656,118 @@ def _canonical_json(value: Any) -> str:
     )
 
 
+def issue_focus_payload_sha256(value: Mapping[str, Any]) -> str:
+    """Hash the exact issue-focus payload carried by a sealed contract."""
+
+    if not isinstance(value, Mapping):
+        raise DeliveryContractError("issue_focus_payload_invalid")
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _issue_focus_stop_message(status: str) -> str:
+    return {
+        ANALYSIS_INSUFFICIENT_STATEMENT: "问题陈述不足，未输出责任归因。",
+        ANALYSIS_CAPABILITY_UNSUPPORTED: "问题焦点所需能力未接入，未输出责任归因。",
+        ANALYSIS_EVIDENCE_INCOMPLETE: "问题焦点证据不完整，未输出责任归因。",
+        ANALYSIS_EVIDENCE_CONFLICT: "问题焦点证据存在冲突，未输出责任归因。",
+    }.get(str(status or "").strip(), "问题焦点未通过归因门禁，未输出责任归因。")
+
+
+def validate_delivery_issue_focus(
+    contract: Mapping[str, Any], issue_title: Any = ""
+) -> tuple[str, IssueFocusValidation | None]:
+    """Bind the immutable submission title to the sealed focus-evidence payload.
+
+    Legacy v1 contracts remain readable when no title/focus is supplied.  Once a
+    title is bound (or a v2 contract is presented), focus evidence is mandatory;
+    generic evaluator output cannot substitute for it.
+    """
+
+    if not isinstance(contract, Mapping):
+        raise DeliveryContractError("delivery_contract_missing")
+    schema = str(contract.get("schema_version") or "").strip()
+    if schema not in DELIVERY_CONTRACT_SCHEMA_VERSIONS:
+        raise DeliveryContractError("delivery_contract_schema_unsupported")
+    title = normalized_issue_title(issue_title)
+    raw_focus = contract.get("issue_focus")
+    if schema == DELIVERY_CONTRACT_SCHEMA_VERSION_V1 and raw_focus is None:
+        # v1 is a historical adapter contract.  It remains readable with the
+        # generic quality oracle, but a newly bound title may only publish an
+        # honest non-attribution until the producer emits v2 focus evidence.
+        return title, None
+    if schema == DELIVERY_CONTRACT_SCHEMA_VERSION and not title:
+        raise DeliveryContractError("issue_focus_title_missing")
+    if not title:
+        if raw_focus is not None:
+            raise DeliveryContractError("issue_focus_title_missing")
+        return "", None
+    if not raw_focus or not isinstance(raw_focus, Mapping):
+        raise DeliveryContractError("issue_focus_evidence_missing")
+    if len(title.encode("utf-8")) > 1200:
+        raise DeliveryContractError("issue_focus_title_invalid")
+    try:
+        validation = validate_issue_focus_evidence(
+            issue_title=title,
+            value=raw_focus,
+        )
+    except IssueFocusContractError as exc:
+        raise DeliveryContractError(exc.code, exc.detail) from exc
+    return title, validation
+
+
+def issue_focus_oracle_contract(
+    contract: Mapping[str, Any],
+    validation: IssueFocusValidation | None,
+) -> dict[str, Any]:
+    """Return the contract view used by the generic quality oracle.
+
+    An incomplete focus is an explicit stop.  Candidate-bearing public fields
+    are removed from the oracle input so a broad evaluator cannot promote the
+    stop to a generic attribution.
+    """
+
+    result = dict(contract)
+    if validation is None or validation.attribution_allowed:
+        return result
+    public = (
+        dict(result.get("public_result"))
+        if isinstance(result.get("public_result"), Mapping)
+        else {}
+    )
+    public["summary"] = {
+        "short_conclusion": _issue_focus_stop_message(validation.analysis_status)
+    }
+    public.pop("candidate", None)
+    public["responsibility"] = {"status": "unresolved"}
+    public["evidence_summary"] = {"refs": []}
+    public["causal_chain"] = {"narrative": []}
+    public["user_action"] = {}
+    result["public_result"] = public
+    result["summary"] = dict(public["summary"])
+    report = dict(result.get("report")) if isinstance(result.get("report"), Mapping) else {}
+    for field in (
+        "candidate_owner_domain",
+        "candidate_owner",
+        "candidate_responsibility",
+        "responsibility_candidate",
+        "is_candidate",
+    ):
+        report.pop(field, None)
+    result["report"] = report
+    return result
+
+
+def delivery_oracle_contract(
+    contract: Mapping[str, Any],
+    validation: IssueFocusValidation | None,
+) -> dict[str, Any]:
+    """Build the exact oracle input used at both Host and dispatch replay."""
+
+    result = dict(contract)
+    result["upstream_dispatch"] = _validated_upstream_dispatch(contract)
+    return issue_focus_oracle_contract(result, validation)
+
+
 def _stable_key(prefix: str, material: Mapping[str, Any]) -> str:
     digest = hashlib.sha256(_canonical_json(material).encode("utf-8")).hexdigest()
     return f"{prefix}-{digest}"
@@ -655,12 +797,21 @@ _V2_BASE_EFFECT_SEMANTIC_FIELDS = (
     "project_simple_name",
     "report_link_kind",
 )
-_BASE_EFFECT_SEMANTIC_FIELDS = (
+_V3_BASE_EFFECT_SEMANTIC_FIELDS = (
     *_V2_BASE_EFFECT_SEMANTIC_FIELDS,
     "terminal_class",
     "confidence_tier",
     "quality_oracle",
     "quality_oracle_sha256",
+)
+_BASE_EFFECT_SEMANTIC_FIELDS = (
+    *_V3_BASE_EFFECT_SEMANTIC_FIELDS,
+    "result_field_value",
+)
+_FOCUS_EFFECT_SEMANTIC_FIELDS = (
+    "issue_title",
+    "issue_focus_sha256",
+    "issue_focus_validation",
 )
 _THREAD_EFFECT_SEMANTIC_FIELDS = (
     "platform",
@@ -873,6 +1024,10 @@ def _terminal_semantic_fields(schema_version: Any) -> tuple[str, ...]:
         return _TERMINAL_BASE_EFFECT_SEMANTIC_FIELDS
     if schema_version == TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION:
         return _TERMINAL_FALLBACK_BASE_EFFECT_SEMANTIC_FIELDS
+    if schema_version == TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY:
+        return _TERMINAL_BASE_EFFECT_SEMANTIC_FIELDS
+    if schema_version == TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY:
+        return _TERMINAL_FALLBACK_BASE_EFFECT_SEMANTIC_FIELDS
     raise DeliveryContractError("terminal_delivery_schema_unsupported")
 
 
@@ -914,8 +1069,12 @@ def delivery_effect_semantic_payload(
         fields = list(_V1_BASE_EFFECT_SEMANTIC_FIELDS)
     elif schema_version == DELIVERY_EFFECT_SCHEMA_VERSION_V2:
         fields = list(_V2_BASE_EFFECT_SEMANTIC_FIELDS)
+    elif schema_version == DELIVERY_EFFECT_SCHEMA_VERSION_V3:
+        fields = list(_V3_BASE_EFFECT_SEMANTIC_FIELDS)
     elif schema_version == DELIVERY_EFFECT_SCHEMA_VERSION:
         fields = list(_BASE_EFFECT_SEMANTIC_FIELDS)
+        if any(key in payload for key in _FOCUS_EFFECT_SEMANTIC_FIELDS):
+            fields.extend(_FOCUS_EFFECT_SEMANTIC_FIELDS)
     else:
         raise DeliveryContractError("delivery_effect_schema_unsupported")
     if effect_kind == DELIVERY_THREAD_EFFECT_KIND:
@@ -1308,6 +1467,8 @@ def build_terminal_delivery(
         TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1,
         TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
         TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
+        TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY,
+        TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY,
     }:
         raise DeliveryContractError("terminal_delivery_schema_unsupported")
     target_key = (
@@ -1354,7 +1515,10 @@ def build_terminal_delivery(
     diagnostic_contract: dict[str, Any] = {}
     fallback_conclusion = ""
     fallback_contract: dict[str, Any] = {}
-    if schema_version == TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION:
+    if schema_version in {
+        TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
+        TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY,
+    }:
         fallback = _validated_terminal_fallback(terminal_fallback)
         public_contract = _terminal_fallback_public_contract()
         fallback_conclusion = _terminal_fallback_public_result()
@@ -1386,12 +1550,17 @@ def build_terminal_delivery(
             "confidence_tier": oracle.confidence_tier,
             "quality_oracle": oracle.as_dict(),
             "quality_oracle_sha256": oracle.sha256(),
-            "field_updates": [
-                {
-                    "field_key": RCA_RESULT_FIELD_KEY,
-                    "field_value": fallback_conclusion,
-                },
-            ],
+            "field_updates": (
+                []
+                if schema_version
+                == TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY
+                else [
+                    {
+                        "field_key": RCA_RESULT_FIELD_KEY,
+                        "field_value": fallback_conclusion,
+                    },
+                ]
+            ),
             "terminal_fallback": fallback,
         })
         fallback_contract = {
@@ -1406,7 +1575,10 @@ def build_terminal_delivery(
             "report_field_write_policy": "preserve_existing",
         }
         normalized_diagnostic_code = ""
-    elif schema_version == TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION:
+    elif schema_version in {
+        TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
+        TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY,
+    }:
         if terminal_fallback is not None:
             raise DeliveryContractError("terminal_fallback_schema_invalid")
         derived_diagnostic_code = terminal_diagnostic_code(
@@ -1438,12 +1610,16 @@ def build_terminal_delivery(
             normalized_diagnostic_code,
             public_detail,
         )
-        field_updates = [
-            {
-                "field_key": RCA_RESULT_FIELD_KEY,
-                "field_value": diagnostic_result,
-            },
-        ]
+        field_updates = (
+            []
+            if schema_version == TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY
+            else [
+                {
+                    "field_key": RCA_RESULT_FIELD_KEY,
+                    "field_value": diagnostic_result,
+                },
+            ]
+        )
         semantic.update({
             "diagnostic_code": normalized_diagnostic_code,
             "diagnostic_result": diagnostic_result,
@@ -1474,7 +1650,10 @@ def build_terminal_delivery(
         semantic_payload_sha256=semantic_sha,
     )
     marker = terminal_delivery_effect_marker(effect_key, normalized_outcome, generation)
-    if schema_version == TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION:
+    if schema_version in {
+        TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
+        TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY,
+    }:
         comment_content = _terminal_fallback_content(
             marker=marker,
             conclusion=fallback_conclusion,
@@ -1556,6 +1735,8 @@ def build_terminal_thread_reply_effect(
             TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1,
             TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
             TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
+            TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY,
+            TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY,
         }
         or issue.get("effect_kind") != DELIVERY_EFFECT_KIND
     ):
@@ -1595,7 +1776,10 @@ def build_terminal_thread_reply_effect(
     outcome = str(semantic.get("outcome") or "")
     generation = semantic.get("generation")
     marker = terminal_delivery_effect_marker(effect_key, outcome, generation)
-    if issue.get("schema_version") == TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION:
+    if issue.get("schema_version") in {
+        TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
+        TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY,
+    }:
         message_content = _terminal_fallback_content(
             marker=marker,
             conclusion=str(semantic.get("conclusion") or ""),
@@ -1980,11 +2164,17 @@ def build_thread_reply_effect(
         work_item_id=str(issue.get("work_item_id") or ""),
     )
     schema_version = issue.get("schema_version")
-    if schema_version != DELIVERY_EFFECT_SCHEMA_VERSION:
+    if schema_version == DELIVERY_EFFECT_SCHEMA_VERSION_V3:
+        base_fields = _V3_BASE_EFFECT_SEMANTIC_FIELDS
+    elif schema_version == DELIVERY_EFFECT_SCHEMA_VERSION:
+        base_fields = list(_BASE_EFFECT_SEMANTIC_FIELDS)
+        if any(key in issue for key in _FOCUS_EFFECT_SEMANTIC_FIELDS):
+            base_fields.extend(_FOCUS_EFFECT_SEMANTIC_FIELDS)
+    else:
         raise DeliveryContractError("delivery_effect_schema_unsupported")
     semantic = {
         key: issue.get(key)
-        for key in _BASE_EFFECT_SEMANTIC_FIELDS
+        for key in base_fields
         if key not in {"effect_kind", "target_key"}
     }
     semantic.update({
@@ -2542,6 +2732,16 @@ def render_public_rca_result(
     contract: Mapping[str, Any], *, terminal_class: str = ""
 ) -> str:
     result = build_public_rca_result(contract)
+    focus = contract.get("issue_focus") if isinstance(contract, Mapping) else None
+    if isinstance(focus, Mapping):
+        focus_status = str(focus.get("analysis_status") or "").strip()
+        if focus_status and focus_status != ANALYSIS_COMPLETE:
+            # Focus stops are deliberately independent of the generic dispatch
+            # evaluator.  Keep the public first line in the existing abstention
+            # grammar so the comment renderer cannot turn a stop into blame.
+            return "\n".join(
+                ["本单未能定向", _issue_focus_stop_message(focus_status)]
+            )
     dispatch = _validated_upstream_dispatch(contract)
     gate_a_projection = _gate_a_projection(contract) is not None
     lines = [_dispatch_first_line(dispatch, gate_a_projection=gate_a_projection)]
@@ -2603,6 +2803,109 @@ def render_public_rca_result(
         if window_line:
             lines.append(window_line)
     return "\n".join(_truncate_utf8(line, 1800) for line in lines)
+
+
+_RESULT_FIELD_CLAUSE_PREFIXES = (
+    "归因结论：",
+    "归因判断：",
+    "因果关系：",
+    "关键证据：",
+    "依据：",
+)
+
+
+def _result_field_clause(value: Any) -> str:
+    text = _public_text(value, limit=1200).strip()
+    changed = True
+    while text and changed:
+        changed = False
+        for prefix in _RESULT_FIELD_CLAUSE_PREFIXES:
+            if text.startswith(prefix):
+                text = text[len(prefix) :].strip()
+                changed = True
+    return text.rstrip("。； ")
+
+
+def _result_field_clause_key(value: str) -> str:
+    return re.sub(
+        r"[\s，。；：、,.!?！？:（）()\[\]【】'\"`]+",
+        "",
+        value,
+    ).lower()
+
+
+def _deduplicated_result_field_conclusion(result: Mapping[str, Any]) -> str:
+    clauses: list[str] = []
+    keys: list[str] = []
+    for value in (
+        result.get("conclusion"),
+        result.get("causal_chain"),
+        result.get("evidence"),
+    ):
+        clause = _result_field_clause(value)
+        key = _result_field_clause_key(clause)
+        if not clause or not key:
+            continue
+        if any(key in existing for existing in keys):
+            continue
+        replaced = False
+        for index, existing in enumerate(keys):
+            if existing and existing in key:
+                clauses[index] = clause
+                keys[index] = key
+                replaced = True
+                break
+        if not replaced:
+            clauses.append(clause)
+            keys.append(key)
+    return "；".join(clauses) or "本次未生成可确认的自动归因"
+
+
+def render_public_rca_result_field(
+    contract: Mapping[str, Any], *, terminal_class: str = ""
+) -> str:
+    """Render the versioned two-line Feishu attribution-result field.
+
+    The full report contract remains structured.  Only this bounded projection
+    folds causal and evidence text into the conclusion line; the existing issue
+    and thread comment renderer remains independent.
+    """
+
+    result = build_public_rca_result(contract)
+    if terminal_class == HONEST_NON_ATTRIBUTION:
+        # The issue comment remains the detailed operational handoff.  The
+        # attribution field must stay a bounded, non-causal projection for a
+        # low-tier terminal: do not let legacy candidates, blame wording, or
+        # evidence snippets turn an abstention into a responsibility claim.
+        result = {
+            **result,
+            "conclusion": "未形成可确认的归因结论",
+            "responsibility": "",
+            "causal_chain": "",
+            "evidence": "",
+        }
+    responsibility = _public_responsibility(result.get("responsibility"))
+    responsibility = responsibility.rstrip("。； ") or "暂无法判断"
+    responsibility_line = f"责任模块：{responsibility}"
+    conclusion_prefix = "归因结论："
+    available = MAX_CONCLUSION_BYTES - len(
+        f"{conclusion_prefix}\n{responsibility_line}".encode("utf-8")
+    )
+    suffix = (
+        f"；{MEDIUM_TIER_DISCLAIMER}。"
+        if terminal_class == CANDIDATE_HYPOTHESIS
+        else "。"
+    )
+    conclusion = _deduplicated_result_field_conclusion(result)
+    conclusion = conclusion.replace(MEDIUM_TIER_DISCLAIMER, "").rstrip("。； ")
+    conclusion = _truncate_utf8(
+        conclusion,
+        max(0, available - len(suffix.encode("utf-8"))),
+    ).rstrip("。； ")
+    return (
+        f"{conclusion_prefix}{conclusion}{suffix}\n"
+        f"{responsibility_line}"
+    )
 
 
 def _render_terminal_user_result(code: str, detail: str = "") -> str:
@@ -3308,6 +3611,8 @@ def verify_delivery_bundle(
     observed_files: Sequence[Mapping[str, Any]],
     html_dependencies: Sequence[str],
     w3_execution_binding: Mapping[str, Any] | None = None,
+    issue_title: Any = "",
+    report_issue_focus: Mapping[str, Any] | None = None,
 ) -> VerifiedDelivery:
     """Verify one sealed report and build a send-free delivery effect.
 
@@ -3328,7 +3633,7 @@ def verify_delivery_bundle(
         raise DeliveryContractError("delivery_contract_missing")
     if not manifest:
         raise DeliveryContractError("delivery_manifest_missing")
-    if contract.get("schema_version") != DELIVERY_CONTRACT_SCHEMA_VERSION:
+    if contract.get("schema_version") not in DELIVERY_CONTRACT_SCHEMA_VERSIONS:
         raise DeliveryContractError("delivery_contract_schema_unsupported")
     if manifest.get("schema_version") != DELIVERY_MANIFEST_SCHEMA_VERSION:
         raise DeliveryContractError("delivery_manifest_schema_unsupported")
@@ -3345,6 +3650,16 @@ def verify_delivery_bundle(
             "manifest must attest a complete HTML dependency inventory",
         )
     _verify_identity(validated_admission, contract, manifest)
+    bound_issue_title, issue_focus_validation = validate_delivery_issue_focus(
+        contract,
+        issue_title,
+    )
+    if issue_focus_validation is not None:
+        raw_focus = contract.get("issue_focus")
+        if not isinstance(report_issue_focus, Mapping):
+            raise DeliveryContractError("issue_focus_report_binding_missing")
+        if not isinstance(raw_focus, Mapping) or dict(report_issue_focus) != dict(raw_focus):
+            raise DeliveryContractError("issue_focus_report_binding_mismatch")
 
     if str(contract.get("business_state") or "").strip() != "report_completed":
         raise DeliveryContractError("delivery_business_state_not_ready")
@@ -3542,8 +3857,10 @@ def verify_delivery_bundle(
             "delivery_conclusion_missing",
             "a non-empty RCA conclusion is required for the result field",
         )
-    oracle_contract = dict(contract)
-    oracle_contract["upstream_dispatch"] = _validated_upstream_dispatch(contract)
+    oracle_contract = delivery_oracle_contract(
+        contract,
+        issue_focus_validation,
+    )
     structural_tier = evaluate_structural_tier(oracle_contract)
     conclusion_text = render_public_rca_result(
         contract, terminal_class=structural_tier.terminal_class
@@ -3566,6 +3883,29 @@ def verify_delivery_bundle(
             ",".join(exc.result.violations)
             or f"{exc.result.terminal_class}_not_publishable",
         ) from exc
+    if (
+        issue_focus_validation is not None
+        and not issue_focus_validation.attribution_allowed
+        and publication_tier.terminal_class != HONEST_NON_ATTRIBUTION
+    ):
+        raise DeliveryContractError("issue_focus_attribution_forbidden")
+    if (
+        bound_issue_title
+        and issue_focus_validation is None
+        and publication_tier.terminal_class != HONEST_NON_ATTRIBUTION
+    ):
+        raise DeliveryContractError("issue_focus_evidence_missing")
+    result_field_value = render_public_rca_result_field(
+        contract,
+        terminal_class=publication_tier.terminal_class,
+    )
+    if (
+        len(result_field_value.encode("utf-8")) > MAX_CONCLUSION_BYTES
+        or len(result_field_value.splitlines()) != 2
+        or not result_field_value.startswith("归因结论：")
+        or not result_field_value.splitlines()[1].startswith("责任模块：")
+    ):
+        raise DeliveryContractError("delivery_result_field_projection_invalid")
     semantic_payload = {
         "schema_version": DELIVERY_EFFECT_SCHEMA_VERSION,
         "delivery_id": delivery_id,
@@ -3591,10 +3931,11 @@ def verify_delivery_bundle(
         "confidence_tier": publication_tier.confidence_tier,
         "quality_oracle": publication_tier.as_dict(),
         "quality_oracle_sha256": publication_tier.sha256(),
+        "result_field_value": result_field_value,
         "field_updates": [
             {
                 "field_key": RCA_RESULT_FIELD_KEY,
-                "field_value": conclusion,
+                "field_value": result_field_value,
             },
             {
                 "field_key": RCA_REPORT_FIELD_KEY,
@@ -3602,6 +3943,17 @@ def verify_delivery_bundle(
             },
         ],
     }
+    if issue_focus_validation is not None:
+        raw_focus = contract.get("issue_focus")
+        if not isinstance(raw_focus, Mapping):
+            raise DeliveryContractError("issue_focus_evidence_missing")
+        semantic_payload.update(
+            {
+                "issue_title": bound_issue_title,
+                "issue_focus_sha256": issue_focus_payload_sha256(raw_focus),
+                "issue_focus_validation": issue_focus_validation.to_dict(),
+            }
+        )
     semantic_payload_sha256 = compute_delivery_effect_payload_sha256(
         semantic_payload, DELIVERY_EFFECT_KIND
     )
@@ -3625,7 +3977,9 @@ def verify_delivery_bundle(
     )
     final_publication_tier = evaluate_structural_tier(
         oracle_contract,
-        publication_text=f"{conclusion}\n{comment_content}",
+        publication_text=(
+            f"{conclusion}\n{result_field_value}\n{comment_content}"
+        ),
     )
     try:
         require_publishable(final_publication_tier)

@@ -388,7 +388,10 @@ def build_report(db_path: Path, *, baseline: str = DEFAULT_BASELINE) -> dict[str
                 or row["job_error_code"] != code
                 or not row["completed_at"]
                 or effect_payload.get("schema_version")
-                != "pnc_rca_terminal_delivery_effect_v3"
+                not in {
+                    "pnc_rca_terminal_delivery_effect_v3",
+                    "pnc_rca_terminal_delivery_effect_v5",
+                }
                 or effect_payload.get("terminal_class") != "honest_non_attribution"
                 or effect_payload.get("confidence_tier") != "low"
                 or not isinstance(oracle, Mapping)

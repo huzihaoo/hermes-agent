@@ -508,7 +508,10 @@ def collect_vm_task_status(
             break
     if contract_vm_path:
         candidate_contract, contract_error = _read_json(agent, contract_vm_path)
-        if candidate_contract and str(candidate_contract.get("schema_version") or "").strip() == "g1q3_delivery_contract_v1":
+        if candidate_contract and str(candidate_contract.get("schema_version") or "").strip() in {
+            "g1q3_delivery_contract_v1",
+            "g1q3_delivery_contract_v2",
+        }:
             delivery_contract = candidate_contract
         elif contract_error and "read_file failed" not in contract_error.lower() and "not found" not in contract_error.lower():
             errors.append(contract_error)

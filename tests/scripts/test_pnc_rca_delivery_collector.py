@@ -162,6 +162,23 @@ def test_remote_bundle_reader_uses_manifest_report_instead_of_fixed_filename(
     )
 
 
+def test_remote_bundle_reader_returns_manifest_bound_issue_focus(tmp_path, monkeypatch):
+    focus = {"schema_version": "focus-fixture-v1", "analysis_status": "complete"}
+
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        report_value={
+            "input_materialized": True,
+            "event_uuid": "focus-fixture",
+            "issue_focus": focus,
+        },
+    )
+
+    assert payload["ok"] is True
+    assert payload["report_issue_focus"] == focus
+
+
 def test_remote_bundle_reader_rejects_missing_report_role(tmp_path, monkeypatch):
     def remove_report_row(script):
         manifest_path = tmp_path / "bundle" / "delivery_manifest.json"

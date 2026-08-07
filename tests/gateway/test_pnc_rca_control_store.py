@@ -523,7 +523,7 @@ def test_feishu_user_rerun_does_not_inherit_silent_terminal_exception(tmp_path):
     assert len(store.list_rows("business_triggers")) == 1
 
 
-def test_batch_terminal_authority_creates_correction_generation_only_for_failed_delivery(
+def test_batch_terminal_authority_creates_refresh_generation_for_settled_delivery(
     tmp_path, monkeypatch
 ):
     from types import SimpleNamespace
@@ -613,6 +613,12 @@ def test_batch_terminal_authority_creates_correction_generation_only_for_failed_
             "SELECT delivery_id FROM rca_execution_watch WHERE submission_key=?",
             (first.submission_key,),
         ).fetchone()[0]
+        conn.execute(
+            "UPDATE rca_delivery_jobs "
+            "SET status='delivered', outcome='success', terminal_error_code='' "
+            "WHERE delivery_id=?",
+            (str(delivery_id),),
+        )
     batch_id = "batch-delivery"
     request = replace(
         _operator_request(
@@ -938,46 +944,6 @@ def test_batch_terminal_authority_creates_correction_generation_only_for_failed_
     ]
     assert json.loads(audit["detail"]) == authority
 
-    # A successful/approved delivery is not a correction candidate.
-    with sqlite3.connect(store.db_path) as conn:
-        conn.execute(
-            "UPDATE rca_delivery_jobs SET outcome='success', terminal_error_code='' "
-            "WHERE delivery_id=?",
-            (str(delivery_id),),
-        )
-    bad_request = replace(
-        _operator_request(
-            "batch-delivery-success-try-1",
-            issue_url=(
-                f"https://project.feishu.cn/g1q3/issue/detail/{stock_issue_id}"
-            ),
-        ),
-        reason=f"production_gray_batch:{batch_id}",
-    )
-    bad_authority = build_batch_terminal_rerun_authority(
-        batch_id=batch_id,
-        queue_sha256="1" * 64,
-        issue_id=stock_issue_id,
-        prior_submission_key=first.submission_key,
-        prior_generation=1,
-        prior_delivery_id=str(delivery_id),
-        owner_receipt_path=str(tmp_path / "owner.json"),
-        owner_receipt_sha256="2" * 64,
-        requester_id=bad_request.requester_id,
-        reason=bad_request.reason,
-    )
-    with pytest.raises(
-        ManualRcaAdmissionError,
-        match="batch_terminal_rerun_terminal_generation_required",
-    ):
-        store.admit_manual_trigger(
-            bad_request,
-            allowed_chat_ids=set(),
-            submit_enabled=True,
-            operator_authorized=True,
-            batch_terminal_rerun_authority=bad_authority,
-            activation_required=True,
-        )
     with sqlite3.connect(store.db_path) as conn:
         conn.execute(
             "UPDATE rca_trigger_sources SET outcome='joined' WHERE source_id=?",

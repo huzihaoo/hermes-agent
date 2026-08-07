@@ -39,9 +39,12 @@ from gateway.pnc_rca_conclusion_adjudication import (
 )
 from gateway.pnc_rca_delivery_contract import (
     DELIVERY_EFFECT_SCHEMA_VERSION,
+    DELIVERY_EFFECT_SCHEMA_VERSION_V3,
     TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
     TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1,
+    TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY,
     TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
+    TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY,
 )
 from gateway.pnc_rca_delivery_quarantine_migration import (
     COMBINED_TARGET_SCHEMA_VERSION,
@@ -1270,13 +1273,19 @@ def audit_unresolved_effect_schema_compatibility(
         outcome = str(row["outcome"] or "")
         accepted = (
             schema_version
-            in {DELIVERY_EFFECT_SCHEMA_VERSION, ADJUDICATION_EFFECT_SCHEMA_VERSION}
+            in {
+                DELIVERY_EFFECT_SCHEMA_VERSION_V3,
+                DELIVERY_EFFECT_SCHEMA_VERSION,
+                ADJUDICATION_EFFECT_SCHEMA_VERSION,
+            }
             if outcome == "success"
             else schema_version
             in {
                 TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1,
                 TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
                 TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
+                TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY,
+                TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY,
             }
         )
         if not accepted:

@@ -32,7 +32,6 @@ from gateway.pnc_rca_kafka_contract import (
     classify_workflow_event,
 )
 from gateway.pnc_rca_gray_samples import (
-    GRAY_SAMPLE_DAILY_LIMIT,
     GRAY_SAMPLE_REQUESTER_ID,
     build_gray_sample_message_id,
     build_gray_sample_reason,
@@ -16307,33 +16306,9 @@ class RcaControlStore:
                         reason="user_rerun_duplicate_window",
                     )
 
-            if gray_sample_authority is not None:
-                day_start = _utc_datetime(now).replace(
-                    hour=0, minute=0, second=0, microsecond=0
-                )
-                day_end = day_start + timedelta(days=1)
-                started_today = int(
-                    conn.execute(
-                        """
-                        SELECT COUNT(*) FROM rca_trigger_sources
-                         WHERE source_kind = 'feishu_group_manual'
-                           AND platform = 'operator'
-                           AND requester_id = ? AND mode = 'rerun'
-                           AND created_at >= ? AND created_at < ?
-                        """,
-                        (
-                            GRAY_SAMPLE_REQUESTER_ID,
-                            _iso(day_start),
-                            _iso(day_end),
-                        ),
-                    ).fetchone()[0]
-                )
-                if started_today >= GRAY_SAMPLE_DAILY_LIMIT:
-                    raise ManualRcaAdmissionError(
-                        "gray_sample_daily_rate_limited"
-                    )
-            elif (
-                operator_requested
+            if (
+                gray_sample_authority is None
+                and operator_requested
                 and not issue_only_operator
                 and normalized_user_rerun is None
             ):
@@ -16481,11 +16456,6 @@ class RcaControlStore:
                     != normalized_batch_rerun["prior_delivery_id"]
                     or str(batch_job["status"] or "")
                     not in {"delivered", "partial", "quarantined"}
-                    or str(batch_job["outcome"] or "") == "success"
-                    or (
-                        not str(batch_job["terminal_error_code"] or "").strip()
-                        and str(batch_job["outcome"] or "") != "terminal_failed"
-                    )
                 ):
                     raise ManualRcaAdmissionError(
                         "batch_terminal_rerun_terminal_generation_required"

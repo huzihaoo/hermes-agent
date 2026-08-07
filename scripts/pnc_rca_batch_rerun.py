@@ -29,10 +29,15 @@ from gateway.pnc_rca_control_store import (  # noqa: E402
     build_batch_terminal_rerun_authority,
     build_silent_terminal_rerun_authority,
 )
+from gateway.pnc_rca_issue_focus import (  # noqa: E402
+    ANALYSIS_COMPLETE,
+    IssueFocusContractError,
+    validate_issue_focus_evidence,
+)
 
 
-SCHEMA_VERSION = "pnc_rca_batch_rerun_state_v3"
-OWNER_RECEIPT_SCHEMA_VERSION = "pnc_rca_batch_owner_receipt_v1"
+SCHEMA_VERSION = "pnc_rca_batch_rerun_state_v4"
+OWNER_RECEIPT_SCHEMA_VERSION = "pnc_rca_batch_owner_receipt_v2"
 OWNER_RECEIPT_FIELDS = frozenset(
     {
         "schema_version",
@@ -47,6 +52,8 @@ OWNER_RECEIPT_FIELDS = frozenset(
         "requester_id",
         "reason",
         "activation_required",
+        "runtime_commit",
+        "runtime_tree",
     }
 )
 OWNER_RECEIPT_EFFECT_SCOPE = {
@@ -64,14 +71,46 @@ OWNER_RECEIPT_NO_OTHER_TASK_BOUNDARY = {
     "production_release_task_untouched": True,
     "other_codex_tasks_untouched": True,
 }
-QUEUE_SCHEMA_VERSION = "g1q3_rca_bootstrap_rerun_queue_v1"
+QUEUE_SCHEMA_VERSION = "g1q3_rca_exact_refresh_queue_v2"
 QUEUE_AUTHORITY_FLAGS = {
     "project_g1q3_only": True,
     "issue_only": True,
     "owner_or_proposer_scope": True,
     "no_other_task": True,
     "activation_required": True,
+    "exact_and_scope": True,
+    "daily_started_attempt_quota": None,
 }
+QUEUE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "batch_id",
+        "project_key",
+        "scope",
+        "source_inventory_sha256",
+        "authority_flags",
+        "items",
+    }
+)
+QUEUE_ITEM_FIELDS = frozenset(
+    {
+        "issue_id",
+        "title",
+        "quality_classification",
+        "current_submission_key",
+        "current_generation",
+        "priority",
+        "project_key",
+    }
+)
+QUEUE_SCOPE = {
+    "logic": "AND",
+    "project_relation_id": "6670325063",
+    "project_name": "G1Q3_T1LFL1 ICE_捷途",
+    "creator_key": "7649830284321508335",
+    "creator_name": "黎涛华",
+}
+QUEUE_QUALITY_CLASSIFICATIONS = frozenset({"missing", "legacy_or_other"})
 MAX_INPUT_BYTES = 2 * 1024 * 1024
 ISSUE_ID_RE = re.compile(r"^[0-9]{6,24}$")
 BATCH_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$")
@@ -121,6 +160,8 @@ def _validate_owner_receipt(
     expected_queue_sha256: str | None = None,
     expected_issue_ids: Sequence[str] | None = None,
     expected_requester_id: str | None = None,
+    expected_runtime_commit: str | None = None,
+    expected_runtime_tree: str | None = None,
 ) -> dict[str, Any]:
     """Validate the semantic owner approval contract before any admission.
 
@@ -165,6 +206,23 @@ def _validate_owner_receipt(
         raise BatchRerunError("batch_owner_receipt_task_boundary_invalid")
     if value.get("activation_required") is not True:
         raise BatchRerunError("batch_owner_receipt_activation_required")
+    runtime_commit = str(value.get("runtime_commit") or "").strip().lower()
+    runtime_tree = str(value.get("runtime_tree") or "").strip().lower()
+    if (
+        re.fullmatch(r"[0-9a-f]{40}", runtime_commit) is None
+        or runtime_commit == "0" * 40
+        or re.fullmatch(r"[0-9a-f]{40}", runtime_tree) is None
+        or runtime_tree == "0" * 40
+    ):
+        raise BatchRerunError("batch_owner_receipt_runtime_invalid")
+    if (
+        expected_runtime_commit is not None
+        and runtime_commit != expected_runtime_commit
+    ) or (
+        expected_runtime_tree is not None
+        and runtime_tree != expected_runtime_tree
+    ):
+        raise BatchRerunError("batch_owner_receipt_runtime_mismatch")
 
     approved_by = value.get("approved_by")
     if (
@@ -212,6 +270,8 @@ def _owner_receipt_binding(
     expected_queue_sha256: str | None = None,
     expected_issue_ids: Sequence[str] | None = None,
     expected_requester_id: str | None = None,
+    expected_runtime_commit: str | None = None,
+    expected_runtime_tree: str | None = None,
 ) -> tuple[str, str]:
     """Validate and hash an owner-only canonical receipt without exposing it."""
     selected = path.expanduser()
@@ -286,6 +346,8 @@ def _owner_receipt_binding(
         expected_queue_sha256=expected_queue_sha256,
         expected_issue_ids=expected_issue_ids,
         expected_requester_id=expected_requester_id,
+        expected_runtime_commit=expected_runtime_commit,
+        expected_runtime_tree=expected_runtime_tree,
     )
     return str(selected), digest.hexdigest()
 
@@ -310,16 +372,34 @@ def _write_state(path: Path, value: Mapping[str, Any]) -> None:
         raise
 
 
-def _runtime_commit() -> str:
+def _runtime_identity() -> tuple[str, str]:
     try:
-        return subprocess.check_output(
-            ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
+        identity = subprocess.check_output(
+            ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD", "HEAD^{tree}"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).splitlines()
+        dirty = subprocess.check_output(
+            [
+                "git",
+                "-C",
+                str(REPO_ROOT),
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+            ],
             text=True,
             stderr=subprocess.DEVNULL,
             timeout=5,
         ).strip()
     except (OSError, subprocess.SubprocessError) as exc:
         raise BatchRerunError("batch_runtime_commit_unavailable") from exc
+    if len(identity) != 2:
+        raise BatchRerunError("batch_runtime_commit_unavailable")
+    if dirty:
+        raise BatchRerunError("batch_runtime_dirty")
+    return identity[0].strip(), identity[1].strip()
 
 
 def _load_queue(
@@ -328,10 +408,16 @@ def _load_queue(
     value, raw_sha = _read_json(path)
     if (
         not isinstance(value, Mapping)
+        or set(value) != QUEUE_FIELDS
         or value.get("schema_version") != QUEUE_SCHEMA_VERSION
         or not isinstance(value.get("items"), list)
         or BATCH_ID_RE.fullmatch(str(value.get("batch_id") or "")) is None
         or value.get("project_key") not in {"g1q3", "t03o4q"}
+        or re.fullmatch(
+            r"[0-9a-f]{64}", str(value.get("source_inventory_sha256") or "")
+        )
+        is None
+        or value.get("source_inventory_sha256") == "0" * 64
         or value.get("authority_flags") != QUEUE_AUTHORITY_FLAGS
         or (
             expected_batch_id is not None
@@ -342,7 +428,14 @@ def _load_queue(
     items: list[dict[str, Any]] = []
     seen: set[str] = set()
     for raw in value["items"]:
-        if not isinstance(raw, Mapping):
+        if not isinstance(raw, Mapping) or set(raw) != QUEUE_ITEM_FIELDS:
+            raise BatchRerunError("batch_queue_item_invalid")
+        if not all(isinstance(raw.get(field), str) for field in (
+            "issue_id",
+            "title",
+            "quality_classification",
+            "current_submission_key",
+        )):
             raise BatchRerunError("batch_queue_item_invalid")
         issue_id = str(raw.get("issue_id") or "").strip()
         if ISSUE_ID_RE.fullmatch(issue_id) is None or issue_id in seen:
@@ -350,20 +443,27 @@ def _load_queue(
         title = str(raw.get("title") or "").strip()
         classification = str(raw.get("quality_classification") or "").strip()
         submission_key = str(raw.get("current_submission_key") or "").strip()
+        generation = raw.get("current_generation")
         priority = raw.get("priority")
         if (
             not title
-            or not classification
-            or not submission_key
+            or classification not in QUEUE_QUALITY_CLASSIFICATIONS
             or isinstance(priority, bool)
             or not isinstance(priority, int)
             or priority < 0
-            or re.fullmatch(r"g1q3-rca-s1-[0-9a-f]{64}", submission_key)
-            is None
+            or isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 0
             or (
-                raw.get("project_key") is not None
-                and raw.get("project_key") != value.get("project_key")
+                generation == 0
+                and submission_key
             )
+            or (
+                generation > 0
+                and re.fullmatch(r"g1q3-rca-s1-[0-9a-f]{64}", submission_key)
+                is None
+            )
+            or raw.get("project_key") != value.get("project_key")
         ):
             raise BatchRerunError("batch_queue_item_invalid")
         seen.add(issue_id)
@@ -372,10 +472,21 @@ def _load_queue(
             "title": title,
             "quality_classification": classification,
             "queue_submission_key": submission_key,
+            "queue_generation": generation,
             "priority": priority,
         })
     if not items:
         raise BatchRerunError("batch_queue_empty")
+    scope = value.get("scope")
+    issue_ids_sha256 = _sha256_bytes(
+        ("\n".join(sorted(seen)) + "\n").encode("utf-8")
+    )
+    if not isinstance(scope, Mapping) or dict(scope) != {
+        **QUEUE_SCOPE,
+        "issue_count": len(items),
+        "issue_ids_sha256": issue_ids_sha256,
+    }:
+        raise BatchRerunError("batch_queue_scope_invalid")
     return sorted(items, key=lambda row: (row["priority"], row["issue_id"])), raw_sha
 
 
@@ -385,6 +496,7 @@ def _load_or_create_state(
     batch_id: str,
     queue_sha256: str,
     runtime_commit: str,
+    runtime_tree: str,
     owner_receipt_path: str,
     owner_receipt_sha256: str,
     selected_issue_ids: Sequence[str],
@@ -403,6 +515,7 @@ def _load_or_create_state(
             or state.get("selected_issue_ids") != list(selected_issue_ids)
             or state.get("activation_required") is not True
             or state.get("runtime_commit") != runtime_commit
+            or state.get("runtime_tree") != runtime_tree
         ):
             raise BatchRerunError("batch_state_binding_mismatch")
         if not isinstance(state.get("items"), Mapping):
@@ -419,6 +532,7 @@ def _load_or_create_state(
         "selected_issue_ids": list(selected_issue_ids),
         "activation_required": True,
         "runtime_commit": runtime_commit,
+        "runtime_tree": runtime_tree,
         "created_at": current,
         "updated_at": current,
         "status": "running",
@@ -478,6 +592,30 @@ def _causal_delivery_quality(contract_raw: Any) -> dict[str, str] | None:
         "status": "causal_candidate",
         "responsibility": responsibility,
         "causal_text_sha256": _sha256_bytes(causal_text.encode("utf-8")),
+    }
+
+
+def _explicit_focus_stop_quality(
+    contract_raw: Any, *, issue_title: str
+) -> dict[str, str] | None:
+    contract = _json_object(contract_raw)
+    focus = contract.get("issue_focus")
+    if not isinstance(focus, Mapping):
+        return None
+    title = str(issue_title or "").strip()
+    if not title:
+        return None
+    try:
+        validation = validate_issue_focus_evidence(issue_title=title, value=focus)
+    except IssueFocusContractError:
+        return None
+    if validation.analysis_status == ANALYSIS_COMPLETE or validation.attribution_allowed:
+        return None
+    return {
+        "status": "explicit_focus_stop",
+        "analysis_status": validation.analysis_status,
+        "responsibility": "暂无法判断",
+        "causal_text_sha256": "",
     }
 
 
@@ -553,7 +691,9 @@ def _issue_snapshot(
         conn.close()
 
 
-def _approval(snapshot: Mapping[str, Any]) -> dict[str, Any] | None:
+def _approval(
+    snapshot: Mapping[str, Any], *, issue_title: str = ""
+) -> dict[str, Any] | None:
     if snapshot.get("job_status") != "delivered":
         return None
     if snapshot.get("job_outcome") != "success":
@@ -578,6 +718,10 @@ def _approval(snapshot: Mapping[str, Any]) -> dict[str, Any] | None:
         return None
     quality = _causal_delivery_quality(snapshot.get("contract_json"))
     if quality is None:
+        quality = _explicit_focus_stop_quality(
+            snapshot.get("contract_json"), issue_title=issue_title
+        )
+    if quality is None:
         return None
     return {
         "generation": int(snapshot["generation"]),
@@ -596,7 +740,9 @@ def _approval(snapshot: Mapping[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def _terminal_failure(snapshot: Mapping[str, Any]) -> dict[str, Any] | None:
+def _terminal_failure(
+    snapshot: Mapping[str, Any], *, issue_title: str = ""
+) -> dict[str, Any] | None:
     effects = [
         effect
         for effect in snapshot.get("effects", [])
@@ -605,7 +751,9 @@ def _terminal_failure(snapshot: Mapping[str, Any]) -> dict[str, Any] | None:
     if any(effect.get("status") in ACTIVE_EFFECT_STATUSES for effect in effects):
         return None
     job_status = str(snapshot.get("job_status") or "")
-    if job_status in TERMINAL_JOB_STATUSES and _approval(snapshot) is None:
+    if job_status in TERMINAL_JOB_STATUSES and _approval(
+        snapshot, issue_title=issue_title
+    ) is None:
         return {
             "job_status": job_status,
             "job_outcome": str(snapshot.get("job_outcome") or ""),
@@ -693,19 +841,13 @@ def _batch_terminal_authority(
     requester_id: str,
     reason: str,
 ) -> dict[str, Any] | None:
-    """Bind an ordinary settled delivery terminal to the owner-approved batch."""
+    """Bind any settled delivery terminal to the owner-approved refresh batch."""
     if (
         snapshot.get("watch_state") != "delivery_created"
         or not str(snapshot.get("watch_delivery_id") or "").strip()
         or str(snapshot.get("job_status") or "")
         not in TERMINAL_JOB_STATUSES
         or not snapshot.get("delivery_id")
-        or snapshot.get("job_outcome") == "success"
-        or _approval(snapshot) is not None
-        or (
-            not str(snapshot.get("terminal_error_code") or "").strip()
-            and str(snapshot.get("job_outcome") or "") != "terminal_failed"
-        )
     ):
         return None
     required_effects = [
@@ -733,21 +875,76 @@ def _batch_terminal_authority(
     )
 
 
+def _queue_precondition_matches(
+    queue_item: Mapping[str, Any], snapshot: Mapping[str, Any] | None
+) -> bool:
+    expected_submission = str(queue_item.get("queue_submission_key") or "")
+    expected_generation = int(queue_item.get("queue_generation") or 0)
+    if expected_generation == 0:
+        return not expected_submission and snapshot is None
+    return bool(
+        snapshot is not None
+        and str(snapshot.get("submission_key") or "") == expected_submission
+        and int(snapshot.get("generation") or 0) == expected_generation
+    )
+
+
+def _refresh_authorities(
+    *,
+    snapshot: Mapping[str, Any],
+    batch_id: str,
+    queue_sha256: str,
+    issue_id: str,
+    owner_receipt_path: str,
+    owner_receipt_sha256: str,
+    requester_id: str,
+    reason: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    silent = _silent_terminal_authority(
+        snapshot=snapshot,
+        batch_id=batch_id,
+        queue_sha256=queue_sha256,
+        issue_id=issue_id,
+        owner_receipt_path=owner_receipt_path,
+        owner_receipt_sha256=owner_receipt_sha256,
+        requester_id=requester_id,
+        reason=reason,
+    )
+    batch = None
+    if silent is None:
+        batch = _batch_terminal_authority(
+            snapshot=snapshot,
+            batch_id=batch_id,
+            queue_sha256=queue_sha256,
+            issue_id=issue_id,
+            owner_receipt_path=owner_receipt_path,
+            owner_receipt_sha256=owner_receipt_sha256,
+            requester_id=requester_id,
+            reason=reason,
+        )
+    return silent, batch
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     batch_id = str(args.batch_id or "").strip()
     if BATCH_ID_RE.fullmatch(batch_id) is None:
         raise BatchRerunError("batch_id_invalid")
-    runtime_commit = _runtime_commit()
-    if runtime_commit != str(args.expected_runtime_commit or "").strip():
+    runtime_commit, runtime_tree = _runtime_identity()
+    if (
+        runtime_commit != str(args.expected_runtime_commit or "").strip()
+        or runtime_tree != str(args.expected_runtime_tree or "").strip()
+    ):
         raise BatchRerunError("batch_runtime_commit_mismatch")
     queue, queue_sha = _load_queue(Path(args.queue), expected_batch_id=batch_id)
-    selected_issue_ids = [str(item["issue_id"]) for item in queue]
+    selected_issue_ids = sorted(str(item["issue_id"]) for item in queue)
     owner_receipt_path, owner_receipt_sha256 = _owner_receipt_binding(
         Path(args.owner_receipt),
         expected_batch_id=batch_id,
         expected_queue_sha256=queue_sha,
         expected_issue_ids=selected_issue_ids,
         expected_requester_id=args.requester_id,
+        expected_runtime_commit=runtime_commit,
+        expected_runtime_tree=runtime_tree,
     )
     state_path = Path(args.state)
     state = _load_or_create_state(
@@ -755,6 +952,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         batch_id=batch_id,
         queue_sha256=queue_sha,
         runtime_commit=runtime_commit,
+        runtime_tree=runtime_tree,
         owner_receipt_path=owner_receipt_path,
         owner_receipt_sha256=owner_receipt_sha256,
         selected_issue_ids=selected_issue_ids,
@@ -765,32 +963,37 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         issue_id = queue_item["issue_id"]
         item = dict(state["items"].get(issue_id) or {})
         latest = _issue_snapshot(Path(args.control_db), issue_id)
-        accepted = _approval(latest) if latest is not None else None
-        queue_submission = queue_item["queue_submission_key"]
-        if accepted is not None and (
-            item.get("status") == "accepted"
-            or str(latest["submission_key"]) != queue_submission
-        ):
-            item.update({
-                **queue_item,
-                "status": "accepted",
-                "approval": accepted,
-                "updated_at": _now(),
-            })
-            state["items"][issue_id] = item
-            state["updated_at"] = _now()
-            _write_state(state_path, state)
+        if item.get("status") == "accepted":
+            if (
+                latest is None
+                or str(latest.get("submission_key") or "")
+                != str(item.get("submission_key") or "")
+                or int(latest.get("generation") or 0)
+                != int(item.get("generation") or 0)
+            ):
+                raise BatchRerunError("batch_issue_generation_drift")
+            accepted_snapshot = _issue_snapshot(
+                Path(args.control_db),
+                issue_id,
+                submission_key=str(item["submission_key"]),
+            )
+            if accepted_snapshot is None or _approval(
+                accepted_snapshot, issue_title=str(queue_item["title"])
+            ) is None:
+                raise BatchRerunError("batch_accepted_item_invalid")
             completed += 1
             continue
         if item.get("status") == "failed" and not args.retry_failed:
             raise BatchRerunError("batch_failed_item_requires_retry_flag")
         request_index = int(item.get("request_index") or 0)
         if item.get("status") not in {"submitted", "running"}:
-            if (
-                latest is None
-                or not queue_submission
-                or str(latest["submission_key"] or "") != queue_submission
-            ):
+            precondition = dict(queue_item)
+            if item.get("status") == "failed" and args.retry_failed:
+                precondition.update({
+                    "queue_submission_key": str(item.get("submission_key") or ""),
+                    "queue_generation": int(item.get("generation") or 0),
+                })
+            if not _queue_precondition_matches(precondition, latest):
                 raise BatchRerunError("batch_issue_generation_drift")
             request_index += 1
             request = _request(
@@ -799,28 +1002,39 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 request_index=request_index,
                 requester_id=args.requester_id,
             )
-            silent_authority = _silent_terminal_authority(
-                snapshot=latest,
-                batch_id=batch_id,
-                queue_sha256=queue_sha,
-                issue_id=issue_id,
-                owner_receipt_path=owner_receipt_path,
-                owner_receipt_sha256=owner_receipt_sha256,
-                requester_id=args.requester_id,
-                reason=request.reason,
-            )
+            silent_authority = None
             batch_authority = None
-            if silent_authority is None:
-                batch_authority = _batch_terminal_authority(
-                    snapshot=latest,
-                    batch_id=batch_id,
-                    queue_sha256=queue_sha,
-                    issue_id=issue_id,
-                    owner_receipt_path=owner_receipt_path,
-                    owner_receipt_sha256=owner_receipt_sha256,
-                    requester_id=args.requester_id,
-                    reason=request.reason,
-                )
+            if latest is not None:
+                wait_deadline = time.monotonic() + args.item_timeout_seconds
+                while True:
+                    silent_authority, batch_authority = _refresh_authorities(
+                        snapshot=latest,
+                        batch_id=batch_id,
+                        queue_sha256=queue_sha,
+                        issue_id=issue_id,
+                        owner_receipt_path=owner_receipt_path,
+                        owner_receipt_sha256=owner_receipt_sha256,
+                        requester_id=args.requester_id,
+                        reason=request.reason,
+                    )
+                    if silent_authority is not None or batch_authority is not None:
+                        break
+                    if time.monotonic() >= wait_deadline:
+                        item.update({
+                            **queue_item,
+                            "status": "waiting_for_prior_terminal",
+                            "request_index": request_index - 1,
+                            "updated_at": _now(),
+                        })
+                        state["items"][issue_id] = item
+                        state["status"] = "waiting_for_prior_terminal"
+                        state["updated_at"] = _now()
+                        _write_state(state_path, state)
+                        raise BatchRerunError("batch_prior_item_timeout")
+                    time.sleep(args.poll_seconds)
+                    latest = _issue_snapshot(Path(args.control_db), issue_id)
+                    if not _queue_precondition_matches(precondition, latest):
+                        raise BatchRerunError("batch_issue_generation_drift")
             admission_kwargs: dict[str, Any] = {}
             if silent_authority is not None:
                 admission_kwargs["silent_terminal_rerun_authority"] = (
@@ -838,6 +1052,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 activation_required=True,
                 **admission_kwargs,
             )
+            expected_generation = int(precondition["queue_generation"]) + 1
+            if (
+                admitted.outcome != "created"
+                or admitted.generation != expected_generation
+            ):
+                raise BatchRerunError("batch_admission_did_not_create_generation")
+            item.pop("failure", None)
             item.update({
                 **queue_item,
                 "status": "submitted",
@@ -863,7 +1084,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             )
             if latest is None:
                 raise BatchRerunError("batch_issue_generation_drift")
-            accepted = _approval(latest)
+            accepted = _approval(latest, issue_title=str(queue_item["title"]))
             if accepted is not None:
                 item.update({
                     "status": "accepted",
@@ -875,7 +1096,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 _write_state(state_path, state)
                 completed += 1
                 break
-            failure = _terminal_failure(latest)
+            failure = _terminal_failure(
+                latest, issue_title=str(queue_item["title"])
+            )
             if failure is not None:
                 item.update({
                     "status": "failed",
@@ -915,6 +1138,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--state", required=True)
     parser.add_argument("--batch-id", required=True)
     parser.add_argument("--expected-runtime-commit", required=True)
+    parser.add_argument("--expected-runtime-tree", required=True)
     parser.add_argument("--owner-receipt", required=True)
     parser.add_argument("--requester-id", default="automation:rca-batch-rerun")
     parser.add_argument("--poll-seconds", type=int, default=5)

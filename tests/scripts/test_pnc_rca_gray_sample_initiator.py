@@ -27,7 +27,7 @@ from gateway.pnc_rca_gray_samples import (
     GRAY_SAMPLE_AUTOMATION_AUTHORIZATION_SCHEMA_VERSION,
     GRAY_SAMPLE_AUTOMATION_AUTHORITY_SCHEMA_VERSION,
     GRAY_SAMPLE_CONTRACTS,
-    GRAY_SAMPLE_DAILY_LIMIT,
+    GRAY_SAMPLE_DAILY_STARTED_ATTEMPT_QUOTA,
     GRAY_SAMPLE_REQUESTER_ID,
     build_gray_sample_message_id,
     build_gray_sample_reason,
@@ -106,7 +106,7 @@ def _authorization(path: Path, *, valid: bool = True) -> str:
             "lane": "production",
             "activation_required": True,
             "allowed_activation_states": ["steady_active"],
-            "daily_started_attempt_quota": GRAY_SAMPLE_DAILY_LIMIT,
+            "daily_started_attempt_quota": GRAY_SAMPLE_DAILY_STARTED_ATTEMPT_QUOTA,
             "allowed_sample_ids": list(GRAY_SAMPLE_CONTRACTS),
             "sample_contract_sha256s": {
                 sample_id: sample_contract_sha256(sample_id)
@@ -576,7 +576,7 @@ def test_core_source_payload_binds_originator_authority(tmp_path, monkeypatch):
     assert _counts(store) == before
 
 
-def test_daily_sixth_sample_is_rejected_before_new_rows(tmp_path, monkeypatch):
+def test_daily_started_attempts_are_unlimited(tmp_path, monkeypatch):
     _patch_runtime(monkeypatch)
     args, store = _args(tmp_path, sample_ids=["S07"])
     _steady_epoch(store)
@@ -605,13 +605,45 @@ def test_daily_sixth_sample_is_rejected_before_new_rows(tmp_path, monkeypatch):
         conn.close()
     before = _counts(store)
 
-    with pytest.raises(
-        initiator.GraySampleInitiatorError,
-        match="gray_sample_daily_rate_limited",
-    ):
-        initiator.run(args, now=NOW)
+    result = initiator.run(args, now=NOW)
 
-    assert _counts(store) == before
+    assert result["ok"] is True
+    assert result["results"][0]["status"] == "admitted"
+    after = _counts(store)
+    assert after["rca_trigger_sources"] == before["rca_trigger_sources"] + 1
+    assert after["business_triggers"] == before["business_triggers"] + 1
+    status = json.loads((tmp_path / "receipts/status.json").read_text())
+    assert status["daily_started_attempt_quota"] is None
+
+
+def test_one_run_can_select_the_full_fixed_regression_set():
+    selected = list(GRAY_SAMPLE_CONTRACTS)
+
+    assert initiator._selected_samples(selected) == selected
+
+
+@pytest.mark.parametrize(
+    ("schema_version", "quota"),
+    (
+        ("pnc_rca_gray_sample_automation_authorization_v1", 5),
+        (GRAY_SAMPLE_AUTOMATION_AUTHORIZATION_SCHEMA_VERSION, 5),
+    ),
+)
+def test_bounded_authorization_cannot_expand_to_unlimited(
+    tmp_path, schema_version, quota
+):
+    path = tmp_path / "authorization.json"
+    _authorization(path)
+    value = json.loads(path.read_text(encoding="utf-8"))
+    value["schema_version"] = schema_version
+    value["daily_started_attempt_quota"] = quota
+
+    with pytest.raises(ValueError, match="gray_sample_authorization_contract_invalid"):
+        validate_gray_sample_automation_authorization(
+            value,
+            expected_release_id=RELEASE_ID,
+            now=NOW,
+        )
 
 
 def test_authority_contract_rejects_wrong_fixed_sample_hash():

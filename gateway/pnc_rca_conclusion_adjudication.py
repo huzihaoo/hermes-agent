@@ -15,6 +15,7 @@ from typing import Any, Literal, Mapping
 
 from gateway.pnc_rca_delivery_contract import (
     DELIVERY_EFFECT_SCHEMA_VERSION,
+    DELIVERY_EFFECT_SCHEMA_VERSION_V3,
     DELIVERY_EFFECT_KIND,
     MAX_FEISHU_COMMENT_BYTES,
     RCA_RESULT_FIELD_KEY,
@@ -901,7 +902,6 @@ def _medium_review_material(row: sqlite3.Row) -> tuple[str, str]:
         required=True,
     )
     expected_identity = {
-        "schema_version": DELIVERY_EFFECT_SCHEMA_VERSION,
         "effect_key": str(row["effect_key"]),
         "delivery_id": str(row["delivery_id"]),
         "target_key": str(row["target_key"]),
@@ -915,6 +915,8 @@ def _medium_review_material(row: sqlite3.Row) -> tuple[str, str]:
     if (
         oracle.terminal_class != CANDIDATE_HYPOTHESIS
         or oracle.confidence_tier != "medium"
+        or payload.get("schema_version")
+        not in {DELIVERY_EFFECT_SCHEMA_VERSION_V3, DELIVERY_EFFECT_SCHEMA_VERSION}
         or any(payload.get(key) != value for key, value in expected_identity.items())
     ):
         raise ConclusionAdjudicationError(

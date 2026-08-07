@@ -1,4 +1,9 @@
-"""Fixed W18 gray-sample contracts and automation authority helpers."""
+"""Fixed W18 regression contracts and automation authority helpers.
+
+The S02-S10 map is deliberately a historical regression lane: each slot names
+one immutable issue and expected terminal class.  It is not the general issue
+selector for business refreshes; those use the exact-manifest batch lane.
+"""
 
 from __future__ import annotations
 
@@ -13,10 +18,10 @@ GRAY_SAMPLE_AUTOMATION_AUTHORITY_SCHEMA_VERSION = (
     "pnc_rca_gray_sample_automation_authority_v1"
 )
 GRAY_SAMPLE_AUTOMATION_AUTHORIZATION_SCHEMA_VERSION = (
-    "pnc_rca_gray_sample_automation_authorization_v1"
+    "pnc_rca_gray_sample_automation_authorization_v2"
 )
 GRAY_SAMPLE_REQUESTER_ID = "automation:gray-sample"
-GRAY_SAMPLE_DAILY_LIMIT = 5
+GRAY_SAMPLE_DAILY_STARTED_ATTEMPT_QUOTA: None = None
 C_TOPIC_FIXTURE_SCHEMA_VERSION = "pnc_rca_c_topic_canary_fixture_v1"
 C_TOPIC_CHAT_ID = "oc_6cfc782212009ff4cd815349909dd423"
 C_TOPIC_ISSUE_ID = "7006868401"
@@ -194,7 +199,8 @@ def validate_gray_sample_automation_authorization(
         or value.get("lane") != "production"
         or value.get("activation_required") is not True
         or value.get("allowed_activation_states") != ["steady_active"]
-        or value.get("daily_started_attempt_quota") != GRAY_SAMPLE_DAILY_LIMIT
+        or value.get("daily_started_attempt_quota")
+        is not GRAY_SAMPLE_DAILY_STARTED_ATTEMPT_QUOTA
         or value.get("allowed_sample_ids") != list(GRAY_SAMPLE_CONTRACTS)
         or value.get("sample_contract_sha256s")
         != {

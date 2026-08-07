@@ -23,6 +23,7 @@ from gateway.pnc_rca_abstention_projection import (
     project_gate_a_report as _project_gate_a_report,
 )
 from gateway.pnc_rca_delivery_contract import (
+    DELIVERY_CONTRACT_SCHEMA_VERSION,
     DELIVERY_EFFECT_KIND,
     DELIVERY_EFFECT_SCHEMA_VERSION_V1,
     TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1,
@@ -73,7 +74,9 @@ from tests.gateway.test_pnc_rca_delivery_contract import (
     _add_structural_candidate,
     _bundle,
     _consumer_capability,
+    _focus_payload,
 )
+from gateway.pnc_rca_issue_focus import ANALYSIS_INSUFFICIENT_STATEMENT
 
 
 _TEST_PROVIDER_WRITE_CLAIM = build_write_fence_provider_claim({"state": "issued"})
@@ -2476,7 +2479,7 @@ def test_success_requires_read_before_http_add_and_read_after_remote_id(tmp_path
     )
 
 
-def test_quality_regression_guard_preserves_existing_causal_result(tmp_path):
+def test_terminal_comment_only_preserves_existing_causal_result(tmp_path):
     store = _seed_terminal(tmp_path)
     dispatcher, remote, _clock = _dispatcher(tmp_path)
     existing_result = (
@@ -2493,20 +2496,16 @@ def test_quality_regression_guard_preserves_existing_causal_result(tmp_path):
 
     outcome = dispatcher.dispatch_one()
 
-    assert outcome.status == "superseded"
-    assert outcome.error_code == "delivery_result_quality_regression_prevented"
-    assert remote.add_calls == 0
+    assert outcome.status == "succeeded"
+    assert outcome.error_code == ""
+    assert remote.add_calls == 1
     assert remote.update_field_calls == 0
     assert remote.fields["field_9193cb"] == existing_result
     assert remote.fields["field_8c912e"] == existing_report
     effect = store.list_rows("rca_delivery_effects")[0]
-    assert effect["status"] == "suppressed"
+    assert effect["status"] == "succeeded"
     assert effect["write_phase"] == "settled"
-    assert effect["last_error_code"] == ("delivery_result_quality_regression_prevented")
-    receipt = json.loads(effect["remote_receipt_json"])
-    assert receipt["source"] == "delivery_result_quality_regression_prevented"
-    assert receipt["preserved_field_keys"] == ["field_9193cb", "field_8c912e"]
-    assert store.list_rows("rca_delivery_jobs")[0]["status"] == "partial"
+    assert store.list_rows("rca_delivery_jobs")[0]["status"] == "delivered"
 
 
 @pytest.mark.parametrize(
@@ -2877,12 +2876,7 @@ def test_terminal_manual_delivery_skips_report_http_and_sends_both_effects(tmp_p
     assert {outcome.status for outcome in outcomes} == {"succeeded"}
     assert verifier_calls == []
     assert remote.add_calls == 1
-    assert remote.update_field_calls == 1
-    assert "检查路径：" in remote.fields["field_9193cb"]
-    assert "数据来源：" in remote.fields["field_9193cb"]
-    assert "检查结果：" in remote.fields["field_9193cb"]
-    assert "第 1 代" not in remote.fields["field_9193cb"]
-    assert "其他代次" not in remote.fields["field_9193cb"]
+    assert remote.update_field_calls == 0
     assert remote.fields["field_8c912e"] == existing_report
     assert thread_remote.add_calls == 1
     assert "本终态不改写" not in remote.comments[0]["content"]
@@ -3674,6 +3668,37 @@ def test_delivery_verifies_viz_publication_before_external_comment(tmp_path):
     assert remote.add_calls == 1
 
 
+def test_dispatcher_replays_focus_binding_and_rejects_title_tamper(tmp_path):
+    title = "ACC braking issue"
+    bundle = _web_bundle_payload()
+    bundle["delivery_contract"]["schema_version"] = DELIVERY_CONTRACT_SCHEMA_VERSION
+    bundle["delivery_contract"]["issue_focus"] = _focus_payload(
+        title,
+        status=ANALYSIS_INSUFFICIENT_STATEMENT,
+    )
+    bundle["report_issue_focus"] = bundle["delivery_contract"]["issue_focus"]
+    store = _seed(tmp_path, bundle_payload=bundle)
+    claim = store.claim_due_effect(lease_owner="worker-1", now=NOW)
+    assert claim is not None
+
+    validated = dispatcher_module._validate_effect(claim)
+
+    assert validated.field_updates == (
+        ("field_9193cb", claim.payload["result_field_value"]),
+        ("field_8c912e", claim.payload["report_url"]),
+    )
+    tampered = replace(
+        claim,
+        payload={**claim.payload, "issue_title": "ACC different issue"},
+    )
+    with pytest.raises(DeliveryContractError) as raised:
+        dispatcher_module._validate_effect(tampered)
+    assert raised.value.code in {
+        "issue_focus_effect_binding_invalid",
+        "issue_focus_effect_binding_mismatch",
+    }
+
+
 def test_dispatcher_rejects_report_url_for_another_submission_before_http(tmp_path):
     store = _seed(tmp_path)
     claim = store.claim_due_effect(lease_owner="worker-1", now=NOW)
@@ -3763,6 +3788,79 @@ def test_dispatcher_rejects_internal_html_report_field_before_write(tmp_path):
         dispatcher_module._validate_effect(tampered)
 
     assert exc.value.code == "delivery_effect_field_updates_invalid"
+
+
+def test_dispatcher_rejects_tampered_v4_result_field_projection(tmp_path):
+    store = _seed(tmp_path)
+    claim = store.claim_due_effect(lease_owner="worker-1", now=NOW)
+    assert claim is not None
+    tampered = replace(
+        claim,
+        payload={
+            **claim.payload,
+            "result_field_value": "归因结论：伪造结论。\n责任模块：伪造模块",
+        },
+    )
+
+    with pytest.raises(DeliveryContractError) as exc:
+        dispatcher_module._validate_effect(tampered)
+
+    assert exc.value.code == "delivery_result_field_projection_invalid"
+
+
+def test_dispatcher_keeps_v3_result_field_bound_to_legacy_conclusion(tmp_path):
+    store = _seed(tmp_path)
+    claim = store.claim_due_effect(lease_owner="worker-1", now=NOW)
+    assert claim is not None
+    payload = dict(claim.payload)
+    payload.pop("result_field_value")
+    payload["schema_version"] = dispatcher_module.DELIVERY_EFFECT_SCHEMA_VERSION_V3
+    field_updates = [dict(item) for item in payload["field_updates"]]
+    field_updates[0]["field_value"] = payload["conclusion"]
+    payload["field_updates"] = field_updates
+    semantic_sha = dispatcher_module.compute_delivery_effect_payload_sha256(
+        payload,
+        claim.effect_kind,
+    )
+    effect_key = dispatcher_module.compute_delivery_effect_key(
+        delivery_id=claim.delivery_id,
+        effect_kind=claim.effect_kind,
+        target_key=claim.target_key,
+        semantic_payload_sha256=semantic_sha,
+    )
+    marker = dispatcher_module.delivery_effect_marker(
+        effect_key,
+        claim.artifact_set_id,
+    )
+    payload.update({
+        "effect_key": effect_key,
+        "semantic_payload_sha256": semantic_sha,
+        "marker": marker,
+        "comment_content": dispatcher_module.build_issue_comment_content(
+            marker=marker,
+            work_item_id=claim.work_item_id,
+            report_status=str(payload.get("report_status") or ""),
+            conclusion=str(payload["conclusion"]),
+            report_url=claim.report_url,
+            foxglove_url=str(payload.get("foxglove_url") or ""),
+            report_cifs_path=str(payload.get("report_cifs_path") or ""),
+            issue_url=claim.issue_url,
+            terminal_class=str(payload.get("terminal_class") or ""),
+        ),
+    })
+    legacy = replace(
+        claim,
+        effect_key=effect_key,
+        payload_sha256=semantic_sha,
+        payload=payload,
+    )
+
+    validated = dispatcher_module._validate_effect(legacy)
+
+    assert validated.field_updates[0] == (
+        "field_9193cb",
+        payload["conclusion"],
+    )
 
 
 def test_dispatcher_rejects_v1_effect_even_when_forged_from_current_claim(tmp_path):

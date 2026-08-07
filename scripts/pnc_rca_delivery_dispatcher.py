@@ -41,11 +41,14 @@ from gateway.pnc_rca_delivery_contract import (
     DELIVERY_EFFECT_KIND,
     DELIVERY_EFFECT_KINDS,
     DELIVERY_EFFECT_SCHEMA_VERSION,
+    DELIVERY_EFFECT_SCHEMA_VERSION_V3,
     DELIVERY_REPORT_LINK_KIND,
     DELIVERY_THREAD_EFFECT_KIND,
     TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
     TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1,
+    TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY,
     TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
+    TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY,
     TERMINAL_DELIVERY_OUTCOMES,
     DeliveryContractError,
     MAX_DELIVERY_ARTIFACT_BYTES,
@@ -61,6 +64,11 @@ from gateway.pnc_rca_delivery_contract import (
     compute_delivery_effect_payload_sha256,
     delivery_effect_idempotency_uuid,
     delivery_effect_marker,
+    render_public_rca_result_field,
+    render_public_rca_result,
+    delivery_oracle_contract,
+    issue_focus_payload_sha256,
+    validate_delivery_issue_focus,
     validate_card_patch_effect_payload,
     validate_report_asset_url,
     validate_report_url,
@@ -3091,7 +3099,10 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
     if claim.contract.get("public_result") != expected_public_result:
         raise DeliveryContractError("delivery_gate_a_public_result_mismatch")
     schema_version = str(payload.get("schema_version") or "")
-    if schema_version != DELIVERY_EFFECT_SCHEMA_VERSION:
+    if schema_version not in {
+        DELIVERY_EFFECT_SCHEMA_VERSION_V3,
+        DELIVERY_EFFECT_SCHEMA_VERSION,
+    }:
         raise DeliveryContractError("delivery_effect_schema_unsupported")
     report_link_fields = {"report_link_kind"}
     expected_issue_url = str(claim.issue_url or "").strip()
@@ -3200,8 +3211,46 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
             *report_link_fields,
         }
         content_field = "message_content"
+    if schema_version == DELIVERY_EFFECT_SCHEMA_VERSION:
+        exact_payload_keys.add("result_field_value")
+        focus_effect = any(
+            key in payload
+            for key in ("issue_title", "issue_focus_sha256", "issue_focus_validation")
+        )
+        if focus_effect:
+            exact_payload_keys.update(
+                {"issue_title", "issue_focus_sha256", "issue_focus_validation"}
+            )
     if set(payload) != exact_payload_keys:
         raise DeliveryContractError("delivery_effect_payload_shape_invalid")
+    focus_validation = None
+    focus_effect = schema_version == DELIVERY_EFFECT_SCHEMA_VERSION and any(
+        key in payload
+        for key in ("issue_title", "issue_focus_sha256", "issue_focus_validation")
+    )
+    contract_has_focus = (
+        isinstance(claim.contract, Mapping)
+        and claim.contract.get("issue_focus") is not None
+    )
+    if focus_effect:
+        try:
+            bound_title, focus_validation = validate_delivery_issue_focus(
+                claim.contract,
+                payload.get("issue_title"),
+            )
+        except DeliveryContractError as exc:
+            raise DeliveryContractError("issue_focus_effect_binding_invalid") from exc
+        raw_focus = claim.contract.get("issue_focus")
+        if (
+            payload.get("issue_title") != bound_title
+            or not isinstance(raw_focus, Mapping)
+            or payload.get("issue_focus_sha256") != issue_focus_payload_sha256(raw_focus)
+            or payload.get("issue_focus_validation")
+            != focus_validation.to_dict()
+        ):
+            raise DeliveryContractError("issue_focus_effect_binding_mismatch")
+    elif contract_has_focus or str(claim.contract.get("schema_version") or "") == "g1q3_delivery_contract_v2":
+        raise DeliveryContractError("issue_focus_effect_missing")
     validate_delivery_subscription_target(
         effect_kind=claim.effect_kind,
         target_key=claim.target_key,
@@ -3264,10 +3313,21 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
     ):
         raise DeliveryContractError("delivery_effect_review_boundary_invalid")
     expected_report_link = claim.report_url
+    if schema_version == DELIVERY_EFFECT_SCHEMA_VERSION:
+        expected_result_field = render_public_rca_result_field(
+            claim.contract,
+            terminal_class=str(payload.get("terminal_class") or ""),
+        )
+        if payload.get("result_field_value") != expected_result_field:
+            raise DeliveryContractError("delivery_result_field_projection_invalid")
+    else:
+        # v3 bound the result field directly to the comment conclusion.  Keep
+        # that stored meaning intact instead of applying the v4 projection.
+        expected_result_field = payload.get("conclusion")
     expected_field_updates = [
         {
             "field_key": RCA_RESULT_FIELD_KEY,
-            "field_value": payload.get("conclusion"),
+            "field_value": expected_result_field,
         },
         {
             "field_key": RCA_REPORT_FIELD_KEY,
@@ -3335,9 +3395,15 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         )
     if content != expected_content:
         raise DeliveryContractError("delivery_effect_content_invalid")
-    replayed_oracle = evaluate_structural_tier(
+    replay_contract = delivery_oracle_contract(
         claim.contract,
-        publication_text=f"{conclusion}\n{content}",
+        focus_validation,
+    )
+    replayed_oracle = evaluate_structural_tier(
+        replay_contract,
+        publication_text=(
+            f"{conclusion}\n{expected_result_field}\n{content}"
+        ),
     )
     try:
         require_publishable(replayed_oracle)
@@ -3357,6 +3423,13 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
             "classification_conflict",
             "persisted quality oracle does not match replayed contract",
         )
+    if focus_validation is not None:
+        expected_focus_conclusion = render_public_rca_result(
+            claim.contract,
+            terminal_class=replayed_oracle.terminal_class,
+        )
+        if conclusion != expected_focus_conclusion:
+            raise DeliveryContractError("issue_focus_conclusion_projection_invalid")
     if claim.effect_kind == DELIVERY_THREAD_EFFECT_KIND:
         expected_uuid = delivery_effect_idempotency_uuid(claim.effect_key)
         if payload.get("idempotency_uuid") != expected_uuid:
@@ -3434,7 +3507,7 @@ def _validate_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         field_updates=(
             (
                 RCA_RESULT_FIELD_KEY,
-                str(payload.get("conclusion") or ""),
+                str(expected_result_field or ""),
             ),
             (RCA_REPORT_FIELD_KEY, str(expected_report_link or "")),
         )
@@ -3468,10 +3541,16 @@ def _validate_terminal_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
     schema_version = str(payload.get("schema_version") or "")
     if schema_version == TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_V1:
         diagnostic_code = ""
-    elif schema_version == TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION:
+    elif schema_version in {
+        TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
+        TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY,
+    }:
         diagnostic_code = str(claim.contract.get("diagnostic_code") or "")
         diagnostic_detail = str(claim.contract.get("diagnostic_detail") or "")
-    elif schema_version == TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION:
+    elif schema_version in {
+        TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
+        TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY,
+    }:
         diagnostic_code = ""
         diagnostic_detail = ""
     else:
@@ -3492,7 +3571,11 @@ def _validate_terminal_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         diagnostic_detail=diagnostic_detail,
         terminal_fallback=(
             claim.contract.get("terminal_fallback")
-            if schema_version == TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION
+            if schema_version
+            in {
+                TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
+                TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY,
+            }
             else None
         ),
         schema_version=schema_version,
@@ -3562,7 +3645,10 @@ def _validate_terminal_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
     marker = str(payload.get("marker") or "")
     if not content or content.splitlines().count(marker) != 1:
         raise DeliveryContractError("terminal_delivery_effect_marker_invalid")
-    if schema_version == TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION:
+    if schema_version in {
+        TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
+        TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY,
+    }:
         public_contract = claim.contract.get("public_contract")
         replayed_oracle = evaluate_structural_tier(
             public_contract if isinstance(public_contract, Mapping) else {},
@@ -3604,8 +3690,8 @@ def _validate_terminal_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
         claim.effect_kind == DELIVERY_EFFECT_KIND
         and not profile_terminal_comment_only
         and schema_version in {
-        TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
-        TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
+            TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION,
+            TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
         }
     ):
         field_updates = (
@@ -3619,6 +3705,11 @@ def _validate_terminal_effect(claim: DeliveryEffectClaim) -> ValidatedEffect:
                 ),
             ),
         )
+    if schema_version in {
+        TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY,
+        TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY,
+    } and payload.get("field_updates") != []:
+        raise DeliveryContractError("terminal_delivery_field_write_forbidden")
     return ValidatedEffect(
         effect_kind=claim.effect_kind,
         marker=marker,
@@ -4767,9 +4858,14 @@ class DeliveryDispatcher:
         if claim.effect_kind == DELIVERY_THREAD_EFFECT_KIND:
             operations = ("feishu_thread_reply",)
         else:
+            raw_field_updates = claim.payload.get("field_updates")
+            has_field_updates = isinstance(raw_field_updates, list) and bool(
+                raw_field_updates
+            )
             operations = (
-                "feishu_issue_comment",
-                "feishu_issue_field_update",
+                ("feishu_issue_comment", "feishu_issue_field_update")
+                if has_field_updates
+                else ("feishu_issue_comment",)
             )
         return build_historical_epoch_provider_claim(
             epoch_id=str(epoch.get("epoch_id") or ""),
