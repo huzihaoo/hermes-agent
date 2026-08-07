@@ -108,6 +108,172 @@ def _rows(store: RcaDeliveryStore) -> dict[str, list[dict]]:
     }
 
 
+_V11_W6_TRIGGER_SQL = (
+    """
+    CREATE TRIGGER trg_learning_lane_stock_effect_insert_forbidden
+    BEFORE INSERT ON rca_delivery_effects
+    WHEN NEW.effect_kind LIKE 'feishu_%'
+     AND EXISTS (
+         SELECT 1
+           FROM rca_delivery_jobs AS job
+           JOIN business_triggers AS bt
+             ON bt.business_key = job.business_key
+            AND bt.generation = job.generation
+           JOIN rca_learning_lane_cohorts AS cohort
+           JOIN rca_learning_lane_stock_items AS item
+             ON item.cohort_id = cohort.cohort_id
+            AND item.work_item_id = job.work_item_id
+          WHERE job.delivery_id = NEW.delivery_id
+            AND (
+                julianday(bt.created_at) IS NULL
+                OR julianday(cohort.stock_cutoff) IS NULL
+                OR julianday(bt.created_at) > julianday(cohort.stock_cutoff)
+            )
+            AND NOT EXISTS (
+                SELECT 1
+                  FROM rca_learning_lane_admissions AS admission
+                 WHERE admission.business_key = job.business_key
+                   AND admission.generation = job.generation
+                   AND admission.lane = 'learning'
+                   AND admission.external_write_allowed = 0
+            )
+     )
+    BEGIN
+        SELECT RAISE(ABORT, 'learning_lane_admission_missing');
+    END
+    """,
+    """
+    CREATE TRIGGER trg_learning_lane_stock_subscription_insert_forbidden
+    BEFORE INSERT ON rca_delivery_subscriptions
+    WHEN NEW.effect_kind LIKE 'feishu_%'
+     AND EXISTS (
+         SELECT 1
+           FROM business_triggers AS bt
+           JOIN rca_learning_lane_cohorts AS cohort
+           JOIN rca_learning_lane_stock_items AS item
+             ON item.cohort_id = cohort.cohort_id
+            AND item.work_item_id = bt.work_item_id
+          WHERE bt.business_key = NEW.business_key
+            AND bt.generation = NEW.generation
+            AND (
+                julianday(bt.created_at) IS NULL
+                OR julianday(cohort.stock_cutoff) IS NULL
+                OR julianday(bt.created_at) > julianday(cohort.stock_cutoff)
+            )
+            AND NOT EXISTS (
+                SELECT 1
+                  FROM rca_learning_lane_admissions AS admission
+                 WHERE admission.business_key = NEW.business_key
+                   AND admission.generation = NEW.generation
+                   AND admission.lane = 'learning'
+                   AND admission.external_write_allowed = 0
+            )
+     )
+    BEGIN
+        SELECT RAISE(ABORT, 'learning_lane_admission_missing');
+    END
+    """,
+    """
+    CREATE TRIGGER trg_learning_lane_stock_subscription_update_forbidden
+    BEFORE UPDATE OF business_key, generation, effect_kind
+        ON rca_delivery_subscriptions
+    WHEN NEW.effect_kind LIKE 'feishu_%'
+     AND EXISTS (
+         SELECT 1
+           FROM business_triggers AS bt
+           JOIN rca_learning_lane_cohorts AS cohort
+           JOIN rca_learning_lane_stock_items AS item
+             ON item.cohort_id = cohort.cohort_id
+            AND item.work_item_id = bt.work_item_id
+          WHERE bt.business_key = NEW.business_key
+            AND bt.generation = NEW.generation
+            AND (
+                julianday(bt.created_at) IS NULL
+                OR julianday(cohort.stock_cutoff) IS NULL
+                OR julianday(bt.created_at) > julianday(cohort.stock_cutoff)
+            )
+            AND NOT EXISTS (
+                SELECT 1
+                  FROM rca_learning_lane_admissions AS admission
+                 WHERE admission.business_key = NEW.business_key
+                   AND admission.generation = NEW.generation
+                   AND admission.lane = 'learning'
+                   AND admission.external_write_allowed = 0
+            )
+     )
+    BEGIN
+        SELECT RAISE(ABORT, 'learning_lane_admission_missing');
+    END
+    """,
+)
+
+
+def _restore_v11_w6_triggers(path: Path, *, update_marker: bool = False) -> None:
+    with sqlite3.connect(path) as conn:
+        for name in (
+            "trg_learning_lane_stock_effect_insert_forbidden",
+            "trg_learning_lane_stock_subscription_insert_forbidden",
+            "trg_learning_lane_stock_subscription_update_forbidden",
+        ):
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+        for statement in _V11_W6_TRIGGER_SQL:
+            conn.execute(statement)
+        if update_marker:
+            conn.execute(
+                "UPDATE rca_delivery_meta SET value = 'pnc_rca_delivery_store_v11' "
+                "WHERE key = 'schema_version'"
+            )
+        conn.commit()
+    path.chmod(0o600)
+
+
+def _normalize_sqlite_copy(path: Path) -> None:
+    """Materialize a standalone DELETE-journal copy after WAL writes finish."""
+    normalized = path.with_name(f"{path.name}.standalone")
+    if normalized.exists():
+        normalized.unlink()
+    source = sqlite3.connect(path)
+    destination = sqlite3.connect(normalized)
+    try:
+        source.backup(destination)
+        destination.execute("PRAGMA journal_mode=DELETE")
+        destination.commit()
+    finally:
+        destination.close()
+        source.close()
+    os.replace(normalized, path)
+    for suffix in ("-wal", "-shm", "-journal"):
+        sidecar = Path(f"{path}{suffix}")
+        if sidecar.exists():
+            sidecar.unlink()
+    path.chmod(0o600)
+
+
+def _downgrade_delivery_clone_to_v11(path: Path) -> None:
+    with sqlite3.connect(path) as conn:
+        tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    if {
+        "business_triggers",
+        "rca_learning_lane_admissions",
+        "rca_learning_lane_cohorts",
+        "rca_learning_lane_stock_items",
+    }.issubset(tables):
+        _restore_v11_w6_triggers(path, update_marker=True)
+    else:
+        with sqlite3.connect(path) as conn:
+            conn.execute(
+                "UPDATE rca_delivery_meta SET value = 'pnc_rca_delivery_store_v11' "
+                "WHERE key = 'schema_version'"
+            )
+            conn.commit()
+    path.chmod(0o600)
+
+
 def _seed_quarantine(root: Path) -> tuple[RcaDeliveryStore, str]:
     root.mkdir(parents=True, exist_ok=True)
     _control(root)
@@ -535,6 +701,13 @@ def _prepare_combined_schema_migration(
                 """,
                 (created_at, created_at, "d" * 64, created_at),
             )
+    # The v3 receipt is delivery-only and targets the historical v11 marker.
+    # Restore the predecessor trigger shape after the mutation connection has
+    # closed; opening a second SQLite writer while that connection is live can
+    # produce a platform-specific disk I/O error.
+    if shared_control_plane and source_version != "pnc_rca_delivery_store_v7":
+        _restore_v11_w6_triggers(live_path)
+    _normalize_sqlite_copy(live_path)
     live_path.chmod(0o600)
     source_backup = root / f"control.{source_version.rsplit('_', 1)[-1]}.backup.sqlite3"
     source = sqlite3.connect(live_path)
@@ -554,6 +727,18 @@ def _prepare_combined_schema_migration(
     shutil.copyfile(source_backup, clone_path)
     clone_path.chmod(0o600)
     RcaDeliveryStore(clone_path)
+    _downgrade_delivery_clone_to_v11(clone_path)
+    if not shared_control_plane:
+        # Isolated delivery fixtures predate W6 authority tables/triggers.
+        with sqlite3.connect(clone_path) as conn:
+            for name in (
+                "trg_learning_lane_stock_effect_insert_forbidden",
+                "trg_learning_lane_stock_subscription_insert_forbidden",
+                "trg_learning_lane_stock_subscription_update_forbidden",
+            ):
+                conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+            conn.commit()
+    _normalize_sqlite_copy(clone_path)
     with sqlite3.connect(clone_path) as conn:
         assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -638,10 +823,8 @@ def _prepare_combined_quarantine_migration(
     shutil.copyfile(source_backup, clone)
     clone.chmod(0o600)
     RcaDeliveryStore(clone)
-    with sqlite3.connect(clone) as conn:
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        conn.execute("PRAGMA journal_mode=DELETE")
-    clone.chmod(0o600)
+    _downgrade_delivery_clone_to_v11(clone)
+    _normalize_sqlite_copy(clone)
     with sqlite3.connect(source_backup) as conn:
         conn.row_factory = sqlite3.Row
         source_schema_sha256 = logical_database_projection(conn)["schema_sha256"]
@@ -691,7 +874,7 @@ def test_combined_v2_offline_receipt_requires_quick_checked_copy_and_rollback(
     )
     assert (
         binding["target_schema_version"]
-        == delivery_store_module.DELIVERY_STORE_SCHEMA_VERSION
+        == "pnc_rca_delivery_store_v11"
     )
     assert binding["source_quick_check"] == "ok"
     assert binding["target_quick_check"] == "ok"
@@ -722,7 +905,7 @@ def test_combined_v2_offline_receipt_requires_quick_checked_copy_and_rollback(
         "selector": {"key": "schema_version"},
         "column": "value",
         "source_value": source_version,
-        "target_value": delivery_store_module.DELIVERY_STORE_SCHEMA_VERSION,
+        "target_value": "pnc_rca_delivery_store_v11",
     }
     expected_variant = {
         "pnc_rca_delivery_store_v7": "active_prod_v7_no_adjudication_v1",
@@ -922,10 +1105,8 @@ def test_combined_v2_receipt_binds_w5_cutoff_backfill_for_legacy_v7_source(
     shutil.copyfile(source_backup, clone)
     clone.chmod(0o600)
     RcaDeliveryStore(clone)
-    with sqlite3.connect(clone) as conn:
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        conn.execute("PRAGMA journal_mode=DELETE")
-    clone.chmod(0o600)
+    _downgrade_delivery_clone_to_v11(clone)
+    _normalize_sqlite_copy(clone)
     with sqlite3.connect(source_backup) as conn:
         conn.row_factory = sqlite3.Row
         source_schema_sha256 = logical_database_projection(conn)["schema_sha256"]
@@ -1127,9 +1308,8 @@ def _unrelated_v9_clone(path: Path) -> Path:
             "VALUES('unrelated_business_state', 'B')"
         )
         conn.commit()
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        conn.execute("PRAGMA journal_mode=DELETE")
-    path.chmod(0o600)
+    _downgrade_delivery_clone_to_v11(path)
+    _normalize_sqlite_copy(path)
     return path
 
 
@@ -1215,10 +1395,10 @@ def test_combined_v2_live_pre_and_post_gates_bind_exact_source_clone_and_rollbac
         migration["source_backup"].read_bytes()
     ).hexdigest()
 
-    RcaDeliveryStore(migration["live_path"])
-    with sqlite3.connect(migration["live_path"]) as conn:
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        conn.execute("PRAGMA journal_mode=DELETE")
+    # v3 is the historical delivery-only v11 receipt.  Simulate the
+    # post-migration replacement with its already-validated offline clone;
+    # v11->v12 is covered by the coupled v4 contract tests.
+    shutil.copyfile(migration["clone_path"], migration["live_path"])
     migration["live_path"].chmod(0o600)
     post = assert_combined_live_post_migration_matches(
         receipt_path=migration["receipt_path"],
@@ -1230,7 +1410,7 @@ def test_combined_v2_live_pre_and_post_gates_bind_exact_source_clone_and_rollbac
 
     assert (
         post["live_validation"]["schema_version"]
-        == delivery_store_module.DELIVERY_STORE_SCHEMA_VERSION
+        == "pnc_rca_delivery_store_v11"
     )
     assert post["live_validation"]["quick_check"] == "ok"
     assert post["live_validation"]["sidecars"] == []

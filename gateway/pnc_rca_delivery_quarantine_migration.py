@@ -19,6 +19,9 @@ from gateway.pnc_rca_conclusion_adjudication import (
 SCHEMA_VERSION = "pnc_rca_delivery_quarantine_offline_migration_v1"
 SOURCE_SCHEMA_VERSION = "pnc_rca_delivery_store_v6"
 TARGET_SCHEMA_VERSION = "pnc_rca_delivery_store_v8"
+# v3 is the historical delivery-only receipt.  Its target is intentionally
+# frozen at v11; changing this in place would make already-issued v3 receipts
+# unverifiable.  The v13/v11 coupled migration below has its own v4 receipt.
 COMBINED_SCHEMA_VERSION = "pnc_rca_delivery_store_offline_migration_v3"
 COMBINED_SOURCE_SCHEMA_VERSIONS = frozenset(
     {
@@ -27,7 +30,14 @@ COMBINED_SOURCE_SCHEMA_VERSIONS = frozenset(
         "pnc_rca_delivery_store_v10",
     }
 )
-COMBINED_TARGET_SCHEMA_VERSION = "pnc_rca_delivery_store_v12"
+COMBINED_TARGET_SCHEMA_VERSION = "pnc_rca_delivery_store_v11"
+# Coupled control+delivery migration introduced by the terminal-rerun
+# authority release (control v13 -> v14, delivery v11 -> v12).
+COUPLED_SCHEMA_VERSION = "pnc_rca_delivery_store_offline_migration_v4"
+COUPLED_SOURCE_CONTROL_SCHEMA_VERSION = "pnc_rca_control_store_v13"
+COUPLED_SOURCE_DELIVERY_SCHEMA_VERSION = "pnc_rca_delivery_store_v11"
+COUPLED_TARGET_CONTROL_SCHEMA_VERSION = "pnc_rca_control_store_v14"
+COUPLED_TARGET_DELIVERY_SCHEMA_VERSION = "pnc_rca_delivery_store_v12"
 MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
 _HEX64 = frozenset("0123456789abcdef")
 _FIELDS = frozenset({
@@ -330,6 +340,100 @@ _COMBINED_CONDITIONAL_OBJECTS = {
 }
 _COMBINED_W2_SOURCE_TABLES = frozenset(
     {"rca_conclusion_adjudications", "rca_failure_routes"}
+)
+
+_COUPLED_AUTHORITY_TABLE = "rca_terminal_rerun_delivery_authorities"
+_COUPLED_AUTHORITY_OBJECTS = {
+    _COUPLED_AUTHORITY_TABLE: (
+        "table",
+        _COUPLED_AUTHORITY_TABLE,
+        "d34c4c0b775ca202949b6bfcf09c6d8b35e16bac850465da277d67c26843d7fe",
+    ),
+    "idx_terminal_rerun_delivery_authority_issue": (
+        "index",
+        _COUPLED_AUTHORITY_TABLE,
+        "3f6fc56fb12e6871eaf71f6196eea8fcaeb423dde7444fad125d07ef8776bbdf",
+    ),
+    "trg_terminal_rerun_delivery_authority_no_update": (
+        "trigger",
+        _COUPLED_AUTHORITY_TABLE,
+        "b043a4c94a83fb50e1900ff972885c867f90f657aaf5a5c6cb3fb8cbe858dc05",
+    ),
+    "trg_terminal_rerun_delivery_authority_no_delete": (
+        "trigger",
+        _COUPLED_AUTHORITY_TABLE,
+        "45c685cd2f81d3c91413b1635ed3e0008c6df8d018e14eb93ae4d57a99e0206c",
+    ),
+    "trg_terminal_rerun_delivery_authority_no_replace": (
+        "trigger",
+        _COUPLED_AUTHORITY_TABLE,
+        "c2c4047447e4e4273b0e1d272ce881c64f0ec3be3e7d7ac981795426ccb322ee",
+    ),
+    "trg_terminal_rerun_delivery_authority_projection_guard": (
+        "trigger",
+        _COUPLED_AUTHORITY_TABLE,
+        "31a78aed0c7eb49daddde5a4f616205aa7e57470dc3685fe87d0bfc3563125c9",
+    ),
+    "trg_terminal_rerun_delivery_authority_binding_guard": (
+        "trigger",
+        _COUPLED_AUTHORITY_TABLE,
+        "19267706806740eaf25a062b15f8a3fccb248cb510806a766a55a5921f941e46",
+    ),
+}
+_COUPLED_AUTHORITY_OBJECT_NAMES = frozenset(_COUPLED_AUTHORITY_OBJECTS)
+_COUPLED_W6_TRIGGER_NAMES = (
+    "trg_learning_lane_stock_effect_insert_forbidden",
+    "trg_learning_lane_stock_subscription_insert_forbidden",
+    "trg_learning_lane_stock_subscription_update_forbidden",
+)
+_COUPLED_W6_TARGET_HASHES = {
+    "trg_learning_lane_stock_effect_insert_forbidden":
+        "a3260673c39df57c96dddcb6536f3447f5cf48834a4733aada055d374756e772",
+    "trg_learning_lane_stock_subscription_insert_forbidden":
+        "a3e4bd9de856da418fef333271d1826e86aa534ddd746fc4758f9658192f81ad",
+    "trg_learning_lane_stock_subscription_update_forbidden":
+        "16aa5bef418e77331ede6faaefccbebe20aea9b313362328a003f76119261d7f",
+}
+_COUPLED_RECEIPT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "source_backup",
+        "source_schema_contract",
+        "source_control_schema_version",
+        "source_delivery_schema_version",
+        "source_logical_projection",
+        "source_health",
+        "migrated_clone",
+        "target_live_db_path",
+        "target_control_schema_version",
+        "target_delivery_schema_version",
+        "post_migration_logical_projection",
+        "post_migration_health",
+        "cross_projection_preservation",
+        "migration_runtime_sha256",
+        "migration_semantics",
+        "no_live_database_writes",
+    }
+)
+_COUPLED_PRESERVATION_FIELDS = frozenset(
+    {
+        "policy",
+        "source_owned_schema",
+        "common_business_tables",
+        "authority_table",
+        "w6_trigger_replacement",
+    }
+)
+_COUPLED_SEMANTICS_FIELDS = frozenset(
+    {
+        "execution_mode",
+        "copy_method",
+        "quick_check_gate",
+        "rollback_path",
+        "rollback_sha256",
+        "live_replacement_performed",
+        "control_delivery_atomicity",
+    }
 )
 
 
@@ -1092,21 +1196,57 @@ def _validate_combined_target_schema_contract(conn: sqlite3.Connection) -> None:
     )
 
 
-def validate_combined_target_schema(conn: sqlite3.Connection) -> dict[str, Any]:
-    """Validate the complete current target without mutating it."""
+def _validate_current_delivery_target_schema(
+    conn: sqlite3.Connection,
+) -> dict[str, Any]:
+    """Validate the resident v12 delivery schema without opening a writer."""
 
-    schema_version = _schema_version(conn)
-    if schema_version != COMBINED_TARGET_SCHEMA_VERSION:
+    # Import lazily: the delivery store imports control-store helpers, while
+    # this module is also imported by the release freshness gate.
+    from gateway.pnc_rca_delivery_store import (
+        DELIVERY_STORE_SCHEMA_VERSION,
+        RcaDeliveryStore,
+    )
+
+    if _schema_version(conn) != DELIVERY_STORE_SCHEMA_VERSION:
         raise QuarantineMigrationError(
             "delivery_store_combined_migration_target_schema_invalid"
         )
-    _validate_combined_target_schema_contract(conn)
+    try:
+        validate_conclusion_adjudication_schema(conn)
+    except RuntimeError as exc:
+        raise QuarantineMigrationError(
+            "delivery_store_combined_migration_target_schema_contract_invalid"
+        ) from exc
+    # These validators are deliberately the same read-only predicates used by
+    # RcaDeliveryStore(require_current=True).  Preserve their detailed reason
+    # codes so migration-order failures remain diagnosable by the gate.
+    RcaDeliveryStore._validate_failure_route_schema(conn)
+    RcaDeliveryStore._validate_comment_slot_schema(conn)
+    RcaDeliveryStore._validate_subscription_observability_schema(conn)
+    RcaDeliveryStore._validate_delivery_observation_outbox_schema(conn)
+    RcaDeliveryStore._validate_w6_effect_guards(conn)
     health = _combined_database_health(conn)
     return {
-        "schema_version": schema_version,
-        "canonical_object_count": len(_COMBINED_CANONICAL_TARGET_OBJECTS),
+        "schema_version": DELIVERY_STORE_SCHEMA_VERSION,
+        "canonical_object_count": len(_normalized_schema_objects(conn)),
         **health,
     }
+
+
+def validate_combined_target_schema(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Validate either the historical v11 or resident v12 target read-only."""
+
+    schema_version = _schema_version(conn)
+    if schema_version == COMBINED_TARGET_SCHEMA_VERSION:
+        _validate_combined_target_schema_contract(conn)
+        health = _combined_database_health(conn)
+        return {
+            "schema_version": schema_version,
+            "canonical_object_count": len(_COMBINED_CANONICAL_TARGET_OBJECTS),
+            **health,
+        }
+    return _validate_current_delivery_target_schema(conn)
 
 
 def _expected_effects_target_schema_sql(source_sql: str) -> str:
@@ -2011,7 +2151,7 @@ def _validate_combined_artifact_binding(
     return path, sha256, size
 
 
-def validate_combined_migration_receipt(
+def _validate_v3_combined_migration_receipt(
     *,
     receipt_path: str | Path,
     expected_sha256: str,
@@ -2202,6 +2342,44 @@ def validate_combined_migration_receipt(
     }
 
 
+def validate_combined_migration_receipt(
+    *,
+    receipt_path: str | Path,
+    expected_sha256: str,
+    target_live_db_path: str | Path,
+    expected_migration_runtime_sha256: str,
+    expected_source_schema_sha256: str,
+    migrated_db_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Dispatch the immutable v3 delivery or v4 coupled receipt validator."""
+
+    raw, observed_sha256 = _read_owner_artifact(
+        receipt_path, artifact="delivery_store_combined_migration_receipt"
+    )
+    if observed_sha256 != _hex64(expected_sha256):
+        raise QuarantineMigrationError(
+            "delivery_store_combined_migration_receipt_sha256_mismatch"
+        )
+    parsed = _strict_json(raw)
+    if parsed.get("schema_version") == COUPLED_SCHEMA_VERSION:
+        return validate_coupled_migration_receipt(
+            receipt_path=receipt_path,
+            expected_sha256=expected_sha256,
+            target_live_db_path=target_live_db_path,
+            expected_migration_runtime_sha256=expected_migration_runtime_sha256,
+            expected_source_schema_sha256=expected_source_schema_sha256,
+            migrated_db_path=migrated_db_path,
+        )
+    return _validate_v3_combined_migration_receipt(
+        receipt_path=receipt_path,
+        expected_sha256=expected_sha256,
+        target_live_db_path=target_live_db_path,
+        expected_migration_runtime_sha256=expected_migration_runtime_sha256,
+        expected_source_schema_sha256=expected_source_schema_sha256,
+        migrated_db_path=migrated_db_path,
+    )
+
+
 def _combined_receipt_projections(
     *,
     receipt_path: str | Path,
@@ -2310,6 +2488,567 @@ def assert_combined_live_post_migration_matches(
         "live_post_migration_schema_sha256": projection["schema_sha256"],
         "live_post_migration_logical_sha256": projection["logical_sha256"],
         "live_validation": live_observation,
+    }
+
+
+def _control_schema_version(conn: sqlite3.Connection) -> str:
+    row = conn.execute(
+        "SELECT value FROM control_meta WHERE key = 'schema_version'"
+    ).fetchone()
+    return str(row[0] if row is not None else "")
+
+
+def _coupled_rows_sha256(rows: list[dict[str, Any]]) -> str:
+    return hashlib.sha256(_canonical(rows)).hexdigest()
+
+
+def _coupled_normalize_marker_rows(
+    table: str,
+    rows: list[dict[str, Any]],
+    *,
+    source_value: str,
+    target_value: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    source = [dict(row) for row in rows]
+    target = [dict(row) for row in rows]
+    marker_rows = [row for row in source if row.get("key") == "schema_version"]
+    if table not in {"control_meta", "rca_delivery_meta"} or len(marker_rows) != 1:
+        raise QuarantineMigrationError(
+            "delivery_store_coupled_migration_marker_projection_invalid"
+        )
+    if marker_rows[0].get("value") != source_value:
+        raise QuarantineMigrationError(
+            "delivery_store_coupled_migration_source_marker_invalid"
+        )
+    for row in target:
+        if row.get("key") == "schema_version":
+            row["value"] = target_value
+    return source, target
+
+
+def _coupled_preservation(
+    *,
+    source: sqlite3.Connection,
+    clone: sqlite3.Connection,
+    source_projection: Mapping[str, Any],
+    target_projection: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Prove the v13/v11 clone only adds the v14 authority schema."""
+
+    source_tables = set(source_projection.get("tables", {}))
+    target_tables = set(target_projection.get("tables", {}))
+    if not source_tables.issubset(target_tables):
+        raise QuarantineMigrationError(
+            "delivery_store_coupled_migration_table_removed"
+        )
+    added_tables = target_tables - source_tables
+    if added_tables != {_COUPLED_AUTHORITY_TABLE}:
+        raise QuarantineMigrationError(
+            "delivery_store_coupled_migration_added_table_invalid"
+        )
+
+    common_tables = sorted(
+        source_tables & target_tables - {"sqlite_sequence", _COUPLED_AUTHORITY_TABLE}
+    )
+    table_evidence: dict[str, Any] = {}
+    for table in common_tables:
+        source_info = source_projection["tables"][table]
+        target_info = target_projection["tables"][table]
+        if (
+            source_info["columns"] != target_info["columns"]
+            or source_info["primary_key"] != target_info["primary_key"]
+        ):
+            raise QuarantineMigrationError(
+                "delivery_store_coupled_migration_common_columns_drift"
+            )
+        columns = list(source_info["columns"])
+        order = list(source_info["primary_key"]) or columns
+        source_rows = _project_table_rows(
+            source, table=table, columns=columns, order=order
+        )
+        target_rows = _project_table_rows(
+            clone, table=table, columns=columns, order=order
+        )
+        if table == "control_meta":
+            source_rows, expected_target_rows = _coupled_normalize_marker_rows(
+                table,
+                source_rows,
+                source_value=COUPLED_SOURCE_CONTROL_SCHEMA_VERSION,
+                target_value=COUPLED_TARGET_CONTROL_SCHEMA_VERSION,
+            )
+        elif table == "rca_delivery_meta":
+            source_rows, expected_target_rows = _coupled_normalize_marker_rows(
+                table,
+                source_rows,
+                source_value=COUPLED_SOURCE_DELIVERY_SCHEMA_VERSION,
+                target_value=COUPLED_TARGET_DELIVERY_SCHEMA_VERSION,
+            )
+        else:
+            expected_target_rows = source_rows
+        if target_rows != expected_target_rows:
+            raise QuarantineMigrationError(
+                "delivery_store_coupled_migration_common_rows_drift"
+            )
+        source_rows_sha256 = _coupled_rows_sha256(source_rows)
+        target_rows_sha256 = _coupled_rows_sha256(target_rows)
+        if (
+            len(source_rows) != source_info["row_count"]
+            or source_info["rows_sha256"] != source_rows_sha256
+            or len(target_rows) != target_info["row_count"]
+            or target_info["rows_sha256"] != target_rows_sha256
+        ):
+            # Marker rows are deliberately normalized only for the comparison;
+            # the raw projection still binds the exact source/target bytes.
+            if table not in {"control_meta", "rca_delivery_meta"}:
+                raise QuarantineMigrationError(
+                    "delivery_store_coupled_migration_common_rows_drift"
+                )
+        table_evidence[table] = {
+            "columns": columns,
+            "primary_key": list(source_info["primary_key"]),
+            "source_row_count": len(source_rows),
+            "target_row_count": len(target_rows),
+            "source_rows_sha256": source_rows_sha256,
+            "target_rows_sha256": target_rows_sha256,
+            "marker_normalization": (
+                "control_v13_to_v14"
+                if table == "control_meta"
+                else "delivery_v11_to_v12"
+                if table == "rca_delivery_meta"
+                else "none"
+            ),
+        }
+
+    source_objects = _normalized_schema_objects(source)
+    target_objects = _normalized_schema_objects(clone)
+    if _COUPLED_AUTHORITY_OBJECT_NAMES & set(source_objects):
+        raise QuarantineMigrationError(
+            "delivery_store_coupled_migration_source_authority_present"
+        )
+    added_objects = set(target_objects) - set(source_objects)
+    if added_objects != _COUPLED_AUTHORITY_OBJECT_NAMES:
+        raise QuarantineMigrationError(
+            "delivery_store_coupled_migration_added_authority_objects_invalid"
+        )
+    object_evidence: dict[str, Any] = {}
+    for name in sorted(set(source_objects) & set(target_objects)):
+        source_item = source_objects[name]
+        target_item = target_objects[name]
+        source_hash = hashlib.sha256(
+            source_item["normalized_sql"].encode()
+        ).hexdigest()
+        target_hash = hashlib.sha256(
+            target_item["normalized_sql"].encode()
+        ).hexdigest()
+        if name in _COUPLED_W6_TRIGGER_NAMES:
+            expected_hash = _COUPLED_W6_TARGET_HASHES[name]
+            if target_hash != expected_hash or source_hash == target_hash:
+                raise QuarantineMigrationError(
+                    "delivery_store_coupled_migration_w6_trigger_replacement_invalid"
+                )
+        elif (
+            source_item["type"] != target_item["type"]
+            or source_item["table"] != target_item["table"]
+            or source_item["normalized_sql"] != target_item["normalized_sql"]
+        ):
+            raise QuarantineMigrationError(
+                "delivery_store_coupled_migration_common_schema_drift"
+            )
+        object_evidence[name] = {
+            "type": source_item["type"],
+            "table": source_item["table"],
+            "source_sql_sha256": source_hash,
+            "target_sql_sha256": target_hash,
+        }
+    authority_objects: dict[str, Any] = {}
+    for name, (expected_type, expected_table, expected_hash) in sorted(
+        _COUPLED_AUTHORITY_OBJECTS.items()
+    ):
+        item = target_objects.get(name)
+        if item is None:
+            raise QuarantineMigrationError(
+                "delivery_store_coupled_migration_authority_object_missing"
+            )
+        observed_hash = hashlib.sha256(
+            item["normalized_sql"].encode()
+        ).hexdigest()
+        if (
+            item["type"] != expected_type
+            or item["table"] != expected_table
+            or observed_hash != expected_hash
+        ):
+            raise QuarantineMigrationError(
+                "delivery_store_coupled_migration_authority_object_invalid"
+            )
+        authority_objects[name] = {
+            "type": item["type"],
+            "table": item["table"],
+            "sql_sha256": observed_hash,
+        }
+
+    authority_info = target_projection["tables"].get(_COUPLED_AUTHORITY_TABLE)
+    if authority_info is None or authority_info["row_count"] != 0:
+        raise QuarantineMigrationError(
+            "delivery_store_coupled_migration_authority_rows_nonempty"
+        )
+    authority_rows_sha256 = _coupled_rows_sha256([])
+    if authority_info["rows_sha256"] != authority_rows_sha256:
+        raise QuarantineMigrationError(
+            "delivery_store_coupled_migration_authority_rows_invalid"
+        )
+    w6_replacement = {
+        name: {
+            "source_sql_sha256": object_evidence[name]["source_sql_sha256"],
+            "target_sql_sha256": object_evidence[name]["target_sql_sha256"],
+            "target_contract_sha256": _COUPLED_W6_TARGET_HASHES[name],
+        }
+        for name in _COUPLED_W6_TRIGGER_NAMES
+    }
+    return {
+        "policy": "common_business_tables_exact_v1",
+        "source_owned_schema": {
+            "policy": "all_common_sqlite_master_objects_exact_except_w6_v1",
+            "conditional_schema_shape": {
+                "schema_version": "pnc_rca_coupled_conditional_schema_shape_v1",
+                "source_tables_sha256": hashlib.sha256(
+                    _canonical(sorted(source_tables))
+                ).hexdigest(),
+            },
+            "source_owned_objects": object_evidence,
+            "added_target_objects": authority_objects,
+        },
+        "common_business_tables": table_evidence,
+        "authority_table": {
+            "name": _COUPLED_AUTHORITY_TABLE,
+            "source_present": False,
+            "target_row_count": 0,
+            "target_rows_sha256": authority_rows_sha256,
+        },
+        "w6_trigger_replacement": {
+            "policy": "exact_target_contract_source_diff_v1",
+            "triggers": w6_replacement,
+        },
+    }
+
+
+def build_coupled_offline_migration_receipt(
+    *,
+    source_backup_path: str | Path,
+    migrated_clone_path: str | Path,
+    target_live_db_path: str | Path,
+    migration_runtime_sha256: str,
+    expected_source_schema_sha256: str,
+) -> dict[str, Any]:
+    """Build a v4 control-v13/delivery-v11 offline clone receipt."""
+
+    source_path = Path(source_backup_path).expanduser().absolute()
+    clone_path = Path(migrated_clone_path).expanduser().absolute()
+    target_path = Path(target_live_db_path).expanduser().absolute()
+    if len({str(source_path), str(clone_path), str(target_path)}) != 3:
+        raise QuarantineMigrationError(
+            "delivery_store_coupled_migration_paths_not_isolated"
+        )
+    source_raw, source_sha256 = _read_owner_artifact(
+        source_path, artifact="delivery_store_coupled_source_backup"
+    )
+    clone_raw, clone_sha256 = _read_owner_artifact(
+        clone_path, artifact="delivery_store_coupled_migrated_clone"
+    )
+    if not source_raw.startswith(b"SQLite format 3\x00") or not clone_raw.startswith(
+        b"SQLite format 3\x00"
+    ):
+        raise QuarantineMigrationError(
+            "delivery_store_coupled_migration_database_invalid"
+        )
+    with (
+        _open_readonly(
+            source_path,
+            artifact="delivery_store_coupled_source_backup",
+            require_standalone=True,
+        ) as source,
+        _open_readonly(
+            clone_path,
+            artifact="delivery_store_coupled_migrated_clone",
+            require_standalone=True,
+        ) as clone,
+    ):
+        source.execute("BEGIN")
+        clone.execute("BEGIN")
+        source_control = _control_schema_version(source)
+        source_delivery = _schema_version(source)
+        target_control = _control_schema_version(clone)
+        target_delivery = _schema_version(clone)
+        if (
+            source_control != COUPLED_SOURCE_CONTROL_SCHEMA_VERSION
+            or source_delivery != COUPLED_SOURCE_DELIVERY_SCHEMA_VERSION
+        ):
+            raise QuarantineMigrationError(
+                "delivery_store_coupled_migration_source_schema_invalid"
+            )
+        if (
+            target_control != COUPLED_TARGET_CONTROL_SCHEMA_VERSION
+            or target_delivery != COUPLED_TARGET_DELIVERY_SCHEMA_VERSION
+        ):
+            raise QuarantineMigrationError(
+                "delivery_store_coupled_migration_target_schema_invalid"
+            )
+        source_health = _combined_database_health(source)
+        target_health = _combined_database_health(clone)
+        if source_health["journal_mode"] != "delete":
+            raise QuarantineMigrationError(
+                "delivery_store_coupled_source_backup_not_standalone"
+            )
+        source_projection = logical_database_projection(source)
+        target_projection = logical_database_projection(clone)
+        expected_source_sha256 = _hex64(expected_source_schema_sha256)
+        if source_projection["schema_sha256"] != expected_source_sha256:
+            raise QuarantineMigrationError(
+                "delivery_store_coupled_migration_source_schema_contract_invalid"
+            )
+        preservation = _coupled_preservation(
+            source=source,
+            clone=clone,
+            source_projection=source_projection,
+            target_projection=target_projection,
+        )
+        receipt = {
+            "schema_version": COUPLED_SCHEMA_VERSION,
+            "source_backup": {
+                "path": str(source_path),
+                "sha256": source_sha256,
+                "size_bytes": len(source_raw),
+            },
+            "source_schema_contract": {
+                "contract_id": "external_coupled_full_schema_v1",
+                "schema_sha256": expected_source_sha256,
+                "authority": "caller_supplied_external_predecessor_schema",
+            },
+            "source_control_schema_version": source_control,
+            "source_delivery_schema_version": source_delivery,
+            "source_logical_projection": source_projection,
+            "source_health": source_health,
+            "migrated_clone": {
+                "path": str(clone_path),
+                "sha256": clone_sha256,
+                "size_bytes": len(clone_raw),
+            },
+            "target_live_db_path": str(target_path),
+            "target_control_schema_version": target_control,
+            "target_delivery_schema_version": target_delivery,
+            "post_migration_logical_projection": target_projection,
+            "post_migration_health": target_health,
+            "cross_projection_preservation": preservation,
+            "migration_runtime_sha256": _hex64(migration_runtime_sha256),
+            "migration_semantics": {
+                "execution_mode": "offline_clone_only",
+                "copy_method": "sqlite_backup_then_filesystem_clone_v1",
+                "quick_check_gate": "source_and_clone_ok_before_receipt",
+                "rollback_path": str(source_path),
+                "rollback_sha256": source_sha256,
+                "live_replacement_performed": False,
+                "control_delivery_atomicity": "single_offline_clone_receipt_v1",
+            },
+            "no_live_database_writes": True,
+        }
+        source.rollback()
+        clone.rollback()
+        return receipt
+
+
+def _validate_coupled_semantics(value: Any, *, rollback_path: str, rollback_sha256: str) -> None:
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != _COUPLED_SEMANTICS_FIELDS
+        or value.get("execution_mode") != "offline_clone_only"
+        or value.get("copy_method") != "sqlite_backup_then_filesystem_clone_v1"
+        or value.get("quick_check_gate") != "source_and_clone_ok_before_receipt"
+        or value.get("rollback_path") != rollback_path
+        or value.get("rollback_sha256") != rollback_sha256
+        or value.get("live_replacement_performed") is not False
+        or value.get("control_delivery_atomicity")
+        != "single_offline_clone_receipt_v1"
+    ):
+        raise QuarantineMigrationError(
+            "delivery_store_coupled_migration_semantics_invalid"
+        )
+
+
+def validate_coupled_migration_receipt(
+    *,
+    receipt_path: str | Path,
+    expected_sha256: str,
+    target_live_db_path: str | Path,
+    expected_migration_runtime_sha256: str,
+    expected_source_schema_sha256: str,
+    migrated_db_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Recompute and validate a v4 coupled migration receipt read-only."""
+
+    raw, observed_sha256 = _read_owner_artifact(
+        receipt_path, artifact="delivery_store_coupled_migration_receipt"
+    )
+    if observed_sha256 != _hex64(expected_sha256):
+        raise QuarantineMigrationError(
+            "delivery_store_coupled_migration_receipt_sha256_mismatch"
+        )
+    value = _strict_json(raw)
+    if raw != canonical_migration_receipt_bytes(value):
+        raise QuarantineMigrationError(
+            "delivery_store_coupled_migration_receipt_not_canonical"
+        )
+    source_path, source_sha256, source_size = _validate_combined_artifact_binding(
+        value.get("source_backup"), label="delivery_store_coupled_source_backup"
+    )
+    clone_path, clone_sha256, clone_size = _validate_combined_artifact_binding(
+        value.get("migrated_clone"), label="delivery_store_coupled_migrated_clone"
+    )
+    source_projection = _validate_projection(value.get("source_logical_projection"))
+    target_projection = _validate_projection(
+        value.get("post_migration_logical_projection")
+    )
+    source_health = _validate_combined_health(value.get("source_health"))
+    target_health = _validate_combined_health(value.get("post_migration_health"))
+    target_path = str(Path(target_live_db_path).expanduser().absolute())
+    expected_runtime = _hex64(expected_migration_runtime_sha256)
+    runtime_sha256 = _hex64(value.get("migration_runtime_sha256"))
+    source_contract = value.get("source_schema_contract")
+    expected_source = _hex64(expected_source_schema_sha256)
+    preservation = value.get("cross_projection_preservation")
+    if (
+        set(value) != _COUPLED_RECEIPT_FIELDS
+        or value.get("schema_version") != COUPLED_SCHEMA_VERSION
+        or value.get("source_control_schema_version")
+        != COUPLED_SOURCE_CONTROL_SCHEMA_VERSION
+        or value.get("source_delivery_schema_version")
+        != COUPLED_SOURCE_DELIVERY_SCHEMA_VERSION
+        or value.get("target_control_schema_version")
+        != COUPLED_TARGET_CONTROL_SCHEMA_VERSION
+        or value.get("target_delivery_schema_version")
+        != COUPLED_TARGET_DELIVERY_SCHEMA_VERSION
+        or value.get("target_live_db_path") != target_path
+        or len({str(source_path), str(clone_path), target_path}) != 3
+        or value.get("no_live_database_writes") is not True
+        or not isinstance(source_contract, Mapping)
+        or set(source_contract)
+        != {"contract_id", "schema_sha256", "authority"}
+        or source_contract.get("contract_id") != "external_coupled_full_schema_v1"
+        or source_contract.get("schema_sha256") != expected_source
+        or source_contract.get("authority")
+        != "caller_supplied_external_predecessor_schema"
+        or source_projection.get("schema_sha256") != expected_source
+        or runtime_sha256 != expected_runtime
+        or source_health["journal_mode"] != "delete"
+    ):
+        raise QuarantineMigrationError(
+            "delivery_store_coupled_migration_receipt_scope_invalid"
+        )
+    _validate_coupled_semantics(
+        value.get("migration_semantics"),
+        rollback_path=str(source_path),
+        rollback_sha256=source_sha256,
+    )
+    if not isinstance(preservation, Mapping) or set(preservation) != _COUPLED_PRESERVATION_FIELDS:
+        raise QuarantineMigrationError(
+            "delivery_store_coupled_migration_preservation_invalid"
+        )
+    source_raw, observed_source_sha256 = _read_owner_artifact(
+        source_path, artifact="delivery_store_coupled_source_backup"
+    )
+    clone_raw, observed_clone_sha256 = _read_owner_artifact(
+        clone_path, artifact="delivery_store_coupled_migrated_clone"
+    )
+    with (
+        _open_readonly(
+            source_path,
+            artifact="delivery_store_coupled_source_backup",
+            require_standalone=True,
+        ) as source,
+        _open_readonly(
+            clone_path,
+            artifact="delivery_store_coupled_migrated_clone",
+            require_standalone=True,
+        ) as clone,
+    ):
+        source.execute("BEGIN")
+        clone.execute("BEGIN")
+        observed_source_control = _control_schema_version(source)
+        observed_source_delivery = _schema_version(source)
+        observed_target_control = _control_schema_version(clone)
+        observed_target_delivery = _schema_version(clone)
+        observed_source_health = _combined_database_health(source)
+        observed_target_health = _combined_database_health(clone)
+        observed_source_projection = logical_database_projection(source)
+        observed_target_projection = logical_database_projection(clone)
+        observed_preservation = _coupled_preservation(
+            source=source,
+            clone=clone,
+            source_projection=observed_source_projection,
+            target_projection=observed_target_projection,
+        )
+        source.rollback()
+        clone.rollback()
+    if (
+        observed_source_sha256 != source_sha256
+        or len(source_raw) != source_size
+        or observed_clone_sha256 != clone_sha256
+        or len(clone_raw) != clone_size
+        or observed_source_control != value.get("source_control_schema_version")
+        or observed_source_delivery != value.get("source_delivery_schema_version")
+        or observed_target_control != value.get("target_control_schema_version")
+        or observed_target_delivery != value.get("target_delivery_schema_version")
+        or observed_source_health != source_health
+        or observed_target_health != target_health
+        or observed_source_projection != source_projection
+        or observed_target_projection != target_projection
+        or observed_preservation != preservation
+    ):
+        raise QuarantineMigrationError(
+            "delivery_store_coupled_migration_artifact_drift"
+        )
+    if migrated_db_path is not None:
+        selected = Path(migrated_db_path).expanduser().absolute()
+        with _open_readonly(
+            selected,
+            artifact="delivery_store_coupled_migrated_database",
+            require_standalone=True,
+        ) as migrated:
+            migrated.execute("BEGIN")
+            migrated_control = _control_schema_version(migrated)
+            migrated_delivery = _schema_version(migrated)
+            migrated_health = _combined_database_health(migrated)
+            migrated_projection = logical_database_projection(migrated)
+            migrated.rollback()
+        if (
+            migrated_control != COUPLED_TARGET_CONTROL_SCHEMA_VERSION
+            or migrated_delivery != COUPLED_TARGET_DELIVERY_SCHEMA_VERSION
+            or migrated_health != target_health
+            or migrated_projection != target_projection
+        ):
+            raise QuarantineMigrationError(
+                "delivery_store_coupled_post_migration_drift"
+            )
+    return {
+        "receipt_path": str(Path(receipt_path).expanduser().absolute()),
+        "receipt_sha256": observed_sha256,
+        "source_control_schema_version": value["source_control_schema_version"],
+        "source_delivery_schema_version": value["source_delivery_schema_version"],
+        "target_control_schema_version": value["target_control_schema_version"],
+        "target_delivery_schema_version": value["target_delivery_schema_version"],
+        "source_backup_path": str(source_path),
+        "source_backup_sha256": source_sha256,
+        "source_schema_sha256": source_projection["schema_sha256"],
+        "source_logical_sha256": source_projection["logical_sha256"],
+        "rollback_path": str(source_path),
+        "rollback_sha256": source_sha256,
+        "source_quick_check": source_health["quick_check"],
+        "target_schema_sha256": target_projection["schema_sha256"],
+        "target_logical_sha256": target_projection["logical_sha256"],
+        "target_quick_check": target_health["quick_check"],
+        "migrated_clone_path": str(clone_path),
+        "migrated_clone_sha256": clone_sha256,
+        "migration_runtime_sha256": runtime_sha256,
+        "target_live_db_path": target_path,
+        "no_live_database_writes": True,
     }
 
 

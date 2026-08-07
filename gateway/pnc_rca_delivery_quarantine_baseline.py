@@ -20,6 +20,7 @@ from gateway.pnc_rca_delivery_contract import (
 )
 from gateway.pnc_rca_delivery_quarantine_migration import (
     COMBINED_SCHEMA_VERSION,
+    COUPLED_SCHEMA_VERSION,
     QuarantineMigrationError,
     validate_combined_migration_receipt,
     validate_migration_receipt,
@@ -1273,10 +1274,10 @@ def _validate_migration_artifact(
     expected_migration_runtime_sha256: str,
 ) -> dict[str, Any]:
     try:
-        # Combined-v9 receipts are the release target; retain the older
-        # validator for pre-v9 rehearsal artifacts.  The source schema hash is
-        # carried by the combined receipt's external predecessor contract and
-        # is rechecked against its immutable source copy by the validator.
+        # v3 delivery-only and v4 coupled receipts are both handled by the
+        # combined validator.  Only unknown schemas fall back to the original
+        # v1 receipt validator; this prevents a v4 artifact from being silently
+        # interpreted as an unrelated legacy migration.
         try:
             raw, _probe_sha256 = _read_stable_file(
                 receipt_path,
@@ -1292,7 +1293,7 @@ def _validate_migration_artifact(
             )
         except (TypeError, ValueError, json.JSONDecodeError):
             receipt_schema = None
-        if receipt_schema == COMBINED_SCHEMA_VERSION:
+        if receipt_schema in {COMBINED_SCHEMA_VERSION, COUPLED_SCHEMA_VERSION}:
             source_contract = parsed.get("source_schema_contract")
             expected_source_schema_sha256 = (
                 source_contract.get("schema_sha256")
