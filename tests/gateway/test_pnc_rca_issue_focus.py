@@ -126,6 +126,9 @@ def test_complete_feedback_sample_covers_every_composed_requirement(title):
         "ACC-加减",
         "ACC-二轮车",
         "LCC-汇入场景",
+        "LDP-LDP触发",
+        "LCC-直道方向盘",
+        "LCC-跟停方向盘",
     ),
 )
 def test_vague_titles_require_honest_stop(title):
@@ -149,6 +152,32 @@ def test_vague_titles_require_honest_stop(title):
     result = validate_issue_focus_evidence(issue_title=title, value=payload)
 
     assert result.attribution_allowed is False
+
+
+@pytest.mark.parametrize(
+    ("title", "expected_phenomena"),
+    (
+        ("ACC-车速60限速60跟停减速太晚", {"late_response"}),
+        ("LCC-弯道行驶向左偏", {"lateral_path_anomaly"}),
+        (
+            "ELKA-自车偏向路沿，ELKA触发，车道线变红，有预警，无纠偏",
+            {"lateral_correction_missing"},
+        ),
+        (
+            "LCC-打转向灯，转向灯拨杆不回退，抑制TJA进入",
+            {"function_activation_inhibited"},
+        ),
+        ("LCC-跟车起步方向盘轻微左打", {"lateral_path_anomaly"}),
+        ("LCC-错位路口方向盘向右打", {"lateral_path_anomaly"}),
+        ("ACC-大巴车切出，确认目标释放时机", {"target_release_timing"}),
+        ("ACC-前车切入，减速后释放过慢", {"target_release_timing"}),
+    ),
+)
+def test_narrow_lexical_recovery_binds_expected_phenomena(title, expected_phenomena):
+    intent = resolve_issue_intent(title)
+
+    assert intent.statement_sufficient is True
+    assert expected_phenomena.issubset(set(intent.phenomena))
 
 
 def test_any_required_capability_can_stop_without_unrelated_analysis():

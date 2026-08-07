@@ -21,6 +21,11 @@ from gateway.pnc_rca_schema import (
     validate_issue_context_fields,
     validate_vm_execution_request_envelope,
 )
+from gateway.pnc_rca_issue_focus import (
+    ANALYSIS_CAPABILITY_UNSUPPORTED,
+    ANALYSIS_INSUFFICIENT_STATEMENT,
+    build_issue_focus_plan,
+)
 
 
 def _nested_mapping(depth):
@@ -140,6 +145,48 @@ def test_issue_context_from_compact_text_extracts_known_fields_without_raw_paylo
     assert ctx.blockers == []
 
 
+def test_issue_context_compact_text_promotes_bounded_comment_timeline():
+    ctx = issue_context_from_compact_text(
+        project_key="t03o4q",
+        work_item_id="7008267126",
+        compact_text=(
+            "- title: ACC-前车减速过晚\n"
+            "## 最近评论摘录\n"
+            "- 2026-08-07T10:00:00Z: 目标 ID=7，减速晚\n"
+            "- 2026-08-07T10:01:00Z: https://project.feishu.cn/file/stream/download/x"
+        ),
+        source_quality="full",
+    )
+
+    assert [row["created_at"] for row in ctx.comments_timeline] == [
+        "2026-08-07T10:00:00Z",
+        "2026-08-07T10:01:00Z",
+    ]
+    assert ctx.comments_timeline[0]["content"].startswith("目标 ID=7")
+
+
+@pytest.mark.parametrize(
+    ("title", "status"),
+    [
+        ("ACC-车速60限速60跟停减速太晚", "planned"),
+        ("HMI-S弯", ANALYSIS_INSUFFICIENT_STATEMENT),
+        ("AEB-双闪无能力", ANALYSIS_CAPABILITY_UNSUPPORTED),
+    ],
+)
+def test_issue_focus_plan_is_title_bound_and_fail_closed(title, status):
+    plan = build_issue_focus_plan(title=title)
+
+    assert plan["schema_version"] == "g1q3_issue_focus_plan_v1"
+    assert plan["analysis_status"] == status
+    assert plan["title_sha256"]
+    assert plan["plan_sha256"]
+    if status == ANALYSIS_CAPABILITY_UNSUPPORTED:
+        assert plan["unsupported_capabilities"] == ["vehicle_signal_chain"]
+        assert plan["stop_reason"]
+    if status == ANALYSIS_INSUFFICIENT_STATEMENT:
+        assert plan["missing_requirements"] == ["statement:problem_statement"]
+
+
 def test_issue_context_carries_canonical_frame_lookup_into_execution_request():
     frame_lookup = {
         "kind": "front_camera_timestamp",
@@ -245,6 +292,8 @@ def test_build_execution_request_has_policy_defaults_and_survives_fields():
     assert "temporary-token" not in json.dumps(payload, ensure_ascii=False)
     assert "private-token" not in json.dumps(payload, ensure_ascii=False)
     assert "signature=secret" not in json.dumps(payload, ensure_ascii=False)
+    assert payload["evidence"]["issue_focus_plan"]["schema_version"] == "g1q3_issue_focus_plan_v1"
+    assert payload["evidence"]["issue_focus_plan"]["source"]["comment_count"] == 1
     assert payload["execution_policy"] == {
         "allow_download": False,
         "allow_feishu_writeback": False,

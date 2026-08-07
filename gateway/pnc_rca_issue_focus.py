@@ -18,6 +18,8 @@ from typing import Any, Mapping, Sequence
 ISSUE_INTENT_SCHEMA_VERSION = "g1q3_issue_intent_v1"
 ISSUE_FOCUS_EVIDENCE_SCHEMA_VERSION = "g1q3_issue_focus_evidence_v2"
 ISSUE_FOCUS_VALIDATION_SCHEMA_VERSION = "g1q3_issue_focus_validation_v1"
+ISSUE_FOCUS_PLAN_SCHEMA_VERSION = "g1q3_issue_focus_plan_v1"
+ISSUE_FOCUS_PLAN_STATUS_PLANNED = "planned"
 
 ANALYSIS_COMPLETE = "complete"
 ANALYSIS_INSUFFICIENT_STATEMENT = "insufficient_statement"
@@ -178,7 +180,7 @@ _INTENT_RULES = (
         ),
     ),
     IntentRule(
-        re.compile(r"(?:减速过晚|刹车晚|制动晚|刹车太晚|退出晚|晚退出|进入过慢|进入太慢)"),
+        re.compile(r"(?:减速过晚|减速太晚|刹车晚|制动晚|制动过晚|刹车太晚|响应晚|响应过晚|退出晚|晚退出|进入过慢|进入太慢)"),
         _contribution(
             "late_response",
             segment="late_response_window",
@@ -188,7 +190,7 @@ _INTENT_RULES = (
         ),
     ),
     IntentRule(
-        re.compile(r"(?:减速过重|减速过大|减速过多|刹车过重|突然刹车|突然减速|急减速|顿挫强)"),
+        re.compile(r"(?:减速过重|减速过大|减速过多|减速不平顺|刹车过重|突然刹车|突然减速|急减速|顿挫强|加减速过急|加减速不平顺)"),
         _contribution(
             "excessive_deceleration",
             segment="excessive_deceleration_window",
@@ -294,7 +296,7 @@ _INTENT_RULES = (
         ),
     ),
     IntentRule(
-        re.compile(r"(?:异常退出|突然退出|功能马上退出|LCC退出|lcc退出|不退出|未退出|功能不退出|反复进入退出|频繁推出进入|退出又恢复|无法激活|不触发)"),
+        re.compile(r"(?:异常退出|突然退出|功能马上退出|LCC退出|lcc退出|不退出|未退出|功能不退出|反复进入退出|频繁推出进入|退出又恢复|无法激活|不触发|功能.*触发|触发后|误触发|提前触发|晚触发|触发异常|报警.*(?:误|异常|未|不))"),
         _contribution(
             "function_state_anomaly",
             segment="function_state_transition_window",
@@ -304,13 +306,33 @@ _INTENT_RULES = (
         ),
     ),
     IntentRule(
-        re.compile(r"(?:拉偏|偏左|偏右|严重偏右|外切压线|压线|冲出车道|向左打方向|向右打方向)"),
+        re.compile(r"(?:拉偏|偏左|偏右|向左偏|向右偏|偏向路沿|严重偏右|外切压线|压线|冲出车道|向左打方向|向右打方向|方向盘.*(?:摆动|抖动|来回|动作|修正|调节|轻微左打|向右打|回打))"),
         _contribution(
             "lateral_path_anomaly",
             segment="lateral_path_window",
             capabilities=("ego_lateral_kinematics", "lane_geometry", "lateral_command_chain"),
             measurements=("ego_lateral_curve", "lane_geometry_curve"),
             checks=("lateral_command_chain", "lane_boundary_relation"),
+        ),
+    ),
+    IntentRule(
+        re.compile(r"(?:无纠偏|未纠偏|不纠偏|纠偏不足|没有纠偏)"),
+        _contribution(
+            "lateral_correction_missing",
+            segment="lateral_correction_window",
+            capabilities=("ego_lateral_kinematics", "lane_geometry", "lateral_command_chain"),
+            measurements=("ego_lateral_curve", "lane_geometry_curve", "steering_angle_curve"),
+            checks=("lateral_correction_command", "lane_boundary_relation"),
+        ),
+    ),
+    IntentRule(
+        re.compile(r"(?:抑制(?:TJA|LCC|功能)?进入|(?:转向灯|拨杆).*(?:不回退|未回退).*(?:抑制|无法进入))", re.I),
+        _contribution(
+            "function_activation_inhibited",
+            segment="function_activation_window",
+            capabilities=("function_state_transition", "driver_input_state_chain"),
+            measurements=("function_state_timeline", "driver_input_state_timeline"),
+            checks=("activation_inhibition_reason", "driver_input_release_state"),
         ),
     ),
     IntentRule(
@@ -334,7 +356,7 @@ _INTENT_RULES = (
         ),
     ),
     IntentRule(
-        re.compile(r"(?:无双闪|双闪未|双闪不)"),
+        re.compile(r"(?:无双闪|双闪未|双闪不|双闪无能力|危险警告灯|hazard|double[ -]?flash)"),
         _contribution(
             "vehicle_signal_missing",
             segment="vehicle_signal_window",
@@ -351,6 +373,16 @@ _INTENT_RULES = (
             capabilities=("traffic_sign_pipeline", "hmi_projection"),
             measurements=("ego_speed_curve", "traffic_sign_timeline"),
             checks=("traffic_sign_detection", "traffic_sign_display", "speed_alert_policy"),
+        ),
+    ),
+    IntentRule(
+        re.compile(r"(?:确认目标释放时机|确认释放时机|目标释放时机|释放时机是否合适|(?:切入|切出|目标|模型).{0,12}释放(?:过慢|时机))"),
+        _contribution(
+            "target_release_timing",
+            segment="target_release_window",
+            capabilities=("object_identity", "object_track_kinematics", "target_lifecycle_chain"),
+            measurements=("target_distance_curve", "target_speed_curve"),
+            checks=("target_selection_state", "target_release_timing"),
         ),
     ),
 )
@@ -466,6 +498,96 @@ def resolve_issue_intent(title: Any) -> IssueIntent:
         "unresolved_statement": unresolved_statement,
     }
     return IssueIntent(**body, intent_sha256=_intent_digest(body))
+
+
+def _text_sha256(value: Any) -> str:
+    return hashlib.sha256(str(value or "").strip().encode("utf-8")).hexdigest()
+
+
+def build_issue_focus_plan(
+    *,
+    title: Any,
+    description_markdown: Any = "",
+    comments_timeline: Sequence[Any] = (),
+) -> dict[str, Any]:
+    """Build a bounded, evidence-free focus plan for the Host -> VM handoff.
+
+    The plan is a requirements projection, not an RCA result.  It is bound to
+    the immutable issue title and carries only hashes/counts for supplemental
+    text so transient Feishu content cannot become executable or asserted
+    evidence on the VM.
+    """
+    normalized_title = normalized_issue_title(title)
+    intent = resolve_issue_intent(normalized_title)
+    supplemental = str(description_markdown or "").strip()
+    comment_texts = []
+    for item in comments_timeline or ():
+        if isinstance(item, Mapping):
+            value = item.get("content") or item.get("text") or item.get("body") or ""
+        else:
+            value = item
+        text = str(value or "").strip()
+        if text:
+            comment_texts.append(text[:1200])
+    evidence_text = "\n".join([supplemental[:6000], *comment_texts[:8]]).strip()
+
+    unsupported: set[str] = set()
+    capability_review: set[str] = set()
+    if "vehicle_signal_chain" in intent.required_capabilities and re.search(
+        r"(?:双闪|危险警告灯|hazard|double[ -]?flash)",
+        normalized_title + " " + evidence_text,
+        re.IGNORECASE,
+    ):
+        # The current evaluator inventory has no decoded hazard/double-flash
+        # chain.  Keep this an explicit stop instead of borrowing AEB output.
+        unsupported.add("vehicle_signal_chain")
+    if "centripetal_acceleration" in intent.required_calculations:
+        capability_review.add("road_geometry/centripetal_acceleration_not_connected")
+    if (
+        intent.domain == "longitudinal_control"
+        and intent.entity_roles
+        and re.search(r"(?:行人|环卫工人|骑行者|二轮车|两轮车)", normalized_title)
+    ):
+        capability_review.add("vru_longitudinal_brake_chain")
+
+    if not intent.statement_sufficient:
+        analysis_status = ANALYSIS_INSUFFICIENT_STATEMENT
+        missing = ["statement:problem_statement"]
+        stop_reason = "问题标题未形成可验证的现象与目标，停止通用评测器归因"
+    elif unsupported:
+        analysis_status = ANALYSIS_CAPABILITY_UNSUPPORTED
+        missing = [f"capability:{key}" for key in sorted(unsupported)]
+        stop_reason = "问题焦点需要当前评测器未提供的能力，停止并转能力补齐/人工复核"
+    else:
+        analysis_status = ISSUE_FOCUS_PLAN_STATUS_PLANNED
+        missing = []
+        stop_reason = ""
+
+    body: dict[str, Any] = {
+        "schema_version": ISSUE_FOCUS_PLAN_SCHEMA_VERSION,
+        "analysis_status": analysis_status,
+        "issue_intent": intent.to_dict(),
+        "title_sha256": issue_title_sha256(normalized_title),
+        "intent_sha256": intent.intent_sha256,
+        "required_capabilities": list(intent.required_capabilities),
+        "required_segments": list(intent.required_segments),
+        "required_entities": list(intent.required_entities),
+        "required_measurements": list(intent.required_measurements),
+        "required_checks": list(intent.required_checks),
+        "required_calculations": list(intent.required_calculations),
+        "missing_requirements": missing,
+        "unsupported_capabilities": sorted(unsupported),
+        "capability_review": sorted(capability_review),
+        "stop_reason": stop_reason,
+        "source": {
+            "kind": "title_plus_bounded_issue_context",
+            "description_sha256": _text_sha256(supplemental[:6000]),
+            "comments_sha256": _text_sha256("\n".join(comment_texts[:8])),
+            "comment_count": len(comment_texts),
+        },
+    }
+    body["plan_sha256"] = _intent_digest(body)
+    return body
 
 
 def _exact_mapping(value: Any, expected: set[str], label: str) -> Mapping[str, Any]:

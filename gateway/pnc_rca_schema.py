@@ -14,6 +14,7 @@ from gateway.pnc_rca_data_access import (
     build_blocked_remote_data_access,
     build_remote_data_access,
 )
+from gateway.pnc_rca_issue_focus import build_issue_focus_plan
 
 
 # === RCA_REQUEST_CONTRACT:BEGIN (do not edit between markers without updating host copy) ===
@@ -370,6 +371,27 @@ def issue_context_from_compact_text(
         if isinstance(parsed_profile, dict):
             business_profile = parsed_profile
 
+    comments_timeline: list[dict[str, Any]] = []
+    in_comments = False
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if line.startswith("## "):
+            in_comments = line.startswith("## 最近评论摘录")
+            continue
+        if not in_comments or not line.startswith("- "):
+            continue
+        comment = line[2:].strip()
+        created_at = ""
+        content = comment
+        if ": " in comment:
+            maybe_time, maybe_content = comment.split(": ", 1)
+            if re.fullmatch(r"[^\s]{1,80}", maybe_time):
+                created_at, content = maybe_time, maybe_content
+        if content:
+            comments_timeline.append(
+                {"created_at": created_at, "content": content[:1200]}
+            )
+
     blockers_value = list(blockers or [])
     if not text and not blockers_value and source_quality == "unavailable":
         blockers_value.append({"kind": "host_preread_unavailable", "message": "Feishu issue preread unavailable"})
@@ -389,6 +411,7 @@ def issue_context_from_compact_text(
         pdcl_download_cmd=line_value("数据地址"),
         root_cause_text=line_value("根因分析字段"),
         description_markdown=text,
+        comments_timeline=comments_timeline,
         source_quality=source_quality,
         blockers=blockers_value,
     )
@@ -497,6 +520,11 @@ def build_execution_request(
             "artifact_kind", ""
         )
         toolchain_payload["business_profile"] = business_profile
+    issue_focus_plan = build_issue_focus_plan(
+        title=issue_context.title,
+        description_markdown=issue_context.description_markdown,
+        comments_timeline=issue_context.comments_timeline,
+    )
     return RcaExecutionRequest(
         request_kind=request_kind,
         work_item=work_item,
@@ -513,6 +541,7 @@ def build_execution_request(
             "comments_timeline": issue_context.comments_timeline,
             "media_refs": issue_context.media_refs,
             "blockers": issue_context.blockers,
+            "issue_focus_plan": issue_focus_plan,
         }, issue_context.pdcl_download_cmd),
         execution_policy=execution_policy,
         source_refs={
