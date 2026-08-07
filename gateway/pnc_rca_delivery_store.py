@@ -1755,12 +1755,19 @@ class RcaDeliveryStore:
             or not isinstance(require_write_started, bool)
         ):
             raise RuntimeError("external_write_fence_schema_invalid")
-        if operation != DELIVERY_EFFECT_KIND:
-            raise RuntimeError("external_write_fence_operation_denied")
         current = _utc_datetime(now)
         conn = self._connect()
         try:
             conn.execute("BEGIN")
+            authority = self._terminal_rerun_authority_tx(
+                conn,
+                business_key=business_key,
+                generation=generation,
+            )
+            if authority is None:
+                raise RuntimeError("external_write_fence_identity_mismatch")
+            if operation != DELIVERY_EFFECT_KIND:
+                raise RuntimeError("external_write_fence_operation_denied")
             row = conn.execute(
                 """
                 SELECT effect.effect_kind, effect.required, effect.target_key,
@@ -1787,14 +1794,6 @@ class RcaDeliveryStore:
             ).fetchone()
             if row is None:
                 raise RuntimeError("external_write_fence_operation_denied")
-            authority = self._terminal_rerun_authority_tx(
-                conn,
-                business_key=business_key,
-                generation=generation,
-                work_item_id=str(row["work_item_id"]),
-            )
-            if authority is None:
-                raise RuntimeError("external_write_fence_identity_mismatch")
             try:
                 expires_at = _parse_iso(str(row["lease_expires_at"] or ""))
                 payload = _json_object(row["payload_json"])
@@ -1836,6 +1835,7 @@ class RcaDeliveryStore:
                 or str(authority["project_key"]) != str(row["project_key"])
                 or str(authority["work_item_type_key"]) !=
                     str(row["work_item_type_key"])
+                or str(authority["issue_id"]) != str(row["work_item_id"])
                 or str(payload.get("schema_version") or "")
                     not in _TERMINAL_EFFECT_SCHEMA_VERSIONS
                 or str(payload.get("delivery_id") or "") != delivery_id

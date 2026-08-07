@@ -347,7 +347,7 @@ def _dispatcher(
         observation_release_id="conclusion-adjudication-test",
         quarantine_release_id="",
     )
-    return DeliveryDispatcher(
+    dispatcher = DeliveryDispatcher(
         store=store,
         config=config,
         list_comments=boundaries["list_comments"],
@@ -360,6 +360,9 @@ def _dispatcher(
         now=now or (lambda: NOW),
         lease_owner="w16-test",
     )
+    # These fixtures model historical effects without a manual-admission store.
+    dispatcher._manual_provider_write_claim = lambda _claim: None
+    return dispatcher
 
 
 def _effect_attempt_snapshot(
@@ -1311,7 +1314,7 @@ def test_w2_v8_migrates_explicitly_to_combined_v10_schema(tmp_path):
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'rca_conclusion_adjudication_repairs'"
         ).fetchone()
-    assert marker == "pnc_rca_delivery_store_v11"
+    assert marker == DELIVERY_STORE_SCHEMA_VERSION
     assert failure_routes is not None
     assert repairs is not None
 

@@ -19,11 +19,21 @@ def _candidate_contract():
             "actual_evaluators": [
                 {"evaluator_id": "lane_geometry_quality", "status": "supported"}
             ],
+            "actual_signals": ["lane_geometry"],
+            "actual_fields": ["lane_offset"],
             "evidence": {
                 "issue_frame_id": 12,
                 "focus_window": {"start_ts": 0.0, "end_ts": 1.0},
-                "field_lineage": {"fidelity_ok": True},
-                "viz_lineage": {"ok": True, "status": "pass"},
+                "field_lineage": {
+                    "schema_version": "g1q3_field_lineage_v2",
+                    "fidelity_ok": True,
+                    "status": "pass",
+                },
+                "viz_lineage": {
+                    "schema_version": "g1q3_viz_lineage_v1",
+                    "ok": True,
+                    "status": "pass",
+                },
             },
         },
         "report": {"candidate_owner_domain": "PERCEPTION_LANE"},
@@ -50,7 +60,9 @@ def _honest_contract():
     return {
         "consumer_capability": {
             "actual_evaluators": [],
-            "evidence": {},
+            "actual_signals": ["vehicle_speed"],
+            "actual_fields": ["ego_speed"],
+            "evidence": {"focus_window": {"start_ts": 0.0, "end_ts": 1.0}},
         },
         "public_result": {
             "summary": {"short_conclusion": "自动RCA未归因：现有证据不足。"},

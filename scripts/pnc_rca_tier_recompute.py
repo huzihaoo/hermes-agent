@@ -281,6 +281,10 @@ def _dimension_gate_contract() -> dict[str, Any]:
             "actual_evaluators": [
                 {"evaluator_id": "lane_geometry_quality", "status": "supported"}
             ],
+            # The injection must reach the validation-dimension gate rather
+            # than being rejected earlier by the public capability contract.
+            "actual_signals": ["lane_geometry"],
+            "actual_fields": ["lane_offset"],
             "evidence": {
                 "issue_frame_id": 12,
                 "focus_window": {"start_ts": 0.0, "end_ts": 1.0},

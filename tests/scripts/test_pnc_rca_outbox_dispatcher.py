@@ -543,6 +543,25 @@ def _patch_exact_hold_cli(monkeypatch, config, env):
     for key, value in env.items():
         monkeypatch.setenv(key, value)
     _prepare_exact_hold_runtime(monkeypatch, config)
+    real_subprocess_run = dispatcher.subprocess.run
+
+    def unloaded_launchctl(command, *args, **kwargs):
+        if command[:2] == ["launchctl", "print"]:
+            label = command[2].rsplit("/", 1)[-1]
+            uid = str(dispatcher.os.getuid())
+            return dispatcher.subprocess.CompletedProcess(
+                command,
+                113,
+                stdout="",
+                stderr=(
+                    "Bad request.\n"
+                    f'Could not find service "{label}" in domain for user gui: '
+                    f"{uid}\n"
+                ),
+            )
+        return real_subprocess_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(dispatcher.subprocess, "run", unloaded_launchctl)
     config.live_env_path.write_text(
         "".join(f"{key}={value}\n" for key, value in sorted(env.items())),
         encoding="utf-8",

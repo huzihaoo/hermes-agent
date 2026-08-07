@@ -894,6 +894,20 @@ def test_batch_terminal_authority_creates_refresh_generation_for_settled_deliver
         generation=claimed.generation,
         require_write_started=True,
     )
+    with pytest.raises(RuntimeError, match="external_write_fence_operation_denied"):
+        delivery.validate_terminal_rerun_external_write_binding(
+            effect_key=claimed.effect_key,
+            delivery_id=claimed.delivery_id,
+            lease_token=claimed.lease_token,
+            lease_fence=claimed.fence,
+            operation="feishu_issue_field_update",
+            issue_url=claimed.issue_url,
+            target_key=claimed.target_key,
+            business_key=claimed.business_key,
+            submission_key=claimed.submission_key,
+            generation=claimed.generation,
+            require_write_started=True,
+        )
     from gateway import pnc_rca_provider_fence as provider_fence
 
     provider_claim = provider_fence.build_terminal_rerun_provider_claim(
