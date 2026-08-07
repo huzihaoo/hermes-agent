@@ -215,4 +215,3 @@ def test_v4_receipt_rejects_tampered_contract(coupled_bundle, path, value, error
 def test_v3_target_marker_remains_frozen_for_legacy_receipts():
     assert migration.COMBINED_SCHEMA_VERSION.endswith("_v3")
     assert migration.COMBINED_TARGET_SCHEMA_VERSION == "pnc_rca_delivery_store_v11"
-
