@@ -13,6 +13,7 @@ import pytest
 from gateway import pnc_rca_delivery_store as delivery_store_module
 from gateway.pnc_rca_delivery_quarantine_baseline import (
     APPROVAL_SCHEMA_VERSION,
+    CORE_SCHEMA_VERSION,
     DEFERRED_CORE_SCHEMA_VERSION,
     DeliveryQuarantineBaselineError,
     _db_identity_matches_baseline,
@@ -2293,6 +2294,7 @@ def _health(bundle: dict, *, path: Path | None = None, sha256: str | None = None
 def test_exact_approved_baseline_acknowledges_lifetime_without_db_writes(tmp_path):
     bundle = _build_bundle(tmp_path)
     store = bundle["store"]
+    assert bundle["core"]["schema_version"] == CORE_SCHEMA_VERSION
     missing = store.health(now=NOW + timedelta(seconds=5))
     assert missing["business_ready"] is False
     assert missing["business_blockers"]["quarantined_jobs"] == 1
@@ -2378,6 +2380,83 @@ def test_unrecognized_quarantined_issue_comment_still_fails_closed(tmp_path):
         match="delivery_quarantine_baseline_manual_thread_adjudication_invalid",
     ):
         _build_core(store, effect_key, tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("column", "value_sql"),
+    [
+        ("required", "0"),
+        ("effect_kind", "'feishu_thread_reply'"),
+        ("source_id", "'source-manual-baseline'"),
+        (
+            "delivery_id",
+            "(SELECT delivery_id FROM rca_delivery_jobs ORDER BY delivery_id LIMIT 1)",
+        ),
+        (
+            "effect_key",
+            "(SELECT effect_key FROM rca_delivery_effects ORDER BY effect_key LIMIT 1)",
+        ),
+    ],
+)
+def test_activation_deferred_issue_comment_requires_exact_unmaterialized_shape(
+    tmp_path, column, value_sql
+):
+    store, effect_key = _seed_quarantine(tmp_path)
+    _mark_issue_comment_activation_deferred(store)
+    with sqlite3.connect(store.db_path) as conn:
+        cursor = conn.execute(
+            f"UPDATE rca_delivery_subscriptions SET {column} = {value_sql} "
+            "WHERE effect_kind = 'feishu_issue_comment' AND status = 'quarantined'"
+        )
+        assert cursor.rowcount == 1
+
+    with pytest.raises(
+        DeliveryQuarantineBaselineError,
+        match="delivery_quarantine_baseline_manual_thread_adjudication_invalid",
+    ):
+        _build_core(store, effect_key, tmp_path)
+
+
+def test_activation_deferred_core_cannot_be_downgraded_to_v1(tmp_path):
+    bundle = _build_bundle(
+        tmp_path, with_activation_deferred_issue_comment=True
+    )
+    body = {
+        key: value
+        for key, value in bundle["core"].items()
+        if key
+        not in {
+            "activation_deferred_issue_comment_adjudication",
+            "core_sha256",
+        }
+    }
+    body["schema_version"] = CORE_SCHEMA_VERSION
+    downgraded = {
+        **body,
+        "core_sha256": hashlib.sha256(
+            _json_bytes(body).removesuffix(b"\n")
+        ).hexdigest(),
+    }
+
+    with pytest.raises(
+        DeliveryQuarantineBaselineError,
+        match="delivery_quarantine_baseline_deferred_issue_adjudication_invalid",
+    ):
+        issue_quarantine_baseline(
+            bundle["store"].db_path,
+            quarantine_core=downgraded,
+            release_manifest_path=bundle["release_manifest_path"],
+            expected_release_manifest_sha256=hashlib.sha256(
+                bundle["release_manifest_path"].read_bytes()
+            ).hexdigest(),
+            expected_release_bom_sha256=bundle["release_bom_sha256"],
+            approval_evidence_path=bundle["approval_path"],
+            expected_approval_evidence_sha256=hashlib.sha256(
+                bundle["approval_path"].read_bytes()
+            ).hexdigest(),
+            baseline_id="baseline-release-downgrade",
+            issued_at=NOW + timedelta(seconds=4),
+        )
 
 
 def test_offline_preapproval_core_exactly_matches_post_migration_live_core(tmp_path):
