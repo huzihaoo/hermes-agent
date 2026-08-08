@@ -116,7 +116,11 @@ def test_build_queue_rejects_or_scope(tmp_path):
     "source_kwargs",
     [
         {"proposer_values": ["其他创建者"]},
+        {"proposer_values": ["黎涛华", "其他创建者"]},
+        {"proposer_values": ["黎涛华", "黎涛华"]},
         {"project_option_ids": ["1234567890"]},
+        {"project_option_ids": ["6670325063", "1234567890"]},
+        {"project_option_ids": ["6670325063", "6670325063"]},
     ],
 )
 def test_build_queue_rejects_item_outside_exact_scope(tmp_path, source_kwargs):

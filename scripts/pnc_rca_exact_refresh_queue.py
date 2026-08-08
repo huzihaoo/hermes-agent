@@ -129,19 +129,9 @@ def _read_source(path: Path) -> tuple[list[dict[str, Any]], str]:
             raise ExactRefreshQueueError("exact_refresh_source_item_invalid")
         if (
             not isinstance(proposer_values, list)
-            or not proposer_values
-            or not all(
-                isinstance(value, str) and value.strip()
-                for value in proposer_values
-            )
-            or SOURCE_FILTER["creator_name"] not in proposer_values
+            or proposer_values != [SOURCE_FILTER["creator_name"]]
             or not isinstance(project_option_ids, list)
-            or not project_option_ids
-            or not all(
-                isinstance(value, str) and value.strip()
-                for value in project_option_ids
-            )
-            or str(SOURCE_FILTER["project_id"]) not in project_option_ids
+            or project_option_ids != [str(SOURCE_FILTER["project_id"])]
         ):
             raise ExactRefreshQueueError("exact_refresh_source_item_out_of_scope")
         seen.add(issue_id)
