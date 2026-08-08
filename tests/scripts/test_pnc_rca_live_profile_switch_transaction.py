@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import sqlite3
 
 import pytest
 
@@ -364,6 +365,50 @@ def test_strict_plan_rejects_target_tamper(tmp_path, monkeypatch):
     with pytest.raises(switch.LiveProfileSwitchError) as error:
         switch._validate_plan(tampered)
     assert error.value.code == "pnc_rca_live_profile_switch_plan_invalid"
+
+
+def test_strict_plan_accepts_direct_steady_activation(tmp_path, monkeypatch):
+    plan, _plan_path, _targets = _make_plan(tmp_path, monkeypatch)
+    plan["activation_binding"]["state"] = "steady_active"
+
+    switch._validate_plan(plan)
+
+
+def test_strict_plan_rejects_nonproduction_activation_state(tmp_path, monkeypatch):
+    plan, _plan_path, _targets = _make_plan(tmp_path, monkeypatch)
+    plan["activation_binding"]["state"] = "aborted"
+
+    with pytest.raises(switch.LiveProfileSwitchError) as error:
+        switch._validate_plan(plan)
+    assert error.value.code == "pnc_rca_live_profile_switch_plan_invalid"
+
+
+def test_activation_binding_matches_declared_steady_state(tmp_path):
+    control_db = tmp_path / "control.sqlite3"
+    with sqlite3.connect(control_db) as connection:
+        connection.execute(
+            "CREATE TABLE rca_activation_epochs ("
+            "epoch_id TEXT, state TEXT, is_current INTEGER, updated_at TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO rca_activation_epochs VALUES (?, ?, 1, ?)",
+            (ACTIVATION_EPOCH_ID, "steady_active", "2026-08-07T00:00:00+00:00"),
+        )
+
+    binding = switch._activation_binding(
+        control_db,
+        epoch_id=ACTIVATION_EPOCH_ID,
+        expected_state="steady_active",
+    )
+    assert binding["state"] == "steady_active"
+
+    with pytest.raises(switch.LiveProfileSwitchError) as error:
+        switch._activation_binding(
+            control_db,
+            epoch_id=ACTIVATION_EPOCH_ID,
+            expected_state="bounded_active",
+        )
+    assert error.value.code == "pnc_rca_live_profile_switch_activation_not_bounded"
 
 
 def test_apply_and_rollback_happy_path(tmp_path, monkeypatch):

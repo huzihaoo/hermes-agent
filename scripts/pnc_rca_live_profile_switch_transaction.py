@@ -105,6 +105,7 @@ ENTRY_FIELDS = frozenset(
     }
 )
 ACTIVATION_BINDING_FIELDS = frozenset({"epoch_id", "state", "updated_at"})
+SUPPORTED_ACTIVATION_STATES = frozenset({"bounded_active", "steady_active"})
 ARTIFACT_BINDING_FIELDS = frozenset({"path", "observation"})
 BASELINE_BINDING_FIELDS = frozenset(
     {
@@ -459,7 +460,14 @@ def _paths(candidate_root: Path, home: Path, hermes_home: Path) -> dict[str, Pat
     }
 
 
-def _activation_binding(control_db: Path, *, epoch_id: str) -> dict[str, Any]:
+def _activation_binding(
+    control_db: Path,
+    *,
+    epoch_id: str,
+    expected_state: str,
+) -> dict[str, Any]:
+    if expected_state not in SUPPORTED_ACTIVATION_STATES:
+        _fail("pnc_rca_live_profile_switch_activation_not_bounded")
     try:
         with steady._read_only_db(control_db) as connection:
             rows = connection.execute(
@@ -471,7 +479,7 @@ def _activation_binding(control_db: Path, *, epoch_id: str) -> dict[str, Any]:
     if (
         len(rows) != 1
         or str(rows[0]["epoch_id"] or "") != epoch_id
-        or str(rows[0]["state"] or "") != "bounded_active"
+        or str(rows[0]["state"] or "") != expected_state
         or int(rows[0]["is_current"] or 0) != 1
     ):
         _fail("pnc_rca_live_profile_switch_activation_not_bounded")
@@ -531,7 +539,8 @@ def _validate_release_state(
         or profile.get("source") != provenance
         or profile.get("initial_mode") != "record-only"
         or profile.get("live_mode") != "live"
-        or profile.get("required_activation_state") != "bounded_active"
+        or profile.get("required_activation_state")
+        not in SUPPORTED_ACTIVATION_STATES
         or IDENTIFIER_RE.fullmatch(str(profile.get("activation_epoch_id") or "")) is None
         or profile.get("live_profile_root") != str(candidate_root / "live-profile")
         or profile.get("production_effects") != _effects()
@@ -545,7 +554,9 @@ def _validate_release_state(
     ):
         _fail("pnc_rca_live_profile_switch_profile_invalid")
     activation_binding = _activation_binding(
-        control_db, epoch_id=str(profile["activation_epoch_id"])
+        control_db,
+        epoch_id=str(profile["activation_epoch_id"]),
+        expected_state=str(profile["required_activation_state"]),
     )
     state_root = hermes_home / "runtime" / "pnc_agent" / "feishu_issue_kafka_rca"
 
@@ -1093,7 +1104,7 @@ def _validate_plan(plan: Mapping[str, Any]) -> None:
         or not isinstance(plan.get("planned_at"), str)
         or not isinstance(activation, Mapping)
         or set(activation) != ACTIVATION_BINDING_FIELDS
-        or activation.get("state") != "bounded_active"
+        or activation.get("state") not in SUPPORTED_ACTIVATION_STATES
         or IDENTIFIER_RE.fullmatch(str(activation.get("epoch_id") or "")) is None
         or not isinstance(activation.get("updated_at"), str)
         or not activation.get("updated_at")

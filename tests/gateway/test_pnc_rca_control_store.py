@@ -1279,6 +1279,31 @@ def _create_activation_epoch(
     )
 
 
+def _activate_direct_steady_epoch(
+    store: RcaControlStore,
+    *,
+    epoch_id: str = "rca-direct-20260712",
+    release_fingerprint: str = "1" * 64,
+    receipt_sha256: str = "a" * 64,
+    config_sha256: str = "2" * 64,
+    start_offset: int = 20,
+):
+    return store.activate_direct_steady_epoch(
+        epoch_id=epoch_id,
+        release_fingerprint=release_fingerprint,
+        release_binding_sha256=receipt_sha256,
+        config_sha256=config_sha256,
+        db_logical_identity={
+            "device": 7,
+            "inode": 11,
+            "logical_store_id": "rca-control-primary",
+        },
+        partition_start_fence={TOPIC: {"2": start_offset}},
+        operator="release-test",
+        reason="activate direct steady test release",
+    )
+
+
 def _confirmation_preconditions(
     store: RcaControlStore,
     partition_end_fence,
@@ -1835,6 +1860,102 @@ def test_activation_state_machine_requires_exact_receipts_and_is_audited(
         ("bounded_active", "confirmed"),
         ("confirmed", "steady_active"),
     ]
+
+
+def test_direct_steady_ignores_historical_shadow_and_has_no_slots(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    _begin_bounded_activation(store, epoch_id="rca-old-bounded-20260712")
+    accepted = store.ingest_record(
+        _record(offset=20),
+        policy=_policy(),
+        submit_enabled=True,
+        activation_required=True,
+    )
+    [shadow] = store.list_rows("rca_outbox")
+    assert shadow["status"] == "shadow"
+    store.transition_activation_epoch(
+        epoch_id="rca-old-bounded-20260712",
+        expected_state="bounded_active",
+        target_state="aborted",
+        operator="release-test",
+        reason="retire the predecessor without settling historical shadow",
+    )
+
+    direct = _activate_direct_steady_epoch(
+        store,
+        epoch_id="rca-direct-20260712",
+        start_offset=21,
+    )
+
+    assert direct["state"] == "steady_active"
+    assert store.activation_epoch() == direct
+    assert [
+        row
+        for row in store.list_rows("rca_activation_budget_slots")
+        if row["epoch_id"] == direct["epoch_id"]
+    ] == []
+    assert [
+        (row["from_state"], row["to_state"])
+        for row in store.list_rows("rca_activation_transition_audit")
+    ][-1:] == [("direct_release", "steady_active")]
+
+    request = _manual_request(
+        "om-direct-steady",
+        issue_url="https://project.feishu.cn/g1q3/issue/detail/7041712816",
+    )
+    admitted = store.admit_manual_trigger(
+        request,
+        allowed_chat_ids={"oc_allowed"},
+        submit_enabled=True,
+        active_policy=_policy(),
+        activation_required=True,
+    )
+    assert admitted.outcome == "created"
+    assert admitted.state == "pending"
+    [ledger] = [
+        row
+        for row in store.list_rows("rca_activation_admission_ledger")
+        if row["epoch_id"] == direct["epoch_id"]
+    ]
+    assert ledger["decision"] == "admit"
+    assert accepted.event_uid
+
+
+def test_direct_steady_is_idempotent_and_rejects_binding_conflicts(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    first = _activate_direct_steady_epoch(store)
+    second = _activate_direct_steady_epoch(store)
+    assert second == first
+    assert len(store.list_rows("rca_activation_transition_audit")) == 1
+
+    with pytest.raises(
+        ActivationEpochError, match="activation_direct_steady_binding_conflict"
+    ):
+        _activate_direct_steady_epoch(store, config_sha256="9" * 64)
+
+
+def test_direct_steady_rejects_active_predecessor_and_replaces_aborted_one(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    _activate_direct_steady_epoch(store, epoch_id="rca-direct-first-20260712")
+    with pytest.raises(
+        ActivationEpochError, match="activation_current_epoch_exists"
+    ):
+        _activate_direct_steady_epoch(store, epoch_id="rca-direct-second-20260712")
+
+    store.transition_activation_epoch(
+        epoch_id="rca-direct-first-20260712",
+        expected_state="steady_active",
+        target_state="aborted",
+        operator="release-test",
+        reason="retire direct predecessor",
+    )
+    replacement = _activate_direct_steady_epoch(
+        store,
+        epoch_id="rca-direct-second-20260712",
+        start_offset=30,
+    )
+    assert replacement["state"] == "steady_active"
+    assert replacement["epoch_id"] == "rca-direct-second-20260712"
 
 
 def test_activation_confirmation_rejects_consumed_but_unbound_slots(tmp_path):

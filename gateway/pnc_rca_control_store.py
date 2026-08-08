@@ -7129,6 +7129,164 @@ class RcaControlStore:
         finally:
             conn.close()
 
+    def activate_direct_steady_epoch(
+        self,
+        *,
+        epoch_id: str,
+        release_fingerprint: str,
+        release_binding_sha256: str,
+        config_sha256: str,
+        db_logical_identity: Mapping[str, Any],
+        partition_start_fence: Mapping[str, Any],
+        operator: str,
+        reason: str,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Atomically install one explicit direct-release steady epoch.
+
+        This is a deliberately separate compatibility path for a release that
+        has no bounded canary slots.  It still records the exact release,
+        config, database, and broker-fence identities and leaves the normal
+        provider/write-fence checks anchored to the current epoch.  Historical
+        outbox state is observation-only here; it is not a prerequisite for
+        activating a fresh current epoch.
+        """
+        identity = self._normalize_activation_epoch_id(epoch_id)
+        release_hash = self._normalize_activation_sha256(
+            release_fingerprint, "release_fingerprint"
+        )
+        receipt_hash = self._normalize_activation_sha256(
+            release_binding_sha256,
+            "release_binding_sha256",
+        )
+        config_hash = self._normalize_activation_sha256(config_sha256, "config_sha256")
+        db_identity_json = self._normalize_activation_db_identity(db_logical_identity)
+        db_identity_sha = hashlib.sha256(db_identity_json.encode("utf-8")).hexdigest()
+        start_fence_json = self._normalize_partition_fence(partition_start_fence)
+        # There is no bounded window in direct mode.  Bind the end to the same
+        # observed start snapshot rather than inventing a second broker read.
+        end_fence_json = start_fence_json
+        end_fence_sha = hashlib.sha256(end_fence_json.encode("utf-8")).hexdigest()
+        start_fence_sha = end_fence_sha
+        actor, justification = self._normalize_activation_audit_text(operator, reason)
+        current = _iso(now)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = self._current_activation_epoch_tx(conn)
+            if existing is not None and str(existing["epoch_id"]) == identity:
+                # A completed direct release is create-once.  Retrying the
+                # exact binding is safe; changing any identity is a conflict.
+                expected = {
+                    "state": "steady_active",
+                    "preauthorization_fingerprint": release_hash,
+                    "preauthorization_gate_receipt_sha256": receipt_hash,
+                    "preauthorization_capsule_sha256": receipt_hash,
+                    "preproduction_fingerprint": release_hash,
+                    "preproduction_gate_receipt_sha256": receipt_hash,
+                    "preproduction_capsule_sha256": receipt_hash,
+                    "config_sha256": config_hash,
+                    "db_logical_identity_sha256": db_identity_sha,
+                    "partition_start_fence_sha256": start_fence_sha,
+                    "partition_end_fence_sha256": end_fence_sha,
+                    "production_fingerprint": release_hash,
+                    "production_gate_receipt_sha256": receipt_hash,
+                }
+                identical = (
+                    all(
+                        str(existing[field] or "") == str(value)
+                        for field, value in expected.items()
+                    )
+                    and str(existing["db_logical_identity_json"])
+                    == db_identity_json
+                    and str(existing["partition_start_fence_json"])
+                    == start_fence_json
+                    and str(existing["partition_end_fence_json"] or "")
+                    == end_fence_json
+                )
+                if identical:
+                    conn.commit()
+                    return self._public_activation_epoch(existing)
+                raise ActivationEpochError("activation_direct_steady_binding_conflict")
+
+            if existing is not None and str(existing["state"]) != "aborted":
+                raise ActivationEpochError("activation_current_epoch_exists")
+            if existing is not None:
+                # Retire the aborted current pointer in the same transaction as
+                # the new steady row.  No intermediate no-current state is
+                # observable to admission or provider-fence readers.
+                updated = conn.execute(
+                    """
+                    UPDATE rca_activation_epochs
+                       SET is_current = 0, superseded_at = ?, updated_at = ?
+                     WHERE epoch_id = ? AND is_current = 1 AND state = 'aborted'
+                    """,
+                    (current, current, existing["epoch_id"]),
+                )
+                if updated.rowcount != 1:
+                    raise ActivationEpochError("activation_epoch_state_changed")
+
+            conn.execute(
+                """
+                INSERT INTO rca_activation_epochs(
+                    epoch_id, state, is_current,
+                    preauthorization_fingerprint,
+                    preauthorization_gate_receipt_sha256,
+                    preauthorization_capsule_sha256,
+                    preproduction_fingerprint,
+                    preproduction_gate_receipt_sha256,
+                    preproduction_capsule_sha256,
+                    config_sha256, db_logical_identity_json,
+                    db_logical_identity_sha256, partition_start_fence_json,
+                    partition_start_fence_sha256, partition_end_fence_json,
+                    partition_end_fence_sha256, production_fingerprint,
+                    production_gate_receipt_sha256, created_at, updated_at,
+                    steady_activated_at
+                ) VALUES (?, 'steady_active', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    identity,
+                    release_hash,
+                    receipt_hash,
+                    receipt_hash,
+                    release_hash,
+                    receipt_hash,
+                    receipt_hash,
+                    config_hash,
+                    db_identity_json,
+                    db_identity_sha,
+                    start_fence_json,
+                    start_fence_sha,
+                    end_fence_json,
+                    end_fence_sha,
+                    release_hash,
+                    receipt_hash,
+                    current,
+                    current,
+                    current,
+                ),
+            )
+            row = self._current_activation_epoch_tx(conn)
+            if row is None or str(row["epoch_id"]) != identity:
+                raise ActivationEpochError("activation_epoch_create_lost")
+            self._insert_activation_transition_audit_tx(
+                conn,
+                epoch=row,
+                from_state="direct_release",
+                to_state="steady_active",
+                operator=actor,
+                reason=justification,
+                transitioned_at=current,
+            )
+            conn.commit()
+            return self._public_activation_epoch(row)
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def preauthorize_activation_epoch(
         self,
         *,

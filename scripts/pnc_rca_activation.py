@@ -37,6 +37,7 @@ from scripts import pnc_rca_activation_capsule as activation_capsule
 
 
 ACTIVATION_CLI_SCHEMA_VERSION = "pnc_rca_activation_cli_v1"
+DIRECT_STEADY_BINDING_SCHEMA_VERSION = "pnc_rca_direct_steady_binding_v1"
 MAX_JSON_INPUT_BYTES = 64 * 1024
 CAPACITY_ORIGIN_COMPAT_SCHEMA_VERSION = "rca_capacity_origin_compat_receipt_v2"
 CAPACITY_ORIGIN_COMPAT_NAME = "capacity-origin-compatibility.json"
@@ -75,6 +76,17 @@ _CAPACITY_ORIGIN_COMPAT_FIELDS = frozenset({
     "producer_receipt_fingerprint",
     "database_rows_modified",
     "external_effects_triggered",
+})
+_DIRECT_STEADY_BINDING_FIELDS = frozenset({
+    "schema_version",
+    "epoch_id",
+    "release_fingerprint",
+    "release_binding_sha256",
+    "config_sha256",
+    "db_logical_identity",
+    "db_logical_identity_sha256",
+    "partition_start_fence",
+    "partition_start_fence_sha256",
 })
 
 
@@ -276,6 +288,66 @@ def _normalize_fence(value: Mapping[str, Any], field: str) -> dict[str, dict[str
     if not normalized:
         raise ActivationCliError(f"activation_{field}_invalid")
     return normalized
+
+
+def _canonical_direct_steady_binding(path: Path) -> dict[str, Any]:
+    """Read and normalize the owner-only direct-release binding document."""
+    value, _raw = _read_json_document(
+        path,
+        "direct_binding",
+        owner_only=True,
+    )
+    if set(value) != _DIRECT_STEADY_BINDING_FIELDS:
+        raise ActivationCliError("activation_direct_binding_schema_invalid")
+    if value.get("schema_version") != DIRECT_STEADY_BINDING_SCHEMA_VERSION:
+        raise ActivationCliError("activation_direct_binding_schema_invalid")
+    epoch_id = _normalized_epoch_id(str(value.get("epoch_id") or ""))
+    release_fingerprint = _normalized_sha256(
+        str(value.get("release_fingerprint") or ""),
+        "direct_release_fingerprint",
+    )
+    release_binding_sha256 = _normalized_sha256(
+        str(value.get("release_binding_sha256") or ""),
+        "direct_release_binding_sha256",
+    )
+    config_sha256 = _normalized_sha256(
+        str(value.get("config_sha256") or ""),
+        "config_sha256",
+    )
+    raw_db_identity = value.get("db_logical_identity")
+    if not isinstance(raw_db_identity, Mapping):
+        raise ActivationCliError("activation_db_identity_invalid")
+    try:
+        db_identity = _normalize_db_identity(raw_db_identity)
+    except (TypeError, ValueError) as exc:
+        raise ActivationCliError("activation_db_identity_invalid") from exc
+    db_identity_sha256 = _normalized_sha256(
+        str(value.get("db_logical_identity_sha256") or ""),
+        "db_logical_identity_sha256",
+    )
+    if db_identity_sha256 != _sha256_json(db_identity):
+        raise ActivationCliError("activation_direct_binding_identity_mismatch")
+    raw_start_fence = value.get("partition_start_fence")
+    if not isinstance(raw_start_fence, Mapping):
+        raise ActivationCliError("activation_partition_start_fence_invalid")
+    start_fence = _normalize_fence(raw_start_fence, "partition_start_fence")
+    start_fence_sha256 = _normalized_sha256(
+        str(value.get("partition_start_fence_sha256") or ""),
+        "partition_start_fence_sha256",
+    )
+    if start_fence_sha256 != _sha256_json(start_fence):
+        raise ActivationCliError("activation_direct_binding_fence_mismatch")
+    return {
+        "schema_version": DIRECT_STEADY_BINDING_SCHEMA_VERSION,
+        "epoch_id": epoch_id,
+        "release_fingerprint": release_fingerprint,
+        "release_binding_sha256": release_binding_sha256,
+        "config_sha256": config_sha256,
+        "db_logical_identity": db_identity,
+        "db_logical_identity_sha256": db_identity_sha256,
+        "partition_start_fence": start_fence,
+        "partition_start_fence_sha256": start_fence_sha256,
+    }
 
 
 def _read_preauthorization_capsule(
@@ -928,6 +1000,103 @@ def _create(store: RcaControlStore, args: argparse.Namespace) -> dict[str, Any]:
         {
             "changed": not identical,
             "current_epoch": epoch,
+            **_audit_hashes(operator, reason),
+        },
+    )
+
+
+def _direct_steady(
+    store: RcaControlStore, args: argparse.Namespace
+) -> dict[str, Any]:
+    operator, reason = _normalized_audit(args.operator, args.reason)
+    binding = _canonical_direct_steady_binding(args.direct_binding)
+    epoch_id = _normalized_epoch_id(args.epoch_id)
+    if binding["epoch_id"] != epoch_id:
+        raise ActivationCliError("activation_direct_binding_epoch_mismatch")
+
+    current = store.activation_epoch()
+    if current is not None:
+        current_epoch_id = str(current.get("epoch_id") or "")
+        current_state = str(current.get("state") or "")
+        if current_epoch_id == epoch_id:
+            expected = {
+                "state": "steady_active",
+                "preauthorization_fingerprint": binding["release_fingerprint"],
+                "preauthorization_gate_receipt_sha256": binding[
+                    "release_binding_sha256"
+                ],
+                "preauthorization_capsule_sha256": binding[
+                    "release_binding_sha256"
+                ],
+                "preproduction_fingerprint": binding["release_fingerprint"],
+                "preproduction_gate_receipt_sha256": binding[
+                    "release_binding_sha256"
+                ],
+                "preproduction_capsule_sha256": binding[
+                    "release_binding_sha256"
+                ],
+                "config_sha256": binding["config_sha256"],
+                "db_logical_identity_sha256": binding[
+                    "db_logical_identity_sha256"
+                ],
+                "partition_start_fence_sha256": binding[
+                    "partition_start_fence_sha256"
+                ],
+                "partition_end_fence_sha256": binding[
+                    "partition_start_fence_sha256"
+                ],
+                "production_fingerprint": binding["release_fingerprint"],
+                "production_gate_receipt_sha256": binding[
+                    "release_binding_sha256"
+                ],
+            }
+            identical = all(current.get(field) == value for field, value in expected.items())
+            if not identical:
+                raise ActivationCliError("activation_direct_steady_binding_conflict")
+            # A same-binding retry is a no-op, including when the operator
+            # supplies a different audit label on a later invocation.
+            would_change = False
+        elif current_state == "aborted":
+            # A different epoch may replace an aborted current pointer.
+            would_change = True
+        else:
+            raise ActivationCliError("activation_current_epoch_exists")
+    else:
+        would_change = True
+
+    summary = {
+        **_audit_hashes(operator, reason),
+        "activation_mode": "direct_steady",
+        "config_sha256": binding["config_sha256"],
+        "db_logical_identity_sha256": binding["db_logical_identity_sha256"],
+        "epoch_id": epoch_id,
+        "partition_start_fence_sha256": binding[
+            "partition_start_fence_sha256"
+        ],
+        "release_fingerprint": binding["release_fingerprint"],
+        "release_binding_sha256": binding[
+            "release_binding_sha256"
+        ],
+        "would_change": would_change,
+    }
+    if not args.apply:
+        return _plan("direct-steady", summary)
+    result = store.activate_direct_steady_epoch(
+        epoch_id=epoch_id,
+        release_fingerprint=str(binding["release_fingerprint"]),
+        release_binding_sha256=str(binding["release_binding_sha256"]),
+        config_sha256=str(binding["config_sha256"]),
+        db_logical_identity=binding["db_logical_identity"],
+        partition_start_fence=binding["partition_start_fence"],
+        operator=operator,
+        reason=reason,
+    )
+    return _applied(
+        "direct-steady",
+        {
+            "activation_mode": "direct_steady",
+            "changed": would_change,
+            "current_epoch": result,
             **_audit_hashes(operator, reason),
         },
     )
@@ -2141,6 +2310,10 @@ def _build_parser() -> argparse.ArgumentParser:
     steady.add_argument("--release-id")
     steady.add_argument("--bootstrap-epoch-id")
 
+    direct_steady = commands.add_parser("direct-steady")
+    _add_mutation_arguments(direct_steady)
+    direct_steady.add_argument("--direct-binding", type=Path, required=True)
+
     abort = commands.add_parser("abort")
     _add_mutation_arguments(abort)
     return parser
@@ -2192,6 +2365,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             payload = _prepare_bootstrap_production(store, args)
         elif command == "transition-steady":
             payload = _transition_steady(store, args)
+        elif command == "direct-steady":
+            payload = _direct_steady(store, args)
         elif command == "abort":
             payload = _abort(store, args)
         else:

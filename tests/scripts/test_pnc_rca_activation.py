@@ -111,6 +111,22 @@ def _preauthorization_input(epoch_id: str = EPOCH_ID) -> dict[str, Any]:
     }
 
 
+def _direct_binding_input(epoch_id: str = EPOCH_ID) -> dict[str, Any]:
+    db_identity = _activation_db_identity()
+    start_fence = {TOPIC: {"0": 10}}
+    return {
+        "schema_version": activation_module.DIRECT_STEADY_BINDING_SCHEMA_VERSION,
+        "epoch_id": epoch_id,
+        "release_fingerprint": PREAUTHORIZATION_FINGERPRINT,
+        "release_binding_sha256": PREAUTHORIZATION_RECEIPT_SHA256,
+        "config_sha256": CONFIG_SHA256,
+        "db_logical_identity": db_identity,
+        "db_logical_identity_sha256": activation_module._sha256_json(db_identity),
+        "partition_start_fence": start_fence,
+        "partition_start_fence_sha256": activation_module._sha256_json(start_fence),
+    }
+
+
 def _canary_slot_plan() -> dict[str, dict[str, Any]]:
     identities: dict[str, dict[str, Any]] = {
         "manual_success": {
@@ -402,6 +418,31 @@ def _create_args(
         REASON,
         "--preauthorization-capsule",
         str(capsule),
+    ]
+    if apply:
+        args.append("--apply")
+    return args
+
+
+def _direct_steady_args(
+    db_path: Path,
+    binding_path: Path,
+    *,
+    epoch_id: str = EPOCH_ID,
+    apply: bool = False,
+) -> list[str]:
+    args = [
+        "--control-db",
+        str(db_path),
+        "direct-steady",
+        "--epoch-id",
+        epoch_id,
+        "--operator",
+        OPERATOR,
+        "--reason",
+        REASON,
+        "--direct-binding",
+        str(binding_path),
     ]
     if apply:
         args.append("--apply")
@@ -765,6 +806,117 @@ def test_status_can_bind_one_exact_current_epoch(tmp_path, capsys):
     )
     assert code == 2
     assert payload["code"] == "activation_epoch_not_current"
+
+
+def test_direct_steady_plan_apply_replaces_aborted_epoch_and_is_idempotent(
+    tmp_path,
+    capsys,
+):
+    db_path = tmp_path / "control.sqlite3"
+    store = RcaControlStore(db_path)
+    predecessor = "rca-direct-predecessor"
+    predecessor_binding = _direct_binding_input(predecessor)
+    store.activate_direct_steady_epoch(
+        epoch_id=predecessor,
+        release_fingerprint=predecessor_binding["release_fingerprint"],
+        release_binding_sha256=predecessor_binding[
+            "release_binding_sha256"
+        ],
+        config_sha256=predecessor_binding["config_sha256"],
+        db_logical_identity=predecessor_binding["db_logical_identity"],
+        partition_start_fence=predecessor_binding["partition_start_fence"],
+        operator=OPERATOR,
+        reason=REASON,
+    )
+    store.transition_activation_epoch(
+        epoch_id=predecessor,
+        target_state="aborted",
+        expected_state="steady_active",
+        operator=OPERATOR,
+        reason="replace direct predecessor",
+    )
+    binding_path = tmp_path / "direct-steady.json"
+    _write_secure_json(binding_path, _direct_binding_input())
+
+    code, planned = _invoke(
+        capsys,
+        _direct_steady_args(db_path, binding_path),
+    )
+    assert code == 0
+    assert planned["mode"] == "plan"
+    assert planned["result"]["would_change"] is True
+    assert store.activation_epoch()["epoch_id"] == predecessor
+
+    code, applied = _invoke(
+        capsys,
+        _direct_steady_args(db_path, binding_path, apply=True),
+    )
+    assert code == 0
+    assert applied["result"]["changed"] is True
+    assert applied["result"]["current_epoch"]["state"] == "steady_active"
+    assert store.activation_epoch()["epoch_id"] == EPOCH_ID
+    assert not [
+        row
+        for row in store.list_rows("rca_activation_budget_slots")
+        if row["epoch_id"] == EPOCH_ID
+    ]
+
+    code, repeated = _invoke(
+        capsys,
+        _direct_steady_args(db_path, binding_path, apply=True),
+    )
+    assert code == 0
+    assert repeated["result"]["changed"] is False
+    direct_audits = [
+        row
+        for row in store.list_rows("rca_activation_transition_audit")
+        if row["epoch_id"] == EPOCH_ID
+    ]
+    assert [(row["from_state"], row["to_state"]) for row in direct_audits] == [
+        ("direct_release", "steady_active")
+    ]
+
+
+def test_direct_steady_rejects_binding_hash_tamper_without_mutation(
+    tmp_path,
+    capsys,
+):
+    db_path = tmp_path / "control.sqlite3"
+    store = RcaControlStore(db_path)
+    binding = _direct_binding_input()
+    binding["partition_start_fence_sha256"] = "0" * 64
+    binding_path = tmp_path / "direct-steady-tampered.json"
+    _write_secure_json(binding_path, binding)
+
+    code, payload = _invoke(
+        capsys,
+        _direct_steady_args(
+            db_path,
+            binding_path,
+            apply=True,
+        ),
+    )
+
+    assert code == 2
+    assert payload["code"] == "activation_direct_binding_fence_mismatch"
+    assert store.activation_epoch() is None
+
+
+def test_direct_steady_requires_owner_only_binding(tmp_path, capsys):
+    db_path = tmp_path / "control.sqlite3"
+    store = RcaControlStore(db_path)
+    binding_path = tmp_path / "direct-steady-world-readable.json"
+    _write_secure_json(binding_path, _direct_binding_input())
+    binding_path.chmod(0o644)
+
+    code, payload = _invoke(
+        capsys,
+        _direct_steady_args(db_path, binding_path),
+    )
+
+    assert code == 2
+    assert payload["code"] == "activation_direct_binding_file_permissions_invalid"
+    assert store.activation_epoch() is None
 
 
 def test_plan_never_creates_a_missing_control_database(tmp_path, capsys):
