@@ -57,6 +57,7 @@ CAPSULE_CLI_SCHEMA_VERSION = "pnc_rca_activation_capsule_cli_v1"
 MAX_CAPSULE_BYTES = 256 * 1024
 MAX_RECEIPT_BYTES = 4 * 1024 * 1024
 MAX_GATE_EVIDENCE_AGE_SECONDS = 900
+PREAUTHORIZATION_CAPSULE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 MAX_STAGE_CAPSULE_AGE_SECONDS = 3600
 LIVE_HEALTH_MAX_AGE_SECONDS = 60
 GATEWAY_SERVICE_LABEL = "ai.hermes.gateway"
@@ -1739,7 +1740,7 @@ def _read_preauthorization_bundle(
         report,
         capsule["created_at"],
         now=now,
-        max_age_seconds=MAX_STAGE_CAPSULE_AGE_SECONDS,
+        max_age_seconds=PREAUTHORIZATION_CAPSULE_MAX_AGE_SECONDS,
     )
     _read_stage_pair(
         stage="preauthorization",

@@ -420,7 +420,7 @@ def test_preauthorization_reader_rejects_expired_and_wrong_database_binding(
     tmp_path: Path,
 ) -> None:
     control_path, delivery_path, _store = _new_databases(tmp_path)
-    old = datetime.now(timezone.utc) - timedelta(hours=2)
+    old = datetime.now(timezone.utc) - timedelta(days=30, seconds=1)
     capsule, _input = _build_preauthorization(
         tmp_path,
         control_path,
@@ -442,6 +442,34 @@ def test_preauthorization_reader_rejects_expired_and_wrong_database_binding(
             capsule,
             control_db_path=other_control,
             now=old,
+        )
+
+
+def test_preauthorization_reader_accepts_a_signed_capsule_for_30_days(
+    tmp_path: Path,
+) -> None:
+    control_path, delivery_path, _store = _new_databases(tmp_path)
+    valid = datetime.now(timezone.utc) - timedelta(days=30) + timedelta(seconds=1)
+    capsule, _input = _build_preauthorization(
+        tmp_path, control_path, delivery_path, evaluated_at=valid, build_now=valid
+    )
+    assert capsules.read_preauthorization_capsule(
+        capsule, control_db_path=control_path
+    )["epoch_id"] == EPOCH_ID
+
+
+def test_preauthorization_builder_still_requires_a_fresh_gate_receipt(
+    tmp_path: Path,
+) -> None:
+    control_path, delivery_path, _store = _new_databases(tmp_path)
+    current = datetime.now(timezone.utc)
+    with pytest.raises(capsules.CapsuleError, match="activation_capsule_stale"):
+        _build_preauthorization(
+            tmp_path,
+            control_path,
+            delivery_path,
+            evaluated_at=current - timedelta(hours=2),
+            build_now=current,
         )
 
 
