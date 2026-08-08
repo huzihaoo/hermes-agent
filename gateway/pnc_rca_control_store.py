@@ -14928,18 +14928,29 @@ class RcaControlStore:
         except ControlStoreCapacityError as exc:
             raise ManualRcaAdmissionError(f"manual_{exc}") from exc
 
-    @staticmethod
+    @classmethod
     def _assert_manual_dispatch_capacity_tx(
+        cls,
         conn: sqlite3.Connection,
         *,
         outbox_high_watermark: int,
+        activation_required: bool,
     ) -> None:
+        activation_predicate, activation_parameters = (
+            cls._activation_claim_predicate_tx(
+                conn,
+                activation_required=activation_required,
+                historical_submission_allowlist=(),
+            )
+        )
         backlog = int(
             conn.execute(
-                """
-                SELECT COUNT(*) FROM rca_outbox
-                 WHERE status IN ('pending', 'claimed')
-                """
+                f"""
+                SELECT COUNT(*) FROM rca_outbox AS o
+                 WHERE o.status IN ('pending', 'claimed')
+                   AND ({activation_predicate})
+                """,
+                activation_parameters,
             ).fetchone()[0]
         )
         if backlog >= outbox_high_watermark:
@@ -14952,10 +14963,11 @@ class RcaControlStore:
         )
         manual_backlog = int(
             conn.execute(
-                """
+                f"""
                 SELECT COUNT(*)
                   FROM rca_outbox AS o
                  WHERE o.status IN ('pending', 'claimed')
+                   AND ({activation_predicate})
                    AND (
                         o.source_topic IS NULL
                         OR EXISTS (
@@ -14969,7 +14981,8 @@ class RcaControlStore:
                                AND s.outcome IN ('created', 'rearmed')
                         )
                    )
-                """
+                """,
+                activation_parameters,
             ).fetchone()[0]
         )
         if manual_backlog >= manual_limit:
@@ -16197,6 +16210,7 @@ class RcaControlStore:
                     self._assert_manual_dispatch_capacity_tx(
                         conn,
                         outbox_high_watermark=high_watermark,
+                        activation_required=activation_required,
                     )
                 shadow_promoted = (
                     False
@@ -16691,6 +16705,7 @@ class RcaControlStore:
                 self._assert_manual_dispatch_capacity_tx(
                     conn,
                     outbox_high_watermark=high_watermark,
+                    activation_required=activation_required,
                 )
                 admission = base_admission
                 outcome = "created"
@@ -16707,6 +16722,7 @@ class RcaControlStore:
                 self._assert_manual_dispatch_capacity_tx(
                     conn,
                     outbox_high_watermark=high_watermark,
+                    activation_required=activation_required,
                 )
                 admission = existing_admission(
                     generation=int(latest["generation"])
@@ -16723,6 +16739,7 @@ class RcaControlStore:
                 self._assert_manual_dispatch_capacity_tx(
                     conn,
                     outbox_high_watermark=high_watermark,
+                    activation_required=activation_required,
                 )
                 admission = existing_admission(
                     generation=int(latest["generation"])
@@ -16746,6 +16763,7 @@ class RcaControlStore:
                 self._assert_manual_dispatch_capacity_tx(
                     conn,
                     outbox_high_watermark=high_watermark,
+                    activation_required=activation_required,
                 )
                 admission = build_rca_admission(
                     project_key=str(latest["project_key"]),

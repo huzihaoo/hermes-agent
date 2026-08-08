@@ -6926,6 +6926,74 @@ def test_manual_high_water_blocks_new_execution_but_allows_existing_join(tmp_pat
     assert len(store.list_rows("rca_trigger_sources")) == before_sources
 
 
+def test_manual_high_water_excludes_historical_null_epoch_backlog(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    for index in range(85):
+        result = store.ingest_record(
+            _record(
+                offset=100 + index,
+                value=_value(work_item_id=7041720000 + index),
+            ),
+            policy=_policy(),
+            submit_enabled=True,
+        )
+        assert result.decision == "accepted"
+
+    _activate_direct_steady_epoch(store, start_offset=185)
+    for index in range(16):
+        admitted = store.admit_manual_trigger(
+            _manual_request(
+                f"om_current_epoch_capacity_{index}",
+                thread_id=f"topic:om_current_epoch_capacity_root_{index}",
+                issue_url=(
+                    "https://project.feishu.cn/g1q3/issue/detail/"
+                    f"{7041730000 + index}"
+                ),
+            ),
+            allowed_chat_ids={"oc_allowed"},
+            submit_enabled=True,
+            active_policy=_policy(),
+            outbox_high_watermark=100,
+            activation_required=True,
+        )
+        assert admitted.outcome == "created"
+
+    rows = store.list_rows("rca_outbox")
+    assert sum(row["activation_epoch_id"] is None for row in rows) == 85
+    assert sum(row["activation_epoch_id"] is not None for row in rows) == 16
+
+    for index in range(84):
+        result = store.ingest_record(
+            _record(
+                offset=200 + index,
+                value=_value(work_item_id=7041740000 + index),
+            ),
+            policy=_policy(),
+            submit_enabled=True,
+            activation_required=True,
+        )
+        assert result.decision == "accepted"
+
+    assert len(store.preview_dispatchable(limit=200, activation_required=True)) == 100
+    with pytest.raises(
+        ManualRcaAdmissionError, match="manual_outbox_high_watermark_reached"
+    ):
+        store.admit_manual_trigger(
+            _manual_request(
+                "om_current_epoch_capacity_rejected",
+                thread_id="topic:om_current_epoch_capacity_rejected_root",
+                issue_url=(
+                    "https://project.feishu.cn/g1q3/issue/detail/7041750000"
+                ),
+            ),
+            allowed_chat_ids={"oc_allowed"},
+            submit_enabled=True,
+            active_policy=_policy(),
+            outbox_high_watermark=100,
+            activation_required=True,
+        )
+
+
 def test_manual_source_quota_reserves_shared_outbox_capacity_for_kafka(tmp_path):
     store = RcaControlStore(tmp_path / "control.sqlite3")
     for index in range(4):
