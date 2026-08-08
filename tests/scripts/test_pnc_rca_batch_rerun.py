@@ -6,6 +6,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from gateway.pnc_rca_abstention_projection import (
+    build_gate_a_identifier_binding,
+    build_gate_a_public_result,
+    project_gate_a_report,
+)
 from gateway.pnc_rca_issue_focus import ANALYSIS_INSUFFICIENT_STATEMENT
 from scripts import pnc_rca_batch_rerun as batch_rerun
 from scripts.pnc_rca_batch_rerun import (
@@ -192,6 +197,107 @@ def test_approval_accepts_explicit_focus_stop_after_official_field_readback():
         "responsibility": "暂无法判断",
         "causal_text_sha256": "",
     }
+
+
+def _observational_contract():
+    binding = build_gate_a_identifier_binding({
+        "actual_evaluators": [
+            {"evaluator_id": "acc_jerk", "status": "supported"},
+        ],
+        "actual_signals": ["ACC_AccelerationRequestMps2"],
+        "actual_fields": [],
+    })
+    projection = project_gate_a_report(
+        {
+            "input_materialized": True,
+            "rca_evaluators": [
+                {
+                    "key": "acc_jerk",
+                    "status": "supported",
+                    "evidence_refs": [
+                        {"signal": "ACC_AccelerationRequestMps2", "max_delta": 1.0}
+                    ],
+                }
+            ],
+        },
+        identifier_binding=binding,
+    )
+    return {
+        "report": {"diagnostic_only": False},
+        "artifacts": {},
+        "consumer_capability": {
+            "actual_evaluators": [
+                {"evaluator_id": "acc_jerk", "status": "supported"},
+            ],
+            "actual_signals": ["ACC_AccelerationRequestMps2"],
+            "actual_fields": [],
+        },
+        "gate_a_projection": projection,
+        "public_result": build_gate_a_public_result(projection),
+    }
+
+
+def test_approval_accepts_canonical_l1_observation_after_official_readback():
+    snapshot = _snapshot(causal=False)
+    snapshot["contract_json"] = json.dumps(_observational_contract())
+
+    approval = _approval(snapshot)
+
+    assert approval is not None
+    assert approval["quality"]["status"] == "observational_non_attribution"
+    assert approval["quality"]["gate_a_level"] == "L1_observation"
+    assert approval["quality"]["responsibility"] == "暂无法判断"
+    assert approval["quality"]["observation_count"] == 1
+    assert len(approval["quality"]["projection_sha256"]) == 64
+    assert approval["quality"]["causal_text_sha256"] == ""
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "diagnostic",
+        "diagnostic_string",
+        "candidate_owner",
+        "causal_text",
+        "causal_fields_with_projection",
+        "tampered_public_result",
+        "binding_mismatch",
+        "terminal_diagnostic",
+        "l0_abstention",
+    ],
+)
+def test_approval_rejects_noncanonical_observational_terminal(mutation):
+    snapshot = _snapshot(causal=False)
+    contract = _observational_contract()
+    if mutation == "diagnostic":
+        contract["report"]["diagnostic_only"] = True
+    elif mutation == "diagnostic_string":
+        contract["report"]["diagnostic_only"] = "true"
+    elif mutation == "candidate_owner":
+        contract["report"]["candidate_owner"] = "ACC"
+    elif mutation == "causal_text":
+        contract["artifacts"]["attribution_causal_text"] = "ACC 导致问题"
+    elif mutation == "causal_fields_with_projection":
+        contract["report"]["candidate_owner"] = "ACC"
+        contract["artifacts"]["attribution_causal_text"] = "ACC 导致问题"
+    elif mutation == "tampered_public_result":
+        contract["public_result"]["summary"]["short_conclusion"] = "已完成归因"
+    elif mutation == "binding_mismatch":
+        contract["consumer_capability"]["actual_evaluators"] = [
+            {"evaluator_id": "other_evaluator", "status": "supported"},
+        ]
+    elif mutation == "terminal_diagnostic":
+        contract["terminal_diagnostic"] = {"blocker_kind": "remote_event_not_found"}
+    else:
+        projection = project_gate_a_report({
+            "input_materialized": False,
+            "failure_class": "remote_event_not_found",
+        })
+        contract["gate_a_projection"] = projection
+        contract["public_result"] = build_gate_a_public_result(projection)
+    snapshot["contract_json"] = json.dumps(contract)
+
+    assert _approval(snapshot) is None
 
 
 def test_approval_waits_for_required_effect_and_surfaces_terminal_failure():

@@ -122,9 +122,9 @@ def _bundle(
         "work_item_id": admission.source_refs.work_item_id,
         "artifact_revision": 1,
         "sealed_at": "2026-07-10T08:00:00+00:00",
-        # HTML remains in the sealed artifact inventory for internal consumers;
-        # the public delivery kind is the published Foxglove surface.
-        "deliverable_kind": "foxglove_viz",
+        # The manifest inventories the sealed HTML audit bundle. The public
+        # delivery kind is independently bound to the published Foxglove surface.
+        "deliverable_kind": "html",
         "dependencies_complete": True,
         "artifact_root": root,
         "html_validation": {
@@ -1399,9 +1399,18 @@ def test_valid_sealed_evidence_and_published_viz_build_issue_effect():
     )
 
 
-def test_manifest_html_kind_is_rejected_even_when_internal_html_is_valid():
+def test_sealed_html_manifest_is_accepted_for_published_foxglove_delivery():
     admission, contract, manifest, observed, dependencies = _bundle()
-    manifest["deliverable_kind"] = "html"
+
+    delivery = _verify((admission, contract, manifest, observed, dependencies))
+
+    assert delivery.manifest["deliverable_kind"] == "html"
+    assert delivery.effect_payload["report_link_kind"] == "foxglove_viz"
+
+
+def test_unknown_manifest_kind_is_rejected():
+    admission, contract, manifest, observed, dependencies = _bundle()
+    manifest["deliverable_kind"] = "pdf"
 
     with pytest.raises(DeliveryContractError) as exc:
         _verify((admission, contract, manifest, observed, dependencies))
@@ -1471,6 +1480,16 @@ def test_html_bundle_without_published_viz_is_not_publicly_deliverable():
         for item in observed
         if item["path"] not in {publication["path"], publication["manifest_path"]}
     ]
+
+    with pytest.raises(DeliveryContractError) as exc:
+        _verify((admission, contract, manifest, observed, dependencies))
+
+    assert exc.value.code == "delivery_kind_unsupported"
+
+
+def test_foxglove_manifest_kind_is_rejected_even_with_published_viz():
+    admission, contract, manifest, observed, dependencies = _bundle()
+    manifest["deliverable_kind"] = "foxglove_viz"
 
     with pytest.raises(DeliveryContractError) as exc:
         _verify((admission, contract, manifest, observed, dependencies))

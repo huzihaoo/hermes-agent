@@ -3134,7 +3134,7 @@ def verify_persisted_artifact_inventory(
         raise DeliveryContractError("delivery_manifest_schema_unsupported")
     if manifest.get("sealed") is not True:
         raise DeliveryContractError("delivery_manifest_not_sealed")
-    if manifest.get("deliverable_kind") != "foxglove_viz":
+    if manifest.get("deliverable_kind") != "html":
         raise DeliveryContractError("delivery_kind_unsupported")
     if manifest.get("dependencies_complete") is not True:
         raise DeliveryContractError("delivery_dependencies_incomplete")
@@ -3639,10 +3639,10 @@ def verify_delivery_bundle(
         raise DeliveryContractError("delivery_manifest_schema_unsupported")
     if manifest.get("sealed") is not True:
         raise DeliveryContractError("delivery_manifest_not_sealed")
-    if manifest.get("deliverable_kind") != "foxglove_viz":
+    if manifest.get("deliverable_kind") != "html":
         raise DeliveryContractError(
             "delivery_kind_unsupported",
-            "only sealed Foxglove delivery is supported; HTML remains internal",
+            "manifest must describe the sealed HTML audit bundle",
         )
     if manifest.get("dependencies_complete") is not True:
         raise DeliveryContractError(

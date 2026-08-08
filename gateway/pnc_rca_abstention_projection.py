@@ -510,25 +510,52 @@ def project_gate_a_report(
             and source.get("materialization_attested") is not True
         ):
             raise RcaEvidenceProjectionError("gate_a_materialization_state_missing")
-        materialized_projection = project_materialized_evaluator_evidence(
-            {"rca_evaluators": evaluators}
-        )
-        public_evaluators = [
-            evaluator
-            for evaluator in materialized_projection["evaluators"]
-            if evaluator.get("status") in _PUBLIC_GATE_A_STATUSES
-            and bool(evaluator.get("evidence_refs"))
-        ]
-        evaluator_projection = {
-            **materialized_projection,
-            "evaluators": public_evaluators,
-        }
         if identifier_binding is None:
             raise RcaEvidenceProjectionError("gate_a_identifier_binding_missing")
         normalized_binding = _validate_gate_a_identifier_binding(identifier_binding)
-        _require_gate_a_identifier_binding(evaluator_projection, normalized_binding)
+        if not isinstance(evaluators, Sequence) or isinstance(
+            evaluators, (str, bytes)
+        ):
+            project_materialized_evaluator_evidence({"rca_evaluators": evaluators})
+            raise AssertionError("invalid evaluator collection was not rejected")
+        public_evaluators: list[dict[str, Any]] = []
+        first_error: RcaEvidenceProjectionError | None = None
+        for evaluator in evaluators:
+            status = (
+                _nonempty_text(evaluator.get("status"))
+                if isinstance(evaluator, Mapping)
+                else None
+            )
+            if status in EVALUATOR_STATUSES - _PUBLIC_GATE_A_STATUSES:
+                continue
+            try:
+                materialized = project_materialized_evaluator_evidence(
+                    {"rca_evaluators": [evaluator]}
+                )
+                projected = materialized["evaluators"][0]
+                if not projected.get("evidence_refs"):
+                    continue
+                candidate_projection = {
+                    **materialized,
+                    "evaluators": [projected],
+                }
+                _require_gate_a_identifier_binding(
+                    candidate_projection, normalized_binding
+                )
+            except RcaEvidenceProjectionError as exc:
+                if first_error is None:
+                    first_error = exc
+                continue
+            public_evaluators.append(projected)
         if not public_evaluators:
+            if first_error is not None:
+                raise first_error
             raise RcaEvidenceProjectionError("gate_a_observation_evidence_missing")
+        evaluator_projection = {
+            "schema_version": MATERIALIZED_EVALUATOR_PROJECTION_SCHEMA_VERSION,
+            "input_materialized": True,
+            "evaluators": public_evaluators,
+        }
         return {
             "schema_version": GATE_A_PROJECTION_SCHEMA_VERSION,
             "mode": GATE_A_PROJECTION_MODE,

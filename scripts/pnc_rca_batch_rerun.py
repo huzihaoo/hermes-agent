@@ -32,6 +32,12 @@ from gateway.pnc_rca_control_store import (  # noqa: E402
     build_batch_terminal_rerun_authority,
     build_silent_terminal_rerun_authority,
 )
+from gateway.pnc_rca_abstention_projection import (  # noqa: E402
+    RcaEvidenceProjectionError,
+    build_gate_a_identifier_binding,
+    build_gate_a_public_result,
+    validate_gate_a_projection,
+)
 from gateway.pnc_rca_issue_focus import (  # noqa: E402
     ANALYSIS_COMPLETE,
     IssueFocusContractError,
@@ -570,6 +576,8 @@ def _json_object(raw: Any) -> dict[str, Any]:
 def _causal_delivery_quality(contract_raw: Any) -> dict[str, str] | None:
     """Return the user-facing causal evidence that qualifies for approval."""
     contract = _json_object(contract_raw)
+    if contract.get("gate_a_projection") is not None:
+        return None
     report = contract.get("report")
     artifacts = contract.get("artifacts")
     public_result = contract.get("public_result")
@@ -632,6 +640,94 @@ def _explicit_focus_stop_quality(
         "status": "explicit_focus_stop",
         "analysis_status": validation.analysis_status,
         "responsibility": "暂无法判断",
+        "causal_text_sha256": "",
+    }
+
+
+def _observational_non_attribution_quality(
+    contract_raw: Any,
+) -> dict[str, Any] | None:
+    """Accept only a canonical L1 observation after official delivery readback."""
+    contract = _json_object(contract_raw)
+    report = contract.get("report")
+    artifacts = contract.get("artifacts")
+    consumer_capability = contract.get("consumer_capability")
+    projection = contract.get("gate_a_projection")
+    public_result = contract.get("public_result")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (report, artifacts, consumer_capability, projection, public_result)
+    ):
+        return None
+    if (
+        (
+            "diagnostic_only" in report
+            and report.get("diagnostic_only") is not False
+        )
+        or "candidate_owner" in report
+        or "candidate_responsibility" in report
+        or "candidate_owner_domain" in report
+        or "responsibility_candidate" in report
+        or "is_candidate" in report
+        or "attribution_causal_text" in artifacts
+        or any(
+            field in contract
+            for field in (
+                "quality_classification",
+                "terminal_class",
+                "confidence_tier",
+                "approval_ready",
+                "human_decision",
+            )
+        )
+        or "terminal_diagnostic" in contract
+        or "terminal_diagnostic" in report
+        or "terminal_diagnostic" in artifacts
+    ):
+        return None
+    try:
+        binding = build_gate_a_identifier_binding(consumer_capability)
+        canonical_projection = validate_gate_a_projection(
+            projection,
+            identifier_binding=binding,
+        )
+        canonical_public_result = build_gate_a_public_result(canonical_projection)
+    except RcaEvidenceProjectionError:
+        return None
+    if (
+        canonical_projection.get("level") != "L1_observation"
+        or dict(public_result) != canonical_public_result
+        or canonical_public_result.get("responsibility")
+        != {"status": "not_attributed", "candidate": "暂无法判断"}
+    ):
+        return None
+    observations = canonical_public_result.get("evaluator_observations")
+    observation_count = canonical_public_result.get("evaluator_observation_count")
+    if (
+        isinstance(observation_count, bool)
+        or not isinstance(observation_count, int)
+        or observation_count < 1
+        or not isinstance(observations, list)
+        or not observations
+        or len(observations) > observation_count
+        or canonical_public_result.get("evaluator_observation_omitted_count")
+        != observation_count - len(observations)
+    ):
+        return None
+    projection_sha256 = _sha256_bytes(
+        json.dumps(
+            canonical_projection,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    return {
+        "status": "observational_non_attribution",
+        "gate_a_level": "L1_observation",
+        "responsibility": "暂无法判断",
+        "observation_count": observation_count,
+        "projection_sha256": projection_sha256,
         "causal_text_sha256": "",
     }
 
@@ -737,6 +833,10 @@ def _approval(
     if quality is None:
         quality = _explicit_focus_stop_quality(
             snapshot.get("contract_json"), issue_title=issue_title
+        )
+    if quality is None:
+        quality = _observational_non_attribution_quality(
+            snapshot.get("contract_json")
         )
     if quality is None:
         return None

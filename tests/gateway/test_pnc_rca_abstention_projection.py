@@ -477,6 +477,118 @@ def test_gate_a_free_prose_only_evidence_fails_closed(reference):
         })
 
 
+def test_gate_a_isolates_unprojectable_evaluator_when_bound_observation_exists():
+    binding = build_gate_a_identifier_binding({
+        "actual_evaluators": [
+            {"evaluator_id": "acc_jerk", "status": "supported"},
+            {"evaluator_id": "object_kinematics", "status": "refuted"},
+        ],
+        "actual_signals": ["ACC_AccelerationRequestMps2"],
+        "actual_fields": [],
+    })
+    projection = _project_gate_a_report({
+        "input_materialized": True,
+        "rca_evaluators": [
+            {
+                "key": "object_kinematics",
+                "status": "refuted",
+                "evidence_refs": [{
+                    "signal": "OPK_PosX,OPK_RelSpeed",
+                    "fields": ["OPK_PosX", "OPK_RelSpeed"],
+                }],
+            },
+            {
+                "key": "acc_jerk",
+                "status": "supported",
+                "evidence_refs": [{"signal": "ACC_AccelerationRequestMps2"}],
+            },
+        ],
+    }, identifier_binding=binding)
+
+    assert [
+        item["key"] for item in projection["evaluator_projection"]["evaluators"]
+    ] == ["acc_jerk"]
+
+
+def test_gate_a_quarantines_unbound_responsibility_bytes_from_every_public_surface():
+    malicious_key = "ACC_is_at_fault"
+    malicious_signal = "control_team_should_own"
+    binding = build_gate_a_identifier_binding({
+        "actual_evaluators": [
+            {"evaluator_id": "acc_jerk", "status": "supported"},
+        ],
+        "actual_signals": ["ACC_AccelerationRequestMps2"],
+        "actual_fields": [],
+    })
+    projection = _project_gate_a_report({
+        "input_materialized": True,
+        "rca_evaluators": [
+            {
+                "key": malicious_key,
+                "status": "supported",
+                "evidence_refs": [{"signal": malicious_signal}],
+            },
+            {
+                "key": "acc_jerk",
+                "status": "supported",
+                "evidence_refs": [{"signal": "ACC_AccelerationRequestMps2"}],
+            },
+        ],
+    }, identifier_binding=binding)
+
+    serialized = json.dumps(
+        {
+            "projection": projection,
+            "public": build_gate_a_public_result(projection),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    assert malicious_key not in serialized
+    assert malicious_signal not in serialized
+    assert "ACC_AccelerationRequestMps2" in serialized
+
+
+@pytest.mark.parametrize(
+    ("evaluator", "expected_code"),
+    [
+        (
+            {
+                "key": "object_kinematics",
+                "status": "refuted",
+                "evidence_refs": [{"signal": "OPK_PosX,OPK_RelSpeed"}],
+            },
+            "evaluator_evidence_text_forbidden",
+        ),
+        (
+            {
+                "key": "object_track_quality",
+                "status": "refuted",
+                "evidence_refs": [{"signal": "OPK_PosX"}],
+                "checks": [{"thresholds": {"stable": True}}],
+            },
+            "evaluator_check_thresholds_invalid",
+        ),
+    ],
+)
+def test_gate_a_invalid_only_rethrows_first_exact_projection_error(
+    evaluator, expected_code
+):
+    binding = build_gate_a_identifier_binding({
+        "actual_evaluators": [
+            {"evaluator_id": evaluator["key"], "status": evaluator["status"]},
+        ],
+        "actual_signals": ["OPK_PosX"],
+        "actual_fields": [],
+    })
+
+    with pytest.raises(RcaEvidenceProjectionError, match=expected_code):
+        _project_gate_a_report({
+            "input_materialized": True,
+            "rca_evaluators": [evaluator],
+        }, identifier_binding=binding)
+
+
 @pytest.mark.parametrize("identifier", ["ACC is at fault.", "规划 模块导致问题"])
 def test_gate_a_rejects_prose_disguised_as_structural_identifier(identifier):
     with pytest.raises(
