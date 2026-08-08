@@ -3571,7 +3571,7 @@ def test_current_epoch_holds_preauthorized_even_when_caller_uses_legacy_flag(
     assert store.backfill_completed_submissions(now=NOW) == 0
 
 
-def test_activation_deferred_outbox_is_never_backfilled_into_delivery(tmp_path):
+def test_forged_activation_deferred_error_does_not_suppress_backfill(tmp_path):
     _control(tmp_path, completed=False)
     store = RcaDeliveryStore(tmp_path / "control.sqlite3")
     with sqlite3.connect(store.db_path) as conn:
@@ -3587,7 +3587,78 @@ def test_activation_deferred_outbox_is_never_backfilled_into_delivery(tmp_path):
         )
         conn.commit()
 
-    assert store.backfill_completed_submissions(now=NOW) == 0
+    assert store.backfill_completed_submissions(now=NOW) == 1
+    assert len(store.list_rows("rca_execution_watch")) == 1
+    assert len(store.list_rows("rca_delivery_jobs")) == 1
+    assert len(store.list_rows("rca_delivery_effects")) == 1
+
+
+def test_audited_activation_deferral_is_never_backfilled_into_delivery(tmp_path):
+    control, result = _control(tmp_path, completed=False)
+    control.create_activation_epoch(
+        epoch_id="delivery-epoch-1",
+        preauthorization_fingerprint="a" * 64,
+        preauthorization_gate_receipt_sha256="b" * 64,
+        preauthorization_capsule_sha256="c" * 64,
+        config_sha256="d" * 64,
+        db_logical_identity={"database": "delivery-test"},
+        partition_start_fence={TOPIC: {"2": 11}},
+        operator="delivery-test",
+        reason="create exact deferral fixture",
+        now=NOW,
+    )
+    with sqlite3.connect(control.db_path) as conn:
+        ledger = conn.execute(
+            """
+            INSERT INTO rca_activation_admission_ledger(
+                epoch_id, admission_key, entrypoint, source_kind,
+                source_identity_sha256, slot_kind, decision, reason,
+                business_key, submission_key, generation,
+                first_adjudicated_at, last_adjudicated_at,
+                admitted_at, bound_at
+            ) VALUES (
+                'delivery-epoch-1', 'exact-kafka-deferral',
+                'kafka_ingest', 'kafka', ?, 'kafka_success', 'admit',
+                'exact_test_admit', ?, ?, ?, ?, ?, ?, ?
+            )
+            """,
+            (
+                "e" * 64,
+                result.business_key,
+                result.submission_key,
+                result.generation,
+                NOW.isoformat(),
+                NOW.isoformat(),
+                NOW.isoformat(),
+                NOW.isoformat(),
+            ),
+        )
+        assert ledger.lastrowid is not None
+        conn.execute(
+            "UPDATE business_triggers SET activation_epoch_id=?, "
+            "activation_ledger_id=? WHERE submission_key=?",
+            ("delivery-epoch-1", ledger.lastrowid, result.submission_key),
+        )
+        conn.execute(
+            "UPDATE rca_outbox SET activation_epoch_id=?, "
+            "activation_ledger_id=? WHERE submission_key=?",
+            ("delivery-epoch-1", ledger.lastrowid, result.submission_key),
+        )
+    with sqlite3.connect(control.db_path) as conn:
+        source_event_id = str(
+            conn.execute("SELECT source_event_id FROM rca_outbox").fetchone()[0]
+        )
+    assert source_event_id
+    control.defer_activation_event(
+        source_event_id,
+        expected_activation_epoch_id="delivery-epoch-1",
+        operator="delivery-test",
+        reason="exact audited deferral must remain local-only",
+        now=NOW + timedelta(seconds=1),
+    )
+    store = RcaDeliveryStore(control.db_path)
+
+    assert store.backfill_completed_submissions(now=NOW + timedelta(seconds=2)) == 0
     assert store.list_rows("rca_execution_watch") == []
     assert store.list_rows("rca_delivery_jobs") == []
     assert store.list_rows("rca_delivery_effects") == []

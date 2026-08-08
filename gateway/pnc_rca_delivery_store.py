@@ -5144,6 +5144,47 @@ class RcaDeliveryStore:
                    AND NOT (
                        o.status = 'quarantined'
                        AND o.last_error_code = 'activation_epoch_deferred'
+                       AND o.activation_epoch_id IS NOT NULL
+                       AND o.activation_ledger_id IS NOT NULL
+                       AND EXISTS (
+                           SELECT 1
+                             FROM rca_activation_admission_ledger AS al
+                            WHERE al.ledger_id = o.activation_ledger_id
+                              AND al.epoch_id = o.activation_epoch_id
+                              AND al.business_key = o.business_key
+                              AND al.submission_key = o.submission_key
+                              AND al.generation = o.generation
+                              AND al.decision IN ('admit', 'shadow')
+                              AND al.bound_at IS NOT NULL
+                       )
+                       AND EXISTS (
+                           SELECT 1
+                             FROM rca_shadow_promotion_audit AS audit
+                            WHERE audit.outbox_id = o.outbox_id
+                              AND audit.submission_key = o.submission_key
+                              AND audit.outcome = 'deferred'
+                              AND audit.to_status = 'quarantined'
+                              AND audit.detail =
+                                  'exact activation item deferred for reviewed manual recovery'
+                              AND (
+                                  audit.event_uid = o.source_event_id
+                                  OR EXISTS (
+                                      SELECT 1
+                                        FROM rca_trigger_sources AS source
+                                        JOIN rca_trigger_bindings AS origin
+                                          ON origin.source_id = source.source_id
+                                         AND origin.business_key = o.business_key
+                                         AND origin.generation = o.generation
+                                         AND origin.role = 'origin'
+                                       WHERE source.source_id = o.origin_source_id
+                                         AND source.source_kind =
+                                             'feishu_group_manual'
+                                         AND source.message_id = audit.event_uid
+                                         AND source.source_dedupe_key =
+                                             'feishu:' || source.message_id
+                                  )
+                              )
+                       )
                    )
                    AND w.submission_key IS NULL
                    {activation_filter}

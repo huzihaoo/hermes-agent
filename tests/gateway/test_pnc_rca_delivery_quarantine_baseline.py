@@ -436,16 +436,97 @@ def _seed_materialized_activation_deferral_race(root: Path) -> RcaDeliveryStore:
             "SELECT delivery_id FROM rca_delivery_jobs LIMIT 1"
         ).fetchone()
         assert job is not None
+        epoch_id = "rca-materialized-deferral-test"
+        conn.execute(
+            """
+            INSERT INTO rca_activation_epochs(
+                epoch_id, state, is_current,
+                preauthorization_fingerprint,
+                preauthorization_gate_receipt_sha256,
+                preauthorization_capsule_sha256, config_sha256,
+                db_logical_identity_json, db_logical_identity_sha256,
+                partition_start_fence_json, partition_start_fence_sha256,
+                created_at, updated_at, aborted_at
+            ) VALUES (?, 'aborted', 1, ?, ?, ?, ?, '{}', ?, '{}', ?, ?, ?, ?)
+            """,
+            (
+                epoch_id,
+                "1" * 64,
+                "2" * 64,
+                "3" * 64,
+                "4" * 64,
+                "5" * 64,
+                "6" * 64,
+                now,
+                now,
+                now,
+            ),
+        )
+        ledger = conn.execute(
+            """
+            INSERT INTO rca_activation_admission_ledger(
+                epoch_id, admission_key, entrypoint, source_kind,
+                source_identity_sha256, slot_kind, decision, reason,
+                business_key, submission_key, generation,
+                first_adjudicated_at, last_adjudicated_at,
+                admitted_at, bound_at
+            ) VALUES (?, 'manual-materialized-race', 'manual_admit', 'manual',
+                      ?, 'manual_success', 'admit',
+                      'activation_bounded_slot_consumed', ?, ?, 1,
+                      ?, ?, ?, ?)
+            """,
+            (
+                epoch_id,
+                "7" * 64,
+                row["business_key"],
+                row["submission_key"],
+                NOW.isoformat(),
+                NOW.isoformat(),
+                NOW.isoformat(),
+                NOW.isoformat(),
+            ),
+        )
+        assert ledger.lastrowid is not None
+        conn.execute(
+            "UPDATE rca_trigger_sources "
+            "SET source_dedupe_key='feishu:' || message_id "
+            "WHERE source_id='source-manual-dual-baseline'"
+        )
+        conn.execute(
+            """
+            INSERT INTO rca_trigger_bindings(
+                source_id, business_key, generation, role, bound_at
+            ) VALUES ('source-manual-dual-baseline', ?, 1, 'origin', ?)
+            """,
+            (row["business_key"], NOW.isoformat()),
+        )
         conn.execute(
             """
             UPDATE rca_outbox
                SET status='quarantined', quarantined_at=?,
                    last_error_code='activation_epoch_deferred',
                    last_error_detail='exact operator-reviewed activation deferral',
-                   updated_at=?
+                   attempt=0, fence=0, next_attempt_at=NULL,
+                   lease_token=NULL, lease_owner=NULL, lease_expires_at=NULL,
+                   origin_source_id='source-manual-dual-baseline',
+                   activation_epoch_id=?, activation_ledger_id=?, updated_at=?
              WHERE outbox_id=?
             """,
-            (now, now, row["outbox_id"]),
+            (now, epoch_id, ledger.lastrowid, now, row["outbox_id"]),
+        )
+        conn.execute(
+            """
+            INSERT INTO rca_shadow_promotion_audit(
+                event_uid, outbox_id, submission_key, operator, reason,
+                outcome, from_status, to_status, detail, created_at
+            ) VALUES (
+                'om_trigger456', ?, ?, 'test-operator',
+                'exact test activation deferral', 'deferred', 'pending',
+                'quarantined',
+                'exact activation item deferred for reviewed manual recovery', ?
+            )
+            """,
+            (row["outbox_id"], row["submission_key"], now),
         )
         conn.execute(
             "UPDATE business_triggers SET state='quarantined' "
@@ -456,6 +537,8 @@ def _seed_materialized_activation_deferral_race(root: Path) -> RcaDeliveryStore:
             """
             UPDATE rca_execution_watch
                SET state='delivery_created', delivery_id=?,
+                   poll_attempt=0, fence=0, lease_token=NULL,
+                   lease_owner=NULL, lease_expires_at=NULL,
                    last_error_code='activation_epoch_deferred', updated_at=?
              WHERE submission_key=?
             """,
@@ -467,9 +550,9 @@ def _seed_materialized_activation_deferral_race(root: Path) -> RcaDeliveryStore:
                SET status='ready', outcome='quarantined',
                    terminal_state='submission_quarantined',
                    terminal_error_code='outbox_submission_quarantined',
-                   updated_at=?
+                   created_at=?, updated_at=?
             """,
-            (now,),
+            (now, now),
         )
         conn.execute(
             """
@@ -485,15 +568,51 @@ def _seed_materialized_activation_deferral_race(root: Path) -> RcaDeliveryStore:
              WHERE effect_kind='feishu_thread_reply'
             """
         )
+        effect = conn.execute(
+            """
+            SELECT e.effect_key, e.delivery_id, e.effect_kind, e.target_key,
+                   j.submission_key, j.generation, j.project_key,
+                   j.work_item_type_key, j.work_item_id, j.outcome,
+                   j.terminal_state, j.terminal_error_code
+              FROM rca_delivery_effects AS e
+              JOIN rca_delivery_jobs AS j ON j.delivery_id=e.delivery_id
+             WHERE e.effect_kind='feishu_issue_comment'
+            """
+        ).fetchone()
+        assert effect is not None
+        semantic_sha256 = "8" * 64
+        payload = {
+            "schema_version": "pnc_rca_terminal_delivery_effect_v4",
+            "delivery_id": effect["delivery_id"],
+            "effect_key": effect["effect_key"],
+            "effect_kind": effect["effect_kind"],
+            "target_key": effect["target_key"],
+            "submission_key": effect["submission_key"],
+            "generation": effect["generation"],
+            "outcome": effect["outcome"],
+            "project_key": effect["project_key"],
+            "work_item_type_key": effect["work_item_type_key"],
+            "work_item_id": effect["work_item_id"],
+            "terminal_state": effect["terminal_state"],
+            "error_code": effect["terminal_error_code"],
+            "semantic_payload_sha256": semantic_sha256,
+            "marker": f"[RCA_TERMINAL:{effect['effect_key']}:quarantined:1]",
+        }
         conn.execute(
             """
             UPDATE rca_delivery_effects
                SET status='pending', outcome='quarantined', write_phase='prewrite',
                    attempt=0, fence=0, remote_receipt_json=NULL,
                    lease_token=NULL, lease_owner=NULL, lease_expires_at=NULL,
-                   next_attempt_at=NULL, write_started_at=NULL, updated_at=?
+                   next_attempt_at=NULL, write_started_at=NULL,
+                   payload_json=?, payload_sha256=?, created_at=?, updated_at=?
             """,
-            (now,),
+            (
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                semantic_sha256,
+                now,
+                now,
+            ),
         )
         conn.commit()
     return store
@@ -519,6 +638,46 @@ def test_materialized_activation_deferral_race_is_exactly_classified(tmp_path):
     assert materialized["entries"][0]["attempt"] == 0
     assert materialized["entries"][0]["fence"] == 0
     assert materialized["entries_sha256"]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "parameters"),
+    (
+        ("UPDATE rca_trigger_bindings SET role='joined'", ()),
+        ("UPDATE rca_outbox SET origin_source_id=NULL", ()),
+        ("UPDATE business_triggers SET state='completed'", ()),
+        ("UPDATE rca_execution_watch SET state='quarantined'", ()),
+        ("UPDATE rca_delivery_jobs SET submission_key='wrong-submission'", ()),
+        ("UPDATE rca_delivery_effects SET required=0", ()),
+        ("UPDATE rca_delivery_effects SET outcome='success'", ()),
+        ("UPDATE rca_delivery_effects SET target_key='wrong-target'", ()),
+        ("UPDATE rca_delivery_effects SET payload_json='{}'", ()),
+        (
+            """
+            INSERT INTO rca_delivery_attempts(
+                effect_key, attempt_no, event_seq, fence, request_id,
+                outcome, started_at
+            ) SELECT effect_key, 1, 1, 0, 'attempt-present', 'started', ?
+                FROM rca_delivery_effects
+            """,
+            (NOW.isoformat(),),
+        ),
+    ),
+)
+def test_materialized_activation_deferral_shape_fails_closed_on_drift(
+    tmp_path, mutation, parameters
+):
+    store = _seed_materialized_activation_deferral_race(tmp_path)
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(mutation, parameters)
+        conn.commit()
+        conn.row_factory = sqlite3.Row
+        projection = _quarantined_subscription_projection(conn)
+        materialized = _activation_deferred_materialized_projection(conn)
+
+    assert materialized["count"] == 0
+    assert projection["activation_deferred_materialized_delivery"] == 0
+    assert projection["unrecognized"] == 1
 
 
 def _settlement_receipt(effect_key: str, root: Path) -> Path:

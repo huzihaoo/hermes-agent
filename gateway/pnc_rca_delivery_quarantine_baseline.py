@@ -804,13 +804,27 @@ def _activation_deferred_materialized_projection(
         """
         SELECT thread.subscription_key AS thread_subscription_key,
                issue.subscription_key AS issue_subscription_key,
-               source.source_id, source.message_id, source.mode, source.outcome,
+               source.source_id, source.source_dedupe_key, source.message_id,
+               source.mode, source.outcome,
                o.outbox_id, o.submission_key, o.business_key, o.generation,
+               o.activation_epoch_id, o.activation_ledger_id,
+               al.entrypoint AS ledger_entrypoint,
+               al.source_kind AS ledger_source_kind,
+               al.decision AS ledger_decision,
+               al.bound_at AS ledger_bound_at,
+               audit.audit_id, audit.outcome AS audit_outcome,
+               audit.from_status AS audit_from_status,
+               audit.to_status AS audit_to_status,
+               audit.detail AS audit_detail,
+               audit.operator AS audit_operator,
+               audit.reason AS audit_reason,
+               audit.created_at AS audit_created_at,
                w.state AS watch_state, w.delivery_id AS watch_delivery_id,
                j.delivery_id, j.status AS job_status, j.outcome AS job_outcome,
-               j.terminal_state, j.terminal_error_code,
+               j.terminal_state, j.terminal_error_code, j.target_key AS job_target_key,
                e.effect_key, e.effect_kind, e.status AS effect_status,
-               e.write_phase, e.attempt, e.fence, e.payload_sha256,
+               e.write_phase, e.attempt, e.fence, e.target_key,
+               e.payload_json, e.payload_sha256,
                e.remote_receipt_json, e.lease_token, e.lease_owner,
                e.lease_expires_at, e.next_attempt_at, e.write_started_at
           FROM rca_delivery_subscriptions AS thread
@@ -828,20 +842,100 @@ def _activation_deferred_materialized_projection(
           JOIN rca_outbox AS o
             ON o.business_key = thread.business_key
            AND o.generation = thread.generation
+           AND o.origin_source_id = source.source_id
            AND o.status = 'quarantined'
            AND o.last_error_code = 'activation_epoch_deferred'
+           AND o.attempt = 0
+           AND o.fence = 0
+           AND o.lease_token IS NULL
+           AND o.lease_owner IS NULL
+           AND o.lease_expires_at IS NULL
+          JOIN business_triggers AS trigger
+            ON trigger.business_key = o.business_key
+           AND trigger.generation = o.generation
+           AND trigger.submission_key = o.submission_key
+           AND trigger.state = 'quarantined'
+          JOIN rca_trigger_bindings AS origin
+            ON origin.source_id = source.source_id
+           AND origin.role = 'origin'
+           AND origin.business_key = o.business_key
+           AND origin.generation = o.generation
+          JOIN rca_activation_admission_ledger AS al
+            ON al.epoch_id = o.activation_epoch_id
+           AND al.ledger_id = o.activation_ledger_id
+           AND al.business_key = o.business_key
+           AND al.submission_key = o.submission_key
+           AND al.generation = o.generation
+           AND al.entrypoint = 'manual_admit'
+           AND al.source_kind = 'manual'
+           AND al.slot_kind IN ('manual_success', 'manual_terminal_failure')
+           AND al.decision = 'admit'
+           AND al.bound_at IS NOT NULL
+          JOIN rca_shadow_promotion_audit AS audit
+            ON audit.outbox_id = o.outbox_id
+           AND audit.submission_key = o.submission_key
+           AND audit.event_uid = source.message_id
+           AND audit.outcome = 'deferred'
+           AND audit.from_status = 'pending'
+           AND audit.to_status = 'quarantined'
+           AND audit.detail =
+               'exact activation item deferred for reviewed manual recovery'
           JOIN rca_execution_watch AS w
             ON w.submission_outbox_id = o.outbox_id
+           AND w.submission_key = o.submission_key
+           AND w.business_key = o.business_key
+           AND w.generation = o.generation
            AND w.state = 'delivery_created'
+           AND w.poll_attempt = 0
+           AND w.fence = 0
+           AND w.lease_token IS NULL
+           AND w.lease_owner IS NULL
+           AND w.lease_expires_at IS NULL
           JOIN rca_delivery_jobs AS j
             ON j.delivery_id = w.delivery_id
+           AND j.submission_key = o.submission_key
+           AND j.business_key = o.business_key
+           AND j.generation = o.generation
+           AND j.project_key = trigger.project_key
+           AND j.work_item_type_key = trigger.work_item_type_key
+           AND j.work_item_id = trigger.work_item_id
            AND j.status = 'ready'
            AND j.outcome = 'quarantined'
            AND j.terminal_state = 'submission_quarantined'
            AND j.terminal_error_code = 'outbox_submission_quarantined'
+           AND j.created_at >= audit.created_at
           JOIN rca_delivery_effects AS e
             ON e.delivery_id = j.delivery_id
            AND e.effect_kind = 'feishu_issue_comment'
+           AND e.required = 1
+           AND e.outcome = 'quarantined'
+           AND e.target_key = j.target_key
+           AND json_extract(e.payload_json, '$.schema_version') IN (
+               'pnc_rca_terminal_delivery_effect_v1',
+               'pnc_rca_terminal_delivery_effect_v2',
+               'pnc_rca_terminal_delivery_effect_v3',
+               'pnc_rca_terminal_delivery_effect_v4',
+               'pnc_rca_terminal_delivery_effect_v5'
+           )
+           AND json_extract(e.payload_json, '$.delivery_id') = j.delivery_id
+           AND json_extract(e.payload_json, '$.effect_key') = e.effect_key
+           AND json_extract(e.payload_json, '$.effect_kind') = e.effect_kind
+           AND json_extract(e.payload_json, '$.target_key') = e.target_key
+           AND json_extract(e.payload_json, '$.submission_key') = j.submission_key
+           AND json_extract(e.payload_json, '$.generation') = j.generation
+           AND json_extract(e.payload_json, '$.outcome') = j.outcome
+           AND json_extract(e.payload_json, '$.project_key') = j.project_key
+           AND json_extract(e.payload_json, '$.work_item_type_key') =
+               j.work_item_type_key
+           AND json_extract(e.payload_json, '$.work_item_id') = j.work_item_id
+           AND json_extract(e.payload_json, '$.terminal_state') = j.terminal_state
+           AND json_extract(e.payload_json, '$.error_code') =
+               j.terminal_error_code
+           AND json_extract(e.payload_json, '$.semantic_payload_sha256') =
+               e.payload_sha256
+           AND instr(
+               json_extract(e.payload_json, '$.marker'), e.effect_key
+           ) > 0
            AND e.status = 'pending'
            AND e.write_phase = 'prewrite'
            AND e.attempt = 0
@@ -852,6 +946,7 @@ def _activation_deferred_materialized_projection(
            AND e.lease_expires_at IS NULL
            AND e.next_attempt_at IS NULL
            AND e.write_started_at IS NULL
+           AND e.created_at >= audit.created_at
          WHERE thread.status = 'quarantined'
            AND thread.effect_kind = 'feishu_thread_reply'
            AND thread.reason = 'activation_epoch_deferred'
@@ -859,12 +954,21 @@ def _activation_deferred_materialized_projection(
            AND thread.effect_key IS NULL
            AND thread.required = 1
            AND source.source_kind = 'feishu_group_manual'
+           AND source.source_dedupe_key = 'feishu:' || source.message_id
            AND source.mode = 'run_or_join'
            AND source.outcome IN ('created', 'joined')
            AND NOT EXISTS (
                  SELECT 1 FROM rca_delivery_effects AS thread_effect
                   WHERE thread_effect.delivery_id = j.delivery_id
                     AND thread_effect.effect_kind = 'feishu_thread_reply'
+           )
+           AND NOT EXISTS (
+                 SELECT 1 FROM rca_delivery_attempts AS attempt
+                  WHERE attempt.effect_key = e.effect_key
+           )
+           AND NOT EXISTS (
+                 SELECT 1 FROM rca_delivery_observation_outbox AS observation
+                  WHERE observation.effect_key = e.effect_key
            )
          ORDER BY thread.subscription_key
         """
@@ -878,12 +982,39 @@ def _activation_deferred_materialized_projection(
                 "delivery_quarantine_materialized_deferred_duplicate"
             )
         seen.add(thread_key)
+        if (
+            not str(row["message_id"] or "")
+            or not str(row["activation_epoch_id"] or "")
+            or int(row["activation_ledger_id"] or 0) <= 0
+            or str(row["ledger_bound_at"] or "") == ""
+            or str(row["audit_operator"] or "") == ""
+            or str(row["audit_reason"] or "") == ""
+        ):
+            raise DeliveryQuarantineBaselineError(
+                "delivery_quarantine_materialized_deferred_binding_invalid"
+            )
+        try:
+            ledger_bound_at = _parse_iso(row["ledger_bound_at"])
+            audit_created_at = _parse_iso(row["audit_created_at"])
+            _audit_text(row["audit_operator"], row["audit_reason"])
+            if audit_created_at < ledger_bound_at:
+                raise ValueError("deferral audit predates activation binding")
+        except (
+            DeliveryQuarantineBaselineError,
+            TypeError,
+            ValueError,
+            OverflowError,
+        ) as exc:
+            raise DeliveryQuarantineBaselineError(
+                "delivery_quarantine_materialized_deferred_binding_invalid"
+            ) from exc
         remote_receipt = str(row["remote_receipt_json"] or "")
         entries.append(
             {
                 "thread_subscription_key": thread_key,
                 "issue_subscription_key": str(row["issue_subscription_key"] or ""),
                 "source_id": str(row["source_id"] or ""),
+                "source_dedupe_key": str(row["source_dedupe_key"] or ""),
                 "message_id": str(row["message_id"] or ""),
                 "source_mode": str(row["mode"] or ""),
                 "source_outcome": str(row["outcome"] or ""),
@@ -891,6 +1022,22 @@ def _activation_deferred_materialized_projection(
                 "submission_key": str(row["submission_key"] or ""),
                 "business_key": str(row["business_key"] or ""),
                 "generation": int(row["generation"]),
+                "activation_epoch_id": str(row["activation_epoch_id"] or ""),
+                "activation_ledger_id": int(row["activation_ledger_id"]),
+                "ledger_entrypoint": str(row["ledger_entrypoint"] or ""),
+                "ledger_source_kind": str(row["ledger_source_kind"] or ""),
+                "ledger_decision": str(row["ledger_decision"] or ""),
+                "ledger_bound_at": str(row["ledger_bound_at"] or ""),
+                "audit_id": int(row["audit_id"]),
+                "audit_outcome": str(row["audit_outcome"] or ""),
+                "audit_from_status": str(row["audit_from_status"] or ""),
+                "audit_to_status": str(row["audit_to_status"] or ""),
+                "audit_detail": str(row["audit_detail"] or ""),
+                "audit_operator": str(row["audit_operator"] or ""),
+                "audit_reason_sha256": hashlib.sha256(
+                    str(row["audit_reason"] or "").encode("utf-8")
+                ).hexdigest(),
+                "audit_created_at": str(row["audit_created_at"] or ""),
                 "watch_state": str(row["watch_state"] or ""),
                 "delivery_id": str(row["delivery_id"] or ""),
                 "job_status": str(row["job_status"] or ""),
