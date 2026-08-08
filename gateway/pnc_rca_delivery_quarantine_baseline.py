@@ -35,6 +35,10 @@ from gateway.pnc_rca_prod_bootstrap import (
 
 CORE_SCHEMA_VERSION = "pnc_rca_delivery_quarantine_core_v1"
 DEFERRED_CORE_SCHEMA_VERSION = "pnc_rca_delivery_quarantine_core_v2"
+# A collector can wake in the small interval between an exact activation
+# deferral and writer shutdown.  Version 3 records that very narrow, local-only
+# materialization shape instead of treating it as an ordinary quarantine.
+MATERIALIZED_DEFERRED_CORE_SCHEMA_VERSION = "pnc_rca_delivery_quarantine_core_v3"
 RELEASE_MANIFEST_SCHEMA_VERSION = "pnc_rca_release_prepare_manifest_v1"
 APPROVAL_SCHEMA_VERSION = "pnc_rca_release_approval_v1"
 BASELINE_SCHEMA_VERSION = "pnc_rca_delivery_quarantine_baseline_v1"
@@ -86,6 +90,12 @@ _CORE_FIELDS = frozenset({
 })
 _DEFERRED_ADJUDICATION_FIELD = "activation_deferred_issue_comment_adjudication"
 _DEFERRED_CORE_FIELDS = _CORE_FIELDS | frozenset({_DEFERRED_ADJUDICATION_FIELD})
+_MATERIALIZED_DEFERRED_ADJUDICATION_FIELD = (
+    "activation_deferred_materialized_delivery_adjudication"
+)
+_MATERIALIZED_DEFERRED_CORE_FIELDS = _DEFERRED_CORE_FIELDS | frozenset(
+    {_MATERIALIZED_DEFERRED_ADJUDICATION_FIELD}
+)
 _MIGRATION_BINDING_FIELDS = frozenset({
     "receipt_path",
     "receipt_sha256",
@@ -133,6 +143,21 @@ _DEFERRED_ADJUDICATION_FIELDS = frozenset({
     "delivery_job_present",
     "delivery_effect_present",
     "count",
+    "analyzed_by",
+    "analyzed_at",
+    "reason",
+})
+_MATERIALIZED_DEFERRED_ADJUDICATION_FIELDS = frozenset({
+    "effect_kind",
+    "reason_code",
+    "technical_finding",
+    "proposed_disposition",
+    "required",
+    "source_kind",
+    "source_mode",
+    "count",
+    "entries",
+    "entries_sha256",
     "analyzed_by",
     "analyzed_at",
     "reason",
@@ -761,12 +786,150 @@ def _quarantine_lifetime_counts(
     return counts
 
 
+def _activation_deferred_materialized_projection(
+    conn: sqlite3.Connection,
+) -> dict[str, Any]:
+    """Identify only the exact no-write collector race shape.
+
+    A deferred manual submission normally has no delivery job.  If the
+    collector wakes before it observes the deferral, it can leave one
+    ``ready`` terminal job and one issue-comment effect in ``prewrite``.  The
+    activation fence makes that effect ineligible, but the successor release
+    still needs an immutable record of the local residue.  Every predicate
+    below is intentionally exact; any different shape remains unrecognized
+    and fails the release gate.
+    """
+
+    rows = conn.execute(
+        """
+        SELECT thread.subscription_key AS thread_subscription_key,
+               issue.subscription_key AS issue_subscription_key,
+               source.source_id, source.message_id, source.mode, source.outcome,
+               o.outbox_id, o.submission_key, o.business_key, o.generation,
+               w.state AS watch_state, w.delivery_id AS watch_delivery_id,
+               j.delivery_id, j.status AS job_status, j.outcome AS job_outcome,
+               j.terminal_state, j.terminal_error_code,
+               e.effect_key, e.effect_kind, e.status AS effect_status,
+               e.write_phase, e.attempt, e.fence, e.payload_sha256,
+               e.remote_receipt_json, e.lease_token, e.lease_owner,
+               e.lease_expires_at, e.next_attempt_at, e.write_started_at
+          FROM rca_delivery_subscriptions AS thread
+          JOIN rca_delivery_subscriptions AS issue
+            ON issue.business_key = thread.business_key
+           AND issue.generation = thread.generation
+           AND issue.effect_kind = 'feishu_issue_comment'
+           AND issue.status = 'quarantined'
+           AND issue.reason = 'activation_epoch_deferred'
+           AND issue.source_id IS NULL
+           AND issue.delivery_id IS NULL
+           AND issue.effect_key IS NULL
+          JOIN rca_trigger_sources AS source
+            ON source.source_id = thread.source_id
+          JOIN rca_outbox AS o
+            ON o.business_key = thread.business_key
+           AND o.generation = thread.generation
+           AND o.status = 'quarantined'
+           AND o.last_error_code = 'activation_epoch_deferred'
+          JOIN rca_execution_watch AS w
+            ON w.submission_outbox_id = o.outbox_id
+           AND w.state = 'delivery_created'
+          JOIN rca_delivery_jobs AS j
+            ON j.delivery_id = w.delivery_id
+           AND j.status = 'ready'
+           AND j.outcome = 'quarantined'
+           AND j.terminal_state = 'submission_quarantined'
+           AND j.terminal_error_code = 'outbox_submission_quarantined'
+          JOIN rca_delivery_effects AS e
+            ON e.delivery_id = j.delivery_id
+           AND e.effect_kind = 'feishu_issue_comment'
+           AND e.status = 'pending'
+           AND e.write_phase = 'prewrite'
+           AND e.attempt = 0
+           AND e.fence = 0
+           AND e.remote_receipt_json IS NULL
+           AND e.lease_token IS NULL
+           AND e.lease_owner IS NULL
+           AND e.lease_expires_at IS NULL
+           AND e.next_attempt_at IS NULL
+           AND e.write_started_at IS NULL
+         WHERE thread.status = 'quarantined'
+           AND thread.effect_kind = 'feishu_thread_reply'
+           AND thread.reason = 'activation_epoch_deferred'
+           AND thread.delivery_id IS NULL
+           AND thread.effect_key IS NULL
+           AND thread.required = 1
+           AND source.source_kind = 'feishu_group_manual'
+           AND source.mode = 'run_or_join'
+           AND source.outcome IN ('created', 'joined')
+           AND NOT EXISTS (
+                 SELECT 1 FROM rca_delivery_effects AS thread_effect
+                  WHERE thread_effect.delivery_id = j.delivery_id
+                    AND thread_effect.effect_kind = 'feishu_thread_reply'
+           )
+         ORDER BY thread.subscription_key
+        """
+    ).fetchall()
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in rows:
+        thread_key = str(row["thread_subscription_key"] or "")
+        if not thread_key or thread_key in seen:
+            raise DeliveryQuarantineBaselineError(
+                "delivery_quarantine_materialized_deferred_duplicate"
+            )
+        seen.add(thread_key)
+        remote_receipt = str(row["remote_receipt_json"] or "")
+        entries.append(
+            {
+                "thread_subscription_key": thread_key,
+                "issue_subscription_key": str(row["issue_subscription_key"] or ""),
+                "source_id": str(row["source_id"] or ""),
+                "message_id": str(row["message_id"] or ""),
+                "source_mode": str(row["mode"] or ""),
+                "source_outcome": str(row["outcome"] or ""),
+                "outbox_id": int(row["outbox_id"]),
+                "submission_key": str(row["submission_key"] or ""),
+                "business_key": str(row["business_key"] or ""),
+                "generation": int(row["generation"]),
+                "watch_state": str(row["watch_state"] or ""),
+                "delivery_id": str(row["delivery_id"] or ""),
+                "job_status": str(row["job_status"] or ""),
+                "job_outcome": str(row["job_outcome"] or ""),
+                "terminal_state": str(row["terminal_state"] or ""),
+                "terminal_error_code": str(row["terminal_error_code"] or ""),
+                "effect_key": str(row["effect_key"] or ""),
+                "effect_kind": str(row["effect_kind"] or ""),
+                "effect_status": str(row["effect_status"] or ""),
+                "write_phase": str(row["write_phase"] or ""),
+                "attempt": int(row["attempt"]),
+                "fence": int(row["fence"]),
+                "payload_sha256": str(row["payload_sha256"] or ""),
+                "remote_receipt_sha256": (
+                    hashlib.sha256(remote_receipt.encode("utf-8")).hexdigest()
+                    if remote_receipt
+                    else ""
+                ),
+            }
+        )
+    entries_sha256 = hashlib.sha256(_canonical_bytes(entries)).hexdigest()
+    return {
+        "count": len(entries),
+        "entries": entries,
+        "entries_sha256": entries_sha256,
+    }
+
+
 def _quarantined_subscription_projection(
     conn: sqlite3.Connection,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     total = 0
     invalid = 0
     deferred = 0
+    materialized_deferred = _activation_deferred_materialized_projection(conn)
+    materialized_keys = {
+        str(item["thread_subscription_key"])
+        for item in materialized_deferred["entries"]
+    }
     rows = conn.execute(
         """
         SELECT subscription.*, job.project_key, job.work_item_type_key,
@@ -786,6 +949,8 @@ def _quarantined_subscription_projection(
     ).fetchall()
     for row in rows:
         total += 1
+        if str(row["subscription_key"] or "") in materialized_keys:
+            continue
         if (
             int(row["required"]) == 1
             and str(row["effect_kind"]) == "feishu_issue_comment"
@@ -825,7 +990,11 @@ def _quarantined_subscription_projection(
         "total": total,
         "invalid_manual_thread": invalid,
         "activation_deferred_issue_comment": deferred,
-        "unrecognized": total - invalid - deferred,
+        "activation_deferred_materialized_delivery": materialized_deferred["count"],
+        "unrecognized": total
+        - invalid
+        - deferred
+        - materialized_deferred["count"],
     }
 
 
@@ -1424,7 +1593,11 @@ def _validate_core(
         else (
             _DEFERRED_CORE_FIELDS
             if schema_version == DEFERRED_CORE_SCHEMA_VERSION
-            else None
+            else (
+                _MATERIALIZED_DEFERRED_CORE_FIELDS
+                if schema_version == MATERIALIZED_DEFERRED_CORE_SCHEMA_VERSION
+                else None
+            )
         )
     )
     if expected_fields is None or set(value) != expected_fields:
@@ -1514,7 +1687,7 @@ def _validate_core(
     deferred_count = projection["activation_deferred_issue_comment"]
     deferred_adjudication = value.get(_DEFERRED_ADJUDICATION_FIELD)
     if schema_version == CORE_SCHEMA_VERSION:
-        if deferred_count != 0:
+        if deferred_count != 0 or projection["activation_deferred_materialized_delivery"] != 0:
             raise DeliveryQuarantineBaselineError(
                 "delivery_quarantine_baseline_deferred_issue_adjudication_invalid"
             )
@@ -1546,6 +1719,46 @@ def _validate_core(
         _audit_text(
             deferred_adjudication.get("analyzed_by"),
             deferred_adjudication.get("reason"),
+        )
+        if projection["activation_deferred_materialized_delivery"] != 0:
+            raise DeliveryQuarantineBaselineError(
+                "delivery_quarantine_baseline_materialized_deferred_adjudication_invalid"
+            )
+    elif schema_version == MATERIALIZED_DEFERRED_CORE_SCHEMA_VERSION:
+        _audit_text(
+            deferred_adjudication.get("analyzed_by"),
+            deferred_adjudication.get("reason"),
+        )
+        materialized = value.get(_MATERIALIZED_DEFERRED_ADJUDICATION_FIELD)
+        materialized_projection = _activation_deferred_materialized_projection(conn)
+        if (
+            projection["activation_deferred_materialized_delivery"] <= 0
+            or not isinstance(materialized, Mapping)
+            or set(materialized) != _MATERIALIZED_DEFERRED_ADJUDICATION_FIELDS
+            or materialized.get("effect_kind") != "feishu_issue_comment"
+            or materialized.get("reason_code") != "activation_epoch_deferred"
+            or materialized.get("technical_finding")
+            != "terminal_delivery_materialized_before_writer_stop"
+            or materialized.get("proposed_disposition")
+            != "retain_prewrite_no_rearm"
+            or materialized.get("required") is not True
+            or materialized.get("source_kind") != "feishu_group_manual"
+            or materialized.get("source_mode") != "run_or_join"
+            or isinstance(materialized.get("count"), bool)
+            or materialized.get("count")
+            != projection["activation_deferred_materialized_delivery"]
+            or materialized.get("entries") != materialized_projection["entries"]
+            or materialized.get("entries_sha256")
+            != materialized_projection["entries_sha256"]
+            or str(materialized.get("analyzed_at") or "") != _iso(snapshot_at)
+        ):
+            raise DeliveryQuarantineBaselineError(
+                "delivery_quarantine_baseline_materialized_deferred_adjudication_invalid"
+            )
+        _audit_text(materialized.get("analyzed_by"), materialized.get("reason"))
+    elif projection["activation_deferred_materialized_delivery"] != 0:
+        raise DeliveryQuarantineBaselineError(
+            "delivery_quarantine_baseline_materialized_deferred_adjudication_invalid"
         )
     if value.get("issuance_policy") != _ISSUANCE_POLICY:
         raise DeliveryQuarantineBaselineError(
@@ -2090,11 +2303,17 @@ def _build_quarantine_core(
         if project_empty_activation_binding:
             control_db = _project_preactivation_db_identity(control_db)
         deferred_count = projection["activation_deferred_issue_comment"]
+        materialized_deferred = _activation_deferred_materialized_projection(conn)
+        materialized_count = materialized_deferred["count"]
         body = {
             "schema_version": (
-                DEFERRED_CORE_SCHEMA_VERSION
-                if deferred_count
-                else CORE_SCHEMA_VERSION
+                MATERIALIZED_DEFERRED_CORE_SCHEMA_VERSION
+                if materialized_count
+                else (
+                    DEFERRED_CORE_SCHEMA_VERSION
+                    if deferred_count
+                    else CORE_SCHEMA_VERSION
+                )
             ),
             "release_id": normalized_release_id,
             "snapshot_at": observed_at,
@@ -2132,6 +2351,24 @@ def _build_quarantine_core(
                 "delivery_job_present": False,
                 "delivery_effect_present": False,
                 "count": deferred_count,
+                "analyzed_by": analyst,
+                "analyzed_at": observed_at,
+                "reason": justification,
+            }
+        if materialized_count:
+            body[_MATERIALIZED_DEFERRED_ADJUDICATION_FIELD] = {
+                "effect_kind": "feishu_issue_comment",
+                "reason_code": "activation_epoch_deferred",
+                "technical_finding": (
+                    "terminal_delivery_materialized_before_writer_stop"
+                ),
+                "proposed_disposition": "retain_prewrite_no_rearm",
+                "required": True,
+                "source_kind": "feishu_group_manual",
+                "source_mode": "run_or_join",
+                "count": materialized_count,
+                "entries": materialized_deferred["entries"],
+                "entries_sha256": materialized_deferred["entries_sha256"],
                 "analyzed_by": analyst,
                 "analyzed_at": observed_at,
                 "reason": justification,

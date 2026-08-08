@@ -3571,6 +3571,28 @@ def test_current_epoch_holds_preauthorized_even_when_caller_uses_legacy_flag(
     assert store.backfill_completed_submissions(now=NOW) == 0
 
 
+def test_activation_deferred_outbox_is_never_backfilled_into_delivery(tmp_path):
+    _control(tmp_path, completed=False)
+    store = RcaDeliveryStore(tmp_path / "control.sqlite3")
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            """
+            UPDATE rca_outbox
+               SET status = 'quarantined', quarantined_at = ?,
+                   last_error_code = 'activation_epoch_deferred',
+                   last_error_detail = 'exact operator-reviewed activation deferral',
+                   updated_at = ?
+            """,
+            (NOW.isoformat(), NOW.isoformat()),
+        )
+        conn.commit()
+
+    assert store.backfill_completed_submissions(now=NOW) == 0
+    assert store.list_rows("rca_execution_watch") == []
+    assert store.list_rows("rca_delivery_jobs") == []
+    assert store.list_rows("rca_delivery_effects") == []
+
+
 def test_legacy_flag_bypasses_only_when_no_current_epoch_exists(tmp_path):
     _control(tmp_path)
     store = RcaDeliveryStore(tmp_path / "control.sqlite3")

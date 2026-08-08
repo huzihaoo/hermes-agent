@@ -5138,6 +5138,13 @@ class RcaDeliveryStore:
                         (o.status = 'completed' AND o.result_json IS NOT NULL)
                         OR o.status = 'quarantined'
                    )
+                   -- Activation deferrals are terminal control-plane
+                   -- dispositions.  They must never be re-materialized into a
+                   -- delivery job after the writer has been fenced.
+                   AND NOT (
+                       o.status = 'quarantined'
+                       AND o.last_error_code = 'activation_epoch_deferred'
+                   )
                    AND w.submission_key IS NULL
                    {activation_filter}
                  ORDER BY COALESCE(o.completed_at, o.quarantined_at, o.updated_at),

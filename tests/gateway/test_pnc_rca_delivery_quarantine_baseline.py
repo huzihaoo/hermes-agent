@@ -16,7 +16,9 @@ from gateway.pnc_rca_delivery_quarantine_baseline import (
     CORE_SCHEMA_VERSION,
     DEFERRED_CORE_SCHEMA_VERSION,
     DeliveryQuarantineBaselineError,
+    _activation_deferred_materialized_projection,
     _db_identity_matches_baseline,
+    _quarantined_subscription_projection,
     build_quarantine_core,
     build_quarantine_core_from_offline_clone,
     build_successor_preactivation_quarantine_core,
@@ -419,6 +421,104 @@ def _seed_manual_dual_effect_quarantine(
             (quarantined_at, quarantined_at),
         )
     return store, effect_keys
+
+
+def _seed_materialized_activation_deferral_race(root: Path) -> RcaDeliveryStore:
+    store, _effect_keys = _seed_manual_dual_effect_quarantine(root)
+    now = (NOW + timedelta(seconds=2)).isoformat()
+    with sqlite3.connect(store.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT outbox_id, business_key, submission_key FROM rca_outbox"
+        ).fetchone()
+        assert row is not None
+        job = conn.execute(
+            "SELECT delivery_id FROM rca_delivery_jobs LIMIT 1"
+        ).fetchone()
+        assert job is not None
+        conn.execute(
+            """
+            UPDATE rca_outbox
+               SET status='quarantined', quarantined_at=?,
+                   last_error_code='activation_epoch_deferred',
+                   last_error_detail='exact operator-reviewed activation deferral',
+                   updated_at=?
+             WHERE outbox_id=?
+            """,
+            (now, now, row["outbox_id"]),
+        )
+        conn.execute(
+            "UPDATE business_triggers SET state='quarantined' "
+            "WHERE business_key=? AND generation=1",
+            (row["business_key"],),
+        )
+        conn.execute(
+            """
+            UPDATE rca_execution_watch
+               SET state='delivery_created', delivery_id=?,
+                   last_error_code='activation_epoch_deferred', updated_at=?
+             WHERE submission_key=?
+            """,
+            (job["delivery_id"], now, row["submission_key"]),
+        )
+        conn.execute(
+            """
+            UPDATE rca_delivery_jobs
+               SET status='ready', outcome='quarantined',
+                   terminal_state='submission_quarantined',
+                   terminal_error_code='outbox_submission_quarantined',
+                   updated_at=?
+            """,
+            (now,),
+        )
+        conn.execute(
+            """
+            UPDATE rca_delivery_subscriptions
+               SET status='quarantined', reason='activation_epoch_deferred',
+                   delivery_id=NULL, effect_key=NULL, updated_at=?
+            """,
+            (now,),
+        )
+        conn.execute(
+            """
+            DELETE FROM rca_delivery_effects
+             WHERE effect_kind='feishu_thread_reply'
+            """
+        )
+        conn.execute(
+            """
+            UPDATE rca_delivery_effects
+               SET status='pending', outcome='quarantined', write_phase='prewrite',
+                   attempt=0, fence=0, remote_receipt_json=NULL,
+                   lease_token=NULL, lease_owner=NULL, lease_expires_at=NULL,
+                   next_attempt_at=NULL, write_started_at=NULL, updated_at=?
+            """,
+            (now,),
+        )
+        conn.commit()
+    return store
+
+
+def test_materialized_activation_deferral_race_is_exactly_classified(tmp_path):
+    store = _seed_materialized_activation_deferral_race(tmp_path)
+    with sqlite3.connect(store.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        projection = _quarantined_subscription_projection(conn)
+        materialized = _activation_deferred_materialized_projection(conn)
+
+    assert projection == {
+        "total": 2,
+        "invalid_manual_thread": 0,
+        "activation_deferred_issue_comment": 1,
+        "activation_deferred_materialized_delivery": 1,
+        "unrecognized": 0,
+    }
+    assert materialized["count"] == 1
+    assert materialized["entries"][0]["effect_status"] == "pending"
+    assert materialized["entries"][0]["write_phase"] == "prewrite"
+    assert materialized["entries"][0]["attempt"] == 0
+    assert materialized["entries"][0]["fence"] == 0
+    assert materialized["entries_sha256"]
 
 
 def _settlement_receipt(effect_key: str, root: Path) -> Path:
