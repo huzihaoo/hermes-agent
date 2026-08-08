@@ -250,14 +250,22 @@ def _migration_result(path: Path) -> tuple[bytes, dict, dict]:
         "conditions": {},
     }
     body = {
-        "source_schema_version": "pnc_rca_delivery_store_v7",
-        "target_schema_version": DELIVERY_STORE_SCHEMA_VERSION,
+        "source_control_schema_version": "pnc_rca_control_store_v13",
+        "source_delivery_schema_version": "pnc_rca_delivery_store_v11",
+        "target_control_schema_version": "pnc_rca_control_store_v14",
+        "target_delivery_schema_version": DELIVERY_STORE_SCHEMA_VERSION,
         "source_logical_projection": {"schema_sha256": "6" * 64},
         "cross_projection_preservation": {
             "source_owned_schema": {"conditional_schema_shape": conditional}
         },
     }
-    return raw, body, {"migration_runtime_sha256": "9" * 64}
+    return raw, body, {
+        "source_control_schema_version": "pnc_rca_control_store_v13",
+        "source_delivery_schema_version": "pnc_rca_delivery_store_v11",
+        "target_control_schema_version": "pnc_rca_control_store_v14",
+        "target_delivery_schema_version": DELIVERY_STORE_SCHEMA_VERSION,
+        "migration_runtime_sha256": "9" * 64,
+    }
 
 
 def _vm_observation(authority: dict[str, Any], now: datetime) -> dict[str, Any]:

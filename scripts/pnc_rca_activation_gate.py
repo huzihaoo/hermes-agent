@@ -1496,6 +1496,21 @@ def produce_release_gate(
             "preauthorization_capsule": preauthorization_capsule,
             "canary_slot_plan": canary_plan,
         })
+    if "source_control_schema_version" in migration_binding:
+        migration_schema_versions = {
+            key: migration_binding[key]
+            for key in (
+                "source_control_schema_version",
+                "source_delivery_schema_version",
+                "target_control_schema_version",
+                "target_delivery_schema_version",
+            )
+        }
+    else:
+        migration_schema_versions = {
+            "source_schema_version": migration_binding["source_schema_version"],
+            "target_schema_version": migration_binding["target_schema_version"],
+        }
     checks = [
         _check("contract_drift", contract),
         _check("release_authority", {
@@ -1509,8 +1524,7 @@ def produce_release_gate(
             "receipt_raw_sha256": hashlib.sha256(schema_raw).hexdigest(),
         }),
         _check("combined_migration", {
-            "source_schema_version": migration_receipt["source_schema_version"],
-            "target_schema_version": migration_receipt["target_schema_version"],
+            **migration_schema_versions,
             "migration_runtime_sha256": migration_binding[
                 "migration_runtime_sha256"
             ],
