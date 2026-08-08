@@ -9191,6 +9191,25 @@ class RcaControlStore:
         subscription_kinds = {
             str(row["effect_kind"] or "") for row in subscriptions
         }
+        trigger_source = conn.execute(
+            """
+            SELECT source.platform, source.chat_id, source.thread_id
+              FROM business_triggers AS trigger
+              JOIN rca_trigger_sources AS source
+                ON source.source_id = trigger.origin_source_id
+             WHERE trigger.business_key = ?
+               AND trigger.submission_key = ?
+               AND trigger.generation = ?
+             LIMIT 1
+            """,
+            (business_key, submission_key, generation),
+        ).fetchone()
+        issue_only_operator = bool(
+            trigger_source is not None
+            and str(trigger_source["platform"] or "") == "operator"
+            and not str(trigger_source["chat_id"] or "")
+            and not str(trigger_source["thread_id"] or "")
+        )
         if taxonomy_gap_terminal:
             valid_subscription_shape = (
                 len(subscriptions) in {1, 2}
@@ -9199,6 +9218,11 @@ class RcaControlStore:
                 and subscription_kinds.issubset(
                     {"feishu_issue_comment", "feishu_thread_reply"}
                 )
+            )
+        elif issue_only_operator:
+            valid_subscription_shape = (
+                len(subscriptions) == 1
+                and subscription_kinds == {"feishu_issue_comment"}
             )
         else:
             valid_subscription_shape = (

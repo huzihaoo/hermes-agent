@@ -305,6 +305,46 @@ def _rewrite_silent_terminal_error_code(
         conn.close()
 
 
+def _convert_silent_terminal_to_issue_only_operator(
+    store: RcaControlStore,
+) -> None:
+    [trigger] = store.list_rows("business_triggers")
+    conn = store._connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "UPDATE rca_trigger_sources SET platform='operator', chat_id='', "
+            "thread_id='', requester_id='automation:rca-batch-rerun' "
+            "WHERE source_id=?",
+            (trigger["origin_source_id"],),
+        )
+        conn.execute(
+            "DELETE FROM rca_delivery_subscription_events "
+            "WHERE subscription_key IN ("
+            "SELECT subscription_key FROM rca_delivery_subscriptions "
+            "WHERE business_key=? AND generation=? "
+            "AND effect_kind='feishu_thread_reply')",
+            (trigger["business_key"], trigger["generation"]),
+        )
+        conn.execute(
+            "DELETE FROM rca_trigger_delivery_bindings "
+            "WHERE subscription_key IN ("
+            "SELECT subscription_key FROM rca_delivery_subscriptions "
+            "WHERE business_key=? AND generation=? "
+            "AND effect_kind='feishu_thread_reply')",
+            (trigger["business_key"], trigger["generation"]),
+        )
+        conn.execute(
+            "DELETE FROM rca_delivery_subscriptions "
+            "WHERE business_key=? AND generation=? "
+            "AND effect_kind='feishu_thread_reply'",
+            (trigger["business_key"], trigger["generation"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _silent_batch_request(batch_id: str = "batch-684") -> ManualRcaTriggerRequest:
     request = _operator_request(
         f"{batch_id}-7041712812-try-1",
@@ -392,6 +432,23 @@ def test_operator_silent_terminal_rerun_creates_new_generation_without_old_mutat
     assert json.loads(audit["detail"]) == authority
     assert audit["from_status"] == "terminal_failed:g1"
     assert audit["to_status"] == "pending:g2"
+
+
+def test_issue_only_operator_silent_terminal_drains_activation(tmp_path):
+    store, _terminal_at = _silent_deadline_terminal_store(tmp_path)
+    _convert_silent_terminal_to_issue_only_operator(store)
+    conn = store._connect()
+    try:
+        [epoch] = conn.execute(
+            "SELECT epoch_id FROM rca_activation_epochs WHERE is_current=1"
+        ).fetchall()
+        inflight = store._direct_steady_current_inflight_tx(
+            conn, epoch_id=str(epoch["epoch_id"])
+        )
+    finally:
+        conn.close()
+
+    assert inflight["execution_delivery"] == 0
 
 
 def test_operator_silent_terminal_rerun_rejects_tampered_authority_without_mutation(
