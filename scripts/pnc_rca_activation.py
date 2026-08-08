@@ -47,6 +47,7 @@ _EVENT_UID_RE = re.compile(
     r"^(?P<topic>[A-Za-z0-9][A-Za-z0-9._-]{0,248}):"
     r"(?P<partition>[0-9]+):(?P<offset>[0-9]+)$"
 )
+_MANUAL_MESSAGE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,499}$")
 _ISSUE_URL_RE = re.compile(
     r"^https://project\.feishu\.cn/"
     r"[A-Za-z0-9._-]+/issue/detail/[0-9]+/*$"
@@ -1985,7 +1986,12 @@ def _reconcile_shadow(
 def _defer_event(store: RcaControlStore, args: argparse.Namespace) -> dict[str, Any]:
     epoch_id = _normalized_epoch_id(args.epoch_id)
     operator, reason = _normalized_audit(args.operator, args.reason)
-    event_uid, _ = _normalize_event_uid(args.event_uid)
+    if args.message_id:
+        event_uid = str(args.message_id).strip()
+        if _MANUAL_MESSAGE_ID_RE.fullmatch(event_uid) is None:
+            raise ActivationCliError("activation_deferred_message_id_invalid")
+    else:
+        event_uid, _ = _normalize_event_uid(args.event_uid)
     current = _current_epoch(
         store,
         epoch_id,
@@ -2109,7 +2115,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     defer = commands.add_parser("defer-event")
     _add_mutation_arguments(defer)
-    defer.add_argument("--event-uid", required=True)
+    identity = defer.add_mutually_exclusive_group(required=True)
+    identity.add_argument("--event-uid")
+    identity.add_argument(
+        "--message-id",
+        help="exact Feishu manual message_id already bound to this epoch",
+    )
 
     prepare_bootstrap = commands.add_parser("prepare-bootstrap-production")
     _add_mutation_arguments(prepare_bootstrap)

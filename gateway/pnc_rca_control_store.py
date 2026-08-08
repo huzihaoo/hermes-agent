@@ -18308,7 +18308,13 @@ class RcaControlStore:
         reason: str,
         now: datetime | None = None,
     ) -> ActivationDeferralResult:
-        """Quarantine one exact unexecuted Kafka item with an immutable audit trail."""
+        """Quarantine one exact unexecuted activation item with an immutable audit trail.
+
+        The identity may be a Kafka ``event_uid`` or a Feishu manual
+        ``message_id``. Both paths resolve one already-bound row and share the
+        same transaction and audit disposition; no broad source lookup is
+        permitted.
+        """
         event_id = str(event_uid or "").strip()
         if not event_id or "\n" in event_id or "\r" in event_id or len(event_id) > 500:
             raise ActivationEpochError("activation_deferred_event_uid_invalid")
@@ -18325,32 +18331,76 @@ class RcaControlStore:
                 raise ActivationEpochError("activation_deferral_closed")
             row = conn.execute(
                 """
-                SELECT i.decision AS inbox_decision,
-                       o.outbox_id, o.business_key, o.submission_key, o.generation,
-                       o.status AS outbox_status, o.last_error_code,
-                       o.activation_epoch_id, o.activation_ledger_id,
-                       t.state AS trigger_state,
-                       al.decision AS ledger_decision, al.bound_at
-                  FROM kafka_inbox AS i
-                  JOIN rca_outbox AS o ON o.source_event_id = i.event_uid
-                  JOIN business_triggers AS t
-                    ON t.business_key = o.business_key
-                   AND t.submission_key = o.submission_key
-                   AND t.generation = o.generation
-                  JOIN rca_activation_admission_ledger AS al
-                    ON al.epoch_id = o.activation_epoch_id
-                   AND al.ledger_id = o.activation_ledger_id
-                   AND al.business_key = o.business_key
-                   AND al.submission_key = o.submission_key
-                   AND al.generation = o.generation
-                 WHERE i.event_uid = ?
+                SELECT *
+                  FROM (
+                    SELECT 'kafka' AS bound_source_kind,
+                           i.decision AS inbox_decision,
+                           NULL AS source_kind, NULL AS source_outcome,
+                           o.outbox_id, o.business_key, o.submission_key,
+                           o.generation, o.status AS outbox_status,
+                           o.last_error_code, o.activation_epoch_id,
+                           o.activation_ledger_id, t.state AS trigger_state,
+                           al.decision AS ledger_decision, al.bound_at
+                      FROM kafka_inbox AS i
+                      JOIN rca_outbox AS o ON o.source_event_id = i.event_uid
+                      JOIN business_triggers AS t
+                        ON t.business_key = o.business_key
+                       AND t.submission_key = o.submission_key
+                       AND t.generation = o.generation
+                      JOIN rca_activation_admission_ledger AS al
+                        ON al.epoch_id = o.activation_epoch_id
+                       AND al.ledger_id = o.activation_ledger_id
+                       AND al.business_key = o.business_key
+                       AND al.submission_key = o.submission_key
+                       AND al.generation = o.generation
+                     WHERE i.event_uid = ?
+                    UNION ALL
+                    SELECT 'manual' AS bound_source_kind,
+                           NULL AS inbox_decision,
+                           s.source_kind, s.outcome AS source_outcome,
+                           o.outbox_id, o.business_key, o.submission_key,
+                           o.generation, o.status AS outbox_status,
+                           o.last_error_code, o.activation_epoch_id,
+                           o.activation_ledger_id, t.state AS trigger_state,
+                           al.decision AS ledger_decision, al.bound_at
+                      FROM rca_trigger_sources AS s
+                      JOIN rca_trigger_bindings AS b
+                        ON b.source_id = s.source_id AND b.role = 'origin'
+                      JOIN business_triggers AS t
+                        ON t.business_key = b.business_key
+                       AND t.generation = b.generation
+                      JOIN rca_outbox AS o
+                        ON o.business_key = b.business_key
+                       AND o.generation = b.generation
+                       AND o.submission_key = t.submission_key
+                      JOIN rca_activation_admission_ledger AS al
+                        ON al.epoch_id = o.activation_epoch_id
+                       AND al.ledger_id = o.activation_ledger_id
+                       AND al.business_key = o.business_key
+                       AND al.submission_key = o.submission_key
+                       AND al.generation = o.generation
+                     WHERE s.source_kind = 'feishu_group_manual'
+                       AND s.source_dedupe_key = 'feishu:' || s.message_id
+                       AND s.message_id = ?
+                  )
+                 LIMIT 1
                 """,
-                (event_id,),
+                (event_id, event_id),
             ).fetchone()
             if row is None:
                 raise ActivationEpochError("activation_deferred_event_not_bound")
+            bound_source_kind = str(row["bound_source_kind"] or "")
+            if bound_source_kind == "kafka":
+                source_binding_valid = str(row["inbox_decision"]) == "accepted"
+            elif bound_source_kind == "manual":
+                source_binding_valid = (
+                    str(row["source_kind"] or "") == "feishu_group_manual"
+                    and str(row["source_outcome"] or "") in {"created", "joined"}
+                )
+            else:
+                source_binding_valid = False
             if (
-                str(row["inbox_decision"]) != "accepted"
+                not source_binding_valid
                 or str(row["activation_epoch_id"] or "") != epoch_id
                 or row["activation_ledger_id"] is None
                 or not str(row["bound_at"] or "")

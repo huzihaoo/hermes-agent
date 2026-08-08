@@ -1454,6 +1454,27 @@ def test_defer_event_is_exact_plan_apply_and_idempotent(tmp_path, capsys, monkey
     assert "secret-deferred-submission-key" not in encoded
 
 
+def test_defer_event_accepts_exact_manual_message_id(
+    tmp_path, capsys, monkeypatch
+):
+    fake = _FakeStore("aborted")
+    monkeypatch.setattr(activation_module, "_open_store", lambda _path: fake)
+    db_path = tmp_path / "control.sqlite3"
+    args = [
+        *_mutation_args(db_path, "defer-event"),
+        "--message-id",
+        "om_manual_exact",
+    ]
+
+    plan_code, plan = _invoke(capsys, args)
+    assert plan_code == 0
+    assert plan["mode"] == "plan"
+    apply_code, applied = _invoke(capsys, [*args, "--apply"])
+    assert apply_code == 0
+    assert applied["result"]["changed"] is True
+    assert fake.deferral_calls[0][0] == "om_manual_exact"
+
+
 @pytest.mark.parametrize(
     ("state", "command", "target"),
     [

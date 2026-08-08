@@ -3504,6 +3504,61 @@ def test_activation_replacement_requires_bound_pending_outbox_to_be_deferred(
     assert replacement["epoch_id"] == "rca-release-replacement-pending"
 
 
+def test_activation_replacement_can_defer_one_exact_manual_message_id(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    identities = _begin_bounded_activation(store)
+    manual = identities["manual_success"][1]
+    admitted = store.admit_manual_trigger(
+        _manual_request(
+            manual["message_id"],
+            issue_url=manual["issue_url"],
+            thread_id=manual["thread_id"],
+        ),
+        allowed_chat_ids={"oc_allowed"},
+        submit_enabled=True,
+        active_policy=_policy(),
+        activation_required=True,
+    )
+    store.transition_activation_epoch(
+        epoch_id="rca-release-20260712",
+        expected_state="bounded_active",
+        target_state="aborted",
+        operator="release-test",
+        reason="reviewed successor replacement for exact manual canary",
+    )
+
+    deferred = store.defer_activation_event(
+        manual["message_id"],
+        expected_activation_epoch_id="rca-release-20260712",
+        operator="release-test",
+        reason="exact manual canary will be re-sent in successor epoch",
+    )
+    repeated = store.defer_activation_event(
+        manual["message_id"],
+        expected_activation_epoch_id="rca-release-20260712",
+        operator="release-test",
+        reason="idempotent repeat of exact manual deferral",
+    )
+
+    assert deferred.prior_status == "pending"
+    assert deferred.status == "quarantined"
+    assert repeated.prior_status == "quarantined"
+    assert repeated.status == "quarantined"
+    assert deferred.outbox_id == repeated.outbox_id
+    outbox = {
+        row["outbox_id"]: row for row in store.list_rows("rca_outbox")
+    }[deferred.outbox_id]
+    assert outbox["status"] == "quarantined"
+    assert outbox["last_error_code"] == "activation_epoch_deferred"
+    [trigger] = [
+        row
+        for row in store.list_rows("business_triggers")
+        if row["business_key"] == admitted.business_key
+    ]
+    assert trigger["state"] == "quarantined"
+    assert RcaDeliveryStore(store.db_path).list_rows("rca_delivery_jobs") == []
+
+
 def test_activation_replacement_requires_bound_quarantine_delivery_to_settle(
     tmp_path,
 ):
