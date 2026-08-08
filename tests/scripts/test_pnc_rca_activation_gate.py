@@ -554,6 +554,44 @@ def test_preauthorization_producer_builds_capsule_consumed_by_activation(
     assert RcaControlStore(producer_case["db"]).activation_epoch()["state"] == "safe_off"
 
 
+def test_preauthorization_preserves_v3_migration_version_detail(
+    producer_case: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = producer_case["migration"].read_bytes()
+    conditional = {
+        "schema_version": "pnc_rca_combined_conditional_schema_shape_v1",
+        "source_tables_sha256": "8" * 64,
+        "conditions": {},
+    }
+    body = {
+        "source_schema_version": "pnc_rca_delivery_store_v7",
+        "target_schema_version": DELIVERY_STORE_SCHEMA_VERSION,
+        "source_logical_projection": {"schema_sha256": "6" * 64},
+        "cross_projection_preservation": {
+            "source_owned_schema": {"conditional_schema_shape": conditional}
+        },
+    }
+    binding = {
+        "source_schema_version": body["source_schema_version"],
+        "target_schema_version": body["target_schema_version"],
+        "migration_runtime_sha256": "9" * 64,
+    }
+    monkeypatch.setattr(
+        gate,
+        "_validate_migration_receipt",
+        lambda _path, **_kwargs: (raw, body, binding),
+    )
+
+    result = _produce(producer_case, mode="preauthorization", broker_end=10)
+    report = json.loads(Path(result["report_path"]).read_text(encoding="utf-8"))
+    detail = next(
+        item for item in report["checks"] if item["name"] == "combined_migration"
+    )["detail"]
+    assert detail["source_schema_version"] == "pnc_rca_delivery_store_v7"
+    assert detail["target_schema_version"] == DELIVERY_STORE_SCHEMA_VERSION
+    assert "source_control_schema_version" not in detail
+
+
 def test_canary_plan_is_bound_only_after_t0(
     producer_case: dict[str, Any],
 ) -> None:

@@ -93,6 +93,40 @@ def test_live_projection_uses_validated_dispatcher_environment(tmp_path):
     assert error.value.code == "pnc_rca_live_profile_switch_dispatcher_environment_invalid"
 
 
+def test_relay_projection_switches_send_with_outbound_mode(tmp_path):
+    home = tmp_path / "home"
+    hermes_home = home / ".hermes"
+    source = _plist_source(tmp_path, hermes_home)
+    relay_source = source / "local.pnc.completion-notice-relay.plist"
+
+    live = switch._project_plist(
+        relay_source.read_bytes(),
+        label="local.pnc.completion-notice-relay",
+        outbound="live",
+        enabled=True,
+        hermes_home=hermes_home,
+        release_id=RELEASE_ID,
+        dispatcher_environment={},
+    )
+    live_value = plistlib.loads(live)
+    assert live_value["ProgramArguments"].count("--send") == 1
+    assert "--task-id" not in live_value["ProgramArguments"]
+    assert live_value["EnvironmentVariables"]["HERMES_OUTBOUND_MODE"] == "live"
+
+    record_only = switch._project_plist(
+        live,
+        label="local.pnc.completion-notice-relay",
+        outbound="record-only",
+        enabled=False,
+        hermes_home=hermes_home,
+        release_id=RELEASE_ID,
+        dispatcher_environment={},
+    )
+    record_value = plistlib.loads(record_only)
+    assert "--send" not in record_value["ProgramArguments"]
+    assert record_value["EnvironmentVariables"]["HERMES_OUTBOUND_MODE"] == "record-only"
+
+
 def test_plist_non_json_value_fails_closed(tmp_path):
     hermes_home = tmp_path / ".hermes"
     source = plistlib.loads(

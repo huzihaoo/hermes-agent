@@ -377,6 +377,14 @@ def _project_plist(
             if index + 1 >= len(args) or args[index + 1] != STALE_RELAY_TASK_ID:
                 _fail("pnc_rca_live_profile_switch_relay_task_id_invalid")
             del args[index : index + 2]
+        send_count = args.count("--send")
+        if send_count > 1:
+            _fail("pnc_rca_live_profile_switch_relay_send_invalid")
+        if outbound == "live" and enabled:
+            if send_count == 0:
+                args.append("--send")
+        elif send_count == 1:
+            args.remove("--send")
         environment["HERMES_OUTBOUND_MODE"] = outbound
     elif label == "local.pnc.rca-delivery-dispatcher":
         if dispatcher_environment is None:
