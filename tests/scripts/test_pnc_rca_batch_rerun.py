@@ -536,6 +536,20 @@ def _write_dry_run_db(tmp_path, *, activation_state="steady_active"):
     return db_path
 
 
+def _file_state(path):
+    if not path.exists():
+        return {"present": False}
+    observed = path.stat()
+    return {
+        "present": True,
+        "device": observed.st_dev,
+        "inode": observed.st_ino,
+        "size": observed.st_size,
+        "mtime_ns": observed.st_mtime_ns,
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+
+
 def test_dry_run_without_owner_receipt_is_read_only_and_not_authorized(
     tmp_path, monkeypatch
 ):
@@ -550,6 +564,7 @@ def test_dry_run_without_owner_receipt_is_read_only_and_not_authorized(
     db_path = _write_dry_run_db(tmp_path)
     state_path = tmp_path / "state.json"
     before = db_path.read_bytes()
+    before_files = sorted(path.name for path in tmp_path.iterdir())
     args = _run_args(tmp_path, queue_path, tmp_path / "unused-owner.json")
     args.control_db = str(db_path)
     args.owner_receipt = None
@@ -576,6 +591,17 @@ def test_dry_run_without_owner_receipt_is_read_only_and_not_authorized(
     }
     assert result["database"]["activation"]["ready"] is True
     assert result["database"]["preconditions"]["matched"] == 1
+    assert result["database"]["source_snapshot"]["transport"] == (
+        "ephemeral_stable_copy"
+    )
+    assert result["database"]["source_snapshot"]["source_unchanged"] is True
+    assert result["database"]["source_snapshot"]["copy_verified"] is True
+    assert result["database"]["source_snapshot"]["files"]["wal"] == {
+        "present": False
+    }
+    assert result["database"]["source_snapshot"]["files"]["shm"] == {
+        "present": False
+    }
     assert result["execution_policy"] == {
         "activation_required": True,
         "daily_started_attempt_quota": None,
@@ -587,6 +613,110 @@ def test_dry_run_without_owner_receipt_is_read_only_and_not_authorized(
     assert len(result["plan_sha256"]) == 64
     assert db_path.read_bytes() == before
     assert state_path.exists() is False
+    assert sorted(path.name for path in tmp_path.iterdir()) == before_files
+
+
+def test_dry_run_never_opens_or_mutates_source_wal_sidecars(tmp_path, monkeypatch):
+    queue_path = tmp_path / "queue.json"
+    queue_path.write_text(
+        json.dumps(
+            _queue_value(current_submission_key="", current_generation=0),
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    db_path = _write_dry_run_db(tmp_path)
+    writer = sqlite3.connect(db_path)
+    assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    writer.execute("INSERT INTO control_meta VALUES('wal_probe', 'ready')")
+    writer.commit()
+    source_files = [
+        db_path,
+        db_path.with_name(f"{db_path.name}-wal"),
+        db_path.with_name(f"{db_path.name}-shm"),
+    ]
+    assert all(path.exists() for path in source_files)
+    before = {path.name: _file_state(path) for path in source_files}
+    args = _run_args(tmp_path, queue_path, tmp_path / "unused-owner.json")
+    args.control_db = str(db_path)
+    args.owner_receipt = None
+    args.dry_run = True
+    monkeypatch.setattr(
+        batch_rerun, "_runtime_identity", lambda: ("a" * 40, "b" * 40)
+    )
+
+    try:
+        result = batch_rerun.run(args)
+        after = {path.name: _file_state(path) for path in source_files}
+        assert after == before
+    finally:
+        writer.close()
+
+    provenance = result["database"]["source_snapshot"]["files"]
+    assert provenance["database"]["sha256"] == before[db_path.name]["sha256"]
+    assert provenance["wal"]["sha256"] == before[f"{db_path.name}-wal"]["sha256"]
+    assert provenance["shm"]["sha256"] == before[f"{db_path.name}-shm"]["sha256"]
+
+
+def test_dry_run_fails_closed_when_source_snapshot_drifts(tmp_path, monkeypatch):
+    queue_path = tmp_path / "queue.json"
+    queue_path.write_text(
+        json.dumps(
+            _queue_value(current_submission_key="", current_generation=0),
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    args = _run_args(tmp_path, queue_path, tmp_path / "unused-owner.json")
+    args.control_db = str(_write_dry_run_db(tmp_path))
+    args.owner_receipt = None
+    args.dry_run = True
+    monkeypatch.setattr(
+        batch_rerun, "_runtime_identity", lambda: ("a" * 40, "b" * 40)
+    )
+    capture = batch_rerun._control_source_snapshot
+    calls = 0
+
+    def drifting_snapshot(path):
+        nonlocal calls
+        calls += 1
+        observed = {role: dict(value) for role, value in capture(path).items()}
+        if calls == 2:
+            observed["database"]["mtime_ns"] += 1
+        return observed
+
+    monkeypatch.setattr(batch_rerun, "_control_source_snapshot", drifting_snapshot)
+
+    with pytest.raises(BatchRerunError, match="batch_control_db_snapshot_drift"):
+        batch_rerun.run(args)
+
+
+def test_dry_run_rejects_a_provided_invalid_owner_receipt_before_db(
+    tmp_path, monkeypatch
+):
+    queue_path = tmp_path / "queue.json"
+    queue_path.write_text(
+        json.dumps(
+            _queue_value(current_submission_key="", current_generation=0),
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    owner_path = tmp_path / "owner-invalid.json"
+    _write_owner_receipt(owner_path, _owner_receipt(approved=False))
+    args = _run_args(tmp_path, queue_path, owner_path)
+    args.dry_run = True
+    monkeypatch.setattr(
+        batch_rerun, "_runtime_identity", lambda: ("a" * 40, "b" * 40)
+    )
+    monkeypatch.setattr(
+        batch_rerun,
+        "_dry_run_database_plan",
+        lambda *_args: pytest.fail("invalid receipt reached the control DB"),
+    )
+
+    with pytest.raises(BatchRerunError, match="batch_owner_receipt_not_approved"):
+        batch_rerun.run(args)
 
 
 def test_dry_run_fails_closed_when_activation_is_not_steady(tmp_path, monkeypatch):
@@ -627,6 +757,34 @@ def test_live_run_still_requires_owner_receipt(tmp_path, monkeypatch):
     )
 
     with pytest.raises(BatchRerunError, match="batch_owner_receipt_required"):
+        batch_rerun.run(args)
+
+
+def test_live_run_rejects_a_receipt_not_bound_to_the_exact_queue(
+    tmp_path, monkeypatch
+):
+    queue_path = tmp_path / "queue.json"
+    queue_path.write_text(
+        json.dumps(
+            _queue_value(current_submission_key="", current_generation=0),
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    owner_path = tmp_path / "owner-mismatched.json"
+    _write_owner_receipt(owner_path, _owner_receipt(queue_sha256="1" * 64))
+    args = _run_args(tmp_path, queue_path, owner_path)
+    args.dry_run = False
+    monkeypatch.setattr(
+        batch_rerun, "_runtime_identity", lambda: ("a" * 40, "b" * 40)
+    )
+    monkeypatch.setattr(
+        batch_rerun,
+        "_load_or_create_state",
+        lambda *_args, **_kwargs: pytest.fail("mismatched receipt reached batch state"),
+    )
+
+    with pytest.raises(BatchRerunError, match="batch_owner_receipt_binding_mismatch"):
         batch_rerun.run(args)
 
 

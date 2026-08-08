@@ -14,6 +14,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Mapping, Sequence
 from urllib.parse import quote
@@ -384,12 +385,15 @@ def _write_state(path: Path, value: Mapping[str, Any]) -> None:
 
 
 def _runtime_identity() -> tuple[str, str]:
+    read_only_git_env = dict(os.environ)
+    read_only_git_env["GIT_OPTIONAL_LOCKS"] = "0"
     try:
         identity = subprocess.check_output(
             ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD", "HEAD^{tree}"],
             text=True,
             stderr=subprocess.DEVNULL,
             timeout=5,
+            env=read_only_git_env,
         ).splitlines()
         dirty = subprocess.check_output(
             [
@@ -403,6 +407,7 @@ def _runtime_identity() -> tuple[str, str]:
             text=True,
             stderr=subprocess.DEVNULL,
             timeout=5,
+            env=read_only_git_env,
         ).strip()
     except (OSError, subprocess.SubprocessError) as exc:
         raise BatchRerunError("batch_runtime_commit_unavailable") from exc
@@ -900,104 +905,270 @@ def _queue_precondition_matches(
     )
 
 
+def _readonly_file_fingerprint(
+    path: Path, *, required: bool = False
+) -> dict[str, Any]:
+    """Hash one regular source file without following a replacement symlink."""
+    try:
+        observed = path.lstat()
+    except FileNotFoundError as exc:
+        if required:
+            raise BatchRerunError("batch_control_db_unavailable") from exc
+        return {"present": False}
+    except OSError as exc:
+        raise BatchRerunError("batch_control_db_snapshot_unavailable") from exc
+    if not stat.S_ISREG(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
+        raise BatchRerunError("batch_control_db_snapshot_identity_invalid")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise BatchRerunError("batch_control_db_snapshot_unavailable") from exc
+    digest = hashlib.sha256()
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (observed.st_dev, observed.st_ino)
+        ):
+            raise BatchRerunError("batch_control_db_snapshot_identity_invalid")
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        final = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    identity = (
+        int(observed.st_dev),
+        int(observed.st_ino),
+        int(observed.st_nlink),
+        int(observed.st_size),
+        int(observed.st_mtime_ns),
+        int(observed.st_ctime_ns),
+    )
+    if identity != (
+        int(final.st_dev),
+        int(final.st_ino),
+        int(final.st_nlink),
+        int(final.st_size),
+        int(final.st_mtime_ns),
+        int(final.st_ctime_ns),
+    ):
+        raise BatchRerunError("batch_control_db_snapshot_drift")
+    return {
+        "present": True,
+        "device": identity[0],
+        "inode": identity[1],
+        "links": identity[2],
+        "size": identity[3],
+        "mtime_ns": identity[4],
+        "ctime_ns": identity[5],
+        "sha256": digest.hexdigest(),
+    }
+
+
+def _control_source_snapshot(db_path: Path) -> dict[str, dict[str, Any]]:
+    return {
+        "database": _readonly_file_fingerprint(db_path, required=True),
+        "wal": _readonly_file_fingerprint(db_path.with_name(f"{db_path.name}-wal")),
+        "shm": _readonly_file_fingerprint(db_path.with_name(f"{db_path.name}-shm")),
+    }
+
+
+def _copy_snapshot_file(
+    source: Path, destination: Path, expected: Mapping[str, Any]
+) -> None:
+    """Copy one already fingerprinted source and bind the replica to its hash."""
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        source_fd = os.open(source, flags)
+        destination_fd = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+    except OSError as exc:
+        if "source_fd" in locals():
+            os.close(source_fd)
+        raise BatchRerunError("batch_control_db_snapshot_copy_failed") from exc
+    digest = hashlib.sha256()
+    try:
+        with os.fdopen(destination_fd, "wb", closefd=True) as stream:
+            opened = os.fstat(source_fd)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or (opened.st_dev, opened.st_ino)
+                != (int(expected["device"]), int(expected["inode"]))
+            ):
+                raise BatchRerunError("batch_control_db_snapshot_drift")
+            while True:
+                chunk = os.read(source_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                stream.write(chunk)
+            stream.flush()
+        final = os.fstat(source_fd)
+    finally:
+        os.close(source_fd)
+    if (
+        (final.st_dev, final.st_ino)
+        != (int(expected["device"]), int(expected["inode"]))
+        or int(final.st_size) != int(expected["size"])
+        or int(final.st_mtime_ns) != int(expected["mtime_ns"])
+        or int(final.st_ctime_ns) != int(expected["ctime_ns"])
+        or digest.hexdigest() != expected["sha256"]
+    ):
+        raise BatchRerunError("batch_control_db_snapshot_drift")
+    replica = _readonly_file_fingerprint(destination, required=True)
+    if (
+        int(replica["size"]) != int(expected["size"])
+        or replica["sha256"] != expected["sha256"]
+    ):
+        raise BatchRerunError("batch_control_db_snapshot_copy_invalid")
+
+
+def _source_snapshot_receipt(
+    source: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    files: dict[str, dict[str, Any]] = {}
+    for role in ("database", "wal", "shm"):
+        fingerprint = source[role]
+        if not fingerprint.get("present"):
+            files[role] = {"present": False}
+            continue
+        files[role] = {
+            "present": True,
+            "device": int(fingerprint["device"]),
+            "inode": int(fingerprint["inode"]),
+            "size": int(fingerprint["size"]),
+            "mtime_ns": int(fingerprint["mtime_ns"]),
+            "sha256": str(fingerprint["sha256"]),
+        }
+    return {
+        "transport": "ephemeral_stable_copy",
+        "source_unchanged": True,
+        "copy_verified": True,
+        "files": files,
+    }
+
+
 def _dry_run_database_plan(
     db_path: Path, queue: Sequence[Mapping[str, Any]]
 ) -> dict[str, Any]:
-    """Validate one coherent control-DB snapshot without opening a writer."""
+    """Validate a stable copy without opening SQLite against the source DB."""
     selected = db_path.expanduser().absolute()
-    try:
-        observed = selected.lstat()
-    except OSError as exc:
-        raise BatchRerunError("batch_control_db_unavailable") from exc
-    if not stat.S_ISREG(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
-        raise BatchRerunError("batch_control_db_identity_invalid")
-    uri = f"file:{quote(str(selected), safe='/')}?mode=ro"
-    try:
-        conn = sqlite3.connect(uri, uri=True, timeout=10)
-        conn.row_factory = sqlite3.Row
-        try:
-            conn.execute("PRAGMA query_only = ON")
-            conn.execute("BEGIN")
-            schema = conn.execute(
-                "SELECT value FROM control_meta WHERE key = 'schema_version'"
-            ).fetchone()
-            if schema is None or str(schema["value"]) != CONTROL_STORE_SCHEMA_VERSION:
-                raise BatchRerunError("batch_control_schema_not_current")
-            quick_check = [
-                str(row[0]) for row in conn.execute("PRAGMA quick_check").fetchall()
-            ]
-            if quick_check != ["ok"]:
-                raise BatchRerunError("batch_control_integrity_invalid")
-            foreign_key_violations = len(
-                conn.execute("PRAGMA foreign_key_check").fetchall()
-            )
-            if foreign_key_violations:
-                raise BatchRerunError("batch_control_foreign_key_invalid")
-            epochs = conn.execute(
-                "SELECT epoch_id, state, is_current "
-                "FROM rca_activation_epochs WHERE is_current = 1"
-            ).fetchall()
-            if len(epochs) != 1 or str(epochs[0]["state"]) != "steady_active":
-                raise BatchRerunError("batch_activation_not_ready")
+    with tempfile.TemporaryDirectory(prefix="pnc-rca-batch-dry-run-") as raw_tmp:
+        snapshot_root = Path(raw_tmp)
+        snapshot_db = snapshot_root / "control.sqlite3"
+        destinations = {
+            "database": snapshot_db,
+            "wal": snapshot_db.with_name(f"{snapshot_db.name}-wal"),
+            # Preserve source SHM provenance without letting SQLite use its
+            # copied lock/read-mark state when rebuilding the local WAL index.
+            "shm": snapshot_root / "source-control.sqlite3-shm",
+        }
+        before = _control_source_snapshot(selected)
+        sources = {
+            "database": selected,
+            "wal": selected.with_name(f"{selected.name}-wal"),
+            "shm": selected.with_name(f"{selected.name}-shm"),
+        }
+        for role in ("database", "wal", "shm"):
+            if before[role].get("present"):
+                _copy_snapshot_file(sources[role], destinations[role], before[role])
+        after = _control_source_snapshot(selected)
+        if after != before:
+            raise BatchRerunError("batch_control_db_snapshot_drift")
 
-            preconditions: list[dict[str, Any]] = []
-            for item in queue:
-                issue_id = str(item["issue_id"])
-                trigger = conn.execute(
-                    "SELECT generation, submission_key FROM business_triggers "
-                    "WHERE work_item_id = ? ORDER BY generation DESC LIMIT 1",
-                    (issue_id,),
+        uri = f"file:{quote(str(snapshot_db), safe='/')}?mode=ro"
+        try:
+            conn = sqlite3.connect(uri, uri=True, timeout=10)
+            conn.row_factory = sqlite3.Row
+            try:
+                conn.execute("PRAGMA query_only = ON")
+                conn.execute("BEGIN")
+                schema = conn.execute(
+                    "SELECT value FROM control_meta WHERE key = 'schema_version'"
                 ).fetchone()
-                snapshot = (
-                    None
-                    if trigger is None
-                    else {
-                        "generation": int(trigger["generation"]),
-                        "submission_key": str(trigger["submission_key"]),
-                    }
+                if schema is None or str(schema["value"]) != CONTROL_STORE_SCHEMA_VERSION:
+                    raise BatchRerunError("batch_control_schema_not_current")
+                quick_check = [
+                    str(row[0]) for row in conn.execute("PRAGMA quick_check").fetchall()
+                ]
+                if quick_check != ["ok"]:
+                    raise BatchRerunError("batch_control_integrity_invalid")
+                foreign_key_violations = len(
+                    conn.execute("PRAGMA foreign_key_check").fetchall()
                 )
-                if not _queue_precondition_matches(item, snapshot):
-                    raise BatchRerunError("batch_issue_generation_drift")
-                outbox_status = ""
-                if trigger is not None:
-                    outboxes = conn.execute(
-                        "SELECT status FROM rca_outbox "
-                        "WHERE submission_key = ? AND generation = ?",
-                        (trigger["submission_key"], trigger["generation"]),
-                    ).fetchall()
-                    if len(outboxes) != 1:
-                        raise BatchRerunError("batch_issue_outbox_binding_invalid")
-                    outbox_status = str(outboxes[0]["status"])
-                preconditions.append(
-                    {
-                        "issue_id": issue_id,
-                        "expected_generation": int(item["queue_generation"]),
-                        "expected_submission_key": str(
-                            item["queue_submission_key"]
-                        ),
-                        "observed_generation": (
-                            int(trigger["generation"]) if trigger is not None else 0
-                        ),
-                        "observed_submission_key": (
-                            str(trigger["submission_key"]) if trigger is not None else ""
-                        ),
-                        "observed_outbox_status": outbox_status,
-                        "matched": True,
-                    }
-                )
-            conn.rollback()
-        finally:
-            conn.close()
-    except BatchRerunError:
-        raise
-    except sqlite3.Error as exc:
-        raise BatchRerunError("batch_control_db_invalid") from exc
-    try:
-        final = selected.lstat()
-    except OSError as exc:
-        raise BatchRerunError("batch_control_db_identity_changed") from exc
-    if (final.st_dev, final.st_ino) != (observed.st_dev, observed.st_ino):
-        raise BatchRerunError("batch_control_db_identity_changed")
+                if foreign_key_violations:
+                    raise BatchRerunError("batch_control_foreign_key_invalid")
+                epochs = conn.execute(
+                    "SELECT epoch_id, state, is_current "
+                    "FROM rca_activation_epochs WHERE is_current = 1"
+                ).fetchall()
+                if len(epochs) != 1 or str(epochs[0]["state"]) != "steady_active":
+                    raise BatchRerunError("batch_activation_not_ready")
+
+                preconditions: list[dict[str, Any]] = []
+                for item in queue:
+                    issue_id = str(item["issue_id"])
+                    trigger = conn.execute(
+                        "SELECT generation, submission_key FROM business_triggers "
+                        "WHERE work_item_id = ? ORDER BY generation DESC LIMIT 1",
+                        (issue_id,),
+                    ).fetchone()
+                    snapshot = (
+                        None
+                        if trigger is None
+                        else {
+                            "generation": int(trigger["generation"]),
+                            "submission_key": str(trigger["submission_key"]),
+                        }
+                    )
+                    if not _queue_precondition_matches(item, snapshot):
+                        raise BatchRerunError("batch_issue_generation_drift")
+                    outbox_status = ""
+                    if trigger is not None:
+                        outboxes = conn.execute(
+                            "SELECT status FROM rca_outbox "
+                            "WHERE submission_key = ? AND generation = ?",
+                            (trigger["submission_key"], trigger["generation"]),
+                        ).fetchall()
+                        if len(outboxes) != 1:
+                            raise BatchRerunError("batch_issue_outbox_binding_invalid")
+                        outbox_status = str(outboxes[0]["status"])
+                    preconditions.append(
+                        {
+                            "issue_id": issue_id,
+                            "expected_generation": int(item["queue_generation"]),
+                            "expected_submission_key": str(
+                                item["queue_submission_key"]
+                            ),
+                            "observed_generation": (
+                                int(trigger["generation"])
+                                if trigger is not None
+                                else 0
+                            ),
+                            "observed_submission_key": (
+                                str(trigger["submission_key"])
+                                if trigger is not None
+                                else ""
+                            ),
+                            "observed_outbox_status": outbox_status,
+                            "matched": True,
+                        }
+                    )
+                conn.rollback()
+            finally:
+                conn.close()
+        except BatchRerunError:
+            raise
+        except sqlite3.Error as exc:
+            raise BatchRerunError("batch_control_db_invalid") from exc
+
     preconditions_sha256 = _sha256_bytes(
         _canonical_json(preconditions).encode("utf-8")
     )
@@ -1006,6 +1177,7 @@ def _dry_run_database_plan(
         "schema_version": CONTROL_STORE_SCHEMA_VERSION,
         "quick_check": "ok",
         "foreign_key_violations": 0,
+        "source_snapshot": _source_snapshot_receipt(before),
         "activation": {
             "epoch_id": str(epochs[0]["epoch_id"]),
             "state": "steady_active",
