@@ -137,7 +137,16 @@ def test_authorization_is_exact_owner_only_fingerprinted_and_hard_deadlined():
     assert set(value["policy"]) == bootstrap.POLICY_FIELDS
     assert value["expires_at"] == value["deadline"]
     assert value["policy"] == bootstrap._policy()
+    assert value["policy"]["daily_started_attempt_quota"] is None
     assert value["receipt_fingerprint"] == bootstrap.authorization_fingerprint(value)
+
+    legacy = copy.deepcopy(value)
+    legacy["policy"]["daily_started_attempt_quota"] = 5
+    legacy["receipt_fingerprint"] = bootstrap.authorization_fingerprint(legacy)
+    with pytest.raises(
+        bootstrap.RcaBootstrapAuthorizationError, match="policy_invalid"
+    ):
+        bootstrap.validate_bootstrap_authorization(legacy, now=NOW)
 
     with pytest.raises(
         bootstrap.RcaBootstrapAuthorizationError, match="owner_required"
@@ -435,10 +444,12 @@ def test_issue_builds_distinct_signed_bootstrap_receipt_and_fixed_meta():
     )
     assert receipt["schema_version"] == admission.BOOTSTRAP_SCHEMA_VERSION
     assert receipt["capacity_mode"] == "bootstrap"
+    assert receipt["bootstrap_authorization"]["daily_started_attempt_quota"] is None
     assert captured["command"][-2:] == ["--resource-class", "rca_prod_bootstrap"]
     assert admission.HMAC_ENV not in captured["env"]
     assert result.meta["rca_prod_capacity_mode"] == "bootstrap"
     assert result.meta["rca_prod_bootstrap_epoch_id"] == EPOCH_ID
+    assert result.meta["rca_prod_bootstrap_daily_started_attempt_quota"] is None
     assert result.meta["rca_prod_release_bom_sha256"] == RELEASE_BOM_SHA
     assert (
         result.meta["rca_prod_active_release_binding_sha256"]
@@ -459,7 +470,7 @@ def test_issue_builds_distinct_signed_bootstrap_receipt_and_fixed_meta():
     "field,value,code",
     [
         ("max_concurrency", 2, "bootstrap_policy_invalid"),
-        ("daily_started_attempt_quota", 6, "bootstrap_policy_invalid"),
+        ("daily_started_attempt_quota", 5, "bootstrap_policy_invalid"),
         ("root_required_available_bytes", 400 * 1024**3, "bootstrap_policy_invalid"),
         ("delivery_required_available_bytes", 512 * 1024**3, "bootstrap_policy_invalid"),
         ("input_materialization", "allowed", "bootstrap_policy_invalid"),

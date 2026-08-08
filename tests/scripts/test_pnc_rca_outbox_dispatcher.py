@@ -146,6 +146,7 @@ def _authorization() -> dict[str, object]:
     return {
         "authorization_ready": True,
         "capacity_mode": "bootstrap",
+        "daily_started_attempt_quota": None,
         "bootstrap_epoch_id": EPOCH_ID,
         "release_approval_id": RELEASE_ID,
         "started_at": "2026-07-20T00:00:00+00:00",
@@ -2368,6 +2369,7 @@ def test_capacity_health_projection_is_release_bound(tmp_path):
     assert status["required"] is True
     assert status["ready"] is True
     assert status["authorization"]["release_approval_id"] == RELEASE_ID
+    assert status["authorization"]["daily_started_attempt_quota"] is None
     assert dispatcher._health_capacity_admission_ok(
         {
             "enabled": True,
@@ -2375,6 +2377,23 @@ def test_capacity_health_projection_is_release_bound(tmp_path):
             "capacity_admission": status,
         }
     )
+
+
+def test_capacity_health_rejects_daily_started_attempt_quota(tmp_path):
+    config = dispatcher.DispatcherConfig.from_env(
+        _config_env(tmp_path, enabled=True), hermes_home=tmp_path
+    )
+    reporter = object.__new__(dispatcher.HealthReporter)
+    reporter.config = config
+    authorization = _authorization()
+    authorization["daily_started_attempt_quota"] = 5
+    reporter._bootstrap_authorization_observer = lambda: authorization
+    reporter._admission_key_fingerprint_observer = lambda: "7" * 64
+
+    status = reporter.capacity_admission_status()
+
+    assert status["ready"] is False
+    assert status["error_code"] == "rca_bootstrap_authorization_projection_invalid"
 
 
 def test_steady_health_requires_hmac_and_has_no_expiring_authorization(tmp_path):

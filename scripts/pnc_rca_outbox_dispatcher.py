@@ -4232,6 +4232,7 @@ class HealthReporter:
                 != self.config.bootstrap_epoch_id
                 or authorization.get("release_approval_id")
                 != self.config.release_id
+                or authorization.get("daily_started_attempt_quota") is not None
                 or any(
                     re.fullmatch(r"[0-9a-f]{64}", str(authorization.get(field) or ""))
                     is None
@@ -4270,6 +4271,9 @@ class HealthReporter:
             "admission_key_fingerprint": admission_key_fingerprint,
             "authorization": {
                 "bootstrap_epoch_id": authorization["bootstrap_epoch_id"],
+                "daily_started_attempt_quota": authorization[
+                    "daily_started_attempt_quota"
+                ],
                 "started_at": authorization["started_at"],
                 "deadline": authorization["deadline"],
                 "receipt_fingerprint": authorization["receipt_fingerprint"],
@@ -4520,6 +4524,7 @@ def _health_capacity_admission_ok(payload: Mapping[str, Any]) -> bool:
         or authorization.get("bootstrap_epoch_id")
         != config.get("bootstrap_epoch_id")
         or authorization.get("release_approval_id") != config.get("release_id")
+        or authorization.get("daily_started_attempt_quota") is not None
     ):
         return False
     return all(
