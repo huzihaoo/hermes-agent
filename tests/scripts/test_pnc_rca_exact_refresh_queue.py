@@ -6,14 +6,25 @@ import pytest
 from scripts.pnc_rca_batch_rerun import QUEUE_SCHEMA_VERSION
 from scripts.pnc_rca_exact_refresh_queue import (
     SOURCE_FILTER,
+    SOURCE_SCHEMA_VERSION,
     ExactRefreshQueueError,
     build_queue,
 )
 
 
-def _source(path, *, logic="AND"):
+def _source(
+    path,
+    *,
+    logic="AND",
+    proposer_values=None,
+    project_option_ids=None,
+):
+    if proposer_values is None:
+        proposer_values = [SOURCE_FILTER["creator_name"]]
+    if project_option_ids is None:
+        project_option_ids = [str(SOURCE_FILTER["project_id"])]
     value = {
-        "schema_version": "pnc_rca_batch_queue_v1",
+        "schema_version": SOURCE_SCHEMA_VERSION,
         "source_inventory_sha256": "a" * 64,
         "filter": {**SOURCE_FILTER, "logic": logic},
         "items": [
@@ -23,6 +34,8 @@ def _source(path, *, logic="AND"):
                 "quality_classification": "missing",
                 "current_submission_key": "",
                 "priority": 1,
+                "proposer_values": proposer_values,
+                "project_option_ids": project_option_ids,
             },
             {
                 "issue_id": "7048803419",
@@ -30,6 +43,8 @@ def _source(path, *, logic="AND"):
                 "quality_classification": "legacy_or_other",
                 "current_submission_key": "",
                 "priority": 2,
+                "proposer_values": proposer_values,
+                "project_option_ids": project_option_ids,
             },
         ],
     }
@@ -92,6 +107,24 @@ def test_build_queue_rejects_or_scope(tmp_path):
     ):
         build_queue(
             source_path=_source(tmp_path / "source.json", logic="OR"),
+            control_db=_db(tmp_path / "control.sqlite3"),
+            batch_id="g1q3-li-taohua-refresh",
+        )
+
+
+@pytest.mark.parametrize(
+    "source_kwargs",
+    [
+        {"proposer_values": ["其他创建者"]},
+        {"project_option_ids": ["1234567890"]},
+    ],
+)
+def test_build_queue_rejects_item_outside_exact_scope(tmp_path, source_kwargs):
+    with pytest.raises(
+        ExactRefreshQueueError, match="exact_refresh_source_item_out_of_scope"
+    ):
+        build_queue(
+            source_path=_source(tmp_path / "source.json", **source_kwargs),
             control_db=_db(tmp_path / "control.sqlite3"),
             batch_id="g1q3-li-taohua-refresh",
         )

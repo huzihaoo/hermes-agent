@@ -29,7 +29,7 @@ from scripts.pnc_rca_batch_rerun import (  # noqa: E402
 )
 
 
-SOURCE_SCHEMA_VERSION = "pnc_rca_batch_queue_v1"
+SOURCE_SCHEMA_VERSION = "pnc_rca_batch_queue_v2"
 RECEIPT_SCHEMA_VERSION = "g1q3_rca_exact_refresh_queue_receipt_v1"
 MAX_INPUT_BYTES = 4 * 1024 * 1024
 SOURCE_FIELDS = frozenset(
@@ -42,6 +42,8 @@ SOURCE_ITEM_FIELDS = frozenset(
         "quality_classification",
         "current_submission_key",
         "priority",
+        "proposer_values",
+        "project_option_ids",
     }
 )
 SOURCE_FILTER = {
@@ -112,6 +114,8 @@ def _read_source(path: Path) -> tuple[list[dict[str, Any]], str]:
         title = str(item.get("title") or "").strip()
         classification = str(item.get("quality_classification") or "").strip()
         priority = item.get("priority")
+        proposer_values = item.get("proposer_values")
+        project_option_ids = item.get("project_option_ids")
         if (
             ISSUE_ID_RE.fullmatch(issue_id) is None
             or issue_id in seen
@@ -123,6 +127,23 @@ def _read_source(path: Path) -> tuple[list[dict[str, Any]], str]:
             or priority < 0
         ):
             raise ExactRefreshQueueError("exact_refresh_source_item_invalid")
+        if (
+            not isinstance(proposer_values, list)
+            or not proposer_values
+            or not all(
+                isinstance(value, str) and value.strip()
+                for value in proposer_values
+            )
+            or SOURCE_FILTER["creator_name"] not in proposer_values
+            or not isinstance(project_option_ids, list)
+            or not project_option_ids
+            or not all(
+                isinstance(value, str) and value.strip()
+                for value in project_option_ids
+            )
+            or str(SOURCE_FILTER["project_id"]) not in project_option_ids
+        ):
+            raise ExactRefreshQueueError("exact_refresh_source_item_out_of_scope")
         seen.add(issue_id)
         items.append({
             "issue_id": issue_id,
