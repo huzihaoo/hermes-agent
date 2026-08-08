@@ -2248,7 +2248,19 @@ def test_feishu_thread_reader_lists_only_exact_origin_topic(monkeypatch):
                     "root_id": "om_root123",
                     "thread_id": "omt_thread123",
                     "msg_type": "text",
-                    "body": {"content": json.dumps({"text": "marker\nreport"})},
+                    "body": {
+                        "content": json.dumps({
+                            "text": "marker\n发起人：@_user_1\nreport"
+                        })
+                    },
+                    "mentions": [
+                        {
+                            "key": "@_user_1",
+                            "id": "ou_requester123",
+                            "id_type": "open_id",
+                            "name": "Requester",
+                        }
+                    ],
                 },
                 {
                     "message_id": "om_other789",
@@ -2287,9 +2299,85 @@ def test_feishu_thread_reader_lists_only_exact_origin_topic(monkeypatch):
 
     assert result == {
         "success": True,
-        "comments": [{"remote_id": "om_reply456", "content": "marker\nreport"}],
+        "comments": [
+            {
+                "remote_id": "om_reply456",
+                "content": (
+                    'marker\n发起人：<at user_id="ou_requester123"></at>\nreport'
+                ),
+            }
+        ],
         "pages_read": 1,
     }
+
+
+@pytest.mark.parametrize(
+    ("remote_content", "mentions", "accepted"),
+    [
+        (
+            "[RCA_TERMINAL:effect:terminal_failed:1]\n发起人：@_user_1\nresult",
+            [{"key": "@_user_1", "id": "ou_requester123", "id_type": "open_id"}],
+            True,
+        ),
+        (
+            "[RCA_TERMINAL:effect:terminal_failed:1]\n发起人：@_user_1\nresult",
+            [{"key": "@_user_1", "id": "ou_different123", "id_type": "open_id"}],
+            False,
+        ),
+        (
+            "[RCA_TERMINAL:effect:terminal_failed:1]\nresult\n发起人：@_user_1",
+            [{"key": "@_user_1", "id": "ou_requester123", "id_type": "open_id"}],
+            False,
+        ),
+        (
+            "[RCA_TERMINAL:effect:terminal_failed:1]\n发起人：@_user_1 @_user_1\nresult",
+            [{"key": "@_user_1", "id": "ou_requester123", "id_type": "open_id"}],
+            False,
+        ),
+        (
+            "[RCA_TERMINAL:effect:terminal_failed:1]\n发起人：@_user_1\nresult",
+            [
+                {"key": "@_user_1", "id": "ou_requester123", "id_type": "open_id"},
+                {"key": "@_user_2", "id": "ou_different123", "id_type": "open_id"},
+            ],
+            False,
+        ),
+        (
+            "[RCA_TERMINAL:effect:terminal_failed:1]\n发起人：@_user_1\nresult",
+            [],
+            False,
+        ),
+        (
+            "[RCA_TERMINAL:effect:terminal_failed:1]\n发起人：@_user_1\nresult",
+            [{"key": "@_user_1", "id": "ou_requester123", "id_type": "user_id"}],
+            False,
+        ),
+        (
+            "[RCA_TERMINAL:effect:terminal_failed:1]\n发起人：@_user_1\nchanged",
+            [{"key": "@_user_1", "id": "ou_requester123", "id_type": "open_id"}],
+            False,
+        ),
+    ],
+)
+def test_feishu_thread_mention_rendering_requires_exact_requester_body(
+    remote_content,
+    mentions,
+    accepted,
+):
+    marker = "[RCA_TERMINAL:effect:terminal_failed:1]"
+    expected = f'{marker}\n发起人：<at user_id="ou_requester123"></at>\nresult'
+    restored = FeishuThreadReplyAdapter._restore_single_text_mention(
+        remote_content,
+        mentions,
+    )
+
+    matches = dispatcher_module._confirmed_content_matches(
+        [{"remote_id": "om_reply456", "content": restored}],
+        marker,
+        expected,
+    )
+
+    assert bool(matches) is accepted
 
 
 def test_feishu_thread_writer_preserves_topic_and_stable_uuid():

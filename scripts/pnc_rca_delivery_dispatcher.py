@@ -196,6 +196,8 @@ RETRY_DELAYS_SECONDS = (2, 5, 10, 20, 40, 120, 300, 900, 3600)
 UNCERTAIN_RECONCILIATION_POLL_SECONDS = 30
 MAX_RECOVERY_WRITES = 2
 _REMOTE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+_FEISHU_OPEN_ID_RE = re.compile(r"^ou_[A-Za-z0-9_-]{8,255}$")
+_FEISHU_RENDERED_MENTION_RE = re.compile(r"@_user_[1-9][0-9]*(?![A-Za-z0-9_])")
 _FEISHU_ISSUE_URL_RE = re.compile(
     r"^https://project\.feishu\.cn/([A-Za-z0-9._-]+)/issue/detail/([0-9]+)$"
 )
@@ -2756,6 +2758,29 @@ class FeishuThreadReplyAdapter:
             raise ValueError("thread_id contains an invalid topic root")
         return anchor
 
+    @staticmethod
+    def _restore_single_text_mention(content: str, mentions: Any) -> str:
+        """Restore one API-proven Feishu text mention for exact body comparison."""
+        placeholders = _FEISHU_RENDERED_MENTION_RE.findall(content)
+        if (
+            len(placeholders) != 1
+            or not isinstance(mentions, list)
+            or len(mentions) != 1
+            or not isinstance(mentions[0], Mapping)
+        ):
+            return content
+        mention = mentions[0]
+        key = str(mention.get("key") or "").strip()
+        open_id = str(mention.get("id") or "").strip()
+        if (
+            key != placeholders[0]
+            or str(mention.get("id_type") or "").strip() != "open_id"
+            or _FEISHU_OPEN_ID_RE.fullmatch(open_id) is None
+            or content.count(key) != 1
+        ):
+            return content
+        return content.replace(key, f'<at user_id="{open_id}"></at>', 1)
+
     async def _resolve_thread_id(self, chat_id: str, anchor: str) -> Mapping[str, Any]:
         request = self._adapter._build_get_message_request(anchor)
         try:
@@ -2914,6 +2939,10 @@ class FeishuThreadReplyAdapter:
                         "success": False,
                         "error_code": "delivery_boundary_contract_invalid",
                     }
+                content = self._restore_single_text_mention(
+                    content,
+                    item.get("mentions"),
+                )
                 comments.append({"remote_id": remote_id, "content": content})
                 if len(comments) > MAX_MEEGLE_COMMENTS:
                     return {
