@@ -266,7 +266,6 @@ def _prepare_candidate(args: dict, monkeypatch: pytest.MonkeyPatch) -> None:
     profile_path = args["candidate_root"] / transaction.PROFILE_NAME
     profile_path.write_bytes(transaction._canonical_bytes(profile))
     profile_path.chmod(0o600)
-
     def fake_baseline(**kwargs):
         path = Path(kwargs["env"]["HERMES_RCA_DELIVERY_QUARANTINE_BASELINE_PATH"])
         return {

@@ -660,6 +660,78 @@ def _seed_materialized_activation_deferral_race(root: Path) -> RcaDeliveryStore:
     return store
 
 
+def _seed_unmaterialized_activation_deferral_companion(
+    root: Path,
+) -> RcaDeliveryStore:
+    store = _seed_materialized_activation_deferral_race(root)
+    claimed_at = (NOW + timedelta(seconds=1)).isoformat()
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("DELETE FROM rca_delivery_effects")
+        conn.execute("DELETE FROM rca_execution_watch")
+        conn.execute("DELETE FROM rca_delivery_jobs")
+        conn.execute(
+            "UPDATE business_triggers SET "
+            "activation_epoch_id=(SELECT activation_epoch_id FROM rca_outbox), "
+            "activation_ledger_id=(SELECT activation_ledger_id FROM rca_outbox)"
+        )
+        conn.execute(
+            "UPDATE rca_outbox SET attempt=9, fence=9, claimed_at=?, "
+            "completed_at=NULL, result_json=NULL",
+            (claimed_at,),
+        )
+        conn.commit()
+    return store
+
+
+def test_unmaterialized_activation_deferral_companion_is_exactly_classified(
+    tmp_path,
+):
+    store = _seed_unmaterialized_activation_deferral_companion(tmp_path)
+    with sqlite3.connect(store.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        projection = _quarantined_subscription_projection(conn)
+
+    assert projection == {
+        "total": 2,
+        "invalid_manual_thread": 0,
+        "activation_deferred_issue_comment": 1,
+        "activation_deferred_materialized_delivery": 0,
+        "activation_deferred_unmaterialized_thread": 1,
+        "unrecognized": 0,
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "UPDATE rca_activation_epochs SET state='safe_off'",
+        "UPDATE rca_delivery_subscriptions SET delivery_id='unexpected' "
+        "WHERE effect_kind='feishu_thread_reply'",
+        "UPDATE rca_delivery_subscriptions SET effect_key='unexpected' "
+        "WHERE effect_kind='feishu_thread_reply'",
+        "UPDATE rca_delivery_subscriptions SET reason='unexpected' "
+        "WHERE effect_kind='feishu_issue_comment'",
+        "UPDATE rca_trigger_sources SET mode='rerun'",
+        "UPDATE rca_outbox SET last_error_code='unexpected'",
+        "UPDATE business_triggers SET state='completed'",
+        "UPDATE rca_activation_admission_ledger SET decision='join'",
+    ),
+)
+def test_unmaterialized_activation_deferral_companion_fails_closed_on_drift(
+    tmp_path,
+    mutation,
+):
+    store = _seed_unmaterialized_activation_deferral_companion(tmp_path)
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(mutation)
+        conn.commit()
+        conn.row_factory = sqlite3.Row
+        projection = _quarantined_subscription_projection(conn)
+
+    assert projection["activation_deferred_unmaterialized_thread"] == 0
+    assert projection["unrecognized"] >= 1
+
+
 def test_materialized_activation_deferral_race_is_exactly_classified(tmp_path):
     store = _seed_materialized_activation_deferral_race(tmp_path)
     with sqlite3.connect(store.db_path) as conn:
@@ -682,6 +754,7 @@ def test_materialized_activation_deferral_race_is_exactly_classified(tmp_path):
         "invalid_manual_thread": 0,
         "activation_deferred_issue_comment": 1,
         "activation_deferred_materialized_delivery": 1,
+        "activation_deferred_unmaterialized_thread": 0,
         "unrecognized": 0,
     }
     assert materialized["count"] == 1

@@ -16,7 +16,7 @@ from typing import Any, Mapping
 SCHEMA_VERSION = "context-rca-bootstrap-capacity-authorization/v1"
 CAPACITY_MODE = "bootstrap"
 RESOURCE_CLASS = "rca_prod"
-MAX_EPOCH_DURATION = timedelta(days=8)
+MAX_EPOCH_DURATION = timedelta(days=30)
 MAX_CONCURRENCY = 1
 DAILY_STARTED_ATTEMPT_QUOTA: None = None
 QUOTA_TIMEZONE = "UTC"

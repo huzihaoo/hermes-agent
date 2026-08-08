@@ -768,7 +768,7 @@ def _task_id_from_sidecar_path(path: Path) -> str:
     return path.name[:-5] if path.name.endswith(".json") else path.stem
 
 
-def iter_pending_notices(*, task_ids: Iterable[str] | None = None, retry_failed_after_seconds: int = 0, max_attempts: int = 3, since_ts: float | None = None) -> list[tuple[str, Path, dict[str, Any], dict[str, Any]]]:
+def iter_pending_notices(*, task_ids: Iterable[str] | None = None, retry_failed_after_seconds: int = 0, max_attempts: int = 3, since_ts: float | None = None, require_current_g1q3_write_fence: bool = False) -> list[tuple[str, Path, dict[str, Any], dict[str, Any]]]:
     task_filter = {str(item).strip() for item in (task_ids or []) if str(item).strip()}
     root = get_hermes_home() / "task-state"
     rows: list[tuple[str, Path, dict[str, Any], dict[str, Any]]] = []
@@ -807,6 +807,15 @@ def iter_pending_notices(*, task_ids: Iterable[str] | None = None, retry_failed_
         if task_filter and task_id not in task_filter:
             continue
         body = _load_json(path)
+        if (
+            require_current_g1q3_write_fence
+            and _is_g1q3_rca_origin_task(task_id, body)
+            and not _automatic_g1q3_write_fence_ready(task_id)
+        ):
+            # Automatic scans must not rewrite or retry historical G1Q3
+            # sidecars that predate the activation-bound write fence. Explicit
+            # one-task runs still surface the original fail-closed error.
+            continue
         body = reconcile_vm_delivery_proposal(task_id, body)
         # Reconciliation may create the card for a non-terminal task. Enrich
         # afterwards so the first scan reaches the same fixed point as replays.
@@ -4877,6 +4886,8 @@ def _load_task_write_fence(task_id: str) -> dict[str, Any]:
 def _is_g1q3_rca_origin_task(task_id: str, body: Mapping[str, Any]) -> bool:
     """Classify relay provenance from canonical admission or live shared state."""
 
+    if "g1q3-rca" in str(task_id or "").strip().lower():
+        return True
     try:
         _load_task_write_fence(task_id)
         return True
@@ -4896,6 +4907,17 @@ def _is_g1q3_rca_origin_task(task_id: str, body: Mapping[str, Any]) -> bool:
         else {}
     )
     return str(delivery.get("schema_version") or "").startswith("g1q3_")
+
+
+def _automatic_g1q3_write_fence_ready(task_id: str) -> bool:
+    """Return whether an automatic relay scan may mutate or deliver this task."""
+
+    try:
+        binding = _load_task_write_fence(task_id)
+        _relay_live_fence_binding(binding["write_fence"])
+    except ExternalWriteFenceError:
+        return False
+    return True
 
 
 def _relay_live_fence_binding(fence: Mapping[str, Any]) -> dict[str, Any]:
@@ -5090,7 +5112,13 @@ def relay_pending_notices(*, task_ids: Iterable[str] | None = None, send: bool =
     fallback_lock = threading.Lock()
     explicit_task_filter = bool(task_ids) if explicit_completion_delivery is None else bool(explicit_completion_delivery)
     effective_since_ts = since_ts if since_ts is not None else (None if explicit_task_filter else RELAY_PROCESS_START_TS)
-    candidates = iter_pending_notices(task_ids=task_ids, retry_failed_after_seconds=retry_failed_after_seconds, max_attempts=max_attempts, since_ts=effective_since_ts)[: max(1, min(limit, 100))]
+    candidates = iter_pending_notices(
+        task_ids=task_ids,
+        retry_failed_after_seconds=retry_failed_after_seconds,
+        max_attempts=max_attempts,
+        since_ts=effective_since_ts,
+        require_current_g1q3_write_fence=send and not explicit_task_filter,
+    )[: max(1, min(limit, 100))]
     def _process(task_id, path, body, notice):
         errs: list[str] = []
         guard_action = body.pop("_close_loop_guard_action", None) if isinstance(body, dict) else None

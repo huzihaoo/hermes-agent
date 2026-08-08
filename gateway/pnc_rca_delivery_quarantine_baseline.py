@@ -1109,6 +1109,91 @@ def _activation_deferred_materialized_projection(
     }
 
 
+def _activation_deferred_unmaterialized_thread_keys(
+    conn: sqlite3.Connection,
+) -> set[str]:
+    """Return exact manual thread companions stopped before delivery creation."""
+
+    rows = conn.execute(
+        """
+        SELECT thread.subscription_key
+          FROM rca_delivery_subscriptions AS thread
+          JOIN rca_delivery_subscriptions AS issue
+            ON issue.business_key = thread.business_key
+           AND issue.generation = thread.generation
+           AND issue.effect_kind = 'feishu_issue_comment'
+           AND issue.required = 1
+           AND issue.status = 'quarantined'
+           AND issue.reason = 'activation_epoch_deferred'
+           AND issue.source_id IS NULL
+           AND issue.delivery_id IS NULL
+           AND issue.effect_key IS NULL
+          JOIN rca_trigger_sources AS source
+            ON source.source_id = thread.source_id
+          JOIN rca_outbox AS o
+            ON o.business_key = thread.business_key
+           AND o.generation = thread.generation
+           AND o.origin_source_id = source.source_id
+           AND o.status = 'quarantined'
+           AND o.last_error_code = 'activation_epoch_deferred'
+           AND o.next_attempt_at IS NULL
+           AND o.lease_token IS NULL
+           AND o.lease_owner IS NULL
+           AND o.lease_expires_at IS NULL
+           AND o.completed_at IS NULL
+           AND o.result_json IS NULL
+           AND o.quarantined_at IS NOT NULL
+          JOIN business_triggers AS trigger
+            ON trigger.business_key = o.business_key
+           AND trigger.generation = o.generation
+           AND trigger.submission_key = o.submission_key
+           AND trigger.state = 'quarantined'
+           AND trigger.activation_epoch_id = o.activation_epoch_id
+           AND trigger.activation_ledger_id = o.activation_ledger_id
+          JOIN rca_activation_epochs AS epoch
+            ON epoch.epoch_id = o.activation_epoch_id
+           AND epoch.state = 'aborted'
+           AND (epoch.is_current = 1 OR epoch.superseded_at IS NOT NULL)
+          JOIN rca_activation_admission_ledger AS ledger
+            ON ledger.epoch_id = o.activation_epoch_id
+           AND ledger.ledger_id = o.activation_ledger_id
+           AND ledger.business_key = o.business_key
+           AND ledger.submission_key = o.submission_key
+           AND ledger.generation = o.generation
+           AND ledger.entrypoint = 'manual_admit'
+           AND ledger.source_kind = 'manual'
+           AND ledger.slot_kind IN ('manual_success', 'manual_terminal_failure')
+           AND ledger.decision = 'admit'
+           AND ledger.bound_at IS NOT NULL
+         WHERE thread.status = 'quarantined'
+           AND thread.effect_kind = 'feishu_thread_reply'
+           AND thread.required = 1
+           AND thread.reason = 'activation_epoch_deferred'
+           AND thread.delivery_id IS NULL
+           AND thread.effect_key IS NULL
+           AND source.source_kind = 'feishu_group_manual'
+           AND source.source_dedupe_key = 'feishu:' || source.message_id
+           AND source.mode = 'run_or_join'
+           AND source.outcome IN ('created', 'joined')
+           AND NOT EXISTS (
+                 SELECT 1 FROM rca_execution_watch AS watch
+                  WHERE watch.submission_outbox_id = o.outbox_id
+                     OR watch.submission_key = o.submission_key
+           )
+           AND NOT EXISTS (
+                 SELECT 1 FROM rca_delivery_jobs AS job
+                  WHERE job.submission_key = o.submission_key
+                     OR (
+                          job.business_key = o.business_key
+                          AND job.generation = o.generation
+                     )
+           )
+         ORDER BY thread.subscription_key
+        """
+    ).fetchall()
+    return {str(row["subscription_key"]) for row in rows}
+
+
 def _quarantined_subscription_projection(
     conn: sqlite3.Connection,
 ) -> dict[str, Any]:
@@ -1120,6 +1205,10 @@ def _quarantined_subscription_projection(
         str(item["thread_subscription_key"])
         for item in materialized_deferred["entries"]
     }
+    unmaterialized_thread_keys = (
+        _activation_deferred_unmaterialized_thread_keys(conn)
+    )
+    unmaterialized_threads = 0
     rows = conn.execute(
         """
         SELECT subscription.*, job.project_key, job.work_item_type_key,
@@ -1140,6 +1229,9 @@ def _quarantined_subscription_projection(
     for row in rows:
         total += 1
         if str(row["subscription_key"] or "") in materialized_keys:
+            continue
+        if str(row["subscription_key"] or "") in unmaterialized_thread_keys:
+            unmaterialized_threads += 1
             continue
         if (
             int(row["required"]) == 1
@@ -1181,10 +1273,12 @@ def _quarantined_subscription_projection(
         "invalid_manual_thread": invalid,
         "activation_deferred_issue_comment": deferred,
         "activation_deferred_materialized_delivery": materialized_deferred["count"],
+        "activation_deferred_unmaterialized_thread": unmaterialized_threads,
         "unrecognized": total
         - invalid
         - deferred
-        - materialized_deferred["count"],
+        - materialized_deferred["count"]
+        - unmaterialized_threads,
     }
 
 

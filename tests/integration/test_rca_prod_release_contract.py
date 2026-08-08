@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import ast
 import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -27,13 +29,10 @@ pytestmark = pytest.mark.integration
 
 WORKSPACE_RUNTIME_ENV = "HERMES_RCA_RELEASE_WORKSPACE_RUNTIME"
 VM_ADMISSION_MODULE_ENV = "HERMES_RCA_RELEASE_VM_ADMISSION_MODULE"
-WORKSPACE_SOURCE_COMMIT = "3baf7825f5b82a6c376934a83f7b7e17c7ded590"
-WORKSPACE_CLOSURE_SHA256 = (
-    "25dad60518a4f5310620a16bfef4e4e3b262759eb1d76ce34bfc41e929a7bf95"
-)
-VM_ADMISSION_SHA256 = (
-    "8b4f926b1129857bfe0e8dcef0c546e1bb3014fe299dc8dce00b938e34a0d76d"
-)
+WORKSPACE_SOURCE_COMMIT_ENV = "HERMES_RCA_RELEASE_WORKSPACE_SOURCE_COMMIT"
+WORKSPACE_CLOSURE_SHA256_ENV = "HERMES_RCA_RELEASE_WORKSPACE_CLOSURE_SHA256"
+VM_ADMISSION_SHA256_ENV = "HERMES_RCA_RELEASE_VM_ADMISSION_SHA256"
+VM_RELEASE_ROOT_ENV = "HERMES_RCA_RELEASE_VM_RELEASE_ROOT"
 HMAC_KEY = "hex:" + ("42" * 32)
 NOW = datetime(2026, 7, 21, 5, 0, tzinfo=timezone.utc)
 
@@ -48,8 +47,35 @@ def _required_release_path(name: str) -> Path:
     return path
 
 
-def _load_vm_admission(path: Path):
-    assert hashlib.sha256(path.read_bytes()).hexdigest() == VM_ADMISSION_SHA256
+def _required_release_value(name: str, pattern: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        pytest.fail(f"set {name} when the pinned RCA release paths are enabled")
+    if re.fullmatch(pattern, value) is None:
+        pytest.fail(f"{name} is invalid: {value}")
+    return value
+
+
+def _workspace_fixed_cli_entrypoint(workspace_root: Path) -> str:
+    module = ast.parse(
+        (workspace_root / "bin/shared_state_fields.py").read_text(encoding="utf-8")
+    )
+    for statement in module.body:
+        if not isinstance(statement, ast.Assign):
+            continue
+        if any(
+            isinstance(target, ast.Name)
+            and target.id == "RCA_FIXED_CLI_ENTRYPOINT"
+            for target in statement.targets
+        ):
+            value = ast.literal_eval(statement.value)
+            if isinstance(value, str):
+                return value
+    pytest.fail("sealed workspace fixed CLI entrypoint is missing")
+
+
+def _load_vm_admission(path: Path, *, expected_sha256: str):
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == expected_sha256
     spec = importlib.util.spec_from_file_location(
         "pinned_e287b731_vm_rca_prod_admission", path
     )
@@ -129,10 +155,26 @@ def test_pinned_release_goal_bytes_survive_creator_and_vm_admission(
 ):
     workspace_root = _required_release_path(WORKSPACE_RUNTIME_ENV)
     vm_admission_path = _required_release_path(VM_ADMISSION_MODULE_ENV)
+    workspace_source_commit = _required_release_value(
+        WORKSPACE_SOURCE_COMMIT_ENV, r"[0-9a-f]{40}"
+    )
+    workspace_closure_sha256 = _required_release_value(
+        WORKSPACE_CLOSURE_SHA256_ENV, r"[0-9a-f]{64}"
+    )
+    vm_admission_sha256 = _required_release_value(
+        VM_ADMISSION_SHA256_ENV, r"[0-9a-f]{64}"
+    )
+    vm_release_root = _required_release_value(VM_RELEASE_ROOT_ENV, r"/.+")
     workspace = validate_staged_workspace_runtime(workspace_root)
-    assert workspace.source_commit == WORKSPACE_SOURCE_COMMIT
-    assert workspace.closure_sha256 == WORKSPACE_CLOSURE_SHA256
-    vm_admission = _load_vm_admission(vm_admission_path)
+    assert workspace.source_commit == workspace_source_commit
+    assert workspace.closure_sha256 == workspace_closure_sha256
+    assert str(RCA_PROD_VM_RELEASE_ROOT) == vm_release_root.rstrip("/")
+    assert _workspace_fixed_cli_entrypoint(workspace_root) == (
+        f"{vm_release_root.rstrip('/')}/{RCA_PROD_VM_FIXED_CLI_RELATIVE_PATH}"
+    )
+    vm_admission = _load_vm_admission(
+        vm_admission_path, expected_sha256=vm_admission_sha256
+    )
 
     admission = build_rca_admission(
         project_key="t03o4q",

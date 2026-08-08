@@ -214,6 +214,24 @@ def test_stage_apply_installs_a_release_bound_bootstrap_authority(tmp_path, monk
     ).hexdigest()
 
 
+def test_stage_accepts_exact_bootstrap_epoch_duration_and_rejects_overflow(
+    tmp_path,
+    monkeypatch,
+):
+    args = _stage_args(tmp_path, monkeypatch)
+    args["deadline"] = NOW + bootstrap.MAX_EPOCH_DURATION
+
+    result = stage.stage_bootstrap(**args)
+
+    assert stage.MAX_AUTHORIZATION_DURATION == bootstrap.MAX_EPOCH_DURATION
+    assert result["status"] == "PLAN"
+    assert result["deadline"] == args["deadline"].isoformat()
+
+    args["deadline"] += timedelta(microseconds=1)
+    with pytest.raises(stage.BootstrapStageError, match="deadline_invalid"):
+        stage.stage_bootstrap(**args)
+
+
 def test_stage_rejects_unready_resource_without_writes(tmp_path, monkeypatch):
     args = _stage_args(tmp_path, monkeypatch)
     _seal, _authority, _approval, snapshot = _inputs(

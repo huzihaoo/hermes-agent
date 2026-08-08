@@ -3351,9 +3351,18 @@ def test_g1q3_intake_without_report_is_not_rendered_as_completed(tmp_path):
     assert len(labels) >= 2
 
 
-def test_g1q3_enrichment_runs_in_watch_channel_without_explicit_filter(tmp_path):
+def test_g1q3_enrichment_runs_in_watch_channel_without_explicit_filter(
+    tmp_path,
+    monkeypatch,
+):
     """F3: relay watch loop (no task_ids filter) must still enrich g1q3 cards."""
     task_id = "20260622-110137-g1q3-rca-issue-intake-7023754183"
+    monkeypatch.setattr(
+        pnc_completion_notice_relay,
+        "_automatic_g1q3_write_fence_ready",
+        lambda _task_id: True,
+    )
+    _install_unit_test_active_relay_fence(monkeypatch)
     token = set_hermes_home_override(tmp_path)
     try:
         sidecar = _write_g1q3_intake_sidecar(tmp_path, task_id)
@@ -3371,6 +3380,83 @@ def test_g1q3_enrichment_runs_in_watch_channel_without_explicit_filter(tmp_path)
     # Enrichment fired in the auto channel: more than just the seed milestone.
     assert any("已接单" in l for l in labels), labels
     assert updated["task_card"].get("user_state") != "done"
+
+
+def test_g1q3_automatic_scan_skips_unfenced_history_without_sidecar_mutation(
+    tmp_path,
+    monkeypatch,
+):
+    task_id = "20260622-110137-g1q3-rca-issue-intake-7023754183"
+    token = set_hermes_home_override(tmp_path)
+    try:
+        sidecar = _write_g1q3_intake_sidecar(tmp_path, task_id)
+        before = sidecar.read_bytes()
+        monkeypatch.setattr(
+            pnc_completion_notice_relay,
+            "_automatic_g1q3_write_fence_ready",
+            lambda _task_id: False,
+        )
+        sends = []
+        cards = []
+
+        result = pnc_completion_notice_relay.relay_pending_notices(
+            task_ids=None,
+            send=True,
+            send_func=lambda args: sends.append(args) or "{}",
+            send_card_func=lambda *args, **kwargs: cards.append((args, kwargs)) or {},
+            explicit_completion_delivery=False,
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert result["ok"] is True
+    assert result["candidate_count"] == 0
+    assert result["errors"] == []
+    assert sidecar.read_bytes() == before
+    assert sends == []
+    assert cards == []
+
+
+def test_g1q3_name_only_automatic_scan_requires_fence_before_mutation_or_send(
+    tmp_path,
+    monkeypatch,
+):
+    task_id = "20260617-190920-g1q3-rca-status-check"
+    token = set_hermes_home_override(tmp_path)
+    try:
+        sidecar = _write_g1q3_intake_sidecar(tmp_path, task_id)
+        meta_path = (
+            tmp_path / "runtime" / "shared-state" / "tasks" / task_id / "meta.json"
+        )
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta.pop("business_line")
+        meta_path.write_text(json.dumps(meta), encoding="utf-8")
+        before = sidecar.read_bytes()
+        body = json.loads(before)
+        assert pnc_completion_notice_relay._is_g1q3_rca_origin_task(task_id, body)
+        monkeypatch.setattr(
+            pnc_completion_notice_relay,
+            "_automatic_g1q3_write_fence_ready",
+            lambda _task_id: False,
+        )
+        sends = []
+        cards = []
+
+        result = pnc_completion_notice_relay.relay_pending_notices(
+            task_ids=None,
+            send=True,
+            send_func=lambda args: sends.append(args) or "{}",
+            send_card_func=lambda *args, **kwargs: cards.append((args, kwargs)) or {},
+            explicit_completion_delivery=False,
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert result["ok"] is True
+    assert result["candidate_count"] == 0
+    assert sidecar.read_bytes() == before
+    assert sends == []
+    assert cards == []
 
 # ---------------------------------------------------------------------------
 # Regression: G1Q3-RCA honest broadcast redesign (2026-06-22)

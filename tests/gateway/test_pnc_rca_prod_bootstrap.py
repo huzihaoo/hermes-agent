@@ -14,7 +14,7 @@ from gateway import pnc_rca_prod_bootstrap as bootstrap
 
 NOW = datetime(2026, 7, 13, 1, 0, tzinfo=timezone.utc)
 STARTED_AT = NOW - timedelta(hours=1)
-DEADLINE = STARTED_AT + timedelta(days=8)
+DEADLINE = STARTED_AT + timedelta(days=30)
 KEY = "hex:" + ("42" * 32)
 TASK_ID = "g1q3-rca-s1-" + ("b" * 32)
 EPOCH_ID = "rca-bootstrap-release-20260713"
@@ -155,7 +155,7 @@ def test_authorization_is_exact_owner_only_fingerprinted_and_hard_deadlined():
     with pytest.raises(
         bootstrap.RcaBootstrapAuthorizationError, match="deadline_invalid"
     ):
-        raw_authorization(deadline=STARTED_AT + timedelta(days=8, seconds=1))
+        raw_authorization(deadline=STARTED_AT + timedelta(days=30, seconds=1))
 
 
 def test_authorization_expiry_and_epoch_release_bindings_fail_closed():

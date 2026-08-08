@@ -27,7 +27,7 @@ from gateway import pnc_rca_release_authority as release_authority
 
 SCHEMA_VERSION = "pnc_rca_bootstrap_stage_receipt_v1"
 MAX_INPUT_BYTES = 1024 * 1024
-MAX_AUTHORIZATION_DURATION = timedelta(days=8)
+MAX_AUTHORIZATION_DURATION = bootstrap.MAX_EPOCH_DURATION
 RELEASE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
 
 
