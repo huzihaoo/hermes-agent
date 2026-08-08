@@ -205,7 +205,15 @@ def test_approval_waits_for_required_effect_and_surfaces_terminal_failure():
     assert failure["job_status"] == "partial"
 
 
-def test_terminal_failure_surfaces_silent_watch_without_delivery_job():
+@pytest.mark.parametrize(
+    "error_code",
+    [
+        "delivery_lineage_unavailable",
+        "failure_receipt_missing",
+        "rca_work_deadline_exceeded",
+    ],
+)
+def test_terminal_failure_surfaces_silent_watch_without_delivery_job(error_code):
     failure = _terminal_failure(
         {
             **_snapshot(job_status=""),
@@ -213,7 +221,7 @@ def test_terminal_failure_surfaces_silent_watch_without_delivery_job():
             "effects": [],
             "watch_state": "terminal_failed",
             "watch_delivery_id": None,
-            "watch_error_code": "failure_receipt_missing",
+            "watch_error_code": error_code,
         }
     )
 
@@ -222,7 +230,7 @@ def test_terminal_failure_surfaces_silent_watch_without_delivery_job():
         "job_outcome": "",
         "outcome_key": "",
         "terminal_state": "watch_terminal_failed",
-        "terminal_error_code": "failure_receipt_missing",
+        "terminal_error_code": error_code,
         "effects": [],
     }
 
@@ -255,7 +263,12 @@ def test_batch_request_is_operator_issue_only_and_deterministic():
 
 
 @pytest.mark.parametrize(
-    "error_code", ["failure_receipt_missing", "rca_work_deadline_exceeded"]
+    "error_code",
+    [
+        "delivery_lineage_unavailable",
+        "failure_receipt_missing",
+        "rca_work_deadline_exceeded",
+    ],
 )
 def test_silent_terminal_authority_requires_exact_deadline_no_delivery(
     tmp_path, error_code

@@ -376,7 +376,12 @@ def _silent_batch_authority(
 
 
 @pytest.mark.parametrize(
-    "error_code", ["failure_receipt_missing", "rca_work_deadline_exceeded"]
+    "error_code",
+    [
+        "delivery_lineage_unavailable",
+        "failure_receipt_missing",
+        "rca_work_deadline_exceeded",
+    ],
 )
 def test_operator_silent_terminal_rerun_creates_new_generation_without_old_mutation(
     tmp_path, error_code,

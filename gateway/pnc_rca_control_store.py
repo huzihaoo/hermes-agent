@@ -390,7 +390,11 @@ SILENT_TERMINAL_RERUN_AUTHORITY_SCHEMA_VERSION = (
     "pnc_rca_silent_terminal_rerun_authority_v1"
 )
 SILENT_TERMINAL_RERUN_ERROR_CODES = frozenset(
-    {"failure_receipt_missing", "rca_work_deadline_exceeded"}
+    {
+        "delivery_lineage_unavailable",
+        "failure_receipt_missing",
+        "rca_work_deadline_exceeded",
+    }
 )
 SILENT_TERMINAL_RERUN_AUTHORITY_FIELDS = frozenset(
     {
