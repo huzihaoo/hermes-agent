@@ -866,6 +866,12 @@ class ExplicitInitialOffsetListener:
                     )
                 ):
                     raise RuntimeError("activation_start_fence_invalid")
+                if (
+                    activation_t0 is not None
+                    and committed_offset < activation_t0
+                ):
+                    to_seek.append((topic_partition, activation_t0))
+                    continue
                 t0 = (
                     int(activation_t0)
                     if activation_t0 is not None

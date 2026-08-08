@@ -885,6 +885,82 @@ def test_partition_assignment_accepts_current_activation_start_fence_skip(
     assert listener.diagnostics()["callback_errors"] == 0
 
 
+def test_partition_assignment_seeks_activation_fence_when_group_commit_is_older(
+    tmp_path,
+):
+    config = _config(
+        tmp_path,
+        HERMES_RCA_KAFKA_START_OFFSETS_JSON='{"0": 676}',
+    )
+    topic_partition = namedtuple("TopicPartition", "topic partition")
+    partition = topic_partition(TOPIC, 0)
+
+    class ActivationFenceConsumer:
+        def __init__(self):
+            self._coordinator = self
+            self.seeks = []
+
+        async def fetch_committed_offsets_async(self, _partitions, **_kwargs):
+            return {partition: SimpleNamespace(offset=1822)}
+
+        def seek(self, topic_partition, offset):
+            self.seeks.append((topic_partition, offset))
+
+    store = SimpleNamespace(
+        partition_progress=lambda **_kwargs: {0: 1784},
+        activation_partition_start_fence=lambda **_kwargs: {0: 1838},
+    )
+    consumer = ActivationFenceConsumer()
+    listener = consumer_module.ExplicitInitialOffsetListener(
+        consumer, config, store
+    )
+
+    asyncio.run(listener.on_partitions_assigned([partition]))
+
+    assert consumer.seeks == [(partition, 1838)]
+    assert listener.diagnostics()["assigned_partitions"] == [0]
+    assert listener.diagnostics()["callback_errors"] == 0
+    assert listener.diagnostics()["applied_t0_offsets"] == {"0": 1838}
+
+
+def test_partition_assignment_blocks_group_commit_ahead_of_activation_fence(
+    tmp_path,
+):
+    config = _config(
+        tmp_path,
+        HERMES_RCA_KAFKA_START_OFFSETS_JSON='{"0": 676}',
+    )
+    topic_partition = namedtuple("TopicPartition", "topic partition")
+    partition = topic_partition(TOPIC, 0)
+
+    class IncoherentConsumer:
+        def __init__(self):
+            self._coordinator = self
+            self.seeks = []
+
+        async def fetch_committed_offsets_async(self, _partitions, **_kwargs):
+            return {partition: SimpleNamespace(offset=1840)}
+
+        def seek(self, topic_partition, offset):
+            self.seeks.append((topic_partition, offset))
+
+    store = SimpleNamespace(
+        partition_progress=lambda **_kwargs: {0: 1784},
+        activation_partition_start_fence=lambda **_kwargs: {0: 1838},
+    )
+    consumer = IncoherentConsumer()
+    listener = consumer_module.ExplicitInitialOffsetListener(
+        consumer, config, store
+    )
+
+    with pytest.raises(RuntimeError, match="broker_local_offset_incoherent:0"):
+        asyncio.run(listener.on_partitions_assigned([partition]))
+
+    assert consumer.seeks == []
+    assert listener.diagnostics()["callback_errors"] == 1
+    assert listener.diagnostics()["assigned_partitions"] == []
+
+
 def test_partition_assignment_uses_current_activation_start_fence_when_group_missing(
     tmp_path,
 ):
