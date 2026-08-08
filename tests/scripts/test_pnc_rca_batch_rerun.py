@@ -9,6 +9,8 @@ import pytest
 from gateway.pnc_rca_issue_focus import ANALYSIS_INSUFFICIENT_STATEMENT
 from scripts import pnc_rca_batch_rerun as batch_rerun
 from scripts.pnc_rca_batch_rerun import (
+    CONTROL_STORE_SCHEMA_VERSION,
+    DRY_RUN_SCHEMA_VERSION,
     OWNER_RECEIPT_EFFECT_SCOPE,
     OWNER_RECEIPT_NO_OTHER_TASK_BOUNDARY,
     OWNER_RECEIPT_SCHEMA_VERSION,
@@ -495,6 +497,137 @@ def _run_args(tmp_path, queue_path, owner_path):
         poll_seconds=1,
         retry_failed=False,
     )
+
+
+def _write_dry_run_db(tmp_path, *, activation_state="steady_active"):
+    db_path = tmp_path / "control.sqlite3"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE control_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE rca_activation_epochs (
+            epoch_id TEXT PRIMARY KEY,
+            state TEXT NOT NULL,
+            is_current INTEGER NOT NULL
+        );
+        CREATE TABLE business_triggers (
+            work_item_id TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            submission_key TEXT NOT NULL
+        );
+        CREATE TABLE rca_outbox (
+            submission_key TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            status TEXT NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO control_meta(key, value) VALUES('schema_version', ?)",
+        (CONTROL_STORE_SCHEMA_VERSION,),
+    )
+    conn.execute(
+        "INSERT INTO rca_activation_epochs(epoch_id, state, is_current) "
+        "VALUES('rca-activation-test', ?, 1)",
+        (activation_state,),
+    )
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+def test_dry_run_without_owner_receipt_is_read_only_and_not_authorized(
+    tmp_path, monkeypatch
+):
+    queue_path = tmp_path / "queue.json"
+    queue_path.write_text(
+        json.dumps(
+            _queue_value(current_submission_key="", current_generation=0),
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    db_path = _write_dry_run_db(tmp_path)
+    state_path = tmp_path / "state.json"
+    before = db_path.read_bytes()
+    args = _run_args(tmp_path, queue_path, tmp_path / "unused-owner.json")
+    args.control_db = str(db_path)
+    args.owner_receipt = None
+    args.dry_run = True
+    monkeypatch.setattr(
+        batch_rerun, "_runtime_identity", lambda: ("a" * 40, "b" * 40)
+    )
+    monkeypatch.setattr(
+        batch_rerun,
+        "RcaControlStore",
+        lambda _path: pytest.fail("dry-run opened the writable control store"),
+    )
+
+    result = batch_rerun.run(args)
+
+    assert result["schema_version"] == DRY_RUN_SCHEMA_VERSION
+    assert result["mode"] == "dry_run"
+    assert result["execution_authorized"] is False
+    assert result["owner_receipt"] == {
+        "provided": False,
+        "validated": False,
+        "path": "",
+        "sha256": "",
+    }
+    assert result["database"]["activation"]["ready"] is True
+    assert result["database"]["preconditions"]["matched"] == 1
+    assert result["execution_policy"] == {
+        "activation_required": True,
+        "daily_started_attempt_quota": None,
+        "fixed_issue_allowlist": None,
+        "selected_issue_count": 1,
+    }
+    assert result["external_effects_triggered"] is False
+    assert not any(result["production_effects"].values())
+    assert len(result["plan_sha256"]) == 64
+    assert db_path.read_bytes() == before
+    assert state_path.exists() is False
+
+
+def test_dry_run_fails_closed_when_activation_is_not_steady(tmp_path, monkeypatch):
+    queue_path = tmp_path / "queue.json"
+    queue_path.write_text(
+        json.dumps(
+            _queue_value(current_submission_key="", current_generation=0),
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    args = _run_args(tmp_path, queue_path, tmp_path / "unused-owner.json")
+    args.control_db = str(_write_dry_run_db(tmp_path, activation_state="aborted"))
+    args.owner_receipt = None
+    args.dry_run = True
+    monkeypatch.setattr(
+        batch_rerun, "_runtime_identity", lambda: ("a" * 40, "b" * 40)
+    )
+
+    with pytest.raises(BatchRerunError, match="batch_activation_not_ready"):
+        batch_rerun.run(args)
+
+
+def test_live_run_still_requires_owner_receipt(tmp_path, monkeypatch):
+    queue_path = tmp_path / "queue.json"
+    queue_path.write_text(
+        json.dumps(
+            _queue_value(current_submission_key="", current_generation=0),
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    args = _run_args(tmp_path, queue_path, tmp_path / "unused-owner.json")
+    args.owner_receipt = None
+    args.dry_run = False
+    monkeypatch.setattr(
+        batch_rerun, "_runtime_identity", lambda: ("a" * 40, "b" * 40)
+    )
+
+    with pytest.raises(BatchRerunError, match="batch_owner_receipt_required"):
+        batch_rerun.run(args)
 
 
 def _write_run_inputs(tmp_path, queue):

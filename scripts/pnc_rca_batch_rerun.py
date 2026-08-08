@@ -23,6 +23,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from gateway.pnc_rca_control_store import (  # noqa: E402
+    CONTROL_STORE_SCHEMA_VERSION,
     MANUAL_TRIGGER_SCHEMA_VERSION,
     ManualRcaTriggerRequest,
     RcaControlStore,
@@ -37,6 +38,7 @@ from gateway.pnc_rca_issue_focus import (  # noqa: E402
 
 
 SCHEMA_VERSION = "pnc_rca_batch_rerun_state_v4"
+DRY_RUN_SCHEMA_VERSION = "pnc_rca_batch_rerun_dry_run_receipt_v1"
 OWNER_RECEIPT_SCHEMA_VERSION = "pnc_rca_batch_owner_receipt_v2"
 OWNER_RECEIPT_FIELDS = frozenset(
     {
@@ -116,6 +118,15 @@ ISSUE_ID_RE = re.compile(r"^[0-9]{6,24}$")
 BATCH_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$")
 TERMINAL_JOB_STATUSES = frozenset({"delivered", "partial", "quarantined"})
 ACTIVE_EFFECT_STATUSES = frozenset({"pending", "claimed", "retry_wait", "uncertain"})
+DRY_RUN_PRODUCTION_EFFECTS = {
+    "state_write": False,
+    "control_db_write": False,
+    "vm_submit": False,
+    "feishu_issue_comment": False,
+    "feishu_issue_field_update": False,
+    "kafka_consume": False,
+    "resident_restart": False,
+}
 
 
 class BatchRerunError(RuntimeError):
@@ -889,6 +900,182 @@ def _queue_precondition_matches(
     )
 
 
+def _dry_run_database_plan(
+    db_path: Path, queue: Sequence[Mapping[str, Any]]
+) -> dict[str, Any]:
+    """Validate one coherent control-DB snapshot without opening a writer."""
+    selected = db_path.expanduser().absolute()
+    try:
+        observed = selected.lstat()
+    except OSError as exc:
+        raise BatchRerunError("batch_control_db_unavailable") from exc
+    if not stat.S_ISREG(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
+        raise BatchRerunError("batch_control_db_identity_invalid")
+    uri = f"file:{quote(str(selected), safe='/')}?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=10)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA query_only = ON")
+            conn.execute("BEGIN")
+            schema = conn.execute(
+                "SELECT value FROM control_meta WHERE key = 'schema_version'"
+            ).fetchone()
+            if schema is None or str(schema["value"]) != CONTROL_STORE_SCHEMA_VERSION:
+                raise BatchRerunError("batch_control_schema_not_current")
+            quick_check = [
+                str(row[0]) for row in conn.execute("PRAGMA quick_check").fetchall()
+            ]
+            if quick_check != ["ok"]:
+                raise BatchRerunError("batch_control_integrity_invalid")
+            foreign_key_violations = len(
+                conn.execute("PRAGMA foreign_key_check").fetchall()
+            )
+            if foreign_key_violations:
+                raise BatchRerunError("batch_control_foreign_key_invalid")
+            epochs = conn.execute(
+                "SELECT epoch_id, state, is_current "
+                "FROM rca_activation_epochs WHERE is_current = 1"
+            ).fetchall()
+            if len(epochs) != 1 or str(epochs[0]["state"]) != "steady_active":
+                raise BatchRerunError("batch_activation_not_ready")
+
+            preconditions: list[dict[str, Any]] = []
+            for item in queue:
+                issue_id = str(item["issue_id"])
+                trigger = conn.execute(
+                    "SELECT generation, submission_key FROM business_triggers "
+                    "WHERE work_item_id = ? ORDER BY generation DESC LIMIT 1",
+                    (issue_id,),
+                ).fetchone()
+                snapshot = (
+                    None
+                    if trigger is None
+                    else {
+                        "generation": int(trigger["generation"]),
+                        "submission_key": str(trigger["submission_key"]),
+                    }
+                )
+                if not _queue_precondition_matches(item, snapshot):
+                    raise BatchRerunError("batch_issue_generation_drift")
+                outbox_status = ""
+                if trigger is not None:
+                    outboxes = conn.execute(
+                        "SELECT status FROM rca_outbox "
+                        "WHERE submission_key = ? AND generation = ?",
+                        (trigger["submission_key"], trigger["generation"]),
+                    ).fetchall()
+                    if len(outboxes) != 1:
+                        raise BatchRerunError("batch_issue_outbox_binding_invalid")
+                    outbox_status = str(outboxes[0]["status"])
+                preconditions.append(
+                    {
+                        "issue_id": issue_id,
+                        "expected_generation": int(item["queue_generation"]),
+                        "expected_submission_key": str(
+                            item["queue_submission_key"]
+                        ),
+                        "observed_generation": (
+                            int(trigger["generation"]) if trigger is not None else 0
+                        ),
+                        "observed_submission_key": (
+                            str(trigger["submission_key"]) if trigger is not None else ""
+                        ),
+                        "observed_outbox_status": outbox_status,
+                        "matched": True,
+                    }
+                )
+            conn.rollback()
+        finally:
+            conn.close()
+    except BatchRerunError:
+        raise
+    except sqlite3.Error as exc:
+        raise BatchRerunError("batch_control_db_invalid") from exc
+    try:
+        final = selected.lstat()
+    except OSError as exc:
+        raise BatchRerunError("batch_control_db_identity_changed") from exc
+    if (final.st_dev, final.st_ino) != (observed.st_dev, observed.st_ino):
+        raise BatchRerunError("batch_control_db_identity_changed")
+    preconditions_sha256 = _sha256_bytes(
+        _canonical_json(preconditions).encode("utf-8")
+    )
+    return {
+        "path": str(selected),
+        "schema_version": CONTROL_STORE_SCHEMA_VERSION,
+        "quick_check": "ok",
+        "foreign_key_violations": 0,
+        "activation": {
+            "epoch_id": str(epochs[0]["epoch_id"]),
+            "state": "steady_active",
+            "is_current": True,
+            "ready": True,
+        },
+        "preconditions": {
+            "matched": len(preconditions),
+            "total": len(queue),
+            "sha256": preconditions_sha256,
+            "items": preconditions,
+        },
+    }
+
+
+def _dry_run_plan(
+    *,
+    batch_id: str,
+    queue: Sequence[Mapping[str, Any]],
+    queue_sha256: str,
+    runtime_commit: str,
+    runtime_tree: str,
+    owner_receipt_path: str,
+    owner_receipt_sha256: str,
+    database: Mapping[str, Any],
+) -> dict[str, Any]:
+    issue_ids = sorted(str(item["issue_id"]) for item in queue)
+    material = {
+        "schema_version": DRY_RUN_SCHEMA_VERSION,
+        "mode": "dry_run",
+        "batch_id": batch_id,
+        "queue_sha256": queue_sha256,
+        "scope": {
+            **QUEUE_SCOPE,
+            "issue_count": len(issue_ids),
+            "issue_ids_sha256": _sha256_bytes(
+                ("\n".join(issue_ids) + "\n").encode("utf-8")
+            ),
+        },
+        "execution_policy": {
+            "activation_required": QUEUE_AUTHORITY_FLAGS["activation_required"],
+            "daily_started_attempt_quota": QUEUE_AUTHORITY_FLAGS[
+                "daily_started_attempt_quota"
+            ],
+            "fixed_issue_allowlist": None,
+            "selected_issue_count": len(issue_ids),
+        },
+        "runtime": {
+            "commit": runtime_commit,
+            "tree": runtime_tree,
+            "clean": True,
+        },
+        "owner_receipt": {
+            "provided": bool(owner_receipt_path),
+            "validated": bool(owner_receipt_path),
+            "path": owner_receipt_path,
+            "sha256": owner_receipt_sha256,
+        },
+        "execution_authorized": bool(owner_receipt_path),
+        "database": dict(database),
+        "production_effects": dict(DRY_RUN_PRODUCTION_EFFECTS),
+        "external_effects_triggered": False,
+    }
+    return {
+        **material,
+        "ok": True,
+        "plan_sha256": _sha256_bytes(_canonical_json(material).encode("utf-8")),
+    }
+
+
 def _refresh_authorities(
     *,
     snapshot: Mapping[str, Any],
@@ -937,15 +1124,34 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise BatchRerunError("batch_runtime_commit_mismatch")
     queue, queue_sha = _load_queue(Path(args.queue), expected_batch_id=batch_id)
     selected_issue_ids = sorted(str(item["issue_id"]) for item in queue)
-    owner_receipt_path, owner_receipt_sha256 = _owner_receipt_binding(
-        Path(args.owner_receipt),
-        expected_batch_id=batch_id,
-        expected_queue_sha256=queue_sha,
-        expected_issue_ids=selected_issue_ids,
-        expected_requester_id=args.requester_id,
-        expected_runtime_commit=runtime_commit,
-        expected_runtime_tree=runtime_tree,
-    )
+    dry_run = bool(getattr(args, "dry_run", False))
+    owner_receipt_arg = str(getattr(args, "owner_receipt", "") or "").strip()
+    if not dry_run and not owner_receipt_arg:
+        raise BatchRerunError("batch_owner_receipt_required")
+    owner_receipt_path = ""
+    owner_receipt_sha256 = ""
+    if owner_receipt_arg:
+        owner_receipt_path, owner_receipt_sha256 = _owner_receipt_binding(
+            Path(owner_receipt_arg),
+            expected_batch_id=batch_id,
+            expected_queue_sha256=queue_sha,
+            expected_issue_ids=selected_issue_ids,
+            expected_requester_id=args.requester_id,
+            expected_runtime_commit=runtime_commit,
+            expected_runtime_tree=runtime_tree,
+        )
+    if dry_run:
+        database = _dry_run_database_plan(Path(args.control_db), queue)
+        return _dry_run_plan(
+            batch_id=batch_id,
+            queue=queue,
+            queue_sha256=queue_sha,
+            runtime_commit=runtime_commit,
+            runtime_tree=runtime_tree,
+            owner_receipt_path=owner_receipt_path,
+            owner_receipt_sha256=owner_receipt_sha256,
+            database=database,
+        )
     state_path = Path(args.state)
     state = _load_or_create_state(
         state_path,
@@ -1139,11 +1345,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-id", required=True)
     parser.add_argument("--expected-runtime-commit", required=True)
     parser.add_argument("--expected-runtime-tree", required=True)
-    parser.add_argument("--owner-receipt", required=True)
+    parser.add_argument("--owner-receipt")
     parser.add_argument("--requester-id", default="automation:rca-batch-rerun")
     parser.add_argument("--poll-seconds", type=int, default=5)
     parser.add_argument("--item-timeout-seconds", type=int, default=7200)
     parser.add_argument("--retry-failed", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
     return parser
 
 
