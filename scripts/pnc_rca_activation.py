@@ -687,7 +687,11 @@ def _normalize_canary_slot_plan(value: Any) -> dict[str, dict[str, Any]]:
                 raise ActivationCliError("activation_canary_slot_plan_invalid")
         else:
             source_identity = _normalize_manual_identity(raw_identity)
-            if source_identity.get("mode") != "run_or_join":
+            if source_identity["mode"] != "run_or_join" and not (
+                source_identity["mode"] == "rerun"
+                and source_identity["chat_id"] == "operator"
+                and source_identity["thread_id"] == "operator:issue-only"
+            ):
                 raise ActivationCliError("activation_canary_slot_plan_invalid")
         source_sha256 = _normalized_sha256(
             str(raw_slot.get("source_identity_sha256") or ""),

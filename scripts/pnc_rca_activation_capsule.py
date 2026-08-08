@@ -1271,7 +1271,14 @@ def _normalize_canary_slot_plan(value: Any) -> dict[str, dict[str, Any]]:
                 not str(identity["requester_id"]).startswith("ou_")
                 or _ISSUE_URL_RE.fullmatch(str(identity["issue_url"]).rstrip("/"))
                 is None
-                or identity["mode"] != "run_or_join"
+                or (
+                    identity["mode"] != "run_or_join"
+                    and not (
+                        identity["mode"] == "rerun"
+                        and identity["chat_id"] == "operator"
+                        and identity["thread_id"] == "operator:issue-only"
+                    )
+                )
             ):
                 raise CapsuleError("activation_capsule_canary_plan_invalid")
         canonical_identity = dict(identity)

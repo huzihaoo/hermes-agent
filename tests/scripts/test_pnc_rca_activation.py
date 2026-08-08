@@ -191,6 +191,54 @@ def _preproduction_input(epoch_id: str = EPOCH_ID) -> dict[str, Any]:
     }
 
 
+def test_canary_slot_plan_accepts_operator_issue_only_rerun() -> None:
+    plan = _canary_slot_plan()
+    identity = {
+        **plan["manual_success"]["source_identity"],
+        "chat_id": "operator",
+        "thread_id": "operator:issue-only",
+        "mode": "rerun",
+    }
+    plan["manual_success"]["source_identity"] = identity
+    plan["manual_success"]["source_identity_sha256"] = (
+        activation_module._sha256_json(identity)
+    )
+
+    normalized = activation_module._normalize_canary_slot_plan(plan)
+
+    assert normalized["manual_success"]["source_identity"] == identity
+
+
+@pytest.mark.parametrize(
+    ("chat_id", "thread_id", "mode"),
+    [
+        ("oc_activation_test", "operator:issue-only", "rerun"),
+        ("operator", "topic:om-success", "rerun"),
+        ("operator", "operator:issue-only", "debug"),
+    ],
+)
+def test_canary_slot_plan_rejects_non_operator_rerun_and_debug(
+    chat_id: str, thread_id: str, mode: str
+) -> None:
+    plan = _canary_slot_plan()
+    identity = {
+        **plan["manual_success"]["source_identity"],
+        "chat_id": chat_id,
+        "thread_id": thread_id,
+        "mode": mode,
+    }
+    plan["manual_success"]["source_identity"] = identity
+    plan["manual_success"]["source_identity_sha256"] = (
+        activation_module._sha256_json(identity)
+    )
+
+    with pytest.raises(
+        activation_module.ActivationCliError,
+        match="activation_canary_slot_plan_invalid",
+    ):
+        activation_module._normalize_canary_slot_plan(plan)
+
+
 @pytest.fixture(autouse=True)
 def _canonical_activation_capsule_readers(monkeypatch):
     def read(path: Path, **_kwargs: Any) -> dict[str, Any]:
