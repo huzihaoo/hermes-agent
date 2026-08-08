@@ -13,6 +13,7 @@ import pytest
 from gateway import pnc_rca_delivery_store as delivery_store_module
 from gateway.pnc_rca_delivery_quarantine_baseline import (
     APPROVAL_SCHEMA_VERSION,
+    DEFERRED_CORE_SCHEMA_VERSION,
     DeliveryQuarantineBaselineError,
     _db_identity_matches_baseline,
     build_quarantine_core,
@@ -340,6 +341,22 @@ def _seed_quarantine(root: Path) -> tuple[RcaDeliveryStore, str]:
             ((NOW + timedelta(seconds=1)).isoformat(), effect.effect_key),
         )
     return store, effect.effect_key
+
+
+def _mark_issue_comment_activation_deferred(
+    store: RcaDeliveryStore, *, reason: str = "activation_epoch_deferred"
+) -> None:
+    with sqlite3.connect(store.db_path) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE rca_delivery_subscriptions
+               SET status = 'quarantined', reason = ?, source_id = NULL,
+                   delivery_id = NULL, effect_key = NULL, updated_at = ?
+             WHERE effect_kind = 'feishu_issue_comment'
+            """,
+            (reason, (NOW + timedelta(seconds=1)).isoformat()),
+        )
+        assert cursor.rowcount == 1
 
 
 def _seed_manual_dual_effect_quarantine(
@@ -2145,8 +2162,12 @@ def test_successor_preactivation_baseline_validates_before_and_after_successor_c
     assert after["quarantine_core_sha256"] == core["core_sha256"]
 
 
-def _build_bundle(root: Path) -> dict:
+def _build_bundle(
+    root: Path, *, with_activation_deferred_issue_comment: bool = False
+) -> dict:
     store, effect_key = _seed_quarantine(root)
+    if with_activation_deferred_issue_comment:
+        _mark_issue_comment_activation_deferred(store)
     rows_before = _rows(store)
     core, receipt, migration = _build_core(store, effect_key, root)
     assert "owner_attestation" not in core
@@ -2315,6 +2336,48 @@ def test_exact_approved_baseline_acknowledges_lifetime_without_db_writes(tmp_pat
         store.backpressure_snapshot(now=NOW + timedelta(seconds=5)).public_dict()
         == before_backpressure
     )
+
+
+def test_activation_deferred_issue_comment_is_explicitly_adjudicated(tmp_path):
+    bundle = _build_bundle(
+        tmp_path, with_activation_deferred_issue_comment=True
+    )
+
+    core = bundle["core"]
+    assert core["schema_version"] == DEFERRED_CORE_SCHEMA_VERSION
+    assert core["invalid_manual_thread_adjudication"]["count"] == 1
+    assert core["activation_deferred_issue_comment_adjudication"] == {
+        "effect_kind": "feishu_issue_comment",
+        "reason_code": "activation_epoch_deferred",
+        "technical_finding": "deferred_before_delivery_materialization",
+        "proposed_disposition": "retain_terminal_for_fresh_rerun",
+        "required": True,
+        "source_id": None,
+        "delivery_id": None,
+        "effect_key": None,
+        "delivery_job_present": False,
+        "delivery_effect_present": False,
+        "count": 1,
+        "analyzed_by": "forensic-operator",
+        "analyzed_at": (NOW + timedelta(seconds=2)).isoformat(),
+        "reason": "exact historical terminal rows and settlement evidence",
+    }
+    health = _health(bundle)
+    assert health["business_ready"] is True
+    assert health["delivery_quarantine"]["acknowledged"]["subscriptions"] == 2
+
+
+def test_unrecognized_quarantined_issue_comment_still_fails_closed(tmp_path):
+    store, effect_key = _seed_quarantine(tmp_path)
+    _mark_issue_comment_activation_deferred(
+        store, reason="activation_epoch_deferred_unproven"
+    )
+
+    with pytest.raises(
+        DeliveryQuarantineBaselineError,
+        match="delivery_quarantine_baseline_manual_thread_adjudication_invalid",
+    ):
+        _build_core(store, effect_key, tmp_path)
 
 
 def test_offline_preapproval_core_exactly_matches_post_migration_live_core(tmp_path):

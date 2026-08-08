@@ -34,6 +34,7 @@ from gateway.pnc_rca_prod_bootstrap import (
 
 
 CORE_SCHEMA_VERSION = "pnc_rca_delivery_quarantine_core_v1"
+DEFERRED_CORE_SCHEMA_VERSION = "pnc_rca_delivery_quarantine_core_v2"
 RELEASE_MANIFEST_SCHEMA_VERSION = "pnc_rca_release_prepare_manifest_v1"
 APPROVAL_SCHEMA_VERSION = "pnc_rca_release_approval_v1"
 BASELINE_SCHEMA_VERSION = "pnc_rca_delivery_quarantine_baseline_v1"
@@ -83,6 +84,8 @@ _CORE_FIELDS = frozenset({
     "issuance_policy",
     "core_sha256",
 })
+_DEFERRED_ADJUDICATION_FIELD = "activation_deferred_issue_comment_adjudication"
+_DEFERRED_CORE_FIELDS = _CORE_FIELDS | frozenset({_DEFERRED_ADJUDICATION_FIELD})
 _MIGRATION_BINDING_FIELDS = frozenset({
     "receipt_path",
     "receipt_sha256",
@@ -113,6 +116,22 @@ _ADJUDICATION_FIELDS = frozenset({
     "required",
     "source_kind",
     "source_mode",
+    "count",
+    "analyzed_by",
+    "analyzed_at",
+    "reason",
+})
+_DEFERRED_ADJUDICATION_FIELDS = frozenset({
+    "effect_kind",
+    "reason_code",
+    "technical_finding",
+    "proposed_disposition",
+    "required",
+    "source_id",
+    "delivery_id",
+    "effect_key",
+    "delivery_job_present",
+    "delivery_effect_present",
     "count",
     "analyzed_by",
     "analyzed_at",
@@ -742,16 +761,23 @@ def _quarantine_lifetime_counts(
     return counts
 
 
-def _invalid_manual_thread_projection(conn: sqlite3.Connection) -> dict[str, int]:
+def _quarantined_subscription_projection(
+    conn: sqlite3.Connection,
+) -> dict[str, int]:
     total = 0
     invalid = 0
+    deferred = 0
     rows = conn.execute(
         """
         SELECT subscription.*, job.project_key, job.work_item_type_key,
-               job.work_item_id, source.source_kind, source.mode
+               job.work_item_id, job.delivery_id AS joined_delivery_id,
+               effect.effect_key AS joined_effect_key,
+               source.source_kind, source.mode
           FROM rca_delivery_subscriptions AS subscription
           LEFT JOIN rca_delivery_jobs AS job
             ON job.delivery_id = subscription.delivery_id
+          LEFT JOIN rca_delivery_effects AS effect
+            ON effect.effect_key = subscription.effect_key
           LEFT JOIN rca_trigger_sources AS source
             ON source.source_id = subscription.source_id
          WHERE subscription.status = 'quarantined'
@@ -760,6 +786,18 @@ def _invalid_manual_thread_projection(conn: sqlite3.Connection) -> dict[str, int
     ).fetchall()
     for row in rows:
         total += 1
+        if (
+            int(row["required"]) == 1
+            and str(row["effect_kind"]) == "feishu_issue_comment"
+            and str(row["reason"] or "") == "activation_epoch_deferred"
+            and row["source_id"] is None
+            and row["delivery_id"] is None
+            and row["effect_key"] is None
+            and row["joined_delivery_id"] is None
+            and row["joined_effect_key"] is None
+        ):
+            deferred += 1
+            continue
         if (
             int(row["required"]) != 1
             or str(row["effect_kind"]) != DELIVERY_THREAD_EFFECT_KIND
@@ -783,7 +821,12 @@ def _invalid_manual_thread_projection(conn: sqlite3.Connection) -> dict[str, int
         except DeliveryContractError as exc:
             if exc.code == "delivery_subscription_target_invalid":
                 invalid += 1
-    return {"total": total, "invalid_manual_thread": invalid}
+    return {
+        "total": total,
+        "invalid_manual_thread": invalid,
+        "activation_deferred_issue_comment": deferred,
+        "unrecognized": total - invalid - deferred,
+    }
 
 
 def _audit_text(actor: Any, reason: Any) -> tuple[str, str]:
@@ -1372,14 +1415,25 @@ def _validate_core(
     identity_db_path: str | Path | None = None,
     require_post_migration_match: bool = False,
 ) -> dict[str, Any]:
-    if not isinstance(value, Mapping) or set(value) != _CORE_FIELDS:
+    if not isinstance(value, Mapping):
+        raise DeliveryQuarantineBaselineError("delivery_quarantine_core_schema_invalid")
+    schema_version = value.get("schema_version")
+    expected_fields = (
+        _CORE_FIELDS
+        if schema_version == CORE_SCHEMA_VERSION
+        else (
+            _DEFERRED_CORE_FIELDS
+            if schema_version == DEFERRED_CORE_SCHEMA_VERSION
+            else None
+        )
+    )
+    if expected_fields is None or set(value) != expected_fields:
         raise DeliveryQuarantineBaselineError("delivery_quarantine_core_schema_invalid")
     release_id = str(value.get("release_id") or "").strip()
     core_sha256 = str(value.get("core_sha256") or "").strip().lower()
     body = {key: item for key, item in value.items() if key != "core_sha256"}
     if (
-        value.get("schema_version") != CORE_SCHEMA_VERSION
-        or _IDENTIFIER_RE.fullmatch(release_id) is None
+        _IDENTIFIER_RE.fullmatch(release_id) is None
         or _HEX64_RE.fullmatch(core_sha256) is None
         or core_sha256 != hashlib.sha256(_canonical_bytes(body)).hexdigest()
     ):
@@ -1436,7 +1490,7 @@ def _validate_core(
         raise DeliveryQuarantineBaselineError(
             "delivery_quarantine_effect_settlement_mismatch"
         )
-    projection = _invalid_manual_thread_projection(conn)
+    projection = _quarantined_subscription_projection(conn)
     adjudication = value.get("invalid_manual_thread_adjudication")
     if (
         not isinstance(adjudication, Mapping)
@@ -1450,13 +1504,49 @@ def _validate_core(
         or adjudication.get("source_mode") != "rerun"
         or isinstance(adjudication.get("count"), bool)
         or adjudication.get("count") != projection["invalid_manual_thread"]
-        or projection["invalid_manual_thread"] != projection["total"]
+        or projection["unrecognized"] != 0
         or str(adjudication.get("analyzed_at") or "") != _iso(snapshot_at)
     ):
         raise DeliveryQuarantineBaselineError(
             "delivery_quarantine_baseline_manual_thread_adjudication_invalid"
         )
     _audit_text(adjudication.get("analyzed_by"), adjudication.get("reason"))
+    deferred_count = projection["activation_deferred_issue_comment"]
+    deferred_adjudication = value.get(_DEFERRED_ADJUDICATION_FIELD)
+    if schema_version == CORE_SCHEMA_VERSION:
+        if deferred_count != 0:
+            raise DeliveryQuarantineBaselineError(
+                "delivery_quarantine_baseline_deferred_issue_adjudication_invalid"
+            )
+    elif (
+        deferred_count <= 0
+        or not isinstance(deferred_adjudication, Mapping)
+        or set(deferred_adjudication) != _DEFERRED_ADJUDICATION_FIELDS
+        or deferred_adjudication.get("effect_kind") != "feishu_issue_comment"
+        or deferred_adjudication.get("reason_code") != "activation_epoch_deferred"
+        or deferred_adjudication.get("technical_finding")
+        != "deferred_before_delivery_materialization"
+        or deferred_adjudication.get("proposed_disposition")
+        != "retain_terminal_for_fresh_rerun"
+        or deferred_adjudication.get("required") is not True
+        or deferred_adjudication.get("source_id") is not None
+        or deferred_adjudication.get("delivery_id") is not None
+        or deferred_adjudication.get("effect_key") is not None
+        or deferred_adjudication.get("delivery_job_present") is not False
+        or deferred_adjudication.get("delivery_effect_present") is not False
+        or isinstance(deferred_adjudication.get("count"), bool)
+        or deferred_adjudication.get("count") != deferred_count
+        or str(deferred_adjudication.get("analyzed_at") or "")
+        != _iso(snapshot_at)
+    ):
+        raise DeliveryQuarantineBaselineError(
+            "delivery_quarantine_baseline_deferred_issue_adjudication_invalid"
+        )
+    if schema_version == DEFERRED_CORE_SCHEMA_VERSION:
+        _audit_text(
+            deferred_adjudication.get("analyzed_by"),
+            deferred_adjudication.get("reason"),
+        )
     if value.get("issuance_policy") != _ISSUANCE_POLICY:
         raise DeliveryQuarantineBaselineError(
             "delivery_quarantine_core_issuance_policy_invalid"
@@ -1991,16 +2081,21 @@ def _build_quarantine_core(
         effect_settlement = _effect_settlement_projection(
             conn, receipt_claims["effect_keys"]
         )
-        projection = _invalid_manual_thread_projection(conn)
-        if projection["invalid_manual_thread"] != projection["total"]:
+        projection = _quarantined_subscription_projection(conn)
+        if projection["unrecognized"] != 0:
             raise DeliveryQuarantineBaselineError(
                 "delivery_quarantine_baseline_manual_thread_adjudication_invalid"
             )
         control_db = _db_identity(conn, target_path)
         if project_empty_activation_binding:
             control_db = _project_preactivation_db_identity(control_db)
+        deferred_count = projection["activation_deferred_issue_comment"]
         body = {
-            "schema_version": CORE_SCHEMA_VERSION,
+            "schema_version": (
+                DEFERRED_CORE_SCHEMA_VERSION
+                if deferred_count
+                else CORE_SCHEMA_VERSION
+            ),
             "release_id": normalized_release_id,
             "snapshot_at": observed_at,
             "control_db": control_db,
@@ -2024,6 +2119,23 @@ def _build_quarantine_core(
             },
             "issuance_policy": dict(_ISSUANCE_POLICY),
         }
+        if deferred_count:
+            body[_DEFERRED_ADJUDICATION_FIELD] = {
+                "effect_kind": "feishu_issue_comment",
+                "reason_code": "activation_epoch_deferred",
+                "technical_finding": "deferred_before_delivery_materialization",
+                "proposed_disposition": "retain_terminal_for_fresh_rerun",
+                "required": True,
+                "source_id": None,
+                "delivery_id": None,
+                "effect_key": None,
+                "delivery_job_present": False,
+                "delivery_effect_present": False,
+                "count": deferred_count,
+                "analyzed_by": analyst,
+                "analyzed_at": observed_at,
+                "reason": justification,
+            }
         core = {
             **body,
             "core_sha256": hashlib.sha256(_canonical_bytes(body)).hexdigest(),
