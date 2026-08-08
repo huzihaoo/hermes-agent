@@ -1014,7 +1014,35 @@ def _direct_steady(
     if binding["epoch_id"] != epoch_id:
         raise ActivationCliError("activation_direct_binding_epoch_mismatch")
 
+    predecessor_values = (
+        str(args.expected_predecessor_epoch_id or "").strip(),
+        str(args.expected_predecessor_state or "").strip(),
+        str(args.expected_predecessor_binding_fingerprint or "").strip().lower(),
+    )
+    if any(predecessor_values) and not all(predecessor_values):
+        raise ActivationCliError("activation_predecessor_binding_incomplete")
+    (
+        expected_predecessor_epoch_id,
+        expected_predecessor_state,
+        expected_predecessor_fingerprint,
+    ) = predecessor_values
+    if expected_predecessor_epoch_id:
+        expected_predecessor_epoch_id = _normalized_epoch_id(
+            expected_predecessor_epoch_id
+        )
+        if expected_predecessor_state not in {"aborted", "steady_active"}:
+            raise ActivationCliError("activation_predecessor_state_invalid")
+        expected_predecessor_fingerprint = _normalized_sha256(
+            expected_predecessor_fingerprint,
+            "predecessor_binding_fingerprint",
+        )
+
     current = store.activation_epoch()
+    predecessor_inflight = {
+        "dispatchable_outbox": 0,
+        "execution_delivery": 0,
+        "total": 0,
+    }
     if current is not None:
         current_epoch_id = str(current.get("epoch_id") or "")
         current_state = str(current.get("state") or "")
@@ -1056,12 +1084,33 @@ def _direct_steady(
             # A same-binding retry is a no-op, including when the operator
             # supplies a different audit label on a later invocation.
             would_change = False
-        elif current_state == "aborted":
-            # A different epoch may replace an aborted current pointer.
-            would_change = True
         else:
-            raise ActivationCliError("activation_current_epoch_exists")
+            if current_state not in {"aborted", "steady_active"}:
+                raise ActivationCliError("activation_current_epoch_exists")
+            if current_state == "steady_active" and not expected_predecessor_epoch_id:
+                raise ActivationCliError("activation_current_epoch_exists")
+            if expected_predecessor_epoch_id:
+                predecessor = store.direct_steady_predecessor()
+                if predecessor is None or (
+                    predecessor["epoch_id"] != expected_predecessor_epoch_id
+                    or predecessor["state"] != expected_predecessor_state
+                    or predecessor["binding_fingerprint"]
+                    != expected_predecessor_fingerprint
+                ):
+                    raise ActivationCliError(
+                        "activation_predecessor_binding_changed"
+                    )
+                predecessor_inflight = dict(predecessor["inflight"])
+            if current_state == "steady_active" and predecessor_inflight["total"]:
+                raise ActivationCliError(
+                    "activation_predecessor_inflight_not_drained"
+                )
+            # A different epoch may replace either a retired predecessor or
+            # one exact drained steady predecessor.
+            would_change = True
     else:
+        if expected_predecessor_epoch_id:
+            raise ActivationCliError("activation_predecessor_binding_changed")
         would_change = True
 
     summary = {
@@ -1070,9 +1119,15 @@ def _direct_steady(
         "config_sha256": binding["config_sha256"],
         "db_logical_identity_sha256": binding["db_logical_identity_sha256"],
         "epoch_id": epoch_id,
+        "expected_predecessor_binding_fingerprint": (
+            expected_predecessor_fingerprint
+        ),
+        "expected_predecessor_epoch_id": expected_predecessor_epoch_id,
+        "expected_predecessor_state": expected_predecessor_state,
         "partition_start_fence_sha256": binding[
             "partition_start_fence_sha256"
         ],
+        "predecessor_inflight": predecessor_inflight,
         "release_fingerprint": binding["release_fingerprint"],
         "release_binding_sha256": binding[
             "release_binding_sha256"
@@ -1090,6 +1145,11 @@ def _direct_steady(
         partition_start_fence=binding["partition_start_fence"],
         operator=operator,
         reason=reason,
+        expected_predecessor_epoch_id=expected_predecessor_epoch_id,
+        expected_predecessor_state=expected_predecessor_state,
+        expected_predecessor_binding_fingerprint=(
+            expected_predecessor_fingerprint
+        ),
     )
     return _applied(
         "direct-steady",
@@ -1097,6 +1157,12 @@ def _direct_steady(
             "activation_mode": "direct_steady",
             "changed": would_change,
             "current_epoch": result,
+            "expected_predecessor_binding_fingerprint": (
+                expected_predecessor_fingerprint
+            ),
+            "expected_predecessor_epoch_id": expected_predecessor_epoch_id,
+            "expected_predecessor_state": expected_predecessor_state,
+            "predecessor_inflight": predecessor_inflight,
             **_audit_hashes(operator, reason),
         },
     )
@@ -2313,6 +2379,16 @@ def _build_parser() -> argparse.ArgumentParser:
     direct_steady = commands.add_parser("direct-steady")
     _add_mutation_arguments(direct_steady)
     direct_steady.add_argument("--direct-binding", type=Path, required=True)
+    direct_steady.add_argument("--expected-predecessor-epoch-id", default="")
+    direct_steady.add_argument(
+        "--expected-predecessor-state",
+        choices=("aborted", "steady_active"),
+        default="",
+    )
+    direct_steady.add_argument(
+        "--expected-predecessor-binding-fingerprint",
+        default="",
+    )
 
     abort = commands.add_parser("abort")
     _add_mutation_arguments(abort)

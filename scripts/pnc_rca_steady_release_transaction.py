@@ -62,6 +62,8 @@ PROFILE_ACTIVATION_FIELDS = frozenset(
 SUCCESSOR_PREDECESSOR_ABORT_STATES = frozenset(
     {"safe_off", "preauthorized", "bounded_active", "confirmed", "steady_active"}
 )
+RECORD_ONLY_PREDECESSOR_STATES = frozenset({"aborted", "steady_active"})
+STEADY_PREDECESSOR_FROM_STATES = frozenset({"confirmed", "direct_release"})
 SAFE_OFF_ABORT_FORBIDDEN_FIELDS = (
     "preproduction_fingerprint",
     "preproduction_gate_receipt_sha256",
@@ -297,23 +299,49 @@ def _read_activation_binding(control_db: Path) -> dict[str, Any]:
                 _fail("pnc_steady_release_transaction_activation_not_current")
             epoch = epochs[0]
             epoch_id = str(epoch["epoch_id"] or "")
+            state = str(epoch["state"] or "")
             if (
                 IDENTIFIER_RE.fullmatch(epoch_id) is None
-                or str(epoch["state"] or "") != "aborted"
+                or state not in RECORD_ONLY_PREDECESSOR_STATES
             ):
                 _fail("pnc_steady_release_transaction_activation_not_aborted")
-            audits = connection.execute(
-                """
-                SELECT audit_id, from_state, to_state, binding_fingerprint,
-                       transitioned_at
-                  FROM rca_activation_transition_audit
-                 WHERE epoch_id = ? AND to_state = 'aborted'
-              ORDER BY audit_id
-                """,
-                (epoch_id,),
-            ).fetchall()
-            if len(audits) != 1 or str(audits[0]["from_state"]) not in SUCCESSOR_PREDECESSOR_ABORT_STATES:
-                _fail("pnc_steady_release_transaction_activation_audit_invalid")
+            if state == "aborted":
+                audits = connection.execute(
+                    """
+                    SELECT audit_id, from_state, to_state, binding_fingerprint,
+                           transitioned_at
+                      FROM rca_activation_transition_audit
+                     WHERE epoch_id = ? AND to_state = 'aborted'
+                  ORDER BY audit_id
+                    """,
+                    (epoch_id,),
+                ).fetchall()
+                if (
+                    len(audits) != 1
+                    or str(audits[0]["from_state"])
+                    not in SUCCESSOR_PREDECESSOR_ABORT_STATES
+                ):
+                    _fail("pnc_steady_release_transaction_activation_audit_invalid")
+                audit = audits[0]
+            else:
+                audit = connection.execute(
+                    """
+                    SELECT audit_id, from_state, to_state, binding_fingerprint,
+                           transitioned_at
+                      FROM rca_activation_transition_audit
+                     WHERE epoch_id = ?
+                  ORDER BY audit_id DESC
+                     LIMIT 1
+                    """,
+                    (epoch_id,),
+                ).fetchone()
+                if (
+                    audit is None
+                    or str(audit["to_state"] or "") != "steady_active"
+                    or str(audit["from_state"] or "")
+                    not in STEADY_PREDECESSOR_FROM_STATES
+                ):
+                    _fail("pnc_steady_release_transaction_activation_audit_invalid")
             slots = [
                 {
                     "authorized_identity_sha256": str(
@@ -338,7 +366,6 @@ def _read_activation_binding(control_db: Path) -> dict[str, Any]:
                     (epoch_id,),
                 ).fetchall()
             ]
-            audit = audits[0]
             if str(audit["from_state"]) == "safe_off" and (
                 any(str(epoch[field] or "") for field in SAFE_OFF_ABORT_FORBIDDEN_FIELDS)
                 or any(
@@ -364,7 +391,7 @@ def _read_activation_binding(control_db: Path) -> dict[str, Any]:
                 )
             return {
                 "epoch_id": epoch_id,
-                "state": "aborted",
+                "state": state,
                 "binding_fingerprint": observed,
                 "transition_audit_id": int(audit["audit_id"]),
                 "transitioned_at": str(audit["transitioned_at"]),
@@ -441,7 +468,8 @@ def _validate_profile(
         or set(activation) != PROFILE_ACTIVATION_FIELDS
         or activation.get("predecessor_epoch_id")
         != expected_activation["predecessor_epoch_id"]
-        or activation.get("predecessor_state") != "aborted"
+        or activation.get("predecessor_state")
+        != expected_activation["predecessor_state"]
         or activation.get("predecessor_binding_fingerprint")
         != expected_activation["predecessor_binding_fingerprint"]
         or IDENTIFIER_RE.fullmatch(str(activation.get("successor_epoch_id") or ""))
@@ -1055,7 +1083,8 @@ def _validate_plan(plan: Mapping[str, Any]) -> None:
         or HEX64_RE.fullmatch(str(plan.get("authority_sha256") or "")) is None
         or not isinstance(plan.get("activation_binding"), Mapping)
         or set(plan["activation_binding"]) != ACTIVATION_BINDING_FIELDS
-        or plan["activation_binding"].get("state") != "aborted"
+        or plan["activation_binding"].get("state")
+        not in RECORD_ONLY_PREDECESSOR_STATES
         or HEX64_RE.fullmatch(
             str(plan["activation_binding"].get("binding_fingerprint") or "")
         )
@@ -1767,8 +1796,8 @@ def rollback_transaction(receipt_path: Path, *, output_path: Path) -> dict[str, 
             or locked_plan != plan
         ):
             _fail("pnc_steady_release_transaction_receipt_binding_invalid")
-        # A filesystem rollback is only safe while the exact aborted
-        # predecessor remains current.  Never restore over a newer epoch.
+        # Filesystem rollback is safe only while the exact predecessor bound
+        # by the record-only install remains current.
         if _read_activation_binding(Path(plan["control_db"])) != dict(
             plan["activation_binding"]
         ):

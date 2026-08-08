@@ -11,6 +11,7 @@ import subprocess
 import pytest
 
 from gateway import pnc_rca_delivery_quarantine_baseline as quarantine_baseline
+from gateway.pnc_rca_control_store import RcaControlStore
 from tests.scripts.test_pnc_rca_release_transaction import (
     _fixture,
     _json_bytes,
@@ -25,7 +26,10 @@ INVENTORY_PIN = "9" * 64
 
 
 def _install_activation_fixture(
-    args: dict, *, predecessor_from_state: str = "steady_active"
+    args: dict,
+    *,
+    predecessor_from_state: str = "steady_active",
+    current_state: str = "aborted",
 ) -> None:
     connection = sqlite3.connect(args["control_db"])
     connection.executescript(
@@ -82,7 +86,7 @@ def _install_activation_fixture(
     )
     epoch = {
         "epoch_id": "rca-old-epoch",
-        "state": "aborted",
+        "state": current_state,
         "is_current": 1,
         "preauthorization_fingerprint": "1" * 64,
         "preauthorization_gate_receipt_sha256": "2" * 64,
@@ -104,7 +108,9 @@ def _install_activation_fixture(
         "bounded_activated_at": "",
         "confirmed_at": "",
         "steady_activated_at": "",
-        "aborted_at": "2026-08-07T00:00:00+00:00",
+        "aborted_at": (
+            "2026-08-07T00:00:00+00:00" if current_state == "aborted" else None
+        ),
         "superseded_at": None,
     }
     slots = [
@@ -125,11 +131,28 @@ def _install_activation_fixture(
             "preproduction_capsule_sha256",
         ):
             epoch[field] = None
+    audit_from_state = predecessor_from_state
+    audit_to_state = "aborted"
+    if current_state == "steady_active":
+        slots = []
+        audit_from_state = "direct_release"
+        audit_to_state = "steady_active"
+        epoch["partition_end_fence_json"] = epoch["partition_start_fence_json"]
+        epoch["partition_end_fence_sha256"] = epoch[
+            "partition_start_fence_sha256"
+        ]
+        epoch["production_fingerprint"] = epoch[
+            "preauthorization_fingerprint"
+        ]
+        epoch["production_gate_receipt_sha256"] = epoch[
+            "preauthorization_gate_receipt_sha256"
+        ]
+        epoch["steady_activated_at"] = "2026-08-07T00:00:00+00:00"
     material = transaction._activation_fingerprint_material(
         epoch,
         slot_bindings=slots,
-        from_state=predecessor_from_state,
-        to_state="aborted",
+        from_state=audit_from_state,
+        to_state=audit_to_state,
     )
     fingerprint = transaction._canonical_sha256(material)
     columns = ",".join(epoch)
@@ -166,8 +189,8 @@ def _install_activation_fixture(
         """,
         (
             epoch["epoch_id"],
-            predecessor_from_state,
-            "aborted",
+            audit_from_state,
+            audit_to_state,
             "owner",
             "test abort",
             fingerprint,
@@ -178,8 +201,13 @@ def _install_activation_fixture(
     connection.close()
 
 
-def _prepare_candidate(args: dict, monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_activation_fixture(args)
+def _prepare_candidate(
+    args: dict,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    current_state: str = "aborted",
+) -> None:
+    _install_activation_fixture(args, current_state=current_state)
     # The candidate's baseline file is intentionally a test stub; the focused
     # transaction tests replace the expensive DB projection with a read-only receipt.
     baseline_path = args["candidate_root"] / "baseline.json"
@@ -237,6 +265,7 @@ def _prepare_candidate(args: dict, monkeypatch: pytest.MonkeyPatch) -> None:
             "path": str(path),
             "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         }
+    activation_binding = transaction._read_activation_binding(args["control_db"])
     profile = {
         "schema_version": transaction.PROFILE_SCHEMA_VERSION,
         "release_id": RELEASE_ID,
@@ -255,10 +284,10 @@ def _prepare_candidate(args: dict, monkeypatch: pytest.MonkeyPatch) -> None:
         },
         "activation": {
             "predecessor_epoch_id": "rca-old-epoch",
-            "predecessor_state": "aborted",
-            "predecessor_binding_fingerprint": transaction._read_activation_binding(
-                args["control_db"]
-            )["binding_fingerprint"],
+            "predecessor_state": activation_binding["state"],
+            "predecessor_binding_fingerprint": activation_binding[
+                "binding_fingerprint"
+            ],
             "successor_epoch_id": SUCCESSOR_EPOCH,
         },
         "read_only_plist_anchors": anchor_values,
@@ -266,6 +295,7 @@ def _prepare_candidate(args: dict, monkeypatch: pytest.MonkeyPatch) -> None:
     profile_path = args["candidate_root"] / transaction.PROFILE_NAME
     profile_path.write_bytes(transaction._canonical_bytes(profile))
     profile_path.chmod(0o600)
+
     def fake_baseline(**kwargs):
         path = Path(kwargs["env"]["HERMES_RCA_DELIVERY_QUARANTINE_BASELINE_PATH"])
         return {
@@ -344,20 +374,107 @@ def test_steady_transaction_rejects_bound_safe_off_predecessor(
         transaction._read_activation_binding(args["control_db"])
 
 
-def test_steady_transaction_rejects_steady_predecessor(tmp_path, monkeypatch):
+def test_steady_transaction_accepts_exact_steady_predecessor(
+    tmp_path,
+    monkeypatch,
+):
     args = _fixture(tmp_path, monkeypatch)
-    _prepare_candidate(args, monkeypatch)
+    _prepare_candidate(args, monkeypatch, current_state="steady_active")
+    _seed_old_targets(args)
+
+    plan, plan_path = _build(args)
+    assert plan["activation_binding"]["state"] == "steady_active"
+    result = transaction.apply_plan(plan, plan_path=plan_path)
+
+    assert result["verification"] == "pass"
+    assert result["activation_binding"] == plan["activation_binding"]
+    assert result["production_effects"] == {
+        "database_mutation": False,
+        "task_submission": False,
+        "kafka_consume": False,
+        "feishu_write": False,
+        "resident_restart": False,
+    }
+
+
+def test_steady_transaction_reads_live_direct_steady_fingerprint(
+    tmp_path,
+    monkeypatch,
+):
+    args = _fixture(tmp_path, monkeypatch)
+    args["control_db"].unlink()
+    store = RcaControlStore(args["control_db"])
+    epoch = store.activate_direct_steady_epoch(
+        epoch_id="rca-live-direct-predecessor",
+        release_fingerprint="1" * 64,
+        release_binding_sha256="2" * 64,
+        config_sha256="3" * 64,
+        db_logical_identity={"logical_store_id": "test-control"},
+        partition_start_fence={"feishu-project-workflow-event": {"0": 10}},
+        operator="release-test",
+        reason="bind live direct predecessor",
+    )
+
+    transaction_binding = transaction._read_activation_binding(args["control_db"])
+    store_binding = store.direct_steady_predecessor()
+
+    assert store_binding is not None
+    assert transaction_binding == {
+        "epoch_id": epoch["epoch_id"],
+        "state": "steady_active",
+        "binding_fingerprint": store_binding["binding_fingerprint"],
+        "transition_audit_id": store_binding["audit_id"],
+        "transitioned_at": store_binding["transitioned_at"],
+    }
+
+
+def test_steady_transaction_rejects_steady_predecessor_fingerprint_drift(
+    tmp_path,
+    monkeypatch,
+):
+    args = _fixture(tmp_path, monkeypatch)
+    _prepare_candidate(args, monkeypatch, current_state="steady_active")
     connection = sqlite3.connect(args["control_db"])
     connection.execute(
-        "UPDATE rca_activation_epochs SET state='steady_active' WHERE is_current=1"
+        "UPDATE rca_activation_transition_audit "
+        "SET binding_fingerprint = ? WHERE epoch_id = 'rca-old-epoch'",
+        ("f" * 64,),
     )
     connection.commit()
     connection.close()
+
     with pytest.raises(
         transaction.SteadyReleaseTransactionError,
-        match="activation_not_aborted",
+        match="activation_fingerprint_invalid",
     ):
         _build(args)
+
+
+def test_steady_apply_rejects_steady_predecessor_drift_before_file_mutation(
+    tmp_path,
+    monkeypatch,
+):
+    args = _fixture(tmp_path, monkeypatch)
+    _prepare_candidate(args, monkeypatch, current_state="steady_active")
+    _seed_old_targets(args)
+    plan, plan_path = _build(args)
+    prior_env = (args["hermes_home"] / ".env").read_bytes()
+    connection = sqlite3.connect(args["control_db"])
+    connection.execute(
+        "UPDATE rca_activation_transition_audit "
+        "SET binding_fingerprint = ? WHERE epoch_id = 'rca-old-epoch'",
+        ("f" * 64,),
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(
+        transaction.SteadyReleaseTransactionError,
+        match="activation_fingerprint_invalid",
+    ):
+        transaction.apply_plan(plan, plan_path=plan_path)
+    assert (args["hermes_home"] / ".env").read_bytes() == prior_env
+    assert not (args["state_root"] / f"{RELEASE_ID}.authority.json").exists()
 
 
 def test_steady_transaction_rechecks_read_only_anchor_and_auto_rolls_back(
@@ -533,7 +650,7 @@ def test_manual_rollback_refuses_replaced_activation_epoch(tmp_path, monkeypatch
     connection.close()
     with pytest.raises(
         transaction.SteadyReleaseTransactionError,
-        match="activation_not_aborted",
+        match="activation_audit_invalid",
     ):
         transaction.rollback_transaction(
             Path(receipt["receipt_path"]),

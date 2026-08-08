@@ -1287,7 +1287,9 @@ def _activate_direct_steady_epoch(
     receipt_sha256: str = "a" * 64,
     config_sha256: str = "2" * 64,
     start_offset: int = 20,
+    expected_predecessor: dict | None = None,
 ):
+    predecessor = expected_predecessor or {}
     return store.activate_direct_steady_epoch(
         epoch_id=epoch_id,
         release_fingerprint=release_fingerprint,
@@ -1301,6 +1303,11 @@ def _activate_direct_steady_epoch(
         partition_start_fence={TOPIC: {"2": start_offset}},
         operator="release-test",
         reason="activate direct steady test release",
+        expected_predecessor_epoch_id=str(predecessor.get("epoch_id") or ""),
+        expected_predecessor_state=str(predecessor.get("state") or ""),
+        expected_predecessor_binding_fingerprint=str(
+            predecessor.get("binding_fingerprint") or ""
+        ),
     )
 
 
@@ -1956,6 +1963,188 @@ def test_direct_steady_rejects_active_predecessor_and_replaces_aborted_one(tmp_p
     )
     assert replacement["state"] == "steady_active"
     assert replacement["epoch_id"] == "rca-direct-second-20260712"
+
+
+def test_direct_steady_atomically_replaces_exact_drained_steady_predecessor(
+    tmp_path,
+):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    predecessor = _activate_direct_steady_epoch(
+        store,
+        epoch_id="rca-direct-first-20260712",
+    )
+    predecessor_binding = store.direct_steady_predecessor()
+    assert predecessor_binding is not None
+    assert predecessor_binding["epoch_id"] == predecessor["epoch_id"]
+    assert predecessor_binding["inflight"]["total"] == 0
+
+    successor = _activate_direct_steady_epoch(
+        store,
+        epoch_id="rca-direct-second-20260712",
+        start_offset=30,
+        expected_predecessor=predecessor_binding,
+    )
+
+    assert successor["state"] == "steady_active"
+    assert store.activation_epoch() == successor
+    assert not [
+        row
+        for row in store.list_rows("rca_activation_budget_slots")
+        if row["epoch_id"] == successor["epoch_id"]
+    ]
+    [retired] = [
+        row
+        for row in store.list_rows("rca_activation_epochs")
+        if row["epoch_id"] == predecessor["epoch_id"]
+    ]
+    assert retired["is_current"] == 0
+    assert retired["state"] == "steady_active"
+    assert retired["superseded_at"]
+
+
+@pytest.mark.parametrize("outbox_status", ["pending", "claimed", "completed"])
+def test_direct_steady_rejects_current_predecessor_inflight(
+    tmp_path,
+    outbox_status,
+):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    predecessor = _activate_direct_steady_epoch(
+        store,
+        epoch_id="rca-direct-first-20260712",
+    )
+    admitted = store.admit_manual_trigger(
+        _manual_request("om-direct-current-inflight"),
+        allowed_chat_ids={"oc_allowed"},
+        submit_enabled=True,
+        active_policy=_policy(),
+        activation_required=True,
+    )
+    if outbox_status != "pending":
+        with sqlite3.connect(store.db_path) as connection:
+            connection.execute(
+                "UPDATE rca_outbox SET status = ? WHERE submission_key = ?",
+                (outbox_status, admitted.submission_key),
+            )
+    predecessor_binding = store.direct_steady_predecessor()
+    assert predecessor_binding is not None
+    assert predecessor_binding["inflight"]["total"] == 1
+
+    with pytest.raises(
+        ActivationEpochError,
+        match="activation_predecessor_inflight_not_drained",
+    ):
+        _activate_direct_steady_epoch(
+            store,
+            epoch_id="rca-direct-second-20260712",
+            start_offset=30,
+            expected_predecessor=predecessor_binding,
+        )
+    assert store.activation_epoch() == predecessor
+
+
+def test_direct_steady_successor_ignores_historical_epoch_inflight(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    historical = _activate_direct_steady_epoch(
+        store,
+        epoch_id="rca-direct-historical-20260712",
+    )
+    store.admit_manual_trigger(
+        _manual_request("om-direct-historical-inflight"),
+        allowed_chat_ids={"oc_allowed"},
+        submit_enabled=True,
+        active_policy=_policy(),
+        activation_required=True,
+    )
+    store.transition_activation_epoch(
+        epoch_id=historical["epoch_id"],
+        expected_state="steady_active",
+        target_state="aborted",
+        operator="release-test",
+        reason="retire predecessor while preserving historical evidence",
+    )
+    current = _activate_direct_steady_epoch(
+        store,
+        epoch_id="rca-direct-current-20260712",
+        start_offset=30,
+    )
+    predecessor_binding = store.direct_steady_predecessor()
+    assert predecessor_binding is not None
+    assert predecessor_binding["epoch_id"] == current["epoch_id"]
+    assert predecessor_binding["inflight"]["total"] == 0
+
+    successor = _activate_direct_steady_epoch(
+        store,
+        epoch_id="rca-direct-successor-20260712",
+        start_offset=40,
+        expected_predecessor=predecessor_binding,
+    )
+
+    assert store.activation_epoch() == successor
+    [historical_outbox] = store.list_rows("rca_outbox")
+    assert historical_outbox["activation_epoch_id"] == historical["epoch_id"]
+    assert historical_outbox["status"] == "pending"
+
+
+def test_direct_steady_successor_rejects_binding_drift_without_mutation(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    predecessor = _activate_direct_steady_epoch(
+        store,
+        epoch_id="rca-direct-first-20260712",
+    )
+    predecessor_binding = store.direct_steady_predecessor()
+    assert predecessor_binding is not None
+    drifted = {**predecessor_binding, "binding_fingerprint": "f" * 64}
+
+    with pytest.raises(
+        ActivationEpochError,
+        match="activation_predecessor_binding_changed",
+    ):
+        _activate_direct_steady_epoch(
+            store,
+            epoch_id="rca-direct-second-20260712",
+            start_offset=30,
+            expected_predecessor=drifted,
+        )
+    assert store.activation_epoch() == predecessor
+
+
+def test_direct_steady_successor_rolls_back_predecessor_supersede_on_insert_error(
+    tmp_path,
+):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    duplicate_id = "rca-direct-duplicate-20260712"
+    _activate_direct_steady_epoch(store, epoch_id=duplicate_id)
+    store.transition_activation_epoch(
+        epoch_id=duplicate_id,
+        expected_state="steady_active",
+        target_state="aborted",
+        operator="release-test",
+        reason="make duplicate identity historical",
+    )
+    predecessor = _activate_direct_steady_epoch(
+        store,
+        epoch_id="rca-direct-current-20260712",
+        start_offset=30,
+    )
+    predecessor_binding = store.direct_steady_predecessor()
+    assert predecessor_binding is not None
+
+    with pytest.raises(sqlite3.IntegrityError):
+        _activate_direct_steady_epoch(
+            store,
+            epoch_id=duplicate_id,
+            start_offset=40,
+            expected_predecessor=predecessor_binding,
+        )
+
+    assert store.activation_epoch() == predecessor
+    [predecessor_row] = [
+        row
+        for row in store.list_rows("rca_activation_epochs")
+        if row["epoch_id"] == predecessor["epoch_id"]
+    ]
+    assert predecessor_row["is_current"] == 1
+    assert predecessor_row["superseded_at"] is None
 
 
 def test_activation_confirmation_rejects_consumed_but_unbound_slots(tmp_path):

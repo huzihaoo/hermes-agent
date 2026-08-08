@@ -6863,16 +6863,13 @@ class RcaControlStore:
         return actor, justification
 
     @staticmethod
-    def _insert_activation_transition_audit_tx(
+    def _activation_transition_binding_material_tx(
         conn: sqlite3.Connection,
         *,
         epoch: sqlite3.Row,
         from_state: str,
         to_state: str,
-        operator: str,
-        reason: str,
-        transitioned_at: str,
-    ) -> int:
+    ) -> dict[str, Any]:
         slot_bindings = [
             {
                 "authorized_identity_sha256": str(
@@ -6895,47 +6892,105 @@ class RcaControlStore:
                 (epoch["epoch_id"],),
             ).fetchall()
         ]
+        return {
+            "config_sha256": str(epoch["config_sha256"]),
+            "db_logical_identity_sha256": str(
+                epoch["db_logical_identity_sha256"]
+            ),
+            "epoch_id": str(epoch["epoch_id"]),
+            "from_state": from_state,
+            "partition_end_fence_sha256": str(
+                epoch["partition_end_fence_sha256"] or ""
+            ),
+            "partition_start_fence_sha256": str(
+                epoch["partition_start_fence_sha256"]
+            ),
+            "preauthorization_capsule_sha256": str(
+                epoch["preauthorization_capsule_sha256"]
+            ),
+            "preauthorization_fingerprint": str(
+                epoch["preauthorization_fingerprint"]
+            ),
+            "preauthorization_gate_receipt_sha256": str(
+                epoch["preauthorization_gate_receipt_sha256"]
+            ),
+            "preproduction_capsule_sha256": str(
+                epoch["preproduction_capsule_sha256"] or ""
+            ),
+            "preproduction_fingerprint": str(
+                epoch["preproduction_fingerprint"] or ""
+            ),
+            "preproduction_gate_receipt_sha256": str(
+                epoch["preproduction_gate_receipt_sha256"] or ""
+            ),
+            "production_fingerprint": str(
+                epoch["production_fingerprint"] or ""
+            ),
+            "production_gate_receipt_sha256": str(
+                epoch["production_gate_receipt_sha256"] or ""
+            ),
+            "slot_bindings_sha256": _canonical_sha256(slot_bindings),
+            "to_state": to_state,
+        }
+
+    @classmethod
+    def _activation_transition_binding_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        epoch: sqlite3.Row,
+    ) -> dict[str, Any]:
+        audit = conn.execute(
+            """
+            SELECT audit_id, from_state, to_state, binding_fingerprint,
+                   transitioned_at
+              FROM rca_activation_transition_audit
+             WHERE epoch_id = ?
+          ORDER BY audit_id DESC
+             LIMIT 1
+            """,
+            (epoch["epoch_id"],),
+        ).fetchone()
+        state = str(epoch["state"] or "")
+        if audit is None or str(audit["to_state"] or "") != state:
+            raise ActivationEpochError("activation_predecessor_binding_invalid")
+        observed = str(audit["binding_fingerprint"] or "").lower()
+        expected = _canonical_sha256(
+            cls._activation_transition_binding_material_tx(
+                conn,
+                epoch=epoch,
+                from_state=str(audit["from_state"] or ""),
+                to_state=state,
+            )
+        )
+        if observed != expected:
+            raise ActivationEpochError("activation_predecessor_binding_invalid")
+        return {
+            "audit_id": int(audit["audit_id"]),
+            "binding_fingerprint": observed,
+            "epoch_id": str(epoch["epoch_id"]),
+            "state": state,
+            "transitioned_at": str(audit["transitioned_at"] or ""),
+        }
+
+    @staticmethod
+    def _insert_activation_transition_audit_tx(
+        conn: sqlite3.Connection,
+        *,
+        epoch: sqlite3.Row,
+        from_state: str,
+        to_state: str,
+        operator: str,
+        reason: str,
+        transitioned_at: str,
+    ) -> int:
         binding_fingerprint = _canonical_sha256(
-            {
-                "config_sha256": str(epoch["config_sha256"]),
-                "db_logical_identity_sha256": str(
-                    epoch["db_logical_identity_sha256"]
-                ),
-                "epoch_id": str(epoch["epoch_id"]),
-                "from_state": from_state,
-                "partition_end_fence_sha256": str(
-                    epoch["partition_end_fence_sha256"] or ""
-                ),
-                "partition_start_fence_sha256": str(
-                    epoch["partition_start_fence_sha256"]
-                ),
-                "preauthorization_capsule_sha256": str(
-                    epoch["preauthorization_capsule_sha256"]
-                ),
-                "preauthorization_fingerprint": str(
-                    epoch["preauthorization_fingerprint"]
-                ),
-                "preauthorization_gate_receipt_sha256": str(
-                    epoch["preauthorization_gate_receipt_sha256"]
-                ),
-                "preproduction_capsule_sha256": str(
-                    epoch["preproduction_capsule_sha256"] or ""
-                ),
-                "preproduction_fingerprint": str(
-                    epoch["preproduction_fingerprint"] or ""
-                ),
-                "preproduction_gate_receipt_sha256": str(
-                    epoch["preproduction_gate_receipt_sha256"] or ""
-                ),
-                "production_fingerprint": str(
-                    epoch["production_fingerprint"] or ""
-                ),
-                "production_gate_receipt_sha256": str(
-                    epoch["production_gate_receipt_sha256"] or ""
-                ),
-                "slot_bindings_sha256": _canonical_sha256(slot_bindings),
-                "to_state": to_state,
-            }
+            RcaControlStore._activation_transition_binding_material_tx(
+                conn,
+                epoch=epoch,
+                from_state=from_state,
+                to_state=to_state,
+            )
         )
         cursor = conn.execute(
             """
@@ -7129,6 +7184,76 @@ class RcaControlStore:
         finally:
             conn.close()
 
+    @classmethod
+    def _direct_steady_current_inflight_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        epoch_id: str,
+    ) -> dict[str, int]:
+        scope_sql = """
+            activation_epoch_id = ? OR activation_ledger_id IN (
+                SELECT ledger_id FROM rca_activation_admission_ledger
+                 WHERE epoch_id = ?
+            )
+        """
+        dispatchable_outbox = int(
+            conn.execute(
+                f"""
+                SELECT COUNT(*) FROM rca_outbox
+                 WHERE status IN ('pending', 'claimed')
+                   AND ({scope_sql})
+                """,
+                (epoch_id, epoch_id),
+            ).fetchone()[0]
+        )
+        delivery_rows = conn.execute(
+            f"""
+            SELECT business_key, submission_key, generation
+              FROM rca_outbox
+             WHERE status IN ('completed', 'quarantined')
+               AND ({scope_sql})
+            """,
+            (epoch_id, epoch_id),
+        ).fetchall()
+        execution_delivery = sum(
+            not cls._activation_delivery_execution_complete_tx(
+                conn,
+                business_key=str(row["business_key"] or ""),
+                submission_key=str(row["submission_key"] or ""),
+                generation=int(row["generation"] or 0),
+            )
+            for row in delivery_rows
+        )
+        return {
+            "dispatchable_outbox": dispatchable_outbox,
+            "execution_delivery": execution_delivery,
+            "total": dispatchable_outbox + execution_delivery,
+        }
+
+    def direct_steady_predecessor(self) -> dict[str, Any] | None:
+        """Return the exact current binding and current-only in-flight count."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            current = self._current_activation_epoch_tx(conn)
+            if current is None:
+                conn.commit()
+                return None
+            binding = self._activation_transition_binding_tx(conn, epoch=current)
+            binding["inflight"] = self._direct_steady_current_inflight_tx(
+                conn,
+                epoch_id=str(current["epoch_id"]),
+            )
+            conn.commit()
+            return binding
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def activate_direct_steady_epoch(
         self,
         *,
@@ -7140,6 +7265,9 @@ class RcaControlStore:
         partition_start_fence: Mapping[str, Any],
         operator: str,
         reason: str,
+        expected_predecessor_epoch_id: str = "",
+        expected_predecessor_state: str = "",
+        expected_predecessor_binding_fingerprint: str = "",
         now: datetime | None = None,
     ) -> dict[str, Any]:
         """Atomically install one explicit direct-release steady epoch.
@@ -7169,6 +7297,26 @@ class RcaControlStore:
         end_fence_sha = hashlib.sha256(end_fence_json.encode("utf-8")).hexdigest()
         start_fence_sha = end_fence_sha
         actor, justification = self._normalize_activation_audit_text(operator, reason)
+        predecessor_values = (
+            str(expected_predecessor_epoch_id or "").strip(),
+            str(expected_predecessor_state or "").strip(),
+            str(expected_predecessor_binding_fingerprint or "").strip().lower(),
+        )
+        if any(predecessor_values) and not all(predecessor_values):
+            raise ActivationEpochError("activation_predecessor_binding_incomplete")
+        predecessor_epoch_id, predecessor_state, predecessor_fingerprint = (
+            predecessor_values
+        )
+        if predecessor_epoch_id:
+            predecessor_epoch_id = self._normalize_activation_epoch_id(
+                predecessor_epoch_id
+            )
+            if predecessor_state not in {"aborted", "steady_active"}:
+                raise ActivationEpochError("activation_predecessor_state_invalid")
+            predecessor_fingerprint = self._normalize_activation_sha256(
+                predecessor_fingerprint,
+                "predecessor_binding_fingerprint",
+            )
         current = _iso(now)
         conn = self._connect()
         try:
@@ -7209,20 +7357,76 @@ class RcaControlStore:
                     return self._public_activation_epoch(existing)
                 raise ActivationEpochError("activation_direct_steady_binding_conflict")
 
-            if existing is not None and str(existing["state"]) != "aborted":
-                raise ActivationEpochError("activation_current_epoch_exists")
+            if existing is None:
+                if predecessor_epoch_id:
+                    raise ActivationEpochError("activation_predecessor_binding_changed")
+            else:
+                existing_state = str(existing["state"] or "")
+                if existing_state not in {"aborted", "steady_active"}:
+                    raise ActivationEpochError("activation_current_epoch_exists")
+                if existing_state == "steady_active" and not predecessor_epoch_id:
+                    raise ActivationEpochError("activation_current_epoch_exists")
+                predecessor_binding: dict[str, Any] | None = None
+                if predecessor_epoch_id:
+                    predecessor_binding = self._activation_transition_binding_tx(
+                        conn,
+                        epoch=existing,
+                    )
+                    if (
+                        predecessor_binding["epoch_id"] != predecessor_epoch_id
+                        or predecessor_binding["state"] != predecessor_state
+                        or predecessor_binding["binding_fingerprint"]
+                        != predecessor_fingerprint
+                    ):
+                        raise ActivationEpochError(
+                            "activation_predecessor_binding_changed"
+                        )
+                if existing_state == "steady_active":
+                    inflight = self._direct_steady_current_inflight_tx(
+                        conn,
+                        epoch_id=str(existing["epoch_id"]),
+                    )
+                    if inflight["total"]:
+                        raise ActivationEpochError(
+                            "activation_predecessor_inflight_not_drained"
+                        )
             if existing is not None:
-                # Retire the aborted current pointer in the same transaction as
-                # the new steady row.  No intermediate no-current state is
-                # observable to admission or provider-fence readers.
-                updated = conn.execute(
-                    """
-                    UPDATE rca_activation_epochs
-                       SET is_current = 0, superseded_at = ?, updated_at = ?
-                     WHERE epoch_id = ? AND is_current = 1 AND state = 'aborted'
-                    """,
-                    (current, current, existing["epoch_id"]),
-                )
+                # The exact predecessor CAS and successor insert share this
+                # write transaction; readers never observe a no-current gap.
+                if predecessor_epoch_id:
+                    assert predecessor_binding is not None
+                    updated = conn.execute(
+                        """
+                        UPDATE rca_activation_epochs
+                           SET is_current = 0, superseded_at = ?, updated_at = ?
+                         WHERE epoch_id = ? AND is_current = 1 AND state = ?
+                           AND EXISTS (
+                               SELECT 1
+                                 FROM rca_activation_transition_audit
+                                WHERE audit_id = ? AND epoch_id = ?
+                                  AND to_state = ? AND binding_fingerprint = ?
+                           )
+                        """,
+                        (
+                            current,
+                            current,
+                            predecessor_epoch_id,
+                            predecessor_state,
+                            predecessor_binding["audit_id"],
+                            predecessor_epoch_id,
+                            predecessor_state,
+                            predecessor_fingerprint,
+                        ),
+                    )
+                else:
+                    updated = conn.execute(
+                        """
+                        UPDATE rca_activation_epochs
+                           SET is_current = 0, superseded_at = ?, updated_at = ?
+                         WHERE epoch_id = ? AND is_current = 1 AND state = 'aborted'
+                        """,
+                        (current, current, existing["epoch_id"]),
+                    )
                 if updated.rowcount != 1:
                     raise ActivationEpochError("activation_epoch_state_changed")
 

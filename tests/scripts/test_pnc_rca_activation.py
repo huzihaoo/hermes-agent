@@ -16,10 +16,13 @@ from gateway import pnc_rca_capacity_transition as capacity_transition
 from gateway import pnc_rca_prod_bootstrap as prod_bootstrap
 from gateway.pnc_rca_control_store import (
     ActivationDeferralResult,
+    MANUAL_TRIGGER_SCHEMA_VERSION,
+    ManualRcaTriggerRequest,
     RcaControlStore,
     ShadowPromotionError,
     ShadowPromotionResult,
 )
+from gateway.pnc_rca_kafka_contract import WorkflowEventPolicy, WorkflowTransition
 from scripts import pnc_rca_activation as activation_module
 
 
@@ -429,6 +432,7 @@ def _direct_steady_args(
     binding_path: Path,
     *,
     epoch_id: str = EPOCH_ID,
+    predecessor: dict[str, Any] | None = None,
     apply: bool = False,
 ) -> list[str]:
     args = [
@@ -444,6 +448,17 @@ def _direct_steady_args(
         "--direct-binding",
         str(binding_path),
     ]
+    if predecessor is not None:
+        args.extend(
+            [
+                "--expected-predecessor-epoch-id",
+                str(predecessor["epoch_id"]),
+                "--expected-predecessor-state",
+                str(predecessor["state"]),
+                "--expected-predecessor-binding-fingerprint",
+                str(predecessor["binding_fingerprint"]),
+            ]
+        )
     if apply:
         args.append("--apply")
     return args
@@ -875,6 +890,148 @@ def test_direct_steady_plan_apply_replaces_aborted_epoch_and_is_idempotent(
     assert [(row["from_state"], row["to_state"]) for row in direct_audits] == [
         ("direct_release", "steady_active")
     ]
+
+
+def test_direct_steady_plan_apply_replaces_exact_drained_steady_predecessor(
+    tmp_path,
+    capsys,
+):
+    db_path = tmp_path / "control.sqlite3"
+    store = RcaControlStore(db_path)
+    predecessor_id = "rca-direct-steady-predecessor"
+    predecessor_input = _direct_binding_input(predecessor_id)
+    predecessor_path = tmp_path / "predecessor.json"
+    _write_secure_json(predecessor_path, predecessor_input)
+    code, _applied = _invoke(
+        capsys,
+        _direct_steady_args(
+            db_path,
+            predecessor_path,
+            epoch_id=predecessor_id,
+            apply=True,
+        ),
+    )
+    assert code == 0
+    predecessor = store.direct_steady_predecessor()
+    assert predecessor is not None
+    assert predecessor["inflight"]["total"] == 0
+
+    successor_path = tmp_path / "successor.json"
+    _write_secure_json(successor_path, _direct_binding_input())
+    code, planned = _invoke(
+        capsys,
+        _direct_steady_args(
+            db_path,
+            successor_path,
+            predecessor=predecessor,
+        ),
+    )
+    assert code == 0
+    assert planned["result"]["expected_predecessor_epoch_id"] == predecessor_id
+    assert planned["result"]["predecessor_inflight"]["total"] == 0
+
+    code, applied = _invoke(
+        capsys,
+        _direct_steady_args(
+            db_path,
+            successor_path,
+            predecessor=predecessor,
+            apply=True,
+        ),
+    )
+    assert code == 0
+    assert applied["result"]["current_epoch"]["epoch_id"] == EPOCH_ID
+    assert applied["result"]["expected_predecessor_epoch_id"] == predecessor_id
+    assert applied["result"]["expected_predecessor_binding_fingerprint"] == (
+        predecessor["binding_fingerprint"]
+    )
+    assert not [
+        row
+        for row in store.list_rows("rca_activation_budget_slots")
+        if row["epoch_id"] == EPOCH_ID
+    ]
+
+
+def test_direct_steady_rejects_predecessor_drift_and_current_inflight(
+    tmp_path,
+    capsys,
+):
+    db_path = tmp_path / "control.sqlite3"
+    store = RcaControlStore(db_path)
+    predecessor_id = "rca-direct-steady-predecessor"
+    predecessor_input = _direct_binding_input(predecessor_id)
+    store.activate_direct_steady_epoch(
+        epoch_id=predecessor_id,
+        release_fingerprint=predecessor_input["release_fingerprint"],
+        release_binding_sha256=predecessor_input["release_binding_sha256"],
+        config_sha256=predecessor_input["config_sha256"],
+        db_logical_identity=predecessor_input["db_logical_identity"],
+        partition_start_fence=predecessor_input["partition_start_fence"],
+        operator=OPERATOR,
+        reason=REASON,
+    )
+    predecessor = store.direct_steady_predecessor()
+    assert predecessor is not None
+    successor_path = tmp_path / "successor.json"
+    _write_secure_json(successor_path, _direct_binding_input())
+
+    drifted = {**predecessor, "binding_fingerprint": "f" * 64}
+    code, payload = _invoke(
+        capsys,
+        _direct_steady_args(
+            db_path,
+            successor_path,
+            predecessor=drifted,
+            apply=True,
+        ),
+    )
+    assert code == 2
+    assert payload["code"] == "activation_predecessor_binding_changed"
+
+    request = ManualRcaTriggerRequest(
+        schema_version=MANUAL_TRIGGER_SCHEMA_VERSION,
+        reason="manual_explicit_issue_action",
+        platform="feishu",
+        chat_id="oc_activation_test",
+        requester_id="ou_activation_test",
+        message_id="om-steady-inflight",
+        thread_id="topic:om-steady-inflight",
+        issue_url="https://project.feishu.cn/g1q3/issue/detail/7041712816",
+        mode="run_or_join",
+    )
+    store.admit_manual_trigger(
+        request,
+        allowed_chat_ids={"oc_activation_test"},
+        submit_enabled=True,
+        active_policy=WorkflowEventPolicy(
+            topic=TOPIC,
+            policy_version="issue-created-v1",
+            project_keys=frozenset({"project-key"}),
+            project_simple_names=frozenset({"g1q3"}),
+            work_item_type_keys=frozenset({"problem-type"}),
+            status_change_types=frozenset({"Reached"}),
+            transitions=(
+                WorkflowTransition(
+                    state_key="new-problem-state",
+                    pre_status=1,
+                    cur_status=2,
+                ),
+            ),
+        ),
+        activation_required=True,
+    )
+    code, payload = _invoke(
+        capsys,
+        _direct_steady_args(
+            db_path,
+            successor_path,
+            predecessor=predecessor,
+            apply=True,
+        ),
+    )
+    assert code == 2
+    assert payload["code"] == "activation_predecessor_inflight_not_drained"
+    assert store.activation_epoch()["epoch_id"] == predecessor_id
 
 
 def test_direct_steady_rejects_binding_hash_tamper_without_mutation(
