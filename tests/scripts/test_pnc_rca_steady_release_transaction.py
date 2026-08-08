@@ -24,7 +24,9 @@ SUCCESSOR_EPOCH = "rca-activation-r15l-successor"
 INVENTORY_PIN = "9" * 64
 
 
-def _install_activation_fixture(args: dict) -> None:
+def _install_activation_fixture(
+    args: dict, *, predecessor_from_state: str = "steady_active"
+) -> None:
     connection = sqlite3.connect(args["control_db"])
     connection.executescript(
         """
@@ -115,8 +117,19 @@ def _install_activation_fixture(args: dict) -> None:
             "slot_kind": "kafka_success",
         }
     ]
+    if predecessor_from_state == "safe_off":
+        slots = []
+        for field in (
+            "preproduction_fingerprint",
+            "preproduction_gate_receipt_sha256",
+            "preproduction_capsule_sha256",
+        ):
+            epoch[field] = None
     material = transaction._activation_fingerprint_material(
-        epoch, slot_bindings=slots, from_state="steady_active", to_state="aborted"
+        epoch,
+        slot_bindings=slots,
+        from_state=predecessor_from_state,
+        to_state="aborted",
     )
     fingerprint = transaction._canonical_sha256(material)
     columns = ",".join(epoch)
@@ -125,24 +138,25 @@ def _install_activation_fixture(args: dict) -> None:
         f"INSERT INTO rca_activation_epochs({columns}) VALUES ({placeholders})",
         tuple(epoch.values()),
     )
-    connection.execute(
-        """
-        INSERT INTO rca_activation_budget_slots(
-            epoch_id, slot_kind, authorized_source_kind,
-            authorized_identity_sha256, authorized_operator,
-            authorized_reason, consumed_ledger_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            epoch["epoch_id"],
-            slots[0]["slot_kind"],
-            slots[0]["authorized_source_kind"],
-            slots[0]["authorized_identity_sha256"],
-            slots[0]["authorized_operator"],
-            slots[0]["authorized_reason"],
-            slots[0]["consumed_ledger_id"],
-        ),
-    )
+    if slots:
+        connection.execute(
+            """
+            INSERT INTO rca_activation_budget_slots(
+                epoch_id, slot_kind, authorized_source_kind,
+                authorized_identity_sha256, authorized_operator,
+                authorized_reason, consumed_ledger_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                epoch["epoch_id"],
+                slots[0]["slot_kind"],
+                slots[0]["authorized_source_kind"],
+                slots[0]["authorized_identity_sha256"],
+                slots[0]["authorized_operator"],
+                slots[0]["authorized_reason"],
+                slots[0]["consumed_ledger_id"],
+            ),
+        )
     connection.execute(
         """
         INSERT INTO rca_activation_transition_audit(
@@ -152,7 +166,7 @@ def _install_activation_fixture(args: dict) -> None:
         """,
         (
             epoch["epoch_id"],
-            "steady_active",
+            predecessor_from_state,
             "aborted",
             "owner",
             "test abort",
@@ -301,6 +315,34 @@ def test_steady_transaction_accepts_aborted_predecessor_and_rolls_back(
         output_path=args["evidence"] / "steady-rollback.json",
     )
     assert rollback["restored_to_pre_transaction"] is True
+
+
+def test_steady_transaction_accepts_zero_binding_safe_off_predecessor(
+    tmp_path, monkeypatch
+):
+    args = _fixture(tmp_path, monkeypatch)
+    _install_activation_fixture(args, predecessor_from_state="safe_off")
+    binding = transaction._read_activation_binding(args["control_db"])
+    assert binding["state"] == "aborted"
+
+
+def test_steady_transaction_rejects_bound_safe_off_predecessor(
+    tmp_path, monkeypatch
+):
+    args = _fixture(tmp_path, monkeypatch)
+    _install_activation_fixture(args, predecessor_from_state="safe_off")
+    connection = sqlite3.connect(args["control_db"])
+    connection.execute(
+        "UPDATE rca_activation_epochs SET preproduction_fingerprint=? WHERE is_current=1",
+        ("4" * 64,),
+    )
+    connection.commit()
+    connection.close()
+    with pytest.raises(
+        transaction.SteadyReleaseTransactionError,
+        match="activation_audit_invalid",
+    ):
+        transaction._read_activation_binding(args["control_db"])
 
 
 def test_steady_transaction_rejects_steady_predecessor(tmp_path, monkeypatch):

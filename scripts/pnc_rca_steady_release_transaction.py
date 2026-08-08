@@ -55,6 +55,25 @@ PROFILE_ACTIVATION_FIELDS = frozenset(
         "successor_epoch_id",
     }
 )
+# A successor may replace either a fully retired production epoch or a staged
+# safe-off epoch that never admitted a release slot.  The latter is useful when
+# a candidate was prepared but superseded before canary activation; it must be
+# held to the stricter zero-binding checks below.
+SUCCESSOR_PREDECESSOR_ABORT_STATES = frozenset(
+    {"safe_off", "preauthorized", "bounded_active", "confirmed", "steady_active"}
+)
+SAFE_OFF_ABORT_FORBIDDEN_FIELDS = (
+    "preproduction_fingerprint",
+    "preproduction_gate_receipt_sha256",
+    "preproduction_capsule_sha256",
+    "partition_end_fence_json",
+    "partition_end_fence_sha256",
+    "production_fingerprint",
+    "production_gate_receipt_sha256",
+    "bounded_activated_at",
+    "confirmed_at",
+    "steady_activated_at",
+)
 PROFILE_ANCHOR_FIELDS = frozenset({"path", "sha256"})
 READ_ONLY_PLIST_NAMES = (
     "ai.hermes.gateway.plist",
@@ -293,7 +312,7 @@ def _read_activation_binding(control_db: Path) -> dict[str, Any]:
                 """,
                 (epoch_id,),
             ).fetchall()
-            if len(audits) != 1 or str(audits[0]["from_state"]) != "steady_active":
+            if len(audits) != 1 or str(audits[0]["from_state"]) not in SUCCESSOR_PREDECESSOR_ABORT_STATES:
                 _fail("pnc_steady_release_transaction_activation_audit_invalid")
             slots = [
                 {
@@ -320,6 +339,16 @@ def _read_activation_binding(control_db: Path) -> dict[str, Any]:
                 ).fetchall()
             ]
             audit = audits[0]
+            if str(audit["from_state"]) == "safe_off" and (
+                any(str(epoch[field] or "") for field in SAFE_OFF_ABORT_FORBIDDEN_FIELDS)
+                or any(
+                    str(slot["authorized_source_kind"] or "")
+                    or str(slot["authorized_identity_sha256"] or "")
+                    or str(slot["consumed_ledger_id"] or "")
+                    for slot in slots
+                )
+            ):
+                _fail("pnc_steady_release_transaction_activation_audit_invalid")
             expected = _canonical_sha256(
                 _activation_fingerprint_material(
                     epoch,
