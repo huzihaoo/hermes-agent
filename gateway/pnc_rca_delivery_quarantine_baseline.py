@@ -16,6 +16,7 @@ from typing import Any, Mapping
 from gateway.pnc_rca_delivery_contract import (
     DELIVERY_THREAD_EFFECT_KIND,
     DeliveryContractError,
+    build_terminal_delivery,
     validate_delivery_subscription_target,
 )
 from gateway.pnc_rca_delivery_quarantine_migration import (
@@ -786,6 +787,68 @@ def _quarantine_lifetime_counts(
     return counts
 
 
+def _materialized_deferred_payload_matches(row: sqlite3.Row) -> bool:
+    """Validate one stored issue-comment effect against its exact contract."""
+
+    raw_payload = row["payload_json"]
+    raw_contract = row["job_contract_json"]
+    if (
+        not isinstance(raw_payload, str)
+        or not raw_payload
+        or not isinstance(raw_contract, str)
+        or not raw_contract
+    ):
+        return False
+    try:
+        payload = _strict_json(
+            raw_payload.encode("utf-8"),
+            artifact="delivery_quarantine_materialized_deferred_payload",
+        )
+        contract = _strict_json(
+            raw_contract.encode("utf-8"),
+            artifact="delivery_quarantine_materialized_deferred_contract",
+        )
+        rebuilt = build_terminal_delivery(
+            business_key=str(row["business_key"] or ""),
+            submission_key=str(row["submission_key"] or ""),
+            generation=int(row["generation"]),
+            project_key=str(row["job_project_key"] or ""),
+            work_item_type_key=str(row["job_work_item_type_key"] or ""),
+            work_item_id=str(row["job_work_item_id"] or ""),
+            outcome=str(row["job_outcome"] or ""),
+            terminal_state=str(row["terminal_state"] or ""),
+            error_code=str(row["terminal_error_code"] or ""),
+            diagnostic_code=str(contract.get("diagnostic_code") or ""),
+            diagnostic_detail=str(contract.get("diagnostic_detail") or ""),
+            terminal_fallback=contract.get("terminal_fallback"),
+            schema_version=str(payload.get("schema_version") or ""),
+        )
+    except (
+        DeliveryContractError,
+        DeliveryQuarantineBaselineError,
+        TypeError,
+        ValueError,
+        OverflowError,
+    ):
+        return False
+    return (
+        dict(payload) == rebuilt.effect_payload
+        and dict(contract) == rebuilt.contract
+        and str(row["delivery_id"] or "") == rebuilt.delivery_id
+        and str(row["effect_key"] or "") == rebuilt.effect_key
+        and str(row["effect_kind"] or "") == "feishu_issue_comment"
+        and str(row["target_key"] or "") == rebuilt.target_key
+        and str(row["job_target_key"] or "") == rebuilt.target_key
+        and str(row["payload_sha256"] or "")
+        == rebuilt.semantic_payload_sha256
+        and payload.get("delivery_id") == rebuilt.delivery_id
+        and payload.get("effect_key") == rebuilt.effect_key
+        and payload.get("semantic_payload_sha256")
+        == rebuilt.semantic_payload_sha256
+        and payload.get("marker") == rebuilt.marker
+    )
+
+
 def _activation_deferred_materialized_projection(
     conn: sqlite3.Connection,
 ) -> dict[str, Any]:
@@ -822,6 +885,10 @@ def _activation_deferred_materialized_projection(
                w.state AS watch_state, w.delivery_id AS watch_delivery_id,
                j.delivery_id, j.status AS job_status, j.outcome AS job_outcome,
                j.terminal_state, j.terminal_error_code, j.target_key AS job_target_key,
+               j.project_key AS job_project_key,
+               j.work_item_type_key AS job_work_item_type_key,
+               j.work_item_id AS job_work_item_id,
+               j.contract_json AS job_contract_json,
                e.effect_key, e.effect_kind, e.status AS effect_status,
                e.write_phase, e.attempt, e.fence, e.target_key,
                e.payload_json, e.payload_sha256,
@@ -910,32 +977,6 @@ def _activation_deferred_materialized_projection(
            AND e.required = 1
            AND e.outcome = 'quarantined'
            AND e.target_key = j.target_key
-           AND json_extract(e.payload_json, '$.schema_version') IN (
-               'pnc_rca_terminal_delivery_effect_v1',
-               'pnc_rca_terminal_delivery_effect_v2',
-               'pnc_rca_terminal_delivery_effect_v3',
-               'pnc_rca_terminal_delivery_effect_v4',
-               'pnc_rca_terminal_delivery_effect_v5'
-           )
-           AND json_extract(e.payload_json, '$.delivery_id') = j.delivery_id
-           AND json_extract(e.payload_json, '$.effect_key') = e.effect_key
-           AND json_extract(e.payload_json, '$.effect_kind') = e.effect_kind
-           AND json_extract(e.payload_json, '$.target_key') = e.target_key
-           AND json_extract(e.payload_json, '$.submission_key') = j.submission_key
-           AND json_extract(e.payload_json, '$.generation') = j.generation
-           AND json_extract(e.payload_json, '$.outcome') = j.outcome
-           AND json_extract(e.payload_json, '$.project_key') = j.project_key
-           AND json_extract(e.payload_json, '$.work_item_type_key') =
-               j.work_item_type_key
-           AND json_extract(e.payload_json, '$.work_item_id') = j.work_item_id
-           AND json_extract(e.payload_json, '$.terminal_state') = j.terminal_state
-           AND json_extract(e.payload_json, '$.error_code') =
-               j.terminal_error_code
-           AND json_extract(e.payload_json, '$.semantic_payload_sha256') =
-               e.payload_sha256
-           AND instr(
-               json_extract(e.payload_json, '$.marker'), e.effect_key
-           ) > 0
            AND e.status = 'pending'
            AND e.write_phase = 'prewrite'
            AND e.attempt = 0
@@ -976,6 +1017,8 @@ def _activation_deferred_materialized_projection(
     entries: list[dict[str, Any]] = []
     seen: set[str] = set()
     for row in rows:
+        if not _materialized_deferred_payload_matches(row):
+            continue
         thread_key = str(row["thread_subscription_key"] or "")
         if not thread_key or thread_key in seen:
             raise DeliveryQuarantineBaselineError(

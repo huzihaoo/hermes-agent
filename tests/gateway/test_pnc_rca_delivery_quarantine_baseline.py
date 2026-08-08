@@ -11,6 +11,14 @@ import sqlite3
 import pytest
 
 from gateway import pnc_rca_delivery_store as delivery_store_module
+from gateway.pnc_rca_delivery_contract import (
+    DELIVERY_EFFECT_KIND,
+    TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY,
+    build_terminal_delivery,
+    compute_terminal_delivery_effect_key,
+    compute_terminal_delivery_effect_payload_sha256,
+    terminal_delivery_effect_marker,
+)
 from gateway.pnc_rca_delivery_quarantine_baseline import (
     APPROVAL_SCHEMA_VERSION,
     CORE_SCHEMA_VERSION,
@@ -433,7 +441,12 @@ def _seed_materialized_activation_deferral_race(root: Path) -> RcaDeliveryStore:
         ).fetchone()
         assert row is not None
         job = conn.execute(
-            "SELECT delivery_id FROM rca_delivery_jobs LIMIT 1"
+            """
+            SELECT delivery_id, business_key, submission_key, generation,
+                   project_key, work_item_type_key, work_item_id, target_key
+              FROM rca_delivery_jobs
+             LIMIT 1
+            """
         ).fetchone()
         assert job is not None
         epoch_id = "rca-materialized-deferral-test"
@@ -580,38 +593,67 @@ def _seed_materialized_activation_deferral_race(root: Path) -> RcaDeliveryStore:
             """
         ).fetchone()
         assert effect is not None
-        semantic_sha256 = "8" * 64
-        payload = {
-            "schema_version": "pnc_rca_terminal_delivery_effect_v4",
-            "delivery_id": effect["delivery_id"],
-            "effect_key": effect["effect_key"],
-            "effect_kind": effect["effect_kind"],
-            "target_key": effect["target_key"],
-            "submission_key": effect["submission_key"],
-            "generation": effect["generation"],
-            "outcome": effect["outcome"],
-            "project_key": effect["project_key"],
-            "work_item_type_key": effect["work_item_type_key"],
-            "work_item_id": effect["work_item_id"],
-            "terminal_state": effect["terminal_state"],
-            "error_code": effect["terminal_error_code"],
-            "semantic_payload_sha256": semantic_sha256,
-            "marker": f"[RCA_TERMINAL:{effect['effect_key']}:quarantined:1]",
-        }
+        terminal = build_terminal_delivery(
+            business_key=row["business_key"],
+            submission_key=effect["submission_key"],
+            generation=effect["generation"],
+            project_key=effect["project_key"],
+            work_item_type_key=effect["work_item_type_key"],
+            work_item_id=effect["work_item_id"],
+            outcome=effect["outcome"],
+            terminal_state=effect["terminal_state"],
+            error_code=effect["terminal_error_code"],
+            schema_version=TERMINAL_DELIVERY_EFFECT_SCHEMA_VERSION_COMMENT_ONLY,
+        )
+        payload = dict(terminal.effect_payload)
+        conn.execute(
+            "UPDATE rca_execution_watch SET delivery_id=? WHERE delivery_id=?",
+            (terminal.delivery_id, effect["delivery_id"]),
+        )
         conn.execute(
             """
             UPDATE rca_delivery_effects
-               SET status='pending', outcome='quarantined', write_phase='prewrite',
+               SET effect_key=?, delivery_id=?, status='pending',
+                   outcome='quarantined',
+                   write_phase='prewrite',
                    attempt=0, fence=0, remote_receipt_json=NULL,
                    lease_token=NULL, lease_owner=NULL, lease_expires_at=NULL,
                    next_attempt_at=NULL, write_started_at=NULL,
                    payload_json=?, payload_sha256=?, created_at=?, updated_at=?
             """,
             (
-                json.dumps(payload, sort_keys=True, separators=(",", ":")),
-                semantic_sha256,
+                terminal.effect_key,
+                terminal.delivery_id,
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                terminal.semantic_payload_sha256,
                 now,
                 now,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE rca_delivery_jobs
+               SET delivery_id=?, artifact_set_id=?, outcome_key=?,
+                   report_url='', manifest_json='{}', contract_json=?,
+                   artifacts_json='[]'
+             WHERE delivery_id=?
+            """,
+            (
+                terminal.delivery_id,
+                terminal.outcome_key,
+                terminal.outcome_key,
+                json.dumps(
+                    terminal.contract,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                effect["delivery_id"],
             ),
         )
         conn.commit()
@@ -622,9 +664,19 @@ def test_materialized_activation_deferral_race_is_exactly_classified(tmp_path):
     store = _seed_materialized_activation_deferral_race(tmp_path)
     with sqlite3.connect(store.db_path) as conn:
         conn.row_factory = sqlite3.Row
+        payload = json.loads(
+            conn.execute(
+                "SELECT payload_json FROM rca_delivery_effects"
+            ).fetchone()["payload_json"]
+        )
         projection = _quarantined_subscription_projection(conn)
         materialized = _activation_deferred_materialized_projection(conn)
 
+    assert payload["schema_version"] == "pnc_rca_terminal_delivery_effect_v4"
+    assert payload["comment_content"]
+    assert payload["diagnostic_code"]
+    assert payload["diagnostic_result"]
+    assert payload["field_updates"] == []
     assert projection == {
         "total": 2,
         "invalid_manual_thread": 0,
@@ -638,6 +690,217 @@ def test_materialized_activation_deferral_race_is_exactly_classified(tmp_path):
     assert materialized["entries"][0]["attempt"] == 0
     assert materialized["entries"][0]["fence"] == 0
     assert materialized["entries_sha256"]
+
+
+def _assert_materialized_activation_deferral_rejected(store: RcaDeliveryStore) -> None:
+    with sqlite3.connect(store.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        projection = _quarantined_subscription_projection(conn)
+        materialized = _activation_deferred_materialized_projection(conn)
+
+    assert materialized["count"] == 0
+    assert projection["activation_deferred_materialized_delivery"] == 0
+    assert projection["unrecognized"] == 1
+
+
+def test_materialized_activation_deferral_rejects_coordinated_sha_and_extra_key(
+    tmp_path,
+):
+    store = _seed_materialized_activation_deferral_race(tmp_path)
+    with sqlite3.connect(store.db_path) as conn:
+        payload = json.loads(
+            conn.execute(
+                "SELECT payload_json FROM rca_delivery_effects"
+            ).fetchone()[0]
+        )
+        forged_sha256 = "a" * 64
+        payload["semantic_payload_sha256"] = forged_sha256
+        payload["reviewer_extra"] = "ignored-by-semantic-hash"
+        conn.execute(
+            "UPDATE rca_delivery_effects SET payload_json=?, payload_sha256=?",
+            (
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                forged_sha256,
+            ),
+        )
+        conn.commit()
+
+    _assert_materialized_activation_deferral_rejected(store)
+
+
+def test_materialized_activation_deferral_rejects_duplicate_trailing_outcome(
+    tmp_path,
+):
+    store = _seed_materialized_activation_deferral_race(tmp_path)
+    with sqlite3.connect(store.db_path) as conn:
+        payload_json = str(
+            conn.execute(
+                "SELECT payload_json FROM rca_delivery_effects"
+            ).fetchone()[0]
+        )
+        assert payload_json.endswith("}")
+        conn.execute(
+            "UPDATE rca_delivery_effects SET payload_json=?",
+            (f'{payload_json[:-1]},"outcome":"success"}}',),
+        )
+        conn.commit()
+
+    _assert_materialized_activation_deferral_rejected(store)
+
+
+def test_materialized_activation_deferral_rejects_marker_substring_match(tmp_path):
+    store = _seed_materialized_activation_deferral_race(tmp_path)
+    with sqlite3.connect(store.db_path) as conn:
+        payload = json.loads(
+            conn.execute(
+                "SELECT payload_json FROM rca_delivery_effects"
+            ).fetchone()[0]
+        )
+        payload["marker"] = f"forged-prefix:{payload['effect_key']}:suffix"
+        conn.execute(
+            "UPDATE rca_delivery_effects SET payload_json=?",
+            (
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            ),
+        )
+        conn.commit()
+
+    _assert_materialized_activation_deferral_rejected(store)
+
+
+def test_materialized_activation_deferral_rejects_coordinated_effect_identity(
+    tmp_path,
+):
+    store = _seed_materialized_activation_deferral_race(tmp_path)
+    with sqlite3.connect(store.db_path) as conn:
+        payload = json.loads(
+            conn.execute(
+                "SELECT payload_json FROM rca_delivery_effects"
+            ).fetchone()[0]
+        )
+        original_marker = payload["marker"]
+        forged_effect_key = f"g1q3-rca-terminal-effect-v1-{'f' * 64}"
+        forged_marker = terminal_delivery_effect_marker(
+            forged_effect_key, payload["outcome"], payload["generation"]
+        )
+        payload.update({
+            "effect_key": forged_effect_key,
+            "marker": forged_marker,
+            "comment_content": payload["comment_content"].replace(
+                original_marker, forged_marker
+            ),
+        })
+        conn.execute(
+            "UPDATE rca_delivery_effects SET effect_key=?, payload_json=?",
+            (
+                forged_effect_key,
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            ),
+        )
+        conn.commit()
+
+    _assert_materialized_activation_deferral_rejected(store)
+
+
+def test_materialized_activation_deferral_rejects_coordinated_diagnostic_payload(
+    tmp_path,
+):
+    store = _seed_materialized_activation_deferral_race(tmp_path)
+    with sqlite3.connect(store.db_path) as conn:
+        payload = json.loads(
+            conn.execute(
+                "SELECT payload_json FROM rca_delivery_effects"
+            ).fetchone()[0]
+        )
+        original_result = payload["diagnostic_result"]
+        original_marker = payload["marker"]
+        payload["diagnostic_result"] = f"{original_result}\nreviewer-forged-result"
+        payload["comment_content"] = payload["comment_content"].replace(
+            original_result, payload["diagnostic_result"]
+        )
+        semantic_sha256 = compute_terminal_delivery_effect_payload_sha256(
+            payload, DELIVERY_EFFECT_KIND
+        )
+        effect_key = compute_terminal_delivery_effect_key(
+            delivery_id=payload["delivery_id"],
+            effect_kind=DELIVERY_EFFECT_KIND,
+            target_key=payload["target_key"],
+            semantic_payload_sha256=semantic_sha256,
+        )
+        marker = terminal_delivery_effect_marker(
+            effect_key, payload["outcome"], payload["generation"]
+        )
+        payload.update({
+            "effect_key": effect_key,
+            "semantic_payload_sha256": semantic_sha256,
+            "marker": marker,
+            "comment_content": payload["comment_content"].replace(
+                original_marker, marker
+            ),
+        })
+        conn.execute(
+            """
+            UPDATE rca_delivery_effects
+               SET effect_key=?, payload_json=?, payload_sha256=?
+            """,
+            (
+                effect_key,
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                semantic_sha256,
+            ),
+        )
+        conn.commit()
+
+    _assert_materialized_activation_deferral_rejected(store)
+
+
+def test_materialized_activation_deferral_rejects_comment_content_only_tamper(
+    tmp_path,
+):
+    store = _seed_materialized_activation_deferral_race(tmp_path)
+    with sqlite3.connect(store.db_path) as conn:
+        payload = json.loads(
+            conn.execute(
+                "SELECT payload_json FROM rca_delivery_effects"
+            ).fetchone()[0]
+        )
+        payload["comment_content"] = (
+            f"reviewer-forged-comment\n{payload['marker']}"
+        )
+        conn.execute(
+            "UPDATE rca_delivery_effects SET payload_json=?",
+            (
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            ),
+        )
+        conn.commit()
+
+    _assert_materialized_activation_deferral_rejected(store)
 
 
 @pytest.mark.parametrize(
