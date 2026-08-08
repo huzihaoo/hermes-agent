@@ -809,12 +809,15 @@ def iter_pending_notices(*, task_ids: Iterable[str] | None = None, retry_failed_
         body = _load_json(path)
         if (
             require_current_g1q3_write_fence
-            and _is_g1q3_rca_origin_task(task_id, body)
+            and (
+                _has_g1q3_chat_target(body)
+                or _is_g1q3_rca_origin_task(task_id, body)
+            )
             and not _automatic_g1q3_write_fence_ready(task_id)
         ):
             # Automatic scans must not rewrite or retry historical G1Q3
             # sidecars that predate the activation-bound write fence. Explicit
-            # one-task runs still surface the original fail-closed error.
+            # one-task runs preserve their existing provider-fence semantics.
             continue
         body = reconcile_vm_delivery_proposal(task_id, body)
         # Reconciliation may create the card for a non-terminal task. Enrich
@@ -4909,6 +4912,18 @@ def _is_g1q3_rca_origin_task(task_id: str, body: Mapping[str, Any]) -> bool:
     return str(delivery.get("schema_version") or "").startswith("g1q3_")
 
 
+def _has_g1q3_chat_target(body: Mapping[str, Any]) -> bool:
+    """Identify protected G1Q3 chat targets for automatic history scans only."""
+
+    if not isinstance(body, Mapping):
+        return False
+    return any(
+        isinstance(payload := body.get(section), Mapping)
+        and str(payload.get("chat_id") or "").strip() == G1Q3_RCA_CHAT_ID
+        for section in ("task_card", "completion_notice", "vm_delivery_proposal")
+    )
+
+
 def _automatic_g1q3_write_fence_ready(task_id: str) -> bool:
     """Return whether an automatic relay scan may mutate or deliver this task."""
 
@@ -5117,7 +5132,10 @@ def relay_pending_notices(*, task_ids: Iterable[str] | None = None, send: bool =
         retry_failed_after_seconds=retry_failed_after_seconds,
         max_attempts=max_attempts,
         since_ts=effective_since_ts,
-        require_current_g1q3_write_fence=send and not explicit_task_filter,
+        # The scan mutates/reconciles sidecars even in preview mode. Apply the
+        # same current-fence boundary to automatic dry-runs so a record-only
+        # startup canary cannot rewrite historical G1Q3 cards.
+        require_current_g1q3_write_fence=not explicit_task_filter,
     )[: max(1, min(limit, 100))]
     def _process(task_id, path, body, notice):
         errs: list[str] = []
@@ -5496,7 +5514,10 @@ def watch_pending_notices(
     )
     startup_canary_completed_at: str | None = None
     # Do not retroactively @-ping every historical anomaly on relay restart.
-    backfill_g1q3_anomaly_notify_keys(task_ids=task_ids or None)
+    # With the feature disabled (the production default), there is no notify key
+    # to backfill; skipping the full history scan also keeps startup bounded.
+    if _g1q3_anomaly_auto_notify_enabled():
+        backfill_g1q3_anomaly_notify_keys(task_ids=task_ids or None)
     while True:
         now = time.monotonic()
         force_full = last_full_scan == 0.0 or now - last_full_scan >= max(1, full_scan_seconds)

@@ -783,10 +783,18 @@ def test_failed_notice_alerts_home_channel_once_at_max_attempts(tmp_path, monkey
 
 
 
-def test_watch_mode_uses_hot_sender_and_relay_loop_once(tmp_path, monkeypatch):
+def test_watch_mode_uses_hot_sender_for_non_g1q3_relay_loop_once(
+    tmp_path,
+    monkeypatch,
+):
     token = set_hermes_home_override(tmp_path)
     try:
-        _write_sidecar(tmp_path)
+        sidecar = _write_sidecar(tmp_path)
+        body = json.loads(sidecar.read_text(encoding="utf-8"))
+        body["completion_notice"]["chat_id"] = (
+            pnc_completion_notice_relay.DEFAULT_CHAT_IDS[0]
+        )
+        sidecar.write_text(json.dumps(body), encoding="utf-8")
         calls = []
 
         class FakeHotSender:
@@ -2107,6 +2115,7 @@ def test_no_ping_when_target_lacks_thread_anchor(tmp_path, monkeypatch):
 def _write_terminal_card_sidecar(tmp_path, task_id="task-1", *, with_contract=True, send_status="pending", delivery_sent=False, text=None, generated_at=None, suppressed_at=None, chat_id=None):
     sidecar = tmp_path / "task-state" / f"{task_id}.json"
     sidecar.parent.mkdir(parents=True, exist_ok=True)
+    target_chat_id = chat_id or pnc_completion_notice_relay.DEFAULT_CHAT_IDS[0]
     contract = {
         "required": True,
         "mode": "thread_reply",
@@ -2117,7 +2126,7 @@ def _write_terminal_card_sidecar(tmp_path, task_id="task-1", *, with_contract=Tr
     notice = {
         "send_status": send_status,
         "state": "completed",
-        "chat_id": chat_id or pnc_completion_notice_relay.DEFAULT_CHAT_IDS[1],
+        "chat_id": target_chat_id,
         "thread_id": "topic:om_1",
         "message_id": "om_1",
         "vm_task_id": "vm-1",
@@ -2136,7 +2145,7 @@ def _write_terminal_card_sidecar(tmp_path, task_id="task-1", *, with_contract=Tr
     card = {
         "schema_version": 1,
         "task_id": task_id,
-        "chat_id": pnc_completion_notice_relay.DEFAULT_CHAT_IDS[1],
+        "chat_id": target_chat_id,
         "thread_id": "topic:om_1",
         "message_id": "om_1",
         "card_message_id": "om_card",
@@ -3415,6 +3424,196 @@ def test_g1q3_automatic_scan_skips_unfenced_history_without_sidecar_mutation(
     assert sidecar.read_bytes() == before
     assert sends == []
     assert cards == []
+
+
+@pytest.mark.parametrize("provenance_section", [
+    "task_card",
+    "completion_notice",
+    "vm_delivery_proposal",
+])
+def test_g1q3_chat_only_provenance_auto_scan_skips_without_byte_change(
+    tmp_path,
+    monkeypatch,
+    provenance_section,
+):
+    """A G1Q3 chat target is protected even when the task id is legacy-shaped."""
+
+    task_id = "legacy-sidecar-chat-only"
+    token = set_hermes_home_override(tmp_path)
+    try:
+        body = {
+            "completion_notice": {
+                "send_status": "pending",
+                "chat_id": pnc_completion_notice_relay.DEFAULT_CHAT_IDS[0],
+                "thread_id": "topic:om_legacy",
+                "message_id": "om_legacy",
+                "text": "完成通知",
+            }
+        }
+        body[provenance_section] = {
+            "chat_id": pnc_completion_notice_relay.G1Q3_RCA_CHAT_ID,
+        }
+        if provenance_section == "completion_notice":
+            body[provenance_section].update(body["completion_notice"])
+            body[provenance_section]["chat_id"] = pnc_completion_notice_relay.G1Q3_RCA_CHAT_ID
+        sidecar = tmp_path / "task-state" / f"{task_id}.json"
+        sidecar.parent.mkdir(parents=True)
+        sidecar.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+        before = sidecar.read_bytes()
+        monkeypatch.setattr(
+            pnc_completion_notice_relay,
+            "_automatic_g1q3_write_fence_ready",
+            lambda _task_id: False,
+        )
+
+        result = pnc_completion_notice_relay.relay_pending_notices(
+            task_ids=None,
+            send=False,
+            explicit_completion_delivery=False,
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert result["ok"] is True
+    assert result["candidate_count"] == 0
+    assert result["errors"] == []
+    assert sidecar.read_bytes() == before
+
+
+def test_g1q3_automatic_dry_run_requires_current_fence_before_mutation(
+    tmp_path,
+    monkeypatch,
+):
+    """Preview scans must not reconcile/render an unfenced G1Q3 sidecar."""
+
+    task_id = "g1q3-rca-legacy-dry-run"
+    token = set_hermes_home_override(tmp_path)
+    try:
+        sidecar = _write_sidecar(tmp_path, task_id)
+        before = sidecar.read_bytes()
+        monkeypatch.setattr(
+            pnc_completion_notice_relay,
+            "_automatic_g1q3_write_fence_ready",
+            lambda _task_id: False,
+        )
+        monkeypatch.setattr(
+            pnc_completion_notice_relay,
+            "reconcile_vm_delivery_proposal",
+            lambda *_args, **_kwargs: pytest.fail("dry-run reconciled before fence"),
+        )
+
+        result = pnc_completion_notice_relay.relay_pending_notices(
+            task_ids=None,
+            send=False,
+            explicit_completion_delivery=False,
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert result["ok"] is True
+    assert result["candidate_count"] == 0
+    assert result["errors"] == []
+    assert sidecar.read_bytes() == before
+
+
+def test_watch_does_not_backfill_g1q3_anomalies_when_auto_notify_disabled(
+    tmp_path,
+    monkeypatch,
+):
+    token = set_hermes_home_override(tmp_path)
+    try:
+        backfill_calls = []
+        monkeypatch.setattr(
+            pnc_completion_notice_relay,
+            "_g1q3_anomaly_auto_notify_enabled",
+            lambda: False,
+        )
+        monkeypatch.setattr(
+            pnc_completion_notice_relay,
+            "backfill_g1q3_anomaly_notify_keys",
+            lambda **_kwargs: backfill_calls.append(True),
+        )
+        monkeypatch.setattr(
+            pnc_completion_notice_relay,
+            "relay_pending_notices",
+            lambda **_kwargs: {
+                "ok": True,
+                "candidate_count": 0,
+                "sent_count": 0,
+                "card_fallback_attempted_count": 0,
+                "card_fallback_sent_count": 0,
+                "errors": [],
+            },
+        )
+
+        def stop_after_first_sleep(_seconds):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(
+            pnc_completion_notice_relay.time,
+            "sleep",
+            stop_after_first_sleep,
+        )
+        with pytest.raises(KeyboardInterrupt):
+            pnc_completion_notice_relay.watch_pending_notices(
+                send=False,
+                poll_seconds=0.1,
+                full_scan_seconds=120,
+            )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert backfill_calls == []
+
+
+def test_watch_backfills_g1q3_anomalies_when_auto_notify_enabled(
+    tmp_path,
+    monkeypatch,
+):
+    token = set_hermes_home_override(tmp_path)
+    try:
+        backfill_calls = []
+        monkeypatch.setattr(
+            pnc_completion_notice_relay,
+            "_g1q3_anomaly_auto_notify_enabled",
+            lambda: True,
+        )
+        monkeypatch.setattr(
+            pnc_completion_notice_relay,
+            "backfill_g1q3_anomaly_notify_keys",
+            lambda **kwargs: backfill_calls.append(kwargs),
+        )
+        monkeypatch.setattr(
+            pnc_completion_notice_relay,
+            "relay_pending_notices",
+            lambda **_kwargs: {
+                "ok": True,
+                "candidate_count": 0,
+                "sent_count": 0,
+                "card_fallback_attempted_count": 0,
+                "card_fallback_sent_count": 0,
+                "errors": [],
+            },
+        )
+
+        def stop_after_first_sleep(_seconds):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(
+            pnc_completion_notice_relay.time,
+            "sleep",
+            stop_after_first_sleep,
+        )
+        with pytest.raises(KeyboardInterrupt):
+            pnc_completion_notice_relay.watch_pending_notices(
+                send=False,
+                poll_seconds=0.1,
+                full_scan_seconds=120,
+            )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert backfill_calls == [{"task_ids": None}]
 
 
 def test_g1q3_name_only_automatic_scan_requires_fence_before_mutation_or_send(
