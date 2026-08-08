@@ -10701,8 +10701,10 @@ class RcaDeliveryStore:
         *,
         now: datetime | None = None,
         busy_timeout_ms: int = 5000,
+        activation_required: bool = False,
     ) -> DeliveryBackpressureSnapshot:
         """Read the delivery backlog and circuit from one immutable DB snapshot."""
+        cls._validate_activation_required(activation_required)
         path = Path(db_path).expanduser()
         if not path.is_file():
             raise RuntimeError("delivery_backpressure_store_unavailable:file_missing")
@@ -10730,34 +10732,122 @@ class RcaDeliveryStore:
                 raise RuntimeError(
                     "delivery_backpressure_contract_invalid:schema_version"
                 )
-            rows = conn.execute(
+            activation_enforced = cls._activation_enforced_tx(
+                conn,
+                activation_required=activation_required,
+            )
+            if activation_enforced:
+                cls._require_activation_schema(conn)
+            all_effect_rows = conn.execute(
                 "SELECT status, COUNT(*) AS count "
                 "FROM rca_delivery_effects GROUP BY status"
             ).fetchall()
-            counts = {str(row["status"]): int(row["count"]) for row in rows}
-            unknown_states = set(counts) - DELIVERY_EFFECT_STATES
-            if unknown_states or any(value < 0 for value in counts.values()):
+            all_effect_counts = {
+                str(row["status"]): int(row["count"]) for row in all_effect_rows
+            }
+            unknown_states = set(all_effect_counts) - DELIVERY_EFFECT_STATES
+            if unknown_states or any(
+                value < 0 for value in all_effect_counts.values()
+            ):
                 raise RuntimeError(
                     "delivery_backpressure_contract_invalid:effect_status"
                 )
-            watch_rows = conn.execute(
+            effect_joins = (
+                """
+                  JOIN rca_delivery_jobs AS j ON j.delivery_id = e.delivery_id
+             LEFT JOIN rca_execution_watch AS w
+                    ON w.submission_key = j.submission_key
+             LEFT JOIN rca_outbox AS o
+                    ON o.outbox_id = w.submission_outbox_id
+             LEFT JOIN business_triggers AS t
+                    ON t.business_key = o.business_key
+                   AND t.generation = o.generation
+                """
+                if activation_enforced
+                else ""
+            )
+            effect_filter = (
+                "WHERE ("
+                f"({_ACTIVATION_EXECUTION_ELIGIBLE_SQL}) OR "
+                f"({_ADJUDICATION_ACTIVATION_ELIGIBLE_SQL}) OR "
+                f"({_CARD_PATCH_ACTIVATION_ELIGIBLE_SQL})"
+                ")"
+                if activation_enforced
+                else ""
+            )
+            if activation_enforced:
+                rows = conn.execute(
+                    f"SELECT e.status, COUNT(*) AS count "
+                    f"FROM rca_delivery_effects AS e {effect_joins} "
+                    f"{effect_filter} GROUP BY e.status"
+                ).fetchall()
+                counts = {
+                    str(row["status"]): int(row["count"]) for row in rows
+                }
+            else:
+                counts = all_effect_counts
+            all_watch_rows = conn.execute(
                 "SELECT state, COUNT(*) AS count "
                 "FROM rca_execution_watch GROUP BY state"
             ).fetchall()
-            watch_counts = {str(row["state"]): int(row["count"]) for row in watch_rows}
-            if set(watch_counts) - DELIVERY_WATCH_STATES or any(
-                value < 0 for value in watch_counts.values()
+            all_watch_counts = {
+                str(row["state"]): int(row["count"]) for row in all_watch_rows
+            }
+            if set(all_watch_counts) - DELIVERY_WATCH_STATES or any(
+                value < 0 for value in all_watch_counts.values()
             ):
                 raise RuntimeError("delivery_backpressure_contract_invalid:watch_state")
+            watch_joins = (
+                """
+                  JOIN rca_outbox AS o ON o.outbox_id = w.submission_outbox_id
+                  JOIN business_triggers AS t
+                    ON t.business_key = o.business_key
+                   AND t.generation = o.generation
+                """
+                if activation_enforced
+                else ""
+            )
+            watch_filter = (
+                f"WHERE {_ACTIVATION_EXECUTION_ELIGIBLE_SQL}"
+                if activation_enforced
+                else ""
+            )
+            if activation_enforced:
+                watch_rows = conn.execute(
+                    f"SELECT w.state, COUNT(*) AS count "
+                    f"FROM rca_execution_watch AS w {watch_joins} "
+                    f"{watch_filter} GROUP BY w.state"
+                ).fetchall()
+                watch_counts = {
+                    str(row["state"]): int(row["count"]) for row in watch_rows
+                }
+            else:
+                watch_counts = all_watch_counts
+            untracked_activation_join = (
+                """
+                  JOIN business_triggers AS t
+                    ON t.business_key = o.business_key
+                   AND t.generation = o.generation
+                """
+                if activation_enforced
+                else ""
+            )
+            untracked_activation_filter = (
+                f"AND {_ACTIVATION_EXECUTION_ELIGIBLE_SQL}"
+                if activation_enforced
+                else ""
+            )
             untracked_completed = int(
                 conn.execute(
-                    """
+                    f"""
                     SELECT COUNT(*)
-                      FROM rca_outbox AS outbox
-                      LEFT JOIN rca_execution_watch AS watch
-                        ON watch.submission_outbox_id = outbox.outbox_id
-                     WHERE outbox.status IN ('completed', 'quarantined')
-                       AND watch.submission_outbox_id IS NULL
+                      FROM rca_outbox AS o
+                      {untracked_activation_join}
+                      LEFT JOIN rca_execution_watch AS w
+                        ON w.submission_outbox_id = o.outbox_id
+                     WHERE o.status IN ('completed', 'quarantined')
+                       AND w.submission_outbox_id IS NULL
+                       {untracked_activation_filter}
                     """
                 ).fetchone()[0]
             )
@@ -10862,12 +10952,16 @@ class RcaDeliveryStore:
         )
 
     def backpressure_snapshot(
-        self, *, now: datetime | None = None
+        self,
+        *,
+        now: datetime | None = None,
+        activation_required: bool = False,
     ) -> DeliveryBackpressureSnapshot:
         return self.read_existing_backpressure_snapshot(
             self.db_path,
             now=now,
             busy_timeout_ms=self.busy_timeout_ms,
+            activation_required=activation_required,
         )
 
     def preview_dispatchable_effects(

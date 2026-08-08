@@ -3867,6 +3867,131 @@ def test_epoch_switch_blocks_historical_watch_materialization_and_effect_aging(
     assert activation["blocked_historical_counts"]["pending_subscriptions"] == 1
 
 
+def test_activation_backpressure_ignores_historical_work_and_counts_current_work(
+    tmp_path,
+):
+    control, historical_effect = _control(tmp_path, issue_id=7041712812)
+    control, historical_watch = _control(
+        tmp_path,
+        offset=11,
+        issue_id=7041712813,
+    )
+    control, historical_untracked = _control(
+        tmp_path,
+        offset=12,
+        issue_id=7041712814,
+    )
+    for result in (historical_effect, historical_watch, historical_untracked):
+        _bind_activation_execution(control, result, state="steady_active")
+    store = RcaDeliveryStore(control.db_path)
+    assert store.backfill_completed_submissions(now=NOW) == 3
+    effect_claim = store.claim_due_watch(
+        lease_owner="historical-effect-collector",
+        now=NOW,
+        activation_required=True,
+    )
+    assert effect_claim is not None
+    store.create_delivery(
+        claim=effect_claim,
+        delivery=_delivery(effect_claim),
+        status={"success": True, "state": "completed"},
+        now=NOW,
+        activation_required=True,
+    )
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute(
+            "DELETE FROM rca_execution_watch WHERE submission_key = ?",
+            (historical_untracked.submission_key,),
+        )
+    _switch_activation_epoch(
+        control,
+        old_epoch="delivery-epoch-1",
+        new_epoch="delivery-epoch-2",
+    )
+
+    activation_snapshot = store.backpressure_snapshot(
+        now=NOW + timedelta(seconds=2)
+    )
+    assert activation_snapshot.unresolved_effects == 0
+    assert activation_snapshot.pending_watches == 0
+    assert activation_snapshot.untracked_completed_submissions == 0
+    assert activation_snapshot.unresolved_work == 0
+
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute("PRAGMA ignore_check_constraints=ON")
+        conn.execute(
+            "UPDATE rca_delivery_effects SET status = 'invalid_historical_state'"
+        )
+    with pytest.raises(RuntimeError, match="effect_status"):
+        store.backpressure_snapshot(
+            now=NOW + timedelta(seconds=2),
+            activation_required=True,
+        )
+
+    current_path = tmp_path / "current"
+    control, current_effect = _control(
+        current_path,
+        issue_id=7041712815,
+    )
+    control, current_untracked = _control(
+        current_path,
+        offset=11,
+        issue_id=7041712816,
+    )
+    _bind_activation_execution(
+        control,
+        current_effect,
+        state="steady_active",
+    )
+    _bind_activation_execution(
+        control,
+        current_untracked,
+        state="steady_active",
+    )
+    current_store = RcaDeliveryStore(control.db_path)
+    assert current_store.backfill_completed_submissions(
+        now=NOW + timedelta(seconds=3)
+    ) == 2
+    current_claim = current_store.claim_due_watch(
+        lease_owner="current-effect-collector",
+        now=NOW + timedelta(seconds=3),
+        activation_required=True,
+    )
+    assert current_claim is not None
+    current_store.create_delivery(
+        claim=current_claim,
+        delivery=_delivery(current_claim),
+        status={"success": True, "state": "completed"},
+        now=NOW + timedelta(seconds=3),
+        activation_required=True,
+    )
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute(
+            "DELETE FROM rca_execution_watch WHERE submission_key = ?",
+            (current_untracked.submission_key,),
+        )
+
+    activation_snapshot = current_store.backpressure_snapshot(
+        now=NOW + timedelta(seconds=4),
+        activation_required=True,
+    )
+    assert activation_snapshot.unresolved_effects == 1
+    assert activation_snapshot.pending_watches == 0
+    assert activation_snapshot.untracked_completed_submissions == 1
+    assert activation_snapshot.unresolved_work == 2
+
+
+def test_activation_backpressure_fails_closed_without_activation_schema(tmp_path):
+    control, result = _control(tmp_path)
+    _bind_activation_execution(control, result, state="steady_active")
+    store = RcaDeliveryStore(control.db_path)
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute("DROP TABLE rca_activation_budget_slots")
+
+    with pytest.raises(RuntimeError, match="delivery_activation_schema_unavailable"):
+        store.backpressure_snapshot(now=NOW)
+
+
 def test_activation_required_concurrent_backfill_and_claim_are_exactly_once(
     tmp_path,
 ):

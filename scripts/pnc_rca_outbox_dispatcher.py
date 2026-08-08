@@ -3800,9 +3800,13 @@ class OutboxDispatcher:
                 snapshot = RcaDeliveryStore.read_existing_backpressure_snapshot(
                     self.config.delivery_db_path,
                     now=self.now(),
+                    activation_required=self.config.activation_required,
                 )
             else:
-                snapshot = self.delivery_store.backpressure_snapshot(now=self.now())
+                snapshot = self.delivery_store.backpressure_snapshot(
+                    now=self.now(),
+                    activation_required=self.config.activation_required,
+                )
             if not isinstance(snapshot, DeliveryBackpressureSnapshot):
                 raise ValueError(
                     "delivery backpressure boundary returned an invalid contract"

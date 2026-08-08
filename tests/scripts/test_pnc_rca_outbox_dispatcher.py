@@ -243,6 +243,34 @@ def test_dispatcher_activation_gate_does_not_claim_legacy_null_row(tmp_path):
     assert row["lease_token"] is None
 
 
+def test_delivery_backpressure_snapshot_uses_strict_activation_scope(tmp_path):
+    env = _config_env(tmp_path)
+    env["HERMES_RCA_OUTBOX_ACTIVATION_REQUIRED"] = "true"
+    config = dispatcher.DispatcherConfig.from_env(env, hermes_home=tmp_path)
+    RcaControlStore(config.control_db_path)
+    snapshot = dispatcher.RcaDeliveryStore(
+        config.delivery_db_path
+    ).backpressure_snapshot()
+    calls = []
+
+    class ProbeDeliveryStore:
+        def backpressure_snapshot(self, *, now, activation_required):
+            calls.append((now, activation_required))
+            return snapshot
+
+    instance = object.__new__(dispatcher.OutboxDispatcher)
+    instance.config = config
+    instance.delivery_store = ProbeDeliveryStore()
+    instance.now = lambda: datetime(2026, 8, 8, tzinfo=timezone.utc)
+    instance.stats = dispatcher.DispatchStats()
+    instance._delivery_backpressure_active = False
+    instance._last_delivery_snapshot = None
+    instance._last_delivery_error = None
+
+    assert instance._delivery_backpressure_outcome() is None
+    assert calls == [(datetime(2026, 8, 8, tzinfo=timezone.utc), True)]
+
+
 def test_dispatcher_renew_passes_activation_required(tmp_path):
     env = _config_env(tmp_path)
     env["HERMES_RCA_OUTBOX_ACTIVATION_REQUIRED"] = "true"
