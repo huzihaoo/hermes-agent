@@ -26,6 +26,7 @@ if str(REPO_ROOT) not in sys.path:
 from gateway.pnc_rca_control_store import (  # noqa: E402
     CONTROL_STORE_SCHEMA_VERSION,
     MANUAL_TRIGGER_SCHEMA_VERSION,
+    SILENT_TERMINAL_RERUN_ERROR_CODES,
     ManualRcaTriggerRequest,
     RcaControlStore,
     build_batch_terminal_rerun_authority,
@@ -796,6 +797,21 @@ def _terminal_failure(
             ),
             "effects": [],
         }
+    if (
+        snapshot.get("watch_state") == "terminal_failed"
+        and snapshot.get("watch_delivery_id") is None
+        and not job_status
+    ):
+        return {
+            "job_status": "",
+            "job_outcome": "",
+            "outcome_key": "",
+            "terminal_state": "watch_terminal_failed",
+            "terminal_error_code": str(
+                snapshot.get("watch_error_code") or "watch_terminal_failed"
+            ),
+            "effects": [],
+        }
     return None
 
 
@@ -830,7 +846,8 @@ def _silent_terminal_authority(
     if (
         snapshot.get("watch_state") != "terminal_failed"
         or snapshot.get("watch_delivery_id") is not None
-        or snapshot.get("watch_error_code") != "rca_work_deadline_exceeded"
+        or snapshot.get("watch_error_code")
+        not in SILENT_TERMINAL_RERUN_ERROR_CODES
     ):
         return None
     return build_silent_terminal_rerun_authority(

@@ -205,6 +205,28 @@ def test_approval_waits_for_required_effect_and_surfaces_terminal_failure():
     assert failure["job_status"] == "partial"
 
 
+def test_terminal_failure_surfaces_silent_watch_without_delivery_job():
+    failure = _terminal_failure(
+        {
+            **_snapshot(job_status=""),
+            "delivery_id": None,
+            "effects": [],
+            "watch_state": "terminal_failed",
+            "watch_delivery_id": None,
+            "watch_error_code": "failure_receipt_missing",
+        }
+    )
+
+    assert failure == {
+        "job_status": "",
+        "job_outcome": "",
+        "outcome_key": "",
+        "terminal_state": "watch_terminal_failed",
+        "terminal_error_code": "failure_receipt_missing",
+        "effects": [],
+    }
+
+
 def test_batch_request_is_operator_issue_only_and_deterministic():
     request = _request(
         batch_id="gray-20260724",
@@ -219,7 +241,12 @@ def test_batch_request_is_operator_issue_only_and_deterministic():
     assert request.requester_id == "automation:rca-batch-rerun"
 
 
-def test_silent_terminal_authority_requires_exact_deadline_no_delivery(tmp_path):
+@pytest.mark.parametrize(
+    "error_code", ["failure_receipt_missing", "rca_work_deadline_exceeded"]
+)
+def test_silent_terminal_authority_requires_exact_deadline_no_delivery(
+    tmp_path, error_code
+):
     batch_id = "gray-20260724"
     reason = f"production_gray_batch:{batch_id}"
     snapshot = {
@@ -228,7 +255,7 @@ def test_silent_terminal_authority_requires_exact_deadline_no_delivery(tmp_path)
         "submission_key": "g1q3-rca-s1-" + "a" * 64,
         "watch_state": "terminal_failed",
         "watch_delivery_id": None,
-        "watch_error_code": "rca_work_deadline_exceeded",
+        "watch_error_code": error_code,
     }
     authority = _silent_terminal_authority(
         snapshot=snapshot,

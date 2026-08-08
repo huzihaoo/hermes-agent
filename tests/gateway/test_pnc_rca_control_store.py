@@ -265,6 +265,46 @@ def _silent_deadline_terminal_store(tmp_path):
     return RcaControlStore(collector.store.db_path), clock[0]
 
 
+def _rewrite_silent_terminal_error_code(
+    store: RcaControlStore, error_code: str
+) -> None:
+    delivery = RcaDeliveryStore(store.db_path)
+    [watch] = delivery.list_rows("rca_execution_watch")
+    [route] = delivery.list_rows("rca_failure_routes")
+    status = json.loads(watch["last_status_json"])
+    taxonomy = status["failure_taxonomy"]
+    taxonomy["raw_code"] = error_code
+    taxonomy["terminal_error_code"] = error_code
+    route_payload = json.loads(route["route_payload_json"])
+    route_payload["blocker"]["kind"] = error_code
+    route_payload["decision"]["raw_code"] = error_code
+    route_payload["decision"]["terminal_error_code"] = error_code
+    conn = store._connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "UPDATE rca_execution_watch SET last_error_code=?, "
+            "last_status_json=? WHERE submission_key=?",
+            (
+                error_code,
+                control_store_module._canonical_json(status),
+                watch["submission_key"],
+            ),
+        )
+        conn.execute(
+            "UPDATE rca_failure_routes SET terminal_error_code=?, "
+            "route_payload_json=? WHERE route_key=?",
+            (
+                error_code,
+                control_store_module._canonical_json(route_payload),
+                route["route_key"],
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _silent_batch_request(batch_id: str = "batch-684") -> ManualRcaTriggerRequest:
     request = _operator_request(
         f"{batch_id}-7041712812-try-1",
@@ -295,10 +335,15 @@ def _silent_batch_authority(
     )
 
 
+@pytest.mark.parametrize(
+    "error_code", ["failure_receipt_missing", "rca_work_deadline_exceeded"]
+)
 def test_operator_silent_terminal_rerun_creates_new_generation_without_old_mutation(
-    tmp_path,
+    tmp_path, error_code,
 ):
     store, terminal_at = _silent_deadline_terminal_store(tmp_path)
+    if error_code != "rca_work_deadline_exceeded":
+        _rewrite_silent_terminal_error_code(store, error_code)
     request = _silent_batch_request()
     authority = _silent_batch_authority(store, request)
     delivery = RcaDeliveryStore(store.db_path)

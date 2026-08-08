@@ -389,6 +389,9 @@ GROUP_USER_RERUN_DEDUPE_SECONDS = 600
 SILENT_TERMINAL_RERUN_AUTHORITY_SCHEMA_VERSION = (
     "pnc_rca_silent_terminal_rerun_authority_v1"
 )
+SILENT_TERMINAL_RERUN_ERROR_CODES = frozenset(
+    {"failure_receipt_missing", "rca_work_deadline_exceeded"}
+)
 SILENT_TERMINAL_RERUN_AUTHORITY_FIELDS = frozenset(
     {
         "schema_version",
@@ -15854,14 +15857,14 @@ class RcaControlStore:
             terminal_generation = int(terminal["watch_generation"] or 0)
         except (TypeError, ValueError, OverflowError):
             return False
+        silent_error_code = str(terminal["last_error_code"] or "")
         if (
             str(terminal["state"] or "") != "terminal_failed"
             or str(terminal["watch_business_key"] or "") != business_key
             or terminal_generation != generation
             or terminal["delivery_id"] is not None
             or not str(terminal["terminal_at"] or "").strip()
-            or str(terminal["last_error_code"] or "")
-            != "rca_work_deadline_exceeded"
+            or silent_error_code not in SILENT_TERMINAL_RERUN_ERROR_CODES
             or not str(terminal["last_error_detail"] or "").strip()
             or any(
                 terminal[name] is not None
@@ -15889,8 +15892,7 @@ class RcaControlStore:
         elif (
             not str(terminal["outbox_quarantined_at"] or "").strip()
             or terminal["outbox_completed_at"] is not None
-            or str(terminal["outbox_error_code"] or "")
-            != "rca_work_deadline_exceeded"
+            or str(terminal["outbox_error_code"] or "") != silent_error_code
         ):
             return False
 
@@ -15910,8 +15912,8 @@ class RcaControlStore:
         if not isinstance(taxonomy, Mapping):
             return False
         if (
-            taxonomy.get("raw_code") != "rca_work_deadline_exceeded"
-            or taxonomy.get("terminal_error_code") != "rca_work_deadline_exceeded"
+            taxonomy.get("raw_code") != silent_error_code
+            or taxonomy.get("terminal_error_code") != silent_error_code
             or taxonomy.get("internal_route") != "internal_alert"
             or taxonomy.get("lane") != "hard_defect"
             or taxonomy.get("known") is not True
@@ -15972,8 +15974,7 @@ class RcaControlStore:
         }:
             return False
         if (
-            str(route["terminal_error_code"] or "")
-            != "rca_work_deadline_exceeded"
+            str(route["terminal_error_code"] or "") != silent_error_code
             or str(route["lane"] or "") != "hard_defect"
             or str(route["route_kind"] or "") != "internal_alert"
             or str(route["owner"] or "") != "rca-engineering"
@@ -15992,8 +15993,8 @@ class RcaControlStore:
         if not isinstance(decision, Mapping) or (
             route_payload.get("schema_version")
             != "pnc_rca_failure_route_payload_v1"
-            or decision.get("terminal_error_code")
-            != "rca_work_deadline_exceeded"
+            or decision.get("raw_code") != silent_error_code
+            or decision.get("terminal_error_code") != silent_error_code
             or decision.get("internal_route") != "internal_alert"
             or decision.get("lane") != "hard_defect"
         ):
