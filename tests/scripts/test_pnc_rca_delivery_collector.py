@@ -59,6 +59,99 @@ def _gate_a_capability(*, status="supported"):
     }
 
 
+def _submission_title_claim(
+    *,
+    source_title: str,
+    receipt_title: str | None = None,
+    receipt_title_sha256: str | None = None,
+):
+    result = {"success": True}
+    if receipt_title is not None:
+        result["work_item"] = {
+            "title": receipt_title,
+            "title_sha256": (
+                receipt_title_sha256
+                if receipt_title_sha256 is not None
+                else collector.issue_title_sha256(receipt_title)
+            ),
+        }
+    return SimpleNamespace(
+        submission_payload={
+            "trigger_context": {
+                "schema_version": "pnc_rca_trigger_context_v1",
+                "source_kind": "feishu_group_manual",
+                "creation_rule_version": "rca-rule-v1",
+                "project_key": "t03o4q",
+                "project_simple_name": "g1q3",
+                "work_item_type_key": "issue",
+                "work_item_id": "7065539652",
+                "issue_url": (
+                    "https://project.feishu.cn/g1q3/issue/detail/7065539652"
+                ),
+                "title": source_title,
+            }
+        },
+        submission_result=result,
+    )
+
+
+def test_submission_issue_title_accepts_bound_receipt_fallback():
+    claim = _submission_title_claim(
+        source_title="",
+        receipt_title="ACC-右车近距离切入ACC不减速",
+    )
+
+    assert collector._submission_issue_title(claim) == (
+        "ACC-右车近距离切入ACC不减速"
+    )
+
+
+def test_submission_issue_title_rejects_receipt_hash_mismatch():
+    claim = _submission_title_claim(
+        source_title="",
+        receipt_title="ACC-右车近距离切入ACC不减速",
+        receipt_title_sha256="f" * 64,
+    )
+
+    with pytest.raises(
+        DeliveryContractError,
+        match="submission_receipt_identity_mismatch",
+    ):
+        collector._submission_issue_title(claim)
+
+
+def test_submission_issue_title_rejects_original_receipt_conflict():
+    claim = _submission_title_claim(
+        source_title="原始问题标题",
+        receipt_title="另一个问题标题",
+    )
+
+    with pytest.raises(
+        DeliveryContractError,
+        match="submission_receipt_identity_mismatch",
+    ):
+        collector._submission_issue_title(claim)
+
+
+def test_submission_issue_title_keeps_matching_original_authoritative():
+    claim = _submission_title_claim(
+        source_title="原始问题标题",
+        receipt_title="原始问题标题",
+    )
+
+    assert collector._submission_issue_title(claim) == "原始问题标题"
+
+
+def test_submission_issue_title_without_original_or_receipt_remains_missing():
+    claim = _submission_title_claim(source_title="")
+
+    with pytest.raises(
+        DeliveryContractError,
+        match="submission_issue_title_missing",
+    ):
+        collector._submission_issue_title(claim)
+
+
 def _manifest_row(path, role, raw, media_type):
     return {
         "role": role,

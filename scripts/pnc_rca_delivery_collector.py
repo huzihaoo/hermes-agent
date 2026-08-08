@@ -76,6 +76,7 @@ from gateway.pnc_rca_delivery_store import (
     StaleDeliveryWatchLeaseError,
 )
 from gateway.pnc_rca_kafka_contract import NORMALIZED_EVENT_SCHEMA_VERSION
+from gateway.pnc_rca_issue_focus import issue_title_sha256, normalized_issue_title
 from gateway.pnc_rca_policy_config import (
     W3SnapshotAuthority,
     w3_snapshot_read_config_from_env,
@@ -2019,10 +2020,31 @@ def _submission_issue_title(
             context = validate_rca_trigger_context(payload.get("trigger_context") or {})
     except Exception as exc:
         raise DeliveryContractError("submission_issue_title_invalid") from exc
-    title = str(context.title or "").strip()
-    if not title:
-        raise DeliveryContractError("submission_issue_title_missing")
-    return title
+    title = normalized_issue_title(context.title)
+    result = claim.submission_result
+    receipt_title = ""
+    if "work_item" in result:
+        receipt_work_item = result.get("work_item")
+        if not isinstance(receipt_work_item, Mapping):
+            raise DeliveryContractError("submission_receipt_identity_mismatch")
+        raw_receipt_title = receipt_work_item.get("title")
+        receipt_title = normalized_issue_title(raw_receipt_title)
+        receipt_title_sha256 = receipt_work_item.get("title_sha256")
+        if (
+            not isinstance(raw_receipt_title, str)
+            or raw_receipt_title != receipt_title
+            or not receipt_title
+            or not isinstance(receipt_title_sha256, str)
+            or receipt_title_sha256 != issue_title_sha256(receipt_title)
+        ):
+            raise DeliveryContractError("submission_receipt_identity_mismatch")
+    if title:
+        if receipt_title and receipt_title != title:
+            raise DeliveryContractError("submission_receipt_identity_mismatch")
+        return title
+    if receipt_title:
+        return receipt_title
+    raise DeliveryContractError("submission_issue_title_missing")
 
 
 def _validate_w3_task_status(

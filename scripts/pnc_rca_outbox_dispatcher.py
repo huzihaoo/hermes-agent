@@ -72,6 +72,7 @@ from gateway.pnc_rca_derived_capacity_reservation import (
     validate_derived_capacity_reservation_receipt,
 )
 from gateway.pnc_rca_kafka_contract import NORMALIZED_EVENT_SCHEMA_VERSION
+from gateway.pnc_rca_issue_focus import issue_title_sha256, normalized_issue_title
 from gateway.pnc_rca_prod_bootstrap import (
     ACTIVE_RELEASE_BINDING_NAME,
     EPOCH_ID_RE as BOOTSTRAP_EPOCH_ID_RE,
@@ -3289,10 +3290,32 @@ def attach_derived_capacity_reservation(
     return attached
 
 
+def _submission_work_item_title_binding(
+    request: RcaExecutionRequest,
+) -> dict[str, str]:
+    work_item = request.work_item
+    if not isinstance(work_item, Mapping):
+        raise DispatchCircuitError(
+            "dispatcher_execution_request_title_missing",
+            "execution request is missing its preread work-item title",
+        )
+    title = normalized_issue_title(work_item.get("title"))
+    if not title:
+        raise DispatchCircuitError(
+            "dispatcher_execution_request_title_missing",
+            "execution request is missing its preread work-item title",
+        )
+    return {
+        "title": title,
+        "title_sha256": issue_title_sha256(title),
+    }
+
+
 def _submission_receipt(
     result: Mapping[str, Any],
     *,
     submission_key: str,
+    work_item_title_binding: Mapping[str, str],
     capacity_admission_summary: Mapping[str, Any],
     derived_capacity_reservation_receipt: Mapping[str, Any],
     snapshot_bundle: AdmissionSnapshotExecutionBundle | None = None,
@@ -3313,6 +3336,7 @@ def _submission_receipt(
         "deduped": result.get("deduped") is True,
         "created": result.get("created"),
         "returncode": result.get("returncode"),
+        "work_item": dict(work_item_title_binding),
         "capacity_admission": {
             "schema_version": str(
                 capacity_admission_summary.get("schema_version") or ""
@@ -3605,6 +3629,7 @@ class OutboxDispatcher:
                     "dispatcher_execution_request_build_failed",
                     f"execution request build failed: {type(exc).__name__}",
                 ) from exc
+            work_item_title_binding = _submission_work_item_title_binding(request)
             reservation_request = build_dispatch_derived_capacity_reservation_request(
                 admission=admission,
                 request=request,
@@ -3729,6 +3754,7 @@ class OutboxDispatcher:
                 receipt = _submission_receipt(
                     result,
                     submission_key=admission.submission_key,
+                    work_item_title_binding=work_item_title_binding,
                     capacity_admission_summary=storage_summary,
                     derived_capacity_reservation_receipt=(
                         validated_reservation.receipt

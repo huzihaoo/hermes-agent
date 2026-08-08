@@ -160,6 +160,34 @@ def _authorization() -> dict[str, object]:
     }
 
 
+def test_submission_receipt_binds_preread_work_item_title():
+    submission_key = "g1q3-rca-s1-" + "a" * 64
+    title_binding = dispatcher._submission_work_item_title_binding(
+        SimpleNamespace(work_item={"title": "ACC-右车近距离切入ACC不减速"})
+    )
+
+    receipt = dispatcher._submission_receipt(
+        {
+            "task": {"task_id": submission_key, "state": "submitted"},
+            "success": True,
+            "deduped": False,
+            "created": True,
+            "returncode": 0,
+        },
+        submission_key=submission_key,
+        work_item_title_binding=title_binding,
+        capacity_admission_summary={},
+        derived_capacity_reservation_receipt={},
+    )
+
+    assert receipt["work_item"] == {
+        "title": "ACC-右车近距离切入ACC不减速",
+        "title_sha256": dispatcher.issue_title_sha256(
+            "ACC-右车近距离切入ACC不减速"
+        ),
+    }
+
+
 def test_config_requires_and_projects_production_capacity_binding(tmp_path):
     config = dispatcher.DispatcherConfig.from_env(
         _config_env(tmp_path), hermes_home=tmp_path
