@@ -1041,6 +1041,7 @@ def _direct_steady(
     predecessor_inflight = {
         "dispatchable_outbox": 0,
         "execution_delivery": 0,
+        "pending_inbox": 0,
         "total": 0,
     }
     if current is not None:

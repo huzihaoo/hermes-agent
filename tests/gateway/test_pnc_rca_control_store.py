@@ -2042,6 +2042,60 @@ def test_direct_steady_rejects_current_predecessor_inflight(
     assert store.activation_epoch() == predecessor
 
 
+def test_direct_steady_counts_current_pending_inbox_and_ignores_old_rows(
+    tmp_path,
+):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    predecessor = _activate_direct_steady_epoch(
+        store,
+        epoch_id="rca-direct-first-20260712",
+    )
+    store.persist_raw(
+        _record(offset=99),
+        policy=_policy(),
+        submit_enabled=True,
+        activation_required=True,
+        activation_slot_kind="",
+    )
+    current = store.direct_steady_predecessor()
+    assert current is not None
+    assert current["inflight"] == {
+        "dispatchable_outbox": 0,
+        "execution_delivery": 0,
+        "pending_inbox": 1,
+        "total": 1,
+    }
+
+    # A pending row carrying an old epoch must not become a successor gate.
+    conn = store._connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "UPDATE kafka_inbox SET activation_epoch_id = ?, decision = 'pending'",
+            ("rca-direct-old-20260711",),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    observed = store.direct_steady_predecessor()
+    assert observed is not None
+    assert observed["inflight"] == {
+        "dispatchable_outbox": 0,
+        "execution_delivery": 0,
+        "pending_inbox": 0,
+        "total": 0,
+    }
+    successor = _activate_direct_steady_epoch(
+        store,
+        epoch_id="rca-direct-second-20260712",
+        start_offset=30,
+        expected_predecessor=observed,
+    )
+    assert successor["state"] == "steady_active"
+    assert store.activation_epoch() == successor
+    assert predecessor["epoch_id"] != successor["epoch_id"]
+
+
 def test_direct_steady_successor_ignores_historical_epoch_inflight(tmp_path):
     store = RcaControlStore(tmp_path / "control.sqlite3")
     historical = _activate_direct_steady_epoch(
@@ -2637,6 +2691,75 @@ def test_activation_delivery_completion_accepts_settled_silent_terminal_route(
             conn,
             epoch_id=store.activation_epoch()["epoch_id"],
         ) == 1
+    finally:
+        conn.close()
+
+
+def test_activation_delivery_completion_accepts_exact_taxonomy_gap_issue_only_route(
+    tmp_path,
+):
+    store, terminal, status = _silent_terminal_activation(tmp_path)
+    _convert_silent_terminal_to_taxonomy_gap(store, terminal, status)
+    row = next(
+        item
+        for item in store.list_rows("rca_outbox")
+        if item["submission_key"] == terminal.submission_key
+    )
+    conn = store._connect()
+    try:
+        assert RcaControlStore._activation_delivery_execution_complete_tx(
+            conn,
+            business_key=row["business_key"],
+            submission_key=row["submission_key"],
+            generation=int(row["generation"]),
+        )
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ("known", "raw_code", "source_conflict", "route_status"),
+)
+def test_activation_taxonomy_gap_route_rejects_forged_contract(
+    tmp_path,
+    corruption,
+):
+    store, terminal, status = _silent_terminal_activation(tmp_path)
+    converted = _convert_silent_terminal_to_taxonomy_gap(store, terminal, status)
+    taxonomy = converted["failure_taxonomy"]
+    if corruption == "known":
+        taxonomy["known"] = True
+    elif corruption == "raw_code":
+        taxonomy["raw_code"] = "different_gap"
+    elif corruption == "source_conflict":
+        taxonomy["source_conflict"] = True
+    else:
+        taxonomy["durable_route"]["status"] = "resolved"
+    conn = store._connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "UPDATE rca_execution_watch SET last_status_json = ? "
+            "WHERE submission_key = ?",
+            (control_store_module._canonical_json(converted), terminal.submission_key),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    row = next(
+        item
+        for item in store.list_rows("rca_outbox")
+        if item["submission_key"] == terminal.submission_key
+    )
+    conn = store._connect()
+    try:
+        assert not RcaControlStore._activation_delivery_execution_complete_tx(
+            conn,
+            business_key=row["business_key"],
+            submission_key=row["submission_key"],
+            generation=int(row["generation"]),
+        )
     finally:
         conn.close()
 
@@ -4169,6 +4292,77 @@ def _silent_terminal_activation(tmp_path):
         now=current + timedelta(seconds=5),
     )
     return store, terminal, status
+
+
+def _convert_silent_terminal_to_taxonomy_gap(
+    store: RcaControlStore,
+    terminal,
+    status: dict,
+) -> dict:
+    converted = json.loads(json.dumps(status))
+    error_code = "taxonomy_gap:submission_issue_title_missing"
+    taxonomy = converted["failure_taxonomy"]
+    taxonomy.update(
+        {
+            "external_comment_policy": "honest_non_attribution_only",
+            "known": False,
+            "observed_state": "pending",
+            "raw_code": "submission_issue_title_missing",
+            "resumed_route_key": taxonomy["durable_route"]["route_key"],
+            "source": "durable_failure_route_deadline",
+            "source_conflict": False,
+            "terminal_error_code": error_code,
+        }
+    )
+    route_key = taxonomy["durable_route"]["route_key"]
+    conn = store._connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            UPDATE rca_execution_watch
+               SET last_error_code = ?, last_status_json = ?
+             WHERE submission_key = ?
+            """,
+            (
+                error_code,
+                control_store_module._canonical_json(converted),
+                terminal.submission_key,
+            ),
+        )
+        conn.execute(
+            "UPDATE rca_failure_routes SET terminal_error_code = ? "
+            "WHERE route_key = ?",
+            (error_code, route_key),
+        )
+        conn.execute(
+            "DELETE FROM rca_delivery_subscription_events "
+            "WHERE subscription_key IN ("
+            "SELECT subscription_key FROM rca_delivery_subscriptions "
+            "WHERE business_key = ? AND generation = ? "
+            "AND effect_kind = 'feishu_thread_reply'"
+            ")",
+            (terminal.business_key, terminal.generation),
+        )
+        conn.execute(
+            "DELETE FROM rca_trigger_delivery_bindings "
+            "WHERE subscription_key IN ("
+            "SELECT subscription_key FROM rca_delivery_subscriptions "
+            "WHERE business_key = ? AND generation = ? "
+            "AND effect_kind = 'feishu_thread_reply'"
+            ")",
+            (terminal.business_key, terminal.generation),
+        )
+        conn.execute(
+            "DELETE FROM rca_delivery_subscriptions "
+            "WHERE business_key = ? AND generation = ? "
+            "AND effect_kind = 'feishu_thread_reply'",
+            (terminal.business_key, terminal.generation),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return converted
 
 
 def _terminalize_input_wait(

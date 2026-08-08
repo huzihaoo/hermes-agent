@@ -7197,6 +7197,15 @@ class RcaControlStore:
                  WHERE epoch_id = ?
             )
         """
+        pending_inbox = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) FROM kafka_inbox
+                 WHERE decision = 'pending' AND activation_epoch_id = ?
+                """,
+                (epoch_id,),
+            ).fetchone()[0]
+        )
         dispatchable_outbox = int(
             conn.execute(
                 f"""
@@ -7228,7 +7237,8 @@ class RcaControlStore:
         return {
             "dispatchable_outbox": dispatchable_outbox,
             "execution_delivery": execution_delivery,
-            "total": dispatchable_outbox + execution_delivery,
+            "pending_inbox": pending_inbox,
+            "total": pending_inbox + dispatchable_outbox + execution_delivery,
         }
 
     def direct_steady_predecessor(self) -> dict[str, Any] | None:
@@ -9069,9 +9079,31 @@ class RcaControlStore:
         lane = str(taxonomy.get("lane") or "")
         durable_route = taxonomy.get("durable_route")
         fallback = taxonomy.get("terminal_fallback")
+        taxonomy_gap_prefix = "taxonomy_gap:"
+        taxonomy_gap_code = (
+            error_code[len(taxonomy_gap_prefix) :]
+            if error_code.startswith(taxonomy_gap_prefix)
+            else ""
+        )
+        known_terminal = (
+            taxonomy.get("known") is True
+            and taxonomy.get("retryable") is False
+            and not taxonomy_gap_code
+        )
+        taxonomy_gap_terminal = (
+            bool(re.fullmatch(r"[a-z0-9_.-]{1,96}", taxonomy_gap_code))
+            and taxonomy.get("known") is False
+            and taxonomy.get("retryable") is False
+            and str(taxonomy.get("raw_code") or "") == taxonomy_gap_code
+            and taxonomy.get("source") == "durable_failure_route_deadline"
+            and taxonomy.get("observed_state") == "pending"
+            and taxonomy.get("source_conflict") is False
+            and taxonomy.get("external_comment_policy")
+            == "honest_non_attribution_only"
+            and (route_kind, lane) == ("internal_alert", "hard_defect")
+        )
         if (
-            taxonomy.get("known") is not True
-            or taxonomy.get("retryable") is not False
+            not (known_terminal or taxonomy_gap_terminal)
             or str(taxonomy.get("terminal_error_code") or "") != error_code
             or (route_kind, lane)
             not in _ACTIVATION_SILENT_TERMINAL_ROUTE_LANES
@@ -9094,6 +9126,16 @@ class RcaControlStore:
             or isinstance(outlet.get("attempt"), bool)
             or not isinstance(outlet.get("attempt"), int)
             or int(outlet["attempt"]) < 1
+        ):
+            return False
+        if taxonomy_gap_terminal and (
+            str(taxonomy.get("resumed_route_key") or "") != route_key
+            or fallback.get("schema_version")
+            != "pnc_rca_bounded_terminal_fallback_v1"
+            or fallback.get("terminal_class") != "honest_non_attribution"
+            or fallback.get("confidence_tier") != "low"
+            or str(durable_route.get("owner") or "") != "rca-engineering"
+            or str(durable_route.get("status") or "") != "alert_pending"
         ):
             return False
         route = conn.execute(
@@ -9143,9 +9185,25 @@ class RcaControlStore:
             """,
             (business_key, generation),
         ).fetchall()
-        if len(subscriptions) != 2 or {
+        subscription_kinds = {
             str(row["effect_kind"] or "") for row in subscriptions
-        } != {"feishu_issue_comment", "feishu_thread_reply"}:
+        }
+        if taxonomy_gap_terminal:
+            valid_subscription_shape = (
+                len(subscriptions) in {1, 2}
+                and len(subscription_kinds) == len(subscriptions)
+                and "feishu_issue_comment" in subscription_kinds
+                and subscription_kinds.issubset(
+                    {"feishu_issue_comment", "feishu_thread_reply"}
+                )
+            )
+        else:
+            valid_subscription_shape = (
+                len(subscriptions) == 2
+                and subscription_kinds
+                == {"feishu_issue_comment", "feishu_thread_reply"}
+            )
+        if not valid_subscription_shape:
             return False
         if any(
             int(row["required"] or 0) != 1
@@ -9156,13 +9214,22 @@ class RcaControlStore:
             for row in subscriptions
         ):
             return False
-        return (
-            conn.execute(
-                "SELECT 1 FROM rca_delivery_jobs WHERE submission_key = ? LIMIT 1",
-                (submission_key,),
-            ).fetchone()
-            is None
-        )
+        delivery_job = conn.execute(
+            "SELECT 1 FROM rca_delivery_jobs WHERE submission_key = ? LIMIT 1",
+            (submission_key,),
+        ).fetchone()
+        delivery_effect = conn.execute(
+            """
+            SELECT 1
+              FROM rca_delivery_effects AS effect
+              JOIN rca_delivery_jobs AS job
+                ON job.delivery_id = effect.delivery_id
+             WHERE job.submission_key = ?
+             LIMIT 1
+            """,
+            (submission_key,),
+        ).fetchone()
+        return delivery_job is None and delivery_effect is None
 
     @classmethod
     def _activation_delivery_execution_complete_tx(
