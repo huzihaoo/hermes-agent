@@ -800,6 +800,8 @@ def _terminal_failure(
     if (
         snapshot.get("watch_state") == "terminal_failed"
         and snapshot.get("watch_delivery_id") is None
+        and snapshot.get("watch_error_code")
+        in SILENT_TERMINAL_RERUN_ERROR_CODES
         and not job_status
     ):
         return {

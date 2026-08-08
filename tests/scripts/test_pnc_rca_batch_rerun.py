@@ -227,6 +227,19 @@ def test_terminal_failure_surfaces_silent_watch_without_delivery_job():
     }
 
 
+def test_terminal_failure_does_not_expand_to_other_silent_watch_codes():
+    snapshot = {
+        **_snapshot(job_status=""),
+        "delivery_id": None,
+        "effects": [],
+        "watch_state": "terminal_failed",
+        "watch_delivery_id": None,
+        "watch_error_code": "vm_status_missing",
+    }
+
+    assert _terminal_failure(snapshot) is None
+
+
 def test_batch_request_is_operator_issue_only_and_deterministic():
     request = _request(
         batch_id="gray-20260724",
