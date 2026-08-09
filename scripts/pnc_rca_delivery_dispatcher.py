@@ -2702,6 +2702,17 @@ class MeegleIssueCommentAdapter:
             return _error_payload(rc, out, err)
         remote_id = _remote_id(_json_stdout(out))
         if not remote_id:
+            readback = self.list_comments(project_key, work_item_id)
+            comments = readback.get("comments") if isinstance(readback, Mapping) else None
+            marker = _delivery_marker_from_content(content)
+            if isinstance(comments, list) and marker:
+                matches = _confirmed_content_matches(comments, marker, content)
+                if len(matches) == 1:
+                    return {
+                        "success": True,
+                        "remote_id": matches[0]["remote_id"],
+                        "confirmed_by": "comment_list_readback",
+                    }
             return {
                 "success": False,
                 "outcome_uncertain": True,
@@ -3899,14 +3910,28 @@ def _marker_matches(
         # Meegle preserves the marker text but strips Markdown link brackets.
         remote_marker = marker[1:-1]
         variants.add(remote_marker)
+    compact_variants = {variant.replace(" ", "") for variant in variants}
     return [
         item
         for item in comments
         if any(
-            line in variants or line.replace(" ", "") == remote_marker
+            line in variants or line.replace(" ", "") in compact_variants
             for line in item["content"].splitlines()
         )
     ]
+
+
+def _delivery_marker_from_content(content: str) -> str:
+    markers = [
+        line
+        for line in str(content).splitlines()
+        if (
+            line.startswith("[RCA_DELIVERY:")
+            or line.startswith("[RCA_TERMINAL:")
+        )
+        and line.endswith("]")
+    ]
+    return markers[0] if len(markers) == 1 else ""
 
 
 def _canonical_remote_content(content: str, marker: str) -> str | None:
@@ -3916,12 +3941,13 @@ def _canonical_remote_content(content: str, marker: str) -> str | None:
     remote_marker = (
         marker[1:-1] if marker.startswith("[") and marker.endswith("]") else marker
     )
+    compact_markers = {marker.replace(" ", ""), remote_marker.replace(" ", "")}
     marker_indexes = [
         index
         for index, line in enumerate(lines)
         if line == marker
         or line == remote_marker
-        or line.replace(" ", "") == remote_marker
+        or line.replace(" ", "") in compact_markers
     ]
     if len(marker_indexes) == 1:
         lines[marker_indexes[0]] = marker

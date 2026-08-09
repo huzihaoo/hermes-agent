@@ -2834,11 +2834,15 @@ def test_remote_terminal_marker_matching_accepts_meegle_inserted_spaces():
             "remote_id": "suffixed",
             "content": "RCA_TERMINAL:effect-key :terminal_failed: 2 suffix",
         },
+        {
+            "remote_id": "bracketed",
+            "content": "[RCA_TERMINAL:effect-key :terminal_failed: 2]",
+        },
     ]
 
     matches = dispatcher_module._marker_matches(comments, marker)
 
-    assert [item["remote_id"] for item in matches] == ["normalized"]
+    assert [item["remote_id"] for item in matches] == ["normalized", "bracketed"]
 
 
 def test_remote_content_matching_accepts_strict_meegle_rendering_only():
@@ -5232,6 +5236,51 @@ def test_meegle_adapter_treats_weak_success_as_uncertain():
     assert result["success"] is False
     assert result["outcome_uncertain"] is True
     assert result["error_code"] == "feishu_add_remote_id_missing"
+
+
+def test_meegle_adapter_confirms_empty_success_response_by_comment_readback():
+    marker = "[RCA_TERMINAL:effect-key:quarantined:1]"
+    issue_url = "https://project.feishu.cn/t03o4q/issue/detail/7041712812"
+    content = f"本单未能定向\n{marker}\n重新分析 {issue_url}"
+    rendered = (
+        "本单未能定向\n\n"
+        "[RCA_TERMINAL:effect-key :quarantined: 1]\n\n"
+        f"重新分析 [{issue_url}]({issue_url})\n"
+    )
+    calls = []
+
+    def runner(args):
+        calls.append(args[:2])
+        if args[:2] == ["comment", "add"]:
+            return 0, "", ""
+        if args[:2] == ["comment", "list"]:
+            return (
+                0,
+                json.dumps({
+                    "comments": [
+                        {"comment_id": "7671912312650894535", "content": rendered}
+                    ],
+                    "pagination": {
+                        "page_num": 1,
+                        "page_size": 20,
+                        "total": 1,
+                        "total_pages": 1,
+                    },
+                }),
+                "",
+            )
+        raise AssertionError(args)
+
+    adapter = MeegleIssueCommentAdapter(runner)
+    with dispatcher_module._bound_provider_write_guard(_TEST_PROVIDER_WRITE_CLAIM):
+        result = adapter.add_comment("t03o4q", "7041712812", content)
+
+    assert result == {
+        "success": True,
+        "remote_id": "7671912312650894535",
+        "confirmed_by": "comment_list_readback",
+    }
+    assert calls == [["comment", "add"], ["comment", "list"]]
 
 
 def test_meegle_adapter_reads_and_updates_only_attribution_fields():
