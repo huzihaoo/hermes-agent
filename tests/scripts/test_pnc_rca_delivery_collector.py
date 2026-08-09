@@ -1238,6 +1238,10 @@ def test_late_host_observation_delivers_vm_result_completed_before_deadline(
             "task_id": task_id,
             "state": "completed",
             "updated_at": (NOW - timedelta(seconds=2)).isoformat(),
+            "meta": {
+                "state": "completed",
+                "updated_at": (NOW - timedelta(seconds=2)).isoformat(),
+            },
         },
     )
     _age_work_start(instance, seconds=1801)
@@ -1255,6 +1259,33 @@ def test_late_host_observation_delivers_vm_result_completed_before_deadline(
     [watch] = instance.store.list_rows("rca_execution_watch")
     assert watch["state"] == "delivery_created"
     assert watch["last_error_code"] == ""
+
+
+def test_completed_status_with_mismatched_meta_time_still_hits_deadline(
+    tmp_path,
+):
+    clock = [NOW]
+    instance = _real_terminal_collector(
+        tmp_path,
+        clock=clock,
+        status_reader=lambda task_id: {
+            "success": True,
+            "task_id": task_id,
+            "state": "completed",
+            "updated_at": (NOW - timedelta(seconds=2)).isoformat(),
+            "meta": {
+                "state": "running",
+                "updated_at": (NOW - timedelta(seconds=2)).isoformat(),
+            },
+        },
+    )
+    _age_work_start(instance, seconds=1801)
+    instance.artifact_bundle_reader = lambda _claim: {}
+
+    outcome = instance.collect_one()
+
+    assert outcome.status == "terminal_failed"
+    assert outcome.error_code == "rca_work_deadline_exceeded"
 
 
 def test_late_valid_completed_bundle_becomes_low_fallback_not_delivery(

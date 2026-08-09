@@ -251,14 +251,35 @@ def _completed_within_work_window(
         return False
     meta = status.get("meta")
     meta = meta if isinstance(meta, Mapping) else {}
-    completed_at = (
-        status.get("completed_at")
-        or status.get("updated_at")
-        or meta.get("completed_at")
-        or meta.get("updated_at")
-    )
+    completed_at = status.get("completed_at") or meta.get("completed_at")
+    if completed_at is None:
+        # A generic top-level updated_at is not enough: bind it to the same
+        # completed state and timestamp carried by the canonical meta object.
+        meta_state = str(meta.get("state") or "").strip().lower()
+        status_updated_at = status.get("updated_at")
+        meta_updated_at = meta.get("updated_at")
+        if (
+            meta_state not in _COMPLETED_STATES
+            or status_updated_at in (None, "")
+            or meta_updated_at in (None, "")
+        ):
+            return False
+        try:
+            status_updated = _utc_datetime(
+                status_updated_at, field="status_updated_at"
+            )
+            meta_updated = _utc_datetime(meta_updated_at, field="meta_updated_at")
+        except RuntimeError:
+            return False
+        if status_updated != meta_updated:
+            return False
+        completed_at = status_updated
     try:
-        observed = _utc_datetime(completed_at, field="status_completed_at")
+        observed = (
+            completed_at
+            if isinstance(completed_at, datetime)
+            else _utc_datetime(completed_at, field="status_completed_at")
+        )
         started, deadline, _elapsed = _work_window(claim, observed)
     except RuntimeError:
         return False
