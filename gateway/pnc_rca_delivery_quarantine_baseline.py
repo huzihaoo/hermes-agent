@@ -1686,6 +1686,7 @@ def _effect_settlement_projection(
     receipt_settled = 0
     superseded = 0
     prewrite_no_external_write = 0
+    retained_terminal = 0
     for row in rows:
         effect_key = str(row["effect_key"])
         effect_kind = str(row["effect_kind"])
@@ -1787,9 +1788,20 @@ def _effect_settlement_projection(
             ),
         ).fetchone()
         if later is None or not later["completed_at"]:
-            raise DeliveryQuarantineBaselineError(
-                "delivery_quarantine_effect_settlement_incomplete"
+            entries.append(
+                {
+                    **entry,
+                    "disposition": "retained_terminal",
+                    "evidence_effect_key": effect_key,
+                    "superseding_delivery_id": "",
+                    "superseding_generation": 0,
+                    "superseding_completed_at": "",
+                    "superseding_remote_receipt_sha256": "",
+                    "superseding_confirmed_field_keys": [],
+                }
             )
+            retained_terminal += 1
+            continue
         try:
             _parse_iso(later["completed_at"])
             remote_receipt = _strict_json(
@@ -1836,6 +1848,8 @@ def _effect_settlement_projection(
     }
     if prewrite_no_external_write:
         body["prewrite_no_external_write_count"] = prewrite_no_external_write
+    if retained_terminal:
+        body["retained_terminal_count"] = retained_terminal
     return {
         **body,
         "entries_sha256": hashlib.sha256(_canonical_bytes(entries)).hexdigest(),

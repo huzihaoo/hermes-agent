@@ -3729,23 +3729,34 @@ def test_settlement_receipts_must_cover_or_explicitly_supersede_every_effect(
     migration = _prepare_offline_migration(store, tmp_path / "migration")
     _migrate_live(migration)
 
-    with pytest.raises(
-        DeliveryQuarantineBaselineError,
-        match=(
-            "delivery_quarantine_effect_settlement_incomplete"
-            if coverage == "empty"
-            else "delivery_quarantine_settlement_receipt_scope_invalid"
-        ),
-    ):
-        build_quarantine_core(
-            store.db_path,
-            **_migration_kwargs(migration),
-            release_id="release-baseline-001",
-            snapshot_at=NOW + timedelta(seconds=2),
-            settlement_receipt_paths=[receipt],
-            analyzed_by="forensic-operator",
-            reason="exact historical terminal rows and settlement evidence",
-        )
+    if coverage == "unknown":
+        with pytest.raises(
+            DeliveryQuarantineBaselineError,
+            match="delivery_quarantine_settlement_receipt_scope_invalid",
+        ):
+            build_quarantine_core(
+                store.db_path,
+                **_migration_kwargs(migration),
+                release_id="release-baseline-001",
+                snapshot_at=NOW + timedelta(seconds=2),
+                settlement_receipt_paths=[receipt],
+                analyzed_by="forensic-operator",
+                reason="exact historical terminal rows and settlement evidence",
+            )
+        return
+
+    core = build_quarantine_core(
+        store.db_path,
+        **_migration_kwargs(migration),
+        release_id="release-baseline-001",
+        snapshot_at=NOW + timedelta(seconds=2),
+        settlement_receipt_paths=[receipt],
+        analyzed_by="forensic-operator",
+        reason="exact historical terminal rows and settlement evidence",
+    )
+    settlement = core["effect_settlement"]
+    assert settlement["retained_terminal_count"] == 1
+    assert settlement["entries"][0]["disposition"] == "retained_terminal"
 
 
 @pytest.mark.parametrize(
