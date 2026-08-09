@@ -181,7 +181,7 @@ def test_stale_snapshot_and_snapshot_hash_tamper_fail_closed():
 def test_live_resource_policy_tamper_fails_closed():
     result = issue()
     tampered = copy.deepcopy(result.receipt)
-    tampered["resource_policy"]["max_concurrency"] = 2
+    tampered["resource_policy"]["max_concurrency"] = 3
     tampered = admission._sign_receipt(tampered, admission._load_hmac_key(KEY))
     with pytest.raises(admission.RcaProdAdmissionError, match="resource_policy_invalid"):
         admission.validate_rca_prod_receipt(

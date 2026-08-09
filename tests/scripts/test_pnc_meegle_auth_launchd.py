@@ -18,10 +18,12 @@ def test_meegle_auth_watchdog_resolves_the_active_manifest():
         "local.pnc.meegle-auth-watchdog",
         "--once",
         "--json",
+        "--no-assist",
     ]
     assert payload["WorkingDirectory"] == "/Users/songying/.hermes/runtime"
     environment = payload["EnvironmentVariables"]
     assert "VIRTUAL_ENV" not in environment
+    assert "PNC_MEEGLE_PROACTIVE_REINIT_HOURS" not in environment
     text = PLIST_PATH.read_text(encoding="utf-8")
     assert "/runtime/releases/" not in text
     assert "/runtime/venvs/" not in text

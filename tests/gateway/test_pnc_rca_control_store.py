@@ -242,11 +242,7 @@ def _silent_deadline_terminal_store(tmp_path):
     collector = _real_terminal_collector(
         tmp_path,
         clock=clock,
-        status_reader=lambda task_id: {
-            "success": True,
-            "task_id": task_id,
-            "state": "running",
-        },
+        blocker={"kind": "service_provenance_unavailable", "retryable": False},
     )
     control = RcaControlStore(collector.store.db_path)
     [trigger] = control.list_rows("business_triggers")
@@ -259,11 +255,11 @@ def _silent_deadline_terminal_store(tmp_path):
         ),
     )
     collector.config = replace(collector.config, activation_required=True)
-    assert collector.collect_one().status == "running"
+    assert collector.collect_one().status == "failure_hold"
     clock[0] = delivery_now + timedelta(seconds=1800)
     terminal = collector.collect_one()
     assert terminal.status == "terminal_failed"
-    assert terminal.error_code == "rca_work_deadline_exceeded"
+    assert terminal.error_code == "service_provenance_unavailable"
     return RcaControlStore(collector.store.db_path), clock[0]
 
 
@@ -383,6 +379,44 @@ def _silent_batch_authority(
         requester_id=request.requester_id,
         reason=request.reason,
     )
+
+
+def _pre_w3_preread_terminal_store(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    _activate_direct_steady_epoch(store, epoch_id="rca-pre-w3-rerun-current")
+    first = store.admit_manual_trigger(
+        _operator_request(
+            "pre-w3-preread-origin",
+            requester_id="automation:rca-batch-rerun",
+        ),
+        allowed_chat_ids=set(),
+        submit_enabled=True,
+        operator_authorized=True,
+        active_policy=_policy(),
+        activation_required=True,
+        outbox_high_watermark=10_000,
+    )
+    terminal_at = datetime.now(timezone.utc) + timedelta(seconds=1)
+    claim = store.claim_outbox(
+        lease_owner="pre-w3-preread-dispatcher",
+        lease_seconds=180,
+        activation_required=True,
+        now=terminal_at,
+    )
+    assert claim is not None and claim.submission_key == first.submission_key
+    store.quarantine_outbox(
+        outbox_id=claim.outbox_id,
+        lease_token=claim.lease_token,
+        error_code="host_issue_preread_failed",
+        error_detail="transient Meegle and MCP preread failure",
+        now=terminal_at,
+    )
+    delivery = RcaDeliveryStore(store.db_path)
+    assert delivery.backfill_completed_submissions(
+        now=terminal_at + timedelta(seconds=1),
+        activation_required=True,
+    ) == 1
+    return store, first, terminal_at
 
 
 @pytest.mark.parametrize(
@@ -647,7 +681,7 @@ def test_operator_silent_terminal_rerun_creates_new_generation_without_old_mutat
     tmp_path, error_code,
 ):
     store, terminal_at = _silent_deadline_terminal_store(tmp_path)
-    if error_code != "rca_work_deadline_exceeded":
+    if error_code != "service_provenance_unavailable":
         _rewrite_silent_terminal_error_code(store, error_code)
     request = _silent_batch_request()
     authority = _silent_batch_authority(store, request)
@@ -697,6 +731,116 @@ def test_operator_silent_terminal_rerun_creates_new_generation_without_old_mutat
     assert json.loads(audit["detail"]) == authority
     assert audit["from_status"] == "terminal_failed:g1"
     assert audit["to_status"] == "pending:g2"
+
+
+def test_owner_batch_rerun_appends_after_pre_w3_preread_terminal_without_old_mutation(
+    tmp_path,
+):
+    store, first, terminal_at = _pre_w3_preread_terminal_store(tmp_path)
+    request = _silent_batch_request()
+    authority = _silent_batch_authority(store, request)
+    delivery = RcaDeliveryStore(store.db_path)
+    old_rows = {
+        table: [dict(item) for item in store.list_rows(table)]
+        for table in (
+            "business_triggers",
+            "rca_outbox",
+            "rca_delivery_subscriptions",
+        )
+    }
+    old_watch = [dict(item) for item in delivery.list_rows("rca_execution_watch")]
+
+    rerun = store.admit_manual_trigger(
+        request,
+        allowed_chat_ids=set(),
+        submit_enabled=True,
+        operator_authorized=True,
+        silent_terminal_rerun_authority=authority,
+        outbox_high_watermark=10_000,
+        activation_required=True,
+        now=terminal_at + timedelta(seconds=2),
+    )
+
+    assert rerun.outcome == "created"
+    assert rerun.generation == first.generation + 1
+    assert [
+        dict(item)
+        for item in store.list_rows("business_triggers")
+        if item["generation"] == first.generation
+    ] == old_rows["business_triggers"]
+    assert [
+        dict(item)
+        for item in store.list_rows("rca_outbox")
+        if item["generation"] == first.generation
+    ] == old_rows["rca_outbox"]
+    assert delivery.list_rows("rca_execution_watch") == old_watch
+    assert [
+        dict(item)
+        for item in store.list_rows("rca_delivery_subscriptions")
+        if item["generation"] == first.generation
+    ] == old_rows["rca_delivery_subscriptions"]
+    [new_outbox] = [
+        item for item in store.list_rows("rca_outbox") if item["generation"] == 2
+    ]
+    assert new_outbox["status"] == "pending"
+
+
+@pytest.mark.parametrize(
+    "drift", ["task_created", "subscription_reopened", "optional_materialized"]
+)
+def test_owner_batch_rerun_rejects_nonzero_pre_w3_execution_state(tmp_path, drift):
+    store, _first, terminal_at = _pre_w3_preread_terminal_store(tmp_path)
+    request = _silent_batch_request()
+    authority = _silent_batch_authority(store, request)
+    conn = store._connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if drift == "task_created":
+            conn.execute(
+                "UPDATE rca_execution_watch SET task_id = 'unexpected-task'"
+            )
+        elif drift == "subscription_reopened":
+            conn.execute(
+                "UPDATE rca_delivery_subscriptions "
+                "SET status = 'pending', reason = 'unexpected_reopen'"
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO rca_delivery_subscriptions(
+                    subscription_key, business_key, generation, source_id,
+                    effect_kind, target_key, target_json, required, status,
+                    reason, delivery_id, effect_key, created_at, updated_at
+                )
+                SELECT 'unexpected-optional', business_key, generation, NULL,
+                       effect_kind, target_key || ':optional', target_json, 0,
+                       'materialized', 'delivery_effect_materialized',
+                       'unexpected-delivery', 'unexpected-effect',
+                       created_at, updated_at
+                  FROM rca_delivery_subscriptions
+                 LIMIT 1
+                """
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(
+        ManualRcaAdmissionError,
+        match="silent_terminal_rerun_terminal_generation_required",
+    ):
+        store.admit_manual_trigger(
+            request,
+            allowed_chat_ids=set(),
+            submit_enabled=True,
+            operator_authorized=True,
+            silent_terminal_rerun_authority=authority,
+            outbox_high_watermark=10_000,
+            activation_required=True,
+            now=terminal_at + timedelta(seconds=2),
+        )
+    assert len(store.list_rows("business_triggers")) == 1
+    assert len(store.list_rows("rca_outbox")) == 1
 
 
 def test_owner_authorized_silent_terminal_rerun_can_publish_success_conclusion(
@@ -4739,8 +4883,132 @@ def _quarantine_for_input_wait(
         max_age_seconds=60,
         now=window_started + timedelta(seconds=61),
     )
+    assert mutation.status == "pending"
+    first_failure_at = window_started + timedelta(seconds=61)
+    claim = store.claim_outbox(
+        lease_owner="input-wait-test",
+        lease_seconds=180,
+        now=first_failure_at + timedelta(seconds=59),
+    )
+    assert claim is not None
+    mutation = store.retry_outbox(
+        outbox_id=claim.outbox_id,
+        lease_token=claim.lease_token,
+        error_code=error_code,
+        error_detail="redacted test detail",
+        delay_seconds=2,
+        max_age_seconds=60,
+        now=first_failure_at + timedelta(seconds=61),
+    )
     assert mutation.status == "quarantined"
     return claim.outbox_id, window_started
+
+
+def test_input_wait_retry_window_starts_at_first_failure_not_queue_admission(
+    tmp_path,
+):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    _register_policy_without_classifying(store)
+    store.admit_manual_trigger(
+        _manual_request("om_retry_window"),
+        allowed_chat_ids={"oc_allowed"},
+        submit_enabled=True,
+    )
+    [before] = store.list_rows("rca_outbox")
+    admitted_at = datetime.fromisoformat(before["created_at"])
+    first_failure_at = admitted_at + timedelta(hours=6)
+    claim = store.claim_outbox(
+        lease_owner="late-first-failure",
+        lease_seconds=180,
+        now=first_failure_at,
+    )
+    assert claim is not None
+
+    first = store.retry_outbox(
+        outbox_id=claim.outbox_id,
+        lease_token=claim.lease_token,
+        error_code="host_issue_preread_failed",
+        error_detail="transient preread failure",
+        delay_seconds=2,
+        max_age_seconds=900,
+        now=first_failure_at,
+    )
+
+    assert first.status == "pending"
+    [after_first] = store.list_rows("rca_outbox")
+    assert after_first["retry_window_started_at"] == first_failure_at.isoformat()
+    assert after_first["next_attempt_at"] == (
+        first_failure_at + timedelta(seconds=2)
+    ).isoformat()
+
+    claim = store.claim_outbox(
+        lease_owner="expired-failure-window",
+        lease_seconds=180,
+        now=first_failure_at + timedelta(seconds=899),
+    )
+    assert claim is not None
+    expired = store.retry_outbox(
+        outbox_id=claim.outbox_id,
+        lease_token=claim.lease_token,
+        error_code="host_issue_preread_failed",
+        error_detail="persistent preread failure",
+        delay_seconds=2,
+        max_age_seconds=900,
+        now=first_failure_at + timedelta(seconds=901),
+    )
+
+    assert expired.status == "quarantined"
+    [after_expiry] = store.list_rows("rca_outbox")
+    assert after_expiry["retry_window_started_at"] == first_failure_at.isoformat()
+
+
+def test_input_wait_retry_window_restarts_when_entering_from_general_failure(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    _register_policy_without_classifying(store)
+    store.admit_manual_trigger(
+        _manual_request("om_retry_window_transition"),
+        allowed_chat_ids={"oc_allowed"},
+        submit_enabled=True,
+    )
+    [before] = store.list_rows("rca_outbox")
+    first_failure_at = datetime.fromisoformat(before["created_at"]) + timedelta(hours=1)
+    claim = store.claim_outbox(
+        lease_owner="general-failure",
+        lease_seconds=180,
+        now=first_failure_at,
+    )
+    assert claim is not None
+    general = store.retry_outbox(
+        outbox_id=claim.outbox_id,
+        lease_token=claim.lease_token,
+        error_code="storage_admission_blocked",
+        delay_seconds=1,
+        max_age_seconds=86_400,
+        now=first_failure_at,
+    )
+    assert general.status == "pending"
+    [after_general] = store.list_rows("rca_outbox")
+    assert after_general["retry_window_started_at"] == before["created_at"]
+
+    first_preread_failure_at = first_failure_at + timedelta(seconds=901)
+    claim = store.claim_outbox(
+        lease_owner="first-preread-failure",
+        lease_seconds=180,
+        now=first_preread_failure_at,
+    )
+    assert claim is not None
+    preread = store.retry_outbox(
+        outbox_id=claim.outbox_id,
+        lease_token=claim.lease_token,
+        error_code="host_issue_preread_failed",
+        delay_seconds=1,
+        max_age_seconds=900,
+        now=first_preread_failure_at,
+    )
+
+    assert preread.status == "pending"
+    [after] = store.list_rows("rca_outbox")
+    assert after["retry_window_started_at"] == first_preread_failure_at.isoformat()
 
 
 def _settle_delivery(store: RcaControlStore, submission_key: str) -> None:
@@ -5876,7 +6144,7 @@ def test_input_wait_quarantine_is_atomically_rearmed_by_new_offset(tmp_path):
     original_outbox_id, original_window = _quarantine_for_input_wait(store)
     quarantined = store.list_rows("rca_outbox")[0]
     prior_fence = quarantined["fence"]
-    assert quarantined["attempt"] == 1
+    assert quarantined["attempt"] == 2
 
     replacement_value = _value(updated_at=1783659999999)
     replacement = store.ingest_record(
@@ -5930,7 +6198,7 @@ def test_input_wait_quarantine_is_atomically_rearmed_by_new_offset(tmp_path):
         "submission_key": first.submission_key,
         "prior_source_event_id": first.event_uid,
         "replacement_source_event_id": replacement.event_uid,
-        "prior_attempt": 1,
+            "prior_attempt": 2,
         "prior_fence": prior_fence,
         "prior_error_code": "issue_field_missing_remote_data_reference",
         "reason": INPUT_WAIT_QUARANTINE_REARMED_REASON,

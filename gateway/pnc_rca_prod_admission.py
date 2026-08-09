@@ -40,7 +40,7 @@ MAX_DNP_REAL = 4
 MAX_DNP_LIKE = 12
 MAX_MCAP_RSS_BYTES = 24 * 1024**3
 MAX_MCAP_PROCESS_COUNT = 2
-MAX_CONCURRENCY = 1
+MAX_CONCURRENCY = 4
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 

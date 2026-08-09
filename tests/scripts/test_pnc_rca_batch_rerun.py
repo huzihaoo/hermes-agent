@@ -544,6 +544,107 @@ def test_silent_terminal_authority_requires_exact_deadline_no_delivery(
         ) is None
 
 
+def test_silent_terminal_authority_accepts_exact_pre_w3_no_write_preread_failure(
+    tmp_path,
+):
+    status = {
+        "success": False,
+        "state": "quarantined",
+        "error_code": "w3_execution_snapshot_missing",
+        "external_writes": False,
+        "terminal_delivery_policy": "silent_internal_alert_only",
+    }
+    snapshot = {
+        **_snapshot(job_status="", job_outcome=""),
+        "generation": 2,
+        "business_key": "g1q3-rca-business-v1-" + "b" * 64,
+        "submission_key": "g1q3-rca-s1-" + "a" * 64,
+        "delivery_id": None,
+        "effects": [],
+        "trigger_state": "quarantined",
+        "outbox_status": "quarantined",
+        "outbox_error_code": "host_issue_preread_failed",
+        "outbox_error_detail": "transient preread failure",
+        "outbox_attempt": 1,
+        "outbox_next_attempt_at": None,
+        "outbox_claimed_at": "2026-08-09T19:09:49+00:00",
+        "outbox_completed_at": None,
+        "outbox_quarantined_at": "2026-08-09T19:09:50+00:00",
+        "outbox_result_json": None,
+        "outbox_lease_token": None,
+        "outbox_lease_owner": None,
+        "outbox_lease_expires_at": None,
+        "watch_state": "quarantined",
+        "watch_business_key": "g1q3-rca-business-v1-" + "b" * 64,
+        "watch_generation": 2,
+        "watch_task_id": None,
+        "watch_delivery_id": None,
+        "watch_error_code": "w3_execution_snapshot_missing",
+        "watch_error_detail": "pre-W3 quarantine",
+        "watch_status_json": json.dumps(status),
+        "watch_terminal_at": "2026-08-09T19:09:50+00:00",
+        "watch_lease_token": None,
+        "watch_lease_owner": None,
+        "watch_lease_expires_at": None,
+        "admission_snapshot_count": 0,
+        "delivery_job_count": 0,
+        "delivery_effect_count": 0,
+        "provider_attempt_count": 0,
+        "subscriptions": [
+            {
+                "required": 1,
+                "status": "quarantined",
+                "delivery_id": None,
+                "effect_key": None,
+                "reason": "w3_execution_snapshot_missing",
+            }
+        ],
+    }
+    kwargs = {
+        "batch_id": "gray-20260724",
+        "queue_sha256": "1" * 64,
+        "issue_id": "7048803418",
+        "owner_receipt_path": str(tmp_path / "owner.json"),
+        "owner_receipt_sha256": "2" * 64,
+        "requester_id": "automation:rca-batch-rerun",
+        "reason": "production_gray_batch:gray-20260724",
+    }
+
+    authority = _silent_terminal_authority(snapshot=snapshot, **kwargs)
+
+    assert authority is not None
+    assert authority["prior_generation"] == 2
+    for changes in (
+        {"watch_task_id": "unexpected-task"},
+        {"outbox_error_code": "host_issue_preread_empty"},
+        {"subscriptions": []},
+        {"delivery_id": "unexpected-delivery"},
+        {"admission_snapshot_count": 1},
+        {"delivery_job_count": 1},
+        {"delivery_effect_count": 1},
+        {"provider_attempt_count": 1},
+        {"outbox_error_detail": ""},
+        {"outbox_quarantined_at": ""},
+        {"watch_business_key": "other-business"},
+        {"watch_generation": 1},
+        {
+            "subscriptions": [
+                *snapshot["subscriptions"],
+                {
+                    "required": 0,
+                    "status": "materialized",
+                    "delivery_id": "unexpected-delivery",
+                    "effect_key": "unexpected-effect",
+                    "reason": "delivery_effect_materialized",
+                },
+            ]
+        },
+    ):
+        assert _silent_terminal_authority(
+            snapshot={**snapshot, **changes}, **kwargs
+        ) is None
+
+
 def test_batch_terminal_authority_accepts_any_settled_owner_approved_delivery(
     tmp_path,
 ):
@@ -1361,6 +1462,73 @@ def test_submit_all_defers_unavailable_authority_and_continues(tmp_path, monkeyp
     assert item["request_index"] == 1
 
 
+def test_submit_all_defers_silent_authority_rejected_by_store(tmp_path, monkeypatch):
+    queue_path, owner_path = _write_run_inputs(tmp_path, _queue_value())
+    prior_submission_key = "g1q3-rca-s1-" + "a" * 64
+    prior = {
+        **_snapshot(job_status=""),
+        "generation": 1,
+        "submission_key": prior_submission_key,
+        "delivery_id": None,
+        "effects": [],
+        "watch_state": "terminal_failed",
+        "watch_delivery_id": None,
+        "watch_error_code": "rca_work_deadline_exceeded",
+    }
+    state = {
+        "items": {
+            "7048803418": {
+                "issue_id": "7048803418",
+                "title": "ACC braking issue",
+                "quality_classification": "missing",
+                "priority": 1,
+                "status": "submitted",
+                "request_index": 1,
+                "generation": 1,
+                "submission_key": prior_submission_key,
+            }
+        }
+    }
+
+    class FakeStore:
+        def __init__(self, _path):
+            pass
+
+        def admit_manual_trigger(self, *_args, **_kwargs):
+            raise batch_rerun.ManualRcaAdmissionError(
+                "silent_terminal_rerun_terminal_generation_required"
+            )
+
+    monkeypatch.setattr(batch_rerun, "RcaControlStore", FakeStore)
+    monkeypatch.setattr(batch_rerun, "_issue_snapshot", lambda *_args, **_kwargs: prior)
+    monkeypatch.setattr(
+        batch_rerun,
+        "_load_or_create_state",
+        lambda *_args, **_kwargs: state,
+    )
+    monkeypatch.setattr(
+        batch_rerun, "_runtime_identity", lambda: ("a" * 40, "b" * 40)
+    )
+    args = _run_args(tmp_path, queue_path, owner_path)
+    args.submit_all = True
+    args.retry_failed = True
+    args.outbox_high_watermark = 1000
+
+    result = batch_rerun.run(args)
+
+    assert result["status"] == "submitted_all"
+    assert result["summary"] == {
+        "accepted": 0,
+        "submitted": 0,
+        "deferred": 1,
+        "total": 1,
+    }
+    item = result["items"]["7048803418"]
+    assert item["status"] == "waiting_for_prior_terminal"
+    assert item["generation"] == 1
+    assert item["request_index"] == 1
+
+
 def test_run_refreshes_existing_success_instead_of_skipping_it(tmp_path, monkeypatch):
     queue_path, owner_path = _write_run_inputs(tmp_path, _queue_value())
     prior = {
@@ -1480,6 +1648,7 @@ def test_issue_snapshot_tracks_new_outbox_before_execution_watch_exists(tmp_path
             generation INTEGER,
             submission_key TEXT,
             work_item_id TEXT,
+            state TEXT,
             activation_epoch_id TEXT,
             activation_ledger_id INTEGER
         );
@@ -1490,22 +1659,43 @@ def test_issue_snapshot_tracks_new_outbox_before_execution_watch_exists(tmp_path
             status TEXT,
             last_error_code TEXT,
             last_error_detail TEXT,
+            attempt INTEGER,
+            next_attempt_at TEXT,
+            claimed_at TEXT,
             completed_at TEXT,
+            quarantined_at TEXT,
+            result_json TEXT,
             lease_token TEXT,
             lease_owner TEXT,
             lease_expires_at TEXT,
             activation_epoch_id TEXT,
             activation_ledger_id INTEGER
         );
-        CREATE TABLE rca_execution_watch (
-            submission_outbox_id INTEGER,
-            state TEXT,
+            CREATE TABLE rca_execution_watch (
+                submission_outbox_id INTEGER,
+                business_key TEXT,
+                generation INTEGER,
+                state TEXT,
             delivery_id TEXT,
             last_error_code TEXT,
+            last_error_detail TEXT,
+            last_status_json TEXT,
+            terminal_at TEXT,
             task_id TEXT,
             lease_token TEXT,
             lease_owner TEXT,
             lease_expires_at TEXT
+        );
+        CREATE TABLE rca_delivery_subscriptions (
+            business_key TEXT,
+            generation INTEGER,
+            subscription_key TEXT,
+            effect_kind TEXT,
+            required INTEGER,
+            status TEXT,
+            delivery_id TEXT,
+            effect_key TEXT,
+            reason TEXT
         );
         CREATE TABLE rca_delivery_jobs (
             submission_key TEXT,
@@ -1547,10 +1737,11 @@ def test_issue_snapshot_tracks_new_outbox_before_execution_watch_exists(tmp_path
         );
         INSERT INTO business_triggers VALUES (
             'business-1', 6, 'submission-6', '7048803418',
-            'rca-old', 61
+            'pending', 'rca-old', 61
         );
         INSERT INTO rca_outbox VALUES (
-            378, 'business-1', 6, 'pending', '', '', NULL,
+            378, 'business-1', 6, 'pending', '', '', 0, NULL, NULL,
+            NULL, NULL, NULL,
             NULL, NULL, NULL, 'rca-old', 61
         );
         INSERT INTO rca_activation_epochs VALUES (

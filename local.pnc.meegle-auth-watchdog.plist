@@ -11,6 +11,7 @@
         <string>local.pnc.meegle-auth-watchdog</string>
         <string>--once</string>
         <string>--json</string>
+        <string>--no-assist</string>
     </array>
     <key>WorkingDirectory</key>
     <string>/Users/songying/.hermes/runtime</string>
@@ -28,8 +29,6 @@
         <string>0</string>
         <key>PNC_MEEGLE_QUIET_HOURS</key>
         <string>0</string>
-        <key>PNC_MEEGLE_PROACTIVE_REINIT_HOURS</key>
-        <string>24</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>

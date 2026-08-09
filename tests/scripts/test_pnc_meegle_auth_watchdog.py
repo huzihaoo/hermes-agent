@@ -92,15 +92,31 @@ def test_healthy_does_not_alert(tmp_path):
     assert sent == []
 
 
+def test_no_assist_cli_flag_disables_watchdog_assist(monkeypatch, capsys):
+    captured = []
+
+    def fake_run_once(config):
+        captured.append(config)
+        return {"ok": True, "state": "healthy"}
+
+    monkeypatch.setattr(wd, "run_once", fake_run_once)
+
+    assert wd.main(["--once", "--json", "--no-assist"]) == 0
+    assert captured[0].try_assist is False
+    assert json.loads(capsys.readouterr().out)["state"] == "healthy"
+
+
 def test_live_mode_keeps_injected_status_runner_and_sender_semantics(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_OUTBOUND_MODE", "live")
     sent = []
     d = deps([auth(None, authenticated=False), auth(None, authenticated=False)], sent=sent)[0]
-    first = wd.run_once(cfg(tmp_path), d)
-    second = wd.run_once(cfg(tmp_path), d)
+    config = cfg(tmp_path, try_assist=False)
+    first = wd.run_once(config, d)
+    second = wd.run_once(config, d)
 
     assert first["alert_sent"] is False
     assert second["alert_sent"] is True
+    assert second["assist"] is None
     assert len(sent) == 1
 
 
@@ -139,6 +155,12 @@ def test_partial_record_only_config_fails_before_original_watchdog_deps_or_state
 
 
 def test_authenticated_expires_roll_119_to_0_to_119_never_alerts_or_assists(tmp_path):
+    (tmp_path / "state.json").write_text(json.dumps({
+        "last_state": "healthy",
+        "last_expires": 0,
+        "consecutive_auto_rolls": 3,
+        "last_proactive_reinit_at": 0,
+    }))
     runner_calls = []
 
     def runner(args):
@@ -149,11 +171,12 @@ def test_authenticated_expires_roll_119_to_0_to_119_never_alerts_or_assists(tmp_
     results = []
     for idx, expires in enumerate(ROLLING_EXPIRES):
         d, _ = deps([auth(expires)], sent=sent, runner=runner, now=1000 + idx * 1019)
-        results.append(wd.run_once(cfg(tmp_path), d))
+        results.append(wd.run_once(cfg(tmp_path, try_assist=False), d))
 
     assert {r["state"] for r in results} == {"healthy"}
     assert all(r["alert_sent"] is False for r in results)
     assert all(r["confirmed_failure"] is False for r in results)
+    assert all(r["proactive_reinit"] is False for r in results)
     assert sent == []
     assert runner_calls == []
     state = json.loads((tmp_path / "state.json").read_text())
@@ -273,14 +296,16 @@ def test_expired_recovery_sends_closing_alert_and_clears_counts(tmp_path):
 
 def test_unknown_single_no_alert_consecutive_n_alerts(tmp_path):
     sent = []
-    r1 = wd.run_once(cfg(tmp_path), deps([auth(None, authenticated=None, ok=False, error="meegle CLI not found")], sent=sent, now=1000)[0])
-    r2 = wd.run_once(cfg(tmp_path), deps([auth(None, authenticated=None, ok=False, error="meegle CLI not found")], sent=sent, now=2000)[0])
+    config = cfg(tmp_path, try_assist=False)
+    r1 = wd.run_once(config, deps([auth(None, authenticated=None, ok=False, error="meegle CLI not found")], sent=sent, now=1000)[0])
+    r2 = wd.run_once(config, deps([auth(None, authenticated=None, ok=False, error="meegle CLI not found")], sent=sent, now=2000)[0])
 
     assert r1["state"] == "unknown"
     assert r1["consecutive_unknown"] == 1
     assert r1["alert_sent"] is False
     assert r2["confirmed_failure"] is True
     assert r2["alert_sent"] is True
+    assert r2["assist"] is None
     assert len(sent) == 1
     assert "unknown，不等同过期" in sent[0]["message"]
     assert "已过期/未授权" not in sent[0]["message"]

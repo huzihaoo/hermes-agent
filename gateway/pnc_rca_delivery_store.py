@@ -5993,14 +5993,6 @@ class RcaDeliveryStore:
             )
             if updated.rowcount != 1:
                 raise StaleDeliveryWatchLeaseError(submission_key)
-            self._record_permanent_failure_in_transaction(
-                conn,
-                subject_key=submission_key,
-                failure_state=state,
-                error_code=error_code,
-                error_detail=error_detail,
-                current=current,
-            )
             conn.commit()
         except Exception:
             conn.rollback()

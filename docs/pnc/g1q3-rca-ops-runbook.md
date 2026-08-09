@@ -220,7 +220,7 @@ python3 scripts/pnc_rca_b15_preflight.py \
 | 信号 | 处理 |
 |---|---|
 | Kafka consumer 未运行或无新 offset | 查 resident health、broker 连接、固定 group 和 topic；认证通过后不要改 group 名绕过问题 |
-| `host_issue_preread_failed` | 查 Meegle/Feishu 读取链路和网络；飞书权限已验证时不要误报为长期权限 blocker |
+| `host_issue_preread_failed` | 查 Meegle/Feishu 读取链路和网络；飞书权限已验证时不要误报为长期权限 blocker。批量排队时间不计入首次真实 preread 失败后的 900 秒重试窗口；已静默封存且无 task/job/effect/provider attempt 的 pre-W3 终态仅可由 owner 批次追加新代次，旧代次保持不可变 |
 | `missing_frame_id` | 核对时间格式、时区、前视 topic 和 1 秒容差；不扩大到无业务依据的宽窗口 |
 | `remote_scope_incomplete` | 完整读取请求范围；不得静默截断消息数 |
 | `translate_failed` | 查任务专属 Docker 输出、设备和镜像；不要求不存在的 NVIDIA runtime |
@@ -253,5 +253,8 @@ python3 scripts/pnc_rca_b15_preflight.py \
 7. **不模拟机器人入口。** operator issue-only 批次不创建 `@机器人`、话题回复或卡片更新，也不把这些动作作为字段写入验收门。真实 `@` 入口仍沿用原 `chat_id/thread_id/message_id` 和既有 topic/card 链路，由真实事件触发并按原功能回归；发布与批处理不得合成事件替代它。
 8. **VM 排队时间不计入执行超时。** Host collector 对 `pending/submitted/queued/claimed/running/in_progress` 只轮询，不得从 outbox 完成时间或入队时间生成执行 deadline；真实执行超时由 VM worker 从进程启动时起算并产出终态。Host 的 30 分钟失败回退只从 `terminal_first_seen_at` 的首次真实失败观测起算，后续健康状态必须清空该窗口。有效 completed 产物无论排队多久都进入同一套产物校验和字段交付。
 9. **大批恢复使用 bulk refresh。** `pnc_rca_batch_rerun.py --submit-all --retry-failed` 必须先按 live DB 刷新 state 中已有的 `submitted/running` 条目：已完成读回的直接 accepted，错误终态创建 `generation + 1`，仍活跃的保持原 submission；刷新后一次性提交所有可重试项，不得在第一条任务上串行等待。暂时没有精确 rerun authority 的单标为 `waiting_for_prior_terminal` 并单独处理，不能阻塞其余条目。常规逐单诊断才省略 `--submit-all`。
+10. **steady 并发为 4，bootstrap 保持 1。** 新任务使用 `capacity_mode=steady` 时 Host 和 VM 都按最多 4 个在途执行；历史 bootstrap receipt 仍按 1 个执行，不篡改签名 receipt。队列等待不使静态 admission receipt 失效，真正开始执行时仍须重新通过实时资源 preflight；并发竞争失败回到 pending，不伪造成业务终态。
+11. **技术终态不污染飞书写入 circuit。** VM execution watch 的失败、超时或缺 receipt 只终结对应执行链，不计入飞书字段投递的 permanent-failure circuit。只有真实 required field effect 的 provider 写入失败才影响该 circuit；恢复后按第 7 节执行一次有 receipt 的 reset，由 dispatcher 继续消费 pending effects。
+12. **Meegle 健康态不发续期噪声。** launchd watchdog 固定使用 `--no-assist`，`authenticated=true` 时依赖 token 正常自动滚动，不创建 proactive device-code，也不发送扫码提醒；只有真实 `expired/unknown` 才告警，并在告警中给出人工续期命令。
 
 最小验收结果是一张当前批次清单：`work_item_id`、generation、Host/Workspace/VM identity、两个字段的 read-after 值和最终状态。旧 baseline 重放、全历史差异矩阵、历史 delivery 清算及额外 canary 均不属于该路径。

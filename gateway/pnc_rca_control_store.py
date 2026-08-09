@@ -396,6 +396,9 @@ SILENT_TERMINAL_RERUN_ERROR_CODES = frozenset({
     "service_provenance_unavailable",
     "taxonomy_gap:gate_a_projection_invalid",
 })
+PRE_W3_NO_WRITE_RERUN_OUTBOX_ERROR_CODES = frozenset({
+    "host_issue_preread_failed",
+})
 SILENT_TERMINAL_RERUN_AUTHORITY_FIELDS = frozenset({
     "schema_version",
     "batch_id",
@@ -484,6 +487,19 @@ INPUT_WAIT_REARM_ERROR_CODES = frozenset(
         "issue_field_missing_remote_data_reference",
         "issue_fields_not_ready",
         "issue_not_visible",
+    }
+)
+INPUT_WAIT_RETRY_WINDOW_ERROR_CODES = INPUT_WAIT_REARM_ERROR_CODES | frozenset(
+    {
+        "host_issue_preread_failed",
+        "host_issue_preread_timeout",
+        "host_mcp_preread_failed",
+        "host_mcp_preread_timeout",
+        "host_meegle_preread_failed",
+        "host_meegle_preread_timeout",
+        "host_preread_unavailable",
+        "issue_field_invalid_frame_reference",
+        "issue_field_untrusted_remote_data_reference",
     }
 )
 MANUAL_TRIGGER_SCHEMA_VERSION = "pnc_rca_manual_trigger_v1"
@@ -16621,7 +16637,10 @@ class RcaControlStore:
             ).fetchone()
             if watch is not None:
                 watch_state = str(watch["state"] or "")
-                if watch_state == "terminal_failed" and allow_silent_terminal:
+                if (
+                    watch_state in {"terminal_failed", "quarantined"}
+                    and allow_silent_terminal
+                ):
                     return cls._silent_terminal_rerun_eligible_tx(conn, row)
                 if watch_state != "delivery_created":
                     return False
@@ -16787,7 +16806,7 @@ class RcaControlStore:
         conn: sqlite3.Connection,
         row: sqlite3.Row,
     ) -> bool:
-        """Validate one internal-only deadline terminal before a new generation.
+        """Validate one internal-only technical terminal before a new generation.
 
         This predicate deliberately validates the complete durable chain.  It
         does not repair or mutate the old watch, route, subscriptions, job, or
@@ -16795,6 +16814,8 @@ class RcaControlStore:
         check succeeds.
         """
         required_tables = {
+            "rca_admission_snapshots",
+            "rca_delivery_attempts",
             "rca_execution_watch",
             "rca_failure_routes",
             "rca_delivery_subscriptions",
@@ -16817,12 +16838,16 @@ class RcaControlStore:
             SELECT w.state, w.business_key AS watch_business_key,
                    w.generation AS watch_generation, w.terminal_at,
                    w.last_status_json, w.last_error_code, w.last_error_detail,
-                   w.delivery_id, w.lease_token, w.lease_owner,
+                   w.task_id, w.delivery_id, w.lease_token, w.lease_owner,
                    w.lease_expires_at, o.status AS outbox_status,
+                   o.attempt AS outbox_attempt,
+                   o.next_attempt_at AS outbox_next_attempt_at,
+                   o.claimed_at AS outbox_claimed_at,
                    o.completed_at AS outbox_completed_at,
                    o.quarantined_at AS outbox_quarantined_at,
                    o.result_json AS outbox_result_json,
                    o.last_error_code AS outbox_error_code,
+                   o.last_error_detail AS outbox_error_detail,
                    o.lease_token AS outbox_lease_token,
                    o.lease_owner AS outbox_lease_owner,
                    o.lease_expires_at AS outbox_lease_expires_at
@@ -16844,6 +16869,15 @@ class RcaControlStore:
             terminal_generation = int(terminal["watch_generation"] or 0)
         except (TypeError, ValueError, OverflowError):
             return False
+        if cls._pre_w3_no_write_rerun_eligible_tx(
+            conn,
+            row=row,
+            terminal=terminal,
+            business_key=business_key,
+            generation=generation,
+            terminal_generation=terminal_generation,
+        ):
+            return True
         silent_error_code = str(terminal["last_error_code"] or "")
         if (
             str(terminal["state"] or "") != "terminal_failed"
@@ -17026,6 +17060,112 @@ class RcaControlStore:
         ):
             return False
         return True
+
+    @classmethod
+    def _pre_w3_no_write_rerun_eligible_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        row: sqlite3.Row,
+        terminal: sqlite3.Row,
+        business_key: str,
+        generation: int,
+        terminal_generation: int,
+    ) -> bool:
+        """Accept only a settled pre-W3 preread quarantine with no write path."""
+        if (
+            str(row["state"] or "") != "quarantined"
+            or str(terminal["state"] or "") != "quarantined"
+            or str(terminal["watch_business_key"] or "") != business_key
+            or terminal_generation != generation
+            or terminal["task_id"] is not None
+            or terminal["delivery_id"] is not None
+            or not str(terminal["terminal_at"] or "").strip()
+            or str(terminal["last_error_code"] or "")
+            != "w3_execution_snapshot_missing"
+            or not str(terminal["last_error_detail"] or "").strip()
+            or str(terminal["outbox_status"] or "") != "quarantined"
+            or int(terminal["outbox_attempt"] or 0) < 1
+            or terminal["outbox_next_attempt_at"] is not None
+            or not str(terminal["outbox_claimed_at"] or "").strip()
+            or terminal["outbox_completed_at"] is not None
+            or not str(terminal["outbox_quarantined_at"] or "").strip()
+            or terminal["outbox_result_json"] is not None
+            or str(terminal["outbox_error_code"] or "")
+            not in PRE_W3_NO_WRITE_RERUN_OUTBOX_ERROR_CODES
+            or not str(terminal["outbox_error_detail"] or "").strip()
+            or str(terminal["terminal_at"])
+            != str(terminal["outbox_quarantined_at"])
+            or any(
+                terminal[name] is not None
+                for name in (
+                    "lease_token",
+                    "lease_owner",
+                    "lease_expires_at",
+                    "outbox_lease_token",
+                    "outbox_lease_owner",
+                    "outbox_lease_expires_at",
+                )
+            )
+        ):
+            return False
+        try:
+            status = json.loads(str(terminal["last_status_json"] or ""))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        if not isinstance(status, Mapping) or (
+            status.get("success") is not False
+            or status.get("state") != "quarantined"
+            or status.get("error_code") != "w3_execution_snapshot_missing"
+            or status.get("external_writes") is not False
+            or status.get("terminal_delivery_policy")
+            != "silent_internal_alert_only"
+        ):
+            return False
+        if conn.execute(
+            "SELECT 1 FROM rca_admission_snapshots "
+            "WHERE business_key = ? AND generation = ? LIMIT 1",
+            (business_key, generation),
+        ).fetchone() is not None:
+            return False
+        if conn.execute(
+            "SELECT 1 FROM rca_delivery_jobs "
+            "WHERE business_key = ? AND generation = ? LIMIT 1",
+            (business_key, generation),
+        ).fetchone() is not None:
+            return False
+        if conn.execute(
+            "SELECT 1 FROM rca_delivery_effects AS effect "
+            "JOIN rca_delivery_jobs AS job ON job.delivery_id = effect.delivery_id "
+            "WHERE job.business_key = ? AND job.generation = ? LIMIT 1",
+            (business_key, generation),
+        ).fetchone() is not None:
+            return False
+        if conn.execute(
+            "SELECT 1 FROM rca_delivery_attempts AS attempt "
+            "JOIN rca_delivery_effects AS effect "
+            "ON effect.effect_key = attempt.effect_key "
+            "JOIN rca_delivery_jobs AS job ON job.delivery_id = effect.delivery_id "
+            "WHERE job.business_key = ? AND job.generation = ? LIMIT 1",
+            (business_key, generation),
+        ).fetchone() is not None:
+            return False
+        subscriptions = conn.execute(
+            """
+            SELECT required, status, delivery_id, effect_key, reason
+              FROM rca_delivery_subscriptions
+             WHERE business_key = ? AND generation = ?
+            """,
+            (business_key, generation),
+        ).fetchall()
+        required = [item for item in subscriptions if int(item["required"] or 0) == 1]
+        return bool(required) and all(
+            str(item["status"] or "") == "quarantined"
+            and item["delivery_id"] is None
+            and item["effect_key"] is None
+            and str(item["reason"] or "") == "w3_execution_snapshot_missing"
+            for item in subscriptions
+        )
 
     @classmethod
     def _terminal_duplicate_retrigger_eligible_tx(
@@ -20747,10 +20887,26 @@ class RcaControlStore:
         current_iso: str,
     ) -> OutboxMutationResult:
         row = self._current_lease_row(conn, outbox_id, lease_token, current_iso)
-        window_started_at = _utc_datetime(
-            datetime.fromisoformat(
-                str(row["retry_window_started_at"] or row["created_at"])
+        normalized_error_code = str(error_code or "dispatch_failed")[:120]
+        previous_error_code = str(row["last_error_code"] or "").strip()
+        entering_input_wait = (
+            normalized_error_code in INPUT_WAIT_RETRY_WINDOW_ERROR_CODES
+            and previous_error_code not in INPUT_WAIT_RETRY_WINDOW_ERROR_CODES
+        )
+        restart_window = entering_input_wait
+        window_started_at = (
+            current
+            if restart_window
+            else _utc_datetime(
+                datetime.fromisoformat(
+                    str(row["retry_window_started_at"] or row["created_at"])
+                )
             )
+        )
+        window_started_at_iso = (
+            current_iso
+            if restart_window
+            else str(row["retry_window_started_at"] or row["created_at"])
         )
         deadline = window_started_at + timedelta(seconds=max_age_seconds)
         expired = current >= deadline
@@ -20767,7 +20923,7 @@ class RcaControlStore:
                    quarantined_at = CASE WHEN ? = 'quarantined' THEN ? ELSE NULL END,
                    lease_token = NULL, lease_owner = NULL,
                    lease_expires_at = NULL, last_error_code = ?,
-                   last_error_detail = ?, updated_at = ?
+                   last_error_detail = ?, retry_window_started_at = ?, updated_at = ?
              WHERE outbox_id = ? AND status = 'claimed' AND lease_token = ?
             """,
             (
@@ -20775,8 +20931,9 @@ class RcaControlStore:
                 next_attempt_at,
                 status,
                 current_iso,
-                str(error_code or "dispatch_failed")[:120],
+                normalized_error_code,
                 str(error_detail or "")[:1000],
+                window_started_at_iso,
                 current_iso,
                 outbox_id,
                 lease_token,

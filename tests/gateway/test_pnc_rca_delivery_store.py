@@ -831,7 +831,7 @@ def test_claim_due_watch_starts_work_at_delayed_outbox_completion(tmp_path):
     )
 
 
-def test_consecutive_permanent_watch_failures_open_circuit_until_manual_reset(
+def test_terminal_watch_failures_do_not_open_delivery_circuit(
     tmp_path,
 ):
     store = _completed_cases(tmp_path, PERMANENT_FAILURE_CIRCUIT_THRESHOLD + 1)
@@ -847,7 +847,7 @@ def test_consecutive_permanent_watch_failures_open_circuit_until_manual_reset(
         now=NOW,
     )
     assert store.delivery_dispatcher_circuit().is_open is False
-    assert store.permanent_failure_circuit_state()["consecutive_failures"] == 1
+    assert store.permanent_failure_circuit_state()["consecutive_failures"] == 0
 
     second = store.claim_due_watch(lease_owner="collector", now=NOW)
     assert second is not None
@@ -860,16 +860,6 @@ def test_consecutive_permanent_watch_failures_open_circuit_until_manual_reset(
         now=NOW,
     )
 
-    circuit = store.delivery_dispatcher_circuit()
-    assert circuit.is_open is True
-    assert circuit.reason_code == "delivery_permanent_failure_streak_exceeded"
-    state = store.permanent_failure_circuit_state()
-    assert state["threshold"] == PERMANENT_FAILURE_CIRCUIT_THRESHOLD
-    assert state["consecutive_failures"] == PERMANENT_FAILURE_CIRCUIT_THRESHOLD
-    assert state["last_failure"]["subject_key"] == second.submission_key
-    assert store.backpressure_snapshot(now=NOW).circuit.is_open is True
-
-    store.close_delivery_dispatcher_circuit(now=NOW + timedelta(seconds=1))
     assert store.delivery_dispatcher_circuit().is_open is False
     assert store.permanent_failure_circuit_state() == {
         "threshold": PERMANENT_FAILURE_CIRCUIT_THRESHOLD,
@@ -891,7 +881,7 @@ def test_consecutive_permanent_watch_failures_open_circuit_until_manual_reset(
         now=NOW + timedelta(seconds=1),
     )
     assert store.delivery_dispatcher_circuit().is_open is False
-    assert store.permanent_failure_circuit_state()["consecutive_failures"] == 1
+    assert store.permanent_failure_circuit_state()["consecutive_failures"] == 0
 
 
 def test_missing_work_item_quarantine_does_not_open_pipeline_circuit(tmp_path):
@@ -1018,7 +1008,7 @@ def test_successful_required_delivery_breaks_permanent_failure_streak(tmp_path):
         now=NOW,
     )
     assert store.delivery_dispatcher_circuit().is_open is False
-    assert store.permanent_failure_circuit_state()["consecutive_failures"] == 1
+    assert store.permanent_failure_circuit_state()["consecutive_failures"] == 0
 
 
 def test_successful_effect_commits_observation_intent_atomically(tmp_path):
@@ -1291,19 +1281,22 @@ def test_permanent_failure_and_circuit_open_roll_back_atomically(
     tmp_path,
     monkeypatch,
 ):
-    store = _completed_cases(tmp_path, PERMANENT_FAILURE_CIRCUIT_THRESHOLD)
-    first = store.claim_due_watch(lease_owner="collector", now=NOW)
-    assert first is not None
-    store.terminal_failure(
-        submission_key=first.submission_key,
-        lease_token=first.lease_token,
-        status={"success": True, "state": "failed"},
-        error_code="vm_terminal_failed",
-        error_detail="task failed",
-        now=NOW,
-    )
-    second = store.claim_due_watch(lease_owner="collector", now=NOW)
-    assert second is not None
+    store, effect = _claimed_effect(tmp_path)
+    conn = store._connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        store._record_permanent_failure_in_transaction(
+            conn,
+            circuit_name=DELIVERY_EFFECT_KIND,
+            subject_key="prior-field-failure",
+            failure_state="quarantined",
+            error_code="report_http_verification_mismatch",
+            error_detail="sealed report mismatch",
+            current=NOW.isoformat(),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
     def fail_circuit_write(*_args, **_kwargs):
         raise RuntimeError("simulated circuit write failure")
@@ -1314,20 +1307,16 @@ def test_permanent_failure_and_circuit_open_roll_back_atomically(
         fail_circuit_write,
     )
     with pytest.raises(RuntimeError, match="simulated circuit write failure"):
-        store.quarantine_watch(
-            submission_key=second.submission_key,
-            lease_token=second.lease_token,
-            status={"success": True, "state": "completed"},
-            error_code="artifact_hash_mismatch",
-            error_detail="sealed artifact mismatch",
+        store.quarantine_effect(
+            claim=effect,
+            error_code="report_http_verification_mismatch",
+            error_detail="field report mismatch",
             now=NOW,
         )
 
-    rows = {
-        row["submission_key"]: row for row in store.list_rows("rca_execution_watch")
-    }
-    assert rows[second.submission_key]["state"] == "pending"
-    assert rows[second.submission_key]["lease_token"] == second.lease_token
+    [row] = store.list_rows("rca_delivery_effects")
+    assert row["status"] == "claimed"
+    assert row["lease_token"] == effect.lease_token
     assert store.permanent_failure_circuit_state()["consecutive_failures"] == 1
     assert store.delivery_dispatcher_circuit().is_open is False
 

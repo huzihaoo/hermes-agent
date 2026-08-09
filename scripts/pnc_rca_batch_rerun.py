@@ -27,7 +27,9 @@ from gateway.pnc_rca_control_store import (  # noqa: E402
     CONTROL_STORE_SCHEMA_VERSION,
     DEFAULT_OUTBOX_HIGH_WATERMARK,
     MANUAL_TRIGGER_SCHEMA_VERSION,
+    PRE_W3_NO_WRITE_RERUN_OUTBOX_ERROR_CODES,
     SILENT_TERMINAL_RERUN_ERROR_CODES,
+    ManualRcaAdmissionError,
     ManualRcaTriggerRequest,
     RcaControlStore,
     build_batch_terminal_rerun_authority,
@@ -761,22 +763,33 @@ def _issue_snapshot(
             params = (issue_id, submission_key)
         row = conn.execute(
             f"""
-            SELECT b.generation, b.submission_key,
+            SELECT b.business_key, b.generation, b.submission_key,
+                   b.state AS trigger_state,
                    b.activation_epoch_id,
                    b.activation_ledger_id,
                    o.status AS outbox_status,
                    o.last_error_code AS outbox_error_code,
                    o.last_error_detail AS outbox_error_detail,
+                   o.attempt AS outbox_attempt,
+                   o.next_attempt_at AS outbox_next_attempt_at,
+                   o.claimed_at AS outbox_claimed_at,
                    o.completed_at AS outbox_completed_at,
+                   o.quarantined_at AS outbox_quarantined_at,
+                   o.result_json AS outbox_result_json,
                    o.lease_token AS outbox_lease_token,
                    o.lease_owner AS outbox_lease_owner,
                    o.lease_expires_at AS outbox_lease_expires_at,
                    o.activation_epoch_id AS outbox_activation_epoch_id,
                    o.activation_ledger_id AS outbox_activation_ledger_id,
                    w.state AS watch_state,
+                   w.business_key AS watch_business_key,
+                   w.generation AS watch_generation,
                    w.task_id AS watch_task_id,
                    w.delivery_id AS watch_delivery_id,
                    w.last_error_code AS watch_error_code,
+                   w.last_error_detail AS watch_error_detail,
+                   w.last_status_json AS watch_status_json,
+                   w.terminal_at AS watch_terminal_at,
                    w.lease_token AS watch_lease_token,
                    w.lease_owner AS watch_lease_owner,
                    w.lease_expires_at AS watch_lease_expires_at,
@@ -807,6 +820,39 @@ def _issue_snapshot(
         if row is None:
             return None
         snapshot = {key: row[key] for key in row.keys()}
+        table_names = {
+            str(item["name"])
+            for item in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        snapshot["admission_snapshot_count"] = (
+            conn.execute(
+                "SELECT COUNT(*) FROM rca_admission_snapshots "
+                "WHERE business_key = ? AND generation = ?",
+                (row["business_key"], row["generation"]),
+            ).fetchone()[0]
+            if "rca_admission_snapshots" in table_names
+            else None
+        )
+        snapshot["delivery_job_count"] = conn.execute(
+            "SELECT COUNT(*) FROM rca_delivery_jobs WHERE submission_key = ?",
+            (row["submission_key"],),
+        ).fetchone()[0]
+        snapshot["delivery_effect_count"] = conn.execute(
+            "SELECT COUNT(*) FROM rca_delivery_effects AS effect "
+            "JOIN rca_delivery_jobs AS job ON job.delivery_id = effect.delivery_id "
+            "WHERE job.submission_key = ?",
+            (row["submission_key"],),
+        ).fetchone()[0]
+        snapshot["provider_attempt_count"] = conn.execute(
+            "SELECT COUNT(*) FROM rca_delivery_attempts AS attempt "
+            "JOIN rca_delivery_effects AS effect "
+            "ON effect.effect_key = attempt.effect_key "
+            "JOIN rca_delivery_jobs AS job ON job.delivery_id = effect.delivery_id "
+            "WHERE job.submission_key = ?",
+            (row["submission_key"],),
+        ).fetchone()[0]
         effects: list[dict[str, Any]] = []
         if row["delivery_id"]:
             for effect in conn.execute(
@@ -831,6 +877,20 @@ def _issue_snapshot(
                 item["remote_receipt"] = _json_object(remote_receipt_json)
                 effects.append(item)
         snapshot["effects"] = effects
+        subscriptions: list[dict[str, Any]] = []
+        for subscription in conn.execute(
+            """
+            SELECT required, status, delivery_id, effect_key, reason
+              FROM rca_delivery_subscriptions
+             WHERE business_key = ? AND generation = ?
+             ORDER BY effect_kind, subscription_key
+            """,
+            (row["business_key"], row["generation"]),
+        ).fetchall():
+            subscriptions.append(
+                {key: subscription[key] for key in subscription.keys()}
+            )
+        snapshot["subscriptions"] = subscriptions
         return snapshot
     finally:
         conn.close()
@@ -1138,13 +1198,14 @@ def _silent_terminal_authority(
     requester_id: str,
     reason: str,
 ) -> dict[str, Any] | None:
-    """Bind only an exact no-delivery deadline terminal to batch authority."""
-    if (
-        snapshot.get("watch_state") != "terminal_failed"
-        or snapshot.get("watch_delivery_id") is not None
-        or snapshot.get("watch_error_code")
-        not in SILENT_TERMINAL_RERUN_ERROR_CODES
-    ):
+    """Bind only an exact owner-approved no-delivery technical terminal."""
+    deadline_terminal = (
+        snapshot.get("watch_state") == "terminal_failed"
+        and snapshot.get("watch_delivery_id") is None
+        and snapshot.get("watch_error_code")
+        in SILENT_TERMINAL_RERUN_ERROR_CODES
+    )
+    if not deadline_terminal and not _pre_w3_no_write_terminal(snapshot):
         return None
     return build_silent_terminal_rerun_authority(
         batch_id=batch_id,
@@ -1156,6 +1217,75 @@ def _silent_terminal_authority(
         owner_receipt_sha256=owner_receipt_sha256,
         requester_id=requester_id,
         reason=reason,
+    )
+
+
+def _pre_w3_no_write_terminal(snapshot: Mapping[str, Any]) -> bool:
+    subscriptions = snapshot.get("subscriptions")
+    if not isinstance(subscriptions, list):
+        return False
+    required = [
+        item
+        for item in subscriptions
+        if isinstance(item, Mapping) and int(item.get("required") or 0) == 1
+    ]
+    try:
+        status = json.loads(str(snapshot.get("watch_status_json") or ""))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return bool(required) and (
+        snapshot.get("trigger_state") == "quarantined"
+        and snapshot.get("outbox_status") == "quarantined"
+        and snapshot.get("outbox_error_code")
+        in PRE_W3_NO_WRITE_RERUN_OUTBOX_ERROR_CODES
+        and bool(str(snapshot.get("outbox_error_detail") or "").strip())
+        and int(snapshot.get("outbox_attempt") or 0) >= 1
+        and snapshot.get("outbox_next_attempt_at") is None
+        and bool(str(snapshot.get("outbox_claimed_at") or "").strip())
+        and snapshot.get("outbox_completed_at") is None
+        and bool(str(snapshot.get("outbox_quarantined_at") or "").strip())
+        and snapshot.get("outbox_result_json") is None
+        and not any(
+            snapshot.get(name) is not None
+            for name in (
+                "outbox_lease_token",
+                "outbox_lease_owner",
+                "outbox_lease_expires_at",
+                "watch_lease_token",
+                "watch_lease_owner",
+                "watch_lease_expires_at",
+            )
+        )
+        and snapshot.get("watch_state") == "quarantined"
+        and snapshot.get("watch_business_key") == snapshot.get("business_key")
+        and snapshot.get("watch_generation") == snapshot.get("generation")
+        and snapshot.get("watch_task_id") is None
+        and snapshot.get("watch_delivery_id") is None
+        and snapshot.get("watch_error_code") == "w3_execution_snapshot_missing"
+        and bool(str(snapshot.get("watch_error_detail") or "").strip())
+        and snapshot.get("watch_terminal_at")
+        == snapshot.get("outbox_quarantined_at")
+        and snapshot.get("delivery_id") is None
+        and not snapshot.get("job_status")
+        and snapshot.get("admission_snapshot_count") == 0
+        and snapshot.get("delivery_job_count") == 0
+        and snapshot.get("delivery_effect_count") == 0
+        and snapshot.get("provider_attempt_count") == 0
+        and snapshot.get("effects") == []
+        and isinstance(status, Mapping)
+        and status.get("success") is False
+        and status.get("state") == "quarantined"
+        and status.get("error_code") == "w3_execution_snapshot_missing"
+        and status.get("external_writes") is False
+        and status.get("terminal_delivery_policy")
+        == "silent_internal_alert_only"
+        and all(
+            str(item.get("status") or "") == "quarantined"
+            and item.get("delivery_id") is None
+            and item.get("effect_key") is None
+            and str(item.get("reason") or "") == "w3_execution_snapshot_missing"
+            for item in subscriptions
+        )
     )
 
 
@@ -1798,15 +1928,35 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 admission_kwargs["silent_terminal_rerun_authority"] = silent_authority
             elif batch_authority is not None:
                 admission_kwargs["batch_terminal_rerun_authority"] = batch_authority
-            admitted = store.admit_manual_trigger(
-                request,
-                allowed_chat_ids=set(),
-                submit_enabled=True,
-                operator_authorized=True,
-                activation_required=True,
-                outbox_high_watermark=outbox_high_watermark,
-                **admission_kwargs,
-            )
+            try:
+                admitted = store.admit_manual_trigger(
+                    request,
+                    allowed_chat_ids=set(),
+                    submit_enabled=True,
+                    operator_authorized=True,
+                    activation_required=True,
+                    outbox_high_watermark=outbox_high_watermark,
+                    **admission_kwargs,
+                )
+            except ManualRcaAdmissionError as exc:
+                if not (
+                    submit_all
+                    and silent_authority is not None
+                    and str(exc)
+                    == "silent_terminal_rerun_terminal_generation_required"
+                ):
+                    raise
+                item.update({
+                    **queue_item,
+                    "status": "waiting_for_prior_terminal",
+                    "request_index": request_index - 1,
+                    "updated_at": _now(),
+                })
+                state["items"][issue_id] = item
+                state["updated_at"] = _now()
+                _write_state(state_path, state)
+                deferred += 1
+                continue
             expected_generation = int(precondition["queue_generation"]) + 1
             if (
                 admitted.outcome != "created"
