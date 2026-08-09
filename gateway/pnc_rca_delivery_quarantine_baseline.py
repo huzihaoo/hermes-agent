@@ -1613,15 +1613,61 @@ def _settlement_receipts(
     )
 
 
+def _prewrite_quarantine_without_external_write(
+    conn: sqlite3.Connection, row: sqlite3.Row
+) -> bool:
+    """Recognize a fence rejection that provably happened before provider I/O."""
+    if (
+        str(row["last_error_code"] or "") != "external_write_fence_missing"
+        or str(row["job_status"] or "") != "quarantined"
+        or str(row["effect_status"] or "") != "quarantined"
+        or str(row["write_phase"] or "") != "settled"
+        or not str(row["quarantined_at"] or "")
+        or row["remote_receipt_json"] is not None
+        or row["write_started_at"] is not None
+        or row["completed_at"] is not None
+        or int(row["attempt"] or 0) < 1
+        or int(row["fence"] or 0) < 1
+    ):
+        return False
+    try:
+        attempts = conn.execute(
+            """
+            SELECT outcome, remote_id, error_code
+              FROM rca_delivery_attempts
+             WHERE effect_key = ?
+             ORDER BY attempt_no, event_seq
+            """,
+            (str(row["effect_key"]),),
+        ).fetchall()
+    except sqlite3.Error:
+        return False
+    if not attempts or not any(
+        str(attempt["outcome"] or "") == "quarantined"
+        and str(attempt["error_code"] or "") == "external_write_fence_missing"
+        for attempt in attempts
+    ):
+        return False
+    return all(
+        not str(attempt["remote_id"] or "").strip()
+        and str(attempt["outcome"] or "") in {"started", "quarantined"}
+        for attempt in attempts
+    )
+
+
 def _effect_settlement_projection(
     conn: sqlite3.Connection, receipt_effect_keys: set[str]
 ) -> dict[str, Any]:
     rows = conn.execute(
         """
         SELECT effect.effect_key, effect.effect_kind, effect.required,
-               effect.target_key, effect.write_phase, job.delivery_id,
+               effect.target_key, effect.write_phase, effect.status AS effect_status,
+               effect.remote_receipt_json, effect.write_started_at,
+               effect.completed_at, effect.quarantined_at, effect.attempt,
+               effect.fence, effect.last_error_code, job.delivery_id,
                job.business_key, job.generation, job.project_key,
                job.work_item_type_key, job.work_item_id,
+               job.status AS job_status, job.outcome AS job_outcome,
                subscription.effect_kind AS subscription_effect_kind,
                subscription.required AS subscription_required,
                subscription.status AS subscription_status,
@@ -1646,6 +1692,7 @@ def _effect_settlement_projection(
     entries: list[dict[str, Any]] = []
     receipt_settled = 0
     superseded = 0
+    prewrite_no_external_write = 0
     for row in rows:
         effect_key = str(row["effect_key"])
         effect_kind = str(row["effect_kind"])
@@ -1706,6 +1753,21 @@ def _effect_settlement_projection(
                 "superseding_confirmed_field_keys": [],
             })
             receipt_settled += 1
+            continue
+        if _prewrite_quarantine_without_external_write(conn, row):
+            entries.append(
+                {
+                    **entry,
+                    "disposition": "terminal_no_external_write",
+                    "evidence_effect_key": effect_key,
+                    "superseding_delivery_id": "",
+                    "superseding_generation": 0,
+                    "superseding_completed_at": "",
+                    "superseding_remote_receipt_sha256": "",
+                    "superseding_confirmed_field_keys": [],
+                }
+            )
+            prewrite_no_external_write += 1
             continue
         later = conn.execute(
             """
@@ -1779,6 +1841,8 @@ def _effect_settlement_projection(
         "superseded_by_later_success_count": superseded,
         "entries": entries,
     }
+    if prewrite_no_external_write:
+        body["prewrite_no_external_write_count"] = prewrite_no_external_write
     return {
         **body,
         "entries_sha256": hashlib.sha256(_canonical_bytes(entries)).hexdigest(),
