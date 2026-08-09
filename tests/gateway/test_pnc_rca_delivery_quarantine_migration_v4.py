@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import sqlite3
@@ -169,6 +170,76 @@ def test_v4_receipt_is_dispatched_by_quarantine_baseline(coupled_bundle):
     assert binding["post_migration_logical_sha256"] == args["body"][
         "post_migration_logical_projection"
     ]["logical_sha256"]
+
+
+def test_v4_baseline_cache_reuses_static_proof_and_tracks_artifact_identity(
+    coupled_bundle, monkeypatch
+):
+    args = _receipt_args(coupled_bundle)
+    baseline._clear_migration_validation_cache()
+    calls = []
+    original = baseline.validate_combined_migration_receipt
+
+    def counted(**kwargs):
+        calls.append(kwargs)
+        return original(**kwargs)
+
+    monkeypatch.setattr(baseline, "validate_combined_migration_receipt", counted)
+    kwargs = {
+        "receipt_path": str(args["receipt_path"]),
+        "expected_sha256": str(args["expected_sha256"]),
+        "target_live_db_path": args["target_live_db_path"],
+        "migrated_db_path": None,
+        "migrated_db_is_live": False,
+        "expected_migration_runtime_sha256": RUNTIME_SHA256,
+    }
+
+    first = baseline._validate_migration_artifact(**kwargs)
+    second = baseline._validate_migration_artifact(**kwargs)
+
+    assert second == first
+    assert len(calls) == 1
+    for name in ("source", "clone"):
+        artifact = Path(coupled_bundle[name])
+        replacement = artifact.with_name(f"{artifact.name}.replacement")
+        shutil.copyfile(artifact, replacement)
+        replacement.chmod(0o600)
+        os.replace(replacement, artifact)
+        assert baseline._validate_migration_artifact(**kwargs) == first
+    assert len(calls) == 3
+
+
+def test_v4_baseline_cache_does_not_hide_new_sqlite_sidecar(
+    coupled_bundle, monkeypatch
+):
+    args = _receipt_args(coupled_bundle)
+    baseline._clear_migration_validation_cache()
+    calls = []
+    original = baseline.validate_combined_migration_receipt
+
+    def counted(**kwargs):
+        calls.append(kwargs)
+        return original(**kwargs)
+
+    monkeypatch.setattr(baseline, "validate_combined_migration_receipt", counted)
+    kwargs = {
+        "receipt_path": str(args["receipt_path"]),
+        "expected_sha256": str(args["expected_sha256"]),
+        "target_live_db_path": args["target_live_db_path"],
+        "migrated_db_path": None,
+        "migrated_db_is_live": False,
+        "expected_migration_runtime_sha256": RUNTIME_SHA256,
+    }
+    baseline._validate_migration_artifact(**kwargs)
+    Path(str(coupled_bundle["source"]) + "-wal").write_bytes(b"unexpected")
+
+    with pytest.raises(
+        baseline.DeliveryQuarantineBaselineError,
+        match="delivery_store_coupled_source_backup_sidecar_present",
+    ):
+        baseline._validate_migration_artifact(**kwargs)
+
+    assert len(calls) == 2
 
 
 @pytest.mark.parametrize(

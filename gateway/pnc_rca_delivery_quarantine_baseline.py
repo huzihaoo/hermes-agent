@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -11,6 +12,7 @@ from pathlib import Path
 import re
 import sqlite3
 import stat
+import threading
 from typing import Any, Mapping
 
 from gateway.pnc_rca_delivery_contract import (
@@ -53,6 +55,7 @@ MAX_BASELINE_BYTES = 1024 * 1024
 MAX_EVIDENCE_BYTES = 4 * 1024 * 1024
 MAX_BACKUP_BYTES = 64 * 1024 * 1024
 MAX_SETTLEMENT_RECEIPTS = 32
+MAX_MIGRATION_VALIDATION_CACHE_ENTRIES = 16
 
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$")
@@ -205,6 +208,11 @@ _ISSUANCE_POLICY = {
     "no_rearm": True,
 }
 
+_MIGRATION_VALIDATION_CACHE_LOCK = threading.Lock()
+_MIGRATION_VALIDATION_CACHE: OrderedDict[
+    tuple[Any, ...], dict[str, Any]
+] = OrderedDict()
+
 
 class DeliveryQuarantineBaselineError(RuntimeError):
     """Stable fail-closed error for an external quarantine acknowledgement."""
@@ -313,6 +321,88 @@ def _stat_identity(value: os.stat_result) -> tuple[int, ...]:
         value.st_mtime_ns,
         value.st_ctime_ns,
     )
+
+
+def _migration_cache_file_identity(path: str | Path) -> tuple[Any, ...] | None:
+    selected = Path(path).expanduser().absolute()
+    try:
+        value = os.lstat(selected)
+    except OSError:
+        return None
+    if stat.S_ISLNK(value.st_mode) or not stat.S_ISREG(value.st_mode):
+        return None
+    sidecars: list[tuple[str, tuple[int, ...] | None]] = []
+    for suffix in ("-wal", "-shm", "-journal"):
+        sidecar = Path(str(selected) + suffix)
+        try:
+            os.lstat(sidecar)
+        except FileNotFoundError:
+            sidecars.append((suffix, None))
+        except OSError:
+            return None
+        else:
+            return None
+    return (str(selected), _stat_identity(value), tuple(sidecars))
+
+
+def _migration_validation_cache_key(
+    *,
+    receipt_path: str,
+    expected_sha256: str,
+    target_live_db_path: str | Path,
+    migrated_db_path: str | Path | None,
+    migrated_db_is_live: bool,
+    expected_migration_runtime_sha256: str,
+) -> tuple[Any, ...] | None:
+    try:
+        raw, observed_sha256 = _read_stable_file(
+            receipt_path,
+            artifact="delivery_quarantine_migration_receipt_probe",
+            maximum_bytes=MAX_EVIDENCE_BYTES,
+            owner_only=True,
+        )
+        parsed = json.loads(raw)
+    except (DeliveryQuarantineBaselineError, OSError, TypeError, ValueError):
+        return None
+    if not isinstance(parsed, Mapping):
+        return None
+    artifact_paths: list[str | Path] = [receipt_path]
+    for name in ("source_backup", "migrated_clone"):
+        binding = parsed.get(name)
+        if isinstance(binding, Mapping) and binding.get("path"):
+            artifact_paths.append(str(binding["path"]))
+    if migrated_db_path is not None:
+        artifact_paths.append(migrated_db_path)
+    identities: list[tuple[Any, ...]] = []
+    seen: set[str] = set()
+    for path in artifact_paths:
+        selected = str(Path(path).expanduser().absolute())
+        if selected in seen:
+            continue
+        seen.add(selected)
+        identity = _migration_cache_file_identity(selected)
+        if identity is None:
+            return None
+        identities.append(identity)
+    return (
+        str(Path(receipt_path).expanduser().absolute()),
+        observed_sha256,
+        str(expected_sha256 or "").strip().lower(),
+        str(Path(target_live_db_path).expanduser().absolute()),
+        (
+            str(Path(migrated_db_path).expanduser().absolute())
+            if migrated_db_path is not None
+            else ""
+        ),
+        bool(migrated_db_is_live),
+        str(expected_migration_runtime_sha256 or "").strip().lower(),
+        tuple(identities),
+    )
+
+
+def _clear_migration_validation_cache() -> None:
+    with _MIGRATION_VALIDATION_CACHE_LOCK:
+        _MIGRATION_VALIDATION_CACHE.clear()
 
 
 def _read_stable_file(
@@ -1760,7 +1850,7 @@ def _open_readonly_db(
         os.close(descriptor)
 
 
-def _validate_migration_artifact(
+def _validate_migration_artifact_uncached(
     *,
     receipt_path: str,
     expected_sha256: str,
@@ -1827,6 +1917,72 @@ def _validate_migration_artifact(
     except QuarantineMigrationError as exc:
         raise DeliveryQuarantineBaselineError(exc.code) from exc
     return binding
+
+
+def _validate_migration_artifact(
+    *,
+    receipt_path: str,
+    expected_sha256: str,
+    target_live_db_path: str | Path,
+    migrated_db_path: str | Path | None,
+    migrated_db_is_live: bool,
+    expected_migration_runtime_sha256: str,
+) -> dict[str, Any]:
+    cache_key = _migration_validation_cache_key(
+        receipt_path=receipt_path,
+        expected_sha256=expected_sha256,
+        target_live_db_path=target_live_db_path,
+        migrated_db_path=migrated_db_path,
+        migrated_db_is_live=migrated_db_is_live,
+        expected_migration_runtime_sha256=expected_migration_runtime_sha256,
+    )
+    if cache_key is None:
+        return _validate_migration_artifact_uncached(
+            receipt_path=receipt_path,
+            expected_sha256=expected_sha256,
+            target_live_db_path=target_live_db_path,
+            migrated_db_path=migrated_db_path,
+            migrated_db_is_live=migrated_db_is_live,
+            expected_migration_runtime_sha256=(
+                expected_migration_runtime_sha256
+            ),
+        )
+    with _MIGRATION_VALIDATION_CACHE_LOCK:
+        cached = _MIGRATION_VALIDATION_CACHE.get(cache_key)
+        if cached is not None:
+            _MIGRATION_VALIDATION_CACHE.move_to_end(cache_key)
+            return dict(cached)
+        binding = _validate_migration_artifact_uncached(
+            receipt_path=receipt_path,
+            expected_sha256=expected_sha256,
+            target_live_db_path=target_live_db_path,
+            migrated_db_path=migrated_db_path,
+            migrated_db_is_live=migrated_db_is_live,
+            expected_migration_runtime_sha256=(
+                expected_migration_runtime_sha256
+            ),
+        )
+        post_validation_key = _migration_validation_cache_key(
+            receipt_path=receipt_path,
+            expected_sha256=expected_sha256,
+            target_live_db_path=target_live_db_path,
+            migrated_db_path=migrated_db_path,
+            migrated_db_is_live=migrated_db_is_live,
+            expected_migration_runtime_sha256=(
+                expected_migration_runtime_sha256
+            ),
+        )
+        if post_validation_key != cache_key:
+            raise DeliveryQuarantineBaselineError(
+                "delivery_quarantine_migration_artifact_unstable"
+            )
+        _MIGRATION_VALIDATION_CACHE[cache_key] = dict(binding)
+        while (
+            len(_MIGRATION_VALIDATION_CACHE)
+            > MAX_MIGRATION_VALIDATION_CACHE_ENTRIES
+        ):
+            _MIGRATION_VALIDATION_CACHE.popitem(last=False)
+        return binding
 
 
 def _migration_binding(

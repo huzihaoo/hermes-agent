@@ -1165,13 +1165,16 @@ def test_permanent_artifact_error_is_silent_until_work_deadline(tmp_path):
     assert fallback.error_code == "artifact_hash_mismatch"
 
 
-def test_admission_parsing_crossing_deadline_skips_status_read(tmp_path, monkeypatch):
+def test_admission_parsing_crossing_deadline_checks_status_before_fallback(
+    tmp_path, monkeypatch
+):
     clock = [NOW]
     status_calls = []
     instance = _real_terminal_collector(
         tmp_path,
         clock=clock,
-        status_reader=lambda task_id: status_calls.append(task_id),
+        status_reader=lambda task_id: status_calls.append(task_id)
+        or {"success": True, "task_id": task_id, "state": "running"},
     )
     _age_work_start(instance, seconds=1799)
     original = collector._submission_admission
@@ -1187,7 +1190,7 @@ def test_admission_parsing_crossing_deadline_skips_status_read(tmp_path, monkeyp
 
     assert fallback.status == "terminal_failed"
     assert fallback.error_code == "rca_work_deadline_exceeded"
-    assert status_calls == []
+    assert len(status_calls) == 1
     assert instance.store.list_rows("rca_delivery_jobs") == []
     assert instance.store.list_rows("rca_delivery_effects") == []
     assert instance.store.list_rows("rca_execution_watch")[0]["state"] == (
@@ -1221,6 +1224,37 @@ def test_status_read_crossing_deadline_skips_artifact_read(tmp_path):
     assert instance.store.list_rows("rca_execution_watch")[0]["state"] == (
         "terminal_failed"
     )
+
+
+def test_late_host_observation_delivers_vm_result_completed_before_deadline(
+    tmp_path, monkeypatch
+):
+    clock = [NOW]
+    instance = _real_terminal_collector(
+        tmp_path,
+        clock=clock,
+        status_reader=lambda task_id: {
+            "success": True,
+            "task_id": task_id,
+            "state": "completed",
+            "updated_at": (NOW - timedelta(seconds=2)).isoformat(),
+        },
+    )
+    _age_work_start(instance, seconds=1801)
+    observed_claims = []
+    instance.artifact_bundle_reader = lambda claim: observed_claims.append(claim) or {}
+    monkeypatch.setattr(
+        collector,
+        "verify_delivery_bundle",
+        lambda **_kwargs: _delivery(observed_claims[0]),
+    )
+
+    outcome = instance.collect_one()
+
+    assert outcome.status == "delivery_created"
+    [watch] = instance.store.list_rows("rca_execution_watch")
+    assert watch["state"] == "delivery_created"
+    assert watch["last_error_code"] == ""
 
 
 def test_late_valid_completed_bundle_becomes_low_fallback_not_delivery(

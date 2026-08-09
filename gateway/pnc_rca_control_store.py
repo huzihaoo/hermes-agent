@@ -8084,7 +8084,15 @@ class RcaControlStore:
             "message_id": str(expected_message_id or "").strip(),
             "requester_id": str(expected_requester_id or "").strip(),
         }
-        if not all(expected_source.values()):
+        operator_issue_only = not expected_source["chat_id"] and not expected_source[
+            "thread_id"
+        ]
+        if (
+            not expected_source["message_id"]
+            or not expected_source["requester_id"]
+            or (not operator_issue_only and not all(expected_source.values()))
+            or (operator_issue_only and (expected_chat_id or expected_thread_id))
+        ):
             raise RecordConflictError(
                 "manual_external_write_source_identity_invalid"
             )
@@ -8138,9 +8146,20 @@ class RcaControlStore:
                 "message_id": str(source["message_id"]),
                 "requester_id": str(source["requester_id"]),
             }
+            source_platform = str(source["platform"] or "")
+            source_mode = str(source["mode"] or "")
+            source_is_operator_issue_only = (
+                source_platform == "operator"
+                and not observed_source["chat_id"]
+                and not observed_source["thread_id"]
+                and source_mode == "rerun"
+            )
             if (
                 str(source["source_kind"]) != "feishu_group_manual"
-                or str(source["platform"]) != "feishu"
+                or not (
+                    (source_platform == "feishu" and not operator_issue_only)
+                    or (source_is_operator_issue_only and operator_issue_only)
+                )
                 or observed_source != expected_source
                 or str(source["outcome"]) != str(value["outcome"])
                 or str(source["delivery_source_id"]) != str(value["source_id"])
@@ -8158,9 +8177,17 @@ class RcaControlStore:
             source_identity = {
                 **observed_source,
                 "issue_url": issue_url,
-                "mode": str(source["mode"]),
+                "mode": source_mode,
             }
-            source_identity_sha256 = _canonical_sha256(source_identity)
+            # Operator issue-only admissions use stable transport placeholders
+            # in the activation ledger while retaining empty chat/thread fields
+            # in the provider-facing source identity.
+            ledger_source_identity = dict(source_identity)
+            if source_is_operator_issue_only:
+                ledger_source_identity.update(
+                    {"chat_id": "operator", "thread_id": "operator:issue-only"}
+                )
+            source_identity_sha256 = _canonical_sha256(ledger_source_identity)
             ledger = conn.execute(
                 """
                 SELECT epoch.epoch_id, epoch.state, epoch.is_current,
@@ -8264,10 +8291,7 @@ class RcaControlStore:
                 """,
                 (business_key, submission_key, generation),
             ).fetchone()
-            if source_row is None or (
-                str(source_row["source_kind"] or "") != "feishu_group_manual"
-                or str(source_row["platform"] or "") != "feishu"
-            ):
+            if source_row is None or str(source_row["source_kind"] or "") != "feishu_group_manual":
                 return None
             row = conn.execute(
                 """
@@ -8291,7 +8315,7 @@ class RcaControlStore:
                    AND subscription.effect_kind = ?
                    AND subscription.target_key = ?
                    AND source.source_kind = 'feishu_group_manual'
-                   AND source.platform = 'feishu'
+                   AND source.platform IN ('feishu', 'operator')
                  ORDER BY subscription.subscription_key
                 """,
                 (
@@ -8322,6 +8346,13 @@ class RcaControlStore:
                 "issue_url": issue_url,
                 "mode": str(row["mode"] or ""),
             }
+            source_platform = str(row["platform"] or "")
+            operator_issue_only = (
+                source_platform == "operator"
+                and not source_identity["chat_id"]
+                and not source_identity["thread_id"]
+                and source_identity["mode"] == "rerun"
+            )
             admission = {
                 "schema_version": MANUAL_ADMISSION_RESULT_SCHEMA_VERSION,
                 "outcome": str(row["outcome"] or ""),
@@ -8336,7 +8367,24 @@ class RcaControlStore:
             if (
                 str(row["effect_kind"] or "") != effect_kind
                 or str(row["delivery_id"] or "") != delivery_id
-                or not all(str(value).strip() for value in source_identity.values())
+                or source_platform not in {"feishu", "operator"}
+                or not source_identity["message_id"].strip()
+                or not source_identity["requester_id"].strip()
+                or not source_identity["issue_url"].strip()
+                or not source_identity["mode"].strip()
+                or (
+                    source_platform == "feishu"
+                    and (
+                        not source_identity["chat_id"].strip()
+                        or not source_identity["thread_id"].strip()
+                    )
+                )
+                or (source_platform == "operator" and not operator_issue_only)
+                or (
+                    operator_issue_only
+                    and effect_kind
+                    not in {"feishu_issue_comment", "feishu_issue_field_update"}
+                )
                 or not all(str(value).strip() for value in admission.values() if not isinstance(value, int))
             ):
                 raise RecordConflictError(

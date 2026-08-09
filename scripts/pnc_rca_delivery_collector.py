@@ -241,6 +241,30 @@ def _work_window(
     return started, deadline, (current - started).total_seconds()
 
 
+def _completed_within_work_window(
+    claim: ExecutionWatchClaim,
+    status: Mapping[str, Any],
+    *,
+    state: str,
+) -> bool:
+    if status.get("success") is not True or state not in _COMPLETED_STATES:
+        return False
+    meta = status.get("meta")
+    meta = meta if isinstance(meta, Mapping) else {}
+    completed_at = (
+        status.get("completed_at")
+        or status.get("updated_at")
+        or meta.get("completed_at")
+        or meta.get("updated_at")
+    )
+    try:
+        observed = _utc_datetime(completed_at, field="status_completed_at")
+        started, deadline, _elapsed = _work_window(claim, observed)
+    except RuntimeError:
+        return False
+    return started <= observed <= deadline
+
+
 def default_infra_remediation_runner(
     claim: ExecutionWatchClaim,
     blocker: Mapping[str, Any],
@@ -2875,14 +2899,6 @@ class DeliveryCollector:
                     code=code,
                     detail=f"{code}: {type(exc).__name__}",
                 )
-        deadline_outcome = self._deadline_outcome(
-            claim,
-            status=status,
-            state=claim.state,
-            source="before_admission",
-        )
-        if deadline_outcome is not None:
-            return deadline_outcome
         if admission is None:
             try:
                 admission = _submission_admission(claim)
@@ -2909,14 +2925,6 @@ class DeliveryCollector:
                     state=claim.state,
                     source="submission_admission",
                 )
-        deadline_outcome = self._deadline_outcome(
-            claim,
-            status=status,
-            state=claim.state,
-            source="after_admission",
-        )
-        if deadline_outcome is not None:
-            return deadline_outcome
 
         try:
             raw_status = self.status_reader(claim.task_id)
@@ -2953,14 +2961,20 @@ class DeliveryCollector:
             )
 
         state = _status_state(status)
-        deadline_outcome = self._deadline_outcome(
+        completed_within_work_window = _completed_within_work_window(
             claim,
-            status=status,
+            status,
             state=state,
-            source="after_vm_status_read",
         )
-        if deadline_outcome is not None:
-            return deadline_outcome
+        if not completed_within_work_window:
+            deadline_outcome = self._deadline_outcome(
+                claim,
+                status=status,
+                state=state,
+                source="after_vm_status_read",
+            )
+            if deadline_outcome is not None:
+                return deadline_outcome
         if status.get("success") is not True:
             code = (
                 "vm_status_missing" if state == "missing" else "vm_status_unavailable"
@@ -3153,22 +3167,23 @@ class DeliveryCollector:
                 state=state,
                 source="delivery_contract_verifier",
             )
-        deadline_outcome = self._deadline_outcome(
-            claim,
-            status=status,
-            state=state,
-            source="after_artifact_verification",
-        )
-        if deadline_outcome is not None:
-            return deadline_outcome
-        deadline_outcome = self._deadline_outcome(
-            claim,
-            status=status,
-            state=state,
-            source="before_delivery_create",
-        )
-        if deadline_outcome is not None:
-            return deadline_outcome
+        if not completed_within_work_window:
+            deadline_outcome = self._deadline_outcome(
+                claim,
+                status=status,
+                state=state,
+                source="after_artifact_verification",
+            )
+            if deadline_outcome is not None:
+                return deadline_outcome
+            deadline_outcome = self._deadline_outcome(
+                claim,
+                status=status,
+                state=state,
+                source="before_delivery_create",
+            )
+            if deadline_outcome is not None:
+                return deadline_outcome
         try:
             result = self.store.create_delivery(
                 claim=claim,

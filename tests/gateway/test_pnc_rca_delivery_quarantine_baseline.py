@@ -10,6 +10,7 @@ import sqlite3
 
 import pytest
 
+from gateway import pnc_rca_delivery_quarantine_baseline as baseline_module
 from gateway import pnc_rca_delivery_store as delivery_store_module
 from gateway.pnc_rca_delivery_contract import (
     DELIVERY_EFFECT_KIND,
@@ -2932,6 +2933,39 @@ def test_exact_approved_baseline_acknowledges_lifetime_without_db_writes(tmp_pat
     assert (
         store.backpressure_snapshot(now=NOW + timedelta(seconds=5)).public_dict()
         == before_backpressure
+    )
+
+
+def test_static_migration_cache_does_not_hide_live_quarantine_drift(
+    tmp_path, monkeypatch
+):
+    bundle = _build_bundle(tmp_path)
+    baseline_module._clear_migration_validation_cache()
+    calls = []
+    original = baseline_module.validate_migration_receipt
+
+    def counted(**kwargs):
+        calls.append(kwargs)
+        return original(**kwargs)
+
+    monkeypatch.setattr(baseline_module, "validate_migration_receipt", counted)
+
+    assert _health(bundle)["business_ready"] is True
+    assert _health(bundle)["business_ready"] is True
+    assert len(calls) == 1
+    with sqlite3.connect(bundle["store"].db_path) as conn:
+        conn.execute(
+            "UPDATE rca_delivery_jobs SET updated_at = ?",
+            ((NOW + timedelta(seconds=9)).isoformat(),),
+        )
+
+    drifted = _health(bundle)
+
+    assert len(calls) == 1
+    assert drifted["business_ready"] is False
+    assert drifted["business_blockers"]["quarantine_baseline_invalid"] == 1
+    assert drifted["delivery_quarantine"]["error_code"] == (
+        "delivery_quarantine_baseline_snapshot_mismatch"
     )
 
 

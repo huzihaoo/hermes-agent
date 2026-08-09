@@ -3125,6 +3125,47 @@ def test_manual_external_write_authority_is_exact_and_revocation_sensitive(
         )
 
 
+def test_operator_issue_only_external_write_authority_uses_operator_ledger_identity(
+    tmp_path,
+):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    _register_policy_without_classifying(store)
+    _activate_direct_steady_epoch(store)
+    request = _operator_request(
+        "batch-operator-7041712812-try-1",
+        requester_id="automation:rca-batch-rerun",
+    )
+    admitted = store.admit_manual_trigger(
+        request,
+        allowed_chat_ids=set(),
+        submit_enabled=True,
+        operator_authorized=True,
+        active_policy=_policy(),
+        activation_required=True,
+    )
+
+    authority = store.validate_manual_external_write_admission(
+        admitted.to_dict(),
+        expected_chat_id="",
+        expected_thread_id="",
+        expected_message_id=request.message_id,
+        expected_requester_id=request.requester_id,
+    )
+
+    assert authority["state"] == "steady_active"
+    assert authority["decision"] == "admit"
+    assert authority["chat_id"] == ""
+    assert authority["thread_id"] == ""
+    with pytest.raises(RecordConflictError, match="source_identity_mismatch"):
+        store.validate_manual_external_write_admission(
+            admitted.to_dict(),
+            expected_chat_id="oc_forbidden",
+            expected_thread_id="topic:forbidden",
+            expected_message_id=request.message_id,
+            expected_requester_id=request.requester_id,
+        )
+
+
 def test_bounded_manual_auto_slot_rejects_ambiguous_exact_identity(tmp_path):
     store = RcaControlStore(tmp_path / "control.sqlite3")
     identity = _manual_activation_identity("om_ambiguous")
