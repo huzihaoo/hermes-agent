@@ -1024,185 +1024,28 @@ def _queue_precondition_matches(
     )
 
 
-def _readonly_file_fingerprint(
-    path: Path, *, required: bool = False
-) -> dict[str, Any]:
-    """Hash one regular source file without following a replacement symlink."""
-    try:
-        observed = path.lstat()
-    except FileNotFoundError as exc:
-        if required:
-            raise BatchRerunError("batch_control_db_unavailable") from exc
-        return {"present": False}
-    except OSError as exc:
-        raise BatchRerunError("batch_control_db_snapshot_unavailable") from exc
-    if not stat.S_ISREG(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
-        raise BatchRerunError("batch_control_db_snapshot_identity_invalid")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as exc:
-        raise BatchRerunError("batch_control_db_snapshot_unavailable") from exc
-    digest = hashlib.sha256()
-    try:
-        opened = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or (opened.st_dev, opened.st_ino) != (observed.st_dev, observed.st_ino)
-        ):
-            raise BatchRerunError("batch_control_db_snapshot_identity_invalid")
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-        final = os.fstat(descriptor)
-    finally:
-        os.close(descriptor)
-    identity = (
-        int(observed.st_dev),
-        int(observed.st_ino),
-        int(observed.st_nlink),
-        int(observed.st_size),
-        int(observed.st_mtime_ns),
-        int(observed.st_ctime_ns),
-    )
-    if identity != (
-        int(final.st_dev),
-        int(final.st_ino),
-        int(final.st_nlink),
-        int(final.st_size),
-        int(final.st_mtime_ns),
-        int(final.st_ctime_ns),
-    ):
-        raise BatchRerunError("batch_control_db_snapshot_drift")
-    return {
-        "present": True,
-        "device": identity[0],
-        "inode": identity[1],
-        "links": identity[2],
-        "size": identity[3],
-        "mtime_ns": identity[4],
-        "ctime_ns": identity[5],
-        "sha256": digest.hexdigest(),
-    }
-
-
-def _control_source_snapshot(db_path: Path) -> dict[str, dict[str, Any]]:
-    return {
-        "database": _readonly_file_fingerprint(db_path, required=True),
-        "wal": _readonly_file_fingerprint(db_path.with_name(f"{db_path.name}-wal")),
-        "shm": _readonly_file_fingerprint(db_path.with_name(f"{db_path.name}-shm")),
-    }
-
-
-def _copy_snapshot_file(
-    source: Path, destination: Path, expected: Mapping[str, Any]
-) -> None:
-    """Copy one already fingerprinted source and bind the replica to its hash."""
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        source_fd = os.open(source, flags)
-        destination_fd = os.open(
-            destination,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
-            0o600,
-        )
-    except OSError as exc:
-        if "source_fd" in locals():
-            os.close(source_fd)
-        raise BatchRerunError("batch_control_db_snapshot_copy_failed") from exc
-    digest = hashlib.sha256()
-    try:
-        with os.fdopen(destination_fd, "wb", closefd=True) as stream:
-            opened = os.fstat(source_fd)
-            if (
-                not stat.S_ISREG(opened.st_mode)
-                or (opened.st_dev, opened.st_ino)
-                != (int(expected["device"]), int(expected["inode"]))
-            ):
-                raise BatchRerunError("batch_control_db_snapshot_drift")
-            while True:
-                chunk = os.read(source_fd, 1024 * 1024)
-                if not chunk:
-                    break
-                digest.update(chunk)
-                stream.write(chunk)
-            stream.flush()
-        final = os.fstat(source_fd)
-    finally:
-        os.close(source_fd)
-    if (
-        (final.st_dev, final.st_ino)
-        != (int(expected["device"]), int(expected["inode"]))
-        or int(final.st_size) != int(expected["size"])
-        or int(final.st_mtime_ns) != int(expected["mtime_ns"])
-        or int(final.st_ctime_ns) != int(expected["ctime_ns"])
-        or digest.hexdigest() != expected["sha256"]
-    ):
-        raise BatchRerunError("batch_control_db_snapshot_drift")
-    replica = _readonly_file_fingerprint(destination, required=True)
-    if (
-        int(replica["size"]) != int(expected["size"])
-        or replica["sha256"] != expected["sha256"]
-    ):
-        raise BatchRerunError("batch_control_db_snapshot_copy_invalid")
-
-
-def _source_snapshot_receipt(
-    source: Mapping[str, Mapping[str, Any]],
-) -> dict[str, Any]:
-    files: dict[str, dict[str, Any]] = {}
-    for role in ("database", "wal", "shm"):
-        fingerprint = source[role]
-        if not fingerprint.get("present"):
-            files[role] = {"present": False}
-            continue
-        files[role] = {
-            "present": True,
-            "device": int(fingerprint["device"]),
-            "inode": int(fingerprint["inode"]),
-            "size": int(fingerprint["size"]),
-            "mtime_ns": int(fingerprint["mtime_ns"]),
-            "sha256": str(fingerprint["sha256"]),
-        }
-    return {
-        "transport": "ephemeral_stable_copy",
-        "source_unchanged": True,
-        "copy_verified": True,
-        "files": files,
-    }
-
-
 def _dry_run_database_plan(
     db_path: Path, queue: Sequence[Mapping[str, Any]]
 ) -> dict[str, Any]:
-    """Validate a stable copy without opening SQLite against the source DB."""
+    """Validate a SQLite-consistent online backup of the source DB."""
     selected = db_path.expanduser().absolute()
     with tempfile.TemporaryDirectory(prefix="pnc-rca-batch-dry-run-") as raw_tmp:
-        snapshot_root = Path(raw_tmp)
-        snapshot_db = snapshot_root / "control.sqlite3"
-        destinations = {
-            "database": snapshot_db,
-            "wal": snapshot_db.with_name(f"{snapshot_db.name}-wal"),
-            # Preserve source SHM provenance without letting SQLite use its
-            # copied lock/read-mark state when rebuilding the local WAL index.
-            "shm": snapshot_root / "source-control.sqlite3-shm",
-        }
-        before = _control_source_snapshot(selected)
-        sources = {
-            "database": selected,
-            "wal": selected.with_name(f"{selected.name}-wal"),
-            "shm": selected.with_name(f"{selected.name}-shm"),
-        }
-        for role in ("database", "wal", "shm"):
-            if before[role].get("present"):
-                _copy_snapshot_file(sources[role], destinations[role], before[role])
-        after = _control_source_snapshot(selected)
-        if after != before:
-            raise BatchRerunError("batch_control_db_snapshot_drift")
+        snapshot_db = Path(raw_tmp) / "control.sqlite3"
+        source_uri = f"file:{quote(str(selected), safe='/')}?mode=ro"
+        try:
+            source = sqlite3.connect(source_uri, uri=True, timeout=30)
+            snapshot = sqlite3.connect(snapshot_db, timeout=30)
+            try:
+                source.execute("PRAGMA query_only = ON")
+                source.backup(snapshot, pages=1024, sleep=0.01)
+                snapshot.commit()
+            finally:
+                snapshot.close()
+                source.close()
+        except sqlite3.Error as exc:
+            raise BatchRerunError("batch_control_db_snapshot_failed") from exc
 
-        uri = f"file:{quote(str(snapshot_db), safe='/')}?mode=ro"
+        uri = f"file:{quote(str(snapshot_db), safe='/')}?mode=ro&immutable=1"
         try:
             conn = sqlite3.connect(uri, uri=True, timeout=10)
             conn.row_factory = sqlite3.Row
@@ -1296,7 +1139,12 @@ def _dry_run_database_plan(
         "schema_version": CONTROL_STORE_SCHEMA_VERSION,
         "quick_check": "ok",
         "foreign_key_violations": 0,
-        "source_snapshot": _source_snapshot_receipt(before),
+        "source_snapshot": {
+            "transport": "sqlite_online_backup",
+            "source_open_mode": "read_only",
+            "source_query_only": True,
+            "copy_verified": True,
+        },
         "activation": {
             "epoch_id": str(epochs[0]["epoch_id"]),
             "state": "steady_active",

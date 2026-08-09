@@ -1,6 +1,8 @@
 import hashlib
 import json
 import sqlite3
+import threading
+import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -750,16 +752,11 @@ def test_dry_run_without_owner_receipt_is_read_only_and_not_authorized(
     }
     assert result["database"]["activation"]["ready"] is True
     assert result["database"]["preconditions"]["matched"] == 1
-    assert result["database"]["source_snapshot"]["transport"] == (
-        "ephemeral_stable_copy"
-    )
-    assert result["database"]["source_snapshot"]["source_unchanged"] is True
-    assert result["database"]["source_snapshot"]["copy_verified"] is True
-    assert result["database"]["source_snapshot"]["files"]["wal"] == {
-        "present": False
-    }
-    assert result["database"]["source_snapshot"]["files"]["shm"] == {
-        "present": False
+    assert result["database"]["source_snapshot"] == {
+        "transport": "sqlite_online_backup",
+        "source_open_mode": "read_only",
+        "source_query_only": True,
+        "copy_verified": True,
     }
     assert result["execution_policy"] == {
         "activation_required": True,
@@ -775,7 +772,7 @@ def test_dry_run_without_owner_receipt_is_read_only_and_not_authorized(
     assert sorted(path.name for path in tmp_path.iterdir()) == before_files
 
 
-def test_dry_run_never_opens_or_mutates_source_wal_sidecars(tmp_path, monkeypatch):
+def test_dry_run_does_not_mutate_source_database_or_wal(tmp_path, monkeypatch):
     queue_path = tmp_path / "queue.json"
     queue_path.write_text(
         json.dumps(
@@ -807,17 +804,27 @@ def test_dry_run_never_opens_or_mutates_source_wal_sidecars(tmp_path, monkeypatc
     try:
         result = batch_rerun.run(args)
         after = {path.name: _file_state(path) for path in source_files}
-        assert after == before
+        assert after[db_path.name] == before[db_path.name]
+        assert after[f"{db_path.name}-wal"] == before[f"{db_path.name}-wal"]
+        assert {
+            key: value
+            for key, value in after[f"{db_path.name}-shm"].items()
+            if key != "sha256"
+        } == {
+            key: value
+            for key, value in before[f"{db_path.name}-shm"].items()
+            if key != "sha256"
+        }
     finally:
         writer.close()
 
-    provenance = result["database"]["source_snapshot"]["files"]
-    assert provenance["database"]["sha256"] == before[db_path.name]["sha256"]
-    assert provenance["wal"]["sha256"] == before[f"{db_path.name}-wal"]["sha256"]
-    assert provenance["shm"]["sha256"] == before[f"{db_path.name}-shm"]["sha256"]
+    assert result["database"]["source_snapshot"]["source_open_mode"] == "read_only"
+    assert result["database"]["source_snapshot"]["source_query_only"] is True
 
 
-def test_dry_run_fails_closed_when_source_snapshot_drifts(tmp_path, monkeypatch):
+def test_dry_run_uses_consistent_backup_during_active_wal_mutation(
+    tmp_path, monkeypatch
+):
     queue_path = tmp_path / "queue.json"
     queue_path.write_text(
         json.dumps(
@@ -826,28 +833,53 @@ def test_dry_run_fails_closed_when_source_snapshot_drifts(tmp_path, monkeypatch)
         ),
         encoding="utf-8",
     )
+    db_path = _write_dry_run_db(tmp_path)
+    setup = sqlite3.connect(db_path)
+    assert setup.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    setup.execute(
+        "CREATE TABLE backup_churn(id INTEGER PRIMARY KEY, value INTEGER NOT NULL)"
+    )
+    setup.execute("INSERT INTO backup_churn VALUES(1, 0)")
+    setup.execute("CREATE TABLE backup_padding(payload BLOB NOT NULL)")
+    setup.execute("INSERT INTO backup_padding VALUES(zeroblob(16777216))")
+    setup.commit()
+    setup.close()
     args = _run_args(tmp_path, queue_path, tmp_path / "unused-owner.json")
-    args.control_db = str(_write_dry_run_db(tmp_path))
+    args.control_db = str(db_path)
     args.owner_receipt = None
     args.dry_run = True
     monkeypatch.setattr(
         batch_rerun, "_runtime_identity", lambda: ("a" * 40, "b" * 40)
     )
-    capture = batch_rerun._control_source_snapshot
-    calls = 0
+    started = threading.Event()
+    commits = []
 
-    def drifting_snapshot(path):
-        nonlocal calls
-        calls += 1
-        observed = {role: dict(value) for role, value in capture(path).items()}
-        if calls == 2:
-            observed["database"]["mtime_ns"] += 1
-        return observed
+    def mutate_wal():
+        writer = sqlite3.connect(db_path, timeout=10)
+        try:
+            for value in range(1, 201):
+                writer.execute("UPDATE backup_churn SET value = ? WHERE id = 1", (value,))
+                writer.commit()
+                commits.append(value)
+                started.set()
+                time.sleep(0.001)
+        finally:
+            writer.close()
 
-    monkeypatch.setattr(batch_rerun, "_control_source_snapshot", drifting_snapshot)
+    thread = threading.Thread(target=mutate_wal)
+    thread.start()
+    try:
+        assert started.wait(timeout=5)
+        before_backup = len(commits)
+        result = batch_rerun.run(args)
+        assert len(commits) > before_backup
+    finally:
+        thread.join(timeout=5)
 
-    with pytest.raises(BatchRerunError, match="batch_control_db_snapshot_drift"):
-        batch_rerun.run(args)
+    assert not thread.is_alive()
+    assert result["database"]["quick_check"] == "ok"
+    assert result["database"]["foreign_key_violations"] == 0
+    assert result["database"]["preconditions"]["matched"] == 1
 
 
 def test_dry_run_rejects_a_provided_invalid_owner_receipt_before_db(
