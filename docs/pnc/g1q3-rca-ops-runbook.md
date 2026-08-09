@@ -75,11 +75,11 @@ DNP 从问题名称、问题所属部门和简洁部门字段中识别。至少�
 
 S6 成功后必须完成：
 
-1. 将非空归因摘要写入「归因结果」。
-2. 将可访问的正式 HTML 报告链接写入「归因报告」。
+1. 将非空归因摘要写入「归因结果」`field_9193cb`。
+2. 将可访问的正式 HTML 报告链接写入「归因报告」`field_8c912e`。
 3. 对两个字段分别执行 read-before、write、read-after。
 4. 读回值与预期完全一致后，才把 delivery effect 标记为成功。
-5. 写入结果不确定时进入 reconciliation，不盲目重发。
+5. 写入结果不确定时只对当前 effect 做字段读回裁决，不盲目重发，也不启动历史全表 reconciliation。
 
 字段 ID 必须从当前飞书字段元数据解析并与字段名称核对，禁止依赖历史手工常量。
 
@@ -237,3 +237,17 @@ python3 scripts/pnc_rca_b15_preflight.py \
 - 真实业务任务的必要报告与阶段 receipt
 
 历史不确定投递记录不能作为普通缓存删除；必须在字段 reconciliation 完成后按审计规则处置。
+
+## 10. v19 最小稳定生产路径
+
+本节定义 v19 能力上线后处理真实问题单的最短路径；只核验本次变更面和当前批次，不恢复旧 release gate、历史对账或合成入口验收。
+
+1. **绑定 v19 runtime。** Host 的 VM release binding、RCA workspace 的 fixed CLI、VM worker 的 `RCA_SERVICE_REPO_ROOT` 与任务状态中的 `route/cwd/fixed_cli_entrypoint` 必须共同指向当前 installed runtime。本轮基准路径是 `/home/mini/.hermes/rca-prod-runtime/releases/rca-platform-20260809.installed-eeb1bb9`；后续切换时用新的完整 installed 路径整体替换，不混用两个 runtime。
+2. **补齐 remote-reader 生效面。** installed runtime 的 Git commit/tree clean 不代表 remote reader 已就绪；`.rca-runtime` 是 Git ignored 的本地生效面。先在目标 runtime 执行 `api/g1q3_rca/scripts/bootstrap_remote_reader_runtime.py --check`；若返回 `remote_reader_runtime_not_bootstrapped`，执行同一脚本的 `--install-offline`，再独立 `--check` 到 `status=ready`。不得联网补包，也不得用 Host 预扫描替代 VM 检查。
+3. **核对三面 identity。** Host 核对 source commit/tree、clean 状态和 VM binding；Workspace 核对 manifest SHA、closure SHA 与 fixed CLI；VM 核对 pipeline commit/tree、正式 origin、必需 submodule、installed path，以及 worker 实际 route/cwd/fixed CLI。任一面不一致只修该面，未变化的面不重复发布。
+4. **直接交付并读回。** 对真实 issue 只写 `field_9193cb` 和 `field_8c912e`，每个字段执行 read-before、write、read-after；两项官方回读与本代 payload 完全一致后才记成功。评论、报告文件存在或本地 receipt 都不能替代字段读回。
+5. **历史 delivery 不阻塞新批。** 批量处理只以当前 generation 的可调度工作和实时资源为背压依据；旧 generation 的 pending/stalled/uncertain/terminal 行保持审计态，不得倒灌成新批 admission blocker。当前 delivery 水位配置为 `HERMES_RCA_OUTBOX_DELIVERY_HIGH_WATERMARK=10000`、`HERMES_RCA_OUTBOX_DELIVERY_RESUME_WATERMARK=9999`，它不同于 Kafka outbox 水位，用于避免历史 delivery backlog 把新问题单入口压停；不得为清旧账而降低水位或暂停当前批次。
+6. **失败代次只前进，不复活。** 已失败或终止的 task、submission key 和 delivery effect 保持不可变。需要重试时必须显式创建 `generation + 1`，生成新的 submission key/task ID，并绑定当前 runtime identity；禁止把旧 task 改回 pending、复用旧任务目录或重新 claim 旧 effect。
+7. **不模拟机器人入口。** operator issue-only 批次不创建 `@机器人`、话题回复或卡片更新，也不把这些动作作为字段写入验收门。真实 `@` 入口仍沿用原 `chat_id/thread_id/message_id` 和既有 topic/card 链路，由真实事件触发并按原功能回归；发布与批处理不得合成事件替代它。
+
+最小验收结果是一张当前批次清单：`work_item_id`、generation、Host/Workspace/VM identity、两个字段的 read-after 值和最终状态。旧 baseline 重放、全历史差异矩阵、历史 delivery 清算及额外 canary 均不属于该路径。
