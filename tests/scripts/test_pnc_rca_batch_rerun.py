@@ -27,6 +27,7 @@ from scripts.pnc_rca_batch_rerun import (
     SCHEMA_VERSION,
     BatchRerunError,
     _approval,
+    _batch_completion,
     _batch_terminal_authority,
     _historical_epoch_rerun_authority,
     _historical_epoch_rerun_ineligibility,
@@ -234,6 +235,47 @@ def test_approval_rejects_delivered_noncausal_result():
     failure = _terminal_failure(snapshot)
     assert failure is not None
     assert failure["job_status"] == "delivered"
+
+
+def test_batch_completion_does_not_repeat_a_confirmed_field_write():
+    snapshot = _snapshot(causal=False)
+
+    completion = _batch_completion(snapshot)
+
+    assert completion is not None
+    assert completion["official_field_keys"] == ["field_8c912e", "field_9193cb"]
+    assert completion["official_readback_source"] == "read_after_write"
+    assert completion["quality"] == {
+        "status": "post_write_review_required",
+        "reason": "quality_contract_not_satisfied",
+        "responsibility": "暂无法判断",
+        "causal_text_sha256": "",
+    }
+
+
+def test_batch_completion_requires_provider_readback():
+    snapshot = _snapshot(causal=False)
+    snapshot["effects"][0]["remote_receipt"]["source"] = "write_response"
+
+    assert _batch_completion(snapshot) is None
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "read_after_recovery_write",
+        "read_before_write",
+        "recovery_read_before_write",
+    ],
+)
+def test_batch_completion_accepts_canonical_reconciliation_readback(source):
+    snapshot = _snapshot(causal=False)
+    snapshot["effects"][0]["remote_receipt"]["source"] = source
+
+    completion = _batch_completion(snapshot)
+
+    assert completion is not None
+    assert completion["official_readback_source"] == source
 
 
 def test_approval_accepts_decoded_data_binding_conflict_as_a_cause():
@@ -1223,6 +1265,63 @@ def test_run_refreshes_existing_success_instead_of_skipping_it(tmp_path, monkeyp
     assert admitted is True
     assert result["items"]["7048803418"]["generation"] == 2
     assert result["status"] == "completed"
+
+
+def test_run_reconciles_failed_state_after_confirmed_field_readback(
+    tmp_path, monkeypatch
+):
+    queue_path, owner_path = _write_run_inputs(tmp_path, _queue_value())
+    delivered = {
+        **_snapshot(causal=False),
+        "generation": 2,
+        "submission_key": "g1q3-rca-s1-" + "c" * 64,
+    }
+    state = {
+        "schema_version": SCHEMA_VERSION,
+        "batch_id": "gray-20260724",
+        "status": "blocked_on_item_failure",
+        "items": {
+            "7048803418": {
+                "issue_id": "7048803418",
+                "title": "ACC braking issue",
+                "status": "failed",
+                "generation": 2,
+                "submission_key": delivered["submission_key"],
+                "request_index": 1,
+                "failure": {"job_status": "delivered"},
+            }
+        },
+    }
+
+    class FakeStore:
+        def __init__(self, _path):
+            pass
+
+        def admit_manual_trigger(self, *_args, **_kwargs):
+            pytest.fail("confirmed field readback created a duplicate generation")
+
+    def snapshot(_path, _issue_id, *, submission_key=""):
+        if submission_key and submission_key != delivered["submission_key"]:
+            return None
+        return delivered
+
+    monkeypatch.setattr(batch_rerun, "RcaControlStore", FakeStore)
+    monkeypatch.setattr(batch_rerun, "_issue_snapshot", snapshot)
+    monkeypatch.setattr(batch_rerun, "_load_or_create_state", lambda *_a, **_k: state)
+    monkeypatch.setattr(
+        batch_rerun, "_runtime_identity", lambda: ("a" * 40, "b" * 40)
+    )
+    args = _run_args(tmp_path, queue_path, owner_path)
+    args.retry_failed = True
+
+    result = batch_rerun.run(args)
+
+    item = result["items"]["7048803418"]
+    assert result["status"] == "completed"
+    assert result["summary"] == {"accepted": 1, "total": 1}
+    assert item["status"] == "accepted"
+    assert "failure" not in item
+    assert item["approval"]["quality"]["status"] == "post_write_review_required"
 
 
 def test_issue_snapshot_tracks_new_outbox_before_execution_watch_exists(tmp_path):

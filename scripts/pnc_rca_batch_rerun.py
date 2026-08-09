@@ -128,6 +128,14 @@ ISSUE_ID_RE = re.compile(r"^[0-9]{6,24}$")
 BATCH_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$")
 TERMINAL_JOB_STATUSES = frozenset({"delivered", "partial", "quarantined"})
 ACTIVE_EFFECT_STATUSES = frozenset({"pending", "claimed", "retry_wait", "uncertain"})
+OFFICIAL_READBACK_SOURCES = frozenset(
+    {
+        "read_after_write",
+        "read_after_recovery_write",
+        "read_before_write",
+        "recovery_read_before_write",
+    }
+)
 DRY_RUN_PRODUCTION_EFFECTS = {
     "state_write": False,
     "control_db_write": False,
@@ -851,7 +859,11 @@ def _approval(
         return None
     receipt = dict(issue_effects[0].get("remote_receipt") or {})
     field_keys = sorted(str(value) for value in receipt.get("confirmed_field_keys", []))
-    if not receipt.get("remote_id") or field_keys != ["field_8c912e", "field_9193cb"]:
+    if (
+        not receipt.get("remote_id")
+        or receipt.get("source") not in OFFICIAL_READBACK_SOURCES
+        or field_keys != ["field_8c912e", "field_9193cb"]
+    ):
         return None
     quality = _causal_delivery_quality(snapshot.get("contract_json"))
     if quality is None:
@@ -875,6 +887,65 @@ def _approval(
         "official_field_keys": field_keys,
         "official_readback_source": str(receipt.get("source") or ""),
         "quality": quality,
+        "manifest": _json_object(snapshot.get("manifest_json")),
+        "artifacts": _json_object(snapshot.get("artifacts_json")),
+        "completed_at": str(issue_effects[0].get("completed_at") or ""),
+    }
+
+
+def _batch_completion(
+    snapshot: Mapping[str, Any], *, issue_title: str = ""
+) -> dict[str, Any] | None:
+    """Return a terminal batch result once the two issue fields were read back.
+
+    Quality classification remains visible, but it cannot trigger another
+    external write after the provider already confirmed both requested fields.
+    """
+    approved = _approval(snapshot, issue_title=issue_title)
+    if approved is not None:
+        return approved
+    if snapshot.get("job_status") != "delivered":
+        return None
+    if snapshot.get("job_outcome") != "success":
+        return None
+    required = [
+        effect
+        for effect in snapshot.get("effects", [])
+        if isinstance(effect, Mapping) and int(effect.get("required") or 0) == 1
+    ]
+    issue_effects = [
+        effect
+        for effect in required
+        if effect.get("effect_kind") == "feishu_issue_comment"
+    ]
+    if len(issue_effects) != 1 or any(
+        effect.get("status") != "succeeded" for effect in required
+    ):
+        return None
+    receipt = dict(issue_effects[0].get("remote_receipt") or {})
+    field_keys = sorted(str(value) for value in receipt.get("confirmed_field_keys", []))
+    if (
+        not receipt.get("remote_id")
+        or receipt.get("source") not in OFFICIAL_READBACK_SOURCES
+        or field_keys != ["field_8c912e", "field_9193cb"]
+    ):
+        return None
+    return {
+        "generation": int(snapshot["generation"]),
+        "submission_key": str(snapshot["submission_key"]),
+        "delivery_id": str(snapshot["delivery_id"]),
+        "outcome_key": str(snapshot.get("outcome_key") or ""),
+        "issue_url": str(snapshot.get("issue_url") or ""),
+        "report_url": str(snapshot.get("report_url") or ""),
+        "official_comment_id": str(receipt["remote_id"]),
+        "official_field_keys": field_keys,
+        "official_readback_source": str(receipt.get("source") or ""),
+        "quality": {
+            "status": "post_write_review_required",
+            "reason": "quality_contract_not_satisfied",
+            "responsibility": "暂无法判断",
+            "causal_text_sha256": "",
+        },
         "manifest": _json_object(snapshot.get("manifest_json")),
         "artifacts": _json_object(snapshot.get("artifacts_json")),
         "completed_at": str(issue_effects[0].get("completed_at") or ""),
@@ -1538,12 +1609,44 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 issue_id,
                 submission_key=str(item["submission_key"]),
             )
-            if accepted_snapshot is None or _approval(
+            if accepted_snapshot is None or _batch_completion(
                 accepted_snapshot, issue_title=str(queue_item["title"])
             ) is None:
                 raise BatchRerunError("batch_accepted_item_invalid")
             completed += 1
             continue
+        if item.get("status") == "failed" and (
+            latest is not None
+            and str(latest.get("submission_key") or "")
+            == str(item.get("submission_key") or "")
+            and int(latest.get("generation") or 0)
+            == int(item.get("generation") or 0)
+        ):
+            failed_snapshot = _issue_snapshot(
+                Path(args.control_db),
+                issue_id,
+                submission_key=str(item["submission_key"]),
+            )
+            completion = (
+                _batch_completion(
+                    failed_snapshot,
+                    issue_title=str(queue_item["title"]),
+                )
+                if failed_snapshot is not None
+                else None
+            )
+            if completion is not None:
+                item.pop("failure", None)
+                item.update({
+                    "status": "accepted",
+                    "approval": completion,
+                    "updated_at": _now(),
+                })
+                state["items"][issue_id] = item
+                state["updated_at"] = _now()
+                _write_state(state_path, state)
+                completed += 1
+                continue
         if item.get("status") == "failed" and not args.retry_failed:
             raise BatchRerunError("batch_failed_item_requires_retry_flag")
         request_index = int(item.get("request_index") or 0)
@@ -1661,7 +1764,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             )
             if latest is None:
                 raise BatchRerunError("batch_issue_generation_drift")
-            accepted = _approval(latest, issue_title=str(queue_item["title"]))
+            accepted = _batch_completion(
+                latest, issue_title=str(queue_item["title"])
+            )
             if accepted is not None:
                 item.update({
                     "status": "accepted",

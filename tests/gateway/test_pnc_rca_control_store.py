@@ -34,6 +34,7 @@ from gateway.pnc_rca_control_store import (
     build_batch_terminal_rerun_authority,
 )
 from gateway.pnc_rca_kafka_contract import WorkflowEventPolicy, WorkflowTransition
+from gateway.pnc_rca_delivery_contract import DeliveryContractError
 from gateway.pnc_rca_delivery_store import RcaDeliveryStore
 from gateway.pnc_rca_runtime_identity import canonical_json_sha256
 
@@ -992,8 +993,16 @@ def test_feishu_user_rerun_does_not_inherit_silent_terminal_exception(tmp_path):
     assert len(store.list_rows("business_triggers")) == 1
 
 
+@pytest.mark.parametrize(
+    "delivery_case",
+    (
+        "terminal_v3_guard",
+        "standard_v4_real_create",
+        "standard_v4_without_authority",
+    ),
+)
 def test_batch_terminal_authority_creates_refresh_generation_for_settled_delivery(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, delivery_case
 ):
     from types import SimpleNamespace
 
@@ -1181,6 +1190,100 @@ def test_batch_terminal_authority_creates_refresh_generation_for_settled_deliver
         for row in store.list_rows("business_triggers")
         if row["generation"] == 2
     )
+    if delivery_case.startswith("standard_v4"):
+        from tests.gateway.test_pnc_rca_delivery_store import _delivery
+
+        delivery = RcaDeliveryStore(store.db_path)
+        submitted_at = datetime.now(timezone.utc)
+        outbox_claim = store.claim_outbox(
+            lease_owner="standard-v4-rerun-submitter",
+            activation_required=True,
+            now=submitted_at,
+        )
+        assert outbox_claim is not None
+        assert outbox_claim.submission_key == rerun.submission_key
+        store.complete_outbox(
+            outbox_id=outbox_claim.outbox_id,
+            lease_token=outbox_claim.lease_token,
+            result={
+                "success": True,
+                "submission_key": rerun.submission_key,
+                "task_id": rerun.submission_key,
+                "task_state": "submitted",
+            },
+            now=submitted_at + timedelta(seconds=1),
+        )
+        assert delivery.backfill_completed_submissions(
+            now=submitted_at + timedelta(seconds=2),
+            activation_required=True,
+        ) == 1
+        watch = next(
+            row
+            for row in delivery.list_rows("rca_execution_watch")
+            if row["submission_key"] == rerun.submission_key
+        )
+        assert watch["delivery_id"] is None
+        watch_claim = delivery.claim_due_watch(
+            lease_owner="standard-v4-rerun-collector",
+            now=submitted_at + timedelta(seconds=3),
+            activation_required=True,
+        )
+        assert watch_claim is not None
+        assert watch_claim.submission_key == rerun.submission_key
+        verified = _delivery(watch_claim)
+
+        if delivery_case == "standard_v4_without_authority":
+            with sqlite3.connect(store.db_path) as conn:
+                conn.execute(
+                    "UPDATE rca_trigger_sources SET outcome='joined' "
+                    "WHERE source_id=?",
+                    (rerun.source_id,),
+                )
+            with pytest.raises(
+                DeliveryContractError, match="learning_lane_admission_missing"
+            ):
+                delivery.create_delivery(
+                    claim=watch_claim,
+                    delivery=verified,
+                    status={"success": True, "state": "completed"},
+                    now=submitted_at + timedelta(seconds=4),
+                    activation_required=True,
+                )
+            assert not [
+                row
+                for row in delivery.list_rows("rca_delivery_jobs")
+                if row["submission_key"] == rerun.submission_key
+            ]
+            assert next(
+                row
+                for row in delivery.list_rows("rca_execution_watch")
+                if row["submission_key"] == rerun.submission_key
+            )["delivery_id"] is None
+            return
+
+        created = delivery.create_delivery(
+            claim=watch_claim,
+            delivery=verified,
+            status={"success": True, "state": "completed"},
+            now=submitted_at + timedelta(seconds=4),
+            activation_required=True,
+        )
+        assert created.created is True
+        [effect] = [
+            row
+            for row in delivery.list_rows("rca_delivery_effects")
+            if row["delivery_id"] == verified.delivery_id
+        ]
+        assert json.loads(effect["payload_json"])["schema_version"] == (
+            "pnc_rca_delivery_effect_v4"
+        )
+        assert next(
+            row
+            for row in delivery.list_rows("rca_execution_watch")
+            if row["submission_key"] == rerun.submission_key
+        )["delivery_id"] == verified.delivery_id
+        return
+
     correction_target = (
         f"feishu_project:{generation['project_key']}:"
         f"{generation['work_item_type_key']}:{generation['work_item_id']}"
