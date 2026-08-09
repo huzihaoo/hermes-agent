@@ -17,6 +17,7 @@ from gateway.pnc_rca_delivery_contract import (
     DELIVERY_CARD_PATCH_EFFECT_KIND,
     DELIVERY_EFFECT_KIND,
     DELIVERY_EFFECT_KINDS,
+    DELIVERY_EFFECT_SCHEMA_VERSION,
     DELIVERY_THREAD_EFFECT_KIND,
     RCA_REPORT_FIELD_KEY,
     RCA_RESULT_FIELD_KEY,
@@ -31,6 +32,7 @@ from gateway.pnc_rca_delivery_contract import (
     build_terminal_delivery,
     build_terminal_thread_reply_effect,
     build_thread_reply_effect,
+    compute_delivery_effect_payload_sha256,
     validate_card_patch_effect_payload,
     validate_delivery_subscription_target,
 )
@@ -182,6 +184,39 @@ _ISSUE_OPERATIONS = frozenset({
     DELIVERY_EFFECT_KIND,
     "feishu_issue_field_update",
 })
+
+
+def _terminal_rerun_payload_identity_matches(
+    payload: Mapping[str, Any],
+    *,
+    effect_key: str,
+    submission_key: str,
+    generation: int,
+    expected_payload_sha256: str,
+) -> bool:
+    schema_version = str(payload.get("schema_version") or "")
+    try:
+        if schema_version == DELIVERY_EFFECT_SCHEMA_VERSION:
+            return (
+                str(payload.get("effect_key") or "") == effect_key
+                and str(payload.get("semantic_payload_sha256") or "")
+                == expected_payload_sha256
+                and compute_delivery_effect_payload_sha256(
+                    payload, DELIVERY_EFFECT_KIND
+                )
+                == expected_payload_sha256
+            )
+        return (
+            schema_version in _TERMINAL_EFFECT_SCHEMA_VERSIONS
+            and str(payload.get("submission_key") or "") == submission_key
+            and int(payload.get("generation") or 0) == generation
+            and hashlib.sha256(
+                _canonical_json(payload).encode("utf-8")
+            ).hexdigest()
+            == expected_payload_sha256
+        )
+    except (DeliveryContractError, TypeError, ValueError):
+        return False
 _LEARNING_ADJUDICATION_SCHEMAS = frozenset({
     "pnc_rca_conclusion_adjudication_effect_v1",
     "pnc_rca_conclusion_adjudication_effect_v2",
@@ -1840,8 +1875,6 @@ class RcaDeliveryStore:
                 or str(authority["work_item_type_key"]) !=
                     str(row["work_item_type_key"])
                 or str(authority["issue_id"]) != str(row["work_item_id"])
-                or str(payload.get("schema_version") or "")
-                    not in _TERMINAL_EFFECT_SCHEMA_VERSIONS
                 or str(payload.get("delivery_id") or "") != delivery_id
                 or str(payload.get("effect_kind") or "") != DELIVERY_EFFECT_KIND
                 or str(payload.get("target_key") or "") != target_key
@@ -1850,11 +1883,13 @@ class RcaDeliveryStore:
                     str(row["work_item_type_key"])
                 or str(payload.get("work_item_id") or "") !=
                     str(row["work_item_id"])
-                or str(payload.get("submission_key") or "") != submission_key
-                or int(payload.get("generation") or 0) != generation
-                or hashlib.sha256(
-                    _canonical_json(payload).encode("utf-8")
-                ).hexdigest() != str(row["payload_sha256"] or "")
+                or not _terminal_rerun_payload_identity_matches(
+                    payload,
+                    effect_key=effect_key,
+                    submission_key=submission_key,
+                    generation=generation,
+                    expected_payload_sha256=str(row["payload_sha256"] or ""),
+                )
             ):
                 raise RuntimeError("external_write_fence_identity_mismatch")
             return {

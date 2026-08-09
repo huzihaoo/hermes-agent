@@ -41,6 +41,7 @@ from gateway.pnc_rca_delivery_store import (
     RcaDeliveryStore,
     StaleDeliveryEffectLeaseError,
     StaleDeliveryWatchLeaseError,
+    _terminal_rerun_payload_identity_matches,
     _pre_w3_disposition_sha256,
     _pre_w3_effect_disposition_after,
     _pre_w3_effect_disposition_fingerprint,
@@ -53,6 +54,39 @@ NOW = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
 TOPIC = "feishu-project-workflow-event"
 REAL_G1Q3_PROJECT_KEY = "68ef617fb371dc80a10641f7"
 REAL_G1Q3_PROJECT_SIMPLE_NAME = "t03o4q"
+
+
+def test_terminal_rerun_payload_identity_accepts_current_issue_effect() -> None:
+    payload = {
+        "schema_version": DELIVERY_EFFECT_SCHEMA_VERSION,
+        "delivery_id": "delivery-1",
+        "effect_key": "effect-1",
+        "effect_kind": DELIVERY_EFFECT_KIND,
+        "target_key": "feishu_project:project:issue:1",
+        "project_key": "project",
+        "work_item_type_key": "issue",
+        "work_item_id": "1",
+        "conclusion": "observed conclusion",
+    }
+    payload_sha256 = compute_delivery_effect_payload_sha256(
+        payload, DELIVERY_EFFECT_KIND
+    )
+    payload["semantic_payload_sha256"] = payload_sha256
+
+    assert _terminal_rerun_payload_identity_matches(
+        payload,
+        effect_key="effect-1",
+        submission_key="submission-1",
+        generation=2,
+        expected_payload_sha256=payload_sha256,
+    )
+    assert not _terminal_rerun_payload_identity_matches(
+        {**payload, "effect_key": "other-effect"},
+        effect_key="effect-1",
+        submission_key="submission-1",
+        generation=2,
+        expected_payload_sha256=payload_sha256,
+    )
 
 
 def _real_g1q3_profile_snapshot(offset: int, option_id: str):
