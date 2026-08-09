@@ -4983,15 +4983,21 @@ class RcaDeliveryStore:
             raise DeliveryRecordConflictError(
                 "pre-W3 quarantined outbox watch was not created exactly once"
             )
+        subscription_status = (
+            "suppressed"
+            if disposition_code in OUTBOX_SILENT_PROFILE_TERMINAL_ERROR_CODES
+            else "quarantined"
+        )
         conn.execute(
             """
             UPDATE rca_delivery_subscriptions
-               SET status = 'quarantined', delivery_id = NULL, effect_key = NULL,
+               SET status = ?, delivery_id = NULL, effect_key = NULL,
                    reason = ?, updated_at = ?
              WHERE business_key = ? AND generation = ?
                AND required = 1 AND status = 'pending'
             """,
             (
+                subscription_status,
                 disposition_code,
                 current,
                 row["business_key"],

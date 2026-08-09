@@ -10,6 +10,7 @@ import sqlite3
 
 import pytest
 
+from gateway import pnc_rca_delivery_quarantine_baseline as quarantine_baseline
 from gateway.pnc_rca_control_store import (
     MANUAL_TRIGGER_SCHEMA_VERSION,
     ActivationEpochError,
@@ -1793,6 +1794,14 @@ def test_current_epoch_unsupported_profile_stays_silent_at_outbox(
     )
 
     store = RcaDeliveryStore(control.db_path)
+    conn = store._connect()
+    try:
+        quarantine_snapshot_before = quarantine_baseline.quarantine_snapshot(conn)
+        quarantine_events_before = (
+            quarantine_baseline._quarantine_event_projection(conn)
+        )
+    finally:
+        conn.close()
     assert (
         store.backfill_completed_submissions(
             now=NOW + timedelta(seconds=2),
@@ -1807,6 +1816,24 @@ def test_current_epoch_unsupported_profile_stays_silent_at_outbox(
     assert watch["last_error_code"] == profile_error_code
     assert store.list_rows("rca_delivery_jobs") == []
     assert store.list_rows("rca_delivery_effects") == []
+    subscriptions = store.list_rows("rca_delivery_subscriptions")
+    assert subscriptions
+    assert {row["status"] for row in subscriptions} == {"suppressed"}
+    assert {row["reason"] for row in subscriptions} == {profile_error_code}
+    assert all(row["delivery_id"] is None for row in subscriptions)
+    assert all(row["effect_key"] is None for row in subscriptions)
+    conn = store._connect()
+    try:
+        assert (
+            quarantine_baseline.quarantine_snapshot(conn)
+            == quarantine_snapshot_before
+        )
+        assert (
+            quarantine_baseline._quarantine_event_projection(conn)
+            == quarantine_events_before
+        )
+    finally:
+        conn.close()
 
 
 def test_profile_terminal_provider_claim_rechecks_lease_target_and_epoch(tmp_path, monkeypatch):
