@@ -5,7 +5,7 @@ from __future__ import annotations
 
 RCA_PROD_VM_RELEASE_ROOT = (
     "/home/mini/.hermes/rca-prod-runtime/releases/"
-    "rca-platform-20260809.installed-6a8c5e3"
+    "rca-platform-20260809.installed-4637074"
 )
 RCA_PROD_VM_FIXED_CLI_RELATIVE_PATH = "api/g1q3_rca/scripts/run_rca_service_request.py"
 RCA_PROD_VM_DERIVED_RESERVATION_MODULE = (
