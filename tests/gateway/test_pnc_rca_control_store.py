@@ -439,6 +439,99 @@ def test_operator_silent_terminal_rerun_creates_new_generation_without_old_mutat
     assert audit["to_status"] == "pending:g2"
 
 
+def test_owner_authorized_silent_terminal_rerun_can_publish_success_conclusion(
+    tmp_path,
+):
+    store, terminal_at = _silent_deadline_terminal_store(tmp_path)
+    request = _silent_batch_request()
+    authority = _silent_batch_authority(store, request)
+    rerun = store.admit_manual_trigger(
+        request,
+        allowed_chat_ids=set(),
+        submit_enabled=True,
+        operator_authorized=True,
+        silent_terminal_rerun_authority=authority,
+        outbox_high_watermark=10_000,
+        activation_required=True,
+        now=terminal_at + timedelta(seconds=1),
+    )
+    delivery = RcaDeliveryStore(store.db_path)
+    target_key = "feishu_project:g1q3:issue:7041712812"
+    delivery_id = "silent-terminal-success-delivery"
+    current = (terminal_at + timedelta(seconds=2)).isoformat()
+    conn = delivery._connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        outbox_id = conn.execute(
+            "SELECT outbox_id FROM rca_outbox "
+            "WHERE business_key=? AND generation=2",
+            (rerun.business_key,),
+        ).fetchone()[0]
+        conn.execute(
+            """
+            INSERT INTO rca_execution_watch(
+                submission_key, submission_outbox_id, business_key, generation,
+                project_key, work_item_type_key, work_item_id, state,
+                next_poll_at, delivery_id, created_at, updated_at
+            ) VALUES (?, ?, ?, 2, 'g1q3', 'issue', '7041712812',
+                      'delivery_created', ?, ?, ?, ?)
+            """,
+            (
+                rerun.submission_key,
+                outbox_id,
+                rerun.business_key,
+                current,
+                delivery_id,
+                current,
+                current,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO rca_delivery_jobs(
+                delivery_id, submission_key, business_key, generation,
+                artifact_set_id, project_key, work_item_type_key, work_item_id,
+                target_key, issue_url, report_url, status, manifest_json,
+                contract_json, artifacts_json, created_at, updated_at
+            ) VALUES (?, ?, ?, 2, 'silent-terminal-success-artifact', 'g1q3',
+                      'issue', '7041712812', ?, ?, '', 'ready', '{}', '{}',
+                      '[]', ?, ?)
+            """,
+            (
+                delivery_id,
+                rerun.submission_key,
+                rerun.business_key,
+                target_key,
+                request.issue_url,
+                current,
+                current,
+            ),
+        )
+        assert (
+            delivery._learning_lane_guard_state_tx(
+                conn,
+                business_key=rerun.business_key,
+                generation=rerun.generation,
+                work_item_id="7041712812",
+            )
+            == "not_learning"
+        )
+        slot = delivery.enforce_issue_comment_budget_tx(
+            conn,
+            delivery_id=delivery_id,
+            business_key=rerun.business_key,
+            generation=rerun.generation,
+            target_key=target_key,
+            payload={"schema_version": "pnc_rca_delivery_effect_v4"},
+        )
+        conn.rollback()
+    finally:
+        conn.close()
+
+    assert slot["comment_slot_kind"] == "conclusion"
+    assert slot["comment_slot_generation"] == 2
+
+
 def test_issue_only_operator_silent_terminal_drains_activation(tmp_path):
     store, _terminal_at = _silent_deadline_terminal_store(tmp_path)
     _convert_silent_terminal_to_issue_only_operator(store)

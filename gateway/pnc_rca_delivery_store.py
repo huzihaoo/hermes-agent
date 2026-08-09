@@ -6500,10 +6500,20 @@ class RcaDeliveryStore:
                     generation=int(generation),
                 )
             )
-            terminal_rerun_exception = (
-                is_terminal and guard_state == "terminal_rerun_authorized"
+            owner_authorized_rerun_exception = (
+                guard_state == "terminal_rerun_authorized"
+                or cls._terminal_rerun_authority_tx(
+                    conn,
+                    business_key=str(business_key),
+                    generation=int(generation),
+                    work_item_id=str(job["work_item_id"]),
+                )
+                is not None
             )
-            if not legacy_terminal_exception and not terminal_rerun_exception:
+            if (
+                not legacy_terminal_exception
+                and not owner_authorized_rerun_exception
+            ):
                 explicit_keys = cls._explicit_user_rerun_keys_tx(
                     conn,
                     business_key=str(job["business_key"]),
