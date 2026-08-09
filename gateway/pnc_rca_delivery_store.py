@@ -3535,13 +3535,6 @@ class RcaDeliveryStore:
                         AND job.target_key =
                             'feishu_project:' || bt.project_key || ':' ||
                             bt.work_item_type_key || ':' || bt.work_item_id
-                        AND json_extract(NEW.payload_json, '$.schema_version') IN (
-                            'pnc_rca_terminal_delivery_effect_v1',
-                            'pnc_rca_terminal_delivery_effect_v2',
-                            'pnc_rca_terminal_delivery_effect_v3',
-                            'pnc_rca_terminal_delivery_effect_v4',
-                            'pnc_rca_terminal_delivery_effect_v5'
-                        )
                         AND json_extract(NEW.payload_json, '$.delivery_id') =
                             NEW.delivery_id
                         AND json_extract(NEW.payload_json, '$.effect_kind') =
@@ -3555,17 +3548,43 @@ class RcaDeliveryStore:
                         ) = bt.work_item_type_key
                         AND json_extract(NEW.payload_json, '$.work_item_id') =
                             bt.work_item_id
-                        AND json_extract(NEW.payload_json, '$.submission_key') =
-                            job.submission_key
-                        AND json_extract(NEW.payload_json, '$.generation') =
-                            job.generation
+                        AND (
+                            (
+                                json_extract(
+                                    NEW.payload_json, '$.schema_version'
+                                ) = 'pnc_rca_delivery_effect_v4'
+                                AND json_extract(
+                                    NEW.payload_json, '$.effect_key'
+                                ) = NEW.effect_key
+                                AND json_extract(
+                                    NEW.payload_json,
+                                    '$.semantic_payload_sha256'
+                                ) = NEW.payload_sha256
+                            )
+                            OR (
+                                json_extract(
+                                    NEW.payload_json, '$.schema_version'
+                                ) IN (
+                                    'pnc_rca_terminal_delivery_effect_v1',
+                                    'pnc_rca_terminal_delivery_effect_v2',
+                                    'pnc_rca_terminal_delivery_effect_v3',
+                                    'pnc_rca_terminal_delivery_effect_v4',
+                                    'pnc_rca_terminal_delivery_effect_v5'
+                                )
+                                AND json_extract(
+                                    NEW.payload_json, '$.submission_key'
+                                ) = job.submission_key
+                                AND json_extract(
+                                    NEW.payload_json, '$.generation'
+                                ) = job.generation
+                            )
+                        )
                         AND EXISTS (
                             SELECT 1
                               FROM rca_owner_authorized_rerun_delivery_authorities AS authority
                               JOIN rca_execution_watch AS authority_watch
                                 ON authority_watch.submission_key =
                                    job.submission_key
-                               AND authority_watch.delivery_id = job.delivery_id
                               JOIN rca_outbox AS authority_outbox
                                 ON authority_outbox.outbox_id =
                                    authority_watch.submission_outbox_id

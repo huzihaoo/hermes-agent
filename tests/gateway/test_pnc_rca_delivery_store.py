@@ -1570,6 +1570,10 @@ def test_current_v14_writable_open_rebuilds_terminal_only_w6_guards(tmp_path):
         "rca_owner_authorized_rerun_delivery_authorities" in sql
         for sql in rebuilt.values()
     )
+    effect_guard = rebuilt["trg_learning_lane_stock_effect_insert_forbidden"]
+    assert "pnc_rca_delivery_effect_v4" in effect_guard
+    assert "$.semantic_payload_sha256" in effect_guard
+    assert "authority_watch.delivery_id = job.delivery_id" not in effect_guard
 
 
 @pytest.mark.parametrize("mutation", ["drop_index", "weaken_check"])
