@@ -5409,12 +5409,7 @@ class RcaDeliveryStore:
                        o.result_json AS submission_result_json,
                        o.origin_source_id AS origin_source_id,
                        t.origin_source_id AS trigger_origin_source_id,
-                       MIN(
-                           t.created_at,
-                           o.created_at,
-                           COALESCE(o.retry_window_started_at, o.created_at),
-                           w.created_at
-                       ) AS work_started_at
+                       o.completed_at AS work_started_at
                   FROM rca_execution_watch AS w
                   JOIN rca_outbox AS o ON o.outbox_id = w.submission_outbox_id
                   JOIN business_triggers AS t
@@ -5470,12 +5465,7 @@ class RcaDeliveryStore:
                        o.result_json AS submission_result_json,
                        o.origin_source_id AS origin_source_id,
                        t.origin_source_id AS trigger_origin_source_id,
-                       MIN(
-                           t.created_at,
-                           o.created_at,
-                           COALESCE(o.retry_window_started_at, o.created_at),
-                           w.created_at
-                       ) AS work_started_at
+                       o.completed_at AS work_started_at
                   FROM rca_execution_watch AS w
                   JOIN rca_outbox AS o ON o.outbox_id = w.submission_outbox_id
                   JOIN business_triggers AS t

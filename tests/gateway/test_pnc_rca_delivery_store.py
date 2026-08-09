@@ -785,6 +785,52 @@ def test_backpressure_snapshot_tracks_collector_handoff_without_double_counting(
     assert after_backfill.unresolved_work == 1
 
 
+def test_claim_due_watch_starts_work_at_delayed_outbox_completion(tmp_path):
+    control, result = _control(tmp_path, completed=False)
+    admitted_at = NOW - timedelta(hours=2)
+    submitted_at = NOW
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute(
+            "UPDATE business_triggers SET created_at = ? WHERE submission_key = ?",
+            (admitted_at.isoformat(), result.submission_key),
+        )
+        conn.execute(
+            "UPDATE rca_outbox SET created_at = ?, updated_at = ?, "
+            "retry_window_started_at = ? WHERE submission_key = ?",
+            (
+                admitted_at.isoformat(),
+                admitted_at.isoformat(),
+                admitted_at.isoformat(),
+                result.submission_key,
+            ),
+        )
+
+    outbox = control.claim_outbox(lease_owner="submission-worker", now=submitted_at)
+    assert outbox is not None
+    control.complete_outbox(
+        outbox_id=outbox.outbox_id,
+        lease_token=outbox.lease_token,
+        result={
+            "success": True,
+            "submission_key": result.submission_key,
+            "task_id": result.submission_key,
+            "task_state": "submitted",
+            "deduped": False,
+        },
+        now=submitted_at,
+    )
+    store = RcaDeliveryStore(control.db_path)
+    assert store.backfill_completed_submissions(now=submitted_at) == 1
+
+    watch = store.claim_due_watch(lease_owner="collector", now=submitted_at)
+
+    assert watch is not None
+    assert watch.work_started_at == submitted_at.isoformat()
+    assert datetime.fromisoformat(watch.work_started_at) + timedelta(minutes=30) > (
+        submitted_at + timedelta(minutes=1)
+    )
+
+
 def test_consecutive_permanent_watch_failures_open_circuit_until_manual_reset(
     tmp_path,
 ):
