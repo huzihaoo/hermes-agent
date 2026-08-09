@@ -956,6 +956,43 @@ def test_all_failure_lanes_are_silent_until_admission_deadline_then_oracle_low(
     )
 
 
+def test_explicit_nonretryable_status_failure_does_not_wait_for_missing_receipt(
+    tmp_path,
+):
+    clock = [NOW]
+    instance = _real_terminal_collector(
+        tmp_path,
+        clock=clock,
+        status_reader=lambda task_id: {
+            "success": True,
+            "task_id": task_id,
+            "state": "failed",
+            "summary": "worker emitted an explicit non-retryable failure",
+            "failure_taxonomy": {
+                "raw_code": "failure_receipt_missing",
+                "terminal_error_code": "failure_receipt_missing",
+                "retryable": False,
+                "observed_state": "failed",
+            },
+        },
+        failure_receipt_reader=lambda _claim: (_ for _ in ()).throw(
+            collector.FailureReceiptReadError("failure_receipt_missing")
+        ),
+    )
+
+    outcome = instance.collect_one()
+
+    assert outcome.status == "terminal_failed"
+    assert outcome.error_code == "failure_receipt_missing"
+    assert instance.store.list_rows("rca_delivery_jobs") == []
+    assert instance.store.list_rows("rca_delivery_effects") == []
+    [watch] = instance.store.list_rows("rca_execution_watch")
+    assert watch["state"] == "terminal_failed"
+    taxonomy = json.loads(watch["last_status_json"])["failure_taxonomy"]
+    assert taxonomy["source"] == "vm_status_failure_taxonomy"
+    assert taxonomy["terminal_observation"]["receipt_available"] is False
+
+
 def test_infra_remediation_runner_executes_once_for_same_task(tmp_path):
     clock = [NOW]
     marker = tmp_path / "remediation-ran"
