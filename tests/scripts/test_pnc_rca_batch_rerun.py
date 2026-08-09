@@ -1215,6 +1215,78 @@ def test_submit_all_admits_historical_generation_without_waiting_for_delivery(
     assert result["items"]["7048803418"]["status"] == "submitted"
 
 
+def test_submit_all_refreshes_tracked_terminal_and_retries_without_waiting(
+    tmp_path, monkeypatch
+):
+    queue_path, owner_path = _write_run_inputs(tmp_path, _queue_value())
+    prior_submission_key = "g1q3-rca-s1-" + "a" * 64
+    prior = {
+        **_snapshot(job_status=""),
+        "generation": 1,
+        "submission_key": prior_submission_key,
+        "delivery_id": None,
+        "effects": [],
+        "watch_state": "terminal_failed",
+        "watch_delivery_id": None,
+        "watch_error_code": "rca_work_deadline_exceeded",
+    }
+    state = {
+        "items": {
+            "7048803418": {
+                "issue_id": "7048803418",
+                "title": "ACC braking issue",
+                "quality_classification": "missing",
+                "priority": 1,
+                "status": "submitted",
+                "request_index": 1,
+                "generation": 1,
+                "submission_key": prior_submission_key,
+            }
+        }
+    }
+    admissions = []
+
+    class FakeStore:
+        def __init__(self, _path):
+            pass
+
+        def admit_manual_trigger(self, _request, **kwargs):
+            assert kwargs.get("silent_terminal_rerun_authority") is not None
+            admissions.append(kwargs)
+            return SimpleNamespace(
+                outcome="created",
+                generation=2,
+                submission_key="g1q3-rca-s1-" + "c" * 64,
+                source_id="source-2",
+            )
+
+    monkeypatch.setattr(batch_rerun, "RcaControlStore", FakeStore)
+    monkeypatch.setattr(batch_rerun, "_issue_snapshot", lambda *_args, **_kwargs: prior)
+    monkeypatch.setattr(
+        batch_rerun,
+        "_load_or_create_state",
+        lambda *_args, **_kwargs: state,
+    )
+    monkeypatch.setattr(
+        batch_rerun, "_runtime_identity", lambda: ("a" * 40, "b" * 40)
+    )
+    args = _run_args(tmp_path, queue_path, owner_path)
+    args.submit_all = True
+    args.retry_failed = True
+    args.outbox_high_watermark = 1000
+
+    result = batch_rerun.run(args)
+
+    assert len(admissions) == 1
+    assert result["status"] == "submitted_all"
+    assert result["summary"] == {"accepted": 0, "submitted": 1, "total": 1}
+    item = result["items"]["7048803418"]
+    assert item["status"] == "submitted"
+    assert item["generation"] == 2
+    assert item["request_index"] == 2
+    assert "failure" not in item
+
+
 def test_run_refreshes_existing_success_instead_of_skipping_it(tmp_path, monkeypatch):
     queue_path, owner_path = _write_run_inputs(tmp_path, _queue_value())
     prior = {

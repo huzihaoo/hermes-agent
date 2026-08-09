@@ -252,5 +252,6 @@ python3 scripts/pnc_rca_b15_preflight.py \
 6. **失败代次只前进，不复活。** 已失败或终止的 task、submission key 和 delivery effect 保持不可变。需要重试时必须显式创建 `generation + 1`，生成新的 submission key/task ID，并绑定当前 runtime identity；禁止把旧 task 改回 pending、复用旧任务目录或重新 claim 旧 effect。
 7. **不模拟机器人入口。** operator issue-only 批次不创建 `@机器人`、话题回复或卡片更新，也不把这些动作作为字段写入验收门。真实 `@` 入口仍沿用原 `chat_id/thread_id/message_id` 和既有 topic/card 链路，由真实事件触发并按原功能回归；发布与批处理不得合成事件替代它。
 8. **VM 排队时间不计入执行超时。** Host collector 对 `pending/submitted/queued/claimed/running/in_progress` 只轮询，不得从 outbox 完成时间或入队时间生成执行 deadline；真实执行超时由 VM worker 从进程启动时起算并产出终态。Host 的 30 分钟失败回退只从 `terminal_first_seen_at` 的首次真实失败观测起算，后续健康状态必须清空该窗口。有效 completed 产物无论排队多久都进入同一套产物校验和字段交付。
+9. **大批恢复使用 bulk refresh。** `pnc_rca_batch_rerun.py --submit-all --retry-failed` 必须先按 live DB 刷新 state 中已有的 `submitted/running` 条目：已完成读回的直接 accepted，错误终态创建 `generation + 1`，仍活跃的保持原 submission；刷新后一次性提交所有可重试项，不得在第一条任务上串行等待。常规逐单诊断才省略 `--submit-all`。
 
 最小验收结果是一张当前批次清单：`work_item_id`、generation、Host/Workspace/VM identity、两个字段的 read-after 值和最终状态。旧 baseline 重放、全历史差异矩阵、历史 delivery 清算及额外 canary 均不属于该路径。

@@ -1615,6 +1615,55 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 raise BatchRerunError("batch_accepted_item_invalid")
             completed += 1
             continue
+        if item.get("status") in {"submitted", "running"} and (
+            latest is not None
+            and str(latest.get("submission_key") or "")
+            == str(item.get("submission_key") or "")
+            and int(latest.get("generation") or 0)
+            == int(item.get("generation") or 0)
+        ):
+            tracked_snapshot = _issue_snapshot(
+                Path(args.control_db),
+                issue_id,
+                submission_key=str(item["submission_key"]),
+            )
+            completion = (
+                _batch_completion(
+                    tracked_snapshot,
+                    issue_title=str(queue_item["title"]),
+                )
+                if tracked_snapshot is not None
+                else None
+            )
+            if completion is not None:
+                item.pop("failure", None)
+                item.update({
+                    "status": "accepted",
+                    "approval": completion,
+                    "updated_at": _now(),
+                })
+                state["items"][issue_id] = item
+                state["updated_at"] = _now()
+                _write_state(state_path, state)
+                completed += 1
+                continue
+            failure = (
+                _terminal_failure(
+                    tracked_snapshot,
+                    issue_title=str(queue_item["title"]),
+                )
+                if tracked_snapshot is not None
+                else None
+            )
+            if failure is not None:
+                item.update({
+                    "status": "failed",
+                    "failure": failure,
+                    "updated_at": _now(),
+                })
+                state["items"][issue_id] = item
+                state["updated_at"] = _now()
+                _write_state(state_path, state)
         if item.get("status") == "failed" and (
             latest is not None
             and str(latest.get("submission_key") or "")
