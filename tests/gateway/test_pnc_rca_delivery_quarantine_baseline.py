@@ -104,6 +104,47 @@ def test_baseline_identity_allows_only_safe_off_epoch_binding() -> None:
     ) is False
 
 
+def test_terminal_quarantine_without_external_write_uses_io_facts(tmp_path) -> None:
+    conn = sqlite3.connect(tmp_path / "attempts.sqlite3")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE rca_delivery_attempts("
+        "effect_key TEXT, outcome TEXT, remote_id TEXT, error_code TEXT, "
+        "attempt_no INTEGER, event_seq INTEGER)"
+    )
+    conn.executemany(
+        "INSERT INTO rca_delivery_attempts VALUES(?, ?, ?, ?, ?, ?)",
+        [
+            ("effect-1", "started", "", "", 1, 1),
+            ("effect-1", "quarantined", "", "arbitrary_prewrite_block", 1, 2),
+        ],
+    )
+    row = {
+        "effect_key": "effect-1",
+        "last_error_code": "arbitrary_prewrite_block",
+        "job_status": "quarantined",
+        "effect_status": "quarantined",
+        "write_phase": "settled",
+        "quarantined_at": NOW.isoformat(),
+        "remote_receipt_json": None,
+        "write_started_at": None,
+        "completed_at": None,
+        "attempt": 1,
+        "fence": 1,
+    }
+
+    assert baseline_module._prewrite_quarantine_without_external_write(conn, row)
+    assert not baseline_module._prewrite_quarantine_without_external_write(
+        conn, {**row, "write_started_at": NOW.isoformat()}
+    )
+    conn.execute(
+        "UPDATE rca_delivery_attempts SET remote_id='remote-write' "
+        "WHERE outcome='quarantined'"
+    )
+    assert not baseline_module._prewrite_quarantine_without_external_write(conn, row)
+    conn.close()
+
+
 def _write(path: Path, value, *, mode: int = 0o600) -> str:
     path.write_bytes(_json_bytes(value))
     path.chmod(mode)

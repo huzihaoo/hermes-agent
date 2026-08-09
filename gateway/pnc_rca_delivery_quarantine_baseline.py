@@ -1616,10 +1616,9 @@ def _settlement_receipts(
 def _prewrite_quarantine_without_external_write(
     conn: sqlite3.Connection, row: sqlite3.Row
 ) -> bool:
-    """Recognize a fence rejection that provably happened before provider I/O."""
+    """Recognize a terminal quarantine that provably had no provider I/O."""
     if (
-        str(row["last_error_code"] or "") != "external_write_fence_missing"
-        or str(row["job_status"] or "") != "quarantined"
+        str(row["job_status"] or "") != "quarantined"
         or str(row["effect_status"] or "") != "quarantined"
         or str(row["write_phase"] or "") != "settled"
         or not str(row["quarantined_at"] or "")
@@ -1643,9 +1642,7 @@ def _prewrite_quarantine_without_external_write(
     except sqlite3.Error:
         return False
     if not attempts or not any(
-        str(attempt["outcome"] or "") == "quarantined"
-        and str(attempt["error_code"] or "") == "external_write_fence_missing"
-        for attempt in attempts
+        str(attempt["outcome"] or "") == "quarantined" for attempt in attempts
     ):
         return False
     return all(
