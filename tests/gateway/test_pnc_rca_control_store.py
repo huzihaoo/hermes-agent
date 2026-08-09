@@ -1332,12 +1332,20 @@ def test_batch_terminal_authority_creates_refresh_generation_for_settled_deliver
         generation=2,
         operation="feishu_issue_comment",
     )
-    with pytest.raises(RuntimeError, match="learning_lane_external_effect_forbidden"):
-        delivery.validate_learning_lane_external_operation(
-            business_key=rerun.business_key,
-            generation=2,
-            operation="feishu_issue_field_update",
-        )
+    delivery.validate_learning_lane_external_operation(
+        business_key=rerun.business_key,
+        generation=2,
+        operation="feishu_issue_field_update",
+    )
+    for denied_operation in ("feishu_thread_reply", "feishu_card_patch"):
+        with pytest.raises(
+            RuntimeError, match="learning_lane_external_effect_forbidden"
+        ):
+            delivery.validate_learning_lane_external_operation(
+                business_key=rerun.business_key,
+                generation=2,
+                operation=denied_operation,
+            )
     claimed = delivery.claim_due_effect(
         lease_owner="terminal-rerun-provider-test",
         lease_seconds=300,

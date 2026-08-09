@@ -1987,7 +1987,7 @@ class RcaDeliveryStore:
             raise RuntimeError(LEARNING_LANE_EXTERNAL_EFFECT_ERROR)
         if (
             state == "terminal_rerun_authorized"
-            and str(operation) != DELIVERY_EFFECT_KIND
+            and str(operation) not in _ISSUE_OPERATIONS
         ):
             raise RuntimeError(LEARNING_LANE_EXTERNAL_EFFECT_ERROR)
         if state == "admission_missing":
