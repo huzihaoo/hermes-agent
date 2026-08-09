@@ -2075,10 +2075,98 @@ def vm_task_submit_service(
                 "existing_status": existing,
                 "admission": admission_payload,
             }
+        existing_meta = (
+            existing.get("meta") if isinstance(existing.get("meta"), dict) else {}
+        )
+        existing_paths = (
+            existing.get("paths") if isinstance(existing.get("paths"), dict) else {}
+        )
+        raw_observed_roots = existing_paths.get("observed_roots")
+        observed_roots = (
+            {
+                str(value).strip()
+                for value in raw_observed_roots
+                if str(value).strip()
+            }
+            if isinstance(raw_observed_roots, list)
+            else set()
+        )
+        host_canonical_root = str(_DEFAULT_HOST_CANONICAL_ROOT)
+        vm_canonical_root = str(_DEFAULT_VM_CANONICAL_ROOT)
+        existing_run_id = str(
+            existing.get("run_id") or existing_meta.get("run_id") or ""
+        ).strip()
+        needs_bridge_redelivery = bool(
+            str(existing.get("state") or "").strip() == "pending"
+            and str(existing_paths.get("root") or "").strip()
+            == host_canonical_root
+            and host_canonical_root in observed_roots
+            and vm_canonical_root not in observed_roots
+            and not str(existing_meta.get("import_source") or "").strip()
+            and not existing_run_id
+        )
+        bridge_redelivery: dict[str, Any] | None = None
+        if needs_bridge_redelivery:
+            existing_receipt = existing_meta.get("rca_prod_admission_receipt")
+            bridge_redelivery = _vm_task_submit_trusted(
+                title=title,
+                goal=goal,
+                task_id=validated_admission.submission_key,
+                owner=normalized_service,
+                lane="heavy",
+                resource_class="rca_prod",
+                repo_scope="unknown",
+                workspace_scope="none",
+                risk_class="high",
+                artifact_root=artifact_root,
+                artifact_cifs_root=artifact_cifs_root,
+                executor_type="direct_cli",
+                agent_backend="none",
+                codex_backend_enabled=False,
+                routing_meta_extra=dict(existing_meta),
+                create_once=True,
+                create_task_script=workspace_runtime.creator_path,
+                rca_prod_service_receipt=(
+                    dict(existing_receipt)
+                    if isinstance(existing_receipt, dict)
+                    else None
+                ),
+                rca_prod_workspace_runtime=workspace_runtime,
+            )
+            if bridge_redelivery.get("success") is not True:
+                return {
+                    "success": False,
+                    "error_code": "vm_task_service_bridge_redelivery_failed",
+                    "error": (
+                        "existing Host-local pending RCA task could not be "
+                        "redelivered to the VM bridge"
+                    ),
+                    "retryable": True,
+                    "returncode": bridge_redelivery.get("returncode"),
+                    "created": False,
+                    "deduped": False,
+                    "existing_status": existing,
+                    "bridge_redelivery": bridge_redelivery,
+                    "admission": admission_payload,
+                    "workspace_runtime": workspace_runtime.to_dict(),
+                    **(
+                        {"w3_execution_snapshot": dict(w3_binding)}
+                        if w3_binding
+                        else {}
+                    ),
+                }
         return {
             "success": True,
             "deduped": True,
             "created": False,
+            **(
+                {
+                    "bridge_redelivered": True,
+                    "bridge_redelivery": bridge_redelivery,
+                }
+                if bridge_redelivery is not None
+                else {}
+            ),
             "task": {
                 "task_id": validated_admission.submission_key,
                 "state": existing.get("state", "unknown"),
@@ -2622,6 +2710,7 @@ def vm_task_status(task_id: str, include_markdown: bool = True) -> Dict[str, Any
             roots.append(root_path)
 
     checked_roots: list[str] = []
+    observed_roots: list[str] = []
     host_fallback: Dict[str, Any] | None = None
     terminal_states = {"completed", "failed", "abandoned", "blocked"}
     for root in roots:
@@ -2638,6 +2727,7 @@ def vm_task_status(task_id: str, include_markdown: bool = True) -> Dict[str, Any
 
         if not task_dir.exists() and not dispatch_queue:
             continue
+        observed_roots.append(str(root))
 
         status_path = task_dir / "status.md"
         result_path = task_dir / "result.md"
@@ -2710,6 +2800,7 @@ def vm_task_status(task_id: str, include_markdown: bool = True) -> Dict[str, Any
             "paths": {
                 "root": str(root),
                 "checked_roots": checked_roots,
+                "observed_roots": list(observed_roots),
                 "task_dir": str(task_dir),
                 "status_md": str(status_path),
                 "result_md": str(result_path),
@@ -2725,11 +2816,13 @@ def vm_task_status(task_id: str, include_markdown: bool = True) -> Dict[str, Any
             continue
         if host_fallback is not None:
             host_fallback["paths"]["checked_roots"] = checked_roots
+            host_fallback["paths"]["observed_roots"] = list(observed_roots)
             return host_fallback
         return payload
 
     if host_fallback is not None:
         host_fallback["paths"]["checked_roots"] = checked_roots
+        host_fallback["paths"]["observed_roots"] = list(observed_roots)
         return host_fallback
 
     return {
@@ -2737,7 +2830,11 @@ def vm_task_status(task_id: str, include_markdown: bool = True) -> Dict[str, Any
         "task_id": task_id,
         "state": "missing",
         "error": f"task not found in shared-state: {task_id}",
-        "paths": {"root": str(roots[0]), "checked_roots": checked_roots},
+        "paths": {
+            "root": str(roots[0]),
+            "checked_roots": checked_roots,
+            "observed_roots": observed_roots,
+        },
     }
 
 

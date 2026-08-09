@@ -3094,6 +3094,195 @@ def test_service_wrapper_uncertain_result_retry_dedupes_any_existing_task(
     assert result["task"] == {"task_id": admission.submission_key, "state": existing_state}
 
 
+def test_service_wrapper_redelivers_host_local_pending_task_before_dedupe(
+    monkeypatch,
+    tmp_path,
+):
+    _configure_service_policy(monkeypatch, tmp_path)
+    admission, request = _contracts()
+    existing = _matching_status(admission, request, state="pending")
+    existing_receipt = {"fixture": "existing-signed-admission"}
+    existing["meta"]["rca_prod_admission_receipt"] = existing_receipt
+    host_root = str(vm_task_tool._DEFAULT_HOST_CANONICAL_ROOT)
+    existing["paths"] = {"root": host_root, "observed_roots": [host_root]}
+    captured = {}
+    monkeypatch.setattr(vm_task_tool, "vm_task_status", lambda *args, **kwargs: existing)
+
+    def redeliver(**kwargs):
+        captured.update(kwargs)
+        return {
+            "success": True,
+            "returncode": 0,
+            "task": {"task_id": admission.submission_key, "status": "duplicate"},
+        }
+
+    monkeypatch.setattr(vm_task_tool, "_vm_task_submit_trusted", redeliver)
+
+    result = _submit_service(
+        service_id=SERVICE_ID,
+        capability=CAPABILITY,
+        operation=OPERATION,
+        admission=admission,
+        execution_request=request,
+    )
+
+    assert captured["task_id"] == admission.submission_key
+    assert captured["create_once"] is True
+    assert captured["create_task_script"] == WORKSPACE_RUNTIME.creator_path
+    assert captured["rca_prod_service_receipt"] == existing_receipt
+    assert captured["routing_meta_extra"] == existing["meta"]
+    assert result["success"] is True
+    assert result["deduped"] is True
+    assert result["created"] is False
+    assert result["bridge_redelivered"] is True
+    assert result["bridge_redelivery"]["success"] is True
+
+
+def test_service_wrapper_keeps_host_bridge_redelivery_failure_retryable(
+    monkeypatch,
+    tmp_path,
+):
+    _configure_service_policy(monkeypatch, tmp_path)
+    admission, request = _contracts()
+    existing = _matching_status(admission, request, state="pending")
+    existing["meta"]["rca_prod_admission_receipt"] = {
+        "fixture": "existing-signed-admission"
+    }
+    host_root = str(vm_task_tool._DEFAULT_HOST_CANONICAL_ROOT)
+    existing["paths"] = {"root": host_root, "observed_roots": [host_root]}
+    monkeypatch.setattr(vm_task_tool, "vm_task_status", lambda *args, **kwargs: existing)
+    monkeypatch.setattr(
+        vm_task_tool,
+        "_vm_task_submit_trusted",
+        lambda **kwargs: {
+            "success": False,
+            "error_code": "vm_task_creation_timeout",
+            "error": "bridge delivery timed out",
+            "retryable": True,
+            "returncode": None,
+        },
+    )
+
+    result = _submit_service(
+        service_id=SERVICE_ID,
+        capability=CAPABILITY,
+        operation=OPERATION,
+        admission=admission,
+        execution_request=request,
+    )
+
+    assert result["success"] is False
+    assert result["retryable"] is True
+    assert result["deduped"] is False
+    assert result["created"] is False
+    assert result["error_code"] == "vm_task_service_bridge_redelivery_failed"
+    assert result["bridge_redelivery"]["error_code"] == "vm_task_creation_timeout"
+
+
+@pytest.mark.parametrize(
+    ("root", "observed_roots", "import_source", "run_id"),
+    [
+        (
+            str(vm_task_tool._DEFAULT_VM_CANONICAL_ROOT),
+            [str(vm_task_tool._DEFAULT_VM_CANONICAL_ROOT)],
+            "",
+            "",
+        ),
+        (
+            str(vm_task_tool._DEFAULT_HOST_CANONICAL_ROOT),
+            [str(vm_task_tool._DEFAULT_HOST_CANONICAL_ROOT)],
+            "bridge-inbox",
+            "",
+        ),
+        (
+            str(vm_task_tool._DEFAULT_HOST_CANONICAL_ROOT),
+            [str(vm_task_tool._DEFAULT_HOST_CANONICAL_ROOT)],
+            "",
+            "worker-existing-run",
+        ),
+    ],
+    ids=("vm-root", "host-imported", "host-run-id"),
+)
+def test_service_wrapper_does_not_redeliver_pending_task_with_vm_or_import_evidence(
+    monkeypatch,
+    tmp_path,
+    root,
+    observed_roots,
+    import_source,
+    run_id,
+):
+    _configure_service_policy(monkeypatch, tmp_path)
+    admission, request = _contracts()
+    existing = _matching_status(admission, request, state="pending")
+    existing["paths"] = {"root": root, "observed_roots": observed_roots}
+    if import_source:
+        existing["meta"]["import_source"] = import_source
+    if run_id:
+        existing["run_id"] = run_id
+    monkeypatch.setattr(vm_task_tool, "vm_task_status", lambda *args, **kwargs: existing)
+    monkeypatch.setattr(
+        vm_task_tool,
+        "_vm_task_submit_trusted",
+        lambda **kwargs: pytest.fail("VM/import evidence must suppress bridge redelivery"),
+    )
+
+    result = _submit_service(
+        service_id=SERVICE_ID,
+        capability=CAPABILITY,
+        operation=OPERATION,
+        admission=admission,
+        execution_request=request,
+    )
+
+    assert result["success"] is True
+    assert result["deduped"] is True
+    assert result["created"] is False
+    assert "bridge_redelivered" not in result
+
+
+def test_service_wrapper_does_not_redeliver_when_real_status_observes_both_roots(
+    monkeypatch,
+    tmp_path,
+):
+    _configure_service_policy(monkeypatch, tmp_path)
+    admission, request = _contracts()
+    host_root = tmp_path / "host-canonical"
+    vm_root = tmp_path / "vm-canonical"
+    monkeypatch.setattr(vm_task_tool, "_DEFAULT_HOST_CANONICAL_ROOT", host_root)
+    monkeypatch.setattr(vm_task_tool, "_DEFAULT_VM_CANONICAL_ROOT", vm_root)
+    payload = _matching_status(admission, request, state="pending")
+    for root in (host_root, vm_root):
+        dispatch = root / "dispatch" / "pending" / f"{admission.submission_key}.json"
+        dispatch.parent.mkdir(parents=True)
+        dispatch.write_text(json.dumps(payload), encoding="utf-8")
+
+    observed = vm_task_tool.vm_task_status(
+        admission.submission_key, include_markdown=False
+    )
+
+    assert observed["paths"]["root"] == str(host_root)
+    assert observed["paths"]["observed_roots"] == [str(host_root), str(vm_root)]
+    monkeypatch.setattr(vm_task_tool, "vm_task_status", lambda *args, **kwargs: observed)
+    monkeypatch.setattr(
+        vm_task_tool,
+        "_vm_task_submit_trusted",
+        lambda **kwargs: pytest.fail("observed VM canonical task must suppress redelivery"),
+    )
+
+    result = _submit_service(
+        service_id=SERVICE_ID,
+        capability=CAPABILITY,
+        operation=OPERATION,
+        admission=admission,
+        execution_request=request,
+    )
+
+    assert result["success"] is True
+    assert result["deduped"] is True
+    assert result["created"] is False
+    assert "bridge_redelivered" not in result
+
+
 def test_service_wrapper_rejects_existing_stable_id_with_conflicting_contract(monkeypatch, tmp_path):
     _configure_service_policy(monkeypatch, tmp_path)
     admission, request = _contracts()
