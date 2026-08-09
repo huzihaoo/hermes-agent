@@ -361,6 +361,32 @@ def test_delivery_backpressure_snapshot_uses_strict_activation_scope(tmp_path):
     assert calls == [(datetime(2026, 8, 8, tzinfo=timezone.utc), True)]
 
 
+def test_delivery_circuit_does_not_block_upstream_rca_submission(tmp_path):
+    env = _config_env(tmp_path)
+    config = dispatcher.DispatcherConfig.from_env(env, hermes_home=tmp_path)
+    RcaControlStore(config.control_db_path)
+    delivery_store = dispatcher.RcaDeliveryStore(config.delivery_db_path)
+    delivery_store.open_delivery_dispatcher_circuit(
+        reason_code="report_public_origin_invalid",
+        now=datetime(2026, 8, 8, tzinfo=timezone.utc),
+    )
+    instance = object.__new__(dispatcher.OutboxDispatcher)
+    instance.config = config
+    instance.delivery_store = delivery_store
+    instance.now = lambda: datetime(2026, 8, 8, tzinfo=timezone.utc)
+    instance.stats = dispatcher.DispatchStats()
+    instance._delivery_backpressure_active = False
+    instance._last_delivery_snapshot = None
+    instance._last_delivery_error = None
+
+    assert instance._delivery_backpressure_outcome() is None
+    assert (
+        instance._last_delivery_snapshot["delivery_dispatcher_circuit"]["state"]
+        == "open"
+    )
+    assert instance.stats.delivery_circuit_blocked == 0
+
+
 def test_dispatcher_renew_passes_activation_required(tmp_path):
     env = _config_env(tmp_path)
     env["HERMES_RCA_OUTBOX_ACTIVATION_REQUIRED"] = "true"

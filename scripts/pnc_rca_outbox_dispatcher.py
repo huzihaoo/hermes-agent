@@ -3880,16 +3880,8 @@ class OutboxDispatcher:
 
         self._last_delivery_snapshot = snapshot.public_dict()
         self._last_delivery_error = None
-        if snapshot.circuit.is_open:
-            self.stats.delivery_circuit_blocked += 1
-            return DispatchOutcome(
-                status="downstream_backpressure",
-                error_code="delivery_dispatcher_circuit_open",
-                downstream_unresolved_effects=snapshot.unresolved_effects,
-                downstream_unresolved_work=snapshot.unresolved_work,
-                downstream_circuit_state=snapshot.circuit.state,
-            )
-
+        # The delivery circuit fences external writes. It must not stall RCA
+        # computation, because successful new generations may be the recovery.
         unresolved = snapshot.unresolved_work
         if self._delivery_backpressure_active:
             if unresolved <= self.config.delivery_resume_watermark:
