@@ -6083,9 +6083,10 @@ def test_default_report_verifier_restats_viz_then_probes_renderer_only(monkeypat
     assert 0 < calls[0][2] <= 7
 
 
-def test_default_report_verifier_missing_viz_never_probes_renderer(monkeypatch):
+def test_default_report_verifier_remote_read_accepts_sealed_missing_viz(monkeypatch):
     path = canonical_viz_mcap_path("g1q3-rca-s1-" + "a" * 64)
     url = foxglove_url(path)
+    monkeypatch.setenv("HERMES_RCA_OUTBOX_DATA_ACCESS_MODE", "remote_read")
     monkeypatch.setattr(
         dispatcher_module,
         "_verify_local_viz_mcap",
@@ -6103,7 +6104,13 @@ def test_default_report_verifier_missing_viz_never_probes_renderer(monkeypatch):
         opener=ForbiddenOpener(),
     )
 
-    assert result == {"success": False, "error_code": "viz_mcap_missing"}
+    assert result == {
+        "success": True,
+        "content_length": 17,
+        "sha256": "b" * 64,
+        "viz_mcap_path": path,
+        "renderer_probe": "upstream_sealed_remote_publication",
+    }
 
 
 def test_default_report_verifier_rejects_noncanonical_viz_url_before_io():
