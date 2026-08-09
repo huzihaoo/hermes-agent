@@ -393,7 +393,10 @@ SILENT_TERMINAL_RERUN_ERROR_CODES = frozenset({
     "delivery_lineage_unavailable",
     "failure_receipt_missing",
     "rca_work_deadline_exceeded",
+    "report_public_origin_invalid",
     "service_provenance_unavailable",
+    "taxonomy_gap:derived_capacity_hfs_target_identity_mismatch",
+    "taxonomy_gap:derived_capacity_reservation_activate_failed",
     "taxonomy_gap:gate_a_projection_invalid",
 })
 PRE_W3_NO_WRITE_RERUN_OUTBOX_ERROR_CODES = frozenset({
