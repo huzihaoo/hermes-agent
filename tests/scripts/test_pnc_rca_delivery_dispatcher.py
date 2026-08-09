@@ -4998,6 +4998,114 @@ def test_meegle_provider_guard_missing_or_revoked_blocks_before_runner(
     assert calls == []
 
 
+def _terminal_rerun_claim() -> SimpleNamespace:
+    return SimpleNamespace(
+        contract={},
+        effect_kind=DELIVERY_EFFECT_KIND,
+        generation=2,
+        effect_key="historical-authority-effect",
+        delivery_id="historical-authority-delivery",
+        lease_token="historical-authority-lease",
+        fence=3,
+        issue_url="https://project.feishu.cn/t03o4q/issue/detail/7055722720",
+        target_key="feishu_project:project-key:problem-type:7055722720",
+        business_key="historical-authority-business",
+        submission_key="historical-authority-submission",
+    )
+
+
+def test_historical_rerun_authority_builds_terminal_provider_claim():
+    claim = _terminal_rerun_claim()
+    live = {
+        "authority_sha256": "a" * 64,
+        "outbox_id": 17,
+        "epoch_id": "epoch-current",
+        "activation_ledger_id": 23,
+        "effect_key": claim.effect_key,
+        "delivery_id": claim.delivery_id,
+        "lease_token": claim.lease_token,
+        "lease_fence": claim.fence,
+        "operation": DELIVERY_EFFECT_KIND,
+        "issue_url": claim.issue_url,
+        "target_key": claim.target_key,
+        "business_key": claim.business_key,
+        "submission_key": claim.submission_key,
+        "generation": claim.generation,
+        "project_key": "project-key",
+        "project_simple_name": "t03o4q",
+        "work_item_type_key": "problem-type",
+        "work_item_id": "7055722720",
+    }
+    store = SimpleNamespace(
+        validate_terminal_rerun_external_write_binding=lambda **_kwargs: live
+    )
+    dispatcher = object.__new__(DeliveryDispatcher)
+    dispatcher.store = store
+    dispatcher.now = lambda: NOW
+
+    provider_claim = dispatcher._provider_write_guard(claim)
+
+    payload = provider_claim.payload()
+    assert payload["authority_kind"] == "terminal_rerun"
+    assert payload["authority"]["authority_sha256"] == "a" * 64
+    assert payload["authority"]["work_item_id"] == "7055722720"
+
+
+def test_historical_rerun_authority_identity_mismatch_never_falls_back(
+    tmp_path,
+):
+    db_path = tmp_path / "historical-authority.sqlite3"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE rca_terminal_rerun_delivery_authorities (
+                business_key TEXT NOT NULL,
+                generation INTEGER NOT NULL
+            );
+            CREATE TABLE rca_historical_epoch_rerun_delivery_authorities (
+                business_key TEXT NOT NULL,
+                generation INTEGER NOT NULL
+            );
+            INSERT INTO rca_historical_epoch_rerun_delivery_authorities
+                (business_key, generation)
+            VALUES ('historical-authority-business', 2);
+            """
+        )
+
+    class Store:
+        @staticmethod
+        def validate_terminal_rerun_external_write_binding(**_kwargs):
+            raise RuntimeError("external_write_fence_identity_mismatch")
+
+        @staticmethod
+        def _connect():
+            return sqlite3.connect(db_path)
+
+        @staticmethod
+        def _table_exists(conn, table):
+            return (
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    (table,),
+                ).fetchone()
+                is not None
+            )
+
+    dispatcher = object.__new__(DeliveryDispatcher)
+    dispatcher.store = Store()
+    dispatcher.now = lambda: NOW
+
+    with pytest.raises(
+        dispatcher_module.ExternalWriteFenceError,
+        match="external_write_fence_identity_mismatch",
+    ):
+        dispatcher._terminal_rerun_external_write_binding(
+            _terminal_rerun_claim(),
+            operation="feishu_issue_comment",
+            require_write_started=True,
+        )
+
+
 def test_meegle_provider_rejects_forged_callable_context_before_runner():
     calls = []
     adapter = MeegleIssueCommentAdapter(

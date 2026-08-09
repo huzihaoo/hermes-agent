@@ -31,6 +31,49 @@ G1Q3_EVALUATOR_INVENTORY = (
 """
 
 
+def test_watcher_staleness_watchdog_checks_only_resident_freshness(tmp_path: Path):
+    home = tmp_path / "home"
+    live_exec = home / ".hermes/runtime/governance-tools/pnc_live_exec.py"
+    live_exec.parent.mkdir(parents=True)
+    calls_path = tmp_path / "calls.txt"
+    live_exec.write_text(
+        """\
+import json
+import os
+from pathlib import Path
+import sys
+
+Path(os.environ["WATCHDOG_CALLS"]).write_text(" ".join(sys.argv[1:]))
+if "release-freshness-gate" in sys.argv:
+    print(json.dumps({"ok": False, "errors": ["unrelated release audit drift"]}))
+    raise SystemExit(2)
+print(json.dumps({"ok": True, "results": [], "errors": []}))
+""",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["/bin/zsh", str(REPO_ROOT / "scripts/watcher_staleness_watchdog.sh")],
+        env={
+            **os.environ,
+            "HOME": str(home),
+            "WATCHDOG_CALLS": str(calls_path),
+            "HERMES_WATCHER_STALENESS_FEISHU_CHAT": "",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = calls_path.read_text(encoding="utf-8")
+    assert "local.pnc.release-fingerprint-check" in calls
+    assert "--watchers-fresh" in calls
+    assert "release-freshness-gate" not in calls
+    log = home / ".hermes/logs/watcher-staleness-watchdog.log"
+    assert "OK rc=0 faces=[]" in log.read_text(encoding="utf-8")
+
+
 def _git(repo: Path, *args: str) -> str:
     completed = subprocess.run(
         ["git", "-C", str(repo), *args],

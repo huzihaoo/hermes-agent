@@ -4822,13 +4822,23 @@ class DeliveryDispatcher:
             if code == "external_write_fence_identity_mismatch":
                 conn = self.store._connect()
                 try:
-                    authority_present = self.store._table_exists(
-                        conn, "rca_terminal_rerun_delivery_authorities"
-                    ) and conn.execute(
-                        "SELECT 1 FROM rca_terminal_rerun_delivery_authorities "
-                        "WHERE business_key = ? AND generation = ?",
-                        (claim.business_key, claim.generation),
-                    ).fetchone() is not None
+                    authority_present = False
+                    for table in (
+                        "rca_terminal_rerun_delivery_authorities",
+                        "rca_historical_epoch_rerun_delivery_authorities",
+                    ):
+                        if not self.store._table_exists(conn, table):
+                            continue
+                        if (
+                            conn.execute(
+                                f"SELECT 1 FROM {table} "
+                                "WHERE business_key = ? AND generation = ?",
+                                (claim.business_key, claim.generation),
+                            ).fetchone()
+                            is not None
+                        ):
+                            authority_present = True
+                            break
                 finally:
                     conn.close()
                 if not authority_present:

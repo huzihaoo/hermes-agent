@@ -11,33 +11,38 @@ ts() { date "+%Y-%m-%d %H:%M:%S"; }
 vm_args=()
 [ "${HERMES_WATCHER_STALENESS_VM:-0}" = "1" ] && vm_args=(--vm)
 
-gate_out="$(/usr/bin/python3 "$LIVE_EXEC" local.pnc.release-freshness-gate --json 2>&1)"
-gate_rc=$?
-out=""
-rc=0
-stale=""
-if [ "$gate_rc" -ne 0 ]; then
-  rc="$gate_rc"
-  stale="release-freshness-gate"
-else
-  out="$(/usr/bin/python3 "$LIVE_EXEC" local.pnc.release-fingerprint-check --watchers-fresh "${vm_args[@]}" --json 2>&1)"
-  rc=$?
-  stale="$(printf '%s' "$out" | /usr/bin/python3 -c 'import sys,json
-try: d=json.load(sys.stdin)
-except Exception: print(""); raise SystemExit
-print(",".join(sorted(str(r.get("face")) for r in d.get("results",[]) if r.get("actual")=="STALE")))' 2>/dev/null)"
-  if [ "$rc" -ne 0 ] && [ -z "$stale" ]; then
-    stale="release-fingerprint-check"
-  fi
+# This watchdog answers one question only: is a long-running resident stale?
+# The full release gate also reports golden/evidence drift and is intentionally
+# not used as a watcher freshness signal.
+out="$(/usr/bin/python3 "$LIVE_EXEC" local.pnc.release-fingerprint-check --watchers-fresh "${vm_args[@]}" --json 2>&1)"
+rc=$?
+summary="$(printf '%s' "$out" | /usr/bin/python3 -c 'import sys,json
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    print("|invalid_json")
+    raise SystemExit(1)
+stale=sorted(str(r.get("face")) for r in d.get("results", []) if r.get("actual") == "STALE")
+errors=[]
+for item in d.get("errors", []):
+    text=str(item)
+    errors.append(text.split(":", 1)[0])
+print(",".join(stale) + "|" + ",".join(sorted(set(errors))))' 2>/dev/null)"
+parse_rc=$?
+stale="${summary%%|*}"
+errors="${summary#*|}"
+if { [ "$rc" -ne 0 ] || [ "$parse_rc" -ne 0 ]; } && [ -z "$stale" ]; then
+  stale="release-fingerprint-check"
+  [ "$rc" -eq 0 ] && rc=1
 fi
 
 if [ "$rc" -eq 0 ] && [ -z "$stale" ]; then
-  echo "$(ts) OK no stale long-running watchers" >> "$LOG"
+  echo "$(ts) OK rc=0 faces=[] errors=[$errors]" >> "$LOG"
   : > "$STATE" 2>/dev/null
   exit 0
 fi
 
-echo "$(ts) STALE rc=$rc faces=[$stale] gate=$gate_out fingerprint=$out" >> "$LOG"
+echo "$(ts) STALE rc=$rc faces=[$stale] errors=[$errors]" >> "$LOG"
 chat="${HERMES_WATCHER_STALENESS_FEISHU_CHAT:-}"
 [ -z "$chat" ] && exit 0
 
