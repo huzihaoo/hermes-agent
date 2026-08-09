@@ -1287,6 +1287,80 @@ def test_submit_all_refreshes_tracked_terminal_and_retries_without_waiting(
     assert "failure" not in item
 
 
+def test_submit_all_defers_unavailable_authority_and_continues(tmp_path, monkeypatch):
+    queue_path, owner_path = _write_run_inputs(tmp_path, _queue_value())
+    prior_submission_key = "g1q3-rca-s1-" + "a" * 64
+    prior = {
+        **_snapshot(job_status=""),
+        "generation": 1,
+        "submission_key": prior_submission_key,
+        "delivery_id": None,
+        "effects": [],
+        "outbox_status": "quarantined",
+        "outbox_error_code": "host_issue_preread_failed",
+    }
+    state = {
+        "items": {
+            "7048803418": {
+                "issue_id": "7048803418",
+                "title": "ACC braking issue",
+                "quality_classification": "missing",
+                "priority": 1,
+                "status": "submitted",
+                "request_index": 1,
+                "generation": 1,
+                "submission_key": prior_submission_key,
+            }
+        }
+    }
+
+    class FakeStore:
+        def __init__(self, _path):
+            pass
+
+        def admit_manual_trigger(self, *_args, **_kwargs):
+            pytest.fail("unavailable authority reached admission")
+
+    monkeypatch.setattr(batch_rerun, "RcaControlStore", FakeStore)
+    monkeypatch.setattr(batch_rerun, "_issue_snapshot", lambda *_args, **_kwargs: prior)
+    monkeypatch.setattr(
+        batch_rerun,
+        "_load_or_create_state",
+        lambda *_args, **_kwargs: state,
+    )
+    monkeypatch.setattr(
+        batch_rerun,
+        "_refresh_authorities",
+        lambda **_kwargs: (None, None, None),
+    )
+    monkeypatch.setattr(
+        batch_rerun, "_runtime_identity", lambda: ("a" * 40, "b" * 40)
+    )
+    monkeypatch.setattr(
+        batch_rerun.time,
+        "sleep",
+        lambda _seconds: pytest.fail("bulk deferral waited"),
+    )
+    args = _run_args(tmp_path, queue_path, owner_path)
+    args.submit_all = True
+    args.retry_failed = True
+    args.outbox_high_watermark = 1000
+
+    result = batch_rerun.run(args)
+
+    assert result["status"] == "submitted_all"
+    assert result["summary"] == {
+        "accepted": 0,
+        "submitted": 0,
+        "deferred": 1,
+        "total": 1,
+    }
+    item = result["items"]["7048803418"]
+    assert item["status"] == "waiting_for_prior_terminal"
+    assert item["generation"] == 1
+    assert item["request_index"] == 1
+
+
 def test_run_refreshes_existing_success_instead_of_skipping_it(tmp_path, monkeypatch):
     queue_path, owner_path = _write_run_inputs(tmp_path, _queue_value())
     prior = {

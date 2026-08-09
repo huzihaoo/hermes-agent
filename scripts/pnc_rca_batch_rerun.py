@@ -1575,6 +1575,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     store = RcaControlStore(Path(args.control_db))
     completed = 0
     submitted = 0
+    deferred = 0
     submit_all = bool(getattr(args, "submit_all", False))
     requested_watermark = getattr(args, "outbox_high_watermark", None)
     if requested_watermark is None and submit_all:
@@ -1615,7 +1616,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 raise BatchRerunError("batch_accepted_item_invalid")
             completed += 1
             continue
-        if item.get("status") in {"submitted", "running"} and (
+        if item.get("status") in {
+            "submitted",
+            "running",
+            "waiting_for_prior_terminal",
+        } and (
             latest is not None
             and str(latest.get("submission_key") or "")
             == str(item.get("submission_key") or "")
@@ -1698,10 +1703,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 continue
         if item.get("status") == "failed" and not args.retry_failed:
             raise BatchRerunError("batch_failed_item_requires_retry_flag")
+        if (
+            item.get("status") == "waiting_for_prior_terminal"
+            and not args.retry_failed
+        ):
+            raise BatchRerunError("batch_prior_item_requires_retry_flag")
         request_index = int(item.get("request_index") or 0)
         if item.get("status") not in {"submitted", "running"}:
             precondition = dict(queue_item)
-            if item.get("status") == "failed" and args.retry_failed:
+            if item.get("status") in {
+                "failed",
+                "waiting_for_prior_terminal",
+            } and args.retry_failed:
                 precondition.update({
                     "queue_submission_key": str(item.get("submission_key") or ""),
                     "queue_generation": int(item.get("generation") or 0),
@@ -1718,6 +1731,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             historical_authority = None
             silent_authority = None
             batch_authority = None
+            authority_deferred = False
             if latest is not None:
                 wait_deadline = time.monotonic() + args.item_timeout_seconds
                 while True:
@@ -1744,6 +1758,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         )
                     ):
                         break
+                    if submit_all:
+                        item.update({
+                            **queue_item,
+                            "status": "waiting_for_prior_terminal",
+                            "request_index": request_index - 1,
+                            "updated_at": _now(),
+                        })
+                        state["items"][issue_id] = item
+                        state["updated_at"] = _now()
+                        _write_state(state_path, state)
+                        deferred += 1
+                        authority_deferred = True
+                        break
                     if time.monotonic() >= wait_deadline:
                         item.update({
                             **queue_item,
@@ -1760,6 +1787,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     latest = _issue_snapshot(Path(args.control_db), issue_id)
                     if not _queue_precondition_matches(precondition, latest):
                         raise BatchRerunError("batch_issue_generation_drift")
+            if authority_deferred:
+                continue
             admission_kwargs: dict[str, Any] = {}
             if historical_authority is not None:
                 admission_kwargs["historical_epoch_rerun_authority"] = (
@@ -1863,6 +1892,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "submitted": submitted,
             "total": len(queue),
         }
+        if deferred:
+            state["summary"]["deferred"] = deferred
     else:
         state["completed_at"] = finished_at
         state["summary"] = {"accepted": completed, "total": len(queue)}
