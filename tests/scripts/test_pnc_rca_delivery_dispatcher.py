@@ -6106,6 +6106,7 @@ def test_default_report_verifier_remote_read_accepts_sealed_missing_viz(monkeypa
 
     assert result == {
         "success": True,
+        "status_code": 200,
         "content_length": 17,
         "sha256": "b" * 64,
         "viz_mcap_path": path,

@@ -1603,6 +1603,7 @@ def _verify_foxglove_publication(
         ):
             return {
                 "success": True,
+                "status_code": 200,
                 "content_length": expected_size,
                 "sha256": expected_sha256,
                 "viz_mcap_path": path,
