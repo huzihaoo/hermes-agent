@@ -2232,58 +2232,6 @@ def _observed_failure(
     return decision, blocker, projection
 
 
-def _explicit_nonretryable_status_failure(
-    status: Mapping[str, Any],
-    *,
-    state: str,
-) -> tuple[
-    pnc_fault_taxonomy.FailureDecision,
-    str,
-    dict[str, Any],
-    dict[str, Any],
-] | None:
-    """Project an explicit VM failure taxonomy when its receipt is absent.
-
-    A failed task can publish its terminal taxonomy in the status snapshot
-    before the standard service-result receipt is materialized.  Once the
-    snapshot binds the same failed state and explicitly says ``retryable`` is
-    false, waiting for the receipt cannot change the terminal disposition.
-    """
-    raw = status.get("failure_taxonomy")
-    if not isinstance(raw, Mapping):
-        return None
-    if (
-        str(raw.get("observed_state") or "").strip().lower() != state
-        or type(raw.get("retryable")) is not bool
-        or raw.get("retryable") is not False
-    ):
-        return None
-    code = str(
-        raw.get("terminal_error_code") or raw.get("raw_code") or ""
-    ).strip().lower()
-    if not code:
-        return None
-    detail = str(
-        raw.get("detail")
-        or raw.get("message")
-        or status.get("summary")
-        or status.get("error")
-        or code
-    )[:1000]
-    blocker = {"kind": code, "retryable": False, "message": detail}
-    decision = pnc_fault_taxonomy.decide_failure(blocker)
-    if decision.retryable:
-        return None
-    projection = {
-        **decision.as_dict(),
-        "observed_state": state,
-        "source": "vm_status_failure_taxonomy",
-        "source_conflict": False,
-        "status_failure_taxonomy": dict(raw),
-    }
-    return decision, detail, projection, blocker
-
-
 def _durable_failure_decision(
     route: Mapping[str, Any],
 ) -> pnc_fault_taxonomy.FailureDecision:
@@ -2511,7 +2459,6 @@ class DeliveryCollector:
         blocker: Mapping[str, Any],
         detail: str,
         taxonomy: Mapping[str, Any],
-        immediate_terminal: bool = False,
     ) -> CollectOutcome:
         now = self.now()
         started, deadline, elapsed_seconds = _work_window(claim, now)
@@ -2591,9 +2538,7 @@ class DeliveryCollector:
             if not decision.known:
                 self.stats.taxonomy_gaps += 1
 
-        deadline_reached = immediate_terminal or (
-            elapsed_seconds >= decision.terminal_fallback_seconds
-        )
+        deadline_reached = elapsed_seconds >= decision.terminal_fallback_seconds
         if (
             not deadline_reached
             and decision.internal_route == pnc_fault_taxonomy.INFRA_REMEDIATION_HOLD
@@ -2662,22 +2607,6 @@ class DeliveryCollector:
                 self.stats.remediation_held += 1
 
         enriched["failure_taxonomy"] = projection
-        if immediate_terminal:
-            projection["terminal_observation"] = {
-                "schema_version": "pnc_rca_immediate_terminal_observation_v1",
-                "reason": "explicit_nonretryable_vm_status",
-                "receipt_required": True,
-                "receipt_available": False,
-            }
-            enriched["failure_taxonomy"] = projection
-            return self._durable_terminal_outcome(
-                claim,
-                status=enriched,
-                outcome="terminal_failed",
-                terminal_state="failed",
-                error_code=decision.terminal_error_code,
-                error_detail=detail,
-            )
         if not deadline_reached:
             next_poll = min(
                 self._next_poll(claim.poll_attempt, running=False),
@@ -3095,21 +3024,6 @@ class DeliveryCollector:
             try:
                 failure_receipt = self.failure_receipt_reader(claim)
             except FailureReceiptReadError as exc:
-                confirmed = _explicit_nonretryable_status_failure(
-                    status,
-                    state=state,
-                )
-                if confirmed is not None:
-                    decision, detail, taxonomy, blocker = confirmed
-                    return self._handle_failure_until_deadline(
-                        claim,
-                        status=status,
-                        decision=decision,
-                        blocker=blocker,
-                        detail=detail,
-                        taxonomy=taxonomy,
-                        immediate_terminal=True,
-                    )
                 return self._handle_observed_failure(
                     claim,
                     status=status,
@@ -3119,21 +3033,6 @@ class DeliveryCollector:
                     source="failure_receipt_reader",
                 )
             except Exception as exc:
-                confirmed = _explicit_nonretryable_status_failure(
-                    status,
-                    state=state,
-                )
-                if confirmed is not None:
-                    decision, detail, taxonomy, blocker = confirmed
-                    return self._handle_failure_until_deadline(
-                        claim,
-                        status=status,
-                        decision=decision,
-                        blocker=blocker,
-                        detail=detail,
-                        taxonomy=taxonomy,
-                        immediate_terminal=True,
-                    )
                 return self._handle_observed_failure(
                     claim,
                     status=status,
