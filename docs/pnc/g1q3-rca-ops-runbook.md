@@ -189,6 +189,8 @@ python3 scripts/pnc_rca_outbox_dispatcher.py \
 
 第一条只读并输出前态/计划后态；第二条在 SQLite 同一事务中写入 `control_meta` 审计记录并关闭 circuit，随后以 0444 receipt 和 `.sha256` sidecar 物化。receipt 或 sidecar 物化失败时，数据库状态可能已经关闭，命令会返回 `recovery_required`、`reset_id` 和 `meta_key`；先从该审计记录恢复 receipt，不得再次盲目 reset。
 
+reset receipt 必须同时记录 active release identity、candidate env SHA 和当前 live env SHA；live env 漂移本身只作观察，不阻塞这个 operator-authorized、零 provider write 的 reset 命令。apply 仍必须匹配紧邻 plan 的 release binding、config、tool provenance、circuit 前态和 receipt 目标，真正字段写入继续由 dispatcher 的目标校验、幂等 marker 与 read-after-write 约束。
+
 ```bash
 python3 scripts/pnc_rca_outbox_dispatcher.py \
   --materialize-reset '<reset-id>' \

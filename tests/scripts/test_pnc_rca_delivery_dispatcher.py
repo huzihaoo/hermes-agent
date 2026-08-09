@@ -274,6 +274,45 @@ def _patch_circuit_reset_cli(monkeypatch, config, tmp_path):
     return binding
 
 
+def test_circuit_reset_binding_observes_live_env_drift(monkeypatch, tmp_path):
+    live_env = tmp_path / ".env"
+    live_env.write_text("CURRENT=true\n", encoding="utf-8")
+    active_binding = tmp_path / "active-release-binding.json"
+    active_binding.write_text("{}\n", encoding="utf-8")
+    config = replace(
+        _config(tmp_path, enabled=False),
+        quarantine_release_id="rca-test-release",
+        quarantine_bootstrap_epoch_id="rca-bootstrap-test",
+        quarantine_active_release_binding_path=active_binding,
+        quarantine_live_env_path=live_env,
+    )
+    calls = []
+
+    def load_binding(**kwargs):
+        calls.append(kwargs)
+        return {
+            "binding_receipt_sha256": "1" * 64,
+            "release_id": "rca-test-release",
+            "authority_sha256": "2" * 64,
+            "authority_epoch_id": "rca-authority-test",
+            "bootstrap_epoch_id": "rca-bootstrap-test",
+            "candidate_env_sha256": "3" * 64,
+        }
+
+    monkeypatch.setattr(dispatcher_module, "load_active_release_binding", load_binding)
+
+    observed = dispatcher_module._active_release_binding_snapshot(config)
+
+    assert calls[0]["verify_live_env"] is False
+    assert observed["live_env_matches_candidate"] is False
+    assert observed["live_env_sha256"] == hashlib.sha256(
+        live_env.read_bytes()
+    ).hexdigest()
+    assert observed["mismatch_policy"] == (
+        "observed_only_operator_authorized_reset"
+    )
+
+
 def _patch_pre_w3_disposition_cli(monkeypatch, config, tmp_path):
     _patch_circuit_reset_cli(monkeypatch, config, tmp_path)
     binding = {

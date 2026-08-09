@@ -612,6 +612,12 @@ def _circuit_reset_tool_provenance() -> dict[str, Any]:
 
 
 def _active_release_binding_snapshot(config: "DispatcherConfig") -> dict[str, Any]:
+    """Pin the release identity while observing, not blocking on, env drift.
+
+    Circuit reset is an operator-authorized database control-plane mutation. It
+    does not itself cross the provider boundary, so an unrelated live env
+    change must remain visible in the receipt without preventing the reset.
+    """
     if not config.quarantine_release_id or not config.quarantine_bootstrap_epoch_id:
         raise ValueError("delivery_circuit_reset_active_binding_config_missing")
     binding = load_active_release_binding(
@@ -619,7 +625,11 @@ def _active_release_binding_snapshot(config: "DispatcherConfig") -> dict[str, An
         live_env_path=config.quarantine_live_env_path,
         expected_release_id=config.quarantine_release_id,
         expected_epoch_id=config.quarantine_bootstrap_epoch_id,
+        verify_live_env=False,
     )
+    live_env_path = config.quarantine_live_env_path.expanduser().absolute()
+    live_env_sha256 = _bound_source_sha256(live_env_path)
+    candidate_env_sha256 = str(binding["candidate_env_sha256"])
     return {
         "path": str(config.quarantine_active_release_binding_path.absolute()),
         "sha256": binding["binding_receipt_sha256"],
@@ -627,6 +637,11 @@ def _active_release_binding_snapshot(config: "DispatcherConfig") -> dict[str, An
         "authority_sha256": binding["authority_sha256"],
         "authority_epoch_id": binding["authority_epoch_id"],
         "bootstrap_epoch_id": binding["bootstrap_epoch_id"],
+        "candidate_env_sha256": candidate_env_sha256,
+        "live_env_path": str(live_env_path),
+        "live_env_sha256": live_env_sha256,
+        "live_env_matches_candidate": live_env_sha256 == candidate_env_sha256,
+        "mismatch_policy": "observed_only_operator_authorized_reset",
     }
 
 
