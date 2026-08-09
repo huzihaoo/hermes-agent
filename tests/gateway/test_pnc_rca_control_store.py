@@ -1094,20 +1094,20 @@ def test_batch_terminal_authority_creates_refresh_generation_for_settled_deliver
         generation=claimed.generation,
         require_write_started=True,
     )
-    with pytest.raises(RuntimeError, match="external_write_fence_operation_denied"):
-        delivery.validate_terminal_rerun_external_write_binding(
-            effect_key=claimed.effect_key,
-            delivery_id=claimed.delivery_id,
-            lease_token=claimed.lease_token,
-            lease_fence=claimed.fence,
-            operation="feishu_issue_field_update",
-            issue_url=claimed.issue_url,
-            target_key=claimed.target_key,
-            business_key=claimed.business_key,
-            submission_key=claimed.submission_key,
-            generation=claimed.generation,
-            require_write_started=True,
-        )
+    field_update_binding = delivery.validate_terminal_rerun_external_write_binding(
+        effect_key=claimed.effect_key,
+        delivery_id=claimed.delivery_id,
+        lease_token=claimed.lease_token,
+        lease_fence=claimed.fence,
+        operation="feishu_issue_field_update",
+        issue_url=claimed.issue_url,
+        target_key=claimed.target_key,
+        business_key=claimed.business_key,
+        submission_key=claimed.submission_key,
+        generation=claimed.generation,
+        require_write_started=True,
+    )
+    assert field_update_binding["operation"] == "feishu_issue_comment"
     from gateway import pnc_rca_provider_fence as provider_fence
 
     provider_claim = provider_fence.build_terminal_rerun_provider_claim(
@@ -1136,6 +1136,44 @@ def test_batch_terminal_authority_creates_refresh_generation_for_settled_deliver
         issue_project_key=generation["project_key"],
         issue_work_item_id=stock_issue_id,
     )["authority_kind"] == "terminal_rerun"
+    assert provider_fence.revalidate_provider_write_claim(
+        provider_claim,
+        operation="feishu_issue_field_update",
+        issue_project_key=generation["project_key"],
+        issue_work_item_id=stock_issue_id,
+    )["authority_kind"] == "terminal_rerun"
+    assert provider_claim.payload()["authority"]["operation"] == (
+        "feishu_issue_comment"
+    )
+    for denied_operation in ("feishu_thread_reply", "feishu_card_patch"):
+        with pytest.raises(
+            provider_fence.ExternalWriteFenceError,
+            match="external_write_fence_operation_denied",
+        ):
+            provider_fence.revalidate_provider_write_claim(
+                provider_claim,
+                operation=denied_operation,
+                issue_project_key=generation["project_key"],
+                issue_work_item_id=stock_issue_id,
+            )
+    no_authority_store = RcaControlStore(tmp_path / "no-authority.sqlite3")
+    RcaDeliveryStore(no_authority_store.db_path)
+    monkeypatch.setattr(
+        provider_fence,
+        "_canonical_store",
+        lambda: no_authority_store,
+    )
+    with pytest.raises(
+        provider_fence.ExternalWriteFenceError,
+        match="external_write_fence_identity_mismatch",
+    ):
+        provider_fence.revalidate_provider_write_claim(
+            provider_claim,
+            operation="feishu_issue_field_update",
+            issue_project_key=generation["project_key"],
+            issue_work_item_id=stock_issue_id,
+        )
+    monkeypatch.setattr(provider_fence, "_canonical_store", lambda: store)
     with pytest.raises(
         provider_fence.ExternalWriteFenceError,
         match="external_write_fence_target_mismatch",

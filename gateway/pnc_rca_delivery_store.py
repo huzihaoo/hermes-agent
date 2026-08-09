@@ -178,6 +178,10 @@ _TERMINAL_EFFECT_SCHEMA_VERSIONS = frozenset({
     "pnc_rca_terminal_delivery_effect_v4",
     "pnc_rca_terminal_delivery_effect_v5",
 })
+_ISSUE_OPERATIONS = frozenset({
+    DELIVERY_EFFECT_KIND,
+    "feishu_issue_field_update",
+})
 _LEARNING_ADJUDICATION_SCHEMAS = frozenset({
     "pnc_rca_conclusion_adjudication_effect_v1",
     "pnc_rca_conclusion_adjudication_effect_v2",
@@ -1734,7 +1738,7 @@ class RcaDeliveryStore:
         require_write_started: bool,
         now: datetime | None = None,
     ) -> dict[str, Any]:
-        """Reopen one exact authority-bound terminal correction comment."""
+        """Reopen exact authority-bound terminal correction issue writes."""
         text_values = (
             effect_key,
             delivery_id,
@@ -1766,7 +1770,7 @@ class RcaDeliveryStore:
             )
             if authority is None:
                 raise RuntimeError("external_write_fence_identity_mismatch")
-            if operation != DELIVERY_EFFECT_KIND:
+            if operation not in _ISSUE_OPERATIONS:
                 raise RuntimeError("external_write_fence_operation_denied")
             row = conn.execute(
                 """

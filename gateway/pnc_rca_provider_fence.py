@@ -573,6 +573,8 @@ def _profile_terminal_effect_binding(
 def _terminal_rerun_effect_binding(
     store: Any,
     authority: Mapping[str, Any],
+    *,
+    operation: str,
 ) -> dict[str, Any]:
     """Reopen the current authority, delivery lease, and terminal payload."""
     from gateway.pnc_rca_delivery_store import RcaDeliveryStore
@@ -589,7 +591,7 @@ def _terminal_rerun_effect_binding(
             delivery_id=authority.get("delivery_id"),
             lease_token=authority.get("lease_token"),
             lease_fence=authority.get("lease_fence"),
-            operation=authority.get("operation"),
+            operation=operation,
             issue_url=authority.get("issue_target"),
             target_key=authority.get("target_key"),
             business_key=authority.get("business_key"),
@@ -740,9 +742,16 @@ def revalidate_provider_write_claim(
         return {"authority_kind": kind, **dict(live)}
 
     if kind == _TERMINAL_RERUN_KIND:
-        if op != "feishu_issue_comment" or authority.get("operation") != op:
+        if (
+            op not in _ISSUE_OPERATIONS
+            or authority.get("operation") != "feishu_issue_comment"
+        ):
             raise ExternalWriteFenceError("external_write_fence_operation_denied")
-        live = _terminal_rerun_effect_binding(store, authority)
+        live = _terminal_rerun_effect_binding(
+            store,
+            authority,
+            operation=op,
+        )
         if (
             observed_project != str(live["project_key"])
             or observed_work_item != str(live["work_item_id"])
