@@ -1645,11 +1645,7 @@ def _prewrite_quarantine_without_external_write(
         str(attempt["outcome"] or "") == "quarantined" for attempt in attempts
     ):
         return False
-    return all(
-        not str(attempt["remote_id"] or "").strip()
-        and str(attempt["outcome"] or "") in {"started", "quarantined"}
-        for attempt in attempts
-    )
+    return all(not str(attempt["remote_id"] or "").strip() for attempt in attempts)
 
 
 def _effect_settlement_projection(

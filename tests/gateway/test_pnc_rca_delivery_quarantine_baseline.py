@@ -116,7 +116,8 @@ def test_terminal_quarantine_without_external_write_uses_io_facts(tmp_path) -> N
         "INSERT INTO rca_delivery_attempts VALUES(?, ?, ?, ?, ?, ?)",
         [
             ("effect-1", "started", "", "", 1, 1),
-            ("effect-1", "quarantined", "", "arbitrary_prewrite_block", 1, 2),
+            ("effect-1", "nack", "", "transient_prewrite_block", 1, 2),
+            ("effect-1", "quarantined", "", "arbitrary_prewrite_block", 2, 1),
         ],
     )
     row = {
