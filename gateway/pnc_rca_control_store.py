@@ -389,57 +389,72 @@ GROUP_USER_RERUN_DEDUPE_SECONDS = 600
 SILENT_TERMINAL_RERUN_AUTHORITY_SCHEMA_VERSION = (
     "pnc_rca_silent_terminal_rerun_authority_v1"
 )
-SILENT_TERMINAL_RERUN_ERROR_CODES = frozenset(
-    {
-        "delivery_lineage_unavailable",
-        "failure_receipt_missing",
-        "rca_work_deadline_exceeded",
-    }
-)
-SILENT_TERMINAL_RERUN_AUTHORITY_FIELDS = frozenset(
-    {
-        "schema_version",
-        "batch_id",
-        "queue_sha256",
-        "issue_id",
-        "prior_submission_key",
-        "prior_generation",
-        "owner_receipt_path",
-        "owner_receipt_sha256",
-        "activation_required",
-        "requester_id",
-        "reason",
-        "selection_sha256",
-    }
-)
+SILENT_TERMINAL_RERUN_ERROR_CODES = frozenset({
+    "delivery_lineage_unavailable",
+    "failure_receipt_missing",
+    "rca_work_deadline_exceeded",
+})
+SILENT_TERMINAL_RERUN_AUTHORITY_FIELDS = frozenset({
+    "schema_version",
+    "batch_id",
+    "queue_sha256",
+    "issue_id",
+    "prior_submission_key",
+    "prior_generation",
+    "owner_receipt_path",
+    "owner_receipt_sha256",
+    "activation_required",
+    "requester_id",
+    "reason",
+    "selection_sha256",
+})
 BATCH_TERMINAL_RERUN_AUTHORITY_SCHEMA_VERSION = (
     "pnc_rca_batch_terminal_rerun_authority_v1"
 )
-BATCH_TERMINAL_RERUN_AUTHORITY_FIELDS = frozenset(
-    {
-        "schema_version",
-        "batch_id",
-        "queue_sha256",
-        "issue_id",
-        "prior_submission_key",
-        "prior_generation",
-        "prior_delivery_id",
-        "owner_receipt_path",
-        "owner_receipt_sha256",
-        "activation_required",
-        "terminal_mode",
-        "requester_id",
-        "reason",
-        "selection_sha256",
-    }
+BATCH_TERMINAL_RERUN_AUTHORITY_FIELDS = frozenset({
+    "schema_version",
+    "batch_id",
+    "queue_sha256",
+    "issue_id",
+    "prior_submission_key",
+    "prior_generation",
+    "prior_delivery_id",
+    "owner_receipt_path",
+    "owner_receipt_sha256",
+    "activation_required",
+    "terminal_mode",
+    "requester_id",
+    "reason",
+    "selection_sha256",
+})
+HISTORICAL_EPOCH_RERUN_AUTHORITY_SCHEMA_VERSION = (
+    "pnc_rca_historical_epoch_rerun_authority_v1"
+)
+HISTORICAL_EPOCH_RERUN_AUTHORITY_FIELDS = frozenset({
+    "schema_version",
+    "batch_id",
+    "queue_sha256",
+    "issue_id",
+    "prior_submission_key",
+    "prior_generation",
+    "prior_activation_epoch_id",
+    "prior_activation_ledger_id",
+    "target_activation_epoch_id",
+    "owner_receipt_path",
+    "owner_receipt_sha256",
+    "activation_required",
+    "requester_id",
+    "reason",
+    "selection_sha256",
+})
+HISTORICAL_EPOCH_RERUN_DELIVERY_AUTHORITY_SCHEMA_VERSION = (
+    "pnc_rca_historical_epoch_rerun_delivery_authority_v1"
 )
 REPLAY_RAW_RETENTION = timedelta(days=7)
 PROCESSED_RAW_RETENTION = timedelta(days=30)
 REPLAY_RAW_PRUNE_BATCH = 1000
 INPUT_WAIT_QUARANTINE_REARMED_REASON = "input_wait_quarantine_rearmed"
-INPUT_WAIT_TERMINAL_NEW_GENERATION_REASON = (
-    "input_wait_terminal_new_generation_created"
-)
+INPUT_WAIT_TERMINAL_NEW_GENERATION_REASON = "input_wait_terminal_new_generation_created"
 INPUT_WAIT_EXECUTION_WATCH_PRESENT_REASON = "input_wait_execution_watch_present"
 MANUAL_SHADOW_PROMOTED_REASON = "manual_shadow_promoted"
 W3_KAFKA_OBSERVATION_JOIN_REASON = "w3_automatic_generation_observation_joined"
@@ -748,6 +763,79 @@ def build_batch_terminal_rerun_authority(
         raise ValueError("batch_terminal_rerun_authority_invalid")
     return {
         "schema_version": BATCH_TERMINAL_RERUN_AUTHORITY_SCHEMA_VERSION,
+        **material,
+        "selection_sha256": _canonical_sha256(material),
+    }
+
+
+def build_historical_epoch_rerun_authority(
+    *,
+    batch_id: str,
+    queue_sha256: str,
+    issue_id: str,
+    prior_submission_key: str,
+    prior_generation: int,
+    prior_activation_epoch_id: str,
+    prior_activation_ledger_id: int | None,
+    target_activation_epoch_id: str,
+    owner_receipt_path: str,
+    owner_receipt_sha256: str,
+    requester_id: str,
+    reason: str,
+    activation_required: bool = True,
+) -> dict[str, Any]:
+    """Build exact owner authority to append one generation in the current epoch."""
+    material: dict[str, Any] = {
+        "batch_id": str(batch_id or "").strip(),
+        "queue_sha256": str(queue_sha256 or "").strip().lower(),
+        "issue_id": str(issue_id or "").strip(),
+        "prior_submission_key": str(prior_submission_key or "").strip(),
+        "prior_generation": prior_generation,
+        "prior_activation_epoch_id": str(prior_activation_epoch_id or "").strip(),
+        "prior_activation_ledger_id": prior_activation_ledger_id,
+        "target_activation_epoch_id": str(target_activation_epoch_id or "").strip(),
+        "owner_receipt_path": str(owner_receipt_path or "").strip(),
+        "owner_receipt_sha256": str(owner_receipt_sha256 or "").strip().lower(),
+        "activation_required": activation_required,
+        "requester_id": str(requester_id or "").strip(),
+        "reason": str(reason or "").strip(),
+    }
+    prior_epoch = material["prior_activation_epoch_id"]
+    target_epoch = material["target_activation_epoch_id"]
+    prior_ledger = material["prior_activation_ledger_id"]
+    valid_prior_binding = (not prior_epoch and prior_ledger is None) or (
+        _ACTIVATION_EPOCH_ID_RE.fullmatch(prior_epoch) is not None
+        and not isinstance(prior_ledger, bool)
+        and isinstance(prior_ledger, int)
+        and prior_ledger >= 1
+    )
+    if (
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{2,63}", material["batch_id"]) is None
+        or _ACTIVATION_SHA256_RE.fullmatch(material["queue_sha256"]) is None
+        or material["queue_sha256"] == "0" * 64
+        or re.fullmatch(r"[0-9]{1,32}", material["issue_id"]) is None
+        or re.fullmatch(r"g1q3-rca-s1-[0-9a-f]{64}", material["prior_submission_key"])
+        is None
+        or isinstance(prior_generation, bool)
+        or not isinstance(prior_generation, int)
+        or prior_generation < 1
+        or not valid_prior_binding
+        or _ACTIVATION_EPOCH_ID_RE.fullmatch(target_epoch) is None
+        or target_epoch == prior_epoch
+        or not Path(material["owner_receipt_path"]).is_absolute()
+        or len(material["owner_receipt_path"].encode("utf-8")) > 4096
+        or any(
+            marker in material["owner_receipt_path"] for marker in ("\x00", "\n", "\r")
+        )
+        or _ACTIVATION_SHA256_RE.fullmatch(material["owner_receipt_sha256"]) is None
+        or material["owner_receipt_sha256"] == "0" * 64
+        or material["activation_required"] is not True
+        or material["requester_id"] != "automation:rca-batch-rerun"
+        or material["reason"] != f"production_gray_batch:{material['batch_id']}"
+    ):
+        raise ValueError("historical_epoch_rerun_authority_invalid")
+    return {
+        "schema_version": HISTORICAL_EPOCH_RERUN_AUTHORITY_SCHEMA_VERSION,
         **material,
         "selection_sha256": _canonical_sha256(material),
     }
@@ -2934,10 +3022,34 @@ class RcaControlStore:
         if self.require_current and marker_value != CONTROL_STORE_SCHEMA_VERSION:
             raise RuntimeError("rca_control_store_schema_not_current")
         if marker_value == CONTROL_STORE_SCHEMA_VERSION:
+            installed_additive_authority = False
+            if not self.require_current and not self.read_only:
+                conn = self._connect()
+                try:
+                    if not self._table_exists(
+                        conn, "rca_historical_epoch_rerun_delivery_authorities"
+                    ):
+                        conn.execute("BEGIN IMMEDIATE")
+                        self._create_historical_epoch_rerun_delivery_authority_schema(
+                            conn
+                        )
+                        self._validate_historical_epoch_rerun_delivery_authority_schema(
+                            conn
+                        )
+                        conn.commit()
+                        installed_additive_authority = True
+                except Exception:
+                    if conn.in_transaction:
+                        conn.rollback()
+                    raise
+                finally:
+                    conn.close()
             self._validate_current_schema_read_only()
             if self.require_current:
                 self._validate_no_installation_marker()
-            self._initialization_mode = "steady"
+            self._initialization_mode = (
+                "migration" if installed_additive_authority else "steady"
+            )
             return
 
         if marker_value == "pnc_rca_control_store_v10":
@@ -2974,6 +3086,9 @@ class RcaControlStore:
                 self._migrate_inbox_columns(conn)
             if self._table_exists(conn, "rca_outbox"):
                 self._migrate_outbox_columns(conn)
+            # A previously installed additive authority trigger references
+            # source tables that this legacy migration temporarily removes.
+            self._drop_historical_epoch_rerun_delivery_authority_triggers(conn)
             conn.execute("PRAGMA foreign_keys=OFF")
             self._migrate_source_neutral_parents(conn)
             conn.execute("PRAGMA foreign_keys=ON")
@@ -3570,10 +3685,9 @@ class RcaControlStore:
             self._create_v12_learning_lane_schema(conn)
             self._create_v13_historical_outbox_hold_schema(conn)
             self._create_v14_terminal_rerun_delivery_authority_schema(conn)
+            self._create_historical_epoch_rerun_delivery_authority_schema(conn)
             if self._learning_delivery_schema_present(conn):
-                self._ensure_learning_lane_cohort_tx(
-                    conn, sealed_at=_now_iso()
-                )
+                self._ensure_learning_lane_cohort_tx(conn, sealed_at=_now_iso())
             self._initialization_backfill_runs += 1
             self._backfill_kafka_sources_and_subscriptions(conn)
             marker = conn.execute(
@@ -3650,6 +3764,7 @@ class RcaControlStore:
             self._create_v12_learning_lane_schema(conn)
             self._create_v13_historical_outbox_hold_schema(conn)
             self._create_v14_terminal_rerun_delivery_authority_schema(conn)
+            self._create_historical_epoch_rerun_delivery_authority_schema(conn)
             self._validate_structural_contract(
                 conn,
                 integrity_check=marker_value != CONTROL_STORE_SCHEMA_VERSION,
@@ -3807,7 +3922,9 @@ class RcaControlStore:
                 raise RuntimeError("incompatible_control_store_schema:version_marker")
             self._validate_v13_historical_outbox_hold_schema(conn)
             self._create_v14_terminal_rerun_delivery_authority_schema(conn)
+            self._create_historical_epoch_rerun_delivery_authority_schema(conn)
             self._validate_structural_contract(conn, integrity_check=True)
+            self._validate_historical_epoch_rerun_delivery_authority_schema(conn)
             updated = conn.execute(
                 "UPDATE control_meta SET value = ? "
                 "WHERE key = 'schema_version' AND value = ?",
@@ -6110,6 +6227,484 @@ class RcaControlStore:
                     "incompatible_control_store_schema:terminal_rerun_authority_binding"
                 )
 
+    @staticmethod
+    def _historical_epoch_rerun_delivery_authority_trigger_names() -> tuple[str, ...]:
+        return (
+            "trg_historical_epoch_rerun_delivery_authority_no_update",
+            "trg_historical_epoch_rerun_delivery_authority_no_delete",
+            "trg_historical_epoch_rerun_delivery_authority_no_replace",
+            "trg_historical_epoch_rerun_delivery_authority_projection_guard",
+            "trg_historical_epoch_rerun_delivery_authority_binding_guard",
+        )
+
+    @classmethod
+    def _drop_historical_epoch_rerun_delivery_authority_triggers(
+        cls, conn: sqlite3.Connection
+    ) -> None:
+        """Remove parent-referencing guards while legacy parents are rebuilt."""
+        conn.execute(
+            "DROP VIEW IF EXISTS rca_owner_authorized_rerun_delivery_authorities"
+        )
+        for name in cls._historical_epoch_rerun_delivery_authority_trigger_names():
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+
+    @staticmethod
+    def _historical_epoch_rerun_delivery_authority_schema_statements() -> tuple[
+        str, ...
+    ]:
+        return (
+            f"""
+            CREATE TABLE IF NOT EXISTS rca_historical_epoch_rerun_delivery_authorities (
+                authority_sha256 TEXT PRIMARY KEY CHECK(
+                    length(authority_sha256) = 64
+                    AND authority_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+                schema_version TEXT NOT NULL CHECK(
+                    schema_version =
+                        '{HISTORICAL_EPOCH_RERUN_DELIVERY_AUTHORITY_SCHEMA_VERSION}'
+                ),
+                source_id TEXT NOT NULL UNIQUE,
+                outbox_id INTEGER NOT NULL UNIQUE,
+                source_payload_sha256 TEXT NOT NULL CHECK(
+                    length(source_payload_sha256) = 64
+                    AND source_payload_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+                business_key TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK(generation >= 2),
+                submission_key TEXT NOT NULL UNIQUE,
+                activation_epoch_id TEXT NOT NULL,
+                activation_ledger_id INTEGER NOT NULL UNIQUE,
+                effect_kind TEXT NOT NULL CHECK(
+                    effect_kind = 'feishu_issue_comment'
+                ),
+                project_key TEXT NOT NULL CHECK(length(trim(project_key)) > 0),
+                project_simple_name TEXT NOT NULL CHECK(
+                    length(trim(project_simple_name)) > 0
+                ),
+                work_item_type_key TEXT NOT NULL CHECK(
+                    length(trim(work_item_type_key)) > 0
+                ),
+                issue_id TEXT NOT NULL CHECK(
+                    length(issue_id) BETWEEN 1 AND 32
+                    AND issue_id NOT GLOB '*[^0-9]*'
+                ),
+                batch_id TEXT NOT NULL CHECK(length(trim(batch_id)) > 0),
+                prior_submission_key TEXT NOT NULL,
+                prior_generation INTEGER NOT NULL CHECK(prior_generation >= 1),
+                prior_activation_epoch_id TEXT NOT NULL,
+                prior_activation_ledger_id INTEGER,
+                target_activation_epoch_id TEXT NOT NULL,
+                queue_sha256 TEXT NOT NULL CHECK(
+                    length(queue_sha256) = 64
+                    AND queue_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+                owner_receipt_path TEXT NOT NULL CHECK(
+                    length(trim(owner_receipt_path)) > 0
+                ),
+                owner_receipt_sha256 TEXT NOT NULL CHECK(
+                    length(owner_receipt_sha256) = 64
+                    AND owner_receipt_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+                requester_id TEXT NOT NULL CHECK(
+                    requester_id = 'automation:rca-batch-rerun'
+                ),
+                reason TEXT NOT NULL CHECK(
+                    reason = 'production_gray_batch:' || batch_id
+                ),
+                activation_required INTEGER NOT NULL CHECK(
+                    activation_required = 1
+                ),
+                authority_json TEXT NOT NULL CHECK(json_valid(authority_json)),
+                created_at TEXT NOT NULL CHECK(length(trim(created_at)) > 0),
+                UNIQUE(business_key, generation),
+                CHECK(generation = prior_generation + 1),
+                CHECK(target_activation_epoch_id = activation_epoch_id),
+                CHECK(target_activation_epoch_id != prior_activation_epoch_id),
+                CHECK(
+                    (prior_activation_epoch_id = ''
+                     AND prior_activation_ledger_id IS NULL)
+                    OR
+                    (length(trim(prior_activation_epoch_id)) > 0
+                     AND prior_activation_ledger_id IS NOT NULL)
+                ),
+                FOREIGN KEY(source_id) REFERENCES rca_trigger_sources(source_id),
+                FOREIGN KEY(outbox_id) REFERENCES rca_outbox(outbox_id),
+                FOREIGN KEY(business_key, generation)
+                    REFERENCES business_triggers(business_key, generation),
+                FOREIGN KEY(submission_key)
+                    REFERENCES business_triggers(submission_key),
+                FOREIGN KEY(activation_epoch_id)
+                    REFERENCES rca_activation_epochs(epoch_id),
+                FOREIGN KEY(activation_ledger_id)
+                    REFERENCES rca_activation_admission_ledger(ledger_id),
+                FOREIGN KEY(business_key, prior_generation)
+                    REFERENCES business_triggers(business_key, generation),
+                FOREIGN KEY(prior_submission_key)
+                    REFERENCES business_triggers(submission_key),
+                FOREIGN KEY(prior_activation_ledger_id)
+                    REFERENCES rca_activation_admission_ledger(ledger_id)
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_historical_epoch_rerun_authority_issue
+                ON rca_historical_epoch_rerun_delivery_authorities(
+                    issue_id, generation, authority_sha256
+                )
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS
+                trg_historical_epoch_rerun_delivery_authority_no_update
+            BEFORE UPDATE ON rca_historical_epoch_rerun_delivery_authorities
+            BEGIN
+                SELECT RAISE(
+                    ABORT, 'historical_epoch_rerun_authority_update_forbidden'
+                );
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS
+                trg_historical_epoch_rerun_delivery_authority_no_delete
+            BEFORE DELETE ON rca_historical_epoch_rerun_delivery_authorities
+            BEGIN
+                SELECT RAISE(
+                    ABORT, 'historical_epoch_rerun_authority_delete_forbidden'
+                );
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS
+                trg_historical_epoch_rerun_delivery_authority_no_replace
+            BEFORE INSERT ON rca_historical_epoch_rerun_delivery_authorities
+            WHEN EXISTS (
+                SELECT 1 FROM rca_historical_epoch_rerun_delivery_authorities
+                 WHERE authority_sha256 = NEW.authority_sha256
+                    OR source_id = NEW.source_id
+                    OR submission_key = NEW.submission_key
+                    OR (
+                        business_key = NEW.business_key
+                        AND generation = NEW.generation
+                    )
+            )
+            BEGIN
+                SELECT RAISE(
+                    ABORT, 'historical_epoch_rerun_authority_replace_forbidden'
+                );
+            END
+            """,
+            f"""
+            CREATE TRIGGER IF NOT EXISTS
+                trg_historical_epoch_rerun_delivery_authority_projection_guard
+            BEFORE INSERT ON rca_historical_epoch_rerun_delivery_authorities
+            WHEN NOT COALESCE((
+                json_extract(NEW.authority_json, '$.schema_version') =
+                    '{HISTORICAL_EPOCH_RERUN_AUTHORITY_SCHEMA_VERSION}'
+                AND json_extract(NEW.authority_json, '$.selection_sha256') =
+                    NEW.authority_sha256
+                AND json_extract(NEW.authority_json, '$.batch_id') = NEW.batch_id
+                AND json_extract(NEW.authority_json, '$.queue_sha256') =
+                    NEW.queue_sha256
+                AND json_extract(NEW.authority_json, '$.issue_id') = NEW.issue_id
+                AND json_extract(
+                    NEW.authority_json, '$.prior_submission_key'
+                ) = NEW.prior_submission_key
+                AND json_extract(NEW.authority_json, '$.prior_generation') =
+                    NEW.prior_generation
+                AND json_extract(
+                    NEW.authority_json, '$.prior_activation_epoch_id'
+                ) = NEW.prior_activation_epoch_id
+                AND (
+                    (
+                        NEW.prior_activation_ledger_id IS NULL
+                        AND json_type(
+                            NEW.authority_json, '$.prior_activation_ledger_id'
+                        ) = 'null'
+                    ) OR json_extract(
+                        NEW.authority_json, '$.prior_activation_ledger_id'
+                    ) = NEW.prior_activation_ledger_id
+                )
+                AND json_extract(
+                    NEW.authority_json, '$.target_activation_epoch_id'
+                ) = NEW.target_activation_epoch_id
+                AND json_extract(NEW.authority_json, '$.owner_receipt_path') =
+                    NEW.owner_receipt_path
+                AND json_extract(NEW.authority_json, '$.owner_receipt_sha256') =
+                    NEW.owner_receipt_sha256
+                AND json_extract(NEW.authority_json, '$.activation_required') =
+                    NEW.activation_required
+                AND json_extract(NEW.authority_json, '$.requester_id') =
+                    NEW.requester_id
+                AND json_extract(NEW.authority_json, '$.reason') = NEW.reason
+                AND (SELECT COUNT(*) FROM json_each(NEW.authority_json)) = 15
+            ), 0)
+            BEGIN
+                SELECT RAISE(
+                    ABORT, 'historical_epoch_rerun_authority_projection_mismatch'
+                );
+            END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS
+                trg_historical_epoch_rerun_delivery_authority_binding_guard
+            BEFORE INSERT ON rca_historical_epoch_rerun_delivery_authorities
+            WHEN NOT EXISTS (
+                SELECT 1
+                  FROM rca_trigger_sources AS source
+                  JOIN rca_trigger_bindings AS binding
+                    ON binding.source_id = source.source_id
+                  JOIN business_triggers AS trigger
+                    ON trigger.business_key = binding.business_key
+                   AND trigger.generation = binding.generation
+                  JOIN rca_outbox AS outbox
+                    ON outbox.business_key = trigger.business_key
+                   AND outbox.generation = trigger.generation
+                   AND outbox.submission_key = trigger.submission_key
+                  JOIN business_triggers AS prior
+                    ON prior.business_key = trigger.business_key
+                   AND prior.generation = NEW.prior_generation
+                  JOIN rca_outbox AS prior_outbox
+                    ON prior_outbox.business_key = prior.business_key
+                   AND prior_outbox.generation = prior.generation
+                   AND prior_outbox.submission_key = prior.submission_key
+                  JOIN rca_activation_admission_ledger AS ledger
+                    ON ledger.ledger_id = NEW.activation_ledger_id
+                   AND ledger.epoch_id = NEW.activation_epoch_id
+                  JOIN rca_activation_epochs AS epoch
+                    ON epoch.epoch_id = ledger.epoch_id
+                 WHERE source.source_id = NEW.source_id
+                   AND source.source_kind = 'feishu_group_manual'
+                   AND source.payload_sha256 = NEW.source_payload_sha256
+                   AND source.platform = 'operator'
+                   AND source.chat_id = ''
+                   AND source.thread_id = ''
+                   AND source.requester_id = NEW.requester_id
+                   AND source.mode = 'rerun'
+                   AND source.outcome = 'created'
+                   AND source.message_id GLOB
+                       NEW.batch_id || '-' || NEW.issue_id || '-try-[1-9]*'
+                   AND binding.business_key = NEW.business_key
+                   AND binding.generation = NEW.generation
+                   AND binding.role = 'origin'
+                   AND trigger.submission_key = NEW.submission_key
+                   AND trigger.origin_source_id = NEW.source_id
+                   AND trigger.project_key = NEW.project_key
+                   AND trigger.work_item_type_key = NEW.work_item_type_key
+                   AND trigger.work_item_id = NEW.issue_id
+                   AND json_extract(
+                       trigger.normalized_json, '$.project_simple_name'
+                   ) = NEW.project_simple_name
+                   AND trigger.activation_epoch_id = NEW.activation_epoch_id
+                   AND trigger.activation_ledger_id = NEW.activation_ledger_id
+                   AND trigger.activation_epoch_id = outbox.activation_epoch_id
+                   AND trigger.activation_ledger_id = outbox.activation_ledger_id
+                   AND outbox.origin_source_id = NEW.source_id
+                   AND outbox.outbox_id = NEW.outbox_id
+                   AND outbox.action = 'submit_rca_issue_intake'
+                   AND prior.submission_key = NEW.prior_submission_key
+                   AND prior.work_item_id = NEW.issue_id
+                   AND (
+                        (
+                            NEW.prior_activation_epoch_id = ''
+                            AND NEW.prior_activation_ledger_id IS NULL
+                            AND prior.activation_epoch_id IS NULL
+                            AND prior.activation_ledger_id IS NULL
+                            AND prior_outbox.activation_epoch_id IS NULL
+                            AND prior_outbox.activation_ledger_id IS NULL
+                        ) OR (
+                            NEW.prior_activation_epoch_id != ''
+                            AND NEW.prior_activation_ledger_id IS NOT NULL
+                            AND prior.activation_epoch_id =
+                                NEW.prior_activation_epoch_id
+                            AND prior.activation_ledger_id =
+                                NEW.prior_activation_ledger_id
+                            AND prior_outbox.activation_epoch_id =
+                                NEW.prior_activation_epoch_id
+                            AND prior_outbox.activation_ledger_id =
+                                NEW.prior_activation_ledger_id
+                            AND EXISTS (
+                                SELECT 1
+                                  FROM rca_activation_admission_ledger AS old_ledger
+                                  JOIN rca_activation_epochs AS old_epoch
+                                    ON old_epoch.epoch_id = old_ledger.epoch_id
+                                 WHERE old_ledger.ledger_id =
+                                       NEW.prior_activation_ledger_id
+                                   AND old_ledger.epoch_id =
+                                       NEW.prior_activation_epoch_id
+                                   AND old_ledger.business_key = NEW.business_key
+                                   AND old_ledger.submission_key =
+                                       NEW.prior_submission_key
+                                   AND old_ledger.generation =
+                                       NEW.prior_generation
+                                   AND old_ledger.decision IN ('admit', 'shadow')
+                                   AND old_ledger.bound_at IS NOT NULL
+                                   AND old_epoch.is_current = 0
+                            )
+                        )
+                   )
+                   AND ledger.entrypoint = 'manual_admit'
+                   AND ledger.source_kind = 'manual'
+                   AND ledger.decision = 'admit'
+                   AND ledger.business_key = NEW.business_key
+                   AND ledger.submission_key = NEW.submission_key
+                   AND ledger.generation = NEW.generation
+                   AND ledger.bound_at IS NOT NULL
+                   AND epoch.epoch_id = NEW.target_activation_epoch_id
+                   AND epoch.is_current = 1
+                   AND epoch.state = 'steady_active'
+            )
+            BEGIN
+                SELECT RAISE(
+                    ABORT, 'historical_epoch_rerun_authority_binding_mismatch'
+                );
+            END
+            """,
+            """
+            CREATE VIEW IF NOT EXISTS rca_owner_authorized_rerun_delivery_authorities AS
+            SELECT 'terminal_rerun' AS authority_family,
+                   authority_sha256, source_id, outbox_id,
+                   source_payload_sha256, business_key, generation,
+                   submission_key, activation_epoch_id, activation_ledger_id,
+                   effect_kind, project_key, project_simple_name,
+                   work_item_type_key, issue_id, batch_id, queue_sha256,
+                   owner_receipt_path, owner_receipt_sha256, requester_id,
+                   reason, activation_required, authority_json, created_at
+              FROM rca_terminal_rerun_delivery_authorities
+            UNION ALL
+            SELECT 'historical_epoch_rerun' AS authority_family,
+                   authority_sha256, source_id, outbox_id,
+                   source_payload_sha256, business_key, generation,
+                   submission_key, activation_epoch_id, activation_ledger_id,
+                   effect_kind, project_key, project_simple_name,
+                   work_item_type_key, issue_id, batch_id, queue_sha256,
+                   owner_receipt_path, owner_receipt_sha256, requester_id,
+                   reason, activation_required, authority_json, created_at
+              FROM rca_historical_epoch_rerun_delivery_authorities
+            """,
+        )
+
+    @classmethod
+    def _create_historical_epoch_rerun_delivery_authority_schema(
+        cls, conn: sqlite3.Connection
+    ) -> None:
+        for (
+            statement
+        ) in cls._historical_epoch_rerun_delivery_authority_schema_statements():
+            conn.execute(statement)
+
+    @classmethod
+    def _validate_historical_epoch_rerun_delivery_authority_schema(
+        cls, conn: sqlite3.Connection
+    ) -> None:
+        normalize_sql = lambda value: " ".join(str(value).split()).rstrip(";")
+        expected_tables: dict[str, str] = {}
+        expected_indexes: dict[str, str] = {}
+        expected_triggers: dict[str, str] = {}
+        expected_views: dict[str, str] = {}
+        for (
+            statement
+        ) in cls._historical_epoch_rerun_delivery_authority_schema_statements():
+            normalized = normalize_sql(statement)
+            for prefix, destination in (
+                ("CREATE TABLE IF NOT EXISTS ", expected_tables),
+                ("CREATE INDEX IF NOT EXISTS ", expected_indexes),
+                ("CREATE TRIGGER IF NOT EXISTS ", expected_triggers),
+                ("CREATE VIEW IF NOT EXISTS ", expected_views),
+            ):
+                if normalized.startswith(prefix):
+                    name = normalized[len(prefix) :].split(" ", 1)[0]
+                    destination[name] = normalized.replace(
+                        prefix, prefix.replace(" IF NOT EXISTS", ""), 1
+                    )
+                    break
+
+        def observed(kind: str, expected: Mapping[str, str]) -> dict[str, str]:
+            return {
+                str(row["name"]): normalize_sql(row["sql"] or "")
+                for row in conn.execute(
+                    "SELECT name, sql FROM sqlite_master WHERE type = ?", (kind,)
+                ).fetchall()
+                if str(row["name"]) in expected
+            }
+
+        if observed("table", expected_tables) != expected_tables:
+            raise RuntimeError(
+                "incompatible_control_store_schema:"
+                "historical_epoch_rerun_authority_table_sql"
+            )
+        if observed("index", expected_indexes) != expected_indexes:
+            raise RuntimeError(
+                "incompatible_control_store_schema:"
+                "historical_epoch_rerun_authority_index_sql"
+            )
+        if observed("trigger", expected_triggers) != expected_triggers:
+            raise RuntimeError(
+                "incompatible_control_store_schema:"
+                "historical_epoch_rerun_authority_trigger_sql"
+            )
+        if observed("view", expected_views) != expected_views:
+            raise RuntimeError(
+                "incompatible_control_store_schema:"
+                "historical_epoch_rerun_authority_view_sql"
+            )
+        for row in conn.execute(
+            "SELECT * FROM rca_historical_epoch_rerun_delivery_authorities "
+            "ORDER BY authority_sha256"
+        ).fetchall():
+            try:
+                authority = json.loads(str(row["authority_json"]))
+                expected = build_historical_epoch_rerun_authority(
+                    batch_id=authority.get("batch_id"),
+                    queue_sha256=authority.get("queue_sha256"),
+                    issue_id=authority.get("issue_id"),
+                    prior_submission_key=authority.get("prior_submission_key"),
+                    prior_generation=authority.get("prior_generation"),
+                    prior_activation_epoch_id=authority.get(
+                        "prior_activation_epoch_id"
+                    ),
+                    prior_activation_ledger_id=authority.get(
+                        "prior_activation_ledger_id"
+                    ),
+                    target_activation_epoch_id=authority.get(
+                        "target_activation_epoch_id"
+                    ),
+                    owner_receipt_path=authority.get("owner_receipt_path"),
+                    owner_receipt_sha256=authority.get("owner_receipt_sha256"),
+                    requester_id=authority.get("requester_id"),
+                    reason=authority.get("reason"),
+                    activation_required=authority.get("activation_required"),
+                )
+            except (AttributeError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    "incompatible_control_store_schema:"
+                    "historical_epoch_rerun_authority_json"
+                ) from exc
+            projected = {
+                "authority_sha256": str(expected["selection_sha256"]),
+                "schema_version": (
+                    HISTORICAL_EPOCH_RERUN_DELIVERY_AUTHORITY_SCHEMA_VERSION
+                ),
+                "issue_id": str(expected["issue_id"]),
+                "batch_id": str(expected["batch_id"]),
+                "prior_submission_key": str(expected["prior_submission_key"]),
+                "prior_generation": int(expected["prior_generation"]),
+                "prior_activation_epoch_id": str(expected["prior_activation_epoch_id"]),
+                "prior_activation_ledger_id": expected["prior_activation_ledger_id"],
+                "target_activation_epoch_id": str(
+                    expected["target_activation_epoch_id"]
+                ),
+                "queue_sha256": str(expected["queue_sha256"]),
+                "owner_receipt_path": str(expected["owner_receipt_path"]),
+                "owner_receipt_sha256": str(expected["owner_receipt_sha256"]),
+                "requester_id": str(expected["requester_id"]),
+                "reason": str(expected["reason"]),
+                "activation_required": 1,
+                "authority_json": _canonical_json(expected),
+            }
+            if any(row[name] != value for name, value in projected.items()):
+                raise RuntimeError(
+                    "incompatible_control_store_schema:"
+                    "historical_epoch_rerun_authority_projection"
+                )
+
     def _preflight_schema_version(self) -> str | None:
         """Reject a future schema using a read-only connection before any pragma/DDL."""
         sqlite_path = self._sqlite_path
@@ -6151,6 +6746,7 @@ class RcaControlStore:
             self._validate_v12_learning_lane_schema(conn)
             self._validate_v13_historical_outbox_hold_schema(conn)
             self._validate_v14_terminal_rerun_delivery_authority_schema(conn)
+            self._validate_historical_epoch_rerun_delivery_authority_schema(conn)
             conn.commit()
         except Exception:
             if conn.in_transaction:
@@ -11427,6 +12023,198 @@ class RcaControlStore:
         ):
             raise RecordConflictError("terminal_rerun_authority_replay_mismatch")
 
+    @staticmethod
+    def _historical_epoch_rerun_delivery_authority_values(
+        *,
+        authority: Mapping[str, Any],
+        source_id: str,
+        outbox_id: int,
+        source_payload_sha256: str,
+        admission: RcaAdmission,
+        activation_epoch_id: str,
+        activation_ledger_id: int,
+        current: str,
+    ) -> dict[str, Any]:
+        normalized = dict(authority)
+        expected = build_historical_epoch_rerun_authority(
+            batch_id=normalized.get("batch_id"),
+            queue_sha256=normalized.get("queue_sha256"),
+            issue_id=normalized.get("issue_id"),
+            prior_submission_key=normalized.get("prior_submission_key"),
+            prior_generation=normalized.get("prior_generation"),
+            prior_activation_epoch_id=normalized.get("prior_activation_epoch_id"),
+            prior_activation_ledger_id=normalized.get("prior_activation_ledger_id"),
+            target_activation_epoch_id=normalized.get("target_activation_epoch_id"),
+            owner_receipt_path=normalized.get("owner_receipt_path"),
+            owner_receipt_sha256=normalized.get("owner_receipt_sha256"),
+            requester_id=normalized.get("requester_id"),
+            reason=normalized.get("reason"),
+            activation_required=normalized.get("activation_required"),
+        )
+        if normalized != expected:
+            raise RecordConflictError("historical_epoch_rerun_authority_invalid")
+        if (
+            str(expected["issue_id"]) != admission.source_refs.work_item_id
+            or int(admission.generation) != int(expected["prior_generation"]) + 1
+            or str(expected["target_activation_epoch_id"]) != activation_epoch_id
+        ):
+            raise RecordConflictError(
+                "historical_epoch_rerun_authority_admission_mismatch"
+            )
+        return {
+            "authority_sha256": str(expected["selection_sha256"]),
+            "schema_version": (
+                HISTORICAL_EPOCH_RERUN_DELIVERY_AUTHORITY_SCHEMA_VERSION
+            ),
+            "source_id": str(source_id),
+            "outbox_id": int(outbox_id),
+            "source_payload_sha256": str(source_payload_sha256),
+            "business_key": admission.business_key,
+            "generation": admission.generation,
+            "submission_key": admission.submission_key,
+            "activation_epoch_id": str(activation_epoch_id),
+            "activation_ledger_id": int(activation_ledger_id),
+            "effect_kind": "feishu_issue_comment",
+            "project_key": admission.source_refs.project_key,
+            "project_simple_name": admission.source_refs.project_simple_name,
+            "work_item_type_key": admission.source_refs.work_item_type_key,
+            "issue_id": str(expected["issue_id"]),
+            "batch_id": str(expected["batch_id"]),
+            "prior_submission_key": str(expected["prior_submission_key"]),
+            "prior_generation": int(expected["prior_generation"]),
+            "prior_activation_epoch_id": str(expected["prior_activation_epoch_id"]),
+            "prior_activation_ledger_id": expected["prior_activation_ledger_id"],
+            "target_activation_epoch_id": str(expected["target_activation_epoch_id"]),
+            "queue_sha256": str(expected["queue_sha256"]),
+            "owner_receipt_path": str(expected["owner_receipt_path"]),
+            "owner_receipt_sha256": str(expected["owner_receipt_sha256"]),
+            "requester_id": str(expected["requester_id"]),
+            "reason": str(expected["reason"]),
+            "activation_required": 1,
+            "authority_json": _canonical_json(expected),
+            "created_at": str(current),
+        }
+
+    @classmethod
+    def _persist_historical_epoch_rerun_delivery_authority_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        authority: Mapping[str, Any],
+        source_id: str,
+        source_payload_sha256: str,
+        admission: RcaAdmission,
+        current: str,
+    ) -> None:
+        if not conn.in_transaction:
+            raise RecordConflictError(
+                "historical_epoch_rerun_authority_transaction_required"
+            )
+        execution = conn.execute(
+            """
+            SELECT outbox.outbox_id, trigger.activation_epoch_id,
+                   trigger.activation_ledger_id
+              FROM business_triggers AS trigger
+              JOIN rca_outbox AS outbox
+                ON outbox.business_key = trigger.business_key
+               AND outbox.generation = trigger.generation
+               AND outbox.submission_key = trigger.submission_key
+               AND outbox.activation_epoch_id = trigger.activation_epoch_id
+               AND outbox.activation_ledger_id = trigger.activation_ledger_id
+             WHERE trigger.business_key = ?
+               AND trigger.generation = ?
+               AND trigger.submission_key = ?
+            """,
+            (
+                admission.business_key,
+                admission.generation,
+                admission.submission_key,
+            ),
+        ).fetchone()
+        if (
+            execution is None
+            or not str(execution["activation_epoch_id"] or "").strip()
+            or execution["activation_ledger_id"] is None
+        ):
+            raise RecordConflictError(
+                "historical_epoch_rerun_authority_activation_missing"
+            )
+        values = cls._historical_epoch_rerun_delivery_authority_values(
+            authority=authority,
+            source_id=source_id,
+            outbox_id=int(execution["outbox_id"]),
+            source_payload_sha256=source_payload_sha256,
+            admission=admission,
+            activation_epoch_id=str(execution["activation_epoch_id"]),
+            activation_ledger_id=int(execution["activation_ledger_id"]),
+            current=current,
+        )
+        columns = tuple(values)
+        conn.execute(
+            "INSERT INTO rca_historical_epoch_rerun_delivery_authorities("
+            + ", ".join(columns)
+            + ") VALUES ("
+            + ", ".join("?" for _ in columns)
+            + ")",
+            tuple(values[column] for column in columns),
+        )
+
+    @classmethod
+    def _require_historical_epoch_rerun_delivery_authority_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        authority: Mapping[str, Any],
+        source_id: str,
+        source_payload_sha256: str,
+        admission: RcaAdmission,
+    ) -> None:
+        execution = conn.execute(
+            "SELECT outbox.outbox_id, trigger.activation_epoch_id, "
+            "trigger.activation_ledger_id FROM business_triggers AS trigger "
+            "JOIN rca_outbox AS outbox ON outbox.business_key=trigger.business_key "
+            "AND outbox.generation=trigger.generation "
+            "AND outbox.submission_key=trigger.submission_key "
+            "WHERE trigger.business_key = ? AND trigger.generation = ? "
+            "AND trigger.submission_key = ?",
+            (
+                admission.business_key,
+                admission.generation,
+                admission.submission_key,
+            ),
+        ).fetchone()
+        if (
+            execution is None
+            or not str(execution["activation_epoch_id"] or "").strip()
+            or execution["activation_ledger_id"] is None
+        ):
+            raise RecordConflictError(
+                "historical_epoch_rerun_authority_activation_missing"
+            )
+        expected = cls._historical_epoch_rerun_delivery_authority_values(
+            authority=authority,
+            source_id=source_id,
+            outbox_id=int(execution["outbox_id"]),
+            source_payload_sha256=source_payload_sha256,
+            admission=admission,
+            activation_epoch_id=str(execution["activation_epoch_id"]),
+            activation_ledger_id=int(execution["activation_ledger_id"]),
+            current="",
+        )
+        row = conn.execute(
+            "SELECT * FROM rca_historical_epoch_rerun_delivery_authorities "
+            "WHERE source_id = ?",
+            (source_id,),
+        ).fetchone()
+        if row is None or any(
+            row[name] != value
+            for name, value in expected.items()
+            if name != "created_at"
+        ):
+            raise RecordConflictError(
+                "historical_epoch_rerun_authority_replay_mismatch"
+            )
+
     def seal_learning_lane_cohort(
         self, *, now: datetime | None = None
     ) -> dict[str, Any]:
@@ -11509,6 +12297,18 @@ class RcaControlStore:
             conn.executescript(
                 """
                 BEGIN IMMEDIATE;
+                DROP VIEW IF EXISTS
+                    rca_owner_authorized_rerun_delivery_authorities;
+                DROP TRIGGER IF EXISTS
+                    trg_historical_epoch_rerun_delivery_authority_no_update;
+                DROP TRIGGER IF EXISTS
+                    trg_historical_epoch_rerun_delivery_authority_no_delete;
+                DROP TRIGGER IF EXISTS
+                    trg_historical_epoch_rerun_delivery_authority_no_replace;
+                DROP TRIGGER IF EXISTS
+                    trg_historical_epoch_rerun_delivery_authority_projection_guard;
+                DROP TRIGGER IF EXISTS
+                    trg_historical_epoch_rerun_delivery_authority_binding_guard;
                 CREATE TABLE business_triggers_v6 (
                     business_key TEXT NOT NULL,
                     generation INTEGER NOT NULL CHECK (generation >= 1),
@@ -11647,7 +12447,9 @@ class RcaControlStore:
             SELECT t.*, o.outbox_id, o.status AS outbox_status,
                    o.attempt, o.completed_at, o.result_json, o.quarantined_at,
                    o.last_error_code, o.lease_token, o.lease_owner,
-                   o.lease_expires_at
+                   o.lease_expires_at,
+                   o.activation_epoch_id AS outbox_activation_epoch_id,
+                   o.activation_ledger_id AS outbox_activation_ledger_id
               FROM business_triggers AS t
               JOIN rca_outbox AS o
                 ON o.business_key = t.business_key AND o.generation = t.generation
@@ -13280,20 +14082,34 @@ class RcaControlStore:
                 "rca_activation_historical_outbox_disposition_items",
             )
         )
-        if marker_value in {
-            "pnc_rca_control_store_v13",
-            CONTROL_STORE_SCHEMA_VERSION,
-        } or v13_tables_present:
+        if (
+            marker_value
+            in {
+                "pnc_rca_control_store_v13",
+                CONTROL_STORE_SCHEMA_VERSION,
+            }
+            or v13_tables_present
+        ):
             RcaControlStore._validate_v13_historical_outbox_hold_schema(conn)
         v14_table_present = RcaControlStore._table_exists(
             conn, "rca_terminal_rerun_delivery_authorities"
         )
         if marker_value == CONTROL_STORE_SCHEMA_VERSION or v14_table_present:
-            RcaControlStore._validate_v14_terminal_rerun_delivery_authority_schema(
+            RcaControlStore._validate_v14_terminal_rerun_delivery_authority_schema(conn)
+        historical_epoch_rerun_table_present = RcaControlStore._table_exists(
+            conn, "rca_historical_epoch_rerun_delivery_authorities"
+        )
+        if (
+            marker_value == CONTROL_STORE_SCHEMA_VERSION
+            or historical_epoch_rerun_table_present
+        ):
+            RcaControlStore._validate_historical_epoch_rerun_delivery_authority_schema(
                 conn
             )
 
-        def foreign_key_groups(table: str) -> dict[tuple[int, str], set[tuple[str, str]]]:
+        def foreign_key_groups(
+            table: str,
+        ) -> dict[tuple[int, str], set[tuple[str, str]]]:
             groups: dict[tuple[int, str], set[tuple[str, str]]] = {}
             for row in conn.execute(f"PRAGMA foreign_key_list({table})").fetchall():
                 key = (int(row["id"]), str(row["table"]))
@@ -15870,6 +16686,99 @@ class RcaControlStore:
                 return True
         return False
 
+    @staticmethod
+    def _historical_epoch_rerun_active_lease(
+        *,
+        token: Any,
+        owner: Any,
+        expires_at: Any,
+        current: datetime,
+    ) -> bool:
+        values = (token, owner, expires_at)
+        if not any(value is not None for value in values):
+            return False
+        if not all(str(value or "").strip() for value in values):
+            return True
+        try:
+            expiry = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+        except (TypeError, ValueError, OverflowError):
+            return True
+        if expiry.tzinfo is None or expiry.utcoffset() is None:
+            return True
+        return expiry.astimezone(timezone.utc) > current
+
+    @classmethod
+    def _historical_epoch_rerun_ineligibility_tx(
+        cls,
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        now: datetime | None,
+    ) -> str:
+        current = _utc_datetime(now)
+        if cls._historical_epoch_rerun_active_lease(
+            token=row["lease_token"],
+            owner=row["lease_owner"],
+            expires_at=row["lease_expires_at"],
+            current=current,
+        ):
+            return "historical_epoch_rerun_prior_outbox_lease_active"
+        submission_key = str(row["submission_key"] or "").strip()
+        if cls._table_exists(conn, "rca_execution_watch"):
+            watch = conn.execute(
+                "SELECT state, task_id, lease_token, lease_owner, lease_expires_at "
+                "FROM rca_execution_watch WHERE submission_key = ?",
+                (submission_key,),
+            ).fetchone()
+            if watch is not None:
+                if cls._historical_epoch_rerun_active_lease(
+                    token=watch["lease_token"],
+                    owner=watch["lease_owner"],
+                    expires_at=watch["lease_expires_at"],
+                    current=current,
+                ):
+                    return "historical_epoch_rerun_prior_watch_lease_active"
+        if cls._table_exists(conn, "rca_delivery_jobs") and cls._table_exists(
+            conn, "rca_delivery_effects"
+        ):
+            effects = conn.execute(
+                """
+                SELECT effect.effect_key, effect.write_phase,
+                       effect.remote_receipt_json, effect.attempt,
+                       effect.lease_token, effect.lease_owner,
+                       effect.lease_expires_at
+                  FROM rca_delivery_jobs AS job
+                  JOIN rca_delivery_effects AS effect
+                    ON effect.delivery_id = job.delivery_id
+                 WHERE job.submission_key = ?
+                """,
+                (submission_key,),
+            ).fetchall()
+            for effect in effects:
+                if str(effect["write_phase"] or "") == "write_started":
+                    return "historical_epoch_rerun_prior_write_started"
+                if effect["remote_receipt_json"] is not None:
+                    return "historical_epoch_rerun_prior_remote_receipt_present"
+                if int(effect["attempt"] or 0) > 0:
+                    return "historical_epoch_rerun_prior_provider_attempt_present"
+                if cls._historical_epoch_rerun_active_lease(
+                    token=effect["lease_token"],
+                    owner=effect["lease_owner"],
+                    expires_at=effect["lease_expires_at"],
+                    current=current,
+                ):
+                    return "historical_epoch_rerun_prior_effect_lease_active"
+                if (
+                    cls._table_exists(conn, "rca_delivery_attempts")
+                    and conn.execute(
+                        "SELECT 1 FROM rca_delivery_attempts WHERE effect_key = ? LIMIT 1",
+                        (str(effect["effect_key"]),),
+                    ).fetchone()
+                    is not None
+                ):
+                    return "historical_epoch_rerun_prior_provider_attempt_present"
+        return ""
+
     @classmethod
     def _silent_terminal_rerun_eligible_tx(
         cls,
@@ -16186,6 +17095,7 @@ class RcaControlStore:
         activation_slot_kind: str = "",
         automation_authority: Mapping[str, Any] | None = None,
         user_rerun_authority: Mapping[str, Any] | None = None,
+        historical_epoch_rerun_authority: Mapping[str, Any] | None = None,
         batch_terminal_rerun_authority: Mapping[str, Any] | None = None,
         silent_terminal_rerun_authority: Mapping[str, Any] | None = None,
         snapshot_authority: Any = None,
@@ -16203,6 +17113,7 @@ class RcaControlStore:
             raise ManualRcaAdmissionError("manual_activation_slot_invalid")
         gray_sample_authority: dict[str, str] | None = None
         normalized_user_rerun: dict[str, str] | None = None
+        normalized_historical_epoch_rerun: dict[str, Any] | None = None
         normalized_batch_rerun: dict[str, Any] | None = None
         normalized_silent_rerun: dict[str, Any] | None = None
         if user_rerun_authority is not None:
@@ -16234,6 +17145,95 @@ class RcaControlStore:
                 or not manual.requester_id.startswith("ou_")
             ):
                 raise ManualRcaAdmissionError("group_user_rerun_authority_invalid")
+        if historical_epoch_rerun_authority is not None:
+            if (
+                not isinstance(historical_epoch_rerun_authority, Mapping)
+                or set(historical_epoch_rerun_authority)
+                != HISTORICAL_EPOCH_RERUN_AUTHORITY_FIELDS
+            ):
+                raise ManualRcaAdmissionError(
+                    "historical_epoch_rerun_authority_invalid"
+                )
+            try:
+                expected_historical_epoch_rerun = (
+                    build_historical_epoch_rerun_authority(
+                        batch_id=historical_epoch_rerun_authority.get("batch_id"),
+                        queue_sha256=historical_epoch_rerun_authority.get(
+                            "queue_sha256"
+                        ),
+                        issue_id=historical_epoch_rerun_authority.get("issue_id"),
+                        prior_submission_key=historical_epoch_rerun_authority.get(
+                            "prior_submission_key"
+                        ),
+                        prior_generation=historical_epoch_rerun_authority.get(
+                            "prior_generation"
+                        ),
+                        prior_activation_epoch_id=(
+                            historical_epoch_rerun_authority.get(
+                                "prior_activation_epoch_id"
+                            )
+                        ),
+                        prior_activation_ledger_id=(
+                            historical_epoch_rerun_authority.get(
+                                "prior_activation_ledger_id"
+                            )
+                        ),
+                        target_activation_epoch_id=(
+                            historical_epoch_rerun_authority.get(
+                                "target_activation_epoch_id"
+                            )
+                        ),
+                        owner_receipt_path=historical_epoch_rerun_authority.get(
+                            "owner_receipt_path"
+                        ),
+                        owner_receipt_sha256=historical_epoch_rerun_authority.get(
+                            "owner_receipt_sha256"
+                        ),
+                        activation_required=historical_epoch_rerun_authority.get(
+                            "activation_required"
+                        ),
+                        requester_id=historical_epoch_rerun_authority.get(
+                            "requester_id"
+                        ),
+                        reason=historical_epoch_rerun_authority.get("reason"),
+                    )
+                )
+            except (TypeError, ValueError) as exc:
+                raise ManualRcaAdmissionError(
+                    "historical_epoch_rerun_authority_invalid"
+                ) from exc
+            expected_message_id = (
+                f"{expected_historical_epoch_rerun['batch_id']}-"
+                f"{expected_historical_epoch_rerun['issue_id']}-try-"
+            )
+            if (
+                dict(historical_epoch_rerun_authority)
+                != expected_historical_epoch_rerun
+                or manual.platform != "operator"
+                or manual.mode != "rerun"
+                or operator_authorized is not True
+                or user_rerun_authority is not None
+                or automation_authority is not None
+                or batch_terminal_rerun_authority is not None
+                or silent_terminal_rerun_authority is not None
+                or activation_slot
+                or snapshot_authority is not None
+                or snapshot_ticket_authority is not None
+                or snapshot_manual_ingress_authority is not None
+                or activation_required is not True
+                or expected_historical_epoch_rerun["requester_id"]
+                != manual.requester_id
+                or expected_historical_epoch_rerun["reason"] != manual.reason
+                or re.fullmatch(
+                    re.escape(expected_message_id) + r"[1-9][0-9]*",
+                    manual.message_id,
+                )
+                is None
+            ):
+                raise ManualRcaAdmissionError(
+                    "historical_epoch_rerun_authority_invalid"
+                )
+            normalized_historical_epoch_rerun = expected_historical_epoch_rerun
         if silent_terminal_rerun_authority is not None:
             if (
                 not isinstance(silent_terminal_rerun_authority, Mapping)
@@ -16280,6 +17280,7 @@ class RcaControlStore:
                 or operator_authorized is not True
                 or user_rerun_authority is not None
                 or automation_authority is not None
+                or historical_epoch_rerun_authority is not None
                 or activation_slot
                 or snapshot_authority is not None
                 or snapshot_ticket_authority is not None
@@ -16342,6 +17343,7 @@ class RcaControlStore:
                 or operator_authorized is not True
                 or user_rerun_authority is not None
                 or automation_authority is not None
+                or historical_epoch_rerun_authority is not None
                 or activation_slot
                 or snapshot_authority is not None
                 or snapshot_ticket_authority is not None
@@ -16372,10 +17374,9 @@ class RcaControlStore:
                 or snapshot_authority is not None
                 or snapshot_ticket_authority is not None
                 or snapshot_manual_ingress_authority is not None
+                or historical_epoch_rerun_authority is not None
             ):
-                raise ManualRcaAdmissionError(
-                    "gray_sample_automation_contract_invalid"
-                )
+                raise ManualRcaAdmissionError("gray_sample_automation_contract_invalid")
             sample_id = gray_sample_authority["sample_id"]
             if (
                 manual.issue_url != gray_sample_issue_url(sample_id)
@@ -16467,6 +17468,10 @@ class RcaControlStore:
             source_payload["automation_authority"] = gray_sample_authority
         if normalized_user_rerun is not None:
             source_payload["user_rerun_authority"] = normalized_user_rerun
+        if normalized_historical_epoch_rerun is not None:
+            source_payload["historical_epoch_rerun_authority"] = (
+                normalized_historical_epoch_rerun
+            )
         if normalized_batch_rerun is not None:
             source_payload["batch_terminal_rerun_authority"] = normalized_batch_rerun
         if normalized_silent_rerun is not None:
@@ -16617,12 +17622,21 @@ class RcaControlStore:
                         source_payload_sha256=payload_sha,
                         admission=replay_admission_for_lane,
                     )
+                if normalized_historical_epoch_rerun is not None:
+                    self._require_historical_epoch_rerun_delivery_authority_tx(
+                        conn,
+                        authority=normalized_historical_epoch_rerun,
+                        source_id=source_id,
+                        source_payload_sha256=payload_sha,
+                        admission=replay_admission_for_lane,
+                    )
                 learning_lane = (
                     False
                     if any(
                         authority is not None
                         for authority in (
                             normalized_user_rerun,
+                            normalized_historical_epoch_rerun,
                             normalized_silent_rerun,
                             normalized_batch_rerun,
                         )
@@ -16904,6 +17918,95 @@ class RcaControlStore:
                     raise ManualRcaAdmissionError(
                         "group_user_rerun_terminal_generation_required"
                     )
+            if normalized_historical_epoch_rerun is not None:
+                if latest is None:
+                    raise ManualRcaAdmissionError(
+                        "historical_epoch_rerun_existing_generation_required"
+                    )
+                current_epoch = self._current_activation_epoch_tx(conn)
+                if (
+                    current_epoch is None
+                    or str(current_epoch["state"] or "") != "steady_active"
+                ):
+                    raise ManualRcaAdmissionError(
+                        "historical_epoch_rerun_current_epoch_not_steady"
+                    )
+                prior_epoch_id = str(latest["activation_epoch_id"] or "").strip()
+                prior_ledger_id = latest["activation_ledger_id"]
+                outbox_prior_epoch_id = str(
+                    latest["outbox_activation_epoch_id"] or ""
+                ).strip()
+                outbox_prior_ledger_id = latest["outbox_activation_ledger_id"]
+                target_epoch_id = str(current_epoch["epoch_id"])
+                if (
+                    prior_epoch_id != outbox_prior_epoch_id
+                    or prior_ledger_id != outbox_prior_ledger_id
+                    or prior_epoch_id == target_epoch_id
+                ):
+                    raise ManualRcaAdmissionError(
+                        "historical_epoch_rerun_authority_mismatch"
+                    )
+                if prior_epoch_id:
+                    old_binding = conn.execute(
+                        """
+                        SELECT 1
+                          FROM rca_activation_admission_ledger AS ledger
+                          JOIN rca_activation_epochs AS epoch
+                            ON epoch.epoch_id = ledger.epoch_id
+                         WHERE ledger.ledger_id = ? AND ledger.epoch_id = ?
+                           AND ledger.business_key = ?
+                           AND ledger.submission_key = ?
+                           AND ledger.generation = ?
+                           AND ledger.decision IN ('admit', 'shadow')
+                           AND ledger.bound_at IS NOT NULL
+                           AND epoch.is_current = 0
+                        """,
+                        (
+                            prior_ledger_id,
+                            prior_epoch_id,
+                            str(latest["business_key"]),
+                            str(latest["submission_key"]),
+                            int(latest["generation"]),
+                        ),
+                    ).fetchone()
+                    if prior_ledger_id is None or old_binding is None:
+                        raise ManualRcaAdmissionError(
+                            "historical_epoch_rerun_authority_mismatch"
+                        )
+                elif prior_ledger_id is not None:
+                    raise ManualRcaAdmissionError(
+                        "historical_epoch_rerun_authority_mismatch"
+                    )
+                expected_historical_epoch_rerun = (
+                    build_historical_epoch_rerun_authority(
+                        batch_id=normalized_historical_epoch_rerun["batch_id"],
+                        queue_sha256=normalized_historical_epoch_rerun["queue_sha256"],
+                        issue_id=work_item_id,
+                        prior_submission_key=str(latest["submission_key"]),
+                        prior_generation=int(latest["generation"]),
+                        prior_activation_epoch_id=prior_epoch_id,
+                        prior_activation_ledger_id=prior_ledger_id,
+                        target_activation_epoch_id=target_epoch_id,
+                        owner_receipt_path=normalized_historical_epoch_rerun[
+                            "owner_receipt_path"
+                        ],
+                        owner_receipt_sha256=normalized_historical_epoch_rerun[
+                            "owner_receipt_sha256"
+                        ],
+                        activation_required=True,
+                        requester_id=manual.requester_id,
+                        reason=manual.reason,
+                    )
+                )
+                if normalized_historical_epoch_rerun != expected_historical_epoch_rerun:
+                    raise ManualRcaAdmissionError(
+                        "historical_epoch_rerun_authority_mismatch"
+                    )
+                ineligibility = self._historical_epoch_rerun_ineligibility_tx(
+                    conn, latest, now=now
+                )
+                if ineligibility:
+                    raise ManualRcaAdmissionError(ineligibility)
             if normalized_silent_rerun is not None:
                 if latest is None or not self._silent_terminal_rerun_eligible_tx(
                     conn, latest
@@ -17056,6 +18159,22 @@ class RcaControlStore:
                     activation_required=activation_required,
                 )
                 admission = base_admission
+                outcome = "created"
+            elif normalized_historical_epoch_rerun is not None:
+                self._assert_manual_dispatch_capacity_tx(
+                    conn,
+                    outbox_high_watermark=high_watermark,
+                    activation_required=activation_required,
+                )
+                admission = build_rca_admission(
+                    project_key=str(latest["project_key"]),
+                    project_simple_name=project_simple_name,
+                    work_item_type_key=str(latest["work_item_type_key"]),
+                    work_item_id=str(latest["work_item_id"]),
+                    rule_version=str(latest["creation_rule_version"]),
+                    trigger_kind="manual_retrigger",
+                    generation=int(latest["generation"]) + 1,
+                )
                 outcome = "created"
             elif (
                 str(latest["outbox_status"] or "") == "shadow"
@@ -17316,6 +18435,33 @@ class RcaControlStore:
                     detail=_canonical_json(normalized_batch_rerun),
                     created_at=current,
                 )
+            if normalized_historical_epoch_rerun is not None:
+                prior_generation = int(
+                    normalized_historical_epoch_rerun["prior_generation"]
+                )
+                if not created or admission.generation != prior_generation + 1:
+                    raise RuntimeError("historical_epoch_rerun_generation_not_created")
+                prior_epoch = str(
+                    normalized_historical_epoch_rerun["prior_activation_epoch_id"]
+                    or "legacy_unconfigured"
+                )
+                self._insert_promotion_audit(
+                    conn,
+                    event_uid=source_id,
+                    outbox_id=int(bound_outbox["outbox_id"]),
+                    submission_key=admission.submission_key,
+                    operator=f"manual:{manual.requester_id}",
+                    reason="historical_epoch_explicit_batch_rerun",
+                    outcome="historical_epoch_rerun_new_generation_created",
+                    from_status=f"historical_epoch:{prior_epoch}:g{prior_generation}",
+                    to_status=(
+                        "current_epoch:"
+                        f"{normalized_historical_epoch_rerun['target_activation_epoch_id']}:"
+                        f"pending:g{admission.generation}"
+                    ),
+                    detail=_canonical_json(normalized_historical_epoch_rerun),
+                    created_at=current,
+                )
             self._audit_manual_policy_observation_tx(
                 conn,
                 source_id=source_id,
@@ -17363,12 +18509,22 @@ class RcaControlStore:
                     admission=admission,
                     current=current,
                 )
+            if normalized_historical_epoch_rerun is not None:
+                self._persist_historical_epoch_rerun_delivery_authority_tx(
+                    conn,
+                    authority=normalized_historical_epoch_rerun,
+                    source_id=source_id,
+                    source_payload_sha256=payload_sha,
+                    admission=admission,
+                    current=current,
+                )
             learning_lane = (
                 False
                 if any(
                     authority is not None
                     for authority in (
                         normalized_user_rerun,
+                        normalized_historical_epoch_rerun,
                         normalized_silent_rerun,
                         normalized_batch_rerun,
                     )
@@ -21381,6 +22537,7 @@ class RcaControlStore:
             "rca_activation_historical_outbox_dispositions",
             "rca_activation_historical_outbox_disposition_items",
             "rca_terminal_rerun_delivery_authorities",
+            "rca_historical_epoch_rerun_delivery_authorities",
         }
         if table not in allowed:
             raise ValueError(f"unsupported table: {table}")

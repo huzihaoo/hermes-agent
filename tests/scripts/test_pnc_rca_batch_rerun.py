@@ -28,6 +28,8 @@ from scripts.pnc_rca_batch_rerun import (
     BatchRerunError,
     _approval,
     _batch_terminal_authority,
+    _historical_epoch_rerun_authority,
+    _historical_epoch_rerun_ineligibility,
     _issue_snapshot,
     _load_queue,
     _load_or_create_state,
@@ -112,6 +114,12 @@ def _snapshot(
     return {
         "generation": 6,
         "submission_key": "submission-6",
+        "activation_epoch_id": "rca-current",
+        "activation_ledger_id": 61,
+        "outbox_activation_epoch_id": "rca-current",
+        "outbox_activation_ledger_id": 61,
+        "current_activation_epoch_id": "rca-current",
+        "current_activation_state": "steady_active",
         "delivery_id": "delivery-6",
         "job_status": job_status,
         "job_outcome": job_outcome,
@@ -135,9 +143,77 @@ def _snapshot(
                 },
                 "completed_at": "2026-07-24T06:00:00+00:00",
                 "last_error_code": "",
+                "write_phase": "settled",
+                "attempt": 1,
+                "provider_attempt_count": 1,
+                "remote_receipt_present": True,
             }
         ],
     }
+
+
+def test_historical_epoch_authority_accepts_exact_null_binding_and_rejects_write_evidence():
+    snapshot = {
+        **_snapshot(),
+        "generation": 1,
+        "submission_key": "g1q3-rca-s1-" + "a" * 64,
+        "activation_epoch_id": None,
+        "activation_ledger_id": None,
+        "outbox_activation_epoch_id": None,
+        "outbox_activation_ledger_id": None,
+        "effects": [],
+    }
+    authority = _historical_epoch_rerun_authority(
+        snapshot=snapshot,
+        batch_id="batch-history",
+        queue_sha256="1" * 64,
+        issue_id="7048803418",
+        owner_receipt_path="/tmp/owner.json",
+        owner_receipt_sha256="2" * 64,
+        requester_id="automation:rca-batch-rerun",
+        reason="production_gray_batch:batch-history",
+    )
+
+    assert authority is not None
+    assert authority["prior_activation_epoch_id"] == ""
+    assert authority["target_activation_epoch_id"] == "rca-current"
+    stale_task = {
+        **snapshot,
+        "watch_state": "pending",
+        "watch_task_id": "stale-vm-task-7048803418",
+        "watch_lease_token": "expired-token",
+        "watch_lease_owner": "retired-worker",
+        "watch_lease_expires_at": "2026-07-24T00:00:00+00:00",
+    }
+    assert _historical_epoch_rerun_ineligibility(stale_task) == ""
+    assert _historical_epoch_rerun_authority(
+        snapshot=stale_task,
+        batch_id="batch-history",
+        queue_sha256="1" * 64,
+        issue_id="7048803418",
+        owner_receipt_path="/tmp/owner.json",
+        owner_receipt_sha256="2" * 64,
+        requester_id="automation:rca-batch-rerun",
+        reason="production_gray_batch:batch-history",
+    ) is not None
+    unsafe = {
+        **snapshot,
+        "effects": [{"write_phase": "write_started"}],
+    }
+    assert _historical_epoch_rerun_ineligibility(unsafe) == "prior_write_started"
+    assert (
+        _historical_epoch_rerun_authority(
+            snapshot=unsafe,
+            batch_id="batch-history",
+            queue_sha256="1" * 64,
+            issue_id="7048803418",
+            owner_receipt_path="/tmp/owner.json",
+            owner_receipt_sha256="2" * 64,
+            requester_id="automation:rca-batch-rerun",
+            reason="production_gray_batch:batch-history",
+        )
+        is None
+    )
 
 
 def test_approval_accepts_issue_only_official_readback():
@@ -1038,6 +1114,61 @@ def test_run_creates_initial_generation_for_exact_absent_item(tmp_path, monkeypa
     assert result["summary"] == {"accepted": 1, "total": 1}
 
 
+def test_submit_all_admits_historical_generation_without_waiting_for_delivery(
+    tmp_path, monkeypatch
+):
+    queue_path, owner_path = _write_run_inputs(tmp_path, _queue_value())
+    prior = {
+        **_snapshot(),
+        "generation": 1,
+        "submission_key": "g1q3-rca-s1-" + "a" * 64,
+        "activation_epoch_id": None,
+        "activation_ledger_id": None,
+        "outbox_activation_epoch_id": None,
+        "outbox_activation_ledger_id": None,
+        "effects": [],
+        "job_status": "",
+        "delivery_id": None,
+    }
+    admitted = False
+
+    class FakeStore:
+        def __init__(self, _path):
+            pass
+
+        def admit_manual_trigger(self, _request, **kwargs):
+            nonlocal admitted
+            authority = kwargs.get("historical_epoch_rerun_authority")
+            assert authority is not None
+            assert kwargs["outbox_high_watermark"] == 1000
+            assert authority["prior_submission_key"] == prior["submission_key"]
+            admitted = True
+            return SimpleNamespace(
+                outcome="created",
+                generation=2,
+                submission_key="g1q3-rca-s1-" + "c" * 64,
+                source_id="source-2",
+            )
+
+    def snapshot(_path, _issue_id, *, submission_key=""):
+        assert not submission_key
+        return prior
+
+    monkeypatch.setattr(batch_rerun, "RcaControlStore", FakeStore)
+    monkeypatch.setattr(batch_rerun, "_issue_snapshot", snapshot)
+    monkeypatch.setattr(batch_rerun, "_runtime_identity", lambda: ("a" * 40, "b" * 40))
+    args = _run_args(tmp_path, queue_path, owner_path)
+    args.submit_all = True
+    args.outbox_high_watermark = 1000
+
+    result = batch_rerun.run(args)
+
+    assert admitted is True
+    assert result["status"] == "submitted_all"
+    assert result["summary"] == {"accepted": 0, "submitted": 1, "total": 1}
+    assert result["items"]["7048803418"]["status"] == "submitted"
+
+
 def test_run_refreshes_existing_success_instead_of_skipping_it(tmp_path, monkeypatch):
     queue_path, owner_path = _write_run_inputs(tmp_path, _queue_value())
     prior = {
@@ -1099,7 +1230,9 @@ def test_issue_snapshot_tracks_new_outbox_before_execution_watch_exists(tmp_path
             business_key TEXT,
             generation INTEGER,
             submission_key TEXT,
-            work_item_id TEXT
+            work_item_id TEXT,
+            activation_epoch_id TEXT,
+            activation_ledger_id INTEGER
         );
         CREATE TABLE rca_outbox (
             outbox_id INTEGER,
@@ -1108,13 +1241,22 @@ def test_issue_snapshot_tracks_new_outbox_before_execution_watch_exists(tmp_path
             status TEXT,
             last_error_code TEXT,
             last_error_detail TEXT,
-            completed_at TEXT
+            completed_at TEXT,
+            lease_token TEXT,
+            lease_owner TEXT,
+            lease_expires_at TEXT,
+            activation_epoch_id TEXT,
+            activation_ledger_id INTEGER
         );
         CREATE TABLE rca_execution_watch (
             submission_outbox_id INTEGER,
             state TEXT,
             delivery_id TEXT,
-            last_error_code TEXT
+            last_error_code TEXT,
+            task_id TEXT,
+            lease_token TEXT,
+            lease_owner TEXT,
+            lease_expires_at TEXT
         );
         CREATE TABLE rca_delivery_jobs (
             submission_key TEXT,
@@ -1138,16 +1280,32 @@ def test_issue_snapshot_tracks_new_outbox_before_execution_watch_exists(tmp_path
             required INTEGER,
             target_key TEXT,
             status TEXT,
+            write_phase TEXT,
+            attempt INTEGER,
+            lease_token TEXT,
+            lease_owner TEXT,
+            lease_expires_at TEXT,
             remote_receipt_json TEXT,
             last_error_code TEXT,
             completed_at TEXT,
             updated_at TEXT
         );
+        CREATE TABLE rca_delivery_attempts (effect_key TEXT);
+        CREATE TABLE rca_activation_epochs (
+            epoch_id TEXT,
+            state TEXT,
+            is_current INTEGER
+        );
         INSERT INTO business_triggers VALUES (
-            'business-1', 6, 'submission-6', '7048803418'
+            'business-1', 6, 'submission-6', '7048803418',
+            'rca-old', 61
         );
         INSERT INTO rca_outbox VALUES (
-            378, 'business-1', 6, 'pending', '', '', NULL
+            378, 'business-1', 6, 'pending', '', '', NULL,
+            NULL, NULL, NULL, 'rca-old', 61
+        );
+        INSERT INTO rca_activation_epochs VALUES (
+            'rca-current', 'steady_active', 1
         );
         """
     )

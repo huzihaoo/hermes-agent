@@ -25,11 +25,13 @@ if str(REPO_ROOT) not in sys.path:
 
 from gateway.pnc_rca_control_store import (  # noqa: E402
     CONTROL_STORE_SCHEMA_VERSION,
+    DEFAULT_OUTBOX_HIGH_WATERMARK,
     MANUAL_TRIGGER_SCHEMA_VERSION,
     SILENT_TERMINAL_RERUN_ERROR_CODES,
     ManualRcaTriggerRequest,
     RcaControlStore,
     build_batch_terminal_rerun_authority,
+    build_historical_epoch_rerun_authority,
     build_silent_terminal_rerun_authority,
 )
 from gateway.pnc_rca_abstention_projection import (  # noqa: E402
@@ -752,19 +754,34 @@ def _issue_snapshot(
         row = conn.execute(
             f"""
             SELECT b.generation, b.submission_key,
+                   b.activation_epoch_id,
+                   b.activation_ledger_id,
                    o.status AS outbox_status,
                    o.last_error_code AS outbox_error_code,
                    o.last_error_detail AS outbox_error_detail,
                    o.completed_at AS outbox_completed_at,
+                   o.lease_token AS outbox_lease_token,
+                   o.lease_owner AS outbox_lease_owner,
+                   o.lease_expires_at AS outbox_lease_expires_at,
+                   o.activation_epoch_id AS outbox_activation_epoch_id,
+                   o.activation_ledger_id AS outbox_activation_ledger_id,
                    w.state AS watch_state,
+                   w.task_id AS watch_task_id,
                    w.delivery_id AS watch_delivery_id,
                    w.last_error_code AS watch_error_code,
+                   w.lease_token AS watch_lease_token,
+                   w.lease_owner AS watch_lease_owner,
+                   w.lease_expires_at AS watch_lease_expires_at,
                    j.delivery_id, j.status AS job_status,
                    j.outcome AS job_outcome, j.outcome_key,
                    j.terminal_state, j.terminal_error_code,
                    j.issue_url, j.report_url, j.manifest_json,
                    j.contract_json, j.artifacts_json,
-                   j.updated_at AS job_updated_at
+                   j.updated_at AS job_updated_at,
+                   (SELECT epoch_id FROM rca_activation_epochs
+                     WHERE is_current = 1) AS current_activation_epoch_id,
+                   (SELECT state FROM rca_activation_epochs
+                     WHERE is_current = 1) AS current_activation_state
               FROM business_triggers AS b
               JOIN rca_outbox AS o
                 ON o.business_key = b.business_key
@@ -787,8 +804,13 @@ def _issue_snapshot(
             for effect in conn.execute(
                 """
                 SELECT effect_key, effect_kind, required, target_key, status,
-                       remote_receipt_json, last_error_code, completed_at,
-                       updated_at
+                       write_phase, attempt, lease_token, lease_owner,
+                       lease_expires_at, remote_receipt_json, last_error_code,
+                       completed_at, updated_at,
+                       (SELECT COUNT(*) FROM rca_delivery_attempts AS attempt_row
+                         WHERE attempt_row.effect_key =
+                               rca_delivery_effects.effect_key
+                       ) AS provider_attempt_count
                   FROM rca_delivery_effects
                  WHERE delivery_id = ?
                  ORDER BY effect_kind, effect_key
@@ -796,7 +818,9 @@ def _issue_snapshot(
                 (row["delivery_id"],),
             ).fetchall():
                 item = {key: effect[key] for key in effect.keys()}
-                item["remote_receipt"] = _json_object(item.pop("remote_receipt_json"))
+                remote_receipt_json = item.pop("remote_receipt_json")
+                item["remote_receipt_present"] = remote_receipt_json is not None
+                item["remote_receipt"] = _json_object(remote_receipt_json)
                 effects.append(item)
         snapshot["effects"] = effects
         return snapshot
@@ -933,6 +957,105 @@ def _request(
     )
 
 
+def _snapshot_lease_active(
+    snapshot: Mapping[str, Any], prefix: str, *, now: datetime | None = None
+) -> bool:
+    values = tuple(
+        snapshot.get(f"{prefix}_{name}" if prefix else name)
+        for name in ("lease_token", "lease_owner", "lease_expires_at")
+    )
+    if not any(value is not None for value in values):
+        return False
+    if not all(str(value or "").strip() for value in values):
+        return True
+    try:
+        expiry = datetime.fromisoformat(str(values[2]).replace("Z", "+00:00"))
+    except (TypeError, ValueError, OverflowError):
+        return True
+    if expiry.tzinfo is None or expiry.utcoffset() is None:
+        return True
+    current = now or datetime.now(timezone.utc)
+    return expiry.astimezone(timezone.utc) > current.astimezone(timezone.utc)
+
+
+def _historical_epoch_rerun_ineligibility(
+    snapshot: Mapping[str, Any], *, now: datetime | None = None
+) -> str:
+    prior_epoch = str(snapshot.get("activation_epoch_id") or "").strip()
+    prior_ledger = snapshot.get("activation_ledger_id")
+    if prior_epoch != str(snapshot.get("outbox_activation_epoch_id") or "").strip():
+        return "prior_epoch_binding_mismatch"
+    if prior_ledger != snapshot.get("outbox_activation_ledger_id"):
+        return "prior_ledger_binding_mismatch"
+    current_epoch = str(snapshot.get("current_activation_epoch_id") or "").strip()
+    if (
+        not current_epoch
+        or str(snapshot.get("current_activation_state") or "") != "steady_active"
+    ):
+        return "current_epoch_not_steady"
+    if prior_epoch == current_epoch:
+        return "prior_epoch_is_current"
+    if (not prior_epoch and prior_ledger is not None) or (
+        prior_epoch
+        and (
+            isinstance(prior_ledger, bool)
+            or not isinstance(prior_ledger, int)
+            or prior_ledger < 1
+        )
+    ):
+        return "prior_epoch_binding_invalid"
+    if _snapshot_lease_active(snapshot, "outbox", now=now):
+        return "prior_outbox_lease_active"
+    if _snapshot_lease_active(snapshot, "watch", now=now):
+        return "prior_watch_lease_active"
+    for effect in snapshot.get("effects", []):
+        if not isinstance(effect, Mapping):
+            return "prior_effect_invalid"
+        if str(effect.get("write_phase") or "") == "write_started":
+            return "prior_write_started"
+        if effect.get("remote_receipt_present") is True:
+            return "prior_remote_receipt_present"
+        if (
+            int(effect.get("attempt") or 0) > 0
+            or int(effect.get("provider_attempt_count") or 0) > 0
+        ):
+            return "prior_provider_attempt_present"
+        if _snapshot_lease_active(effect, "", now=now):
+            return "prior_effect_lease_active"
+    return ""
+
+
+def _historical_epoch_rerun_authority(
+    *,
+    snapshot: Mapping[str, Any],
+    batch_id: str,
+    queue_sha256: str,
+    issue_id: str,
+    owner_receipt_path: str,
+    owner_receipt_sha256: str,
+    requester_id: str,
+    reason: str,
+) -> dict[str, Any] | None:
+    if _historical_epoch_rerun_ineligibility(snapshot):
+        return None
+    return build_historical_epoch_rerun_authority(
+        batch_id=batch_id,
+        queue_sha256=queue_sha256,
+        issue_id=issue_id,
+        prior_submission_key=str(snapshot.get("submission_key") or ""),
+        prior_generation=int(snapshot.get("generation") or 0),
+        prior_activation_epoch_id=str(snapshot.get("activation_epoch_id") or ""),
+        prior_activation_ledger_id=snapshot.get("activation_ledger_id"),
+        target_activation_epoch_id=str(
+            snapshot.get("current_activation_epoch_id") or ""
+        ),
+        owner_receipt_path=owner_receipt_path,
+        owner_receipt_sha256=owner_receipt_sha256,
+        requester_id=requester_id,
+        reason=reason,
+    )
+
+
 def _silent_terminal_authority(
     *,
     snapshot: Mapping[str, Any],
@@ -1025,7 +1148,14 @@ def _queue_precondition_matches(
 
 
 def _dry_run_database_plan(
-    db_path: Path, queue: Sequence[Mapping[str, Any]]
+    db_path: Path,
+    queue: Sequence[Mapping[str, Any]],
+    *,
+    batch_id: str,
+    queue_sha256: str,
+    owner_receipt_path: str,
+    owner_receipt_sha256: str,
+    requester_id: str,
 ) -> dict[str, Any]:
     """Validate a SQLite-consistent online backup of the source DB."""
     selected = db_path.expanduser().absolute()
@@ -1075,6 +1205,7 @@ def _dry_run_database_plan(
                     raise BatchRerunError("batch_activation_not_ready")
 
                 preconditions: list[dict[str, Any]] = []
+                eligibility_items: list[dict[str, Any]] = []
                 for item in queue:
                     issue_id = str(item["issue_id"])
                     trigger = conn.execute(
@@ -1092,6 +1223,44 @@ def _dry_run_database_plan(
                     )
                     if not _queue_precondition_matches(item, snapshot):
                         raise BatchRerunError("batch_issue_generation_drift")
+                    route = "initial_generation"
+                    ineligibility = ""
+                    if trigger is not None:
+                        observed = _issue_snapshot(snapshot_db, issue_id)
+                        if observed is None:
+                            raise BatchRerunError("batch_issue_outbox_binding_invalid")
+                        ineligibility = _historical_epoch_rerun_ineligibility(observed)
+                        if not ineligibility:
+                            route = "historical_epoch_rerun"
+                        else:
+                            authority_args = {
+                                "snapshot": observed,
+                                "batch_id": batch_id,
+                                "queue_sha256": queue_sha256,
+                                "issue_id": issue_id,
+                                "owner_receipt_path": (
+                                    owner_receipt_path or "/dry-run-owner-receipt.json"
+                                ),
+                                "owner_receipt_sha256": (
+                                    owner_receipt_sha256 or "1" * 64
+                                ),
+                                "requester_id": requester_id,
+                                "reason": f"production_gray_batch:{batch_id}",
+                            }
+                            if _silent_terminal_authority(**authority_args) is not None:
+                                route = "silent_terminal_rerun"
+                                ineligibility = ""
+                            elif (
+                                _batch_terminal_authority(**authority_args) is not None
+                            ):
+                                route = "batch_terminal_rerun"
+                                ineligibility = ""
+                    eligibility_items.append({
+                        "issue_id": issue_id,
+                        "eligible": not ineligibility,
+                        "route": route if not ineligibility else "",
+                        "reason": ineligibility,
+                    })
                     outbox_status = ""
                     if trigger is not None:
                         outboxes = conn.execute(
@@ -1157,6 +1326,12 @@ def _dry_run_database_plan(
             "sha256": preconditions_sha256,
             "items": preconditions,
         },
+        "eligibility": {
+            "all_eligible": all(item["eligible"] for item in eligibility_items),
+            "eligible": sum(1 for item in eligibility_items if item["eligible"]),
+            "total": len(eligibility_items),
+            "items": eligibility_items,
+        },
     }
 
 
@@ -1210,7 +1385,7 @@ def _dry_run_plan(
     }
     return {
         **material,
-        "ok": True,
+        "ok": bool(database.get("eligibility", {}).get("all_eligible")),
         "plan_sha256": _sha256_bytes(_canonical_json(material).encode("utf-8")),
     }
 
@@ -1225,7 +1400,23 @@ def _refresh_authorities(
     owner_receipt_sha256: str,
     requester_id: str,
     reason: str,
-) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+) -> tuple[
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+]:
+    historical = _historical_epoch_rerun_authority(
+        snapshot=snapshot,
+        batch_id=batch_id,
+        queue_sha256=queue_sha256,
+        issue_id=issue_id,
+        owner_receipt_path=owner_receipt_path,
+        owner_receipt_sha256=owner_receipt_sha256,
+        requester_id=requester_id,
+        reason=reason,
+    )
+    if historical is not None:
+        return historical, None, None
     silent = _silent_terminal_authority(
         snapshot=snapshot,
         batch_id=batch_id,
@@ -1248,7 +1439,7 @@ def _refresh_authorities(
             requester_id=requester_id,
             reason=reason,
         )
-    return silent, batch
+    return historical, silent, batch
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -1280,7 +1471,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             expected_runtime_tree=runtime_tree,
         )
     if dry_run:
-        database = _dry_run_database_plan(Path(args.control_db), queue)
+        database = _dry_run_database_plan(
+            Path(args.control_db),
+            queue,
+            batch_id=batch_id,
+            queue_sha256=queue_sha,
+            owner_receipt_path=owner_receipt_path,
+            owner_receipt_sha256=owner_receipt_sha256,
+            requester_id=args.requester_id,
+        )
         return _dry_run_plan(
             batch_id=batch_id,
             queue=queue,
@@ -1304,6 +1503,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     store = RcaControlStore(Path(args.control_db))
     completed = 0
+    submitted = 0
+    submit_all = bool(getattr(args, "submit_all", False))
+    requested_watermark = getattr(args, "outbox_high_watermark", None)
+    if requested_watermark is None and submit_all:
+        # A submit-all batch is intentionally admitted as one bounded batch;
+        # retain the normal default for single-item/interactive callers.
+        requested_watermark = max(DEFAULT_OUTBOX_HIGH_WATERMARK, len(queue) * 4)
+    try:
+        outbox_high_watermark = int(
+            requested_watermark
+            if requested_watermark is not None
+            else DEFAULT_OUTBOX_HIGH_WATERMARK
+        )
+    except (TypeError, ValueError) as exc:
+        raise BatchRerunError("batch_outbox_high_watermark_invalid") from exc
+    if outbox_high_watermark < 1:
+        raise BatchRerunError("batch_outbox_high_watermark_invalid")
     for queue_item in queue:
         issue_id = queue_item["issue_id"]
         item = dict(state["items"].get(issue_id) or {})
@@ -1347,12 +1563,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 request_index=request_index,
                 requester_id=args.requester_id,
             )
+            historical_authority = None
             silent_authority = None
             batch_authority = None
             if latest is not None:
                 wait_deadline = time.monotonic() + args.item_timeout_seconds
                 while True:
-                    silent_authority, batch_authority = _refresh_authorities(
+                    (
+                        historical_authority,
+                        silent_authority,
+                        batch_authority,
+                    ) = _refresh_authorities(
                         snapshot=latest,
                         batch_id=batch_id,
                         queue_sha256=queue_sha,
@@ -1362,7 +1583,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         requester_id=args.requester_id,
                         reason=request.reason,
                     )
-                    if silent_authority is not None or batch_authority is not None:
+                    if any(
+                        authority is not None
+                        for authority in (
+                            historical_authority,
+                            silent_authority,
+                            batch_authority,
+                        )
+                    ):
                         break
                     if time.monotonic() >= wait_deadline:
                         item.update({
@@ -1381,20 +1609,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     if not _queue_precondition_matches(precondition, latest):
                         raise BatchRerunError("batch_issue_generation_drift")
             admission_kwargs: dict[str, Any] = {}
-            if silent_authority is not None:
-                admission_kwargs["silent_terminal_rerun_authority"] = (
-                    silent_authority
+            if historical_authority is not None:
+                admission_kwargs["historical_epoch_rerun_authority"] = (
+                    historical_authority
                 )
+            elif silent_authority is not None:
+                admission_kwargs["silent_terminal_rerun_authority"] = silent_authority
             elif batch_authority is not None:
-                admission_kwargs["batch_terminal_rerun_authority"] = (
-                    batch_authority
-                )
+                admission_kwargs["batch_terminal_rerun_authority"] = batch_authority
             admitted = store.admit_manual_trigger(
                 request,
                 allowed_chat_ids=set(),
                 submit_enabled=True,
                 operator_authorized=True,
                 activation_required=True,
+                outbox_high_watermark=outbox_high_watermark,
                 **admission_kwargs,
             )
             expected_generation = int(precondition["queue_generation"]) + 1
@@ -1417,6 +1646,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             state["items"][issue_id] = item
             state["updated_at"] = _now()
             _write_state(state_path, state)
+        if submit_all:
+            submitted += 1
+            continue
         deadline = time.monotonic() + args.item_timeout_seconds
         while True:
             current = _issue_snapshot(Path(args.control_db), issue_id)
@@ -1468,10 +1700,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             state["updated_at"] = _now()
             _write_state(state_path, state)
             time.sleep(args.poll_seconds)
-    state["status"] = "completed"
-    state["completed_at"] = _now()
-    state["updated_at"] = state["completed_at"]
-    state["summary"] = {"accepted": completed, "total": len(queue)}
+    state["status"] = "submitted_all" if submit_all else "completed"
+    finished_at = _now()
+    if submit_all:
+        state["submitted_at"] = finished_at
+        state["summary"] = {
+            "accepted": completed,
+            "submitted": submitted,
+            "total": len(queue),
+        }
+    else:
+        state["completed_at"] = finished_at
+        state["summary"] = {"accepted": completed, "total": len(queue)}
+    state["updated_at"] = finished_at
     _write_state(state_path, state)
     return state
 
@@ -1490,6 +1731,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--item-timeout-seconds", type=int, default=7200)
     parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--submit-all", action="store_true")
+    parser.add_argument(
+        "--outbox-high-watermark",
+        type=int,
+        default=None,
+        help="Admission outbox watermark; raise explicitly for a large batch.",
+    )
     return parser
 
 

@@ -1805,7 +1805,7 @@ class RcaDeliveryStore:
         conn = self._connect()
         try:
             conn.execute("BEGIN")
-            authority = self._terminal_rerun_authority_tx(
+            authority = self._owner_authorized_rerun_authority_tx(
                 conn,
                 business_key=business_key,
                 generation=generation,
@@ -3382,11 +3382,12 @@ class RcaDeliveryStore:
         RcaDeliveryStore._validate_comment_slot_schema(conn)
         RcaDeliveryStore._validate_subscription_observability_schema(conn)
         RcaDeliveryStore._validate_delivery_observation_outbox_schema(conn)
-        # The enforcement objects are additive on every supported predecessor.
+        # Recreate the exact W6 objects even when the marker already says v12.
+        # The historical-epoch authority contract changes trigger bodies, and
+        # SQLite's CREATE TRIGGER IF NOT EXISTS does not replace an older body.
         # The Python transaction guards remain authoritative when the control
         # tables are not present in an isolated delivery fixture.
-        if initial_schema_version != DELIVERY_STORE_SCHEMA_VERSION:
-            RcaDeliveryStore._drop_w6_stock_effect_guards(conn)
+        RcaDeliveryStore._drop_w6_stock_effect_guards(conn)
         RcaDeliveryStore._install_w6_effect_guards(conn)
         RcaDeliveryStore._validate_w6_effect_guards(conn)
         quick_check = conn.execute("PRAGMA quick_check").fetchone()
@@ -3461,9 +3462,21 @@ class RcaDeliveryStore:
         )
         if not (cohort_ready and admissions_ready):
             return tuple(statements)
-        if not RcaDeliveryStore._table_exists(
-            conn, "rca_terminal_rerun_delivery_authorities"
-        ):
+        authority_schema_ready = (
+            all(
+                RcaDeliveryStore._table_exists(conn, table)
+                for table in (
+                    "rca_terminal_rerun_delivery_authorities",
+                    "rca_historical_epoch_rerun_delivery_authorities",
+                )
+            )
+            and conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='view' "
+                "AND name='rca_owner_authorized_rerun_delivery_authorities'"
+            ).fetchone()
+            is not None
+        )
+        if not authority_schema_ready:
             raise RuntimeError(
                 "incompatible_delivery_store_schema:"
                 "terminal_rerun_authority_table_missing"
@@ -3484,9 +3497,8 @@ class RcaDeliveryStore:
                 "incompatible_delivery_store_schema:"
                 "terminal_rerun_authority_control_schema"
             )
-        RcaControlStore._validate_v14_terminal_rerun_delivery_authority_schema(
-            conn
-        )
+        RcaControlStore._validate_v14_terminal_rerun_delivery_authority_schema(conn)
+        RcaControlStore._validate_historical_epoch_rerun_delivery_authority_schema(conn)
         statements.append(
             """
             CREATE TRIGGER IF NOT EXISTS
@@ -3549,7 +3561,7 @@ class RcaDeliveryStore:
                             job.generation
                         AND EXISTS (
                             SELECT 1
-                              FROM rca_terminal_rerun_delivery_authorities AS authority
+                              FROM rca_owner_authorized_rerun_delivery_authorities AS authority
                               JOIN rca_execution_watch AS authority_watch
                                 ON authority_watch.submission_key =
                                    job.submission_key
@@ -3638,7 +3650,7 @@ class RcaDeliveryStore:
                                 ) = bt.work_item_id
                                 AND EXISTS (
                                     SELECT 1
-                                      FROM rca_terminal_rerun_delivery_authorities
+                                      FROM rca_owner_authorized_rerun_delivery_authorities
                                            AS authority
                                       JOIN rca_outbox AS authority_outbox
                                         ON authority_outbox.outbox_id =
@@ -3723,7 +3735,7 @@ class RcaDeliveryStore:
                                 ) = bt.work_item_id
                                 AND EXISTS (
                                     SELECT 1
-                                      FROM rca_terminal_rerun_delivery_authorities
+                                      FROM rca_owner_authorized_rerun_delivery_authorities
                                            AS authority
                                       JOIN rca_outbox AS authority_outbox
                                         ON authority_outbox.outbox_id =
@@ -6151,6 +6163,101 @@ class RcaDeliveryStore:
         return row
 
     @classmethod
+    def _owner_authorized_rerun_authority_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        business_key: str,
+        generation: int,
+        work_item_id: str | None = None,
+    ) -> sqlite3.Row | None:
+        required = (
+            "business_triggers",
+            "rca_outbox",
+            "rca_trigger_bindings",
+            "rca_trigger_sources",
+            "rca_activation_admission_ledger",
+            "rca_activation_epochs",
+        )
+        if not all(cls._table_exists(conn, table) for table in required):
+            return None
+        if (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='view' "
+                "AND name='rca_owner_authorized_rerun_delivery_authorities'"
+            ).fetchone()
+            is None
+        ):
+            return None
+        row = conn.execute(
+            """
+            SELECT authority.*
+              FROM rca_owner_authorized_rerun_delivery_authorities AS authority
+              JOIN business_triggers AS trigger
+                ON trigger.business_key = authority.business_key
+               AND trigger.generation = authority.generation
+               AND trigger.submission_key = authority.submission_key
+               AND trigger.project_key = authority.project_key
+               AND trigger.work_item_type_key = authority.work_item_type_key
+               AND trigger.work_item_id = authority.issue_id
+               AND json_extract(
+                   trigger.normalized_json, '$.project_simple_name'
+               ) = authority.project_simple_name
+               AND trigger.activation_epoch_id = authority.activation_epoch_id
+               AND trigger.activation_ledger_id = authority.activation_ledger_id
+              JOIN rca_trigger_bindings AS binding
+                ON binding.source_id = authority.source_id
+               AND binding.business_key = authority.business_key
+               AND binding.generation = authority.generation
+               AND binding.role = 'origin'
+              JOIN rca_trigger_sources AS source
+                ON source.source_id = binding.source_id
+               AND source.payload_sha256 = authority.source_payload_sha256
+               AND source.source_kind = 'feishu_group_manual'
+               AND source.platform = 'operator'
+               AND source.chat_id = ''
+               AND source.thread_id = ''
+               AND source.mode = 'rerun'
+               AND source.outcome = 'created'
+               AND source.requester_id = authority.requester_id
+              JOIN rca_outbox AS outbox
+                ON outbox.outbox_id = authority.outbox_id
+               AND outbox.business_key = authority.business_key
+               AND outbox.generation = authority.generation
+               AND outbox.submission_key = authority.submission_key
+               AND outbox.origin_source_id = authority.source_id
+               AND outbox.action = 'submit_rca_issue_intake'
+               AND outbox.activation_epoch_id = authority.activation_epoch_id
+               AND outbox.activation_ledger_id = authority.activation_ledger_id
+              JOIN rca_activation_admission_ledger AS ledger
+                ON ledger.ledger_id = authority.activation_ledger_id
+               AND ledger.epoch_id = authority.activation_epoch_id
+               AND ledger.entrypoint = 'manual_admit'
+               AND ledger.source_kind = 'manual'
+               AND ledger.decision = 'admit'
+               AND ledger.business_key = authority.business_key
+               AND ledger.submission_key = authority.submission_key
+               AND ledger.generation = authority.generation
+               AND ledger.bound_at IS NOT NULL
+              JOIN rca_activation_epochs AS epoch
+                ON epoch.epoch_id = ledger.epoch_id
+               AND epoch.is_current = 1
+               AND epoch.state IN ('bounded_active', 'steady_active')
+             WHERE authority.business_key = ?
+               AND authority.generation = ?
+               AND authority.effect_kind = 'feishu_issue_comment'
+               AND authority.activation_required = 1
+             LIMIT 1
+            """,
+            (str(business_key), int(generation)),
+        ).fetchone()
+        if row is None or (
+            work_item_id is not None and str(row["issue_id"]) != str(work_item_id)
+        ):
+            return None
+        return row
+
+    @classmethod
     def _explicit_user_rerun_keys_tx(
         cls,
         conn: sqlite3.Connection,
@@ -6386,12 +6493,15 @@ class RcaDeliveryStore:
         ).fetchone()
         if member is None:
             return "not_learning"
-        if cls._terminal_rerun_authority_tx(
-            conn,
-            business_key=str(business_key),
-            generation=int(generation),
-            work_item_id=item_id,
-        ) is not None:
+        if (
+            cls._owner_authorized_rerun_authority_tx(
+                conn,
+                business_key=str(business_key),
+                generation=int(generation),
+                work_item_id=item_id,
+            )
+            is not None
+        ):
             return "terminal_rerun_authorized"
         return "admission_missing"
 
@@ -6562,7 +6672,7 @@ class RcaDeliveryStore:
             )
             owner_authorized_rerun_exception = (
                 guard_state == "terminal_rerun_authorized"
-                or cls._terminal_rerun_authority_tx(
+                or cls._owner_authorized_rerun_authority_tx(
                     conn,
                     business_key=str(business_key),
                     generation=int(generation),

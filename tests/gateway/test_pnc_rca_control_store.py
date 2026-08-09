@@ -29,6 +29,7 @@ from gateway.pnc_rca_control_store import (
     RecordProcessingBlockedError,
     ShadowPromotionError,
     StaleOutboxLeaseError,
+    build_historical_epoch_rerun_authority,
     build_silent_terminal_rerun_authority,
     build_batch_terminal_rerun_authority,
 )
@@ -373,6 +374,254 @@ def _silent_batch_authority(
         requester_id=request.requester_id,
         reason=request.reason,
     )
+
+
+@pytest.mark.parametrize(
+    "prior_binding", ["legacy", "legacy_stale_task", "historical"]
+)
+def test_historical_epoch_batch_rerun_appends_current_generation_without_old_mutation(
+    tmp_path, monkeypatch, prior_binding
+):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    issue_id = "7055722720"
+    issue_url = f"https://project.feishu.cn/g1q3/issue/detail/{issue_id}"
+    old_epoch = None
+    if prior_binding == "historical":
+        old_epoch = _activate_direct_steady_epoch(
+            store, epoch_id="rca-historical-rerun-old"
+        )
+    original_utc_datetime = control_store_module._utc_datetime
+    pre_cutoff = datetime(2026, 7, 24, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        control_store_module,
+        "_utc_datetime",
+        lambda value=None: (
+            pre_cutoff if value is None else original_utc_datetime(value)
+        ),
+    )
+    first = store.ingest_record(
+        _record(value=_value(work_item_id=int(issue_id))),
+        policy=_policy(),
+        submit_enabled=True,
+        activation_required=prior_binding == "historical",
+    )
+    monkeypatch.setattr(control_store_module, "_utc_datetime", original_utc_datetime)
+    RcaDeliveryStore(store.db_path)
+    if prior_binding == "legacy_stale_task":
+        [seed_outbox] = store.list_rows("rca_outbox")
+        conn = store._connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO rca_execution_watch(
+                    submission_key, submission_outbox_id, business_key,
+                    generation, project_key, work_item_type_key, work_item_id,
+                    task_id, state, next_poll_at, lease_token, lease_owner,
+                    lease_expires_at, created_at, updated_at
+                ) VALUES (?, ?, ?, 1, 'project-key', 'problem-type', ?, ?,
+                          'pending', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    first.submission_key,
+                    seed_outbox["outbox_id"],
+                    first.business_key,
+                    issue_id,
+                    "stale-vm-task-7055722720",
+                    "2026-07-24T00:00:00+00:00",
+                    "expired-token",
+                    "retired-worker",
+                    "2026-07-24T00:00:00+00:00",
+                    "2026-07-24T00:00:00+00:00",
+                    "2026-07-24T00:00:00+00:00",
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    if old_epoch is not None:
+        store.transition_activation_epoch(
+            epoch_id=old_epoch["epoch_id"],
+            expected_state="steady_active",
+            target_state="aborted",
+            operator="release-test",
+            reason="retire historical rerun predecessor",
+        )
+    current_epoch = _activate_direct_steady_epoch(
+        store, epoch_id="rca-historical-rerun-current", start_offset=30
+    )
+    [old_trigger] = store.list_rows("business_triggers")
+    [old_outbox] = store.list_rows("rca_outbox")
+    old_subscriptions = store.list_rows("rca_delivery_subscriptions")
+    old_watches = RcaDeliveryStore(store.db_path).list_rows("rca_execution_watch")
+    batch_id = "batch-historical"
+    request = replace(
+        _operator_request(
+            f"{batch_id}-{issue_id}-try-1",
+            issue_url=issue_url,
+            requester_id="automation:rca-batch-rerun",
+        ),
+        reason=f"production_gray_batch:{batch_id}",
+    )
+    authority = build_historical_epoch_rerun_authority(
+        batch_id=batch_id,
+        queue_sha256="1" * 64,
+        issue_id=issue_id,
+        prior_submission_key=first.submission_key,
+        prior_generation=1,
+        prior_activation_epoch_id=str(old_trigger["activation_epoch_id"] or ""),
+        prior_activation_ledger_id=old_trigger["activation_ledger_id"],
+        target_activation_epoch_id=current_epoch["epoch_id"],
+        owner_receipt_path=str(tmp_path / "owner.json"),
+        owner_receipt_sha256="2" * 64,
+        requester_id=request.requester_id,
+        reason=request.reason,
+    )
+
+    rerun = store.admit_manual_trigger(
+        request,
+        allowed_chat_ids=set(),
+        submit_enabled=True,
+        operator_authorized=True,
+        activation_required=True,
+        historical_epoch_rerun_authority=authority,
+        outbox_high_watermark=10_000,
+    )
+
+    assert rerun.outcome == "created"
+    assert rerun.generation == 2
+    triggers = sorted(
+        store.list_rows("business_triggers"), key=lambda row: row["generation"]
+    )
+    outboxes = sorted(store.list_rows("rca_outbox"), key=lambda row: row["generation"])
+    assert triggers[0] == old_trigger
+    assert outboxes[0] == old_outbox
+    assert RcaDeliveryStore(store.db_path).list_rows("rca_execution_watch") == old_watches
+    assert [
+        row
+        for row in store.list_rows("rca_delivery_subscriptions")
+        if row["generation"] == 1
+    ] == old_subscriptions
+    assert triggers[1]["activation_epoch_id"] == current_epoch["epoch_id"]
+    assert triggers[1]["activation_ledger_id"] == outboxes[1]["activation_ledger_id"]
+    assert [
+        row["effect_kind"]
+        for row in store.list_rows("rca_delivery_subscriptions")
+        if row["generation"] == 2
+    ] == ["feishu_issue_comment"]
+    [persisted] = store.list_rows("rca_historical_epoch_rerun_delivery_authorities")
+    assert persisted["authority_sha256"] == authority["selection_sha256"]
+    assert store.list_rows("rca_terminal_rerun_delivery_authorities") == []
+    assert [
+        row
+        for row in store.list_rows("rca_learning_lane_admissions")
+        if row["generation"] == 2
+    ] == []
+
+    replay = store.admit_manual_trigger(
+        request,
+        allowed_chat_ids=set(),
+        submit_enabled=True,
+        operator_authorized=True,
+        activation_required=True,
+        historical_epoch_rerun_authority=authority,
+        outbox_high_watermark=10_000,
+    )
+    assert (replay.generation, replay.submission_key) == (
+        rerun.generation,
+        rerun.submission_key,
+    )
+    assert len(store.list_rows("business_triggers")) == 2
+    assert len(store.list_rows("rca_historical_epoch_rerun_delivery_authorities")) == 1
+    delivery = RcaDeliveryStore(store.db_path)
+    conn = delivery._connect()
+    try:
+        owner_authority = delivery._owner_authorized_rerun_authority_tx(
+            conn,
+            business_key=rerun.business_key,
+            generation=rerun.generation,
+            work_item_id=issue_id,
+        )
+        stock_guard_sql = str(
+            conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' "
+                "AND name='trg_learning_lane_stock_subscription_insert_forbidden'"
+            ).fetchone()["sql"]
+        )
+    finally:
+        conn.close()
+    assert owner_authority is not None
+    assert owner_authority["authority_family"] == "historical_epoch_rerun"
+    assert "rca_owner_authorized_rerun_delivery_authorities" in stock_guard_sql
+
+
+@pytest.mark.parametrize("failure", ["tampered", "current_epoch"])
+def test_historical_epoch_batch_rerun_rejects_invalid_authority_without_mutation(
+    tmp_path, failure
+):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    first = store.admit_manual_trigger(
+        _operator_request("legacy-negative-seed"),
+        allowed_chat_ids=set(),
+        submit_enabled=True,
+        operator_authorized=True,
+        active_policy=_policy(),
+    )
+    current = _activate_direct_steady_epoch(
+        store, epoch_id="rca-historical-rerun-negative"
+    )
+    batch_id = "batch-negative"
+    request = replace(
+        _operator_request(
+            f"{batch_id}-7041712812-try-1",
+            requester_id="automation:rca-batch-rerun",
+        ),
+        reason=f"production_gray_batch:{batch_id}",
+    )
+    authority = build_historical_epoch_rerun_authority(
+        batch_id=batch_id,
+        queue_sha256="1" * 64,
+        issue_id="7041712812",
+        prior_submission_key=first.submission_key,
+        prior_generation=1,
+        prior_activation_epoch_id=(
+            current["epoch_id"] if failure == "current_epoch" else ""
+        ),
+        prior_activation_ledger_id=(1 if failure == "current_epoch" else None),
+        target_activation_epoch_id=(
+            "not-current-epoch" if failure == "current_epoch" else current["epoch_id"]
+        ),
+        owner_receipt_path=str(tmp_path / "owner.json"),
+        owner_receipt_sha256="2" * 64,
+        requester_id=request.requester_id,
+        reason=request.reason,
+    )
+    if failure == "tampered":
+        authority["selection_sha256"] = "3" * 64
+    before = {
+        table: store.list_rows(table)
+        for table in (
+            "business_triggers",
+            "rca_outbox",
+            "rca_trigger_sources",
+            "rca_historical_epoch_rerun_delivery_authorities",
+        )
+    }
+
+    with pytest.raises(
+        ManualRcaAdmissionError,
+        match="historical_epoch_rerun_authority_(invalid|mismatch)",
+    ):
+        store.admit_manual_trigger(
+            request,
+            allowed_chat_ids=set(),
+            submit_enabled=True,
+            operator_authorized=True,
+            activation_required=True,
+            historical_epoch_rerun_authority=authority,
+            outbox_high_watermark=10_000,
+        )
+
+    assert {table: store.list_rows(table) for table in before} == before
 
 
 @pytest.mark.parametrize(
@@ -8843,13 +9092,25 @@ V13_HISTORICAL_HOLD_TABLES = {
     "rca_activation_historical_outbox_holds",
 }
 V14_TERMINAL_RERUN_TABLES = {"rca_terminal_rerun_delivery_authorities"}
+V14_HISTORICAL_EPOCH_RERUN_TABLES = {
+    "rca_historical_epoch_rerun_delivery_authorities"
+}
+V14_RERUN_TABLES = (
+    V14_TERMINAL_RERUN_TABLES | V14_HISTORICAL_EPOCH_RERUN_TABLES
+)
 
 
 def _drop_schema_objects(conn, *, tables):
     tables = tuple(tables)
     drop_learning = bool(set(tables) & V12_LEARNING_TABLES)
     drop_historical = bool(set(tables) & V13_HISTORICAL_HOLD_TABLES)
+    drop_rerun = bool(set(tables) & V14_RERUN_TABLES)
     conn.execute("PRAGMA foreign_keys=OFF")
+    if drop_rerun:
+        conn.execute(
+            "DROP VIEW IF EXISTS "
+            "rca_owner_authorized_rerun_delivery_authorities"
+        )
     for row in conn.execute(
         "SELECT name FROM sqlite_master WHERE type = 'trigger'"
     ).fetchall():
@@ -8858,6 +9119,14 @@ def _drop_schema_objects(conn, *, tables):
             drop_learning and name.startswith("trg_learning_lane_")
         ) or (
             drop_historical and name.startswith("trg_activation_historical_")
+        ) or (
+            drop_rerun
+            and name.startswith(
+                (
+                    "trg_terminal_rerun_delivery_authority_",
+                    "trg_historical_epoch_rerun_delivery_authority_",
+                )
+            )
         ):
             conn.execute(f"DROP TRIGGER {name}")
     for table in tables:
@@ -8872,7 +9141,7 @@ def _downgrade_current_store_to_v10(store):
             tables=(
                 *V13_HISTORICAL_HOLD_TABLES,
                 *V12_LEARNING_TABLES,
-                *V14_TERMINAL_RERUN_TABLES,
+                *V14_RERUN_TABLES,
             ),
         )
         for table in (
@@ -8895,7 +9164,7 @@ def _downgrade_current_store_to_v12(store):
     try:
         _drop_schema_objects(
             conn,
-            tables=(*V13_HISTORICAL_HOLD_TABLES, *V14_TERMINAL_RERUN_TABLES),
+            tables=(*V13_HISTORICAL_HOLD_TABLES, *V14_RERUN_TABLES),
         )
         conn.execute(
             "UPDATE control_meta SET value='pnc_rca_control_store_v12' "
@@ -8913,7 +9182,7 @@ def _downgrade_current_store_to_v11(store):
             tables=(
                 *V13_HISTORICAL_HOLD_TABLES,
                 *V12_LEARNING_TABLES,
-                *V14_TERMINAL_RERUN_TABLES,
+                *V14_RERUN_TABLES,
             ),
         )
         conn.execute(
@@ -8927,7 +9196,7 @@ def _downgrade_current_store_to_v11(store):
 def _downgrade_current_store_to_v13(store):
     conn = store._connect()
     try:
-        _drop_schema_objects(conn, tables=V14_TERMINAL_RERUN_TABLES)
+        _drop_schema_objects(conn, tables=V14_RERUN_TABLES)
         conn.execute(
             "UPDATE control_meta SET value='pnc_rca_control_store_v13' "
             "WHERE key='schema_version'"
@@ -8979,6 +9248,15 @@ def test_v12_store_migrates_to_v13_historical_hold_schema(tmp_path):
 def test_v13_store_migrates_to_v14_terminal_rerun_authority_schema(tmp_path):
     path = tmp_path / "control.sqlite3"
     _downgrade_current_store_to_v13(RcaControlStore(path))
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='rca_historical_epoch_rerun_delivery_authorities'"
+        ).fetchone() is None
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='view' "
+            "AND name='rca_owner_authorized_rerun_delivery_authorities'"
+        ).fetchone() is None
 
     with pytest.raises(RuntimeError, match="rca_control_store_schema_not_current"):
         RcaControlStore(path, require_current=True)
@@ -8987,6 +9265,14 @@ def test_v13_store_migrates_to_v14_terminal_rerun_authority_schema(tmp_path):
     assert upgraded.health()["schema_version"] == CONTROL_STORE_SCHEMA_VERSION
     assert upgraded.initialization_observation()["mode"] == "migration"
     assert upgraded.list_rows("rca_terminal_rerun_delivery_authorities") == []
+    assert upgraded.list_rows(
+        "rca_historical_epoch_rerun_delivery_authorities"
+    ) == []
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='view' "
+            "AND name='rca_owner_authorized_rerun_delivery_authorities'"
+        ).fetchone() is not None
 
 
 def test_v13_to_v14_migration_rolls_back_ddl_and_marker(tmp_path, monkeypatch):

@@ -1478,6 +1478,54 @@ def test_require_current_delivery_store_opens_current_regular_file(tmp_path):
     assert reopened.db_path == path
 
 
+def test_current_v14_writable_open_rebuilds_terminal_only_w6_guards(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    RcaControlStore(path)
+    RcaDeliveryStore(path)
+    trigger_names = (
+        "trg_learning_lane_stock_effect_insert_forbidden",
+        "trg_learning_lane_stock_subscription_insert_forbidden",
+        "trg_learning_lane_stock_subscription_update_forbidden",
+    )
+    with sqlite3.connect(path) as conn:
+        for name in trigger_names:
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+                (name,),
+            ).fetchone()
+            assert row is not None
+            legacy_sql = str(row[0]).replace(
+                "rca_owner_authorized_rerun_delivery_authorities",
+                "rca_terminal_rerun_delivery_authorities",
+            )
+            conn.execute(f"DROP TRIGGER {name}")
+            conn.execute(legacy_sql)
+
+    with pytest.raises(
+        RuntimeError,
+        match="incompatible_delivery_store_schema:w6_trigger:",
+    ):
+        RcaDeliveryStore(path, require_current=True)
+
+    RcaControlStore(path)
+    RcaDeliveryStore(path)
+    RcaDeliveryStore(path, require_current=True)
+    with sqlite3.connect(path) as conn:
+        rebuilt = {
+            str(row[0]): str(row[1])
+            for row in conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type='trigger' "
+                "AND name IN (?, ?, ?)",
+                trigger_names,
+            ).fetchall()
+        }
+    assert set(rebuilt) == set(trigger_names)
+    assert all(
+        "rca_owner_authorized_rerun_delivery_authorities" in sql
+        for sql in rebuilt.values()
+    )
+
+
 @pytest.mark.parametrize("mutation", ["drop_index", "weaken_check"])
 def test_require_current_rejects_noncanonical_observation_outbox_schema(
     tmp_path,
